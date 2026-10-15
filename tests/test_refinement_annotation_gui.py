@@ -3780,3 +3780,116 @@ def test_removing_one_of_multiple_abnormal_intervals_rejoins_only_its_gap(
         assert fragments[1]["outcome"] == selected["outcome"]
     finally:
         application.close()
+
+
+
+def _run_annotation_catalog_contract(source: str, scenario: str) -> None:
+    import shutil
+    import subprocess
+
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("Node.js is required for the annotation browser contract")
+
+    def function(start: str, end: str) -> str:
+        position = source.index(start)
+        return source[position:source.index(end, position + len(start))]
+
+    selected = [
+        function("function episodeStatus(", "\nfunction applyCommittedEpisodeSummary("),
+        function("function applyCommittedEpisodeSummary(", "\nfunction annotationSummarySignature("),
+        function("async function loadEpisodes(", "\nfunction startEpisodePolling("),
+        function("function resetAnnotationStateForWorkspace(", "\nasync function switchWorkspace("),
+    ]
+    setup = r"""
+const assert = require('node:assert/strict');
+const STATUS_LOADING = {loaded:false, badges:[]};
+const episodeSummaryCommitEpoch = new Map(), episodeSummaryRefreshedAt = new Map();
+let pendingEpisodeCommitRefresh = null;
+const pendingEpisodeSummaryIds = new Set(), inFlightEpisodeSummaryIds = new Set();
+const episodeRowNodes = new Map(), episodeRowSignatures = new Map();
+const episodeSummaryObserver = null;
+const EPISODE_PAGE_SIZE = 40, EPISODE_RENDER_BATCH_SIZE = 40, EPISODE_SUMMARY_REFRESH_MS = 1000;
+const noop = () => {};
+const setServerOnline = noop, renderCatalogScanProgress = noop, showToast = noop,
+ renderEpisodeList = noop, updateEpisodeNavigation = noop, renderEditor = noop,
+ clearRecoverableFailureCapture = noop, cancelPendingSeek = noop,
+ cancelVideoPrefetch = noop, clearVideoLoadListeners = noop, setSavedDraftSnapshot = noop;
+const video = {pause:noop, removeAttribute:noop, load:noop};
+const $ = () => ({textContent:''});
+const compareEpisodeOrder = (a,b) => a.episode_uuid.localeCompare(b.episode_uuid);
+const state = {episodeRefreshInFlight:false, episodePageInFlight:false,
+ workspaceConfigured:true, workspaceGeneration:1, selectedEpisode:'B', episodeRevision:0,
+ episodeHasMore:true, episodeRenderLimit:40, episodes:['A','B','C'].map(episode_uuid =>
+ ({episode_uuid, annotation_summary_loaded:true, marker:'before-' + episode_uuid}))};
+const requests = [];
+const requestJson = (url) => new Promise((resolve,reject) => requests.push({url,resolve,reject}));
+const payload = {episode_summary:{episode_uuid:'A', annotation_summary_loaded:true,
+ annotation_status:{schema:'dexteleop.refinement_annotation.episode_status.v1',badges:[]},marker:'committed-A'}};
+const catalog = (ids=['A','B','C']) => ({episodes:ids.map(episode_uuid =>
+ ({episode_uuid,annotation_summary_loaded:false,marker:'stale-' + episode_uuid})),
+ revision:1,total_count:3,has_more:false,dataset_root:'/offline'});
+"""
+    action = r"""
+(async () => {
+ const mode = SCENARIO;
+ if (mode === 'first_page') state.episodeRevision = null;
+ const first = loadEpisodes({append:mode === 'append'});
+ assert.equal(requests.length, 1);
+ state.selectedEpisode = 'A'; state.detail = {episode_uuid:'A'};
+ assert.equal(applyCommittedEpisodeSummary(payload), null);
+ if (['revision','first_page','append'].includes(mode)) {
+   state.selectedEpisode = 'C';
+   requests[0].resolve(catalog(mode === 'first_page' ? ['B','C'] : undefined));
+   assert.equal(await first, true);
+   assert.equal(state.episodes.find(x => x.episode_uuid === 'A').marker, 'committed-A');
+ } else if (mode === 'workspace') {
+   const queued = loadEpisodes({afterCommit:true});
+   resetAnnotationStateForWorkspace();
+   assert.equal(await queued, false);
+   requests[0].resolve(catalog());
+   assert.equal(await first, false);
+   assert.deepEqual(state.episodes, []);
+   assert.equal(episodeSummaryCommitEpoch.size, 0);
+   assert.equal(requests.length, 1);
+   const fresh = loadEpisodes();
+   requests[1].resolve(catalog(['C']));
+   assert.equal(await fresh, true);
+   assert.deepEqual(state.episodes.map(x => x.episode_uuid), ['C']);
+ } else {
+   // Exercise the real commit caller's existing restore-after-refresh contract.
+   const commit = (async () => {
+     const refreshed = await loadEpisodes({afterCommit:true});
+     applyCommittedEpisodeSummary(payload, {markCommit:false});
+     return refreshed;
+   })();
+   const follower = loadEpisodes({afterCommit:true});
+   assert.equal(requests.length, 1);
+   requests[0].resolve(catalog());
+   assert.equal(await first, true);
+   assert.equal(requests.length, 2);
+   assert.equal(state.episodes.find(x => x.episode_uuid === 'A').marker, 'committed-A');
+   if (mode === 'refresh_failure') requests[1].reject(new Error('offline refresh failure'));
+   else requests[1].resolve(catalog());
+   assert.equal(await commit, mode !== 'refresh_failure');
+   assert.equal(await follower, mode !== 'refresh_failure');
+   assert.equal(requests.length, 2);
+   assert.equal(state.episodes.find(x => x.episode_uuid === 'A').marker, 'committed-A');
+ }
+ assert.equal(state.episodeRefreshInFlight, false);
+ assert.equal(state.episodePageInFlight, false);
+ process.stdout.write('ok');
+})().catch(error => {process.stderr.write(String(error.stack)); process.exitCode = 1;});
+""".replace("SCENARIO", json.dumps(scenario))
+    result = subprocess.run(
+        [node, "-"], input=setup + "\n".join(selected) + action,
+        capture_output=True, text=True, timeout=10, check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "ok"
+
+
+@pytest.mark.parametrize("scenario", ("revision", "first_page", "append", "queued_refresh", "refresh_failure", "workspace"))
+def test_catalog_commit_ordering_across_selection_and_refresh(scenario: str) -> None:
+    source = (Path(__file__).resolve().parents[1] / "control_station/refinement_annotation/static/app.js").read_text(encoding="utf-8")
+    _run_annotation_catalog_contract(source, scenario)

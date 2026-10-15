@@ -60,6 +60,7 @@ const pendingEpisodeSummaryIds = new Set();
 const inFlightEpisodeSummaryIds = new Set();
 const episodeSummaryRefreshedAt = new Map();
 const episodeSummaryCommitEpoch = new Map();
+let pendingEpisodeCommitRefresh = null;
 const episodeRowNodes = new Map();
 const episodeRowSignatures = new Map();
 const datasetBrowserCache = new Map();
@@ -927,6 +928,10 @@ function resetAnnotationStateForWorkspace() {
   inFlightEpisodeSummaryIds.clear();
   episodeSummaryRefreshedAt.clear();
   episodeSummaryCommitEpoch.clear();
+  if (pendingEpisodeCommitRefresh) {
+    pendingEpisodeCommitRefresh.resolve(false);
+    pendingEpisodeCommitRefresh = null;
+  }
   episodeRowNodes.clear();
   episodeRowSignatures.clear();
   if (episodeSummaryObserver) episodeSummaryObserver.disconnect();
@@ -2662,22 +2667,30 @@ async function loadEpisodes({
   silent = false,
   force = false,
   append = false,
+  afterCommit = false,
 } = {}) {
-  if (
-    state.episodeRefreshInFlight
-    || state.episodePageInFlight
-    || !state.workspaceConfigured
-    || (append && !state.episodeHasMore)
-  ) return false;
+  if (!state.workspaceConfigured || (append && !state.episodeHasMore)) return false;
+  if (state.episodeRefreshInFlight || state.episodePageInFlight) {
+    if (!afterCommit) return false;
+    // Commit callers await one shared refresh after the current request. Their
+    // existing summary restoration then runs after that refresh, not before it.
+    if (!pendingEpisodeCommitRefresh) {
+      let resolve;
+      const promise = new Promise((done) => { resolve = done; });
+      pendingEpisodeCommitRefresh = {
+        promise, resolve, force: false, generation: state.workspaceGeneration,
+      };
+    }
+    pendingEpisodeCommitRefresh.force ||= force;
+    return pendingEpisodeCommitRefresh.promise;
+  }
   state.episodeRefreshInFlight = true;
   state.episodePageInFlight = append;
   const previousIds = new Set(
     state.episodes.map((value) => value.episode_uuid),
   );
-  const selectedAtRequest = state.selectedEpisode;
-  const commitEpochAtRequest = episodeSummaryCommitEpoch.get(
-    selectedAtRequest,
-  ) || 0;
+  const workspaceGeneration = state.workspaceGeneration;
+  const requestedCommitEpochs = new Map(episodeSummaryCommitEpoch);
   try {
     const params = new URLSearchParams();
     params.set("stale_ok", "1");
@@ -2686,6 +2699,7 @@ async function loadEpisodes({
     if (force) params.set("refresh", "1");
     const query = `?${params.toString()}`;
     const payload = await requestJson(`/api/episodes${query}`);
+    if (workspaceGeneration !== state.workspaceGeneration) return false;
     setServerOnline(true);
     state.episodeScanInProgress = Boolean(payload.refreshing);
     renderCatalogScanProgress(payload);
@@ -2703,11 +2717,12 @@ async function loadEpisodes({
       && (state.episodeRevision === null || state.episodes.length === 0);
     // A catalog request issued before a commit must not replace its newer
     // authoritative status when that older request finishes later.
+    const committedSinceRequest = (episodeUuid) => (
+      (episodeSummaryCommitEpoch.get(episodeUuid) || 0)
+        !== (requestedCommitEpochs.get(episodeUuid) || 0)
+    );
     const retainNewerCommit = (item, existing) => (
-      item.episode_uuid === selectedAtRequest
-      && existing
-      && (episodeSummaryCommitEpoch.get(selectedAtRequest) || 0)
-        !== commitEpochAtRequest
+      existing && committedSinceRequest(item.episode_uuid)
     ) ? existing : item;
     if (append) {
       const byId = new Map(
@@ -2726,14 +2741,12 @@ async function loadEpisodes({
       // Retain already loaded pages (and the currently selected row) during a
       // background revision update.  Only the first page is replaced; this
       // avoids pulling the entire catalog back over the wire every 4 seconds.
-      const selectedItem = state.episodes.find(
-        (value) => value.episode_uuid === state.selectedEpisode,
+      const retainedItems = state.episodes.filter(
+        (value) => value.episode_uuid === state.selectedEpisode
+          || committedSinceRequest(value.episode_uuid),
       );
       const byId = new Map(
-        (replaceLoadedPage
-          ? (selectedItem ? [selectedItem] : [])
-          : state.episodes
-        ).map(
+        (replaceLoadedPage ? retainedItems : state.episodes).map(
           (value) => [value.episode_uuid, value],
         ),
       );
@@ -2819,6 +2832,15 @@ async function loadEpisodes({
   } finally {
     state.episodeRefreshInFlight = false;
     state.episodePageInFlight = false;
+    const queued = pendingEpisodeCommitRefresh;
+    pendingEpisodeCommitRefresh = null;
+    if (queued) {
+      if (queued.generation === state.workspaceGeneration && state.workspaceConfigured) {
+        void loadEpisodes({silent: true, force: queued.force}).then(
+          queued.resolve, () => queued.resolve(false),
+        );
+      } else queued.resolve(false);
+    }
   }
 }
 
@@ -3065,7 +3087,8 @@ function renderEpisodeList({preserveViewport = true} = {}) {
     episodeRowNodes.delete(episodeUuid);
     episodeRowSignatures.delete(episodeUuid);
     episodeSummaryRefreshedAt.delete(episodeUuid);
-    episodeSummaryCommitEpoch.delete(episodeUuid);
+    // Commit ordering outlives DOM rows, including rows scrolled off screen.
+    // The workspace reset clears these epochs with the catalog itself.
   }
   if (renderedEpisodes.length < state.episodes.length) {
     const remaining = state.episodes.length - renderedEpisodes.length;
@@ -4468,7 +4491,7 @@ async function publishDetailAnnotations() {
   setSavedDraftSnapshot(state.draft);
   renderTimeline();
   renderEpisodeList({preserveViewport: true});
-  await loadEpisodes();
+  await loadEpisodes({afterCommit: true});
   // A changed catalog revision may replace the hydrated row with a lightweight
   // one. Restore the summary returned by this successful commit afterward.
   applyCommittedEpisodeSummary(payload, {markCommit: false});
@@ -4582,7 +4605,7 @@ async function publishCurrentAnnotations() {
   renderSealedReeditControls();
   $("coverage-preview").textContent =
     `已封存 ${report.annotation_set_id} · coverage=${report.coverage_status} · 排除区间 ${report.exclusion_count}`;
-  await loadEpisodes();
+  await loadEpisodes({afterCommit: true});
   applyCommittedEpisodeSummary(payload, {markCommit: false});
   renderEpisodeList({preserveViewport: true});
   return {...report, status_refresh_warning: statusRefreshWarning};
