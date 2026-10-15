@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import socket
 import subprocess
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -79,16 +80,22 @@ printf '%s\\n' "$MPLCONFIGDIR" >"$FAKE_SYNC_ROOT/$name.matplotlib-cache"
 printf '%s\\n' "$NUMBA_CACHE_DIR" >"$FAKE_SYNC_ROOT/$name.numba-cache"
 printf '%s\\n' "$MUJOCO_GL" >"$FAKE_SYNC_ROOT/$name.mujoco-gl"
 umask >"$FAKE_SYNC_ROOT/$name.umask"
+printf '%s\\n' "${DEXTELEOP_FULL_ACCEPTANCE_MAX_JOBS-unset}" >"$FAKE_SYNC_ROOT/$name.max-jobs"
+printf 'start %s\\n' "$name" >>"$FAKE_SYNC_ROOT/events"
 : >"$FAKE_SYNC_ROOT/$name.started"
 for _ in {1..250}; do
   started=$(find "$FAKE_SYNC_ROOT" -name '*.started' | wc -l)
-  [[ "$started" -eq "$FAKE_SHARD_COUNT" ]] && break
+  [[ "$started" -ge "$FAKE_START_BARRIER" ]] && break
   sleep 0.02
 done
-[[ "$started" -eq "$FAKE_SHARD_COUNT" ]] || exit 91
+[[ "$started" -ge "$FAKE_START_BARRIER" ]] || exit 91
+if [[ "$FAKE_CHECK_FORKSERVER" == 1 ]]; then
+  python3 -c 'from multiprocessing import forkserver; forkserver.ensure_running()'
+fi
 mkdir -p -- "$(dirname -- "$junit")"
 printf '<testsuite tests="1" errors="0" failures="0" skipped="0" time="0.1"><testcase classname="tests.fake" name="%s" time="0.1"/></testsuite>\\n' "$name" >"$junit"
 echo "fake shard: $name"
+printf 'end %s\\n' "$name" >>"$FAKE_SYNC_ROOT/events"
 [[ "${FAKE_FAIL_SHARD:-}" != "$name" ]] || exit 7
 """,
         encoding="utf-8",
@@ -104,23 +111,30 @@ def _run_wrapper(
     run_root: Path,
     *,
     shard_count: int | str | None = None,
+    max_jobs: int | str | None = None,
+    check_forkserver: bool = False,
     fail_shard: str = "",
     socket_preflight_status: int = 0,
 ) -> subprocess.CompletedProcess[str]:
     environment = dict(os.environ)
     environment.pop("DEXTELEOP_FULL_ACCEPTANCE_SHARDS", None)
+    environment.pop("DEXTELEOP_FULL_ACCEPTANCE_MAX_JOBS", None)
+    effective_shards = 4 if shard_count is None else shard_count
     environment.update(
         {
             "DEXTELEOP_ASSET_ROOT": str(asset_root),
             "DEXTELEOP_FULL_ACCEPTANCE_RUN_ROOT": str(run_root),
             "FAKE_FAIL_SHARD": fail_shard,
-            "FAKE_SHARD_COUNT": str(4 if shard_count is None else shard_count),
+            "FAKE_START_BARRIER": str(effective_shards if max_jobs is None else max_jobs),
+            "FAKE_CHECK_FORKSERVER": "1" if check_forkserver else "0",
             "FAKE_SOCKET_PREFLIGHT_STATUS": str(socket_preflight_status),
             "FAKE_SYNC_ROOT": str(sync_root),
         }
     )
     if shard_count is not None:
         environment["DEXTELEOP_FULL_ACCEPTANCE_SHARDS"] = str(shard_count)
+    if max_jobs is not None:
+        environment["DEXTELEOP_FULL_ACCEPTANCE_MAX_JOBS"] = str(max_jobs)
     return subprocess.run(
         [str(wrapper), "--durations=3"],
         check=False,
@@ -140,7 +154,6 @@ def _assert_complete_run(
     ]
     assert len(planned) == len(set(planned)) == 9
     isolated_paths = {
-        "tmpdir": "tmp",
         "xdg-cache": "xdg-cache",
         "python-cache": "python-bytecode",
         "matplotlib-cache": "matplotlib-cache",
@@ -156,6 +169,16 @@ def _assert_complete_run(
             for index in range(shard_count)
         }
         assert observed == expected
+    temporary_paths = {
+        Path((sync_root / f"shard-{index}.tmpdir").read_text().strip())
+        for index in range(shard_count)
+    }
+    assert len(temporary_paths) == shard_count
+    assert len({path.parent for path in temporary_paths}) == 1
+    for path in temporary_paths:
+        assert str(path).startswith("/tmp/dt-full-tmp-")
+        assert len(os.fsencode(path)) <= 48
+        assert not path.parent.exists()
     assert {
         (sync_root / f"shard-{index}.mujoco-cache").read_text().strip()
         for index in range(shard_count)
@@ -169,6 +192,7 @@ def _assert_complete_run(
         assert f"--junitxml={run_root / f'shard-{index}.xml'}" in arguments
         assert (sync_root / f"shard-{index}.mujoco-gl").read_text().strip() == "egl"
         assert (sync_root / f"shard-{index}.umask").read_text().strip() == "0022"
+        assert (sync_root / f"shard-{index}.max-jobs").read_text().strip() == "unset"
     aggregate = ET.parse(run_root / "full-acceptance.xml").getroot()
     cases = aggregate.findall(".//testcase")
     assert aggregate.attrib["tests"] == str(shard_count)
@@ -190,6 +214,78 @@ def test_wrapper_defaults_to_four_complete_shards(
 
     assert completed.returncode == 0, completed.stderr
     _assert_complete_run(sync_root, run_root, shard_count=4)
+    assert not os.path.lexists(checkout / "assets")
+
+
+@pytest.mark.parametrize("shard_count,max_jobs", [(6, 1), (6, 2), (6, 3), (5, 2), (6, 5)])
+def test_wrapper_bounds_live_jobs_without_reducing_the_plan(
+    tmp_path: Path, shard_count: int, max_jobs: int,
+) -> None:
+    checkout, wrapper, sync_root = _wrapper_checkout(tmp_path)
+    assets = tmp_path / "assets"
+    assets.mkdir()
+    run_root = tmp_path / "bounded"
+
+    completed = _run_wrapper(
+        wrapper, sync_root, assets, run_root, shard_count=shard_count, max_jobs=max_jobs
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    _assert_complete_run(sync_root, run_root, shard_count=shard_count)
+    active: set[str] = set()
+    peak = 0
+    for line in (sync_root / "events").read_text().splitlines():
+        event, name = line.split()
+        if event == "start":
+            assert name not in active
+            active.add(name)
+            peak = max(peak, len(active))
+        else:
+            assert event == "end" and name in active
+            active.remove(name)
+    assert not active
+    assert peak == max_jobs
+    assert not os.path.lexists(checkout / "assets")
+
+
+@pytest.mark.parametrize("max_jobs", [0, 5, 7, "auto"])
+def test_wrapper_rejects_invalid_job_limits_before_artifacts(
+    tmp_path: Path, max_jobs: int | str,
+) -> None:
+    checkout, wrapper, sync_root = _wrapper_checkout(tmp_path)
+    assets = tmp_path / "assets"
+    assets.mkdir()
+    run_root = tmp_path / "invalid-jobs"
+
+    completed = _run_wrapper(wrapper, sync_root, assets, run_root, max_jobs=max_jobs)
+
+    assert completed.returncode == 2
+    assert "DEXTELEOP_FULL_ACCEPTANCE_MAX_JOBS" in completed.stderr
+    assert not run_root.exists()
+    assert not list(sync_root.glob("*.started"))
+    assert not os.path.lexists(checkout / "assets")
+
+
+def test_wrapper_keeps_forkserver_working_with_a_long_evidence_root(
+    tmp_path: Path, short_unix_socket_path_factory,
+) -> None:
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as probe:
+        try:
+            probe.bind(str(short_unix_socket_path_factory("full")))
+        except OSError as exc:
+            pytest.skip(f"AF_UNIX unavailable: {exc}")
+    checkout, wrapper, sync_root = _wrapper_checkout(tmp_path)
+    assets = tmp_path / "assets"
+    assets.mkdir()
+    run_root = tmp_path / ("evidence-" + "x" * 120)
+    assert len(os.fsencode(run_root)) > 107
+
+    completed = _run_wrapper(
+        wrapper, sync_root, assets, run_root, shard_count=2, check_forkserver=True
+    )
+
+    assert completed.returncode == 0, completed.stderr + completed.stdout
+    _assert_complete_run(sync_root, run_root, shard_count=2)
     assert not os.path.lexists(checkout / "assets")
 
 
@@ -282,8 +378,9 @@ def test_wrapper_rejects_missing_socket_capability_before_artifact_root(
     assert not os.path.lexists(checkout / "assets")
 
 
+@pytest.mark.parametrize("max_jobs", [None, 1, 2])
 def test_wrapper_propagates_failure_after_preserving_other_shards(
-    tmp_path: Path,
+    tmp_path: Path, max_jobs: int | None,
 ) -> None:
     checkout, wrapper, sync_root = _wrapper_checkout(tmp_path)
     assets = tmp_path / "assets"
@@ -296,13 +393,15 @@ def test_wrapper_propagates_failure_after_preserving_other_shards(
         assets,
         run_root,
         shard_count=6,
-        fail_shard="shard-5",
+        max_jobs=max_jobs,
+        fail_shard="shard-1",
     )
 
     assert completed.returncode == 1
-    assert "full acceptance shard 5 (status=7)" in completed.stdout
+    assert "full acceptance shard 1 (status=7)" in completed.stdout
     assert all((run_root / f"shard-{index}.xml").is_file() for index in range(6))
     assert (run_root / "full-acceptance.xml").is_file()
+    _assert_complete_run(sync_root, run_root, shard_count=6)
     assert not os.path.lexists(checkout / "assets")
 
 
