@@ -3160,15 +3160,16 @@ def test_cancelled_prepare_never_publishes_candidate(
 
 
 @pytest.mark.parametrize(
-    ("origin", "cleanup_failure"),
+    ("origin", "cleanup_failure", "cancel_reason"),
     [
-        ("new", None),
-        ("replacement", None),
-        ("reused", None),
-        ("new", "submit"),
-        ("replacement", "submit"),
-        ("new", "close"),
-        ("replacement", "close"),
+        ("new", None, "operator_hold"),
+        ("replacement", None, "operator_hold"),
+        ("reused", None, "operator_hold"),
+        ("new", "submit", "operator_hold"),
+        ("replacement", "submit", "operator_hold"),
+        ("new", "close", "operator_hold"),
+        ("replacement", "close", "operator_hold"),
+        pytest.param("new", None, "", id="empty_reason"),
     ],
 )
 def test_prepare_cancel_launch_failure_keeps_candidate_out_of_admission(
@@ -3176,6 +3177,7 @@ def test_prepare_cancel_launch_failure_keeps_candidate_out_of_admission(
     monkeypatch: pytest.MonkeyPatch,
     origin: str,
     cleanup_failure: str | None,
+    cancel_reason: str,
 ) -> None:
     release = threading.Event()
     instances: list[object] = []
@@ -3243,7 +3245,7 @@ def test_prepare_cancel_launch_failure_keeps_candidate_out_of_admission(
         assert slot[0] is None
         with monkeypatch.context() as failure_patch:
             failure_patch.setattr(control_plane_module.threading.Thread, "start", fail_start)
-            assert runtime.cancel_recording_countdown(time.time(), reason="operator_hold")
+            assert runtime.cancel_recording_countdown(time.time(), reason=cancel_reason)
             if cleanup_failure == "submit":
                 runtime.poll_dataset_finalize(time.time())
         if cleanup_failure != "submit":

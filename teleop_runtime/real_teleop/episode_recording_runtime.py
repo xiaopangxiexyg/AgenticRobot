@@ -70,6 +70,20 @@ class _PreparedDatasetRecorder:
     owned_candidate: bool
 
 
+@dataclass
+class _DatasetPreparation:
+    """One writer admission, including its irreversible retirement boundary."""
+
+    start_reason: str
+    previous_recorder: Any | None
+    cancel_reason: str | None = None
+    previous_retirement_started: bool = False
+
+    @property
+    def recoverable_recorder(self) -> Any | None:
+        return None if self.previous_retirement_started else self.previous_recorder
+
+
 @dataclass(frozen=True)
 class _DatasetSelectionTransaction:
     previous_recorder: Any | None
@@ -280,10 +294,7 @@ def build_episode_recording_runtime(
         name="real-teleop-collection-control"
     )
     runtime_closing = False
-    episode_prepare_reason = "manual_key_start"
-    episode_prepare_cancel_reason = ""
-    episode_prepare_previous: Any | None = None
-    episode_prepare_previous_retirement_started = False
+    dataset_preparation: _DatasetPreparation | None = None
     episode_open_recorder: Any | None = None
     episode_open_start_attempted = False
     episode_open_formal_started = False
@@ -1311,10 +1322,7 @@ def build_episode_recording_runtime(
         return "pending"
 
     def schedule_recording_countdown(now: float, *, start_reason: str) -> bool:
-        nonlocal episode_prepare_reason
-        nonlocal episode_prepare_cancel_reason, episode_start_failure_message
-        nonlocal episode_prepare_previous
-        nonlocal episode_prepare_previous_retirement_started, dataset_recorder
+        nonlocal dataset_preparation, episode_start_failure_message, dataset_recorder
         refresh_runtime_views()
         if recording_active():
             return False
@@ -1380,9 +1388,12 @@ def build_episode_recording_runtime(
             ignored_camera_keys=tuple(getattr(args, "ignore_camera", ()) or ()),
             ignored_tactile_keys=tuple(getattr(args, "ignore_tactile", ()) or ()),
         )
+        transaction = _DatasetPreparation(
+            start_reason=str(start_reason),
+            previous_recorder=existing_recorder,
+        )
 
         def prepare_writer() -> _PreparedDatasetRecorder:
-            nonlocal episode_prepare_previous_retirement_started
             try:
                 prepare_dataset_transition("formal_episode_start")
                 bind_capture_modality_contract(dataset_root, modality_contract)
@@ -1401,7 +1412,7 @@ def build_episode_recording_runtime(
                     # close() may partially release a one-shot process even when
                     # it raises.  The control thread must not republish it on a
                     # failed completion.
-                    episode_prepare_previous_retirement_started = True
+                    transaction.previous_retirement_started = True
                     try:
                         existing_recorder.close()
                     except BaseException:
@@ -1415,21 +1426,15 @@ def build_episode_recording_runtime(
                     owned_candidate=True,
                 )
             except BaseException:
-                if (
-                    runtime_closing
-                    and existing_recorder is not None
-                    and not episode_prepare_previous_retirement_started
-                ):
+                previous = transaction.recoverable_recorder
+                if runtime_closing and previous is not None:
                     try:
-                        existing_recorder.close()
+                        previous.close()
                     except BaseException:
                         pass
                 raise
 
-        episode_prepare_reason = str(start_reason)
-        episode_prepare_cancel_reason = ""
-        episode_prepare_previous = existing_recorder
-        episode_prepare_previous_retirement_started = False
+        dataset_preparation = transaction
         episode_start_failure_message = None
         try:
             prepare_generation = collection_control_plane.submit(
@@ -1438,9 +1443,11 @@ def build_episode_recording_runtime(
                 discard_value=discard_prepared_dataset_recorder,
             )
         except CollectionControlOperationBusy as exc:
+            dataset_preparation = None
             _log("Dataset", str(exc), now=now)
             return False
         except Exception as exc:  # noqa: BLE001 - existing recorder remains published.
+            dataset_preparation = None
             message = (
                 "正式 dataset writer 后台预备任务未能启动；"
                 "未转移现有 writer 所有权，可重试："
@@ -1491,12 +1498,13 @@ def build_episode_recording_runtime(
     def cancel_recording_countdown(now: float, *, reason: str) -> bool:
         nonlocal episode_start_countdown_deadline, episode_start_warmup_ready_since
         nonlocal episode_start_warmup_last_message
-        nonlocal episode_prepare_cancel_reason
         nonlocal episode_open_cancel_reason
         refresh_runtime_views()
         prepare_generation = transition_generation("prepare_writer")
         if prepare_generation is not None:
-            episode_prepare_cancel_reason = str(reason)
+            if dataset_preparation is None:
+                raise RuntimeError("writer preparation has no owning transaction")
+            dataset_preparation.cancel_reason = str(reason)
             collection_control_plane.cancel(prepare_generation)
             episode_start_warmup_ready_since = None
             episode_start_warmup_last_message = None
@@ -2303,12 +2311,12 @@ def build_episode_recording_runtime(
         *,
         now: float,
     ) -> None:
-        nonlocal dataset_recorder
-        nonlocal episode_prepare_cancel_reason, episode_start_failure_message
-        nonlocal episode_prepare_previous
-        nonlocal episode_prepare_previous_retirement_started
+        nonlocal dataset_recorder, dataset_preparation, episode_start_failure_message
+        transaction = dataset_preparation
+        if transaction is None:
+            raise RuntimeError("writer preparation completion has no owning transaction")
         if (
-            episode_prepare_cancel_reason
+            transaction.cancel_reason is not None
             and result.succeeded
             and isinstance(result.value, _PreparedDatasetRecorder)
         ):
@@ -2326,7 +2334,9 @@ def build_episode_recording_runtime(
                             cancelled_result, now=time.time(),
                         ),
                     )
-                except Exception as exc:  # ownership is retained for retry
+                except CollectionControlOperationBusy:
+                    raise
+                except RuntimeError as exc:  # worker launch failed; ownership is retained
                     _log(
                         "Dataset",
                         "cancelled writer preparation retirement is retained "
@@ -2335,19 +2345,13 @@ def build_episode_recording_runtime(
                     )
                 return
             result = cancelled_result
-        previous_recorder = episode_prepare_previous
-        previous_recoverable = bool(
-            previous_recorder is not None
-            and not episode_prepare_previous_retirement_started
-        )
-        episode_prepare_previous = None
-        episode_prepare_previous_retirement_started = False
+        previous_recorder = transaction.recoverable_recorder
+        dataset_preparation = None
         if result.cancelled:
-            if previous_recoverable:
+            if previous_recorder is not None:
                 dataset_recorder = previous_recorder
                 set_dataset_recorder(previous_recorder)
-            reason = episode_prepare_cancel_reason or "operator_cancelled"
-            episode_prepare_cancel_reason = ""
+            reason = transaction.cancel_reason or "operator_cancelled"
             message = f"数采 writer 预备已取消：{reason}。"
             _log("Dataset", message, now=now)
             publish_control_ui_message(
@@ -2371,7 +2375,7 @@ def build_episode_recording_runtime(
             failure = result.error or result.discard_error or RuntimeError(
                 "writer preparation returned an invalid completion"
             )
-            if previous_recoverable:
+            if previous_recorder is not None:
                 dataset_recorder = previous_recorder
                 set_dataset_recorder(previous_recorder)
             detail = f"{type(failure).__name__}: {failure}"
@@ -2415,7 +2419,7 @@ def build_episode_recording_runtime(
             f"generation={result.generation}",
             now=now,
         )
-        begin_recording_countdown(time.time(), start_reason=episode_prepare_reason)
+        begin_recording_countdown(time.time(), start_reason=transaction.start_reason)
 
     def publish_dataset_selection_completion(
         result: CollectionControlOperationResult,
