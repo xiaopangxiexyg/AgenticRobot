@@ -111,3 +111,37 @@ def test_validate_dataset_media_limits_checks_to_selected_episodes(
     assert selected.checked_video_count == 1
     assert not all_episodes.ok
     assert all_episodes.issues[0].episode_index == 1
+
+
+@pytest.mark.parametrize("camera_keys", [None, ("left_wrist",)])
+@pytest.mark.parametrize("metadata", [{}, {"frame_count": None}, {"frame_count": "broken"}, {"frame_count": 4}])
+def test_selected_media_ignores_unselected_frame_metadata_and_camera_roles(
+    tmp_path: Path, camera_keys, metadata,
+) -> None:
+    _write_episode(tmp_path, declared=4, actual=4)
+    with (tmp_path / "meta/episodes.jsonl").open("a", encoding="utf-8") as stream:
+        stream.write(json.dumps({
+            "episode_index": 1,
+            "video_paths": {"unselected_camera": "videos/not-required.mp4"},
+            **metadata,
+        }) + chr(10))
+    selected = validate_dataset_media(tmp_path, camera_keys=camera_keys, episode_indices=(0,))
+    assert selected.ok
+    assert selected.checked_video_count == 1
+    assert selected.camera_keys == ("left_wrist",)
+    all_episodes = validate_dataset_media(tmp_path, camera_keys=camera_keys)
+    assert not all_episodes.ok
+    if metadata.get("frame_count") != 4:
+        assert any(issue.reason == "invalid_episode_or_frame_count" for issue in all_episodes.issues)
+
+
+@pytest.mark.parametrize("episode_index", [None, "broken"])
+def test_selected_media_keeps_unidentifiable_episode_metadata_fail_closed(
+    tmp_path: Path, episode_index,
+) -> None:
+    _write_episode(tmp_path, declared=4, actual=4)
+    with (tmp_path / "meta/episodes.jsonl").open("a", encoding="utf-8") as stream:
+        stream.write(json.dumps({"episode_index": episode_index, "frame_count": 4}) + chr(10))
+    report = validate_dataset_media(tmp_path, camera_keys=("left_wrist",), episode_indices=(0,))
+    assert not report.ok
+    assert any(issue.reason == "invalid_episode_or_frame_count" for issue in report.issues)

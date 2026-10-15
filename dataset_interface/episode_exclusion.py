@@ -34,9 +34,10 @@ def read_episode_exclusions(dataset_root: str | Path) -> dict[int, bool]:
                     or type(index) is not int
                     or index < 0
                     or type(record["excluded"]) is not bool
-                    or record["episode_manifest_hash"]
-                    != source_episode_manifest_hash(root, index)
                 ):
+                    raise ValueError("invalid or stale episode decision")
+                current_hash = source_episode_manifest_hash(root, index)
+                if current_hash is None or record["episode_manifest_hash"] != current_hash:
                     raise ValueError("invalid or stale episode decision")
             except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
                 raise ValueError(f"Invalid episode exclusion {path}:{number}: {exc}") from exc

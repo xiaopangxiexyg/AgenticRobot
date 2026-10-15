@@ -106,6 +106,19 @@ def validate_dataset_media(
         if episode_indices is None
         else frozenset(int(index) for index in episode_indices)
     )
+    if selected_episode_indices is not None:
+        selected_records = []
+        for record in records:
+            try:
+                episode_index = int(record["episode_index"])
+            except (KeyError, TypeError, ValueError):
+                # Its identity cannot be scoped out safely; retain the row so
+                # the existing metadata diagnostic still fails closed.
+                selected_records.append(record)
+            else:
+                if episode_index in selected_episode_indices:
+                    selected_records.append(record)
+        records = selected_records
     selected_cameras = _camera_keys(records, camera_keys)
     report = DatasetMediaIntegrityReport(
         dataset_root=str(root),
@@ -135,11 +148,6 @@ def validate_dataset_media(
                 )
             ):
                 break
-            continue
-        if (
-            selected_episode_indices is not None
-            and episode_index not in selected_episode_indices
-        ):
             continue
         paths = record.get("video_paths")
         if not isinstance(paths, Mapping):
