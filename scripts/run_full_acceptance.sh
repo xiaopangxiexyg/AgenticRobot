@@ -10,6 +10,7 @@ set -euo pipefail
 # models are compiled once without creating cross-Run state.
 # DEXTELEOP_FULL_ACCEPTANCE_RUN_ROOT may name a new absolute artifact directory.
 # DEXTELEOP_FULL_ACCEPTANCE_JUNIT may name the final aggregate JUnit report.
+# DEXTELEOP_FULL_ACCEPTANCE_MAX_JOBS limits live shards, not planned targets.
 
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 umask 022
@@ -37,6 +38,8 @@ ASSET_LINK="$REPO_ROOT/assets"
 ASSET_ROOT=""
 ASSET_LINK_CREATED=0
 SHARD_COUNT=""
+MAX_JOBS=""
+SHORT_TMP_ROOT=""
 SHARD_PIDS=()
 SHARD_STATUSES=()
 SHARD_LOGS=()
@@ -103,6 +106,13 @@ configure_shards() {
     1|2|3|4|5|6) ;;
     *) die "DEXTELEOP_FULL_ACCEPTANCE_SHARDS must be an integer from 1 to 6: $SHARD_COUNT" ;;
   esac
+  MAX_JOBS="${DEXTELEOP_FULL_ACCEPTANCE_MAX_JOBS:-$SHARD_COUNT}"
+  case "$MAX_JOBS" in
+    1|2|3|4|5|6) ;;
+    *) die "DEXTELEOP_FULL_ACCEPTANCE_MAX_JOBS must be an integer from 1 to SHARD_COUNT ($SHARD_COUNT): $MAX_JOBS" ;;
+  esac
+  ((MAX_JOBS <= SHARD_COUNT)) || die \
+    "DEXTELEOP_FULL_ACCEPTANCE_MAX_JOBS must not exceed SHARD_COUNT ($SHARD_COUNT): $MAX_JOBS"
 }
 
 verify_local_socket_capabilities() {
@@ -121,6 +131,8 @@ verify_required_model_input() {
 
 prepare_shards() {
   local index
+  # multiprocessing's forkserver uses TMPDIR, not pytest's short basetemp.
+  SHORT_TMP_ROOT="$(mktemp -d "/tmp/dt-full-tmp-${UID:-user}-XXXXXX")"
   mkdir -- "$RUN_ROOT/mujoco-cache"
   python3 "$REPO_ROOT/scripts/pytest_sharding.py" plan \
     --repository "$REPO_ROOT" \
@@ -144,9 +156,21 @@ stop_children() {
 cleanup() {
   local status=$?
   local current_root
+  local retain_tmp=0
   trap - EXIT INT TERM
   if ((${#SHARD_PIDS[@]} > 0)); then
+    retain_tmp=1
     stop_children
+  fi
+  if [[ -n "$SHORT_TMP_ROOT" ]]; then
+    if ((retain_tmp || status == 130 || status == 143)); then
+      echo "[dexteleop-full-acceptance] interrupted temporary state retained: $SHORT_TMP_ROOT"
+    else
+      case "$SHORT_TMP_ROOT" in
+        /tmp/dt-full-tmp-*) rm -rf -- "$SHORT_TMP_ROOT" || status=1 ;;
+        *) echo "[dexteleop-full-acceptance] ERROR: unexpected temporary root: $SHORT_TMP_ROOT" >&2; status=1 ;;
+      esac
+    fi
   fi
   if ((ASSET_LINK_CREATED)); then
     if [[ -L "$ASSET_LINK" ]]; then
@@ -170,6 +194,7 @@ on_signal() {
   stop_children
   local pid
   for pid in "${SHARD_PIDS[@]}"; do
+    [[ -n "$pid" ]] || continue
     wait "$pid" 2>/dev/null || true
   done
   SHARD_PIDS=()
@@ -180,7 +205,7 @@ run_shard() {
   local index="$1"
   shift
   local name="shard-${index}"
-  local shard_tmp="$RUN_ROOT/${name}-tmp"
+  local shard_tmp="$SHORT_TMP_ROOT/$name"
   local -a shard_paths=()
   mkdir -- "$shard_tmp" "$RUN_ROOT/${name}-xdg-cache" "$RUN_ROOT/${name}-matplotlib-cache" \
     "$RUN_ROOT/${name}-numba-cache"
@@ -203,6 +228,21 @@ run_shard() {
     >"${SHARD_LOGS[index]}" 2>&1
 }
 
+wait_shard() {
+  local index="$1"
+  local shard_status=0
+  if wait "${SHARD_PIDS[index]}"; then
+    shard_status=0
+  else
+    shard_status=$?
+  fi
+  SHARD_STATUSES[index]=$shard_status
+  # Never signal a completed child's PID after it could have been reused.
+  SHARD_PIDS[index]=""
+  ((shard_status == 0)) || OVERALL_STATUS=1
+  return 0
+}
+
 trap cleanup EXIT
 configure_shards
 verify_required_model_input
@@ -214,24 +254,23 @@ prepare_asset_compat_link
 unset DEXTELEOP_FULL_ACCEPTANCE_RUN_ROOT
 unset DEXTELEOP_FULL_ACCEPTANCE_JUNIT
 unset DEXTELEOP_FULL_ACCEPTANCE_SHARDS
+unset DEXTELEOP_FULL_ACCEPTANCE_MAX_JOBS
 prepare_shards
 trap on_signal INT TERM
 
+OVERALL_STATUS=0
 for ((index = 0; index < SHARD_COUNT; index++)); do
+  if ((index >= MAX_JOBS)); then
+    wait_shard "$((index - MAX_JOBS))"
+  fi
   run_shard "$index" "$@" &
   SHARD_PIDS[index]=$!
 done
 
-set +e
-OVERALL_STATUS=0
-for ((index = 0; index < SHARD_COUNT; index++)); do
-  wait "${SHARD_PIDS[index]}"
-  shard_status=$?
-  SHARD_STATUSES[index]=$shard_status
-  ((shard_status == 0)) || OVERALL_STATUS=1
+for ((index = SHARD_COUNT - MAX_JOBS; index < SHARD_COUNT; index++)); do
+  wait_shard "$index"
 done
 SHARD_PIDS=()
-set -e
 
 for ((index = 0; index < SHARD_COUNT; index++)); do
   echo "===== full acceptance shard $index (status=${SHARD_STATUSES[index]}) ====="

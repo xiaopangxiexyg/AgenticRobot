@@ -266,7 +266,7 @@ locking, atomic publication, and hash validation, and it is never reused across
 Run roots. The wrapper waits for every child, rejects duplicate JUnit
 identities, and writes `full-acceptance.xml` plus `shard-plan.json` under a new
 artifact root. Set
-`DEXTELEOP_FULL_ACCEPTANCE_SHARDS=1` for serial reproduction. Explicit five-
+`DEXTELEOP_FULL_ACCEPTANCE_SHARDS=1` for single-process reproduction. Explicit five-
 and six-shard runs are supported only on hosts whose CPU and memory headroom
 has been validated; values above six remain outside the measured concurrency
 and memory budget. Keep the deterministic default instead of deriving this
@@ -275,6 +275,28 @@ may set new absolute `DEXTELEOP_FULL_ACCEPTANCE_RUN_ROOT` and
 `DEXTELEOP_FULL_ACCEPTANCE_JUNIT` paths so the aggregate evidence remains in
 the protected Run directory. Explicit test targets are rejected because this
 entrypoint represents complete-suite acceptance.
+
+在内存受限的主机上，可以把分片数量与同时运行的进程数分开配置：
+
+```bash
+DEXTELEOP_FULL_ACCEPTANCE_SHARDS=6 \
+DEXTELEOP_FULL_ACCEPTANCE_MAX_JOBS=1 \
+bash scripts/run_full_acceptance.sh --durations=50
+```
+
+`MAX_JOBS` 必须介于 1 与 `SHARDS` 之间；未设置时仍同时启动全部分片，默认四分片行为不变。
+上例保持六分片的完整目标集合、参数矩阵和隔离边界，逐个运行 pytest 进程，避免一个长期驻留
+进程积累所有模块的原生内存。失败分片不会取消后续待运行分片，最终仍合并全部 JUnit 并返回失败。
+这是并发上限，不是内存硬限额；进程还可能创建子进程，调用方仍需独立的资源预算和停止条件。
+中断沿用直接子进程信号机制，不能据此断言 pytest 的全部后代已退出；需要可靠整组停止时，
+由调用方使用 cgroup 或等价的进程树生命周期管理并验证退出状态。
+较低并发通常增加墙钟时间，不能把它作为速度提升的证据。
+
+每个分片的 `TMPDIR` 位于本次运行独有的 `/tmp/dt-full-tmp-*/shard-*` 短路径，而不是证据目录。
+Python multiprocessing/forkserver 使用 `TMPDIR` 创建 Unix socket，不读取 pytest 的 `--basetemp`；
+因此即使证据根目录很长，也必须同时保持这两类临时路径短且独立。正常完成（包括测试失败）后
+清理临时根；中断时保留并报告路径。日志、JUnit 和各类缓存仍保存在原证据目录，生产端的路径
+校验不变。
 
 ## Marker semantics
 
