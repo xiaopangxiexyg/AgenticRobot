@@ -463,6 +463,42 @@ owner 已复制的只读 qpos，不能当作完整计划、当前准入结论或
 `planning_timing.local_chain_reuse_count` 和 `local_chain_revalidation_wall_duration_sec` 区分
 命中次数及重新检查耗时。冻结输入的缓存命中收益不代表真实设备上一定命中。
 
+#### 线缆掩码诊断（离线，不改变碰撞场景）
+
+`deployments.perception.cable_diagnostics` 提供纯数组诊断，不启动模型或设备，也不接入生产删点：
+
+- `separate_thin_cable_mask` 用掩码内有效深度中位数和记录的 `fx`，将候选最大直径换算成
+  形态学 opening/top-hat 的像素尺度，分离细线与粗大壳体。默认 25 mm 是可调整的诊断先验，
+  **不是**线缆直径测量；跨深度、遮挡或错误掩码仍可能使结果不可靠，不能固定套用 9 px。
+  细手指、壳体边缘或其他同色窄结构也可能被保留，不能只凭宽度认定它是线缆。
+- `cable_prompt_from_geometry` 只为深度支持的连通细线生成正提示。负提示需要同帧刚性机器人
+  表面的三维距离支持，并避开受保护目标；不能用二维轮廓或未知开度的手指扫掠并集充当负提示
+  依据。接口不判定线缆归属，也不保证所选细线是某臂唯一的线缆。
+- `cable_depth_evidence` 在局部 ROI 内精确检查有界圆形邻域，将边缘分为深度连续、深度无法解释、
+  缺失深度，并单独报告原掩码与目标的重叠。它不做补洞、深度平滑或掩码膨胀删除；连续也不等于
+  已确认的自体，未知或不一致边缘不能被解释为自由空间。
+
+保存帧可以用下面的独立诊断探针检查（所有输入必须属于同一保存帧，输出目录须不存在）：
+
+```bash
+python -m scripts.probes.inspect_grasp_cable \
+  --snapshot /path/to/input/point_grasp_rgbd_snapshot.npz \
+  --mask-npz /path/to/cable_masks.npz \
+  --mask-key black_cable \
+  --output /path/to/new-cable-diagnostic
+```
+
+输出为 `report.json`、`diagnostic_masks.npz` 和带颜色说明的 `overlay.png`。如果输入没有 RGB，
+须用 `--rgb` 提供同帧图像；如果没有内参 metadata，须用 `--fx` 显式提供记录值，不猜测。
+可选 `--robot-distances` 接收同帧米制浮点数组 `attachment_distance_m` 和
+`rigid_surface_distance_m`（未支持位置为 `+inf`），只增加提示建议，不创建机器人几何或执行入口。
+没有原始目标掩码时报告 `target_protection_available=false`，不能把该诊断当成受保护抓姿输入。
+
+SAM3 的模型接口支持正负提示；当前单点 HTTP 服务契约没有负点字段，离线模型实验不能被表述
+为服务已经支持多点。线缆识别、深度异常判别与随臂线缆碰撞包络是三个独立问题；识别出线缆
+不授权将它从路径检查中删除。生产路径仍保留原有自体过滤、可见场景及稀疏 proxy 保护。
+自动负提示也不默认视为正确：它可能截断靠近机器人表面的真实线缆，应单独比较提示前后结果。
+
 ### 可选端点可达性注释（v3，或 v4 的同名选项）
 
 未启用冻结观测时，该组合还可额外传入 `--enable-point-grasp-arm-reachability`，此时注册显式升级的
