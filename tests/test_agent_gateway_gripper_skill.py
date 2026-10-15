@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from types import SimpleNamespace
 
 import pytest
 
@@ -11,7 +12,7 @@ from agent_gateway.profiles.real.gripper_skill import (
     RealDmtacGripperControlPort,
     build_real_dmtac_gripper_skill_contract_bundle,
 )
-from agent_gateway.protocol.contracts import AgentSkillRequest
+from agent_gateway.protocol.contracts import AgentSkillOperation, AgentSkillRequest
 from agent_gateway.skills.gripper.definition import (
     SET_GRIPPER_STATE_RESULT_SCHEMA_V1,
     validate_set_gripper_state_result_for_parameters_v1,
@@ -25,6 +26,7 @@ from agent_gateway.skills.gripper.runtime import (
     GripperConvergenceProfile,
     GripperHoldReceipt,
     GripperReadiness,
+    GripperSkillLifecycle,
     GripperStateSample,
     assemble_gripper_agent_gateway_session,
 )
@@ -44,7 +46,9 @@ class FakeGripperPort:
     def readiness(self) -> GripperReadiness:
         return GripperReadiness(True, "fake:ready", ("fake-ready-receipt",))
 
-    def command_close(self, target_close: float) -> GripperCommandReceipt:
+    def command_close(self, target_close: float, *, cancel_requested=None) -> GripperCommandReceipt:
+        if cancel_requested is not None and cancel_requested():
+            return GripperCommandReceipt(False, "fake:preempted", ("fake-preempted",))
         self.commanded.append(target_close)
         return GripperCommandReceipt(
             True,
@@ -216,6 +220,32 @@ def test_gateway_executes_closed_contact_settle_and_reuses_executor() -> None:
     assert len(port.holds) == 2
 
 
+def test_wire_adapter_observation_uses_receiver_admission_outcome() -> None:
+    port = FakeGripperPort([(0.2, False), (0.3, False)])
+    bundle = _sim_bundle(port)
+    session = assemble_gripper_agent_gateway_session(
+        contract_bundle=bundle,
+        port=port,
+        allowed_client_ids=("client:test",),
+        current_station_revision=lambda: 3,
+        clock_domain_id="clock:test",
+    )
+    adapter = session.wire_adapter(authenticated_client_id="client:test")
+
+    wire_snapshot = adapter.get_observation_snapshot()
+
+    admitted_snapshot = session.service.get_observation()
+    assert admitted_snapshot is not None
+    assert wire_snapshot == admitted_snapshot.to_wire()
+
+    session.close()
+    with pytest.raises(
+        RuntimeError,
+        match="Gateway observation publication failed: agent_gateway_service_closed",
+    ):
+        adapter.get_observation_snapshot()
+
+
 def test_open_result_cannot_claim_contact_settle() -> None:
     result = {
         "schema_version": SET_GRIPPER_STATE_RESULT_SCHEMA_V1,
@@ -264,7 +294,7 @@ class _FakeDmtacBackend:
         return True
 
     def read_gripper_state_now(self):
-        return {}
+        return {"timestamp": time.time()}
 
     def get_state(self, **_kwargs):
         close, moving = self.samples.pop(0) if self.samples else (0.98, False)
@@ -418,3 +448,438 @@ def test_dmtac_backend_hold_uses_stop_without_reconnect() -> None:
     assert backend.hold_gripper_motion("test hold") is True
     assert backend.device.stop_count == 1
     assert backend._last_send_status == "gripper_hold"
+
+
+def test_real_gripper_hold_waits_for_delayed_fresh_stopped_feedback():
+    backend = _FakeDmtacBackend()
+    backend.samples = [(0.98, True), (0.99, True), (1.0, False)]
+
+    def stop(reason):
+        backend.holds.append(reason)
+        return True
+
+    backend.hold_gripper_motion = stop
+    port = RealDmtacGripperControlPort(backend=backend, hold_confirmation_timeout_sec=0.2)
+    receipt = port.hold(reason="delayed stop")
+    assert receipt.succeeded
+    assert backend.holds == ["delayed stop"]
+    assert len(receipt.evidence_refs) == 4
+    assert backend.commands == []
+
+
+
+@pytest.mark.parametrize("moving,error_code", [(None, 0), (False, 16)])
+def test_real_gripper_hold_does_not_wait_through_unknown_state_or_hardware_fault(moving, error_code, caplog):
+    backend = _FakeDmtacBackend()
+    reads = []
+    backend.get_state = lambda **kwargs: reads.append(1) or {
+        "gripper_measured_scalar": 0.98,
+        "gripper_error_code": error_code,
+        "gripper_is_moving": moving,
+    }
+    port = RealDmtacGripperControlPort(backend=backend)
+    assert not port.hold(reason="invalid feedback").succeeded
+    assert reads == [1]
+    assert "HOLD not confirmed" in caplog.text
+
+
+
+def test_real_gripper_hold_without_stop_ack_does_not_claim_or_query_stopped_state(caplog):
+    backend = _FakeDmtacBackend()
+    backend.hold_gripper_motion = lambda reason: False
+    backend.read_gripper_state_now = lambda: pytest.fail("No stop ACK")
+    port = RealDmtacGripperControlPort(backend=backend)
+    assert not port.hold(reason="no ack").succeeded
+    assert "stop_ack=False" in caplog.text
+
+
+
+def test_real_skill_waits_for_busy_native_backend_without_changing_stream_policy():
+    from teleop_runtime.backends.grippers.dmtac import (
+        DMTacGripperBackend,
+        DMTacGripperBackendConfig,
+    )
+
+    class Device:
+        gripper = object()
+        tactile = None
+
+        def __init__(self):
+            self.moves = []
+
+        def move(self, value, **kwargs):
+            self.moves.append(value)
+
+    backend = DMTacGripperBackend(DMTacGripperBackendConfig(
+        side="right", connect_hardware=True, connect_tactile=False, enable_telemetry=False,
+    ))
+    backend.device = device = Device()
+    port = RealDmtacGripperControlPort(backend=backend, command_submission_timeout_sec=0.2)
+    entered = threading.Event()
+    native_send = backend.send_fixed_joint_pos
+
+    def send(value):
+        sent = native_send(value)
+        entered.set()
+        return sent
+
+    backend.send_fixed_joint_pos = send
+    backend._lock.acquire()
+    receipts = []
+    thread = threading.Thread(target=lambda: receipts.append(port.command_close(1.0)))
+    thread.start()
+    try:
+        assert entered.wait(timeout=1)
+        assert thread.is_alive()
+        assert device.moves == []
+    finally:
+        backend._lock.release()
+        thread.join(timeout=1)
+    assert not thread.is_alive()
+    assert len(receipts) == 1 and receipts[0].accepted
+    assert device.moves == [1.0]
+
+
+
+@pytest.mark.parametrize("status", ["send_exception", "hardware_fault", "not_connected", "io_busy"])
+def test_real_skill_preserves_send_failure_before_hold_overwrites_it(status, caplog):
+    backend = _FakeDmtacBackend()
+    sends = []
+    diagnostic = {
+        "gripper_last_send_status": status,
+        "gripper_last_send_skip_reason": "original send failure",
+        "gripper_measured_scalar": 0.0,
+        "gripper_error_code": 0,
+        "gripper_is_moving": False,
+    }
+    backend.get_state = lambda **kwargs: dict(diagnostic)
+    backend.send_fixed_joint_pos = lambda value: sends.append(value) or False
+
+    def hold(reason):
+        diagnostic["gripper_last_send_status"] = "gripper_hold"
+        diagnostic["gripper_last_send_skip_reason"] = reason
+        return True
+
+    backend.hold_gripper_motion = hold
+    port = RealDmtacGripperControlPort(backend=backend, command_submission_timeout_sec=0.02)
+    command = port.command_close(1.0)
+    assert not command.accepted
+    assert port.hold(reason="cleanup").succeeded
+    assert status in caplog.text and "original send failure" in caplog.text
+    assert command.evidence_refs[0] in caplog.text
+    if status != "io_busy":
+        assert sends == [1.0]
+    else:
+        assert 1 <= len(sends) <= 5
+
+
+
+def test_cancelled_real_command_never_calls_backend():
+    backend = _FakeDmtacBackend()
+    port = RealDmtacGripperControlPort(backend=backend)
+    assert not port.command_close(1.0, cancel_requested=lambda: True).accepted
+    assert backend.commands == []
+
+
+
+def test_diagnostic_read_failure_does_not_retry_or_prevent_hold(caplog):
+    backend = _FakeDmtacBackend()
+    attempts = []
+    original_get_state = backend.get_state
+    backend.send_fixed_joint_pos = lambda target: attempts.append(target) or False
+    backend.get_state = lambda **kwargs: (_ for _ in ()).throw(RuntimeError("diagnostic unavailable"))
+    port = RealDmtacGripperControlPort(backend=backend)
+    assert not port.command_close(1.0).accepted
+    assert attempts == [1.0]
+    assert "diagnostic unavailable" in caplog.text
+    backend.get_state = original_get_state
+    assert port.hold(reason="cleanup").succeeded
+
+
+
+@pytest.mark.parametrize("name", ["command_submission_timeout_sec", "hold_confirmation_timeout_sec"])
+@pytest.mark.parametrize("value", [0, -1, float("inf"), float("nan")])
+def test_real_gripper_wait_budgets_must_be_finite_positive(name, value):
+    with pytest.raises(ValueError, match=name):
+        RealDmtacGripperControlPort(backend=_FakeDmtacBackend(), **{name: value})
+
+
+
+@pytest.mark.parametrize("moving", [True, None])
+def test_at_target_without_stopped_feedback_times_out_instead_of_completing(moving):
+    from dataclasses import replace
+
+    port = FakeGripperPort([(0.5, False)])
+    port.poll_state = lambda: GripperStateSample(
+        measured_close=1.0, moving=moving, fault_code=None,
+        observed_at=time.monotonic(), evidence_ref="sample:still-moving",
+    )
+    bundle = _sim_bundle(port)
+    session = assemble_gripper_agent_gateway_session(
+        contract_bundle=bundle, port=port, allowed_client_ids=("client:test",),
+        current_station_revision=lambda: 3, clock_domain_id="clock:test",
+    )
+    try:
+        snapshot = session.publish_observation()
+        request = replace(_request(bundle, snapshot, target_state="closed"), requested_timeout_ms=50)
+        submitted = session.service.submit_request(request=request, current_station_revision=3)
+        assert submitted.accepted
+        assert session.service.launch_operation(submitted.operation.operation_id).accepted
+        assert session.executor.wait(timeout_sec=1)
+        operation = session.service.get_operation(submitted.operation.operation_id)
+        assert operation.execution_outcome != "completed"
+        assert operation.execution_result is None
+        assert port.commanded == [1.0]
+        assert len(port.holds) == 1
+    finally:
+        assert session.close().accepted
+
+
+
+@pytest.mark.parametrize("target_state", ["open", "closed"])
+def test_endpoint_position_does_not_complete_until_motion_stops(target_state):
+    target = 0.0 if target_state == "open" else 1.0
+    port = FakeGripperPort([(0.5, False), *[(target, True)] * 3, *[(target, False)] * 3])
+    bundle = _sim_bundle(port)
+    session = assemble_gripper_agent_gateway_session(
+        contract_bundle=bundle, port=port, allowed_client_ids=("client:test",),
+        current_station_revision=lambda: 3, clock_domain_id="clock:test",
+        convergence=GripperConvergenceProfile(poll_interval_sec=0),
+    )
+    try:
+        snapshot = session.publish_observation()
+        submitted = session.service.submit_request(
+            request=_request(bundle, snapshot, target_state=target_state),
+            current_station_revision=3,
+        )
+        assert submitted.accepted
+        assert session.service.launch_operation(submitted.operation.operation_id).accepted
+        assert session.executor.wait(timeout_sec=1)
+        operation = session.service.get_operation(submitted.operation.operation_id)
+        assert operation.execution_outcome == "completed"
+        assert port.sequence == 7
+        assert len(port.holds) == 1
+    finally:
+        assert session.close().accepted
+
+
+class _GripperTestClock:
+    def __init__(self):
+        self.now = 100.0
+
+    def __call__(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.now += seconds
+
+    def wall(self):
+        return 1_000.0 + self.now
+
+
+@pytest.fixture
+def controlled_real_gripper(monkeypatch):
+    from agent_gateway.profiles.real import gripper_skill as owner
+
+    clock = _GripperTestClock()
+    # Replace only this adapter's time port, leaving service/thread clocks intact.
+    monkeypatch.setattr(owner, "time", SimpleNamespace(
+        monotonic=clock, time=clock.wall, sleep=clock.sleep))
+    backend = _FakeDmtacBackend()
+    backend.read_gripper_state_now = lambda: {"timestamp": clock.wall()}
+    port = RealDmtacGripperControlPort(
+        backend=backend, clock=clock,
+        command_submission_timeout_sec=0.02, hold_confirmation_timeout_sec=0.05)
+    return backend, port, clock
+
+
+def test_real_hold_cannot_confirm_an_earlier_measurement(controlled_real_gripper):
+    backend, port, clock = controlled_real_gripper
+    backend.samples = [(0.98, False)]
+    backend.read_gripper_state_now = lambda: {"timestamp": clock.wall() - 0.01}
+    assert not port.hold(reason="stop needs newer feedback").succeeded
+    assert len(backend.holds) == 1 and backend.commands == []
+
+
+@pytest.mark.parametrize("phase", ("stop", "read"))
+def test_real_hold_rejects_late_stop_or_stopped_feedback(controlled_real_gripper, phase):
+    backend, port, clock = controlled_real_gripper
+    backend.samples = [(0.98, False)]
+    native_stop = backend.hold_gripper_motion
+    reads = []
+
+    def stop(reason):
+        result = native_stop(reason)
+        if phase == "stop":
+            clock.sleep(0.051)
+        return result
+
+    def read():
+        reads.append(1)
+        if phase == "read":
+            clock.sleep(0.051)
+        return {"timestamp": clock.wall()}
+
+    backend.hold_gripper_motion = stop
+    backend.read_gripper_state_now = read
+    assert not port.hold(reason="late confirmation").succeeded
+    assert reads == ([] if phase == "stop" else [1])
+    assert len(backend.holds) == 1
+
+
+def test_real_hold_moving_forever_exhausts_only_its_wait_budget(controlled_real_gripper):
+    backend, port, clock = controlled_real_gripper
+    backend.get_state = lambda **_kw: {
+        "gripper_measured_scalar": 0.98, "gripper_error_code": 0, "gripper_is_moving": True}
+    assert not port.hold(reason="still moving").succeeded
+    assert clock.now == pytest.approx(100.05)
+    assert len(backend.holds) == 1 and backend.commands == []
+
+
+@pytest.mark.parametrize("reading", ("unavailable", "missing", "stale", "future", "nan"))
+def test_real_feedback_rejects_unavailable_or_invalid_acquisition_time(controlled_real_gripper, reading):
+    backend, port, clock = controlled_real_gripper
+    value = {
+        "unavailable": None, "missing": {},
+        "stale": {"timestamp": clock.wall() - 0.201},
+        "future": {"timestamp": clock.wall() + 0.001},
+        "nan": {"timestamp": float("nan")},
+    }[reading]
+    backend.read_gripper_state_now = lambda: value
+    with pytest.raises(RuntimeError):
+        port.observe_state()
+
+
+@pytest.mark.parametrize("phase", ("read", "cached_state"))
+def test_real_feedback_slow_access_cannot_refresh_an_old_cut(controlled_real_gripper, phase):
+    backend, port, clock = controlled_real_gripper
+    native_get = backend.get_state
+
+    def read():
+        if phase == "read":
+            clock.sleep(0.201)
+        return {"timestamp": clock.wall()}
+
+    def get(**kw):
+        if phase == "cached_state":
+            clock.sleep(0.201)
+        return native_get(**kw)
+
+    backend.read_gripper_state_now = read
+    backend.get_state = get
+    with pytest.raises(RuntimeError, match="200 ms budget"):
+        port.observe_state()
+
+
+def test_cancel_during_unwritten_busy_retry_prevents_later_dispatch(controlled_real_gripper):
+    backend, port, _clock = controlled_real_gripper
+    cancelled = [False]
+
+    def busy(target):
+        backend.commands.append(target)
+        cancelled[0] = True
+        return False
+
+    backend.send_fixed_joint_pos = busy
+    backend.get_state = lambda **_kw: {"gripper_last_send_status": "io_busy"}
+    assert not port.command_close(1.0, cancel_requested=lambda: cancelled[0]).accepted
+    assert backend.commands == [1.0]
+
+
+def _prepared_gripper_lifecycle():
+    clock = _GripperTestClock()
+    port = FakeGripperPort([(0.5, False)])
+    bundle = _sim_bundle(port)
+    session = assemble_gripper_agent_gateway_session(
+        contract_bundle=bundle, port=port, allowed_client_ids=("client:test",),
+        current_station_revision=lambda: 3, clock_domain_id="clock:test")
+    request = _request(bundle, session.publish_observation(), target_state="closed")
+    operation = AgentSkillOperation(
+        operation_id="operation:controlled-gripper", request_hash=request.semantic_content_hash,
+        runtime_session_id=request.runtime_session_id, status="activated", reason_code="test",
+        station_revision_at_admission=3, current_station_revision=3,
+        started_at=clock(), updated_at=clock(), deadline_at=clock() + 1.0)
+    lifecycle = GripperSkillLifecycle(
+        port=port, contract_bundle=bundle,
+        convergence=GripperConvergenceProfile(stable_sample_count=1),
+        clock=clock, sleep=clock.sleep)
+    activation = lifecycle.activate(request=request, operation=operation, cancel_requested=lambda: False)
+    assert activation.succeeded
+    return lifecycle, request, replace(operation, status="running",
+        lower_operation_id=activation.lower_operation_id), port, clock
+
+
+@pytest.mark.parametrize("reason", ("cancelled", "expired"))
+def test_gripper_predispatch_preemption_does_not_issue_a_command(reason):
+    lifecycle, request, operation, port, clock = _prepared_gripper_lifecycle()
+    if reason == "expired":
+        clock.now = operation.deadline_at
+    result = lifecycle.run(request=request, operation=operation,
+        cancel_requested=lambda: reason == "cancelled")
+    assert not result.succeeded and result.execution_result is None
+    assert port.commanded == []
+    assert result.terminal_hold_confirmed
+
+
+@pytest.mark.parametrize("phase", ("dispatch", "poll", "hold"))
+@pytest.mark.parametrize("reason", ("cancelled", "expired"))
+def test_gripper_completion_rechecks_preemption_after_synchronous_boundaries(phase, reason):
+    lifecycle, request, operation, port, clock = _prepared_gripper_lifecycle()
+    cancelled = [False]
+
+    def preempt():
+        if reason == "expired":
+            clock.now = operation.deadline_at
+        else:
+            cancelled[0] = True
+
+    original = {"dispatch": port.command_close, "poll": port.poll_state, "hold": port.hold}[phase]
+
+    def cross_boundary(*args, **kw):
+        result = original(*args, **kw)
+        preempt()
+        return result
+
+    setattr(port, {"dispatch": "command_close", "poll": "poll_state", "hold": "hold"}[phase], cross_boundary)
+    result = lifecycle.run(request=request, operation=operation, cancel_requested=lambda: cancelled[0])
+    assert not result.succeeded and result.execution_result is None
+    assert result.reason_code == (
+        "gripper_execution_preempted" if reason == "cancelled" else "gripper_convergence_timeout")
+    assert result.terminal_hold_confirmed and len(port.holds) == 1
+
+
+def test_gripper_cancel_and_hold_keep_the_activation_owner_identity():
+    lifecycle, request, operation, port, _clock = _prepared_gripper_lifecycle()
+    result = lifecycle.run(request=request, operation=operation, cancel_requested=lambda: False)
+    assert result.succeeded and port.commanded == [1.0]
+    cancel = lifecycle.cancel(request=request, operation=operation, reason="identity check")
+    held = lifecycle.request_hold(operation=operation, reason="identity check")
+    assert cancel.lower_operation_id == held.lower_operation_id == operation.lower_operation_id
+    assert cancel.lower_hold_confirmed and held.lower_hold_confirmed
+    assert len(port.holds) == 1
+
+
+@pytest.mark.parametrize("cancelled", (False, True))
+def test_mujoco_gripper_predispatch_callback_preserves_passive_physics(cancelled):
+    queued, steps = [], []
+    rig = SimpleNamespace(
+        config=SimpleNamespace(realtime_worker=False), is_ready=lambda: True,
+        queue_gripper_close_targets=lambda targets: queued.append(targets) or 7,
+        gripper_execution_snapshot=dict, hold_gripper_motion=lambda _reason: None,
+        step_physics=lambda: steps.append(1),
+    )
+    port = MujocoGripperControlPort(rig=rig, gripper_name="right_gripper")
+    receipt = port.command_close(1.0, cancel_requested=lambda: cancelled)
+    assert receipt.accepted is (not cancelled)
+    assert queued == ([] if cancelled else [{"right_gripper": 1.0}])
+    assert steps == []
+
+
+@pytest.mark.parametrize("name", ("command_submission_timeout_sec", "hold_confirmation_timeout_sec"))
+def test_real_gripper_binding_identifies_its_wait_budget(name):
+    backend = _FakeDmtacBackend()
+    default = RealDmtacGripperControlPort(backend=backend)
+    changed = RealDmtacGripperControlPort(backend=backend, **{name: 0.3})
+    assert default.port_binding_hash != changed.port_binding_hash
+    assert default.component_id == changed.component_id == "right_gripper"
+    assert backend.commands == backend.holds == []

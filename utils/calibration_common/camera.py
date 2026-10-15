@@ -9,6 +9,12 @@ from typing import Any, Callable, Mapping, Sequence, TypeVar
 
 import numpy as np
 
+from hardware.realsense.lifecycle import (
+    SDK_LIFECYCLE_LOCK,
+    NativePipelineStop,
+    clear_native_tracebacks,
+)
+
 
 @dataclass(frozen=True)
 class VideoStreamProfileInfo:
@@ -115,6 +121,7 @@ def start_camera_bounded(
     *,
     timeout_sec: float,
     on_timeout: Callable[[], None] | None = None,
+    on_worker: Callable[[threading.Thread], None] | None = None,
 ) -> Any:
     """Bound CLI camera admission without retrying a stuck native SDK call.
 
@@ -135,6 +142,8 @@ def start_camera_bounded(
             errors.append(exc)
 
     worker = threading.Thread(target=run, name="calibration_camera_start", daemon=True)
+    if on_worker is not None:
+        on_worker(worker)
     worker.start()
     worker.join(timeout=duration)
     if worker.is_alive():
@@ -200,14 +209,98 @@ def safe_device_info(rs: Any, device: Any, field: Any) -> str:
     return ""
 
 
-def stop_pipeline_quietly(pipeline: Any | None) -> None:
-    """Release a failed SDK pipeline without masking its original error."""
+class CalibrationCameraLifecycle:
+    """Shared native ownership for head/wrist calibration camera clients."""
 
-    if pipeline is None:
-        return
-    try:
-        pipeline.stop()
-    except Exception:
+    def _init_camera_lifecycle(self) -> None:
+        self._camera_lifecycle_lock = threading.RLock()
+        self._native_pipeline_stop: NativePipelineStop | None = None
+        self._pipeline = None
+        self._profile = None
+        self._align = None
+        self._startup_timeout_event = threading.Event()
+        self._startup_worker: threading.Thread | None = None
+
+    def _remember_startup_worker(self, worker: threading.Thread) -> None:
+        if self._startup_worker is not None and self._startup_worker.is_alive():
+            raise RuntimeError("Calibration camera startup worker is still active")
+        self._startup_worker = worker
+
+    def _check_pending_stop(self) -> None:
+        if self._native_pipeline_stop is not None:
+            error = self._native_pipeline_stop.wait(0)
+            if error is not None:
+                raise RuntimeError(f"Calibration camera native cleanup is not complete: {error}") from error
+
+    def _start_owned_pipeline(self, config: Any) -> Any:
+        self._check_pending_stop()
+        with SDK_LIFECYCLE_LOCK:
+            if self._startup_timeout_event.is_set():
+                raise RuntimeError("Calibration camera startup timed out; no pipeline was opened")
+            self._native_pipeline_stop = None
+            self._pipeline = self._rs.pipeline()
+            try:
+                self._profile = self._pipeline.start(config)
+            except BaseException as exc:  # noqa: BLE001 - release partial startup on interruption too.
+                clear_native_tracebacks(exc)
+                error = exc
+            else:
+                return self._profile
+        self._cleanup_failed_start(error, allow_not_started=True)
+        raise error
+
+    def _cleanup_failed_start(self, error: BaseException, *, allow_not_started: bool = False) -> None:
+        clear_native_tracebacks(error)
+        try:
+            self._stop_owned_pipeline(allow_not_started=allow_not_started)
+        except BaseException as cleanup_error:  # noqa: BLE001 - keep operation and cleanup evidence.
+            raise RuntimeError(f"{error}; camera cleanup failed: {cleanup_error}") from error
+
+    def _stop_owned_pipeline(self, *, allow_not_started: bool = False,
+                             before_stop: Callable[[], None] | None = None) -> None:
+        self._align = None
+        self._profile = None
+        if self._pipeline is not None:
+            self._check_pending_stop()
+            self._native_pipeline_stop = NativePipelineStop(
+                self._pipeline, allow_not_started=allow_not_started, before_stop=before_stop,
+            )
+            self._pipeline = None
+            self._native_pipeline_stop.start()
+        if self._native_pipeline_stop is not None:
+            error = self._native_pipeline_stop.wait(self.config.pipeline_stop_timeout_sec)
+            self.settings_report["pipeline.stop"] = self._native_pipeline_stop.snapshot()
+            if error is not None:
+                raise RuntimeError(f"Calibration camera pipeline cleanup failed: {error}") from error
+
+    def start(self):
+        with self._camera_lifecycle_lock:
+            self._check_pending_stop()
+            if self._startup_timeout_event.is_set():
+                raise RuntimeError("Calibration camera startup timed out; reconstruct the camera")
+            try:
+                return self._start_camera()
+            except BaseException as exc:  # noqa: BLE001 - release partial startup on interruption too.
+                clear_native_tracebacks(exc)
+                failure = exc
+            self._cleanup_failed_start(failure)
+            raise failure
+
+    def stop(self) -> None:
+        if (self._startup_worker is not None and self._startup_worker.is_alive()
+                and self._startup_worker is not threading.current_thread()):
+            self._startup_timeout_event.set()
+            raise RuntimeError("Calibration camera startup worker is still active; cleanup is not complete")
+        if not self._camera_lifecycle_lock.acquire(blocking=False):
+            self._startup_timeout_event.set()
+            raise RuntimeError("Calibration camera startup is still active; cleanup is not complete")
+        try:
+            self._stop_owned_pipeline(before_stop=self._before_pipeline_stop)
+            self._active_color_format = self.config.color_format
+        finally:
+            self._camera_lifecycle_lock.release()
+
+    def _before_pipeline_stop(self) -> None:
         pass
 
 
@@ -260,6 +353,7 @@ def put_status(cv2: Any, image: np.ndarray, text: str, *, ok: bool) -> None:
 
 __all__ = [
     "CALIBRATION_CAMERA_STARTUP_TIMEOUT_SEC",
+    "CalibrationCameraLifecycle",
     "VideoStreamProfileInfo",
     "aruco_dictionary",
     "detector_parameters",
@@ -271,6 +365,5 @@ __all__ = [
     "require_pyrealsense2",
     "safe_device_info",
     "start_camera_bounded",
-    "stop_pipeline_quietly",
     "video_profile_score",
 ]

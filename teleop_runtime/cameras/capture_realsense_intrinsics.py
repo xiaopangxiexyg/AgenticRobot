@@ -7,18 +7,18 @@ import time
 from pathlib import Path
 from typing import Sequence
 
+from robot_motion.runtime.lifecycle import run_best_effort_cleanup
+
 from ..configs.camera_paths import (
     DEFAULT_REALSENSE_CAMERA_REGISTRY_PATH,
     DEFAULT_REALSENSE_DEVICE_CONFIG_PATH,
 )
-
 from ..sources.camera import (
     RealSenseRGBSource,
     load_realsense_camera_config_map,
     start_real_sense_source_with_containment,
 )
 from .registry import build_camera_registry_snapshot, load_camera_registry
-
 
 DEFAULT_CAMERA_CONFIG_PATH = DEFAULT_REALSENSE_DEVICE_CONFIG_PATH
 DEFAULT_CAMERA_REGISTRY_PATH = DEFAULT_REALSENSE_CAMERA_REGISTRY_PATH
@@ -66,8 +66,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         for camera_key, config in camera_configs.items()
     }
     started_sources: list[RealSenseRGBSource] = []
+    # This is an application CLI; reuse the production inventory ordering,
+    # rather than making JSON declaration order a second startup policy.
+    from ..real_teleop.camera_runtime import (
+        CAMERA_START_STAGGER_SEC,
+        _camera_startup_items,
+    )
+
     try:
-        for source in sources.values():
+        for index, (_key, source) in enumerate(_camera_startup_items(sources)):
+            if index:
+                time.sleep(CAMERA_START_STAGGER_SEC)
             start_real_sense_source_with_containment(
                 source,
                 timeout_sec=30.0,
@@ -89,8 +98,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     finally:
         # A timed-out native SDK worker may still hold its lifecycle lock.
         # Only close sources whose startup completed.
-        for source in reversed(started_sources):
-            source.close()
+        run_best_effort_cleanup(
+            "capture_realsense_intrinsics.close",
+            ((f"camera[{source.camera_key}]", source.close)
+             for source in reversed(started_sources)),
+        )
 
     text = json.dumps(snapshot, indent=2, sort_keys=True)
     if args.output:

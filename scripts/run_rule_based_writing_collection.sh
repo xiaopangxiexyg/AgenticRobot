@@ -63,7 +63,9 @@ Options:
                               dataset modality contract. Without a tactile root,
                               the launcher defaults to this mode.
   --source-pool-range A:B     Half-open candidate range (default: whole pool).
-  --selection-seed N          Deterministic source selection seed (default: 0).
+  --selection-seed N|auto     Source and writing-variant selection seed. Default:
+                              auto (new OS-random seed per launch); an integer
+                              reproduces the same sequence with the same pool.
   --pre-pen-down-replay-candidate-id ID
                               Writing mode only; optional extra complete source
                               Episode replayed without capture before ordinary
@@ -131,7 +133,7 @@ SOURCE_EPISODE=""
 DETAIL_ANNOTATION_DIR=""
 SOURCE_POOL_MANIFEST=""
 SOURCE_POOL_RANGE=""
-SELECTION_SEED="0"
+SELECTION_SEED="auto"
 PRE_PEN_DOWN_REPLAY_CANDIDATE_ID=""
 PRE_PEN_DOWN_REPLAY_NORMAL_EPISODES="0"
 COLLECTION_MODE="rule-based-writing"
@@ -324,7 +326,8 @@ fi
 if [[ -z "$TACTILE_ROOT" && "$TACTILE_MIN_FREE_EXPLICIT" -eq 0 ]]; then
   TACTILE_MIN_FREE_GB="0"
 fi
-[[ "$SELECTION_SEED" =~ ^-?[0-9]+$ ]] || die "selection seed must be an integer."
+[[ "$SELECTION_SEED" == "auto" || "$SELECTION_SEED" =~ ^-?[0-9]+$ ]] || \
+  die "selection seed must be an integer or auto."
 [[ "$PRE_PEN_DOWN_REPLAY_NORMAL_EPISODES" =~ ^[0-9]+$ ]] || \
   die "pre-pen-down replay normal Episodes must be a non-negative integer."
 [[ "$GRASP_ADJUSTMENT_INTERVAL" =~ ^[1-9][0-9]*$ ]] || \
@@ -415,6 +418,17 @@ cd -- "$PROJECT_ROOT"
 # shellcheck source=../docs/real/teleop_args.sh
 source docs/real/teleop_args.sh
 
+SELECTION_SEED_SOURCE="explicit"
+if [[ "$SELECTION_SEED" == "auto" ]]; then
+  # Read OS entropy once without importing the runtime before its dependency
+  # preflight. Seven bytes fit within signed 64-bit dataset metadata fields.
+  SELECTION_SEED="$(od -An -N7 -tu8 /dev/urandom | awk '{print $1}')" || \
+    die "could not obtain an OS-random selection seed."
+  [[ "$SELECTION_SEED" =~ ^[0-9]+$ ]] || \
+    die "OS-random selection seed was not a valid integer."
+  SELECTION_SEED_SOURCE="auto"
+fi
+
 # Rule-based writing owns the arm command override and intentionally has no
 # human gripper input.  Keep the shared formal profile unchanged while removing
 # its opt-in Q6 gesture from this specialized launcher.
@@ -429,6 +443,7 @@ RULE_ARGS=(
   --rule-collection-mode "$RULE_COLLECTION_MODE"
   --rule-initial-alignment-speed-scale "$INITIAL_ALIGNMENT_SPEED_SCALE"
   --rule-task-chain-grasp-adjustment-interval "$GRASP_ADJUSTMENT_INTERVAL"
+  --rule-source-selection-seed "$SELECTION_SEED"
 )
 if [[ "$TASK_CHAIN_FOOT_PAD" -eq 1 ]]; then
   RULE_ARGS+=(--rule-task-chain-foot-pad)
@@ -476,7 +491,6 @@ fi
 if [[ -n "$SOURCE_POOL_MANIFEST" ]]; then
   RULE_ARGS+=(
     --rule-source-pool-manifest "$SOURCE_POOL_MANIFEST"
-    --rule-source-selection-seed "$SELECTION_SEED"
   )
   if [[ -n "$SOURCE_POOL_RANGE" ]]; then
     RULE_ARGS+=(--rule-source-pool-range "$SOURCE_POOL_RANGE")
@@ -661,7 +675,7 @@ fi
 printf '%s\n' \
   "[RuleBased] starting collection mode=$COLLECTION_MODE on the established real-teleop UI." \
   '[RuleBased] clear the workspace; start one formal Episode only after the existing GUI reports ready.' \
-  "[RuleBased] source_pool=${SOURCE_POOL_MANIFEST:-legacy_single_source} range=${SOURCE_POOL_RANGE:-all} seed=$SELECTION_SEED" \
+  "[RuleBased] source_pool=${SOURCE_POOL_MANIFEST:-legacy_single_source} range=${SOURCE_POOL_RANGE:-all} seed=$SELECTION_SEED seed_source=$SELECTION_SEED_SOURCE" \
   "[RuleBased] extra_pre_pen_down_full_replay=${PRE_PEN_DOWN_REPLAY_CANDIDATE_ID:-disabled} normal_episodes_between_extra_replays=$PRE_PEN_DOWN_REPLAY_NORMAL_EPISODES" \
   "[RuleBased] grasp_adjustment_interval=$GRASP_ADJUSTMENT_INTERVAL successful_episodes" \
   "[RuleBased] source_dataset=${SOURCE_DATASET:-pool_selected} episode=${SOURCE_EPISODE:-pool_selected}" \

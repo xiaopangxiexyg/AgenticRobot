@@ -471,11 +471,25 @@ def test_qpos_init_acceleration_planner_keeps_target_admission_nonblocking(
         finally:
             completed.set()
 
-    with backend._send_lock:
-        thread = threading.Thread(target=admit_target, daemon=True)
-        thread.start()
-        assert completed.wait(0.25), "acceleration qpos admission waited for _send_lock"
-    thread.join(timeout=0.25)
+    reached_admission = threading.Event()
+    original_stamp = backend._stamp_final_action_target
+
+    def stamp_and_observe_admission(*args, **kwargs):
+        # Keep real final-target FK/metadata preparation. Its cold work or
+        # process GC is upstream of the sender-lock admission under test.
+        original_stamp(*args, **kwargs)
+        reached_admission.set()
+
+    backend._stamp_final_action_target = stamp_and_observe_admission
+    try:
+        with backend._send_lock:
+            thread = threading.Thread(target=admit_target, daemon=True)
+            thread.start()
+            assert reached_admission.wait(0.5), "command preparation did not reach admission"
+            assert completed.wait(0.25), "acceleration qpos admission waited for _send_lock"
+        thread.join(timeout=0.25)
+    finally:
+        del backend._stamp_final_action_target
 
     assert not errors
     assert len(receipts) == 1
@@ -595,9 +609,24 @@ def test_synchronous_target_admission_remains_explicit_rollback() -> None:
         finally:
             completed.set()
 
+    attempted_send_lock = threading.Event()
+    original_send_lock = backend._send_lock
+
+    class _ObservedSendLock:
+        def __enter__(self):
+            if threading.current_thread() is thread:
+                attempted_send_lock.set()
+            return original_send_lock.__enter__()
+
+        def __exit__(self, *args):
+            return original_send_lock.__exit__(*args)
+
+    thread = threading.Thread(target=admit_target, daemon=True)
+    backend._send_lock = _ObservedSendLock()
     with backend._send_lock:
-        thread = threading.Thread(target=admit_target, daemon=True)
         thread.start()
+        # Pre-lock work must not consume the interval that proves contention.
+        assert attempted_send_lock.wait(0.5)
         assert not completed.wait(0.03)
     assert completed.wait(0.25)
     thread.join(timeout=0.25)

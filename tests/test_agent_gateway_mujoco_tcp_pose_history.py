@@ -22,6 +22,9 @@ from agent_gateway.profiles.mujoco.motion_factory import (
 from agent_gateway.profiles.mujoco.motion_gateway_session import (
     assemble_mujoco_agent_tcp_pose_gateway_session,
 )
+from agent_gateway.protocol.state_schemas import (
+    agent_state_history_slice_content_hash_v1,
+)
 from collection_runtime.source_observation_history import (
     SourceObservationHistoryBinding,
     SQLiteSourceObservationHistoryStore,
@@ -302,12 +305,38 @@ def test_history_is_opt_in_exactly_bound_and_default_off(
             "history_window_ms": 5_000,
             "max_samples": 4,
         }
+        bundle.payload_validators.validate_parameters(
+            route=history_entry.route, payload=parameters,
+        )
+        with pytest.raises(ValueError, match="reference frame mismatch"):
+            bundle.payload_validators.validate_parameters(
+                route=history_entry.route,
+                payload={**parameters, "reference_frame_id": "right_arm_base"},
+            )
         history_read = session.history_provider.read(
             active_operation_id="operation:tcp-pose-history:lower:1",
             parameters=parameters,
         )
         result = history_read.execution_result
         assert result is not None and result["sample_count"] == 2
+        bundle.payload_validators.validate_execution_result(
+            route=history_entry.route, payload=result, request_parameters=parameters,
+        )
+        wrong_frame_result = {
+            **result,
+            "reference_frame_spec_hash": (
+                bundle.motion_profile.execution_reference_frame_spec_hash
+            ),
+        }
+        # Keep the slice internally consistent to exercise deployment identity.
+        wrong_frame_result["history_slice_hash"] = agent_state_history_slice_content_hash_v1(
+            wrong_frame_result
+        )
+        with pytest.raises(ValueError, match="reference_frame_spec_hash mismatch"):
+            bundle.payload_validators.validate_execution_result(
+                route=history_entry.route, request_parameters=parameters,
+                payload=wrong_frame_result,
+            )
         assert result["reference_frame_id"] == "mujoco_sim_hil/station"
         assert bundle.history_source_binding.source_contract[
             "reference_frame_id"

@@ -142,6 +142,7 @@ from .tracker_side_check import evaluate_tracker_side_assignment
 from .vive_calibration_profiles import (
     _load_gui_vive_calibration_profile,
     _save_gui_vive_calibration_profile,
+    validate_vive_profile_for_home,
 )
 from .vive_calibration_runtime import (
     _vive_pose_source_from_components,
@@ -753,11 +754,10 @@ class RealTeleopControlInput:
         )
 
     def _strict_profile_arm_control_active(self) -> bool:
-        payload = getattr(self, "_progress_ui_payload", {})
+        args = getattr(self, "args", None)
         return bool(
-            isinstance(payload, Mapping)
-            and payload.get("configured", False)
-            and str(payload.get("arm_control_mode", ""))
+            getattr(args, "collection_progress_profile", None) is not None
+            and str(getattr(args, "collection_progress_arm_control_mode", ""))
             == PROGRESS_ARM_CONTROL_MODE_STRICT
         )
 
@@ -1966,6 +1966,8 @@ class RealTeleopControlInput:
                 reason = "已有 progress 请求等待控制循环处理"
             elif blocked_reason == "arm_transition_home_pending":
                 reason = "上一条阶段切换正在等待目标活动臂 runtime Home"
+            elif blocked_reason == "projection_failed":
+                reason = "progress 状态读取失败，踏板准入已关闭"
             elif not bool(runtime_state.get("configured", False)):
                 reason = "当前 Episode 未配置 progress profile"
             elif not recording_active or phase == "IDLE":
@@ -3793,6 +3795,23 @@ class RealTeleopControlInput:
                         gripper_control_enabled=self.gripper_control_enabled(),
                     )
                 return False
+            try:
+                validate_vive_profile_for_home(self.components)
+            except ValueError as exc:
+                message = f"runtime Home 未启动：{exc} 请重新标定当前 Tracker。"
+                _log("ViveCalibration", message)
+                self._append_ui_message_observation(
+                    "ViveCalibration", message,
+                    context="runtime Home rejected with incomplete VIVE profile",
+                )
+                if self.ui is not None:
+                    self._publish_ui_observation(
+                        context="runtime Home rejected with incomplete VIVE profile",
+                        active_controls=self._current_active_controls(),
+                        control_hint=message, home_ready=False,
+                        teleop_running=False, gripper_control_enabled=False,
+                    )
+                return False
             if request_from_hold:
                 self._hold_active = False
                 # Cache the lower Hold receipt while Home samples tracker/arm
@@ -4518,6 +4537,17 @@ class RealTeleopControlInput:
         self._teleop_dispatch_projection = "hold"
         self._gripper_control_enabled = False
         self._hold_request_reason = str(reason or "manual")
+        # A Hold may be raised after pedal/GUI sampling in this same poll.
+        # Revoke the previous projection immediately; the control loop also
+        # rechecks canonical availability before any progress arm transition.
+        self._progress_runtime_controls = ()
+        self._progress_runtime_state = {
+            **dict(getattr(self, "_progress_runtime_state", {}) or {}),
+            "application_held": True,
+            "blocked_reason": "application_hold",
+        }
+        self._progress_ui_controls = ()
+        self._progress_ui_payload = {}
         self._q6_hold_recalibration_gesture.reset_for_hold()
         is_q6_gesture = self._hold_request_reason == "q6_gesture"
         if self.ui is not None:
@@ -4787,8 +4817,8 @@ class RealTeleopControlInput:
     ) -> None:
         """Project lower progress state through the Station application leaf."""
 
-        projection = (
-            self._progress_application_port().project_progress_application_state(
+        try:
+            projection = self._progress_application_port().project_progress_application_state(
                 dataset_recorder=dataset_recorder,
                 progress_workflow=progress_workflow,
                 promotable_hold_pause=promotable_hold_pause,
@@ -4798,16 +4828,30 @@ class RealTeleopControlInput:
                     self._progress_configuration_selection_enabled()
                 ),
             )
-        )
-        self.publish_progress_control_availability(
-            configured=projection.configured,
-            active_controls=projection.active_controls,
-            recording_active=projection.recording_active,
-            phase=projection.phase,
-            application_held=projection.application_held,
-            allowed_next_step_ids=projection.allowed_next_step_ids,
-            blocked_reason=projection.blocked_reason,
-        )
+            self.publish_progress_control_availability(
+                configured=projection.configured,
+                active_controls=projection.active_controls,
+                recording_active=projection.recording_active,
+                phase=projection.phase,
+                application_held=projection.application_held,
+                allowed_next_step_ids=projection.allowed_next_step_ids,
+                blocked_reason=projection.blocked_reason,
+            )
+        except Exception:
+            # Presentation construction and runtime projection validation may
+            # fail before refreshing admission. Never retain an older grant.
+            self.publish_progress_control_availability(
+                configured=False,
+                active_controls=(),
+                recording_active=False,
+                phase="UNAVAILABLE",
+                application_held=self.hold_active(),
+                allowed_next_step_ids=(),
+                blocked_reason="projection_failed",
+            )
+            self._progress_ui_controls = ()
+            self._progress_ui_payload = {}
+            raise
         self.publish_progress_ui_state(projection.ui_payload)
 
     def submit_progress_operator_intent(
@@ -4960,10 +5004,9 @@ class RealTeleopControlInput:
         if pending:
             return False
         pending.append(command)
-        # Keep the last backend-published mode authoritative until the control
-        # loop consumes this selection. Clearing the payload here would create
-        # a brief strict->permissive window for a second event in the same GUI
-        # poll batch.
+        # The current args mode remains authoritative until the control loop
+        # consumes this selection. The UI projection may be invalidated by an
+        # unrelated progress event without changing FixArm admission.
         self._progress_ui_transport_revision = int(
             getattr(self, "_progress_ui_transport_revision", 0)
         ) + 1

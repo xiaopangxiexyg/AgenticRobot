@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import time
-import threading
+import math
 from dataclasses import dataclass
 from typing import Any, Sequence
 
@@ -9,6 +9,7 @@ import numpy as np
 
 from utils.calibration_common.camera import (
     CALIBRATION_CAMERA_STARTUP_TIMEOUT_SEC,
+    CalibrationCameraLifecycle,
     VideoStreamProfileInfo as _CommonVideoStreamProfileInfo,
     available_video_profiles as _collect_video_profiles,
     aruco_dictionary as _aruco_dictionary,
@@ -22,7 +23,6 @@ from utils.calibration_common.camera import (
     require_pyrealsense2 as _require_pyrealsense2,
     safe_device_info as _safe_device_info,
     start_camera_bounded,
-    stop_pipeline_quietly as _stop_pipeline_quietly,
     video_profile_score as _video_profile_score,
 )
 from hardware.realsense.color import (
@@ -82,6 +82,7 @@ class RealSenseConfig:
     auto_select_supported_profile: bool = True
     startup_wait_timeout_ms: int = 1000
     startup_frame_grace_sec: float = 5.0
+    pipeline_stop_timeout_sec: float = 5.0
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "color_format", _normalize_color_format(self.color_format))
@@ -89,17 +90,16 @@ class RealSenseConfig:
             raise ValueError("startup_wait_timeout_ms must be positive")
         if float(self.startup_frame_grace_sec) <= 0.0:
             raise ValueError("startup_frame_grace_sec must be positive")
+        if not math.isfinite(self.pipeline_stop_timeout_sec) or self.pipeline_stop_timeout_sec <= 0:
+            raise ValueError("pipeline_stop_timeout_sec must be finite and positive")
 
 
-class RealSenseCamera:
+class RealSenseCamera(CalibrationCameraLifecycle):
     def __init__(self, config: RealSenseConfig):
         self.config = config
         self._rs = _require_pyrealsense2()
-        self._pipeline = None
-        self._align = None
-        self._profile = None
+        self._init_camera_lifecycle()
         self._active_color_format = self.config.color_format
-        self._startup_timeout_event = threading.Event()
         self.serial: str | None = None
         self.depth_scale_m: float | None = None
         # Saved by the command-line tool with new calibration samples/results.
@@ -122,7 +122,7 @@ class RealSenseCamera:
             )
         return devices
 
-    def start(self) -> "RealSenseCamera":
+    def _start_camera(self) -> "RealSenseCamera":
         if self._startup_timeout_event.is_set():
             raise RuntimeError("Calibration camera startup timed out; reconstruct the camera")
         if self._pipeline is not None:
@@ -133,7 +133,6 @@ class RealSenseCamera:
         self.serial = serial
 
         rs = self._rs
-        pipeline = rs.pipeline()
         config = rs.config()
         color_format = _color_format_value(rs, self.config.color_format)
         if serial:
@@ -143,7 +142,7 @@ class RealSenseCamera:
             config.enable_stream(rs.stream.depth, width, height, rs.format.z16, int(self.config.fps))
         config.enable_stream(rs.stream.color, width, height, color_format, int(self.config.fps))
         try:
-            profile = pipeline.start(config)
+            profile = self._start_owned_pipeline(config)
             selected_profiles = {
                 "requested": _requested_profile_text(
                     width,
@@ -155,35 +154,22 @@ class RealSenseCamera:
                 "fallback_used": False,
             }
         except Exception as exc:
-            _stop_pipeline_quietly(pipeline)
+            self._check_pending_stop()
             if not self.config.auto_select_supported_profile:
                 raise RuntimeError(self._profile_error_message(exc, serial)) from exc
             fallback_config, selected_profiles, active_color_format = self._fallback_stream_config(
                 serial
             )
-            pipeline = rs.pipeline()
             try:
-                profile = pipeline.start(fallback_config)
+                profile = self._start_owned_pipeline(fallback_config)
             except Exception as fallback_exc:
-                _stop_pipeline_quietly(pipeline)
                 raise RuntimeError(self._profile_error_message(fallback_exc, serial)) from fallback_exc
-        try:
-            if self._startup_timeout_event.is_set():
-                raise RuntimeError("Calibration camera startup timed out")
-            self._wait_for_first_frameset(pipeline)
-            if self._startup_timeout_event.is_set():
-                raise RuntimeError("Calibration camera startup timed out")
-        except Exception:
-            _stop_pipeline_quietly(pipeline)
-            raise
-        try:
-            align = rs.align(rs.stream.color) if self.config.enable_depth else None
-        except Exception:
-            _stop_pipeline_quietly(pipeline)
-            raise
-        self._pipeline = pipeline
-        self._profile = profile
-        self._align = align
+        if self._startup_timeout_event.is_set():
+            raise RuntimeError("Calibration camera startup timed out")
+        self._wait_for_first_frameset(self._pipeline)
+        if self._startup_timeout_event.is_set():
+            raise RuntimeError("Calibration camera startup timed out")
+        self._align = rs.align(rs.stream.color) if self.config.enable_depth else None
         self._active_color_format = (
             self.config.color_format
             if not selected_profiles.get("fallback_used")
@@ -384,22 +370,12 @@ class RealSenseCamera:
             depth_scale_m=self.depth_scale_m,
         )
 
-    def stop(self) -> None:
-        pipeline = self._pipeline
-        try:
-            if pipeline is not None:
-                pipeline.stop()
-        finally:
-            self._pipeline = None
-            self._align = None
-            self._profile = None
-            self._active_color_format = self.config.color_format
-
     def __enter__(self) -> "RealSenseCamera":
         return start_camera_bounded(
             self.start,
             timeout_sec=CALIBRATION_CAMERA_STARTUP_TIMEOUT_SEC,
             on_timeout=self._startup_timeout_event.set,
+            on_worker=self._remember_startup_worker,
         )
 
     def __exit__(self, exc_type, exc, tb) -> None:

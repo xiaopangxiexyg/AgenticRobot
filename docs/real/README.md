@@ -69,6 +69,8 @@ VIVE 坐标 profile、RM65 工具/TCP profile 与 runtime Home 分别管理。Se
 
 真实遥操按 VIVE source role 读取 wrist offset；GUI 重新标定也按当前 source role 保存。失败或取消的标定不会安装半成品坐标，生成新全局坐标后不会沿用旧坐标系下未重采的 wrist offset。带 `logical_channel` 标记的独立 Control Station 坐标 profile 不能直接作为真实遥操 profile 使用；没有绑定标记的旧 profile 保持原读取解释，不会自动交换偏置。旧 profile 若曾在互换 Tracker 后重新标定，须现场核对或重新标定。
 
+带 `source_role` 标记的 profile 在 runtime Home 准入时必须具备当前映射所需的 wrist offset；单侧标定后若切换到未标定的源角色，Home 会拒绝启动并保留 Hold，需要重新标定。GUI 保存成功后将新文件路径与 SHA256 一起设为当前 profile；先完整写入临时文件再发布，失败写入不参与“最新 profile”选择，也不会覆盖已有文件。
+
 加载 profile 不会恢复其保存的 Tracker 互换或运动倍率；当前 CLI 默认运动倍率为 `1.35`。如需固定启动文件，可使用 `--load-profile <绝对路径>` 和 `--expected-vive-profile-sha256 <64位小写SHA256>`；摘要会在构造机械臂 backend 前校验。启动、GUI 保存/加载和 Home 请求会记录文件身份、实际 source mapping、选定 Tracker mapping 与倍率。runtime Home 采集当前人体和机械臂锚点，不会让机械臂回固定零位；更换坐标后仍须重新采 Home。
 
 进入 runtime Home 前，系统会用已标定的 VIVE desk 横向轴检查左右 wrist tracker：
@@ -125,10 +127,10 @@ q5 release-band 的“保持上一侧”条件，并启用 `[1,2,4]` 半径的�
 ### 踏板:
 
 ```bash
-sudo -E "$(command -v python)" -m teleop_runtime.configure_devices --fix-permissions
-
-python -m hardware.foot_pad --count 2
+bash scripts/start_foot_pad.sh
 ```
+
+按提示输入踏板数量 `N`，再在 sudo 提示中输入密码，并按服务提示依次踩下踏板完成重新标定。转发服务会保持前台运行，按 `Ctrl-C` 停止。
 
 ### 1.3 正式 position 数采（M）
 

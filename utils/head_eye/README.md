@@ -51,6 +51,13 @@ python -m utils.head_eye \
 
 `--list-cameras --show-profiles` 可在实际设备上列出可用 profile。新保存的 samples 与结果 JSON 会记录请求 profile、是否发生 fallback，以及实际选择的 profile。该字段只用于溯源：不会改写既有 JSON/NPZ/NPY 标定结果，旧结果仍可直接加载。
 
+头部/腕部标定共用原生相机清理实现：正常退出、启动失败和 profile fallback 都须先
+完成原 pipeline 的关闭与句柄释放。Python 配置 `pipeline_stop_timeout_sec` 默认为
+5 秒，超时或错误会显式报告；不会因第二次 `stop()` 而忘记尚未完成的关闭线程，也
+不会在清理未完成时进入 fallback 或硬件 reset。关闭阶段保存在
+`settings_report["pipeline.stop"]`；首帧期限和原有流选择策略不变。普通遥操/Agent
+source 的默认关闭预算仍按原配置派生，不由标定配置改写。
+
 窗口按键：
 
 - `r`：手动记录一组稳定采样。程序会在短时间内连续采相机和机械臂 pose，并拒绝明显晃动的数据。

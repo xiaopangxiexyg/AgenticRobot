@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import time
-import threading
+import math
 from dataclasses import dataclass
 from typing import Any, Sequence
 
@@ -9,6 +9,7 @@ import numpy as np
 
 from utils.calibration_common.camera import (
     CALIBRATION_CAMERA_STARTUP_TIMEOUT_SEC,
+    CalibrationCameraLifecycle,
     VideoStreamProfileInfo as _CommonVideoStreamProfileInfo,
     available_video_profiles as _available_video_profiles,
     aruco_dictionary as _aruco_dictionary,
@@ -23,7 +24,6 @@ from utils.calibration_common.camera import (
     require_pyrealsense2 as _require_pyrealsense2,
     safe_device_info as _safe_device_info,
     start_camera_bounded,
-    stop_pipeline_quietly as _stop_pipeline_quietly,
     video_profile_score as _video_profile_score,
 )
 from hardware.realsense.color import (
@@ -31,6 +31,7 @@ from hardware.realsense.color import (
     color_image_to_bgr as _color_image_to_bgr,
     normalize_color_format as _normalize_color_format,
 )
+from hardware.realsense.lifecycle import SDK_LIFECYCLE_LOCK, clear_native_tracebacks
 
 from .transforms import make_transform
 
@@ -99,6 +100,7 @@ class RealSenseConfig:
     startup_hardware_reset_sleep_sec: float = 2.0
     startup_hardware_reset_reconnect_timeout_sec: float = 6.0
     startup_hardware_reset_reconnect_poll_sec: float = 0.25
+    pipeline_stop_timeout_sec: float = 5.0
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "color_format", _normalize_color_format(self.color_format))
@@ -114,6 +116,8 @@ class RealSenseConfig:
             raise ValueError("startup_hardware_reset_reconnect_timeout_sec must be >= 0")
         if float(self.startup_hardware_reset_reconnect_poll_sec) <= 0.0:
             raise ValueError("startup_hardware_reset_reconnect_poll_sec must be positive")
+        if not math.isfinite(self.pipeline_stop_timeout_sec) or self.pipeline_stop_timeout_sec <= 0:
+            raise ValueError("pipeline_stop_timeout_sec must be finite and positive")
 
 
 @dataclass(frozen=True)
@@ -124,19 +128,16 @@ class _SensorOptionSnapshot:
     value: float
 
 
-class RealSenseCamera:
+class RealSenseCamera(CalibrationCameraLifecycle):
     def __init__(self, config: RealSenseConfig):
         self.config = config
         self._rs = _require_pyrealsense2()
-        self._pipeline = None
-        self._align = None
-        self._profile = None
+        self._init_camera_lifecycle()
         self.serial: str | None = None
         self.depth_scale_m: float | None = None
         self.settings_report: dict[str, Any] = {}
         self._settings_snapshot: list[_SensorOptionSnapshot] = []
         self._active_color_format = self.config.color_format
-        self._startup_timeout_event = threading.Event()
 
     @staticmethod
     def list_devices() -> list[RealSenseDevice]:
@@ -155,7 +156,7 @@ class RealSenseCamera:
             )
         return devices
 
-    def start(self) -> "RealSenseCamera":
+    def _start_camera(self) -> "RealSenseCamera":
         if self._startup_timeout_event.is_set():
             raise RuntimeError("Calibration camera startup timed out; reconstruct the camera")
         if self._pipeline is not None:
@@ -169,7 +170,6 @@ class RealSenseCamera:
         if self.config.startup_hardware_reset_on_failure:
             attempts += int(self.config.startup_hardware_reset_retry_attempts)
         last_error: Exception | None = None
-        recovery_count = 0
         for attempt_index in range(attempts):
             try:
                 self._start_once(serial)
@@ -181,26 +181,29 @@ class RealSenseCamera:
                 self.settings_report["startup.warmup_frames"] = int(
                     self.config.startup_warmup_frames
                 )
-                self.settings_report["startup.hardware_reset_recovery_count"] = recovery_count
+                self.settings_report["startup.hardware_reset_recovery_count"] = attempt_index
                 if self._startup_timeout_event.is_set():
                     raise RuntimeError("Calibration camera startup timed out")
                 return self
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 - preserve failed startup before explicit recovery.
+                clear_native_tracebacks(exc)
                 last_error = exc
+            try:
                 self.stop()
-                should_retry = (
-                    attempt_index + 1 < attempts
-                    and serial is not None
-                    and _is_startup_connection_error(str(exc))
-                )
-                if not should_retry:
-                    raise
-                if not self._hardware_reset_device(str(serial)):
-                    raise RuntimeError(
-                        "RealSense startup recovery failed: unable to reset and reconnect "
-                        f"serial {serial!r} after: {exc}"
-                    ) from exc
-                recovery_count += 1
+            except Exception as cleanup_error:  # noqa: BLE001 - keep startup and cleanup errors together.
+                raise RuntimeError(f"{last_error}; camera cleanup failed: {cleanup_error}") from last_error
+            should_retry = (
+                attempt_index + 1 < attempts
+                and serial is not None
+                and _is_startup_connection_error(str(last_error))
+            )
+            if not should_retry:
+                raise last_error
+            if not self._hardware_reset_device(str(serial)):
+                raise RuntimeError(
+                    "RealSense startup recovery failed: unable to reset and reconnect "
+                    f"serial {serial!r} after: {last_error}"
+                ) from last_error
         if last_error is not None:  # pragma: no cover - loop always returns or raises
             raise last_error
         raise RuntimeError("RealSense startup failed without an exception")  # pragma: no cover
@@ -210,7 +213,6 @@ class RealSenseCamera:
             raise RuntimeError("RealSense pipeline is already running")
 
         rs = self._rs
-        pipeline = rs.pipeline()
         config = rs.config()
         color_format = _color_format_value(rs, self.config.color_format)
         if serial:
@@ -220,7 +222,7 @@ class RealSenseCamera:
             config.enable_stream(rs.stream.depth, width, height, rs.format.z16, int(self.config.fps))
         config.enable_stream(rs.stream.color, width, height, color_format, int(self.config.fps))
         try:
-            profile = pipeline.start(config)
+            profile = self._start_owned_pipeline(config)
             selected_profiles = {
                 "requested": _requested_profile_text(
                     width,
@@ -232,20 +234,16 @@ class RealSenseCamera:
                 "fallback_used": False,
             }
         except Exception as exc:
-            _stop_pipeline_quietly(pipeline)
+            self._check_pending_stop()
             if not self.config.auto_select_supported_profile:
                 raise RuntimeError(self._profile_error_message(exc, serial)) from exc
             fallback_config, selected_profiles, active_color_format = self._fallback_stream_config(
                 serial
             )
-            pipeline = rs.pipeline()
             try:
-                profile = pipeline.start(fallback_config)
+                profile = self._start_owned_pipeline(fallback_config)
             except Exception as fallback_exc:
-                _stop_pipeline_quietly(pipeline)
                 raise RuntimeError(self._profile_error_message(fallback_exc, serial)) from fallback_exc
-        self._pipeline = pipeline
-        self._profile = profile
         self._active_color_format = (
             self.config.color_format
             if not selected_profiles.get("fallback_used")
@@ -293,6 +291,15 @@ class RealSenseCamera:
             ) from last_error
 
     def _hardware_reset_device(self, serial: str) -> bool:
+        self._check_pending_stop()
+        if self._startup_timeout_event.is_set():
+            raise RuntimeError("Calibration camera startup timed out; no reset was issued")
+        with SDK_LIFECYCLE_LOCK:
+            return self._hardware_reset_device_locked(serial)
+
+    def _hardware_reset_device_locked(self, serial: str) -> bool:
+        if self._startup_timeout_event.is_set():
+            raise RuntimeError("Calibration camera startup timed out; no reset was issued")
         try:
             device = _device_from_serial(self._rs, serial)
             device.hardware_reset()
@@ -449,31 +456,23 @@ class RealSenseCamera:
             depth_scale_m=self.depth_scale_m,
         )
 
-    def stop(self) -> None:
-        pipeline = self._pipeline
+    def _before_pipeline_stop(self) -> None:
         try:
-            if pipeline is not None and self.config.restore_settings_on_stop:
+            if self.config.restore_settings_on_stop:
                 restore_report = self._restore_device_settings()
                 if restore_report:
                     self.settings_report.update(restore_report)
-            elif pipeline is not None and self._settings_snapshot:
+            elif self._settings_snapshot:
                 self.settings_report["restore.enabled"] = False
         finally:
             self._settings_snapshot = []
-            try:
-                if pipeline is not None:
-                    pipeline.stop()
-            finally:
-                self._pipeline = None
-                self._align = None
-                self._profile = None
-                self._active_color_format = self.config.color_format
 
     def __enter__(self) -> "RealSenseCamera":
         return start_camera_bounded(
             self.start,
             timeout_sec=CALIBRATION_CAMERA_STARTUP_TIMEOUT_SEC,
             on_timeout=self._startup_timeout_event.set,
+            on_worker=self._remember_startup_worker,
         )
 
     def __exit__(self, exc_type, exc, tb) -> None:

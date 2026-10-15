@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import sys
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -514,3 +516,208 @@ def test_single_swapped_calibration_discards_offsets_from_the_old_global_frame(
         loaded.metadata["tracker_offset_calibration"]["left_wrist"]["capture_channel"]
         == "right_wrist_pose"
     )
+
+
+def _home_control(args, components, *, from_hold=False, ui=None):
+    from teleop_runtime.real_teleop.operator_control_runtime import (
+        RealTeleopControlInput,
+    )
+
+    control = RealTeleopControlInput.__new__(RealTeleopControlInput)
+    control.args, control.components, control.ui = args, components, ui
+    control._calibration_requested = True
+    control._calibration_request_from_hold = from_hold
+    control._hold_active = from_hold
+    control._hardware_hold_confirmed = from_hold
+    control._teleop_started = from_hold
+    control._tracker_swap_locked = False
+    control._gripper_control_enabled = False
+    control._current_active_controls = Mock(return_value=["q"])
+    return control
+
+
+@pytest.mark.parametrize("from_hold", [False, True])
+@pytest.mark.parametrize("broken_ui", [False, True])
+def test_missing_source_offset_rejects_home_without_releasing_hold(
+    tmp_path, monkeypatch, from_hold, broken_ui
+):
+    args, source, _physical, components, _path = _calibrate(
+        tmp_path, monkeypatch, True, 180.0, ("right",)
+    )
+    source.swap_left_right_source_roles()
+    args.swap_operator_sides = False
+    components.session.calibration.arms["right_arm"].home_qpos = np.ones(6)
+    before = components.session.calibration.to_dict()
+    ui = SimpleNamespace(publish=Mock(), append_message=Mock())
+    if broken_ui:
+        ui.publish.side_effect = OSError("broken observer")
+        ui.append_message.side_effect = OSError("broken observer")
+    control = _home_control(args, components, from_hold=from_hold, ui=ui)
+
+    assert control.consume_calibration_request() is False
+    assert control._hold_active is from_hold
+    assert control._hardware_hold_confirmed is from_hold
+    assert control._last_calibration_started_from_hold is False
+    assert control._gripper_control_enabled is False
+    assert components.session.calibration.to_dict() == before
+    assert control.consume_calibration_request() is False
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+def test_home_accepts_bound_offset_and_preserves_unmarked_legacy_behavior(
+    tmp_path, monkeypatch, legacy
+):
+    args, source, _physical, components, _path = _calibrate(
+        tmp_path, monkeypatch, True, 180.0, ("right",)
+    )
+    if legacy:
+        components.session.calibration.metadata.pop("tracker_offset_role_binding")
+        source.swap_left_right_source_roles()
+    control = _home_control(args, components, from_hold=True)
+    assert control.consume_calibration_request() is True
+    assert control._hold_active is False
+    assert control._last_calibration_started_from_hold is True
+
+
+@pytest.mark.parametrize("missing", ["offset", "source", "channel"])
+def test_direct_runtime_home_rejects_incomplete_binding_before_sampling(
+    tmp_path, monkeypatch, missing
+):
+    from teleop_runtime.real_teleop.runtime_home import _runtime_home_calibration
+
+    _args, source, _physical, components, _path = _calibrate(
+        tmp_path, monkeypatch, True, 180.0, ("right",)
+    )
+    if missing == "offset":
+        source.swap_left_right_source_roles()
+    elif missing == "source":
+        components.session.sources = []
+    else:
+        components.active_sides = ("left", "right")
+    components.session.poll = Mock(side_effect=AssertionError("must not sample"))
+    before = components.session.calibration.to_dict()
+    with pytest.raises(ValueError, match="VIVE.*(offset|source|mapping)"):
+        _runtime_home_calibration(
+            components, arm_mode="real", timeout_sec=0.1, num_samples=1
+        )
+    components.session.poll.assert_not_called()
+    assert components.session.calibration.to_dict() == before
+
+
+def test_save_new_profile_keeps_selected_path_and_digest_together(tmp_path, monkeypatch):
+    args, _source, _physical, components, original = _calibrate(
+        tmp_path, monkeypatch, False, 0.0
+    )
+    changed = _pose()
+    changed[0, 3] = 0.25
+    components.session.calibration.set_world_to_desk(changed)
+    saved = _save_gui_vive_calibration_profile(args, components, profile_dir=tmp_path)
+    assert saved != original
+    assert args.load_profile == str(saved)
+    assert args.gui_last_vive_calibration_profile == str(saved)
+    assert args.expected_vive_profile_sha256 == hashlib.sha256(saved.read_bytes()).hexdigest()
+    assert _load_gui_vive_calibration_profile(args, components) == saved
+    np.testing.assert_array_equal(components.session.calibration.world_to_desk_pose(), changed)
+
+
+@pytest.mark.parametrize("failure", ["write", "flush", "publish", "collision"])
+def test_failed_profile_publication_leaves_old_binding_and_no_partial_json(
+    tmp_path, monkeypatch, failure
+):
+    from teleop_runtime.real_teleop import vive_calibration_profiles as profiles
+
+    args, _source, _physical, components, original = _calibrate(
+        tmp_path, monkeypatch, False, 0.0
+    )
+    original_bytes = original.read_bytes()
+    before_args = vars(args).copy()
+    before_calibration = components.session.calibration.to_dict()
+    if failure == "write":
+        original_open = io.open
+
+        class InterruptedWrite:
+            def __init__(self, stream):
+                self.stream = stream
+
+            def __getattr__(self, name):
+                return getattr(self.stream, name)
+
+            def __enter__(self):
+                self.stream.__enter__()
+                return self
+
+            def __exit__(self, *exc):
+                return self.stream.__exit__(*exc)
+
+            def write(self, data):
+                self.stream.write(data[:100])
+                self.stream.flush()
+                raise OSError("controlled partial write")
+
+        def interrupted_open(file, mode="r", *args, **kwargs):
+            stream = original_open(file, mode, *args, **kwargs)
+            return InterruptedWrite(stream) if mode.startswith(("w", "x")) else stream
+
+        monkeypatch.setattr(io, "open", interrupted_open)
+        original_path_open = Path.open
+
+        def interrupted_path_open(path, mode="r", *args, **kwargs):
+            stream = original_path_open(path, mode, *args, **kwargs)
+            return InterruptedWrite(stream) if mode.startswith(("w", "x")) else stream
+
+        monkeypatch.setattr(Path, "open", interrupted_path_open)
+        expected_error = OSError
+    elif failure == "flush":
+        monkeypatch.setattr(profiles.os, "fsync", Mock(side_effect=OSError("flush failed")))
+        expected_error = OSError
+    elif failure == "publish":
+        monkeypatch.setattr(profiles.os, "link", Mock(side_effect=OSError("publish failed")))
+        expected_error = OSError
+    else:
+        timestamp = original.name.split("_vive_rm65_real_teleop")[0]
+        monkeypatch.setattr(
+            profiles, "datetime", SimpleNamespace(now=lambda: SimpleNamespace(
+                strftime=lambda _: timestamp, isoformat=lambda **_: "controlled"
+            ))
+        )
+        expected_error = FileExistsError
+    with pytest.raises(expected_error):
+        _save_gui_vive_calibration_profile(args, components, profile_dir=tmp_path)
+    assert list(tmp_path.iterdir()) == [original]
+    assert original.read_bytes() == original_bytes
+    assert vars(args) == before_args
+    assert components.session.calibration.to_dict() == before_calibration
+
+
+def test_profile_discovery_sees_new_file_only_after_complete_publication(tmp_path, monkeypatch):
+    from teleop_runtime.real_teleop import vive_calibration_profiles as profiles
+
+    args, _source, _physical, components, original = _calibrate(
+        tmp_path, monkeypatch, False, 0.0
+    )
+    original_link = profiles.os.link
+
+    def publish(temporary, final):
+        assert profiles._latest_vive_calibration_profile_path(profile_dir=tmp_path) == original
+        assert json.loads(Path(temporary).read_text())["metadata"]["tracker_offset_role_binding"] == "source_role"
+        assert not Path(final).exists()
+        original_link(temporary, final)
+
+    monkeypatch.setattr(profiles.os, "link", publish)
+    saved = _save_gui_vive_calibration_profile(args, components, profile_dir=tmp_path)
+    assert profiles._latest_vive_calibration_profile_path(profile_dir=tmp_path) == saved
+    assert set(tmp_path.iterdir()) == {original, saved}
+
+
+def test_home_subset_requires_only_its_mapped_offset(tmp_path, monkeypatch):
+    from teleop_runtime.real_teleop.vive_calibration_profiles import (
+        validate_vive_profile_for_home,
+    )
+
+    _args, _source, _physical, components, _path = _calibrate(
+        tmp_path, monkeypatch, True, 180.0, ("right",)
+    )
+    components.active_sides = ("left", "right")
+    validate_vive_profile_for_home(components, capture_sides=("right",))
+    with pytest.raises(ValueError, match="mapping.*left_wrist_pose"):
+        validate_vive_profile_for_home(components)

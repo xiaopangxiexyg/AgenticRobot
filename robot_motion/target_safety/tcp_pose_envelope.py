@@ -1650,6 +1650,83 @@ def _projection_result(
     )
 
 
+def _validated_projection_targets(
+    raw_tcp_pose_by_side: Mapping[str, object],
+    *,
+    profile: TCPPoseEnvelopeProfile,
+    target_frame_binding_hash: str,
+    tool_frame_binding_hash_by_side: Mapping[str, str],
+    controlled_frame_id: str,
+    reference_frame_by_side: Mapping[str, str],
+    execution_epoch: int,
+    anchor_receipt: TCPPoseEnvelopeAnchorReceipt | None = None,
+) -> Mapping[str, np.ndarray]:
+    """Validate the paired projection boundary for reports and planning."""
+
+    if not isinstance(profile, TCPPoseEnvelopeProfile):
+        raise TypeError("profile must be TCPPoseEnvelopeProfile")
+    raw_poses = _freeze_pose_mapping(
+        raw_tcp_pose_by_side,
+        name="raw_tcp_pose_by_side",
+    )
+    missing_sides = sorted(set(profile.enabled_sides) - set(raw_poses))
+    if missing_sides:
+        raise TCPPoseEnvelopeBindingError(
+            f"target pose is missing enabled sides: {missing_sides}"
+        )
+    _validate_projection_binding(
+        profile=profile,
+        target_frame_binding_hash=target_frame_binding_hash,
+        tool_frame_binding_hash_by_side=tool_frame_binding_hash_by_side,
+        controlled_frame_id=controlled_frame_id,
+        reference_frame_by_side=reference_frame_by_side,
+        execution_epoch=execution_epoch,
+        anchor_receipt=anchor_receipt,
+    )
+    return raw_poses
+
+
+def tcp_pose_envelope_requires_projection(
+    raw_tcp_pose_by_side: Mapping[str, object],
+    *,
+    profile: TCPPoseEnvelopeProfile,
+    target_frame_binding_hash: str,
+    tool_frame_binding_hash_by_side: Mapping[str, str],
+    controlled_frame_id: str,
+    reference_frame_by_side: Mapping[str, str],
+    execution_epoch: int,
+    anchor_receipt: TCPPoseEnvelopeAnchorReceipt | None = None,
+) -> bool:
+    """Check the same projection without allocating a lineage report.
+
+    This is a read-only planning query, not an alternative safety rule. Every
+    pose and binding is validated and every side uses the canonical projection
+    kernel. A caller that needs a modified pose or diagnostics must perform
+    the normal projection. No result is retained across queries.
+    """
+
+    raw_poses = _validated_projection_targets(
+        raw_tcp_pose_by_side,
+        profile=profile,
+        target_frame_binding_hash=target_frame_binding_hash,
+        tool_frame_binding_hash_by_side=tool_frame_binding_hash_by_side,
+        controlled_frame_id=controlled_frame_id,
+        reference_frame_by_side=reference_frame_by_side,
+        execution_epoch=execution_epoch,
+        anchor_receipt=anchor_receipt,
+    )
+    modified = False
+    for side, raw_pose in raw_poses.items():
+        _, diagnostics = _project_tcp_pose_envelope_side_unchecked(
+            side=side,
+            raw_pose=raw_pose,
+            profile=profile,
+            anchor_receipt=anchor_receipt,
+        )
+        modified = modified or diagnostics.modified
+    return modified
+
+
 def project_tcp_pose_envelope(
     raw_tcp_pose_by_side: Mapping[str, object],
     *,
@@ -1668,18 +1745,8 @@ def project_tcp_pose_envelope(
     raise a typed error so a runtime owner can fail closed before invoking IK.
     """
 
-    if not isinstance(profile, TCPPoseEnvelopeProfile):
-        raise TypeError("profile must be TCPPoseEnvelopeProfile")
-    raw_poses = _freeze_pose_mapping(
+    raw_poses = _validated_projection_targets(
         raw_tcp_pose_by_side,
-        name="raw_tcp_pose_by_side",
-    )
-    missing_sides = sorted(set(profile.enabled_sides) - set(raw_poses))
-    if missing_sides:
-        raise TCPPoseEnvelopeBindingError(
-            f"target pose is missing enabled sides: {missing_sides}"
-        )
-    _validate_projection_binding(
         profile=profile,
         target_frame_binding_hash=target_frame_binding_hash,
         tool_frame_binding_hash_by_side=tool_frame_binding_hash_by_side,
@@ -1764,4 +1831,5 @@ __all__ = [
     "TCPPoseSafetyReferenceReceipt",
     "project_tcp_pose_envelope",
     "project_tcp_pose_envelope_side",
+    "tcp_pose_envelope_requires_projection",
 ]

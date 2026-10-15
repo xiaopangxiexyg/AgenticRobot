@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import deque
 from contextlib import redirect_stderr
+from concurrent.futures import ThreadPoolExecutor
 from io import StringIO
 import json
 import sys
@@ -4167,6 +4168,46 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
             left_preview_backend=preview,
             right_preview_backend=preview,
             arm_state_read_executor=None,
+        )
+
+        snapshot = real_teleop._fresh_gui_init_qpos_by_side(components)
+
+        np.testing.assert_allclose(snapshot["left"], np.zeros(6))
+        np.testing.assert_allclose(snapshot["right"], np.ones(6))
+
+    def test_gui_exact_qpos_snapshot_does_not_reuse_shutdown_startup_executor(self) -> None:
+        now = time.time()
+
+        class StateBackend:
+            def __init__(self, qpos):
+                self.qpos = np.asarray(qpos, dtype=float)
+
+            def refresh_state_from_hardware(self):
+                return {
+                    "hardware_read_success": True,
+                    "hardware_measurement_valid": True,
+                    "hardware_arm_err": 0,
+                    "hardware_sys_err": 0,
+                    "hardware_measurement_timestamp": now,
+                    "hardware_qpos": self.qpos.copy(),
+                }
+
+        class PreviewBackend:
+            @staticmethod
+            def normalize_local_qpos_observation(qpos, *, label):
+                del label
+                return np.asarray(qpos, dtype=float).copy(), {"status": "exact"}
+
+        startup_executor = ThreadPoolExecutor(max_workers=2)
+        startup_executor.shutdown(wait=True)
+        preview = PreviewBackend()
+        components = SimpleNamespace(
+            active_sides=("left", "right"),
+            left_state_backend=StateBackend(np.zeros(6)),
+            right_state_backend=StateBackend(np.ones(6)),
+            left_preview_backend=preview,
+            right_preview_backend=preview,
+            arm_state_read_executor=startup_executor,
         )
 
         snapshot = real_teleop._fresh_gui_init_qpos_by_side(components)

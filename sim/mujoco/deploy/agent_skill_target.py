@@ -22,7 +22,7 @@ from .target_measurement import (
 
 @dataclass(frozen=True)
 class MujocoAgentSkillMotionTarget:
-    """No-model, arms-only target bound to the shared MuJoCo executor."""
+    """No-model right-arm action target on a rig with a separate gripper actuator."""
 
     task_config: Any
     scene: Any
@@ -121,8 +121,9 @@ def build_mujoco_agent_skill_motion_target(
             timing=prepared.timing,
             active_sides=("left", "right"),
             actuation_profile=prepared.arm_profile,
-            # The generic profile has no hand action surface.
-            gripper_actuation_profile=None,
+            # The ComponentAction schema remains right_arm-only. The existing
+            # gripper Skill binds this actuator through its own lower port.
+            gripper_actuation_profile=prepared.gripper_profile,
             realtime_worker=config.realtime_worker,
             follow_qpos_alpha=1.0,
         ),

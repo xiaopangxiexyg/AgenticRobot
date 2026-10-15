@@ -711,6 +711,7 @@ class RuleBasedRealTeleopExtension:
         # compares writer ACKs with the raw keyframe count.
         self._writer_rate_expected_samples_by_step: dict[str, int] = {}
         self._height_calibration: RuleBasedWritingHeightCalibration | None = None
+        self._height_calibration_required_after_release = False
         self._height_calibration_error = ""
         self._height_calibration_pending = False
         self._height_calibration_future: Future[Mapping[str, Any]] | None = None
@@ -1630,6 +1631,8 @@ class RuleBasedRealTeleopExtension:
                     or self._aborted
                     or self._height_calibration_future is not None
                     or self._height_calibration_pending
+                    or self._height_calibration_required_after_release
+                    or self._pending_gripper_action is not None
                     or (
                         self._writing_reachability_enabled()
                         and not self._writing_reachability_passed_for_current_selection()
@@ -1804,6 +1807,7 @@ class RuleBasedRealTeleopExtension:
                     if not self._height_calibration_mutation_idle():
                         raise RuntimeError("高度标定只能在数采和规则运动完整停止时清除。")
                     self._height_calibration = None
+                    self._height_calibration_required_after_release = False
                     self._invalidate_writing_reachability_preflight()
                     self._writing_height_target_z_m = None
                     self._height_calibration_error = ""
@@ -1989,6 +1993,7 @@ class RuleBasedRealTeleopExtension:
             ),
         )
         self._height_calibration = captured
+        self._height_calibration_required_after_release = False
         self._invalidate_writing_reachability_preflight()
         self._height_lower_tolerance_m = float(captured.lower_tolerance_m)
         self._height_upper_tolerance_m = float(captured.upper_tolerance_m)
@@ -2741,45 +2746,55 @@ class RuleBasedRealTeleopExtension:
         second device loop.
         """
 
+        def interrupted(reason: str) -> tuple[bool, str]:
+            self._manual_gripper_settle_samples_by_side[side] = 0
+            return False, reason
+
         recovery_phase = str(state.get("gripper_recovery_phase") or "").strip()
         if recovery_phase in {"recovering", "failed"}:
-            return False, f"等待夹爪恢复({recovery_phase})"
+            return interrupted(f"等待夹爪恢复({recovery_phase})")
         raw_error_code = state.get("gripper_error_code", state.get("error_code"))
         try:
             error_code = None if raw_error_code is None else int(raw_error_code)
         except (TypeError, ValueError):
-            return False, "夹爪反馈错误码无效"
+            return interrupted("夹爪反馈错误码无效")
         if error_code not in (None, 0):
-            return False, f"等待夹爪故障清除(error_code={error_code})"
+            return interrupted(f"等待夹爪故障清除(error_code={error_code})")
         telemetry_error = str(state.get("telemetry_error") or "").strip()
         if telemetry_error and not telemetry_error.lower().startswith("tactile_"):
-            return False, f"等待夹爪传输恢复({telemetry_error})"
+            return interrupted(f"等待夹爪传输恢复({telemetry_error})")
 
         status_code = state.get("gripper_status_code", state.get("status_code"))
         try:
             status_code = None if status_code is None else int(status_code)
         except (TypeError, ValueError):
-            return False, "夹爪状态码无效"
+            return interrupted("夹爪状态码无效")
         if status_code in {4, 5}:
             direction = "张开" if status_code == 5 else "闭合"
-            return False, f"夹爪仍在{direction}运动"
+            return interrupted(f"夹爪仍在{direction}运动")
         if bool(state.get("gripper_is_moving")):
-            return False, "夹爪反馈仍显示运动中"
+            return interrupted("夹爪反馈仍显示运动中")
 
         feedback_timestamp = self._manual_gripper_feedback_timestamp(state)
         last_dispatch = self._manual_gripper_last_dispatch_at_by_side.get(side)
         if last_dispatch is None:
-            return False, "等待本次夹爪命令后的反馈"
+            return interrupted("等待本次夹爪命令后的反馈")
         if (
             feedback_timestamp is not None
             and feedback_timestamp <= float(last_dispatch)
         ):
-            return False, "等待夹爪命令后的新鲜反馈"
+            return interrupted("等待夹爪命令后的新鲜反馈")
 
         token = self._manual_gripper_feedback_token(state, now=float(now))
         previous_token = self._manual_gripper_last_settle_feedback_token_by_side.get(
             side
         )
+        if (
+            previous_token is not None
+            and previous_token[0] == token[0]
+            and token[1] < previous_token[1]
+        ):
+            return interrupted("夹爪反馈时间倒退，等待新鲜反馈")
         if previous_token == token:
             count = self._manual_gripper_settle_samples_by_side.get(side, 0)
             return False, (
@@ -3085,6 +3100,7 @@ class RuleBasedRealTeleopExtension:
             if feedback_state is not None:
                 feedback_state_by_side[side] = feedback_state
             if measured_qpos is None:
+                self._manual_gripper_settle_samples_by_side[side] = 0
                 waiting.append(f"{side}:{feedback_error}")
                 continue
             config = getattr(backend, "config", None)
@@ -3167,6 +3183,9 @@ class RuleBasedRealTeleopExtension:
                             hand_qpos[side] = qpos
                             resend_sides.add(side)
                 continue
+            # A fresh sample outside the endpoint/contact predicate also
+            # interrupts settling; it must not bridge two stable streaks.
+            self._manual_gripper_settle_samples_by_side[side] = 0
             if last_target is not None:
                 command_baseline = self._manual_gripper_command_baseline_by_side.get(side)
                 if command_baseline is None:
@@ -3412,6 +3431,19 @@ class RuleBasedRealTeleopExtension:
                 raise RuntimeError(
                     "Session does not expose the external-command safety seam."
                 )
+            if (
+                is_release
+                and "right" in hand_qpos
+                and str(self.source_selection.get("collection_mode") or "rule_based_writing")
+                == "rule_based_writing"
+            ):
+                # Invalidate before the call: a failed/partial receipt or
+                # transport exception cannot prove the pen did not move.
+                # Merely queueing an intent never reaches this boundary.
+                self._height_calibration = None
+                self._height_calibration_required_after_release = True
+                self._writing_height_target_z_m = None
+                self._invalidate_writing_reachability_preflight()
             result = dispatch_external(
                 command,
                 observation,
@@ -7411,13 +7443,26 @@ class RuleBasedRealTeleopExtension:
                     )
                 else:
                     right_pose[2, 3] = float(calibration.upper_bound_z_m)
-            elif calibration.contact_offset_tool_tcp_m:
-                probe_pose = pose_matrix_to_xyzquat(right_pose)
-                right_pose[2, 3] += max(
-                    0.0,
-                    calibration.lower_bound_z_m
-                    - contact_height_from_tool_tcp(probe_pose),
+            else:
+                # Height capture translates the planned writing boundary in
+                # canonical desk Z without changing its orientation. Apply
+                # that same translation to the entire relative replay, not
+                # just a floor clamp of its source-height samples.
+                writing_end = np.asarray(
+                    raw_probe["writing_end_pose_canonical_desk"], dtype=float
+                ).reshape(7)
+                calibrated_end_z = (
+                    tool_tcp_z_for_contact_height(writing_end, calibration.upper_bound_z_m)
+                    if calibration.contact_offset_tool_tcp_m
+                    else float(calibration.upper_bound_z_m)
                 )
+                right_pose[2, 3] += calibrated_end_z - float(writing_end[2])
+                probe_pose = pose_matrix_to_xyzquat(right_pose)
+                contact_z = (
+                    contact_height_from_tool_tcp(probe_pose)
+                    if calibration.contact_offset_tool_tcp_m else float(probe_pose[2])
+                )
+                right_pose[2, 3] += max(0.0, calibration.lower_bound_z_m - contact_z)
             # Mirror the formal execution path in _coupled_pose_emission:
             # canonical desk -> runtime arm base -> calibrated solver world ->
             # solver endpoint.  Feeding canonical desk directly to the solver
@@ -8588,6 +8633,11 @@ class RuleBasedRealTeleopExtension:
             and self._pending_gripper_action is None
         )
         gripper_action_pending = self._pending_gripper_action is not None
+        if self._height_calibration_required_after_release:
+            readiness_blockers = dict(readiness_blockers)
+            detail = "右夹爪已松开，原书写高度已失效；请闭紧夹爪后重新标定书写高度。"
+            readiness_blockers["rule.writing_height"] = detail
+            readiness_reason = "; ".join(part for part in (readiness_reason, detail) if part)
         if (
             session_state_value in {"ARMED", "RUNNING"}
             and not self._held
