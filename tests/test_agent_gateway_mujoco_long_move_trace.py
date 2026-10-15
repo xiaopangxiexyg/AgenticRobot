@@ -132,7 +132,13 @@ def test_move_tcp_to_pose_completes_envelope_derived_eight_cm_mujoco_trace() -> 
             admitted["operation"]["operation_id"]
         )
         assert operation is not None
-        assert operation.status == "completed"
+        assert operation.status == "completed", (
+            f"status={operation.status}; reason_code={operation.reason_code}; "
+            f"task_outcome={operation.task_outcome}; "
+            f"initial_pose={initial_pose}; target_pose={target_pose}; "
+            f"first_measured_pose={measured_pose_path[:1]}; "
+            f"last_measured_pose={measured_pose_path[-1:]}"
+        )
         assert operation.reason_code == "tcp_pose_terminal_rule_succeeded"
         assert operation.task_outcome == "succeeded"
 
