@@ -31,6 +31,10 @@ from control_station.refinement_annotation.application import (
     _stage_occurrences_from_draft,
 )
 from control_station.refinement_annotation.cli import build_parser
+from control_station.refinement_annotation.episode_status import (
+    EpisodeAnnotationSummary,
+    build_episode_status_payload,
+)
 from dataset_interface.progress_annotation_read_cache import (
     ProgressAnnotationReadCache,
 )
@@ -292,14 +296,12 @@ def test_empty_dataset_gui_is_loopback_only_and_releases_lock(
         assert "/api/reflow-failed-stage/" in app_source
         assert "function renderCaptureEndStepEditor" in app_source
         assert "function annotationAttempts" in app_source
-        assert "详细标注完成" in app_source
         assert "detail_annotation_complete" in app_source
         assert ".badge.detail-complete" in style_source
         assert "function episodeStatus" in app_source
         assert "function renderEpisodeRow" in app_source
         assert "episodeRowSignatures" in app_source
         assert "annotationSummarySignature(updated)" in app_source
-        assert "详细标注需重做" in app_source
         assert ".episode-item.attention-critical" in style_source
         assert ".episode-item.attention-failure" in style_source
         assert '"ANNOTATED_FAILURE"' in app_source
@@ -2036,6 +2038,85 @@ def test_http_commit_returns_json_for_stage_store_error(
         gui.close()
 
 
+def test_http_commit_returns_authoritative_episode_status(tmp_path: Path) -> None:
+    episode_uuid = _finalized_failure_retry_dataset(tmp_path)
+    gui = RefinementAnnotationGui(
+        tmp_path,
+        annotator_id="fixture",
+        open_browser=False,
+    )
+    try:
+        url = gui.start()
+        draft = _read_json(
+            f"{url}api/episode/{quote(episode_uuid)}"
+        )["episode"]["draft"]
+        committed = _post_json(
+            f"{url}api/commit/{quote(episode_uuid)}",
+            draft,
+        )
+        summary = committed["episode_summary"]
+        assert committed["ok"] is True
+        assert committed["episode_summary_error"] is None
+        assert summary["episode_uuid"] == episode_uuid
+        assert summary["annotation_summary_loaded"] is True
+        assert summary["annotation_set_count"] == 1
+        assert summary["annotation_status"]["schema"] == (
+            "dexteleop.refinement_annotation.episode_status.v1"
+        )
+        assert "COARSE_SEALED" in {
+            badge["code"]
+            for badge in summary["annotation_status"]["badges"]
+        }
+    finally:
+        gui.close()
+
+
+def test_http_commit_keeps_success_when_status_read_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    episode_uuid = _finalized_failure_retry_dataset(tmp_path)
+    gui = RefinementAnnotationGui(
+        tmp_path,
+        annotator_id="fixture",
+        open_browser=False,
+    )
+    try:
+        url = gui.start()
+        draft = _read_json(
+            f"{url}api/episode/{quote(episode_uuid)}"
+        )["episode"]["draft"]
+
+        def failed_status_read(*_args: object, **_kwargs: object) -> object:
+            raise RuntimeError("status read unavailable")
+
+        monkeypatch.setattr(
+            gui.server.require_application(),
+            "episode_annotation_summaries",
+            failed_status_read,
+        )
+        committed = _post_json(
+            f"{url}api/commit/{quote(episode_uuid)}",
+            draft,
+        )
+        assert committed["ok"] is True
+        assert committed["episode_summary"] is None
+        assert committed["episode_summary_error"] == (
+            "RuntimeError: status read unavailable"
+        )
+        annotation_root = (
+            tmp_path
+            / "meta"
+            / "progress"
+            / "stage_annotations"
+            / episode_uuid
+            / committed["report"]["annotation_set_id"]
+        )
+        assert (annotation_root / "manifest.cjson").is_file()
+    finally:
+        gui.close()
+
+
 def test_http_episode_open_reports_operation_progress(tmp_path: Path) -> None:
     episode_uuid = _finalized_failure_retry_dataset(tmp_path)
     gui = RefinementAnnotationGui(
@@ -2063,6 +2144,28 @@ def test_http_episode_open_reports_operation_progress(tmp_path: Path) -> None:
         assert progress["error"] is None
     finally:
         gui.close()
+
+
+def test_detail_badge_labels_come_from_server_status() -> None:
+    summary = EpisodeAnnotationSummary(
+        annotation_set_count=1,
+        review_state="NONE",
+        latest_annotation_mode="STANDARD",
+        whole_episode_abnormal=False,
+        whole_episode_abnormal_reason=None,
+    )
+    for detail_state, code, label in (
+        ("COMPLETE", "DETAIL_COMPLETE", "详细标注完成"),
+        ("STALE", "DETAIL_STALE", "详细标注需重做"),
+    ):
+        status = build_episode_status_payload(
+            summary,
+            draft_requires_seal=False,
+            detail_state=detail_state,
+        )
+        assert {
+            badge["code"]: badge["label"] for badge in status["badges"]
+        }[code] == label
 
 
 def test_episode_status_separates_unsealed_draft_from_sealed_cache(

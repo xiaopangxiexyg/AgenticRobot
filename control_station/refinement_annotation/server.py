@@ -505,6 +505,44 @@ class _AnnotationHandler(BaseHTTPRequestHandler):
             "application/json; charset=utf-8",
         )
 
+    def _send_committed_report(
+        self,
+        episode_uuid: str,
+        report: dict[str, Any],
+    ) -> None:
+        # The immutable commit has already succeeded. A subsequent status-read
+        # failure must remain visible without turning that success into an
+        # ambiguous HTTP error that might prompt a duplicate publication.
+        summary: dict[str, Any] | None = None
+        summary_error: str | None = None
+        try:
+            result = self.application.episode_annotation_summaries(
+                (episode_uuid,)
+            )
+            summaries = result["summaries"]
+            errors = result["errors"]
+            if (
+                len(summaries) == 1
+                and summaries[0].get("episode_uuid") == episode_uuid
+                and not errors
+            ):
+                summary = summaries[0]
+            elif errors:
+                summary_error = str(errors[0].get("error") or "状态摘要读取失败。")
+            else:
+                summary_error = "提交后未能读取对应 Episode 的状态摘要。"
+        except Exception as exc:  # noqa: BLE001 - commit is already irreversible.
+            summary_error = f"{type(exc).__name__}: {exc}"
+        self._send_json(
+            HTTPStatus.OK,
+            {
+                "ok": True,
+                "report": report,
+                "episode_summary": summary,
+                "episode_summary_error": summary_error,
+            },
+        )
+
     def _send_error_json(
         self,
         status: HTTPStatus,
@@ -1111,10 +1149,7 @@ class _AnnotationHandler(BaseHTTPRequestHandler):
                         operation_id,
                         "详细标注已封存",
                     )
-                self._send_json(
-                    HTTPStatus.OK,
-                    {"ok": True, "report": report},
-                )
+                self._send_committed_report(detail_episode_uuid, report)
             except (
                 OSError,
                 RefinementAnnotationApplicationError,
@@ -1162,7 +1197,7 @@ class _AnnotationHandler(BaseHTTPRequestHandler):
                     operation_id,
                     "标注已封存",
                 )
-            self._send_json(HTTPStatus.OK, {"ok": True, "report": report})
+            self._send_committed_report(episode_uuid, report)
         except (
             OSError,
             RefinementAnnotationApplicationError,
