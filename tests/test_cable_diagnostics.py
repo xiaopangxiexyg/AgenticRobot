@@ -200,3 +200,37 @@ def test_probe_uses_recorded_intrinsics_and_explicit_robot_distance_hints(tmp_pa
     assert mask[positive[1], positive[0]]
     assert rigid[negative[1], negative[0]] <= .008
     assert report["opening_radius_px"] == pytest.approx(5.)
+
+
+@pytest.mark.parametrize("larger_state", ["rigid", "no_depth", "protected", "valid"])
+def test_prompt_ranks_only_components_with_an_eligible_positive_seed(larger_state):
+    thin = np.zeros((24, 32), dtype=bool)
+    larger = np.zeros_like(thin)
+    smaller = np.zeros_like(thin)
+    larger[3:8, 3:12] = True
+    smaller[14:17, 22:28] = True
+    thin |= larger | smaller
+    depth = np.ones(thin.shape, dtype=np.float32)
+    protected = np.zeros_like(thin)
+    attachment = np.full(thin.shape, np.inf)
+    attachment[thin] = .01
+    rigid = np.full(thin.shape, np.inf)
+    if larger_state == "rigid":
+        rigid[larger] = .005
+    elif larger_state == "no_depth":
+        depth[larger] = 0
+    elif larger_state == "protected":
+        protected[larger] = True
+    originals = [value.copy() for value in (depth, thin, protected, attachment, rigid)]
+    result = cable_prompt_from_geometry(depth_m=depth, thin_mask=thin,
+        protected_mask=protected, attachment_distance_m=attachment,
+        rigid_surface_distance_m=rigid)
+    assert result is not None, "A supported component with a valid positive seed must not be discarded"
+    expected = larger if larger_state == "valid" else smaller
+    u, v = result.positive_uv
+    assert expected[v, u] and not protected[v, u]
+    assert depth[v, u] > 0 and rigid[v, u] > .008
+    assert result.component_pixels == int(expected.sum())
+    assert result.attachment_support_pixels == int(expected.sum())
+    for actual, original in zip((depth, thin, protected, attachment, rigid), originals):
+        np.testing.assert_array_equal(actual, original)

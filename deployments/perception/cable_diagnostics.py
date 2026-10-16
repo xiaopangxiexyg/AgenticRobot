@@ -122,6 +122,9 @@ def cable_prompt_from_geometry(*, depth_m: np.ndarray, thin_mask: np.ndarray,
         count = int(support.sum())
         if count < minimum_support_pixels:
             continue
+        eligible_seed = local & (depth[region] > 0) & (rigid[region] > rigid_tolerance_m)
+        if not np.any(eligible_seed):
+            continue
         # Prefer a substantial connected strand, not an arbitrary top-score tie.
         rank = (int(local.sum()), count)
         if best_rank is None or rank > best_rank:
