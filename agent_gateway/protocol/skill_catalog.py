@@ -17,6 +17,7 @@ import math
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass
+from functools import cached_property
 from types import MappingProxyType
 from typing import Any
 
@@ -1586,8 +1587,10 @@ class SkillRouteManifest:
             )
         raise KeyError("Skill Route reference is ambiguous; route identity required.")
 
-    @property
+    @cached_property
     def semantic_content_hash(self) -> str:
+        # The manifest and its typed children are frozen. Reuse only this
+        # instance's identity, never an observation or an admission decision.
         return canonical_content_hash(
             {
                 "protocol_version": self.protocol_version,

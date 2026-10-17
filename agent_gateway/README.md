@@ -179,6 +179,9 @@ agent framework:
 
 1. Discover and hash-pin the Definition, Schema, I/O, Route, and Session
    Capability documents for one runtime session.
+   不可变 Route Manifest 的语义哈希仅在该实例首次使用时计算，后续请求复用；
+   新会话或 binding/Route 等变化仍创建新实例并重新计算。该复用不缓存实时观测、
+   参数校验或准入决定，也不改变 wire/hash 协议。
 2. Keep upper Task, Program/graph, guard, retry/fallback, planning-generation,
    Memory, and reasoning records outside the Gateway wire request. In RPent,
    `ExecutionIntent`, `SemanticProgramSpec`, and `SkillAttempt` are examples of

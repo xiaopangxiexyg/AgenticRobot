@@ -366,6 +366,84 @@ def test_manifest_entry_evaluation_plan_presence_matches_route_semantics() -> No
         )
 
 
+def test_manifest_identity_is_computed_once_per_immutable_instance(monkeypatch) -> None:
+    from agent_gateway.protocol import skill_catalog
+
+    definition, schema_entry, definitions, schemas = _catalogs()
+    manifest = _manifest(_route(definition, schema_entry), definitions, schemas)
+    original = skill_catalog.canonical_content_hash
+    calls = []
+
+    def counted(payload, *, domain):
+        if domain == skill_catalog.AGENT_SKILL_ROUTE_MANIFEST_HASH_DOMAIN_V2:
+            calls.append(payload)
+        return original(payload, domain=domain)
+
+    monkeypatch.setattr(skill_catalog, "canonical_content_hash", counted)
+    identity = manifest.semantic_content_hash
+    for _ in range(3):
+        assert manifest.semantic_content_hash == identity
+        assert manifest.to_wire()["route_manifest_hash"] == identity
+    assert len(calls) == 1
+    assert original(
+        calls[0], domain=skill_catalog.AGENT_SKILL_ROUTE_MANIFEST_HASH_DOMAIN_V2,
+    ) == identity
+
+
+@pytest.mark.parametrize("changed_field", [
+    "runtime", "station", "definition_catalog", "schema_catalog", "io_catalog",
+    "features", "exclusions", "availability", "evaluation", "binding", "route",
+])
+def test_replaced_manifest_never_reuses_another_instances_identity(changed_field) -> None:
+    definition, schema_entry, definitions, schemas = _catalogs()
+    manifest = _manifest(_route(definition, schema_entry), definitions, schemas)
+    identity = manifest.semantic_content_hash
+    entry = manifest.skill_routes[0]
+    changes = {
+        "runtime": {"runtime_session_id": "runtime:sim:other"},
+        "station": {"station_manifest_hash": "station:sim:other"},
+        "definition_catalog": {"skill_definition_catalog_hash": "definitions:other"},
+        "schema_catalog": {"skill_schema_catalog_hash": "schemas:other"},
+        "io_catalog": {"skill_io_catalog_hash": "io:other"},
+        "features": {"supported_transport_features": ("idempotency_v1", "poll_v1")},
+        "exclusions": {"explicit_exclusions": ("other-exclusion",)},
+        "availability": {"skill_routes": (replace(entry, availability_hash="availability:other"),)},
+        "evaluation": {"skill_routes": (replace(entry, evaluation_plan_hash="evaluation:other"),)},
+        "binding": {"skill_routes": (replace(entry, deployment_binding=replace(
+            entry.deployment_binding, deployment_binding_hash="binding:other")),)},
+        "route": {"skill_routes": (replace(entry, route=replace(
+            entry.route, max_operation_duration_ms=4_000)),)},
+    }
+    same = replace(manifest)
+    other = replace(manifest, **changes[changed_field])
+    assert same == manifest
+    assert same.semantic_content_hash == identity
+    assert other.semantic_content_hash != identity
+    assert manifest.semantic_content_hash == identity
+
+
+def test_manifest_identity_is_not_changed_by_exported_wire_or_input_lists() -> None:
+    from concurrent.futures import ThreadPoolExecutor
+    from dataclasses import FrozenInstanceError
+
+    definition, schema_entry, definitions, schemas = _catalogs()
+    original = _manifest(_route(definition, schema_entry), definitions, schemas)
+    entries = list(original.skill_routes)
+    manifest = replace(original, skill_routes=entries)
+    entries.clear()
+    with ThreadPoolExecutor(max_workers=4) as workers:
+        identities = tuple(workers.map(lambda _: manifest.semantic_content_hash, range(16)))
+    assert len(set(identities)) == 1
+    wire = manifest.to_wire()
+    wire["skill_routes"][0]["availability_hash"] = "availability:mutated"
+    wire["skill_routes"][0]["route"]["resource_claims"].clear()
+    wire["supported_transport_features"].clear()
+    assert manifest.semantic_content_hash == identities[0]
+    assert manifest.to_wire() == original.to_wire()
+    with pytest.raises(FrozenInstanceError):
+        manifest.runtime_session_id = "runtime:mutated"
+
+
 def test_manifest_closes_over_definition_schema_profile_and_binding_hashes() -> None:
     definition, schema_entry, definitions, schemas = _catalogs()
     route = _route(definition, schema_entry)
