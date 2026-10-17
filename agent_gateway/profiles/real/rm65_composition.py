@@ -9,8 +9,10 @@ socket, thread, or motion authority.  RealTeleop, VIVE, collection, GUI, and
 from __future__ import annotations
 
 import time
+import threading
+from functools import partial
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 from pathlib import Path
 
 from agent_gateway.profiles.segmentation import (
@@ -21,6 +23,8 @@ from agent_gateway.protocol.skill_catalog import (
     SkillDeploymentSafetyEnvelopeRef,
 )
 from agent_gateway.runtime.artifact_store import RecoverableAgentArtifactStore
+from .motion_observed_scene import ObservedSafeMovePlanner, SafeMotionObservationConfig
+from .motion_observed_scene_debug import validate_debug_directory
 from agent_gateway.transport.client_bindings import (
     compile_agent_gateway_unix_client_bindings,
 )
@@ -208,8 +212,7 @@ class ExclusiveRM65AgentPrimitiveComposition:
             if any(
                 item is not None
                 for item in (
-                    self.rgb_camera_geometry,
-                    self.localization_registration,
+                            self.localization_registration,
                     self.localization_provider,
                     self.segmentation_registration,
                     self.station_point_grasp_registration,
@@ -279,6 +282,8 @@ def assemble_exclusive_rm65_agent_primitive_composition(
     debug_render_object_coordinates: bool = False,
     enable_point_grasp_arm_reachability: bool = False,
     grasp_trajectory_config: RM65GraspTrajectoryPlanningConfig | None = None,
+    safe_motion_observation_config: SafeMotionObservationConfig | None = None,
+    safe_motion_debug_dir: str | Path | None = None,
     clock: Callable[[], float] = time.time,
     sleep: Callable[[float], None] = time.sleep,
 ) -> ExclusiveRM65AgentPrimitiveComposition:
@@ -382,6 +387,14 @@ def assemble_exclusive_rm65_agent_primitive_composition(
             "provided together."
         )
     grasp_enabled = point_grasp_planner is not None
+    observed_safe_enabled = safe_motion_observation_config is not None
+    if observed_safe_enabled and (not isinstance(safe_motion_observation_config, SafeMotionObservationConfig)
+            or not perception_enabled or "move_tcp_to_pose_safe" not in normalized_actions):
+        raise ValueError("Observed safe motion requires its typed policy, composed cameras and explicit safe move authorization.")
+    if safe_motion_debug_dir is not None:
+        if not observed_safe_enabled:
+            raise ValueError("Safe-motion debug records require observed safe motion.")
+        safe_motion_debug_dir = validate_debug_directory(safe_motion_debug_dir)
     if enable_grasp_observation and (
         not grasp_enabled or getattr(point_grasp_planner, "backend_id", None) != "graspgenx"
     ):
@@ -394,7 +407,7 @@ def assemble_exclusive_rm65_agent_primitive_composition(
         raise ValueError("Point-grasp requires the composed camera resources.")
     if enable_back_projection and not perception_enabled:
         raise ValueError("Back projection requires composed cameras and capture-time geometry.")
-    if (grasp_enabled or enable_back_projection) != (camera_mount_urdf_path is not None):
+    if (grasp_enabled or enable_back_projection or observed_safe_enabled) != (camera_mount_urdf_path is not None):
         raise ValueError(
             "Point-grasp three-view rendering requires one explicit camera mount URDF."
         )
@@ -495,6 +508,8 @@ def assemble_exclusive_rm65_agent_primitive_composition(
             "active_side": side,
             "inactive_side_semantics": "coupled_solver_hard_hold",
             "command_owner_count": 1,
+            **({"safe_motion_observation": asdict(safe_motion_observation_config)}
+               if safe_motion_observation_config is not None else {}),
         },
         domain="dexteleop.real_skill.rm65_execution_manifest.v1",
     )
@@ -657,7 +672,7 @@ def assemble_exclusive_rm65_agent_primitive_composition(
             ),
         )
         perception_frame_binding = station_frame_binding
-        if grasp_enabled or enable_back_projection:
+        if grasp_enabled or enable_back_projection or observed_safe_enabled:
             assert camera_mount_urdf_path is not None
             rgb_camera_geometry = build_rm65_rgb_camera_geometry(
                 source_binding=perception_source_binding,
@@ -904,18 +919,62 @@ def assemble_exclusive_rm65_agent_primitive_composition(
             reachability_config=reachability_config,
             trajectory_record_dir=planned_trajectory_dir,
         )
-
         safe_pose_trajectory_planner = None
+        safe_pose_trajectory_planner_factory = None
         if "move_tcp_to_pose_safe" in normalized_actions:
             safe_config = (grasp_trajectory_config or RM65GraspTrajectoryPlanningConfig()).for_tcp_pose_move(
                 translation_tolerance_m=convergence_profile.translation_tolerance_m,
                 rotation_tolerance_rad=convergence_profile.rotation_tolerance_rad)
-            safe_pose_trajectory_planner = RM65GraspJointTrajectoryPlanner(
-                profile=lower.profile,
-                planning_target_builder=build_exclusive_rm65_skill_target_builder(lower.profile),
-                target_envelope_filter=lower.target_builder.pre_ik_target_safety_filter,
-                config=safe_config, reachability_config=reachability_config,
-                trajectory_record_dir=planned_trajectory_dir)
+
+            safe_static_planner = None
+            safe_static_planner_lock = threading.Lock()
+
+            def safe_planner_factory(cloud=None):
+                nonlocal safe_static_planner
+                with safe_static_planner_lock:
+                    if safe_static_planner is None:
+                        safe_static_planner = RM65GraspJointTrajectoryPlanner(profile=lower.profile,
+                            planning_target_builder=build_exclusive_rm65_skill_target_builder(lower.profile),
+                            target_envelope_filter=lower.target_builder.pre_ik_target_safety_filter,
+                            config=safe_config, reachability_config=reachability_config,
+                            trajectory_record_dir=planned_trajectory_dir)
+                return (safe_static_planner if cloud is None else
+                        partial(safe_static_planner.plan_with_observed_cloud, cloud))
+
+            if observed_safe_enabled:
+                assert captured_robot_observation_filter is not None
+                assert perception_source_binding is not None
+                aligned_roles = {item["role"] for item in catalog_provider.aligned_rgbd_source_catalog()}
+                if not set(safe_motion_observation_config.roles) <= aligned_roles:
+                    raise ValueError("Required safe-motion views are absent from the camera profile.")
+                if lower.profile.station_world_frame_id != perception_frame_binding.source_frame_id:
+                    raise ValueError("Safe obstacle camera geometry and lower world frame differ.")
+
+                def safe_pose_trajectory_planner_factory(provider, current_revision):
+                    context_files = None
+                    if safe_motion_debug_dir is not None:
+                        context_files = {
+                            "camera-config.json": camera_config_path, "camera-registry.json": camera_registry_path,
+                            "robot.urdf": camera_mount_urdf_path, "envelope-profile.json": lower.profile.envelope_profile_path,
+                            **{f"{side}-tool-profile.json": path
+                               for side, path in lower.profile.tool_profile_path_by_side.items()},
+                        }
+                        deployment_metadata = Path(__file__).resolve().parents[3] / "DEPLOYMENT.json"
+                        if deployment_metadata.is_file():
+                            context_files["deployment.json"] = deployment_metadata
+                    return ObservedSafeMovePlanner(provider=provider, current_station_revision=current_revision,
+                        reference_frame_id=lower.profile.station_world_frame_id,
+                        self_filter=captured_robot_observation_filter, config=safe_motion_observation_config,
+                        planner_factory=safe_planner_factory, clock=clock,
+                        non_motion_read_window=lower.ports.non_motion_read_window,
+                        debug_record_dir=safe_motion_debug_dir,
+                        debug_context={"runtime_session_id": runtime_session_id,
+                                       "deployment_profile_hash": lower.profile.semantic_content_hash},
+                        debug_context_files=context_files,
+                        observation_record_dir=(None if planned_trajectory_dir is None
+                            else Path(planned_trajectory_dir) / "observations"))
+            else:
+                safe_pose_trajectory_planner = safe_planner_factory()
 
         def reachability_evaluator_factory(port):
             if arm_reachability_profile is None:
@@ -971,6 +1030,7 @@ def assemble_exclusive_rm65_agent_primitive_composition(
             ),
             grasp_trajectory_planner=grasp_trajectory_planner,
             safe_pose_trajectory_planner=safe_pose_trajectory_planner,
+            safe_pose_trajectory_planner_factory=safe_pose_trajectory_planner_factory,
             captured_robot_observation_filter=(captured_robot_observation_filter),
             non_motion_read_window=lower.ports.non_motion_read_window,
             perception_provider_factory=provider_factory,

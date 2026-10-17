@@ -79,7 +79,7 @@ class VisibleGraspDepthFilterConfig:
 PRODUCTION_VISIBLE_GRASP_DEPTH_FILTER = VisibleGraspDepthFilterConfig()
 
 
-def _filter_isolated_background_depth(
+def filter_isolated_background_depth(
     *,
     depth_m: np.ndarray,
     target_mask: np.ndarray,
@@ -322,7 +322,7 @@ class VisibleGraspScene:
             if not isinstance(depth_filter, VisibleGraspDepthFilterConfig):
                 raise TypeError("depth_filter must be VisibleGraspDepthFilterConfig or None")
             valid_depth, depth_preprocessing_evidence = (
-                _filter_isolated_background_depth(
+                filter_isolated_background_depth(
                     depth_m=depth,
                     target_mask=mask,
                     config=depth_filter,

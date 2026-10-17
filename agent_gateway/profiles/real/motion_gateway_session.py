@@ -317,16 +317,17 @@ class RealAgentPrimitiveObservationProducer:
                 raise ValueError(f"Real motion owner {field_name} mismatch.")
         if owner.lifecycle_state != "running" or owner.execution_gate != "ready":
             snapshot = self.port.snapshot()
-            composed_confirmed_hold = (
-                self.contract_bundle.gripper_contract is not None
-                and owner.lifecycle_state == "hold"
+            confirmed_hold = (
+                owner.lifecycle_state == "hold"
                 and owner.execution_gate == "hold"
                 and snapshot.phase == RealAgentMotionPhase.HELD
                 and snapshot.hold_succeeded is True
             )
-            if not composed_confirmed_hold:
+            if not confirmed_hold:
                 raise RuntimeError(
-                    "Real motion owner is not RUNNING/READY or a composed confirmed HOLD."
+                    "Real motion owner is not RUNNING/READY or a lower-confirmed HOLD: "
+                    f"lifecycle={owner.lifecycle_state}, gate={owner.execution_gate}, "
+                    f"phase={snapshot.phase.value}, hold_succeeded={snapshot.hold_succeeded}."
                 )
         return owner
 

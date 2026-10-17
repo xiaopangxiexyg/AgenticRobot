@@ -1,0 +1,142 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>只读 RGB-D · 碰撞点投影检查</title>
+<style>
+:root{color-scheme:light dark;--bg:light-dark(#fff,#17191d);--fg:light-dark(#20232b,#e9edf4);--line:light-dark(#d6dbe3,#414854);--muted:light-dark(#626b79,#b3bac7)}
+*{box-sizing:border-box}body{margin:0;padding:20px;background:var(--bg);color:var(--fg);font:15px/1.5 system-ui,sans-serif}h1{font-size:21px;margin:0 0 10px}h2{font-size:17px;font-weight:500;margin:10px 0}label{display:inline-flex;align-items:center;gap:8px}select,button{font:inherit;color:inherit;background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:6px 9px}select:focus,button:focus{outline:2px solid #628ed9}.controls{display:flex;gap:16px;flex-wrap:wrap;margin:10px 0}.grid{display:grid;grid-template-columns:minmax(0,1.25fr) minmax(0,1fr);gap:18px}.grid>section{min-width:0}#plot{height:580px;width:100%}canvas{display:block;width:100%;height:auto;cursor:crosshair}p{margin:8px 0}.muted{color:var(--muted);font-size:13px}.status{font-variant-numeric:tabular-nums;overflow-wrap:anywhere;min-height:26px}#error{color:light-dark(#ad1829,#ff9fa9);white-space:pre-wrap}.legend{display:flex;gap:14px;flex-wrap:wrap;font-size:13px}.green{color:light-dark(#087f47,#6adfa6)}.orange{color:light-dark(#a65a00,#ffbc63)}code{overflow-wrap:anywhere;font-size:13px}@media(max-width:850px){.grid{grid-template-columns:1fr}#plot{height:510px}body{padding:12px}}
+</style>
+</head>
+<body>
+<h1>只读 RGB-D · 碰撞点与原图像素联动</h1>
+<section id="raw-preview"><p>原始 RGB 预览（无需网络或 JavaScript；3D 加载失败时仍可查看）：</p>
+<div style="display:flex;flex-wrap:wrap;gap:10px">__RGB_PREVIEW__</div></section>
+<style>#raw-preview figure{margin:0;flex:1;min-width:250px}#raw-preview img{width:100%;height:auto}</style>
+<p id="summary" class="status">正在加载已保存的数据；不会连接设备。</p>
+<div class="controls">
+  <label>点云显示<select id="mode"><option value="raw">原始 RGB 彩色点云</option><option value="retained">保留的障碍点</option><option value="self">已滤除的自体点</option><option value="classified">过滤分类着色</option></select></label>
+  <label>范围<select id="scope"><option value="local">冲突位置附近</option><option value="all">完整场景</option></select></label>
+  <label><input type="checkbox" id="boxes" checked>碰撞 proxy</label>
+  <button id="nearest" type="button">回到最近冲突点</button>
+</div>
+<div class="grid">
+  <section>
+    <h2>RGB-D 反投影 · 可旋转、缩放、点选</h2>
+    <div id="plot" role="img" aria-label="来自同步 RGB-D 的彩色点云以及当前关节姿态下的碰撞框。点选可定位到原图像素。"></div>
+    <div class="legend"><span>◆ 日志/检查的体素中心</span><span>● 当前选点</span><span>线框：稀疏实体碰撞 proxy</span></div>
+    <p id="counts" class="muted"></p>
+  </section>
+  <section>
+    <h2>原始 RGB · 点击像素选取真实深度点</h2>
+    <label>图像视角<select id="view"><option value="main">主相机</option><option value="wrist_left">左腕</option><option value="wrist_right">右腕</option></select></label>
+    <p id="pixel" class="status" aria-live="polite"></p>
+    <canvas id="image" aria-label="原始彩色图像与选中三维点的像素投影"></canvas>
+    <p class="muted"><span class="green">绿圈：与本帧深度相符（≤10 mm）</span>；<span class="orange">橙叉：仅几何投影，遮挡/缺深度/深度不符</span>。不是跨视角自动确认同一物体。</p>
+    <p id="identity" class="muted"></p>
+  </section>
+</div>
+<p id="world" class="status"></p>
+<p class="muted">这是本次只读采集的静态证据，不是上一次运行的补拍。保留了完整 RGB-D、qpos、过滤掩码、全量点和体素；3D 显示使用确定性抽稀，不改变碰撞检查。正距离不足 20 mm 也会被拒绝；负值是 proxy/体素几何量，不是实物穿透深度。未做路径搜索或执行。</p>
+<p id="error" role="alert"></p>
+<script type="application/octet-stream" id="packed">__INSPECTION_DATA__</script>
+<script src="https://cdn.jsdelivr.net/npm/plotly.js-dist-min@2.35.2/plotly.min.js"></script>
+<script>
+(async()=>{
+try{
+if(typeof Plotly==='undefined')throw new Error('Plotly 未加载，请检查静态资源网络访问。RGB-D 文件仍保留在本目录。');
+const bytes=Uint8Array.from(atob(document.getElementById('packed').textContent.trim()),c=>c.charCodeAt(0));
+const data=JSON.parse(await new Response(new Blob([bytes]).stream().pipeThrough(new DecompressionStream('gzip'))).text());
+const byRole=Object.fromEntries(data.views.map(v=>[v.role,v]));
+const ids=['plot','mode','scope','boxes','nearest','view','pixel','image','counts','identity','world','summary'];
+const ui=Object.fromEntries(ids.map(id=>[id,document.getElementById(id)]));
+for(const view of data.views){
+  const binary=Uint8Array.from(atob(view.depth_f32),c=>c.charCodeAt(0));view.depth=new Float32Array(binary.buffer);
+  view.image=new Image();view.image.src=view.jpeg;await view.image.decode();
+}
+const nearest=data.report.nearest_observed;
+let selected=nearest?.occupied_center_world_m?.slice()||null, selectedOrigin='体素中心', previousScope='';
+const fg=()=>getComputedStyle(document.body).color;
+const border=()=>getComputedStyle(document.documentElement).getPropertyValue('--line');
+const xyz=p=>({x:p.map(v=>v[0]),y:p.map(v=>v[1]),z:p.map(v=>v[2])});
+const edges=[[0,1],[0,2],[0,4],[1,3],[1,5],[2,3],[2,6],[3,7],[4,5],[4,6],[5,7],[6,7]];
+const focus=data.report.boxes.find(b=>b.name===nearest?.geometry_name);
+function project(point,view){
+ const d=point.map((x,i)=>x-view.pose[i][3]);
+ const local=[0,1,2].map(j=>d.reduce((sum,x,i)=>sum+x*view.pose[i][j],0));
+ if(local[2]<=0)return null;
+ const k=view.intrinsics,u=k.fx*local[0]/local[2]+k.cx,v=k.fy*local[1]/local[2]+k.cy;
+ if(u<0||v<0||u>view.width-1||v>view.height-1)return null;
+ const measured=view.depth[Math.round(v)*view.width+Math.round(u)];
+ return{u,v,z:local[2],measured,consistent:measured>0&&Math.abs(measured-local[2])<=.01};
+}
+function showImage(){
+ const view=byRole[ui.view.value],canvas=ui.image,ctx=canvas.getContext('2d');
+ canvas.width=view.width;canvas.height=view.height;ctx.drawImage(view.image,0,0);
+ ui.identity.textContent=`${view.source_id} · 帧 ${view.frame_index} · 接收时间 ${view.acquired_at.toFixed(6)} · qpos 时间 ${view.pose_measured_at.toFixed(6)}`;
+ if(!selected){ui.pixel.textContent='当前没有碰撞体素；可点击图像检查任意像素。';return}
+ const hit=project(selected,view);
+ if(!hit){ui.pixel.textContent='选中三维点不在当前相机视野内。';return}
+ ctx.strokeStyle=hit.consistent?'#00b45f':'#ff9b22';ctx.lineWidth=3;
+ if(hit.consistent){ctx.beginPath();ctx.arc(hit.u,hit.v,9,0,Math.PI*2);ctx.stroke()}
+ else{ctx.beginPath();ctx.moveTo(hit.u-9,hit.v-9);ctx.lineTo(hit.u+9,hit.v+9);ctx.moveTo(hit.u-9,hit.v+9);ctx.lineTo(hit.u+9,hit.v-9);ctx.stroke()}
+ ctx.beginPath();ctx.moveTo(hit.u-14,hit.v);ctx.lineTo(hit.u+14,hit.v);ctx.moveTo(hit.u,hit.v-14);ctx.lineTo(hit.u,hit.v+14);ctx.stroke();
+ ui.pixel.textContent=`u=${hit.u.toFixed(1)}, v=${hit.v.toFixed(1)} · 投影 Z=${hit.z.toFixed(3)}m · 本帧深度=${hit.measured.toFixed(3)}m · ${hit.consistent?'深度相符':'仅几何投影'}`;
+}
+async function render(){
+ const traces=[],allBounds=[],scope=ui.scope.value,mode=ui.mode.value;
+ const anchor=focus?focus.pose.map(r=>r[3]).slice(0,3):selected;
+ let displayed=0,total=0;
+ data.points.forEach(group=>{
+  const points=[],colors=[],uvs=[];total+=group.full_count;
+  for(let i=0;i<group.xyz.length;i++){
+   const point=group.xyz[i],category=group.category[i];
+   if(scope==='local'&&anchor&&Math.hypot(...point.map((x,j)=>x-anchor[j]))>.36)continue;
+   if(mode==='retained'&&category!==0||mode==='self'&&category!==1)continue;
+   points.push(point);uvs.push([group.role,...group.uv[i]]);
+   colors.push(mode==='classified'?(category===0?'#d98634':category===1?'#46a6d8':'#9e9e9e'):`rgb(${group.rgb[i].join(',')})`);
+  }
+  displayed+=points.length;allBounds.push(...points);
+  traces.push({type:'scatter3d',mode:'markers',...xyz(points),customdata:uvs,name:group.role,
+   marker:{size:2,color:colors,opacity:.9},hovertemplate:'%{customdata[0]} · u=%{customdata[1]} v=%{customdata[2]}<br>X=%{x:.3f} Y=%{y:.3f} Z=%{z:.3f} m<extra></extra>'});
+ });
+ if(ui.boxes.checked)for(const box of data.report.boxes){
+  const path=edges.flatMap(e=>[box.corners[e[0]],box.corners[e[1]],[null,null,null]]);
+  if(scope==='local'&&anchor&&Math.hypot(...box.pose.slice(0,3).map((r,i)=>r[3]-anchor[i]))>.45)continue;
+  allBounds.push(...box.corners);
+  traces.push({type:'scatter3d',mode:'lines',...xyz(path),name:box.name,line:{color:box.name===focus?.name?'#ef6a20':'#989898',width:box.name===focus?.name?5:2},hoverinfo:'name'});
+ }
+ if(nearest)traces.push({type:'scatter3d',mode:'markers',...xyz([nearest.occupied_center_world_m]),name:'冲突体素中心',marker:{size:8,color:'#ec4b4b',symbol:'diamond'}});
+ if(selected){allBounds.push(selected);traces.push({type:'scatter3d',mode:'markers',...xyz([selected]),name:'当前选点',marker:{size:5,color:'#1fdd72',symbol:'circle'}})}
+ if(!allBounds.length&&focus)allBounds.push(...focus.corners);
+ if(!allBounds.length)throw new Error('没有可显示的数据');
+ const ranges=[0,1,2].map(j=>[Math.min(...allBounds.map(p=>p[j]))-.025,Math.max(...allBounds.map(p=>p[j]))+.025]);
+ const camera=scope===previousScope&&ui.plot._fullLayout?.scene?.camera?JSON.parse(JSON.stringify(ui.plot._fullLayout.scene.camera)):{eye:{x:1.3,y:-1.4,z:1},up:{x:0,y:0,z:1}};
+ await Plotly.react(ui.plot,traces,{showlegend:false,margin:{l:24,r:24,t:8,b:65},paper_bgcolor:'rgba(0,0,0,0)',font:{color:fg()},scene:{aspectmode:'data',camera,uirevision:scope,xaxis:{title:'X (m)',range:ranges[0],gridcolor:border()},yaxis:{title:'Y (m)',range:ranges[1],gridcolor:border()},zaxis:{title:'Z (m)',range:ranges[2],gridcolor:border()}}},{responsive:true,scrollZoom:true,displaylogo:false,displayModeBar:false});
+ previousScope=scope;
+ ui.counts.textContent=`显示 ${displayed.toLocaleString()} 点 / 原始有效点 ${total.toLocaleString()} · 分类：保留障碍 / 已滤自体 / 其余噪点或离群点`;
+ ui.world.textContent=selected?`${selectedOrigin} · ${data.report.reference_frame_id} XYZ = (${selected.map(x=>x.toFixed(4)).join(', ')}) m`:'没有选中点';
+ showImage();document.body.dataset.ready='true';
+}
+let queue=Promise.resolve();const schedule=()=>{queue=queue.then(render).catch(e=>{document.getElementById('error').textContent=e.stack||e.message})};
+ui.image.addEventListener('click',event=>{
+ const view=byRole[ui.view.value],rect=ui.image.getBoundingClientRect();
+ const u=Math.min(view.width-1,Math.max(0,Math.floor((event.clientX-rect.left)*view.width/rect.width))),v=Math.min(view.height-1,Math.max(0,Math.floor((event.clientY-rect.top)*view.height/rect.height)));
+ const z=view.depth[v*view.width+u];if(!(z>0)){ui.pixel.textContent=`u=${u}, v=${v} 没有有效深度，不生成三维位置。`;return}
+ const k=view.intrinsics,local=[(u-k.cx)*z/k.fx,(v-k.cy)*z/k.fy,z];
+ selected=[0,1,2].map(i=>view.pose[i][3]+local.reduce((sum,x,j)=>sum+x*view.pose[i][j],0));selectedOrigin=`${view.role} 像素 (${u}, ${v})`;
+ schedule();
+});
+ui.nearest.onclick=()=>{selected=nearest?.occupied_center_world_m?.slice()||null;selectedOrigin='体素中心';schedule()};
+for(const name of ['mode','scope','boxes'])ui[name].onchange=schedule;
+ui.view.onchange=showImage;
+ui.summary.textContent=`${data.report.collision_check.reason} · 点云保守距离 ${(data.report.observed_distance_m*1000).toFixed(2)} mm · 要求 ≥20 mm · 仅只读检查，无路径搜索/执行`;
+await render();document.getElementById('raw-preview').hidden=true;
+ui.plot.on('plotly_click',event=>{const point=event.points[0];if(!point.customdata)return;const [role,u,v]=point.customdata;ui.view.value=role;selected=[point.x,point.y,point.z];selectedOrigin=`${role} 像素 (${u}, ${v})`;schedule()});
+new ResizeObserver(()=>Plotly.Plots.resize(ui.plot)).observe(ui.plot);
+}catch(error){document.getElementById('error').textContent=error.stack||error.message}
+})();
+</script>
+</body>
+</html>

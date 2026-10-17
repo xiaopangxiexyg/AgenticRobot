@@ -38,6 +38,28 @@ def test_cli_back_projection_resolves_measured_geometry_without_grasp_models():
     assert error.value.code == 2  # Missing cameras are rejected before creating devices.
 
 
+def test_cli_observed_safe_move_does_not_require_grasp_models(tmp_path):
+    parser = gateway_cli.build_parser()
+    args = parser.parse_args([*_argv(confirmation=REAL_AGENT_PRIMITIVE_SESSION_CONFIRM_TOKEN),
+        "--safe-motion-observation-roles", "main", "wrist_left", "wrist_right",
+        "--safe-motion-debug-dir", str(tmp_path)])
+    assert not args.enable_point_grasp
+    assert gateway_cli._effective_camera_registry(args) == gateway_cli.DEFAULT_RM65_CAMERA_REGISTRY_V4
+    assert gateway_cli._effective_camera_mount_urdf(args) == gateway_cli.DEFAULT_RM65_CAMERA_MOUNT_URDF
+    assert args.safe_motion_scene_max_age_sec == 30
+    assert args.safe_motion_maximum_depth_m == 1.5
+    assert args.safe_motion_debug_dir == tmp_path
+
+
+def test_cli_debug_scene_requires_observed_safe_move_before_devices(monkeypatch, tmp_path):
+    def forbidden(*args, **kwargs):
+        raise AssertionError("No profile/device resolution is allowed for invalid debug configuration")
+    monkeypatch.setattr(gateway_cli, "resolve_exclusive_rm65_skill_deployment_profile", forbidden)
+    with pytest.raises(SystemExit):
+        gateway_cli.main([*_argv(confirmation=REAL_AGENT_PRIMITIVE_SESSION_CONFIRM_TOKEN,
+            socket_path=tmp_path / "gateway.sock"), "--safe-motion-debug-dir", str(tmp_path)])
+
+
 def _argv(*, confirmation: str, socket_path: Path | None = None) -> list[str]:
     existing = str(REPO_ROOT / "pyproject.toml")
     return [

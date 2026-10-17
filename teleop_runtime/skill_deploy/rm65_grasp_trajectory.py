@@ -820,8 +820,11 @@ class RM65GraspJointTrajectoryPlanner:
 
     def plan_with_observed_cloud(self, cloud: ObservedObstacleCloud, **kwargs):
         """Serialize shared target-builder use across observed requests."""
+        monotonic = kwargs.get("monotonic", time.perf_counter)
+        started = float(monotonic())
         with self._observed_planning_lock:
-            return self.for_observed_cloud(cloud)(**kwargs)
+            return self.for_observed_cloud(cloud)._plan(
+                _planning_started_at=started, **kwargs)
 
     def require_static_grasp_scene(
         self, *, qpos_by_side: Mapping[str, np.ndarray], side: str,
@@ -5116,11 +5119,13 @@ class RM65GraspJointTrajectoryPlanner:
         time_budget_sec: float | None = None,
     ) -> RealAgentJointTrajectory:
         # This entrypoint shares the same target builder as normal requests.
+        started = float(monotonic())
         with self._observed_planning_lock:
             return self._plan_tcp_pose(
                 qpos_by_side=qpos_by_side, side=side,
                 target_tool_tcp_world=target_tool_tcp_world, speed_scale=speed_scale,
                 monotonic=monotonic, time_budget_sec=time_budget_sec,
+                _planning_started_at=started,
             )
 
     def _plan_tcp_pose(
@@ -5128,6 +5133,7 @@ class RM65GraspJointTrajectoryPlanner:
         target_tool_tcp_world: np.ndarray, speed_scale: float,
         monotonic: Callable[[], float] = time.perf_counter,
         time_budget_sec: float | None = None,
+        _planning_started_at: float | None = None,
     ) -> RealAgentJointTrajectory:
         """Plan before activation; fixed-orientation moves keep a Cartesian line.
 
@@ -5143,13 +5149,15 @@ class RM65GraspJointTrajectoryPlanner:
         current = {name: np.asarray(qpos_by_side[name], dtype=float).reshape(6).copy()
                    for name in _SIDES}
         target = np.asarray(target_tool_tcp_world, dtype=float).reshape(4, 4)
-        started = monotonic()
+        started = float(monotonic()) if _planning_started_at is None else _planning_started_at
         budget = self.config.path_planning_time_budget_sec
         if time_budget_sec is not None:
             if not math.isfinite(time_budget_sec) or time_budget_sec <= 0:
                 raise RM65GraspTrajectoryPlanningError("path_planning_time_budget_exhausted")
             budget = min(budget, time_budget_sec)
         deadline = started + budget
+        if float(monotonic()) >= deadline:
+            raise RM65GraspTrajectoryPlanningError("path_planning_time_budget_exhausted")
         self.require_static_grasp_scene(qpos_by_side=current, side=side)
         solver_targets = self.target_builder.solver_world_targets_for_qpos_pair(
             left_qpos=current["left"], right_qpos=current["right"])
@@ -5236,15 +5244,18 @@ class RM65GraspJointTrajectoryPlanner:
         visible_scene: VisibleGraspScene | None = None,
         monotonic: Callable[[], float] = time.perf_counter,
         require_grasp_approach: bool = True,
+        time_budget_sec: float | None = None,
     ) -> RealAgentJointTrajectory:
         # Request planners share a mutable target builder with their template.
         # Keep diagnostics inspectable without allowing concurrent plan state.
+        started = float(monotonic())
         with self._observed_planning_lock:
             return self._plan(
                 qpos_by_side=qpos_by_side, side=side,
                 target_tool_tcp_world=target_tool_tcp_world, speed_scale=speed_scale,
                 visible_scene=visible_scene, monotonic=monotonic,
                 require_grasp_approach=require_grasp_approach,
+                time_budget_sec=time_budget_sec, _planning_started_at=started,
             )
 
     def _plan(
@@ -5257,7 +5268,18 @@ class RM65GraspJointTrajectoryPlanner:
         visible_scene: VisibleGraspScene | None = None,
         monotonic: Callable[[], float] = time.perf_counter,
         require_grasp_approach: bool = True,
+        time_budget_sec: float | None = None,
+        _planning_started_at: float | None = None,
     ) -> RealAgentJointTrajectory:
+        started = float(monotonic()) if _planning_started_at is None else _planning_started_at
+        budget = self.config.path_planning_time_budget_sec
+        if time_budget_sec is not None:
+            if not math.isfinite(time_budget_sec) or time_budget_sec <= 0:
+                raise RM65GraspTrajectoryPlanningError("path_planning_time_budget_exhausted")
+            budget = min(budget, time_budget_sec)
+        deadline = started + budget
+        if float(monotonic()) >= deadline:
+            raise RM65GraspTrajectoryPlanningError("path_planning_time_budget_exhausted")
         if not isinstance(require_grasp_approach, bool):
             raise TypeError("require_grasp_approach must be bool.")
         if require_grasp_approach and self.observed_obstacles is not None:
@@ -5344,7 +5366,8 @@ class RM65GraspJointTrajectoryPlanner:
         if not 0.0 < scale <= 1.0:
             raise ValueError("speed_scale must satisfy 0 < speed_scale <= 1.")
         self._preflight_start_envelope(qpos_by_side=current, side=selected_side)
-        deadline = float(monotonic()) + self.config.path_planning_time_budget_sec
+        if float(monotonic()) >= deadline:
+            raise RM65GraspTrajectoryPlanningError("path_planning_time_budget_exhausted")
         ingress_route_attempts: list[dict[str, object]] = []
         pregrasp_route_attempts: list[dict[str, object]] = []
         selected_legs: tuple[_PlannedPathLeg, ...] | None = None

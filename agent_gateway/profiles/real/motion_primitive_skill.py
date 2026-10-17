@@ -469,7 +469,8 @@ class RealAgentPrimitiveSkillLifecycle:
                             resolution.target_pose, name="real_agent_planned_tcp_target"),
                         speed_scale=float(self.request.parameters.get("speed_scale", 1.0)),
                         **({"time_budget_sec": operation.deadline_at - float(self.clock())}
-                           if planned_tcp else {}),
+                           if planned_tcp or self.route.skill_id == SAFE_TCP_POSE_TARGET_SKILL_ID_V1
+                           else {}),
                         **({"require_grasp_approach": False}
                            if self.route.skill_id == SAFE_TCP_POSE_TARGET_SKILL_ID_V1 else {}),
                     )

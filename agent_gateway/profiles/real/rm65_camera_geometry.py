@@ -16,6 +16,7 @@ import xml.etree.ElementTree as ET
 from collections import deque
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from itertools import pairwise
 from pathlib import Path, PurePosixPath
 
 import numpy as np
@@ -210,6 +211,15 @@ class _DynamicCameraMount:
     parent_from_camera: tuple[float, ...]
 
 
+class RM65StationaryGeometryUnavailable(RuntimeError):
+    """A bounded diagnostic for the existing stationary-capture admission."""
+
+    def __init__(self, reason_code: str, diagnostic: Mapping[str, object]):
+        self.reason_code = reason_code
+        self.diagnostic = dict(diagnostic)
+        super().__init__(reason_code + ": " + json.dumps(self.diagnostic, sort_keys=True))
+
+
 class RM65RgbCameraGeometry:
     """Thread-safe geometry cut store shared by control and render threads."""
 
@@ -363,21 +373,46 @@ class RM65RgbCameraGeometry:
         current = _finite_time(now, field_name="now")
         with self._lock:
             history = tuple(self._capture_history)
+        diagnostic = {"source_id": source_id, "frame_acquired_at": captured, "now": current,
+                      "history_count": len(history), "max_pose_age_ms": self.max_pose_age_ms,
+                      "max_frame_pose_skew_ms": self.max_frame_pose_skew_ms,
+                      "history_window_sec": .25, "minimum_sample_count": 3,
+                      "required_pre_frame_history_sec": .10, "maximum_pre_frame_lag_sec": .05,
+                      "maximum_allowed_sample_gap_sec": .10}
         if captured > current:
-            raise RuntimeError("grasp_observation_frame_pose_unavailable")
+            raise RM65StationaryGeometryUnavailable("grasp_observation_frame_pose_unavailable",
+                {**diagnostic, "failed_conditions": ["frame_in_future"]})
         samples = [sample for sample in history if captured - 0.25 <= sample[0] <= current and sample[1] <= current]
-        if (len(samples) < 3 or samples[0][0] > captured - 0.10
-                or samples[-1][0] < captured - 0.05
-                or current-samples[-1][0] > self.max_pose_age_ms / 1000
-                or any(b[0]-a[0] > 0.10 for a, b in zip(samples, samples[1:]))):
-            raise RuntimeError("grasp_observation_stationary_history_unavailable")
-        if any(np.max(np.ptp(np.stack([sample[2][side] for sample in samples]), axis=0)) > 0.002
-               for side in ("left", "right")):
-            raise RuntimeError("grasp_observation_robot_not_stationary")
+        diagnostic.update(sample_count=len(samples),
+            first_measured_at=samples[0][0] if samples else None,
+            last_measured_at=samples[-1][0] if samples else None,
+            last_available_at=samples[-1][1] if samples else None,
+            maximum_sample_gap_sec=max((b[0]-a[0] for a,b in pairwise(samples)), default=0.))
+        failed = []
+        if len(samples) < 3:
+            failed.append("insufficient_samples")
+        if samples:
+            if samples[0][0] > captured - .10:
+                failed.append("missing_pre_frame_history")
+            if samples[-1][0] < captured - .05:
+                failed.append("last_sample_before_frame")
+            if current-samples[-1][0] > self.max_pose_age_ms / 1000:
+                failed.append("last_sample_stale")
+            if diagnostic["maximum_sample_gap_sec"] > .10:
+                failed.append("sample_gap_exceeded")
+        if failed:
+            raise RM65StationaryGeometryUnavailable("grasp_observation_stationary_history_unavailable",
+                {**diagnostic, "failed_conditions": failed})
+        spreads = {side:float(np.max(np.ptp(np.stack([sample[2][side] for sample in samples]), axis=0)))
+                   for side in ("left", "right")}
+        if any(spread > .002 for spread in spreads.values()):
+            raise RM65StationaryGeometryUnavailable("grasp_observation_robot_not_stationary",
+                {**diagnostic, "maximum_joint_spread_rad_by_side": spreads})
         selected = min(samples, key=lambda sample: abs(sample[0]-captured))
         measured, available, pair, cuts, refs = selected
         if available > current or abs(measured-captured) > self.max_frame_pose_skew_ms / 1000:
-            raise RuntimeError("grasp_observation_frame_pose_unavailable")
+            raise RM65StationaryGeometryUnavailable("grasp_observation_frame_pose_unavailable",
+                {**diagnostic, "selected_measured_at": measured, "selected_available_at": available})
         geometry = (self.pose_cut(source_id=source_id, frame_acquired_at=captured, now=current)
                     if source_id in self._static else cuts[source_id])
         return geometry, pair, measured, available, refs
@@ -578,5 +613,6 @@ def build_rm65_rgb_camera_geometry(
 
 __all__ = [
     "RM65RgbCameraGeometry",
+    "RM65StationaryGeometryUnavailable",
     "build_rm65_rgb_camera_geometry",
 ]

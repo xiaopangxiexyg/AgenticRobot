@@ -168,6 +168,7 @@ def assemble_exclusive_real_agent_primitive_deployment(
     ) = None,
     grasp_trajectory_planner: Callable[..., object] | None = None,
     safe_pose_trajectory_planner: Callable[..., object] | None = None,
+    safe_pose_trajectory_planner_factory: Callable[..., Callable[..., object]] | None = None,
     captured_robot_observation_filter: Callable[..., object] | None = None,
     non_motion_read_window: Callable[[], object] | None = None,
     perception_provider_factory: (
@@ -237,6 +238,11 @@ def assemble_exclusive_real_agent_primitive_deployment(
         if station_point_grasp_reachability_evaluator_factory is None
         else station_point_grasp_reachability_evaluator_factory(port)
     )
+    if safe_pose_trajectory_planner_factory is not None:
+        if safe_pose_trajectory_planner is not None or perception_provider is None:
+            raise ValueError("Observed safe planner requires perception and no second safe planner.")
+        safe_pose_trajectory_planner = safe_pose_trajectory_planner_factory(
+            perception_provider, lambda: revision_tracker.current_revision)
     control_runtime = ExclusiveRealSkillControlRuntime(
         motion_port=port,
         observation_provider=observation_provider,
@@ -310,6 +316,7 @@ def assemble_exclusive_rm65_agent_primitive_deployment(
     ) = None,
     grasp_trajectory_planner: Callable[..., object] | None = None,
     safe_pose_trajectory_planner: Callable[..., object] | None = None,
+    safe_pose_trajectory_planner_factory: Callable[..., Callable[..., object]] | None = None,
     captured_robot_observation_filter: Callable[..., object] | None = None,
     non_motion_read_window: Callable[[], object] | None = None,
     perception_provider_factory: (
@@ -369,6 +376,7 @@ def assemble_exclusive_rm65_agent_primitive_deployment(
         ),
         grasp_trajectory_planner=grasp_trajectory_planner,
         safe_pose_trajectory_planner=safe_pose_trajectory_planner,
+        safe_pose_trajectory_planner_factory=safe_pose_trajectory_planner_factory,
         captured_robot_observation_filter=captured_robot_observation_filter,
         non_motion_read_window=non_motion_read_window,
         perception_provider_factory=perception_provider_factory,

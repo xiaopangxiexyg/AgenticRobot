@@ -77,6 +77,7 @@ from .rm65_composition import (
     ExclusiveRM65AgentPrimitiveComposition,
     assemble_exclusive_rm65_agent_primitive_composition,
 )
+from .motion_observed_scene import SafeMotionObservationConfig
 from .session_authorization import (
     REAL_AGENT_PRIMITIVE_ACTIONS,
     REAL_AGENT_PRIMITIVE_SESSION_CONFIRM_TOKEN,
@@ -143,8 +144,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--planned-trajectory-dir",
         type=Path,
         help=(
-            "existing private directory for exact sampled grasp plans; a failed "
-            "record prevents plan admission"
+            "existing private directory for exact sampled plans and safe-move RGB-D inputs "
+            "(including failed attempts); a failed record prevents plan admission"
         ),
     )
     parser.add_argument(
@@ -152,6 +153,15 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="enable main-view proposal generation and three-view candidate rendering",
     )
+    parser.add_argument("--safe-motion-observation-roles", nargs="+",
+        choices=("main", "wrist_left", "wrist_right"),
+        help="enable model-independent RGB-D obstacles for safe move; every selected view is required")
+    parser.add_argument("--safe-motion-maximum-depth-m", type=float, default=1.5,
+        help="observed obstacle depth range in meters; farther/unknown space is not certified")
+    parser.add_argument("--safe-motion-scene-max-age-sec", type=float, default=30.,
+        help="maximum frozen scene age at activation (default: 30s); no automatic degraded fallback")
+    parser.add_argument("--safe-motion-debug-dir", type=Path,
+        help="existing private directory for exact RGB-D, filtered points and safe-move rejection evidence; opt-in, no extra captures")
     parser.add_argument("--enable-spatial-goals", action="store_true",
         help="expose read-only endpoint relation goals; no observation or motion authority")
     parser.add_argument("--enable-grasp-observation", action="store_true",
@@ -366,7 +376,7 @@ def _absolute_existing_file(
 def _effective_camera_registry(args: argparse.Namespace) -> Path | None:
     if args.camera_registry is not None:
         return args.camera_registry
-    if args.enable_point_grasp or args.enable_back_projection:
+    if args.enable_point_grasp or args.enable_back_projection or args.safe_motion_observation_roles is not None:
         return DEFAULT_RM65_CAMERA_REGISTRY_V4
     return None
 
@@ -374,7 +384,7 @@ def _effective_camera_registry(args: argparse.Namespace) -> Path | None:
 def _effective_camera_mount_urdf(args: argparse.Namespace) -> Path | None:
     if args.camera_mount_urdf is not None:
         return args.camera_mount_urdf
-    if args.enable_point_grasp or args.enable_back_projection:
+    if args.enable_point_grasp or args.enable_back_projection or args.safe_motion_observation_roles is not None:
         if args.collision_scene_profile == "dual_arm_hand_proxy_dmtac_strict":
             return DEFAULT_RM65_DMTAC_CAMERA_MOUNT_URDF
         return DEFAULT_RM65_CAMERA_MOUNT_URDF
@@ -891,8 +901,10 @@ def main(argv: list[str] | None = None) -> int:
             "--camera-config, --camera-registry, and --artifact-root must be "
             "provided together"
         )
-    if (args.enable_point_grasp or args.enable_back_projection) and not all(perception_supplied):
-        parser.error("Point-grasp or back projection requires the composed camera options")
+    if (args.enable_point_grasp or args.enable_back_projection or args.safe_motion_observation_roles is not None) and not all(perception_supplied):
+        parser.error("Point-grasp, back projection or observed safe motion requires the composed camera options")
+    if args.safe_motion_debug_dir is not None and args.safe_motion_observation_roles is None:
+        parser.error("--safe-motion-debug-dir requires --safe-motion-observation-roles")
     if args.enable_grasp_observation and (not args.enable_point_grasp or args.point_grasp_backend != "graspgenx"):
         parser.error("--enable-grasp-observation requires --enable-point-grasp and GraspGenX")
     if args.debug_render_object_coordinates and not args.enable_point_grasp:
@@ -902,8 +914,10 @@ def main(argv: list[str] | None = None) -> int:
             "--enable-point-grasp-arm-reachability requires --enable-point-grasp"
         )
     camera_mount_urdf_arg = _effective_camera_mount_urdf(args)
-    if args.camera_mount_urdf is not None and not (args.enable_point_grasp or args.enable_back_projection):
-        parser.error("--camera-mount-urdf requires point-grasp or back projection")
+    if args.camera_mount_urdf is not None and not (
+            args.enable_point_grasp or args.enable_back_projection
+            or args.safe_motion_observation_roles is not None):
+        parser.error("--camera-mount-urdf requires point-grasp, back projection or observed safe motion")
     if args.object_localization_backend == "sam3-service":
         if not args.enable_point_grasp:
             parser.error("--object-localization-backend sam3-service requires --enable-point-grasp")
@@ -921,13 +935,10 @@ def main(argv: list[str] | None = None) -> int:
         for value in (
             args.object_localization_asset_bundle,
             args.point_grasp_asset_bundle,
-            args.camera_mount_urdf,
         )
     ):
         parser.error("point-grasp model bundle options require --enable-point-grasp")
-    if args.enable_point_grasp != all(
-        value is not None for value in point_grasp_values
-    ):
+    if args.enable_point_grasp and not all(value is not None for value in point_grasp_values):
         if args.object_localization_backend == "sam3-service":
             parser.error("SAM3 point grasp requires --point-grasp-asset-bundle and --camera-mount-urdf")
         parser.error(
@@ -997,7 +1008,7 @@ def main(argv: list[str] | None = None) -> int:
                 "candidate geometry cannot be reinterpreted for another tool"
             )
     camera_mount_urdf = None
-    if args.enable_point_grasp or args.enable_back_projection:
+    if args.enable_point_grasp or args.enable_back_projection or args.safe_motion_observation_roles is not None:
         camera_mount_urdf = _absolute_existing_file(
             parser,
             camera_mount_urdf_arg,
@@ -1049,6 +1060,10 @@ def main(argv: list[str] | None = None) -> int:
             args.planned_trajectory_dir,
             flag="--planned-trajectory-dir",
         )
+    )
+    safe_motion_debug_dir = (
+        None if args.safe_motion_debug_dir is None else _absolute_managed_directory(
+            parser, args.safe_motion_debug_dir, flag="--safe-motion-debug-dir")
     )
     motion_trace_root = (
         None
@@ -1205,6 +1220,11 @@ def main(argv: list[str] | None = None) -> int:
         enable_back_projection=args.enable_back_projection,
         debug_render_object_coordinates=args.debug_render_object_coordinates,
         enable_point_grasp_arm_reachability=(args.enable_point_grasp_arm_reachability),
+        safe_motion_observation_config=(None if args.safe_motion_observation_roles is None
+            else SafeMotionObservationConfig(roles=tuple(args.safe_motion_observation_roles),
+                maximum_depth_m=args.safe_motion_maximum_depth_m,
+                maximum_scene_age_sec=args.safe_motion_scene_max_age_sec)),
+        safe_motion_debug_dir=safe_motion_debug_dir,
         grasp_trajectory_config=RM65GraspTrajectoryPlanningConfig(
             trajectory_parameterization=(args.grasp_trajectory_parameterization),
             trajectory_speed_profile=(args.grasp_trajectory_speed_profile),

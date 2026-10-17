@@ -315,6 +315,9 @@ def test_gateway_numerical_dependencies_are_confined_to_concrete_profiles() -> N
         # Frozen RGB-D/FK decoding and held-object/tool transforms belong to
         # these concrete real-profile leaves, not to Gateway core.
         "agent_gateway/profiles/real/grasp_observation.py": ["numpy"],
+        # RGB-D obstacle projection and retained diagnostics are concrete profiles.
+        "agent_gateway/profiles/real/motion_observed_scene.py": ["numpy"],
+        "agent_gateway/profiles/real/motion_observed_scene_debug.py": ["numpy"],
         "agent_gateway/profiles/real/object_transport.py": ["numpy"],
         "agent_gateway/profiles/real/perception_probe.py": ["numpy"],
         # Offline v1 and deployment-bound live v2 point-grasp stay in one

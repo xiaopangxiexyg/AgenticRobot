@@ -1441,3 +1441,14 @@ safe planner 的到位容差绑定当前 convergence profile，不改抓取规�
 所有已装配的预规划轨迹都必须执行到原时长结束；即使测量提前进入到位容差，也不能提前判定完成并 HOLD。
 lower 只有取得停止命令的 worker／SDK 确认后，才可返回成功 HOLD receipt，或暂停读取窗口内的采样及陈旧测量看门狗；失败和不可读状态仍会拒绝。该确认表示冻结命令已被 SDK 接纳，不是物理静止测量。
 本批只接入固定场景规划；RGB-D 障碍场景与会话几何准备另按依赖接入。
+
+
+观测场景安全移动可显式配置 safe_motion_observation_config，复用已有 RGB-D
+provider、相机几何与唯一 lower owner；不需要定位模型。它先冻结同一批静止视图，
+再进入已确认 HOLD 的只读窗口，按原深度自体过滤与碰撞规则生成每请求独立的障碍云。
+静态规划器按会话复用，请求的 FK／碰撞数据和路径缓存保持隔离；没有目标接触豁免。
+
+planned_trajectory_dir/observations 留存每次尝试的 snapshot.json、原始 RGB-D、
+相机/FK 绑定、障碍与 result.json；可选调试记录使用同一批视图，不再采集。
+path_found 只证明找到规划路径，execution_verified 仍为 false。采集、场景准备、
+规划、记录和请求锁等待都计入剩余操作预算；最后一项落盘后仍检查视图有效期与预算。

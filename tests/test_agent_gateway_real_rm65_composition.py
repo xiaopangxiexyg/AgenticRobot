@@ -452,8 +452,70 @@ def test_composition_binds_selected_side_to_one_lower_graph_without_start(
         lower.profile.position_profile.rates.reference_hz
     )
     assert all(backend.starts == 0 for backend in lower.arm_backends.values())
+
     assert guard.starts == 0
     assert not socket_path.exists()
+
+
+@pytest.mark.parametrize("debug_enabled", [False, True])
+def test_safe_planner_binding_uses_arrival_tolerances_and_can_observe_without_models(monkeypatch, tmp_path, debug_enabled):
+    from agent_gateway.profiles.real.motion_observed_scene import SafeMotionObservationConfig
+    from agent_gateway.profiles.real.motion_primitive_profiles import RealAgentPrimitiveConvergenceProfile
+    planners = []
+    class Planner:
+        def __call__(self, **kwargs):
+            return None
+        def plan_with_observed_cloud(self, cloud, **kwargs):
+            return cloud
+    def planner(**kwargs):
+        planners.append(kwargs)
+        return Planner()
+    monkeypatch.setattr(composition_module, "RM65GraspJointTrajectoryPlanner", planner)
+    lower, guard = _lower(monkeypatch)
+    kwargs = dict(lower=lower, socket_path=tmp_path / "gateway.sock", authorized_side="right",
+        authorized_action="move_tcp_to_pose_safe", confirmation_token=REAL_AGENT_PRIMITIVE_CONFIRM_TOKEN,
+        client_id="rpent:test", client_uid=1000, runtime_session_id="safe:test",
+        control_domain_id="safe:domain", embodiment_instance_id="safe:embodiment")
+    configured = assemble_exclusive_rm65_agent_primitive_composition(**kwargs)
+    assert len(planners) == 2
+    grasp, safe = planners
+    assert grasp["config"] is None  # Grasp path still uses its own defaults.
+    arrival = RealAgentPrimitiveConvergenceProfile()
+    assert safe["config"].endpoint_position_tolerance_m == arrival.translation_tolerance_m
+    assert np.deg2rad(safe["config"].endpoint_orientation_tolerance_deg) == pytest.approx(arrival.rotation_tolerance_rad)
+    configured.deployment.gateway_session.close()
+    planners.clear()
+    (tmp_path / "artifacts").mkdir()
+    adapter_bindings = []
+    original_adapter = composition_module.ObservedSafeMovePlanner
+    def adapter(**kwargs):
+        adapter_bindings.append(kwargs)
+        return original_adapter(**kwargs)
+    monkeypatch.setattr(composition_module, "ObservedSafeMovePlanner", adapter)
+    observed = assemble_exclusive_rm65_agent_primitive_composition(**kwargs,
+        camera_config_path=REPO_ROOT / "teleop_runtime/configs/devices/agent_gateway_realsense.json",
+        camera_registry_path=DEFAULT_RM65_CAMERA_REGISTRY_V4, artifact_root=tmp_path / "artifacts",
+        camera_mount_urdf_path=DEFAULT_RM65_CAMERA_MOUNT_URDF,
+        safe_motion_observation_config=SafeMotionObservationConfig(),
+        safe_motion_debug_dir=tmp_path if debug_enabled else None)
+    session = observed.deployment.gateway_session
+    assert len(planners) == 1  # Safe static template is lazy, not a fixed-only fallback.
+    for cloud in (object(), object()):
+        request = adapter_bindings[0]['planner_factory'](cloud)
+        assert request() is cloud
+        assert len(planners) == 2  # No second target builder/native planner for the next scene.
+    assert session.station_point_grasp_provider is None and session.localization_provider is None
+    assert session.perception_provider.rgb_camera_geometry is not None
+    binding, = adapter_bindings
+    assert binding["debug_record_dir"] == (tmp_path if debug_enabled else None)
+    if debug_enabled:
+        assert binding["debug_context"]["runtime_session_id"] == "safe:test"
+        assert binding["debug_context_files"]["robot.urdf"] == DEFAULT_RM65_CAMERA_MOUNT_URDF
+    assert not list(tmp_path.glob("scene-*"))  # No capture during construction.
+    assert all(backend.starts == 0 for backend in lower.arm_backends.values())
+    session.close()
+    assert guard.starts == 0
+    assert not kwargs["socket_path"].exists()
 
 
 def test_composition_matches_mujoco_canonical_station_axes_and_pose(

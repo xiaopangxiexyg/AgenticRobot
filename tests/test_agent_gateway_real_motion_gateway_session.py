@@ -1560,10 +1560,15 @@ def test_one_gateway_session_executes_two_motion_requests_and_holds_between() ->
             ),
         )
 
+    def observe_owner():
+        held = port.snapshot().phase == RealAgentMotionPhase.HELD
+        return replace(owner_state, captured_at=clock(),
+            lifecycle_state="hold" if held else "running", execution_gate="hold" if held else "ready")
+
     gateway = assemble_real_agent_primitive_gateway_session(
         contract_bundle=bundle,
         port=port,
-        owner_state_provider=lambda: owner_state,
+        owner_state_provider=observe_owner,
         allowed_client_ids=(CLIENT_ID,),
         clock=clock,
         sleep=owner_sleep,
@@ -1585,6 +1590,7 @@ def test_one_gateway_session_executes_two_motion_requests_and_holds_between() ->
     for client_sequence, direction in enumerate(("forward", "backward"), start=1):
         observation = gateway.observation_producer.capture_and_publish(gateway.service)
         assert observation.accepted and observation.snapshot is not None
+        assert observation.snapshot.lifecycle_state == ("running" if client_sequence == 1 else "hold")
         request = _request(
             bundle,
             observation.snapshot,
@@ -2113,3 +2119,77 @@ def test_real_rgb_and_depth_routes_run_passively_and_commit_artifacts(tmp_path) 
         assert port.snapshot().dispatch_count == 0
     finally:
         store.close()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+def test_motion_only_gateway_reads_confirmed_hold_without_resuming_arm():
+    bundle, port, builder = _runtime_fixture(exclusive_owner=True)
+    clock, lower_owner = _Clock(), _PersistentOwnerSession()
+    port.request_domain_hold(reason="planning rejected", requested_at=clock())
+    port.apply_owner_requests(session=lower_owner, now=clock())
+    port.publish_measured_pose(pose_world_by_component={COMPONENT_ID: np.eye(4)},
+        measured_at=clock(), available_at=clock(), source_evidence_refs=("fresh:held",))
+    owner = replace(_owner_state(bundle, captured_at=clock()), lifecycle_state="hold", execution_gate="hold")
+    gateway = assemble_real_agent_primitive_gateway_session(contract_bundle=bundle, port=port,
+        owner_state_provider=lambda: owner, allowed_client_ids=(CLIENT_ID,), clock=clock)
+    before = port.snapshot()
+    try:
+        assert bundle.gripper_contract is None
+        snapshot = gateway.observation_producer.capture_and_publish(gateway.service).snapshot
+        assert snapshot.lifecycle_state == snapshot.execution_gate == "hold"
+        assert port.snapshot() == before
+        assert before.phase == RealAgentMotionPhase.HELD and before.hold_succeeded is True
+        assert builder.last_target is None
+        clock.value += .3
+        with pytest.raises(RuntimeError, match="stale"):
+            gateway.observation_producer.capture_snapshot(active_operation_id=None)
+        assert port.snapshot() == before
+    finally:
+        gateway.close()
+
+
+
+@pytest.mark.parametrize("lifecycle,gate", [("fault", "fault"), ("closed", "hold"), ("hold", "fault")])
+def test_motion_only_confirmed_hold_does_not_override_owner_fault_or_closed(lifecycle, gate):
+    bundle, port, _ = _runtime_fixture(exclusive_owner=True)
+    clock = _Clock()
+    port.request_domain_hold(reason="fixture", requested_at=clock())
+    port.apply_owner_requests(session=_PersistentOwnerSession(), now=clock())
+    owner = replace(_owner_state(bundle, captured_at=clock()), lifecycle_state=lifecycle, execution_gate=gate)
+    gateway = assemble_real_agent_primitive_gateway_session(contract_bundle=bundle, port=port,
+        owner_state_provider=lambda: owner, allowed_client_ids=(CLIENT_ID,), clock=clock)
+    try:
+        with pytest.raises(RuntimeError, match="Real motion owner is not"):
+            gateway.observation_producer.capture_snapshot(active_operation_id=None)
+    finally:
+        gateway.close()
+
+
+
+@pytest.mark.parametrize("proof", [None, False])
+def test_motion_only_hold_observation_requires_lower_stop_proof(monkeypatch, proof):
+    bundle, port, _ = _runtime_fixture(exclusive_owner=True)
+    clock = _Clock()
+    port.request_domain_hold(reason="fixture", requested_at=clock())
+    port.apply_owner_requests(session=_PersistentOwnerSession(), now=clock())
+    held = replace(port.snapshot(), hold_succeeded=proof)
+    monkeypatch.setattr(port, "snapshot", lambda: held)
+    owner = replace(_owner_state(bundle, captured_at=clock()), lifecycle_state="hold", execution_gate="hold")
+    gateway = assemble_real_agent_primitive_gateway_session(contract_bundle=bundle, port=port,
+        owner_state_provider=lambda: owner, allowed_client_ids=(CLIENT_ID,), clock=clock)
+    try:
+        with pytest.raises(RuntimeError, match="hold_succeeded"):
+            gateway.observation_producer.capture_snapshot(active_operation_id=None)
+    finally:
+        gateway.close()

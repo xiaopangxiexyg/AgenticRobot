@@ -5195,3 +5195,64 @@ def test_tcp_preplan_rejects_original_outside_target_before_branch_search(monkey
         planner.plan_tcp_pose(qpos_by_side=pair, side="right",
             target_tool_tcp_world=target, speed_scale=.2, time_budget_sec=1.)
     assert not searched
+
+
+@pytest.mark.parametrize("budget", [0.0, -1.0, float("nan"), float("inf")])
+def test_generic_pose_planner_refuses_exhausted_operation_budget(budget):
+    planner = _planner_without_assets(config=RM65GraspTrajectoryPlanningConfig())
+    with pytest.raises(RM65GraspTrajectoryPlanningError) as error:
+        planner(qpos_by_side={s: np.zeros(6) for s in ("left", "right")},
+            side="right", target_tool_tcp_world=np.eye(4), speed_scale=.2,
+            require_grasp_approach=False, time_budget_sec=budget)
+    assert error.value.reason_code == "path_planning_time_budget_exhausted"
+
+
+
+def test_generic_pose_planner_does_not_restart_budget_after_preflight(monkeypatch):
+    planner = _planner_without_assets(config=RM65GraspTrajectoryPlanningConfig())
+    planner.target_builder = _CartesianQposBuilder()
+    elapsed = [0.0]
+
+    def preflight(**_kwargs):
+        elapsed[0] += 2.0
+
+    monkeypatch.setattr(planner, "require_static_grasp_scene", preflight)
+    monkeypatch.setattr(planner, "_preflight_start_envelope", lambda **_: None)
+    target = np.eye(4)
+    target[2, 3] = .03
+    with pytest.raises(RM65GraspTrajectoryPlanningError) as error:
+        planner(qpos_by_side={s: np.zeros(6) for s in ("left", "right")},
+            side="right", target_tool_tcp_world=target, speed_scale=.2,
+            require_grasp_approach=False, time_budget_sec=1.0,
+            monotonic=lambda: elapsed[0])
+    assert error.value.reason_code == "path_planning_time_budget_exhausted"
+
+
+
+@pytest.mark.parametrize("entrypoint", ["direct", "observed", "tcp_pose"])
+def test_operation_planning_budget_includes_shared_builder_lock_wait(monkeypatch, entrypoint):
+    from contextlib import contextmanager
+
+    planner = _planner_without_assets(config=RM65GraspTrajectoryPlanningConfig())
+    elapsed = [0.0]
+
+    @contextmanager
+    def delayed_lock():
+        elapsed[0] += 2.0
+        yield
+
+    planner._observed_planning_lock = delayed_lock()
+    monkeypatch.setattr(planner, "for_observed_cloud", lambda cloud: planner)
+    monkeypatch.setattr(planner, "require_static_grasp_scene",
+                        lambda **kw: pytest.fail("Exhausted request must not enter geometry"))
+    kwargs = dict(qpos_by_side={s: np.zeros(6) for s in ("left", "right")},
+                  side="right", target_tool_tcp_world=np.eye(4), speed_scale=.2,
+                  time_budget_sec=1.0, monotonic=lambda: elapsed[0])
+    with pytest.raises(RM65GraspTrajectoryPlanningError) as caught:
+        if entrypoint == "tcp_pose":
+            planner.plan_tcp_pose(**kwargs)
+        elif entrypoint == "observed":
+            planner.plan_with_observed_cloud("frozen-scene", require_grasp_approach=False, **kwargs)
+        else:
+            planner(require_grasp_approach=False, **kwargs)
+    assert caught.value.reason_code == "path_planning_time_budget_exhausted"

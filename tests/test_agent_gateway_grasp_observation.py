@@ -13,7 +13,9 @@ from agent_gateway.profiles.real.point_grasp_gateway import (
     StationBoundPointGraspProvider, build_station_bound_point_grasp_executor,
 )
 from agent_gateway.profiles.real.realsense_perception import RealAlignedRgbdCapture
-from agent_gateway.profiles.real.rm65_camera_geometry import RM65RgbCameraGeometry, _DynamicCameraMount
+from agent_gateway.profiles.real.rm65_camera_geometry import (
+    RM65RgbCameraGeometry, RM65StationaryGeometryUnavailable, _DynamicCameraMount,
+)
 from agent_gateway.profiles.real.station_point_grasp_deployment import build_station_bound_point_grasp_registration
 from agent_gateway.runtime.artifact_store import RecoverableAgentArtifactStore
 from dataset_contracts.grasp_multiview_snapshot import decode_grasp_multiview_snapshot
@@ -175,16 +177,20 @@ def test_capture_inference_and_planning_reuse_exact_observation(tmp_path, monkey
         read_observation("observation:1", 8)
 
 
-def test_stationary_camera_history_rejects_movement_and_matches_capture():
+def _stationary_test_geometry():
     provider, _ = frozen_stack()
     source = provider.perception_provider.source_binding.camera_sources["front"]
     binding = replace(provider.perception_provider.source_binding,
         camera_sources={"front": source, "left_wrist": source})
-    geometry = RM65RgbCameraGeometry(source_binding=binding,
+    return RM65RgbCameraGeometry(source_binding=binding,
         target_builder=SimpleNamespace(solver_world_targets_for_qpos_pair=lambda **_: {"left": np.eye(4), "right": np.eye(4)}),
         static_source_from_camera={"front": np.eye(4)},
         dynamic_mounts=(_DynamicCameraMount("left_wrist", "wrist_left", "left", "link6", "camera", tuple(np.eye(4).reshape(-1))),),
         urdf_sha256="test")
+
+
+def test_stationary_camera_history_rejects_movement_and_matches_capture():
+    geometry = _stationary_test_geometry()
     with pytest.raises(RuntimeError, match="history_unavailable"):
         geometry.stationary_geometry_cut(source_id="left_wrist", frame_acquired_at=10., now=10.01)
     for measured in (9.8, 9.85, 9.9, 9.95, 10.):
@@ -197,6 +203,29 @@ def test_stationary_camera_history_rejects_movement_and_matches_capture():
         measured_at=10.02, available_at=10.021, evidence_refs=("sample:moved",))
     with pytest.raises(RuntimeError, match="not_stationary"):
         geometry.stationary_geometry_cut(source_id="left_wrist", frame_acquired_at=10., now=10.03)
+
+
+@pytest.mark.parametrize("times,now,condition", [
+    ((), 10.01, "insufficient_samples"),
+    ((9.9, 10.), 10.01, "insufficient_samples"),
+    ((9.94, 9.97, 10.), 10.01, "missing_pre_frame_history"),
+    ((9.8, 9.85, 9.90), 10.01, "last_sample_before_frame"),
+    ((9.8, 9.9, 9.98), 10.3, "last_sample_stale"),
+    ((9.8, 9.95, 10.), 10.01, "sample_gap_exceeded"),
+])
+def test_stationary_history_failure_reports_the_exact_admission_condition(times, now, condition):
+    geometry = _stationary_test_geometry()
+    for measured in times:
+        geometry.publish_measured_qpos(qpos_by_side={s: np.zeros(6) for s in ("left", "right")},
+            measured_at=measured, available_at=measured+.001, evidence_refs=("sample:test",))
+    with pytest.raises(RM65StationaryGeometryUnavailable) as caught:
+        geometry.stationary_geometry_cut(source_id="left_wrist", frame_acquired_at=10., now=now)
+    diagnostic = caught.value.diagnostic
+    assert caught.value.reason_code == "grasp_observation_stationary_history_unavailable"
+    assert condition in diagnostic["failed_conditions"]
+    assert diagnostic["sample_count"] == len(times)
+    assert diagnostic["source_id"] == "left_wrist" and diagnostic["frame_acquired_at"] == 10.
+    assert diagnostic["last_measured_at"] == (times[-1] if times else None)
 
 
 @pytest.mark.parametrize("failure", [None, "grasp_observation_not_stationary", "grasp_observation_pose_history_unavailable"])
