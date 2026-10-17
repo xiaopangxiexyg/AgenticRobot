@@ -1,0 +1,166 @@
+{
+  "schema_version": "dexteleop.sim.real2sim_artifact.v1",
+  "name": "rm65_arm_free_motion_20260721_v4_runtime_binding_20261017_v7",
+  "simulation_contract": {
+    "artifact_id": "rm65-bimanual-physics-runtime-20261017-v7",
+    "artifact_kind": "simulation_contract",
+    "sha256": "dbf0cd77b5e8ffbd0f7951f9a4ae10c6c25757e6f32657e16f1fe14cf100938d",
+    "locator": "sim/configs/rm65_bimanual_physics_v1.json"
+  },
+  "resolved_timing": {
+    "sample_hz": 15.0,
+    "policy_hz": 15.0,
+    "reference_hz": 60.0,
+    "ik_hz": 60.0,
+    "command_hz": 120.0,
+    "physics_hz": 1000.0,
+    "camera_hz": 30.0,
+    "interpolation": "timestamp_linear",
+    "command_hold": "zero_order_hold_between_command_ticks",
+    "parameter_source": "project_default_pending_real_system_id"
+  },
+  "dependency_artifacts": [
+    {
+      "artifact_id": "rm65-arm-free-motion-fit-20260721-v4",
+      "artifact_kind": "real2sim_fit_artifact",
+      "sha256": "89d72aed454bdc309959f7489486eb5ef3eae13d688be444efd849b637d6bd53",
+      "locator": "sim/rm65/real2sim/artifacts/rm65_arm_free_motion_20260721_v4.json"
+    },
+    {
+      "artifact_id": "rm65-arm-profile-runtime-20261017-v7",
+      "artifact_kind": "actuation_profile",
+      "sha256": "551b8a832f97d6e4fdfaef96b0cd3ff8b7dee46f4610ac948e23ff13602c48de",
+      "locator": "sim/rm65/actuation/profile.py"
+    },
+    {
+      "artifact_id": "rm65-arm-actuator-core-runtime-20261017-v7",
+      "artifact_kind": "sim_actuator_core_source",
+      "sha256": "4a68394fd359b6481e28594bf933c56ffe270ddcd7806c44675cd3e964e697c6",
+      "locator": "sim/rm65/actuation/core.py"
+    },
+    {
+      "artifact_id": "rm65-arm-mujoco-executor-runtime-20261017-v7",
+      "artifact_kind": "sim_backend_adapter_source",
+      "sha256": "4913933a6ccabcf2d9ac1dd55bd3df164b3135b1e7cddda3be7d1e7de6ed4c62",
+      "locator": "sim/mujoco/actuation/executor.py"
+    },
+    {
+      "artifact_id": "rm65-camera-registry-runtime-20261017-v7",
+      "artifact_kind": "camera_registry",
+      "sha256": "7a0c1e612508c15dc5e0d8445e362498d92b28606e6f7157f47b88fda965e9ba",
+      "locator": "robot_motion/configs/rm65_camera_registry.json"
+    },
+    {
+      "artifact_id": "rm65-arm-runtime-binding-20260922-v5",
+      "artifact_kind": "real2sim_runtime_binding",
+      "sha256": "4a0d1d520864138bc1cef41347cf3fe43ec4a3f511710fdc2b77404c342768d8",
+      "locator": "sim/rm65/real2sim/artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20260922_v5.json"
+    },
+    {
+      "artifact_id": "rm65-command-guard-runtime-20261017-v7",
+      "artifact_kind": "sim_command_admission_source",
+      "sha256": "8e46a5361b687d53fbc6a834361ba60be9da86826f55f3107cc163d82f538666",
+      "locator": "sim/mujoco/adapters/tcp_pose_command_guard.py"
+    },
+    {
+      "artifact_id": "rm65-envelope-adapter-runtime-20261017-v7",
+      "artifact_kind": "sim_command_admission_source",
+      "sha256": "da9c97f6cf262c39122f0126e48ad46d86a3b75a7118fa6ac43edfe16656d1ce",
+      "locator": "sim/mujoco/adapters/tcp_pose_envelope.py"
+    },
+    {
+      "artifact_id": "rm65-position-rig-runtime-20261017-v7",
+      "artifact_kind": "sim_command_admission_source",
+      "sha256": "f8827bd5e5f0800bd69f25da576c5e84276d487d93a858946d1f3b10b8f56c77",
+      "locator": "sim/mujoco/adapters/robot_motion.py"
+    },
+    {
+      "artifact_id": "rm65-position-assembly-runtime-20261017-v7",
+      "artifact_kind": "sim_command_admission_source",
+      "sha256": "81d18dc93e7fb53d4fd6545e1f3c2089660a55a9a22b951127ec94903d36db61",
+      "locator": "sim/mujoco/control/desk_tcp_position.py"
+    }
+  ],
+  "fidelity_claims": [
+    {
+      "component": "arm.position_response.free_motion.runtime_source_binding",
+      "status": "provisional",
+      "evidence_artifact_ids": [
+        "rm65-arm-free-motion-fit-20260721-v4",
+        "rm65-arm-profile-runtime-20261017-v7",
+        "rm65-arm-actuator-core-runtime-20261017-v7",
+        "rm65-arm-mujoco-executor-runtime-20261017-v7",
+        "rm65-camera-registry-runtime-20261017-v7",
+        "rm65-arm-runtime-binding-20260922-v5",
+        "rm65-command-guard-runtime-20261017-v7",
+        "rm65-envelope-adapter-runtime-20261017-v7",
+        "rm65-position-rig-runtime-20261017-v7",
+        "rm65-position-assembly-runtime-20261017-v7"
+      ],
+      "limitations": [
+        "This binding reuses the frozen 20260721.v4 arm fit; no arm parameters were refit or revalidated.",
+        "The frozen fit manifest continues to identify its historical core and MuJoCo adapter by their original hashes; the current sources are bound separately here.",
+        "The optional final TCP command admission and copied held-control response are offline MuJoCo checks. They do not establish swept-TCP certification, future gripper-input safety, or real-robot braking behavior.",
+        "The original v4 held-out status remains not_run, so this binding does not promote the arm fidelity claim.",
+        "Collision avoidance correctness and MuJoCo contact behavior do not establish real-robot collision or grasp fidelity."
+      ],
+      "notes": "The v7 runtime-source binding records final TCP command admission while preserving the frozen v4 fit and the v5 runtime binding unchanged."
+    }
+  ],
+  "validation_evidence": [
+    {
+      "validation_id": "runtime-source-content-binding-integrity-v7",
+      "split": "validation",
+      "status": "passed",
+      "metrics": {
+        "bound_runtime_source_file_count": 7.0,
+        "changed_runtime_source_file_count_from_previous_binding": 5.0,
+        "unchanged_arm_profile_source_file_count": 1.0,
+        "arm_profile_refit_count": 0.0,
+        "mutated_historical_artifact_count": 0.0,
+        "new_runtime_source_file_count": 4.0
+      },
+      "evidence_artifact_ids": [
+        "rm65-arm-free-motion-fit-20260721-v4",
+        "rm65-arm-profile-runtime-20261017-v7",
+        "rm65-arm-actuator-core-runtime-20261017-v7",
+        "rm65-arm-mujoco-executor-runtime-20261017-v7",
+        "rm65-arm-runtime-binding-20260922-v5",
+        "rm65-command-guard-runtime-20261017-v7",
+        "rm65-envelope-adapter-runtime-20261017-v7",
+        "rm65-position-rig-runtime-20261017-v7",
+        "rm65-position-assembly-runtime-20261017-v7"
+      ],
+      "notes": "Exact content hashes bind final command admission, its envelope/rig/assembly, and the unchanged arm profile and actuator core; the previous v5 binding and frozen fit are retained."
+    },
+    {
+      "validation_id": "new-untouched-clean-held-out-v7-runtime-source-binding",
+      "split": "held_out",
+      "status": "not_run",
+      "metrics": {},
+      "evidence_artifact_ids": [],
+      "notes": "Lifecycle and identity hardening plus source rebinding are not new arm-response evidence. A later clean capture must remain untouched before the reused v4 fit can pass held-out validation."
+    }
+  ],
+  "code_revision": "b528f0de6a56f23e0244cda11a9e9608288385f7",
+  "environment_fingerprint": {
+    "python": "3.10.20",
+    "mujoco": "3.10.0",
+    "source_commit": "b528f0de6a56f23e0244cda11a9e9608288385f7"
+  },
+  "metadata": {
+    "owner": "sim.rm65",
+    "binding_kind": "runtime_source_rebind",
+    "fit_profile_name": "rm65_bimanual_udp_feedback_20260721.v4",
+    "fit_artifact_sha256": "501702e3b741096fc3038b082405073bad51f63626b7296b75d2847e85df778d",
+    "fit_simulation_contract_sha256": "baa5efcd490f27b0d2e261ac2e5c91181a0618de75596017a05714a02333a0df",
+    "previous_runtime_binding_artifact_sha256": "9b5bc0cd6e45b8f907a921f3fee811b062efc71db93a4cec5a7ed2bd61724f76",
+    "previous_runtime_binding_file_sha256": "4a0d1d520864138bc1cef41347cf3fe43ec4a3f511710fdc2b77404c342768d8",
+    "arm_profile_refit": false,
+    "runtime_behavior_change": true,
+    "runtime_behavior_change_scope": "offline_tcp_envelope_final_command_admission",
+    "runtime_source_commit": "b528f0de6a56f23e0244cda11a9e9608288385f7",
+    "migration": "tcp_envelope_final_command_runtime_source_binding"
+  },
+  "artifact_sha256": "bfb52780d549c5221201fde7f33dd95079c33dafe94c40ab4cf5a7931d0fbac6"
+}
