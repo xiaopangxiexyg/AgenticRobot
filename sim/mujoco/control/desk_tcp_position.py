@@ -8,6 +8,7 @@ physics.  Dataset parsing and viewer policy deliberately live elsewhere.
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -317,8 +318,14 @@ class DeskTcpPositionControl:
     def build(
         cls,
         config: DeskTcpPositionControlConfig | None = None,
+        *,
+        use_physics_clock: bool = False,
     ) -> "DeskTcpPositionControl":
         cfg = config or DeskTcpPositionControlConfig()
+        if not isinstance(use_physics_clock, bool):
+            raise TypeError("use_physics_clock must be a bool")
+        if use_physics_clock and cfg.realtime_worker:
+            raise ValueError("physics clock requires explicit offline stepping")
         base_contract = SimulationContract.load(cfg.simulation_contract_path)
         timing = position_15_60_120_timing(
             base_contract.timing,
@@ -478,6 +485,7 @@ class DeskTcpPositionControl:
                     gripper_actuation_profile=gripper_profile,
                     realtime_worker=bool(cfg.realtime_worker),
                 ),
+                monotonic_clock=(lambda: float(scene.data.time)) if use_physics_clock else time.monotonic,
             )
             rig.start()
             return cls(

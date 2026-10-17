@@ -93,6 +93,18 @@ The random stream is fixed by the JSON config. Increase `sample_count` for a
 longer offline soak test; do not replace deterministic CI coverage with an
 unbounded random loop.
 
+## TCP 包络的最终输出与物理响应
+
+`test_mujoco_tcp_pose_envelope_closed_loop.py` 保留原 8° 限值，并逐个 1000 Hz
+physics tick 检查实际 TCP 和最终 120 Hz qcmd 的 FK；平移仍受原 15 mm 包络限制。
+IK 前的目标投影不能单独证明这些边界：关节独立整形及不同传输延迟会改变 TCP 路径。
+本离线场景显式绑定同一 profile、anchor 和 epoch 的最终命令接纳，使用独立 FK 数据，
+复制当前 MuJoCo 完整状态及原执行器的待交付命令、滤波状态，查询接纳命令后保持的响应。
+只接纳通过检查且在有界时间内稳定的候选，必要时缩短原碰撞投影已接纳的双臂线段；
+无法证明安全保持则失败并锁存，不修改真实物理状态、伺服参数或碰撞门禁。
+该查询仅支持显式离线 stepping，其他控制量在预演中保持当前值；它不覆盖未来夹爪输入，
+不构成连续扫掠认证或真机制动保证。场景的 `passed` 同样包含实际姿态越界的失败判定。
+
 ## Arbitrary grasp-pose reachability probe
 
 `rm65_random_grasp_pose_reachability_v1.json` defines a bounded Cartesian box,

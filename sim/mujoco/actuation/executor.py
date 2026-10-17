@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import copy
 import math
-from dataclasses import dataclass
-from typing import Mapping, Sequence
+from dataclasses import dataclass, replace
+from typing import Callable, Mapping, Sequence
 
 import numpy as np
 
@@ -71,6 +72,7 @@ class ActuatedPositionTick:
     minimum_distance_m: float = float("inf")
     collision_pair: tuple[str | None, str | None] = (None, None)
     hard_contact: bool = False
+    final_command_projection_alpha: float = 1.0
 
 
 class MujocoActuatedPositionExecutor:
@@ -168,6 +170,9 @@ class MujocoActuatedPositionExecutor:
         self._last_safety_status = "unavailable"
         self._hard_contact_latched = False
         self._last_requested_qpos_by_side: dict[str, np.ndarray] = {}
+        self._final_command_guard = None
+        self._final_command_fault_latched = False
+        self._last_final_command_projection_alpha = 1.0
 
     @property
     def execution_metadata(self) -> dict[str, object]:
@@ -224,6 +229,111 @@ class MujocoActuatedPositionExecutor:
     def hard_contact_latched(self) -> bool:
         return bool(self._hard_contact_latched)
 
+    def install_final_command_guard(self, guard) -> None:
+        """Bind one explicit final-qcmd owner while the enclosing rig is held."""
+
+        if self._final_command_guard is not None:
+            raise RuntimeError("A final command guard is already installed.")
+        if not all(callable(getattr(guard, name, None)) for name in (
+            "admission_fraction", "check_qpos_pair", "snapshot",
+        )):
+            raise TypeError("final command guard lacks its admission/check/snapshot port")
+        guard.check_qpos_pair({s: self.measured_arm_qpos(s) for s in self.active_sides})
+        if self._held_command is None:
+            raise RuntimeError("reset is required before binding a final command guard")
+        previous = {s: self._actuator.accepted_qpos(s) for s in self.active_sides}
+        held = replace(self._held_command, sequence=self._held_command.sequence + 1, qpos_by_side=previous)
+        alpha = float(guard.admission_fraction(
+            held, previous_qpos_by_side=previous,
+            preview_held_command=self.preview_held_command_is_safe,
+        ))
+        if not math.isfinite(alpha) or not 0.0 <= alpha <= 1.0:
+            raise ValueError("initial final command admission fraction must lie in [0, 1]")
+        self._final_command_guard = guard
+
+    def preview_held_command_is_safe(
+        self,
+        command: DirectQposCommand,
+        *,
+        qpos_check: Callable[[Mapping[str, np.ndarray]], bool],
+        max_preview_time_sec: float,
+    ) -> bool:
+        """Query a discrete held-control response without advancing live state.
+
+        The cloned actuator preserves pending per-joint delays and filter state.
+        MuJoCo uses copied complete data and the same read-only model. Other
+        controls remain held; this is not a prediction of future gripper input,
+        a swept-volume certificate, or a real-hardware braking guarantee.
+        """
+
+        self._validate_command(command, require_newer_than=self._held_command)
+        duration = float(max_preview_time_sec)
+        if not math.isfinite(duration) or duration <= 0.0:
+            raise ValueError("max_preview_time_sec must be finite and positive")
+        core = copy.deepcopy(self._actuator, memo={id(self.profile): self.profile})
+        data = self.scene.mujoco.MjData(self.scene.model)
+        self.scene.mujoco.mj_copyData(data, self.scene.model, self.scene.data)
+        q_indices = {
+            s: [self.scene.joint_qpos_addr(n) for n in self.profile.joint_names_by_side[s]]
+            for s in self.active_sides
+        }
+        v_indices = [
+            self.scene.joint_dof_addr(n)
+            for s in self.active_sides for n in self.profile.joint_names_by_side[s]
+        ]
+        if not qpos_check({s: data.qpos[i].copy() for s, i in q_indices.items()}):
+            return False
+        state = core.snapshot()
+        last_old_delivery = max(
+            (float(x["apply_time_sec"]) for x in state["delayed_targets"]),
+            default=core.physics_time_sec,
+        )
+        first_delivery_complete = core.physics_time_sec + max(
+            self.profile.command_delay_sec(s, j) for s in self.active_sides for j in range(6)
+        )
+        settle_after = max(last_old_delivery, first_delivery_complete)
+        stable_ticks = 0
+        required_stable_ticks = max(1, math.ceil(0.02 * self.timing.physics_hz))
+        sequence = int(command.sequence)
+        for _ in range(math.ceil(duration * self.timing.physics_hz)):
+            if core.command_due:
+                tick = core.step(command_sequence=sequence, qpos_by_side=command.qpos_by_side)
+                sequence += 1
+            else:
+                tick = core.step()
+            targets = tick.actuator_target_by_side
+            if not qpos_check(targets):
+                return False
+            for side, target in targets.items():
+                data.ctrl[self._actuator_ids[side]] = target
+            self.scene.mujoco.mj_step(self.scene.model, data)
+            if not np.all(np.isfinite(data.qvel[v_indices])) or not qpos_check(
+                {s: data.qpos[i].copy() for s, i in q_indices.items()}
+            ):
+                return False
+            settled = (
+                core.physics_time_sec >= settle_after
+                and all(np.max(np.abs(targets[s] - command.qpos_by_side[s])) <= 1e-8
+                        for s in self.active_sides)
+                and np.max(np.abs(data.qvel[v_indices])) <= 1e-4
+            )
+            stable_ticks = stable_ticks + 1 if settled else 0
+            if stable_ticks >= required_stable_ticks:
+                return True
+        # An unfinished stop is not evidence that the held response is safe.
+        return False
+
+    def _check_final_measured_guard(self) -> None:
+        if self._final_command_guard is None:
+            return
+        try:
+            self._final_command_guard.check_qpos_pair(
+                {s: self.measured_arm_qpos(s) for s in self.active_sides}
+            )
+        except Exception:
+            self._final_command_fault_latched = True
+            raise
+
     def reset(
         self,
         initial_command: DirectQposCommand,
@@ -232,6 +342,14 @@ class MujocoActuatedPositionExecutor:
         initial_state: Mapping[str, object] | None = None,
     ) -> None:
         self._validate_command(initial_command, require_newer_than=None)
+        if initial_state is not None and not isinstance(initial_state, Mapping):
+            raise TypeError("initial_state must be a mapping")
+        guard_state = None if self._final_command_guard is None else self._final_command_guard.snapshot()
+        restored_guard = None if initial_state is None else initial_state.get("final_command_guard")
+        if restored_guard is not None and (
+            guard_state is None or restored_guard.get("binding") != guard_state["binding"]
+        ):
+            raise ValueError("initial_state final command guard binding does not match")
         wrapper_identity_fields = {
             "execution_mode",
             "profile",
@@ -298,6 +416,8 @@ class MujocoActuatedPositionExecutor:
         self._last_active_collision_check = None
         self._last_admitted_target_check = None
         self._hard_contact_latched = False
+        self._final_command_fault_latched = False
+        self._last_final_command_projection_alpha = 1.0
         self._last_requested_qpos_by_side = {
             side: np.asarray(values, dtype=float).reshape(6).copy()
             for side, values in initial_command.qpos_by_side.items()
@@ -336,6 +456,7 @@ class MujocoActuatedPositionExecutor:
                     )
                 self._last_safety_status = "initial_clearance_violation"
         self._write_ctrl(self._actuator.actuator_target_by_side)
+        self._check_final_measured_guard()
 
     def step_physics(
         self,
@@ -345,12 +466,15 @@ class MujocoActuatedPositionExecutor:
 
         if self._held_command is None:
             raise RuntimeError("reset(initial_command) is required before stepping physics.")
+        if self._final_command_fault_latched:
+            raise RuntimeError("Final command guard is faulted; explicit reset/rearm is required.")
         if self._hard_contact_latched:
             raise RuntimeError(
                 "MuJoCo physical execution is latched after forbidden hard "
                 "contact; reset/rearm is required before another physics step."
             )
         projector = self._collision_projector()
+        self._check_final_measured_guard()
         if projector is not None:
             self._check_active_contact_or_latch(projector, phase="pre_step")
         due = self.command_due
@@ -360,6 +484,7 @@ class MujocoActuatedPositionExecutor:
         # physics tick; that made a stable zero-order hold look like a fresh
         # safety intervention to visualizers and downstream metrics.
         tick_safety_result: CollisionProjectionResult | None = None
+        final_command_alpha = 1.0
         tick_safety_status = "held" if projector is not None else "unavailable"
         if due:
             if command is None:
@@ -416,6 +541,27 @@ class MujocoActuatedPositionExecutor:
                     )
                 self._last_safety_status = self.collision_projection_mode
                 tick_safety_status = self.collision_projection_mode
+            if self._final_command_guard is not None:
+                try:
+                    previous = {s: self._actuator.accepted_qpos(s) for s in self.active_sides}
+                    final_command_alpha = float(self._final_command_guard.admission_fraction(
+                        effective_command,
+                        previous_qpos_by_side=previous,
+                        preview_held_command=self.preview_held_command_is_safe,
+                    ))
+                    if not math.isfinite(final_command_alpha) or not 0.0 <= final_command_alpha <= 1.0:
+                        raise ValueError("final command admission fraction must lie in [0, 1]")
+                    # One common scalar only shortens the already collision-
+                    # admitted bimanual segment. It cannot create a new path or
+                    # change sequence, source, gripper targets, or the receipt.
+                    effective_command = replace(effective_command, qpos_by_side={
+                        s: previous[s] + final_command_alpha * (effective_command.qpos_by_side[s] - previous[s])
+                        for s in self.active_sides
+                    })
+                    self._last_final_command_projection_alpha = final_command_alpha
+                except Exception:
+                    self._final_command_fault_latched = True
+                    raise
             core_tick = self._actuator.step(
                 command_sequence=int(effective_command.sequence),
                 qpos_by_side=effective_command.qpos_by_side,
@@ -445,6 +591,7 @@ class MujocoActuatedPositionExecutor:
                 self._last_safety_status = "held"
         else:
             self._last_safety_status = "unavailable"
+        self._check_final_measured_guard()
         check = self._last_active_collision_check
         if check is None or not np.isfinite(float(check.minimum_distance_m)):
             check = self._last_admitted_target_check
@@ -482,6 +629,7 @@ class MujocoActuatedPositionExecutor:
                 else (check.body1_name, check.body2_name)
             ),
             hard_contact=hard_contact,
+            final_command_projection_alpha=final_command_alpha,
         )
 
     def snapshot(self) -> dict[str, object]:
@@ -494,6 +642,13 @@ class MujocoActuatedPositionExecutor:
         return {
             **self.execution_metadata,
             **self._actuator.snapshot(),
+            "final_command_guard": (
+                None if self._final_command_guard is None else {
+                    **self._final_command_guard.snapshot(),
+                    "fault_latched": self._final_command_fault_latched,
+                    "last_projection_alpha": self._last_final_command_projection_alpha,
+                }
+            ),
             "measured_qpos_by_side": {side: values.tolist() for side, values in measured.items()},
             "accepted_minus_measured_qpos_by_side": {
                 side: (accepted[side] - measured[side]).tolist()

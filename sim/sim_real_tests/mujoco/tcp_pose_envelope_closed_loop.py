@@ -5,8 +5,8 @@ real position control, while remaining isolated from ``teleop_runtime`` and
 all hardware backends.  It runs 15 Hz Cartesian source targets through 60 Hz
 coupled IK, 120 Hz joint commands, and 1000 Hz MuJoCo physics.
 
-This scenario certifies target projection and closed-loop behavior at emitted
-target samples.  It does not claim swept-TCP certification between samples.
+This scenario checks target projection, final qcmd and measured TCP poses at
+every physics tick. It does not claim swept-TCP certification between ticks.
 """
 
 from __future__ import annotations
@@ -34,6 +34,7 @@ from sim.mujoco.adapters.tcp_pose_envelope import (
     mujoco_target_frame_binding_hash,
     mujoco_tool_frame_binding_hashes,
 )
+from sim.mujoco.adapters.tcp_pose_command_guard import install_mujoco_tcp_pose_command_guard
 from sim.mujoco.control.desk_tcp_position import DeskTcpPositionControl
 
 from ..core import SimRealScenarioResult
@@ -257,7 +258,7 @@ def run_tcp_pose_envelope_active_closed_loop(
     control: DeskTcpPositionControl | None = None
     records: list[dict[str, Any]] = []
     try:
-        control = DeskTcpPositionControl.build()
+        control = DeskTcpPositionControl.build(use_physics_clock=True)
         initial_qpos = {
             side: control.scene.get_arm_qpos(side).copy()
             for side in ("left", "right")
@@ -309,6 +310,9 @@ def run_tcp_pose_envelope_active_closed_loop(
             anchor_receipt=anchor,
             apply_to_target=True,
         )
+        command_guard = install_mujoco_tcp_pose_command_guard(
+            rig=control.rig, target_filter=active_filter,
+        )
         source_targets = _source_targets(
             control=control,
             anchor_tool_world_by_side=anchor_tool_world,
@@ -346,6 +350,9 @@ def run_tcp_pose_envelope_active_closed_loop(
         ik_failure_count = 0
         nonfinite_qcmd_count = 0
         right_projection_change_m = 0.0
+        physics_tick_count = 0
+        max_final_qcmd_translation_component_m = 0.0
+        max_final_qcmd_rotation_deg = 0.0
 
         for reference_index, reference in enumerate(references):
             actual_before = control.retargeter.tool_tcp_world_targets_for_qpos_pair(
@@ -429,7 +436,30 @@ def run_tcp_pose_envelope_active_closed_loop(
             physics_tick_accumulator -= physics_ticks
             for _ in range(physics_ticks):
                 control.step_physics()
+                physics_tick_count += 1
                 qcmd = control.rig.accepted_qcmd_by_side()
+                actual_tick = command_guard.tcp_pose_pair({
+                    s: control.scene.get_arm_qpos(s) for s in ("left", "right")
+                })["left"]
+                qcmd_tick = command_guard.tcp_pose_pair(qcmd)["left"]
+                max_actual_direction_angle_deg = max(
+                    max_actual_direction_angle_deg,
+                    _max_basis_direction_error_deg(anchor_left, actual_tick),
+                )
+                max_actual_anchor_rotation_deg = max(
+                    max_actual_anchor_rotation_deg, _rotation_error_deg(anchor_left, actual_tick),
+                )
+                max_actual_translation_component_m = max(
+                    max_actual_translation_component_m,
+                    float(np.max(np.abs(actual_tick[:3, 3] - anchor_left[:3, 3]))),
+                )
+                max_final_qcmd_translation_component_m = max(
+                    max_final_qcmd_translation_component_m,
+                    float(np.max(np.abs(qcmd_tick[:3, 3] - anchor_left[:3, 3]))),
+                )
+                max_final_qcmd_rotation_deg = max(
+                    max_final_qcmd_rotation_deg, _rotation_error_deg(anchor_left, qcmd_tick),
+                )
                 for side in ("left", "right"):
                     if not np.all(np.isfinite(qcmd[side])):
                         nonfinite_qcmd_count += 1
@@ -543,6 +573,16 @@ def run_tcp_pose_envelope_active_closed_loop(
             failures.append("an effective target exceeded the translation envelope")
         if max_effective_rotation_deg > cfg.max_rotation_deg + cfg.projection_tolerance_deg:
             failures.append("an effective target exceeded the rotation envelope")
+        if max_actual_translation_component_m > cfg.translation_half_extent_m + cfg.projection_tolerance_m:
+            failures.append("a measured physics-tick TCP exceeded the translation envelope")
+        if max_actual_anchor_rotation_deg > cfg.max_rotation_deg + cfg.projection_tolerance_deg:
+            failures.append("a measured physics-tick TCP exceeded the rotation envelope")
+        if max_actual_direction_angle_deg > cfg.max_rotation_deg + cfg.projection_tolerance_deg:
+            failures.append("a measured physics-tick TCP basis exceeded the direction envelope")
+        if max_final_qcmd_translation_component_m > cfg.translation_half_extent_m + cfg.projection_tolerance_m:
+            failures.append("a final qcmd exceeded the translation envelope")
+        if max_final_qcmd_rotation_deg > cfg.max_rotation_deg + cfg.projection_tolerance_deg:
+            failures.append("a final qcmd exceeded the rotation envelope")
         if right_projection_change_m > cfg.projection_tolerance_m:
             failures.append("the unconfigured right target was modified")
         if final_anchor_error_m > cfg.projection_tolerance_m:
@@ -564,6 +604,11 @@ def run_tcp_pose_envelope_active_closed_loop(
                 "reference_hz": cfg.reference_hz,
                 "command_hz": control.contract.timing.command_hz,
                 "physics_hz": control.contract.timing.physics_hz,
+                "physics_tick_count": physics_tick_count,
+                "final_command_admission_count": command_guard.snapshot()["admission_count"],
+                "final_command_modified_count": command_guard.snapshot()["modified_count"],
+                "max_final_qcmd_translation_component_m": max_final_qcmd_translation_component_m,
+                "max_final_qcmd_rotation_deg": max_final_qcmd_rotation_deg,
                 "source_target_count": len(source_targets),
                 "reference_count": len(references),
                 "projection_count": active_filter.projection_count,

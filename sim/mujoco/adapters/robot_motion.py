@@ -1105,6 +1105,22 @@ class MujocoPositionExecutionRig(Rig):
                 for side, qpos in self._accepted_qcmd_by_side.items()
             }
 
+    def install_final_command_guard(self, guard) -> None:
+        """Bind an offline native admission query before publishing references."""
+
+        with self._lock:
+            if self.config.realtime_worker or not isinstance(
+                self._execution, MujocoActuatedPositionExecutor
+            ):
+                raise RuntimeError("native held-control preview requires offline actuated execution")
+            if (
+                not self._started or self._stop_event.is_set()
+                or self._last_worker_error is not None
+                or self._pending_reference is not None or self._last_reference is not None
+            ):
+                raise RuntimeError("install final command guard on a started, held rig before references")
+            self._execution.install_final_command_guard(guard)
+
     def _measured_qpos_by_side_locked(self) -> dict[str, np.ndarray]:
         """Read the physical scene state while the rig lock is held.
 

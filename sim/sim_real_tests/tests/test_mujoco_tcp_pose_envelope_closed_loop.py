@@ -33,6 +33,13 @@ def test_active_tcp_pose_envelope_in_physical_position_chain() -> None:
     assert result.metrics["max_raw_direction_angle_deg"] > 8.0
     assert result.metrics["max_effective_direction_angle_deg"] <= 8.0 + 1e-5
     assert result.metrics["max_actual_direction_angle_deg"] <= 8.0 + 1e-5
+    assert result.metrics["max_actual_anchor_rotation_deg"] <= 8.0 + 1e-5
+    assert result.metrics["max_actual_translation_component_m"] <= 0.015 + 1e-8
+    assert result.metrics["max_final_qcmd_rotation_deg"] <= 8.0 + 1e-5
+    assert result.metrics["max_final_qcmd_translation_component_m"] <= 0.015 + 1e-8
+    assert result.metrics["physics_tick_count"] > result.metrics["reference_count"]
+    assert result.metrics["final_command_admission_count"] > 0
+    assert result.metrics["final_command_modified_count"] > 0
     assert result.metrics["max_actual_residual_m"] > 0.0
     assert result.metrics["ik_failure_count"] == 0
     assert result.metrics["nonfinite_qcmd_count"] == 0

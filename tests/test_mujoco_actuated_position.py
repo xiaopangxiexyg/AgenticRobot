@@ -107,6 +107,68 @@ def _command(sequence: int, qpos_by_side) -> DirectQposCommand:
 
 
 @pytest.mark.optional
+def test_native_held_control_preview_preserves_live_causal_and_physics_state() -> None:
+    pytest.importorskip("mujoco")
+    scene, profile = _scene_and_profile()
+    sender = MujocoActuatedPositionExecutor(scene, _timing(), profile)
+    initial = {s: scene.get_arm_qpos(s) for s in ("left", "right")}
+    sender.reset(_command(0, initial))
+    sequence = 1
+    while sender.physics_time_sec < 0.026:
+        command = _command(sequence, initial) if sender.command_due else None
+        if command is not None:
+            sequence += 1
+        sender.step_physics(command)
+    before = sender.snapshot()
+    physics = {n: getattr(scene.data, n).copy() for n in ("qpos", "qvel", "ctrl", "qacc_warmstart")}
+    scene_time = float(scene.data.time)
+    assert before["pending_delayed_targets"] > 0
+    candidate = _command(sequence, initial)
+    assert sender.preview_held_command_is_safe(
+        candidate, qpos_check=lambda pair: all(np.all(np.isfinite(q)) for q in pair.values()),
+        max_preview_time_sec=1.0,
+    )
+    assert not sender.preview_held_command_is_safe(
+        candidate, qpos_check=lambda pair: False, max_preview_time_sec=1.0,
+    )
+    assert sender.snapshot() == before
+    assert float(scene.data.time) == scene_time
+    for name, values in physics.items():
+        np.testing.assert_array_equal(getattr(scene.data, name), values)
+
+
+def test_final_command_fault_rejects_before_transport_and_cannot_restore_unbound() -> None:
+    scene = _PhysicalFakeScene(None)
+    sender = MujocoActuatedPositionExecutor(scene, _timing(), _physical_test_profile())
+    initial = {s: scene.get_arm_qpos(s) for s in ("left", "right")}
+    sender.reset(_command(0, initial))
+    fraction = [1.0]
+    guard = SimpleNamespace(
+        admission_fraction=lambda *a, **k: fraction[0],
+        check_qpos_pair=lambda pair: None,
+        snapshot=lambda: {"binding": {"profile_hash": "test-bound-envelope"}},
+    )
+    sender.install_final_command_guard(guard)
+    with pytest.raises(RuntimeError, match="already installed"):
+        sender.install_final_command_guard(guard)
+    while not sender.command_due:
+        sender.step_physics()
+    before = sender.snapshot()
+    steps = scene.data.physics_steps
+    fraction[0] = float("nan")
+    with pytest.raises(ValueError, match="fraction"):
+        sender.step_physics(_command(1, initial))
+    assert scene.data.physics_steps == steps
+    assert sender.snapshot()["accepted_command_sequence"] == before["accepted_command_sequence"]
+    assert sender.snapshot()["final_command_guard"]["fault_latched"] is True
+    with pytest.raises(RuntimeError, match="faulted"):
+        sender.step_physics(_command(1, initial))
+    unbound = MujocoActuatedPositionExecutor(scene, _timing(), _physical_test_profile())
+    with pytest.raises(ValueError, match="guard binding"):
+        unbound.reset(_command(0, initial), initial_state=before)
+
+
+@pytest.mark.optional
 def test_actuated_executor_is_only_the_120hz_sender_and_physical_plant() -> None:
     pytest.importorskip("mujoco")
     scene, profile = _scene_and_profile()

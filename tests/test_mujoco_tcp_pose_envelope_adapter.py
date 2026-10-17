@@ -15,6 +15,8 @@ from sim.mujoco.adapters.tcp_pose_envelope import (
     mujoco_target_frame_binding_hash,
     mujoco_tool_frame_binding_hashes,
 )
+from sim.mujoco.adapters.tcp_pose_command_guard import MujocoTCPPoseCommandGuard
+from sim.mujoco.control import DirectQposCommand
 
 
 def _pose(x: float = 0.0) -> np.ndarray:
@@ -84,6 +86,82 @@ def _fixture():
         captured_at_by_side={"left": 0.0},
     )
     return retargeter, target_hash, profile, anchor
+
+
+def _command_guard_fixture():
+    retargeter, target_hash, profile, anchor = _fixture()
+    target_filter = install_mujoco_tcp_pose_envelope_filter(
+        retargeter=retargeter, profile=profile, target_frame_binding_hash=target_hash,
+        execution_epoch=3, anchor_receipt=anchor, apply_to_target=True,
+    )
+    guard = MujocoTCPPoseCommandGuard(
+        target_filter=target_filter,
+        fk_by_side=lambda pair: {s: _pose(q[0]) for s, q in pair.items()},
+    )
+    return target_filter, guard, profile
+
+
+def test_final_command_guard_checks_stopping_response_as_well_as_endpoint() -> None:
+    target_filter, guard, _ = _command_guard_fixture()
+    start = {s: np.zeros(6) for s in ("left", "right")}
+    requested = {s: q.copy() for s, q in start.items()}
+    requested["left"][0] = 0.2
+    command = DirectQposCommand(1, requested, source="final-guard-test")
+    observed = []
+
+    def stopping_query(candidate, *, qpos_check, max_preview_time_sec):
+        assert candidate.sequence == command.sequence
+        assert candidate.source == command.source
+        assert max_preview_time_sec > 0
+        assert qpos_check(candidate.qpos_by_side)
+        safe = candidate.qpos_by_side["left"][0] <= 0.08
+        observed.append((candidate.qpos_by_side["left"][0], safe))
+        return safe
+
+    alpha = guard.admission_fraction(
+        command, previous_qpos_by_side=start, preview_held_command=stopping_query,
+    )
+    assert 0.399 < alpha <= 0.4
+    accepted = alpha * command.qpos_by_side["left"][0]
+    assert any(x == accepted and safe for x, safe in observed)
+    np.testing.assert_array_equal(command.qpos_by_side["left"], requested["left"])
+    assert target_filter.projection_count == 0
+    assert target_filter.last_projection is None
+    assert guard.snapshot()["modified_count"] == 1
+
+
+def test_final_command_guard_rejects_an_unproved_stop() -> None:
+    _, guard, _ = _command_guard_fixture()
+    pair = {s: np.zeros(6) for s in ("left", "right")}
+    with pytest.raises(MujocoTCPPoseEnvelopeError, match="no safe held-control"):
+        guard.admission_fraction(
+            DirectQposCommand(1, pair), previous_qpos_by_side=pair,
+            preview_held_command=lambda *a, **k: False,
+        )
+
+
+def test_final_command_guard_rejects_rebound_anchor_epoch() -> None:
+    target_filter, guard, profile = _command_guard_fixture()
+    anchor = TCPPoseEnvelopeAnchorReceipt.capture(
+        anchor_id="new-activation", profile=profile, execution_epoch=4,
+        clock_domain_id="mujoco_physics_time", tcp_pose_by_side={"left": _pose()},
+        captured_at_by_side={"left": 0.0},
+    )
+    target_filter.rebind(execution_epoch=4, anchor_receipt=anchor)
+    with pytest.raises(MujocoTCPPoseEnvelopeError, match="binding changed"):
+        guard.check_qpos_pair({s: np.zeros(6) for s in ("left", "right")})
+
+
+def test_final_command_guard_rejects_shadow_and_nonfinite_fk() -> None:
+    target_filter, guard, _ = _command_guard_fixture()
+    target_filter.apply_to_target = False
+    with pytest.raises(MujocoTCPPoseEnvelopeError, match="Active"):
+        MujocoTCPPoseCommandGuard(target_filter=target_filter, fk_by_side=lambda q: {})
+    target_filter.apply_to_target = True
+    pair = {s: np.zeros(6) for s in ("left", "right")}
+    pair["left"][0] = float("nan")
+    with pytest.raises(ValueError, match="finite"):
+        guard.check_qpos_pair(pair)
 
 
 def test_active_mujoco_adapter_projects_only_configured_side() -> None:

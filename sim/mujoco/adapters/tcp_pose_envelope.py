@@ -20,6 +20,7 @@ from robot_motion.target_safety.tcp_pose_envelope import (
     TCPPoseEnvelopeProjectionFeedback,
     TCPPoseEnvelopeProjectionResult,
     project_tcp_pose_envelope,
+    tcp_pose_envelope_requires_projection,
 )
 
 
@@ -309,6 +310,23 @@ class MujocoTCPPoseEnvelopeTargetFilter:
 
     def command_metadata(self) -> dict[str, object]:
         return self.feedback_snapshot().to_payload()
+
+    def contains_tcp_pose_pair(self, poses: Mapping[str, np.ndarray]) -> bool:
+        """Query the same bound envelope without advancing target feedback."""
+
+        with self._lock:
+            if not self.apply_to_target:
+                raise MujocoTCPPoseEnvelopeError("a final command guard requires an Active target filter")
+            return not tcp_pose_envelope_requires_projection(
+                poses,
+                profile=self.profile,
+                target_frame_binding_hash=self._target_frame_binding_hash,
+                tool_frame_binding_hash_by_side=self._tool_frame_binding_hash_by_side,
+                controlled_frame_id=TCP_CONTROLLED_FRAME_ID,
+                reference_frame_by_side=self.profile.reference_frame_by_side,
+                execution_epoch=self._execution_epoch,
+                anchor_receipt=self._anchor_receipt,
+            )
 
 
 def install_mujoco_tcp_pose_envelope_filter(
