@@ -49,7 +49,7 @@ finalize_common_ssh
 print_wrapper_header "L1"
 
 remote_bash "$LINES" <<'REMOTE'
-set -eu
+set -euo pipefail
 lines=$1
 if ! command -v dmesg >/dev/null 2>&1; then
   printf 'dmesg command not found on remote.\n' >&2

@@ -577,6 +577,8 @@ Python 运行和环境管理。
 | `remote_last_error.sh` | L1 | 提取最近错误 |
 | `remote_collect_debug_bundle.sh` | L2 | 打包日志、设备状态、版本信息 |
 
+`remote_dmesg_usb.sh` 在内核日志读取失败（例如权限不足）时保留诊断并返回退出码 4；读取成功但没有匹配记录时正常返回。
+
 调试包建议包含：
 
 ```text

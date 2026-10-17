@@ -47,6 +47,29 @@ def _run(
     )
 
 
+@pytest.mark.parametrize(("exit_code", "message", "expected_code"), [
+    (1, "dmesg: read kernel buffer failed: Operation not permitted", 4),
+    (0, "usb 1-1: camera ready", 0),
+    (0, "no relevant devices", 0),
+])
+def test_usb_kernel_log_read_failure_is_not_reported_as_success(
+    wrapper_environment, exit_code, message, expected_code,
+):
+    environment, calls = wrapper_environment
+    bin_dir = Path(environment["PATH"].split(os.pathsep)[0])
+    _executable(bin_dir / "dmesg", 'printf "%s\\n" "$DMESG_MESSAGE"\nexit "$DMESG_EXIT"\n')
+    environment.update(DMESG_MESSAGE=message, DMESG_EXIT=str(exit_code))
+    result = _run(environment, "remote_dmesg_usb.sh", "-H", "trusted-target", "--lines", "12")
+    assert calls.exists()
+    assert result.returncode == expected_code
+    if exit_code:
+        assert message in result.stderr
+    elif "usb" in message:
+        assert message in result.stdout
+    else:
+        assert message not in result.stdout
+
+
 def test_readonly_snapshot_preview_never_connects(wrapper_environment):
     environment, calls = wrapper_environment
     result = _run(environment, "remote_rm65_grasp_snapshot.sh", "-H", "trusted-target",
