@@ -162,6 +162,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="run MuJoCo stepping without realtime pacing (simulation only)",
     )
     parser.add_argument(
+        "--enable-safe-tcp-pose",
+        action="store_true",
+        help="also publish collision-aware move_tcp_to_pose_safe using lower-owned joint paths",
+    )
+    parser.add_argument(
+        "--safe-tcp-planning-clearance-padding-m",
+        type=float,
+        default=0.002,
+        help="extra planning reserve for simulated gripper tracking (metres); live collision margin stays unchanged",
+    )
+    parser.add_argument(
         "--viewer",
         action="store_true",
         help=(
@@ -452,6 +463,8 @@ def main(argv: list[str] | None = None) -> int:
     # instead of making an RPent caller know DexTeleop's repository layout.
     os.chdir(repo_root())
 
+    if not 0 <= args.safe_tcp_planning_clearance_padding_m < float("inf"):
+        parser.error("--safe-tcp-planning-clearance-padding-m must be finite and non-negative")
     target_config = MujocoSimHILTargetConfig(
         task_config_path=task_config,
         realtime_worker=not args.no_realtime_worker,
@@ -471,6 +484,8 @@ def main(argv: list[str] | None = None) -> int:
         history_storage=history_storage,
         artifact_storage=artifact_storage,
         segmentation_localizer=segmentation_localizer,
+        enable_safe_tcp_pose=args.enable_safe_tcp_pose,
+        safe_tcp_planning_clearance_padding_m=args.safe_tcp_planning_clearance_padding_m,
     )
     viewer = None
     if args.viewer:

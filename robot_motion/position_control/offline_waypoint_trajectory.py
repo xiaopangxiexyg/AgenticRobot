@@ -14,16 +14,16 @@ checking only the output sample grid would miss between-tick extrema.
 from __future__ import annotations
 
 import math
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import Any, Mapping, Sequence
+from typing import Any
 
 import numpy as np
 from scipy.interpolate import PchipInterpolator
 
 from .horizon_governor import JointHorizonLimits
 from .resampling import validate_resample_rate
-
 
 _TIME_EPSILON_SEC = 1e-12
 _ROOT_IMAG_TOLERANCE = 1e-9
@@ -417,6 +417,7 @@ def _trajectory_segments(
     final_velocity_rad_s: np.ndarray,
     initial_acceleration_rad_s2: np.ndarray,
     final_acceleration_rad_s2: np.ndarray,
+    stop_at_waypoints: bool = False,
 ) -> tuple[np.ndarray, np.ndarray, tuple[np.ndarray, ...], dict[str, np.ndarray]]:
     knot_velocity = _estimate_knot_velocities(
         timestamps,
@@ -424,6 +425,8 @@ def _trajectory_segments(
         initial_velocity_rad_s=initial_velocity_rad_s,
         final_velocity_rad_s=final_velocity_rad_s,
     )
+    if stop_at_waypoints:
+        knot_velocity[1:-1] = 0.0
     knot_acceleration = np.zeros_like(q_waypoints)
     knot_acceleration[0] = initial_acceleration_rad_s2
     knot_acceleration[-1] = final_acceleration_rad_s2
@@ -462,6 +465,7 @@ def build_offline_quintic_waypoint_trajectory(
     timing_mode: str = OFFLINE_WAYPOINT_TIMING_STRICT,
     max_time_scale: float = 4.0,
     terminal_hold_sec: float = 0.0,
+    stop_at_waypoints: bool = False,
 ) -> OfflineJointWaypointTrajectory:
     """Build an exact fixed-time C2 waypoint trajectory or fail closed.
 
@@ -469,6 +473,8 @@ def build_offline_quintic_waypoint_trajectory(
     sustained motion.  Endpoint derivatives default to zero because replay
     starts after explicit qpos initialization and ends in a hold.  All
     polynomial extrema are certified, not just the sampled command ticks.
+    ``stop_at_waypoints`` explicitly preserves each straight joint-space leg
+    with zero knot derivatives; the default retains continuous through-motion.
     """
 
     source_times, q_waypoints = _normalize_waypoints(timestamps, q_waypoints_rad)
@@ -517,6 +523,18 @@ def build_offline_quintic_waypoint_trajectory(
         raise ValueError(
             "terminal_hold_sec requires zero final velocity and acceleration."
         )
+    if not isinstance(stop_at_waypoints, bool):
+        raise TypeError("stop_at_waypoints must be boolean.")
+    if stop_at_waypoints and any(
+        np.any(np.abs(value) > _TIME_EPSILON_SEC)
+        for value in (
+            initial_velocity,
+            final_velocity,
+            initial_acceleration,
+            final_acceleration,
+        )
+    ):
+        raise ValueError("stop_at_waypoints requires zero endpoint derivatives.")
     (
         knot_velocity,
         knot_acceleration,
@@ -529,6 +547,7 @@ def build_offline_quintic_waypoint_trajectory(
         final_velocity_rad_s=final_velocity,
         initial_acceleration_rad_s2=initial_acceleration,
         final_acceleration_rad_s2=final_acceleration,
+        stop_at_waypoints=stop_at_waypoints,
     )
     certificate = _certify_extrema(extrema, limits)
     time_scale = 1.0
@@ -564,6 +583,7 @@ def build_offline_quintic_waypoint_trajectory(
                 final_velocity_rad_s=final_velocity,
                 initial_acceleration_rad_s2=initial_acceleration,
                 final_acceleration_rad_s2=final_acceleration,
+                stop_at_waypoints=stop_at_waypoints,
             )
             certificate = _certify_extrema(extrema, limits)
             if bool(certificate["passed"]):
@@ -653,10 +673,12 @@ def build_offline_quintic_waypoint_trajectory(
             "execution_duration_sec": float(times[-1] - times[0]),
             "terminal_hold_sec": terminal_hold,
             "waypoint_position_exact": True,
-            "internal_knot_zero_velocity_required": False,
+            "internal_knot_zero_velocity_required": stop_at_waypoints,
             "endpoint_velocity_default": "zero",
             "position_interpolation": "piecewise_quintic_hermite",
-            "knot_velocity_estimator": "pchip_shape_preserving",
+            "knot_velocity_estimator": "zero_at_waypoints"
+            if stop_at_waypoints
+            else "pchip_shape_preserving",
             "knot_acceleration": "shared_zero_internal",
             "continuous_hard_limit_certificate": certificate,
             "command_hz": rate,

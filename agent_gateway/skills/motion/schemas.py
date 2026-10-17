@@ -31,6 +31,7 @@ from agent_gateway.skills.motion.definition import (
     GRASP_APPROACH_SKILL_ID_V1,
     INLINE_TCP_TRAJECTORY_SKILL_ID_V1,
     REGISTERED_TCP_TRAJECTORY_SKILL_ID_V1,
+    SAFE_TCP_POSE_TARGET_SKILL_ID_V1,
     TCP_CARDINAL_STEP_SKILL_ID_V1,
     TCP_LEVEL_FORWARD_LEFT_30_SKILL_ID_V1,
     TCP_LEVEL_FORWARD_RIGHT_30_SKILL_ID_V1,
@@ -230,6 +231,7 @@ def tcp_pose_target_schema_entry_v1(
     selected_skill_id = _required(skill_id, field_name="skill_id")
     if selected_skill_id not in {
         TCP_POSE_TARGET_SKILL_ID_V1,
+        SAFE_TCP_POSE_TARGET_SKILL_ID_V1,
         GRASP_APPROACH_SKILL_ID_V1,
     }:
         raise ValueError("skill_id is not an absolute TCP-pose Skill.")
@@ -1003,6 +1005,7 @@ __all__ = [
     "FIXED_LEVEL_TCP_ORIENTATION_SKILL_SUMMARY_BY_ID_V1",
     "INLINE_TCP_TRAJECTORY_SKILL_ID_V1",
     "REGISTERED_TCP_TRAJECTORY_SKILL_ID_V1",
+    "SAFE_TCP_POSE_TARGET_SKILL_ID_V1",
     "TCP_CARDINAL_STEP_SKILL_ID_V1",
     "TCP_LEVEL_FORWARD_LEFT_30_SKILL_ID_V1",
     "TCP_LEVEL_FORWARD_RIGHT_30_SKILL_ID_V1",

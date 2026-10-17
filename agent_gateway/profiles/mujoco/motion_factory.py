@@ -40,6 +40,7 @@ from sim.mujoco.deploy.target_config import DEFAULT_STATION_POSE_CONTRACT_PATH
 
 from .motion_application import MujocoAgentSkillMotionApplication
 from .motion_deployment import (
+    MUJOCO_AGENT_SAFE_TCP_POSE_ROUTE_ID_V1,
     MUJOCO_AGENT_TCP_POSE_MAX_ROTATION_DELTA_RAD_V1,
     MUJOCO_AGENT_TCP_POSE_MAX_TRANSLATION_DELTA_M_V1,
     MUJOCO_AGENT_TCP_POSE_ROUTE_ID_V1,
@@ -222,6 +223,7 @@ def _build_standard_tcp_pose_envelope_runtime(
     *,
     prepared: Any,
     target_config: MujocoSimHILTargetConfig,
+    enable_safe_tcp_pose: bool = False,
 ) -> TCPPoseEnvelopeSafetyRuntime:
     """Bind separate lower envelopes for bounded pose and fixed heading Routes.
 
@@ -281,6 +283,7 @@ def _build_standard_tcp_pose_envelope_runtime(
         constraint_set_hash=constraint_set_hash,
         allowed_route_ids=(
             MUJOCO_AGENT_TCP_POSE_ROUTE_ID_V1,
+            *((MUJOCO_AGENT_SAFE_TCP_POSE_ROUTE_ID_V1,) if enable_safe_tcp_pose else ()),
             MUJOCO_AGENT_TCP_CARDINAL_STEP_ROUTE_ID_V1,
             *tuple(
                 MUJOCO_AGENT_TCP_FIXED_CARDINAL_STEP_ROUTE_ID_BY_SKILL_ID_V1.values()
@@ -346,9 +349,13 @@ def build_mujoco_agent_tcp_pose_gateway_session(
     history_storage: MujocoAgentTcpPoseHistoryStorageConfig | None = None,
     artifact_storage: MujocoAgentArtifactStorageConfig | None = None,
     segmentation_localizer: object | None = None,
+    enable_safe_tcp_pose: bool = False,
+    safe_tcp_planning_clearance_padding_m: float = 0.002,
 ) -> MujocoAgentTcpPoseGatewaySession:
     """Build the exact default-off graph; do not start, record, or serve it."""
 
+    if not isinstance(enable_safe_tcp_pose, bool):
+        raise TypeError("enable_safe_tcp_pose must be boolean.")
     if history_storage is not None and not isinstance(
         history_storage,
         MujocoAgentTcpPoseHistoryStorageConfig,
@@ -427,6 +434,7 @@ def build_mujoco_agent_tcp_pose_gateway_session(
     tcp_pose_envelope_runtime = _build_standard_tcp_pose_envelope_runtime(
         prepared=prepared,
         target_config=target_config,
+        enable_safe_tcp_pose=enable_safe_tcp_pose,
     )
     target = build_mujoco_agent_skill_motion_target(
         config=target_config,
@@ -435,6 +443,8 @@ def build_mujoco_agent_tcp_pose_gateway_session(
         execution_observation_sink=observation_sink,
         trace_sink=trace_sink,
         tcp_pose_envelope_runtime=tcp_pose_envelope_runtime,
+        enable_safe_tcp_pose=enable_safe_tcp_pose,
+        safe_tcp_planning_clearance_padding_m=safe_tcp_planning_clearance_padding_m,
     )
     runtime_rig_holder["rig"] = target.runtime.rig
     captured_at = float(target.runtime.clock())
@@ -496,6 +506,7 @@ def build_mujoco_agent_tcp_pose_gateway_session(
                 if segmentation_localizer is None
                 else segmentation_localizer.semantic_content_hash
             ),
+            enable_safe_tcp_pose=enable_safe_tcp_pose,
         )
         if history_storage is not None:
             source_binding = contract_bundle.history_source_binding

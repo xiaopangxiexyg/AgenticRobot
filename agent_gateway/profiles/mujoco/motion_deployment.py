@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 from agent_gateway.profiles.placement import (
@@ -54,6 +54,7 @@ from agent_gateway.skills.motion.definition import (
     cardinal_tcp_step_skill_definition_v1,
     fixed_cardinal_tcp_step_skill_definition_v1,
     fixed_level_tcp_orientation_skill_definition_v1,
+    safe_tcp_pose_target_skill_definition_v1,
     tcp_pose_target_skill_definition_v1,
 )
 from agent_gateway.skills.motion.schemas import (
@@ -116,6 +117,9 @@ from .rgb_deployment import (
 )
 from .state_deployment import MujocoPassiveTcpPoseStateDeploymentBinding
 from .visual_observation import mujoco_rgb_role_for_source
+
+MUJOCO_AGENT_SAFE_TCP_POSE_ROUTE_ID_V1 = "sim.mujoco.motion.move_tcp_to_pose_safe.v1"
+MUJOCO_AGENT_SAFE_TCP_POSE_EXECUTOR_ID_V1 = "mujoco-agent-safe-tcp-pose-executor-v1"
 
 MUJOCO_AGENT_TCP_POSE_ROUTE_ID_V1 = "sim.mujoco.rm65.agent_skill_tcp_pose"
 MUJOCO_AGENT_TCP_POSE_EXECUTOR_ID_V1 = (
@@ -663,6 +667,13 @@ class MujocoAgentTcpFixedOrientationContract:
 
 
 @dataclass(frozen=True)
+class MujocoAgentSafeTcpPoseContract:
+    deployment_binding: MujocoAgentTcpPoseDeploymentBinding
+    evaluation_plan: SkillEvaluationPlan
+    motion_profile: MujocoAgentTcpPoseMotionProfile
+
+
+@dataclass(frozen=True)
 class MujocoAgentTcpPoseContractBundle:
     definition_catalog: SkillDefinitionCatalog
     schema_catalog: AgentSkillSchemaCatalog
@@ -684,6 +695,7 @@ class MujocoAgentTcpPoseContractBundle:
     payload_validators: AgentSkillPayloadValidatorRegistry
     station_manifest: ControlStationRunManifest
     execution_manifest: Any
+    safe_tcp_pose_contract: MujocoAgentSafeTcpPoseContract | None = None
     depth_capture: MujocoDepthCaptureRegistration | None = None
     rgb_capture: MujocoRgbCaptureRegistration | None = None
     segmentation: SegmentationRegistration | None = None
@@ -701,6 +713,21 @@ class MujocoAgentTcpPoseContractBundle:
             route_manifest=self.route_manifest,
             io_catalog=self.io_catalog,
         )
+        if self.safe_tcp_pose_contract is not None:
+            safe = self.safe_tcp_pose_contract
+            entry = self.route_manifest.route("motion.move_tcp_to_pose_safe", "1")
+            if (
+                entry.deployment_binding.deployment_binding_hash
+                != safe.deployment_binding.semantic_content_hash
+                or entry.evaluation_plan_hash
+                != safe.evaluation_plan.semantic_content_hash
+                or safe.evaluation_plan.route_hash != entry.route.semantic_content_hash
+                or safe.evaluation_plan.deployment_binding_hash
+                != safe.deployment_binding.semantic_content_hash
+                or safe.deployment_binding.motion_profile_hash
+                != safe.motion_profile.semantic_content_hash
+            ):
+                raise ValueError("Safe TCP Route, deployment and evaluator disagree.")
         motion_entry = self.route_manifest.route(
             "motion.move_tcp_to_pose",
             "1",
@@ -1710,6 +1737,7 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
     segmentation_model_profile_id: str | None = None,
     segmentation_model_profile_hash: str | None = None,
     segmentation_inference_implementation_hash: str | None = None,
+    enable_safe_tcp_pose: bool = False,
 ) -> MujocoAgentTcpPoseContractBundle:
     """Project one already-constructed no-model application without starting it."""
 
@@ -1731,7 +1759,11 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
         raise ValueError("MuJoCo segmentation model identity is all-or-none.")
     if segmentation_model_profile_id is not None and not enable_artifact_perception:
         raise ValueError("MuJoCo segmentation requires Artifact perception.")
+    if not isinstance(enable_safe_tcp_pose, bool):
+        raise TypeError("enable_safe_tcp_pose must be boolean.")
     exact = _exact_application(application)
+    if enable_safe_tcp_pose and application.target.planned_tcp_motion is None:
+        raise ValueError("Safe TCP Route requires the exact lower planned-motion adapter.")
     station, execution = _build_station_manifests(application)
     runtime = application.runtime
     target_binding = station.execution_binding
@@ -2285,6 +2317,66 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
         disagreement_policy="aggregation_policy",
         task_outcome_schema_hash=schema_entry.task_evaluation_schema_hash,
     )
+    safe_definition = safe_schema = safe_route = safe_contract = None
+    safe_profile = None
+    if enable_safe_tcp_pose:
+        safe_profile = replace(
+            profile,
+            profile_id="mujoco.agent_safe_tcp_pose.v1",
+            max_control_cycles=300,
+        )
+        safe_definition = safe_tcp_pose_target_skill_definition_v1(
+            controlled_component_ids=("right_arm",)
+        )
+        safe_schema = tcp_pose_target_schema_entry_v1(
+            skill_id=safe_definition.skill_id,
+            skill_definition_hash=safe_definition.semantic_content_hash,
+            parameter_profile_id=safe_profile.profile_id,
+            parameter_profile_hash=safe_profile.semantic_content_hash,
+            allowed_component_ids=("right_arm",),
+            allowed_reference_frame_ids=(profile.reference_frame_id,),
+            max_requested_duration_ms=None,
+            workspace_bounds_by_component={"right_arm": profile.workspace_bounds},
+        )
+        safe_route = replace(
+            route,
+            skill_id=safe_definition.skill_id,
+            skill_definition_hash=safe_definition.semantic_content_hash,
+            route_id=MUJOCO_AGENT_SAFE_TCP_POSE_ROUTE_ID_V1,
+            skill_io_contract_hash=None,
+            parameter_schema_hash=safe_schema.parameter_schema_hash,
+            execution_result_schema_hash=safe_schema.execution_result_schema_hash,
+            task_evaluation_schema_hash=safe_schema.task_evaluation_schema_hash,
+            allowed_parameter_profiles=safe_schema.parameter_profiles,
+            max_operation_duration_ms=30_000,
+        )
+        safe_binding = replace(
+            binding,
+            deployment_binding_id="sim.mujoco.agent_safe_tcp_pose:"
+            + exact["runtime_session_id"],
+            route_hash=safe_route.semantic_content_hash,
+            executor_id=MUJOCO_AGENT_SAFE_TCP_POSE_EXECUTOR_ID_V1,
+            motion_profile_hash=safe_profile.semantic_content_hash,
+            safety_envelope_refs=safety_envelope_refs_for_route(safe_route.route_id),
+        )
+        safe_contract = MujocoAgentSafeTcpPoseContract(
+            deployment_binding=safe_binding,
+            evaluation_plan=replace(
+                evaluation_plan,
+                skill_definition_hash=safe_definition.semantic_content_hash,
+                route_hash=safe_route.semantic_content_hash,
+                deployment_binding_hash=safe_binding.semantic_content_hash,
+                evaluator_specs=(
+                    replace(
+                        evaluator, configuration_hash=safe_profile.semantic_content_hash
+                    ),
+                ),
+            ),
+            motion_profile=safe_profile,
+        )
+        validate_agent_motion_route_schema_v1(
+            route=safe_route, schema_entry=safe_schema
+        )
     cardinal_evaluator = SkillEvaluatorSpec(
         evaluator_id="motion.tcp_cardinal_step_arrival_rule",
         evaluator_version="1",
@@ -2786,6 +2878,9 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
         *orientation_schemas,
         state_schema,
     ]
+    if safe_definition is not None and safe_schema is not None:
+        definition_items.append(safe_definition)
+        schema_items.append(safe_schema)
     if history_definition is not None and history_schema is not None:
         definition_items.append(history_definition)
         schema_items.append(history_schema)
@@ -2868,6 +2963,24 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
             availability_hash=state_availability,
         ),
     ]
+    if safe_route is not None and safe_contract is not None:
+        route_items.append(
+            SkillRouteManifestEntry(
+                route=safe_route,
+                deployment_binding=safe_contract.deployment_binding.to_ref(),
+                evaluation_plan_hash=safe_contract.evaluation_plan.semantic_content_hash,
+                availability_hash=canonical_content_hash(
+                    {
+                        "route": safe_route.semantic_content_hash,
+                        "planner": "mujoco_collision_checked_joint_path_v1",
+                        "planning_clearance_padding_m": (
+                            application.target.planned_tcp_motion.planning_clearance_padding_m
+                        ),
+                    },
+                    domain="dexteleop.mujoco.safe_tcp_availability.v1",
+                ),
+            )
+        )
     for fixed_route, fixed_contract in zip(
         fixed_cardinal_routes,
         fixed_cardinal_contracts,
@@ -3157,6 +3270,12 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
         validator_items.append(segmentation.payload_validator)
     if placement is not None:
         validator_items.append(placement.payload_validator)
+    if safe_route is not None and safe_schema is not None and safe_profile is not None:
+        validator_items.append(
+            _motion_validators(
+                route=safe_route, schema_entry=safe_schema, profile=safe_profile
+            )
+        )
     validators = AgentSkillPayloadValidatorRegistry(
         registry_id=(
             "dexteleop.agent_skill_payload_validators.agent_tcp_pose_session:"
@@ -3181,6 +3300,7 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
         payload_validators=validators,
         station_manifest=station,
         execution_manifest=execution,
+        safe_tcp_pose_contract=safe_contract,
         depth_capture=depth_capture,
         rgb_capture=rgb_capture,
         segmentation=segmentation,

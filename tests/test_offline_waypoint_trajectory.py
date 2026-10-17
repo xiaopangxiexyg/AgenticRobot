@@ -4,8 +4,8 @@ import numpy as np
 import pytest
 
 from robot_motion.position_control import (
-    JointHorizonLimits,
     OFFLINE_WAYPOINT_TIMING_SAFE_RETIME_GLOBAL,
+    JointHorizonLimits,
     OfflineWaypointTrajectoryInfeasibleError,
     build_offline_quintic_waypoint_trajectory,
 )
@@ -57,6 +57,40 @@ def test_continuous_waypoints_do_not_stop_at_internal_15hz_knots() -> None:
     assert trajectory.knot_qdd_rad_s2[1, 0] == pytest.approx(0.0)
     assert trajectory.knot_qdd_rad_s2[2, 0] == pytest.approx(0.0)
     assert trajectory.metadata["continuous_hard_limit_certificate"]["passed"]
+
+
+def test_explicit_stops_preserve_joint_space_polyline_without_corner_cutting() -> None:
+    q = np.asarray(((0.0, 0.0), (0.1, 0.1), (0.2, 0.05)))
+    trajectory = build_offline_quintic_waypoint_trajectory(
+        (0.0, 1.0, 2.0),
+        q,
+        command_hz=120.0,
+        limits=_limits(2),
+        stop_at_waypoints=True,
+    )
+    np.testing.assert_allclose(trajectory.knot_qd_rad_s, 0, atol=1e-12)
+    np.testing.assert_allclose(trajectory.knot_qdd_rad_s2, 0, atol=1e-12)
+    # Each half lies on its original line, not a blended PCHIP corner.
+    np.testing.assert_allclose(
+        trajectory.q_rad[:121, 0], trajectory.q_rad[:121, 1], atol=1e-12
+    )
+    np.testing.assert_allclose(
+        trajectory.q_rad[120:, 1], 0.15 - 0.5 * trajectory.q_rad[120:, 0], atol=1e-12
+    )
+    assert trajectory.metadata["continuous_hard_limit_certificate"]["passed"]
+    assert trajectory.metadata["internal_knot_zero_velocity_required"]
+
+
+def test_explicit_stops_reject_nonzero_endpoint_derivatives() -> None:
+    with pytest.raises(ValueError, match="zero endpoint derivatives"):
+        build_offline_quintic_waypoint_trajectory(
+            (0, 1),
+            ((0.0,), (0.1,)),
+            command_hz=120,
+            limits=_limits(1),
+            stop_at_waypoints=True,
+            initial_velocity_rad_s=(0.1,),
+        )
 
 
 def test_continuous_replay_mode_emits_one_certified_command_clock() -> None:

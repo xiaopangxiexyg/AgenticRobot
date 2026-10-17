@@ -1140,6 +1140,18 @@ when the lower Skill is activated. Distance, frame/tool/calibration identities,
 primitive hash, safety envelope, IK, dispatch, evaluation, and HOLD remain
 trusted deployment facts.
 
+MuJoCo 的现有入口可显式增加 `--enable-safe-tcp-pose`，为右臂发布
+`motion.move_tcp_to_pose_safe@1`；默认不发布。该 Route 使用当前场景、另一臂的
+实测起点和已绑定工具配置，复用下层 RM65 IK、BiRRT-Connect、C2 时间参数化
+及原有唯一执行链。逐参考复核继续使用同一已接纳 TCP 包络，绑定改变时拒绝执行。
+拐点显式零速度、零加速度，并对齐参考时钟；实测到达拐点后才进入下一段，避免
+轨迹平滑或跨采样插值切角。普通 move-to 与既有轨迹默认行为保持不变。
+`--safe-tcp-planning-clearance-padding-m` 默认额外预留 0.002 m，执行准入继续
+使用原场景阈值。free-space move 禁止夹爪与物体接触，未找到路径时保留拒绝，
+不替换为普通 move-to。相机未建模障碍、未建模负载、抓取接近及携物不属于该
+Route 的能力；这项接入也不发布双夹爪 v2。完成、取消和关闭仍需下层 HOLD 证据。
+模拟验证与真机验收分别记录。
+
 MuJoCo 的 ``state.read_tcp_pose`` 与可选 TCP history 发布同一公开 Station 坐标系。
 其参数及结果校验从公开 state binding 获取坐标身份，不使用内部 IK execution frame；
 Agent 必须按当前 schema 查询和复制身份，不能以 arm-base 查询替代 Station 查询。

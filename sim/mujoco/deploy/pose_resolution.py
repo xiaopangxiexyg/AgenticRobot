@@ -117,7 +117,7 @@ def _plain(value: Any) -> Any:
 
 @dataclass(frozen=True)
 class MujocoPoseToQposResolution:
-    """Immutable evidence for one successful coupled IK resolution."""
+    """Immutable evidence for one coupled IK or registered-path resolution."""
 
     resolution_id: str
     input_safe_action: RobotAction
@@ -217,12 +217,21 @@ class MujocoCoupledPoseToQposResolver:
         target_pose_smoother: BimanualPoseSmoother | None = None,
         pose_target_safety_filter: Callable[[RobotAction], RobotAction] | None = None,
         support_only_arm_sides: tuple[str, ...] = (),
+        planned_tcp_motion: Any | None = None,
     ) -> None:
         if not isinstance(ik, (RM65CanonicalIK, RM65RetargeterIK)):
             raise TypeError(
                 "ik must be RM65CanonicalIK or RM65RetargeterIK."
             )
         self.ik = ik
+        if planned_tcp_motion is not None:
+            from .planned_tcp_motion import MujocoPlannedTcpMotion
+
+            if not isinstance(planned_tcp_motion, MujocoPlannedTcpMotion):
+                raise TypeError("planned_tcp_motion must be a lower MuJoCo planner.")
+            if pose_transformer is not None or target_pose_smoother is not None:
+                raise ValueError("Planned references require exact arm-base poses without smoothing.")
+        self.planned_tcp_motion = planned_tcp_motion
         self.pose_transformer = pose_transformer
         if target_pose_smoother is not None and not isinstance(
             target_pose_smoother,
@@ -399,6 +408,15 @@ class MujocoCoupledPoseToQposResolver:
         # outside the semantic resolution payload/hash: measuring a resolve
         # must never change command identity or acceptance behavior.
         self._last_resolve_diagnostics: dict[str, object] = {}
+        if planned_tcp_motion is not None:
+            self.resolver_contract_id += "+registered-joint-path-v1"
+            self.resolver_contract_hash = canonical_content_hash(
+                {
+                    "base_resolver_contract_hash": self.resolver_contract_hash,
+                    "registered_path_semantics": "exact_collision_checked_qpos_no_second_ik",
+                },
+                domain="dexteleop.mujoco.planned_pose_resolution.v1",
+            )
 
     @property
     def last_resolve_diagnostics(self) -> Mapping[str, object]:
@@ -504,7 +522,21 @@ class MujocoCoupledPoseToQposResolver:
         )
         ik_started = time.perf_counter()
         try:
-            result = self.ik.solve(targets, active_sides=self.active_arm_sides)
+            if self.planned_tcp_motion is not None and self.planned_tcp_motion.active:
+                from .planned_tcp_motion import MujocoTcpPlanRejected
+
+                try:
+                    result = self.planned_tcp_motion.resolve(solver_input)
+                except MujocoTcpPlanRejected as error:
+                    raise ActionResolutionError(
+                        ActionResolutionFailure(
+                            reason_code=error.reason_code,
+                            resolver_status="registered_joint_path_rejected",
+                            message=str(error),
+                        )
+                    ) from error
+            else:
+                result = self.ik.solve(targets, active_sides=self.active_arm_sides)
         except BaseException as error:
             timing.update(
                 {

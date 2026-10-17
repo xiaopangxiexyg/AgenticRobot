@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import math
 import threading
 import time
@@ -35,11 +36,15 @@ from agent_gateway.runtime.station_operation_worker import (
 )
 from dataset_contracts.canonical_encoding import canonical_content_hash
 from robot_motion.action import ComponentAction
+from robot_motion.path_planning import JointConfigurationCheck
+from robot_motion.relative_action import xyzquat_to_pose_matrix
+from robot_motion.relative_action import xyzquat_to_pose_matrix
 from robot_motion.target_safety import (
     TCPPoseEnvelopeLifecycleError,
     TCPPoseEnvelopeSafetyRuntime,
     TCPPoseEnvelopeSelection,
 )
+from sim.mujoco.deploy.planned_tcp_motion import MujocoTcpPlanRejected
 
 from .motion_application import MujocoAgentSkillMotionApplication
 from .motion_deployment import (
@@ -1079,7 +1084,165 @@ class MujocoAgentTcpPoseSkillLifecycle:
             self._closed = True
 
 
+class MujocoAgentSafeTcpPoseSkillLifecycle(MujocoAgentTcpPoseSkillLifecycle):
+    """Keep the normal lifecycle and receipts; replace only lower references."""
+
+    def __init__(self, *, path_search_time_budget_sec: float = 3.0, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self._path_search_time_budget_sec = path_search_time_budget_sec
+        self._planner = self.application.target.planned_tcp_motion
+        if self._planner is None:
+            raise ValueError("Safe TCP lifecycle requires a lower joint-path planner.")
+        self._path_completed = False
+        self._lower_failure_code: str | None = None
+
+    def _remember_step_evidence(self, step: Any) -> None:
+        super()._remember_step_evidence(step)
+        failure = getattr(step.authoritative_step, "resolution_failure", None)
+        if failure is not None:
+            self._lower_failure_code = failure.reason_code
+            logging.getLogger(__name__).warning(
+                "Safe TCP reference rejected: %s", failure
+            )
+
+    def _failure(self, *, reason_code, hold):
+        if (
+            reason_code == "tcp_pose_authoritative_step_failed"
+            and self._lower_failure_code is not None
+        ):
+            reason_code = self._lower_failure_code
+        return super()._failure(reason_code=reason_code, hold=hold)
+
+    def activate(self, *, request, operation, cancel_requested):
+        self._validate_call(request=request, operation=operation)
+        if self.target_pose is None:
+            raise ValueError("Safe TCP motion requires an absolute target.")
+        measured = self._capture_pose()
+        translation, rotation = _pose_error(measured, self.target_pose)
+        if (
+            cancel_requested()
+            or translation > self.motion_profile.max_translation_delta_m
+            or rotation > self.motion_profile.max_rotation_delta_rad
+        ):
+            # Preserve the ordinary cancellation/delta gate before planning.
+            return super().activate(
+                request=request, operation=operation, cancel_requested=cancel_requested
+            )
+        # Bind the exact admitted envelope before search, without submitting
+        # a reference. Search and execution then consult the same lower owner.
+        evidence = super().activate(
+            request=request, operation=operation, cancel_requested=cancel_requested
+        )
+        if not evidence.succeeded:
+            return evidence
+        safety = self.application.tcp_pose_envelope_runtime
+        constraint = None
+        constraint_identity = None
+        if safety is not None:
+            initial = safety.project({"right": xyzquat_to_pose_matrix(measured)})
+            basis = (initial.envelope_profile_hash, initial.anchor_hash)
+            constraint_identity = canonical_content_hash(
+                {"profile": basis[0], "anchor": basis[1]},
+                domain="dexteleop.mujoco.planned_tcp_envelope.v1",
+            )
+
+            def constraint(model_qpos, pair):
+                pose = self._planner.pose_for_configuration(model_qpos, pair)
+                projection = safety.project({"right": xyzquat_to_pose_matrix(pose)})
+                same_basis = (
+                    projection.envelope_profile_hash,
+                    projection.anchor_hash,
+                ) == basis
+                return JointConfigurationCheck(
+                    safe=same_basis and not projection.modified_sides,
+                    minimum_distance_m=None,
+                    reason=(
+                        None
+                        if same_basis and not projection.modified_sides
+                        else "tcp_envelope_blocked"
+                        if same_basis
+                        else "tcp_envelope_binding_changed"
+                    ),
+                    metadata=projection.to_payload(),
+                )
+
+        try:
+            plan = self._planner.plan(
+                self.target_pose,
+                translation_tolerance_m=self.motion_profile.translation_tolerance_m,
+                rotation_tolerance_rad=self.motion_profile.rotation_tolerance_rad,
+                cancel_requested=cancel_requested,
+                configuration_constraint=constraint,
+                constraint_identity=constraint_identity,
+                path_search_time_budget_sec=self._path_search_time_budget_sec,
+            )
+            if (
+                len(plan.reference_poses) + self.motion_profile.stable_measurement_count
+                >= self.motion_profile.max_control_cycles
+            ):
+                raise MujocoTcpPlanRejected("safe_tcp_path_exceeds_control_budget")
+        except MujocoTcpPlanRejected as error:
+            logging.getLogger(__name__).warning("Safe TCP planning rejected: %s", error)
+            hold = self._hold(reason=error.reason_code)
+            return StationLifecycleActivationEvidence(
+                succeeded=False,
+                status=error.reason_code,
+                lower_operation_id=self._lower_operation_id,
+                evidence_refs=hold.evidence_refs,
+                lower_hold_confirmed=hold.lower_hold_confirmed,
+            )
+        try:
+            if safety is not None:
+                for index, pose in enumerate(plan.reference_poses):
+                    projection = safety.project({"right": xyzquat_to_pose_matrix(pose)})
+                    if projection.modified_sides:
+                        raise MujocoTcpPlanRejected(
+                            "safe_tcp_path_safety_envelope_blocked",
+                            {
+                                "reference_index": index,
+                                "projection": projection.to_payload(),
+                            },
+                        )
+            self._planner.activate(plan)
+        except MujocoTcpPlanRejected as error:
+            logging.getLogger(__name__).warning(
+                "Safe TCP activation rejected: %s", error
+            )
+            hold = self._hold(reason=error.reason_code)
+            return StationLifecycleActivationEvidence(
+                succeeded=False,
+                status=error.reason_code,
+                lower_operation_id=self._lower_operation_id,
+                evidence_refs=hold.evidence_refs,
+                lower_hold_confirmed=hold.lower_hold_confirmed,
+            )
+        self._execution_refs.add("mujoco-safe-joint-trajectory:" + plan.trajectory_hash)
+        return evidence
+
+    def _reference_action_for_cycle(self, cycle: int) -> ComponentAction:
+        pose = self._planner.reference(cycle)
+        self._path_completed = self._planner.final_reference_selected
+        return ComponentAction(
+            action_schema=self.application.runtime.action_schema,
+            values_by_component={self.component_id: np.asarray(pose, dtype=np.float32)},
+        )
+
+    def _within_terminal_tolerance(self, pose: tuple[float, ...]) -> bool:
+        # Reuse the base lifecycle's stable-observation/HOLD completion when
+        # the goal already held at activation. Otherwise require the entire
+        # checked path, not just an intermediate pose near the goal.
+        activation_pose = self._activation_measured_pose
+        already_satisfied = (
+            activation_pose is not None
+            and super()._within_terminal_tolerance(activation_pose)
+        )
+        return (
+            already_satisfied or self._path_completed
+        ) and super()._within_terminal_tolerance(pose)
+
+
 __all__ = [
+    "MujocoAgentSafeTcpPoseSkillLifecycle",
     "MujocoAgentTcpPoseSkillLifecycle",
     "MujocoAgentTcpTargetResolution",
     "mujoco_agent_skill_hold_evidence_from_transition",

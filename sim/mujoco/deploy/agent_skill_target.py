@@ -3,20 +3,21 @@
 from __future__ import annotations
 
 import time
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from typing import Any, Callable, Mapping
+from typing import Any
 
 from robot_motion.action import ExecutionObservationSink
 from robot_motion.coordinate_profiles import TargetFrameProfile, ToolFrameProfile
 
 from .target_config import MujocoSimHILTargetConfig
-from .target_preparation import (
-    MujocoSimHILPreparedTarget,
-    prepare_mujoco_sim_hil_target,
-)
 from .target_measurement import (
     build_mujoco_sim_hil_pose_observation_projector,
     capture_mujoco_sim_hil_safety_anchor,
+)
+from .target_preparation import (
+    MujocoSimHILPreparedTarget,
+    prepare_mujoco_sim_hil_target,
 )
 
 
@@ -31,6 +32,7 @@ class MujocoAgentSkillMotionTarget:
     tool_frame_profile: ToolFrameProfile
     task_initialization_info: Mapping[str, object]
     tcp_pose_envelope_runtime: Any | None = None
+    planned_tcp_motion: Any | None = None
 
 
 def build_mujoco_agent_skill_motion_target(
@@ -41,6 +43,8 @@ def build_mujoco_agent_skill_motion_target(
     execution_observation_sink: ExecutionObservationSink | None = None,
     trace_sink: Callable[[Any], None] | None = None,
     tcp_pose_envelope_runtime: Any | None = None,
+    enable_safe_tcp_pose: bool = False,
+    safe_tcp_planning_clearance_padding_m: float = 0.002,
 ) -> MujocoAgentSkillMotionTarget:
     """Build the first no-model, right-arm Agent Skill execution target.
 
@@ -51,6 +55,8 @@ def build_mujoco_agent_skill_motion_target(
 
     if not isinstance(config, MujocoSimHILTargetConfig):
         raise TypeError("config must be a MujocoSimHILTargetConfig.")
+    if not isinstance(enable_safe_tcp_pose, bool):
+        raise TypeError("enable_safe_tcp_pose must be boolean.")
     if config.allow_scripted_task_reset:
         raise ValueError(
             "Agent Skill motion target requires allow_scripted_task_reset=False."
@@ -80,17 +86,17 @@ def build_mujoco_agent_skill_motion_target(
         )
 
     from robot_motion.action import (
-        CanonicalKeyframeSafetyProfile,
         IMMEDIATE_QREF_SIM_V1,
+        CanonicalKeyframeSafetyProfile,
         apply_canonical_keyframe_safety,
     )
     from robot_motion.position_control import PositionKeyframeSafetyConfig
     from robot_motion.rm65 import (
         DEFAULT_COLLISION_SCENE,
         DEFAULT_DUAL_ARM_COLLISION_DISTANCE_EPSILON_M,
+        RM65_BIMANUAL_POSITION_V1,
         DualArmCollisionAwareRetargeter,
         DualArmCollisionAwareRetargeterConfig,
-        RM65_BIMANUAL_POSITION_V1,
         RM65PositionCollisionPlannerConfig,
         load_ik_tuning_config,
         load_rm65_tool_profile,
@@ -286,6 +292,29 @@ def build_mujoco_agent_skill_motion_target(
         pose_target_safety_filter = RobotActionTCPPoseEnvelopeFilter(
             tcp_pose_envelope_runtime
         )
+    pose_projector = (
+        build_mujoco_sim_hil_pose_observation_projector(
+            prepared,
+            component_execution_binding,
+        )
+        if config.execution_observation_plan is not None
+        else None
+    )
+    planned_tcp_motion = None
+    if enable_safe_tcp_pose:
+        if not config.collision_stop_enabled or pose_projector is None:
+            raise ValueError(
+                "Safe TCP motion requires collision checking and FK observation."
+            )
+        from .planned_tcp_motion import MujocoPlannedTcpMotion
+
+        planned_tcp_motion = MujocoPlannedTcpMotion(
+            rig=rig,
+            task_config=prepared.task_config,
+            pose_projector=pose_projector,
+            reference_hz=prepared.compose_target_hz,
+            planning_clearance_padding_m=safe_tcp_planning_clearance_padding_m,
+        )
     runtime = MujocoDeployRuntime(
         rig,
         MujocoDeployConfig(
@@ -319,6 +348,7 @@ def build_mujoco_agent_skill_motion_target(
         ),
         pose_resolver=MujocoCoupledPoseToQposResolver(
             ik,
+            planned_tcp_motion=planned_tcp_motion,
             pose_target_safety_filter=pose_target_safety_filter,
             support_only_arm_sides=tuple(
                 effector.removesuffix("_arm")
@@ -328,14 +358,7 @@ def build_mujoco_agent_skill_motion_target(
         shared_safety=shared_safety,
         component_execution_binding=component_execution_binding,
         execution_observation_sink=execution_observation_sink,
-        execution_pose_observation_projector=(
-            build_mujoco_sim_hil_pose_observation_projector(
-                prepared,
-                component_execution_binding,
-            )
-            if config.execution_observation_plan is not None
-            else None
-        ),
+        execution_pose_observation_projector=pose_projector,
         trace_sink=trace_sink,
     )
     return MujocoAgentSkillMotionTarget(
@@ -346,6 +369,7 @@ def build_mujoco_agent_skill_motion_target(
         tool_frame_profile=prepared.tool_frame_profile,
         task_initialization_info=prepared.task_initialization_info,
         tcp_pose_envelope_runtime=tcp_pose_envelope_runtime,
+        planned_tcp_motion=planned_tcp_motion,
     )
 
 

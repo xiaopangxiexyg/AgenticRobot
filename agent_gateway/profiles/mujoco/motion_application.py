@@ -520,6 +520,8 @@ class MujocoAgentSkillMotionApplication:
                     hold_evidence_ids=hold_refs,
                 )
             self._held = True
+            if self.target.planned_tcp_motion is not None:
+                self.target.planned_tcp_motion.clear()
             return transition
 
     def release_operation(self, *, operation_id: str) -> None:

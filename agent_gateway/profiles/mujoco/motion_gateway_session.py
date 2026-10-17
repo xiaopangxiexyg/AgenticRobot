@@ -103,6 +103,7 @@ from .depth_deployment import MUJOCO_CAPTURE_DEPTH_OUTPUT_SLOT_ID_V1
 from .motion_application import MujocoAgentSkillMotionApplication
 from .motion_deployment import MujocoAgentTcpPoseContractBundle
 from .motion_skill import (
+    MujocoAgentSafeTcpPoseSkillLifecycle,
     MujocoAgentTcpPoseSkillLifecycle,
     mujoco_agent_skill_hold_evidence_from_transition,
 )
@@ -166,6 +167,7 @@ class MujocoAgentTcpPoseGatewaySession:
     owns_artifact_store: bool
     hardware_view_provider: HardwareViewProvider
     service: AgentGatewayService
+    safe_tcp_pose_executor: ReusableStationAgentSkillOperationExecutor | None = None
     _close_lock: threading.Lock = field(
         default_factory=threading.Lock,
         init=False,
@@ -357,6 +359,10 @@ class MujocoAgentTcpPoseGatewaySession:
         self,
         outcome: AgentGatewayOperationOutcome,
     ) -> None:
+        if self.application.closed:
+            # Preserve the first close receipt. Repeated teardown must not
+            # send another HOLD into a runtime that has already stopped.
+            return
         receipt = outcome.port_receipt
         if not (
             outcome.accepted
@@ -392,6 +398,7 @@ class MujocoAgentTcpPoseGatewaySession:
     ) -> tuple[ReusableStationAgentSkillOperationExecutor, ...]:
         return (
             self.motion_executor,
+            *((self.safe_tcp_pose_executor,) if self.safe_tcp_pose_executor is not None else ()),
             self.cardinal_step_executor,
             *tuple(
                 self.fixed_cardinal_step_executors[skill_id]
@@ -1439,6 +1446,42 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
         cardinal_step_route.semantic_content_hash: cardinal_step_executor,
         state_entry.route.semantic_content_hash: state_executor,
     }
+    safe_contract = contract_bundle.safe_tcp_pose_contract
+    safe_tcp_pose_executor = None
+    if safe_contract is not None:
+        safe_route = contract_bundle.route_manifest.route("motion.move_tcp_to_pose_safe", "1").route
+        safe_binding = safe_contract.deployment_binding
+
+        def safe_lifecycle_factory(*, request, operation):
+            return MujocoAgentSafeTcpPoseSkillLifecycle(
+                application=application,
+                route=safe_route,
+                deployment_binding=safe_binding,
+                evaluation_plan=safe_contract.evaluation_plan,
+                motion_profile=safe_contract.motion_profile,
+                request=request,
+                operation=operation,
+                clock=runtime_clock,
+            )
+
+        safe_tcp_pose_executor = ReusableStationAgentSkillOperationExecutor(
+            port_id="agent-gateway:safe-tcp-pose-worker:" + safe_binding.runtime_session_id,
+            binding=StationOperationWorkerBinding(
+                worker_id="agent-safe-tcp-pose-worker:" + safe_binding.runtime_session_id,
+                executor_id=safe_binding.executor_id,
+                runtime_session_id=safe_binding.runtime_session_id,
+                skill_id=safe_route.skill_id,
+                skill_version=safe_route.skill_version,
+                route_id=safe_route.route_id,
+                route_version=safe_route.route_version,
+                deployment_binding_hash=safe_binding.semantic_content_hash,
+            ),
+            lifecycle_factory=safe_lifecycle_factory,
+            domain_hold=domain_hold,
+            current_station_revision=lambda: observation_producer.current_station_revision,
+            clock=runtime_clock,
+        )
+        execution_port_by_route_hash[safe_route.semantic_content_hash] = safe_tcp_pose_executor
     execution_port_by_route_hash.update(
         {
             fixed_cardinal_entry_by_skill_id[
@@ -1613,6 +1656,7 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
         owns_artifact_store=owns_artifact_store,
         hardware_view_provider=hardware_view_provider,
         service=service,
+        safe_tcp_pose_executor=safe_tcp_pose_executor,
     )
 
 

@@ -18,6 +18,7 @@ from agent_gateway.skills.motion.definition import (
     cardinal_tcp_step_skill_definition_v1,
     fixed_cardinal_tcp_step_skill_definition_v1,
     fixed_level_tcp_orientation_skill_definition_v1,
+    safe_tcp_pose_target_skill_definition_v1,
     tcp_pose_target_skill_definition_v1,
 )
 from agent_gateway.skills.motion.schemas import (
@@ -339,6 +340,7 @@ def test_motion_skill_definition_hashes_match_protocol_v2_domains() -> None:
         tcp_pose_target_skill_definition_v1(
             controlled_component_ids=("right_arm",),
         ),
+        safe_tcp_pose_target_skill_definition_v1(controlled_component_ids=("left_arm", "right_arm")),
         cardinal_tcp_step_skill_definition_v1(
             controlled_component_ids=("right_arm",),
         ),
@@ -354,6 +356,9 @@ def test_motion_skill_definition_hashes_match_protocol_v2_domains() -> None:
     } == {
         "motion.move_tcp_to_pose": (
             "595e9c6f4c34cc1629e5a973268cd91b1c9490d8b8064a662c437465b0f7930c"
+        ),
+        "motion.move_tcp_to_pose_safe": (
+            "74fc01559bb1441d8d486beb8a2b81b87a35e4a959842b53a81c9af55cf59457"
         ),
         "motion.step_tcp_cardinal": (
             "28c5d8cd1315785b4287fad3fe2e926cf17cc1650ebd0f99cee6451113550249"
