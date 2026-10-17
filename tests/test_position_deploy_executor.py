@@ -1995,6 +1995,30 @@ def test_mixed_pose_and_qpos_sides_share_one_causal_reference_clock() -> None:
         executor.close()
 
 
+@pytest.mark.parametrize("rewrite", [False, True])
+@pytest.mark.parametrize("field", ["requested_value", "final_value", "backend_final_target_qpos"])
+def test_native_dispatch_receipt_preserves_float64_and_rejects_real_rewrite(field, rewrite):
+    qpos = np.array([1.57, .18, 2.1029762205809672, .07, -.8, -.05], dtype=float)
+    assert abs(float(np.float32(qpos[2])) - qpos[2]) > 1e-7
+    receipt = {"accepted": True, "effectors": {f"{side}_arm": {
+        "accepted": True, "backend_ready": True, "command_type": "joint_vector",
+        "requested_value": qpos.tolist(), "final_value": qpos.tolist(),
+        "backend_final_target_qpos": qpos.tolist(),
+    } for side in ("left", "right")}}
+    executor = PositionDeployExecutor(config=PositionDeployExecutorConfig(debug_events_enabled=True),
+                                      canonical_pipeline=_pipeline(("left", "right")))
+    if rewrite:
+        receipt["effectors"]["right_arm"][field][2] += 1e-5
+        with pytest.raises(RuntimeError, match="changed|not preserved"):
+            executor._validate_collision_arm_dispatch_result(receipt,
+                expected_joint_qpos_by_effector={f"{s}_arm": qpos for s in ("left", "right")})
+    else:
+        result = executor._validate_collision_arm_dispatch_result(receipt,
+            expected_joint_qpos_by_effector={f"{s}_arm": qpos for s in ("left", "right")})
+        assert result["position_arm_backend_dispatch_verified"]
+        np.testing.assert_array_equal(result["position_arm_backend_dispatch_by_effector"]["right_arm"]["final_qpos"], qpos)
+
+
 def test_collision_required_pose_reference_becomes_dual_joint_command() -> None:
     planner = _FakePositionCollisionPlanner()
     commands: list[TeleopCommand] = []

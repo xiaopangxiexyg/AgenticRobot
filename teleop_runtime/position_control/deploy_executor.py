@@ -470,6 +470,20 @@ class _DiscreteDispatchItem:
     command: TeleopCommand
 
 
+def _dispatch_qpos_or_none(value: Any) -> np.ndarray | None:
+    # Backend receipts describe native float64 certified qref, not the float32
+    # model state/action wire format. Do not create a rewrite while reading it.
+    if value is None:
+        return None
+    try:
+        vector = np.asarray(value, dtype=float).reshape(-1)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if vector.shape != (6,) or not np.isfinite(vector).all():
+        return None
+    return vector.copy()
+
+
 def _finite_time(value: float, *, name: str) -> float:
     try:
         timestamp = float(value)
@@ -3646,8 +3660,8 @@ class PositionDeployExecutor:
                 expected_joint_qpos_by_effector[effector_name],
                 dtype=float,
             ).reshape(6)
-            requested = vector_or_none(receipt.get("requested_value"), length=6)
-            final = vector_or_none(receipt.get("final_value"), length=6)
+            requested = _dispatch_qpos_or_none(receipt.get("requested_value"))
+            final = _dispatch_qpos_or_none(receipt.get("final_value"))
             if requested is None or final is None:
                 raise RuntimeError(
                     f"collision-required arm dispatch receipt for {effector_name} "
@@ -3661,7 +3675,7 @@ class PositionDeployExecutor:
             backend_final = (
                 None
                 if backend_final_raw is None
-                else vector_or_none(backend_final_raw, length=6)
+                else _dispatch_qpos_or_none(backend_final_raw)
             )
             if backend_final_raw is not None and backend_final is None:
                 raise RuntimeError(
