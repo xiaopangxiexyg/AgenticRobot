@@ -20,6 +20,17 @@ _FIELDS = {"rgb", "depth_m", "target_mask", "left_qpos", "right_qpos", "metadata
 def encode_grasp_rgbd_snapshot(*, rgb: np.ndarray, depth_m: np.ndarray,
                               target_mask: np.ndarray, metadata: Mapping,
                               qpos_by_side: Mapping | None = None) -> bytes:
+    data = _serialize_grasp_rgbd_snapshot(rgb=rgb, depth_m=depth_m,
+        target_mask=target_mask, metadata=metadata, qpos_by_side=qpos_by_side)
+    decode_grasp_rgbd_snapshot(data)
+    return data
+
+
+def _serialize_grasp_rgbd_snapshot(compression_level: int = 3, /, *,
+                                 rgb: np.ndarray, depth_m: np.ndarray,
+                                 target_mask: np.ndarray, metadata: Mapping,
+                                 qpos_by_side: Mapping | None = None) -> bytes:
+    """Internal serializer; the public single/composed encoder validates its output."""
     arrays = {
         "rgb": np.asarray(rgb), "depth_m": np.asarray(depth_m),
         "target_mask": np.asarray(target_mask),
@@ -30,11 +41,24 @@ def encode_grasp_rgbd_snapshot(*, rgb: np.ndarray, depth_m: np.ndarray,
     }
     if any(array.dtype.hasobject for array in arrays.values()):
         raise ValueError("snapshot arrays cannot contain Python objects")
-    stream = io.BytesIO()
-    np.savez_compressed(stream, **arrays)
-    data = stream.getvalue()
-    decode_grasp_rgbd_snapshot(data)
+    data = _compressed_snapshot(arrays, compression_level)
+    if len(data) > GRASP_RGBD_SNAPSHOT_MAX_BYTES and compression_level != 6:
+        # Preserve the original representation budget for unusually large cuts.
+        # Drop the faster payload before the original-strength encode.
+        del data
+        data = _compressed_snapshot(arrays, 6)
     return data
+
+
+def _compressed_snapshot(arrays: Mapping[str, np.ndarray], level: int) -> bytes:
+    """Write the same pickle-free NPZ members at a chosen lossless strength."""
+    stream = io.BytesIO()
+    with zipfile.ZipFile(stream, "w", compression=zipfile.ZIP_DEFLATED,
+                         compresslevel=level) as archive:
+        for name, array in arrays.items():
+            with archive.open(name+".npy", "w", force_zip64=True) as member:
+                np.lib.format.write_array(member, array, allow_pickle=False)
+    return stream.getvalue()
 
 
 def decode_grasp_rgbd_snapshot(data: bytes) -> tuple[dict[str, np.ndarray], dict]:

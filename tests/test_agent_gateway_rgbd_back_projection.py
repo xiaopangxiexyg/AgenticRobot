@@ -434,3 +434,20 @@ def test_geometry_read_control_waits_for_worker_before_closing_resources(geometr
     operation = session.service.operation_store.get(operation_id)
     assert operation.terminal and operation.status != "completed"
     assert all(source.starts == 0 for source in sources.values())
+
+
+def test_public_capture_validates_its_serialized_view_only_once(geometry, monkeypatch):
+    import dataset_contracts.grasp_rgbd_snapshot as single
+    import dataset_contracts.grasp_multiview_snapshot as multi
+
+    decode = single.decode_grasp_rgbd_snapshot
+    calls = []
+    def counted(data):
+        calls.append(data)
+        return decode(data)
+    monkeypatch.setattr(single, "decode_grasp_rgbd_snapshot", counted)
+    monkeypatch.setattr(multi, "decode_grasp_rgbd_snapshot", counted)
+    composition, _ = geometry
+    operation = capture(composition)
+    assert operation.execution_outcome == "completed"
+    assert len(operation.execution_result["frames"]) == len(calls) == 1

@@ -55,7 +55,7 @@ from agent_gateway.skills.perception.grasp_approach_plan_schemas import (
 from agent_gateway.skills.perception.schemas import validate_no_task_evaluation_v1
 from dataset_contracts.canonical_encoding import canonical_content_hash
 from dataset_contracts.grasp_rgbd_snapshot import decode_grasp_rgbd_snapshot
-from dataset_contracts.grasp_multiview_snapshot import GRASP_MULTIVIEW_SCHEMA_ID, decode_grasp_multiview_snapshot
+from dataset_contracts.grasp_multiview_snapshot import GRASP_MULTIVIEW_SCHEMA_ID, decode_grasp_multiview_snapshot_arrays
 from robot_motion.grasp_visible_scene import (
     PRODUCTION_VISIBLE_GRASP_DEPTH_FILTER,
     ParallelJawSolidGeometry,
@@ -105,11 +105,10 @@ def build_grasp_visible_scene_reader(*, artifact_store: RecoverableAgentArtifact
             raise ValueError("point-grasp snapshot Artifact identity changed")
         multiview = artifact.schema_id == GRASP_MULTIVIEW_SCHEMA_ID
         if multiview:
-            views, metadata, scene_points, scene_labels = decode_grasp_multiview_snapshot(data)
+            views, metadata, scene_points, scene_labels = decode_grasp_multiview_snapshot_arrays(data)
             if scene_points is None or metadata.get("scene_frame") != "anchor_camera":
                 raise ValueError("Multi-view plan requires its retained validated scene")
-            selected_views = [decode_grasp_rgbd_snapshot(v) for v in views]
-            selected_views = [a for a, m in selected_views if m["role"] == source["role"]]
+            selected_views = [a for a, m in views if m["role"] == source["role"]]
             if len(selected_views) != 1:
                 raise ValueError("Multi-view scene anchor is missing")
             arrays = selected_views[0]

@@ -5,6 +5,7 @@ from __future__ import annotations
 import threading
 import time
 from collections.abc import Callable, Mapping
+from typing import TYPE_CHECKING
 
 from agent_gateway.protocol.contracts import AgentSkillRequest
 from agent_gateway.runtime.access_policy import (
@@ -24,7 +25,8 @@ from agent_gateway.skills.motion.definition import (
 )
 from dataset_contracts.canonical_encoding import canonical_content_hash
 
-from .motion_gateway_session import RealAgentPrimitiveGatewaySession
+if TYPE_CHECKING:
+    from .motion_gateway_session import RealAgentPrimitiveGatewaySession
 
 REAL_AGENT_PRIMITIVE_SESSION_CONFIRM_TOKEN = "AUTHORIZE_PERSISTENT_REAL_TCP_PRIMITIVES"
 # Compatibility name used by the existing composition API. Its value is the
@@ -133,6 +135,9 @@ class RealAgentPrimitiveSessionAuthorization:
         grant_lifetime_sec: float = 5.0,
         clock: Callable[[], float] = time.time,
     ) -> None:
+        # Only construction needs the concrete owner; clients import action IDs.
+        from .motion_gateway_session import RealAgentPrimitiveGatewaySession
+
         if not isinstance(gateway_session, RealAgentPrimitiveGatewaySession):
             raise TypeError("gateway_session must be typed.")
         normalized_side = str(side).strip()

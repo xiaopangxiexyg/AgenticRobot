@@ -630,28 +630,30 @@ class AgentSkillSchemaEntry:
             tuple(sorted(profiles, key=lambda item: item.parameter_profile_id)),
         )
 
-    @property
+    @cached_property
     def parameter_schema_hash(self) -> str:
+        # Schemas are deep-frozen at construction. Reuse only this entry's
+        # static identity; each request still validates its own payload.
         return agent_skill_schema_document_hash(
             self.parameter_schema,
             schema_kind="parameter",
         )
 
-    @property
+    @cached_property
     def execution_result_schema_hash(self) -> str:
         return agent_skill_schema_document_hash(
             self.execution_result_schema,
             schema_kind="execution_result",
         )
 
-    @property
+    @cached_property
     def task_evaluation_schema_hash(self) -> str:
         return agent_skill_schema_document_hash(
             self.task_evaluation_schema,
             schema_kind="task_evaluation",
         )
 
-    @property
+    @cached_property
     def semantic_content_hash(self) -> str:
         return canonical_content_hash(
             self.to_wire(include_hash=False),
@@ -735,7 +737,7 @@ class AgentSkillSchemaCatalog:
                 return entry
         raise KeyError(f"Unknown Skill schema entry: {identity!r}.")
 
-    @property
+    @cached_property
     def semantic_content_hash(self) -> str:
         return canonical_content_hash(
             {

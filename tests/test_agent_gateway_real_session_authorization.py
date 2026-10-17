@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-from agent_gateway.profiles.real import session_authorization
+import pytest
+
+from agent_gateway.profiles.real import motion_gateway_session, session_authorization
 
 
 class _Manifest:
@@ -45,7 +47,7 @@ def test_absolute_tcp_pose_request_receives_a_request_bound_grant(monkeypatch) -
     issued: list[object] = []
 
     monkeypatch.setattr(
-        session_authorization,
+        motion_gateway_session,
         "RealAgentPrimitiveGatewaySession",
         _Gateway,
     )
@@ -79,7 +81,7 @@ def test_absolute_tcp_pose_grant_rejects_wrong_side_and_unlisted_action(
     monkeypatch,
 ) -> None:
     monkeypatch.setattr(
-        session_authorization,
+        motion_gateway_session,
         "RealAgentPrimitiveGatewaySession",
         _Gateway,
     )
@@ -116,3 +118,12 @@ def test_absolute_tcp_pose_grant_rejects_wrong_side_and_unlisted_action(
 
     assert wrong_side_authorization.grant_resolver(_request()) is None
     assert unlisted_authorization.grant_resolver(_request()) is None
+
+
+def test_authorization_still_requires_the_concrete_gateway_owner():
+    with pytest.raises(TypeError, match="gateway_session must be typed"):
+        session_authorization.RealAgentPrimitiveSessionAuthorization(
+            gateway_session=SimpleNamespace(), side="right", action="up",
+            client_id="operator:test",
+            confirmation_token=session_authorization.REAL_AGENT_PRIMITIVE_SESSION_CONFIRM_TOKEN,
+        )

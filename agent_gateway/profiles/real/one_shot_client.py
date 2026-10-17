@@ -15,11 +15,12 @@ import time
 import uuid
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from agent_gateway.skills.motion.definition import (
     FIXED_CARDINAL_TCP_STEP_DIRECTION_BY_SKILL_ID_V1,
     FIXED_CARDINAL_TCP_STEP_SKILL_ID_BY_DIRECTION_V1,
+    FIXED_LEVEL_TCP_ORIENTATION_SKILL_IDS_V1,
     GRASP_APPROACH_SKILL_ID_V1,
     TCP_CARDINAL_STEP_SKILL_ID_V1,
     TCP_LEVEL_FORWARD_LEFT_30_SKILL_ID_V1,
@@ -31,18 +32,13 @@ from agent_gateway.transport.unix_transport import (
     AGENT_GATEWAY_UNIX_JSON_PROTOCOL_V2,
 )
 
-from .grasp_pose_adapter import (
-    CameraRelativeGraspProposal,
-    load_camera_relative_grasp_proposal,
-    resolve_camera_relative_grasp_target,
-)
-from .motion_primitive_profiles import (
-    REAL_AGENT_TCP_FIXED_ORIENTATION_HEADING_BY_SKILL_ID_V1,
-)
 from .session_authorization import (
     REAL_AGENT_ABSOLUTE_TCP_POSE_ACTION,
     REAL_AGENT_GRASP_APPROACH_ACTION,
 )
+
+if TYPE_CHECKING:
+    from .grasp_pose_adapter import CameraRelativeGraspProposal
 
 _PREFIX = struct.Struct(">I")
 _CONFIRM_TOKEN = "EXECUTE_AUTHORIZED_REAL_TCP_PRIMITIVE"
@@ -355,6 +351,8 @@ def _absolute_tcp_input_from_args(
                 "--target-xyz-m/--target-quat-xyzw and "
                 "--relative-delta-xyz-m."
             )
+        from .grasp_pose_adapter import load_camera_relative_grasp_proposal
+
         return None, load_camera_relative_grasp_proposal(proposal_path), None
     if relative_delta_value is not None:
         if xyz_value is not None or quaternion_value is not None:
@@ -577,7 +575,7 @@ def _parameters(
             properties, "primitive_catalog_hash"
         )
     else:
-        if skill_id not in REAL_AGENT_TCP_FIXED_ORIENTATION_HEADING_BY_SKILL_ID_V1:
+        if skill_id not in FIXED_LEVEL_TCP_ORIENTATION_SKILL_IDS_V1:
             raise RuntimeError("Unsupported fixed-orientation real primitive Skill.")
         payload["primitive_hash"] = _schema_const(properties, "primitive_hash")
     return payload
@@ -641,6 +639,8 @@ def execute_one_shot(args: argparse.Namespace) -> Mapping[str, Any]:
                 delta_xyz_m=relative_delta_xyz_m,
             )
         elif camera_grasp_proposal is not None:
+            from .grasp_pose_adapter import resolve_camera_relative_grasp_target
+
             absolute_tcp_pose = resolve_camera_relative_grasp_target(
                 proposal=camera_grasp_proposal,
                 route_manifest=manifest,

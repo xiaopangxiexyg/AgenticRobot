@@ -37,7 +37,7 @@ from dataset_contracts.grasp_rgbd_snapshot import (
     decode_grasp_rgbd_snapshot,
 )
 from dataset_contracts.grasp_multiview_snapshot import (
-    GRASP_MULTIVIEW_SCHEMA_ID, GRASP_MULTIVIEW_ENCODING, encode_grasp_multiview_snapshot,
+    GRASP_MULTIVIEW_SCHEMA_ID, GRASP_MULTIVIEW_ENCODING, encode_grasp_multiview_arrays,
 )
 from deployments.perception.grasp_multiview import GraspRgbdView, fuse_grasp_views
 from dataset_contracts.perception_artifacts import (
@@ -926,12 +926,12 @@ class StationBoundPointGraspProvider:
                     retained_views = []
                     for a, m in frozen_views:
                         target_mask = fused_observation.target_masks.get(m["role"])
-                        retained_views.append(encode_grasp_rgbd_snapshot(
+                        retained_views.append(dict(
                             rgb=a["rgb"], depth_m=a["depth_m"],
                             target_mask=np.zeros_like(a["target_mask"]) if target_mask is None else target_mask,
                             qpos_by_side={side: a[side+"_qpos"] for side in ("left", "right")},
                             metadata={**m, "target_mask_available": target_mask is not None}))
-                    snapshot = encode_grasp_multiview_snapshot(views=retained_views,
+                    snapshot = encode_grasp_multiview_arrays(views=retained_views,
                         metadata={**metadata, "schema_id": GRASP_MULTIVIEW_SCHEMA_ID, "scene_frame": "anchor_camera"},
                         scene_points=fused_observation.scene.points,
                         scene_target_mask=fused_observation.scene.target_mask)

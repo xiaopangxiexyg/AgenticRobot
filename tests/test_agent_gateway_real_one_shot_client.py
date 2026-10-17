@@ -919,3 +919,51 @@ def test_repeated_one_shot_calls_do_not_replay_the_first_sequence(monkeypatch, t
     for _ in range(2):
         assert one_shot_client.execute_one_shot(args)["status"] == "completed"
     assert sequences == [1, 2]
+
+
+def test_simple_client_entry_does_not_import_server_or_motion_stacks():
+    from pathlib import Path
+
+    script = r'''
+import importlib.abc
+import sys
+sys.path.insert(0, sys.argv[1])
+blocked = ("scipy", "hardware", "sim", "teleop_runtime", "deployments")
+class NoApplicationImports(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path=None, target=None):
+        if any(fullname == name or fullname.startswith(name + ".") for name in blocked):
+            raise AssertionError("unneeded client import: " + fullname)
+sys.meta_path.insert(0, NoApplicationImports())
+from agent_gateway.profiles.real import one_shot_client as client
+for side in ("right",):
+    for state in ("open", "closed"):
+        args = client.build_parser().parse_args([
+            "--socket-path", "/unused-offline.sock", "--side", side,
+            "--action", "set_gripper_state", "--target-state", state])
+        assert client._absolute_tcp_input_from_args(args) == (None, None, None)
+        parameters = client._parameters(action=args.action,
+            skill_id="manipulation.set_gripper_state", side=side, snapshot={},
+            target_state=state, schema_entry={"parameter_schema": {"properties": {
+                "target_state": {"enum": ["open", "closed"]},
+                "component_id": {"enum": ["left_gripper", "right_gripper"]}}}})
+        assert parameters == {"target_state": state}
+args = client.build_parser().parse_args([
+    "--socket-path", "/unused-offline.sock", "--side", "right",
+    "--action", "move_tcp_to_pose", "--relative-delta-xyz-m", "0", "0", ".03"])
+assert client._absolute_tcp_input_from_args(args) == (None, None, (0., 0., .03))
+assert client._relative_tcp_target_from_snapshot(snapshot={"measurement_summary": {
+    "pose_xyz_quat_xyzw_by_component": {"right_arm": [0., 0., .3, 0., 0., 0., 1.]}}},
+    side="right", delta_xyz_m=(0., 0., .03)) == (0., 0., .3 + .03, 0., 0., 0., 1.)
+assert all(name not in sys.modules for name in blocked)
+'''
+    completed = subprocess.run([sys.executable, "-I", "-c", script,
+        str(Path(__file__).resolve().parents[1])], capture_output=True, text=True, timeout=10)
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
+def test_fixed_orientation_client_uses_the_same_skill_ids_as_the_server():
+    from agent_gateway.profiles.real.motion_primitive_profiles import (
+        REAL_AGENT_TCP_FIXED_ORIENTATION_HEADING_BY_SKILL_ID_V1,
+    )
+    assert set(one_shot_client.FIXED_LEVEL_TCP_ORIENTATION_SKILL_IDS_V1) == set(
+        REAL_AGENT_TCP_FIXED_ORIENTATION_HEADING_BY_SKILL_ID_V1)

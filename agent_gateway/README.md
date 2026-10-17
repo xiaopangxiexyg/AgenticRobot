@@ -588,6 +588,15 @@ DINO 模型在首次文本推理时绑定所解析的物理设备，后续复用
 关闭时由同一 owner 释放引用。权重、精度、阈值和输入 tensor 的官方迁移路径保持不变。
 localize 的 last_call_timing_ms 仅报告当前调用的锁等待和推理阶段耗时，不构成控制或测量时间依据。
 
+冻结的 Skill schema entry/catalog 仅复用其静态身份字符串；每次发现仍返回新的可修改 wire 副本，
+替换 schema 会重新计算身份，逐请求 payload、Route 闭包和授权校验保持原样。
+一次性 client 只在读取相机抓姿提案或创建服务端授权 owner 时加载相应应用代码，现有动作和右夹爪 v1 合同不变。
+
+保留 RGB-D 的原有 NPZ/ZIP schema、NPY 成员、无 pickle 校验和 16 MiB 上限。组合抓取观测通过同一入口
+编码并完整验证，每个嵌入视图只解码一次；规划读取直接复用这些已验证数组和采集时 qpos。
+新原始数组采用无损 deflate level 3，接近原字节上限时改用原 level 6 再验证；接收已有视图字节的入口
+始终逐字节保留输入，不重新压缩。压缩包可能略大，最终字节、解压体积、形状和元数据门禁均保留。
+
 ### 可选 SAM3 服务：文本目标与图片点选
 
 `real-rm65` 和 `real-perception` 的 `--object-localization-backend` 默认仍为

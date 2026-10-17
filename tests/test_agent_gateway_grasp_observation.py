@@ -59,8 +59,8 @@ def test_frozen_registration_is_closed_and_read_only():
         registration.payload_validator.validate_parameters({k: v for k, v in parameters.items() if k != "observation_operation_id"})
 
 
-@pytest.mark.parametrize("anchor,missing", [("main", "wrist_right"), ("wrist_left", "wrist_right"), ("wrist_left", "main")])
-def test_capture_inference_and_planning_reuse_exact_observation(tmp_path, anchor, missing):
+@pytest.mark.parametrize("anchor,missing", [("main", None), ("main", "wrist_right"), ("wrist_left", "wrist_right"), ("wrist_left", "main")])
+def test_capture_inference_and_planning_reuse_exact_observation(tmp_path, monkeypatch, anchor, missing):
     old_provider, registration = frozen_stack()
     captures = []
     filter_calls = []
@@ -118,13 +118,26 @@ def test_capture_inference_and_planning_reuse_exact_observation(tmp_path, anchor
         frame_binding=old_provider.frame_binding, artifact_store=store, runtime_session_id=registration.binding.runtime_session_id,
         current_station_revision=lambda: 7, max_retained_operations=4, clock=lambda: 10., non_motion_read_window=nullcontext)
     selected_roles = ["main", "wrist_left", "wrist_right"]
+    import dataset_contracts.grasp_rgbd_snapshot as single_codec
+    import dataset_contracts.grasp_multiview_snapshot as multi_codec
+    decode = single_codec.decode_grasp_rgbd_snapshot
+    serialized_view_checks = []
+    def checked_once(data):
+        serialized_view_checks.append(data)
+        return decode(data)
+    monkeypatch.setattr(single_codec, "decode_grasp_rgbd_snapshot", checked_once)
+    monkeypatch.setattr(multi_codec, "decode_grasp_rgbd_snapshot", checked_once)
     observed = observation_executor._read(SimpleNamespace(parameters={"selected_roles": selected_roles}, expected_station_revision=7),
         SimpleNamespace(operation_id="observation:1"))
     validator = registration.observation_registration.payload_validator
     validator.validate_execution_result(observed.execution_result)
     validator.validate_execution_result_for_parameters({"selected_roles": selected_roles}, observed.execution_result)
-    assert len(observed.execution_result["frames"]) == 2
-    assert observed.execution_result["excluded_views"][0]["role"] == missing
+    frame_count = 3 if missing is None else 2
+    assert len(observed.execution_result["frames"]) == len(serialized_view_checks) == frame_count
+    if missing is None:
+        assert not observed.execution_result["excluded_views"]
+    else:
+        assert observed.execution_result["excluded_views"][0]["role"] == missing
     completion = SimpleNamespace(accepted=True, operation=SimpleNamespace(
         runtime_session_id=registration.binding.runtime_session_id, status="completed", execution_outcome="completed",
         execution_result=observed.execution_result, output_artifact_bindings=observed.output_artifact_bindings))
@@ -150,7 +163,7 @@ def test_capture_inference_and_planning_reuse_exact_observation(tmp_path, anchor
     registration.payload_validator.validate_execution_result(result.execution_result)
     registration.payload_validator.validate_execution_result_for_parameters(parameters, result.execution_result)
     assert captures == selected_roles  # No second camera read during inference.
-    assert len(filter_calls) == 2
+    assert len(filter_calls) == frame_count
     assert len(generated_scenes) == 1
     reader = build_grasp_visible_scene_reader(artifact_store=store, frame_graph=provider.frame_binding.frame_graph,
         execution_frame_id=provider.frame_binding.reference_frame_id)

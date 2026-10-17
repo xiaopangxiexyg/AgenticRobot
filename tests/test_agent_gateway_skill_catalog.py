@@ -552,3 +552,92 @@ def test_frozen_lifecycle_routes_reject_ambiguous_or_wrong_effects() -> None:
             may_open_publication=True,
             requires_deadman=True,
         )
+
+
+def test_schema_identities_are_computed_once_without_caching_wire_payloads(monkeypatch) -> None:
+    from collections import Counter
+    from agent_gateway.protocol import skill_catalog
+
+    _, entry, _, catalog = _catalogs()
+    original = skill_catalog.canonical_content_hash
+    calls = Counter()
+
+    def counted(payload, *, domain):
+        calls[domain] += 1
+        return original(payload, domain=domain)
+
+    monkeypatch.setattr(skill_catalog, "canonical_content_hash", counted)
+    identity = catalog.semantic_content_hash
+    expected = catalog.to_wire()
+    for _ in range(3):
+        assert catalog.semantic_content_hash == identity
+        wire = catalog.to_wire()
+        assert wire == expected
+        wire["schema_entries"][0]["parameter_schema"]["properties"].clear()
+        wire["schema_entries"][0]["parameter_profiles"].clear()
+    # The parameter identity is already needed during entry construction.
+    prefix = skill_catalog.AGENT_SKILL_SCHEMA_DOCUMENT_HASH_DOMAIN_V2
+    assert calls[prefix+".parameter"] == 0
+    assert calls[prefix+".execution_result"] == 1
+    assert calls[prefix+".task_evaluation"] == 1
+    assert calls[skill_catalog.AGENT_SKILL_SCHEMA_ENTRY_HASH_DOMAIN_V2] == 1
+    assert calls[skill_catalog.AGENT_SKILL_SCHEMA_CATALOG_HASH_DOMAIN_V2] == 1
+    assert entry.semantic_content_hash == original(
+        entry.to_wire(include_hash=False), domain=skill_catalog.AGENT_SKILL_SCHEMA_ENTRY_HASH_DOMAIN_V2)
+    assert catalog.to_wire() == expected
+
+
+@pytest.mark.parametrize("field", [
+    "parameter_schema", "execution_result_schema", "task_evaluation_schema",
+    "skill_definition_hash", "skill_version", "parameter_profiles",
+])
+def test_replaced_schema_entry_recomputes_its_identity_and_closure(field) -> None:
+    from agent_gateway.protocol import skill_catalog
+
+    definition, entry, definitions, catalog = _catalogs()
+    expected = catalog.to_wire()
+    changes = {field: "definition:changed" if field == "skill_definition_hash" else "2"}
+    if field.endswith("_schema"):
+        changes[field] = _strict_schema(property_name="changed")
+    if field == "parameter_schema":
+        with pytest.raises(ValueError, match="exact parameter schema"):
+            replace(entry, **changes)
+        changes["parameter_profiles"] = (replace(entry.parameter_profiles[0],
+            parameter_schema_hash=agent_skill_schema_document_hash(
+                changes[field], schema_kind="parameter")),)
+    elif field == "parameter_profiles":
+        changes[field] = (replace(entry.parameter_profiles[0], parameter_profile_hash="profile:changed"),)
+    other = replace(entry, **changes)
+    updated = replace(catalog, schema_entries=(other,))
+    assert other.semantic_content_hash != entry.semantic_content_hash
+    assert updated.semantic_content_hash != catalog.semantic_content_hash
+    assert other.semantic_content_hash == skill_catalog.canonical_content_hash(
+        other.to_wire(include_hash=False), domain=skill_catalog.AGENT_SKILL_SCHEMA_ENTRY_HASH_DOMAIN_V2)
+    assert catalog.to_wire() == expected
+    # A new, internally valid catalog must still be rejected by an old Route.
+    manifest = _manifest(_route(definition, entry), definitions, catalog)
+    with pytest.raises(ValueError, match="schema catalog hash mismatch"):
+        validate_skill_route_catalog_closure(definition_catalog=definitions,
+            schema_catalog=updated, route_manifest=manifest)
+
+
+def test_schema_cache_owns_nested_inputs_and_is_not_copied_by_replace() -> None:
+    from concurrent.futures import ThreadPoolExecutor
+
+    _, original, _, _ = _catalogs()
+    schema = original.to_wire()["parameter_schema"]
+    entry = replace(original, parameter_schema=schema)
+    entries = [entry]
+    catalog = AgentSkillSchemaCatalog(catalog_id="schemas:owned", catalog_version="1", schema_entries=entries)
+    with ThreadPoolExecutor(max_workers=4) as workers:
+        identities = tuple(workers.map(lambda _: catalog.semantic_content_hash, range(16)))
+    expected = catalog.to_wire()
+    schema["properties"].clear()
+    entries.clear()
+    assert len(set(identities)) == 1
+    assert catalog.to_wire() == expected
+    with pytest.raises(TypeError):
+        entry.parameter_schema["properties"]["pose_targets_by_component"]["type"] = "number"
+    same = replace(entry)
+    assert "semantic_content_hash" not in same.__dict__
+    assert same.semantic_content_hash == entry.semantic_content_hash

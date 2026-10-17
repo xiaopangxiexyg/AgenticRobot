@@ -14,7 +14,11 @@ from collections.abc import Mapping, Sequence
 
 import numpy as np
 
-from .grasp_rgbd_snapshot import decode_grasp_rgbd_snapshot
+from .grasp_rgbd_snapshot import (
+    GRASP_RGBD_SNAPSHOT_MAX_BYTES,
+    _serialize_grasp_rgbd_snapshot,
+    decode_grasp_rgbd_snapshot,
+)
 
 GRASP_MULTIVIEW_SCHEMA_ID = "dexteleop.perception.grasp_multiview_snapshot.v1"
 GRASP_MULTIVIEW_ENCODING = "zip.rgbd_views.scene_points.metadata_json.v1"
@@ -45,7 +49,40 @@ def _read_array(data: bytes, *, dtype: str, columns: int | None) -> np.ndarray:
     return np.load(io.BytesIO(data), allow_pickle=False)
 
 
+def encode_grasp_multiview_arrays(
+    *, views: Sequence[Mapping], metadata: Mapping,
+    scene_points: np.ndarray | None = None,
+    scene_target_mask: np.ndarray | None = None,
+) -> bytes:
+    """Compose raw views, then validate the complete serialized observation once."""
+    if not 1 <= len(views) <= 3:
+        raise ValueError("A grasp observation requires one to three views")
+    data = _serialize_grasp_multiview_snapshot(
+        views=[_serialize_grasp_rgbd_snapshot(**view) for view in views],
+        metadata=metadata, scene_points=scene_points, scene_target_mask=scene_target_mask)
+    if len(data) > GRASP_MULTIVIEW_MAX_BYTES:
+        # Only this raw-array entry point may re-encode views. The bytes API
+        # below always preserves the exact supplied embedded observations.
+        del data
+        data = _serialize_grasp_multiview_snapshot(
+            views=[_serialize_grasp_rgbd_snapshot(6, **view) for view in views],
+            metadata=metadata, scene_points=scene_points, scene_target_mask=scene_target_mask)
+    decode_grasp_multiview_snapshot(data)
+    return data
+
+
 def encode_grasp_multiview_snapshot(
+    *, views: Sequence[bytes], metadata: Mapping,
+    scene_points: np.ndarray | None = None,
+    scene_target_mask: np.ndarray | None = None,
+) -> bytes:
+    data = _serialize_grasp_multiview_snapshot(views=views, metadata=metadata,
+        scene_points=scene_points, scene_target_mask=scene_target_mask)
+    decode_grasp_multiview_snapshot(data)
+    return data
+
+
+def _serialize_grasp_multiview_snapshot(
     *, views: Sequence[bytes], metadata: Mapping,
     scene_points: np.ndarray | None = None,
     scene_target_mask: np.ndarray | None = None,
@@ -58,14 +95,13 @@ def encode_grasp_multiview_snapshot(
     with zipfile.ZipFile(stream, "w", compression=zipfile.ZIP_STORED) as archive:
         archive.writestr("metadata.json", json.dumps(dict(metadata), allow_nan=False))
         for index, view in enumerate(views):
-            decode_grasp_rgbd_snapshot(view)
+            if not 0 < len(view) <= GRASP_RGBD_SNAPSHOT_MAX_BYTES:
+                raise ValueError("snapshot exceeds its byte bound")
             archive.writestr(f"view_{index}.npz", view)
         if scene_points is not None:
             archive.writestr("points.npy", _array_bytes(np.asarray(scene_points, dtype=np.float64)))
             archive.writestr("target_mask.npy", _array_bytes(np.asarray(scene_target_mask, dtype=np.bool_)))
-    data = stream.getvalue()
-    decode_grasp_multiview_snapshot(data)
-    return data
+    return stream.getvalue()
 
 
 def decode_grasp_multiview_snapshot(data: bytes) -> tuple[list[bytes], dict, np.ndarray | None, np.ndarray | None]:

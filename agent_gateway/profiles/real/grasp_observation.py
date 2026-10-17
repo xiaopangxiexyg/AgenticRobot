@@ -26,11 +26,11 @@ from agent_gateway.skills.perception.schemas import validate_no_task_evaluation_
 from dataset_contracts.canonical_encoding import canonical_content_hash
 from dataset_contracts.grasp_multiview_snapshot import (
     GRASP_MULTIVIEW_SCHEMA_ID, GRASP_MULTIVIEW_ENCODING, GRASP_MULTIVIEW_MAX_BYTES,
-    encode_grasp_multiview_snapshot, decode_grasp_multiview_snapshot,
+    encode_grasp_multiview_arrays, decode_grasp_multiview_snapshot,
     decode_grasp_multiview_snapshot_arrays,
 )
 from dataset_contracts.grasp_rgbd_snapshot import (
-    GRASP_RGBD_SNAPSHOT_SCHEMA_ID, encode_grasp_rgbd_snapshot,
+    GRASP_RGBD_SNAPSHOT_SCHEMA_ID,
 )
 from dataset_contracts.perception_artifacts import (
     RGB_FRAME_SCHEMA_ID_V1, RGB_FRAME_ENCODING_V1, RGB_FRAME_COMPRESSION_V1,
@@ -224,7 +224,7 @@ def build_grasp_observation_executor(*, registration, perception_provider, frame
                         "measured_at": capture.pose_measured_at, "available_at": capture.pose_available_at,
                         "source_evidence_refs": list(capture.pose_evidence_refs)},
                 }
-                views.append(encode_grasp_rgbd_snapshot(rgb=capture.rgb, depth_m=capture.depth_m,
+                views.append(dict(rgb=capture.rgb, depth_m=capture.depth_m,
                     target_mask=np.zeros(capture.depth_m.shape, dtype=bool), metadata=metadata,
                     qpos_by_side=capture.capture_qpos_by_side))
                 stream = io.BytesIO()
@@ -234,7 +234,7 @@ def build_grasp_observation_executor(*, registration, perception_provider, frame
             raise RuntimeError("No usable RGB-D view; "+str(excluded))
         if current_station_revision() != request.expected_station_revision:
             raise RuntimeError("Station revision changed during grasp observation")
-        observation = encode_grasp_multiview_snapshot(views=views, metadata={
+        observation = encode_grasp_multiview_arrays(views=views, metadata={
             "schema_id": GRASP_MULTIVIEW_SCHEMA_ID, "runtime_session_id": runtime_session_id,
             "station_revision": request.expected_station_revision,
             "frame_binding_hash": frame_binding.semantic_content_hash, "excluded_views": excluded,
