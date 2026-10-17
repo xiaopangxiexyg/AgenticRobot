@@ -27,6 +27,49 @@ from dataset_contracts.canonical_encoding import canonical_content_hash
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
+def test_camera_only_sam3_binding_never_constructs_sam2_or_starts_devices(monkeypatch, tmp_path):
+    from deployments.perception import sam3_service
+
+    captured = []
+    original = sam3_service.Sam3ServiceLocalizer
+
+    def construct(**kwargs):
+        value = original(**kwargs)
+        captured.append(value)
+        return value
+
+    def reject_sam2(*args, **kwargs):
+        raise AssertionError("SAM3 selected but SAM2 was constructed")
+
+    def stop_before_sources(*args, **kwargs):
+        raise RuntimeError("stop before camera construction")
+
+    monkeypatch.setattr(sam3_service, "Sam3ServiceLocalizer", construct)
+    monkeypatch.setattr(perception_cli.Sam2GroundingDinoModelSpec, "from_asset_bundle", reject_sam2)
+    monkeypatch.setattr(perception_cli, "build_rm65_dual_arm_scene_profile", stop_before_sources)
+    existing = str(REPO_ROOT / "pyproject.toml")
+    with pytest.raises(RuntimeError, match="stop before camera construction"):
+        perception_cli.main([
+            "--socket-path", str(tmp_path / "unused.sock"), "--camera-config", existing,
+            "--camera-registry", existing, "--artifact-root", str(tmp_path),
+            "--enable-object-localization", "--object-localization-backend", "sam3-service",
+        ])
+    assert len(captured) == 1 and not captured[0]._started
+
+
+def test_perception_default_does_not_import_optional_sam3_client():
+    result = subprocess.run([
+        sys.executable, "-c",
+        ("import sys; from agent_gateway.profiles.real import perception_cli; "
+        "assert 'deployments.perception.sam3_service' not in sys.modules; "
+        "p=perception_cli.build_parser(); "
+        "a=p.parse_args(['--socket-path','/unused.sock','--camera-config','/unused.json',"
+        "'--camera-registry','/unused.json','--artifact-root','/unused']); "
+        "assert a.object_localization_backend=='sam2-grounding-dino'"),
+    ], cwd=REPO_ROOT, capture_output=True, text=True, check=False)
+    assert result.returncode == 0, result.stderr
+
+
 class _CameraSource:
     def __init__(self, source_id: str, *, enable_depth: bool) -> None:
         self.source_id = source_id

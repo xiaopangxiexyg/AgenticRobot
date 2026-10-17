@@ -546,6 +546,47 @@ python -m agent_gateway real-perception \
   --graspgenx-source-root /absolute/AgenticRobot/model/perception/graspgenx
 ```
 
+### 可选 SAM3 服务：文本目标与图片点选
+
+`real-rm65` 和 `real-perception` 的 `--object-localization-backend` 默认仍为
+`sam2-grounding-dino`。未显式选择 SAM3 时，原模型、阈值、自动分割和启动路径不变，
+不会导入 SAM3 client 或连接额外服务。GraspGenX 的 `in-process` 默认也不变。
+
+SAM3 复用 RPent 的通用服务，在它自己的模型环境中独立运行，不向 Gateway 环境
+安装 SAM3，也不把相机、抓姿、IK 或运动功能放入服务：
+
+```bash
+SAM3_CHECKPOINT_PATH=/absolute/checkpoints/sam3.pt \
+  python -m rpent.robots.components.sam3_server \
+  --transport http --host 127.0.0.1 --port 8114
+```
+
+在现有 Gateway 命令中显式加入下面的选项，并移除
+`--object-localization-asset-bundle`；RPent 手动脚本对应移除
+`--sam2-grounding-dino-bundle`。相机、工具标定、抓取 profile、深度处理和执行确认保持原样：
+
+```text
+--object-localization-backend sam3-service
+--sam3-endpoint http://127.0.0.1:8114
+--sam3-timeout-sec 120
+--sam3-min-score 0.2
+```
+
+此版本支持文本提示的**单个最佳实例**和原图像素点选；`max_detections` 仍是上界，
+不是承诺返回多个物体。无文本自动分割暂不支持，会明确拒绝，不能以空结果假装成功。
+同一实例支持现有 `perception.segment` 的文本和点选请求，复用标准 mask NPY 与
+overlay JPEG Artifact 编码、分数阈值及发布时的观测版本检查。
+文本没有检出时可按现有交互流程由操作者改为图片点选；不会自动换回 SAM2 或偷偷
+降低阈值。Gateway 的 `(u,v)` 只在 client 中转换一次为服务的 `[row,col]`，返回
+掩码必须与输入图同尺寸，且点选掩码必须包含点击点。多视角仍区分正常提示未命中与
+传输／模型／畸形掩码故障；后者不会被当作可重试的背景点。
+
+适配器只使用 loopback HTTP，显式超时、不重试、不跟随重定向，也不关闭共享服务。
+现有 SAM2 命名的下游历史类／计时字段不代表实际选择的模型；部署身份绑定所选
+localizer。SAM3 的 profile hash 表示服务协议与 endpoint 配置，**不证明外部服务的
+checkpoint 字节身份**，因此应在服务自身的部署记录中保留源码、权重与环境信息。
+离线掩码或规划通过不代表深度、标定、真实接触或抓取成功已经验收。
+
 The live `perception.plan_point_grasp@2` request contains only a registered
 aligned-depth role, a clicked pixel, and a bounded candidate count. The
 application reads RGB and aligned depth from one published `VideoFrame`, binds

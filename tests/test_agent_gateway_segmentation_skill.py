@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import io
 import threading
 from dataclasses import replace
@@ -44,6 +45,7 @@ from agent_gateway.transport.client_bindings import (
 from deployments.perception.sam2_grounding_dino import (
     GroundedObjectSegment,
     Sam2GroundingDinoLocalizer,
+    Sam2PointMaskUnavailable,
     encode_grounded_object_segment_artifacts,
 )
 from teleop_runtime.video_frame import VideoFrame
@@ -248,6 +250,28 @@ def test_shared_localizer_point_segmentation_preserves_score_and_mask(mask_dtype
     np.testing.assert_array_equal(
         localizer.segment_point(image, pixel_uv=(3, 2)), result.mask
     )
+
+
+@pytest.mark.parametrize("failure", ["prompt_miss", "invalid_shape"])
+def test_shared_localizer_distinguishes_prompt_miss_from_invalid_shape(failure) -> None:
+    masks = np.zeros((2, 10, 12), dtype=bool)
+    masks[0, 2:4, 2:4] = True
+    masks[1] = True
+    scores = np.array([.95, .08])
+    if failure == "invalid_shape":
+        masks, scores = np.ones((1, 2, 2), dtype=bool), np.array([1.])
+    localizer = object.__new__(Sam2GroundingDinoLocalizer)
+    localizer._lock = threading.RLock()
+    localizer._started, localizer._closed = True, False
+    localizer._predictor = SimpleNamespace(
+        set_image=lambda image: None,
+        predict=lambda **kwargs: (masks, scores, None),
+    )
+    expected = Sam2PointMaskUnavailable if failure == "prompt_miss" else RuntimeError
+    message = "requested pixel" if failure == "prompt_miss" else "invalid point mask shape"
+    with pytest.raises(expected, match=message) as error:
+        localizer.segment_point(Image.new("RGB", (12, 10)), pixel_uv=(6, 6))
+    assert type(error.value) is expected
 
 
 def test_shared_localizer_rejects_non_finite_point_score() -> None:
@@ -729,8 +753,9 @@ def test_segmentation_provider_rejects_corrupt_encoded_artifacts(
         )
 
 
+@pytest.mark.parametrize("backend", ["fixture", "sam3-service"])
 def test_real_gateway_segments_live_realsense_frame_and_commits_artifacts(
-    monkeypatch, tmp_path
+    monkeypatch, tmp_path, backend
 ) -> None:
     monkeypatch.setattr(
         realsense_perception,
@@ -748,6 +773,32 @@ def test_real_gateway_segments_live_realsense_frame_and_commits_artifacts(
         lambda _sources: None,
     )
     segmenter = _FakeSegmenter()
+    if backend == "sam3-service":
+        from deployments.perception.sam3_service import Sam3ServiceLocalizer
+
+        segmenter = Sam3ServiceLocalizer()
+        segmenter.images, segmenter.on_segment = [], None
+        original_segment = segmenter.segment
+
+        def infer(method, kwargs):
+            if method == "healthz":
+                return {"status": "ok"}
+            image = Image.open(io.BytesIO(base64.b64decode(kwargs["image_base64"])))
+            stream = io.BytesIO()
+            Image.new("L", image.size, 255).save(stream, format="PNG")
+            return {"found": True, "score": .95,
+                    "mask_shape": [image.height, image.width],
+                    "mask_png_base64": base64.b64encode(stream.getvalue()).decode()}
+
+        def segment_and_observe(image, **kwargs):
+            result = original_segment(image, **kwargs)
+            segmenter.images.append(image.size)
+            if segmenter.on_segment is not None:
+                segmenter.on_segment()
+            return result
+
+        monkeypatch.setattr(segmenter, "_call", infer)
+        monkeypatch.setattr(segmenter, "segment", segment_and_observe)
     camera = _RealCameraSource()
     source_binding = RealPerceptionSourceBinding(
         camera_sources={"front": camera},
@@ -928,4 +979,9 @@ def test_real_gateway_segments_live_realsense_frame_and_commits_artifacts(
         )
     finally:
         composition.application.close()
-    assert segmenter.closed is True
+    if backend == "fixture":
+        assert segmenter.closed is True
+    else:
+        assert not segmenter.started
+        with pytest.raises(RuntimeError, match="cannot restart"):
+            segmenter.start()

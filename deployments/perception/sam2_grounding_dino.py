@@ -28,6 +28,10 @@ GROUNDING_DINO_REVIEWED_REVISION = "856dde20aee659246248e20734ef9ba5214f5e44"
 MODEL_ASSET_MANIFEST_SCHEMA_V1 = "dexteleop.perception_model_assets.v1"
 
 
+class Sam2PointMaskUnavailable(RuntimeError):
+    """Inference completed, but its best mask did not identify the prompt."""
+
+
 def _required(value: object, *, field_name: str) -> str:
     if not isinstance(value, str) or not value or value != value.strip():
         raise ValueError(f"{field_name} must be a non-empty trimmed string.")
@@ -718,8 +722,10 @@ class Sam2GroundingDinoLocalizer:
             raise RuntimeError("SAM2 returned non-finite point-mask scores.")
         best = int(np.argmax(score_values))
         mask = _sam_binary_mask(masks[best])
-        if mask.shape != (rgb.height, rgb.width) or not bool(mask[v, u]):
-            raise RuntimeError("SAM2 point mask does not contain the requested pixel.")
+        if mask.shape != (rgb.height, rgb.width):
+            raise RuntimeError("SAM2 returned an invalid point mask shape.")
+        if not bool(mask[v, u]):
+            raise Sam2PointMaskUnavailable("SAM2 point mask does not contain the requested pixel.")
         score = min(1.0, max(0.0, float(score_values[best])))
         bounds = _mask_box(mask)
         if bounds is None:

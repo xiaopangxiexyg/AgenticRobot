@@ -633,6 +633,61 @@ def test_cli_rejects_overlong_socket_before_profile_or_hardware_assembly(
     assert "Traceback" not in error
 
 
+@pytest.mark.parametrize("with_reachability", [False, True])
+@pytest.mark.parametrize("localization_backend", ["sam2-grounding-dino", "sam3-service"])
+def test_cli_binds_the_same_localizer_to_perception_and_point_grasp(
+    monkeypatch, tmp_path, short_unix_socket_path_factory, with_reachability, localization_backend,
+):
+    resolved = SimpleNamespace(
+        semantic_content_hash="a" * 64,
+        tool_tcp_pose_flange_m_rad_by_side={
+            "right": gateway_cli.DMTAC_M_REVIEWED_TOOL_TCP_POSE_FLANGE_M_RAD,
+        },
+        scene_world_from_canonical_station=gateway_cli.np.eye(4),
+        scene_world_from_arm_base_by_side={"right": gateway_cli.np.eye(4)},
+    )
+    captured = {}
+    model_spec = object()
+    monkeypatch.setattr(gateway_cli, "resolve_exclusive_rm65_skill_deployment_profile", lambda _: resolved)
+    monkeypatch.setattr(gateway_cli, "assemble_exclusive_rm65_skill_lower", lambda **_: object())
+    monkeypatch.setattr(gateway_cli, "_validate_point_grasp_capture_urdf", lambda *_, **__: None)
+    for name in ("Sam2GroundingDinoModelSpec", "GraspGenXPointGraspModelSpec"):
+        monkeypatch.setattr(gateway_cli, name, SimpleNamespace(from_asset_bundle=lambda _: model_spec))
+    monkeypatch.setattr(gateway_cli, "Sam2GroundingDinoLocalizer", lambda **_: object())
+    monkeypatch.setattr(gateway_cli, "GraspGenXInProcessBackend", lambda **_: object())
+
+    def construct_planner(**kwargs):
+        captured.update(kwargs)
+        return object()
+
+    def stop_before_start(**kwargs):
+        assert kwargs["object_localizer"] is captured["point_segmenter"]
+        assert kwargs["enable_point_grasp_arm_reachability"] is with_reachability
+        if localization_backend == "sam3-service":
+            from deployments.perception.sam3_service import Sam3ServiceLocalizer
+
+            assert isinstance(kwargs["object_localizer"], Sam3ServiceLocalizer)
+            assert kwargs["object_localizer"]._started is False
+        raise RuntimeError("stop before any device startup")
+
+    monkeypatch.setattr(gateway_cli, "Sam2GraspGenXPointGraspPlanner", construct_planner)
+    monkeypatch.setattr(gateway_cli, "assemble_exclusive_rm65_agent_primitive_composition", stop_before_start)
+    argv = _argv(confirmation=REAL_AGENT_PRIMITIVE_SESSION_CONFIRM_TOKEN,
+                 socket_path=short_unix_socket_path_factory("padding-cli"))
+    argv += ["--enable-point-grasp", "--point-grasp-backend", "graspgenx",
+             "--camera-config", str(REPO_ROOT / "pyproject.toml"),
+             "--artifact-root", str(tmp_path),
+             "--point-grasp-asset-bundle", str(tmp_path)]
+    if localization_backend == "sam2-grounding-dino":
+        argv += ["--object-localization-asset-bundle", str(tmp_path)]
+    else:
+        argv += ["--object-localization-backend", "sam3-service"]
+    if with_reachability:
+        argv.append("--enable-point-grasp-arm-reachability")
+    with pytest.raises(RuntimeError, match="stop before any device startup"):
+        gateway_cli.main(argv)
+
+
 def test_cli_assembles_then_reports_ready_and_lower_hold(
     monkeypatch,
     capsys,

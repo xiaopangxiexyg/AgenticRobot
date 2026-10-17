@@ -168,6 +168,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--object-localization-asset-bundle", type=Path)
     parser.add_argument("--object-localization-device", default="cuda")
     parser.add_argument(
+        "--object-localization-backend",
+        choices=("sam2-grounding-dino", "sam3-service"), default="sam2-grounding-dino",
+    )
+    parser.add_argument("--sam3-endpoint", default="http://127.0.0.1:8114")
+    parser.add_argument("--sam3-timeout-sec", type=float, default=120.0)
+    parser.add_argument("--sam3-min-score", type=float, default=0.2)
+    parser.add_argument(
         "--point-grasp-backend",
         choices=tuple(sorted(SUPPORTED_POINT_GRASP_BACKEND_IDS)),
         default=DEFAULT_POINT_GRASP_BACKEND_ID,
@@ -817,11 +824,18 @@ def main(argv: list[str] | None = None) -> int:
             "--enable-point-grasp-arm-reachability requires --enable-point-grasp"
         )
     camera_mount_urdf_arg = _effective_camera_mount_urdf(args)
-    point_grasp_values = (
-        args.object_localization_asset_bundle,
-        args.point_grasp_asset_bundle,
-        camera_mount_urdf_arg,
-    )
+    if args.object_localization_backend == "sam3-service":
+        if not args.enable_point_grasp:
+            parser.error("--object-localization-backend sam3-service requires --enable-point-grasp")
+        if args.object_localization_asset_bundle is not None:
+            parser.error("--object-localization-asset-bundle is invalid with sam3-service")
+        point_grasp_values = (args.point_grasp_asset_bundle, camera_mount_urdf_arg)
+    else:
+        point_grasp_values = (
+            args.object_localization_asset_bundle,
+            args.point_grasp_asset_bundle,
+            camera_mount_urdf_arg,
+        )
     if not args.enable_point_grasp and any(
         value is not None
         for value in (
@@ -834,6 +848,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.enable_point_grasp != all(
         value is not None for value in point_grasp_values
     ):
+        if args.object_localization_backend == "sam3-service":
+            parser.error("SAM3 point grasp requires --point-grasp-asset-bundle and --camera-mount-urdf")
         parser.error(
             "--enable-point-grasp requires --object-localization-asset-bundle, "
             "--point-grasp-asset-bundle, and --camera-mount-urdf; those options "
@@ -974,10 +990,12 @@ def main(argv: list[str] | None = None) -> int:
     object_localizer = None
     point_grasp_planner = None
     if args.enable_point_grasp:
-        object_bundle = _absolute_managed_directory(
-            parser,
-            args.object_localization_asset_bundle,
-            flag="--object-localization-asset-bundle",
+        object_bundle = (
+            _absolute_managed_directory(
+                parser, args.object_localization_asset_bundle,
+                flag="--object-localization-asset-bundle",
+            )
+            if args.object_localization_backend == "sam2-grounding-dino" else None
         )
         point_grasp_bundle = _absolute_managed_directory(
             parser,
@@ -985,13 +1003,18 @@ def main(argv: list[str] | None = None) -> int:
             flag="--point-grasp-asset-bundle",
         )
         try:
-            localization_spec = Sam2GroundingDinoModelSpec.from_asset_bundle(
-                object_bundle
-            )
-            object_localizer = Sam2GroundingDinoLocalizer(
-                model_spec=localization_spec,
-                device=args.object_localization_device,
-            )
+            if args.object_localization_backend == "sam2-grounding-dino":
+                localization_spec = Sam2GroundingDinoModelSpec.from_asset_bundle(object_bundle)
+                object_localizer = Sam2GroundingDinoLocalizer(
+                    model_spec=localization_spec, device=args.object_localization_device,
+                )
+            else:
+                from deployments.perception.sam3_service import Sam3ServiceLocalizer
+
+                object_localizer = Sam3ServiceLocalizer(
+                    endpoint=args.sam3_endpoint, timeout_sec=args.sam3_timeout_sec,
+                    min_score=args.sam3_min_score,
+                )
             if args.point_grasp_backend == "vgn":
                 point_grasp_spec = VgnPointGraspModelSpec.from_asset_bundle(
                     point_grasp_bundle

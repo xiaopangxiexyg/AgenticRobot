@@ -92,7 +92,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--enable-object-localization",
         action="store_true",
-        help="load the reviewed SAM2 + Grounding DINO model bundle before serving",
+        help="enable localization using default SAM2 + Grounding DINO or explicit SAM3 service",
     )
     parser.add_argument(
         "--object-localization-asset-bundle",
@@ -100,10 +100,17 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help=(
             "absolute path to assets/perception/sam2_grounding_dino; required "
-            "when object localization is enabled"
+            "when the default SAM2 localization backend is enabled"
         ),
     )
     parser.add_argument("--object-localization-device", default="cuda")
+    parser.add_argument(
+        "--object-localization-backend",
+        choices=("sam2-grounding-dino", "sam3-service"), default="sam2-grounding-dino",
+    )
+    parser.add_argument("--sam3-endpoint", default="http://127.0.0.1:8114")
+    parser.add_argument("--sam3-timeout-sec", type=float, default=120.0)
+    parser.add_argument("--sam3-min-score", type=float, default=0.2)
     parser.add_argument("--object-localization-box-threshold", type=float, default=0.35)
     parser.add_argument(
         "--object-localization-text-threshold", type=float, default=0.25
@@ -251,29 +258,43 @@ def main(argv: list[str] | None = None) -> int:
             "--point-grasp-backend graspgenx"
         )
     object_localizer = None
+    if args.object_localization_backend == "sam3-service":
+        if not args.enable_object_localization:
+            parser.error("sam3-service requires --enable-object-localization")
+        if args.object_localization_asset_bundle is not None:
+            parser.error("--object-localization-asset-bundle is invalid with sam3-service")
     if args.enable_object_localization:
-        if args.object_localization_asset_bundle is None:
+        if (args.object_localization_backend == "sam2-grounding-dino"
+                and args.object_localization_asset_bundle is None):
             parser.error(
                 "--enable-object-localization requires "
                 "--object-localization-asset-bundle"
             )
-        model_bundle = _absolute_directory(
-            parser,
-            args.object_localization_asset_bundle,
-            flag="--object-localization-asset-bundle",
+        model_bundle = (
+            _absolute_directory(parser, args.object_localization_asset_bundle,
+                                flag="--object-localization-asset-bundle")
+            if args.object_localization_backend == "sam2-grounding-dino" else None
         )
         try:
-            model_spec = Sam2GroundingDinoModelSpec.from_asset_bundle(model_bundle)
-            object_localizer = Sam2GroundingDinoLocalizer(
-                model_spec=model_spec,
-                device=args.object_localization_device,
-                box_threshold=args.object_localization_box_threshold,
-                text_threshold=args.object_localization_text_threshold,
-                automatic_score_threshold=(
-                    args.object_localization_automatic_score_threshold
-                ),
-                nms_iou_threshold=args.object_localization_nms_iou_threshold,
-            )
+            if args.object_localization_backend == "sam2-grounding-dino":
+                model_spec = Sam2GroundingDinoModelSpec.from_asset_bundle(model_bundle)
+                object_localizer = Sam2GroundingDinoLocalizer(
+                    model_spec=model_spec,
+                    device=args.object_localization_device,
+                    box_threshold=args.object_localization_box_threshold,
+                    text_threshold=args.object_localization_text_threshold,
+                    automatic_score_threshold=(
+                        args.object_localization_automatic_score_threshold
+                    ),
+                    nms_iou_threshold=args.object_localization_nms_iou_threshold,
+                )
+            else:
+                from deployments.perception.sam3_service import Sam3ServiceLocalizer
+
+                object_localizer = Sam3ServiceLocalizer(
+                    endpoint=args.sam3_endpoint, timeout_sec=args.sam3_timeout_sec,
+                    min_score=args.sam3_min_score,
+                )
         except (OSError, TypeError, ValueError) as error:
             parser.error(f"invalid object-localization model bundle: {error}")
     point_grasp_planner = None
