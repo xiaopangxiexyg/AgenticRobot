@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import json
 import subprocess
 import sys
@@ -781,23 +783,52 @@ def test_rm65_ports_retry_only_unfinished_backend_close_stage() -> None:
     assert all(len(backend.holds) == 2 for backend in backends.values())
 
 
-def test_rm65_ports_retry_only_unfinished_force_guard_close_stage() -> None:
-    ports, backends, _ = _ports(force_guard_close_failures=1)
+@pytest.mark.parametrize("with_udp", [False, True])
+@pytest.mark.parametrize("guard_failures", [1, 2])
+@pytest.mark.parametrize("backend_failure", [None, "right"])
+def test_rm65_ports_retry_only_unfinished_force_guard_close_stage(with_udp, guard_failures, backend_failure) -> None:
+    ports, backends, _ = _ports(force_guard_close_failures=guard_failures,
+        backend_close_failures={} if backend_failure is None else {backend_failure: 1})
+    receiver_closes = []
+    receiver = SimpleNamespace(start=lambda: None, wait_ready=lambda **kwargs: None,
+        close=lambda: receiver_closes.append("closed"), diagnostics=lambda: {"transport": "udp"})
+    if with_udp:
+        ports.udp_feedback = receiver
+    guard = ports.position_force_guard
     ports.start()
 
-    with pytest.raises(RuntimeError, match="force_guard: RuntimeError"):
-        ports.close()
+    for attempt in range(guard_failures):
+        with pytest.raises(RuntimeError, match="force_guard: RuntimeError"):
+            ports.close()
+        assert ports.resources_started is False
+        assert ports.resources_closed is False
+        assert guard.closes == attempt + 1
+        assert ports._force_guard_started is True
+        assert ports._backend_close_pending == {"left", "right"}
+        assert all(backend.closes == 0 for backend in backends.values())
+        assert receiver_closes == []
+        assert ports._udp_feedback_started is with_udp
+        assert ports.position_force_guard is guard
+        if with_udp:
+            assert ports.udp_feedback is receiver
+        with pytest.raises(RuntimeError, match="cannot restart"):
+            ports.start()
 
-    assert ports.resources_started is False
-    assert ports.resources_closed is False
-    assert ports.position_force_guard.closes == 1
-    assert all(backend.closes == 1 for backend in backends.values())
-
+    if backend_failure is not None:
+        with pytest.raises(RuntimeError, match="right: RuntimeError: right close failed"):
+            ports.close()
+        assert ports._force_guard_started is False
+        assert ports._backend_close_pending == {"right"}
+        assert backends["left"].closes == backends["right"].closes == 1
+        assert receiver_closes == []
     ports.close()
-
+    ports.close()
     assert ports.resources_closed is True
-    assert ports.position_force_guard.closes == 2
-    assert all(backend.closes == 1 for backend in backends.values())
+    assert guard.closes == guard_failures + 1
+    assert backends["left"].closes == 1
+    assert backends["right"].closes == (2 if backend_failure else 1)
+    assert all(len(backend.holds) == 2 for backend in backends.values())
+    assert receiver_closes == (["closed"] if with_udp else [])
 
 
 def test_rm65_ports_do_not_turn_unconfirmed_shutdown_hold_into_success() -> None:
@@ -836,27 +867,46 @@ def test_rm65_ports_start_failure_is_closed_and_not_retryable() -> None:
         ports.start()
 
 
-def test_rm65_ports_start_rollback_keeps_failed_cleanup_retryable() -> None:
-    ports, backends, _ = _ports(
-        force_guard_ready=False,
-        force_guard_close_failures=1,
-    )
-
+@pytest.mark.parametrize("with_udp", [False, True])
+@pytest.mark.parametrize("guard_failures", [1, 2])
+@pytest.mark.parametrize("failure_phase", ["ready", "start"])
+def test_rm65_ports_start_rollback_keeps_failed_cleanup_retryable(with_udp, guard_failures, failure_phase) -> None:
+    ports, backends, _ = _ports(force_guard_ready=False, force_guard_close_failures=guard_failures)
+    guard = ports.position_force_guard
+    if failure_phase == "start":
+        original_start = guard.start
+        def partial_start(**kwargs):
+            original_start(**kwargs)
+            raise RuntimeError("fixture guard partial startup")
+        guard.start = partial_start
+    receiver_closes = []
+    receiver = SimpleNamespace(start=lambda: None, wait_ready=lambda **kwargs: None,
+        close=lambda: receiver_closes.append("closed"), diagnostics=lambda: {"transport": "udp"})
+    if with_udp:
+        ports.udp_feedback = receiver
     with pytest.raises(RuntimeError, match="startup rollback incomplete"):
         ports.start()
-
-    assert ports.resources_started is False
-    assert ports.resources_closed is False
-    assert ports.position_force_guard.closes == 1
-    assert all(backend.closes == 1 for backend in backends.values())
-    with pytest.raises(RuntimeError, match="cannot restart"):
-        ports.start()
-
+    for attempt in range(guard_failures):
+        assert ports.resources_started is False
+        assert ports.resources_closed is False
+        assert guard.closes == attempt + 1
+        assert ports._force_guard_started is True
+        assert ports._backend_close_pending == {"left", "right"}
+        assert all(backend.closes == 0 for backend in backends.values())
+        assert all(backend.holds for backend in backends.values())
+        assert receiver_closes == []
+        assert ports._udp_feedback_started is with_udp
+        with pytest.raises(RuntimeError, match="cannot restart"):
+            ports.start()
+        if attempt + 1 < guard_failures:
+            with pytest.raises(RuntimeError, match="force_guard: RuntimeError"):
+                ports.close()
     ports.close()
-
+    ports.close()
     assert ports.resources_closed is True
-    assert ports.position_force_guard.closes == 2
+    assert guard.closes == guard_failures + 1
     assert all(backend.closes == 1 for backend in backends.values())
+    assert receiver_closes == (["closed"] if with_udp else [])
 
 
 def test_rm65_ports_convert_backend_rejection_to_failed_receipt() -> None:
@@ -1066,3 +1116,46 @@ def test_rm65_factory_binds_every_effect_to_the_same_port_owner() -> None:
         "emergency_stop_controller",
     ):
         assert getattr(kwargs[field_name], "__self__", None) is ports
+
+
+@pytest.mark.parametrize("failure", ["startup", "close", None])
+def test_udp_lifecycle_is_owned_once_and_bad_stream_precedes_sdk_or_hold(failure):
+    ports, backends, _ = _ports()
+    events = ports.position_force_guard.events
+    class Receiver:
+        close_failures = 1 if failure == "close" else 0
+        def start(self):
+            events.append("udp_start")
+        def wait_ready(self, **kwargs):
+            assert kwargs == {"timeout_sec": 2., "max_age_sec": .2}
+            events.append("udp_ready")
+            if failure == "startup":
+                raise RuntimeError("wrong UDP force frame")
+        def close(self):
+            events.append("udp_close")
+            if self.close_failures:
+                self.close_failures -= 1
+                raise RuntimeError("udp close failed")
+        def diagnostics(self):
+            return {"transport": "udp"}
+    ports.udp_feedback = Receiver()
+    if failure == "startup":
+        with pytest.raises(RuntimeError, match="wrong UDP force frame"):
+            ports.start()
+        assert all(backend.starts == 0 and not backend.holds for backend in backends.values())
+        assert ports.position_force_guard.starts == 0
+        assert ports.resources_closed
+    else:
+        ports.start()
+        assert events.index("udp_ready") < events.index("backend_start:left")
+        assert ports.measurement_sampler_snapshot()["udp_feedback"] == {"transport": "udp"}
+        if failure == "close":
+            with pytest.raises(RuntimeError, match="udp close failed"):
+                ports.close()
+            assert not ports.resources_closed
+        ports.close()
+        assert ports.resources_closed
+        assert events.index("force_guard_close") < events.index("udp_close")
+        assert all(backend.closes == 1 for backend in backends.values())
+    assert events.count("udp_start") == 1
+    assert events.count("udp_close") == (2 if failure == "close" else 1)

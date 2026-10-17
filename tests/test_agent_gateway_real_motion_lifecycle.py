@@ -1145,3 +1145,45 @@ def test_real_gateway_session_retries_unconfirmed_close_hold() -> None:
     assert len(session._closed_executor_ids) == len(
         {id(executor) for executor in session.executors_by_skill_id.values()}
     )
+
+
+@pytest.mark.parametrize("lower_reason,reason_code", [
+    ("lower_dispatch_failed", "real_primitive_lower_dispatch_failed"),
+    ("lower_backend_not_ready", "real_primitive_lower_backend_not_ready"),
+    ("exclusive_skill_control_cycle_failed", "real_primitive_lower_control_cycle_failed"),
+])
+def test_real_lifecycle_reports_lower_failure_and_preserves_reason(caplog, lower_reason, reason_code) -> None:
+    bundle, port, _ = _runtime_fixture()
+    clock = _Clock()
+    owner = _OwnerSession()
+    request, operation, route, binding = _request_and_operation(bundle, clock=clock)
+    port.publish_measured_pose(
+        pose_world_by_component={"right_arm": np.eye(4)},
+        measured_at=clock(), available_at=clock(),
+        source_evidence_refs=("real-hardware-cut:before-failed-dispatch",),
+    )
+
+    def owner_sleep(duration):
+        clock.value += duration
+        port.apply_owner_requests(session=owner, now=clock())
+
+    lifecycle = RealAgentPrimitiveSkillLifecycle(
+        port=port, contract_bundle=bundle, route=route, binding=binding,
+        profile=bundle.cardinal_profile, request=request, operation=operation,
+        clock=clock, sleep=owner_sleep,
+    )
+    assert lifecycle.activate(request=request, operation=operation,
+        cancel_requested=lambda: False).succeeded
+    native_reason = lower_reason + ": native failure details"
+    port.request_hold(operation_id=operation.operation_id,
+        reason=native_reason, requested_at=clock())
+    port.apply_owner_requests(session=owner, now=clock())
+    result = lifecycle.run(request=request, operation=operation,
+        cancel_requested=lambda: False)
+    assert not result.succeeded
+    assert result.reason_code == reason_code
+    assert result.terminal_hold_confirmed
+    assert result.execution_result is None
+    assert port.snapshot().hold_reason == native_reason
+    assert native_reason in caplog.text
+    assert len(owner.holds) == 1

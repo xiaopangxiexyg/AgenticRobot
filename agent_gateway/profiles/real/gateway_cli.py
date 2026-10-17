@@ -297,6 +297,10 @@ def build_parser() -> argparse.ArgumentParser:
             "warnings and shutdown diagnostics"
         ),
     )
+    parser.add_argument("--rm65-feedback-source", choices=("sdk", "udp"), default="sdk",
+        help="feedback transport; udp passively consumes existing tool-frame joint/force push; never reconfigures controllers")
+    parser.add_argument("--rm65-udp-port", type=int, default=8090,
+        help="exclusive UDP feedback receive port when feedback-source=udp")
     parser.add_argument("--authorized-side", choices=("left", "right"), required=True)
     parser.add_argument(
         "--authorized-action",
@@ -1003,6 +1007,10 @@ def main(argv: list[str] | None = None) -> int:
             collision_scene_profile=args.collision_scene_profile,
         )
     lower_kwargs: dict[str, object] = {"profile": resolved}
+    if args.rm65_feedback_source == "udp":
+        if not 1 <= args.rm65_udp_port <= 65535:
+            parser.error("--rm65-udp-port must be in 1..65535")
+        lower_kwargs.update(feedback_source="udp", udp_port=args.rm65_udp_port)
     if args.debug_motion_skill:
         lower_kwargs["debug_motion_skill"] = True
     if args.debug_rm65_stream_timing:

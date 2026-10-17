@@ -78,6 +78,7 @@ class Arm:
         port: int = 8080,
         log_level: int = 3,
         thread_mode: rm_thread_mode_e = rm_thread_mode_e.RM_TRIPLE_MODE_E,
+        external_udp_receiver: bool = False,
     ):
         self.dev_mode = dev_mode
         self.ip = ip
@@ -85,7 +86,13 @@ class Arm:
         self._closed = False
         self._realtime_push_callback = None
         self._realtime_push_dispatch = None
-        self._robot = RoboticArm(thread_mode)
+        # A separately owned passive receiver must not compete with the SDK's
+        # process-wide UDP worker/callback for the same controller push port.
+        if not isinstance(external_udp_receiver, bool):
+            raise TypeError("external_udp_receiver must be bool")
+        self._robot = RoboticArm(
+            rm_thread_mode_e.RM_DUAL_MODE_E if external_udp_receiver else thread_mode
+        )
         self._handle = self._robot.rm_create_robot_arm(ip, port, level=log_level)
         self.nSocket = getattr(self._handle, "id", -1)
         if getattr(self._robot, "arm_dof", 0) == 0 and dev_mode == RM65:

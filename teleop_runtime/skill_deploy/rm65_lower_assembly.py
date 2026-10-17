@@ -4,9 +4,12 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
+from functools import partial
 from typing import Protocol
 
 import numpy as np
+
+from hardware.rm65.realtime_feedback import RM65RealtimeFeedback, RM65UDPFeedbackReceiver
 
 from robot_motion.position_control import (
     POSITION_COMMAND_PLANNER_ACCELERATION_LIMITED,
@@ -157,6 +160,7 @@ def _backend_config(
     *,
     side: str,
     debug_rm65_stream_timing: bool = False,
+    udp_feedback_reader: Callable[[], RM65RealtimeFeedback] | None = None,
 ) -> RM65ArmBackendConfig:
     position = profile.position_profile
     command = position.command_execution
@@ -167,6 +171,7 @@ def _backend_config(
             "require a separate Skill-source timing review."
         )
     return RM65ArmBackendConfig(
+        udp_feedback_reader=udp_feedback_reader,
         arm_ip=profile.arm_ip_by_side[side],
         side=side,
         connect_hardware=True,
@@ -265,6 +270,8 @@ def assemble_exclusive_rm65_skill_lower(
     profile: ResolvedExclusiveRM65SkillDeploymentProfile,
     debug_motion_skill: bool = False,
     debug_rm65_stream_timing: bool = False,
+    feedback_source: str = "sdk",
+    udp_port: int = 8090,
     backend_factory: RM65SkillBackendFactory = RM65ArmBackend,
     target_builder_factory: RM65SkillTargetBuilderFactory = (
         DualArmCollisionAwareRetargeter
@@ -278,6 +285,10 @@ def assemble_exclusive_rm65_skill_lower(
 
     if not isinstance(profile, ResolvedExclusiveRM65SkillDeploymentProfile):
         raise TypeError("profile must be resolved and typed.")
+    if feedback_source not in {"sdk", "udp"}:
+        raise ValueError("feedback_source must be sdk or udp")
+    udp_feedback = (RM65UDPFeedbackReceiver(arm_ip_by_side=profile.arm_ip_by_side,
+        port=udp_port) if feedback_source == "udp" else None)
     if not isinstance(debug_motion_skill, bool):
         raise TypeError("debug_motion_skill must be bool.")
     if not isinstance(debug_rm65_stream_timing, bool):
@@ -300,6 +311,7 @@ def assemble_exclusive_rm65_skill_lower(
                 profile,
                 side=side,
                 debug_rm65_stream_timing=debug_rm65_stream_timing,
+                udp_feedback_reader=(None if udp_feedback is None else partial(udp_feedback.snapshot, side)),
             )
         )
         for side in ("left", "right")
@@ -319,6 +331,7 @@ def assemble_exclusive_rm65_skill_lower(
         arm_backends=backends,
         target_builder=target_builder,
         position_force_guard=force_guard,
+        udp_feedback=udp_feedback,
         profile=ExclusiveRM65SkillPortProfile(
             state_refresh_hz=30.0,
             max_measurement_age_sec=(

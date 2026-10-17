@@ -1005,3 +1005,40 @@ def test_cli_assembles_then_reports_ready_and_lower_hold(
     stopped = gateway_cli._stopped_payload(composition)
     assert stopped["safe_shutdown"] is True
     assert stopped["gripper_stop_evidence_refs"] == ["hand-stopped"]
+
+
+@pytest.mark.parametrize("source", ["sdk", "udp"])
+def test_feedback_transport_is_an_explicit_lower_binding(monkeypatch, short_unix_socket_path_factory, source):
+    resolved = SimpleNamespace(semantic_content_hash="a" * 64)
+    monkeypatch.setattr(gateway_cli, "resolve_exclusive_rm65_skill_deployment_profile", lambda profile: resolved)
+    captured = {}
+
+    def assemble(**kwargs):
+        captured.update(kwargs)
+        raise RuntimeError("stop before devices")
+
+    monkeypatch.setattr(gateway_cli, "assemble_exclusive_rm65_skill_lower", assemble)
+    path = short_unix_socket_path_factory("feedback")
+    path.parent.chmod(0o2750)
+    argv = _argv(confirmation=REAL_AGENT_PRIMITIVE_SESSION_CONFIRM_TOKEN, socket_path=path)
+    if source == "udp":
+        argv += ["--rm65-feedback-source", "udp", "--rm65-udp-port", "8090"]
+    with pytest.raises(RuntimeError, match="stop before devices"):
+        gateway_cli.main(argv)
+    assert captured == ({"profile": resolved, "feedback_source": "udp", "udp_port": 8090}
+                        if source == "udp" else {"profile": resolved})
+
+
+
+@pytest.mark.parametrize("port", ["0", "65536"])
+def test_invalid_udp_port_cannot_assemble_resources(monkeypatch, short_unix_socket_path_factory, port):
+    monkeypatch.setattr(gateway_cli, "resolve_exclusive_rm65_skill_deployment_profile",
+                        lambda profile: SimpleNamespace(semantic_content_hash="a" * 64))
+    monkeypatch.setattr(gateway_cli, "assemble_exclusive_rm65_skill_lower",
+                        lambda **kwargs: pytest.fail("invalid port reached device assembly"))
+    path = short_unix_socket_path_factory("bad-udp")
+    path.parent.chmod(0o2750)
+    with pytest.raises(SystemExit) as error:
+        gateway_cli.main(_argv(confirmation=REAL_AGENT_PRIMITIVE_SESSION_CONFIRM_TOKEN, socket_path=path)
+                         + ["--rm65-feedback-source", "udp", "--rm65-udp-port", port])
+    assert error.value.code == 2

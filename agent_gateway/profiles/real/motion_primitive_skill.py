@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import math
 import time
 from collections.abc import Callable, Mapping
@@ -80,6 +81,9 @@ def _grant_hash(grant_id: str | None) -> tuple[str, str]:
     if not normalized.startswith(prefix) or len(normalized) == len(prefix):
         raise ValueError("Real motion requires a content-addressed Skill grant ID.")
     return normalized, normalized.removeprefix(prefix)
+
+
+_LOGGER = logging.getLogger(__name__)
 
 
 class RealAgentPrimitiveSkillLifecycle:
@@ -963,8 +967,17 @@ class RealAgentPrimitiveSkillLifecycle:
                     evidence_refs=current_evidence(),
                 )
             if snapshot.phase != RealAgentMotionPhase.ACTIVE:
+                lower_reason = (snapshot.hold_reason or "").split(":", 1)[0]
+                _LOGGER.error(
+                    "Real primitive lower operation stopped: operation_id=%s phase=%s hold_reason=%s",
+                    operation.operation_id, snapshot.phase.value, snapshot.hold_reason,
+                )
                 return self._failed_execution(
-                    reason_code="real_primitive_lower_not_active",
+                    reason_code={
+                        "lower_dispatch_failed": "real_primitive_lower_dispatch_failed",
+                        "lower_backend_not_ready": "real_primitive_lower_backend_not_ready",
+                        "exclusive_skill_control_cycle_failed": "real_primitive_lower_control_cycle_failed",
+                    }.get(lower_reason, "real_primitive_lower_not_active"),
                     evidence_refs=current_evidence(),
                 )
             cut = self._latest_measured(wait_for_fresh=True)

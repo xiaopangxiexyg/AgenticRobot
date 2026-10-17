@@ -320,3 +320,18 @@ print(json.dumps(sorted(
     )
 
     assert json.loads(completed.stdout) == []
+
+
+@pytest.mark.parametrize("source", ["sdk", "udp"])
+def test_lower_feedback_transport_is_explicit_and_constructs_no_socket(monkeypatch, source):
+    def no_socket(*args, **kwargs):
+        raise AssertionError("assembly construction must not bind/open a UDP socket")
+    monkeypatch.setattr("hardware.rm65.realtime_feedback.socket.socket", no_socket)
+    assembly = assemble_exclusive_rm65_skill_lower(profile=_resolved(monkeypatch),
+        feedback_source=source, udp_port=8090, backend_factory=_Backend,
+        target_builder_factory=lambda config: _TargetBuilder(),
+        force_guard_factory=lambda backends: _ForceGuard())
+    assert (assembly.ports.udp_feedback is not None) == (source == "udp")
+    for backend in assembly.arm_backends.values():
+        assert (backend.config.udp_feedback_reader is not None) == (source == "udp")
+        assert backend.starts == 0

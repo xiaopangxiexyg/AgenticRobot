@@ -20,6 +20,14 @@ POSITION_REFERENCE_DISPATCH_AUDIT_CHOICES = (
 )
 
 
+class PositionDispatchNotReady(RuntimeError):
+    """A rejected readiness cut, retained for lower-owned recovery decisions."""
+
+    def __init__(self, message: str, *, health: Mapping[str, Any]) -> None:
+        super().__init__(message)
+        self.health = health
+
+
 # Real-launcher boundary:
 # This file should NOT move to robot_motion. robot_motion should own common
 # action/deploy preparation up to TeleopCommand. teleop_runtime owns dispatching
@@ -327,8 +335,9 @@ def require_arm_backends_ready_for_position_dispatch(
                 failures.append(failure)
         if not failures:
             failures.append("no_arm_backends")
-        raise RuntimeError(
-            f"position deploy arm stream is not ready at {stage}: " + "; ".join(failures)
+        raise PositionDispatchNotReady(
+            f"position deploy arm stream is not ready at {stage}: " + "; ".join(failures),
+            health=health,
         )
     return health
 

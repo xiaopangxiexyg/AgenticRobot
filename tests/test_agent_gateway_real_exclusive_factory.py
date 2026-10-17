@@ -38,6 +38,7 @@ from robot_motion.coordinate_frames import (
 )
 from robot_motion.coordinate_profiles import STATION_RETARGET_FRAME_CONTRACT_V1
 from robot_motion.runtime import EffectorCommand, TeleopCommand, TeleopObservation
+from teleop_runtime.deploy.dispatch import PositionDispatchNotReady
 from teleop_runtime.skill_deploy import (
     RealAgentMotionPortConfig,
     RealSkillMotionDispatchReceipt,
@@ -578,3 +579,29 @@ def test_application_ready_hook_and_shutdown_request_preserve_close_owner() -> N
     assert deployment.control_runtime.last_hold_receipt.succeeded is True
     assert resources.closes == 1
     assert holds
+
+
+@pytest.mark.parametrize("error_type,expected_prefix", [
+    (PositionDispatchNotReady, "lower_backend_not_ready"),
+    (RuntimeError, "exclusive_skill_control_cycle_failed"),
+])
+def test_control_fault_retains_typed_cause_without_misclassifying_other_faults(
+    monkeypatch, error_type, expected_prefix,
+):
+    deployment = _deployment(observation_provider=_fresh_observation_cut, hold_reasons=[])
+    application = ExclusiveRealSkillApplication(
+        deployment=deployment, resources=_Resources(),
+        startup_admission=lambda: {"startup": "admitted"}, server_factory=_Server,
+    )
+    holds = []
+
+    def failed_step():
+        if error_type is PositionDispatchNotReady:
+            raise error_type("native cause with\nnew line", health={})
+        raise error_type("native cause with\nnew line")
+
+    monkeypatch.setattr(deployment.control_runtime, "step", failed_step)
+    monkeypatch.setattr(deployment.control_runtime, "fail_closed", holds.append)
+    application._run_control_loop()
+    assert holds == [expected_prefix + ": native cause with new line"]
+    assert isinstance(application.control_fault, error_type)

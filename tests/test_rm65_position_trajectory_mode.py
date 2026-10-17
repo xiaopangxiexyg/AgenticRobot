@@ -1802,3 +1802,37 @@ def test_disengage_position_stream_stops_once_and_withdraws_hold_target() -> Non
     assert arm.slow_stop_calls == 1
 
     backend.close()
+
+
+@pytest.mark.parametrize("origin", ["manual_hold", "expired_tracking"])
+def test_persistent_quick_stop_reaches_sdk_after_source_age_limit(monkeypatch, origin):
+    clock = [100.0]
+    monkeypatch.setattr("teleop_runtime.backends.arms.rm65.time.monotonic", lambda: clock[0])
+    backend, arm = _backend(target_max_age_sec=.1)
+    if origin == "expired_tracking":
+        backend.send_command(_command(.05))
+        clock[0] += .2
+        assert backend._expire_stale_stream_target(now_monotonic=clock[0])
+    else:
+        with backend._state_lock:
+            backend._activate_stream_quick_stop_locked(reason="manual_hold:test",
+                monotonic_time=clock[0], source="manual_hold")
+    held_qpos = backend.get_state()["last_accepted_qpos"].copy()
+    clock[0] += 20.0
+    events = []
+
+    def sink(event):
+        events.append(event)
+        backend._stream_stop_event.set()
+
+    backend.set_position_audit_sink(sink)
+    backend._stream_stop_event.clear()
+    backend._background_stream_loop_impl()
+    event, = events
+    assert event.sdk_attempted and event.sdk_accepted
+    assert event.metadata["transport_block_reason"] is None
+    assert len(arm.sent_joint_deg) == 1
+    np.testing.assert_allclose(np.deg2rad(arm.sent_joint_deg[0]), held_qpos, atol=1e-12)
+    stream = backend.get_state()["background_streaming"]
+    assert stream["quick_stop_active"] and not stream["target_stale"]
+    assert "low_send_rate" not in stream["health_reasons"]

@@ -20,6 +20,7 @@ from typing import Any, Protocol
 import numpy as np
 
 from dataset_contracts.canonical_encoding import canonical_content_hash
+from hardware.rm65.realtime_feedback import RM65UDPFeedbackReceiver
 from robot_motion.runtime import TeleopCommand, TeleopObservation
 from teleop_runtime.deploy.arm_safety_runtime import (
     bimanual_emergency_stop,
@@ -318,6 +319,7 @@ class ExclusiveRM65SkillDeployPorts:
         position_force_guard: RM65SkillPositionForceGuard,
         profile: ExclusiveRM65SkillPortProfile | None = None,
         clock: Callable[[], float] = time.time,
+        udp_feedback: RM65UDPFeedbackReceiver | None = None,
     ) -> None:
         backends = dict(arm_backends)
         if set(backends) != {"left", "right"}:
@@ -342,6 +344,9 @@ class ExclusiveRM65SkillDeployPorts:
         self.position_force_guard = position_force_guard
         self.profile = profile or ExclusiveRM65SkillPortProfile()
         self.clock = clock
+        self.udp_feedback = udp_feedback
+        self._udp_feedback_started = False
+        self._backend_start_attempted = False
         measurement_refresh_executor = (
             ThreadPoolExecutor(
                 max_workers=2,
@@ -576,8 +581,16 @@ class ExclusiveRM65SkillDeployPorts:
                     raise RuntimeError("closed RM65 Skill resources cannot restart.")
                 self._start_attempted = True
             try:
+                if self.udp_feedback is not None:
+                    # Bind/wait before SDK attachment: a occupied port, stale
+                    # stream or wrong force frame must never start motion/HOLD.
+                    self._udp_feedback_started = True
+                    self.udp_feedback.start()
+                    self.udp_feedback.wait_ready(timeout_sec=2.,
+                        max_age_sec=self.profile.max_measurement_age_sec)
                 for side in ("left", "right"):
                     backend = self.arm_backends[side]
+                    self._backend_start_attempted = True
                     backend.start()
                     if not backend.is_ready():
                         raise RuntimeError(f"{side} RM65 backend is not ready.")
@@ -608,7 +621,8 @@ class ExclusiveRM65SkillDeployPorts:
                     self._resources_started = False
                     self._closing = True
                 cleanup_errors = self._attempt_resource_shutdown(
-                    reason="exclusive real Skill resource startup rollback"
+                    reason="exclusive real Skill resource startup rollback",
+                    request_hold=self._backend_start_attempted,
                 )
                 self._finish_resource_shutdown()
                 if cleanup_errors:
@@ -638,7 +652,8 @@ class ExclusiveRM65SkillDeployPorts:
                 self._resources_started = False
                 self._closing = True
             errors = self._attempt_resource_shutdown(
-                reason="exclusive real Skill resource shutdown"
+                reason="exclusive real Skill resource shutdown",
+                request_hold=self._backend_start_attempted,
             )
             self._finish_resource_shutdown()
             if errors:
@@ -647,11 +662,11 @@ class ExclusiveRM65SkillDeployPorts:
                     + "; ".join(errors)
                 )
 
-    def _attempt_resource_shutdown(self, *, reason: str) -> list[str]:
+    def _attempt_resource_shutdown(self, *, reason: str, request_hold: bool = True) -> list[str]:
         """Attempt each owned stage once, retaining only failed stages."""
 
         errors: list[str] = []
-        if not self._shutdown_hold_attempted:
+        if request_hold and not self._shutdown_hold_attempted:
             self._shutdown_hold_attempted = True
             hold_receipt = self.hold(reason)
             self._shutdown_hold_confirmed = bool(hold_receipt.succeeded)
@@ -679,13 +694,17 @@ class ExclusiveRM65SkillDeployPorts:
         if measurement_refresh_executor_stopped and self._force_guard_started:
             try:
                 self.position_force_guard.close()
-            except Exception as exc:  # noqa: BLE001 - still close both arms.
+            except Exception as exc:  # noqa: BLE001 - retain live monitor dependencies.
                 errors.append(f"force_guard: {type(exc).__name__}: {exc}")
             else:
                 self._force_guard_started = False
 
+        # A failed monitor close can leave SDK readers/watchdog callbacks alive.
+        # Preserve both backend owners until that exact monitor confirms stop.
         for side in (
-            ("right", "left") if measurement_refresh_executor_stopped else ()
+            ("right", "left")
+            if measurement_refresh_executor_stopped and not self._force_guard_started
+            else ()
         ):
             if side not in self._backend_close_pending:
                 continue
@@ -695,6 +714,14 @@ class ExclusiveRM65SkillDeployPorts:
                 errors.append(f"{side}: {type(exc).__name__}: {exc}")
             else:
                 self._backend_close_pending.remove(side)
+        if (measurement_refresh_executor_stopped and not self._force_guard_started
+                and not self._backend_close_pending and self._udp_feedback_started):
+            try:
+                self.udp_feedback.close()
+            except Exception as exc:  # noqa: BLE001 - retain unfinished owner for retry.
+                errors.append(f"udp_feedback: {type(exc).__name__}: {exc}")
+            else:
+                self._udp_feedback_started = False
         return errors
 
     def _finish_resource_shutdown(self) -> None:
@@ -704,6 +731,7 @@ class ExclusiveRM65SkillDeployPorts:
             self._measurement_refresh_executor_shutdown
             and not self._force_guard_started
             and not self._backend_close_pending
+            and not self._udp_feedback_started
         )
         with self._resource_lock:
             self._resources_started = False
@@ -864,6 +892,8 @@ class ExclusiveRM65SkillDeployPorts:
         now = float(self.clock())
         return {
             "enabled": self.profile.background_measurement_sampling,
+            **({"udp_feedback": self.udp_feedback.diagnostics()}
+               if self.udp_feedback is not None else {}),
             "thread_alive": bool(
                 self._measurement_thread is not None
                 and self._measurement_thread.is_alive()

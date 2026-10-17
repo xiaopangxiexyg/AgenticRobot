@@ -989,6 +989,19 @@ action is the distinct `execute_grasp_approach_plan`; authorizing the legacy
 阶段在当前模型下通过”，不是“完整抓取链通过”；不能据此自动闭合、试抬
 或搬运。后续这些阶段必须有独立的场景/夹爪状态和接触规则证据后才可开放。
 
+#### 可选被动 UDP 反馈
+
+现有真机 Gateway 可用 `--rm65-feedback-source udp --rm65-udp-port 8090` 显式接入
+控制器已有的双臂关节与工具坐标系力反馈；默认仍为 SDK。该模式只接收数据，
+不修改控制器推送配置，也不在 UDP 失败时切回 SDK 或与 SDK 回调争抢同一端口。
+接收端在两臂 SDK 连接及启动 HOLD 前独占绑定端口，确认双臂反馈新鲜、无错误、
+关节已使能且力坐标为 tool；端口占用或就绪失败直接拒绝启动。
+接收端要求 Linux 64 位内核时间戳支持。测量序号只随新包推进，保留内核接收时间
+（不是控制器采集时间）；重复读取不会刷新测量年龄，
+已有状态/力反馈过期门禁仍负责拒绝派发与停机。
+关闭时先确认测量采样与力监控停止，再释放两臂 backend，最后释放 UDP 接收端；
+关闭失败保留尚被引用的资源并允许重试。SDK 尚未启动时的失败清理不会产生 HOLD。
+
 #### 可选右夹爪接入
 
 `real-rm65 --right-gripper-config /absolute/right-gripper.json` 使用既有

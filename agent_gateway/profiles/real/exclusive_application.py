@@ -10,6 +10,8 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Protocol
 
+from teleop_runtime.deploy.dispatch import PositionDispatchNotReady
+
 from .exclusive_factory import ExclusiveRealAgentPrimitiveDeployment
 
 
@@ -207,8 +209,14 @@ class ExclusiveRealSkillApplication:
                 self.deployment.control_runtime.step()
             except BaseException as exc:  # noqa: BLE001 - fail closed then stop.
                 try:
+                    reason = (
+                        "lower_backend_not_ready"
+                        if isinstance(exc, PositionDispatchNotReady)
+                        else "exclusive_skill_control_cycle_failed"
+                    )
+                    diagnostic = " ".join(str(exc).split())[:512]
                     self.deployment.control_runtime.fail_closed(
-                        "exclusive_skill_control_cycle_failed"
+                        reason + (f": {diagnostic}" if diagnostic else "")
                     )
                 except BaseException as hold_exc:  # noqa: BLE001
                     exc = RuntimeError(

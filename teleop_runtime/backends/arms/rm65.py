@@ -11,6 +11,8 @@ from uuid import uuid4
 import numpy as np
 import time
 
+from hardware.rm65.realtime_feedback import RM65RealtimeFeedback
+
 from hardware.rm65.calibration_profiles import (
     ARM_ENDPOINT_TCP_POSE_FLANGE_M_RAD,
     is_position_endpoint_profile,
@@ -658,8 +660,11 @@ class RM65ArmBackendConfig:
     # Deployment-only live observation shadow.  Kept at the end of the public
     # init fields so legacy positional construction keeps its old meaning.
     observation_only: bool = False
+    udp_feedback_reader: Callable[[], RM65RealtimeFeedback] | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
+        if self.udp_feedback_reader is not None and not callable(self.udp_feedback_reader):
+            raise TypeError("udp_feedback_reader must be callable or None")
         if self.effector_name is None:
             self.effector_name = f"{self.side}_arm"
         if bool(self.observation_only):
@@ -1015,6 +1020,8 @@ class RM65ArmBackend(EffectorBackend):
         pose_source_instance_id: str | None = None,
     ):
         self.config = config
+        self._udp_feedback_reader = config.udp_feedback_reader
+        self._udp_feedback_sequence = 0
         self._hardware_idle_worker_preflight_binding_id: str | None = None
         if hardware_idle_worker_preflight_binding is not None:
             from .rm65_idle_worker_preflight_binding import (
@@ -2769,6 +2776,8 @@ class RM65ArmBackend(EffectorBackend):
             raise RuntimeError(
                 "realtime push observation requires an observation-only backend"
             )
+        if self._udp_feedback_reader is not None:
+            raise RuntimeError("External UDP feedback already owns reception; SDK callback registration is forbidden")
         if not callable(callback):
             raise TypeError("callback must be callable")
         arm = self.arm
@@ -2855,7 +2864,10 @@ class RM65ArmBackend(EffectorBackend):
         attachment_endpoint = str(self.config.arm_ip).strip()
         if not attachment_endpoint:
             raise ValueError("RM65 arm_ip must be non-empty before attachment.")
-        self.arm = Arm(RM65, attachment_endpoint)
+        self.arm = (
+            Arm(RM65, attachment_endpoint, external_udp_receiver=True)
+            if self._udp_feedback_reader is not None else Arm(RM65, attachment_endpoint)
+        )
         try:
             self._begin_pose_source_epoch(
                 attachment_endpoint=attachment_endpoint,
@@ -6359,6 +6371,12 @@ class RM65ArmBackend(EffectorBackend):
                                             self.config.background_streaming_target_max_age_sec
                                         ),
                                     )
+                                # A lower-owned quick stop holds/decelerates the
+                                # accepted command; it is not an ageing source
+                                # motion target. Match _expire_stale_stream_target
+                                # so persistent HOLD still reaches the SDK.
+                                if self._stream_quick_stop_active:
+                                    current_target_stale = False
                                 if current_target_stale:
                                     # The target was valid when the planner
                                     # sampled it but expired while waiting for
@@ -7204,6 +7222,36 @@ class RM65ArmBackend(EffectorBackend):
                 ),
                 include_background_streaming=bool(include_background_streaming),
             )
+        if self._udp_feedback_reader is not None:
+            sample = self._read_udp_feedback()
+            # Multiple observers may read one packet; they must not advance
+            # measurement identity or renew its age on repeated cache reads.
+            with self._state_lock:
+                if sample.sequence > self._udp_feedback_sequence:
+                    qpos = _joint_now_to_qpos(sample.joint_deg)
+                    if qpos is None:
+                        raise RuntimeError("UDP joint feedback is not a valid six-joint observation")
+                    self._udp_feedback_sequence = sample.sequence
+                    self._hardware_read_sequence += 1
+                    self._last_hardware_read_time = sample.wall_time_sec
+                    self._last_hardware_read_monotonic = sample.monotonic_time_sec
+                    self._last_hardware_read_success = True
+                    self._last_hardware_result_code = 0
+                    self._last_hardware_result_text = "udp_kernel_feedback"
+                    self._last_hardware_arm_err = self._last_hardware_sys_err = 0
+                    self._last_hardware_pose_6d = np.asarray(sample.pose_6d)
+                    self._last_hardware_refresh_time = sample.wall_time_sec
+                    self._last_hardware_read_phase_timing = {"sdk_call_wall_ms": 0.,
+                        "udp_receive_age_ms": max(0., time.monotonic() - sample.monotonic_time_sec) * 1000.}
+                    self._record_measured_qpos_locked(qpos, timestamp=sample.wall_time_sec,
+                        monotonic_time=sample.monotonic_time_sec)
+                    self._hardware_ready = True
+                    self._hardware_ready_source = "udp_kernel_feedback"
+            return self.get_state(include_derived_pose=bool(include_derived_pose),
+                include_timing_percentiles=bool(include_timing_percentiles),
+                include_pose_source_attestation=include_pose_source_attestation,
+                include_background_streaming=bool(include_background_streaming))
+
         priority = str(hardware_read_priority or "normal").strip().lower()
         if priority not in {"normal", "background"}:
             raise ValueError(
@@ -7406,11 +7454,37 @@ class RM65ArmBackend(EffectorBackend):
         }
         return state
 
+    def _read_udp_feedback(self) -> RM65RealtimeFeedback:
+        reader = self._udp_feedback_reader
+        if reader is None:
+            raise RuntimeError("UDP feedback is not bound")
+        sample = reader()
+        if not isinstance(sample, RM65RealtimeFeedback):
+            raise TypeError("UDP reader must return RM65RealtimeFeedback")
+        if sample.side != self.config.side or sample.controller_ip != self.config.arm_ip:
+            raise RuntimeError("UDP feedback side/controller identity differs from this backend")
+        sample.require_healthy()
+        # Another observer can publish a newer packet after this snapshot was
+        # taken. That is not stream regression; keep this cut's original age.
+        # The state writer below admits only newer sequences under its lock.
+        return sample
+
+
     def read_force_data(self) -> dict[str, object]:
         """Read one validated RM65 force sample from this backend connection."""
 
         if self.arm is None:
             raise RuntimeError(f"{self.name} RM65 force read requires a hardware connection")
+        if self._udp_feedback_reader is not None:
+            snapshot_started = time.monotonic()
+            sample = self._read_udp_feedback()
+            read_elapsed_sec = max(0., time.monotonic() - snapshot_started)
+            return {"sources": sample.force_sources(), "wall_time_sec": sample.wall_time_sec,
+                "monotonic_time_sec": sample.monotonic_time_sec, "read_elapsed_sec": read_elapsed_sec,
+                "result_code": 0, "result_text": "udp_kernel_feedback",
+                "transport": "udp", "feedback_sequence": sample.sequence,
+                "read_phase_timing": {"sdk_call_wall_ms": 0., "udp_snapshot_wall_ms": read_elapsed_sec * 1000.}}
+
         started_monotonic = time.monotonic()
         read_wall_started = time.perf_counter()
         read_cpu_started = time.thread_time()

@@ -62,6 +62,7 @@ from teleop_runtime.deploy.position_stream_handoff import (
 from teleop_runtime.deploy.dispatch import (
     POSITION_REFERENCE_DISPATCH_AUDIT_FULL,
     POSITION_REFERENCE_DISPATCH_AUDIT_POST,
+    PositionDispatchNotReady,
     dispatch_position_reference_command,
     dispatch_teleop_command,
     inspect_arm_backends_for_position_dispatch,
@@ -3615,12 +3616,15 @@ def test_position_dispatch_blocks_low_send_rate_warning() -> None:
     assert health["sides"]["left"]["reasons"] == ["background_unhealthy"]
     assert health["sides"]["left"]["warnings"] == ["low_send_rate"]
 
-    with pytest.raises(RuntimeError, match="left=background_unhealthy"):
+    with pytest.raises(RuntimeError, match="left=background_unhealthy") as failure:
         require_arm_backends_ready_for_position_dispatch(
             backends,
             require_background_target=True,
             stage="pre_arm_reference_queue",
         )
+    assert isinstance(failure.value, PositionDispatchNotReady)
+    assert failure.value.health["ready"] is False
+    assert failure.value.health["sides"]["left"]["reasons"] == ["background_unhealthy"]
 
 
 def test_position_dispatch_rejects_unknown_background_unhealthy_state() -> None:
