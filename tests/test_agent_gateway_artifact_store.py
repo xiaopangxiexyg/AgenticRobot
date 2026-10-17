@@ -434,6 +434,8 @@ def test_operation_pin_and_materialization_gate_gc(tmp_path: Path) -> None:
         )
         with pytest.raises(ArtifactStoreConflictError, match="not available"):
             store.managed_read_path(artifact.artifact_id)
+        with pytest.raises(ArtifactStoreConflictError, match="not available"):
+            store.read_bytes(artifact, maximum=1024)
 
 
 def test_without_materialization_output_survives_until_handoff_deadline(
@@ -487,3 +489,101 @@ def test_expired_staging_is_aborted_and_reclaims_its_private_inode(
         report = store.garbage_collect(now=31.0)
         assert report.aborted_upload_ids == (lease.upload_id,)
         assert store.upload(lease.upload_id).state == "aborted"
+
+
+@pytest.mark.parametrize("data", [b"", b"one-pass", b"x" * 32])
+def test_verified_bytes_read_opens_once_and_retains_no_sidecar(tmp_path, monkeypatch, data):
+    import agent_gateway.runtime.artifact_store as module
+
+    with _store(tmp_path / "store") as store:
+        artifact = _upload(store, data=data)
+        path = store.managed_read_path(artifact.artifact_id)
+        files = set(store.root.rglob("*"))
+        opened = []
+        original_open = os.open
+        def counted(path, flags, *args, **kwargs):
+            opened.append(Path(path))
+            return original_open(path, flags, *args, **kwargs)
+        monkeypatch.setattr(os, "open", counted)
+        monkeypatch.setattr(module, "_sha256_file", lambda _: pytest.fail("second file traversal"))
+        for _ in range(3):
+            assert store.read_bytes(artifact, maximum=max(1, len(data))) == data
+        assert opened == [path] * 3
+        assert set(store.root.rglob("*")) == files
+        if data:
+            with pytest.raises(ValueError, match="consumer byte bound"):
+                store.read_bytes(artifact, maximum=len(data)-1)
+            assert opened == [path] * 3
+
+
+@pytest.mark.parametrize("replacement", [b"bad-data", b"short", b"longer-than-expected"])
+def test_verified_bytes_quarantines_size_and_digest_corruption(tmp_path, replacement):
+    with _store(tmp_path / "store") as store:
+        artifact = _upload(store, data=b"original")
+        path = store.managed_read_path(artifact.artifact_id)
+        path.chmod(0o600)
+        path.write_bytes(replacement)
+        with pytest.raises(ArtifactStoreIntegrityError, match="failed verification"):
+            store.read_bytes(artifact, maximum=1024)
+        assert store.artifact(artifact.artifact_id).state == "quarantined"
+        with pytest.raises(ArtifactStoreConflictError, match="not available"):
+            store.read_bytes(artifact, maximum=1024)
+
+
+@pytest.mark.parametrize("maximum", [True, 0, -1, 1.5])
+def test_verified_bytes_rejects_invalid_limits_before_open(tmp_path, monkeypatch, maximum):
+    with _store(tmp_path / "store") as store:
+        artifact = _upload(store, data=b"original")
+        monkeypatch.setattr(os, "open", lambda *a, **kw: pytest.fail("opened before byte-bound validation"))
+        with pytest.raises((TypeError, ValueError), match="maximum"):
+            store.read_bytes(artifact, maximum=maximum)
+
+
+@pytest.mark.parametrize("mutation", ["truncate", "grow", "overwrite"])
+def test_verified_bytes_rejects_mutation_during_the_read(tmp_path, monkeypatch, mutation):
+    with _store(tmp_path / "store") as store:
+        artifact = _upload(store, data=b"original")
+        path = store.managed_read_path(artifact.artifact_id)
+        path.chmod(0o600)
+        original_fdopen = os.fdopen
+        class MutatingReader:
+            def __init__(self, descriptor, *args, **kwargs):
+                self.stream = original_fdopen(descriptor, *args, **kwargs)
+            def __enter__(self):
+                return self
+            def __exit__(self, *args):
+                self.stream.close()
+            def read(self, maximum):
+                if mutation == "truncate":
+                    path.write_bytes(b"short")
+                elif mutation == "overwrite":
+                    path.write_bytes(b"bad-data")
+                data = self.stream.read(maximum)
+                if mutation == "grow":
+                    with path.open("ab") as writer:
+                        writer.write(b"more")
+                return data
+        monkeypatch.setattr(os, "fdopen", MutatingReader)
+        with pytest.raises(ArtifactStoreIntegrityError, match="failed verification"):
+            store.read_bytes(artifact, maximum=1024)
+        assert store.artifact(artifact.artifact_id).state == "quarantined"
+
+
+@pytest.mark.parametrize("kind", ["symlink", "directory", "fifo"])
+def test_verified_bytes_never_reads_non_regular_blob_paths(tmp_path, kind):
+    with _store(tmp_path / "store") as store:
+        artifact = _upload(store, data=b"original")
+        path = store.managed_read_path(artifact.artifact_id)
+        # Move this test-owned file aside; never overwrite an external target.
+        original = path.with_name(path.name + ".original")
+        path.rename(original)
+        if kind == "symlink":
+            path.symlink_to(original)
+        elif kind == "directory":
+            path.mkdir()
+        else:
+            if not hasattr(os, "mkfifo"):
+                pytest.skip("FIFO paths require POSIX")
+            os.mkfifo(path)
+        with pytest.raises((OSError, ArtifactStoreIntegrityError)):
+            store.read_bytes(artifact, maximum=1024)

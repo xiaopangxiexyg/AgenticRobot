@@ -12,7 +12,6 @@ from contextlib import nullcontext
 import numpy as np
 
 import logging
-import hashlib
 import math
 import threading
 import time
@@ -54,8 +53,10 @@ from agent_gateway.skills.perception.grasp_approach_plan_schemas import (
 )
 from agent_gateway.skills.perception.schemas import validate_no_task_evaluation_v1
 from dataset_contracts.canonical_encoding import canonical_content_hash
-from dataset_contracts.grasp_rgbd_snapshot import decode_grasp_rgbd_snapshot
-from dataset_contracts.grasp_multiview_snapshot import GRASP_MULTIVIEW_SCHEMA_ID, decode_grasp_multiview_snapshot_arrays
+from dataset_contracts.grasp_rgbd_snapshot import GRASP_RGBD_SNAPSHOT_MAX_BYTES, decode_grasp_rgbd_snapshot
+from dataset_contracts.grasp_multiview_snapshot import (
+    GRASP_MULTIVIEW_MAX_BYTES, GRASP_MULTIVIEW_SCHEMA_ID, decode_grasp_multiview_snapshot_arrays,
+)
 from robot_motion.grasp_visible_scene import (
     PRODUCTION_VISIBLE_GRASP_DEPTH_FILTER,
     ParallelJawSolidGeometry,
@@ -100,10 +101,9 @@ def build_grasp_visible_scene_reader(*, artifact_store: RecoverableAgentArtifact
         if len(bindings) != 1:
             raise ValueError("point-grasp has no unique RGB-D snapshot Artifact")
         artifact = bindings[0].artifact
-        data = artifact_store.managed_read_path(artifact.artifact_id).read_bytes()
-        if len(data) != artifact.byte_length or hashlib.sha256(data).hexdigest() != artifact.sha256:
-            raise ValueError("point-grasp snapshot Artifact identity changed")
         multiview = artifact.schema_id == GRASP_MULTIVIEW_SCHEMA_ID
+        data = artifact_store.read_bytes(artifact, maximum=(
+            GRASP_MULTIVIEW_MAX_BYTES if multiview else GRASP_RGBD_SNAPSHOT_MAX_BYTES))
         if multiview:
             views, metadata, scene_points, scene_labels = decode_grasp_multiview_snapshot_arrays(data)
             if scene_points is None or metadata.get("scene_frame") != "anchor_camera":

@@ -1015,6 +1015,7 @@ def test_graspgenx_capture_snapshot_artifact_is_replayed_through_real_profile(
         return
     changed = copy.deepcopy(result.execution_result)
     expected_error = "capture differ"
+    expected_exception = ValueError
     if mutation == "station_revision":
         changed[mutation] += 1
     elif mutation == "target_pixel_uv":
@@ -1037,14 +1038,18 @@ def test_graspgenx_capture_snapshot_artifact_is_replayed_through_real_profile(
             if mutation == "snapshot_length"
             else original[:-1] + bytes([original[-1] ^ 1])
         )
-        monkeypatch.setattr(store, "managed_read_path", lambda _artifact_id: corrupted)
-        expected_error = "Artifact identity changed"
+        # Integrity belongs to the one-open store read, not a second read of
+        # a previously verified path. Keep the immutable original CAS intact.
+        monkeypatch.setattr(store, "_blob_path", lambda _sha256: corrupted)
+        from agent_gateway.runtime.artifact_store import ArtifactStoreIntegrityError
+        expected_exception = ArtifactStoreIntegrityError
+        expected_error = "failed verification"
     else:
         assert mutation == "missing_snapshot"
         retained = replace(retained, output_artifact_bindings=())
         expected_error = "no unique RGB-D snapshot"
     retained = replace(retained, execution_result=changed)
-    with pytest.raises(ValueError, match=expected_error):
+    with pytest.raises(expected_exception, match=expected_error):
         reader(retained, retained.execution_result)
 
 

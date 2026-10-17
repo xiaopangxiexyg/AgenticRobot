@@ -36,8 +36,6 @@ from dataset_contracts.perception_artifacts import (
     RGB_FRAME_SCHEMA_ID_V1, RGB_FRAME_ENCODING_V1, RGB_FRAME_COMPRESSION_V1,
 )
 
-from .localization_gateway import read_bounded_regular_file
-
 OBSERVATION_SLOT = "grasp_observation"
 
 
@@ -276,10 +274,7 @@ def read_retained_grasp_observation(*, executor, operation_id, artifact_store, r
     if len(bindings) != 1:
         raise ValueError("Grasp observation lacks a unique retained Artifact")
     artifact = bindings[0].artifact
-    data = read_bounded_regular_file(artifact_store.managed_read_path(artifact.artifact_id),
-                                     maximum=artifact.byte_length)
-    if len(data) != artifact.byte_length or hashlib.sha256(data).hexdigest() != artifact.sha256:
-        raise ValueError("Retained grasp observation changed")
+    data = artifact_store.read_bytes(artifact, maximum=GRASP_MULTIVIEW_MAX_BYTES)
     decoder = decode_grasp_multiview_snapshot_arrays if decode_arrays else decode_grasp_multiview_snapshot
     views, metadata, points, _ = decoder(data)
     if (metadata.get("runtime_session_id") != runtime_session_id

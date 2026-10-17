@@ -265,13 +265,8 @@ class PointGraspProvider:
         ):
             raise ValueError("Point-grasp depth Artifact identity is invalid.")
         return (
-            read_bounded_regular_file(
-                store.managed_read_path(rgb.artifact_id), maximum=profile.max_rgb_bytes
-            ),
-            read_bounded_regular_file(
-                store.managed_read_path(depth.artifact_id),
-                maximum=profile.max_depth_bytes,
-            ),
+            store.read_bytes(rgb, maximum=profile.max_rgb_bytes),
+            store.read_bytes(depth, maximum=profile.max_depth_bytes),
             rgb.media_type,
         )
 

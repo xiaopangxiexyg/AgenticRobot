@@ -205,6 +205,7 @@ def test_local_path_mode_is_bounded_to_explicit_test_root(tmp_path: Path) -> Non
 def test_artifact_mode_reads_committed_bytes_and_preserves_prompt(
     tmp_path: Path,
     input_schema_id: str,
+    monkeypatch,
 ) -> None:
     data = _jpeg_bytes()
     registration = _registration(local_path_enabled=False)
@@ -246,7 +247,16 @@ def test_artifact_mode_reads_committed_bytes_and_preserves_prompt(
             ),
         )
 
+        path = store.managed_read_path(committed.artifact_id)
+        monkeypatch.setattr(store, "managed_read_path", lambda _: pytest.fail("reopened verified pathname"))
         prepared = provider.localize_request(request, artifact_store=store)
+        assert len(localizer.calls) == 1
+        path.chmod(0o600)
+        path.write_bytes(bytes([data[0] ^ 1]) + data[1:])
+        from agent_gateway.runtime.artifact_store import ArtifactStoreIntegrityError
+        with pytest.raises(ArtifactStoreIntegrityError, match="failed verification"):
+            provider.localize_request(request, artifact_store=store)
+        assert len(localizer.calls) == 1
 
     assert (
         prepared.execution_result["input_media_content_hash"]

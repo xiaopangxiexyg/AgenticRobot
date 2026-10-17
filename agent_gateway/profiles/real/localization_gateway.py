@@ -221,7 +221,7 @@ class ObjectLocalizationProvider:
 
     def _input_bytes(
         self, request: Any, store: RecoverableAgentArtifactStore
-    ) -> tuple[bytes, str]:
+    ) -> tuple[bytes, str, str]:
         source = request.parameters["input_source"]
         bindings = tuple(request.input_artifact_bindings)
         if source == "artifact":
@@ -255,13 +255,9 @@ class ObjectLocalizationProvider:
                 raise ValueError(
                     "Object-localization input Artifact identity is invalid."
                 )
-            path = store.managed_read_path(artifact.artifact_id)
             return (
-                read_bounded_regular_file(
-                    path,
-                    maximum=self.registration.profile.max_image_bytes,
-                ),
-                artifact.media_type,
+                store.read_bytes(artifact, maximum=self.registration.profile.max_image_bytes),
+                artifact.media_type, artifact.sha256,
             )
         if source == "local_path":
             if bindings:
@@ -272,13 +268,8 @@ class ObjectLocalizationProvider:
                 request.parameters["local_image_path"],
                 self.allowed_local_image_roots,
             )
-            return (
-                read_bounded_regular_file(
-                    path,
-                    maximum=self.registration.profile.max_image_bytes,
-                ),
-                "",
-            )
+            data = read_bounded_regular_file(path, maximum=self.registration.profile.max_image_bytes)
+            return data, "", hashlib.sha256(data).hexdigest()
         raise ValueError("Object-localization input source is unsupported.")
 
     def localize_request(
@@ -287,8 +278,7 @@ class ObjectLocalizationProvider:
         *,
         artifact_store: RecoverableAgentArtifactStore,
     ) -> PreparedObjectLocalization:
-        data, declared_media_type = self._input_bytes(request, artifact_store)
-        input_hash = hashlib.sha256(data).hexdigest()
+        data, declared_media_type, input_hash = self._input_bytes(request, artifact_store)
         image = decode_bounded_image(
             data,
             expected_media_type=declared_media_type or None,

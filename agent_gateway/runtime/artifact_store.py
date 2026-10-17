@@ -750,15 +750,56 @@ class RecoverableAgentArtifactStore:
         path = self._blob_path(record.artifact.sha256)
         size, digest = _sha256_file(path)
         if size != record.artifact.byte_length or digest != record.artifact.sha256:
-            with self._lock, self._connection:
-                self._connection.execute(
-                    "UPDATE artifacts SET state = 'quarantined', "
-                    "deletion_reason = 'committed_blob_integrity_failure' "
-                    "WHERE artifact_id = ?",
-                    (record.artifact.artifact_id,),
-                )
+            self._quarantine_committed_blob(record.artifact.artifact_id)
             raise ArtifactStoreIntegrityError("Committed Artifact failed verification.")
         return path
+
+    def read_bytes(self, artifact: AgentArtifactRef, *, maximum: int) -> bytes:
+        """Return bounded, verified bytes from one open file, without caching them."""
+
+        if not isinstance(artifact, AgentArtifactRef):
+            raise TypeError("artifact must be an AgentArtifactRef.")
+        maximum = positive_integer(maximum, field_name="maximum")
+        record = self.artifact(artifact.artifact_id)
+        if not record.available:
+            raise ArtifactStoreConflictError(
+                f"Artifact is not available in state {record.state!r}."
+            )
+        if record.artifact != artifact:
+            raise ArtifactStoreIntegrityError("Stored Artifact identity differs.")
+        if artifact.byte_length > maximum:
+            raise ValueError("Artifact exceeds the consumer byte bound.")
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+        descriptor = os.open(self._blob_path(artifact.sha256), flags)
+        try:
+            info = os.fstat(descriptor)
+            if not stat.S_ISREG(info.st_mode):
+                raise ArtifactStoreIntegrityError("Artifact bytes are not a regular file.")
+            if info.st_size != artifact.byte_length:
+                raise ArtifactStoreIntegrityError("Committed Artifact failed verification.")
+            # A bounded file read avoids the chunk-list plus joined-payload copy
+            # used by profile readers. Verify the exact bytes returned, not a
+            # path that the consumer would reopen after verification.
+            with os.fdopen(descriptor, "rb", closefd=False) as stream:
+                data = stream.read(artifact.byte_length + 1)
+            if (len(data) != artifact.byte_length
+                    or os.fstat(descriptor).st_size != info.st_size
+                    or hashlib.sha256(data).hexdigest() != artifact.sha256):
+                raise ArtifactStoreIntegrityError("Committed Artifact failed verification.")
+            return data
+        except ArtifactStoreIntegrityError:
+            self._quarantine_committed_blob(artifact.artifact_id)
+            raise
+        finally:
+            os.close(descriptor)
+
+    def _quarantine_committed_blob(self, artifact_id: str) -> None:
+        with self._lock, self._connection:
+            self._connection.execute(
+                "UPDATE artifacts SET state = 'quarantined', "
+                "deletion_reason = 'committed_blob_integrity_failure' "
+                "WHERE artifact_id = ?", (artifact_id,),
+            )
 
     def pin(
         self,

@@ -96,6 +96,11 @@ Events use monotonic per-session sequence numbers, bounded retention, and an
 explicit `gap_detected` result. They are notification hints only. After a gap,
 clients reconcile through authoritative operation and discovery queries.
 
+进程内完整载荷消费者使用 `artifact_store.read_bytes(ref, maximum=...)`：在消费者
+字节上限内，从同一文件描述符读取并验证实际返回的长度和 SHA-256；损坏内容按原有
+策略隔离。该接口不缓存载荷、不创建副本文件，不再让消费者校验路径后重新打开文件。
+分块传输和路径授权继续采用既有流式校验，不把完整 Artifact 读入常驻下载缓存。
+
 ## Building a Skill
 
 `protocol.skill_registration.SkillRegistrationTemplate` is the recommended
