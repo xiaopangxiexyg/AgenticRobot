@@ -86,6 +86,12 @@ Grant。它的公共目标始终是 `canonical_station` 下的实际 DMTAC `tool
 实时 observation/schema 绑定 frame graph、Station frame、tool config 和 calibration hash，
 不允许调用方用字符串把 arm-base 或 camera pose 冒充 Station pose。
 
+一次请求客户端允许在 `RUNNING/READY` 或 `HOLD/HOLD` 状态提出新的独立请求，不再要求
+普通 TCP 运动的 session 同时暴露夹爪 Route。`HOLD/HOLD` 不是客户端自行恢复控制的许可：
+原有下层 owner 仍检查此前 HOLD 的成功回执、fresh measurement、新请求 admission 与 Grant，
+再决定是否恢复。FAULT、混合／异常 execution gate 和已关闭的 owner 仍拒绝；失败 HOLD
+不会被当作正常收尾。这使正常到达并 HOLD 后可以继续下一个 Skill，不削弱原有保护。
+
 需要从当前姿态做较远但仍受原有 envelope 约束的诊断移动时，可用
 `--relative-delta-xyz-m DX DY DZ` 替代绝对目标或相机 proposal。该偏移沿
 `canonical_station` 的 XYZ 轴解释；客户端只从同一份提交所绑定的 fresh observation
