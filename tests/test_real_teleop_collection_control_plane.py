@@ -1142,12 +1142,15 @@ def test_episode_open_rpc_is_nonblocking_and_recorder_is_detached_until_publish(
     )
 
 
+@pytest.mark.parametrize("cleanup_retry", (None, "poll", "cancel"))
 def test_pending_episode_open_is_cancellable_and_never_becomes_sample_visible(
     tmp_path: Path,
+    cleanup_retry: str | None,
 ) -> None:
     entered = threading.Event()
     release = threading.Event()
     stop_reasons: list[str] = []
+    fail_cleanup = cleanup_retry is not None
 
     class Recorder:
         def __init__(self, **_kwargs: object) -> None:
@@ -1180,6 +1183,8 @@ def test_pending_episode_open_is_cancellable_and_never_becomes_sample_visible(
             return None
 
         def close(self) -> None:
+            if fail_cleanup:
+                raise RuntimeError("cancelled open cleanup unavailable")
             self.closed = True
 
         def collection_frequency_status(self) -> dict[str, object]:
@@ -1212,6 +1217,21 @@ def test_pending_episode_open_is_cancellable_and_never_becomes_sample_visible(
     )
     assert "正在取消" in str(clutch.countdown_states[-1]["message"])
     release.set()
+    if cleanup_retry is not None:
+        deadline = time.monotonic() + 1.0
+        while not clutch.recording_states and time.monotonic() < deadline:
+            runtime.poll_dataset_finalize(time.time())
+            time.sleep(0.001)
+        assert runtime.collection_transition_active()
+        assert slot[0] is None and not recorder.closed
+        assert not runtime.recording_active()
+        assert clutch.plus_episode_indices == []
+        assert clutch.recording_states[-1]["event_status"] == "error"
+        assert "unit_hold" in str(clutch.recording_states[-1]["event_message"])
+        assert not runtime.start_recording(time.time(), start_reason="premature_retry")
+        fail_cleanup = False
+        if cleanup_retry == "cancel":
+            assert runtime.cancel_recording_countdown(time.time(), reason="cleanup_retry")
     deadline = time.monotonic() + 1.0
     while runtime.collection_transition_active() and time.monotonic() < deadline:
         runtime.poll_dataset_finalize(time.time())
@@ -1220,13 +1240,19 @@ def test_pending_episode_open_is_cancellable_and_never_becomes_sample_visible(
     assert not runtime.collection_transition_active()
     assert slot[0] is None
     assert recorder.closed
-    assert stop_reasons == ["episode_open_cancelled"]
+    assert stop_reasons == ["episode_open_cancelled"] * (2 if cleanup_retry else 1)
     assert not runtime.recording_active()
     assert clutch.plus_episode_indices == []
     assert clutch.recording_states[-1]["event_status"] == "idle"
     assert "未向控制循环发布可采样 Episode" in str(
         clutch.recording_states[-1]["event_message"]
     )
+    expected_reason = {
+        None: "unit_hold",
+        "poll": "operator_cancelled",
+        "cancel": "cleanup_retry",
+    }[cleanup_retry]
+    assert expected_reason in str(clutch.recording_states[-1]["event_message"])
     assert args.dataset_startup_error == ""
     assert runtime.close()
 
@@ -1495,6 +1521,8 @@ def test_position_audit_detach_failure_cannot_veto_formal_stop(
 def test_episode_open_configuration_failure_republishes_unmutated_recorder(
     tmp_path: Path,
 ) -> None:
+    reject_configuration = True
+
     class Recorder:
         def __init__(self, **_kwargs: object) -> None:
             self.dataset_root = tmp_path
@@ -1509,7 +1537,20 @@ def test_episode_open_configuration_failure_republishes_unmutated_recorder(
             self.closed = False
 
         def require_configured_for_current_args(self) -> None:
-            raise RuntimeError("profile changed")
+            if reject_configuration:
+                raise RuntimeError("profile changed")
+
+        def start_episode(self, _metadata: object, *, now: float) -> int:
+            self.is_recording = True
+            self.active_episode_index = self.writer.next_episode_index
+            return self.active_episode_index
+
+        def stop_episode(self, **_kwargs: object) -> None:
+            self.is_recording = False
+            self.active_episode_index = None
+
+        def collection_frequency_status(self) -> dict[str, object]:
+            return {}
 
         def poll_finalize_tasks(self) -> list[object]:
             return []
@@ -1520,7 +1561,7 @@ def test_episode_open_configuration_failure_republishes_unmutated_recorder(
     recorder = Recorder()
     slot: list[object | None] = [recorder]
     clutch = _Clutch()
-    runtime, _args, _logs = _episode_runtime(
+    runtime, args, logs = _episode_runtime(
         tmp_path=tmp_path,
         recorder_type=Recorder,
         dataset_slot=slot,
@@ -1537,6 +1578,28 @@ def test_episode_open_configuration_failure_republishes_unmutated_recorder(
     assert slot[0] is recorder
     assert not recorder.closed
     assert clutch.recording_states[-1]["event_status"] == "error"
+
+    # A later open has its own mutation boundary and reason, even when the
+    # same ready writer and runtime survive a complete open/stop cycle.
+    reject_configuration = False
+    assert runtime.start_recording(time.time(), start_reason="configured_retry")
+    poll_recording_transition(runtime)
+    assert slot[0] is recorder and recorder.is_recording
+    assert clutch.recording_states[-1]["event_status"] == "recording"
+    assert any(tag == "DatasetTiming" and "reason=configured_retry" in message
+               for tag, message in logs)
+    assert runtime.stop_recording(time.time(), end_reason="retry_finished")
+    poll_recording_transition(runtime)
+    assert slot[0] is recorder and not recorder.is_recording
+    assert not recorder.closed
+
+    reject_configuration = True
+    assert runtime.start_recording(time.time(), start_reason="profile_changed_again")
+    poll_recording_transition(runtime)
+    assert slot[0] is recorder and not recorder.closed
+    assert clutch.recording_states[-1]["event_status"] == "error"
+    assert args.dataset_startup_error == ""
+    assert runtime.close()
 
 
 @pytest.mark.parametrize("cleanup_fails", (False, True))
@@ -2153,6 +2216,7 @@ def test_stop_submission_failure_keeps_recorder_owned_paused_and_retryable(
             raise AssertionError("test must reuse the published recorder")
 
     stop_calls = 0
+    stop_reasons: list[str] = []
     recorder = SimpleNamespace(
         dataset_root=tmp_path,
         writer=SimpleNamespace(next_episode_index=4),
@@ -2169,9 +2233,10 @@ def test_stop_submission_failure_keeps_recorder_owned_paused_and_retryable(
         close=lambda: None,
     )
 
-    def stop_episode(**_kwargs: object) -> None:
+    def stop_episode(**kwargs: object) -> None:
         nonlocal stop_calls
         stop_calls += 1
+        stop_reasons.append(str(kwargs["reason"]))
         recorder.is_recording = False
         recorder.active_episode_index = None
         return None
@@ -2213,6 +2278,7 @@ def test_stop_submission_failure_keeps_recorder_owned_paused_and_retryable(
         "start",
         original_start,
     )
+    recorder.frame_count = 17
     assert runtime.stop_recording(time.time(), end_reason="manual_key_stop_retry")
     assert slot[0] is None
     deadline = time.monotonic() + 1.0
@@ -2223,6 +2289,8 @@ def test_stop_submission_failure_keeps_recorder_owned_paused_and_retryable(
     assert slot[0] is recorder
     assert recorder.is_recording is False
     assert stop_calls == 1
+    assert stop_reasons == ["manual_key_stop_retry"]
+    assert clutch.recording_states[-1]["frame_count"] == 17
     assert not runtime.recording_paused()
     assert runtime.close()
 

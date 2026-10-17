@@ -100,6 +100,29 @@ class _PreparedDatasetSelection:
     transaction: _DatasetSelectionTransaction
 
 
+@dataclass
+class _EpisodeOpenState:
+    """One open's publication state, including its irreversible RPC boundary.
+
+    A worker captures its own instance. After publication, empty ownership
+    fields still allow cancelled-cleanup results and further cancellation.
+    """
+
+    recorder: Any | None = None
+    start_reason: str = "manual_key_start"
+    start_attempted: bool = False
+    cancel_reason: str = ""
+
+
+@dataclass(frozen=True)
+class _EpisodeStopState:
+    """Facts retained for publication even when stop produces no completion."""
+
+    recorder: Any | None = None
+    frame_count: int = 0
+    reason: str = ""
+
+
 @dataclass(frozen=True)
 class _DatasetOpenCompletion:
     recorder: Any | None
@@ -115,8 +138,6 @@ class _DatasetStopCompletion:
     task: Any | None
     formal_stopped: bool
     formal_discarded: bool
-    debug_stopped: bool
-    frame_count: int
     debug_error: str | None = None
 
 
@@ -333,14 +354,8 @@ def build_episode_recording_runtime(
     )
     runtime_closing = False
     dataset_preparation: _DatasetPreparation | None = None
-    episode_open_recorder: Any | None = None
-    episode_open_start_attempted = False
-    episode_open_formal_started = False
-    episode_open_start_reason = "manual_key_start"
-    episode_open_cancel_reason = ""
-    episode_stop_recorder: Any | None = None
-    episode_stop_frame_count = 0
-    episode_stop_reason = ""
+    episode_open = _EpisodeOpenState()
+    episode_stop = _EpisodeStopState()
     dataset_selection_transaction: _DatasetSelectionTransaction | None = None
     recorder_retirement: _DatasetRecorderRetirement | None = None
     finalize_failure_count = 0
@@ -794,9 +809,7 @@ def build_episode_recording_runtime(
 
 
     def start_recording(now: float, *, start_reason: str) -> bool:
-        nonlocal episode_open_recorder
-        nonlocal episode_open_start_attempted, episode_open_formal_started
-        nonlocal episode_open_start_reason, episode_open_cancel_reason
+        nonlocal episode_open
         nonlocal episode_start_failure_message, dataset_recorder
         refresh_runtime_views()
         episode_start_failure_message = None
@@ -848,9 +861,12 @@ def build_episode_recording_runtime(
         formal_recorder = dataset_recorder
         captured_step_index = int(step_index)
         start_wall_time = float(now)
+        opening = _EpisodeOpenState(
+            recorder=formal_recorder,
+            start_reason=str(start_reason),
+        )
 
         def open_episode_lifecycle() -> _DatasetOpenCompletion:
-            nonlocal episode_open_start_attempted, episode_open_formal_started
             planned_episode_index: int | None = None
             episode_index: int | None = None
             position_debug_started = False
@@ -918,14 +934,13 @@ def build_episode_recording_runtime(
                             ),
                         }
                     )
-                    episode_open_start_attempted = True
+                    opening.start_attempted = True
                     episode_index = int(
                         formal_recorder.start_episode(
                             metadata,
                             now=start_wall_time,
                         )
                     )
-                    episode_open_formal_started = True
                 if (
                     episode_recorder.config.enabled
                     and not debug_episode_quarantined
@@ -982,9 +997,7 @@ def build_episode_recording_runtime(
                         )
                     except BaseException:
                         pass
-                if formal_recorder is not None and (
-                    episode_open_start_attempted
-                ):
+                if formal_recorder is not None and opening.start_attempted:
                     try:
                         if formal_recorder.is_recording:
                             formal_recorder.stop_episode(
@@ -1005,8 +1018,9 @@ def build_episode_recording_runtime(
                         )
                     except BaseException:
                         pass
-                close_formal = bool(formal_recorder is not None and
-                    (episode_open_start_attempted))
+                close_formal = bool(
+                    formal_recorder is not None and opening.start_attempted
+                )
                 def close_failed_open() -> None:
                     if close_formal:
                         formal_recorder.close()
@@ -1047,11 +1061,7 @@ def build_episode_recording_runtime(
                 if audit_close is not None:
                     audit_close()
 
-        episode_open_recorder = formal_recorder
-        episode_open_start_attempted = False
-        episode_open_formal_started = False
-        episode_open_start_reason = str(start_reason)
-        episode_open_cancel_reason = ""
+        episode_open = opening
         try:
             open_generation = collection_control_plane.submit(
                 "open_episode",
@@ -1059,11 +1069,11 @@ def build_episode_recording_runtime(
                 discard_value=discard_open_completion,
             )
         except CollectionControlOperationBusy as exc:
-            episode_open_recorder = None
+            episode_open = replace(opening, recorder=None)
             episode_start_failure_message = str(exc)
             return False
         except Exception as exc:  # noqa: BLE001 - recorder ownership was not transferred.
-            episode_open_recorder = None
+            episode_open = replace(opening, recorder=None)
             message = (
                 "正式 dataset episode 后台打开任务未能启动；"
                 "writer 仍保持当前所有权，可重试："
@@ -1535,7 +1545,6 @@ def build_episode_recording_runtime(
     def cancel_recording_countdown(now: float, *, reason: str) -> bool:
         nonlocal episode_start_countdown_deadline, episode_start_warmup_ready_since
         nonlocal episode_start_warmup_last_message
-        nonlocal episode_open_cancel_reason
         refresh_runtime_views()
         prepare_generation = transition_generation("prepare_writer")
         if prepare_generation is not None:
@@ -1567,8 +1576,8 @@ def build_episode_recording_runtime(
             # writer may still be blocked in start_episode().  Hold, safety, and
             # the operator stop button must be able to revoke that pending
             # admission before the completion is made sample-visible.
-            if not episode_open_cancel_reason:
-                episode_open_cancel_reason = str(reason)
+            if not episode_open.cancel_reason:
+                episode_open.cancel_reason = str(reason)
             cancel_accepted = collection_control_plane.cancel(open_generation)
             if not cancel_accepted and collection_control_plane.cleanup_error is not None:
                 _log("Dataset", "Episode取消已阻止接纳，回收仍待重试："
@@ -1723,8 +1732,7 @@ def build_episode_recording_runtime(
         end_reason: str,
         summary: Mapping[str, object] | None = None,
     ) -> bool:
-        nonlocal episode_stop_recorder
-        nonlocal episode_stop_frame_count, episode_stop_reason, dataset_recorder
+        nonlocal episode_stop, dataset_recorder
         nonlocal episode_recording_paused, episode_recording_pause_reason
         refresh_runtime_views()
         if collection_worker_transition_active():
@@ -1837,8 +1845,6 @@ def build_episode_recording_runtime(
                     task=task,
                     formal_stopped=formal_recorder is not None,
                     formal_discarded=formal_discarded,
-                    debug_stopped=debug_stopped,
-                    frame_count=int(frame_count),
                     debug_error=debug_error,
                 )
             except BaseException as error:
@@ -1907,9 +1913,11 @@ def build_episode_recording_runtime(
                 ),
             )
             return False
-        episode_stop_recorder = formal_recorder
-        episode_stop_frame_count = int(frame_count)
-        episode_stop_reason = str(end_reason)
+        episode_stop = _EpisodeStopState(
+            recorder=formal_recorder,
+            frame_count=int(frame_count),
+            reason=str(end_reason),
+        )
         if formal_recorder is not None:
             # Stop now exclusively owns the recorder through async sample drain
             # and episode mutation.  Detach it until completion publication so
@@ -2679,19 +2687,17 @@ def build_episode_recording_runtime(
         *,
         now: float,
     ) -> None:
-        nonlocal dataset_recorder, episode_open_recorder
-        nonlocal episode_open_start_attempted, episode_open_formal_started
-        nonlocal episode_open_cancel_reason
+        nonlocal dataset_recorder, episode_open
         nonlocal episode_start_failure_message, episode_last_state
         nonlocal last_collection_frequency_debug_at
         nonlocal last_collection_frequency_warning_active
-        opened_recorder = episode_open_recorder
-        start_attempted = bool(episode_open_start_attempted)
-        cancel_reason = str(episode_open_cancel_reason or "")
-        episode_open_recorder = None
-        episode_open_start_attempted = False
-        episode_open_formal_started = False
-        episode_open_cancel_reason = ""
+        opening = episode_open
+        opened_recorder = opening.recorder
+        start_attempted = bool(opening.start_attempted)
+        cancel_reason = str(opening.cancel_reason or "")
+        episode_open = replace(
+            opening, recorder=None, start_attempted=False, cancel_reason=""
+        )
 
         if result.cancelled:
             if opened_recorder is not None and not start_attempted:
@@ -2898,7 +2904,7 @@ def build_episode_recording_runtime(
             "episode open completed outside the realtime loop "
             f"elapsed={result.elapsed_sec * 1000.0:.1f}ms "
             f"generation={result.generation} "
-            f"reason={episode_open_start_reason}",
+            f"reason={opening.start_reason}",
             now=now,
         )
 
@@ -2907,18 +2913,15 @@ def build_episode_recording_runtime(
         *,
         now: float,
     ) -> None:
-        nonlocal dataset_recorder, episode_stop_recorder
-        nonlocal episode_stop_frame_count, episode_stop_reason, episode_last_state
+        nonlocal dataset_recorder, episode_stop, episode_last_state
         nonlocal last_collection_frequency_warning_active
         nonlocal episode_recording_paused, episode_recording_pause_reason
         nonlocal episode_resume_warmup_ready_count, episode_resume_failure_message
         nonlocal episode_pause_failure_message, debug_episode_quarantined
-        stopped_recorder = episode_stop_recorder
-        stopped_frame_count = int(episode_stop_frame_count)
-        stopped_reason = str(episode_stop_reason or "control_plane_completion")
-        episode_stop_recorder = None
-        episode_stop_frame_count = 0
-        episode_stop_reason = ""
+        stopped_recorder = episode_stop.recorder
+        stopped_frame_count = int(episode_stop.frame_count)
+        stopped_reason = str(episode_stop.reason or "control_plane_completion")
+        episode_stop = _EpisodeStopState()
         if not result.succeeded or not isinstance(
             result.value,
             _DatasetStopCompletion,
