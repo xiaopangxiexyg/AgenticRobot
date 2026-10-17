@@ -154,6 +154,9 @@ def _deferred_camera_startup_retry_budget(source: object, detail: str) -> int:
     """Return retries owned by the serial batch, never by one source start call."""
 
     configured = _configured_camera_startup_retry_attempts(source)
+    metadata = getattr(getattr(source, "config", None), "metadata", None)
+    if isinstance(metadata, Mapping) and metadata.get("perception_single_start") is True:
+        return 0
     if _is_bounded_first_frame_startup_failure(source, detail):
         # Preserve the existing one deferred recovery attempt for every formal
         # bounded-first-frame source. A larger reviewed per-camera budget (for
@@ -700,7 +703,10 @@ def _start_camera_sources_best_effort(
                     "remaining cameras will not be opened or retried",
                 )
             if startup_progress is not None:
-                if _is_bounded_first_frame_startup_failure(source, detail):
+                if (
+                    _is_bounded_first_frame_startup_failure(source, detail)
+                    and _deferred_camera_startup_retry_budget(source, detail) > 0
+                ):
                     startup_progress.update(
                         progress_key,
                         message="首轮未收到视频帧；等待批次结束后串行重试",

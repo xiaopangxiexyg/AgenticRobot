@@ -156,12 +156,17 @@ module 和 pytest wrapper 只允许 L3 非控制执行；关键词检查只是�
   先检查既有连接/相机占用，不发送运动、HOLD、STOP、夹爪命令或相机 reset；固定 60 秒上限。
   `--dry-run` 仅显示参数，不连接设备。相机缺失和稳定性验证失败保留原因，不冒充完整采集成功。
   相机复用 rule-base / real-teleop 的 `RealSenseRGBSource`：按配置顺序错峰启动、持续采集完整
-  RGB-D、有界延迟重试、启动超时终止批次、按实际启动顺序反向关闭；没有独立的原生 pipeline
+  RGB-D、单次启动、启动超时终止批次、按实际启动顺序反向关闭；没有独立的原生 pipeline
   预热/轮询路径。探针始终禁用三种 hardware-reset 配置和自动曝光参数写入，保留分辨率、帧率、
   对齐与标定角色。连续新鲜帧检查通过后才连接双臂只读采样，RGB/Depth 使用同一个 `VideoFrame`
   的原始时间戳，不以读取缓存的时间替换。`capture_stages.jsonl` 实时保存阶段，`snapshot.json`
   及帧数据先于设备关闭保存；`cleanup_complete=false` 不能解释为设备已释放。
   用户态超时不能解除内核 `D` 状态；发现原生启动阻塞后不继续开启其他相机或连接机械臂。
+  `--check-only` 仅校验源码/文件/依赖，不打开设备；可额外传相机 registry、CAD URDF 和左右工具
+  profile 检查交互采集所需的上下文。操作者在设备主机直接运行同一探针的 `--interactive` 模式，
+  启动时复用相同 owner 连接设备一次，回车保存新状态，退出时统一关闭；启动、单次采样和关闭分别
+  有 60 s 看门狗，不限制人工等待时间。会话级清理证据与逐状态快照分开保存；SSH wrapper
+  不提供持续交互或任意命令入口。详见 POINT_GRASP 的补充样例采集说明。
 - `remote_grasp_snapshot_inference.sh`：`--python` 后用 `--` 传固定探针的 `--mode segment|infer`、
   `--repo`、`--input`、`--output`、`--bundle`，以及分割用 `--pixel u v` 或推理用 `--source`。
   只处理保存的数组、写入新目录；离线加载已有模型，固定 120 秒上限，不连接相机或机械臂。

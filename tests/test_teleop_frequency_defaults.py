@@ -2911,3 +2911,17 @@ def test_deploy_arm_backend_accepts_qpos_init_singularity_slowdown() -> None:
     )
 
     assert backends["right"].config.singularity_qpos_init_slowdown == 0.35
+
+
+
+@pytest.mark.parametrize("single_start,expected", [(False, 2), ("true", 2), (True, 0)])
+def test_explicit_single_start_owns_zero_batch_retry_without_changing_defaults(single_start, expected):
+    source = SimpleNamespace(config=SimpleNamespace(
+        startup_warmup_policy="bounded_first_frame", startup_software_retry_attempts=2,
+        metadata={"perception_single_start": single_start},
+    ))
+    detail = "startup_warmup_failed:policy=bounded_first_frame:no_frames"
+    assert camera_runtime._deferred_camera_startup_retry_budget(source, detail) == expected
+    source.config.startup_software_retry_attempts = -1
+    with pytest.raises(ValueError, match=">= 0"):
+        camera_runtime._deferred_camera_startup_retry_budget(source, detail)

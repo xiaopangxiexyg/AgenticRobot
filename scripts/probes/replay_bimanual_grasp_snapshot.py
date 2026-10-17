@@ -94,10 +94,21 @@ class RetainedAuxiliarySegmenter:
         raise RuntimeError(f"Auxiliary view needs real SAM2 evidence for exact image/seed {pixel_uv}; no invented mask")
 
 
-def prepare(args):
-    report = json.loads((args.capture / "snapshot.json").read_text())
+def load_snapshot_report(capture: Path):
+    report = json.loads((capture / "snapshot.json").read_text())
+    if report.get("schema") == "agenticrobot.readonly_rgbd_qpos.v2":
+        if report.get("session_lifecycle") != "../../devices/lifecycle.json":
+            raise ValueError("Persistent capture has an invalid lifecycle reference")
+        lifecycle = json.loads((capture.parent.parent / "devices/lifecycle.json").read_text())
+        if lifecycle.get("status") != "closed" or lifecycle.get("cleanup_complete") is not True:
+            raise ValueError("Persistent capture session is still active or not safely closed")
     if report["status"] != "captured" or "stationarity" not in report:
         raise ValueError("Replay requires a successfully bracketed stationary capture")
+    return report
+
+
+def prepare(args):
+    report = load_snapshot_report(args.capture)
     profile = profile_for(args, args.sides[0])
     builder = build_exclusive_rm65_skill_target_builder(profile)
     binding = build_real_perception_source_binding(

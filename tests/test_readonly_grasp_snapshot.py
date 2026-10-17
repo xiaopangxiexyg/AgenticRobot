@@ -161,7 +161,12 @@ def test_config_reuses_collection_policy_without_reset_or_stream_downgrade(captu
         assert config.enable_depth and config.align_depth_to_color
         assert config.retain_unaligned_depth
         assert config.startup_warmup_policy == "bounded_first_frame" and config.require_complete_frameset
-        assert config.restart_on_incomplete_frameset
+        assert not any(getattr(config, field) for field in (
+            "startup_reset", "restart_on_stale_timeout", "restart_on_runtime_error",
+            "restart_on_black_frames", "restart_on_incomplete_frameset",
+        ))
+        assert config.startup_software_retry_attempts == 0
+        assert config.metadata["perception_single_start"] is True
         assert not config.startup_hardware_reset
         assert not config.startup_hardware_reset_on_failure
         assert not config.startup_hardware_reset_on_warmup_failure
@@ -214,16 +219,16 @@ def test_capture_reuses_order_live_workers_and_reverse_cleanup(capture_args, cam
             assert raw_meta["depth_to_color_extrinsics"]["translation_m"] == [.01, 0., 0.]
 
 
-def test_unavailable_view_gets_only_canonical_deferred_retry(capture_args, camera_rig):
+def test_unavailable_view_is_not_reopened_after_no_first_frame(capture_args, camera_rig):
     camera_rig.modes.update(front="unavailable", right_wrist="unavailable")
     result = probe.capture(capture_args, arm_factory=camera_rig.arm_factory)
     assert result["status"] == "captured", result
     assert not result["all_views_captured"]
     assert set(result["missing_roles"]) == {"main", "wrist_right"}
     assert result["views"]["main"]["status"] == "unavailable"
-    assert "deferred_startup_retry_failed" in result["views"]["main"]["error"]
+    assert "startup_warmup_failed:policy=bounded_first_frame" in result["views"]["main"]["error"]
     assert [event[1] for event in camera_rig.events if event[0] == "start"] == [
-        "front", "right_wrist", "left_wrist", "front", "right_wrist"]
+        "front", "right_wrist", "left_wrist"]
     assert len(result["views"]["wrist_left"]["frames"]) == 5
 
 
@@ -320,6 +325,31 @@ def test_storage_failure_does_not_skip_device_cleanup(capture_args, camera_rig, 
     assert result["status"] == "failed"
     assert result["persistence_errors"] == ["OSError: injected disk full"]
     assert result["cleanup_complete"]
+    assert sum(event[0] == "arm_close" for event in camera_rig.events) == 2
+    assert sum(event[0] == "close" for event in camera_rig.events) == 3
+
+
+def test_snapshot_write_failure_cannot_skip_owned_device_close(capture_args, camera_rig, monkeypatch):
+    original = probe.save_json
+    def disk_full(path, value):
+        if path.name == "snapshot.json":
+            raise OSError("snapshot disk full")
+        return original(path, value)
+    monkeypatch.setattr(probe, "save_json", disk_full)
+    with pytest.raises(OSError, match="snapshot disk full"):
+        probe.capture(capture_args, arm_factory=camera_rig.arm_factory)
+    assert sum(event[0] == "arm_close" for event in camera_rig.events) == 2
+    assert sum(event[0] == "close" for event in camera_rig.events) == 3
+
+
+def test_lifecycle_write_failure_cannot_skip_owned_device_close(capture_args, camera_rig, monkeypatch):
+    session = probe.ReadOnlySnapshotSession(capture_args, arm_factory=camera_rig.arm_factory)
+    session.start()
+    def disk_full():
+        raise OSError("lifecycle disk full")
+    monkeypatch.setattr(session, "save", disk_full)
+    with pytest.raises(OSError, match="lifecycle disk full"):
+        session.close()
     assert sum(event[0] == "arm_close" for event in camera_rig.events) == 2
     assert sum(event[0] == "close" for event in camera_rig.events) == 3
 
@@ -428,3 +458,318 @@ def test_stationary_evidence_needs_coverage_cadence_and_both_arms():
         stationarity(data, .1, .3)
     with pytest.raises(RuntimeError, match="gap"):
         stationarity(samples()[::3], .1, .3)
+
+
+def collection_fixture(tmp_path):
+    config_dir = tmp_path / "original_configs"
+    config_dir.mkdir()
+    paths = {}
+    for name in probe.CONTEXT_FILES:
+        path = config_dir / (name + (".urdf" if name == "camera_mount_urdf" else ".json"))
+        path.write_text(json.dumps({"arm_ip_by_side": {"left": "left-test", "right": "right-test"}})
+            if name == "arm_ip_assignment" else f"configuration:{name}")
+        paths[name] = str(path)
+    return SimpleNamespace(output=tmp_path / "session", repo=Path("/owned/source")), {
+        "files": paths, "source_commit": "abc123", "hardware_connected": False}
+
+
+@pytest.mark.parametrize("answer", ["", "0", "5", "1 5", "blue_cube", "| note", "1 q"])
+def test_interactive_labels_require_an_allowed_object(answer):
+    with pytest.raises(ValueError):
+        probe.parse_scene_selection(answer, None)
+
+
+def test_multiple_scene_objects_and_repeat_are_explicit_operator_labels():
+    selection = probe.parse_scene_selection("1 4 1 | 主相机遮挡，方块边长40mm", None)
+    assert selection == (("blue_cube", "black_cup"), "主相机遮挡，方块边长40mm")
+    assert probe.parse_scene_selection("", selection) == selection
+    assert probe.parse_scene_selection("2，3", selection) == (("blue_small_bottle", "red_cube"), "")
+
+
+def test_preflight_imports_only_and_never_starts_devices(tmp_path, monkeypatch):
+    import sys
+    args, context = collection_fixture(tmp_path)
+    args.repo = tmp_path / "source"
+    args.repo.mkdir()
+    args.interactive = True
+    monkeypatch.setattr(sys, "path", list(sys.path))
+    for name, path in context["files"].items():
+        setattr(args, name, path)
+    Path(args.arm_ip_assignment).write_text(json.dumps({"arm_ip_by_side": {"left": "left-test", "right": "right-test"}}))
+    commands = []
+    def git(command, **kwargs):
+        commands.append(command)
+        return "" if "status" in command else "test-commit\n"
+    def forbidden(*args, **kwargs):
+        pytest.fail("Preflight must not construct an SDK connection or start a camera")
+    monkeypatch.setattr(probe.subprocess, "check_output", git)
+    monkeypatch.setattr(probe.importlib.util, "find_spec", lambda _: object())
+    monkeypatch.setattr(probe.shutil, "which", lambda name: "/usr/bin/" + name)
+    source = SimpleNamespace(config=SimpleNamespace(serial="test", width=640, height=480, fps=15), start=forbidden)
+    monkeypatch.setattr(probe, "readonly_camera_sources", lambda _: {"front": source})
+    monkeypatch.setitem(sys.modules, "hardware.rm65.rm_api2_adapter", SimpleNamespace(Arm=forbidden, RM65=65))
+    result = probe.check_inputs(args)
+    assert not result["hardware_connected"] and result["source_commit"] == "test-commit"
+    assert len(commands) == 2 and not args.output.exists()
+
+
+def test_persistent_session_starts_before_input_and_reuses_every_device(capture_args, camera_rig, tmp_path):
+    args, context = collection_fixture(tmp_path)
+    capture_args.output = args.output / "devices"
+    answers = iter(("5", "1 4 | 遮挡", "", "2 3", "q"))
+    reads = []
+
+    def prompt(_):
+        reads.append(time.time())
+        current = json.loads((args.output / "session.json").read_text())
+        assert current["status"] == "ready" and current["hardware_connected"]
+        assert all(source.device_info()["running"] for source in camera_rig.sources.values())
+        assert sum(event[0] == "arm_open" for event in camera_rig.events) == 2
+        assert not any(event[0] == "arm_close" for event in camera_rig.events)
+        if len(reads) == 3:
+            Path(context["files"]["camera_config"]).write_text("changed after startup")
+        return next(answers)
+
+    assert probe.interactive_capture(args, context=context, arm_factory=camera_rig.arm_factory, input_fn=prompt) == 0
+    assert [event[1] for event in camera_rig.events if event[0] == "start"] == ["front", "right_wrist", "left_wrist"]
+    assert [event[1] for event in camera_rig.events if event[0] == "close"] == ["left_wrist", "right_wrist", "front"]
+    assert sum(event[0] == "arm_close" for event in camera_rig.events) == 2
+    assert (args.output / "context/camera_config.json").read_text() == "configuration:camera_config"
+    records = [json.loads(line) for line in (args.output / "samples.jsonl").read_text().splitlines()]
+    assert [row["scene_objects"] for row in records] == [["blue_cube", "black_cup"]]*2 + [["blue_small_bottle", "red_cube"]]
+    ids = []
+    for record in records:
+        snapshot = json.loads((args.output / record["snapshot"]).read_text())
+        assert snapshot["status"] == "captured" and snapshot["all_views_captured"]
+        assert not snapshot["cleanup_complete"]  # Not a fictitious per-state disconnect.
+        assert snapshot["session_lifecycle"] == "../../devices/lifecycle.json"
+        assert snapshot["motion_commands"] == [] and not snapshot["camera_reset"]
+        assert {row["source"] for row in snapshot["scene_objects"]} == {"operator_declared"}
+        frames = snapshot["views"]["main"]["frames"]
+        ids.append({frame["source_frame_index"] for frame in frames})
+        for frame in frames:
+            assert snapshot["capture_started_at"] <= frame["received_at"] <= snapshot["capture_finished_at"]
+        assert snapshot["stationarity"]["left"]["sample_count"] >= 3
+    assert not ids[0].intersection(ids[1]) and not ids[1].intersection(ids[2])
+    lifecycle = json.loads((args.output / "devices/lifecycle.json").read_text())
+    assert lifecycle["status"] == "closed" and lifecycle["cleanup_complete"]
+    closed = json.loads((args.output / "session.json").read_text())
+    assert closed["sample_count"] == 3 and not closed["hardware_connected"]
+    with pytest.raises(FileExistsError):
+        probe.interactive_capture(args, context=context, arm_factory=camera_rig.arm_factory, input_fn=lambda _: "q")
+
+
+def test_persistent_capture_keeps_partial_views_explicit(capture_args, camera_rig, tmp_path):
+    args, context = collection_fixture(tmp_path)
+    capture_args.output = args.output / "devices"
+    camera_rig.modes.update(front="unavailable", left_wrist="unavailable")
+    answers = iter(("1", "", "q"))
+    assert probe.interactive_capture(args, context=context, arm_factory=camera_rig.arm_factory,
+        input_fn=lambda _: next(answers)) == 0
+    records = [json.loads(line) for line in (args.output / "samples.jsonl").read_text().splitlines()]
+    assert len(records) == 2
+    assert all(not row["all_views_captured"] and set(row["missing_roles"]) == {"main", "wrist_left"} for row in records)
+    assert sum(event == ("start", "right_wrist") for event in camera_rig.events) == 1
+
+
+def test_persistent_unclean_close_does_not_claim_disconnection(capture_args, camera_rig, tmp_path):
+    args, context = collection_fixture(tmp_path)
+    capture_args.output = args.output / "devices"
+    def factory(ip):
+        arm = camera_rig.arm_factory(ip)
+        arm.Arm_Socket_Close = lambda: 9
+        return arm
+    assert probe.interactive_capture(args, context=context, arm_factory=factory, input_fn=lambda _: "q") == 1
+    report = json.loads((args.output / "session.json").read_text())
+    assert report["status"] == "cleanup_failed"
+    assert report["hardware_connected"] is None and not report["cleanup_complete"]
+
+
+def test_persistent_failed_state_can_retry_without_restart(capture_args, camera_rig, tmp_path, monkeypatch):
+    args, context = collection_fixture(tmp_path)
+    capture_args.output = args.output / "devices"
+    original = probe.stationarity
+    calls = []
+
+    def first_fail(*values):
+        calls.append(1)
+        if len(calls) == 1:
+            raise RuntimeError("moving scene")
+        return original(*values)
+
+    monkeypatch.setattr(probe, "stationarity", first_fail)
+    answers = iter(("3", "", "q"))
+    assert probe.interactive_capture(args, context=context, arm_factory=camera_rig.arm_factory,
+        input_fn=lambda _: next(answers)) == 0
+    records = [json.loads(line) for line in (args.output / "samples.jsonl").read_text().splitlines()]
+    assert [row["status"] for row in records] == ["failed", "captured"]
+    assert sum(event[0] == "arm_open" for event in camera_rig.events) == 2
+    assert sum(event[0] == "start" for event in camera_rig.events) == 3
+
+
+@pytest.mark.parametrize("cancel", ["EOF", "CtrlC"])
+def test_cancel_while_waiting_closes_persistent_session(capture_args, camera_rig, tmp_path, cancel):
+    args, context = collection_fixture(tmp_path)
+    capture_args.output = args.output / "devices"
+    def stop(_):
+        raise EOFError if cancel == "EOF" else KeyboardInterrupt
+    assert probe.interactive_capture(args, context=context,
+        arm_factory=camera_rig.arm_factory, input_fn=stop) == 130
+    assert json.loads((args.output / "session.json").read_text())["cleanup_complete"]
+    assert sum(event[0] == "arm_close" for event in camera_rig.events) == 2
+
+
+def test_persistent_sdk_failure_stops_without_reconnect(capture_args, camera_rig, tmp_path):
+    args, context = collection_fixture(tmp_path)
+    capture_args.output = args.output / "devices"
+    def fail(_):
+        # Fault belongs to the existing sampler, not a second SDK reader.
+        for source in camera_rig.sources.values():
+            source._running = False
+        return "1"
+    assert probe.interactive_capture(args, context=context,
+        arm_factory=camera_rig.arm_factory, input_fn=fail) == 1
+    assert sum(event[0] == "arm_open" for event in camera_rig.events) == 2
+    assert sum(event[0] == "start" for event in camera_rig.events) == 3
+    state = json.loads((args.output / "state_0001/capture/snapshot.json").read_text())
+    assert state["status"] == "failed" and "no longer running" in state["error"]["message"]
+
+
+def test_operation_deadline_records_failure_before_process_exit(tmp_path):
+    import subprocess
+    import sys
+    output = tmp_path / "bounded"
+    ips = tmp_path / "arms.json"
+    ips.write_text(json.dumps({"arm_ip_by_side": {"left": "test-left", "right": "test-right"}}))
+    code = (
+        "import time; from types import SimpleNamespace; "
+        "from scripts.probes.capture_rm65_grasp_snapshot import ReadOnlySnapshotSession; "
+        f"s=ReadOnlySnapshotSession(SimpleNamespace(output={str(output)!r},camera_config='unused',arm_ip_assignment={str(ips)!r}),arm_factory=None);\n"
+        "with s.bounded_operation('blocked_native_test',timeout_sec=.05): time.sleep(5)"
+    )
+    result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=3, check=False)
+    assert result.returncode == 124 and "operation_timeout" in result.stdout
+    lifecycle = json.loads((output / "lifecycle.json").read_text())
+    assert lifecycle["status"] == "operation_timeout" and not lifecycle["cleanup_complete"]
+
+
+def test_continuous_sampler_history_is_bounded_and_health_checks_keep_original_time(tmp_path):
+    ips = tmp_path / "arms.json"
+    ips.write_text(json.dumps({"arm_ip_by_side": {"left": "test-left", "right": "test-right"}}))
+    session = probe.ReadOnlySnapshotSession(SimpleNamespace(output=tmp_path / "bounded",
+        camera_config="unused", arm_ip_assignment=ips), arm_factory=None)
+    try:
+        now = time.time()
+        for i in range(300):
+            session.samples.append({side: {"started_at": now-.01, "finished_at": now-.005, "qpos_rad": [0]*6}
+                for side in ("left", "right")})
+        assert len(session.history()) == 256
+        session.sampler = SimpleNamespace(is_alive=lambda: True)
+        session.assert_healthy()
+        session.samples[-1]["left"]["finished_at"] = now-10
+        with pytest.raises(RuntimeError, match="stale"):
+            session.assert_healthy()
+        session.samples[-1]["left"]["finished_at"] = time.time()+10
+        session.samples[-1]["right"]["finished_at"] = time.time()+10
+        with pytest.raises(RuntimeError, match="invalid time"):
+            session.assert_healthy()
+
+    finally:
+        session.sampler = None
+        session.close()
+
+@pytest.mark.parametrize("error_type", [ValueError, TypeError])
+def test_non_io_lifecycle_record_failure_still_closes_owned_devices(capture_args, camera_rig, monkeypatch, error_type):
+    session = probe.ReadOnlySnapshotSession(capture_args, arm_factory=camera_rig.arm_factory)
+    session.start()
+
+    def invalid_record():
+        raise error_type("invalid lifecycle record")
+
+    monkeypatch.setattr(session, "save", invalid_record)
+    with pytest.raises(error_type, match="invalid lifecycle record"):
+        session.close()
+    assert sum(event[0] == "arm_close" for event in camera_rig.events) == 2
+    assert sum(event[0] == "close" for event in camera_rig.events) == 3
+    assert not session.info["cleanup_complete"]
+
+
+def test_sampler_join_failure_keeps_inflight_arms_but_closes_cameras(capture_args, camera_rig, monkeypatch):
+    session = probe.ReadOnlySnapshotSession(capture_args, arm_factory=camera_rig.arm_factory)
+    session.start()
+    sampler = session.sampler
+    original_join = sampler.join
+
+    def failed_join(*_args, **_kwargs):
+        raise RuntimeError("sampler join failed")
+
+    monkeypatch.setattr(sampler, "join", failed_join)
+    try:
+        with pytest.raises(RuntimeError, match="sampler join failed"):
+            session.close()
+        assert sum(event[0] == "arm_close" for event in camera_rig.events) == 0
+        assert sum(event[0] == "close" for event in camera_rig.events) == 3
+        assert not session.info["cleanup_complete"]
+    finally:
+        original_join(timeout=2)
+
+
+def test_teardown_does_not_need_new_monitor_thread_resources(capture_args, camera_rig, monkeypatch):
+    capture_finished = threading.Event()
+    original_start = threading.Thread.start
+    original_capture = probe.ReadOnlySnapshotSession.capture_state
+
+    def refuse_new_threads_after_capture(thread):
+        if capture_finished.is_set():
+            raise RuntimeError("new thread resources unavailable during teardown")
+        return original_start(thread)
+
+    def capture_state(session, *args, **kwargs):
+        report = original_capture(session, *args, **kwargs)
+        capture_finished.set()
+        return report
+
+    monkeypatch.setattr(threading.Thread, "start", refuse_new_threads_after_capture)
+    monkeypatch.setattr(probe.ReadOnlySnapshotSession, "capture_state", capture_state)
+    try:
+        result = probe.capture(capture_args, arm_factory=camera_rig.arm_factory)
+    finally:
+        assert sum(event[0] == "arm_close" for event in camera_rig.events) == 2
+        assert sum(event[0] == "close" for event in camera_rig.events) == 3
+    assert result["status"] == "captured" and result["cleanup_complete"]
+
+
+
+def test_watchdog_acquisition_failure_opens_no_devices(capture_args, camera_rig, monkeypatch):
+    def no_thread_resources(_thread):
+        raise RuntimeError("watchdog thread unavailable")
+
+    monkeypatch.setattr(threading.Thread, "start", no_thread_resources)
+    with pytest.raises(RuntimeError, match="watchdog thread unavailable"):
+        probe.capture(capture_args, arm_factory=camera_rig.arm_factory)
+    assert not any(event[0] in {"start", "arm_open"} for event in camera_rig.events)
+
+
+
+@pytest.mark.parametrize("interrupt_type", [KeyboardInterrupt, SystemExit])
+def test_cleanup_interrupt_takes_priority_over_earlier_record_error(capture_args, camera_rig, monkeypatch, interrupt_type):
+    session = probe.ReadOnlySnapshotSession(capture_args, arm_factory=camera_rig.arm_factory)
+    session.start()
+    original_join = session.sampler.join
+
+    def invalid_record():
+        raise ValueError("invalid lifecycle record")
+
+    def interrupted_join(*_args, **_kwargs):
+        raise interrupt_type("cleanup interrupted")
+
+    monkeypatch.setattr(session, "save", invalid_record)
+    monkeypatch.setattr(session.sampler, "join", interrupted_join)
+    try:
+        with pytest.raises(interrupt_type, match="cleanup interrupted"):
+            session.close()
+        assert sum(event[0] == "arm_close" for event in camera_rig.events) == 0
+        assert sum(event[0] == "close" for event in camera_rig.events) == 3
+        assert not session.info["cleanup_complete"]
+    finally:
+        original_join(timeout=2)

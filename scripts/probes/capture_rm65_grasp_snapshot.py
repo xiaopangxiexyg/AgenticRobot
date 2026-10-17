@@ -8,18 +8,31 @@ from __future__ import annotations
 
 import argparse
 import copy
+import importlib.util
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
 import threading
 import time
+from collections import deque
+from contextlib import contextmanager
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 
 ROLES = {"front": "main", "left_wrist": "wrist_left", "right_wrist": "wrist_right"}
+SCENE_OBJECTS = {
+    "1": ("blue_cube", "蓝色方块"),
+    "2": ("blue_small_bottle", "蓝色小瓶子"),
+    "3": ("red_cube", "红色方块"),
+    "4": ("black_cup", "黑色水杯"),
+}
+CONTEXT_FILES = ("camera_config", "arm_ip_assignment", "camera_registry",
+                 "camera_mount_urdf", "left_tool_profile", "right_tool_profile")
 
 
 def readonly_camera_sources(config_path):
@@ -41,6 +54,15 @@ def readonly_camera_sources(config_path):
         config.startup_hardware_reset_on_warmup_failure = False
         config.auto_exposure_priority = None
         config.retain_unaligned_depth = True
+        # This capture owns one long-lived pipeline per device. Preserve fault
+        # diagnostics and admission checks, but never recover by reopening it.
+        config.startup_reset = False
+        config.startup_software_retry_attempts = 0
+        config.restart_on_stale_timeout = False
+        config.restart_on_runtime_error = False
+        config.restart_on_black_frames = False
+        config.restart_on_incomplete_frameset = False
+        config.metadata["perception_single_start"] = True
     return {key: RealSenseRGBSource(config) for key, config in configs.items() if key in ROLES}
 
 
@@ -123,6 +145,7 @@ def frame_payload(source, frame, *, index):
     }
 
 
+
 def diagnostic_frame_payload(source, frame, *, index):
     """Persist native Z16 beside the unchanged aligned metric input."""
     rgb, depth, metadata = frame_payload(source, frame, index=index)
@@ -190,163 +213,499 @@ def stationarity(samples: list[dict], started: float, finished: float) -> dict:
     return result
 
 
-def capture(args, *, arm_factory) -> dict:
-    from PIL import Image
-    from teleop_runtime.real_teleop import camera_runtime
-    from teleop_runtime.deploy.camera_runtime import run_camera_startup_self_check
+def save_json(path: Path, value: dict) -> None:
+    pending = path.with_name(path.name + ".pending")
+    pending.write_text(json.dumps(value, ensure_ascii=False, indent=2, allow_nan=False) + "\n")
+    pending.replace(path)
 
-    output = Path(args.output)
-    output.mkdir(parents=True, exist_ok=False)
-    ips = json.loads(Path(args.arm_ip_assignment).read_text())["arm_ip_by_side"]
-    report = {"schema": "agenticrobot.readonly_rgbd_qpos.v1", "status": "failed",
-              "motion_commands": [], "camera_reset": False, "arm_ips": ips,
-              "pid": os.getpid(), "camera_lifecycle": "real_teleop",
-              "cleanup_complete": False, "data_captured": False,
-              "views": {}, "qpos_samples": [], "cleanup_errors": [], "persistence_errors": []}
-    arms, sources, frames, errors = {}, {}, {}, []
-    stopped = threading.Event()
-    sampler = None
 
-    def save_report():
-        temporary = output / "snapshot.json.pending"
-        temporary.write_text(json.dumps(report, indent=2, allow_nan=False) + "\n")
-        temporary.replace(output / "snapshot.json")
+class ReadOnlySnapshotSession:
+    """One canonical camera/SDK owner, shared by one-shot and interactive capture."""
 
-    def stage(name: str, **details) -> None:
-        # Flush before native calls: Python's finally/timeout cannot complete
-        # while a kernel USB call remains in uninterruptible sleep.
-        event = {"stage": name, "wall_time_sec": time.time(), **details}
-        with (output / "capture_stages.jsonl").open("a", encoding="utf-8") as log:
-            log.write(json.dumps(event, allow_nan=False) + "\n")
-        print(json.dumps(event, allow_nan=False), flush=True)
+    def __init__(self, args, *, arm_factory):
+        self.output = Path(args.output)
+        self.output.mkdir(parents=True, exist_ok=False)
+        self.camera_config = args.camera_config
+        self.ips = json.loads(Path(args.arm_ip_assignment).read_text())["arm_ip_by_side"]
+        self.arm_factory = arm_factory
+        self.arms, self.sources, self.ready = {}, {}, {}
+        self.samples = deque(maxlen=256)
+        self.sample_lock = threading.Lock()
+        self.errors = []
+        self.stopped = threading.Event()
+        self.sampler = None
+        self.closed = False
+        self.info = {"status": "starting", "cleanup_complete": False,
+            "motion_commands": [], "camera_reset": False, "views": {},
+            "cleanup_errors": [], "pid": os.getpid(), "camera_lifecycle": "real_teleop"}
+        self.save()
+        # Acquire one watchdog before opening any device; teardown reuses it.
+        self._operation_condition = threading.Condition()
+        self._operation = None
+        self._watchdog_stopped = False
+        self._watchdog = threading.Thread(
+            target=self._watch_operations, name="readonly-operation-watchdog", daemon=True)
+        self._watchdog.start()
 
-    def sample() -> None:
-        while not stopped.is_set():
-            cycle = time.monotonic()
-            try:
-                report["qpos_samples"].append({side: read_arm(arm) for side, arm in arms.items()})
-            except Exception as exc:
-                errors.append(f"{type(exc).__name__}: {exc}")
+    def save(self):
+        save_json(self.output / "lifecycle.json", self.info)
+
+    def stage(self, name, **details):
+        row = {"stage": name, "wall_time_sec": time.time(), **details}
+        with (self.output / "capture_stages.jsonl").open("a", encoding="utf-8") as log:
+            log.write(json.dumps(row, allow_nan=False) + "\n")
+        print(json.dumps(row, ensure_ascii=False, allow_nan=False), flush=True)
+
+    def _watch_operations(self):
+        with self._operation_condition:
+            while not self._watchdog_stopped:
+                if self._operation is None:
+                    self._operation_condition.wait()
+                    continue
+                _token, name, timeout_sec, deadline, abort = self._operation
+                remaining = deadline - time.monotonic()
+                if remaining > 0:
+                    self._operation_condition.wait(timeout=remaining)
+                    continue
+                self._operation = None
+                try:
+                    self.info.update(status="operation_timeout", cleanup_complete=False,
+                        error={"type": "TimeoutError", "message": f"{name} exceeded {timeout_sec:.1f}s"})
+                    self.stage("operation_timeout", operation=name, timeout_sec=timeout_sec)
+                    self.save()
+                finally:
+                    abort(124)
+
+    def _finish_watchdog_when_idle(self):
+        with self._operation_condition:
+            if self._operation is not None:
                 return
-            stopped.wait(max(0, .05 - (time.monotonic() - cycle)))
+            self._watchdog_stopped = True
+            self._operation_condition.notify_all()
+        self._watchdog.join(timeout=.5)
 
-    try:
-        save_report()
-        stage("check_device_ownership")
-        assert_devices_idle(ips)
-        sources = readonly_camera_sources(args.camera_config)
-        for key, source in sources.items():
-            report["views"][ROLES[key]] = {"serial": source.config.serial, "status": "unavailable", "frames": []}
-        save_report()
-        stage("start_cameras", lifecycle="real_teleop")
+    @contextmanager
+    def bounded_operation(self, name, *, timeout_sec=60., abort=os._exit):
+        # Human input has no deadline; every native operation retains its budget.
+        token = object()
+        with self._operation_condition:
+            if self._watchdog_stopped or not self._watchdog.is_alive():
+                raise RuntimeError("Read-only operation watchdog is unavailable")
+            if self._operation is not None:
+                raise RuntimeError("Read-only native operations cannot overlap")
+            self._operation = (token, name, timeout_sec, time.monotonic() + timeout_sec, abort)
+            self._operation_condition.notify_all()
+        try:
+            yield
+        finally:
+            with self._operation_condition:
+                if self._operation is not None and self._operation[0] is token:
+                    self._operation = None
+                    self._operation_condition.notify_all()
+            if self.closed:
+                self._finish_watchdog_when_idle()
+    def start(self):
+        from teleop_runtime.deploy.camera_runtime import run_camera_startup_self_check
+        from teleop_runtime.real_teleop import camera_runtime
+
+        self.stage("check_device_ownership")
+        assert_devices_idle(self.ips)
+        self.sources = readonly_camera_sources(self.camera_config)
+        for key, source in self.sources.items():
+            self.info["views"][ROLES[key]] = {"serial": source.config.serial, "status": "unavailable", "frames": []}
+        self.save()
+        self.stage("start_cameras", lifecycle="real_teleop")
         camera_errors = camera_runtime._start_camera_sources_best_effort(
-            sources, startup_progress=CameraProgress(stage),
-        )
-        for key, source in sources.items():
-            record = report["views"][ROLES[key]]
+            self.sources, startup_progress=CameraProgress(self.stage))
+        for key, source in self.sources.items():
+            record = self.info["views"][ROLES[key]]
             record["device_info"] = source.device_info()
             if key in camera_errors:
                 record["error"] = camera_errors[key]
             else:
                 record["status"] = "ready"
-        save_report()
-        # The canonical batch reports exception types in its error strings.
-        # Honor its terminal TimeoutError even if the native call returned and
-        # the source has already transitioned back to stopped.
-        startup_timed_out = any("TimeoutError:" in detail for detail in camera_errors.values())
-        source_faulted = any(record["device_info"]["lifecycle_state"] == "faulted" for record in report["views"].values())
+        self.save()
+        startup_timed_out = any("TimeoutError:" in value for value in camera_errors.values())
+        source_faulted = any(record["device_info"]["lifecycle_state"] == "faulted"
+            for record in self.info["views"].values())
         if startup_timed_out or source_faulted:
             raise RuntimeError(f"Camera lifecycle fault or startup timeout; no arm connection attempted: {camera_errors}")
-        ready = {key: source for key, source in sources.items() if key not in camera_errors}
-        if not ready:
+        self.ready = {key: source for key, source in self.sources.items() if key not in camera_errors}
+        if not self.ready:
             raise RuntimeError(f"No usable camera; no reset attempted: {camera_errors}")
-        stage("camera_freshness_check", cameras=list(ready))
-        run_camera_startup_self_check(ready)
-        # Only admit arm reads after cameras are healthy; a native camera
-        # startup stall must not retain RM65 connections. Recheck arm ownership
-        # because camera negotiation may have taken several seconds.
-        assert_arm_connections_idle(ips)
+        self.stage("camera_freshness_check", cameras=list(self.ready))
+        run_camera_startup_self_check(self.ready)
+        assert_arm_connections_idle(self.ips)
         for side in ("left", "right"):
-            stage("connect_arm_readonly", side=side)
-            arms[side] = arm_factory(ips[side])
-            stage("read_initial_qpos", side=side)
-            initial = read_arm(arms[side])
-            stage("initial_qpos_ready", side=side, **initial)
-        frames = {ROLES[key]: [] for key in ready}
-        sampler = threading.Thread(target=sample, name="readonly-qpos", daemon=True)
-        sampler.start()
+            self.stage("connect_arm_readonly", side=side)
+            self.arms[side] = self.arm_factory(self.ips[side])
+            self.stage("read_initial_qpos", side=side)
+            self.stage("initial_qpos_ready", side=side, **read_arm(self.arms[side]))
+        self.sampler = threading.Thread(target=self._sample, name="readonly-qpos", daemon=True)
+        self.sampler.start()
         time.sleep(.2)
-        capture_start = time.time()
-        previous = {}
-        for index in range(5):
-            if errors:
-                raise RuntimeError(errors[0])
-            batch = next_frames(ready, previous, after=capture_start)
-            for key, frame in batch.items():
-                frames[ROLES[key]].append(diagnostic_frame_payload(ready[key], frame, index=index))
-                previous[key] = (frame.metadata["source_generation"], frame.frame_index)
-            time.sleep(.07)
-        capture_end = time.time()
-        time.sleep(.15)
-        stopped.set()
-        sampler.join(timeout=2)
-        if sampler.is_alive() or errors:
-            raise RuntimeError(f"Read-only qpos sampler did not complete: {errors}")
-        report["stationarity"] = stationarity(report["qpos_samples"], capture_start, capture_end)
-        report["capture_started_at"], report["capture_finished_at"] = capture_start, capture_end
-        report["data_captured"] = True
-    except (Exception, KeyboardInterrupt) as exc:
-        report["error"] = {"type": type(exc).__name__, "message": str(exc)}
-    finally:
-        stopped.set()
-        if sampler is not None:
-            sampler.join(timeout=2)
-        # Preserve data and the primary error before SDK teardown. A blocked
-        # close or an outer SIGKILL must not erase the acquisition evidence.
+        self.assert_healthy()
+        self.info["status"] = "ready"
+        self.save()
+        self.stage("session_ready", cameras=list(self.ready),
+            missing_roles=[role for role, view in self.info["views"].items() if view["status"] != "ready"])
+
+    def _sample(self):
+        while not self.stopped.is_set():
+            cycle = time.monotonic()
+            try:
+                row = {side: read_arm(arm) for side, arm in self.arms.items()}
+                with self.sample_lock:
+                    self.samples.append(row)
+            except Exception as exc:
+                self.errors.append(f"{type(exc).__name__}: {exc}")
+                self.stage("qpos_sampler_failed", error=self.errors[-1])
+                return
+            self.stopped.wait(max(0, .05 - (time.monotonic() - cycle)))
+
+    def history(self):
+        with self.sample_lock:
+            return list(self.samples)
+
+    def assert_healthy(self):
+        if self.closed or self.errors or self.sampler is None or not self.sampler.is_alive():
+            raise RuntimeError(f"Read-only qpos sampler is unavailable: {self.errors}")
+        rows = self.history()
+        if not rows:
+            raise RuntimeError("Read-only sampler has no measured state")
+        age = time.time() - min(row["finished_at"] for row in rows[-1].values())
+        if not 0 <= age <= .2:
+            raise RuntimeError(f"Read-only measured qpos is stale or has invalid time: {age:.3f}s")
+        for key, source in self.ready.items():
+            info = source.device_info()
+            if not info["running"] or info["lifecycle_state"] != "running":
+                raise RuntimeError(f"{key}: camera is no longer running: {info}")
+
+    def capture_state(self, args, *, create_output=True):
+        from PIL import Image
+
+        output = Path(args.output)
+        if create_output:
+            output.mkdir(parents=True, exist_ok=False)
+        held = create_output
+        report = {"schema": "agenticrobot.readonly_rgbd_qpos.v2" if held else "agenticrobot.readonly_rgbd_qpos.v1",
+            "status": "failed", "motion_commands": [], "camera_reset": False, "arm_ips": self.ips,
+            "pid": os.getpid(), "camera_lifecycle": "real_teleop", "cleanup_complete": False,
+            "data_captured": False, "views": copy.deepcopy(self.info["views"]),
+            "qpos_samples": [], "cleanup_errors": [], "persistence_errors": []}
+        if held:
+            report.update(resource_lifecycle="session",
+                session_lifecycle=os.path.relpath(self.output / "lifecycle.json", output))
+        if getattr(args, "scene_object", None):
+            report["scene_objects"] = [{"id": key, "name": name, "source": "operator_declared"}
+                for key in dict.fromkeys(args.scene_object)
+                for known, name in SCENE_OBJECTS.values() if known == key]
+            report["scene_note"] = getattr(args, "scene_note", "")
+        save_json(output / "snapshot.json", report)
+        self.stage("capture_state_begin", output=str(output))
+        started = time.time()
+        finished = started
         try:
-            for role, observations in frames.items():
-                for arrays, metadata in observations:
-                    stem = f"{role}_{metadata['index']:02d}"
-                    np.savez_compressed(output / f"{stem}.npz", **arrays)
-                    Image.fromarray(arrays["rgb"]).save(output / f"{stem}.jpg")
-                    report["views"][role]["frames"].append({**metadata, "file": f"{stem}.npz"})
+            self.assert_healthy()
+            # Pre-bracket the acquisition from the continuous, bounded history.
+            time.sleep(.05)
+            started = time.time()
+            previous = {}
+            for index in range(5):
+                self.assert_healthy()
+                frames = next_frames(self.ready, previous, after=started)
+                for key, frame in frames.items():
+                    arrays, metadata = diagnostic_frame_payload(self.ready[key], frame, index=index)
+                    stem = f"{ROLES[key]}_{index:02d}"
+                    # Persist each observed frame before the next native wait.
+                    try:
+                        np.savez_compressed(output / f"{stem}.npz", **arrays)
+                        Image.fromarray(arrays["rgb"]).save(output / f"{stem}.jpg")
+                    except OSError as exc:
+                        report["persistence_errors"].append(f"{type(exc).__name__}: {exc}")
+                        raise
+                    report["views"][ROLES[key]]["frames"].append({**metadata, "file": f"{stem}.npz"})
+                    previous[key] = (frame.metadata["source_generation"], frame.frame_index)
+                finished = time.time()
+                save_json(output / "snapshot.json", report)
+                time.sleep(.07)
+            finished = time.time()
+            time.sleep(.15)
+            self.assert_healthy()
+            report["qpos_samples"] = self._capture_history(started, finished)
+            report["stationarity"] = stationarity(report["qpos_samples"], started, finished)
+            report["data_captured"] = True
+            if held:
+                report["status"] = "captured"
+        except (Exception, KeyboardInterrupt) as exc:
+            report["error"] = {"type": type(exc).__name__, "message": str(exc)}
+        finally:
+            report["capture_started_at"], report["capture_finished_at"] = started, finished
+            if not report["qpos_samples"]:
+                report["qpos_samples"] = self._capture_history(started, finished)
             report["missing_roles"] = [role for role in ROLES.values() if not report["views"].get(role, {}).get("frames")]
             report["all_views_captured"] = all(len(report["views"].get(role, {}).get("frames", [])) == 5 for role in ROLES.values())
-            save_report()
-        except Exception as exc:
-            # Artifact failure is fatal, but must not bypass device teardown.
-            report["persistence_errors"].append(f"{type(exc).__name__}: {exc}")
-        # Never close an SDK handle concurrently with an inflight read. The
-        # bounded outer process owns and releases these sockets on exit.
-        if sampler is None or not sampler.is_alive():
-            for side, arm in arms.items():
-                try:
-                    try:
-                        stage("close_arm_readonly", side=side)
-                    finally:
-                        code = arm.Arm_Socket_Close()
-                    if code:
-                        report["cleanup_errors"].append(f"{side}: close returned {code}")
-                except Exception as exc:
-                    report["cleanup_errors"].append(f"{side}: {exc}")
-        else:
-            report["cleanup_errors"].append("SDK read still inflight; process exit releases sockets")
+            save_json(output / "snapshot.json", report)
+            self.stage("capture_state_saved", output=str(output), status=report["status"],
+                data_captured=report["data_captured"], all_views_captured=report["all_views_captured"],
+                error=report.get("error"))
+        return report
+
+    def _capture_history(self, started, finished):
+        return [row for row in self.history()
+            if max(item["finished_at"] for item in row.values()) >= started - .2
+            and min(item["started_at"] for item in row.values()) <= finished + .15]
+
+    def close(self):
+        from teleop_runtime.real_teleop import camera_runtime
+
+        if self.closed:
+            return
+        self.closed = True
+        self.stopped.set()
+        self.info["status"] = "closing"
+        deferred_error = None
         try:
             try:
-                stage("close_cameras", lifecycle="real_teleop")
-            finally:
-                camera_runtime._close_camera_sources(sources)
-        except Exception as exc:
-            report["cleanup_errors"].append(f"cameras: {type(exc).__name__}: {exc}")
-        report["cleanup_complete"] = not report["cleanup_errors"]
+                self.save()
+            except BaseException as exc:
+                # Re-raise after independent owned cleanup, including cancellation.
+                deferred_error = exc
+                self.info["cleanup_errors"].append(f"lifecycle record: {type(exc).__name__}: {exc}")
+            sampler_finished = self.sampler is None
+            try:
+                if self.sampler is not None:
+                    self.sampler.join(timeout=2)
+                    sampler_finished = not self.sampler.is_alive()
+            except BaseException as exc:
+                if deferred_error is None or (
+                    not isinstance(exc, Exception) and isinstance(deferred_error, Exception)
+                ):
+                    deferred_error = exc
+                self.info["cleanup_errors"].append(f"sampler join: {type(exc).__name__}: {exc}")
+            if sampler_finished:
+                for side, arm in self.arms.items():
+                    try:
+                        try:
+                            self.stage("close_arm_readonly", side=side)
+                        finally:
+                            code = arm.Arm_Socket_Close()
+                        if code:
+                            self.info["cleanup_errors"].append(f"{side}: close returned {code}")
+                    except BaseException as exc:
+                        self.info["cleanup_errors"].append(f"{side}: {type(exc).__name__}: {exc}")
+                        if not isinstance(exc, Exception) and (
+                            deferred_error is None or isinstance(deferred_error, Exception)
+                        ):
+                            deferred_error = exc
+            else:
+                self.info["cleanup_errors"].append("SDK read still inflight or unconfirmed; process exit releases sockets")
+            try:
+                try:
+                    self.stage("close_cameras", lifecycle="real_teleop")
+                finally:
+                    camera_runtime._close_camera_sources(self.sources)
+            except BaseException as exc:
+                self.info["cleanup_errors"].append(f"cameras: {type(exc).__name__}: {exc}")
+                if not isinstance(exc, Exception) and (
+                    deferred_error is None or isinstance(deferred_error, Exception)
+                ):
+                    deferred_error = exc
+            self.info["cleanup_complete"] = not self.info["cleanup_errors"]
+            self.info["status"] = "closed" if self.info["cleanup_complete"] else "cleanup_failed"
+            try:
+                self.save()
+            except BaseException as exc:
+                self.info.update(cleanup_complete=False, status="cleanup_failed")
+                if deferred_error is None or (
+                    not isinstance(exc, Exception) and isinstance(deferred_error, Exception)
+                ):
+                    deferred_error = exc
+            if deferred_error is not None:
+                raise deferred_error
+        finally:
+            # An active close phase owns the deadline until its context exits.
+            self._finish_watchdog_when_idle()
+
+def capture(args, *, arm_factory) -> dict:
+    session = ReadOnlySnapshotSession(args, arm_factory=arm_factory)
+    report = {"schema": "agenticrobot.readonly_rgbd_qpos.v1", "status": "failed",
+        "data_captured": False, "cleanup_complete": False, "motion_commands": [], "camera_reset": False,
+        "views": {}, "qpos_samples": [], "persistence_errors": []}
+    try:
+        with session.bounded_operation("startup"):
+            session.start()
+        with session.bounded_operation("capture"):
+            report = session.capture_state(args, create_output=False)
+    except (Exception, KeyboardInterrupt) as exc:
+        report.update(error={"type": type(exc).__name__, "message": str(exc)},
+            views=copy.deepcopy(session.info["views"]))
+    finally:
+        # Keep the original one-shot evidence-before-teardown contract.
+        try:
+            save_json(session.output / "snapshot.json", report)
+        except OSError as exc:
+            report["persistence_errors"].append(f"{type(exc).__name__}: {exc}")
+        finally:
+            with session.bounded_operation("close"):
+                session.close()
+        report["cleanup_errors"] = session.info["cleanup_errors"]
+        report["cleanup_complete"] = session.info["cleanup_complete"]
         if report["data_captured"] and report["cleanup_complete"] and not report["persistence_errors"] and "error" not in report:
             report["status"] = "captured"
-        save_report()
-    print(json.dumps({"status": report["status"], "output": str(output), "error": report.get("error"),
-                      "roles": list(frames), "qpos_samples": len(report["qpos_samples"]),
-                      "cleanup_errors": report["cleanup_errors"],
-                      "persistence_errors": report["persistence_errors"]}), flush=True)
+        save_json(session.output / "snapshot.json", report)
+    print(json.dumps({"status": report["status"], "output": str(session.output),
+        "error": report.get("error"), "cleanup_errors": report["cleanup_errors"]}), flush=True)
     return report
+
+
+def check_inputs(args) -> dict:
+    """Validate source/configuration/dependencies without opening any device."""
+    repo = Path(args.repo).resolve(strict=True)
+    commit = subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip()
+    if subprocess.check_output(["git", "-C", str(repo), "status", "--porcelain", "--untracked-files=no"], text=True).strip():
+        raise RuntimeError("Capture source has tracked changes; deploy a clean Git revision first")
+    sys.path.insert(0, str(repo))
+    required = CONTEXT_FILES if args.interactive else CONTEXT_FILES[:2]
+    resolved = {}
+    for name in required:
+        value = getattr(args, name, None)
+        if not value:
+            raise ValueError(f"--{name.replace('_', '-')} is required for interactive collection")
+        path = Path(value).resolve(strict=True)
+        if not path.is_file():
+            raise ValueError(f"{name} must be a file")
+        resolved[name] = str(path)
+    for name in ("PIL", "pyrealsense2"):
+        if importlib.util.find_spec(name) is None:
+            raise RuntimeError(f"Missing dependency: {name}; no devices opened")
+    for name in ("ss", "fuser", "timeout"):
+        if shutil.which(name) is None:
+            raise RuntimeError(f"Missing executable in PATH: {name}; no devices opened")
+    ips = json.loads(Path(resolved["arm_ip_assignment"]).read_text())["arm_ip_by_side"]
+    if any(not isinstance(ips.get(side), str) or not ips[side] for side in ("left", "right")):
+        raise ValueError("Arm assignment must name both controller IPs")
+    # Construction holds only cached Python state. Do not call start()/query_devices().
+    sources = readonly_camera_sources(resolved["camera_config"])
+    from hardware.rm65.rm_api2_adapter import RM65, Arm
+    del Arm, RM65  # Verify the SDK can load, without constructing a connection.
+    return {"source_commit": commit, "python": sys.executable, "files": resolved,
+            "cameras": {ROLES[key]: {"serial": source.config.serial,
+                "width": source.config.width, "height": source.config.height,
+                "fps": source.config.fps} for key, source in sources.items()},
+            "hardware_connected": False}
+
+
+def parse_scene_selection(answer: str, previous):
+    if not answer.strip():
+        if previous is None:
+            raise ValueError("首次采集请至少输入一个物体编号，例如 1 或 1 4")
+        return previous
+    numbers, _, note = answer.partition("|")
+    tokens = numbers.replace(",", " ").replace("，", " ").split()
+    if not tokens or any(token not in SCENE_OBJECTS for token in tokens):
+        raise ValueError("物体编号只允许 1、2、3、4；多个编号用空格分隔")
+    return tuple(dict.fromkeys(SCENE_OBJECTS[token][0] for token in tokens)), note.strip()
+
+
+def interactive_capture(args, *, context, arm_factory, input_fn=input) -> int:
+    output = Path(args.output)
+    output.mkdir(parents=True, exist_ok=False)
+    config_dir = output / "context"
+    config_dir.mkdir()
+    frozen_files = {}
+    for name, path in context["files"].items():
+        target = config_dir / (name + Path(path).suffix)
+        shutil.copyfile(path, target)
+        frozen_files[name] = target
+    metadata = {**context, "schema": "agenticrobot.readonly_grasp_collection.v2",
+        "context_copies": {name: str(path.relative_to(output)) for name, path in frozen_files.items()},
+        "object_catalog": [{"id": key, "name": name} for key, name in SCENE_OBJECTS.values()],
+        "motion_commands": [], "operation_timeout_sec": 60, "resource_lifecycle": "session",
+        "annotation_source": "operator_declared", "device_lifecycle": "devices/lifecycle.json",
+        "status": "starting", "hardware_connected": False}
+    save_json(output / "session.json", metadata)
+    device_args = SimpleNamespace(output=output / "devices",
+        camera_config=frozen_files["camera_config"], arm_ip_assignment=frozen_files["arm_ip_assignment"])
+    session = ReadOnlySnapshotSession(device_args, arm_factory=arm_factory)
+    previous, ordinal, code = None, 0, 0
+    try:
+        print(f"只读采集目录：{output}；正在启动一次设备会话。", flush=True)
+        with session.bounded_operation("startup"):
+            session.start()
+        metadata.update(status="ready", hardware_connected=True)
+        save_json(output / "session.json", metadata)
+        print("不发送运动、HOLD、STOP、夹爪或相机 reset 指令。设备保持连接直到退出。", flush=True)
+        missing = [role for role, view in session.info["views"].items() if view["status"] != "ready"]
+        if missing:
+            print(f"注意：缺少视角 {missing}；本会话只能采集部分视角，不是完整三视角数据。", flush=True)
+        print("物体编号：1 蓝色方块；2 蓝色小瓶子；3 红色方块；4 黑色水杯。", flush=True)
+        print("输入编号并回车采集，例如 1 4；可加 | 场景说明/实际尺寸。", flush=True)
+        print("之后直接回车重复上一组标签；物体变化时重新输入编号；q 统一关闭设备并结束。", flush=True)
+        while True:
+            answer = input_fn("物体编号 / 回车采集 / q 结束: ").strip()
+            if answer.lower() == "q":
+                break
+            try:
+                objects, note = parse_scene_selection(answer, previous)
+            except ValueError as exc:
+                print(str(exc), flush=True)
+                continue
+            previous = objects, note
+            ordinal += 1
+            sample_dir = output / f"state_{ordinal:04d}"
+            sample_dir.mkdir()
+            save_json(sample_dir / "scene.json", {"scene_objects": objects,
+                "scene_note": note, "source": "operator_declared", "triggered_at": time.time()})
+            capture_args = SimpleNamespace(output=sample_dir / "capture",
+                scene_object=objects, scene_note=note)
+            print(f"保存新状态，不重启设备：{sample_dir}；请保持场景静止。", flush=True)
+            with session.bounded_operation("capture"):
+                report = session.capture_state(capture_args)
+            # Explicitly link a held-resource capture to its eventual teardown,
+            # rather than pretending each state disconnected the devices.
+            record = {"state": sample_dir.name, "scene_objects": objects, "scene_note": note,
+                "status": report["status"], "resource_lifecycle": "session",
+                "all_views_captured": report["all_views_captured"],
+                "missing_roles": report["missing_roles"],
+                "snapshot": str((capture_args.output / "snapshot.json").relative_to(output))}
+            with (output / "samples.jsonl").open("a", encoding="utf-8") as log:
+                log.write(json.dumps(record, ensure_ascii=False) + "\n")
+                log.flush()
+            if report.get("error", {}).get("type") == "KeyboardInterrupt":
+                code = 130
+                break
+            if report["status"] != "captured":
+                print(f"本状态失败，诊断已保存：{report.get('error')}。", flush=True)
+                # A moving scene can be re-sampled. A dead/stale device cannot
+                # be restored by relabeling or by silently restarting it.
+                session.assert_healthy()
+                if report["persistence_errors"]:
+                    code = 1
+                    break
+            else:
+                print(f"已保存 {sample_dir.name}；三视角完整={record['all_views_captured']}。", flush=True)
+    except (EOFError, KeyboardInterrupt):
+        code = 130
+        print("会话取消，正在统一关闭设备；已保存的数据不删除。", flush=True)
+    except Exception as exc:
+        code = 1
+        session.info["error"] = {"type": type(exc).__name__, "message": str(exc)}
+        session.save()
+        session.stage("session_failed", **session.info["error"])
+    finally:
+        with session.bounded_operation("close"):
+            session.close()
+        metadata.update(cleanup_complete=session.info["cleanup_complete"],
+            status="closed" if session.info["cleanup_complete"] else "cleanup_failed",
+            sample_count=ordinal, exit_code=code,
+            hardware_connected=False if session.info["cleanup_complete"] else None)
+        if not session.info["cleanup_complete"]:
+            code = 1
+            metadata["exit_code"] = code
+        save_json(output / "session.json", metadata)
+        print(f"采集结束；状态数={ordinal}；设备清理完成={session.info['cleanup_complete']}；记录保存在：{output}", flush=True)
+    return code
 
 
 def main() -> int:
@@ -355,7 +714,20 @@ def main() -> int:
     parser.add_argument("--camera-config", required=True)
     parser.add_argument("--arm-ip-assignment", required=True)
     parser.add_argument("--output", required=True)
+    parser.add_argument("--interactive", action="store_true", help="Operator-labeled repeated read-only snapshots")
+    parser.add_argument("--check-only", action="store_true", help="Validate paths/imports without opening devices")
+    for name in CONTEXT_FILES[2:]:
+        parser.add_argument("--" + name.replace("_", "-"))
+    parser.add_argument("--scene-object", action="append", choices=[key for key, _ in SCENE_OBJECTS.values()])
+    parser.add_argument("--scene-note", default="")
     args = parser.parse_args()
+    if args.check_only:
+        print(json.dumps(check_inputs(args), ensure_ascii=False, indent=2), flush=True)
+        return 0
+    if args.interactive:
+        if not sys.stdin.isatty():
+            parser.error("Interactive collection needs terminal input; do not pipe a heredoc into Python")
+        context = check_inputs(args)
     sys.path.insert(0, args.repo)
     from hardware.rm65.rm_api2_adapter import Arm, RM65
 
@@ -366,6 +738,8 @@ def main() -> int:
 
     signal.signal(signal.SIGTERM, interrupted)
     signal.signal(signal.SIGINT, interrupted)
+    if args.interactive:
+        return interactive_capture(args, context=context, arm_factory=lambda ip: Arm(RM65, ip))
     result = capture(args, arm_factory=lambda ip: Arm(RM65, ip))
     if result.get("error", {}).get("type") == "KeyboardInterrupt":
         return 130

@@ -64,6 +64,20 @@ def test_readonly_snapshot_rejects_arbitrary_command(wrapper_environment):
     assert not calls.exists()
 
 
+def test_readonly_preflight_preview_keeps_context_and_never_connects(wrapper_environment):
+    environment, calls = wrapper_environment
+    result = _run(environment, "remote_rm65_grasp_snapshot.sh", "-H", "trusted-target",
+        "--repo", "/repo", "--python", "/python", "--camera-config", "/cameras.json",
+        "--arm-ip-assignment", "/arms.json", "--output", "/new-evidence",
+        "--camera-registry", "/registry.json", "--camera-mount-urdf", "/cad.urdf",
+        "--left-tool-profile", "/left.json", "--right-tool-profile", "/right.json",
+        "--check-only", "--dry-run")
+    assert result.returncode == 0
+    assert not calls.exists()
+    assert "--check-only" in result.stdout and "--interactive" in result.stdout
+    assert "/cad.urdf" in result.stdout
+
+
 @pytest.mark.parametrize("wrapper", ["remote_python.sh", "remote_module.sh", "remote_pytest.sh"])
 def test_generic_execution_rejects_control_authority_overrides(
     wrapper_environment: tuple[dict[str, str], Path], wrapper: str

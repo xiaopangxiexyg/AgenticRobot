@@ -33,6 +33,28 @@ def test_retained_model_output_cannot_be_reused_for_another_cloud(tmp_path):
         backend.infer_object(points[:2])
 
 
+@pytest.mark.parametrize("status,clean", [("ready", False), ("cleanup_failed", False), ("closed", True)])
+def test_persistent_snapshot_requires_eventual_session_cleanup(tmp_path, status, clean):
+    import json
+    capture = tmp_path / "state_0001/capture"
+    capture.mkdir(parents=True)
+    device = tmp_path / "devices"
+    device.mkdir()
+    report = {"schema": "agenticrobot.readonly_rgbd_qpos.v2", "status": "captured", "stationarity": {},
+        "session_lifecycle": "../../devices/lifecycle.json"}
+    (capture / "snapshot.json").write_text(json.dumps(report))
+    (device / "lifecycle.json").write_text(json.dumps({"status": status, "cleanup_complete": clean}))
+    if clean:
+        assert replay.load_snapshot_report(capture) == report
+        report["session_lifecycle"] = "../../outside.json"
+        (capture / "snapshot.json").write_text(json.dumps(report))
+        with pytest.raises(ValueError, match="lifecycle reference"):
+            replay.load_snapshot_report(capture)
+    else:
+        with pytest.raises(ValueError, match="still active"):
+            replay.load_snapshot_report(capture)
+
+
 def test_auxiliary_mask_is_bound_to_both_image_and_association_seed(tmp_path):
     import json
     from PIL import Image

@@ -405,17 +405,44 @@ RPent 手动入口的对应显式选项是 `--grasp-view-policy single|auto`；`
 夹爪或相机 reset。原始数据保留相机内参、设备时间与主机接收时间、双臂关节序列及清理结果。
 模型测试由 `remote_grasp_snapshot_inference.sh` 在已保存数组上运行，不再次连接设备。
 采集探针复用 rule-base / real-teleop 的 `RealSenseRGBSource` 和串行启动/反序关闭流程，
-按配置优先级错峰启动并持续取帧；软件重试预算由共享生命周期管理，没有另一套原生 pipeline
-预热/轮询循环。保留颜色传输格式、分辨率、帧率和 RGB-D 对齐，保存图像统一转换为 RGB。
+按配置优先级错峰启动并持续取帧；专用只读探针绑定单 pipeline 策略，初始失败后本会话不重开，
+运行期失败也不通过自动重开恢复。共享生命周期执行该策略，不修改正式遥操作的默认恢复配置，
+没有另一套原生 pipeline 预热/轮询循环。保留颜色传输格式、分辨率、帧率和 RGB-D 对齐，保存图像统一转换为 RGB。
 始终禁用三种 hardware-reset 配置及曝光参数写入；诊断读取 source 缓存，不追加原生 SDK 查询。
 只有相机连续新鲜帧检查通过后才连接双臂，避免相机启动阻塞连带保留机械臂连接。
 阶段和初始 qpos 实时写入 `capture_stages.jsonl`；帧数据与 `snapshot.json` 在设备关闭前保存，
 主错误、清理错误分别保留。若原生 USB 调用卡在 Linux D 状态，外层 60 s timeout 仍不能保证
 进程退出；启动超时终止本批次，不继续开相机或连接双臂，也不自动重置设备。
-`cleanup_complete=false` 不能解释为设备已释放。`captured` 只证明可用视角已完成静止采集且清理
+`cleanup_complete=false` 不能解释为设备已释放。原单次 v1 的 `captured` 只证明可用视角已完成静止采集且清理
 成功，缺失视角列在 `missing_roles`，只有 `all_views_captured=true` 才表示三个视角都保存了五帧，
 仍不代表三视角融合、规划或真实抓取验收。RGB-D 同帧，接收/可用/设备时间分别保留，
 不会用读取缓存的当前时间把旧帧伪装成新帧。
+
+`scripts/probes/capture_rm65_grasp_snapshot.py --interactive` 提供终端按键采集，与单次探针共享同一设备 owner。
+输入 `1` 蓝色方块、`2` 蓝色小瓶子、`3` 红色方块、`4` 黑色水杯；多个物体如 `1 4`。
+编号后可加 `| 场景说明/实测尺寸`；回车触发一次状态记录，随后空回车重复上一组标签，`q` 正常结束。
+物体变化时必须重新输入编号。标签是人工声明，不是模型识别，也不证明物体在所有视角中可见。
+每个状态保存三视角各五帧的原始对齐 RGB-D（可用视角）、JPEG、内参及独立时间域、采集前后双臂
+qpos、SDK pose 和静止性诊断。程序启动时连接相机与双臂一次，按键仅读取新鲜帧和对应 qpos；
+等待输入期间保持连接，不重复启动/关闭设备。`q`、Ctrl+C、异常或 EOF 时统一清理。持续只读
+采样使用 20 Hz、有界 256 组历史；每个状态只保存采集前后附近的关节窗口，不因之前调整机械臂
+而把整个会话误判为不静止。捕获期间的静止性、时间与 RGB-D 同帧要求不变。
+
+交互模式额外要求 `--camera-registry`、`--camera-mount-urdf`、`--left-tool-profile` 和
+`--right-tool-profile`。启动时与相机配置/IP 表一起复制到新会话的 `context/`，并保存源码 Git commit；
+单次实际读取使用冻结的相机配置与 IP 表，配置变化需要新会话。`session.json` 保存上下文，
+`samples.jsonl` 逐次追加成功/失败索引，`state_0001/scene.json` 在读取本次图像前保存人工标签；
+`devices/capture_stages.jsonl` 实时保存启动、采样与关闭阶段，`devices/lifecycle.json` 单独记录
+会话级设备清理结果。每张图像在等待下一帧前保存，错误不会覆盖前面已完成的状态。
+目录存在时不覆盖。启动、单次采样及关闭分别有 60 s 看门狗，不把人工等待时间计入预算；
+超时保存未清理标记并终止本进程，不自动重启设备。内核 D 状态仍不能据此推断已释放。
+普通非静止失败可在同一连接下重采；设备死亡/过期、存储失败则结束会话，不放宽新鲜度或静止阈值。
+缺视角在进入交互前明确警告，并逐状态保留，不伪装为完整三视角采样。
+常驻模式 snapshot 使用 `agenticrobot.readonly_rgbd_qpos.v2`，`resource_lifecycle=session`；
+`cleanup_complete=false` 不冒充每次断开，引用 `../../devices/lifecycle.json` 的最终状态。
+离线 replay 在会话已关闭且清理完成后才接收 v2。原限定单次探针仍返回 v1 并在返回前完成关闭。
+不使用 heredoc、`exec` 或管道向 Python 提供交互输入。`--check-only` 只验证文件、导入和依赖，
+不会打开设备；限定远端 wrapper 同样支持此选项，不用于替代真实数据验收。
 
 离线多视角回放可重复传入 `--aux-segmentation DIR`，使用 `infer_frozen_grasp.py` 保存的真实辅助视角
 分割。目录中的 RGB 数组和关联种子必须与请求逐一匹配；缺少/错配分割不能用全图 mask 冒充成功融合。
