@@ -160,6 +160,115 @@ class _FakeHardwareDevice:
             raise self.reset_error
 
 
+def test_native_depth_diagnostics_are_opt_in_and_require_depth():
+    assert not RealSenseRGBCameraConfig(serial="test").retain_unaligned_depth
+    with pytest.raises(ValueError, match="requires enable_depth"):
+        RealSenseRGBCameraConfig(serial="test", retain_unaligned_depth=True)
+    config = RealSenseRGBCameraConfig(serial="test", enable_depth=True, retain_unaligned_depth=True)
+    assert RealSenseRGBCameraConfig(**config.to_dict()).retain_unaligned_depth
+
+
+@pytest.mark.parametrize("retain", [False, True])
+def test_capture_preserves_native_depth_before_alignment_without_another_read(monkeypatch, retain):
+    source = RealSenseRGBSource(RealSenseRGBCameraConfig(serial="test", enable_depth=True,
+        color_format="bgr8", retain_unaligned_depth=retain))
+    order = []
+    raw = np.full((2, 3), 900, dtype=np.uint16)
+    aligned = np.full((3, 4), 1000, dtype=np.uint16)
+
+    def frame(data, number):
+        return SimpleNamespace(get_data=lambda: data, get_timestamp=lambda: 120.,
+            get_frame_number=lambda: number, get_frame_timestamp_domain=lambda: "hardware_clock",
+            get_frame_metadata=lambda _: 120.)
+
+    color, depth = frame(np.full((3, 4, 3), 30, dtype=np.uint8), 10), frame(raw, 9)
+    depth.get_data = lambda: order.append("native_copy") or raw
+    frames = SimpleNamespace(get_depth_frame=lambda: depth, get_color_frame=lambda: color)
+
+    def align(frames):
+        order.append("align")
+        return SimpleNamespace(get_color_frame=lambda: color, get_depth_frame=lambda: frame(aligned, 9))
+
+    source._depth_align = SimpleNamespace(process=align)
+    source._depth_scale_m_per_unit = .001
+    source._device_info = {"depth_intrinsics": {"width": 3, "height": 2},
+        "intrinsics": {"width": 4, "height": 3},
+        "depth_to_color_extrinsics": {"rotation_layout": "column_major"}}
+    waits = []
+    source._pipeline = SimpleNamespace(wait_for_frames=lambda **kw: waits.append(kw) or frames)
+    monkeypatch.setattr(realsense_rgb, "_load_pyrealsense2", lambda: SimpleNamespace(
+        frame_metadata_value=SimpleNamespace(sensor_timestamp="sensor_timestamp")))
+    active = iter((True, False))
+    monkeypatch.setattr(source, "_is_generation_active", lambda *a: next(active))
+    source._capture_loop(1, threading.Event())
+    stored = source.frame_buffer().get_latest()
+    assert stored is not None
+    assert len(waits) == 1
+    np.testing.assert_array_equal(stored.depth_image, aligned)
+    assert not stored.depth_image.flags.writeable
+    if retain:
+        assert order == ["native_copy", "align"]
+        assert not stored.unaligned_depth_image.flags.writeable
+        np.testing.assert_array_equal(stored.unaligned_depth_image, 900)
+        raw[:] = 12
+        copied = source.get_latest_frame()
+        np.testing.assert_array_equal(copied.unaligned_depth_image, 900)
+        copied.unaligned_depth_image[:] = 34
+        np.testing.assert_array_equal(stored.unaligned_depth_image, 900)
+        assert stored.unaligned_depth_metadata["frame_number"] == stored.depth_metadata["frame_number"] == 9
+        assert stored.unaligned_depth_metadata["camera_timestamp_sec"] == stored.depth_metadata["camera_timestamp_sec"]
+    else:
+        assert order == ["align"]
+        assert stored.unaligned_depth_image is None
+        assert stored.unaligned_depth_metadata == {}
+
+
+@pytest.mark.parametrize("retain", [False, True])
+def test_native_depth_calibration_uses_negotiated_profiles(monkeypatch, retain):
+    source = RealSenseRGBSource(RealSenseRGBCameraConfig(serial="test", enable_depth=True,
+        retain_unaligned_depth=retain))
+    k = SimpleNamespace(width=4, height=3, fx=10., fy=11., ppx=2., ppy=1., coeffs=[0.]*5, model="none")
+    calls = []
+    rotation = [0., 1., 0., -1., 0., 0., 0., 0., 1.]
+    color = SimpleNamespace(get_intrinsics=lambda: k)
+    depth = SimpleNamespace(get_intrinsics=lambda: k, get_extrinsics_to=lambda target:
+        calls.append(target) or SimpleNamespace(rotation=rotation, translation=[.01, 0., 0.]))
+    profile = SimpleNamespace(get_stream=lambda stream: SimpleNamespace(
+        as_video_stream_profile=lambda: color if stream == "color" else depth),
+        get_device=lambda: SimpleNamespace(get_info=lambda _: "test"))
+    monkeypatch.setattr(realsense_rgb, "_load_pyrealsense2", lambda: SimpleNamespace(
+        stream=SimpleNamespace(color="color", depth="depth"),
+        camera_info=SimpleNamespace(name="name", product_line="product_line", serial_number="serial",
+                                    firmware_version="firmware")))
+    info = source._device_info_from_profile(profile)
+    assert calls == ([color] if retain else [])
+    if retain:
+        assert info["depth_to_color_extrinsics"] == {"rotation": rotation,
+            "rotation_layout": "column_major", "translation_m": [.01, 0., 0.]}
+        assert info["depth_intrinsics"]["model"] == "none"
+        assert info["intrinsics"]["model"] == "none"
+
+
+def test_diagnostic_calibration_failure_closes_the_started_pipeline_without_reopening(monkeypatch):
+    source = RealSenseRGBSource(RealSenseRGBCameraConfig(serial="test", enable_depth=True,
+        retain_unaligned_depth=True))
+    stops, starts = [], []
+    pipeline = SimpleNamespace(stop=lambda: stops.append("stop"))
+    monkeypatch.setattr(realsense_rgb, "_load_pyrealsense2", lambda: object())
+    monkeypatch.setattr(source, "_start_pipeline", lambda *a, **kw:
+        starts.append("start") or (pipeline, object()))
+
+    def unavailable(profile):
+        raise RuntimeError("Unaligned depth diagnostics require depth intrinsics")
+
+    monkeypatch.setattr(source, "_device_info_from_profile", unavailable)
+    with pytest.raises(RuntimeError, match="require depth intrinsics"):
+        source.start()
+    assert starts == ["start"] and stops == ["stop"]
+    assert source._pipeline is None and source._thread is None
+    assert not source.device_info()["running"]
+
+
 def test_realsense_legacy_startup_settles_and_warms_up_front_without_depth() -> None:
     fake_rs = _FakeRealSense()
     source = RealSenseRGBSource(

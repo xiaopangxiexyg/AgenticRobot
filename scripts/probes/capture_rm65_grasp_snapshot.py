@@ -7,6 +7,7 @@ SDK construction reads robot info; cleanup deletes only this process's handles.
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import os
 import signal
@@ -39,6 +40,7 @@ def readonly_camera_sources(config_path):
         config.startup_hardware_reset_on_failure = False
         config.startup_hardware_reset_on_warmup_failure = False
         config.auto_exposure_priority = None
+        config.retain_unaligned_depth = True
     return {key: RealSenseRGBSource(config) for key, config in configs.items() if key in ROLES}
 
 
@@ -119,6 +121,25 @@ def frame_payload(source, frame, *, index):
         "intrinsics": {"fx": intr["fx"], "fy": intr["fy"], "cx": intr["ppx"], "cy": intr["ppy"]},
         "index": index,
     }
+
+
+def diagnostic_frame_payload(source, frame, *, index):
+    """Persist native Z16 beside the unchanged aligned metric input."""
+    rgb, depth, metadata = frame_payload(source, frame, index=index)
+    raw = frame.unaligned_depth_image
+    raw_meta = frame.unaligned_depth_metadata
+    if (raw is None or raw.dtype != np.uint16 or raw.ndim != 2
+            or raw_meta.get("aligned_to") != "none"
+            or raw_meta.get("frame_number") != frame.depth_metadata.get("frame_number")
+            or raw_meta.get("camera_timestamp_sec") != frame.depth_metadata.get("camera_timestamp_sec")
+            or raw_meta.get("depth_scale_m_per_unit") != frame.depth_metadata.get("depth_scale_m_per_unit")):
+        raise RuntimeError(f"{source.camera_key}: missing or mismatched unaligned depth evidence")
+    intr = raw_meta.get("intrinsics", {})
+    if (raw.shape != (intr.get("height"), intr.get("width"))
+            or not all(key in raw_meta for key in ("color_intrinsics", "depth_to_color_extrinsics"))):
+        raise RuntimeError(f"{source.camera_key}: unaligned depth calibration is incomplete")
+    metadata["unaligned_depth_metadata"] = copy.deepcopy(raw_meta)
+    return {"rgb": rgb, "depth_m": depth, "unaligned_depth_z16": raw}, metadata
 
 
 def assert_arm_connections_idle(arm_ips: dict[str, str]) -> None:
@@ -262,7 +283,7 @@ def capture(args, *, arm_factory) -> dict:
                 raise RuntimeError(errors[0])
             batch = next_frames(ready, previous, after=capture_start)
             for key, frame in batch.items():
-                frames[ROLES[key]].append(frame_payload(ready[key], frame, index=index))
+                frames[ROLES[key]].append(diagnostic_frame_payload(ready[key], frame, index=index))
                 previous[key] = (frame.metadata["source_generation"], frame.frame_index)
             time.sleep(.07)
         capture_end = time.time()
@@ -284,10 +305,10 @@ def capture(args, *, arm_factory) -> dict:
         # close or an outer SIGKILL must not erase the acquisition evidence.
         try:
             for role, observations in frames.items():
-                for rgb, depth, metadata in observations:
+                for arrays, metadata in observations:
                     stem = f"{role}_{metadata['index']:02d}"
-                    np.savez_compressed(output / f"{stem}.npz", rgb=rgb, depth_m=depth)
-                    Image.fromarray(rgb).save(output / f"{stem}.jpg")
+                    np.savez_compressed(output / f"{stem}.npz", **arrays)
+                    Image.fromarray(arrays["rgb"]).save(output / f"{stem}.jpg")
                     report["views"][role]["frames"].append({**metadata, "file": f"{stem}.npz"})
             report["missing_roles"] = [role for role in ROLES.values() if not report["views"].get(role, {}).get("frames")]
             report["all_views_captured"] = all(len(report["views"].get(role, {}).get("frames", [])) == 5 for role in ROLES.values())

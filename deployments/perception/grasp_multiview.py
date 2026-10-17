@@ -131,7 +131,7 @@ def _associate_target(
     view: GraspRgbdView, anchor_points: np.ndarray,
     segment_point: Callable, policy: GraspViewFusionPolicy,
     anchor: GraspRgbdView, anchor_mask: np.ndarray,
-) -> tuple[np.ndarray | None, str, int]:
+) -> tuple[np.ndarray | None, str, int, dict]:
     """Use visible anchor surface samples, not a possibly occluded 3-D centroid."""
     pose = view.reference_from_camera
     xyz = (anchor_points - pose[:3, 3]) @ pose[:3, :3]
@@ -143,15 +143,15 @@ def _associate_target(
               & (pixels[:, 1] >= 0) & (pixels[:, 1] < h))
     pixels, xyz = pixels[inside], xyz[inside]
     if not len(pixels):
-        return None, "target_out_of_view", 0
+        return None, "target_out_of_view", 0, {}
     observed = view.depth_m[pixels[:, 1], pixels[:, 0]]
     matched = (observed > 0) & (np.abs(observed-xyz[:, 2]) <= policy.depth_agreement_m)
     if np.count_nonzero(matched) < 3:
         reason = "target_occluded" if np.all((observed > 0) & (observed < xyz[:, 2]-policy.depth_agreement_m)) else "target_depth_unconfirmed"
-        return None, reason, 0
+        return None, reason, 0, {}
     pixels = np.unique(pixels[matched], axis=0)
     if len(pixels) < 3:
-        return None, "insufficient_shared_target_surface", len(pixels)
+        return None, "insufficient_shared_target_surface", len(pixels), {}
     center = np.median(pixels, axis=0)
     seed = pixels[np.argmin(np.sum((pixels-center)**2, axis=1))]
     mask = np.asarray(segment_point(Image.fromarray(view.rgb), pixel_uv=tuple(int(x) for x in seed)), dtype=bool)
@@ -159,15 +159,21 @@ def _associate_target(
         raise RuntimeError("Auxiliary target segmenter returned an invalid mask")
     agreement = np.mean(mask[pixels[:, 1], pixels[:, 0]])
     target = _points(view, mask)
+    evidence = {"target_depth_points": len(target),
+                "shared_pixel_mask_agreement": float(agreement)}
     if len(target) < policy.min_target_points or agreement < 0.5:
-        return None, "target_association_rejected", len(pixels)
+        return None, "target_association_rejected", len(pixels), evidence
     # A mask containing the seed is insufficient: reject a disconnected or
     # grossly over-segmented object. This is an association check, not completion
     # of unseen geometry or permission to move through unobserved space.
     distance, _ = cKDTree(anchor_points).query(target)
     span = float(np.linalg.norm(np.ptp(anchor_points, axis=0)))
-    if np.quantile(distance, 0.95) > max(0.10, 2.0 * span):
-        return None, "target_geometry_inconsistent", len(pixels)
+    distance_p95 = float(np.quantile(distance, 0.95))
+    evidence.update(target_to_anchor_distance_p95_m=distance_p95,
+        target_xyz_span_m=np.ptp(target, axis=0).tolist(),
+        target_depth_quantiles_m=np.quantile(view.depth_m[mask & (view.depth_m > 0)], [.05, .5, .95]).tolist())
+    if distance_p95 > max(0.10, 2.0 * span):
+        return None, "target_geometry_inconsistent", len(pixels), evidence
     # Check the reverse association only where the anchor actually observes
     # that surface. Hidden backsides may add evidence; visible neighbours must
     # not become exempt target-contact geometry through an oversized mask.
@@ -181,9 +187,15 @@ def _associate_target(
     observed = anchor.depth_m[uv[:, 1], uv[:, 0]]
     confirmed = (observed > 0) & (np.abs(observed-anchor_xyz[:, 2]) <= policy.depth_agreement_m)
     conflicting = confirmed & ~anchor_mask[uv[:, 1], uv[:, 0]]
-    if np.count_nonzero(conflicting) >= 3 and np.count_nonzero(conflicting) > .1*np.count_nonzero(confirmed):
-        return None, "target_background_conflict", len(pixels)
-    return mask, "target_and_environment", len(pixels)
+    confirmed_count, conflict_count = int(np.count_nonzero(confirmed)), int(np.count_nonzero(conflicting))
+    # Evidence describes the existing gate; it never authorizes target contact
+    # or deletes geometry. Count surface samples, as the original gate does.
+    evidence.update(reverse_confirmed_surface_samples=confirmed_count,
+        reverse_background_conflict_samples=conflict_count,
+        reverse_background_conflict_fraction=conflict_count / max(1, confirmed_count))
+    if conflict_count >= 3 and conflict_count > .1*confirmed_count:
+        return None, "target_background_conflict", len(pixels), evidence
+    return mask, "target_and_environment", len(pixels), evidence
 
 
 def fuse_grasp_views(
@@ -220,15 +232,19 @@ def fuse_grasp_views(
     diagnostics = []
     scenes = []
     for index, view in enumerate(views):
+        association_evidence = {}
         if index == 0:
             selected_mask, reason, shared = mask, "anchor", len(anchor_points)
         elif abs(view.acquired_at-anchor.acquired_at) > policy.max_frame_skew_sec:
             diagnostics.append({"role": view.role, "used": False, "reason": "frame_skew_exceeded"})
             continue
         else:
-            selected_mask, reason, shared = _associate_target(view, anchor_points, segment_point, policy, anchor, mask)
+            selected_mask, reason, shared, association_evidence = _associate_target(
+                view, anchor_points, segment_point, policy, anchor, mask)
+        evidence = {"association_evidence": association_evidence} if association_evidence else {}
         if selected_mask is None:
-            diagnostics.append({"role": view.role, "used": False, "reason": reason, "shared_target_pixels": shared})
+            diagnostics.append({"role": view.role, "used": False, "reason": reason,
+                                "shared_target_pixels": shared, **evidence})
             continue
         masks[view.role] = selected_mask.copy()
         # Protect the original target pixels during self/background denoising.
@@ -251,7 +267,7 @@ def fuse_grasp_views(
         scenes.append(scene)
         diagnostics.append({"role": view.role, "used": True, "reason": reason,
                             "target_points": int(np.count_nonzero(scene.target_mask)),
-                            "shared_target_pixels": shared})
+                            "shared_target_pixels": shared, **evidence})
         if index == 0 and refinement is not None:
             diagnostics[-1]["target_depth_refinement"] = refinement
     points = np.concatenate([s.points for s in scenes])

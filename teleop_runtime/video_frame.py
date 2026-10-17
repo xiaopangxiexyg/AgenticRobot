@@ -25,6 +25,9 @@ class VideoFrame:
     metadata: dict[str, Any] = field(default_factory=dict)
     depth_image: Any | None = None
     depth_metadata: dict[str, Any] = field(default_factory=dict)
+    # Optional diagnostic evidence from the same frameset, before alignment.
+    unaligned_depth_image: Any | None = None
+    unaligned_depth_metadata: dict[str, Any] = field(default_factory=dict)
 
 
 class NearestFrameBuffer:

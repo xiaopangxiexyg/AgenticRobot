@@ -94,6 +94,10 @@ def test_associated_wrist_adds_metric_geometry_once():
     result = fuse(auxiliary=(view("wrist_left", reference_from_camera=pose),), segment=segment)
     assert len(calls) == 1
     assert result.view_diagnostics[1]["used"]
+    evidence = result.view_diagnostics[1]["association_evidence"]
+    assert evidence["reverse_background_conflict_samples"] == 0
+    assert evidence["target_depth_quantiles_m"] == [.5, .5, .5]
+    json.dumps(result.view_diagnostics, allow_nan=False)
     assert len(result.scene.points) > len(fuse().scene.points)
 
 
@@ -165,7 +169,13 @@ def test_auxiliary_mask_cannot_relabel_visible_neighbour_as_target():
     contaminated[10:22, 22:26] = True
     result = fuse(auxiliary=(view("wrist_left"),), segment=lambda *a, **kw: contaminated)
     assert result.view_diagnostics[1]["reason"] == "target_background_conflict"
+    evidence = result.view_diagnostics[1]["association_evidence"]
+    assert evidence["reverse_confirmed_surface_samples"] == 192
+    assert evidence["reverse_background_conflict_samples"] == 48
+    assert evidence["reverse_background_conflict_fraction"] == .25
+    assert evidence["target_xyz_span_m"] == pytest.approx([.075, .055, 0.])
     np.testing.assert_array_equal(result.scene.points, fuse().scene.points)
+    np.testing.assert_array_equal(result.scene.target_mask, fuse().scene.target_mask)
 
 
 def test_bad_pose_or_segmenter_fault_is_not_silently_dropped():

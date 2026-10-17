@@ -45,6 +45,16 @@ def make_frame(index=1, *, received_at=None):
                   "color_frame_number": index},
         depth_metadata={"aligned_to": "color", "depth_scale_m_per_unit": .001,
                         "frame_number": index, "camera_timestamp_sec": index * .01},
+        unaligned_depth_image=np.full((2, 3), 900 + index, dtype=np.uint16),
+        unaligned_depth_metadata={"aligned_to": "none", "format": "z16",
+            "frame_number": index, "camera_timestamp_sec": index * .01,
+            "depth_scale_m_per_unit": .001,
+            "intrinsics": {"width": 3, "height": 2, "fx": 10., "fy": 11.,
+                "ppx": 1., "ppy": 1., "model": "distortion.none", "coeffs": [0.]*5},
+            "color_intrinsics": {"width": 4, "height": 3, "fx": 10., "fy": 11.,
+                "ppx": 2., "ppy": 1., "model": "distortion.none", "coeffs": [0.]*5},
+            "depth_to_color_extrinsics": {"rotation": np.eye(3).reshape(-1).tolist(),
+                "rotation_layout": "column_major", "translation_m": [.01, 0., 0.]}},
     )
 
 
@@ -149,6 +159,7 @@ def test_config_reuses_collection_policy_without_reset_or_stream_downgrade(captu
         assert (config.width, config.height, config.fps, config.color_format) == (4, 3, 15, "bgr8")
         assert (config.depth_width, config.depth_height, config.depth_fps) == (4, 3, 15)
         assert config.enable_depth and config.align_depth_to_color
+        assert config.retain_unaligned_depth
         assert config.startup_warmup_policy == "bounded_first_frame" and config.require_complete_frameset
         assert config.restart_on_incomplete_frameset
         assert not config.startup_hardware_reset
@@ -195,6 +206,12 @@ def test_capture_reuses_order_live_workers_and_reverse_cleanup(capture_args, cam
                 assert data["rgb"][0, 0].tolist() == [1, 2, 3]
                 np.testing.assert_allclose(data["depth_m"], (1000 + frame["frame_number"]) * .001,
                                            rtol=0, atol=np.finfo(np.float32).eps)
+                assert data["unaligned_depth_z16"].shape == (2, 3)
+                assert data["unaligned_depth_z16"].dtype == np.uint16
+                np.testing.assert_array_equal(data["unaligned_depth_z16"], 900 + frame["frame_number"])
+            raw_meta = frame["unaligned_depth_metadata"]
+            assert raw_meta["frame_number"] == frame["depth_metadata"]["frame_number"]
+            assert raw_meta["depth_to_color_extrinsics"]["translation_m"] == [.01, 0., 0.]
 
 
 def test_unavailable_view_gets_only_canonical_deferred_retry(capture_args, camera_rig):
@@ -340,6 +357,25 @@ def test_rgb_depth_and_timestamps_come_from_one_source_frame():
     assert metadata["device_timestamp_ms"] == 70.
     assert metadata["depth_metadata"]["frame_number"] == metadata["frame_number"] == 7
     assert metadata["intrinsics"] == {"fx": 10, "fy": 11, "cx": 2, "cy": 1}
+
+
+@pytest.mark.parametrize("invalid", ["missing", "frame_number", "timestamp", "scale", "shape", "calibration"])
+def test_native_depth_evidence_must_match_the_aligned_frame(invalid):
+    frame = make_frame()
+    if invalid == "missing":
+        frame = replace(frame, unaligned_depth_image=None)
+    elif invalid == "shape":
+        frame = replace(frame, unaligned_depth_image=np.zeros((2, 4), dtype=np.uint16))
+    elif invalid == "calibration":
+        frame.unaligned_depth_metadata.pop("depth_to_color_extrinsics")
+    else:
+        key = {"frame_number": "frame_number", "timestamp": "camera_timestamp_sec",
+               "scale": "depth_scale_m_per_unit"}[invalid]
+        frame.unaligned_depth_metadata[key] += 1
+    source = SimpleNamespace(camera_key="front", device_info=lambda: {"intrinsics": {
+        "fx": 10, "fy": 11, "ppx": 2, "ppy": 1}})
+    with pytest.raises(RuntimeError, match="unaligned depth"):
+        probe.diagnostic_frame_payload(source, frame, index=0)
 
 
 @pytest.mark.parametrize("invalid", ["depth_missing", "unaligned", "zero_scale", "nan_scale"])

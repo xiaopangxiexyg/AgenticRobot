@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import math
@@ -131,6 +132,8 @@ class RealSenseRGBCameraConfig:
     depth_height: int | None = None
     depth_fps: int = 15
     align_depth_to_color: bool = True
+    # Default-off: retain native Z16 data for read-only alignment diagnostics.
+    retain_unaligned_depth: bool = False
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -144,6 +147,8 @@ class RealSenseRGBCameraConfig:
         if int(self.fps) <= 0:
             raise ValueError("RealSense RGB fps must be positive.")
         self.color_format = _normalize_color_format(self.color_format)
+        if self.retain_unaligned_depth and not self.enable_depth:
+            raise ValueError("retain_unaligned_depth requires enable_depth.")
         if int(self.keep_last) <= 0:
             raise ValueError("keep_last must be positive.")
         if int(self.wait_timeout_ms) <= 0:
@@ -269,6 +274,7 @@ class RealSenseRGBCameraConfig:
                 "depth_height": int(self.depth_height),
                 "depth_fps": int(self.depth_fps),
                 "align_depth_to_color": bool(self.align_depth_to_color),
+                "retain_unaligned_depth": bool(self.retain_unaligned_depth),
                 "metadata": dict(self.metadata),
             }
         )
@@ -1331,8 +1337,21 @@ class RealSenseRGBSource(ObservationSource):
                     "ppy": float(depth_intr.ppy),
                     "coeffs": [float(value) for value in depth_intr.coeffs],
                 }
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
+                if self.config.retain_unaligned_depth:
+                    raise RuntimeError("Unaligned depth diagnostics require depth intrinsics") from exc
                 info["depth_intrinsics_error"] = f"{type(exc).__name__}: {exc}"
+            if self.config.retain_unaligned_depth:
+                # Calibration is queried once from the negotiated profiles,
+                # not by snapshot consumers or on every frame.
+                info["intrinsics"]["model"] = str(intr.model)
+                info["depth_intrinsics"]["model"] = str(depth_intr.model)
+                extrinsics = depth_profile.get_extrinsics_to(color_profile)
+                info["depth_to_color_extrinsics"] = {
+                    "rotation": [float(value) for value in extrinsics.rotation],
+                    "rotation_layout": "column_major",
+                    "translation_m": [float(value) for value in extrinsics.translation],
+                }
         for key, info_name in {
             "device_name": rs.camera_info.name,
             "product_line": rs.camera_info.product_line,
@@ -1655,6 +1674,7 @@ class RealSenseRGBSource(ObservationSource):
                 finally:
                     pipeline = None
                 received_at = time.time()
+                unaligned_depth_image, unaligned_depth_metadata = self._unaligned_depth_snapshot(frames)
                 color_frame, depth_frame = self._required_stream_frames(frames)
                 if not self._required_streams_complete(color_frame, depth_frame):
                     if self._record_incomplete_frameset(
@@ -1761,6 +1781,8 @@ class RealSenseRGBSource(ObservationSource):
                     },
                     depth_image=depth_snapshot,
                     depth_metadata=depth_metadata,
+                    unaligned_depth_image=unaligned_depth_image,
+                    unaligned_depth_metadata=unaligned_depth_metadata,
                 )
                 frame = self._frame_buffer.publish(frame)
                 with self._lock:
@@ -1816,6 +1838,32 @@ class RealSenseRGBSource(ObservationSource):
                 )
 
 
+    def _unaligned_depth_snapshot(self, frames: Any) -> tuple[np.ndarray | None, dict[str, Any]]:
+        if not self.config.retain_unaligned_depth:
+            return None, {}
+        depth = frames.get_depth_frame()
+        if not depth:
+            return None, {}
+        # Copy before align.process: no SDK-owned buffer or frame handle escapes
+        # into the history. Native and aligned resolutions may differ.
+        image = np.array(depth.get_data(), copy=True, order="C")
+        image.setflags(write=False)
+        with self._lock:
+            calibration = copy.deepcopy({
+                "intrinsics": self._device_info["depth_intrinsics"],
+                "color_intrinsics": self._device_info["intrinsics"],
+                "depth_to_color_extrinsics": self._device_info["depth_to_color_extrinsics"],
+            })
+        return image, {
+            "aligned_to": "none", "format": "z16",
+            "width": int(image.shape[1]), "height": int(image.shape[0]),
+            "depth_scale_m_per_unit": self._depth_scale_m_per_unit,
+            "frame_number": int(depth.get_frame_number()),
+            "camera_timestamp_sec": float(depth.get_timestamp()) / 1000.,
+            "timestamp_domain": str(depth.get_frame_timestamp_domain()),
+            **calibration,
+        }
+
     def get_latest_frame(self) -> VideoFrame | None:
         with self._lock:
             if self._latest_frame is None:
@@ -1834,6 +1882,9 @@ class RealSenseRGBSource(ObservationSource):
                 else np.asarray(frame.depth_image).copy()
             ),
             depth_metadata=dict(frame.depth_metadata),
+            unaligned_depth_image=(None if frame.unaligned_depth_image is None
+                                   else np.asarray(frame.unaligned_depth_image).copy()),
+            unaligned_depth_metadata=copy.deepcopy(frame.unaligned_depth_metadata),
         )
 
     def frame_buffer(self) -> NearestFrameBuffer:
