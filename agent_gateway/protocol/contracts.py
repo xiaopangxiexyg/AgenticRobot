@@ -12,6 +12,7 @@ import json
 import math
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from functools import cached_property
 from types import MappingProxyType
 from typing import Any
 
@@ -1477,8 +1478,10 @@ class AgentSkillOperation:
     def terminal(self) -> bool:
         return self.status in AGENT_SKILL_TERMINAL_OPERATION_STATUSES_V1
 
-    @property
+    @cached_property
     def semantic_content_hash(self) -> str:
+        # All payloads are recursively frozen at construction. A revision is a
+        # new operation instance, so polling this projection cannot change it.
         return canonical_content_hash(
             self.to_wire(include_hash=False),
             domain=AGENT_SKILL_OPERATION_HASH_DOMAIN_V2,

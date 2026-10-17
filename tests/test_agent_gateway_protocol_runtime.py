@@ -11,6 +11,7 @@ from agent_gateway.protocol.artifact_contracts import (
     AgentArtifactMaterializationReceipt,
     AgentArtifactRef,
 )
+from agent_gateway.protocol.contracts import AgentSkillOperation
 from agent_gateway.protocol.session_contracts import AgentGatewaySessionCapabilities
 from agent_gateway.protocol.skill_catalog import (
     AgentSkillSchemaCatalog,
@@ -276,6 +277,52 @@ def _artifact_runtime(tmp_path: Path):
         current_station_revision=lambda: 0,
     )
     return adapter, store
+
+
+def test_event_poll_hashes_each_immutable_operation_revision_once(tmp_path, monkeypatch):
+    import agent_gateway.protocol.contracts as contracts
+
+    adapter, store = _artifact_runtime(tmp_path)
+    runtime = adapter.service.protocol_runtime
+    canonical_hash = contracts.canonical_content_hash
+    calls = []
+    def counted(payload, *, domain):
+        if domain == contracts.AGENT_SKILL_OPERATION_HASH_DOMAIN_V2:
+            calls.append(payload["operation_id"])
+        return canonical_hash(payload, domain=domain)
+    monkeypatch.setattr(contracts, "canonical_content_hash", counted)
+    operation = AgentSkillOperation(operation_id="operation:poll", request_hash="request:poll",
+        runtime_session_id=runtime.runtime_session_id, status="running", reason_code="running",
+        station_revision_at_admission=0, current_station_revision=0,
+        started_at=1., updated_at=1., deadline_at=30., progress_summary={"phase": ["prepare"]})
+    try:
+        first = runtime.replay_events(after_sequence=0, max_events=16, operations=[operation])
+        assert len(first.events) == 1
+        for _ in range(5):
+            batch = runtime.replay_events(after_sequence=first.latest_sequence, max_events=16,
+                operations=[operation])
+            assert not batch.events
+            assert batch.latest_sequence == first.latest_sequence
+        assert calls == [operation.operation_id]
+        equivalent = replace(operation)
+        runtime.synchronize_operations([equivalent])
+        assert len(calls) == 2
+        assert runtime.event_journal.latest_sequence == first.latest_sequence
+        changed = replace(operation, status="completed", reason_code="completed", updated_at=2.,
+            execution_outcome="completed", execution_result={"points": [[1., 2., 3.]]})
+        batch = runtime.replay_events(after_sequence=first.latest_sequence, max_events=16,
+            operations=[changed])
+        assert len(calls) == 3
+        assert [e.event_kind for e in batch.events] == ["operation_terminal"]
+        for i in range(20):
+            runtime.synchronize_operations([replace(changed, updated_at=3.+i)])
+        assert runtime.replay_events(after_sequence=0, max_events=16).gap_detected
+        sequence = runtime.event_journal.latest_sequence
+        with pytest.raises(ValueError, match="another runtime session"):
+            runtime.synchronize_operations([replace(changed, runtime_session_id="another")])
+        assert runtime.event_journal.latest_sequence == sequence
+    finally:
+        store.close()
 
 
 def test_protocol_runtime_rejects_event_journal_payload_bound_mismatch(

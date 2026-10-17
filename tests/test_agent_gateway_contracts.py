@@ -290,7 +290,7 @@ def test_observation_snapshot_is_causal_and_not_a_safety_permit() -> None:
         replace(snapshot, fault_rearmable=True)
 
 
-def test_operation_separates_running_from_terminal_success() -> None:
+def test_operation_separates_running_from_terminal_success(monkeypatch) -> None:
     running = AgentSkillOperation(
         operation_id="operation:test",
         request_hash="request-hash:test",
@@ -329,6 +329,28 @@ def test_operation_separates_running_from_terminal_success() -> None:
     assert completed.terminal
     assert completed.task_outcome == "not_assessed"
     assert completed.to_wire()["operation_hash"] == completed.semantic_content_hash
+
+    import agent_gateway.protocol.contracts as contracts
+    canonical_hash = contracts.canonical_content_hash
+    calls = []
+    def counted(value, *, domain):
+        calls.append(domain)
+        return canonical_hash(value, domain=domain)
+    monkeypatch.setattr(contracts, "canonical_content_hash", counted)
+    revision = replace(completed, updated_at=21.1,
+        execution_result={"values": [{"position": [1., 2., 3.]}]})
+    expected = canonical_hash(revision.to_wire(include_hash=False),
+        domain=contracts.AGENT_SKILL_OPERATION_HASH_DOMAIN_V2)
+    assert revision.semantic_content_hash == expected
+    for _ in range(5):
+        assert revision.semantic_content_hash == expected
+        assert revision.to_wire()["operation_hash"] == expected
+    assert calls == [contracts.AGENT_SKILL_OPERATION_HASH_DOMAIN_V2]
+    with pytest.raises(TypeError):
+        revision.execution_result["values"][0]["position"][0] = 4.
+    updated = replace(revision, updated_at=21.2)
+    assert updated.semantic_content_hash != expected
+    assert calls == [contracts.AGENT_SKILL_OPERATION_HASH_DOMAIN_V2] * 2
 
     evaluated_failure = replace(
         completed,
