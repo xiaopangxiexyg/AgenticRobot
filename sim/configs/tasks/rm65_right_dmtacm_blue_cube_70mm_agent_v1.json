@@ -2,7 +2,7 @@
   "extends": "sim/configs/tasks/rm65_right_cube_reach_fixed_pose_xyz_proprio_v1.json",
   "name": "rm65_right_dmtacm_blue_cube_70mm_agent_v1",
   "base_contract_path": "sim/configs/rm65_bimanual_dmtacm_blue_cube_70mm_v1.json",
-  "base_contract_sha256": "1817b561f79a56cb0dd32513c7de0cde932a9cb082a70909dab415f034a12600",
+  "base_contract_sha256": "40d4d51919d57d4b8893e6f94ef4784650b0225d942e531df50468d64066ea9f",
   "gripper_actuation_profile_name": "dmtac_bimanual_cad_cube_contact_20261017.v2_bounded_stroke",
   "gripper_actuation_profile_sha256": "6f42766fafa12239e15350d8afd3989e2fa84c4c558cdb600f0c39b28795f9ef",
   "left_gripper_name": "left_eg2_4b2_cad",

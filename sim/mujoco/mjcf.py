@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Iterable
 
-from sim.contracts.scene import SceneSpec
+from sim.contracts.scene import ContactMaterialSpec, SceneSpec
 
 from .config import CameraMount
 from .modeling.actuators import add_position_actuators
@@ -109,6 +109,7 @@ def _add_visual_geom(
     visual: URDFVisual,
     geometry_registry: MeshAssetRegistry,
     debug_proxy_visuals: bool = False,
+    rgba_override: tuple[float, float, float, float] | None = None,
 ) -> None:
     is_proxy = _is_proxy_link(link_name)
     is_hidden_debug_visual = is_proxy or _is_translucent_box_visual(visual)
@@ -124,7 +125,11 @@ def _add_visual_geom(
             "name": f"{link_name}_visual_{index}{suffix}",
             "pos": pos_text,
             "quat": quat_text,
-            "rgba": _visual_rgba(visual, mesh_rgba=part.rgba),
+            "rgba": (
+                format_float_list(rgba_override)
+                if rgba_override is not None
+                else _visual_rgba(visual, mesh_rgba=part.rgba)
+            ),
             "contype": "0",
             "conaffinity": "0",
             "group": "1",
@@ -243,6 +248,10 @@ def convert_urdf_to_mjcf_xml(
     collision_filter = CollisionFilter()
     collision_enabled = bool(scene_spec is not None and scene_spec.collision.enabled)
     urdf_contact = None if scene_spec is None else scene_spec.collision.contact
+    visual_colors = {} if scene_spec is None else scene_spec.visual_rgba_by_link
+    unknown = set(visual_colors).difference(model.links)
+    if unknown:
+        raise ValueError(f"Visual color overrides reference unknown URDF links: {sorted(unknown)}")
 
     if collision_enabled:
         add_ground(worldbody, scene_spec.ground, collision_filter)
@@ -261,6 +270,7 @@ def convert_urdf_to_mjcf_xml(
                 visual=visual_item,
                 geometry_registry=geometry_registry,
                 debug_proxy_visuals=debug_proxy_visuals,
+                rgba_override=visual_colors.get(link_name),
             )
         if collision_enabled:
             for index, collision_item in enumerate(link.collisions):

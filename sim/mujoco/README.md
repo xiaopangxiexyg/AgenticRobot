@@ -355,6 +355,14 @@ weld、抓取 latch、qpos 强制回放或摩擦覆盖。80 g 是可改的**仿�
 也不能替代当前六关节 CAD／DMTAC 的动力学验收。完整诊断完成但任一试抬不通过时
 退出码为 2，不能仅凭程序执行完毕宣称抓取成功。
 
+### 可选的传感器外观覆盖
+
+场景可通过 `scene.visual_rgba_by_link` 显式覆盖 URDF link 的可视材质。
+70 mm DMTAC CAD 任务将四个传感器末端设为灰色 `[0.5, 0.5, 0.5, 1]`。
+转换只改可视 geom 的 RGBA；碰撞体、质量、摩擦、关节、TCP 和共享资产不变。
+未配置覆盖时保留原材质和场景序列化身份；未知 link、非有限值和越界颜色在
+构建边界报错。该外观配置不代表新的抓取或携物执行能力。
+
 ## 150 Hz Direct-Qpos Debug Execution
 
 `sim.mujoco.control.DirectQposDebugController` is the temporary execution

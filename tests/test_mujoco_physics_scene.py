@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import xml.etree.ElementTree as ET
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -51,6 +52,48 @@ def _drop_scene(urdf_path: Path) -> SceneSpec:
             ),
         ),
     )
+
+
+def test_visual_color_override_does_not_change_physics(tmp_path: Path) -> None:
+    model = parse_urdf(_isolated_table_world(tmp_path))
+    spec = _drop_scene(model.path)
+    plain = ET.fromstring(convert_urdf_to_mjcf_xml(model, camera_mounts=(), scene_spec=spec))
+    colored = ET.fromstring(convert_urdf_to_mjcf_xml(model, camera_mounts=(),
+        scene_spec=replace(spec, visual_rgba_by_link={"table": (0.5, 0.5, 0.5, 1)})))
+    visual = colored.find(".//geom[@name='table_visual_0']")
+    assert visual.get("rgba") == "0.5 0.5 0.5 1"
+    visual.set("rgba", plain.find(".//geom[@name='table_visual_0']").get("rgba"))
+    assert ET.tostring(colored) == ET.tostring(plain)
+    with pytest.raises(ValueError, match="unknown URDF links"):
+        convert_urdf_to_mjcf_xml(model, camera_mounts=(),
+            scene_spec=replace(spec, visual_rgba_by_link={"missing": (0.5,) * 4}))
+
+
+@pytest.mark.integration
+def test_dmtac_task_has_four_gray_sensor_visuals_without_recoloring_collision() -> None:
+    from sim.mujoco.tasks.cube_lift.config import CubeLiftTaskConfig
+
+    task = CubeLiftTaskConfig.load(
+        "sim/configs/tasks/rm65_right_dmtacm_blue_cube_70mm_agent_v1.json")
+    contract = task.base_contract()
+    model = parse_urdf(contract.scene.urdf_path)
+    plain_spec = replace(contract.scene, visual_rgba_by_link={})
+    converted = []
+    for spec in (plain_spec, contract.scene):
+        converted.append(ET.fromstring(convert_urdf_to_mjcf_xml(model,
+            camera_mounts=(), timestep=.001, scene_spec=spec,
+            gripper_actuation_profile=task.gripper_actuation_profile())))
+    plain, colored = converted
+    assert len(contract.scene.visual_rgba_by_link) == 4
+    for link in contract.scene.visual_rgba_by_link:
+        geoms = colored.findall(f".//body[@name='{link}']/geom")
+        visuals = [geom for geom in geoms if geom.get("group") == "1"]
+        assert visuals
+        for visual in visuals:
+            assert visual.get("rgba") == "0.5 0.5 0.5 1"
+            assert visual.get("contype") == visual.get("conaffinity") == "0"
+            visual.set("rgba", plain.find(f".//geom[@name='{visual.get('name')}']").get("rgba"))
+    assert ET.tostring(colored) == ET.tostring(plain)
 
 
 @pytest.mark.integration

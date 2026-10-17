@@ -48,6 +48,27 @@ def test_simulation_contract_round_trip_is_lossless() -> None:
     assert restored.to_dict() == contract.to_dict()
 
 
+def test_scene_visual_colors_round_trip_and_are_not_mutable() -> None:
+    colors = {"sensor": [0.5, 0.5, 0.5, 1.0]}
+    scene = SceneSpec(visual_rgba_by_link=colors)
+    colors["sensor"][0] = 0.0
+    assert scene.visual_rgba_by_link["sensor"] == (0.5, 0.5, 0.5, 1.0)
+    assert SceneSpec.from_dict(scene.to_dict()).to_dict() == scene.to_dict()
+    with pytest.raises(TypeError):
+        scene.visual_rgba_by_link["other"] = (1.0,) * 4
+    assert "visual_rgba_by_link" not in SceneSpec().to_dict()
+
+
+@pytest.mark.parametrize("colors", (
+    None, [], {"": [0, 0, 0, 1]}, {" sensor": [0, 0, 0, 1]},
+    {"sensor": [0, 0, 0]}, {"sensor": [0, 0, 0, float("nan")]},
+    {"sensor": [-0.1, 0, 0, 1]}, {"sensor": [0, 0, 0, 1.1]},
+))
+def test_scene_rejects_invalid_visual_color_overrides(colors) -> None:
+    with pytest.raises(ValueError):
+        SceneSpec(visual_rgba_by_link=colors)
+
+
 def test_contract_rejects_unknown_nested_schema_version() -> None:
     payload = SimulationContract.load(CONTRACT).to_dict()
     payload["scene"]["schema_version"] = "dexteleop.sim.scene_spec.v999"

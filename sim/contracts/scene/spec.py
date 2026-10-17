@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import Any, Mapping
+from types import MappingProxyType
+from typing import Any
 
 from ..versions import SCENE_SPEC_VERSION, require_version
 from .collision import CollisionSpec
@@ -31,6 +33,9 @@ class SceneSpec:
         default_factory=lambda: (FreeBodyObjectSpec(name="debug_cube"),)
     )
     collision: CollisionSpec = field(default_factory=CollisionSpec)
+    visual_rgba_by_link: Mapping[str, tuple[float, float, float, float]] = field(
+        default_factory=dict
+    )
 
     def __post_init__(self) -> None:
         require_version(self.schema_version, SCENE_SPEC_VERSION, field="scene spec version")
@@ -44,6 +49,17 @@ class SceneSpec:
             raise ValueError("Scene object names must be unique.")
         object.__setattr__(self, "gravity_mps2", gravity)
         object.__setattr__(self, "objects", tuple(self.objects))
+        if not isinstance(self.visual_rgba_by_link, Mapping):
+            raise ValueError("visual_rgba_by_link must be a link-to-RGBA mapping.")
+        colors: dict[str, tuple[float, float, float, float]] = {}
+        for name, value in self.visual_rgba_by_link.items():
+            if not isinstance(name, str) or not name or name != name.strip():
+                raise ValueError("Visual color overrides require non-empty link names.")
+            rgba = finite_tuple(value, 4, f"visual color for {name}")
+            if any(channel < 0 or channel > 1 for channel in rgba):
+                raise ValueError("Visual RGBA channels must be in [0, 1].")
+            colors[name] = rgba
+        object.__setattr__(self, "visual_rgba_by_link", MappingProxyType(colors))
 
     @classmethod
     def kinematic_replay(cls) -> "SceneSpec":
@@ -57,7 +73,7 @@ class SceneSpec:
         )
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        payload = {
             "schema_version": self.schema_version,
             "profile_name": self.profile_name,
             "backend": self.backend,
@@ -69,6 +85,12 @@ class SceneSpec:
             "objects": [obj.to_dict() for obj in self.objects],
             "collision": self.collision.to_dict(),
         }
+        # Preserve existing scene identities when no override is requested.
+        if self.visual_rgba_by_link:
+            payload["visual_rgba_by_link"] = {
+                name: list(rgba) for name, rgba in self.visual_rgba_by_link.items()
+            }
+        return payload
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, Any]) -> "SceneSpec":
@@ -90,6 +112,7 @@ class SceneSpec:
                 for item in payload.get("objects", ({"name": "debug_cube"},))
             ),
             collision=CollisionSpec.from_dict(payload.get("collision")),
+            visual_rgba_by_link=payload.get("visual_rgba_by_link", {}),
         )
 
 

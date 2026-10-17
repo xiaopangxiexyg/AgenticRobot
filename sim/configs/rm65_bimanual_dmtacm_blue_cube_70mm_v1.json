@@ -25,6 +25,12 @@
     "backend_role": "canonical_task_physics",
     "urdf_path": "assets/realman_dual_arm_inspire_gripper_dmtacm/realman_dual_arm_inspire_gripper_dmtacm.urdf",
     "camera_registry_path": "robot_motion/configs/rm65_camera_registry_v4.json",
+    "visual_rgba_by_link": {
+      "left_gripper_l_dm_tac_w2m_sensor": [0.5, 0.5, 0.5, 1.0],
+      "left_gripper_r_dm_tac_w2m_sensor": [0.5, 0.5, 0.5, 1.0],
+      "right_gripper_l_dm_tac_w2m_sensor": [0.5, 0.5, 0.5, 1.0],
+      "right_gripper_r_dm_tac_w2m_sensor": [0.5, 0.5, 0.5, 1.0]
+    },
     "gravity_mps2": [
       0.0,
       0.0,
