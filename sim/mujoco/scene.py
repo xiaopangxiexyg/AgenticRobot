@@ -946,6 +946,11 @@ class MujocoScene:
                 "camera_pose_world_xyz_quat_xyzw": pose_to_xyz_quat_xyzw(
                     self.camera_pose(mount.name)
                 ),
+                # Pinhole depth uses +x right, +y down, +z forward; MuJoCo
+                # renders along -z with +y up (the converter adds Rx(pi)).
+                "optical_camera_pose_world_xyz_quat_xyzw": pose_to_xyz_quat_xyzw(
+                    self.camera_pose(mount.name) @ np.diag((1., -1., -1., 1.))
+                ),
                 "link_pose_world_xyz_quat_xyzw": pose_to_xyz_quat_xyzw(
                     self.camera_link_pose(mount.name)
                 ),

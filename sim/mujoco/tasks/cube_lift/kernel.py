@@ -16,6 +16,7 @@ from ...adapters import MujocoPositionExecutionConfig, MujocoPositionExecutionRi
 from ...collision_safety import project_grippers_then_arms
 from ...grasp_contact import extract_gripper_contact_scores
 from ...scene import MujocoCameraRenderer, MujocoScene
+from ...tool_frames import resolve_task_grasp_frame
 from .action_conditioning import CubeLiftActionConditioner
 from .config import (
     CONTACT_LATCH_DEBUG_GRASP_MODE,
@@ -194,7 +195,7 @@ class CubeLiftKernel:
         self._cube_dof_addr = int(self.model.jnt_dofadr[free_joint_id])
         self._cube_body_id = self.scene.body_id(self.config.object_body_name)
         self._table_body_id = self.scene.body_id(self.config.table_body_name)
-        self._grasp_body_id = self.scene.body_id(self.config.right_grasp_body_name)
+        self._grasp_body_id, self._body_from_grasp = resolve_task_grasp_frame(self.scene, self.config)
         self._left_finger_body_id = self.scene.body_id(
             self.config.grasp_latch_left_finger_body_name
         )
@@ -1717,7 +1718,9 @@ class CubeLiftKernel:
         out[6] = np.clip(np.mean(closes), 0.0, 1.0)
         out[7:14] = cube_qpos
         out[14:20] = cube_qvel
-        out[20:23] = cube_qpos[:3] - self.data.xpos[self._grasp_body_id]
+        grasp_position = (self.data.xpos[self._grasp_body_id]
+                          + self.data.xmat[self._grasp_body_id].reshape(3, 3) @ self._body_from_grasp[:3, 3])
+        out[20:23] = cube_qpos[:3] - grasp_position
         out[23:30] = self._last_action
         out[30] = self._episode_steps / self.config.max_episode_steps
         if not np.all(np.isfinite(out)):

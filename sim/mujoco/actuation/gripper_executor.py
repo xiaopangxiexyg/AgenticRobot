@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Mapping
 
 import numpy as np
 
@@ -48,6 +48,11 @@ class MujocoDmtacGripperExecutor:
                     f"{gripper_name} scene/profile joint mismatch: "
                     f"scene={tuple(spec.joint_names)} profile={tuple(joint_names)}"
                 )
+            if (
+                tuple(spec.open_qpos) != profile.open_qpos_by_gripper[gripper_name]
+                or tuple(spec.closed_qpos) != profile.closed_qpos_by_gripper[gripper_name]
+            ):
+                raise ValueError(f"{gripper_name} scene/profile operating range mismatch.")
             ids: list[int] = []
             for index in range(len(joint_names)):
                 actuator_name = profile.actuator_name(gripper_name, index)
@@ -344,6 +349,11 @@ class MujocoDmtacGripperExecutor:
             ),
             "measured_close_by_gripper": self.measured_close_by_gripper(),
             "pending_delayed_targets": core["pending_delayed_targets"],
+            "measured_max_joint_speed_rad_sec_by_gripper": {
+                name: float(np.max(np.abs(self.scene.data.qvel[
+                    [self.scene.joint_dof_addr(joint) for joint in joints]])))
+                for name, joints in self.profile.joint_names_by_gripper.items()
+            },
             "last_status_by_gripper": dict(self._last_status_by_gripper),
         }
 

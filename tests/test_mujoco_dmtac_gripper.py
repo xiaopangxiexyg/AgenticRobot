@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from types import SimpleNamespace
+from xml.etree import ElementTree as ET
 
 import numpy as np
 import pytest
@@ -39,7 +40,9 @@ from robot_motion.runtime import (
 from sim.contracts import SimulationContract, TimingSpec
 from sim.mujoco.actuation import (
     MujocoDmtacGripperExecutor,
+    bounded_cad_dmtac_cube_contact_gripper_profile,
     cad_bimanual_dmtac_gripper_profile,
+    cad_dmtac_cube_contact_gripper_profile,
     identified_bimanual_dmtac_gripper_profile,
     point_grasp_cad_bimanual_dmtac_gripper_profile,
     rm65_bimanual_udp_feedback_profile,
@@ -53,6 +56,7 @@ from sim.mujoco.artifacts import ModelArtifactCache
 from sim.mujoco.deploy import MujocoDeployConfig, MujocoDeployRuntime
 from sim.mujoco.deploy.pose_resolution import MujocoCoupledPoseToQposResolver
 from sim.mujoco.ik import RM65CanonicalIK
+from sim.mujoco.modeling.gripper_actuators import add_gripper_position_actuators
 from teleop_runtime.action.human_proposal import HumanCommandEmission
 
 CONTRACT_PATH = "sim/configs/rm65_bimanual_physics_v1.json"
@@ -161,6 +165,52 @@ def test_cad_dmtac_profile_preserves_official_six_joint_open_close_semantics() -
             master == profile.master_joint_by_gripper[name]
             for master, _mimic in profile.equality_joint_pairs(name)
         )
+
+
+def test_installed_cad_operating_profile_preserves_force_and_contact_tuning():
+    baseline = cad_dmtac_cube_contact_gripper_profile()
+    bounded = bounded_cad_dmtac_cube_contact_gripper_profile()
+    changed = {"name", "closed_qpos_by_gripper", "calibration_status", "evidence"}
+    assert {k:v for k,v in baseline.to_metadata().items() if k not in changed} == {
+        k:v for k,v in bounded.to_metadata().items() if k not in changed}
+    for name in baseline.joint_names_by_gripper:
+        assert baseline.closed_qpos_by_gripper[name] == (.864,)*6
+        assert bounded.qpos_from_close(name, 1.) == (.8,)*6
+
+
+@pytest.mark.parametrize("hard_range", ("-0.035 0", "-0.04 0.01"))
+def test_compiled_gripper_operating_range_uses_the_servo_mapping(hard_range):
+    profile = identified_bimanual_dmtac_gripper_profile()
+    root = ET.Element("mujoco")
+    body = ET.SubElement(root, "worldbody")
+    for names in profile.joint_names_by_gripper.values():
+        for name in names:
+            ET.SubElement(body, "joint", name=name, range=hard_range)
+    add_gripper_position_actuators(root, profile)
+    for joint in body.findall("joint"):
+        assert joint.get("limited") == "true"
+        assert tuple(map(float, joint.get("range").split())) == (-.035, 0.)
+
+
+@pytest.mark.parametrize("hard_range", ("0 .035", "nan .035", ".1 0", "0"))
+def test_compiled_gripper_operating_range_cannot_exceed_model_limits(hard_range):
+    profile = identified_bimanual_dmtac_gripper_profile()
+    root = ET.Element("mujoco")
+    body = ET.SubElement(root, "worldbody")
+    for names in profile.joint_names_by_gripper.values():
+        for name in names:
+            ET.SubElement(body, "joint", name=name, range=hard_range)
+    with pytest.raises(ValueError, match="operating range"):
+        add_gripper_position_actuators(root, profile)
+
+
+def test_gripper_executor_rejects_a_second_normalization_mapping():
+    profile = bounded_cad_dmtac_cube_contact_gripper_profile()
+    scene = SimpleNamespace(gripper_specs={name: SimpleNamespace(
+        joint_names=joints, open_qpos=profile.open_qpos_by_gripper[name],
+        closed_qpos=(.864,)*6) for name,joints in profile.joint_names_by_gripper.items()})
+    with pytest.raises(ValueError, match="operating range mismatch"):
+        MujocoDmtacGripperExecutor(scene, profile)
 
 
 def test_point_grasp_cad_dmtac_profile_has_separate_revolute_gain_identity() -> None:

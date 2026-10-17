@@ -18,7 +18,9 @@ from robot_motion.position_control import DEFAULT_POSITION_COMMAND_HZ
 from sim.contracts import SimulationContract
 
 from ...actuation import (
+    bounded_cad_dmtac_cube_contact_gripper_profile,
     cad_bimanual_dmtac_gripper_profile,
+    cad_dmtac_cube_contact_gripper_profile,
     cube_lift_contact_dmtac_gripper_profile,
     identified_bimanual_dmtac_gripper_profile,
     point_grasp_cad_bimanual_dmtac_gripper_profile,
@@ -95,6 +97,8 @@ def resolve_dmtac_gripper_actuation_profile(name: str):
             cad_bimanual_dmtac_gripper_profile(),
             point_grasp_cad_bimanual_dmtac_gripper_profile(),
             strong_cad_bimanual_dmtac_gripper_profile(),
+            cad_dmtac_cube_contact_gripper_profile(),
+            bounded_cad_dmtac_cube_contact_gripper_profile(),
         )
     }
     try:
@@ -354,8 +358,16 @@ class CubeLiftTaskConfig:
     source_path: str = ""
     source_sha256: str = ""
     source_dependencies: tuple[str, ...] = ()
+    grasp_frame_source: str = "body"
 
     def __post_init__(self) -> None:
+        if self.grasp_frame_source not in {"body", "tool_tcp"}:
+            raise ValueError("grasp_frame_source must be body or tool_tcp.")
+        if self.grasp_frame_source == "tool_tcp" and (
+            self.execution_mode != ACTUATED_POSITION_EXECUTION_MODE
+            or self.grasp_mode != PHYSICAL_CONTACT_GRASP_MODE
+        ):
+            raise ValueError("Calibrated tool_tcp grasp frames require physical actuated execution.")
         if self.schema_version not in {
             CUBE_LIFT_TASK_SCHEMA_VERSION,
             CUBE_LIFT_ACTUATED_TASK_SCHEMA_VERSION,
@@ -2075,6 +2087,7 @@ class CubeLiftTaskConfig:
             "observation_mode": self.observation_mode,
             "action_layout": self.action_layout,
             "pose_control_frame": self.pose_control_frame,
+            **({"grasp_frame_source": self.grasp_frame_source} if self.grasp_frame_source != "body" else {}),
             "task_objective": self.task_objective,
             "success_termination_reason": self.success_termination_reason,
             "reach_target_height_offset_m": self.reach_target_height_offset_m,
@@ -2317,6 +2330,7 @@ class CubeLiftTaskConfig:
             right_grasp_body_name=str(
                 payload.get("right_grasp_body_name", "right_gripper_grasp_center_frame")
             ),
+            grasp_frame_source=payload.get("grasp_frame_source", "body"),
             grasp_latch_left_finger_body_name=str(
                 payload.get(
                     "grasp_latch_left_finger_body_name", "right_gripper_left_finger"

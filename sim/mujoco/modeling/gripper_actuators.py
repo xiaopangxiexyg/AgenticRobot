@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import xml.etree.ElementTree as ET
 
 from ..actuation.gripper_profile import GripperActuationProfile
@@ -18,7 +19,7 @@ def add_gripper_position_actuators(
 ) -> None:
     """Add mimic-linked finger constraints and force-limited servos.
 
-    The first configured joint is the master.  This makes CAD URDF mimic
+    The profile selects the master joint. This makes CAD URDF mimic
     semantics explicit in generated MJCF because the local URDF parser keeps
     joint limits and axes but intentionally does not import ``<mimic>`` tags.
     """
@@ -52,12 +53,32 @@ def add_gripper_position_actuators(
                     "joint1": master_joint,
                     "joint2": mimic_joint,
                     "polycoef": "0 1 0 0 0",
-                    "solref": "0.005 1",
+                    "solref": " ".join(map(str, profile.contact_tuning.mimic_solref or (.005, 1.))),
+                    **({"solimp": " ".join(map(str, profile.contact_tuning.mimic_solimp))}
+                        if profile.contact_tuning.mimic_solimp is not None else {}),
                 },
             )
         for index, joint_name in enumerate(joint_names):
+            opened = profile.open_qpos_by_gripper[gripper_name][index]
+            closed = profile.closed_qpos_by_gripper[gripper_name][index]
+            operating_range = (min(opened, closed), max(opened, closed))
+            hard_range = joints[joint_name].get("range")
+            if hard_range is not None:
+                limits = tuple(float(v) for v in hard_range.split())
+                if (
+                    len(limits) != 2 or not all(math.isfinite(v) for v in limits)
+                    or limits[0] >= limits[1]
+                    or operating_range[0] < limits[0] - 1e-9
+                    or operating_range[1] > limits[1] + 1e-9
+                ):
+                    raise ValueError(f"{joint_name} operating range exceeds model joint limits.")
+            # The compiled range also supplies normalized scene feedback and
+            # reset/preview mapping. Keep it identical to the servo profile;
+            # never leave feedback normalized to the old bare-hand stroke.
             joints[joint_name].attrib.update(
                 {
+                    "range": " ".join(f"{v:.17g}" for v in operating_range),
+                    "limited": "true",
                     "damping": f"{profile.joint_damping_n_s_m:.12g}",
                     "frictionloss": f"{profile.joint_frictionloss_n:.12g}",
                 }
@@ -77,6 +98,8 @@ def add_gripper_position_actuators(
             )
 
         tuning = profile.contact_tuning
+        if tuning.geom_pairs:
+            continue
         for side_name in ("left", "right"):
             geom_name = f"{gripper_name}_{side_name}_finger_collision_0"
             geom = geoms.get(geom_name)
@@ -88,6 +111,29 @@ def add_gripper_position_actuators(
                 geom.attrib["solref"] = " ".join(str(value) for value in tuning.solref)
             if tuning.solimp is not None:
                 geom.attrib["solimp"] = " ".join(str(value) for value in tuning.solimp)
+
+    tuning = profile.contact_tuning
+    if tuning.solver_cone is not None or tuning.solver_impratio is not None:
+        option = _find_or_add(mujoco_root, "option")
+        if tuning.solver_cone is not None:
+            option.set("cone", tuning.solver_cone)
+        if tuning.solver_impratio is not None:
+            option.set("impratio", str(tuning.solver_impratio))
+    for first, second in tuning.geom_pairs:
+        if first not in geoms or second not in geoms:
+            raise KeyError(f"Contact profile references unknown geom pair {(first, second)!r}.")
+        if any(geoms[name].get("contype") == "0" and geoms[name].get("conaffinity") == "0"
+               for name in (first, second)):
+            raise ValueError("Explicit contact pairs cannot select visual-only geoms.")
+        attributes = {"geom1": first, "geom2": second}
+        for name in ("solref", "solimp"):
+            if getattr(tuning, name) is not None:
+                attributes[name] = " ".join(map(str, getattr(tuning, name)))
+        if tuning.friction is not None:
+            slide, spin, roll = tuning.friction
+            attributes["friction"] = " ".join(map(str, (slide, slide, spin, roll, roll)))
+        attributes["condim"] = str(max(int(geoms[name].get("condim", "3")) for name in (first, second)))
+        ET.SubElement(_find_or_add(mujoco_root, "contact"), "pair", attributes)
 
 
 __all__ = ["add_gripper_position_actuators"]

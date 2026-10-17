@@ -1,0 +1,28 @@
+{
+  "extends": "sim/configs/tasks/rm65_right_cube_reach_fixed_pose_xyz_proprio_v1.json",
+  "name": "rm65_right_dmtacm_blue_cube_70mm_agent_v1",
+  "base_contract_path": "sim/configs/rm65_bimanual_dmtacm_blue_cube_70mm_v1.json",
+  "base_contract_sha256": "1817b561f79a56cb0dd32513c7de0cde932a9cb082a70909dab415f034a12600",
+  "gripper_actuation_profile_name": "dmtac_bimanual_cad_cube_contact_20261017.v2_bounded_stroke",
+  "gripper_actuation_profile_sha256": "6f42766fafa12239e15350d8afd3989e2fa84c4c558cdb600f0c39b28795f9ef",
+  "left_gripper_name": "left_eg2_4b2_cad",
+  "right_gripper_name": "right_eg2_4b2_cad",
+  "initial_gripper_close_by_name": {"left_eg2_4b2_cad": 0.0, "right_eg2_4b2_cad": 0.0},
+  "grasp_frame_source": "tool_tcp",
+  "grasp_latch_left_finger_body_name": "right_gripper_l_dm_tac_w2m_sensor",
+  "grasp_latch_right_finger_body_name": "right_gripper_r_dm_tac_w2m_sensor",
+  "gripper_contact_surface_specs": [],
+  "object_size_m": [0.07, 0.07, 0.07],
+  "cube_center_xy_m": [-0.272, 0.0],
+  "task_objective": "lift",
+  "success_requires_bilateral_contact": true,
+  "lift_delta_m": 0.03,
+  "max_episode_steps": 900,
+  "policy_action_components": [
+    "right_tcp_delta_x", "right_tcp_delta_y", "right_tcp_delta_z",
+    "right_tcp_rotvec_x", "right_tcp_rotvec_y", "right_tcp_rotvec_z", "right_gripper_delta"
+  ],
+  "scripted_pregrasp_reset": false,
+  "scripted_contact_reset": false,
+  "post_contact_phase_enabled": false
+}

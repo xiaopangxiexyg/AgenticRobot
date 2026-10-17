@@ -38,8 +38,40 @@ class GripperContactTuning:
     post_settle_geom_friction_by_name: Mapping[str, tuple[float, float, float]] = field(
         default_factory=dict
     )
+    geom_pairs: tuple[tuple[str, str], ...] = ()
+    mimic_solref: tuple[float, float] | None = None
+    mimic_solimp: tuple[float, float, float, float, float] | None = None
+    solver_cone: str | None = None
+    solver_impratio: float | None = None
 
     def __post_init__(self) -> None:
+        if any(isinstance(pair, (str, bytes)) for pair in self.geom_pairs):
+            raise ValueError("Contact geom pairs must be name pairs, not strings.")
+        pairs = tuple(tuple(str(name).strip() for name in pair) for pair in self.geom_pairs)
+        if any(len(pair) != 2 or not all(pair) or pair[0] == pair[1] for pair in pairs):
+            raise ValueError("Contact geom pairs require two distinct non-empty names.")
+        if len({tuple(sorted(pair)) for pair in pairs}) != len(pairs):
+            raise ValueError("Contact geom pairs must be unique.")
+        object.__setattr__(self, "geom_pairs", pairs)
+        for name, length in (("mimic_solref", 2), ("mimic_solimp", 5)):
+            value = getattr(self, name)
+            if value is not None:
+                value = _finite_tuple(value, name=name, length=length)
+                if name == "mimic_solref" and any(v <= 0 for v in value):
+                    raise ValueError("Positive-format mimic solref must be positive.")
+                if name == "mimic_solimp" and not (
+                    0 < value[0] <= value[1] < 1 and value[2] > 0
+                    and 0 < value[3] < 1 and value[4] >= 1
+                ):
+                    raise ValueError("Invalid mimic solimp.")
+                object.__setattr__(self, name, value)
+        if self.solver_cone not in (None, "pyramidal", "elliptic"):
+            raise ValueError("Unknown friction cone.")
+        if self.solver_impratio is not None:
+            ratio = float(self.solver_impratio)
+            if not math.isfinite(ratio) or ratio <= 0:
+                raise ValueError("Solver impratio must be finite and positive.")
+            object.__setattr__(self, "solver_impratio", ratio)
         if self.friction is not None:
             friction = _finite_tuple(self.friction, name="friction", length=3)
             if any(value < 0.0 for value in friction):
@@ -87,6 +119,10 @@ class GripperContactTuning:
                 name: list(values)
                 for name, values in self.post_settle_geom_friction_by_name.items()
             }
+        for name in ("geom_pairs", "mimic_solref", "mimic_solimp", "solver_cone", "solver_impratio"):
+            value = getattr(self, name)
+            if value is not None and value != ():
+                metadata[name] = value
         return metadata
 
 
@@ -536,10 +572,49 @@ def strong_cad_bimanual_dmtac_gripper_profile() -> GripperActuationProfile:
     )
 
 
+def cad_dmtac_cube_contact_gripper_profile(*, sliding_friction: float = 1.2) -> GripperActuationProfile:
+    """Explicit simulation-only CAD contact model; no hardware force claim."""
+    return replace(point_grasp_cad_bimanual_dmtac_gripper_profile(),
+        name="dmtac_bimanual_cad_cube_contact_20261017.v1",
+        contact_tuning=GripperContactTuning(
+            friction=(sliding_friction, .005, .0001), solref=(.002, 1.),
+            solimp=(.99, .99, .001), mimic_solref=(.002, 1.),
+            mimic_solimp=(.9999, .9999, .001, .5, 2.),
+            solver_cone="elliptic", solver_impratio=10.,
+            geom_pairs=tuple(("debug_cube_collision",
+                f"{side}_gripper_{finger}_dm_tac_w2m_sensor_collision_0")
+                for side in ("left", "right") for finger in ("l", "r"))),
+        calibration_status="simulation_only_cad_contact_compliance_not_hardware_identified",
+        evidence=("70 mm CAD contact fixture; explicit sensor/object contact pairs and "
+            "rigid-linkage numerical constraints. Sliding friction defaults to 1.2; "
+            "actuator force limits unchanged. Not a real material calibration."))
+
+
 def temporary_bimanual_dmtac_gripper_profile() -> GripperActuationProfile:
     """Compatibility alias for the current identified bimanual V1 profile."""
 
     return identified_bimanual_dmtac_gripper_profile()
+
+
+def bounded_cad_dmtac_cube_contact_gripper_profile() -> GripperActuationProfile:
+    """Installed CAD travel with reserve before opposed carrier self-contact.
+
+    The bare CAD's 0.864 rad endpoint intersects the opposed carrier meshes.
+    The simulation-only 0.800 rad operating endpoint retains approximately
+    3.8 mm nominal carrier separation without changing friction or force.
+    This is an operating range, not a hardware stroke calibration or grasp proof.
+    """
+    base = cad_dmtac_cube_contact_gripper_profile()
+    return replace(
+        base,
+        name="dmtac_bimanual_cad_cube_contact_20261017.v2_bounded_stroke",
+        closed_qpos_by_gripper={name: (0.800,) * len(joints)
+            for name, joints in base.joint_names_by_gripper.items()},
+        calibration_status="simulation_only_installed_cad_bounded_stroke_not_hardware_identified",
+        evidence=base.evidence + " Installed-CAD operating range 0..0.800 rad; "
+            "0.864 rad bare-hand endpoint has triangle-confirmed carrier self-intersection. "
+            "Normalized close=1 denotes this bounded operating endpoint, not zero aperture.",
+    )
 
 
 def cube_lift_contact_dmtac_gripper_profile() -> GripperActuationProfile:
@@ -571,7 +646,9 @@ def cube_lift_contact_dmtac_gripper_profile() -> GripperActuationProfile:
 __all__ = [
     "GripperActuationProfile",
     "GripperContactTuning",
+    "bounded_cad_dmtac_cube_contact_gripper_profile",
     "cad_bimanual_dmtac_gripper_profile",
+    "cad_dmtac_cube_contact_gripper_profile",
     "cube_lift_contact_dmtac_gripper_profile",
     "identified_bimanual_dmtac_gripper_profile",
     "point_grasp_cad_bimanual_dmtac_gripper_profile",

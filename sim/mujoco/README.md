@@ -318,6 +318,43 @@ This is an interactive GLFW viewer, so Linux requires `DISPLAY` or
 `WAYLAND_DISPLAY`. `MUJOCO_GL=egl` and `MUJOCO_GL=osmesa` are offscreen render
 options and do not provide an interactive desktop window.
 
+## DMTAC CAD 方块接触诊断（仅离线）
+
+```bash
+python -m scripts.probes.diagnose_dmtac_cube_contact \
+  --output /absolute/path/to/new-contact-run \
+  --cube-edge-m 0.070 --cube-mass-kg 0.08
+```
+
+该探针复用当前 DMTAC CAD、MJCF 转换和 `MujocoDmtacGripperExecutor`，分别运行
+左右手的水平／顶抓隔离夹具。自由法兰通过 weld 跟随独立 mocap 驱动；方块是自由刚体，不使用物体
+weld、抓取 latch、qpos 强制回放或摩擦覆盖。80 g 是可改的**仿真假设**，不是实测质量。
+`--object-approach-offset-m 0.01` 可对照更浅的抓取位置，不会修改部署抓取标定。
+
+每组保存 `fixture.xml`、启动配置 `configuration.json`、每 10 ms flush 的
+`trace.jsonl` 和最终 `result.json`，中断时也可保留配置及已产生的状态。记录实际
+接触位置、法向／切向力、六个关节角、联动偏差、穿透和超限；先区分初始放置干涉、
+接触动力学失真、未夹住，再判断 3 cm 试抬。诊断有效性阈值为初始穿透 0.1 mm、
+运动中穿透 2 mm、联动／限位偏差 0.01 rad；它们只用于该离线实验，不改变生产安全策略。
+试抬还要求法兰跟踪误差及手部地面穿透不超过 2 mm，手—物相对滑移不超过 3 mm、
+相对转角不超过 2°，并且最终两侧传感器仍有接触力。
+明显穿透或关节变形时，即使方块被弹起，也不能当作抓取成功。
+法向／切向分量按 [MuJoCo 接触坐标约定](https://mujoco.readthedocs.io/en/stable/computation/#contact)
+从 `mj_contactForce` 读取，不将力向量模长误当作法向力。
+
+`--contact-model constraint_candidate` 仅供对照：传感器—方块接触 `solref=0.002`、
+`solimp=0.99`，CAD 联动 `solref=0.002`、`solimp=0.9999`，椭圆摩擦锥及
+`impratio=10`；对应独立的 `dmtac_bimanual_cad_cube_contact_20261017.v1` 仿真 profile。
+传感器—方块显式接触对的滑动摩擦默认从 1.0 提高到 1.2（`--sliding-friction 1.0`
+可做原值对照）；不改变扭转／滚动摩擦、驱动力、几何、共享 URDF 或真机 profile。
+遵循 [MuJoCo 的 mocap 与防滑建模建议](https://mujoco.readthedocs.io/en/stable/modeling.html#mocap-bodies)：
+直接移动 mocap 手部缺少基座速度，不适合作为试抬摩擦响应的依据；自由手部跟踪驱动能保留
+物理速度。接触刚度和求解设置仍是仿真候选，不代表实测材料标定。
+
+这不是完整机械臂路径、Gateway Skill 或 Agent 验收。旧版平行夹爪的接触测试通过，
+也不能替代当前六关节 CAD／DMTAC 的动力学验收。完整诊断完成但任一试抬不通过时
+退出码为 2，不能仅凭程序执行完毕宣称抓取成功。
+
 ## 150 Hz Direct-Qpos Debug Execution
 
 `sim.mujoco.control.DirectQposDebugController` is the temporary execution

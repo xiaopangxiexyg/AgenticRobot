@@ -24,12 +24,14 @@ class _Scene:
                 "height": 2,
                 "fovy_deg": 90.0,
                 "camera_pose_world_xyz_quat_xyzw": [0, 0, 1, 0, 0, 0, 1],
+                "optical_camera_pose_world_xyz_quat_xyzw": [0, 0, 1, 1, 0, 0, 0],
             },
             "wrist": {
                 "width": 3,
                 "height": 1,
                 "fovy_deg": 60.0,
                 "camera_pose_world_xyz_quat_xyzw": [1, 2, 3, 0, 0, 0, 1],
+                "optical_camera_pose_world_xyz_quat_xyzw": [1, 2, 3, 1, 0, 0, 0],
             },
         }
 

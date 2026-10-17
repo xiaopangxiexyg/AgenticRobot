@@ -175,6 +175,31 @@ Oracle 使用世界 AABB 的保守分离下界校验这类矛盾结果；只有�
 `distance_query_disagreement_count`。包围盒重叠时仍保留有符号查询，预防间隙
 和物理接触穿透限制均不变；下界不是精确的表面距离。
 
+## 当前 DMTAC CAD / 70 mm 方块任务
+
+
+`sim/configs/tasks/rm65_right_dmtacm_blue_cube_70mm_agent_v1.json` 绑定当前
+`realman_dual_arm_inspire_gripper_dmtacm` URDF、v4 相机注册表、双侧实体 CAD
+夹爪和自由的 70 mm 蓝色方块。边长由操作者确认；80 g 质量和接触摩擦是仿真假设，
+不是实物测量标定。该任务使用真实接触，不使用物体锁定或脚本预抓取；抬升成功
+还要求双侧传感器同时接触。已有任务和默认值不变。
+
+显式 `grasp_frame_source: "tool_tcp"` 让控制和奖励几何共用所控物理臂的现有
+法兰到 TCP 标定，不虚构新 CAD 中不存在的旧夹爪中心节点。默认 `"body"` 保留
+已有任务元数据和行为；TCP 模式仅允许物理驱动任务，拒绝 direct-qpos 和 latch。
+
+该配置目前用于下层物理任务与离线诊断；Gateway 的夹爪组合和抓取接近接线
+有独立的集成依赖，不能据场景或闭爪测试宣称完整 Agent 抓取链已验收。
+
+该任务使用显式的 `v2_bounded_stroke` 仿真 profile：安装传感器后，原裸手
+`0.864 rad` 端点的对置 `l_3`/`r_3` 网格实际相交，工作行程改为 `0..0.800 rad`。
+归一化 close=1 表示该工作端点，不表示零开口或新的真机标定。编译关节限位、
+场景归一化读数和执行器使用同一 profile；旧 profile 保留，不修改共享 URDF、
+驱动力、接触摩擦或自碰撞对。张手移动或空载闭爪成功仍不能作为抓取抬升验收。
+
+深度快照沿用针孔内参对应的光学轴（右、下、前）；场景相机元数据同时列出
+原 MuJoCo 渲染姿态和光学姿态，共享深度编码器继续负责唯一的轴转换。
+
 ## High-throughput Cube-Lift runtime
 
 The reference `CubeLiftEnv` intentionally preserves detailed info and complete

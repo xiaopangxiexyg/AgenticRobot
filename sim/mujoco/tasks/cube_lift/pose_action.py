@@ -9,17 +9,13 @@ not import ``teleop_runtime`` or initialize a vendor device.
 
 from __future__ import annotations
 
-import json
 from collections.abc import Mapping
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any
 
 import numpy as np
 from scipy.spatial.transform import Rotation
 
-from project_paths import resolve_path
-from robot_motion.pose import pose6_to_matrix
 from robot_motion.rm65 import (
     DEFAULT_DUAL_ARM_COLLISION_DISTANCE_EPSILON_M,
     RM65_POSITION_TRACKING_MAX_VELOCITY_RAD_S,
@@ -28,6 +24,7 @@ from robot_motion.rm65 import (
 )
 
 from ...ik import IKResult, PoseTarget, RM65CanonicalIK
+from ...tool_frames import load_endpoint_to_tool_transform
 from .config import CubeLiftTaskConfig
 
 # MuJoCo enforces revolute joint ranges through a soft constraint.  A position
@@ -70,38 +67,6 @@ def inset_joint_position_target(
     if np.any(inset_lower > inset_upper):
         raise ValueError("Pose qref joint-limit margin leaves an empty joint range.")
     return np.clip(values, inset_lower, inset_upper)
-
-
-def _load_endpoint_to_tool_transform(path: str | Path, *, side: str) -> np.ndarray:
-    """Load only the TCP transform from a calibration JSON.
-
-    The task config records the profile path, but this simulation adapter reads
-    the small JSON payload directly so the ``sim`` package does not need to
-    import a vendor hardware backend merely to build its pose contract.
-    """
-
-    resolved = resolve_path(path)
-    payload = json.loads(resolved.read_text(encoding="utf-8"))
-    if not isinstance(payload, dict):
-        raise ValueError(  # noqa: TRY004 - profile validation contract
-            f"RM65 tool profile {resolved} must contain a JSON object."
-        )
-    arm = str(payload.get("arm", "")).strip().lower()
-    if arm and arm != str(side).strip().lower():
-        raise ValueError(
-            f"RM65 tool profile {resolved} is for arm {arm!r}, expected {side!r}."
-        )
-    tcp = payload.get("tcp")
-    if not isinstance(tcp, dict):
-        raise ValueError(  # noqa: TRY004 - profile validation contract
-            f"RM65 tool profile {resolved} is missing tcp metadata."
-        )
-    values = np.asarray(tcp.get("pose_flange_m_rad"), dtype=float).reshape(-1)
-    if values.shape != (6,) or not np.all(np.isfinite(values)):
-        raise ValueError(
-            f"RM65 tool profile {resolved} tcp.pose_flange_m_rad must contain six finite values."
-        )
-    return pose6_to_matrix(values)
 
 
 def _arm_base_body_name(scene, side: str) -> str:
@@ -296,11 +261,11 @@ class CubeLiftPoseActionController:
         self.config = config
         self.side = str(config.controlled_side)
         transforms = {
-            "left": _load_endpoint_to_tool_transform(
+            "left": load_endpoint_to_tool_transform(
                 config.left_tool_profile_path,
                 side="left",
             ),
-            "right": _load_endpoint_to_tool_transform(
+            "right": load_endpoint_to_tool_transform(
                 config.right_tool_profile_path,
                 side="right",
             ),
