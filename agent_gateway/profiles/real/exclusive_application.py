@@ -138,6 +138,13 @@ class ExclusiveRealSkillApplication:
                 )
             with self._lock:
                 self._startup_admission_receipt = startup_receipt
+            if (
+                self.deployment.gateway_session.contract_bundle.gripper_contract
+                is not None
+            ):
+                # Keep the exact lower startup admission. Its already-required
+                # HOLD is projected by the same owner before publishing Routes.
+                self.deployment.control_runtime.request_startup_hold()
             self.deployment.control_runtime.step()
             server = self.server_factory()
             for name in ("serve_forever", "shutdown", "server_close"):
@@ -153,30 +160,43 @@ class ExclusiveRealSkillApplication:
                 self._control_thread = thread
                 self._state = ExclusiveRealSkillApplicationState.RUNNING
             thread.start()
-        except Exception:
+        except Exception as start_error:
+            cleanup_errors: list[str] = []
             if runtime_started:
                 try:
                     self.deployment.control_runtime.fail_closed(
                         "exclusive_skill_application_start_failed"
                     )
-                except Exception:
-                    pass
-            if server is not None:
+                except Exception as error:  # noqa: BLE001 - retain failed safety evidence.
+                    cleanup_errors.append(
+                        f"startup_hold:{type(error).__name__}:{error}"
+                    )
+                # Reuse the normal composed shutdown owner. Failed arm or hand
+                # stop proof keeps device resources available for a later close.
+                with self._lock:
+                    self._server = server
                 try:
-                    server.server_close()
-                except Exception:
-                    pass
-                else:
-                    self._server_closed = True
-            if resources_started:
+                    self.close()
+                except Exception as error:  # noqa: BLE001 - preserve startup and cleanup faults.
+                    cleanup_errors.append(
+                        f"startup_close:{type(error).__name__}:{error}"
+                    )
+            elif resources_started:
                 try:
                     self.resources.close()
-                except Exception:
-                    pass
+                except Exception as error:  # noqa: BLE001 - preserve cleanup for retry.
+                    cleanup_errors.append(
+                        f"resources_close:{type(error).__name__}:{error}"
+                    )
                 else:
                     self._resources_closed = True
             with self._lock:
                 self._state = ExclusiveRealSkillApplicationState.FAULT
+            if cleanup_errors:
+                raise RuntimeError(
+                    f"exclusive real Skill startup failed: {start_error}; "
+                    + "; ".join(cleanup_errors)
+                ) from start_error
             raise
 
     def _run_control_loop(self) -> None:

@@ -120,6 +120,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--right-tool-profile", type=Path, required=True)
     parser.add_argument("--envelope-profile", type=Path, required=True)
     parser.add_argument(
+        "--right-gripper-config",
+        type=Path,
+        help="optional explicit DMTacGripperBackendConfig JSON; right-arm session only, no startup opening/reset/recovery",
+    )
+    parser.add_argument(
         "--camera-config",
         type=Path,
         help="absolute RealSense config; requires --camera-registry and --artifact-root",
@@ -598,6 +603,11 @@ def _stopped_payload(
                 f"{type(exc).__name__}: {exc}"
             )[:512]
     lower_hold_proved = bool(hold is not None and hold.succeeded)
+    gripper_port = composition.deployment.gateway_session.gripper_port
+    gripper_hold = None if gripper_port is None else gripper_port.last_hold_receipt
+    gripper_stop_proved = gripper_port is None or (
+        gripper_hold is not None and gripper_hold.succeeded
+    )
     lower_emergency_stop_proved = bool(
         emergency_stop is not None
         and emergency_stop.succeeded
@@ -627,9 +637,7 @@ def _stopped_payload(
         ),
         "position_force_guard": position_force_guard_snapshot,
         "position_force_guard_snapshot_error": position_force_guard_snapshot_error,
-        "measurement_sampler": (
-            composition.lower.ports.measurement_sampler_snapshot()
-        ),
+        "measurement_sampler": (composition.lower.ports.measurement_sampler_snapshot()),
         "arm_backend_diagnostics": (
             composition.lower.ports.arm_backend_diagnostics_snapshot()
         ),
@@ -663,24 +671,33 @@ def _stopped_payload(
         "emergency_stop_latched": (
             composition.deployment.gateway_session.service.emergency_stop_latched
         ),
-        "emergency_stop_confirmed": lower_emergency_stop_proved,
+        "emergency_stop_confirmed": lower_emergency_stop_proved and gripper_stop_proved,
         "emergency_stop_status_by_side": (
-            {}
-            if emergency_stop is None
-            else dict(emergency_stop.status_by_side)
+            {} if emergency_stop is None else dict(emergency_stop.status_by_side)
         ),
         "emergency_stop_evidence_refs": (
-            []
-            if emergency_stop is None
-            else list(emergency_stop.evidence_refs)
+            [] if emergency_stop is None else list(emergency_stop.evidence_refs)
         ),
-        "safe_shutdown": lower_hold_proved or lower_emergency_stop_proved,
+        "safe_shutdown": (lower_hold_proved or lower_emergency_stop_proved)
+        and gripper_stop_proved,
         "safe_shutdown_basis": (
-            "lower_emergency_stop_receipt"
+            "missing_gripper_stop_proof"
+            if not gripper_stop_proved
+            else "lower_emergency_stop_receipt"
             if lower_emergency_stop_proved
             else "lower_hold_receipt"
             if lower_hold_proved
             else "missing_lower_safety_stop_proof"
+        ),
+        **(
+            {
+                "gripper_stop_proved": bool(gripper_stop_proved),
+                "gripper_stop_evidence_refs": []
+                if gripper_hold is None
+                else list(gripper_hold.evidence_refs),
+            }
+            if gripper_port is not None
+            else {}
         ),
     }
 
@@ -769,6 +786,55 @@ def main(argv: list[str] | None = None) -> int:
         parser.error(
             "provide exactly one of --authorized-action or --authorized-actions"
         )
+    actions = (
+        (args.authorized_action,)
+        if args.authorized_actions is None
+        else tuple(args.authorized_actions)
+    )
+    if "set_gripper_state" in actions and args.right_gripper_config is None:
+        parser.error("set_gripper_state requires --right-gripper-config")
+    right_gripper_backend = None
+    if args.right_gripper_config is not None:
+        if args.authorized_side != "right":
+            parser.error("gripper v1 requires --authorized-side right")
+        from teleop_runtime.backends.grippers.dmtac import (
+            DMTacGripperBackend,
+            DMTacGripperBackendConfig,
+        )
+
+        path = _absolute_existing_file(
+            parser, args.right_gripper_config, flag="--right-gripper-config"
+        )
+        try:
+            values = json.loads(path.read_text(encoding="utf-8"))
+            if (
+                not isinstance(values, dict)
+                or values.get("side") != "right"
+                or not values.get("gripper_port")
+            ):
+                raise ValueError("explicit side=right and gripper_port are required")
+            config = DMTacGripperBackendConfig(
+                **{
+                    "connect_tactile": False,
+                    "clear_fault_on_start": False,
+                    "auto_recover_internal_communication_fault": False,
+                    "reconnect_on_error": False,
+                    **values,
+                }
+            )
+            if (
+                config.open_on_start
+                or config.clear_fault_on_start
+                or config.reconnect_on_error
+                or config.auto_recover_internal_communication_fault
+                or config.tactile_reset_on_start
+            ):
+                raise ValueError(
+                    "startup opening, fault clearing and automatic recovery are forbidden in this Skill profile"
+                )
+            right_gripper_backend = DMTacGripperBackend(config)
+        except (ValueError, TypeError) as error:
+            parser.error(f"invalid right gripper config: {error}")
     if args.client_uid < 0:
         parser.error("--client-uid must be non-negative")
     try:
@@ -1086,6 +1152,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     runtime_session_id = _runtime_session_id(args.runtime_session_id)
     composition = assemble_exclusive_rm65_agent_primitive_composition(
+        right_gripper_backend=right_gripper_backend,
         lower=lower,
         socket_path=socket_path,
         authorized_side=args.authorized_side,

@@ -9,8 +9,10 @@ import pytest
 
 from agent_gateway.profiles.mujoco.gripper_skill import MujocoGripperControlPort
 from agent_gateway.profiles.real.gripper_skill import (
+    ExclusiveRealGripperResources,
     RealDmtacGripperControlPort,
     build_real_dmtac_gripper_skill_contract_bundle,
+    stop_arm_and_gripper,
 )
 from agent_gateway.protocol.contracts import AgentSkillOperation, AgentSkillRequest
 from agent_gateway.skills.gripper.definition import (
@@ -29,6 +31,7 @@ from agent_gateway.skills.gripper.runtime import (
     GripperSkillLifecycle,
     GripperStateSample,
     assemble_gripper_agent_gateway_session,
+    build_gripper_skill_executor,
 )
 
 
@@ -135,6 +138,17 @@ def test_sim_route_is_target_neutral_semantics_with_sim_privilege() -> None:
     assert (
         "approach_then_close_composition" in bundle.route_manifest.explicit_exclusions
     )
+
+
+def test_gripper_executor_rejects_wrong_port_before_activation():
+    port = FakeGripperPort([(0.0, False)])
+    bundle = _sim_bundle(port)
+    port.port_binding_hash = "port:other-device"
+    with pytest.raises(ValueError, match="port identity"):
+        build_gripper_skill_executor(
+            contract_bundle=bundle, port=port, current_station_revision=lambda: 0
+        )
+    assert port.commanded == port.holds == []
 
 
 def test_gateway_executes_closed_contact_settle_and_reuses_executor() -> None:
@@ -282,6 +296,14 @@ class _FakeDmtacBackend:
         self.commands: list[float] = []
         self.holds: list[str] = []
         self.samples = [(0.0, True), (0.98, False)]
+        self.held = False
+        self.events = []
+
+    def start(self):
+        self.events.append("hand_start")
+
+    def close(self):
+        self.events.append("hand_close")
 
     def is_ready(self) -> bool:
         return True
@@ -290,6 +312,7 @@ class _FakeDmtacBackend:
         return {"ready": True, "reason": ""}
 
     def send_fixed_joint_pos(self, value):
+        self.held = False
         self.commands.append(float(value))
         return True
 
@@ -298,6 +321,8 @@ class _FakeDmtacBackend:
 
     def get_state(self, **_kwargs):
         close, moving = self.samples.pop(0) if self.samples else (0.98, False)
+        if self.held:
+            moving = False
         return {
             "gripper_measured_scalar": close,
             "gripper_error_code": 0,
@@ -306,7 +331,127 @@ class _FakeDmtacBackend:
 
     def hold_gripper_motion(self, reason):
         self.holds.append(reason)
+        self.held = True
         return True
+
+
+def test_gripper_resources_start_once_and_close_hand_before_lower():
+    backend = _FakeDmtacBackend()
+    backend.samples = [(0.0, False)]
+
+    class Lower:
+        def start(self):
+            backend.events.append("lower_start")
+
+        def close(self):
+            backend.events.append("lower_close")
+
+    resources = ExclusiveRealGripperResources(
+        lower=Lower(), port=RealDmtacGripperControlPort(backend=backend)
+    )
+    resources.start()
+    with pytest.raises(RuntimeError, match="start once"):
+        resources.start()
+    resources.close()
+    resources.close()
+    assert backend.events == ["lower_start", "hand_start", "hand_close", "lower_close"]
+    assert backend.commands == []
+
+
+def test_gripper_startup_moving_state_is_rejected_and_cleans_owned_resources():
+    backend = _FakeDmtacBackend()
+
+    class Lower:
+        def start(self):
+            backend.events.append("lower_start")
+
+        def close(self):
+            backend.events.append("lower_close")
+
+    resources = ExclusiveRealGripperResources(
+        lower=Lower(), port=RealDmtacGripperControlPort(backend=backend)
+    )
+    with pytest.raises(RuntimeError, match="stationary"):
+        resources.start()
+    assert backend.events == ["lower_start", "hand_start", "hand_close", "lower_close"]
+    assert backend.commands == []
+
+
+@pytest.mark.parametrize(
+    "reading", [None, {"timestamp": 0.0}, {"timestamp": float("inf")}]
+)
+def test_real_gripper_never_reuses_cached_state_after_invalid_fresh_read(reading):
+    backend = _FakeDmtacBackend()
+    backend.read_gripper_state_now = lambda: reading
+    port = RealDmtacGripperControlPort(backend=backend)
+    with pytest.raises(RuntimeError):
+        port.observe_state()
+
+
+def test_real_gripper_stop_ack_without_stopped_feedback_is_not_hold_proof():
+    backend = _FakeDmtacBackend()
+    backend.hold_gripper_motion = lambda reason: True
+    backend.get_state = lambda **kwargs: {
+        "gripper_measured_scalar": 0.98,
+        "gripper_error_code": 0,
+        "gripper_is_moving": True,
+    }
+    port = RealDmtacGripperControlPort(backend=backend, hold_confirmation_timeout_sec=0.02)
+    assert port.hold(reason="test unconfirmed stop").succeeded is False
+
+
+@pytest.mark.parametrize("failed_boundary", ["arm", "hand", "both"])
+def test_composed_stop_attempts_both_boundaries_even_after_exception(failed_boundary):
+    backend = _FakeDmtacBackend()
+    calls = []
+
+    def arm_stop():
+        calls.append("arm")
+        if failed_boundary in {"arm", "both"}:
+            raise RuntimeError("arm stop failed")
+        return GripperHoldReceipt(True, ("arm-stop-proof",))
+
+    def hand_stop(reason):
+        calls.append("hand")
+        if failed_boundary in {"hand", "both"}:
+            raise RuntimeError("hand stop failed")
+        backend.held = True
+        return True
+
+    backend.hold_gripper_motion = hand_stop
+    port = RealDmtacGripperControlPort(backend=backend)
+    with pytest.raises(RuntimeError, match="Composed stop failed") as captured:
+        stop_arm_and_gripper(arm_stop=arm_stop, port=port, reason="shutdown")
+    assert calls == ["arm", "hand"]
+    for boundary in {"arm", "hand"} if failed_boundary == "both" else {failed_boundary}:
+        assert f"{boundary} stop failed" in str(captured.value)
+
+
+def test_real_gripper_command_or_failed_read_clears_previous_stop_proof():
+    backend = _FakeDmtacBackend()
+    port = RealDmtacGripperControlPort(backend=backend)
+    assert port.hold(reason="first stop").succeeded
+    assert port.last_hold_receipt is not None
+    port.command_close(1.0)
+    assert port.last_hold_receipt is None
+    assert port.hold(reason="second stop").succeeded
+    backend.read_gripper_state_now = lambda: None
+    with pytest.raises(RuntimeError, match="unavailable"):
+        port.hold(reason="unproved stop")
+    assert port.last_hold_receipt is None
+
+
+def test_real_gripper_fresh_timestamp_does_not_hide_an_over_budget_read():
+    backend = _FakeDmtacBackend()
+
+    def slow_read():
+        time.sleep(0.21)
+        return {"timestamp": time.time()}
+
+    backend.read_gripper_state_now = slow_read
+    port = RealDmtacGripperControlPort(backend=backend)
+    with pytest.raises(RuntimeError, match="200 ms budget"):
+        port.observe_state()
 
 
 def test_real_adapter_and_route_are_default_off_until_granted() -> None:
@@ -358,6 +503,15 @@ def test_real_adapter_dispatches_normalized_close_and_measures_feedback() -> Non
     assert sample.moving is True
     assert hold.succeeded is True
     assert backend.holds == ["test terminal hold"]
+
+
+def test_real_gripper_binding_distinguishes_continuous_grasp_configuration():
+    backend = _FakeDmtacBackend()
+    first = RealDmtacGripperControlPort(backend=backend).port_binding_hash
+    backend.config.continuous_grasp = False
+    second = RealDmtacGripperControlPort(backend=backend).port_binding_hash
+    assert first != second
+    assert backend.commands == backend.holds == []
 
 
 def test_real_adapter_rejects_backend_side_that_does_not_match_component() -> None:

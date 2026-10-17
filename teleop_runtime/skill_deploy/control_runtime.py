@@ -438,6 +438,19 @@ class ExclusiveRealSkillControlRuntime:
             return "fault", "fault"
         return "hold", "hold"
 
+    def request_startup_hold(self) -> None:
+        """Queue initial HOLD under this owner's clock, before publication."""
+        with self._cycle_lock:
+            if self.lifecycle != RealSkillControlLifecycle.RUNNING:
+                raise RuntimeError("Startup HOLD requires a started lower owner.")
+            if self.motion_port.snapshot().phase != RealAgentMotionPhase.INACTIVE:
+                raise RuntimeError(
+                    "Startup HOLD cannot replace an active or previously held operation."
+                )
+            self.motion_port.request_domain_hold(
+                reason="composed application startup", requested_at=float(self._clock())
+            )
+
     def hold_skill_motion(self, reason: str) -> bool:
         receipt = self._hold_controller(_required(reason, field_name="hold_reason"))
         if not isinstance(receipt, RealSkillMotionHoldReceipt):

@@ -47,6 +47,7 @@ from .session_authorization import (
 _PREFIX = struct.Struct(">I")
 _CONFIRM_TOKEN = "EXECUTE_AUTHORIZED_REAL_TCP_PRIMITIVE"
 _ACTION_TO_SKILL_ID = {
+    "set_gripper_state": "manipulation.set_gripper_state",
     **dict(FIXED_CARDINAL_TCP_STEP_SKILL_ID_BY_DIRECTION_V1),
     "level_forward": TCP_LEVEL_FORWARD_SKILL_ID_V1,
     "level_forward_left_30": TCP_LEVEL_FORWARD_LEFT_30_SKILL_ID_V1,
@@ -466,7 +467,16 @@ def _parameters(
     schema_entry: Mapping[str, Any],
     absolute_tcp_pose_xyz_quat_xyzw: tuple[float, ...] | None = None,
     speed_scale: float | None = None,
+    target_state: str | None = None,
 ) -> dict[str, Any]:
+    if skill_id == "manipulation.set_gripper_state":
+        if side != "right" or target_state not in _schema_enum(
+            _schema_properties(schema_entry), "target_state"
+        ):
+            raise ValueError(
+                "Gripper v1 requires side right and explicit open/closed target_state."
+            )
+        return {"target_state": target_state}
     summary = snapshot["measurement_summary"]
     components = tuple(summary["pose_xyz_quat_xyzw_by_component"])
     expected_component = f"{side}_arm"
@@ -574,6 +584,14 @@ def _parameters(
 
 
 def execute_one_shot(args: argparse.Namespace) -> Mapping[str, Any]:
+    target_state = getattr(args, "target_state", None)
+    if args.action == "set_gripper_state":
+        if args.side != "right" or target_state not in {"open", "closed"}:
+            raise ValueError(
+                "set_gripper_state requires --side right and --target-state open|closed"
+            )
+    elif target_state is not None:
+        raise ValueError("--target-state requires --action set_gripper_state")
     if args.confirm != _CONFIRM_TOKEN:
         raise ValueError(f"--confirm must equal {_CONFIRM_TOKEN}")
     if not Path(args.socket_path).is_absolute():
@@ -637,13 +655,21 @@ def execute_one_shot(args: argparse.Namespace) -> Mapping[str, Any]:
             schema_entry=schema_entry,
             absolute_tcp_pose_xyz_quat_xyzw=absolute_tcp_pose,
             speed_scale=getattr(args, "speed_scale", None),
+            target_state=getattr(args, "target_state", None),
         )
         requested_components = (
             tuple(parameters["pose_targets_by_component"])
             if skill_id in {TCP_POSE_TARGET_SKILL_ID_V1, GRASP_APPROACH_SKILL_ID_V1}
+            else ("right_gripper",)
+            if skill_id == "manipulation.set_gripper_state"
             else (parameters["component_id"],)
         )
-        if requested_components != (expected_component,):
+        expected_controlled_component = (
+            "right_gripper"
+            if skill_id == "manipulation.set_gripper_state"
+            else expected_component
+        )
+        if requested_components != (expected_controlled_component,):
             raise RuntimeError(
                 "Server component does not match the operator-selected side."
             )
@@ -744,6 +770,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--client-id", default="dexteleop-local-primitive-operator")
     parser.add_argument("--side", choices=("left", "right"), required=True)
     parser.add_argument("--action", choices=tuple(_ACTION_TO_SKILL_ID), required=True)
+    parser.add_argument(
+        "--target-state",
+        choices=("open", "closed"),
+        help="required for set_gripper_state; never closes implicitly after an arm action",
+    )
     parser.add_argument(
         "--target-xyz-m",
         type=float,

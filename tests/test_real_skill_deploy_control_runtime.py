@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-from dataclasses import replace
 import importlib
 import json
 import subprocess
 import sys
 import threading
 import time
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -131,6 +131,36 @@ def _observation_cut() -> RealSkillMotionObservationCut:
         available_at=1.95,
         evidence_refs=("hardware-qpos-cut:test",),
     )
+
+
+def test_startup_hold_uses_lower_owner_clock_without_dispatch_or_resume():
+    builder = _TargetBuilder()
+    port = _port(builder)
+    dispatched = []
+    runtime = ExclusiveRealSkillControlRuntime(
+        motion_port=port,
+        observation_provider=_observation_cut,
+        synchronize_target_builder=builder.synchronize,
+        command_admission=lambda command, observation, now: True,
+        command_dispatch=lambda command: dispatched.append(command),
+        hold_controller=lambda reason: RealSkillMotionHoldReceipt(
+            succeeded=True, evidence_refs=("fixture:startup-hold",)
+        ),
+        clock=lambda: 2.0,
+    )
+    with pytest.raises(RuntimeError, match="started lower owner"):
+        runtime.request_startup_hold()
+    runtime.start()
+    runtime.request_startup_hold()
+    assert port.snapshot().hold_requested_at == 2.0
+    result = runtime.step()
+    assert result.port_snapshot.phase == RealAgentMotionPhase.HELD
+    assert result.lifecycle == RealSkillControlLifecycle.HOLD
+    assert result.port_snapshot.hold_succeeded is True
+    assert not dispatched
+    with pytest.raises(RuntimeError):
+        runtime.request_startup_hold()
+    runtime.close()
 
 
 def test_independent_runtime_owns_dispatch_and_lower_confirmed_hold() -> None:

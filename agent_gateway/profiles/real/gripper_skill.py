@@ -60,6 +60,9 @@ class RealDmtacGripperControlPort:
                 raise ValueError(f"{name} must be finite and positive.")
         self.command_submission_timeout_sec = float(command_submission_timeout_sec)
         self.hold_confirmation_timeout_sec = float(hold_confirmation_timeout_sec)
+        self._motion_guard: Callable[[], bool] | None = None
+        self._last_command_attempt_ref: str | None = None
+        self._last_hold_receipt: GripperHoldReceipt | None = None
         config = getattr(backend, "config", None)
         side = str(getattr(config, "side", "right"))
         if side != "right":
@@ -77,6 +80,8 @@ class RealDmtacGripperControlPort:
             )
         if getattr(config, "disconnected_state_scalar", None) is not None:
             raise ValueError("real gripper Skill rejects assumed disconnected state.")
+        if getattr(config, "send_commands", True) is not True:
+            raise ValueError("real gripper Skill requires command-enabled hardware.")
         identity = {
             "adapter": "real_dmtac_gripper_control.v1",
             "component_id": self.component_id,
@@ -85,6 +90,10 @@ class RealDmtacGripperControlPort:
             "gripper_id": int(getattr(config, "gripper_id", 1)),
             "command_submission_timeout_sec": self.command_submission_timeout_sec,
             "hold_confirmation_timeout_sec": self.hold_confirmation_timeout_sec,
+            "speed": float(getattr(config, "speed", 1.0)),
+            "torque": float(getattr(config, "torque", 0.2)),
+            "max_open_mm": float(getattr(config, "max_open_mm", 70.0)),
+            "continuous_grasp": bool(getattr(config, "continuous_grasp", True)),
         }
         self.port_binding_hash = canonical_content_hash(
             identity,
@@ -115,7 +124,13 @@ class RealDmtacGripperControlPort:
     def command_close(
         self, target_close: float, *, cancel_requested: Callable[[], bool] | None = None,
     ) -> GripperCommandReceipt:
+        self._require_arm_hold()
         target = float(target_close)
+        # A hardware write may change the scene even if its ACK is lost.
+        self._last_command_attempt_ref = self._ref(
+            "command_attempt", {"target_close": target}
+        )
+        self._last_hold_receipt = None
         started_at = time.monotonic()
         deadline = started_at + self.command_submission_timeout_sec
         attempts = 0
@@ -217,9 +232,26 @@ class RealDmtacGripperControlPort:
         )
 
     def poll_state(self) -> GripperStateSample:
+        self._require_arm_hold()
         return self.observe_state()
 
+    def bind_motion_guard(self, guard: Callable[[], bool]) -> None:
+        if self._motion_guard is not None or not callable(guard):
+            raise ValueError("Gripper arm-HOLD owner is bound exactly once.")
+        self._motion_guard = guard
+
+    @property
+    def last_command_attempt_ref(self) -> str | None:
+        return self._last_command_attempt_ref
+
+    def _require_arm_hold(self) -> None:
+        if self._motion_guard is not None and not self._motion_guard():
+            raise RuntimeError(
+                "Gripper motion requires a fresh, healthy arm owner under confirmed HOLD."
+            )
+
     def hold(self, *, reason: str) -> GripperHoldReceipt:
+        self._last_hold_receipt = None
         started_at = time.monotonic()
         deadline = started_at + self.hold_confirmation_timeout_sec
         stop_requested_at = float(self.clock())
@@ -261,7 +293,101 @@ class RealDmtacGripperControlPort:
                 *samples,
             ),
         )
+        self._last_hold_receipt = receipt
         return receipt
+
+    @property
+    def last_hold_receipt(self) -> GripperHoldReceipt | None:
+        return self._last_hold_receipt
+
+
+def stop_arm_and_gripper(
+    *, arm_stop: Callable[[], Any], port: RealDmtacGripperControlPort, reason: str
+) -> tuple[Any, GripperHoldReceipt]:
+    """Attempt both independent stop boundaries; surface all failed calls."""
+    errors = []
+    arm = hand = None
+    try:
+        arm = arm_stop()
+    except Exception as error:  # noqa: BLE001 - one failed stop must not omit the other.
+        errors.append(error)
+    try:
+        hand = port.hold(reason=reason)
+    except Exception as error:  # noqa: BLE001 - report partial stop without claiming safety.
+        errors.append(error)
+    if errors:
+        raise RuntimeError(
+            "Composed stop failed: " + "; ".join(str(error) for error in errors)
+        ) from errors[0]
+    return arm, hand
+
+
+class ExclusiveRealGripperResources:
+    """Own the optional hand beside the existing lower application resources."""
+
+    def __init__(self, *, lower: Any, port: RealDmtacGripperControlPort) -> None:
+        if not isinstance(port, RealDmtacGripperControlPort):
+            raise TypeError("Gripper resources require the reviewed real adapter.")
+        for resource in (lower, port.backend):
+            if not all(
+                callable(getattr(resource, method, None))
+                for method in ("start", "close")
+            ):
+                raise TypeError(
+                    "Application resources must expose start() and close()."
+                )
+        config = getattr(port.backend, "config", None)
+        if any(
+            bool(getattr(config, name, False))
+            for name in (
+                "open_on_start",
+                "clear_fault_on_start",
+                "reconnect_on_error",
+                "auto_recover_internal_communication_fault",
+                "tactile_reset_on_start",
+            )
+        ):
+            raise ValueError(
+                "Gripper Skill resources forbid startup opening/reset and automatic recovery."
+            )
+        self.lower = lower
+        self.port = port
+        self._lower_started = False
+        self._hand_attempted = False
+        self._hand_closed = False
+        self._lower_closed = False
+
+    def start(self) -> None:
+        if self._lower_started or self._hand_attempted:
+            raise RuntimeError("Gripper application resources start once.")
+        self.lower.start()
+        self._lower_started = True
+        self._hand_attempted = True
+        try:
+            self.port.backend.start()
+            if not self.port.readiness().ready:
+                raise RuntimeError("Right gripper startup is not ready.")
+            sample = self.port.observe_state()
+            if sample.fault_code is not None or sample.moving is not False:
+                raise RuntimeError(
+                    "Right gripper must be fault-free and stationary before transport publication."
+                )
+        except Exception as start_error:
+            try:
+                self.close()
+            except Exception as close_error:  # noqa: BLE001 - preserve startup and cleanup failures.
+                raise RuntimeError(
+                    f"Gripper startup failed: {start_error}; cleanup failed: {close_error}"
+                ) from start_error
+            raise
+
+    def close(self) -> None:
+        if self._hand_attempted and not self._hand_closed:
+            self.port.backend.close()
+            self._hand_closed = True
+        if self._lower_started and not self._lower_closed:
+            self.lower.close()
+            self._lower_closed = True
 
 
 def build_real_dmtac_gripper_skill_contract_bundle(
@@ -324,6 +450,7 @@ def assemble_real_dmtac_gripper_agent_gateway_session(
 
 
 __all__ = [
+    "ExclusiveRealGripperResources",
     "RealDmtacGripperControlPort",
     "assemble_real_dmtac_gripper_agent_gateway_session",
     "build_real_dmtac_gripper_skill_contract_bundle",

@@ -56,6 +56,7 @@ from .exclusive_factory import (
 from .grasp_approach_plan import (
     DEFAULT_REAL_GRASP_EXECUTION_OPERATION_TIMEOUT_SEC,
 )
+from .gripper_skill import ExclusiveRealGripperResources, RealDmtacGripperControlPort
 from .localization_deployment import (
     RealObjectLocalizationRegistration,
     build_real_object_localization_registration,
@@ -185,8 +186,15 @@ class ExclusiveRM65AgentPrimitiveComposition:
             raise ValueError("authorization must bind the exact Gateway session.")
         if self.application.resources is not self.resources:
             raise ValueError("application must own the exact composed resources.")
+        owned_resources = self.resources
+        if isinstance(owned_resources, ExclusiveRealGripperResources):
+            if owned_resources.port is not self.deployment.gateway_session.gripper_port:
+                raise ValueError("Gripper resources must own the advertised adapter.")
+            owned_resources = owned_resources.lower
+        elif self.deployment.gateway_session.gripper_port is not None:
+            raise ValueError("Advertised gripper requires application-owned resources.")
         if self.perception_capture is None:
-            if self.resources is not self.lower.ports:
+            if owned_resources is not self.lower.ports:
                 raise ValueError("motion-only composition must own lower resources.")
             if (
                 self.perception_source_binding is not None
@@ -210,7 +218,7 @@ class ExclusiveRM65AgentPrimitiveComposition:
                 raise ValueError(
                     "motion-only composition cannot retain grasp resources."
                 )
-        elif not isinstance(self.resources, ExclusiveRealPerceptionResources):
+        elif not isinstance(owned_resources, ExclusiveRealPerceptionResources):
             raise ValueError("perception composition requires aggregate resources.")
         elif (
             self.perception_source_binding is None
@@ -239,6 +247,7 @@ class ExclusiveRM65AgentPrimitiveComposition:
 def assemble_exclusive_rm65_agent_primitive_composition(
     *,
     lower: ExclusiveRM65SkillLowerAssembly,
+    right_gripper_backend: object | None = None,
     socket_path: str | Path,
     authorized_side: str,
     authorized_action: str | None,
@@ -306,6 +315,19 @@ def assemble_exclusive_rm65_agent_primitive_composition(
         item not in REAL_AGENT_PRIMITIVE_ACTIONS for item in normalized_actions
     ):
         raise ValueError("authorized_actions contains an unreviewed primitive.")
+    if ("set_gripper_state" in normalized_actions) and (
+        side != "right" or right_gripper_backend is None
+    ):
+        raise ValueError(
+            "set_gripper_state requires a right-arm session and explicit right gripper backend."
+        )
+    if right_gripper_backend is not None and side != "right":
+        raise ValueError("Gripper v1 is bound to a right-arm session.")
+    gripper_port = (
+        None
+        if right_gripper_backend is None
+        else RealDmtacGripperControlPort(backend=right_gripper_backend, clock=clock)
+    )
     client = _required(client_id, field_name="client_id")
     runtime_id = _required(runtime_session_id, field_name="runtime_session_id")
     domain_id = _required(control_domain_id, field_name="control_domain_id")
@@ -886,6 +908,7 @@ def assemble_exclusive_rm65_agent_primitive_composition(
             )
 
         deployment = assemble_exclusive_rm65_agent_primitive_deployment(
+            gripper_port=gripper_port,
             target_builder=lower.target_builder,
             rm65_ports=lower.ports,
             port_config=port_config,
@@ -912,9 +935,7 @@ def assemble_exclusive_rm65_agent_primitive_composition(
                 else None
             ),
             grasp_trajectory_planner=grasp_trajectory_planner,
-            captured_robot_observation_filter=(
-                captured_robot_observation_filter
-            ),
+            captured_robot_observation_filter=(captured_robot_observation_filter),
             non_motion_read_window=lower.ports.non_motion_read_window,
             perception_provider_factory=provider_factory,
             measured_qpos_observer=(
@@ -948,6 +969,8 @@ def assemble_exclusive_rm65_agent_primitive_composition(
             artifact_store=artifact_store,
             additional_resources=additional_resources,
         )
+    if gripper_port is not None:
+        resources = ExclusiveRealGripperResources(lower=resources, port=gripper_port)
     authorization = RealAgentPrimitiveOneShotAuthorization(
         gateway_session=deployment.gateway_session,
         side=side,

@@ -11,6 +11,7 @@ from agent_gateway.runtime.access_policy import (
     SkillExecutionGrant,
     issue_skill_execution_grant,
 )
+from agent_gateway.skills.gripper.definition import SET_GRIPPER_STATE_SKILL_ID_V1
 from agent_gateway.skills.motion.definition import (
     EXECUTE_GRASP_APPROACH_PLAN_SKILL_ID_V1,
     FIXED_CARDINAL_TCP_STEP_DIRECTION_BY_SKILL_ID_V1,
@@ -45,8 +46,10 @@ REAL_AGENT_PRIMITIVE_ACTIONS = (
     REAL_AGENT_ABSOLUTE_TCP_POSE_ACTION,
     REAL_AGENT_GRASP_APPROACH_ACTION,
     REAL_AGENT_EXECUTE_GRASP_APPROACH_PLAN_ACTION,
+    "set_gripper_state",
 )
 _FIXED_SKILL_ID_BY_ACTION = {
+    "set_gripper_state": SET_GRIPPER_STATE_SKILL_ID_V1,
     **dict(FIXED_CARDINAL_TCP_STEP_SKILL_ID_BY_DIRECTION_V1),
     "level_forward": TCP_LEVEL_FORWARD_SKILL_ID_V1,
     "level_forward_left_30": TCP_LEVEL_FORWARD_LEFT_30_SKILL_ID_V1,
@@ -76,6 +79,8 @@ def _requested_action_and_component_ids(
     """
 
     parameters = request.parameters
+    if request.skill_id == SET_GRIPPER_STATE_SKILL_ID_V1:
+        return "set_gripper_state", ("right_gripper",)
     fixed_cardinal_action = FIXED_CARDINAL_TCP_STEP_DIRECTION_BY_SKILL_ID_V1.get(
         request.skill_id
     )
@@ -173,6 +178,13 @@ class RealAgentPrimitiveSessionAuthorization:
         self._clock = clock
         self._lock = threading.Lock()
         self._grants_issued = 0
+        if "set_gripper_state" in normalized_actions and (
+            normalized_side != "right"
+            or gateway_session.contract_bundle.gripper_contract is None
+        ):
+            raise ValueError(
+                "Gripper authorization requires the bound right-gripper Route."
+            )
 
         manifest = gateway_session.contract_bundle.route_manifest
         self.operator_authorization_receipt_id = (
@@ -222,7 +234,12 @@ class RealAgentPrimitiveSessionAuthorization:
         requested_action, component_ids = _requested_action_and_component_ids(request)
         if requested_action not in self.authorized_actions:
             return None
-        if component_ids != (f"{self.side}_arm",):
+        expected_component = (
+            "right_gripper"
+            if requested_action == "set_gripper_state"
+            else f"{self.side}_arm"
+        )
+        if component_ids != (expected_component,):
             return None
         if requested_action not in REAL_AGENT_PRIMITIVE_ACTIONS:
             return None

@@ -10,13 +10,13 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from agent_gateway.profiles.real.exclusive_factory import (
-    assemble_exclusive_real_agent_primitive_deployment,
-)
 from agent_gateway.profiles.real.exclusive_application import (
     ExclusiveRealSkillApplication,
     ExclusiveRealSkillApplicationConfig,
     ExclusiveRealSkillApplicationState,
+)
+from agent_gateway.profiles.real.exclusive_factory import (
+    assemble_exclusive_real_agent_primitive_deployment,
 )
 from agent_gateway.profiles.real.motion_primitive_profiles import (
     REAL_AGENT_TCP_CARDINAL_STEP_ROUTE_ID_V1,
@@ -207,10 +207,11 @@ class _Server:
         self.closed += 1
 
 
-def _deployment(*, observation_provider, hold_reasons):
+def _deployment(*, observation_provider, hold_reasons, gripper_port=None):
     frame_graph, station_frame, attachment, config, envelope = _assembly_inputs()
     target_builder = _TargetBuilder()
     return assemble_exclusive_real_agent_primitive_deployment(
+        gripper_port=gripper_port,
         target_builder=target_builder,
         port_config=config,
         observation_attachment=attachment,
@@ -235,6 +236,95 @@ def _deployment(*, observation_provider, hold_reasons):
         clock=time.time,
         sleep=time.sleep,
     )
+
+
+def test_composed_application_starts_hand_once_and_publishes_confirmed_hold():
+    from agent_gateway.profiles.real.gripper_skill import (
+        ExclusiveRealGripperResources,
+        RealDmtacGripperControlPort,
+    )
+    from teleop_runtime.skill_deploy.motion_port import RealAgentMotionPhase
+    from tests.test_agent_gateway_gripper_skill import _FakeDmtacBackend
+
+    backend = _FakeDmtacBackend()
+    backend.samples = [(0.0, False)]
+    hand = RealDmtacGripperControlPort(backend=backend, clock=time.time)
+    holds = []
+    deployment = _deployment(
+        observation_provider=_fresh_observation_cut,
+        hold_reasons=holds,
+        gripper_port=hand,
+    )
+    lower_resources = _Resources()
+    resources = ExclusiveRealGripperResources(lower=lower_resources, port=hand)
+    server = _Server()
+    application = ExclusiveRealSkillApplication(
+        deployment=deployment,
+        resources=resources,
+        startup_admission=lambda: "fixture:lower-startup-admission",
+        server_factory=lambda: server,
+    )
+    try:
+        application.start()
+        snapshot = deployment.gateway_session.observation_producer.capture_and_publish(
+            deployment.gateway_session.service
+        ).snapshot
+        assert snapshot.lifecycle_state == "hold"
+        assert snapshot.execution_gate == "hold"
+        assert (
+            deployment.gateway_session.port.snapshot().phase
+            == RealAgentMotionPhase.HELD
+        )
+        assert backend.commands == []
+    finally:
+        application.close()
+    assert backend.events == ["hand_start", "hand_close"]
+    assert lower_resources.starts == lower_resources.closes == 1
+
+
+def test_composed_startup_failure_keeps_resources_when_hand_stop_is_unproved():
+    from agent_gateway.profiles.real.gripper_skill import (
+        ExclusiveRealGripperResources,
+        RealDmtacGripperControlPort,
+    )
+    from tests.test_agent_gateway_gripper_skill import _FakeDmtacBackend
+
+    backend = _FakeDmtacBackend()
+    backend.samples = [(0.0, False)]
+    hand = RealDmtacGripperControlPort(backend=backend, clock=time.time)
+    deployment = _deployment(
+        observation_provider=_fresh_observation_cut,
+        hold_reasons=[],
+        gripper_port=hand,
+    )
+    lower_resources = _Resources()
+    resources = ExclusiveRealGripperResources(lower=lower_resources, port=hand)
+    original_stop = backend.hold_gripper_motion
+    backend.hold_gripper_motion = lambda reason: False
+
+    def reject_startup():
+        raise RuntimeError("injected admission failure")
+
+    def no_server():
+        raise AssertionError("Failed startup must not expose the transport.")
+
+    application = ExclusiveRealSkillApplication(
+        deployment=deployment,
+        resources=resources,
+        startup_admission=reject_startup,
+        server_factory=no_server,
+    )
+    with pytest.raises(RuntimeError, match="injected admission failure.*startup_close"):
+        application.start()
+    assert application.state == ExclusiveRealSkillApplicationState.FAULT
+    assert lower_resources.closes == 0
+    assert backend.events == ["hand_start"]
+    assert backend.commands == []
+    backend.hold_gripper_motion = original_stop
+    application.close()
+    assert application.state == ExclusiveRealSkillApplicationState.CLOSED
+    assert backend.events == ["hand_start", "hand_close"]
+    assert lower_resources.closes == 1
 
 
 def test_factory_assembles_one_gateway_and_independent_lower_owner() -> None:

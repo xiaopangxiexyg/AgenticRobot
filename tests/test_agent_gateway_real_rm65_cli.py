@@ -67,6 +67,38 @@ def test_cli_rejects_confirmation_before_profile_or_hardware_resolution(
     assert called is False
 
 
+def test_cli_gripper_authorization_requires_explicit_config_before_hardware():
+    args = _argv(confirmation=REAL_AGENT_PRIMITIVE_SESSION_CONFIRM_TOKEN)
+    args[args.index("forward")] = "set_gripper_state"
+    with pytest.raises(SystemExit) as error:
+        gateway_cli.main(args)
+    assert error.value.code == 2
+
+
+@pytest.mark.parametrize(
+    "flag",
+    [
+        "open_on_start",
+        "clear_fault_on_start",
+        "reconnect_on_error",
+        "auto_recover_internal_communication_fault",
+        "tactile_reset_on_start",
+    ],
+)
+def test_cli_gripper_rejects_implicit_motion_or_recovery_before_hardware(
+    tmp_path, flag
+):
+    config = tmp_path / "hand.json"
+    config.write_text(
+        json.dumps({"side": "right", "gripper_port": "/dev/fake", flag: True})
+    )
+    args = _argv(confirmation=REAL_AGENT_PRIMITIVE_SESSION_CONFIRM_TOKEN)
+    args.extend(["--right-gripper-config", str(config)])
+    with pytest.raises(SystemExit) as error:
+        gateway_cli.main(args)
+    assert error.value.code == 2
+
+
 def test_cli_rejects_retired_one_shot_confirmation_before_hardware_resolution(
     monkeypatch,
 ) -> None:
@@ -794,8 +826,7 @@ def test_cli_assembles_then_reports_ready_and_lower_hold(
                     "left": {"background_fault": None},
                     "right": {
                         "background_fault": (
-                            "Movej_CANFD returned non-zero/unknown result: "
-                            "error code 7"
+                            "Movej_CANFD returned non-zero/unknown result: error code 7"
                         ),
                         "background_fault_stop_attempted": True,
                         "background_fault_stop_success": True,
@@ -814,15 +845,14 @@ def test_cli_assembles_then_reports_ready_and_lower_hold(
         ),
         deployment=SimpleNamespace(
             gateway_session=SimpleNamespace(
+                gripper_port=None,
                 contract_bundle=SimpleNamespace(route_manifest=manifest),
                 emergency_stop_port=object(),
                 service=SimpleNamespace(
                     emergency_stop_latched=False,
                     emergency_stop_receipt=None,
                 ),
-                executors_by_skill_id={
-                    "motion.step_tcp_cardinal": SimpleNamespace()
-                },
+                executors_by_skill_id={"motion.step_tcp_cardinal": SimpleNamespace()},
                 passive_read_executors_by_skill_id={
                     "perception.capture_rgb": camera_executor,
                     "perception.plan_point_grasp": point_grasp_executor,
@@ -937,3 +967,24 @@ def test_cli_assembles_then_reports_ready_and_lower_hold(
     assert stopped_after_emergency_stop["safe_shutdown_basis"] == (
         "lower_emergency_stop_receipt"
     )
+
+    # Neither arm HOLD nor emergency-stop proof may conceal a missing hand stop.
+    hand = SimpleNamespace(last_hold_receipt=None)
+    composition.deployment.gateway_session.gripper_port = hand
+    for receipt in (
+        None,
+        SimpleNamespace(succeeded=False, evidence_refs=("hand-ack",)),
+    ):
+        hand.last_hold_receipt = receipt
+        stopped = gateway_cli._stopped_payload(composition)
+        assert stopped["lower_hold_proved"] is True
+        assert stopped["emergency_stop_confirmed"] is False
+        assert stopped["gripper_stop_proved"] is False
+        assert stopped["safe_shutdown"] is False
+        assert stopped["safe_shutdown_basis"] == "missing_gripper_stop_proof"
+    hand.last_hold_receipt = SimpleNamespace(
+        succeeded=True, evidence_refs=("hand-stopped",)
+    )
+    stopped = gateway_cli._stopped_payload(composition)
+    assert stopped["safe_shutdown"] is True
+    assert stopped["gripper_stop_evidence_refs"] == ["hand-stopped"]

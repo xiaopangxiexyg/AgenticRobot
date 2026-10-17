@@ -1,11 +1,17 @@
 from __future__ import annotations
 
+import time
 from dataclasses import MISSING, fields, replace
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
 
+from agent_gateway.profiles.real import gripper_skill as gripper_module
+from agent_gateway.profiles.real.gripper_skill import (
+    RealDmtacGripperControlPort,
+    build_real_dmtac_gripper_skill_contract_bundle,
+)
 from agent_gateway.profiles.real.motion_factory import (
     attach_real_agent_primitive_gateway,
 )
@@ -453,6 +459,374 @@ PRIMITIVE_CASES = (
     ),
     *tuple((skill_id, None) for skill_id in FIXED_LEVEL_TCP_ORIENTATION_SKILL_IDS_V1),
 )
+
+
+class _ComposedGripperBackend:
+    def __init__(self, side="right", *, clock=None):
+        self.config = SimpleNamespace(
+            side=side, gripper_port="/dev/fake-" + side, gripper_id=1
+        )
+        self.commands = []
+        self.holds = []
+        self.close_fraction = 0.0
+        self.stop_ok = True
+        self.clock = clock
+
+    def is_ready(self):
+        return True
+
+    def readiness_report(self):
+        return {"ready": True}
+
+    def read_gripper_state_now(self):
+        if self.clock is not None:
+            self.clock.value += .001
+            return {"timestamp": self.clock()}
+        return {"timestamp": time.time()}
+
+    def get_state(self, **kwargs):
+        return {
+            "gripper_measured_scalar": self.close_fraction,
+            "gripper_is_moving": False,
+            "gripper_error_code": 0,
+        }
+
+    def send_fixed_joint_pos(self, value):
+        self.commands.append(value)
+        self.close_fraction = value
+        return True
+
+    def hold_gripper_motion(self, reason):
+        self.holds.append(reason)
+        return self.stop_ok
+
+
+@pytest.fixture
+def _composed_gripper_fixture(monkeypatch):
+    return lambda: _build_composed_gripper_fixture(monkeypatch=monkeypatch)
+
+
+def _build_composed_gripper_fixture(*, monkeypatch):
+    base, port, _ = _runtime_fixture(exclusive_owner=True)
+    clock = _Clock()
+    # Only the adapter time port is replaced. Service/thread time remains real;
+    # acquisition, wall age and HOLD deadlines share this fixture's logical cut.
+    monkeypatch.setattr(gripper_module, "time", SimpleNamespace(
+        monotonic=clock, time=clock,
+        sleep=lambda duration: setattr(clock, "value", clock.value + duration)))
+    owner = _PersistentOwnerSession()
+    port.request_domain_hold(reason="fixture startup", requested_at=clock())
+    port.apply_owner_requests(session=owner, now=clock())
+    port.publish_owner_state(session=owner, captured_at=clock())
+    port.publish_measured_pose(
+        pose_world_by_component={COMPONENT_ID: np.eye(4)},
+        measured_at=clock(),
+        available_at=clock(),
+        source_evidence_refs=("fixture:fresh-qpos",),
+    )
+    backend = _ComposedGripperBackend(clock=clock)
+    hand = RealDmtacGripperControlPort(backend=backend, clock=clock)
+    contract = build_real_dmtac_gripper_skill_contract_bundle(
+        runtime_session_id=base.attachment.runtime_session_id,
+        control_domain_id=base.attachment.control_domain_id,
+        target_binding_id=base.attachment.target_binding_id,
+        station_manifest_hash=base.attachment.station_manifest_hash,
+        execution_manifest_hash=base.attachment.execution_manifest_hash,
+        port=hand,
+    )
+    bundle = build_real_agent_primitive_contract_bundle(
+        attachment=base.attachment,
+        port_config=port.config,
+        frame_graph=base.frame_graph,
+        primitive_reference_frame_id=base.cardinal_profile.reference_frame_id,
+        safety_envelope_refs=base.deployment_bindings[0].safety_envelope_refs,
+        gripper_contract=contract,
+    )
+
+    def sleep(duration):
+        clock.value += duration
+        port.apply_owner_requests(session=owner, now=clock())
+        port.publish_owner_state(session=owner, captured_at=clock())
+        port.publish_measured_pose(
+            pose_world_by_component={COMPONENT_ID: np.eye(4)},
+            measured_at=clock(),
+            available_at=clock(),
+            source_evidence_refs=("fixture:fresh-qpos",),
+        )
+
+    gateway = assemble_real_agent_primitive_gateway_session(
+        contract_bundle=bundle,
+        port=port,
+        gripper_port=hand,
+        owner_state_provider=lambda: _owner_state(bundle, captured_at=clock()),
+        allowed_client_ids=(CLIENT_ID,),
+        clock=clock,
+        sleep=sleep,
+    )
+    snapshot = gateway.observation_producer.capture_and_publish(
+        gateway.service
+    ).snapshot
+    assert snapshot is not None
+    entry = bundle.route_manifest.route("manipulation.set_gripper_state", "1")
+    route = entry.route
+    profile = route.allowed_parameter_profiles[0]
+    request = replace(
+        _read_request(bundle, snapshot),
+        request_id="request:gripper",
+        idempotency_key="idempotency:gripper",
+        skill_id=route.skill_id,
+        skill_version=route.skill_version,
+        skill_definition_hash=route.skill_definition_hash,
+        route_id=route.route_id,
+        route_version=route.route_version,
+        route_hash=route.semantic_content_hash,
+        deployment_binding_hash=entry.deployment_binding.deployment_binding_hash,
+        parameter_profile_id=profile.parameter_profile_id,
+        parameter_profile_hash=profile.parameter_profile_hash,
+        parameters={"target_state": "closed"},
+        requested_timeout_ms=5000,
+    )
+    return gateway, backend, request, snapshot, clock
+
+
+def test_composed_gripper_requires_separate_authorization_and_executes_under_hold(_composed_gripper_fixture):
+    gateway, backend, request, snapshot, clock = _composed_gripper_fixture()
+    try:
+        arm_auth = RealAgentPrimitiveSessionAuthorization(
+            gateway_session=gateway,
+            side="right",
+            authorized_actions=("forward",),
+            client_id=CLIENT_ID,
+            confirmation_token=REAL_AGENT_PRIMITIVE_SESSION_CONFIRM_TOKEN,
+            clock=clock,
+        )
+        assert arm_auth.grant_resolver(request) is None
+        assert not gateway.service.submit_request(
+            request=request, current_station_revision=snapshot.station_revision
+        ).accepted
+        assert not backend.commands
+        auth = RealAgentPrimitiveSessionAuthorization(
+            gateway_session=gateway,
+            side="right",
+            authorized_actions=("set_gripper_state",),
+            client_id=CLIENT_ID,
+            confirmation_token=REAL_AGENT_PRIMITIVE_SESSION_CONFIRM_TOKEN,
+            clock=clock,
+        )
+        grant = auth.grant_resolver(request)
+        request = replace(request, skill_execution_grant_id=grant.grant_id)
+        admitted = gateway.service.submit_request(
+            request=request,
+            grant=grant,
+            current_station_revision=snapshot.station_revision,
+        )
+        assert admitted.accepted
+        assert gateway.service.launch_operation(
+            admitted.operation.operation_id
+        ).accepted
+        assert gateway.wait(timeout_sec=3)
+        result = gateway.service.get_operation(admitted.operation.operation_id)
+        assert result.execution_outcome == "completed"
+        assert result.execution_result["terminal_hold_confirmed"] is True
+        assert backend.commands == [1.0]
+        assert gateway.port.snapshot().phase == RealAgentMotionPhase.HELD
+    finally:
+        assert gateway.close().accepted
+
+
+def test_composed_gripper_reserves_the_same_operation_slot_as_arm_motion(_composed_gripper_fixture):
+    gateway, backend, request, snapshot, clock = _composed_gripper_fixture()
+    try:
+        auth = RealAgentPrimitiveSessionAuthorization(
+            gateway_session=gateway,
+            side="right",
+            authorized_actions=("forward", "set_gripper_state"),
+            client_id=CLIENT_ID,
+            confirmation_token=REAL_AGENT_PRIMITIVE_SESSION_CONFIRM_TOKEN,
+            clock=clock,
+        )
+        grant = auth.grant_resolver(request)
+        request = replace(request, skill_execution_grant_id=grant.grant_id)
+        assert gateway.service.submit_request(
+            request=request,
+            grant=grant,
+            current_station_revision=snapshot.station_revision,
+        ).accepted
+        arm = _request(
+            gateway.contract_bundle,
+            snapshot,
+            skill_id="motion.step_tcp_forward",
+            direction="forward",
+            client_sequence=2,
+        )
+        grant = auth.grant_resolver(arm)
+        arm = replace(arm, skill_execution_grant_id=grant.grant_id)
+        rejected = gateway.service.submit_request(
+            request=arm, grant=grant, current_station_revision=snapshot.station_revision
+        )
+        assert not rejected.accepted
+        assert "active" in rejected.reason_code or "busy" in rejected.reason_code
+        assert not backend.commands
+    finally:
+        assert gateway.close().accepted
+
+
+def test_composed_gateway_does_not_confirm_shutdown_if_gripper_stop_fails(_composed_gripper_fixture):
+    gateway, backend, _, _, _ = _composed_gripper_fixture()
+    backend.stop_ok = False
+    assert not gateway.close().accepted
+    backend.stop_ok = True
+    assert gateway.close().accepted
+
+
+@pytest.mark.parametrize("hand_stop_ok", [False, True])
+def test_composed_emergency_stop_requires_arm_and_hand_proof(hand_stop_ok):
+    backend = _ComposedGripperBackend()
+    backend.stop_ok = hand_stop_ok
+    hand = RealDmtacGripperControlPort(backend=backend)
+    reasons = []
+
+    def stop_arms(reason):
+        reasons.append(reason)
+        return RealSkillMotionEmergencyStopReceipt(
+            succeeded=True,
+            evidence_refs=("arm-estop:left", "arm-estop:right"),
+            status_by_side={"left": "confirmed", "right": "confirmed"},
+        )
+
+    port = RealAgentDomainEmergencyStopPort(
+        port_id="composed-estop:test", emergency_stop=stop_arms, gripper_port=hand
+    )
+    receipt = port.request_emergency_stop(operation=None, reason="operator stop")
+    assert receipt.succeeded is hand_stop_ok
+    assert receipt.proves_motion_or_hold is hand_stop_ok
+    assert reasons == backend.holds == ["operator stop"]
+    assert {"arm-estop:left", "arm-estop:right"}.issubset(receipt.evidence_refs)
+    assert hand.last_hold_receipt is not None
+    assert set(hand.last_hold_receipt.evidence_refs).issubset(receipt.evidence_refs)
+
+
+def test_composed_emergency_stop_still_stops_hand_after_arm_exception():
+    backend = _ComposedGripperBackend()
+    hand = RealDmtacGripperControlPort(backend=backend)
+
+    def stop_arms(reason):
+        raise RuntimeError("arm stop unavailable")
+
+    port = RealAgentDomainEmergencyStopPort(
+        port_id="composed-estop:test", emergency_stop=stop_arms, gripper_port=hand
+    )
+    with pytest.raises(RuntimeError, match="arm stop unavailable"):
+        port.request_emergency_stop(operation=None, reason="operator stop")
+    assert backend.holds == ["operator stop"]
+    assert port.receipts == ()
+
+
+def test_composed_gripper_accepts_fresh_confirmed_hold_observation_without_resuming_arm(_composed_gripper_fixture):
+    gateway, _, _, _, clock = _composed_gripper_fixture()
+    owner = replace(
+        _owner_state(gateway.contract_bundle, captured_at=clock()),
+        lifecycle_state="hold",
+        execution_gate="hold",
+    )
+    gateway.observation_producer.owner_state_provider = lambda: owner
+    snapshot = gateway.observation_producer.capture_and_publish(
+        gateway.service
+    ).snapshot
+    assert snapshot.lifecycle_state == "hold"
+    assert snapshot.execution_gate == "hold"
+    assert gateway.port.snapshot().phase == RealAgentMotionPhase.HELD
+    assert gateway.close().accepted
+
+
+def test_gripper_command_attempt_invalidates_scene_revision_but_passive_reads_do_not(_composed_gripper_fixture):
+    gateway, _, _, snapshot, _ = _composed_gripper_fixture()
+    try:
+        gateway.gripper_port.observe_state()
+        assert (
+            gateway.observation_producer.current_station_revision
+            == snapshot.station_revision
+        )
+        gateway.gripper_port.command_close(1.0)
+        assert (
+            gateway.observation_producer.current_station_revision
+            > snapshot.station_revision
+        )
+    finally:
+        assert gateway.close().accepted
+
+
+def test_composed_gripper_rejects_motion_after_arm_owner_becomes_stale(_composed_gripper_fixture):
+    gateway, backend, _, _, clock = _composed_gripper_fixture()
+    clock.value += 0.3
+    with pytest.raises(RuntimeError, match="fresh, healthy"):
+        gateway.gripper_port.command_close(1.0)
+    assert not backend.commands
+    assert gateway.close().accepted
+
+
+def test_composed_gripper_rejects_fresh_owner_with_stale_arm_measurement(_composed_gripper_fixture):
+    gateway, backend, _, _, clock = _composed_gripper_fixture()
+    clock.value += 0.3
+    gateway.port.publish_owner_state(
+        session=_PersistentOwnerSession(), captured_at=clock()
+    )
+    with pytest.raises(RuntimeError, match="fresh, healthy"):
+        gateway.gripper_port.command_close(1.0)
+    assert not backend.commands
+    assert gateway.close().accepted
+
+
+def test_composed_gripper_client_uses_real_wire_admission_and_hand_constraint_binding(
+    monkeypatch,
+    _composed_gripper_fixture,
+    tmp_path,
+):
+    from argparse import Namespace
+
+    from agent_gateway.profiles.real import one_shot_client
+
+    gateway, backend, _, _, clock = _composed_gripper_fixture()
+    auth = RealAgentPrimitiveSessionAuthorization(
+        gateway_session=gateway,
+        side="right",
+        authorized_actions=("set_gripper_state",),
+        client_id=CLIENT_ID,
+        confirmation_token=REAL_AGENT_PRIMITIVE_SESSION_CONFIRM_TOKEN,
+        clock=clock,
+    )
+    adapter = gateway.wire_adapter(
+        authenticated_client_id=CLIENT_ID, grant_resolver=auth.grant_resolver
+    )
+
+    class Client:
+        def __init__(self, **kwargs):
+            pass
+
+        def call(self, method, payload):
+            function = getattr(adapter, method)
+            return function() if payload is None else function(payload)
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(one_shot_client, "_Client", Client)
+    args = Namespace(
+        confirm="EXECUTE_AUTHORIZED_REAL_TCP_PRIMITIVE",
+        socket_path=str(tmp_path / "fake.sock"),
+        side="right",
+        action="set_gripper_state",
+        target_state="closed",
+        client_id=CLIENT_ID,
+        timeout_sec=1,
+        operation_timeout_sec=None,
+    )
+    try:
+        result = one_shot_client.execute_one_shot(args)
+        assert result["status"] == "completed"
+        assert backend.commands == [1.0]
+    finally:
+        assert gateway.close().accepted
 
 
 def test_real_wire_adapter_projects_lower_owned_arm_resource_while_idle() -> None:

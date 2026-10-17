@@ -36,6 +36,7 @@ from agent_gateway.runtime.payload_validation import (
     AgentSkillPayloadValidatorRegistry,
     AgentSkillPayloadValidatorSet,
 )
+from agent_gateway.skills.gripper.deployment import GripperSkillContractBundle
 from agent_gateway.skills.motion.definition import (
     EXECUTE_GRASP_APPROACH_PLAN_SKILL_ID_V1,
     FIXED_CARDINAL_TCP_STEP_DIRECTION_BY_SKILL_ID_V1,
@@ -63,7 +64,6 @@ from agent_gateway.skills.motion.schemas import (
 )
 from dataset_contracts.canonical_encoding import canonical_content_hash
 from robot_motion.coordinate_frames import CoordinateFrameGraph
-from .object_transport import ObjectTransportRegistration
 from robot_motion.coordinate_profiles import STATION_RETARGET_FRAME_CONTRACT_V1
 from robot_motion.primitives import (
     CARDINAL_TCP_SHORT_STEP_PRIMITIVES,
@@ -84,6 +84,7 @@ from .grasp_approach_plan import (
     build_real_grasp_approach_plan_registration,
 )
 from .localization_deployment import RealObjectLocalizationRegistration
+from .object_transport import ObjectTransportRegistration
 from .observation_gateway import (
     RealTcpPoseObserveAttachmentSpec,
     RealTcpPoseObserveContractBundle,
@@ -592,6 +593,7 @@ class RealAgentPrimitiveContractBundle:
     ) = None
     grasp_approach_plan_registration: RealGraspApproachPlanRegistration | None = None
     object_transport_registration: ObjectTransportRegistration | None = None
+    gripper_contract: GripperSkillContractBundle | None = None
 
     def __post_init__(self) -> None:
         validate_skill_route_catalog_closure(
@@ -601,6 +603,21 @@ class RealAgentPrimitiveContractBundle:
             io_catalog=self.io_catalog,
         )
         self.payload_validators.validate_manifest(self.route_manifest)
+        if self.gripper_contract is not None:
+            if self.cardinal_profile.side != "right":
+                raise ValueError("Gripper v1 requires the bound right-arm session.")
+            binding = self.gripper_contract.deployment_binding
+            for name in (
+                "runtime_session_id",
+                "control_domain_id",
+                "target_binding_id",
+                "station_manifest_hash",
+                "execution_manifest_hash",
+                "target_kind",
+                "current_mode",
+            ):
+                if getattr(binding, name) != getattr(self.route_manifest, name):
+                    raise ValueError("Gripper and arm deployment identities disagree.")
         pose_target_enabled = self.pose_target_profile is not None
         grasp_approach_enabled = any(
             entry.route.skill_id == GRASP_APPROACH_SKILL_ID_V1
@@ -767,8 +784,12 @@ class RealAgentPrimitiveContractBundle:
             + int(self.placement_registration is not None)
             + (2 if grasp_approach_plan_enabled else 0)
             + int(transport_enabled)
-            + int(self.station_point_grasp_registration is not None
-                  and self.station_point_grasp_registration.observation_registration is not None)
+            + int(self.gripper_contract is not None)
+            + int(
+                self.station_point_grasp_registration is not None
+                and self.station_point_grasp_registration.observation_registration
+                is not None
+            )
         )
         if len(self.route_manifest.skill_routes) != expected_route_count:
             raise ValueError("Real perception registration and manifest disagree.")
@@ -985,6 +1006,7 @@ def build_real_agent_primitive_contract_bundle(
     convergence_profile: RealAgentPrimitiveConvergenceProfile | None = None,
     perception_capture: RealPerceptionCaptureRegistration | None = None,
     object_transport_registration: ObjectTransportRegistration | None = None,
+    gripper_contract: GripperSkillContractBundle | None = None,
     localization_registration: RealObjectLocalizationRegistration | None = None,
     segmentation_registration: SegmentationRegistration | None = None,
     station_point_grasp_registration: StationBoundPointGraspRegistration | None = None,
@@ -1604,6 +1626,11 @@ def build_real_agent_primitive_contract_bundle(
             *fixed_cardinal_definitions,
             *orientation_definitions,
             *(item.definition for item in perception_registrations),
+            *(
+                (gripper_contract.definition_catalog.skill_definitions)
+                if gripper_contract is not None
+                else ()
+            ),
         ),
     )
     schemas = AgentSkillSchemaCatalog(
@@ -1622,9 +1649,36 @@ def build_real_agent_primitive_contract_bundle(
             *fixed_cardinal_schemas,
             *orientation_schemas,
             *(item.schema_entry for item in perception_registrations),
+            *(
+                (gripper_contract.schema_catalog.schema_entries)
+                if gripper_contract is not None
+                else ()
+            ),
         ),
     )
     route_items = [tcp_pose_entry]
+    if gripper_contract is not None:
+        hand_binding = gripper_contract.deployment_binding
+        entry = gripper_contract.route_manifest.skill_routes[0]
+        # The composed manifest requires a selected lower constraint binding
+        # for every motion Route. This is the hand profile, not a TCP box.
+        hand_envelope = SkillDeploymentSafetyEnvelopeRef(
+            object_id="real-dmtac-gripper:" + hand_binding.port_binding_hash,
+            schema="dexteleop.deployment_safety_envelope.v1",
+            content_hash=hand_binding.port_binding_hash,
+            constraint_set_hash=gripper_contract.schema_catalog.schema_entries[
+                0
+            ].parameter_schema_hash,
+            allowed_route_ids=(entry.route.route_id,),
+        )
+        route_items.append(
+            replace(
+                entry,
+                deployment_binding=replace(
+                    entry.deployment_binding, safety_envelope_refs=(hand_envelope,)
+                ),
+            )
+        )
     route_items.extend(
         SkillRouteManifestEntry(
             route=route,
@@ -1905,8 +1959,25 @@ def build_real_agent_primitive_contract_bundle(
                 if grasp_approach_plan_registration is None
                 else (grasp_approach_plan_registration.payload_validator,)
             ),
-            *((grasp_observation_registration.payload_validator,) if grasp_observation_registration is not None else ()),
-            *((object_transport_registration.payload_validator,) if object_transport_registration is not None else ()),
+            *(
+                (grasp_observation_registration.payload_validator,)
+                if grasp_observation_registration is not None
+                else ()
+            ),
+            *(
+                (object_transport_registration.payload_validator,)
+                if object_transport_registration is not None
+                else ()
+            ),
+            *(
+                (
+                    gripper_contract.payload_validators.validator_for(
+                        gripper_contract.route_manifest.skill_routes[0].route
+                    ),
+                )
+                if gripper_contract is not None
+                else ()
+            ),
         ),
     )
     return RealAgentPrimitiveContractBundle(
@@ -1933,6 +2004,7 @@ def build_real_agent_primitive_contract_bundle(
         ),
         grasp_approach_plan_registration=grasp_approach_plan_registration,
         object_transport_registration=object_transport_registration,
+        gripper_contract=gripper_contract,
     )
 
 

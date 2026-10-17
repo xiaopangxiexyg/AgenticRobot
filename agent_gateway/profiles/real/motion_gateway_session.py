@@ -63,6 +63,11 @@ from agent_gateway.runtime.station_operation_worker import (
     StationOperationWorkerBinding,
 )
 from agent_gateway.runtime.station_revision import AgentStationRevisionTracker
+from agent_gateway.skills.gripper.definition import SET_GRIPPER_STATE_SKILL_ID_V1
+from agent_gateway.skills.gripper.runtime import (
+    GripperControlPort,
+    build_gripper_skill_executor,
+)
 from agent_gateway.skills.motion.definition import (
     EXECUTE_GRASP_APPROACH_PLAN_SKILL_ID_V1,
     FIXED_CARDINAL_TCP_STEP_SKILL_IDS_V1,
@@ -92,6 +97,11 @@ from .grasp_approach_plan import (
 )
 from .back_projection import RealSenseBackProjectionCapturePort
 from .placement import RealPlacementRobotStatePort
+from .grasp_observation import (
+    build_grasp_observation_executor,
+    read_retained_grasp_observation,
+)
+from .gripper_skill import RealDmtacGripperControlPort, stop_arm_and_gripper
 from .localization_gateway import (
     ObjectLocalizationProvider,
     build_real_object_localization_executor,
@@ -100,10 +110,9 @@ from .motion_primitive_profiles import (
     RealAgentPrimitiveContractBundle,
 )
 from .motion_primitive_skill import RealAgentPrimitiveSkillLifecycle
+from .object_transport import build_object_transport_executor
 from .observation_gateway import RealControlOwnerState
 from .perception_gateway import build_real_perception_passive_executors
-from .grasp_observation import build_grasp_observation_executor, read_retained_grasp_observation
-from .object_transport import build_object_transport_executor
 from .point_grasp_gateway import (
     StationBoundPointGraspProvider,
     build_station_bound_point_grasp_executor,
@@ -134,12 +143,14 @@ class RealAgentDomainEmergencyStopPort:
         *,
         port_id: str,
         emergency_stop: Callable[[str], RealSkillMotionEmergencyStopReceipt],
+        gripper_port: GripperControlPort | None = None,
         clock: Callable[[], float] = time.time,
     ) -> None:
         self.port_id = _required(port_id, field_name="port_id")
         if not callable(emergency_stop) or not callable(clock):
             raise TypeError("emergency_stop and clock must be callable.")
         self._emergency_stop = emergency_stop
+        self._gripper_port = gripper_port
         self._clock = clock
         self._lock = threading.Lock()
         self._next_sequence = 0
@@ -157,11 +168,20 @@ class RealAgentDomainEmergencyStopPort:
         reason: str,
     ) -> AgentGatewayAuthoritativePortReceipt:
         normalized_reason = _required(reason, field_name="reason")
-        lower = self._emergency_stop(normalized_reason)
+        if self._gripper_port is None:
+            lower = self._emergency_stop(normalized_reason)
+            hand_hold = None
+        else:
+            lower, hand_hold = stop_arm_and_gripper(
+                arm_stop=lambda: self._emergency_stop(normalized_reason),
+                port=self._gripper_port,
+                reason=normalized_reason,
+            )
         if not isinstance(lower, RealSkillMotionEmergencyStopReceipt):
             raise TypeError(
                 "lower emergency_stop must return RealSkillMotionEmergencyStopReceipt."
             )
+        stopped = lower.succeeded and (hand_hold is None or hand_hold.succeeded)
         with self._lock:
             sequence = self._next_sequence
             self._next_sequence += 1
@@ -169,10 +189,10 @@ class RealAgentDomainEmergencyStopPort:
             port_id=self.port_id,
             operation_kind="emergency_stop",
             operation_id=None if operation is None else operation.operation_id,
-            succeeded=lower.succeeded,
+            succeeded=stopped,
             status=(
                 "real_rm65_domain_emergency_stop_confirmed"
-                if lower.succeeded
+                if stopped
                 else "real_rm65_domain_emergency_stop_unconfirmed"
             ),
             completed_at=float(self._clock()),
@@ -182,8 +202,10 @@ class RealAgentDomainEmergencyStopPort:
                 if operation is None
                 else "real-agent-motion:" + operation.operation_id
             ),
-            evidence_refs=lower.evidence_refs,
-            proves_motion_or_hold=lower.succeeded,
+            evidence_refs=lower.evidence_refs
+            if hand_hold is None
+            else (*lower.evidence_refs, *hand_hold.evidence_refs),
+            proves_motion_or_hold=stopped,
         )
         with self._lock:
             self._receipts.append(receipt)
@@ -197,6 +219,7 @@ class RealAgentPrimitiveObservationProducer:
         self,
         *,
         contract_bundle: RealAgentPrimitiveContractBundle,
+        gripper_port: RealDmtacGripperControlPort | None = None,
         port: RealAgentMotionPort,
         owner_state_provider: Callable[[], RealControlOwnerState],
         revision_tracker: AgentStationRevisionTracker | None = None,
@@ -209,6 +232,7 @@ class RealAgentPrimitiveObservationProducer:
         if not callable(owner_state_provider) or not callable(clock):
             raise TypeError("owner_state_provider and clock must be callable.")
         self.contract_bundle = contract_bundle
+        self.gripper_port = gripper_port
         self.port = port
         self.owner_state_provider = owner_state_provider
         self.revision_tracker = (
@@ -261,6 +285,10 @@ class RealAgentPrimitiveObservationProducer:
                     "execution_gate": owner_cut.execution_gate,
                 }
             )
+        if self.gripper_port is not None:
+            fingerprint["gripper_command_attempt_ref"] = (
+                self.gripper_port.last_command_attempt_ref
+            )
         return fingerprint
 
     def _observe_control_state(self) -> int:
@@ -286,7 +314,18 @@ class RealAgentPrimitiveObservationProducer:
             if getattr(owner, field_name) != expected:
                 raise ValueError(f"Real motion owner {field_name} mismatch.")
         if owner.lifecycle_state != "running" or owner.execution_gate != "ready":
-            raise RuntimeError("Real motion owner is not RUNNING/READY.")
+            snapshot = self.port.snapshot()
+            composed_confirmed_hold = (
+                self.contract_bundle.gripper_contract is not None
+                and owner.lifecycle_state == "hold"
+                and owner.execution_gate == "hold"
+                and snapshot.phase == RealAgentMotionPhase.HELD
+                and snapshot.hold_succeeded is True
+            )
+            if not composed_confirmed_hold:
+                raise RuntimeError(
+                    "Real motion owner is not RUNNING/READY or a composed confirmed HOLD."
+                )
         return owner
 
     def _validate_port_binding(self) -> None:
@@ -643,6 +682,7 @@ class RealAgentPrimitiveGatewaySession:
     service: AgentGatewayService
     grasp_observation_executor: PassiveReadSkillExecutor | None = None
     object_transport_executor: PassiveReadSkillExecutor | None = None
+    gripper_port: RealDmtacGripperControlPort | None = None
     _close_lock: threading.Lock = field(default_factory=threading.Lock, init=False)
     _close_outcome: AgentGatewayOperationOutcome | None = field(
         default=None,
@@ -659,6 +699,10 @@ class RealAgentPrimitiveGatewaySession:
         )
         if advertised != (self.emergency_stop_port is not None):
             raise ValueError("Real emergency-stop feature and profile port must match.")
+        if (self.contract_bundle.gripper_contract is not None) != (
+            self.gripper_port is not None
+        ):
+            raise ValueError("Composed gripper port and contract must coexist.")
         enabled = self.contract_bundle.perception_capture is not None
         if enabled != (self.perception_provider is not None):
             raise ValueError("Real perception registration and provider disagree.")
@@ -1003,6 +1047,7 @@ def _real_perception_control_claimed(
 def _real_hardware_view_provider(
     *,
     contract_bundle: RealAgentPrimitiveContractBundle,
+    gripper_port: RealDmtacGripperControlPort | None = None,
     port: RealAgentMotionPort,
     perception_provider: RealSenseAgentPerceptionProvider | None,
     localization_provider: ObjectLocalizationProvider | None,
@@ -1042,6 +1087,21 @@ def _real_hardware_view_provider(
             control_claimed_provider=lambda: _real_motion_control_claimed(port),
         )
     ]
+    if gripper_port is not None:
+        hand_route = contract_bundle.route_manifest.route(
+            SET_GRIPPER_STATE_SKILL_ID_V1, "1"
+        ).route
+        bindings.append(
+            HardwareResourceBinding(
+                resource_id="manipulation.right_gripper",
+                resource_kind="gripper",
+                route_hashes=(hand_route.semantic_content_hash,),
+                health_provider=lambda: (
+                    "ready" if gripper_port.backend.is_ready() else "unavailable"
+                ),
+                control_claimed_provider=lambda: bool(gripper_port.backend.is_ready()),
+            )
+        )
     if perception_provider is not None:
         if not perception_route_hashes:
             raise ValueError("Real perception provider has no read-only Routes.")
@@ -1093,6 +1153,7 @@ def _real_hardware_view_provider(
 def assemble_real_agent_primitive_gateway_session(
     *,
     contract_bundle: RealAgentPrimitiveContractBundle,
+    gripper_port: GripperControlPort | None = None,
     port: RealAgentMotionPort,
     owner_state_provider: Callable[[], RealControlOwnerState],
     allowed_client_ids: tuple[str, ...],
@@ -1209,7 +1270,42 @@ def assemble_real_agent_primitive_gateway_session(
         or max_session_admissions_per_route <= 0
     ):
         raise ValueError("max_session_admissions_per_route must be positive or None.")
+    if (contract_bundle.gripper_contract is not None) != (gripper_port is not None):
+        raise ValueError("Gripper registration and execution port must coexist.")
+    if gripper_port is not None:
+        if not isinstance(gripper_port, RealDmtacGripperControlPort):
+            raise TypeError(
+                "Real composed gripper requires the reviewed DMTAC adapter."
+            )
+
+        def arm_held_for_gripper():
+            snapshot = port.snapshot()
+            measured = port.latest_measured_pose()
+            now = float(clock())
+            fresh = (
+                measured is not None
+                and measured.available_at <= now
+                and (
+                    0.0
+                    <= now - measured.measured_at
+                    <= contract_bundle.attachment.max_measurement_age_ms / 1000.0
+                )
+            )
+            return (
+                fresh
+                and snapshot.phase == RealAgentMotionPhase.HELD
+                and snapshot.hold_succeeded is True
+                and _real_motion_resource_health(
+                    port=port,
+                    clock=clock,
+                    maximum_owner_age_ms=contract_bundle.attachment.max_measurement_age_ms,
+                )
+                == "ready"
+            )
+
+        gripper_port.bind_motion_guard(arm_held_for_gripper)
     producer = RealAgentPrimitiveObservationProducer(
+        gripper_port=gripper_port,
         contract_bundle=contract_bundle,
         port=port,
         owner_state_provider=owner_state_provider,
@@ -1222,14 +1318,32 @@ def assemble_real_agent_primitive_gateway_session(
 
     def domain_hold(*, operation, reason):
         del operation
-        return _shared_port_hold_evidence(
-            port=port,
-            reason=reason,
-            clock=clock,
-            sleep=sleep,
-            timeout_sec=(
-                contract_bundle.convergence_profile.hold_confirmation_timeout_sec
-            ),
+
+        def arm_stop():
+            return _shared_port_hold_evidence(
+                port=port,
+                reason=reason,
+                clock=clock,
+                sleep=sleep,
+                timeout_sec=contract_bundle.convergence_profile.hold_confirmation_timeout_sec,
+            )
+
+        if gripper_port is None:
+            return arm_stop()
+        arm_hold, hand_hold = stop_arm_and_gripper(
+            arm_stop=arm_stop, port=gripper_port, reason=reason
+        )
+        proved = (
+            arm_hold.succeeded and arm_hold.lower_hold_confirmed and hand_hold.succeeded
+        )
+        return StationLifecycleControlEvidence(
+            succeeded=proved,
+            status="arm_gripper_hold_confirmed"
+            if proved
+            else "arm_gripper_hold_failed",
+            lower_operation_id=arm_hold.lower_operation_id,
+            evidence_refs=(*arm_hold.evidence_refs, *hand_hold.evidence_refs),
+            lower_hold_confirmed=proved,
         )
 
     executors: dict[str, ReusableStationAgentSkillOperationExecutor] = {}
@@ -1266,6 +1380,7 @@ def assemble_real_agent_primitive_gateway_session(
         entry
         for entry in contract_bundle.route_manifest.skill_routes
         if entry.route.control_effect_class == "motion"
+        and entry.route.skill_id != SET_GRIPPER_STATE_SKILL_ID_V1
     )
     for entry in motion_entries:
         route = entry.route
@@ -1352,6 +1467,21 @@ def assemble_real_agent_primitive_gateway_session(
         )
         executors[route.skill_id] = executor
         execution_port_by_route_hash[route.semantic_content_hash] = executor
+    if contract_bundle.gripper_contract is not None:
+        assert gripper_port is not None
+        gripper_executor = build_gripper_skill_executor(
+            contract_bundle=contract_bundle.gripper_contract,
+            port=gripper_port,
+            current_station_revision=lambda: producer.current_station_revision,
+            domain_hold=domain_hold,
+            clock=clock,
+            sleep=sleep,
+        )
+        executors[SET_GRIPPER_STATE_SKILL_ID_V1] = gripper_executor
+        entry = contract_bundle.route_manifest.route(SET_GRIPPER_STATE_SKILL_ID_V1, "1")
+        execution_port_by_route_hash[entry.route.semantic_content_hash] = (
+            gripper_executor
+        )
     rgb_executor = None
     depth_executor = None
     back_projection_provider = None
@@ -1668,6 +1798,7 @@ def assemble_real_agent_primitive_gateway_session(
         None
         if emergency_stop is None
         else RealAgentDomainEmergencyStopPort(
+            gripper_port=gripper_port,
             port_id=(
                 "agent-gateway:real-domain-emergency-stop:"
                 + contract_bundle.route_manifest.runtime_session_id
@@ -1740,6 +1871,7 @@ def assemble_real_agent_primitive_gateway_session(
         clock_domain_id=contract_bundle.attachment.clock_domain_id,
     )
     hardware_view_provider = _real_hardware_view_provider(
+        gripper_port=gripper_port,
         contract_bundle=contract_bundle,
         port=port,
         perception_provider=perception_provider,
@@ -1749,6 +1881,7 @@ def assemble_real_agent_primitive_gateway_session(
         clock=clock,
     )
     return RealAgentPrimitiveGatewaySession(
+        gripper_port=gripper_port,
         contract_bundle=contract_bundle,
         port=port,
         observation_producer=producer,

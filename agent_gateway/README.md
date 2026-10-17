@@ -941,7 +941,7 @@ action is the distinct `execute_grasp_approach_plan`; authorizing the legacy
 | 渲染候选 | `perception.render_point_grasp_candidate` | 只读；不改变候选、姿态或运动状态 |
 | 可选的显式 reach 规划 | `perception.plan_grasp_approach@1` | 只读；计划绑定会话、场景版本、起始 qpos 和时效 |
 | 到达抓姿 | `motion.execute_grasp_approach_plan@1` / `motion.approach_grasp_pose@1` | 独立运动授权；不自动闭合夹爪 |
-| 夹爪闭合 / 松开 | 尚未在此 worktree 公开 | 必须是独立执行 Skill，不能悄悄并入 reach |
+| 夹爪闭合 / 松开 | `manipulation.set_gripper_state@1`（显式启用、仅右夹爪） | 独立授权和请求；只证明开闭/停稳，不证明抓牢 |
 | 空手移动 | `motion.move_tcp_to_pose@1` | 不能作为携物碰撞验证的替代品 |
 
 当前 reach 准入验证真实机械臂连杆网格与部署的代理几何、固定桌面/相机杆和 TCP
@@ -950,6 +950,39 @@ action is the distinct `execute_grasp_approach_plan`; authorizing the legacy
 带物退出、放置或物理夹持成功。因此 `path_found` 的含义是“reach
 阶段在当前模型下通过”，不是“完整抓取链通过”；不能据此自动闭合、试抬
 或搬运。后续这些阶段必须有独立的场景/夹爪状态和接触规则证据后才可开放。
+
+#### 可选右夹爪接入
+
+`real-rm65 --right-gripper-config /absolute/right-gripper.json` 使用既有
+`DMTacGripperBackendConfig` 字段配置独立的右夹爪 backend，配置必须显式提供
+`side: "right"` 和 `gripper_port`，不是 USB assignment 文件。默认不启用触觉采集；
+部署禁止启动张开、自动清故障、自动重连和触觉 reset。初始化可以设置已有的速度/力矩，
+但不发位置命令；反馈表明夹爪正在运动、状态无效或资源启动失败时，不发布 endpoint。
+机器人、相机、模型与夹爪均由 application 一次启动和关闭，不按 Skill 请求重建。
+
+仅配置 backend 不授权开闭；操作者还须独立把 `set_gripper_state` 加入
+`--authorized-actions`。同一 Gateway 的 `gateway.operation` 独占资源及 operation store
+使机械臂和夹爪不能同时执行；不创建第二个 service、控制器或 admission 锁。
+已有本机 client 支持 `--action set_gripper_state --side right --target-state open|closed`，
+仍需逐请求确认，并消费精确绑定的 one-use Grant 和夹爪约束 profile。
+调用方不能设置夹爪速度、力矩、设备地址或扩张运动权限。
+
+下层确认 HOLD 后可以继续发布带真实 `hold/hold` 标签的新鲜观测，不能把它写成
+`running/ready`。夹爪位置命令要求同一机械臂 owner 处于新鲜、无故障且已确认的 HOLD；
+首次 startup HOLD 也由既有 lower owner 的时钟与控制周期推进。该路径不恢复机械臂。
+每次夹爪位置写入尝试均进入 Station control fingerprint，旧冻结观测和路径计划会失效，
+不能凭双臂 qpos 未变复用夹爪变化前的计划。读取夹爪状态不改变该 revision。
+
+串口 STOP ACK 不是 HOLD 证明：必须用不超过 200 ms 的新鲜读取确认 `moving=false`，
+才可报告夹爪已停止；读取超预算、反馈过期/未来、故障或不明确都不伪装成功。
+全域 HOLD、emergency stop 和关闭同时覆盖机械臂及夹爪；停止不完整时保留失败，
+不把机械臂的单独 HOLD 作为全域安全证明或继续拆除设备资源。
+当前验证包含 fake backend/真实 Gateway wire、启动/互斥/独立授权/关闭失败测试，
+以及使用既有独立 MuJoCo 夹爪 port 的双指物理接触测试。它不是硬件串口验收，
+也不是同一真实硬件或同一仿真 endpoint 上的完整携物/放置验收。左夹爪不属于 v1，
+不能用 `--side left` 偷换绑定。闭爪完成不证明手物关系，普通 TCP 路径仍不验证携物碰撞。
+正式真机启用前仍须确认“闭爪后普通空手移动/靠近”的准入策略，并完成硬件验收；
+当前接入不能作为已验证携物执行的入口。
 
 The CLI is a concrete lower deployment leaf, not an Agent API. All files and
 the selected side/action are trusted operator inputs. The process exposes no

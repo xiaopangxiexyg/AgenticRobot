@@ -649,6 +649,76 @@ class GripperAgentGatewaySession:
             return self._close_outcome
 
 
+def build_gripper_skill_executor(
+    *,
+    contract_bundle: GripperSkillContractBundle,
+    port: GripperControlPort,
+    current_station_revision: Callable[[], int],
+    convergence: GripperConvergenceProfile | None = None,
+    domain_hold: Callable[..., StationLifecycleControlEvidence] | None = None,
+    clock: Callable[[], float] = time.monotonic,
+    sleep: Callable[[float], None] = time.sleep,
+) -> ReusableStationAgentSkillOperationExecutor:
+    """Bind the existing lifecycle to a standalone or composed Gateway owner."""
+    if not isinstance(contract_bundle, GripperSkillContractBundle):
+        raise TypeError("contract_bundle must be typed.")
+    if not isinstance(port, GripperControlPort):
+        raise TypeError("port must implement GripperControlPort.")
+    convergence = GripperConvergenceProfile() if convergence is None else convergence
+    if not isinstance(convergence, GripperConvergenceProfile):
+        raise TypeError("convergence must be a GripperConvergenceProfile.")
+    binding = contract_bundle.deployment_binding
+    route = contract_bundle.route_manifest.skill_routes[0].route
+
+    if (
+        port.component_id != binding.component_id
+        or port.target_kind != binding.target_kind
+        or port.port_binding_hash != binding.port_binding_hash
+    ):
+        raise ValueError("port identity does not match deployment binding.")
+    if not callable(clock) or not callable(sleep):
+        raise TypeError("clock and sleep must be callable.")
+
+    def lifecycle_factory(**_kwargs: Any) -> GripperSkillLifecycle:
+        return GripperSkillLifecycle(
+            port=port,
+            contract_bundle=contract_bundle,
+            convergence=convergence,
+            clock=clock,
+            sleep=sleep,
+        )
+
+    def gripper_hold(**kwargs: Any) -> StationLifecycleControlEvidence:
+        hold = port.hold(reason=_required(kwargs["reason"], field_name="reason"))
+        return StationLifecycleControlEvidence(
+            succeeded=hold.succeeded,
+            status="gripper_domain_hold_confirmed"
+            if hold.succeeded
+            else "gripper_domain_hold_failed",
+            lower_operation_id=None,
+            evidence_refs=hold.evidence_refs,
+            lower_hold_confirmed=hold.succeeded,
+        )
+
+    return ReusableStationAgentSkillOperationExecutor(
+        port_id=f"agent-gateway:gripper:{binding.runtime_session_id}",
+        binding=StationOperationWorkerBinding(
+            worker_id=f"gripper-worker:{binding.runtime_session_id}",
+            executor_id=binding.executor_id,
+            runtime_session_id=binding.runtime_session_id,
+            skill_id=route.skill_id,
+            skill_version=route.skill_version,
+            route_id=route.route_id,
+            route_version=route.route_version,
+            deployment_binding_hash=binding.semantic_content_hash,
+        ),
+        lifecycle_factory=lifecycle_factory,
+        domain_hold=gripper_hold if domain_hold is None else domain_hold,
+        current_station_revision=current_station_revision,
+        clock=clock,
+    )
+
+
 def assemble_gripper_agent_gateway_session(
     *,
     contract_bundle: GripperSkillContractBundle,
@@ -675,45 +745,13 @@ def assemble_gripper_agent_gateway_session(
     binding = contract_bundle.deployment_binding
     route = contract_bundle.route_manifest.skill_routes[0].route
 
-    def lifecycle_factory(**_kwargs: Any) -> GripperSkillLifecycle:
-        return GripperSkillLifecycle(
-            port=port,
-            contract_bundle=contract_bundle,
-            convergence=convergence,
-            clock=clock,
-            sleep=sleep,
-        )
-
-    def domain_hold(**kwargs: Any) -> StationLifecycleControlEvidence:
-        hold = port.hold(reason=_required(kwargs["reason"], field_name="reason"))
-        return StationLifecycleControlEvidence(
-            succeeded=hold.succeeded,
-            status=(
-                "gripper_domain_hold_confirmed"
-                if hold.succeeded
-                else "gripper_domain_hold_failed"
-            ),
-            lower_operation_id=None,
-            evidence_refs=hold.evidence_refs,
-            lower_hold_confirmed=hold.succeeded,
-        )
-
-    executor = ReusableStationAgentSkillOperationExecutor(
-        port_id=f"agent-gateway:gripper:{binding.runtime_session_id}",
-        binding=StationOperationWorkerBinding(
-            worker_id=f"gripper-worker:{binding.runtime_session_id}",
-            executor_id=binding.executor_id,
-            runtime_session_id=binding.runtime_session_id,
-            skill_id=route.skill_id,
-            skill_version=route.skill_version,
-            route_id=route.route_id,
-            route_version=route.route_version,
-            deployment_binding_hash=binding.semantic_content_hash,
-        ),
-        lifecycle_factory=lifecycle_factory,
-        domain_hold=domain_hold,
+    executor = build_gripper_skill_executor(
+        contract_bundle=contract_bundle,
+        port=port,
+        convergence=convergence,
         current_station_revision=current_station_revision,
         clock=clock,
+        sleep=sleep,
     )
     registry = SkillExecutorRegistry(
         manifest=contract_bundle.route_manifest,
@@ -764,4 +802,5 @@ __all__ = [
     "GripperSkillLifecycle",
     "GripperStateSample",
     "assemble_gripper_agent_gateway_session",
+    "build_gripper_skill_executor",
 ]

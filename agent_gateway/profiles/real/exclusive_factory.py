@@ -36,10 +36,14 @@ from teleop_runtime.skill_deploy.rm65_ports import (
     ExclusiveRM65SkillDeployPorts,
 )
 
-from .localization_deployment import RealObjectLocalizationRegistration
 from .grasp_approach_plan import (
     DEFAULT_REAL_GRASP_EXECUTION_OPERATION_TIMEOUT_SEC,
 )
+from .gripper_skill import (
+    RealDmtacGripperControlPort,
+    build_real_dmtac_gripper_skill_contract_bundle,
+)
+from .localization_deployment import RealObjectLocalizationRegistration
 from .localization_gateway import ObjectLocalizationProvider
 from .motion_gateway_session import (
     RealAgentPrimitiveGatewaySession,
@@ -129,6 +133,7 @@ def _owner_state(port: RealAgentMotionPort) -> RealControlOwnerState:
 def assemble_exclusive_real_agent_primitive_deployment(
     *,
     target_builder: RealAgentMotionTargetBuilder,
+    gripper_port: RealDmtacGripperControlPort | None = None,
     port_config: RealAgentMotionPortConfig,
     observation_attachment: RealTcpPoseObserveAttachmentSpec,
     frame_graph: CoordinateFrameGraph,
@@ -177,7 +182,20 @@ def assemble_exclusive_real_agent_primitive_deployment(
 ) -> ExclusiveRealAgentPrimitiveDeployment:
     """Assemble an exclusive Skill owner without constructing RealTeleop."""
 
+    gripper_contract = (
+        None
+        if gripper_port is None
+        else build_real_dmtac_gripper_skill_contract_bundle(
+            runtime_session_id=observation_attachment.runtime_session_id,
+            control_domain_id=observation_attachment.control_domain_id,
+            target_binding_id=observation_attachment.target_binding_id,
+            station_manifest_hash=observation_attachment.station_manifest_hash,
+            execution_manifest_hash=observation_attachment.execution_manifest_hash,
+            port=gripper_port,
+        )
+    )
     bundle = build_real_agent_primitive_contract_bundle(
+        gripper_contract=gripper_contract,
         attachment=observation_attachment,
         port_config=port_config,
         frame_graph=frame_graph,
@@ -227,6 +245,7 @@ def assemble_exclusive_real_agent_primitive_deployment(
         clock=clock,
     )
     gateway = assemble_real_agent_primitive_gateway_session(
+        gripper_port=gripper_port,
         contract_bundle=bundle,
         port=port,
         owner_state_provider=lambda: _owner_state(port),
@@ -258,6 +277,7 @@ def assemble_exclusive_real_agent_primitive_deployment(
 def assemble_exclusive_rm65_agent_primitive_deployment(
     *,
     target_builder: RealAgentMotionTargetBuilder,
+    gripper_port: RealDmtacGripperControlPort | None = None,
     rm65_ports: ExclusiveRM65SkillDeployPorts,
     port_config: RealAgentMotionPortConfig,
     observation_attachment: RealTcpPoseObserveAttachmentSpec,
@@ -306,6 +326,7 @@ def assemble_exclusive_rm65_agent_primitive_deployment(
             "RM65 ports and Gateway deployment must share one target builder."
         )
     return assemble_exclusive_real_agent_primitive_deployment(
+        gripper_port=gripper_port,
         target_builder=target_builder,
         port_config=port_config,
         observation_attachment=observation_attachment,

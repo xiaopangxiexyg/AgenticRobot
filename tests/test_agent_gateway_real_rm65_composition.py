@@ -230,6 +230,58 @@ def _lower(monkeypatch, *, envelope_side: str = "right"):
     return lower, guard
 
 
+def test_composition_advertises_right_gripper_without_starting_any_backend(monkeypatch):
+    from agent_gateway.profiles.real.gripper_skill import ExclusiveRealGripperResources
+
+    lower, _ = _lower(monkeypatch)
+
+    class Hand:
+        config = SimpleNamespace(side="right", gripper_port="/dev/fake", gripper_id=1)
+
+        def __getattr__(self, name):
+            if name in {
+                "start",
+                "close",
+                "send_fixed_joint_pos",
+                "read_gripper_state_now",
+                "get_state",
+                "hold_gripper_motion",
+                "is_ready",
+                "readiness_report",
+            }:
+
+                def forbidden(*args, **kwargs):
+                    raise AssertionError("composition must not access hand hardware")
+
+                return forbidden
+            raise AttributeError(name)
+
+    hand = Hand()
+    composition = assemble_exclusive_rm65_agent_primitive_composition(
+        lower=lower,
+        right_gripper_backend=hand,
+        socket_path=REPO_ROOT / "temp/test-gripper-composition.sock",
+        authorized_side="right",
+        authorized_actions=("forward", "set_gripper_state"),
+        authorized_action=None,
+        confirmation_token=REAL_AGENT_PRIMITIVE_CONFIRM_TOKEN,
+        client_id="rpent:test",
+        client_uid=1000,
+        runtime_session_id="real-gripper:test",
+        control_domain_id="exclusive-real-skill:test",
+        embodiment_instance_id="dual-rm65:test",
+    )
+    assert isinstance(composition.resources, ExclusiveRealGripperResources)
+    assert composition.resources.lower is lower.ports
+    assert composition.resources.port.backend is hand
+    route = composition.deployment.gateway_session.contract_bundle.route_manifest.route(
+        "manipulation.set_gripper_state", "1"
+    ).route
+    assert route.requires_operator_confirmation
+    assert route.control_effect_class == "motion"
+    assert all(backend.starts == 0 for backend in lower.ports.arm_backends.values())
+
+
 @pytest.mark.parametrize("authorized_side", ("left", "right"))
 def test_composition_binds_selected_side_to_one_lower_graph_without_start(
     monkeypatch, authorized_side: str
