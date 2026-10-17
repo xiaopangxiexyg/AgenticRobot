@@ -1265,6 +1265,8 @@ def test_lift_hold_maps_owned_z_to_nonnegative_pose_action() -> None:
     assert config.scripted_contact_action_bias[2] == pytest.approx(0.5)
     assert config.scripted_contact_nonnegative_lift_action is False
     assert config.reward_shaping["bilateral_contact_reward_scale"] == 0.0
+    assert config.reward_shaping["closed_grasp_height_offset_m"] == 0.022
+    assert config.success_min_safety_clear_policy_steps == 0
 
 
 def test_lift_short_v2_requires_positive_policy_owned_z() -> None:
@@ -1739,7 +1741,7 @@ def test_normal_v2_disables_rgb_and_requires_physical_grasp_success() -> None:
     assert config.pose_target_anti_windup is True
     assert config.lift_delta_m == pytest.approx(0.07)
     assert config.reward_shaping["closed_grasp_height_offset_m"] == pytest.approx(
-        0.022
+        0.014
     )
     assert config.reward_shaping["gripper_reward_scale"] == 0.0
     assert config.reward_shaping["require_bilateral_contact_for_lift_reward"] is True
@@ -1892,6 +1894,7 @@ def test_contact_curriculum_v3_is_strict_lift_only_with_loss_aware_reward() -> N
     )
     assert v3.policy_active_action_indices == (2,)
     assert v3.lift_delta_m == pytest.approx(0.04)
+    assert v3.success_min_safety_clear_policy_steps == 20
     assert v3.scripted_contact_nonnegative_lift_action is True
     assert v3.reward_shaping["reach_reward_scale"] == 0.0
     assert v3.reward_shaping["reach_progress_scale"] == 0.0
@@ -2045,7 +2048,11 @@ def test_contact_curriculum_v3_applies_only_nonnegative_lift_action() -> None:
 
 
 @pytest.mark.optional
-def test_contact_curriculum_v3_projection_preserves_locked_gripper_target() -> None:
+def test_contact_curriculum_v3_projection_preserves_locked_gripper_target(
+    monkeypatch,
+) -> None:
+    from dataclasses import replace
+
     _require_mujoco_runtime()
     from sim.mujoco.tasks.cube_lift.fast_env import FastCubeLiftEnv
 
@@ -2058,6 +2065,28 @@ def test_contact_curriculum_v3_projection_preserves_locked_gripper_target() -> N
     try:
         _observation, reset_info = env.reset(seed=1)
         reset_target_close = reset_info["right_gripper_target_close"]
+        controller = env.kernel._pose_action_controller
+        original_apply = controller.apply
+        injected = False
+
+        def apply_with_table_crossing_reference(action):
+            nonlocal injected
+            step = original_apply(action)
+            if injected:
+                return step
+            injected = True
+            # Exercise the real final projector with an explicit unsafe qref.
+            # The old action sequence only triggered projection through native
+            # CCD artifacts; corrected geometry can admit all five lift steps.
+            qpos_by_side = dict(step.ik_result.qpos_by_side)
+            right = env.kernel.scene.get_arm_qpos("right").copy()
+            right[5] += 0.08
+            qpos_by_side["right"] = right.tolist()
+            return replace(
+                step, ik_result=replace(step.ik_result, qpos_by_side=qpos_by_side)
+            )
+
+        monkeypatch.setattr(controller, "apply", apply_with_table_crossing_reference)
         safety_modified = False
         for raw_lift_action in raw_lift_actions:
             action = np.zeros(7, dtype=np.float32)

@@ -63,7 +63,7 @@
     "reach_sigma_m": 0.25,
     "reach_progress_scale": 4.0,
     "grasp_height_offset_m": 0.03,
-    "closed_grasp_height_offset_m": 0.022,
+    "closed_grasp_height_offset_m": 0.014,
     "grasp_distance_m": 0.05,
     "grasp_gate_width_m": 0.01,
     "close_gate_distance_m": 0.1,

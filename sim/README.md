@@ -159,6 +159,22 @@ the identified free-motion DM-Tac response. This is an environment/API
 milestone, not evidence of actuator dynamics, physical grasp stability, or
 sim2real transfer.
 
+旧 30 mm 方块课程 `normal_v2`、`normal_contact_curriculum_v2/v3` 的闭合抓取
+高度使用方块中心上方 14 mm。旧平行夹爪的指垫长 34 mm；原 22 mm 偏置只留下
+约 10 mm 的初始竖直重叠，抬升中的缓慢滑移容易耗尽接触面。14 mm 偏置增加了
+接触重叠，并继续接受完整场景的碰撞投影和原有脚本接触准备。
+v3 显式要求连续 20 个无安全干预的策略步，再执行原有的双侧接触、4 cm 抬升和
+100 个物理 tick 保持判定；normal/v2 的 7 cm 抬升、夹爪力、摩擦和硬碰撞限值
+保留。派生的 `lift_hold_pose_z_v1` 及其短程课程显式保留原来的 22 mm 准备高度和
+原有稳定窗口，不继承本次 v3 的调整。这些配置调整属于仿真课程，旧训练产物
+应继续按各自任务元数据核对配置。
+
+原生 CCD 在薄片 CAD 上可能将宽范围距离查询的正间隙误报为负穿透。公共碰撞
+Oracle 使用世界 AABB 的保守分离下界校验这类矛盾结果；只有包围盒确实分离时
+才使用该下界，并在诊断中标明 `minimum_distance_is_lower_bound` 和
+`distance_query_disagreement_count`。包围盒重叠时仍保留有符号查询，预防间隙
+和物理接触穿透限制均不变；下界不是精确的表面距离。
+
 ## High-throughput Cube-Lift runtime
 
 The reference `CubeLiftEnv` intentionally preserves detailed info and complete
