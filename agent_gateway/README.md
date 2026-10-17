@@ -1438,4 +1438,5 @@ safe planner 的到位容差绑定当前 convergence profile，不改抓取规�
 规划时使用 lower 的 confirmed-HOLD 读取窗口；窗口退出后最多等待 0.5 秒、
 且不超过原 operation deadline，取得更新且仍新鲜的 measured qpos 后才可激活。
 未来时间、过期、不可用、起始关节漂移、取消及剩余执行时间不足仍按原门禁拒绝并 HOLD。
+所有已装配的预规划轨迹都必须执行到原时长结束；即使测量提前进入到位容差，也不能提前判定完成并 HOLD。
 本批只接入固定场景规划；RGB-D 障碍场景与会话几何准备另按依赖接入。

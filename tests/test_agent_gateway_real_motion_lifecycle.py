@@ -766,15 +766,24 @@ def test_grasp_approach_cancelled_after_planning_never_activates_motion() -> Non
     assert len(owner.holds) == 1
 
 
-def test_grasp_approach_cannot_complete_before_planned_trajectory_elapsed() -> None:
-    bundle, port, _builder = _runtime_fixture(include_grasp_approach=True)
+@pytest.mark.parametrize("skill_id, planner_key", [
+    ("motion.approach_grasp_pose", "grasp_trajectory_planner"),
+    ("motion.move_tcp_to_pose_safe", "grasp_trajectory_planner"),
+    ("motion.move_tcp_to_pose", "tcp_trajectory_planner"),
+])
+def test_grasp_approach_cannot_complete_before_planned_trajectory_elapsed(
+    skill_id, planner_key,
+) -> None:
+    bundle, port, _builder = _runtime_fixture(
+        include_grasp_approach=True, include_safe_pose=True,
+    )
     clock = _Clock()
     owner = _OwnerSession()
     request, operation, route, binding = _pose_request_and_operation(
         bundle,
         clock=clock,
         speed_scale=0.2,
-        skill_id="motion.approach_grasp_pose",
+        skill_id=skill_id,
     )
     qpos_by_side = {
         "left": np.zeros(6, dtype=float),
@@ -793,6 +802,8 @@ def test_grasp_approach_cannot_complete_before_planned_trajectory_elapsed() -> N
 
     def lower_owner_sleep(duration: float) -> None:
         clock.value += duration
+        _publish_qpos(port, qpos_by_side=qpos_by_side,
+            measured_at=clock(), available_at=clock())
         snapshot = port.apply_owner_requests(session=owner, now=clock())
         if snapshot.phase != RealAgentMotionPhase.ACTIVE:
             return
@@ -820,7 +831,7 @@ def test_grasp_approach_cannot_complete_before_planned_trajectory_elapsed() -> N
         profile=bundle.pose_target_profile,
         request=request,
         operation=operation,
-        grasp_trajectory_planner=lambda **_kwargs: trajectory,
+        **{planner_key: lambda **_kwargs: trajectory},
         clock=clock,
         sleep=lower_owner_sleep,
     )

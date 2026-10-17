@@ -1064,7 +1064,7 @@ class RealAgentPrimitiveSkillLifecycle:
                 )
                 translation, rotation = _pose_error(measured_pose, self.target_pose)
                 planned_trajectory_elapsed = True
-                if self.route.skill_id in {
+                if self._planned_joint_trajectory is not None or self.route.skill_id in {
                     GRASP_APPROACH_SKILL_ID_V1,
                     SAFE_TCP_POSE_TARGET_SKILL_ID_V1,
                     EXECUTE_GRASP_APPROACH_PLAN_SKILL_ID_V1,
