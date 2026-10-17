@@ -5314,3 +5314,33 @@ def test_boundary_hold_removes_legacy_escape_from_auxiliary_candidate_pool(
     assert len(calls) == 2
     assert calls[0]["include_limit_escape"] is False
     assert calls[1]["include_limit_escape"] is False
+
+
+def test_combined_frame_query_recomputes_exact_native_pose_and_jacobian() -> None:
+    import pinocchio as pin
+
+    model = pin.buildSampleModelManipulator()
+    solver = object.__new__(MultiTaskIKSolver)
+    solver.robot = SimpleNamespace(model=model, data=model.createData())
+    solver.configuration = SimpleNamespace(q=pin.neutral(model))
+    solver.pin = pin
+    original = solver.current_q.copy()
+    rng = np.random.default_rng(742)
+    retained = []
+    for index in range(8):
+        q = None if index == 0 else rng.uniform(-1.5, 1.5, model.nq)
+        frame = "effector_body" if index % 2 == 0 else "wrist2_body"
+        expected_pose = solver.compute_frame_pose(frame, q)
+        expected_jacobian = solver.compute_frame_jacobian(frame, q)
+        # Overwrite native scratch state with another q and frame first.
+        solver.compute_frame_pose("elbow_body", rng.uniform(-1.5, 1.5, model.nq))
+        pose, jacobian = solver.compute_frame_pose_and_jacobian(frame, q)
+        np.testing.assert_array_equal(pose, expected_pose)
+        np.testing.assert_allclose(jacobian, expected_jacobian, atol=1e-14, rtol=1e-14)
+        np.testing.assert_array_equal(solver.current_q, original)
+        retained.append((pose, pose.copy(), jacobian, jacobian.copy()))
+    for pose, expected_pose, jacobian, expected_jacobian in retained:
+        np.testing.assert_array_equal(pose, expected_pose)
+        np.testing.assert_array_equal(jacobian, expected_jacobian)
+    with pytest.raises(ValueError, match="was not found"):
+        solver.compute_frame_pose_and_jacobian("absent_frame")

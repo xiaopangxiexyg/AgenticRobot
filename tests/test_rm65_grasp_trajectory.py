@@ -1,3 +1,4 @@
+import math
 import threading
 from collections import OrderedDict
 from pathlib import Path
@@ -5,6 +6,7 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
+from scipy.spatial.transform import Rotation
 
 from dataset_contracts.pose_frames import load_pose_frame_contract
 from robot_motion.joint_limits import load_joint_velocity_limit_profiles
@@ -1686,42 +1688,56 @@ def test_joint_proposal_dedup_matches_original_absolute_tolerance(atol):
 
 
 @pytest.mark.parametrize("side", ("left", "right"))
-@pytest.mark.parametrize("count", (1, 8, 24, 64))
-def test_endpoint_seed_dedup_preserves_sequence_and_detached_guesses(monkeypatch, side, count):
-    planner = _planner_without_assets(config=RM65GraspTrajectoryPlanningConfig())
+@pytest.mark.parametrize("count", (1, 2, 8, 24, 64))
+@pytest.mark.parametrize("case,perturbation", (
+    ("measured", .4), ("limits", .4), ("default", 1e-30), ("default", 5e-10),
+))
+def test_endpoint_seed_dedup_preserves_sequence_and_detached_guesses(
+    side, count, case, perturbation,
+):
+    planner = _planner_without_assets(config=RM65GraspTrajectoryPlanningConfig(
+        endpoint_seed_perturbation_rad=perturbation,
+    ))
     lower = np.asarray(grasp_trajectory_module.RM65_ABSOLUTE_Q_MIN_RAD)
     upper = np.asarray(grasp_trajectory_module.RM65_ABSOLUTE_Q_MAX_RAD)
-    original_match = grasp_trajectory_module._joint_proposals_match
-    default_pair = {
-        name: np.asarray(getattr(grasp_trajectory_module, f"DEFAULT_{name.upper()}_ARM_QPOS"))
-        for name in ("left", "right")
+    defaults = {
+        "left": np.asarray(grasp_trajectory_module.DEFAULT_LEFT_ARM_QPOS),
+        "right": np.asarray(grasp_trajectory_module.DEFAULT_RIGHT_ARM_QPOS),
     }
-    for pair in (
-        FIELD_TRACE_QPOS,
-        default_pair,
-        {"left": lower.copy(), "right": upper.copy()},
-    ):
-        before = {name: value.copy() for name, value in pair.items()}
-        # The canonical NumPy predicate reconstructs the old sequence using
-        # the unchanged local/default/Halton seed-generation algorithm.
-        with monkeypatch.context() as context:
-            context.setattr(
-                grasp_trajectory_module,
-                "_joint_proposals_match",
-                lambda a, b, *, atol: bool(np.allclose(a, b, atol=atol, rtol=0.0)),
-            )
-            expected = planner._endpoint_seed_qpos(pair, side=side, seed_count=count)
-        actual = planner._endpoint_seed_qpos(pair, side=side, seed_count=count)
-        assert grasp_trajectory_module._joint_proposals_match is original_match
-        assert len(actual) == len(expected) == count
-        for first, second in zip(actual, expected, strict=True):
-            for name in ("left", "right"):
-                np.testing.assert_array_equal(first[name], second[name])
-                assert not np.shares_memory(first[name], pair[name])
-        actual[0][side][0] = 0.0
-        for name, value in pair.items():
-            np.testing.assert_array_equal(value, before[name])
-        assert np.all(actual[-1][side] >= lower) and np.all(actual[-1][side] <= upper)
+    pair = {name: values.copy() for name, values in FIELD_TRACE_QPOS.items()}
+    if case == "limits":
+        pair[side] = np.where(np.arange(6) % 2, lower, upper)
+    elif case == "default":
+        pair[side] = defaults[side].copy()
+    original = {name: values.copy() for name, values in pair.items()}
+    # The established componentwise allclose rule is the independent oracle.
+    patterns = np.array(((0, 0, 0, 0, 0, 0), (0, 1, -1, 0, 0, 0),
+        (0, -1, 1, 0, 0, 0), (1, 0, 0, 0, -1, 0), (-1, 0, 0, 0, 1, 0),
+        (0, 0, 1, -1, 0, 1), (0, 0, -1, 1, 0, -1)))
+    proposals = [np.clip(pair[side]+pattern*perturbation, lower, upper) for pattern in patterns]
+    proposals.insert(1, np.clip(defaults[side], lower, upper))
+    proposals.extend(lower + (upper-lower)*np.array([
+        planner._radical_inverse(index, prime) for prime in (2, 3, 5, 7, 11, 13)
+    ]) for index in range(1, count*2+1))
+    expected = []
+    for values in proposals:
+        if not any(np.allclose(values, prior, atol=1e-9, rtol=0.) for prior in expected):
+            expected.append(values)
+            if len(expected) == count:
+                break
+    actual = planner._endpoint_seed_qpos(pair, side=side, seed_count=count)
+    assert len(actual) == len(expected) == count
+    inactive = "right" if side == "left" else "left"
+    for seed, values in zip(actual, expected, strict=True):
+        np.testing.assert_array_equal(seed[side], values)
+        np.testing.assert_array_equal(seed[inactive], original[inactive])
+        for name in pair:
+            assert not np.shares_memory(seed[name], pair[name])
+    for name in pair:
+        np.testing.assert_array_equal(pair[name], original[name])
+    if len(actual) > 1:
+        for name in pair:
+            assert not np.shares_memory(actual[0][name], actual[1][name])
 
 
 @pytest.mark.parametrize("phase", ["envelope_ingress", "pregrasp_target", "grasp_target"])
@@ -4205,3 +4221,229 @@ def test_safe_pose_config_uses_public_arrival_contract_without_changing_grasp():
     assert safe.minimum_clearance_m == original.minimum_clearance_m == .02
     with pytest.raises(ValueError):
         original.for_tcp_pose_move(translation_tolerance_m=0, rotation_tolerance_rad=.1)
+
+
+@pytest.fixture(scope="module", params=("DMTAC_M", "inspire"))
+def derivative_builder(request):
+    profile = resolve_exclusive_rm65_skill_deployment_profile(
+        ExclusiveRM65SkillDeploymentProfile(
+            arm_ip_assignment_path=(
+                REPO_ROOT / "teleop_runtime/configs/hardware/rm65_arm_ips/latest.json"
+            ),
+            tool_profile_path_by_side={
+                side: REPO_ROOT / (
+                    f"hardware/rm65/utils/configs/calibrations/rm65_{side}_{request.param}.json"
+                )
+                for side in ("left", "right")
+            },
+            envelope_profile_path=(
+                REPO_ROOT
+                / "teleop_runtime/configs/skill_deploy/agent_grasp_right_absolute_standard_v1.json"
+            ),
+            collision_scene_profile=(
+                "dual_arm_hand_proxy_dmtac_strict"
+                if request.param == "DMTAC_M"
+                else "dual_arm_hand_proxy_open"
+            ),
+        )
+    )
+    return build_exclusive_rm65_skill_target_builder(profile)
+
+
+@pytest.mark.parametrize("side", ("left", "right"))
+def test_tcp_analytic_jacobian_matches_finite_differences(derivative_builder, side):
+    builder = derivative_builder
+    current_q = builder.ik_solver.current_q.copy()
+    for wrist_pitch in (None, -1e-5, 1e-5):
+        pair = {name: values.copy() for name, values in FIELD_TRACE_QPOS.items()}
+        if wrist_pitch is not None:
+            pair[side][4] = wrist_pitch
+        pose, jacobian = builder.tool_tcp_world_pose_and_jacobian_for_qpos_pair(
+            side=side, left_qpos=pair["left"], right_qpos=pair["right"]
+        )
+        expected_pose = builder.tool_tcp_world_targets_for_qpos_pair(
+            left_qpos=pair["left"], right_qpos=pair["right"]
+        )[side]
+        np.testing.assert_allclose(pose, expected_pose, atol=1e-12)
+        numeric = np.empty((6, 6))
+        step = 1e-6
+        for joint in range(6):
+            poses = []
+            for sign in (1, -1):
+                perturbed = {name: values.copy() for name, values in pair.items()}
+                perturbed[side][joint] += sign * step
+                poses.append(builder.tool_tcp_world_targets_for_qpos_pair(
+                    left_qpos=perturbed["left"], right_qpos=perturbed["right"]
+                )[side])
+            numeric[:3, joint] = (poses[0][:3, 3] - poses[1][:3, 3]) / (2 * step)
+            numeric[3:, joint] = Rotation.from_matrix(
+                poses[0][:3, :3] @ poses[1][:3, :3].T
+            ).as_rotvec() / (2 * step)
+        np.testing.assert_allclose(jacobian, numeric, atol=1e-8, rtol=1e-6)
+        np.testing.assert_array_equal(builder.ik_solver.current_q, current_q)
+        for name in pair:
+            expected = FIELD_TRACE_QPOS[name].copy()
+            if name == side and wrist_pitch is not None:
+                expected[4] = wrist_pitch
+            np.testing.assert_array_equal(pair[name], expected)
+
+
+@pytest.mark.parametrize("side", ("left", "right"))
+def test_prepared_tcp_query_matches_owner_and_freezes_other_joints(derivative_builder, side, monkeypatch):
+    builder = derivative_builder
+    pair = {name: values.copy() for name, values in FIELD_TRACE_QPOS.items()}
+    original = {name: values.copy() for name, values in pair.items()}
+    solver_q = builder.ik_solver.current_q.copy()
+    native_query = builder.ik_solver.compute_frame_pose_and_jacobian
+    queried = []
+
+    def native(frame, q):
+        queried.append(q.copy())
+        return native_query(frame, q)
+
+    monkeypatch.setattr(builder.ik_solver, "compute_frame_pose_and_jacobian", native)
+    query = builder.prepare_tool_tcp_pose_and_jacobian_query(side=side, qpos_by_side=pair)
+    for values in pair.values():
+        values[:] += .2
+    for wrist in (-1e-5, 0., 1e-5, -.6):
+        active = original[side].copy()
+        active[4] = wrist
+        complete = {**original, side: active}
+        expected = builder.tool_tcp_world_pose_and_jacobian_for_qpos_pair(
+            side=side, left_qpos=complete["left"], right_qpos=complete["right"])
+        actual = query(active)
+        np.testing.assert_array_equal(queried[-1], queried[-2])
+        np.testing.assert_array_equal(actual[0], expected[0])
+        np.testing.assert_array_equal(actual[1], expected[1])
+        active[:] = 0.
+        np.testing.assert_array_equal(actual[0], expected[0])
+        np.testing.assert_array_equal(actual[1], expected[1])
+    for bad in (np.zeros(5), np.full(6, np.nan), np.full(6, np.inf)):
+        with pytest.raises(ValueError, match="six finite"):
+            query(bad)
+    with pytest.raises(ValueError, match="exactly left and right"):
+        builder.prepare_tool_tcp_pose_and_jacobian_query(side=side, qpos_by_side={side: original[side]})
+    np.testing.assert_array_equal(builder.ik_solver.current_q, solver_q)
+    another = builder.prepare_tool_tcp_pose_and_jacobian_query(side=side, qpos_by_side=pair)
+    another(original[side])
+    query(original[side])
+    inactive = "right" if side == "left" else "left"
+    indices = builder._arm_joint_indices(solver_q.size)[inactive]
+    np.testing.assert_allclose(queried[-2][indices] - queried[-1][indices], .2, atol=1e-15)
+
+
+@pytest.mark.parametrize("side", ("left", "right"))
+@pytest.mark.parametrize("angle", (0.0, 0.4, 2.7, np.pi - 1e-4))
+def test_endpoint_residual_jacobian_and_solve_local_cache(
+    derivative_builder, monkeypatch, side, angle
+):
+    builder = derivative_builder
+    planner = _planner_without_assets(config=RM65GraspTrajectoryPlanningConfig())
+    planner.target_builder = builder
+    target = builder.tool_tcp_world_targets_for_qpos_pair(
+        left_qpos=FIELD_TRACE_QPOS["left"], right_qpos=FIELD_TRACE_QPOS["right"]
+    )[side]
+    target[:3, :3] = Rotation.from_rotvec(
+        np.array((1.0, 2.0, -3.0)) / np.sqrt(14) * angle
+    ).as_matrix() @ target[:3, :3]
+    target[:3, 3] += (0.01, -0.02, 0.03)
+    prepare_query = builder.prepare_tool_tcp_pose_and_jacobian_query
+    queries = []
+
+    def prepare(**kwargs):
+        actual_query = prepare_query(**kwargs)
+
+        def query(values):
+            queries.append(values.copy())
+            return actual_query(values)
+
+        return query
+
+    monkeypatch.setattr(builder, "prepare_tool_tcp_pose_and_jacobian_query", prepare)
+
+    def check_derivative(residual, values, *, jac, **_kwargs):
+        assert callable(jac)
+        query_count = len(queries)
+        base = residual(values)
+        analytic = jac(values)
+        np.testing.assert_array_equal(residual(values.copy()), base)
+        assert len(queries) == query_count + 1
+        numeric = np.empty((6, 6))
+        for joint in range(6):
+            delta = np.zeros(6)
+            delta[joint] = 1e-7
+            numeric[:, joint] = (
+                residual(values + delta) - residual(values - delta)
+            ) / (2e-7)
+        np.testing.assert_allclose(analytic, numeric, atol=1e-5, rtol=1e-5)
+        return SimpleNamespace(x=values.copy(), nfev=1)
+
+    monkeypatch.setattr(grasp_trajectory_module, "least_squares", check_derivative)
+    for _ in range(2):
+        # The second solve must query again, even with identical values.
+        planner._least_squares_endpoint_from_seed(
+            qpos_by_side=FIELD_TRACE_QPOS, side=side,
+            target_tool_tcp_world=target, seed_qpos=FIELD_TRACE_QPOS[side],
+            # This test isolates the exact-pose Jacobian. The feasibility
+            # phase and its Jacobian have separate regression coverage below.
+            maximum_evaluations=1, prefer_closest_tolerance=False,
+        )
+    assert len(queries) == 26
+
+
+@pytest.mark.parametrize("side", ("left", "right"))
+def test_endpoint_jacobian_is_lazy_and_invalidated_by_trial_iterates(
+    derivative_builder, monkeypatch, side
+):
+    builder = derivative_builder
+    planner = _planner_without_assets(config=RM65GraspTrajectoryPlanningConfig())
+    planner.target_builder = builder
+    pair = {name: values.copy() for name, values in FIELD_TRACE_QPOS.items()}
+    target = builder.tool_tcp_world_targets_for_qpos_pair(
+        left_qpos=pair["left"], right_qpos=pair["right"]
+    )[side]
+    target[:3, :3] = Rotation.from_rotvec((.4, -.2, .1)).as_matrix() @ target[:3, :3]
+    original_tan = math.tan
+    derivative_angles = []
+
+    def tan(angle):
+        derivative_angles.append(angle)
+        return original_tan(angle)
+
+    monkeypatch.setattr(grasp_trajectory_module.math, "tan", tan)
+
+    def solve(fun, x, *, jac, **_kwargs):
+        first_residual = fun(x)
+        assert derivative_angles == []
+        first_jacobian = jac(x).copy()
+        assert len(derivative_angles) == 1
+        np.testing.assert_array_equal(jac(x.copy()), first_jacobian)
+        assert len(derivative_angles) == 1
+        trial = x + np.array((.001, -.002, .003, -.001, .002, -.003))
+        # Rejected trials need only residuals. Retaining their native query
+        # must neither form a log derivative nor overwrite previous outputs.
+        for step in (trial, x, trial):
+            fun(step)
+        assert len(derivative_angles) == 1
+        trial_jacobian = jac(trial).copy()
+        assert len(derivative_angles) == 2
+        assert not np.array_equal(trial_jacobian, first_jacobian)
+        np.testing.assert_array_equal(jac(x), first_jacobian)
+        np.testing.assert_array_equal(fun(x), first_residual)
+        assert len(derivative_angles) == 3
+        trial[:] = x
+        fun(trial)
+        trial[0] += .001
+        fun(trial)
+        assert not np.array_equal(jac(trial), first_jacobian)
+        assert len(derivative_angles) == 4
+        return SimpleNamespace(x=x.copy(), nfev=4)
+
+    monkeypatch.setattr(grasp_trajectory_module, "least_squares", solve)
+    planner._least_squares_endpoint_from_seed(
+        qpos_by_side=pair, side=side, target_tool_tcp_world=target,
+        seed_qpos=pair[side], maximum_evaluations=4,
+        prefer_closest_tolerance=False,
+    )
+    for name in pair:
+        np.testing.assert_array_equal(pair[name], FIELD_TRACE_QPOS[name])

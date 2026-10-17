@@ -1621,6 +1621,34 @@ class MultiTaskIKSolver:
         )
         return np.asarray(jacobian, dtype=float).copy()
 
+    def compute_frame_pose_and_jacobian(
+        self,
+        frame_name: str,
+        q: np.ndarray | None = None,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Query pose and world-aligned Jacobian from one kinematic pass.
+
+        Pinocchio's joint-Jacobian pass also updates joint placements. Reuse
+        those placements, not an earlier configuration or admitted reference.
+        Outputs are detached from scratch data; no pose cache survives a query.
+        """
+
+        q_eval = self.current_q if q is None else np.asarray(q, dtype=float).reshape(-1)
+        model, data = self.robot.model, self.robot.data
+        frame_id = model.getFrameId(str(frame_name))
+        if frame_id >= len(model.frames):
+            raise ValueError(f"Frame '{frame_name}' was not found in the multitask IK model.")
+        self.pin.computeJointJacobians(model, data, q_eval)
+        self.pin.updateFramePlacements(model, data)
+        transform = data.oMf[frame_id]
+        pose = np.eye(4, dtype=float)
+        pose[:3, :3] = np.asarray(transform.rotation, dtype=float)
+        pose[:3, 3] = np.asarray(transform.translation, dtype=float)
+        jacobian = self.pin.getFrameJacobian(
+            model, data, frame_id, self.pin.ReferenceFrame.LOCAL_WORLD_ALIGNED,
+        )
+        return pose, np.asarray(jacobian, dtype=float).copy()
+
     def compute_frame_task_conditioning(
         self,
         targets: list[np.ndarray],

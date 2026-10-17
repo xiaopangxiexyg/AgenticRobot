@@ -2210,6 +2210,20 @@ class RM65GraspJointTrajectoryPlanner:
         if not 1 <= maximum <= 64:
             raise ValueError("seed_count must be in [1, 64].")
         seeds: list[dict[str, np.ndarray]] = []
+        seed_values = np.empty((maximum, 6), dtype=float)
+
+        def append_seed(values: np.ndarray) -> None:
+            # Retain the same componentwise 1e-9 absolute tolerance, ordering
+            # and coverage. This request-local matrix is at most 64x6 doubles.
+            if seeds and np.any(np.all(
+                np.abs(seed_values[:len(seeds)] - values) <= 1e-9, axis=1,
+            )):
+                return
+            candidate = {name: value.copy() for name, value in baseline.items()}
+            candidate[side] = np.asarray(values, dtype=float).copy()
+            seed_values[len(seeds)] = candidate[side]
+            seeds.append(candidate)
+
         local_values = [
             np.clip(
                 baseline[side] + pattern * self.config.endpoint_seed_perturbation_rad,
@@ -2224,14 +2238,7 @@ class RM65GraspJointTrajectoryPlanner:
         }
         local_values.insert(1, np.clip(default_by_side[side], lower, upper))
         for values in local_values:
-            candidate = {name: value.copy() for name, value in baseline.items()}
-            candidate[side] = np.asarray(values, dtype=float).copy()
-            if any(
-                _joint_proposals_match(candidate[side], existing[side], atol=1e-9)
-                for existing in seeds
-            ):
-                continue
-            seeds.append(candidate)
+            append_seed(values)
             if len(seeds) == maximum:
                 return tuple(seeds)
 
@@ -2243,14 +2250,7 @@ class RM65GraspJointTrajectoryPlanner:
                 ],
                 dtype=float,
             )
-            candidate = {name: value.copy() for name, value in baseline.items()}
-            candidate[side] = lower + unit * (upper - lower)
-            if any(
-                _joint_proposals_match(candidate[side], existing[side], atol=1e-9)
-                for existing in seeds
-            ):
-                continue
-            seeds.append(candidate)
+            append_seed(lower + unit * (upper - lower))
             if len(seeds) == maximum:
                 break
         return tuple(seeds)
@@ -2284,6 +2284,28 @@ class RM65GraspJointTrajectoryPlanner:
             self.config.endpoint_orientation_residual_scale_deg
         )
 
+        rotation_identity = np.eye(3)
+        pose_and_jacobian = getattr(
+            self.target_builder,
+            "tool_tcp_world_pose_and_jacobian_for_qpos_pair",
+            None,
+        )
+        prepare_query = getattr(
+            self.target_builder, "prepare_tool_tcp_pose_and_jacobian_query", None,
+        )
+        prepared_query = (
+            prepare_query(side=side, qpos_by_side=qpos_by_side)
+            if callable(pose_and_jacobian) and callable(prepare_query) else None
+        )
+        # Residual and Jacobian queries at the same SciPy iterate share FK.
+        # Keep this cache inside one solve: no candidate, arm or scene state
+        # may be reused by a later local-chain request.
+        cached_values: np.ndarray | None = None
+        cached_residual: np.ndarray | None = None
+        cached_jacobian: np.ndarray | None = None
+        cached_tcp_jacobian: np.ndarray | None = None
+        cached_rotation_error: np.ndarray | None = None
+
         def qpos_pair(values: np.ndarray) -> dict[str, np.ndarray]:
             pair = {
                 name: np.asarray(qpos_by_side[name], dtype=float).copy()
@@ -2293,24 +2315,79 @@ class RM65GraspJointTrajectoryPlanner:
             return pair
 
         def residual(values: np.ndarray) -> np.ndarray:
-            pair = qpos_pair(values)
-            tcp = self.target_builder.tool_tcp_world_targets_for_qpos_pair(
-                left_qpos=pair["left"],
-                right_qpos=pair["right"],
-            )[side]
+            nonlocal cached_values, cached_residual, cached_jacobian
+            nonlocal cached_tcp_jacobian, cached_rotation_error
+            # SciPy supplies fixed-shape six-joint iterates. Compare exactly,
+            # not by identity or tolerance, including after an in-place update.
+            if cached_values is not None and not (values != cached_values).any():
+                assert cached_residual is not None
+                return cached_residual
+            if prepared_query is not None:
+                tcp, tcp_jacobian = prepared_query(values)
+            elif callable(pose_and_jacobian):
+                pair = qpos_pair(values)
+                tcp, tcp_jacobian = pose_and_jacobian(
+                    side=side,
+                    left_qpos=pair["left"],
+                    right_qpos=pair["right"],
+                )
+            else:
+                pair = qpos_pair(values)
+                tcp = self.target_builder.tool_tcp_world_targets_for_qpos_pair(
+                    left_qpos=pair["left"],
+                    right_qpos=pair["right"],
+                )[side]
             rotation_error = Rotation.from_matrix(
                 target_pose[:3, :3] @ tcp[:3, :3].T
             ).as_rotvec()
-            return np.concatenate(
-                (
-                    (target_pose[:3, 3] - tcp[:3, 3]) / position_scale,
-                    rotation_error / orientation_scale,
+            value = np.empty(6)
+            value[:3] = (target_pose[:3, 3] - tcp[:3, 3]) / position_scale
+            value[3:] = rotation_error / orientation_scale
+            if callable(pose_and_jacobian):
+                cached_values = np.asarray(values, dtype=float).copy()
+                cached_residual = value
+                cached_tcp_jacobian = tcp_jacobian
+                cached_rotation_error = rotation_error
+                cached_jacobian = None
+            return value
+
+        def jacobian(values: np.ndarray) -> np.ndarray:
+            nonlocal cached_jacobian
+            residual(values)
+            if cached_jacobian is None:
+                assert cached_tcp_jacobian is not None
+                assert cached_rotation_error is not None
+                # SciPy rejects some trial residuals without asking for their
+                # Jacobian. Keep the native query shared, but form the SO(3)
+                # derivative only when this exact iterate actually needs it.
+                x, y, z = cached_rotation_error
+                skew = np.array(((0.0, -z, y), (z, 0.0, -x), (-y, x, 0.0)))
+                angle = float(np.linalg.norm(cached_rotation_error))
+                # E = R_target R_tcp^T changes by right multiplication with
+                # exp(-omega).  Its log derivative uses the inverse right
+                # SO(3) Jacobian, not just the angular-velocity Jacobian.
+                coefficient = (
+                    1.0 / 12.0 + angle * angle / 720.0
+                    if angle < 1e-4
+                    else (
+                        (1.0 - 0.5 * angle / math.tan(0.5 * angle))
+                        / (angle * angle)
+                    )
                 )
-            )
+                right_log_jacobian = (
+                    rotation_identity + 0.5 * skew + coefficient * (skew @ skew)
+                )
+                cached_jacobian = np.empty((6, 6))
+                cached_jacobian[:3] = -cached_tcp_jacobian[:3] / position_scale
+                cached_jacobian[3:] = (
+                    -(right_log_jacobian @ cached_tcp_jacobian[3:]) / orientation_scale
+                )
+            return cached_jacobian
 
         solved = least_squares(
             residual,
             np.asarray(seed_qpos, dtype=float),
+            jac=jacobian if callable(pose_and_jacobian) else "2-point",
             bounds=(lower, upper),
             max_nfev=int(maximum_evaluations),
             xtol=1e-9,

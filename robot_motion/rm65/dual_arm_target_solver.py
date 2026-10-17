@@ -1827,6 +1827,84 @@ class DualArmCollisionAwareRetargeter(Retargeter):
             for side in ("left", "right")
         }
 
+    def tool_tcp_world_pose_and_jacobian_for_qpos_pair(
+        self,
+        *,
+        side: str,
+        left_qpos: Sequence[float] | np.ndarray,
+        right_qpos: Sequence[float] | np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Return one TCP pose and its world-aligned, active-arm Jacobian.
+
+        The solver Jacobian belongs to the configured flange/link origin.
+        Shift its linear part to the actual tool TCP; a tactile tool offset
+        must not be treated as a zero-length flange.  Neither this query nor
+        the existing FK query admits a new solver configuration.
+        """
+
+        normalized_side = self._validated_side(side)
+        full_q = self.solver_q_from_qpos_by_side(
+            {"left": left_qpos, "right": right_qpos}
+        )
+        indices = self._arm_joint_indices(full_q.size)[normalized_side]
+        return self._tool_tcp_pose_and_jacobian_for_solver_q(normalized_side, full_q, indices)
+
+    def prepare_tool_tcp_pose_and_jacobian_query(
+        self,
+        *,
+        side: str,
+        qpos_by_side: Mapping[str, Sequence[float] | np.ndarray],
+    ) -> Callable[[np.ndarray], tuple[np.ndarray, np.ndarray]]:
+        """Freeze the inactive joints for one locked, read-only IK solve.
+
+        Validate the complete pair and resolve its layout once, not at every
+        least-squares iterate. Each query still checks the changing arm and
+        uses the canonical tool transform and native kinematics. The detached
+        template is solve-local; this is neither an admitted reference nor a
+        cache of poses, collision results or other requests.
+        """
+
+        normalized_side = self._validated_side(side)
+        template = self.solver_q_from_qpos_by_side(qpos_by_side)
+        indices = self._arm_joint_indices(template.size)[normalized_side].copy()
+
+        def query(values: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+            active = np.asarray(values, dtype=float).reshape(-1)
+            if active.shape != (6,) or not np.all(np.isfinite(active)):
+                raise ValueError("active qpos must contain six finite values.")
+            full_q = template.copy()
+            full_q[indices] = active
+            return self._tool_tcp_pose_and_jacobian_for_solver_q(normalized_side, full_q, indices)
+
+        return query
+
+    def _tool_tcp_pose_and_jacobian_for_solver_q(
+        self, normalized_side: str, full_q: np.ndarray, indices: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        frame_name = (
+            self.profile.left_frame_name
+            if normalized_side == "left"
+            else self.profile.right_frame_name
+        )
+        solver_pose, full_jacobian = self.ik_solver.compute_frame_pose_and_jacobian(
+            frame_name, full_q,
+        )
+        solver_pose = as_pose_matrix(solver_pose)
+        tcp_pose = self.tool_tcp_world_target_from_solver_world_target(
+            side=normalized_side,
+            solver_world_target=solver_pose,
+        )
+        if full_jacobian.shape != (6, full_q.size):
+            raise ValueError("RM65 TCP derivatives require a fixed-base nq == nv model.")
+        jacobian = full_jacobian[:, indices].copy()
+        offset = tcp_pose[:3, 3] - solver_pose[:3, 3]
+        # Fixed 3x6 cross product, avoiding generic axis normalization at each
+        # least-squares iterate. Angular rows are unchanged until all shifts.
+        jacobian[0] += jacobian[4] * offset[2] - jacobian[5] * offset[1]
+        jacobian[1] += jacobian[5] * offset[0] - jacobian[3] * offset[2]
+        jacobian[2] += jacobian[3] * offset[1] - jacobian[4] * offset[0]
+        return tcp_pose, jacobian
+
     def _solver_world_targets_for_full_q(
         self,
         full_q: Sequence[float] | np.ndarray,
