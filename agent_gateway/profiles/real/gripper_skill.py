@@ -140,6 +140,8 @@ class RealDmtacGripperControlPort:
             if cancel_requested is not None and cancel_requested():
                 diagnostic = {"gripper_last_send_status": "preempted_before_dispatch"}
                 break
+            # A busy retry can outlive the arm's original fresh HOLD cut.
+            self._require_arm_hold()
             attempts += 1
             accepted = bool(self.backend.send_fixed_joint_pos(target))
             if accepted:

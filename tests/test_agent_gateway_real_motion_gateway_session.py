@@ -777,6 +777,54 @@ def test_composed_gripper_rejects_fresh_owner_with_stale_arm_measurement(_compos
     assert gateway.close().accepted
 
 
+@pytest.mark.parametrize("expiring_cut", ("arm_measurement", "arm_owner", "fresh"))
+def test_composed_gripper_rechecks_arm_hold_before_io_busy_retry(
+    _composed_gripper_fixture, expiring_cut
+):
+    gateway, backend, _, _, clock = _composed_gripper_fixture()
+    maximum_age = gateway.contract_bundle.attachment.max_measurement_age_ms / 1000.0
+    # Leave 2 ms of validity; the existing io_busy backoff lasts 5 ms.
+    if expiring_cut != "fresh":
+        clock.value += maximum_age - 0.002
+    if expiring_cut == "arm_measurement":
+        gateway.port.publish_owner_state(
+            session=_PersistentOwnerSession(), captured_at=clock()
+        )
+    elif expiring_cut == "arm_owner":
+        gateway.port.publish_measured_pose(
+            pose_world_by_component={COMPONENT_ID: np.eye(4)},
+            measured_at=clock(),
+            available_at=clock(),
+            source_evidence_refs=("fixture:fresh-qpos-before-busy",),
+        )
+    attempts = []
+    send = backend.send_fixed_joint_pos
+    get_state = backend.get_state
+
+    def busy_once(target):
+        attempts.append(clock())
+        if len(attempts) == 1:
+            return False
+        return send(target)
+
+    backend.send_fixed_joint_pos = busy_once
+    backend.get_state = lambda **kwargs: {
+        **get_state(**kwargs), "gripper_last_send_status": "io_busy"
+    }
+    try:
+        if expiring_cut == "fresh":
+            assert gateway.gripper_port.command_close(1.0).accepted
+            assert len(attempts) == 2
+            assert backend.commands == [1.0]
+        else:
+            with pytest.raises(RuntimeError, match="fresh, healthy"):
+                gateway.gripper_port.command_close(1.0)
+            assert len(attempts) == 1
+            assert not backend.commands
+    finally:
+        assert gateway.close().accepted
+
+
 def test_composed_gripper_client_uses_real_wire_admission_and_hand_constraint_binding(
     monkeypatch,
     _composed_gripper_fixture,

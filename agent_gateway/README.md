@@ -969,7 +969,8 @@ action is the distinct `execute_grasp_approach_plan`; authorizing the legacy
 
 下层确认 HOLD 后可以继续发布带真实 `hold/hold` 标签的新鲜观测，不能把它写成
 `running/ready`。夹爪位置命令要求同一机械臂 owner 处于新鲜、无故障且已确认的 HOLD；
-首次 startup HOLD 也由既有 lower owner 的时钟与控制周期推进。该路径不恢复机械臂。
+首次 startup HOLD 也由既有 lower owner 的时钟与控制周期推进。串口忙后的每次重试
+也必须重新满足同一检查，不沿用首次下发前的结果。该路径不恢复机械臂。
 每次夹爪位置写入尝试均进入 Station control fingerprint，旧冻结观测和路径计划会失效，
 不能凭双臂 qpos 未变复用夹爪变化前的计划。读取夹爪状态不改变该 revision。
 
