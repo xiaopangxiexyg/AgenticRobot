@@ -81,3 +81,12 @@ Historical `cameras/configs/rm65/devices/...` references are resolved only by
 the offline metadata path migration helper. New callers must use this
 directory or the exported path constants in
 `teleop_runtime.configs.camera_paths`.
+
+初始首帧等待的有界失败
+
+`bounded_first_frame` 在一次原生初始启动中耗尽首帧等待后，即使配置了重试或 warmup reset，
+也直接返回原有失败，完成既有原生清理；本次启动内部不延长等待来重开或 reset。
+运行期间的恢复和连接建立错误的软件重试保持。另修复 `legacy` 模式下已显式启用的
+`startup_hardware_reset_on_warmup_failure`：即使通用 startup-reset-on-failure 开关关闭，
+该 warmup-only 开关仍生效；没有新增默认 reset，也不扩大非 warmup 错误的 reset 范围。
+这项边界不改变上层相机调度、默认设备配置、流类型、自检或新鲜度门禁。

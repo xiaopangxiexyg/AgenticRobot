@@ -2040,3 +2040,124 @@ def test_explicit_recovery_is_performed_by_capture_owner(monkeypatch):
     source.close()
     with pytest.raises(RuntimeError, match="not running"):
         source.request_pipeline_recovery()
+
+
+def test_realsense_bounded_warmup_failure_is_terminal_despite_retry_config(warmup_clock) -> None:
+    fake_rs = _FakeRealSense(clock=warmup_clock)
+    target_device = _FakeHardwareDevice("FRONT123")
+    fake_rs.devices = [target_device]
+    fake_rs.wait_errors = [RuntimeError("Frame didn't arrive within 1000")] * 5
+    source = RealSenseRGBSource(
+        RealSenseRGBCameraConfig(
+            serial="FRONT123",
+            startup_reset=False,
+            startup_warmup_frames=10,
+            startup_warmup_policy=REALSENSE_STARTUP_WARMUP_BOUNDED_FIRST_FRAME,
+            startup_software_retry_attempts=2,
+            startup_hardware_reset_on_warmup_failure=True,
+        )
+    )
+
+    with pytest.raises(RuntimeError, match="policy=bounded_first_frame") as raised:
+        source._start_pipeline(
+            fake_rs,
+            terminal_bounded_no_frame_failure=True,
+        )
+
+    assert len(fake_rs.pipelines) == 1
+    assert fake_rs.pipelines[0].wait_timeouts == [1000] * 5
+    assert fake_rs.pipelines[0].stop_calls == 1
+    assert target_device.hardware_reset_calls == 0
+    assert '"failed_stage": "first_frame_warmup"' in str(raised.value)
+    assert '"pipeline_start_sec":' in str(raised.value)
+    assert '"pipeline_stop_error": null' in str(raised.value)
+
+
+
+def test_realsense_legacy_warmup_keeps_explicit_reset_recovery() -> None:
+    fake_rs = _FakeRealSense()
+    front = _FakeHardwareDevice("FRONT123")
+    fake_rs.devices = [front]
+    fake_rs.wait_errors = [RuntimeError("Frame didn't arrive within 1000")] * 5
+    source = RealSenseRGBSource(
+        RealSenseRGBCameraConfig(
+            serial="FRONT123",
+            startup_reset=False,
+            startup_warmup_policy="legacy",
+            startup_warmup_frames=10,
+            startup_hardware_reset_on_failure=False,
+            startup_hardware_reset_on_warmup_failure=True,
+            startup_hardware_reset_sleep_sec=0.0,
+        )
+    )
+
+    pipeline, _ = source._start_pipeline(fake_rs)
+
+    assert pipeline is fake_rs.pipelines[1]
+    assert len(fake_rs.pipelines) == 2
+    assert front.hardware_reset_calls == 1
+
+
+
+def test_realsense_connection_error_retry_rebuilds_without_hardware_reset() -> None:
+    fake_rs = _FakeRealSense()
+    target_device = _FakeHardwareDevice("FRONT123")
+    fake_rs.devices = [target_device]
+    fake_rs.start_errors = [RuntimeError("Device or resource busy")]
+    source = RealSenseRGBSource(
+        RealSenseRGBCameraConfig(
+            serial="FRONT123",
+            startup_reset=False,
+            startup_warmup_frames=1,
+            startup_frame_grace_sec=1.0,
+            startup_wait_timeout_ms=1000,
+            startup_software_retry_attempts=1,
+            startup_software_retry_sleep_sec=0.25,
+            startup_hardware_reset_on_failure=False,
+        )
+    )
+
+    with patch.object(source._shutdown_event, "wait", return_value=False) as wait_mock:
+        pipeline, _ = source._start_pipeline(fake_rs)
+
+    assert pipeline is fake_rs.pipelines[1]
+    assert len(fake_rs.pipelines) == 2
+    assert fake_rs.pipelines[0].stop_calls == 1
+    assert target_device.hardware_reset_calls == 0
+    wait_mock.assert_called_once_with(0.25)
+
+
+
+def test_initial_source_start_does_not_extend_bounded_first_frame_with_retries(warmup_clock, monkeypatch) -> None:
+    fake_rs = _FakeRealSense(clock=warmup_clock)
+    target_device = _FakeHardwareDevice("FRONT123")
+    fake_rs.devices = [target_device]
+    fake_rs.wait_errors = [RuntimeError("Frame didn't arrive within 1000")] * 5
+    source = RealSenseRGBSource(
+        RealSenseRGBCameraConfig(
+            serial="FRONT123",
+            startup_reset=False,
+            startup_warmup_frames=10,
+            startup_warmup_policy=REALSENSE_STARTUP_WARMUP_BOUNDED_FIRST_FRAME,
+            startup_software_retry_attempts=2,
+            startup_hardware_reset_on_warmup_failure=True,
+        )
+    )
+
+    monkeypatch.setattr(realsense_rgb, "_load_pyrealsense2", lambda: fake_rs)
+    # Calibration projection is covered separately from this startup-budget check.
+    monkeypatch.setattr(source, "_device_info_from_profile", lambda *_args: {})
+    try:
+        with pytest.raises(RuntimeError, match="policy=bounded_first_frame") as raised:
+            source.start()
+
+        assert len(fake_rs.pipelines) == 1
+        assert fake_rs.pipelines[0].wait_timeouts == [1000] * 5
+        assert fake_rs.pipelines[0].stop_calls == 1
+        assert target_device.hardware_reset_calls == 0
+        assert '"failed_stage": "first_frame_warmup"' in str(raised.value)
+        assert '"pipeline_start_sec":' in str(raised.value)
+        assert '"pipeline_stop_error": null' in str(raised.value)
+
+    finally:
+        source.close()

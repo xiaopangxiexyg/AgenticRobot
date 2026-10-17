@@ -103,13 +103,13 @@ class RealSenseRGBCameraConfig:
     startup_reset: bool = True
     startup_reset_sleep_sec: float = 0.2
     startup_warmup_frames: int = 10
-    # ``legacy`` preserves the historical N-frame synchronous warmup and its
-    # hardware-reset retry. ``bounded_first_frame`` waits only for the first
-    # valid frameset within startup_frame_grace_sec.  Multi-camera callers own
-    # any deferred second pass so a failed pipeline is not reopened
-    # immediately while the remaining cameras have not yet been initialized;
-    # the existing global camera self-check remains responsible for proving
-    # multi-frame freshness.
+    # ``legacy`` preserves the historical N-frame synchronous warmup.
+    # ``bounded_first_frame`` waits for one valid frameset within
+    # startup_frame_grace_sec. On initial start, a no-frame failure is
+    # terminal for that startup attempt; reopening/resetting can compound a
+    # UVC or host-controller fault. Runtime pipeline recovery keeps its
+    # configured retry/reset behavior. The global camera self-check proves
+    # multi-frame freshness after successful starts.
     startup_warmup_policy: str = REALSENSE_STARTUP_WARMUP_BOUNDED_FIRST_FRAME
     # Default-off, process-local retry. This only rebuilds the SDK pipeline; it
     # never resets or re-enumerates hardware. The wait remains cancellable so a
@@ -118,9 +118,8 @@ class RealSenseRGBCameraConfig:
     startup_software_retry_sleep_sec: float = 0.5
     startup_hardware_reset: bool = False
     startup_hardware_reset_on_failure: bool = True
-    # Opt in per camera: a missing first frame can require device re-enumeration
-    # even after a clean pipeline stop/reopen. Other startup errors keep their
-    # existing reset policy.
+    # Opt-in device re-enumeration after a no-frame warmup failure. Initial
+    # bounded startup may suppress this; runtime recovery honors the setting.
     startup_hardware_reset_on_warmup_failure: bool = False
     startup_hardware_reset_retry_attempts: int = 1
     startup_hardware_reset_sleep_sec: float = 2.0
@@ -434,11 +433,15 @@ class RealSenseRGBSource(ObservationSource):
                 rs = _load_pyrealsense2()
                 self._require_pipeline_cleanup()
                 if startup_software_retry_attempts is None:
-                    pipeline, profile = self._start_pipeline(rs)
+                    pipeline, profile = self._start_pipeline(
+                        rs,
+                        terminal_bounded_no_frame_failure=True,
+                    )
                 else:
                     pipeline, profile = self._start_pipeline(
                         rs,
                         software_retry_attempts=startup_software_retry_attempts,
+                        terminal_bounded_no_frame_failure=True,
                     )
                 if not self._is_startup_generation_active(
                     generation,
@@ -548,8 +551,9 @@ class RealSenseRGBSource(ObservationSource):
         rs: Any,
         *,
         software_retry_attempts: int | None = None,
+        terminal_bounded_no_frame_failure: bool = False,
     ) -> tuple[Any, Any]:
-        """Start a stream only after prior native cleanup has completed."""
+        """Wait for prior native cleanup, then apply the requested startup policy."""
         self._require_pipeline_cleanup()
         recovery_started = time.perf_counter()
         reset_attempt_count = 0
@@ -590,9 +594,14 @@ class RealSenseRGBSource(ObservationSource):
                 if self._lifecycle_state == _LIFECYCLE_FAULTED:
                     raise
                 message = str(exc)
+                bounded_first_frame_failure = (
+                    terminal_bounded_no_frame_failure
+                    and self._is_bounded_first_frame_startup_failure(message)
+                )
                 if (
                     software_retries_remaining > 0
                     and self._is_startup_connection_error(message)
+                    and not bounded_first_frame_failure
                 ):
                     software_retries_remaining -= 1
                     with self._lock:
@@ -612,7 +621,12 @@ class RealSenseRGBSource(ObservationSource):
                     continue
                 if (
                     hardware_reset_retries_remaining <= 0
-                    or not self._should_hardware_reset_retry_startup_error(message)
+                    or not self._should_hardware_reset_retry_startup_error(
+                        message,
+                        terminal_bounded_no_frame_failure=(
+                            terminal_bounded_no_frame_failure
+                        ),
+                    )
                 ):
                     raise
                 hardware_reset_retries_remaining -= 1
@@ -1208,19 +1222,38 @@ class RealSenseRGBSource(ObservationSource):
             )
         )
 
-    def _should_hardware_reset_retry_startup_error(self, message: str) -> bool:
-        # A missing first frame permits a device reset only for a camera whose
-        # profile explicitly opts in. Resetting another camera can disturb
-        # its siblings during a multi-camera startup.
+    def _should_hardware_reset_retry_startup_error(
+        self,
+        message: str,
+        *,
+        terminal_bounded_no_frame_failure: bool = False,
+    ) -> bool:
+        # During initial startup, a bounded no-frame failure is terminal:
+        # reset/reopen can compound a shared UVC/xHCI fault. Runtime recovery
+        # keeps its configured retry/reset behavior.
         if (
-            self.config.startup_warmup_policy
-            == REALSENSE_STARTUP_WARMUP_BOUNDED_FIRST_FRAME
-            and "startup_warmup_failed" in str(message).lower()
+            terminal_bounded_no_frame_failure
+            and self._is_bounded_first_frame_startup_failure(message)
         ):
+            return False
+        if self._is_bounded_first_frame_startup_failure(message):
             return bool(self.config.startup_hardware_reset_on_warmup_failure)
+        if (
+            "startup_warmup_failed" in str(message).lower()
+            and self.config.startup_hardware_reset_on_warmup_failure
+        ):
+            return True
         return bool(
             self.config.startup_hardware_reset_on_failure
             and self._is_startup_connection_error(message)
+        )
+
+    def _is_bounded_first_frame_startup_failure(self, message: str) -> bool:
+        return bool(
+            self.config.startup_warmup_policy
+            == REALSENSE_STARTUP_WARMUP_BOUNDED_FIRST_FRAME
+            and "startup_warmup_failed:policy=bounded_first_frame"
+            in str(message).lower()
         )
 
 
