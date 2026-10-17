@@ -525,6 +525,39 @@ or connect a robot backend.
 相机和 Artifact store。任务等待超时或关闭被拒绝时，应用返回 `FAULT` 并保留这些依赖；
 任务结束后可再次调用 `close()` 完成清理。启动失败也使用同一关闭流程。
 
+`real-perception --enable-back-projection` 独立发布
+`perception.capture_rgbd@1` 和 `perception.back_project@2`，不加载 SAM2/GraspGenX，
+不连接机械臂。既有实时像素／区域 `perception.back_project@1` 及其参数保持兼容；
+留存观测调用必须同时按 Skill id 和版本选择 `@2`，不能只取同名 Route 的第一项。
+RPent 等按工具名投影接口的客户端应在 `tool_name_by_skill` 中显式区分别名：
+`"perception.back_project@1": "gateway_perception_back_project_live"` 与
+`"perception.back_project@2": "gateway_perception_back_project_retained"`。
+请求的 `skill_version`、Route/hash 和参数 Schema 必须来自同一发现条目。
+前者复用已有冻结 RGB-D 编码与相机 owner，在同一 VideoFrame 中
+保留 RGB、对齐米制深度、内参及采集时相机位姿，并通过 `rgb_frames` 返回可见预览。
+后者传入该采集的 `observation_operation_id`、`role`、`pixels_uv`（1–128 个 `[u,v]`），
+只读取同一客户端、同一会话仍保留的观测，批量返回相机系与公开参考系 XYZ。
+不重新取帧、补深度洞、调用模型或提供运动权限；结果是被观测表面，不是物体中心或 6D 位姿。
+源观测已淘汰、所选视角被排除、像素越界或深度无效时明确失败。历史观测可查询，但结果
+保留原始采集时间与 Station revision，不冒充当前场景；运动决策前仍需重新观测。
+启用该两步工作流时 `max_retained_operations` 至少为 2；容量不足在装配时拒绝，
+其他操作仍可能按既有保留策略淘汰旧观测，不能把 Artifact 尚存等同于 operation 仍可用。
+只发布实际目录中对齐到 RGB 且有可信位姿的深度角色；非对齐深度仍可用于既有
+`capture_depth`，不能用于逐 RGB 像素反投影。当前 camera-only 默认只有主相机，不能把固定标定
+或主相机深度套到腕部图像。动态腕部需要应用层提供对应采集时刻的几何，不能由 Agent 猜测。
+既有抓姿消费者继续使用 `capture_grasp_observation` 的静止/qpos 合同，两种入口复用同一编码和采集实现。
+
+已有 `real-rm65-skill` 双臂会话也可选择 `--enable-back-projection`，复用同一个相机 owner、
+lower 测量发布与 `RM65RgbCameraGeometry`。这条入口按已对齐 RGB-D 目录发布主相机与两腕角色，
+不需要 SAM2/GraspGenX；普通 `capture_depth` 仍只发布固定外参深度，不改写其既有语义。
+腕部没有有效位姿、位姿过期或帧/位姿时间偏差过大时排除该视角；全部缺失时失败，不套用
+主相机外参。动态腕部复用已有静止历史选择与帧匹配的测量，不用最新 qpos 替代采集时位姿；
+静止历史不完整或帧前后发生运动时排除腕部。此阶段不承诺运动期间的曝光时间配对，
+固定主相机不需要静止机械臂。冻结数据保留逐视角 `stationary_only` 和 `camera_pose`
+测量/可用时间及证据；后续机器人移动不改变原观测的
+投影。只读 Skill 不发送运动/HOLD/STOP，但该既有双臂应用的启动与收尾仍保持原来的
+设备/初始 HOLD 行为，不能当成相机-only 启动命令。上层是否暴露动作由独立策略决定。
+
 `--enable-object-localization` adds the supplied-image localization Route after
 loading its reviewed model bundle. `--enable-point-grasp` is a separate,
 default-off module and requires that same localizer plus a reviewed point-grasp

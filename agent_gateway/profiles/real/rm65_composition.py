@@ -228,7 +228,6 @@ class ExclusiveRM65AgentPrimitiveComposition:
         ):
             raise ValueError("perception composition requires one exact frame binding.")
         grasp_items = (
-            self.rgb_camera_geometry,
             self.localization_registration,
             self.localization_provider,
             self.segmentation_registration,
@@ -240,6 +239,8 @@ class ExclusiveRM65AgentPrimitiveComposition:
             item is not None for item in grasp_items
         ):
             raise ValueError("RM65 point-grasp resources must be assembled together.")
+        if any(item is not None for item in grasp_items) and self.rgb_camera_geometry is None:
+            raise ValueError("RM65 point-grasp requires camera geometry.")
         if self.application.startup_admission is not self.lower.startup_admission:
             raise ValueError("application must use the exact lower startup gate.")
 
@@ -271,6 +272,7 @@ def assemble_exclusive_rm65_agent_primitive_composition(
     object_localizer: object | None = None,
     point_grasp_planner: object | None = None,
     enable_grasp_observation: bool = False,
+    enable_back_projection: bool = False,
     debug_render_object_coordinates: bool = False,
     enable_point_grasp_arm_reachability: bool = False,
     grasp_trajectory_config: RM65GraspTrajectoryPlanningConfig | None = None,
@@ -287,6 +289,8 @@ def assemble_exclusive_rm65_agent_primitive_composition(
         raise TypeError("enable_point_grasp_arm_reachability must be bool.")
     if not isinstance(enable_grasp_observation, bool):
         raise TypeError("enable_grasp_observation must be bool.")
+    if not isinstance(enable_back_projection, bool):
+        raise TypeError("enable_back_projection must be bool.")
     if grasp_trajectory_config is not None and not isinstance(
         grasp_trajectory_config,
         RM65GraspTrajectoryPlanningConfig,
@@ -383,7 +387,9 @@ def assemble_exclusive_rm65_agent_primitive_composition(
         )
     if grasp_enabled and not perception_enabled:
         raise ValueError("Point-grasp requires the composed camera resources.")
-    if grasp_enabled != (camera_mount_urdf_path is not None):
+    if enable_back_projection and not perception_enabled:
+        raise ValueError("Back projection requires composed cameras and capture-time geometry.")
+    if (grasp_enabled or enable_back_projection) != (camera_mount_urdf_path is not None):
         raise ValueError(
             "Point-grasp three-view rendering requires one explicit camera mount URDF."
         )
@@ -617,6 +623,7 @@ def assemble_exclusive_rm65_agent_primitive_composition(
     perception_frame_binding = None
     perception_capture = None
     rgb_camera_geometry = None
+    rgbd_geometry_registrations = ()
     localization_registration = None
     localization_provider = None
     segmentation_registration = None
@@ -644,7 +651,7 @@ def assemble_exclusive_rm65_agent_primitive_composition(
             ),
         )
         perception_frame_binding = station_frame_binding
-        if grasp_enabled:
+        if grasp_enabled or enable_back_projection:
             assert camera_mount_urdf_path is not None
             rgb_camera_geometry = build_rm65_rgb_camera_geometry(
                 source_binding=perception_source_binding,
@@ -677,6 +684,12 @@ def assemble_exclusive_rm65_agent_primitive_composition(
             source_binding_hash=perception_source_binding.semantic_content_hash,
             frame_binding=perception_frame_binding,
         )
+        if enable_back_projection:
+            from .back_projection import build_rgbd_geometry_registrations
+
+            rgbd_geometry_registrations = build_rgbd_geometry_registrations(
+                perception_capture, roles=tuple(row["role"]
+                    for row in catalog_provider.aligned_rgbd_source_catalog()))
         if grasp_enabled:
             assert object_localizer is not None
             assert point_grasp_planner is not None
@@ -918,6 +931,7 @@ def assemble_exclusive_rm65_agent_primitive_composition(
             safety_envelope_refs=(envelope_ref,),
             allowed_client_ids=client_bindings.allowed_client_ids,
             perception_capture=perception_capture,
+            rgbd_geometry_registrations=rgbd_geometry_registrations,
             localization_registration=localization_registration,
             segmentation_registration=segmentation_registration,
             localization_provider=localization_provider,

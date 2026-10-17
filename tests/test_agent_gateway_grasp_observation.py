@@ -218,3 +218,30 @@ def test_real_rgbd_adapter_requires_the_capture_stationary_cut(failure):
     assert stationary_calls == [("left_wrist", 9.97, 10.2)]
     assert sources["left_wrist"].latest_frame_reads == 1
     assert geometry.pose_cut_calls == []  # Never fall back to a current wrist pose.
+
+
+@pytest.mark.parametrize("moved_after_frame", [False, True])
+def test_generic_wrist_rgbd_uses_history_even_without_a_grasp_request(moved_after_frame):
+    from test_agent_gateway_real_realsense_perception import _provider
+
+    provider, _, _, _ = _provider(wrist_depth=True, clock=lambda: 10.03)
+    geometry = RM65RgbCameraGeometry(source_binding=provider.source_binding,
+        target_builder=SimpleNamespace(solver_world_targets_for_qpos_pair=lambda **_: {
+            "left": np.eye(4), "right": np.eye(4)}),
+        static_source_from_camera={"front": np.eye(4)},
+        dynamic_mounts=(_DynamicCameraMount("left_wrist", "wrist_left", "left", "link6", "camera",
+            tuple(np.eye(4).reshape(-1))),), urdf_sha256="test")
+    provider.rgb_camera_geometry = geometry
+    for measured in (9.8, 9.85, 9.9, 9.95, 10.02):
+        q = .01 if moved_after_frame and measured == 10.02 else 0.
+        geometry.publish_measured_qpos(qpos_by_side={side: np.full(6, q) for side in ("left", "right")},
+            measured_at=measured, available_at=measured+.001, evidence_refs=("measured:test",))
+    # The old latest-pose path would accept this cut 50 ms after the frame.
+    assert geometry.pose_cut(source_id="left_wrist", frame_acquired_at=9.97, now=10.03).measured_at == 10.02
+    if moved_after_frame:
+        with pytest.raises(RuntimeError, match="not_stationary"):
+            provider.capture_aligned_rgbd(role="wrist_left", expected_station_revision=7)
+    else:
+        capture = provider.capture_aligned_rgbd(role="wrist_left", expected_station_revision=7)
+        assert capture.pose_measured_at == 9.95
+        assert capture.capture_qpos_by_side is not None

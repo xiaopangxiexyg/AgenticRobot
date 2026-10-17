@@ -224,6 +224,7 @@ def assemble_camera_only_real_perception_composition(
     frame_binding: RealPerceptionFrameBinding,
     object_localizer: object | None = None,
     point_grasp_planner: object | None = None,
+    enable_back_projection: bool = False,
     max_retained_operations: int = 16,
     peer_idle_timeout_sec: float = 10.0,
     clock: Callable[[], float] = time.time,
@@ -301,6 +302,8 @@ def assemble_camera_only_real_perception_composition(
     }
     if planner_hash is not None:
         execution_manifest_payload["point_grasp_planner_hash"] = planner_hash
+    if enable_back_projection:
+        execution_manifest_payload["rgbd_back_projection_enabled"] = True
     execution_manifest_hash = canonical_content_hash(
         execution_manifest_payload,
         domain="dexteleop.real_perception.execution_manifest.v1",
@@ -310,6 +313,8 @@ def assemble_camera_only_real_perception_composition(
         current_station_revision=lambda: 0,
         clock=clock,
     )
+    if enable_back_projection and not catalog_provider.aligned_rgbd_source_catalog():
+        raise ValueError("RGB-D roles require aligned depth with trusted camera geometry")
     registration = build_real_perception_capture_registration_v2(
         rgb_source_catalog=catalog_provider.rgb_source_catalog(),
         depth_source_catalog=catalog_provider.depth_source_catalog(),
@@ -418,6 +423,8 @@ def assemble_camera_only_real_perception_composition(
         frame_graph_hash=frame_graph_hash,
         tool_config_hash=tool_config_hash,
         calibration_hash=source_binding.semantic_content_hash,
+        enable_back_projection=enable_back_projection,
+        rgbd_roles=tuple(item["role"] for item in catalog_provider.aligned_rgbd_source_catalog()),
         localization_registration=localization_registration,
         segmentation_registration=segmentation_registration,
         station_point_grasp_registration=station_point_grasp_registration,

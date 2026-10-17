@@ -154,6 +154,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--enable-grasp-observation", action="store_true",
         help="Use frozen stationary RGB-D target selection and optional associated-view fusion (GraspGenX only).")
+    parser.add_argument("--enable-back-projection", action="store_true",
+        help="Expose model-free RGB-D capture and back projection using the existing measured camera geometry.")
     parser.add_argument(
         "--debug-render-object-coordinates",
         action="store_true",
@@ -358,7 +360,7 @@ def _absolute_existing_file(
 def _effective_camera_registry(args: argparse.Namespace) -> Path | None:
     if args.camera_registry is not None:
         return args.camera_registry
-    if args.enable_point_grasp:
+    if args.enable_point_grasp or args.enable_back_projection:
         return DEFAULT_RM65_CAMERA_REGISTRY_V4
     return None
 
@@ -366,7 +368,7 @@ def _effective_camera_registry(args: argparse.Namespace) -> Path | None:
 def _effective_camera_mount_urdf(args: argparse.Namespace) -> Path | None:
     if args.camera_mount_urdf is not None:
         return args.camera_mount_urdf
-    if args.enable_point_grasp:
+    if args.enable_point_grasp or args.enable_back_projection:
         if args.collision_scene_profile == "dual_arm_hand_proxy_dmtac_strict":
             return DEFAULT_RM65_DMTAC_CAMERA_MOUNT_URDF
         return DEFAULT_RM65_CAMERA_MOUNT_URDF
@@ -495,6 +497,8 @@ def _ready_payload(
         None,
     )
     perception_capture = getattr(composition, "perception_capture", None)
+    geometry_registrations = getattr(getattr(session, "contract_bundle", None),
+                                     "rgbd_geometry_registrations", ())
     authorized_actions = tuple(
         getattr(
             composition,
@@ -545,6 +549,8 @@ def _ready_payload(
                 "rgb_roles": list(perception_capture.profile.rgb_roles),
                 "depth_roles": list(perception_capture.profile.depth_roles),
                 "control_effect_class": "read_only",
+                **({"back_projection_roles": list(geometry_registrations[0].skill.schema_entry.parameter_schema[
+                    "properties"]["selected_roles"]["items"]["enum"])} if geometry_registrations else {}),
                 "point_grasp_enabled": (
                     composition.station_point_grasp_registration is not None
                 ),
@@ -618,12 +624,12 @@ def _stopped_payload(
     )
     passive_read_failures = []
     for (
-        skill_id,
+        (skill_id, skill_version),
         executor,
-    ) in composition.deployment.gateway_session.passive_read_executors_by_skill_id.items():
+    ) in composition.deployment.gateway_session.passive_read_executors_by_skill_ref.items():
         diagnostics = getattr(executor, "failure_diagnostics", ())
         passive_read_failures.extend(
-            {"skill_id": skill_id, **dict(diagnostic)} for diagnostic in diagnostics
+            {"skill_id": skill_id, "skill_version": skill_version, **dict(diagnostic)} for diagnostic in diagnostics
         )
     return {
         "event": "gateway_stopped",
@@ -879,8 +885,8 @@ def main(argv: list[str] | None = None) -> int:
             "--camera-config, --camera-registry, and --artifact-root must be "
             "provided together"
         )
-    if args.enable_point_grasp and not all(perception_supplied):
-        parser.error("--enable-point-grasp requires the composed camera options")
+    if (args.enable_point_grasp or args.enable_back_projection) and not all(perception_supplied):
+        parser.error("Point-grasp or back projection requires the composed camera options")
     if args.enable_grasp_observation and (not args.enable_point_grasp or args.point_grasp_backend != "graspgenx"):
         parser.error("--enable-grasp-observation requires --enable-point-grasp and GraspGenX")
     if args.debug_render_object_coordinates and not args.enable_point_grasp:
@@ -890,6 +896,8 @@ def main(argv: list[str] | None = None) -> int:
             "--enable-point-grasp-arm-reachability requires --enable-point-grasp"
         )
     camera_mount_urdf_arg = _effective_camera_mount_urdf(args)
+    if args.camera_mount_urdf is not None and not (args.enable_point_grasp or args.enable_back_projection):
+        parser.error("--camera-mount-urdf requires point-grasp or back projection")
     if args.object_localization_backend == "sam3-service":
         if not args.enable_point_grasp:
             parser.error("--object-localization-backend sam3-service requires --enable-point-grasp")
@@ -983,7 +991,7 @@ def main(argv: list[str] | None = None) -> int:
                 "candidate geometry cannot be reinterpreted for another tool"
             )
     camera_mount_urdf = None
-    if args.enable_point_grasp:
+    if args.enable_point_grasp or args.enable_back_projection:
         camera_mount_urdf = _absolute_existing_file(
             parser,
             camera_mount_urdf_arg,
@@ -1183,6 +1191,7 @@ def main(argv: list[str] | None = None) -> int:
         object_localizer=object_localizer,
         point_grasp_planner=point_grasp_planner,
         enable_grasp_observation=args.enable_grasp_observation,
+        enable_back_projection=args.enable_back_projection,
         debug_render_object_coordinates=args.debug_render_object_coordinates,
         enable_point_grasp_arm_reachability=(args.enable_point_grasp_arm_reachability),
         grasp_trajectory_config=RM65GraspTrajectoryPlanningConfig(

@@ -60,7 +60,7 @@ def test_registered_skill_is_bound_in_gateway_and_missing_owner_is_rejected(tmp_
                 {s: np.zeros((2, 6)) for s in ("left", "right")}, ("sim:planned",)), {})
     gateway = assemble_real_agent_primitive_gateway_session(**kwargs,
         held_object_observer=observe, object_transport_planner_factory=Planner)
-    assert "perception.plan_object_move" in gateway.passive_read_executors_by_skill_id
+    assert ("perception.plan_object_move", "1") in gateway.passive_read_executors_by_skill_ref
     assert "perception.plan_object_move" not in gateway.executors_by_skill_id
     port.publish_measured_pose(pose_world_by_component={"right_arm": np.eye(4)}, measured_at=10., available_at=10.,
         source_evidence_refs=("sim:state",))

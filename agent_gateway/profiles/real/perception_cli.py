@@ -88,6 +88,8 @@ def build_parser() -> argparse.ArgumentParser:
         default="real-perception-only",
     )
     parser.add_argument("--max-retained-operations", type=int, default=16)
+    parser.add_argument("--enable-back-projection", action="store_true",
+                        help="Expose model-free frozen RGB-D capture and pixel back projection; no arm connection")
     parser.add_argument("--peer-idle-timeout-sec", type=float, default=10.0)
     parser.add_argument(
         "--enable-object-localization",
@@ -404,6 +406,7 @@ def main(argv: list[str] | None = None) -> int:
         frame_binding=frame_binding,
         object_localizer=object_localizer,
         point_grasp_planner=point_grasp_planner,
+        enable_back_projection=args.enable_back_projection,
         max_retained_operations=args.max_retained_operations,
         peer_idle_timeout_sec=peer_timeout,
     )
@@ -430,6 +433,7 @@ def main(argv: list[str] | None = None) -> int:
                 composition.localization_registration is not None
             ),
             "local_path_test_input_enabled": False,
+            "back_projection_enabled": bool(composition.contract_bundle.rgbd_geometry_registrations),
         }
         if composition.station_point_grasp_registration is not None:
             ready_payload["point_grasp_enabled"] = True

@@ -9,6 +9,7 @@ import pytest
 
 from dataset_contracts.grasp_multiview_snapshot import (
     GRASP_MULTIVIEW_SCHEMA_ID, decode_grasp_multiview_snapshot,
+    decode_grasp_multiview_snapshot_arrays,
     encode_grasp_multiview_snapshot,
 )
 from dataset_contracts.grasp_rgbd_snapshot import (
@@ -43,6 +44,25 @@ def blob(role="main"):
         metadata={"schema_id": GRASP_RGBD_SNAPSHOT_SCHEMA_ID, "role": role},
         qpos_by_side={"left": np.zeros(6), "right": np.zeros(6)},
     )
+
+
+def test_decoded_multiview_api_reuses_the_one_validated_array_decode(monkeypatch):
+    import dataset_contracts.grasp_multiview_snapshot as codec
+    encoded = encode_grasp_multiview_snapshot(views=[blob("main"), blob("wrist_left")],
+        metadata={"schema_id": GRASP_MULTIVIEW_SCHEMA_ID})
+    decode = codec.decode_grasp_rgbd_snapshot
+    calls = []
+    def counted(data):
+        value = decode(data)
+        calls.append(value)
+        return value
+    monkeypatch.setattr(codec, "decode_grasp_rgbd_snapshot", counted)
+    views, _, points, labels = decode_grasp_multiview_snapshot_arrays(encoded)
+    assert len(calls) == len(views) == 2
+    assert views[0][0] is calls[0][0]
+    assert views[1][1]["role"] == "wrist_left"
+    assert points is labels is None
+    np.testing.assert_array_equal(views[0][0]["rgb"], view().rgb)
 
 
 def fuse(anchor=None, auxiliary=(), segment=None):

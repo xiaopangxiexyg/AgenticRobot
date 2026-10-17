@@ -36,6 +36,7 @@ from teleop_runtime.skill_deploy.rm65_ports import (
     ExclusiveRM65SkillDeployPorts,
 )
 
+from .back_projection import RgbdGeometryRegistration
 from .grasp_approach_plan import (
     DEFAULT_REAL_GRASP_EXECUTION_OPERATION_TIMEOUT_SEC,
 )
@@ -151,6 +152,7 @@ def assemble_exclusive_real_agent_primitive_deployment(
     measured_qpos_observer: RealSkillMeasuredQposObserver | None = None,
     convergence_profile: RealAgentPrimitiveConvergenceProfile | None = None,
     perception_capture: RealPerceptionCaptureRegistration | None = None,
+    rgbd_geometry_registrations: tuple[RgbdGeometryRegistration, ...] = (),
     localization_registration: RealObjectLocalizationRegistration | None = None,
     segmentation_registration: SegmentationRegistration | None = None,
     localization_provider: ObjectLocalizationProvider | None = None,
@@ -203,6 +205,7 @@ def assemble_exclusive_real_agent_primitive_deployment(
         safety_envelope_refs=safety_envelope_refs,
         convergence_profile=convergence_profile,
         perception_capture=perception_capture,
+        rgbd_geometry_registrations=rgbd_geometry_registrations,
         localization_registration=localization_registration,
         segmentation_registration=segmentation_registration,
         station_point_grasp_registration=station_point_grasp_registration,
@@ -287,6 +290,7 @@ def assemble_exclusive_rm65_agent_primitive_deployment(
     allowed_client_ids: tuple[str, ...],
     convergence_profile: RealAgentPrimitiveConvergenceProfile | None = None,
     perception_capture: RealPerceptionCaptureRegistration | None = None,
+    rgbd_geometry_registrations: tuple[RgbdGeometryRegistration, ...] = (),
     localization_registration: RealObjectLocalizationRegistration | None = None,
     segmentation_registration: SegmentationRegistration | None = None,
     localization_provider: ObjectLocalizationProvider | None = None,
@@ -343,6 +347,7 @@ def assemble_exclusive_rm65_agent_primitive_deployment(
         measured_qpos_observer=measured_qpos_observer,
         convergence_profile=convergence_profile,
         perception_capture=perception_capture,
+        rgbd_geometry_registrations=rgbd_geometry_registrations,
         localization_registration=localization_registration,
         segmentation_registration=segmentation_registration,
         localization_provider=localization_provider,

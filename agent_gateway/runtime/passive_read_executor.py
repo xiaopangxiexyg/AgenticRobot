@@ -258,6 +258,18 @@ class PassiveReadSkillExecutor:
         with self._lock:
             return self._completion_by_operation.get(normalized)
 
+    def _complete_operation(
+        self, service: _PassiveReadGatewayService, **kwargs: Any
+    ) -> Any:
+        # A dependent reader may observe the public terminal state as soon as
+        # complete_operation returns it. Keep local retention and publication
+        # under the same lock used by completion_for, including failed CASes.
+        with self._lock:
+            outcome = service.complete_operation(**kwargs)
+            self._completion_by_operation[kwargs["operation_id"]] = outcome
+            self._trim_records_locked()
+            return outcome
+
     def launch(
         self,
         *,
@@ -470,7 +482,8 @@ class PassiveReadSkillExecutor:
                 succeeded=True,
                 reason_code=result.reason_code,
             )
-            outcome = service.complete_operation(
+            outcome = self._complete_operation(
+                service,
                 operation_id=running.operation_id,
                 expected_operation_hash=running.semantic_content_hash,
                 succeeded=True,
@@ -508,7 +521,8 @@ class PassiveReadSkillExecutor:
                 with self._lock:
                     self._failure_diagnostics[running.operation_id] = diagnostic
                     self._trim_records_locked()
-                outcome = service.complete_operation(
+                self._complete_operation(
+                    service,
                     operation_id=running.operation_id,
                     expected_operation_hash=running.semantic_content_hash,
                     succeeded=False,
@@ -529,7 +543,6 @@ class PassiveReadSkillExecutor:
                 )
             with self._lock:
                 self._execution_receipts[running.operation_id] = execution_receipt
-                self._completion_by_operation[running.operation_id] = outcome
                 self._trim_records_locked()
         except Exception as error:  # noqa: BLE001 - convert reader failure to CAS.
             message = " ".join(str(error).split())
@@ -545,7 +558,8 @@ class PassiveReadSkillExecutor:
                 self._trim_records_locked()
             current = service.operation_store.get(admitted.operation_id)
             if isinstance(current, AgentSkillOperation) and not current.terminal:
-                outcome = service.complete_operation(
+                self._complete_operation(
+                    service,
                     operation_id=current.operation_id,
                     expected_operation_hash=current.semantic_content_hash,
                     succeeded=False,
@@ -562,9 +576,6 @@ class PassiveReadSkillExecutor:
                         },
                     },
                 )
-                with self._lock:
-                    self._completion_by_operation[current.operation_id] = outcome
-                    self._trim_records_locked()
 
     def _expire_or_cancelled(
         self,

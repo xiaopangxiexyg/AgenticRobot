@@ -27,6 +27,7 @@ from dataset_contracts.canonical_encoding import canonical_content_hash
 from dataset_contracts.grasp_multiview_snapshot import (
     GRASP_MULTIVIEW_SCHEMA_ID, GRASP_MULTIVIEW_ENCODING, GRASP_MULTIVIEW_MAX_BYTES,
     encode_grasp_multiview_snapshot, decode_grasp_multiview_snapshot,
+    decode_grasp_multiview_snapshot_arrays,
 )
 from dataset_contracts.grasp_rgbd_snapshot import (
     GRASP_RGBD_SNAPSHOT_SCHEMA_ID, encode_grasp_rgbd_snapshot,
@@ -34,6 +35,8 @@ from dataset_contracts.grasp_rgbd_snapshot import (
 from dataset_contracts.perception_artifacts import (
     RGB_FRAME_SCHEMA_ID_V1, RGB_FRAME_ENCODING_V1, RGB_FRAME_COMPRESSION_V1,
 )
+
+from .localization_gateway import read_bounded_regular_file
 
 OBSERVATION_SLOT = "grasp_observation"
 
@@ -156,7 +159,9 @@ def build_grasp_observation_registration(point_registration) -> GraspObservation
 
 def build_grasp_observation_executor(*, registration, perception_provider, frame_binding,
                                      artifact_store, runtime_session_id, current_station_revision,
-                                     max_retained_operations, clock, non_motion_read_window):
+                                     max_retained_operations, clock, non_motion_read_window,
+                                     require_stationary=True, observation_slot=OBSERVATION_SLOT):
+    capture_name = "grasp-observation" if observation_slot == OBSERVATION_SLOT else "rgbd-observation"
     def commit(data, *, slot, ordinal, schema, encoding, media_type, compression, operation):
         artifact = artifact_ref_for_bytes(data, media_type=media_type, schema_id=schema,
                                          encoding=encoding, compression=compression)
@@ -175,13 +180,20 @@ def build_grasp_observation_executor(*, registration, perception_provider, frame
             for role in request.parameters["selected_roles"]:
                 try:
                     capture = perception_provider.capture_aligned_rgbd(role=role,
-                        expected_station_revision=request.expected_station_revision, require_stationary=True)
+                        expected_station_revision=request.expected_station_revision,
+                        require_stationary=require_stationary)
                 except RuntimeError as error:
                     reason = str(error).split(":", 1)[0]
                     if reason not in {"real_perception_frame_unavailable", "real_perception_frame_stale",
                                       "real_perception_source_not_running", "real_rgb_camera_pose_unavailable",
                                       "real_rgb_camera_pose_stale", "real_rgb_camera_frame_pose_skew_exceeded",
-                                      "grasp_observation_frame_pose_unavailable"}:
+                                      "grasp_observation_frame_pose_unavailable"} and not (
+                        not require_stationary and reason in {
+                            "grasp_observation_stationary_geometry_unavailable",
+                            "grasp_observation_stationary_history_unavailable",
+                            "grasp_observation_robot_not_stationary",
+                        }
+                    ):
                         raise
                     excluded.append({"role": role, "reason": reason})
                     continue
@@ -206,9 +218,11 @@ def build_grasp_observation_executor(*, registration, perception_provider, frame
                     "T_reference_from_camera": transform.tolist(),
                     "reference_frame_id": frame_binding.reference_frame_id,
                     "rgb_content_hash": capture.rgb_content_hash, "depth_content_hash": capture.depth_content_hash,
-                    "target_mask_available": False, "stationary_only": True,
-                    "measured_qpos": {"measured_at": capture.pose_measured_at, "available_at": capture.pose_available_at,
-                                      "source_evidence_refs": list(capture.pose_evidence_refs)},
+                    "target_mask_available": False,
+                    "stationary_only": require_stationary or capture.capture_qpos_by_side is not None,
+                    ("measured_qpos" if require_stationary else "camera_pose"): {
+                        "measured_at": capture.pose_measured_at, "available_at": capture.pose_available_at,
+                        "source_evidence_refs": list(capture.pose_evidence_refs)},
                 }
                 views.append(encode_grasp_rgbd_snapshot(rgb=capture.rgb, depth_m=capture.depth_m,
                     target_mask=np.zeros(capture.depth_m.shape, dtype=bool), metadata=metadata,
@@ -224,9 +238,10 @@ def build_grasp_observation_executor(*, registration, perception_provider, frame
             "schema_id": GRASP_MULTIVIEW_SCHEMA_ID, "runtime_session_id": runtime_session_id,
             "station_revision": request.expected_station_revision,
             "frame_binding_hash": frame_binding.semantic_content_hash, "excluded_views": excluded,
-            "scope": "stationary_observation_not_a_validated_plan",
+            "scope": ("stationary_observation_not_a_validated_plan" if require_stationary
+                      else "capture_time_geometry_not_current_scene"),
         })
-        outputs = [commit(observation, slot=OBSERVATION_SLOT, ordinal=0, schema=GRASP_MULTIVIEW_SCHEMA_ID,
+        outputs = [commit(observation, slot=observation_slot, ordinal=0, schema=GRASP_MULTIVIEW_SCHEMA_ID,
             encoding=GRASP_MULTIVIEW_ENCODING, media_type="application/zip", compression="zip", operation=operation)]
         frames = []
         for ordinal, (capture, data) in enumerate(previews):
@@ -237,15 +252,18 @@ def build_grasp_observation_executor(*, registration, perception_provider, frame
                 "media_content_hash": hashlib.sha256(data).hexdigest(), "acquired_at": capture.acquired_at})
         return PassiveReadResult(execution_result={"station_revision": request.expected_station_revision,
                 "frames": frames, "excluded_views": excluded},
-            evidence_refs=("grasp-observation:"+operation.operation_id,), output_artifact_bindings=tuple(outputs),
-            reason_code="passive_grasp_observation_retained")
-    return PassiveReadSkillExecutor(port_id="agent-gateway:grasp-observation:"+runtime_session_id,
+            evidence_refs=(capture_name+":"+operation.operation_id,),
+            output_artifact_bindings=tuple(sorted(outputs, key=lambda item: (item.slot_id, item.ordinal))),
+            reason_code=("passive_grasp_observation_retained" if observation_slot == OBSERVATION_SLOT
+                         else "passive_rgbd_observation_retained"))
+    return PassiveReadSkillExecutor(port_id="agent-gateway:"+capture_name+":"+runtime_session_id,
         executor_id=registration.executor_id, read=read, current_station_revision=current_station_revision,
         clock=clock, max_retained_operations=max_retained_operations)
 
 
 def read_retained_grasp_observation(*, executor, operation_id, artifact_store, runtime_session_id,
-                                    expected_station_revision, frame_binding_hash):
+                                    expected_station_revision, frame_binding_hash,
+                                    observation_slot=OBSERVATION_SLOT, decode_arrays=False):
     completion = executor.completion_for(operation_id)
     if completion is None or not completion.accepted:
         raise ValueError("Grasp observation is not retained by this session")
@@ -254,14 +272,16 @@ def read_retained_grasp_observation(*, executor, operation_id, artifact_store, r
             or operation.execution_outcome != "completed"
             or operation.execution_result["station_revision"] != expected_station_revision):
         raise ValueError("Grasp observation session, revision, or completion differs")
-    bindings = [b for b in operation.output_artifact_bindings if b.slot_id == OBSERVATION_SLOT]
+    bindings = [b for b in operation.output_artifact_bindings if b.slot_id == observation_slot]
     if len(bindings) != 1:
         raise ValueError("Grasp observation lacks a unique retained Artifact")
     artifact = bindings[0].artifact
-    data = artifact_store.managed_read_path(artifact.artifact_id).read_bytes()
+    data = read_bounded_regular_file(artifact_store.managed_read_path(artifact.artifact_id),
+                                     maximum=artifact.byte_length)
     if len(data) != artifact.byte_length or hashlib.sha256(data).hexdigest() != artifact.sha256:
         raise ValueError("Retained grasp observation changed")
-    views, metadata, points, _ = decode_grasp_multiview_snapshot(data)
+    decoder = decode_grasp_multiview_snapshot_arrays if decode_arrays else decode_grasp_multiview_snapshot
+    views, metadata, points, _ = decoder(data)
     if (metadata.get("runtime_session_id") != runtime_session_id
             or metadata.get("station_revision") != expected_station_revision
             or metadata.get("frame_binding_hash") != frame_binding_hash or points is not None):

@@ -15,6 +15,21 @@ from agent_gateway.profiles.real.session_authorization import (
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
+def test_cli_back_projection_resolves_measured_geometry_without_grasp_models():
+    parser = gateway_cli.build_parser()
+    args = parser.parse_args([*_argv(confirmation=REAL_AGENT_PRIMITIVE_SESSION_CONFIRM_TOKEN),
+                              "--enable-back-projection"])
+    assert not args.enable_point_grasp
+    assert args.object_localization_asset_bundle is None
+    assert args.point_grasp_asset_bundle is None
+    assert gateway_cli._effective_camera_registry(args) == gateway_cli.DEFAULT_RM65_CAMERA_REGISTRY_V4
+    assert gateway_cli._effective_camera_mount_urdf(args) == gateway_cli.DEFAULT_RM65_CAMERA_MOUNT_URDF
+    with pytest.raises(SystemExit) as error:
+        gateway_cli.main([*_argv(confirmation=REAL_AGENT_PRIMITIVE_SESSION_CONFIRM_TOKEN),
+                          "--enable-back-projection"])
+    assert error.value.code == 2  # Missing cameras are rejected before creating devices.
+
+
 def _argv(*, confirmation: str, socket_path: Path | None = None) -> list[str]:
     existing = str(REPO_ROOT / "pyproject.toml")
     return [
@@ -853,9 +868,9 @@ def test_cli_assembles_then_reports_ready_and_lower_hold(
                     emergency_stop_receipt=None,
                 ),
                 executors_by_skill_id={"motion.step_tcp_cardinal": SimpleNamespace()},
-                passive_read_executors_by_skill_id={
-                    "perception.capture_rgb": camera_executor,
-                    "perception.plan_point_grasp": point_grasp_executor,
+                passive_read_executors_by_skill_ref={
+                    ("perception.capture_rgb", "1"): camera_executor,
+                    ("perception.plan_point_grasp", "1"): point_grasp_executor,
                 },
             ),
             control_runtime=runtime,
@@ -929,6 +944,7 @@ def test_cli_assembles_then_reports_ready_and_lower_hold(
     assert events[1]["passive_read_failures"] == [
         {
             "skill_id": "perception.capture_rgb",
+            "skill_version": "1",
             "executor_id": "camera-reader:test",
             "operation_id": "operation:rgb:test",
             "exception_type": "RuntimeError",
@@ -937,6 +953,7 @@ def test_cli_assembles_then_reports_ready_and_lower_hold(
         },
         {
             "skill_id": "perception.plan_point_grasp",
+            "skill_version": "1",
             "executor_id": "point-grasp-planner:test",
             "operation_id": "operation:point-grasp:test",
             "exception_type": "RuntimeError",

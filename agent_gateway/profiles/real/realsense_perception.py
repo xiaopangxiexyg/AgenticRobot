@@ -1217,7 +1217,12 @@ class RealSenseAgentPerceptionProvider:
         capture_qpos = None
         qpos_measured_at = qpos_available_at = None
         qpos_refs = ()
-        if require_stationary:
+        # Dynamic camera geometry is only qualified by the existing stationary
+        # history contract; a recent latest qpos is not an exposure-time pose.
+        stationary_geometry = require_stationary or (
+            source_id not in self.source_binding.world_from_depth_camera_by_source
+        )
+        if stationary_geometry:
             stationary = getattr(self.rgb_camera_geometry, "stationary_geometry_cut", None)
             if not callable(stationary):
                 raise RuntimeError("grasp_observation_stationary_geometry_unavailable")
@@ -1296,9 +1301,9 @@ class RealSenseAgentPerceptionProvider:
             rgb_content_hash=rgb_content_hash,
             depth_content_hash=depth_content_hash,
             capture_qpos_by_side=capture_qpos,
-            pose_measured_at=qpos_measured_at,
-            pose_available_at=qpos_available_at,
-            pose_evidence_refs=qpos_refs,
+            pose_measured_at=(qpos_measured_at if stationary_geometry else geometry.measured_at),
+            pose_available_at=(qpos_available_at if stationary_geometry else geometry.available_at),
+            pose_evidence_refs=(qpos_refs if stationary_geometry else geometry.evidence_refs),
         )
 
     def capture_rgb_geometry(

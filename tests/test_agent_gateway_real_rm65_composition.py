@@ -230,6 +230,107 @@ def _lower(monkeypatch, *, envelope_side: str = "right"):
     return lower, guard
 
 
+@pytest.mark.parametrize("side", ["left", "right"])
+def test_model_free_three_view_projection_uses_the_existing_owner_cut(monkeypatch, tmp_path, side):
+    import time
+    from agent_gateway.profiles.real.grasp_observation import read_retained_grasp_observation
+    from teleop_runtime.video_frame import VideoFrame
+
+    lower, guard = _lower(monkeypatch, envelope_side=side)
+
+    def fk(*, left_qpos, right_qpos):
+        poses = {arm: np.eye(4) for arm in ("left", "right")}
+        for arm, q in (("left", left_qpos), ("right", right_qpos)):
+            poses[arm][:3, 3] = [q[0], .2 if arm == "left" else -.2, .3]
+        return poses
+
+    monkeypatch.setattr(lower.target_builder, "solver_world_targets_for_qpos_pair", fk)
+    composition = assemble_exclusive_rm65_agent_primitive_composition(
+        lower=lower, socket_path=tmp_path / "geometry.sock", authorized_side=side,
+        authorized_action="forward", confirmation_token=REAL_AGENT_PRIMITIVE_CONFIRM_TOKEN,
+        client_id="rpent:test", client_uid=1000, runtime_session_id="geometry:test",
+        control_domain_id="geometry:domain", embodiment_instance_id="geometry:arms",
+        camera_config_path=REPO_ROOT / "teleop_runtime/configs/devices/agent_gateway_realsense.json",
+        camera_registry_path=DEFAULT_RM65_CAMERA_REGISTRY_V4,
+        camera_mount_urdf_path=DEFAULT_RM65_CAMERA_MOUNT_URDF,
+        artifact_root=tmp_path, enable_back_projection=True)
+    session = composition.deployment.gateway_session
+    try:
+        assert session.localization_provider is None and session.station_point_grasp_provider is None
+        assert all(backend.starts == 0 for backend in lower.arm_backends.values()) and guard.starts == 0
+        assert composition.perception_capture.profile.depth_roles == ("main",)
+        capture_registration, project_registration = session.contract_bundle.rgbd_geometry_registrations
+        roles = ("main", "wrist_left", "wrist_right")
+        assert set(capture_registration.skill.schema_entry.parameter_schema["properties"]["selected_roles"]["items"]["enum"]) == set(roles)
+        for registration in (capture_registration, project_registration):
+            route = registration.skill.routes[0]
+            assert route.control_effect_class == "read_only" and not route.may_move_robot
+            assert (registration.skill.definition.skill_id, registration.skill.definition.skill_version) in session.passive_read_executors_by_skill_ref
+
+        provider = session.perception_provider
+        monkeypatch.setattr(provider, "_current_station_revision", lambda: 0)
+        reads = []
+        now = time.time()
+        for name, source in provider.source_binding.camera_sources.items():
+            config = source.config
+            frame = VideoFrame(image=np.zeros((config.height, config.width, 3), np.uint8),
+                source_timestamp=now-.05, receive_timestamp=now-.05, available_timestamp=now-.049,
+                frame_index=3, metadata={"camera_key": name, "serial": config.serial, "source_generation": 1},
+                depth_image=np.full((config.height, config.width), 200, np.uint16),
+                depth_metadata={"aligned_to": "color", "depth_scale_m_per_unit": .001})
+            monkeypatch.setattr(source, "get_latest_frame", lambda frame=frame, name=name: reads.append(name) or frame)
+            info = {"running": True, "lifecycle_state": "running", "worker_alive": True,
+                "serial_number": config.serial, "generation": 1, "intrinsics": {
+                    "width": config.width, "height": config.height, "fx": 400., "fy": 400., "ppx": 320., "ppy": 240.}}
+            monkeypatch.setattr(source, "device_info", lambda info=info: info)
+        geometry = composition.rgb_camera_geometry
+        for age in (.20, .15, .10, .06):
+            geometry.publish_measured_qpos(qpos_by_side={arm: np.zeros(6) for arm in ("left", "right")},
+                measured_at=now-age, available_at=now-age+.001, evidence_refs=("measured:original",))
+        source_poses = {row["role"]: np.array(geometry.pose_cut(source_id=row["source_id"],
+            frame_acquired_at=now-.05, now=now).source_from_camera).reshape(4, 4)
+            for row in provider.aligned_rgbd_source_catalog()}
+        capture_executor, project_executor = session.rgbd_geometry_executors
+        readers = session.passive_read_executors_by_skill_ref
+        assert readers[("perception.back_project", "1")] is session.back_projection_executor
+        assert readers[("perception.back_project", "2")] is project_executor
+        operation_id = "observation:frozen-three-view"
+        captured = capture_executor._read(SimpleNamespace(parameters={"selected_roles": list(roles)},
+            expected_station_revision=0), SimpleNamespace(operation_id=operation_id))
+        completion = SimpleNamespace(accepted=True, operation=SimpleNamespace(
+            runtime_session_id="geometry:test", status="completed", execution_outcome="completed",
+            execution_result=captured.execution_result, output_artifact_bindings=captured.output_artifact_bindings))
+        monkeypatch.setattr(capture_executor, "completion_for", lambda _: completion)
+        monkeypatch.setattr(session.service.operation_store, "request_for_operation",
+                            lambda _: SimpleNamespace(client_id="rpent:test"))
+        views, _ = read_retained_grasp_observation(executor=capture_executor, operation_id=operation_id,
+            artifact_store=session.artifact_store, runtime_session_id="geometry:test", expected_station_revision=0,
+            frame_binding_hash=composition.perception_frame_binding.semantic_content_hash,
+            observation_slot="rgbd_observation", decode_arrays=True)
+        for _, metadata in views:
+            assert metadata["camera_pose"]["source_evidence_refs"]
+            assert "measured_qpos" not in metadata
+            if metadata["role"] != "main":
+                assert metadata["camera_pose"]["measured_at"] == now-.06
+                assert metadata["stationary_only"] is True
+        read_count = len(reads)
+        later = time.time()
+        geometry.publish_measured_qpos(qpos_by_side={arm: np.full(6, .1) for arm in ("left", "right")},
+            measured_at=later, available_at=later, evidence_refs=("measured:later",))
+        for role in roles:
+            result = project_executor._read(SimpleNamespace(client_id="rpent:test", parameters={
+                "observation_operation_id": operation_id, "role": role, "pixels_uv": [[320, 240]]}),
+                SimpleNamespace(operation_id="project:" + role))
+            expected_pose, _ = composition.perception_frame_binding.frame_graph.transform_pose_matrix(
+                source_poses[role], source_reference_frame_id=composition.perception_frame_binding.source_frame_id,
+                target_reference_frame_id=composition.perception_frame_binding.reference_frame_id)
+            expected = expected_pose @ np.array([0., 0., float(np.float32(.2)), 1.])
+            np.testing.assert_allclose(result.execution_result["points"][0]["point_reference_m"], expected[:3], atol=1e-9)
+        assert len(reads) == read_count == 3
+    finally:
+        session.close()
+
+
 def test_composition_advertises_right_gripper_without_starting_any_backend(monkeypatch):
     from agent_gateway.profiles.real.gripper_skill import ExclusiveRealGripperResources
 
@@ -592,6 +693,10 @@ def test_composition_opt_in_closes_v4_three_view_grasp_and_motion_routes(
     )
     session = composition.deployment.gateway_session
     try:
+        from dataclasses import replace
+
+        with pytest.raises(ValueError, match="point-grasp requires camera geometry"):
+            replace(composition, rgb_camera_geometry=None)
         routes = {
             entry.route.skill_id: entry.route.control_effect_class
             for entry in session.contract_bundle.route_manifest.skill_routes
@@ -653,7 +758,7 @@ def test_composition_opt_in_closes_v4_three_view_grasp_and_motion_routes(
             expected_reads.add("perception.capture_grasp_observation")
             assert routes["perception.capture_grasp_observation"] == "read_only"
             assert callable(session.station_point_grasp_provider.observation_reader)
-        assert set(session.passive_read_executors_by_skill_id) == expected_reads
+        assert {skill_id for skill_id, _version in session.passive_read_executors_by_skill_ref} == expected_reads
         assert session.owns_artifact_store is False
         assert composition.resources.artifact_store is session.artifact_store
         assert all(backend.starts == 0 for backend in lower.arm_backends.values())

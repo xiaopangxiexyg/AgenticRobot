@@ -74,6 +74,7 @@ from robot_motion.primitives import (
 )
 from teleop_runtime.skill_deploy.motion_port import RealAgentMotionPortConfig
 
+from .back_projection import RgbdGeometryRegistration
 from .grasp_approach_plan import (
     DEFAULT_REAL_GRASP_EXECUTION_OPERATION_TIMEOUT_SEC,
     REAL_AGENT_EXECUTE_GRASP_APPROACH_PLAN_EXECUTOR_ID_V1,
@@ -594,6 +595,7 @@ class RealAgentPrimitiveContractBundle:
     grasp_approach_plan_registration: RealGraspApproachPlanRegistration | None = None
     object_transport_registration: ObjectTransportRegistration | None = None
     gripper_contract: GripperSkillContractBundle | None = None
+    rgbd_geometry_registrations: tuple[RgbdGeometryRegistration, ...] = ()
 
     def __post_init__(self) -> None:
         validate_skill_route_catalog_closure(
@@ -603,6 +605,8 @@ class RealAgentPrimitiveContractBundle:
             io_catalog=self.io_catalog,
         )
         self.payload_validators.validate_manifest(self.route_manifest)
+        if self.rgbd_geometry_registrations and self.perception_capture is None:
+            raise ValueError("RGB-D geometry requires composed perception capture.")
         if self.gripper_contract is not None:
             if self.cardinal_profile.side != "right":
                 raise ValueError("Gripper v1 requires the bound right-arm session.")
@@ -779,6 +783,7 @@ class RealAgentPrimitiveContractBundle:
                 self.perception_capture is not None
                 and self.perception_capture.back_projection is not None
             )
+            + len(self.rgbd_geometry_registrations)
             + (3 if self.localization_registration is not None else 0)
             + int(self.segmentation_registration is not None)
             + int(self.placement_registration is not None)
@@ -1005,6 +1010,7 @@ def build_real_agent_primitive_contract_bundle(
     safety_envelope_refs: tuple[SkillDeploymentSafetyEnvelopeRef, ...],
     convergence_profile: RealAgentPrimitiveConvergenceProfile | None = None,
     perception_capture: RealPerceptionCaptureRegistration | None = None,
+    rgbd_geometry_registrations: tuple[RgbdGeometryRegistration, ...] = (),
     object_transport_registration: ObjectTransportRegistration | None = None,
     gripper_contract: GripperSkillContractBundle | None = None,
     localization_registration: RealObjectLocalizationRegistration | None = None,
@@ -1582,6 +1588,9 @@ def build_real_agent_primitive_contract_bundle(
         and perception_capture.back_projection is not None
     ):
         perception_registrations.append(perception_capture.back_projection.skill)
+    if rgbd_geometry_registrations and perception_capture is None:
+        raise ValueError("RGB-D geometry requires composed perception capture.")
+    perception_registrations.extend(item.skill for item in rgbd_geometry_registrations)
     if localization_registration is not None:
         assert station_point_grasp_registration is not None
         assert station_point_grasp_render_registration is not None
@@ -1729,6 +1738,10 @@ def build_real_agent_primitive_contract_bundle(
                     availability_hash=back_projection.availability_hash,
                 )
             )
+    for item in rgbd_geometry_registrations:
+        route_items.append(SkillRouteManifestEntry(
+            route=item.skill.routes[0], deployment_binding=item.binding.to_ref(),
+            evaluation_plan_hash=None, availability_hash=item.availability_hash))
     if localization_registration is not None:
         assert station_point_grasp_registration is not None
         assert station_point_grasp_render_registration is not None
@@ -1935,6 +1948,7 @@ def build_real_agent_primitive_contract_bundle(
                     ),
                 )
             ),
+            *(item.payload_validator for item in rgbd_geometry_registrations),
             *(
                 ()
                 if localization_registration is None
@@ -1995,6 +2009,7 @@ def build_real_agent_primitive_contract_bundle(
         attachment=attachment,
         tcp_pose_observe=tcp_pose_observe,
         perception_capture=perception_capture,
+        rgbd_geometry_registrations=rgbd_geometry_registrations,
         localization_registration=localization_registration,
         segmentation_registration=segmentation_registration,
         placement_registration=placement_registration,

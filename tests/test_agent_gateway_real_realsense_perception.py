@@ -125,6 +125,7 @@ class _RecordingRgbCameraGeometry:
 
     def __init__(self, *, failure: str | None = None) -> None:
         self.pose_cut_calls: list[tuple[str, float, float]] = []
+        self.stationary_cut_calls: list[tuple[str, float, float]] = []
         self.failure = failure
 
     @staticmethod
@@ -159,6 +160,11 @@ class _RecordingRgbCameraGeometry:
             geometry_cut_hash="geometry-cut:test",
             evidence_refs=("geometry-cut:test",),
         )
+
+    def stationary_geometry_cut(self, *, source_id, frame_acquired_at, now):
+        self.stationary_cut_calls.append((source_id, frame_acquired_at, now))
+        cut = self.pose_cut(source_id=source_id, frame_acquired_at=frame_acquired_at, now=now)
+        return cut, {side: np.zeros(6) for side in ("left", "right")}, cut.measured_at, cut.available_at, cut.evidence_refs
 
 
 def _provider(
@@ -490,6 +496,7 @@ def test_aligned_wrist_rgbd_uses_dynamic_geometry_from_the_same_frame_time() -> 
     )
 
     assert sources["left_wrist"].latest_frame_reads == 1
+    assert geometry.stationary_cut_calls == [("left_wrist", 9.97, 10.2)]
     assert geometry.pose_cut_calls == [("left_wrist", 9.97, 10.2)]
     assert capture.source_id == "left_wrist"
     assert capture.role == "wrist_left"

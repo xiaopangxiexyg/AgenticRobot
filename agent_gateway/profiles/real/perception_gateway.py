@@ -68,7 +68,12 @@ from agent_gateway.transport.unix_transport import (
 from agent_gateway.transport.wire_adapter import BoundAgentGatewayWireAdapter
 from dataset_contracts.canonical_encoding import canonical_content_hash
 
-from .back_projection import RealSenseBackProjectionCapturePort
+from .back_projection import (
+    RealSenseBackProjectionCapturePort,
+    RgbdGeometryRegistration,
+    build_rgbd_geometry_executors,
+    build_rgbd_geometry_registrations,
+)
 from .localization_deployment import RealObjectLocalizationRegistration
 from .localization_gateway import (
     ObjectLocalizationProvider,
@@ -129,6 +134,7 @@ class RealPerceptionContractBundle:
     frame_graph_hash: str
     tool_config_hash: str
     calibration_hash: str
+    rgbd_geometry_registrations: tuple[RgbdGeometryRegistration, ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.registration, RealPerceptionCaptureRegistration):
@@ -171,6 +177,7 @@ class RealPerceptionContractBundle:
             + int(self.segmentation_registration is not None)
             + int(self.station_point_grasp_registration is not None)
             + int(self.station_point_grasp_render_registration is not None)
+            + len(self.rgbd_geometry_registrations)
         )
         if len(self.route_manifest.skill_routes) != expected_routes:
             raise ValueError(
@@ -227,6 +234,8 @@ def build_real_perception_contract_bundle(
     station_point_grasp_render_registration: (
         StationBoundPointGraspRenderRegistration | None
     ) = None,
+    enable_back_projection: bool = False,
+    rgbd_roles: tuple[str, ...] | None = None,
 ) -> RealPerceptionContractBundle:
     """Build the passive-only manifest without starting a camera or socket."""
 
@@ -259,6 +268,14 @@ def build_real_perception_contract_bundle(
         raise ValueError(
             "Station point-grasp and candidate-render registrations must coexist."
         )
+    if not isinstance(enable_back_projection, bool):
+        raise TypeError("enable_back_projection must be boolean")
+    if enable_back_projection and rgbd_roles is None:
+        raise ValueError("RGB-D geometry requires the aligned source catalog roles")
+    geometry_registrations = (
+        build_rgbd_geometry_registrations(registration, roles=rgbd_roles)
+        if enable_back_projection else ()
+    )
     raw_pairs = [
         (
             registration.rgb,
@@ -283,6 +300,8 @@ def build_real_perception_contract_bundle(
                 registration.back_projection.availability_hash,
             )
         )
+
+    raw_pairs.extend((item.skill, item.binding, item.availability_hash) for item in geometry_registrations)
     if localization_registration is not None:
         raw_pairs.append(
             (
@@ -393,6 +412,8 @@ def build_real_perception_contract_bundle(
     optional_validators = []
     if registration.back_projection is not None:
         optional_validators.append(registration.back_projection.payload_validator)
+
+    optional_validators.extend(item.payload_validator for item in geometry_registrations)
     if localization_registration is not None:
         optional_validators.append(localization_registration.payload_validator)
     if segmentation_registration is not None:
@@ -425,6 +446,7 @@ def build_real_perception_contract_bundle(
         frame_graph_hash=_required(frame_graph_hash, field_name="frame_graph_hash"),
         tool_config_hash=_required(tool_config_hash, field_name="tool_config_hash"),
         calibration_hash=_required(calibration_hash, field_name="calibration_hash"),
+        rgbd_geometry_registrations=geometry_registrations,
     )
 
 
@@ -809,6 +831,7 @@ class RealPerceptionGatewaySession:
     station_point_grasp_render_executor: PassiveReadSkillExecutor | None
     hardware_view_provider: HardwareViewProvider
     service: AgentGatewayService
+    rgbd_geometry_executors: tuple[PassiveReadSkillExecutor, ...] = ()
     _close_lock: threading.Lock = field(default_factory=threading.Lock, init=False)
     _close_outcome: object | None = field(default=None, init=False)
 
@@ -874,6 +897,9 @@ class RealPerceptionGatewaySession:
             raise RuntimeError("Passive RGB reads did not quiesce during close.")
         if not self.depth_executor.wait_all(timeout_sec=5.0):
             raise RuntimeError("Passive depth reads did not quiesce during close.")
+        for executor in self.rgbd_geometry_executors:
+            if not executor.wait_all(timeout_sec=10.0):
+                raise RuntimeError("Passive RGB-D geometry did not quiesce during close.")
         if (
             self.back_projection_executor is not None
             and not self.back_projection_executor.wait_all(timeout_sec=5.0)
@@ -979,6 +1005,18 @@ def assemble_real_perception_gateway_session(
         ports[back_projection_registration.skill.routes[0].semantic_content_hash] = (
             back_projection_executor
         )
+
+    geometry_executors = ()
+    if bundle.rgbd_geometry_registrations:
+        geometry_executors = build_rgbd_geometry_executors(
+            registrations=bundle.rgbd_geometry_registrations, perception_provider=provider,
+            frame_binding=bundle.registration.frame_binding, artifact_store=artifact_store,
+            runtime_session_id=bundle.route_manifest.runtime_session_id,
+            current_station_revision=lambda: producer.current_station_revision,
+            max_retained_operations=max_retained_operations, clock=clock,
+            source_request_for_operation=lambda identifier: service.operation_store.request_for_operation(identifier))
+        ports.update((item.skill.routes[0].semantic_content_hash, executor)
+                     for item, executor in zip(bundle.rgbd_geometry_registrations, geometry_executors, strict=True))
     localization_executor = None
     if bundle.localization_registration is not None:
         if localization_provider is None:
@@ -1147,6 +1185,8 @@ def assemble_real_perception_gateway_session(
         camera_route_hashes.append(
             bundle.segmentation_registration.skill.routes[0].semantic_content_hash
         )
+
+    camera_route_hashes.extend(item.skill.routes[0].semantic_content_hash for item in bundle.rgbd_geometry_registrations)
     if bundle.station_point_grasp_registration is not None:
         camera_route_hashes.append(
             bundle.station_point_grasp_registration.skill.routes[
@@ -1237,6 +1277,7 @@ def assemble_real_perception_gateway_session(
         station_point_grasp_render_executor=station_point_grasp_render_executor,
         hardware_view_provider=hardware_view,
         service=service,
+        rgbd_geometry_executors=geometry_executors,
     )
 
 

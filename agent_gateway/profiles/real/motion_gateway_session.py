@@ -89,6 +89,7 @@ from teleop_runtime.skill_deploy.motion_port import (
     RealAgentMotionPort,
 )
 
+from .back_projection import build_rgbd_geometry_executors
 from .grasp_approach_plan import (
     BoundedRealGraspApproachPlanStore,
     RealGraspApproachPlanProvider,
@@ -683,6 +684,7 @@ class RealAgentPrimitiveGatewaySession:
     grasp_observation_executor: PassiveReadSkillExecutor | None = None
     object_transport_executor: PassiveReadSkillExecutor | None = None
     gripper_port: RealDmtacGripperControlPort | None = None
+    rgbd_geometry_executors: tuple[PassiveReadSkillExecutor, ...] = ()
     _close_lock: threading.Lock = field(default_factory=threading.Lock, init=False)
     _close_outcome: AgentGatewayOperationOutcome | None = field(
         default=None,
@@ -704,6 +706,8 @@ class RealAgentPrimitiveGatewaySession:
         ):
             raise ValueError("Composed gripper port and contract must coexist.")
         enabled = self.contract_bundle.perception_capture is not None
+        if len(self.rgbd_geometry_executors) != len(self.contract_bundle.rgbd_geometry_registrations):
+            raise ValueError("RGB-D geometry registration and executors disagree.")
         if enabled != (self.perception_provider is not None):
             raise ValueError("Real perception registration and provider disagree.")
         if enabled != (self.artifact_store is not None):
@@ -787,10 +791,10 @@ class RealAgentPrimitiveGatewaySession:
             raise TypeError("Real hardware view provider must be typed.")
 
     @property
-    def passive_read_executors_by_skill_id(
+    def passive_read_executors_by_skill_ref(
         self,
-    ) -> Mapping[str, PassiveReadSkillExecutor]:
-        """Return the live read-only executors under their public Skill ids."""
+    ) -> Mapping[tuple[str, str], PassiveReadSkillExecutor]:
+        """Return every read-only executor by public Skill id and version."""
 
         executors = {
             "perception.plan_object_move": self.object_transport_executor,
@@ -808,11 +812,18 @@ class RealAgentPrimitiveGatewaySession:
             ),
             "perception.plan_grasp_approach": self.grasp_approach_plan_executor,
         }
-        return {
-            skill_id: executor
-            for skill_id, executor in executors.items()
-            if executor is not None
+        geometry = {
+            (item.skill.definition.skill_id, item.skill.definition.skill_version): executor
+            for item, executor in zip(self.contract_bundle.rgbd_geometry_registrations,
+                                      self.rgbd_geometry_executors, strict=True)
         }
+        return {
+            (entry.route.skill_id, entry.route.skill_version): executors[entry.route.skill_id]
+            for entry in self.contract_bundle.route_manifest.skill_routes
+            if entry.route.skill_id in executors
+            and executors[entry.route.skill_id] is not None
+            and (entry.route.skill_id, entry.route.skill_version) not in geometry
+        } | geometry
 
     def wire_adapter(
         self,
@@ -916,6 +927,7 @@ class RealAgentPrimitiveGatewaySession:
                     (self.grasp_approach_plan_executor, 5.0),
                     (self.grasp_observation_executor, 5.0),
                     (self.object_transport_executor, 5.0),
+                    *((executor, 5.0) for executor in self.rgbd_geometry_executors),
                 )
             )
             segmentation_settled = (
@@ -1500,6 +1512,7 @@ def assemble_real_agent_primitive_gateway_session(
     grasp_approach_plan_executor = None
     grasp_observation_executor = None
     object_transport_executor = None
+    rgbd_geometry_executors = ()
     if perception_provider is not None and artifact_store is not None:
         registration = contract_bundle.perception_capture
         assert registration is not None
@@ -1609,6 +1622,19 @@ def assemble_real_agent_primitive_gateway_session(
             execution_port_by_route_hash[
                 placement_registration.skill.routes[0].semantic_content_hash
             ] = placement_executor
+
+        if contract_bundle.rgbd_geometry_registrations:
+            rgbd_geometry_executors = build_rgbd_geometry_executors(
+                registrations=contract_bundle.rgbd_geometry_registrations,
+                perception_provider=perception_provider, frame_binding=registration.frame_binding,
+                artifact_store=artifact_store, runtime_session_id=contract_bundle.attachment.runtime_session_id,
+                current_station_revision=lambda: producer.current_station_revision,
+                max_retained_operations=max_retained_operations, clock=clock,
+                source_request_for_operation=lambda identifier: service.operation_store.request_for_operation(identifier))
+            execution_port_by_route_hash.update(
+                (item.skill.routes[0].semantic_content_hash, executor)
+                for item, executor in zip(contract_bundle.rgbd_geometry_registrations,
+                                          rgbd_geometry_executors, strict=True))
         if contract_bundle.localization_registration is not None:
             assert localization_provider is not None
             assert station_point_grasp_planner is not None
@@ -1912,6 +1938,7 @@ def assemble_real_agent_primitive_gateway_session(
         service=service,
         grasp_observation_executor=grasp_observation_executor,
         object_transport_executor=object_transport_executor,
+        rgbd_geometry_executors=rgbd_geometry_executors,
     )
 
 

@@ -69,6 +69,17 @@ def encode_grasp_multiview_snapshot(
 
 
 def decode_grasp_multiview_snapshot(data: bytes) -> tuple[list[bytes], dict, np.ndarray | None, np.ndarray | None]:
+    views, metadata, points, labels, _ = _decode_multiview(data)
+    return views, metadata, points, labels
+
+
+def decode_grasp_multiview_snapshot_arrays(data: bytes) -> tuple[list[tuple[dict, dict]], dict, np.ndarray | None, np.ndarray | None]:
+    """Return the arrays already validated by the shared decoder, not a second NPZ decode."""
+    _, metadata, points, labels, decoded = _decode_multiview(data)
+    return decoded, metadata, points, labels
+
+
+def _decode_multiview(data: bytes):
     if not 0 < len(data) <= GRASP_MULTIVIEW_MAX_BYTES:
         raise ValueError("Multi-view observation exceeds its byte bound")
     with zipfile.ZipFile(io.BytesIO(data)) as archive:
@@ -90,9 +101,10 @@ def decode_grasp_multiview_snapshot(data: bytes) -> tuple[list[bytes], dict, np.
         if not isinstance(metadata, dict) or metadata.get("schema_id") != GRASP_MULTIVIEW_SCHEMA_ID:
             raise ValueError("Invalid multi-view observation schema")
         views = [archive.read(name) for name in view_names]
-        roles = []
+        roles, decoded = [], []
         for view in views:
-            _, view_metadata = decode_grasp_rgbd_snapshot(view)
+            arrays, view_metadata = decode_grasp_rgbd_snapshot(view)
+            decoded.append((arrays, view_metadata))
             roles.append(view_metadata.get("role"))
         if (any(not isinstance(role, str) or not role for role in roles)
                 or len(set(roles)) != len(roles)):
@@ -104,4 +116,4 @@ def decode_grasp_multiview_snapshot(data: bytes) -> tuple[list[bytes], dict, np.
             if (labels.shape != (len(points),) or not np.all(np.isfinite(points))
                     or not np.any(labels)):
                 raise ValueError("Invalid retained multi-view scene")
-        return views, metadata, points, labels
+        return views, metadata, points, labels, decoded
