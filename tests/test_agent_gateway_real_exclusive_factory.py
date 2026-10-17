@@ -605,3 +605,119 @@ def test_control_fault_retains_typed_cause_without_misclassifying_other_faults(
     application._run_control_loop()
     assert holds == [expected_prefix + ": native cause with new line"]
     assert isinstance(application.control_fault, error_type)
+
+
+@pytest.mark.parametrize("with_grippers", [False, True])
+@pytest.mark.parametrize("with_udp", [False, True])
+@pytest.mark.parametrize("guard_failures", [3, 4])
+@pytest.mark.parametrize("entry", ["start", "serve_forever"])
+def test_application_partial_resource_start_failure_retries_the_same_owner(with_grippers, with_udp, guard_failures, entry):
+    from types import SimpleNamespace
+    from agent_gateway.profiles.real.gripper_skill import ExclusiveRealGripperResources, RealDmtacGripperControlPort
+    from teleop_runtime.skill_deploy.control_runtime import RealSkillControlLifecycle
+    from tests.test_agent_gateway_gripper_skill import _FakeDmtacBackend
+    from tests.test_real_skill_deploy_rm65_ports import _ports
+
+    lower, backends, _ = _ports(force_guard_ready=False, force_guard_close_failures=guard_failures)
+    guard = lower.position_force_guard
+    receiver_closes = []
+    receiver = SimpleNamespace(start=lambda: None, wait_ready=lambda **kwargs: None,
+        close=lambda: receiver_closes.append("closed"), diagnostics=lambda: {"transport": "udp"})
+    if with_udp:
+        lower.udp_feedback = receiver
+    hands = {}
+    if with_grippers:
+        backend = _FakeDmtacBackend()
+        hands["right_gripper"] = RealDmtacGripperControlPort(backend=backend)
+    resources = ExclusiveRealGripperResources(lower=lower, port=hands["right_gripper"]) if with_grippers else lower
+    holds = []
+    deployment = _deployment(observation_provider=_fresh_observation_cut, hold_reasons=holds,
+        gripper_port=hands.get("right_gripper"))
+    def no_server():
+        pytest.fail("partial startup must never publish transport")
+    app = ExclusiveRealSkillApplication(deployment=deployment, resources=resources,
+        startup_admission=lambda: pytest.fail("partial startup must not reach admission"),
+        server_factory=no_server)
+    with pytest.raises(RuntimeError, match="startup rollback incomplete"):
+        getattr(app, entry)()
+    assert app.state == ExclusiveRealSkillApplicationState.FAULT
+    assert lower.resources_closed is False
+    assert guard.closes >= 2  # The application retains and retries partial acquisition.
+    assert all(backend.closes == 0 for backend in backends.values())
+    assert receiver_closes == []
+    assert app.resources is resources
+    assert lower.position_force_guard is guard
+    assert deployment.control_runtime.lifecycle == RealSkillControlLifecycle.CREATED
+    assert deployment.control_runtime.last_hold_receipt is None
+    assert holds == []
+    with pytest.raises(RuntimeError, match="starts once"):
+        app.start()
+    while guard.closes < guard_failures:
+        with pytest.raises(RuntimeError, match="force_guard"):
+            app.close()
+        assert app.state == ExclusiveRealSkillApplicationState.FAULT
+        assert all(backend.closes == 0 for backend in backends.values())
+        assert receiver_closes == []
+    app.close()
+    app.close()
+    assert app.state == ExclusiveRealSkillApplicationState.CLOSED
+    assert lower.resources_closed is True
+    assert guard.starts == 1 and guard.closes == guard_failures + 1
+    assert all(backend.closes == 1 for backend in backends.values())
+    assert all(len(backend.holds) == 2 for backend in backends.values())
+    assert receiver_closes == (["closed"] if with_udp else [])
+    assert holds == []
+    assert deployment.control_runtime.last_hold_receipt is None
+    assert all(port.backend.events == port.backend.commands == [] for port in hands.values())
+
+
+
+def test_application_close_waits_for_the_inflight_resource_start():
+    entered, release, start_returned = threading.Event(), threading.Event(), threading.Event()
+    close_entered, close_finished = threading.Event(), threading.Event()
+    class Resources(_Resources):
+        def start(self):
+            entered.set()
+            assert release.wait(3.)
+            super().start()
+            start_returned.set()
+        def close(self):
+            assert start_returned.is_set()
+            super().close()
+    resources = Resources()
+    deployment = _deployment(observation_provider=_fresh_observation_cut, hold_reasons=[])
+    app = ExclusiveRealSkillApplication(deployment=deployment, resources=resources,
+        startup_admission=lambda: {"startup": "admitted"}, server_factory=_Server)
+    errors = []
+    def start():
+        try:
+            app.start()
+        except BaseException as error:
+            errors.append(error)
+    def close():
+        close_entered.set()
+        try:
+            app.close()
+        except BaseException as error:
+            errors.append(error)
+        finally:
+            close_finished.set()
+    starter, closer = threading.Thread(target=start), threading.Thread(target=close)
+    starter.start()
+    try:
+        assert entered.wait(2.)
+        closer.start()
+        assert close_entered.wait(2.)
+        assert not close_finished.wait(.05)
+        assert resources.closes == 0
+    finally:
+        release.set()
+        starter.join(timeout=5.)
+        if closer.ident is not None:
+            closer.join(timeout=5.)
+        if not starter.is_alive() and not closer.is_alive():
+            app.close()
+    assert not starter.is_alive() and not closer.is_alive()
+    assert errors == []
+    assert app.state == ExclusiveRealSkillApplicationState.CLOSED
+    assert resources.starts == resources.closes == 1

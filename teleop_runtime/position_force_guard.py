@@ -16,6 +16,8 @@ import argparse
 import math
 import sys
 import threading
+
+from utils.owned_thread import OwnedThread
 import time
 from dataclasses import dataclass
 from typing import Any, Callable, Mapping
@@ -200,8 +202,8 @@ class PositionForceGuardMonitor:
         self._ready_by_side = {
             side: threading.Event() for side in self._readers
         }
-        self._threads: list[threading.Thread] = []
-        self._watchdog_thread: threading.Thread | None = None
+        self._threads: list[OwnedThread] = []
+        self._watchdog_thread: OwnedThread | None = None
         self._last_reading_by_side: dict[str, PositionForceReading] = {}
         self._last_success_monotonic_by_side: dict[str, float] = {}
         self._reader_inflight_since_by_side: dict[str, float] = {}
@@ -372,15 +374,15 @@ class PositionForceGuardMonitor:
         self._stop_event.clear()
         self._stale_watchdog_armed.clear()
         for side, reader in self._readers.items():
-            thread = threading.Thread(
+            thread = OwnedThread(
                 target=self._poll_loop,
                 args=(side, reader),
                 daemon=True,
                 name=f"rm65_position_force_guard_{side}",
             )
-            thread.start()
             self._threads.append(thread)
-        self._watchdog_thread = threading.Thread(
+            thread.start()
+        self._watchdog_thread = OwnedThread(
             target=self._watchdog_loop,
             daemon=True,
             name="rm65_position_force_guard_watchdog",
@@ -526,17 +528,10 @@ class PositionForceGuardMonitor:
         self._stop_event.set()
         old_threads = tuple(self._threads)
         old_watchdog = self._watchdog_thread
-        for thread in old_threads:
-            thread.join(timeout=1.0)
-        if old_watchdog is not None:
-            old_watchdog.join(timeout=1.0)
         alive = [
             thread.name
-            for thread in (
-                *old_threads,
-                *((old_watchdog,) if old_watchdog is not None else ()),
-            )
-            if thread.is_alive()
+            for thread in (*old_threads, *((old_watchdog,) if old_watchdog is not None else ()))
+            if not thread.join_and_confirm(timeout=1.0)
         ]
         if alive:
             raise RuntimeError(
@@ -570,20 +565,18 @@ class PositionForceGuardMonitor:
 
     def close(self) -> None:
         self._stop_event.set()
-        for thread in tuple(self._threads):
-            thread.join(timeout=1.0)
-        watchdog = self._watchdog_thread
-        if watchdog is not None:
-            watchdog.join(timeout=1.0)
-        alive = [
-            thread.name
-            for thread in (*self._threads, *((watchdog,) if watchdog is not None else ()))
-            if thread.is_alive()
+        remaining = [
+            thread for thread in tuple(self._threads)
+            if not thread.join_and_confirm(timeout=1.0)
         ]
-        self._threads = [thread for thread in self._threads if thread.is_alive()]
-        self._watchdog_thread = (
-            watchdog if watchdog is not None and watchdog.is_alive() else None
-        )
+        watchdog = self._watchdog_thread
+        if watchdog is not None and watchdog.join_and_confirm(timeout=1.0):
+            self._watchdog_thread = None
+        self._threads = remaining
+        alive = [thread.name for thread in (
+            *remaining,
+            *((self._watchdog_thread,) if self._watchdog_thread is not None else ()),
+        )]
         if alive:
             raise RuntimeError(
                 "position force guard worker(s) did not stop within 1.000s: "

@@ -964,20 +964,44 @@ class RealAgentPrimitiveGatewaySession:
                     )
                 executor.close_after_hold(hold_receipt=executor_receipt)
                 self._closed_executor_ids.add(executor_id)
-            if (
-                self.owns_artifact_store
-                and self.artifact_store is not None
-                and not self._artifact_store_closed
-            ):
-                self.artifact_store.close()
-                self._artifact_store_closed = True
-            if (
-                self.grasp_approach_plan_store is not None
-                and not self._grasp_approach_plan_store_closed
-            ):
-                self.grasp_approach_plan_store.close()
-                self._grasp_approach_plan_store_closed = True
+            self._close_owned_stores()
             return outcome
+
+
+    def close_unused(self) -> None:
+        """Release construction-only resources after permanently sealing admission.
+
+        The application calls this only before any control-start attempt or
+        transport exposure. No result from here is a lower HOLD receipt.
+        """
+
+        with self._close_lock:
+            self.service.fence_if_unused()
+            for executor in self.passive_read_executors_by_skill_ref.values():
+                if not executor.wait_all(timeout_sec=0.0):
+                    raise RuntimeError("Unused Gateway still has a passive reader.")
+            for executor in self.executors_by_skill_id.values():
+                executor_id = id(executor)
+                if executor_id not in self._closed_executor_ids:
+                    executor.close_unused()
+                    self._closed_executor_ids.add(executor_id)
+            self._close_owned_stores()
+
+
+    def _close_owned_stores(self) -> None:
+        if (
+            self.owns_artifact_store
+            and self.artifact_store is not None
+            and not self._artifact_store_closed
+        ):
+            self.artifact_store.close()
+            self._artifact_store_closed = True
+        if (
+            self.grasp_approach_plan_store is not None
+            and not self._grasp_approach_plan_store_closed
+        ):
+            self.grasp_approach_plan_store.close()
+            self._grasp_approach_plan_store_closed = True
 
 
 def _real_motion_resource_health(

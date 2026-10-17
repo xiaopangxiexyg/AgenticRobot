@@ -21,6 +21,7 @@ import numpy as np
 
 from dataset_contracts.canonical_encoding import canonical_content_hash
 from hardware.rm65.realtime_feedback import RM65UDPFeedbackReceiver
+from utils.owned_thread import OwnedThread
 from robot_motion.runtime import TeleopCommand, TeleopObservation
 from teleop_runtime.deploy.arm_safety_runtime import (
     bimanual_emergency_stop,
@@ -391,7 +392,7 @@ class ExclusiveRM65SkillDeployPorts:
         self._measurement_lock = threading.Lock()
         self._measurement_read_lock = threading.Lock()
         self._measurement_stop = threading.Event()
-        self._measurement_thread: threading.Thread | None = None
+        self._measurement_thread: OwnedThread | None = None
         self._latest_observation_cut: RealSkillMotionObservationCut | None = None
         self._measurement_fault: str | None = None
         self._measurement_sample_count = 0
@@ -756,7 +757,7 @@ class ExclusiveRM65SkillDeployPorts:
 
         initial = self._read_hardware_cut()
         self._publish_measurement_sample(initial)
-        thread = threading.Thread(
+        thread = OwnedThread(
             target=self._run_measurement_sampler,
             name="exclusive-rm65-measurement-sampler",
             daemon=False,
@@ -861,8 +862,9 @@ class ExclusiveRM65SkillDeployPorts:
         thread = self._measurement_thread
         if thread is None or thread is threading.current_thread():
             return thread is None
-        thread.join(timeout=max(1.0, 4.0 / self.profile.state_refresh_hz))
-        return not thread.is_alive()
+        return thread.join_and_confirm(
+            timeout=max(1.0, 4.0 / self.profile.state_refresh_hz)
+        )
 
     def _shutdown_measurement_refresh_executor(self) -> None:
         if self._measurement_refresh_executor_shutdown:

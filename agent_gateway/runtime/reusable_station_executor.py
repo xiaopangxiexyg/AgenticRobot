@@ -280,6 +280,16 @@ class ReusableStationAgentSkillOperationExecutor:
             self._idle_hold_receipts.append(receipt)
         return receipt
 
+    def close_unused(self) -> None:
+        """Seal a route that has never acquired a worker; certify no HOLD."""
+
+        with self._condition:
+            if self._active_worker is not None or self._retired_workers:
+                raise RuntimeError("Route has acquired a worker; lower HOLD remains required.")
+            self._closed = True
+            self._condition.notify_all()
+
+
     def close_after_hold(
         self,
         *,

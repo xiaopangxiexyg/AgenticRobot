@@ -1516,6 +1516,15 @@ class AgentGatewayService:
             use_hold=use_hold,
         )
 
+    def fence_if_unused(self) -> None:
+        """Seal an unused service without requesting or certifying lower HOLD."""
+
+        with self._close_lock, self._admission_lock:
+            self._closed = True
+            if self.operation_store.total_admitted != 0:
+                raise RuntimeError("Gateway has admitted work; lower HOLD remains required.")
+
+
     def close(
         self,
         *,

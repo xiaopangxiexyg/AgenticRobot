@@ -11,6 +11,8 @@ from enum import Enum
 from typing import Protocol
 
 from teleop_runtime.deploy.dispatch import PositionDispatchNotReady
+from teleop_runtime.skill_deploy.control_runtime import RealSkillControlLifecycle
+from utils.owned_thread import OwnedThread
 
 from .exclusive_factory import ExclusiveRealAgentPrimitiveDeployment
 
@@ -92,10 +94,10 @@ class ExclusiveRealSkillApplication:
         self.server_factory = server_factory
         self.config = config or ExclusiveRealSkillApplicationConfig()
         self._lock = threading.RLock()
-        self._close_lock = threading.Lock()
+        self._close_lock = threading.RLock()
         self._state = ExclusiveRealSkillApplicationState.CREATED
         self._server: ExclusiveRealSkillServer | None = None
-        self._control_thread: threading.Thread | None = None
+        self._control_thread: OwnedThread | None = None
         self._control_stop = threading.Event()
         self._serving = threading.Event()
         self._control_fault: BaseException | None = None
@@ -103,6 +105,8 @@ class ExclusiveRealSkillApplication:
         self._control_runtime_closed = False
         self._server_closed = False
         self._resources_closed = False
+        self._resources_start_attempted = False
+        self._control_runtime_start_attempted = False
 
     @property
     def state(self) -> ExclusiveRealSkillApplicationState:
@@ -120,19 +124,24 @@ class ExclusiveRealSkillApplication:
             return self._startup_admission_receipt
 
     def start(self) -> None:
+        """Serialize startup and shutdown while preserving partial acquisition."""
+
+        with self._close_lock:
+            self._start_locked()
+
+    def _start_locked(self) -> None:
         """Pass lower startup admission before publishing or exposing transport."""
 
         with self._lock:
-            if self._state != ExclusiveRealSkillApplicationState.CREATED:
+            if (self._state != ExclusiveRealSkillApplicationState.CREATED
+                    or self._resources_start_attempted):
                 raise RuntimeError("exclusive real Skill application starts once.")
-        resources_started = False
-        runtime_started = False
+            self._resources_start_attempted = True
         server: ExclusiveRealSkillServer | None = None
         try:
             self.resources.start()
-            resources_started = True
+            self._control_runtime_start_attempted = True
             self.deployment.control_runtime.start()
-            runtime_started = True
             startup_receipt = self.startup_admission()
             if startup_receipt is None:
                 raise RuntimeError(
@@ -152,7 +161,7 @@ class ExclusiveRealSkillApplication:
             for name in ("serve_forever", "shutdown", "server_close"):
                 if not callable(getattr(server, name, None)):
                     raise TypeError(f"server must expose {name}.")
-            thread = threading.Thread(
+            thread = OwnedThread(
                 target=self._run_control_loop,
                 name="exclusive-real-skill-control",
                 daemon=False,
@@ -164,7 +173,7 @@ class ExclusiveRealSkillApplication:
             thread.start()
         except Exception as start_error:
             cleanup_errors: list[str] = []
-            if runtime_started:
+            if self._control_runtime_start_attempted:
                 try:
                     self.deployment.control_runtime.fail_closed(
                         "exclusive_skill_application_start_failed"
@@ -183,15 +192,13 @@ class ExclusiveRealSkillApplication:
                     cleanup_errors.append(
                         f"startup_close:{type(error).__name__}:{error}"
                     )
-            elif resources_started:
+            elif self._resources_start_attempted:
                 try:
-                    self.resources.close()
+                    self.close()
                 except Exception as error:  # noqa: BLE001 - preserve cleanup for retry.
                     cleanup_errors.append(
-                        f"resources_close:{type(error).__name__}:{error}"
+                        f"startup_close:{type(error).__name__}:{error}"
                     )
-                else:
-                    self._resources_closed = True
             with self._lock:
                 self._state = ExclusiveRealSkillApplicationState.FAULT
             if cleanup_errors:
@@ -292,13 +299,22 @@ class ExclusiveRealSkillApplication:
             errors: list[str] = []
             gateway_closed = False
             try:
-                gateway_outcome = self.deployment.gateway_session.close()
-                gateway_closed = gateway_outcome.accepted
-                if not gateway_closed:
-                    errors.append(
-                        "gateway_close_not_confirmed:"
-                        + gateway_outcome.reason_code
-                    )
+                if not self._control_runtime_start_attempted:
+                    if (self.deployment.control_runtime.lifecycle != RealSkillControlLifecycle.CREATED
+                            or server is not None or thread is not None
+                            or self._serving.is_set()
+                            or self._startup_admission_receipt is not None):
+                        raise RuntimeError("Unstarted application acquisition facts disagree.")
+                    self.deployment.gateway_session.close_unused()
+                    gateway_closed = True
+                else:
+                    gateway_outcome = self.deployment.gateway_session.close()
+                    gateway_closed = gateway_outcome.accepted
+                    if not gateway_closed:
+                        errors.append(
+                            "gateway_close_not_confirmed:"
+                            + gateway_outcome.reason_code
+                        )
             except Exception as exc:  # noqa: BLE001 - keep retryable owner state.
                 errors.append(f"gateway_close:{type(exc).__name__}:{exc}")
 
@@ -306,7 +322,7 @@ class ExclusiveRealSkillApplication:
             # An already-running cycle may finish before the runtime cycle lock
             # establishes the barrier.
             self._control_stop.set()
-            if not self._control_runtime_closed:
+            if self._control_runtime_start_attempted and not self._control_runtime_closed:
                 try:
                     self.deployment.control_runtime.close()
                 except Exception as exc:  # noqa: BLE001 - retry on next close.
@@ -325,8 +341,7 @@ class ExclusiveRealSkillApplication:
                 control_thread_stopped = False
                 errors.append("control_thread_cannot_join_itself")
             elif thread is not None:
-                thread.join(timeout=self.config.control_join_timeout_sec)
-                if thread.is_alive():
+                if not thread.join_and_confirm(timeout=self.config.control_join_timeout_sec):
                     control_thread_stopped = False
                     errors.append("control_thread_join_timeout")
 
@@ -341,7 +356,9 @@ class ExclusiveRealSkillApplication:
 
             prerequisites_closed = (
                 gateway_closed
-                and self._control_runtime_closed
+                # An unacquired control stage has no attachment or HOLD
+                # receipt. Resource rollback remains its own shutdown owner.
+                and (not self._control_runtime_start_attempted or self._control_runtime_closed)
                 and control_thread_stopped
                 and server_closed
             )

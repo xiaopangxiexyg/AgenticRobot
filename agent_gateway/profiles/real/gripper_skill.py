@@ -354,16 +354,16 @@ class ExclusiveRealGripperResources:
             )
         self.lower = lower
         self.port = port
-        self._lower_started = False
+        self._lower_start_attempted = False
         self._hand_attempted = False
         self._hand_closed = False
         self._lower_closed = False
 
     def start(self) -> None:
-        if self._lower_started or self._hand_attempted:
+        if self._lower_start_attempted or self._hand_attempted:
             raise RuntimeError("Gripper application resources start once.")
+        self._lower_start_attempted = True
         self.lower.start()
-        self._lower_started = True
         self._hand_attempted = True
         try:
             self.port.backend.start()
@@ -387,7 +387,7 @@ class ExclusiveRealGripperResources:
         if self._hand_attempted and not self._hand_closed:
             self.port.backend.close()
             self._hand_closed = True
-        if self._lower_started and not self._lower_closed:
+        if self._lower_start_attempted and not self._lower_closed:
             self.lower.close()
             self._lower_closed = True
 
