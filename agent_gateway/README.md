@@ -579,6 +579,15 @@ python -m agent_gateway real-perception \
   --graspgenx-source-root /absolute/AgenticRobot/model/perception/graspgenx
 ```
 
+SAM2 掩码边界仅扫描行列占用，保持原来的半开区间和空掩码结果，避免展开所有前景像素坐标。
+同一模型 owner 在既有锁内最多保留一份精确 RGB 身份及其 DINO 预处理输入；检测框、完整文本掩码
+和点选共用这条路径。像素或尺寸变化、编码失败及关闭会使旧输入失效，每个新提示仍重新执行预测，
+掩码、检测结果、深度与机器人状态不作缓存；已有分数、二值掩码及点选包含关系校验保留。
+DINO 输入额外常驻量受原有 800/1333 resize 限制，float32 至多约 12.2 MiB；新帧和首次推理不承诺加速。
+DINO 模型在首次文本推理时绑定所解析的物理设备，后续复用官方 predict，避免重复遍历 model.to；
+关闭时由同一 owner 释放引用。权重、精度、阈值和输入 tensor 的官方迁移路径保持不变。
+localize 的 last_call_timing_ms 仅报告当前调用的锁等待和推理阶段耗时，不构成控制或测量时间依据。
+
 ### 可选 SAM3 服务：文本目标与图片点选
 
 `real-rm65` 和 `real-perception` 的 `--object-localization-backend` 默认仍为

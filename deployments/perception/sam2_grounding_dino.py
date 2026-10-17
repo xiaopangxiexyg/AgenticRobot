@@ -9,9 +9,11 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import logging
 import math
 import subprocess
 import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -26,6 +28,7 @@ GROUNDING_DINO_GIT_URL = "https://github.com/IDEA-Research/GroundingDINO.git"
 SAM2_REVIEWED_REVISION = "aa9b8722d0585b661ded4b3dff1bd103540554ae"
 GROUNDING_DINO_REVIEWED_REVISION = "856dde20aee659246248e20734ef9ba5214f5e44"
 MODEL_ASSET_MANIFEST_SCHEMA_V1 = "dexteleop.perception_model_assets.v1"
+_LOG = logging.getLogger(__name__)
 
 
 class Sam2PointMaskUnavailable(RuntimeError):
@@ -450,15 +453,49 @@ def _sam_binary_mask(mask: object) -> np.ndarray:
 
 
 def _mask_box(mask: np.ndarray) -> tuple[int, int, int, int] | None:
-    rows, columns = np.nonzero(np.asarray(mask, dtype=bool))
+    foreground = np.asarray(mask, dtype=bool)
+    if foreground.ndim != 2:
+        raise ValueError("SAM2 mask must be two-dimensional.")
+    # Only the occupied axes are needed, not two coordinates per foreground pixel.
+    rows = np.flatnonzero(foreground.any(axis=1))
+    columns = np.flatnonzero(foreground.any(axis=0))
     if not len(columns):
         return None
     return (
-        int(columns.min()),
-        int(rows.min()),
-        int(columns.max()) + 1,
-        int(rows.max()) + 1,
+        int(columns[0]),
+        int(rows[0]),
+        int(columns[-1]) + 1,
+        int(rows[-1]) + 1,
     )
+
+
+class _DeviceBoundGroundingPredictor:
+    """Reuse reviewed predict without walking model.to on every request.
+
+    The localizer's model lock serializes calls. Keep placement lazy so a
+    point-only/SAM-only session does not allocate unused DINO GPU weights.
+    """
+
+    def __init__(self, model: Any, predict: Any, device: str) -> None:
+        self._model = model
+        self._predict = predict
+        self._configured_device = device
+        self._device: Any = None
+
+    def to(self, device: Any) -> Any:
+        # Reviewed predict calls .to() before using the real module. Return
+        # that same module, with no model copy or replacement inference code.
+        if self._device is None or device != self._device:
+            raise ValueError("Grounding DINO predictor is bound to its session device.")
+        return self._model
+
+    def __call__(self, **parameters: Any) -> Any:
+        if self._device is None:
+            self._model = self._model.to(self._configured_device)
+            # Resolve aliases such as 'cuda' once. Input tensors must keep
+            # using that physical device even on another executor thread.
+            self._device = next(self._model.parameters()).device
+        return self._predict(model=self, device=self._device, **parameters)
 
 
 class Sam2GroundingDinoLocalizer:
@@ -496,9 +533,11 @@ class Sam2GroundingDinoLocalizer:
         self._closed = False
         self._automatic_generator: Any = None
         self._predictor: Any = None
-        self._grounding_model: Any = None
+        self._encoded_image: np.ndarray | None = None
+        self._grounding_input: Any = None
         self._grounding_predict: Any = None
         self._grounding_transform: Any = None
+        self._last_call_timing_ms: dict[str, float] = {}
 
     @property
     def semantic_content_hash(self) -> str:
@@ -577,12 +616,13 @@ class Sam2GroundingDinoLocalizer:
                 raise RuntimeError(
                     "Grounding DINO model config is absent from the installed source package."
                 )
-            self._grounding_model = load_model(
+            grounding_model = load_model(
                 str(grounding_config),
                 str(self.model_spec.grounding_dino_checkpoint_path),
                 device=self.device,
             )
-            self._grounding_predict = predict
+            self._grounding_predict = _DeviceBoundGroundingPredictor(
+                grounding_model, predict, self.device)
             self._grounding_transform = grounding_transforms.Compose(
                 [
                     grounding_transforms.RandomResize([800], max_size=1333),
@@ -599,7 +639,8 @@ class Sam2GroundingDinoLocalizer:
         with self._lock:
             self._automatic_generator = None
             self._predictor = None
-            self._grounding_model = None
+            self._encoded_image = None
+            self._grounding_input = None
             self._grounding_predict = None
             self._grounding_transform = None
             self._closed = True
@@ -620,20 +661,43 @@ class Sam2GroundingDinoLocalizer:
             or max_detections <= 0
         ):
             raise ValueError("max_detections must be positive.")
+        started = time.perf_counter()
         rgb = image.convert("RGB")
         array = np.array(rgb, dtype=np.uint8, copy=True, order="C")
+        lock_started = time.perf_counter()
         with self._lock:
             if not self._started or self._closed:
                 raise RuntimeError("Object-localization model is not running.")
-            if language_prompt is None:
-                detections = self._automatic(array)
-            else:
-                detections = self._grounded(rgb, array, language_prompt)
-        return _bounded_nms(
-            detections,
-            threshold=self.nms_iou_threshold,
-            maximum=max_detections,
-        )
+            timings = {"lock_wait": (time.perf_counter() - lock_started) * 1000.}
+            try:
+                if language_prompt is None:
+                    stage = time.perf_counter()
+                    detections = self._automatic(array)
+                    timings["automatic_masks"] = (time.perf_counter()-stage)*1000.
+                else:
+                    detections = self._grounded(rgb, array, language_prompt, timings=timings)
+                return _bounded_nms(detections, threshold=self.nms_iou_threshold, maximum=max_detections)
+            finally:
+                timings["total"] = (time.perf_counter()-started)*1000.
+                self._last_call_timing_ms = dict(timings)
+                _LOG.info("Localization model timing_ms=%s", timings)
+
+    @property
+    def last_call_timing_ms(self) -> dict[str, float]:
+        with self._lock:
+            return dict(self._last_call_timing_ms)
+
+    def _set_prediction_image(self, array: np.ndarray) -> None:
+        """Reuse only exact RGB pixels on the existing locked predictor.
+
+        Masks/prompts/depth and robot state are never cached. Keep one entry,
+        owned by the model lifecycle, instead of restoring private SAM2 state.
+        """
+        if self._encoded_image is None or not np.array_equal(array, self._encoded_image):
+            self._encoded_image = None
+            self._grounding_input = None
+            self._predictor.set_image(array)
+            self._encoded_image = array.copy()
 
     def segment_point(
         self, image: Image.Image, *, pixel_uv: tuple[int, int]
@@ -708,7 +772,7 @@ class Sam2GroundingDinoLocalizer:
             u, v = pixel_uv
             if not (0 <= u < rgb.width and 0 <= v < rgb.height):
                 raise ValueError("pixel_uv is outside the image.")
-            self._predictor.set_image(array)
+            self._set_prediction_image(array)
             masks, scores, _logits = self._predictor.predict(
                 point_coords=np.asarray([[u, v]], dtype=np.float32),
                 point_labels=np.asarray([1], dtype=np.int32),
@@ -763,23 +827,61 @@ class Sam2GroundingDinoLocalizer:
                 )
         return result
 
+    def _grounded_predictions(
+        self,
+        image: Image.Image,
+        array: np.ndarray,
+        language_prompt: str,
+        *,
+        timings: dict[str, float],
+    ) -> tuple[Any, Any, Any]:
+        """Share source input reuse across the current box and mask interfaces.
+
+        Callers hold the existing model lock. Every caption still runs inference;
+        the single input key is published only after SAM image encoding succeeds.
+        """
+        started = time.perf_counter()
+        reuse_image = (self._grounding_input is not None and self._encoded_image is not None
+                       and np.array_equal(array, self._encoded_image))
+        if reuse_image:
+            transformed = self._grounding_input
+        else:
+            self._grounding_input = None
+            transformed, _target = self._grounding_transform(image, None)
+        timings["text_image_preprocessing"] = (time.perf_counter()-started)*1000.
+        started = time.perf_counter()
+        boxes, logits, phrases = self._grounding_predict(
+            image=transformed,
+            caption=language_prompt,
+            box_threshold=self.box_threshold,
+            text_threshold=self.text_threshold,
+        )
+        timings["grounding_dino"] = (time.perf_counter()-started)*1000.
+        if not len(boxes) == len(logits) == len(phrases):
+            raise RuntimeError("Grounding DINO returned inconsistent detection arrays.")
+        if len(boxes):
+            started = time.perf_counter()
+            if not reuse_image:
+                self._set_prediction_image(array)
+            self._grounding_input = transformed
+            timings["sam_image_encoding"] = (time.perf_counter()-started)*1000.
+        return boxes, logits, phrases
+
     def _grounded(
         self,
         image: Image.Image,
         array: np.ndarray,
         language_prompt: str,
+        *,
+        timings: dict[str, float],
     ) -> list[GroundedObjectDetection]:
-        transformed, _target = self._grounding_transform(image, None)
-        boxes, logits, phrases = self._grounding_predict(
-            model=self._grounding_model,
-            image=transformed,
-            caption=language_prompt,
-            box_threshold=self.box_threshold,
-            text_threshold=self.text_threshold,
-            device=self.device,
+        boxes, logits, phrases = self._grounded_predictions(
+            image, array, language_prompt, timings=timings,
         )
+        if not len(boxes):
+            return []
         width, height = image.size
-        self._predictor.set_image(array)
+        started = time.perf_counter()
         result = []
         for box, logit, phrase in zip(boxes, logits, phrases, strict=True):
             grounding_score = float(logit)
@@ -819,6 +921,7 @@ class Sam2GroundingDinoLocalizer:
                         label=_required(str(phrase), field_name="grounding phrase"),
                     )
                 )
+        timings["sam_box_refinement"] = (time.perf_counter()-started)*1000.
         return result
 
     def _grounded_segments(
@@ -827,17 +930,10 @@ class Sam2GroundingDinoLocalizer:
         array: np.ndarray,
         language_prompt: str,
     ) -> list[GroundedObjectSegment]:
-        transformed, _target = self._grounding_transform(image, None)
-        boxes, logits, phrases = self._grounding_predict(
-            model=self._grounding_model,
-            image=transformed,
-            caption=language_prompt,
-            box_threshold=self.box_threshold,
-            text_threshold=self.text_threshold,
-            device=self.device,
+        boxes, logits, phrases = self._grounded_predictions(
+            image, array, language_prompt, timings={},
         )
         width, height = image.size
-        self._predictor.set_image(array)
         result = []
         for box, logit, phrase in zip(boxes, logits, phrases, strict=True):
             grounding_score = float(logit)

@@ -229,6 +229,8 @@ def test_shared_localizer_point_segmentation_preserves_score_and_mask(mask_dtype
             return masks, np.asarray([0.4, 0.9]), None
 
     localizer = object.__new__(Sam2GroundingDinoLocalizer)
+    localizer._encoded_image = None
+    localizer._grounding_input = None
     localizer._lock = threading.RLock()
     localizer._started = True
     localizer._closed = False
@@ -261,6 +263,8 @@ def test_shared_localizer_distinguishes_prompt_miss_from_invalid_shape(failure) 
     if failure == "invalid_shape":
         masks, scores = np.ones((1, 2, 2), dtype=bool), np.array([1.])
     localizer = object.__new__(Sam2GroundingDinoLocalizer)
+    localizer._encoded_image = None
+    localizer._grounding_input = None
     localizer._lock = threading.RLock()
     localizer._started, localizer._closed = True, False
     localizer._predictor = SimpleNamespace(
@@ -285,6 +289,8 @@ def test_shared_localizer_rejects_non_finite_point_score() -> None:
             return masks, np.asarray([np.nan]), None
 
     localizer = object.__new__(Sam2GroundingDinoLocalizer)
+    localizer._encoded_image = None
+    localizer._grounding_input = None
     localizer._lock = threading.RLock()
     localizer._started = True
     localizer._closed = False
@@ -312,6 +318,8 @@ def test_shared_localizer_rejects_non_binary_point_mask(invalid_value) -> None:
             return masks, np.asarray([0.9]), None
 
     localizer = object.__new__(Sam2GroundingDinoLocalizer)
+    localizer._encoded_image = None
+    localizer._grounding_input = None
     localizer._lock = threading.RLock()
     localizer._started = True
     localizer._closed = False
@@ -349,13 +357,14 @@ def test_shared_localizer_text_segmentation_combines_grounding_and_sam_scores(ma
         )
 
     localizer = object.__new__(Sam2GroundingDinoLocalizer)
+    localizer._encoded_image = None
+    localizer._grounding_input = None
     localizer._lock = threading.RLock()
     localizer._started = True
     localizer._closed = False
     localizer._predictor = _Predictor()
     localizer._grounding_transform = lambda image, _target: (image, None)
     localizer._grounding_predict = grounding_predict
-    localizer._grounding_model = object()
     localizer.box_threshold = 0.35
     localizer.text_threshold = 0.25
     localizer.device = "cuda"
@@ -385,6 +394,8 @@ def test_shared_localizer_rejects_non_finite_text_score() -> None:
             return masks, np.asarray([0.9]), None
 
     localizer = object.__new__(Sam2GroundingDinoLocalizer)
+    localizer._encoded_image = None
+    localizer._grounding_input = None
     localizer._lock = threading.RLock()
     localizer._started = True
     localizer._closed = False
@@ -395,7 +406,6 @@ def test_shared_localizer_rejects_non_finite_text_score() -> None:
         np.asarray([np.nan], dtype=np.float32),
         ["cube"],
     )
-    localizer._grounding_model = object()
     localizer.box_threshold = 0.35
     localizer.text_threshold = 0.25
     localizer.device = "cpu"
@@ -421,6 +431,8 @@ def test_shared_localizer_rejects_non_binary_text_mask(invalid_value) -> None:
             return masks, np.asarray([0.9]), None
 
     localizer = object.__new__(Sam2GroundingDinoLocalizer)
+    localizer._encoded_image = None
+    localizer._grounding_input = None
     localizer._lock = threading.RLock()
     localizer._started = True
     localizer._closed = False
@@ -431,7 +443,6 @@ def test_shared_localizer_rejects_non_binary_text_mask(invalid_value) -> None:
         np.asarray([0.9], dtype=np.float32),
         ["cube"],
     )
-    localizer._grounding_model = object()
     localizer.box_threshold = 0.35
     localizer.text_threshold = 0.25
     localizer.device = "cpu"
