@@ -69,8 +69,9 @@ def test_distance_admission_uses_required_margin_and_retains_real_penetration(
 @pytest.mark.parametrize("separation_m,expected_safe", (
     (.027, True), (.0015, False), (-.005, False),
 ))
+@pytest.mark.parametrize("artifact_distance", (0.0, -.026))
 def test_disjoint_aabb_bound_does_not_turn_ccd_artifacts_into_penetration(
-    monkeypatch, separation_m, expected_safe
+    monkeypatch, separation_m, expected_safe, artifact_distance
 ):
     mujoco = pytest.importorskip("mujoco")
     from sim.mujoco.collision_safety import CollisionSafetyOracle
@@ -88,15 +89,16 @@ def test_disjoint_aabb_bound_does_not_turn_ccd_artifacts_into_penetration(
     # Reproduce the native CCD sign defect without depending on a particular
     # MuJoCo build or developer-local CAD asset. The composed CAD test covers
     # the real installed meshes and trajectory that exposed it.
-    monkeypatch.setattr(mujoco, "mj_geomDistance", lambda *args: -.026)
+    monkeypatch.setattr(mujoco, "mj_geomDistance", lambda *args: artifact_distance)
     check = oracle.check(data)
     assert check.safe is expected_safe
     if separation_m > 0:
         assert check.minimum_distance_m == pytest.approx(separation_m - 1e-9)
         assert check.minimum_distance_is_lower_bound
         assert check.to_dict()["distance_query_disagreement_count"] == 1
+        assert check.to_dict()["distance_query_raw_distance_m"] == artifact_distance
     else:
-        assert check.minimum_distance_m == -.026
+        assert check.minimum_distance_m == artifact_distance
         assert not check.minimum_distance_is_lower_bound
         assert check.distance_query_disagreement_count == 0
 

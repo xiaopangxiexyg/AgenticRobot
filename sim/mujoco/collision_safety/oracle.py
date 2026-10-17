@@ -130,6 +130,7 @@ class CollisionSafetyOracle:
         minimum = float("inf")
         closest: _ForbiddenGeomPair | None = None
         minimum_is_lower_bound = False
+        minimum_raw_distance = None
         distance_query_disagreement_count = 0
         required_limit = max(0.0, clearance)
         limit = max(self.policy.distance_query_limit_m, required_limit)
@@ -175,6 +176,7 @@ class CollisionSafetyOracle:
             # overlapping AABBs still require the signed narrow-phase result.
             lower_bound = max(0.0, float(aabb_lower_bound[pair_index]) - 1e-9)
             bounded = lower_bound > 0.0 and distance < lower_bound
+            raw_distance = distance if bounded else None
             if bounded:
                 distance = lower_bound
                 distance_query_disagreement_count += 1
@@ -182,6 +184,7 @@ class CollisionSafetyOracle:
                 minimum = distance
                 closest = pair
                 minimum_is_lower_bound = bounded or distance >= limit
+                minimum_raw_distance = raw_distance
         if closest is None:
             return CollisionCheckResult(
                 safe=True, minimum_distance_m=limit,
@@ -199,6 +202,7 @@ class CollisionSafetyOracle:
             pair_class=closest.pair_class,
             minimum_distance_is_lower_bound=minimum_is_lower_bound,
             distance_query_disagreement_count=distance_query_disagreement_count,
+            distance_query_raw_distance_m=minimum_raw_distance,
         )
 
     def check_contacts(self, data) -> CollisionCheckResult:

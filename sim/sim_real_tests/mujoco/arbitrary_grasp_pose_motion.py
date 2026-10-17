@@ -184,6 +184,8 @@ def _recover_zero_distance_mesh_query(
         collision,
         safe=True,
         minimum_distance_m=float(witness_distance_m),
+        minimum_distance_is_lower_bound=False,
+        distance_query_raw_distance_m=None,
     )
 
 
@@ -197,9 +199,15 @@ def _recover_projector_zero_distance_result(
 ) -> CollisionCheckResult:
     """Repair one separated mesh false-zero using a full MuJoCo witness."""
 
-    if (
+    bounded_disagreement = (
         collision.safe
-        or collision.minimum_distance_m != 0.0
+        and collision.minimum_distance_is_lower_bound
+        and collision.distance_query_disagreement_count > 0
+        and collision.distance_query_raw_distance_m == 0.0
+    )
+    if (
+        (collision.safe and not bounded_disagreement)
+        or (collision.minimum_distance_m != 0.0 and not bounded_disagreement)
         or collision.pair_class not in ZERO_DISTANCE_MESH_QUERY_PAIR_CLASSES
         or collision.geom1_id is None
         or collision.geom2_id is None
@@ -219,8 +227,8 @@ def _recover_projector_zero_distance_result(
     mujoco.mj_forward(projector.model, scratch)
     if _pair_has_contact(scratch, collision):
         return collision
-    fromto = np.empty(6, dtype=np.float64)
-    mujoco.mj_geomDistance(
+    fromto = np.full(6, np.nan, dtype=np.float64)
+    signed_distance = mujoco.mj_geomDistance(
         projector.model,
         scratch,
         int(collision.geom1_id),
@@ -228,9 +236,18 @@ def _recover_projector_zero_distance_result(
         float(projector.policy.distance_query_limit_m),
         fromto,
     )
+    # The canonical oracle may already have proved separation with disjoint
+    # AABBs. Recover measured clearance only for the original exact-zero
+    # artifact; a negative or otherwise inconsistent query keeps its bound.
+    if (not math.isfinite(float(signed_distance)) or signed_distance < 0.0
+            or signed_distance >= projector.policy.distance_query_limit_m):
+        return collision
     witness_distance = float(np.linalg.norm(fromto[:3] - fromto[3:]))
-    return _recover_zero_distance_mesh_query(
-        collision,
+    if bounded_disagreement and witness_distance < collision.minimum_distance_m:
+        return collision
+    recovered = _recover_zero_distance_mesh_query(
+        replace(collision, safe=False, minimum_distance_m=0.0)
+        if bounded_disagreement else collision,
         pair_has_contact=False,
         witness_distance_m=witness_distance,
         minimum_clearance_m=float(
@@ -239,6 +256,7 @@ def _recover_projector_zero_distance_result(
             else minimum_clearance_m
         ),
     )
+    return collision if bounded_disagreement and not recovered.safe else recovered
 
 
 class _ArtifactAwareKinematicCollisionProjector(KinematicCollisionProjector):
@@ -291,7 +309,13 @@ class _ArtifactAwareKinematicCollisionProjector(KinematicCollisionProjector):
         # retain the conservative admitted lower bound, never its invalid
         # distance. An unsafe admission still follows the existing narrow
         # full-forward zero-witness recovery and is never broadly overridden.
-        return admission if admission.safe and not measured.safe else measured
+        if admission.safe and (
+            not measured.safe
+            or (measured.minimum_distance_is_lower_bound
+                and measured.distance_query_disagreement_count > 0)
+        ):
+            return admission
+        return measured
 
 
 def _install_artifact_aware_collision_projector(

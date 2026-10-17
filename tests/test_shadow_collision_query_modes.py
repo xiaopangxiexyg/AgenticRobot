@@ -12,8 +12,9 @@ from sim.sim_real_tests.mujoco.arbitrary_grasp_pose_motion import (
 @pytest.mark.parametrize(
     "separation_m,expected_safe", [(0.01, True), (0.001, False), (-0.002, False)]
 )
+@pytest.mark.parametrize("broad_artifact", (-0.026, 0.0))
 def test_shadow_broad_query_artifact_cannot_override_admission(
-    monkeypatch, separation_m, expected_safe
+    monkeypatch, separation_m, expected_safe, broad_artifact
 ):
     mujoco = pytest.importorskip("mujoco")
     model = mujoco.MjModel.from_xml_string(
@@ -33,14 +34,19 @@ def test_shadow_broad_query_artifact_cannot_override_admission(
 
     def inconsistent_broad_query(model, data, first, second, limit, witness):
         radii.append(limit)
+        if limit > 0.002 and broad_artifact == 0.0:
+            # A query that returns no witness must not promote uninitialized
+            # coordinates into measured separation, even with disjoint AABBs.
+            return 0.0
         measured = original(model, data, first, second, limit, witness)
-        return -0.026 if limit > 0.002 else measured
+        return broad_artifact if limit > 0.002 else measured
 
     monkeypatch.setattr(mujoco, "mj_geomDistance", inconsistent_broad_query)
     result = projector.check_qpos(data, data.qpos)
     assert result.safe is expected_safe
     assert result.minimum_distance_m == pytest.approx(min(0.002, separation_m))
     if expected_safe:
-        assert radii == [0.05]  # Narrow admission prunes this separated AABB.
+        # Only a false zero needs the optional full-forward witness query.
+        assert radii == ([0.05, 0.05] if broad_artifact == 0.0 else [0.05])
     else:
         assert radii == [0.002]  # Unsafe admission never requests a diagnostic.
