@@ -4536,7 +4536,7 @@ def test_full_grasp_terminal_miss_still_allows_later_forward_branch(side):
         return (endpoint,)
 
     leg = grasp_trajectory_module._PlannedPathLeg(endpoint,
-        SimpleNamespace(waypoints=(current,)), {}, ())
+        SimpleNamespace(waypoints=(current,), metadata={}), {}, ())
     planner._endpoint_qpos_candidates = endpoints
     planner._plan_constrained_approach_leg = lambda **_kwargs: leg
     planner._envelope_ingress_targets = lambda **_kwargs: ()
@@ -4546,15 +4546,16 @@ def test_full_grasp_terminal_miss_still_allows_later_forward_branch(side):
         connected.append(arguments["target_tool_tcp_world"].copy())
         return leg
 
-    class ReachedTrajectoryPreparation(Exception):
+    class ReachedRouteValidation(Exception):
         pass
 
-    def quality(*_args, **_kwargs):
-        raise ReachedTrajectoryPreparation
+    def validate_route(*_args, **_kwargs):
+        raise ReachedRouteValidation
 
     planner._plan_path_leg = connect
-    planner._require_motion_quality = quality
-    with pytest.raises(ReachedTrajectoryPreparation):
+    # Stop at this planner's existing post-chain validation boundary.
+    planner._revalidate = validate_route
+    with pytest.raises(ReachedRouteValidation):
         planner(qpos_by_side=current, side=side, target_tool_tcp_world=target,
             speed_scale=.2, monotonic=lambda: 0.)
     assert len(calls) == 3 and len(connected) == 1
