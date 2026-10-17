@@ -66,6 +66,26 @@ def test_distance_admission_uses_required_margin_and_retains_real_penetration(
         oracle.check(data, minimum_clearance_m=0.002, distance_query_limit_m=0.001)
 
 
+@pytest.mark.parametrize("native_distance", (float("nan"), float("inf"), -float("inf")))
+def test_distance_admission_rejects_nonfinite_native_query(monkeypatch, native_distance):
+    mujoco = pytest.importorskip("mujoco")
+    from sim.mujoco.collision_safety import CollisionSafetyOracle
+
+    model = mujoco.MjModel.from_xml_string(
+        '<mujoco><worldbody>'
+        '<body><geom type="box" size=".02 .02 .02" contype="2"/></body>'
+        '<body pos=".043 0 0"><joint type="slide"/>'
+        '<geom type="box" size=".02 .02 .02" contype="2"/></body>'
+        '</worldbody></mujoco>'
+    )
+    data = mujoco.MjData(model)
+    mujoco.mj_kinematics(model, data)
+    oracle = CollisionSafetyOracle(mujoco, model)
+    monkeypatch.setattr(mujoco, "mj_geomDistance", lambda *args: native_distance)
+    with pytest.raises(RuntimeError, match="non-finite"):
+        oracle.check(data)
+
+
 @pytest.mark.parametrize("separation_m,expected_safe", (
     (.027, True), (.0015, False), (-.005, False),
 ))

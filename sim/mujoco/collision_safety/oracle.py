@@ -169,6 +169,8 @@ class CollisionSafetyOracle:
                     self._fromto,
                 )
             )
+            if not np.isfinite(distance):
+                raise RuntimeError("MuJoCo geom distance query returned a non-finite result.")
             # Disjoint world AABBs prove a positive separation independently
             # of CCD. Native CCD can return a spurious negative distance for
             # nearly planar CAD meshes at broad query radii. Preserve the
