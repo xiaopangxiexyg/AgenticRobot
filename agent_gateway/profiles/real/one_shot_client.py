@@ -703,7 +703,6 @@ def execute_one_shot(args: argparse.Namespace) -> Mapping[str, Any]:
         while str(operation["status"]) not in _TERMINAL_STATUSES:
             if time.monotonic() >= deadline:
                 raise RuntimeError("Timed out waiting for terminal operation/HOLD.")
-            time.sleep(0.05)
             outcome = client.call(
                 "get_own_operation",
                 {
@@ -722,6 +721,13 @@ def execute_one_shot(args: argparse.Namespace) -> Mapping[str, Any]:
             operation = outcome.get("operation")
             if not isinstance(operation, Mapping):
                 raise TypeError("Gateway returned no owned operation.")
+            if str(operation["status"]) not in _TERMINAL_STATUSES:
+                # Query once immediately: a short Skill may already have its
+                # authoritative outcome. Pace only subsequent pending polls.
+                remaining = deadline - time.monotonic()
+                if remaining <= 0.0:
+                    raise RuntimeError("Timed out waiting for terminal operation/HOLD.")
+                time.sleep(min(0.05, remaining))
         return operation
     finally:
         client.close()

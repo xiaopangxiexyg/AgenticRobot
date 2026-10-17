@@ -388,6 +388,83 @@ def test_one_shot_client_unwraps_owned_operation_outcome(monkeypatch, tmp_path) 
     )
 
 
+@pytest.mark.parametrize("statuses", (
+    ("completed",), ("failed",), ("cancelled",), ("timed_out",),
+    ("running", "cancelling", "completed"),
+))
+def test_one_shot_client_queries_before_pacing_and_waits_for_terminal_owner(
+    monkeypatch, tmp_path, statuses,
+):
+    events = []
+    pending = iter(statuses)
+
+    class Client(_FakeClient):
+        def call(self, method, payload):
+            response = super().call(method, payload)
+            if method == "get_own_operation":
+                status = next(pending)
+                events.append(("query", status))
+                response["operation"]["status"] = status
+            return response
+
+    monkeypatch.setattr(one_shot_client, "_Client", Client)
+    monkeypatch.setattr(one_shot_client.time, "sleep", lambda delay: events.append(("sleep", delay)))
+    args = Namespace(
+        confirm="EXECUTE_AUTHORIZED_REAL_TCP_PRIMITIVE",
+        socket_path=str(tmp_path / "poll.sock"), side="left", action="forward",
+        client_id="operator", timeout_sec=1.0, operation_timeout_sec=1.0,
+    )
+    operation = one_shot_client.execute_one_shot(args)
+    expected = []
+    for index, status in enumerate(statuses):
+        if index:
+            expected.append(("sleep", .05))
+        expected.append(("query", status))
+    assert events == expected
+    assert operation["status"] == statuses[-1]
+    client = Client.instances[-1]
+    assert client.closed
+    assert sum(method == "submit_skill_request" for method, _ in client.calls) == 1
+    for method, payload in client.calls:
+        if method == "get_own_operation":
+            assert payload["operation_id"] == "operation:test"
+            assert payload["runtime_session_id"] == "real-session:test"
+
+
+def test_one_shot_client_pending_poll_does_not_sleep_or_query_past_deadline(
+    monkeypatch, tmp_path,
+):
+    clock = [0.0]
+    sleeps = []
+
+    class Client(_FakeClient):
+        def call(self, method, payload):
+            response = super().call(method, payload)
+            if method == "get_own_operation":
+                response["operation"]["status"] = "running"
+                clock[0] = 3.98  # One-second operation budget plus HOLD grace.
+            return response
+
+    def sleep(delay):
+        sleeps.append(delay)
+        clock[0] += delay
+
+    monkeypatch.setattr(one_shot_client, "_Client", Client)
+    monkeypatch.setattr(one_shot_client.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(one_shot_client.time, "sleep", sleep)
+    args = Namespace(
+        confirm="EXECUTE_AUTHORIZED_REAL_TCP_PRIMITIVE",
+        socket_path=str(tmp_path / "timeout.sock"), side="left", action="forward",
+        client_id="operator", timeout_sec=1.0, operation_timeout_sec=1.0,
+    )
+    with pytest.raises(RuntimeError, match="terminal operation/HOLD"):
+        one_shot_client.execute_one_shot(args)
+    assert sleeps == pytest.approx([.02])
+    client = Client.instances[-1]
+    assert client.closed
+    assert sum(method == "get_own_operation" for method, _ in client.calls) == 1
+
+
 def test_one_shot_client_submits_absolute_dmtac_tcp_in_canonical_station(
     monkeypatch,
     tmp_path,
