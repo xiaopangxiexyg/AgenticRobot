@@ -401,6 +401,15 @@ def _debug_backend_group_health_summary(value: Any) -> dict[str, Any]:
 
 def _debug_position_executor_event_summary(payload: Mapping[str, Any]) -> dict[str, Any]:
     compact = dict(payload)
+    selection = compact.get("ik_candidate_selection")
+    if isinstance(selection, Mapping):
+        # Coupled IK carries nested candidate/branch diagnostics. Bound that
+        # passive tree before the synchronous JSON sink walks it at 60 Hz;
+        # keep the admitted candidate certificate verbatim for qref diagnosis.
+        summary = _debug_compact_value(selection, max_items=64)
+        if "candidate_certificate" in selection:
+            summary["candidate_certificate"] = selection["candidate_certificate"]
+        compact["ik_candidate_selection"] = summary
     collision_debug = compact.get("position_collision_debug")
     if isinstance(collision_debug, Mapping):
         compact["position_collision_debug"] = {
