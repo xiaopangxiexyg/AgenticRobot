@@ -151,6 +151,7 @@ def assemble_exclusive_real_agent_primitive_deployment(
     ) = None,
     measured_qpos_observer: RealSkillMeasuredQposObserver | None = None,
     convergence_profile: RealAgentPrimitiveConvergenceProfile | None = None,
+    enable_spatial_goals: bool = False,
     perception_capture: RealPerceptionCaptureRegistration | None = None,
     rgbd_geometry_registrations: tuple[RgbdGeometryRegistration, ...] = (),
     localization_registration: RealObjectLocalizationRegistration | None = None,
@@ -197,6 +198,7 @@ def assemble_exclusive_real_agent_primitive_deployment(
         )
     )
     bundle = build_real_agent_primitive_contract_bundle(
+        enable_spatial_goals=enable_spatial_goals,
         gripper_contract=gripper_contract,
         attachment=observation_attachment,
         port_config=port_config,
@@ -289,6 +291,7 @@ def assemble_exclusive_rm65_agent_primitive_deployment(
     safety_envelope_refs: tuple[SkillDeploymentSafetyEnvelopeRef, ...],
     allowed_client_ids: tuple[str, ...],
     convergence_profile: RealAgentPrimitiveConvergenceProfile | None = None,
+    enable_spatial_goals: bool = False,
     perception_capture: RealPerceptionCaptureRegistration | None = None,
     rgbd_geometry_registrations: tuple[RgbdGeometryRegistration, ...] = (),
     localization_registration: RealObjectLocalizationRegistration | None = None,
@@ -330,6 +333,7 @@ def assemble_exclusive_rm65_agent_primitive_deployment(
             "RM65 ports and Gateway deployment must share one target builder."
         )
     return assemble_exclusive_real_agent_primitive_deployment(
+        enable_spatial_goals=enable_spatial_goals,
         gripper_port=gripper_port,
         target_builder=target_builder,
         port_config=port_config,

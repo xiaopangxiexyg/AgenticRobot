@@ -11,7 +11,10 @@ from __future__ import annotations
 import math
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from agent_gateway.profiles.spatial_goal import SpatialGoalRegistration
 
 from agent_gateway.profiles.segmentation import SegmentationRegistration
 from agent_gateway.profiles.placement import (
@@ -595,6 +598,7 @@ class RealAgentPrimitiveContractBundle:
     grasp_approach_plan_registration: RealGraspApproachPlanRegistration | None = None
     object_transport_registration: ObjectTransportRegistration | None = None
     gripper_contract: GripperSkillContractBundle | None = None
+    spatial_goal_registration: SpatialGoalRegistration | None = None
     rgbd_geometry_registrations: tuple[RgbdGeometryRegistration, ...] = ()
 
     def __post_init__(self) -> None:
@@ -605,6 +609,9 @@ class RealAgentPrimitiveContractBundle:
             io_catalog=self.io_catalog,
         )
         self.payload_validators.validate_manifest(self.route_manifest)
+        if self.spatial_goal_registration is not None:
+            if self.route_manifest.route("perception.compute_spatial_goal", "1") != self.spatial_goal_registration.entry:
+                raise ValueError("Spatial goal registration differs from its manifest entry.")
         if self.rgbd_geometry_registrations and self.perception_capture is None:
             raise ValueError("RGB-D geometry requires composed perception capture.")
         if self.gripper_contract is not None:
@@ -790,6 +797,7 @@ class RealAgentPrimitiveContractBundle:
             + (2 if grasp_approach_plan_enabled else 0)
             + int(transport_enabled)
             + int(self.gripper_contract is not None)
+            + int(self.spatial_goal_registration is not None)
             + int(
                 self.station_point_grasp_registration is not None
                 and self.station_point_grasp_registration.observation_registration
@@ -1021,6 +1029,7 @@ def build_real_agent_primitive_contract_bundle(
     ) = None,
     grasp_execution_operation_timeout_sec: float = DEFAULT_REAL_GRASP_EXECUTION_OPERATION_TIMEOUT_SEC,
     domain_emergency_stop_available: bool = False,
+    enable_spatial_goals: bool = False,
 ) -> RealAgentPrimitiveContractBundle:
     """Build exact motion and optional passive Routes without runtime effects."""
 
@@ -1032,6 +1041,8 @@ def build_real_agent_primitive_contract_bundle(
         raise TypeError("frame_graph must be typed.")
     if not isinstance(domain_emergency_stop_available, bool):
         raise TypeError("domain_emergency_stop_available must be boolean.")
+    if not isinstance(enable_spatial_goals, bool):
+        raise TypeError("enable_spatial_goals must be boolean.")
     refs = tuple(safety_envelope_refs)
     if not refs:
         raise ValueError("Real primitive Routes require lower safety-envelope refs.")
@@ -1619,6 +1630,15 @@ def build_real_agent_primitive_contract_bundle(
     tcp_pose_definition = tcp_pose_observe.definition_catalog.skill_definitions[0]
     tcp_pose_schema = tcp_pose_observe.schema_catalog.schema_entries[0]
     tcp_pose_entry = tcp_pose_observe.route_manifest.skill_routes[0]
+    spatial_goal_registration = None
+    if enable_spatial_goals:
+        from agent_gateway.profiles.spatial_goal import build_spatial_goal_registration
+
+        spatial_goal_registration = build_spatial_goal_registration(
+            base_route=tcp_pose_entry.route, base_binding=tcp_pose_entry.deployment_binding,
+            component_ids=attachment.component_ids, reference_frame_id=primitive_reference_frame_id,
+        )
+        perception_registrations = (*perception_registrations, spatial_goal_registration.skill)
     definitions = SkillDefinitionCatalog(
         catalog_id="dexteleop.agent_skill_definitions.real_motion_primitives",
         catalog_version="1",
@@ -1808,6 +1828,8 @@ def build_real_agent_primitive_contract_bundle(
             deployment_binding=object_transport_registration.binding,
             evaluation_plan_hash=None,
             availability_hash=object_transport_registration.binding.deployment_binding_hash))
+    if spatial_goal_registration is not None:
+        route_items.append(spatial_goal_registration.entry)
     artifact_contract_by_skill = {
         (item.definition.skill_id, item.definition.skill_version): item.io_contract
         for item in perception_registrations
@@ -1983,6 +2005,7 @@ def build_real_agent_primitive_contract_bundle(
                 if object_transport_registration is not None
                 else ()
             ),
+            *((spatial_goal_registration.payload_validator,) if spatial_goal_registration is not None else ()),
             *(
                 (
                     gripper_contract.payload_validators.validator_for(
@@ -2019,6 +2042,7 @@ def build_real_agent_primitive_contract_bundle(
         ),
         grasp_approach_plan_registration=grasp_approach_plan_registration,
         object_transport_registration=object_transport_registration,
+        spatial_goal_registration=spatial_goal_registration,
         gripper_contract=gripper_contract,
     )
 

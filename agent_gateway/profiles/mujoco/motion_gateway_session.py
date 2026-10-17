@@ -168,6 +168,7 @@ class MujocoAgentTcpPoseGatewaySession:
     hardware_view_provider: HardwareViewProvider
     service: AgentGatewayService
     safe_tcp_pose_executor: ReusableStationAgentSkillOperationExecutor | None = None
+    spatial_goal_executor: PassiveReadSkillExecutor | None = None
     _close_lock: threading.Lock = field(
         default_factory=threading.Lock,
         init=False,
@@ -195,6 +196,8 @@ class MujocoAgentTcpPoseGatewaySession:
     )
 
     def __post_init__(self) -> None:
+        if (self.contract_bundle.spatial_goal_registration is not None) != (self.spatial_goal_executor is not None):
+            raise ValueError("Spatial goal registration and executor must coexist.")
         if set(self.fixed_cardinal_step_executors) != set(
             FIXED_CARDINAL_TCP_STEP_SKILL_IDS_V1
         ):
@@ -448,6 +451,7 @@ class MujocoAgentTcpPoseGatewaySession:
                         5.0,
                     ),
                     ("history", self.history_executor, 5.0),
+                    ("spatial_goal", self.spatial_goal_executor, 5.0),
                     ("segmentation", self.segmentation_executor, 65.0),
                     (
                         "placement",
@@ -1446,6 +1450,16 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
         cardinal_step_route.semantic_content_hash: cardinal_step_executor,
         state_entry.route.semantic_content_hash: state_executor,
     }
+    spatial_goal_executor = None
+    if contract_bundle.spatial_goal_registration is not None:
+        from agent_gateway.profiles.spatial_goal import build_spatial_goal_executor
+
+        registration = contract_bundle.spatial_goal_registration
+        spatial_goal_executor = build_spatial_goal_executor(
+            registration=registration, current_station_revision=lambda: observation_producer.current_station_revision,
+            clock=runtime_clock, max_retained_operations=retention,
+        )
+        execution_port_by_route_hash[registration.entry.route.semantic_content_hash] = spatial_goal_executor
     safe_contract = contract_bundle.safe_tcp_pose_contract
     safe_tcp_pose_executor = None
     if safe_contract is not None:
@@ -1638,6 +1652,7 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
         fixed_cardinal_step_executors=fixed_cardinal_step_executors,
         fixed_orientation_executors=fixed_orientation_executors,
         state_executor=state_executor,
+        spatial_goal_executor=spatial_goal_executor,
         depth_executor=depth_executor,
         rgb_executor=rgb_executor,
         back_projection_provider=back_projection_provider,

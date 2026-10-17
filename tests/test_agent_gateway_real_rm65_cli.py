@@ -15,6 +15,14 @@ from agent_gateway.profiles.real.session_authorization import (
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
+def test_spatial_goal_cli_is_explicitly_optional():
+    parser = gateway_cli.build_parser()
+    assert parser.get_default("enable_spatial_goals") is False
+    action = next(item for item in parser._actions if item.dest == "enable_spatial_goals")
+    assert action.option_strings == ["--enable-spatial-goals"]
+    assert action.const is True
+
+
 def test_cli_back_projection_resolves_measured_geometry_without_grasp_models():
     parser = gateway_cli.build_parser()
     args = parser.parse_args([*_argv(confirmation=REAL_AGENT_PRIMITIVE_SESSION_CONFIRM_TOKEN),

@@ -99,6 +99,54 @@ def _bundle():
     )
 
 
+@pytest.mark.parametrize("component", ["left_arm", "right_arm"])
+def test_spatial_goal_is_optional_and_binds_the_current_component(component):
+    from agent_gateway.profiles.spatial_goal import _calculate
+
+    attachment, config, graph, envelope = _inputs()
+    side = component.removesuffix("_arm")
+    attachment = replace(attachment, component_ids=(component,))
+    config = replace(config, active_sides=(side,), component_id_by_side={side: component})
+    kwargs = {"attachment": attachment, "port_config": config, "frame_graph": graph,
+        "primitive_reference_frame_id": "canonical_station",
+        "safety_envelope_refs": (envelope,)}
+    baseline = build_real_agent_primitive_contract_bundle(**kwargs)
+    assert baseline.spatial_goal_registration is None
+    bundle = build_real_agent_primitive_contract_bundle(**kwargs, enable_spatial_goals=True)
+    registration = bundle.spatial_goal_registration
+    assert registration.entry.route.control_effect_class == "read_only"
+    assert registration.entry.route.privilege_tier == "t0_read_only"
+    assert registration.entry.route.may_move_robot is False
+    assert registration.entry.route.requires_operator_confirmation is False
+    assert registration.entry.evaluation_plan_hash is None
+    assert len(bundle.route_manifest.skill_routes) == len(baseline.route_manifest.skill_routes) + 1
+    for entry in baseline.route_manifest.skill_routes:
+        assert entry == bundle.route_manifest.route(entry.route.skill_id, entry.route.skill_version)
+    parameters = {"component_id": component, "reference_frame_id": "canonical_station",
+        "current_tcp_pose_xyz_quat_xyzw": [0., 0., .3, 0., 0., 0., 1.],
+        "anchor_xyz_m": [.2, -.1, .3], "offset_xyz_m": [0., 0., .03],
+        "offset_frame": "reference", "orientation_mode": "align_axis",
+        "tool_axis": "z", "axis_reference_xyz": [0., 0., -1.]}
+    validator = registration.payload_validator
+    result = _calculate(parameters)
+    validator.validate_parameters(parameters)
+    validator.validate_execution_result(result)
+    validator.validate_execution_result_for_parameters(parameters, result)
+    assert result["rotation_distance_rad"] == pytest.approx(np.pi)
+    for changes in ({"reference_frame_id": "camera"}, {"component_id": "head"},
+                    {"component_id": "right_arm" if component == "left_arm" else "left_arm"},
+                    {"anchor_xyz_m": [True, 0, 0]}, {"unexpected": 1}):
+        with pytest.raises(ValueError):
+            validator.validate_parameters({**parameters, **changes})
+    for changes in ({"path_checked": True}, {"motion_executed": True},
+                    {"rotation_distance_rad": 0.},
+                    {"pose_targets_by_component": {component: [float("nan"), 0., .3, 0., 0., 0., 1.]}},
+                    {"pose_targets_by_component": {component: [0., 0., .3, 0., 0., 0., 2.]}},
+                    {"pose_targets_by_component": {component: [0., 0., .4, 0., 0., 0., 1.]}}):
+        with pytest.raises(ValueError):
+            validator.validate_execution_result_for_parameters(parameters, {**result, **changes})
+
+
 def test_real_bundle_exposes_read_diagnostic_and_fixed_motion_primitives() -> None:
     bundle = _bundle()
 

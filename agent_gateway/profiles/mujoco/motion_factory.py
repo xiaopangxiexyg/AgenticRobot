@@ -350,12 +350,15 @@ def build_mujoco_agent_tcp_pose_gateway_session(
     artifact_storage: MujocoAgentArtifactStorageConfig | None = None,
     segmentation_localizer: object | None = None,
     enable_safe_tcp_pose: bool = False,
+    enable_spatial_goals: bool = False,
     safe_tcp_planning_clearance_padding_m: float = 0.002,
 ) -> MujocoAgentTcpPoseGatewaySession:
     """Build the exact default-off graph; do not start, record, or serve it."""
 
     if not isinstance(enable_safe_tcp_pose, bool):
         raise TypeError("enable_safe_tcp_pose must be boolean.")
+    if not isinstance(enable_spatial_goals, bool):
+        raise TypeError("enable_spatial_goals must be boolean.")
     if history_storage is not None and not isinstance(
         history_storage,
         MujocoAgentTcpPoseHistoryStorageConfig,
@@ -507,6 +510,7 @@ def build_mujoco_agent_tcp_pose_gateway_session(
                 else segmentation_localizer.semantic_content_hash
             ),
             enable_safe_tcp_pose=enable_safe_tcp_pose,
+            enable_spatial_goals=enable_spatial_goals,
         )
         if history_storage is not None:
             source_binding = contract_bundle.history_source_binding

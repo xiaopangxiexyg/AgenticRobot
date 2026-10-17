@@ -152,6 +152,8 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="enable main-view proposal generation and three-view candidate rendering",
     )
+    parser.add_argument("--enable-spatial-goals", action="store_true",
+        help="expose read-only endpoint relation goals; no observation or motion authority")
     parser.add_argument("--enable-grasp-observation", action="store_true",
         help="Use frozen stationary RGB-D target selection and optional associated-view fusion (GraspGenX only).")
     parser.add_argument("--enable-back-projection", action="store_true",
@@ -1199,6 +1201,7 @@ def main(argv: list[str] | None = None) -> int:
         object_localizer=object_localizer,
         point_grasp_planner=point_grasp_planner,
         enable_grasp_observation=args.enable_grasp_observation,
+        enable_spatial_goals=args.enable_spatial_goals,
         enable_back_projection=args.enable_back_projection,
         debug_render_object_coordinates=args.debug_render_object_coordinates,
         enable_point_grasp_arm_reachability=(args.enable_point_grasp_arm_reachability),

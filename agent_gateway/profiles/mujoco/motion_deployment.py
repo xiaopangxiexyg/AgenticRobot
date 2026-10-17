@@ -5,7 +5,10 @@ from __future__ import annotations
 import math
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from agent_gateway.profiles.spatial_goal import SpatialGoalRegistration
 
 from agent_gateway.profiles.placement import (
     PlacementRegistration,
@@ -705,6 +708,7 @@ class MujocoAgentTcpPoseContractBundle:
     history_deployment_binding: (
         MujocoPassiveTcpPoseHistoryDeploymentBinding | None
     ) = None
+    spatial_goal_registration: SpatialGoalRegistration | None = None
 
     def __post_init__(self) -> None:
         validate_skill_route_catalog_closure(
@@ -713,6 +717,9 @@ class MujocoAgentTcpPoseContractBundle:
             route_manifest=self.route_manifest,
             io_catalog=self.io_catalog,
         )
+        if self.spatial_goal_registration is not None:
+            if self.route_manifest.route("perception.compute_spatial_goal", "1") != self.spatial_goal_registration.entry:
+                raise ValueError("Spatial goal registration differs from its manifest entry.")
         if self.safe_tcp_pose_contract is not None:
             safe = self.safe_tcp_pose_contract
             entry = self.route_manifest.route("motion.move_tcp_to_pose_safe", "1")
@@ -1738,6 +1745,7 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
     segmentation_model_profile_hash: str | None = None,
     segmentation_inference_implementation_hash: str | None = None,
     enable_safe_tcp_pose: bool = False,
+    enable_spatial_goals: bool = False,
 ) -> MujocoAgentTcpPoseContractBundle:
     """Project one already-constructed no-model application without starting it."""
 
@@ -1761,6 +1769,8 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
         raise ValueError("MuJoCo segmentation requires Artifact perception.")
     if not isinstance(enable_safe_tcp_pose, bool):
         raise TypeError("enable_safe_tcp_pose must be boolean.")
+    if not isinstance(enable_spatial_goals, bool):
+        raise TypeError("enable_spatial_goals must be boolean.")
     exact = _exact_application(application)
     if enable_safe_tcp_pose and application.target.planned_tcp_motion is None:
         raise ValueError("Safe TCP Route requires the exact lower planned-motion adapter.")
@@ -2864,6 +2874,15 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
             domain="dexteleop.agent_state.mujoco_tcp_pose_history_availability.v1",
         )
 
+    spatial_goal_registration = None
+    if enable_spatial_goals:
+        from agent_gateway.profiles.spatial_goal import build_spatial_goal_registration
+
+        spatial_goal_registration = build_spatial_goal_registration(
+            base_route=state_route, base_binding=state_binding,
+            component_ids=state_definition.controlled_component_ids,
+            reference_frame_id=profile.reference_frame_id,
+        )
     definition_items = [
         definition,
         cardinal_step_definition,
@@ -2881,6 +2900,9 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
     if safe_definition is not None and safe_schema is not None:
         definition_items.append(safe_definition)
         schema_items.append(safe_schema)
+    if spatial_goal_registration is not None:
+        definition_items.append(spatial_goal_registration.skill.definition)
+        schema_items.append(spatial_goal_registration.skill.schema_entry)
     if history_definition is not None and history_schema is not None:
         definition_items.append(history_definition)
         schema_items.append(history_schema)
@@ -3107,6 +3129,8 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
                 availability_hash=placement.availability_hash,
             )
         )
+    if spatial_goal_registration is not None:
+        route_items.append(spatial_goal_registration.entry)
     io_contract_by_skill = {}
     for item in route_items:
         route_item = item.route
@@ -3266,6 +3290,8 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
             validator_items.append(depth_capture.back_projection.payload_validator)
     if rgb_capture is not None:
         validator_items.append(rgb_capture.payload_validator)
+    if spatial_goal_registration is not None:
+        validator_items.append(spatial_goal_registration.payload_validator)
     if segmentation is not None:
         validator_items.append(segmentation.payload_validator)
     if placement is not None:
@@ -3301,6 +3327,7 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
         station_manifest=station,
         execution_manifest=execution,
         safe_tcp_pose_contract=safe_contract,
+        spatial_goal_registration=spatial_goal_registration,
         depth_capture=depth_capture,
         rgb_capture=rgb_capture,
         segmentation=segmentation,

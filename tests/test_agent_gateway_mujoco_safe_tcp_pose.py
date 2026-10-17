@@ -29,7 +29,7 @@ TASK = Path("sim/configs/tasks/rm65_right_cube_reach_fixed_pose_xyz_proprio_v1.j
 CLIENT = "test:mujoco-safe-tcp"
 
 
-def _session(trace, *, after_fact=None):
+def _session(trace, *, after_fact=None, task=TASK, spatial=False):
     def consume(fact):
         trace.append(fact)
         if after_fact is not None:
@@ -37,7 +37,7 @@ def _session(trace, *, after_fact=None):
 
     return build_mujoco_agent_tcp_pose_gateway_session(
         target_config=MujocoSimHILTargetConfig(
-            task_config_path=resolve_path(TASK),
+            task_config_path=resolve_path(task),
             realtime_worker=False,
             runtime_session_id="test:mujoco-safe-tcp",
             control_domain_id="test:mujoco-safe-tcp",
@@ -48,6 +48,7 @@ def _session(trace, *, after_fact=None):
         allowed_client_ids=(CLIENT,),
         trace_sink=consume,
         enable_safe_tcp_pose=True,
+        enable_spatial_goals=spatial,
     )
 
 
@@ -163,6 +164,64 @@ def _place_cube_at_collision(application, plan, *, terminal):
     raise AssertionError(
         "Could not construct the declared start-free collision fixture"
     )
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("task", [TASK, Path("sim/configs/tasks/rm65_right_dmtacm_blue_cube_70mm_agent_v1.json")])
+def test_spatial_goal_calculation_then_existing_safe_move(task, record_property):
+    session = _session([], task=task, spatial=True)
+    try:
+        session.application.start_observation_ready()
+        adapter = session.wire_adapter(authenticated_client_id=CLIENT)
+        snapshot = adapter.get_observation_snapshot()
+        initial = snapshot["measurement_summary"]["pose_xyz_quat_xyzw_by_component"]["right_arm"]
+        profile = session.contract_bundle.motion_profile
+        entry = session.contract_bundle.spatial_goal_registration.entry
+        route = entry.route
+        parameter_profile = route.allowed_parameter_profiles[0]
+        request = replace(_request(session, adapter, initial),
+            skill_id=route.skill_id, skill_version=route.skill_version,
+            skill_definition_hash=route.skill_definition_hash, route_id=route.route_id,
+            route_version=route.route_version, route_hash=route.semantic_content_hash,
+            deployment_binding_hash=entry.deployment_binding.deployment_binding_hash,
+            parameter_profile_id=parameter_profile.parameter_profile_id,
+            parameter_profile_hash=parameter_profile.parameter_profile_hash,
+            requested_timeout_ms=5_000,
+            parameters={"component_id": "right_arm", "reference_frame_id": profile.reference_frame_id,
+                "current_tcp_pose_xyz_quat_xyzw": initial, "anchor_xyz_m": initial[:3],
+                "offset_xyz_m": [0., 0., .03], "offset_frame": "reference",
+                "orientation_mode": "preserve", "tool_axis": None, "axis_reference_xyz": None})
+        before = session.application.scene.data.qpos.copy()
+        before_velocity = session.application.scene.data.qvel.copy()
+        before_time = float(session.application.scene.data.time)
+        readonly = session.wire_adapter(authenticated_client_id=CLIENT, read_only_access=True)
+        admitted = readonly.submit_read_only_skill_request(request.to_wire())
+        assert admitted["accepted"], admitted
+        assert session.spatial_goal_executor.wait_all(timeout_sec=5)
+        operation = session.service.operation_store.get(admitted["operation"]["operation_id"])
+        assert operation.execution_outcome == "completed", operation
+        goal = operation.execution_result
+        np.testing.assert_array_equal(session.application.scene.data.qpos, before)
+        np.testing.assert_array_equal(session.application.scene.data.qvel, before_velocity)
+        assert float(session.application.scene.data.time) == before_time
+        assert goal["path_checked"] is False and goal["motion_executed"] is False
+        assert goal["constraint_scope"] == "endpoint_only"
+        target = goal["pose_targets_by_component"]["right_arm"]
+        admitted = adapter.submit_skill_request(_request(session, adapter, target, sequence=1).to_wire())
+        assert admitted["accepted"], admitted
+        assert session.wait(timeout_sec=35)
+        operation = session.service.operation_store.get(admitted["operation"]["operation_id"])
+        assert operation.execution_outcome == "completed", operation
+        final = adapter.get_observation_snapshot()["measurement_summary"]["pose_xyz_quat_xyzw_by_component"]["right_arm"]
+        error = float(np.linalg.norm(np.asarray(final[:3]) - target[:3]))
+        assert error <= profile.translation_tolerance_m
+        record_property("relation_goal_evidence_json", json.dumps({
+            "task": str(task), "initial": initial, "goal": target, "final": final,
+            "position_error_m": error, "spatial_calculation_changed_state": False,
+            "motion_outcome": operation.execution_outcome, "hardware_used": False,
+        }))
+    finally:
+        assert session.close().accepted
 
 
 @pytest.mark.integration

@@ -1381,3 +1381,44 @@ the historical `control-station` spelling. They are protocol identities, not
 current Python ownership claims, and remain unchanged so the structural move
 does not invalidate manifests, schema snapshots, idempotency records, or
 external reconciliation.
+
+### 可选关系目标计算（MuJoCo / Realman 共用）
+
+两端 Gateway 均可加 `--enable-spatial-goals` 发布只读的
+`perception.compute_spatial_goal@1`，默认关闭，不改变原有运动 Skill 的参数或执行逻辑。
+计算由 `robot_motion.spatial_goals` 统一实现；不启动相机、模型、机械臂或第二个控制循环。
+可用的 `component_id` 与 `reference_frame_id` 来自当前部署绑定；现有单臂配置继续保持单臂合同，
+此计算只使用该部署已公开的组件和坐标身份。
+上层可以在发现此 Route 后选择暴露；缺少它时保留原有接线。外部客户端是否暴露此可选能力
+需要由该客户端另行验证，本仓库的测试不证明 RPent 接线已经更新。
+
+参数示例（所有坐标、姿态必须先转换到同一个公开参考系；不要混用相机光学坐标）：
+
+```json
+{
+  "component_id": "right_arm",
+  "reference_frame_id": "canonical_station",
+  "current_tcp_pose_xyz_quat_xyzw": [0.2, -0.1, 0.3, 0, 0, 0, 1],
+  "anchor_xyz_m": [0.2, -0.1, 0.3],
+  "offset_xyz_m": [0, 0, 0.03],
+  "offset_frame": "reference",
+  "orientation_mode": "preserve",
+  "tool_axis": null,
+  "axis_reference_xyz": null
+}
+```
+
+`anchor_xyz_m` 是调用方传入的几何锚点，例如来自同帧分割/深度测量的物体中心，
+或来自 `state.read_tcp_pose` 的 TCP 位置。输出明确标为 `caller_supplied_geometry`，
+不是新的物体观测；不得用模型臆测坐标替代实测证据。`offset_frame=reference` 表示公开参考系轴，
+`tool` 表示输入 TCP 的自身轴，均为米，且偏移使用调整姿态之前的自身轴。
+`orientation_mode=preserve` 保持输入姿态；`align_axis` 需指定 `tool_axis=x/y/z`
+与公开参考系中的非零 `axis_reference_xyz`，只约束这一个轴并选择相对输入姿态转角最小的解。
+这避免为了满足一个轴的目标而人为固定多余的滚转，但不保证该姿态的 IK 或关节路径最短。
+
+输出的 `pose_targets_by_component` 可供现有避障 Skill 构造目标；公开坐标、工具和标定身份
+仍须从部署绑定读取，不由本计算生成。它不放行运动、不评估可达性或碰撞，
+`path_checked=false`、`motion_executed=false`、`constraint_scope=endpoint_only`。
+完整路径仍由现有 `motion.move_tcp_to_pose_safe` 重新取得当前状态、检查场景并规划，
+失败不回退普通 move-to。沿整个路径保持水平、绕开指定区域等持续约束尚不由该 Skill 实现，
+也不能把终点轴对齐解释为全过程满足该约束。

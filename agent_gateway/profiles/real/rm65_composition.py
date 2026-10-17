@@ -272,6 +272,7 @@ def assemble_exclusive_rm65_agent_primitive_composition(
     object_localizer: object | None = None,
     point_grasp_planner: object | None = None,
     enable_grasp_observation: bool = False,
+    enable_spatial_goals: bool = False,
     enable_back_projection: bool = False,
     debug_render_object_coordinates: bool = False,
     enable_point_grasp_arm_reachability: bool = False,
@@ -289,6 +290,8 @@ def assemble_exclusive_rm65_agent_primitive_composition(
         raise TypeError("enable_point_grasp_arm_reachability must be bool.")
     if not isinstance(enable_grasp_observation, bool):
         raise TypeError("enable_grasp_observation must be bool.")
+    if not isinstance(enable_spatial_goals, bool):
+        raise TypeError("enable_spatial_goals must be bool.")
     if not isinstance(enable_back_projection, bool):
         raise TypeError("enable_back_projection must be bool.")
     if grasp_trajectory_config is not None and not isinstance(
@@ -921,6 +924,7 @@ def assemble_exclusive_rm65_agent_primitive_composition(
             )
 
         deployment = assemble_exclusive_rm65_agent_primitive_deployment(
+            enable_spatial_goals=enable_spatial_goals,
             gripper_port=gripper_port,
             target_builder=lower.target_builder,
             rm65_ports=lower.ports,

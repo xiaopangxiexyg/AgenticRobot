@@ -182,6 +182,7 @@ def _runtime_fixture(
     *,
     exclusive_owner: bool = False,
     station_from_execution: np.ndarray | None = None,
+    spatial: bool = False,
 ):
     if station_from_execution is None:
         station_from_execution = np.eye(4, dtype=float)
@@ -256,6 +257,7 @@ def _runtime_fixture(
         allowed_route_ids=route_ids,
     )
     bundle = build_real_agent_primitive_contract_bundle(
+        enable_spatial_goals=spatial,
         attachment=attachment,
         port_config=port_config,
         frame_graph=frame_graph,
@@ -927,6 +929,52 @@ def test_real_wire_adapter_projects_lower_owned_arm_resource_while_idle() -> Non
     assert stale["occupancy"] == "occupied"
     assert stale["health"] == "unavailable"
     assert stale["reason_code"] == "lower_control_claim_occupied"
+
+
+def test_real_spatial_goal_route_is_passive_and_uses_no_motion_grant():
+    bundle, port, builder = _runtime_fixture(spatial=True, exclusive_owner=True)
+    clock = _Clock()
+    owner = _PersistentOwnerSession()
+    port.request_domain_hold(reason="fixture startup", requested_at=clock())
+    port.apply_owner_requests(session=owner, now=clock())
+    port.publish_owner_state(session=owner, captured_at=clock())
+    port.publish_measured_pose(pose_world_by_component={COMPONENT_ID: np.eye(4)},
+        measured_at=clock(), available_at=clock(), source_evidence_refs=("fixture:geometry-only",))
+    gateway = assemble_real_agent_primitive_gateway_session(
+        contract_bundle=bundle, port=port,
+        owner_state_provider=lambda: _owner_state(bundle, captured_at=clock()),
+        allowed_client_ids=(CLIENT_ID,), clock=clock,
+    )
+    try:
+        snapshot = gateway.observation_producer.capture_and_publish(gateway.service).snapshot
+        registration = bundle.spatial_goal_registration
+        route = registration.entry.route
+        profile = route.allowed_parameter_profiles[0]
+        request = replace(_read_request(bundle, snapshot), skill_id=route.skill_id,
+            skill_definition_hash=route.skill_definition_hash, route_id=route.route_id,
+            route_hash=route.semantic_content_hash,
+            deployment_binding_hash=registration.entry.deployment_binding.deployment_binding_hash,
+            parameter_profile_id=profile.parameter_profile_id, parameter_profile_hash=profile.parameter_profile_hash,
+            parameters={"component_id": COMPONENT_ID, "reference_frame_id": "canonical_station",
+                "current_tcp_pose_xyz_quat_xyzw": [0., 0., .3, 0., 0., 0., 1.],
+                "anchor_xyz_m": [.2, -.1, .3], "offset_xyz_m": [0., 0., .03],
+                "offset_frame": "reference", "orientation_mode": "preserve",
+                "tool_axis": None, "axis_reference_xyz": None})
+        before = port.snapshot()
+        adapter = gateway.wire_adapter(authenticated_client_id=CLIENT_ID, read_only_access=True)
+        submission = adapter.submit_read_only_skill_request(request.to_wire())
+        assert submission["accepted"], submission
+        assert gateway.spatial_goal_executor.wait_all(timeout_sec=1.)
+        operation = gateway.service.get_operation(submission["operation"]["operation_id"])
+        assert operation.status == "completed", operation
+        assert operation.task_outcome == "not_assessed"
+        np.testing.assert_allclose(operation.execution_result["pose_targets_by_component"][COMPONENT_ID],
+                                   [.2, -.1, .33, 0, 0, 0, 1])
+        assert port.snapshot() == before
+        assert builder.last_target is None
+        assert gateway.passive_read_executors_by_skill_ref[(route.skill_id, route.skill_version)] is gateway.spatial_goal_executor
+    finally:
+        assert gateway.close().accepted
 
 
 def test_real_gateway_reads_tcp_pose_without_consuming_motion_grant() -> None:

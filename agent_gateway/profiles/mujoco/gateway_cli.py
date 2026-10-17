@@ -161,6 +161,8 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="run MuJoCo stepping without realtime pacing (simulation only)",
     )
+    parser.add_argument("--enable-spatial-goals", action="store_true",
+                        help="Expose read-only endpoint relation calculation; does not authorize motion.")
     parser.add_argument(
         "--enable-safe-tcp-pose",
         action="store_true",
@@ -485,6 +487,7 @@ def main(argv: list[str] | None = None) -> int:
         artifact_storage=artifact_storage,
         segmentation_localizer=segmentation_localizer,
         enable_safe_tcp_pose=args.enable_safe_tcp_pose,
+        enable_spatial_goals=args.enable_spatial_goals,
         safe_tcp_planning_clearance_padding_m=args.safe_tcp_planning_clearance_padding_m,
     )
     viewer = None

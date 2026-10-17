@@ -683,6 +683,7 @@ class RealAgentPrimitiveGatewaySession:
     service: AgentGatewayService
     grasp_observation_executor: PassiveReadSkillExecutor | None = None
     object_transport_executor: PassiveReadSkillExecutor | None = None
+    spatial_goal_executor: PassiveReadSkillExecutor | None = None
     gripper_port: RealDmtacGripperControlPort | None = None
     rgbd_geometry_executors: tuple[PassiveReadSkillExecutor, ...] = ()
     _close_lock: threading.Lock = field(default_factory=threading.Lock, init=False)
@@ -695,6 +696,8 @@ class RealAgentPrimitiveGatewaySession:
     _closed_executor_ids: set[int] = field(default_factory=set, init=False)
 
     def __post_init__(self) -> None:
+        if (self.contract_bundle.spatial_goal_registration is not None) != (self.spatial_goal_executor is not None):
+            raise ValueError("Spatial goal registration and executor must coexist.")
         advertised = (
             "own_domain_emergency_stop_v1"
             in self.contract_bundle.route_manifest.supported_transport_features
@@ -797,6 +800,7 @@ class RealAgentPrimitiveGatewaySession:
         """Return every read-only executor by public Skill id and version."""
 
         executors = {
+            "perception.compute_spatial_goal": self.spatial_goal_executor,
             "perception.plan_object_move": self.object_transport_executor,
             "perception.capture_grasp_observation": self.grasp_observation_executor,
             "state.read_tcp_pose": self.state_executor,
@@ -927,6 +931,7 @@ class RealAgentPrimitiveGatewaySession:
                     (self.grasp_approach_plan_executor, 5.0),
                     (self.grasp_observation_executor, 5.0),
                     (self.object_transport_executor, 5.0),
+                    (self.spatial_goal_executor, 5.0),
                     *((executor, 5.0) for executor in self.rgbd_geometry_executors),
                 )
             )
@@ -1405,6 +1410,16 @@ def assemble_real_agent_primitive_gateway_session(
     execution_port_by_route_hash[state_entry.route.semantic_content_hash] = (
         state_executor
     )
+    spatial_goal_executor = None
+    if contract_bundle.spatial_goal_registration is not None:
+        from agent_gateway.profiles.spatial_goal import build_spatial_goal_executor
+
+        registration = contract_bundle.spatial_goal_registration
+        spatial_goal_executor = build_spatial_goal_executor(
+            registration=registration, current_station_revision=lambda: producer.current_station_revision,
+            clock=clock, max_retained_operations=max_retained_operations,
+        )
+        execution_port_by_route_hash[registration.entry.route.semantic_content_hash] = spatial_goal_executor
     grasp_approach_plan_store = (
         BoundedRealGraspApproachPlanStore(
             max_retained_plans=max_retained_operations,
@@ -1962,6 +1977,7 @@ def assemble_real_agent_primitive_gateway_session(
         service=service,
         grasp_observation_executor=grasp_observation_executor,
         object_transport_executor=object_transport_executor,
+        spatial_goal_executor=spatial_goal_executor,
         rgbd_geometry_executors=rgbd_geometry_executors,
     )
 
