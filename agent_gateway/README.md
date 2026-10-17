@@ -528,6 +528,19 @@ motion action, or `--confirm`. The selected collision-scene profile is read only
 to derive fixed arm-base geometry for static camera poses; it does not construct
 or connect a robot backend.
 
+For a session that must never reopen or reset a camera, pass
+`--camera-single-start`. This explicit camera-only deployment option disables
+startup software retries, hardware resets, runtime reopen policies and the
+automatic-exposure-priority write after applying formal startup defaults.
+Serial bindings, stream settings, startup priorities, complete RGB-D and
+consecutive-fresh-frame admission are unchanged. The effective policy is part
+of the source binding identity; missing cameras fail admission, not RGB-only
+fallback. The default policy remains unchanged for existing consumers.
+
+可选 `--camera-sdk-debug-log NEW_ABSOLUTE_PATH` 保存原生 DEBUG 日志和 SDK/启动上下文，
+不改变相机流、reset 或新鲜度要求。默认不启用；现有文件和符号链接均拒绝覆盖。
+启用日志会提前导入 SDK，单次成功不能据此证明初始化时序问题已根治。
+
 相机应用关闭时，先确认 Gateway 已停止准入且所有只读任务已经结束，再释放模型、
 相机和 Artifact store。任务等待超时或关闭被拒绝时，应用返回 `FAULT` 并保留这些依赖；
 任务结束后可再次调用 `close()` 完成清理。启动失败也使用同一关闭流程。

@@ -173,3 +173,45 @@ def test_control_characters_are_rejected_before_ssh(
     assert result.returncode != 0
     assert "unsafe or invalid SSH" in result.stderr
     assert not calls.exists()
+
+
+def test_readonly_agent_preview_is_fixed_and_never_connects(wrapper_environment):
+    environment, calls = wrapper_environment
+    args = ("-H", "trusted-target", "--repo", "/repo", "--python", "/python",
+        "--rpent-repo", "/upper", "--rpent-python", "/upper-python",
+        "--camera-config", "/cameras.json", "--camera-registry", "/registry.json",
+        "--localization-bundle", "/bundle", "--output", "/new-evidence", "--hf-home", "/cache-root", "--dry-run")
+    result = _run(environment, "remote_readonly_agent_acceptance.sh", *args)
+    assert result.returncode == 0
+    assert not calls.exists()
+    assert "300s" in result.stdout and "run_readonly_agent_acceptance.py" in result.stdout
+    assert "--hf-home '/cache-root'" in result.stdout
+    assert "--camera-scope 'all'" in result.stdout
+    debug = _run(environment, "remote_readonly_agent_acceptance.sh", *args, "--camera-sdk-debug-log")
+    assert debug.returncode == 0 and "--camera-sdk-debug-log" in debug.stdout
+    assert not calls.exists()
+    main = _run(environment, "remote_readonly_agent_acceptance.sh", *args, "--camera-scope", "main")
+    assert main.returncode == 0 and "--camera-scope 'main'" in main.stdout
+    invalid = _run(environment, "remote_readonly_agent_acceptance.sh", *args, "--camera-scope", "automatic")
+    assert invalid.returncode != 0
+    result = _run(environment, "remote_readonly_agent_acceptance.sh", *args, "--command", "move")
+    assert result.returncode != 0
+    assert not calls.exists()
+
+
+def test_readonly_tcp_agent_wrapper_is_fixed_without_camera_or_control(wrapper_environment):
+    environment, calls = wrapper_environment
+    args = ("-H", "trusted-target", "--repo", "/repo", "--python", "/python",
+        "--rpent-repo", "/upper", "--rpent-python", "/upper-python",
+        "--acceptance-scope", "tcp", "--arm-ip-assignment", "/ips.json",
+        "--left-tool-profile", "/left.json", "--right-tool-profile", "/right.json",
+        "--envelope-profile", "/envelope.json", "--output", "/new-run", "--dry-run")
+    result = _run(environment, "remote_readonly_agent_acceptance.sh", *args)
+    assert result.returncode == 0
+    assert "--acceptance-scope 'tcp'" in result.stdout
+    assert "--arm-ip-assignment '/ips.json'" in result.stdout
+    assert "--camera-config" not in result.stdout
+    assert not calls.exists()
+    for extra in (("--camera-config", "/cam"), ("--camera-sdk-debug-log",), ("--command", "move")):
+        assert _run(environment, "remote_readonly_agent_acceptance.sh", *args, *extra).returncode != 0
+    assert not calls.exists()

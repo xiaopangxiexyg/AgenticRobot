@@ -947,3 +947,29 @@ def test_rgb_checks_skew_before_encoding_and_revision_after_encoding(monkeypatch
         provider.capture_rgb(parameters, expected_station_revision=7)
     for source in sources.values():
         assert source.starts == source.closes == 0
+
+
+def test_single_start_policy_is_bound_before_sources_start() -> None:
+    options = {
+        "camera_config_path": "teleop_runtime/configs/devices/agent_gateway_realsense.json",
+        "camera_registry_path": "robot_motion/configs/rm65_camera_registry.json",
+        "scene_world_from_arm_base_by_side": {"left": np.eye(4), "right": np.eye(4)},
+    }
+    default = build_real_perception_source_binding(**options)
+    binding = build_real_perception_source_binding(**options, single_start=True)
+    assert binding.semantic_content_hash != default.semantic_content_hash
+    for key, source in binding.camera_sources.items():
+        config = source.config
+        assert (config.width, config.height, config.fps) == (640, 480, 15)
+        assert config.serial == default.camera_sources[key].config.serial
+        assert config.enable_depth and config.align_depth_to_color
+        assert config.require_complete_frameset
+        assert config.startup_software_retry_attempts == 0
+        assert config.auto_exposure_priority is None
+        assert not any(getattr(config, field) for field in (
+            "startup_reset", "startup_hardware_reset", "startup_hardware_reset_on_failure",
+            "startup_hardware_reset_on_warmup_failure", "restart_on_stale_timeout",
+            "restart_on_runtime_error", "restart_on_black_frames", "restart_on_incomplete_frameset",
+        ))
+        assert source.device_info()["running"] is False
+    assert default.camera_sources["front"].config.restart_on_incomplete_frameset

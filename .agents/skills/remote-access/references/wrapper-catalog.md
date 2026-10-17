@@ -32,6 +32,11 @@ this does not extend its authority or replace fresh checks.
 - Frozen RGB-D/qpos evidence: `remote_rm65_grasp_snapshot.sh`; requires explicit
   device-read authorization and a new output directory. It does not issue
   motion, HOLD, STOP, gripper commands or camera reset.
+- Read-only Agent acceptance: `remote_readonly_agent_acceptance.sh`; requires
+  explicit current device-read authorization. Uses fixed camera-only
+  `real-perception --camera-single-start` or TCP-only `real-tcp-observe` and
+  the existing RPent CLI; stdin credentials only, 300s budget. No motion,
+  gripper, controller, HOLD, STOP or camera reset authority.
 - Offline frozen grasp inference: `remote_grasp_snapshot_inference.sh`; runs
   only the fixed inference probe on retained evidence, without device access.
 - Inspection: `remote_view.sh`, `remote_tail_log.sh`,

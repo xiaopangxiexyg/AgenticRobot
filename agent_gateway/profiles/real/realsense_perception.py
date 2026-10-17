@@ -296,6 +296,7 @@ def build_real_perception_source_binding(
     camera_config_path: str | Path,
     camera_registry_path: str | Path,
     scene_world_from_arm_base_by_side: Mapping[str, np.ndarray],
+    single_start: bool = False,
 ) -> RealPerceptionSourceBinding:
     """Prepare sources and static depth geometry without opening hardware."""
 
@@ -310,6 +311,19 @@ def build_real_perception_source_binding(
     _apply_formal_camera_startup_defaults(configs)
     for config in configs.values():
         config.keep_last = max(4, int(config.keep_last))
+        if single_start:
+            # Apply after formal defaults, before binding identity is computed.
+            config.startup_reset = False
+            config.startup_hardware_reset = False
+            config.startup_hardware_reset_on_failure = False
+            config.startup_hardware_reset_on_warmup_failure = False
+            config.startup_software_retry_attempts = 0
+            config.restart_on_stale_timeout = False
+            config.restart_on_runtime_error = False
+            config.restart_on_black_frames = False
+            config.restart_on_incomplete_frameset = False
+            config.auto_exposure_priority = None
+            config.metadata["perception_single_start"] = True
     registry = load_camera_registry(camera_registry_path)
     registry_cameras = registry["cameras"]
     world_from_base = {

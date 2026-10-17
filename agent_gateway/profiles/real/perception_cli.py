@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import argparse
+import importlib.metadata
 import json
 import os
 import signal
 import stat
 import sys
 import threading
+import time
 import uuid
 from pathlib import Path
 
@@ -66,6 +68,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--socket-path", type=Path, required=True)
     parser.add_argument("--camera-config", type=Path, required=True)
+    parser.add_argument(
+        "--camera-single-start", action="store_true",
+        help="start each camera once; disable automatic reopen/reset without changing streams or admission",
+    )
+    parser.add_argument(
+        "--camera-sdk-debug-log", type=Path,
+        help="optional new absolute librealsense DEBUG log; records startup context without retry or reset",
+    )
     parser.add_argument("--camera-registry", type=Path, required=True)
     parser.add_argument("--artifact-root", type=Path, required=True)
     parser.add_argument(
@@ -219,6 +229,37 @@ def _graspgenx_mode_was_explicit(argv: list[str] | None) -> bool:
     )
 
 
+def _camera_debug_event(stage: str, **details: object) -> None:
+    print(json.dumps({
+        "event": "camera_startup_debug", "stage": stage,
+        "wall_time_sec": time.time(), "monotonic_time_sec": time.monotonic(),
+        "pid": os.getpid(), "thread_name": threading.current_thread().name,
+        "thread_native_id": threading.get_native_id(),
+        "active_python_threads": [thread.name for thread in threading.enumerate()],
+        "torch_imported": "torch" in sys.modules,
+        **details,
+    }, sort_keys=True), flush=True)
+
+
+def _enable_camera_sdk_debug_log(path: Path | None) -> None:
+    if path is None:
+        return
+    if not path.is_absolute() or not path.parent.is_dir():
+        raise ValueError("camera SDK log requires an absolute path with an existing parent")
+    if os.path.lexists(path):
+        raise FileExistsError(f"camera SDK log must be new: {path}")
+    # Import and enable the same native logger used by the read-only capture
+    # probe. This diagnostic mode changes import timing, not camera settings.
+    import pyrealsense2 as rs
+
+    rs.log_to_file(rs.log_severity.debug, str(path))
+    _camera_debug_event(
+        "sdk_debug_enabled", sdk_log=str(path), sdk_module=str(rs.__file__),
+        sdk_version=importlib.metadata.version("pyrealsense2"),
+        python_executable=sys.executable,
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -247,6 +288,7 @@ def main(argv: list[str] | None = None) -> int:
         args.artifact_root,
         flag="--artifact-root",
     )
+    _enable_camera_sdk_debug_log(args.camera_sdk_debug_log)
     if (
         _graspgenx_mode_was_explicit(argv)
         and args.graspgenx_mode != "service"
@@ -395,7 +437,13 @@ def main(argv: list[str] | None = None) -> int:
         camera_config_path=camera_config,
         camera_registry_path=camera_registry,
         scene_world_from_arm_base_by_side=world_from_base,
+        single_start=args.camera_single_start,
     )
+    if args.camera_sdk_debug_log is not None:
+        _camera_debug_event("sources_prepared", camera_config={
+            key: source.config.to_dict()
+            for key, source in source_binding.camera_sources.items()
+        })
     composition = assemble_camera_only_real_perception_composition(
         source_binding=source_binding,
         socket_path=endpoint_value,
@@ -415,6 +463,8 @@ def main(argv: list[str] | None = None) -> int:
     errors: list[BaseException] = []
 
     def ready_callback() -> None:
+        if args.camera_sdk_debug_log is not None:
+            _camera_debug_event("gateway_ready")
         manifest = composition.contract_bundle.route_manifest
         ready_payload = {
             "event": "gateway_ready",
@@ -454,9 +504,13 @@ def main(argv: list[str] | None = None) -> int:
 
     def serve() -> None:
         try:
+            if args.camera_sdk_debug_log is not None:
+                _camera_debug_event("resources_start")
             composition.application.serve_forever(ready_callback=ready_callback)
         except BaseException as error:  # noqa: BLE001 - surfaced to the main thread.
             errors.append(error)
+            if args.camera_sdk_debug_log is not None:
+                _camera_debug_event("resources_failed", error_type=type(error).__name__)
         finally:
             stop_requested.set()
 

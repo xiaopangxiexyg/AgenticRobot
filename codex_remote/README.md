@@ -149,6 +149,40 @@ module 和 pytest wrapper 只允许 L3 非控制执行；关键词检查只是�
 
 ### 冻结抓姿数据的限定探针
 
+`remote_readonly_agent_acceptance.sh` 是另一个显式授权的只读验收入口：仅运行已有
+`real-perception --camera-single-start` Gateway 和 RPent 正式 CLI；另可显式选择
+`--acceptance-scope tcp`，仅启动 `real-tcp-observe` 和 RPent 的 state 附着。
+TCP 分支要求显式的双臂 IP assignment、左右 tool profile 和 envelope 配置路径，
+不接受相机配置；相机分支不接受机械臂配置。两者均不接受任意命令、motion profile
+或夹爪动作；TCP 分支只读 SDK/FK，不构造控制器，不发 HOLD/STOP。
+模型密钥仅经 SSH stdin 进入上层子进程环境，
+不放入 argv、源码或输出；新输出目录保存 Gateway、配置准备、Agent 日志和收尾结果。
+相机 Gateway 的子进程环境移除宿主继承的 `OPENAI_API_KEY`，包括 `--check-only`
+路径；上层 Agent 使用本次 stdin 提供的密钥，不改变宿主环境。
+已有 Grounding DINO 的 BERT 缓存可通过 `--hf-home PATH` 显式绑定；缓存根包含
+`hub/`。子进程仍强制离线，不下载权重，也不改共享缓存中的模型文件。
+相机专用验收可复用已有 `dexteleop310` 的 SAM2/Grounding DINO CUDA 栈；不要仅因
+GraspGenX 环境能加载权重，就假定该环境也有 Grounding DINO 的可用 CUDA 扩展。
+使用保存图片完成文本定位后再安排现场开流，不将模型加载通过当作推理通过。
+`--camera-scope all` 默认要求三视角齐全。操作者明确选择 `--camera-scope main` 时，
+验收在新的运行目录生成仅含原 `front` 项的配置副本，不启动腕部相机；不改原配置、
+主相机流或标定，新鲜度准入保持原逻辑。报告记录所选范围，不能将主相机验收解释为
+三相机验收。缺少必需相机时仍失败，不自动切换范围或降成 RGB-only。
+Agent 检查实际公开的全部 RGB 角色，并绑定所选图像 Artifact 做文本定位；主视角深度
+不用于其他视角像素的反投影。随后只讨论“右臂上移 3 cm 再返回”的状态来源和执行
+前提，缺少 TCP 状态 Skill 时必须明确报告，不猜数值、不调用格式适配器或运动工具。
+该相机专用 profile 不构造机械臂控制 owner，不能证明真机运动链已接通。
+可选 `--camera-sdk-debug-log` 在新运行目录保存 `librealsense.debug.log`，并在
+Gateway 日志记录 SDK 包路径/版本、实际相机配置、启动线程和阶段。它只透传给
+正式 `real-perception` 入口，不改变流、重试、reset 或新鲜度准入。启用原生日志
+会提前导入 SDK，可能影响初始化时序；单次成功不证明根因或长期修复。
+固定 300 秒预算，TERM 后预留 90 秒收尾；不自动重试或 reset。`--check-only` 只检查
+路径和两个正式入口的参数，不开相机或请求模型。只读报告通过已有
+`finish(status="completed")` 收尾，不声明物理任务成功。验收入口读取正式 CLI 的
+transcript，保留 `agent_finish` 和 `environment_success`；即使 Agent 退出码为零，
+stuck/failure 或缺少 completed 收尾仍算运行失败。报告完成后仍须复核实际工具
+结果、图像来源和清理证据，不能当成定位成功或物理抓取成功。
+
 只读抓姿场景实验另有两个限定入口，不能用普通 Python wrapper 启动真实 Gateway 来替代：
 
 - `remote_rm65_grasp_snapshot.sh`：明确设备只读授权后，提供 `--repo`、`--python`、
