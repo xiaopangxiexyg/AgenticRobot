@@ -254,6 +254,8 @@ def test_gateway_sim_dependencies_are_confined_to_mujoco_profile() -> None:
         "agent_gateway/profiles/mujoco/gateway_cli.py": ["sim"],
         "agent_gateway/profiles/mujoco/motion_application.py": ["sim"],
         "agent_gateway/profiles/mujoco/motion_factory.py": ["sim"],
+        # The concrete safe-TCP lifecycle binds its lower simulation planner.
+        "agent_gateway/profiles/mujoco/motion_skill.py": ["sim"],
         "agent_gateway/profiles/mujoco/observation.py": ["sim"],
         "agent_gateway/profiles/mujoco/policy_application.py": ["sim"],
         "agent_gateway/profiles/mujoco/policy_factory.py": ["sim"],
