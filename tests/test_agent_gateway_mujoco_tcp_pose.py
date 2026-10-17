@@ -189,6 +189,7 @@ def test_unsettled_passive_read_defers_owned_dependency_cleanup() -> None:
         depth_executor=None,
         rgb_executor=None,
         history_executor=None,
+        spatial_goal_executor=None,
         segmentation_executor=None,
         placement_executor=executor,
         _segmentation_model_started=True,
