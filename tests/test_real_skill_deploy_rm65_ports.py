@@ -686,6 +686,19 @@ def test_rm65_ports_non_motion_read_window_blocks_commands_and_rearms_guard() ->
     ports.close()
 
 
+def test_non_motion_window_refuses_active_targets_without_disarming_guard():
+    ports, backends, _ = _ports()
+    ports.start()
+    backends["right"].target_active = True
+    with pytest.raises(RuntimeError, match="not confirmed HOLD"):
+        with ports.non_motion_read_window():
+            pytest.fail("An active motion must not enter a non-motion window")
+    assert ports.position_force_guard.motion_ready
+    assert not ports.measurement_sampler_snapshot()["non_motion_read_window_active"]
+    backends["right"].target_active = False
+    ports.close()
+
+
 def test_non_motion_read_window_pauses_background_qpos_refresh_until_exit() -> None:
     ports, backends, _ = _ports(
         background_measurement_sampling=True,
@@ -917,6 +930,43 @@ def test_rm65_ports_convert_backend_rejection_to_failed_receipt() -> None:
 
     assert receipt.succeeded is False
     assert receipt.evidence_refs[0].startswith("rm65-skill-dispatch:")
+
+
+def test_rm65_ports_require_worker_confirmation_before_reporting_hold(monkeypatch, caplog):
+    ports, backends, _ = _ports()
+    ports.start()
+    confirmations = []
+
+    def confirm(*, timeout_sec):
+        assert timeout_sec > 0
+        confirmations.append(True)
+        raise RuntimeError("HOLD was queued but no SDK acknowledgement arrived")
+
+    monkeypatch.setattr(backends["right"], "confirm_hold", confirm, raising=False)
+    receipt = ports.hold("operator cancellation")
+    assert not receipt.succeeded
+    assert confirmations == [True]
+    assert "no SDK acknowledgement arrived" in caplog.text
+    monkeypatch.delattr(backends["right"], "confirm_hold")
+    ports.close()
+
+
+def test_dispatch_retains_native_error_in_diagnostics(monkeypatch, caplog):
+    ports, _, _ = _ports()
+    ports.start()
+
+    def failed_dispatch(*_args, **_kwargs):
+        raise RuntimeError("right SDK timeout at target_sequence=37")
+
+    monkeypatch.setattr(
+        "teleop_runtime.skill_deploy.rm65_ports.dispatch_position_reference_command",
+        failed_dispatch,
+    )
+    receipt = ports.dispatch(_command())
+    assert not receipt.succeeded
+    assert receipt.diagnostics["error"] == "right SDK timeout at target_sequence=37"
+    assert "target_sequence=37" in caplog.text
+    ports.close()
 
 
 def test_rm65_ports_reject_non_coupled_or_unbound_command() -> None:
@@ -1159,3 +1209,26 @@ def test_udp_lifecycle_is_owned_once_and_bad_stream_precedes_sdk_or_hold(failure
         assert all(backend.closes == 1 for backend in backends.values())
     assert events.count("udp_start") == 1
     assert events.count("udp_close") == (2 if failure == "close" else 1)
+
+
+def test_hold_receipt_fails_when_acknowledged_backend_state_is_unreadable(monkeypatch):
+    ports, backends, _ = _ports(background_measurement_sampling=False)
+    ports.start()
+    state_reads = []
+
+    def confirmed(*, timeout_sec):
+        assert timeout_sec > 0
+
+    def unreadable():
+        state_reads.append(True)
+        raise RuntimeError("confirmed backend state unavailable")
+
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(backends["right"], "confirm_hold", confirmed, raising=False)
+            patch.setattr(backends["right"], "get_state", unreadable)
+            receipt = ports.hold("operator cancellation")
+        assert not receipt.succeeded
+        assert state_reads == [True]
+    finally:
+        ports.close()

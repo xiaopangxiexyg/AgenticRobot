@@ -3003,7 +3003,8 @@ class RM65ArmBackend(EffectorBackend):
                     self._clear_stream_target_locked()
                     self._last_target_qpos = None
                     self._last_target_pose = None
-                    self._last_send_result_code = 0
+                    # A latched stop can still lack an SDK acknowledgement.
+                    # Ordinary HOLD must not replace that failed result by 0.
                     self._last_send_result_text = (
                         f"hold_skipped_emergency_latched:{reason}"
                     )
@@ -3074,6 +3075,49 @@ class RM65ArmBackend(EffectorBackend):
                 raise RuntimeError(
                     f"{self.name} {stop_label} failed with return code {stop_text}"
                 )
+
+    def confirm_hold(self, *, timeout_sec: float) -> None:
+        """Wait for lower stop acknowledgement, not merely HOLD enqueue.
+
+        For a persistent position HOLD this proves that the worker committed
+        and the SDK accepted its frozen command. It is not a physical
+        stationarity measurement. This method never issues another command.
+        """
+        timeout = float(timeout_sec)
+        if not math.isfinite(timeout) or timeout <= 0:
+            raise ValueError("HOLD confirmation timeout must be finite and positive.")
+        deadline = time.monotonic() + timeout
+        while True:
+            with self._state_lock:
+                if self._stream_quick_stop_active:
+                    thread = self._stream_thread
+                    if self._stream_fault is not None or not (
+                        thread is not None and thread.is_alive()
+                    ):
+                        raise RuntimeError(f"{self.name} HOLD worker is unavailable.")
+                    accepted_at = self._last_accepted_monotonic
+                    requested_at = self._stream_target_monotonic
+                    planner = self._stream_planner.snapshot()
+                    velocity = planner.get("qd_command_rad_s")
+                    if (
+                        accepted_at is not None and requested_at is not None
+                        and accepted_at >= requested_at
+                        and self._last_send_result_code == 0
+                        and velocity is not None
+                        and np.all(np.isfinite(velocity))
+                        and np.all(np.abs(velocity) <= 1e-9)
+                    ):
+                        return
+                elif self._stream_target_qpos is not None:
+                    raise RuntimeError(f"{self.name} cannot confirm HOLD with an active motion target.")
+                elif self._last_send_result_code == 0:
+                    return
+                else:
+                    raise RuntimeError(f"{self.name} HOLD has no successful stop acknowledgement.")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise RuntimeError(f"{self.name} HOLD acknowledgement timed out after {timeout:.3f}s.")
+            time.sleep(min(0.005, remaining))
 
     def request_policy_inference_soft_hold(
         self,

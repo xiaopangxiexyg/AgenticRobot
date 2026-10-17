@@ -1659,6 +1659,53 @@ def test_stale_target_becomes_persistent_quick_stop_in_acceleration_mode() -> No
     assert stream["stale_count"] == 1
 
 
+@pytest.mark.parametrize("acknowledged", [False, True])
+def test_hold_confirmation_waits_for_actual_worker_ack(monkeypatch, acknowledged):
+    backend, arm = _backend()
+    now = [time.monotonic()]
+    monkeypatch.setattr("teleop_runtime.backends.arms.rm65.time.monotonic", lambda: now[0])
+    backend._stream_thread = SimpleNamespace(is_alive=lambda: True)
+    backend.hold_motion("operator acceptance")
+    assert backend._last_accepted_monotonic is None
+    sleeps = []
+
+    def sleep(duration):
+        sleeps.append(duration)
+        now[0] += duration
+        if acknowledged:
+            backend.set_position_audit_sink(lambda _event: backend._stream_stop_event.set())
+            backend._stream_stop_event.clear()
+            backend._background_stream_loop_impl()
+
+    monkeypatch.setattr("teleop_runtime.backends.arms.rm65.time.sleep", sleep)
+    if acknowledged:
+        backend.confirm_hold(timeout_sec=0.03)
+        assert len(arm.sent_joint_deg) == 1
+        np.testing.assert_allclose(arm.sent_joint_deg[0], 0.0)
+    else:
+        with pytest.raises(RuntimeError, match="acknowledgement timed out"):
+            backend.confirm_hold(timeout_sec=0.03)
+        assert not arm.sent_joint_deg
+    assert sleeps
+
+
+def test_ordinary_hold_does_not_erase_failed_emergency_stop_acknowledgement():
+    backend, _ = _backend()
+
+    class FailedStopArm(_FakeArm):
+        def Arm_Slow_Stop(self):
+            return 2
+
+    backend.arm = FailedStopArm()
+    with pytest.raises(RuntimeError):
+        backend.emergency_stop()
+    assert backend.get_state()["send_result_code"] is None
+    backend.hold_motion("cleanup after failed stop")
+    assert backend.get_state()["send_result_code"] is None
+    with pytest.raises(RuntimeError, match="no successful stop acknowledgement"):
+        backend.confirm_hold(timeout_sec=0.03)
+
+
 def test_stale_sample_aligned_target_reanchors_command_space_hold() -> None:
     backend = RM65ArmBackend(
         RM65ArmBackendConfig(

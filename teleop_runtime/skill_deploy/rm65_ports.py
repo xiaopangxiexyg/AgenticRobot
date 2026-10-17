@@ -8,6 +8,7 @@ it does not construct RealTeleop, a Gateway, a device, or a control thread.
 from __future__ import annotations
 
 import json
+import logging
 import math
 import threading
 import time
@@ -116,9 +117,12 @@ class ExclusiveRM65SkillPortProfile:
     max_measurement_age_sec: float = 0.2
     background_measurement_sampling: bool = True
     dispatch_audit_mode: str = POSITION_REFERENCE_DISPATCH_AUDIT_POST
+    hold_confirmation_timeout_sec: float = 1.0
 
     def __post_init__(self) -> None:
-        for field_name in ("state_refresh_hz", "max_measurement_age_sec"):
+        for field_name in (
+            "state_refresh_hz", "max_measurement_age_sec", "hold_confirmation_timeout_sec",
+        ):
             value = float(getattr(self, field_name))
             if not math.isfinite(value) or value <= 0.0:
                 raise ValueError(f"{field_name} must be positive and finite.")
@@ -429,6 +433,9 @@ class ExclusiveRM65SkillDeployPorts:
             raise RuntimeError(
                 "exclusive RM65 Skill resources are not started."
             )
+        # Never suspend stale protection or qpos publication during motion.
+        # Reuse the backend's acknowledgement, without issuing another HOLD.
+        self._confirm_arm_holds()
         suspend = getattr(
             self.position_force_guard,
             "suspend_stale_watchdog_for_non_motion",
@@ -1266,10 +1273,13 @@ class ExclusiveRM65SkillDeployPorts:
             summary = {
                 "accepted": False,
                 "error_type": type(exc).__name__,
+                "error": _bounded_diagnostic_text(exc, limit=2048),
             }
             diagnostics = {
                 "error_type": type(exc).__name__,
+                "error": _bounded_diagnostic_text(exc, limit=2048),
             }
+            logging.getLogger(__name__).exception("Real Skill lower dispatch failed")
         receipt_hash = canonical_content_hash(
             summary,
             domain="dexteleop.real_skill.rm65_dispatch_receipt.v1",
@@ -1280,27 +1290,47 @@ class ExclusiveRM65SkillDeployPorts:
             diagnostics=diagnostics,
         )
 
+    def _confirm_arm_holds(self) -> None:
+        deadline = time.monotonic() + self.profile.hold_confirmation_timeout_sec
+        for side, backend in self.arm_backends.items():
+            confirm = getattr(backend, "confirm_hold", None)
+            if callable(confirm):
+                confirm(timeout_sec=max(0.001, deadline - time.monotonic()))
+            else:
+                # Synchronous backend adapters must have withdrawn their
+                # target before returning from hold_motion(). Native RM65 uses
+                # confirm_hold() above and requires an actual worker SDK ACK.
+                state = backend.get_state()
+                background = state.get("background_streaming") or {}
+                if background.get("target_active") or state.get("send_result_code") not in (None, 0):
+                    raise RuntimeError(f"{side} backend has not confirmed HOLD.")
+
     def hold(self, reason: str) -> RealSkillMotionHoldReceipt:
         """Ask both lower backends to HOLD and compile their bounded result."""
 
         error_type: str | None = None
         try:
             hold_deploy_arm_backends(self.arm_backends, reason=str(reason))
+            self._confirm_arm_holds()
             succeeded = True
         except Exception as exc:  # noqa: BLE001 - preserve a typed failed receipt.
             succeeded = False
             error_type = type(exc).__name__
+            logging.getLogger(__name__).exception("Real Skill lower HOLD not confirmed")
         state_by_side: dict[str, Any] = {}
         for side, backend in self.arm_backends.items():
             try:
                 state_by_side[side] = _bounded_backend_state(backend.get_state())
             except Exception as exc:  # noqa: BLE001 - receipt records unreadable state.
+                succeeded = False
                 state_by_side[side] = {
                     "state_error_type": type(exc).__name__,
                 }
         receipt_hash = canonical_content_hash(
             {
                 "succeeded": succeeded,
+                "reason": str(reason),
+                "confirmed_at": self.clock() if succeeded else None,
                 "error_type": error_type,
                 "state_by_side": state_by_side,
             },
