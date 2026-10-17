@@ -5,7 +5,6 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-
 TASK_CONFIG = Path("sim/configs/tasks/rm65_right_cube_lift_rl_debug_v0.json")
 
 
@@ -65,6 +64,41 @@ def test_distance_admission_uses_required_margin_and_retains_real_penetration(
     assert measured.minimum_distance_m == pytest.approx(separation_m, abs=1e-8)
     with pytest.raises(ValueError, match="distance_query_limit_m"):
         oracle.check(data, minimum_clearance_m=0.002, distance_query_limit_m=0.001)
+
+
+@pytest.mark.parametrize("separation_m,expected_safe", (
+    (.027, True), (.0015, False), (-.005, False),
+))
+def test_disjoint_aabb_bound_does_not_turn_ccd_artifacts_into_penetration(
+    monkeypatch, separation_m, expected_safe
+):
+    mujoco = pytest.importorskip("mujoco")
+    from sim.mujoco.collision_safety import CollisionSafetyOracle
+
+    model = mujoco.MjModel.from_xml_string(
+        '<mujoco><worldbody>'
+        '<body><geom type="box" size=".02 .02 .02" contype="2"/></body>'
+        f'<body pos="{.04 + separation_m} 0 0"><joint type="slide"/>'
+        '<geom type="box" size=".02 .02 .02" contype="2"/>'
+        '</body></worldbody></mujoco>'
+    )
+    data = mujoco.MjData(model)
+    mujoco.mj_kinematics(model, data)
+    oracle = CollisionSafetyOracle(mujoco, model)
+    # Reproduce the native CCD sign defect without depending on a particular
+    # MuJoCo build or developer-local CAD asset. The composed CAD test covers
+    # the real installed meshes and trajectory that exposed it.
+    monkeypatch.setattr(mujoco, "mj_geomDistance", lambda *args: -.026)
+    check = oracle.check(data)
+    assert check.safe is expected_safe
+    if separation_m > 0:
+        assert check.minimum_distance_m == pytest.approx(separation_m - 1e-9)
+        assert check.minimum_distance_is_lower_bound
+        assert check.to_dict()["distance_query_disagreement_count"] == 1
+    else:
+        assert check.minimum_distance_m == -.026
+        assert not check.minimum_distance_is_lower_bound
+        assert check.distance_query_disagreement_count == 0
 
 
 @pytest.mark.parametrize(

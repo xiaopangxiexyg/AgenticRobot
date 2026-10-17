@@ -1,8 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 import math
-
+from dataclasses import dataclass
 
 FORBIDDEN_COLLISION_CATEGORIES = (
     "robot_environment",
@@ -42,6 +41,8 @@ class CollisionCheckResult:
     body1_name: str | None = None
     body2_name: str | None = None
     pair_class: str | None = None
+    minimum_distance_is_lower_bound: bool = False
+    distance_query_disagreement_count: int = 0
 
     @property
     def penetration_depth_m(self) -> float:
@@ -53,7 +54,7 @@ class CollisionCheckResult:
 
     def to_dict(self) -> dict[str, object]:
         distance = float(self.minimum_distance_m)
-        return {
+        values = {
             "safe": bool(self.safe),
             "minimum_distance_m": distance if math.isfinite(distance) else None,
             "penetration_depth_m": self.penetration_depth_m,
@@ -64,3 +65,8 @@ class CollisionCheckResult:
             "pair_class": self.pair_class,
             "collision_category": self.collision_category,
         }
+        if self.minimum_distance_is_lower_bound:
+            values["minimum_distance_is_lower_bound"] = True
+        if self.distance_query_disagreement_count:
+            values["distance_query_disagreement_count"] = self.distance_query_disagreement_count
+        return values

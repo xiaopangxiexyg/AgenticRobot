@@ -129,6 +129,8 @@ class CollisionSafetyOracle:
             raise ValueError("minimum_clearance_m must be finite.")
         minimum = float("inf")
         closest: _ForbiddenGeomPair | None = None
+        minimum_is_lower_bound = False
+        distance_query_disagreement_count = 0
         required_limit = max(0.0, clearance)
         limit = max(self.policy.distance_query_limit_m, required_limit)
         if distance_query_limit_m is not None:
@@ -166,11 +168,25 @@ class CollisionSafetyOracle:
                     self._fromto,
                 )
             )
+            # Disjoint world AABBs prove a positive separation independently
+            # of CCD. Native CCD can return a spurious negative distance for
+            # nearly planar CAD meshes at broad query radii. Preserve the
+            # conservative geometric bound, never an invented exact distance;
+            # overlapping AABBs still require the signed narrow-phase result.
+            lower_bound = max(0.0, float(aabb_lower_bound[pair_index]) - 1e-9)
+            bounded = lower_bound > 0.0 and distance < lower_bound
+            if bounded:
+                distance = lower_bound
+                distance_query_disagreement_count += 1
             if distance < minimum:
                 minimum = distance
                 closest = pair
+                minimum_is_lower_bound = bounded or distance >= limit
         if closest is None:
-            return CollisionCheckResult(safe=True, minimum_distance_m=limit)
+            return CollisionCheckResult(
+                safe=True, minimum_distance_m=limit,
+                minimum_distance_is_lower_bound=True,
+            )
         return CollisionCheckResult(
             safe=minimum >= clearance,
             minimum_distance_m=minimum,
@@ -181,6 +197,8 @@ class CollisionSafetyOracle:
             body1_name=closest.body1_name,
             body2_name=closest.body2_name,
             pair_class=closest.pair_class,
+            minimum_distance_is_lower_bound=minimum_is_lower_bound,
+            distance_query_disagreement_count=distance_query_disagreement_count,
         )
 
     def check_contacts(self, data) -> CollisionCheckResult:
