@@ -384,6 +384,7 @@ class _ReachabilityBuilder:
 def _real_profile(
     *,
     envelope_profile_name: str = "agent_primitive_right_relative_tight_v1.json",
+    collision_scene_profile: str = "dual_arm_hand_proxy_open",
 ):
     return resolve_exclusive_rm65_skill_deployment_profile(
         ExclusiveRM65SkillDeploymentProfile(
@@ -402,6 +403,7 @@ def _real_profile(
                 / "teleop_runtime/configs/skill_deploy"
                 / envelope_profile_name
             ),
+            collision_scene_profile=collision_scene_profile,
         )
     )
 
@@ -1331,7 +1333,7 @@ def test_reachability_stops_on_wall_time_budget_and_returns_best_basic_solution(
         qpos_by_side={side: np.zeros(6) for side in ("left", "right")},
         side="right",
         target_tool_tcp_world=np.eye(4),
-        monotonic=lambda: next(times),
+        monotonic=lambda: next(times, 2.0),
     )
 
     assert result.classification == "basically_reachable"
@@ -4602,3 +4604,195 @@ def test_terminal_endpoint_search_pool_keeps_deadline_and_request_identity(outco
             another()
         assert error.value.details["call"] == 2
     assert len(calls) == 2 and calls[-1]["side"] == "right"
+
+
+def test_frozen_dmtac_static_scene_blocks_before_ik_but_not_the_active_arm(monkeypatch):
+    profile = _real_profile(
+        envelope_profile_name="agent_grasp_right_absolute_standard_v1.json",
+        collision_scene_profile="dual_arm_hand_proxy_dmtac_strict",
+    )
+    builder = build_exclusive_rm65_skill_target_builder(profile)
+    planner = RM65GraspJointTrajectoryPlanner(
+        profile=profile,
+        planning_target_builder=builder,
+        target_envelope_filter=builder.pre_ik_target_safety_filter,
+    )
+    measured = {
+        "left": np.array((2.327623565385757, .8887216231575795, 1.874605749209501,
+            1.8164688094550168, -1.3424897849709652, -.3151540891841784)),
+        "right": np.array((-1.4745937603154737, .6181083705727584, 1.6288110274553462,
+            -1.6168730083949026, -1.2114854288405503, .6198711168982818)),
+    }
+    target = builder.tool_tcp_world_targets_for_qpos_pair(
+        left_qpos=measured["left"], right_qpos=measured["right"]
+    )["right"]
+    monkeypatch.setattr(grasp_trajectory_module, "least_squares",
+        lambda *_a, **_k: pytest.fail("A fixed-scene failure must not run endpoint IK"))
+
+    # Moving the left arm may repair its table clearance. Moving the right
+    # cannot change that same fixed-left/table pair; it must fail before IK.
+    planner.require_static_grasp_scene(qpos_by_side=measured, side="left")
+    with pytest.raises(RM65GraspTrajectoryPlanningError) as raised:
+        planner.require_static_grasp_scene(qpos_by_side=measured, side="right")
+    assert raised.value.reason_code == "static_scene_clearance_blocked"
+    assert raised.value.details["minimum_distance_m"] == pytest.approx(.015772, abs=1e-5)
+    assert raised.value.details["minimum_clearance_m"] == .02
+    assert "left_" in raised.value.details["closest_geometry_names"][0]
+    assert "table" in raised.value.details["closest_geometry_names"][1]
+    result = planner.assess_local_grasp_chain(qpos_by_side=measured, side="right",
+        target_tool_tcp_world=target, time_budget_sec=2.)
+    assert not result.feasible and result.branch_count == 0
+    assert result.reason_code == raised.value.reason_code
+    with pytest.raises(RM65GraspTrajectoryPlanningError) as full_error:
+        planner(qpos_by_side=measured, side="right", target_tool_tcp_world=target,
+            speed_scale=.2)
+    assert full_error.value.reason_code == raised.value.reason_code
+    assert not planner.oracle.check(measured).safe  # Ordinary safety is unchanged.
+
+
+
+
+@pytest.mark.parametrize("side,target,seed", (
+    ("left", (
+        (-.009970041067677267, -.7944051429138251, -.6073064030563285, -.2930536345292537),
+        (.0033534069853865507, -.6073597362235296, .7944198546587931, -.12012666262538349),
+        (-.9999446749409371, .005883853041647383, .008719365268475837, .05502406318607412),
+        (0., 0., 0., 1.),
+    ), (2.1759384101582953, 1.5707963267899998, 2.098256419105255,
+        1.5340856723484095, -1.5768356478157899, .5329777592772937)),
+    ("right", (
+        (.3476023152795042, .936925047084379, .036661786076578225, -.3730198946941199),
+        (.005079970124108881, .03721760197925033, -.9992942729779106, .08032986724793957),
+        (-.9376282975230129, .347543243710641, .008177373369420626, .07656260974946202),
+        (0., 0., 0., 1.),
+    ), (-1.8333260882557645, 1.5707963267899998, .8671328575721751,
+        -1.7965423639577107, -1.7422734277086889, 1.037302510727392)),
+))
+def test_endpoint_ik_finds_tolerance_region_without_relaxing_joint_limits(
+    monkeypatch, side, target, seed
+):
+    # Retained 2026-09-24 wrist RGB-D candidates. Their weighted pose minima
+    # were 0.294/0.314 mm but 1.456/1.533 degrees at the joint-2 upper limit.
+    builder = build_exclusive_rm65_skill_target_builder(_real_profile(
+        envelope_profile_name="agent_grasp_right_absolute_standard_v1.json"
+    ))
+    planner = _planner_without_assets(config=RM65GraspTrajectoryPlanningConfig())
+    planner.target_builder = builder
+    measured = {
+        "left": np.array((2.327623565385757, .8887216231575795, 1.874605749209501,
+            1.8164688094550168, -1.3424897849709652, -.3151540891841784)),
+        "right": np.array((-1.4745937603154737, .6181083705727584, 1.6288110274553462,
+            -1.6168730083949026, -1.2114854288405503, .6198711168982818)),
+    }
+    original_q = builder.ik_solver.current_q.copy()
+    original_solve = grasp_trajectory_module.least_squares
+    solve_count = 0
+
+    def checked_solve(fun, x, *, jac, **kwargs):
+        nonlocal solve_count
+        solve_count += 1
+        if solve_count == 2:
+            assert callable(jac)
+            numeric = np.column_stack([
+                (fun(x + np.eye(6)[i] * 1e-7) - fun(x - np.eye(6)[i] * 1e-7)) / 2e-7
+                for i in range(6)
+            ])
+            np.testing.assert_allclose(jac(x), numeric, atol=1e-5, rtol=1e-5)
+        return original_solve(fun, x, jac=jac, **kwargs)
+
+    monkeypatch.setattr(grasp_trajectory_module, "least_squares", checked_solve)
+    pair, evaluations, position, orientation = planner._least_squares_endpoint_from_seed(
+        qpos_by_side=measured, side=side, target_tool_tcp_world=np.asarray(target),
+        seed_qpos=np.asarray(seed), maximum_evaluations=180,
+        prefer_closest_tolerance=False,
+    )
+    assert solve_count == 2
+    assert evaluations <= 180
+    assert position <= .003 and orientation <= 1.0
+    assert np.all(pair[side] >= grasp_trajectory_module.RM65_ABSOLUTE_Q_MIN_RAD)
+    assert np.all(pair[side] <= grasp_trajectory_module.RM65_ABSOLUTE_Q_MAX_RAD)
+    inactive = "right" if side == "left" else "left"
+    np.testing.assert_array_equal(pair[inactive], measured[inactive])
+    np.testing.assert_array_equal(builder.ik_solver.current_q, original_q)
+
+
+
+
+def test_endpoint_tolerance_search_respects_evaluation_budget_and_stage_tolerance(monkeypatch):
+    planner = _planner_without_assets(config=RM65GraspTrajectoryPlanningConfig())
+    planner.target_builder = _CartesianQposBuilder()
+    target = np.eye(4)
+    target[:3, :3] = Rotation.from_rotvec((0., 0., np.radians(2.))).as_matrix()
+    pair = {side: np.zeros(6) for side in ("left", "right")}
+    calls = []
+
+    def solve(_fun, x, **kwargs):
+        calls.append(kwargs["max_nfev"])
+        return SimpleNamespace(x=x.copy(), nfev=kwargs["max_nfev"])
+
+    monkeypatch.setattr(grasp_trajectory_module, "least_squares", solve)
+    planner._least_squares_endpoint_from_seed(qpos_by_side=pair, side="right",
+        target_tool_tcp_world=target, seed_qpos=pair["right"], maximum_evaluations=1,
+        prefer_closest_tolerance=False)
+    assert calls == [1]
+    calls.clear()
+
+    def pregrasp_solve(_fun, x, **kwargs):
+        calls.append(kwargs["max_nfev"])
+        return SimpleNamespace(x=x.copy(), nfev=1)
+
+    monkeypatch.setattr(grasp_trajectory_module, "least_squares", pregrasp_solve)
+    _, evaluations, _, orientation = planner._least_squares_endpoint_from_seed(
+        qpos_by_side=pair, side="right", target_tool_tcp_world=target,
+        seed_qpos=pair["right"], maximum_evaluations=180,
+        prefer_closest_tolerance=False, orientation_tolerance_deg=3.)
+    assert calls == [180] and evaluations == 1
+    assert orientation == pytest.approx(2.)
+    calls.clear()
+    _, evaluations, _, _ = planner._least_squares_endpoint_from_seed(
+        qpos_by_side=pair, side="right", target_tool_tcp_world=target,
+        seed_qpos=pair["right"], maximum_evaluations=180,
+        prefer_closest_tolerance=False, deadline=1., monotonic=lambda: 2.)
+    assert calls == [180] and evaluations == 1
+
+
+
+
+@pytest.mark.parametrize("normal_outcome", ("accepted", "collision", "miss", "pregrasp_miss"))
+def test_endpoint_search_only_refines_a_complete_pose_miss(normal_outcome, monkeypatch):
+    planner = _planner_without_assets(config=RM65GraspTrajectoryPlanningConfig(
+        maximum_endpoint_solve_cycles=20, endpoint_seed_count=2,
+    ))
+    planner.target_builder = _CartesianQposBuilder()
+    planner.oracle = SimpleNamespace(check=lambda _pair: JointConfigurationCheck(
+        safe=normal_outcome != "collision", collision_check_available=True,
+        minimum_distance_m=-.001 if normal_outcome == "collision" else .1,
+    ))
+    pair = {side: np.zeros(6) for side in ("left", "right")}
+    seeds = tuple({"left": pair["left"].copy(), "right": np.full(6, value)}
+        for value in (0., .1))
+    monkeypatch.setattr(planner, "_endpoint_seed_qpos", lambda *_a, **_k: seeds)
+    calls = []
+
+    def solve(**kwargs):
+        refining = kwargs["refine_tolerance_region"]
+        calls.append((refining, kwargs["maximum_evaluations"]))
+        values = np.asarray(kwargs["seed_qpos"]) + .01
+        candidate = {"left": pair["left"].copy(), "right": values}
+        missed = not refining and (normal_outcome in {"miss", "pregrasp_miss"} or len(calls) == 1)
+        orientation = 3.5 if normal_outcome == "pregrasp_miss" else 1.5 if missed else .5
+        return candidate, 4 if refining else 6, .001, orientation
+
+    monkeypatch.setattr(planner, "_least_squares_endpoint_from_seed", solve)
+    if normal_outcome in {"collision", "pregrasp_miss"}:
+        reason = "endpoint_collision_blocked" if normal_outcome == "collision" else "ik_search_exhausted"
+        with pytest.raises(RM65GraspTrajectoryPlanningError, match=reason):
+            planner._endpoint_qpos_candidates(qpos_by_side=pair, side="right",
+                target_tool_tcp_world=np.eye(4),
+                orientation_tolerance_deg=3. if normal_outcome == "pregrasp_miss" else None)
+    else:
+        endpoints = planner._endpoint_qpos_candidates(qpos_by_side=pair, side="right",
+            target_tool_tcp_world=np.eye(4))
+        assert endpoints
+    assert calls == ([(False, 20), (False, 20), (True, 14), (True, 14)]
+        if normal_outcome == "miss" else [(False, 20), (False, 20)])

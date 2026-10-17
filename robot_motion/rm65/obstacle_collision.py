@@ -456,6 +456,45 @@ class RM65ObstacleCollisionOracle:
                 self._check_embedded(full_q), distance_bound_m=self._scene.minimum_clearance_m)
         return self._check_cache[key]
 
+    def check_static_scene(
+        self, qpos_by_component: Mapping[str, np.ndarray], *, active_component: str,
+    ) -> JointConfigurationCheck:
+        """Check pairs whose placement the selected arm cannot change.
+
+        This is an early scene-readiness check, not a collision exemption.
+        Ordinary endpoint and path queries still check every configured pair.
+        Dependencies come from joint ancestry, never geometry-name prefixes.
+        """
+        try:
+            full_q = self._embed(qpos_by_component)
+            active_indices = set(self._indices[active_component])
+        except (KeyError, TypeError, ValueError) as exc:
+            return JointConfigurationCheck(safe=False, collision_check_available=False,
+                reason="invalid_static_collision_query", metadata={"error": str(exc)})
+
+        def affected(geometry_id: int) -> bool:
+            joint_id = int(self._collision_model.geometryObjects[geometry_id].parentJoint)
+            while joint_id:
+                joint = self._model.joints[joint_id]
+                if active_indices.intersection(range(joint.idx_q, joint.idx_q + joint.nq)):
+                    return True
+                joint_id = int(self._model.parents[joint_id])
+            return False
+
+        pairs = tuple(
+            i for i, pair in enumerate(self._collision_model.collisionPairs)
+            if not affected(int(pair.first)) and not affected(int(pair.second))
+        )
+        if not pairs:
+            return JointConfigurationCheck(safe=True, collision_check_available=True,
+                reason="no_static_collision_pairs", metadata={"active_component": active_component})
+        check = self._check_embedded_distances(full_q,
+            pair_count=len(self._collision_model.collisionPairs), pair_indices=pairs)
+        return replace(check, metadata={**check.metadata,
+            "query_mode": "inactive_component_minimum_distance",
+            "active_component": active_component, "static_pair_count": len(pairs)})
+
+
     def check_clearance_only(
         self, qpos_by_component: Mapping[str, np.ndarray]
     ) -> JointConfigurationCheck:
@@ -552,17 +591,24 @@ class RM65ObstacleCollisionOracle:
 
     def _check_embedded_distances(
         self, full_q: np.ndarray, *, pair_count: int,
+        pair_indices: tuple[int, ...] | None = None,
     ) -> JointConfigurationCheck:
         metadata = {**self._base_metadata(pair_count), "query_mode": "all_pair_minimum_distance"}
         try:
+            model_data, collision_data = self._model_data, self._collision_data
+            if pair_indices is not None:
+                # Readiness subsets may overlap ordinary cached queries.
+                # Keep mutable native buffers private through result extraction.
+                model_data = self._model.createData()
+                collision_data = self._pin.GeometryData(self._collision_model)
             self._pin.computeDistances(
                 self._model,
-                self._model_data,
+                model_data,
                 self._collision_model,
-                self._collision_data,
+                collision_data,
                 full_q,
             )
-            distance_results = tuple(self._collision_data.distanceResults)
+            distance_results = tuple(collision_data.distanceResults)
         except Exception as exc:  # noqa: BLE001 - external collision query fails closed
             return JointConfigurationCheck(
                 safe=False,
@@ -594,7 +640,10 @@ class RM65ObstacleCollisionOracle:
                 reason="collision_distance_invalid",
                 metadata=metadata,
             )
-        closest_index = int(np.argmin(distances))
+        if pair_indices is None:
+            closest_index = int(np.argmin(distances))
+        else:
+            closest_index = pair_indices[int(np.argmin(distances[list(pair_indices)]))]
         closest_pair = self._collision_model.collisionPairs[closest_index]
         first_id = int(closest_pair.first)
         second_id = int(closest_pair.second)

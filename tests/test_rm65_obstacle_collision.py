@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import threading
+
 import numpy as np
 import pytest
 
@@ -91,6 +93,41 @@ def test_clearance_margin_can_block_a_geometrically_separated_link() -> None:
     assert check.collision_check_available is True
     assert check.minimum_distance_m == pytest.approx(0.05, abs=1e-6)
     assert check.safe is False
+
+
+@pytest.mark.parametrize("active_component", ("left", "right"))
+def test_static_scene_uses_kinematic_ancestry_and_never_exempts_normal_checks(active_component):
+    model = pin.Model()
+    collision = pin.GeometryModel()
+    indices = {}
+    for side, offset in (("left", 0.), ("right", 1.)):
+        joint_id = model.addJoint(0, pin.JointModelPX(),
+            pin.SE3(np.eye(3), np.array((0., offset, 0.))), side + "_joint")
+        model.appendBodyToJoint(joint_id, pin.Inertia.Random(), pin.SE3.Identity())
+        # The shape is on a child joint and deliberately has no arm-name prefix.
+        child = model.addJoint(joint_id, pin.JointModelRZ(), pin.SE3.Identity(), side + "_child")
+        model.appendBodyToJoint(child, pin.Inertia.Random(), pin.SE3.Identity())
+        collision.addGeometryObject(pin.GeometryObject("sensor_" + str(child), child,
+            0, pin.SE3.Identity(), hppfcl.Sphere(.05)))
+        indices[side] = (model.joints[joint_id].idx_q,)
+    scene = ObstacleSceneSnapshot(reference_frame_id="world",
+        reference_frame_spec_hash="world-v1", revision=1, minimum_clearance_m=.02,
+        obstacles=(AxisAlignedBoxObstacle(obstacle_id="slab",
+            center_xyz_m=(.2, .5, 0.), size_xyz_m=(.2, 2., .2)),))
+    oracle = RM65ObstacleCollisionOracle(model=model, base_collision_model=collision,
+        reference_full_q=pin.neutral(model), qpos_indices_by_component=indices, scene=scene)
+    inactive = "right" if active_component == "left" else "left"
+    pair = {active_component: np.array((.2,)), inactive: np.array((0.,))}
+    assert oracle.check_static_scene(pair, active_component=active_component).safe
+    assert not oracle.check(pair).safe  # Active-arm collision is still checked.
+    for active_q in (-.5, 0., .2):
+        pair = {active_component: np.array((active_q,)), inactive: np.array((.04,))}
+        result = oracle.check_static_scene(pair, active_component=active_component)
+        assert result.collision_check_available
+        assert not result.safe
+        assert result.minimum_distance_m == pytest.approx(.01, abs=1e-6)
+        assert result.metadata["static_pair_count"] == 1
+    assert not oracle.check_static_scene(pair, active_component="missing").collision_check_available
 
 
 def test_early_exit_query_preserves_clearance_decision_and_distance() -> None:
@@ -508,3 +545,72 @@ def test_observed_voxels_preserve_all_numeric_cells_order_hash_and_input(layout,
     np.testing.assert_array_equal(reordered.points_m, expected)
     assert reordered.semantic_content_hash == expected_hash
     assert cloud.quantization_margin_m == pytest.approx(np.sqrt(3) * size / 2)
+
+
+@pytest.mark.parametrize("early_exit", (False, True))
+def test_static_scene_query_does_not_overwrite_concurrent_ordinary_query(monkeypatch, early_exit):
+    model, collision = pin.Model(), pin.GeometryModel()
+    indices = {}
+    for side, offset in (("left", 0.), ("right", 1.)):
+        joint = model.addJoint(0, pin.JointModelPX(),
+            pin.SE3(np.eye(3), np.array((0., offset, 0.))), side + "_joint")
+        model.appendBodyToJoint(joint, pin.Inertia.Random(), pin.SE3.Identity())
+        collision.addGeometryObject(pin.GeometryObject(side + "_sensor", joint,
+            0, pin.SE3.Identity(), hppfcl.Sphere(.05)))
+        indices[side] = (model.joints[joint].idx_q,)
+    scene = ObstacleSceneSnapshot(reference_frame_id="world",
+        reference_frame_spec_hash="world-v1", revision=1, minimum_clearance_m=.02,
+        obstacles=(AxisAlignedBoxObstacle(obstacle_id="slab",
+            center_xyz_m=(.2, .5, 0.), size_xyz_m=(.2, 2., .2)),))
+    oracle = RM65ObstacleCollisionOracle(model=model, base_collision_model=collision,
+        reference_full_q=pin.neutral(model), qpos_indices_by_component=indices,
+        scene=scene, stop_at_first_clearance_violation=early_exit)
+    blocked_pair = {"left": np.array((.2,)), "right": np.array((0.,))}
+    static_pair = {"left": np.array((-.5,)), "right": np.array((0.,))}
+    computed, release = threading.Event(), threading.Event()
+    buffers, placements, result, errors = {}, {}, {}, []
+
+    def observe(native):
+        def compute(*arguments):
+            returned = native(*arguments)
+            label = "ordinary" if threading.current_thread() is worker else "static"
+            buffers[label] = (arguments[1], arguments[3])
+            if label == "ordinary":
+                placements["joint"] = np.stack([pose.translation for pose in arguments[1].oMi])
+                placements["geometry"] = np.stack([pose.translation for pose in arguments[3].oMg])
+                computed.set()
+                if not release.wait(10.):
+                    raise RuntimeError("Test did not release the ordinary query.")
+            return returned
+        return compute
+
+    monkeypatch.setattr(pin, "computeDistances", observe(pin.computeDistances))
+    monkeypatch.setattr(pin, "computeCollisions", observe(pin.computeCollisions))
+
+    def run_ordinary():
+        try:
+            result["ordinary"] = oracle.check(blocked_pair)
+        except BaseException as error:
+            errors.append(error)
+
+    worker = threading.Thread(target=run_ordinary, name="static-query-isolation-probe")
+    worker.start()
+    try:
+        assert computed.wait(10.), "Ordinary native query did not reach the barrier."
+        static_result = oracle.check_static_scene(static_pair, active_component="left")
+        assert static_result.collision_check_available and static_result.safe
+        joint_after_static = np.stack([pose.translation for pose in oracle._model_data.oMi])
+        geometry_after_static = np.stack([pose.translation for pose in oracle._collision_data.oMg])
+    finally:
+        release.set()
+        worker.join(10.)
+    assert not worker.is_alive()
+    if errors:
+        raise errors[0]
+    assert result["ordinary"].collision_check_available and not result["ordinary"].safe
+    assert oracle.check(blocked_pair) is result["ordinary"]
+    assert len(oracle._check_cache) == 1
+    assert buffers["static"][0] is not buffers["ordinary"][0]
+    assert buffers["static"][1] is not buffers["ordinary"][1]
+    np.testing.assert_array_equal(joint_after_static, placements["joint"])
+    np.testing.assert_array_equal(geometry_after_static, placements["geometry"])

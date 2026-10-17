@@ -17,6 +17,7 @@ from robot_motion.coordinate_frames import CoordinateFrameGraph
 from teleop_runtime.skill_deploy.motion_port import RealAgentMotionPort
 from teleop_runtime.skill_deploy.rm65_grasp_trajectory import (
     RM65GraspJointTrajectoryPlanner,
+    RM65GraspTrajectoryPlanningError,
 )
 
 from .station_point_grasp_deployment import (
@@ -221,6 +222,22 @@ class RM65PointGraspReachabilityAdapter:
             measured_qpos_cut=measured_qpos_cut,
             measurement_reference_time=measurement_reference_time,
         )
+        static_check = getattr(self.planner, "require_static_grasp_scene", None)
+        if callable(static_check):
+            try:
+                static_check(qpos_by_side=qpos_cut.qpos_by_side, side=self.profile.arm_side)
+            except RM65GraspTrajectoryPlanningError as error:
+                return GraspGenXCandidateSelection(selected_indices=(), diagnostics={
+                    "arm_shortlist_status": "static_scene_blocked",
+                    "arm_shortlist_pool_count": len(candidates),
+                    "arm_shortlist_selected_count": 0,
+                    "arm_shortlist_local_chain_assessment_count": 0,
+                    "arm_shortlist_rescue_activated": False,
+                    "arm_shortlist_rejections_json": json.dumps({error.reason_code: 1}),
+                    "arm_shortlist_static_scene_check_json": json.dumps({
+                        "reason_code": error.reason_code, **error.details,
+                    }),
+                })
         desired_horizontal = target[:2] - np.asarray(
             self.arm_base_origin_candidate_m[:2], dtype=np.float64
         )

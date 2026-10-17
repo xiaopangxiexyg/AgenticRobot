@@ -124,6 +124,41 @@ def test_embodied_shortlist_reports_bounded_rejection_reasons() -> None:
     assert result.diagnostics["arm_shortlist_rescue_activated"] is False
 
 
+@pytest.mark.parametrize("reason", (
+    "static_scene_clearance_blocked", "static_scene_collision_blocked",
+    "static_scene_collision_check_unavailable",
+))
+def test_embodied_shortlist_reports_fixed_scene_without_spending_candidate_budget(reason):
+    from teleop_runtime.skill_deploy.rm65_grasp_trajectory import RM65GraspTrajectoryPlanningError
+    adapter = object.__new__(RM65PointGraspReachabilityAdapter)
+    adapter.profile = SimpleNamespace(max_measured_qpos_age_ms=200., arm_side="right")
+    adapter.clock = lambda: 10.
+    pair = {side: np.zeros(6) for side in ("left", "right")}
+
+    def static_check(*, qpos_by_side, side):
+        assert qpos_by_side is pair and side == "right"
+        raise RM65GraspTrajectoryPlanningError(reason, details={
+            "planning_phase": "static_scene_admission",
+            "closest_geometry_names": ("left_hand_proxy_1", "table_0"),
+            "minimum_distance_m": .015769077420228917,
+        })
+
+    def must_not_search(**_kwargs):
+        pytest.fail("A fixed scene violation must not start IK, probes or rescue")
+
+    adapter.planner = SimpleNamespace(require_static_grasp_scene=static_check,
+        assess_local_grasp_chain=must_not_search, probe_grasp_endpoint_clearance=must_not_search)
+    candidate = SimpleNamespace(base_from_tcp=tuple(np.eye(4).reshape(-1)), score=1.)
+    result = adapter.select_candidates((candidate,), (0., 0., 0.), 1,
+        measured_qpos_cut=SimpleNamespace(measured_at=10., qpos_by_side=pair),
+        measurement_reference_time=10.)
+    assert result.selected_indices == ()
+    assert result.diagnostics["arm_shortlist_status"] == "static_scene_blocked"
+    assert result.diagnostics["arm_shortlist_local_chain_assessment_count"] == 0
+    assert not result.diagnostics["arm_shortlist_rescue_activated"]
+    assert json.loads(result.diagnostics["arm_shortlist_static_scene_check_json"])["reason_code"] == reason
+
+
 def test_embodied_shortlist_preserves_tilted_pose_and_direction_diversity() -> None:
     candidates = []
     poses = []

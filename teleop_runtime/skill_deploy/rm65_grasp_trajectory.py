@@ -796,6 +796,32 @@ class RM65GraspJointTrajectoryPlanner:
         with self._observed_planning_lock:
             return self.for_observed_cloud(cloud)(**kwargs)
 
+    def require_static_grasp_scene(
+        self, *, qpos_by_side: Mapping[str, np.ndarray], side: str,
+    ) -> None:
+        """Reject a fixed-arm violation once, without searching the active arm."""
+        if not isinstance(self.oracle, RM65ObstacleCollisionOracle):
+            # Injected planners retain their ordinary endpoint/path admission.
+            return
+        check = self.oracle.check_static_scene(qpos_by_side, active_component=side)
+        if check.collision_check_available and check.safe:
+            return
+        reason = (
+            "static_scene_collision_check_unavailable"
+            if not check.collision_check_available
+            else "static_scene_collision_blocked"
+            if check.minimum_distance_m is not None and check.minimum_distance_m <= 0.0
+            else "static_scene_clearance_blocked"
+        )
+        raise RM65GraspTrajectoryPlanningError(reason, details={
+            "planning_phase": "static_scene_admission",
+            "active_side": side,
+            "minimum_distance_m": check.minimum_distance_m,
+            "minimum_clearance_m": self.config.minimum_clearance_m,
+            **check.metadata,
+        })
+
+
     def _remaining_path_planning_time_sec(
         self,
         *,
@@ -2275,6 +2301,10 @@ class RM65GraspJointTrajectoryPlanner:
         seed_qpos: np.ndarray,
         maximum_evaluations: int,
         prefer_closest_tolerance: bool = True,
+        orientation_tolerance_deg: float | None = None,
+        refine_tolerance_region: bool = True,
+        deadline: float | None = None,
+        monotonic: Callable[[], float] = time.perf_counter,
     ) -> tuple[dict[str, np.ndarray], int, float, float]:
         target_pose = np.asarray(target_tool_tcp_world, dtype=float)
         lower = np.asarray(RM65_ABSOLUTE_Q_MIN_RAD, dtype=float)
@@ -2400,6 +2430,78 @@ class RM65GraspJointTrajectoryPlanner:
             right_qpos=candidate["right"],
         )[side]
         position, orientation = pose_delta_metrics(tcp, target_pose)
+        evaluations = int(solved.nfev)
+        rotation_tolerance = (
+            self.config.endpoint_orientation_tolerance_deg
+            if orientation_tolerance_deg is None
+            else float(orientation_tolerance_deg)
+        )
+        position_tolerance = self.config.endpoint_position_tolerance_m
+        remaining_evaluations = int(maximum_evaluations) - evaluations
+        if refine_tolerance_region and remaining_evaluations > 0 and (
+            position > position_tolerance or orientation > rotation_tolerance
+        ) and (deadline is None or float(monotonic()) < deadline):
+            # A weighted pose optimum need not satisfy both admission bounds.
+            # Search the feasible tolerance region with the SAME target and
+            # joint bounds, using only this seed's remaining evaluation budget.
+            # The tiny inward offset avoids returning just outside a bound at
+            # numerical convergence; final admission still uses the real bounds.
+            scales = np.repeat(
+                (
+                    position_scale / (position_tolerance * (1.0 - 1e-6)),
+                    math.degrees(orientation_scale)
+                    / (rotation_tolerance * (1.0 - 1e-6)),
+                ),
+                3,
+            )
+
+            def violation(values: np.ndarray) -> np.ndarray:
+                normalized = (residual(values) * scales).reshape(2, 3)
+                norms = np.linalg.norm(normalized, axis=1)
+                factors = np.maximum(0.0, 1.0 - 1.0 / np.maximum(norms, 1.0))
+                return (normalized * factors[:, None]).reshape(6)
+
+            def violation_jacobian(values: np.ndarray) -> np.ndarray:
+                normalized = (residual(values) * scales).reshape(2, 3)
+                scaled_jacobian = jacobian(values) * scales[:, None]
+                result = np.zeros((6, 6))
+                for block, vector in enumerate(normalized):
+                    norm = float(np.linalg.norm(vector))
+                    if norm > 1.0:
+                        derivative = (
+                            (1.0 - 1.0 / norm) * np.eye(3)
+                            + np.outer(vector, vector) / norm**3
+                        )
+                        section = slice(3 * block, 3 * block + 3)
+                        result[section] = derivative @ scaled_jacobian[section]
+                return result
+
+            refined = least_squares(
+                violation,
+                np.asarray(solved.x, dtype=float),
+                jac=violation_jacobian if callable(pose_and_jacobian) else "2-point",
+                bounds=(lower, upper),
+                max_nfev=min(60, remaining_evaluations),
+                xtol=1e-9,
+                ftol=1e-9,
+                gtol=1e-9,
+            )
+            evaluations += int(refined.nfev)
+            refined_candidate = qpos_pair(np.asarray(refined.x, dtype=float))
+            refined_tcp = self.target_builder.tool_tcp_world_targets_for_qpos_pair(
+                left_qpos=refined_candidate["left"],
+                right_qpos=refined_candidate["right"],
+            )[side]
+            refined_position, refined_orientation = pose_delta_metrics(
+                refined_tcp, target_pose
+            )
+            if max(
+                refined_position / position_tolerance,
+                refined_orientation / rotation_tolerance,
+            ) < max(position / position_tolerance, orientation / rotation_tolerance):
+                candidate, position, orientation = (
+                    refined_candidate, refined_position, refined_orientation
+                )
         if prefer_closest_tolerance and (
             position <= self.config.endpoint_position_tolerance_m
             and orientation <= self.config.endpoint_orientation_tolerance_deg
@@ -2411,7 +2513,7 @@ class RM65GraspJointTrajectoryPlanner:
                 seed_qpos=np.asarray(seed_qpos, dtype=float),
                 solved_qpos=np.asarray(candidate[side], dtype=float),
             )
-        return candidate, int(solved.nfev), position, orientation
+        return candidate, evaluations, position, orientation
 
     def _closest_tolerance_endpoint(
         self,
@@ -2502,6 +2604,7 @@ class RM65GraspJointTrajectoryPlanner:
         deadline: float | None = None,
         monotonic: Callable[[], float] = time.perf_counter,
     ) -> tuple[_EndpointIKCandidate, ...]:
+        self.require_static_grasp_scene(qpos_by_side=qpos_by_side, side=side)
         solver_targets = self.target_builder.solver_world_targets_for_qpos_pair(
             left_qpos=qpos_by_side["left"],
             right_qpos=qpos_by_side["right"],
@@ -2539,130 +2642,156 @@ class RM65GraspJointTrajectoryPlanner:
         collision_blocked = False
         clearance_blocked = False
         endpoint_envelope_blocked = False
-        for seed_index, seed in enumerate(
-            self._endpoint_seed_qpos(qpos_by_side, side=side)
+        normal_seeds = tuple(
+            (index, seed, self.config.maximum_endpoint_solve_cycles)
+            for index, seed in enumerate(self._endpoint_seed_qpos(qpos_by_side, side=side))
+        )
+        feasibility_seeds: list[tuple[int, dict[str, np.ndarray], int]] = []
+        pose_feasible_found = False
+        # Preserve all normal branches and the existing clearance rescue.
+        # Only a complete pose-only miss needs tolerance-region continuation.
+        for refine_tolerance_region, search_seeds in (
+            (False, normal_seeds), (True, feasibility_seeds),
         ):
-            if deadline is not None and float(monotonic()) >= deadline:
-                if accepted:
-                    break
-                raise RM65GraspTrajectoryPlanningError(
-                    "path_planning_time_budget_exhausted",
-                    details={
-                        "planning_phase": "endpoint_ik",
-                        "time_budget_sec": (self.config.path_planning_time_budget_sec),
-                        "endpoint_seed_count_attempted": len(attempts),
-                        "attempts": attempts,
-                    },
-                )
-            outcome = "ik_search_exhausted"
-            evaluations = 0
-            collision_detail: dict[str, object] = {}
-            try:
-                candidate, evaluations, position, orientation = (
-                    self._least_squares_endpoint_from_seed(
-                        qpos_by_side=qpos_by_side,
-                        side=side,
-                        target_tool_tcp_world=target_tool_tcp_world,
-                        seed_qpos=seed[side],
-                        maximum_evaluations=(self.config.maximum_endpoint_solve_cycles),
-                        prefer_closest_tolerance=prefer_closest_tolerance,
+            if refine_tolerance_region and (
+                pose_feasible_found
+                or effective_orientation_tolerance_deg
+                != self.config.endpoint_orientation_tolerance_deg
+            ):
+                break
+            for seed_index, seed, maximum_evaluations in search_seeds:
+                if deadline is not None and float(monotonic()) >= deadline:
+                    if accepted:
+                        break
+                    raise RM65GraspTrajectoryPlanningError(
+                        "path_planning_time_budget_exhausted",
+                        details={
+                            "planning_phase": "endpoint_ik",
+                            "time_budget_sec": (self.config.path_planning_time_budget_sec),
+                            "endpoint_seed_count_attempted": len(attempts),
+                            "attempts": attempts,
+                        },
                     )
+                outcome = "ik_search_exhausted"
+                evaluations = 0
+                collision_detail: dict[str, object] = {}
+                try:
+                    candidate, evaluations, position, orientation = (
+                        self._least_squares_endpoint_from_seed(
+                            qpos_by_side=qpos_by_side,
+                            side=side,
+                            target_tool_tcp_world=target_tool_tcp_world,
+                            seed_qpos=seed[side],
+                            maximum_evaluations=maximum_evaluations,
+                            prefer_closest_tolerance=prefer_closest_tolerance,
+                            orientation_tolerance_deg=effective_orientation_tolerance_deg,
+                            refine_tolerance_region=refine_tolerance_region,
+                            deadline=deadline,
+                            monotonic=monotonic,
+                        )
+                    )
+                    candidate[inactive] = np.asarray(
+                        qpos_by_side[inactive], dtype=float
+                    ).copy()
+                except RM65GraspTrajectoryPlanningError:
+                    raise
+                except (RuntimeError, ValueError, np.linalg.LinAlgError) as exc:
+                    attempts.append(
+                        {
+                            "seed_index": seed_index,
+                            "solve_cycles": evaluations,
+                            "outcome": "ik_solver_error",
+                            "error_type": type(exc).__name__,
+                        }
+                    )
+                    continue
+                within_tolerance = (
+                    position <= self.config.endpoint_position_tolerance_m
+                    and orientation <= effective_orientation_tolerance_deg
                 )
-                candidate[inactive] = np.asarray(
-                    qpos_by_side[inactive], dtype=float
-                ).copy()
-            except RM65GraspTrajectoryPlanningError:
-                raise
-            except (RuntimeError, ValueError, np.linalg.LinAlgError) as exc:
+                if not refine_tolerance_region and not within_tolerance:
+                    remaining = maximum_evaluations - evaluations
+                    if remaining > 0:
+                        feasibility_seeds.append((seed_index, candidate, remaining))
+                if within_tolerance:
+                    pose_feasible_found = True
+                    if not self._qpos_is_within_target_envelope(
+                        candidate,
+                        sides=(side,),
+                        phase="endpoint",
+                    ):
+                        endpoint_envelope_blocked = True
+                        outcome = "endpoint_safety_envelope_blocked"
+                    elif any(
+                        _joint_proposals_match(
+                            candidate[side],
+                            item.qpos_by_side[side],
+                            atol=1e-5,
+                        )
+                        for item in accepted
+                    ):
+                        outcome = "duplicate_exact_solution"
+                    else:
+                        check = self.oracle.check(candidate)
+                        if not check.collision_check_available:
+                            collision_unavailable = True
+                            outcome = "endpoint_collision_check_unavailable"
+                        elif not check.safe:
+                            positive_gap = (
+                                check.minimum_distance_m is not None
+                                and check.minimum_distance_m > 0.0
+                            )
+                            if positive_gap:
+                                clearance_blocked = True
+                                outcome = "endpoint_clearance_blocked"
+                                clearance_rescue_seeds.append(
+                                    (
+                                        float(check.minimum_distance_m),
+                                        seed_index,
+                                        {
+                                            name: np.asarray(values, dtype=float).copy()
+                                            for name, values in candidate.items()
+                                        },
+                                    )
+                                )
+                            else:
+                                collision_blocked = True
+                                outcome = "endpoint_collision_blocked"
+                            collision_detail = {
+                                "closest_geometry_names": check.metadata.get(
+                                    "closest_geometry_names"
+                                ),
+                                "closest_obstacle_id": check.metadata.get(
+                                    "closest_obstacle_id"
+                                ),
+                                "minimum_distance_m": check.minimum_distance_m,
+                            }
+                        else:
+                            accepted.append(
+                                _EndpointIKCandidate(
+                                    qpos_by_side=candidate,
+                                    seed_index=seed_index,
+                                    solve_cycles=evaluations,
+                                    position_residual_m=position,
+                                    orientation_residual_deg=orientation,
+                                )
+                            )
+                            outcome = "accepted"
                 attempts.append(
                     {
                         "seed_index": seed_index,
                         "solve_cycles": evaluations,
-                        "outcome": "ik_solver_error",
-                        "error_type": type(exc).__name__,
+                        "tolerance_feasibility_rescue": refine_tolerance_region,
+                        "outcome": outcome,
+                        "best_position_residual_m": position,
+                        "best_orientation_residual_deg": orientation,
+                        **collision_detail,
                     }
                 )
-                continue
-            if (
-                position <= self.config.endpoint_position_tolerance_m
-                and orientation <= effective_orientation_tolerance_deg
-            ):
-                if not self._qpos_is_within_target_envelope(
-                    candidate,
-                    sides=(side,),
-                    phase="endpoint",
-                ):
-                    endpoint_envelope_blocked = True
-                    outcome = "endpoint_safety_envelope_blocked"
-                elif any(
-                    _joint_proposals_match(
-                        candidate[side],
-                        item.qpos_by_side[side],
-                        atol=1e-5,
-                    )
-                    for item in accepted
-                ):
-                    outcome = "duplicate_exact_solution"
-                else:
-                    check = self.oracle.check(candidate)
-                    if not check.collision_check_available:
-                        collision_unavailable = True
-                        outcome = "endpoint_collision_check_unavailable"
-                    elif not check.safe:
-                        positive_gap = (
-                            check.minimum_distance_m is not None
-                            and check.minimum_distance_m > 0.0
-                        )
-                        if positive_gap:
-                            clearance_blocked = True
-                            outcome = "endpoint_clearance_blocked"
-                            clearance_rescue_seeds.append(
-                                (
-                                    float(check.minimum_distance_m),
-                                    seed_index,
-                                    {
-                                        name: np.asarray(values, dtype=float).copy()
-                                        for name, values in candidate.items()
-                                    },
-                                )
-                            )
-                        else:
-                            collision_blocked = True
-                            outcome = "endpoint_collision_blocked"
-                        collision_detail = {
-                            "closest_geometry_names": check.metadata.get(
-                                "closest_geometry_names"
-                            ),
-                            "closest_obstacle_id": check.metadata.get(
-                                "closest_obstacle_id"
-                            ),
-                            "minimum_distance_m": check.minimum_distance_m,
-                        }
-                    else:
-                        accepted.append(
-                            _EndpointIKCandidate(
-                                qpos_by_side=candidate,
-                                seed_index=seed_index,
-                                solve_cycles=evaluations,
-                                position_residual_m=position,
-                                orientation_residual_deg=orientation,
-                            )
-                        )
-                        outcome = "accepted"
-            attempts.append(
-                {
-                    "seed_index": seed_index,
-                    "solve_cycles": evaluations,
-                    "outcome": outcome,
-                    "best_position_residual_m": position,
-                    "best_orientation_residual_deg": orientation,
-                    **collision_detail,
-                }
-            )
-            # Only the advisory existence probe requests this. Admission
-            # and path consumers still search every normal IK branch.
-            if stop_on_first_feasible and accepted:
-                break
+                # Only the advisory existence probe requests this. Admission
+                # and path consumers still search every normal IK branch.
+                if stop_on_first_feasible and accepted:
+                    break
         # Pose-only least squares converges to the exact target and therefore
         # cannot use the already-authorized endpoint tolerance to improve a
         # positive but insufficient clearance.  Starting from the best such
@@ -2704,6 +2833,10 @@ class RM65GraspJointTrajectoryPlanner:
                                 60,
                             ),
                             prefer_closest_tolerance=False,
+                            orientation_tolerance_deg=effective_orientation_tolerance_deg,
+                            refine_tolerance_region=False,
+                            deadline=deadline,
+                            monotonic=monotonic,
                         )
                     )
                     candidate[inactive] = np.asarray(
@@ -2972,6 +3105,9 @@ class RM65GraspJointTrajectoryPlanner:
                                 config.max_solve_evaluations_per_seed,
                                 remaining_evaluations,
                             ),
+                            orientation_tolerance_deg=config.standard_orientation_tolerance_deg,
+                            deadline=deadline,
+                            monotonic=monotonic,
                         )
                     )
                 except (RuntimeError, ValueError, np.linalg.LinAlgError):
@@ -3785,6 +3921,10 @@ class RM65GraspJointTrajectoryPlanner:
                                 self.config.maximum_endpoint_solve_cycles
                             ),
                             prefer_closest_tolerance=False,
+                            orientation_tolerance_deg=orientation_tolerance_deg,
+                            refine_tolerance_region=approach_progress == 1.0,
+                            deadline=deadline,
+                            monotonic=monotonic,
                         )
                     )
                 except RM65GraspTrajectoryPlanningError:
@@ -4415,6 +4555,16 @@ class RM65GraspJointTrajectoryPlanner:
         current = {name: np.asarray(qpos_by_side[name], dtype=float).copy() for name in _SIDES}
         started = float(monotonic())
         deadline = started + min(budget, self.config.path_planning_time_budget_sec)
+        try:
+            self.require_static_grasp_scene(qpos_by_side=current, side=side)
+        except RM65GraspTrajectoryPlanningError as error:
+            return RM65GraspLocalChainResult(
+                feasible=False, selected_pregrasp_distance_m=None, branch_count=0,
+                elapsed_ms=max(0.0, (float(monotonic()) - started) * 1000.0),
+                reason_code=error.reason_code,
+                attempts=({"status": "rejected", "reason_code": error.reason_code,
+                    **error.details},),
+            )
         attempts: list[Mapping[str, object]] = []
         last_error: RM65GraspTrajectoryPlanningError | None = None
         terminal_endpoint_search = self._terminal_endpoint_search(
@@ -4793,6 +4943,7 @@ class RM65GraspJointTrajectoryPlanner:
             for name in _SIDES
         }
         target_pose = np.asarray(target_tool_tcp_world, dtype=float).reshape(4, 4).copy()
+        self.require_static_grasp_scene(qpos_by_side=current, side=selected_side)
         if self.observed_obstacles is not None:
             initial_check = self.oracle.check(current)
             if not initial_check.collision_check_available or not initial_check.safe:
