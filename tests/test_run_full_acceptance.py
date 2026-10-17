@@ -16,6 +16,7 @@ SOURCE_ROOT = Path(__file__).resolve().parents[1]
 SOURCE_WRAPPER = SOURCE_ROOT / "scripts/run_full_acceptance.sh"
 SOURCE_SHARDING = SOURCE_ROOT / "scripts/pytest_sharding.py"
 REBOT_MODEL = Path("hardware/reBotArm_control_py/urdf/00-arm-rs_asm-v3/urdf/00-arm-rs_asm-v3.urdf")
+FIXTURE_MODULE_COUNT = 12
 
 
 def _wrapper_checkout(tmp_path: Path) -> tuple[Path, Path, Path]:
@@ -28,7 +29,7 @@ def _wrapper_checkout(tmp_path: Path) -> tuple[Path, Path, Path]:
     model.parent.mkdir(parents=True)
     model.write_text("<robot name='preflight-fixture'/>", encoding="utf-8")
     model.chmod(0o444)
-    for index in range(9):
+    for index in range(FIXTURE_MODULE_COUNT):
         (tests / f"test_case_{index}.py").write_text(
             "#" * (1_000 + index * 200), encoding="utf-8"
         )
@@ -36,6 +37,9 @@ def _wrapper_checkout(tmp_path: Path) -> tuple[Path, Path, Path]:
     shutil.copy2(SOURCE_WRAPPER, wrapper)
     sharding_real = scripts / "pytest_sharding_real.py"
     shutil.copy2(SOURCE_SHARDING, sharding_real)
+    node = scripts / "node"
+    node.write_text('#!/bin/sh\nexit "${FAKE_NODE_PREFLIGHT_STATUS:-0}"\n', encoding="utf-8")
+    node.chmod(0o755)
     (scripts / "pytest_sharding.py").write_text(
         """#!/usr/bin/env python3
 import os
@@ -115,6 +119,7 @@ def _run_wrapper(
     check_forkserver: bool = False,
     fail_shard: str = "",
     socket_preflight_status: int = 0,
+    node_preflight_status: int = 0,
 ) -> subprocess.CompletedProcess[str]:
     environment = dict(os.environ)
     environment.pop("DEXTELEOP_FULL_ACCEPTANCE_SHARDS", None)
@@ -128,7 +133,9 @@ def _run_wrapper(
             "FAKE_START_BARRIER": str(effective_shards if max_jobs is None else max_jobs),
             "FAKE_CHECK_FORKSERVER": "1" if check_forkserver else "0",
             "FAKE_SOCKET_PREFLIGHT_STATUS": str(socket_preflight_status),
+            "FAKE_NODE_PREFLIGHT_STATUS": str(node_preflight_status),
             "FAKE_SYNC_ROOT": str(sync_root),
+            "PATH": str(wrapper.parent) + os.pathsep + environment.get("PATH", ""),
         }
     )
     if shard_count is not None:
@@ -152,7 +159,7 @@ def _assert_complete_run(
     planned = [
         module for shard in manifest["shards"] for module in shard["test_modules"]
     ]
-    assert len(planned) == len(set(planned)) == 9
+    assert len(planned) == len(set(planned)) == FIXTURE_MODULE_COUNT
     isolated_paths = {
         "xdg-cache": "xdg-cache",
         "python-cache": "python-bytecode",
@@ -217,7 +224,10 @@ def test_wrapper_defaults_to_four_complete_shards(
     assert not os.path.lexists(checkout / "assets")
 
 
-@pytest.mark.parametrize("shard_count,max_jobs", [(6, 1), (6, 2), (6, 3), (5, 2), (6, 5)])
+@pytest.mark.parametrize(
+    "shard_count,max_jobs",
+    [(6, 1), (6, 2), (6, 3), (5, 2), (6, 5), (7, 2), (12, 1), (12, 2), (12, 5), (12, 6)],
+)
 def test_wrapper_bounds_live_jobs_without_reducing_the_plan(
     tmp_path: Path, shard_count: int, max_jobs: int,
 ) -> None:
@@ -248,16 +258,21 @@ def test_wrapper_bounds_live_jobs_without_reducing_the_plan(
     assert not os.path.lexists(checkout / "assets")
 
 
-@pytest.mark.parametrize("max_jobs", [0, 5, 7, "auto"])
+@pytest.mark.parametrize(
+    "shard_count,max_jobs",
+    [(None, 0), (None, 5), (None, 7), (None, "auto"), (12, None), (12, 7), (12, "auto")],
+)
 def test_wrapper_rejects_invalid_job_limits_before_artifacts(
-    tmp_path: Path, max_jobs: int | str,
+    tmp_path: Path, shard_count: int | None, max_jobs: int | str | None,
 ) -> None:
     checkout, wrapper, sync_root = _wrapper_checkout(tmp_path)
     assets = tmp_path / "assets"
     assets.mkdir()
     run_root = tmp_path / "invalid-jobs"
 
-    completed = _run_wrapper(wrapper, sync_root, assets, run_root, max_jobs=max_jobs)
+    completed = _run_wrapper(
+        wrapper, sync_root, assets, run_root, shard_count=shard_count, max_jobs=max_jobs
+    )
 
     assert completed.returncode == 2
     assert "DEXTELEOP_FULL_ACCEPTANCE_MAX_JOBS" in completed.stderr
@@ -307,7 +322,7 @@ def test_wrapper_supports_explicit_additional_shards(
     assert not os.path.lexists(checkout / "assets")
 
 
-@pytest.mark.parametrize("shard_count", ["7", "auto"])
+@pytest.mark.parametrize("shard_count", ["0", "13", "auto"])
 def test_wrapper_rejects_unsupported_shard_counts(
     tmp_path: Path, shard_count: str
 ) -> None:
@@ -321,7 +336,8 @@ def test_wrapper_rejects_unsupported_shard_counts(
     )
 
     assert completed.returncode == 2
-    assert "must be an integer from 1 to 6" in completed.stderr
+    assert "must be an integer from 1 to 12" in completed.stderr
+    assert not run_root.exists()
     assert not list(sync_root.glob("*.started"))
     assert not os.path.lexists(checkout / "assets")
 
@@ -378,9 +394,28 @@ def test_wrapper_rejects_missing_socket_capability_before_artifact_root(
     assert not os.path.lexists(checkout / "assets")
 
 
-@pytest.mark.parametrize("max_jobs", [None, 1, 2])
+def test_wrapper_rejects_incompatible_node_before_artifacts_or_shards(
+    tmp_path: Path,
+) -> None:
+    checkout, wrapper, sync_root = _wrapper_checkout(tmp_path)
+    assets = tmp_path / "assets"
+    assets.mkdir()
+    run_root = tmp_path / "node-blocked"
+
+    completed = _run_wrapper(
+        wrapper, sync_root, assets, run_root, node_preflight_status=17
+    )
+
+    assert completed.returncode == 2
+    assert "Node.js on PATH cannot run the annotation browser contracts" in completed.stderr
+    assert not run_root.exists()
+    assert not list(sync_root.glob("*.started"))
+    assert not os.path.lexists(checkout / "assets")
+
+
+@pytest.mark.parametrize("shard_count,max_jobs", [(6, None), (6, 1), (6, 2), (12, 2), (12, 5)])
 def test_wrapper_propagates_failure_after_preserving_other_shards(
-    tmp_path: Path, max_jobs: int | None,
+    tmp_path: Path, shard_count: int, max_jobs: int | None,
 ) -> None:
     checkout, wrapper, sync_root = _wrapper_checkout(tmp_path)
     assets = tmp_path / "assets"
@@ -392,16 +427,16 @@ def test_wrapper_propagates_failure_after_preserving_other_shards(
         sync_root,
         assets,
         run_root,
-        shard_count=6,
+        shard_count=shard_count,
         max_jobs=max_jobs,
         fail_shard="shard-1",
     )
 
     assert completed.returncode == 1
     assert "full acceptance shard 1 (status=7)" in completed.stdout
-    assert all((run_root / f"shard-{index}.xml").is_file() for index in range(6))
+    assert all((run_root / f"shard-{index}.xml").is_file() for index in range(shard_count))
     assert (run_root / "full-acceptance.xml").is_file()
-    _assert_complete_run(sync_root, run_root, shard_count=6)
+    _assert_complete_run(sync_root, run_root, shard_count=shard_count)
     assert not os.path.lexists(checkout / "assets")
 
 

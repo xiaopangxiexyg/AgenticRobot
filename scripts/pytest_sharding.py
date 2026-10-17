@@ -20,7 +20,7 @@ from pathlib import Path
 # here makes the default plan useful in a clean checkout without depending on
 # mutable Harness history.
 FULL_WEIGHTS = {
-    # Exact testcase sums from the green six-shard baseline at 47d7be6e,
+    # Existing testcase sums from the green six-shard baseline at 47d7be6e,
     # except the two artifact I/O modules refreshed at c3c06be6 (2026-09-25).
     # These are scheduling estimates only; they do not change test selection.
     "tests/test_mujoco_temp_pipeline.py": 134.914,
@@ -71,6 +71,17 @@ FULL_WEIGHTS = {
     "tests/test_lazy_package_root_exports.py": 5.736,
     "tests/test_control_station_contracts.py": 5.593,
     "tests/test_policy_learning_boundaries.py": 5.103,
+    # Previously unweighted modules >= 5 s in the green 298221fc full Run
+    # full-20261018-baseline6j1node22 (six serial batches, Node 22).
+    "tests/test_dmtac_cube_contact_probe.py": 66.941,
+    "tests/test_agent_gateway_mujoco_safe_tcp_pose.py": 33.811,
+    "tests/test_rm65_dmtac_sweep_probe.py": 15.684,
+    "tests/test_owned_worker_cleanup.py": 12.397,
+    "tests/test_mujoco_planned_tcp_constraints.py": 11.803,
+    "tests/test_openpi_cpu_resources.py": 10.931,
+    "tests/test_agent_gateway_mujoco_gripper_contact.py": 9.849,
+    "tests/test_sam3_service.py": 9.564,
+    "tests/test_agent_gateway_mujoco_back_projection.py": 8.847,
 }
 
 # Modules normally remain the isolation unit. These two long-running modules

@@ -103,13 +103,17 @@ prepare_asset_compat_link() {
 configure_shards() {
   SHARD_COUNT="${DEXTELEOP_FULL_ACCEPTANCE_SHARDS:-4}"
   case "$SHARD_COUNT" in
-    1|2|3|4|5|6) ;;
-    *) die "DEXTELEOP_FULL_ACCEPTANCE_SHARDS must be an integer from 1 to 6: $SHARD_COUNT" ;;
+    1|2|3|4|5|6|7|8|9|10|11|12) ;;
+    *) die "DEXTELEOP_FULL_ACCEPTANCE_SHARDS must be an integer from 1 to 12: $SHARD_COUNT" ;;
   esac
+  # More fresh-process batches must not implicitly increase live concurrency.
+  if ((SHARD_COUNT > 6)) && [[ -z "${DEXTELEOP_FULL_ACCEPTANCE_MAX_JOBS:-}" ]]; then
+    die "DEXTELEOP_FULL_ACCEPTANCE_MAX_JOBS must be explicit when SHARD_COUNT exceeds 6"
+  fi
   MAX_JOBS="${DEXTELEOP_FULL_ACCEPTANCE_MAX_JOBS:-$SHARD_COUNT}"
   case "$MAX_JOBS" in
     1|2|3|4|5|6) ;;
-    *) die "DEXTELEOP_FULL_ACCEPTANCE_MAX_JOBS must be an integer from 1 to SHARD_COUNT ($SHARD_COUNT): $MAX_JOBS" ;;
+    *) die "DEXTELEOP_FULL_ACCEPTANCE_MAX_JOBS must be an integer from 1 to 6: $MAX_JOBS" ;;
   esac
   ((MAX_JOBS <= SHARD_COUNT)) || die \
     "DEXTELEOP_FULL_ACCEPTANCE_MAX_JOBS must not exceed SHARD_COUNT ($SHARD_COUNT): $MAX_JOBS"
@@ -118,6 +122,13 @@ configure_shards() {
 verify_local_socket_capabilities() {
   python3 "$REPO_ROOT/scripts/pytest_sharding.py" check-sockets || die \
     "complete acceptance requires working loopback TCP and Unix sockets"
+}
+
+verify_browser_contract_runtime() {
+  # Absence remains optional, but an installed incompatible Node fails the suite.
+  command -v node >/dev/null 2>&1 || return 0
+  node -e 'const assert = require("node:assert/strict"); const value = {ready: true}; assert.equal(value?.ready ?? false, true);' \
+    || die "Node.js on PATH cannot run the annotation browser contracts; select a compatible runtime before complete acceptance (no shards started)"
 }
 
 verify_required_model_input() {
@@ -247,6 +258,7 @@ trap cleanup EXIT
 configure_shards
 verify_required_model_input
 verify_local_socket_capabilities
+verify_browser_contract_runtime
 prepare_run_root
 prepare_asset_compat_link
 # Wrapper configuration is private to this invocation.  Do not leak it into

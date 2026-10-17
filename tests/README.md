@@ -236,6 +236,9 @@ The wrapper also verifies that the
 host can create both loopback TCP and Unix sockets required by the complete
 suite. An incapable sandbox therefore fails immediately instead of running the
 remaining modules and reporting predictable transport errors at the end.
+如果 `PATH` 中存在 Node.js，入口还会验证浏览器契约所需的语法和 `node:assert/strict`；
+不兼容时在创建证据目录和启动分片前失败。Node 缺失时仍由原有可选测试报告跳过。
+远端非交互命令应显式选择已有的兼容 Node 运行时，不能假设交互 shell 的版本管理器已生效。
 It assigns every discovered `tests/test_*.py` module exactly once using a
 checked-in sparse timing profile plus a deterministic source-size fallback.
 Modules remain the isolation unit unless the full profile explicitly registers
@@ -257,6 +260,9 @@ failed, capability-limited, or focused runs are not representative inputs.
 完整验证的模块和 replay 函数权重以绿色六分片基线 `47d7be6e` 为基础；其中
 artifact migration / resolution 两个 I/O 模块按 `c3c06be6` 在 2026-09-25 的
 绿色全量结果更新为 49.666 / 15.847 秒，避免旧估值将耗时集中在同一分片。
+2026-10-18 的绿色完整基线 `298221fc`（六分片串行、Node 22）补齐了九个此前未加权、
+实际累计至少五秒的模块，包括 DMTAC 接触、Gateway 安全位姿和 worker 清理等。
+既有模块与函数权重保留，避免把单一远端的 I/O 差异当作全局变化。
 这些值只用于调度，不是 timeout 或验收阈值；不改变测试内容、真实 `fsync`、
 模块隔离边界、参数矩阵或 fast Profile 的权重。
 The default remains four shards. Each shard has separate pytest, Python, XDG,
@@ -266,11 +272,12 @@ locking, atomic publication, and hash validation, and it is never reused across
 Run roots. The wrapper waits for every child, rejects duplicate JUnit
 identities, and writes `full-acceptance.xml` plus `shard-plan.json` under a new
 artifact root. Set
-`DEXTELEOP_FULL_ACCEPTANCE_SHARDS=1` for single-process reproduction. Explicit five-
-and six-shard runs are supported only on hosts whose CPU and memory headroom
-has been validated; values above six remain outside the measured concurrency
-and memory budget. Keep the deterministic default instead of deriving this
-setting automatically from `nproc`. Harness callers
+`DEXTELEOP_FULL_ACCEPTANCE_SHARDS=1` for single-process reproduction. Up to twelve
+shards are supported, with at most six live shard processes. More than six
+shards require an explicit `DEXTELEOP_FULL_ACCEPTANCE_MAX_JOBS`; they never
+implicitly increase concurrency. Validate the CPU and memory headroom for each
+chosen concurrency level. Keep the deterministic default instead of deriving
+this setting automatically from `nproc`. Harness callers
 may set new absolute `DEXTELEOP_FULL_ACCEPTANCE_RUN_ROOT` and
 `DEXTELEOP_FULL_ACCEPTANCE_JUNIT` paths so the aggregate evidence remains in
 the protected Run directory. Explicit test targets are rejected because this
@@ -284,13 +291,20 @@ DEXTELEOP_FULL_ACCEPTANCE_MAX_JOBS=1 \
 bash scripts/run_full_acceptance.sh --durations=50
 ```
 
-`MAX_JOBS` 必须介于 1 与 `SHARDS` 之间；未设置时仍同时启动全部分片，默认四分片行为不变。
+`MAX_JOBS` 必须介于 1 与 `min(SHARDS, 6)` 之间；六片以内未设置时仍同时启动全部分片，
+默认四分片行为不变。七至十二片必须显式设置 `MAX_JOBS`，配置不完整或越界时在创建证据目录前拒绝。
 上例保持六分片的完整目标集合、参数矩阵和隔离边界，逐个运行 pytest 进程，避免一个长期驻留
 进程积累所有模块的原生内存。失败分片不会取消后续待运行分片，最终仍合并全部 JUnit 并返回失败。
 这是并发上限，不是内存硬限额；进程还可能创建子进程，调用方仍需独立的资源预算和停止条件。
 中断沿用直接子进程信号机制，不能据此断言 pytest 的全部后代已退出；需要可靠整组停止时，
 由调用方使用 cgroup 或等价的进程树生命周期管理并验证退出状态。
 较低并发通常增加墙钟时间，不能把它作为速度提升的证据。
+
+当长 pytest 进程的常驻内存随模块加载和测试执行累积时，可以增加 `SHARDS`，同时保持已经
+验证的 `MAX_JOBS`。例如十二片、单并发会让每个进程执行更短的批次，退出后再启动下一片；
+仍使用同一完整目标规划器，每个目标及其全部参数只执行一次，模块级 fixture 的隔离边界不变。
+更多分片会增加收集和进程启动成本，也不能降低单个测试模块本身的峰值。应比较完整 JUnit、
+墙钟时间和内存记录后选择配置，不能仅凭分片数推断加速或安全并发数。
 
 每个分片的 `TMPDIR` 位于本次运行独有的 `/tmp/dt-full-tmp-*/shard-*` 短路径，而不是证据目录。
 Python multiprocessing/forkserver 使用 `TMPDIR` 创建 Unix socket，不读取 pytest 的 `--basetemp`；
