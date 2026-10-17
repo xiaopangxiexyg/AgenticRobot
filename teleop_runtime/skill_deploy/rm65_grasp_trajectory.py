@@ -28,6 +28,12 @@ from robot_motion.path_planning import (
     JointPathStatus,
     plan_collision_aware_joint_path,
 )
+from robot_motion.path_planning.motion_quality import (
+    DEFAULT_PATH_MOTION_QUALITY_LIMITS,
+    PathMotionQualityLimits,
+    sampled_path_motion_quality,
+    tcp_path_edge_cost,
+)
 from robot_motion.pose import pose_delta_metrics
 from robot_motion.position_control.horizon_governor import JointHorizonLimits
 from robot_motion.position_control.offline_waypoint_trajectory import (
@@ -142,6 +148,9 @@ class RM65GraspTrajectoryPlanningError(RuntimeError):
 @dataclass(frozen=True)
 class RM65GraspTrajectoryPlanningConfig:
     minimum_clearance_m: float = 0.02
+    maximum_proximal_joint_travel_rad: float = DEFAULT_PATH_MOTION_QUALITY_LIMITS.maximum_proximal_joint_travel_rad
+    maximum_tcp_detour_ratio: float = DEFAULT_PATH_MOTION_QUALITY_LIMITS.maximum_tcp_detour_ratio
+    maximum_tcp_detour_excess_m: float = DEFAULT_PATH_MOTION_QUALITY_LIMITS.maximum_tcp_detour_excess_m
     linear_speed_m_s: float = 0.12
     angular_speed_deg_s: float = 45.0
     minimum_segment_duration_sec: float = 0.25
@@ -193,8 +202,7 @@ class RM65GraspTrajectoryPlanningConfig:
             self,
             endpoint_position_tolerance_m=translation_tolerance_m,
             endpoint_orientation_tolerance_deg=orientation_deg,
-            # These approach-only fields are unused by ordinary moves, but
-            # the immutable configuration still requires consistent bounds.
+            # Local ordinary moves also share the approach solver bounds.
             pregrasp_orientation_tolerance_deg=max(
                 self.pregrasp_orientation_tolerance_deg, orientation_deg,
             ),
@@ -208,6 +216,9 @@ class RM65GraspTrajectoryPlanningConfig:
             raise ValueError("allow_unconstrained_terminal_fallback must be bool.")
         for name in (
             "minimum_clearance_m",
+            "maximum_proximal_joint_travel_rad",
+            "maximum_tcp_detour_ratio",
+            "maximum_tcp_detour_excess_m",
             "linear_speed_m_s",
             "angular_speed_deg_s",
             "minimum_segment_duration_sec",
@@ -441,6 +452,7 @@ class RM65GraspLocalChainResult:
     elapsed_ms: float
     reason_code: str | None
     attempts: tuple[Mapping[str, object], ...]
+    joint_travel_rad: tuple[float, ...] | None = None
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -450,6 +462,7 @@ class RM65GraspLocalChainResult:
             "elapsed_ms": self.elapsed_ms,
             "reason_code": self.reason_code,
             "attempts": [dict(item) for item in self.attempts],
+            "joint_travel_rad": self.joint_travel_rad,
         }
 
 
@@ -483,6 +496,7 @@ class _EndpointIKCandidate:
     position_residual_m: float
     orientation_residual_deg: float
     search_attempt_count: int = 0
+    generation_attempts: tuple[Mapping[str, object], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -491,6 +505,19 @@ class _PlannedPathLeg:
     path: JointPathPlanResult
     dense_revalidation: Mapping[str, object]
     search_attempts: tuple[Mapping[str, object], ...]
+
+
+def _plain_search_evidence(value):
+    """Project frozen collision metadata into the existing JSON record."""
+    if isinstance(value, Mapping):
+        return {key: _plain_search_evidence(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_plain_search_evidence(item) for item in value]
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, np.generic):
+        return value.item()
+    return value
 
 
 @dataclass(frozen=True)
@@ -2953,7 +2980,8 @@ class RM65GraspJointTrajectoryPlanner:
                 side=side,
             )
             return tuple(
-                replace(candidate, search_attempt_count=len(attempts))
+                replace(candidate, search_attempt_count=len(attempts),
+                        generation_attempts=tuple(attempts))
                 for candidate in ordered[: self.config.maximum_endpoint_candidates]
             )
         if collision_unavailable:
@@ -3604,6 +3632,35 @@ class RM65GraspJointTrajectoryPlanner:
             ),
         }
 
+    def _trajectory_motion_quality(self, values, *, side: str, deadline, monotonic):
+        positions = []
+        for left, right in zip(values["left"], values["right"]):
+            self._remaining_path_planning_time_sec(deadline=deadline, monotonic=monotonic,
+                planning_phase="trajectory_motion_quality")
+            positions.append(self.target_builder.tool_tcp_world_targets_for_qpos_pair(
+                left_qpos=left, right_qpos=right)[side][:3, 3])
+        return sampled_path_motion_quality(np.asarray(values[side]), np.asarray(positions))
+
+    def _tcp_path_edge_cost(self, start, end, *, side: str) -> float:
+        """Sample FK travel for quality only; collision checks stay independent."""
+        return tcp_path_edge_cost(start, end, side=side,
+            step_rad=self.planner_config.extension_step_rad,
+            pose_for_pair=lambda pair: self.target_builder.tool_tcp_world_targets_for_qpos_pair(
+                left_qpos=pair["left"], right_qpos=pair["right"])[side])
+
+    def _require_motion_quality(self, values, *, side, deadline, monotonic):
+        quality = self._trajectory_motion_quality(values, side=side, deadline=deadline, monotonic=monotonic)
+        limits = PathMotionQualityLimits(self.config.maximum_proximal_joint_travel_rad,
+            self.config.maximum_tcp_detour_ratio, self.config.maximum_tcp_detour_excess_m)
+        if limits.exceeded(quality):
+            raise RM65GraspTrajectoryPlanningError("grasp_path_motion_quality_exceeded", details={
+                "planning_phase": "motion_quality_admission", "motion_quality": quality,
+                "maximum_proximal_joint_travel_deg": math.degrees(self.config.maximum_proximal_joint_travel_rad),
+                "maximum_tcp_detour_ratio": self.config.maximum_tcp_detour_ratio,
+                "maximum_tcp_detour_excess_m": self.config.maximum_tcp_detour_excess_m,
+            })
+        return quality
+
     def _plan_path_leg(
         self,
         *,
@@ -3686,6 +3743,7 @@ class RM65GraspJointTrajectoryPlanner:
                 config=attempt_config,
                 joint_lower_by_component={side: corridor_lower},
                 joint_upper_by_component={side: corridor_upper},
+                edge_cost=lambda start, end: self._tcp_path_edge_cost(start, end, side=side),
                 monotonic=monotonic,
             )
             attempt_record: dict[str, object] = {
@@ -3703,6 +3761,14 @@ class RM65GraspJointTrajectoryPlanner:
                 "reason": path.reason,
             }
             search_attempts.append(attempt_record)
+            if path_attempt == 0:
+                attempt_record["endpoint_generation_attempts"] = endpoint_candidates[0].generation_attempts
+                attempt_record["endpoint_candidates"] = tuple({
+                    "seed_index": item.seed_index,
+                    "joint_delta_deg": np.rad2deg(item.qpos_by_side[side] - qpos_by_side[side]).tolist(),
+                    "position_residual_m": item.position_residual_m,
+                    "orientation_residual_deg": item.orientation_residual_deg,
+                } for item in endpoint_candidates)
             if path.status is not JointPathStatus.PATH_FOUND:
                 if path.status is JointPathStatus.START_BLOCKED:
                     raise RM65GraspTrajectoryPlanningError(
@@ -3781,6 +3847,23 @@ class RM65GraspJointTrajectoryPlanner:
                 # connection hide the other local branches in the next round.
                 search_candidates = tuple(e for e in search_candidates if e is not endpoint) + (endpoint,)
                 continue
+            if planning_phase == "safe_pose_target":
+                try:
+                    attempt_record["motion_quality"] = self._require_motion_quality(
+                        {name: np.stack([wp[name] for wp in path.waypoints]) for name in _SIDES},
+                        side=side, deadline=deadline, monotonic=monotonic,
+                    )
+                except RM65GraspTrajectoryPlanningError as error:
+                    attempt_record["quality_rejection"] = {
+                        "reason_code": error.reason_code, "details": dict(error.details),
+                    }
+                    terminal_error = error
+                    if error.reason_code != "grasp_path_motion_quality_exceeded":
+                        break
+                    # Reject this route, retaining every endpoint for a later
+                    # corridor while giving other branches the next attempt.
+                    search_candidates = tuple(e for e in search_candidates if e is not endpoint) + (endpoint,)
+                    continue
             return _PlannedPathLeg(
                 endpoint=endpoint, path=path, dense_revalidation=dense,
                 search_attempts=tuple(search_attempts),
@@ -3790,6 +3873,7 @@ class RM65GraspJointTrajectoryPlanner:
             "path_planning_time_budget_exhausted",
             "path_target_safety_envelope_blocked",
             "path_target_safety_envelope_unavailable",
+            "grasp_path_motion_quality_exceeded",
         }:
             reason = terminal_error.reason_code
         elif any(
@@ -3837,6 +3921,7 @@ class RM65GraspJointTrajectoryPlanner:
         grasp_tool_tcp_world: np.ndarray,
         visible_scene: VisibleGraspScene | None = None,
         terminal_endpoint: _EndpointIKCandidate | None = None,
+        allow_terminal_target_contact: bool = True,
         deadline: float | None = None,
         monotonic: Callable[[], float] = time.perf_counter,
     ) -> _PlannedPathLeg:
@@ -4088,7 +4173,9 @@ class RM65GraspJointTrajectoryPlanner:
                     waypoint_tuple,
                     moving_side=side,
                     visible_scene=visible_scene,
-                    terminal_tool_tcp_world=grasp_tool_tcp_world,
+                    terminal_tool_tcp_world=(
+                        grasp_tool_tcp_world if allow_terminal_target_contact else None
+                    ),
                     deadline=deadline,
                     monotonic=monotonic,
                 ),
@@ -4243,6 +4330,115 @@ class RM65GraspJointTrajectoryPlanner:
         return _PreparedGraspApproaches(tuple(candidates), prepared.validation_attempts + tuple(attempts))
 
 
+    @staticmethod
+    def _local_chain_joint_travel(
+        approach: _PlannedPathLeg, *, current: np.ndarray, side: str,
+    ) -> np.ndarray:
+        """Lower-bound far travel plus the actual validated local joint path."""
+        values = np.asarray([item[side] for item in approach.path.waypoints])
+        return np.abs(values[0] - current) + np.abs(np.diff(values, axis=0)).sum(axis=0)
+
+
+    def _ordered_local_approaches(self, candidates, *, current, side):
+        def key(item):
+            travel = self._local_chain_joint_travel(item[1], current=current, side=side)
+            return float(np.max(travel[:3])), float(np.linalg.norm(travel)), item[0].seed_index
+        return tuple(sorted(candidates, key=key))
+
+
+    def _plan_safe_pose_leg(
+        self, *, qpos_by_side, side, start_tool_tcp_world, target_tool_tcp_world,
+        visible_scene, deadline, monotonic,
+    ) -> _PlannedPathLeg:
+        """Try the existing local solver before bounded multi-branch search."""
+        distance, orientation = pose_delta_metrics(start_tool_tcp_world, target_tool_tcp_world)
+        local_attempts = []
+        local_targets = []
+        if (1e-9 < distance <= self.config.pregrasp_distance_m
+                and orientation <= self.config.endpoint_orientation_tolerance_deg):
+            local_targets.append(("requested_pose", target_tool_tcp_world))
+        for candidate_kind, local_target in local_targets:
+            attempt = {"planning_phase": "safe_pose_local_continuation",
+                       "candidate_kind": candidate_kind,
+                       "distance_m": distance, "orientation_error_deg": orientation}
+            local_attempts.append(attempt)
+            local_distance = float(np.linalg.norm(
+                local_target[:3, 3] - start_tool_tcp_world[:3, 3]))
+            if not math.isfinite(local_distance) or local_distance <= 1e-9:
+                # A bounded tolerance probe can coincide with the measured
+                # start. Keep the constrained solver's nonzero-ray contract.
+                attempt.update(status="rejected", reason_code="approach_degenerate_local_target",
+                               candidate_distance_m=local_distance)
+                continue
+            started = monotonic()
+            try:
+                leg = self._plan_constrained_approach_leg(
+                    qpos_by_side=qpos_by_side, side=side,
+                    pregrasp_tool_tcp_world=start_tool_tcp_world,
+                    grasp_tool_tcp_world=local_target,
+                    visible_scene=visible_scene, allow_terminal_target_contact=False,
+                    deadline=deadline, monotonic=monotonic,
+                )
+                attempt["motion_quality"] = self._require_motion_quality(
+                    {name: np.stack([wp[name] for wp in leg.path.waypoints]) for name in _SIDES},
+                    side=side, deadline=deadline, monotonic=monotonic,
+                )
+                realized = self.target_builder.tool_tcp_world_targets_for_qpos_pair(
+                    left_qpos=leg.endpoint.qpos_by_side["left"],
+                    right_qpos=leg.endpoint.qpos_by_side["right"],
+                )[side]
+                position_error, orientation_error = pose_delta_metrics(realized, target_tool_tcp_world)
+                if (position_error > self.config.endpoint_position_tolerance_m
+                        or orientation_error > self.config.endpoint_orientation_tolerance_deg):
+                    raise RM65GraspTrajectoryPlanningError("approach_ik_search_exhausted",
+                        details={"position_residual_m": position_error,
+                                 "orientation_residual_deg": orientation_error})
+            except RM65GraspTrajectoryPlanningError as error:
+                attempt.update(status="rejected", reason_code=error.reason_code,
+                               details=dict(error.details), elapsed_sec=monotonic() - started)
+                # A failed candidate may fall through; unavailable safety
+                # evidence and exhausted global budgets must stop immediately.
+                if error.reason_code not in {
+                    "approach_ik_search_exhausted", "approach_branch_discontinuous",
+                    "approach_endpoint_safety_envelope_blocked",
+                    "approach_endpoint_clearance_blocked", "approach_endpoint_collision_blocked",
+                    "path_target_safety_envelope_blocked", "path_collision_blocked",
+                    "visible_gripper_path_collision", "grasp_path_motion_quality_exceeded",
+                    "approach_progress_out_of_bounds", "approach_progress_reversed",
+                    "approach_lateral_deviation", "approach_orientation_deviation",
+                }:
+                    raise RM65GraspTrajectoryPlanningError(error.reason_code,
+                        details={**error.details, "local_continuation_attempts": local_attempts}) from error
+                if (candidate_kind == "requested_pose"
+                        and error.reason_code == "approach_endpoint_clearance_blocked"):
+                    # Use the existing bounded endpoint tolerance probes even
+                    # when a distant exact IK branch could pass collision.
+                    local_targets.extend(self._clearance_rescue_target_poses(
+                        target_tool_tcp_world,
+                        orientation_tolerance_deg=self.config.endpoint_orientation_tolerance_deg,
+                    ))
+            else:
+                attempt.update(status="path_found", elapsed_sec=monotonic() - started,
+                               position_residual_m=position_error,
+                               orientation_residual_deg=orientation_error)
+                return replace(leg,
+                    endpoint=replace(leg.endpoint, position_residual_m=position_error,
+                                     orientation_residual_deg=orientation_error),
+                    path=replace(leg.path, metadata={**leg.path.metadata,
+                        "planning_phase": "safe_pose_target", "local_continuation": True}),
+                    search_attempts=(*local_attempts, *leg.search_attempts))
+        try:
+            leg = self._plan_path_leg(
+                qpos_by_side=qpos_by_side, side=side, target_tool_tcp_world=target_tool_tcp_world,
+                planning_phase="safe_pose_target", visible_scene=visible_scene,
+                prefer_closest_tolerance=False, deadline=deadline, monotonic=monotonic,
+            )
+        except RM65GraspTrajectoryPlanningError as error:
+            raise RM65GraspTrajectoryPlanningError(error.reason_code,
+                details={**error.details, "local_continuation_attempts": local_attempts}) from error
+        return replace(leg, search_attempts=(*local_attempts, *leg.search_attempts))
+
+
     def _prepare_grasp_approaches(
         self,
         *,
@@ -4360,10 +4556,17 @@ class RM65GraspJointTrajectoryPlanner:
                         ) from error
                     continue
                 attempt["status"] = "local_chain_valid"
+                travel = self._local_chain_joint_travel(approach, current=np.asarray(qpos_by_side[side]), side=side)
+                if float(max(travel[:3])) > self.config.maximum_proximal_joint_travel_rad:
+                    last_error = RM65GraspTrajectoryPlanningError("grasp_path_motion_quality_exceeded",
+                        details={"joint_travel_deg": np.rad2deg(travel).tolist()})
+                    attempt.update(status="rejected", reason_code=last_error.reason_code)
+                    continue
                 candidates.append((endpoint, approach))
         if candidates:
             return self._remember_local_approaches(
-                _PreparedGraspApproaches(tuple(candidates), tuple(attempts)),
+                _PreparedGraspApproaches(self._ordered_local_approaches(
+                    candidates, current=np.asarray(qpos_by_side[side]), side=side), tuple(attempts)),
                 qpos_by_side=qpos_by_side, side=side,
                 pregrasp=pregrasp_tool_tcp_world, grasp=grasp_tool_tcp_world)
 
@@ -4471,10 +4674,17 @@ class RM65GraspJointTrajectoryPlanner:
                     orientation_residual_deg=orientation,
                 )
                 attempt["status"] = "local_chain_valid"
+                travel = self._local_chain_joint_travel(approach, current=np.asarray(qpos_by_side[side]), side=side)
+                if float(max(travel[:3])) > self.config.maximum_proximal_joint_travel_rad:
+                    last_error = RM65GraspTrajectoryPlanningError("grasp_path_motion_quality_exceeded",
+                        details={"joint_travel_deg": np.rad2deg(travel).tolist()})
+                    attempt.update(status="rejected", reason_code=last_error.reason_code)
+                    continue
                 candidates.append((pregrasp_endpoint, approach))
         if candidates:
             return self._remember_local_approaches(
-                _PreparedGraspApproaches(tuple(candidates), tuple(attempts)),
+                _PreparedGraspApproaches(self._ordered_local_approaches(
+                    candidates, current=np.asarray(qpos_by_side[side]), side=side), tuple(attempts)),
                 qpos_by_side=qpos_by_side, side=side,
                 pregrasp=pregrasp_tool_tcp_world, grasp=grasp_tool_tcp_world)
         assert last_error is not None
@@ -4640,6 +4850,8 @@ class RM65GraspJointTrajectoryPlanner:
                 elapsed_ms=max(0.0, (float(monotonic()) - started) * 1_000.0),
                 reason_code=None,
                 attempts=tuple(attempts),
+                joint_travel_rad=tuple(self._local_chain_joint_travel(
+                    prepared.candidates[0][1], current=np.asarray(qpos_by_side[side]), side=side)),
             )
         return RM65GraspLocalChainResult(
             feasible=False,
@@ -5026,14 +5238,14 @@ class RM65GraspJointTrajectoryPlanner:
         direct_fallback_tried = False
         path_search_started_at = time.perf_counter()
         if not require_grasp_approach:
-            # Ordinary pose moves retain multi-IK search and dense validation,
-            # without applying grasp ingress or target-contact exemptions.
+            # Ordinary short translations first propagate the measured branch;
+            # neither route permits grasp-target contact exemptions.
             selected_legs = (
-                self._plan_path_leg(
+                self._plan_safe_pose_leg(
                     qpos_by_side=current, side=selected_side,
+                    start_tool_tcp_world=current_tcp,
                     target_tool_tcp_world=target_pose,
-                    planning_phase="safe_pose_target", visible_scene=visible_scene,
-                    prefer_closest_tolerance=False, deadline=deadline,
+                    visible_scene=visible_scene, deadline=deadline,
                     monotonic=monotonic,
                 ),
             )
@@ -5162,6 +5374,11 @@ class RM65GraspJointTrajectoryPlanner:
                         visible_scene=visible_scene,
                         terminal_endpoint_search=terminal_endpoint_search,
                     )
+                    route_values = {
+                        name: np.stack([wp[name] for leg in candidate_legs for wp in leg.path.waypoints])
+                        for name in _SIDES
+                    }
+                    self._require_motion_quality(route_values, side=selected_side, deadline=deadline, monotonic=monotonic)
                 except RM65GraspTrajectoryPlanningError as error:
                     route_error = error
                     route_attempt.update(
@@ -5828,6 +6045,10 @@ class RM65GraspJointTrajectoryPlanner:
                 ),
                 "scope": "observed_points_nominal_parallel_jaw_solids_only",
             }
+        parameterization_metadata["motion_quality"] = self._require_motion_quality(
+            samples, side=selected_side, deadline=deadline, monotonic=monotonic)
+        if not require_grasp_approach:
+            parameterization_metadata["path_search_attempts"] = _plain_search_evidence(search_attempts)
         planning_timing = {
             "clock": "host_perf_counter",
             "pre_path_search_wall_duration_sec": float(

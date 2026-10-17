@@ -93,6 +93,7 @@ def plan_collision_aware_joint_path(
     joint_lower_by_component: Mapping[str, Any] | None = None,
     joint_upper_by_component: Mapping[str, Any] | None = None,
     scene_hash: str | None = None,
+    edge_cost: Callable[[Mapping[str, np.ndarray], Mapping[str, np.ndarray]], float] | None = None,
     monotonic: Callable[[], float] = time.perf_counter,
 ) -> JointPathPlanResult:
     """Plan a collision-checked path without authorizing its execution.
@@ -108,6 +109,8 @@ def plan_collision_aware_joint_path(
     """
 
     cfg = config if config is not None else JointPathPlannerConfig()
+    if edge_cost is not None and not callable(edge_cost):
+        raise TypeError("edge_cost must be callable or None.")
     deadline = (
         None
         if cfg.time_budget_sec is None
@@ -533,11 +536,23 @@ def plan_collision_aware_joint_path(
     if found is None:
         return _result(JointPathStatus.PATH_SEARCH_EXHAUSTED, start, target, movable, resolved_scene_hash, "bounded_search_exhausted", search_metadata)
 
+    cost_cache: dict[tuple[bytes, bytes], float] = {}
+
+    def cost(a, b):
+        key = a.tobytes(), b.tobytes()
+        if key not in cost_cache:
+            value = float(edge_cost(expand(a), expand(b)))
+            if not math.isfinite(value) or value < 0.0:
+                raise ValueError("edge_cost must return a finite non-negative cost.")
+            cost_cache[key] = value
+        return cost_cache[key]
+
     shortened, shortcut_unavailable, shortcut_timed_out = _shortcut_path(
         found,
         edge_safe,
         rng,
         cfg.shortcut_attempts,
+        cost=cost if edge_cost is not None else None,
     )
     if shortcut_timed_out:
         return timeout_result(
@@ -561,6 +576,12 @@ def plan_collision_aware_joint_path(
             break
     if final_rejection is not None:
         return _result(JointPathStatus.PATH_SEARCH_EXHAUSTED, start, target, movable, resolved_scene_hash, "final_path_revalidation_failed", {**search_metadata, "last_rejected_edge": final_rejection})
+    cost_metadata = {}
+    if edge_cost is not None:
+        cost_metadata = {
+            "shortcut_cost_before": sum(cost(a, b) for a, b in zip(found, found[1:])),
+            "shortcut_cost_after": sum(cost(a, b) for a, b in zip(shortened, shortened[1:])),
+        }
     if budget_expired():
         return timeout_result("finalize", search_metadata)
     return _result(
@@ -575,6 +596,7 @@ def plan_collision_aware_joint_path(
             "shortcut_revalidated": True,
             "unshortened_waypoint_count": len(found),
             "waypoint_count": len(shortened),
+            **cost_metadata,
         },
         tuple(expand(item) for item in shortened),
     )
@@ -682,12 +704,25 @@ def _shortcut_path(
     edge_safe: Any,
     rng: np.random.Generator,
     attempts: int,
+    *, cost: Callable[[np.ndarray, np.ndarray], float] | None = None,
 ) -> tuple[list[np.ndarray], Mapping[str, Any] | None, bool]:
     shortened = [np.asarray(item, dtype=float).copy() for item in path]
+    examined: set[tuple[bytes, bytes]] = set()
     for _ in range(attempts):
         if len(shortened) < 3:
             break
-        left, right = sorted(int(item) for item in rng.choice(len(shortened), size=2, replace=False))
+        if cost is None:
+            left, right = sorted(int(item) for item in rng.choice(len(shortened), size=2, replace=False))
+        else:
+            # Try the largest removable intervals first. Never repeatedly spend
+            # the bounded attempts on the same rejected pair after shortening.
+            pairs = [(i, j) for i in range(len(shortened) - 2)
+                     for j in range(i + 2, len(shortened))
+                     if (shortened[i].tobytes(), shortened[j].tobytes()) not in examined]
+            if not pairs:
+                break
+            left, right = max(pairs, key=lambda pair: (pair[1] - pair[0], -pair[0]))
+            examined.add((shortened[left].tobytes(), shortened[right].tobytes()))
         if right <= left + 1:
             continue
         edge = edge_safe(shortened[left], shortened[right])
@@ -696,6 +731,11 @@ def _shortcut_path(
         if not edge.available:
             return shortened, edge.rejection, False
         if edge.safe:
+            if cost is not None:
+                old_cost = sum(cost(a, b) for a, b in zip(
+                    shortened[left:right], shortened[left + 1:right + 1]))
+                if cost(shortened[left], shortened[right]) > old_cost + 1e-12:
+                    continue
             shortened = shortened[: left + 1] + shortened[right:]
     return shortened, None, False
 

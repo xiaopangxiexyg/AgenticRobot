@@ -83,6 +83,28 @@ def _runtime(*entries: TCPPoseEnvelopeCatalogEntry) -> TCPPoseEnvelopeSafetyRunt
     return runtime
 
 
+def test_readonly_preview_uses_committed_reference_without_activation_or_mutation():
+    entry = _entry("envelope.standard", .2)
+    runtime = _runtime(entry)
+    before = runtime.snapshot()
+    preview = runtime.preview_for_envelope({"right": _pose(.4)},
+        deployment_envelope_hash=entry.semantic_content_hash)
+    assert preview.modified_sides == ("right",)
+    assert runtime.snapshot() == before
+    with pytest.raises(TCPPoseEnvelopeLifecycleError, match="absent"):
+        runtime.preview_for_envelope({"right": _pose(0)}, deployment_envelope_hash="unknown")
+    with pytest.raises(TCPPoseEnvelopeLifecycleError, match="no operation-local"):
+        runtime.project({"right": _pose(0)})
+    runtime.activate(selection=_selection(entry, safety_profile_id="test"),
+        operation_id="operation:1", route_id=ROUTE_ID, execution_epoch=3,
+        source_event_ids=("operation:1",), lower_state="hold")
+    active_before = runtime.snapshot()
+    runtime.preview_for_envelope({"right": _pose(.1)}, deployment_envelope_hash=entry.semantic_content_hash)
+    assert runtime.snapshot() == active_before
+    normal = runtime.project({"right": _pose(.4)})
+    np.testing.assert_array_equal(normal.effective_tcp_pose_by_side["right"], preview.effective_tcp_pose_by_side["right"])
+
+
 def test_hold_rebinds_epoch_without_moving_stable_reference() -> None:
     standard = _entry("envelope.standard", 0.20)
     strict = _entry("envelope.strict", 0.05)

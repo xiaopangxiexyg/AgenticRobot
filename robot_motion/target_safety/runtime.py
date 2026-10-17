@@ -562,6 +562,36 @@ class TCPPoseEnvelopeSafetyRuntime:
             self._active = None
             self._last_projection = None
 
+    def preview_for_envelope(
+        self, raw_tcp_pose_by_side: Mapping[str, object], *,
+        deployment_envelope_hash: str,
+    ) -> TCPPoseEnvelopeProjectionResult:
+        """Query a catalog envelope without activating or changing runtime state.
+
+        Relative terms use the same committed initialization reference as an
+        operation, never a caller-made anchor. This result cannot open READY.
+        """
+        with self._lock:
+            entry = self._entry_by_hash.get(deployment_envelope_hash)
+            if entry is None:
+                raise TCPPoseEnvelopeLifecycleError("preview envelope is absent from lower catalog")
+            anchor = None
+            if entry.profile.anchor_required_sides:
+                if self._reference is None:
+                    raise TCPPoseEnvelopeLifecycleError("preview envelope has no committed SafetyReference")
+                anchor = self._reference.bind_profile(
+                    anchor_id="read-only-envelope-preview", profile=entry.profile,
+                    execution_epoch=0,
+                )
+            return project_tcp_pose_envelope(
+                raw_tcp_pose_by_side, profile=entry.profile,
+                target_frame_binding_hash=self.target_frame_binding_hash,
+                tool_frame_binding_hash_by_side=self.tool_frame_binding_hash_by_side,
+                controlled_frame_id=self.controlled_frame_id,
+                reference_frame_by_side=self.reference_frame_by_side,
+                execution_epoch=0, anchor_receipt=anchor,
+            )
+
     def project(
         self,
         raw_tcp_pose_by_side: Mapping[str, object],

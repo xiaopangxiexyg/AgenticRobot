@@ -45,6 +45,41 @@ def _planner_config(**overrides) -> JointPathPlannerConfig:
     return JointPathPlannerConfig(**values)
 
 
+def test_cost_aware_shortcut_does_not_replace_a_path_with_a_longer_workspace_edge():
+    from robot_motion.path_planning.sampling import _EdgeResult, _shortcut_path
+    path = [np.array([0.]), np.array([1.]), np.array([2.])]
+    cost = lambda a, b: 10. if abs(float(b[0] - a[0])) > 1.5 else 1.
+    result, unavailable, timed_out = _shortcut_path(path,
+        lambda *_: _EdgeResult(True, True), np.random.default_rng(0), 80, cost=cost)
+    assert len(result) == 3 and unavailable is None and not timed_out
+    shortened, _, _ = _shortcut_path(path,
+        lambda *_: _EdgeResult(True, True), np.random.default_rng(0), 80,
+        cost=lambda a, b: abs(float(b[0] - a[0])))
+    assert len(shortened) == 2
+
+
+@pytest.mark.parametrize("invalid_cost", [float("nan"), float("inf"), -1.])
+def test_planner_rejects_invalid_workspace_cost(invalid_cost):
+    with pytest.raises(ValueError, match="finite non-negative"):
+        plan_collision_aware_joint_path(start_qpos_by_component={"left":[-1.,0.]},
+            target_qpos_by_component={"left":[1.,0.]}, movable_components=("left",),
+            oracle=_PlanarBoxOracle(), config=_planner_config(),
+            edge_cost=lambda *_: invalid_cost)
+
+
+def test_cost_optimization_keeps_existing_total_deadline():
+    clock = [0.]
+    def cost(a, b):
+        clock[0] += 20.
+        return float(np.linalg.norm(a["left"] - b["left"]))
+    result = plan_collision_aware_joint_path(start_qpos_by_component={"left":[-1.,0.]},
+        target_qpos_by_component={"left":[1.,0.]}, movable_components=("left",),
+        oracle=_PlanarBoxOracle(), config=_planner_config(time_budget_sec=10.),
+        edge_cost=cost, monotonic=lambda: clock[0])
+    assert result.status is JointPathStatus.PATH_SEARCH_EXHAUSTED
+    assert result.reason == "time_budget_exhausted"
+
+
 def test_aabb_scene_is_immutable_canonical_and_order_independent() -> None:
     first = AxisAlignedBoxObstacle("first", (0.0, 0.0, 0.2), (0.4, 0.2, 0.6))
     second = AxisAlignedBoxObstacle("second", (1.0, 2.0, 3.0), (0.1, 0.2, 0.3))
@@ -523,3 +558,45 @@ def test_expired_budget_never_starts_a_collision_query() -> None:
     assert result.metadata["termination_phase"] == "start_check"
     assert result.waypoints == ()
     assert oracle.queries == []
+
+
+def test_shared_motion_quality_preserves_grasp_bounds_and_short_motion():
+    from robot_motion.path_planning.motion_quality import (
+        DEFAULT_PATH_MOTION_QUALITY_LIMITS,
+        sampled_path_motion_quality,
+        tcp_path_edge_cost,
+    )
+
+    limits = DEFAULT_PATH_MOTION_QUALITY_LIMITS
+    q = np.zeros((3, 6))
+    xyz = np.array([[0, 0, 0], [.02, 0, 0], [.03, 0, 0]])
+    quality = sampled_path_motion_quality(q, xyz)
+    assert quality["tcp_detour_ratio"] == pytest.approx(1)
+    assert not limits.exceeded(quality)
+    # A short near-zero-displacement motion is not rejected on ratio alone.
+    assert not limits.exceeded(sampled_path_motion_quality(q, np.array([[0, 0, 0], [.01, 0, 0], [0, 0, 0]])))
+    q[1:, 0] = np.deg2rad(219.2)
+    assert limits.exceeded(sampled_path_motion_quality(q, xyz))
+    q[:] = 0
+    assert limits.exceeded(sampled_path_motion_quality(q, np.array([[0, 0, 0], [1, 0, 0], [.1, 0, 0]])))
+    start, end = {"right": np.zeros(6)}, {"right": np.ones(6)}
+
+    def pose(pair):
+        matrix = np.eye(4)
+        matrix[0, 3] = pair["right"][0]
+        return matrix
+
+    assert tcp_path_edge_cost(start, end, side="right", pose_for_pair=pose, step_rad=.1) == pytest.approx(1)
+
+
+@pytest.mark.parametrize("q,xyz", (
+    (np.zeros((0, 6)), np.zeros((0, 3))),
+    (np.zeros((2, 6)), np.zeros((3, 3))),
+    (np.full((2, 6), np.nan), np.zeros((2, 3))),
+    (np.zeros((2, 6)), np.full((2, 3), np.inf)),
+))
+def test_shared_motion_quality_rejects_corrupt_samples(q, xyz):
+    from robot_motion.path_planning.motion_quality import sampled_path_motion_quality
+
+    with pytest.raises(ValueError):
+        sampled_path_motion_quality(q, xyz)
