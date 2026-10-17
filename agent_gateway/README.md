@@ -552,6 +552,11 @@ RPent 等按工具名投影接口的客户端应在 `tool_name_by_skill` 中显�
 或主相机深度套到腕部图像。动态腕部需要应用层提供对应采集时刻的几何，不能由 Agent 猜测。
 既有抓姿消费者继续使用 `capture_grasp_observation` 的静止/qpos 合同，两种入口复用同一编码和采集实现。
 
+普通多视角 `capture_rgb` 先取得并复制本次请求所需的 RGB 像素，检查视角时间偏差，
+再按请求顺序编码 JPEG。私有副本不保留深度或完整源帧，编码时逐张释放、调用结束后
+不保留像素缓存；临时容量由本次视角数和原始分辨率决定。采集时的新鲜度、设备身份、
+generation 与编码后的 Station revision 检查保持有效，不改变相机启动或流配置。
+
 已有 `real-rm65-skill` 双臂会话也可选择 `--enable-back-projection`，复用同一个相机 owner、
 lower 测量发布与 `RM65RgbCameraGeometry`。这条入口按已对齐 RGB-D 目录发布主相机与两腕角色，
 不需要 SAM2/GraspGenX；普通 `capture_depth` 仍只发布固定外参深度，不改写其既有语义。

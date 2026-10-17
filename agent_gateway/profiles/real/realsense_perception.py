@@ -7,6 +7,7 @@ import io
 import math
 import threading
 import time
+from collections import deque
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -1005,6 +1006,7 @@ class RealSenseAgentPerceptionProvider:
             for source_id, source in self.source_binding.camera_sources.items()
         }
         frames = []
+        pending_frames = deque()
         source_timestamps = []
         total_bytes = 0
         for role in roles:
@@ -1018,6 +1020,17 @@ class RealSenseAgentPerceptionProvider:
                 raise RuntimeError(f"real_rgb_frame_contract_mismatch:{source_id}")
             if source.config.color_space == "bgr":
                 image = image[..., ::-1]
+            # Freeze RGB only, not the source frame's depth buffers. Acquire
+            # every cut before JPEG work can delay the next camera read.
+            pending_frames.append((source_id, role, source_at, image.copy()))
+            source_timestamps.append(source_at)
+        skew_ms = (max(source_timestamps) - min(source_timestamps)) * 1000.0
+        if skew_ms > self.max_inter_camera_skew_ms:
+            raise RuntimeError("rgb_capture_inter_camera_skew_exceeded")
+        # Release each private image as it is consumed. These are request-local
+        # cuts, never a growing cache of camera pixels or VideoFrame objects.
+        while pending_frames:
+            source_id, role, source_at, image = pending_frames.popleft()
             encoded = _encode_rgb_jpeg(image, width=width, height=height)
             total_bytes += len(encoded)
             if total_bytes > max_total_bytes:
@@ -1032,10 +1045,6 @@ class RealSenseAgentPerceptionProvider:
                     data=encoded,
                 )
             )
-            source_timestamps.append(source_at)
-        skew_ms = (max(source_timestamps) - min(source_timestamps)) * 1000.0
-        if skew_ms > self.max_inter_camera_skew_ms:
-            raise RuntimeError("rgb_capture_inter_camera_skew_exceeded")
         if self._current_station_revision() != expected_station_revision:
             raise RuntimeError("rgb_capture_station_revision_changed")
         return RealRgbCapture(

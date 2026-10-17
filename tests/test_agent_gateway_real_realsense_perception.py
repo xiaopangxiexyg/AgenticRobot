@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import threading
+import weakref
 from types import SimpleNamespace
 
 import numpy as np
@@ -893,3 +894,56 @@ def test_camera_only_resources_do_not_claim_close_until_native_stop_finishes():
         resources.close()
     assert resources._closed and resources._cameras_closed
     assert calls == ["stop", "store.close"]
+
+
+@pytest.mark.parametrize("color_space", ["rgb", "bgr"])
+def test_rgb_cuts_are_frozen_before_encoding_and_preserve_requested_order(monkeypatch, color_space):
+    provider, sources, _revision, _profile = _provider()
+    events, images, image_refs = [], [], []
+    expected = {}
+    for key, source in sources.items():
+        source.config.color_space = color_space
+        expected[key] = source.frame.image.copy()
+        if color_space == "bgr":
+            expected[key] = expected[key][..., ::-1]
+        latest = source.get_latest_frame
+        def observed(*, key=key, latest=latest):
+            events.append(("read", key))
+            return latest()
+        monkeypatch.setattr(source, "get_latest_frame", observed)
+    encode = realsense_perception._encode_rgb_jpeg
+    def encoding(image, **kwargs):
+        assert [e for e in events if e[0] == "read"] == [("read", "left_wrist"), ("read", "front")]
+        events.append(("encode", len(images)))
+        # Emulate a camera worker reusing its input buffers during compression.
+        for source in sources.values():
+            source.frame.image[:] = 0
+        image_refs.append(weakref.ref(image))
+        images.append(image.copy())
+        return encode(image, **kwargs)
+    monkeypatch.setattr(realsense_perception, "_encode_rgb_jpeg", encoding)
+    result = provider.capture_rgb({"selected_roles": ["wrist_left", "main"],
+        "width": 2, "height": 2, "max_total_bytes": 100_000}, expected_station_revision=7)
+    assert [f.role for f in result.frames] == ["wrist_left", "main"]
+    for image, key in zip(images, ("left_wrist", "front"), strict=True):
+        np.testing.assert_array_equal(image, expected[key])
+        assert not np.shares_memory(image, sources[key].frame.image)
+    assert all(reference() is None for reference in image_refs)
+    assert [source.starts for source in sources.values()] == [0, 0]
+
+
+def test_rgb_checks_skew_before_encoding_and_revision_after_encoding(monkeypatch):
+    skewed, _sources, _revision, _profile = _provider(front_at=9.86, wrist_at=9.98)
+    monkeypatch.setattr(realsense_perception, "_encode_rgb_jpeg", lambda *a, **kw: pytest.fail("encoded rejected cuts"))
+    parameters = {"selected_roles": ["main", "wrist_left"], "width": 2, "height": 2, "max_total_bytes": 100_000}
+    with pytest.raises(RuntimeError, match="inter_camera_skew"):
+        skewed.capture_rgb(parameters, expected_station_revision=7)
+    provider, sources, revision, _profile = _provider()
+    def changed(image, **kwargs):
+        revision["value"] = 8
+        return b"jpeg"
+    monkeypatch.setattr(realsense_perception, "_encode_rgb_jpeg", changed)
+    with pytest.raises(RuntimeError, match="station_revision_changed"):
+        provider.capture_rgb(parameters, expected_station_revision=7)
+    for source in sources.values():
+        assert source.starts == source.closes == 0

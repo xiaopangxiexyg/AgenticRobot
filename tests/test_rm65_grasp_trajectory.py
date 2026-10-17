@@ -4447,3 +4447,157 @@ def test_endpoint_jacobian_is_lazy_and_invalidated_by_trial_iterates(
     )
     for name in pair:
         np.testing.assert_array_equal(pair[name], FIELD_TRACE_QPOS[name])
+
+
+@pytest.mark.parametrize("side", ("left", "right"))
+@pytest.mark.parametrize("terminal_has_candidate", (False, True))
+@pytest.mark.parametrize("entrypoint", ("assessment", "full_plan"))
+def test_grasp_request_shares_terminal_search_but_checks_each_route(
+    side, terminal_has_candidate, entrypoint,
+):
+    planner = _planner_without_assets(config=RM65GraspTrajectoryPlanningConfig(path_planning_time_budget_sec=10.))
+    planner.target_builder = _CartesianQposBuilder()
+    current = {name: np.zeros(6) for name in ("left", "right")}
+    target = np.eye(4)
+    target[2, 3] = .1
+    calls, reverse_distances = [], []
+    endpoint = grasp_trajectory_module._EndpointIKCandidate(
+        qpos_by_side=current, seed_index=0, solve_cycles=1,
+        position_residual_m=0., orientation_residual_deg=0.,
+    )
+
+    def endpoints(**arguments):
+        assert arguments["side"] == side
+        assert arguments["deadline"] == 10.
+        np.testing.assert_array_equal(arguments["qpos_by_side"][side], request_current[side])
+        pose = arguments["target_tool_tcp_world"]
+        calls.append(pose.copy())
+        # Public requests must own their input snapshot. A caller changing
+        # its arrays must not change either later routes or the terminal pool.
+        if len(calls) == request_start + 1:
+            current[side][0] += .01
+            target[2, 3] += .01
+        if np.array_equal(pose, request_target) and terminal_has_candidate:
+            return (endpoint,)
+        raise RM65GraspTrajectoryPlanningError("ik_search_exhausted")
+
+    def reverse(**arguments):
+        assert arguments["terminal_endpoint"] is endpoint
+        reverse_distances.append(float(request_target[2, 3] - arguments["pregrasp_tool_tcp_world"][2, 3]))
+        raise RM65GraspTrajectoryPlanningError("approach_branch_discontinuous")
+
+    planner._endpoint_qpos_candidates = endpoints
+    planner._plan_constrained_approach_leg = reverse
+    distances = planner._pregrasp_distance_candidates()
+    for request in range(2):
+        request_current = {name: q.copy() for name, q in current.items()}
+        request_target = target.copy()
+        request_start = len(calls)
+        reason = "approach_branch_discontinuous" if terminal_has_candidate else "ik_search_exhausted"
+        if entrypoint == "full_plan":
+            with pytest.raises(RM65GraspTrajectoryPlanningError, match=reason) as error:
+                planner(qpos_by_side=current, side=side, target_tool_tcp_world=target,
+                    speed_scale=.2, monotonic=lambda: 0.)
+            attempts = error.value.details["pregrasp_route_attempts"]
+        else:
+            result = planner.assess_local_grasp_chain(qpos_by_side=current, side=side,
+                target_tool_tcp_world=target, time_budget_sec=10., monotonic=lambda: 0.)
+            assert not result.feasible and result.reason_code == reason
+            attempts = result.attempts
+        assert [a["distance_m"] for a in attempts] == list(distances)
+        request_calls = calls[request * (len(distances) + 1):]
+        assert len(request_calls) == len(distances) + 1
+        assert sum(np.array_equal(pose, request_target) for pose in request_calls) == 1
+        np.testing.assert_allclose([pose[2, 3] for pose in request_calls if not np.array_equal(pose, request_target)],
+            [request_target[2, 3] - distance for distance in distances])
+    if terminal_has_candidate:
+        np.testing.assert_allclose(reverse_distances, list(distances) * 2)
+    else:
+        assert reverse_distances == []
+
+
+@pytest.mark.parametrize("side", ("left", "right"))
+def test_full_grasp_terminal_miss_still_allows_later_forward_branch(side):
+    planner = _planner_without_assets(config=RM65GraspTrajectoryPlanningConfig(path_planning_time_budget_sec=10.))
+    planner.target_builder = _CartesianQposBuilder()
+    current = {name: np.zeros(6) for name in ("left", "right")}
+    target = np.eye(4)
+    target[2, 3] = .1
+    endpoint = grasp_trajectory_module._EndpointIKCandidate(
+        qpos_by_side=current, seed_index=0, solve_cycles=1,
+        position_residual_m=0., orientation_residual_deg=0.,
+    )
+    calls, connected = [], []
+
+    def endpoints(**arguments):
+        calls.append(arguments["target_tool_tcp_world"].copy())
+        if len(calls) <= 2:
+            raise RM65GraspTrajectoryPlanningError("ik_search_exhausted")
+        return (endpoint,)
+
+    leg = grasp_trajectory_module._PlannedPathLeg(endpoint,
+        SimpleNamespace(waypoints=(current,)), {}, ())
+    planner._endpoint_qpos_candidates = endpoints
+    planner._plan_constrained_approach_leg = lambda **_kwargs: leg
+    planner._envelope_ingress_targets = lambda **_kwargs: ()
+
+    def connect(**arguments):
+        assert arguments["endpoint_candidates"] == (endpoint,)
+        connected.append(arguments["target_tool_tcp_world"].copy())
+        return leg
+
+    class ReachedTrajectoryPreparation(Exception):
+        pass
+
+    def quality(*_args, **_kwargs):
+        raise ReachedTrajectoryPreparation
+
+    planner._plan_path_leg = connect
+    planner._require_motion_quality = quality
+    with pytest.raises(ReachedTrajectoryPreparation):
+        planner(qpos_by_side=current, side=side, target_tool_tcp_world=target,
+            speed_scale=.2, monotonic=lambda: 0.)
+    assert len(calls) == 3 and len(connected) == 1
+    np.testing.assert_array_equal(calls[1], target)
+    np.testing.assert_array_equal(connected[0], calls[2])
+    assert calls[0][2, 3] != calls[2][2, 3]
+
+
+@pytest.mark.parametrize("outcome", ("candidate", "ik_search_exhausted", "endpoint_collision_blocked"))
+def test_terminal_endpoint_search_pool_keeps_deadline_and_request_identity(outcome):
+    planner = _planner_without_assets(config=RM65GraspTrajectoryPlanningConfig())
+    current = {side: np.zeros(6) for side in ("left", "right")}
+    target = np.eye(4)
+    clock, calls = [0.], []
+
+    def endpoints(**arguments):
+        calls.append(arguments)
+        if outcome != "candidate":
+            raise RM65GraspTrajectoryPlanningError(outcome, details={"call": len(calls)})
+        return ()
+
+    planner._endpoint_qpos_candidates = endpoints
+    search = planner._terminal_endpoint_search(qpos_by_side=current, side="left",
+        target_tool_tcp_world=target, deadline=1., monotonic=lambda: clock[0])
+    for _ in range(2):
+        if outcome == "candidate":
+            assert search() == ()  # An empty solved set is also a retained result.
+        else:
+            with pytest.raises(RM65GraspTrajectoryPlanningError, match=outcome) as error:
+                search()
+            assert error.value.details["call"] == 1
+    assert len(calls) == 1
+    clock[0] = 1.
+    with pytest.raises(RM65GraspTrajectoryPlanningError, match="path_planning_time_budget_exhausted"):
+        search()
+    assert len(calls) == 1
+    clock[0] = 0.
+    another = planner._terminal_endpoint_search(qpos_by_side=current, side="right",
+        target_tool_tcp_world=target.copy(), deadline=1., monotonic=lambda: clock[0])
+    if outcome == "candidate":
+        assert another() == ()
+    else:
+        with pytest.raises(RM65GraspTrajectoryPlanningError, match=outcome) as error:
+            another()
+        assert error.value.details["call"] == 2
+    assert len(calls) == 2 and calls[-1]["side"] == "right"

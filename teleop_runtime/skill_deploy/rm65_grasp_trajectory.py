@@ -4344,6 +4344,48 @@ class RM65GraspJointTrajectoryPlanner:
                      "pregrasp_branch_attempts": attempts},
         ) from last_error
 
+    def _terminal_endpoint_search(
+        self, *, qpos_by_side: Mapping[str, np.ndarray], side: str,
+        target_tool_tcp_world: np.ndarray, deadline: float,
+        monotonic: Callable[[], float],
+    ) -> Callable[[], tuple[_EndpointIKCandidate, ...]]:
+        """Share one fixed terminal search across a request's local routes.
+
+        The caller binds the same initial pair, terminal pose and deadline.
+        Changing the pregrasp distance does not change that IK problem. A
+        cached miss is only a miss of these seeds: each route must still try
+        its own forward approach, and no path certification is cached here.
+        """
+
+        terminal_endpoints: tuple[_EndpointIKCandidate, ...] | None = None
+        terminal_error: RM65GraspTrajectoryPlanningError | None = None
+
+        def search() -> tuple[_EndpointIKCandidate, ...]:
+            nonlocal terminal_endpoints, terminal_error
+            if float(monotonic()) >= deadline:
+                raise RM65GraspTrajectoryPlanningError(
+                    "path_planning_time_budget_exhausted",
+                    details={"planning_phase": "terminal_branch_selection"},
+                )
+            if terminal_error is not None:
+                raise terminal_error
+            if terminal_endpoints is None:
+                try:
+                    terminal_endpoints = self._endpoint_qpos_candidates(
+                        qpos_by_side=qpos_by_side,
+                        side=side,
+                        target_tool_tcp_world=target_tool_tcp_world,
+                        prefer_closest_tolerance=False,
+                        deadline=deadline,
+                        monotonic=monotonic,
+                    )
+                except RM65GraspTrajectoryPlanningError as error:
+                    terminal_error = error
+                    raise
+            return terminal_endpoints
+
+        return search
+
     def assess_local_grasp_chain(
         self,
         *,
@@ -4364,45 +4406,21 @@ class RM65GraspJointTrajectoryPlanner:
 
         if side not in _SIDES:
             raise ValueError("side must be left or right.")
-        target = np.asarray(target_tool_tcp_world, dtype=float)
+        target = np.array(target_tool_tcp_world, dtype=float, copy=True)
         if target.shape != (4, 4) or not np.all(np.isfinite(target)):
             raise ValueError("target_tool_tcp_world must be one finite 4x4 pose.")
         budget = float(time_budget_sec)
         if not math.isfinite(budget) or budget <= 0.0:
             raise ValueError("time_budget_sec must be finite and positive.")
+        current = {name: np.asarray(qpos_by_side[name], dtype=float).copy() for name in _SIDES}
         started = float(monotonic())
         deadline = started + min(budget, self.config.path_planning_time_budget_sec)
         attempts: list[Mapping[str, object]] = []
         last_error: RM65GraspTrajectoryPlanningError | None = None
-        terminal_endpoints: tuple[_EndpointIKCandidate, ...] | None = None
-        terminal_error: RM65GraspTrajectoryPlanningError | None = None
-
-        def terminal_endpoint_search() -> tuple[_EndpointIKCandidate, ...]:
-            # Distance changes the pregrasp, not this fixed terminal request.
-            # Share its deterministic search only within this one assessment;
-            # every distance still attempts its own forward approach first.
-            nonlocal terminal_endpoints, terminal_error
-            if float(monotonic()) >= deadline:
-                raise RM65GraspTrajectoryPlanningError(
-                    "path_planning_time_budget_exhausted",
-                    details={"planning_phase": "terminal_branch_selection"},
-                )
-            if terminal_error is not None:
-                raise terminal_error
-            if terminal_endpoints is None:
-                try:
-                    terminal_endpoints = self._endpoint_qpos_candidates(
-                        qpos_by_side=qpos_by_side,
-                        side=side,
-                        target_tool_tcp_world=target,
-                        prefer_closest_tolerance=False,
-                        deadline=deadline,
-                        monotonic=monotonic,
-                    )
-                except RM65GraspTrajectoryPlanningError as error:
-                    terminal_error = error
-                    raise
-            return terminal_endpoints
+        terminal_endpoint_search = self._terminal_endpoint_search(
+            qpos_by_side=current, side=side,
+            target_tool_tcp_world=target, deadline=deadline, monotonic=monotonic,
+        )
 
         for distance_m in self._pregrasp_distance_candidates():
             if float(monotonic()) >= deadline:
@@ -4417,7 +4435,7 @@ class RM65GraspJointTrajectoryPlanner:
             )
             try:
                 prepared = self._prepare_grasp_approaches(
-                    qpos_by_side=qpos_by_side,
+                    qpos_by_side=current,
                     side=side,
                     pregrasp_tool_tcp_world=pregrasp,
                     grasp_tool_tcp_world=target,
@@ -4561,6 +4579,9 @@ class RM65GraspJointTrajectoryPlanner:
         deadline: float,
         monotonic: Callable[[], float],
         visible_scene: VisibleGraspScene | None = None,
+        terminal_endpoint_search: Callable[
+            [], tuple[_EndpointIKCandidate, ...]
+        ] | None = None,
     ) -> tuple[
         tuple[_PlannedPathLeg, ...],
         dict[str, object] | None,
@@ -4574,6 +4595,7 @@ class RM65GraspJointTrajectoryPlanner:
             grasp_tool_tcp_world=grasp_tool_tcp_world,
             visible_scene=visible_scene,
             deadline=deadline, monotonic=monotonic,
+            terminal_endpoint_search=terminal_endpoint_search,
         )
         ingress_targets = self._envelope_ingress_targets(
             qpos_by_side=qpos_by_side,
@@ -4770,7 +4792,7 @@ class RM65GraspJointTrajectoryPlanner:
             .copy()
             for name in _SIDES
         }
-        target_pose = np.asarray(target_tool_tcp_world, dtype=float).reshape(4, 4)
+        target_pose = np.asarray(target_tool_tcp_world, dtype=float).reshape(4, 4).copy()
         if self.observed_obstacles is not None:
             initial_check = self.oracle.check(current)
             if not initial_check.collision_check_available or not initial_check.safe:
@@ -4879,6 +4901,11 @@ class RM65GraspJointTrajectoryPlanner:
                 ),
             )
         else:
+            terminal_endpoint_search = self._terminal_endpoint_search(
+                qpos_by_side=current, side=selected_side,
+                target_tool_tcp_world=target_pose, deadline=deadline,
+                monotonic=monotonic,
+            )
             for distance_m in self._ordered_pregrasp_distances(
                 qpos_by_side=current, side=selected_side, grasp=target_pose,
             ):
@@ -4982,6 +5009,7 @@ class RM65GraspJointTrajectoryPlanner:
                         deadline=deadline,
                         monotonic=monotonic,
                         visible_scene=visible_scene,
+                        terminal_endpoint_search=terminal_endpoint_search,
                     )
                 except RM65GraspTrajectoryPlanningError as error:
                     route_error = error
