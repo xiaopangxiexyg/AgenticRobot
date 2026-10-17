@@ -1498,6 +1498,82 @@ class RM65GraspJointTrajectoryPlanner:
             )
         return continuous, tuple(segment_diagnostics), float(tcp_time_scale)
 
+    def _localized_continuous_leg(
+        self, *, continuous, error: RM65GraspTrajectoryPlanningError,
+        waypoints: tuple[Mapping[str, np.ndarray], ...], moving_side: str,
+        speed_scale: float, joint_velocity_rad_s: np.ndarray, reference_hz: float,
+        visible_scene: VisibleGraspScene | None, deadline: float | None,
+        monotonic: Callable[[], float],
+    ) -> dict[str, object] | None:
+        """Try one local stop before downgrading the entire far-field leg.
+
+        Split at an existing knot nearest the rejected curve sample. Each
+        side uses the same C2 owner, zero boundary derivatives, and complete
+        final checks. No source knot, endpoint, clearance or budget changes.
+        This is a single bounded attempt, not recursive smoothing search.
+        """
+        sample_index = error.details.get("segment_index")
+        if (len(waypoints) < 3 or not isinstance(sample_index, int)
+                or not 0 <= sample_index < len(continuous.timestamps)):
+            return None
+        knot = 1 + int(np.argmin(np.abs(
+            continuous.waypoint_timestamps[1:-1]
+            - continuous.timestamps[sample_index]
+        )))
+        groups = []
+        try:
+            for first, last in ((0, knot), (knot, len(waypoints) - 1)):
+                if deadline is not None:
+                    self._remaining_path_planning_time_sec(deadline=deadline,
+                        monotonic=monotonic, planning_phase="localized_c2_revalidation")
+                part, segments, tcp_scale = self._continuous_leg_trajectory(
+                    waypoints=waypoints[first:last + 1], moving_side=moving_side,
+                    speed_scale=speed_scale, joint_velocity_rad_s=joint_velocity_rad_s,
+                    reference_hz=reference_hz,
+                )
+                samples = tuple({"left": row[:6], "right": row[6:]} for row in part.q_rad)
+                collision = self._revalidate(samples, moving_side=moving_side,
+                    deadline=deadline, monotonic=monotonic)
+                visible = None if visible_scene is None else self._revalidate_visible_gripper_path(
+                    samples, moving_side=moving_side, visible_scene=visible_scene,
+                    terminal_tool_tcp_world=None, deadline=deadline, monotonic=monotonic)
+                groups.append((part, segments, tcp_scale, collision, visible, first, last))
+        except RM65GraspTrajectoryPlanningError as rejected:
+            if rejected.reason_code not in {"path_collision_blocked",
+                    "path_target_safety_envelope_blocked", "visible_gripper_path_collision"}:
+                raise
+            return None
+        certificates = [part.metadata["continuous_hard_limit_certificate"] for part, *_ in groups]
+        certificate = {"passed": all(item["passed"] for item in certificates),
+            "violations": [], "coverage": "two_continuous_polynomial_groups"}
+        for key in ("max_abs_velocity_rad_s", "max_abs_acceleration_rad_s2",
+                "max_abs_jerk_rad_s3", "max_position_rad", "min_position_rad"):
+            values = np.asarray([item[key] for item in certificates])
+            certificate[key] = (values.min(axis=0) if key == "min_position_rad"
+                else values.max(axis=0)).tolist()
+        first, second = groups[0][0], groups[1][0]
+        visible_evidence = None
+        if visible_scene is not None:
+            visible_evidence = {**groups[0][4], "complete": True,
+                "coverage": "two_parameterized_groups", "groups": [group[4] for group in groups],
+                "sample_count": sum(group[4]["sample_count"] for group in groups),
+                "terminal_target_contact_points": max(group[4]["terminal_target_contact_points"] for group in groups),
+                "terminal_target_contact_sample_count": sum(group[4]["terminal_target_contact_sample_count"] for group in groups)}
+        return {
+            "times": np.concatenate((first.timestamps, first.timestamps[-1] + second.timestamps[1:])),
+            "q": np.concatenate((first.q_rad, second.q_rad[1:])),
+            "segments": tuple({**item, "segment_index": offset + item["segment_index"]}
+                for _, segments, _, _, _, offset, _ in groups for item in segments),
+            "source_duration_sec": sum(part.metadata["source_duration_sec"] for part, *_ in groups),
+            "joint_limit_time_scale": max(part.metadata["time_scale"] for part, *_ in groups),
+            "tcp_limit_time_scale": max(group[2] for group in groups),
+            "certificate": certificate, "stop_source_waypoint_index": knot,
+            "collision_revalidation": {"complete": True, "coverage": "two_parameterized_groups",
+                "sample_count": sum(group[3]["sample_count"] for group in groups),
+                "groups": [group[3] for group in groups]},
+            "visible_scene_revalidation": visible_evidence,
+        }
+
     def _segmented_leg_trajectory(
         self,
         *,
@@ -5711,6 +5787,7 @@ class RM65GraspJointTrajectoryPlanner:
                         RM65_GRASP_TRAJECTORY_PARAMETERIZATION_CONTINUOUS_C2
                     )
                     fallback: dict[str, object] | None = None
+                    localized = None
                     parameterized_waypoints = tuple(
                         {
                             "left": np.asarray(row[:6], dtype=float),
@@ -5772,15 +5849,32 @@ class RM65GraspJointTrajectoryPlanner:
                                 "background_collision_points"
                             ),
                         }
-                        leg_times, leg_q, leg_segments = (
-                            self._segmented_leg_trajectory(
-                                waypoints=leg_waypoints,
-                                moving_side=selected_side,
-                                speed_scale=effective_speed_scale,
-                                joint_velocity_rad_s=effective_joint_velocity,
-                                reference_hz=reference_hz,
+                        # Ingress has a stateful envelope transition and near
+                        # approach is constrained. Localize stops only in the
+                        # free-space pregrasp leg, preserving those contracts.
+                        if phase == "pregrasp_target":
+                            localized = self._localized_continuous_leg(
+                                continuous=continuous, error=error, waypoints=leg_waypoints,
+                                moving_side=selected_side, speed_scale=effective_speed_scale,
+                                joint_velocity_rad_s=effective_joint_velocity, reference_hz=reference_hz,
+                                visible_scene=visible_scene, deadline=deadline, monotonic=monotonic)
+                        if localized is not None:
+                            execution_mode = "continuous_c2_localized_stop"
+                            fallback["localized_stop_source_waypoint_index"] = localized["stop_source_waypoint_index"]
+                            leg_times, leg_q, leg_segments = localized["times"], localized["q"], localized["segments"]
+                            tcp_time_scale = localized["tcp_limit_time_scale"]
+                            collision_revalidation = localized["collision_revalidation"]
+                            visible_revalidation = localized["visible_scene_revalidation"]
+                        else:
+                            leg_times, leg_q, leg_segments = (
+                                self._segmented_leg_trajectory(
+                                    waypoints=leg_waypoints,
+                                    moving_side=selected_side,
+                                    speed_scale=effective_speed_scale,
+                                    joint_velocity_rad_s=effective_joint_velocity,
+                                    reference_hz=reference_hz,
+                                )
                             )
-                        )
                         fallback_waypoints = tuple(
                             {
                                 "left": np.asarray(row[:6], dtype=float),
@@ -5788,14 +5882,15 @@ class RM65GraspJointTrajectoryPlanner:
                             }
                             for row in leg_q
                         )
-                        collision_revalidation = self._revalidate(
-                            fallback_waypoints,
-                            moving_side=selected_side,
-                            deadline=deadline,
-                            monotonic=monotonic,
-                        )
-                        visible_revalidation = None
-                        if visible_scene is not None:
+                        if localized is None:
+                            collision_revalidation = self._revalidate(
+                                fallback_waypoints,
+                                moving_side=selected_side,
+                                deadline=deadline,
+                                monotonic=monotonic,
+                            )
+                            visible_revalidation = None
+                        if localized is None and visible_scene is not None:
                             visible_revalidation = (
                                 self._revalidate_visible_gripper_path(
                                     fallback_waypoints,
@@ -5846,22 +5941,26 @@ class RM65GraspJointTrajectoryPlanner:
                             "execution_mode": execution_mode,
                             "collision_preserving_fallback": fallback,
                             "source_duration_sec": float(
-                                continuous.metadata["source_duration_sec"]
+                                continuous.metadata["source_duration_sec"] if localized is None
+                                else localized["source_duration_sec"]
                             ),
                             "execution_duration_sec": float(
                                 leg_times[-1] - leg_times[0]
                             ),
                             "joint_limit_time_scale": float(
-                                continuous.metadata["time_scale"]
+                                continuous.metadata["time_scale"] if localized is None
+                                else localized["joint_limit_time_scale"]
                             ),
                             "tcp_limit_time_scale": tcp_time_scale,
                             "internal_knot_zero_velocity_required": bool(
                                 fallback is not None
                             ),
+                            "internal_path_stop_count": (1 if localized is not None
+                                else len(leg_waypoints) - 2 if fallback is not None else 0),
                             "collision_revalidation": collision_revalidation,
                             "visible_scene_revalidation": visible_revalidation,
                             "continuous_hard_limit_certificate": (
-                                continuous.metadata[
+                                localized["certificate"] if localized is not None else continuous.metadata[
                                     "continuous_hard_limit_certificate"
                                 ]
                             ),

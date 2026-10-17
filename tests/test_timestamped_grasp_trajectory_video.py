@@ -10,6 +10,7 @@ from experiments.sim_point_grasp.commands.record_timestamped_trajectory import (
     _annotate_frame,
     build_parser,
     infer_uniform_sample_hz,
+    timestamped_video_samples,
 )
 from teleop_runtime.skill_deploy.grasp_trajectory_record import (
     write_grasp_trajectory_record,
@@ -26,6 +27,22 @@ def test_infer_uniform_sample_hz_preserves_production_60hz_lattice() -> None:
 def test_infer_uniform_sample_hz_rejects_variable_rate_video_claim() -> None:
     with pytest.raises(ValueError, match="uniform trajectory timestamp lattice"):
         infer_uniform_sample_hz(np.asarray((0.0, 1.0 / 60.0, 0.04)))
+
+
+def test_variable_rate_video_holds_only_existing_source_samples_at_real_time() -> None:
+    source = np.asarray((0., .01, .025, .051))
+    times, indices = timestamped_video_samples(source, 60)
+    assert times == pytest.approx(np.arange(5) / 60)
+    assert indices.tolist() == [0, 1, 2, 2, 3]
+    assert np.all(source[indices] <= times)
+    assert times[-1] - source[-1] < 1 / 60
+
+
+@pytest.mark.parametrize("source,fps", [([.01, .02], 30), ([0, 0], 30),
+    ([0, float("nan")], 30), ([0, .02], 0), ([0, .02], 29.5)])
+def test_variable_rate_video_rejects_invalid_clock(source, fps) -> None:
+    with pytest.raises(ValueError):
+        timestamped_video_samples(np.asarray(source), fps)
 
 
 def test_annotation_preserves_frame_shape_and_marks_timing() -> None:
@@ -142,3 +159,14 @@ def test_recording_finishes_without_a_scene_close_contract(
     assert report["status"] == "recorded"
     assert writer.frames == 3
     assert writer.released is True
+
+
+@pytest.mark.parametrize("duration", [np.nextafter(1 / 3, np.inf), np.nextafter(2 / 3, np.inf)])
+def test_video_clock_keeps_final_source_state_after_product_rounding(duration):
+    source = np.array([0., duration])
+    clock, indices = timestamped_video_samples(source, 3)
+    assert clock[-1] >= source[-1]
+    assert clock[-1] - source[-1] <= 1 / 3
+    assert indices[-1] == 1
+    assert np.all(indices[:-1] == 0)
+    assert np.all(source[indices] <= clock)

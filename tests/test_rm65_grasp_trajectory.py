@@ -5256,3 +5256,49 @@ def test_operation_planning_budget_includes_shared_builder_lock_wait(monkeypatch
         else:
             planner(require_grasp_approach=False, **kwargs)
     assert caught.value.reason_code == "path_planning_time_budget_exhausted"
+
+
+@pytest.mark.parametrize("failure", [None, "path_collision_blocked",
+    "path_collision_check_unavailable", "path_planning_time_budget_exhausted"])
+def test_localized_c2_stop_keeps_other_knots_and_fails_closed(failure):
+    planner = object.__new__(RM65GraspJointTrajectoryPlanner)
+    planner.config = RM65GraspTrajectoryPlanningConfig()
+    planner.target_builder = _CartesianQposBuilder()
+    waypoints = tuple({"left": np.zeros(6),
+        "right": np.array([x, 0, 0, 0, .3, 0])} for x in (0., .05, .1, .15))
+    velocity = np.full(6, .5)
+    continuous, _, _ = planner._continuous_leg_trajectory(waypoints=waypoints,
+        moving_side="right", speed_scale=.5, joint_velocity_rad_s=velocity, reference_hz=60)
+    rejected = RM65GraspTrajectoryPlanningError("path_collision_blocked", details={
+        "segment_index": int(np.argmin(abs(continuous.timestamps - continuous.waypoint_timestamps[1])))})
+    groups = []
+    def validate(samples, **_):
+        if failure:
+            raise RM65GraspTrajectoryPlanningError(failure)
+        groups.append(samples)
+        return {"sample_count": len(samples)}
+    planner._revalidate = validate
+    planner._revalidate_visible_gripper_path = lambda *_args, **_kw: {
+        "sample_count": 7, "terminal_target_contact_points": 0,
+        "terminal_target_contact_sample_count": 0}
+    kwargs = dict(continuous=continuous, error=rejected, waypoints=waypoints,
+        moving_side="right", speed_scale=.5, joint_velocity_rad_s=velocity,
+        reference_hz=60, visible_scene=object(), deadline=100, monotonic=lambda: 0)
+    if failure in {"path_collision_check_unavailable", "path_planning_time_budget_exhausted"}:
+        with pytest.raises(RM65GraspTrajectoryPlanningError, match=failure):
+            planner._localized_continuous_leg(**kwargs)
+        return
+    result = planner._localized_continuous_leg(**kwargs)
+    if failure:
+        assert result is None  # Ordinary collision keeps the original safe fallback.
+        return
+    assert len(groups) == 2
+    assert result["stop_source_waypoint_index"] == 1
+    np.testing.assert_allclose(result["q"][0, 6:], waypoints[0]["right"])
+    np.testing.assert_allclose(result["q"][-1, 6:], waypoints[-1]["right"])
+    assert np.max(np.abs(result["q"][:, :6])) == 0
+    assert np.all(np.diff(result["times"]) > 0)
+    assert result["certificate"]["passed"]
+    assert result["visible_scene_revalidation"]["sample_count"] == 14
+    assert len(result["collision_revalidation"]["groups"]) == 2
+    assert result["collision_revalidation"]["sample_count"] == sum(map(len, groups))

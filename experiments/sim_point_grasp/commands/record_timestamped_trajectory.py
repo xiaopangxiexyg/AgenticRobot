@@ -54,6 +54,27 @@ def infer_uniform_sample_hz(
     return 1.0 / interval
 
 
+def timestamped_video_samples(
+    timestamps_sec: np.ndarray, video_fps: int
+) -> tuple[np.ndarray, np.ndarray]:
+    """Hold source qpos on a video clock; never interpolate a new robot path."""
+
+    timestamps = np.asarray(timestamps_sec, dtype=float)
+    if (timestamps.ndim != 1 or timestamps.size < 2
+            or not np.isfinite(timestamps).all() or timestamps[0] != 0.0
+            or np.any(np.diff(timestamps) <= 0.0)):
+        raise ValueError("Video source timestamps must start at zero and increase.")
+    if isinstance(video_fps, bool) or int(video_fps) != video_fps or video_fps <= 0:
+        raise ValueError("video_fps must be a positive integer.")
+    # The final source state appears no later than one video frame after its
+    # real timestamp. Repeated frames are deliberate holds, not faster motion.
+    clock = np.arange(math.ceil(timestamps[-1] * video_fps) + 1) / video_fps
+    if clock[-1] < timestamps[-1]:
+        clock = np.append(clock, len(clock) / video_fps)
+    indices = np.searchsorted(timestamps, clock, side="right") - 1
+    return clock, np.minimum(indices, timestamps.size - 1)
+
+
 def _write_json(path: Path, payload: dict[str, object]) -> None:
     path.write_text(
         json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
@@ -98,8 +119,9 @@ def record_timestamped_trajectory(
     height: int,
     left_gripper_close: float,
     right_gripper_close: float,
+    video_fps: int | None = None,
 ) -> dict[str, object]:
-    """Render every planned qpos sample once at its original constant rate."""
+    """Replay source qpos at real time, optionally holding it on a video clock."""
 
     source = trajectory_record.expanduser().resolve(strict=True)
     destination = output_dir.expanduser().resolve()
@@ -115,13 +137,22 @@ def record_timestamped_trajectory(
             raise ValueError(f"{name} must be finite and in [0, 1].")
 
     trajectory, metadata = load_grasp_trajectory_record(source)
-    source_hz = infer_uniform_sample_hz(trajectory.time_from_start_sec)
-    rounded_hz = round(source_hz)
-    if not math.isclose(source_hz, rounded_hz, abs_tol=1e-9, rel_tol=0.0):
-        raise ValueError(
-            "Trajectory sample rate must be an integer for MP4 timestamp preservation."
+    if video_fps is None:
+        source_hz = infer_uniform_sample_hz(trajectory.time_from_start_sec)
+        rounded_hz = round(source_hz)
+        if not math.isclose(source_hz, rounded_hz, abs_tol=1e-9, rel_tol=0.0):
+            raise ValueError(
+                "Trajectory sample rate must be an integer for MP4 timestamp preservation."
+            )
+        fps = int(rounded_hz)
+        video_times = trajectory.time_from_start_sec
+        video_indices = np.arange(video_times.size)
+    else:
+        source_hz = None
+        fps = video_fps
+        video_times, video_indices = timestamped_video_samples(
+            trajectory.time_from_start_sec, fps
         )
-    fps = int(rounded_hz)
     contract_path = resolve_path(scene_contract_path)
     contract = SimulationContract.load(contract_path)
     destination.mkdir(parents=True)
@@ -129,6 +160,7 @@ def record_timestamped_trajectory(
 
     scene = MujocoScene.from_contract(
         contract,
+        mjcf_path=destination / "scene.mjcf",
         position_actuation_profile=rm65_bimanual_udp_feedback_profile(),
         gripper_actuation_profile=cad_bimanual_dmtac_gripper_profile(),
     )
@@ -153,7 +185,7 @@ def record_timestamped_trajectory(
             scene.set_gripper_close(gripper_name, gripper_close_by_side[side])
         sample_count = int(trajectory.time_from_start_sec.size)
         duration_sec = float(trajectory.time_from_start_sec[-1])
-        for index, elapsed_sec in enumerate(trajectory.time_from_start_sec):
+        for elapsed_sec, index in zip(video_times, video_indices):
             scene.set_qpos_by_side(
                 {
                     side: trajectory.qpos_by_side[side][index]
@@ -175,7 +207,7 @@ def record_timestamped_trajectory(
         writer.release()
         renderer.close()
 
-    encoded_duration_sec = sample_count / float(fps)
+    encoded_duration_sec = len(video_times) / float(fps)
     report: dict[str, object] = {
         "schema": REPORT_SCHEMA,
         "status": "recorded",
@@ -188,9 +220,13 @@ def record_timestamped_trajectory(
         "source_sample_hz": source_hz,
         "source_duration_sec": duration_sec,
         "video_fps": fps,
-        "video_frame_count": sample_count,
+        "video_frame_count": len(video_times),
         "video_encoded_duration_sec": encoded_duration_sec,
-        "video_final_frame_timestamp_sec": duration_sec,
+        "video_final_frame_timestamp_sec": float(video_times[-1]),
+        "video_sampling": "all_source_samples" if video_fps is None else "previous_source_sample_hold",
+        "maximum_source_hold_age_sec": float(np.max(
+            video_times - trajectory.time_from_start_sec[video_indices]
+        )),
         "video_terminal_frame_hold_sec": 1.0 / fps,
         "playback_rate": 1.0,
         "camera_name": camera_name,
@@ -223,6 +259,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--height", type=int, default=480)
     parser.add_argument("--left-gripper-close", type=float, default=0.2)
     parser.add_argument("--right-gripper-close", type=float, default=0.3)
+    parser.add_argument("--video-fps", type=int,
+                        help="Real-time video clock for nonuniform source timestamps; holds exact source qpos")
     return parser
 
 
@@ -238,6 +276,7 @@ def main(argv: list[str] | None = None) -> int:
             height=args.height,
             left_gripper_close=args.left_gripper_close,
             right_gripper_close=args.right_gripper_close,
+            video_fps=args.video_fps,
         )
     except (OSError, RuntimeError, TypeError, ValueError) as exc:
         raise SystemExit(f"Timestamped MuJoCo recording failed: {exc}") from exc

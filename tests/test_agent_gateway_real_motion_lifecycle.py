@@ -545,8 +545,8 @@ def test_grasp_approach_activation_evidence_stays_bounded_while_owner_waits() ->
     assert port.snapshot().phase == RealAgentMotionPhase.ACTIVE
 
 
-@pytest.mark.parametrize("failure", ["no_path", "stale_start", "cancel", "deadline", "start_drift"])
-def test_safe_pose_move_never_falls_back_to_online_ik(failure, monkeypatch):
+@pytest.mark.parametrize("failure", ["no_path", "start_blocked", "stale_start", "cancel", "deadline", "start_drift"])
+def test_safe_pose_move_never_falls_back_to_online_ik(failure, monkeypatch, caplog):
     from dataclasses import replace
 
     from teleop_runtime.skill_deploy.rm65_grasp_trajectory import (
@@ -564,12 +564,23 @@ def test_safe_pose_move_never_falls_back_to_online_ik(failure, monkeypatch):
         stale_qpos = replace(port.latest_measured_qpos(), measured_at=clock() - 0.3)
         monkeypatch.setattr(port, "latest_measured_qpos", lambda: stale_qpos)
     planned = []
+    rejection_details = {"planning_phase": "safe_pose_target", "path": {
+        "metadata": {"start_check": {
+            "minimum_distance_m": 0.006,
+            "metadata": {"nearest_observed": {
+                "geometry_name": "right_hand_proxy", "occupied_center_world_m": [0.1, 0.2, 0.3],
+            }},
+        }},
+    }}
 
     def planner(**kwargs):
         planned.append(kwargs)
         assert kwargs["require_grasp_approach"] is False
-        if failure == "no_path":
-            raise RM65GraspTrajectoryPlanningError("path_search_exhausted")
+        if failure in {"no_path", "start_blocked"}:
+            raise RM65GraspTrajectoryPlanningError(
+                "path_start_collision_blocked" if failure == "start_blocked" else "path_search_exhausted",
+                details=rejection_details,
+            )
         if failure == "deadline":
             clock.value += 9.8
         changed = {side: values.copy() for side, values in qpos.items()}
@@ -594,6 +605,15 @@ def test_safe_pose_move_never_falls_back_to_online_ik(failure, monkeypatch):
     assert port.snapshot().dispatch_count == 0
     assert builder.last_target is None
     assert len(planned) == (0 if failure == "stale_start" else 1)
+    if failure in {"no_path", "start_blocked"}:
+        records = [record for record in caplog.records if record.name ==
+                   "agent_gateway.profiles.real.motion_primitive_skill"]
+        assert len(records) == 1
+        message = records[0].getMessage()
+        assert result.status in message
+        assert operation.operation_id in message
+        assert route.skill_id in message
+        assert repr(rejection_details) in message
 
 
 def test_grasp_approach_rejects_stale_qpos_after_planning_and_holds() -> None:

@@ -58,6 +58,7 @@ from .motion_primitive_profiles import (
 )
 
 
+
 def _required(value: object, *, field_name: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{field_name} must be a non-empty string.")
@@ -475,6 +476,17 @@ class RealAgentPrimitiveSkillLifecycle:
                            if self.route.skill_id == SAFE_TCP_POSE_TARGET_SKILL_ID_V1 else {}),
                     )
             except RM65GraspTrajectoryPlanningError as exc:
+                # Preserve the lower rejection geometry without changing the
+                # versioned operation schema or weakening its HOLD decision.
+                _LOGGER.error(
+                    "Real TCP planning rejected: operation_id=%s skill_id=%s "
+                    "side=%s reason_code=%s details=%r",
+                    operation.operation_id,
+                    self.route.skill_id,
+                    self.profile.side,
+                    exc.reason_code,
+                    exc.details,
+                )
                 hold = self.request_hold(
                     operation=operation,
                     reason=exc.reason_code,
