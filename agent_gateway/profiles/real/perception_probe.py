@@ -249,6 +249,10 @@ def _wait_for_terminal_operation(
     deadline = time.monotonic() + timeout_sec
     query_index = 0
     while True:
+        execution_port = adapter.service.execution_port_for_operation(operation_id)
+        executor_finished = execution_port.wait(operation_id, timeout_sec=0.0)
+        # A finished worker must be judged against a subsequent authoritative
+        # snapshot, not one copied immediately before its completion.
         outcome = adapter.get_own_operation(
             AgentOwnOperationQuery(
                 client_id=client_id,
@@ -270,8 +274,7 @@ def _wait_for_terminal_operation(
                     f"{operation['status']}:{operation['reason_code']}"
                 )
             return operation
-        execution_port = adapter.service.execution_port_for_operation(operation_id)
-        if execution_port.wait(operation_id, timeout_sec=0.0):
+        if executor_finished:
             completion = execution_port.completion_for(operation_id)
             raise RuntimeError(
                 "perception executor exited without a terminal operation: "

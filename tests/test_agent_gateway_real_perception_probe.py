@@ -233,6 +233,38 @@ def test_real_perception_probe_rejects_unexpected_or_motion_routes(violation) ->
         perception_probe._assert_no_motion_surface(composition)
 
 
+@pytest.mark.parametrize("published_status", ["completed", "failed", "running"])
+def test_probe_completion_race_uses_a_fresh_operation_snapshot(monkeypatch, published_status):
+    finished = False
+    queries = []
+
+    def query(payload):
+        nonlocal finished
+        queries.append(payload["query_id"])
+        status = published_status if finished else "running"
+        snapshot = {"terminal": status != "running", "status": status,
+                    "reason_code": "read_finished" if finished else "read_running"}
+        # The worker exits after the first query copied its running snapshot.
+        finished = True
+        return {"accepted": True, "operation": snapshot}
+
+    port = SimpleNamespace(wait=lambda *a, **k: finished,
+        completion_for=lambda *a: SimpleNamespace(reason_code="operation_result_committed"))
+    adapter = SimpleNamespace(get_own_operation=query,
+        service=SimpleNamespace(execution_port_for_operation=lambda *a: port))
+    monkeypatch.setattr(perception_probe.time, "sleep", lambda _: None)
+    arguments = dict(adapter=adapter, client_id="client:probe", runtime_session_id="session:probe",
+        manifest_hash="a" * 64, operation_id="operation:probe", timeout_sec=2., executor_errors={})
+    if published_status == "completed":
+        assert perception_probe._wait_for_terminal_operation(**arguments)["status"] == "completed"
+    else:
+        message = ("Skill did not complete: failed:read_finished" if published_status == "failed"
+                   else "executor exited without a terminal operation: status=running")
+        with pytest.raises(RuntimeError, match=message):
+            perception_probe._wait_for_terminal_operation(**arguments)
+    assert len(queries) == 2 and len(set(queries)) == 2
+
+
 def test_real_perception_probe_runs_both_skills_and_validates_artifacts(
     monkeypatch,
     tmp_path,

@@ -719,6 +719,9 @@ JSON object and saves the same bounded evidence as
 `real_perception_skill_probe.json` under `--run-root`; raw image/depth bytes are
 not included in that JSON.
 
+探针以执行器退出之后的新操作快照判断最终状态，避免把退出前读到的 `running` 误报为异常。
+执行器已退出而新快照仍非终态、真实失败或超时仍按原合同拒绝；本地替身测试不代表真实相机验收。
+
 This probe covers real Gateway startup, camera admission, both passive Skill
 executors, operation polling, and Artifact transfer/decoding. The Skill calls
 use the in-process bound wire adapter after a real server socket is established;
