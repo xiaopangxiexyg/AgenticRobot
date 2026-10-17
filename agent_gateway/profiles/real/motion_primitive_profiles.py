@@ -46,6 +46,7 @@ from agent_gateway.skills.motion.definition import (
     FIXED_CARDINAL_TCP_STEP_SKILL_IDS_V1,
     FIXED_LEVEL_TCP_ORIENTATION_SKILL_IDS_V1,
     GRASP_APPROACH_SKILL_ID_V1,
+    SAFE_TCP_POSE_TARGET_SKILL_ID_V1,
     TCP_LEVEL_FORWARD_LEFT_30_SKILL_ID_V1,
     TCP_LEVEL_FORWARD_RIGHT_30_SKILL_ID_V1,
     TCP_LEVEL_FORWARD_SKILL_ID_V1,
@@ -54,6 +55,7 @@ from agent_gateway.skills.motion.definition import (
     fixed_cardinal_tcp_step_skill_definition_v1,
     fixed_level_tcp_orientation_skill_definition_v1,
     grasp_approach_skill_definition_v1,
+    safe_tcp_pose_target_skill_definition_v1,
     tcp_pose_target_skill_definition_v1,
 )
 from agent_gateway.skills.motion.schemas import (
@@ -102,6 +104,12 @@ from .station_point_grasp_render_deployment import (
 
 REAL_AGENT_TCP_CARDINAL_STEP_ROUTE_ID_V1 = "real.rm65.agent_skill_tcp_cardinal_step"
 REAL_AGENT_TCP_POSE_TARGET_ROUTE_ID_V1 = "real.rm65.agent_skill_tcp_pose_target"
+REAL_AGENT_SAFE_TCP_POSE_TARGET_ROUTE_ID_V1 = (
+    "real.rm65.agent_skill_tcp_pose_target_safe"
+)
+REAL_AGENT_SAFE_TCP_POSE_TARGET_EXECUTOR_ID_V1 = (
+    "control-station.real-agent-tcp-pose-target-safe.v1"
+)
 REAL_AGENT_GRASP_APPROACH_ROUTE_ID_V1 = "real.rm65.agent_skill_grasp_approach"
 REAL_AGENT_GRASP_APPROACH_EXECUTOR_ID_V1 = (
     "control-station.real-agent-grasp-approach.v1"
@@ -175,12 +183,14 @@ REAL_AGENT_TCP_FIXED_ORIENTATION_PARAMETER_PROFILE_ID_BY_SKILL_ID_V1 = {
 
 def real_agent_motion_route_ids_v1(
     *,
+    include_safe_pose: bool = False,
     include_grasp_approach: bool = False,
     include_grasp_approach_plan: bool = False,
 ) -> tuple[str, ...]:
     """Return the single authoritative real-motion Route allowlist."""
 
     optional_routes = (
+        *((REAL_AGENT_SAFE_TCP_POSE_TARGET_ROUTE_ID_V1,) if include_safe_pose else ()),
         *((REAL_AGENT_GRASP_APPROACH_ROUTE_ID_V1,) if include_grasp_approach else ()),
         *(
             (REAL_AGENT_EXECUTE_GRASP_APPROACH_PLAN_ROUTE_ID_V1,)
@@ -629,11 +639,22 @@ class RealAgentPrimitiveContractBundle:
             ):
                 if getattr(binding, name) != getattr(self.route_manifest, name):
                     raise ValueError("Gripper and arm deployment identities disagree.")
-        pose_target_enabled = self.pose_target_profile is not None
+        pose_target_enabled = any(
+            entry.route.skill_id == TCP_POSE_TARGET_SKILL_ID_V1
+            for entry in self.route_manifest.skill_routes
+        )
+        safe_pose_enabled = any(
+            entry.route.skill_id == SAFE_TCP_POSE_TARGET_SKILL_ID_V1
+            for entry in self.route_manifest.skill_routes
+        )
         grasp_approach_enabled = any(
             entry.route.skill_id == GRASP_APPROACH_SKILL_ID_V1
             for entry in self.route_manifest.skill_routes
         )
+        if (pose_target_enabled or safe_pose_enabled or grasp_approach_enabled) != (
+            self.pose_target_profile is not None
+        ):
+            raise ValueError("Absolute-pose Routes require their bound target profile.")
         grasp_approach_plan_enabled = self.grasp_approach_plan_registration is not None
         transport_enabled = self.object_transport_registration is not None
         if transport_enabled != any(entry.route.skill_id == "perception.plan_object_move"
@@ -659,6 +680,7 @@ class RealAgentPrimitiveContractBundle:
         expected_binding_count = (
             10
             + int(pose_target_enabled)
+            + int(safe_pose_enabled)
             + int(grasp_approach_enabled)
             + int(grasp_approach_plan_enabled)
         )
@@ -784,7 +806,8 @@ class RealAgentPrimitiveContractBundle:
         ):
             raise ValueError("Grasp-approach planning requires retained point grasps.")
         expected_route_count = (
-            (11 + int(pose_target_enabled) + int(grasp_approach_enabled))
+            (11 + int(pose_target_enabled) + int(grasp_approach_enabled)
+             + int(safe_pose_enabled))
             + (2 if self.perception_capture is not None else 0)
             + int(
                 self.perception_capture is not None
@@ -1207,6 +1230,20 @@ def build_real_agent_primitive_contract_bundle(
     grasp_approach_definition = grasp_approach_skill_definition_v1(
         controlled_component_ids=(component_id,),
     )
+    safe_pose_definition = safe_tcp_pose_target_skill_definition_v1(
+        controlled_component_ids=(component_id,),
+    )
+    safe_pose_schema = tcp_pose_target_schema_entry_v1(
+        skill_id=SAFE_TCP_POSE_TARGET_SKILL_ID_V1,
+        skill_definition_hash=safe_pose_definition.semantic_content_hash,
+        parameter_profile_id=pose_target_profile.parameter_profile_id,
+        parameter_profile_hash=pose_target_profile.semantic_content_hash,
+        allowed_component_ids=(component_id,),
+        allowed_reference_frame_ids=(pose_target_profile.reference_frame_id,),
+        max_requested_duration_ms=None,
+        min_speed_scale=pose_target_profile.min_speed_scale,
+        max_speed_scale=pose_target_profile.max_speed_scale,
+    )
     grasp_approach_schema = tcp_pose_target_schema_entry_v1(
         skill_id=GRASP_APPROACH_SKILL_ID_V1,
         skill_definition_hash=grasp_approach_definition.semantic_content_hash,
@@ -1353,6 +1390,14 @@ def build_real_agent_primitive_contract_bundle(
         route_id=REAL_AGENT_GRASP_APPROACH_ROUTE_ID_V1,
         max_operation_duration_ms=60_000,
     )
+    safe_pose_route = route_for(
+        definition=safe_pose_definition, schema=safe_pose_schema,
+        route_id=REAL_AGENT_SAFE_TCP_POSE_TARGET_ROUTE_ID_V1,
+        max_operation_duration_ms=120_000,
+    )
+    safe_pose_enabled = any(
+        REAL_AGENT_SAFE_TCP_POSE_TARGET_ROUTE_ID_V1 in ref.allowed_route_ids for ref in refs
+    )
     pose_target_enabled = any(
         REAL_AGENT_TCP_POSE_TARGET_ROUTE_ID_V1 in ref.allowed_route_ids for ref in refs
     )
@@ -1396,6 +1441,7 @@ def build_real_agent_primitive_contract_bundle(
         )
     )
     all_routes = (
+        *((safe_pose_route,) if safe_pose_enabled else ()),
         *((pose_target_route,) if pose_target_enabled else ()),
         *((grasp_approach_route,) if grasp_approach_enabled else ()),
         *(
@@ -1409,6 +1455,7 @@ def build_real_agent_primitive_contract_bundle(
     )
     expected_route_ids = set(
         real_agent_motion_route_ids_v1(
+            include_safe_pose=safe_pose_enabled,
             include_grasp_approach=grasp_approach_enabled,
             include_grasp_approach_plan=grasp_approach_plan_enabled,
         )
@@ -1438,6 +1485,8 @@ def build_real_agent_primitive_contract_bundle(
         domain="dexteleop.real_agent_motion.port_binding.v1",
     )
     profile_by_route_hash = {
+        **({safe_pose_route.semantic_content_hash: pose_target_profile}
+           if safe_pose_enabled else {}),
         **(
             {pose_target_route.semantic_content_hash: pose_target_profile}
             if pose_target_enabled
@@ -1473,6 +1522,8 @@ def build_real_agent_primitive_contract_bundle(
         },
     }
     executor_by_route_hash = {
+        **({safe_pose_route.semantic_content_hash: REAL_AGENT_SAFE_TCP_POSE_TARGET_EXECUTOR_ID_V1}
+           if safe_pose_enabled else {}),
         **(
             {
                 pose_target_route.semantic_content_hash: (
@@ -1644,6 +1695,7 @@ def build_real_agent_primitive_contract_bundle(
         catalog_version="1",
         skill_definitions=(
             tcp_pose_definition,
+            *((safe_pose_definition,) if safe_pose_enabled else ()),
             *((pose_target_definition,) if pose_target_enabled else ()),
             *((grasp_approach_definition,) if grasp_approach_enabled else ()),
             *(
@@ -1667,6 +1719,7 @@ def build_real_agent_primitive_contract_bundle(
         catalog_version="1",
         schema_entries=(
             tcp_pose_schema,
+            *((safe_pose_schema,) if safe_pose_enabled else ()),
             *((pose_target_schema,) if pose_target_enabled else ()),
             *((grasp_approach_schema,) if grasp_approach_enabled else ()),
             *(
@@ -1940,6 +1993,8 @@ def build_real_agent_primitive_contract_bundle(
                 else ()
             ),
             _payload_validator(route=cardinal_route, profile=cardinal_profile),
+            *((_payload_validator(route=safe_pose_route, profile=pose_target_profile),)
+              if safe_pose_enabled else ()),
             *tuple(
                 _payload_validator(
                     route=route,
@@ -2023,7 +2078,11 @@ def build_real_agent_primitive_contract_bundle(
         route_manifest=manifest,
         io_catalog=io_catalog,
         cardinal_profile=cardinal_profile,
-        pose_target_profile=(pose_target_profile if pose_target_enabled else None),
+        pose_target_profile=(
+            pose_target_profile
+            if pose_target_enabled or safe_pose_enabled or grasp_approach_enabled
+            else None
+        ),
         orientation_profiles=orientation_profiles,
         deployment_bindings=bindings,
         convergence_profile=convergence,
@@ -2050,6 +2109,8 @@ def build_real_agent_primitive_contract_bundle(
 __all__ = [
     "REAL_AGENT_GRASP_APPROACH_EXECUTOR_ID_V1",
     "REAL_AGENT_GRASP_APPROACH_ROUTE_ID_V1",
+    "REAL_AGENT_SAFE_TCP_POSE_TARGET_EXECUTOR_ID_V1",
+    "REAL_AGENT_SAFE_TCP_POSE_TARGET_ROUTE_ID_V1",
     "REAL_AGENT_TCP_CARDINAL_STEP_EXECUTOR_ID_V1",
     "REAL_AGENT_TCP_CARDINAL_STEP_PARAMETER_PROFILE_ID_V1",
     "REAL_AGENT_TCP_CARDINAL_STEP_ROUTE_ID_V1",

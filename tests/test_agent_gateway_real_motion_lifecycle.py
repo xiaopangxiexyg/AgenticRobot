@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 from types import SimpleNamespace
 
 import numpy as np
@@ -9,6 +10,7 @@ from agent_gateway.profiles.real.motion_gateway_session import (
     assemble_real_agent_primitive_gateway_session,
 )
 from agent_gateway.profiles.real.motion_primitive_profiles import (
+    RealAgentPrimitiveConvergenceProfile,
     build_real_agent_primitive_contract_bundle,
     real_agent_motion_route_ids_v1,
 )
@@ -111,6 +113,8 @@ def _runtime_fixture(
     station_from_execution_x: float = 0.0,
     include_inactive_command: bool = False,
     include_grasp_approach: bool = False,
+    include_safe_pose: bool = False,
+    convergence_profile: RealAgentPrimitiveConvergenceProfile | None = None,
 ):
     execution_frame = CoordinateFrameSpec(frame_id="dual_arm_solver_world")
     station_frame = CoordinateFrameSpec(
@@ -170,6 +174,7 @@ def _runtime_fixture(
         content_hash="real-envelope-hash:lifecycle-test",
         constraint_set_hash="real-constraint-hash:lifecycle-test",
         allowed_route_ids=real_agent_motion_route_ids_v1(
+            include_safe_pose=include_safe_pose,
             include_grasp_approach=include_grasp_approach,
         ),
     )
@@ -179,6 +184,7 @@ def _runtime_fixture(
         frame_graph=graph,
         primitive_reference_frame_id=station_frame.frame_id,
         safety_envelope_refs=(envelope,),
+        convergence_profile=convergence_profile,
     )
     builder = _TargetBuilder(include_inactive_command=include_inactive_command)
     port = RealAgentMotionPort(config=port_config, target_builder=builder)
@@ -324,15 +330,20 @@ def _publish_qpos(
     )
 
 
-def test_grasp_approach_activates_only_the_preplanned_joint_trajectory() -> None:
-    bundle, port, builder = _runtime_fixture(include_grasp_approach=True)
+@pytest.mark.parametrize("skill_id, planner_key", [
+    ("motion.approach_grasp_pose", "grasp_trajectory_planner"),
+    ("motion.move_tcp_to_pose_safe", "grasp_trajectory_planner"),
+    ("motion.move_tcp_to_pose", "tcp_trajectory_planner"),
+])
+def test_grasp_approach_activates_only_the_preplanned_joint_trajectory(skill_id, planner_key) -> None:
+    bundle, port, builder = _runtime_fixture(include_grasp_approach=True, include_safe_pose=True)
     clock = _Clock()
     owner = _OwnerSession()
     request, operation, route, binding = _pose_request_and_operation(
         bundle,
         clock=clock,
         speed_scale=0.2,
-        skill_id="motion.approach_grasp_pose",
+        skill_id=skill_id,
     )
     qpos_by_side = {
         "left": np.zeros(6, dtype=float),
@@ -350,10 +361,12 @@ def test_grasp_approach_activates_only_the_preplanned_joint_trajectory() -> None
     def planner(**_kwargs) -> RealAgentJointTrajectory:
         nonlocal planner_calls
         planner_calls += 1
+        assert _kwargs.get("require_grasp_approach", True) == (skill_id != "motion.move_tcp_to_pose_safe")
         return trajectory
 
     def lower_owner_sleep(duration: float) -> None:
         clock.value += duration
+        _publish_qpos(port, qpos_by_side=qpos_by_side, measured_at=clock(), available_at=clock())
         port.apply_owner_requests(session=owner, now=clock())
 
     lifecycle = RealAgentPrimitiveSkillLifecycle(
@@ -364,7 +377,7 @@ def test_grasp_approach_activates_only_the_preplanned_joint_trajectory() -> None
         profile=bundle.pose_target_profile,
         request=request,
         operation=operation,
-        grasp_trajectory_planner=planner,
+        **{planner_key: planner},
         clock=clock,
         sleep=lower_owner_sleep,
     )
@@ -385,6 +398,88 @@ def test_grasp_approach_activates_only_the_preplanned_joint_trajectory() -> None
     assert isinstance(command, TeleopCommand)
     metadata = command.metadata[REAL_AGENT_MOTION_COMMAND_METADATA_KEY]
     assert metadata["joint_trajectory_hash"] == trajectory.semantic_content_hash
+    assert builder.last_target is None
+
+
+@pytest.mark.parametrize("skill_id", ["motion.move_tcp_to_pose", "motion.move_tcp_to_pose_safe"])
+@pytest.mark.parametrize("outcome", ["fresh", "stale", "unavailable", "drift", "cancel", "cancel_wait", "future", "deadline"])
+def test_preplanned_tcp_waits_for_fresh_state_after_non_motion_window(skill_id, outcome, caplog, monkeypatch):
+    bundle, port, builder = _runtime_fixture(include_grasp_approach=True, include_safe_pose=True)
+    clock, owner = _Clock(), _OwnerSession()
+    request, operation, route, binding = _pose_request_and_operation(
+        bundle, clock=clock, speed_scale=.2, skill_id=skill_id)
+    qpos = {s: np.zeros(6) for s in ("left", "right")}
+    _publish_qpos(port, qpos_by_side=qpos, measured_at=clock(), available_at=clock())
+    events = []
+
+    @contextmanager
+    def window():
+        assert port.snapshot().phase != RealAgentMotionPhase.ACTIVE
+        events.append("enter")
+        yield
+        events.append("exit")
+
+    def calculate(**kwargs):
+        assert events == ["enter"]
+        if skill_id == "motion.move_tcp_to_pose":
+            assert kwargs["time_budget_sec"] > 0
+        else:
+            assert kwargs["require_grasp_approach"] is False
+        clock.value += .3  # Original cut expires while no motion is active.
+        if outcome == "deadline":
+            clock.value = operation.deadline_at - .025
+        if outcome == "future":
+            _publish_qpos(port, qpos_by_side=qpos, measured_at=clock()+.1, available_at=clock()+.1)
+        if outcome == "unavailable":
+            monkeypatch.setattr(port, "latest_measured_qpos", lambda: None)
+        return _stationary_grasp_trajectory(qpos)
+
+    def observed_planner(**kwargs):
+        # The observed-safe adapter owns its window after correlated capture.
+        with window():
+            return calculate(**kwargs)
+
+    wait_polls = []
+    def sleep(duration):
+        clock.value += duration
+        if port.snapshot().phase == RealAgentMotionPhase.INACTIVE:
+            assert events == ["enter", "exit"]
+            wait_polls.append(duration)
+        if outcome in {"fresh", "drift"} and len(wait_polls) >= 4:
+            pair = {s: v.copy() for s, v in qpos.items()}
+            if outcome == "drift":
+                pair["right"][0] += .5
+            _publish_qpos(port, qpos_by_side=pair, measured_at=clock(), available_at=clock())
+        port.apply_owner_requests(session=owner, now=clock())
+
+    lifecycle = RealAgentPrimitiveSkillLifecycle(port=port, contract_bundle=bundle,
+        route=route, binding=binding, profile=bundle.pose_target_profile,
+        request=request, operation=operation,
+        **({"tcp_trajectory_planner": calculate} if skill_id == "motion.move_tcp_to_pose"
+           else {"grasp_trajectory_planner": observed_planner}),
+        non_motion_read_window=window, clock=clock, sleep=sleep)
+    result = lifecycle.activate(request=request, operation=operation,
+        cancel_requested=lambda: (outcome == "cancel" and "exit" in events)
+            or (outcome == "cancel_wait" and len(wait_polls) >= 2))
+    assert events == ["enter", "exit"]
+    assert result.succeeded == (outcome == "fresh")
+    if outcome != "fresh":
+        assert result.lower_hold_confirmed
+        assert port.snapshot().phase != RealAgentMotionPhase.ACTIVE
+    if outcome in {"fresh", "drift"}:
+        assert len(wait_polls) >= 4
+    if outcome == "future":
+        assert not wait_polls
+        assert result.status == "grasp_path_postplan_measured_qpos_from_future"
+    if outcome in {"stale", "unavailable"}:
+        assert sum(wait_polls) <= .501
+        assert result.status == "grasp_path_postplan_measured_qpos_" + outcome
+        assert "postplan_qpos" in caplog.text and operation.operation_id in caplog.text
+        assert "'poll_count':" in caplog.text and "'maximum_age_ms':" in caplog.text
+    if outcome == "drift":
+        assert result.status == "grasp_path_start_state_drift"
+    if outcome in {"cancel", "cancel_wait"}:
+        assert result.status == "real_primitive_cancelled_before_activation"
     assert builder.last_target is None
 
 
@@ -448,6 +543,57 @@ def test_grasp_approach_activation_evidence_stays_bounded_while_owner_waits() ->
     assert activation.succeeded is True
     assert len(activation.evidence_refs) < 16
     assert port.snapshot().phase == RealAgentMotionPhase.ACTIVE
+
+
+@pytest.mark.parametrize("failure", ["no_path", "stale_start", "cancel", "deadline", "start_drift"])
+def test_safe_pose_move_never_falls_back_to_online_ik(failure, monkeypatch):
+    from dataclasses import replace
+
+    from teleop_runtime.skill_deploy.rm65_grasp_trajectory import (
+        RM65GraspTrajectoryPlanningError,
+    )
+
+    bundle, port, builder = _runtime_fixture(include_safe_pose=True)
+    clock, owner = _Clock(), _OwnerSession()
+    request, operation, route, binding = _pose_request_and_operation(
+        bundle, clock=clock, speed_scale=0.2, skill_id="motion.move_tcp_to_pose_safe",
+    )
+    qpos = {side: np.zeros(6) for side in ("left", "right")}
+    _publish_qpos(port, qpos_by_side=qpos, measured_at=clock(), available_at=clock())
+    if failure == "stale_start":
+        stale_qpos = replace(port.latest_measured_qpos(), measured_at=clock() - 0.3)
+        monkeypatch.setattr(port, "latest_measured_qpos", lambda: stale_qpos)
+    planned = []
+
+    def planner(**kwargs):
+        planned.append(kwargs)
+        assert kwargs["require_grasp_approach"] is False
+        if failure == "no_path":
+            raise RM65GraspTrajectoryPlanningError("path_search_exhausted")
+        if failure == "deadline":
+            clock.value += 9.8
+        changed = {side: values.copy() for side, values in qpos.items()}
+        if failure == "start_drift":
+            changed["left"][0] += 0.2
+        _publish_qpos(port, qpos_by_side=changed, measured_at=clock(), available_at=clock())
+        return _stationary_grasp_trajectory(qpos)
+
+    def lower_sleep(duration):
+        clock.value += duration
+        port.apply_owner_requests(session=owner, now=clock())
+
+    lifecycle = RealAgentPrimitiveSkillLifecycle(
+        port=port, contract_bundle=bundle, route=route, binding=binding,
+        profile=bundle.pose_target_profile, request=request, operation=operation,
+        grasp_trajectory_planner=planner, clock=clock, sleep=lower_sleep,
+    )
+    result = lifecycle.activate(request=request, operation=operation,
+        cancel_requested=lambda: failure == "cancel" and bool(planned))
+    assert not result.succeeded
+    assert result.lower_hold_confirmed
+    assert port.snapshot().dispatch_count == 0
+    assert builder.last_target is None
+    assert len(planned) == (0 if failure == "stale_start" else 1)
 
 
 def test_grasp_approach_rejects_stale_qpos_after_planning_and_holds() -> None:
@@ -1187,3 +1333,55 @@ def test_real_lifecycle_reports_lower_failure_and_preserves_reason(caplog, lower
     assert port.snapshot().hold_reason == native_reason
     assert native_reason in caplog.text
     assert len(owner.holds) == 1
+
+
+@pytest.mark.parametrize("skill_id", ["motion.move_tcp_to_pose", "motion.move_tcp_to_pose_safe"])
+def test_preplanned_tcp_requires_new_cut_even_when_previous_cut_is_still_fresh(skill_id):
+    bundle, port, builder = _runtime_fixture(include_grasp_approach=True, include_safe_pose=True,
+        convergence_profile=RealAgentPrimitiveConvergenceProfile(max_measurement_age_ms=1000))
+    clock, owner = _Clock(), _OwnerSession()
+    request, operation, route, binding = _pose_request_and_operation(
+        bundle, clock=clock, speed_scale=.2, skill_id=skill_id)
+    qpos = {s: np.zeros(6) for s in ("left", "right")}
+    _publish_qpos(port, qpos_by_side=qpos, measured_at=clock(), available_at=clock())
+    initial_measured_at = port.latest_measured_qpos().measured_at
+    events, wait_polls = [], []
+
+    @contextmanager
+    def window():
+        events.append("enter")
+        yield
+        events.append("exit")
+
+    def calculate(**kwargs):
+        assert events == ["enter"]
+        clock.value += .3
+        return _stationary_grasp_trajectory(qpos)
+
+    def safe_planner(**kwargs):
+        with window():
+            return calculate(**kwargs)
+
+    def sleep(duration):
+        if port.snapshot().phase == RealAgentMotionPhase.INACTIVE:
+            wait_polls.append(duration)
+        clock.value += duration
+        port.apply_owner_requests(session=owner, now=clock())
+
+    lifecycle = RealAgentPrimitiveSkillLifecycle(port=port, contract_bundle=bundle,
+        route=route, binding=binding, profile=bundle.pose_target_profile,
+        request=request, operation=operation,
+        **({"tcp_trajectory_planner": calculate} if skill_id == "motion.move_tcp_to_pose"
+           else {"grasp_trajectory_planner": safe_planner}),
+        non_motion_read_window=window, clock=clock, sleep=sleep)
+    result = lifecycle.activate(request=request, operation=operation, cancel_requested=lambda: False)
+    assert events == ["enter", "exit"]
+    assert .49 <= sum(wait_polls) <= .501
+    assert port.latest_measured_qpos().measured_at == initial_measured_at
+    assert (clock() - initial_measured_at) * 1000 < 1000
+    assert not result.succeeded
+    assert result.status == "grasp_path_postplan_measured_qpos_not_refreshed"
+    assert result.lower_hold_confirmed
+    assert port.snapshot().dispatch_count == 0
+    assert port.snapshot().phase != RealAgentMotionPhase.ACTIVE
+    assert builder.last_target is None

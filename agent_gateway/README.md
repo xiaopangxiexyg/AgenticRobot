@@ -1422,3 +1422,20 @@ external reconciliation.
 完整路径仍由现有 `motion.move_tcp_to_pose_safe` 重新取得当前状态、检查场景并规划，
 失败不回退普通 move-to。沿整个路径保持水平、绕开指定区域等持续约束尚不由该 Skill 实现，
 也不能把终点轴对齐解释为全过程满足该约束。
+
+### 真机 TCP 预规划的统一接线
+
+`motion.move_tcp_to_pose_safe@1` 需要单独授权 `move_tcp_to_pose_safe`；普通
+`move_tcp_to_pose` 的授权不能调用它。该路由通过现有 lower planner 先完成固定场景
+碰撞、路径质量、目标包络和最终轨迹检查，再由原控制 owner 执行，不回退到在线 IK。
+safe planner 的到位容差绑定当前 convergence profile，不改抓取规划的原有配置。
+
+在已装配抓取 planner 的部署中，普通 `motion.move_tcp_to_pose@1` 也可复用它的
+`plan_tcp_pose` 做预规划。固定朝向的平移保留笛卡尔直线，调用共用的求解、连续 C2
+时序、硬限制、密集复验和记录路径；它没有携带物碰撞认证或目标接触豁免。
+未绑定此可选 planner 的既有普通入口保留原行为。
+
+规划时使用 lower 的 confirmed-HOLD 读取窗口；窗口退出后最多等待 0.5 秒、
+且不超过原 operation deadline，取得更新且仍新鲜的 measured qpos 后才可激活。
+未来时间、过期、不可用、起始关节漂移、取消及剩余执行时间不足仍按原门禁拒绝并 HOLD。
+本批只接入固定场景规划；RGB-D 障碍场景与会话几何准备另按依赖接入。

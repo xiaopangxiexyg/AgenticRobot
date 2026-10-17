@@ -160,6 +160,9 @@ class _FakeClient:
 
 
 class _FakeAbsolutePoseClient(_FakeClient):
+    skill_id: ClassVar[str] = "motion.move_tcp_to_pose"
+    route_id: ClassVar[str] = "real.rm65.agent_skill_tcp_pose_target"
+    requested_timeout_ms: ClassVar[int] = 30_000
     expected_pose: ClassVar[list[float]] = [
         0.31,
         -0.12,
@@ -180,10 +183,10 @@ class _FakeAbsolutePoseClient(_FakeClient):
                 "skill_routes": [
                     {
                         "route": {
-                            "skill_id": "motion.move_tcp_to_pose",
+                            "skill_id": self.skill_id,
                             "skill_version": "1",
                             "skill_definition_hash": "skill-definition:absolute-pose",
-                            "route_id": "real.rm65.agent_skill_tcp_pose_target",
+                            "route_id": self.route_id,
                             "route_version": "1",
                             "route_hash": "route:absolute-pose",
                             "parameter_schema_hash": "schema:absolute-pose",
@@ -207,7 +210,7 @@ class _FakeAbsolutePoseClient(_FakeClient):
                                         "constraint-hash:absolute-pose"
                                     ),
                                     "allowed_route_ids": [
-                                        "real.rm65.agent_skill_tcp_pose_target"
+                                        self.route_id
                                     ],
                                 }
                             ],
@@ -234,7 +237,7 @@ class _FakeAbsolutePoseClient(_FakeClient):
                 "skill_schema_catalog_hash": "catalog:absolute-pose",
                 "schema_entries": [
                     {
-                        "skill_id": "motion.move_tcp_to_pose",
+                        "skill_id": self.skill_id,
                         "skill_version": "1",
                         "parameter_schema_hash": "schema:absolute-pose",
                         "parameter_schema": {
@@ -296,7 +299,9 @@ class _FakeAbsolutePoseClient(_FakeClient):
             }
         if method == "submit_skill_request":
             parameters = payload["parameters"]
-            assert payload["requested_timeout_ms"] == 30_000
+            assert payload["skill_id"] == self.skill_id
+            assert payload["route_id"] == self.route_id
+            assert payload["requested_timeout_ms"] == self.requested_timeout_ms
             assert "component_id" not in parameters
             assert parameters["reference_frame_id"] == "canonical_station"
             assert parameters["reference_frame_spec_hash"] == (
@@ -465,17 +470,26 @@ def test_one_shot_client_pending_poll_does_not_sleep_or_query_past_deadline(
     assert sum(method == "get_own_operation" for method, _ in client.calls) == 1
 
 
+@pytest.mark.parametrize("action", ["move_tcp_to_pose", "move_tcp_to_pose_safe"])
 def test_one_shot_client_submits_absolute_dmtac_tcp_in_canonical_station(
     monkeypatch,
     tmp_path,
+    action,
 ) -> None:
+    class Client(_FakeAbsolutePoseClient):
+        skill_id = "motion." + action
+        route_id = "real.rm65.agent_skill_tcp_pose_target" + (
+            "_safe" if action == "move_tcp_to_pose_safe" else ""
+        )
+        requested_timeout_ms = 120_000 if action == "move_tcp_to_pose_safe" else 30_000
+
     _FakeClient.instances.clear()
-    monkeypatch.setattr(one_shot_client, "_Client", _FakeAbsolutePoseClient)
+    monkeypatch.setattr(one_shot_client, "_Client", Client)
     args = Namespace(
         confirm="EXECUTE_AUTHORIZED_REAL_TCP_PRIMITIVE",
         socket_path=str(tmp_path / "absolute-pose.sock"),
         side="right",
-        action="move_tcp_to_pose",
+        action=action,
         target_xyz_m=(0.31, -0.12, 0.28),
         target_quat_xyzw=(0.0, 0.0, 0.0, 2.0),
         speed_scale=0.2,

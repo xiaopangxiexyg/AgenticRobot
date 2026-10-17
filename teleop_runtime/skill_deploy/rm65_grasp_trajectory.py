@@ -5109,6 +5109,123 @@ class RM65GraspJointTrajectoryPlanner:
             "dense_revalidation",
         }
 
+    def plan_tcp_pose(
+        self, *, qpos_by_side: Mapping[str, np.ndarray], side: str,
+        target_tool_tcp_world: np.ndarray, speed_scale: float,
+        monotonic: Callable[[], float] = time.perf_counter,
+        time_budget_sec: float | None = None,
+    ) -> RealAgentJointTrajectory:
+        # This entrypoint shares the same target builder as normal requests.
+        with self._observed_planning_lock:
+            return self._plan_tcp_pose(
+                qpos_by_side=qpos_by_side, side=side,
+                target_tool_tcp_world=target_tool_tcp_world, speed_scale=speed_scale,
+                monotonic=monotonic, time_budget_sec=time_budget_sec,
+            )
+
+    def _plan_tcp_pose(
+        self, *, qpos_by_side: Mapping[str, np.ndarray], side: str,
+        target_tool_tcp_world: np.ndarray, speed_scale: float,
+        monotonic: Callable[[], float] = time.perf_counter,
+        time_budget_sec: float | None = None,
+    ) -> RealAgentJointTrajectory:
+        """Plan before activation; fixed-orientation moves keep a Cartesian line.
+
+        This reuses the approach solver and timing owner, without a pregrasp
+        offset or target-contact exemption. It does not model a carried object.
+        Failure never falls back to live IK or an unconstrained lift.
+        """
+        if side not in _SIDES:
+            raise ValueError("side must be left or right.")
+        scale = float(speed_scale)
+        if not 0 < scale <= 1:
+            raise ValueError("speed_scale must satisfy 0 < speed_scale <= 1.")
+        current = {name: np.asarray(qpos_by_side[name], dtype=float).reshape(6).copy()
+                   for name in _SIDES}
+        target = np.asarray(target_tool_tcp_world, dtype=float).reshape(4, 4)
+        started = monotonic()
+        budget = self.config.path_planning_time_budget_sec
+        if time_budget_sec is not None:
+            if not math.isfinite(time_budget_sec) or time_budget_sec <= 0:
+                raise RM65GraspTrajectoryPlanningError("path_planning_time_budget_exhausted")
+            budget = min(budget, time_budget_sec)
+        deadline = started + budget
+        self.require_static_grasp_scene(qpos_by_side=current, side=side)
+        solver_targets = self.target_builder.solver_world_targets_for_qpos_pair(
+            left_qpos=current["left"], right_qpos=current["right"])
+        solver_targets[side] = self.target_builder.solver_world_target_from_tool_tcp_world_target(
+            side=side, tool_tcp_world_target=target)
+        self._require_unmodified_target_envelope(solver_targets, sides=(side,), phase="target")
+        self._preflight_start_envelope(qpos_by_side=current, side=side)
+        start = self.target_builder.tool_tcp_world_targets_for_qpos_pair(
+            left_qpos=current["left"], right_qpos=current["right"])[side]
+        distance, rotation_error = pose_delta_metrics(start, target)
+        linear = distance > 1e-9 and rotation_error <= self.config.endpoint_orientation_tolerance_deg
+        if linear:
+            leg = self._plan_constrained_approach_leg(
+                qpos_by_side=current, side=side, pregrasp_tool_tcp_world=start,
+                grasp_tool_tcp_world=target, allow_terminal_target_contact=False,
+                deadline=deadline, monotonic=monotonic)
+        else:
+            leg = self._plan_path_leg(
+                qpos_by_side=current, side=side, target_tool_tcp_world=target,
+                planning_phase="tcp_pose_target", prefer_closest_tolerance=False,
+                deadline=deadline, monotonic=monotonic)
+        waypoints = tuple(leg.path.waypoints)
+        if len(waypoints) == 1:
+            waypoints = (waypoints[0], waypoints[0])
+        velocity = load_joint_velocity_limit_profiles()[
+            self.profile.position_profile.ik_execution.joint_velocity_limit_profile]
+        continuous, _, tcp_scale = self._continuous_leg_trajectory(
+            waypoints=waypoints, moving_side=side, speed_scale=scale,
+            joint_velocity_rad_s=np.deg2rad(velocity.max_velocity_deg_s) * scale,
+            reference_hz=float(self.profile.position_profile.rates.ik_hz))
+        final = tuple({"left": row[:6], "right": row[6:]} for row in continuous.q_rad)
+        validation = self._revalidate(final, moving_side=side,
+                                      deadline=deadline, monotonic=monotonic)
+        geometry = None
+        if linear:
+            geometry = self._validate_constrained_approach_geometry(
+                final, moving_side=side, pregrasp_tool_tcp_world=start,
+                grasp_tool_tcp_world=target, deadline=deadline, monotonic=monotonic)
+        qpos = {"left": continuous.q_rad[:, :6], "right": continuous.q_rad[:, 6:]}
+        inactive = "right" if side == "left" else "left"
+        if not np.allclose(qpos[inactive], current[inactive], atol=1e-12, rtol=0):
+            raise RM65GraspTrajectoryPlanningError("stationary_arm_changed")
+        quality = self._require_motion_quality(qpos, side=side, deadline=deadline,
+                                               monotonic=monotonic)
+        metadata = {"mode": "continuous_c2", "planning_kind": "tcp_pose_target",
+                    "cartesian_line": linear, "carried_object_collision_checked": False,
+                    "dense_revalidation": validation, "cartesian_geometry": geometry,
+                    "motion_quality": quality, "tcp_limit_time_scale": tcp_scale,
+                    "continuous_hard_limit_certificate": continuous.metadata["continuous_hard_limit_certificate"]}
+        planning_timing = {"clock": "host_perf_counter",
+                           "planning_wall_duration_sec": monotonic() - started}
+        trajectory = RealAgentJointTrajectory(
+            time_from_start_sec=continuous.timestamps, qpos_by_side=qpos,
+            planner_evidence_refs=("rm65-tcp-path:" + canonical_content_hash(
+                {"scene_hash": self.scene.semantic_content_hash, "target": target,
+                 "path_hash": leg.path.semantic_content_hash, "validation": metadata,
+                 "planning_timing": planning_timing},
+                domain="dexteleop.real_agent_motion.rm65_tcp_path.v1"),))
+        if self.trajectory_record_dir is not None:
+            try:
+                write_grasp_trajectory_record(
+                    self.trajectory_record_dir, trajectory, moving_side=side,
+                    scene_hash=self.scene.semantic_content_hash,
+                    collision_scope="profile_sparse_proxy_pairs",
+                    collision_scene_profile=self.path_collision_scene_profile,
+                    target_tool_tcp_world=target, speed_scale=scale,
+                    stage_boundaries=(), parameterization=metadata,
+                    planning_timing=planning_timing,
+                    source_waypoints_by_side={name: np.stack([v[name] for v in waypoints])
+                                              for name in _SIDES})
+            except (OSError, ValueError, BadZipFile) as error:
+                raise RM65GraspTrajectoryPlanningError("trajectory_record_failed",
+                    details={"exception_type": type(error).__name__}) from error
+        return trajectory
+
+
     def __call__(
         self,
         *,

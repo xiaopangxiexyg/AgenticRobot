@@ -6,6 +6,7 @@ import logging
 import math
 import time
 from collections.abc import Callable, Mapping
+from contextlib import nullcontext
 
 from agent_gateway.profiles.motion_primitive_resolution import (
     MotionPrimitiveTargetResolution,
@@ -22,6 +23,8 @@ from agent_gateway.runtime.station_operation_worker import (
 from agent_gateway.skills.motion.definition import (
     EXECUTE_GRASP_APPROACH_PLAN_SKILL_ID_V1,
     GRASP_APPROACH_SKILL_ID_V1,
+    SAFE_TCP_POSE_TARGET_SKILL_ID_V1,
+    TCP_POSE_TARGET_SKILL_ID_V1,
 )
 from dataset_contracts.canonical_encoding import canonical_content_hash
 from robot_motion.relative_action import (
@@ -103,6 +106,8 @@ class RealAgentPrimitiveSkillLifecycle:
         request: AgentSkillRequest,
         operation: AgentSkillOperation,
         grasp_trajectory_planner: Callable[..., object] | None = None,
+        tcp_trajectory_planner: Callable[..., object] | None = None,
+        non_motion_read_window: Callable[[], object] | None = None,
         grasp_approach_plan_store: BoundedRealGraspApproachPlanStore | None = None,
         clock: Callable[[], float] = time.time,
         sleep: Callable[[float], None] = time.sleep,
@@ -127,10 +132,10 @@ class RealAgentPrimitiveSkillLifecycle:
             raise TypeError("profile must be a real primitive profile.")
         if not callable(clock) or not callable(sleep):
             raise TypeError("clock and sleep must be callable.")
-        if route.skill_id == GRASP_APPROACH_SKILL_ID_V1 and not callable(
-            grasp_trajectory_planner
-        ):
-            raise TypeError("grasp approach Route requires its URDF/FCL planner.")
+        if route.skill_id in {
+            GRASP_APPROACH_SKILL_ID_V1, SAFE_TCP_POSE_TARGET_SKILL_ID_V1,
+        } and not callable(grasp_trajectory_planner):
+            raise TypeError("Planned pose Route requires its URDF/FCL planner.")
         if route.skill_id == EXECUTE_GRASP_APPROACH_PLAN_SKILL_ID_V1 and not isinstance(
             grasp_approach_plan_store,
             BoundedRealGraspApproachPlanStore,
@@ -178,6 +183,8 @@ class RealAgentPrimitiveSkillLifecycle:
         self.request = request
         self.operation = operation
         self.grasp_trajectory_planner = grasp_trajectory_planner
+        self.tcp_trajectory_planner = tcp_trajectory_planner
+        self.non_motion_read_window = non_motion_read_window or nullcontext
         self.grasp_approach_plan_store = grasp_approach_plan_store
         self.clock = clock
         self.sleep = sleep
@@ -419,7 +426,11 @@ class RealAgentPrimitiveSkillLifecycle:
             if self._reserved_grasp_approach_plan is not None
             else ()
         )
-        if self.route.skill_id == GRASP_APPROACH_SKILL_ID_V1:
+        planned_tcp = (self.route.skill_id == TCP_POSE_TARGET_SKILL_ID_V1
+                       and self.tcp_trajectory_planner is not None)
+        if self.route.skill_id in {
+            GRASP_APPROACH_SKILL_ID_V1, SAFE_TCP_POSE_TARGET_SKILL_ID_V1,
+        } or planned_tcp:
             qpos_cut = self.port.latest_measured_qpos()
             now = float(self.clock())
             qpos_problem = self._measured_qpos_problem(cut=qpos_cut, now=now)
@@ -445,17 +456,23 @@ class RealAgentPrimitiveSkillLifecycle:
                     lower_hold_confirmed=hold.lower_hold_confirmed,
                 )
             assert qpos_cut is not None
-            assert self.grasp_trajectory_planner is not None
+            planner = self.tcp_trajectory_planner if planned_tcp else self.grasp_trajectory_planner
+            assert planner is not None
             try:
-                joint_trajectory = self.grasp_trajectory_planner(
-                    qpos_by_side=qpos_cut.qpos_by_side,
-                    side=self.profile.side,
-                    target_tool_tcp_world=xyzquat_to_pose_matrix(
-                        resolution.target_pose,
-                        name="real_agent_grasp_approach_target",
-                    ),
-                    speed_scale=float(self.request.parameters.get("speed_scale", 1.0)),
-                )
+                # No motion is active yet. Reuse the lower confirmed-HOLD
+                # read window; planning never runs inside the control cycle.
+                with self.non_motion_read_window() if planned_tcp else nullcontext():
+                    joint_trajectory = planner(
+                        qpos_by_side=qpos_cut.qpos_by_side,
+                        side=self.profile.side,
+                        target_tool_tcp_world=xyzquat_to_pose_matrix(
+                            resolution.target_pose, name="real_agent_planned_tcp_target"),
+                        speed_scale=float(self.request.parameters.get("speed_scale", 1.0)),
+                        **({"time_budget_sec": operation.deadline_at - float(self.clock())}
+                           if planned_tcp else {}),
+                        **({"require_grasp_approach": False}
+                           if self.route.skill_id == SAFE_TCP_POSE_TARGET_SKILL_ID_V1 else {}),
+                    )
             except RM65GraspTrajectoryPlanningError as exc:
                 hold = self.request_hold(
                     operation=operation,
@@ -500,10 +517,55 @@ class RealAgentPrimitiveSkillLifecycle:
                 )
             latest_qpos = self.port.latest_measured_qpos()
             now = float(self.clock())
+            postplan_started_at = now
+            postplan_initial_qpos = latest_qpos
+            refresh_poll_count = 0
+            if planned_tcp or self.route.skill_id == SAFE_TCP_POSE_TARGET_SKILL_ID_V1:
+                # Both TCP planners can pause the lower sampler. Window exit
+                # refreshes it, but the control loop publishes to this port
+                # asynchronously. Never activate from the pre-window cut.
+                refresh_deadline = min(now + 0.5, operation.deadline_at)
+                while (self._measured_qpos_problem(cut=latest_qpos, now=now) != "from_future"
+                       and (latest_qpos is None
+                       or latest_qpos.measured_at <= qpos_cut.measured_at
+                       or self._measured_qpos_problem(cut=latest_qpos, now=now))):
+                    if cancel_requested() or now >= refresh_deadline:
+                        break
+                    self.sleep(min(0.01, refresh_deadline - now))
+                    refresh_poll_count += 1
+                    latest_qpos = self.port.latest_measured_qpos()
+                    now = float(self.clock())
+                if cancel_requested():
+                    hold = self.request_hold(operation=operation, reason="cancelled_after_tcp_planning")
+                    return StationLifecycleActivationEvidence(
+                        succeeded=False, status="real_primitive_cancelled_before_activation",
+                        lower_operation_id=self.lower_operation_id,
+                        evidence_refs=hold.evidence_refs,
+                        lower_hold_confirmed=hold.lower_hold_confirmed)
             postplan_qpos_problem = self._measured_qpos_problem(
                 cut=latest_qpos,
                 now=now,
             )
+            if (postplan_qpos_problem is None
+                    and (planned_tcp or self.route.skill_id == SAFE_TCP_POSE_TARGET_SKILL_ID_V1)
+                    and latest_qpos.measured_at <= qpos_cut.measured_at):
+                # Freshness does not prove publication after the planning window.
+                postplan_qpos_problem = "not_refreshed"
+            postplan_diagnostic = {
+                "planning_start_measured_at": qpos_cut.measured_at,
+                "initial_measured_at": None if postplan_initial_qpos is None else postplan_initial_qpos.measured_at,
+                "initial_age_ms": None if postplan_initial_qpos is None else
+                    (postplan_started_at - postplan_initial_qpos.measured_at) * 1000,
+                "final_measured_at": None if latest_qpos is None else latest_qpos.measured_at,
+                "final_available_at": None if latest_qpos is None else latest_qpos.available_at,
+                "final_age_ms": None if latest_qpos is None else (now - latest_qpos.measured_at) * 1000,
+                "maximum_age_ms": self.contract_bundle.convergence_profile.max_measurement_age_ms,
+                "checked_at": now, "wait_sec": now - postplan_started_at,
+                "poll_count": refresh_poll_count, "problem": postplan_qpos_problem,
+            }
+            _LOGGER.log(logging.ERROR if postplan_qpos_problem else logging.INFO,
+                "Real TCP postplan_qpos: operation_id=%s skill_id=%s side=%s diagnostic=%r",
+                operation.operation_id, self.route.skill_id, self.profile.side, postplan_diagnostic)
             if postplan_qpos_problem is not None:
                 reason = "grasp_path_postplan_measured_qpos_" + postplan_qpos_problem
                 hold = self.request_hold(operation=operation, reason=reason)
@@ -1004,6 +1066,7 @@ class RealAgentPrimitiveSkillLifecycle:
                 planned_trajectory_elapsed = True
                 if self.route.skill_id in {
                     GRASP_APPROACH_SKILL_ID_V1,
+                    SAFE_TCP_POSE_TARGET_SKILL_ID_V1,
                     EXECUTE_GRASP_APPROACH_PLAN_SKILL_ID_V1,
                 }:
                     trajectory = self._planned_joint_trajectory

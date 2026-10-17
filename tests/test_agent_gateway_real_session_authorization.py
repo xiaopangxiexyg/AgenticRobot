@@ -24,11 +24,11 @@ class _Gateway:
         self.service = SimpleNamespace(access_policy=SimpleNamespace())
 
 
-def _request(*, component_id: str = "right_arm") -> SimpleNamespace:
+def _request(*, component_id: str = "right_arm", action: str = "move_tcp_to_pose") -> SimpleNamespace:
     return SimpleNamespace(
         client_id="rpent.dexteleop",
         skill_execution_grant_id=None,
-        skill_id="motion.move_tcp_to_pose",
+        skill_id="motion." + action,
         skill_version="1",
         route_id="real.rm65.agent_skill_tcp_pose_target",
         route_version="1",
@@ -42,7 +42,8 @@ def _request(*, component_id: str = "right_arm") -> SimpleNamespace:
     )
 
 
-def test_absolute_tcp_pose_request_receives_a_request_bound_grant(monkeypatch) -> None:
+@pytest.mark.parametrize("action", ["move_tcp_to_pose", "move_tcp_to_pose_safe"])
+def test_absolute_tcp_pose_request_receives_a_request_bound_grant(monkeypatch, action) -> None:
     gateway = _Gateway()
     issued: list[object] = []
 
@@ -60,14 +61,14 @@ def test_absolute_tcp_pose_request_receives_a_request_bound_grant(monkeypatch) -
     authorization = session_authorization.RealAgentPrimitiveSessionAuthorization(
         gateway_session=gateway,
         side="right",
-        action=session_authorization.REAL_AGENT_ABSOLUTE_TCP_POSE_ACTION,
+        action=action,
         client_id="rpent.dexteleop",
         confirmation_token=(
             session_authorization.REAL_AGENT_PRIMITIVE_SESSION_CONFIRM_TOKEN
         ),
         clock=lambda: 10.0,
     )
-    request = _request()
+    request = _request(action=action)
 
     grant = authorization.grant_resolver(request)
 
@@ -118,6 +119,18 @@ def test_absolute_tcp_pose_grant_rejects_wrong_side_and_unlisted_action(
 
     assert wrong_side_authorization.grant_resolver(_request()) is None
     assert unlisted_authorization.grant_resolver(_request()) is None
+
+
+def test_legacy_pose_grant_cannot_authorize_safe_move(monkeypatch):
+    monkeypatch.setattr(motion_gateway_session, "RealAgentPrimitiveGatewaySession", _Gateway)
+    monkeypatch.setattr(session_authorization, "issue_skill_execution_grant",
+        lambda **kwargs: (_ for _ in ()).throw(AssertionError("must not issue a grant")))
+    authorization = session_authorization.RealAgentPrimitiveSessionAuthorization(
+        gateway_session=_Gateway(), side="right", action="move_tcp_to_pose",
+        client_id="rpent.dexteleop",
+        confirmation_token=session_authorization.REAL_AGENT_PRIMITIVE_SESSION_CONFIRM_TOKEN,
+    )
+    assert authorization.grant_resolver(_request(action="move_tcp_to_pose_safe")) is None
 
 
 def test_authorization_still_requires_the_concrete_gateway_owner():

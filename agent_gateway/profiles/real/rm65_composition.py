@@ -63,6 +63,7 @@ from .localization_deployment import (
 )
 from .localization_gateway import ObjectLocalizationProvider
 from .motion_primitive_profiles import (
+    RealAgentPrimitiveConvergenceProfile,
     real_agent_motion_route_ids_v1,
 )
 from .observation_gateway import RealTcpPoseObserveAttachmentSpec
@@ -134,8 +135,9 @@ def _public_tool_profiles(lower: ExclusiveRM65SkillLowerAssembly) -> dict[str, o
     }
 
 
-def _route_ids(*, include_grasp_approach_plan: bool = False) -> tuple[str, ...]:
+def _route_ids(*, include_grasp_approach_plan: bool = False, include_safe_pose: bool = False) -> tuple[str, ...]:
     return real_agent_motion_route_ids_v1(
+        include_safe_pose=include_safe_pose,
         include_grasp_approach=True,
         include_grasp_approach_plan=include_grasp_approach_plan,
     )
@@ -619,6 +621,7 @@ def assemble_exclusive_rm65_agent_primitive_composition(
         content_hash=envelope_profile.semantic_content_hash,
         constraint_set_hash=constraint_set_hash,
         allowed_route_ids=_route_ids(
+            include_safe_pose="move_tcp_to_pose_safe" in normalized_actions,
             include_grasp_approach_plan=grasp_enabled,
         ),
     )
@@ -890,6 +893,7 @@ def assemble_exclusive_rm65_agent_primitive_composition(
     )
 
     try:
+        convergence_profile = RealAgentPrimitiveConvergenceProfile()
         grasp_trajectory_planner = RM65GraspJointTrajectoryPlanner(
             profile=lower.profile,
             planning_target_builder=build_exclusive_rm65_skill_target_builder(
@@ -900,6 +904,18 @@ def assemble_exclusive_rm65_agent_primitive_composition(
             reachability_config=reachability_config,
             trajectory_record_dir=planned_trajectory_dir,
         )
+
+        safe_pose_trajectory_planner = None
+        if "move_tcp_to_pose_safe" in normalized_actions:
+            safe_config = (grasp_trajectory_config or RM65GraspTrajectoryPlanningConfig()).for_tcp_pose_move(
+                translation_tolerance_m=convergence_profile.translation_tolerance_m,
+                rotation_tolerance_rad=convergence_profile.rotation_tolerance_rad)
+            safe_pose_trajectory_planner = RM65GraspJointTrajectoryPlanner(
+                profile=lower.profile,
+                planning_target_builder=build_exclusive_rm65_skill_target_builder(lower.profile),
+                target_envelope_filter=lower.target_builder.pre_ik_target_safety_filter,
+                config=safe_config, reachability_config=reachability_config,
+                trajectory_record_dir=planned_trajectory_dir)
 
         def reachability_evaluator_factory(port):
             if arm_reachability_profile is None:
@@ -934,6 +950,7 @@ def assemble_exclusive_rm65_agent_primitive_composition(
             primitive_reference_frame_id=station_frame.frame_id,
             safety_envelope_refs=(envelope_ref,),
             allowed_client_ids=client_bindings.allowed_client_ids,
+            convergence_profile=convergence_profile,
             perception_capture=perception_capture,
             rgbd_geometry_registrations=rgbd_geometry_registrations,
             localization_registration=localization_registration,
@@ -953,6 +970,7 @@ def assemble_exclusive_rm65_agent_primitive_composition(
                 else None
             ),
             grasp_trajectory_planner=grasp_trajectory_planner,
+            safe_pose_trajectory_planner=safe_pose_trajectory_planner,
             captured_robot_observation_filter=(captured_robot_observation_filter),
             non_motion_read_window=lower.ports.non_motion_read_window,
             perception_provider_factory=provider_factory,

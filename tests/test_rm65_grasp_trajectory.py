@@ -4386,7 +4386,7 @@ def test_observed_start_collision_is_rejected_before_endpoint_search():
 
 
 
-@pytest.mark.parametrize("entrypoint", ["direct", "request"])
+@pytest.mark.parametrize("entrypoint", ["direct", "request", "tcp_pose"])
 def test_observed_planner_template_serializes_builder_and_drops_path_cache(monkeypatch, entrypoint):
     from concurrent.futures import ThreadPoolExecutor
     from types import SimpleNamespace
@@ -4420,13 +4420,14 @@ def test_observed_planner_template_serializes_builder_and_drops_path_cache(monke
                 active -= 1
 
     monkeypatch.setattr(cls, '_plan', plan)
+    monkeypatch.setattr(cls, '_plan_tcp_pose', plan)
     def invoke(cloud):
         kwargs = dict(qpos_by_side={}, side="right", target_tool_tcp_world=np.eye(4), speed_scale=1.0)
         if entrypoint == "direct":
             return template.plan_with_observed_cloud(cloud, **kwargs)
         request = template.for_observed_cloud(cloud)
         assert isinstance(request, cls)
-        return request(**kwargs)
+        return request.plan_tcp_pose(**kwargs) if entrypoint == "tcp_pose" else request(**kwargs)
     with ThreadPoolExecutor(max_workers=2) as pool:
         assert list(pool.map(invoke, ('scene-a', 'scene-b'))) == ['scene-a', 'scene-b']
     assert maximum == 1 and len(requests) == 2
@@ -5132,3 +5133,65 @@ def test_safe_pose_clearance_probe_equal_to_start_preserves_bounded_search(later
     with pytest.raises(ValueError, match="distinct and finite"):
         planner._constrained_approach_targets(
             pregrasp_tool_tcp_world=start, grasp_tool_tcp_world=start)
+
+
+def test_tcp_lift_from_20261014_measured_state_is_preplanned_and_smooth(tmp_path):
+    # First online-IK cut from chain-20261014-212028, retained without devices.
+    q = np.array([1.5062715288497481, .8376009810319908, 2.056730947202586,
+        -.009843657164340344, -1.3452998193951622, -.037960910398638824,
+        -1.9867606506184985, 1.0622073934163934, 2.263098634282554,
+        -1.3372887645200948, -1.6221090494141073, -.5218883603881955])
+    # Keep the currently admitted strict DMTAC collision policy.
+    profile = _real_profile(envelope_profile_name="agent_grasp_right_absolute_standard_v1.json",
+                            collision_scene_profile="dual_arm_hand_proxy_dmtac_strict")
+    builder = build_exclusive_rm65_skill_target_builder(profile)
+    planner = RM65GraspJointTrajectoryPlanner(profile=profile, planning_target_builder=builder,
+        target_envelope_filter=builder.pre_ik_target_safety_filter, trajectory_record_dir=tmp_path)
+    pair = {"left": q[:6], "right": q[6:]}
+    start = builder.tool_tcp_world_targets_for_qpos_pair(left_qpos=q[:6], right_qpos=q[6:])["right"]
+    target = start.copy()
+    target[2, 3] += .05
+    trajectory = planner.plan_tcp_pose(qpos_by_side=pair, side="right",
+        target_tool_tcp_world=target, speed_scale=.2, time_budget_sec=10.)
+    values = trajectory.qpos_by_side
+    np.testing.assert_allclose(values["left"], np.broadcast_to(q[:6], values["left"].shape), atol=1e-12)
+    np.testing.assert_allclose(values["right"][0], q[6:], atol=1e-12)
+    assert np.max(np.abs(np.rad2deg(np.diff(values["right"], axis=0)))) < .2
+    poses = np.array([builder.tool_tcp_world_targets_for_qpos_pair(left_qpos=l, right_qpos=r)["right"]
+                      for l, r in zip(values["left"], values["right"])])
+    assert np.min(np.diff(poses[:, 2, 3])) > -1e-6
+    assert np.max(np.linalg.norm(poses[:, :2, 3] - start[:2, 3], axis=1)) < .001
+    assert np.linalg.norm(poses[-1, :3, 3] - target[:3, 3]) < .001
+    assert 1. < trajectory.time_from_start_sec[-1] < 10.
+    assert list(tmp_path.glob("*.npz"))  # Lift is retained like approach, even on later interruption.
+    repeated = planner.plan_tcp_pose(qpos_by_side=pair, side="right",
+        target_tool_tcp_world=target, speed_scale=.2, time_budget_sec=10.)
+    np.testing.assert_allclose(repeated.qpos_by_side["right"], values["right"], atol=1e-10)
+    assert len(list(tmp_path.glob("*.npz"))) == 2  # Separate timing evidence cannot overwrite the first attempt.
+
+
+
+@pytest.mark.parametrize("rotation_rad", [0., .2])
+def test_tcp_preplan_rejects_original_outside_target_before_branch_search(monkeypatch, rotation_rad):
+    planner = _planner_without_assets(config=RM65GraspTrajectoryPlanningConfig())
+    planner.target_builder = _ToolOffsetCartesianBuilder()
+    planner.target_envelope_filter = _ToolSpaceAbsoluteEnvelopeFilter(planner.target_builder, 0.)
+    pair = {side: np.zeros(6) for side in ("left", "right")}
+    pair["right"][0] = .02
+    target = planner.target_builder.tool_tcp_world_targets_for_qpos_pair(
+        left_qpos=pair["left"], right_qpos=pair["right"])["right"].copy()
+    target[0, 3] = -.001  # Outside the requested envelope, but within endpoint tolerance.
+    target[:3, :3] = grasp_trajectory_module.Rotation.from_rotvec([rotation_rad, 0., 0.]).as_matrix()
+    monkeypatch.setattr(planner, "require_static_grasp_scene", lambda **kwargs: None)
+    searched = []
+
+    def branch(**kwargs):
+        searched.append(kwargs)
+        raise AssertionError("An outside original request must be rejected before branch search")
+
+    monkeypatch.setattr(planner, "_plan_constrained_approach_leg", branch)
+    monkeypatch.setattr(planner, "_plan_path_leg", branch)
+    with pytest.raises(RM65GraspTrajectoryPlanningError, match="target_safety_envelope_blocked"):
+        planner.plan_tcp_pose(qpos_by_side=pair, side="right",
+            target_tool_tcp_world=target, speed_scale=.2, time_budget_sec=1.)
+    assert not searched

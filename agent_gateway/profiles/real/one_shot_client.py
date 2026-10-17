@@ -22,6 +22,7 @@ from agent_gateway.skills.motion.definition import (
     FIXED_CARDINAL_TCP_STEP_SKILL_ID_BY_DIRECTION_V1,
     FIXED_LEVEL_TCP_ORIENTATION_SKILL_IDS_V1,
     GRASP_APPROACH_SKILL_ID_V1,
+    SAFE_TCP_POSE_TARGET_SKILL_ID_V1,
     TCP_CARDINAL_STEP_SKILL_ID_V1,
     TCP_LEVEL_FORWARD_LEFT_30_SKILL_ID_V1,
     TCP_LEVEL_FORWARD_RIGHT_30_SKILL_ID_V1,
@@ -35,6 +36,7 @@ from agent_gateway.transport.unix_transport import (
 from .session_authorization import (
     REAL_AGENT_ABSOLUTE_TCP_POSE_ACTION,
     REAL_AGENT_GRASP_APPROACH_ACTION,
+    REAL_AGENT_SAFE_TCP_POSE_ACTION,
 )
 
 if TYPE_CHECKING:
@@ -49,6 +51,7 @@ _ACTION_TO_SKILL_ID = {
     "level_forward_left_30": TCP_LEVEL_FORWARD_LEFT_30_SKILL_ID_V1,
     "level_forward_right_30": TCP_LEVEL_FORWARD_RIGHT_30_SKILL_ID_V1,
     REAL_AGENT_ABSOLUTE_TCP_POSE_ACTION: TCP_POSE_TARGET_SKILL_ID_V1,
+    REAL_AGENT_SAFE_TCP_POSE_ACTION: SAFE_TCP_POSE_TARGET_SKILL_ID_V1,
     REAL_AGENT_GRASP_APPROACH_ACTION: GRASP_APPROACH_SKILL_ID_V1,
 }
 _TERMINAL_STATUSES = frozenset(
@@ -324,6 +327,7 @@ def _absolute_tcp_input_from_args(
     relative_delta_value = getattr(args, "relative_delta_xyz_m", None)
     absolute_actions = {
         REAL_AGENT_ABSOLUTE_TCP_POSE_ACTION,
+        REAL_AGENT_SAFE_TCP_POSE_ACTION,
         REAL_AGENT_GRASP_APPROACH_ACTION,
     }
     is_absolute = getattr(args, "action", None) in absolute_actions
@@ -337,7 +341,7 @@ def _absolute_tcp_input_from_args(
         ):
             raise ValueError(
                 "absolute/relative target, proposal, and --speed-scale require "
-                "--action move_tcp_to_pose or approach_grasp_pose."
+                "--action move_tcp_to_pose, move_tcp_to_pose_safe or approach_grasp_pose."
             )
         return None, None, None
     if proposal_path is not None:
@@ -485,6 +489,7 @@ def _parameters(
     properties = _schema_properties(schema_entry)
     is_absolute = skill_id in {
         TCP_POSE_TARGET_SKILL_ID_V1,
+        SAFE_TCP_POSE_TARGET_SKILL_ID_V1,
         GRASP_APPROACH_SKILL_ID_V1,
     }
     if is_absolute:
@@ -603,9 +608,10 @@ def execute_one_shot(args: argparse.Namespace) -> Mapping[str, Any]:
     ) = _absolute_tcp_input_from_args(args)
     requested_timeout = getattr(args, "operation_timeout_sec", None)
     operation_timeout_sec = (
-        (60.0 if skill_id == GRASP_APPROACH_SKILL_ID_V1 else 30.0)
+        (120.0 if skill_id == SAFE_TCP_POSE_TARGET_SKILL_ID_V1
+         else 60.0 if skill_id == GRASP_APPROACH_SKILL_ID_V1 else 30.0)
         if requested_timeout is None
-        and skill_id in {TCP_POSE_TARGET_SKILL_ID_V1, GRASP_APPROACH_SKILL_ID_V1}
+        and skill_id in {TCP_POSE_TARGET_SKILL_ID_V1, GRASP_APPROACH_SKILL_ID_V1, SAFE_TCP_POSE_TARGET_SKILL_ID_V1}
         else (5.0 if requested_timeout is None else float(requested_timeout))
     )
     if not math.isfinite(operation_timeout_sec) or operation_timeout_sec <= 0.0:
@@ -659,7 +665,7 @@ def execute_one_shot(args: argparse.Namespace) -> Mapping[str, Any]:
         )
         requested_components = (
             tuple(parameters["pose_targets_by_component"])
-            if skill_id in {TCP_POSE_TARGET_SKILL_ID_V1, GRASP_APPROACH_SKILL_ID_V1}
+            if skill_id in {TCP_POSE_TARGET_SKILL_ID_V1, GRASP_APPROACH_SKILL_ID_V1, SAFE_TCP_POSE_TARGET_SKILL_ID_V1}
             else ("right_gripper",)
             if skill_id == "manipulation.set_gripper_state"
             else (parameters["component_id"],)
@@ -830,7 +836,8 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=None,
         help=(
-            "operation deadline (default: 60s for approach_grasp_pose, 30s "
+            "operation deadline (default: 120s for move_tcp_to_pose_safe, "
+            "60s for approach_grasp_pose, 30s "
             "for move_tcp_to_pose, 5s for fixed primitives)"
         ),
     )

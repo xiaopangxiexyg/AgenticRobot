@@ -72,6 +72,7 @@ from agent_gateway.skills.motion.definition import (
     EXECUTE_GRASP_APPROACH_PLAN_SKILL_ID_V1,
     FIXED_CARDINAL_TCP_STEP_SKILL_IDS_V1,
     GRASP_APPROACH_SKILL_ID_V1,
+    SAFE_TCP_POSE_TARGET_SKILL_ID_V1,
     TCP_POSE_TARGET_SKILL_ID_V1,
 )
 from agent_gateway.transport.unix_transport import (
@@ -1205,6 +1206,7 @@ def assemble_real_agent_primitive_gateway_session(
     station_point_grasp_planner: object | None = None,
     station_point_grasp_reachability_evaluator: Callable[..., object] | None = None,
     grasp_trajectory_planner: Callable[..., object] | None = None,
+    safe_pose_trajectory_planner: Callable[..., object] | None = None,
     held_object_observer: Callable[..., object] | None = None,
     object_transport_planner_factory: Callable[..., object] | None = None,
     captured_robot_observation_filter: Callable[..., object] | None = None,
@@ -1294,6 +1296,12 @@ def assemble_real_agent_primitive_gateway_session(
         raise ValueError(
             "Grasp approach Route requires exactly one URDF/FCL trajectory planner."
         )
+    safe_pose_enabled = any(
+        entry.route.skill_id == SAFE_TCP_POSE_TARGET_SKILL_ID_V1
+        for entry in contract_bundle.route_manifest.skill_routes
+    )
+    if safe_pose_enabled != callable(safe_pose_trajectory_planner):
+        raise ValueError("Safe pose Route requires its independently bound trajectory planner.")
     grasp_approach_plan_enabled = (
         contract_bundle.grasp_approach_plan_registration is not None
     )
@@ -1445,6 +1453,7 @@ def assemble_real_agent_primitive_gateway_session(
             profile = registration.profile
         elif route.skill_id in {
             TCP_POSE_TARGET_SKILL_ID_V1,
+            SAFE_TCP_POSE_TARGET_SKILL_ID_V1,
             GRASP_APPROACH_SKILL_ID_V1,
         }:
             profile = contract_bundle.pose_target_profile
@@ -1476,10 +1485,17 @@ def assemble_real_agent_primitive_gateway_session(
                 request=request,
                 operation=operation,
                 grasp_trajectory_planner=(
-                    grasp_trajectory_planner
+                    safe_pose_trajectory_planner
+                    if _route.skill_id == SAFE_TCP_POSE_TARGET_SKILL_ID_V1
+                    else grasp_trajectory_planner
                     if _route.skill_id == GRASP_APPROACH_SKILL_ID_V1
                     else None
                 ),
+                tcp_trajectory_planner=(
+                    getattr(grasp_trajectory_planner, "plan_tcp_pose", None)
+                    if _route.skill_id == TCP_POSE_TARGET_SKILL_ID_V1 else None
+                ),
+                non_motion_read_window=non_motion_read_window,
                 grasp_approach_plan_store=(
                     grasp_approach_plan_store
                     if _route.skill_id == EXECUTE_GRASP_APPROACH_PLAN_SKILL_ID_V1

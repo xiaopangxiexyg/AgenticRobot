@@ -384,8 +384,9 @@ def test_composition_advertises_right_gripper_without_starting_any_backend(monke
 
 
 @pytest.mark.parametrize("authorized_side", ("left", "right"))
+@pytest.mark.parametrize("action", ["forward", "move_tcp_to_pose_safe"])
 def test_composition_binds_selected_side_to_one_lower_graph_without_start(
-    monkeypatch, authorized_side: str
+    monkeypatch, authorized_side: str, action: str
 ) -> None:
     lower, guard = _lower(monkeypatch, envelope_side=authorized_side)
     socket_path = REPO_ROOT / f"temp/test-real-rm65-{authorized_side}-composition.sock"
@@ -394,7 +395,7 @@ def test_composition_binds_selected_side_to_one_lower_graph_without_start(
         lower=lower,
         socket_path=socket_path,
         authorized_side=authorized_side,
-        authorized_action="forward",
+        authorized_action=action,
         confirmation_token=REAL_AGENT_PRIMITIVE_CONFIRM_TOKEN,
         client_id="rpent:test",
         client_uid=1000,
@@ -420,7 +421,12 @@ def test_composition_binds_selected_side_to_one_lower_graph_without_start(
         RM65_SKILL_EXECUTION_FRAME_ID_V1
     )
     assert RM65_SKILL_STATION_FRAME_ID_V1 in composition.frame_graph.frame_by_id
-    assert len(composition.safety_envelope_ref.allowed_route_ids) == 12
+    assert len(composition.safety_envelope_ref.allowed_route_ids) == 12 + int(action == "move_tcp_to_pose_safe")
+    manifest = composition.deployment.gateway_session.contract_bundle.route_manifest
+    if action == "move_tcp_to_pose_safe":
+        assert manifest.route("motion.move_tcp_to_pose_safe", "1").route.control_effect_class == "motion"
+    else:
+        assert not any(item.route.skill_id == "motion.move_tcp_to_pose_safe" for item in manifest.skill_routes)
     assert (
         "real.rm65.agent_skill_grasp_approach"
         in composition.safety_envelope_ref.allowed_route_ids

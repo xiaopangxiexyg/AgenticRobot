@@ -167,6 +167,7 @@ def assemble_exclusive_real_agent_primitive_deployment(
         Callable[[RealAgentMotionPort], Callable[..., object]] | None
     ) = None,
     grasp_trajectory_planner: Callable[..., object] | None = None,
+    safe_pose_trajectory_planner: Callable[..., object] | None = None,
     captured_robot_observation_filter: Callable[..., object] | None = None,
     non_motion_read_window: Callable[[], object] | None = None,
     perception_provider_factory: (
@@ -264,6 +265,7 @@ def assemble_exclusive_real_agent_primitive_deployment(
             station_point_grasp_reachability_evaluator
         ),
         grasp_trajectory_planner=grasp_trajectory_planner,
+        safe_pose_trajectory_planner=safe_pose_trajectory_planner,
         captured_robot_observation_filter=captured_robot_observation_filter,
         non_motion_read_window=non_motion_read_window,
         artifact_store=artifact_store,
@@ -307,6 +309,7 @@ def assemble_exclusive_rm65_agent_primitive_deployment(
         Callable[[RealAgentMotionPort], Callable[..., object]] | None
     ) = None,
     grasp_trajectory_planner: Callable[..., object] | None = None,
+    safe_pose_trajectory_planner: Callable[..., object] | None = None,
     captured_robot_observation_filter: Callable[..., object] | None = None,
     non_motion_read_window: Callable[[], object] | None = None,
     perception_provider_factory: (
@@ -365,6 +368,7 @@ def assemble_exclusive_rm65_agent_primitive_deployment(
             station_point_grasp_reachability_evaluator_factory
         ),
         grasp_trajectory_planner=grasp_trajectory_planner,
+        safe_pose_trajectory_planner=safe_pose_trajectory_planner,
         captured_robot_observation_filter=captured_robot_observation_filter,
         non_motion_read_window=non_motion_read_window,
         perception_provider_factory=perception_provider_factory,
