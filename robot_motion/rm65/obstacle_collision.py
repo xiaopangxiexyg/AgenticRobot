@@ -8,7 +8,7 @@ hardware authority.
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from copy import deepcopy
+from copy import copy, deepcopy
 from dataclasses import dataclass, replace
 from functools import lru_cache
 from types import MappingProxyType
@@ -18,6 +18,8 @@ import numpy as np
 
 from robot_motion.path_planning import JointConfigurationCheck
 from robot_motion.scene_obstacles import ObstacleSceneSnapshot
+from robot_motion.observed_obstacles import ObservedObstacleCloud, ObservedBoxDistance
+from dataset_contracts.canonical_encoding import canonical_content_hash
 
 _OBSTACLE_GEOMETRY_PREFIX = "aabb_obstacle::"
 
@@ -290,6 +292,41 @@ class RM65ObstacleCollisionOracle:
         self._check_cache: dict[bytes, JointConfigurationCheck] = {}
         self._clearance_check_cache: dict[bytes, JointConfigurationCheck] = {}
         self._search_check_cache: dict[tuple[float, bytes], JointConfigurationCheck] = {}
+        self._observed_distance: ObservedBoxDistance | None = None
+        self._observed_scene_hash: str | None = None
+
+    def bind_observed_cloud(self, cloud: ObservedObstacleCloud) -> None:
+        """Bind once, before any query, to this request-owned oracle."""
+        if (self._observed_distance is not None or self._check_cache
+                or self._clearance_check_cache or self._search_check_cache):
+            raise ValueError("Observed cloud must be bound before collision queries.")
+        if cloud.reference_frame_id != self._scene.reference_frame_id:
+            raise ValueError("Observed cloud and collision model reference frames differ.")
+        self.world_obstacle_proxy_boxes({
+            name: self._reference_full_q[list(indices)] for name, indices in self._indices.items()})
+        self._observed_distance = ObservedBoxDistance(cloud)
+        self._observed_scene_hash = canonical_content_hash({
+            "fixed_scene": self._scene.semantic_content_hash,
+            "observed_scene": cloud.semantic_content_hash,
+        }, domain="dexteleop.rm65.combined_obstacle_scene.v1")
+
+    def for_observed_cloud(self, cloud: ObservedObstacleCloud) -> RM65ObstacleCollisionOracle:
+        """Reuse static models with new request-owned FK, queries and obstacles."""
+        if self._observed_distance is not None:
+            raise ValueError("Observed requests must originate from a static oracle.")
+        request = copy(self)
+        request._model_data = self._model.createData()
+        request._collision_data = self._pin.GeometryData(self._collision_model)
+        request._collision_query_margin_m = None
+        if self._stop_at_first_clearance_violation:
+            for query in request._collision_data.collisionRequests:
+                query.security_margin = float(self._scene.minimum_clearance_m)
+            request._collision_query_margin_m = float(self._scene.minimum_clearance_m)
+        request._check_cache = {}
+        request._clearance_check_cache = {}
+        request._search_check_cache = {}
+        request.bind_observed_cloud(cloud)
+        return request
 
     @classmethod
     def from_solver(
@@ -352,7 +389,52 @@ class RM65ObstacleCollisionOracle:
 
     @property
     def scene_hash(self) -> str:
+        if self._observed_distance is not None:
+            return self._observed_scene_hash
         return self._scene.semantic_content_hash
+
+    def world_obstacle_proxy_boxes(self, qpos_by_component):
+        """Query the reviewed obstacle proxies, independent of cached checks."""
+        full_q = self._embed(qpos_by_component)
+        self._pin.updateGeometryPlacements(
+            self._model, self._model_data, self._collision_model, self._collision_data, full_q)
+        boxes = []
+        for index in self._obstacle_pair_geometry_ids:
+            geometry = self._collision_model.geometryObjects[index]
+            half = getattr(geometry.geometry, "halfSide", None)
+            if half is None:
+                raise ValueError("Observed obstacle coverage requires explicit sparse box proxies.")
+            pose = self._collision_data.oMg[index]
+            transform = np.eye(4)
+            transform[:3, :3] = pose.rotation
+            transform[:3, 3] = pose.translation
+            boxes.append((str(geometry.name), transform, np.asarray(half).copy()))
+        if not boxes:
+            raise ValueError("Observed obstacle proxy set is empty.")
+        return tuple(boxes)
+
+    def _with_observed(self, qpos, result, *, distance_bound_m):
+        if self._observed_distance is None or not result.safe:
+            return result
+        cloud = self._observed_distance.cloud
+        try:
+            distance, nearest = self._observed_distance.check_boxes(
+                self.world_obstacle_proxy_boxes(qpos), clearance_m=distance_bound_m)
+        except (ValueError, RuntimeError) as error:
+            return JointConfigurationCheck(safe=False, collision_check_available=False,
+                reason="observed_obstacle_collision_check_unavailable", metadata={"error": str(error)})
+        safe = distance >= self._scene.minimum_clearance_m
+        closest = {}
+        if nearest is not None and (result.minimum_distance_m is None or distance < result.minimum_distance_m):
+            closest = {"closest_geometry_names": (nearest["geometry_name"], "observed_voxels"),
+                       "closest_obstacle_id": "observed-rgbd:" + cloud.semantic_content_hash}
+        return replace(result, safe=safe, reason=result.reason if safe else "observed_obstacle_clearance_blocked",
+            minimum_distance_m=min(distance, result.minimum_distance_m)
+            if result.minimum_distance_m is not None else distance,
+            metadata={**result.metadata, **closest, "scene_hash": self.scene_hash,
+                      "observed_scene_hash": cloud.semantic_content_hash,
+                      "observed_scope": "occupied_voxels_against_profile_obstacle_box_proxies",
+                      "observed_distance_is_lower_bound": True, "nearest_observed": nearest})
 
     @property
     def collision_model_is_independent(self) -> bool:
@@ -370,7 +452,8 @@ class RM65ObstacleCollisionOracle:
             )
         key = full_q.tobytes()
         if key not in self._check_cache:
-            self._check_cache[key] = self._check_embedded(full_q)
+            self._check_cache[key] = self._with_observed(qpos_by_component,
+                self._check_embedded(full_q), distance_bound_m=self._scene.minimum_clearance_m)
         return self._check_cache[key]
 
     def check_clearance_only(
@@ -400,7 +483,8 @@ class RM65ObstacleCollisionOracle:
                 )
                 if result.collision_check_available and not result.safe:
                     result = self.check(qpos_by_component)
-            self._clearance_check_cache[key] = result
+            self._clearance_check_cache[key] = self._with_observed(
+                qpos_by_component, result, distance_bound_m=self._scene.minimum_clearance_m)
         return self._clearance_check_cache[key]
 
     def _check_embedded(self, full_q: np.ndarray) -> JointConfigurationCheck:
@@ -460,6 +544,7 @@ class RM65ObstacleCollisionOracle:
                     if self._stop_at_first_clearance_violation
                     else self.check(qpos_by_component)
                 )
+            guard = self._with_observed(qpos_by_component, guard, distance_bound_m=margin)
             self._search_check_cache[key] = replace(
                 guard, metadata={**guard.metadata, "search_guard_clearance_m": margin},
             )
@@ -658,7 +743,7 @@ class RM65ObstacleCollisionOracle:
 
     def _base_metadata(self, pair_count: int) -> dict[str, Any]:
         return {
-            "scene_hash": self._scene.semantic_content_hash,
+            "scene_hash": self.scene_hash,
             "scene_revision": self._scene.revision,
             "collision_model_is_independent": True,
             "collision_scope": self._collision_scope,

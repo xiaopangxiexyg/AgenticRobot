@@ -6,6 +6,7 @@ import math
 import threading
 import time
 from collections import OrderedDict
+from copy import copy
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from itertools import pairwise
@@ -53,6 +54,7 @@ from robot_motion.scene_obstacles import ObstacleSceneSnapshot
 from teleop_runtime.target_safety.tcp_pose_envelope_runtime import (
     TCPPoseEnvelopeTargetFilter,
 )
+from robot_motion.observed_obstacles import ObservedObstacleCloud
 
 from .grasp_trajectory_record import write_grasp_trajectory_record
 from .motion_port import RealAgentJointTrajectory
@@ -181,6 +183,25 @@ class RM65GraspTrajectoryPlanningConfig:
         0.20,
         0.35,
     )
+
+    def for_tcp_pose_move(
+        self, *, translation_tolerance_m: float, rotation_tolerance_rad: float,
+    ) -> RM65GraspTrajectoryPlanningConfig:
+        """Bind ordinary-move arrival bounds without changing grasp policy."""
+        orientation_deg = math.degrees(rotation_tolerance_rad)
+        return replace(
+            self,
+            endpoint_position_tolerance_m=translation_tolerance_m,
+            endpoint_orientation_tolerance_deg=orientation_deg,
+            # These approach-only fields are unused by ordinary moves, but
+            # the immutable configuration still requires consistent bounds.
+            pregrasp_orientation_tolerance_deg=max(
+                self.pregrasp_orientation_tolerance_deg, orientation_deg,
+            ),
+            maximum_approach_orientation_error_deg=max(
+                self.maximum_approach_orientation_error_deg, orientation_deg,
+            ),
+        )
 
     def __post_init__(self) -> None:
         if not isinstance(self.allow_unconstrained_terminal_fallback, bool):
@@ -670,6 +691,7 @@ class RM65GraspJointTrajectoryPlanner:
         planner_config: JointPathPlannerConfig | None = None,
         reachability_config: RM65GraspReachabilityConfig | None = None,
         trajectory_record_dir: str | Path | None = None,
+        observed_obstacles: ObservedObstacleCloud | None = None,
     ) -> None:
         if not isinstance(profile, ResolvedExclusiveRM65SkillDeploymentProfile):
             raise TypeError("profile must be resolved and typed.")
@@ -698,6 +720,7 @@ class RM65GraspJointTrajectoryPlanner:
                 raise ValueError("trajectory_record_dir must be an existing real directory.")
             self.trajectory_record_dir = record_dir
         self._solver_lock = threading.Lock()
+        self._observed_planning_lock = threading.RLock()
         self._local_chain_cache_lock = threading.Lock()
         # Bounded session-local proposals; all admission checks run again.
         self._local_chain_cache: OrderedDict[tuple, tuple] = OrderedDict()
@@ -753,6 +776,25 @@ class RM65GraspJointTrajectoryPlanner:
             attached_box_proxies=RM65_D405_ATTACHED_COLLISION_PROXIES,
             use_profile_proxy_geometry=True,
         )
+        self.observed_obstacles = observed_obstacles
+        if observed_obstacles is not None:
+            self.oracle.bind_observed_cloud(observed_obstacles)
+
+    def for_observed_cloud(self, cloud: ObservedObstacleCloud) -> RM65GraspJointTrajectoryPlanner:
+        """Bind request-owned collision state while retaining the static model."""
+        if self.observed_obstacles is not None:
+            raise ValueError("Observed planning requires a static planner template.")
+        request = copy(self)
+        request.oracle = self.oracle.for_observed_cloud(cloud)
+        request.observed_obstacles = cloud
+        request._local_chain_cache = OrderedDict()
+        request._local_chain_cache_lock = threading.Lock()
+        return request
+
+    def plan_with_observed_cloud(self, cloud: ObservedObstacleCloud, **kwargs):
+        """Serialize shared target-builder use across observed requests."""
+        with self._observed_planning_lock:
+            return self.for_observed_cloud(cloud)(**kwargs)
 
     def _remaining_path_planning_time_sec(
         self,
@@ -992,7 +1034,7 @@ class RM65GraspJointTrajectoryPlanner:
         # task envelope.  Its dedicated ingress leg is bounded, monotonic, and
         # densely revalidated.  Once inside, every grasp-search sample must
         # satisfy both collision and TCP-envelope constraints.
-        if planning_phase == "envelope_ingress" and self.target_envelope_filter is not None:
+        if planning_phase in {"envelope_ingress", "safe_pose_target"} and self.target_envelope_filter is not None:
             if side not in _SIDES or start_qpos_by_side is None:
                 raise ValueError("envelope ingress search requires its moving side and start qpos")
             oracle = _TargetEnvelopePathOracle(
@@ -4615,7 +4657,33 @@ class RM65GraspJointTrajectoryPlanner:
         speed_scale: float,
         visible_scene: VisibleGraspScene | None = None,
         monotonic: Callable[[], float] = time.perf_counter,
+        require_grasp_approach: bool = True,
     ) -> RealAgentJointTrajectory:
+        # Request planners share a mutable target builder with their template.
+        # Keep diagnostics inspectable without allowing concurrent plan state.
+        with self._observed_planning_lock:
+            return self._plan(
+                qpos_by_side=qpos_by_side, side=side,
+                target_tool_tcp_world=target_tool_tcp_world, speed_scale=speed_scale,
+                visible_scene=visible_scene, monotonic=monotonic,
+                require_grasp_approach=require_grasp_approach,
+            )
+
+    def _plan(
+        self,
+        *,
+        qpos_by_side: Mapping[str, np.ndarray],
+        side: str,
+        target_tool_tcp_world: np.ndarray,
+        speed_scale: float,
+        visible_scene: VisibleGraspScene | None = None,
+        monotonic: Callable[[], float] = time.perf_counter,
+        require_grasp_approach: bool = True,
+    ) -> RealAgentJointTrajectory:
+        if not isinstance(require_grasp_approach, bool):
+            raise TypeError("require_grasp_approach must be bool.")
+        if require_grasp_approach and self.observed_obstacles is not None:
+            raise ValueError("Generic observed obstacles do not implement grasp contact exemptions.")
         selected_side = str(side).strip().lower()
         if selected_side not in _SIDES:
             raise ValueError("side must be left or right.")
@@ -4626,6 +4694,15 @@ class RM65GraspJointTrajectoryPlanner:
             for name in _SIDES
         }
         target_pose = np.asarray(target_tool_tcp_world, dtype=float).reshape(4, 4)
+        if self.observed_obstacles is not None:
+            initial_check = self.oracle.check(current)
+            if not initial_check.collision_check_available or not initial_check.safe:
+                raise RM65GraspTrajectoryPlanningError(
+                    "path_start_collision_check_unavailable" if not initial_check.collision_check_available
+                    else "path_start_collision_blocked", details={
+                        **initial_check.metadata, "minimum_distance_m": initial_check.minimum_distance_m,
+                        "collision_query_reason": initial_check.reason,
+                        "planning_phase": "observed_scene_start_admission"})
         planning_started_at = time.perf_counter()
         capture_self_observation_evidence = (
             None
@@ -4698,7 +4775,21 @@ class RM65GraspJointTrajectoryPlanner:
         direct_fallback_attempt: dict[str, object] | None = None
         direct_fallback_tried = False
         path_search_started_at = time.perf_counter()
-        if already_at_grasp:
+        if not require_grasp_approach:
+            # Ordinary pose moves retain multi-IK search and dense validation,
+            # without applying grasp ingress or target-contact exemptions.
+            selected_legs = (
+                self._plan_path_leg(
+                    qpos_by_side=current, side=selected_side,
+                    target_tool_tcp_world=target_pose,
+                    planning_phase="safe_pose_target", visible_scene=visible_scene,
+                    prefer_closest_tolerance=False, deadline=deadline,
+                    monotonic=monotonic,
+                ),
+            )
+            pregrasp_pose = target_pose.copy()
+            route_mode = "safe_pose_target"
+        elif already_at_grasp:
             selected_legs = (
                 self._plan_path_leg(
                     qpos_by_side=current,
@@ -5393,6 +5484,7 @@ class RM65GraspJointTrajectoryPlanner:
                             self.config.endpoint_orientation_tolerance_deg
                         ),
                     )
+                    terminal_contact_allowed = require_grasp_approach and terminal_contact_allowed
                     if terminal_contact_allowed:
                         (
                             target_hits,
@@ -5507,7 +5599,8 @@ class RM65GraspJointTrajectoryPlanner:
         }
         evidence_hash = canonical_content_hash(
             {
-                "scene_hash": self.scene.semantic_content_hash,
+                "scene_hash": (self.scene.semantic_content_hash if self.observed_obstacles is None
+                    else self.oracle.scene_hash),
                 "path_hash": selected_legs[-1].path.semantic_content_hash,
                 "path_leg_hashes": [
                     leg.path.semantic_content_hash for leg in selected_legs
@@ -5529,15 +5622,15 @@ class RM65GraspJointTrajectoryPlanner:
                 "route_mode": route_mode or "pregrasp_and_fixed_approach",
                 "direct_grasp_target_fallback": direct_fallback_attempt,
                 "unconstrained_terminal_fallback_enabled": (
-                    self.config.allow_unconstrained_terminal_fallback
+                    require_grasp_approach and self.config.allow_unconstrained_terminal_fallback
                 ),
                 "pregrasp_applied": (
-                    not already_at_grasp
+                    require_grasp_approach and not already_at_grasp
                     and route_mode != "global_grasp_target_fallback"
                 ),
                 "selected_pregrasp_distance_m": (
                     0.0
-                    if already_at_grasp
+                    if not require_grasp_approach or already_at_grasp
                     or route_mode == "global_grasp_target_fallback"
                     else float(
                         np.linalg.norm(
@@ -5570,14 +5663,17 @@ class RM65GraspJointTrajectoryPlanner:
                     self.trajectory_record_dir,
                     trajectory,
                     moving_side=selected_side,
-                    scene_hash=self.scene.semantic_content_hash,
-                    collision_scope="profile_sparse_proxy_pairs",
+                    scene_hash=(self.scene.semantic_content_hash if self.observed_obstacles is None
+                        else self.oracle.scene_hash),
+                    collision_scope=("profile_sparse_proxy_pairs_with_observed_voxels"
+                        if self.observed_obstacles is not None else "profile_sparse_proxy_pairs"),
                     collision_scene_profile=self.path_collision_scene_profile,
                     target_tool_tcp_world=target_pose,
                     speed_scale=scale,
                     stage_boundaries=tuple(stage_boundaries),
                     parameterization=parameterization_metadata,
                     planning_timing=planning_timing,
+                    observed_obstacles=self.observed_obstacles,
                     source_waypoints_by_side={
                         side: np.stack(
                             [

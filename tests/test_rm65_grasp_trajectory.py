@@ -1565,6 +1565,8 @@ def _planner_without_assets(
 ) -> RM65GraspJointTrajectoryPlanner:
     planner = object.__new__(RM65GraspJointTrajectoryPlanner)
     planner.config = config
+    planner.observed_obstacles = None
+    planner._observed_planning_lock = threading.RLock()
     planner.reachability_config = RM65GraspReachabilityConfig()
     planner.profile = SimpleNamespace(
         station_world_frame_id="canonical_station",
@@ -4102,3 +4104,104 @@ def test_native_warm_local_chain_preserves_complete_field_trace_trajectory(mode,
     waypoints = tuple({side: values[index] for side, values in warm.qpos_by_side.items()}
         for index in range(warm.time_from_start_sec.size))
     assert planner._revalidate(waypoints, moving_side="right")["sample_count"] > 0
+
+
+def test_observed_start_collision_is_rejected_before_endpoint_search():
+    planner = _planner_without_assets(config=RM65GraspTrajectoryPlanningConfig())
+    planner.observed_obstacles = object()
+    planner.oracle = SimpleNamespace(check=lambda _: JointConfigurationCheck(
+        safe=False, minimum_distance_m=-.003, reason="observed_obstacle_clearance_blocked",
+        metadata={"nearest_observed": {"occupied_center_world_m": [.1, .2, .3]}}))
+    with pytest.raises(RM65GraspTrajectoryPlanningError) as caught:
+        planner(qpos_by_side={s: np.zeros(6) for s in ("left", "right")}, side="right",
+                target_tool_tcp_world=np.eye(4), speed_scale=.2, require_grasp_approach=False)
+    assert caught.value.reason_code == "path_start_collision_blocked"
+    assert caught.value.details["planning_phase"] == "observed_scene_start_admission"
+    assert caught.value.details["nearest_observed"]["occupied_center_world_m"] == (.1, .2, .3)
+
+
+
+@pytest.mark.parametrize("entrypoint", ["direct", "request"])
+def test_observed_planner_template_serializes_builder_and_drops_path_cache(monkeypatch, entrypoint):
+    from concurrent.futures import ThreadPoolExecutor
+    from types import SimpleNamespace
+    import time
+
+    cls = grasp_trajectory_module.RM65GraspJointTrajectoryPlanner
+    template = object.__new__(cls)
+    template.observed_obstacles = None
+    template._observed_planning_lock = threading.RLock()
+    template.target_builder = object()
+    template._local_chain_cache = OrderedDict(old='previous-plan')
+    template.oracle = SimpleNamespace(for_observed_cloud=lambda cloud: SimpleNamespace(cloud=cloud))
+    active, maximum, requests = 0, 0, []
+    count_lock = threading.Lock()
+
+    def plan(request, **kwargs):
+        nonlocal active, maximum
+        with count_lock:
+            active += 1
+            maximum = max(maximum, active)
+        try:
+            assert request.target_builder is template.target_builder
+            assert not request._local_chain_cache
+            assert request.oracle.cloud == request.observed_obstacles
+            request._local_chain_cache['new'] = request.observed_obstacles
+            requests.append(request)
+            time.sleep(.01)
+            return request.observed_obstacles
+        finally:
+            with count_lock:
+                active -= 1
+
+    monkeypatch.setattr(cls, '_plan', plan)
+    def invoke(cloud):
+        kwargs = dict(qpos_by_side={}, side="right", target_tool_tcp_world=np.eye(4), speed_scale=1.0)
+        if entrypoint == "direct":
+            return template.plan_with_observed_cloud(cloud, **kwargs)
+        request = template.for_observed_cloud(cloud)
+        assert isinstance(request, cls)
+        return request(**kwargs)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        assert list(pool.map(invoke, ('scene-a', 'scene-b'))) == ['scene-a', 'scene-b']
+    assert maximum == 1 and len(requests) == 2
+    assert template._local_chain_cache == OrderedDict(old='previous-plan')
+    with pytest.raises(ValueError, match='static planner'):
+        requests[0].plan_with_observed_cloud('scene-c')
+
+
+def test_safe_pose_search_checks_envelope_and_preserves_bounded_ingress():
+    planner = _planner_without_assets(config=RM65GraspTrajectoryPlanningConfig())
+    planner.target_builder = _LinearQposBuilder()
+    planner.oracle = SimpleNamespace(scene_hash="scene:test",
+        check=lambda _: JointConfigurationCheck(safe=True, minimum_distance_m=.03))
+    planner.target_envelope_filter = _MinimumRightXEnvelopeFilter(.8)
+    inside = {"left": np.zeros(6), "right": np.array([.9, 0, 0, 0, 0, 0])}
+    oracle = planner._path_search_oracle(planning_phase="safe_pose_target", side="right",
+                                        start_qpos_by_side=inside)
+    outside = {**inside, "right": np.array([.5, 0, 0, 0, 0, 0])}
+    assert oracle.check(inside).safe
+    assert not oracle.check(outside).safe  # Previously only the final guard rejected this.
+    planner.target_builder = _CartesianQposBuilder()
+    planner.target_envelope_filter = _IngressEnvelopeFilter((.12, .05, 0, .11, .123))
+    oracle = planner._path_search_oracle(planning_phase="safe_pose_target", side="right",
+                                        start_qpos_by_side=inside)
+    assert oracle.check(inside).safe
+    assert oracle.check(inside).safe
+    assert oracle.check(inside).safe
+    assert not oracle.check(inside).safe  # No widening of the original outer boundary.
+
+
+def test_safe_pose_config_uses_public_arrival_contract_without_changing_grasp():
+    from agent_gateway.profiles.real.motion_primitive_profiles import RealAgentPrimitiveConvergenceProfile
+    original = RM65GraspTrajectoryPlanningConfig()
+    arrival = RealAgentPrimitiveConvergenceProfile()
+    safe = original.for_tcp_pose_move(translation_tolerance_m=arrival.translation_tolerance_m,
+                                    rotation_tolerance_rad=arrival.rotation_tolerance_rad)
+    assert original.endpoint_position_tolerance_m == .003
+    assert original.endpoint_orientation_tolerance_deg == 1
+    assert safe.endpoint_position_tolerance_m == .01
+    assert safe.endpoint_orientation_tolerance_deg == pytest.approx(5)
+    assert safe.minimum_clearance_m == original.minimum_clearance_m == .02
+    with pytest.raises(ValueError):
+        original.for_tcp_pose_move(translation_tolerance_m=0, rotation_tolerance_rad=.1)

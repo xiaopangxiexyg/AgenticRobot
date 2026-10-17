@@ -363,3 +363,148 @@ def test_real_rm65_scene_profile_oracle_clones_live_model() -> None:
     assert check.metadata["collision_pair_count"] > pair_count
     assert len(live_model.geometryObjects) == geometry_count
     assert len(live_model.collisionPairs) == pair_count
+
+
+def test_observed_voxels_block_search_and_final_checks_and_permit_a_detour():
+    from robot_motion.observed_obstacles import ObservedObstacleCloud
+    from robot_motion.path_planning import plan_collision_aware_joint_path, JointPathPlannerConfig, JointPathStatus
+    model = pin.Model()
+    joint = model.addJoint(0, pin.JointModelTranslation(), pin.SE3.Identity(), "proxy_translation")
+    collision = pin.GeometryModel()
+    collision.addGeometryObject(pin.GeometryObject("hand_proxy", joint, 0,
+        pin.SE3.Identity(), hppfcl.Box(.04, .04, .04)))
+    oracle = RM65ObstacleCollisionOracle(model=model, base_collision_model=collision,
+        reference_full_q=np.zeros(3), qpos_indices_by_component={"arm": (0, 1, 2)},
+        scene=_scene(center_x=5, clearance=.02))
+    cloud = ObservedObstacleCloud(reference_frame_id="world", evidence={"capture": "unit"},
+        points_m=np.array([[0, y, z] for y in np.linspace(-.04, .04, 9) for z in np.linspace(-.04, .04, 9)]))
+    fixed_hash = oracle.scene_hash
+    oracle.bind_observed_cloud(cloud)
+    assert oracle.scene_hash != fixed_hash
+    blocked = {"arm": np.zeros(3)}
+    for query in (oracle.check, oracle.check_clearance_only,
+                  lambda q: oracle.check_for_search(q, refinement_distance_m=.03)):
+        result = query(blocked)
+        assert not result.safe and result.collision_check_available
+        assert result.reason == "observed_obstacle_clearance_blocked"
+    start, target = {"arm": np.array([-.2, 0, 0])}, {"arm": np.array([.2, 0, 0])}
+    assert oracle.check(start).safe and oracle.check(target).safe
+    assert oracle.check_for_search(start, refinement_distance_m=.03).minimum_distance_m > .03
+    plan = plan_collision_aware_joint_path(start_qpos_by_component=start,
+        target_qpos_by_component=target, movable_components=("arm",), oracle=oracle,
+        config=JointPathPlannerConfig(seed=2, edge_resolution_rad=.01),
+        joint_lower_by_component={"arm": np.full(3, -.3)},
+        joint_upper_by_component={"arm": np.full(3, .3)})
+    assert plan.status == JointPathStatus.PATH_FOUND
+    assert len(plan.waypoints) > 2
+    assert all(oracle.check(q).safe for q in plan.waypoints)
+    # Cached queries must not leave subsequent proxy FK stuck at another pose.
+    oracle.check(blocked)
+    box = oracle.world_obstacle_proxy_boxes(target)[0]
+    np.testing.assert_allclose(box[1][:3, 3], target["arm"])
+    with pytest.raises(ValueError, match="before"):
+        oracle.bind_observed_cloud(cloud)
+
+
+
+@pytest.mark.parametrize('early_stop', [False, True])
+def test_static_template_has_independent_observed_query_data_and_no_cross_scene_cache(early_stop):
+    from robot_motion.observed_obstacles import ObservedObstacleCloud
+    model = pin.Model()
+    joint = model.addJoint(0, pin.JointModelTranslation(), pin.SE3.Identity(), 'hand')
+    geometry = pin.GeometryModel()
+    geometry.addGeometryObject(pin.GeometryObject('hand', joint, 0,
+        pin.SE3.Identity(), hppfcl.Box(.04, .04, .04)))
+    template = RM65ObstacleCollisionOracle(model=model, base_collision_model=geometry,
+        reference_full_q=np.zeros(3), qpos_indices_by_component={'arm': (0, 1, 2)},
+        scene=_scene(center_x=5, clearance=.02), stop_at_first_clearance_violation=early_stop)
+    q = {'arm': np.zeros(3)}
+    assert template.check(q).safe
+    fixed_hash = template.scene_hash
+    requests = []
+    for point, safe in (([1., 1., 1.], True), ([0., 0., 0.], False), ([1., 1., 1.], True)):
+        cloud = ObservedObstacleCloud(reference_frame_id='world', points_m=np.array([point]), evidence={})
+        request = template.for_observed_cloud(cloud)
+        assert request._model is template._model
+        assert request._collision_model is template._collision_model
+        assert request._model_data is not template._model_data
+        assert request._collision_data is not template._collision_data
+        assert not request._check_cache and not request._search_check_cache
+        for check in (request.check, request.check_clearance_only,
+                      lambda q: request.check_for_search(q, refinement_distance_m=.03)):
+            assert check(q).safe == safe
+        assert request.scene_hash != fixed_hash
+        requests.append(request)
+    assert requests[0]._check_cache is not requests[2]._check_cache
+    assert template.scene_hash == fixed_hash and template.check(q).safe
+    with pytest.raises(ValueError, match='static oracle'):
+        requests[0].for_observed_cloud(cloud)
+    with pytest.raises(ValueError, match='reference frames'):
+        template.for_observed_cloud(ObservedObstacleCloud(reference_frame_id='other',
+            points_m=np.array([[0., 0., 0.]]), evidence={}))
+
+
+
+@pytest.mark.parametrize("layout", ["contiguous", "fortran", "strided", "reversed"])
+@pytest.mark.parametrize("size", [0.004, 0.1])
+def test_observed_voxels_preserve_all_numeric_cells_order_hash_and_input(layout, size):
+    from dataset_contracts.canonical_encoding import canonical_content_hash
+    from robot_motion.observed_obstacles import ObservedObstacleCloud
+
+    rng = np.random.default_rng(7)
+    values = np.concatenate(
+        (
+            rng.normal(size=(4096, 3)) * 0.02,
+            np.array(
+                [
+                    [0.0, -0.0, 0.0],
+                    [-0.0, 0.0, -0.0],
+                    [size, -size, np.nextafter(size, 0.0)],
+                    [np.nextafter(-size, -np.inf), -size, np.nextafter(-size, 0.0)],
+                    [1e30, -1e30, 1e15],
+                    [-1e30, 1e30, -1e15],
+                ]
+            ),
+        )
+    )
+    if layout == "fortran":
+        values = np.asfortranarray(values)
+    elif layout == "strided":
+        padded = np.empty((len(values), 6))
+        padded[:, ::2] = values
+        values = padded[:, ::2]
+    elif layout == "reversed":
+        values = values[::-1, ::-1]
+    before = values.copy()
+    expected = (np.unique(np.floor(values / size), axis=0) + 0.5) * size
+    evidence = {"views": ["main", "wrist_left", "wrist_right"]}
+    expected_hash = canonical_content_hash(
+        {
+            "reference_frame_id": "world",
+            "points_m": expected,
+            "voxel_size_m": size,
+            "evidence": evidence,
+        },
+        domain="dexteleop.observed_obstacle_cloud.v1",
+    )
+
+    cloud = ObservedObstacleCloud(
+        reference_frame_id="world",
+        points_m=values,
+        evidence=evidence,
+        voxel_size_m=size,
+    )
+
+    np.testing.assert_array_equal(cloud.points_m, expected)
+    np.testing.assert_array_equal(values, before)
+    assert not cloud.points_m.flags.writeable
+    assert cloud.semantic_content_hash == expected_hash
+    reordered = ObservedObstacleCloud(
+        reference_frame_id="world",
+        points_m=values[::-1],
+        evidence=evidence,
+        voxel_size_m=size,
+    )
+    np.testing.assert_array_equal(reordered.points_m, expected)
+    assert reordered.semantic_content_hash == expected_hash
+    assert cloud.quantization_margin_m == pytest.approx(np.sqrt(3) * size / 2)

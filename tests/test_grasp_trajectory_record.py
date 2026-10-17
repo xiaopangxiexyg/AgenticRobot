@@ -23,7 +23,7 @@ def _trajectory() -> RealAgentJointTrajectory:
     )
 
 
-def _write(directory, trajectory):
+def _write(directory, trajectory, *, observed_obstacles=None):
     return write_grasp_trajectory_record(
         directory,
         trajectory,
@@ -50,6 +50,7 @@ def _write(directory, trajectory):
             "left": np.zeros((2, 6)),
             "right": np.arange(12, dtype=float).reshape(2, 6) * 0.01,
         },
+        observed_obstacles=observed_obstacles,
     )
 
 
@@ -90,3 +91,14 @@ def test_existing_corrupt_record_is_not_overwritten(tmp_path):
         _write(tmp_path, original)
     assert path.read_bytes() == b"broken"
     assert not list(tmp_path.glob(".grasp-plan-*.npz"))
+
+
+def test_record_retains_the_frozen_obstacles_used_in_planning(tmp_path):
+    from robot_motion.observed_obstacles import ObservedObstacleCloud
+    cloud = ObservedObstacleCloud(reference_frame_id="world",
+        points_m=np.array([[.5, .2, .1], [.51, .2, .1]]), evidence={"views": [{"frame": 7}]})
+    path = _write(tmp_path, _trajectory(), observed_obstacles=cloud)
+    _, metadata = load_grasp_trajectory_record(path)
+    assert metadata["observed_obstacles"]["scene_hash"] == cloud.semantic_content_hash
+    with np.load(path, allow_pickle=False) as data:
+        np.testing.assert_array_equal(data["observed_voxel_centers_m"], cloud.points_m)

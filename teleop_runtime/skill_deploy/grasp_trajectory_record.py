@@ -15,6 +15,7 @@ from typing import Any, Mapping
 import numpy as np
 
 from dataset_contracts.canonical_encoding import canonical_content_hash
+from robot_motion.observed_obstacles import ObservedObstacleCloud
 
 from .motion_port import RealAgentJointTrajectory
 
@@ -30,6 +31,13 @@ def load_grasp_trajectory_record(
     source = Path(path)
     with np.load(source, allow_pickle=False) as data:
         metadata = json.loads(data["metadata_json"].tobytes().decode("utf-8"))
+        if "observed_obstacles" in metadata:
+            observed = metadata["observed_obstacles"]
+            cloud = ObservedObstacleCloud(reference_frame_id=observed["reference_frame_id"],
+                points_m=data["observed_voxel_centers_m"], voxel_size_m=observed["voxel_size_m"],
+                evidence=observed["evidence"])
+            if cloud.semantic_content_hash != observed["scene_hash"]:
+                raise ValueError("Recorded observed obstacles changed.")
         trajectory = RealAgentJointTrajectory(
             time_from_start_sec=data["time_from_start_sec"],
             qpos_by_side={
@@ -88,6 +96,7 @@ def write_grasp_trajectory_record(
     parameterization: Mapping[str, object] | None = None,
     planning_timing: Mapping[str, object] | None = None,
     source_waypoints_by_side: Mapping[str, np.ndarray] | None = None,
+    observed_obstacles: ObservedObstacleCloud | None = None,
 ) -> Path:
     """Publish a full plan once, without replacing an earlier record."""
 
@@ -173,6 +182,14 @@ def write_grasp_trajectory_record(
                 ),
             }
         )
+    if observed_obstacles is not None:
+        metadata["observed_obstacles"] = {
+            "reference_frame_id": observed_obstacles.reference_frame_id,
+            "voxel_size_m": observed_obstacles.voxel_size_m,
+            "scene_hash": observed_obstacles.semantic_content_hash,
+            "evidence": observed_obstacles.evidence_payload(),
+            "scope": "occupied_voxels_not_unknown_space_or_carried_geometry",
+        }
     payload = json.dumps(
         metadata, ensure_ascii=False, sort_keys=True, separators=(",", ":")
     ).encode("utf-8")
@@ -196,6 +213,8 @@ def write_grasp_trajectory_record(
                         "source_right_qpos": source_waypoints["right"],
                     }
                 )
+            if observed_obstacles is not None:
+                arrays["observed_voxel_centers_m"] = observed_obstacles.points_m
             np.savez_compressed(stream, **arrays)
             stream.flush()
             os.fsync(stream.fileno())
