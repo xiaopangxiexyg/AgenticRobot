@@ -189,6 +189,10 @@ stuck/failure 或缺少 completed 收尾仍算运行失败。报告完成后仍�
   `--camera-config`、`--arm-ip-assignment` 和新的 `--output` 目录，采集双臂 qpos 与可用相机 RGB-D。
   先检查既有连接/相机占用，不发送运动、HOLD、STOP、夹爪命令或相机 reset；固定 60 秒上限。
   `--dry-run` 仅显示参数，不连接设备。相机缺失和稳定性验证失败保留原因，不冒充完整采集成功。
+  `--camera-startup-check [streams|sensors]` 复用同一探针，仅诊断相机，不导入或连接机械臂 SDK；
+  streams 保留完整 RGB-D、新鲜帧及清理门禁，并保存同帧 native depth；sensors 仅枚举目标设备的
+  当前选项和流能力，不开启流或设置参数。两者均写入新证据目录，与 `--check-only`、`--interactive`
+  互斥；`observed` 只表示完成枚举，不能解释为相机采集或物理任务成功。
   相机复用 rule-base / real-teleop 的 `RealSenseRGBSource`：按配置顺序错峰启动、持续采集完整
   RGB-D、单次启动、启动超时终止批次、按实际启动顺序反向关闭；没有独立的原生 pipeline
   预热/轮询路径。探针始终禁用三种 hardware-reset 配置和自动曝光参数写入，保留分辨率、帧率、

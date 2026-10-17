@@ -773,3 +773,83 @@ def test_cleanup_interrupt_takes_priority_over_earlier_record_error(capture_args
         assert not session.info["cleanup_complete"]
     finally:
         original_join(timeout=2)
+
+
+@pytest.mark.parametrize("failed_camera", [None, "front"])
+def test_camera_startup_check_never_enters_arm_branch(capture_args, camera_rig, monkeypatch, failed_camera):
+    sources, events, modes = camera_rig.sources, camera_rig.events, camera_rig.modes
+    if failed_camera:
+        modes[failed_camera] = "unavailable"
+    monkeypatch.setattr(probe, "camera_sensor_diagnostics", lambda _: {})
+    monkeypatch.setattr(probe, "read_arm", lambda _: pytest.fail("Camera check read an arm"))
+    report = probe.check_camera_startup(capture_args)
+    assert report["arm_connected"] is False and report["camera_reset"] is False
+    assert report["cleanup_complete"] is True
+    assert report["status"] == ("partial" if failed_camera else "ready")
+    assert not any(event[0] == "arm_ownership" for event in events)
+    assert all(len(view["frames"]) == (0 if role == "main" and failed_camera else 2)
+        for role, view in report["views"].items())
+    assert json.loads((capture_args.output / "camera_startup.json").read_text()) == report
+    assert report["all_views_ready"] is (failed_camera is None)
+    for path in capture_args.output.glob("*.npz"):
+        with np.load(path) as arrays:
+            assert {"rgb", "depth_m", "unaligned_depth_z16"} <= set(arrays.files)
+            assert arrays["unaligned_depth_z16"].dtype == np.uint16
+
+
+def test_sensor_diagnostics_only_reads_target_device(monkeypatch):
+    import sys
+
+    calls = []
+    profile = SimpleNamespace(stream_type=lambda: "depth", as_video_stream_profile=lambda: profile,
+        width=lambda: 640, height=lambda: 480, fps=lambda: 15, format=lambda: "z16")
+    sensor = SimpleNamespace(get_info=lambda _: "sensor", supports=lambda _: True,
+        get_option=lambda option: calls.append(option) or 0., get_stream_profiles=lambda: [profile])
+    devices = [SimpleNamespace(get_info=lambda key, serial=serial: serial if key == "serial" else "camera",
+        query_sensors=lambda: [sensor]) for serial in ("wanted", "other")]
+    monkeypatch.setitem(sys.modules, "pyrealsense2", SimpleNamespace(
+        context=lambda: SimpleNamespace(query_devices=lambda: devices),
+        camera_info=SimpleNamespace(serial_number="serial", name="name"),
+        option=SimpleNamespace(inter_cam_sync_mode="sync"),
+        stream=SimpleNamespace(color="color", depth="depth")))
+    result = probe.camera_sensor_diagnostics({"wanted"})
+    assert list(result) == ["wanted"] and calls == ["sync"]
+    assert result["wanted"]["sensors"][0]["profiles"][0]["fps"] == 15
+
+
+def test_sensor_only_check_does_not_start_any_camera(capture_args, monkeypatch):
+    capture_args.camera_startup_check = "sensors"
+    monkeypatch.setattr(probe, "assert_devices_idle", lambda _: None)
+    monkeypatch.setattr(probe, "camera_sensor_diagnostics", lambda _: {"serial": {"sensors": []}})
+    monkeypatch.setattr(probe, "readonly_camera_sources", lambda _: pytest.fail("Sensor-only check started streams"))
+    result = probe.check_camera_startup(capture_args)
+    assert result["status"] == "observed" and result["cleanup_complete"]
+    assert not result["arm_connected"] and not result["views"]
+
+
+@pytest.mark.parametrize("mode", ["streams", "sensors"])
+@pytest.mark.parametrize("conflict", [None, "--check-only", "--interactive"])
+def test_camera_only_cli_dispatch_and_preflight_conflicts(monkeypatch, mode, conflict):
+    import sys
+
+    argv = ["snapshot", "--repo", "/repo", "--camera-config", "/cameras.json",
+            "--arm-ip-assignment", "/arms.json", "--output", "/new-evidence",
+            "--camera-startup-check", mode]
+    if conflict:
+        argv.append(conflict)
+    monkeypatch.setattr(sys, "argv", argv)
+    monkeypatch.setattr(sys, "path", list(sys.path))
+    monkeypatch.setitem(sys.modules, "hardware.rm65.rm_api2_adapter", None)
+    monkeypatch.setattr(probe.signal, "signal", lambda *_args: None)
+    monkeypatch.setattr(probe, "check_inputs", lambda _args: pytest.fail("Conflict reached preflight"))
+    calls = []
+    def check(args):
+        calls.append(args.camera_startup_check)
+        return {"status": "observed" if mode == "sensors" else "ready"}
+    monkeypatch.setattr(probe, "check_camera_startup", check)
+    if conflict:
+        with pytest.raises(SystemExit) as result:
+            probe.main()
+        assert result.value.code == 2 and not calls
+    else:
+        assert probe.main() == 0 and calls == [mode]

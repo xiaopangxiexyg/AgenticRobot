@@ -304,7 +304,7 @@ class ReadOnlySnapshotSession:
                     self._operation_condition.notify_all()
             if self.closed:
                 self._finish_watchdog_when_idle()
-    def start(self):
+    def start(self, *, cameras_only=False):
         from teleop_runtime.deploy.camera_runtime import run_camera_startup_self_check
         from teleop_runtime.real_teleop import camera_runtime
 
@@ -335,6 +335,11 @@ class ReadOnlySnapshotSession:
             raise RuntimeError(f"No usable camera; no reset attempted: {camera_errors}")
         self.stage("camera_freshness_check", cameras=list(self.ready))
         run_camera_startup_self_check(self.ready)
+        if cameras_only:
+            self.info["status"] = "ready"
+            self.save()
+            self.stage("camera_check_ready", cameras=list(self.ready))
+            return
         assert_arm_connections_idle(self.ips)
         for side in ("left", "right"):
             self.stage("connect_arm_readonly", side=side)
@@ -559,6 +564,92 @@ def capture(args, *, arm_factory) -> dict:
     return report
 
 
+def camera_sensor_diagnostics(serials) -> dict:
+    """Read stream capabilities and current settings; never open or set sensors."""
+    import pyrealsense2 as rs
+
+    result = {}
+    for device in rs.context().query_devices():
+        serial = device.get_info(rs.camera_info.serial_number)
+        if serial not in serials:
+            continue
+        record = {"name": device.get_info(rs.camera_info.name), "sensors": []}
+        for sensor in device.query_sensors():
+            item = {"name": sensor.get_info(rs.camera_info.name), "options": {}, "profiles": []}
+            for name in ("inter_cam_sync_mode", "enable_auto_exposure", "exposure",
+                         "auto_exposure_priority", "global_time_enabled", "frames_queue_size"):
+                option = getattr(rs.option, name, None)
+                if option is not None and sensor.supports(option):
+                    item["options"][name] = sensor.get_option(option)
+            for profile in sensor.get_stream_profiles():
+                if profile.stream_type() not in (rs.stream.color, rs.stream.depth):
+                    continue
+                video = profile.as_video_stream_profile()
+                item["profiles"].append({"stream": str(profile.stream_type()),
+                    "width": video.width(), "height": video.height(), "fps": profile.fps(),
+                    "format": str(profile.format())})
+            record["sensors"].append(item)
+        result[serial] = record
+    return result
+
+
+def check_camera_startup(args) -> dict:
+    """Exercise the canonical lifecycle without importing or connecting an arm SDK."""
+    from PIL import Image
+    from teleop_runtime.sources.camera import load_realsense_camera_config_map
+
+    def forbidden_arm_factory(ip):
+        raise AssertionError("Camera startup check must not connect an arm")
+
+    session = ReadOnlySnapshotSession(args, arm_factory=forbidden_arm_factory)
+    keys = set(ROLES)
+    report = {"schema": "agenticrobot.readonly_camera_startup.v1", "status": "failed",
+        "arm_connected": False, "camera_reset": False, "views": {},
+        "required_roles": list(ROLES.values()),
+        "all_views_ready": False}
+    try:
+        with session.bounded_operation("startup"):
+            sensors_only = getattr(args, "camera_startup_check", "streams") == "sensors"
+            if sensors_only:
+                assert_devices_idle(session.ips)
+                session.stage("camera_sensor_diagnostics")
+                configs = load_realsense_camera_config_map(Path(args.camera_config))
+                report["sensors"] = camera_sensor_diagnostics({configs[key].serial for key in keys})
+                save_json(session.output / "camera_sensors.json", report["sensors"])
+                report["status"] = "observed"
+            else:
+                session.start(cameras_only=True)
+        if not sensors_only:
+            with session.bounded_operation("capture"):
+                previous = {}
+                for index in range(2):
+                    frames = next_frames(session.ready, previous, after=time.time())
+                    for key, frame in frames.items():
+                        arrays, metadata = diagnostic_frame_payload(session.ready[key], frame, index=index)
+                        role = ROLES[key]
+                        np.savez_compressed(session.output / f"{role}_{index:02d}.npz", **arrays)
+                        Image.fromarray(arrays["rgb"]).save(session.output / f"{role}_{index:02d}.jpg")
+                        session.info["views"][role]["frames"].append(metadata)
+                        previous[key] = (frame.metadata["source_generation"], frame.frame_index)
+                    session.save()
+                report["status"] = "ready" if set(session.ready) == set(keys) else "partial"
+                report["all_views_ready"] = set(session.ready) == set(ROLES)
+    except (Exception, KeyboardInterrupt) as exc:
+        report["error"] = {"type": type(exc).__name__, "message": str(exc)}
+    finally:
+        with session.bounded_operation("close"):
+            session.close()
+        report.update(views=session.info["views"], cleanup_complete=session.info["cleanup_complete"],
+            cleanup_errors=session.info["cleanup_errors"])
+        if not report["cleanup_complete"]:
+            report["status"] = "failed"
+            report["all_views_ready"] = False
+        save_json(session.output / "camera_startup.json", report)
+    print(json.dumps({"status": report["status"], "output": str(session.output),
+        "error": report.get("error"), "cleanup_complete": report["cleanup_complete"]}, ensure_ascii=False), flush=True)
+    return report
+
+
 def check_inputs(args) -> dict:
     """Validate source/configuration/dependencies without opening any device."""
     repo = Path(args.repo).resolve(strict=True)
@@ -716,11 +807,15 @@ def main() -> int:
     parser.add_argument("--output", required=True)
     parser.add_argument("--interactive", action="store_true", help="Operator-labeled repeated read-only snapshots")
     parser.add_argument("--check-only", action="store_true", help="Validate paths/imports without opening devices")
+    parser.add_argument("--camera-startup-check", nargs="?", const="streams", choices=("streams", "sensors"),
+        help="Bounded RGB-D check, or sensors to read settings only; no arm SDK import or connection")
     for name in CONTEXT_FILES[2:]:
         parser.add_argument("--" + name.replace("_", "-"))
     parser.add_argument("--scene-object", action="append", choices=[key for key, _ in SCENE_OBJECTS.values()])
     parser.add_argument("--scene-note", default="")
     args = parser.parse_args()
+    if args.camera_startup_check and (args.check_only or args.interactive):
+        parser.error("--camera-startup-check cannot be combined with --check-only or --interactive")
     if args.check_only:
         print(json.dumps(check_inputs(args), ensure_ascii=False, indent=2), flush=True)
         return 0
@@ -729,8 +824,6 @@ def main() -> int:
             parser.error("Interactive collection needs terminal input; do not pipe a heredoc into Python")
         context = check_inputs(args)
     sys.path.insert(0, args.repo)
-    from hardware.rm65.rm_api2_adapter import Arm, RM65
-
     def interrupted(signum, frame):
         # Not a recoverable camera startup error: the serial lifecycle must
         # unwind immediately instead of treating cancellation as a retry.
@@ -738,6 +831,10 @@ def main() -> int:
 
     signal.signal(signal.SIGTERM, interrupted)
     signal.signal(signal.SIGINT, interrupted)
+    if args.camera_startup_check:
+        result = check_camera_startup(args)
+        return 0 if result["status"] in ("ready", "observed") else 1
+    from hardware.rm65.rm_api2_adapter import Arm, RM65
     if args.interactive:
         return interactive_capture(args, context=context, arm_factory=lambda ip: Arm(RM65, ip))
     result = capture(args, arm_factory=lambda ip: Arm(RM65, ip))

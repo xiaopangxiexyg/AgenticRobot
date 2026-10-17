@@ -215,3 +215,20 @@ def test_readonly_tcp_agent_wrapper_is_fixed_without_camera_or_control(wrapper_e
     for extra in (("--camera-config", "/cam"), ("--camera-sdk-debug-log",), ("--command", "move")):
         assert _run(environment, "remote_readonly_agent_acceptance.sh", *args, *extra).returncode != 0
     assert not calls.exists()
+
+
+@pytest.mark.parametrize("mode", ["streams", "sensors"])
+@pytest.mark.parametrize("conflict", [False, True])
+def test_camera_only_startup_wrapper_is_fixed_and_rejects_preflight_conflict(wrapper_environment, conflict, mode):
+    environment, calls = wrapper_environment
+    args = ["-H", "trusted-target", "--repo", "/repo", "--python", "/python",
+        "--camera-config", "/cameras.json", "--arm-ip-assignment", "/arms.json",
+        "--output", "/new-evidence", "--camera-startup-check", mode, "--dry-run"]
+    if conflict:
+        args.append("--check-only")
+    result = _run(environment, "remote_rm65_grasp_snapshot.sh", *args)
+    assert (result.returncode != 0) == conflict
+    assert not calls.exists()
+    if not conflict:
+        assert "--camera-startup-check" in result.stdout
+        assert "--interactive" not in result.stdout
