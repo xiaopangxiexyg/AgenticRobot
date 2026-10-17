@@ -295,3 +295,26 @@ def test_oversized_npy_header_is_rejected_before_numpy_can_allocate(monkeypatch)
     monkeypatch.setattr(np, "load", lambda *_args, **_kwargs: pytest.fail("unsafe allocation attempted"))
     with pytest.raises(ValueError, match="bounded body"):
         decode_grasp_rgbd_snapshot(out.getvalue())
+
+
+@pytest.mark.parametrize("count", [0, 1, 10000])
+def test_native_query_index_reuse_matches_original_xyz_and_labels(count):
+    import math
+
+    rng = np.random.default_rng(42)
+    view = scene(rng.uniform(-.2, .2, (count, 3)), rng.random(count) > .5)
+    for opening, distance in ((.07, 0.), (.035, .06), (.07, .1)):
+        for yaw in (0., .7, -1.2):
+            pose = np.eye(4)
+            pose[:2, :2] = [[np.cos(yaw), -np.sin(yaw)], [np.sin(yaw), np.cos(yaw)]]
+            pose[:3, 3] = rng.uniform(-.05, .05, 3)
+            g = view.geometry
+            radius = math.sqrt((opening/2+g.finger_thickness_m)**2 +
+                (g.pad_height_m/2)**2 +
+                max(abs(g.palm_z_m-g.finger_thickness_m-distance), abs(g.palm_z_m+g.finger_length_m))**2)
+            indices = view._tree.query_ball_point(pose[:3, 3], radius+1e-9)
+            expected_points = (view.points[indices]-pose[:3, 3]) @ pose[:3, :3]
+            actual_points, actual_labels = view._local_points(pose, opening_m=opening,
+                distance_m=distance)
+            np.testing.assert_array_equal(actual_points, expected_points)
+            np.testing.assert_array_equal(actual_labels, view.target_mask[indices])

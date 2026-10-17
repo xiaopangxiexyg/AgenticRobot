@@ -265,6 +265,7 @@ class RM65CapturedRobotObservationFilter:
         self.config = config or RM65CapturedRobotObservationFilterConfig()
         self._lock = threading.Lock()
         self._runtime: tuple[Any, ...] | None = None
+        self._mesh_buffers: dict[int, tuple[np.ndarray, np.ndarray]] = {}
 
     def _runtime_components(self) -> tuple[Any, ...]:
         if self._runtime is not None:
@@ -306,6 +307,28 @@ class RM65CapturedRobotObservationFilter:
             selected,
         )
         return self._runtime
+
+    def _mesh_buffers_for(self, geometry_index: int, shape: Any) -> tuple[np.ndarray, np.ndarray]:
+        # The loaded visual model owns fixed mesh topology. Cache only local
+        # buffers under the renderer lock; FK, camera transforms and ray hits
+        # are recomputed for every view and sampled finger state.
+        buffers = self._mesh_buffers.get(geometry_index)
+        if buffers is None:
+            vertices = np.asarray(shape.vertices(), dtype=float).copy(order="K")
+            faces = np.asarray(
+                [
+                    (int(triangle[0]), int(triangle[1]), int(triangle[2]))
+                    for triangle in (
+                        shape.tri_indices(index) for index in range(int(shape.num_tris))
+                    )
+                ],
+                dtype=np.int64,
+            )
+            vertices.setflags(write=False)
+            faces.setflags(write=False)
+            buffers = vertices, faces
+            self._mesh_buffers[geometry_index] = buffers
+        return buffers
 
     @staticmethod
     def _validated_pose(value: object, *, field_name: str) -> np.ndarray:
@@ -384,8 +407,7 @@ class RM65CapturedRobotObservationFilter:
                     item.name, finger_only=True
                 ):
                     continue
-                shape = item.geometry
-                local_vertices = np.asarray(shape.vertices(), dtype=float)
+                local_vertices, faces = self._mesh_buffers_for(geometry_index, item.geometry)
                 source_from_geometry = visual_data.oMg[geometry_index]
                 source_vertices = (
                     local_vertices @ np.asarray(source_from_geometry.rotation).T
@@ -394,17 +416,6 @@ class RM65CapturedRobotObservationFilter:
                 camera_vertices = (
                     source_vertices @ camera_from_source[:3, :3].T
                     + camera_from_source[:3, 3]
-                )
-                faces = np.asarray(
-                    [
-                        (
-                            int(shape.tri_indices(index)[0]),
-                            int(shape.tri_indices(index)[1]),
-                            int(shape.tri_indices(index)[2]),
-                        )
-                        for index in range(int(shape.num_tris))
-                    ],
-                    dtype=np.int64,
                 )
                 vertices_parts.append(camera_vertices)
                 faces_parts.append(faces + vertex_offset)

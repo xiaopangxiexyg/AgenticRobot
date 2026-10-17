@@ -286,7 +286,9 @@ class VisibleGraspScene:
                            (g.pad_height_m/2)**2 +
                            max(abs(g.palm_z_m-g.finger_thickness_m-distance_m),
                                abs(g.palm_z_m+g.finger_length_m))**2)
-        indices = self._tree.query_ball_point(pose[:3, 3], radius+1e-9)
+        # Reuse one native index array for XYZ and labels.
+        indices = np.asarray(self._tree.query_ball_point(pose[:3, 3], radius+1e-9),
+                             dtype=np.intp)
         return ((self.points[indices]-pose[:3, 3]) @ pose[:3, :3],
                 self.target_mask[indices])
 
