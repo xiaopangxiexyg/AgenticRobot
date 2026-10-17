@@ -304,12 +304,14 @@ device, or lower owner, and the server repeats it immediately before bind. An
 advanced caller may pass `--root`, but is then responsible for choosing a root
 that leaves enough pathname budget.
 
-One authenticated client identity may reserve at most three persistent local
-connections: its ordinary request channel, an independent emergency-stop
-channel, and one bounded bootstrap/inspection channel during attachment
-handoff. The bound is fixed; a fourth connection is rejected. Any channel
-disconnecting or timing out still invokes the same fail-closed authenticated
-disconnect handling, so the safety channel does not weaken HOLD-on-disconnect.
+每个已认证客户端身份最多保留 **四条**本地持久连接，供会话级操作者界面和当前任务
+各使用一条普通请求通道、一条独立急停通道。启动预检在 Dashboard 打开前结束；
+临时接线也占用同一个有界额度，不额外放行。第五条连接会被拒绝，服务端日志记录
+客户端身份、当前连接数及上限。若额度暂满，握手最多等待 250 ms，让已关闭连接完成
+服务端登记清理；仍无空位则拒绝，不挤掉现有连接、不重放请求。这段等待发生在绑定
+facade 和执行 RPC 之前，不阻塞控制循环。任务结束只释放自身连接，操作者界面的通道继续保留。
+任何已认证通道断开或超时仍走原有的保守断连保护；这里不改变 HOLD 回执、权限或
+急停语义。调用方不能把正常任务收尾等同于已经获得下层 HOLD 证明。
 
 `--artifact-root` is optional and default-off. Supplying a real,
 non-world-writable directory enables the read-only

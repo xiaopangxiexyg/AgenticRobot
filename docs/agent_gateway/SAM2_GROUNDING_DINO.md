@@ -88,6 +88,27 @@ sha256sum \
 
 ## 使用一张本地图片验证真实模型
 
+离线部署还依赖 Grounding DINO 配置指定的文本编码器（当前受审配置为
+`bert-base-uncased`），不只是 SAM2 和检测器的两个 checkpoint。启动前必须把
+`HF_HOME` / `HF_HUB_CACHE` 绑定到已准备的模型缓存；若还设置了
+`HUGGINGFACE_HUB_CACHE` 或 `TRANSFORMERS_CACHE`，须指向同一个 hub，避免优先级
+覆盖。这些变量应在导入 Transformers 前由会话设置，不能依赖其他终端的缓存环境。
+保持 `HF_HUB_OFFLINE=1` 和 `TRANSFORMERS_OFFLINE=1`；缺文件应在设备启动前报错，
+不得通过关闭离线模式或重开相机恢复。
+
+```bash
+python scripts/smoke_sam2_grounding_dino.py \
+  --asset-bundle "${DEXTELEOP_ASSET_ROOT}/perception/sam2_grounding_dino" \
+  --device cuda --verify-only
+```
+
+此检查不连接设备，验证受审源码、权重、离线文本配置/分词器与文本权重，并实际执行
+一个小型 Grounding DINO CUDA 算子。这样可在启动相机前拦截扩展与 PyTorch 的 ABI
+不兼容，而不是只看 `_C` 文件存在或 import warning。省略 `--verify-only` 可额外
+加载/关闭真实模型；它仍不启动相机或机械臂。源码 revision 一致不保证编译产物兼容，
+跨环境复用扩展时必须在目标 PyTorch 环境中重新验证；需要重建时使用独立源码/构建
+目录，不覆盖共享已安装包。CPU 仅在操作者明确选择 `--device cpu` 时使用，不自动降级。
+
 这是最短的权重与模型端到端验证，不启动 RealSense 或 Gateway，也不连接机械臂：
 
 ```bash

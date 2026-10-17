@@ -7,6 +7,7 @@ import stat
 import struct
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -352,15 +353,18 @@ def test_live_rpent_client_authenticates_heartbeats_and_binds_payload_identity(
         facade=facade,
         peer_idle_timeout_sec=0.3,
     )
-    client = None
+    clients = []
     try:
-        client = UnixDexTeleopGatewayClient(
-            socket_path=path,
-            client_id="rpent:local",
-            expected_server_uid=os.getuid(),
-            expected_server_gid=os.getgid(),
-            heartbeat_interval_sec=0.05,
-        )
+        # Each current client consumes one of the four bounded channels.
+        for _ in range(4):
+            clients.append(UnixDexTeleopGatewayClient(
+                socket_path=path,
+                client_id="rpent:local",
+                expected_server_uid=os.getuid(),
+                expected_server_gid=os.getgid(),
+                heartbeat_interval_sec=0.05,
+            ))
+        client = clients[0]
         assert client.get_skill_definition_catalog() == {
             "catalog": "definitions"
         }
@@ -373,7 +377,8 @@ def test_live_rpent_client_authenticates_heartbeats_and_binds_payload_identity(
         assert admitted["accepted"]
 
         time.sleep(0.65)
-        assert client.get_observation_snapshot() == {"snapshot": "current"}
+        for channel in clients:
+            assert channel.get_observation_snapshot() == {"snapshot": "current"}
         assert not server.disconnect_events
 
         with pytest.raises(DexTeleopGatewayTransportError):
@@ -381,6 +386,7 @@ def test_live_rpent_client_authenticates_heartbeats_and_binds_payload_identity(
                 socket_path=path,
                 client_id="rpent:local",
                 expected_server_uid=os.getuid(),
+                expected_server_gid=os.getgid(),
                 heartbeat_interval_sec=0.05,
             )
 
@@ -400,8 +406,8 @@ def test_live_rpent_client_authenticates_heartbeats_and_binds_payload_identity(
             "authenticated_peer_request_rejected"
         ]
     finally:
-        if client is not None:
-            client.close()
+        for channel in clients:
+            channel.close()
         _stop_server(server, thread)
     assert len(close_calls) == 1
 
@@ -449,8 +455,9 @@ def test_idle_or_oversized_authenticated_peer_disconnects_fail_closed(
         _stop_server(server, thread)
 
 
-def test_reserved_safety_channel_survives_bounded_bootstrap_connection(
+def test_reserved_safety_channels_survive_bounded_task_connections(
     short_unix_socket_path_factory,
+    caplog,
 ) -> None:
     path = short_unix_socket_path_factory("dual-channel")
     facade = _FakeBoundFacade("rpent:local")
@@ -458,8 +465,9 @@ def test_reserved_safety_channel_survives_bounded_bootstrap_connection(
     primary = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     emergency = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     bootstrap = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    task_emergency = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     rejected = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    for channel in (primary, emergency, bootstrap, rejected):
+    for channel in (primary, emergency, bootstrap, task_emergency, rejected):
         channel.settimeout(1.0)
     try:
         primary.connect(str(path))
@@ -483,24 +491,48 @@ def test_reserved_safety_channel_survives_bounded_bootstrap_connection(
             method="healthz",
             payload=None,
         )["result"]["status"] == "ok"
+        task_emergency.connect(str(path))
+        assert _raw_call(
+            task_emergency,
+            request_id="request:task-emergency-health",
+            method="healthz",
+            payload=None,
+        )["result"]["status"] == "ok"
         _wait_for(lambda: server.active_client_ids == ("rpent:local",))
 
         rejected.connect(str(path))
         assert rejected.recv(1) == b""
+        assert "client_id=rpent:local active=4 limit=4" in caplog.text
+        assert not server.disconnect_events
+        assert not facade.disconnect_reasons
+        # Refusing an excess socket must not evict an admitted
+        # channel or invoke the admitted client's disconnect-to-HOLD path.
+        for index, channel in enumerate((primary, emergency, bootstrap, task_emergency)):
+            assert _raw_call(
+                channel,
+                request_id=f"request:after-rejection:{index}",
+                method="healthz",
+                payload=None,
+            )["result"]["status"] == "ok"
 
         bootstrap.close()
         _wait_for(lambda: len(server.disconnect_events) == 1)
         assert server.active_client_ids == ("rpent:local",)
         assert facade.disconnect_reasons == ["authenticated_peer_eof"]
 
-        primary.close()
+        task_emergency.close()
         _wait_for(lambda: len(server.disconnect_events) == 2)
         assert server.active_client_ids == ("rpent:local",)
 
-        emergency.close()
+        primary.close()
         _wait_for(lambda: len(server.disconnect_events) == 3)
+        assert server.active_client_ids == ("rpent:local",)
+
+        emergency.close()
+        _wait_for(lambda: len(server.disconnect_events) == 4)
         assert server.active_client_ids == ()
         assert facade.disconnect_reasons == [
+            "authenticated_peer_eof",
             "authenticated_peer_eof",
             "authenticated_peer_eof",
             "authenticated_peer_eof",
@@ -509,7 +541,181 @@ def test_reserved_safety_channel_survives_bounded_bootstrap_connection(
         primary.close()
         emergency.close()
         bootstrap.close()
+        task_emergency.close()
         rejected.close()
+        _stop_server(server, thread)
+
+
+def test_session_channels_survive_sequential_task_connection_pairs(
+    short_unix_socket_path_factory,
+) -> None:
+    path = short_unix_socket_path_factory("session-tasks")
+    facade = _FakeBoundFacade("rpent:local")
+    server, thread, _ = _start_server(path=path, facade=facade)
+    channels = []
+
+    def open_channel(label):
+        channel = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        channels.append(channel)
+        channel.settimeout(1.0)
+        channel.connect(str(path))
+        assert _raw_call(
+            channel,
+            request_id=f"request:open:{label}",
+            method="healthz",
+            payload=None,
+        )["result"]["status"] == "ok"
+        return channel
+
+    try:
+        # Bootstrap must finish before the session and task pairs overlap.
+        open_channel("bootstrap").close()
+        _wait_for(lambda: len(server.disconnect_events) == 1)
+        primary, emergency = open_channel("session"), open_channel("session-stop")
+        for cycle in range(3):
+            task = open_channel(f"task:{cycle}")
+            task_stop = open_channel(f"task-stop:{cycle}")
+            task.close()
+            task_stop.close()
+            _wait_for(lambda: len(server.disconnect_events) == 3 + 2 * cycle)
+            assert _raw_call(
+                primary,
+                request_id=f"request:session:{cycle}",
+                method="get_observation_snapshot",
+                payload=None,
+            )["result"] == {"snapshot": "current"}
+            # A fake facade proves transport independence, not hardware stop.
+            assert _raw_call(
+                emergency,
+                request_id=f"request:session-stop:{cycle}",
+                method="healthz",
+                payload=None,
+            )["result"]["status"] == "ok"
+        assert facade.disconnect_reasons == ["authenticated_peer_eof"] * 7
+        assert not any(name == "submit_skill_request" for name, _ in facade.requests)
+    finally:
+        for channel in channels:
+            channel.close()
+        _stop_server(server, thread)
+
+
+def test_connection_handoff_tolerates_delayed_closed_peer_retirement(
+    short_unix_socket_path_factory,
+    monkeypatch,
+) -> None:
+    path = short_unix_socket_path_factory("handoff")
+    facade = _FakeBoundFacade("rpent:local")
+    server, thread, _ = _start_server(path=path, facade=facade)
+    channels = []
+    delayed = set()
+    retiring = set()
+    release = threading.Event()
+    original = server._release_authenticated_connection
+
+    def delayed_retirement(**kwargs):
+        if kwargs["sock"] in delayed:
+            retiring.add(kwargs["sock"])
+            assert release.wait(1.0)
+        return original(**kwargs)
+
+    def open_channel(index):
+        channel = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        channels.append(channel)
+        channel.settimeout(1.0)
+        channel.connect(str(path))
+        assert _raw_call(
+            channel,
+            request_id=f"request:handoff:{index}",
+            method="healthz",
+            payload=None,
+        )["result"]["status"] == "ok"
+        return channel
+
+    monkeypatch.setattr(server, "_release_authenticated_connection", delayed_retirement)
+    timer = None
+    try:
+        for index in range(4):
+            open_channel(index)
+        with server._connection_lock:
+            delayed.update(list(server._active_connections["rpent:local"].values())[2:])
+        channels[2].close()
+        channels[3].close()
+        _wait_for(lambda: len(retiring) == 2)
+        # Local close has returned, but the server still accounts for both old
+        # task sockets. The caller must not need a private server-side barrier.
+        timer = threading.Timer(0.05, release.set)
+        timer.start()
+        open_channel(4)
+        open_channel(5)
+        _wait_for(lambda: len(server.disconnect_events) == 2)
+        assert facade.disconnect_reasons == ["authenticated_peer_eof"] * 2
+    finally:
+        release.set()
+        if timer is not None:
+            timer.join(timeout=1.0)
+        for channel in channels:
+            channel.close()
+        _stop_server(server, thread)
+
+
+def test_transport_close_rejects_waiting_peer_before_facade_binding(
+    short_unix_socket_path_factory,
+    monkeypatch,
+) -> None:
+    path = short_unix_socket_path_factory("close-waiter")
+    facade = _FakeBoundFacade("rpent:local")
+    server, thread, _ = _start_server(path=path, facade=facade)
+    channels = []
+    factory_calls = []
+    waiting, retire = threading.Event(), threading.Event()
+    original_wait = server._connection_available.wait_for
+    original_release = server._release_authenticated_connection
+
+    def wait_for_slot(*args, **kwargs):
+        waiting.set()
+        return original_wait(*args, **kwargs)
+
+    def delayed_release(**kwargs):
+        assert retire.wait(1.0)
+        return original_release(**kwargs)
+
+    def factory(client_id):
+        factory_calls.append(client_id)
+        return facade
+
+    def query(channel, index):
+        try:
+            return _raw_call(channel, request_id=f"request:close:{index}",
+                             method="healthz", payload=None)
+        except (OSError, AssertionError):
+            return None
+
+    monkeypatch.setattr(server, "_facade_factory", factory)
+    monkeypatch.setattr(server._connection_available, "wait_for", wait_for_slot)
+    monkeypatch.setattr(server, "_release_authenticated_connection", delayed_release)
+    try:
+        for index in range(5):
+            channel = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            channels.append(channel)
+            channel.settimeout(1.0)
+            channel.connect(str(path))
+            if index < 4:
+                assert query(channel, index)["result"]["status"] == "ok"
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            pending = pool.submit(query, channels[-1], 4)
+            try:
+                assert waiting.wait(1.0)
+                server.shutdown()
+                server.server_close()
+            finally:
+                retire.set()
+            assert pending.result(timeout=1.0) is None
+        assert len(factory_calls) == 4
+        _wait_for(lambda: not server.active_client_ids)
+    finally:
+        retire.set()
+        for channel in channels:
+            channel.close()
         _stop_server(server, thread)
 
 

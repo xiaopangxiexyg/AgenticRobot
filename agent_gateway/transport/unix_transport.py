@@ -7,15 +7,17 @@ the owner of ``serve_forever``/shutdown process lifecycle.
 
 Linux ``SO_PEERCRED`` is authoritative for the connecting process identity.
 The JSON payload's ``client_id`` is never used to authenticate a connection.
-At most three persistent connections are allowed per configured client
-identity: one ordinary request channel, one independently reservable safety
-channel, and one bounded bootstrap/inspection channel during handoff. EOF or
-idle timeout on any channel keeps the conservative disconnect-to-HOLD behavior.
+At most four persistent connections are allowed per configured client
+identity. A session-level operator surface and its current task may each keep
+an ordinary request channel and an independent safety channel. Bootstrap uses
+this same bounded capacity, not an additional allowance. EOF or idle timeout
+on any channel keeps the conservative disconnect-to-HOLD behavior.
 """
 
 from __future__ import annotations
 
 import json
+import logging
 import os
 import socket
 import socketserver
@@ -63,7 +65,10 @@ DEFAULT_AGENT_GATEWAY_UNIX_MAX_FRAME_BYTES = 2 * 1024 * 1024
 MAX_AGENT_GATEWAY_UNIX_FRAME_BYTES = 16 * 1024 * 1024
 DEFAULT_AGENT_GATEWAY_UNIX_PEER_IDLE_TIMEOUT_SEC = 10.0
 MAX_AGENT_GATEWAY_UNIX_SOCKET_PATH_BYTES = 107
-MAX_AGENT_GATEWAY_UNIX_CONNECTIONS_PER_CLIENT = 3
+MAX_AGENT_GATEWAY_UNIX_CONNECTIONS_PER_CLIENT = 4
+_CONNECTION_SLOT_WAIT_SEC = 0.25
+
+_LOGGER = logging.getLogger(__name__)
 
 _FRAME_PREFIX = struct.Struct(">I")
 _PEER_CREDENTIALS = struct.Struct("3i")
@@ -609,6 +614,7 @@ class AgentGatewayUnixJsonServer(
         self._facade_factory = facade_factory
         self._close_gateway = close_gateway
         self._connection_lock = threading.RLock()
+        self._connection_available = threading.Condition(self._connection_lock)
         self._active_connections: dict[str, dict[int, socket.socket]] = {}
         self._disconnect_events: deque[AgentGatewayUnixDisconnectEvent] = deque(
             maxlen=max_disconnect_events
@@ -679,11 +685,32 @@ class AgentGatewayUnixJsonServer(
     ]:
         peer = _peer_credentials(sock)
         client_id = self.peer_client_map.resolve(peer)
-        with self._connection_lock:
+        with self._connection_available:
+            if self._transport_closed:
+                raise RuntimeError("Gateway transport is closed.")
             connections = self._active_connections.setdefault(client_id, {})
             if len(connections) >= MAX_AGENT_GATEWAY_UNIX_CONNECTIONS_PER_CLIENT:
+                # Local close can finish before the preceding handler retires
+                # its slot. Wait only here, before facade binding or any RPC;
+                # never evict a live peer or replay an application request.
+                self._connection_available.wait_for(
+                    lambda: self._transport_closed
+                    or len(self._active_connections.get(client_id, {}))
+                    < MAX_AGENT_GATEWAY_UNIX_CONNECTIONS_PER_CLIENT,
+                    timeout=_CONNECTION_SLOT_WAIT_SEC,
+                )
+                if self._transport_closed:
+                    raise RuntimeError("Gateway transport is closed.")
+                connections = self._active_connections.setdefault(client_id, {})
+            if len(connections) >= MAX_AGENT_GATEWAY_UNIX_CONNECTIONS_PER_CLIENT:
+                _LOGGER.warning(
+                    "Gateway connection limit reached: client_id=%s active=%d limit=%d",
+                    client_id,
+                    len(connections),
+                    MAX_AGENT_GATEWAY_UNIX_CONNECTIONS_PER_CLIENT,
+                )
                 raise PermissionError(
-                    "At most three persistent connections are allowed per client_id."
+                    "At most four persistent connections are allowed per client_id."
                 )
             connections[id(sock)] = sock
         try:
@@ -718,12 +745,13 @@ class AgentGatewayUnixJsonServer(
                         )
             return client_id, peer, facade
         except BaseException:
-            with self._connection_lock:
+            with self._connection_available:
                 connections = self._active_connections.get(client_id)
                 if connections is not None:
                     connections.pop(id(sock), None)
                     if not connections:
                         self._active_connections.pop(client_id, None)
+                    self._connection_available.notify_all()
             raise
 
     def _dispatch_request(
@@ -848,12 +876,13 @@ class AgentGatewayUnixJsonServer(
         sock: socket.socket,
         reason: str,
     ) -> None:
-        with self._connection_lock:
+        with self._connection_available:
             connections = self._active_connections.get(client_id)
             if connections is not None:
                 connections.pop(id(sock), None)
                 if not connections:
                     self._active_connections.pop(client_id, None)
+                self._connection_available.notify_all()
         outcome_accepted: bool | None = None
         outcome_reason: str | None = None
         error_type: str | None = None
@@ -904,10 +933,11 @@ class AgentGatewayUnixJsonServer(
                     self._gateway_close_complete = (
                         getattr(outcome, "accepted", None) is not False
                     )
-            if self._transport_closed:
-                return
-            self._transport_closed = True
-            with self._connection_lock:
+            with self._connection_available:
+                if self._transport_closed:
+                    return
+                self._transport_closed = True
+                self._connection_available.notify_all()
                 active_sockets = tuple(
                     sock
                     for connections in self._active_connections.values()
