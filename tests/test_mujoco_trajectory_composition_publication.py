@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import time
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -276,7 +275,16 @@ def _trajectory(
     )
 
 
+class ManualClock:
+    def __init__(self, value: float = 10.0) -> None:
+        self.value = float(value)
+
+    def __call__(self) -> float:
+        return self.value
+
+
 def _build_running_fixture():
+    clock = ManualClock()
     observation_plan = ExecutionObservationPlan(
         plan_id="locked-chunk-right-arm-fk-pose-observation",
         reference_mode="full_frames",
@@ -376,6 +384,7 @@ def _build_running_fixture():
         prepared_target=prepared,
         component_execution_binding=execution_binding,
         execution_observation_sink=observation_sink,
+        monotonic_clock=clock,
         composition_input_action_schema_by_role=(
             residual_profile.input_action_schema_by_role
         ),
@@ -424,7 +433,29 @@ def _build_running_fixture():
         },
     )
     composition.start()
-    return target, composition, residual_profile, schema, observation_sink
+    return target, composition, residual_profile, schema, observation_sink, clock
+
+
+def test_sim_hil_factory_rejects_invalid_clock_before_preparation(monkeypatch) -> None:
+    def unexpected_preparation(*_args, **_kwargs):
+        pytest.fail("invalid clock reached native target preparation")
+
+    monkeypatch.setattr(
+        "sim.mujoco.deploy.sim_hil_target.prepare_mujoco_sim_hil_target",
+        unexpected_preparation,
+    )
+    with pytest.raises(TypeError, match="monotonic_clock must be callable"):
+        build_mujoco_sim_hil_target(
+            config=MujocoSimHILTargetConfig(
+                task_config_path=Path(
+                    "sim/configs/tasks/"
+                    "rm65_right_cube_lift_rl_normal_contact_curriculum_v3.json"
+                )
+            ),
+            contracts=SimpleNamespace(),
+            hand_specs_by_side={},
+            monotonic_clock=None,
+        )
 
 
 def test_publication_profile_is_default_off_and_lazy() -> None:
@@ -491,7 +522,7 @@ def test_exact_trajectory_input_identity_cannot_be_silently_substituted() -> Non
 
 @pytest.mark.slow_sim
 def test_locked_chunk_residual_enters_existing_mujoco_chain_once() -> None:
-    target, composition, residual_profile, schema, observation_sink = (
+    target, composition, residual_profile, schema, observation_sink, clock = (
         _build_running_fixture()
     )
     session_controller = None
@@ -667,9 +698,9 @@ def test_locked_chunk_residual_enters_existing_mujoco_chain_once() -> None:
         assert controller.state.last_emitted_action_hash != (
             nominal_action.semantic_content_hash
         )
-        wait_sec = due_target - float(target.runtime.clock()) + 0.005
-        if wait_sec > 0.0:
-            time.sleep(wait_sec)
+        # Exercise the same target time and support margins independently of
+        # CPU scheduling; the native physics and all lifecycle gates stay live.
+        clock.value = max(clock.value, due_target + 0.005)
         execution = target.runtime.step(
             now=float(target.runtime.clock()),
             physics_ticks_after_dispatch=100,

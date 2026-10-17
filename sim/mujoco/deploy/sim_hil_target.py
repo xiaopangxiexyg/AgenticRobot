@@ -68,18 +68,23 @@ def build_mujoco_sim_hil_target(
     component_execution_binding: Any | None = None,
     execution_observation_sink: ExecutionObservationSink | None = None,
     trace_sink: Callable[[Any], None] | None = None,
+    monotonic_clock: Callable[[], float] = time.monotonic,
 ) -> MujocoSimHILTarget:
     """Build scene, shared safety, coupled IK and one deploy runtime.
 
     The composition contract is supplied by the application leaf as an
     opaque binding.  This target factory only uses its already-built strategy
     and compound authority profile; it does not define composition semantics.
+    One clock supplies rig, safety-anchor and runtime/handoff timestamps, so
+    offline callers can drive simulation time without mixing in host delays.
     """
 
     from .composition_binding import MujocoCompositionRuntimeConfig
 
     if not isinstance(config, MujocoSimHILTargetConfig):
         raise TypeError("config must be a MujocoSimHILTargetConfig.")
+    if not callable(monotonic_clock):
+        raise TypeError("monotonic_clock must be callable.")
     if not hasattr(contracts, "authority_profile") or not hasattr(
         contracts,
         "strategy",
@@ -190,6 +195,7 @@ def build_mujoco_sim_hil_target(
             realtime_worker=config.realtime_worker,
             follow_qpos_alpha=1.0,
         ),
+        monotonic_clock=monotonic_clock,
     )
     safety_profile = CanonicalKeyframeSafetyProfile(
         profile_id="control-station-mujoco-sim-hil-safety-v1",
@@ -206,7 +212,7 @@ def build_mujoco_sim_hil_target(
                 captured_scene,
                 task_config,
                 hand_specs,
-                now=time.monotonic(),
+                now=float(monotonic_clock()),
             )
         )
         return apply_canonical_keyframe_safety(
@@ -286,6 +292,7 @@ def build_mujoco_sim_hil_target(
             ),
             execution_observation_plan=config.execution_observation_plan,
         ),
+        clock=monotonic_clock,
         pose_resolver=MujocoCoupledPoseToQposResolver(
             ik,
             target_pose_smoother=(
