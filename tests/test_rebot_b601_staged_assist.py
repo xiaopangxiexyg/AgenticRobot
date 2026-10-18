@@ -166,7 +166,7 @@ def _held_runtime(direction=1, *, recovery=False, target=.1, feedback_gain=0., a
 
 def _held_tick(runtime, now, q, *, direction=1, speed=0., raw=0., span=.000384,
                ack=True, final=None, human=False, ack_delay=.001,
-               permission=None, target=.1, raw_limit=.05):
+               permission=None, target=.1, raw_limit=.05, dt_sec=.01):
     seq = round(now*1000)
     runtime.publish_policy(_command(seq, now, direction*target))
     positions = (0.,0.,direction*q,0.,0.,0.)
@@ -174,7 +174,7 @@ def _held_tick(runtime, now, q, *, direction=1, speed=0., raw=0., span=.000384,
     soft = (0.,0.,direction*speed,0.,0.,0.)
     frame = runtime.step(control_sequence=seq, control_timestamp_sec=now,
         measured_qpos_rad=positions, measured_qvel_rad_s=velocities,
-        dt_sec=.01, human_override_detected=human,
+        dt_sec=dt_sec, human_override_detected=human,
         control_qvel_rad_s=soft, control_qvel_window_span_sec=.08,
         tracking_recovery_permitted=(runtime.config.tracking_recovery_gain_nm_per_rad is not None if permission is None else permission),
         stop_evidence=B601WindowStopEvidence(now, positions, velocities,
@@ -1025,6 +1025,32 @@ def _arrival_runtime(direction=1, *, continuous_limit=None):
 
 
 @pytest.mark.parametrize("direction", [-1, 1])
+@pytest.mark.parametrize("interval", [.01, .025])
+def test_continuous_arrival_does_not_recharge_planned_velocity_cut_to_memory(direction, interval):
+    runtime, now, q, _ = _arrival_runtime(direction, continuous_limit=.05)
+    runtime._tracking_bias_nm = direction*.3
+    runtime._previous_overlay_nm = direction*.3
+    runtime._command_delta = (0., 0., direction*.3, 0., 0., 0.)
+    runtime._last_output_zero = runtime._final_zero_confirmed = False
+    # A prescribed constant-speed window isolates the receipt algebra. This
+    # is not a plant forecast: each receipt matches its preceding request.
+    for n in range(1, 9):
+        frame = _held_tick(runtime, now+n*interval, q, direction=direction,
+            target=.02, speed=.008, raw=.008, span=.0012, raw_limit=.13, dt_sec=interval)
+        assert frame.motion.arrival_stabilization_active
+        assert not frame.motion.arrival_unloading
+        assert frame.tracking_recovery["tracking_velocity_correction_nm"] > .05
+        assert frame.tracking_recovery["dispatch_tracking_cut_nm"] == pytest.approx(0.)
+        assert abs(runtime._tracking_bias_nm) == pytest.approx(.3-n*20.*.008*interval)
+    previous = abs(runtime._tracking_bias_nm)
+    runtime._command_delta = (0., 0., runtime._previous_overlay_nm-direction*.1, 0., 0., 0.)
+    frame = _held_tick(runtime, now+9*interval, q, direction=direction,
+        target=.02, speed=.008, raw=.008, span=.0012, raw_limit=.13, dt_sec=interval)
+    assert frame.tracking_recovery["dispatch_tracking_cut_nm"] == pytest.approx(.1)
+    assert abs(runtime._tracking_bias_nm) == pytest.approx(previous-.1-20.*.008*interval)
+
+
+@pytest.mark.parametrize("direction", [-1, 1])
 @pytest.mark.parametrize("sent", [.589663066342947, .4])
 def test_continuous_arrival_cannot_restore_latent_bias_or_conditioned_shortfall(direction, sent):
     runtime, now, frame = _recovery_track(direction, feedback_gain=10., target=.02,
@@ -1059,7 +1085,14 @@ def test_continuous_arrival_cannot_restore_latent_bias_or_conditioned_shortfall(
     for _ in range(250):
         now += .01
         frame = _held_tick(runtime, now, q, direction=direction, target=.02, raw_limit=.13)
-        assert abs(frame.overlay_torque_nm[2]) <= previous+1e-10
+        # Quieting the velocity correction is not final unloading. A bounded
+        # stabilization rise is permitted, but cannot restore the latent .86
+        # state or bypass the original slow-rise and final-unload contracts.
+        assert abs(runtime._tracking_bias_nm) <= sent+1e-10
+        if frame.motion.arrival_unloading:
+            assert abs(frame.overlay_torque_nm[2]) <= previous+1e-10
+        else:
+            assert abs(frame.overlay_torque_nm[2])-previous <= runtime.config.tracking_slew_nm_s*.01+1e-10
         previous = abs(frame.overlay_torque_nm[2])
         if frame.phase is B601StagedAssistPhase.SOFT_HOLD:
             break

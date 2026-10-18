@@ -1223,6 +1223,9 @@ class B601StagedSingleJointAssistRuntime:
             else motion.arrival_brake_error_rad
         )
         arrival_active = frontier_feedback and motion.arrival_stabilization_active
+        arrival_projection = (arrival_active and (
+            not str(previous_recovery.get("reason", "")).startswith("arrival_")
+            or motion.arrival_unloading))
         if ((self._phase is B601StagedAssistPhase.TRACK or arrival_active)
             and self._tracking_recovery_permitted
             and self._stop_evidence is not None
@@ -1264,11 +1267,13 @@ class B601StagedSingleJointAssistRuntime:
                 # maintenance first: total slew may not have served all PD.
                 # This can only CUT existing state, never copy PD or gravity
                 # into it. Velocity error below remains its only growth source.
-                if config.continuous_speed_limit_rad_s is not None and arrival_active:
+                if config.continuous_speed_limit_rad_s is not None and arrival_projection:
                     # Arrival must start from what was actually dispatched,
                     # not latent maintenance hidden behind TRACK regulation.
-                    # Reserve current same-direction PD first; this projection
-                    # can only cut memory, never learn PD or gravity as bias.
+                    # Project ON ENTRY, then again during final unloading.
+                    # Repeating this while stabilizing charges each intentional
+                    # velocity cut to memory a second time and loses support.
+                    # Final unloading cannot restore hidden drive from memory.
                     delivered_bias = max(0.0,
                         direction * self._command_delta[self.joint_index]
                         - max(0.0, direction * motion.requested_torque_nm))
@@ -1371,8 +1376,10 @@ class B601StagedSingleJointAssistRuntime:
             "velocity_feedback_cut_nm": feedback_cut,
             "antiwindup_cut_nm": antiwindup_cut,
             "dispatch_tracking_cut_nm": dispatch_tracking_cut,
-            "dispatch_credit_mode": ("arrival_reserve_pd_from_sent_total"
-                if arrival_active and config.continuous_speed_limit_rad_s is not None
+            "dispatch_credit_mode": ("arrival_unload_sent_total" if motion.arrival_unloading
+                and arrival_projection and config.continuous_speed_limit_rad_s is not None
+                else "arrival_entry_reserve_pd_from_sent_total"
+                if arrival_projection and config.continuous_speed_limit_rad_s is not None
                 else "receipt_shortfall_from_previous_owner_request"
                 if config.continuous_speed_limit_rad_s is not None
                 else "maintenance_first_bounded_by_sent_total" if frontier_feedback else "reserve_requested_pd_first"),

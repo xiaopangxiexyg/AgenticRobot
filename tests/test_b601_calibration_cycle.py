@@ -627,7 +627,7 @@ def test_normal_transfer_fall_is_finite_and_cannot_exceed_protective_braking_or_
 
 @pytest.mark.parametrize("continuous,friction,residual", [
     (False, .2, 0.), (False, .6, 0.),
-    (True, .2, 0.), (True, .6, 0.), (True, .2, .16),
+    (True, .2, 0.), (True, .6, 0.), (True, .2, .16), (True, .2, -.16),
 ])
 def test_transfer_native_owner_with_quantized_stiction_plant_reaches_twenty_degrees(tmp_path, friction, continuous, residual, record_property):
     # Synthetic mechanical stress model, not identified B601 dynamics. Native
