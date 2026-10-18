@@ -15,6 +15,18 @@ from agent_gateway.profiles.real.session_authorization import (
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
+@pytest.mark.parametrize("event", ["gateway_ready", "gateway_stopped"])
+def test_lifecycle_json_and_newline_are_written_together(monkeypatch, event):
+    writes = []
+    stream = SimpleNamespace(write=writes.append, flush=lambda: writes.append("flushed"))
+    monkeypatch.setattr(gateway_cli.sys, "stdout", stream)
+    payload = {"event": event, "routes": [{"route_id": "x" * 6000}]}
+    gateway_cli._emit_lifecycle_event(payload)
+    assert len(writes) == 2 and writes[1] == "flushed"
+    assert writes[0].endswith("\n")
+    assert json.loads(writes[0]) == payload
+
+
 def test_spatial_goal_cli_is_explicitly_optional():
     parser = gateway_cli.build_parser()
     assert parser.get_default("enable_spatial_goals") is False

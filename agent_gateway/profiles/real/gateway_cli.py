@@ -797,6 +797,13 @@ def _detach_motion_trace(
     return errors
 
 
+def _emit_lifecycle_event(payload: dict[str, Any]) -> None:
+    # print(payload) writes the JSON and newline separately. A background
+    # warning can land between them and corrupt a line-oriented event reader.
+    sys.stdout.write(json.dumps(payload, sort_keys=True) + "\n")
+    sys.stdout.flush()
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -1321,7 +1328,7 @@ def main(argv: list[str] | None = None) -> int:
             or not application_thread.is_alive()
         ):
             raise RuntimeError("real RM65 Skill application lost readiness")
-        print(json.dumps(_ready_payload(composition), sort_keys=True), flush=True)
+        _emit_lifecycle_event(_ready_payload(composition))
         if stop_requested.is_set():
             composition.application.request_shutdown()
         while application_thread.is_alive():
@@ -1363,7 +1370,7 @@ def main(argv: list[str] | None = None) -> int:
             motion_trace=motion_trace,
             motion_trace_close_error=motion_trace_close_error,
         )
-        print(json.dumps(stopped_payload, sort_keys=True), flush=True)
+        _emit_lifecycle_event(stopped_payload)
     if stopped_payload is None or not stopped_payload["safe_shutdown"]:
         raise RuntimeError(
             "real RM65 Skill Gateway stopped without lower safety-stop proof"
