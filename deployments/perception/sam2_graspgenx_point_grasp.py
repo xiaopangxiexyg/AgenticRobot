@@ -36,6 +36,7 @@ from .dmtac_grasp_overlay import (
     reviewed_graspgenx_dmtac_solid_geometry,
 )
 from .graspgenx_client import GraspGenXInferenceBackend
+from .grasp_planning_priority import GRASP_PLANNING_ORDER_FIELD, GRASP_PLANNING_ORDER_SCOPE
 from .sam2_vgn_point_grasp import (
     DEFAULT_DMTAC_M_URDF,
     DEFAULT_DMTAC_M_URDF_SHA256,
@@ -1971,10 +1972,15 @@ class Sam2GraspGenXPointGraspPlanner:
                         "candidate_selector diagnostics must be scalar arm_shortlist fields."
                     )
                 counts[key] = value
-            # Published candidates remain in descending proposal-score order so
-            # the existing point-grasp schema remains truthful. The selector
-            # admits a subset; the later reachability annotation does not reorder it.
-            selected_indices = tuple(sorted(selected_indices))
+            # Keep public score order and ordinal identity unchanged. Preserve
+            # the selector's independent preference in the frozen evidence so
+            # an automatic full-path caller need not undo the lower motion cost.
+            preferred_indices = selected_indices
+            selected_indices = tuple(sorted(preferred_indices))
+            published_ordinal = {index: ordinal for ordinal, index in enumerate(selected_indices)}
+            counts[GRASP_PLANNING_ORDER_FIELD] = json.dumps(
+                [published_ordinal[index] for index in preferred_indices], separators=(",", ":"))
+            counts["arm_shortlist_planning_order_scope"] = GRASP_PLANNING_ORDER_SCOPE
         else:
             # Without an embodiment selector, preserve the generic perception
             # shortlist and reserve bounded capacity for physically re-admitted

@@ -24,6 +24,7 @@ from agent_gateway.profiles.real.rm65_grasp_reachability import RM65PointGraspRe
 from agent_gateway.profiles.real.station_point_grasp_deployment import StationPointGraspArmReachabilityProfile
 from deployments.perception.dmtac_grasp_overlay import reviewed_graspgenx_dmtac_solid_geometry
 from deployments.perception.grasp_multiview import GraspRgbdView, fuse_grasp_views
+from deployments.perception.grasp_planning_priority import grasp_planning_candidate_ordinals
 from deployments.perception.sam2_graspgenx_point_grasp import (
     GraspGenXPointGraspModelSpec, Sam2GraspGenXPointGraspPlanner,
     GRASPGENX_DMTAC_REACHABILITY_ORIENTATION_VARIANTS_LOCAL_AXIS_DEG,
@@ -252,7 +253,13 @@ def replay(args):
             world_from_station = profile.scene_world_from_canonical_station
             scene = VisibleGraspScene(points=fused.scene.points @ world_from_station[:3, :3].T + world_from_station[:3, 3],
                 target_mask=fused.scene.target_mask, geometry=fused.scene.geometry, capture_qpos_by_side=qpos)
-            for index, candidate in enumerate(grasps.candidates[:args.plan_candidates]):
+            planning_order = grasp_planning_candidate_ordinals(
+                point.last_filter_summary, candidate_count=len(grasps.candidates))
+            if planning_order is None:
+                planning_order = tuple(range(len(grasps.candidates)))
+            result["planning_candidate_ordinals"] = planning_order
+            for index in planning_order[:args.plan_candidates]:
+                candidate = grasps.candidates[index]
                 plan_started = time.perf_counter()
                 print(f"[{side}] full path planning candidate={index}", flush=True)
                 try:

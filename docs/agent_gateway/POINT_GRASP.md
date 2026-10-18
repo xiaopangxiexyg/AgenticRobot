@@ -519,6 +519,13 @@ owner 已复制的只读 qpos，不能当作完整计划、当前准入结论或
 `planning_timing.local_chain_reuse_count` 和 `local_chain_revalidation_wall_duration_sec` 区分
 命中次数及重新检查耗时。冻结输入的缓存命中收益不代表真实设备上一定命中。
 
+公共候选仍按 proposal 分数降序，显示序号、分数和位姿不变。为保留局部链选择器的规划偏好，
+同一结果的 `candidate_filter_summary.arm_shortlist_planning_order_json` 保存返回候选序号的完整排列，
+`arm_shortlist_planning_order_scope` 固定为 `selector_preference_not_path_or_execution_authority`。
+冻结 RGB-D Artifact 随原 capture/result 保留该建议；调用方必须先核对来源绑定。字段缺失时沿用
+既有选择方式，字段存在但范围或排列损坏时明确失败。离线双臂回放按此建议请求完整路径并记录
+原显示序号，每个候选仍经过原规划、碰撞和包络检查；这项建议不证明路径通过，也不授权执行。
+
 #### 线缆掩码诊断（离线，不改变碰撞场景）
 
 `deployments.perception.cable_diagnostics` 提供纯数组诊断，不启动模型或设备，也不接入生产删点：

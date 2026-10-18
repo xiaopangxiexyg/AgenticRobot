@@ -48,6 +48,9 @@ from deployments.perception.dmtac_grasp_overlay import (
     reviewed_graspgenx_dmtac_solid_geometry,
 )
 from robot_motion.grasp_visible_scene import VisibleGraspScene
+from deployments.perception.grasp_planning_priority import (
+    GRASP_PLANNING_ORDER_FIELD, GRASP_PLANNING_ORDER_SCOPE, grasp_planning_candidate_ordinals,
+)
 
 
 class _FakeSocket:
@@ -1329,3 +1332,59 @@ def test_pose_duplicate_comparison_matches_componentwise_threshold(offset, compo
     assert _pose_is_duplicate(first, [second]) is expected
     assert _pose_is_duplicate(first, np.asarray([second])) is expected
     assert _pose_is_duplicate(first, []) is False
+
+
+def test_selector_planning_priority_survives_public_score_order_without_changing_poses(tmp_path):
+    depth = np.zeros((20, 20), dtype=np.float32)
+    depth[8:13, 8:13] = 1.
+    poses = np.repeat(np.eye(4)[None], 3, axis=0)
+    poses[:, 2, 3] = .975
+    poses[:, 0, 3] = (-.004, 0., .004)
+    planner = Sam2GraspGenXPointGraspPlanner(model_spec=_model_spec(tmp_path),
+        point_segmenter=_Segmenter(depth > 0), client=_PlannerClient(poses, np.array([.9, .8, .7])))
+    selected = []
+
+    def select(pool, _target, _maximum):
+        indices = tuple(next(index for index, candidate in enumerate(pool)
+            if candidate.pose_source == "model_scored" and candidate.model_score == score)
+            for score in (.9, .7))
+        selected.extend(pool[index] for index in indices)
+        return GraspGenXCandidateSelection(indices[::-1], {})
+
+    planner.start()
+    options = {"pixel_uv": (10, 10), "intrinsics": {"width": 20, "height": 20,
+        "fx": 100., "fy": 100., "cx": 10., "cy": 10.}, "base_from_camera": np.eye(4), "max_candidates": 2}
+    image = Image.new("RGB", (20, 20))
+    try:
+        result = planner.plan(image, depth, candidate_selector=select, **options)
+        assert [c.model_score for c in result.candidates] == [.9, .7]
+        assert result.candidates[0].score > result.candidates[1].score
+        for actual, expected in zip(result.candidates, selected, strict=True):
+            assert actual.base_from_tcp == expected.base_from_tcp
+            assert actual.camera_from_tcp == expected.camera_from_tcp
+        assert grasp_planning_candidate_ordinals(planner.last_filter_summary, candidate_count=2) == (1, 0)
+        # A later unembodied request cannot inherit the previous recommendation.
+        planner.plan(image, depth, **options)
+        assert grasp_planning_candidate_ordinals(planner.last_filter_summary, candidate_count=2) is None
+    finally:
+        planner.close()
+
+
+@pytest.mark.parametrize("encoded", ('[0,0]', '[0]', '[0,2]', '[false,1]', 'null', '{}', 'not-json'))
+def test_present_corrupt_planning_priority_is_not_silently_ignored(encoded):
+    with pytest.raises(ValueError):
+        grasp_planning_candidate_ordinals({GRASP_PLANNING_ORDER_FIELD: encoded,
+            "arm_shortlist_planning_order_scope": GRASP_PLANNING_ORDER_SCOPE}, candidate_count=2)
+
+
+def test_planning_priority_is_advisory_and_optional_for_existing_producers():
+    assert grasp_planning_candidate_ordinals({}, candidate_count=2) is None
+    with pytest.raises(ValueError, match="scope"):
+        grasp_planning_candidate_ordinals({GRASP_PLANNING_ORDER_FIELD: '[1,0]',
+            "arm_shortlist_planning_order_scope": "full_path_validated"}, candidate_count=2)
+    with pytest.raises(TypeError, match="JSON text"):
+        grasp_planning_candidate_ordinals({GRASP_PLANNING_ORDER_FIELD: [1, 0],
+            "arm_shortlist_planning_order_scope": GRASP_PLANNING_ORDER_SCOPE}, candidate_count=2)
+    for count in (-1, True, 1.5):
+        with pytest.raises(ValueError, match="candidate_count"):
+            grasp_planning_candidate_ordinals({}, candidate_count=count)

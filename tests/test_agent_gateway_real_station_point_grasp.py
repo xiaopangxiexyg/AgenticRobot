@@ -974,6 +974,9 @@ def test_graspgenx_capture_snapshot_artifact_is_replayed_through_real_profile(
     from dataset_contracts.grasp_rgbd_snapshot import decode_grasp_rgbd_snapshot
 
     source, _, planner, registration, provider = _provider_stack(backend_id="graspgenx")
+    from deployments.perception.grasp_planning_priority import GRASP_PLANNING_ORDER_SCOPE
+    planner.last_filter_summary = {"arm_shortlist_planning_order_json": "[0]",
+        "arm_shortlist_planning_order_scope": GRASP_PLANNING_ORDER_SCOPE}
     if cad_bound:
         from deployments.perception.dmtac_grasp_overlay import (
             reviewed_4b2_cad_solid_geometry,
@@ -1011,6 +1014,8 @@ def test_graspgenx_capture_snapshot_artifact_is_replayed_through_real_profile(
     assert source.read_count == 1
     assert arrays["depth_m"].shape == (3, 4)
     assert metadata["capture"] == result.execution_result
+    assert metadata["candidate_filter_summary"] == planner.last_filter_summary
+    assert "planning_candidate_ordinals" not in result.execution_result
     assert metadata["measured_qpos"] is None
     assert arrays["left_qpos"].size == arrays["right_qpos"].size == 0
     reader = build_grasp_visible_scene_reader(
