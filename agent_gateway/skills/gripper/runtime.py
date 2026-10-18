@@ -42,7 +42,10 @@ from agent_gateway.transport.unix_transport import (
 )
 from agent_gateway.transport.wire_adapter import BoundAgentGatewayWireAdapter
 
-from .definition import SET_GRIPPER_STATE_RESULT_SCHEMA_V1
+from .definition import (
+    SET_GRIPPER_STATE_RESULT_SCHEMA_V1,
+    SET_GRIPPER_STATE_RESULT_SCHEMA_V2,
+)
 from .deployment import GripperSkillContractBundle
 
 
@@ -160,6 +163,31 @@ class GripperHoldReceipt:
         )
 
 
+def hold_gripper_ports(
+    *, ports: Mapping[str, GripperControlPort], reason: str
+) -> GripperHoldReceipt:
+    """Attempt every configured stop, preserving the first process interrupt."""
+    if not ports:
+        raise ValueError("Gripper stop requires configured ports.")
+    receipts, errors = [], []
+    interrupted = None
+    for component, port in ports.items():
+        try:
+            receipts.append(port.hold(reason=reason))
+        except (KeyboardInterrupt, SystemExit) as error:
+            if interrupted is None:
+                interrupted = error
+        except Exception as error:  # noqa: BLE001 - all independent stops must run.
+            errors.append(f"{component}:{type(error).__name__}:{error}")
+    if interrupted is not None:
+        raise interrupted
+    if errors:
+        raise RuntimeError("Gripper stop failed: " + "; ".join(errors))
+    return GripperHoldReceipt(
+        all(item.succeeded for item in receipts),
+        tuple(ref for item in receipts for ref in item.evidence_refs),
+    )
+
 @runtime_checkable
 class GripperControlPort(Protocol):
     component_id: str
@@ -230,9 +258,8 @@ class GripperSkillLifecycle:
             raise TypeError("convergence must be typed.")
         binding = contract_bundle.deployment_binding
         if (
-            port.component_id != binding.component_id
-            or port.target_kind != binding.target_kind
-            or port.port_binding_hash != binding.port_binding_hash
+            port.target_kind != binding.target_kind
+            or port.port_binding_hash != binding.port_hash_for(port.component_id)
         ):
             raise ValueError("port identity does not match deployment binding.")
         if not callable(clock) or not callable(sleep):
@@ -275,6 +302,11 @@ class GripperSkillLifecycle:
         )
         if not all(checks):
             raise ValueError("request does not bind this exact gripper lifecycle.")
+        if (
+            self.deployment_binding.skill_version == "2"
+            and request.parameters["component_id"] != self.port.component_id
+        ):
+            raise ValueError("request selected a different gripper.")
 
     def _ensure_hold(self, reason: str) -> GripperHoldReceipt:
         with self._lock:
@@ -458,8 +490,10 @@ class GripperSkillLifecycle:
                 evidence_refs=tuple(evidence),
             )
         result = {
-            "schema_version": SET_GRIPPER_STATE_RESULT_SCHEMA_V1,
-            "component_id": self.deployment_binding.component_id,
+            "schema_version": SET_GRIPPER_STATE_RESULT_SCHEMA_V1
+            if self.deployment_binding.skill_version == "1"
+            else SET_GRIPPER_STATE_RESULT_SCHEMA_V2,
+            "component_id": self.port.component_id,
             "commanded_state": target_state,
             "measured_close": final_sample.measured_close,
             "completion_kind": completion_kind,
@@ -530,12 +564,13 @@ class GripperSkillLifecycle:
 @dataclass
 class GripperAgentGatewaySession:
     contract_bundle: GripperSkillContractBundle
-    port: GripperControlPort
+    port: GripperControlPort | None
     executor: ReusableStationAgentSkillOperationExecutor
     service: AgentGatewayService
     current_station_revision: Callable[[], int]
     clock: Callable[[], float]
     clock_domain_id: str
+    ports: Mapping[str, GripperControlPort] = field(default_factory=dict)
     _snapshot_sequence: int = field(default=0, init=False, repr=False)
     _snapshot_lock: threading.Lock = field(
         default_factory=threading.Lock, init=False, repr=False
@@ -548,8 +583,34 @@ class GripperAgentGatewaySession:
     )
 
     def _publish_observation_outcome(self) -> AgentGatewayObservationOutcome:
-        sample = self.port.observe_state()
         binding = self.contract_bundle.deployment_binding
+        if binding.skill_version == "1":
+            sample = self.port.observe_state()
+            summary = {
+                "component_id": binding.component_id,
+                "measured_close": sample.measured_close,
+                "moving": sample.moving,
+                "fault_code": sample.fault_code,
+                "evidence_ref": sample.evidence_ref,
+            }
+            captured_at, fault_code = sample.observed_at, sample.fault_code
+        else:
+            samples = {key: port.observe_state() for key, port in self.ports.items()}
+            summary = {
+                "gripper_states_by_component": {
+                    key: {
+                        "measured_close": item.measured_close,
+                        "moving": item.moving,
+                        "fault_code": item.fault_code,
+                        "evidence_ref": item.evidence_ref,
+                    }
+                    for key, item in samples.items()
+                }
+            }
+            captured_at = min(item.observed_at for item in samples.values())
+            fault_code = next(
+                (item.fault_code for item in samples.values() if item.fault_code), None
+            )
         revision = int(self.current_station_revision())
         with self._snapshot_lock:
             self._snapshot_sequence += 1
@@ -559,14 +620,14 @@ class GripperAgentGatewaySession:
             runtime_session_id=binding.runtime_session_id,
             skill_route_manifest_hash=self.contract_bundle.route_manifest.semantic_content_hash,
             station_revision=revision,
-            captured_at=sample.observed_at,
-            available_at=max(sample.observed_at, float(self.clock())),
+            captured_at=captured_at,
+            available_at=max(captured_at, float(self.clock())),
             clock_domain_id=self.clock_domain_id,
             authority_epoch=0,
             execution_epoch=0,
             dispatch_owner_generation=0,
-            lifecycle_state="active" if sample.fault_code is None else "fault",
-            execution_gate="run" if sample.fault_code is None else "hold",
+            lifecycle_state="active" if fault_code is None else "fault",
+            execution_gate="run" if fault_code is None else "hold",
             active_operation_id=self.service.operation_store.active_operation_id,
             source_binding_id=None,
             producer_epoch=None,
@@ -575,16 +636,10 @@ class GripperAgentGatewaySession:
             frame_graph_hash="not-applicable:gripper-only",
             tool_config_hash=binding.port_binding_hash,
             calibration_hash=binding.port_binding_hash,
-            measurement_summary={
-                "component_id": binding.component_id,
-                "measured_close": sample.measured_close,
-                "moving": sample.moving,
-                "fault_code": sample.fault_code,
-                "evidence_ref": sample.evidence_ref,
-            },
+            measurement_summary=summary,
             measurement_freshness_ms=0,
-            measurement_valid=sample.fault_code is None,
-            fault_class=sample.fault_code,
+            measurement_valid=fault_code is None,
+            fault_class=fault_code,
             fault_rearmable=False,
         )
         return self.service.publish_observation(
@@ -643,16 +698,20 @@ class GripperAgentGatewaySession:
     def close(self) -> AgentGatewayOperationOutcome:
         with self._close_lock:
             if self._close_outcome is None:
-                self._close_outcome = self.service.close(
+                outcome = self.service.close(
                     current_station_revision=int(self.current_station_revision())
                 )
+                if not outcome.accepted:
+                    return outcome
+                self._close_outcome = outcome
             return self._close_outcome
 
 
 def build_gripper_skill_executor(
     *,
     contract_bundle: GripperSkillContractBundle,
-    port: GripperControlPort,
+    port: GripperControlPort | None = None,
+    ports: Mapping[str, GripperControlPort] | None = None,
     current_station_revision: Callable[[], int],
     convergence: GripperConvergenceProfile | None = None,
     domain_hold: Callable[..., StationLifecycleControlEvidence] | None = None,
@@ -662,26 +721,40 @@ def build_gripper_skill_executor(
     """Bind the existing lifecycle to a standalone or composed Gateway owner."""
     if not isinstance(contract_bundle, GripperSkillContractBundle):
         raise TypeError("contract_bundle must be typed.")
-    if not isinstance(port, GripperControlPort):
-        raise TypeError("port must implement GripperControlPort.")
     convergence = GripperConvergenceProfile() if convergence is None else convergence
     if not isinstance(convergence, GripperConvergenceProfile):
         raise TypeError("convergence must be a GripperConvergenceProfile.")
     binding = contract_bundle.deployment_binding
     route = contract_bundle.route_manifest.skill_routes[0].route
 
-    if (
-        port.component_id != binding.component_id
-        or port.target_kind != binding.target_kind
-        or port.port_binding_hash != binding.port_binding_hash
-    ):
-        raise ValueError("port identity does not match deployment binding.")
+    if binding.skill_version == "1":
+        if ports is not None or not isinstance(port, GripperControlPort):
+            raise TypeError("v1 requires exactly one gripper port.")
+        selected_ports = {port.component_id: port}
+    else:
+        if port is not None or set(ports or {}) != set(
+            binding.port_binding_hash_by_component
+        ):
+            raise ValueError("v2 requires the exact configured left and right ports.")
+        selected_ports = dict(ports)
+    for component, item in selected_ports.items():
+        if (
+            not isinstance(item, GripperControlPort)
+            or item.component_id != component
+            or item.target_kind != binding.target_kind
+            or item.port_binding_hash != binding.port_hash_for(component)
+        ):
+            raise ValueError("port identity does not match deployment binding.")
     if not callable(clock) or not callable(sleep):
         raise TypeError("clock and sleep must be callable.")
 
-    def lifecycle_factory(**_kwargs: Any) -> GripperSkillLifecycle:
+    def lifecycle_factory(
+        *, request: AgentSkillRequest, **_kwargs: Any
+    ) -> GripperSkillLifecycle:
         return GripperSkillLifecycle(
-            port=port,
+            port=selected_ports[request.parameters["component_id"]]
+            if binding.skill_version == "2"
+            else port,
             contract_bundle=contract_bundle,
             convergence=convergence,
             clock=clock,
@@ -689,7 +762,10 @@ def build_gripper_skill_executor(
         )
 
     def gripper_hold(**kwargs: Any) -> StationLifecycleControlEvidence:
-        hold = port.hold(reason=_required(kwargs["reason"], field_name="reason"))
+        hold = hold_gripper_ports(
+            ports=selected_ports,
+            reason=_required(kwargs["reason"], field_name="reason"),
+        )
         return StationLifecycleControlEvidence(
             succeeded=hold.succeeded,
             status="gripper_domain_hold_confirmed"
@@ -722,7 +798,8 @@ def build_gripper_skill_executor(
 def assemble_gripper_agent_gateway_session(
     *,
     contract_bundle: GripperSkillContractBundle,
-    port: GripperControlPort,
+    port: GripperControlPort | None = None,
+    ports: Mapping[str, GripperControlPort] | None = None,
     allowed_client_ids: tuple[str, ...],
     current_station_revision: Callable[[], int],
     clock_domain_id: str,
@@ -732,8 +809,6 @@ def assemble_gripper_agent_gateway_session(
 ) -> GripperAgentGatewaySession:
     if not isinstance(contract_bundle, GripperSkillContractBundle):
         raise TypeError("contract_bundle must be typed.")
-    if not isinstance(port, GripperControlPort):
-        raise TypeError("port must implement GripperControlPort.")
     if convergence is None:
         convergence = GripperConvergenceProfile()
     elif not isinstance(convergence, GripperConvergenceProfile):
@@ -748,6 +823,7 @@ def assemble_gripper_agent_gateway_session(
     executor = build_gripper_skill_executor(
         contract_bundle=contract_bundle,
         port=port,
+        ports=ports,
         convergence=convergence,
         current_station_revision=current_station_revision,
         clock=clock,
@@ -782,6 +858,7 @@ def assemble_gripper_agent_gateway_session(
         clock_domain_id=_required(clock_domain_id, field_name="clock_domain_id"),
     )
     return GripperAgentGatewaySession(
+        ports=dict(ports or {}),
         contract_bundle=contract_bundle,
         port=port,
         executor=executor,
@@ -803,4 +880,5 @@ __all__ = [
     "GripperStateSample",
     "assemble_gripper_agent_gateway_session",
     "build_gripper_skill_executor",
+    "hold_gripper_ports",
 ]

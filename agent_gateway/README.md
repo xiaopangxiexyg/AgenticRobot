@@ -1051,6 +1051,15 @@ action is the distinct `execute_grasp_approach_plan`; authorizing the legacy
 仅当控制运行时从未启动、入口未发布且 Gateway 从未接纳请求时，才允许无 HOLD 的构造资源清理；
 已取得控制资源的正常关闭仍须确认原有下层 HOLD，线程关闭以实际完成凭据为准。
 
+#### 显式夹爪 v2 合同基础
+
+`manipulation.set_gripper_state@1` 及现有右夹爪接入保持默认行为。
+可选 v2 必须显式构造双夹爪 deployment、绑定两侧独立 port，并在请求中同时给出
+`component_id`（`left_gripper` / `right_gripper`）和 `target_state`。
+定义、schema、Route、结果验证与执行器按同一版本闭合；v1 不接受该新增字段。
+本批提供中立执行器及 MuJoCo 双夹爪验证基础；真机 CLI 和组合入口尚未启用 v2。
+两版复用原有收敛、取消与下层 HOLD 确认，任何一侧停机失败都不能宣称组合安全。
+
 #### 可选右夹爪接入
 
 `real-rm65 --right-gripper-config /absolute/right-gripper.json` 使用既有

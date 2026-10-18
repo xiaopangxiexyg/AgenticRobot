@@ -6,6 +6,7 @@ import logging
 import math
 import time
 from collections.abc import Callable, Mapping
+from pathlib import Path
 from typing import Any
 
 from agent_gateway.skills.gripper.deployment import (
@@ -20,6 +21,7 @@ from agent_gateway.skills.gripper.runtime import (
     GripperReadiness,
     GripperStateSample,
     assemble_gripper_agent_gateway_session,
+    hold_gripper_ports,
 )
 from dataset_contracts.canonical_encoding import canonical_content_hash
 
@@ -34,6 +36,7 @@ class RealDmtacGripperControlPort:
 
     def __init__(
         self, *, backend: Any, clock=time.monotonic,
+        component_id: str = "right_gripper",
         command_submission_timeout_sec: float = 0.1,
         hold_confirmation_timeout_sec: float = 0.5,
     ) -> None:
@@ -65,11 +68,14 @@ class RealDmtacGripperControlPort:
         self._last_hold_receipt: GripperHoldReceipt | None = None
         config = getattr(backend, "config", None)
         side = str(getattr(config, "side", "right"))
-        if side != "right":
+        if component_id not in {"left_gripper", "right_gripper"}:
+            raise ValueError("component_id must identify a left or right gripper.")
+        if side + "_gripper" != component_id:
             raise ValueError(
-                "real gripper Skill is bound to right_gripper; "
-                f"backend side must be 'right', got {side!r}."
+                f"real gripper Skill is bound to {component_id}; "
+                f"backend side does not match: {side!r}."
             )
+        self.component_id = component_id
         if bool(getattr(config, "observation_only", False)):
             raise ValueError(
                 "real gripper Skill cannot use an observation-only backend."
@@ -103,7 +109,8 @@ class RealDmtacGripperControlPort:
     def _ref(self, kind: str, payload: dict[str, object]) -> str:
         self._sequence += 1
         digest = canonical_content_hash(
-            {"kind": kind, "sequence": self._sequence, **payload},
+            {"kind": kind, "sequence": self._sequence,
+             "component_id": self.component_id, **payload},
             domain="dexteleop.real.gripper_skill_evidence.v1",
         )
         return f"dmtac-gripper-{kind}:{digest}"
@@ -117,7 +124,7 @@ class RealDmtacGripperControlPort:
         )
         return GripperReadiness(
             ready=ready,
-            lower_operation_id="dmtac-gripper:live-session",
+            lower_operation_id=f"dmtac-gripper:{self.component_id}:live-session",
             evidence_refs=(ref,),
         )
 
@@ -303,26 +310,50 @@ class RealDmtacGripperControlPort:
         return self._last_hold_receipt
 
 
-def stop_arm_and_gripper(
-    *, arm_stop: Callable[[], Any], port: RealDmtacGripperControlPort, reason: str
+def stop_arm_and_grippers(
+    *,
+    arm_stop: Callable[[], Any],
+    ports: Mapping[str, RealDmtacGripperControlPort],
+    reason: str,
 ) -> tuple[Any, GripperHoldReceipt]:
     """Attempt both independent stop boundaries; surface all failed calls."""
+    if not ports:
+        raise ValueError("Composed gripper stop requires configured hands.")
     errors = []
-    arm = hand = None
+    interrupted = None
+    arm = None
+    hand_hold = None
     try:
         arm = arm_stop()
+    except (KeyboardInterrupt, SystemExit) as error:
+        if interrupted is None:
+            interrupted = error
     except Exception as error:  # noqa: BLE001 - one failed stop must not omit the other.
         errors.append(error)
     try:
-        hand = port.hold(reason=reason)
-    except Exception as error:  # noqa: BLE001 - report partial stop without claiming safety.
+        hand_hold = hold_gripper_ports(ports=ports, reason=reason)
+    except (KeyboardInterrupt, SystemExit) as error:
+        if interrupted is None:
+            interrupted = error
+    except Exception as error:  # noqa: BLE001 - both lower stop attempts must run.
         errors.append(error)
+    if interrupted is not None:
+        raise interrupted
     if errors:
         raise RuntimeError(
             "Composed stop failed: " + "; ".join(str(error) for error in errors)
         ) from errors[0]
-    return arm, hand
+    return arm, hand_hold
 
+
+
+def stop_arm_and_gripper(
+    *, arm_stop: Callable[[], Any], port: RealDmtacGripperControlPort, reason: str
+) -> tuple[Any, GripperHoldReceipt]:
+    """Retain the v1 single-hand caller on the shared stop boundary."""
+    return stop_arm_and_grippers(
+        arm_stop=arm_stop, ports={port.component_id: port}, reason=reason
+    )
 
 class ExclusiveRealGripperResources:
     """Own the optional hand beside the existing lower application resources."""
@@ -392,6 +423,50 @@ class ExclusiveRealGripperResources:
             self._lower_closed = True
 
 
+def build_real_dmtac_grippers_skill_contract_bundle(
+    *,
+    runtime_session_id: str,
+    control_domain_id: str,
+    target_binding_id: str,
+    station_manifest_hash: str,
+    execution_manifest_hash: str,
+    ports: Mapping[str, RealDmtacGripperControlPort],
+) -> GripperSkillContractBundle:
+    if set(ports) != {"left_gripper", "right_gripper"} or any(
+        key != port.component_id for key, port in ports.items()
+    ):
+        raise ValueError(
+            "The composed gripper deployment requires both correctly bound hands."
+        )
+    paths = [
+        str(Path(port.backend.config.gripper_port).resolve()) for port in ports.values()
+    ]
+    if len(set(paths)) != len(paths):
+        raise ValueError(
+            "Left and right grippers cannot independently own the same serial port."
+        )
+    hashes = {key: port.port_binding_hash for key, port in ports.items()}
+    return build_gripper_skill_contract_bundle(
+        GripperSkillDeploymentBinding(
+            runtime_session_id=runtime_session_id,
+            control_domain_id=control_domain_id,
+            component_id="grippers",
+            target_binding_id=target_binding_id,
+            target_kind="real",
+            current_mode="real_active",
+            executor_id="real.dmtac-grippers-control.v2",
+            port_binding_hash=canonical_content_hash(
+                hashes, domain="dexteleop.gripper_ports.v2"
+            ),
+            station_manifest_hash=station_manifest_hash,
+            execution_manifest_hash=execution_manifest_hash,
+            skill_version="2",
+            port_binding_hash_by_component=hashes,
+        )
+    )
+
+
+
 def build_real_dmtac_gripper_skill_contract_bundle(
     *,
     runtime_session_id: str,
@@ -456,4 +531,5 @@ __all__ = [
     "RealDmtacGripperControlPort",
     "assemble_real_dmtac_gripper_agent_gateway_session",
     "build_real_dmtac_gripper_skill_contract_bundle",
+    "build_real_dmtac_grippers_skill_contract_bundle",
 ]

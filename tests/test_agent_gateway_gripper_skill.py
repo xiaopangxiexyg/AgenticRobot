@@ -13,10 +13,14 @@ from agent_gateway.profiles.real.gripper_skill import (
     RealDmtacGripperControlPort,
     build_real_dmtac_gripper_skill_contract_bundle,
     stop_arm_and_gripper,
+    stop_arm_and_grippers,
+    build_real_dmtac_grippers_skill_contract_bundle,
 )
 from agent_gateway.protocol.contracts import AgentSkillOperation, AgentSkillRequest
 from agent_gateway.skills.gripper.definition import (
     SET_GRIPPER_STATE_RESULT_SCHEMA_V1,
+    validate_set_gripper_state_parameters_v2,
+    validate_set_gripper_state_result_for_parameters_v2,
     validate_set_gripper_state_result_for_parameters_v1,
 )
 from agent_gateway.skills.gripper.deployment import (
@@ -1037,3 +1041,137 @@ def test_real_gripper_binding_identifies_its_wait_budget(name):
     assert default.port_binding_hash != changed.port_binding_hash
     assert default.component_id == changed.component_id == "right_gripper"
     assert backend.commands == backend.holds == []
+
+
+@pytest.mark.parametrize(
+    "parameters",
+    [
+        {"target_state": "closed"},
+        {"component_id": "both", "target_state": "closed"},
+        {"component_id": "left_gripper", "target_state": "closed", "speed": 1.0},
+    ],
+)
+def test_v2_requires_one_explicit_hand_and_does_not_allow_extra_command_settings(
+    parameters,
+):
+    with pytest.raises(ValueError):
+        validate_set_gripper_state_parameters_v2(parameters)
+
+
+
+def test_v2_feedback_must_belong_to_the_selected_hand():
+    result = {
+        "schema_version": "dexteleop.agent_skill.set_gripper_state_result.v2",
+        "component_id": "right_gripper",
+        "commanded_state": "closed",
+        "measured_close": 0.5,
+        "completion_kind": "settled_before_full_close",
+        "terminal_hold_confirmed": True,
+    }
+    with pytest.raises(ValueError, match="selected gripper"):
+        validate_set_gripper_state_result_for_parameters_v2(
+            {"component_id": "left_gripper", "target_state": "closed"}, result
+        )
+
+
+
+def test_gripper_session_retries_unconfirmed_shutdown_instead_of_caching_failure():
+    port = FakeGripperPort([(0.0, False)])
+    original_hold = port.hold
+    port.hold = lambda **kwargs: GripperHoldReceipt(False, ("stop-not-proved",))
+    session = assemble_gripper_agent_gateway_session(
+        contract_bundle=_sim_bundle(port),
+        port=port,
+        allowed_client_ids=("client:test",),
+        current_station_revision=lambda: 0,
+        clock_domain_id="clock:test",
+    )
+    assert not session.close().accepted
+    port.hold = original_hold
+    assert session.close().accepted
+
+
+
+def test_failure_to_stop_one_hand_still_attempts_the_other_and_does_not_claim_safety():
+    left = _FakeDmtacBackend()
+    left.config.side = "left"
+    right = _FakeDmtacBackend()
+    left.hold_gripper_motion = lambda reason: (_ for _ in ()).throw(
+        RuntimeError("left serial failed")
+    )
+    ports = {
+        "left_gripper": RealDmtacGripperControlPort(backend=left, component_id="left_gripper"),
+        "right_gripper": RealDmtacGripperControlPort(backend=right),
+    }
+    with pytest.raises(RuntimeError, match="left serial failed"):
+        stop_arm_and_grippers(
+            arm_stop=lambda: "arm stopped", ports=ports, reason="cancel"
+        )
+    assert right.holds == ["cancel"]
+    assert ports["left_gripper"].last_hold_receipt is None
+    assert ports["right_gripper"].last_hold_receipt.succeeded
+
+
+
+def test_two_gripper_contract_rejects_duplicate_serial_ownership_without_device_io():
+    left = _FakeDmtacBackend()
+    left.config.side = "left"
+    right = _FakeDmtacBackend()
+    ports = {
+        "left_gripper": RealDmtacGripperControlPort(backend=left, component_id="left_gripper"),
+        "right_gripper": RealDmtacGripperControlPort(backend=right),
+    }
+    with pytest.raises(ValueError, match="same serial port"):
+        build_real_dmtac_grippers_skill_contract_bundle(
+            runtime_session_id="runtime:test",
+            control_domain_id="domain:test",
+            target_binding_id="target:test",
+            station_manifest_hash="station:test",
+            execution_manifest_hash="execution:test",
+            ports=ports,
+        )
+    assert left.events == right.events == []
+
+
+
+@pytest.mark.parametrize("interrupt_type", [KeyboardInterrupt, SystemExit])
+@pytest.mark.parametrize("boundary", ["arm", "left"])
+def test_bilateral_stop_attempts_all_boundaries_before_reraising_interrupt(interrupt_type, boundary):
+    from agent_gateway.skills.gripper.runtime import hold_gripper_ports
+
+    calls = []
+    original = interrupt_type("interrupt stop")
+
+    def stop(name):
+        calls.append(name)
+        if name == boundary:
+            raise original
+        return GripperHoldReceipt(True, ("stop:"+name,))
+
+    ports = {name: SimpleNamespace(hold=lambda reason, name=name: stop(name))
+             for name in ("left", "right")}
+    with pytest.raises(interrupt_type) as captured:
+        stop_arm_and_grippers(arm_stop=lambda: stop("arm"), ports=ports, reason="cancel")
+    assert captured.value is original
+    assert calls == ["arm", "left", "right"]
+    if boundary == "left":
+        calls.clear()
+        with pytest.raises(interrupt_type) as captured:
+            hold_gripper_ports(ports=ports, reason="shutdown")
+        assert captured.value is original
+        assert calls == ["left", "right"]
+
+
+@pytest.mark.parametrize("component,physical", [("left_gripper", "right_gripper"),
+                                                ("right_gripper", "left_gripper"),
+                                                (None, "left_gripper")])
+def test_explicit_mujoco_component_cannot_select_the_other_physical_hand(component, physical):
+    rig = SimpleNamespace(
+        config=SimpleNamespace(realtime_worker=False,
+            gripper_actuation_profile=SimpleNamespace(gripper_for_side=lambda side: side+"_gripper")),
+        **{name: lambda *args, **kwargs: pytest.fail("Constructor must not execute the rig")
+           for name in ("is_ready", "queue_gripper_close_targets", "gripper_execution_snapshot",
+                        "hold_gripper_motion", "step_physics")})
+    with pytest.raises(ValueError, match="physical gripper"):
+        MujocoGripperControlPort(rig=rig, gripper_name=physical,
+            **({} if component is None else {"component_id": component}))

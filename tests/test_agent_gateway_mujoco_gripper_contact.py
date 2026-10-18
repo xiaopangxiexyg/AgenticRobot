@@ -530,3 +530,115 @@ def test_agent_skill_target_actuates_gripper_into_real_mujoco_cube_contact(
         if gripper_session is not None:
             gripper_session.close()
         session.close()
+
+
+@pytest.mark.integration
+@pytest.mark.optional
+@pytest.mark.slow_sim
+def test_v2_gateway_selects_both_physical_mujoco_grippers_without_cross_commands():
+    from dataclasses import replace
+
+    from agent_gateway.skills.gripper.deployment import (
+        GripperSkillDeploymentBinding,
+        build_gripper_skill_contract_bundle,
+    )
+    from agent_gateway.skills.gripper.runtime import (
+        assemble_gripper_agent_gateway_session,
+    )
+    from dataset_contracts.canonical_encoding import canonical_content_hash
+    from sim.mujoco.adapters import (
+        MujocoPositionExecutionConfig,
+        MujocoPositionExecutionRig,
+    )
+    from tests.test_mujoco_dmtac_gripper import _scene, _timing
+
+    pytest.importorskip("mujoco")
+    scene, arm_profile, hand_profile = _scene()
+    rig = MujocoPositionExecutionRig(
+        scene,
+        MujocoPositionExecutionConfig(
+            timing=_timing(),
+            actuation_profile=arm_profile,
+            gripper_actuation_profile=hand_profile,
+            realtime_worker=False,
+            follow_qpos_alpha=1.0,
+        ),
+    )
+    rig.start()
+    physics_clock = lambda: float(scene.data.time)
+    ports = {
+        name: MujocoGripperControlPort(
+            rig=rig, gripper_name=name, component_id=name, clock=physics_clock
+        )
+        for name in ("left_gripper", "right_gripper")
+    }
+    hashes = {name: port.port_binding_hash for name, port in ports.items()}
+    binding = GripperSkillDeploymentBinding(
+        runtime_session_id="sim:two-hands",
+        control_domain_id="sim:grippers",
+        component_id="grippers",
+        target_binding_id="sim:rig",
+        target_kind="sim",
+        current_mode="sim_active",
+        executor_id="sim:gripper-v2",
+        port_binding_hash=canonical_content_hash(hashes, domain="sim:gripper-v2"),
+        station_manifest_hash="sim:station",
+        execution_manifest_hash="sim:execution",
+        skill_version="2",
+        port_binding_hash_by_component=hashes,
+    )
+    bundle = build_gripper_skill_contract_bundle(binding)
+    session = assemble_gripper_agent_gateway_session(
+        contract_bundle=bundle,
+        ports=ports,
+        allowed_client_ids=("sim:operator",),
+        current_station_revision=lambda: 0,
+        clock_domain_id="sim:clock",
+        clock=physics_clock,
+        convergence=GripperConvergenceProfile(poll_interval_sec=0.0),
+    )
+    try:
+        for sequence, (component, target) in enumerate(
+            (
+                ("left_gripper", "closed"),
+                ("right_gripper", "closed"),
+                ("left_gripper", "open"),
+                ("right_gripper", "open"),
+            ),
+            start=1,
+        ):
+            snapshot = session.publish_observation()
+            other = "right_gripper" if component == "left_gripper" else "left_gripper"
+            other_before = ports[other].observe_state().measured_close
+            request = replace(
+                _gripper_request(bundle, snapshot, client_id="sim:operator"),
+                request_id=f"sim:hand:{sequence}",
+                idempotency_key=f"sim:hand:{sequence}",
+                client_sequence=sequence,
+                parameters={"component_id": component, "target_state": target},
+            )
+            admitted = session.service.submit_request(
+                request=request, current_station_revision=0
+            )
+            assert admitted.accepted
+            assert session.service.launch_operation(
+                admitted.operation.operation_id
+            ).accepted
+            assert session.wait(timeout_sec=6)
+            operation = session.service.get_operation(admitted.operation.operation_id)
+            assert operation.execution_outcome == "completed", (
+                component,
+                target,
+                operation,
+                rig.gripper_execution_snapshot(),
+            )
+            assert operation.execution_result["component_id"] == component
+            assert operation.execution_result["commanded_state"] == target
+            assert operation.execution_result["schema_version"].endswith(".v2")
+            assert ports[other].observe_state().measured_close == pytest.approx(
+                other_before, abs=0.03
+            )
+        assert len(session.executor.workers) == 4
+    finally:
+        assert session.close().accepted
+        rig.close()

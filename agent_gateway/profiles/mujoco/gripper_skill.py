@@ -25,7 +25,6 @@ from dataset_contracts.canonical_encoding import canonical_content_hash
 class MujocoGripperControlPort:
     """Drive one gripper through the rig's gripper-only lower boundary."""
 
-    component_id = "right_gripper"
     target_kind = "sim"
 
     def __init__(
@@ -33,6 +32,7 @@ class MujocoGripperControlPort:
         *,
         rig: Any,
         gripper_name: str,
+        component_id: str | None = None,
         clock=time.monotonic,
     ) -> None:
         if not callable(clock):
@@ -51,9 +51,21 @@ class MujocoGripperControlPort:
                 "atomic MuJoCo gripper Skill requires deterministic physics ownership."
             )
         self.rig = rig
+        explicit_component = component_id is not None
+        component_id = "right_gripper" if component_id is None else component_id
+        if component_id not in {"left_gripper", "right_gripper"}:
+            raise ValueError("component_id must identify a left or right gripper.")
+        self.component_id = component_id
         self.gripper_name = str(gripper_name).strip()
         if not self.gripper_name:
             raise ValueError("gripper_name must be non-empty.")
+        profile = getattr(rig.config, "gripper_actuation_profile", None)
+        side_binding = getattr(profile, "gripper_for_side", None)
+        if explicit_component or profile is not None:
+            if not callable(side_binding):
+                raise ValueError("Explicit gripper components require the lower side binding.")
+            if side_binding(component_id.removesuffix("_gripper")) != self.gripper_name:
+                raise ValueError("Selected component does not match the lower physical gripper.")
         self.clock = clock
         self._sequence = 0
         self.port_binding_hash = canonical_content_hash(
@@ -68,7 +80,12 @@ class MujocoGripperControlPort:
     def _ref(self, kind: str, payload: dict[str, object]) -> str:
         self._sequence += 1
         digest = canonical_content_hash(
-            {"kind": kind, "sequence": self._sequence, **payload},
+            {
+                "kind": kind,
+                "sequence": self._sequence,
+                "component_id": self.component_id,
+                **payload,
+            },
             domain="dexteleop.sim.gripper_skill_evidence.v1",
         )
         return f"mujoco-gripper-{kind}:{digest}"

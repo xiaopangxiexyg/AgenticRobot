@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
+from types import MappingProxyType
 
 from agent_gateway.protocol.skill_catalog import (
     AgentSkillSchemaCatalog,
@@ -20,13 +22,19 @@ from agent_gateway.runtime.payload_validation import (
 from dataset_contracts.canonical_encoding import canonical_content_hash
 
 from .definition import (
+    GRIPPER_COMPONENT_IDS,
     SET_GRIPPER_STATE_SKILL_ID_V1,
     set_gripper_state_schema_entry_v1,
+    set_gripper_state_schema_entry_v2,
     set_gripper_state_skill_definition_v1,
+    set_gripper_state_skill_definition_v2,
     validate_no_gripper_task_evaluation_v1,
     validate_set_gripper_state_parameters_v1,
+    validate_set_gripper_state_parameters_v2,
     validate_set_gripper_state_result_for_parameters_v1,
+    validate_set_gripper_state_result_for_parameters_v2,
     validate_set_gripper_state_result_v1,
+    validate_set_gripper_state_result_v2,
 )
 
 SIM_GRIPPER_ROUTE_ID_V1 = "sim.mujoco.set_gripper_state"
@@ -51,6 +59,8 @@ class GripperSkillDeploymentBinding:
     port_binding_hash: str
     station_manifest_hash: str
     execution_manifest_hash: str
+    skill_version: str = "1"
+    port_binding_hash_by_component: Mapping[str, str] | None = None
 
     def __post_init__(self) -> None:
         for field_name in (
@@ -73,8 +83,34 @@ class GripperSkillDeploymentBinding:
             raise ValueError("target_kind must be 'sim' or 'real'.")
         if self.current_mode != expected_mode[self.target_kind]:
             raise ValueError("current_mode does not match target_kind.")
-        if self.component_id != "right_gripper":
-            raise ValueError("v1 binds exactly the right_gripper component.")
+        if self.skill_version == "1":
+            if (
+                self.component_id != "right_gripper"
+                or self.port_binding_hash_by_component is not None
+            ):
+                raise ValueError("v1 binds exactly the right_gripper component.")
+        elif self.skill_version == "2":
+            bindings = dict(self.port_binding_hash_by_component or {})
+            if self.component_id != "grippers" or set(bindings) != set(
+                GRIPPER_COMPONENT_IDS
+            ):
+                raise ValueError("v2 binds both left_gripper and right_gripper.")
+            bindings = {
+                key: _required(value, field_name="gripper port binding")
+                for key, value in bindings.items()
+            }
+            object.__setattr__(
+                self, "port_binding_hash_by_component", MappingProxyType(bindings)
+            )
+        else:
+            raise ValueError("Unsupported gripper Skill version.")
+
+    def port_hash_for(self, component_id: str) -> str:
+        if self.skill_version == "1":
+            if component_id != self.component_id:
+                raise ValueError("port component does not match v1 binding.")
+            return self.port_binding_hash
+        return self.port_binding_hash_by_component[component_id]
 
     @property
     def route_id(self) -> str:
@@ -99,6 +135,16 @@ class GripperSkillDeploymentBinding:
                 "station_manifest_hash": self.station_manifest_hash,
                 "execution_manifest_hash": self.execution_manifest_hash,
                 "route_id": self.route_id,
+                **(
+                    {
+                        "skill_version": "2",
+                        "port_binding_hash_by_component": dict(
+                            self.port_binding_hash_by_component
+                        ),
+                    }
+                    if self.skill_version == "2"
+                    else {}
+                ),
             },
             domain="dexteleop.agent_skill.gripper_deployment_binding.v1",
         )
@@ -130,7 +176,9 @@ class GripperSkillContractBundle:
             route_manifest=self.route_manifest,
         )
         self.payload_validators.validate_manifest(self.route_manifest)
-        entry = self.route_manifest.route(SET_GRIPPER_STATE_SKILL_ID_V1, "1")
+        entry = self.route_manifest.route(
+            SET_GRIPPER_STATE_SKILL_ID_V1, self.deployment_binding.skill_version
+        )
         if (
             entry.deployment_binding.deployment_binding_hash
             != self.deployment_binding.semantic_content_hash
@@ -143,18 +191,27 @@ def build_gripper_skill_contract_bundle(
 ) -> GripperSkillContractBundle:
     if not isinstance(binding, GripperSkillDeploymentBinding):
         raise TypeError("binding must be a GripperSkillDeploymentBinding.")
-    definition = set_gripper_state_skill_definition_v1()
-    schema = set_gripper_state_schema_entry_v1(
+    version = binding.skill_version
+    definition = (
+        set_gripper_state_skill_definition_v1
+        if version == "1"
+        else set_gripper_state_skill_definition_v2
+    )()
+    schema = (
+        set_gripper_state_schema_entry_v1
+        if version == "1"
+        else set_gripper_state_schema_entry_v2
+    )(
         skill_definition_hash=definition.semantic_content_hash,
     )
     definition_catalog = SkillDefinitionCatalog(
         catalog_id="dexteleop.agent_skill_definitions.gripper_control",
-        catalog_version="1",
+        catalog_version=version,
         skill_definitions=(definition,),
     )
     schema_catalog = AgentSkillSchemaCatalog(
         catalog_id="dexteleop.agent_skill_schemas.gripper_control",
-        catalog_version="1",
+        catalog_version=version,
         schema_entries=(schema,),
     )
     route = SkillExecutionRoute(
@@ -162,7 +219,7 @@ def build_gripper_skill_contract_bundle(
         skill_version=definition.skill_version,
         skill_definition_hash=definition.semantic_content_hash,
         route_id=binding.route_id,
-        route_version="1",
+        route_version=version,
         parameter_schema_hash=schema.parameter_schema_hash,
         execution_result_schema_hash=schema.execution_result_schema_hash,
         task_evaluation_schema_hash=schema.task_evaluation_schema_hash,
@@ -215,7 +272,7 @@ def build_gripper_skill_contract_bundle(
         ),
     )
     validator = AgentSkillPayloadValidatorSet(
-        validator_id=f"gripper-control:{binding.target_kind}:v1",
+        validator_id=f"gripper-control:{binding.target_kind}:v{version}",
         skill_id=route.skill_id,
         skill_version=route.skill_version,
         route_id=route.route_id,
@@ -223,11 +280,17 @@ def build_gripper_skill_contract_bundle(
         parameter_schema_hash=route.parameter_schema_hash,
         execution_result_schema_hash=route.execution_result_schema_hash,
         task_evaluation_schema_hash=route.task_evaluation_schema_hash,
-        validate_parameters=validate_set_gripper_state_parameters_v1,
-        validate_execution_result=validate_set_gripper_state_result_v1,
+        validate_parameters=validate_set_gripper_state_parameters_v1
+        if version == "1"
+        else validate_set_gripper_state_parameters_v2,
+        validate_execution_result=validate_set_gripper_state_result_v1
+        if version == "1"
+        else validate_set_gripper_state_result_v2,
         validate_task_evaluation=validate_no_gripper_task_evaluation_v1,
         validate_execution_result_for_parameters=(
             validate_set_gripper_state_result_for_parameters_v1
+            if version == "1"
+            else validate_set_gripper_state_result_for_parameters_v2
         ),
     )
     return GripperSkillContractBundle(

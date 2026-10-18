@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Mapping
+from dataclasses import replace
 from typing import Any
 
 from agent_gateway.protocol.skill_catalog import (
@@ -22,6 +23,101 @@ SET_GRIPPER_STATE_COMPLETIONS_V1 = (
     "settled_before_full_close",
     "target_reached",
 )
+GRIPPER_COMPONENT_IDS = ("left_gripper", "right_gripper")
+SET_GRIPPER_STATE_RESULT_SCHEMA_V2 = "dexteleop.agent_skill.set_gripper_state_result.v2"
+
+
+def set_gripper_state_skill_definition_v2() -> SkillDefinition:
+    return replace(
+        set_gripper_state_skill_definition_v1(),
+        skill_version="2",
+        controlled_component_ids=GRIPPER_COMPONENT_IDS,
+        parameter_semantics_id="gripper_state.selected_component_open_or_closed.v2",
+    )
+
+
+def set_gripper_state_schema_entry_v2(
+    *, skill_definition_hash: str
+) -> AgentSkillSchemaEntry:
+    base = set_gripper_state_schema_entry_v1(
+        skill_definition_hash=skill_definition_hash
+    )
+    parameters = {
+        **base.parameter_schema,
+        "properties": {
+            **base.parameter_schema["properties"],
+            "component_id": {"type": "string", "enum": list(GRIPPER_COMPONENT_IDS)},
+        },
+        "required": ["component_id", "target_state"],
+    }
+    result = {
+        **base.execution_result_schema,
+        "properties": {
+            **base.execution_result_schema["properties"],
+            "schema_version": {"const": SET_GRIPPER_STATE_RESULT_SCHEMA_V2},
+            "component_id": {"type": "string", "enum": list(GRIPPER_COMPONENT_IDS)},
+        },
+    }
+    schema_hash = agent_skill_schema_document_hash(parameters, schema_kind="parameter")
+    profile_id = "gripper_state.selected_open_or_closed.v2"
+    profile_hash = canonical_content_hash(
+        {
+            "parameter_profile_id": profile_id,
+            "parameter_schema_hash": schema_hash,
+            "agent_selectable_parameters": ("component_id", "target_state"),
+        },
+        domain="dexteleop.agent_skill.gripper_state_parameter_profile.v2",
+    )
+    return AgentSkillSchemaEntry(
+        skill_id=SET_GRIPPER_STATE_SKILL_ID_V1,
+        skill_version="2",
+        skill_definition_hash=skill_definition_hash,
+        parameter_schema=parameters,
+        execution_result_schema=result,
+        task_evaluation_schema=base.task_evaluation_schema,
+        parameter_profiles=(
+            SkillParameterProfileRef(
+                parameter_profile_id=profile_id,
+                parameter_profile_hash=profile_hash,
+                parameter_schema_hash=schema_hash,
+            ),
+        ),
+    )
+
+
+def validate_set_gripper_state_parameters_v2(parameters: Mapping[str, Any]) -> None:
+    if not isinstance(parameters, Mapping) or set(parameters) != {
+        "component_id",
+        "target_state",
+    }:
+        raise ValueError(
+            "v2 parameters must contain exactly component_id and target_state."
+        )
+    if parameters["component_id"] not in GRIPPER_COMPONENT_IDS:
+        raise ValueError("component_id must identify the left or right gripper.")
+    validate_set_gripper_state_parameters_v1(
+        {"target_state": parameters["target_state"]}
+    )
+
+
+def validate_set_gripper_state_result_v2(result: Mapping[str, Any]) -> None:
+    _validate_set_gripper_state_result(
+        result, schema_version=SET_GRIPPER_STATE_RESULT_SCHEMA_V2
+    )
+    if result["component_id"] not in GRIPPER_COMPONENT_IDS:
+        raise ValueError("result component_id is not a gripper.")
+
+
+def validate_set_gripper_state_result_for_parameters_v2(
+    parameters: Mapping[str, Any], result: Mapping[str, Any]
+) -> None:
+    validate_set_gripper_state_parameters_v2(parameters)
+    validate_set_gripper_state_result_v2(result)
+    if (
+        result["component_id"] != parameters["component_id"]
+        or result["commanded_state"] != parameters["target_state"]
+    ):
+        raise ValueError("result does not match the selected gripper and target state.")
 
 
 def set_gripper_state_skill_definition_v1() -> SkillDefinition:
@@ -136,6 +232,14 @@ def validate_set_gripper_state_parameters_v1(
 
 
 def validate_set_gripper_state_result_v1(result: Mapping[str, Any]) -> None:
+    _validate_set_gripper_state_result(
+        result, schema_version=SET_GRIPPER_STATE_RESULT_SCHEMA_V1
+    )
+
+
+def _validate_set_gripper_state_result(
+    result: Mapping[str, Any], *, schema_version: str
+) -> None:
     expected = {
         "schema_version",
         "component_id",
@@ -146,7 +250,7 @@ def validate_set_gripper_state_result_v1(result: Mapping[str, Any]) -> None:
     }
     if not isinstance(result, Mapping) or set(result) != expected:
         raise ValueError("execution result fields do not match the v1 schema.")
-    if result["schema_version"] != SET_GRIPPER_STATE_RESULT_SCHEMA_V1:
+    if result["schema_version"] != schema_version:
         raise ValueError("unsupported gripper execution result schema.")
     component_id = result["component_id"]
     if not isinstance(component_id, str) or not component_id.strip():
@@ -188,15 +292,22 @@ def validate_no_gripper_task_evaluation_v1(payload: Mapping[str, Any]) -> None:
 
 
 __all__ = [
+    "GRIPPER_COMPONENT_IDS",
     "SET_GRIPPER_STATE_COMPLETIONS_V1",
     "SET_GRIPPER_STATE_PARAMETER_PROFILE_ID_V1",
     "SET_GRIPPER_STATE_RESULT_SCHEMA_V1",
+    "SET_GRIPPER_STATE_RESULT_SCHEMA_V2",
     "SET_GRIPPER_STATE_SKILL_ID_V1",
     "SET_GRIPPER_STATE_TARGETS_V1",
     "set_gripper_state_schema_entry_v1",
+    "set_gripper_state_schema_entry_v2",
     "set_gripper_state_skill_definition_v1",
+    "set_gripper_state_skill_definition_v2",
     "validate_no_gripper_task_evaluation_v1",
     "validate_set_gripper_state_parameters_v1",
+    "validate_set_gripper_state_parameters_v2",
     "validate_set_gripper_state_result_for_parameters_v1",
+    "validate_set_gripper_state_result_for_parameters_v2",
     "validate_set_gripper_state_result_v1",
+    "validate_set_gripper_state_result_v2",
 ]
