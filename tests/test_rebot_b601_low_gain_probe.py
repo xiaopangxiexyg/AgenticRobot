@@ -4753,6 +4753,44 @@ def test_feedback_substage_timing_sums_disjoint_intervals_without_hiding_retry_c
     assert "not_contiguous" in after["interval_semantics"]
 
 
+def test_feedback_rejection_evidence_is_bounded_and_snapshot_does_not_change():
+    diagnostics = probe._ProbeFeedbackTiming()
+    diagnostics.reject("host_freshness_admission", "joint1 latest status frame is communication type 2, not Type-24")
+    before = diagnostics.snapshot()
+    for _ in range(1000):
+        diagnostics.reject("backend_poll", "x"*2000)
+    after = diagnostics.snapshot()
+    assert before["last_rejection"]["ordinal"] == 1
+    assert after["first_rejection"] == before["first_rejection"]
+    assert after["rejection_counts"] == {"host_freshness_admission": 1, "backend_poll": 1000}
+    assert after["last_rejection"]["ordinal"] == 1001
+    assert len(after["last_rejection"]["reason"]) == 400
+    assert not any(isinstance(v, BaseException) for v in after["last_rejection"].values())
+
+
+def test_feedback_rejection_distinguishes_backend_retry_from_gate_retry(monkeypatch):
+    now, calls = [10.], []
+    frames = iter((None, _timed_feedback_state(1), _timed_feedback_state(2)))
+
+    def poll(**kwargs):
+        calls.append(kwargs)
+        state = next(frames)
+        if state is None:
+            raise probe.LowGainProbeError("declared transient backend rejection")
+        return state
+
+    monkeypatch.setattr(probe.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(probe.time, "sleep", lambda delay: now.__setitem__(0, now[0]+delay))
+    diagnostics = probe._ProbeFeedbackTiming()
+    gate = probe.B601ActiveReportControlGate(probe._ALL_JOINTS, maximum_receive_age_sec=.10)
+    state = probe._read_admitted_control_feedback(SimpleNamespace(poll_feedback=poll), gate, .01, diagnostics)
+    assert state.sequence == 2 and len(calls) == 3
+    evidence = diagnostics.snapshot()
+    assert evidence["rejection_counts"] == {"backend_poll": 1, "baseline_not_advanced": 1}
+    assert evidence["first_rejection"]["reason"] == "declared transient backend rejection"
+    assert evidence["last_rejection"]["stage"] == "baseline_not_advanced"
+
+
 def test_gc_observer_bounds_events_distinguishes_threads_and_does_not_change_gc(monkeypatch):
     settings = probe.gc.isenabled(), probe.gc.get_threshold()
     observer = probe._ProbeGCObserver(max_pending_events=2)
@@ -5078,6 +5116,10 @@ def test_feedback_diagnostics_preserve_real_admission_retries_and_source_request
         assert report["stages"]["backend_poll"]["interval_count"] == 4
         assert report["stages"]["host_freshness_admission"]["interval_count"] == 4
         assert report["stages"]["retry_wait"]["interval_count"] == 3
+        assert report["rejection_counts"] == {"baseline_not_advanced": 1, "host_freshness_admission": 2}
+        assert report["first_rejection"]["stage"] == "baseline_not_advanced"
+        assert "did not advance" in report["last_rejection"]["reason"] or "receive_age_sec" in report["last_rejection"]["reason"]
+        assert report["last_rejection"]["ordinal"] == 3
 
 
 @pytest.mark.parametrize("observe", [False, True])

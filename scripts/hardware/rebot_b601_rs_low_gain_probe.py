@@ -7260,6 +7260,19 @@ class _ProbeFeedbackTiming:
         self.timer = _ProbeStageTiming()
         self.not_advanced_count = 0
         self.retryable_error_count = 0
+        self.rejection_counts: dict[str, int] = {}
+        self.first_rejection: dict[str, object] | None = None
+        self.last_rejection: dict[str, object] | None = None
+
+    def reject(self, stage: str, reason: str) -> None:
+        # Fixed caller stages, two bounded strings, no retained exception or
+        # extra clock read. Diagnostics must not alter admission or deadlines.
+        self.rejection_counts[stage] = self.rejection_counts.get(stage, 0) + 1
+        entry = {"stage": stage, "reason": reason[:400],
+                 "ordinal": sum(self.rejection_counts.values())}
+        if self.first_rejection is None:
+            self.first_rejection = entry
+        self.last_rejection = entry
 
     def mark(self, stage: str) -> None:
         self.timer.mark(stage, accumulate=True)
@@ -7270,6 +7283,9 @@ class _ProbeFeedbackTiming:
             "interval_semantics": "summed_disjoint_intervals; span_bounds_are_not_contiguous",
             "not_advanced_count": self.not_advanced_count,
             "retryable_error_count": self.retryable_error_count,
+            "rejection_counts": dict(self.rejection_counts),
+            "first_rejection": None if self.first_rejection is None else dict(self.first_rejection),
+            "last_rejection": None if self.last_rejection is None else dict(self.last_rejection),
         }
 
 
@@ -7286,6 +7302,10 @@ def _poll_control_feedback(
             if active_report_gate is None
             else backend.poll_feedback(require_host_freshness=True)
         )
+    except LowGainProbeError as exc:
+        if diagnostics is not None:
+            diagnostics.reject("backend_poll", str(exc))
+        raise
     finally:
         if diagnostics is not None:
             diagnostics.mark("backend_poll")
@@ -7294,6 +7314,8 @@ def _poll_control_feedback(
     try:
         advanced = active_report_gate.observe(state)
     except (TypeError, ValueError) as exc:
+        if diagnostics is not None:
+            diagnostics.reject("host_freshness_admission", str(exc))
         raise LowGainProbeError(f"active-report feedback rejected: {exc}") from exc
     finally:
         if diagnostics is not None:
@@ -7352,6 +7374,7 @@ def _read_admitted_control_feedback(
             last_error = "active-report feedback established a baseline but did not yet advance"
             if diagnostics is not None:
                 diagnostics.not_advanced_count += 1
+                diagnostics.reject("baseline_not_advanced", last_error)
         if diagnostics is not None:
             diagnostics.mark("retry_bookkeeping")
         time.sleep(0.001)
