@@ -203,15 +203,21 @@ class RealAgentPrimitiveSessionAuthorization:
         self._clock = clock
         self._lock = threading.Lock()
         self._grants_issued = 0
-        if "set_gripper_state" in normalized_actions and (
-            gateway_session.contract_bundle.gripper_contract is None
-        ):
-            raise ValueError("Gripper authorization requires the bound gripper Route.")
-        gripper_contract = gateway_session.contract_bundle.gripper_contract
-        if ("set_gripper_state" in normalized_actions and gripper_contract is not None
-                and gripper_contract.deployment_binding.skill_version == "1"
-                and (normalized_side != "right" or self.authorized_gripper_sides != ("right",))):
-            raise ValueError("Gripper v1 authorization requires the bound right-gripper Route.")
+        gripper_contract = None
+        if "set_gripper_state" in normalized_actions:
+            gripper_contract = gateway_session.contract_bundle.gripper_contract
+            if gripper_contract is None:
+                raise ValueError("Gripper authorization requires the bound gripper Route.")
+            if (
+                gripper_contract.deployment_binding.skill_version == "1"
+                and (
+                    normalized_side != "right"
+                    or self.authorized_gripper_sides != ("right",)
+                )
+            ):
+                raise ValueError(
+                    "Gripper v1 authorization requires the bound right-gripper Route."
+                )
 
         manifest = gateway_session.contract_bundle.route_manifest
         self.operator_authorization_receipt_id = (
