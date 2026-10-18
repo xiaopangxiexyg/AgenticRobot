@@ -763,10 +763,17 @@ class Sam2GraspGenXPointGraspPlanner:
     ) -> PointGraspResult:
         started = time.perf_counter()
         timing: dict[str, float] = {}
-        if not self._started or self._closed:
-            raise RuntimeError("Point-grasp planner is not running.")
         with self._lock:
             self._last_filter_summary = {}
+            self._last_plan_timing_ms = {}
+            if not self._started or self._closed:
+                raise RuntimeError("Point-grasp planner is not running.")
+
+        def finish_stage(name, began):
+            timing[name] = (time.perf_counter() - began) * 1000.
+            timing["plan_total"] = (time.perf_counter() - started) * 1000.
+            with self._lock:
+                self._last_plan_timing_ms = dict(timing)
         rgb = image.convert("RGB")
         depth = np.asarray(depth_m, dtype=np.float32)
         if depth.shape != (rgb.height, rgb.width) or not np.all(np.isfinite(depth)):
@@ -798,10 +805,11 @@ class Sam2GraspGenXPointGraspPlanner:
             base_from_camera, field_name="base_from_camera"
         )
         stage_started = time.perf_counter()
-        mask = np.asarray(
-            self.point_segmenter.segment_point(rgb, pixel_uv=(u, v)), dtype=bool
-        )
-        timing["sam2_inference"] = (time.perf_counter() - stage_started) * 1000.0
+        try:
+            mask = np.asarray(
+                self.point_segmenter.segment_point(rgb, pixel_uv=(u, v)), dtype=bool)
+        finally:
+            finish_stage("sam2_inference", stage_started)
         if mask.shape != depth.shape or not mask[v, u]:
             raise RuntimeError("SAM2 returned an invalid point mask.")
         with self._lock:
@@ -835,24 +843,17 @@ class Sam2GraspGenXPointGraspPlanner:
         visible_scene = None
         if visible_scene_factory is not None:
             stage_started = time.perf_counter()
-            visible_scene = visible_scene_factory(
-                depth_m=depth,
-                target_mask=mask,
-                intrinsics=values,
-                geometry=replace(
-                    self.solid_geometry,
-                    tool_from_solid_xyz_m=(0, 0, 0),
-                    solid_yaw_rad=0,
-                    tool_from_solid_rotation=_DMTAC_GRASPGENX_IDENTITY_ROTATION,
-                ),
-            )
+            try:
+                visible_scene = visible_scene_factory(
+                    depth_m=depth, target_mask=mask, intrinsics=values,
+                    geometry=replace(self.solid_geometry, tool_from_solid_xyz_m=(0, 0, 0),
+                        solid_yaw_rad=0, tool_from_solid_rotation=_DMTAC_GRASPGENX_IDENTITY_ROTATION))
+            finally:
+                finish_stage("visible_scene_construction", stage_started)
             if not isinstance(visible_scene, VisibleGraspScene):
                 raise TypeError(
                     "visible_scene_factory must return a VisibleGraspScene."
                 )
-            timing["visible_scene_construction"] = (
-                time.perf_counter() - stage_started
-            ) * 1000.0
         if use_visible_target_points:
             if visible_scene is None:
                 raise ValueError("Fused target inference requires its matching visible scene")
@@ -862,15 +863,14 @@ class Sam2GraspGenXPointGraspPlanner:
             target_points_base = np.ascontiguousarray(
                 target_points_camera @ transform_base_camera[:3, :3].T + transform_base_camera[:3, 3], dtype=np.float32)
         stage_started = time.perf_counter()
-        grasps, scores = self.client.infer_object(
-            # GraspMoE's OBB branch defines top in the gravity-aligned input
-            # frame. Fuse target points before this single model invocation.
-            target_points_base,
-            sweep_volume_params=DMTAC_M_GRASPGENX_SWEEP_VOLUME_V1,
-            planner=self.planner, num_grasps=self.num_grasps,
-            score_threshold=self.score_threshold, top_k=self.server_top_k,
-        )
-        timing["graspgenx_inference"] = (time.perf_counter() - stage_started) * 1000.0
+        try:
+            grasps, scores = self.client.infer_object(
+                # OBB top is gravity aligned; fuse before this single invocation.
+                target_points_base, sweep_volume_params=DMTAC_M_GRASPGENX_SWEEP_VOLUME_V1,
+                planner=self.planner, num_grasps=self.num_grasps,
+                score_threshold=self.score_threshold, top_k=self.server_top_k)
+        finally:
+            finish_stage("graspgenx_inference", stage_started)
         stage_started = time.perf_counter()
         filter_summary: dict[str, int | float | str | None] = {}
         if (
@@ -897,26 +897,31 @@ class Sam2GraspGenXPointGraspPlanner:
                     ),
                 }
             )
-        candidates = self._rank(
-            grasps,
-            scores,
-            target_points_camera=target_points_camera,
-            target_camera=point_camera[:3],
-            base_from_camera=transform_base_camera,
-            depth=depth,
-            intrinsics=values,
-            maximum=int(max_candidates),
-            filter_summary=filter_summary,
-            visible_scene=visible_scene,
-            candidate_selector=candidate_selector,
-        )
-        timing["candidate_ranking_and_visible_collision"] = (
-            time.perf_counter() - stage_started
-        ) * 1000.0
-        timing["plan_total"] = (time.perf_counter() - started) * 1000.0
-        with self._lock:
-            self._last_plan_timing_ms = timing
-            self._last_filter_summary = dict(filter_summary)
+        selector_for_ranking = None
+        if candidate_selector is not None:
+            def measured_selector(*args):
+                began = time.perf_counter()
+                try:
+                    return candidate_selector(*args)
+                finally:
+                    timing["arm_candidate_selection"] = (time.perf_counter() - began) * 1000.
+            selector_for_ranking = measured_selector
+        try:
+            candidates = self._rank(
+                grasps, scores, target_points_camera=target_points_camera,
+                target_camera=point_camera[:3], base_from_camera=transform_base_camera,
+                depth=depth, intrinsics=values, maximum=int(max_candidates),
+                filter_summary=filter_summary, visible_scene=visible_scene,
+                candidate_selector=selector_for_ranking)
+        finally:
+            elapsed = (time.perf_counter() - stage_started) * 1000.
+            # Preserve the inclusive legacy field; expose its exclusive child
+            # so expensive arm checks are not misattributed to point collisions.
+            timing["candidate_filtering_excluding_arm_selection"] = max(
+                0., elapsed - timing.get("arm_candidate_selection", 0.))
+            finish_stage("candidate_ranking_and_visible_collision", stage_started)
+            with self._lock:
+                self._last_filter_summary = dict(filter_summary)
         if not candidates:
             summary_json = json.dumps(
                 filter_summary,

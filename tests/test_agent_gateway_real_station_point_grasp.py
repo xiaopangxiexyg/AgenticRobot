@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import json
+import logging
 from dataclasses import replace
 from types import SimpleNamespace
 
@@ -1880,3 +1881,204 @@ def test_rigid_endpoint_priority_covers_low_scores_but_never_vetoes_ik(side, rig
     assert probed[0] == expected and assessed == [expected]
     assert result.selected_indices == (expected,)
     assert result.diagnostics["arm_shortlist_rigid_endpoint_scope"] == "advisory_only_not_ik_or_path_admission"
+
+
+@pytest.mark.parametrize("side", ("left", "right"))
+def test_shortlist_exposes_only_the_selected_endpoint_hint(side):
+    adapter = object.__new__(RM65PointGraspReachabilityAdapter)
+    adapter.profile = SimpleNamespace(max_measured_qpos_age_ms=200., arm_side=side)
+    adapter.arm_base_origin_candidate_m = (1., 0., 0.)
+    adapter.monotonic = lambda: 0.
+    adapter._solver_pose = lambda value: value
+    candidates = []
+    for i in range(2):
+        pose = np.diag([-1., 1., -1., 1.])
+        pose[0, 3] = i * .01
+        candidates.append(SimpleNamespace(base_from_tcp=pose, score=.9 - i * .1,
+            symmetry_parent_index=None if i == 0 else 0,
+            orientation_variant_axis=None if i == 0 else "z", orientation_variant_angle_deg=0. if i == 0 else 180.))
+
+    def assess(**kwargs):
+        index = round(kwargs["target_tool_tcp_world"][0, 3] * 100)
+        return SimpleNamespace(feasible=True, selected_pregrasp_distance_m=.06,
+            elapsed_ms=1., reason_code=None, attempts=(), joint_travel_rad=(1. - index * .5,) * 6,
+            terminal_qpos=(float(index),) * 6)
+
+    adapter.planner = SimpleNamespace(assess_local_grasp_chain=assess)
+    baseline = adapter.select_candidates(tuple(candidates), (0., 0., 0.), 1,
+        measured_qpos_cut=SimpleNamespace(measured_at=10., qpos_by_side={}), measurement_reference_time=10.)
+    hints = {}
+    selection = adapter.select_candidates(tuple(candidates), (0., 0., 0.), 1,
+        measured_qpos_cut=SimpleNamespace(measured_at=10., qpos_by_side={}),
+        measurement_reference_time=10., endpoint_seeds=hints)
+    assert selection.selected_indices == baseline.selected_indices
+    assert hints == {tuple(candidates[i].base_from_tcp.reshape(-1)): (float(i),) * 6
+        for i in baseline.selected_indices}
+
+
+def test_provider_passes_hints_only_within_one_request_and_times_annotation(caplog):
+    from deployments.perception.sam2_graspgenx_point_grasp import (
+        GraspGenXCandidateSelection,
+    )
+    from teleop_runtime.skill_deploy.motion_port import RealAgentMotionMeasuredQposCut
+
+    adapter = object.__new__(RM65PointGraspReachabilityAdapter)
+    _, _, planner, registration, provider = _provider_stack(
+        backend_id="graspgenx", arm_reachability_evaluator=adapter)
+    adapter.profile = registration.profile.arm_reachability_profile
+    adapter.candidate_reference_frame_id = registration.profile.reference_frame_id
+    adapter.clock = lambda: 10.
+    adapter.monotonic = lambda: 0.
+    adapter._solver_pose = lambda value: value
+    cut = RealAgentMotionMeasuredQposCut(revision=4, measured_at=9.95, available_at=9.96,
+        qpos_by_side={s: np.zeros(6) for s in ("left", "right")}, source_evidence_refs=("test-cut",))
+    adapter.motion_port = SimpleNamespace(latest_measured_qpos=lambda: cut)
+    mappings, received = [], []
+
+    def select(candidates, point, maximum, *, endpoint_seeds, **_):
+        mappings.append(endpoint_seeds)
+        if len(mappings) == 1:
+            for candidate in candidates:
+                endpoint_seeds[tuple(np.asarray(candidate.base_from_tcp).reshape(-1))] = (.1,) * 6
+        return GraspGenXCandidateSelection(tuple(range(len(candidates))), {})
+
+    adapter.select_candidates = select
+
+    def annotate(**kwargs):
+        received.append(kwargs.get("initial_seed_qpos"))
+        return SimpleNamespace(to_dict=lambda: {"classification": "standard_reachable",
+            "position_residual_m": .001, "orientation_residual_deg": .5,
+            "solve_cycles": 1, "elapsed_ms": 1., "termination_reason": "standard_tolerance_met"})
+
+    adapter.planner = SimpleNamespace(assess_endpoint_ik=annotate)
+    original_plan = planner.plan
+
+    def plan(*args, candidate_selector, **kwargs):
+        result = original_plan(*args, **kwargs)
+        candidate_selector(result.candidates, result.target_point_base_m, kwargs["max_candidates"])
+        return result
+
+    planner.plan = plan
+    with caplog.at_level(logging.INFO):
+        first = provider.plan_request(_request(include_arm_reachability=True))
+        first_count = len(received)
+        second = provider.plan_request(_request(include_arm_reachability=True))
+    assert mappings[0] is not mappings[1]
+    assert mappings[0] and not mappings[1]
+    assert all(hint is not None for hint in received[:first_count])
+    assert all(hint is None for hint in received[first_count:])
+    assert first.execution_result["candidates"] == second.execution_result["candidates"]
+    registration.payload_validator.validate_execution_result(first.execution_result)
+    events = [json.loads(record.message.split("Point-grasp provider timing: ")[1])
+        for record in caplog.records if record.message.startswith("Point-grasp provider timing: ")]
+    assert len(events) == 2
+    assert all(event["status"] == "completed" for event in events)
+    assert all("endpoint_annotation" in event["timing_ms"] for event in events)
+    assert all(event["timing_ms"]["provider_total"] >= event["timing_ms"]["proposal_planning"] for event in events)
+
+
+def test_failed_point_request_keeps_original_error_and_records_its_phase(caplog):
+    _, _, planner, _, provider = _provider_stack(backend_id="graspgenx")
+
+    def fail(*_, **__):
+        raise RuntimeError("original_model_failure")
+
+    planner.plan = fail
+    with caplog.at_level(logging.INFO), pytest.raises(RuntimeError, match="original_model_failure"):
+        provider.plan_request(_request())
+    event = next(json.loads(r.message.split("Point-grasp provider timing: ")[1])
+        for r in caplog.records if r.message.startswith("Point-grasp provider timing: "))
+    assert event["status"] == "failed"
+    assert event["timing_ms"]["proposal_planning"] >= 0.
+    assert "result_encoding" not in event["timing_ms"]
+
+
+def test_provider_records_window_factory_failure_without_replacing_error(caplog):
+    _, _, _, _, provider = _provider_stack(backend_id="graspgenx")
+
+    def fail():
+        raise RuntimeError("original_window_failure")
+
+    provider.non_motion_read_window = fail
+    with caplog.at_level(logging.INFO), pytest.raises(RuntimeError, match="original_window_failure"):
+        provider.plan_request(_request())
+    event = next(json.loads(record.message.split("Point-grasp provider timing: ")[1])
+        for record in caplog.records if record.message.startswith("Point-grasp provider timing: "))
+    assert event["status"] == "failed"
+    assert set(event["timing_ms"]) == {"provider_total"}
+
+
+@pytest.mark.parametrize("phase", ("capture", "encoding"))
+def test_provider_records_entered_failed_phase_without_replacing_error(monkeypatch, caplog, phase):
+    from agent_gateway.profiles.real import point_grasp_gateway as gateway
+
+    _, _, _, _, provider = _provider_stack(backend_id="graspgenx")
+
+    def fail(*_args, **_kwargs):
+        raise RuntimeError("original_phase_failure")
+
+    if phase == "capture":
+        monkeypatch.setattr(provider.perception_provider, "capture_aligned_rgbd", fail)
+    else:
+        monkeypatch.setattr(gateway, "encode_grasp_rgbd_snapshot", fail)
+    with caplog.at_level(logging.INFO), pytest.raises(RuntimeError, match="original_phase_failure"):
+        provider.plan_request(_request())
+    event = next(json.loads(record.message.split("Point-grasp provider timing: ")[1])
+        for record in caplog.records if record.message.startswith("Point-grasp provider timing: "))
+    assert event["status"] == "failed"
+    key = "capture_and_preparation" if phase == "capture" else "result_encoding"
+    assert event["timing_ms"][key] >= 0.
+    assert ("proposal_planning" in event["timing_ms"]) == (phase == "encoding")
+
+
+def test_producer_records_failed_publication_without_success_receipt(monkeypatch, caplog, tmp_path):
+    from agent_gateway.profiles.real import point_grasp_gateway as gateway
+    from agent_gateway.runtime.artifact_store import RecoverableAgentArtifactStore
+
+    _, _, _, registration, provider = _provider_stack(backend_id="graspgenx")
+    store = RecoverableAgentArtifactStore(root=tmp_path/"artifacts",
+        quota_bytes=32*1024*1024, max_artifact_bytes=16*1024*1024, max_chunk_bytes=1024*1024)
+    original = gateway.commit_artifact_bytes
+
+    def commit(**kwargs):
+        if kwargs["producer_id"] == "agent_gateway.provider.station_bound_point_grasp":
+            raise RuntimeError("original_publication_failure")
+        return original(**kwargs)
+
+    monkeypatch.setattr(gateway, "commit_artifact_bytes", commit)
+    executor = gateway.build_station_bound_point_grasp_executor(
+        registration=registration, provider=provider, artifact_store=store,
+        runtime_session_id="station-point-grasp:test", current_station_revision=lambda: 7,
+        max_retained_operations=4, clock=lambda: 10.)
+    request = _request()
+    request.semantic_content_hash = "a"*64
+    with caplog.at_level(logging.INFO), pytest.raises(RuntimeError, match="original_publication_failure"):
+        executor._read(request, SimpleNamespace(operation_id="publication:failure"))
+    event = next(json.loads(record.message.split("Point-grasp producer timing: ")[1])
+        for record in caplog.records if record.message.startswith("Point-grasp producer timing: "))
+    assert event["status"] == "failed"
+    assert event["timing_ms"]["artifact_publication"] >= 0.
+
+
+def test_uninspectable_selector_does_not_replace_original_model_failure(monkeypatch):
+    from teleop_runtime.skill_deploy.motion_port import RealAgentMotionMeasuredQposCut
+
+    adapter = object.__new__(RM65PointGraspReachabilityAdapter)
+    _, _, planner, registration, provider = _provider_stack(
+        backend_id="graspgenx", arm_reachability_evaluator=adapter)
+    cut = RealAgentMotionMeasuredQposCut(revision=4, measured_at=9.95, available_at=9.96,
+        qpos_by_side={side: np.zeros(6) for side in ("left", "right")}, source_evidence_refs=("test-cut",))
+    adapter.motion_port = SimpleNamespace(latest_measured_qpos=lambda: cut)
+
+    def select(*_args, **_kwargs):
+        pytest.fail("The failing model must not enter candidate selection")
+
+    select.__signature__ = "not-a-signature"
+    adapter.select_candidates = select
+
+    def fail(*_args, **_kwargs):
+        raise RuntimeError("original_model_failure")
+
+    monkeypatch.setattr(planner, "plan", fail)
+    with pytest.raises(RuntimeError, match="original_model_failure"):
+        provider.plan_request(_request(include_arm_reachability=True))

@@ -3278,7 +3278,7 @@ def test_cached_terminal_miss_does_not_veto_a_different_forward_branch():
 
     planner._endpoint_qpos_candidates = endpoints
     planner._plan_constrained_approach_leg = lambda **_: SimpleNamespace(
-        path=SimpleNamespace(waypoints=(current, current)))
+        path=SimpleNamespace(waypoints=(current, current)), endpoint=endpoint)
     result = planner.assess_local_grasp_chain(
         qpos_by_side=current, side="left", target_tool_tcp_world=target,
         time_budget_sec=5, monotonic=lambda: 0,
@@ -3287,6 +3287,7 @@ def test_cached_terminal_miss_does_not_veto_a_different_forward_branch():
     assert len(calls) == 3
     assert calls[1] == 0
     assert calls[0] != calls[2]
+    assert result.terminal_qpos == tuple(current["left"])
 
 
 def test_constrained_approach_rejects_lateral_tcp_bow() -> None:
@@ -5424,5 +5425,270 @@ def test_rigid_endpoint_query_waits_for_shared_builder_planning(monkeypatch, que
         rigid = pool.submit(advisory)
         assert full.result(timeout=3.0) == "planned"
         assert rigid.result(timeout=3.0) == "advisory"
+    assert raced == [False]
+    assert maximum == 1
+
+
+@pytest.mark.parametrize("side", ("left", "right"))
+def test_endpoint_annotation_rechecks_hint_fk_at_its_own_tolerance(monkeypatch, side):
+    planner = _planner_without_assets(config=RM65GraspTrajectoryPlanningConfig())
+    measured = {s: np.full(6, .1 if s == side else .2) for s in ("left", "right")}
+    hint = np.full(6, .3)
+    pairs = []
+
+    def fk(**kwargs):
+        pairs.append(kwargs)
+        return {s: np.eye(4) for s in ("left", "right")}
+
+    planner.target_builder = SimpleNamespace(tool_tcp_world_targets_for_qpos_pair=fk)
+
+    calls = []
+
+    def one_evaluation(**kwargs):
+        calls.append(kwargs)
+        assert kwargs["maximum_evaluations"] == 1
+        assert not kwargs["refine_tolerance_region"]
+        np.testing.assert_array_equal(kwargs["seed_qpos"], hint)
+        return ({}, 1, 0., 0.)
+
+    monkeypatch.setattr(planner, "_least_squares_endpoint_from_seed", one_evaluation)
+    result = planner.assess_endpoint_ik(qpos_by_side=measured, side=side,
+        target_tool_tcp_world=np.eye(4), initial_seed_qpos=hint)
+    assert result.classification == "standard_reachable"
+    assert result.solve_cycles == 1
+    assert len(calls) == 1
+    inactive = "left" if side == "right" else "right"
+    np.testing.assert_array_equal(pairs[0][f"{side}_qpos"], hint)
+    np.testing.assert_array_equal(pairs[0][f"{inactive}_qpos"], measured[inactive])
+    np.testing.assert_array_equal(measured[side], .1)
+
+
+def test_endpoint_hint_with_wrong_pose_preserves_original_search_and_budget(monkeypatch):
+    planner = _planner_without_assets(config=RM65GraspTrajectoryPlanningConfig())
+    planner.reachability_config = RM65GraspReachabilityConfig(
+        time_budget_ms=1000., max_solve_cycles=5, max_solve_evaluations_per_seed=3, seed_count=3)
+    shifted = np.eye(4)
+    shifted[0, 3] = 1.
+    planner.target_builder = SimpleNamespace(tool_tcp_world_targets_for_qpos_pair=
+        lambda **_: {s: shifted for s in ("left", "right")})
+    seeds = tuple({s: np.full(6, i) for s in ("left", "right")} for i in range(3))
+    monkeypatch.setattr(planner, "_endpoint_seed_qpos", lambda *_, **__: seeds)
+    budgets = []
+
+    def solve(**kwargs):
+        budgets.append(kwargs["maximum_evaluations"])
+        return ({}, kwargs["maximum_evaluations"], .06, 25.)
+
+    monkeypatch.setattr(planner, "_least_squares_endpoint_from_seed", solve)
+    current = {s: np.zeros(6) for s in ("left", "right")}
+    original = planner.assess_endpoint_ik(qpos_by_side=current, side="right",
+        target_tool_tcp_world=np.eye(4), monotonic=lambda: 0.)
+    budgets.clear()
+    hinted = planner.assess_endpoint_ik(qpos_by_side=current, side="right",
+        target_tool_tcp_world=np.eye(4), monotonic=lambda: 0., initial_seed_qpos=np.zeros(6))
+    assert hinted.to_dict() == original.to_dict()
+    assert budgets == [3, 2]
+
+
+@pytest.mark.parametrize("validation_fails", (False, True))
+def test_hint_validation_does_not_bypass_search_or_expand_cycle_budget(monkeypatch, validation_fails):
+    planner = _planner_without_assets(config=RM65GraspTrajectoryPlanningConfig())
+    planner.reachability_config = RM65GraspReachabilityConfig(
+        time_budget_ms=1000., max_solve_cycles=5, max_solve_evaluations_per_seed=3, seed_count=3)
+    planner.target_builder = SimpleNamespace(tool_tcp_world_targets_for_qpos_pair=
+        lambda **_: {s: np.eye(4) for s in ("left", "right")})
+    current = {s: np.zeros(6) for s in ("left", "right")}
+    monkeypatch.setattr(planner, "_endpoint_seed_qpos", lambda *_, **__: (current,) * 3)
+    budgets = []
+
+    def solve(**kwargs):
+        budgets.append(kwargs["maximum_evaluations"])
+        if len(budgets) == 1 and validation_fails:
+            raise np.linalg.LinAlgError("hint validation unavailable")
+        return ({}, kwargs["maximum_evaluations"], .06, 25.)
+
+    monkeypatch.setattr(planner, "_least_squares_endpoint_from_seed", solve)
+    result = planner.assess_endpoint_ik(qpos_by_side=current, side="right", target_tool_tcp_world=np.eye(4),
+        initial_seed_qpos=np.zeros(6), monotonic=lambda: 0.)
+    assert result.classification == "difficult_to_reach"
+    assert result.solve_cycles == 5
+    assert budgets == [1, 3, 1]
+    assert sum(budgets) <= planner.reachability_config.max_solve_cycles
+
+
+@pytest.mark.parametrize("hint", (np.zeros(5), np.full(6, np.nan), np.full(6, 100.)))
+def test_endpoint_annotation_rejects_invalid_or_out_of_limit_hint(hint):
+    planner = _planner_without_assets(config=RM65GraspTrajectoryPlanningConfig())
+    with pytest.raises(ValueError, match="initial_seed_qpos"):
+        planner.assess_endpoint_ik(qpos_by_side={s: np.zeros(6) for s in ("left", "right")},
+            side="right", target_tool_tcp_world=np.eye(4), initial_seed_qpos=hint)
+
+
+@pytest.mark.parametrize("phase", ("lock_wait", "hint_fk", "hint_validation", "seed_generation", "fallback_solve"))
+def test_endpoint_hint_deadline_covers_wait_validation_and_ordinary_fallback(monkeypatch, phase):
+    from contextlib import contextmanager
+
+    planner = _planner_without_assets(config=RM65GraspTrajectoryPlanningConfig())
+    planner.reachability_config = RM65GraspReachabilityConfig(
+        time_budget_ms=1000., max_solve_cycles=5,
+        max_solve_evaluations_per_seed=3, seed_count=3)
+    current = {side: np.zeros(6) for side in ("left", "right")}
+    elapsed, calls = [0.], []
+
+    @contextmanager
+    def delayed_owner():
+        if phase == "lock_wait":
+            elapsed[0] = 1.1
+        yield
+
+    planner._observed_planning_lock = delayed_owner()
+
+    def fk(**_kwargs):
+        if phase == "hint_fk":
+            elapsed[0] = 1.1
+        if phase == "fallback_solve":
+            elapsed[0] += .5
+        pose = np.eye(4)
+        if phase in {"seed_generation", "fallback_solve"}:
+            pose[0, 3] = .5
+        return {side: pose for side in ("left", "right")}
+
+    def seeds(*_args, **_kwargs):
+        if phase == "seed_generation":
+            elapsed[0] = 1.1
+        return (current,)
+
+    def solve(**kwargs):
+        calls.append(kwargs["maximum_evaluations"])
+        if phase == "hint_validation":
+            elapsed[0] = 1.1
+        if phase == "fallback_solve":
+            elapsed[0] += .6
+        return (current, 1, 0., 0.)
+
+    planner.target_builder = SimpleNamespace(tool_tcp_world_targets_for_qpos_pair=fk)
+    monkeypatch.setattr(planner, "_endpoint_seed_qpos", seeds)
+    monkeypatch.setattr(planner, "_least_squares_endpoint_from_seed", solve)
+    if phase == "fallback_solve":
+        result = planner.assess_endpoint_ik(qpos_by_side=current, side="right",
+            target_tool_tcp_world=np.eye(4), monotonic=lambda: elapsed[0])
+        assert result.classification == "standard_reachable"
+        assert result.elapsed_ms == pytest.approx(600.)
+        elapsed[0], calls[:] = 0., []
+        planner._observed_planning_lock = delayed_owner()
+    if phase == "fallback_solve":
+        result = planner.assess_endpoint_ik(qpos_by_side=current, side="right",
+            target_tool_tcp_world=np.eye(4), monotonic=lambda: elapsed[0], initial_seed_qpos=np.zeros(6))
+        assert result.classification == "basically_reachable"
+        assert result.termination_reason == "time_budget_exhausted"
+        assert result.elapsed_ms == pytest.approx(1100.)
+    else:
+        with pytest.raises(RuntimeError, match="time budget"):
+            planner.assess_endpoint_ik(qpos_by_side=current, side="right",
+                target_tool_tcp_world=np.eye(4), monotonic=lambda: elapsed[0], initial_seed_qpos=np.zeros(6))
+    assert len(calls) == (1 if phase in {"hint_validation", "fallback_solve"} else 0)
+
+
+def test_endpoint_hint_fk_numeric_failure_keeps_ordinary_search(monkeypatch):
+    planner = _planner_without_assets(config=RM65GraspTrajectoryPlanningConfig())
+    current = {side: np.zeros(6) for side in ("left", "right")}
+    calls = []
+
+    def unavailable_fk(**_kwargs):
+        raise np.linalg.LinAlgError("optional hint FK unavailable")
+
+    def solve(**kwargs):
+        calls.append(kwargs["maximum_evaluations"])
+        return (current, 1, 0., 0.)
+
+    planner.target_builder = SimpleNamespace(tool_tcp_world_targets_for_qpos_pair=unavailable_fk)
+    monkeypatch.setattr(planner, "_endpoint_seed_qpos", lambda *_args, **_kwargs: (current,))
+    monkeypatch.setattr(planner, "_least_squares_endpoint_from_seed", solve)
+    result = planner.assess_endpoint_ik(qpos_by_side=current, side="right",
+        target_tool_tcp_world=np.eye(4), monotonic=lambda: 0., initial_seed_qpos=np.zeros(6))
+    assert result.classification == "standard_reachable"
+    assert result.solve_cycles == 1 and len(calls) == 1
+
+
+def test_local_chain_lock_wait_uses_original_deadline_before_shared_fk(monkeypatch):
+    from contextlib import contextmanager
+
+    planner = _planner_without_assets(config=RM65GraspTrajectoryPlanningConfig())
+    elapsed = [0.]
+
+    @contextmanager
+    def delayed_owner():
+        elapsed[0] = 2.
+        yield
+
+    planner._observed_planning_lock = delayed_owner()
+    monkeypatch.setattr(planner, "require_static_grasp_scene",
+        lambda **_kwargs: pytest.fail("Expired local query must not enter geometry or FK"))
+    result = planner.assess_local_grasp_chain(
+        qpos_by_side={side: np.zeros(6) for side in ("left", "right")}, side="right",
+        target_tool_tcp_world=np.eye(4), time_budget_sec=1., monotonic=lambda: elapsed[0])
+    assert result.feasible is False
+    assert result.reason_code == "path_planning_time_budget_exhausted"
+
+
+@pytest.mark.parametrize("query_owner", ("template", "observed_request"))
+def test_local_chain_hint_producer_serializes_shared_fk_with_full_planning(monkeypatch, query_owner):
+    from concurrent.futures import ThreadPoolExecutor
+
+    planner = _planner_without_assets(config=RM65GraspTrajectoryPlanningConfig())
+    planner.oracle = SimpleNamespace(for_observed_cloud=lambda _cloud: planner.oracle)
+    planned, querying, fk_entered = threading.Event(), threading.Event(), threading.Event()
+    counts_lock = threading.Lock()
+    active, maximum = 0, 0
+    raced = []
+
+    def enter():
+        nonlocal active, maximum
+        with counts_lock:
+            active += 1
+            maximum = max(maximum, active)
+
+    def leave():
+        nonlocal active
+        with counts_lock:
+            active -= 1
+
+    def full(**_kwargs):
+        enter()
+        try:
+            planned.set()
+            assert querying.wait(2.)
+            raced.append(fk_entered.wait(.05))
+            return "planned"
+        finally:
+            leave()
+
+    def prepare(**_kwargs):
+        enter()
+        try:
+            fk_entered.set()
+            raise RM65GraspTrajectoryPlanningError("ik_search_exhausted")
+        finally:
+            leave()
+
+    monkeypatch.setattr(planner, "_plan", full)
+    monkeypatch.setattr(planner, "require_static_grasp_scene", lambda **_kwargs: None)
+    monkeypatch.setattr(planner, "_terminal_endpoint_search", lambda **_kwargs: lambda: ())
+    monkeypatch.setattr(planner, "_prepare_grasp_approaches", prepare)
+    query = planner if query_owner == "template" else planner.for_observed_cloud("current-cloud")
+    qpos = {side: np.zeros(6) for side in ("left", "right")}
+
+    def local():
+        assert planned.wait(2.)
+        querying.set()
+        return query.assess_local_grasp_chain(qpos_by_side=qpos, side="right",
+            target_tool_tcp_world=np.eye(4), time_budget_sec=1., monotonic=lambda: 0.)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        complete = pool.submit(planner, qpos_by_side=qpos, side="right",
+            target_tool_tcp_world=np.eye(4), speed_scale=.2)
+        proposal = pool.submit(local)
+        assert complete.result(timeout=3.) == "planned"
+        assert proposal.result(timeout=3.).feasible is False
     assert raced == [False]
     assert maximum == 1

@@ -453,6 +453,8 @@ class RM65GraspLocalChainResult:
     reason_code: str | None
     attempts: tuple[Mapping[str, object], ...]
     joint_travel_rad: tuple[float, ...] | None = None
+    # A proposal hint for later endpoint annotation, not execution authority.
+    terminal_qpos: tuple[float, ...] | None = None
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -3172,6 +3174,7 @@ class RM65GraspJointTrajectoryPlanner:
         side: str,
         target_tool_tcp_world: np.ndarray,
         monotonic: Callable[[], float] = time.perf_counter,
+        initial_seed_qpos: np.ndarray | None = None,
     ) -> RM65GraspReachabilityResult:
         """Classify one endpoint with bounded read-only FK IK, without a path."""
 
@@ -3181,11 +3184,65 @@ class RM65GraspJointTrajectoryPlanner:
         if target_pose.shape != (4, 4) or not np.all(np.isfinite(target_pose)):
             raise ValueError("target_tool_tcp_world must be one finite 4x4 pose.")
         config = self.reachability_config
-        with self._solver_lock:
-            started = float(monotonic())
-            deadline = started + config.time_budget_ms / 1_000.0
-            best: tuple[float, float, float] | None = None
+        started = float(monotonic())
+        deadline = started + config.time_budget_ms / 1_000.0
+
+        def require_remaining_time():
+            now = float(monotonic())
+            if now >= deadline:
+                raise RuntimeError("RM65 reachability time budget exhausted.")
+            return now
+
+        with self._observed_planning_lock, self._solver_lock:
+            if initial_seed_qpos is not None:
+                require_remaining_time()
             cycles = 0
+            if initial_seed_qpos is not None:
+                seed = np.asarray(initial_seed_qpos, dtype=float)
+                if (seed.shape != (6,) or not np.all(np.isfinite(seed))
+                        or np.any(seed < RM65_ABSOLUTE_Q_MIN_RAD)
+                        or np.any(seed > RM65_ABSOLUTE_Q_MAX_RAD)):
+                    raise ValueError("initial_seed_qpos must be six finite, in-limit joint values.")
+                try:
+                    require_remaining_time()
+                    pair = {name: np.asarray(qpos_by_side[name], dtype=float) for name in _SIDES}
+                    pair[side] = seed
+                    realized = self.target_builder.tool_tcp_world_targets_for_qpos_pair(
+                        left_qpos=pair["left"], right_qpos=pair["right"])[side]
+                    require_remaining_time()
+                    position, orientation = pose_delta_metrics(realized, target_pose)
+                except (RuntimeError, ValueError, np.linalg.LinAlgError):
+                    # An optional numerical hint may fail; ordinary seeds keep
+                    # the remaining original deadline and evaluation budget.
+                    pass
+                else:
+                    if (position <= config.standard_position_tolerance_m
+                            and orientation <= config.standard_orientation_tolerance_deg):
+                        require_remaining_time()
+                        # Reserve the one permitted canonical evaluation even
+                        # when its residual/Jacobian path raises after work.
+                        cycles = 1
+                        try:
+                            _, evaluations, position, orientation = self._least_squares_endpoint_from_seed(
+                                qpos_by_side=qpos_by_side, side=side, target_tool_tcp_world=target_pose,
+                                seed_qpos=seed, maximum_evaluations=1, prefer_closest_tolerance=False,
+                                orientation_tolerance_deg=config.standard_orientation_tolerance_deg,
+                                refine_tolerance_region=False, deadline=deadline, monotonic=monotonic)
+                        except (RuntimeError, ValueError, np.linalg.LinAlgError):
+                            pass
+                        else:
+                            require_remaining_time()
+                            if evaluations != 1:
+                                raise RuntimeError("Hint validation must use exactly one canonical evaluation.")
+                            if (position <= config.standard_position_tolerance_m
+                                    and orientation <= config.standard_orientation_tolerance_deg):
+                                return RM65GraspReachabilityResult(
+                                    classification="standard_reachable", position_residual_m=position,
+                                    orientation_residual_deg=orientation, solve_cycles=cycles,
+                                    elapsed_ms=max(0.0, (require_remaining_time() - started) * 1_000.0),
+                                    termination_reason="standard_tolerance_met")
+                require_remaining_time()
+            best: tuple[float, float, float] | None = None
             termination = "seed_budget_exhausted"
             for seed_index, seed in enumerate(
                 self._endpoint_seed_qpos(
@@ -3194,7 +3251,9 @@ class RM65GraspJointTrajectoryPlanner:
                     seed_count=config.seed_count,
                 )
             ):
-                if seed_index > 0 and float(monotonic()) >= deadline:
+                # Retain the legacy first no-hint diagnostic attempt. It may
+                # report a basic timed-out result, never a late standard label.
+                if float(monotonic()) >= deadline and (seed_index > 0 or initial_seed_qpos is not None):
                     termination = "time_budget_exhausted"
                     break
                 remaining_evaluations = config.max_solve_cycles - cycles
@@ -3230,11 +3289,15 @@ class RM65GraspJointTrajectoryPlanner:
                 )
                 if best is None or normalized_error < best[0]:
                     best = (normalized_error, position, orientation)
+                finished = float(monotonic())
+                if finished >= deadline:
+                    termination = "time_budget_exhausted"
+                    break
                 if (
                     position <= config.standard_position_tolerance_m
                     and orientation <= config.standard_orientation_tolerance_deg
                 ):
-                    elapsed_ms = max(0.0, (float(monotonic()) - started) * 1_000.0)
+                    elapsed_ms = max(0.0, (finished - started) * 1_000.0)
                     return RM65GraspReachabilityResult(
                         classification="standard_reachable",
                         position_residual_m=position,
@@ -3244,6 +3307,8 @@ class RM65GraspJointTrajectoryPlanner:
                         termination_reason="standard_tolerance_met",
                     )
             if best is None:
+                if termination == "time_budget_exhausted":
+                    raise RuntimeError("RM65 reachability time budget exhausted without a candidate.")
                 raise RuntimeError("RM65 reachability solver produced no candidate.")
             if float(monotonic()) >= deadline:
                 termination = "time_budget_exhausted"
@@ -4860,106 +4925,111 @@ class RM65GraspJointTrajectoryPlanner:
         current = {name: np.asarray(qpos_by_side[name], dtype=float).copy() for name in _SIDES}
         started = float(monotonic())
         deadline = started + min(budget, self.config.path_planning_time_budget_sec)
-        try:
-            self.require_static_grasp_scene(qpos_by_side=current, side=side)
-        except RM65GraspTrajectoryPlanningError as error:
-            return RM65GraspLocalChainResult(
-                feasible=False, selected_pregrasp_distance_m=None, branch_count=0,
-                elapsed_ms=max(0.0, (float(monotonic()) - started) * 1000.0),
-                reason_code=error.reason_code,
-                attempts=({"status": "rejected", "reason_code": error.reason_code,
-                    **error.details},),
-            )
-        attempts: list[Mapping[str, object]] = []
-        last_error: RM65GraspTrajectoryPlanningError | None = None
-        terminal_endpoint_search = self._terminal_endpoint_search(
-            qpos_by_side=current, side=side,
-            target_tool_tcp_world=target, deadline=deadline, monotonic=monotonic,
-        )
-
-        for distance_m in self._pregrasp_distance_candidates():
-            if float(monotonic()) >= deadline:
-                last_error = RM65GraspTrajectoryPlanningError(
-                    "path_planning_time_budget_exhausted",
-                    details={"planning_phase": "local_grasp_chain_admission"},
-                )
-                break
-            pregrasp = self._pregrasp_target_pose(
-                target,
-                distance_m=distance_m,
-            )
+        with self._observed_planning_lock:
             try:
-                prepared = self._prepare_grasp_approaches(
-                    qpos_by_side=current,
-                    side=side,
-                    pregrasp_tool_tcp_world=pregrasp,
-                    grasp_tool_tcp_world=target,
-                    deadline=deadline,
-                    monotonic=monotonic,
-                    terminal_endpoint_search=terminal_endpoint_search,
-                )
+                self._remaining_path_planning_time_sec(deadline=deadline, monotonic=monotonic,
+                    planning_phase="local_grasp_chain_admission")
+                self.require_static_grasp_scene(qpos_by_side=current, side=side)
             except RM65GraspTrajectoryPlanningError as error:
-                last_error = error
+                return RM65GraspLocalChainResult(
+                    feasible=False, selected_pregrasp_distance_m=None, branch_count=0,
+                    elapsed_ms=max(0.0, (float(monotonic()) - started) * 1000.0),
+                    reason_code=error.reason_code,
+                    attempts=({"status": "rejected", "reason_code": error.reason_code,
+                        **error.details},),
+                )
+            attempts: list[Mapping[str, object]] = []
+            last_error: RM65GraspTrajectoryPlanningError | None = None
+            terminal_endpoint_search = self._terminal_endpoint_search(
+                qpos_by_side=current, side=side,
+                target_tool_tcp_world=target, deadline=deadline, monotonic=monotonic,
+            )
+
+            for distance_m in self._pregrasp_distance_candidates():
+                if float(monotonic()) >= deadline:
+                    last_error = RM65GraspTrajectoryPlanningError(
+                        "path_planning_time_budget_exhausted",
+                        details={"planning_phase": "local_grasp_chain_admission"},
+                    )
+                    break
+                pregrasp = self._pregrasp_target_pose(
+                    target,
+                    distance_m=distance_m,
+                )
+                try:
+                    prepared = self._prepare_grasp_approaches(
+                        qpos_by_side=current,
+                        side=side,
+                        pregrasp_tool_tcp_world=pregrasp,
+                        grasp_tool_tcp_world=target,
+                        deadline=deadline,
+                        monotonic=monotonic,
+                        terminal_endpoint_search=terminal_endpoint_search,
+                    )
+                except RM65GraspTrajectoryPlanningError as error:
+                    last_error = error
+                    attempts.append(
+                        {
+                            "distance_m": float(distance_m),
+                            "status": "rejected",
+                            "reason_code": error.reason_code,
+                            "planning_phase": error.details.get("planning_phase"),
+                            "best_position_residual_m": error.details.get(
+                                "best_position_residual_m"
+                            ),
+                            "best_orientation_residual_deg": error.details.get(
+                                "best_orientation_residual_deg"
+                            ),
+                            "endpoint_seed_count": error.details.get(
+                                "endpoint_seed_count"
+                            ),
+                            "collision_examples": error.details.get(
+                                "collision_examples", []
+                            ),
+                        }
+                    )
+                    if error.reason_code in {
+                        "path_planning_time_budget_exhausted",
+                        "path_collision_check_unavailable",
+                        "endpoint_collision_check_unavailable",
+                        "approach_endpoint_collision_check_unavailable",
+                        "approach_endpoint_safety_envelope_unavailable",
+                        "path_target_safety_envelope_unavailable",
+                        "target_safety_envelope_unavailable",
+                    }:
+                        break
+                    continue
                 attempts.append(
                     {
                         "distance_m": float(distance_m),
-                        "status": "rejected",
-                        "reason_code": error.reason_code,
-                        "planning_phase": error.details.get("planning_phase"),
-                        "best_position_residual_m": error.details.get(
-                            "best_position_residual_m"
-                        ),
-                        "best_orientation_residual_deg": error.details.get(
-                            "best_orientation_residual_deg"
-                        ),
-                        "endpoint_seed_count": error.details.get(
-                            "endpoint_seed_count"
-                        ),
-                        "collision_examples": error.details.get(
-                            "collision_examples", []
-                        ),
+                        "status": "local_chain_valid",
+                        "branch_count": len(prepared.candidates),
                     }
                 )
-                if error.reason_code in {
-                    "path_planning_time_budget_exhausted",
-                    "path_collision_check_unavailable",
-                    "endpoint_collision_check_unavailable",
-                    "approach_endpoint_collision_check_unavailable",
-                    "approach_endpoint_safety_envelope_unavailable",
-                    "path_target_safety_envelope_unavailable",
-                    "target_safety_envelope_unavailable",
-                }:
-                    break
-                continue
-            attempts.append(
-                {
-                    "distance_m": float(distance_m),
-                    "status": "local_chain_valid",
-                    "branch_count": len(prepared.candidates),
-                }
-            )
+                return RM65GraspLocalChainResult(
+                    feasible=True,
+                    selected_pregrasp_distance_m=float(distance_m),
+                    branch_count=len(prepared.candidates),
+                    elapsed_ms=max(0.0, (float(monotonic()) - started) * 1_000.0),
+                    reason_code=None,
+                    attempts=tuple(attempts),
+                    joint_travel_rad=tuple(self._local_chain_joint_travel(
+                        prepared.candidates[0][1], current=np.asarray(qpos_by_side[side]), side=side)),
+                    terminal_qpos=tuple(float(value) for value in
+                        prepared.candidates[0][1].endpoint.qpos_by_side[side]),
+                )
             return RM65GraspLocalChainResult(
-                feasible=True,
-                selected_pregrasp_distance_m=float(distance_m),
-                branch_count=len(prepared.candidates),
+                feasible=False,
+                selected_pregrasp_distance_m=None,
+                branch_count=0,
                 elapsed_ms=max(0.0, (float(monotonic()) - started) * 1_000.0),
-                reason_code=None,
+                reason_code=(
+                    "local_grasp_chain_rejected"
+                    if last_error is None
+                    else last_error.reason_code
+                ),
                 attempts=tuple(attempts),
-                joint_travel_rad=tuple(self._local_chain_joint_travel(
-                    prepared.candidates[0][1], current=np.asarray(qpos_by_side[side]), side=side)),
             )
-        return RM65GraspLocalChainResult(
-            feasible=False,
-            selected_pregrasp_distance_m=None,
-            branch_count=0,
-            elapsed_ms=max(0.0, (float(monotonic()) - started) * 1_000.0),
-            reason_code=(
-                "local_grasp_chain_rejected"
-                if last_error is None
-                else last_error.reason_code
-            ),
-            attempts=tuple(attempts),
-        )
 
     def _plan_pregrasp_and_approach(
         self,

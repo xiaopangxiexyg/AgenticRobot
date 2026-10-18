@@ -1388,3 +1388,51 @@ def test_planning_priority_is_advisory_and_optional_for_existing_producers():
     for count in (-1, True, 1.5):
         with pytest.raises(ValueError, match="candidate_count"):
             grasp_planning_candidate_ordinals({}, candidate_count=count)
+
+
+def test_grasp_timing_separates_arm_selection_and_preserves_failed_stage(tmp_path, monkeypatch):
+    import time
+
+    from deployments.perception.sam2_graspgenx_point_grasp import (
+        GraspGenXCandidateSelection,
+    )
+
+    depth = np.zeros((20, 20), dtype=np.float32)
+    depth[8:13, 8:13] = 1.
+    pose = np.eye(4)
+    pose[2, 3] = .975
+    planner = Sam2GraspGenXPointGraspPlanner(model_spec=_model_spec(tmp_path),
+        point_segmenter=_Segmenter(depth > 0), client=_PlannerClient(pose[None], np.array([.9])))
+    planner.start()
+    options = {"pixel_uv": (10, 10), "intrinsics": {"width": 20, "height": 20,
+        "fx": 100., "fy": 100., "cx": 10., "cy": 10.}, "base_from_camera": np.eye(4), "max_candidates": 1}
+
+    def select(*_):
+        time.sleep(.02)
+        return GraspGenXCandidateSelection((0,), {})
+
+    image = Image.new("RGB", (20, 20))
+    try:
+        planner.plan(image, depth, candidate_selector=select, **options)
+        timings = planner.last_plan_timing_ms
+        assert timings["arm_candidate_selection"] >= 15.
+        assert timings["candidate_ranking_and_visible_collision"] == pytest.approx(
+            timings["arm_candidate_selection"] + timings["candidate_filtering_excluding_arm_selection"], abs=1.)
+
+        def fail(*_, **__):
+            raise RuntimeError("selection_failed")
+
+        with pytest.raises(RuntimeError, match="selection_failed"):
+            planner.plan(image, depth, candidate_selector=fail, **options)
+        assert planner.last_plan_timing_ms["arm_candidate_selection"] < timings["arm_candidate_selection"]
+        assert "graspgenx_inference" in planner.last_plan_timing_ms
+        monkeypatch.setattr(planner.point_segmenter, "segment_point", fail)
+        with pytest.raises(RuntimeError, match="selection_failed"):
+            planner.plan(image, depth, **options)
+        assert set(planner.last_plan_timing_ms) == {"sam2_inference", "plan_total"}
+    finally:
+        planner.close()
+
+    with pytest.raises(RuntimeError, match="not running"):
+        planner.plan(image, depth, **options)
+    assert planner.last_plan_timing_ms == {}

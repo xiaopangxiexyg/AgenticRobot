@@ -201,6 +201,7 @@ class RM65PointGraspReachabilityAdapter:
         *,
         measured_qpos_cut: Any | None = None,
         measurement_reference_time: float | None = None,
+        endpoint_seeds: dict[tuple[float, ...], tuple[float, ...]] | None = None,
     ) -> GraspGenXCandidateSelection:
         """Admit candidates whose production local grasp chain is feasible."""
 
@@ -542,6 +543,11 @@ class RM65PointGraspReachabilityAdapter:
             else:
                 selected.append(item)
         selected = (selected + deferred)[: int(maximum)]
+        if endpoint_seeds is not None:
+            for item in selected:
+                terminal_qpos = getattr(item["local_chain"], "terminal_qpos", None)
+                if terminal_qpos is not None:
+                    endpoint_seeds[tuple(item["solver_pose"].reshape(-1))] = terminal_qpos
         return GraspGenXCandidateSelection(
             selected_indices=tuple(int(item["index"]) for item in selected),
             diagnostics={
@@ -602,6 +608,7 @@ class RM65PointGraspReachabilityAdapter:
         *,
         measured_qpos_cut: Any | None = None,
         measurement_reference_time: float | None = None,
+        endpoint_seeds: Mapping[tuple[float, ...], tuple[float, ...]] | None = None,
     ) -> tuple[Mapping[str, Any], tuple[Mapping[str, Any], ...]]:
         if not 1 <= len(candidate_reference_from_tool_tcp) <= 5:
             raise ValueError("Reachability requires one to five candidates.")
@@ -613,11 +620,13 @@ class RM65PointGraspReachabilityAdapter:
         results = []
         for candidate in candidate_reference_from_tool_tcp:
             solver_pose = self._solver_pose(candidate)
+            initial_seed = None if endpoint_seeds is None else endpoint_seeds.get(tuple(solver_pose.reshape(-1)))
             result = self.planner.assess_endpoint_ik(
                 qpos_by_side=qpos_cut.qpos_by_side,
                 side=self.profile.arm_side,
                 target_tool_tcp_world=solver_pose,
                 monotonic=self.monotonic,
+                **({"initial_seed_qpos": np.asarray(initial_seed)} if initial_seed is not None else {}),
             )
             results.append(result.to_dict())
         context = {
