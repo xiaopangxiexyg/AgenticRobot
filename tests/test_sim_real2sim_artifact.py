@@ -23,6 +23,10 @@ ARM_BASELINE_PATH = Path(
 )
 ARM_RUNTIME_BINDING_PATH = Path(
     "sim/rm65/real2sim/artifacts/"
+    "rm65_arm_free_motion_20260721_v4_runtime_binding_20261018_v8.json"
+)
+ARM_RUNTIME_BINDING_V7_PATH = Path(
+    "sim/rm65/real2sim/artifacts/"
     "rm65_arm_free_motion_20260721_v4_runtime_binding_20261017_v7.json"
 )
 ARM_RUNTIME_BINDING_V5_PATH = Path(
@@ -270,7 +274,7 @@ def test_v4_arm_fit_baseline_remains_frozen_and_provisional() -> None:
 def test_current_arm_runtime_binding_uses_exact_current_inputs() -> None:
     binding = Real2SimArtifactManifest.load(ARM_RUNTIME_BINDING_PATH)
     fit = Real2SimArtifactManifest.load(ARM_BASELINE_PATH)
-    previous = Real2SimArtifactManifest.load(ARM_RUNTIME_BINDING_V5_PATH)
+    previous = Real2SimArtifactManifest.load(ARM_RUNTIME_BINDING_V7_PATH)
     artifacts = {
         artifact.artifact_id: artifact
         for artifact in binding.dependency_artifacts
@@ -288,28 +292,28 @@ def test_current_arm_runtime_binding_uses_exact_current_inputs() -> None:
             artifact_kind="real2sim_fit_artifact",
         ).sha256
     )
-    assert artifacts["rm65-arm-profile-runtime-20261017-v7"].sha256 == (
+    assert artifacts["rm65-arm-profile-runtime-20261018-v8"].sha256 == (
         ArtifactRef.from_file(
             ARM_PROFILE_PATH,
             artifact_id="profile-check",
             artifact_kind="actuation_profile",
         ).sha256
     )
-    assert artifacts["rm65-arm-actuator-core-runtime-20261017-v7"].sha256 == (
+    assert artifacts["rm65-arm-actuator-core-runtime-20261018-v8"].sha256 == (
         ArtifactRef.from_file(
             ARM_CORE_PATH,
             artifact_id="core-check",
             artifact_kind="sim_actuator_core_source",
         ).sha256
     )
-    assert artifacts["rm65-arm-mujoco-executor-runtime-20261017-v7"].sha256 == (
+    assert artifacts["rm65-arm-mujoco-executor-runtime-20261018-v8"].sha256 == (
         ArtifactRef.from_file(
             ARM_MUJOCO_ADAPTER_PATH,
             artifact_id="executor-check",
             artifact_kind="sim_backend_adapter_source",
         ).sha256
     )
-    assert artifacts["rm65-camera-registry-runtime-20261017-v7"].sha256 == (
+    assert artifacts["rm65-camera-registry-runtime-20261018-v8"].sha256 == (
         ArtifactRef.from_file(
             CAMERA_REGISTRY_PATH,
             artifact_id="camera-registry-check",
@@ -338,10 +342,10 @@ def test_current_arm_runtime_binding_uses_exact_current_inputs() -> None:
     assert binding.metadata["runtime_behavior_change"] is True
     assert (
         binding.metadata["runtime_behavior_change_scope"]
-        == "offline_tcp_envelope_final_command_admission"
+        == "offline_mujoco_target_bound_grasp_contact_guard"
     )
     assert binding.metadata["runtime_source_commit"] == (
-        "b528f0de6a56f23e0244cda11a9e9608288385f7"
+        "910c6b76636c894ef08fbd6af762e8587126ba71"
     )
     assert binding.fidelity_claims[0].status == "provisional"
     held_out = next(
@@ -351,12 +355,33 @@ def test_current_arm_runtime_binding_uses_exact_current_inputs() -> None:
     )
     assert held_out.status == "not_run"
 
-    for label in ("command-guard", "envelope-adapter", "position-rig", "position-assembly"):
-        artifact = artifacts[f"rm65-{label}-runtime-20261017-v7"]
+    assert artifacts["rm65-arm-runtime-binding-20261017-v7"].sha256 == (
+        ArtifactRef.from_file(
+            ARM_RUNTIME_BINDING_V7_PATH, artifact_id="previous-binding-check",
+            artifact_kind="real2sim_runtime_binding",
+        ).sha256
+    )
+    for label in (
+        "command-guard", "envelope-adapter", "position-rig", "position-assembly",
+        "collision-oracle", "collision-projection", "collision-result",
+        "grasp-contact", "planned-tcp-motion",
+    ):
+        artifact = artifacts[f"rm65-{label}-runtime-20261018-v8"]
         assert artifact.sha256 == ArtifactRef.from_file(
             artifact.locator, artifact_id="command-source-check",
             artifact_kind="sim_command_admission_source",
         ).sha256
+
+
+def test_v7_arm_runtime_binding_remains_frozen_after_scoped_contact_guard() -> None:
+    binding = Real2SimArtifactManifest.load(ARM_RUNTIME_BINDING_V7_PATH)
+    assert binding.artifact_sha256 == "bfb52780d549c5221201fde7f33dd95079c33dafe94c40ab4cf5a7931d0fbac6"
+    assert ArtifactRef.from_file(
+        ARM_RUNTIME_BINDING_V7_PATH, artifact_id="frozen-v7-check",
+        artifact_kind="real2sim_runtime_binding",
+    ).sha256 == "1ce52c5c3cbd0a95e999efead5fa00ca2c8098b75eb76bfc896ad503b26dbbe7"
+    assert binding.fidelity_claims[0].status == "provisional"
+    assert next(e for e in binding.validation_evidence if e.split == "held_out").status == "not_run"
 
 
 def test_v5_arm_runtime_binding_remains_frozen_after_final_command_admission() -> None:

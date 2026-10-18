@@ -92,15 +92,19 @@ core and MuJoCo adapter used for the 20260721 fit; tests compare those hashes to
 fixed historical values rather than silently reinterpreting the fit against
 the current files.
 
-The current runtime-source binding is
-`artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261017_v7.json`.
-It content-addresses the current arm profile, backend-independent actuator core,
-MuJoCo executor, final command admission and its envelope/rig/assembly sources,
-simulation contract, camera registry, frozen v4 fit, and the preceding v5 binding.
-It records the optional offline final TCP envelope admission and copied
-held-control response. This is discrete simulation evidence, without swept-TCP
-certification, future gripper-input coverage, a refit or real-robot braking proof.
-The `provisional` claim and held-out `not_run` status remain unchanged.
+当前运行时源码绑定是
+`artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261018_v8.json`。
+它绑定当前 actuator、MuJoCo executor、最终命令准入、rig／assembly，以及显式
+目标接触的 oracle、projection、result、binding 和 planned-motion 源码，同时保留
+原 simulation contract、相机登记、冻结 v4 拟合及 v7／v5 运行时绑定的精确身份。
+本次相对 v7 改动两个既有源码文件，并新增五项接触路径源码依赖；没有调整执行器
+参数、重新拟合或改写历史清单。14 模块的离线报告按内容哈希登记，包含原生接触、
+撤销临时 guard 后的实测复核及只读候选预览；它不证明真机抓取、制动或 swept-TCP
+安全。`provisional` 及 held-out `not_run` 保持不变，完整组合验收单独记录。
+
+v7 仍冻结保留于
+`artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261017_v7.json`。
+它记录当时最终 TCP command admission 的源码身份；其哈希不随新接触 guard 更新。
 
 The v5 runtime-source binding remains immutable at
 `artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20260922_v5.json`.
