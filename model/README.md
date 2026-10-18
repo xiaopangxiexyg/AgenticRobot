@@ -20,6 +20,7 @@ non-canonical learner experiments belong under `experiments/policy_learning/`.
 Initialize the external sources after clone or pull with:
 
 ```bash
+git submodule sync -- model/perception/graspgenx
 git submodule update --init --recursive -- \
   model/openpi model/perception/sam2 model/perception/GroundingDINO \
   model/perception/vgn model/perception/graspnet-baseline \
