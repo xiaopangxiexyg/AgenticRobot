@@ -255,3 +255,26 @@ def test_camera_only_startup_wrapper_is_fixed_and_rejects_preflight_conflict(wra
     if not conflict:
         assert "--camera-startup-check" in result.stdout
         assert "--interactive" not in result.stdout
+
+
+@pytest.mark.parametrize("apply", [False, True])
+def test_left_udp_destination_preview_preserves_explicit_write_scope(wrapper_environment, apply):
+    environment, calls = wrapper_environment
+    arguments = ["-H", "trusted-target", "--repo", "/repo", "--python", "/python",
+        "--arm-ip-assignment", "/arms.json", "--left-controller-ip", "192.0.2.21",
+        "--from-ip", "198.51.100.10", "--to-ip", "192.0.2.10", "--output", "/new-output", "--dry-run"]
+    if apply:
+        arguments.append("--apply")
+    result = _run(environment, "remote_rm65_left_udp_destination.sh", *arguments)
+    assert result.returncode == 0
+    assert not calls.exists()
+    assert "60s" in result.stdout
+    assert (" --apply" in result.stdout) == apply
+
+
+@pytest.mark.parametrize("argument", ["--side", "--command", "--port", "--allow-control-risk"])
+def test_left_udp_destination_rejects_scope_expansion_before_ssh(wrapper_environment, argument):
+    environment, calls = wrapper_environment
+    result = _run(environment, "remote_rm65_left_udp_destination.sh", "-H", "trusted-target", argument)
+    assert result.returncode != 0
+    assert not calls.exists()

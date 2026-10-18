@@ -421,3 +421,31 @@ def test_capture_without_both_acknowledgements_fails_before_hardware() -> None:
     )
     with pytest.raises(RuntimeError, match="--i-understand-no-motion"):
         trace.capture(args)
+
+@pytest.mark.parametrize("restore_failure", [False, True])
+def test_unwritable_journal_still_attempts_verified_original_recovery(monkeypatch, tmp_path, restore_failure):
+    path = tmp_path / "disk-full.recovery.json"
+    _journal(path)
+    original = path.read_bytes()
+    calls = []
+
+    def full(*args, **kwargs):
+        raise OSError(28, "disk_full")
+
+    def restore(ip, config):
+        calls.append(ip)
+        if restore_failure and ip == "192.168.1.20":
+            raise trace.RestoreError("synthetic readback failure")
+        return config
+
+    monkeypatch.setattr(trace, "_atomic_write_json", full)
+    monkeypatch.setattr(trace, "set_and_verify_config", restore)
+    with pytest.raises((OSError, trace.RestoreError)) as caught:
+        trace.restore_journal(path, actor="disk_full_test")
+    assert calls == ["192.168.1.20", "192.168.101.21"]
+    assert isinstance(caught.value, trace.RestoreError)
+    assert "disk_full" in str(caught.value)
+    if restore_failure:
+        assert "synthetic readback failure" in str(caught.value)
+    assert path.read_bytes() == original
+    assert json.loads(path.read_text())["status"] == "configured"

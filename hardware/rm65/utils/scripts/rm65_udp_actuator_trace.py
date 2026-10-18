@@ -417,7 +417,12 @@ def restore_journal(path: Path, *, actor: str) -> None:
     journal["status"] = "restoring"
     journal["restore_actor"] = str(actor)
     journal["restore_started_wall_time"] = time.time()
-    _atomic_write_json(path, journal)
+    record_errors: list[str] = []
+    try:
+        _atomic_write_json(path, journal)
+    except OSError as record_error:
+        # The persisted original configuration still permits verified recovery.
+        record_errors.append(f"restoring journal: {type(record_error).__name__}: {record_error}")
     failures: list[str] = []
     restored: dict[str, Any] = {}
     for item in reversed(_journal_arms(journal)):
@@ -431,14 +436,18 @@ def restore_journal(path: Path, *, actor: str) -> None:
     journal = _load_json(path)
     journal["restore_finished_wall_time"] = time.time()
     journal["restored_config_by_side"] = restored
-    if failures:
-        journal["status"] = "restore_failed"
-        journal["restore_failures"] = failures
+    journal["status"] = "restore_failed" if failures else "restored"
+    journal["restore_failures"] = failures
+    if record_errors:
+        journal["restore_record_errors"] = record_errors
+    try:
         _atomic_write_json(path, journal)
-        raise RestoreError("; ".join(failures))
-    journal["status"] = "restored"
-    journal["restore_failures"] = []
-    _atomic_write_json(path, journal)
+    except OSError as record_error:
+        detail = "; ".join([*failures, *record_errors,
+                            f"final journal: {type(record_error).__name__}: {record_error}"])
+        raise RestoreError(f"Recovery journal could not be saved: {detail}") from record_error
+    if failures:
+        raise RestoreError("; ".join([*failures, *record_errors]))
 
 
 def recovery_journal_paths(roots: Iterable[Path]) -> tuple[Path, ...]:
