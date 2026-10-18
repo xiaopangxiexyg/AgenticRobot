@@ -1032,6 +1032,8 @@ def test_continuous_arrival_does_not_recharge_planned_velocity_cut_to_memory(dir
     runtime._previous_overlay_nm = direction*.3
     runtime._command_delta = (0., 0., direction*.3, 0., 0., 0.)
     runtime._last_output_zero = runtime._final_zero_confirmed = False
+    target_speed = 2.*(.02-q)
+    velocity_error = .008-target_speed
     # A prescribed constant-speed window isolates the receipt algebra. This
     # is not a plant forecast: each receipt matches its preceding request.
     for n in range(1, 9):
@@ -1039,15 +1041,15 @@ def test_continuous_arrival_does_not_recharge_planned_velocity_cut_to_memory(dir
             target=.02, speed=.008, raw=.008, span=.0012, raw_limit=.13, dt_sec=interval)
         assert frame.motion.arrival_stabilization_active
         assert not frame.motion.arrival_unloading
-        assert frame.tracking_recovery["tracking_velocity_correction_nm"] > .05
+        assert frame.tracking_recovery["tracking_velocity_correction_nm"] == pytest.approx(10.*velocity_error)
         assert frame.tracking_recovery["dispatch_tracking_cut_nm"] == pytest.approx(0.)
-        assert abs(runtime._tracking_bias_nm) == pytest.approx(.3-n*20.*.008*interval)
+        assert abs(runtime._tracking_bias_nm) == pytest.approx(.3-n*20.*velocity_error*interval)
     previous = abs(runtime._tracking_bias_nm)
     runtime._command_delta = (0., 0., runtime._previous_overlay_nm-direction*.1, 0., 0., 0.)
     frame = _held_tick(runtime, now+9*interval, q, direction=direction,
         target=.02, speed=.008, raw=.008, span=.0012, raw_limit=.13, dt_sec=interval)
     assert frame.tracking_recovery["dispatch_tracking_cut_nm"] == pytest.approx(.1)
-    assert abs(runtime._tracking_bias_nm) == pytest.approx(previous-.1-20.*.008*interval)
+    assert abs(runtime._tracking_bias_nm) == pytest.approx(previous-.1-20.*velocity_error*interval)
 
 
 @pytest.mark.parametrize("direction", [-1, 1])
@@ -1146,6 +1148,125 @@ def test_recorded_arrival_restore_jump_is_not_a_fast_damping_command(direction, 
         # A genuine speed brake remains fast (2 * .10835 = .2167).
         assert output == pytest.approx(direction*.2167)
         assert runtime._motion_frame.torque_transition_reason == "fast_tracking_withdrawal_or_brake"
+
+
+@pytest.mark.parametrize("direction", [-1, 1])
+@pytest.mark.parametrize("arrival", [False, True])
+def test_recorded_arrival_drive_removal_is_not_a_terminal_brake(direction, arrival):
+    runtime, _, _, frame = _arrival_runtime(direction, continuous_limit=.0585)
+    runtime.config = replace(runtime.config, motion_control=replace(
+        runtime.config.motion_control, braking_slew_nm_s=10.))
+    runtime._previous_overlay_nm = direction*.35329
+    runtime._command_delta = (0., 0., direction*.35329, 0., 0., 0.)
+    runtime._last_output_zero = runtime._final_zero_confirmed = False
+    runtime._motion_frame = replace(frame.motion,
+        arrival_stabilization_active=arrival, arrival_unloading=False,
+        reason="target_reached_braking" if arrival else "soft_velocity_braking",
+        tracking_recent_velocity_rad_s=direction*.04,
+        tracking_recent_position_span_rad=.0012)
+    runtime._stop_evidence = replace(runtime._stop_evidence,
+        raw_qvel_rad_s=(0., 0., direction*.0639, 0., 0., 0.),
+        position_span_rad=(0., 0., .0012, 0., 0., 0.))
+    # 6kxiophs: entering arrival withdrew -.35329 -> 0 before recoil.
+    # Normal arrival must not use either fast-brake or fast-tail removal.
+    output = runtime._responsive_tracking_output(0., direction*.0367, .025)
+    if arrival:
+        assert output == pytest.approx(direction*(.35329-.5*.025))
+        assert runtime._motion_frame.torque_transition_reason == "bounded_arrival_drive_reduction"
+    else:
+        assert output == 0.
+        assert runtime._motion_frame.torque_transition_reason == "fast_resolved_drive_removal"
+
+
+@pytest.mark.parametrize("direction", [-1, 1])
+def test_recorded_arrival_pi_and_slew_keep_the_loaded_command_continuous(direction):
+    runtime, _, _, frame = _arrival_runtime(direction, continuous_limit=.0585)
+    runtime.config = replace(runtime.config, settle_error_rad=.01352,
+        motion_control=replace(runtime.config.motion_control, braking_slew_nm_s=10.))
+    runtime._tracking_bias_nm = direction*.43191
+    runtime._previous_overlay_nm = direction*.35329
+    runtime._command_delta = (0., 0., direction*.35329, 0., 0., 0.)
+    runtime._last_output_zero = runtime._final_zero_confirmed = False
+    runtime._tracking_recovery = {"reason": "bounded_velocity_error_maintenance"}
+    runtime._motion_frame = replace(frame.motion,
+        target_error_rad=direction*.011607, target_position_rad=0., q_reference_rad=0.,
+        position_torque_nm=direction*.13928, velocity_torque_nm=-direction*.07347,
+        requested_torque_nm=direction*.06581, arrival_brake_error_rad=.01272,
+        tracking_recent_velocity_rad_s=direction*.04,
+        tracking_recent_position_span_rad=.0012, arrival_unloading=False)
+    runtime._stop_evidence = replace(runtime._stop_evidence,
+        qpos_rad=(0., 0., -direction*.011607, 0., 0., 0.),
+        raw_qvel_rad_s=(0., 0., direction*.0639, 0., 0., 0.),
+        window_qvel_rad_s=(0., 0., direction*.0367, 0., 0., 0.),
+        position_span_rad=(0., 0., .0012, 0., 0., 0.))
+    # Prescribed 6kxiophs arrival boundary, reflected in both directions.
+    # Exercise composition AND slew; do not infer a physical trajectory.
+    requested = runtime._tracking_recovery_output(
+        runtime._motion_frame, frame.base_frame, .025, direction*.0367, 1.)
+    motion = runtime._motion_frame
+    recovery = runtime._tracking_recovery
+    output = runtime._responsive_tracking_output(requested, direction*.0367, .025)
+    assert recovery["target_velocity_rad_s"] == pytest.approx(direction*.0075)
+    assert direction*requested > 0.
+    assert abs(runtime._tracking_bias_nm) <= .35329
+    assert output == pytest.approx(direction*(.35329-.5*.025))
+    assert runtime._motion_frame.arrival_stabilization_active
+    assert motion.target_error_rad == direction*.011607
+
+
+@pytest.mark.parametrize("direction", [-1, 1])
+def test_continuous_arrival_keeps_position_velocity_demand_inside_trigger_band(direction):
+    runtime, now, q, _ = _arrival_runtime(direction, continuous_limit=.05)
+    frame = _held_tick(runtime, now+.025, q, direction=direction,
+        target=.02, speed=.008, raw=.008, span=.0012, raw_limit=.13, dt_sec=.025)
+    assert frame.motion.arrival_stabilization_active and not frame.motion.arrival_unloading
+    error = direction*(.02-q)
+    gain = (runtime.config.tracking_recovery_gain_nm_per_rad
+        / runtime.config.tracking_recovery_velocity_feedback_nm_s_per_rad)
+    assert frame.tracking_recovery["target_velocity_rad_s"] == pytest.approx(gain*error)
+    assert direction*frame.tracking_recovery["target_velocity_rad_s"] > 0.
+    # Demand tapers to zero at the actual target, not at the earlier capture
+    # boundary. Keep explicit motion evidence so this is not a quiet dwell.
+    while q < .02:
+        q = min(.02, q+.0001)
+        now += .025
+        frame = _held_tick(runtime, now+.025, q, direction=direction,
+            target=.02, speed=.004, raw=.004, span=.0012, raw_limit=.13, dt_sec=.025)
+        assert frame.motion.arrival_stabilization_active
+        assert frame.tracking_recovery["target_velocity_rad_s"] == pytest.approx(
+            direction*gain*(.02-q))
+    assert frame.tracking_recovery["target_velocity_rad_s"] == 0.
+
+
+@pytest.mark.parametrize("direction", [-1, 1])
+def test_continuous_arrival_cannot_accept_a_pose_that_drifts_after_final_zero(direction):
+    runtime, now, q, _ = _arrival_runtime(direction, continuous_limit=.05)
+    for _ in range(200):
+        now += .025
+        frame = _held_tick(runtime, now, q, direction=direction,
+            target=.02, raw_limit=.13, dt_sec=.025)
+        if frame.motion.arrival_unloading and runtime._final_zero_confirmed:
+            break
+    else:
+        pytest.fail("arrival never produced a complete zero receipt")
+    onset_clock = runtime._breakaway_started_sec
+    # Prescribed low-speed recoil, not a claimed physical load model. A pose
+    # outside the SAME final band must not be captured just because zero was
+    # acknowledged earlier, nor may its original braking clock be restarted.
+    for n in range(1, 180):
+        now += .025
+        moved = q-min(.0016, n*.0002)
+        frame = _held_tick(runtime, now, moved, direction=direction,
+            target=.02, speed=-.008 if n <= 8 else 0.,
+            raw=-.008 if n <= 8 else 0., span=.0012 if n <= 8 else .000384,
+            raw_limit=.13, dt_sec=.025)
+        assert frame.phase is not B601StagedAssistPhase.SOFT_HOLD
+        assert runtime._breakaway_started_sec == onset_clock
+        assert abs(frame.overlay_torque_nm[2]) <= runtime.config.max_total_overlay_nm
+        if frame.release_terminal:
+            break
+    assert frame.release_terminal
+    assert runtime._release_reason == "braking_timeout_assist_withdrawn"
 
 
 @pytest.mark.parametrize("direction", [-1, 1])

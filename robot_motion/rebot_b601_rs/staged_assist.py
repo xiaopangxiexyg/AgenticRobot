@@ -1239,21 +1239,23 @@ class B601StagedSingleJointAssistRuntime:
             direction = (self._intent_direction
                 if arrival_active and config.continuous_speed_limit_rad_s is None
                 else math.copysign(1.0, motion.target_error_rad))
+            stopping_distance = abs(motion.target_error_rad)
+            if config.continuous_speed_limit_rad_s is None:
+                stopping_distance = max(0.0, stopping_distance-arrival_error)
             target_velocity = math.copysign(1.0, motion.target_error_rad) * min(
                 config.max_reference_velocity_rad_s,
-                math.sqrt(2 * config.max_reference_acceleration_rad_s2 * max(
-                    0.0, abs(motion.target_error_rad) - arrival_error)),
+                math.sqrt(2 * config.max_reference_acceleration_rad_s2 * stopping_distance),
             )
-            if (motion.phase == "track" and config.continuous_speed_limit_rad_s is not None
+            if (config.continuous_speed_limit_rad_s is not None
                 and self.config.tracking_recovery_velocity_feedback_nm_s_per_rad > 0):
-                # Track the dispatched trajectory, not a constant goalward
-                # speed after the measured joint has passed that reference.
-                # Ki/Kv is the existing PI velocity-loop crossover (1/s).
-                # A stuck joint behind a paused reference still has a positive
-                # demand; a joint ahead of it cannot keep accumulating drive.
+                # One Ki/Kv position-to-speed demand for TRACK and arrival.
+                # The inner arrival band changes the reference to the goal,
+                # not the remaining stopping distance to zero. A paused TRACK
+                # reference still cannot accumulate drive behind the plant.
                 position_gain = (self.config.tracking_recovery_gain_nm_per_rad
                     / self.config.tracking_recovery_velocity_feedback_nm_s_per_rad)
-                reference_demand = motion.qvel_reference_rad_s + position_gain * (
+                reference_demand = (0.0 if arrival_active else motion.qvel_reference_rad_s) + position_gain * (
+                    motion.target_error_rad if arrival_active else
                     motion.q_reference_rad-self._stop_evidence.qpos_rad[self.joint_index])
                 target_velocity = direction * min(abs(target_velocity), max(0., direction*reference_demand))
             if (motion.phase == "track" and motion.continuous_speed_scale is not None
@@ -1434,14 +1436,17 @@ class B601StagedSingleJointAssistRuntime:
             rate = self.config.motion_control.arrival_unload_slew_nm_s
             reason = "gradual_arrival_unloading"
         elif self._phase is B601StagedAssistPhase.BRAKE:
-            if continuous_arrival and abs(requested) > abs(previous):
+            if continuous_arrival:
                 # Arrival includes a target spring and maintenance, not just
-                # damping. Even a directionally opposing sum cannot authorize
-                # restoring that entire drive at the fast braking slew: a
-                # velocity-cut/fast-restore cycle can excite gearbox recoil.
-                # Actual speed/terminal braking has already left arrival and
-                # retains its original fast lane; drive removal is unchanged.
-                reason = "bounded_arrival_correction_rise"
+                # damping. Neither restoring nor removing the whole sum is a
+                # safety brake. Use ordinary rise and the existing controlled
+                # unloading rate for reduction; genuine speed/terminal brakes
+                # have already left arrival and retain their fast lane.
+                if abs(requested) > abs(previous):
+                    reason = "bounded_arrival_correction_rise"
+                else:
+                    rate = self.config.motion_control.arrival_unload_slew_nm_s
+                    reason = "bounded_arrival_drive_reduction"
             else:
                 rate = self.config.motion_control.braking_slew_nm_s
                 reason = "fast_tracking_withdrawal_or_brake"
@@ -1459,6 +1464,7 @@ class B601StagedSingleJointAssistRuntime:
         motion = self._motion_frame
         direction = self._intent_direction
         if (self.config.motion_control.continuous_speed_limit_rad_s is not None
+            and not continuous_arrival
             and direction*previous_sent > 0 and direction*previous > 0
             and direction*requested < direction*previous
             and direction*control_v >= 0.0
