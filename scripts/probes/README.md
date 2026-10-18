@@ -19,6 +19,14 @@ Experiment-specific learner, loss, training, and evaluation implementations
 belong under `experiments/`. A launcher kept here for compatibility must stay
 thin and delegate to that owner.
 
+## 冻结观测的双臂抓姿重放（纯离线）
+
+`replay_bimanual_grasp_snapshot.py` 加载已留存 RGB-D、mask、qpos 及标定，
+`--sides left right` 共用一次感知推理和物理候选池，各臂随后独立做局部链及路径准入。
+`shared_candidates.json` 保留共享池与组件诊断；逐臂结果不代表执行或抓取成功。
+原单臂入口保留，模型路径和输入要求见该工具 `--help`。它不创建真实硬件 backend；
+本次集成验证使用已留存输入或推理替身，没有启动模型服务。
+
 ## DMTAC 连续开合包络对照（纯离线）
 
 `compare_rm65_dmtac_sweep.py` 只读加载已审核 CAD 与 sparse proxy URDF，使用保存的

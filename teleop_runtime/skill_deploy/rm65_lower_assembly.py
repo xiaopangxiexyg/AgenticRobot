@@ -265,6 +265,30 @@ def build_exclusive_rm65_skill_target_builder(
     )
 
 
+def bind_exclusive_rm65_skill_target_safety(
+    *, profile: ResolvedExclusiveRM65SkillDeploymentProfile,
+    target_builder: RM65SkillTargetBuilder,
+) -> ExclusiveRM65SkillTargetSafetyRuntime:
+    """Bind the same canonical envelope in live assembly and offline planning."""
+    if not isinstance(profile, ResolvedExclusiveRM65SkillDeploymentProfile):
+        raise TypeError("profile must be resolved and typed.")
+    canonical_station_from_solver_world = np.linalg.inv(
+        np.asarray(profile.scene_world_from_canonical_station, dtype=float)
+    )
+    canonical_station_from_arm_base_by_side = {
+        side: canonical_station_from_solver_world
+        @ np.asarray(profile.scene_world_from_arm_base_by_side[side], dtype=float)
+        for side in ("left", "right")
+    }
+    return ExclusiveRM65SkillTargetSafetyRuntime.from_profile_path(
+        target_builder=target_builder,
+        station_world_from_arm_base_by_side=canonical_station_from_arm_base_by_side,
+        station_world_frame_id=RM65_SKILL_CANONICAL_STATION_FRAME_ID_V1,
+        envelope_profile_path=profile.envelope_profile_path,
+        target_world_from_solver_world=canonical_station_from_solver_world,
+    )
+
+
 def assemble_exclusive_rm65_skill_lower(
     *,
     profile: ResolvedExclusiveRM65SkillDeploymentProfile,
@@ -339,22 +363,8 @@ def assemble_exclusive_rm65_skill_lower(
             ),
         ),
     )
-    canonical_station_from_solver_world = np.linalg.inv(
-        np.asarray(profile.scene_world_from_canonical_station, dtype=float)
-    )
-    canonical_station_from_arm_base_by_side = {
-        side: canonical_station_from_solver_world
-        @ np.asarray(profile.scene_world_from_arm_base_by_side[side], dtype=float)
-        for side in ("left", "right")
-    }
-    target_safety = ExclusiveRM65SkillTargetSafetyRuntime.from_profile_path(
-        target_builder=target_builder,
-        station_world_from_arm_base_by_side=(
-            canonical_station_from_arm_base_by_side
-        ),
-        station_world_frame_id=RM65_SKILL_CANONICAL_STATION_FRAME_ID_V1,
-        envelope_profile_path=profile.envelope_profile_path,
-        target_world_from_solver_world=canonical_station_from_solver_world,
+    target_safety = bind_exclusive_rm65_skill_target_safety(
+        profile=profile, target_builder=target_builder,
     )
     startup_admission = ExclusiveRM65SkillStartupSafetyBinder(
         ports=ports,

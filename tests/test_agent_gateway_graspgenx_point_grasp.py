@@ -1477,3 +1477,148 @@ def test_grasp_timing_separates_arm_selection_and_preserves_failed_stage(tmp_pat
     with pytest.raises(RuntimeError, match="not running"):
         planner.plan(image, depth, **options)
     assert planner.last_plan_timing_ms == {}
+
+
+def _shared_proposal_fixture(tmp_path, **planner_options):
+    depth = np.zeros((20, 20), dtype=np.float32)
+    depth[8:13, 8:13] = 1.
+    poses = np.repeat(np.eye(4)[None], 3, axis=0)
+    poses[:, 2, 3] = .975
+    poses[:, 0, 3] = (-.004, 0., .004)
+    client = _PlannerClient(poses, np.array([.9, .8, .7]))
+    segmenter = _Segmenter(depth > 0)
+    planner = Sam2GraspGenXPointGraspPlanner(model_spec=_model_spec(tmp_path),
+        point_segmenter=segmenter, client=client, **planner_options)
+    options = {"pixel_uv": (10, 10), "intrinsics": {"width": 20, "height": 20,
+        "fx": 100., "fy": 100., "cx": 10., "cy": 10.},
+        "base_from_camera": np.eye(4), "max_candidates": 2}
+    return planner, Image.new("RGB", (20, 20)), depth, options
+
+
+def test_components_share_exact_pool_and_perception_once(tmp_path, monkeypatch):
+    planner, image, depth, options = _shared_proposal_fixture(tmp_path, enable_finger_exchange=True)
+    calls, pools = [], []
+    segment = planner.point_segmenter.segment_point
+    rank = planner._rank_pool
+
+    def record_segment(*args, **kwargs):
+        calls.append("segment")
+        return segment(*args, **kwargs)
+
+    def record_rank(*args, **kwargs):
+        calls.append("rank")
+        return rank(*args, **kwargs)
+
+    def select(pool, target, maximum):
+        pools.append(pool)
+        assert target == (0., 0., 1.) and maximum == 2
+        return GraspGenXCandidateSelection((2, 0), {"arm_shortlist_attempts": 2})
+
+    def empty(pool, target, maximum):
+        pools.append(pool)
+        return GraspGenXCandidateSelection((), {"arm_shortlist_attempts": 3})
+
+    monkeypatch.setattr(planner.point_segmenter, "segment_point", record_segment)
+    monkeypatch.setattr(planner, "_rank_pool", record_rank)
+    planner.start()
+    try:
+        result = planner.plan_for_components(image, depth,
+            candidate_selectors={"left_arm": select, "right_arm": empty}, **options)
+        assert calls == ["segment", "rank"] and len(planner.client.calls) == 1
+        assert pools[0] is pools[1] is result.candidate_pool
+        assert len(result.results_by_component["left_arm"].candidates) == 2
+        assert result.results_by_component["right_arm"].candidates == ()
+        assert grasp_planning_candidate_ordinals(result.filter_summary_by_component["left_arm"], candidate_count=2) == (1, 0)
+        assert grasp_planning_candidate_ordinals(result.filter_summary_by_component["right_arm"], candidate_count=0) == ()
+        assert GRASP_PLANNING_ORDER_FIELD not in planner.last_filter_summary
+        assert "selected" not in planner.last_filter_summary
+        assert set(result.selection_timing_ms_by_component) == {"left_arm", "right_arm"}
+        with pytest.raises(TypeError):
+            result.results_by_component["right_arm"] = result.results_by_component["left_arm"]
+        with pytest.raises(TypeError):
+            result.filter_summary_by_component["left_arm"]["selected"] = 7
+        for component in result.results_by_component.values():
+            assert component.target_point_camera_m == (0., 0., 1.)
+            assert component.target_mask_bbox_xyxy == (8, 8, 13, 13)
+            assert all(not hasattr(candidate, "symmetry_parent_index") for candidate in component.candidates)
+    finally:
+        planner.close()
+
+
+def test_single_component_matches_existing_explicit_arm_request(tmp_path):
+    planner, image, depth, options = _shared_proposal_fixture(tmp_path,
+        preferred_approach_origin_base_m=(-.2, 0., 0.))
+    def select(pool, target, maximum):
+        return GraspGenXCandidateSelection((1, 0), {"arm_shortlist_attempts": 2})
+    planner.start()
+    try:
+        single = planner.plan(image, depth, candidate_selector=select, **options)
+        summary = planner.last_filter_summary
+        shared = planner.plan_for_components(image, depth, candidate_selectors={"right_arm": select}, **options)
+        assert shared.results_by_component["right_arm"] == single
+        assert dict(shared.filter_summary_by_component["right_arm"]) == summary
+    finally:
+        planner.close()
+
+
+@pytest.mark.parametrize("selectors", [{}, {"": lambda *_: None}, {"left": None},
+    {"left": lambda *_: None, "right": lambda *_: None, "third": lambda *_: None}])
+def test_invalid_components_fail_before_inference(tmp_path, selectors):
+    planner, image, depth, options = _shared_proposal_fixture(tmp_path)
+    planner.start()
+    try:
+        with pytest.raises((ValueError, TypeError)):
+            planner.plan_for_components(image, depth, candidate_selectors=selectors, **options)
+        assert not planner.client.calls
+    finally:
+        planner.close()
+
+
+@pytest.mark.parametrize("indices", [(0, 0), (True,), (-1,), (999,), (0, 1, 2), ([0],)])
+def test_bad_component_admission_does_not_publish_partial_batch(tmp_path, indices):
+    planner, image, depth, options = _shared_proposal_fixture(tmp_path)
+    planner.start()
+    try:
+        with pytest.raises(ValueError, match="invalid indices"):
+            planner.plan_for_components(image, depth, candidate_selectors={
+                "left_arm": lambda *_: GraspGenXCandidateSelection((0,), {}),
+                "right_arm": lambda *_: GraspGenXCandidateSelection(indices, {})}, **options)
+        assert "arm_candidate_selection" in planner.last_plan_timing_ms
+    finally:
+        planner.close()
+
+
+def test_no_arm_admitted_is_distinct_from_no_physical_proposals(tmp_path):
+    planner, image, depth, options = _shared_proposal_fixture(tmp_path)
+    calls = []
+    def select(*_):
+        calls.append(1)
+        return GraspGenXCandidateSelection((), {})
+    planner.start()
+    try:
+        result = planner.plan_for_components(image, depth,
+            candidate_selectors={"left_arm": select, "right_arm": select}, **options)
+        assert result.candidate_pool and all(not view.candidates for view in result.results_by_component.values())
+        planner.client.grasps = np.empty((0, 4, 4))
+        planner.client.scores = np.empty((0,))
+        with pytest.raises(RuntimeError, match="No visible collision-free"):
+            planner.plan_for_components(image, depth, candidate_selectors={"left_arm": select}, **options)
+        assert len(calls) == 2
+    finally:
+        planner.close()
+
+
+def test_multiple_origins_preserve_single_origin_identity_and_validate_inputs(tmp_path):
+    single, *_ = _shared_proposal_fixture(tmp_path, preferred_approach_origin_base_m=(-.2, 0., 0.))
+    equivalent, *_ = _shared_proposal_fixture(tmp_path,
+        preferred_approach_origins_base_m=((- .2, 0., 0.),))
+    assert single.semantic_content_hash == equivalent.semantic_content_hash
+    dual, *_ = _shared_proposal_fixture(tmp_path,
+        preferred_approach_origins_base_m=((- .2, 0., 0.), (.2, 0., 0.)))
+    assert dual.semantic_content_hash != single.semantic_content_hash
+    for origins in (((0., 0.),), ((float("nan"), 0., 0.),), ((0., 0., 0.),)*3):
+        with pytest.raises(ValueError):
+            _shared_proposal_fixture(tmp_path, preferred_approach_origins_base_m=origins)
+    with pytest.raises(ValueError, match="not both"):
+        _shared_proposal_fixture(tmp_path, preferred_approach_origin_base_m=(0., 0., 0.),
+            preferred_approach_origins_base_m=((1., 0., 0.),))

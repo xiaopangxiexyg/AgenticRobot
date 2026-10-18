@@ -9,8 +9,9 @@ import math
 import threading
 import time
 from collections.abc import Callable, Mapping
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, fields, replace
 from pathlib import Path
+from types import MappingProxyType
 
 import numpy as np
 from PIL import Image
@@ -124,6 +125,30 @@ class GraspGenXCandidateSelection:
 
     selected_indices: tuple[int, ...]
     diagnostics: Mapping[str, int | float | str | None]
+
+
+CandidateSelector = Callable[
+    [tuple[PointGraspCandidate, ...], tuple[float, float, float], int],
+    GraspGenXCandidateSelection,
+]
+
+
+@dataclass(frozen=True)
+class GraspGenXComponentProposals:
+    """Shared physical proposals with explicitly named, non-executable views."""
+
+    candidate_pool: tuple[PointGraspCandidate, ...]
+    results_by_component: Mapping[str, PointGraspResult]
+    filter_summary_by_component: Mapping[str, Mapping[str, int | float | str | None]]
+    selection_timing_ms_by_component: Mapping[str, float]
+
+
+@dataclass(frozen=True)
+class _GraspGenXCandidatePool:
+    candidates: tuple[PointGraspCandidate, ...]
+    generic_indices: tuple[int, ...]
+    reserved_variant_indices: tuple[int, ...]
+    summary: Mapping[str, int | float | str | None]
 
 
 def _required(value: object, *, field_name: str) -> str:
@@ -452,6 +477,7 @@ class Sam2GraspGenXPointGraspPlanner:
             GRASPGENX_DMTAC_ORIENTATION_VARIANT_SOURCE_LIMIT
         ),
         preferred_approach_origin_base_m: tuple[float, float, float] | None = None,
+        preferred_approach_origins_base_m: tuple[tuple[float, float, float], ...] = (),
         enable_finger_exchange: bool = False,
     ) -> None:
         if not isinstance(model_spec, GraspGenXPointGraspModelSpec):
@@ -534,19 +560,25 @@ class Sam2GraspGenXPointGraspPlanner:
             raise ValueError("orientation_variant_source_limit must be in [1, 32].")
         self.orientation_variants_local_axis_degrees = orientation_variants
         self.orientation_variant_source_limit = source_limit
-        preferred_origin = None
-        if preferred_approach_origin_base_m is not None:
+        if preferred_approach_origin_base_m is not None and preferred_approach_origins_base_m:
+            raise ValueError("Specify a single approach origin or multiple origins, not both.")
+        origins = ((preferred_approach_origin_base_m,)
+            if preferred_approach_origin_base_m is not None else preferred_approach_origins_base_m)
+        if len(origins) > 2:
+            raise ValueError("At most two approach origins are supported.")
+        preferred_origins = []
+        for origin in origins:
             preferred_origin_array = np.asarray(
-                preferred_approach_origin_base_m, dtype=np.float64
+                origin, dtype=np.float64
             )
             if preferred_origin_array.shape != (3,) or not np.all(
                 np.isfinite(preferred_origin_array)
             ):
                 raise ValueError(
-                    "preferred_approach_origin_base_m must be three finite values."
+                    "Each approach origin must be three finite values."
                 )
-            preferred_origin = tuple(float(value) for value in preferred_origin_array)
-        self.preferred_approach_origin_base_m = preferred_origin
+            preferred_origins.append(tuple(float(value) for value in preferred_origin_array))
+        self.preferred_approach_origins_base_m = tuple(dict.fromkeys(preferred_origins))
         expected_collision_geometry = ParallelJawSolidGeometry(
             DMTAC_M_GRASPGENX_PALM_Z_M,
             DMTAC_M_GRASPGENX_FINGER_LENGTH_M + DMTAC_M_GRASPGENX_PROXY_FINGERTIP_EXTENSION_M,
@@ -627,8 +659,11 @@ class Sam2GraspGenXPointGraspPlanner:
                     },
                     "dmtac_arm_side_variants": {
                         "preferred_approach_origin_base_m": (
-                            self.preferred_approach_origin_base_m
+                            self.preferred_approach_origins_base_m[0]
+                            if len(self.preferred_approach_origins_base_m) == 1 else None
                         ),
+                        **({"preferred_approach_origins_base_m": self.preferred_approach_origins_base_m}
+                           if len(self.preferred_approach_origins_base_m) > 1 else {}),
                         "source_limit": GRASPGENX_DMTAC_ARM_SIDE_VARIANT_SOURCE_LIMIT,
                         "maximum_rotation_deg": (
                             GRASPGENX_DMTAC_ARM_SIDE_VARIANT_MAX_ROTATION_DEG
@@ -755,6 +790,101 @@ class Sam2GraspGenXPointGraspPlanner:
             self._closed = True
 
     def plan(
+        self, image: Image.Image, depth_m: np.ndarray, *, pixel_uv: tuple[int, int],
+        intrinsics: Mapping[str, float | int], base_from_camera: np.ndarray,
+        max_candidates: int,
+        visible_scene_factory: Callable[..., VisibleGraspScene] | None = None,
+        use_visible_target_points: bool = False,
+        candidate_selector: CandidateSelector | None = None,
+    ) -> PointGraspResult:
+        if candidate_selector is not None and not callable(candidate_selector):
+            raise TypeError("candidate_selector must be callable or None.")
+        observation, pool = self._prepare_pool(
+            image, depth_m, pixel_uv=pixel_uv, intrinsics=intrinsics,
+            base_from_camera=base_from_camera, max_candidates=max_candidates,
+            visible_scene_factory=visible_scene_factory,
+            use_visible_target_points=use_visible_target_points,
+            for_embodiment=candidate_selector is not None)
+        began = time.perf_counter()
+        try:
+            candidates, summary = self._publish_pool(pool,
+                target=observation.target_point_base_m, maximum=int(max_candidates),
+                selector=candidate_selector)
+            with self._lock:
+                self._last_filter_summary = summary
+            if not candidates:
+                self._raise_no_candidates(summary)
+            return replace(observation, candidates=candidates)
+        finally:
+            self._finish_selection_timing(began, embodied=candidate_selector is not None)
+
+    def plan_for_components(
+        self, image: Image.Image, depth_m: np.ndarray, *, pixel_uv: tuple[int, int],
+        intrinsics: Mapping[str, float | int], base_from_camera: np.ndarray,
+        max_candidates: int, candidate_selectors: Mapping[str, CandidateSelector],
+        visible_scene_factory: Callable[..., VisibleGraspScene] | None = None,
+        use_visible_target_points: bool = False,
+    ) -> GraspGenXComponentProposals:
+        """Generate once for components sharing the same gripper and scene.
+
+        Selectors retain their own arm-specific native IK/local-chain checks.
+        An empty component view means no admitted candidate in its budget, not
+        a perception failure or permission to switch arms during execution.
+        """
+        selectors = dict(candidate_selectors)
+        if not selectors or len(selectors) > 2:
+            raise ValueError("Provide one or two named component selectors.")
+        for name, selector in selectors.items():
+            _required(name, field_name="component name")
+            if not callable(selector):
+                raise TypeError("Each component selector must be callable.")
+        observation, pool = self._prepare_pool(
+            image, depth_m, pixel_uv=pixel_uv, intrinsics=intrinsics,
+            base_from_camera=base_from_camera, max_candidates=max_candidates,
+            visible_scene_factory=visible_scene_factory,
+            use_visible_target_points=use_visible_target_points, for_embodiment=True)
+        results, summaries, durations = {}, {}, {}
+        began = time.perf_counter()
+        try:
+            for name, selector in selectors.items():
+                selection_started = time.perf_counter()
+                try:
+                    candidates, summary = self._publish_pool(pool,
+                        target=observation.target_point_base_m,
+                        maximum=int(max_candidates), selector=selector)
+                finally:
+                    durations[name] = (time.perf_counter() - selection_started) * 1000.
+                results[name] = replace(observation, candidates=candidates)
+                summaries[name] = MappingProxyType(summary)
+            return GraspGenXComponentProposals(
+                candidate_pool=pool.candidates,
+                results_by_component=MappingProxyType(results),
+                filter_summary_by_component=MappingProxyType(summaries),
+                selection_timing_ms_by_component=MappingProxyType(durations))
+        finally:
+            # last_filter_summary remains the common physical funnel. Do not
+            # label the last evaluated arm's admission as a shared conclusion.
+            self._finish_selection_timing(began, embodied=True)
+
+    def _finish_selection_timing(self, began: float, *, embodied: bool) -> None:
+        elapsed = (time.perf_counter() - began) * 1000.
+        with self._lock:
+            if embodied:
+                self._last_plan_timing_ms["arm_candidate_selection"] = elapsed
+            else:
+                self._last_plan_timing_ms["candidate_filtering_excluding_arm_selection"] += elapsed
+            self._last_plan_timing_ms["candidate_ranking_and_visible_collision"] += elapsed
+            self._last_plan_timing_ms["plan_total"] += elapsed
+
+    @staticmethod
+    def _raise_no_candidates(summary: Mapping[str, object]) -> None:
+        summary_json = json.dumps(summary, sort_keys=True, separators=(",", ":"))
+        _LOGGER.error("No point-grasp candidate survived: filter_summary=%s", summary_json)
+        raise RuntimeError(
+            "No visible collision-free DMTAC M GraspGenX candidate belongs "
+            f"to the clicked region: filter_summary={summary_json}")
+
+    def _prepare_pool(
         self,
         image: Image.Image,
         depth_m: np.ndarray,
@@ -765,16 +895,8 @@ class Sam2GraspGenXPointGraspPlanner:
         max_candidates: int,
         visible_scene_factory: Callable[..., VisibleGraspScene] | None = None,
         use_visible_target_points: bool = False,
-        candidate_selector: Callable[
-            [
-                tuple[PointGraspCandidate, ...],
-                tuple[float, float, float],
-                int,
-            ],
-            GraspGenXCandidateSelection,
-        ]
-        | None = None,
-    ) -> PointGraspResult:
+        for_embodiment: bool,
+    ) -> tuple[PointGraspResult, _GraspGenXCandidatePool]:
         started = time.perf_counter()
         timing: dict[str, float] = {}
         with self._lock:
@@ -796,8 +918,6 @@ class Sam2GraspGenXPointGraspPlanner:
             raise ValueError("max_candidates must be in [1, 5].")
         if visible_scene_factory is not None and not callable(visible_scene_factory):
             raise TypeError("visible_scene_factory must be callable or None.")
-        if candidate_selector is not None and not callable(candidate_selector):
-            raise TypeError("candidate_selector must be callable or None.")
         u, v = pixel_uv
         if not (0 <= u < rgb.width and 0 <= v < rgb.height):
             raise ValueError("pixel_uv is outside the image.")
@@ -911,22 +1031,13 @@ class Sam2GraspGenXPointGraspPlanner:
                     ),
                 }
             )
-        selector_for_ranking = None
-        if candidate_selector is not None:
-            def measured_selector(*args):
-                began = time.perf_counter()
-                try:
-                    return candidate_selector(*args)
-                finally:
-                    timing["arm_candidate_selection"] = (time.perf_counter() - began) * 1000.
-            selector_for_ranking = measured_selector
         try:
-            candidates = self._rank(
+            pool = self._rank_pool(
                 grasps, scores, target_points_camera=target_points_camera,
                 target_camera=point_camera[:3], base_from_camera=transform_base_camera,
                 depth=depth, intrinsics=values, maximum=int(max_candidates),
                 filter_summary=filter_summary, visible_scene=visible_scene,
-                candidate_selector=selector_for_ranking)
+                for_embodiment=for_embodiment)
         finally:
             elapsed = (time.perf_counter() - stage_started) * 1000.
             # Preserve the inclusive legacy field; expose its exclusive child
@@ -936,17 +1047,8 @@ class Sam2GraspGenXPointGraspPlanner:
             finish_stage("candidate_ranking_and_visible_collision", stage_started)
             with self._lock:
                 self._last_filter_summary = dict(filter_summary)
-        if not candidates:
-            summary_json = json.dumps(
-                filter_summary,
-                sort_keys=True,
-                separators=(",", ":"),
-            )
-            _LOGGER.error("No point-grasp candidate survived: filter_summary=%s", summary_json)
-            raise RuntimeError(
-                "No visible collision-free DMTAC M GraspGenX candidate belongs "
-                f"to the clicked region: filter_summary={summary_json}"
-            )
+        if not pool.candidates:
+            self._raise_no_candidates(filter_summary)
         rows, columns = np.nonzero(mask)
         return PointGraspResult(
             target_point_camera_m=tuple(float(value) for value in point_camera[:3]),
@@ -957,10 +1059,10 @@ class Sam2GraspGenXPointGraspPlanner:
                 int(columns.max()) + 1,
                 int(rows.max()) + 1,
             ),
-            candidates=candidates,
-        )
+            candidates=(),
+        ), pool
 
-    def _rank(
+    def _rank_pool(
         self,
         grasps: np.ndarray,
         scores: np.ndarray,
@@ -973,18 +1075,10 @@ class Sam2GraspGenXPointGraspPlanner:
         maximum: int,
         filter_summary: dict[str, int | float | str | None] | None = None,
         visible_scene: VisibleGraspScene | None = None,
-        candidate_selector: Callable[
-            [
-                tuple[PointGraspCandidate, ...],
-                tuple[float, float, float],
-                int,
-            ],
-            GraspGenXCandidateSelection,
-        ]
-        | None = None,
-    ) -> tuple[PointGraspCandidate, ...]:
+        for_embodiment: bool = False,
+    ) -> _GraspGenXCandidatePool:
         internal_candidate_target = (
-            max(maximum, 24) if candidate_selector is not None else maximum
+            max(maximum, 24) if for_embodiment else maximum
         )
         model_base_from_tcp = np.eye(4, dtype=np.float64)
         # The saved DMTAC alignment defines GraspGenX's output as the model
@@ -1473,15 +1567,14 @@ class Sam2GraspGenXPointGraspPlanner:
 
         def prepare_arm_side_variant(
             source: _RankedGraspCandidate,
+            origin: tuple[float, float, float],
         ) -> list[_RankedGraspCandidate]:
-            if self.preferred_approach_origin_base_m is None:
-                return []
             source_approach = np.asarray(
                 source.base_from_grasp_geometry[:3, 2], dtype=np.float64
             )
             desired_horizontal = (
                 target_center_base[:2]
-                - np.asarray(self.preferred_approach_origin_base_m[:2])
+                - np.asarray(origin[:2])
             )
             desired_norm = float(np.linalg.norm(desired_horizontal))
             if desired_norm < 1e-6:
@@ -1725,9 +1818,10 @@ class Sam2GraspGenXPointGraspPlanner:
             if len(arm_source_indices) >= GRASPGENX_DMTAC_ARM_SIDE_VARIANT_SOURCE_LIMIT:
                 break
         for source_index in arm_source_indices:
-            prepared_candidates.extend(
-                prepare_arm_side_variant(model_candidates[source_index])
-            )
+            for origin in self.preferred_approach_origins_base_m:
+                prepared_candidates.extend(
+                    prepare_arm_side_variant(model_candidates[source_index], origin)
+                )
 
         ranked = []
         admitted_pose_variants: list[np.ndarray] = []
@@ -1794,7 +1888,7 @@ class Sam2GraspGenXPointGraspPlanner:
             GRASPGENX_DMTAC_SUPPORT_CLEARANCE_RETURN_LIMIT,
             (
                 GRASPGENX_DMTAC_SUPPORT_CLEARANCE_RETURN_LIMIT
-                if candidate_selector is not None
+                if for_embodiment
                 else max(0, internal_candidate_target - len(ranked))
             ),
         )
@@ -1908,7 +2002,7 @@ class Sam2GraspGenXPointGraspPlanner:
             )
         ranked.extend(support_candidates)
 
-        if candidate_selector is not None and self.enable_finger_exchange:
+        if for_embodiment and self.enable_finger_exchange:
             # A valid tilted/support-refined proposal also needs its own finger
             # exchange. Generating it only from raw poses misses that branch.
             sources = sorted(ranked, key=lambda item: (-item.score, item.click_distance_m))
@@ -1954,11 +2048,8 @@ class Sam2GraspGenXPointGraspPlanner:
 
         pool_indices = {id(item): index for index, item in enumerate(deduplicated)}
 
-        def public_candidate(item: _RankedGraspCandidate, *, for_selection=False) -> PointGraspCandidate:
-            candidate_type = GraspGenXSelectionCandidate if for_selection else PointGraspCandidate
-            lineage = ({"symmetry_parent_index": pool_indices.get(id(item.symmetry_parent))}
-                       if for_selection else {})
-            return candidate_type(
+        def public_candidate(item: _RankedGraspCandidate) -> GraspGenXSelectionCandidate:
+            return GraspGenXSelectionCandidate(
                 score=float(item.score),
                 model_score=float(item.model_score),
                 click_distance_m=float(item.click_distance_m),
@@ -1980,144 +2071,127 @@ class Sam2GraspGenXPointGraspPlanner:
                 orientation_variant_axis=item.orientation_variant_axis,
                 orientation_variant_angle_deg=item.orientation_variant_angle_deg,
                 support_clearance_world_z_m=item.support_clearance_world_z_m,
-                **lineage,
+                symmetry_parent_index=pool_indices.get(id(item.symmetry_parent)),
             )
 
         reserved_variant_indices: list[int] = []
-        if candidate_selector is not None:
-            target_reference = base_from_camera @ np.asarray(
-                (*target_camera, 1.0), dtype=np.float64
-            )
-            selection = candidate_selector(
-                tuple(public_candidate(item, for_selection=True) for item in deduplicated),
-                tuple(float(value) for value in target_reference[:3]),
-                maximum,
-            )
-            if not isinstance(selection, GraspGenXCandidateSelection):
-                raise TypeError(
-                    "candidate_selector must return GraspGenXCandidateSelection."
-                )
-            selected_indices = tuple(selection.selected_indices)
+        # Without an embodiment selector, preserve the generic perception
+        # shortlist and reserve bounded capacity for physically re-admitted
+        # DMTAC variants.
+        variant_return_limit = min(3, max(0, maximum - 1))
+        support_variant_indices = [
+            index
+            for index, item in enumerate(deduplicated)
+            if item.pose_source == "dmtac_support_clearance_variant_v1"
+        ]
+        reserved_variant_indices = support_variant_indices[
+            : min(2, variant_return_limit)
+        ]
+        orientation_variant_slots = min(
+            GRASPGENX_DMTAC_ORIENTATION_VARIANT_RETURN_LIMIT,
+            variant_return_limit - len(reserved_variant_indices),
+        )
+        support_reserved_count = len(reserved_variant_indices)
+        reserved_variant_indices.extend(
+            index
+            for index, item in enumerate(deduplicated)
+            if item.pose_source == "dmtac_local_orientation_variant_v1"
+            and index not in reserved_variant_indices
+        )
+        reserved_variant_indices = reserved_variant_indices[
+            : support_reserved_count + orientation_variant_slots
+        ]
+        reserved_variant_set = set(reserved_variant_indices)
+        combined_indices = list(reserved_variant_indices)
+        combined_set = set(combined_indices)
+        for index in default_selected_indices:
+            if len(combined_indices) == maximum:
+                break
             if (
-                len(selected_indices) > maximum
-                or len(set(selected_indices)) != len(selected_indices)
-                or any(
-                    isinstance(index, bool)
-                    or not isinstance(index, int)
-                    or not 0 <= index < len(deduplicated)
-                    for index in selected_indices
-                )
+                deduplicated[index].pose_source != "model_scored"
+                and index not in reserved_variant_set
+            ):
+                continue
+            if index not in combined_set:
+                combined_indices.append(index)
+                combined_set.add(index)
+        selected_indices = combined_indices
+        selected_set = set(selected_indices)
+        for index in range(len(deduplicated)):
+            if len(selected_indices) == maximum:
+                break
+            if deduplicated[index].pose_source != "model_scored":
+                continue
+            if index not in selected_set:
+                selected_indices.append(index)
+                selected_set.add(index)
+        for index in range(len(deduplicated)):
+            if len(selected_indices) == maximum:
+                break
+            if index not in selected_set:
+                selected_indices.append(index)
+                selected_set.add(index)
+        selected_indices = tuple(sorted(selected_indices))
+        counts["candidate_family_count"] = len(family_indices)
+        counts["candidate_variant_count"] = len(deduplicated)
+        counts["distinct_approach_count"] = len(representative_indices)
+        if filter_summary is not None:
+            filter_summary.update(counts)
+        return _GraspGenXCandidatePool(
+            candidates=tuple(public_candidate(item) for item in deduplicated),
+            generic_indices=tuple(selected_indices),
+            reserved_variant_indices=tuple(reserved_variant_indices),
+            summary=MappingProxyType(dict(filter_summary) if filter_summary is not None else counts),
+        )
+
+    @staticmethod
+    def _publish_pool(
+        pool: _GraspGenXCandidatePool, *, target: tuple[float, float, float],
+        maximum: int, selector: CandidateSelector | None,
+    ) -> tuple[tuple[PointGraspCandidate, ...], dict[str, int | float | str | None]]:
+        counts = dict(pool.summary)
+        reserved = pool.reserved_variant_indices if selector is None else ()
+        selected_indices = pool.generic_indices
+        if selector is not None:
+            selection = selector(pool.candidates, target, maximum)
+            if not isinstance(selection, GraspGenXCandidateSelection):
+                raise TypeError("candidate_selector must return GraspGenXCandidateSelection.")
+            preferred_indices = tuple(selection.selected_indices)
+            if (
+                len(preferred_indices) > maximum
+                or any(isinstance(index, bool) or not isinstance(index, int)
+                    or not 0 <= index < len(pool.candidates) for index in preferred_indices)
+                or len(set(preferred_indices)) != len(preferred_indices)
             ):
                 raise ValueError("candidate_selector returned invalid indices.")
             for key, value in selection.diagnostics.items():
-                if (
-                    not isinstance(key, str)
-                    or not key.startswith("arm_shortlist_")
-                    or isinstance(value, (list, tuple, dict, set))
-                ):
-                    raise ValueError(
-                        "candidate_selector diagnostics must be scalar arm_shortlist fields."
-                    )
+                if (not isinstance(key, str) or not key.startswith("arm_shortlist_")
+                    or (value is not None and not isinstance(value, (int, float, str)))):
+                    raise ValueError("candidate_selector diagnostics must be scalar arm_shortlist fields.")
                 counts[key] = value
-            # Keep public score order and ordinal identity unchanged. Preserve
-            # the selector's independent preference in the frozen evidence so
-            # an automatic full-path caller need not undo the lower motion cost.
-            preferred_indices = selected_indices
+            # Public score order is independent of the advisory planning order.
             selected_indices = tuple(sorted(preferred_indices))
             published_ordinal = {index: ordinal for ordinal, index in enumerate(selected_indices)}
             counts[GRASP_PLANNING_ORDER_FIELD] = json.dumps(
                 [published_ordinal[index] for index in preferred_indices], separators=(",", ":"))
             counts["arm_shortlist_planning_order_scope"] = GRASP_PLANNING_ORDER_SCOPE
-        else:
-            # Without an embodiment selector, preserve the generic perception
-            # shortlist and reserve bounded capacity for physically re-admitted
-            # DMTAC variants.
-            variant_return_limit = min(3, max(0, maximum - 1))
-            support_variant_indices = [
-                index
-                for index, item in enumerate(deduplicated)
-                if item.pose_source == "dmtac_support_clearance_variant_v1"
-            ]
-            reserved_variant_indices = support_variant_indices[
-                : min(2, variant_return_limit)
-            ]
-            orientation_variant_slots = min(
-                GRASPGENX_DMTAC_ORIENTATION_VARIANT_RETURN_LIMIT,
-                variant_return_limit - len(reserved_variant_indices),
-            )
-            support_reserved_count = len(reserved_variant_indices)
-            reserved_variant_indices.extend(
-                index
-                for index, item in enumerate(deduplicated)
-                if item.pose_source == "dmtac_local_orientation_variant_v1"
-                and index not in reserved_variant_indices
-            )
-            reserved_variant_indices = reserved_variant_indices[
-                : support_reserved_count + orientation_variant_slots
-            ]
-            reserved_variant_set = set(reserved_variant_indices)
-            combined_indices = list(reserved_variant_indices)
-            combined_set = set(combined_indices)
-            for index in default_selected_indices:
-                if len(combined_indices) == maximum:
-                    break
-                if (
-                    deduplicated[index].pose_source != "model_scored"
-                    and index not in reserved_variant_set
-                ):
-                    continue
-                if index not in combined_set:
-                    combined_indices.append(index)
-                    combined_set.add(index)
-            selected_indices = combined_indices
-            selected_set = set(selected_indices)
-            for index in range(len(deduplicated)):
-                if len(selected_indices) == maximum:
-                    break
-                if deduplicated[index].pose_source != "model_scored":
-                    continue
-                if index not in selected_set:
-                    selected_indices.append(index)
-                    selected_set.add(index)
-            for index in range(len(deduplicated)):
-                if len(selected_indices) == maximum:
-                    break
-                if index not in selected_set:
-                    selected_indices.append(index)
-                    selected_set.add(index)
-            selected_indices = tuple(sorted(selected_indices))
-        selected = [deduplicated[index] for index in selected_indices]
-        counts["candidate_family_count"] = len(family_indices)
-        counts["candidate_variant_count"] = len(deduplicated)
-        counts["distinct_approach_count"] = len(representative_indices)
+        selected = tuple(pool.candidates[index] for index in selected_indices)
         counts["selected"] = len(selected)
-        counts["orientation_variant_selected"] = sum(
-            item.pose_source == "dmtac_local_orientation_variant_v1"
-            for item in selected
-        )
-        counts["finger_exchange_selected"] = sum(
-            item.pose_source == PARALLEL_JAW_FINGER_EXCHANGE_POSE_SOURCE_V1 for item in selected)
-        counts["support_clearance_variant_selected"] = sum(
-            item.pose_source == "dmtac_support_clearance_variant_v1"
-            for item in selected
-        )
-        counts["arm_side_variant_selected"] = sum(
-            item.pose_source == "dmtac_arm_side_approach_variant_v1"
-            for item in selected
-        )
-        counts["orientation_variant_reserved"] = sum(
-            deduplicated[index].pose_source
-            == "dmtac_local_orientation_variant_v1"
-            for index in reserved_variant_indices
-        )
-        counts["support_clearance_variant_reserved"] = sum(
-            deduplicated[index].pose_source
-            == "dmtac_support_clearance_variant_v1"
-            for index in reserved_variant_indices
-        )
-        if filter_summary is not None:
-            filter_summary.update(counts)
-        return tuple(public_candidate(item) for item in selected)
+        for name, source in (
+            ("orientation_variant", "dmtac_local_orientation_variant_v1"),
+            ("finger_exchange", PARALLEL_JAW_FINGER_EXCHANGE_POSE_SOURCE_V1),
+            ("support_clearance_variant", "dmtac_support_clearance_variant_v1"),
+            ("arm_side_variant", "dmtac_arm_side_approach_variant_v1"),
+        ):
+            counts[f"{name}_selected"] = sum(item.pose_source == source for item in selected)
+        for name, source in (
+            ("orientation_variant", "dmtac_local_orientation_variant_v1"),
+            ("support_clearance_variant", "dmtac_support_clearance_variant_v1"),
+        ):
+            counts[f"{name}_reserved"] = sum(pool.candidates[index].pose_source == source for index in reserved)
+        return tuple(PointGraspCandidate(**{
+            field.name: getattr(item, field.name) for field in fields(PointGraspCandidate)
+        }) for item in selected), counts
 
     @staticmethod
     def _same_candidate_family(first: np.ndarray, second: np.ndarray) -> bool:
