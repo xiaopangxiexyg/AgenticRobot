@@ -1434,13 +1434,13 @@ class B601StagedSingleJointAssistRuntime:
             rate = self.config.motion_control.arrival_unload_slew_nm_s
             reason = "gradual_arrival_unloading"
         elif self._phase is B601StagedAssistPhase.BRAKE:
-            resolved_braking = (opposes_motion
-                and self._stop_evidence is not None
-                and self._stop_evidence.position_span_rad[self.joint_index]
-                > self.config.motion_control.position_resolution_rad)
-            if continuous_arrival and abs(requested) > abs(previous) and not resolved_braking:
-                # BRAKE is a phase label, not proof that a larger command is
-                # dissipative. Goalward corrections retain the slow rise.
+            if continuous_arrival and abs(requested) > abs(previous):
+                # Arrival includes a target spring and maintenance, not just
+                # damping. Even a directionally opposing sum cannot authorize
+                # restoring that entire drive at the fast braking slew: a
+                # velocity-cut/fast-restore cycle can excite gearbox recoil.
+                # Actual speed/terminal braking has already left arrival and
+                # retains its original fast lane; drive removal is unchanged.
                 reason = "bounded_arrival_correction_rise"
             else:
                 rate = self.config.motion_control.braking_slew_nm_s

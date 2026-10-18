@@ -625,11 +625,9 @@ def test_normal_transfer_fall_is_finite_and_cannot_exceed_protective_braking_or_
             replace(controller.cycle, positioning_torque_fall_nm_s=rate))
 
 
-@pytest.mark.parametrize("continuous,friction,residual", [
-    (False, .2, 0.), (False, .6, 0.),
-    (True, .2, 0.), (True, .6, 0.), (True, .2, .16), (True, .2, -.16),
-])
-def test_transfer_native_owner_with_quantized_stiction_plant_reaches_twenty_degrees(tmp_path, friction, continuous, residual, record_property):
+def _exercise_transfer_with_quantized_stiction_plant(
+    tmp_path, friction, continuous, residual, record_property, *, control_dt=.01,
+):
     # Synthetic mechanical stress model, not identified B601 dynamics. Native
     # controller/receipt paths consume the ACTUAL prior dispatched command.
     controller = _production_cycle_controller(tmp_path)
@@ -645,7 +643,7 @@ def test_transfer_native_owner_with_quantized_stiction_plant_reaches_twenty_degr
         # Inertia + dry friction + angle-dependent load/cogging. Gravity is
         # residual can hold at rest but exceed kinetic friction after release,
         # exposing reverse motion without an initially unstable gravity pose.
-        for _ in range(10):
+        for _ in range(round(control_dt/.001)):
             effort = replay.delta[2] - replay.last_kd[2]*velocity - .02*math.sin(25*q) - residual
             static = friction * (1.0 + .15*math.sin(40*q))
             if abs(velocity) < 1e-5 and abs(effort) <= static:
@@ -657,11 +655,11 @@ def test_transfer_native_owner_with_quantized_stiction_plant_reaches_twenty_degr
                 q += velocity*.001
         feedback = list(replay.q)
         feedback[2] = round(q/.000383496)*.000383496
-        replay.tick(feedback)
+        replay.tick(feedback, dt_sec=control_dt)
         return q, velocity
     q, velocity = 0., 0.
     maximum_speed = maximum_torque = maximum_resume = regulation_ticks = feedback_ticks = 0
-    for _ in range(24000):
+    for _ in range(round(240/control_dt)):
         q, velocity = plant_step(q, velocity)
         maximum_speed = max(maximum_speed, abs(velocity))
         maximum_torque = max(maximum_torque, abs(replay.delta[2]))
@@ -680,6 +678,7 @@ def test_transfer_native_owner_with_quantized_stiction_plant_reaches_twenty_degr
         "maximum_physical_speed_rad_s": maximum_speed, "maximum_overlay_nm": maximum_torque,
         "maximum_resumptions": maximum_resume, "regulation_ticks": regulation_ticks,
         "net_velocity_feedback_ticks": feedback_ticks,
+        "control_period_sec": control_dt,
     })
     if not continuous and friction == .6:
         # This stress plant exceeds the admitted 234 s positioning window;
@@ -706,7 +705,7 @@ def test_transfer_native_owner_with_quantized_stiction_plant_reaches_twenty_degr
         cycle = controller.status()["automatic_calibration"]["cycle"]
         assert cycle["phase"] == "returning", cycle["reason"]
         q, velocity = replay.q[2], 0.
-        for _ in range(18000):
+        for _ in range(round(180/control_dt)):
             q, velocity = plant_step(q, velocity)
             cycle = controller.status()["automatic_calibration"]["cycle"]
             replay.audits.clear()
@@ -716,6 +715,22 @@ def test_transfer_native_owner_with_quantized_stiction_plant_reaches_twenty_degr
         assert cycle["phase"] == "return_observe", (cycle, q, velocity)
         assert abs(q) <= controller.config.motion_tracking_arrival_tolerance_rad
         assert replay.delta == ZERO and replay.last_kd == ZERO
+
+
+@pytest.mark.parametrize("continuous,friction,residual", [
+    (False, .2, 0.), (False, .6, 0.),
+    (True, .2, 0.), (True, .6, 0.), (True, .2, .16), (True, .2, -.16),
+])
+def test_transfer_native_owner_with_quantized_stiction_plant_reaches_twenty_degrees(tmp_path, friction, continuous, residual, record_property):
+    _exercise_transfer_with_quantized_stiction_plant(
+        tmp_path, friction, continuous, residual, record_property)
+
+
+def test_transfer_native_owner_at_observed_40hz_with_quantized_stiction_plant(tmp_path, record_property):
+    # Match the observed control interval, not an identified B601 plant. The
+    # mechanical substeps and controller clock must advance by the SAME dt.
+    _exercise_transfer_with_quantized_stiction_plant(
+        tmp_path, .6, True, 0., record_property, control_dt=.025)
 
 
 @pytest.mark.parametrize("enabled", [False, True])

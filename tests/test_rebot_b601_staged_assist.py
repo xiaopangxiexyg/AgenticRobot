@@ -1101,18 +1101,51 @@ def test_continuous_arrival_cannot_restore_latent_bias_or_conditioned_shortfall(
 
 
 @pytest.mark.parametrize("direction", [-1, 1])
-@pytest.mark.parametrize("velocity", [0., .008])
-def test_continuous_arrival_fast_brake_rate_cannot_amplify_same_direction_drive(direction, velocity):
+@pytest.mark.parametrize("velocity", [0., .008, -.008])
+@pytest.mark.parametrize("dt", [.01, .025])
+def test_continuous_arrival_fast_brake_rate_cannot_amplify_same_direction_drive(direction, velocity, dt):
     runtime, _, _, frame = _arrival_runtime(direction, continuous_limit=.05)
     runtime.config = replace(runtime.config, motion_control=replace(
         runtime.config.motion_control, braking_slew_nm_s=10.))
     runtime._previous_overlay_nm = direction*.2
     runtime._command_delta = (0., 0., direction*.1, 0., 0., 0.)
     runtime._last_output_zero = runtime._final_zero_confirmed = False
+    runtime._stop_evidence = replace(runtime._stop_evidence,
+        raw_qvel_rad_s=(0., 0., direction*velocity, 0., 0., 0.),
+        position_span_rad=(0., 0., .002, 0., 0., 0.))
     assert frame.motion.arrival_stabilization_active and not frame.motion.arrival_unloading
-    output = runtime._responsive_tracking_output(direction*.6, direction*velocity, .01)
-    assert output == pytest.approx(direction*(.1+.15*.01))
+    output = runtime._responsive_tracking_output(direction*.6, direction*velocity, dt)
+    assert output == pytest.approx(direction*(.1+.15*dt))
     assert runtime._motion_frame.torque_transition_reason == "bounded_arrival_correction_rise"
+
+
+@pytest.mark.parametrize("direction", [-1, 1])
+@pytest.mark.parametrize("arrival", [False, True])
+def test_recorded_arrival_restore_jump_is_not_a_fast_damping_command(direction, arrival):
+    runtime, _, _, frame = _arrival_runtime(direction, continuous_limit=.05)
+    runtime.config = replace(runtime.config, motion_control=replace(
+        runtime.config.motion_control, braking_slew_nm_s=10.))
+    runtime._previous_overlay_nm = direction*.0076
+    runtime._command_delta = (0., 0., direction*.0076, 0., 0., 0.)
+    runtime._last_output_zero = runtime._final_zero_confirmed = False
+    runtime._motion_frame = replace(frame.motion,
+        arrival_stabilization_active=arrival,
+        reason="target_reached_braking" if arrival else "soft_velocity_braking")
+    # pj8ryb79: late arrival restored -.0076 -> -.2167 in one ~25 ms
+    # tick despite the low configured guidance slew. This is the output
+    # boundary only, not a counterfactual physical trajectory prediction.
+    speed = .0138 if arrival else .10835
+    runtime._stop_evidence = replace(runtime._stop_evidence,
+        raw_qvel_rad_s=(0., 0., -direction*speed, 0., 0., 0.),
+        position_span_rad=(0., 0., .002, 0., 0., 0.))
+    output = runtime._responsive_tracking_output(direction*.2167, -direction*speed, .025)
+    if arrival:
+        assert output == pytest.approx(direction*.01135)
+        assert runtime._motion_frame.torque_transition_reason == "bounded_arrival_correction_rise"
+    else:
+        # A genuine speed brake remains fast (2 * .10835 = .2167).
+        assert output == pytest.approx(direction*.2167)
+        assert runtime._motion_frame.torque_transition_reason == "fast_tracking_withdrawal_or_brake"
 
 
 @pytest.mark.parametrize("direction", [-1, 1])
