@@ -398,4 +398,3 @@ def _save_json(path, value):
             return dict(item)
         raise TypeError(type(item).__name__)
     path.write_text(json.dumps(value, default=encode, ensure_ascii=False, indent=2, allow_nan=False))
-
