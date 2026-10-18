@@ -8,7 +8,7 @@ It starts no socket, thread, backend, device, or motion.
 from __future__ import annotations
 
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 
 from agent_gateway.profiles.segmentation import SegmentationRegistration
@@ -43,6 +43,7 @@ from .grasp_approach_plan import (
 from .gripper_skill import (
     RealDmtacGripperControlPort,
     build_real_dmtac_gripper_skill_contract_bundle,
+    build_real_dmtac_grippers_skill_contract_bundle,
 )
 from .localization_deployment import RealObjectLocalizationRegistration
 from .localization_gateway import ObjectLocalizationProvider
@@ -135,6 +136,7 @@ def assemble_exclusive_real_agent_primitive_deployment(
     *,
     target_builder: RealAgentMotionTargetBuilder,
     gripper_port: RealDmtacGripperControlPort | None = None,
+    gripper_ports: Mapping[str, RealDmtacGripperControlPort] | None = None,
     port_config: RealAgentMotionPortConfig,
     observation_attachment: RealTcpPoseObserveAttachmentSpec,
     frame_graph: CoordinateFrameGraph,
@@ -187,18 +189,21 @@ def assemble_exclusive_real_agent_primitive_deployment(
 ) -> ExclusiveRealAgentPrimitiveDeployment:
     """Assemble an exclusive Skill owner without constructing RealTeleop."""
 
-    gripper_contract = (
-        None
-        if gripper_port is None
-        else build_real_dmtac_gripper_skill_contract_bundle(
+    if gripper_port is not None and gripper_ports is not None:
+        raise ValueError("Select the v1 single port or explicit v2 ports, not both.")
+    gripper_contract = None
+    if gripper_port is not None or gripper_ports is not None:
+        factory = (build_real_dmtac_gripper_skill_contract_bundle
+                   if gripper_port is not None
+                   else build_real_dmtac_grippers_skill_contract_bundle)
+        gripper_contract = factory(
             runtime_session_id=observation_attachment.runtime_session_id,
             control_domain_id=observation_attachment.control_domain_id,
             target_binding_id=observation_attachment.target_binding_id,
             station_manifest_hash=observation_attachment.station_manifest_hash,
             execution_manifest_hash=observation_attachment.execution_manifest_hash,
-            port=gripper_port,
+            **({"port": gripper_port} if gripper_port is not None else {"ports": gripper_ports}),
         )
-    )
     bundle = build_real_agent_primitive_contract_bundle(
         enable_spatial_goals=enable_spatial_goals,
         gripper_contract=gripper_contract,
@@ -258,6 +263,7 @@ def assemble_exclusive_real_agent_primitive_deployment(
     )
     gateway = assemble_real_agent_primitive_gateway_session(
         gripper_port=gripper_port,
+        gripper_ports=gripper_ports,
         contract_bundle=bundle,
         port=port,
         owner_state_provider=lambda: _owner_state(port),
@@ -291,6 +297,7 @@ def assemble_exclusive_rm65_agent_primitive_deployment(
     *,
     target_builder: RealAgentMotionTargetBuilder,
     gripper_port: RealDmtacGripperControlPort | None = None,
+    gripper_ports: Mapping[str, RealDmtacGripperControlPort] | None = None,
     rm65_ports: ExclusiveRM65SkillDeployPorts,
     port_config: RealAgentMotionPortConfig,
     observation_attachment: RealTcpPoseObserveAttachmentSpec,
@@ -345,6 +352,7 @@ def assemble_exclusive_rm65_agent_primitive_deployment(
     return assemble_exclusive_real_agent_primitive_deployment(
         enable_spatial_goals=enable_spatial_goals,
         gripper_port=gripper_port,
+        gripper_ports=gripper_ports,
         target_builder=target_builder,
         port_config=port_config,
         observation_attachment=observation_attachment,

@@ -472,13 +472,25 @@ def _parameters(
     target_state: str | None = None,
 ) -> dict[str, Any]:
     if skill_id == "manipulation.set_gripper_state":
-        if side != "right" or target_state not in _schema_enum(
+        if side not in {"left", "right"} or target_state not in _schema_enum(
             _schema_properties(schema_entry), "target_state"
         ):
             raise ValueError(
-                "Gripper v1 requires side right and explicit open/closed target_state."
+                "Gripper control requires explicit side and open/closed target_state."
             )
-        return {"target_state": target_state}
+        version = schema_entry.get("skill_version", "1")
+        if version == "1":
+            if side != "right":
+                raise ValueError("Gripper v1 requires side right.")
+            return {"target_state": target_state}
+        if version != "2":
+            raise ValueError("Unsupported gripper Skill version.")
+        component = side + "_gripper"
+        if component not in _schema_enum(
+            _schema_properties(schema_entry), "component_id"
+        ):
+            raise ValueError("Selected gripper is not advertised by the server schema.")
+        return {"component_id": component, "target_state": target_state}
     summary = snapshot["measurement_summary"]
     components = tuple(summary["pose_xyz_quat_xyzw_by_component"])
     expected_component = f"{side}_arm"
@@ -589,9 +601,9 @@ def _parameters(
 def execute_one_shot(args: argparse.Namespace) -> Mapping[str, Any]:
     target_state = getattr(args, "target_state", None)
     if args.action == "set_gripper_state":
-        if args.side != "right" or target_state not in {"open", "closed"}:
+        if args.side not in {"left", "right"} or target_state not in {"open", "closed"}:
             raise ValueError(
-                "set_gripper_state requires --side right and --target-state open|closed"
+                "set_gripper_state requires --side left|right and --target-state open|closed"
             )
     elif target_state is not None:
         raise ValueError("--target-state requires --action set_gripper_state")
@@ -666,12 +678,12 @@ def execute_one_shot(args: argparse.Namespace) -> Mapping[str, Any]:
         requested_components = (
             tuple(parameters["pose_targets_by_component"])
             if skill_id in {TCP_POSE_TARGET_SKILL_ID_V1, GRASP_APPROACH_SKILL_ID_V1, SAFE_TCP_POSE_TARGET_SKILL_ID_V1}
-            else ("right_gripper",)
+            else (parameters.get("component_id", "right_gripper"),)
             if skill_id == "manipulation.set_gripper_state"
             else (parameters["component_id"],)
         )
         expected_controlled_component = (
-            "right_gripper"
+            args.side + "_gripper"
             if skill_id == "manipulation.set_gripper_state"
             else expected_component
         )

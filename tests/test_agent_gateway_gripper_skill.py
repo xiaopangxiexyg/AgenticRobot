@@ -1175,3 +1175,87 @@ def test_explicit_mujoco_component_cannot_select_the_other_physical_hand(compone
     with pytest.raises(ValueError, match="physical gripper"):
         MujocoGripperControlPort(rig=rig, gripper_name=physical,
             **({} if component is None else {"component_id": component}))
+
+
+@pytest.mark.parametrize("failure", ["lower_start", "right_start", "right_close"])
+def test_bilateral_resources_keep_partial_start_and_failed_close_owned(failure):
+    events = []
+    failing = {failure}
+
+    def action(name):
+        events.append(name)
+        if name in failing:
+            raise RuntimeError(name)
+
+    class Lower:
+        def start(self):
+            action("lower_start")
+
+        def close(self):
+            action("lower_close")
+
+    ports = {}
+    for side in ("left", "right"):
+        backend = _FakeDmtacBackend()
+        backend.config.side = side
+        backend.config.gripper_port = "/dev/fake-" + side
+        backend.samples = [(0.0, False)]
+        backend.start = lambda side=side: action(side + "_start")
+        backend.close = lambda side=side: action(side + "_close")
+        ports[side + "_gripper"] = RealDmtacGripperControlPort(
+            backend=backend, component_id=side + "_gripper")
+    resources = ExclusiveRealGripperResources(lower=Lower(), ports=ports)
+    if failure == "right_close":
+        resources.start()
+        with pytest.raises(RuntimeError, match="right_close"):
+            resources.close()
+        assert "left_close" in events and "lower_close" not in events
+        failing.clear()
+        resources.close()
+        assert events.count("right_close") == 2
+        assert events.count("left_close") == 1
+    else:
+        with pytest.raises(RuntimeError, match=failure):
+            resources.start()
+        resources.close()
+        if failure == "lower_start":
+            assert events == ["lower_start", "lower_close"]
+        else:
+            assert events == ["lower_start", "left_start", "right_start",
+                              "right_close", "left_close", "lower_close"]
+    assert events.count("lower_close") == 1
+    resources.close()
+    assert events.count("lower_close") == 1
+
+
+@pytest.mark.parametrize("interrupt_type", [KeyboardInterrupt, SystemExit])
+def test_bilateral_resource_close_interrupt_keeps_other_cleanup_and_retry(interrupt_type):
+    events = []
+    original = interrupt_type("right close interrupted")
+    interrupt = [True]
+
+    def close_hand(side):
+        events.append(side + "_close")
+        if side == "right" and interrupt[0]:
+            raise original
+
+    ports = {}
+    for side in ("left", "right"):
+        backend = _FakeDmtacBackend()
+        backend.config.side = side
+        backend.samples = [(0.0, False)]
+        backend.close = lambda side=side: close_hand(side)
+        ports[side + "_gripper"] = RealDmtacGripperControlPort(
+            backend=backend, component_id=side + "_gripper")
+    lower = SimpleNamespace(start=lambda: None, close=lambda: events.append("lower_close"))
+    resources = ExclusiveRealGripperResources(lower=lower, ports=ports)
+    resources.start()
+    with pytest.raises(interrupt_type) as captured:
+        resources.close()
+    assert captured.value is original
+    assert events == ["right_close", "left_close"]
+    interrupt[0] = False
+    resources.close()
+    assert events == ["right_close", "left_close", "right_close", "lower_close"]
+    resources.close()
+    assert events.count("lower_close") == 1

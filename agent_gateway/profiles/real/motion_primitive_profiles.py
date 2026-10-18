@@ -625,9 +625,9 @@ class RealAgentPrimitiveContractBundle:
         if self.rgbd_geometry_registrations and self.perception_capture is None:
             raise ValueError("RGB-D geometry requires composed perception capture.")
         if self.gripper_contract is not None:
-            if self.cardinal_profile.side != "right":
-                raise ValueError("Gripper v1 requires the bound right-arm session.")
             binding = self.gripper_contract.deployment_binding
+            if binding.skill_version == "1" and self.cardinal_profile.side != "right":
+                raise ValueError("Gripper v1 requires the bound right-arm session.")
             for name in (
                 "runtime_session_id",
                 "control_domain_id",

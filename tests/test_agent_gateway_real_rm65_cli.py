@@ -903,6 +903,7 @@ def test_cli_assembles_then_reports_ready_and_lower_hold(
         deployment=SimpleNamespace(
             gateway_session=SimpleNamespace(
                 gripper_port=None,
+                gripper_ports={},
                 contract_bundle=SimpleNamespace(route_manifest=manifest),
                 emergency_stop_port=object(),
                 service=SimpleNamespace(
@@ -1030,6 +1031,7 @@ def test_cli_assembles_then_reports_ready_and_lower_hold(
     # Neither arm HOLD nor emergency-stop proof may conceal a missing hand stop.
     hand = SimpleNamespace(last_hold_receipt=None)
     composition.deployment.gateway_session.gripper_port = hand
+    composition.deployment.gateway_session.gripper_ports = {"right_gripper": hand}
     for receipt in (
         None,
         SimpleNamespace(succeeded=False, evidence_refs=("hand-ack",)),
@@ -1084,3 +1086,20 @@ def test_invalid_udp_port_cannot_assemble_resources(monkeypatch, short_unix_sock
         gateway_cli.main(_argv(confirmation=REAL_AGENT_PRIMITIVE_SESSION_CONFIRM_TOKEN, socket_path=path)
                          + ["--rm65-feedback-source", "udp", "--rm65-udp-port", port])
     assert error.value.code == 2
+
+
+@pytest.mark.parametrize("flags", [
+    ["--left-gripper-config", "unused-left.json"],
+    ["--gripper-skill-version", "2"],
+    ["--gripper-skill-version", "2", "--right-gripper-config", "unused-right.json"],
+])
+def test_gripper_v2_requires_explicit_complete_configuration_before_profile_or_device_resolution(monkeypatch, flags):
+    def forbidden(*args, **kwargs):
+        pytest.fail("Incomplete gripper selection must not resolve a hardware profile")
+
+    monkeypatch.setattr(gateway_cli, "resolve_exclusive_rm65_skill_deployment_profile", forbidden)
+    args = _argv(confirmation=REAL_AGENT_PRIMITIVE_SESSION_CONFIRM_TOKEN)
+    assert gateway_cli.build_parser().parse_args(args).gripper_skill_version == "1"
+    with pytest.raises(SystemExit) as captured:
+        gateway_cli.main([*args, *flags])
+    assert captured.value.code == 2

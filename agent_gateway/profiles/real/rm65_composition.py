@@ -194,10 +194,10 @@ class ExclusiveRM65AgentPrimitiveComposition:
             raise ValueError("application must own the exact composed resources.")
         owned_resources = self.resources
         if isinstance(owned_resources, ExclusiveRealGripperResources):
-            if owned_resources.port is not self.deployment.gateway_session.gripper_port:
+            if owned_resources.ports != self.deployment.gateway_session.gripper_ports:
                 raise ValueError("Gripper resources must own the advertised adapter.")
             owned_resources = owned_resources.lower
-        elif self.deployment.gateway_session.gripper_port is not None:
+        elif self.deployment.gateway_session.gripper_ports:
             raise ValueError("Advertised gripper requires application-owned resources.")
         if self.perception_capture is None:
             if owned_resources is not self.lower.ports:
@@ -254,6 +254,8 @@ def assemble_exclusive_rm65_agent_primitive_composition(
     *,
     lower: ExclusiveRM65SkillLowerAssembly,
     right_gripper_backend: object | None = None,
+    gripper_backends: Mapping[str, object] | None = None,
+    authorized_gripper_sides: tuple[str, ...] | None = None,
     socket_path: str | Path,
     authorized_side: str,
     authorized_action: str | None,
@@ -329,19 +331,23 @@ def assemble_exclusive_rm65_agent_primitive_composition(
         item not in REAL_AGENT_PRIMITIVE_ACTIONS for item in normalized_actions
     ):
         raise ValueError("authorized_actions contains an unreviewed primitive.")
-    if ("set_gripper_state" in normalized_actions) and (
-        side != "right" or right_gripper_backend is None
-    ):
-        raise ValueError(
-            "set_gripper_state requires a right-arm session and explicit right gripper backend."
-        )
-    if right_gripper_backend is not None and side != "right":
+    bilateral = gripper_backends is not None
+    if bilateral and right_gripper_backend is not None:
+        raise ValueError("Select existing right-gripper v1 or explicit bilateral v2.")
+    if not bilateral and right_gripper_backend is not None and side != "right":
         raise ValueError("Gripper v1 is bound to a right-arm session.")
-    gripper_port = (
-        None
-        if right_gripper_backend is None
-        else RealDmtacGripperControlPort(backend=right_gripper_backend, clock=clock)
-    )
+    gripper_backends = (dict(gripper_backends) if bilateral else
+                        {} if right_gripper_backend is None else {"right": right_gripper_backend})
+    if bilateral and set(gripper_backends) != {"left", "right"}:
+        raise ValueError("Gripper v2 requires both left and right backend configurations.")
+    if "set_gripper_state" in normalized_actions and not gripper_backends:
+        raise ValueError("set_gripper_state requires configured gripper backends.")
+    gripper_ports = {
+        key + "_gripper": RealDmtacGripperControlPort(
+            backend=value, clock=clock, component_id=key+"_gripper")
+        for key, value in gripper_backends.items()
+    }
+    gripper_port = None if bilateral else gripper_ports.get("right_gripper")
     client = _required(client_id, field_name="client_id")
     runtime_id = _required(runtime_session_id, field_name="runtime_session_id")
     domain_id = _required(control_domain_id, field_name="control_domain_id")
@@ -1001,6 +1007,7 @@ def assemble_exclusive_rm65_agent_primitive_composition(
         deployment = assemble_exclusive_rm65_agent_primitive_deployment(
             enable_spatial_goals=enable_spatial_goals,
             gripper_port=gripper_port,
+            gripper_ports=gripper_ports if bilateral else None,
             target_builder=lower.target_builder,
             rm65_ports=lower.ports,
             port_config=port_config,
@@ -1065,9 +1072,11 @@ def assemble_exclusive_rm65_agent_primitive_composition(
             artifact_store=artifact_store,
             additional_resources=additional_resources,
         )
-    if gripper_port is not None:
-        resources = ExclusiveRealGripperResources(lower=resources, port=gripper_port)
+    if gripper_ports:
+        resources = ExclusiveRealGripperResources(lower=resources,
+            **({"ports": gripper_ports} if bilateral else {"port": gripper_port}))
     authorization = RealAgentPrimitiveOneShotAuthorization(
+        authorized_gripper_sides=authorized_gripper_sides,
         gateway_session=deployment.gateway_session,
         side=side,
         authorized_actions=normalized_actions,

@@ -1057,7 +1057,11 @@ action is the distinct `execute_grasp_approach_plan`; authorizing the legacy
 可选 v2 必须显式构造双夹爪 deployment、绑定两侧独立 port，并在请求中同时给出
 `component_id`（`left_gripper` / `right_gripper`）和 `target_state`。
 定义、schema、Route、结果验证与执行器按同一版本闭合；v1 不接受该新增字段。
-本批提供中立执行器及 MuJoCo 双夹爪验证基础；真机 CLI 和组合入口尚未启用 v2。
+真机 CLI 默认仍为 `--gripper-skill-version 1`，沿用 `--right-gripper-config`。
+显式选择 `--gripper-skill-version 2` 时必须同时提供两侧配置；
+`--authorized-gripper-sides left|right [left|right]` 只限定夹爪授权，缺省为已授权臂的一侧，
+不扩展手臂动作权限。程序化组合显式传入两侧 `gripper_backends` 时选择 v2，
+不得与原 v1 的 `right_gripper_backend` 混用。两侧共享原应用资源 owner 和操作槽位。
 两版复用原有收敛、取消与下层 HOLD 确认，任何一侧停机失败都不能宣称组合安全。
 
 #### 可选右夹爪接入

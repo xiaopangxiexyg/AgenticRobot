@@ -86,7 +86,8 @@ def _requested_action_and_component_ids(
 
     parameters = request.parameters
     if request.skill_id == SET_GRIPPER_STATE_SKILL_ID_V1:
-        return "set_gripper_state", ("right_gripper",)
+        return "set_gripper_state", (("right_gripper",) if request.skill_version == "1"
+                                      else (str(parameters.get("component_id")),))
     fixed_cardinal_action = FIXED_CARDINAL_TCP_STEP_DIRECTION_BY_SKILL_ID_V1.get(
         request.skill_id
     )
@@ -135,6 +136,7 @@ class RealAgentPrimitiveSessionAuthorization:
         side: str,
         action: str | None = None,
         authorized_actions: tuple[str, ...] | None = None,
+        authorized_gripper_sides: tuple[str, ...] | None = None,
         client_id: str,
         confirmation_token: str,
         grant_lifetime_sec: float = 5.0,
@@ -182,6 +184,19 @@ class RealAgentPrimitiveSessionAuthorization:
         self.gateway_session = gateway_session
         self.side = normalized_side
         self.authorized_actions = normalized_actions
+        self.authorized_gripper_sides = tuple(
+            sorted(
+                set(
+                    (normalized_side,)
+                    if authorized_gripper_sides is None
+                    else authorized_gripper_sides
+                )
+            )
+        )
+        if not self.authorized_gripper_sides or any(
+            item not in {"left", "right"} for item in self.authorized_gripper_sides
+        ):
+            raise ValueError("authorized_gripper_sides must select left and/or right.")
         self.action = normalized_actions[0] if len(normalized_actions) == 1 else None
         self.client_id = normalized_client_id
         self.grant_lifetime_sec = lifetime
@@ -189,12 +204,14 @@ class RealAgentPrimitiveSessionAuthorization:
         self._lock = threading.Lock()
         self._grants_issued = 0
         if "set_gripper_state" in normalized_actions and (
-            normalized_side != "right"
-            or gateway_session.contract_bundle.gripper_contract is None
+            gateway_session.contract_bundle.gripper_contract is None
         ):
-            raise ValueError(
-                "Gripper authorization requires the bound right-gripper Route."
-            )
+            raise ValueError("Gripper authorization requires the bound gripper Route.")
+        gripper_contract = gateway_session.contract_bundle.gripper_contract
+        if ("set_gripper_state" in normalized_actions and gripper_contract is not None
+                and gripper_contract.deployment_binding.skill_version == "1"
+                and (normalized_side != "right" or self.authorized_gripper_sides != ("right",))):
+            raise ValueError("Gripper v1 authorization requires the bound right-gripper Route.")
 
         manifest = gateway_session.contract_bundle.route_manifest
         self.operator_authorization_receipt_id = (
@@ -206,6 +223,8 @@ class RealAgentPrimitiveSessionAuthorization:
                     "control_domain_id": manifest.control_domain_id,
                     "target_binding_id": manifest.target_binding_id,
                     "side": self.side,
+                    **({"authorized_gripper_sides": self.authorized_gripper_sides}
+                       if gripper_contract is not None and gripper_contract.deployment_binding.skill_version == "2" else {}),
                     "authorized_actions": self.authorized_actions,
                     "client_id": self.client_id,
                     "confirmation": REAL_AGENT_PRIMITIVE_SESSION_CONFIRM_TOKEN,
@@ -244,12 +263,12 @@ class RealAgentPrimitiveSessionAuthorization:
         requested_action, component_ids = _requested_action_and_component_ids(request)
         if requested_action not in self.authorized_actions:
             return None
-        expected_component = (
-            "right_gripper"
-            if requested_action == "set_gripper_state"
-            else f"{self.side}_arm"
-        )
-        if component_ids != (expected_component,):
+        if requested_action == "set_gripper_state":
+            if len(component_ids) != 1 or component_ids[0] not in {
+                side + "_gripper" for side in self.authorized_gripper_sides
+            }:
+                return None
+        elif component_ids != (f"{self.side}_arm",):
             return None
         if requested_action not in REAL_AGENT_PRIMITIVE_ACTIONS:
             return None

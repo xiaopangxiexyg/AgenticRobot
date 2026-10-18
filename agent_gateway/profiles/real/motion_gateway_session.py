@@ -103,7 +103,7 @@ from .grasp_observation import (
     build_grasp_observation_executor,
     read_retained_grasp_observation,
 )
-from .gripper_skill import RealDmtacGripperControlPort, stop_arm_and_gripper
+from .gripper_skill import RealDmtacGripperControlPort, stop_arm_and_grippers
 from .localization_gateway import (
     ObjectLocalizationProvider,
     build_real_object_localization_executor,
@@ -135,6 +135,14 @@ def _required(value: object, *, field_name: str) -> str:
     return value
 
 
+def _configured_gripper_ports(gripper_port, gripper_ports):
+    if gripper_port is not None:
+        if gripper_ports is not None:
+            raise ValueError("Select the v1 single port or explicit v2 ports, not both.")
+        return {gripper_port.component_id: gripper_port}
+    return dict(gripper_ports or {})
+
+
 class RealAgentDomainEmergencyStopPort:
     """Profile binding from Gateway safety control to the lower RM65 owner."""
 
@@ -146,13 +154,14 @@ class RealAgentDomainEmergencyStopPort:
         port_id: str,
         emergency_stop: Callable[[str], RealSkillMotionEmergencyStopReceipt],
         gripper_port: GripperControlPort | None = None,
+        gripper_ports: Mapping[str, RealDmtacGripperControlPort] | None = None,
         clock: Callable[[], float] = time.time,
     ) -> None:
         self.port_id = _required(port_id, field_name="port_id")
         if not callable(emergency_stop) or not callable(clock):
             raise TypeError("emergency_stop and clock must be callable.")
         self._emergency_stop = emergency_stop
-        self._gripper_port = gripper_port
+        self._gripper_ports = _configured_gripper_ports(gripper_port, gripper_ports)
         self._clock = clock
         self._lock = threading.Lock()
         self._next_sequence = 0
@@ -170,13 +179,13 @@ class RealAgentDomainEmergencyStopPort:
         reason: str,
     ) -> AgentGatewayAuthoritativePortReceipt:
         normalized_reason = _required(reason, field_name="reason")
-        if self._gripper_port is None:
+        if not self._gripper_ports:
             lower = self._emergency_stop(normalized_reason)
             hand_hold = None
         else:
-            lower, hand_hold = stop_arm_and_gripper(
+            lower, hand_hold = stop_arm_and_grippers(
                 arm_stop=lambda: self._emergency_stop(normalized_reason),
-                port=self._gripper_port,
+                ports=self._gripper_ports,
                 reason=normalized_reason,
             )
         if not isinstance(lower, RealSkillMotionEmergencyStopReceipt):
@@ -221,7 +230,8 @@ class RealAgentPrimitiveObservationProducer:
         self,
         *,
         contract_bundle: RealAgentPrimitiveContractBundle,
-        gripper_port: RealDmtacGripperControlPort | None = None,
+        gripper_port: GripperControlPort | None = None,
+        gripper_ports: Mapping[str, RealDmtacGripperControlPort] | None = None,
         port: RealAgentMotionPort,
         owner_state_provider: Callable[[], RealControlOwnerState],
         revision_tracker: AgentStationRevisionTracker | None = None,
@@ -235,6 +245,7 @@ class RealAgentPrimitiveObservationProducer:
             raise TypeError("owner_state_provider and clock must be callable.")
         self.contract_bundle = contract_bundle
         self.gripper_port = gripper_port
+        self.gripper_ports = _configured_gripper_ports(gripper_port, gripper_ports)
         self.port = port
         self.owner_state_provider = owner_state_provider
         self.revision_tracker = (
@@ -287,10 +298,11 @@ class RealAgentPrimitiveObservationProducer:
                     "execution_gate": owner_cut.execution_gate,
                 }
             )
-        if self.gripper_port is not None:
-            fingerprint["gripper_command_attempt_ref"] = (
-                self.gripper_port.last_command_attempt_ref
-            )
+        if self.gripper_ports:
+            fingerprint["gripper_command_attempt_refs"] = {
+                key: port.last_command_attempt_ref
+                for key, port in self.gripper_ports.items()
+            }
         return fingerprint
 
     def _observe_control_state(self) -> int:
@@ -688,6 +700,7 @@ class RealAgentPrimitiveGatewaySession:
     spatial_goal_executor: PassiveReadSkillExecutor | None = None
     gripper_port: RealDmtacGripperControlPort | None = None
     rgbd_geometry_executors: tuple[PassiveReadSkillExecutor, ...] = ()
+    gripper_ports: Mapping[str, RealDmtacGripperControlPort] = field(default_factory=dict)
     _close_lock: threading.Lock = field(default_factory=threading.Lock, init=False)
     _close_outcome: AgentGatewayOperationOutcome | None = field(
         default=None,
@@ -707,7 +720,7 @@ class RealAgentPrimitiveGatewaySession:
         if advertised != (self.emergency_stop_port is not None):
             raise ValueError("Real emergency-stop feature and profile port must match.")
         if (self.contract_bundle.gripper_contract is not None) != (
-            self.gripper_port is not None
+            bool(self.gripper_ports)
         ):
             raise ValueError("Composed gripper port and contract must coexist.")
         enabled = self.contract_bundle.perception_capture is not None
@@ -1090,7 +1103,8 @@ def _real_perception_control_claimed(
 def _real_hardware_view_provider(
     *,
     contract_bundle: RealAgentPrimitiveContractBundle,
-    gripper_port: RealDmtacGripperControlPort | None = None,
+    gripper_port: GripperControlPort | None = None,
+    gripper_ports: Mapping[str, RealDmtacGripperControlPort] | None = None,
     port: RealAgentMotionPort,
     perception_provider: RealSenseAgentPerceptionProvider | None,
     localization_provider: ObjectLocalizationProvider | None,
@@ -1130,19 +1144,21 @@ def _real_hardware_view_provider(
             control_claimed_provider=lambda: _real_motion_control_claimed(port),
         )
     ]
-    if gripper_port is not None:
+    for component, gripper_port in _configured_gripper_ports(gripper_port, gripper_ports).items():
         hand_route = contract_bundle.route_manifest.route(
-            SET_GRIPPER_STATE_SKILL_ID_V1, "1"
+            SET_GRIPPER_STATE_SKILL_ID_V1, contract_bundle.gripper_contract.deployment_binding.skill_version
         ).route
         bindings.append(
             HardwareResourceBinding(
-                resource_id="manipulation.right_gripper",
+                resource_id="manipulation." + component,
                 resource_kind="gripper",
                 route_hashes=(hand_route.semantic_content_hash,),
-                health_provider=lambda: (
-                    "ready" if gripper_port.backend.is_ready() else "unavailable"
+                health_provider=lambda port=gripper_port: (
+                    "ready" if port.backend.is_ready() else "unavailable"
                 ),
-                control_claimed_provider=lambda: bool(gripper_port.backend.is_ready()),
+                control_claimed_provider=lambda port=gripper_port: bool(
+                    port.backend.is_ready()
+                ),
             )
         )
     if perception_provider is not None:
@@ -1197,6 +1213,7 @@ def assemble_real_agent_primitive_gateway_session(
     *,
     contract_bundle: RealAgentPrimitiveContractBundle,
     gripper_port: GripperControlPort | None = None,
+    gripper_ports: Mapping[str, RealDmtacGripperControlPort] | None = None,
     port: RealAgentMotionPort,
     owner_state_provider: Callable[[], RealControlOwnerState],
     allowed_client_ids: tuple[str, ...],
@@ -1320,10 +1337,19 @@ def assemble_real_agent_primitive_gateway_session(
         or max_session_admissions_per_route <= 0
     ):
         raise ValueError("max_session_admissions_per_route must be positive or None.")
-    if (contract_bundle.gripper_contract is not None) != (gripper_port is not None):
+    version = None if contract_bundle.gripper_contract is None else contract_bundle.gripper_contract.deployment_binding.skill_version
+    if version == "1" and gripper_port is None:
+        raise ValueError("v1 requires the existing single right-gripper port.")
+    if version == "2" and gripper_port is not None:
+        raise ValueError("v2 requires explicit bilateral gripper_ports.")
+    gripper_ports = _configured_gripper_ports(gripper_port, gripper_ports)
+    if (contract_bundle.gripper_contract is not None) != bool(gripper_ports):
         raise ValueError("Gripper registration and execution port must coexist.")
-    if gripper_port is not None:
-        if not isinstance(gripper_port, RealDmtacGripperControlPort):
+    if gripper_ports:
+        if any(
+            not isinstance(port, RealDmtacGripperControlPort)
+            for port in gripper_ports.values()
+        ):
             raise TypeError(
                 "Real composed gripper requires the reviewed DMTAC adapter."
             )
@@ -1353,9 +1379,10 @@ def assemble_real_agent_primitive_gateway_session(
                 == "ready"
             )
 
-        gripper_port.bind_motion_guard(arm_held_for_gripper)
+        for hand in gripper_ports.values():
+            hand.bind_motion_guard(arm_held_for_gripper)
     producer = RealAgentPrimitiveObservationProducer(
-        gripper_port=gripper_port,
+        **({"gripper_port": gripper_port} if version == "1" else {"gripper_ports": gripper_ports}),
         contract_bundle=contract_bundle,
         port=port,
         owner_state_provider=owner_state_provider,
@@ -1378,10 +1405,10 @@ def assemble_real_agent_primitive_gateway_session(
                 timeout_sec=contract_bundle.convergence_profile.hold_confirmation_timeout_sec,
             )
 
-        if gripper_port is None:
+        if not gripper_ports:
             return arm_stop()
-        arm_hold, hand_hold = stop_arm_and_gripper(
-            arm_stop=arm_stop, port=gripper_port, reason=reason
+        arm_hold, hand_hold = stop_arm_and_grippers(
+            arm_stop=arm_stop, ports=gripper_ports, reason=reason
         )
         proved = (
             arm_hold.succeeded and arm_hold.lower_hold_confirmed and hand_hold.succeeded
@@ -1536,17 +1563,16 @@ def assemble_real_agent_primitive_gateway_session(
         executors[route.skill_id] = executor
         execution_port_by_route_hash[route.semantic_content_hash] = executor
     if contract_bundle.gripper_contract is not None:
-        assert gripper_port is not None
         gripper_executor = build_gripper_skill_executor(
             contract_bundle=contract_bundle.gripper_contract,
-            port=gripper_port,
+            **({"port": gripper_port} if version == "1" else {"ports": gripper_ports}),
             current_station_revision=lambda: producer.current_station_revision,
             domain_hold=domain_hold,
             clock=clock,
             sleep=sleep,
         )
         executors[SET_GRIPPER_STATE_SKILL_ID_V1] = gripper_executor
-        entry = contract_bundle.route_manifest.route(SET_GRIPPER_STATE_SKILL_ID_V1, "1")
+        entry = contract_bundle.route_manifest.route(SET_GRIPPER_STATE_SKILL_ID_V1, contract_bundle.gripper_contract.deployment_binding.skill_version)
         execution_port_by_route_hash[entry.route.semantic_content_hash] = (
             gripper_executor
         )
@@ -1880,7 +1906,7 @@ def assemble_real_agent_primitive_gateway_session(
         None
         if emergency_stop is None
         else RealAgentDomainEmergencyStopPort(
-            gripper_port=gripper_port,
+            gripper_ports=gripper_ports,
             port_id=(
                 "agent-gateway:real-domain-emergency-stop:"
                 + contract_bundle.route_manifest.runtime_session_id
@@ -1953,7 +1979,7 @@ def assemble_real_agent_primitive_gateway_session(
         clock_domain_id=contract_bundle.attachment.clock_domain_id,
     )
     hardware_view_provider = _real_hardware_view_provider(
-        gripper_port=gripper_port,
+        gripper_ports=gripper_ports,
         contract_bundle=contract_bundle,
         port=port,
         perception_provider=perception_provider,
@@ -1964,6 +1990,7 @@ def assemble_real_agent_primitive_gateway_session(
     )
     return RealAgentPrimitiveGatewaySession(
         gripper_port=gripper_port,
+        gripper_ports=gripper_ports,
         contract_bundle=contract_bundle,
         port=port,
         observation_producer=producer,

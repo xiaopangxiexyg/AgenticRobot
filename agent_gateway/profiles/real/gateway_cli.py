@@ -120,10 +120,23 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--left-tool-profile", type=Path, required=True)
     parser.add_argument("--right-tool-profile", type=Path, required=True)
     parser.add_argument("--envelope-profile", type=Path, required=True)
+    parser.add_argument("--gripper-skill-version", choices=("1", "2"), default="1",
+                        help="default right-gripper v1; explicit v2 requires both hand configs")
+    parser.add_argument(
+        "--left-gripper-config",
+        type=Path,
+        help="explicit left DMTacGripperBackendConfig JSON; pair with --right-gripper-config",
+    )
+    parser.add_argument(
+        "--authorized-gripper-sides",
+        nargs="+",
+        choices=("left", "right"),
+        help="independent gripper authorization scope; defaults to the authorized arm side",
+    )
     parser.add_argument(
         "--right-gripper-config",
         type=Path,
-        help="optional explicit DMTacGripperBackendConfig JSON; right-arm session only, no startup opening/reset/recovery",
+        help="optional right DMTacGripperBackendConfig JSON for v1; v2 also requires --left-gripper-config; no startup opening/reset/recovery",
     )
     parser.add_argument(
         "--camera-config",
@@ -625,10 +638,10 @@ def _stopped_payload(
                 f"{type(exc).__name__}: {exc}"
             )[:512]
     lower_hold_proved = bool(hold is not None and hold.succeeded)
-    gripper_port = composition.deployment.gateway_session.gripper_port
-    gripper_hold = None if gripper_port is None else gripper_port.last_hold_receipt
-    gripper_stop_proved = gripper_port is None or (
-        gripper_hold is not None and gripper_hold.succeeded
+    gripper_ports = composition.deployment.gateway_session.gripper_ports
+    gripper_holds = {key: port.last_hold_receipt for key, port in gripper_ports.items()}
+    gripper_stop_proved = all(
+        hold is not None and hold.succeeded for hold in gripper_holds.values()
     )
     lower_emergency_stop_proved = bool(
         emergency_stop is not None
@@ -714,11 +727,18 @@ def _stopped_payload(
         **(
             {
                 "gripper_stop_proved": bool(gripper_stop_proved),
-                "gripper_stop_evidence_refs": []
-                if gripper_hold is None
-                else list(gripper_hold.evidence_refs),
+                "gripper_stop_by_component": {
+                    key: bool(hold is not None and hold.succeeded)
+                    for key, hold in gripper_holds.items()
+                },
+                "gripper_stop_evidence_refs": [
+                    ref
+                    for hold in gripper_holds.values()
+                    if hold is not None
+                    for ref in hold.evidence_refs
+                ],
             }
-            if gripper_port is not None
+            if gripper_ports
             else {}
         ),
     }
@@ -820,28 +840,44 @@ def main(argv: list[str] | None = None) -> int:
         if args.authorized_actions is None
         else tuple(args.authorized_actions)
     )
-    if "set_gripper_state" in actions and args.right_gripper_config is None:
-        parser.error("set_gripper_state requires --right-gripper-config")
-    right_gripper_backend = None
-    if args.right_gripper_config is not None:
-        if args.authorized_side != "right":
-            parser.error("gripper v1 requires --authorized-side right")
+    hand_configs = {
+        "left": args.left_gripper_config,
+        "right": args.right_gripper_config,
+    }
+    bilateral = args.gripper_skill_version == "2"
+    if not bilateral and args.left_gripper_config is not None:
+        parser.error("--left-gripper-config requires --gripper-skill-version 2")
+    if not bilateral and args.right_gripper_config is not None and args.authorized_side != "right":
+        parser.error("gripper v1 requires --authorized-side right")
+    if bilateral and not all(hand_configs.values()):
+        parser.error("provide both --left-gripper-config and --right-gripper-config")
+    if "set_gripper_state" in actions and (not args.right_gripper_config or (bilateral and not args.left_gripper_config)):
+        parser.error(
+            "set_gripper_state v2 requires both gripper configs" if bilateral
+            else "set_gripper_state v1 requires --right-gripper-config"
+        )
+    gripper_backends = {}
+    for hand_side, config_path in hand_configs.items():
+        if config_path is None:
+            continue
         from teleop_runtime.backends.grippers.dmtac import (
             DMTacGripperBackend,
             DMTacGripperBackendConfig,
         )
 
         path = _absolute_existing_file(
-            parser, args.right_gripper_config, flag="--right-gripper-config"
+            parser, config_path, flag=f"--{hand_side}-gripper-config"
         )
         try:
             values = json.loads(path.read_text(encoding="utf-8"))
             if (
                 not isinstance(values, dict)
-                or values.get("side") != "right"
+                or values.get("side") != hand_side
                 or not values.get("gripper_port")
             ):
-                raise ValueError("explicit side=right and gripper_port are required")
+                raise ValueError(
+                    f"explicit side={hand_side} and gripper_port are required"
+                )
             config = DMTacGripperBackendConfig(
                 **{
                     "connect_tactile": False,
@@ -861,9 +897,9 @@ def main(argv: list[str] | None = None) -> int:
                 raise ValueError(
                     "startup opening, fault clearing and automatic recovery are forbidden in this Skill profile"
                 )
-            right_gripper_backend = DMTacGripperBackend(config)
+            gripper_backends[hand_side] = DMTacGripperBackend(config)
         except (ValueError, TypeError) as error:
-            parser.error(f"invalid right gripper config: {error}")
+            parser.error(f"invalid {hand_side} gripper config: {error}")
     if args.client_uid < 0:
         parser.error("--client-uid must be non-negative")
     try:
@@ -1192,7 +1228,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     runtime_session_id = _runtime_session_id(args.runtime_session_id)
     composition = assemble_exclusive_rm65_agent_primitive_composition(
-        right_gripper_backend=right_gripper_backend,
+        right_gripper_backend=None if bilateral else gripper_backends.get("right"),
+        gripper_backends=gripper_backends if bilateral else None,
+        authorized_gripper_sides=None
+        if args.authorized_gripper_sides is None
+        else tuple(args.authorized_gripper_sides),
         lower=lower,
         socket_path=socket_path,
         authorized_side=args.authorized_side,

@@ -358,10 +358,21 @@ def stop_arm_and_gripper(
 class ExclusiveRealGripperResources:
     """Own the optional hand beside the existing lower application resources."""
 
-    def __init__(self, *, lower: Any, port: RealDmtacGripperControlPort) -> None:
-        if not isinstance(port, RealDmtacGripperControlPort):
-            raise TypeError("Gripper resources require the reviewed real adapter.")
-        for resource in (lower, port.backend):
+    def __init__(
+        self, *, lower: Any, port: RealDmtacGripperControlPort | None = None,
+        ports: Mapping[str, RealDmtacGripperControlPort] | None = None
+    ) -> None:
+        if port is not None:
+            if ports is not None:
+                raise ValueError("Select single v1 or explicit bilateral v2 resources.")
+            ports = {port.component_id: port}
+        if not ports or any(
+            not isinstance(port, RealDmtacGripperControlPort)
+            or key != port.component_id
+            for key, port in ports.items()
+        ):
+            raise TypeError("Gripper resources require correctly keyed real adapters.")
+        for resource in (lower, *(port.backend for port in ports.values())):
             if not all(
                 callable(getattr(resource, method, None))
                 for method in ("start", "close")
@@ -369,9 +380,9 @@ class ExclusiveRealGripperResources:
                 raise TypeError(
                     "Application resources must expose start() and close()."
                 )
-        config = getattr(port.backend, "config", None)
         if any(
-            bool(getattr(config, name, False))
+            bool(getattr(getattr(port.backend, "config", None), name, False))
+            for port in ports.values()
             for name in (
                 "open_on_start",
                 "clear_fault_on_start",
@@ -384,10 +395,11 @@ class ExclusiveRealGripperResources:
                 "Gripper Skill resources forbid startup opening/reset and automatic recovery."
             )
         self.lower = lower
+        self.ports = dict(ports)
         self.port = port
         self._lower_start_attempted = False
-        self._hand_attempted = False
-        self._hand_closed = False
+        self._hand_attempted: set[str] = set()
+        self._hand_closed: set[str] = set()
         self._lower_closed = False
 
     def start(self) -> None:
@@ -395,16 +407,17 @@ class ExclusiveRealGripperResources:
             raise RuntimeError("Gripper application resources start once.")
         self._lower_start_attempted = True
         self.lower.start()
-        self._hand_attempted = True
         try:
-            self.port.backend.start()
-            if not self.port.readiness().ready:
-                raise RuntimeError("Right gripper startup is not ready.")
-            sample = self.port.observe_state()
-            if sample.fault_code is not None or sample.moving is not False:
-                raise RuntimeError(
-                    "Right gripper must be fault-free and stationary before transport publication."
-                )
+            for component, port in self.ports.items():
+                self._hand_attempted.add(component)
+                port.backend.start()
+                if not port.readiness().ready:
+                    raise RuntimeError(f"{component} startup is not ready.")
+                sample = port.observe_state()
+                if sample.fault_code is not None or sample.moving is not False:
+                    raise RuntimeError(
+                        f"{component} must be fault-free and stationary before transport publication."
+                    )
         except Exception as start_error:
             try:
                 self.close()
@@ -415,9 +428,23 @@ class ExclusiveRealGripperResources:
             raise
 
     def close(self) -> None:
-        if self._hand_attempted and not self._hand_closed:
-            self.port.backend.close()
-            self._hand_closed = True
+        errors = []
+        interrupted = None
+        for component in reversed(tuple(self.ports)):
+            if component not in self._hand_attempted or component in self._hand_closed:
+                continue
+            try:
+                self.ports[component].backend.close()
+                self._hand_closed.add(component)
+            except (KeyboardInterrupt, SystemExit) as error:
+                if interrupted is None:
+                    interrupted = error
+            except Exception as error:  # noqa: BLE001 - preserve independent cleanup attempts.
+                errors.append(f"{component}:{error}")
+        if interrupted is not None:
+            raise interrupted
+        if errors:
+            raise RuntimeError("Gripper resource close failed: " + "; ".join(errors))
         if self._lower_start_attempted and not self._lower_closed:
             self.lower.close()
             self._lower_closed = True
