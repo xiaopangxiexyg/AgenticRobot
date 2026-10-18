@@ -267,7 +267,7 @@ manifest = {
     "schema_version": "dexteleop.perception_graspgenx_point_grasp_assets.v1",
     "model_profile_id": "graspgenx-release-dmtac-m-sweep-volume-v1",
     "source": {
-        "git_url": "https://github.com/NVlabs/GraspGenX.git",
+        "git_url": "https://github.com/CYBER-QAQ/GraspGenX.git",
         "revision": source_revision,
         "license": "Apache-2.0",
     },

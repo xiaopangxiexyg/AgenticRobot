@@ -9,9 +9,11 @@ The directory contents are ignored by Git except for this README and reviewed
 Git submodule boundaries. `model/openpi` remains independently owned and uses
 its own Python/runtime environment. `model/perception/{sam2,GroundingDINO,vgn,
 graspnet-baseline,graspgenx}` supplies the pinned external source used by the
-optional perception installers. Each gitlink records only an upstream commit;
-model weights and GraspGenX's isolated service environment remain in the
-reviewed `assets/` store.
+optional perception installers. Each gitlink records an exact source commit.
+GraspGenX uses the `CYBER-QAQ/GraspGenX` fork to retain the reviewed
+support-aware side-grasp changes; publish that pinned commit in the fork before
+publishing a parent revision that requires it. Model weights and GraspGenX's
+isolated service environment remain in the reviewed `assets/` store.
 
 Versioned artifact contracts and integration code belong under `deployments/`;
 non-canonical learner experiments belong under `experiments/policy_learning/`.
