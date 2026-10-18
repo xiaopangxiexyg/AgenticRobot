@@ -440,6 +440,88 @@ class RM65ObstacleCollisionOracle:
     def collision_model_is_independent(self) -> bool:
         return True
 
+    def check_rigid_endpoint_pose(
+        self, qpos_by_component: Mapping[str, np.ndarray], *, active_component: str,
+        current_tool_tcp_world: np.ndarray, target_tool_tcp_world: np.ndarray,
+    ) -> JointConfigurationCheck:
+        """Advisory terminal-tool clearance without solving arm IK.
+
+        Move only the terminal joint's rigid subtree to the requested TCP pose.
+        Query existing pairs against fixed geometry and the inactive component,
+        in independent scratch data. Forearm geometry, pose tolerances and path
+        continuity are deliberately NOT certified by this query. A result may
+        order IK requests, never admit or remove a grasp candidate.
+        """
+        metadata = {"scene_hash": self.scene_hash, "active_component": active_component,
+            "query_mode": "advisory_rigid_endpoint_vs_static_pairs",
+            "admission_authority": False}
+        try:
+            full_q = self._embed(qpos_by_component)
+            active_indices = set(self._indices[active_component])
+        except (KeyError, TypeError, ValueError) as exc:
+            return JointConfigurationCheck(safe=False, collision_check_available=False,
+                reason="invalid_rigid_endpoint_query", metadata={**metadata, "error": str(exc)})
+        poses = [np.asarray(p, dtype=float) for p in (current_tool_tcp_world, target_tool_tcp_world)]
+        for pose in poses:
+            if (pose.shape != (4, 4) or not np.isfinite(pose).all()
+                    or not np.allclose(pose[3], (0., 0., 0., 1.), atol=1e-9, rtol=0.)
+                    or not np.allclose(pose[:3, :3].T @ pose[:3, :3], np.eye(3), atol=1e-5, rtol=0.)
+                    or not np.isclose(np.linalg.det(pose[:3, :3]), 1., atol=1e-5, rtol=0.)):
+                raise ValueError("Rigid endpoint query requires two finite rigid world poses.")
+
+        def ancestors(joint_id):
+            result = set()
+            while joint_id:
+                result.add(joint_id)
+                joint_id = int(self._model.parents[joint_id])
+            return result
+
+        active_joints = {i for i, j in enumerate(self._model.joints)
+            if i and active_indices.intersection(range(j.idx_q, j.idx_q + j.nq))}
+        terminal_joints = active_joints - set().union(
+            *(ancestors(int(self._model.parents[j])) for j in active_joints))
+        if len(terminal_joints) != 1:
+            return JointConfigurationCheck(safe=False, collision_check_available=False,
+                reason="rigid_endpoint_requires_serial_component", metadata=metadata)
+        terminal_joint = next(iter(terminal_joints))
+        ancestry = [ancestors(int(g.parentJoint)) for g in self._collision_model.geometryObjects]
+        rigid = {i for i, parents in enumerate(ancestry) if terminal_joint in parents}
+        affected = {i for i, parents in enumerate(ancestry) if active_joints.intersection(parents)}
+        pairs = tuple(i for i, p in enumerate(self._collision_model.collisionPairs)
+            if (int(p.first) in rigid and int(p.second) not in affected)
+            or (int(p.second) in rigid and int(p.first) not in affected))
+        if not pairs:
+            return JointConfigurationCheck(safe=False, collision_check_available=False,
+                reason="no_rigid_endpoint_static_pairs", metadata=metadata)
+        try:
+            # Do not alter ordinary FK/GeometryData or any qpos-keyed cache.
+            data = self._model.createData()
+            geometry_data = self._pin.GeometryData(self._collision_model)
+            self._pin.updateGeometryPlacements(self._model, data, self._collision_model, geometry_data, full_q)
+            delta = poses[1] @ np.linalg.inv(poses[0])
+            transform = self._pin.SE3(delta[:3, :3], delta[:3, 3])
+            for i in rigid:
+                geometry_data.oMg[i] = transform * geometry_data.oMg[i]
+            distances = [float(self._pin.computeDistance(self._collision_model, geometry_data, i).min_distance)
+                for i in pairs]
+        except Exception as exc:  # noqa: BLE001 - optional external geometry query is unavailable
+            return JointConfigurationCheck(safe=False, collision_check_available=False,
+                reason="rigid_endpoint_distance_query_failed",
+                metadata={**metadata, "exception_type": type(exc).__name__, "exception": str(exc)})
+        if not np.isfinite(distances).all():
+            return JointConfigurationCheck(safe=False, collision_check_available=False,
+                reason="rigid_endpoint_distance_invalid", metadata=metadata)
+        closest = int(np.argmin(distances))
+        pair = self._collision_model.collisionPairs[pairs[closest]]
+        distance = distances[closest]
+        return JointConfigurationCheck(safe=distance > self._scene.minimum_clearance_m,
+            collision_check_available=True, reason="advisory_rigid_endpoint_clearance",
+            minimum_distance_m=distance, metadata={**metadata,
+                "rigid_geometry_count": len(rigid), "queried_pair_count": len(pairs),
+                "minimum_clearance_m": self._scene.minimum_clearance_m,
+                "closest_geometry_names": tuple(str(self._collision_model.geometryObjects[i].name)
+                    for i in (int(pair.first), int(pair.second)))})
+
     def check(self, qpos_by_component: Mapping[str, np.ndarray]) -> JointConfigurationCheck:
         try:
             full_q = self._embed(qpos_by_component)

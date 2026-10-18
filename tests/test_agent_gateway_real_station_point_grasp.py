@@ -1835,3 +1835,48 @@ def test_point_grasp_is_default_off_and_lifecycle_order_is_reversible(
         "localizer.close",
         "cameras.close",
     ]
+
+
+@pytest.mark.parametrize("side", ("left", "right"))
+@pytest.mark.parametrize("rigid_safe_index", (None, 29))
+def test_rigid_endpoint_priority_covers_low_scores_but_never_vetoes_ik(side, rigid_safe_index):
+    adapter = object.__new__(RM65PointGraspReachabilityAdapter)
+    adapter.profile = SimpleNamespace(max_measured_qpos_age_ms=200., arm_side=side)
+    adapter.arm_base_origin_candidate_m = (1., 0., 0.)
+    adapter.clock = lambda: 10.
+    adapter.monotonic = lambda: 1.
+    adapter._solver_pose = lambda p: p
+    candidates = []
+    for i in range(30):
+        pose = np.diag((-1., 1., -1., 1.))
+        pose[0, 3] = i
+        candidates.append(SimpleNamespace(base_from_tcp=tuple(pose.reshape(-1)), score=1.-i*.02))
+    queried, probed, assessed = [], [], []
+    def index(kw):
+        assert kw["side"] == side
+        return int(kw["target_tool_tcp_world"][0, 3])
+    def rigid(**kw):
+        i = index(kw)
+        queried.append(i)
+        return SimpleNamespace(collision_check_available=True, safe=i == rigid_safe_index,
+            minimum_distance_m=.04 if i == rigid_safe_index else -.03, metadata={})
+    def probe(**kw):
+        i = index(kw)
+        probed.append(i)
+        return SimpleNamespace(classification="clearance_safe", elapsed_ms=1., reason_code=None,
+            best_minimum_distance_m=.04, attempted_seed_count=1)
+    def assess(**kw):
+        i = index(kw)
+        assessed.append(i)
+        return SimpleNamespace(feasible=True, selected_pregrasp_distance_m=.06, elapsed_ms=1.,
+            reason_code=None, joint_travel_rad=(.01,)*6, attempts=())
+    adapter.planner = SimpleNamespace(check_grasp_rigid_endpoint_clearance=rigid,
+        probe_grasp_endpoint_clearance=probe, assess_local_grasp_chain=assess)
+    result = adapter.select_candidates(tuple(candidates), (0., 0., 0.), 1,
+        measured_qpos_cut=SimpleNamespace(measured_at=10., qpos_by_side={}), measurement_reference_time=10.)
+    assert set(queried) == set(range(30))
+    assert len(probed) == 24
+    expected = 0 if rigid_safe_index is None else rigid_safe_index
+    assert probed[0] == expected and assessed == [expected]
+    assert result.selected_indices == (expected,)
+    assert result.diagnostics["arm_shortlist_rigid_endpoint_scope"] == "advisory_only_not_ik_or_path_admission"

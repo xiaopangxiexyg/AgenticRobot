@@ -614,3 +614,30 @@ def test_static_scene_query_does_not_overwrite_concurrent_ordinary_query(monkeyp
     assert buffers["static"][1] is not buffers["ordinary"][1]
     np.testing.assert_array_equal(joint_after_static, placements["joint"])
     np.testing.assert_array_equal(geometry_after_static, placements["geometry"])
+
+
+def test_rigid_endpoint_query_matches_native_shape_distance_without_mutating_qpos_cache():
+    model, collision = _simple_prismatic_collision_model()
+    oracle = RM65ObstacleCollisionOracle(model=model, base_collision_model=collision,
+        reference_full_q=pin.neutral(model), qpos_indices_by_component={"arm": (0,)},
+        scene=_scene(clearance=.02))
+    current = {"arm": np.array((0.,))}
+    original = oracle.check(current)
+    for x in (0., .3, .5):
+        target = np.eye(4)
+        target[0, 3] = x
+        advisory = oracle.check_rigid_endpoint_pose(current, active_component="arm",
+            current_tool_tcp_world=np.eye(4), target_tool_tcp_world=target)
+        ordinary = oracle.check({"arm": np.array((x,))})
+        assert advisory.safe == ordinary.safe
+        assert advisory.minimum_distance_m == pytest.approx(ordinary.minimum_distance_m, abs=1e-9)
+        assert advisory.metadata["admission_authority"] is False
+        assert advisory.metadata["queried_pair_count"] == 1
+        assert oracle.check(current) is original
+    invalid = np.eye(4)
+    invalid[0, 0] = 2.
+    with pytest.raises(ValueError, match="rigid world poses"):
+        oracle.check_rigid_endpoint_pose(current, active_component="arm",
+            current_tool_tcp_world=np.eye(4), target_tool_tcp_world=invalid)
+    assert not oracle.check_rigid_endpoint_pose(current, active_component="absent",
+        current_tool_tcp_world=np.eye(4), target_tool_tcp_world=np.eye(4)).collision_check_available

@@ -346,6 +346,30 @@ class RM65PointGraspReachabilityAdapter:
             if int(item["index"]) not in support_priority_indices
         ]
 
+        # Model score and approach direction alone can hide a low-scored side
+        # grasp whose palm clears the stationary hand. This cheap native query
+        # covers the entire eligible pool before the bounded IK probes. It has
+        # no arm IK, pose-tolerance or path authority: keep every candidate.
+        rigid_query = getattr(self.planner, "check_grasp_rigid_endpoint_clearance", None)
+        rigid_started = float(self.monotonic())
+        rigid_counts = {"safe": 0, "blocked": 0, "unavailable": 0}
+        if callable(rigid_query):
+            for item in evaluation:
+                check = rigid_query(qpos_by_side=qpos_cut.qpos_by_side,
+                    side=self.profile.arm_side, target_tool_tcp_world=item["solver_pose"])
+                if check is None or not check.collision_check_available:
+                    rigid_counts["unavailable"] += 1
+                    continue
+                rigid_counts["safe" if check.safe else "blocked"] += 1
+                item["rigid_endpoint_check"] = {
+                    "safe": check.safe, "minimum_distance_m": check.minimum_distance_m,
+                    "closest_geometry_names": check.metadata.get("closest_geometry_names"),
+                }
+            # Unknown results retain their chance, and a blocked exact nominal
+            # pose can still have a valid tolerance-region IK branch below.
+            evaluation.sort(key=lambda item: not item.get("rigid_endpoint_check", {"safe": True})["safe"])
+        rigid_elapsed_ms = max(0., (float(self.monotonic()) - rigid_started) * 1000.)
+
         # A bounded endpoint probe orders, but never removes, candidates before
         # the expensive local approach validation.  This gives every physical
         # family a cheap chance to expose a clearance-safe or positive-gap IK
@@ -475,6 +499,7 @@ class RM65PointGraspReachabilityAdapter:
                         dict(attempt) for attempt in local_chain.attempts
                     ),
                     "endpoint_probe": item.get("endpoint_probe"),
+                    "rigid_endpoint_check": item.get("rigid_endpoint_check"),
                 }
             )
             if not local_chain.feasible:
@@ -545,6 +570,9 @@ class RM65PointGraspReachabilityAdapter:
                 "arm_shortlist_endpoint_probe_count": len(
                     endpoint_probe_attempts
                 ),
+                "arm_shortlist_rigid_endpoint_counts_json": json.dumps(rigid_counts, separators=(",", ":")),
+                "arm_shortlist_rigid_endpoint_elapsed_ms": rigid_elapsed_ms,
+                "arm_shortlist_rigid_endpoint_scope": "advisory_only_not_ik_or_path_admission",
                 "arm_shortlist_endpoint_probe_elapsed_ms": (
                     endpoint_probe_elapsed_ms
                 ),
@@ -562,8 +590,8 @@ class RM65PointGraspReachabilityAdapter:
                 ),
                 "arm_shortlist_selected_count": len(selected),
                 "arm_shortlist_policy": (
-                    "arm_side_family_then_advisory_endpoint_probe_then_"
-                    "production_local_grasp_chain_v3"
+                    "arm_side_family_then_rigid_endpoint_advisory_then_"
+                    "advisory_endpoint_probe_then_production_local_grasp_chain_v4"
                 ),
             },
         )

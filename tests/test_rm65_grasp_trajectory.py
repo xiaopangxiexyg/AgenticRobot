@@ -5355,3 +5355,74 @@ def test_endpoint_seed_dedup_preserves_order_tolerance_and_detached_qpos(
     if len(actual) > 1:
         for name in pair:
             assert not np.shares_memory(actual[0][name], actual[1][name])
+
+
+@pytest.mark.parametrize("query_owner", ("template", "observed_request"))
+def test_rigid_endpoint_query_waits_for_shared_builder_planning(monkeypatch, query_owner):
+    from concurrent.futures import ThreadPoolExecutor
+
+    planner = _planner_without_assets(config=RM65GraspTrajectoryPlanningConfig())
+    planner.observed_obstacles = None
+    planned, querying, fk_entered = threading.Event(), threading.Event(), threading.Event()
+    counts_lock = threading.Lock()
+    active, maximum = 0, 0
+    raced = []
+
+    class Oracle:
+        def for_observed_cloud(self, _cloud):
+            return self
+
+        def check_rigid_endpoint_pose(self, *_args, **_kwargs):
+            return "advisory"
+
+    monkeypatch.setattr(grasp_trajectory_module, "RM65ObstacleCollisionOracle", Oracle)
+    planner.oracle = Oracle()
+
+    def enter():
+        nonlocal active, maximum
+        with counts_lock:
+            active += 1
+            maximum = max(maximum, active)
+
+    def leave():
+        nonlocal active
+        with counts_lock:
+            active -= 1
+
+    def planning(**_kwargs):
+        enter()
+        try:
+            planned.set()
+            assert querying.wait(2.0), "Advisory worker did not attempt the query"
+            raced.append(fk_entered.wait(.05))
+            return "planned"
+        finally:
+            leave()
+
+    def fk(**_kwargs):
+        enter()
+        try:
+            fk_entered.set()
+            return {"right": np.eye(4)}
+        finally:
+            leave()
+
+    planner.target_builder = SimpleNamespace(tool_tcp_world_targets_for_qpos_pair=fk)
+    monkeypatch.setattr(planner, "_plan", planning)
+    query = planner if query_owner == "template" else planner.for_observed_cloud("current-cloud")
+    qpos = {side: np.zeros(6) for side in ("left", "right")}
+
+    def advisory():
+        assert planned.wait(2.0), "Planning worker did not acquire the shared owner"
+        querying.set()
+        return query.check_grasp_rigid_endpoint_clearance(
+            qpos_by_side=qpos, side="right", target_tool_tcp_world=np.eye(4))
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        full = pool.submit(planner, qpos_by_side=qpos, side="right",
+            target_tool_tcp_world=np.eye(4), speed_scale=.2)
+        rigid = pool.submit(advisory)
+        assert full.result(timeout=3.0) == "planned"
+        assert rigid.result(timeout=3.0) == "advisory"
+    assert raced == [False]
+    assert maximum == 1

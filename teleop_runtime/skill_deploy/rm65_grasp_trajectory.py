@@ -3265,6 +3265,22 @@ class RM65GraspJointTrajectoryPlanner:
                 termination_reason=termination,
             )
 
+    def check_grasp_rigid_endpoint_clearance(
+        self, *, qpos_by_side: Mapping[str, np.ndarray], side: str,
+        target_tool_tcp_world: np.ndarray,
+    ) -> JointConfigurationCheck | None:
+        """Order terminal IK using the native tool geometry, not another proxy."""
+        if not isinstance(self.oracle, RM65ObstacleCollisionOracle):
+            return None
+        # Shared builder FK participates in the complete planning owner.
+        with self._observed_planning_lock, self._solver_lock:
+            current = self.target_builder.tool_tcp_world_targets_for_qpos_pair(
+                left_qpos=qpos_by_side["left"], right_qpos=qpos_by_side["right"],
+            )[side]
+            return self.oracle.check_rigid_endpoint_pose(qpos_by_side,
+                active_component=side, current_tool_tcp_world=current,
+                target_tool_tcp_world=target_tool_tcp_world)
+
     def probe_grasp_endpoint_clearance(
         self,
         *,
