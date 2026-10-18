@@ -351,6 +351,10 @@ class _FakeMotor:
         self._call("robstride_get_state_observation")
         return self.observation
 
+    def robstride_get_active_report_observation(self) -> object | None:
+        self._call("robstride_get_active_report_observation")
+        return self.observation
+
     def request_feedback(self) -> None:
         self._call("request_feedback")
 
@@ -874,6 +878,70 @@ def test_host_fresh_poll_uses_operation_status_sequence_and_receive_age() -> Non
         motor.calls == [("robstride_get_state_observation", ())]
         for motor in controller.motors.values()
     )
+
+
+@pytest.mark.parametrize("fault", [None, "empty", "stale", "getter_error", "getter_missing", "wrong_type"])
+def test_type24_cache_advertisement_selects_only_dedicated_stream_and_never_falls_back(fault):
+    from hardware.rebot_b601_rs.active_report import B601ActiveReportControlGate
+
+    controller = _FakeController()
+    controller.robstride_capabilities.append("active_report_observation_v1")
+    backend = B601RSBackend(_config(), controller_factory=lambda _: controller, clock=lambda: 10.)
+    backend.connect()
+    _populate_states(controller)
+    for index, motor in controller.motors.items():
+        motor.observation = SimpleNamespace(state=motor.state, status_sequence=20+index,
+                                            receive_age_ns=5_000_000)
+        # Generic Type-2 replies remain available but cannot rescue this poll.
+        motor.state = SimpleNamespace(**{**vars(motor.state), "arbitration_id": 0x02000000+index})
+        if index == 2:
+            if fault == "empty": motor.observation = None
+            elif fault == "stale": motor.observation.receive_age_ns = 200_000_000
+            elif fault == "getter_error": motor.fail_method = "robstride_get_active_report_observation"
+            elif fault == "getter_missing": motor.robstride_get_active_report_observation = None
+            elif fault == "wrong_type": motor.observation.state = motor.state
+    state = backend.poll_feedback(require_host_freshness=True, prefer_active_report=True)
+    gate = B601ActiveReportControlGate(B601_RS_ARM_JOINT_NAMES, .1)
+    if fault:
+        with pytest.raises(ValueError):
+            gate.observe(state)
+        assert not gate.baseline_established
+    else:
+        assert gate.observe(state) is False
+        # Polling fresh Type-2 replies cannot advance a static Type-24 sequence.
+        with pytest.raises(ValueError, match="advance"):
+            gate.observe(backend.poll_feedback(require_host_freshness=True, prefer_active_report=True))
+        for motor in controller.motors.values():
+            motor.observation.status_sequence += 10
+        assert gate.observe(backend.poll_feedback(require_host_freshness=True, prefer_active_report=True))
+        assert state.joints[1].receive_age_sec == pytest.approx(.005)
+    assert all(name != "robstride_get_state_observation"
+               for motor in controller.motors.values() for name, _ in motor.calls)
+    assert all(name not in {"request_feedback", "get_state", "enable", "send_mit"}
+               for motor in controller.motors.values() for name, _ in motor.calls)
+
+
+def test_host_fresh_generic_contract_does_not_change_when_type24_cache_is_available():
+    controller = _FakeController()
+    controller.robstride_capabilities.append("active_report_observation_v1")
+    backend = B601RSBackend(_config(), controller_factory=lambda _: controller)
+    backend.connect()
+    _populate_states(controller)
+    for index, motor in controller.motors.items():
+        motor.observation = SimpleNamespace(state=motor.state, status_sequence=index,
+                                            receive_age_ns=1_000_000)
+        motor.fail_method = "robstride_get_active_report_observation"
+    assert backend.poll_feedback(require_host_freshness=True).valid
+    assert all(motor.calls == [("robstride_get_state_observation", ())]
+               for motor in controller.motors.values())
+
+
+@pytest.mark.parametrize("preference,error", [(True, ValueError), (1, TypeError), ("yes", TypeError)])
+def test_active_report_cache_preference_requires_explicit_freshness(preference, error):
+    backend = B601RSBackend(_config())
+    with pytest.raises(error, match="prefer_active_report"):
+        backend.poll_feedback(prefer_active_report=preference)
+    assert not backend.connected
 
 
 def test_host_fresh_poll_rejects_operation_status_older_than_timeout() -> None:

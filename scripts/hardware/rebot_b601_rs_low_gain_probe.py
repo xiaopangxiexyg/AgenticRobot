@@ -7300,7 +7300,7 @@ def _poll_control_feedback(
         state = (
             backend.poll_feedback(request_feedback=True)
             if active_report_gate is None
-            else backend.poll_feedback(require_host_freshness=True)
+            else backend.poll_feedback(require_host_freshness=True, prefer_active_report=True)
         )
     except LowGainProbeError as exc:
         if diagnostics is not None:

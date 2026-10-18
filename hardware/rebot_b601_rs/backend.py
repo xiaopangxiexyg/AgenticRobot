@@ -64,6 +64,7 @@ _B601_RS_PARAMETER_REPLY_CORRELATION_CAPABILITY = (
     "parameter_reply_correlation_v1"
 )
 _B601_RS_STATE_OBSERVATION_CAPABILITY = "state_observation_metadata_v1"
+_B601_RS_ACTIVE_REPORT_OBSERVATION_CAPABILITY = "active_report_observation_v1"
 # RobStride POS_VEL parameter IDs used by the pinned reBotArm
 # ``JointGroup._write_pv_params`` implementation.  Keep these explicit so a
 # future vendor/runtime update cannot silently turn mode preparation into a
@@ -958,6 +959,7 @@ class B601RSBackend:
         *,
         request_feedback: bool = False,
         require_host_freshness: bool = False,
+        prefer_active_report: bool = False,
     ) -> B601HardwareState:
         """Observe six joints, optionally requesting a fresh vendor snapshot.
 
@@ -974,12 +976,23 @@ class B601RSBackend:
         receive-sequence/age capability, does not issue parameter reads, and
         rejects cached frames older than ``feedback_timeout_sec``.  It still
         cannot claim device-source timestamp freshness.
+
+        ``prefer_active_report=True`` selects the dedicated Type-24 cache when
+        the runtime advertises it. Older runtimes retain their generic cache;
+        the caller's Type-24 admission gate remains mandatory. This preference
+        requires host freshness and never rescues an empty/stale/broken
+        advertised dedicated cache with generic replies. Ordinary host-fresh
+        consumers retain the existing newest-status contract.
         """
 
         if not isinstance(request_feedback, bool):
             raise TypeError("request_feedback must be a bool")
         if not isinstance(require_host_freshness, bool):
             raise TypeError("require_host_freshness must be a bool")
+        if not isinstance(prefer_active_report, bool):
+            raise TypeError("prefer_active_report must be a bool")
+        if prefer_active_report and not require_host_freshness:
+            raise ValueError("prefer_active_report requires require_host_freshness")
         if request_feedback and require_host_freshness:
             raise ValueError(
                 "request_feedback and require_host_freshness are separate feedback paths"
@@ -1025,8 +1038,17 @@ class B601RSBackend:
             host_receive_freshness_verified = False
             observed_at = now
             if require_host_freshness:
+                features = (self._motorbridge_runtime_evidence or {}).get("robstride_features", ())
+                observation_method = (
+                    "robstride_get_active_report_observation"
+                    if prefer_active_report and _B601_RS_ACTIVE_REPORT_OBSERVATION_CAPABILITY in features
+                    else "robstride_get_state_observation"
+                )
                 try:
-                    raw_observation = motor.robstride_get_state_observation()
+                    # The dedicated stream retains its original age/sequence
+                    # while Type-2 command replies update the generic cache.
+                    # A missing/failing advertised getter must NOT fall back.
+                    raw_observation = getattr(motor, observation_method)()
                     if raw_observation is None:
                         raw_state = None
                         raw_state_error = (
@@ -1064,7 +1086,7 @@ class B601RSBackend:
                 except Exception as exc:  # noqa: BLE001 - vendor observation boundary
                     raw_state = None
                     raw_state_error = (
-                        f"{joint.name}.robstride_get_state_observation: {exc}"
+                        f"{joint.name}.{observation_method}: {exc}"
                     )
             else:
                 try:

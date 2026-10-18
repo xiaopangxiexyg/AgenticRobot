@@ -1127,7 +1127,7 @@ def test_active_report_warmup_requires_advancing_type24_and_disables_stream(
             )
 
         def poll_feedback(self, **kwargs: object) -> B601HardwareState:
-            assert kwargs == {"require_host_freshness": True}
+            assert kwargs == {"require_host_freshness": True, "prefer_active_report": True}
             self.sequence += 1
             events.append(f"type24_{self.sequence}")
             return state(self.sequence)
@@ -5061,7 +5061,7 @@ def test_feedback_retries_release_rejected_tracebacks_without_waiting_for_gc(mon
     gate.observe(_timed_feedback_state(1))
 
     def poll(**kwargs):
-        assert kwargs == {"require_host_freshness": True}
+        assert kwargs == {"require_host_freshness": True, "prefer_active_report": True}
         polls[0] += 1
         return _timed_feedback_state(2 if advances and polls[0] > 3 else 1)
 
@@ -5106,7 +5106,7 @@ def test_feedback_diagnostics_preserve_real_admission_retries_and_source_request
     diagnostics = probe._ProbeFeedbackTiming() if observe else None
     admitted = probe._read_admitted_control_feedback(SimpleNamespace(poll_feedback=poll), gate, .05, diagnostics)
     assert admitted is advancing
-    assert calls == [{"require_host_freshness": True}] * 4
+    assert calls == [{"require_host_freshness": True, "prefer_active_report": True}] * 4
     assert waits == [.001] * 3
     assert gate.last_status_sequences == {f"joint{i}": 2 for i in range(1, 7)}
     if diagnostics is not None:
