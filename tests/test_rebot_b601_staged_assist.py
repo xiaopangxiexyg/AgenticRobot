@@ -332,7 +332,7 @@ def test_continuous_transfer_regulates_propulsion_without_rearming(direction):
     expected_cut = max(0., direction*recovery["pd_request_nm"])*(1-frame.motion.continuous_speed_scale)
     assert recovery["continuous_speed_drive_cut_nm"] == pytest.approx(expected_cut)
     assert recovery["velocity_feedback_cut_nm"] == 0.
-    assert recovery["velocity_feedback_baseline_mode"] == "continuous_pd_scaling_with_bounded_maintenance"
+    assert recovery["velocity_feedback_baseline_mode"] == "continuous_pd_scaling_with_net_velocity_feedback"
     assert recovery["combined_request_nm"] == pytest.approx(before-direction*expected_cut)
     assert abs(recovery["target_velocity_rad_s"]) < runtime.config.motion_control.max_reference_velocity_rad_s
     assert abs(frame.overlay_torque_nm[2]) <= 1.
@@ -344,7 +344,29 @@ def test_continuous_transfer_regulates_propulsion_without_rearming(direction):
 
 
 @pytest.mark.parametrize("direction", [-1, 1])
-def test_continuous_regulation_preserves_bounded_maintenance_but_cuts_propulsion(direction):
+def test_continuous_negative_feedback_can_reduce_a_maintenance_dominated_request(direction):
+    runtime, now, _ = _recovery_track(direction, target=.1, pacing=True,
+        handoff="track", governor=True, continuous_limit=.05, feedback_gain=10.)
+    for n in range(1, 301):
+        _held_tick(runtime, now+n*.01, .001536, direction=direction, target=.1)
+    frame = _held_tick(runtime, now+3.01, .0018, direction=direction, target=.1,
+        speed=.0252, raw=.0384, span=.002, raw_limit=.13)
+    r = frame.tracking_recovery
+    full = r["pd_request_nm"] + frame.base_frame.decision.state.authority*r["bias_request_nm"]
+    error_cut = 10.*max(0., direction*(direction*.0252-r["target_velocity_rad_s"]))
+    assert direction*r["bias_request_nm"] > .1
+    assert r["tracking_velocity_correction_nm"] == pytest.approx(min(max(0., direction*full), error_cut))
+    assert r["tracking_velocity_correction_nm"] > max(0., direction*r["pd_request_nm"])
+    assert 0 <= direction*r["combined_request_nm"] < direction*r["bias_request_nm"]
+    # The output correction is not recursively subtracted from integral memory.
+    assert r["velocity_feedback_cut_nm"] == 0.
+    next_frame = _held_tick(runtime, now+3.02, .0018, direction=direction, target=.1,
+        speed=.0252, raw=0., span=.002, raw_limit=.13)
+    assert next_frame.tracking_recovery["dispatch_tracking_cut_nm"] == pytest.approx(0.)
+
+
+@pytest.mark.parametrize("direction", [-1, 1])
+def test_continuous_regulation_preserves_integral_memory_not_a_drive_floor(direction):
     runtime, now, _ = _recovery_track(direction, target=.1, pacing=True,
         handoff="track", governor=True, continuous_limit=.05, feedback_gain=10.)
     for n in range(1, 301):
@@ -357,10 +379,14 @@ def test_continuous_regulation_preserves_bounded_maintenance_but_cuts_propulsion
     pd = recovery["pd_request_nm"]
     assert direction*maintenance > .1
     assert 0 < frame.motion.continuous_speed_scale < 1
-    # Normal regulation can remove propulsion, but not multiply away the
-    # integral's separate bounded memory as if it were all acceleration force.
-    assert direction*recovery["combined_request_nm"] >= direction*maintenance + min(0., direction*pd)
-    assert recovery["applied_drive_cut_nm"] <= max(0., direction*pd)+1e-12
+    # Scaling remains PD-only; velocity error can reduce net drive below I.
+    # The integral remains separately bounded, not an output lower bound.
+    scale_cut = max(0., direction*pd)*(1-frame.motion.continuous_speed_scale)
+    velocity_cut = min(max(0., direction*(pd+maintenance)),
+        10.*max(0., direction*(direction*.025-recovery["target_velocity_rad_s"])))
+    assert recovery["applied_drive_cut_nm"] == pytest.approx(
+        min(max(0., direction*(pd+maintenance)), max(scale_cut, velocity_cut)))
+    assert 0 <= direction*recovery["combined_request_nm"] < direction*maintenance
     assert abs(frame.overlay_torque_nm[2]) <= runtime.config.max_total_overlay_nm
 
 
@@ -421,7 +447,8 @@ def test_continuous_velocity_correction_uses_same_window_as_maintenance(directio
         recovery = frame.tracking_recovery
         assert recovery["tracking_cut_velocity_rad_s"] == pytest.approx(direction*.015)
         assert recovery["tracking_velocity_correction_nm"] == pytest.approx(
-            min(max(0., direction*recovery["pd_request_nm"]),
+            min(max(0., direction*(recovery["pd_request_nm"]
+                +frame.base_frame.decision.state.authority*recovery["bias_request_nm"])),
                 10.*max(0., direction*(direction*.015-recovery["target_velocity_rad_s"]))))
         assert recovery["combined_request_nm"] == pytest.approx(expected["combined_request_nm"])
         assert frame.overlay_torque_nm == pytest.approx(frames[0].overlay_torque_nm)
@@ -433,7 +460,7 @@ def test_continuous_velocity_correction_uses_same_window_as_maintenance(directio
 
 
 @pytest.mark.parametrize("direction", [-1, 1])
-def test_continuous_velocity_and_scale_bounds_are_applied_once_to_propulsion(direction):
+def test_continuous_velocity_and_scale_bounds_are_applied_once_to_net_request(direction):
     runtime, now, _ = _recovery_track(direction, target=.1, pacing=True,
         handoff="track", governor=True, continuous_limit=.05, feedback_gain=10.)
     for n in range(1, 351):
@@ -443,11 +470,10 @@ def test_continuous_velocity_and_scale_bounds_are_applied_once_to_propulsion(dir
     assert frame.phase is B601StagedAssistPhase.TRACK
     recovery = frame.tracking_recovery
     full = recovery["pd_request_nm"] + frame.base_frame.decision.state.authority*recovery["bias_request_nm"]
-    maintenance = direction*frame.base_frame.decision.state.authority*recovery["bias_request_nm"]
     drive = max(0., direction*recovery["pd_request_nm"])
     scale = frame.motion.continuous_speed_scale
     velocity_cut = recovery["tracking_velocity_correction_nm"]
-    assert drive >= velocity_cut > 0
+    assert direction*full >= velocity_cut > drive
     assert 0 < scale < 1
     scale_cut = drive*(1-scale)
     assert recovery["continuous_speed_bound_cut_nm"] == pytest.approx(scale_cut)
@@ -456,7 +482,7 @@ def test_continuous_velocity_and_scale_bounds_are_applied_once_to_propulsion(dir
         recovery["applied_drive_cut_nm"] - velocity_cut)
     combined = direction*recovery["combined_request_nm"]
     assert combined == pytest.approx(direction*full-max(velocity_cut, scale_cut))
-    assert combined >= maintenance
+    assert combined >= 0.
     assert abs(frame.overlay_torque_nm[2]) <= runtime.config.max_total_overlay_nm
     runtime.request_withdrawal("operator_withdraw")
     withdrawn = _held_tick(runtime, now+3.52, .0018, direction=direction, target=.1)

@@ -1141,8 +1141,10 @@ class B601StagedSingleJointAssistRuntime:
         if (motion.phase == "track" and motion.continuous_speed_scale is not None
             or continuous_arrival):
             # The bounded integral learns load/velocity error separately.
-            # Normal speed shaping removes PD propulsion, not that complete
-            # maintenance command a second time. Opposing PD remains intact.
+            # Speed scaling removes PD propulsion only. Proportional velocity
+            # error must still reduce the complete same-direction output:
+            # a bounded integral is not a guaranteed physical load torque.
+            # Neither correction is debited recursively from integral memory.
             # Arrival still drains the complete request before final zero.
             direction = math.copysign(1.0, motion.target_error_rad)
             maintenance = (base_frame.decision.state.authority
@@ -1159,7 +1161,8 @@ class B601StagedSingleJointAssistRuntime:
             # permanent debit of low-frequency maintenance. The integral still
             # learns velocity error once below, with the existing finite cap.
             target_velocity = (self._tracking_recovery or {}).get("target_velocity_rad_s", 0.0)
-            velocity_cut = min(propulsion,
+            aligned_request = max(0.0, direction * requested)
+            velocity_cut = min(aligned_request,
                 self.config.tracking_recovery_velocity_feedback_nm_s_per_rad
                 * max(0.0, direction * (feedback_velocity-target_velocity)))
             # A short window may still contain the preceding forward burst.
@@ -1167,10 +1170,9 @@ class B601StagedSingleJointAssistRuntime:
             drive = propulsion if direction * control_v >= 0.0 else 0.0
             cut = drive * (1.0 - (motion.continuous_speed_scale
                 if motion.continuous_speed_scale is not None else 1.0))
-            # Both constraints bound the same propulsion demand.
-            # Satisfy the stricter bound once, rather than scaling the remainder
-            # of a velocity cut a second time and unnecessarily re-sticking.
-            applied_cut = max(velocity_cut, cut)
+            # Apply the stricter output constraint once, without creating a
+            # torque reversal or erasing a separate opposing PD request.
+            applied_cut = min(aligned_request, max(velocity_cut, cut))
             requested -= direction * applied_cut
             if self._tracking_recovery is not None:
                 self._tracking_recovery.update(
@@ -1376,7 +1378,7 @@ class B601StagedSingleJointAssistRuntime:
                 else "maintenance_first_bounded_by_sent_total" if frontier_feedback else "reserve_requested_pd_first"),
             "feedback_velocity_rad_s": feedback_velocity,
             "velocity_feedback_baseline_mode": (
-                "continuous_pd_scaling_with_bounded_maintenance" if config.continuous_speed_limit_rad_s is not None
+                "continuous_pd_scaling_with_net_velocity_feedback" if config.continuous_speed_limit_rad_s is not None
                 else "track_resolved_speed_frontier" if frontier_feedback else "current_resolved_speed"),
             "maintenance_state_mode": ("receipt_bounded_frozen_memory"
                 if reason == "tracking_bias_frozen_for_governed_stop" else "bounded_bias_with_separate_transient_feedback"

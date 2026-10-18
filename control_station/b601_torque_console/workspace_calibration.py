@@ -37,6 +37,7 @@ class WorkspaceCalibrationConfig:
     positioning_velocity_rad_s: float = 0.015
     positioning_torque_rise_nm_s: float = 1.0
     positioning_torque_fall_nm_s: float = 8.0
+    positioning_support_soft_speed_recovery: bool = False
     gravity_observation_sec: float = 5.0
     max_workspace_sec: float = 7200.0
     max_command_exposure_nm_sec: float = 2400.0
@@ -44,6 +45,8 @@ class WorkspaceCalibrationConfig:
     setup_label: str = "temporary_end_effector"
 
     def __post_init__(self):
+        if type(self.positioning_support_soft_speed_recovery) is not bool:
+            raise TypeError("workspace positioning support recovery must be boolean")
         for name, upper in (("joint2_centres_deg", 120), ("joint3_centres_deg", 90)):
             values = tuple(finite(v, name) for v in getattr(self, name))
             if not 1 <= len(values) <= 12 or list(values) != sorted(set(values)):
@@ -170,7 +173,9 @@ class B601WorkspaceCalibrationController:
     def _make_controller(self, joint, *, positioning):
         gains = getattr(self.workspace, f"{joint}_drive_kd")
         motion = replace(self.settings.staged_assist.motion_control,
-                         drive_driver_kd_nm_s_per_rad=gains)
+                         drive_driver_kd_nm_s_per_rad=gains,
+                         support_soft_speed_recovery=(self.workspace.positioning_support_soft_speed_recovery
+                             if positioning else self.settings.staged_assist.motion_control.support_soft_speed_recovery))
         staged = replace(self.settings.staged_assist, joint_name=joint, motion_control=motion)
         if positioning:
             staged = replace(staged,

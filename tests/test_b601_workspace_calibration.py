@@ -143,6 +143,8 @@ def test_workspace_rejects_start_away_from_zero_and_retains_narrow_feedback_enve
     {"joint2_centres_deg": (-.3, 60)}, {"joint2_centres_deg": (120,)},
     {"joint3_centres_deg": (91,)}, {"joint3_centres_deg": (40, 10)},
     {"joint2_drive_kd": (0,) * 5}, {"max_command_exposure_nm_sec": float("inf")},
+    {"positioning_support_soft_speed_recovery": 1},
+    {"positioning_support_soft_speed_recovery": None},
 ])
 def test_workspace_config_rejects_unbounded_or_outside_targets(values):
     with pytest.raises((ValueError, TypeError)):
@@ -532,6 +534,47 @@ def test_workspace_production_profile_constructs_every_child_before_motion(
     assert staged.onset_handoff == "track"
     assert staged.max_total_overlay_nm == 1
     assert child.limits.max_joint_velocity_rad_s == .13
+    # The wrapper's cycle section does not configure workspace children.
+    # Recovery must be explicit for positioning, never silently for sweeps.
+    assert staged.motion_control.support_soft_speed_recovery is positioning
+
+
+def test_workspace_positioning_support_brake_resumes_same_leg_only_after_zero_and_still(production_controller):
+    controller = production_controller
+    controller.submit("select_mode", now_sec=1., operation_mode="workspace")
+    replay = AcquisitionReplay(controller.settings, controller=controller,
+        position_limits=LIMITS, initial_q=ZERO)
+    controller.submit("arm", now_sec=replay.now+.001, operation_mode="workspace")
+    advance(replay, until=lambda b: b["state"] == "position" and replay.audit.get("phase") == "track")
+    target = replay.audit["motion_control"]["target_position_rad"]
+    session = controller._workspace._session
+    batch_id = controller._workspace._batch_id
+    # Prescribed support motion is below the raw hard limit, but crosses the
+    # existing causal-window soft limit. It must withdraw before any resumption.
+    for _ in range(9):
+        q = list(replay.q)
+        q[3] += .0006
+        replay.tick(q)
+    assert replay.audit["motion_control"]["reason"] == "support_velocity_braking"
+    for _ in range(8):
+        replay.tick()
+        assert replay.audit["phase"] != "track"
+    for _ in range(200):
+        replay.tick()
+        if replay.audit["phase"] == "track":
+            break
+    assert replay.audit["phase"] == "track", replay.audit
+    assert replay.audit["motion_control"]["speed_governor_resume_count"] == 1
+    assert replay.audit["motion_control"]["target_position_rad"] == target
+    assert controller._workspace._session is session
+    assert controller._workspace._batch_id == batch_id
+    assert controller.status()["automatic_calibration"]["workspace"]["task_index"] == 0
+    # An explicit operator cancel cannot be undone by the next quiet window.
+    controller.submit("withdraw", now_sec=replay.now+.001)
+    for _ in range(150):
+        replay.tick()
+        assert replay.audit["phase"] != "track"
+    assert controller.result_record()["state"] == "cancelled"
 
 
 def test_workspace_production_profile_checks_both_axes_at_construction(production_controller, monkeypatch):

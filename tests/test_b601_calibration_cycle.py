@@ -660,7 +660,7 @@ def test_transfer_native_owner_with_quantized_stiction_plant_reaches_twenty_degr
         replay.tick(feedback)
         return q, velocity
     q, velocity = 0., 0.
-    maximum_speed = maximum_torque = maximum_resume = regulation_ticks = 0
+    maximum_speed = maximum_torque = maximum_resume = regulation_ticks = feedback_ticks = 0
     for _ in range(24000):
         q, velocity = plant_step(q, velocity)
         maximum_speed = max(maximum_speed, abs(velocity))
@@ -668,6 +668,7 @@ def test_transfer_native_owner_with_quantized_stiction_plant_reaches_twenty_degr
         motion = replay.audit.get("motion_control") or {}
         maximum_resume = max(maximum_resume, motion.get("speed_governor_resume_count", 0))
         regulation_ticks += motion.get("continuous_speed_scale") is not None and motion["continuous_speed_scale"] < 1.
+        feedback_ticks += (replay.audit.get("tracking_recovery") or {}).get("tracking_velocity_correction_nm", 0.) > 0.
         cycle = controller.status()["automatic_calibration"]["cycle"]
         replay.audits.clear()
         replay.records.clear()
@@ -678,6 +679,7 @@ def test_transfer_native_owner_with_quantized_stiction_plant_reaches_twenty_degr
         "reason": cycle["reason"], "position_rad": q, "duration_sec": replay.now-1.12,
         "maximum_physical_speed_rad_s": maximum_speed, "maximum_overlay_nm": maximum_torque,
         "maximum_resumptions": maximum_resume, "regulation_ticks": regulation_ticks,
+        "net_velocity_feedback_ticks": feedback_ticks,
     })
     if not continuous and friction == .6:
         # This stress plant exceeds the admitted 234 s positioning window;
@@ -690,7 +692,9 @@ def test_transfer_native_owner_with_quantized_stiction_plant_reaches_twenty_degr
     assert abs(q-math.radians(20)) <= controller.config.motion_tracking_arrival_tolerance_rad
     assert maximum_torque <= 1.
     assert maximum_speed < .10
-    assert regulation_ticks > 0 if continuous else regulation_ticks == 0
+    # Net velocity feedback may regulate before the independent PD scaling
+    # ceiling is reached. Reaching saturation is not an arrival requirement.
+    assert regulation_ticks+feedback_ticks > 0 if continuous else regulation_ticks+feedback_ticks == 0
     # Soft governor may pause and resume repeatedly; outer positioning/cycle
     # deadlines and the command-exposure budget bound the operation.
     assert controller._fixed.settings.staged_assist.motion_control.continuous_speed_limit_rad_s == .039
