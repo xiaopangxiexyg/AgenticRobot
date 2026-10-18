@@ -282,12 +282,22 @@ class VisibleGraspScene:
     def _local_points(self, pose: np.ndarray, *, opening_m: float,
                       distance_m: float = 0) -> tuple[np.ndarray, np.ndarray]:
         g = self.geometry
-        radius = math.sqrt((opening_m/2+g.finger_thickness_m)**2 +
-                           (g.pad_height_m/2)**2 +
-                           max(abs(g.palm_z_m-g.finger_thickness_m-distance_m),
-                               abs(g.palm_z_m+g.finger_length_m))**2)
-        # Reuse one native index array for XYZ and labels.
-        indices = np.asarray(self._tree.query_ball_point(pose[:3, 3], radius+1e-9),
+        low_z = g.palm_z_m - g.finger_thickness_m - distance_m
+        high_z = g.palm_z_m + g.finger_length_m
+        center_z = (low_z + high_z) / 2
+        # Enclose the same solids about their own center, not the TCP. The
+        # inverse also preserves the local-point predicate for accepted poses
+        # that are only numerically orthonormal.
+        inverse = np.linalg.inv(pose[:3, :3])
+        center = pose[:3, 3] + center_z * inverse[2]
+        extents = np.array((opening_m/2 + g.finger_thickness_m,
+                            g.pad_height_m/2, (high_z - low_z)/2))
+        corners = np.array(((-1, -1, -1), (-1, -1, 1), (-1, 1, -1), (-1, 1, 1),
+                            (1, -1, -1), (1, -1, 1), (1, 1, -1), (1, 1, 1)))
+        radius = float(np.linalg.norm((corners * extents) @ inverse, axis=1).max())
+        # Reuse one native index array for XYZ and labels. Passing the Python
+        # list to both NumPy lookups repeats its conversion for every pose.
+        indices = np.asarray(self._tree.query_ball_point(center, radius+1e-9),
                              dtype=np.intp)
         return ((self.points[indices]-pose[:3, 3]) @ pose[:3, :3],
                 self.target_mask[indices])
@@ -462,21 +472,31 @@ class VisibleGraspScene:
                                   )),
                 int(np.count_nonzero(remove)))
 
-    def _collision_local_points(
+    def _validated_solid_pose(
         self, pose: np.ndarray, *, opening_m: float,
-    ) -> tuple[np.ndarray, np.ndarray]:
+    ) -> np.ndarray:
         g = self.geometry
         if not math.isfinite(opening_m) or not 0 < opening_m <= g.maximum_opening_m:
             raise ValueError("opening is outside the geometry bound")
         pose = np.asarray(pose, dtype=float)
+        identity = np.eye(3)
+        # Preserve the previous allclose/isclose tolerances for finite poses;
+        # these small fixed-shape comparisons are hot in candidate and path checks.
         if (pose.shape != (4, 4) or not np.all(np.isfinite(pose))
-                or not np.allclose(pose[3], [0, 0, 0, 1])
-                or not np.allclose(pose[:3, :3].T @ pose[:3, :3], np.eye(3), atol=1e-7)
-                or not np.isclose(np.linalg.det(pose[:3, :3]), 1)):
+                or not np.all(np.abs(pose[3] - (0, 0, 0, 1))
+                              <= (1e-8, 1e-8, 1e-8, 1e-8 + 1e-5))
+                or not np.all(np.abs(pose[:3, :3].T @ pose[:3, :3] - identity)
+                              <= 1e-7 + 1e-5 * identity)
+                or not abs(float(np.linalg.det(pose[:3, :3])) - 1.) <= 1e-8 + 1e-5):
             raise ValueError("grasp pose must be rigid")
-        pose = g.solid_pose(pose)
-        return self._local_points(pose, opening_m=opening_m)
+        return g.solid_pose(pose)
 
+
+    def _collision_local_points(
+        self, pose: np.ndarray, *, opening_m: float,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        pose = self._validated_solid_pose(pose, opening_m=opening_m)
+        return self._local_points(pose, opening_m=opening_m)
     def collision_counts(self, pose: np.ndarray, *, opening_m: float) -> tuple[int, int]:
         """Count observed target/background points inside the nominal solids."""
         local, labels = self._collision_local_points(pose, opening_m=opening_m)
@@ -527,9 +547,8 @@ class VisibleGraspScene:
         """
         if not math.isfinite(distance_m) or distance_m < 0:
             raise ValueError("approach distance must be finite and nonnegative")
-        # Validate opening and transform using the independently callable check.
-        self.collision_counts(grasp_pose, opening_m=opening_m)
-        pose = self.geometry.solid_pose(np.asarray(grasp_pose))
+        # Reuse the same input checks, not an unused terminal collision query.
+        pose = self._validated_solid_pose(grasp_pose, opening_m=opening_m)
         local, labels = self._local_points(pose, opening_m=opening_m, distance_m=distance_m)
         occupied = self._solid_mask(local, opening_m=opening_m, distance_m=distance_m)
         target = occupied & labels

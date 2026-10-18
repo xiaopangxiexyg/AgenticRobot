@@ -299,22 +299,148 @@ def test_oversized_npy_header_is_rejected_before_numpy_can_allocate(monkeypatch)
 
 @pytest.mark.parametrize("count", [0, 1, 10000])
 def test_native_query_index_reuse_matches_original_xyz_and_labels(count):
-    import math
-
     rng = np.random.default_rng(42)
     view = scene(rng.uniform(-.2, .2, (count, 3)), rng.random(count) > .5)
+    original_tree = view._tree
+    queries = []
+
+    class QueryTrace:
+        def query_ball_point(self, *args, **kwargs):
+            indices = original_tree.query_ball_point(*args, **kwargs)
+            queries.append(indices)
+            return indices
+
+    view._tree = QueryTrace()
     for opening, distance in ((.07, 0.), (.035, .06), (.07, .1)):
         for yaw in (0., .7, -1.2):
             pose = np.eye(4)
             pose[:2, :2] = [[np.cos(yaw), -np.sin(yaw)], [np.sin(yaw), np.cos(yaw)]]
             pose[:3, 3] = rng.uniform(-.05, .05, 3)
-            g = view.geometry
-            radius = math.sqrt((opening/2+g.finger_thickness_m)**2 +
-                (g.pad_height_m/2)**2 +
-                max(abs(g.palm_z_m-g.finger_thickness_m-distance), abs(g.palm_z_m+g.finger_length_m))**2)
-            indices = view._tree.query_ball_point(pose[:3, 3], radius+1e-9)
-            expected_points = (view.points[indices]-pose[:3, 3]) @ pose[:3, :3]
+            queries.clear()
             actual_points, actual_labels = view._local_points(pose, opening_m=opening,
                 distance_m=distance)
+            assert len(queries) == 1
+            indices = np.asarray(queries[0], dtype=np.intp)
+            expected_points = (view.points[indices]-pose[:3, 3]) @ pose[:3, :3]
             np.testing.assert_array_equal(actual_points, expected_points)
             np.testing.assert_array_equal(actual_labels, view.target_mask[indices])
+            full_local = (view.points-pose[:3, 3]) @ pose[:3, :3]
+            full = view._solid_mask(full_local, opening_m=opening, distance_m=distance)
+            queried = view._solid_mask(actual_points, opening_m=opening, distance_m=distance)
+            expected_rows = np.column_stack((full_local[full], view.target_mask[full]))
+            actual_rows = np.column_stack((actual_points[queried], actual_labels[queried]))
+            np.testing.assert_array_equal(sorted(map(tuple, actual_rows)), sorted(map(tuple, expected_rows)))
+
+
+@pytest.mark.parametrize('palm_z', [-.043, 0., .08])
+@pytest.mark.parametrize('distance', [0., .06, .1])
+@pytest.mark.parametrize('anisotropic', [False, True])
+def test_centered_query_covers_corners_rotated_offsets_and_numerical_pose_error(palm_z, distance, anisotropic):
+    from dataclasses import replace
+    geometry = replace(GEOMETRY, palm_z_m=palm_z, tool_from_solid_xyz_m=(.0245, 0, .0082),
+                       solid_yaw_rad=.7)
+    pose = np.eye(4)
+    pose[:3, :3] = [[np.cos(.3), -np.sin(.3), 0], [np.sin(.3), np.cos(.3), 0], [0, 0, 1]]
+    if anisotropic:
+        pose[:3, :3] = pose[:3, :3] @ np.array([[1.-1e-6, 1e-8, 0], [0, 1.+2e-6, 0], [0, 0, 1.-3e-6]])
+    else:
+        pose[:3, :3] *= 1. - 1e-6
+    pose[:3, 3] = [.2, -.1, .3]
+    solid = geometry.solid_pose(pose)
+    x = .07/2 + geometry.finger_thickness_m - 1e-10
+    y = geometry.pad_height_m/2 - 1e-10
+    low = palm_z - geometry.finger_thickness_m - distance + 1e-10
+    high = palm_z + geometry.finger_length_m - 1e-10
+    local = np.array([[sx*x, sy*y, z] for sx in (-1, 1) for sy in (-1, 1) for z in (low, high)])
+    points = local @ np.linalg.inv(solid[:3, :3]) + solid[:3, 3]
+    view = VisibleGraspScene(points=points, target_mask=np.arange(8) % 2 == 0, geometry=geometry)
+    actual, labels = view._local_points(solid, opening_m=.07, distance_m=distance)
+    assert len(actual) == 8
+    np.testing.assert_allclose(actual, local, rtol=0, atol=1e-15)
+    np.testing.assert_array_equal(labels, view.target_mask)
+
+
+def test_centered_query_excludes_irrelevant_points_near_tcp_but_keeps_swept_obstacle():
+    view = scene([[0, 0, .11], [.04, 0, -.08]], [False, False])
+    local, _ = view._local_points(np.eye(4), opening_m=.07, distance_m=.06)
+    assert len(local) == 1
+    assert view.approach_collision_counts(np.eye(4), opening_m=.07, distance_m=.06) == (0, 1)
+
+
+def test_hot_solid_pose_check_matches_original_finite_pose_tolerances():
+    view = scene([], [])
+    rng = np.random.default_rng(43)
+    poses = [np.eye(3), np.full((4, 4), np.nan), np.full((4, 4), np.inf),
+             np.diag([-1., 1., 1., 1.])]
+    for _ in range(40):
+        rotation, _ = np.linalg.qr(rng.normal(size=(3, 3)))
+        rotation[:, 0] *= np.linalg.det(rotation)
+        for error in (0., 1e-8, 5e-8, 1e-7, 1e-6, 4.999e-6, 5e-6, 5.001e-6, 1e-5):
+            pose = np.eye(4)
+            pose[:3, :3] = rotation * (1 + error)
+            poses.append(pose)
+    for axis in range(4):
+        limit = 1e-8 if axis < 3 else 1e-8 + 1e-5
+        for sign in (-1, 1):
+            for delta in (np.nextafter(limit, 0), limit, np.nextafter(limit, np.inf)):
+                pose = np.eye(4)
+                pose[3, axis] += sign * delta
+                poses.append(pose)
+    for pose in poses:
+        expected = (pose.shape == (4, 4) and np.isfinite(pose).all()
+            and np.allclose(pose[3], (0, 0, 0, 1))
+            and np.allclose(pose[:3, :3].T @ pose[:3, :3], np.eye(3), atol=1e-7)
+            and np.isclose(np.linalg.det(pose[:3, :3]), 1))
+        if expected:
+            np.testing.assert_array_equal(view._validated_solid_pose(pose, opening_m=.07),
+                                          view.geometry.solid_pose(pose))
+        else:
+            with pytest.raises(ValueError, match="pose"):
+                view._validated_solid_pose(pose, opening_m=.07)
+
+
+@pytest.mark.parametrize("contact", [False, True])
+def test_approach_uses_one_query_and_matches_original_sweep(monkeypatch, contact):
+    from dataclasses import replace
+
+    rng = np.random.default_rng(17)
+    geometry = replace(GEOMETRY, tool_from_solid_xyz_m=(.0245, 0, .0082), solid_yaw_rad=.7)
+    view = VisibleGraspScene(points=rng.uniform(-.12, .12, (10000, 3)),
+        target_mask=rng.random(10000) > .5, geometry=geometry)
+    original_local = view._local_points
+    calls = []
+
+    def local(*args, **kwargs):
+        calls.append(kwargs["distance_m"])
+        return original_local(*args, **kwargs)
+
+    monkeypatch.setattr(view, "_local_points", local)
+    for yaw in (0., .7, -1.2):
+        pose = np.eye(4)
+        pose[:2, :2] = [[np.cos(yaw), -np.sin(yaw)], [np.sin(yaw), np.cos(yaw)]]
+        pose[:3, 3] = rng.uniform(-.03, .03, 3)
+        for distance in (0., .02, .06):
+            solid_pose = geometry.solid_pose(np.asarray(pose))
+            points, labels = original_local(solid_pose, opening_m=.07, distance_m=distance)
+            occupied = view._solid_mask(points, opening_m=.07, distance_m=distance)
+            target = occupied & labels
+            if contact:
+                target &= ~view._terminal_target_contact_mask(points, opening_m=.07, contact_depth_m=.006)
+            expected = (int(np.count_nonzero(target)), int(np.count_nonzero(occupied & ~labels)))
+            calls.clear()
+            assert view.approach_collision_counts(pose, opening_m=.07, distance_m=distance,
+                allow_terminal_target_contact=contact) == expected
+            assert calls == [distance]
+
+
+@pytest.mark.parametrize("opening", [0., -.01, .071, np.inf, np.nan])
+def test_approach_still_rejects_invalid_opening(opening):
+    with pytest.raises(ValueError, match="opening"):
+        scene([], []).approach_collision_counts(np.eye(4), opening_m=opening, distance_m=.06)
+
+
+@pytest.mark.parametrize("pose", [np.eye(3), np.full((4, 4), np.nan),
+    np.diag([2., 1., 1., 1.]), np.diag([-1., 1., 1., 1.])])
+def test_approach_still_rejects_invalid_pose(pose):
+    with pytest.raises(ValueError, match="pose"):
+        scene([], []).approach_collision_counts(pose, opening_m=.07, distance_m=.06)
