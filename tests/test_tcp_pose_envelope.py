@@ -654,3 +654,47 @@ def test_anchor_preserves_per_side_capture_skew_and_outputs_are_immutable() -> N
     assert result.raw_tcp_pose_by_side["left"].flags.writeable is False
     with pytest.raises(ValueError):
         result.effective_tcp_pose_by_side["left"][0, 3] = 1.0
+
+
+@pytest.mark.parametrize("owner", ("domain", "runtime"))
+def test_small_pose_validation_matches_original_allclose_at_boundaries(owner):
+    from robot_motion.target_safety import tcp_pose_envelope as domain
+    from teleop_runtime.target_safety import tcp_pose_envelope_runtime as runtime
+    validate = domain._pose if owner == "domain" else runtime._pose
+    error_type = domain.TCPPoseEnvelopeError if owner == "domain" else ValueError
+    matrices = []
+    for delta in (0., np.nextafter(1e-9, 0.), 1e-9, np.nextafter(1e-9, 1.), 1e-8):
+        homogeneous = np.eye(4)
+        homogeneous[3, 0] = delta
+        matrices.append(homogeneous)
+        orthogonal = np.eye(4)
+        orthogonal[0, 0] = np.sqrt(1. + delta)
+        matrices.append(orthogonal)
+    for value in (np.nan, np.inf, 1e100, -1.):
+        pose = np.eye(4)
+        pose[0, 0] = value
+        matrices.append(pose)
+    random = np.random.default_rng(7)
+    for _ in range(32):
+        pose = np.eye(4)
+        pose[:3, :3] = Rotation.from_rotvec(random.normal(size=3)).as_matrix()
+        pose[:3, 3] = random.normal(size=3)
+        matrices.append(pose)
+    for pose in matrices:
+        expected_error = None
+        if not np.isfinite(pose).all():
+            expected_error = "finite"
+        elif not np.allclose(pose[3], (0., 0., 0., 1.), atol=1e-9, rtol=0.):
+            expected_error = "homogeneous"
+        elif not np.allclose(pose[:3, :3].T @ pose[:3, :3], np.eye(3), atol=1e-9, rtol=0.):
+            expected_error = "orthonormal"
+        elif not math.isclose(float(np.linalg.det(pose[:3, :3])), 1., abs_tol=1e-9,
+                              rel_tol=0. if owner == "domain" else 1e-9):
+            expected_error = "determinant"
+        if expected_error:
+            with pytest.raises(error_type, match=expected_error):
+                validate(pose, name="test-pose")
+        else:
+            result = validate(pose, name="test-pose")
+            np.testing.assert_array_equal(result, pose)
+            assert not np.shares_memory(result, pose)

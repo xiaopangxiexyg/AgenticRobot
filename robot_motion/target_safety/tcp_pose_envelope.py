@@ -122,20 +122,12 @@ def _pose(value: object, *, name: str) -> np.ndarray:
         raise TCPPoseEnvelopeError(f"{name} must be a numeric 4x4 pose") from exc
     if pose.shape != (4, 4) or not np.all(np.isfinite(pose)):
         raise TCPPoseEnvelopeError(f"{name} must be a finite 4x4 pose")
-    if not np.allclose(
-        pose[3],
-        (0.0, 0.0, 0.0, 1.0),
-        rtol=0.0,
-        atol=_POSE_ATOL,
-    ):
+    # Both references are finite and rtol is zero. Keep the exact allclose
+    # inequality without its general NaN/broadcast/dtype machinery per pose.
+    if not np.all(np.abs(pose[3] - (0.0, 0.0, 0.0, 1.0)) <= _POSE_ATOL):
         raise TCPPoseEnvelopeError(f"{name} must be homogeneous")
     rotation = pose[:3, :3]
-    if not np.allclose(
-        rotation.T @ rotation,
-        np.eye(3),
-        rtol=0.0,
-        atol=_POSE_ATOL,
-    ):
+    if not np.all(np.abs(rotation.T @ rotation - np.eye(3)) <= _POSE_ATOL):
         raise TCPPoseEnvelopeError(f"{name} rotation must be orthonormal")
     if not math.isclose(
         float(np.linalg.det(rotation)),
@@ -1296,12 +1288,7 @@ def _project_to_halfspace_intersection(
         residual_normal[axis] = 0.0
         if (
             not math.isclose(abs(sign), 1.0, rel_tol=0.0, abs_tol=1e-12)
-            or not np.allclose(
-                residual_normal,
-                np.zeros(3, dtype=float),
-                rtol=0.0,
-                atol=1e-12,
-            )
+            or not np.all(np.abs(residual_normal) <= 1e-12)
         ):
             axis_by_constraint = []
             break

@@ -400,6 +400,26 @@ class _RankedGraspCandidate:
     support_clearance_world_z_m: float = 0.0
 
 
+def _pose_is_duplicate(pose: np.ndarray, accepted: list[np.ndarray] | np.ndarray) -> bool:
+    """Compare already validated poses with the existing allclose(rtol=0) rule."""
+    if len(accepted) == 0:
+        return False
+    return bool(np.any(np.all(np.abs(np.asarray(accepted) - pose) <= 1e-6, axis=(1, 2))))
+
+
+def _deduplicate_ranked_poses(candidates: list[_RankedGraspCandidate]) -> list[_RankedGraspCandidate]:
+    # Keep the same greedy, order-dependent policy. A tolerance is not a
+    # transitive equivalence relation, so rounding/hash bins would change it.
+    retained: list[_RankedGraspCandidate] = []
+    poses = np.empty((len(candidates), 4, 4), dtype=np.float64)
+    for candidate in candidates:
+        pose = candidate.camera_from_grasp_geometry
+        if not _pose_is_duplicate(pose, poses[:len(retained)]):
+            poses[len(retained)] = pose
+            retained.append(candidate)
+    return retained
+
+
 class Sam2GraspGenXPointGraspPlanner:
     """Proposal-only GraspGenX planner using a retained aligned RGB-D frame."""
 
@@ -1350,20 +1370,7 @@ class Sam2GraspGenXPointGraspPlanner:
                 ranked.append(prepared)
 
         ranked.sort(key=lambda item: (-item.score, item.click_distance_m))
-        model_candidates: list[_RankedGraspCandidate] = []
-        for item in ranked:
-            pose = item.camera_from_grasp_geometry
-            if any(
-                np.allclose(
-                    pose,
-                    previous.camera_from_grasp_geometry,
-                    rtol=0,
-                    atol=1e-6,
-                )
-                for previous in model_candidates
-            ):
-                continue
-            model_candidates.append(item)
+        model_candidates = _deduplicate_ranked_poses(ranked)
 
         target_points_base = (
             target_points_camera @ base_from_camera[:3, :3].T
@@ -1700,15 +1707,8 @@ class Sam2GraspGenXPointGraspPlanner:
         admitted_model_candidates: list[_RankedGraspCandidate] = []
         for item in prepared_candidates:
             admitted = admit_visible_scene(item)
-            if admitted is not None and not any(
-                np.allclose(
-                    admitted.camera_from_grasp_geometry,
-                    previous,
-                    rtol=0,
-                    atol=1e-6,
-                )
-                for previous in admitted_pose_variants
-            ):
+            if admitted is not None and not _pose_is_duplicate(
+                admitted.camera_from_grasp_geometry, admitted_pose_variants):
                 ranked.append(admitted)
                 admitted_pose_variants.append(
                     admitted.camera_from_grasp_geometry
@@ -1732,15 +1732,7 @@ class Sam2GraspGenXPointGraspPlanner:
         if len(ranked) < internal_candidate_target:
             for source in admitted_model_candidates:
                 for variant in prepare_orientation_variants(source):
-                    if any(
-                        np.allclose(
-                            variant.camera_from_grasp_geometry,
-                            previous,
-                            rtol=0,
-                            atol=1e-6,
-                        )
-                        for previous in admitted_pose_variants
-                    ):
+                    if _pose_is_duplicate(variant.camera_from_grasp_geometry, admitted_pose_variants):
                         continue
                     admitted = admit_visible_scene(variant)
                     if admitted is None:
@@ -1835,15 +1827,8 @@ class Sam2GraspGenXPointGraspPlanner:
                     if variant is None:
                         continue
                     admitted = admit_visible_scene(variant)
-                    if admitted is None or any(
-                        np.allclose(
-                            admitted.camera_from_grasp_geometry,
-                            previous,
-                            rtol=0,
-                            atol=1e-6,
-                        )
-                        for previous in support_candidate_poses
-                    ):
+                    if admitted is None or _pose_is_duplicate(
+                        admitted.camera_from_grasp_geometry, support_candidate_poses):
                         continue
                     support_candidates.append(admitted)
                     support_candidate_poses.append(
@@ -1895,20 +1880,7 @@ class Sam2GraspGenXPointGraspPlanner:
         ranked.extend(support_candidates)
 
         ranked.sort(key=lambda item: (-item.score, item.click_distance_m))
-        deduplicated: list[_RankedGraspCandidate] = []
-        for item in ranked:
-            pose = item.camera_from_grasp_geometry
-            if any(
-                np.allclose(
-                    pose,
-                    previous.camera_from_grasp_geometry,
-                    rtol=0,
-                    atol=1e-6,
-                )
-                for previous in deduplicated
-            ):
-                continue
-            deduplicated.append(item)
+        deduplicated = _deduplicate_ranked_poses(ranked)
 
         # A family is a display-priority group, not an IK-equivalence class.
         # Nearby scored depths can differ in support clearance and arm feasibility.

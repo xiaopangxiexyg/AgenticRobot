@@ -789,3 +789,65 @@ def test_real_agent_grasp_profile_uses_station_absolute_workspace_without_anchor
     assert config.absolute_max_xyz_m == pytest.approx((0.39, 0.1, 0.85))
     assert config.relative_min_xyz_m is None
     assert config.max_rotation_rad is None
+
+
+def test_fixed_binding_hash_reuse_preserves_subsets_and_numeric_identity(monkeypatch) -> None:
+    from teleop_runtime.target_safety import tcp_pose_envelope_runtime as runtime
+
+    transforms = {"left": _pose((1., 0., 0.)), "right": _pose((0., 1., 0.))}
+    solver_transform = _pose((0., 0., 2.))
+    references = {"left": "station", "right": "station"}
+    binding = TCPPoseEnvelopeTargetFrameBinding(
+        reference_frame_by_side=references,
+        target_world_from_base_by_side=transforms,
+        target_world_from_solver_world=solver_transform,
+    )
+    sides_to_check = (("left",), ("right",), ("left", "right"), ("right", "left"))
+    expected = [runtime.target_frame_binding_hash_from_transforms(
+        target_world_from_base_by_side=transforms, sides=sides,
+        reference_frame_by_side=references, target_world_from_solver_world=solver_transform,
+    ) for sides in sides_to_check]
+    calls = []
+    original = runtime.target_frame_binding_hash_from_transforms
+
+    def counted(**kwargs):
+        calls.append(kwargs["sides"])
+        return original(**kwargs)
+
+    monkeypatch.setattr(runtime, "target_frame_binding_hash_from_transforms", counted)
+    for _ in range(2):
+        assert [binding.semantic_hash(sides=sides) for sides in sides_to_check] == expected
+    assert calls == []
+    transforms["left"][0, 3] = 99.
+    solver_transform[2, 3] = 99.
+    references["left"] = "other-frame"
+    assert binding.semantic_hash(sides=("left",)) == expected[0]
+    for matrix in (*binding.target_world_from_base_by_side.values(),
+                   binding.target_world_from_solver_world):
+        with pytest.raises(ValueError):
+            matrix.setflags(write=True)
+    with pytest.raises(ValueError, match="non-empty and unique"):
+        binding.semantic_hash(sides=("left", "left"))
+    with pytest.raises(ValueError, match="reference_frame_by_side"):
+        binding.semantic_hash(sides=("missing",))
+
+
+def test_fixed_binding_replacement_still_fails_closed() -> None:
+    calibration, retargeter, profile = _fixture()
+    binding = TCPPoseEnvelopeTargetFrameBinding(
+        reference_frame_by_side=profile.reference_frame_by_side,
+        target_world_from_base_by_side=calibration.transforms,
+    )
+    observer = TCPPoseEnvelopeTargetFilter(
+        retargeter=retargeter, profile=profile, target_frame_binding=binding,
+        execution_epoch=7, anchor_receipt=_anchor(calibration, profile), apply_to_target=True,
+    )
+    changed = dict(calibration.transforms)
+    changed["left"] = _pose((1.01, 0., 0.))
+    observer.target_frame_binding = TCPPoseEnvelopeTargetFrameBinding(
+        reference_frame_by_side=profile.reference_frame_by_side,
+        target_world_from_base_by_side=changed,
+    )
+    with pytest.raises(TCPPoseEnvelopeRuntimeError, match="binding hash mismatch"):
+        observer({"left": _pose(), "right": _pose()})
+    assert observer.snapshot().last_error is not None

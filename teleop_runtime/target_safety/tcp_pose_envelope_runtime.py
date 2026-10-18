@@ -17,7 +17,7 @@ import copy
 import json
 import math
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Mapping, Sequence
@@ -67,10 +67,11 @@ def _pose(value: object, *, name: str) -> np.ndarray:
         raise ValueError(f"{name} must be a finite rigid 4x4 pose") from exc
     if not np.all(np.isfinite(matrix)):
         raise ValueError(f"{name} must be a finite rigid 4x4 pose")
-    if not np.allclose(matrix[3], (0.0, 0.0, 0.0, 1.0), atol=1e-9, rtol=0.0):
+    # Same finite-reference, zero-rtol predicate as the lower envelope owner.
+    if not np.all(np.abs(matrix[3] - (0.0, 0.0, 0.0, 1.0)) <= 1e-9):
         raise ValueError(f"{name} must be homogeneous")
     rotation = matrix[:3, :3]
-    if not np.allclose(rotation.T @ rotation, np.eye(3), atol=1e-9, rtol=0.0):
+    if not np.all(np.abs(rotation.T @ rotation - np.eye(3)) <= 1e-9):
         raise ValueError(f"{name} rotation must be orthonormal")
     if not math.isclose(float(np.linalg.det(rotation)), 1.0, abs_tol=1e-9):
         raise ValueError(f"{name} rotation determinant must be +1")
@@ -261,6 +262,9 @@ class TCPPoseEnvelopeTargetFrameBinding:
     reference_frame_by_side: Mapping[str, str]
     target_world_from_base_by_side: Mapping[str, np.ndarray]
     target_world_from_solver_world: np.ndarray | None = None
+    _semantic_hash_by_sides: Mapping[frozenset[str], str] = field(
+        init=False, repr=False, compare=False,
+    )
 
     def __post_init__(self) -> None:
         references: dict[str, str] = {}
@@ -300,10 +304,15 @@ class TCPPoseEnvelopeTargetFrameBinding:
             )
         frozen_transforms: dict[str, np.ndarray] = {}
         for side, transform in transforms.items():
-            transform.setflags(write=False)
-            frozen_transforms[side] = transform
+            # Hash reuse is safe only for genuinely immutable geometry, not an
+            # owning ndarray whose writeable flag can be enabled again.
+            frozen_transforms[side] = np.frombuffer(
+                transform.tobytes(), dtype=transform.dtype,
+            ).reshape(4, 4)
         if solver_world_transform is not None:
-            solver_world_transform.setflags(write=False)
+            solver_world_transform = np.frombuffer(
+                solver_world_transform.tobytes(), dtype=solver_world_transform.dtype,
+            ).reshape(4, 4)
         object.__setattr__(
             self,
             "reference_frame_by_side",
@@ -319,11 +328,27 @@ class TCPPoseEnvelopeTargetFrameBinding:
             "target_world_from_solver_world",
             solver_world_transform,
         )
+        side_sets = {(side,) for side in references}
+        side_sets.add(tuple(sorted(references)))
+        object.__setattr__(self, "_semantic_hash_by_sides", MappingProxyType({
+            frozenset(sides): target_frame_binding_hash_from_transforms(
+                target_world_from_base_by_side=self.target_world_from_base_by_side,
+                sides=sides,
+                reference_frame_by_side=self.reference_frame_by_side,
+                target_world_from_solver_world=self.target_world_from_solver_world,
+            )
+            for sides in side_sets
+        }))
 
     def semantic_hash(self, *, sides: Sequence[str]) -> str:
+        normalized = _normalized_sides(sides)
+        cached = self._semantic_hash_by_sides.get(frozenset(normalized))
+        if cached is not None:
+            return cached
+        # Keep the original errors for missing or unknown side bindings.
         return target_frame_binding_hash_from_transforms(
             target_world_from_base_by_side=self.target_world_from_base_by_side,
-            sides=sides,
+            sides=normalized,
             reference_frame_by_side=self.reference_frame_by_side,
             target_world_from_solver_world=self.target_world_from_solver_world,
         )

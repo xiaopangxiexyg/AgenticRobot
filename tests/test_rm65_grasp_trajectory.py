@@ -5302,3 +5302,56 @@ def test_localized_c2_stop_keeps_other_knots_and_fails_closed(failure):
     assert result["visible_scene_revalidation"]["sample_count"] == 14
     assert len(result["collision_revalidation"]["groups"]) == 2
     assert result["collision_revalidation"]["sample_count"] == sum(map(len, groups))
+
+
+@pytest.mark.parametrize("side", ("left", "right"))
+@pytest.mark.parametrize("count", (1, 2, 24, 64))
+@pytest.mark.parametrize("case,perturbation", (
+    ("measured", .4), ("limits", .4), ("default", 1e-30), ("default", 5e-10),
+))
+def test_endpoint_seed_dedup_preserves_order_tolerance_and_detached_qpos(
+    side, count, case, perturbation,
+):
+    planner = _planner_without_assets(config=RM65GraspTrajectoryPlanningConfig(
+        endpoint_seed_perturbation_rad=perturbation,
+    ))
+    lower = np.asarray(grasp_trajectory_module.RM65_ABSOLUTE_Q_MIN_RAD)
+    upper = np.asarray(grasp_trajectory_module.RM65_ABSOLUTE_Q_MAX_RAD)
+    defaults = {
+        "left": np.asarray(grasp_trajectory_module.DEFAULT_LEFT_ARM_QPOS),
+        "right": np.asarray(grasp_trajectory_module.DEFAULT_RIGHT_ARM_QPOS),
+    }
+    pair = {name: values.copy() for name, values in FIELD_TRACE_QPOS.items()}
+    if case == "limits":
+        pair[side] = np.where(np.arange(6) % 2, lower, upper)
+    elif case == "default":
+        pair[side] = defaults[side].copy()
+    original = {name: values.copy() for name, values in pair.items()}
+    # The established componentwise allclose rule is the independent oracle.
+    patterns = np.array(((0, 0, 0, 0, 0, 0), (0, 1, -1, 0, 0, 0),
+        (0, -1, 1, 0, 0, 0), (1, 0, 0, 0, -1, 0), (-1, 0, 0, 0, 1, 0),
+        (0, 0, 1, -1, 0, 1), (0, 0, -1, 1, 0, -1)))
+    proposals = [np.clip(pair[side]+pattern*perturbation, lower, upper) for pattern in patterns]
+    proposals.insert(1, np.clip(defaults[side], lower, upper))
+    proposals.extend(lower + (upper-lower)*np.array([
+        planner._radical_inverse(index, prime) for prime in (2, 3, 5, 7, 11, 13)
+    ]) for index in range(1, count*2+1))
+    expected = []
+    for values in proposals:
+        if not any(np.allclose(values, prior, atol=1e-9, rtol=0.) for prior in expected):
+            expected.append(values)
+            if len(expected) == count:
+                break
+    actual = planner._endpoint_seed_qpos(pair, side=side, seed_count=count)
+    assert len(actual) == len(expected) == count
+    inactive = "right" if side == "left" else "left"
+    for seed, values in zip(actual, expected, strict=True):
+        np.testing.assert_array_equal(seed[side], values)
+        np.testing.assert_array_equal(seed[inactive], original[inactive])
+        for name in pair:
+            assert not np.shares_memory(seed[name], pair[name])
+    for name in pair:
+        np.testing.assert_array_equal(pair[name], original[name])
+    if len(actual) > 1:
+        for name in pair:
+            assert not np.shares_memory(actual[0][name], actual[1][name])

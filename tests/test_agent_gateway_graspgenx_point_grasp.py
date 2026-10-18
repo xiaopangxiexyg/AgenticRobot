@@ -38,6 +38,9 @@ from deployments.perception.sam2_graspgenx_point_grasp import (
     GraspGenXCandidateSelection,
     GraspGenXPointGraspModelSpec,
     Sam2GraspGenXPointGraspPlanner,
+    _RankedGraspCandidate,
+    _deduplicate_ranked_poses,
+    _pose_is_duplicate,
 )
 from deployments.perception.sam2_vgn_point_grasp import Sam2VgnPointGraspPlanner
 from deployments.perception.dmtac_grasp_overlay import (
@@ -1281,3 +1284,48 @@ def test_planner_fails_closed_when_model_pose_misses_clicked_object(
             base_from_camera=np.eye(4),
             max_candidates=1,
         )
+
+
+def test_batched_pose_dedup_preserves_greedy_order_and_original_objects():
+    rng = np.random.default_rng(19)
+    poses = []
+    for _ in range(100):
+        pose = np.eye(4)
+        pose[:3, 3] = rng.uniform(-.2, .2, 3)
+        poses.extend((pose, pose.copy()))
+        shifted = pose.copy()
+        shifted[:3, 3] += rng.uniform(-1.5e-6, 1.5e-6, 3)
+        poses.append(shifted)
+    # Near-duplicate matching is intentionally not transitive.
+    for x in (0., .75e-6, 1.5e-6):
+        pose = np.eye(4)
+        pose[0, 3] = x
+        poses.append(pose)
+    candidates = [_RankedGraspCandidate(score=1.-index*.001, model_score=.9,
+        click_distance_m=.01, gripper_width_m=.05,
+        camera_from_grasp_geometry=pose, base_from_grasp_geometry=pose)
+        for index, pose in enumerate(poses)]
+    expected = []
+    for candidate in candidates:
+        if not any(np.allclose(candidate.camera_from_grasp_geometry,
+            previous.camera_from_grasp_geometry, atol=1e-6, rtol=0.) for previous in expected):
+            expected.append(candidate)
+    actual = _deduplicate_ranked_poses(candidates)
+    assert [id(item) for item in actual] == [id(item) for item in expected]
+    assert actual[-2] is candidates[-3] and actual[-1] is candidates[-1]
+    assert _deduplicate_ranked_poses([]) == []
+
+
+@pytest.mark.parametrize("offset", [0., np.nextafter(1e-6, 0.), 1e-6, np.nextafter(1e-6, np.inf)])
+@pytest.mark.parametrize("component", ["translation", "rotation"])
+def test_pose_duplicate_comparison_matches_componentwise_threshold(offset, component):
+    first, second = np.eye(4), np.eye(4)
+    if component == "translation":
+        second[:3, 3] = offset
+    else:
+        second[:2, :2] = ((math.cos(offset), -math.sin(offset)),
+            (math.sin(offset), math.cos(offset)))
+    expected = bool(np.allclose(first, second, rtol=0., atol=1e-6))
+    assert _pose_is_duplicate(first, [second]) is expected
+    assert _pose_is_duplicate(first, np.asarray([second])) is expected
+    assert _pose_is_duplicate(first, []) is False
