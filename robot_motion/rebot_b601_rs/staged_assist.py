@@ -1188,7 +1188,8 @@ class B601StagedSingleJointAssistRuntime:
                 )
         requested = max(-cap, min(cap, requested))
         if self.config.motion_control.responsive_tracking_brake:
-            return self._responsive_tracking_output(requested, control_v, dt)
+            return self._responsive_tracking_output(
+                requested, control_v, dt, protect_maintenance=protect_maintenance)
         rate = self.config.tracking_slew_nm_s
         if self._phase is B601StagedAssistPhase.BRAKE:
             # Never let slew retention keep driving into a requested brake.
@@ -1399,16 +1400,20 @@ class B601StagedSingleJointAssistRuntime:
         }
         return requested
 
-    def _responsive_tracking_output(self, requested: float, control_v: float, dt: float) -> float:
-        """Slow guidance rise, fast withdrawal, native zero before reversal."""
+    def _responsive_tracking_output(
+        self, requested: float, control_v: float, dt: float, *, protect_maintenance: bool = True,
+    ) -> float:
+        """Bound composite guidance; fast protective stops and native zero before reversal."""
         if self._command_delta is None:
             raise ValueError("responsive tracking requires a conditioned dispatch receipt")
         previous_sent = self._command_delta[self.joint_index]
         previous = self._previous_overlay_nm
         continuous_arrival = (self._motion_frame.arrival_stabilization_active
             and self.config.motion_control.continuous_speed_limit_rad_s is not None)
-        if continuous_arrival and previous * previous_sent >= 0.0:
-            # A downstream cut is authoritative during arrival. Do not restore
+        continuous_tracking = (self._phase is B601StagedAssistPhase.TRACK
+            and protect_maintenance and self.config.motion_control.continuous_speed_limit_rad_s is not None)
+        if (continuous_arrival or continuous_tracking) and previous * previous_sent >= 0.0:
+            # A downstream cut is authoritative during guidance. Do not restore
             # the difference at the fast braking slew on the following tick.
             previous = math.copysign(min(abs(previous), abs(previous_sent)), previous)
             self._previous_overlay_nm = previous
@@ -1435,6 +1440,16 @@ class B601StagedSingleJointAssistRuntime:
         elif self._motion_frame.arrival_unloading:
             rate = self.config.motion_control.arrival_unload_slew_nm_s
             reason = "gradual_arrival_unloading"
+        elif continuous_tracking:
+            # TRACK also composes a spring, learned command bias and velocity
+            # feedback. Direction alone cannot make that sum a damping-only
+            # command. Preserve explicit normal fall tuning, with the existing
+            # controlled unload rate when no normal fall was configured.
+            if abs(requested) < abs(previous):
+                rate = (self.config.tracking_release_slew_nm_s
+                        or self.config.motion_control.arrival_unload_slew_nm_s)
+                reason = ("normal_tracking_drive_reduction" if self.config.tracking_release_slew_nm_s
+                          else "bounded_tracking_drive_reduction")
         elif self._phase is B601StagedAssistPhase.BRAKE:
             if continuous_arrival:
                 # Arrival includes a target spring and maintenance, not just
@@ -1466,24 +1481,31 @@ class B601StagedSingleJointAssistRuntime:
         if (self.config.motion_control.continuous_speed_limit_rad_s is not None
             and not continuous_arrival
             and direction*previous_sent > 0 and direction*previous > 0
-            and direction*requested < direction*previous
             and direction*control_v >= 0.0
             and motion.tracking_recent_velocity_rad_s is not None
             and motion.tracking_recent_position_span_rad > self.config.motion_control.position_resolution_rad
             and direction*motion.tracking_recent_velocity_rad_s >= self.config.motion_control.resolved_soft_velocity_rad_s):
-            # Remove the propulsion tail within the existing owner-rate and
-            # watchdog envelope. This lane cannot increase magnitude or cross
-            # zero; ordinary correction/arrival unloading retains its old slew.
+            # At the early speed frontier never add propulsion or restore a
+            # tail already cut by conditioning. Normal composed guidance uses
+            # its finite fall; the onset pulse and safety brakes remain fast.
+            # This lane cannot increase magnitude or cross zero.
             # A downstream conditioner may already have reduced the actual
             # command below our preceding request. Never restore that tail
             # while claiming to withdraw it; anchor to the complete receipt.
             available = min(direction*previous, direction*previous_sent)
             self._previous_overlay_nm = direction*available
             requested = direction * min(available, max(0.0, direction*requested))
-            rate = max(rate, min(self._command_rate,
-                self.config.max_total_overlay_nm / self.config.motion_control.max_control_gap_sec))
-            if reason != "native_zero_pending_before_torque_reversal":
-                reason = "fast_resolved_drive_removal"
+            if not continuous_tracking:
+                # The initial pulse transfer explicitly sets maintenance
+                # protection false: retain its fast burst-tail withdrawal.
+                # Actual speed/terminal brakes keep the same fast lane too.
+                rate = max(rate, min(self._command_rate,
+                    self.config.max_total_overlay_nm / self.config.motion_control.max_control_gap_sec))
+                if reason != "native_zero_pending_before_torque_reversal":
+                    reason = "fast_resolved_drive_removal"
+            elif reason != "native_zero_pending_before_torque_reversal":
+                reason = ("normal_tracking_drive_reduction" if self.config.tracking_release_slew_nm_s
+                          else "bounded_tracking_drive_reduction")
         self._motion_frame = replace(
             self._motion_frame, torque_transition_reason=reason,
             torque_transition_target_nm=requested, torque_transition_rate_nm_s=rate,

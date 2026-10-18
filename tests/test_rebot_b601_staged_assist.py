@@ -249,7 +249,7 @@ def test_fast_drive_removal_never_restores_a_tail_already_cut_by_final_condition
         tracking_recent_position_span_rad=.002)
     output = runtime._responsive_tracking_output(direction*.4, direction*.025, .01)
     assert 0 <= direction*output <= .1
-    assert runtime._motion_frame.torque_transition_reason == "fast_resolved_drive_removal"
+    assert runtime._motion_frame.torque_transition_reason == "bounded_tracking_drive_reduction"
 
 
 @pytest.mark.parametrize("direction", [-1, 1])
@@ -1270,8 +1270,8 @@ def test_continuous_arrival_cannot_accept_a_pose_that_drifts_after_final_zero(di
 
 
 @pytest.mark.parametrize("direction", [-1, 1])
-@pytest.mark.parametrize("raw,fast", [(-.038, False), (0., False), (.019, True)])
-def test_continuous_track_fast_brake_lane_requires_latest_direction_not_only_delayed_window(direction, raw, fast):
+@pytest.mark.parametrize("raw", [-.038, 0., .019])
+def test_continuous_track_composite_rise_does_not_become_fast_damping(direction, raw):
     runtime, _, _, frame = _arrival_runtime(direction, continuous_limit=.05)
     runtime._phase = B601StagedAssistPhase.TRACK
     runtime._motion_frame = replace(frame.motion, phase="track", arrival_stabilization_active=False)
@@ -1284,10 +1284,57 @@ def test_continuous_track_fast_brake_lane_requires_latest_direction_not_only_del
         raw_qvel_rad_s=(0., 0., direction*raw, 0., 0., 0.),
         position_span_rad=(0., 0., .002, 0., 0., 0.))
     output = runtime._responsive_tracking_output(-direction*.6, direction*.012, .025)
-    rate = runtime.config.motion_control.braking_slew_nm_s if fast else runtime.config.tracking_slew_nm_s
+    rate = runtime.config.tracking_slew_nm_s
     assert output == pytest.approx(-direction*(.2+min(.4, rate*.025)))
+    assert runtime._motion_frame.torque_transition_reason == "slow_guidance_rise"
+
+
+@pytest.mark.parametrize("direction", [-1, 1])
+@pytest.mark.parametrize("restore", [False, True])
+def test_recorded_track_composite_has_no_fast_restore_or_tail_dump(direction, restore):
+    runtime, _, _, frame = _arrival_runtime(direction, continuous_limit=.0585)
+    runtime.config = replace(runtime.config, motion_control=replace(
+        runtime.config.motion_control, braking_slew_nm_s=10.))
+    runtime._phase = B601StagedAssistPhase.TRACK
+    runtime._motion_frame = replace(frame.motion, phase="track", arrival_stabilization_active=False,
+        reason="bounded_reference_tracking", tracking_recent_velocity_rad_s=direction*.04,
+        tracking_recent_position_span_rad=.0023)
+    previous, requested = (.24968, .49369) if restore else (.41742, .02415)
+    speed = -direction*.0076 if restore else direction*.0383
+    runtime._previous_overlay_nm = direction*previous
+    runtime._command_delta = (0., 0., direction*previous, 0., 0., 0.)
+    runtime._last_output_zero = runtime._final_zero_confirmed = False
+    runtime._stop_evidence = replace(runtime._stop_evidence,
+        raw_qvel_rad_s=(0., 0., -direction*.0256 if restore else direction*.0384, 0., 0., 0.),
+        position_span_rad=(0., 0., .0023, 0., 0., 0.))
+    # pufipubb: normal TRACK jumped -.24968 -> -.49369, then repeatedly
+    # dumped its loaded command BEFORE the actual soft speed brake.
+    output = runtime._responsive_tracking_output(direction*requested, speed, .025)
+    expected = previous+.15*.025 if restore else previous-.5*.025
+    assert output == pytest.approx(direction*expected)
     assert runtime._motion_frame.torque_transition_reason == (
-        "fast_resolved_motion_braking" if fast else "slow_guidance_rise")
+        "slow_guidance_rise" if restore else "bounded_tracking_drive_reduction")
+
+
+@pytest.mark.parametrize("direction", [-1, 1])
+def test_continuous_normal_slew_does_not_delay_actual_soft_speed_braking(direction):
+    runtime, now, _ = _recovery_track(direction, target=.1, feedback_gain=10.,
+        handoff="track", governor=True, pacing=True, continuous_limit=.0585)
+    runtime.config = replace(runtime.config, motion_control=replace(
+        runtime.config.motion_control, braking_slew_nm_s=10.))
+    runtime._motion.config = runtime.config.motion_control
+    runtime._previous_overlay_nm = direction*.2
+    runtime._command_delta = (0., 0., direction*.2, 0., 0., 0.)
+    runtime._last_output_zero = runtime._final_zero_confirmed = False
+    frame = _held_tick(runtime, now+.025, .001536, direction=direction,
+        target=.1, speed=.06, raw=.09, span=.003, raw_limit=.195, dt_sec=.025)
+    assert frame.phase is B601StagedAssistPhase.BRAKE
+    assert frame.reason == "soft_velocity_braking"
+    assert frame.overlay_torque_nm == ZERO  # Fast native zero before reversal.
+    frame = _held_tick(runtime, now+.05, .001536, direction=direction,
+        target=.1, speed=.06, raw=.09, span=.003, raw_limit=.195, dt_sec=.025)
+    assert frame.overlay_torque_nm[2] == pytest.approx(-direction*.12)
+    assert frame.motion.torque_transition_reason == "fast_tracking_withdrawal_or_brake"
 
 
 @pytest.mark.parametrize("direction", [-1, 1])
