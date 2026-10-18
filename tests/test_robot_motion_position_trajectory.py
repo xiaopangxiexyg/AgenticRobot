@@ -86,6 +86,49 @@ def test_acceleration_limited_planner_respects_velocity_and_acceleration() -> No
         previous_velocity = proposal.qd_command_rad_s
 
 
+def test_reference_pause_decelerates_and_resumes_without_reanchoring_endpoint():
+    planner = _planner(max_velocity=.1, max_acceleration=.2)
+    _accept(planner, (.5, -.5), sequence=1, now=0.)
+    for i in range(1, 21):
+        proposal = planner.propose(monotonic_time=i*.01)
+        planner.commit(proposal, accepted_monotonic_time=i*.01)
+    before = planner.snapshot()
+    planner.pause_reference(monotonic_time=.2, reason="observed_lead_reserve")
+    assert planner.snapshot()["q_command"] == before["q_command"]
+    assert planner.snapshot()["qd_command_rad_s"] == before["qd_command_rad_s"]
+    previous = np.asarray(before["qd_command_rad_s"])
+    previous_q = np.asarray(before["q_command"])
+    for i in range(21, 81):
+        proposal = planner.propose(monotonic_time=i*.01)
+        np.testing.assert_allclose(proposal.q_target, (.5, -.5))
+        assert np.max(np.abs(proposal.qd_command_rad_s-previous)) <= .002 + 1e-12
+        np.testing.assert_allclose(proposal.q_command, previous_q + .01*proposal.qd_command_rad_s)
+        planner.commit(proposal, accepted_monotonic_time=i*.01)
+        previous, previous_q = proposal.qd_command_rad_s, proposal.q_command
+    np.testing.assert_array_equal(previous, (0., 0.))
+    stopped_q = previous_q.copy()
+    _accept(planner, (.5, -.5), sequence=2, now=.8)
+    proposal = planner.propose(monotonic_time=.81)
+    assert np.max(np.abs(proposal.qd_command_rad_s)) <= .002 + 1e-12
+    np.testing.assert_allclose(proposal.q_command, stopped_q + .01*proposal.qd_command_rad_s)
+
+
+def test_reference_pause_requires_acknowledged_tracking_and_keeps_quick_stop_terminal():
+    planner = _planner()
+    _accept(planner, (1., -1.), sequence=1, now=0.)
+    pending = planner.propose(monotonic_time=.01)
+    with pytest.raises(RuntimeError, match="acknowledged"):
+        planner.pause_reference(monotonic_time=.01, reason="pause")
+    planner.commit(pending, accepted_monotonic_time=.01)
+    with pytest.raises(ValueError, match="precede"):
+        planner.pause_reference(monotonic_time=0., reason="pause")
+    with pytest.raises(ValueError, match="non-empty"):
+        planner.pause_reference(monotonic_time=.01, reason=" ")
+    planner.quick_stop(sequence=2, monotonic_time=.01, reason="operator_stop")
+    with pytest.raises(RuntimeError, match="acknowledged"):
+        planner.pause_reference(monotonic_time=.02, reason="pause")
+
+
 def test_target_preemption_inherits_velocity_instead_of_resetting_it() -> None:
     planner = _planner(max_velocity=1.0, max_acceleration=10.0)
     _accept(planner, (0.2, 0.0), sequence=1, now=0.0)

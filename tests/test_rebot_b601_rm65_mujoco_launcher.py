@@ -145,7 +145,7 @@ def test_owner_launcher_requires_explicit_motion_acknowledgement() -> None:
     assert args.mode == "hold"
     assert args.feedback_source == "active-report"
     assert args.driver_kd == owner.DEFAULT_DRIVER_KD
-    assert args.gravity_debug_mode is False
+    assert args.gravity_debug_mode is True
 
 
 def test_owner_launcher_reuses_guarded_probe_and_standard_limits(tmp_path: Path) -> None:
@@ -159,7 +159,8 @@ def test_owner_launcher_reuses_guarded_probe_and_standard_limits(tmp_path: Path)
     assert "--allow-active-report" in command
     assert "--auto-disable-active-report" in command
     assert "--apply-driver-torque-limits" in command
-    assert "--gravity-debug-mode" not in command
+    assert "--gravity-debug-mode" in command
+    assert "--debug-dynamics-trace" not in command
     assert (
         command[command.index("--confirmation") + 1]
         == low_gain_probe.CONFIRMATION
@@ -170,6 +171,71 @@ def test_owner_launcher_reuses_guarded_probe_and_standard_limits(tmp_path: Path)
     # Re-parse the exact generated argv through the real probe contract.  This
     # is deliberately offline: _validate_cli performs no CAN or motor I/O.
     parsed_probe_args = low_gain_probe.build_parser().parse_args(command[2:])
+    low_gain_probe._validate_cli(parsed_probe_args)
+    assert parsed_probe_args.kp == pytest.approx(0.0)
+    assert parsed_probe_args.kd == pytest.approx(0.0)
+    assert parsed_probe_args.driver_kd == pytest.approx((0.0,) * 6)
+    assert parsed_probe_args.gravity_scale == pytest.approx(1.0)
+    assert parsed_probe_args.gravity_joint_scales == pytest.approx(
+        (1.0, 0.96, 1.0, 1.0, 1.0, 1.0)
+    )
+    assert parsed_probe_args.gravity_joint_offsets_rad == pytest.approx((0.0,) * 6)
+    assert parsed_probe_args.gravity_joint_bias_nm == pytest.approx(
+        (0.0, -0.22, -0.11, -0.08, 0.0, 0.0)
+    )
+    assert parsed_probe_args.gravity_coulomb_friction_nm == pytest.approx(
+        (0.0,) * 6
+    )
+    assert parsed_probe_args.gravity_coulomb_velocity_threshold_rad_s == pytest.approx(
+        0.02
+    )
+
+
+def test_owner_forwards_optional_dynamics_trace_without_changing_limits(
+    tmp_path: Path,
+) -> None:
+    args = owner._parser().parse_args(
+        ["--allow-motion", "--debug-dynamics-trace"]
+    )
+    command = owner.build_probe_command(args, run_dir=tmp_path)
+    parsed = low_gain_probe.build_parser().parse_args(command[2:])
+
+    assert parsed.debug_dynamics_trace is True
+    assert parsed.velocity_abort_rad_s == args.velocity_abort_rad_s
+    assert parsed.torque_limit_scale == args.torque_limit_scale
+    assert parsed.output == tmp_path / "b601_owner.json"
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_owner_joint_angle_display_is_optional_and_does_not_enable_assist(
+    tmp_path: Path, enabled: bool,
+) -> None:
+    argv = ["--allow-motion"] + (["--show-joint-angles"] if enabled else [])
+    args = owner._parser().parse_args(argv)
+    parsed = low_gain_probe.build_parser().parse_args(
+        owner.build_probe_command(args, run_dir=tmp_path)[2:]
+    )
+
+    low_gain_probe._validate_cli(parsed)
+    assert parsed.show_joint_angles is enabled
+    assert parsed.torque_console is False
+    assert parsed.single_joint_assist is False
+    assert parsed.cartesian_assist is False
+    assert parsed.kp == parsed.kd == 0.0
+    assert parsed.driver_kd == list(owner.DEFAULT_DRIVER_KD)
+    assert parsed.velocity_abort_rad_s == args.velocity_abort_rad_s
+
+
+def test_owner_launcher_can_opt_out_of_default_gravity_debug_mode(tmp_path: Path) -> None:
+    args = owner._parser().parse_args(
+        ["--allow-motion", "--no-gravity-debug-mode"]
+    )
+    command = owner.build_probe_command(args, run_dir=tmp_path)
+
+    assert args.gravity_debug_mode is False
+    assert "--gravity-debug-mode" not in command
+    parsed_probe_args = low_gain_probe.build_parser().parse_args(command[2:])
+    assert parsed_probe_args.gravity_debug_mode is False
     low_gain_probe._validate_cli(parsed_probe_args)
 
 
@@ -236,8 +302,28 @@ def test_owner_launcher_builds_cartesian_assist_inside_existing_owner(
             "z",
             "--cartesian-assist-offset-m",
             "0.008",
+            "--cartesian-assist-max-offset-m",
+            "0.12",
             "--cartesian-assist-max-rotation-drift-rad",
             "0.06",
+            "--cartesian-assist-max-joint-torque-nm",
+            "0.5",
+            "--cartesian-assist-joint-torque-release-slew-nm-s",
+            "2.0",
+            "--cartesian-assist-breakaway-positive-nm",
+            "0",
+            "0.2",
+            "0.1",
+            "0",
+            "0",
+            "0",
+            "--cartesian-assist-breakaway-negative-nm",
+            "0",
+            "0.3",
+            "0.15",
+            "0",
+            "0",
+            "0",
             "--cartesian-assist-confirmation",
             owner.DEFAULT_CARTESIAN_ASSIST_CONFIRMATION,
         ]
@@ -248,6 +334,10 @@ def test_owner_launcher_builds_cartesian_assist_inside_existing_owner(
     assert command[command.index("--cartesian-assist-axis") + 1] == "z"
     assert command[command.index("--cartesian-assist-offset-m") + 1] == "0.008"
     assert (
+        command[command.index("--cartesian-assist-max-offset-m") + 1]
+        == "0.12"
+    )
+    assert (
         command[command.index("--cartesian-assist-max-rotation-drift-rad") + 1]
         == "0.06"
     )
@@ -255,12 +345,31 @@ def test_owner_launcher_builds_cartesian_assist_inside_existing_owner(
         command[command.index("--cartesian-assist-confirmation") + 1]
         == low_gain_probe.CARTESIAN_ASSIST_CONFIRMATION
     )
+    assert (
+        command[
+            command.index(
+                "--cartesian-assist-joint-torque-release-slew-nm-s"
+            )
+            + 1
+        ]
+        == "2.0"
+    )
     parsed_probe_args = low_gain_probe.build_parser().parse_args(command[2:])
     low_gain_probe._validate_cli(parsed_probe_args)
     session = low_gain_probe._build_cartesian_assist(parsed_probe_args)
     assert session is not None
     assert session.config.axis == "z"
     assert session.config.offset_m == pytest.approx(0.008)
+    assert session.config.max_offset_m == pytest.approx(0.12)
+    assert session.config.max_joint_torque_release_rate_nm_s == pytest.approx(
+        2.0
+    )
+    assert session.config.breakaway.positive_torque_nm == pytest.approx(
+        (0.0, 0.2, 0.1, 0.0, 0.0, 0.0)
+    )
+    assert session.config.breakaway.negative_torque_nm == pytest.approx(
+        (0.0, 0.3, 0.15, 0.0, 0.0, 0.0)
+    )
 
 
 def test_owner_launcher_rejects_cartesian_assist_without_confirmation() -> None:

@@ -143,21 +143,28 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import gc
 import hashlib
 import json
 import math
 import os
+import pickle
 import signal
 import sys
+import tempfile
 import termios
+import threading
 import time
 import tty
+import webbrowser
 import xml.etree.ElementTree as ET
+from collections import deque
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field, replace
+from functools import partial
 from itertools import pairwise
 from pathlib import Path
-from typing import TextIO
+from typing import Protocol, TextIO, overload
 
 import numpy as np
 
@@ -185,6 +192,7 @@ from robot_motion.rebot_b601_rs import (
     B601CartesianAssistConfig,
     B601CartesianAssistResponseCriteria,
     B601CartesianAssistSession,
+    B601CartesianBreakawayConfig,
     B601MitControlProfile,
     B601MitReference,
     B601MitTorqueBreakdown,
@@ -194,12 +202,65 @@ from robot_motion.rebot_b601_rs import (
     B601SharedControlRuntime,
     B601SingleJointAssistConfig,
     B601SingleJointAssistSession,
+    B601StagedAssistConfig,
     B601TranslationalVirtualSpring,
     compute_b601_mit_torque,
+    compute_cartesian_breakaway_compensation,
     evaluate_cartesian_assist_response,
     evaluate_single_joint_assist_response,
     map_world_aligned_ee_wrench_to_joint_torque,
+    select_cartesian_assist_torque_slew,
 )
+from robot_motion.rebot_b601_rs.gravity_defaults import (
+    B601_DEFAULT_DRIVER_KD,
+    B601_DEFAULT_GRAVITY_COULOMB_FRICTION_NM,
+    B601_DEFAULT_GRAVITY_COULOMB_VELOCITY_THRESHOLD_RAD_S,
+    B601_DEFAULT_GRAVITY_JOINT_BIAS_NM,
+    B601_DEFAULT_GRAVITY_JOINT_OFFSETS_RAD,
+    B601_DEFAULT_GRAVITY_JOINT_SCALES,
+    B601_DEFAULT_GRAVITY_SCALE,
+    B601_DEFAULT_KD,
+    B601_DEFAULT_KP,
+)
+from robot_motion.rebot_b601_rs.torque_experiment import (
+    B601MotionOnsetCaptureConfig,
+    B601OnsetProbeConfig,
+    B601TorqueExperiment,
+    B601TorqueExperimentLimits,
+)
+
+
+class _TorqueConsoleController(Protocol):
+    limits: B601TorqueExperimentLimits
+
+    def owner_ready(self) -> None: ...
+
+    def step(
+        self,
+        *,
+        now_sec: float,
+        qpos_rad: tuple[float, ...],
+        qvel_rad_s: tuple[float, ...],
+    ) -> tuple[tuple[float, ...], dict[str, object]]: ...
+
+    def record_dispatch(
+        self,
+        *,
+        joint_name: str,
+        receipt_sequence: int,
+        feedback_timestamp_sec: float,
+        overlay_after_profile_nm: float,
+        gravity_nm: float,
+        requested_total_nm: float,
+        conditioned_total_nm: float,
+        joint_commands: dict[str, tuple[float, ...]] | None = None,
+        completed_at_sec: float | None = None,
+        torque_rate_nm_s: tuple[float, ...] | None = None,
+    ) -> None: ...
+
+    def owner_stopped(self, *, now_sec: float, reason: str) -> None: ...
+
+    def status(self) -> dict[str, object]: ...
 
 CONFIRMATION = "B601_RS_LOW_GAIN_MIT_GRAVITY_DAMPING"
 SINGLE_JOINT_ASSIST_CONFIRMATION = "B601_RS_SINGLE_JOINT_POLICY_ASSIST"
@@ -259,14 +320,17 @@ _DEFAULT_RATE_HZ = 20.0
 _DEFAULT_DURATION_SEC = 8.0
 _DEFAULT_WARMUP_SEC = 2.0
 _DEFAULT_FREEZE_SEC = 1.0
-_DEFAULT_KP = 0.0
-_DEFAULT_KD = 0.0
-_DEFAULT_DRIVER_KD = (0.2, 0.3, 0.2, 0.15, 0.1, 0.05)
-_DEFAULT_GRAVITY_SCALE = 1.0
-_DEFAULT_GRAVITY_JOINT_SCALES = (1.0, 0.95, 1.0, 1.0, 1.0, 1.0)
-_DEFAULT_GRAVITY_JOINT_OFFSETS_RAD = _ZERO_SIX
-_DEFAULT_GRAVITY_JOINT_BIAS_NM = (0.0, -0.105, -0.1, -0.05, 0.0, 0.0)
-_DEFAULT_GRAVITY_COULOMB_FRICTION_NM = _ZERO_SIX
+_DEFAULT_KP = B601_DEFAULT_KP
+_DEFAULT_KD = B601_DEFAULT_KD
+_DEFAULT_DRIVER_KD = B601_DEFAULT_DRIVER_KD
+_DEFAULT_GRAVITY_SCALE = B601_DEFAULT_GRAVITY_SCALE
+_DEFAULT_GRAVITY_JOINT_SCALES = B601_DEFAULT_GRAVITY_JOINT_SCALES
+_DEFAULT_GRAVITY_JOINT_OFFSETS_RAD = B601_DEFAULT_GRAVITY_JOINT_OFFSETS_RAD
+_DEFAULT_GRAVITY_JOINT_BIAS_NM = B601_DEFAULT_GRAVITY_JOINT_BIAS_NM
+_DEFAULT_GRAVITY_COULOMB_FRICTION_NM = B601_DEFAULT_GRAVITY_COULOMB_FRICTION_NM
+_DEFAULT_GRAVITY_COULOMB_VELOCITY_THRESHOLD_RAD_S = (
+    B601_DEFAULT_GRAVITY_COULOMB_VELOCITY_THRESHOLD_RAD_S
+)
 _DEFAULT_TORQUE_LIMIT_SCALE = 0.25
 _DEFAULT_TORQUE_RISE_TIME_SEC = 1.0
 _DEFAULT_STEP_RAD = 0.05
@@ -3637,6 +3701,7 @@ def resolve_active_joint_names() -> tuple[str, ...]:
 def _validate_cli(args: argparse.Namespace) -> None:
     _validate_single_joint_assist_cli(args)
     _validate_cartesian_assist_cli(args)
+    _validate_torque_console_cli(args)
     gravity_debug_mode = bool(getattr(args, "gravity_debug_mode", False))
     feedback_source = getattr(args, "feedback_source", "parameter")
     if feedback_source not in ("parameter", "active-report"):
@@ -3911,7 +3976,11 @@ def _validate_cli(args: argparse.Namespace) -> None:
         name="gravity_coulomb_friction_nm",
     )
     _non_negative(
-        getattr(args, "gravity_coulomb_velocity_threshold_rad_s", 0.0),
+        getattr(
+            args,
+            "gravity_coulomb_velocity_threshold_rad_s",
+            _DEFAULT_GRAVITY_COULOMB_VELOCITY_THRESHOLD_RAD_S,
+        ),
         name="gravity_coulomb_velocity_threshold_rad_s",
     )
     _bounded(
@@ -4573,6 +4642,198 @@ def condition_torque(
     return tuple(float(value) for value in conditioned), torque_limited, slew_limited
 
 
+def torque_conditioning_sample_diagnostics(
+    requested_nm: Sequence[float],
+    previous_nm: Sequence[float],
+    conditioned_nm: Sequence[float],
+    *,
+    absolute_limits_nm: Sequence[float],
+    max_rate_nm_s: Sequence[float],
+    dt_sec: float,
+) -> dict[str, object]:
+    """Describe one final torque-conditioning decision without changing it.
+
+    ``requested_nm`` is the controller output before the final absolute and
+    slew-rate bounds.  The helper deliberately mirrors :func:`condition_torque`
+    instead of re-running control logic, so the trace can answer whether a
+    high-load posture was limited by absolute torque authority or only by the
+    configured slew rate.  It is diagnostic evidence, not a second limiter.
+    """
+
+    requested = np.asarray(_six(requested_nm, name="requested_nm"), dtype=float)
+    previous = np.asarray(_six(previous_nm, name="previous_nm"), dtype=float)
+    conditioned = np.asarray(
+        _six(conditioned_nm, name="conditioned_nm"),
+        dtype=float,
+    )
+    limits = np.asarray(
+        _six(absolute_limits_nm, name="absolute_limits_nm"),
+        dtype=float,
+    )
+    rates = np.asarray(
+        _six(max_rate_nm_s, name="max_rate_nm_s"),
+        dtype=float,
+    )
+    dt = _positive(dt_sec, name="dt_sec")
+    if np.any(limits <= 0.0) or np.any(rates <= 0.0):
+        raise ValueError("absolute_limits_nm and max_rate_nm_s must be positive")
+
+    absolute_clipped = np.clip(requested, -limits, limits)
+    max_delta = rates * dt
+    absolute_mask = np.not_equal(absolute_clipped, requested)
+    slew_mask = np.not_equal(conditioned, absolute_clipped)
+    margin = limits - np.abs(requested)
+    ratio = np.abs(requested) / limits
+    joint_names = _ALL_JOINTS
+    return {
+        "absolute_limits_nm": tuple(float(value) for value in limits),
+        "max_rate_nm_s": tuple(float(value) for value in rates),
+        "dt_sec": float(dt),
+        "previous_tau_nm": tuple(float(value) for value in previous),
+        "requested_tau_nm": tuple(float(value) for value in requested),
+        "absolute_clipped_tau_nm": tuple(
+            float(value) for value in absolute_clipped
+        ),
+        "conditioned_tau_nm": tuple(float(value) for value in conditioned),
+        "max_slew_delta_nm": tuple(float(value) for value in max_delta),
+        "absolute_torque_margin_nm": tuple(float(value) for value in margin),
+        "absolute_torque_request_ratio": tuple(float(value) for value in ratio),
+        "absolute_torque_saturated_joint_names": tuple(
+            joint_names[index]
+            for index, saturated in enumerate(absolute_mask)
+            if bool(saturated)
+        ),
+        "slew_torque_saturated_joint_names": tuple(
+            joint_names[index]
+            for index, saturated in enumerate(slew_mask)
+            if bool(saturated)
+        ),
+        "absolute_torque_saturated": bool(np.any(absolute_mask)),
+        "slew_torque_saturated": bool(np.any(slew_mask)),
+        "semantics": (
+            "requested is pre-limit; absolute_clipped applies the per-joint "
+            "absolute envelope; conditioned is the dispatched software value"
+        ),
+    }
+
+
+def summarize_torque_conditioning(
+    samples: Sequence[Mapping[str, object]],
+    *,
+    absolute_limits_nm: Sequence[float],
+) -> dict[str, object]:
+    """Summarize torque authority evidence across an active run.
+
+    This summary is intentionally descriptive.  It never changes acceptance,
+    limits, or the protective-hold policy.  A nonzero absolute saturation count
+    is evidence that tuning the gravity scale alone cannot increase the sent
+    torque; a nonzero slew count is reported separately.
+    """
+
+    limits = np.asarray(
+        _six(absolute_limits_nm, name="absolute_limits_nm"),
+        dtype=float,
+    )
+    if np.any(limits <= 0.0):
+        raise ValueError("absolute_limits_nm must be positive")
+    joint_names = _ALL_JOINTS
+    requested_rows: list[np.ndarray] = []
+    conditioned_rows: list[np.ndarray] = []
+    margin_rows: list[np.ndarray] = []
+    absolute_counts = np.zeros(6, dtype=int)
+    slew_counts = np.zeros(6, dtype=int)
+    first_absolute: list[dict[str, object] | None] = [None] * 6
+    first_slew: list[dict[str, object] | None] = [None] * 6
+
+    for sample_index, sample in enumerate(samples):
+        if not isinstance(sample, Mapping):
+            raise TypeError("torque diagnostic samples must be mappings")
+        requested = np.asarray(
+            _six(sample.get("requested_tau_nm"), name="requested_tau_nm"),
+            dtype=float,
+        )
+        conditioned = np.asarray(
+            _six(sample.get("conditioned_tau_nm"), name="conditioned_tau_nm"),
+            dtype=float,
+        )
+        if not np.all(np.isfinite(requested)) or not np.all(
+            np.isfinite(conditioned)
+        ):
+            raise ValueError("torque diagnostic sample contains non-finite torque")
+        clipped = np.clip(requested, -limits, limits)
+        absolute_mask = np.not_equal(clipped, requested)
+        slew_mask = np.not_equal(conditioned, clipped)
+        requested_rows.append(requested)
+        conditioned_rows.append(conditioned)
+        margin_rows.append(limits - np.abs(requested))
+        for index in range(6):
+            if absolute_mask[index]:
+                absolute_counts[index] += 1
+                if first_absolute[index] is None:
+                    first_absolute[index] = {
+                        "sample_index": sample_index,
+                        "elapsed_sec": sample.get("elapsed_sec"),
+                        "requested_tau_nm": float(requested[index]),
+                        "limit_nm": float(limits[index]),
+                    }
+            if slew_mask[index]:
+                slew_counts[index] += 1
+                if first_slew[index] is None:
+                    first_slew[index] = {
+                        "sample_index": sample_index,
+                        "elapsed_sec": sample.get("elapsed_sec"),
+                        "conditioned_tau_nm": float(conditioned[index]),
+                        "absolute_clipped_tau_nm": float(clipped[index]),
+                    }
+
+    if requested_rows:
+        requested_array = np.vstack(requested_rows)
+        conditioned_array = np.vstack(conditioned_rows)
+        margin_array = np.vstack(margin_rows)
+        max_requested = np.max(np.abs(requested_array), axis=0)
+        max_conditioned = np.max(np.abs(conditioned_array), axis=0)
+        min_margin = np.min(margin_array, axis=0)
+    else:
+        max_requested = np.zeros(6, dtype=float)
+        max_conditioned = np.zeros(6, dtype=float)
+        min_margin = limits.copy()
+
+    return {
+        "sample_count": len(samples),
+        "absolute_saturation_sample_count": int(
+            sum(1 for sample in samples if sample.get("torque_limited") is True)
+        ),
+        "slew_saturation_sample_count": int(
+            sum(1 for sample in samples if sample.get("slew_limited") is True)
+        ),
+        "any_absolute_saturation": bool(np.any(absolute_counts > 0)),
+        "any_slew_saturation": bool(np.any(slew_counts > 0)),
+        "absolute_limits_nm": tuple(float(value) for value in limits),
+        "max_abs_requested_tau_nm": tuple(float(value) for value in max_requested),
+        "max_abs_conditioned_tau_nm": tuple(
+            float(value) for value in max_conditioned
+        ),
+        "minimum_absolute_margin_nm": tuple(float(value) for value in min_margin),
+        "per_joint": {
+            joint_names[index]: {
+                "absolute_saturation_count": int(absolute_counts[index]),
+                "slew_saturation_count": int(slew_counts[index]),
+                "max_abs_requested_tau_nm": float(max_requested[index]),
+                "max_abs_conditioned_tau_nm": float(max_conditioned[index]),
+                "minimum_absolute_margin_nm": float(min_margin[index]),
+                "absolute_saturation_first": first_absolute[index],
+                "slew_saturation_first": first_slew[index],
+            }
+            for index in range(6)
+        },
+        "interpretation": (
+            "absolute saturation means requested torque exceeded the software "
+            "envelope; increasing gravity scale cannot increase dispatched "
+            "torque until the envelope is changed under a separate safety review"
+        ),
+    }
+
+
 def gravity_ramp_fraction(*, elapsed_sec: float, rise_time_sec: float) -> float:
     """Return one shared linear startup scale for the complete gravity vector."""
 
@@ -4622,9 +4883,10 @@ def vendor_status_cache_diagnostics(state: object) -> dict[str, object]:
 
     RobStride operation-status frames are already produced by the existing MIT
     exchange and cached by MotorBridge.  Reading these properties therefore
-    adds no CAN request.  The cache has no source timestamp or command-response
-    correlation in the pinned ABI, so the result is evidence only and must not
-    participate in a safety decision or torque command.
+    adds no CAN request. Host receive metadata, when present in the admitted
+    snapshot, is copied without inventing a device sampling timestamp. Timing
+    does not validate velocity units/sign or command-response correlation, so
+    these values remain diagnostic-only, never a safety or torque input.
     """
 
     errors: list[str] = []
@@ -4652,6 +4914,21 @@ def vendor_status_cache_diagnostics(state: object) -> dict[str, object]:
         "torques_reported_nm",
         "vendor_status_torque_nm",
     )
+    timing = None
+    if isinstance(state, B601HardwareState):
+        timing = {
+            "snapshot_observed_at_sec": state.receive_timestamp_sec,
+            "host_receive_freshness_verified": state.host_receive_freshness_verified,
+            "device_source_timestamp_available": False,
+            "joint_observations": tuple({
+                "joint_name": joint.name,
+                "status_sequence": joint.status_sequence,
+                "observed_at_sec": joint.observed_at_sec,
+                "receive_age_sec": joint.receive_age_sec,
+                "host_receive_freshness_verified": joint.host_receive_freshness_verified,
+                "position_source": joint.position_source,
+            } for joint in state.joints),
+        }
     return {
         "velocity_rad_s": velocity,
         "torque_nm": torque,
@@ -4662,13 +4939,132 @@ def vendor_status_cache_diagnostics(state: object) -> dict[str, object]:
         ),
         "velocity_source": _VENDOR_STATUS_VELOCITY_SOURCE,
         "velocity_role": "diagnostic_only_not_used_for_control",
+        "velocity_scale_sign_calibrated": False,
+        "observation_timing": timing,
+        "velocity_semantics": state.velocity_semantics if isinstance(state, B601HardwareState) else None,
         "control_qvel_source": _QVEL_SOURCE,
         "semantics": (
             "passive_motorbridge_operation_status_cache_unverified; "
+            "host_receive_metadata_if_available; device_source_time_unavailable; "
             "no_extra_can_request; not command-response correlated; "
             "diagnostic_only_not_used_for_control"
         ),
     }
+
+
+def feedback_velocity_timebase_diagnostics(
+    state: object, previous_state: object | None, *,
+    qpos_rad: Sequence[float], previous_qpos_rad: Sequence[float] | None,
+    snapshot_dt_sec: float, raw_qvel_rad_s: Sequence[float],
+) -> dict[str, object]:
+    """Compare host snapshot and per-joint receive clocks without control authority.
+
+    The paired previous state advances only with the owner's dispatched state.
+    Host ages reconstruct receive time, NOT device acquisition time. Missing,
+    unverified or non-advancing metadata yields no replacement velocity.
+    """
+    q = _six(qpos_rad, name="diagnostic_qpos_rad")
+    previous_q = None if previous_qpos_rad is None else _six(previous_qpos_rad, name="diagnostic_previous_qpos_rad")
+    raw = _six(raw_qvel_rad_s, name="diagnostic_raw_qvel_rad_s")
+    snapshot_dt = _positive(snapshot_dt_sec, name="diagnostic_snapshot_dt_sec")
+    current = state if isinstance(state, B601HardwareState) else None
+    previous = previous_state if isinstance(previous_state, B601HardwareState) else None
+    paired = current is not None and previous is not None and previous_q is not None
+    aligned = paired and math.isclose(current.receive_timestamp_sec-previous.receive_timestamp_sec, snapshot_dt, rel_tol=0., abs_tol=1e-9)
+    observations = []
+    for index, name in enumerate(_ALL_JOINTS):
+        c = None if current is None else current.joints[index]
+        p = None if previous is None else previous.joints[index]
+        delta = None if previous_q is None else q[index]-previous_q[index]
+        joint_dt = None if c is None or p is None or c.observed_at_sec is None or p.observed_at_sec is None else c.observed_at_sec-p.observed_at_sec
+        sequence_delta = None if c is None or p is None or c.status_sequence is None or p.status_sequence is None else c.status_sequence-p.status_sequence
+        reason = "available"
+        if not paired:
+            reason = "paired_metadata_unavailable"
+        elif not aligned:
+            reason = "snapshot_history_not_aligned"
+        elif not all(s.valid and not s.stale and s.host_receive_freshness_verified for s in (current, previous)) or not all(
+            j.valid and not j.stale and j.host_receive_freshness_verified
+            and j.position_source == "robstride_operation_status_cache"
+            and j.arbitration_id is not None and ((j.arbitration_id >> 24) & 0x1F) == 24
+            for j in (c, p)
+        ):
+            reason = "host_metadata_unverified"
+        elif joint_dt is None:
+            reason = "joint_receive_time_unavailable"
+        elif not all(j.receive_age_sec is not None and j.observed_at_sec <= s.receive_timestamp_sec and math.isclose(
+            j.observed_at_sec, s.receive_timestamp_sec-j.receive_age_sec, rel_tol=0., abs_tol=1e-6
+        ) for j, s in ((c, current), (p, previous))):
+            reason = "inconsistent_host_receive_metadata"
+        elif sequence_delta is None or sequence_delta <= 0:
+            reason = "joint_status_sequence_not_advanced"
+        elif joint_dt <= 0:
+            reason = "joint_receive_time_not_advanced"
+        observations.append({
+            "joint_name": name, "delta_qpos_rad": delta,
+            "raw_snapshot_qvel_rad_s": raw[index],
+            "previous_status_sequence": None if p is None else p.status_sequence,
+            "status_sequence": None if c is None else c.status_sequence,
+            "previous_observed_at_sec": None if p is None else p.observed_at_sec,
+            "observed_at_sec": None if c is None else c.observed_at_sec,
+            "previous_receive_age_sec": None if p is None else p.receive_age_sec,
+            "receive_age_sec": None if c is None else c.receive_age_sec,
+            "joint_receive_dt_sec": joint_dt, "comparison_valid": reason == "available",
+            "diagnostic_joint_qvel_rad_s": delta/joint_dt if reason == "available" else None,
+            "reason": reason,
+        })
+    return {
+        "role": "diagnostic_only_not_used_for_control",
+        "semantics": "host_age_reconstructed_receive_time; not device acquisition time or calibrated velocity; no extra CAN request",
+        "snapshot_dt_sec": snapshot_dt,
+        "previous_snapshot_sec": None if previous is None else previous.receive_timestamp_sec,
+        "snapshot_sec": None if current is None else current.receive_timestamp_sec,
+        "previous_snapshot_sequence": None if previous is None else previous.sequence,
+        "snapshot_sequence": None if current is None else current.sequence,
+        "device_source_timestamp_available": False,
+        "joint_observations": observations,
+    }
+
+
+def _torque_console_feedback_velocity(
+    console, snapshot_qvel_rad_s: Sequence[float], diagnostics: Mapping[str, object] | None,
+) -> tuple[float, ...]:
+    """Explicit active-report candidate: raw dq over each paired receive dt.
+
+    Snapshot velocity remains the default and the independent owner guard.
+    Invalid joint clocks never fall back to cached/vendor or snapshot speeds
+    inside the candidate, and no command is sent for such a frame.
+    """
+    if getattr(getattr(console, "config", None), "feedback_velocity_timebase", "snapshot") == "snapshot":
+        return _six(snapshot_qvel_rad_s, name="snapshot feedback velocity")
+    rows = None if diagnostics is None else diagnostics.get("joint_observations")
+    if not isinstance(rows, list) or len(rows) != 6:
+        raise LowGainProbeError("joint receive velocity requires complete paired metadata")
+    maximum_gap = console.settings.staged_assist.motion_control.max_control_gap_sec
+    snapshot_dt = diagnostics.get("snapshot_dt_sec")
+    if (isinstance(snapshot_dt, bool) or not isinstance(snapshot_dt, (int, float))
+        or not math.isfinite(snapshot_dt) or not 0 < snapshot_dt <= maximum_gap):
+        raise LowGainProbeError("joint receive velocity snapshot gap exceeds control watchdog or is invalid")
+    result = []
+    for name, row in zip(_ALL_JOINTS, rows, strict=True):
+        if not isinstance(row, Mapping) or row.get("joint_name") != name or row.get("comparison_valid") is not True:
+            raise LowGainProbeError(f"joint receive velocity unavailable: {name}")
+        dt = row.get("joint_receive_dt_sec")
+        delta = row.get("delta_qpos_rad")
+        ages = (row.get("previous_receive_age_sec"), row.get("receive_age_sec"))
+        if (any(isinstance(x, bool) or not isinstance(x, (int, float)) or not math.isfinite(x)
+                for x in (dt, delta, *ages))
+            or dt <= 0):
+            raise LowGainProbeError(f"joint receive velocity invalid receive interval or position: {name}")
+        if any(not 0 <= age <= maximum_gap for age in ages):
+            raise LowGainProbeError(f"joint receive velocity feedback age exceeds freshness limit: {name}")
+        # Asynchronous reports need not have the same interval as snapshots.
+        # Keep BOTH snapshot watchdog and age bounds, and require the paired
+        # clock identity instead of imposing that watchdog on a different dt.
+        if not math.isclose(dt, snapshot_dt + ages[0] - ages[1], rel_tol=0., abs_tol=1e-6):
+            raise LowGainProbeError(f"joint receive velocity inconsistent receive interval: {name}")
+        result.append(delta / dt)
+    return _six(result, name="joint receive position velocity")
 
 
 def build_startup_diagnostic_observation(
@@ -5337,12 +5733,306 @@ def _validate_single_joint_assist_cli(args: argparse.Namespace) -> None:
     )
 
 
+def _validate_torque_console_cli(args: argparse.Namespace) -> None:
+    _prepare_automatic_calibration_args(args)
+    if args.torque_console_onset_probe_max_displacement_rad is not None and not args.torque_console_onset_probe:
+        raise LowGainProbeError("probe displacement bound requires explicit onset probe")
+    if args.torque_console_onset_probe and not args.torque_console_onset_capture:
+        raise LowGainProbeError("onset probe requires explicit onset capture")
+    if args.torque_console_onset_probe and any(_one_or_six_non_negative(args.driver_kd or _ZERO_SIX, name="driver_kd")):
+        raise LowGainProbeError("onset probe requires calibrated zero base driver Kd")
+    if args.torque_console_motion_profile is not None:
+        args.torque_console_staged_assist = True
+    if args.torque_console_onset_capture and not args.torque_console_quantized_velocity_debug:
+        raise LowGainProbeError("onset capture requires explicit direct J3 quantized velocity debug")
+    if args.torque_console_quantized_velocity_debug and (
+        not args.torque_console or args.torque_console_staged_assist
+    ):
+        raise LowGainProbeError("quantized velocity debug requires direct torque console")
+    if args.torque_console_quantized_velocity_debug and args.feedback_source != "active-report":
+        raise LowGainProbeError("quantized velocity debug requires active-report position feedback")
+    if (
+        args.torque_console_staged_motion_confirm_rad is not None
+        or args.torque_console_staged_motion_confirm_samples != 1
+    ) and (not args.torque_console or not args.torque_console_staged_assist):
+        raise LowGainProbeError("motion confirmation options require staged torque console")
+    if not getattr(args, "torque_console", False):
+        if getattr(args, "torque_console_confirmation", "") or getattr(
+            args, "torque_console_staged_assist", False
+        ):
+            raise LowGainProbeError(
+                "staged torque-console options require --torque-console"
+            )
+        return
+    if args.mode != "hold":
+        raise LowGainProbeError("torque console requires --mode hold")
+    if args.torque_console_confirmation != "B601_RS_TORQUE_CONSOLE":
+        raise LowGainProbeError(
+            "torque console requires --torque-console-confirmation "
+            "B601_RS_TORQUE_CONSOLE"
+        )
+    if args.single_joint_assist or args.cartesian_assist:
+        raise LowGainProbeError(
+            "torque console cannot run with one-shot joint or Cartesian assist"
+        )
+    if args.kp != 0 or args.kd != 0:
+        raise LowGainProbeError("torque console requires zero software --kp and --kd")
+    if args.torque_console_staged_motion_confirm_rad is not None and any(
+        _one_or_six_non_negative(args.driver_kd or _ZERO_SIX, name="driver_kd")
+    ):
+        raise LowGainProbeError("confirmed staged withdrawal requires calibrated zero base --driver-kd")
+    if not args.allow_motion or not args.auto_disable:
+        raise LowGainProbeError(
+            "torque console requires --allow-motion and --auto-disable"
+        )
+    if not args.gravity_debug_mode:
+        raise LowGainProbeError(
+            "torque console requires the frozen gravity profile in protective hold"
+        )
+    if not args.apply_driver_torque_limits:
+        raise LowGainProbeError(
+            "torque console requires volatile driver torque limits"
+        )
+    if getattr(args, "torque_console_auto_calibration_profile", None) is not None:
+        _automatic_calibration_controller_from_args(args)
+    elif args.torque_console_staged_assist:
+        _staged_torque_console_settings_from_args(args)
+    else:
+        _direct_torque_console_from_args(args)
+
+
+def _torque_console_limits_from_args(
+    args: argparse.Namespace,
+) -> B601TorqueExperimentLimits:
+    return B601TorqueExperimentLimits(
+        joint_name=args.torque_console_joint,
+        max_abs_assist_nm=args.torque_console_max_assist_nm,
+        rise_slew_nm_s=args.torque_console_rise_slew_nm_s,
+        release_slew_nm_s=args.torque_console_release_slew_nm_s,
+        command_timeout_sec=args.torque_console_timeout_sec,
+        stationarity_limit_rad_s=args.torque_console_stationarity_limit_rad_s,
+        max_joint_velocity_rad_s=args.torque_console_max_joint_velocity_rad_s,
+        max_excursion_rad=args.torque_console_max_excursion_rad,
+        max_support_drift_rad=args.torque_console_max_support_drift_rad,
+    )
+
+
+def _automatic_profile_values(path: Path) -> dict:
+    from control_station.b601_torque_console.automatic_calibration import (
+        load_automatic_profile,
+    )
+
+    return load_automatic_profile(path)
+
+
+def _prepare_automatic_calibration_args(args: argparse.Namespace) -> None:
+    path = getattr(args, "torque_console_auto_calibration_profile", None)
+    if path is None:
+        return
+    if args.torque_console_onset_capture or args.torque_console_onset_probe or args.torque_console_quantized_velocity_debug:
+        raise LowGainProbeError("automatic calibration cannot be combined with manual onset/debug modes")
+    if args.feedback_source != "active-report" or args.rate_hz < 100:
+        raise LowGainProbeError("automatic calibration requires active-report and owner rate at least 100 Hz")
+    values = _automatic_profile_values(path)
+    if not isinstance(values.get("motion_profile"), str):
+        raise TypeError("automatic profile requires a motion_profile filename")
+    args.torque_console = args.torque_console_staged_assist = True
+    if args.torque_console_motion_profile is None:
+        args.torque_console_motion_profile = (path.parent / values["motion_profile"]).resolve()
+    if args.torque_console_staged_motion_confirm_rad is None:
+        args.torque_console_staged_motion_confirm_rad = .0007
+    if args.torque_console_staged_motion_confirm_samples == 1:
+        args.torque_console_staged_motion_confirm_samples = 2
+
+
+def _automatic_calibration_controller_from_args(args: argparse.Namespace):
+    from control_station.b601_torque_console.automatic_calibration import (
+        AutomaticCalibrationConfig,
+        B601AutomaticCalibrationController,
+    )
+    values = _automatic_profile_values(args.torque_console_auto_calibration_profile)
+    values.pop("motion_profile")
+    cycle = values.pop("cycle", None)
+    workspace = values.pop("workspace", None)
+    controller = B601AutomaticCalibrationController(_staged_torque_console_settings_from_args(args), AutomaticCalibrationConfig(**values))
+    workspace_controller = None
+    if workspace is not None:
+        if cycle is None or not isinstance(workspace, dict):
+            raise ValueError("workspace mode requires explicit cycle and workspace settings")
+        from control_station.b601_torque_console.workspace_calibration import (
+            B601WorkspaceCalibrationController,
+            WorkspaceCalibrationConfig,
+        )
+        workspace_controller = B601WorkspaceCalibrationController(
+            controller.settings, controller.config, WorkspaceCalibrationConfig(**workspace))
+    if cycle is not None:
+        from control_station.b601_torque_console.calibration_cycle import (
+            B601AutomaticCalibrationCycleController,
+            CalibrationCycleConfig,
+        )
+        controller = B601AutomaticCalibrationCycleController(controller, CalibrationCycleConfig(**cycle))
+        from control_station.b601_torque_console.mode_controller import (
+            B601CalibrationModeController,
+        )
+        controller = B601CalibrationModeController(controller, workspace=workspace_controller)
+    return controller
+
+
+def _direct_torque_console_from_args(args: argparse.Namespace) -> B601TorqueExperiment:
+    if args.torque_console_quantized_velocity_debug and args.rate_hz < 100:
+        raise LowGainProbeError("quantized velocity debug requires owner rate at least 100 Hz")
+    return B601TorqueExperiment(
+        _torque_console_limits_from_args(args),
+        quantized_velocity_debug=args.torque_console_quantized_velocity_debug,
+        onset_capture=(B601MotionOnsetCaptureConfig(
+            displacement_rad=args.torque_console_onset_displacement_rad,
+            confirm_samples=args.torque_console_onset_confirm_samples,
+            window_velocity_rad_s=args.torque_console_onset_velocity_rad_s,
+            settle_timeout_sec=args.torque_console_onset_settle_timeout_sec,
+        ) if args.torque_console_onset_capture else None),
+        onset_probe=(B601OnsetProbeConfig(
+            hold_sec=args.torque_console_onset_probe_hold_sec,
+            max_trial_sec=args.torque_console_onset_probe_max_trial_sec,
+            max_command_exposure_nm_sec=args.torque_console_onset_probe_max_command_exposure_nm_sec,
+            max_displacement_rad=args.torque_console_onset_probe_max_displacement_rad,
+        ) if args.torque_console_onset_probe else None),
+    )
+
+
+def _staged_torque_console_settings_from_args(args: argparse.Namespace):
+    from control_station.b601_torque_console.staged_controller import (
+        B601StagedTorqueConsoleSettings,
+    )
+    from robot_motion.rebot_b601_rs.joint_motion import B601JointMotionConfig
+
+    limits = _torque_console_limits_from_args(args)
+    motion = None
+    if args.torque_console_motion_profile is not None:
+        values = json.loads(
+            args.torque_console_motion_profile.read_text(encoding="utf-8")
+        )
+        if not isinstance(values, dict):
+            raise ValueError("motion profile must be a JSON object")
+        motion = B601JointMotionConfig(**values)
+    settle_overlay_cap = min(0.05, args.torque_console_staged_tracking_overlay_cap_nm)
+    settle_integral_cap = min(0.02, settle_overlay_cap)
+    staged = B601StagedAssistConfig(
+        joint_name=args.torque_console_joint,
+        cue_torque_nm=args.torque_console_staged_cue_torque_nm,
+        cue_duration_sec=args.torque_console_staged_cue_duration_sec,
+        cue_rise_slew_nm_s=min(0.20, args.torque_console_rise_slew_nm_s),
+        breakaway_torque_nm=args.torque_console_staged_breakaway_torque_nm,
+        breakaway_rise_slew_nm_s=args.torque_console_staged_breakaway_rise_slew_nm_s,
+        breakaway_max_duration_sec=args.torque_console_staged_breakaway_duration_sec,
+        breakaway_max_impulse_nm_sec=args.torque_console_staged_breakaway_impulse_nm_sec,
+        # Keep a 10 mrad GUI target eligible after small encoder/backlash
+        # motion; the previous 10 mrad minimum consumed the entire test target.
+        minimum_breakaway_error_rad=min(
+            0.002, args.torque_console_staged_target_offset_limit_rad
+        ),
+        stuck_max_velocity_rad_s=min(
+            args.torque_console_stationarity_limit_rad_s,
+            args.torque_console_max_joint_velocity_rad_s / 2.0,
+        ),
+        motion_onset_displacement_rad=args.torque_console_staged_motion_onset_rad,
+        motion_onset_velocity_rad_s=args.torque_console_staged_motion_onset_velocity_rad_s,
+        # Withdrawal and optional persistent-displacement confirmation are
+        # separate; the default preserves the existing onset contract.
+        motion_onset_confirm_samples=args.torque_console_staged_motion_confirm_samples,
+        motion_onset_confirm_displacement_rad=args.torque_console_staged_motion_confirm_rad,
+        new_intent_delta_rad=min(
+            0.01, args.torque_console_staged_target_offset_limit_rad
+        ),
+        tracking_overlay_cap_nm=args.torque_console_staged_tracking_overlay_cap_nm,
+        tracking_slew_nm_s=min(0.20, args.torque_console_rise_slew_nm_s),
+        settle_error_rad=min(
+            0.003,
+            args.torque_console_staged_target_offset_limit_rad / 4.0,
+        ) * 1.30,
+        settle_capture_error_rad=min(
+            0.015, args.torque_console_staged_target_offset_limit_rad
+        ),
+        settle_velocity_rad_s=min(
+            0.005, args.torque_console_stationarity_limit_rad_s
+        ),
+        settle_dwell_sec=0.15,
+        settle_integral_gain_nm_per_rad_sec=0.5,
+        settle_integral_leak_per_sec=1.0,
+        settle_integral_cap_nm=settle_integral_cap,
+        settle_overlay_cap_nm=settle_overlay_cap,
+        max_total_overlay_nm=args.torque_console_max_assist_nm,
+        motion_control=motion,
+    )
+    settings = B601StagedTorqueConsoleSettings(
+        limits=limits,
+        staged_assist=staged,
+        maximum_target_offset_rad=args.torque_console_staged_target_offset_limit_rad,
+        tracking_kp_nm_per_rad=(
+            args.torque_console_staged_tracking_kp_nm_per_rad
+            if motion is None else motion.tracking_kp_nm_per_rad
+        ),
+        tracking_kd_nm_s_per_rad=0.0 if motion is None else motion.tracking_kd_nm_s_per_rad,
+        authority_rise_per_sec=args.torque_console_staged_authority_rise_per_sec,
+        nominal_control_period_sec=1.0 / args.rate_hz,
+    )
+    if motion is not None:
+        envelope = staged.breakaway_envelope(control_period_sec=settings.nominal_control_period_sec)
+        if not envelope["nominal_peak_within_optimistic_ceiling"]:
+            raise ValueError(
+                "breakaway peak is unreachable within the configured rise/duration/impulse envelope: "
+                f"{', '.join(envelope['limiting_reasons'])}; "
+                f"optimistic command ceiling={envelope['optimistic_command_peak_ceiling_nm']:.6f} Nm"
+            )
+    return settings
+
+
+def _motion_console_driver_kd(
+    console, base_kd: tuple[float, ...], *, final_command_delta_nm: tuple[float, ...] | None = None,
+) -> tuple[float, ...]:
+    """Resolve opt-in motor damping without changing the frozen base profile."""
+    from control_station.b601_torque_console.automatic_calibration import (
+        B601AutomaticCalibrationController,
+    )
+    from control_station.b601_torque_console.calibration_cycle import (
+        B601AutomaticCalibrationCycleController,
+    )
+    from control_station.b601_torque_console.mode_controller import (
+        B601CalibrationModeController,
+    )
+    from control_station.b601_torque_console.staged_controller import (
+        B601StagedTorqueConsoleController,
+    )
+    from control_station.b601_torque_console.workspace_calibration import (
+        B601WorkspaceCalibrationController,
+    )
+
+    if isinstance(console, (
+        B601StagedTorqueConsoleController, B601AutomaticCalibrationController,
+        B601AutomaticCalibrationCycleController, B601CalibrationModeController,
+        B601WorkspaceCalibrationController,
+    )):
+        return console.active_driver_damping(base_kd, final_command_delta_nm=final_command_delta_nm)
+    return base_kd
+
+
+def _motion_protective_driver_kd(settings, base_kd: Sequence[float]) -> tuple[float, ...] | None:
+    """Reuse explicit motion-profile damping at the owner fault boundary."""
+    motion = None if settings is None else settings.staged_assist.motion_control
+    if motion is None or not any(motion.drive_driver_kd_nm_s_per_rad):
+        return None
+    base = _non_negative_six(base_kd, name="base_driver_kd_nm_s_per_rad")
+    return tuple(max(current, configured) for current, configured in zip(
+        base, motion.drive_driver_kd_nm_s_per_rad, strict=True,
+    ))
+
+
 def _cartesian_assist_config_from_args(
     args: argparse.Namespace,
 ) -> B601CartesianAssistConfig:
     return B601CartesianAssistConfig(
         axis=args.cartesian_assist_axis,
         offset_m=args.cartesian_assist_offset_m,
+        max_offset_m=args.cartesian_assist_max_offset_m,
         stiffness_n_per_m=args.cartesian_assist_stiffness_n_per_m,
         damping_n_s_per_m=args.cartesian_assist_damping_n_s_per_m,
         lateral_stiffness_n_per_m=(
@@ -5356,11 +6046,29 @@ def _cartesian_assist_config_from_args(
         max_joint_torque_rate_nm_s=(
             args.cartesian_assist_joint_torque_slew_nm_s
         ),
+        max_joint_torque_release_rate_nm_s=(
+            args.cartesian_assist_joint_torque_release_slew_nm_s
+        ),
         authority_rise_per_sec=args.cartesian_assist_authority_rise_per_sec,
         countdown_sec=args.cartesian_assist_countdown_sec,
         assist_duration_sec=args.cartesian_assist_duration_sec,
         stationarity_limit_rad_s=(
             args.cartesian_assist_stationarity_limit_rad_s
+        ),
+        breakaway=B601CartesianBreakawayConfig(
+            positive_torque_nm=(
+                args.cartesian_assist_breakaway_positive_nm
+            ),
+            negative_torque_nm=(
+                args.cartesian_assist_breakaway_negative_nm
+            ),
+            velocity_fade_rad_s=(
+                args.cartesian_assist_breakaway_velocity_fade_rad_s
+            ),
+            intent_deadband_nm=(
+                args.cartesian_assist_breakaway_intent_deadband_nm
+            ),
+            intent_ramp_nm=args.cartesian_assist_breakaway_intent_ramp_nm,
         ),
     )
 
@@ -5380,6 +6088,17 @@ def _validate_cartesian_assist_cli(args: argparse.Namespace) -> None:
         if confirmation:
             raise LowGainProbeError(
                 "--cartesian-assist-confirmation requires --cartesian-assist"
+            )
+        if any(
+            float(value) != 0.0
+            for name in (
+                "cartesian_assist_breakaway_positive_nm",
+                "cartesian_assist_breakaway_negative_nm",
+            )
+            for value in getattr(args, name, _ZERO_SIX)
+        ):
+            raise LowGainProbeError(
+                "Cartesian breakaway torque requires --cartesian-assist"
             )
         return
     if getattr(args, "single_joint_assist", False):
@@ -5703,7 +6422,7 @@ def compute_cartesian_assist_overlay(
         damping_n_s_per_m=tuple(damping),
         max_abs_force_n=(config.max_abs_force_n,) * 3,
     )
-    raw_overlay, audit = compute_cartesian_impedance_overlay(
+    raw_task_overlay, audit = compute_cartesian_impedance_overlay(
         model,
         spring,
         qpos_rad=qpos_rad,
@@ -5712,13 +6431,34 @@ def compute_cartesian_assist_overlay(
             2.0 * abs(config.offset_m) + maximum_lateral_drift_m
         ),
     )
+    breakaway = compute_cartesian_breakaway_compensation(
+        config.breakaway,
+        task_torque_nm=raw_task_overlay,
+        measured_qvel_rad_s=qvel_rad_s,
+    )
+    raw_overlay = tuple(
+        task + compensation
+        for task, compensation in zip(
+            raw_task_overlay,
+            breakaway.torque_nm,
+            strict=True,
+        )
+    )
     authority = session.authority(timestamp_sec=timestamp_sec)
     authority_overlay = tuple(authority * value for value in raw_overlay)
+    slew_decision = select_cartesian_assist_torque_slew(
+        requested_nm=authority_overlay,
+        previous_nm=previous_overlay_nm,
+        measured_qvel_rad_s=qvel_rad_s,
+        rise_rate_nm_s=config.max_joint_torque_rate_nm_s,
+        release_rate_nm_s=config.max_joint_torque_release_rate_nm_s,
+        brake_velocity_deadband_rad_s=config.stationarity_limit_rad_s,
+    )
     conditioned_overlay, torque_limited, slew_limited = condition_torque(
-        authority_overlay,
+        slew_decision.conditioning_target_nm,
         previous_overlay_nm,
         absolute_limits_nm=(config.max_abs_joint_torque_nm,) * 6,
-        max_rate_nm_s=(config.max_joint_torque_rate_nm_s,) * 6,
+        max_rate_nm_s=slew_decision.selected_rate_nm_s,
         dt_sec=dt_sec,
     )
     commanded_force = tuple(
@@ -5735,8 +6475,23 @@ def compute_cartesian_assist_overlay(
             "authority": authority,
             "commanded_force_n": commanded_force,
             "rotation_drift_rad": rotation_drift_rad,
+            "raw_task_joint_torque_overlay_nm": raw_task_overlay,
+            "breakaway": {
+                **config.breakaway.as_dict(),
+                "torque_nm": breakaway.torque_nm,
+                "velocity_weight": breakaway.velocity_weight,
+                "intent_weight": breakaway.intent_weight,
+                "active": breakaway.active,
+            },
             "raw_joint_torque_overlay_nm": raw_overlay,
             "authority_joint_torque_overlay_nm": authority_overlay,
+            "conditioning_target_joint_torque_nm": (
+                slew_decision.conditioning_target_nm
+            ),
+            "joint_torque_slew_mode": slew_decision.mode,
+            "joint_torque_selected_rate_nm_s": (
+                slew_decision.selected_rate_nm_s
+            ),
             "joint_torque_overlay_nm": conditioned_overlay,
             "joint_torque_limited": torque_limited,
             "joint_torque_slew_limited": slew_limited,
@@ -6153,6 +6908,7 @@ def format_cartesian_assist_response_notice(
 ) -> str:
     status = str(response.get("status", "UNKNOWN"))
     displacement_m = float(response.get("settled_signed_displacement_m", 0.0))
+    target_m = abs(float(response.get("commanded_offset_m", 0.0)))
     minimum_m = float(response.get("minimum_response_m", 0.0))
     peak_force_n = float(response.get("peak_signed_force_n", 0.0))
     lateral_m = float(response.get("max_lateral_drift_m", 0.0))
@@ -6161,6 +6917,7 @@ def format_cartesian_assist_response_notice(
         "[B601] [CARTESIAN ASSIST RESPONSE] "
         f"status={status} "
         f"displacement={1000.0 * displacement_m:.3f}mm "
+        f"target={1000.0 * target_m:.3f}mm "
         f"minimum={1000.0 * minimum_m:.3f}mm "
         f"peak_force={peak_force_n:.3f}N "
         f"max_lateral_drift={1000.0 * lateral_m:.3f}mm "
@@ -6168,23 +6925,505 @@ def format_cartesian_assist_response_notice(
     )
 
 
-def _output_payload(payload: dict[str, object], output: Path | None) -> None:
-    encoded = json.dumps(payload, indent=2, sort_keys=True, default=list)
-    if output is None:
-        print(encoded)
-        return
-    output_path = output.expanduser().resolve()
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text(encoded + "\n", encoding="utf-8")
+def _finalize_automatic_result(payload: dict, acquisition: dict) -> int:
+    """Separate a clean operator stop from strict experiment acceptance.
+
+    This is called only AFTER owner cleanup in explicit automatic collection.
+    It cannot convert an owner error, unsafe stop or unknown failure to success.
+    Acceptance and acquisition-complete fields remain unchanged.
+    """
+    outcome = acquisition["outcome"]
+    payload["acquisition_outcome"] = outcome
+    degraded = payload.get("protective_hold", {}).get("degraded", {})
+    if payload.get("status") != "ERROR" and (degraded.get("entry_count", 0) or degraded.get("escalation_reason")):
+        payload["execution_status"] = "FAILED"
+    payload["execution_warnings"] = [
+        {"scope": "timing_quality", "reason": f"{event}_frequency_acceptance_not_met"}
+        for event, check in payload.get("frequency_acceptance", {}).items()
+        if check["passed"] is False
+    ]
+    if (payload.get("status") != "ERROR"
+        and payload.get("execution_status") == "STOPPED_BY_OPERATOR"
+        and acquisition["state"] in {"complete", "failed", "cancelled"}
+        and outcome["severity"] in {"info", "warning"}):
+        payload["status"] = "STOPPED_WITH_WARNINGS" if outcome["severity"] == "warning" or payload["execution_warnings"] else "STOPPED"
+        return 0
+    return 2 if payload.get("status") == "ERROR" else 0 if payload.get("status") == "OK" else 1
+
+
+def _write_result_json(payload: dict[str, object], output: Path) -> None:
+    """Atomically replace only this run's primary result, after control cleanup."""
+    output = output.expanduser().resolve()
+    output.parent.mkdir(parents=True, exist_ok=True)
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=output.parent,
+                prefix=f".{output.name}.", suffix=".tmp", delete=False) as stream:
+            temporary = Path(stream.name)
+            json.dump(payload, stream, indent=2, sort_keys=True, default=list)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, output)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
+def _emit_result_summary(payload: dict[str, object], output: Path) -> None:
     summary = {
         key: payload[key]
-        for key in ("status", "mode", "acceptance_status", "stop_reason", "error")
+        for key in ("status", "mode", "execution_status", "acquisition_outcome", "execution_warnings", "acceptance_status", "stop_reason", "error", "automatic_calibration_report_status")
         if key in payload
     }
-    summary["result_path"] = str(output_path)
+    summary["result_path"] = str(output.expanduser().resolve())
     if "runtime_log_path" in payload:
         summary["runtime_log_path"] = payload["runtime_log_path"]
     print(json.dumps(summary, sort_keys=True, default=list), flush=True)
+
+
+def _output_payload(payload: dict[str, object], output: Path | None, *, emit_summary=True) -> dict[str, object]:
+    if (output is not None and isinstance(payload.get("automatic_calibration"), dict)
+        and payload["automatic_calibration"].get("operation_mode") == "workspace"
+        and "samples" in payload):
+        import gzip
+
+        archive_path = output.expanduser().resolve().with_suffix(".samples.jsonl.gz")
+        archive_path.parent.mkdir(parents=True, exist_ok=True)
+        samples = payload["samples"]
+        if archive_path.exists():
+            raise FileExistsError(archive_path)
+        checkpoint = {**payload, "samples": [], "sample_storage": {
+            **payload.get("sample_storage", {}), "sample_count": len(samples),
+            "samples_in_result_json": False, "sample_archive_status": "PENDING",
+            "sample_archive_path": str(archive_path),
+            "semantics": "archive_pending_original_dynamics_trace_retained",
+        }}
+        _write_result_json(checkpoint, output)
+        if not emit_summary:
+            _operator_notice(f"[B601] primary control checkpoint saved: {output}; archiving {len(samples)} samples after cleanup (no motor control).")
+        try:
+            with gzip.open(archive_path, "xt", encoding="utf-8", compresslevel=3) as archive:
+                for sample in samples:
+                    archive.write(json.dumps(sample, default=list, allow_nan=False, separators=(",", ":")) + "\n")
+        except (KeyboardInterrupt, OSError, TypeError, ValueError) as exc:
+            checkpoint["sample_storage"]["sample_archive_status"] = "INTERRUPTED" if isinstance(exc, KeyboardInterrupt) else "ERROR"
+            checkpoint["sample_storage"]["error"] = f"{type(exc).__name__}: {exc}"
+            _write_result_json(checkpoint, output)
+            raise
+        payload = {**payload, "samples": [], "sample_storage": {
+            **payload.get("sample_storage", {}), "sample_count": len(samples),
+            "sample_archive_status": "COMPLETE",
+            "sample_archive_path": str(archive_path), "sample_archive_format": "gzip_jsonl",
+            "samples_in_result_json": False, "semantics": "all_complete_samples_preserved_in_linked_archive_no_sample_discard",
+        }}
+    if output is None:
+        print(json.dumps(payload, indent=2, sort_keys=True, default=list))
+        return payload
+    _write_result_json(payload, output)
+    if emit_summary:
+        _emit_result_summary(payload, output)
+    return payload
+
+
+class _ProbeSampleArchive(Sequence[dict[str, object]]):
+    """Keep completed evidence outside the cyclic-GC graph, without dropping it.
+
+    Only the latest frame remains mutable. Earlier frames are packed when the
+    next one is appended, after their trace/timing fields have been completed.
+    Blobs are process-local and generated here; never read pickle from a file,
+    transport, GUI request or other external input. Types (including tuples
+    and NumPy diagnostic arrays) are preserved for the existing consumers.
+    """
+
+    def __init__(self) -> None:
+        self._completed: list[bytes | dict[str, object]] = []
+        self._latest: dict[str, object] | None = None
+        self._packed_bytes = 0
+        self._packing_failures = 0
+        self._first_packing_error: str | None = None
+
+    def append(self, sample: dict[str, object]) -> None:
+        if not isinstance(sample, dict):
+            raise TypeError("probe samples must be dictionaries")
+        if self._latest is not None:
+            try:
+                packed = pickle.dumps(self._latest, protocol=pickle.HIGHEST_PROTOCOL)
+            except (pickle.PicklingError, TypeError, AttributeError, ValueError) as exc:
+                # An unsupported diagnostic value must not affect motor control
+                # or lose evidence. Retain that frame and expose the fallback.
+                self._completed.append(self._latest)
+                self._packing_failures += 1
+                if self._first_packing_error is None:
+                    self._first_packing_error = f"{type(exc).__name__}: {exc}"
+            else:
+                self._completed.append(packed)
+                self._packed_bytes += len(packed)
+        self._latest = sample
+
+    def __len__(self) -> int:
+        return len(self._completed) + int(self._latest is not None)
+
+    @overload
+    def __getitem__(self, index: int) -> dict[str, object]: ...
+
+    @overload
+    def __getitem__(self, index: slice) -> list[dict[str, object]]: ...
+
+    def __getitem__(self, index: int | slice) -> dict[str, object] | list[dict[str, object]]:
+        if isinstance(index, slice):
+            return [self[position] for position in range(len(self))[index]]
+        position = index + len(self) if index < 0 else index
+        if position < 0 or position >= len(self):
+            raise IndexError("probe sample index out of range")
+        if position == len(self._completed):
+            assert self._latest is not None
+            return self._latest
+        completed = self._completed[position]
+        return pickle.loads(completed) if isinstance(completed, bytes) else completed
+
+    def materialize(self) -> list[dict[str, object]]:
+        """Restore the existing result.samples list only after owner cleanup."""
+        return list(self)
+
+    def diagnostics(self) -> dict[str, object]:
+        return {
+            "semantics": "diagnostic_only; process_local_completed_frames; no_sample_discard",
+            "sample_count": len(self),
+            "packed_sample_count": len(self._completed) - self._packing_failures,
+            "packed_bytes": self._packed_bytes,
+            "live_sample_count": int(self._latest is not None),
+            "packing_fallback_count": self._packing_failures,
+            "first_packing_error": self._first_packing_error,
+            "result_materialization": "after_control_cleanup_and_backend_close_attempt",
+        }
+
+
+class _ProbeStageTiming:
+    """Diagnostic wall/thread-CPU durations; never a controller clock/input."""
+
+    def __init__(self) -> None:
+        self._wall = time.perf_counter()
+        self._cpu = time.thread_time()
+        self.stages: dict[str, dict[str, float]] = {}
+
+    def mark(self, stage: str, *, accumulate: bool = False) -> None:
+        wall, cpu = time.perf_counter(), time.thread_time()
+        values = {
+            "wall_sec": wall - self._wall,
+            "thread_cpu_sec": cpu - self._cpu,
+            "started_perf_counter_sec": self._wall,
+            "completed_perf_counter_sec": wall,
+        }
+        if accumulate:
+            previous = self.stages.get(stage, {})
+            values.update({
+                "wall_sec": previous.get("wall_sec", 0.0) + values["wall_sec"],
+                "thread_cpu_sec": previous.get("thread_cpu_sec", 0.0) + values["thread_cpu_sec"],
+                "started_perf_counter_sec": previous.get("started_perf_counter_sec", self._wall),
+                "interval_count": previous.get("interval_count", 0) + 1,
+                "max_interval_wall_sec": max(previous.get("max_interval_wall_sec", 0.0), wall - self._wall),
+            })
+        self.stages[stage] = values
+        self._wall, self._cpu = wall, cpu
+
+    def snapshot(self) -> dict[str, object]:
+        return {
+            "semantics": (
+                "diagnostic_only; wall=perf_counter; cpu=owner_thread_time; "
+                "wall_cpu_difference_does_not_identify_a_scheduler_or_io_cause"
+            ),
+            "stages": {name: dict(values) for name, values in self.stages.items()},
+            "total_wall_sec": sum(stage["wall_sec"] for stage in self.stages.values()),
+            "total_thread_cpu_sec": sum(stage["thread_cpu_sec"] for stage in self.stages.values()),
+        }
+
+
+def _flush_automatic_calibration_records(torque_console, debug_trace, cycle_timing=None) -> None:
+    """Persist queued fault receipts even when the normal cycle cannot finish."""
+    for calibration_record in torque_console.drain_records():
+        record = dict(calibration_record)
+        kind = record.pop("kind")
+        if "recorded_monotonic_sec" not in record:
+            raise LowGainProbeError(f"automatic calibration record {kind!r} requires recorded_monotonic_sec")
+        timestamp = record.pop("recorded_monotonic_sec")
+        # Existing pre-dispatch snapshots explicitly carry None: there is no
+        # completed command yet. Do not fabricate a receipt time for them.
+        if timestamp is not None and (
+            isinstance(timestamp, bool) or not isinstance(timestamp, (int, float)) or not math.isfinite(timestamp)
+        ):
+            raise LowGainProbeError(f"automatic calibration record {kind!r} has invalid recorded_monotonic_sec")
+        timestamp_key = {
+            "automatic_calibration_dispatch_rejected": "rejection_observed_at_sec",
+            "automatic_calibration_cycle_transition": "transition_observed_at_sec",
+            "automatic_calibration_mode_selected": "mode_selected_at_sec",
+        }.get(kind, "acquisition_completed_at_sec")
+        record[timestamp_key] = timestamp
+        if kind == "automatic_calibration_dispatch_rejected" and cycle_timing is not None:
+            cycle_timing.mark("dispatch_rejection_capture")
+            record["cycle_timing"] = cycle_timing.snapshot()
+        debug_trace.record(kind, **record)
+        if (kind in {"workspace_calibration_transition", "automatic_calibration_cycle_transition"}
+            and record.get("phase") in {"failed", "cancelled"}):
+            _operator_notice(
+                f"[B601] ACQUISITION STOPPED: {record.get('reason')}; "
+                "no automatic retry or return. No new acquisition targets; "
+                "check owner withdrawal/hold/disable receipts. Acquisition stop is not full disable."
+            )
+
+
+class _ProbeGCObserver:
+    """Bounded process-local observation; never change GC or control settings."""
+
+    def __init__(self, max_pending_events: int = 64) -> None:
+        if max_pending_events <= 0:
+            raise ValueError("max_pending_events must be positive")
+        self._events: deque[tuple[object, ...]] = deque(maxlen=max_pending_events)
+        self._owner_thread = threading.get_ident()
+        self._started: tuple[int, int, float, float] | None = None
+        self._completed = 0
+        self._dropped = 0
+        self._last_drained_sequence = 0
+        self._unmatched_stops = 0
+        self._registered = False
+        self._callback = self._observe
+        self.settings_at_start = {"enabled": gc.isenabled(), "thresholds": gc.get_threshold()}
+
+    def __enter__(self) -> _ProbeGCObserver:  # noqa: PYI034 - typing.Self requires Python 3.11.
+        if self._registered:
+            raise RuntimeError("GC observer is already registered")
+        gc.callbacks.append(self._callback)
+        self._registered = True
+        return self
+
+    def close(self) -> None:
+        if self._registered:
+            # Preserve callbacks owned by other components of this process.
+            if self._callback in gc.callbacks:
+                gc.callbacks.remove(self._callback)
+            self._registered = False
+
+    def __exit__(self, *_exc: object) -> None:
+        self.close()
+
+    def _observe(self, phase: str, info: Mapping[str, int]) -> None:
+        thread_id = threading.get_ident()
+        if phase == "start":
+            self._started = (info["generation"], thread_id, time.perf_counter(), time.thread_time())
+        elif phase == "stop":
+            wall, cpu = time.perf_counter(), time.thread_time()
+            started, self._started = self._started, None
+            if started is None or started[:2] != (info["generation"], thread_id):
+                self._unmatched_stops += 1
+                return
+            generation, _thread, start_wall, start_cpu = started
+            self._completed += 1
+            # No serialization, stack inspection, logging, locks or GC calls
+            # inside the GC callback. Collector CPU is not owner CPU when the
+            # GUI thread initiated this collection.
+            self._events.append((self._completed, generation, thread_id,
+                                 thread_id == self._owner_thread, start_wall, wall,
+                                 cpu - start_cpu, info["collected"], info["uncollectable"]))
+
+    def drain(self) -> dict[str, object]:
+        events = []
+        # One owner-thread consumer; CPython deque pops/appends are atomic.
+        # Bound the drain even if another thread completes a collection here.
+        for _ in range(len(self._events)):
+            event = self._events.popleft()
+            sequence, generation, thread_id, owner_thread, start, end, cpu, collected, uncollectable = event
+            # A producer's full-queue check races with the owner drain. Count
+            # only sequence gaps actually observed by this single consumer.
+            self._dropped += sequence - self._last_drained_sequence - 1
+            self._last_drained_sequence = sequence
+            events.append({
+                "sequence": sequence, "generation": generation, "collector_thread_id": thread_id,
+                "collector_is_owner_thread": owner_thread,
+                "started_perf_counter_sec": start, "completed_perf_counter_sec": end,
+                "wall_sec": end - start, "collector_thread_cpu_sec": cpu,
+                "collected": collected, "uncollectable": uncollectable,
+            })
+        return {
+            "semantics": "diagnostic_only; completed_events_since_previous_drain; perf_counter_bounds; collector_CPU_is_not_always_owner_CPU",
+            "events": tuple(events), "completed_count": self._completed,
+            "dropped_event_count": self._dropped, "unmatched_stop_count": self._unmatched_stops,
+            "dropped_event_count_semantics": "exact_sequence_gaps_observed_by_single_consumer",
+            "last_drained_sequence": self._last_drained_sequence,
+            "max_pending_events": self._events.maxlen,
+        }
+
+
+class _ProbeFeedbackTiming:
+    """Observe the existing read/admission/retry path, without a second gate."""
+
+    def __init__(self) -> None:
+        self.timer = _ProbeStageTiming()
+        self.not_advanced_count = 0
+        self.retryable_error_count = 0
+
+    def mark(self, stage: str) -> None:
+        self.timer.mark(stage, accumulate=True)
+
+    def snapshot(self) -> dict[str, object]:
+        return {
+            **self.timer.snapshot(),
+            "interval_semantics": "summed_disjoint_intervals; span_bounds_are_not_contiguous",
+            "not_advanced_count": self.not_advanced_count,
+            "retryable_error_count": self.retryable_error_count,
+        }
+
+
+def _poll_control_feedback(
+    backend: B601RSBackend,
+    active_report_gate: B601ActiveReportControlGate | None,
+    diagnostics: _ProbeFeedbackTiming | None = None,
+) -> tuple[B601HardwareState, bool]:
+    """Read one configured source and retain the existing authoritative gate."""
+
+    try:
+        state = (
+            backend.poll_feedback(request_feedback=True)
+            if active_report_gate is None
+            else backend.poll_feedback(require_host_freshness=True)
+        )
+    finally:
+        if diagnostics is not None:
+            diagnostics.mark("backend_poll")
+    if active_report_gate is None:
+        return state, True
+    try:
+        advanced = active_report_gate.observe(state)
+    except (TypeError, ValueError) as exc:
+        raise LowGainProbeError(f"active-report feedback rejected: {exc}") from exc
+    finally:
+        if diagnostics is not None:
+            diagnostics.mark("host_freshness_admission")
+    return state, advanced
+
+
+def _active_report_feedback_deadline(
+    planned_deadline_sec: float,
+    *,
+    previous_feedback_timestamp_sec: float | None,
+    period_sec: float,
+) -> float:
+    """Keep actual reads a period apart from the dispatched feedback anchor.
+
+    A late cycle may reset the scheduler to its completion time. That is not
+    a new observation interval: polling immediately can compress snapshot dt.
+    Wait before reading, while retaining the actual timestamp in every guard.
+    Quarantined observations never advance this dispatched-state anchor.
+    """
+    deadline = _finite(planned_deadline_sec, name="planned_feedback_deadline_sec")
+    period = _positive(period_sec, name="feedback_period_sec")
+    if previous_feedback_timestamp_sec is None:
+        return deadline
+    previous = _finite(
+        previous_feedback_timestamp_sec, name="previous_feedback_timestamp_sec"
+    )
+    floor = _finite(previous + period, name="feedback_cadence_deadline_sec")
+    return max(deadline, floor)
+
+
+def _read_admitted_control_feedback(
+    backend: B601RSBackend,
+    active_report_gate: B601ActiveReportControlGate | None,
+    timeout_sec: float,
+    diagnostics: _ProbeFeedbackTiming | None = None,
+) -> B601HardwareState:
+    if active_report_gate is None:
+        state, _advanced = _poll_control_feedback(backend, active_report_gate, diagnostics)
+        return state
+    deadline = time.monotonic() + timeout_sec
+    last_error: str | None = None
+    while time.monotonic() <= deadline:
+        try:
+            state, advanced = _poll_control_feedback(backend, active_report_gate, diagnostics)
+        except LowGainProbeError as exc:
+            # A retained exception points through its traceback back to this
+            # frame, keeping successful retry loops alive until cyclic GC.
+            # Timeout reporting only consumes its text, never the traceback.
+            last_error = str(exc)
+            if diagnostics is not None:
+                diagnostics.retryable_error_count += 1
+        else:
+            if advanced:
+                return state
+            last_error = "active-report feedback established a baseline but did not yet advance"
+            if diagnostics is not None:
+                diagnostics.not_advanced_count += 1
+        if diagnostics is not None:
+            diagnostics.mark("retry_bookkeeping")
+        time.sleep(0.001)
+        if diagnostics is not None:
+            diagnostics.mark("retry_wait")
+    raise LowGainProbeError(
+        "no advancing complete Type-24 snapshot arrived within "
+        f"{timeout_sec:.6f}s: {last_error}"
+    )
+
+
+class _DynamicsTrace:
+    """Best-effort diagnostic sink; a storage fault cannot change motor control."""
+
+    def __init__(self, stream: TextIO, gc_observer: _ProbeGCObserver | None = None) -> None:
+        self.stream = stream
+        self.gc_observer = gc_observer
+        self.sample_count = 0
+        self.error: str | None = None
+        self.last_record_timing: dict[str, object] | None = None
+        self.last_feedback_read_diagnostics: _ProbeFeedbackTiming | None = None
+        self.gc_observation_end: dict[str, object] | None = None
+
+    def finish_control_observation(self, *, cleanup_errors: Sequence[str]) -> None:
+        """Close the online observation before bulk post-cleanup evaluation.
+
+        This boundary follows the existing backend-close attempt, not merely
+        a control stop or protective-hold entry. Post-cleanup unpickling/JSON
+        allocations are not servo GC events and have no periodic drain.
+        """
+        if self.gc_observation_end is not None:
+            return
+        if self.gc_observer is not None:
+            self.gc_observer.close()
+        self.gc_observation_end = {
+            "boundary": "after_control_cleanup_and_backend_close_attempt",
+            "ended_perf_counter_sec": time.perf_counter(),
+            "cleanup_errors": tuple(cleanup_errors),
+            "excluded_phases": (
+                "post_cleanup_acceptance", "sample_materialization",
+                "final_json_serialization",
+            ),
+        }
+        self.record("control_observation_complete", **self.gc_observation_end)
+
+    def record(self, kind: str, **fields: object) -> None:
+        if self.error is not None:
+            return
+        timing = _ProbeStageTiming()
+        try:
+            if self.gc_observer is not None:
+                fields["gc_observation"] = self.gc_observer.drain()
+            encoded = json.dumps(
+                {"kind": kind, "recorded_monotonic_sec": time.monotonic(), **fields},
+                allow_nan=False,
+                default=list,
+            )
+            timing.mark("encode")
+            self.stream.write(encoded + "\n")
+            timing.mark("write")
+            self.stream.flush()
+            timing.mark("flush")
+            self.sample_count += 1
+        except (OSError, TypeError, ValueError) as exc:
+            self.error = f"{type(exc).__name__}: {exc}"
+        finally:
+            self.last_record_timing = {
+                "kind": kind,
+                "sequence": fields.get("sequence"),
+                "completed": self.error is None,
+                **timing.snapshot(),
+            }
 
 
 def _operator_notice(message: str) -> None:
@@ -6198,6 +7437,28 @@ def _operator_notice(message: str) -> None:
             print(message, file=operator_stream, flush=True)
     except OSError:
         return
+
+
+class _JointAngleDisplay:
+    """Rate-limited view of admitted feedback, never a feedback reader."""
+
+    def __init__(self) -> None:
+        self._next_at_sec = -math.inf
+
+    def observe(
+        self, qpos_rad: Sequence[float], *, observed_at_sec: float, phase: str
+    ) -> None:
+        if observed_at_sec < self._next_at_sec:
+            return
+        self._next_at_sec = observed_at_sec + 0.5
+        angles = "  ".join(
+            f"J{index + 1}={math.degrees(value):+8.3f}"
+            for index, value in enumerate(qpos_rad)
+        )
+        _operator_notice(
+            f"[B601] ANGLES phase={phase} unit=deg "
+            f"t={observed_at_sec:.3f}s | {angles}"
+        )
 
 
 def _protective_hold_notice(title: str, *details: str) -> str:
@@ -6221,6 +7482,44 @@ def _signal_handler(stop: dict[str, bool], signum: int, _frame: object) -> None:
         signum == signal.SIGINT and already_requested
     ):
         stop["full_disable_requested"] = True
+
+
+def _console_stop_request(stop: dict[str, bool], action: str) -> None:
+    """Route GUI shutdown through the existing owner flags, never through CAN."""
+
+    if action == "protective_hold":
+        # Repeated browser clicks must not emulate a second Ctrl-C.
+        stop["requested"] = True
+    elif action == "full_disable":
+        stop["requested"] = True
+        stop["full_disable_requested"] = True
+    else:
+        raise ValueError("unsupported console stop action")
+
+
+def _confirm_completed_cycle_disable(
+    torque_console,
+    stop: dict[str, bool],
+    confirmation: dict[str, object],
+    *,
+    confirmed_at_monotonic_sec: float,
+) -> None:
+    """Accept the GUI's explicit final-disable confirmation for a completed cycle."""
+
+    if not getattr(torque_console, "cycle_disable_confirmation_ready", False):
+        raise ValueError(
+            "supported cycle is not complete and ready for GUI disable confirmation"
+        )
+    if confirmation.get("confirmed", False) or stop.get("full_disable_requested", False):
+        raise ValueError("completed-cycle disable confirmation was already consumed")
+    _console_stop_request(stop, "full_disable")
+    confirmation.update(
+        {
+            "confirmed": True,
+            "confirmed_at_monotonic_sec": float(confirmed_at_monotonic_sec),
+            "source": "local_gui",
+        }
+    )
 
 
 def resolve_shutdown_action(
@@ -6439,6 +7738,7 @@ def _run_latched_fault_hold(
     max_iterations: int | None = None,
     recovery_samples_required: int = _DEFAULT_PROTECTIVE_HOLD_RECOVERY_SAMPLES,
     driver_kd_nm_s_per_rad: Sequence[float] = _ZERO_SIX,
+    protective_driver_kd_nm_s_per_rad: Sequence[float] | None = None,
     hold_profile: B601MitControlProfile | None = None,
     operator_interrupt: bool = False,
     fault_entry: bool = False,
@@ -6456,6 +7756,8 @@ def _run_latched_fault_hold(
     gravity_coulomb_velocity_threshold_rad_s: float = 0.0,
     gravity_debug_profile: B601GravityCompensationDebugProfile | None = None,
     feedback_reader: Callable[[], B601HardwareState] | None = None,
+    debug_trace: _DynamicsTrace | None = None,
+    joint_angle_display: _JointAngleDisplay | None = None,
 ) -> tuple[
     int,
     tuple[float, ...],
@@ -6482,6 +7784,10 @@ def _run_latched_fault_hold(
     is retried once; full disable is reserved for an explicit request or when
     neither the live nor cached all-six-joint frame can be sent completely.
     The loop has no time-based release.
+
+    An explicit motion profile may supply protective motor damping separately
+    from the frozen debug baseline. Gravity calibration remains frozen while
+    both live and cached hold frames retain the motion-profile brake.
 
     After a degraded interval, the first valid frame establishes a new
     monitoring baseline.  ``recovery_samples_required`` subsequent valid live
@@ -6513,6 +7819,13 @@ def _run_latched_fault_hold(
         )
         gravity_coulomb_velocity_threshold_rad_s = (
             gravity_debug_profile.gravity_coulomb_velocity_threshold_rad_s
+        )
+    if protective_driver_kd_nm_s_per_rad is not None:
+        # An explicit motion profile owns fault damping independently of the
+        # frozen gravity-tuning baseline. Never clear its brake at handoff.
+        driver_kd_nm_s_per_rad = _non_negative_six(
+            protective_driver_kd_nm_s_per_rad,
+            name="protective_driver_kd_nm_s_per_rad",
         )
     latest_tau = previous_tau
     command_profile = profile if hold_profile is None else hold_profile
@@ -6578,6 +7891,21 @@ def _run_latched_fault_hold(
         )
     )
     telemetry["motor_local_damping_available"] = driver_damping_available
+    software_kd = _six(
+        getattr(command_profile, "damping_kd_nm_s_per_rad", _ZERO_SIX),
+        name="protective_software_kd_nm_s_per_rad",
+    )
+    telemetry["damping_parameter_source"] = (
+        "motion_profile_safety_damping"
+        if protective_driver_kd_nm_s_per_rad is not None
+        else "frozen_debug_run_snapshot" if gravity_debug_profile is not None
+        else "active_controller_arguments"
+    )
+    live_control_notice = (
+        "CONTROL: live gravity compensation and damping are ACTIVE."
+        if driver_damping_available or any(value > 0.0 for value in software_kd)
+        else "CONTROL: live gravity compensation is ACTIVE; damping is NOT configured."
+    )
     degraded_active = False
     recovery_candidate_count = 0
 
@@ -6651,7 +7979,7 @@ def _run_latched_fault_hold(
         _operator_notice(
             _protective_hold_notice(
                 "PROTECTIVE HOLD RECOVERED",
-                "CONTROL: live gravity update and damping have resumed.",
+                live_control_notice,
                 "ARM STATE: joint1..joint6 remain ENABLED in protective hold.",
             )
         )
@@ -6926,7 +8254,7 @@ def _run_latched_fault_hold(
         "CONTROL: DEGRADED cached gravity; damping availability is reported "
         "above."
         if degraded_active
-        else "CONTROL: live gravity compensation and damping are ACTIVE."
+        else live_control_notice
     )
     _operator_notice(
         _protective_hold_notice(
@@ -6934,14 +8262,31 @@ def _run_latched_fault_hold(
             "ARM STATE: joint1..joint6 remain ENABLED; joint7 is outside this "
             "backend.",
             control_state,
+            f"DAMPING: driver Kd={tuple(driver_kd_nm_s_per_rad)}; software Kd={software_kd}.",
             f"PID: {os.getpid()}.",
             "FULL DISABLE: press Ctrl-C again or send SIGUSR1.",
         )
     )
     if gravity_debug_profile is not None:
         _operator_notice(
+            "[B601] GRAVITY DEBUG HOLD: frozen gravity parameters remain active; "
+            "motion-profile safety damping owns live/degraded hold."
+            if protective_driver_kd_nm_s_per_rad is not None else
             "[B601] GRAVITY DEBUG HOLD: frozen tuning parameters remain active "
             "in live/degraded hold; safety limits and full-disable rules are unchanged."
+        )
+    if debug_trace is not None:
+        debug_trace.record(
+            "protective_hold_entry",
+            degraded_entry_reason=degraded_entry_reason,
+            gravity_parameter_source=telemetry["gravity_parameter_source"],
+            driver_kd_nm_s_per_rad=tuple(driver_kd_nm_s_per_rad),
+            software_kd_nm_s_per_rad=software_kd,
+            damping_parameter_source=telemetry["damping_parameter_source"],
+            cached_qpos_rad=cached_q,
+            cached_gravity_tau_nm=cached_gravity,
+            commanded_tau_nm=latest_tau,
+            state=telemetry["state"],
         )
     period = 1.0 / _positive(rate_hz, name="rate_hz")
     monitor_q = _six(measured_qpos, name="fault_measured_qpos_rad")
@@ -6970,6 +8315,8 @@ def _run_latched_fault_hold(
         ] | None = None
         cycle_failures: tuple[str, ...] = ()
         baseline_sample = False
+        trace_feedback_qpos: tuple[float, ...] | None = None
+        trace_feedback_qvel: tuple[float, ...] | None = None
         try:
             state = (
                 backend.poll_feedback(request_feedback=True)
@@ -6990,6 +8337,7 @@ def _run_latched_fault_hold(
                 state.positions_rad,
                 name="protective_hold_feedback_qpos_rad",
             )
+            trace_feedback_qpos = current_q
             if monitor_baseline_pending:
                 baseline_sample = True
                 # The first post-interrupt sample spans the transition from
@@ -7012,6 +8360,7 @@ def _run_latched_fault_hold(
                 monitor_observed_at = observed_at
                 monitor_baseline_pending = False
                 monitor_qvel = _ZERO_SIX
+                trace_feedback_qvel = monitor_qvel
             else:
                 monitor_dt = observed_at - monitor_observed_at
                 if not math.isfinite(monitor_dt) or monitor_dt <= 0.0:
@@ -7026,6 +8375,7 @@ def _run_latched_fault_hold(
                         strict=True,
                     )
                 )
+                trace_feedback_qvel = monitor_qvel
                 if monitor_acceleration_limit is not None:
                     monitor_qacc = tuple(
                         (current - previous) / monitor_dt
@@ -7097,6 +8447,12 @@ def _run_latched_fault_hold(
             )
             monitor_observed_at = observed_at
             telemetry["command_count"] = int(telemetry["command_count"]) + 1
+            if joint_angle_display is not None:
+                joint_angle_display.observe(
+                    state.positions_rad,
+                    observed_at_sec=observed_at,
+                    phase="PROTECTIVE_HOLD",
+                )
             if degraded_active:
                 if baseline_sample:
                     telemetry["state"] = "RECOVERY_BASELINE"
@@ -7138,6 +8494,20 @@ def _run_latched_fault_hold(
             _receipt, latest_tau, cached_gravity = cached_result
             hold_commands += 1
             telemetry["command_count"] = int(telemetry["command_count"]) + 1
+        if debug_trace is not None:
+            debug_trace.record(
+                "protective_hold_cycle",
+                state=telemetry["state"],
+                transition=telemetry["last_transition"],
+                command_source="live" if cycle_result is not None else "cached_gravity",
+                feedback_qpos_rad=trace_feedback_qpos,
+                feedback_qvel_fd_rad_s=trace_feedback_qvel,
+                cached_qpos_rad=cached_q,
+                cached_gravity_tau_nm=cached_gravity,
+                commanded_tau_nm=latest_tau,
+                cycle_error=None if cycle_error is None else str(cycle_error),
+                command_count=telemetry["command_count"],
+            )
         if max_iterations is not None and hold_commands >= max_iterations:
             break
         time.sleep(period)
@@ -7173,11 +8543,29 @@ def run_probe(
     shared_control_runtime: B601SharedControlRuntime | None = None,
     shared_control_commissioning: B601SingleJointAssistSession | None = None,
     cartesian_assist_commissioning: B601CartesianAssistSession | None = None,
+    debug_trace: _DynamicsTrace | None = None,
+    torque_console: _TorqueConsoleController | None = None,
+    console_stop_binding: Callable[[Callable[[str], None] | None], None] | None = None,
 ) -> dict[str, object]:
     """Run the guarded active probe; callers must provide explicit authority."""
 
+    if torque_console is not None and getattr(torque_console, "hardware_execution_allowed", True) is False:
+        raise LowGainProbeError("offline calibration adapter is not a hardware console")
     _validate_cli(args)
     _validate_shared_control_integration(args, shared_control_runtime)
+    joint_angle_display = (
+        _JointAngleDisplay() if getattr(args, "show_joint_angles", False) else None
+    )
+    if (torque_console is None) != (not getattr(args, "torque_console", False)):
+        raise LowGainProbeError("torque console flag and owner session must agree")
+    if torque_console is not None and (
+        shared_control_runtime is not None
+        or shared_control_commissioning is not None
+        or cartesian_assist_commissioning is not None
+    ):
+        raise LowGainProbeError("torque console must be the only assist source")
+    if torque_console is not None and debug_trace is None:
+        raise LowGainProbeError("torque console requires a dynamics trace")
     if shared_control_commissioning is not None:
         if shared_control_runtime is None:
             raise LowGainProbeError(
@@ -7226,7 +8614,11 @@ def run_probe(
         name="gravity_coulomb_friction_nm",
     )
     gravity_coulomb_velocity_threshold_rad_s = _non_negative(
-        getattr(args, "gravity_coulomb_velocity_threshold_rad_s", 0.0),
+        getattr(
+            args,
+            "gravity_coulomb_velocity_threshold_rad_s",
+            _DEFAULT_GRAVITY_COULOMB_VELOCITY_THRESHOLD_RAD_S,
+        ),
         name="gravity_coulomb_velocity_threshold_rad_s",
     )
     gravity_scale = _non_negative(args.gravity_scale, name="gravity_scale")
@@ -7308,7 +8700,14 @@ def run_probe(
             position_limits=position_limits,
             torque_limits_nm=torque_limits,
         )
-    if shared_control_runtime is not None:
+    if torque_console is not None:
+        cap = torque_console.limits.max_abs_assist_nm
+        if any(cap > limit for limit in torque_limits):
+            raise LowGainProbeError(
+                "torque console assist cap exceeds a selectable joint's final torque envelope"
+            )
+        overlay_limits = (cap,) * 6
+    elif shared_control_runtime is not None:
         overlay_limits = _shared_control_overlay_limits(
             shared_control_runtime,
             total_torque_limits_nm=torque_limits,
@@ -7347,6 +8746,38 @@ def run_probe(
         position_limits_rad=position_limits,
         feedback_position_limits_rad=feedback_position_limits,
     )
+    calibration_context_profile = None
+    if debug_trace is not None:
+        # Capture resolved values once, before connecting. An offline fitter
+        # must not infer a gravity profile from command amplitudes or filenames.
+        calibration_context_profile = {
+            "config_sha256": hashlib.sha256(config_path.read_bytes()).hexdigest(),
+            "urdf_sha256": hashlib.sha256(model.urdf_path.read_bytes()).hexdigest(),
+            "gravity_scale": gravity_scale, "gravity_joint_scales": gravity_joint_scales,
+            "gravity_joint_offsets_rad": gravity_joint_offsets_rad, "gravity_joint_bias_nm": gravity_joint_bias_nm,
+            "gravity_coulomb_friction_nm": gravity_coulomb_friction_nm,
+            "gravity_coulomb_velocity_threshold_rad_s": gravity_coulomb_velocity_threshold_rad_s,
+            "driver_kd_nm_s_per_rad": driver_kd_nm_s_per_rad,
+        }
+        debug_trace.record(
+            "calibration_context",
+            schema="b601.command-calibration-context.v1",
+            profile=calibration_context_profile,
+            physical_load_source="not_independently_measured_run_local_only",
+            planning_limits={
+                "position_limits_rad": position_limits,
+                "joint_velocity_guard_rad_s": (
+                    torque_console.limits.max_joint_velocity_rad_s
+                    if torque_console is not None else args.velocity_abort_rad_s
+                ),
+            },
+        )
+    if getattr(args, "torque_console_auto_calibration_profile", None) is not None:
+        from robot_motion.rebot_b601_rs.calibration import CalibrationCondition
+        torque_console.configure_context(
+            CalibrationCondition.from_mapping(calibration_context_profile, run_id=str(args.output.resolve().parent)),
+            position_limits,
+        )
     startup_lock_vendor_kp_nm_per_rad = tuple(
         joint.mit_kp for joint in config.joints
     )
@@ -7360,9 +8791,16 @@ def run_probe(
         torque_rise_time_sec=args.torque_rise_time_sec,
         velocity_limit_rad_s=args.velocity_abort_rad_s,
     )
+    protective_motion_driver_kd = _motion_protective_driver_kd(
+        getattr(torque_console, "settings", None), driver_kd_nm_s_per_rad,
+    )
+    protective_driver_kd = (
+        driver_kd_nm_s_per_rad if protective_motion_driver_kd is None
+        else protective_motion_driver_kd
+    )
     protective_hold_profile = build_protective_hold_profile(
         startup_lock_profile,
-        driver_kd_nm_s_per_rad=driver_kd_nm_s_per_rad,
+        driver_kd_nm_s_per_rad=protective_driver_kd,
         default_damping_kd_nm_s_per_rad=getattr(
             args,
             "protective_hold_kd",
@@ -7370,6 +8808,11 @@ def run_probe(
         ),
         preserve_zero_driver_damping=gravity_debug_profile is not None,
     )
+    if protective_motion_driver_kd is not None:
+        protective_hold_profile = replace(protective_hold_profile, metadata={
+            **protective_hold_profile.metadata,
+            "gain_source": "motion_profile_safety_damping",
+        })
     backend = B601RSBackend(config)
     ledger = FrequencyLedger()
     active_joint_names = resolve_active_joint_names()
@@ -7377,9 +8820,15 @@ def run_probe(
         name for name in active_joint_names if name != args.joint
     )
     stop = {"requested": False, "full_disable_requested": False}
+    cycle_disable_confirmation: dict[str, object] = {
+        "confirmed": False,
+        "confirmed_at_monotonic_sec": None,
+        "source": None,
+    }
     previous_q: tuple[float, ...] | None = None
     previous_feedback_time: float | None = None
     previous_guard_qvel: tuple[float, ...] | None = None
+    previous_velocity_diagnostic_state: B601HardwareState | None = None
     previous_tau = _ZERO_SIX
     previous_cartesian_assist_overlay = _ZERO_SIX
     last_verified_gravity_tau: tuple[float, ...] | None = None
@@ -7414,14 +8863,13 @@ def run_probe(
     motion_rejection_confirmed_abort_count = 0
     backend_feedback_diagnostics: tuple[dict[str, object], ...] = ()
     startup_diagnostic_observations: list[dict[str, object]] = []
-    samples: list[dict[str, object]] = []
+    samples = _ProbeSampleArchive()
     stop_reason: str | None = None
     control_completion_reason: str | None = None
-    assist_commissioning_response: dict[str, object] | None = None
-    cartesian_assist_commissioning_response: dict[str, object] | None = None
     assist_guard_rejection: dict[str, object] | None = None
     cartesian_assist_guard_rejection: dict[str, object] | None = None
     primary_error: Exception | None = None
+    cycle_timing = None
     preflight_disable: B601ModeReceipt | None = None
     mode_receipt: B601ModeReceipt | None = None
     enable_receipt: B601ModeReceipt | None = None
@@ -7522,8 +8970,14 @@ def run_probe(
         if feedback_source == "active-report"
         else None
     )
+    # Parameter reads never enter the advancing-Type-24 wait. Preserve that
+    # path's lack of an active-report timeout dependency, including recovery.
+    advance_timeout_sec = config.feedback_timeout_sec if active_report_gate is not None else 0.0
     if gravity_debug_profile is not None:
         _operator_notice(
+            "[B601] GRAVITY DEBUG MODE: frozen gravity/base-driver-Kd parameters; "
+            "motion-profile safety damping owns protective/degraded hold."
+            if protective_motion_driver_kd is not None else
             "[B601] GRAVITY DEBUG MODE: this run freezes gravity/driver-Kd "
             "parameters through protective/degraded hold; safety limits and "
             "full-disable rules are unchanged."
@@ -7537,43 +8991,6 @@ def run_probe(
         startup_state_history.append(state)
         _operator_notice(f"[B601] STARTUP {state}")
 
-    def poll_control_feedback() -> tuple[B601HardwareState, bool]:
-        """Read one configured feedback source and enforce its control gate."""
-
-        if active_report_gate is None:
-            return backend.poll_feedback(request_feedback=True), True
-        state = backend.poll_feedback(require_host_freshness=True)
-        try:
-            advanced = active_report_gate.observe(state)
-        except (TypeError, ValueError) as exc:
-            raise LowGainProbeError(
-                f"active-report feedback rejected: {exc}"
-            ) from exc
-        return state, advanced
-
-    def read_admitted_control_feedback() -> B601HardwareState:
-        if active_report_gate is None:
-            state, _advanced = poll_control_feedback()
-            return state
-        deadline = time.monotonic() + config.feedback_timeout_sec
-        last_error: LowGainProbeError | None = None
-        while time.monotonic() <= deadline:
-            try:
-                state, advanced = poll_control_feedback()
-            except LowGainProbeError as exc:
-                last_error = exc
-            else:
-                if advanced:
-                    return state
-                last_error = LowGainProbeError(
-                    "active-report feedback established a baseline but did not yet advance"
-                )
-            time.sleep(0.001)
-        raise LowGainProbeError(
-            "no advancing complete Type-24 snapshot arrived within "
-            f"{config.feedback_timeout_sec:.6f}s: {last_error}"
-        )
-
     signal.signal(
         signal.SIGINT,
         lambda signum, frame: _signal_handler(stop, signum, frame),
@@ -7583,6 +9000,25 @@ def run_probe(
         lambda signum, frame: _signal_handler(stop, signum, frame),
     )
     try:
+        if console_stop_binding is not None:
+            def request_console_stop(action: str) -> None:
+                if action == "confirm_cycle_full_disable":
+                    _confirm_completed_cycle_disable(
+                        torque_console,
+                        stop,
+                        cycle_disable_confirmation,
+                        confirmed_at_monotonic_sec=time.monotonic(),
+                    )
+                else:
+                    _console_stop_request(stop, action)
+                _operator_notice(
+                    "[B601] GUI confirmed completed-cycle full disable; "
+                    "owner shutdown protocol is active."
+                    if action == "confirm_cycle_full_disable"
+                    else f"[B601] GUI requested {action}; owner shutdown protocol is active."
+                )
+
+            console_stop_binding(request_console_stop)
         if (
             calibration_capture is not None
             or startup_replay_capture is not None
@@ -7625,7 +9061,7 @@ def run_probe(
             if stop["requested"]:
                 raise LowGainProbeError("operator interrupt before motor enable")
             try:
-                warmup_state, warmup_feedback_advanced = poll_control_feedback()
+                warmup_state, warmup_feedback_advanced = _poll_control_feedback(backend, active_report_gate)
             except LowGainProbeError:
                 time.sleep(0.01)
                 continue
@@ -7733,7 +9169,7 @@ def run_probe(
             raise LowGainProbeError(
                 "operator interrupt immediately after motor enable"
             )
-        arming_state = read_admitted_control_feedback()
+        arming_state = _read_admitted_control_feedback(backend, active_report_gate, advance_timeout_sec)
         arming_observed_at_sec = time.monotonic()
         if (
             not arming_state.valid
@@ -7898,7 +9334,7 @@ def run_probe(
             if stop["requested"]:
                 stop_reason = "operator_interrupt during arming settle"
                 break
-            settle_state = read_admitted_control_feedback()
+            settle_state = _read_admitted_control_feedback(backend, active_report_gate, advance_timeout_sec)
             settle_observed_at_sec = time.monotonic()
             if (
                 not settle_state.valid
@@ -8084,6 +9520,8 @@ def run_probe(
         period = 1.0 / args.rate_hz
         started = time.monotonic()
         next_deadline = started
+        torque_console_ready_notice = False
+        cycle_completion_notice_sent = False
         while stop_reason is None and time.monotonic() - started < args.duration_sec:
             fault_qpos_for_hold = None
             fault_qvel_for_hold = None
@@ -8094,11 +9532,33 @@ def run_probe(
             if stop["requested"]:
                 stop_reason = "operator_interrupt"
                 break
+            if torque_console is not None and debug_trace is not None and debug_trace.error:
+                stop_reason = f"torque console dynamics trace failed: {debug_trace.error}"
+                break
+            if active_report_gate is not None:
+                next_deadline = _active_report_feedback_deadline(
+                    next_deadline,
+                    previous_feedback_timestamp_sec=previous_feedback_time,
+                    period_sec=period,
+                )
             now = time.monotonic()
+            cycle_timing = _ProbeStageTiming() if debug_trace is not None else None
+            requested_schedule_wait_sec = max(0.0, next_deadline - now)
             if now < next_deadline:
                 time.sleep(next_deadline - now)
-            state = read_admitted_control_feedback()
-            observed_at_sec = time.monotonic()
+            if cycle_timing is not None:
+                cycle_timing.mark("schedule_wait")
+            feedback_diagnostics = _ProbeFeedbackTiming() if debug_trace is not None else None
+            try:
+                state = _read_admitted_control_feedback(
+                    backend, active_report_gate, advance_timeout_sec, feedback_diagnostics,
+                )
+                observed_at_sec = time.monotonic()
+            finally:
+                if debug_trace is not None:
+                    debug_trace.last_feedback_read_diagnostics = feedback_diagnostics
+            if cycle_timing is not None:
+                cycle_timing.mark("feedback_read_and_admission")
             ledger.mark("feedback", state.receive_timestamp_sec)
             if not state.valid or state.positions_rad is None:
                 stop_reason = state.fault_reason or "invalid feedback snapshot"
@@ -8214,6 +9674,15 @@ def run_probe(
                 }
                 rejected_motion_sample_count += 1
                 break
+            velocity_timebase = None
+            velocity_vendor_status = None
+            if debug_trace is not None:
+                velocity_vendor_status = vendor_status_cache_diagnostics(state)
+                velocity_timebase = feedback_velocity_timebase_diagnostics(
+                    state, previous_velocity_diagnostic_state,
+                    qpos_rad=q, previous_qpos_rad=previous_q,
+                    snapshot_dt_sec=dt, raw_qvel_rad_s=qvel,
+                )
             try:
                 qacc, motion_rejection = evaluate_feedback_motion_guard(
                     sequence=state.sequence,
@@ -8257,6 +9726,17 @@ def run_probe(
                 if motion_rejection_action == "quarantine":
                     last_quarantined_motion_sample = motion_rejection
                     motion_rejection_quarantine_count += 1
+                    if debug_trace is not None:
+                        debug_trace.record(
+                            "active_rejection",
+                            action="quarantine",
+                            rejection=motion_rejection,
+                            last_dispatched_tau_nm=previous_tau,
+                            last_verified_gravity_tau_nm=last_verified_gravity_tau,
+                            velocity_timebase=velocity_timebase,
+                            vendor_status_diagnostic_only=velocity_vendor_status,
+                            feedback_read_diagnostics=feedback_diagnostics.snapshot(),
+                        )
                     print(
                         "[B601] motion sample quarantined; no command dispatched: "
                         f"{motion_rejection['reason']}",
@@ -8333,6 +9813,31 @@ def run_probe(
                 set_startup_state("HANDOFF")
             else:
                 set_startup_state("ACTIVE")
+                if torque_console is not None:
+                    torque_console.owner_ready()
+                    if not torque_console_ready_notice:
+                        if getattr(args, "torque_console_auto_calibration_profile", None) is not None:
+                            ready_notice = (
+                                "[B601] [AUTOMATIC CALIBRATION READY] gravity only; "
+                                "choose the GUI mode when available, declare no human intervention, then press Start. "
+                                "The selected GUI mode drives J3, or J2/J3 when workspace acquisition is configured; keep E-stop ready."
+                            )
+                        elif args.torque_console_staged_assist:
+                            ready_notice = (
+                                "[B601] [STAGED TORQUE CONSOLE READY] gravity and damping only; "
+                                "prepare from a stationary pose, set a relative target, "
+                                "feel the CUE, then explicitly authorize one breakaway pulse. "
+                                "There is no automatic human-contact detector."
+                            )
+                        else:
+                            ready_notice = (
+                                "[B601] [TORQUE CONSOLE READY] gravity and damping only; "
+                                "open the local GUI, release the arm, then arm assist "
+                                "from a stationary pose. Ctrl-C retains the usual "
+                                "protective-hold protocol."
+                            )
+                        _operator_notice(ready_notice)
+                        torque_console_ready_notice = True
             if (
                 pose_axis_guide is not None
                 and handoff_fraction >= 1.0
@@ -8571,8 +10076,24 @@ def run_probe(
                         f"{config_value.maximum_static_force_n:.3f}N "
                         "joint_torque_cap="
                         f"{config_value.max_abs_joint_torque_nm:.3f}Nm "
+                        "rise_slew="
+                        f"{config_value.max_joint_torque_rate_nm_s:.3f}Nm/s "
+                        "release_slew="
+                        f"{config_value.max_joint_torque_release_rate_nm_s:.3f}Nm/s "
+                        "breakaway="
+                        f"{'enabled' if config_value.breakaway.enabled else 'disabled'} "
                         f"duration={config_value.assist_duration_sec:.3f}s"
                     )
+                    if config_value.breakaway.enabled:
+                        _operator_notice(
+                            "[B601] [CARTESIAN BREAKAWAY] "
+                            "positive_j2_j3="
+                            f"{config_value.breakaway.positive_torque_nm[1:3]}Nm "
+                            "negative_j2_j3="
+                            f"{config_value.breakaway.negative_torque_nm[1:3]}Nm "
+                            "velocity_fade="
+                            f"{config_value.breakaway.velocity_fade_rad_s:.4f}rad/s"
+                        )
                 keys = (
                     operator_keys.poll_keys()
                     if operator_keys is not None
@@ -8816,6 +10337,10 @@ def run_probe(
                 )
                 qref = shared_reference.qpos_rad
                 qvel_ref = shared_reference.qvel_rad_s
+            if torque_console is not None and handoff_fraction >= 1.0:
+                # Direct torque commissioning has no fixed position reference.
+                qref = q
+                qvel_ref = _ZERO_SIX
             max_error = max(
                 abs(current - reference)
                 for index, (current, reference) in enumerate(
@@ -8829,6 +10354,8 @@ def run_probe(
                     f"> {args.max_error_rad:.6f} rad"
                 )
                 break
+            if cycle_timing is not None:
+                cycle_timing.mark("guards_and_reference")
             cartesian_audit: dict[str, object] | None = None
             pose_audit: dict[str, object] | None = None
             cartesian_assist_audit: dict[str, object] | None = None
@@ -8837,7 +10364,71 @@ def run_probe(
                 if shared_reference is not None
                 else _ZERO_SIX
             )
-            if cartesian_assist_commissioning is not None:
+            torque_console_audit: dict[str, object] | None = None
+            if torque_console is not None and handoff_fraction >= 1.0:
+                if getattr(args, "torque_console_auto_calibration_profile", None) is not None and debug_trace.error is not None:
+                    torque_console.recording_failed(debug_trace.error)
+                try:
+                    console_qvel = _torque_console_feedback_velocity(torque_console, qvel, velocity_timebase)
+                except LowGainProbeError as exc:
+                    if debug_trace is not None:
+                        cycle_timing.mark("console_velocity_rejection")
+                        debug_trace.record("torque_console_velocity_rejected", reason=str(exc),
+                            sequence=state.sequence, feedback_timestamp_sec=state.receive_timestamp_sec,
+                            velocity_timebase=velocity_timebase, command_dispatched=False,
+                            cycle_timing=cycle_timing.snapshot(),
+                            feedback_read_diagnostics=feedback_diagnostics.snapshot(),
+                            requested_schedule_wait_sec=requested_schedule_wait_sec,
+                            previous_trace_record_timing=debug_trace.last_record_timing)
+                    raise
+                if getattr(getattr(torque_console, "config", None), "feedback_velocity_timebase", "snapshot") == "joint_receive":
+                    maximum_gap = torque_console.settings.staged_assist.motion_control.max_control_gap_sec
+                    long_intervals = {
+                        row["joint_name"]: row["joint_receive_dt_sec"]
+                        for row in velocity_timebase["joint_observations"]
+                        if row["joint_receive_dt_sec"] > maximum_gap
+                    }
+                    if long_intervals:
+                        velocity_timebase = {**velocity_timebase, "receive_interval_warning": {
+                            "severity": "warning", "action": "continue_with_valid_paired_velocity",
+                            "reason": "asynchronous_receive_interval_exceeds_snapshot_watchdog",
+                            "snapshot_dt_sec": velocity_timebase["snapshot_dt_sec"],
+                            "joint_receive_intervals_sec": long_intervals,
+                            "snapshot_and_feedback_age_limits_sec": maximum_gap,
+                        }}
+                joint_torque_overlay_nm, torque_console_audit = torque_console.step(
+                    now_sec=state.receive_timestamp_sec,
+                    qpos_rad=q,
+                    qvel_rad_s=console_qvel,
+                    **({"feedback_sequence": state.sequence, "control_now_sec": time.monotonic()}
+                       if getattr(args, "torque_console_auto_calibration_profile", None) is not None else {}),
+                )
+                torque_console_audit["feedback_velocity_timebase"] = getattr(
+                    getattr(torque_console, "config", None), "feedback_velocity_timebase", "snapshot")
+                torque_console_audit["snapshot_qvel_fd_rad_s"] = tuple(qvel)
+                if torque_console_audit["feedback_velocity_timebase"] == "joint_receive":
+                    velocity_timebase = {**velocity_timebase,
+                        "role": "paired_receive_metadata_used_for_explicit_console_velocity"}
+                if torque_console_audit["phase"] == "fault":
+                    if debug_trace is not None:
+                        debug_trace.record(
+                            "torque_console_guard", **torque_console_audit,
+                            sequence=state.sequence,
+                            feedback_timestamp_sec=state.receive_timestamp_sec,
+                            feedback_dt_sec=dt,
+                            previous_feedback_timestamp_sec=previous_feedback_time,
+                            previous_qpos_rad=previous_q,
+                            velocity_timebase=velocity_timebase,
+                            vendor_status_diagnostic_only=velocity_vendor_status,
+                            feedback_read_diagnostics=feedback_diagnostics.snapshot(),
+                        )
+                    stop_reason = (
+                        "torque console guard withdrew assist: "
+                        f"{torque_console_audit['fault']}"
+                    )
+                    _operator_notice(f"[B601] {stop_reason}")
+                    break
+            elif cartesian_assist_commissioning is not None:
                 joint_torque_overlay_nm, cartesian_assist_audit = (
                     compute_cartesian_assist_overlay(
                         model,
@@ -8894,6 +10485,8 @@ def run_probe(
                 qvel_rad_s=qvel_ref,
                 joint_torque_overlay_nm=joint_torque_overlay_nm,
             )
+            if cycle_timing is not None:
+                cycle_timing.mark("overlay_and_reference")
             target_torque_breakdown = compute_software_torque_breakdown(
                 model,
                 reference=reference,
@@ -8909,6 +10502,8 @@ def run_probe(
                     gravity_coulomb_velocity_threshold_rad_s
                 ),
             )
+            if cycle_timing is not None:
+                cycle_timing.mark("gravity_and_active_torque")
             # Gravity is present at its requested scale from the first active
             # frame.  The total-torque conditioner below is the single startup
             # slew; applying a second scalar gravity ramp here would create a
@@ -8931,20 +10526,15 @@ def run_probe(
                 qpos_rad=lock_reference_qpos,
                 qvel_rad_s=_ZERO_SIX,
             )
-            startup_lock_torque_breakdown = compute_software_torque_breakdown(
-                model,
-                reference=startup_lock_reference,
+            # Both controllers consume the same measured q/qvel and frozen
+            # gravity calibration in this physical tick. Reuse that vector,
+            # not a cached value from an earlier tick or a different pose.
+            startup_lock_torque_breakdown = compute_b601_mit_torque(
+                startup_lock_reference,
+                startup_lock_profile,
                 measured_qpos_rad=q,
                 measured_qvel_rad_s=qvel,
-                profile=startup_lock_profile,
-                gravity_scale=gravity_scale,
-                gravity_joint_scales=gravity_joint_scales,
-                gravity_joint_offsets_rad=gravity_joint_offsets_rad,
-                gravity_joint_bias_nm=gravity_joint_bias_nm,
-                gravity_coulomb_friction_nm=gravity_coulomb_friction_nm,
-                gravity_coulomb_velocity_threshold_rad_s=(
-                    gravity_coulomb_velocity_threshold_rad_s
-                ),
+                gravity_torque_nm=target_torque_breakdown.gravity_torque_nm,
             )
             effective_handoff_fraction = (
                 1.0 - replay_lock_fraction
@@ -8953,6 +10543,9 @@ def run_probe(
                 else handoff_fraction
             )
             driver_lock_fraction = 1.0 - effective_handoff_fraction
+            active_driver_kd = driver_kd_nm_s_per_rad
+            if torque_console_audit is not None and args.torque_console_staged_assist:
+                active_driver_kd = _motion_console_driver_kd(torque_console, driver_kd_nm_s_per_rad)
             driver_command = resolve_driver_local_lock_command(
                 lock_reference_qpos_rad=lock_reference_qpos,
                 active_reference_qpos_rad=reference.qpos_rad,
@@ -8960,7 +10553,7 @@ def run_probe(
                 position_limits_rad=position_limits,
                 lock_kp_nm_per_rad=startup_lock_vendor_kp_nm_per_rad,
                 lock_kd_nm_s_per_rad=startup_lock_vendor_kd_nm_s_per_rad,
-                active_kd_nm_s_per_rad=driver_kd_nm_s_per_rad,
+                active_kd_nm_s_per_rad=active_driver_kd,
                 lock_fraction=driver_lock_fraction,
             )
             torque_breakdown = blend_startup_lock_torque_breakdown(
@@ -8977,6 +10570,24 @@ def run_probe(
                 max_rate_nm_s=profile.max_torque_rate_nm_s,
                 dt_sec=dt,
             )
+            if torque_console_audit is not None and args.torque_console_staged_assist and driver_lock_fraction == 0.0:
+                driver_command = replace(
+                    driver_command,
+                    kd_nm_s_per_rad=_motion_console_driver_kd(
+                        torque_console, driver_kd_nm_s_per_rad,
+                        final_command_delta_nm=tuple(
+                            final-gravity for final, gravity in zip(conditioned_tau, torque_breakdown.gravity_torque_nm)
+                        ),
+                    ),
+                )
+            torque_conditioning_audit = torque_conditioning_sample_diagnostics(
+                requested_tau,
+                previous_tau,
+                conditioned_tau,
+                absolute_limits_nm=torque_limits,
+                max_rate_nm_s=profile.max_torque_rate_nm_s,
+                dt_sec=dt,
+            )
             compute_time = time.monotonic()
             ledger.mark("compute", compute_time)
             dispatch_reference = build_reference(
@@ -8986,6 +10597,18 @@ def run_probe(
                 qvel_rad_s=driver_command.reference_qvel_rad_s,
                 joint_torque_overlay_nm=reference.joint_torque_overlay_nm,
             )
+            if cycle_timing is not None:
+                cycle_timing.mark("lock_composition_and_conditioning")
+            if (args.torque_console_onset_probe or getattr(args, "torque_console_auto_calibration_profile", None) is not None) and torque_console is not None:
+                torque_console.validate_final_command(
+                    gravity_nm=torque_breakdown.gravity_torque_nm,
+                    total_nm=conditioned_tau,
+                )
+            if getattr(args, "torque_console_auto_calibration_profile", None) is not None and torque_console_audit is not None:
+                torque_console.validate_dispatch_start(
+                    feedback_sequence=state.sequence,
+                    feedback_timestamp_sec=state.receive_timestamp_sec,
+                )
             receipt = backend.send_mit(
                 dispatch_reference,
                 # The temporary lock runs in the drive's high-rate MIT loop.
@@ -8997,14 +10620,67 @@ def run_probe(
                 torque_limits_nm=torque_limits,
                 joint_names=active_joint_names,
             )
-            if not receipt.accepted:
+            if cycle_timing is not None:
+                cycle_timing.mark("six_joint_dispatch")
+            if not receipt.accepted and not (
+                getattr(args, "torque_console_auto_calibration_profile", None) is not None
+                and torque_console_audit is not None
+            ):
                 stop_reason = "; ".join(receipt.errors) or "incomplete MIT dispatch"
                 break
+            # Automatic acquisition records a rejected native receipt before
+            # raising; it must not disappear at this earlier accepted gate.
+            if torque_console is not None and torque_console_audit is not None:
+                selected_joint = str(torque_console_audit["joint_name"])
+                selected_index = _ALL_JOINTS.index(selected_joint)
+                torque_console.record_dispatch(
+                    joint_name=selected_joint,
+                    receipt_sequence=receipt.sequence,
+                    feedback_timestamp_sec=state.receive_timestamp_sec,
+                    overlay_after_profile_nm=torque_breakdown.overlay_effective_nm[
+                        selected_index
+                    ],
+                    gravity_nm=torque_breakdown.gravity_torque_nm[selected_index],
+                    requested_total_nm=requested_tau[selected_index],
+                    conditioned_total_nm=conditioned_tau[selected_index],
+                    joint_commands={
+                        "gravity_nm": torque_breakdown.gravity_torque_nm,
+                        "overlay_nm": torque_breakdown.overlay_effective_nm,
+                        "total_nm": conditioned_tau,
+                        **({"driver_kd_nm_s_per_rad": driver_command.kd_nm_s_per_rad} if args.torque_console_staged_assist else {}),
+                    },
+                    **({"completed_at_sec": receipt.completed_at_sec}
+                       if args.torque_console_staged_assist or args.torque_console_quantized_velocity_debug else {}),
+                    **({"torque_rate_nm_s": profile.max_torque_rate_nm_s}
+                       if args.torque_console_staged_assist else {}),
+                    **({"native_receipt": _command_receipt_payload(receipt)}
+                       if getattr(args, "torque_console_auto_calibration_profile", None) is not None else {}),
+                )
+                if (
+                    not cycle_completion_notice_sent
+                    and getattr(torque_console, "cycle_disable_confirmation_ready", False)
+                ):
+                    _operator_notice(
+                        "[B601] AUTOMATIC CYCLE COMPLETE: supported origin, final zero assist and base damping confirmed; "
+                        "gravity/damping hold continues until the operator confirms full disable in the GUI."
+                    )
+                    cycle_completion_notice_sent = True
+                torque_console_audit = {
+                    **torque_console_audit,
+                    "overlay_after_profile_nm": torque_breakdown.overlay_effective_nm[
+                        selected_index
+                    ],
+                    "gravity_nm": torque_breakdown.gravity_torque_nm[selected_index],
+                    "requested_total_nm": requested_tau[selected_index],
+                    "conditioned_total_nm": conditioned_tau[selected_index],
+                }
             ledger.mark("tx", receipt.completed_at_sec)
             commands_sent += 1
             torque_limit_count += int(torque_limited)
             slew_limit_count += int(slew_limited)
             overlay_limit_count += int(torque_breakdown.overlay_limited)
+            if cycle_timing is not None:
+                cycle_timing.mark("dispatch_observers")
             operator_guide_sample = (
                 pose_axis_guide.sample_metadata(elapsed_sec=elapsed)
                 if pose_axis_guide is not None
@@ -9029,6 +10705,7 @@ def run_probe(
                     "dispatch_qref_rad": dispatch_reference.qpos_rad,
                     "qvel_ref_rad_s": qvel_ref,
                     "shared_control": shared_control_audit,
+                    "torque_console": torque_console_audit,
                     "shared_control_commissioning_state": (
                         shared_control_commissioning.state.value
                         if shared_control_commissioning is not None
@@ -9112,6 +10789,7 @@ def run_probe(
                     "conditioned_tau_nm": conditioned_tau,
                     "torque_limited": torque_limited,
                     "slew_limited": slew_limited,
+                    "torque_conditioning": torque_conditioning_audit,
                     "fault_hold_candidate_accepted": safe_candidate_q is not None,
                     "fault_hold_candidate_rejection": fault_hold_candidate_rejection,
                     "step_done": step_done,
@@ -9125,13 +10803,68 @@ def run_probe(
                         else None
                     ),
                     "dispatch_receipt": _command_receipt_payload(receipt),
-                    "vendor_status": vendor_status_cache_diagnostics(state),
+                    "vendor_status": (velocity_vendor_status if debug_trace is not None else vendor_status_cache_diagnostics(state)),
+                    **({"velocity_timebase": velocity_timebase} if debug_trace is not None else {}),
                 }
             )
+            if debug_trace is not None:
+                sample = samples[-1]
+                cycle_timing.mark("evidence_capture")
+                sample["feedback_read_diagnostics"] = feedback_diagnostics.snapshot()
+                sample["feedback_read_completed_at_sec"] = observed_at_sec
+                debug_trace.record(
+                    "active_dispatch",
+                    sequence=sample["sequence"],
+                    feedback_timestamp_sec=sample["feedback_timestamp_sec"],
+                    feedback_dt_sec=sample["feedback_dt_sec"],
+                    qpos_rad=sample["qpos_rad"],
+                    qvel_fd_rad_s=sample["qvel_fd_rad_s"],
+                    qacc_fd_rad_s2=sample["qacc_fd_rad_s2"],
+                    startup_state=sample["startup_state"],
+                    gravity_ramp_fraction=sample["gravity_ramp_fraction"],
+                    startup_handoff_fraction=sample["startup_handoff_fraction"],
+                    vendor_kp_nm_per_rad=sample["vendor_kp_nm_per_rad"],
+                    vendor_kd_nm_s_per_rad=sample["vendor_kd_nm_s_per_rad"],
+                    dispatch_receipt=sample["dispatch_receipt"],
+                    gravity_tau_nm=sample["gravity_tau_nm"],
+                    damping_tau_nm=sample["damping_tau_nm"],
+                    overlay_effective_tau_nm=sample["overlay_effective_tau_nm"],
+                    overlay_limited=sample["overlay_limited"],
+                    requested_tau_nm=sample["requested_tau_nm"],
+                    conditioned_tau_nm=sample["conditioned_tau_nm"],
+                    torque_limited=sample["torque_limited"],
+                    slew_limited=sample["slew_limited"],
+                    commanded_power_w=tuple(
+                        float(tau) * float(velocity)
+                        for tau, velocity in zip(conditioned_tau, qvel, strict=True)
+                    ),
+                    cartesian_assist=sample["cartesian_assist"],
+                    torque_console=sample["torque_console"],
+                    host_observation=sample["host_observation"],
+                    vendor_status_diagnostic_only=sample["vendor_status"],
+                    velocity_timebase=sample["velocity_timebase"],
+                    cycle_timing=cycle_timing.snapshot(),
+                    feedback_read_diagnostics=sample["feedback_read_diagnostics"],
+                    feedback_read_completed_at_sec=observed_at_sec,
+                    requested_schedule_wait_sec=requested_schedule_wait_sec,
+                    previous_trace_record_timing=debug_trace.last_record_timing,
+                )
+                cycle_timing.mark("debug_trace")
+                if getattr(args, "torque_console_auto_calibration_profile", None) is not None:
+                    _flush_automatic_calibration_records(torque_console, debug_trace)
+                sample["debug_trace_record_timing"] = debug_trace.last_record_timing
             previous_q = q
             previous_feedback_time = state.receive_timestamp_sec
             previous_guard_qvel = tuple(float(value) for value in qvel)
+            if debug_trace is not None:
+                previous_velocity_diagnostic_state = state
             previous_tau = conditioned_tau
+            if joint_angle_display is not None:
+                joint_angle_display.observe(
+                    raw_q,
+                    observed_at_sec=observed_at_sec,
+                    phase=startup_state_history[-1],
+                )
             last_verified_gravity_tau = _six(
                 torque_breakdown.gravity_torque_nm,
                 name="active_gravity_tau_nm",
@@ -9140,6 +10873,13 @@ def run_probe(
                 last_safe_q = safe_candidate_q
                 last_safe_qvel = tuple(float(value) for value in qvel)
                 last_safe_observed_at_sec = observed_at_sec
+            if cycle_timing is not None:
+                cycle_timing.mark("control_history_update")
+                # JSONL cannot include its own completed write duration. The
+                # result sample contains it; next JSONL frame reports it with
+                # the originating kind/sequence, never as this frame's cost.
+                samples[-1]["control_cycle_timing"] = cycle_timing.snapshot()
+                samples[-1]["requested_schedule_wait_sec"] = requested_schedule_wait_sec
             next_deadline += period
             completed_at = time.monotonic()
             if completed_at > next_deadline:
@@ -9162,6 +10902,19 @@ def run_probe(
                 is B601AssistCommissioningState.COMPLETE
             ):
                 break
+        if debug_trace is not None and stop_reason is not None:
+            debug_trace.record(
+                "active_stop",
+                reason=stop_reason,
+                rejection=(
+                    rejected_motion_sample
+                    if rejected_motion_sample is not None
+                    and rejected_motion_sample.get("reason") == stop_reason
+                    else None
+                ),
+                last_dispatched_tau_nm=previous_tau,
+                last_verified_gravity_tau_nm=last_verified_gravity_tau,
+            )
         if stop_reason is None:
             if (
                 interactive_pose_axis_guide is not None
@@ -9180,25 +10933,9 @@ def run_probe(
             ):
                 stop["requested"] = True
                 control_completion_reason = "single_joint_assist_complete"
-                assist_commissioning_response = (
-                    evaluate_assist_commissioning_response(
-                        session=shared_control_commissioning,
-                        samples=samples,
-                        active_joint_names=active_joint_names,
-                        minimum_response_rad=args.assist_min_response_rad,
-                        maximum_response_ratio=args.assist_max_response_ratio,
-                        maximum_support_drift_rad=(
-                            args.assist_max_support_drift_rad
-                        ),
-                    )
-                )
-                _operator_notice(
-                    format_assist_response_notice(assist_commissioning_response)
-                )
                 _operator_notice(
                     "[B601] ASSIST TRIAL COMPLETE: command flow completed; "
-                    f"mechanical acceptance="
-                    f"{assist_commissioning_response['status']}. Entering "
+                    "mechanical acceptance pending cleanup. Entering "
                     "protective hold with assist zero and no return target. "
                     "Ctrl-C or SIGUSR1 requests final full disable."
                 )
@@ -9209,31 +10946,9 @@ def run_probe(
             ):
                 stop["requested"] = True
                 control_completion_reason = "cartesian_assist_complete"
-                cartesian_assist_commissioning_response = (
-                    evaluate_cartesian_assist_commissioning_response(
-                        session=cartesian_assist_commissioning,
-                        samples=samples,
-                        minimum_response_m=args.cartesian_assist_min_response_m,
-                        maximum_response_ratio=(
-                            args.cartesian_assist_max_response_ratio
-                        ),
-                        maximum_lateral_drift_m=(
-                            args.cartesian_assist_max_lateral_drift_m
-                        ),
-                        maximum_rotation_drift_rad=(
-                            args.cartesian_assist_max_rotation_drift_rad
-                        ),
-                    )
-                )
-                _operator_notice(
-                    format_cartesian_assist_response_notice(
-                        cartesian_assist_commissioning_response
-                    )
-                )
                 _operator_notice(
                     "[B601] CARTESIAN ASSIST TRIAL COMPLETE: command flow "
-                    "completed; mechanical acceptance="
-                    f"{cartesian_assist_commissioning_response['status']}. "
+                    "completed; mechanical acceptance pending cleanup. "
                     "Entering protective hold with assist zero and no return "
                     "target. Ctrl-C or SIGUSR1 requests final full disable."
                 )
@@ -9310,8 +11025,26 @@ def run_probe(
     except Exception as exc:  # noqa: BLE001 - report unexpected probe failure
         primary_error = exc
     finally:
+        if torque_console is not None:
+            # Observer finalization must not bypass the enabled-arm shutdown
+            # path, even when it repeats the original recording failure.
+            try:
+                torque_console.owner_stopped(
+                    now_sec=time.monotonic(),
+                    reason=stop_reason or str(primary_error or "owner_left_active_control"),
+                )
+            except Exception as exc:  # noqa: BLE001 - continue hardware cleanup, retain failure
+                cleanup_errors.append(f"torque console owner_stopped: {type(exc).__name__}: {exc}")
+            if debug_trace is not None and getattr(args, "torque_console_auto_calibration_profile", None) is not None:
+                try:
+                    _flush_automatic_calibration_records(torque_console, debug_trace, cycle_timing)
+                except Exception as exc:  # noqa: BLE001 - recording cannot skip safety cleanup
+                    cleanup_errors.append(f"automatic calibration record flush: {type(exc).__name__}: {exc}")
         if operator_keys is not None:
-            operator_keys.close()
+            try:
+                operator_keys.close()
+            except Exception as exc:  # noqa: BLE001 - terminal cleanup cannot skip drive cleanup
+                cleanup_errors.append(f"operator keys close: {type(exc).__name__}: {exc}")
         full_stop_attempts = 0
 
         def issue_full_safe_stop() -> None:
@@ -9507,6 +11240,22 @@ def run_probe(
                     if hold_age_sec is None:
                         hold_age_sec = math.inf
                     protective_hold_admission_age_sec = hold_age_sec
+                    if debug_trace is not None:
+                        try:
+                            debug_trace.record(
+                                "protective_hold_attempt",
+                                stop_reason=stop_reason,
+                                reference_source=protective_hold_reference_source,
+                                observed_age_sec=(
+                                    hold_age_sec if math.isfinite(hold_age_sec) else None
+                                ),
+                                qpos_rad=hold_qpos,
+                                qvel_rad_s=hold_qvel,
+                                last_dispatched_tau_nm=previous_tau,
+                                last_verified_gravity_tau_nm=last_verified_gravity_tau,
+                            )
+                        except Exception as exc:  # noqa: BLE001 - still attempt the existing hold
+                            cleanup_errors.append(f"protective hold trace: {type(exc).__name__}: {exc}")
                     try:
                         (
                             protective_hold_commands,
@@ -9535,6 +11284,7 @@ def run_probe(
                             rate_hz=args.rate_hz,
                             stop=stop,
                             driver_kd_nm_s_per_rad=driver_kd_nm_s_per_rad,
+                            protective_driver_kd_nm_s_per_rad=protective_motion_driver_kd,
                             hold_profile=protective_hold_profile,
                             # A duration boundary, like an operator transition,
                             # needs a new monitoring baseline on the first hold
@@ -9560,7 +11310,12 @@ def run_probe(
                                 gravity_coulomb_velocity_threshold_rad_s
                             ),
                             gravity_debug_profile=gravity_debug_profile,
-                            feedback_reader=read_admitted_control_feedback,
+                            feedback_reader=partial(
+                                _read_admitted_control_feedback,
+                                backend, active_report_gate, advance_timeout_sec,
+                            ),
+                            debug_trace=debug_trace,
+                            joint_angle_display=joint_angle_display,
                         )
                         cleanup_errors.extend(hold_errors)
                         protective_hold_latched = (
@@ -9638,8 +11393,15 @@ def run_probe(
             backend.close()
         except Exception as exc:  # noqa: BLE001 - preserve cleanup evidence
             cleanup_errors.append(f"close: {exc}")
-        signal.signal(signal.SIGINT, old_sigint)
-        signal.signal(signal.SIGUSR1, old_sigusr1)
+        try:
+            if console_stop_binding is not None:
+                console_stop_binding(None)
+        finally:
+            signal.signal(signal.SIGINT, old_sigint)
+            signal.signal(signal.SIGUSR1, old_sigusr1)
+
+    if debug_trace is not None:
+        debug_trace.finish_control_observation(cleanup_errors=cleanup_errors)
 
     if calibration_capture is not None and calibration_capture.state in (
         "SETTLING",
@@ -9657,6 +11419,15 @@ def run_probe(
             detail += "; cleanup: " + "; ".join(cleanup_errors)
         raise LowGainProbeError(detail) from primary_error
 
+    # Restore once, only after the existing owner cleanup. Repeated lazy
+    # archive traversal otherwise unpickles the entire history for each
+    # evaluator and allocates diagnostic garbage without an online drain.
+    sample_storage = samples.diagnostics()
+    workspace_mode = (torque_console is not None
+        and torque_console.status().get("automatic_calibration", {}).get("operation_mode") == "workspace")
+    result_samples = samples if workspace_mode else samples.materialize()
+    if workspace_mode:
+        sample_storage["result_materialization"] = "streamed_after_cleanup_without_bulk_expansion"
     frequency = ledger.summarize(target_hz=args.rate_hz)
     required_events = ("feedback", "compute", "tx")
     frequency_acceptance = {
@@ -9694,7 +11465,7 @@ def run_probe(
     startup_replay_acceptance = evaluate_startup_replay_capture(
         startup_replay_capture,
         final_qpos_rad=final_q,
-        sample_count=len(samples),
+        sample_count=len(result_samples),
     )
     calibration_passed = calibration_acceptance["status"] in (
         "PASS",
@@ -9716,7 +11487,7 @@ def run_probe(
         step_rad=args.step_rad,
         step_direction=args.step_direction,
         initial_qpos_rad=initial_q,
-        samples=samples,
+        samples=result_samples,
         active_joint_names=active_joint_names,
     )
     response_passed = bool(slow_step_response["passed"])
@@ -9727,33 +11498,30 @@ def run_probe(
             or interactive_pose_axis_guide.completed
         )
     )
-    if assist_commissioning_response is None:
-        assist_commissioning_response = evaluate_assist_commissioning_response(
-            session=shared_control_commissioning,
-            samples=samples,
-            active_joint_names=active_joint_names,
-            minimum_response_rad=args.assist_min_response_rad,
-            maximum_response_ratio=args.assist_max_response_ratio,
-            maximum_support_drift_rad=args.assist_max_support_drift_rad,
-        )
+    # Historical decoding/evaluation must not delay the protective-hold entry.
+    assist_commissioning_response = evaluate_assist_commissioning_response(
+        session=shared_control_commissioning,
+        samples=result_samples,
+        active_joint_names=active_joint_names,
+        minimum_response_rad=args.assist_min_response_rad,
+        maximum_response_ratio=args.assist_max_response_ratio,
+        maximum_support_drift_rad=args.assist_max_support_drift_rad,
+    )
+    if control_completion_reason == "single_joint_assist_complete":
+        _operator_notice(format_assist_response_notice(assist_commissioning_response))
     shared_control_commissioning_passed = bool(
         assist_commissioning_response["passed"]
     )
-    if cartesian_assist_commissioning_response is None:
-        cartesian_assist_commissioning_response = (
-            evaluate_cartesian_assist_commissioning_response(
-                session=cartesian_assist_commissioning,
-                samples=samples,
-                minimum_response_m=args.cartesian_assist_min_response_m,
-                maximum_response_ratio=args.cartesian_assist_max_response_ratio,
-                maximum_lateral_drift_m=(
-                    args.cartesian_assist_max_lateral_drift_m
-                ),
-                maximum_rotation_drift_rad=(
-                    args.cartesian_assist_max_rotation_drift_rad
-                ),
-            )
-        )
+    cartesian_assist_commissioning_response = evaluate_cartesian_assist_commissioning_response(
+        session=cartesian_assist_commissioning,
+        samples=result_samples,
+        minimum_response_m=args.cartesian_assist_min_response_m,
+        maximum_response_ratio=args.cartesian_assist_max_response_ratio,
+        maximum_lateral_drift_m=args.cartesian_assist_max_lateral_drift_m,
+        maximum_rotation_drift_rad=args.cartesian_assist_max_rotation_drift_rad,
+    )
+    if control_completion_reason == "cartesian_assist_complete":
+        _operator_notice(format_cartesian_assist_response_notice(cartesian_assist_commissioning_response))
     cartesian_assist_commissioning_passed = bool(
         cartesian_assist_commissioning_response["passed"]
     )
@@ -9767,18 +11535,22 @@ def run_probe(
         and cartesian_assist_commissioning_passed
     )
     max_abs_requested = max(
-        (max(abs(value) for value in sample["requested_tau_nm"]) for sample in samples),
+        (max(abs(value) for value in sample["requested_tau_nm"]) for sample in result_samples),
         default=0.0,
     )
     max_abs_conditioned = max(
-        (max(abs(value) for value in sample["conditioned_tau_nm"]) for sample in samples),
+        (max(abs(value) for value in sample["conditioned_tau_nm"]) for sample in result_samples),
         default=0.0,
+    )
+    torque_conditioning_summary = summarize_torque_conditioning(
+        result_samples,
+        absolute_limits_nm=torque_limits,
     )
     startup_diagnostics = summarize_startup_diagnostics(
         pre_enable_qpos_rad=pre_enable_q,
         lock_reference_qpos_rad=initial_q,
         pre_control_observations=startup_diagnostic_observations,
-        samples=samples,
+        samples=result_samples,
     )
     if interactive_pose_axis_guide is not None:
         operator_guidance_payload: dict[str, object] = {
@@ -9861,6 +11633,11 @@ def run_probe(
         }
     return {
         "status": "OK" if acceptance_passed else "FAIL",
+        **({"execution_status": (
+            "STOPPED_BY_OPERATOR" if stop_reason in {"explicit_full_disable", "operator_interrupt"}
+            and cleanup_ok and commands_sent > 0 else
+            "COMPLETED" if stop_reason is None and cleanup_ok and commands_sent > 0 else "FAILED"
+        )} if getattr(args, "torque_console_auto_calibration_profile", None) is not None else {}),
         "mode": args.mode,
         "confirmation": CONFIRMATION,
         "channel": config.channel,
@@ -9909,6 +11686,24 @@ def run_probe(
                 else "existing_normal_hold_path_unchanged"
             ),
         },
+        "torque_console": (
+            {
+                "enabled": True,
+                "controller_mode": torque_console.status().get(
+                    "controller_mode", "direct_torque"
+                ),
+                "joint_name": torque_console.status()["joint_name"],
+                "limits": vars(torque_console.limits),
+                "final_phase": torque_console.status()["phase"],
+                "events": torque_console.status()["events"],
+                **({"onset_capture": torque_console.status()["onset_capture"]}
+                   if args.torque_console_onset_capture else {}),
+                "torque_semantics": "requested_overlay_not_measured_motor_output",
+                "hardware_acceptance": "NOT_CLAIMED",
+            }
+            if torque_console is not None
+            else {"enabled": False}
+        ),
         "feedback_freshness": {
             "control_admitted": active_report_gate is not None,
             "host_receive_sequence_and_age_verified": (
@@ -10096,6 +11891,19 @@ def run_probe(
             ),
         },
         "stop_reason": stop_reason,
+        "cycle_disable_confirmation": {
+            "required": bool(
+                getattr(torque_console, "cycle_disable_confirmation_required", False)
+            ),
+            "available": bool(
+                getattr(torque_console, "cycle_disable_confirmation_ready", False)
+            ),
+            **cycle_disable_confirmation,
+            "semantics": (
+                "explicit_local_gui_confirmation_after_supported_origin_and_zero_assist_base_damping; "
+                "not a physical support sensor"
+            ),
+        },
         "cleanup_errors": tuple(cleanup_errors),
         "preflight_disable_receipt": _mode_receipt_payload(preflight_disable),
         "mode_receipt": _mode_receipt_payload(mode_receipt),
@@ -10152,11 +11960,12 @@ def run_probe(
             "max_velocity_rad_s": args.fault_hold_max_velocity_rad_s,
             "max_rebase_rad": args.fault_hold_max_rebase_rad,
             "vendor_kp_nm_per_rad": _ZERO_SIX,
-            "vendor_kd_nm_s_per_rad": driver_kd_nm_s_per_rad,
+            "vendor_kd_nm_s_per_rad": protective_driver_kd,
             "software_kp_nm_per_rad": protective_hold_profile.position_kp_nm_per_rad,
             "software_kd_nm_s_per_rad": protective_hold_profile.damping_kd_nm_s_per_rad,
             "damping_owner": (
-                "frozen_debug_driver_kd_exact"
+                "motion_profile_safety_damping"
+                if protective_motion_driver_kd is not None else "frozen_debug_driver_kd_exact"
                 if gravity_debug_profile is not None
                 else "driver_kd_where_nonzero_else_protective_hold_software_kd"
             ),
@@ -10378,6 +12187,9 @@ def run_probe(
                 {
                     "axis": cartesian_assist_commissioning.config.axis,
                     "offset_m": cartesian_assist_commissioning.config.offset_m,
+                    "max_offset_m": (
+                        cartesian_assist_commissioning.config.max_offset_m
+                    ),
                     "stiffness_n_per_m": (
                         cartesian_assist_commissioning.config.stiffness_n_per_m
                     ),
@@ -10398,6 +12210,15 @@ def run_probe(
                     ),
                     "max_joint_torque_rate_nm_s": (
                         cartesian_assist_commissioning.config.max_joint_torque_rate_nm_s
+                    ),
+                    "max_joint_torque_release_rate_nm_s": (
+                        cartesian_assist_commissioning.config.max_joint_torque_release_rate_nm_s
+                    ),
+                    "brake_velocity_deadband_rad_s": (
+                        cartesian_assist_commissioning.config.stationarity_limit_rad_s
+                    ),
+                    "breakaway": (
+                        cartesian_assist_commissioning.config.breakaway.as_dict()
                     ),
                     "maximum_rotation_drift_rad": (
                         args.cartesian_assist_max_rotation_drift_rad
@@ -10464,6 +12285,7 @@ def run_probe(
         "torque_limit_count": torque_limit_count,
         "slew_limit_count": slew_limit_count,
         "overlay_limit_count": overlay_limit_count,
+        "torque_conditioning": torque_conditioning_summary,
         "max_abs_requested_tau_nm": max_abs_requested,
         "max_abs_conditioned_tau_nm": max_abs_conditioned,
         "frequency": {event: stats.as_dict() for event, stats in frequency.items()},
@@ -10494,12 +12316,12 @@ def run_probe(
             "interval_semantics": "inclusive_lower_exclusive_upper",
             "applied_sample_count": sum(
                 bool(sample.get("boundary_normalized_joint_names"))
-                for sample in samples
+                for sample in result_samples
             ),
             "applied_joint_counts": {
                 joint_name: sum(
                     joint_name in sample.get("boundary_normalized_joint_names", ())
-                    for sample in samples
+                    for sample in result_samples
                 )
                 for joint_name in _FEEDBACK_BOUNDARY_NORMALIZATION_JOINTS
             },
@@ -10508,7 +12330,8 @@ def run_probe(
                 "feedback_admission_only; URDF limits and outgoing references remain strict"
             ),
         },
-        "samples": samples,
+        "sample_storage": sample_storage,
+        "samples": result_samples,
         "notes": [
             "Human-run commissioning only; automated tests never execute this active path.",
             "The active set is the target plus explicitly selected support joints; scheme-1 J6 commissioning selects all six arm joints while only the J6 reference changes.",
@@ -10694,7 +12517,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help=(
             "one shared or six joint1..joint6 motor-local MIT damping gains; "
-            "defaults to 0.2 0.3 0.2 0.15 0.1 0.05 in enabled gravity modes"
+            "defaults to zero for the operator-confirmed gravity profile"
         ),
     )
     parser.add_argument(
@@ -10707,6 +12530,112 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         help="optional software damping gain override for --joint only",
     )
+    parser.add_argument(
+        "--torque-console",
+        action="store_true",
+        help="local browser torque-intent GUI inside the sole gravity owner",
+    )
+    parser.add_argument(
+        "--torque-console-staged-assist",
+        action="store_true",
+        help=(
+            "replace direct torque adjustment with a relative target, cue, "
+            "one-shot breakaway authorization, and bounded tracking"
+        ),
+    )
+    parser.add_argument(
+        "--torque-console-quantized-velocity-debug", action="store_true",
+        help="opt-in direct J3 single-count speed withdrawal/confirmation; default guard unchanged",
+    )
+    parser.add_argument("--torque-console-onset-capture", action="store_true", help="withdraw on sustained J3 onset; keep GUI and gravity; manual next trial")
+    parser.add_argument("--torque-console-onset-displacement-rad", type=float, default=0.0012)
+    parser.add_argument("--torque-console-onset-confirm-samples", type=int, default=3)
+    parser.add_argument("--torque-console-onset-velocity-rad-s", type=float, default=0.002)
+    parser.add_argument("--torque-console-onset-settle-timeout-sec", type=float, default=1.0)
+    parser.add_argument("--torque-console-onset-probe", action="store_true", help="opt-in held-overlay observation; explicit no-human declaration required")
+    parser.add_argument("--torque-console-onset-probe-hold-sec", type=float, default=0.12)
+    parser.add_argument("--torque-console-onset-probe-max-displacement-rad", type=float,
+                        help="cumulative observation bound; defaults to onset displacement, below the hard excursion limit")
+    parser.add_argument("--torque-console-onset-probe-max-trial-sec", type=float, default=10.0)
+    parser.add_argument("--torque-console-onset-probe-max-command-exposure-nm-sec", type=float, default=4.0)
+    parser.add_argument(
+        "--torque-console-staged-authority-rise-per-sec",
+        type=float,
+        default=3.0,
+        help="authority ramp for the opt-in staged console policy intent",
+    )
+    parser.add_argument("--torque-console-joint", choices=_ALL_JOINTS, default="joint3")
+    parser.add_argument("--torque-console-max-assist-nm", type=float, default=0.30)
+    parser.add_argument(
+        "--torque-console-motion-profile", type=Path,
+        help="opt-in J3 reference/brake/stop-point hold JSON profile; implies staged assist",
+    )
+    parser.add_argument("--torque-console-auto-calibration-profile", type=Path,
+                        help="opt-in one-click J3 onset, low-speed and withdrawal acquisition profile")
+    parser.add_argument(
+        "--torque-console-staged-target-offset-limit-rad",
+        type=float,
+        default=0.065,
+    )
+    parser.add_argument(
+        "--torque-console-staged-cue-torque-nm", type=float, default=0.04
+    )
+    parser.add_argument(
+        "--torque-console-staged-cue-duration-sec", type=float, default=0.30
+    )
+    parser.add_argument(
+        "--torque-console-staged-breakaway-torque-nm", type=float, default=0.20
+    )
+    parser.add_argument(
+        "--torque-console-staged-breakaway-rise-slew-nm-s",
+        type=float,
+        default=2.0,
+        help="independent rise slew for the one-shot breakaway pulse",
+    )
+    parser.add_argument(
+        "--torque-console-staged-breakaway-duration-sec",
+        type=float,
+        default=0.20,
+    )
+    parser.add_argument(
+        "--torque-console-staged-breakaway-impulse-nm-sec",
+        type=float,
+        default=0.04,
+    )
+    parser.add_argument(
+        "--torque-console-staged-motion-onset-rad", type=float, default=0.0007
+    )
+    parser.add_argument("--torque-console-staged-motion-confirm-rad", type=float, default=None)
+    parser.add_argument("--torque-console-staged-motion-confirm-samples", type=int, default=1)
+    parser.add_argument(
+        "--torque-console-staged-motion-onset-velocity-rad-s",
+        type=float,
+        default=0.025,
+    )
+    parser.add_argument(
+        "--torque-console-staged-tracking-kp-nm-per-rad",
+        type=float,
+        default=0.6,
+    )
+    parser.add_argument(
+        "--torque-console-staged-tracking-overlay-cap-nm",
+        type=float,
+        default=0.10,
+    )
+    parser.add_argument("--torque-console-rise-slew-nm-s", type=float, default=0.15)
+    parser.add_argument("--torque-console-release-slew-nm-s", type=float, default=2.0)
+    parser.add_argument("--torque-console-timeout-sec", type=float, default=0.35)
+    parser.add_argument(
+        "--torque-console-stationarity-limit-rad-s", type=float, default=0.02
+    )
+    parser.add_argument("--torque-console-max-joint-velocity-rad-s", type=float, default=0.05)
+    parser.add_argument("--torque-console-max-excursion-rad", type=float, default=0.15)
+    parser.add_argument(
+        "--torque-console-max-support-drift-rad",
+        type=float,
+        default=0.008726646259971648,
+    )
+    parser.add_argument("--torque-console-confirmation", default="")
     parser.add_argument(
         "--single-joint-assist",
         action="store_true",
@@ -10799,6 +12728,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--cartesian-assist-offset-m", type=float, default=0.01)
     parser.add_argument(
+        "--cartesian-assist-max-offset-m",
+        type=float,
+        default=0.05,
+        help=(
+            "explicit Cartesian assist excursion envelope; the requested "
+            "offset must not exceed this value"
+        ),
+    )
+    parser.add_argument(
         "--cartesian-assist-stiffness-n-per-m",
         type=float,
         default=50.0,
@@ -10832,6 +12770,58 @@ def build_parser() -> argparse.ArgumentParser:
         "--cartesian-assist-joint-torque-slew-nm-s",
         type=float,
         default=0.10,
+        help=(
+            "maximum assist torque rise rate; limits energy-injecting onset"
+        ),
+    )
+    parser.add_argument(
+        "--cartesian-assist-joint-torque-release-slew-nm-s",
+        type=float,
+        default=None,
+        help=(
+            "optional faster assist release/dissipative-brake rate; defaults "
+            "to the rise rate for exact historical behavior"
+        ),
+    )
+    parser.add_argument(
+        "--cartesian-assist-breakaway-positive-nm",
+        type=float,
+        nargs=6,
+        metavar=("J1", "J2", "J3", "J4", "J5", "J6"),
+        default=_ZERO_SIX,
+        help=(
+            "positive task-intent breakaway torque for joint1..joint6; only "
+            "joint2/joint3 may be non-zero and defaults preserve old behavior"
+        ),
+    )
+    parser.add_argument(
+        "--cartesian-assist-breakaway-negative-nm",
+        type=float,
+        nargs=6,
+        metavar=("J1", "J2", "J3", "J4", "J5", "J6"),
+        default=_ZERO_SIX,
+        help=(
+            "negative task-intent breakaway torque magnitudes for "
+            "joint1..joint6; only joint2/joint3 may be non-zero"
+        ),
+    )
+    parser.add_argument(
+        "--cartesian-assist-breakaway-velocity-fade-rad-s",
+        type=float,
+        default=0.03,
+        help="extra breakaway torque fades continuously to zero by this speed",
+    )
+    parser.add_argument(
+        "--cartesian-assist-breakaway-intent-deadband-nm",
+        type=float,
+        default=0.01,
+        help="ignore smaller absolute J.T task-torque intents",
+    )
+    parser.add_argument(
+        "--cartesian-assist-breakaway-intent-ramp-nm",
+        type=float,
+        default=0.04,
+        help="task-torque span over which breakaway compensation ramps to full",
     )
     parser.add_argument(
         "--cartesian-assist-authority-rise-per-sec",
@@ -10907,8 +12897,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=_DEFAULT_GRAVITY_JOINT_SCALES,
         help=(
             "explicit joint1..joint6 multipliers applied after --gravity-scale; "
-            "defaults to 1 0.95 1 1 1 1 and is intended for reversible, "
-            "evidence-backed gravity calibration trials"
+            "defaults to 1 0.96 1 1 1 1 for the operator-confirmed gravity profile"
         ),
     )
     parser.add_argument(
@@ -10941,10 +12930,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--gravity-coulomb-velocity-threshold-rad-s",
         type=float,
-        default=0.0,
+        default=_DEFAULT_GRAVITY_COULOMB_VELOCITY_THRESHOLD_RAD_S,
         help=(
             "non-negative absolute velocity below which the Coulomb direction "
-            "is zero; relevant only when a friction magnitude is non-zero"
+            "is zero; defaults to 0.02 rad/s and is relevant only when a "
+            "friction magnitude is non-zero"
         ),
     )
     parser.add_argument(
@@ -11116,6 +13106,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=_DEFAULT_GUIDED_POSE_REST_SEC,
         help="hands-off recovery interval after each signed pose axis",
     )
+    parser.add_argument("--preflight-only", action="store_true")
     parser.add_argument("--allow-motion", action="store_true")
     parser.add_argument(
         "--auto-disable",
@@ -11127,6 +13118,19 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--confirmation", default="")
     parser.add_argument("--output", type=Path, help="write JSON outside the source worktree")
+    parser.add_argument(
+        "--show-joint-angles",
+        action="store_true",
+        help="display measured J1-J6 angles in degrees at 2 Hz; no extra CAN reads",
+    )
+    parser.add_argument(
+        "--debug-dynamics-trace",
+        action="store_true",
+        help=(
+            "write optional per-cycle dynamics and protective-hold JSONL beside "
+            "--output; diagnostic only, no additional CAN reads"
+        ),
+    )
     parser.add_argument(
         "--log",
         type=Path,
@@ -11144,8 +13148,93 @@ def _resolve_runtime_log_path(args: argparse.Namespace) -> Path:
     return Path(f"/tmp/b601-rs-low-gain-probe-{os.getpid()}.log")
 
 
+def _preflight_probe(args: argparse.Namespace) -> dict[str, object]:
+    """Pure resource/ABI inspection; never construct a hardware backend."""
+    _validate_cli(args)
+    base_driver_kd = _one_or_six_non_negative(args.driver_kd or _ZERO_SIX, name="driver_kd")
+    model, limits = _resolve_model_and_limits(args.rebot_source_root)
+    config = B601RSBackendConfig.from_rs_yaml(
+        args.config, allow_motion=False, position_limits_rad=limits,
+    )
+    torque_limits = _resolve_effort_limits(model.urdf_path, scale=args.torque_limit_scale)
+    import motorbridge
+
+    capabilities = motorbridge.abi_capabilities()
+    features = capabilities["features"]["robstride"]
+    required = {"parameter_reply_correlation_v1", "state_observation_metadata_v1"}
+    if not required <= set(features):
+        raise LowGainProbeError(f"MotorBridge lacks required capabilities: {sorted(required - set(features))}")
+    settings = None
+    automatic = None
+    if args.torque_console_auto_calibration_profile is not None:
+        automatic = _automatic_calibration_controller_from_args(args)
+        settings = automatic.settings
+        if hasattr(automatic, "validate_position_limits"):
+            automatic.validate_position_limits(limits)
+    elif args.torque_console_staged_assist:
+        settings = _staged_torque_console_settings_from_args(args)
+    if args.torque_console and any(args.torque_console_max_assist_nm > cap for cap in torque_limits):
+        raise LowGainProbeError("torque console assist cap exceeds a selectable joint's final torque envelope")
+    return {
+        "status": "PASS", "preflight_only": True, "hardware_claim": False,
+        "can_opened": False, "motor_command_sent": False,
+        "config": str(Path(args.config).resolve()), "urdf": str(model.urdf_path),
+        "channel": config.channel, "joints": [joint.name for joint in config.joints],
+        "torque_limits_nm": torque_limits, "motorbridge_capabilities": capabilities,
+        "owner_rate_hz": args.rate_hz,
+        "direct_velocity_debug_enabled": args.torque_console_quantized_velocity_debug,
+        "onset_capture_settings": vars(_direct_torque_console_from_args(args).onset_capture) if args.torque_console_onset_capture else None,
+        **({"onset_probe_settings": vars(_direct_torque_console_from_args(args).onset_probe)} if args.torque_console_onset_probe else {}),
+        "motion_settings": None if settings is None else asdict(settings),
+        "automatic_calibration_settings": (
+            asdict(automatic.config) if automatic is not None else None
+        ),
+        "automatic_cycle_settings": (
+            asdict(automatic.cycle) if automatic is not None and hasattr(automatic,"cycle") else None
+        ),
+        "automatic_mode_selection": None if automatic is None else automatic.status().get("mode_selection"),
+        "automatic_workspace_settings": (
+            None if getattr(automatic, "workspace_configuration", None) is None
+            else asdict(automatic.workspace_configuration)
+        ),
+        "onset_support_damping": None if automatic is None else automatic.result_record()["onset_damping"],
+        "protective_hold_driver_kd_nm_s_per_rad": (
+            _motion_protective_driver_kd(settings, base_driver_kd)
+            or tuple(base_driver_kd)
+        ),
+        "breakaway_command_envelope": None if settings is None else settings.staged_assist.breakaway_envelope(
+            control_period_sec=settings.nominal_control_period_sec,
+        ),
+        "evidence_limit": "Does not establish CAN connectivity, device state, timing stability or mechanical acceptance.",
+    }
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if args.torque_console_auto_calibration_profile is not None:
+        args.torque_console = args.torque_console_staged_assist = True
+    if args.preflight_only:
+        if args.output is None:
+            build_parser().error("--preflight-only requires --output")
+        try:
+            payload = _preflight_probe(args)
+            code = 0
+        except (ValueError, TypeError, OSError, RuntimeError, ImportError, KeyError) as error:
+            payload = {
+                "status": "ERROR", "preflight_only": True, "can_opened": False,
+                "motor_command_sent": False, "error": f"{type(error).__name__}: {error}",
+            }
+            code = 2
+        with args.output.open("x", encoding="utf-8") as output:
+            json.dump(payload, output, indent=2)
+        print(f"[B601] OFFLINE PREFLIGHT {payload['status']}: {args.output}", flush=True)
+        if code:
+            print(f"[B601] {payload['error']}", flush=True)
+        return code
+    if args.torque_console:
+        args.debug_dynamics_trace = True
+    if args.debug_dynamics_trace and args.output is None:
+        build_parser().error("--debug-dynamics-trace requires --output")
     runtime_log_path = _resolve_runtime_log_path(args)
     runtime_log_path.parent.mkdir(parents=True, exist_ok=True)
     print(
@@ -11160,16 +13249,86 @@ def main(argv: Sequence[str] | None = None) -> int:
             "SIGUSR1 requests full six-joint disable. Physical E-stop remains primary.",
             flush=True,
         )
-    with (
-        runtime_log_path.open("a", encoding="utf-8") as runtime_log,
-        contextlib.redirect_stdout(runtime_log),
-        contextlib.redirect_stderr(runtime_log),
-    ):
+    debug_trace_path = (
+        Path(args.output).expanduser().resolve().with_suffix(".debug.jsonl")
+        if args.debug_dynamics_trace
+        else None
+    )
+    console_server = None
+    with contextlib.ExitStack() as stack:
+        runtime_log = stack.enter_context(runtime_log_path.open("a", encoding="utf-8"))
+        stack.enter_context(contextlib.redirect_stdout(runtime_log))
+        stack.enter_context(contextlib.redirect_stderr(runtime_log))
+        debug_trace = None
+        gc_observer = None
+        if debug_trace_path is not None:
+            debug_trace_path.parent.mkdir(parents=True, exist_ok=True)
+            debug_stream = stack.enter_context(debug_trace_path.open("x", encoding="utf-8"))
+            gc_observer = stack.enter_context(_ProbeGCObserver())
+            debug_trace = _DynamicsTrace(debug_stream, gc_observer=gc_observer)
         print(
             f"[B601] run started mode={args.mode} pid={os.getpid()}",
             flush=True,
         )
         try:
+            torque_console = None
+            if args.torque_console:
+                _validate_cli(args)
+                if not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
+                    raise LowGainProbeError(
+                        "torque console needs an Ubuntu desktop session"
+                    )
+                from control_station.b601_torque_console import B601TorqueConsoleServer
+                from control_station.b601_torque_console.server import (
+                    recent_runtime_notices,
+                )
+
+                if getattr(args, "torque_console_auto_calibration_profile", None) is not None:
+                    torque_console = _automatic_calibration_controller_from_args(args)
+                elif args.torque_console_staged_assist:
+                    from control_station.b601_torque_console.staged_controller import (
+                        B601StagedTorqueConsoleController,
+                    )
+
+                    torque_console = B601StagedTorqueConsoleController(
+                        _staged_torque_console_settings_from_args(args)
+                    )
+                else:
+                    torque_console = _direct_torque_console_from_args(args)
+                console_server = B601TorqueConsoleServer(
+                    torque_console,
+                    assessment_path=args.output.resolve().with_suffix(".transparency.jsonl"),
+                    automatic_recording=True,
+                    human_intervention_handler=(torque_console.set_human_intervention
+                        if args.torque_console_onset_probe or getattr(args, "torque_console_auto_calibration_profile", None) is not None else None),
+                    recording_failure_handler=(torque_console.recording_failed
+                        if getattr(args, "torque_console_auto_calibration_profile", None) is not None else None),
+                    status_provider=lambda: {
+                        "owner_pid": os.getpid(),
+                        "debug_trace_path": str(debug_trace_path),
+                        "debug_trace_error": (
+                            None if debug_trace is None else debug_trace.error
+                        ),
+                        "terminal_statuses": recent_runtime_notices(runtime_log_path),
+                        "runtime_log_path": str(runtime_log_path),
+                    },
+                )
+                console_server.start()
+                stack.callback(console_server.close)
+                console_description = "automatic calibration; select the configured GUI mode before starting" if getattr(args, "torque_console_auto_calibration_profile", None) is not None else (
+                    "staged target/CUE console; one-shot breakaway requires explicit authorization"
+                    if args.torque_console_staged_assist
+                    else "direct bounded torque console"
+                )
+                _operator_notice(
+                    f"[B601] TORQUE CONSOLE ({console_description}): "
+                    f"{console_server.url} "
+                    "(local browser only; closing the page withdraws assist)"
+                )
+                if not webbrowser.open_new_tab(console_server.url):
+                    _operator_notice(
+                        "[B601] Browser did not open automatically; use the URL above."
+                    )
             commissioning_pair = _build_single_joint_assist(args)
             if commissioning_pair is None:
                 shared_runtime = None
@@ -11184,18 +13343,119 @@ def main(argv: Sequence[str] | None = None) -> int:
                 cartesian_assist_commissioning=(
                     cartesian_commissioning_session
                 ),
+                debug_trace=debug_trace,
+                torque_console=torque_console,
+                console_stop_binding=(
+                    console_server.set_stop_handler if torque_console is not None else None
+                ),
             )
         except (LowGainProbeError, B601HardwareError, OSError, ValueError) as exc:
             payload = {"status": "ERROR", "mode": args.mode, "error": str(exc)}
+            if getattr(args, "torque_console_auto_calibration_profile", None) is not None:
+                payload["execution_status"] = "ERROR"
             exit_code = 2
         else:
             exit_code = 0 if payload.get("status") == "OK" else 1
+        if torque_console is not None and getattr(args, "torque_console_auto_calibration_profile", None) is not None:
+            try:
+                payload["automatic_calibration"] = torque_console.result_record()
+                outcome = payload["automatic_calibration"]["outcome"]
+                exit_code = _finalize_automatic_result(payload, payload["automatic_calibration"])
+                final_record = dict(payload["automatic_calibration"])
+                kind = final_record.pop("kind")
+                final_record["acquisition_completed_at_sec"] = final_record.pop("recorded_monotonic_sec")
+                debug_trace.record(kind, **final_record)
+            except (OSError, TypeError, ValueError, KeyError) as exc:
+                # Control cleanup has already run. An observer export failure
+                # must remain an ERROR without preventing the primary JSON.
+                payload["automatic_calibration_export_error"] = f"{type(exc).__name__}: {exc}"
+                payload.setdefault("error", payload["automatic_calibration_export_error"])
+                payload.update(status="ERROR", execution_status="ERROR")
+                exit_code = 2
+                _operator_notice(f"[B601] automatic calibration export failed: {payload['automatic_calibration_export_error']}")
+            else:
+                _operator_notice(
+                    f"[B601] ACQUISITION {outcome['severity'].upper()}: {outcome['reason']}; "
+                    "execution status and model-fit readiness are evaluated separately."
+                )
+        if getattr(args, "torque_console_auto_calibration_profile", None) is None:
+            print(
+                f"[B601] run finished status={payload.get('status')} exit={exit_code}",
+                flush=True,
+            )
+        if debug_trace is not None:
+            gc_observer.close()
+            payload["debug_dynamics_trace"] = {
+                "path": str(debug_trace_path),
+                "sample_count": debug_trace.sample_count,
+                "error": debug_trace.error,
+                "last_feedback_read_diagnostics": (
+                    debug_trace.last_feedback_read_diagnostics.snapshot()
+                    if debug_trace.last_feedback_read_diagnostics is not None else None
+                ),
+                "gc_observation": {
+                    **gc_observer.drain(), "settings_at_start": gc_observer.settings_at_start,
+                    "registered_after_cleanup": gc_observer._registered,
+                    "control_observation_end": debug_trace.gc_observation_end,
+                    "scope": (
+                        "startup_control_protective_hold_and_cleanup"
+                        if debug_trace.gc_observation_end is not None
+                        else "main_lifecycle_until_observer_close"
+                    ),
+                },
+                "velocity_source": "normalized_qpos_finite_difference_over_feedback_dt",
+                "torque_power_semantics": "commanded_torque_times_finite_difference_velocity",
+            }
+    if (getattr(args, "torque_console_auto_calibration_profile", None) is not None
+        and debug_trace is not None and debug_trace.error is not None):
+        payload.update(status="ERROR", execution_status="ERROR",
+            error=payload.get("error", f"automatic calibration trace failed: {debug_trace.error}"))
+        exit_code = 2
+    payload["runtime_log_path"] = str(runtime_log_path)
+    if console_server is not None:
+        payload["transparency_assessment"] = console_server.assessment_status()
+        payload["http_status_diagnostics"] = console_server.status_response_diagnostics()
+    if getattr(args, "torque_console_auto_calibration_profile", None) is not None and torque_console is not None:
+        from control_station.b601_torque_console.automatic_report import (
+            save_automatic_report,
+        )
+
+        payload["automatic_calibration_report_status"] = "PENDING"
+        try:
+            payload = _output_payload(payload, args.output, emit_summary=False)
+        except KeyboardInterrupt:
+            _operator_notice("[B601] sample archival interrupted after control cleanup; primary checkpoint and raw trace retained.")
+            return 130
+        except (OSError, TypeError, ValueError) as exc:
+            _operator_notice(f"[B601] ERROR: post-cleanup primary/sample export failed: {exc}; inspect primary checkpoint at {args.output} and raw trace; no successful archive is claimed.")
+            return 2
+        _operator_notice(f"[B601] primary control result saved: {args.output}; building offline report (no motor control). Ctrl-C skips report.")
+        try:
+            report_path = save_automatic_report(args.output.resolve().parent)
+            payload["automatic_calibration_report_path"] = str(report_path)
+            payload["automatic_calibration_report_status"] = "COMPLETE"
+            _operator_notice(f"[B601] automatic calibration report: {report_path}")
+        except KeyboardInterrupt:
+            payload["automatic_calibration_report_status"] = "INTERRUPTED"
+            payload["automatic_calibration_report_error"] = "operator_interrupted_report_after_control_cleanup"
+            _operator_notice("[B601] offline report interrupted; primary control/cleanup result and sample archive retained.")
+            exit_code = 130
+        except (OSError, TypeError, ValueError, KeyError) as exc:
+            payload["automatic_calibration_report_status"] = "ERROR"
+            payload["automatic_calibration_report_error"] = str(exc)
+            payload.update(status="ERROR", execution_status="ERROR")
+            _operator_notice(f"[B601] automatic calibration report failed: {exc}")
+            exit_code = 2
+    if getattr(args, "torque_console_auto_calibration_profile", None) is not None:
         print(
             f"[B601] run finished status={payload.get('status')} exit={exit_code}",
             flush=True,
         )
-    payload["runtime_log_path"] = str(runtime_log_path)
-    _output_payload(payload, args.output)
+    if "automatic_calibration_report_status" in payload:
+        _write_result_json(payload, args.output)
+        _emit_result_summary(payload, args.output)
+    else:
+        _output_payload(payload, args.output)
     return exit_code
 
 

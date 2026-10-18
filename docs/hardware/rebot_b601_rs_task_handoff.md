@@ -1,6 +1,6 @@
 # B601-RS 硬件开发交接说明
 
-> 版本：2026-09-09。本文是 B601-RS 当前代码、真机 commissioning、重力采集和
+> 版本：2026-09-22。本文是 B601-RS 当前代码、真机 commissioning、重力采集和
 > Harness/Git 交接的统一入口。它描述可复核的实现和流程，不授予新的使能、运动或
 > 合并权限。任何真机动作仍须由现场操作者在确认机械支撑和物理急停后前台执行。
 > B601 Real2Sim、双向 ReBot/RM65 遥操、policy 传导和人工实时干预的长期阶段目标见
@@ -34,11 +34,15 @@
   guard、原始 RobStride 帧诊断、交互式多姿态残差采集、startup replay、离线 candidate
   fit，以及逐关节重力 scale/offset/bias/Coulomb 和 driver Kd 配置。
 - 操作者已确认下列正常重力补偿 profile 的真机手感合理，因此它已成为 enabled gravity
-  mode 的程序默认值：软件 `kp/kd=0/0`，driver Kd=`0.2 0.3 0.2 0.15 0.1 0.05`，全局
-  scale=`1.0`，joint scale=`1 0.95 1 1 1 1`，offset 全零，bias=
-  `0 -0.105 -0.1 -0.05 0 0 N.m`，Coulomb 全零。
+  mode 的程序默认值：软件 `kp/kd=0/0`，driver Kd=`0 0 0 0 0 0`，全局
+  scale=`1.0`，joint scale=`1 0.96 1 1 1 1`，offset 全零，bias=
+  `0 -0.22 -0.11 -0.08 0 0 N.m`，Coulomb 全零，速度阈值为 `0.02 rad/s`。
 - 当前状态是“独立候选已准备交接”，不是“已合并/已安装/最终硬件通过”。逐关节 offset
   和 Coulomb 仍为零；没有独立力矩传感器标定，也没有高带宽触觉或系统级 `HARDWARE_PASS`。
+
+本次默认值变更限定在 B601 硬件 owner/probe 及其 protective/degraded hold；已有
+MuJoCo `B601Real2SimControllerProfile` 保持独立的仿真契约，避免未经单独验收就改变
+既有仿真动力学和回归结果。
 
 ## 1. 任务目标与明确非目标
 
@@ -122,16 +126,18 @@ tau_request[i] = gravity_scale * gravity_joint_scales[i] * g_i(q + offset)
    `send_mit(position, velocity, kp, kd, feedforward_tau)`。
 
 `--gravity-joint-scales J1 J2 J3 J4 J5 J6` 的操作者真机验证默认值为
-`1 0.95 1 1 1 1`。它不是 URDF 修改，也没有隐式标定激活。该向量必须一致用于启动锁、
+`1 0.96 1 1 1 1`。它不是 URDF 修改，也没有隐式标定激活。该向量必须一致用于启动锁、
 ACTIVE、protective hold 和缓存 gravity-only degraded hold，并记录到结果 profile。
 `--gravity-joint-offsets-rad`、`--gravity-joint-bias-nm`、
-`--gravity-coulomb-friction-nm` 的默认值分别为全零、`0 -0.105 -0.1 -0.05 0 0` 和
-全零。Coulomb 方向只在有限差分速度绝对值超过
-`--gravity-coulomb-velocity-threshold-rad-s` 时取正或负，否则为零；这避免静止量化噪声
+`--gravity-coulomb-friction-nm` 的默认值分别为全零、`0 -0.22 -0.11 -0.08 0 0` 和
+全零。Coulomb 方向只在有限差分速度绝对值超过默认的
+`--gravity-coulomb-velocity-threshold-rad-s=0.02 rad/s` 时取正或负，否则为零；这避免静止量化噪声
 驱动完整摩擦力矩反复换向。所有项贯穿启动、ACTIVE、protective hold 和缓存补偿，并记录
 在结果 profile；它们组成默认 runtime profile，但不修改 URDF、不隐式改写模型文件。
 
-重力调参现场若需要保持参数可比性，可显式使用 `--gravity-debug-mode`。该模式在
+canonical `rebot_b601_rs_owner.py` 默认启用 `--gravity-debug-mode`；直接调用
+low-gain probe 或其他模式若要保持参数可比性，需显式使用该开关，owner 可用
+`--no-gravity-debug-mode` 恢复普通保护保持语义。该模式在
 使能前冻结本次 run 的 gravity scale、六轴 scale/offset/bias/friction、Coulomb
 阈值和 driver Kd；ACTIVE、protective hold、恢复后的 live hold 及 degraded cache
 均复用该不可变快照。它只固定参数来源，不改变任何反馈新鲜度、运动/力矩/加速度
@@ -142,6 +148,62 @@ ACTIVE、protective hold 和缓存 gravity-only degraded hold，并记录到结�
 在该显式调试模式中，保护保持也不会为冻结快照中 `driver Kd=0` 的关节补入默认
 `protective_hold_kd`；`protective_hold.software_kd_nm_s_per_rad` 应与本次调试的
 单一阻尼 owner 一致。普通模式的默认阻尼 fallback 保持不变。
+
+### 单关节连续助力调试界面（待真机验收）
+
+`rebot_b601_rs_owner.py --torque-console --torque-console-confirmation
+B601_RS_TORQUE_CONSOLE --allow-motion` 在原单一 CAN owner 进程内启动仅绑定
+`127.0.0.1` 的浏览器界面；网页只提交短时意图，不能直接调用 MotorBridge。
+独立开发 worktree 尚未编译 MotorBridge 时，用 `--motorbridge-root` 显式指定
+已有 Python bindings 和已构建 ABI 的同版本 checkout，不把二进制复制进源码树。
+界面默认选 J3、助力上限 `0.30 Nm`、上升斜率 `0.15 Nm/s`、撤力斜率
+`2.0 Nm/s`、意图超时 `0.35 s`，这些值均可通过 `--torque-console-*` 显式调整。
+所选关节助力期间的有限差分速度另设默认 `0.05 rad/s` 保护阈值；越界会在本
+周期撤销助力并进入原保护保持，网页同时显示速度和阈值。它不作用于未加力的
+手动摆位，也不是主动制动，零阻尼时仍可能发生惯性滑行。
+该模式要求软件 Kp/Kd 为零、冻结本次重力参数、启用驱动临时力矩上限，且不与
+既有单次关节/笛卡尔助力叠加。必须在启动交接完成、六轴速度都落入静止阈值后
+才能从当前实测位置开始一轮；网页失联撤去助力，超出所选关节/其他关节位移
+保护则退回原 protective hold，仍须第二次 Ctrl-C/SIGUSR1 才全臂失能。
+
+此模式自动开启 `--debug-dynamics-trace`，逐周期记录反馈位置、有限差分速度、
+重力、请求/限幅后的助力与最终软件力矩、完整发送回执；网页的曲线只是短时
+滚动视图。所谓“已接受发送的助力”仅由完整发送回执确认，不代表独立测得的
+电机实际输出力矩。该界面尚无真机验收，不能据离线测试宣称力矩标定或触觉
+性能通过。
+
+显式自动标定 profile 的两个 GUI 模式共用同一个阻尼发送适配口：固定位置采集、
+完整搬运流程及其子阶段都必须通过该口解析当前控制帧的 driver Kd，再由原六轴
+MIT dispatch 发送并校验回执，不能因 GUI 包装器类型不同而退回零阻尼。开始标定
+时，子控制器首帧的阻尼渐升最多使用一个正常控制周期；搬运或等待期间未执行的
+时间不计作渐升额度。后续继续从已确认发送的 Kd 渐升，起步扫描的 J3 Kd 仍为零，
+纯重力阶段及故障保持仍使用冻结的基础配置。这里校验的是软件发送命令，不是
+电机实际阻尼力矩或独立测力结果。
+
+`b601_j3_local_identification_v1.json` 显式启用
+`motion_continuous_speed_regulation`，两个 GUI 模式的局部采集阶段都复用已有连续调速。
+该选项把显式配置的绝对软制动上限作为连续调速终点，不再叠加第二份速度余量：参考速度
+`0.0075 / 0.015 rad/s` 对应的减力起点为 `0.01625 / 0.026 rad/s`，终点仍为
+`0.039 rad/s`（本轮批准从 `0.03` 放宽 30%）。两者之间保持原 TRACK、目标和有界维持状态，
+按完整 PD 加维持助力减小同向推进量；真正软超速仍制动。本轮局部 profile 的跟踪和采集
+到位容差为 `0.0065 rad`，原为 `0.005 rad`；配套命令的六轴原始硬速度保护为 `0.13 rad/s`，
+原为 `0.10 rad/s`。普通默认值和其他采集 profile 不变。完整搬运/回程仍使用独立的
+J3 `0.05 rad/s` 软制动上限，继承本轮 `0.039 rad/s` 支撑轴软门和六轴硬门。
+起步扫描期间 J3 原有的独立 `0.15 rad/s` 原始速度上限不变，其他轴使用上述硬门；
+带撤力支撑确认的显式采集路径也同步接纳最高 `0.13 rad/s` 的配置，普通量化调试的接纳上限不变。
+反馈、回执、人工撤销、力矩、位移绝对上限及预算保护不变。连续减力不等于
+已辨识摩擦，也不证明真机能完成全部运动段，仍须检查实际采集报告和模型数据质量。
+
+连续模式进入到位稳定阶段时，有界维持项先投影到最近完整派发的附加助力，预留当前
+同方向 PD 份额，不能恢复 TRACK 调速时未实际派发的内部维持量。速度误差减力继续作用于
+完整 PD 加维持输出；不再因阶段名变为 BRAKE 而失效。到位输出以实际派发量为渐变起点，
+快速制动速率只允许撤掉推进量或产生有可靠运动证据的反向制动，同方向增推仍受原跟踪
+渐升速率限制。到位后仍须完成停稳、渐退、零助力派发确认和撤力后停稳，不把位置进入
+容差直接当作稳定；原生零回执前不得反向。所有启用 `arrival_stabilization` 的目标到位路径中，
+内侧 `arrival_margin_rad` 仍用于提前进入制动/接近带；制动后停稳驻留按配置的最终位置容差判定，
+不再把内侧门限重复用作停稳门。量化位置在最终容差内相邻计数间变化时，按既有位置分辨率和
+停稳速度累计驻留；越出最终容差、持续超速或六轴运动仍会清零驻留。以上是软件命令链修复，
+不是测力标定结果。
 
 重要 owner 规则：
 
@@ -154,7 +216,7 @@ ACTIVE、protective hold 和缓存 gravity-only degraded hold，并记录到结�
   应为零。`cartesian-hold` 同理，只产生平移 overlay。
 - 软件 Kd 和 driver Kd 只能有一个实际阻尼 owner。临时锁期间 YAML Kd 由电机本地拥有，
   主机临时 Kd 为零；交接时本地 Kd 连续回到 active driver Kd。`--driver-kd` 的已验证
-  默认值为 `0.2 0.3 0.2 0.15 0.1 0.05`，也接受一个六轴共用值；任一项非零时必须
+  默认值为 `0 0 0 0 0 0`，也接受一个六轴共用值；任一项非零时必须
   `--kd 0`、不使用非零 `--target-kd`，并且先完成六轴 `0x700B` 临时 torque-limit
   round-trip；driver Kd 只提供电机局部速度耗散，不提供位置锁。正常重力补偿的软件
   `kp/kd` 默认均为零；需要固定参考采样的 `gravity-calibration` 必须显式选择非零 `--kp`。
@@ -824,20 +886,20 @@ ffc2bbd2 gravity offset/bias/Coulomb runtime terms
 
 ### 16.3 验证与证据边界
 
-- 当前代码离线验证：
-  `python3.10 -m pytest -q tests/test_rebot_b601_hardware_backend.py tests/test_rebot_b601_low_gain_probe.py`
-  得到 `167 passed`；Ruff、`py_compile` 和 `git diff --check` 通过。
+- 当前候选的 B601 相关离线回归得到 `476 passed`（1 个既有 hppfcl deprecation
+  warning）；Ruff、`py_compile` 和 `git diff --check` 通过。该结果不包含真机动作。
 - `/tmp/b601-rs-j2-gravity-scale-095-20260909-173751/`：J2 scale `0.95` 的完整 startup
   replay 状态机通过，约 20 Hz，无 torque/slew limit；最终顶层 `FAIL/operator_interrupt`
   是第二次 Ctrl-C 的记账，不抹去 replay 子结果和完整 cleanup。
   JSON/runtime/raw SHA-256 分别为 `381f3be1829ae72a07982a1611762d77a653d97c2c67470a55604263edbb4d68`、
   `7e70afccaaaf3e5ca6da8bd1977f70848429bda230ae99eeb9693dedcfd21ba4`、
   `dc8027306559cfec7b91a5d266a0bf5bd3cf5db467873fcaa72554583a3d5224`。
-- `/tmp/b601-rs-j2-bias-minus010-r1/result.json`：机器证据确认实际下发 profile 为
+- `/tmp/b601-rs-j2-bias-minus010-r1/result.json`：历史机器证据确认当时实际下发的旧 profile 为
   driver Kd `0.2 0.3 0.2 0.15 0.1 0.05`、joint scale `1 0.95 1 1 1 1`、bias
   `0 -0.105 -0.1 -0.05 0 0`，protective hold 和最终六轴 cleanup 完整。该次没有按 R，
-  所以 `startup_replay.status=FAIL`；它不能冒充 replay 验收。操作者另行确认这组正常重力
-  补偿配置的手感合理，这是默认值的人工验收来源。
+  所以 `startup_replay.status=FAIL`；它不能冒充 replay 验收，也不能作为当前默认 profile
+  的验收证据。当前默认 profile 是操作者在 2026-09-22 调整后确认的配置；其 exact
+  handoff commit 的真机重放仍需单独取得证据。
   JSON/runtime/raw SHA-256 分别为 `55f2d0575350e9233ff062dddf4b256b082f8005e7429b355c04b7f0c4cfd582`、
   `92a190c930de0f596d80e0e3ad28d795719f82bc182664d0cc03606c6b587f9b`、
   `4d2802bcc33b15fdedaee88c2cc985a941ad35fdafc373ba4ba8d26e3146a796`。
