@@ -1473,6 +1473,42 @@ def test_braking_raw_direction_wins_over_delayed_opposite_window_velocity():
     assert frame.requested_torque_nm > 0.0
 
 
+@pytest.mark.parametrize("scale,reason,stabilizing", [
+    (1., "resolved_tracking_speed_braking", False),
+    (1.5, "target_reached_braking", True),
+])
+def test_authorized_speed_margin_allows_recorded_approach_to_enter_arrival(scale, reason, stabilizing):
+    # 89q710sv's final negative approach, prescribed as causal input only.
+    # This distinguishes the trigger order, not the counterfactual plant motion.
+    tracker = _governed_tracker(
+        soft_velocity_rad_s=.039*scale, continuous_speed_limit_rad_s=.039*scale,
+        max_reference_lag_rad=.013*scale, max_reference_velocity_rad_s=.0075,
+        arrival_stabilization=True, arrival_margin_rad=.0008,
+        velocity_headroom_ratio=.3)
+    tracker.start(now=1., q=.029913589358329773, target=.01523936927318573)
+    _governor_tick(tracker, 1.025, q=.02876363880932331, velocity=-.0216,
+                   raw=-.0583, span=.002, stop_error=.01352, raw_limit=.13*scale)
+    frame = _governor_tick(tracker, 1.05, q=.02761315368115902, velocity=-.0321,
+                           raw=-.038, span=.003, stop_error=.01352, raw_limit=.13*scale)
+    assert frame.phase == "brake"
+    assert frame.reason == reason
+    assert frame.arrival_stabilization_active is stabilizing
+    assert frame.target_position_rad == .01523936927318573
+
+
+@pytest.mark.parametrize("limit,raw,blocked", [
+    (.13, .1341664002565264, True),
+    (.195, .1341664002565264, False),
+    (.195, .195001, True),
+])
+def test_authorized_raw_speed_margin_remains_a_finite_hard_guard(limit, raw, blocked):
+    tracker = _governed_tracker(continuous_speed_limit_rad_s=.0585, soft_velocity_rad_s=.0585)
+    frame = _governor_tick(tracker, 1.02, q=.001, velocity=.1193432985,
+                           raw=raw, span=.002, raw_limit=limit)
+    assert (frame.phase == "authority_exhausted") is blocked
+    assert frame.motion_evidence_block_reason == ("raw_velocity_hard_guard" if blocked else None)
+
+
 @pytest.mark.parametrize("direction", [-1, 1])
 @pytest.mark.parametrize("raw,window,expected", [
     (.058, -.023, 0.),       # Actual reversal in cr02hmu0: old window would propel recoil.

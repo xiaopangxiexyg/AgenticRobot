@@ -1612,7 +1612,7 @@ def test_auto_profile_parent_child_roundtrip_is_connection_free(tmp_path, monkey
             "--torque-console-staged-target-offset-limit-rad",
             ".09" if profile_name == "b601_j3_local_identification_v1.json" else ".065",
             "--torque-console-max-joint-velocity-rad-s",
-            "0.13" if profile_name == "b601_j3_local_identification_v1.json"
+            "0.195" if profile_name == "b601_j3_local_identification_v1.json"
             else "0.10" if profile_name == "b601_j3_continuous_motion_v1.json" else "0.05",
             "--torque-console-confirmation",
             "B601_RS_TORQUE_CONSOLE",
@@ -1641,12 +1641,13 @@ def test_auto_profile_parent_child_roundtrip_is_connection_free(tmp_path, monkey
     identification = profile_name == "b601_j3_local_identification_v1.json"
     assert controller.config.motion_continuous_speed_regulation is identification
     assert controller.settings.staged_assist.motion_control.continuous_speed_limit_rad_s == (
-        .039 if identification else None)
+        .0585 if identification else None)
     continuous = profile_name == "b601_j3_continuous_motion_v1.json" or identification
-    hard_speed = .13 if identification else .10 if continuous else .05
+    hard_speed = .195 if identification else .10 if continuous else .05
     assert controller.limits.max_joint_velocity_rad_s == hard_speed
     assert controller.settings.maximum_target_offset_rad == (.09 if identification else .065)
-    assert controller.config.motion_soft_velocity_rad_s == (.039 if identification else None)
+    assert controller.config.motion_soft_velocity_rad_s == (.0585 if identification else None)
+    assert controller.settings.staged_assist.motion_control.max_reference_lag_rad == (.0195 if identification else .013)
     assert controller.config.onset_release_support_confirmation is continuous
     assert controller._direct.onset_capture.release_support_confirmation is continuous
     assert controller.config.feedback_velocity_timebase == (
@@ -1744,7 +1745,8 @@ def test_local_identification_reuses_the_verified_continuous_drive_profile():
     assert identification.pop("sweep_excursion_rad") == .035
     assert continuous.pop("sweep_excursion_rad") == .020
     assert identification.pop("motion_continuous_speed_regulation") is True
-    assert identification.pop("motion_soft_velocity_rad_s") == .039
+    assert identification.pop("motion_soft_velocity_rad_s") == .0585
+    assert identification.pop("motion_max_reference_lag_rad") == .0195
     for key in ("motion_tracking_arrival_tolerance_rad", "motion_acquisition_arrival_tolerance_rad"):
         assert identification.pop(key) == .01352
         assert continuous.pop(key) == .00845
@@ -1774,6 +1776,16 @@ def test_acquisition_soft_speed_override_is_explicit_and_below_hard_guard(settin
     assert controller.settings.staged_assist.motion_control.soft_velocity_rad_s == .039
     assert settings.staged_assist.motion_control.soft_velocity_rad_s == original == .03
     assert controller.limits == settings.limits
+    assert AutomaticCalibrationConfig().motion_max_reference_lag_rad is None
+    with pytest.raises(ValueError, match="explicit continuous acquisition"):
+        AutomaticCalibrationConfig(motion_max_reference_lag_rad=.0195)
+    widened = B601AutomaticCalibrationController(settings, replace(config, motion_max_reference_lag_rad=.0195))
+    assert widened.settings.staged_assist.motion_control.max_reference_lag_rad == .0195
+    assert settings.staged_assist.motion_control.max_reference_lag_rad == .013
+    for value in (0., -1., True, float("nan"), float("inf"), .0129,
+                  settings.maximum_target_offset_rad+.001):
+        with pytest.raises((ValueError, TypeError)):
+            B601AutomaticCalibrationController(settings, replace(config, motion_max_reference_lag_rad=value))
     for value in (.029, settings.limits.max_joint_velocity_rad_s):
         with pytest.raises(ValueError, match="original soft floor"):
             B601AutomaticCalibrationController(settings, replace(config, motion_soft_velocity_rad_s=value))

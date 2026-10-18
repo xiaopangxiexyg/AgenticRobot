@@ -11,7 +11,7 @@
     "max_cycle_sec": 900,
     "supported_origin_disable_confirmation": true,
     "positioning_support_soft_speed_recovery": true,
-    "positioning_continuous_speed_limit_rad_s": 0.05,
+    "positioning_continuous_speed_limit_rad_s": 0.075,
     "positioning_torque_rise_nm_s": 1.0,
     "positioning_torque_fall_nm_s": 8.0
   }

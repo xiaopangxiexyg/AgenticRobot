@@ -105,6 +105,7 @@ class AutomaticCalibrationConfig:
     onset_release_support_confirmation: bool = False
     motion_continuous_speed_regulation: bool = False
     motion_soft_velocity_rad_s: float | None = None
+    motion_max_reference_lag_rad: float | None = None
 
     def __post_init__(self) -> None:
         if (
@@ -137,6 +138,7 @@ class AutomaticCalibrationConfig:
                     "onset_release_support_confirmation",
                     "motion_continuous_speed_regulation",
                     "motion_soft_velocity_rad_s",
+                    "motion_max_reference_lag_rad",
                     "max_sweep_leg_command_exposure_nm_sec",
                     "motion_onset_handoff",
                     "motion_plan",
@@ -261,6 +263,10 @@ class AutomaticCalibrationConfig:
             speed = finite(self.motion_soft_velocity_rad_s, "motion soft velocity")
             if speed <= 0 or not self.motion_continuous_speed_regulation:
                 raise ValueError("motion soft velocity override requires positive explicit continuous acquisition")
+        if self.motion_max_reference_lag_rad is not None:
+            lag = finite(self.motion_max_reference_lag_rad, "motion maximum reference lag")
+            if lag <= 0 or not self.motion_continuous_speed_regulation:
+                raise ValueError("motion reference lag override requires positive explicit continuous acquisition")
 
 
 class B601AutomaticCalibrationController:
@@ -339,6 +345,10 @@ class B601AutomaticCalibrationController:
                 overrides.update(speed_governor=True,
                     arrival_stabilization=config.motion_arrival_stabilization)
             if config.motion_continuous_speed_regulation:
+                if config.motion_max_reference_lag_rad is not None:
+                    if not motion.max_reference_lag_rad <= config.motion_max_reference_lag_rad <= settings.maximum_target_offset_rad:
+                        raise ValueError("acquisition reference lag must retain the original floor and stay inside the target envelope")
+                    overrides["max_reference_lag_rad"] = config.motion_max_reference_lag_rad
                 if config.motion_soft_velocity_rad_s is not None:
                     if not motion.soft_velocity_rad_s <= config.motion_soft_velocity_rad_s < self.limits.max_joint_velocity_rad_s:
                         raise ValueError("acquisition soft velocity must retain the original soft floor and stay below the hard guard")

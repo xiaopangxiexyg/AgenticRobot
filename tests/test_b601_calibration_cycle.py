@@ -452,7 +452,7 @@ def _production_cycle_controller(tmp_path):
             "--torque-console-staged-target-offset-limit-rad",
             ".0845",
             "--torque-console-max-joint-velocity-rad-s",
-            ".13",
+            ".195",
             "--torque-console-staged-motion-onset-rad",
             ".0004",
             "--torque-console-staged-breakaway-duration-sec",
@@ -550,7 +550,7 @@ def test_production_local_track_regulates_without_spending_stop_resume_budget(tm
             break
         assert motion["speed_governor_resume_count"] == 0
         assert motion["target_position_rad"] == target
-        assert motion["tracking_speed_brake_limit_rad_s"] == .039
+        assert motion["tracking_speed_brake_limit_rad_s"] == .0585
         assert abs(replay.delta[2]) <= 1.
         scales.append(motion["continuous_speed_scale"])
     assert scales
@@ -573,11 +573,11 @@ def test_cycle_profile_reuses_local_identification_without_modifying_ordinary_pr
     assert isinstance(controller, B601CalibrationModeController)
     assert as_cycle(controller) == cycle
     assert not controller.cycle_disable_confirmation_ready
-    assert controller.limits.max_joint_velocity_rad_s == 0.13
+    assert controller.limits.max_joint_velocity_rad_s == 0.195
     assert controller.settings.staged_assist.motion_control.support_soft_speed_recovery
     assert not controller._fixed.settings.staged_assist.motion_control.support_soft_speed_recovery
-    assert controller.settings.staged_assist.motion_control.continuous_speed_limit_rad_s == .05
-    assert controller._fixed.settings.staged_assist.motion_control.continuous_speed_limit_rad_s == .039
+    assert controller.settings.staged_assist.motion_control.continuous_speed_limit_rad_s == .075
+    assert controller._fixed.settings.staged_assist.motion_control.continuous_speed_limit_rad_s == .0585
     assert controller.settings.staged_assist.tracking_slew_nm_s == 1.
     assert controller.settings.limits.rise_slew_nm_s == 1.
     assert controller.settings.staged_assist.tracking_release_slew_nm_s == 8.
@@ -601,7 +601,7 @@ def test_cycle_profile_reuses_local_identification_without_modifying_ordinary_pr
 def test_transfer_soft_ceiling_must_be_admitted_below_raw_hard_guard_before_connection(tmp_path):
     controller = _production_cycle_controller(tmp_path)
     with pytest.raises(ValueError, match="continuous speed ceiling"):
-        replace(controller.settings, limits=replace(controller.settings.limits, max_joint_velocity_rad_s=.05))
+        replace(controller.settings, limits=replace(controller.settings.limits, max_joint_velocity_rad_s=.075))
 
 
 @pytest.mark.parametrize("rate", [0., -.1, True, float("nan"), float("inf")])
@@ -697,7 +697,7 @@ def test_transfer_native_owner_with_quantized_stiction_plant_reaches_twenty_degr
     assert regulation_ticks+feedback_ticks > 0 if continuous else regulation_ticks+feedback_ticks == 0
     # Soft governor may pause and resume repeatedly; outer positioning/cycle
     # deadlines and the command-exposure budget bound the operation.
-    assert controller._fixed.settings.staged_assist.motion_control.continuous_speed_limit_rad_s == .039
+    assert controller._fixed.settings.staged_assist.motion_control.continuous_speed_limit_rad_s == .0585
     if continuous:
         # Intermediate calibration uses prescribed encoder motion, not the
         # mechanical model above. Then test the SAME native return controller

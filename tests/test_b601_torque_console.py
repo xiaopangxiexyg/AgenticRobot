@@ -92,7 +92,7 @@ def test_acquisition_velocity_ceiling_preserves_ordinary_debug(joint, limit, ind
             B601TorqueExperiment(limits, quantized_velocity_debug=True, onset_capture=capture)
 
 
-@pytest.mark.parametrize("limit,accepted", [(.10,True),(.13,True),(.130001,False)])
+@pytest.mark.parametrize("limit,accepted", [(.10,True),(.13,True),(.130001,True),(.195,True),(.195001,False)])
 def test_explicit_release_acquisition_accepts_only_authorized_raw_speed_ceiling(limit,accepted):
     limits = B601TorqueExperimentLimits("joint3",max_joint_velocity_rad_s=limit)
     capture = B601MotionOnsetCaptureConfig(raw_joint_velocity_limit_rad_s=.15,release_support_confirmation=True)
@@ -103,7 +103,7 @@ def test_explicit_release_acquisition_accepts_only_authorized_raw_speed_ceiling(
         assert controller._hard_velocity_limit(2) == .15
         assert controller._hard_velocity_limit(3) == limit
     else:
-        with pytest.raises(ValueError,match="hard limit at most 0.13"):
+        with pytest.raises(ValueError,match="hard limit at most 0.195"):
             B601TorqueExperiment(limits,quantized_velocity_debug=True,
                 onset_capture=capture,onset_probe=B601OnsetProbeConfig())
 

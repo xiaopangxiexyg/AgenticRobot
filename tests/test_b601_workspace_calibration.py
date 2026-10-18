@@ -495,7 +495,7 @@ def production_controller(tmp_path):
         "--allow-motion", "--torque-console-auto-calibration-profile", str(profile),
         "--torque-console-confirmation", "B601_RS_TORQUE_CONSOLE", "--rate-hz", "100",
         "--torque-console-joint", "joint3", "--torque-console-max-assist-nm", "1",
-        "--torque-console-max-joint-velocity-rad-s", ".13", "--torque-console-max-excursion-rad", ".1",
+        "--torque-console-max-joint-velocity-rad-s", ".195", "--torque-console-max-excursion-rad", ".1",
         "--torque-console-staged-target-offset-limit-rad", ".09",
         "--torque-console-staged-breakaway-torque-nm", "1",
         "--torque-console-staged-breakaway-rise-slew-nm-s", "1",
@@ -533,7 +533,12 @@ def test_workspace_production_profile_constructs_every_child_before_motion(
     assert staged.tracking_recovery_gain_nm_per_rad == 20
     assert staged.onset_handoff == "track"
     assert staged.max_total_overlay_nm == 1
-    assert child.limits.max_joint_velocity_rad_s == .13
+    assert child.limits.max_joint_velocity_rad_s == .195
+    assert staged.motion_control.max_reference_lag_rad == .0195
+    assert staged.motion_control.soft_velocity_rad_s == .0585
+    assert staged.motion_control.continuous_speed_limit_rad_s == .0585
+    assert staged.motion_control.max_control_gap_sec == .04
+    assert staged.settle_error_rad == .01352
     # The wrapper's cycle section does not configure workspace children.
     # Recovery must be explicit for positioning, never silently for sweeps.
     assert staged.motion_control.support_soft_speed_recovery is positioning

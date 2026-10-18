@@ -210,10 +210,12 @@ class B601TorqueExperiment:
         if not isinstance(quantized_velocity_debug, bool):
             raise TypeError("quantized_velocity_debug must be boolean")
         # Acquisition has a separate onset speed guard; retain the original
-        # ceiling for ordinary quantized-velocity commissioning.
+        # ceiling for ordinary quantized-velocity commissioning. The explicit
+        # release/support-confirmed acquisition accepts the authorized .195
+        # envelope only when the caller requests it; no default is raised.
         velocity_ceiling = 0.05
         if isinstance(onset_capture, B601MotionOnsetCaptureConfig) and onset_capture.raw_joint_velocity_limit_rad_s is not None:
-            velocity_ceiling = 0.13 if onset_capture.release_support_confirmation else 0.07
+            velocity_ceiling = 0.195 if onset_capture.release_support_confirmation else 0.07
         if quantized_velocity_debug and (
             limits.joint_name != "joint3" or limits.max_joint_velocity_rad_s > velocity_ceiling
         ):
