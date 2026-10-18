@@ -7691,24 +7691,36 @@ class RM65ArmBackend(EffectorBackend):
         """
 
         with self._state_lock:
-            current_qpos = None if self._current_qpos is None else self._current_qpos.copy()
-            attempted_qpos = (
-                None if self._last_attempted_qpos is None else self._last_attempted_qpos.copy()
+            # Command/qpos publishers replace bindings rather than editing the
+            # arrays in place. Capture bindings with their attempted, accepted
+            # and measured receipts at the publication-lock boundary, then
+            # detach the payload outside the command lock: a NumPy copy can
+            # relinquish the GIL without blocking a newer command publication.
+            array_bindings = (
+                self._current_qpos,
+                self._last_attempted_qpos,
+                self._last_accepted_qpos,
+                self._measured_qpos,
+                self._last_hardware_qpos,
+                self._last_target_qpos,
+                self._last_command,
             )
-            accepted_qpos = (
-                None if self._last_accepted_qpos is None else self._last_accepted_qpos.copy()
-            )
-            measured_qpos = None if self._measured_qpos is None else self._measured_qpos.copy()
-            hardware_qpos = (
-                None if self._last_hardware_qpos is None else self._last_hardware_qpos.copy()
-            )
-            last_target_qpos = (
-                None if self._last_target_qpos is None else self._last_target_qpos.copy()
-            )
-            last_command = None if self._last_command is None else self._last_command.copy()
+            # Preserve the existing copy boundary for the legacy SDK pose,
+            # which may arrive as an externally owned array.
             hardware_pose_6d = (
                 None if self._last_hardware_pose_6d is None else self._last_hardware_pose_6d.copy()
             )
+            attempted_timestamp = self._last_attempted_timestamp
+            attempted_monotonic = self._last_attempted_monotonic
+            attempted_sequence = int(self._last_attempted_sequence)
+            accepted_timestamp = self._last_accepted_timestamp
+            accepted_monotonic = self._last_accepted_monotonic
+            accepted_sequence = int(self._last_accepted_sequence)
+            last_command_timestamp = self._last_command_timestamp
+            send_result_code = self._last_send_result_code
+            send_result_text = self._last_send_result_text
+            effective_control_dt = float(self._last_effective_control_dt)
+            effective_step_scale = float(self._last_effective_step_scale)
             hardware_read_time = self._last_hardware_read_time
             hardware_read_monotonic = self._last_hardware_read_monotonic
             hardware_read_success = self._last_hardware_read_success
@@ -7734,6 +7746,15 @@ class RM65ArmBackend(EffectorBackend):
                 if include_background_streaming
                 else {}
             )
+        (
+            current_qpos,
+            attempted_qpos,
+            accepted_qpos,
+            measured_qpos,
+            hardware_qpos,
+            last_target_qpos,
+            last_command,
+        ) = (None if value is None else value.copy() for value in array_bindings)
         if include_background_streaming and include_timing_percentiles:
             background_streaming["timing_percentiles"] = (
                 self._background_stream_timing_percentiles_snapshot()
@@ -7795,13 +7816,13 @@ class RM65ArmBackend(EffectorBackend):
                 else "last_accepted_command_or_local_anchor"
             ),
             "last_attempted_qpos": attempted_qpos,
-            "last_attempted_timestamp": self._last_attempted_timestamp,
-            "last_attempted_timestamp_monotonic": self._last_attempted_monotonic,
-            "last_attempted_sequence": int(self._last_attempted_sequence),
+            "last_attempted_timestamp": attempted_timestamp,
+            "last_attempted_timestamp_monotonic": attempted_monotonic,
+            "last_attempted_sequence": attempted_sequence,
             "last_accepted_qpos": accepted_qpos,
-            "last_accepted_timestamp": self._last_accepted_timestamp,
-            "last_accepted_timestamp_monotonic": self._last_accepted_monotonic,
-            "last_accepted_sequence": int(self._last_accepted_sequence),
+            "last_accepted_timestamp": accepted_timestamp,
+            "last_accepted_timestamp_monotonic": accepted_monotonic,
+            "last_accepted_sequence": accepted_sequence,
             "measured_qpos": measured_qpos,
             "measured_timestamp": measured_timestamp,
             "measured_timestamp_monotonic": measured_monotonic,
@@ -7811,7 +7832,7 @@ class RM65ArmBackend(EffectorBackend):
             "last_target_qpos": last_target_qpos,
             "last_target_tcp_pose": last_target_tcp_pose,
             "last_command": last_command,
-            "last_command_timestamp": self._last_command_timestamp,
+            "last_command_timestamp": last_command_timestamp,
             "arm_state_source": (
                 "hardware_observation_only"
                 if self.config.observation_only
@@ -7839,8 +7860,8 @@ class RM65ArmBackend(EffectorBackend):
             "hardware_result_text": hardware_result_text,
             "hardware_arm_err": hardware_arm_err,
             "hardware_sys_err": hardware_sys_err,
-            "send_result_code": self._last_send_result_code,
-            "send_result_text": self._last_send_result_text,
+            "send_result_code": send_result_code,
+            "send_result_text": send_result_text,
             "hardware_ready": hardware_ready,
             "hardware_ready_source": hardware_ready_source,
             "emergency_stopped": emergency_stopped,
@@ -7848,8 +7869,8 @@ class RM65ArmBackend(EffectorBackend):
             "canfd_follow": bool(self.config.canfd_follow),
             "canfd_trajectory_mode": int(self.config.canfd_trajectory_mode),
             "canfd_radio": int(self.config.canfd_radio),
-            "effective_control_dt_sec": float(self._last_effective_control_dt),
-            "effective_step_scale": float(self._last_effective_step_scale),
+            "effective_control_dt_sec": effective_control_dt,
+            "effective_step_scale": effective_step_scale,
             "ik_metadata": ik_metadata,
             "singularity_metadata": singularity_metadata,
             "singularity_protection_ready": bool(self._singularity_protection_ready),

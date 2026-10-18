@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 from unittest import mock
 
 import numpy as np
@@ -37,6 +38,125 @@ from teleop_runtime.session import (
     TeleopSession,
     TeleopSessionConfig,
 )
+
+
+def _snapshot_backend() -> RM65ArmBackend:
+    backend = RM65ArmBackend(RM65ArmBackendConfig(
+        arm_ip="0.0.0.0", side="left", connect_hardware=False,
+        initial_qpos=(0.0,) * 6, singularity_protection_enabled=False,
+    ))
+    with backend._state_lock:
+        backend._record_command_attempt_locked(
+            np.zeros(6), timestamp=101.0, monotonic_time=11.0,
+        )
+        backend._record_command_accepted_locked(
+            np.zeros(6), timestamp=101.0, monotonic_time=11.0,
+        )
+    return backend
+
+
+def test_get_state_does_not_mix_accepted_qpos_with_a_newer_receipt(monkeypatch) -> None:
+    backend = _snapshot_backend()
+    with backend._state_lock:
+        backend._last_command = np.full(7, 0.2)
+        backend._last_command_timestamp = 101.0
+        backend._last_send_result_code = 0
+        backend._last_send_result_text = "old-result"
+        backend._last_effective_control_dt = 0.02
+        backend._last_effective_step_scale = 0.8
+    original = backend._active_tcp_pose_flange_m_rad
+
+    def publish_after_capture():
+        with backend._state_lock:
+            backend._record_command_attempt_locked(
+                np.full(6, 0.01), timestamp=102.0, monotonic_time=12.0,
+            )
+            backend._record_command_accepted_locked(
+                np.full(6, 0.01), timestamp=102.0, monotonic_time=12.0,
+            )
+            backend._last_command = np.full(7, 0.3)
+            backend._last_command_timestamp = 102.0
+            backend._last_send_result_code = 7
+            backend._last_send_result_text = "new-result"
+            backend._last_effective_control_dt = 0.04
+            backend._last_effective_step_scale = 0.4
+        return original()
+
+    monkeypatch.setattr(backend, "_active_tcp_pose_flange_m_rad", publish_after_capture)
+    snapshot = backend.get_state(include_derived_pose=False, include_timing_percentiles=False)
+    for family in ("attempted", "accepted"):
+        np.testing.assert_array_equal(snapshot[f"last_{family}_qpos"], np.zeros(6))
+        assert snapshot[f"last_{family}_timestamp"] == 101.0
+        assert snapshot[f"last_{family}_timestamp_monotonic"] == 11.0
+        assert snapshot[f"last_{family}_sequence"] == 1
+    np.testing.assert_array_equal(snapshot["last_command"], np.full(7, 0.2))
+    assert snapshot["last_command_timestamp"] == 101.0
+    assert snapshot["send_result_code"] == 0
+    assert snapshot["send_result_text"] == "old-result"
+    assert snapshot["effective_control_dt_sec"] == 0.02
+    assert snapshot["effective_step_scale"] == 0.8
+    np.testing.assert_array_equal(backend._last_accepted_qpos, np.full(6, 0.01))
+    assert backend._last_accepted_sequence == 2
+
+
+def test_get_state_payload_copy_does_not_hold_the_command_publication_lock() -> None:
+    backend = _snapshot_backend()
+    copy_started, published = threading.Event(), threading.Event()
+    errors = []
+
+    class CopyBarrier(np.ndarray):
+        def copy(self, *args, **kwargs):
+            copy_started.set()
+            assert published.wait(1.0), "state payload copy held the command publication lock"
+            return np.asarray(self).copy(*args, **kwargs)
+
+    backend._current_qpos = np.zeros(6).view(CopyBarrier)
+
+    def publish():
+        if not copy_started.wait(2.0):
+            errors.append("state copy was not reached")
+            return
+        with backend._state_lock:
+            backend._record_command_accepted_locked(
+                np.full(6, 0.01), timestamp=102.0, monotonic_time=12.0,
+            )
+        published.set()
+
+    worker = threading.Thread(target=publish)
+    worker.start()
+    try:
+        snapshot = backend.get_state(include_derived_pose=False, include_timing_percentiles=False)
+    finally:
+        worker.join(timeout=2.0)
+    assert not worker.is_alive()
+    assert not errors
+    np.testing.assert_array_equal(snapshot["current_qpos"], np.zeros(6))
+    np.testing.assert_array_equal(snapshot["last_accepted_qpos"], np.zeros(6))
+    assert snapshot["last_accepted_sequence"] == 1
+    assert backend._last_accepted_sequence == 2
+
+
+@pytest.mark.parametrize("attribute,key,dimension", [
+    ("_current_qpos", "current_qpos", 6),
+    ("_last_attempted_qpos", "last_attempted_qpos", 6),
+    ("_last_accepted_qpos", "last_accepted_qpos", 6),
+    ("_measured_qpos", "measured_qpos", 6),
+    ("_last_hardware_qpos", "hardware_qpos", 6),
+    ("_last_target_qpos", "last_target_qpos", 6),
+    ("_last_command", "last_command", 7),
+    ("_last_hardware_pose_6d", "hardware_pose_6d", 6),
+])
+def test_get_state_array_payload_stays_detached(attribute, key, dimension) -> None:
+    backend = _snapshot_backend()
+    original = np.arange(dimension, dtype=float) / 100
+    with backend._state_lock:
+        setattr(backend, attribute, original.copy())
+    snapshot = backend.get_state(include_derived_pose=False, include_timing_percentiles=False)
+    result = snapshot[key]
+    np.testing.assert_array_equal(result, original)
+    assert not np.shares_memory(result, getattr(backend, attribute))
+    result[:] = 7.0
+    np.testing.assert_array_equal(getattr(backend, attribute), original)
 
 
 class _FakeRM65Arm:
@@ -574,3 +694,114 @@ def test_assembler_accepts_successful_valid_fresh_sequenced_feedback() -> None:
     assert state["runtime_arm_state_source"] == "causal_measured_hardware"
     assert state["causal_measured_state_eligible"] is True
     assert state["causal_measured_state_rejection_reason"] == "accepted"
+
+
+@pytest.mark.parametrize("publisher,attribute,key", [
+    ("_record_command_attempt_locked", "_last_attempted_qpos", "last_attempted_qpos"),
+    ("_record_command_accepted_locked", "_last_accepted_qpos", "last_accepted_qpos"),
+    ("_record_measured_qpos_locked", "_measured_qpos", "measured_qpos"),
+])
+def test_get_state_publisher_owns_input_and_preserves_replaced_binding(
+    publisher, attribute, key,
+) -> None:
+    backend = _snapshot_backend()
+    expected = np.arange(6, dtype=float) / 1000
+    caller_value = expected.copy()
+    with backend._state_lock:
+        getattr(backend, publisher)(caller_value, timestamp=201.0, monotonic_time=21.0)
+        old_binding = getattr(backend, attribute)
+    assert not np.shares_memory(old_binding, caller_value)
+    caller_value[:] = 7.0
+    snapshot = backend.get_state(include_derived_pose=False, include_timing_percentiles=False)
+    np.testing.assert_array_equal(snapshot[key], expected)
+    with backend._state_lock:
+        getattr(backend, publisher)(np.full(6, 0.02), timestamp=202.0, monotonic_time=22.0)
+    np.testing.assert_array_equal(old_binding, expected)
+    np.testing.assert_array_equal(snapshot[key], expected)
+    assert getattr(backend, attribute) is not old_binding
+
+
+def test_get_state_real_command_value_stays_detached_after_publication_and_replacement() -> None:
+    backend = _direct_backend(0)
+    command = _joint_command(0.01)
+    backend.send_command(command)
+    snapshot = backend.get_state(include_derived_pose=False, include_timing_percentiles=False)
+    stored = backend._last_command
+    result = snapshot["last_command"]
+    assert isinstance(stored, EffectorCommand)
+    assert isinstance(result, EffectorCommand)
+    assert result is not stored
+    assert not np.shares_memory(stored.value, command.value)
+    assert not np.shares_memory(result.value, stored.value)
+    command.value[:] = 7.0
+    np.testing.assert_array_equal(stored.value, np.full(6, 0.01))
+    backend.send_command(_joint_command(0.02))
+    np.testing.assert_array_equal(result.value, np.full(6, 0.01))
+    result.value[:] = 9.0
+    np.testing.assert_array_equal(backend._last_command.value, np.full(6, 0.02))
+
+
+@pytest.mark.parametrize("include_background_streaming", [False, True])
+@pytest.mark.parametrize("include_timing_percentiles", [False, True])
+def test_get_state_preserves_optional_background_snapshot_work(
+    monkeypatch, include_background_streaming, include_timing_percentiles,
+) -> None:
+    backend = _snapshot_backend()
+    calls = []
+
+    def background():
+        calls.append("background")
+        return {"snapshot": "marker"}
+
+    def timings():
+        calls.append("timings")
+        return {"samples": 3}
+
+    monkeypatch.setattr(backend, "_background_stream_snapshot_locked", background)
+    monkeypatch.setattr(backend, "_background_stream_timing_percentiles_snapshot", timings)
+    snapshot = backend.get_state(
+        include_derived_pose=False,
+        include_background_streaming=include_background_streaming,
+        include_timing_percentiles=include_timing_percentiles,
+    )
+    expected = {}
+    expected_calls = []
+    if include_background_streaming:
+        expected["snapshot"] = "marker"
+        expected_calls.append("background")
+        if include_timing_percentiles:
+            expected["timing_percentiles"] = {"samples": 3}
+            expected_calls.append("timings")
+    assert snapshot["background_streaming"] == expected
+    assert calls == expected_calls
+
+
+def test_get_state_keeps_legacy_sdk_pose_copy_inside_publication_lock() -> None:
+    backend = _snapshot_backend()
+    acquired_by_other_thread = []
+    threads = []
+
+    class LockProbe(np.ndarray):
+        def copy(self, *args, **kwargs):
+            def try_lock():
+                acquired = backend._state_lock.acquire(blocking=False)
+                acquired_by_other_thread.append(acquired)
+                if acquired:
+                    backend._state_lock.release()
+
+            worker = threading.Thread(target=try_lock)
+            threads.append(worker)
+            worker.start()
+            worker.join(timeout=2.0)
+            assert not worker.is_alive()
+            return np.asarray(self).copy(*args, **kwargs)
+
+    with backend._state_lock:
+        backend._last_hardware_pose_6d = np.arange(6, dtype=float).view(LockProbe)
+    try:
+        snapshot = backend.get_state(include_derived_pose=False, include_timing_percentiles=False)
+    finally:
+        for worker in threads:
+            worker.join(timeout=2.0)
+    assert acquired_by_other_thread == [False]
+    np.testing.assert_array_equal(snapshot["hardware_pose_6d"], np.arange(6, dtype=float))
