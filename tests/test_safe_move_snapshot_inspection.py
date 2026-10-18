@@ -13,6 +13,23 @@ from scripts.probes import inspect_safe_move_snapshot as probe
 pytestmark = [pytest.mark.unit, pytest.mark.contract]
 
 
+def test_resolve_inputs_constructs_real_default_filter_without_nonexistent_profile_fields(tmp_path, monkeypatch):
+    urdf = tmp_path / 'physical.urdf'; urdf.write_text('<robot name="test"/>')
+    (tmp_path / 'camera_mount_urdf.urdf').write_bytes(urdf.read_bytes())
+    profile = SimpleNamespace(scene_world_from_arm_base_by_side={},
+        scene_world_from_canonical_station=np.eye(4),
+        tool_tcp_pose_flange_m_rad_by_side={s: np.zeros(6) for s in ('left', 'right')})
+    monkeypatch.setattr(probe, 'resolve_exclusive_rm65_skill_deployment_profile', lambda _: profile)
+    monkeypatch.setattr(probe, 'build_exclusive_rm65_skill_target_builder', lambda _: object())
+    monkeypatch.setattr(probe, 'build_real_perception_source_binding', lambda **_: object())
+    monkeypatch.setattr(probe, 'build_rm65_rgb_camera_geometry', lambda **_: object())
+    # Keep the real filter constructor: the profile deliberately has no self-box field.
+    selected, _, _, _, cleaner = probe.resolve_inputs(tmp_path, urdf)
+    assert selected is profile
+    assert cleaner.config.depth_tolerance_m == .015
+    assert cleaner._runtime is None
+
+
 def capture(role='main'):
     return RealAlignedRgbdCapture(source_id=probe.SOURCES[role], role=role, acquired_at=10.,
         station_revision=0, source_generation=1, frame_index=2, capture_group_id='test:cut',

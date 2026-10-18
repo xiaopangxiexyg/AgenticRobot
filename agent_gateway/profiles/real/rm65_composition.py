@@ -36,6 +36,7 @@ from dataset_contracts.canonical_encoding import canonical_content_hash
 from robot_motion.coordinate_frames import CoordinateFrameGraph
 from robot_motion.rm65.captured_robot_observations import (
     RM65CapturedRobotObservationFilter,
+    RM65CapturedRobotObservationFilterConfig,
 )
 from teleop_runtime.skill_deploy import (
     RM65_SKILL_SCENE_WORLD_FRAME_ID_V1,
@@ -277,6 +278,9 @@ def assemble_exclusive_rm65_agent_primitive_composition(
     artifact_root: str | Path | None = None,
     planned_trajectory_dir: str | Path | None = None,
     camera_mount_urdf_path: str | Path | None = None,
+    captured_robot_filter_config: RM65CapturedRobotObservationFilterConfig | None = None,
+    captured_robot_observation_urdf_path: str | Path | None = None,
+    self_observation_proxy_urdf_path: str | Path | None = None,
     object_localizer: object | None = None,
     point_grasp_planner: object | None = None,
     enable_grasp_observation: bool = False,
@@ -447,6 +451,20 @@ def assemble_exclusive_rm65_agent_primitive_composition(
         )
 
     profile = lower.profile
+    if camera_mount_urdf_path is None and any(value is not None for value in (
+        captured_robot_filter_config, captured_robot_observation_urdf_path,
+        self_observation_proxy_urdf_path,
+    )):
+        raise ValueError("Captured-robot filter options require a physical camera mount URDF.")
+    captured_robot_observation_filter = (
+        None if camera_mount_urdf_path is None else
+        RM65CapturedRobotObservationFilter.for_binding(
+            urdf_path=camera_mount_urdf_path, config=captured_robot_filter_config,
+            observation_urdf_path=captured_robot_observation_urdf_path,
+            self_observation_proxy_urdf_path=self_observation_proxy_urdf_path,
+            tool_tcp_pose_flange_m_rad_by_side=profile.tool_tcp_pose_flange_m_rad_by_side,
+        )
+    )
     if profile.station_world_frame_id != RM65_SKILL_EXECUTION_FRAME_ID_V1:
         raise ValueError(
             "lower Station world frame does not match the real Skill execution frame"
@@ -523,6 +541,11 @@ def assemble_exclusive_rm65_agent_primitive_composition(
             "active_side": side,
             "inactive_side_semantics": "coupled_solver_hard_hold",
             "command_owner_count": 1,
+            **({"captured_robot_filter": {
+                "config_hash": captured_robot_observation_filter.config.semantic_content_hash,
+                "input_binding_hash": captured_robot_observation_filter.input_binding_hash,
+            }} if captured_robot_observation_filter is not None
+                and captured_robot_observation_filter.config.geometry_mode != "legacy" else {}),
             **({"safe_motion_observation": asdict(safe_motion_observation_config)}
                if safe_motion_observation_config is not None else {}),
         },
@@ -921,14 +944,6 @@ def assemble_exclusive_rm65_agent_primitive_composition(
             available_at=derived_available_at,
             evidence_refs=cut.evidence_refs,
         )
-
-    captured_robot_observation_filter = (
-        None
-        if camera_mount_urdf_path is None
-        else RM65CapturedRobotObservationFilter(
-            urdf_path=camera_mount_urdf_path
-        )
-    )
 
     try:
         convergence_profile = RealAgentPrimitiveConvergenceProfile()

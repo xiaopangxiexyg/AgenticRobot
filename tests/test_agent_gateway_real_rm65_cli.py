@@ -15,6 +15,13 @@ from agent_gateway.profiles.real.session_authorization import (
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
+def test_capture_filter_cli_defaults_never_select_extended_geometry():
+    parser = gateway_cli.build_parser()
+    for name in ('captured_robot_filter_config', 'captured_robot_observation_urdf',
+                 'captured_robot_self_envelope_urdf'):
+        assert parser.get_default(name) is None
+
+
 @pytest.mark.parametrize("event", ["gateway_ready", "gateway_stopped"])
 def test_lifecycle_json_and_newline_are_written_together(monkeypatch, event):
     writes = []

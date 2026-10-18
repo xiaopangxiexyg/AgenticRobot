@@ -90,3 +90,29 @@ stepped 自体包络与独立 rigid 近似，输出目录必须不存在。stepp
 原两盒或 core 加 upper/lower 的三盒候选，并构造与实际几何相符的完整 pair 集。默认仍是原
 `rm65_dual_arm_hand_proxy_dmtac_strict.urdf` 和 20 对检查；三盒候选是 31 对，不自动被 CLI、
 Skill 或执行链选中。这是离线候选加载能力，不能代替具体模型的几何覆盖和执行验收。
+## 显式自观测过滤候选
+
+`build_rm65_self_observation_urdf.py` 从已绑定的物理 URDF 和人工复核的胶囊参数生成新目录，
+只追加固定在原 link 上的 visual mesh；不改源文件、碰撞模型或默认资产绑定。参数中的
+端点和半径单位为米，端点位于指定 parent link 的坐标系。生成结果仍需几何与负对照复核。
+
+快照检查、双臂冻结重放及真实 RM65 Gateway 共用以下显式选项：
+
+- `--captured-robot-filter-config`：JSON 配置；省略时保留旧 15 mm 深度范围、旧匹配与证据哈希。
+- `--captured-robot-observation-urdf`：物理 URDF 的 visual-only 克隆；原 link、joint、collision 必须一致。
+- `--captured-robot-self-envelope-urdf`：显式的 stepped 三盒/手候选，仅将末端两盒用于捕获时自观测。
+
+后两个资源选项必须同时选择扩展过滤模式，不能隐式改变默认行为。以下配置显式启用
+源实现的 CAD 全图射线、工具椭球容差和 50 mm 手臂表面窗口：
+
+```json
+{"geometry_mode":"cad_surface","depth_tolerance_m":0.025,
+ "tool_surface_bounds_m":[[-0.045,0.045],[-0.05,0.05],[-0.05,0.05]],
+ "body_surface_tolerance_m":0.05}
+```
+
+`link_primitives` 需完整左右 TCP 标定、显式工具范围和 stepped 自观测盒；未识别的附件必须
+选择 `cad_surface`。`Config.for_urdf(...)` 是显式候选选择器，不会被默认构造调用。
+两种扩展模式只删除冻结捕获中的背景点，始终保护目标标签；缓存仅保存模型局部几何和查询树，
+每帧重新计算双臂与相机变换。输入哈希绑定 URDF 描述、TCP 和自观测盒参数，不是外部 mesh
+内容的完整覆盖证明。运动碰撞仍使用原严格模型与检查对，未将 rigid 候选换为默认。

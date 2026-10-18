@@ -29,7 +29,9 @@ from deployments.perception.sam2_graspgenx_point_grasp import (
     GraspGenXPointGraspModelSpec, Sam2GraspGenXPointGraspPlanner,
     GRASPGENX_DMTAC_REACHABILITY_ORIENTATION_VARIANTS_LOCAL_AXIS_DEG,
 )
-from robot_motion.rm65.captured_robot_observations import RM65CapturedRobotObservationFilter
+from robot_motion.rm65.captured_robot_observations import (
+    RM65CapturedRobotObservationFilter, RM65CapturedRobotObservationFilterConfig,
+)
 from robot_motion.grasp_visible_scene import VisibleGraspScene
 from teleop_runtime.skill_deploy.rm65_grasp_trajectory import RM65GraspJointTrajectoryPlanner, RM65GraspTrajectoryPlanningConfig, RM65GraspTrajectoryPlanningError
 from teleop_runtime.skill_deploy.rm65_lower_assembly import (
@@ -149,7 +151,13 @@ def prepare(args):
         views[role] = GraspRgbdView(role, rgb, depth, {**frame["intrinsics"], "width": rgb.shape[1], "height": rgb.shape[0]}, station_from_camera, frame["received_at"])
     anchor = views[args.anchor]
     mask = np.load(args.mask, allow_pickle=False)
-    cleaner = RM65CapturedRobotObservationFilter(urdf_path=args.urdf)
+    config_path = getattr(args, "captured_robot_filter_config", None)
+    cleaner = RM65CapturedRobotObservationFilter.for_binding(urdf_path=args.urdf,
+        config=(None if config_path is None else
+            RM65CapturedRobotObservationFilterConfig.from_json_file(config_path)),
+        observation_urdf_path=getattr(args, "captured_robot_observation_urdf", None),
+        self_observation_proxy_urdf_path=getattr(args, "captured_robot_self_envelope_urdf", None),
+        tool_tcp_pose_flange_m_rad_by_side=profile.tool_tcp_pose_flange_m_rad_by_side)
     cleaning = {}
 
     def clean_depth(view, target_mask):
@@ -356,6 +364,9 @@ def main():
     for name in ("repo", "canonical", "capture", "mask", "urdf", "output", "bundle"):
         p.add_argument("--"+name, required=True, type=Path)
     p.add_argument("--inference", type=Path)
+    p.add_argument("--captured-robot-filter-config", type=Path)
+    p.add_argument("--captured-robot-observation-urdf", type=Path)
+    p.add_argument("--captured-robot-self-envelope-urdf", type=Path)
     p.add_argument("--model-manifest", type=Path)
     p.add_argument("--aux-segmentation", type=Path, action="append", default=[],
                    help="Saved real segment probe output; repeat for each auxiliary view")

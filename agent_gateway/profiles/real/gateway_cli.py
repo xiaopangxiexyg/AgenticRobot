@@ -44,6 +44,9 @@ from deployments.perception.dmtac_grasp_overlay import (
     reviewed_graspgenx_dmtac_solid_geometry,
 )
 from robot_motion.rm65 import RM65_BIMANUAL_POSITION_V1_NAME
+from robot_motion.rm65.captured_robot_observations import (
+    RM65CapturedRobotObservationFilter, RM65CapturedRobotObservationFilterConfig,
+)
 from teleop_runtime.skill_deploy import (
     ExclusiveRM65SkillDeploymentProfile,
     assemble_exclusive_rm65_skill_lower,
@@ -236,6 +239,12 @@ def build_parser() -> argparse.ArgumentParser:
             "defaults to model/perception/graspgenx"
         ),
     )
+    parser.add_argument("--captured-robot-filter-config", type=Path,
+                        help="Explicit filter JSON; default preserves legacy 15 mm policy")
+    parser.add_argument("--captured-robot-observation-urdf", type=Path,
+                        help="Visual-only clone of the physical camera mount URDF")
+    parser.add_argument("--captured-robot-self-envelope-urdf", type=Path,
+                        help="Explicit stepped DMTAC capture-only envelope")
     parser.add_argument(
         "--camera-mount-urdf",
         type=Path,
@@ -1071,6 +1080,25 @@ def main(argv: list[str] | None = None) -> int:
             urdf_path=camera_mount_urdf,
             collision_scene_profile=args.collision_scene_profile,
         )
+    captured_robot_filter_config = None
+    filter_options = (args.captured_robot_filter_config,
+                      args.captured_robot_observation_urdf,
+                      args.captured_robot_self_envelope_urdf)
+    if any(value is not None for value in filter_options):
+        if camera_mount_urdf is None:
+            parser.error("captured-robot filter options require composed camera geometry")
+        try:
+            if args.captured_robot_filter_config is not None:
+                captured_robot_filter_config = RM65CapturedRobotObservationFilterConfig.from_json_file(
+                    args.captured_robot_filter_config)
+            # Validate resource/config pairs before constructing lower resources.
+            RM65CapturedRobotObservationFilter.for_binding(
+                urdf_path=camera_mount_urdf, config=captured_robot_filter_config,
+                observation_urdf_path=args.captured_robot_observation_urdf,
+                self_observation_proxy_urdf_path=args.captured_robot_self_envelope_urdf,
+                tool_tcp_pose_flange_m_rad_by_side=resolved.tool_tcp_pose_flange_m_rad_by_side)
+        except (OSError, ValueError, TypeError) as error:
+            parser.error(f"invalid captured-robot filter options: {error}")
     lower_kwargs: dict[str, object] = {"profile": resolved}
     if args.rm65_feedback_source == "udp":
         if not 1 <= args.rm65_udp_port <= 65535:
@@ -1270,6 +1298,9 @@ def main(argv: list[str] | None = None) -> int:
         artifact_root=artifact_root,
         planned_trajectory_dir=planned_trajectory_dir,
         camera_mount_urdf_path=camera_mount_urdf,
+        captured_robot_filter_config=captured_robot_filter_config,
+        captured_robot_observation_urdf_path=args.captured_robot_observation_urdf,
+        self_observation_proxy_urdf_path=args.captured_robot_self_envelope_urdf,
         object_localizer=object_localizer,
         point_grasp_planner=point_grasp_planner,
         enable_grasp_observation=args.enable_grasp_observation,

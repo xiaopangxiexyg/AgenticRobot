@@ -65,6 +65,37 @@ from teleop_runtime.skill_deploy.rm65_profile import (
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
+@pytest.mark.parametrize('mode', ['legacy', 'cad_surface'])
+def test_explicit_capture_filter_binds_one_owner_without_starting_resources(monkeypatch, tmp_path, mode):
+    from robot_motion.rm65.captured_robot_observations import RM65CapturedRobotObservationFilterConfig
+    from agent_gateway.profiles.real.motion_observed_scene import SafeMotionObservationConfig
+    bindings = []
+    original = composition_module.ObservedSafeMovePlanner
+    def adapter(**kwargs):
+        bindings.append(kwargs)
+        return original(**kwargs)
+    monkeypatch.setattr(composition_module, 'ObservedSafeMovePlanner', adapter)
+    lower, guard = _lower(monkeypatch)
+    cfg = RM65CapturedRobotObservationFilterConfig(geometry_mode=mode,
+        depth_tolerance_m=.015 if mode == 'legacy' else .025)
+    (tmp_path / 'artifacts').mkdir()
+    result = assemble_exclusive_rm65_agent_primitive_composition(lower=lower,
+        socket_path=tmp_path / 'gateway.sock', authorized_side='right',
+        authorized_action='move_tcp_to_pose_safe', confirmation_token=REAL_AGENT_PRIMITIVE_CONFIRM_TOKEN,
+        client_id='rpent:test', client_uid=1000, runtime_session_id='filter:test',
+        control_domain_id='filter:domain', embodiment_instance_id='filter:embodiment',
+        camera_config_path=REPO_ROOT / 'teleop_runtime/configs/devices/agent_gateway_realsense.json',
+        camera_registry_path=DEFAULT_RM65_CAMERA_REGISTRY_V4, artifact_root=tmp_path / 'artifacts',
+        camera_mount_urdf_path=DEFAULT_RM65_CAMERA_MOUNT_URDF,
+        safe_motion_observation_config=SafeMotionObservationConfig(), captured_robot_filter_config=cfg)
+    cleaner = bindings[0]['self_filter']
+    assert cleaner.config is cfg and cleaner._runtime is None
+    assert bool(cleaner.input_binding_hash) == (mode != 'legacy')
+    assert all(backend.starts == 0 for backend in lower.arm_backends.values())
+    assert guard.starts == 0 and not (tmp_path / 'gateway.sock').exists()
+    result.deployment.gateway_session.close()
+
+
 @pytest.fixture(autouse=True)
 def _preflight_without_af_unix_path_binding(monkeypatch) -> None:
     """The isolated worktree path itself exceeds Linux's AF_UNIX limit."""

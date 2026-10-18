@@ -7,7 +7,7 @@ this module.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from itertools import combinations
 from pathlib import Path
 from typing import Literal
@@ -460,6 +460,59 @@ def _load_fixed_scene_box(urdf_path: Path, *, link_name: str) -> FixedSceneBoxSp
     return _build_fixed_scene_box_spec(root, link_name=link_name)
 
 
+def _hand_boxes_in_flange_frame(urdf_path: Path, boxes: tuple[HandProxyBoxSpec, ...]) -> tuple[HandProxyBoxSpec, ...]:
+    """Preserve fixed hand-base offsets when binding observation to CAD FK."""
+    root = ET.parse(urdf_path).getroot()
+    result = []
+    for box in boxes:
+        flange = 'arm_link6' if box.side == 'left' else 'right_arm_link6'
+        cursor, seen = box.parent_link_name, set()
+        pose = _pose_matrix_from_xyz_rpy(box.joint_origin_xyz, box.joint_origin_rpy)
+        while cursor != flange:
+            if cursor in seen:
+                raise ValueError('Self proxy fixed chain contains a cycle')
+            seen.add(cursor)
+            joint = _find_fixed_joint_for_link(root, cursor)
+            xyz, rpy = _parse_origin(joint)
+            pose = _pose_matrix_from_xyz_rpy(xyz, rpy) @ pose
+            cursor = joint.find('parent').get('link')
+        result.append(replace(box, parent_link_name=flange,
+            joint_origin_xyz=tuple(pose[:3, 3]),
+            joint_origin_rpy=tuple(R.from_matrix(pose[:3, :3]).as_euler('xyz'))))
+    return tuple(result)
+
+
+def load_dmtac_self_observation_proxy_boxes(urdf_path: str | Path) -> tuple[HandProxyBoxSpec, ...]:
+    """Load explicit stepped observation geometry without selecting a motion model."""
+    path = Path(urdf_path).resolve(strict=True)
+    root = ET.parse(path).getroot()
+    for side in ("left", "right"):
+        cursor = side + "_hand_proxy"
+        flange = "arm_link6" if side == "left" else "right_arm_link6"
+        seen = set()
+        while cursor != flange:
+            if cursor in seen:
+                raise ValueError("Self proxy fixed chain contains a cycle")
+            seen.add(cursor)
+            joints = [joint for joint in root.findall("joint")
+                if joint.find("child") is not None
+                and joint.find("child").get("link") == cursor]
+            if len(joints) != 1 or joints[0].get("type") != "fixed":
+                raise ValueError("Self proxy requires a unique fixed chain to its flange")
+            parent = joints[0].find("parent")
+            if parent is None or not parent.get("link"):
+                raise ValueError("Self proxy fixed chain requires a parent link")
+            cursor = parent.get("link")
+    boxes = _load_hand_proxy_boxes(path, include_all_collision_boxes=True)
+    expected = tuple(f"{side}_hand_proxy_{index}"
+        for side in ("left", "right") for index in range(3))
+    if tuple(box.geometry_name for box in boxes) != expected:
+        raise ValueError("Self observation requires core and two stepped terminal boxes per hand")
+    return _hand_boxes_in_flange_frame(path, tuple(
+        box for box in boxes if not box.geometry_name.endswith("_0")
+    ))
+
+
 def build_dual_arm_scene_profile(
     name: str = DEFAULT_COLLISION_SCENE, *, dmtac_proxy_urdf_path: Path | None = None,
 ) -> DualArmSceneProfile:
@@ -694,6 +747,7 @@ def build_rm65_dual_arm_scene_profile(
 
 
 __all__ = [
+    "load_dmtac_self_observation_proxy_boxes",
     "DUAL_ARM_DMTAC_HAND_PROXY_CHECKED_COLLISION_PAIRS",
     "DUAL_ARM_HAND_PROXY_CHECKED_COLLISION_PAIRS",
     "DUAL_ARM_HAND_PROXY_COLLISION_FIXED_GEOMETRIES",

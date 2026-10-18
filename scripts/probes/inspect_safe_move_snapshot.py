@@ -25,7 +25,9 @@ from robot_motion.grasp_visible_scene import (
     PRODUCTION_VISIBLE_GRASP_DEPTH_FILTER, filter_isolated_background_depth,
 )
 from robot_motion.observed_obstacles import ObservedBoxDistance
-from robot_motion.rm65.captured_robot_observations import RM65CapturedRobotObservationFilter
+from robot_motion.rm65.captured_robot_observations import (
+    RM65CapturedRobotObservationFilter, RM65CapturedRobotObservationFilterConfig,
+)
 from scripts.probes.capture_rm65_grasp_snapshot import stationarity
 from teleop_runtime.skill_deploy.rm65_grasp_trajectory import RM65GraspJointTrajectoryPlanner
 from teleop_runtime.skill_deploy.rm65_lower_assembly import build_exclusive_rm65_skill_target_builder
@@ -107,7 +109,8 @@ def project(points, capture, depth_tolerance_m=.01):
             'camera_depth_m': z, 'observed_depth_m': observed}
 
 
-def resolve_inputs(context, urdf):
+def resolve_inputs(context, urdf, *, filter_config=None, observation_urdf_path=None,
+                   self_observation_proxy_urdf_path=None):
     context, urdf = Path(context), Path(urdf).resolve(strict=True)
     frozen_urdf = context / 'camera_mount_urdf.urdf'
     if frozen_urdf.read_bytes() != urdf.read_bytes():
@@ -125,9 +128,11 @@ def resolve_inputs(context, urdf):
         camera_registry_path=context / 'camera_registry.json', camera_mount_urdf_path=urdf,
         scene_world_from_arm_base_by_side=profile.scene_world_from_arm_base_by_side,
         scene_world_from_canonical_station=profile.scene_world_from_canonical_station)
-    cleaner = RM65CapturedRobotObservationFilter(urdf_path=urdf,
+    cleaner = RM65CapturedRobotObservationFilter.for_binding(urdf_path=urdf,
+        config=filter_config, observation_urdf_path=observation_urdf_path,
+        self_observation_proxy_urdf_path=self_observation_proxy_urdf_path,
         tool_tcp_pose_flange_m_rad_by_side=profile.tool_tcp_pose_flange_m_rad_by_side,
-        self_observation_proxy_boxes=profile.self_observation_proxy_boxes)
+    )
     return profile, builder, binding, geometry, cleaner
 
 
@@ -296,8 +301,15 @@ def main():
     parser.add_argument('--urdf', required=True, type=Path)
     parser.add_argument('--output', type=Path)
     parser.add_argument('--check-only', action='store_true')
+    parser.add_argument('--captured-robot-filter-config', type=Path)
+    parser.add_argument('--captured-robot-observation-urdf', type=Path)
+    parser.add_argument('--captured-robot-self-envelope-urdf', type=Path)
     args = parser.parse_args()
-    profile, builder, binding, geometry, cleaner = resolve_inputs(args.context, args.urdf)
+    profile, builder, binding, geometry, cleaner = resolve_inputs(args.context, args.urdf,
+        filter_config=(None if args.captured_robot_filter_config is None else
+            RM65CapturedRobotObservationFilterConfig.from_json_file(args.captured_robot_filter_config)),
+        observation_urdf_path=args.captured_robot_observation_urdf,
+        self_observation_proxy_urdf_path=args.captured_robot_self_envelope_urdf)
     if args.check_only:
         # Exercise native CAD/Embree without any camera or robot connection.
         cleaner(depth_m=np.ones((2, 2)), target_mask=np.zeros((2, 2), bool),

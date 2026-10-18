@@ -869,3 +869,14 @@ registry。生产 Skill 只广告当前部署已经具备可信 RGB 和相机 po
 工具的力源和授权确认是显式模拟 fixture，MuJoCo 仅跟随 qpos 做运动学回放；不构成真实设备
 跟踪、制动或接触验收。规划预算不是进程强制终止时限；实际 worker 关闭边界与调用方式见
 `scripts/probes/README.md`，运行前使用模块 `--help` 查看必需输入。
+## 可选的捕获时自观测过滤
+
+默认继续使用旧 15 mm 深度范围及原证据身份。显式 `--captured-robot-filter-config` 可选择
+`cad_surface` 或 `link_primitives`，放大窗口必须写入配置；原始目标标签均保留。
+配置与资源格式见 `scripts/probes/README.md` 的“显式自观测过滤候选”。Gateway、离线检查与
+冻结重放复用同一个 lower filter 构造规则，不增加规划、安全或执行 owner。
+
+`--captured-robot-observation-urdf` 仅接受保留原物理模型的 visual-only 克隆；
+`--captured-robot-self-envelope-urdf` 只用于捕获时删点，不会替换运动碰撞模型。
+扩展配置与几何参数哈希进入执行 manifest 及过滤证据，默认 manifest 和旧过滤证据不变。
+本地几何、离线或仿真验证不代表附件已获现场复核或真实动作已获验收。
