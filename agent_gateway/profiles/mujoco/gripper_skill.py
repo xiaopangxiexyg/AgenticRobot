@@ -41,6 +41,7 @@ class MujocoGripperControlPort:
         if arm_held is not None and not callable(arm_held):
             raise TypeError("arm_held must be callable or None.")
         self._arm_held = arm_held
+        self._requires_arm_hold = arm_held is not None
         for method_name in (
             "is_ready",
             "queue_gripper_close_targets",
@@ -83,6 +84,17 @@ class MujocoGripperControlPort:
             },
             domain="dexteleop.agent_skill.gripper_port_binding.v1",
         )
+
+    @property
+    def requires_arm_hold(self) -> bool:
+        return self._requires_arm_hold
+
+    def bind_motion_guard(self, guard: Callable[[], bool]) -> None:
+        if not callable(guard):
+            raise TypeError("motion guard must be callable.")
+        if not self.requires_arm_hold:
+            raise ValueError("Composed grippers require an arm-HOLD-bound port.")
+        self._arm_held = guard
 
     def _ref(self, kind: str, payload: dict[str, object]) -> str:
         self._sequence += 1

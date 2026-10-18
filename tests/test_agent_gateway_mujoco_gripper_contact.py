@@ -761,3 +761,56 @@ def test_composed_domain_hold_attempts_both_hands_after_arm_stop_failure(monkeyp
         assert sorted(calls[1:]) == ["left_gripper", "right_gripper"]
     finally:
         assert session.close().accepted
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("invalid_ports", ["foreign_rig", "standalone_without_guard"])
+def test_composed_assembler_rejects_self_consistent_ports_outside_its_physics_and_hold_owner(monkeypatch, invalid_ports):
+    from agent_gateway.profiles.mujoco.motion_factory import _bind_grippers
+    from agent_gateway.profiles.mujoco.motion_gateway_session import assemble_mujoco_agent_tcp_pose_gateway_session
+
+    task = _REPOSITORY_ROOT / "sim/configs/tasks/rm65_right_cube_reach_fixed_pose_xyz_proprio_v1.json"
+    config = MujocoSimHILTargetConfig(task_config_path=task, realtime_worker=False,
+        exposed_pose_sides=("right",), allow_scripted_task_reset=False,
+        execution_observation_plan=mujoco_agent_tcp_pose_execution_observation_plan_v1())
+    primary = build_mujoco_agent_tcp_pose_gateway_session(
+        target_config=config, allowed_client_ids=("test:primary",))
+    other = None
+    try:
+        primary.application.start_observation_ready()
+        if invalid_ports == "foreign_rig":
+            other = build_mujoco_agent_tcp_pose_gateway_session(
+                target_config=config, allowed_client_ids=("test:other",), enable_grippers=True)
+            other.application.start_observation_ready()
+            ports = other.gripper_ports
+            expected = "exact application physics owner"
+        else:
+            rig = primary.application.runtime.rig
+            profile = rig.config.gripper_actuation_profile
+            ports = {side + "_gripper": MujocoGripperControlPort(
+                rig=rig, gripper_name=profile.gripper_for_side(side),
+                component_id=side + "_gripper", clock=primary.application.runtime.clock)
+                for side in ("left", "right")}
+            expected = "arm-HOLD-bound port"
+        bundle = _bind_grippers(primary.contract_bundle, ports)
+        assert all(bundle.gripper_contract.deployment_binding.port_hash_for(key) == port.port_binding_hash
+                   for key, port in ports.items())
+        rigs = [primary.application.runtime.rig]
+        if other is not None:
+            rigs.append(other.application.runtime.rig)
+        times_before = [float(rig.scene.data.time) for rig in rigs]
+        with monkeypatch.context() as patch:
+            def forbidden(*args, **kwargs):
+                pytest.fail("Invalid composition must be rejected before queueing or advancing physics")
+            for rig in rigs:
+                patch.setattr(rig, "queue_gripper_close_targets", forbidden)
+                patch.setattr(rig, "step_physics", forbidden)
+            with pytest.raises(ValueError, match=expected):
+                assemble_mujoco_agent_tcp_pose_gateway_session(
+                    application=primary.application, contract_bundle=bundle,
+                    gripper_ports=ports, allowed_client_ids=("test:injected",))
+        assert [float(rig.scene.data.time) for rig in rigs] == times_before
+    finally:
+        if other is not None:
+            assert other.close().accepted
+        assert primary.close().accepted

@@ -646,6 +646,15 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
     gripper_ports = dict(gripper_ports or {})
     if bool(gripper_ports) != (contract_bundle.gripper_contract is not None):
         raise ValueError("Composed gripper contract and ports must coexist.")
+    for hand in gripper_ports.values():
+        if not isinstance(hand, MujocoGripperControlPort):
+            raise TypeError("Composed grippers require the reviewed MuJoCo adapter.")
+        if hand.rig is not application.runtime.rig:
+            raise ValueError("Composed grippers must share the exact application physics owner.")
+        if not hand.requires_arm_hold:
+            raise ValueError("Composed grippers require an arm-HOLD-bound port.")
+    for hand in gripper_ports.values():
+        hand.bind_motion_guard(lambda: application.held)
     if not isinstance(owns_source_observation_history_store, bool):
         raise TypeError("owns_source_observation_history_store must be boolean.")
     if not isinstance(owns_artifact_store, bool):
