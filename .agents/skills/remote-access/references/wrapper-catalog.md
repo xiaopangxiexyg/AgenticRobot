@@ -37,6 +37,14 @@ this does not extend its authority or replace fresh checks.
   `real-perception --camera-single-start` or TCP-only `real-tcp-observe` and
   the existing RPent CLI; stdin credentials only, 300s budget. No motion,
   gripper, controller, HOLD, STOP or camera reset authority.
+- `remote_rm65_left_udp_destination.sh`, `remote_rm65_udp_force_coordinate.sh`:
+  preflight by default; `--apply` requires exact controller/config authority.
+- `remote_camera_v4l2_pair.sh`: bounded capture requires exact serial/start
+  authority and new output. Verify child exits; no production readiness claim.
+- `remote_camera_driver_bind.sh`: inspect by default; `--bind` requires exact
+  port/serial authority, fresh idle checks; only unbound VideoControl binding.
+  These wrappers grant no motion/reset authority. Read matching README scopes,
+  limits and recovery rules before use.
 - Offline frozen grasp inference: `remote_grasp_snapshot_inference.sh`; runs
   only the fixed inference probe on retained evidence, without device access.
 - Inspection: `remote_view.sh`, `remote_tail_log.sh`,
