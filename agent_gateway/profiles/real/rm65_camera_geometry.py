@@ -22,6 +22,7 @@ from pathlib import Path, PurePosixPath
 import numpy as np
 
 from dataset_contracts.canonical_encoding import canonical_content_hash
+from robot_motion.pose import pose6_to_matrix
 
 from .realsense_perception import (
     RealPerceptionSourceBinding,
@@ -458,6 +459,33 @@ class RM65RgbCameraGeometry:
         return cut
 
 
+def load_rm65_wrist_camera_side_axis_tool(
+    *, camera_mount_urdf_path: str | Path, side: str,
+    tool_tcp_pose_flange_m_rad: object,
+) -> tuple[float, float, float]:
+    """Resolve the camera's radial mounting side, not its optical viewing axis.
+
+    Removing the axial offset distinguishes wrist roll without treating a
+    camera behind the grasp TCP as upside down on an inclined approach.
+    """
+    if side not in {"left", "right"}:
+        raise ValueError("Wrist camera side must be left or right.")
+    root = ET.parse(Path(camera_mount_urdf_path).resolve(strict=True)).getroot()
+    flange_from_camera = _fixed_transform_from_ancestor(
+        urdf_root=root, ancestor=f"{side}_arm_link6", descendant=f"{side}_camera_rgb",
+    )
+    flange_from_tool = _pose(
+        pose6_to_matrix(tool_tcp_pose_flange_m_rad), field_name="flange_from_tool_tcp",
+    )
+    tool_from_camera = np.linalg.inv(flange_from_tool) @ flange_from_camera
+    lateral = tool_from_camera[:3, 3].copy()
+    lateral[2] = 0.0
+    length = float(np.linalg.norm(lateral))
+    if length < 1e-6:
+        raise ValueError("Wrist camera has no identifiable radial side of the tool TCP.")
+    return tuple(float(value) for value in lateral / length)
+
+
 def build_rm65_rgb_camera_geometry(
     *,
     source_binding: RealPerceptionSourceBinding,
@@ -615,4 +643,5 @@ __all__ = [
     "RM65RgbCameraGeometry",
     "RM65StationaryGeometryUnavailable",
     "build_rm65_rgb_camera_geometry",
+    "load_rm65_wrist_camera_side_axis_tool",
 ]

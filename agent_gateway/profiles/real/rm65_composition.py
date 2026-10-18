@@ -95,6 +95,7 @@ from .realsense_perception import (
 from .rm65_camera_geometry import (
     RM65RgbCameraGeometry,
     build_rm65_rgb_camera_geometry,
+    load_rm65_wrist_camera_side_axis_tool,
 )
 from .rm65_grasp_reachability import (
     RM65PointGraspReachabilityAdapter,
@@ -829,6 +830,13 @@ def assemble_exclusive_rm65_agent_primitive_composition(
                     arm_reachability_profile=(
                         StationPointGraspArmReachabilityProfile(
                             arm_side=side,
+                            wrist_camera_side_axis_tool=(
+                                load_rm65_wrist_camera_side_axis_tool(
+                                    camera_mount_urdf_path=camera_mount_urdf_path,
+                                    side=side,
+                                    tool_tcp_pose_flange_m_rad=lower.profile.tool_tcp_pose_flange_m_rad_by_side[side],
+                                ) if backend_id == "graspgenx" else None
+                            ),
                             evaluator_profile_id=(
                                 "rm65.global_fk_multistart_reachability.v1"
                             ),

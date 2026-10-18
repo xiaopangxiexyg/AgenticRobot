@@ -19,7 +19,7 @@ from PIL import Image
 
 from agent_gateway.profiles.real.perception_frames import build_real_perception_station_frame_binding
 from agent_gateway.profiles.real.realsense_perception import build_real_perception_source_binding
-from agent_gateway.profiles.real.rm65_camera_geometry import build_rm65_rgb_camera_geometry
+from agent_gateway.profiles.real.rm65_camera_geometry import build_rm65_rgb_camera_geometry, load_rm65_wrist_camera_side_axis_tool
 from agent_gateway.profiles.real.rm65_grasp_reachability import RM65PointGraspReachabilityAdapter, arm_base_origin_in_candidate_frame
 from agent_gateway.profiles.real.station_point_grasp_deployment import StationPointGraspArmReachabilityProfile
 from deployments.perception.dmtac_grasp_overlay import reviewed_graspgenx_dmtac_solid_geometry
@@ -51,7 +51,7 @@ def profile_for(args, side):
         arm_ip_assignment_path=args.canonical / "teleop_runtime/configs/hardware/rm65_arm_ips/latest.json",
         tool_profile_path_by_side={s: args.canonical / f"hardware/rm65/utils/configs/calibrations/rm65_{s}_DMTAC_M.json" for s in ("left", "right")},
         envelope_profile_path=args.repo / f"teleop_runtime/configs/skill_deploy/agent_grasp_{side}_absolute_standard_v1.json",
-        collision_scene_profile="dual_arm_hand_proxy_dmtac_strict",
+        collision_scene_profile=args.collision_scene_profile,
     ))
 
 
@@ -206,6 +206,9 @@ def replay(args):
             scene_mount_hash=profile.semantic_content_hash, scene_world_from_canonical_station=profile.scene_world_from_canonical_station)
         config = motion.reachability_config
         reach_profile = StationPointGraspArmReachabilityProfile(arm_side=side,
+            wrist_camera_side_axis_tool=load_rm65_wrist_camera_side_axis_tool(
+                camera_mount_urdf_path=args.urdf, side=side,
+                tool_tcp_pose_flange_m_rad=profile.tool_tcp_pose_flange_m_rad_by_side[side]),
             evaluator_profile_id="rm65.global_fk_multistart_reachability.v1", evaluator_profile_hash=config.semantic_content_hash,
             solver_reference_frame_id=frames.source_frame_id, solver_reference_frame_spec_hash=frames.source_frame_spec_hash,
             frame_graph_hash=frames.frame_graph.semantic_content_hash, time_budget_ms=config.time_budget_ms,
@@ -317,6 +320,10 @@ def main():
                    help="Saved real segment probe output; repeat for each auxiliary view")
     p.add_argument("--refine-target-depth", action="store_true")
     p.add_argument("--diagnose-endpoints", action="store_true")
+    p.add_argument("--collision-scene-profile", choices=(
+        "dual_arm_hand_proxy_dmtac_strict", "dual_arm_hand_proxy_dmtac_grasp"),
+        default="dual_arm_hand_proxy_dmtac_grasp",
+        help="Select the grasp CAD table or unchanged strict scene for matched replay")
     p.add_argument("--anchor", choices=("main", "wrist_left", "wrist_right"), required=True)
     p.add_argument("--pixel", nargs=2, type=int, required=True)
     p.add_argument("--frame", type=int, default=2)

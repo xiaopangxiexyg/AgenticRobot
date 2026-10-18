@@ -7,16 +7,19 @@ import pytest
 from scripts.probes import replay_bimanual_grasp_snapshot as replay
 
 
-def test_observation_camera_does_not_select_the_motion_arm(monkeypatch):
+@pytest.mark.parametrize("scene", (
+    "dual_arm_hand_proxy_dmtac_strict", "dual_arm_hand_proxy_dmtac_grasp"))
+def test_observation_camera_does_not_select_the_motion_arm(monkeypatch, scene):
     monkeypatch.setattr(replay, "ExclusiveRM65SkillDeploymentProfile", lambda **kwargs: kwargs)
     monkeypatch.setattr(replay, "resolve_exclusive_rm65_skill_deployment_profile", lambda value: value)
-    args = SimpleNamespace(repo=Path("/repo"), canonical=Path("/canonical"), anchor="wrist_left")
+    args = SimpleNamespace(repo=Path("/repo"), canonical=Path("/canonical"),
+        anchor="wrist_left", collision_scene_profile=scene)
     left, right = (replay.profile_for(args, side) for side in ("left", "right"))
     assert left["envelope_profile_path"].name == "agent_grasp_left_absolute_standard_v1.json"
     assert right["envelope_profile_path"].name == "agent_grasp_right_absolute_standard_v1.json"
     for profile in (left, right):
         assert set(profile["tool_profile_path_by_side"]) == {"left", "right"}
-        assert profile["collision_scene_profile"] == "dual_arm_hand_proxy_dmtac_strict"
+        assert profile["collision_scene_profile"] == scene
 
 
 def test_retained_model_output_cannot_be_reused_for_another_cloud(tmp_path):

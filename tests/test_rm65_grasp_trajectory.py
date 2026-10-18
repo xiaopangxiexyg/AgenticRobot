@@ -5692,3 +5692,44 @@ def test_local_chain_hint_producer_serializes_shared_fk_with_full_planning(monke
         assert proposal.result(timeout=3.).feasible is False
     assert raced == [False]
     assert maximum == 1
+
+
+@pytest.mark.parametrize("scene, admitted, table_center_z", (
+    ("dual_arm_hand_proxy_dmtac_strict", False, .005),
+    ("dual_arm_hand_proxy_dmtac_grasp", True, -.015),
+))
+def test_grasp_cad_table_is_consistent_in_builder_planner_and_native_oracle(
+    scene, admitted, table_center_z,
+):
+    profile = _real_profile(
+        envelope_profile_name="agent_grasp_right_absolute_standard_v1.json",
+        collision_scene_profile=scene,
+    )
+    builder = build_exclusive_rm65_skill_target_builder(profile)
+    planner = RM65GraspJointTrajectoryPlanner(profile=profile,
+        planning_target_builder=builder,
+        target_envelope_filter=builder.pre_ik_target_safety_filter)
+    measured = {
+        "left": np.array((2.327623565385757, .8887216231575795, 1.874605749209501,
+            1.8164688094550168, -1.3424897849709652, -.3151540891841784)),
+        "right": np.array((-1.4745937603154737, .6181083705727584, 1.6288110274553462,
+            -1.6168730083949026, -1.2114854288405503, .6198711168982818)),
+    }
+    assert planner.path_collision_scene_profile == scene
+    assert builder.ik_solver.robot.collision_model.geometryObjects[
+        builder.ik_solver.robot.collision_model.getGeometryId("table_0")
+    ].placement.translation[2] == pytest.approx(table_center_z)
+    table = next(b for b in planner.scene.obstacles if b.obstacle_id == "fixed-scene:table")
+    assert table.center_xyz_m[2] == pytest.approx(table_center_z)
+    # Both the original URDF table and augmented planner obstacle must agree.
+    model = planner.oracle._collision_model
+    for name in ("table_0", "aabb_obstacle::fixed-scene:table"):
+        assert model.geometryObjects[model.getGeometryId(name)].placement.translation[2] == pytest.approx(table_center_z)
+    assert planner.scene.minimum_clearance_m == .02
+    assert planner.config.minimum_clearance_m == .02
+    check = planner.oracle.check_static_scene(measured, active_component="right")
+    assert check.collision_check_available and check.safe is admitted
+    assert check.minimum_distance_m == pytest.approx(
+        .015772 + (.02 if admitted else 0), abs=1e-5)
+    assert model.getGeometryId("left_d405_safety_proxy") < len(model.geometryObjects)
+    assert model.getGeometryId("right_d405_safety_proxy") < len(model.geometryObjects)

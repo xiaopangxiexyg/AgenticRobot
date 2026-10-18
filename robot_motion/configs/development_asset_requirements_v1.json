@@ -44,6 +44,14 @@
       ]
     },
     {
+      "bundle_id": "rm65.dmtac_cad_models",
+      "relative_path": "realman_dual_arm_inspire_gripper_dmtacm",
+      "required_by_default": false,
+      "required_paths": [
+        "realman_dual_arm_inspire_gripper_dmtacm.urdf"
+      ]
+    },
+    {
       "bundle_id": "inspire_gripper.tools",
       "relative_path": "inspire_gripper",
       "required_by_default": false,

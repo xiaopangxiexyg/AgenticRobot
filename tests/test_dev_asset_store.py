@@ -97,6 +97,14 @@ def test_store_status_requires_only_default_bundles(tmp_path: Path) -> None:
     )
     assert point_grasp.relative_path == "perception/sam2_vgn_point_grasp"
     assert point_grasp.required_by_default is False
+    cad = next(item for item in status.bundles if item.bundle_id == "rm65.dmtac_cad_models")
+    assert cad.required_by_default is False and cad.available is False
+    cad_path = store / cad.relative_path / "realman_dual_arm_inspire_gripper_dmtacm.urdf"
+    cad_path.parent.mkdir()
+    cad_path.write_text("fixture\n", encoding="utf-8")
+    updated = asset_tool.inspect_asset_store(store, source="test")
+    assert updated.available is True
+    assert next(item for item in updated.bundles if item.bundle_id == cad.bundle_id).available
 
 
 def test_resolution_precedence_is_explicit_environment_git_then_worktree(

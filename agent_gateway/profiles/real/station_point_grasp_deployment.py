@@ -7,6 +7,7 @@ calibration, and Station-frame conversion remain deployment-owned inputs.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 from agent_gateway.protocol.skill_catalog import (
@@ -85,6 +86,7 @@ class StationPointGraspArmReachabilityProfile:
     standard_orientation_tolerance_deg: float = 1.0
     basic_position_tolerance_m: float = 0.05
     basic_orientation_tolerance_deg: float = 20.0
+    wrist_camera_side_axis_tool: tuple[float, float, float] | None = None
 
     def __post_init__(self) -> None:
         for field_name in (
@@ -103,6 +105,13 @@ class StationPointGraspArmReachabilityProfile:
         if side not in {"left", "right"}:
             raise ValueError("arm_side must be left or right.")
         object.__setattr__(self, "arm_side", side)
+        if self.wrist_camera_side_axis_tool is not None:
+            axis = tuple(float(value) for value in self.wrist_camera_side_axis_tool)
+            if (len(axis) != 3 or not all(math.isfinite(value) for value in axis)
+                or not math.isclose(sum(value * value for value in axis), 1.0, abs_tol=1e-6)
+                or abs(axis[2]) > 1e-6):
+                raise ValueError("wrist_camera_side_axis_tool must be a radial unit vector.")
+            object.__setattr__(self, "wrist_camera_side_axis_tool", axis)
         for field_name in (
             "time_budget_ms",
             "max_measured_qpos_age_ms",
@@ -132,13 +141,16 @@ class StationPointGraspArmReachabilityProfile:
             {
                 field_name: getattr(self, field_name)
                 for field_name in self.__dataclass_fields__
+                if field_name != "wrist_camera_side_axis_tool" or self.wrist_camera_side_axis_tool is not None
             }
             | {
                 "evaluation_scope": (
                     "finite_time_endpoint_ik_not_path_or_grasp_success"
                 ),
                 "candidate_order_effect": "annotation_only_order_unchanged",
-            },
+            }
+            | ({"wrist_orientation_policy": "side_grasp_camera_above_v1"}
+               if self.wrist_camera_side_axis_tool is not None else {}),
             domain="dexteleop.agent_skill.station_point_grasp_arm_reachability.v1",
         )
 

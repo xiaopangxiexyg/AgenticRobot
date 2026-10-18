@@ -7,6 +7,8 @@ from typing import Any
 
 import numpy as np
 
+from .scene_profiles import FixedSceneBoxSpec
+
 
 def _task_conditioned_jacobian_metrics(
     jacobian: np.ndarray,
@@ -905,6 +907,7 @@ class MultiTaskIKSolver:
         collision_safe_displacement_gain: float = 0.001,
         collision_min_distance_m: float = 0.03,
         damping: float = 0.01,
+        robot_fixed_scene_box_overrides: tuple[FixedSceneBoxSpec, ...] = (),
     ):
         try:
             import pinocchio as pin
@@ -959,6 +962,7 @@ class MultiTaskIKSolver:
             root_joint=robot_root_joint,
             list_of_joints_to_lock=robot_list_of_joints_to_lock,
             collision_pair_names=robot_collision_pair_names,
+            fixed_scene_box_overrides=robot_fixed_scene_box_overrides,
         )
         self.configuration = self._initialize_configuration(q_ref=q_ref)
         self.tasks: list[Any] = []
@@ -1028,6 +1032,7 @@ class MultiTaskIKSolver:
         root_joint: Any,
         list_of_joints_to_lock: list[str] | None,
         collision_pair_names: list[tuple[str, str]] | None,
+        fixed_scene_box_overrides: tuple[FixedSceneBoxSpec, ...] = (),
     ) -> Any:
         robot = self.pin.RobotWrapper.BuildFromURDF(
             filename=urdf_path,
@@ -1036,6 +1041,28 @@ class MultiTaskIKSolver:
         )
         if list_of_joints_to_lock is not None:
             robot = robot.buildReducedRobot(list_of_joints_to_lock=list_of_joints_to_lock)
+
+        for box in fixed_scene_box_overrides:
+            if box.parent_link_name != "world":
+                raise ValueError("Fixed scene overrides must be attached directly to world.")
+            placement = box.world_to_box_pose_matrix()
+            if not np.isfinite(placement).all():
+                raise ValueError("Fixed scene geometry placement must be finite.")
+            # Pinocchio folds fixed joints into parentJoint=0, so geometry
+            # placement is world-relative. Leave all model frames untouched.
+            for geometry_model in (robot.collision_model, robot.visual_model):
+                geometry_id = geometry_model.getGeometryId(box.geometry_name)
+                if geometry_id >= len(geometry_model.geometryObjects):
+                    raise ValueError(f"Fixed scene geometry {box.geometry_name!r} is missing.")
+                geometry = geometry_model.geometryObjects[geometry_id]
+                if geometry.parentJoint != 0:
+                    raise ValueError("Fixed scene overrides cannot move articulated geometry.")
+                half_size = getattr(geometry.geometry, "halfSide", None)
+                if half_size is None or not np.allclose(
+                    2 * np.asarray(half_size), box.box_size_xyz, atol=1e-12, rtol=0,
+                ):
+                    raise ValueError("Fixed scene overrides must retain the existing box size.")
+                geometry.placement = self.pin.SE3(placement)
 
         if collision_pair_names is not None:
             geometry_count = len(robot.collision_model.geometryObjects)

@@ -17,6 +17,7 @@ from agent_gateway.profiles.real.realsense_perception import (
 )
 from agent_gateway.profiles.real.rm65_camera_geometry import (
     build_rm65_rgb_camera_geometry,
+    load_rm65_wrist_camera_side_axis_tool,
 )
 from robot_motion.rm65 import (
     build_rm65_dual_arm_scene_profile,
@@ -28,6 +29,22 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 CAMERA_CONFIG = (
     REPO_ROOT / "teleop_runtime/configs/devices/agent_gateway_realsense.json"
 )
+
+
+@pytest.mark.parametrize("side", ("left", "right"))
+@pytest.mark.parametrize("urdf", (
+    DEFAULT_RM65_CAMERA_MOUNT_URDF,
+    REPO_ROOT / "assets/realman_dual_arm_inspire_gripper_dmtacm/realman_dual_arm_inspire_gripper_dmtacm.urdf",
+))
+def test_wrist_camera_radial_side_uses_actual_mount_and_tool_rotation(side, urdf):
+    import math
+
+    axis = load_rm65_wrist_camera_side_axis_tool(camera_mount_urdf_path=urdf,
+        side=side, tool_tcp_pose_flange_m_rad=(0., 0., .14, 0., 0., 0.))
+    assert axis == pytest.approx((-.96713410, .25426685, 0.), abs=1e-7)
+    rotated = load_rm65_wrist_camera_side_axis_tool(camera_mount_urdf_path=urdf,
+        side=side, tool_tcp_pose_flange_m_rad=(0., 0., .18, 0., 0., math.pi / 2))
+    assert rotated == pytest.approx((axis[1], -axis[0], 0.), abs=1e-7)
 
 
 def _scene_geometry():

@@ -63,6 +63,68 @@ from deployments.perception.sam2_vgn_point_grasp import (
 from teleop_runtime.video_frame import VideoFrame
 
 
+@pytest.mark.parametrize("axis", ((0., 0., 0.), (float("nan"), 0., 0.), (0., 0., 1.), (1., 0.)))
+def test_wrist_camera_orientation_binding_rejects_invalid_radial_axis(axis):
+    profile = StationPointGraspArmReachabilityProfile(arm_side="right",
+        evaluator_profile_id="evaluator", evaluator_profile_hash="evaluator-hash",
+        solver_reference_frame_id="solver", solver_reference_frame_spec_hash="solver-hash",
+        frame_graph_hash="frames")
+    with pytest.raises(ValueError, match="radial unit vector"):
+        replace(profile, wrist_camera_side_axis_tool=axis)
+    assert replace(profile, wrist_camera_side_axis_tool=(-1., 0., 0.)).semantic_content_hash != profile.semantic_content_hash
+
+
+@pytest.mark.parametrize("side", ("left", "right"))
+@pytest.mark.parametrize("upright_feasible", (True, False))
+def test_horizontal_grasp_excludes_camera_below_even_if_shorter_and_higher_score(side, upright_feasible):
+    adapter = object.__new__(RM65PointGraspReachabilityAdapter)
+    adapter.profile = SimpleNamespace(max_measured_qpos_age_ms=200., arm_side=side,
+        wrist_camera_side_axis_tool=(-1., 0., 0.))
+    adapter.arm_base_origin_candidate_m = (-1., 0., 0.)
+    adapter.monotonic = lambda: 0.
+    adapter._solver_pose = lambda value: value
+    below = np.eye(4)
+    below[:3, :3] = [[0., 0., 1.], [0., -1., 0.], [1., 0., 0.]]
+    above = below @ np.diag([-1., -1., 1., 1.])
+    candidates = tuple(SimpleNamespace(base_from_tcp=pose.copy(), score=score)
+        for pose, score in ((below, .9), (above, .3)))
+    assessed = []
+
+    def assess(**kwargs):
+        pose = kwargs["target_tool_tcp_world"]
+        assessed.append(pose.copy())
+        return SimpleNamespace(feasible=upright_feasible, selected_pregrasp_distance_m=.06,
+            elapsed_ms=1., reason_code=None if upright_feasible else "collision",
+            attempts=(), joint_travel_rad=(3., 1., 2., 1., .1, .3))
+
+    adapter.planner = SimpleNamespace(assess_local_grasp_chain=assess)
+    result = adapter.select_candidates(candidates, (0., 0., 0.), 5,
+        measured_qpos_cut=SimpleNamespace(measured_at=10., qpos_by_side={}), measurement_reference_time=10.)
+    assert result.selected_indices == ((1,) if upright_feasible else ())
+    assert assessed and all(np.array_equal(pose, above) for pose in assessed)
+    assert result.diagnostics["arm_shortlist_wrist_orientation_rejected_count"] == 1
+    assert "side_grasp_wrist_camera_not_above" in result.diagnostics["arm_shortlist_wrist_orientation_rejections_json"]
+    assert np.array_equal(candidates[0].base_from_tcp, below)
+    assert np.array_equal(candidates[1].base_from_tcp, above)
+
+
+def test_camera_upright_rule_leaves_vertical_grasp_roll_unconstrained():
+    adapter = object.__new__(RM65PointGraspReachabilityAdapter)
+    adapter.profile = SimpleNamespace(max_measured_qpos_age_ms=200., arm_side="right",
+        wrist_camera_side_axis_tool=(-1., 0., 0.))
+    adapter.arm_base_origin_candidate_m = (-1., 0., 0.)
+    adapter.monotonic = lambda: 0.
+    adapter._solver_pose = lambda value: value
+    adapter.planner = SimpleNamespace(assess_local_grasp_chain=lambda **kwargs: SimpleNamespace(
+        feasible=True, selected_pregrasp_distance_m=.06, elapsed_ms=1., reason_code=None,
+        attempts=(), joint_travel_rad=(.1,) * 6))
+    pose = np.diag([-1., 1., -1., 1.])
+    result = adapter.select_candidates((SimpleNamespace(base_from_tcp=pose, score=.9),), (0.,0.,0.), 1,
+        measured_qpos_cut=SimpleNamespace(measured_at=10., qpos_by_side={}), measurement_reference_time=10.)
+    assert result.selected_indices == (0,)
+    assert result.diagnostics["arm_shortlist_wrist_orientation_rejected_count"] == 0
+
+
 @pytest.mark.parametrize("side", ("left", "right"))
 def test_shortlist_compares_checked_finger_exchange_and_prefers_small_proximal_motion(side):
     adapter = object.__new__(RM65PointGraspReachabilityAdapter)

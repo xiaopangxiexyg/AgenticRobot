@@ -198,6 +198,9 @@ class DualArmSceneProfile:
     left_pose_transform: np.ndarray
     right_pose_transform: np.ndarray
     solution_layout: Literal["auto", "dual_arm_hand"]
+    # Geometry-only overrides are applied before native collision data exists.
+    # They never change the URDF frame graph or joint placements.
+    fixed_scene_box_overrides: tuple[FixedSceneBoxSpec, ...] = ()
 
 
 def fixed_scene_aabb_obstacles(
@@ -496,15 +499,18 @@ def build_dual_arm_scene_profile(name: str = DEFAULT_COLLISION_SCENE) -> DualArm
         "dual_arm_hand_proxy_strict",
         "dual_arm_hand_proxy_grasp_full",
         "dual_arm_hand_proxy_dmtac_strict",
+        "dual_arm_hand_proxy_dmtac_grasp",
     }:
-        if name == "dual_arm_hand_proxy_dmtac_strict":
+        is_dmtac_profile = name in {
+            "dual_arm_hand_proxy_dmtac_strict", "dual_arm_hand_proxy_dmtac_grasp"
+        }
+        if is_dmtac_profile:
             urdf_name = "rm65_dual_arm_hand_proxy_dmtac_strict.urdf"
         elif name == "dual_arm_hand_proxy_open":
             urdf_name = "rm65_dual_arm_hand_proxy_open.urdf"
         else:
             urdf_name = "rm65_dual_arm_hand_proxy_strict.urdf"
         urdf_path = asset_dir / urdf_name
-        is_dmtac_profile = name == "dual_arm_hand_proxy_dmtac_strict"
         hand_proxy_boxes = _load_hand_proxy_boxes(
             urdf_path,
             include_all_collision_boxes=is_dmtac_profile,
@@ -532,6 +538,26 @@ def build_dual_arm_scene_profile(name: str = DEFAULT_COLLISION_SCENE) -> DualArm
             raise ValueError(
                 "DMTAC hand-proxy URDF must expose exactly two collision boxes per hand."
             )
+        fixed_scene_box_overrides = ()
+        if name == "dual_arm_hand_proxy_dmtac_grasp":
+            cad_table = _load_fixed_scene_box(
+                asset_dir.parent / "realman_dual_arm_inspire_gripper_dmtacm"
+                / "realman_dual_arm_inspire_gripper_dmtacm.urdf",
+                link_name="table",
+            )
+            strict_table = fixed_scene_boxes[-1]
+            if (
+                cad_table.parent_link_name != "world"
+                or cad_table.joint_origin_xyz != strict_table.joint_origin_xyz
+                or cad_table.joint_origin_rpy != strict_table.joint_origin_rpy
+                or cad_table.box_size_xyz != strict_table.box_size_xyz
+            ):
+                raise ValueError(
+                    "DMTAC grasp table must retain the strict table frame and size; "
+                    "only its reviewed CAD collision placement may differ."
+                )
+            fixed_scene_boxes = (*fixed_scene_boxes[:-1], cad_table)
+            fixed_scene_box_overrides = (cad_table,)
         return DualArmSceneProfile(
             name=name,
             urdf_path=urdf_path,
@@ -550,6 +576,7 @@ def build_dual_arm_scene_profile(name: str = DEFAULT_COLLISION_SCENE) -> DualArm
             left_pose_transform=_POSE_TRANSFORM_LEFT.copy(),
             right_pose_transform=_POSE_TRANSFORM_RIGHT.copy(),
             solution_layout="auto",
+            fixed_scene_box_overrides=fixed_scene_box_overrides,
         )
 
     if name == "dual_arm_hand":

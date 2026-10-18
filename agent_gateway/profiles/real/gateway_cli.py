@@ -400,7 +400,9 @@ def _effective_camera_mount_urdf(args: argparse.Namespace) -> Path | None:
     if args.camera_mount_urdf is not None:
         return args.camera_mount_urdf
     if args.enable_point_grasp or args.enable_back_projection or args.safe_motion_observation_roles is not None:
-        if args.collision_scene_profile == "dual_arm_hand_proxy_dmtac_strict":
+        if args.collision_scene_profile in {
+            "dual_arm_hand_proxy_dmtac_strict", "dual_arm_hand_proxy_dmtac_grasp"
+        }:
             return DEFAULT_RM65_DMTAC_CAMERA_MOUNT_URDF
         return DEFAULT_RM65_CAMERA_MOUNT_URDF
     return None
@@ -449,7 +451,9 @@ def _validate_point_grasp_capture_urdf(
             f"{missing_preview[:8]}{suffix}"
         )
 
-    if collision_scene_profile != "dual_arm_hand_proxy_dmtac_strict":
+    if collision_scene_profile not in {
+        "dual_arm_hand_proxy_dmtac_strict", "dual_arm_hand_proxy_dmtac_grasp"
+    }:
         return
     visual_names = {
         str(visual.get("name", "")).strip()
@@ -458,7 +462,7 @@ def _validate_point_grasp_capture_urdf(
     missing = sorted(_REQUIRED_DMTAC_CAPTURE_VISUALS - visual_names)
     if missing:
         parser.error(
-            "--collision-scene-profile dual_arm_hand_proxy_dmtac_strict "
+            f"--collision-scene-profile {collision_scene_profile} "
             "requires --camera-mount-urdf to contain both arms' reviewed "
             f"DMTAC capture geometry; missing visuals: {missing}"
         )

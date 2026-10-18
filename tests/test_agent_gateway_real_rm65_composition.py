@@ -1047,13 +1047,16 @@ def test_preplanned_grasp_execution_consumes_exact_path_without_replanning(
         session.artifact_store.close()
 
 
+@pytest.mark.parametrize("backend", ("vgn", "graspgenx"))
 def test_composition_opt_in_binds_point_grasp_v3_to_lower_ik_without_starting(
     monkeypatch,
     tmp_path,
+    backend,
 ) -> None:
     lower, guard = _lower(monkeypatch)
     localizer = _Localizer()
     planner = _PointGraspPlanner(localizer)
+    planner.backend_id = backend
 
     composition = assemble_exclusive_rm65_agent_primitive_composition(
         lower=lower,
@@ -1085,6 +1088,10 @@ def test_composition_opt_in_binds_point_grasp_v3_to_lower_ik_without_starting(
         reachability = registration.profile.arm_reachability_profile
         assert reachability is not None
         assert reachability.arm_side == "right"
+        if backend == "graspgenx":
+            assert reachability.wrist_camera_side_axis_tool == pytest.approx((-.96713410, .25426685, 0.), abs=1e-7)
+        else:
+            assert reachability.wrist_camera_side_axis_tool is None
         assert reachability.solver_reference_frame_id == (
             RM65_SKILL_EXECUTION_FRAME_ID_V1
         )

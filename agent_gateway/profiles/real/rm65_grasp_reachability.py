@@ -248,6 +248,7 @@ class RM65PointGraspReachabilityAdapter:
         desired_horizontal /= desired_norm
 
         candidate_evidence: list[dict[str, Any]] = []
+        camera_axis = getattr(self.profile, "wrist_camera_side_axis_tool", None)
         for index, candidate in enumerate(candidates):
             reference_pose = np.asarray(candidate.base_from_tcp, dtype=np.float64).reshape(
                 4, 4
@@ -279,6 +280,15 @@ class RM65PointGraspReachabilityAdapter:
                 side_admissible = side_angle_deg <= 85.0
             score = float(candidate.score)
             heuristic_score = score * math.exp(-side_angle_deg / 90.0)
+            camera_side_up = (
+                None if camera_axis is None else float(reference_pose[2, :3] @ camera_axis)
+            )
+            # Only side/inclined approaches have an unambiguous upper radial
+            # side. Do not apply a wrist-roll preference to a vertical grasp.
+            camera_upright = (
+                camera_side_up is None or abs(float(approach[2])) >= 0.7
+                or camera_side_up > 1e-6
+            )
             candidate_evidence.append(
                 {
                     "index": index,
@@ -289,6 +299,8 @@ class RM65PointGraspReachabilityAdapter:
                     "side_admissible": side_admissible,
                     "heuristic_score": heuristic_score,
                     "score": score,
+                    "camera_side_up": camera_side_up,
+                    "camera_upright": camera_upright,
                     "pose_source": str(
                         getattr(candidate, "pose_source", "model_scored")
                     ),
@@ -300,7 +312,9 @@ class RM65PointGraspReachabilityAdapter:
                 }
             )
 
-        eligible = [item for item in candidate_evidence if item["side_admissible"]]
+        side_eligible = [item for item in candidate_evidence if item["side_admissible"]]
+        inverted = [item for item in side_eligible if not item["camera_upright"]]
+        eligible = [item for item in side_eligible if item["camera_upright"]]
         symmetry_pairs = {}
         for item in eligible:
             parent = item["symmetry_parent_index"]
@@ -594,7 +608,16 @@ class RM65PointGraspReachabilityAdapter:
                     else "no_production_local_grasp_chain_candidate"
                 ),
                 "arm_shortlist_pool_count": len(candidates),
-                "arm_shortlist_side_admissible_count": len(eligible),
+                "arm_shortlist_side_admissible_count": len(side_eligible),
+                "arm_shortlist_wrist_orientation_policy": (
+                    "side_grasp_camera_above_v1" if camera_axis is not None else "unbound"
+                ),
+                "arm_shortlist_wrist_orientation_rejected_count": len(inverted),
+                "arm_shortlist_wrist_orientation_rejections_json": json.dumps([
+                    {"index": int(item["index"]), "camera_side_up": item["camera_side_up"],
+                     "reason": "side_grasp_wrist_camera_not_above"}
+                    for item in inverted[:_ARM_SHORTLIST_PROBE_MAX_COUNT]
+                ], separators=(",", ":")),
                 "arm_shortlist_evaluated_count": local_chain_assessment_count,
                 "arm_shortlist_local_chain_assessment_count": (
                     local_chain_assessment_count

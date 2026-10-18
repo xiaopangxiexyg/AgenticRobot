@@ -1935,6 +1935,7 @@ def test_rm65_ik_can_omit_collision_pairs_without_changing_kinematic_profile(
         left_frame_name="left_tcp",
         right_frame_name="right_tcp",
         collision_pairs=(("left_link", "right_link"),),
+        fixed_scene_box_overrides=(),
         hand_proxy_boxes=(),
         fixed_scene_boxes=(),
         left_pose_transform=np.eye(4),

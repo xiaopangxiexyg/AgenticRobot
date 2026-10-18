@@ -170,6 +170,7 @@ def test_build_rm65_dual_arm_collision_ik_solver_adds_shared_tasks(monkeypatch) 
         urdf_path="dual.urdf",
         package_dirs=("assets",),
         collision_pairs=(("left_hand_proxy_0", "right_hand_proxy_0"),),
+        fixed_scene_box_overrides=(),
         left_frame_name="arm_link6",
         right_frame_name="right_arm_link6",
     )

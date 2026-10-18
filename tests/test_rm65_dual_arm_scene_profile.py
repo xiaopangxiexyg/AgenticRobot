@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 
+import numpy as np
 import pytest
 
 from robot_motion.rm65 import (
@@ -224,3 +225,95 @@ def test_dual_arm_hand_proxy_dmtac_is_opt_in_and_loads_both_hand_boxes():
     for pair in dmtac_profile.collision_pairs:
         assert pair[0] in known_geometries
         assert pair[1] in known_geometries
+
+
+def test_dmtac_grasp_profile_changes_only_table_geometry_to_reviewed_cad():
+    strict = build_dual_arm_scene_profile("dual_arm_hand_proxy_dmtac_strict")
+    grasp = build_dual_arm_scene_profile("dual_arm_hand_proxy_dmtac_grasp")
+    assert grasp.urdf_path == strict.urdf_path
+    assert grasp.collision_pairs == strict.collision_pairs
+    assert len(grasp.collision_pairs) == 20
+    assert grasp.hand_proxy_boxes == strict.hand_proxy_boxes
+    assert grasp.fixed_scene_boxes[:-1] == strict.fixed_scene_boxes[:-1]
+    assert strict.fixed_scene_box_overrides == ()
+    assert grasp.fixed_scene_box_overrides == (grasp.fixed_scene_boxes[-1],)
+    old_table, new_table = (p.fixed_scene_boxes[-1] for p in (strict, grasp))
+    assert old_table.joint_origin_xyz == new_table.joint_origin_xyz
+    assert old_table.joint_origin_rpy == new_table.joint_origin_rpy
+    assert old_table.box_size_xyz == new_table.box_size_xyz
+    assert old_table.world_to_box_pose_matrix()[2, 3] == pytest.approx(.005)
+    assert new_table.world_to_box_pose_matrix()[2, 3] == pytest.approx(-.015)
+    table = next(b for b in fixed_scene_aabb_obstacles(grasp)
+        if b.obstacle_id == "fixed-scene:table")
+    assert table.maximum_xyz_m[2] == pytest.approx(.01)
+    np.testing.assert_array_equal(strict.left_pose_transform, grasp.left_pose_transform)
+    np.testing.assert_array_equal(strict.right_pose_transform, grasp.right_pose_transform)
+
+
+def test_dmtac_grasp_table_override_reaches_native_collision_and_visual_models():
+    pin = pytest.importorskip("pinocchio")
+    from robot_motion.rm65.ik import (
+        RM65DualArmCollisionIKConfig, build_rm65_dual_arm_collision_ik_solver,
+    )
+    from robot_motion.rm65.position_collision import load_world_from_fixed_link_transform
+
+    bundles = [build_rm65_dual_arm_collision_ik_solver(
+        RM65DualArmCollisionIKConfig(scene_profile=name)) for name in (
+            "dual_arm_hand_proxy_dmtac_strict", "dual_arm_hand_proxy_dmtac_grasp")]
+    strict, grasp = bundles
+    # Direct URDF loading is an independent reference, not the override helper.
+    raw = pin.RobotWrapper.BuildFromURDF(str(strict.scene_profile.urdf_path),
+        package_dirs=[str(p) for p in strict.scene_profile.package_dirs])
+    cad_path = strict.scene_profile.urdf_path.parent.parent / (
+        "realman_dual_arm_inspire_gripper_dmtacm/realman_dual_arm_inspire_gripper_dmtacm.urdf")
+    cad = pin.RobotWrapper.BuildFromURDF(str(cad_path), package_dirs=[str(cad_path.parent)])
+    for kind in ("collision_model", "visual_model"):
+        models = [getattr(b.solver.robot, kind) for b in bundles]
+        old = models[0].geometryObjects[models[0].getGeometryId("table_0")]
+        new = models[1].geometryObjects[models[1].getGeometryId("table_0")]
+        raw_model, cad_model = getattr(raw, kind), getattr(cad, kind)
+        raw_table = raw_model.geometryObjects[raw_model.getGeometryId("table_0")]
+        cad_table = cad_model.geometryObjects[cad_model.getGeometryId("table_0")]
+        np.testing.assert_allclose(old.placement.homogeneous, raw_table.placement.homogeneous)
+        np.testing.assert_allclose(new.placement.homogeneous, cad_table.placement.homogeneous)
+        np.testing.assert_array_equal(old.geometry.halfSide, new.geometry.halfSide)
+        assert len(models[0].geometryObjects) == len(models[1].geometryObjects)
+        for geometry in models[0].geometryObjects:
+            if geometry.name != "table_0":
+                other = models[1].geometryObjects[models[1].getGeometryId(geometry.name)]
+                np.testing.assert_array_equal(geometry.placement.homogeneous, other.placement.homogeneous)
+    for frame in ("workspace_near_boundary_frame", "base_link", "right_base_link"):
+        np.testing.assert_array_equal(
+            load_world_from_fixed_link_transform(strict.scene_profile, link_name=frame),
+            load_world_from_fixed_link_transform(grasp.scene_profile, link_name=frame))
+    for q in (pin.neutral(raw.model), np.linspace(-.3, .3, raw.model.nq)):
+        for robot in (strict.solver.robot, grasp.solver.robot):
+            pin.framesForwardKinematics(robot.model, robot.data, q)
+        for frame in ("arm_link6", "right_arm_link6", "workspace_near_boundary_frame"):
+            np.testing.assert_array_equal(
+                strict.solver.robot.data.oMf[strict.solver.robot.model.getFrameId(frame)].homogeneous,
+                grasp.solver.robot.data.oMf[grasp.solver.robot.model.getFrameId(frame)].homogeneous)
+
+
+@pytest.mark.parametrize("change", ("missing", "articulated", "size", "parent"))
+def test_native_fixed_scene_override_rejects_non_geometry_only_changes(change):
+    pin = pytest.importorskip("pinocchio")
+    from robot_motion.rm65.dual_arm_ik import MultiTaskIKSolver
+
+    profile = build_dual_arm_scene_profile("dual_arm_hand_proxy_dmtac_grasp")
+    box = profile.fixed_scene_box_overrides[0]
+    if change == "missing":
+        box = replace(box, geometry_name="missing_table")
+    elif change == "articulated":
+        box = replace(box, geometry_name="left_hand_proxy_0", box_size_xyz=(.07, .07, .36))
+    elif change == "size":
+        box = replace(box, box_size_xyz=(1., 1., 1.))
+    else:
+        box = replace(box, parent_link_name="table")
+    solver = object.__new__(MultiTaskIKSolver)
+    solver.pin = pin
+    with pytest.raises(ValueError):
+        solver._initialize_robot(urdf_path=str(profile.urdf_path),
+            package_dirs=[str(p) for p in profile.package_dirs], root_joint=None,
+            list_of_joints_to_lock=None, collision_pair_names=[],
+            fixed_scene_box_overrides=(box,))

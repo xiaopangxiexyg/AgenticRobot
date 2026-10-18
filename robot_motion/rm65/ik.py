@@ -249,6 +249,7 @@ def build_rm65_dual_arm_collision_ik_solver(
         robot_root_joint=None,
         robot_list_of_joints_to_lock=None,
         robot_collision_pair_names=list(scene_profile.collision_pairs),
+        robot_fixed_scene_box_overrides=scene_profile.fixed_scene_box_overrides,
         solver=resolved_config.solver,
         frequency=float(resolved_config.solver_frequency),
         damping=float(resolved_config.damping),

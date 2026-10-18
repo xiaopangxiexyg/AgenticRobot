@@ -634,6 +634,19 @@ IK、生产 URDF/FCL 场景和完整关节路径规划；不会接受调用方�
 shortlist 的关节行程排序也适用于旧版本的普通候选，可能改变其展示顺序；
 关闭手指交换只是不生成新候选，原有物理准入和总时间预算继续生效。
 
+### 抓取专用场景与相机朝向
+
+离线 grasp replay 默认使用 `dual_arm_hand_proxy_dmtac_grasp`。它只把桌面碰撞
+位置对齐已登记的 CAD，保留 strict 场景的 world 固定连接、桌面尺寸和 URDF
+坐标图；普通 strict 场景不变。重放旧 strict 场景记录或做对照时，显式指定
+`--collision-scene-profile dual_arm_hand_proxy_dmtac_strict`，避免混用场景身份。
+这个 profile 同时约束 native IK 几何、路径碰撞检查和固定场景 AABB。
+
+GraspGenX 的 arm reachability 在绑定同侧腕相机标定后，会从 tool TCP 的径向
+安装侧确定相机朝向，并拒绝侧向／倾斜接近中相机位于下方的候选；竖直接近仍保留
+绕接近轴的自由度。该筛选也适用于普通候选，并非仅用于手指交换。安装轴及策略
+进入 profile hash，保留原路径准入、缓存、时间预算和执行权限边界。
+
 ## DMTAC M 和坐标语义
 
 DMTAC/GraspGenX 的名义模型指长仍为 100 mm；碰撞及渲染 proxy 在最前端单独加长 1 mm，

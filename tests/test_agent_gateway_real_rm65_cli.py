@@ -228,6 +228,24 @@ def test_cli_defaults_to_the_detailed_v4_camera_mount_urdf() -> None:
     )
 
 
+@pytest.mark.parametrize("scene", (
+    "dual_arm_hand_proxy_dmtac_strict", "dual_arm_hand_proxy_dmtac_grasp"))
+def test_dmtac_grasp_scene_keeps_reviewed_capture_geometry_validation(scene, tmp_path):
+    parsed = gateway_cli.build_parser().parse_args([
+        *_argv(confirmation=REAL_AGENT_PRIMITIVE_SESSION_CONFIRM_TOKEN),
+        "--enable-point-grasp", "--collision-scene-profile", scene,
+    ])
+    effective = gateway_cli._effective_camera_mount_urdf(parsed)
+    assert effective == gateway_cli.DEFAULT_RM65_DMTAC_CAMERA_MOUNT_URDF
+    gateway_cli._validate_point_grasp_capture_urdf(
+        gateway_cli.build_parser(), urdf_path=effective, collision_scene_profile=scene)
+    missing = tmp_path / "missing-sensors.urdf"
+    missing.write_text('<robot name="no-sensors"><link name="world"/></robot>')
+    with pytest.raises(SystemExit):
+        gateway_cli._validate_point_grasp_capture_urdf(
+            gateway_cli.build_parser(), urdf_path=missing, collision_scene_profile=scene)
+
+
 def test_cli_accepts_opt_in_continuous_grasp_trajectory_preferences() -> None:
     parsed = gateway_cli.build_parser().parse_args(
         [

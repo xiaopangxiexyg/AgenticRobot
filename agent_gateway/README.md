@@ -1257,6 +1257,12 @@ dispatch, convergence, and lower-confirmed HOLD still apply. Direct
 `--target-xyz-m`/`--target-quat-xyzw` input remains unchanged and is mutually
 exclusive with `--camera-grasp-proposal`.
 
+显式 `dual_arm_hand_proxy_dmtac_grasp` 将抓取专用桌面碰撞位置对齐已登记 CAD，
+普通 strict 场景及坐标图保持不变；离线 grasp replay 默认选择该抓取场景，旧记录
+可显式指定 strict 对照。绑定腕相机安装轴的 GraspGenX reachability 会筛除侧向／
+倾斜接近中相机朝下的候选，普通候选也受此约束；竖直接近保留原自由度。
+详细场景身份和使用方式见 `docs/agent_gateway/POINT_GRASP.md`。
+
 The MuJoCo arbitrary-grasp viewer and the real Skill deliberately do not accept
 the same numeric input frame. The viewer's explicit input is
 `selected_arm_base_from_actual_dmtac_tool_tcp`, while the real Skill public
