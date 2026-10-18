@@ -13,6 +13,33 @@ from scripts.probes import inspect_safe_move_snapshot as probe
 pytestmark = [pytest.mark.unit, pytest.mark.contract]
 
 
+@pytest.mark.parametrize('status,complete', [('closed', True), ('running', False),
+    ('closed', False), ('cleanup_failed', False)])
+def test_inspector_reuses_persistent_replay_lifecycle_before_reading_frames(tmp_path, monkeypatch, status, complete):
+    root = tmp_path / 'session'; capture_dir = root / 'state_0001' / 'capture'
+    capture_dir.mkdir(parents=True); (root / 'devices').mkdir()
+    report = dict(schema='agenticrobot.readonly_rgbd_qpos.v2', status='captured',
+        stationarity={'left': {}}, session_lifecycle='../../devices/lifecycle.json')
+    (capture_dir / 'snapshot.json').write_text(json.dumps(report))
+    (root / 'devices' / 'lifecycle.json').write_text(json.dumps(
+        dict(status=status, cleanup_complete=complete)))
+    class ReachedFrozenFrames(Exception):
+        pass
+    def select(*args, **kwargs):
+        raise ReachedFrozenFrames()
+    monkeypatch.setattr(probe, 'select_frames', select)
+    expected = ReachedFrozenFrames if status == 'closed' and complete else ValueError
+    with pytest.raises(expected):
+        probe.load_captures(capture_dir, object(), object(), object())
+
+
+def test_inspector_never_accepts_arbitrary_persistent_lifecycle_reference(tmp_path):
+    (tmp_path / 'snapshot.json').write_text(json.dumps(dict(
+        schema='agenticrobot.readonly_rgbd_qpos.v2', session_lifecycle='../other.json')))
+    with pytest.raises(ValueError, match='lifecycle reference'):
+        probe.load_captures(tmp_path, object(), object(), object())
+
+
 def test_resolve_inputs_constructs_real_default_filter_without_nonexistent_profile_fields(tmp_path, monkeypatch):
     urdf = tmp_path / 'physical.urdf'; urdf.write_text('<robot name="test"/>')
     (tmp_path / 'camera_mount_urdf.urdf').write_bytes(urdf.read_bytes())

@@ -116,3 +116,15 @@ Skill 或执行链选中。这是离线候选加载能力，不能代替具体�
 两种扩展模式只删除冻结捕获中的背景点，始终保护目标标签；缓存仅保存模型局部几何和查询树，
 每帧重新计算双臂与相机变换。输入哈希绑定 URDF 描述、TCP 和自观测盒参数，不是外部 mesh
 内容的完整覆盖证明。运动碰撞仍使用原严格模型与检查对，未将 rigid 候选换为默认。
+
+`inspect_safe_move_snapshot.py` 读取 v2 连续会话时，复用冻结重放入口的
+`devices/lifecycle.json` 判定：会话必须 closed 且 cleanup_complete；v1 单次捕获及正常
+Skill 记录仍按原格式读取。`--envelope-profile` 只为离线检查显式选择另一份已有包络配置，
+默认仍用冻结 context，不替换真机运行绑定。
+
+`benchmark_self_observation.py` 在已关闭会话上复用该读取与装配规则，对同一显式配置比较
+CAD 和局部几何模式，输出逐视图 mask、原始 RGB-D、变换、关节值及耗时。必须提供
+`--captured-robot-filter-config`（cad_surface 配置）和
+`--captured-robot-self-envelope-urdf`；不会用默认配置悄悄放大删点范围。新输出目录不可已存在，
+状态名必须唯一且不能逃逸路径，快照必须位于会话内；失败状态不跳过。CAD 是参考实现，
+不作为逐像素真值，耗时对比也不代表真机安全或现场附件覆盖证明。

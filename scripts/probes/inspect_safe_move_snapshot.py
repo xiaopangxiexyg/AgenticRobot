@@ -29,6 +29,7 @@ from robot_motion.rm65.captured_robot_observations import (
     RM65CapturedRobotObservationFilter, RM65CapturedRobotObservationFilterConfig,
 )
 from scripts.probes.capture_rm65_grasp_snapshot import stationarity
+from scripts.probes.replay_bimanual_grasp_snapshot import load_snapshot_report
 from teleop_runtime.skill_deploy.rm65_grasp_trajectory import RM65GraspJointTrajectoryPlanner
 from teleop_runtime.skill_deploy.rm65_lower_assembly import build_exclusive_rm65_skill_target_builder
 from teleop_runtime.skill_deploy.rm65_profile import (
@@ -110,7 +111,7 @@ def project(points, capture, depth_tolerance_m=.01):
 
 
 def resolve_inputs(context, urdf, *, filter_config=None, observation_urdf_path=None,
-                   self_observation_proxy_urdf_path=None):
+                   self_observation_proxy_urdf_path=None, envelope_profile=None):
     context, urdf = Path(context), Path(urdf).resolve(strict=True)
     frozen_urdf = context / 'camera_mount_urdf.urdf'
     if frozen_urdf.read_bytes() != urdf.read_bytes():
@@ -118,7 +119,8 @@ def resolve_inputs(context, urdf, *, filter_config=None, observation_urdf_path=N
     profile = resolve_exclusive_rm65_skill_deployment_profile(ExclusiveRM65SkillDeploymentProfile(
         arm_ip_assignment_path=context / 'arm_ip_assignment.json',
         tool_profile_path_by_side={side: context / f'{side}_tool_profile.json' for side in ('left', 'right')},
-        envelope_profile_path=context / 'envelope_profile.json',
+        envelope_profile_path=(context / 'envelope_profile.json' if envelope_profile is None
+                               else Path(envelope_profile)),
         collision_scene_profile='dual_arm_hand_proxy_dmtac_strict'))
     builder = build_exclusive_rm65_skill_target_builder(profile)
     binding = build_real_perception_source_binding(camera_config_path=context / 'camera_config.json',
@@ -159,7 +161,11 @@ def load_captures(capture_dir, profile, binding, geometry, *, frame_index=2):
                 pose_measured_at=view['pose_measured_at'], pose_available_at=view['pose_available_at'],
                 pose_evidence_refs=tuple(view['pose_evidence_refs'])))
         return captures
-    if report.get('schema') != 'agenticrobot.readonly_rgbd_qpos.v1' or report.get('cleanup_complete') is not True:
+    if report.get('schema') == 'agenticrobot.readonly_rgbd_qpos.v2':
+        # Share the accepted writer/replay lifecycle, rather than introducing
+        # a second persistent-session format for the offline inspector.
+        report = load_snapshot_report(capture_dir)
+    elif report.get('schema') != 'agenticrobot.readonly_rgbd_qpos.v1' or report.get('cleanup_complete') is not True:
         raise ValueError('This probe requires a closed one-shot read-only capture')
     selected = select_frames(report, frame_index)
     history = report['qpos_samples']
@@ -301,6 +307,7 @@ def main():
     parser.add_argument('--urdf', required=True, type=Path)
     parser.add_argument('--output', type=Path)
     parser.add_argument('--check-only', action='store_true')
+    parser.add_argument('--envelope-profile', type=Path)
     parser.add_argument('--captured-robot-filter-config', type=Path)
     parser.add_argument('--captured-robot-observation-urdf', type=Path)
     parser.add_argument('--captured-robot-self-envelope-urdf', type=Path)
@@ -309,7 +316,8 @@ def main():
         filter_config=(None if args.captured_robot_filter_config is None else
             RM65CapturedRobotObservationFilterConfig.from_json_file(args.captured_robot_filter_config)),
         observation_urdf_path=args.captured_robot_observation_urdf,
-        self_observation_proxy_urdf_path=args.captured_robot_self_envelope_urdf)
+        self_observation_proxy_urdf_path=args.captured_robot_self_envelope_urdf,
+        envelope_profile=args.envelope_profile)
     if args.check_only:
         # Exercise native CAD/Embree without any camera or robot connection.
         cleaner(depth_m=np.ones((2, 2)), target_mask=np.zeros((2, 2), bool),
