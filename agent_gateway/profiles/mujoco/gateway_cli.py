@@ -170,6 +170,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--enable-grippers", action="store_true",
         help="publish bilateral atomic gripper Skills on the same deterministic MuJoCo owner")
+    parser.add_argument("--enable-grasp-approach", action="store_true",
+        help="publish right-arm approach_grasp_pose with an absolute envelope and noncontact joint planning; requires grippers and no realtime worker")
     parser.add_argument(
         "--safe-tcp-planning-clearance-padding-m",
         type=float,
@@ -493,6 +495,7 @@ def main(argv: list[str] | None = None) -> int:
         segmentation_localizer=segmentation_localizer,
         enable_safe_tcp_pose=args.enable_safe_tcp_pose,
         enable_spatial_goals=args.enable_spatial_goals,
+        enable_grasp_approach=args.enable_grasp_approach,
         safe_tcp_planning_clearance_padding_m=args.safe_tcp_planning_clearance_padding_m,
     )
     viewer = None

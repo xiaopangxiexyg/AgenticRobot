@@ -175,6 +175,7 @@ class MujocoAgentTcpPoseGatewaySession:
     service: AgentGatewayService
     safe_tcp_pose_executor: ReusableStationAgentSkillOperationExecutor | None = None
     spatial_goal_executor: PassiveReadSkillExecutor | None = None
+    grasp_approach_executor: ReusableStationAgentSkillOperationExecutor | None = None
     gripper_executor: ReusableStationAgentSkillOperationExecutor | None = None
     gripper_ports: Mapping[str, MujocoGripperControlPort] = field(default_factory=dict)
     _close_lock: threading.Lock = field(
@@ -414,7 +415,16 @@ class MujocoAgentTcpPoseGatewaySession:
         return (
             self.motion_executor,
             *((self.gripper_executor,) if self.gripper_executor is not None else ()),
-            *((self.safe_tcp_pose_executor,) if self.safe_tcp_pose_executor is not None else ()),
+            *(
+                (self.safe_tcp_pose_executor,)
+                if self.safe_tcp_pose_executor is not None
+                else ()
+            ),
+            *(
+                (self.grasp_approach_executor,)
+                if self.grasp_approach_executor is not None
+                else ()
+            ),
             self.cardinal_step_executor,
             *tuple(
                 self.fixed_cardinal_step_executors[skill_id]
@@ -644,6 +654,11 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
     if not isinstance(contract_bundle, MujocoAgentTcpPoseContractBundle):
         raise TypeError("contract_bundle must be typed.")
     gripper_ports = dict(gripper_ports or {})
+    if contract_bundle.grasp_approach_contract is not None:
+        if not gripper_ports or contract_bundle.gripper_contract is None:
+            raise ValueError("Grasp approach requires composed grippers and their contract.")
+        if application.runtime.rig.config.realtime_worker is not False:
+            raise ValueError("Grasp approach requires deterministic physics ownership.")
     if bool(gripper_ports) != (contract_bundle.gripper_contract is not None):
         raise ValueError("Composed gripper contract and ports must coexist.")
     for hand in gripper_ports.values():
@@ -1511,29 +1526,50 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
             clock=runtime_clock, max_retained_operations=retention,
         )
         execution_port_by_route_hash[registration.entry.route.semantic_content_hash] = spatial_goal_executor
-    safe_contract = contract_bundle.safe_tcp_pose_contract
-    safe_tcp_pose_executor = None
-    if safe_contract is not None:
-        safe_route = contract_bundle.route_manifest.route("motion.move_tcp_to_pose_safe", "1").route
+    planned_executors = {}
+    for skill_id, label, safe_contract in (
+        (
+            "motion.move_tcp_to_pose_safe",
+            "safe-tcp-pose",
+            contract_bundle.safe_tcp_pose_contract,
+        ),
+        (
+            "motion.approach_grasp_pose",
+            "grasp-approach",
+            contract_bundle.grasp_approach_contract,
+        ),
+    ):
+        if safe_contract is None:
+            continue
+        safe_route = contract_bundle.route_manifest.route(skill_id, "1").route
         safe_binding = safe_contract.deployment_binding
 
-        def safe_lifecycle_factory(*, request, operation):
+        def safe_lifecycle_factory(
+            *, request, operation, _route=safe_route, _contract=safe_contract
+        ):
             return MujocoAgentSafeTcpPoseSkillLifecycle(
+                path_search_time_budget_sec=_contract.path_search_time_budget_sec,
                 application=application,
                 domain_hold=domain_hold if gripper_ports else None,
-                route=safe_route,
-                deployment_binding=safe_binding,
-                evaluation_plan=safe_contract.evaluation_plan,
-                motion_profile=safe_contract.motion_profile,
+                route=_route,
+                deployment_binding=_contract.deployment_binding,
+                evaluation_plan=_contract.evaluation_plan,
+                motion_profile=_contract.motion_profile,
                 request=request,
                 operation=operation,
                 clock=runtime_clock,
             )
 
-        safe_tcp_pose_executor = ReusableStationAgentSkillOperationExecutor(
-            port_id="agent-gateway:safe-tcp-pose-worker:" + safe_binding.runtime_session_id,
+        planned_executor = ReusableStationAgentSkillOperationExecutor(
+            port_id="agent-gateway:"
+            + label
+            + "-worker:"
+            + safe_binding.runtime_session_id,
             binding=StationOperationWorkerBinding(
-                worker_id="agent-safe-tcp-pose-worker:" + safe_binding.runtime_session_id,
+                worker_id="agent-"
+                + label
+                + "-worker:"
+                + safe_binding.runtime_session_id,
                 executor_id=safe_binding.executor_id,
                 runtime_session_id=safe_binding.runtime_session_id,
                 skill_id=safe_route.skill_id,
@@ -1544,10 +1580,15 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
             ),
             lifecycle_factory=safe_lifecycle_factory,
             domain_hold=domain_hold,
-            current_station_revision=lambda: observation_producer.current_station_revision,
+            current_station_revision=lambda: (
+                observation_producer.current_station_revision
+            ),
             clock=runtime_clock,
         )
-        execution_port_by_route_hash[safe_route.semantic_content_hash] = safe_tcp_pose_executor
+        execution_port_by_route_hash[safe_route.semantic_content_hash] = (
+            planned_executor
+        )
+        planned_executors[skill_id] = planned_executor
     execution_port_by_route_hash.update(
         {
             fixed_cardinal_entry_by_skill_id[
@@ -1732,7 +1773,8 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
         owns_artifact_store=owns_artifact_store,
         hardware_view_provider=hardware_view_provider,
         service=service,
-        safe_tcp_pose_executor=safe_tcp_pose_executor,
+        safe_tcp_pose_executor=planned_executors.get("motion.move_tcp_to_pose_safe"),
+        grasp_approach_executor=planned_executors.get("motion.approach_grasp_pose"),
         gripper_executor=gripper_executor,
         gripper_ports=gripper_ports,
     )

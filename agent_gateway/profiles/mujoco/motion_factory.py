@@ -8,6 +8,7 @@ configuration is rejected instead of being silently repurposed.
 
 from __future__ import annotations
 
+import math
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -50,6 +51,7 @@ from sim.mujoco.deploy.target_config import DEFAULT_STATION_POSE_CONTRACT_PATH
 from .gripper_skill import MujocoGripperControlPort
 from .motion_application import MujocoAgentSkillMotionApplication
 from .motion_deployment import (
+    MUJOCO_AGENT_GRASP_APPROACH_ROUTE_ID_V1,
     MUJOCO_AGENT_SAFE_TCP_POSE_ROUTE_ID_V1,
     MUJOCO_AGENT_TCP_POSE_MAX_ROTATION_DELTA_RAD_V1,
     MUJOCO_AGENT_TCP_POSE_MAX_TRANSLATION_DELTA_M_V1,
@@ -235,6 +237,7 @@ def _build_standard_tcp_pose_envelope_runtime(
     prepared: Any,
     target_config: MujocoSimHILTargetConfig,
     enable_safe_tcp_pose: bool = False,
+    enable_grasp_approach: bool = False,
 ) -> TCPPoseEnvelopeSafetyRuntime:
     """Bind separate lower envelopes for bounded pose and fixed heading Routes.
 
@@ -341,8 +344,35 @@ def _build_standard_tcp_pose_envelope_runtime(
             MUJOCO_AGENT_TCP_FIXED_ORIENTATION_ROUTE_ID_BY_SKILL_ID_V1.values()
         ),
     )
+    entries = [standard_entry, orientation_entry]
+    if enable_grasp_approach:
+        grasp_profile = replace(
+            profile,
+            profile_id="mujoco-agent-grasp-absolute-envelope-v1",
+            side_config_by_side={
+                "right": TCPPoseEnvelopeSideConfig(
+                    absolute_min_xyz_m=(bounds[0], bounds[2], bounds[4]),
+                    absolute_max_xyz_m=(bounds[1], bounds[3], bounds[5]),
+                    max_rotation_rad=math.pi,
+                )
+            },
+        )
+        entries.append(
+            TCPPoseEnvelopeCatalogEntry(
+                envelope_id="mujoco.agent_grasp_approach.safety.absolute.v1",
+                profile=grasp_profile,
+                constraint_set_hash=canonical_content_hash(
+                    {
+                        "profile": grasp_profile.semantic_content_hash,
+                        "contact_permission": "none_noncontact_joint_path_only",
+                    },
+                    domain="mujoco.grasp_approach.absolute_envelope.v1",
+                ),
+                allowed_route_ids=(MUJOCO_AGENT_GRASP_APPROACH_ROUTE_ID_V1,),
+            )
+        )
     return TCPPoseEnvelopeSafetyRuntime(
-        catalog_entries=(standard_entry, orientation_entry),
+        catalog_entries=tuple(entries),
         target_frame_binding_hash=target_binding_hash,
         tool_frame_binding_hash_by_side={"right": tool_binding_hash},
         reference_frame_by_side={"right": reference_frame},
@@ -411,6 +441,7 @@ def build_mujoco_agent_tcp_pose_gateway_session(
     enable_spatial_goals: bool = False,
     safe_tcp_planning_clearance_padding_m: float = 0.002,
     enable_grippers: bool = False,
+    enable_grasp_approach: bool = False,
 ) -> MujocoAgentTcpPoseGatewaySession:
     """Build the exact default-off graph; do not start, record, or serve it."""
 
@@ -424,6 +455,12 @@ def build_mujoco_agent_tcp_pose_gateway_session(
         raise TypeError("enable_safe_tcp_pose must be boolean.")
     if not isinstance(enable_spatial_goals, bool):
         raise TypeError("enable_spatial_goals must be boolean.")
+    if not isinstance(enable_grasp_approach, bool):
+        raise TypeError("enable_grasp_approach must be boolean.")
+    if enable_grasp_approach and (not enable_grippers or target_config.realtime_worker):
+        raise ValueError(
+            "Grasp approach requires composed grippers and deterministic physics ownership."
+        )
     if history_storage is not None and not isinstance(
         history_storage,
         MujocoAgentTcpPoseHistoryStorageConfig,
@@ -503,6 +540,7 @@ def build_mujoco_agent_tcp_pose_gateway_session(
         prepared=prepared,
         target_config=target_config,
         enable_safe_tcp_pose=enable_safe_tcp_pose,
+        enable_grasp_approach=enable_grasp_approach,
     )
     target = build_mujoco_agent_skill_motion_target(
         config=target_config,
@@ -511,7 +549,7 @@ def build_mujoco_agent_tcp_pose_gateway_session(
         execution_observation_sink=observation_sink,
         trace_sink=trace_sink,
         tcp_pose_envelope_runtime=tcp_pose_envelope_runtime,
-        enable_safe_tcp_pose=enable_safe_tcp_pose,
+        enable_safe_tcp_pose=enable_safe_tcp_pose or enable_grasp_approach,
         safe_tcp_planning_clearance_padding_m=safe_tcp_planning_clearance_padding_m,
     )
     runtime_rig_holder["rig"] = target.runtime.rig
@@ -584,6 +622,7 @@ def build_mujoco_agent_tcp_pose_gateway_session(
             ),
             enable_safe_tcp_pose=enable_safe_tcp_pose,
             enable_spatial_goals=enable_spatial_goals,
+            enable_grasp_approach=enable_grasp_approach,
         )
         if enable_grippers:
             contract_bundle = _bind_grippers(contract_bundle, gripper_ports)

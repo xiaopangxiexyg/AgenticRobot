@@ -29,7 +29,7 @@ TASK = Path("sim/configs/tasks/rm65_right_cube_reach_fixed_pose_xyz_proprio_v1.j
 CLIENT = "test:mujoco-safe-tcp"
 
 
-def _session(trace, *, after_fact=None, task=TASK, spatial=False):
+def _session(trace, *, after_fact=None, task=TASK, spatial=False, grasp=False):
     def consume(fact):
         trace.append(fact)
         if after_fact is not None:
@@ -49,13 +49,15 @@ def _session(trace, *, after_fact=None, task=TASK, spatial=False):
         trace_sink=consume,
         enable_safe_tcp_pose=True,
         enable_spatial_goals=spatial,
+        enable_grippers=grasp,
+        enable_grasp_approach=grasp,
     )
 
 
-def _request(session, adapter, target, *, sequence=0):
+def _request(session, adapter, target, *, sequence=0, skill_id="motion.move_tcp_to_pose_safe"):
     observation = adapter.get_observation_snapshot()
     entry = session.contract_bundle.route_manifest.route(
-        "motion.move_tcp_to_pose_safe", "1"
+        skill_id, "1"
     )
     route = entry.route
     profile = session.contract_bundle.motion_profile
@@ -88,7 +90,7 @@ def _request(session, adapter, target, *, sequence=0):
         },
         observation_snapshot_id=observation["snapshot_id"],
         requested_mode="sim_active",
-        requested_timeout_ms=30_000,
+        requested_timeout_ms=min(120_000, route.max_operation_duration_ms),
     )
 
 
@@ -325,9 +327,10 @@ def test_safe_tcp_consumes_planned_joints_without_re_ik(monkeypatch, record_prop
 
 
 @pytest.mark.integration
-def test_safe_tcp_rejects_gripper_object_collision_without_dispatch(record_property):
+@pytest.mark.parametrize("grasp", (False, True))
+def test_safe_tcp_rejects_gripper_object_collision_without_dispatch(record_property, grasp):
     facts = []
-    session = _session(facts)
+    session = _session(facts, grasp=grasp)
     try:
         session.application.start_observation_ready()
         application = session.application
@@ -360,7 +363,9 @@ def test_safe_tcp_rejects_gripper_object_collision_without_dispatch(record_prope
         adapter = session.wire_adapter(authenticated_client_id=CLIENT)
         baseline = sum(fact.event_type == "command" for fact in facts)
         admitted = adapter.submit_skill_request(
-            _request(session, adapter, target).to_wire()
+            _request(session, adapter, target, skill_id=(
+                "motion.approach_grasp_pose" if grasp else "motion.move_tcp_to_pose_safe"
+            )).to_wire()
         )
         assert admitted["accepted"]
         assert session.wait(timeout_sec=35)

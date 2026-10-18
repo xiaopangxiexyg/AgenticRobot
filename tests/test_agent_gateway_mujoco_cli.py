@@ -284,6 +284,8 @@ def test_runtime_session_identity_is_unique_by_default_and_overridable() -> None
     assert parser.parse_args(common).runtime_session_id is None
     assert parser.parse_args(common).artifact_root is None
     assert parser.parse_args(common).viewer is False
+    assert parser.parse_args(common).enable_grasp_approach is False
+    assert parser.parse_args([*common, "--enable-grasp-approach"]).enable_grasp_approach is True
     assert parser.parse_args([*common, "--viewer"]).viewer is True
     assert parser.parse_args(common).max_session_admissions_per_route is None
     assert (

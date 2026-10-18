@@ -1302,6 +1302,13 @@ MuJoCo 的现有入口可显式增加 `--enable-safe-tcp-pose`，为右臂发布
 Route 的能力；这项接入也不发布双夹爪 v2。完成、取消和关闭仍需下层 HOLD 证据。
 模拟验证与真机验收分别记录。
 
+MuJoCo 可显式组合 `--enable-grasp-approach --enable-grippers --no-realtime-worker`，
+发布 `motion.approach_grasp_pose@1`。它复用同一 planned-motion、operation slot
+及机械臂／双手联合 HOLD，使用独立且只绑定自身 Route 的绝对 TCP 包络；
+原 safe move 的增量限值和禁止接触语义不变。公开 assembler 同样要求端口属于
+当前 rig、具有构造时声明的 arm-HOLD 约束，且实际 rig 使用确定性物理时钟。
+该 Route 只执行接近，不自动闭合夹爪、抬升或证明抓取成功；默认不发布。
+
 MuJoCo 的 ``state.read_tcp_pose`` 与可选 TCP history 发布同一公开 Station 坐标系。
 其参数及结果校验从公开 state binding 获取坐标身份，不使用内部 IK execution frame；
 Agent 必须按当前 schema 查询和复制身份，不能以 arm-base 查询替代 Station 查询。
