@@ -16,6 +16,7 @@ import numpy as np
 from PIL import Image
 
 from dataset_contracts.canonical_encoding import canonical_content_hash
+from dataset_contracts.perception_artifacts import PARALLEL_JAW_FINGER_EXCHANGE_POSE_SOURCE_V1
 from robot_motion.grasp_visible_scene import (
     PRODUCTION_VISIBLE_GRASP_DEPTH_FILTER,
     ParallelJawSolidGeometry,
@@ -388,6 +389,12 @@ class GraspGenXPointGraspModelSpec:
 
 
 @dataclass(frozen=True)
+class GraspGenXSelectionCandidate(PointGraspCandidate):
+    """Ephemeral pool lineage for selection, never a wire candidate identity."""
+    symmetry_parent_index: int | None = None
+
+
+@dataclass(frozen=True)
 class _RankedGraspCandidate:
     score: float
     model_score: float
@@ -399,6 +406,7 @@ class _RankedGraspCandidate:
     orientation_variant_axis: str | None = None
     orientation_variant_angle_deg: float = 0.0
     support_clearance_world_z_m: float = 0.0
+    symmetry_parent: _RankedGraspCandidate | None = None
 
 
 def _pose_is_duplicate(pose: np.ndarray, accepted: list[np.ndarray] | np.ndarray) -> bool:
@@ -444,6 +452,7 @@ class Sam2GraspGenXPointGraspPlanner:
             GRASPGENX_DMTAC_ORIENTATION_VARIANT_SOURCE_LIMIT
         ),
         preferred_approach_origin_base_m: tuple[float, float, float] | None = None,
+        enable_finger_exchange: bool = False,
     ) -> None:
         if not isinstance(model_spec, GraspGenXPointGraspModelSpec):
             raise TypeError("model_spec must be typed.")
@@ -480,6 +489,9 @@ class Sam2GraspGenXPointGraspPlanner:
         self.score_threshold = threshold
         self.max_gripper_width_m = float(max_gripper_width_m)
         self.max_click_distance_m = float(max_click_distance_m)
+        if not isinstance(enable_finger_exchange, bool):
+            raise TypeError("enable_finger_exchange must be bool.")
+        self.enable_finger_exchange = enable_finger_exchange
         orientation_variants = []
         for value in orientation_variants_local_axis_degrees:
             if (
@@ -593,7 +605,7 @@ class Sam2GraspGenXPointGraspPlanner:
                     ),
                 },
                 "candidate_selection": {
-                    "policy": "collision_readmitted_arm_local_chain_shortlist_v10",
+                    "policy": "collision_readmitted_arm_motion_shortlist_v11",
                     "approach_axis_deg": (
                         GRASPGENX_CANDIDATE_APPROACH_DIVERSITY_DEG
                     ),
@@ -610,6 +622,8 @@ class Sam2GraspGenXPointGraspPlanner:
                         "physical_readmission": (
                             "width_target_capture_terminal_collision_and_approach"
                         ),
+                        "embodied_half_turn": ("z_180_about_observed_target_center"
+                            if self.enable_finger_exchange else "disabled"),
                     },
                     "dmtac_arm_side_variants": {
                         "preferred_approach_origin_base_m": (
@@ -1103,7 +1117,7 @@ class Sam2GraspGenXPointGraspPlanner:
         def increment(name: str, *, pose_source: str, amount: int = 1) -> None:
             if pose_source == "model_scored":
                 key = name
-            elif pose_source == "dmtac_local_orientation_variant_v1":
+            elif pose_source in {"dmtac_local_orientation_variant_v1", PARALLEL_JAW_FINGER_EXCHANGE_POSE_SOURCE_V1}:
                 key = f"orientation_variant_{name}"
             elif pose_source == "dmtac_arm_side_approach_variant_v1":
                 key = f"arm_side_variant_{name}"
@@ -1391,6 +1405,7 @@ class Sam2GraspGenXPointGraspPlanner:
 
         def prepare_orientation_variants(
             source: _RankedGraspCandidate,
+            *, axis_angles=None,
         ) -> list[_RankedGraspCandidate]:
             variants: list[_RankedGraspCandidate] = []
             source_grasp_from_camera = np.linalg.inv(
@@ -1413,7 +1428,9 @@ class Sam2GraspGenXPointGraspPlanner:
                 @ source_target_center_local
                 + source.camera_from_grasp_geometry[:3, 3]
             )
-            for axis, angle_deg in self.orientation_variants_local_axis_degrees:
+            if axis_angles is None:
+                axis_angles = self.orientation_variants_local_axis_degrees
+            for axis, angle_deg in axis_angles:
                 variant_camera_from_grasp_geometry = (
                     source.camera_from_grasp_geometry
                     @ _local_axis_rotation(axis, angle_deg)
@@ -1439,12 +1456,18 @@ class Sam2GraspGenXPointGraspPlanner:
                         field_name="DMTAC base orientation variant",
                     ),
                     raw_model_score=source.model_score,
-                    pose_source="dmtac_local_orientation_variant_v1",
+                    pose_source=(PARALLEL_JAW_FINGER_EXCHANGE_POSE_SOURCE_V1
+                        if axis == "z" and abs(angle_deg) == 180.0
+                        else "dmtac_local_orientation_variant_v1"),
                     orientation_variant_axis=axis,
                     orientation_variant_angle_deg=angle_deg,
                     support_clearance_world_z_m=0.0,
                 )
                 if variant is not None:
+                    if axis == "z" and abs(angle_deg) == 180.0:
+                        variant = replace(variant, symmetry_parent=source,
+                            score=source.score * math.exp(-abs(angle_deg)
+                                / GRASPGENX_DMTAC_ORIENTATION_VARIANT_SCORE_DECAY_DEG))
                     variants.append(variant)
             return variants
 
@@ -1885,6 +1908,19 @@ class Sam2GraspGenXPointGraspPlanner:
             )
         ranked.extend(support_candidates)
 
+        if candidate_selector is not None and self.enable_finger_exchange:
+            # A valid tilted/support-refined proposal also needs its own finger
+            # exchange. Generating it only from raw poses misses that branch.
+            sources = sorted(ranked, key=lambda item: (-item.score, item.click_distance_m))
+            _, source_indices = self._distinct_approach_first_indices(
+                tuple(item.camera_from_grasp_geometry for item in sources),
+                maximum=min(internal_candidate_target, len(sources)))
+            for index in source_indices:
+                for variant in prepare_orientation_variants(sources[index], axis_angles=(("z", 180.),)):
+                    admitted = admit_visible_scene(variant)
+                    if admitted is not None:
+                        ranked.append(admitted)
+
         ranked.sort(key=lambda item: (-item.score, item.click_distance_m))
         deduplicated = _deduplicate_ranked_poses(ranked)
 
@@ -1916,8 +1952,13 @@ class Sam2GraspGenXPointGraspPlanner:
             self.solid_geometry.solid_pose(np.eye(4))
         )
 
-        def public_candidate(item: _RankedGraspCandidate) -> PointGraspCandidate:
-            return PointGraspCandidate(
+        pool_indices = {id(item): index for index, item in enumerate(deduplicated)}
+
+        def public_candidate(item: _RankedGraspCandidate, *, for_selection=False) -> PointGraspCandidate:
+            candidate_type = GraspGenXSelectionCandidate if for_selection else PointGraspCandidate
+            lineage = ({"symmetry_parent_index": pool_indices.get(id(item.symmetry_parent))}
+                       if for_selection else {})
+            return candidate_type(
                 score=float(item.score),
                 model_score=float(item.model_score),
                 click_distance_m=float(item.click_distance_m),
@@ -1939,6 +1980,7 @@ class Sam2GraspGenXPointGraspPlanner:
                 orientation_variant_axis=item.orientation_variant_axis,
                 orientation_variant_angle_deg=item.orientation_variant_angle_deg,
                 support_clearance_world_z_m=item.support_clearance_world_z_m,
+                **lineage,
             )
 
         reserved_variant_indices: list[int] = []
@@ -1947,7 +1989,7 @@ class Sam2GraspGenXPointGraspPlanner:
                 (*target_camera, 1.0), dtype=np.float64
             )
             selection = candidate_selector(
-                tuple(public_candidate(item) for item in deduplicated),
+                tuple(public_candidate(item, for_selection=True) for item in deduplicated),
                 tuple(float(value) for value in target_reference[:3]),
                 maximum,
             )
@@ -2053,6 +2095,8 @@ class Sam2GraspGenXPointGraspPlanner:
             item.pose_source == "dmtac_local_orientation_variant_v1"
             for item in selected
         )
+        counts["finger_exchange_selected"] = sum(
+            item.pose_source == PARALLEL_JAW_FINGER_EXCHANGE_POSE_SOURCE_V1 for item in selected)
         counts["support_clearance_variant_selected"] = sum(
             item.pose_source == "dmtac_support_clearance_variant_v1"
             for item in selected

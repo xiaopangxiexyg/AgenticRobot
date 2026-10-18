@@ -292,10 +292,24 @@ class RM65PointGraspReachabilityAdapter:
                     "pose_source": str(
                         getattr(candidate, "pose_source", "model_scored")
                     ),
+                    "half_turn": (
+                        getattr(candidate, "orientation_variant_axis", None) == "z"
+                        and abs(getattr(candidate, "orientation_variant_angle_deg", 0.0)) == 180.0
+                    ),
+                    "symmetry_parent_index": getattr(candidate, "symmetry_parent_index", None),
                 }
             )
 
         eligible = [item for item in candidate_evidence if item["side_admissible"]]
+        symmetry_pairs = {}
+        for item in eligible:
+            parent = item["symmetry_parent_index"]
+            if parent is not None:
+                if (isinstance(parent, bool) or not isinstance(parent, int)
+                        or not 0 <= parent < len(candidates) or parent == item["index"]):
+                    raise ValueError("Symmetry lineage must reference another pool candidate.")
+                symmetry_pairs[int(parent)] = int(item["index"])
+                symmetry_pairs[int(item["index"])] = int(parent)
         eligible.sort(
             key=lambda item: (
                 -float(item["heuristic_score"]),
@@ -338,13 +352,14 @@ class RM65PointGraspReachabilityAdapter:
             for item in eligible
             if item["pose_source"] == "dmtac_support_clearance_variant_v1"
         ][:_ARM_SHORTLIST_PROBE_MAX_COUNT // 6]
-        support_priority_indices = {
-            int(item["index"]) for item in support_priority
-        }
-        evaluation = support_priority + [
+        half_turn_priority = [item for item in eligible if item["half_turn"]][
+            :_ARM_SHORTLIST_PROBE_MAX_COUNT // 6]
+        priority = support_priority + half_turn_priority
+        priority_indices = {int(item["index"]) for item in priority}
+        evaluation = priority + [
             item
             for item in base_evaluation
-            if int(item["index"]) not in support_priority_indices
+            if int(item["index"]) not in priority_indices
         ]
 
         # Model score and approach direction alone can hide a low-scored side
@@ -452,7 +467,9 @@ class RM65PointGraspReachabilityAdapter:
         feasible: list[dict[str, Any]] = []
         shortlist_attempts: list[dict[str, Any]] = []
         rejection_counts: dict[str, int] = {}
-        for item in evaluation:
+        feasible_limit = int(maximum) * (2 if half_turn_priority else 1)
+        assessed_indices = set()
+        for evaluation_index, item in enumerate(evaluation):
             remaining_sec = shortlist_deadline - float(self.monotonic())
             if (
                 remaining_sec < _ARM_SHORTLIST_CANDIDATE_BUDGET_SEC
@@ -479,6 +496,7 @@ class RM65PointGraspReachabilityAdapter:
                 monotonic=self.monotonic,
             )
             local_chain_assessment_count += 1
+            assessed_indices.add(int(item["index"]))
             if rescue_activated:
                 rescue_assessment_count += 1
             local_chain_elapsed_ms += float(local_chain.elapsed_ms)
@@ -501,6 +519,7 @@ class RM65PointGraspReachabilityAdapter:
                     ),
                     "endpoint_probe": item.get("endpoint_probe"),
                     "rigid_endpoint_check": item.get("rigid_endpoint_check"),
+                    "joint_travel_rad": local_chain.joint_travel_rad,
                 }
             )
             if not local_chain.feasible:
@@ -519,11 +538,21 @@ class RM65PointGraspReachabilityAdapter:
                     ),
                 }
             )
-            if len(feasible) >= int(maximum):
+            paired_index = symmetry_pairs.get(int(item["index"]))
+            if paired_index is not None and paired_index not in assessed_indices:
+                for next_index in range(evaluation_index + 1, len(evaluation)):
+                    if int(evaluation[next_index]["index"]) == paired_index:
+                        evaluation.insert(evaluation_index + 1, evaluation.pop(next_index))
+                        break
+            # A lower-scored finger-exchange proposal must be compared, not
+            # hidden by the first full display page. Same total time budget.
+            if len(feasible) >= feasible_limit:
                 break
 
         feasible.sort(
             key=lambda item: (
+                float(np.max(item["local_chain"].joint_travel_rad[:3])),
+                float(np.linalg.norm(item["local_chain"].joint_travel_rad)),
                 float(item["side_angle_deg"]),
                 -float(item["pregrasp_distance_m"]),
                 -float(item["score"]),
@@ -532,7 +561,15 @@ class RM65PointGraspReachabilityAdapter:
         )
         selected: list[dict[str, Any]] = []
         deferred = []
+        represented = set()
         for item in feasible:
+            index = int(item["index"])
+            if index in represented:
+                continue
+            represented.add(index)
+            paired_index = symmetry_pairs.get(index)
+            if paired_index is not None:
+                represented.add(paired_index)
             approach = np.asarray(item["approach"], dtype=np.float64)
             if any(
                 float(np.dot(approach, np.asarray(previous["approach"])))
@@ -563,6 +600,7 @@ class RM65PointGraspReachabilityAdapter:
                     local_chain_assessment_count
                 ),
                 "arm_shortlist_local_chain_feasible_count": len(feasible),
+                "arm_shortlist_motion_cost_policy": "proximal_max_then_joint_travel_v1",
                 "arm_shortlist_local_chain_elapsed_ms": (
                     local_chain_elapsed_ms
                 ),
@@ -597,7 +635,7 @@ class RM65PointGraspReachabilityAdapter:
                 "arm_shortlist_selected_count": len(selected),
                 "arm_shortlist_policy": (
                     "arm_side_family_then_rigid_endpoint_advisory_then_"
-                    "advisory_endpoint_probe_then_production_local_grasp_chain_v4"
+                    "advisory_endpoint_probe_then_production_local_grasp_chain_motion_cost_v5"
                 ),
             },
         )

@@ -138,6 +138,47 @@ class _DuckBackend:
         return self.grasps.copy(), self.scores.copy()
 
 
+def test_embodied_half_turn_covers_tilted_candidate_and_keeps_pool_lineage_internal(tmp_path):
+    depth = np.zeros((20, 20), dtype=np.float32)
+    depth[8:13, 8:13] = 1.
+    mask = depth > 0
+    pose = np.diag([1., -1., -1., 1.])
+    pose[2, 3] = 1.025
+    planner = Sam2GraspGenXPointGraspPlanner(model_spec=_model_spec(tmp_path),
+        point_segmenter=_Segmenter(mask), client=_PlannerClient(pose[None], np.array([.9])),
+        orientation_variants_local_axis_degrees=(("x", -10.),), enable_finger_exchange=True)
+    chosen = []
+
+    def select(pool, _target, _maximum):
+        for index, candidate in enumerate(pool):
+            parent_index = candidate.symmetry_parent_index
+            if parent_index is None:
+                continue
+            parent = pool[parent_index]
+            if parent.orientation_variant_axis != "x":
+                continue
+            first = planner.solid_geometry.solid_pose(np.asarray(parent.camera_from_tcp).reshape(4, 4))
+            second = planner.solid_geometry.solid_pose(np.asarray(candidate.camera_from_tcp).reshape(4, 4))
+            np.testing.assert_allclose(first[:3, 2], second[:3, 2], atol=1e-12)
+            np.testing.assert_allclose(first[:3, 0], -second[:3, 0], atol=1e-12)
+            local = (np.array([0., 0., 1.]) - first[:3, 3]) @ first[:3, :3]
+            np.testing.assert_allclose(second[:3, :3] @ local + second[:3, 3], [0., 0., 1.], atol=1e-12)
+            chosen.append(candidate)
+            return GraspGenXCandidateSelection((index,), {})
+        pytest.fail("The readmitted tilted proposal must have a checked half-turn")
+
+    planner.start()
+    try:
+        result = planner.plan(Image.fromarray(np.zeros((20, 20, 3), dtype=np.uint8)), depth,
+            pixel_uv=(10, 10), intrinsics={"width":20,"height":20,"fx":100.,"fy":100.,"cx":10.,"cy":10.},
+            base_from_camera=np.eye(4), max_candidates=1, candidate_selector=select)
+    finally:
+        planner.close()
+    assert len(chosen) == 1
+    assert not hasattr(result.candidates[0], "symmetry_parent_index")
+    assert result.candidates[0].orientation_variant_angle_deg == 180.
+
+
 def test_support_clearance_retains_arm_side_and_top_without_ignoring_table(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

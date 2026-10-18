@@ -35,6 +35,7 @@ LOCALIZATION_ANNOTATED_IMAGE_ENCODING_V1 = "jpeg.rgb8.v1"
 LOCALIZATION_ANNOTATED_IMAGE_COMPRESSION_V1 = "none"
 
 POINT_GRASP_RGB_SCHEMA_ID_V1 = "dexteleop.perception.point_grasp_rgb.v1"
+PARALLEL_JAW_FINGER_EXCHANGE_POSE_SOURCE_V1 = "parallel_jaw_finger_exchange_variant_v1"
 POINT_GRASP_DEPTH_SCHEMA_ID_V1 = "dexteleop.perception.point_grasp_depth_meters.v1"
 POINT_GRASP_ANNOTATED_SCHEMA_ID_V1 = (
     "dexteleop.perception.point_grasp_annotated_image.v1"

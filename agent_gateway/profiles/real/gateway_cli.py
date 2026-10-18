@@ -181,6 +181,8 @@ def build_parser() -> argparse.ArgumentParser:
         help="Use frozen stationary RGB-D target selection and optional associated-view fusion (GraspGenX only).")
     parser.add_argument("--enable-back-projection", action="store_true",
         help="Expose model-free RGB-D capture and back projection using the existing measured camera geometry.")
+    parser.add_argument("--enable-point-grasp-finger-exchange", action="store_true",
+        help="Register point-grasp v5 with separately readmitted 180-degree finger exchanges; requires GraspGenX and arm reachability.")
     parser.add_argument(
         "--debug-render-object-coordinates",
         action="store_true",
@@ -956,6 +958,9 @@ def main(argv: list[str] | None = None) -> int:
         parser.error(
             "--enable-point-grasp-arm-reachability requires --enable-point-grasp"
         )
+    if args.enable_point_grasp_finger_exchange and (
+            not args.enable_point_grasp_arm_reachability or args.point_grasp_backend != "graspgenx"):
+        parser.error("--enable-point-grasp-finger-exchange requires GraspGenX and --enable-point-grasp-arm-reachability")
     camera_mount_urdf_arg = _effective_camera_mount_urdf(args)
     if args.camera_mount_urdf is not None and not (
             args.enable_point_grasp or args.enable_back_projection
@@ -1218,6 +1223,7 @@ def main(argv: list[str] | None = None) -> int:
                     preferred_approach_origin_base_m=tuple(
                         float(value) for value in reference_from_arm_base[:3, 3]
                     ),
+                    enable_finger_exchange=args.enable_point_grasp_finger_exchange,
                 )
         except (OSError, TypeError, ValueError) as error:
             parser.error(f"invalid point-grasp model bundle: {error}")
@@ -1265,6 +1271,7 @@ def main(argv: list[str] | None = None) -> int:
         enable_grasp_observation=args.enable_grasp_observation,
         enable_spatial_goals=args.enable_spatial_goals,
         enable_back_projection=args.enable_back_projection,
+        enable_point_grasp_finger_exchange=args.enable_point_grasp_finger_exchange,
         debug_render_object_coordinates=args.debug_render_object_coordinates,
         enable_point_grasp_arm_reachability=(args.enable_point_grasp_arm_reachability),
         safe_motion_observation_config=(None if args.safe_motion_observation_roles is None

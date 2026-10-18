@@ -16,6 +16,7 @@ from agent_gateway.profiles.real.grasp_approach_plan import (
 )
 from agent_gateway.profiles.real.station_point_grasp_deployment import (
     StationBoundPointGraspRegistration,
+    StationPointGraspArmReachabilityProfile,
     build_station_bound_point_grasp_registration,
 )
 from agent_gateway.protocol.contracts import AgentSkillOperation
@@ -111,7 +112,8 @@ def _no_op_point_grasp_validator(
 
 
 def _planning_fixture(
-    *, planner, execution_operation_timeout_sec=DEFAULT_REAL_GRASP_EXECUTION_OPERATION_TIMEOUT_SEC
+    *, planner, execution_operation_timeout_sec=DEFAULT_REAL_GRASP_EXECUTION_OPERATION_TIMEOUT_SEC,
+    finger_exchange=False,
 ):
     from robot_motion.grasp_visible_scene import VisibleGraspScene, ParallelJawSolidGeometry
     # Explicit geometry fixture: route tests exercise control/plan lifecycles,
@@ -163,6 +165,12 @@ def _planning_fixture(
         station_manifest_hash="station-manifest:grasp-plan-test",
         execution_manifest_hash="execution-manifest:grasp-plan-test",
         current_mode="real_active",
+        finger_exchange=finger_exchange,
+        arm_reachability_profile=(StationPointGraspArmReachabilityProfile(arm_side="right",
+            evaluator_profile_id="fixture:reachability", evaluator_profile_hash="fixture:reachability-hash",
+            solver_reference_frame_id=execution_frame.frame_id,
+            solver_reference_frame_spec_hash=execution_frame.semantic_content_hash,
+            frame_graph_hash=graph.semantic_content_hash) if finger_exchange else None),
     )
     point_grasp = replace(
         point_grasp,
@@ -195,6 +203,8 @@ def _planning_fixture(
     )
     candidate_pose = np.eye(4, dtype=float)
     candidate_pose[:3, 3] = (0.25, -0.10, 0.30)
+    if finger_exchange:
+        candidate_pose[:3, :3] = np.diag([-1., -1., 1.])
     source_result = {
         "station_revision": 7,
         "backend_id": point_grasp.profile.backend_id,
@@ -424,7 +434,8 @@ def test_start_state_rejection_keeps_subject_and_unchanged_ingress_bound() -> No
     assert plan is None
 
 
-def test_path_found_is_read_only_and_produces_one_use_immutable_plan() -> None:
+@pytest.mark.parametrize("finger_exchange", [False, True])
+def test_path_found_is_read_only_and_produces_one_use_immutable_plan(finger_exchange) -> None:
     calls = []
 
     def planner(**kwargs):
@@ -432,7 +443,7 @@ def test_path_found_is_read_only_and_produces_one_use_immutable_plan() -> None:
         return _stationary_trajectory(kwargs["qpos_by_side"])
 
     registration, provider, store, port, request, operation = _planning_fixture(
-        planner=planner
+        planner=planner, finger_exchange=finger_exchange,
     )
 
     result, plan = provider.plan_request(request, operation)
@@ -450,6 +461,10 @@ def test_path_found_is_read_only_and_produces_one_use_immutable_plan() -> None:
         calls[0]["target_tool_tcp_world"],
         plan.target_pose_execution,
     )
+    assert provider.point_grasp_registration.skill.definition.skill_version == ("5" if finger_exchange else "2")
+    if finger_exchange:
+        np.testing.assert_allclose(np.asarray(calls[0]["target_tool_tcp_world"]).reshape(4,4)[:3, :3],
+            np.diag([-1., -1., 1.]))
     assert port.snapshot().phase == RealAgentMotionPhase.INACTIVE
     assert port.snapshot().dispatch_count == 0
 

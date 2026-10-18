@@ -281,6 +281,7 @@ def assemble_exclusive_rm65_agent_primitive_composition(
     enable_grasp_observation: bool = False,
     enable_spatial_goals: bool = False,
     enable_back_projection: bool = False,
+    enable_point_grasp_finger_exchange: bool = False,
     debug_render_object_coordinates: bool = False,
     enable_point_grasp_arm_reachability: bool = False,
     grasp_trajectory_config: RM65GraspTrajectoryPlanningConfig | None = None,
@@ -303,6 +304,8 @@ def assemble_exclusive_rm65_agent_primitive_composition(
         raise TypeError("enable_spatial_goals must be bool.")
     if not isinstance(enable_back_projection, bool):
         raise TypeError("enable_back_projection must be bool.")
+    if not isinstance(enable_point_grasp_finger_exchange, bool):
+        raise TypeError("enable_point_grasp_finger_exchange must be bool.")
     if grasp_trajectory_config is not None and not isinstance(
         grasp_trajectory_config,
         RM65GraspTrajectoryPlanningConfig,
@@ -401,6 +404,11 @@ def assemble_exclusive_rm65_agent_primitive_composition(
         if not observed_safe_enabled:
             raise ValueError("Safe-motion debug records require observed safe motion.")
         safe_motion_debug_dir = validate_debug_directory(safe_motion_debug_dir)
+    if enable_point_grasp_finger_exchange and (not enable_point_grasp_arm_reachability
+            or getattr(point_grasp_planner, "backend_id", None) != "graspgenx"):
+        raise ValueError("Finger exchange requires GraspGenX and arm reachability.")
+    if bool(getattr(point_grasp_planner, "enable_finger_exchange", False)) != enable_point_grasp_finger_exchange:
+        raise ValueError("Finger-exchange generator and registered contract differ.")
     if enable_grasp_observation and (
         not grasp_enabled or getattr(point_grasp_planner, "backend_id", None) != "graspgenx"
     ):
@@ -817,6 +825,7 @@ def assemble_exclusive_rm65_agent_primitive_composition(
                     execution_manifest_hash=execution_manifest_hash,
                     current_mode="real_active",
                     frozen_observation=enable_grasp_observation,
+                    finger_exchange=enable_point_grasp_finger_exchange,
                     arm_reachability_profile=(
                         StationPointGraspArmReachabilityProfile(
                             arm_side=side,

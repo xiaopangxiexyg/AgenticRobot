@@ -1103,3 +1103,12 @@ def test_gripper_v2_requires_explicit_complete_configuration_before_profile_or_d
     with pytest.raises(SystemExit) as captured:
         gateway_cli.main([*args, *flags])
     assert captured.value.code == 2
+
+
+def test_finger_exchange_is_explicit_and_old_cli_default_stays_disabled():
+    parser = gateway_cli.build_parser()
+    argv = _argv(confirmation=REAL_AGENT_PRIMITIVE_SESSION_CONFIRM_TOKEN)
+    assert not parser.parse_args(argv).enable_point_grasp_finger_exchange
+    parsed = parser.parse_args([*argv, "--enable-point-grasp", "--enable-point-grasp-arm-reachability",
+        "--enable-point-grasp-finger-exchange", "--point-grasp-backend", "graspgenx"])
+    assert parsed.enable_point_grasp_finger_exchange and parsed.enable_point_grasp_arm_reachability

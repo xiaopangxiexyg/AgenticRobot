@@ -164,6 +164,7 @@ class StationBoundPointGraspProfile:
     max_annotated_bytes: int = 16 * 1024 * 1024
     profile_id: str = "real-live-station-bound-dmtac-m-point-grasp-v2"
     frozen_observation: bool = False
+    finger_exchange: bool = False
 
     def __post_init__(self) -> None:
         for field_name in (
@@ -189,6 +190,9 @@ class StationBoundPointGraspProfile:
             raise ValueError("Station point-grasp backend is unsupported.")
         if not isinstance(self.frozen_observation, bool) or (self.frozen_observation and self.backend_id != "graspgenx"):
             raise ValueError("Frozen grasp observations require GraspGenX")
+        if not isinstance(self.finger_exchange, bool) or (self.finger_exchange and (
+                self.backend_id != "graspgenx" or self.arm_reachability_profile is None)):
+            raise ValueError("Finger exchange requires GraspGenX and its embodied reachability profile")
         if self.arm_reachability_profile is not None and not isinstance(
             self.arm_reachability_profile,
             StationPointGraspArmReachabilityProfile,
@@ -266,6 +270,8 @@ class StationBoundPointGraspProfile:
         }
         if self.frozen_observation:
             payload["input"] = "retained_stationary_rgbd_observation_with_optional_view_fusion"
+        if self.finger_exchange:
+            payload["finger_exchange"] = "independently_readmitted_model_z_half_turn"
         if self.arm_reachability_profile is None:
             return canonical_content_hash(
                 payload,
@@ -304,8 +310,8 @@ class StationBoundPointGraspBinding:
                 field_name,
                 _required(getattr(self, field_name), field_name=field_name),
             )
-        if self.deployment_binding_version not in {"2", "3", "4"}:
-            raise ValueError("deployment_binding_version must be 2, 3 or 4.")
+        if self.deployment_binding_version not in {"2", "3", "4", "5"}:
+            raise ValueError("deployment_binding_version must be 2, 3, 4 or 5.")
 
     @property
     def semantic_content_hash(self) -> str:
@@ -368,6 +374,7 @@ def build_station_bound_point_grasp_registration(
     current_mode: str = "real_observe",
     arm_reachability_profile: StationPointGraspArmReachabilityProfile | None = None,
     frozen_observation: bool = False,
+    finger_exchange: bool = False,
 ) -> StationBoundPointGraspRegistration:
     """Build one closed, proposal-only live point-grasp registration."""
 
@@ -395,6 +402,7 @@ def build_station_bound_point_grasp_registration(
         inference_implementation_hash=inference_implementation_hash,
         arm_reachability_profile=arm_reachability_profile,
         frozen_observation=frozen_observation,
+        finger_exchange=finger_exchange,
         profile_id=(
             "real-live-station-bound-dmtac-m-point-grasp-v3"
             if arm_reachability_profile is not None
@@ -615,7 +623,10 @@ def build_station_bound_point_grasp_registration(
     )
     if frozen_observation:
         from .grasp_observation import upgrade_frozen_point_grasp_registration
-        return upgrade_frozen_point_grasp_registration(registration)
+        registration = upgrade_frozen_point_grasp_registration(registration)
+    if finger_exchange:
+        from .point_grasp_finger_exchange import upgrade_finger_exchange_point_grasp_registration
+        registration = upgrade_finger_exchange_point_grasp_registration(registration)
     return registration
 
 

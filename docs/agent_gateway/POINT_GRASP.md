@@ -617,6 +617,23 @@ IK、生产 URDF/FCL 场景和完整关节路径规划；不会接受调用方�
 标定，因此其 `base` 输出不能被称为 deployment-trusted Station pose，也不会由生产
 `real-perception` profile 发布。
 
+### 可选手指交换候选（显式 v5）
+
+真实 Gateway 的现有入口可显式增加 `--enable-point-grasp-finger-exchange`，
+同时启用 GraspGenX 和 arm reachability。默认关闭，原 v2／v3／v4 注册保留。
+开启后发布独立 v5 合同，允许绕模型局部 Z 轴旋转 180° 的平行夹爪手指交换候选；
+候选必须重新通过开口、目标归属、可见几何碰撞和完整局部接近链检查。
+它沿用主线的路径质量、局部链缓存和总时间预算，并在同源候选之间比较近端关节
+行程；静态端点提示只参与排序，不代替实际路径准入。
+
+候选的 `pose_source` 为 `parallel_jaw_finger_exchange_variant_v1`，其轴必须为
+`z`、角度必须为 180°。旧版本仍拒绝该新来源；调用者不能通过请求字段放宽安全
+条件。这个只读候选功能不会运动、闭合夹爪或授予后续 motion 的执行权限。
+冻结观测入口仍需显式开启并携带其原有观测身份。
+
+shortlist 的关节行程排序也适用于旧版本的普通候选，可能改变其展示顺序；
+关闭手指交换只是不生成新候选，原有物理准入和总时间预算继续生效。
+
 ## DMTAC M 和坐标语义
 
 DMTAC/GraspGenX 的名义模型指长仍为 100 mm；碰撞及渲染 proxy 在最前端单独加长 1 mm，

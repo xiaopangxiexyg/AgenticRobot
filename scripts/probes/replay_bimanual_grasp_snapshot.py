@@ -218,6 +218,7 @@ def replay(args):
             frame_graph=frames.frame_graph, candidate_reference_frame_id=frames.reference_frame_id, arm_base_origin_candidate_m=origin)
         point = Sam2GraspGenXPointGraspPlanner(model_spec=spec, point_segmenter=localizer, client=backend,
             solid_geometry=reviewed_graspgenx_dmtac_solid_geometry(),
+            enable_finger_exchange=True,
             orientation_variants_local_axis_degrees=GRASPGENX_DMTAC_REACHABILITY_ORIENTATION_VARIANTS_LOCAL_AXIS_DEG,
             preferred_approach_origin_base_m=origin)
         selection_diagnostics = {}

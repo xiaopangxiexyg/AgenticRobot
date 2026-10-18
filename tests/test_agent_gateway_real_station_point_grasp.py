@@ -63,6 +63,41 @@ from deployments.perception.sam2_vgn_point_grasp import (
 from teleop_runtime.video_frame import VideoFrame
 
 
+@pytest.mark.parametrize("side", ("left", "right"))
+def test_shortlist_compares_checked_finger_exchange_and_prefers_small_proximal_motion(side):
+    adapter = object.__new__(RM65PointGraspReachabilityAdapter)
+    adapter.profile = SimpleNamespace(max_measured_qpos_age_ms=200., arm_side=side)
+    adapter.arm_base_origin_candidate_m = (1., 0., 0.)
+    adapter.clock = lambda: 10.
+    adapter.monotonic = lambda: 0.
+    adapter._solver_pose = lambda value: value
+    candidates = []
+    for index in range(2):
+        pose = np.diag([-1., 1., -1., 1.])
+        pose[0, 3] = index * .01
+        candidates.append(SimpleNamespace(base_from_tcp=pose, score=.9 if index==0 else .3,
+            symmetry_parent_index=None if index==0 else 0,
+            orientation_variant_axis=None if index==0 else "z",
+            orientation_variant_angle_deg=0. if index==0 else 180.))
+    assessed = []
+    def assess(**kwargs):
+        index = int(round(kwargs["target_tool_tcp_world"][0, 3] * 100))
+        assessed.append(index)
+        return SimpleNamespace(feasible=True, selected_pregrasp_distance_m=.06,
+            elapsed_ms=1., reason_code=None, attempts=(),
+            joint_travel_rad=(3.6,1.,2.,1.,.1,.3) if index==0 else (.5,.3,1.,1.,2.7,.3))
+    adapter.planner = SimpleNamespace(assess_local_grasp_chain=assess)
+    result = adapter.select_candidates(tuple(candidates), (0.,0.,0.), 1,
+        measured_qpos_cut=SimpleNamespace(measured_at=10., qpos_by_side={}), measurement_reference_time=10.)
+    assert set(assessed) == {0, 1}
+    assert result.selected_indices == (1,)
+    assert result.diagnostics["arm_shortlist_local_chain_feasible_count"] == 2
+    candidates[1].symmetry_parent_index = 2
+    with pytest.raises(ValueError, match="lineage"):
+        adapter.select_candidates(tuple(candidates), (0.,0.,0.), 1,
+            measured_qpos_cut=SimpleNamespace(measured_at=10., qpos_by_side={}), measurement_reference_time=10.)
+
+
 def test_offline_reachability_never_invents_a_live_qpos_cut():
     adapter = object.__new__(RM65PointGraspReachabilityAdapter)
     adapter.motion_port = None
@@ -97,6 +132,7 @@ def test_embodied_shortlist_reports_bounded_rejection_reasons() -> None:
         reason = next(reasons)
         return SimpleNamespace(
             feasible=reason is None,
+            joint_travel_rad=(0.,) * 6,
             selected_pregrasp_distance_m=0.08 if reason is None else None,
             elapsed_ms=25.0,
             reason_code=reason,
@@ -188,6 +224,7 @@ def test_embodied_shortlist_preserves_tilted_pose_and_direction_diversity() -> N
         assessed.append(index)
         return SimpleNamespace(
             feasible=True, selected_pregrasp_distance_m=0.06,
+            joint_travel_rad=(0.,) * 6,
             elapsed_ms=1.0, reason_code=None, attempts=(),
         )
 
@@ -239,6 +276,7 @@ def test_embodied_shortlist_explores_unknown_before_known_collision(
         assessed.append(index)
         return SimpleNamespace(
             feasible=index == 1, selected_pregrasp_distance_m=0.06,
+            joint_travel_rad=(0.,) * 6,
             elapsed_ms=1.0, reason_code=None if index == 1 else "endpoint_collision_blocked",
             attempts=(),
         )
@@ -296,6 +334,7 @@ def test_embodied_shortlist_uses_endpoint_probe_only_to_reorder_full_checks() ->
         assessed.append(index)
         return SimpleNamespace(
             feasible=index == 2,
+            joint_travel_rad=(0.,) * 6,
             selected_pregrasp_distance_m=0.06 if index == 2 else None,
             elapsed_ms=2.0,
             reason_code=None if index == 2 else "ik_search_exhausted",
@@ -364,6 +403,7 @@ def test_embodied_shortlist_probes_support_clearance_family_before_model_scores(
         assessed.append(index)
         return SimpleNamespace(
             feasible=index == 5,
+            joint_travel_rad=(0.,) * 6,
             selected_pregrasp_distance_m=0.06 if index == 5 else None,
             elapsed_ms=2.0,
             reason_code=None if index == 5 else "endpoint_collision_blocked",
@@ -407,6 +447,7 @@ def test_embodied_shortlist_does_not_reject_an_unresolved_endpoint_probe() -> No
         ),
         assess_local_grasp_chain=lambda **_kwargs: SimpleNamespace(
             feasible=True,
+            joint_travel_rad=(0.,) * 6,
             selected_pregrasp_distance_m=0.04,
             elapsed_ms=2.0,
             reason_code=None,
@@ -455,6 +496,7 @@ def test_embodied_shortlist_rescues_late_feasible_pose_after_extreme_scene_budge
         feasible = index == 6
         return SimpleNamespace(
             feasible=feasible,
+            joint_travel_rad=(0.,) * 6,
             selected_pregrasp_distance_m=0.06 if feasible else None,
             elapsed_ms=durations[index] * 1000.0,
             reason_code=None if feasible else "ik_search_exhausted",
@@ -497,6 +539,7 @@ def test_embodied_shortlist_rescue_stops_at_total_deadline() -> None:
         elapsed[0] += 2.0
         return SimpleNamespace(
             feasible=False,
+            joint_travel_rad=None,
             selected_pregrasp_distance_m=None,
             elapsed_ms=2000.0,
             reason_code="ik_search_exhausted",
@@ -554,6 +597,7 @@ def test_embodied_shortlist_checks_nearby_pose_before_spending_first_window() ->
         feasible = index == 5
         return SimpleNamespace(
             feasible=feasible,
+            joint_travel_rad=(0.,) * 6,
             selected_pregrasp_distance_m=0.06 if feasible else None,
             elapsed_ms=1000.0,
             reason_code=None if feasible else "ik_search_exhausted",
