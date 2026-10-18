@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 
 import numpy as np
@@ -56,12 +57,16 @@ class KinematicCollisionProjector:
         model,
         controlled_qpos_indices: np.ndarray,
         policy: CollisionSafetyPolicy | None = None,
+        *,
+        pair_clearance_m: Mapping[tuple[int, int], float] | None = None,
     ) -> None:
         self.mujoco = mujoco
         self.model = model
         self.policy = policy or CollisionSafetyPolicy()
         self.controlled_qpos_indices = np.asarray(controlled_qpos_indices, dtype=np.int32)
-        self.oracle = CollisionSafetyOracle(mujoco, model, self.policy)
+        self.oracle = CollisionSafetyOracle(
+            mujoco, model, self.policy, pair_clearance_m=pair_clearance_m
+        )
         self.scratch = mujoco.MjData(model)
 
     def _check_candidate(

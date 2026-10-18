@@ -44,6 +44,7 @@ class CollisionCheckResult:
     minimum_distance_is_lower_bound: bool = False
     distance_query_disagreement_count: int = 0
     distance_query_raw_distance_m: float | None = None
+    required_clearance_m: float | None = None
 
     @property
     def penetration_depth_m(self) -> float:
@@ -72,4 +73,6 @@ class CollisionCheckResult:
             values["distance_query_disagreement_count"] = self.distance_query_disagreement_count
         if self.distance_query_raw_distance_m is not None:
             values["distance_query_raw_distance_m"] = self.distance_query_raw_distance_m
+        if self.required_clearance_m is not None:
+            values["required_clearance_m"] = self.required_clearance_m
         return values

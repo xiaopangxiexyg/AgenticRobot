@@ -176,6 +176,7 @@ class MujocoAgentTcpPoseGatewaySession:
     safe_tcp_pose_executor: ReusableStationAgentSkillOperationExecutor | None = None
     spatial_goal_executor: PassiveReadSkillExecutor | None = None
     grasp_approach_executor: ReusableStationAgentSkillOperationExecutor | None = None
+    grasp_contact_executor: ReusableStationAgentSkillOperationExecutor | None = None
     gripper_executor: ReusableStationAgentSkillOperationExecutor | None = None
     gripper_ports: Mapping[str, MujocoGripperControlPort] = field(default_factory=dict)
     _close_lock: threading.Lock = field(
@@ -274,6 +275,19 @@ class MujocoAgentTcpPoseGatewaySession:
             )
         if not isinstance(self.hardware_view_provider, HardwareViewProvider):
             raise TypeError("MuJoCo hardware view provider must be typed.")
+
+    def build_grasp_candidate_selector(self, *, world_from_candidate_reference, config=None):
+        """Bind the existing model selector seam; never activate a motion plan."""
+        from .grasp_candidate_selection import (
+            MujocoGraspCandidateSelector,
+            MujocoGraspSelectionConfig,
+        )
+
+        return MujocoGraspCandidateSelector(
+            application=self.application, contract_bundle=self.contract_bundle,
+            world_from_candidate_reference=world_from_candidate_reference,
+            config=MujocoGraspSelectionConfig() if config is None else config,
+        )
 
     def wire_adapter(
         self,
@@ -425,6 +439,7 @@ class MujocoAgentTcpPoseGatewaySession:
                 if self.grasp_approach_executor is not None
                 else ()
             ),
+            *((self.grasp_contact_executor,) if self.grasp_contact_executor is not None else ()),
             self.cardinal_step_executor,
             *tuple(
                 self.fixed_cardinal_step_executors[skill_id]
@@ -654,6 +669,11 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
     if not isinstance(contract_bundle, MujocoAgentTcpPoseContractBundle):
         raise TypeError("contract_bundle must be typed.")
     gripper_ports = dict(gripper_ports or {})
+    if (
+        contract_bundle.grasp_contact_contract is not None
+        and contract_bundle.grasp_approach_contract is None
+    ):
+        raise ValueError("Terminal contact requires the separate grasp approach Route.")
     if contract_bundle.grasp_approach_contract is not None:
         if not gripper_ports or contract_bundle.gripper_contract is None:
             raise ValueError("Grasp approach requires composed grippers and their contract.")
@@ -1538,6 +1558,11 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
             "grasp-approach",
             contract_bundle.grasp_approach_contract,
         ),
+        (
+            "motion.approach_grasp_contact",
+            "grasp-contact",
+            contract_bundle.grasp_contact_contract,
+        ),
     ):
         if safe_contract is None:
             continue
@@ -1549,6 +1574,7 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
         ):
             return MujocoAgentSafeTcpPoseSkillLifecycle(
                 path_search_time_budget_sec=_contract.path_search_time_budget_sec,
+                contact_binding=_contract.contact_binding,
                 application=application,
                 domain_hold=domain_hold if gripper_ports else None,
                 route=_route,
@@ -1775,6 +1801,7 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
         service=service,
         safe_tcp_pose_executor=planned_executors.get("motion.move_tcp_to_pose_safe"),
         grasp_approach_executor=planned_executors.get("motion.approach_grasp_pose"),
+        grasp_contact_executor=planned_executors.get("motion.approach_grasp_contact"),
         gripper_executor=gripper_executor,
         gripper_ports=gripper_ports,
     )

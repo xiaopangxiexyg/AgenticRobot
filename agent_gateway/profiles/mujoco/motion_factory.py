@@ -46,12 +46,17 @@ from sim.mujoco.deploy import (
     capture_mujoco_sim_hil_tool_tcp_pose_by_side,
     prepare_mujoco_sim_hil_target,
 )
+from sim.mujoco.deploy.grasp_contact import (
+    MujocoGraspContactBinding,
+    bind_task_grasp_contact,
+)
 from sim.mujoco.deploy.target_config import DEFAULT_STATION_POSE_CONTRACT_PATH
 
 from .gripper_skill import MujocoGripperControlPort
 from .motion_application import MujocoAgentSkillMotionApplication
 from .motion_deployment import (
     MUJOCO_AGENT_GRASP_APPROACH_ROUTE_ID_V1,
+    MUJOCO_AGENT_GRASP_CONTACT_ROUTE_ID_V1,
     MUJOCO_AGENT_SAFE_TCP_POSE_ROUTE_ID_V1,
     MUJOCO_AGENT_TCP_POSE_MAX_ROTATION_DELTA_RAD_V1,
     MUJOCO_AGENT_TCP_POSE_MAX_TRANSLATION_DELTA_M_V1,
@@ -238,6 +243,7 @@ def _build_standard_tcp_pose_envelope_runtime(
     target_config: MujocoSimHILTargetConfig,
     enable_safe_tcp_pose: bool = False,
     enable_grasp_approach: bool = False,
+    grasp_contact_binding: MujocoGraspContactBinding | None = None,
 ) -> TCPPoseEnvelopeSafetyRuntime:
     """Bind separate lower envelopes for bounded pose and fixed heading Routes.
 
@@ -371,6 +377,17 @@ def _build_standard_tcp_pose_envelope_runtime(
                 allowed_route_ids=(MUJOCO_AGENT_GRASP_APPROACH_ROUTE_ID_V1,),
             )
         )
+        if grasp_contact_binding is not None:
+            contact_profile = replace(grasp_profile, profile_id="mujoco-agent-grasp-contact-envelope-v1")
+            entries.append(TCPPoseEnvelopeCatalogEntry(
+                envelope_id="mujoco.agent_grasp_contact.safety.absolute.v1",
+                profile=contact_profile,
+                constraint_set_hash=canonical_content_hash(
+                    {"profile":contact_profile.semantic_content_hash,
+                     "contact_binding":grasp_contact_binding.to_payload()},
+                    domain="mujoco.grasp_contact.absolute_envelope.v1"),
+                allowed_route_ids=(MUJOCO_AGENT_GRASP_CONTACT_ROUTE_ID_V1,),
+            ))
     return TCPPoseEnvelopeSafetyRuntime(
         catalog_entries=tuple(entries),
         target_frame_binding_hash=target_binding_hash,
@@ -442,6 +459,7 @@ def build_mujoco_agent_tcp_pose_gateway_session(
     safe_tcp_planning_clearance_padding_m: float = 0.002,
     enable_grippers: bool = False,
     enable_grasp_approach: bool = False,
+    grasp_contact_target_body: str | None = None,
 ) -> MujocoAgentTcpPoseGatewaySession:
     """Build the exact default-off graph; do not start, record, or serve it."""
 
@@ -461,6 +479,8 @@ def build_mujoco_agent_tcp_pose_gateway_session(
         raise ValueError(
             "Grasp approach requires composed grippers and deterministic physics ownership."
         )
+    if grasp_contact_target_body is not None and not enable_grasp_approach:
+        raise ValueError("Terminal contact requires explicit grasp approach enablement.")
     if history_storage is not None and not isinstance(
         history_storage,
         MujocoAgentTcpPoseHistoryStorageConfig,
@@ -493,6 +513,10 @@ def build_mujoco_agent_tcp_pose_gateway_session(
         )
     validate_mujoco_agent_tcp_pose_target_config(target_config)
     prepared = prepare_mujoco_sim_hil_target(target_config)
+    grasp_contact_binding = (
+        None if grasp_contact_target_body is None else bind_task_grasp_contact(
+            prepared.scene, prepared.gripper_profile, grasp_contact_target_body)
+    )
     component_profile = build_mujoco_pose_component_target_profile(
         prepared.scene,
         profile_id=MUJOCO_AGENT_TCP_POSE_COMPONENT_PROFILE_ID_V1,
@@ -541,6 +565,7 @@ def build_mujoco_agent_tcp_pose_gateway_session(
         target_config=target_config,
         enable_safe_tcp_pose=enable_safe_tcp_pose,
         enable_grasp_approach=enable_grasp_approach,
+        grasp_contact_binding=grasp_contact_binding,
     )
     target = build_mujoco_agent_skill_motion_target(
         config=target_config,
@@ -623,6 +648,7 @@ def build_mujoco_agent_tcp_pose_gateway_session(
             enable_safe_tcp_pose=enable_safe_tcp_pose,
             enable_spatial_goals=enable_spatial_goals,
             enable_grasp_approach=enable_grasp_approach,
+            grasp_contact_binding=grasp_contact_binding,
         )
         if enable_grippers:
             contract_bundle = _bind_grippers(contract_bundle, gripper_ports)

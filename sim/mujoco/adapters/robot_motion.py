@@ -1274,6 +1274,13 @@ class MujocoPositionExecutionRig(Rig):
         with self._lock:
             return capture(self.scene)
 
+    def set_additional_contact_oracle(self, oracle) -> None:
+        """Bind a terminal-operation guard on the existing physics owner."""
+        with self._lock:
+            if not isinstance(self._execution, MujocoActuatedPositionExecutor):
+                raise TypeError("Target contact requires the physical position executor.")
+            self._execution.set_additional_contact_oracle(oracle)
+
     def capture_active_contact_observation(self) -> dict[str, object]:
         """Observe current MuJoCo forbidden contacts without advancing physics."""
 

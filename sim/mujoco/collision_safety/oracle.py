@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 
 import numpy as np
@@ -20,9 +21,17 @@ class _ForbiddenGeomPair:
 
 
 class CollisionSafetyOracle:
-    """Precomputed forbidden-pair distance oracle over one MuJoCo model."""
+    """Precomputed forbidden-pair distance oracle over one MuJoCo model.
 
-    def __init__(self, mujoco, model, policy: CollisionSafetyPolicy | None = None) -> None:
+    Explicit hand/object pairs may have a contact threshold within the scene's
+    hard bound. Other pairs keep the preventive margin. Report an actual
+    blocking pair even if a permitted contact has a smaller signed distance.
+    """
+
+    def __init__(
+        self, mujoco, model, policy: CollisionSafetyPolicy | None = None, *,
+        pair_clearance_m: Mapping[tuple[int, int], float] | None = None,
+    ) -> None:
         self.mujoco = mujoco
         self.model = model
         self.policy = policy or CollisionSafetyPolicy()
@@ -35,6 +44,17 @@ class CollisionSafetyOracle:
         self._pair_by_geom_ids = {
             (pair.geom1, pair.geom2): pair for pair in self._pairs
         }
+        self._pair_clearance_m = {}
+        for pair, value in (pair_clearance_m or {}).items():
+            key = tuple(sorted(pair))
+            if key not in self._pair_by_geom_ids:
+                raise ValueError("Contact clearance must bind an existing checked geom pair.")
+            if self._pair_by_geom_ids[key].pair_class != "4:8":
+                raise ValueError("Contact clearance is limited to hand/object pairs.")
+            value = float(value)
+            if not np.isfinite(value) or not -self.policy.hard_penetration_m <= value <= 0:
+                raise ValueError("Contact clearance must retain the hard penetration bound.")
+            self._pair_clearance_m[key] = value
 
     @property
     def forbidden_pair_count(self) -> int:
@@ -132,6 +152,8 @@ class CollisionSafetyOracle:
         minimum_is_lower_bound = False
         minimum_raw_distance = None
         distance_query_disagreement_count = 0
+        blocking = None
+        blocking_deficit = 0.0
         required_limit = max(0.0, clearance)
         limit = max(self.policy.distance_query_limit_m, required_limit)
         if distance_query_limit_m is not None:
@@ -187,13 +209,29 @@ class CollisionSafetyOracle:
                 closest = pair
                 minimum_is_lower_bound = bounded or distance >= limit
                 minimum_raw_distance = raw_distance
+            pair_clearance = self._pair_clearance_m.get((pair.geom1, pair.geom2), clearance)
+            if distance - pair_clearance < blocking_deficit:
+                blocking_deficit = distance - pair_clearance
+                blocking = (
+                    pair, distance, bounded or distance >= limit,
+                    pair_clearance, raw_distance,
+                )
         if closest is None:
             return CollisionCheckResult(
                 safe=True, minimum_distance_m=limit,
                 minimum_distance_is_lower_bound=True,
             )
+        if blocking is not None:
+            (
+                closest, minimum, minimum_is_lower_bound,
+                required_clearance, minimum_raw_distance,
+            ) = blocking
+        else:
+            required_clearance = self._pair_clearance_m.get(
+                (closest.geom1, closest.geom2), clearance
+            )
         return CollisionCheckResult(
-            safe=minimum >= clearance,
+            safe=blocking is None,
             minimum_distance_m=minimum,
             geom1_id=closest.geom1,
             geom2_id=closest.geom2,
@@ -205,6 +243,7 @@ class CollisionSafetyOracle:
             minimum_distance_is_lower_bound=minimum_is_lower_bound,
             distance_query_disagreement_count=distance_query_disagreement_count,
             distance_query_raw_distance_m=minimum_raw_distance,
+            required_clearance_m=required_clearance if self._pair_clearance_m else None,
         )
 
     def check_contacts(self, data) -> CollisionCheckResult:
@@ -212,17 +251,29 @@ class CollisionSafetyOracle:
 
         minimum = float("inf")
         closest: _ForbiddenGeomPair | None = None
+        blocking = None
+        deficit = 0.0
         for index in range(int(data.ncon)):
             contact = data.contact[index]
             key = tuple(sorted((int(contact.geom1), int(contact.geom2))))
             pair = self._pair_by_geom_ids.get(key)
-            if pair is not None and float(contact.dist) < minimum:
-                minimum = float(contact.dist)
-                closest = pair
+            if pair is not None:
+                distance = float(contact.dist)
+                threshold = self._pair_clearance_m.get(
+                    key, 0.0 if self._pair_clearance_m and pair.pair_class == "4:8"
+                    else -self.policy.hard_penetration_m)
+                if distance < minimum:
+                    minimum, closest = distance, pair
+                if distance - threshold < deficit:
+                    blocking = (pair, distance, threshold)
+                    deficit = distance - threshold
         if closest is None:
             return CollisionCheckResult(safe=True, minimum_distance_m=float("inf"))
+        threshold = None
+        if blocking is not None:
+            closest, minimum, threshold = blocking
         return CollisionCheckResult(
-            safe=minimum >= -self.policy.hard_penetration_m,
+            safe=blocking is None,
             minimum_distance_m=minimum,
             geom1_id=closest.geom1,
             geom2_id=closest.geom2,
@@ -231,4 +282,5 @@ class CollisionSafetyOracle:
             body1_name=closest.body1_name,
             body2_name=closest.body2_name,
             pair_class=closest.pair_class,
+            required_clearance_m=threshold if self._pair_clearance_m else None,
         )

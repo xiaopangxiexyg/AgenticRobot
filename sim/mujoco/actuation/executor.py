@@ -755,6 +755,9 @@ class MujocoActuatedPositionExecutor:
 
     def _check_active_contact_or_latch(self, projector, *, phase: str) -> None:
         check = projector.oracle.check_contacts(self.scene.data)
+        additional = getattr(self, "_additional_contact_oracle", None)
+        if check.safe and additional is not None:
+            check = additional.check_contacts(self.scene.data)
         self._last_active_collision_check = check
         if not check.safe:
             self._hard_contact_latched = True
@@ -763,6 +766,16 @@ class MujocoActuatedPositionExecutor:
                 "MuJoCo physical execution found forbidden hard contact "
                 f"{phase}: {check.to_dict()}"
             )
+
+    def set_additional_contact_oracle(self, oracle) -> None:
+        """Add a scoped contact check; never replace the canonical guard."""
+        from ..collision_safety import CollisionSafetyOracle
+
+        if oracle is not None and (
+            not isinstance(oracle, CollisionSafetyOracle) or oracle.model is not self.scene.model
+        ):
+            raise ValueError("Additional contact oracle must bind this exact scene model.")
+        self._additional_contact_oracle = oracle
 
     def _project_arm_command(self, command: DirectQposCommand, projector):
         """Project an arm qcmd through the complete CAD scene.

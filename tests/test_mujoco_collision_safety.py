@@ -123,6 +123,50 @@ def test_disjoint_aabb_bound_does_not_turn_ccd_artifacts_into_penetration(
         assert check.distance_query_disagreement_count == 0
 
 
+@pytest.mark.parametrize("target_gap,other_gap,expected_safe", (
+    (-.0005, .02, True), (-.002, .02, False), (-.0005, .0015, False),
+    (-.0005, -.0005, False),
+))
+def test_selected_contact_keeps_hard_bound_and_does_not_mask_another_object(
+    target_gap, other_gap, expected_safe, monkeypatch
+):
+    mujoco = pytest.importorskip("mujoco")
+    from sim.mujoco.collision_safety import CollisionSafetyOracle
+    from sim.mujoco.deploy.planned_tcp_motion import _NonContactMovePolicy
+
+    model = mujoco.MjModel.from_xml_string(
+        '<mujoco><default><geom conaffinity="12"/></default><worldbody><body><geom name="finger" type="box" size=".02 .02 .02" contype="4"/></body>'
+        f'<body pos="{.04 + target_gap} 0 0"><joint type="slide"/>'
+        '<geom name="target" type="box" size=".02 .02 .02" contype="8"/></body>'
+        f'<body pos="{-.04 - other_gap} 0 0"><joint type="slide"/>'
+        '<geom name="other" type="box" size=".02 .02 .02" contype="8"/></body>'
+        '</worldbody></mujoco>')
+    data = mujoco.MjData(model)
+    mujoco.mj_forward(model, data)
+    plain = CollisionSafetyOracle(mujoco, model, _NonContactMovePolicy())
+    assert not plain.check(data).safe
+    oracle = CollisionSafetyOracle(mujoco, model, _NonContactMovePolicy(),
+        pair_clearance_m={(0, 1): -.001})
+    result = oracle.check(data)
+    assert result.safe is expected_safe
+    assert oracle.check_contacts(data).safe is (target_gap >= -.001 and other_gap >= 0)
+    if other_gap < .002:
+        assert result.geom2_name == "other"
+        assert result.required_clearance_m == .002
+    elif target_gap < -.001:
+        assert result.geom2_name == "target"
+        assert result.required_clearance_m == -.001
+    for value in (-.002, float("nan"), .002):
+        with pytest.raises(ValueError, match="hard penetration"):
+            CollisionSafetyOracle(mujoco, model, _NonContactMovePolicy(),
+                pair_clearance_m={(0, 1): value})
+    with pytest.raises(ValueError, match="existing checked"):
+        CollisionSafetyOracle(mujoco, model, _NonContactMovePolicy(), pair_clearance_m={(1, 2): -.001})
+    monkeypatch.setattr(mujoco, "mj_geomDistance", lambda *args: float("nan"))
+    with pytest.raises(RuntimeError, match="non-finite"):
+        oracle.check(data)
+
+
 @pytest.mark.parametrize(
     ("pair_class", "expected"),
     (

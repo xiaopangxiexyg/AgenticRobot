@@ -252,7 +252,10 @@ def test_gateway_sim_dependencies_are_confined_to_mujoco_profile() -> None:
         {"sim"},
     ) == {
         "agent_gateway/profiles/mujoco/gateway_cli.py": ["sim"],
+        # Native grasp preview and target-bound contact stay in concrete leaves.
+        "agent_gateway/profiles/mujoco/grasp_candidate_selection.py": ["sim"],
         "agent_gateway/profiles/mujoco/motion_application.py": ["sim"],
+        "agent_gateway/profiles/mujoco/motion_deployment.py": ["sim"],
         "agent_gateway/profiles/mujoco/motion_factory.py": ["sim"],
         # The concrete safe-TCP lifecycle binds its lower simulation planner.
         "agent_gateway/profiles/mujoco/motion_skill.py": ["sim"],
@@ -306,6 +309,7 @@ def test_gateway_numerical_dependencies_are_confined_to_concrete_profiles() -> N
         "agent_gateway/profiles/real/back_projection.py": ["numpy"],
         "agent_gateway/profiles/segmentation.py": ["numpy"],
         "agent_gateway/profiles/mujoco/motion_skill.py": ["numpy"],
+        "agent_gateway/profiles/mujoco/grasp_candidate_selection.py": ["numpy"],
         # The concrete real-RM65 CLI validates reviewed camera/tool geometry
         # while assembling its profile; Gateway core remains numerical-neutral.
         "agent_gateway/profiles/real/gateway_cli.py": ["numpy"],

@@ -1309,6 +1309,17 @@ MuJoCo 可显式组合 `--enable-grasp-approach --enable-grippers --no-realtime-
 当前 rig、具有构造时声明的 arm-HOLD 约束，且实际 rig 使用确定性物理时钟。
 该 Route 只执行接近，不自动闭合夹爪、抬升或证明抓取成功；默认不发布。
 
+同一显式接近组合可另设 `--grasp-contact-target-body`，发布独立的
+`motion.approach_grasp_contact@1`。末端接触只绑定任务配置中右手传感器与指定
+目标物体的几何对，并保留原硬穿透上限；其他几何对继续使用原预防间隙。
+该权限由部署 profile hash 固定，调用者不能另传接触例外。结束或取消时撤销
+临时 guard，成功仍需在确认 HOLD 后复核实测接触及工具轴接近走廊。
+
+组合内的候选选择器只在冻结场景上预览接近、近端和末端路径，不激活计划或
+推动物理；结果仍需重新提交精确 motion 请求。共享下层 planner 同时增加紧凑
+分支选择和路径质量检查，因此普通 safe TCP 的排序／拒绝结果也可能变化，
+其默认碰撞政策不变。以上能力均不自动闭合、携物或证明物理抓取成功。
+
 MuJoCo 的 ``state.read_tcp_pose`` 与可选 TCP history 发布同一公开 Station 坐标系。
 其参数及结果校验从公开 state binding 获取坐标身份，不使用内部 IK execution frame；
 Agent 必须按当前 schema 查询和复制身份，不能以 arm-base 查询替代 Station 查询。

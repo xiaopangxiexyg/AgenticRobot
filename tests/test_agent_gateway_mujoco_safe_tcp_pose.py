@@ -29,7 +29,7 @@ TASK = Path("sim/configs/tasks/rm65_right_cube_reach_fixed_pose_xyz_proprio_v1.j
 CLIENT = "test:mujoco-safe-tcp"
 
 
-def _session(trace, *, after_fact=None, task=TASK, spatial=False, grasp=False):
+def _session(trace, *, after_fact=None, task=TASK, spatial=False, grasp=False, contact_target=None):
     def consume(fact):
         trace.append(fact)
         if after_fact is not None:
@@ -51,6 +51,7 @@ def _session(trace, *, after_fact=None, task=TASK, spatial=False, grasp=False):
         enable_spatial_goals=spatial,
         enable_grippers=grasp,
         enable_grasp_approach=grasp,
+        grasp_contact_target_body=contact_target,
     )
 
 

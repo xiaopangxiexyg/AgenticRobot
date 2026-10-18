@@ -153,3 +153,29 @@ def test_search_cancellation_does_not_wait_out_long_budget(monkeypatch):
         assert not any(f.event_type == "command" for f in facts)
     finally:
         assert session.close().accepted
+
+
+@pytest.mark.integration
+def test_preview_does_not_replace_pending_plan_or_allow_activation():
+    session = _session([])
+    try:
+        app = session.application
+        app.start_observation_ready()
+        planner = app.target.planned_tcp_motion
+        source = planner._model_qpos()
+        target = app.capture_tcp_pose_by_component()["right_arm"]
+        kwargs = {"translation_tolerance_m": .003, "rotation_tolerance_rad": .03,
+            "cancel_requested": lambda: False}
+        owned = planner.plan(target, **kwargs)
+        before_time = float(app.scene.data.time)
+        preview = planner.plan(target, preview_model_qpos=source, **kwargs)
+        with pytest.raises(MujocoTcpPlanRejected, match="not_owned"):
+            planner.activate(preview)
+        assert planner._pending_plan is owned
+        assert not planner.active
+        assert float(app.scene.data.time) == before_time
+        np.testing.assert_array_equal(planner._model_qpos(), source)
+        planner.activate(owned)
+        assert app.request_hold(reason="preview-test").snapshot.status == "hold"
+    finally:
+        assert session.close().accepted

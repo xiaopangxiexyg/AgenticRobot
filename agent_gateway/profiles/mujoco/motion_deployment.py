@@ -59,6 +59,7 @@ from agent_gateway.skills.motion.definition import (
     fixed_cardinal_tcp_step_skill_definition_v1,
     fixed_level_tcp_orientation_skill_definition_v1,
     grasp_approach_skill_definition_v1,
+    grasp_contact_approach_skill_definition_v1,
     safe_tcp_pose_target_skill_definition_v1,
     tcp_pose_target_skill_definition_v1,
 )
@@ -92,6 +93,7 @@ from robot_motion.action import (
 )
 from robot_motion.coordinate_profiles import STATION_RETARGET_FRAME_CONTRACT_V1
 from robot_motion.primitives import level_tcp_orientation
+from sim.mujoco.deploy.grasp_contact import MujocoGraspContactBinding
 
 from .depth_deployment import (
     MujocoDepthCaptureRegistration,
@@ -127,6 +129,7 @@ from .visual_observation import mujoco_rgb_role_for_source
 MUJOCO_AGENT_SAFE_TCP_POSE_ROUTE_ID_V1 = "sim.mujoco.motion.move_tcp_to_pose_safe.v1"
 MUJOCO_AGENT_SAFE_TCP_POSE_EXECUTOR_ID_V1 = "mujoco-agent-safe-tcp-pose-executor-v1"
 MUJOCO_AGENT_GRASP_APPROACH_ROUTE_ID_V1 = "sim.mujoco.motion.approach_grasp_pose.v1"
+MUJOCO_AGENT_GRASP_CONTACT_ROUTE_ID_V1 = "sim.mujoco.motion.approach_grasp_contact.v1"
 MUJOCO_AGENT_GRASP_APPROACH_EXECUTOR_ID_V1 = "mujoco-agent-grasp-approach-executor-v1"
 
 MUJOCO_AGENT_TCP_POSE_ROUTE_ID_V1 = "sim.mujoco.rm65.agent_skill_tcp_pose"
@@ -227,8 +230,11 @@ class MujocoAgentTcpPoseMotionProfile:
     stable_measurement_count: int = 3
     max_control_cycles: int = 120
     physics_ticks_per_control_cycle: int = 1
+    contact_policy_hash: str | None = None
 
     def __post_init__(self) -> None:
+        if self.contact_policy_hash is not None:
+            _required(self.contact_policy_hash, field_name="contact_policy_hash")
         for field_name in (
             "reference_frame_id",
             "reference_frame_spec_hash",
@@ -330,6 +336,8 @@ class MujocoAgentTcpPoseMotionProfile:
                     self.physics_ticks_per_control_cycle
                 ),
                 "requested_duration_semantics": "not_supported",
+                **({"contact_policy_hash": self.contact_policy_hash}
+                   if self.contact_policy_hash is not None else {}),
             },
             domain="dexteleop.agent_skill.mujoco_tcp_pose_profile.v1",
         )
@@ -680,6 +688,16 @@ class MujocoAgentSafeTcpPoseContract:
     evaluation_plan: SkillEvaluationPlan
     motion_profile: MujocoAgentTcpPoseMotionProfile
     path_search_time_budget_sec: float = 3.0
+    contact_binding: MujocoGraspContactBinding | None = None
+
+    def __post_init__(self):
+        if self.contact_binding is not None:
+            if not isinstance(self.contact_binding, MujocoGraspContactBinding):
+                raise TypeError("contact_binding must be a lower target contact binding.")
+            if self.contact_binding.semantic_content_hash != self.motion_profile.contact_policy_hash:
+                raise ValueError("Contact binding differs from the admitted motion profile.")
+        elif self.motion_profile.contact_policy_hash is not None:
+            raise ValueError("Contact motion profile requires its exact lower binding.")
 
 
 @dataclass(frozen=True)
@@ -717,6 +735,7 @@ class MujocoAgentTcpPoseContractBundle:
     spatial_goal_registration: SpatialGoalRegistration | None = None
     gripper_contract: GripperSkillContractBundle | None = None
     grasp_approach_contract: MujocoAgentSafeTcpPoseContract | None = None
+    grasp_contact_contract: MujocoAgentSafeTcpPoseContract | None = None
 
     def __post_init__(self) -> None:
         validate_skill_route_catalog_closure(
@@ -741,6 +760,7 @@ class MujocoAgentTcpPoseContractBundle:
         for skill_id, safe in (
             ("motion.move_tcp_to_pose_safe", self.safe_tcp_pose_contract),
             ("motion.approach_grasp_pose", self.grasp_approach_contract),
+            ("motion.approach_grasp_contact", self.grasp_contact_contract),
         ):
             if safe is None:
                 continue
@@ -1769,6 +1789,7 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
     enable_safe_tcp_pose: bool = False,
     enable_spatial_goals: bool = False,
     enable_grasp_approach: bool = False,
+    grasp_contact_binding: MujocoGraspContactBinding | None = None,
 ) -> MujocoAgentTcpPoseContractBundle:
     """Project one already-constructed no-model application without starting it."""
 
@@ -2366,6 +2387,7 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
         binding_prefix,
         duration_ms,
         path_search_time_budget_sec=3.0,
+        contact_binding=None,
     ):
         motion_schema = tcp_pose_target_schema_entry_v1(
             skill_id=motion_definition.skill_id,
@@ -2376,6 +2398,11 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
             allowed_reference_frame_ids=(profile.reference_frame_id,),
             max_requested_duration_ms=None,
             workspace_bounds_by_component={"right_arm": profile.workspace_bounds},
+            parameter_description=(None if contact_binding is None else
+                "Terminal contact target=" + contact_binding.target_body_name +
+                "; sensor geoms=" + ",".join(contact_binding.sensor_geom_names) +
+                "; max approach metres=" + str(contact_binding.max_approach_m) +
+                "; no other contact permission; no automatic closure or carry."),
         )
         motion_route = replace(
             route,
@@ -2413,6 +2440,7 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
             ),
             motion_profile=motion_profile,
             path_search_time_budget_sec=path_search_time_budget_sec,
+            contact_binding=contact_binding,
         )
         validate_agent_motion_route_schema_v1(
             route=motion_route, schema_entry=motion_schema
@@ -2420,7 +2448,7 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
         return motion_definition, motion_schema, motion_route, motion_contract
 
     planned_motions = []
-    safe_contract = grasp_contract = None
+    safe_contract = grasp_contract = contact_contract = None
     if enable_safe_tcp_pose:
         item = planned_motion_contract(
             safe_tcp_pose_target_skill_definition_v1(
@@ -2459,6 +2487,30 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
             path_search_time_budget_sec=15.0,
         )
         grasp_contract = item[3]
+        planned_motions.append(item)
+    if grasp_contact_binding is not None:
+        if not enable_grasp_approach:
+            raise ValueError("Terminal contact requires the separate grasp approach Route.")
+        item = planned_motion_contract(
+            grasp_contact_approach_skill_definition_v1(controlled_component_ids=("right_arm",)),
+            replace(
+                profile,
+                profile_id="mujoco.agent_grasp_contact.v1",
+                contact_policy_hash=grasp_contact_binding.semantic_content_hash,
+                max_control_cycles=600,
+                max_translation_delta_m=grasp_contact_binding.max_approach_m,
+                max_rotation_delta_rad=grasp_contact_binding.rotation_tolerance_rad,
+                translation_tolerance_m=0.001,
+                rotation_tolerance_rad=math.radians(1),
+            ),
+            route_id=MUJOCO_AGENT_GRASP_CONTACT_ROUTE_ID_V1,
+            executor_id="mujoco-grasp-contact-v1",
+            binding_prefix="sim.mujoco.agent_grasp_contact:",
+            duration_ms=60_000,
+            path_search_time_budget_sec=3.0,
+            contact_binding=grasp_contact_binding,
+        )
+        contact_contract = item[3]
         planned_motions.append(item)
     cardinal_evaluator = SkillEvaluatorSpec(
         evaluator_id="motion.tcp_cardinal_step_arrival_rule",
@@ -3405,6 +3457,7 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
         safe_tcp_pose_contract=safe_contract,
         spatial_goal_registration=spatial_goal_registration,
         grasp_approach_contract=grasp_contract,
+        grasp_contact_contract=contact_contract,
         depth_capture=depth_capture,
         rgb_capture=rgb_capture,
         segmentation=segmentation,

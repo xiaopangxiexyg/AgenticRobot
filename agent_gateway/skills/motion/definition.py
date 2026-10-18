@@ -15,6 +15,7 @@ from agent_gateway.protocol.skill_catalog import SkillDefinition
 TCP_POSE_TARGET_SKILL_ID_V1 = "motion.move_tcp_to_pose"
 SAFE_TCP_POSE_TARGET_SKILL_ID_V1 = "motion.move_tcp_to_pose_safe"
 GRASP_APPROACH_SKILL_ID_V1 = "motion.approach_grasp_pose"
+GRASP_CONTACT_APPROACH_SKILL_ID_V1 = "motion.approach_grasp_contact"
 EXECUTE_GRASP_APPROACH_PLAN_SKILL_ID_V1 = "motion.execute_grasp_approach_plan"
 TCP_CARDINAL_STEP_SKILL_ID_V1 = "motion.step_tcp_cardinal"
 TCP_STEP_FORWARD_SKILL_ID_V1 = "motion.step_tcp_forward"
@@ -200,6 +201,24 @@ def grasp_approach_skill_definition_v1(
     )
 
 
+def grasp_contact_approach_skill_definition_v1(
+    *, controlled_component_ids: tuple[str, ...],
+) -> SkillDefinition:
+    """Terminal sensor contact with a deployment-bound target, not free motion."""
+    from dataclasses import replace
+
+    return replace(
+        grasp_approach_skill_definition_v1(controlled_component_ids=controlled_component_ids),
+        skill_id=GRASP_CONTACT_APPROACH_SKILL_ID_V1,
+        summary=("Advance tool_tcp through a bounded terminal approach corridor, permitting "
+                 "only deployment-bound fingertip/target contact within the existing hard "
+                 "penetration bound. Does not close the gripper or carry the object."),
+        parameter_semantics_id="grasp_contact.absolute.xyz_quat_xyzw.v1",
+        entry_predicate_ids=("route_ready.v1", "measured_start_pose_valid.v1",
+                             "bound_target_contact_corridor_path_found.v1"),
+    )
+
+
 def execute_grasp_approach_plan_skill_definition_v1(
     *,
     controlled_component_ids: tuple[str, ...],
@@ -328,6 +347,7 @@ __all__ = [
     "FIXED_LEVEL_TCP_ORIENTATION_SKILL_IDS_V1",
     "FIXED_LEVEL_TCP_ORIENTATION_SKILL_SUMMARY_BY_ID_V1",
     "GRASP_APPROACH_SKILL_ID_V1",
+    "GRASP_CONTACT_APPROACH_SKILL_ID_V1",
     "INLINE_TCP_TRAJECTORY_SKILL_ID_V1",
     "REGISTERED_TCP_TRAJECTORY_SKILL_ID_V1",
     "SAFE_TCP_POSE_TARGET_SKILL_ID_V1",
@@ -347,6 +367,7 @@ __all__ = [
     "fixed_cardinal_tcp_step_skill_definition_v1",
     "fixed_level_tcp_orientation_skill_definition_v1",
     "grasp_approach_skill_definition_v1",
+    "grasp_contact_approach_skill_definition_v1",
     "safe_tcp_pose_target_skill_definition_v1",
     "tcp_pose_target_skill_definition_v1",
 ]

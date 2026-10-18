@@ -1096,9 +1096,12 @@ class MujocoAgentTcpPoseSkillLifecycle:
 class MujocoAgentSafeTcpPoseSkillLifecycle(MujocoAgentTcpPoseSkillLifecycle):
     """Keep the normal lifecycle and receipts; replace only lower references."""
 
-    def __init__(self, *, path_search_time_budget_sec: float = 3.0, **kwargs: Any) -> None:
+    def __init__(self, *, path_search_time_budget_sec: float = 3.0,
+                 contact_binding=None, **kwargs: Any) -> None:
         super().__init__(**kwargs)
         self._path_search_time_budget_sec = path_search_time_budget_sec
+        self._contact_binding = contact_binding
+        self._contact_check_enabled = False
         self._planner = self.application.target.planned_tcp_motion
         if self._planner is None:
             raise ValueError("Safe TCP lifecycle requires a lower joint-path planner.")
@@ -1184,6 +1187,7 @@ class MujocoAgentSafeTcpPoseSkillLifecycle(MujocoAgentTcpPoseSkillLifecycle):
                 configuration_constraint=constraint,
                 constraint_identity=constraint_identity,
                 path_search_time_budget_sec=self._path_search_time_budget_sec,
+                contact_binding=self._contact_binding,
             )
             if (
                 len(plan.reference_poses) + self.motion_profile.stable_measurement_count
@@ -1213,6 +1217,7 @@ class MujocoAgentSafeTcpPoseSkillLifecycle(MujocoAgentTcpPoseSkillLifecycle):
                             },
                         )
             self._planner.activate(plan)
+            self._contact_check_enabled = self._contact_binding is not None
         except MujocoTcpPlanRejected as error:
             logging.getLogger(__name__).warning(
                 "Safe TCP activation rejected: %s", error
@@ -1227,6 +1232,14 @@ class MujocoAgentSafeTcpPoseSkillLifecycle(MujocoAgentTcpPoseSkillLifecycle):
             )
         self._execution_refs.add("mujoco-safe-joint-trajectory:" + plan.trajectory_hash)
         return evidence
+
+    def _capture_pose(self):
+        pose = super()._capture_pose()
+        if self._contact_check_enabled:
+            check = self._planner.check_measured_contact(self._contact_binding, self.target_pose)
+            if not check.safe:
+                raise MujocoTcpPlanRejected("grasp_contact_measured_state_blocked", check.to_dict())
+        return pose
 
     def _reference_action_for_cycle(self, cycle: int) -> ComponentAction:
         pose = self._planner.reference(cycle)
