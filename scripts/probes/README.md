@@ -77,3 +77,16 @@ MuJoCo contract 之间没有自动交叉 hash 绑定，不能据此声称所有�
 冻结状态的精确起点比较和模拟确认不提供真机恢复策略，也不新增生产 staged Skill 或真实 Route/grant。
 失败退出时分别关闭 force monitor 与 plan store；优先保留首个中断，否则保留首个普通异常，
 附带其他关闭错误的完整信息，不将关闭失败报告为成功。
+
+
+## 显式 DMTAC 几何候选
+
+`python -m scripts.probes.build_rm65_dmtac_stepped_proxy --help` 从只读 CAD 和 strict proxy 生成新的
+stepped 自体包络与独立 rigid 近似，输出目录必须不存在。stepped 的连续扫掠覆盖证明与双臂
+101 个原生 FK 开合样本会保留在报告中；rigid 采用 lower footprint 向上延长，**没有完整 CAD
+扫掠覆盖证明**，不能把 stepped 的证明移用于 rigid。生成过程不修改共享资产或运行绑定。
+
+纯 profile 工厂支持显式 `dmtac_proxy_urdf_path=Path(...)`，仅对 DMTAC 场景接受；可验证
+原两盒或 core 加 upper/lower 的三盒候选，并构造与实际几何相符的完整 pair 集。默认仍是原
+`rm65_dual_arm_hand_proxy_dmtac_strict.urdf` 和 20 对检查；三盒候选是 31 对，不自动被 CLI、
+Skill 或执行链选中。这是离线候选加载能力，不能代替具体模型的几何覆盖和执行验收。

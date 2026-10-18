@@ -91,9 +91,10 @@ def _grasp_full_collision_pairs() -> tuple[tuple[str, str], ...]:
     return tuple(unique.values())
 
 
-def _build_dmtac_hand_proxy_collision_pairs() -> tuple[tuple[str, str], ...]:
-    left_hand_geometries = ("left_hand_proxy_0", "left_hand_proxy_1")
-    right_hand_geometries = ("right_hand_proxy_0", "right_hand_proxy_1")
+def _build_dmtac_hand_proxy_collision_pairs(
+    left_hand_geometries: tuple[str, ...] = ("left_hand_proxy_0", "left_hand_proxy_1"),
+    right_hand_geometries: tuple[str, ...] = ("right_hand_proxy_0", "right_hand_proxy_1"),
+) -> tuple[tuple[str, str], ...]:
     pairs: list[tuple[str, str]] = []
     pairs.extend(("arm_link3_proxy_0", geometry) for geometry in right_hand_geometries)
     pairs.extend((geometry, "right_arm_link3_proxy_0") for geometry in left_hand_geometries)
@@ -459,10 +460,16 @@ def _load_fixed_scene_box(urdf_path: Path, *, link_name: str) -> FixedSceneBoxSp
     return _build_fixed_scene_box_spec(root, link_name=link_name)
 
 
-def build_dual_arm_scene_profile(name: str = DEFAULT_COLLISION_SCENE) -> DualArmSceneProfile:
+def build_dual_arm_scene_profile(
+    name: str = DEFAULT_COLLISION_SCENE, *, dmtac_proxy_urdf_path: Path | None = None,
+) -> DualArmSceneProfile:
     """Build a pure RM65 dual-arm collision/model profile."""
 
     name = str(name or DEFAULT_COLLISION_SCENE)
+    if dmtac_proxy_urdf_path is not None and name not in {
+        "dual_arm_hand_proxy_dmtac_strict", "dual_arm_hand_proxy_dmtac_grasp"
+    }:
+        raise ValueError("A DMTAC proxy candidate requires a DMTAC scene profile.")
     asset_dir = require_asset_path()
     if name == "dual_arm":
         left_links = (
@@ -510,7 +517,8 @@ def build_dual_arm_scene_profile(name: str = DEFAULT_COLLISION_SCENE) -> DualArm
             urdf_name = "rm65_dual_arm_hand_proxy_open.urdf"
         else:
             urdf_name = "rm65_dual_arm_hand_proxy_strict.urdf"
-        urdf_path = asset_dir / urdf_name
+        urdf_path = (Path(dmtac_proxy_urdf_path).resolve(strict=True)
+            if dmtac_proxy_urdf_path is not None else asset_dir / urdf_name)
         hand_proxy_boxes = _load_hand_proxy_boxes(
             urdf_path,
             include_all_collision_boxes=is_dmtac_profile,
@@ -529,15 +537,16 @@ def build_dual_arm_scene_profile(name: str = DEFAULT_COLLISION_SCENE) -> DualArm
                 "Hand-proxy collision scene URDF no longer exposes the required "
                 f"fixed geometry set {DUAL_ARM_HAND_PROXY_COLLISION_FIXED_GEOMETRIES}."
             )
-        if is_dmtac_profile and tuple(box.geometry_name for box in hand_proxy_boxes) != (
-            "left_hand_proxy_0",
-            "left_hand_proxy_1",
-            "right_hand_proxy_0",
-            "right_hand_proxy_1",
-        ):
-            raise ValueError(
-                "DMTAC hand-proxy URDF must expose exactly two collision boxes per hand."
-            )
+        if is_dmtac_profile:
+            count = len(hand_proxy_boxes) // 2
+            allowed_counts = (2, 3) if dmtac_proxy_urdf_path is not None else (2,)
+            expected = tuple(f"{side}_hand_proxy_{index}"
+                for side in ("left", "right") for index in range(count))
+            if count not in allowed_counts or tuple(
+                box.geometry_name for box in hand_proxy_boxes
+            ) != expected:
+                raise ValueError("DMTAC proxy must expose matching sequential boxes per hand; "
+                    "three boxes require an explicit candidate path.")
         fixed_scene_box_overrides = ()
         if name == "dual_arm_hand_proxy_dmtac_grasp":
             cad_table = _load_fixed_scene_box(
@@ -565,7 +574,10 @@ def build_dual_arm_scene_profile(name: str = DEFAULT_COLLISION_SCENE) -> DualArm
             left_frame_name="arm_link6",
             right_frame_name="right_arm_link6",
             collision_pairs=(
-                DUAL_ARM_DMTAC_HAND_PROXY_CHECKED_COLLISION_PAIRS
+                _build_dmtac_hand_proxy_collision_pairs(
+                    tuple(box.geometry_name for box in hand_proxy_boxes if box.side == "left"),
+                    tuple(box.geometry_name for box in hand_proxy_boxes if box.side == "right"),
+                )
                 if is_dmtac_profile
                 else _grasp_full_collision_pairs()
                 if name == "dual_arm_hand_proxy_grasp_full"
@@ -676,8 +688,9 @@ def build_dual_arm_scene_profile(name: str = DEFAULT_COLLISION_SCENE) -> DualArm
 
 def build_rm65_dual_arm_scene_profile(
     name: str = DEFAULT_COLLISION_SCENE,
+    *, dmtac_proxy_urdf_path: Path | None = None,
 ) -> DualArmSceneProfile:
-    return build_dual_arm_scene_profile(name)
+    return build_dual_arm_scene_profile(name, dmtac_proxy_urdf_path=dmtac_proxy_urdf_path)
 
 
 __all__ = [
