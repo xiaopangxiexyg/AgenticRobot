@@ -1412,6 +1412,13 @@ class B601StagedSingleJointAssistRuntime:
             self._previous_overlay_nm = previous
         rate = self.config.tracking_slew_nm_s
         reason = "slow_guidance_rise"
+        opposes_motion = requested * control_v < 0.0
+        if self.config.motion_control.continuous_speed_limit_rad_s is not None:
+            # A delayed window alone cannot authorize the fast braking lane:
+            # the latest paired interval must agree that this request opposes
+            # motion. Otherwise it is ordinary guidance, with its normal slew.
+            opposes_motion = (opposes_motion and self._stop_evidence is not None
+                and requested * self._stop_evidence.raw_qvel_rad_s[self.joint_index] < 0.0)
         if (
             requested * previous_sent < 0.0 and not self._final_zero_confirmed
             or requested * previous < 0.0
@@ -1427,7 +1434,7 @@ class B601StagedSingleJointAssistRuntime:
             rate = self.config.motion_control.arrival_unload_slew_nm_s
             reason = "gradual_arrival_unloading"
         elif self._phase is B601StagedAssistPhase.BRAKE:
-            resolved_braking = (requested * control_v < 0.0
+            resolved_braking = (opposes_motion
                 and self._stop_evidence is not None
                 and self._stop_evidence.position_span_rad[self.joint_index]
                 > self.config.motion_control.position_resolution_rad)
@@ -1439,7 +1446,7 @@ class B601StagedSingleJointAssistRuntime:
                 rate = self.config.motion_control.braking_slew_nm_s
                 reason = "fast_tracking_withdrawal_or_brake"
         elif (
-            requested * control_v < 0.0 and self._stop_evidence is not None
+            opposes_motion and self._stop_evidence is not None
             and self._stop_evidence.position_span_rad[self.joint_index]
             > self.config.motion_control.position_resolution_rad
         ):

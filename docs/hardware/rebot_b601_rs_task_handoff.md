@@ -18,6 +18,46 @@
   基线中已接入的自观测过滤、夹爪等扩展保持原显式启用方式，默认 15 mm／v1／严格碰撞
   行为不随硬件迁移切换。物理验证仍由操作者运行，不把离线回归当成硬件有效性证明。
 
+### Type-24 独立缓存修复（arrival-credit 真机记录之后）
+
+`j2-j3-arrival-credit-acceptance/b601-owner-cr02hmu0` 的首次退出是 J2 原始速度
+`+0.134238 rad/s > 0.13 rad/s`。此前 J3/J2 定位和约 5 秒零助力重力观察已完成；
+第一段 J2 负向扫描在反向回弹中触发硬保护，不是到位、预算或日志持久化失败。
+六轴最终 disable 回执完整，但该事实不能推广到其他未核实的运行。
+
+该记录 1114 个 active 派发周期共有 14717 次反馈接纳拒绝；每周期首末原因均为
+`joint1 latest status frame is communication type 2, not Type-24 active report`，
+retry wait 中位数约 13.73 ms。MotorBridge 原先只有一个 Type-2/24 共用最新状态槽，
+命令回复会覆盖已收到的主动报告。本轮为 MotorBridge 添加只读的
+`active_report_observation_v1` / `robstride_get_active_report_observation()`，保留原
+generic getter 的合同。Type-2 不得刷新独立 Type-24 槽的位置、时间或序号；停止上报
+不能用新回复伪造新鲜度。
+
+backend 的新增 `prefer_active_report=False` 保持普通 host-fresh 消费者不变；owner 的
+active-report 路径显式选择 True，能力存在时读取独立槽，不存在时保留原 generic 路径和
+原 Type-24 接纳门。已声明能力但 getter 缺失、异常、空缓存或过龄时不能 fallback。
+六轴完整、Type-24、序号推进、接收年龄和原 watchdog 均不放宽。不修改上报寄存器、
+不接受 Type-2 替代控制反馈，也不改变收到的速度字段仍仅用于诊断的约定。
+
+这消除缓存覆盖问题，不等于已证明 100 Hz：该轮接纳的 J1 Type-24 时间间隔约 25 ms，
+日志没有保存所有被覆盖的原帧；固件实际上报周期仍需下一轮证据确认。构建仅在本工作区
+的 `hardware/MotorBridge/target/release` 生成，新真机命令必须绑定本工作区 MotorBridge，
+不能继续绑定未修改的外部 checkout。父仓 gitlink 与子模块源码提交一起交付，不复制
+二进制或改写 Python 环境；子模块提交未推送时，不能声称其他机器已经能够拉取。
+
+### 连续模式反向回弹时的制动方向修复
+
+同一记录在反弹初期出现 `raw_v=+0.058`、80 ms 窗口 `control_v=-0.023 rad/s`，原软件
+制动仍输出约 `+0.046 N·m`，与最新位置进展同向。正常 TRACK 也曾在窗口尚为正、
+原始进展已经为负时，将负向增推误判为耗散并使用快速制动 slew。
+
+本轮只对显式连续模式修复两处：软件速度制动须窗口和最新配对位置差分同向，幅值受
+两者较小绝对速度约束；不同向或最新速度为零则不产生该软件制动项，既有 motor-local
+Kd 不变。TRACK/到位快速反向制动速率也要求两个方向证据一致，否则增推仅走正常
+tracking slew。窗口仍用于起动/状态/停稳，raw 仍用于独立硬保护；不提高力矩、速度、
+位移、预算或超时，不自动重试故障，不改变人工退出和 GUI 失能确认。离散时间上的
+符号约束不等于独立测得的能量被动性证明；真机回弹是否消失仍待现场验证。
+
 ## 历史交接记录
 
 > 版本：2026-09-22。本文是 B601-RS 当前代码、真机 commissioning、重力采集和

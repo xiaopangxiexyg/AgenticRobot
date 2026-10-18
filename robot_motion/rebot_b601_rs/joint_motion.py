@@ -958,6 +958,14 @@ class B601JointMotionTracker:
         brake_v = control_v if self.config.windowed_soft_velocity else (
             raw_v if raw_v * control_v < 0.0 or abs(raw_v) > abs(control_v) else control_v
         )
+        if self.config.windowed_soft_velocity and continuous_limit is not None:
+            # A causal window can retain the old direction after a gearbox
+            # recoil. Never turn damping into propulsion in the latest paired
+            # position interval. Require agreement for a nonzero request and
+            # cap its magnitude by BOTH estimates; one-count raw noise cannot
+            # amplify the window brake. Motor-local damping remains active.
+            brake_v = (math.copysign(min(abs(raw_v), abs(control_v)), raw_v)
+                       if raw_v * control_v > 0.0 else 0.0)
         d = -self.config.braking_kd_nm_s_per_rad * brake_v
         p = kp * (self._target - q) if arrival_active else 0.0
         if arrival_active and self._arrival_unloading:

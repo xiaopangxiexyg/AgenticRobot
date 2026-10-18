@@ -1116,6 +1116,27 @@ def test_continuous_arrival_fast_brake_rate_cannot_amplify_same_direction_drive(
 
 
 @pytest.mark.parametrize("direction", [-1, 1])
+@pytest.mark.parametrize("raw,fast", [(-.038, False), (0., False), (.019, True)])
+def test_continuous_track_fast_brake_lane_requires_latest_direction_not_only_delayed_window(direction, raw, fast):
+    runtime, _, _, frame = _arrival_runtime(direction, continuous_limit=.05)
+    runtime._phase = B601StagedAssistPhase.TRACK
+    runtime._motion_frame = replace(frame.motion, phase="track", arrival_stabilization_active=False)
+    # A request opposite the old positive window is not a brake once the
+    # newest measured interval has already reversed (cr02hmu0 t=+8.402 s).
+    runtime._previous_overlay_nm = -direction*.2
+    runtime._command_delta = (0., 0., -direction*.2, 0., 0., 0.)
+    runtime._last_output_zero = runtime._final_zero_confirmed = False
+    runtime._stop_evidence = replace(runtime._stop_evidence,
+        raw_qvel_rad_s=(0., 0., direction*raw, 0., 0., 0.),
+        position_span_rad=(0., 0., .002, 0., 0., 0.))
+    output = runtime._responsive_tracking_output(-direction*.6, direction*.012, .025)
+    rate = runtime.config.motion_control.braking_slew_nm_s if fast else runtime.config.tracking_slew_nm_s
+    assert output == pytest.approx(-direction*(.2+min(.4, rate*.025)))
+    assert runtime._motion_frame.torque_transition_reason == (
+        "fast_resolved_motion_braking" if fast else "slow_guidance_rise")
+
+
+@pytest.mark.parametrize("direction", [-1, 1])
 def test_arrival_retains_receipt_bounded_maintenance_then_gradually_unloads(direction):
     runtime, now, q, frame = _arrival_runtime(direction)
     assert direction*frame.overlay_torque_nm[2] > .05

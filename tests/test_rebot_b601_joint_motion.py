@@ -158,12 +158,12 @@ def test_responsive_tracking_cannot_advance_with_unusable_motion_evidence(invali
 
 def _governor_tick(tracker, now, *, q=.006, velocity=0., raw=0., span=0.,
                    permit=True, zero=True, brake=False, support=0., evidence=True, stop_error=.003,
-                   support_span=0.):
+                   support_span=0., raw_limit=.05):
     positions = (0., 0., q, 0., 0., 0.)
     raw_values = (0., 0., raw, 0., 0., 0.)
     velocities = (support, 0., velocity, 0., 0., 0.)
     stop = B601WindowStopEvidence(now, positions, raw_values, velocities,
-        (support_span, 0., span, 0., 0., 0.), .08, .05) if evidence else None
+        (support_span, 0., span, 0., 0., 0.), .08, raw_limit) if evidence else None
     frame = tracker.update(now=now, q=q, raw_v=raw, control_v=velocity,
         control_sequence=round(now*1000), authority=1., kp=12., kd=1.,
         stop_error_rad=stop_error, stop_velocity_rad_s=.005, stop_dwell_sec=.15,
@@ -1471,6 +1471,28 @@ def test_braking_raw_direction_wins_over_delayed_opposite_window_velocity():
     frame = _update(_tracker(), raw_v=-0.04, control_v=0.06)
     assert frame.phase == "brake"
     assert frame.requested_torque_nm > 0.0
+
+
+@pytest.mark.parametrize("direction", [-1, 1])
+@pytest.mark.parametrize("raw,window,expected", [
+    (.058, -.023, 0.),       # Actual reversal in cr02hmu0: old window would propel recoil.
+    (.096, .052, -.104),
+    (.013, .052, -.026),     # Both estimates bound magnitude, not the raw count alone.
+    (0., .052, 0.),
+    (.0384, 0., 0.),
+])
+def test_continuous_brake_never_injects_torque_against_latest_direction_evidence(
+    direction, raw, window, expected,
+):
+    tracker = _governed_tracker(continuous_speed_limit_rad_s=.039)
+    frame = _governor_tick(tracker, 1.02, q=.001, velocity=direction*window,
+                           raw=direction*raw, span=.002, brake=True, raw_limit=.13)
+    assert frame.phase == "brake"
+    assert frame.position_torque_nm == 0.
+    assert frame.velocity_torque_nm == pytest.approx(direction*expected)
+    assert frame.velocity_torque_nm * direction*raw <= 0.
+    assert abs(frame.velocity_torque_nm) <= 2*abs(window)+1e-12
+    assert frame.hold_position_rad is None
 
 
 def test_brake_retains_trigger_reference_and_reports_unreached_original_target():
