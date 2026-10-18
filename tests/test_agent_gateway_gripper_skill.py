@@ -576,6 +576,14 @@ def test_mujoco_adapter_observation_is_passive_and_command_is_gripper_only() -> 
     assert receipt.accepted is True
     assert sample.measured_close == 1.0
     assert rig.steps == 1
+    composed = MujocoGripperControlPort(
+        rig=rig, gripper_name="right_gripper", arm_held=lambda: False,
+    )
+    assert not composed.readiness().ready
+    assert composed.port_binding_hash != port.port_binding_hash
+    assert not composed.command_close(0.0).accepted
+    assert rig.target == 1.0
+    assert rig.steps == 1
 
 
 def test_dmtac_backend_hold_uses_stop_without_reconnect() -> None:

@@ -21,6 +21,22 @@ from agent_gateway.profiles.mujoco.gateway_cli import (
 pytestmark = [pytest.mark.unit, pytest.mark.contract]
 
 
+def test_bilateral_grippers_refuse_realtime_physics_before_session_construction(monkeypatch, tmp_path, capsys):
+    from pathlib import Path
+
+    def forbidden(**kwargs):
+        pytest.fail("Conflicting physics ownership must fail before session construction")
+
+    monkeypatch.setattr(gateway_cli, "build_mujoco_agent_tcp_pose_gateway_session", forbidden)
+    task = Path(__file__).resolve().parents[1] / "sim/configs/tasks/rm65_right_cube_reach_fixed_pose_xyz_proprio_v1.json"
+    args = ["--socket-path", str(tmp_path / "gateway.sock"), "--task-config", str(task)]
+    assert not build_parser().parse_args(args).enable_grippers
+    with pytest.raises(SystemExit) as captured:
+        gateway_cli.main([*args, "--enable-grippers"])
+    assert captured.value.code == 2
+    assert "--enable-grippers requires --no-realtime-worker" in capsys.readouterr().err
+
+
 def test_cli_import_does_not_load_optional_perception_models() -> None:
     script = r"""
 import importlib.abc

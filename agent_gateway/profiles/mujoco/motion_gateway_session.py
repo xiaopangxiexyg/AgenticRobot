@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import threading
 from collections.abc import Callable, Collection, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from agent_gateway.profiles.back_projection import (
     LiveBackProjectionProvider,
@@ -69,6 +69,11 @@ from agent_gateway.runtime.service import (
 from agent_gateway.runtime.station_operation_worker import (
     StationOperationWorkerBinding,
 )
+from agent_gateway.skills.gripper.runtime import (
+    GripperConvergenceProfile,
+    build_gripper_skill_executor,
+    hold_gripper_ports,
+)
 from agent_gateway.skills.motion.definition import (
     FIXED_CARDINAL_TCP_STEP_SKILL_IDS_V1,
     FIXED_LEVEL_TCP_ORIENTATION_SKILL_IDS_V1,
@@ -100,6 +105,7 @@ from dataset_contracts.canonical_encoding import canonical_content_hash
 
 from .back_projection import MujocoBackProjectionCapturePort
 from .depth_deployment import MUJOCO_CAPTURE_DEPTH_OUTPUT_SLOT_ID_V1
+from .gripper_skill import MujocoGripperControlPort
 from .motion_application import MujocoAgentSkillMotionApplication
 from .motion_deployment import MujocoAgentTcpPoseContractBundle
 from .motion_skill import (
@@ -169,6 +175,8 @@ class MujocoAgentTcpPoseGatewaySession:
     service: AgentGatewayService
     safe_tcp_pose_executor: ReusableStationAgentSkillOperationExecutor | None = None
     spatial_goal_executor: PassiveReadSkillExecutor | None = None
+    gripper_executor: ReusableStationAgentSkillOperationExecutor | None = None
+    gripper_ports: Mapping[str, MujocoGripperControlPort] = field(default_factory=dict)
     _close_lock: threading.Lock = field(
         default_factory=threading.Lock,
         init=False,
@@ -198,6 +206,10 @@ class MujocoAgentTcpPoseGatewaySession:
     def __post_init__(self) -> None:
         if (self.contract_bundle.spatial_goal_registration is not None) != (self.spatial_goal_executor is not None):
             raise ValueError("Spatial goal registration and executor must coexist.")
+        hand_parts = (self.contract_bundle.gripper_contract is not None,
+                      self.gripper_executor is not None, bool(self.gripper_ports))
+        if any(hand_parts) and not all(hand_parts):
+            raise ValueError("Composed gripper contract and executor must coexist.")
         if set(self.fixed_cardinal_step_executors) != set(
             FIXED_CARDINAL_TCP_STEP_SKILL_IDS_V1
         ):
@@ -401,6 +413,7 @@ class MujocoAgentTcpPoseGatewaySession:
     ) -> tuple[ReusableStationAgentSkillOperationExecutor, ...]:
         return (
             self.motion_executor,
+            *((self.gripper_executor,) if self.gripper_executor is not None else ()),
             *((self.safe_tcp_pose_executor,) if self.safe_tcp_pose_executor is not None else ()),
             self.cardinal_step_executor,
             *tuple(
@@ -622,6 +635,7 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
     artifact_store: RecoverableAgentArtifactStore | None = None,
     owns_artifact_store: bool = False,
     segmentation_localizer: object | None = None,
+    gripper_ports: Mapping[str, MujocoGripperControlPort] | None = None,
 ) -> MujocoAgentTcpPoseGatewaySession:
     """Wire exact Routes without starting the application or history recorder."""
 
@@ -629,6 +643,9 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
         raise TypeError("application must be a motion application.")
     if not isinstance(contract_bundle, MujocoAgentTcpPoseContractBundle):
         raise TypeError("contract_bundle must be typed.")
+    gripper_ports = dict(gripper_ports or {})
+    if bool(gripper_ports) != (contract_bundle.gripper_contract is not None):
+        raise ValueError("Composed gripper contract and ports must coexist.")
     if not isinstance(owns_source_observation_history_store, bool):
         raise TypeError("owns_source_observation_history_store must be boolean.")
     if not isinstance(owns_artifact_store, bool):
@@ -908,6 +925,7 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
     def lifecycle_factory(*, request, operation):
         return MujocoAgentTcpPoseSkillLifecycle(
             application=application,
+            domain_hold=domain_hold if gripper_ports else None,
             route=motion_route,
             deployment_binding=binding,
             evaluation_plan=contract_bundle.evaluation_plan,
@@ -954,6 +972,7 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
 
         return MujocoAgentTcpPoseSkillLifecycle(
             application=application,
+            domain_hold=domain_hold if gripper_ports else None,
             route=route,
             deployment_binding=deployment_binding,
             evaluation_plan=evaluation_plan,
@@ -992,16 +1011,38 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
         )
 
     def domain_hold(*, operation, reason):
-        transition = application.request_hold(
-            reason=reason,
-            operation_id=(None if operation is None else operation.operation_id),
-        )
-        return mujoco_agent_skill_hold_evidence_from_transition(
+        failure = None
+        try:
+            transition = application.request_hold(
+                reason=reason,
+                operation_id=(None if operation is None else operation.operation_id),
+            )
+        except (Exception, KeyboardInterrupt, SystemExit) as error:
+            failure = error
+        hand_hold = None
+        if gripper_ports:
+            try:
+                hand_hold = hold_gripper_ports(ports=gripper_ports, reason=reason)
+            except (Exception, KeyboardInterrupt, SystemExit) as error:
+                if failure is None or (
+                    isinstance(error, (KeyboardInterrupt, SystemExit))
+                    and not isinstance(failure, (KeyboardInterrupt, SystemExit))
+                ):
+                    raise
+                raise failure from error
+        if failure is not None:
+            raise failure
+        evidence = mujoco_agent_skill_hold_evidence_from_transition(
             transition,
             lower_operation_id=(
                 None if operation is None else operation.lower_operation_id
             ),
         )
+        if hand_hold is not None:
+            return replace(evidence, succeeded=evidence.succeeded and hand_hold.succeeded,
+                lower_hold_confirmed=evidence.lower_hold_confirmed and hand_hold.succeeded,
+                evidence_refs=(*evidence.evidence_refs, *hand_hold.evidence_refs))
+        return evidence
 
     motion_executor = ReusableStationAgentSkillOperationExecutor(
         port_id="agent-gateway:station-worker:" + binding.runtime_session_id,
@@ -1134,6 +1175,7 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
 
             return MujocoAgentTcpPoseSkillLifecycle(
                 application=application,
+                domain_hold=domain_hold if gripper_ports else None,
                 route=_route,
                 deployment_binding=_contract.deployment_binding,
                 evaluation_plan=_contract.evaluation_plan,
@@ -1469,6 +1511,7 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
         def safe_lifecycle_factory(*, request, operation):
             return MujocoAgentSafeTcpPoseSkillLifecycle(
                 application=application,
+                domain_hold=domain_hold if gripper_ports else None,
                 route=safe_route,
                 deployment_binding=safe_binding,
                 evaluation_plan=safe_contract.evaluation_plan,
@@ -1536,6 +1579,15 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
         execution_port_by_route_hash[
             placement_entry.route.semantic_content_hash
         ] = placement_executor
+    gripper_executor = None
+    if contract_bundle.gripper_contract is not None:
+        gripper_executor = build_gripper_skill_executor(
+            contract_bundle=contract_bundle.gripper_contract, ports=gripper_ports,
+            current_station_revision=lambda: observation_producer.current_station_revision,
+            convergence=GripperConvergenceProfile(poll_interval_sec=0.),
+            domain_hold=domain_hold, clock=runtime_clock)
+        hand_route = contract_bundle.gripper_contract.route_manifest.skill_routes[0].route
+        execution_port_by_route_hash[hand_route.semantic_content_hash] = gripper_executor
     executor_registry = SkillExecutorRegistry(
         manifest=contract_bundle.route_manifest,
         bindings=tuple(
@@ -1672,6 +1724,8 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
         hardware_view_provider=hardware_view_provider,
         service=service,
         safe_tcp_pose_executor=safe_tcp_pose_executor,
+        gripper_executor=gripper_executor,
+        gripper_ports=gripper_ports,
     )
 
 

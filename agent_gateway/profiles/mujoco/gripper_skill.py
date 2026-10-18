@@ -34,9 +34,13 @@ class MujocoGripperControlPort:
         gripper_name: str,
         component_id: str | None = None,
         clock=time.monotonic,
+        arm_held: Callable[[], bool] | None = None,
     ) -> None:
         if not callable(clock):
             raise TypeError("clock must be callable.")
+        if arm_held is not None and not callable(arm_held):
+            raise TypeError("arm_held must be callable or None.")
+        self._arm_held = arm_held
         for method_name in (
             "is_ready",
             "queue_gripper_close_targets",
@@ -68,11 +72,14 @@ class MujocoGripperControlPort:
                 raise ValueError("Selected component does not match the lower physical gripper.")
         self.clock = clock
         self._sequence = 0
+        actuator_profile = getattr(rig.config, "gripper_actuation_profile", None)
         self.port_binding_hash = canonical_content_hash(
             {
                 "adapter": "mujoco_gripper_control.v1",
                 "component_id": self.component_id,
                 "gripper_name": self.gripper_name,
+                "actuation_profile": None if actuator_profile is None else actuator_profile.to_metadata(),
+                "requires_arm_hold": arm_held is not None,
             },
             domain="dexteleop.agent_skill.gripper_port_binding.v1",
         )
@@ -91,7 +98,7 @@ class MujocoGripperControlPort:
         return f"mujoco-gripper-{kind}:{digest}"
 
     def readiness(self) -> GripperReadiness:
-        ready = bool(self.rig.is_ready())
+        ready = bool(self.rig.is_ready()) and (self._arm_held is None or self._arm_held())
         snapshot = self.rig.gripper_execution_snapshot()
         configured = self.gripper_name in snapshot["measured_close_by_gripper"]
         ref = self._ref("readiness", {"ready": ready, "configured": configured})
@@ -105,7 +112,9 @@ class MujocoGripperControlPort:
         self, target_close: float, *, cancel_requested: Callable[[], bool] | None = None,
     ) -> GripperCommandReceipt:
         target = float(target_close)
-        if cancel_requested is not None and cancel_requested():
+        if (cancel_requested is not None and cancel_requested()) or (
+            self._arm_held is not None and not self._arm_held()
+        ):
             return GripperCommandReceipt(
                 accepted=False,
                 lower_operation_id=f"mujoco-gripper:{self.gripper_name}:preempted",

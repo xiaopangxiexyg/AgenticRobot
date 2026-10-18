@@ -1062,6 +1062,9 @@ action is the distinct `execute_grasp_approach_plan`; authorizing the legacy
 `--authorized-gripper-sides left|right [left|right]` 只限定夹爪授权，缺省为已授权臂的一侧，
 不扩展手臂动作权限。程序化组合显式传入两侧 `gripper_backends` 时选择 v2，
 不得与原 v1 的 `right_gripper_backend` 混用。两侧共享原应用资源 owner 和操作槽位。
+MuJoCo 组合显式使用 `--enable-grippers --no-realtime-worker`，或 factory 的
+`enable_grippers=True`；默认保持关闭。夹爪与手臂共用同一物理 owner、操作槽位和
+域 HOLD；夹爪请求仍逐侧选择，手臂未 HOLD 时拒绝夹爪派发，原碰撞门禁保持。
 两版复用原有收敛、取消与下层 HOLD 确认，任何一侧停机失败都不能宣称组合安全。
 
 #### 可选右夹爪接入

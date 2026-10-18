@@ -168,6 +168,8 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="also publish collision-aware move_tcp_to_pose_safe using lower-owned joint paths",
     )
+    parser.add_argument("--enable-grippers", action="store_true",
+        help="publish bilateral atomic gripper Skills on the same deterministic MuJoCo owner")
     parser.add_argument(
         "--safe-tcp-planning-clearance-padding-m",
         type=float,
@@ -467,6 +469,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if not 0 <= args.safe_tcp_planning_clearance_padding_m < float("inf"):
         parser.error("--safe-tcp-planning-clearance-padding-m must be finite and non-negative")
+    if args.enable_grippers and not args.no_realtime_worker:
+        parser.error("--enable-grippers requires --no-realtime-worker for one physics owner")
     target_config = MujocoSimHILTargetConfig(
         task_config_path=task_config,
         realtime_worker=not args.no_realtime_worker,
@@ -479,6 +483,7 @@ def main(argv: list[str] | None = None) -> int:
         allow_scripted_task_reset=False,
     )
     session = build_mujoco_agent_tcp_pose_gateway_session(
+        enable_grippers=args.enable_grippers,
         target_config=target_config,
         allowed_client_ids=client_bindings.allowed_client_ids,
         max_retained_operations=args.max_retained_operations,

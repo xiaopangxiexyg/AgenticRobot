@@ -13,7 +13,16 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
+from agent_gateway.protocol.skill_catalog import SkillDeploymentSafetyEnvelopeRef
+from agent_gateway.protocol.skill_io_contracts import (
+    inline_only_skill_io_catalog_for_routes,
+)
 from agent_gateway.runtime.artifact_store import RecoverableAgentArtifactStore
+from agent_gateway.runtime.payload_validation import AgentSkillPayloadValidatorRegistry
+from agent_gateway.skills.gripper.deployment import (
+    GripperSkillDeploymentBinding,
+    build_gripper_skill_contract_bundle,
+)
 from collection_runtime.source_observation_history import (
     SourceObservationHistoryBinding,
     SQLiteSourceObservationHistoryStore,
@@ -38,6 +47,7 @@ from sim.mujoco.deploy import (
 )
 from sim.mujoco.deploy.target_config import DEFAULT_STATION_POSE_CONTRACT_PATH
 
+from .gripper_skill import MujocoGripperControlPort
 from .motion_application import MujocoAgentSkillMotionApplication
 from .motion_deployment import (
     MUJOCO_AGENT_SAFE_TCP_POSE_ROUTE_ID_V1,
@@ -45,6 +55,7 @@ from .motion_deployment import (
     MUJOCO_AGENT_TCP_POSE_MAX_TRANSLATION_DELTA_M_V1,
     MUJOCO_AGENT_TCP_POSE_ROUTE_ID_V1,
     MUJOCO_AGENT_TCP_POSE_WORKSPACE_BOUNDS_V1,
+    MujocoAgentTcpPoseContractBundle,
     MujocoAgentTcpPoseHistoryProfile,
     build_mujoco_agent_tcp_pose_contract_bundle,
 )
@@ -339,6 +350,53 @@ def _build_standard_tcp_pose_envelope_runtime(
     )
 
 
+def _bind_grippers(
+    bundle: MujocoAgentTcpPoseContractBundle,
+    ports: Mapping[str, MujocoGripperControlPort],
+) -> MujocoAgentTcpPoseContractBundle:
+    hashes = {component: port.port_binding_hash for component, port in ports.items()}
+    manifest = bundle.route_manifest
+    hand = build_gripper_skill_contract_bundle(GripperSkillDeploymentBinding(
+        runtime_session_id=manifest.runtime_session_id, control_domain_id=manifest.control_domain_id,
+        component_id="grippers", target_binding_id=manifest.target_binding_id,
+        target_kind="sim", current_mode="sim_active", executor_id="mujoco-composed-grippers-v2",
+        port_binding_hash=canonical_content_hash(hashes, domain="mujoco-composed-grippers-v2"),
+        station_manifest_hash=manifest.station_manifest_hash,
+        execution_manifest_hash=manifest.execution_manifest_hash,
+        skill_version="2", port_binding_hash_by_component=hashes))
+    definitions = replace(bundle.definition_catalog, skill_definitions=tuple(sorted(
+        (*bundle.definition_catalog.skill_definitions, *hand.definition_catalog.skill_definitions),
+        key=lambda d: (d.skill_id, d.skill_version))))
+    schemas = replace(bundle.schema_catalog, schema_entries=tuple(sorted(
+        (*bundle.schema_catalog.schema_entries, *hand.schema_catalog.schema_entries),
+        key=lambda s: (s.skill_id, s.skill_version))))
+    inline = inline_only_skill_io_catalog_for_routes(e.route for e in hand.route_manifest.skill_routes)
+    io = replace(bundle.io_catalog, io_contracts=tuple(sorted(
+        (*bundle.io_catalog.io_contracts, *inline.io_contracts), key=lambda c: (c.skill_id, c.skill_version))))
+    hand_entry = hand.route_manifest.skill_routes[0]
+    # Match the existing real composition: hands have a port-bound envelope,
+    # not the arm's Cartesian workspace box.
+    envelope = SkillDeploymentSafetyEnvelopeRef(
+        object_id="mujoco-gripper:" + hand.deployment_binding.port_binding_hash,
+        schema="dexteleop.deployment_safety_envelope.v1",
+        content_hash=hand.deployment_binding.port_binding_hash,
+        constraint_set_hash=hand.schema_catalog.schema_entries[0].parameter_schema_hash,
+        allowed_route_ids=(hand_entry.route.route_id,))
+    hand_entry = replace(hand_entry, deployment_binding=replace(
+        hand_entry.deployment_binding, safety_envelope_refs=(envelope,)))
+    entries = tuple(sorted((*manifest.skill_routes, hand_entry),
+        key=lambda e: (e.route.skill_id, e.route.skill_version, e.route.route_id, e.route.route_version)))
+    manifest = replace(manifest, skill_routes=entries,
+        explicit_exclusions=tuple(item for item in manifest.explicit_exclusions if item != "hand_control"),
+        skill_definition_catalog_hash=definitions.semantic_content_hash,
+        skill_schema_catalog_hash=schemas.semantic_content_hash, skill_io_catalog_hash=io.semantic_content_hash)
+    validators = AgentSkillPayloadValidatorRegistry(registry_id=bundle.payload_validators.registry_id,
+        validators=tuple(b.payload_validators.validator_for(e.route)
+            for b in (bundle, hand) for e in b.route_manifest.skill_routes))
+    return replace(bundle, definition_catalog=definitions, schema_catalog=schemas, io_catalog=io,
+        route_manifest=manifest, payload_validators=validators, gripper_contract=hand)
+
+
 def build_mujoco_agent_tcp_pose_gateway_session(
     *,
     target_config: MujocoSimHILTargetConfig,
@@ -352,9 +410,16 @@ def build_mujoco_agent_tcp_pose_gateway_session(
     enable_safe_tcp_pose: bool = False,
     enable_spatial_goals: bool = False,
     safe_tcp_planning_clearance_padding_m: float = 0.002,
+    enable_grippers: bool = False,
 ) -> MujocoAgentTcpPoseGatewaySession:
     """Build the exact default-off graph; do not start, record, or serve it."""
 
+    if not isinstance(target_config, MujocoSimHILTargetConfig):
+        raise TypeError("target_config must be MujocoSimHILTargetConfig.")
+    if not isinstance(enable_grippers, bool):
+        raise TypeError("enable_grippers must be boolean.")
+    if enable_grippers and target_config.realtime_worker:
+        raise ValueError("Composed gripper Skills require deterministic physics ownership.")
     if not isinstance(enable_safe_tcp_pose, bool):
         raise TypeError("enable_safe_tcp_pose must be boolean.")
     if not isinstance(enable_spatial_goals, bool):
@@ -488,6 +553,14 @@ def build_mujoco_agent_tcp_pose_gateway_session(
     history_store = None
     artifact_store = None
     try:
+        gripper_ports = {}
+        if enable_grippers:
+            if sorted(prepared.gripper_profile.side_by_gripper.values()) != ["left", "right"]:
+                raise ValueError("Composed grippers require both configured hands.")
+            gripper_ports = {side + "_gripper": MujocoGripperControlPort(
+                rig=target.runtime.rig, gripper_name=name, component_id=side + "_gripper",
+                clock=target.runtime.clock, arm_held=lambda: application.held)
+                for name, side in prepared.gripper_profile.side_by_gripper.items()}
         contract_bundle = build_mujoco_agent_tcp_pose_contract_bundle(
             application=application,
             history_profile=(
@@ -512,6 +585,8 @@ def build_mujoco_agent_tcp_pose_gateway_session(
             enable_safe_tcp_pose=enable_safe_tcp_pose,
             enable_spatial_goals=enable_spatial_goals,
         )
+        if enable_grippers:
+            contract_bundle = _bind_grippers(contract_bundle, gripper_ports)
         if history_storage is not None:
             source_binding = contract_bundle.history_source_binding
             if source_binding is None:
@@ -544,6 +619,7 @@ def build_mujoco_agent_tcp_pose_gateway_session(
             artifact_store=artifact_store,
             owns_artifact_store=artifact_store is not None,
             segmentation_localizer=segmentation_localizer,
+            gripper_ports=gripper_ports,
         )
     except Exception:
         if history_store is not None:

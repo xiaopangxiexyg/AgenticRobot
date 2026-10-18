@@ -272,6 +272,7 @@ class MujocoAgentTcpPoseSkillLifecycle:
         max_reference_rotation_step_rad: float | None = None,
         max_measured_translation_excursion_m: float | None = None,
         parameter_lineage: Mapping[str, str] | None = None,
+        domain_hold: Callable[..., StationLifecycleControlEvidence] | None = None,
         clock: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], None] = time.sleep,
     ) -> None:
@@ -290,6 +291,9 @@ class MujocoAgentTcpPoseSkillLifecycle:
             raise TypeError("motion_profile must be typed.")
         if not callable(clock) or not callable(sleep):
             raise TypeError("clock and sleep must be callable.")
+        if domain_hold is not None and not callable(domain_hold):
+            raise TypeError("domain_hold must be callable or None.")
+        self._domain_hold = domain_hold
         checks = (
             (request.semantic_content_hash == operation.request_hash, "request hash"),
             (request.route_hash == route.semantic_content_hash, "Route hash"),
@@ -773,14 +777,19 @@ class MujocoAgentTcpPoseSkillLifecycle:
         return tuple(sorted((*stable, *dynamic[: 128 - len(stable)])))
 
     def _hold(self, *, reason: str) -> StationLifecycleControlEvidence:
-        transition = self.application.request_hold(
-            reason=reason,
-            operation_id=self.operation.operation_id,
-        )
-        evidence = mujoco_agent_skill_hold_evidence_from_transition(
-            transition,
-            lower_operation_id=self._lower_operation_id,
-        )
+        if self._domain_hold is not None:
+            evidence = self._domain_hold(operation=self.operation, reason=reason)
+            if not isinstance(evidence, StationLifecycleControlEvidence):
+                raise TypeError("domain_hold returned invalid control evidence.")
+        else:
+            transition = self.application.request_hold(
+                reason=reason,
+                operation_id=self.operation.operation_id,
+            )
+            evidence = mujoco_agent_skill_hold_evidence_from_transition(
+                transition,
+                lower_operation_id=self._lower_operation_id,
+            )
         with self._lock:
             self._execution_refs.update(evidence.evidence_refs)
         return evidence

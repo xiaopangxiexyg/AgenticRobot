@@ -642,3 +642,122 @@ def test_v2_gateway_selects_both_physical_mujoco_grippers_without_cross_commands
     finally:
         assert session.close().accepted
         rig.close()
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("keep_left_closed", (False, True))
+def test_motion_and_bilateral_grippers_share_one_session_and_physics_owner(keep_left_closed):
+    from dataclasses import replace
+
+    task = _REPOSITORY_ROOT / "sim/configs/tasks/rm65_right_cube_reach_fixed_pose_xyz_proprio_v1.json"
+    session = build_mujoco_agent_tcp_pose_gateway_session(
+        target_config=MujocoSimHILTargetConfig(task_config_path=task, realtime_worker=False,
+            exposed_pose_sides=("right",), allow_scripted_task_reset=False,
+            execution_observation_plan=mujoco_agent_tcp_pose_execution_observation_plan_v1()),
+        allowed_client_ids=("test:composed",), enable_grippers=True, enable_safe_tcp_pose=True)
+    try:
+        app = session.application
+        app.start_observation_ready()
+        bundle = session.contract_bundle
+        assert bundle.gripper_contract is not None
+        assert all(port.rig is app.runtime.rig for port in session.gripper_ports.values())
+        profile = bundle.motion_profile
+
+        def public_pose():
+            return app.transform_tcp_pose_xyzquat(
+                app.capture_tcp_pose_by_component()["right_arm"],
+                source_frame_id=profile.execution_reference_frame_id,
+                target_frame_id=profile.reference_frame_id,
+            )
+
+        initial = public_pose()
+        operations = []
+        for sequence, (skill, params) in enumerate((
+            ("manipulation.set_gripper_state", {"component_id": "left_gripper", "target_state": "closed"}),
+            ("manipulation.set_gripper_state", {"component_id": "right_gripper" if keep_left_closed else "left_gripper",
+                                                 "target_state": "closed" if keep_left_closed else "open"}),
+            ("manipulation.set_gripper_state", {"component_id": "right_gripper", "target_state": "closed"}),
+            ("manipulation.set_gripper_state", {"component_id": "right_gripper", "target_state": "open"}),
+            ("motion.move_tcp_to_pose", None),
+        ), 1):
+            observed = session.observation_producer.capture_and_publish(session.service)
+            assert observed.accepted
+            target = list(initial)
+            target[2] += .03
+            request = _motion_request(session, observed.snapshot, target, client_id="test:composed")
+            entry = bundle.route_manifest.route(skill, "2" if params else "1")
+            route = entry.route
+            parameter = route.allowed_parameter_profiles[0]
+            request = replace(request, request_id=f"mixed:{sequence}", idempotency_key=f"mixed:{sequence}",
+                client_sequence=sequence, skill_id=route.skill_id, skill_version=route.skill_version,
+                skill_definition_hash=route.skill_definition_hash, route_id=route.route_id,
+                route_version=route.route_version, route_hash=route.semantic_content_hash,
+                deployment_binding_hash=entry.deployment_binding.deployment_binding_hash,
+                parameter_profile_id=parameter.parameter_profile_id,
+                parameter_profile_hash=parameter.parameter_profile_hash,
+                requested_timeout_ms=min(request.requested_timeout_ms, route.max_operation_duration_ms),
+                parameters=params if params else request.parameters)
+            admitted = session.service.submit_request(request=request,
+                current_station_revision=observed.snapshot.station_revision)
+            assert admitted.accepted, admitted
+            assert session.service.launch_operation(admitted.operation.operation_id).accepted
+            assert session.wait(timeout_sec=20)
+            result = session.service.get_operation(admitted.operation.operation_id)
+            if keep_left_closed and sequence == 2:
+                # The old parallel-finger fixture has forbidden finger self-contact
+                # when held fully closed. Composition must preserve that rejection.
+                assert result.execution_outcome == "failed"
+                assert result.reason_code == "station_operation_worker_exception_after_hold"
+                assert "collision-safe segment" in result.progress_summary["worker_error"]["message"]
+                assert app.held
+                return
+            assert result.execution_outcome == "completed", (skill, result.reason_code, result.progress_summary)
+            assert app.held
+            operations.append(result)
+        assert len(operations) == 5
+        final = public_pose()
+        assert abs(final[2] - initial[2] - .03) < .01
+    finally:
+        closed = session.close()
+        assert closed.accepted
+        assert closed.port_receipt.proves_motion_or_hold
+        assert any(ref.startswith("mujoco-gripper-hold:") for ref in closed.port_receipt.evidence_refs)
+        assert session.close() is closed
+        assert session.application.closed
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("failure_type", [RuntimeError, KeyboardInterrupt, SystemExit])
+def test_composed_domain_hold_attempts_both_hands_after_arm_stop_failure(monkeypatch, failure_type):
+    from agent_gateway.skills.gripper.runtime import GripperHoldReceipt
+
+    task = _REPOSITORY_ROOT / "sim/configs/tasks/rm65_right_cube_reach_fixed_pose_xyz_proprio_v1.json"
+    session = build_mujoco_agent_tcp_pose_gateway_session(
+        target_config=MujocoSimHILTargetConfig(task_config_path=task, realtime_worker=False,
+            exposed_pose_sides=("right",), allow_scripted_task_reset=False,
+            execution_observation_plan=mujoco_agent_tcp_pose_execution_observation_plan_v1()),
+        allowed_client_ids=("test:stop-failure",), enable_grippers=True)
+    calls = []
+    original = failure_type("arm stop failed")
+
+    def fail_arm(**kwargs):
+        calls.append("arm")
+        raise original
+
+    def stop_hand(component, **kwargs):
+        calls.append(component)
+        return GripperHoldReceipt(True, ("test:stop:" + component,))
+
+    try:
+        session.application.start_observation_ready()
+        with monkeypatch.context() as patch:
+            patch.setattr(session.application, "request_hold", fail_arm)
+            for component, port in session.gripper_ports.items():
+                patch.setattr(port, "hold", lambda component=component, **kwargs: stop_hand(component, **kwargs))
+            with pytest.raises(failure_type) as captured:
+                session.motion_executor.request_hold(operation=None, reason="stop regression")
+            assert captured.value is original
+        assert calls[0] == "arm"
+        assert sorted(calls[1:]) == ["left_gripper", "right_gripper"]
+    finally:
+        assert session.close().accepted

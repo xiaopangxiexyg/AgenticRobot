@@ -50,6 +50,7 @@ from agent_gateway.runtime.payload_validation import (
     AgentSkillPayloadValidatorRegistry,
     AgentSkillPayloadValidatorSet,
 )
+from agent_gateway.skills.gripper.deployment import GripperSkillContractBundle
 from agent_gateway.skills.motion.definition import (
     FIXED_CARDINAL_TCP_STEP_DIRECTION_BY_SKILL_ID_V1,
     FIXED_CARDINAL_TCP_STEP_SKILL_IDS_V1,
@@ -99,6 +100,7 @@ from .motion_primitive_profiles import (
     MUJOCO_AGENT_TCP_CARDINAL_STEP_EXECUTOR_ID_V1,
     MUJOCO_AGENT_TCP_CARDINAL_STEP_PARAMETER_PROFILE_ID_V1,
     MUJOCO_AGENT_TCP_CARDINAL_STEP_ROUTE_ID_V1,
+    MUJOCO_AGENT_TCP_FIXED_CARDINAL_STEP_DIRECTION_BY_SKILL_ID_V1,
     MUJOCO_AGENT_TCP_FIXED_CARDINAL_STEP_EXECUTOR_ID_BY_SKILL_ID_V1,
     MUJOCO_AGENT_TCP_FIXED_CARDINAL_STEP_ROUTE_ID_BY_SKILL_ID_V1,
     MUJOCO_AGENT_TCP_FIXED_ORIENTATION_EXECUTOR_ID_BY_SKILL_ID_V1,
@@ -709,6 +711,7 @@ class MujocoAgentTcpPoseContractBundle:
         MujocoPassiveTcpPoseHistoryDeploymentBinding | None
     ) = None
     spatial_goal_registration: SpatialGoalRegistration | None = None
+    gripper_contract: GripperSkillContractBundle | None = None
 
     def __post_init__(self) -> None:
         validate_skill_route_catalog_closure(
@@ -720,6 +723,16 @@ class MujocoAgentTcpPoseContractBundle:
         if self.spatial_goal_registration is not None:
             if self.route_manifest.route("perception.compute_spatial_goal", "1") != self.spatial_goal_registration.entry:
                 raise ValueError("Spatial goal registration differs from its manifest entry.")
+        if self.gripper_contract is not None:
+            hand = self.gripper_contract
+            for name in ("runtime_session_id", "control_domain_id", "target_binding_id", "target_kind", "current_mode",
+                         "station_manifest_hash", "execution_manifest_hash"):
+                if getattr(hand.route_manifest, name) != getattr(self.route_manifest, name):
+                    raise ValueError("Composed gripper and motion session identity mismatch.")
+            entry = self.route_manifest.route("manipulation.set_gripper_state", "2")
+            if (entry.route != hand.route_manifest.skill_routes[0].route
+                    or entry.deployment_binding.deployment_binding_hash != hand.deployment_binding.semantic_content_hash):
+                raise ValueError("Composed gripper Route changed.")
         if self.safe_tcp_pose_contract is not None:
             safe = self.safe_tcp_pose_contract
             entry = self.route_manifest.route("motion.move_tcp_to_pose_safe", "1")
