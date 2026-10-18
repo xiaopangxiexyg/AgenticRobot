@@ -17,6 +17,7 @@ from .shared_control import (
     B601PolicyAssistCommand,
     B601PolicyCommandBuffer,
     B601PolicyCommandReceipt,
+    B601PolicyCommandSample,
     B601SharedControlConfig,
     B601SharedControlOutput,
     B601SharedControlState,
@@ -78,6 +79,10 @@ class B601SharedControlRuntime:
 
         return self._commands.clear()
 
+    def sample_policy(self, *, now_sec: float) -> B601PolicyCommandSample:
+        """Read canonical intent validity without advancing servo state."""
+        return self._commands.sample_for_config(now_sec=now_sec, config=self.config)
+
     def step(
         self,
         *,
@@ -97,10 +102,7 @@ class B601SharedControlRuntime:
         and dispatch it through its existing single-owner path.
         """
 
-        sample = self._commands.sample_for_config(
-            now_sec=control_timestamp_sec,
-            config=self.config,
-        )
+        sample = self.sample_policy(now_sec=control_timestamp_sec)
         decision = compute_b601_shared_control_step(
             self.config,
             self._state,
