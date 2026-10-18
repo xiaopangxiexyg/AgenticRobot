@@ -278,3 +278,41 @@ def test_left_udp_destination_rejects_scope_expansion_before_ssh(wrapper_environ
     result = _run(environment, "remote_rm65_left_udp_destination.sh", "-H", "trusted-target", argument)
     assert result.returncode != 0
     assert not calls.exists()
+
+
+def test_raw_camera_pair_preview_is_fixed_and_does_not_connect(wrapper_environment):
+    environment, calls = wrapper_environment
+    result = _run(environment, "remote_camera_v4l2_pair.sh", "-H", "trusted-target",
+                  "--usb-serial", "123456789012", "--output", "/new-evidence", "--dry-run")
+    assert result.returncode == 0
+    assert not calls.exists()
+    assert "30s /usr/bin/python3 -u -" in result.stdout
+    assert "--usb-serial '123456789012'" in result.stdout
+
+@pytest.mark.parametrize("extra", [("--usb-serial", "bad"), ("--output", "/"),
+                                   ("--command", "arbitrary"), ("--reset",)])
+def test_raw_camera_pair_rejects_unbounded_or_invalid_args(wrapper_environment, extra):
+    environment, calls = wrapper_environment
+    result = _run(environment, "remote_camera_v4l2_pair.sh", "-H", "trusted-target",
+                  "--usb-serial", "123456789012", "--output", "/new-evidence", *extra)
+    assert result.returncode != 0
+    assert not calls.exists()
+
+@pytest.mark.parametrize("bind", [False, True])
+def test_driver_bind_wrapper_limits_effect_and_does_not_connect_in_preview(wrapper_environment, bind):
+    environment, calls = wrapper_environment
+    args = ["-H", "trusted-target", "--usb-port", "2-4.1", "--usb-serial", "123456789012", "--dry-run"]
+    if bind:
+        args.append("--bind")
+    result = _run(environment, "remote_camera_driver_bind.sh", *args)
+    assert result.returncode == 0 and not calls.exists()
+    assert "15s" in result.stdout
+    assert ("/usr/bin/sudo -n" in result.stdout) == bind
+    assert "/usr/bin/python3 -I -u -" in result.stdout
+
+@pytest.mark.parametrize("extra", [("--usb-port", "../other"), ("--usb-serial", "bad"), ("--unbind",)])
+def test_driver_bind_wrapper_rejects_other_effects_or_paths(wrapper_environment, extra):
+    environment, calls = wrapper_environment
+    result = _run(environment, "remote_camera_driver_bind.sh", "-H", "trusted-target", "--usb-port", "2-4.1",
+                  "--usb-serial", "123456789012", "--dry-run", *extra)
+    assert result.returncode != 0 and not calls.exists()
