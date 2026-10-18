@@ -56,3 +56,24 @@ CAD 与 proxy 对照必须使用同一个固定场景。输出先列出桌面/�
 只读留存检查可使用 inspect_safe_move_snapshot.py，直接加载安全移动尝试的
 snapshot.json 与同批 RGB-D/FK，不重新连接设备或重算采集位姿。输出目录必须不存在；
 报告只提供观测表面、碰撞点投影与离线几何证据，不代表路径执行或抓取成功。
+
+
+## 冻结局部关节路径的分段离线诊断
+
+`python -m scripts.probes.validate_grasp_pipeline --help` 提供独立的离线验证工具。
+它消费已经选定的两阶段关节路径，输入必须含 `pregrasp_target`、`constrained_approach`、
+`stage_boundary_stops` 和两段动力学证书；不会重新搜索抓姿或 IK，也不会改变当前 whole-plan 默认。
+调用方须保证点云、目标标签、夹爪几何与 MuJoCo contract 来自同一冻结 solver-world 场景。
+工具会核对留存路径、原 waypoint 与当前碰撞 profile 身份并拒绝不匹配；外部点云、几何与
+MuJoCo contract 之间没有自动交叉 hash 绑定，不能据此声称所有输入身份均已自动验证。
+
+工具复用现有 motion port、C2 补接、碰撞与可见点云复核、不可变计划 store 及 force monitor，
+检查前段执行、确认 HOLD、连续停稳、新后段授权 fixture 和一次性消费。worker 仅持有本地规划模型；
+力输入是零力模拟源，MuJoCo 通过 qpos/forward 做运动学跟随。输出写入指定的新目录。
+这里没有硬件 backend、SDK、相机或模型服务启动，结果不构成执行器跟踪、制动或物理抓取验收。
+
+`--budget` 用于规划与后段采纳等待；它不是强制终止底层进程的硬时限。
+`Future.cancel()` 无法取消已运行的原生工作，进程池关闭会等待这类工作结束；应在受控 CPU 资源中运行。
+冻结状态的精确起点比较和模拟确认不提供真机恢复策略，也不新增生产 staged Skill 或真实 Route/grant。
+失败退出时分别关闭 force monitor 与 plan store；优先保留首个中断，否则保留首个普通异常，
+附带其他关闭错误的完整信息，不将关闭失败报告为成功。
