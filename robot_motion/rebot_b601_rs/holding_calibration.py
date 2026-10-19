@@ -61,7 +61,10 @@ class HoldingForceSearch:
         self.state, self.reason = "searching", "verify_arrival_command"
         self._verification = None
 
-    def record(self, *, command_nm: float, outcome: str, evidence: dict):
+    def record(
+        self, *, command_nm: float, outcome: str, evidence: dict,
+        requested_command_nm: float | None = None,
+    ):
         if self.state != "searching":
             raise ValueError("holding search is terminal")
         if outcome not in {"stationary", "positive_motion", "negative_motion"}:
@@ -72,8 +75,21 @@ class HoldingForceSearch:
             or abs(command_nm) > self.cap_nm + 1e-9
         ):
             raise ValueError("observed holding command exceeds its envelope")
+        if requested_command_nm is not None and (
+            isinstance(requested_command_nm, bool)
+            or not math.isfinite(requested_command_nm)
+            or abs(requested_command_nm) > self.cap_nm + 1e-9
+            or abs(requested_command_nm - self.candidate_nm) > 1e-9
+        ):
+            raise ValueError("holding observation must belong to the current probe")
+        changed_plateau = (requested_command_nm is not None
+                           and abs(command_nm - requested_command_nm) > 1e-9)
+        if changed_plateau and evidence.get("ramp_frozen") is not True:
+            raise ValueError("changed holding plateau requires a frozen ramp")
         self.observations.append(
-            {**evidence, "command_nm": command_nm, "outcome": outcome}
+            {**evidence,
+             **({"requested_command_nm": requested_command_nm} if requested_command_nm is not None else {}),
+             "command_nm": command_nm, "outcome": outcome}
         )
         positive = [
             r["command_nm"]
@@ -98,9 +114,17 @@ class HoldingForceSearch:
             )
             return
         if self._verification is not None:
-            if outcome != "stationary" or abs(command_nm - self._verification) > 1e-9:
+            if outcome != "stationary" or (
+                abs(command_nm - self._verification) > 1e-9 and not changed_plateau
+            ):
                 self.state, self.reason = "incomplete", "holding_verification_changed"
                 return
+            # The observer can stop a ramp at an actually dispatched level
+            # before the requested recheck level. A causal quiet plateau is a
+            # new observation, not a failed recheck of an unsent command.
+            # Recheck this actual level; do not count the requested level as
+            # another observation or relax command equality for completion.
+            self._verification = self.candidate_nm = command_nm
             count = sum(
                 r["outcome"] == "stationary"
                 and abs(r["command_nm"] - command_nm) <= 1e-9

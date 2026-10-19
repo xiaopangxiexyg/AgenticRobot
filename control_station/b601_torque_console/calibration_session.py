@@ -965,7 +965,8 @@ class B601AutomaticCalibrationSession:
         if max(abs(q[i]-self._holding_pose[i]) for i in range(6) if i != j) > config.movement_rad:
             self._abort(now, "holding_search_incomplete")
             return
-        self._holding.record(command_nm=self._holding_probe_nm, outcome=outcome, evidence=dict(observation))
+        self._holding.record(command_nm=self._holding_probe_nm, outcome=outcome,
+            requested_command_nm=observation["requested_command_nm"], evidence=dict(observation))
         self._events.append({"time_sec": now, "state": "holding_observation", **observation,
             "command_nm": self._holding_probe_nm, "outcome": outcome})
         self._holding_reacquire_bias_nm = self._holding_return_command()

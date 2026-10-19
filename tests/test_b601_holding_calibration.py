@@ -213,6 +213,76 @@ def test_each_failed_return_check_removes_only_that_candidate_from_further_retri
     assert len(search.observations) + len(search.transitions) < search.config.max_trials
 
 
+@pytest.mark.parametrize("sign", [-1, 1])
+def test_4j8unjzh_causal_frozen_plateau_is_new_hold_to_recheck_not_failed_request(sign):
+    seed = sign * 0.3423907938939641
+    search = HoldingForceSearch(HoldingSearchConfig(), seed_nm=seed, cap_nm=1)
+    search.record(command_nm=seed, outcome="stationary", evidence={})
+    search.record_transition(command_nm=sign * 0.032948165695660725,
+                             requested_command_nm=0, evidence={})
+    search.record(command_nm=search.candidate_nm, outcome="stationary", evidence={})
+    for _ in range(4):
+        search.record_transition(command_nm=search.candidate_nm,
+                                 requested_command_nm=search.candidate_nm, evidence={})
+    assert search.candidate_nm == seed
+    actual = sign * 0.32665337778768744
+    search.record(command_nm=actual, requested_command_nm=seed,
+                  outcome="stationary", evidence={"ramp_frozen": True})
+    assert search.state == "searching"
+    assert search.candidate_nm == search.return_command_nm == actual
+    assert search.status()["usable_hold_nm"] is None
+    search.record(command_nm=actual, requested_command_nm=actual,
+                  outcome="stationary", evidence={"ramp_frozen": False})
+    result = search.status(detailed=True)
+    assert result["state"] == "complete"
+    assert result["usable_hold_nm"] == actual
+    assert [r["command_nm"] for r in result["observations"][-2:]] == [actual, actual]
+    assert result["observations"][-2]["requested_command_nm"] == seed
+    assert result["negative_motion_below_nm"] is result["positive_motion_above_nm"] is None
+
+
+@pytest.mark.parametrize("requested", [True, float("nan"), 1.01, 0.1])
+def test_changed_plateau_rejects_invalid_or_stale_request_before_recording(requested):
+    search = HoldingForceSearch(HoldingSearchConfig(), seed_nm=-0.3, cap_nm=1)
+    with pytest.raises(ValueError, match="current probe"):
+        search.record(command_nm=-0.28, requested_command_nm=requested,
+                      outcome="stationary", evidence={"ramp_frozen": True})
+    assert search.observations == []
+
+
+def test_changed_plateau_requires_explicit_freeze_and_a_new_exact_repeat():
+    search = HoldingForceSearch(HoldingSearchConfig(), seed_nm=-0.3, cap_nm=1)
+    search.record(command_nm=-0.3, outcome="stationary", evidence={})
+    search.record_transition(command_nm=-0.28, requested_command_nm=0, evidence={})
+    with pytest.raises(ValueError, match="frozen ramp"):
+        search.record(command_nm=-0.29, requested_command_nm=-0.3,
+                      outcome="stationary", evidence={"ramp_frozen": False})
+    assert len(search.observations) == 1
+    search.record(command_nm=-0.29, requested_command_nm=-0.3,
+                  outcome="stationary", evidence={"ramp_frozen": True})
+    assert search.state == "searching"
+    search.record(command_nm=-0.29, requested_command_nm=-0.29,
+                  outcome="positive_motion", evidence={})
+    assert search.state == "incomplete"
+    assert search.status()["usable_hold_nm"] is None
+
+
+def test_new_plateau_does_not_renew_trial_budget_or_relax_unexplained_mismatch():
+    search = HoldingForceSearch(HoldingSearchConfig(max_trials=3), seed_nm=-0.3, cap_nm=1)
+    search.record(command_nm=-0.3, outcome="stationary", evidence={})
+    search.record_transition(command_nm=-0.28, requested_command_nm=0, evidence={})
+    search.record(command_nm=-0.29, requested_command_nm=-0.3,
+                  outcome="stationary", evidence={"ramp_frozen": True})
+    assert search.reason == "holding_trial_budget_exhausted"
+    assert search.status()["usable_hold_nm"] is None
+    unexplained = HoldingForceSearch(HoldingSearchConfig(), seed_nm=-0.3, cap_nm=1)
+    unexplained.record(command_nm=-0.3, outcome="stationary", evidence={})
+    unexplained.record_transition(command_nm=-0.28, requested_command_nm=0, evidence={})
+    unexplained.record(command_nm=-0.29, outcome="stationary", evidence={})
+    assert unexplained.reason == "holding_verification_changed"
+    assert unexplained.status()["usable_hold_nm"] is None
+
+
 @pytest.mark.parametrize(
     "values",
     [
@@ -549,6 +619,28 @@ def test_native_point_comparison_uses_actual_sample_not_nominal_arrival_edge(set
     assert observations[1]["final_qpos_rad"][2] - sample < 0.002
 
 
+@pytest.mark.parametrize("joint_name", ["joint2", "joint3"])
+def test_other_calibration_axis_drift_is_not_a_hold_or_force_bound_at_original_pose(settings, joint_name):
+    replay = holding_replay(settings, joint_name=joint_name)
+    prime_offset_arrival(replay)
+    search = replay.session._holding
+    other = 2 if joint_name == "joint2" else 1
+    initial = replay.q[other]
+    for _ in range(45):
+        q = list(replay.q)
+        q[other] += min(0.0001, max(0, initial + 0.0032 - q[other]))
+        replay.tick(q=q)
+        if replay.session.status()["state"] in {"failed", "releasing"}:
+            break
+    replay.run_until(lambda: replay.session.status()["state"] == "failed", max_ticks=200)
+    assert replay.session.status()["reason"] == "holding_search_incomplete"
+    assert len(search.observations) == 1
+    assert search.status()["usable_hold_nm"] is None
+    assert search.status()["positive_motion_above_nm"] is None
+    assert search.status()["negative_motion_below_nm"] is None
+    assert replay.session.status()["completed_legs"] == []
+
+
 @pytest.mark.parametrize("period", [0.01, 0.025])
 @pytest.mark.parametrize("movement", [0.002, 0.003])
 def test_explicit_wider_point_band_allows_seven_count_recoil_only_after_quiet_plateau(settings, period, movement):
@@ -635,7 +727,8 @@ def test_native_transition_refinement_reacquires_verifies_then_withdraws(setting
 
 @pytest.mark.parametrize("period", [0.01, 0.025])
 @pytest.mark.parametrize("joint_name", ["joint2", "joint3"])
-def test_native_failed_weak_hold_recheck_returns_with_stronger_bias_and_fresh_receipts(settings, period, joint_name):
+@pytest.mark.parametrize("recoil_on_return", [False, True])
+def test_native_failed_weak_hold_recheck_returns_with_stronger_bias_and_fresh_receipts(settings, period, joint_name, recoil_on_return):
     replay = holding_replay(settings, control_period_sec=period, joint_name=joint_name)
     j = int(joint_name[-1]) - 1
     sample = prime_offset_arrival(replay)
@@ -666,7 +759,9 @@ def test_native_failed_weak_hold_recheck_returns_with_stronger_bias_and_fresh_re
                     # static-friction plant or classify its recoil as a bound.
                     goal = sample
                     if rejected:
-                        goal = replay.session._holding_observation["anchor_qpos_rad"][j]
+                        # 4j8unjzh: stronger return can move back inside the
+                        # sample neighbourhood, freezing a NEW actual plateau.
+                        goal = sample if recoil_on_return else replay.session._holding_observation["anchor_qpos_rad"][j]
                     elif search._verification is not None:
                         goal += 0.0024
                     elif sent >= -0.15:
@@ -685,6 +780,13 @@ def test_native_failed_weak_hold_recheck_returns_with_stronger_bias_and_fresh_re
     assert point["observations"][-1]["completed_at_sec"] > point["transitions"][-1]["completed_at_sec"]
     assert all(r["started_at_sec"] > r["first_causal_receipt_at_sec"] for r in point["observations"])
     assert result["completed_legs"][0]["final_zero_and_still_confirmed"]
+    if recoil_on_return and period == 0.01:
+        changed = [r for r in point["observations"]
+                   if abs(r["command_nm"] - r["requested_command_nm"]) > 1e-9]
+        assert changed
+        assert all(r["ramp_frozen"] for r in changed)
+        assert changed[-1]["command_nm"] == point["usable_hold_nm"]
+        assert point["observations"][-1]["completed_at_sec"] > changed[-1]["completed_at_sec"]
 
 
 def test_nonzero_hold_survives_subsequent_recoil_and_withdrawal_still_requires_receipts(
