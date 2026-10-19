@@ -121,7 +121,7 @@ def test_safe_motion_then_fresh_comparison_uses_the_same_owner_and_cut(task, rec
         target_matrix = xyzquat_to_pose_matrix(target)
         assert comparison["translation_error_m_by_component"]["right_arm"] == pytest.approx(translation_distance(current_matrix, target_matrix))
         assert comparison["rotation_error_rad_by_component"]["right_arm"] == pytest.approx(rotation_angle_rad(current_matrix, target_matrix))
-        assert comparison["target_pose_by_component"]["right_arm"] == target
+        assert list(comparison["target_pose_by_component"]["right_arm"]) == target
         assert comparison["target_request_hash"] == session.service.operation_store.request_for_operation(moved.operation_id).semantic_content_hash
         assert comparison["target_status"] == moved.status
         assert comparison["target_execution_outcome"] == moved.execution_outcome
