@@ -393,6 +393,7 @@ class B601JointMotionTracker:
         self._brake_trigger_lag: float | None = None
         self._speed_governor_resume_count = 0
         self._arrival_unloading = False
+        self._calibration_probe_active = False
         # The shorter causal window only advances soft withdrawal in explicit
         # governed tracking. It never authorizes start, stop, or hard admission.
         self._recent_velocity = B601WindowVelocityEstimator(self.config.velocity_window_sec / 2)
@@ -472,7 +473,21 @@ class B601JointMotionTracker:
         stop_evidence: B601WindowStopEvidence | None = None,
         speed_governor_permitted: bool = False,
         zero_dispatch_confirmed: bool = False,
+        calibration_hold_enabled: bool = False,
+        calibration_probe_nm: float | None = None,
     ) -> B601JointMotionFrame:
+        if type(calibration_hold_enabled) is not bool:
+            raise TypeError("calibration hold permit must be boolean")
+        if calibration_hold_enabled and not (
+            self.config.responsive_tracking_brake
+            and self.config.continuous_speed_limit_rad_s is not None
+        ):
+            raise ValueError("holding calibration requires explicit resolved continuous motion")
+        if calibration_probe_nm is not None and (
+            not calibration_hold_enabled or isinstance(calibration_probe_nm, bool)
+            or not math.isfinite(calibration_probe_nm)
+        ):
+            raise ValueError("fixed holding probe requires explicit finite calibration demand")
         if type(speed_governor_permitted) is not bool or type(zero_dispatch_confirmed) is not bool:
             raise TypeError("governor permit and zero receipt must be boolean")
         support_raw = support_max_velocity_rad_s if support_raw_max_velocity_rad_s is None else support_raw_max_velocity_rad_s
@@ -655,6 +670,33 @@ class B601JointMotionTracker:
                 return frame("authority_exhausted", "tracking_motion_evidence_unavailable_or_unsafe",
                              q, 0.0, control_v, 0.0, 0.0, 0.0,
                              motion_evidence_block_reason=block)
+        if calibration_probe_nm is not None:
+            # This is a fixed-command observation, not position regulation.
+            # Raw/evidence admission above and every existing soft brake below
+            # still take precedence, including motion away from the goal.
+            probe_safe = (
+                not request_brake
+                and support_max_velocity_rad_s < self.config.soft_velocity_rad_s
+                and soft_speed < selected_stop_limit
+                and (not self._recent_velocity.ready
+                     or self._recent_velocity.position_span_rad <= (resolution or 0.0)
+                     or abs(self._recent_speed) < (continuous_limit or tracking_speed_limit or selected_stop_limit))
+                and (self._brake_start is None or self._brake_reason == "target_reached_braking")
+            )
+            if probe_safe:
+                self._calibration_probe_active = True
+                self._brake_start = self._stationary_start = None
+                self._arrival_unloading = False
+                return frame("track", "calibration_fixed_command_observation",
+                             q, 0.0, control_v, 0.0, 0.0, authority * calibration_probe_nm)
+        elif self._calibration_probe_active:
+            # Same frozen target, fresh measured reference. Do not reset the
+            # governor count or caller's point/command-exposure budgets.
+            if not request_brake and self._brake_start is None:
+                self._planner.reset((q,), monotonic_time=now)
+                self._planner.accept_target((self._target,), sequence=0,
+                    published_monotonic_time=now, monotonic_time=now)
+            self._calibration_probe_active = False
         if (
             self._hold_position is not None
             and not request_brake
@@ -837,7 +879,10 @@ class B601JointMotionTracker:
                 self._brake_reason = "reference_lag_braking"
             self._hold_position = None
         elapsed = now - self._brake_start
-        if elapsed >= self.config.braking_timeout_sec:
+        if elapsed >= self.config.braking_timeout_sec and not (
+            calibration_hold_enabled and not request_brake
+            and self._brake_reason == "target_reached_braking"
+        ):
             stop_capture_block_reason = "braking_timeout"
             return frame(
                 "authority_exhausted",
@@ -850,6 +895,15 @@ class B601JointMotionTracker:
                 0.0,
                 brake_elapsed_sec=elapsed,
             )
+        if (calibration_hold_enabled and not request_brake
+            and self._brake_reason == "target_reached_braking"):
+            # Calibration must observe the necessary nonzero command BEFORE
+            # normal arrival unloads it. Genuine brakes retain their old exit.
+            self._arrival_unloading = False
+            return frame("brake", "target_reached_braking", self._target,
+                         0.0, control_v, kp * (self._target-q), -kd * control_v,
+                         authority * (kp * (self._target-q) - kd * control_v),
+                         brake_elapsed_sec=elapsed)
         stationary = (
             evidence_reason is None if resolution is not None else
             max(abs(raw_v), abs(control_v), support_max_velocity_rad_s, support_raw) <= stop_velocity_rad_s

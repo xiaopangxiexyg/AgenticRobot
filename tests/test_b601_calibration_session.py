@@ -67,7 +67,7 @@ def settings(tmp_path):
 class Replay:
     """Native staged logic only; feedback motion is prescribed, not simulated."""
 
-    def __init__(self, settings, *, limits=None, plan_change=None, acquisition_arrival_tolerance_rad=None, excursion_rad=.008):
+    def __init__(self, settings, *, limits=None, plan_change=None, acquisition_arrival_tolerance_rad=None, excursion_rad=.008, holding_search=None, control_period_sec=.01):
         self.controller = B601StagedTorqueConsoleController(settings)
         self.condition = CalibrationCondition(
             "offline-contract-replay",
@@ -99,8 +99,10 @@ class Replay:
             position_limits_rad=((-1.0, 1.0),) * 6,
             limits=limits or CalibrationBatchLimits(120.0, 12.0, 2.0, 0.10, 0.04, 20.0),
             acquisition_arrival_tolerance_rad=acquisition_arrival_tolerance_rad,
+            holding_search=holding_search,
         )
         self.now = 1.0
+        self.control_period_sec = control_period_sec
         self.sequence = 0
         self.q = ZERO
         self.audit = {}
@@ -119,10 +121,10 @@ class Replay:
         ack=True,
         command_delta=None,
     ):
-        self.now = round(self.now + 0.01, 9)
+        self.now = round(self.now + self.control_period_sec, 9)
         self.sequence += 1
         new_q = self.q if q is None else tuple(q)
-        velocity = tuple((a - b) / 0.01 for a, b in zip(new_q, self.q))
+        velocity = tuple((a - b) / self.control_period_sec for a, b in zip(new_q, self.q))
         self.q = new_q
         overlay, self.audit = self.session.step(
             now_sec=self.now,
@@ -194,6 +196,12 @@ class Replay:
                 motion = self.audit.get("motion_control")
                 if motion and motion["phase"] == "track":
                     q[2] = motion["q_reference_rad"]
+                elif (self.session.holding_search is not None and motion
+                      and motion.get("arrival_stabilization_active")):
+                    # The new mode deliberately retains the target spring
+                    # before measurement; prescribe its slow approach too.
+                    step = self.controller.settings.staged_assist.motion_control.max_reference_velocity_rad_s * self.control_period_sec
+                    q[2] += max(-step, min(step, target-q[2]))
                 elif view["phase"] == "breakaway":
                     q[2] += max(-0.00010, min(0.00010, target - q[2]))
                 elif (

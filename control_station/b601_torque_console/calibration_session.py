@@ -14,6 +14,10 @@ from dataclasses import dataclass
 from typing import Any
 
 from robot_motion.rebot_b601_rs.calibration import CalibrationCondition, finite, six
+from robot_motion.rebot_b601_rs.holding_calibration import (
+    HoldingForceSearch,
+    HoldingSearchConfig,
+)
 from robot_motion.rebot_b601_rs.mit import B601_RS_JOINT_MIT_FRAME
 from robot_motion.rebot_b601_rs.model import B601_RS_ARM_JOINT_NAMES
 
@@ -31,6 +35,7 @@ def calibration_outcome(state: str, reason: str) -> dict[str, str]:
         "batch_timeout", "leg_timeout", "preparation_timeout",
         "active_command_exposure_budget", "leg_command_exposure_budget",
         "workspace_timeout", "workspace_command_exposure_budget",
+        "holding_search_incomplete",
     }
     if state == "failed":
         severity = "warning" if reason in incomplete else "error"
@@ -124,12 +129,22 @@ class B601AutomaticCalibrationSession:
         position_limits_rad: tuple[tuple[float, float], ...],
         limits: CalibrationBatchLimits,
         acquisition_arrival_tolerance_rad: float | None = None,
+        holding_search: HoldingSearchConfig | None = None,
     ) -> None:
         if not isinstance(controller, B601StagedTorqueConsoleController):
             raise TypeError(
                 "automatic acquisition requires the existing staged controller"
             )
         motion = controller.settings.staged_assist.motion_control
+        if holding_search is not None and (
+            not isinstance(holding_search, HoldingSearchConfig)
+            or motion is None
+            or not motion.responsive_tracking_brake
+            or motion.continuous_speed_limit_rad_s is None
+            or holding_search.movement_rad < 4 * (motion.position_resolution_rad or 0.0)
+        ):
+            raise ValueError("holding search requires explicit continuous resolved motion and at least four position counts")
+        self.holding_search = holding_search
         if (
             motion is None
             or controller.settings.staged_assist.motion_onset_confirm_displacement_rad
@@ -232,10 +247,10 @@ class B601AutomaticCalibrationSession:
             acquisition_arrival_tolerance_rad, "acquisition arrival tolerance"
         )
         if acquisition_arrival_tolerance_rad is not None and (
-            arrival_tolerance + 1e-12 < strict_tolerance or not spans
+            arrival_tolerance + 1e-12 < (strict_tolerance if holding_search is None else holding_search.movement_rad) or not spans
             or arrival_tolerance > min(spans) / 2 + 1e-12
         ):
-            raise ValueError("acquisition tolerance must lie between tracking tolerance and half the smallest planned move")
+            raise ValueError("acquisition tolerance must lie between the applicable tracking/holding tolerance and half the smallest planned move")
         if (
             acquisition_arrival_tolerance_rad is not None
             and max(spans) + arrival_tolerance
@@ -288,6 +303,17 @@ class B601AutomaticCalibrationSession:
         self._arrival_stationary_since: float | None = None
         self._arrival_min: tuple[float, ...] | None = None
         self._arrival_max: tuple[float, ...] | None = None
+        self._holding = None
+        self._holding_probe_nm = None
+        self._holding_observation = None
+        self._holding_pose = None
+        self._holding_leg_result = None
+        self._holding_attempts = 0
+        self._holding_reacquire_bias_nm = 0.0
+        self._holding_approach_origin = None
+        self._previous_sent_delta = (0.0,) * 6
+        self._previous_completed = None
+        self._previous_sent_driver_kd = None
 
     def _transition(self, state: str, reason: str, now: float) -> None:
         self._state, self._reason, self._phase_started = state, reason, now
@@ -505,9 +531,14 @@ class B601AutomaticCalibrationSession:
                     and human_intervention is False and permit is not None
                     and 0 <= permit_clock - permit <= self.limits.operator_lease_sec
                 ),
+                **({"calibration_hold_enabled": self._state == "moving",
+                    "calibration_probe_nm": self._holding_probe_nm if self._state == "moving" else None,
+                    "calibration_approach_bias_nm": self._holding_reacquire_bias_nm if self._state == "moving" else 0.0}
+                   if self.holding_search is not None else {}),
             )
             self._pending = (feedback_sequence, now)
-            audit = {**audit, "calibration_trial": self._marker()}
+            audit = {**audit, "calibration_trial": self._marker(),
+                "holding_calibration": self._holding_status()}
             return overlay, audit
 
     def _zero_dispatch(self) -> bool:
@@ -634,6 +665,8 @@ class B601AutomaticCalibrationSession:
                     self._release_exposure += exposure
                 else:
                     self._active_exposure += exposure
+            self._previous_sent_delta, self._previous_completed = self._sent_delta, self._last_completed
+            self._previous_sent_driver_kd = self._sent_driver_kd
             self._sent_delta = tuple(t - g for t, g in zip(total, gravity))
             self._sent_driver_kd = driver_kd
             self._last_dispatch_was_releasing = self._state == "releasing"
@@ -673,7 +706,7 @@ class B601AutomaticCalibrationSession:
                     if budget_reason:
                         self._transition("failed", budget_reason, now)
                         return
-                    if abs(error) > self.acquisition_arrival_tolerance_rad:
+                    if self._holding_leg_result is None and abs(error) > self.acquisition_arrival_tolerance_rad:
                         self._transition("failed", "stopped_short_of_target", now)
                         return
                     self._completed_legs.append(
@@ -689,13 +722,22 @@ class B601AutomaticCalibrationSession:
                             "tracking_arrival_tolerance_rad": self.controller.settings.staged_assist.settle_error_rad,
                             "acquisition_arrival_tolerance_rad": self.acquisition_arrival_tolerance_rad,
                             "command_exposure_nm_sec": self._leg_exposure,
+                            **({"holding_calibration": self._holding_leg_result,
+                                "arrival_semantics": "verified_nonzero_hold_then_separate_safe_withdrawal"}
+                               if self._holding_leg_result is not None else {}),
                         }
                     )
                     self._index += 1
                     self._leg_exposure = 0.0
+                    self._holding = self._holding_probe_nm = self._holding_observation = None
+                    self._holding_pose = self._holding_leg_result = None
+                    self._holding_attempts = 0
+                    self._holding_reacquire_bias_nm = 0.0
+                    self._holding_approach_origin = None
                     if self._index == len(self._steps):
                         self._transition(
                             "complete", (
+                                "holding_points_and_withdrawals_confirmed" if self.holding_search is not None else
                                 "all_targets_and_withdrawals_confirmed"
                                 if all(leg["tracking_target_reached"] for leg in self._completed_legs)
                                 else "all_legs_collected_with_target_deviation"
@@ -741,12 +783,15 @@ class B601AutomaticCalibrationSession:
             self.controller.submit("set_target", now_sec=now, target_offset_rad=offset)
             self._breakaway_consumed = False
             self._leg_started = now
+            self._holding_approach_origin = view["qpos_rad"]
             self._transition("moving", "target_submitted_after_arm_receipt", now)
         elif self._state == "moving":
             if view["release_terminal"]:
                 self._abort(now, f"owner_terminal_withdrawal:{view['reason']}")
             elif view["phase"] == "authority_exhausted":
                 self._abort(now, "insufficient_authority_no_automatic_retry")
+            elif self.holding_search is not None and view["phase"] in {"track", "brake"}:
+                self._advance_holding(view, now, driver_kd)
             elif view["phase"] == "soft_hold" and view["motion_phase"] == "soft_hold":
                 # Always unload first. A stop point captured with a conditioner
                 # tail or soft-hold torque cannot establish final arrival.
@@ -761,6 +806,145 @@ class B601AutomaticCalibrationSession:
             ):
                 self.controller.submit("authorize_breakaway", now_sec=now)
                 self._breakaway_consumed = True
+
+    def _holding_status(self, *, detailed=False):
+        if self.holding_search is None:
+            return None
+        return {"enabled": True, "search": None if self._holding is None else self._holding.status(detailed=detailed),
+                "probe_command_nm": self._holding_probe_nm,
+                "stage": ("withdrawal" if self._state == "releasing" else self._state if self._state != "moving"
+                    else "reacquire" if self._holding_probe_nm is None else "fixed_command_observation"),
+                "attempt_count": self._holding_attempts, "max_attempts": self.holding_search.max_trials,
+                "reacquire_bias_nm": self._holding_reacquire_bias_nm,
+                "sample_pose_rad": self._holding_pose,
+                "nominal_target_rad": self._steps[min(self._index, len(self._steps)-1)]["target_qpos_rad"],
+                "quantity": "software_command_not_measured_force", "auto_apply": False}
+
+    def _advance_holding(self, view, now, driver_kd):
+        config, j = self.holding_search, self._joint_index
+        q, stamp = view["qpos_rad"], view["feedback_timestamp_sec"]
+        target = self._steps[self._index]["target_qpos_rad"]
+        expected_kd = tuple(max(a,b) for a,b in zip(self.condition.driver_kd_nm_s_per_rad,
+            self.controller.settings.staged_assist.motion_control.drive_driver_kd_nm_s_per_rad))
+        if self._holding_probe_nm is None:
+            if (abs(q[j]-target[j]) > min(config.movement_rad, self.acquisition_arrival_tolerance_rad)
+                or view["arrival_stop_gate"] != "ready" or tuple(driver_kd) != expected_kd
+                or view["motion_reason"] not in {"bounded_reference_tracking", "target_reached_braking"}):
+                return
+            if self._holding is None:
+                self._holding = HoldingForceSearch(config, seed_nm=self._sent_delta[j],
+                    cap_nm=self.controller.settings.staged_assist.tracking_overlay_cap_nm)
+                self._holding_pose = q
+            elif max(abs(a-b) for a,b in zip(q, self._holding_pose)) > config.movement_rad:
+                return  # Do not compare different full-arm poses as one point.
+            if self._holding_attempts >= config.max_trials:
+                self._abort(now, "holding_search_incomplete")
+                return
+            self._holding_attempts += 1
+            self._holding_probe_nm = self._holding.candidate_nm
+            self._holding_observation = {"started_at_sec": None, "anchor_qpos_rad": q,
+                "minimum_rad": q, "maximum_rad": q, "ramp_frozen": False,
+                "requested_command_nm": self._holding_probe_nm,
+                "approach_from_qpos_rad": self._holding_approach_origin,
+                "reacquired_qpos_rad": q,
+                "reacquired_at_sec": now}
+            return
+        observation = self._holding_observation
+        if view["motion_reason"] != "calibration_fixed_command_observation":
+            # Real speed braking is never turned into a signed force sample.
+            # Resume only via the existing finite governor/point budgets.
+            observation.update(outcome="censored_owner_brake", completed_at_sec=now)
+            self._events.append({"time_sec": now, "state": "holding_observation", **observation})
+            self._holding_probe_nm = self._holding_observation = None
+            self._holding_reacquire_bias_nm = 0.0  # A real brake invalidates the probe handoff.
+            self._holding_approach_origin = q
+            return
+        if (observation["started_at_sec"] is not None
+            and now - observation["started_at_sec"] > config.observation_timeout_sec):
+            self._abort(now, "holding_search_incomplete")
+            return
+        # Feedback precedes THIS receipt. Only the preceding complete command
+        # can have caused it; starting at this receipt would backdate evidence.
+        previous = self._previous_sent_delta[j]
+        plateau = (self._previous_completed is not None and stamp > self._previous_completed
+                   and abs(previous-self._holding_probe_nm) <= 1e-9
+                   and abs(self._sent_delta[j]-self._holding_probe_nm) <= 1e-9
+                   and all(abs(self._previous_sent_delta[i]) <= 1e-9 and abs(self._sent_delta[i]) <= 1e-9
+                           for i in range(6) if i != j)
+                   and self._previous_sent_driver_kd == expected_kd
+                   and tuple(driver_kd) == expected_kd)
+        if not plateau:
+            observation["started_at_sec"] = None
+            if (not observation["ramp_frozen"]
+                and abs(q[j]-observation["anchor_qpos_rad"][j]) >= config.movement_rad
+                and (self._holding_probe_nm-previous)*(q[j]-observation["anchor_qpos_rad"][j]) > 0):
+                # Stop the ramp at the command that was actually in force.
+                # Subsequent evidence must come from its constant plateau.
+                observation["ramp_frozen"] = True
+                self._holding_probe_nm = previous
+            return
+        if observation["started_at_sec"] is None:
+            if (abs(q[j]-target[j]) > config.movement_rad
+                or max(abs(a-b) for a,b in zip(q,self._holding_pose)) > config.movement_rad):
+                self._events.append({"time_sec": now, "state": "holding_observation",
+                    **observation, "outcome": "censored_plateau_outside_point"})
+                self._holding_reacquire_bias_nm = self._sent_delta[j]
+                self._holding_probe_nm = self._holding_observation = None
+                self._holding_approach_origin = q
+                return
+            observation.update(started_at_sec=stamp, first_causal_receipt_at_sec=self._previous_completed,
+                anchor_qpos_rad=q, minimum_rad=q, maximum_rad=q)
+            return
+        observation["minimum_rad"] = tuple(min(a,b) for a,b in zip(observation["minimum_rad"],q))
+        observation["maximum_rad"] = tuple(max(a,b) for a,b in zip(observation["maximum_rad"],q))
+        delta = q[j]-observation["anchor_qpos_rad"][j]
+        elapsed = stamp-observation["started_at_sec"]
+        outcome = None
+        velocity = view["control_qvel_rad_s"][j]
+        if (elapsed >= self.controller.settings.staged_assist.motion_control.velocity_window_sec
+            and abs(delta) >= config.movement_rad and delta*velocity > 0
+            and delta*view["raw_qvel_rad_s"][j] > 0):
+            outcome = "positive_motion" if delta > 0 else "negative_motion"
+        elif elapsed >= config.observation_sec:
+            span = max(b-a for a,b in zip(observation["minimum_rad"],observation["maximum_rad"]))
+            if (span <= config.movement_rad and view["arrival_stop_gate"] == "ready"
+                and abs(q[j]-target[j]) <= config.movement_rad):
+                outcome = "stationary"
+            elif span <= config.movement_rad and view["arrival_stop_gate"] == "ready":
+                # A preload release can move during the ramp and then stop.
+                # Reacquire and repeat; this is not evidence of sustained
+                # movement at the final plateau or an in-pose hold sample.
+                self._events.append({"time_sec": now, "state": "holding_observation",
+                    **observation, "outcome": "censored_settled_outside_point"})
+                self._holding_reacquire_bias_nm = self._sent_delta[j]
+                self._holding_probe_nm = self._holding_observation = None
+                self._holding_approach_origin = q
+                return
+        if outcome is None:
+            return
+        observation.update(completed_at_sec=now, final_qpos_rad=q,
+            gravity_nm=view["gravity_command_nm"],
+            driver_kd_nm_s_per_rad=tuple(driver_kd),
+            net_approach_direction=(0 if abs(observation["reacquired_qpos_rad"][j]-observation["approach_from_qpos_rad"][j])
+                < self.controller.settings.staged_assist.motion_control.position_resolution_rad else
+                1 if observation["reacquired_qpos_rad"][j] > observation["approach_from_qpos_rad"][j] else -1),
+            nominal_target_rad=target)
+        # Guard against a changing support posture during the observation.
+        if max(abs(q[i]-self._holding_pose[i]) for i in range(6) if i != j) > config.movement_rad:
+            self._abort(now, "holding_search_incomplete")
+            return
+        self._holding.record(command_nm=self._holding_probe_nm, outcome=outcome, evidence=dict(observation))
+        self._events.append({"time_sec": now, "state": "holding_observation", **observation,
+            "command_nm": self._holding_probe_nm, "outcome": outcome})
+        self._holding_reacquire_bias_nm = self._sent_delta[j]
+        self._holding_probe_nm = self._holding_observation = None
+        self._holding_approach_origin = q
+        if self._holding.state == "complete":
+            self._holding_leg_result = self._holding.status(detailed=True)
+            self.controller.submit("withdraw", now_sec=now)
+            self._transition("releasing", "holding_point_verified_withdrawal_pending", now)
+        elif self._holding.state == "incomplete":
+            self._abort(now, "holding_search_incomplete")
 
     def result_record(self) -> dict[str, Any]:
         """Return one trace record; the caller reuses its existing log writer."""
@@ -804,6 +988,7 @@ class B601AutomaticCalibrationSession:
                 "exposure_semantics": "software_command_not_mechanical_energy_or_measured_torque",
                 "pending_dispatch": self._pending is not None,
                 "hardware_execution_allowed": False,
+                "holding_calibration": self._holding_status(detailed=True),
             }
 
     def owner_snapshot(self) -> dict[str, Any]:
@@ -813,4 +998,5 @@ class B601AutomaticCalibrationSession:
                 "state": self._state,
                 "reason": self._reason,
                 "step_index": self._index,
+                "holding_calibration": self._holding_status(),
             }

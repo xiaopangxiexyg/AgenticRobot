@@ -283,9 +283,13 @@ function renderWorkspace(batch) {
     advancing: "准备下一阶段", stopping: "撤力停稳", complete: "多位姿采集完成",
     failed: batch.outcome?.severity === "warning" ? "采集未完成 · 告警，数据保留" : "采集故障 · 已停止",
     cancelled: "已撤销"};
-  const label = names[workspace.phase] || workspace.phase;
+  const label = workspace.phase === "sweep" && workspace.holding_search_enabled
+    ? "定点保持命令搜索" : names[workspace.phase] || workspace.phase;
   const ranges = workspace.acquisition_ranges_deg || {joint2: [0, 10], joint3: [0, 10]};
   el("automatic-mode-title").textContent = "J2/J3 多位姿自动采集 · 重力优先";
+  if (workspace.holding_search_enabled) {
+    el("automatic-mode-title").textContent = "J2/J3 多位姿采集 · 等效保持命令搜索候选";
+  }
   el("automatic-mode-note").textContent = `本批采集范围 J2 ${ranges.joint2.join("–")}°、J3 ${ranges.joint3.join("–")}°；从 J2/J3 零位附近（不超过 ${workspace.maximum_start_angle_deg ?? 2}°）开始，先展开 J3 再移动 J2，返回时顺序相反。完整机械角度范围不等于任意组合可达；本功能不替代自碰撞/环境检查。J2 −0.3° 只作已有反馈边界处理，不生成负目标。`;
   el("arm").textContent = "开始 J2/J3 多位姿自动采集";
   el("withdraw").textContent = "停止采集并撤力（不自动返回）";
@@ -300,10 +304,23 @@ function renderWorkspace(batch) {
   const target = Number.isFinite(task?.target) ? `，换位目标 ${number(task.target * 180 / Math.PI, 2)}°` : "";
   const reason = workspace.reason === "leg_timeout" ? "本段在时限内未完成（leg_timeout）" : workspace.reason;
   el("automatic-progress").textContent = `${label}；任务 ${workspace.task_index}/${workspace.task_count}；关节采集 ${workspace.completed_joint_acquisitions}/${workspace.expected_joint_acquisitions}；当前 ${task?.joint || "六轴观察"}${target}；原因 ${reason}；命令暴露 ${number(workspace.command_exposure_nm_sec, 2)} / ${number(workspace.max_command_exposure_nm_sec, 2)} N·m·s（非实测能量）。`;
+  const holding = workspace.holding_calibration;
+  if (holding?.enabled) {
+    const search = holding.search;
+    const stages = {reacquire: "缓慢返回同一目标并等待稳定", fixed_command_observation: "定命令观察", withdrawal: "观测保留，正在撤力停稳", failed: "采样已停止", cancelled: "已撤销", complete: "已完成"};
+    el("automatic-progress").textContent += ` 保持力搜索：${stages[holding.stage] || holding.stage}；尝试 ${holding.attempt_count}/${holding.max_attempts}；本次附加命令 ${number(holding.probe_command_nm)} N·m；已记录 ${search?.trial_count ?? 0} 次；${search?.reason ?? "等待到点"}。`;
+    el("automatic-trials").textContent = `可用保持命令 ${number(search?.usable_hold_nm)} N·m；已观察静止范围 ${(search?.observed_stationary_range_nm || []).map(v => number(v)).join(" ～ ") || "尚无"}。这是软件命令与编码器响应，不是实测保持力或唯一重力修正。`;
+  }
   const centres = (workspace.pose_centres_rad || []).map(q => `(${number(q[0] * 180 / Math.PI, 0)}°, ${number(q[1] * 180 / Math.PI, 0)}°)`).join(" → ");
   el("automatic-data-status").textContent = `配置组：${workspace.setup_label}。采样中心 (J2,J3)：${centres}。重力参数本轮冻结；保存已完成段与未完成段，数据质量和流程状态分开。不自动安装重力或摩擦补偿；本阶段不执行静摩擦阈值扫描。`;
-  el("automatic-trials").textContent = "";
+  if (workspace.holding_search_enabled) {
+    el("automatic-data-status").textContent += ` 局部采样半径 ${number(workspace.local_excursion_rad, 4)} rad。本轮另存定点保持命令、偏移方向和复验结果；它们不等于唯一重力修正，后续撤力失败不回溯作废已确认观测。`;
+  }
+  if (!holding?.enabled) el("automatic-trials").textContent = "";
   el("automatic-sequence-note").textContent = "本阶段先采集零驱动力下的重力漂移，再采集 J2/J3 双向双速度运动，不执行额外静摩擦阈值扫描。软件力矩命令不是实测受力；不会自动安装补偿。";
+  if (holding?.enabled) {
+    el("automatic-sequence-note").textContent = "本候选到点后搜索可重复的非零保持命令；撤力回退用于下一次试探，不要求每个点都能零助力保持。取消或结束仍单独确认撤力与停稳，不自动安装补偿。";
+  }
   const ready = batch.cycle?.disable_confirmation_available === true && state.stop_controls_available === true;
   el("cycle-disable-hint").hidden = !ready;
   if (ready) {

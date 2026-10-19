@@ -375,6 +375,9 @@ class B601StagedSingleJointAssistRuntime:
         self._previous_overlay_nm = 0.0
         self._tracking_bias_nm = 0.0
         self._tracking_recovery_permitted = False
+        self._calibration_hold_enabled = False
+        self._calibration_probe_nm = None
+        self._calibration_approach_bias_nm = 0.0
         self._tracking_recovery: dict[str, object] | None = None
         self._motion = (
             None if staged_config.motion_control is None
@@ -767,10 +770,34 @@ class B601StagedSingleJointAssistRuntime:
         control_qvel_window_span_sec: float | None = None,
         stop_evidence: B601WindowStopEvidence | None = None,
         tracking_recovery_permitted: bool = False,
+        calibration_hold_enabled: bool = False,
+        calibration_probe_nm: float | None = None,
+        calibration_approach_bias_nm: float = 0.0,
     ) -> B601StagedAssistFrame:
         if type(tracking_recovery_permitted) is not bool:
             raise TypeError("tracking recovery permission must be boolean")
         self._tracking_recovery_permitted = tracking_recovery_permitted
+        if type(calibration_hold_enabled) is not bool or calibration_hold_enabled and not tracking_recovery_permitted:
+            raise ValueError("holding calibration requires the fresh acquisition permit")
+        if calibration_probe_nm is not None and (
+            not calibration_hold_enabled or isinstance(calibration_probe_nm, bool)
+            or not math.isfinite(calibration_probe_nm)
+            or abs(calibration_probe_nm) > self.config.tracking_overlay_cap_nm + 1e-9
+        ):
+            raise ValueError("holding probe exceeds the existing tracking envelope")
+        self._calibration_hold_enabled = calibration_hold_enabled
+        bias = _finite(calibration_approach_bias_nm, name="calibration approach bias")
+        if abs(bias) > self.config.tracking_overlay_cap_nm + 1e-9 or bias and not calibration_hold_enabled:
+            raise ValueError("calibration approach bias requires the existing permitted tracking envelope")
+        if self._calibration_probe_nm is not None and calibration_probe_nm is None:
+            # A fixed command contains no PD/integral decomposition to carry
+            # forward. The session transfers its actual total as a separate
+            # temporary approach bias; erase the old integral to avoid double
+            # counting. Withdrawal never receives that temporary bias.
+            self._tracking_bias_nm = 0.0
+        self._calibration_approach_bias_nm = max(-self.config.tracking_overlay_cap_nm, min(self.config.tracking_overlay_cap_nm, bias))
+        self._calibration_probe_nm = (None if calibration_probe_nm is None else
+            max(-self.config.tracking_overlay_cap_nm, min(self.config.tracking_overlay_cap_nm, calibration_probe_nm)))
         base_frame = self._runtime.step(
             control_sequence=control_sequence,
             control_timestamp_sec=control_timestamp_sec,
@@ -1114,6 +1141,8 @@ class B601StagedSingleJointAssistRuntime:
             speed_governor_permitted=(self.config.onset_handoff == "track"
                                       and self._tracking_recovery_permitted),
             zero_dispatch_confirmed=self._final_zero_confirmed,
+            calibration_hold_enabled=self._calibration_hold_enabled and not request_brake,
+            calibration_probe_nm=self._calibration_probe_nm if not request_brake else None,
         )
         self._motion_frame = motion
         self._phase = B601StagedAssistPhase(motion.phase)
@@ -1134,8 +1163,25 @@ class B601StagedSingleJointAssistRuntime:
             return 0.0
         cap = self.config.capture_overlay_cap_nm if capture else self.config.tracking_overlay_cap_nm
         requested = motion.requested_torque_nm
+        if motion.reason == "calibration_fixed_command_observation":
+            # No tracking PD, velocity cut or integral update contaminates a
+            # fixed-command observation. The tracker has already admitted all
+            # feedback and speed gates; final owner conditioning is unchanged.
+            self._tracking_recovery = {"reason": motion.reason,
+                "maintenance_bias_nm": self._tracking_bias_nm,
+                "combined_request_nm": requested, "integral_frozen": True}
+            self._phase = B601StagedAssistPhase.TRACK
+            return self._responsive_tracking_output(
+                max(-cap, min(cap, requested)), control_v, dt)
         if self.config.tracking_recovery_gain_nm_per_rad is not None:
             requested = self._tracking_recovery_output(motion, base_frame, dt, control_v, cap)
+        if self._calibration_hold_enabled and (
+            motion.phase == "track" or motion.arrival_stabilization_active
+        ):
+            requested += base_frame.decision.state.authority * self._calibration_approach_bias_nm
+            if self._tracking_recovery is not None:
+                self._tracking_recovery.update(calibration_approach_bias_nm=self._calibration_approach_bias_nm,
+                    combined_request_nm=requested)
         continuous_arrival = (motion.arrival_stabilization_active
             and self.config.motion_control.continuous_speed_limit_rad_s is not None)
         if (motion.phase == "track" and motion.continuous_speed_scale is not None

@@ -9,6 +9,7 @@ import time
 from dataclasses import asdict, dataclass, replace
 
 from robot_motion.rebot_b601_rs.calibration import finite, plan_local_sweeps, six
+from robot_motion.rebot_b601_rs.holding_calibration import HoldingSearchConfig
 from robot_motion.rebot_b601_rs.model import B601_RS_ARM_JOINT_NAMES
 
 from .calibration_session import (
@@ -43,8 +44,18 @@ class WorkspaceCalibrationConfig:
     max_command_exposure_nm_sec: float = 2400.0
     background_permit_timeout_sec: float = 70.0
     setup_label: str = "temporary_end_effector"
+    holding_search: HoldingSearchConfig | None = None
+    holding_excursion_rad: float | None = None
 
     def __post_init__(self):
+        if isinstance(self.holding_search, dict):
+            object.__setattr__(self, "holding_search", HoldingSearchConfig(**self.holding_search))
+        if self.holding_search is not None and not isinstance(self.holding_search, HoldingSearchConfig):
+            raise TypeError("holding search must be an explicit configuration object")
+        if self.holding_excursion_rad is not None and (
+            self.holding_search is None or finite(self.holding_excursion_rad, "holding excursion") <= 0
+        ):
+            raise ValueError("holding excursion requires the explicit holding search")
         if type(self.positioning_support_soft_speed_recovery) is not bool:
             raise TypeError("workspace positioning support recovery must be boolean")
         for name, upper in (("joint2_centres_deg", 120), ("joint3_centres_deg", 90)):
@@ -89,6 +100,13 @@ class WorkspaceCalibrationConfig:
             for j3 in (self.joint3_centres_deg if row % 2 == 0 else reversed(self.joint3_centres_deg))
         )
 
+    def local_excursion_rad(self, calibration):
+        if self.holding_excursion_rad is None:
+            return calibration.sweep_excursion_rad
+        if not 2 * self.holding_search.movement_rad < self.holding_excursion_rad <= calibration.sweep_excursion_rad:
+            raise ValueError("holding targets must fit the existing local sweep and measurement neighbourhood")
+        return self.holding_excursion_rad
+
     def tasks(self, origin_qpos_rad):
         origin = six(origin_qpos_rad, "workspace origin")
         tasks = []
@@ -126,6 +144,15 @@ class B601WorkspaceCalibrationController:
         motion = self.settings.staged_assist.motion_control
         if motion is None or not motion.responsive_tracking_brake or config.motion_plan != "local_identification":
             raise ValueError("workspace acquisition requires the explicit local identification profile")
+        if workspace.holding_search is not None and (
+            motion.continuous_speed_limit_rad_s is None
+            or config.motion_acquisition_arrival_tolerance_rad is None
+            or workspace.holding_search.movement_rad < 4 * (motion.position_resolution_rad or 0.0)
+            or workspace.holding_search.observation_timeout_sec >= config.max_sweep_leg_sec
+            or workspace.holding_search.movement_rad >= config.motion_acquisition_arrival_tolerance_rad
+        ):
+            raise ValueError("holding search must fit resolved continuous motion, point duration and arrival envelope")
+        workspace.local_excursion_rad(config)
         tolerance = config.motion_acquisition_arrival_tolerance_rad
         if tolerance is None or not 2 * tolerance < workspace.maximum_positioning_step_rad <= settings.maximum_target_offset_rad:
             raise ValueError("workspace positioning steps must fit the existing local target envelope and tolerance")
@@ -310,13 +337,14 @@ class B601WorkspaceCalibrationController:
             else:
                 plan = plan_local_sweeps(condition=self._condition, joint_name=joint,
                     anchor_qpos_rad=self._q, position_limits_rad=self._position_limits,
-                    excursion_rad=self.config.sweep_excursion_rad,
+                    excursion_rad=self.workspace.local_excursion_rad(self.config),
                     speeds_rad_s=self.config.sweep_speeds_rad_s,
                     max_reference_velocity_rad_s=self.settings.staged_assist.motion_control.max_reference_velocity_rad_s,
                     purpose="local_identification")
                 for step in plan["steps"]:
                     step["trial_id"] = f"w{self._index}:{joint}:{step['trial_id']}"
-                tolerance = self.config.motion_acquisition_arrival_tolerance_rad
+                tolerance = (self.workspace.holding_search.movement_rad if self.workspace.holding_search is not None
+                    else self.config.motion_acquisition_arrival_tolerance_rad)
             controller = self._make_controller(joint, positioning=kind != "sweep")
             session = B601AutomaticCalibrationSession(controller, plan=plan,
                 condition=self._condition, position_limits_rad=self._position_limits,
@@ -325,7 +353,8 @@ class B601WorkspaceCalibrationController:
                     self.settings.staged_assist.motion_control.max_control_gap_sec,
                     self.config.max_sweep_command_exposure_nm_sec,
                     self.config.max_sweep_leg_command_exposure_nm_sec),
-                acquisition_arrival_tolerance_rad=tolerance)
+                acquisition_arrival_tolerance_rad=tolerance,
+                holding_search=self.workspace.holding_search if kind == "sweep" else None)
             self._delegate, self._session = controller, session
             self._child_created_at = now
             return
@@ -525,6 +554,10 @@ class B601WorkspaceCalibrationController:
             "max_command_exposure_nm_sec": self.workspace.max_command_exposure_nm_sec,
             "origin_qpos_rad": self._origin, "current_qpos_rad": self._q,
             "auto_apply": False, "gravity_parameters_frozen": True,
+            "holding_search_enabled": self.workspace.holding_search is not None,
+            "local_excursion_rad": self.workspace.local_excursion_rad(self.config),
+            "holding_calibration": (None if self._session is None else
+                self._session.owner_snapshot().get("holding_calibration")),
             "quantity": "software_command_and_encoder_response_not_measured_force"}
         if detailed:
             acquisitions = list(self._acquisitions)

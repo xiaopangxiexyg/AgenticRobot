@@ -171,6 +171,26 @@ def build_automatic_report(run_dir: Path) -> dict:
         report["gravity_identification"] = {
             "status": "REQUIRES_PAIRED_MOTION_ANALYSIS", "auto_apply": False,
             "gravity_parameters_frozen": True, "setup_label": result["workspace"]["setup_label"]}
+        holds = []
+        for stage in result["workspace"].get("acquisitions", []):
+            child = stage["result"]
+            for leg in child.get("completed_legs", []):
+                if leg.get("holding_calibration") is not None:
+                    holds.append({"joint": stage["task"]["joint"], "pose": stage["task"]["pose"],
+                        "trial_id": leg["trial_id"], "withdrawal_confirmed": True,
+                        **leg["holding_calibration"]})
+            pending = child.get("holding_calibration")
+            if pending and pending.get("search"):
+                # Completed observations survive a later withdrawal failure.
+                holds.append({"joint": stage["task"]["joint"], "pose": stage["task"]["pose"],
+                    "withdrawal_confirmed": False, "sample_pose_rad": pending["sample_pose_rad"],
+                    "nominal_target_rad": pending["nominal_target_rad"], **pending["search"]})
+        if holds:
+            verified = sum(h["state"] == "complete" for h in holds)
+            report["holding_calibration"] = {"status": "VERIFIED_COMMAND_HOLDS_AVAILABLE" if verified else "PARTIAL_COMMAND_OBSERVATIONS",
+                "verified_points": verified, "points": holds, "auto_apply": False,
+                "identifies_unique_gravity": False,
+                "quantity": "software_command_not_measured_force"}
     report["release_support_observations"] = [
         {"trial_sequence": trial["trial_sequence"], **trial["release_support_observation"]}
         for trial in result["onset_trials"] if trial.get("release_support_observation") is not None

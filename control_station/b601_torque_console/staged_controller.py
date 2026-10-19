@@ -223,6 +223,8 @@ class B601StagedTorqueConsoleController:
                 "reason": None if frame is None else frame.reason,
                 "fault": self._fault, "feedback_timestamp_sec": self._last_step_sec,
                 "qpos_rad": self._qpos, "anchor_qpos_rad": self._anchor_qpos,
+                "control_qvel_rad_s": self._control_qvel,
+                "raw_qvel_rad_s": self._qvel,
                 "target_offset_rad": self._target_offset_rad,
                 "overlay_torque_nm": self._last_overlay,
                 "prepare_gate": self._stationary_gate_reason(self.limits.stationarity_limit_rad_s, all_joints=True),
@@ -230,6 +232,8 @@ class B601StagedTorqueConsoleController:
                 "breakaway_gate": self._breakaway_gate_reason(),
                 "motion_phase": None if frame is None or frame.motion is None else frame.motion.phase,
                 "target_error_rad": None if frame is None or frame.motion is None else frame.motion.target_error_rad,
+                "motion_reason": None if frame is None or frame.motion is None else frame.motion.reason,
+                "gravity_command_nm": None if self._last_dispatch is None else self._last_dispatch["gravity_nm"],
                 "release_failed": False if frame is None else frame.release_failed,
                 "release_terminal": False if frame is None else frame.release_terminal,
             }
@@ -422,6 +426,9 @@ class B601StagedTorqueConsoleController:
         qpos_rad: tuple[float, ...],
         qvel_rad_s: tuple[float, ...],
         tracking_recovery_permitted: bool = False,
+        calibration_hold_enabled: bool = False,
+        calibration_probe_nm: float | None = None,
+        calibration_approach_bias_nm: float = 0.0,
     ) -> tuple[tuple[float, ...], dict[str, object]]:
         now = _finite(now_sec, name="now_sec")
         qpos = tuple(_finite(value, name="qpos_rad") for value in qpos_rad)
@@ -555,6 +562,9 @@ class B601StagedTorqueConsoleController:
                 control_qvel_window_span_sec=self._window_span(),
                 stop_evidence=stop_evidence,
                 tracking_recovery_permitted=tracking_recovery_permitted,
+                calibration_hold_enabled=calibration_hold_enabled,
+                calibration_probe_nm=calibration_probe_nm,
+                calibration_approach_bias_nm=calibration_approach_bias_nm,
             )
             overlay = frame.overlay_torque_nm
             previous_stage_phase = (

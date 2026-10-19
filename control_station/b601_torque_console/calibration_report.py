@@ -46,6 +46,10 @@ class _CommandWindow:
 
 
 def _admission_reason(row: dict[str, Any], trial: dict[str, Any]) -> str | None:
+    if ((row.get("torque_console") or {}).get("holding_calibration") or {}).get("enabled"):
+        # Holding/reacquisition deliberately probes static bias and preload.
+        # Keep its raw data, but never silently train the running model on it.
+        return "holding_search_not_running_resistance"
     if trial["end_sec"] is None or trial["end_reason"] not in (
         "context_change",
         "owner_closed",

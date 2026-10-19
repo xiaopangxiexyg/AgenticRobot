@@ -116,7 +116,7 @@ def nominal_segments(workspace, config, origin, condition):
         elif task["kind"] == "sweep":
             plan = plan_local_sweeps(condition=condition, joint_name=task["joint"],
                 anchor_qpos_rad=q, position_limits_rad=limits,
-                excursion_rad=config.sweep_excursion_rad, speeds_rad_s=config.sweep_speeds_rad_s,
+                excursion_rad=workspace.local_excursion_rad(config), speeds_rad_s=config.sweep_speeds_rad_s,
                 max_reference_velocity_rad_s=max(config.sweep_speeds_rad_s), purpose="local_identification")
             targets = [step["target_qpos_rad"][int(task["joint"][-1])-1] for step in plan["steps"]]
         else:
