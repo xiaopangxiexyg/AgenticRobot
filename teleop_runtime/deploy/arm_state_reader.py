@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import inspect
 import math
 import time
 from collections.abc import Callable, Mapping
@@ -33,6 +32,7 @@ from robot_motion.runtime.pose_observation import (
 )
 
 from ..interfaces import EffectorBackend
+from .backend_state import read_backend_state
 
 REAL_ARM_QPOS_MEASUREMENT_HASH_DOMAIN_V1 = (
     "dexteleop.real_arm.hardware_qpos_measurement.v1"
@@ -107,28 +107,7 @@ def _read_backend_state(
         "include_pose_source_attestation": False,
         "include_background_streaming": False,
     }
-    try:
-        parameters = inspect.signature(method).parameters
-    except (TypeError, ValueError):
-        return method()
-    accepts_arbitrary_keywords = any(
-        parameter.kind is inspect.Parameter.VAR_KEYWORD
-        for parameter in parameters.values()
-    )
-    supported_arguments = {
-        name: value
-        for name, value in optional_arguments.items()
-        if accepts_arbitrary_keywords
-        or (
-            name in parameters
-            and parameters[name].kind
-            in {
-                inspect.Parameter.POSITIONAL_OR_KEYWORD,
-                inspect.Parameter.KEYWORD_ONLY,
-            }
-        )
-    }
-    return method(**supported_arguments)
+    return read_backend_state(method, optional_arguments=optional_arguments)
 
 
 @dataclass(frozen=True)

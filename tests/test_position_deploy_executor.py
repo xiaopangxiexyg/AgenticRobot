@@ -4378,3 +4378,228 @@ def test_failed_close_is_rethrown_to_concurrent_and_later_callers(
     with pytest.raises(RuntimeError) as later:
         executor.close()
     assert later.value is close_error
+
+
+@pytest.mark.parametrize("healthy", [True, False])
+def test_position_dispatch_health_omits_unused_work_but_keeps_live_stream(healthy) -> None:
+    class SelectiveBackend:
+        def __init__(self):
+            self.calls = []
+
+        def is_ready(self):
+            return True
+
+        def get_state(self, *, include_derived_pose=True, include_timing_percentiles=True,
+                      include_pose_source_attestation=True, include_background_streaming=False):
+            self.calls.append((include_derived_pose, include_timing_percentiles,
+                               include_pose_source_attestation, include_background_streaming))
+            assert not include_derived_pose and not include_timing_percentiles
+            assert not include_pose_source_attestation
+            assert include_background_streaming
+            return {"hardware_ready": True, "background_streaming": {
+                "enabled": True, "healthy": healthy, "thread_alive": True,
+                "health_reasons": [] if healthy else ["low_send_rate"],
+                "target_active": True, "target_stale": False, "fault": None}}
+
+    backend = SelectiveBackend()
+    health = inspect_arm_backends_for_position_dispatch(
+        {"right": backend}, require_background_target=True)
+    assert backend.calls == [(False, False, False, True)]
+    assert health["ready"] is healthy
+    assert health["sides"]["right"]["warnings"] == ([] if healthy else ["low_send_rate"])
+
+
+def test_position_dispatch_health_uses_real_backend_without_fk_or_percentiles(monkeypatch) -> None:
+    from teleop_runtime.backends.arms.rm65 import RM65ArmBackend, RM65ArmBackendConfig
+
+    backend = RM65ArmBackend(RM65ArmBackendConfig(
+        side="right", arm_ip="0.0.0.0", connect_hardware=False,
+        initial_qpos=np.zeros(6), background_streaming_enabled=True))
+    backend._hardware_ready = True
+    backend._stream_thread = SimpleNamespace(is_alive=lambda: True)
+    backend._stream_warning = {"active": True}
+    expensive_calls = []
+
+    def expensive(*args, **kwargs):
+        expensive_calls.append(True)
+        raise AssertionError("unused derived work must not run in a health read")
+
+    monkeypatch.setattr(backend, "compute_tcp_pose", expensive)
+    monkeypatch.setattr(backend, "_background_stream_timing_percentiles_snapshot", expensive)
+    try:
+        health = inspect_arm_backends_for_position_dispatch(
+            {"right": backend}, require_background_target=False)
+        assert not expensive_calls
+        assert health["ready"] is False
+        assert health["sides"]["right"]["background_streaming"]["health_reasons"] == ["low_send_rate"]
+        assert health["sides"]["right"]["warnings"] == ["low_send_rate"]
+    finally:
+        backend._stream_thread = None
+        backend.close()
+
+
+def test_position_dispatch_health_does_not_retry_a_backend_type_error() -> None:
+    class BrokenBackend:
+        calls = 0
+
+        def is_ready(self):
+            return True
+
+        def get_state(self, *, include_derived_pose=True):
+            self.calls += 1
+            assert include_derived_pose is False
+            raise TypeError("internal snapshot failure")
+
+    backend = BrokenBackend()
+    health = inspect_arm_backends_for_position_dispatch(
+        {"right": backend}, require_background_target=True)
+    assert backend.calls == 1
+    assert health["ready"] is False
+    assert health["sides"]["right"]["state_error"] == "TypeError: internal snapshot failure"
+    assert "state_error" in health["sides"]["right"]["reasons"]
+
+
+@pytest.mark.parametrize("kind", ["legacy", "explicit", "partial", "arbitrary", "positional_only", "unavailable_type", "unavailable_value"])
+def test_shared_backend_snapshot_options_follow_declared_signature_once(monkeypatch, kind):
+    from teleop_runtime.deploy import backend_state
+
+    calls = []
+    marker = object()
+    options = {"include_derived_pose": False, "include_timing_percentiles": False,
+               "include_pose_source_attestation": False, "include_background_streaming": True}
+    if kind in {"legacy", "unavailable_type", "unavailable_value"}:
+        def read():
+            calls.append({})
+            return marker
+        expected = {}
+    elif kind == "explicit":
+        def read(*, include_derived_pose=True, include_timing_percentiles=True,
+                 include_pose_source_attestation=True, include_background_streaming=False):
+            calls.append(dict(include_derived_pose=include_derived_pose, include_timing_percentiles=include_timing_percentiles,
+                              include_pose_source_attestation=include_pose_source_attestation, include_background_streaming=include_background_streaming))
+            return marker
+        expected = options
+    elif kind == "partial":
+        def read(*, include_derived_pose=True):
+            calls.append({"include_derived_pose": include_derived_pose})
+            return marker
+        expected = {"include_derived_pose": False}
+    elif kind == "positional_only":
+        def read(include_derived_pose=True, /):
+            calls.append({"positional_default": include_derived_pose})
+            return marker
+        expected = {"positional_default": True}
+    else:
+        def read(**kwargs):
+            calls.append(kwargs)
+            return marker
+        expected = options
+    if kind.startswith("unavailable_"):
+        original = backend_state.inspect.signature
+        def signature(method):
+            if method is read:
+                raise (TypeError if kind == "unavailable_type" else ValueError)("signature unavailable")
+            return original(method)
+        monkeypatch.setattr(backend_state.inspect, "signature", signature)
+    assert backend_state.read_backend_state(read, optional_arguments=options) is marker
+    assert calls == [expected]
+
+
+def test_shared_backend_snapshot_does_not_retry_internal_type_error():
+    from teleop_runtime.deploy.backend_state import read_backend_state
+
+    calls = []
+    def read(*, include_derived_pose=True):
+        calls.append(include_derived_pose)
+        raise TypeError("internal snapshot failure")
+    with pytest.raises(TypeError, match="internal snapshot failure"):
+        read_backend_state(read, optional_arguments={"include_derived_pose": False})
+    assert calls == [False]
+
+
+def test_health_and_qpos_consumers_keep_distinct_snapshot_options_and_full_audit():
+    from teleop_runtime.deploy import arm_state_reader, dispatch
+
+    class Backend:
+        calls = []
+        def is_ready(self):
+            return True
+        def get_state(self, *, include_derived_pose=True, include_timing_percentiles=True,
+                      include_pose_source_attestation=True, include_background_streaming=True):
+            self.calls.append((include_derived_pose, include_timing_percentiles,
+                               include_pose_source_attestation, include_background_streaming))
+            return {"hardware_ready": True, "hardware_qpos": [0.]*6,
+                    "background_streaming": {"enabled": True, "healthy": True, "thread_alive": True,
+                        "health_reasons": [], "target_active": True, "target_stale": False, "fault": None},
+                    "full_audit_marker": "full" if include_derived_pose else "lean"}
+    backend = Backend()
+    qpos = arm_state_reader._read_backend_state(backend.get_state, raw_hardware_qpos_only=True)
+    assert qpos["hardware_qpos"] == [0.]*6
+    health = dispatch.inspect_arm_backends_for_position_dispatch({"right": backend}, require_background_target=True)
+    assert health["ready"] is True
+    assert arm_state_reader._read_backend_state(backend.get_state, raw_hardware_qpos_only=False)["full_audit_marker"] == "full"
+    full, error = dispatch._safe_backend_state(backend)
+    assert error is None and full["full_audit_marker"] == "full"
+    assert backend.calls == [(False, False, False, False), (False, False, False, True),
+                             (True, True, True, True), (True, True, True, True)]
+
+
+@pytest.mark.parametrize("case", ["ready", "not_ready", "hardware_not_ready", "emergency", "send_error", "low_rate", "stale", "fault", "unknown_unhealthy"])
+def test_lean_health_retains_identical_canonical_rejections(monkeypatch, case):
+    from teleop_runtime.deploy import dispatch
+
+    state = {"hardware_ready": case != "hardware_not_ready", "emergency_stopped": case == "emergency",
+        "send_result_code": 1 if case == "send_error" else 0,
+        "singularity_metadata": {"source": "native-owner", "sequence": 9},
+        "background_streaming": {"enabled": True, "healthy": True, "thread_alive": True,
+            "health_reasons": [], "target_active": True, "target_stale": False, "fault": None}}
+    stream = state["background_streaming"]
+    if case == "low_rate":
+        stream.update(healthy=False, health_reasons=["low_send_rate"], warning={"active": True})
+    elif case == "stale":
+        stream.update(healthy=False, target_stale=True, health_reasons=["target_stale"])
+    elif case == "fault":
+        stream.update(healthy=False, fault="native fault", health_reasons=["fault_latched"])
+    elif case == "unknown_unhealthy":
+        stream.update(healthy=False)
+    calls = []
+    class Backend:
+        def is_ready(self):
+            return case != "not_ready"
+        def get_state(self, **kwargs):
+            calls.append(kwargs)
+            return state
+    backend = Backend()
+    lean = dispatch.inspect_arm_backends_for_position_dispatch({"right": backend}, require_background_target=True)
+    assert calls == [{"include_derived_pose": False, "include_timing_percentiles": False,
+                      "include_pose_source_attestation": False, "include_background_streaming": True}]
+    # Counterfactual only changes which optional snapshot work is requested.
+    monkeypatch.setattr(dispatch, "read_backend_state", lambda method, **_kw: method())
+    full = dispatch.inspect_arm_backends_for_position_dispatch({"right": backend}, require_background_target=True)
+    assert calls[-1] == {} and len(calls) == 2
+    for result in [lean, full]:
+        result.pop("timing")
+        for side in result["sides"].values():
+            side.pop("timing")
+    assert lean == full
+    assert lean["ready"] is (case == "ready")
+    assert lean["sides"]["right"]["singularity_metadata"] == state["singularity_metadata"]
+
+
+def test_shared_backend_health_error_preserves_typed_readiness_receipt():
+    from teleop_runtime.deploy import dispatch
+
+    class Backend:
+        calls = 0
+        def is_ready(self):
+            return True
+        def get_state(self, *, include_derived_pose=True):
+            self.calls += 1
+            raise TypeError("single-read typed failure")
+    backend = Backend()
+    with pytest.raises(dispatch.PositionDispatchNotReady) as caught:
+        dispatch.require_arm_backends_ready_for_position_dispatch({"right": backend}, stage="fixture", require_background_target=True)
+    assert backend.calls == 1
+    health = caught.value.health
+    assert health["ready"] is False
+    assert health["sides"]["right"]["state_error"] == "TypeError: single-read typed failure"

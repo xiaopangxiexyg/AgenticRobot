@@ -192,3 +192,21 @@ camera routing 或 action pose mode 来绕过 artifact/profile 错误。当前 c
 该路线只开放真实 observation 的
 no-action shadow。真实动作还必须显式加入 `--send-actions`，完成 dataset-frame qpos-init、
 ready 确认和上述 Active latency gate；profile 本身不会授予动作权限。
+
+## 2026-10-19 主线分批吸收：健康快照精简读取
+
+本批从固定来源 `0539b7cd5b499abcdb32da9a94069fc8a128f8e1` 选择性吸收健康读取减负。
+原 ArmStateReader 的签名筛选移到同应用层 `backend_state.read_backend_state()`，只传给
+backend 已声明支持的选项；无参或签名不可检查的后端仍只读一次，后端自身的 TypeError
+不会导致重试或换另一份快照。
+
+position-dispatch 健康读取关闭 FK 派生、timing percentile 和 pose attestation，显式保留
+后台 streaming 状态；ready、send、fault、target freshness、epoch、singularity 和原拒绝
+规则保持不变。普通 dispatch 的完整审计仍无参读取。qpos-only reader 保留主线的四项 False，
+并保留 refresh 返回 Mapping 的权威快照复用、避免第二次 get_state，以及 observation timing
+复制。不能整文件用来源覆盖主线，两个消费者对后台诊断的选项有意不同。
+
+来源曾报告 36 个冻结短段 mock 切片的历史 CPU 对照；它不是本批重新运行的性能证据，
+也不能代表真实模型全链路时序或实机达标。本批以离线行为与消费者兼容回归核验省略路径，
+不改变 120 Hz 命令节拍、发送健康阈值、TTL、deadline、碰撞或默认控制配置。
+来源后续 100 Hz 健康下界、并行 native 准备和实验性恢复目标单独评估；SDK 和实机验收独立。
