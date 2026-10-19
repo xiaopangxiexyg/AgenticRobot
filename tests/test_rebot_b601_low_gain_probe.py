@@ -876,7 +876,7 @@ def test_active_report_warmup_requires_advancing_type24_and_disables_stream(
             )
 
         def poll_feedback(self, **kwargs: object) -> B601HardwareState:
-            assert kwargs == {"require_host_freshness": True}
+            assert kwargs == {"require_host_freshness": True, "prefer_active_report": True}
             self.sequence += 1
             events.append(f"type24_{self.sequence}")
             return state(self.sequence)

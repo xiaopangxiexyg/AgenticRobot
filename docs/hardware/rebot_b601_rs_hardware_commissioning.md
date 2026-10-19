@@ -140,6 +140,33 @@ SocketCAN/MotorBridge 的接入边界和频率验收顺序，不替代急停、�
 translation/rotation 收敛，并记录 force/torque clip、joint torque/slew、qvel/qacc 和
 driver fault。该 ideal-effort 结果只验证控制数学与稳定趋势，不映射为真机力值或手感。
 
+## Type-24 control-feedback cache compatibility
+
+The low-gain probe's existing active-report control path requests
+`poll_feedback(require_host_freshness=True, prefer_active_report=True)`.
+When MotorBridge advertises `active_report_observation_v1`, this selects
+`robstride_get_active_report_observation()` so Type-2 command replies cannot
+overwrite the selected Type-24 observation. An advertised dedicated getter
+that is missing, raises, returns no observation or returns stale data is
+rejected; generic replies cannot rescue it. The existing admission owner still
+requires complete, fresh Type-24 observations for all six joints and advancing
+receive sequences. Host receive age is not a device-source timestamp.
+
+The pinned MotorBridge gitlink remains
+`93a6b4c21f3f4252e935dfbd5f0d42dd06e06424`. Without the advertised capability,
+the same preference uses the older generic observation API and retains the
+original strict Type-24 gate. This compatibility path does not isolate Type-24
+from intervening Type-2 replies on an older SDK. Ordinary host-fresh callers
+that omit the preference retain the generic newest-status contract.
+
+This batch imports no controller tuning, profile defaults or new hardware
+entrypoints. The dedicated SDK implementation, its distributable Git object
+and reproducible ABI build remain a separate integration step. Offline fake
+SDK checks establish selection and rejection behavior only; they establish
+neither hardware acceptance nor a control-loop frequency claim. The source
+feedback-retry diagnostics depend on an additional probe refactor and remain
+outside this compatibility batch until that dependency is reviewed.
+
 ## 频率指标契约
 
 频率不能从一条混合 CAN 计数推断。`hardware.rebot_b601_rs.frequency.FrequencyLedger`

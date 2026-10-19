@@ -7542,7 +7542,9 @@ def run_probe(
 
         if active_report_gate is None:
             return backend.poll_feedback(request_feedback=True), True
-        state = backend.poll_feedback(require_host_freshness=True)
+        state = backend.poll_feedback(
+            require_host_freshness=True, prefer_active_report=True
+        )
         try:
             advanced = active_report_gate.observe(state)
         except (TypeError, ValueError) as exc:
