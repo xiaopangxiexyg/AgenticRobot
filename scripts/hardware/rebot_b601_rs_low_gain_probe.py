@@ -7167,6 +7167,167 @@ def _run_latched_fault_hold(
     )
 
 
+class _ProbeStageTiming:
+    """Diagnostic wall/thread-CPU durations; never a controller clock/input."""
+
+    def __init__(self) -> None:
+        self._wall = time.perf_counter()
+        self._cpu = time.thread_time()
+        self.stages: dict[str, dict[str, float]] = {}
+
+    def mark(self, stage: str, *, accumulate: bool = False) -> None:
+        wall, cpu = time.perf_counter(), time.thread_time()
+        values = {
+            "wall_sec": wall - self._wall,
+            "thread_cpu_sec": cpu - self._cpu,
+            "started_perf_counter_sec": self._wall,
+            "completed_perf_counter_sec": wall,
+        }
+        if accumulate:
+            previous = self.stages.get(stage, {})
+            values.update({
+                "wall_sec": previous.get("wall_sec", 0.0) + values["wall_sec"],
+                "thread_cpu_sec": previous.get("thread_cpu_sec", 0.0) + values["thread_cpu_sec"],
+                "started_perf_counter_sec": previous.get("started_perf_counter_sec", self._wall),
+                "interval_count": previous.get("interval_count", 0) + 1,
+                "max_interval_wall_sec": max(previous.get("max_interval_wall_sec", 0.0), wall - self._wall),
+            })
+        self.stages[stage] = values
+        self._wall, self._cpu = wall, cpu
+
+    def snapshot(self) -> dict[str, object]:
+        return {
+            "semantics": (
+                "diagnostic_only; wall=perf_counter; cpu=owner_thread_time; "
+                "wall_cpu_difference_does_not_identify_a_scheduler_or_io_cause"
+            ),
+            "stages": {name: dict(values) for name, values in self.stages.items()},
+            "total_wall_sec": sum(stage["wall_sec"] for stage in self.stages.values()),
+            "total_thread_cpu_sec": sum(stage["thread_cpu_sec"] for stage in self.stages.values()),
+        }
+
+
+class _ProbeFeedbackTiming:
+    """Observe the existing read/admission/retry path, without a second gate."""
+
+    def __init__(self, *, measure_intervals: bool = True) -> None:
+        self.timer = _ProbeStageTiming() if measure_intervals else None
+        self.not_advanced_count = 0
+        self.retryable_error_count = 0
+        self.rejection_counts: dict[str, int] = {}
+        self.first_rejection: dict[str, object] | None = None
+        self.last_rejection: dict[str, object] | None = None
+
+    def reject(self, stage: str, reason: str) -> None:
+        # Fixed caller stages, two bounded strings, no retained exception or
+        # extra clock read. Diagnostics must not alter admission or deadlines.
+        self.rejection_counts[stage] = self.rejection_counts.get(stage, 0) + 1
+        entry = {"stage": stage, "reason": reason[:400],
+                 "ordinal": sum(self.rejection_counts.values())}
+        if self.first_rejection is None:
+            self.first_rejection = entry
+        self.last_rejection = entry
+
+    def mark(self, stage: str) -> None:
+        if self.timer is not None:
+            self.timer.mark(stage, accumulate=True)
+
+    def snapshot(self) -> dict[str, object]:
+        return {
+            **(self.timer.snapshot() if self.timer is not None else {
+                "semantics": "diagnostic_only; timing_not_collected",
+                "stages": {},
+                "total_wall_sec": None,
+                "total_thread_cpu_sec": None,
+            }),
+            "measure_intervals": self.timer is not None,
+            "interval_semantics": (
+                "summed_disjoint_intervals; span_bounds_are_not_contiguous"
+                if self.timer is not None else "not_collected"
+            ),
+            "not_advanced_count": self.not_advanced_count,
+            "retryable_error_count": self.retryable_error_count,
+            "rejection_counts": dict(self.rejection_counts),
+            "first_rejection": None if self.first_rejection is None else dict(self.first_rejection),
+            "last_rejection": None if self.last_rejection is None else dict(self.last_rejection),
+        }
+
+
+def _poll_control_feedback(
+    backend: B601RSBackend,
+    active_report_gate: B601ActiveReportControlGate | None,
+    diagnostics: _ProbeFeedbackTiming | None = None,
+) -> tuple[B601HardwareState, bool]:
+    """Read one configured source and retain the existing authoritative gate."""
+
+    try:
+        state = (
+            backend.poll_feedback(request_feedback=True)
+            if active_report_gate is None
+            else backend.poll_feedback(
+                require_host_freshness=True, prefer_active_report=True
+            )
+        )
+    except LowGainProbeError as exc:
+        if diagnostics is not None:
+            diagnostics.reject("backend_poll", str(exc))
+        raise
+    finally:
+        if diagnostics is not None:
+            diagnostics.mark("backend_poll")
+    if active_report_gate is None:
+        return state, True
+    try:
+        advanced = active_report_gate.observe(state)
+    except (TypeError, ValueError) as exc:
+        if diagnostics is not None:
+            diagnostics.reject("host_freshness_admission", str(exc))
+        raise LowGainProbeError(f"active-report feedback rejected: {exc}") from exc
+    finally:
+        if diagnostics is not None:
+            diagnostics.mark("host_freshness_admission")
+    return state, advanced
+
+
+def _read_admitted_control_feedback(
+    backend: B601RSBackend,
+    active_report_gate: B601ActiveReportControlGate | None,
+    timeout_sec: float,
+    diagnostics: _ProbeFeedbackTiming | None = None,
+) -> B601HardwareState:
+    if active_report_gate is None:
+        state, _advanced = _poll_control_feedback(backend, active_report_gate, diagnostics)
+        return state
+    deadline = time.monotonic() + timeout_sec
+    last_error: str | None = None
+    while time.monotonic() <= deadline:
+        try:
+            state, advanced = _poll_control_feedback(backend, active_report_gate, diagnostics)
+        except LowGainProbeError as exc:
+            # A retained exception points through its traceback back to this
+            # frame, keeping successful retry loops alive until cyclic GC.
+            # Timeout reporting only consumes its text, never the traceback.
+            last_error = str(exc)
+            if diagnostics is not None:
+                diagnostics.retryable_error_count += 1
+        else:
+            if advanced:
+                return state
+            last_error = "active-report feedback established a baseline but did not yet advance"
+            if diagnostics is not None:
+                diagnostics.not_advanced_count += 1
+                diagnostics.reject("baseline_not_advanced", last_error)
+        if diagnostics is not None:
+            diagnostics.mark("retry_bookkeeping")
+        time.sleep(0.001)
+        if diagnostics is not None:
+            diagnostics.mark("retry_wait")
+    raise LowGainProbeError(
+        "no advancing complete Type-24 snapshot arrived within "
+        f"{timeout_sec:.6f}s: {last_error}"
+    )
+
+
 def run_probe(
     args: argparse.Namespace,
     *,
@@ -7422,6 +7583,8 @@ def run_probe(
     assist_guard_rejection: dict[str, object] | None = None
     cartesian_assist_guard_rejection: dict[str, object] | None = None
     primary_error: Exception | None = None
+    last_feedback_read_diagnostics: _ProbeFeedbackTiming | None = None
+    primary_feedback_read_diagnostics: dict[str, object] | None = None
     preflight_disable: B601ModeReceipt | None = None
     mode_receipt: B601ModeReceipt | None = None
     enable_receipt: B601ModeReceipt | None = None
@@ -7538,42 +7701,40 @@ def run_probe(
         _operator_notice(f"[B601] STARTUP {state}")
 
     def poll_control_feedback() -> tuple[B601HardwareState, bool]:
-        """Read one configured feedback source and enforce its control gate."""
-
-        if active_report_gate is None:
-            return backend.poll_feedback(request_feedback=True), True
-        state = backend.poll_feedback(
-            require_host_freshness=True, prefer_active_report=True
+        # Warmup remains one poll per attempt under its original outer budget.
+        nonlocal last_feedback_read_diagnostics
+        diagnostics = (
+            _ProbeFeedbackTiming(measure_intervals=False)
+            if active_report_gate is not None else None
         )
+        last_feedback_read_diagnostics = diagnostics
         try:
-            advanced = active_report_gate.observe(state)
-        except (TypeError, ValueError) as exc:
-            raise LowGainProbeError(
-                f"active-report feedback rejected: {exc}"
-            ) from exc
+            state, advanced = _poll_control_feedback(backend, active_report_gate, diagnostics)
+        except LowGainProbeError:
+            if diagnostics is not None:
+                diagnostics.retryable_error_count += 1
+            raise
+        if diagnostics is not None and not advanced:
+            diagnostics.not_advanced_count += 1
+            diagnostics.reject(
+                "baseline_not_advanced",
+                "active-report feedback established a baseline but did not yet advance",
+            )
         return state, advanced
 
     def read_admitted_control_feedback() -> B601HardwareState:
         if active_report_gate is None:
             state, _advanced = poll_control_feedback()
             return state
-        deadline = time.monotonic() + config.feedback_timeout_sec
-        last_error: LowGainProbeError | None = None
-        while time.monotonic() <= deadline:
-            try:
-                state, advanced = poll_control_feedback()
-            except LowGainProbeError as exc:
-                last_error = exc
-            else:
-                if advanced:
-                    return state
-                last_error = LowGainProbeError(
-                    "active-report feedback established a baseline but did not yet advance"
-                )
-            time.sleep(0.001)
-        raise LowGainProbeError(
-            "no advancing complete Type-24 snapshot arrived within "
-            f"{config.feedback_timeout_sec:.6f}s: {last_error}"
+        nonlocal last_feedback_read_diagnostics
+        diagnostics = (
+            _ProbeFeedbackTiming(measure_intervals=False)
+            if active_report_gate is not None else None
+        )
+        # Register before a fallible poll, and share one observer across retries.
+        last_feedback_read_diagnostics = diagnostics
+        return _read_admitted_control_feedback(
+            backend, active_report_gate, config.feedback_timeout_sec, diagnostics
         )
 
     signal.signal(
@@ -9018,6 +9179,8 @@ def run_probe(
             )
             samples.append(
                 {
+                    **({"feedback_read_diagnostics": last_feedback_read_diagnostics.snapshot()}
+                       if last_feedback_read_diagnostics is not None else {}),
                     "sequence": state.sequence,
                     "elapsed_sec": elapsed,
                     "feedback_timestamp_sec": state.receive_timestamp_sec,
@@ -9307,10 +9470,25 @@ def run_probe(
                 )
     except LowGainProbeError as exc:
         primary_error = exc
+        # Cleanup may perform another feedback read; preserve the primary read.
+        primary_feedback_read_diagnostics = (
+            last_feedback_read_diagnostics.snapshot()
+            if last_feedback_read_diagnostics is not None else None
+        )
     except (B601HardwareError, OSError, TypeError, ValueError) as exc:
         primary_error = exc
+        # Cleanup may perform another feedback read; preserve the primary read.
+        primary_feedback_read_diagnostics = (
+            last_feedback_read_diagnostics.snapshot()
+            if last_feedback_read_diagnostics is not None else None
+        )
     except Exception as exc:  # noqa: BLE001 - report unexpected probe failure
         primary_error = exc
+        # Cleanup may perform another feedback read; preserve the primary read.
+        primary_feedback_read_diagnostics = (
+            last_feedback_read_diagnostics.snapshot()
+            if last_feedback_read_diagnostics is not None else None
+        )
     finally:
         if operator_keys is not None:
             operator_keys.close()
@@ -9657,7 +9835,10 @@ def run_probe(
         detail = str(primary_error)
         if cleanup_errors:
             detail += "; cleanup: " + "; ".join(cleanup_errors)
-        raise LowGainProbeError(detail) from primary_error
+        error = LowGainProbeError(detail)
+        if primary_feedback_read_diagnostics is not None:
+            error.feedback_read_diagnostics = primary_feedback_read_diagnostics
+        raise error from primary_error
 
     frequency = ledger.summarize(target_hz=args.rate_hz)
     required_events = ("feedback", "compute", "tx")
@@ -9893,6 +10074,8 @@ def run_probe(
         },
         "transport": "motorbridge_wired_local",
         "feedback_source": feedback_source,
+        **({"feedback_read_diagnostics": last_feedback_read_diagnostics.snapshot()}
+           if last_feedback_read_diagnostics is not None else {}),
         "gravity_debug": {
             "enabled": gravity_debug_profile is not None,
             "parameter_source": (
@@ -11189,6 +11372,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
         except (LowGainProbeError, B601HardwareError, OSError, ValueError) as exc:
             payload = {"status": "ERROR", "mode": args.mode, "error": str(exc)}
+            feedback_diagnostics = getattr(exc, "feedback_read_diagnostics", None)
+            if feedback_diagnostics is not None:
+                payload["feedback_read_diagnostics"] = feedback_diagnostics
             exit_code = 2
         else:
             exit_code = 0 if payload.get("status") == "OK" else 1

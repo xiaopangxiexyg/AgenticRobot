@@ -1273,3 +1273,27 @@ MotorBridge 线程安全契约时并发调用同一个 controller。
 bitrate、操作者/观察者、唯一 owner、每 event 的统计、每关节状态/命令/错误、限幅、
 watchdog/fault transition、物理急停和 cleanup 结果。每个阶段标记为 `NOT_RUN`、`FAIL`
 或 `HARDWARE_PASS`；`OFFLINE_PASS` 只能描述 P0，不得升级为真机结论。
+
+## Type-24 反馈读取诊断与离线集成边界（2026-10-19）
+
+当前 low-gain probe 在 `active-report` 路径的每次逻辑读取中，记录
+`feedback_read_diagnostics`：`backend_poll`、`host_freshness_admission`、
+`baseline_not_advanced` 三类拒绝计数、首次及末次拒绝原因（各最多 400 字符）、
+未推进次数及可重试异常次数。每次读取只保存首末两个原因；连续重试不保留异常或 traceback。
+此有界性指单个快照；既有 `samples` 总量仍随采样数量增长。
+
+主路径固定 `measure_intervals=false`，`interval_semantics=not_collected`，
+耗时值为 `null`；不构造 interval timer，不增加诊断时钟读取。计数仍有少量分配和 CPU 开销，
+不能据此声称频率改善。计数只观察现有请求、准入和重试，不是新的 freshness 或调度依据。
+warmup 仍为原外层预算下的单次 poll，随后读取仍使用原反馈超时及 1 ms retry wait；
+Type-24 preference、六关节 host freshness 与序号推进门不变。
+
+成功样本携带该样本读取的快照；成功结果顶层携带最近一次读取（可能发生在 cleanup）的快照。
+失败时在 cleanup 前冻结最近一次逻辑读取的诊断，通过原错误包装送到 CLI `ERROR` JSON，
+避免保护保持的后续读取覆盖主故障证据。连接失败或首次读取之前失败时允许无该字段；
+parameter 路径维持原输出，不增加此字段。错误文本、cause、退出码和清理顺序保持原语义。
+
+本次仅吸收固定来源 `4f9e3390fe129f58d5d810b9421d11f48c7b8ee2` 的小范围反馈辅助逻辑，
+适配当前主线的输出与 Type-24 preference；未接入完整 dynamics trace、GC observer、反馈
+cadence floor、调参默认值或 vendor gitlink 更新。离线通过不等于实机验收，仍需由硬件阶段
+验证总线、六关节帧连续推进、停止与保护保持以及目标频率。

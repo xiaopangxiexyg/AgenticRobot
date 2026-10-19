@@ -5074,3 +5074,481 @@ def test_driver_damping_rejects_ambiguous_joint_count() -> None:
 
     with pytest.raises(ValueError, match="one or six"):
         probe._validate_cli(args)
+
+
+def _timed_feedback_state(sequence: int, *, age: float = .005) -> B601HardwareState:
+    joints = tuple(B601JointState(
+        name=f"joint{i}", motor_id=i, feedback_id=0xFD, arbitration_id=24 << 24,
+        status_code=0, position_rad=.1, velocity_reported=99., torque_reported_nm=99.,
+        observed_at_sec=10. - age, sample_sequence=sequence, valid=True, stale=False,
+        position_source="robstride_operation_status_cache", status_sequence=sequence,
+        receive_age_sec=age, host_receive_freshness_verified=True,
+    ) for i in range(1, 7))
+    return B601HardwareState(
+        sequence=sequence, receive_timestamp_sec=10., joints=joints,
+        valid=True, stale=False, host_receive_freshness_verified=True,
+    )
+
+
+def test_feedback_substage_timing_sums_disjoint_intervals_without_hiding_retry_counts(monkeypatch):
+    wall, cpu = iter((10., 10.03, 10.04, 10.09)), iter((2., 2.002, 2.003, 2.007))
+    monkeypatch.setattr(probe.time, "perf_counter", lambda: next(wall))
+    monkeypatch.setattr(probe.time, "thread_time", lambda: next(cpu))
+    diagnostics = probe._ProbeFeedbackTiming()
+    diagnostics.mark("backend_poll")
+    before = diagnostics.snapshot()
+    diagnostics.mark("retry_wait")
+    diagnostics.mark("backend_poll")
+    after = diagnostics.snapshot()
+    poll = after["stages"]["backend_poll"]
+    assert poll["wall_sec"] == pytest.approx(.08)
+    assert poll["thread_cpu_sec"] == pytest.approx(.006)
+    assert poll["max_interval_wall_sec"] == pytest.approx(.05)
+    assert poll["interval_count"] == 2
+    assert after["total_wall_sec"] == pytest.approx(.09)
+    assert before["stages"]["backend_poll"]["interval_count"] == 1
+    assert "not_contiguous" in after["interval_semantics"]
+
+
+def test_feedback_rejection_evidence_is_bounded_and_snapshot_does_not_change():
+    diagnostics = probe._ProbeFeedbackTiming()
+    diagnostics.reject("host_freshness_admission", "joint1 latest status frame is communication type 2, not Type-24")
+    before = diagnostics.snapshot()
+    for _ in range(1000):
+        diagnostics.reject("backend_poll", "x"*2000)
+    after = diagnostics.snapshot()
+    assert before["last_rejection"]["ordinal"] == 1
+    assert after["first_rejection"] == before["first_rejection"]
+    assert after["rejection_counts"] == {"host_freshness_admission": 1, "backend_poll": 1000}
+    assert after["last_rejection"]["ordinal"] == 1001
+    assert len(after["last_rejection"]["reason"]) == 400
+    assert not any(isinstance(v, BaseException) for v in after["last_rejection"].values())
+
+
+def test_feedback_rejection_distinguishes_backend_retry_from_gate_retry(monkeypatch):
+    now, calls = [10.], []
+    frames = iter((None, _timed_feedback_state(1), _timed_feedback_state(2)))
+
+    def poll(**kwargs):
+        calls.append(kwargs)
+        state = next(frames)
+        if state is None:
+            raise probe.LowGainProbeError("declared transient backend rejection")
+        return state
+
+    monkeypatch.setattr(probe.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(probe.time, "sleep", lambda delay: now.__setitem__(0, now[0]+delay))
+    diagnostics = probe._ProbeFeedbackTiming()
+    gate = probe.B601ActiveReportControlGate(probe._ALL_JOINTS, maximum_receive_age_sec=.10)
+    state = probe._read_admitted_control_feedback(SimpleNamespace(poll_feedback=poll), gate, .01, diagnostics)
+    assert state.sequence == 2 and len(calls) == 3
+    evidence = diagnostics.snapshot()
+    assert evidence["rejection_counts"] == {"backend_poll": 1, "baseline_not_advanced": 1}
+    assert evidence["first_rejection"]["reason"] == "declared transient backend rejection"
+    assert evidence["last_rejection"]["stage"] == "baseline_not_advanced"
+
+
+@pytest.mark.parametrize("advances", [False, True])
+def test_feedback_retries_release_rejected_tracebacks_without_waiting_for_gc(monkeypatch, advances):
+    import gc
+    import weakref
+
+    errors = []
+    original_error = probe.LowGainProbeError
+
+    class ObservedError(original_error):
+        def __init__(self, message):
+            super().__init__(message)
+            errors.append(weakref.ref(self))
+
+    monkeypatch.setattr(probe, "LowGainProbeError", ObservedError)
+    now, polls = [10.], [0]
+    monkeypatch.setattr(probe.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(probe.time, "sleep", lambda delay: now.__setitem__(0, now[0] + delay))
+    gate = probe.B601ActiveReportControlGate(probe._ALL_JOINTS, maximum_receive_age_sec=.10)
+    gate.observe(_timed_feedback_state(1))
+
+    def poll(**kwargs):
+        assert kwargs == {"require_host_freshness": True, "prefer_active_report": True}
+        polls[0] += 1
+        return _timed_feedback_state(2 if advances and polls[0] > 3 else 1)
+
+    diagnostics = probe._ProbeFeedbackTiming()
+    enabled = gc.isenabled()
+    # Offline lifetime assertion: automatic GC must not hide retained cycles.
+    gc.disable()
+    try:
+        if advances:
+            state = probe._read_admitted_control_feedback(SimpleNamespace(poll_feedback=poll), gate, .01, diagnostics)
+            assert state.sequence == 2 and polls[0] == 4
+            assert all(reference() is None for reference in errors)
+        else:
+            with pytest.raises(ObservedError, match="joint1 status_sequence did not advance") as caught:
+                probe._read_admitted_control_feedback(SimpleNamespace(poll_feedback=poll), gate, .002, diagnostics)
+            assert all(reference() is None for reference in errors[:-1])
+            assert errors[-1]() is caught.value  # The delivered timeout remains inspectable.
+        assert diagnostics.retryable_error_count == polls[0] - int(advances)
+        assert gate.last_status_sequences == {f"joint{i}": 2 if advances else 1 for i in range(1, 7)}
+    finally:
+        if enabled:
+            gc.enable()
+
+
+@pytest.mark.parametrize("observe", [False, True])
+def test_feedback_diagnostics_preserve_real_admission_retries_and_source_requests(monkeypatch, observe):
+    baseline, advancing = _timed_feedback_state(1), _timed_feedback_state(2)
+    frames = iter((baseline, baseline, _timed_feedback_state(2, age=.20), advancing))
+    calls, waits, now = [], [], [10.]
+
+    def poll(**kwargs):
+        calls.append(kwargs)
+        return next(frames)
+
+    def sleep(delay):
+        waits.append(delay)
+        now[0] += delay
+
+    monkeypatch.setattr(probe.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(probe.time, "sleep", sleep)
+    gate = probe.B601ActiveReportControlGate(probe._ALL_JOINTS, maximum_receive_age_sec=.10)
+    diagnostics = probe._ProbeFeedbackTiming() if observe else None
+    admitted = probe._read_admitted_control_feedback(SimpleNamespace(poll_feedback=poll), gate, .05, diagnostics)
+    assert admitted is advancing
+    assert calls == [{"require_host_freshness": True, "prefer_active_report": True}] * 4
+    assert waits == [.001] * 3
+    assert gate.last_status_sequences == {f"joint{i}": 2 for i in range(1, 7)}
+    if diagnostics is not None:
+        report = diagnostics.snapshot()
+        assert report["not_advanced_count"] == 1
+        assert report["retryable_error_count"] == 2
+        assert report["stages"]["backend_poll"]["interval_count"] == 4
+        assert report["stages"]["host_freshness_admission"]["interval_count"] == 4
+        assert report["stages"]["retry_wait"]["interval_count"] == 3
+        assert report["rejection_counts"] == {"baseline_not_advanced": 1, "host_freshness_admission": 2}
+        assert report["first_rejection"]["stage"] == "baseline_not_advanced"
+        assert "did not advance" in report["last_rejection"]["reason"] or "receive_age_sec" in report["last_rejection"]["reason"]
+        assert report["last_rejection"]["ordinal"] == 3
+
+
+@pytest.mark.parametrize("observe", [False, True])
+def test_feedback_diagnostics_keep_parameter_source_and_fatal_backend_errors(monkeypatch, observe):
+    state, calls = _timed_feedback_state(1), []
+    diagnostics = probe._ProbeFeedbackTiming() if observe else None
+
+    def poll(**kwargs):
+        calls.append(kwargs)
+        return state
+
+    backend = SimpleNamespace(poll_feedback=poll)
+    assert probe._read_admitted_control_feedback(backend, None, .10, diagnostics) is state
+    assert calls == [{"request_feedback": True}]
+    if diagnostics is not None:
+        assert set(diagnostics.snapshot()["stages"]) == {"backend_poll"}
+
+    def fatal(**_kwargs):
+        raise RuntimeError("transport failed")
+
+    failed_diagnostics = probe._ProbeFeedbackTiming() if observe else None
+    with pytest.raises(RuntimeError, match="transport failed"):
+        probe._read_admitted_control_feedback(SimpleNamespace(poll_feedback=fatal), None, .10, failed_diagnostics)
+    if failed_diagnostics is not None:
+        assert failed_diagnostics.snapshot()["stages"]["backend_poll"]["interval_count"] == 1
+
+
+@pytest.mark.parametrize("observe", [False, True])
+def test_feedback_diagnostics_preserve_timeout_and_last_rejection(monkeypatch, observe):
+    state, now, calls = _timed_feedback_state(1), [10.], []
+
+    def poll(**kwargs):
+        calls.append(kwargs)
+        return state
+
+    monkeypatch.setattr(probe.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(probe.time, "sleep", lambda delay: now.__setitem__(0, now[0] + delay))
+    gate = probe.B601ActiveReportControlGate(probe._ALL_JOINTS, maximum_receive_age_sec=.10)
+    diagnostics = probe._ProbeFeedbackTiming() if observe else None
+    with pytest.raises(probe.LowGainProbeError, match=r"within 0.002000s: active-report feedback rejected: joint1 status_sequence did not advance"):
+        probe._read_admitted_control_feedback(SimpleNamespace(poll_feedback=poll), gate, .002, diagnostics)
+    assert gate.last_status_sequences == {f"joint{i}": 1 for i in range(1, 7)}
+    if diagnostics is not None:
+        assert diagnostics.snapshot()["retryable_error_count"] == len(calls) - 1
+
+
+def test_feedback_counter_mode_does_not_construct_timer_or_read_diagnostic_clocks(monkeypatch):
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("counter-only observer must not read a clock")
+
+    monkeypatch.setattr(probe, "_ProbeStageTiming", forbidden)
+    monkeypatch.setattr(probe.time, "perf_counter", forbidden)
+    monkeypatch.setattr(probe.time, "thread_time", forbidden)
+    monkeypatch.setattr(probe.time, "monotonic", forbidden)
+    observer = probe._ProbeFeedbackTiming(measure_intervals=False)
+    observer.mark("backend_poll")
+    observer.reject("backend_poll", "synthetic " * 100)
+    before = observer.snapshot()
+    observer.reject("host_freshness_admission", "next")
+    after = observer.snapshot()
+    assert observer.timer is None
+    assert before["measure_intervals"] is False
+    assert before["interval_semantics"] == "not_collected"
+    assert "timing_not_collected" in before["semantics"]
+    assert before["stages"] == {}
+    assert before["total_wall_sec"] is before["total_thread_cpu_sec"] is None
+    assert before["last_rejection"]["ordinal"] == 1
+    assert len(before["first_rejection"]["reason"]) == 400
+    assert after["last_rejection"]["ordinal"] == 2
+    before["first_rejection"]["reason"] = "consumer mutation"
+    assert observer.snapshot()["first_rejection"]["reason"] != "consumer mutation"
+
+
+@pytest.mark.parametrize("timeout", [False, True])
+def test_feedback_counter_mode_preserves_all_control_clock_reads_and_requests(monkeypatch, timeout):
+    results = []
+    for observe in [False, True]:
+        now, reads, polls, waits = [10.], [], [], []
+
+        def monotonic():
+            reads.append(now[0])
+            return now[0]
+
+        def sleep(delay):
+            waits.append(delay)
+            now[0] += delay
+
+        def poll(**kwargs):
+            polls.append(kwargs)
+            sequence = 1 if timeout or len(polls) < 4 else 2
+            return _timed_feedback_state(sequence)
+
+        monkeypatch.setattr(probe.time, "monotonic", monotonic)
+        monkeypatch.setattr(probe.time, "sleep", sleep)
+        gate = probe.B601ActiveReportControlGate(probe._ALL_JOINTS, .1)
+        observer = probe._ProbeFeedbackTiming(measure_intervals=False) if observe else None
+        try:
+            state = probe._read_admitted_control_feedback(
+                SimpleNamespace(poll_feedback=poll), gate, .002 if timeout else .01, observer
+            )
+        except probe.LowGainProbeError as exc:
+            outcome = str(exc)
+        else:
+            outcome = state.sequence
+        results.append((reads, polls, waits, outcome, dict(gate.last_status_sequences)))
+    assert results[0] == results[1]
+    assert results[0][1] == [{"require_host_freshness": True, "prefer_active_report": True}] * len(results[0][1])
+    assert results[0][2] == [.001] * len(results[0][2])
+
+
+@pytest.mark.parametrize("failure", [OSError, probe.B601HardwareError, RuntimeError])
+def test_feedback_active_report_fatal_exceptions_are_never_retried(monkeypatch, failure):
+    calls = []
+
+    def poll(**kwargs):
+        calls.append(kwargs)
+        raise failure("fatal transport")
+
+    def no_wait(_delay):
+        pytest.fail("fatal errors must not enter retry wait")
+
+    monkeypatch.setattr(probe.time, "sleep", no_wait)
+    gate = probe.B601ActiveReportControlGate(probe._ALL_JOINTS, .1)
+    observer = probe._ProbeFeedbackTiming(measure_intervals=False)
+    with pytest.raises(failure, match="fatal transport"):
+        probe._read_admitted_control_feedback(SimpleNamespace(poll_feedback=poll), gate, .01, observer)
+    assert len(calls) == 1
+    assert observer.retryable_error_count == 0
+
+
+def _feedback_diagnostics_probe_fixture(monkeypatch, tmp_path, *, source="active-report", failure=None, cleanup_error=False):
+    from dataclasses import replace
+
+    events, polls, payloads = [], [], []
+    clock = [10.]
+    q = (.1, .7, 1.1, 0., -.1, .2)
+    config_path = tmp_path / "synthetic-feedback-config.yaml"
+    config_path.write_text("offline fixture\n", encoding="utf-8")
+    config = SimpleNamespace(
+        channel="fake-no-hardware", feedback_timeout_sec=.025,
+        joints=[SimpleNamespace(mit_kp=1., mit_kd=.1) for _ in range(6)],
+    )
+
+    def receipt(operation="safe_stop"):
+        return probe.B601ModeReceipt(
+            operation=operation, requested_joint_names=probe._ALL_JOINTS,
+            completed_joint_names=probe._ALL_JOINTS, failed_joint_names=(), errors=(), completed=True,
+        )
+
+    def limit_receipt(operation):
+        return SimpleNamespace(
+            operation=operation, requested_joint_names=probe._ALL_JOINTS,
+            target_limits_nm=(1.,)*6, prior_limits_nm=(1.,)*6, verified_limits_nm=(1.,)*6,
+            applied_joint_names=probe._ALL_JOINTS, restored_joint_names=probe._ALL_JOINTS,
+            failed_joint_names=(), errors=(), completed=True,
+            rollback_attempted=False, rollback_completed=False,
+        )
+
+    class Backend:
+        sequence = 0
+        enabled = False
+        cleanup = False
+        dispatches = 0
+
+        def connect(self):
+            events.append("connect")
+            if failure == "connect":
+                raise OSError("synthetic connect failure")
+
+        def set_active_reporting(self, enabled, **_kwargs):
+            events.append("report_on" if enabled else "report_off")
+            return receipt("active_report")
+
+        def poll_feedback(self, **kwargs):
+            polls.append(kwargs)
+            events.append("read_cleanup" if self.cleanup else "read")
+            clock[0] += .01
+            if failure == "warmup" and not self.enabled:
+                raise probe.LowGainProbeError("synthetic warmup rejection")
+            duplicate = (
+                self.enabled and not self.cleanup and kwargs.get("prefer_active_report")
+                and (failure == "arming" or (failure == "settle" and self.dispatches > 0))
+            )
+            if not duplicate:
+                self.sequence += 1
+            state = _timed_feedback_state(self.sequence)
+            return replace(state, receive_timestamp_sec=clock[0], joints=tuple(
+                replace(joint, position_rad=position, observed_at_sec=clock[0]-.005)
+                for joint, position in zip(state.joints, q, strict=True)
+            ))
+
+        def safe_stop(self, **_kwargs):
+            events.append("disable")
+            return receipt()
+
+        def prepare_mit_mode(self, **_kwargs):
+            events.append("mit_mode")
+            return receipt("mit_mode")
+
+        def apply_temporary_driver_torque_limits(self, *_args, **_kwargs):
+            events.append("limits_on")
+            return limit_receipt("apply")
+
+        def restore_driver_torque_limits(self):
+            events.append("limits_off")
+            return limit_receipt("restore")
+
+        def enable(self, **_kwargs):
+            self.enabled = True
+            events.append("enable")
+            return receipt("enable")
+
+        def send_mit(self, reference, **_kwargs):
+            self.dispatches += 1
+            events.append("dispatch")
+            return _fault_hold_command_receipt(accepted=True, sequence=reference.sequence)
+
+        def close(self):
+            events.append("close")
+
+    backend = Backend()
+    model = SimpleNamespace(urdf_path=config_path, arm_generalized_gravity=lambda _q: (0.,)*6)
+
+    def hold(backend, _model, **kwargs):
+        events.append("hold")
+        backend.cleanup = True
+        state = kwargs["feedback_reader"]()
+        assert state.valid
+        kwargs["stop"]["full_disable_requested"] = True
+        errors = ["synthetic hold cleanup error"] if cleanup_error else []
+        return 1, (0.,)*6, _fault_hold_command_receipt(accepted=True), None, backend.safe_stop(), errors
+
+    monkeypatch.setattr(probe.B601RSBackendConfig, "from_rs_yaml", lambda *a, **kw: config)
+    monkeypatch.setattr(probe, "B601RSBackend", lambda _config: backend)
+    monkeypatch.setattr(probe, "_resolve_model_and_limits", lambda _root: (model, _fault_hold_limits()))
+    monkeypatch.setattr(probe, "_resolve_effort_limits", lambda *a, **kw: (1.,)*6)
+    monkeypatch.setattr(probe, "_drive_enable_countdown", lambda _stop: True)
+    monkeypatch.setattr(probe, "_operator_notice", lambda _msg: None)
+    monkeypatch.setattr(probe, "_run_latched_fault_hold", hold)
+    monkeypatch.setattr(probe.signal, "signal", lambda *_a: None)
+    monkeypatch.setattr(probe.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(probe.time, "sleep", lambda delay: clock.__setitem__(0, clock[0]+delay))
+    monkeypatch.setattr(probe, "_resolve_runtime_log_path", lambda _args: tmp_path / "synthetic.log")
+    monkeypatch.setattr(probe, "_output_payload", lambda payload, _output: payloads.append(payload))
+    argv = ["--mode", "hold", "--config", str(config_path), "--rebot-source-root", str(tmp_path),
+            "--feedback-source", source, "--duration-sec", ".10", "--warmup-sec", ".05", "--rate-hz", "20",
+            "--allow-motion", "--auto-disable", "--apply-driver-torque-limits", "--confirmation", probe.CONFIRMATION]
+    if source == "active-report":
+        argv += ["--allow-active-report", "--auto-disable-active-report"]
+    return SimpleNamespace(args=probe.build_parser().parse_args(argv), argv=argv, backend=backend,
+                           events=events, polls=polls, payloads=payloads)
+
+
+@pytest.mark.parametrize("source", ["parameter", "active-report"])
+def test_feedback_diagnostics_runtime_samples_and_result_preserve_parameter_output(monkeypatch, tmp_path, source):
+    fixture = _feedback_diagnostics_probe_fixture(monkeypatch, tmp_path, source=source)
+    payload = probe.run_probe(fixture.args)
+    assert payload["samples"]
+    if source == "active-report":
+        assert payload["feedback_read_diagnostics"]["measure_intervals"] is False
+        assert all(row["feedback_read_diagnostics"]["measure_intervals"] is False for row in payload["samples"])
+        assert all(call == {"require_host_freshness": True, "prefer_active_report": True} for call in fixture.polls)
+    else:
+        assert "feedback_read_diagnostics" not in payload
+        assert all("feedback_read_diagnostics" not in row for row in payload["samples"])
+        assert all(call == {"request_feedback": True} for call in fixture.polls)
+    assert fixture.backend.dispatches >= 5
+    assert fixture.events[-1] == "close"
+
+
+@pytest.mark.parametrize("cleanup_error", [False, True])
+def test_feedback_primary_timeout_is_frozen_before_cleanup_and_keeps_cause(monkeypatch, tmp_path, cleanup_error):
+    fixture = _feedback_diagnostics_probe_fixture(monkeypatch, tmp_path, failure="settle", cleanup_error=cleanup_error)
+    with pytest.raises(probe.LowGainProbeError, match="within 0.025000s") as caught:
+        probe.run_probe(fixture.args)
+    error = caught.value
+    assert isinstance(error.__cause__, probe.LowGainProbeError)
+    assert "joint1 status_sequence did not advance" in str(error.__cause__)
+    report = error.feedback_read_diagnostics
+    assert report["rejection_counts"]["host_freshness_admission"] >= 1
+    assert report["retryable_error_count"] >= 1
+    assert "did not advance" in report["last_rejection"]["reason"]
+    assert report["measure_intervals"] is False
+    assert fixture.events.index("hold") < fixture.events.index("read_cleanup") < len(fixture.events)-1
+    assert ("; cleanup: synthetic hold cleanup error" in str(error)) is cleanup_error
+    assert fixture.events[-2:] == ["report_off", "close"]
+
+
+@pytest.mark.parametrize("failure", ["connect", "warmup", "arming", "settle"])
+def test_feedback_cli_error_payload_preserves_primary_diagnostics_and_exit_code(monkeypatch, tmp_path, failure):
+    fixture = _feedback_diagnostics_probe_fixture(monkeypatch, tmp_path, failure=failure)
+    assert probe.main(fixture.argv) == 2
+    payload, = fixture.payloads
+    assert payload["status"] == "ERROR" and payload["mode"] == "hold"
+    assert payload["error"]
+    if failure == "connect":
+        assert "feedback_read_diagnostics" not in payload
+    else:
+        report = payload["feedback_read_diagnostics"]
+        assert report["retryable_error_count"] >= 1
+        assert report["measure_intervals"] is False
+        assert report["first_rejection"]["stage"] == ("backend_poll" if failure == "warmup" else "host_freshness_admission")
+    assert fixture.events[-1] == "close"
+
+
+def test_feedback_warmup_keeps_single_poll_outer_budget_and_wait(monkeypatch, tmp_path):
+    fixture = _feedback_diagnostics_probe_fixture(monkeypatch, tmp_path, failure="warmup")
+    waits = []
+    original_sleep = probe.time.sleep
+
+    def sleep(delay):
+        waits.append(delay)
+        original_sleep(delay)
+
+    def no_inner_read(*_a, **_kw):
+        pytest.fail("warmup must not acquire a nested feedback timeout budget")
+
+    monkeypatch.setattr(probe.time, "sleep", sleep)
+    monkeypatch.setattr(probe, "_read_admitted_control_feedback", no_inner_read, raising=False)
+    with pytest.raises(probe.LowGainProbeError, match="during warmup"):
+        probe.run_probe(fixture.args)
+    assert len(fixture.polls) == 3
+    assert waits == [.01]*3
+    assert "enable" not in fixture.events and "dispatch" not in fixture.events
