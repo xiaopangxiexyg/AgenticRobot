@@ -44,7 +44,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m agent_gateway mujoco",
         description=(
-            "Serve the generic right-arm TCP-pose Agent Gateway on MuJoCo. "
+            "Serve a fixed-single-arm TCP-pose Agent Gateway on MuJoCo (default: right). "
             "This starts no Agent planner and connects no real device."
         ),
     )
@@ -63,6 +63,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         required=True,
         help="absolute MuJoCo task-config JSON path",
+    )
+    parser.add_argument(
+        "--motion-side",
+        choices=("left", "right"),
+        default="right",
+        help="fixed movable arm for this session; not per-request switching or simultaneous arms",
     )
     parser.add_argument(
         "--client-id",
@@ -161,21 +167,35 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="run MuJoCo stepping without realtime pacing (simulation only)",
     )
-    parser.add_argument("--enable-spatial-goals", action="store_true",
-                        help="Expose read-only endpoint relation calculation; does not authorize motion.")
-    parser.add_argument("--enable-tcp-pose-comparison", action="store_true",
-                        help="Expose explicit read_tcp_pose v2 comparison with a retained absolute safe target; no motion authority.")
+    parser.add_argument(
+        "--enable-spatial-goals",
+        action="store_true",
+        help="Expose read-only endpoint relation calculation; does not authorize motion.",
+    )
+    parser.add_argument(
+        "--enable-tcp-pose-comparison",
+        action="store_true",
+        help="Expose explicit read_tcp_pose v2 comparison with a retained absolute safe target; no motion authority.",
+    )
     parser.add_argument(
         "--enable-safe-tcp-pose",
         action="store_true",
         help="also publish collision-aware move_tcp_to_pose_safe using lower-owned joint paths",
     )
-    parser.add_argument("--enable-grippers", action="store_true",
-        help="publish bilateral atomic gripper Skills on the same deterministic MuJoCo owner")
-    parser.add_argument("--enable-grasp-approach", action="store_true",
-        help="publish right-arm approach_grasp_pose with an absolute envelope and noncontact joint planning; requires grippers and no realtime worker")
-    parser.add_argument("--grasp-contact-target-body",
-        help="also publish bounded terminal contact for this task object and its profile-bound right sensors")
+    parser.add_argument(
+        "--enable-grippers",
+        action="store_true",
+        help="publish bilateral atomic gripper Skills on the same deterministic MuJoCo owner",
+    )
+    parser.add_argument(
+        "--enable-grasp-approach",
+        action="store_true",
+        help="publish right-arm approach_grasp_pose with an absolute envelope and noncontact joint planning; requires grippers and no realtime worker",
+    )
+    parser.add_argument(
+        "--grasp-contact-target-body",
+        help="also publish bounded terminal contact for this task object and its profile-bound right sensors",
+    )
     parser.add_argument(
         "--safe-tcp-planning-clearance-padding-m",
         type=float,
@@ -397,6 +417,18 @@ def _prepare_gateway_before_ready(*, session: Any, viewer: Any | None) -> None:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.motion_side == "left" and (
+        args.enable_grippers
+        or args.enable_grasp_approach
+        or args.grasp_contact_target_body is not None
+        or args.enable_spatial_goals
+        or args.history_root is not None
+        or args.segmentation_asset_bundle is not None
+    ):
+        parser.error(
+            "--motion-side left currently supports baseline TCP/state Routes only; "
+            "gripper, grasp, spatial goal, history and segmentation combinations are not enabled"
+        )
     task_config = _absolute_existing_file(parser, args.task_config)
     socket_path = _absolute_path(parser, args.socket_path, flag="--socket-path")
     if args.client_uid < 0:
@@ -483,12 +515,15 @@ def main(argv: list[str] | None = None) -> int:
         runtime_session_id=runtime_session_id,
         control_domain_id=args.control_domain_id,
         execution_observation_plan=(
-            mujoco_agent_tcp_pose_execution_observation_plan_v1()
+            mujoco_agent_tcp_pose_execution_observation_plan_v1(
+                motion_side=args.motion_side
+            )
         ),
-        exposed_pose_sides=("right",),
+        exposed_pose_sides=(args.motion_side,),
         allow_scripted_task_reset=False,
     )
     session = build_mujoco_agent_tcp_pose_gateway_session(
+        motion_side=args.motion_side,
         enable_grippers=args.enable_grippers,
         target_config=target_config,
         allowed_client_ids=client_bindings.allowed_client_ids,

@@ -62,23 +62,35 @@ MUJOCO_AGENT_TCP_POSE_SNAPSHOT_ID_HASH_DOMAIN_V1 = (
 MUJOCO_AGENT_TCP_POSE_SAMPLE_ID_HASH_DOMAIN_V1 = (
     "dexteleop.agent_state.mujoco_tcp_pose_sample_id.v1"
 )
-MUJOCO_AGENT_TCP_POSE_OBSERVATION_CONTRACT_HASH_V1 = canonical_content_hash(
-    {
-        "contract_id": "dexteleop.agent_state.mujoco_tcp_pose_observation.v1",
-        "stream_id": "robot_state.right_arm.tool_tcp_pose",
-        "payload": "xyz+quat_xyzw",
-        "measurement_owner": "mujoco_scene_ground_truth",
-    },
-    domain="dexteleop.agent_state.observation_contract.v1",
+
+
+def _tcp_pose_observation_contract_hash(component_id: str) -> str:
+    return canonical_content_hash(
+        {
+            "contract_id": "dexteleop.agent_state.mujoco_tcp_pose_observation.v1",
+            "stream_id": f"robot_state.{component_id}.tool_tcp_pose",
+            "payload": "xyz+quat_xyzw",
+            "measurement_owner": "mujoco_scene_ground_truth",
+        },
+        domain="dexteleop.agent_state.observation_contract.v1",
+    )
+
+
+def _tcp_pose_io_layout_hash(component_id: str) -> str:
+    return canonical_content_hash(
+        {
+            "layout_id": "dexteleop.agent_state.tcp_pose_read.v1",
+            "input_streams": (f"robot_state.{component_id}.tool_tcp_pose",),
+            "output": "measured_tcp_pose_projection",
+        },
+        domain="dexteleop.agent_state.io_layout.v1",
+    )
+
+
+MUJOCO_AGENT_TCP_POSE_OBSERVATION_CONTRACT_HASH_V1 = (
+    _tcp_pose_observation_contract_hash("right_arm")
 )
-MUJOCO_AGENT_TCP_POSE_IO_LAYOUT_HASH_V1 = canonical_content_hash(
-    {
-        "layout_id": "dexteleop.agent_state.tcp_pose_read.v1",
-        "input_streams": ("robot_state.right_arm.tool_tcp_pose",),
-        "output": "measured_tcp_pose_projection",
-    },
-    domain="dexteleop.agent_state.io_layout.v1",
-)
+MUJOCO_AGENT_TCP_POSE_IO_LAYOUT_HASH_V1 = _tcp_pose_io_layout_hash("right_arm")
 
 
 @dataclass(frozen=True)
@@ -133,6 +145,8 @@ def _finite(value: object, *, field_name: str) -> float:
 class MujocoAgentObservationProducer:
     """Single-session snapshot/revision owner for one constructed graph."""
 
+    _component_id: str = "right_arm"
+
     def __init__(
         self,
         *,
@@ -164,6 +178,20 @@ class MujocoAgentObservationProducer:
         runtime = getattr(application, "runtime", None)
         runtime_config = getattr(runtime, "config", None)
         binding = contract_bundle.deployment_binding
+        component_id = getattr(binding, "component_id", None)
+        if component_id not in {"left_arm", "right_arm"}:
+            raise ValueError("Observation producer requires one bound arm component.")
+        motion_side = component_id.removesuffix("_arm")
+        if (
+            getattr(application, "component_id", "right_arm") != component_id
+            or getattr(application, "motion_side", "right") != motion_side
+            or tuple(getattr(getattr(runtime, "action_schema", None), "component_ids", ()))
+            != (component_id,)
+        ):
+            raise ValueError("Observation producer application motion side mismatch.")
+        state_binding = getattr(contract_bundle, "state_deployment_binding", None)
+        if state_binding is not None and state_binding.component_id != component_id:
+            raise ValueError("Observation producer state binding component mismatch.")
         if (
             source_binding.runtime_session_id != binding.runtime_session_id
             or source_binding.control_domain_id != binding.control_domain_id
@@ -195,11 +223,13 @@ class MujocoAgentObservationProducer:
             not bool(getattr(observation_plan, "enabled", False))
             or getattr(observation_plan, "measurement_mode", None) == "off"
             or tuple(getattr(observation_plan, "component_ids", ()))
-            != ("right_arm",)
+            != (component_id,)
             or getattr(observation_plan, "semantic_content_hash", None)
             != binding.observation_plan_hash
         ):
-            raise ValueError("Observation producer requires the exact right TCP plan.")
+            raise ValueError(
+                f"Observation producer requires the exact {motion_side} TCP plan."
+            )
         observation_binding = getattr(runtime, "execution_observation_binding", None)
         observation_binding_id = _required(
             getattr(observation_binding, "binding_id", None),
@@ -222,11 +252,11 @@ class MujocoAgentObservationProducer:
         )
         pose_schema_hash = (
             _required(
-                schema_hash_by_component["right_arm"],
-                field_name="right_arm pose schema hash",
+                schema_hash_by_component[component_id],
+                field_name=f"{component_id} pose schema hash",
             )
-            if representation_by_component.get("right_arm") == "cartesian_pose"
-            and "right_arm" in schema_hash_by_component
+            if representation_by_component.get(component_id) == "cartesian_pose"
+            and component_id in schema_hash_by_component
             else None
         )
 
@@ -239,11 +269,11 @@ class MujocoAgentObservationProducer:
         reference_frame_by_component = dict(
             getattr(target_profile, "reference_frame_by_component", {})
         )
-        if "right_arm" not in reference_frame_by_component:
-            raise ValueError("Target profile lacks the right_arm reference frame.")
+        if component_id not in reference_frame_by_component:
+            raise ValueError(f"Target profile lacks the {component_id} reference frame.")
         execution_reference_frame_id = _required(
-            reference_frame_by_component["right_arm"],
-            field_name="right_arm execution reference frame",
+            reference_frame_by_component[component_id],
+            field_name=f"{component_id} execution reference frame",
         )
         reference_frame_id = _required(
             getattr(target_profile, "canonical_reference_frame_id", None),
@@ -259,7 +289,7 @@ class MujocoAgentObservationProducer:
         frame_graph.resolve(execution_reference_frame_id, reference_frame_id)
         reference_frame_spec_hash = _required(
             getattr(frame_spec, "semantic_content_hash", None),
-            field_name="right_arm reference frame spec hash",
+            field_name=f"{component_id} reference frame spec hash",
         )
 
         tool_profile = getattr(application, "tool_frame_profile", None)
@@ -268,11 +298,12 @@ class MujocoAgentObservationProducer:
         ):
             raise ValueError("Observation producer tool profile mismatch.")
         tool_binding = getattr(tool_profile, "binding_by_component", {}).get(
-            "right_arm"
+            component_id
         )
         if getattr(tool_binding, "controlled_frame_id", None) != "tool_tcp":
-            raise ValueError("Observation producer requires right_arm tool_tcp.")
+            raise ValueError(f"Observation producer requires {component_id} tool_tcp.")
 
+        self._component_id = component_id
         self.application = application
         self.contract_bundle = contract_bundle
         self.revision_tracker = tracker
@@ -293,6 +324,8 @@ class MujocoAgentObservationProducer:
             None,
         )
         if history_source_binding is not None:
+            if motion_side != "right":
+                raise ValueError("TCP pose history is supported only for right motion_side.")
             if not isinstance(
                 history_source_binding,
                 SourceObservationHistoryBinding,
@@ -312,6 +345,14 @@ class MujocoAgentObservationProducer:
         self._next_snapshot_sequence = 0
 
     @property
+    def component_id(self) -> str:
+        return self._component_id
+
+    @property
+    def motion_side(self) -> str:
+        return self.component_id.removesuffix("_arm")
+
+    @property
     def current_station_revision(self) -> int:
         return self.revision_tracker.current_revision
 
@@ -323,7 +364,7 @@ class MujocoAgentObservationProducer:
                 scene,
                 self.application.task_config,
             )
-            raw_vector = pose_matrix_to_xyzquat(pose_by_side["right"])
+            raw_vector = pose_matrix_to_xyzquat(pose_by_side[self.motion_side])
             vector = (
                 None
                 if raw_vector is None
@@ -336,7 +377,7 @@ class MujocoAgentObservationProducer:
             if vector is not None:
                 values = [float(item) for item in vector]
                 if len(values) == 7 and all(math.isfinite(item) for item in values):
-                    pose_by_component["right_arm"] = values
+                    pose_by_component[self.component_id] = values
         return {
             "finite_state": finite_state,
             "pose_xyz_quat_xyzw_by_component": pose_by_component,
@@ -355,8 +396,8 @@ class MujocoAgentObservationProducer:
         pose_by_component: dict[str, list[float]] = {}
         if isinstance(raw_pose_by_component, Mapping) and set(
             raw_pose_by_component
-        ) == {"right_arm"}:
-            raw_pose = raw_pose_by_component["right_arm"]
+        ) == {self.component_id}:
+            raw_pose = raw_pose_by_component[self.component_id]
             if isinstance(raw_pose, (tuple, list)) and len(raw_pose) == 7:
                 try:
                     pose = [float(item) for item in raw_pose]
@@ -370,26 +411,26 @@ class MujocoAgentObservationProducer:
                     and all(math.isfinite(item) for item in pose)
                     and abs(quaternion_norm - 1.0) <= 1e-5
                 ):
-                    pose_by_component["right_arm"] = pose
+                    pose_by_component[self.component_id] = pose
         measurement_valid = bool(
             isinstance(projection, Mapping)
             and projection.get("finite_state") is True
-            and set(pose_by_component) == {"right_arm"}
+            and set(pose_by_component) == {self.component_id}
             and cut.lifecycle_state not in {"closed", "restart_required"}
         )
         payload = {
             "schema": MUJOCO_AGENT_TCP_POSE_SUMMARY_SCHEMA_V1,
             "status": "valid" if measurement_valid else "invalid",
             "source_kind": "mujoco_scene_ground_truth",
-            "component_ids": ["right_arm"],
+            "component_ids": [self.component_id],
             "reference_frame_id_by_component": {
-                "right_arm": self.reference_frame_id,
+                self.component_id: self.reference_frame_id,
             },
             "reference_frame_spec_hash_by_component": {
-                "right_arm": self.reference_frame_spec_hash,
+                self.component_id: self.reference_frame_spec_hash,
             },
             "controlled_frame_id_by_component": {
-                "right_arm": "tool_tcp",
+                self.component_id: "tool_tcp",
             },
             "pose_xyz_quat_xyzw_by_component": pose_by_component,
             "observation_binding_id": self.observation_binding_id,
@@ -434,7 +475,7 @@ class MujocoAgentObservationProducer:
         )
         if not isinstance(pose_by_component, Mapping) or set(
             pose_by_component
-        ) != {"right_arm"}:
+        ) != {self.component_id}:
             raise ValueError("Passive TCP pose measurement is incomplete.")
         sample_identity_hash = canonical_content_hash(
             {
@@ -449,7 +490,7 @@ class MujocoAgentObservationProducer:
         )
         measurement_id = f"mujoco-tcp-pose-measurement:{sample_identity_hash}"
         sample = ObservationSampleRef(
-            stream_id="robot_state.right_arm.tool_tcp_pose",
+            stream_id=f"robot_state.{self.component_id}.tool_tcp_pose",
             sample_id=measurement_id,
             sequence=sequence,
             measured_at=cut.captured_at,
@@ -479,9 +520,9 @@ class MujocoAgentObservationProducer:
             built_clock_domain_id=control_cut.clock_domain_id,
             selected_sample_by_stream={sample.stream_id: sample},
             observation_contract_hash=(
-                MUJOCO_AGENT_TCP_POSE_OBSERVATION_CONTRACT_HASH_V1
+                _tcp_pose_observation_contract_hash(self.component_id)
             ),
-            policy_io_layout_hash=MUJOCO_AGENT_TCP_POSE_IO_LAYOUT_HASH_V1,
+            policy_io_layout_hash=_tcp_pose_io_layout_hash(self.component_id),
             trigger_reason="agent_gateway_passive_tcp_pose_capture",
         )
         measurement = ExecutionMeasurementObservation(
@@ -492,11 +533,11 @@ class MujocoAgentObservationProducer:
             available_at=control_cut.cutoff_at,
             clock_domain_id=control_cut.clock_domain_id,
             value_by_component={
-                "right_arm": pose_by_component["right_arm"],
+                self.component_id: pose_by_component[self.component_id],
             },
-            representation_by_component={"right_arm": "cartesian_pose"},
+            representation_by_component={self.component_id: "cartesian_pose"},
             schema_hash_by_component={
-                "right_arm": self.pose_schema_hash,
+                self.component_id: self.pose_schema_hash,
             },
             observation_binding_id=self.observation_binding_id,
             observation_plan_hash=(
@@ -644,12 +685,12 @@ class MujocoAgentObservationProducer:
             )
         requested = parameters.get("component_ids")
         if not isinstance(requested, (list, tuple)) or tuple(requested) != (
-            "right_arm",
+            self.component_id,
         ):
-            raise ValueError("This deployment exposes only right_arm TCP pose.")
+            raise ValueError(f"This deployment exposes only {self.component_id} TCP pose.")
         if parameters.get("reference_frame_id") != self.reference_frame_id:
             raise ValueError("Requested reference frame is not deployment-bound.")
-        pose = measurement.value_by_component["right_arm"]
+        pose = measurement.value_by_component[self.component_id]
         binding = self.contract_bundle.deployment_binding
         result = {
             "observation_cut_id": observation_cut.observation_cut_id,
@@ -658,7 +699,7 @@ class MujocoAgentObservationProducer:
             "cutoff_clock_domain_id": (
                 observation_cut.cutoff_clock_domain_id
             ),
-            "component_ids": ["right_arm"],
+            "component_ids": [self.component_id],
             "reference_frame_id": self.reference_frame_id,
             "reference_frame_spec_hash": self.reference_frame_spec_hash,
             "controlled_frame_id": "tool_tcp",
@@ -673,12 +714,12 @@ class MujocoAgentObservationProducer:
             "measured_at": measurement.measured_at,
             "available_at": measurement.available_at,
             "clock_domain_id": measurement.clock_domain_id,
-            "pose_by_component": {"right_arm": list(pose)},
+            "pose_by_component": {self.component_id: list(pose)},
             "pose_schema_hash_by_component": {
-                "right_arm": measurement.schema_hash_by_component["right_arm"],
+                self.component_id: measurement.schema_hash_by_component[self.component_id],
             },
             "representation_by_component": {
-                "right_arm": "cartesian_pose",
+                self.component_id: "cartesian_pose",
             },
             "observation_binding_id": self.observation_binding_id,
             "observation_plan_hash": binding.observation_plan_hash,
@@ -687,7 +728,7 @@ class MujocoAgentObservationProducer:
             schema_kind="tcp_pose",
             parameters=parameters,
             result=result,
-            allowed_component_ids=("right_arm",),
+            allowed_component_ids=(self.component_id,),
         )
         return MujocoAgentTcpPoseStateRead(
             snapshot=capture.snapshot,

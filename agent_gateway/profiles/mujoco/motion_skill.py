@@ -38,7 +38,6 @@ from dataset_contracts.canonical_encoding import canonical_content_hash
 from robot_motion.action import ComponentAction
 from robot_motion.path_planning import JointConfigurationCheck
 from robot_motion.relative_action import xyzquat_to_pose_matrix
-from robot_motion.relative_action import xyzquat_to_pose_matrix
 from robot_motion.target_safety import (
     TCPPoseEnvelopeLifecycleError,
     TCPPoseEnvelopeSafetyRuntime,
@@ -1148,10 +1147,11 @@ class MujocoAgentSafeTcpPoseSkillLifecycle(MujocoAgentTcpPoseSkillLifecycle):
         if not evidence.succeeded:
             return evidence
         safety = self.application.tcp_pose_envelope_runtime
+        motion_side = self.component_id.removesuffix("_arm")
         constraint = None
         constraint_identity = None
         if safety is not None:
-            initial = safety.project({"right": xyzquat_to_pose_matrix(measured)})
+            initial = safety.project({motion_side: xyzquat_to_pose_matrix(measured)})
             basis = (initial.envelope_profile_hash, initial.anchor_hash)
             constraint_identity = canonical_content_hash(
                 {"profile": basis[0], "anchor": basis[1]},
@@ -1160,7 +1160,7 @@ class MujocoAgentSafeTcpPoseSkillLifecycle(MujocoAgentTcpPoseSkillLifecycle):
 
             def constraint(model_qpos, pair):
                 pose = self._planner.pose_for_configuration(model_qpos, pair)
-                projection = safety.project({"right": xyzquat_to_pose_matrix(pose)})
+                projection = safety.project({motion_side: xyzquat_to_pose_matrix(pose)})
                 same_basis = (
                     projection.envelope_profile_hash,
                     projection.anchor_hash,
@@ -1207,7 +1207,7 @@ class MujocoAgentSafeTcpPoseSkillLifecycle(MujocoAgentTcpPoseSkillLifecycle):
         try:
             if safety is not None:
                 for index, pose in enumerate(plan.reference_poses):
-                    projection = safety.project({"right": xyzquat_to_pose_matrix(pose)})
+                    projection = safety.project({motion_side: xyzquat_to_pose_matrix(pose)})
                     if projection.modified_sides:
                         raise MujocoTcpPlanRejected(
                             "safe_tcp_path_safety_envelope_blocked",

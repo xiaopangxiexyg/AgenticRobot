@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import time
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from robot_motion.action import ExecutionObservationSink
@@ -23,7 +23,7 @@ from .target_preparation import (
 
 @dataclass(frozen=True)
 class MujocoAgentSkillMotionTarget:
-    """No-model right-arm action target on a rig with a separate gripper actuator."""
+    """No-model single-arm action target on the existing dual-arm rig."""
 
     task_config: Any
     scene: Any
@@ -33,6 +33,15 @@ class MujocoAgentSkillMotionTarget:
     task_initialization_info: Mapping[str, object]
     tcp_pose_envelope_runtime: Any | None = None
     planned_tcp_motion: Any | None = None
+    motion_side: str = field(default="right", kw_only=True)
+
+    def __post_init__(self) -> None:
+        if type(self.motion_side) is not str or self.motion_side not in ("left", "right"):
+            raise ValueError("motion_side must be exactly 'left' or 'right'.")
+
+    @property
+    def component_id(self) -> str:
+        return self.motion_side + "_arm"
 
 
 def build_mujoco_agent_skill_motion_target(
@@ -45,8 +54,9 @@ def build_mujoco_agent_skill_motion_target(
     tcp_pose_envelope_runtime: Any | None = None,
     enable_safe_tcp_pose: bool = False,
     safe_tcp_planning_clearance_padding_m: float = 0.002,
+    motion_side: str = "right",
 ) -> MujocoAgentSkillMotionTarget:
-    """Build the first no-model, right-arm Agent Skill execution target.
+    """Build one no-model Agent Skill target with a fixed motion side.
 
     The direct source only emits the runtime's exact ``ComponentAction``.
     Canonical safety, coupled IK, reference generation and dispatch remain in
@@ -55,6 +65,9 @@ def build_mujoco_agent_skill_motion_target(
 
     if not isinstance(config, MujocoSimHILTargetConfig):
         raise TypeError("config must be a MujocoSimHILTargetConfig.")
+    if type(motion_side) is not str or motion_side not in ("left", "right"):
+        raise ValueError("motion_side must be exactly 'left' or 'right'.")
+    component_id = motion_side + "_arm"
     if not isinstance(enable_safe_tcp_pose, bool):
         raise TypeError("enable_safe_tcp_pose must be boolean.")
     if config.allow_scripted_task_reset:
@@ -75,13 +88,13 @@ def build_mujoco_agent_skill_motion_target(
     materializer = getattr(component_execution_binding, "materializer", None)
     profile = getattr(materializer, "profile", None)
     if (
-        tuple(getattr(action_schema, "component_ids", ())) != ("right_arm",)
+        tuple(getattr(action_schema, "component_ids", ())) != (component_id,)
         or dict(getattr(profile, "arm_side_by_component", {}))
-        != {"right_arm": "right"}
+        != {component_id: motion_side}
         or dict(getattr(profile, "gripper_name_by_component", {}))
     ):
         raise ValueError(
-            "The first Agent motion target requires one right_arm pose "
+            f"The first Agent motion target requires one {component_id} pose "
             "component and no hand/gripper component."
         )
 
@@ -127,7 +140,7 @@ def build_mujoco_agent_skill_motion_target(
             timing=prepared.timing,
             active_sides=("left", "right"),
             actuation_profile=prepared.arm_profile,
-            # The ComponentAction schema remains right_arm-only. The existing
+            # The ComponentAction schema remains single-arm. The existing
             # gripper Skill binds this actuator through its own lower port.
             gripper_actuation_profile=prepared.gripper_profile,
             realtime_worker=config.realtime_worker,
@@ -314,6 +327,7 @@ def build_mujoco_agent_skill_motion_target(
             pose_projector=pose_projector,
             reference_hz=prepared.compose_target_hz,
             planning_clearance_padding_m=safe_tcp_planning_clearance_padding_m,
+            motion_side=motion_side,
         )
     runtime = MujocoDeployRuntime(
         rig,
@@ -370,6 +384,7 @@ def build_mujoco_agent_skill_motion_target(
         task_initialization_info=prepared.task_initialization_info,
         tcp_pose_envelope_runtime=tcp_pose_envelope_runtime,
         planned_tcp_motion=planned_tcp_motion,
+        motion_side=motion_side,
     )
 
 

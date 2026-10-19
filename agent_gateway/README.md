@@ -1296,7 +1296,7 @@ when the lower Skill is activated. Distance, frame/tool/calibration identities,
 primitive hash, safety envelope, IK, dispatch, evaluation, and HOLD remain
 trusted deployment facts.
 
-MuJoCo 的现有入口可显式增加 `--enable-safe-tcp-pose`，为右臂发布
+MuJoCo 的现有入口可显式增加 `--enable-safe-tcp-pose`，为会话选定的一臂发布
 `motion.move_tcp_to_pose_safe@1`；默认不发布。该 Route 使用当前场景、另一臂的
 实测起点和已绑定工具配置，复用下层 RM65 IK、BiRRT-Connect、C2 时间参数化
 及原有唯一执行链。逐参考复核继续使用同一已接纳 TCP 包络，绑定改变时拒绝执行。
@@ -1307,6 +1307,20 @@ MuJoCo 的现有入口可显式增加 `--enable-safe-tcp-pose`，为右臂发布
 不替换为普通 move-to。相机未建模障碍、未建模负载、抓取接近及携物不属于该
 Route 的能力；这项接入也不发布双夹爪 v2。完成、取消和关闭仍需下层 HOLD 证据。
 模拟验证与真机验收分别记录。
+
+MuJoCo 入口可用 `--motion-side left|right` 选择这一会话唯一可驱动的机械臂，
+默认仍为 `right`。factory 对应参数为 `motion_side`；自行构造 target config 的调用方
+还须让 `exposed_pose_sides` 与 `mujoco_agent_tcp_pose_execution_observation_plan_v1`
+的 `motion_side` 一致。双臂／`both` 请求不会自动拆分，也不支持在同一会话切换控制侧。
+左右侧使用各自工具标定、arm-base 与公开 Station 转换、状态 schema 和包络身份；
+另一臂仅作为同一 rig 中的实测 support。安全规划与执行复用原 owner、碰撞 oracle、
+硬限制、完整路径复验和 HOLD；原有 support 关节漂移检查保持 0.001 rad，不代表另一臂
+在物理仿真中绝对零位移。默认右臂的公开合同不变，不改变真机入口。
+
+显式左臂组合目前支持基础 TCP/state、可选 safe TCP、可选 TCP comparison v2，
+以及独立启用的只读 RGB-D Artifact capture；尚未接通左臂的 gripper、grasp、spatial goal、
+history 或 segmentation 组合会在创建场景／资源前拒绝，不发布只改标签的伪左臂能力。
+这些组合仍可按默认右臂入口使用。该配置增加的是已有 Skill 的部署覆盖，不新增日常工具名。
 
 MuJoCo 可显式组合 `--enable-grasp-approach --enable-grippers --no-realtime-worker`，
 发布 `motion.approach_grasp_pose@1`。它复用同一 planned-motion、operation slot
@@ -1334,10 +1348,10 @@ Target-independent motion semantics and payload schemas live in
 `skills/motion`. They also define fixed level-orientation Skills for forward,
 forward-left 30 degrees, and forward-right 30 degrees. Together, the cardinal
 Skill's six enum choices and the three fixed-orientation Skill identities expose
-nine bounded lower primitives. The current single-right-arm no-model launcher
+nine bounded lower primitives. The fixed-single-arm no-model launcher
 publishes all nine through exact MuJoCo Routes. Cardinal directions and absolute
 headings are resolved in the canonical Station frame, then transformed into the
-right-arm execution frame; the arm-base frame is not relabelled as canonical
+selected-arm execution frame; the arm-base frame is not relabelled as canonical
 desk axes. Fixed orientations use their own route-scoped safety envelope because
 they preserve translation but may require a larger angular correction than a
 cardinal step or generic small pose move. Publication still grants no motion by

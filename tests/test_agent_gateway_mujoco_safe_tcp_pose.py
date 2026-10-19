@@ -29,7 +29,8 @@ TASK = Path("sim/configs/tasks/rm65_right_cube_reach_fixed_pose_xyz_proprio_v1.j
 CLIENT = "test:mujoco-safe-tcp"
 
 
-def _session(trace, *, after_fact=None, task=TASK, spatial=False, grasp=False, contact_target=None):
+def _session(trace, *, after_fact=None, task=TASK, spatial=False, grasp=False,
+             contact_target=None, motion_side="right"):
     def consume(fact):
         trace.append(fact)
         if after_fact is not None:
@@ -41,11 +42,14 @@ def _session(trace, *, after_fact=None, task=TASK, spatial=False, grasp=False, c
             realtime_worker=False,
             runtime_session_id="test:mujoco-safe-tcp",
             control_domain_id="test:mujoco-safe-tcp",
-            execution_observation_plan=mujoco_agent_tcp_pose_execution_observation_plan_v1(),
-            exposed_pose_sides=("right",),
+            execution_observation_plan=mujoco_agent_tcp_pose_execution_observation_plan_v1(
+                motion_side=motion_side,
+            ),
+            exposed_pose_sides=(motion_side,),
             allow_scripted_task_reset=False,
         ),
         allowed_client_ids=(CLIENT,),
+        motion_side=motion_side,
         trace_sink=consume,
         enable_safe_tcp_pose=True,
         enable_spatial_goals=spatial,
@@ -81,7 +85,7 @@ def _request(session, adapter, target, *, sequence=0, skill_id="motion.move_tcp_
         parameter_profile_id=parameter.parameter_profile_id,
         parameter_profile_hash=parameter.parameter_profile_hash,
         parameters={
-            "pose_targets_by_component": {"right_arm": target},
+            "pose_targets_by_component": {profile.component_id: target},
             "reference_frame_id": profile.reference_frame_id,
             "reference_frame_spec_hash": profile.reference_frame_spec_hash,
             "controlled_frame_id": "tool_tcp",
@@ -603,8 +607,9 @@ def test_safe_move_already_satisfied_confirms_hold_without_commands(
 
 
 @pytest.mark.integration
+@pytest.mark.parametrize("motion_side", ("right", "left"))
 def test_cancelled_safe_move_replans_from_measured_hold_without_old_references(
-    monkeypatch, record_property
+    monkeypatch, record_property, motion_side
 ):
     facts, plans = [], []
     executing = threading.Event()
@@ -617,9 +622,11 @@ def test_cancelled_safe_move_replans_from_measured_hold_without_old_references(
             if reference_count == 3:
                 executing.set()
 
-    session = _session(facts, after_fact=observe_progress)
+    session = _session(facts, after_fact=observe_progress, motion_side=motion_side)
     try:
         application = session.application
+        component_id = application.component_id
+        assert application.motion_side == motion_side
         application.start_observation_ready()
         adapter = session.wire_adapter(authenticated_client_id=CLIENT)
         planner = application.target.planned_tcp_motion
@@ -634,7 +641,7 @@ def test_cancelled_safe_move_replans_from_measured_hold_without_old_references(
         observation = adapter.get_observation_snapshot()
         target = list(
             observation["measurement_summary"]["pose_xyz_quat_xyzw_by_component"][
-                "right_arm"
+                component_id
             ]
         )
         target[2] += 0.08
@@ -668,11 +675,11 @@ def test_cancelled_safe_move_replans_from_measured_hold_without_old_references(
         assert application.held and not planner.active
         with pytest.raises(MujocoTcpPlanRejected, match="no_active_plan"):
             planner.reference(0)
-        held_q = application.runtime.rig.measured_qpos_by_side()["right"].copy()
+        held_q = application.runtime.rig.measured_qpos_by_side()[motion_side].copy()
         observation = adapter.get_observation_snapshot()
         target = list(
             observation["measurement_summary"]["pose_xyz_quat_xyzw_by_component"][
-                "right_arm"
+                component_id
             ]
         )
         target[2] += 0.03
@@ -690,10 +697,10 @@ def test_cancelled_safe_move_replans_from_measured_hold_without_old_references(
         assert len(plans) == 2
         assert plans[0].trajectory_hash != plans[1].trajectory_hash
         np.testing.assert_allclose(
-            plans[1].path.start_qpos_by_component["right"], held_q, atol=1e-6
+            plans[1].path.start_qpos_by_component[motion_side], held_q, atol=1e-6
         )
         restarted_references = [
-            fact.payload["payload"]["output_values_by_effector"]["right_arm"]
+            fact.payload["payload"]["output_values_by_effector"][component_id]
             for fact in facts[restart_trace_index:]
             if fact.event_type == "component_execution_target"
         ]
@@ -703,6 +710,8 @@ def test_cancelled_safe_move_replans_from_measured_hold_without_old_references(
             "cancel_and_replan_json",
             json.dumps(
                 {
+                    "motion_side": motion_side,
+                    "component_id": component_id,
                     "cancel_receipt": cancelled["port_receipt"],
                     "cancelled_operation_id": first_operation.operation_id,
                     "new_operation_id": second_operation.operation_id,
@@ -718,15 +727,18 @@ def test_cancelled_safe_move_replans_from_measured_hold_without_old_references(
 
 
 @pytest.mark.integration
-def test_safe_gateway_close_fences_an_inflight_request(record_property):
-    session = _session([])
+@pytest.mark.parametrize("motion_side", ("right", "left"))
+def test_safe_gateway_close_fences_an_inflight_request(record_property, motion_side):
+    session = _session([], motion_side=motion_side)
     try:
+        component_id = session.application.component_id
+        assert session.application.motion_side == motion_side
         session.application.start_observation_ready()
         adapter = session.wire_adapter(authenticated_client_id=CLIENT)
         target = list(
             adapter.get_observation_snapshot()["measurement_summary"][
                 "pose_xyz_quat_xyzw_by_component"
-            ]["right_arm"]
+            ][component_id]
         )
         target[2] += 0.08
         admitted = adapter.submit_skill_request(
@@ -747,6 +759,8 @@ def test_safe_gateway_close_fences_an_inflight_request(record_property):
             "close_evidence",
             json.dumps(
                 {
+                    "motion_side": motion_side,
+                    "component_id": component_id,
                     "accepted": outcome.accepted,
                     "lower_hold_proved": outcome.port_receipt.proves_motion_or_hold,
                 }
