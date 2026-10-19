@@ -72,6 +72,88 @@ def test_inconsistent_same_level_is_not_forced_into_a_binary_result():
     assert search.status()["usable_hold_nm"] is None
 
 
+@pytest.mark.parametrize("sign", [-1, 1])
+def test_censored_withdrawal_refines_next_probe_without_fabricating_motion_bound(sign):
+    search = HoldingForceSearch(HoldingSearchConfig(), seed_nm=sign * 0.304858, cap_nm=1)
+    search.record(command_nm=search.candidate_nm, outcome="stationary", evidence={})
+    assert search.candidate_nm == 0
+    search.record_transition(
+        command_nm=sign * 0.070971,
+        requested_command_nm=0,
+        evidence={"outcome": "censored_plateau_outside_point"},
+    )
+    first_retry = search.candidate_nm
+    assert first_retry == pytest.approx(sign * (0.304858 + 0.070971) / 2)
+    result = search.status(detailed=True)
+    assert result["trial_count"] == 1
+    assert result["transition_count"] == 1
+    assert result["negative_motion_below_nm"] is None
+    assert result["positive_motion_above_nm"] is None
+    assert result["usable_hold_nm"] is None
+    # Even a successful smaller probe must not restart the failed zero sweep.
+    search.record(command_nm=first_retry, outcome="stationary", evidence={})
+    assert abs(sign * 0.070971) < abs(search.candidate_nm) < abs(first_retry)
+
+
+def test_resolved_nonzero_motion_bound_is_used_before_retrying_zero():
+    search = HoldingForceSearch(HoldingSearchConfig(), seed_nm=-0.3, cap_nm=1)
+    search.record(command_nm=-0.3, outcome="stationary", evidence={})
+    search.record(command_nm=-0.1, outcome="positive_motion", evidence={})
+    assert search.candidate_nm == pytest.approx(-0.2)
+
+
+def test_transition_refinement_requires_a_repeated_hold_not_a_fabricated_root():
+    search = HoldingForceSearch(HoldingSearchConfig(), seed_nm=-0.3, cap_nm=1)
+    search.record(command_nm=-0.3, outcome="stationary", evidence={})
+    search.record_transition(command_nm=-0.28, requested_command_nm=0, evidence={})
+    assert search.candidate_nm == -0.3
+    assert search.state == "searching"
+    search.record(command_nm=-0.3, outcome="stationary", evidence={})
+    assert search.state == "complete"
+    assert search.status()["usable_hold_nm"] == -0.3
+    assert search.status()["positive_motion_above_nm"] is None
+
+
+@pytest.mark.parametrize("command", [True, float("nan"), 1.001])
+def test_transition_rejects_invalid_command_without_mutating_search(command):
+    search = HoldingForceSearch(HoldingSearchConfig(), seed_nm=-0.3, cap_nm=1)
+    search.record(command_nm=-0.3, outcome="stationary", evidence={})
+    with pytest.raises(ValueError, match="envelope"):
+        search.record_transition(command_nm=command, requested_command_nm=0, evidence={})
+    assert search.transitions == []
+    assert search.candidate_nm == 0
+
+
+def test_censored_attempts_remain_in_original_finite_trial_budget():
+    search = HoldingForceSearch(HoldingSearchConfig(max_trials=2), seed_nm=-0.3, cap_nm=1)
+    search.record(command_nm=-0.3, outcome="stationary", evidence={})
+    search.record_transition(command_nm=-0.1, requested_command_nm=0, evidence={})
+    assert search.state == "incomplete"
+    assert search.reason == "holding_trial_budget_exhausted"
+    assert search.status()["usable_hold_nm"] is None
+
+
+def test_stale_transition_cannot_change_a_later_probe():
+    search = HoldingForceSearch(HoldingSearchConfig(), seed_nm=-0.3, cap_nm=1)
+    search.record(command_nm=-0.3, outcome="stationary", evidence={})
+    search.record_transition(command_nm=-0.1, requested_command_nm=0, evidence={})
+    with pytest.raises(ValueError, match="current probe"):
+        search.record_transition(command_nm=-0.1, requested_command_nm=0, evidence={})
+    assert len(search.transitions) == 1
+
+
+def test_transition_after_repeated_old_holds_still_needs_a_fresh_return_check():
+    search = HoldingForceSearch(HoldingSearchConfig(), seed_nm=-0.3, cap_nm=1)
+    for _ in range(2):
+        search.record(command_nm=-0.3, outcome="stationary", evidence={})
+    search.record_transition(command_nm=-0.28, requested_command_nm=0, evidence={})
+    assert search.state == "searching"
+    assert search.candidate_nm == -0.3
+    assert search.status()["usable_hold_nm"] is None
+    search.record(command_nm=-0.3, outcome="stationary", evidence={})
+    assert search.state == "complete"
+
+
 @pytest.mark.parametrize(
     "values",
     [
@@ -87,7 +169,9 @@ def test_invalid_search_configuration_is_rejected(values):
         HoldingSearchConfig(**values)
 
 
-def holding_replay(settings, *, control_period_sec=0.01):
+def holding_replay(settings, *, control_period_sec=0.01, joint_name="joint3"):
+    from dataclasses import replace
+
     from control_station.b601_torque_console.automatic_calibration import (
         AutomaticCalibrationConfig,
         B601AutomaticCalibrationController,
@@ -108,6 +192,9 @@ def holding_replay(settings, *, control_period_sec=0.01):
         motion_tracking_recovery_velocity_feedback_nm_s_per_rad=1,
     )
     resolved = B601AutomaticCalibrationController(settings, config).settings
+    # Workspace resolves the established profile first, then binds each axis.
+    resolved = replace(resolved, limits=replace(resolved.limits, joint_name=joint_name),
+        staged_assist=replace(resolved.staged_assist, joint_name=joint_name))
     # One existing local-sweep endpoint; budgets are not reset by reacquisition.
     return Replay(
         resolved,
@@ -198,6 +285,137 @@ def scripted_tick(replay, *, drift_on_release=False):
     elif phase == "releasing" and drift_on_release:
         q[j] += max(-0.00005, min(0.00005, target + 0.006 - q[j]))
     replay.tick(q=q)
+
+
+def prime_offset_arrival(replay):
+    """Prescribe the measured offset and bounded arrival command from the fault."""
+    replay.begin(breakaway=True)
+    replay.run_until(
+        lambda: (replay.audit.get("motion_control") or {}).get("phase") == "track",
+        move=True,
+    )
+    j = int(replay.controller.limits.joint_name[-1]) - 1
+    target = replay.plan["steps"][0]["target_qpos_rad"][j]
+    sample = target + 0.0019466
+    for _ in range(1000):
+        q = list(replay.q)
+        step = 0.01 * replay.control_period_sec
+        q[j] += max(-step, min(step, sample - q[j]))
+        delta = [0.0] * 6
+        delta[j] = -0.2
+        replay.tick(q=q, command_delta=tuple(delta) if replay.session._holding is None else None)
+        if replay.session._holding is not None and replay.session._holding.observations:
+            return sample
+    pytest.fail(f"offset arrival was not observed: {replay.session.status()}")
+
+
+@pytest.mark.parametrize("period", [0.01, 0.025])
+@pytest.mark.parametrize("joint_name", ["joint2", "joint3"])
+def test_native_censored_recoil_changes_candidate_and_retains_stable_return_command(settings, period, joint_name):
+    replay = holding_replay(settings, control_period_sec=period, joint_name=joint_name)
+    j = int(joint_name[-1]) - 1
+    sample = prime_offset_arrival(replay)
+    for _ in range(500):
+        q = list(replay.q)
+        holding = replay.session._holding_status()
+        if holding["stage"] == "fixed_command_observation":
+            # Release during the ramp; then keep moving briefly at its plateau.
+            sent = replay.commands["total_nm"][j]
+            if sent > -0.15:
+                q[j] += 0.015 * period
+        replay.tick(q=q)
+        if replay.session._holding.transitions:
+            break
+    result = replay.session._holding.status(detailed=True)
+    assert result["transition_count"] == 1, replay.session.status()
+    assert -0.2 < result["candidate_nm"] < 0
+    assert result["trial_count"] == 1
+    assert result["positive_motion_above_nm"] is None
+    assert result["negative_motion_below_nm"] is None
+    assert replay.session._holding_reacquire_bias_nm == -0.2
+    assert replay.session._holding_pose[j] == pytest.approx(sample)
+    transition = result["transitions"][0]
+    assert transition["requested_command_nm"] == 0
+    assert transition["actual_plateau_command_nm"] == transition["command_nm"]
+    assert transition["completed_at_sec"] > transition["first_causal_receipt_at_sec"]
+    assert transition["final_qpos_rad"][j] > sample + 0.002
+    assert replay.session._leg_started < transition["reacquired_at_sec"]
+    assert replay.session.status()["batch_command_exposure_nm_sec"] > 0
+
+
+def test_native_point_comparison_uses_actual_sample_not_nominal_arrival_edge(settings):
+    replay = holding_replay(settings)
+    sample = prime_offset_arrival(replay)
+    # The nominal target is almost 0.002 rad below the actual sample. A single
+    # additional count must not consume the entire same-point observation band.
+    target = replay.plan["steps"][0]["target_qpos_rad"][2]
+    for _ in range(100):
+        q = list(replay.q)
+        q[2] += min(0.00004, max(0, sample + 0.0004 - q[2]))
+        replay.tick(q=q, command_delta=(0, 0, 0, 0, 0, 0))
+        if len(replay.session._holding.observations) >= 2:
+            break
+    observations = replay.session._holding.observations
+    assert len(observations) == 2, replay.session.status()
+    assert observations[1]["outcome"] == "stationary"
+    assert observations[1]["final_qpos_rad"][2] - target > 0.002
+    assert observations[1]["final_qpos_rad"][2] - sample < 0.002
+
+
+def test_short_plateau_recoil_then_stop_refines_without_claiming_sustained_motion(settings):
+    replay = holding_replay(settings)
+    prime_offset_arrival(replay)
+    replay.run_until(lambda: replay.session._holding_observation is not None
+        and replay.session._holding_observation["requested_command_nm"] == 0
+        and replay.session._holding_observation["started_at_sec"] is not None)
+    # Complete a short rebound before the 80 ms sustained-motion window.
+    for _ in range(7):
+        q = list(replay.q)
+        q[2] += 0.029 * replay.control_period_sec
+        replay.tick(q=q)
+    replay.run_until(lambda: bool(replay.session._holding.transitions), max_ticks=100)
+    result = replay.session._holding.status(detailed=True)
+    assert result["transitions"][0]["outcome"] == "censored_settled_outside_point"
+    assert result["candidate_nm"] == pytest.approx(-0.1)
+    assert result["trial_count"] == 1
+    assert result["positive_motion_above_nm"] is None
+
+
+@pytest.mark.parametrize("period", [0.01, 0.025])
+def test_native_transition_refinement_reacquires_verifies_then_withdraws(settings, period):
+    replay = holding_replay(settings, control_period_sec=period)
+    sample = prime_offset_arrival(replay)
+    for _ in range(2000):
+        state = replay.session.status()["state"]
+        if state in {"complete", "failed"}:
+            break
+        q = list(replay.q)
+        if state == "moving":
+            if replay.session._holding_status()["stage"] == "fixed_command_observation":
+                # Synthetic static interval; not an identified gearbox model.
+                sent = replay.commands["total_nm"][2]
+                if sent > -0.12:
+                    q[2] += 0.015 * period
+                elif sent < -0.24:
+                    q[2] -= 0.015 * period
+            else:
+                q[2] += max(-0.01 * period, min(0.01 * period, sample - q[2]))
+        elif state == "releasing":
+            q[2] += max(-0.005 * period, min(0.005 * period, sample + 0.006 - q[2]))
+        replay.tick(q=q)
+    result = replay.session.result_record()
+    assert result["state"] == "complete", result
+    leg = result["completed_legs"][0]
+    point = leg["holding_calibration"]
+    assert point["transition_count"] >= 1
+    assert point["sample_pose_rad"][2] == pytest.approx(sample)
+    assert point["nominal_target_rad"] == replay.plan["steps"][0]["target_qpos_rad"]
+    assert -0.24 <= point["usable_hold_nm"] <= -0.12
+    assert sum(r["outcome"] == "stationary" and r["command_nm"] == point["usable_hold_nm"]
+               for r in point["observations"]) >= 2
+    assert leg["final_zero_and_still_confirmed"]
+    assert abs(leg["target_error_rad"]) > result["acquisition_arrival_tolerance_rad"]
+    assert all(abs(row["commands"]["total_nm"][2]) <= 0.3 + 1e-9 for row in replay.history)
 
 
 def test_nonzero_hold_survives_subsequent_recoil_and_withdrawal_still_requires_receipts(
@@ -415,13 +633,16 @@ const context = {state: {owner_ready: true}, number: v => Number.isFinite(v) ? S
   el: id => nodes[id] ||= {}, batch: {workspace: {phase: "sweep", setup_label: "candidate",
     holding_search_enabled: true, acquisition_ranges_deg: {joint2:[0,10], joint3:[0,10]},
     holding_calibration: {enabled:true, stage:"fixed_command_observation", attempt_count:3,
-      max_attempts:12, probe_command_nm:-.3, search:{trial_count:2, reason:"next_bounded_probe",
+      max_attempts:12, probe_command_nm:-.3, search:{trial_count:2, transition_count:1,
+        candidate_nm:-.2, reason:"next_bounded_probe",
         usable_hold_nm:null, observed_stationary_range_nm:[-.4,-.3]}}}}};
 vm.createContext(context);
 vm.runInContext(fn+"; renderWorkspace(batch);", context);
 assert(nodes["phase"].textContent.includes("保持命令搜索"));
 assert(nodes["automatic-progress"].textContent.includes("定命令观察"));
 assert(nodes["automatic-progress"].textContent.includes("3/12"));
+assert(nodes["automatic-progress"].textContent.includes("变力退回／缩步 1 次"));
+assert(nodes["automatic-progress"].textContent.includes("下一试探 -0.2"));
 assert(nodes["automatic-trials"].textContent.includes("不是实测保持力"));
 context.batch.workspace.holding_calibration.stage="withdrawal";
 vm.runInContext("renderWorkspace(batch);", context);

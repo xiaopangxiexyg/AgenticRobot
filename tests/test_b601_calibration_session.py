@@ -83,7 +83,7 @@ class Replay:
         )
         self.plan = plan_local_sweeps(
             condition=self.condition,
-            joint_name="joint3",
+            joint_name=settings.limits.joint_name,
             anchor_qpos_rad=ZERO,
             position_limits_rad=((-1.0, 1.0),) * 6,
             excursion_rad=excursion_rad,
@@ -182,6 +182,7 @@ class Replay:
         )
 
     def run_until(self, predicate, *, max_ticks=2000, move=False):
+        j = int(self.controller.limits.joint_name[-1]) - 1
         for _ in range(max_ticks):
             if predicate():
                 return
@@ -190,28 +191,28 @@ class Replay:
             if move and self.session.status()["state"] == "moving":
                 target = self.plan["steps"][self.session.status()["step_index"]][
                     "target_qpos_rad"
-                ][2]
+                ][j]
                 # An ideal scripted servo follows the committed reference in
                 # TRACK. Initial displacement is an explicit test stimulus.
                 motion = self.audit.get("motion_control")
                 if motion and motion["phase"] == "track":
-                    q[2] = motion["q_reference_rad"]
+                    q[j] = motion["q_reference_rad"]
                 elif (self.session.holding_search is not None and motion
                       and motion.get("arrival_stabilization_active")):
                     # The new mode deliberately retains the target spring
                     # before measurement; prescribe its slow approach too.
                     step = self.controller.settings.staged_assist.motion_control.max_reference_velocity_rad_s * self.control_period_sec
-                    q[2] += max(-step, min(step, target-q[2]))
+                    q[j] += max(-step, min(step, target-q[j]))
                 elif view["phase"] == "breakaway":
-                    q[2] += max(-0.00010, min(0.00010, target - q[2]))
+                    q[j] += max(-0.00010, min(0.00010, target - q[j]))
                 elif (
                     view["phase"] == "releasing"
                     and not view["release_terminal"]
-                    and abs(q[2] - view["anchor_qpos_rad"][2]) < 0.001
+                    and abs(q[j] - view["anchor_qpos_rad"][j]) < 0.001
                 ):
                     # Explicit post-pulse inertial displacement stimulus so the
                     # native multi-window onset confirmation can be exercised.
-                    q[2] += max(-0.00010, min(0.00010, target - q[2]))
+                    q[j] += max(-0.00010, min(0.00010, target - q[j]))
             self.tick(q=q)
         pytest.fail(
             f"bounded replay timed out: {self.session.status()} / {self.controller.owner_snapshot()}"

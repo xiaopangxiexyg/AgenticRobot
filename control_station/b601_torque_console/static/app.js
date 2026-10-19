@@ -308,7 +308,7 @@ function renderWorkspace(batch) {
   if (holding?.enabled) {
     const search = holding.search;
     const stages = {reacquire: "缓慢返回同一目标并等待稳定", fixed_command_observation: "定命令观察", withdrawal: "观测保留，正在撤力停稳", failed: "采样已停止", cancelled: "已撤销", complete: "已完成"};
-    el("automatic-progress").textContent += ` 保持力搜索：${stages[holding.stage] || holding.stage}；尝试 ${holding.attempt_count}/${holding.max_attempts}；本次附加命令 ${number(holding.probe_command_nm)} N·m；已记录 ${search?.trial_count ?? 0} 次；${search?.reason ?? "等待到点"}。`;
+    el("automatic-progress").textContent += ` 保持命令搜索：${stages[holding.stage] || holding.stage}；尝试 ${holding.attempt_count}/${holding.max_attempts}；本次附加命令 ${number(holding.probe_command_nm)} N·m；已确认观测 ${search?.trial_count ?? 0} 次；变力退回／缩步 ${search?.transition_count ?? 0} 次；下一试探 ${number(search?.candidate_nm)} N·m；${search?.reason ?? "等待到点"}。`;
     el("automatic-trials").textContent = `可用保持命令 ${number(search?.usable_hold_nm)} N·m；已观察静止范围 ${(search?.observed_stationary_range_nm || []).map(v => number(v)).join(" ～ ") || "尚无"}。这是软件命令与编码器响应，不是实测保持力或唯一重力修正。`;
   }
   const centres = (workspace.pose_centres_rad || []).map(q => `(${number(q[0] * 180 / Math.PI, 0)}°, ${number(q[1] * 180 / Math.PI, 0)}°)`).join(" → ");

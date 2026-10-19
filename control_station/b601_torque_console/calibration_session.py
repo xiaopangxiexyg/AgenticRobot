@@ -824,10 +824,11 @@ class B601AutomaticCalibrationSession:
         config, j = self.holding_search, self._joint_index
         q, stamp = view["qpos_rad"], view["feedback_timestamp_sec"]
         target = self._steps[self._index]["target_qpos_rad"]
+        point = target if self._holding_pose is None else self._holding_pose
         expected_kd = tuple(max(a,b) for a,b in zip(self.condition.driver_kd_nm_s_per_rad,
             self.controller.settings.staged_assist.motion_control.drive_driver_kd_nm_s_per_rad))
         if self._holding_probe_nm is None:
-            if (abs(q[j]-target[j]) > min(config.movement_rad, self.acquisition_arrival_tolerance_rad)
+            if (abs(q[j]-point[j]) > min(config.movement_rad, self.acquisition_arrival_tolerance_rad)
                 or view["arrival_stop_gate"] != "ready" or tuple(driver_kd) != expected_kd
                 or view["motion_reason"] not in {"bounded_reference_tracking", "target_reached_braking"}):
                 return
@@ -845,6 +846,10 @@ class B601AutomaticCalibrationSession:
             self._holding_observation = {"started_at_sec": None, "anchor_qpos_rad": q,
                 "minimum_rad": q, "maximum_rad": q, "ramp_frozen": False,
                 "requested_command_nm": self._holding_probe_nm,
+                "transition_start_command_nm": self._sent_delta[j],
+                "transition_minimum_command_nm": self._sent_delta[j],
+                "transition_maximum_command_nm": self._sent_delta[j],
+                "transition_minimum_rad": q, "transition_maximum_rad": q,
                 "approach_from_qpos_rad": self._holding_approach_origin,
                 "reacquired_qpos_rad": q,
                 "reacquired_at_sec": now}
@@ -866,6 +871,10 @@ class B601AutomaticCalibrationSession:
         # Feedback precedes THIS receipt. Only the preceding complete command
         # can have caused it; starting at this receipt would backdate evidence.
         previous = self._previous_sent_delta[j]
+        observation["transition_minimum_command_nm"] = min(observation["transition_minimum_command_nm"], previous)
+        observation["transition_maximum_command_nm"] = max(observation["transition_maximum_command_nm"], previous)
+        observation["transition_minimum_rad"] = tuple(min(a,b) for a,b in zip(observation["transition_minimum_rad"],q))
+        observation["transition_maximum_rad"] = tuple(max(a,b) for a,b in zip(observation["transition_maximum_rad"],q))
         plateau = (self._previous_completed is not None and stamp > self._previous_completed
                    and abs(previous-self._holding_probe_nm) <= 1e-9
                    and abs(self._sent_delta[j]-self._holding_probe_nm) <= 1e-9
@@ -884,13 +893,8 @@ class B601AutomaticCalibrationSession:
                 self._holding_probe_nm = previous
             return
         if observation["started_at_sec"] is None:
-            if (abs(q[j]-target[j]) > config.movement_rad
-                or max(abs(a-b) for a,b in zip(q,self._holding_pose)) > config.movement_rad):
-                self._events.append({"time_sec": now, "state": "holding_observation",
-                    **observation, "outcome": "censored_plateau_outside_point"})
-                self._holding_reacquire_bias_nm = self._sent_delta[j]
-                self._holding_probe_nm = self._holding_observation = None
-                self._holding_approach_origin = q
+            if max(abs(a-b) for a,b in zip(q,point)) > config.movement_rad:
+                self._refine_holding_transition(view, now, driver_kd, "censored_plateau_outside_point")
                 return
             observation.update(started_at_sec=stamp, first_causal_receipt_at_sec=self._previous_completed,
                 anchor_qpos_rad=q, minimum_rad=q, maximum_rad=q)
@@ -908,17 +912,14 @@ class B601AutomaticCalibrationSession:
         elif elapsed >= config.observation_sec:
             span = max(b-a for a,b in zip(observation["minimum_rad"],observation["maximum_rad"]))
             if (span <= config.movement_rad and view["arrival_stop_gate"] == "ready"
-                and abs(q[j]-target[j]) <= config.movement_rad):
+                and abs(q[j]-point[j]) <= config.movement_rad):
                 outcome = "stationary"
-            elif span <= config.movement_rad and view["arrival_stop_gate"] == "ready":
-                # A preload release can move during the ramp and then stop.
+            elif view["arrival_stop_gate"] == "ready" and abs(q[j]-point[j]) > config.movement_rad:
+                # A preload release can move during the ramp or briefly at
+                # its plateau and then stop outside the sampled point.
                 # Reacquire and repeat; this is not evidence of sustained
                 # movement at the final plateau or an in-pose hold sample.
-                self._events.append({"time_sec": now, "state": "holding_observation",
-                    **observation, "outcome": "censored_settled_outside_point"})
-                self._holding_reacquire_bias_nm = self._sent_delta[j]
-                self._holding_probe_nm = self._holding_observation = None
-                self._holding_approach_origin = q
+                self._refine_holding_transition(view, now, driver_kd, "censored_settled_outside_point")
                 return
         if outcome is None:
             return
@@ -936,14 +937,43 @@ class B601AutomaticCalibrationSession:
         self._holding.record(command_nm=self._holding_probe_nm, outcome=outcome, evidence=dict(observation))
         self._events.append({"time_sec": now, "state": "holding_observation", **observation,
             "command_nm": self._holding_probe_nm, "outcome": outcome})
-        self._holding_reacquire_bias_nm = self._sent_delta[j]
+        self._holding_reacquire_bias_nm = self._holding_return_command()
         self._holding_probe_nm = self._holding_observation = None
         self._holding_approach_origin = q
         if self._holding.state == "complete":
-            self._holding_leg_result = self._holding.status(detailed=True)
+            self._holding_leg_result = {**self._holding.status(detailed=True),
+                "sample_pose_rad": self._holding_pose, "nominal_target_rad": target}
             self.controller.submit("withdraw", now_sec=now)
             self._transition("releasing", "holding_point_verified_withdrawal_pending", now)
         elif self._holding.state == "incomplete":
+            self._abort(now, "holding_search_incomplete")
+
+    def _holding_return_command(self):
+        stable = [r["command_nm"] for r in self._holding.observations if r["outcome"] == "stationary"]
+        return min(stable, key=abs) if stable else self._sent_delta[self._joint_index]
+
+    def _refine_holding_transition(self, view, now, driver_kd, outcome):
+        j, q = self._joint_index, view["qpos_rad"]
+        observation = {**self._holding_observation, "outcome": outcome,
+            "completed_at_sec": now, "final_qpos_rad": q,
+            "actual_plateau_command_nm": self._previous_sent_delta[j],
+            "first_causal_receipt_at_sec": self._previous_completed,
+            "gravity_nm": view["gravity_command_nm"],
+            "driver_kd_nm_s_per_rad": tuple(driver_kd),
+            "nominal_target_rad": self._steps[self._index]["target_qpos_rad"]}
+        self._events.append({"time_sec": now, "state": "holding_observation", **observation})
+        # A different support posture cannot guide a same-pose command search.
+        if any(max(abs(observation[key][i]-self._holding_pose[i])
+                   for key in ("transition_minimum_rad", "transition_maximum_rad")) > self.holding_search.movement_rad
+               for i in range(6) if i != j):
+            self._abort(now, "holding_search_incomplete")
+            return
+        self._holding.record_transition(command_nm=self._previous_sent_delta[j],
+            requested_command_nm=observation["requested_command_nm"], evidence=observation)
+        self._holding_reacquire_bias_nm = self._holding_return_command()
+        self._holding_probe_nm = self._holding_observation = None
+        self._holding_approach_origin = q
+        if self._holding.state == "incomplete":
             self._abort(now, "holding_search_incomplete")
 
     def result_record(self) -> dict[str, Any]:

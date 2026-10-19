@@ -38,7 +38,7 @@ class HoldingSearchConfig:
 
 
 class HoldingForceSearch:
-    """Search a usable hold nearest zero, not a unique gravity correction.
+    """Search a usable hold toward zero, not a unique gravity correction.
 
     Each observation must be made at the same pose after reacquisition and a
     constant, actually dispatched command. Opposite-direction motion provides
@@ -57,6 +57,7 @@ class HoldingForceSearch:
         self.config, self.cap_nm = config, cap_nm
         self.candidate_nm = max(-cap_nm, min(cap_nm, seed_nm))
         self.observations = []
+        self.transitions = []
         self.state, self.reason = "searching", "verify_arrival_command"
         self._verification = None
 
@@ -113,33 +114,8 @@ class HoldingForceSearch:
                 return
             self.candidate_nm = self._verification
         elif stable:
-            best = min(stable, key=abs)
-            toward_zero = upper if best < 0 else lower
-            if (
-                abs(best) <= 1e-9
-                or math.isfinite(toward_zero)
-                and abs(toward_zero - best) <= self.config.torque_resolution_nm
-            ):
-                self._verification = self.candidate_nm = best
-                count = sum(
-                    r["outcome"] == "stationary" and abs(r["command_nm"] - best) <= 1e-9
-                    for r in self.observations
-                )
-                if count >= self.config.verification_repeats:
-                    self.state, self.reason = (
-                        "complete",
-                        "verified_usable_hold_not_unique_gravity",
-                    )
-                    return
-            elif not any(abs(r["command_nm"]) <= 1e-9 for r in self.observations):
-                self.candidate_nm = 0.0
-            elif math.isfinite(toward_zero):
-                self.candidate_nm = (best + toward_zero) / 2
-            else:
-                self.state, self.reason = (
-                    "incomplete",
-                    "holding_zero_direction_not_bracketed",
-                )
+            self._probe_from_stable(stable, lower, upper)
+            if self.state == "complete":
                 return
         elif math.isfinite(lower) and math.isfinite(upper):
             self.candidate_nm = (lower + upper) / 2
@@ -165,7 +141,103 @@ class HoldingForceSearch:
             if self._verification is not None
             else "next_bounded_probe"
         )
-        if len(self.observations) >= self.config.max_trials:
+        if len(self.observations) + len(self.transitions) >= self.config.max_trials:
+            self.state, self.reason = "incomplete", "holding_trial_budget_exhausted"
+
+    def _probe_from_stable(self, stable, lower, upper):
+        best = min(stable, key=abs)
+        # Transition endpoints guide exploration only. They never enter the
+        # resolved positive/negative motion bounds or stationary observations.
+        motion_limit = upper if best < 0 else lower
+        endpoints = [r["command_nm"] for r in self.transitions]
+        if math.isfinite(motion_limit):
+            endpoints.append(motion_limit)
+        toward_zero = [
+            max(best, min(0.0, v)) if best < 0 else min(best, max(0.0, v))
+            for v in endpoints
+            if (v - best) * best <= 0
+        ]
+        endpoint = (
+            min(toward_zero, key=lambda v: abs(v - best)) if toward_zero else None
+        )
+        if abs(best) <= 1e-9 or (
+            endpoint is not None
+            and abs(endpoint - best) <= self.config.torque_resolution_nm
+        ):
+            self._verification = self.candidate_nm = best
+            count = sum(
+                r["outcome"] == "stationary" and abs(r["command_nm"] - best) <= 1e-9
+                for r in self.observations
+            )
+            if count >= self.config.verification_repeats:
+                self.state, self.reason = (
+                    "complete",
+                    "verified_usable_hold_not_unique_gravity",
+                )
+        else:
+            self.candidate_nm = 0.0 if endpoint is None else (best + endpoint) / 2
+
+    def record_transition(
+        self, *, command_nm: float, requested_command_nm: float, evidence: dict
+    ):
+        """Refine a censored ramp without calling its endpoint a force bound."""
+        if self.state != "searching":
+            raise ValueError("holding search is terminal")
+        if any(
+            isinstance(v, bool) or not math.isfinite(v) or abs(v) > self.cap_nm + 1e-9
+            for v in (command_nm, requested_command_nm)
+        ):
+            raise ValueError("holding transition must fit the command envelope")
+        if abs(requested_command_nm - self.candidate_nm) > 1e-9:
+            raise ValueError("holding transition must belong to the current probe")
+        self.transitions.append(
+            {
+                **evidence,
+                "command_nm": command_nm,
+                "requested_command_nm": requested_command_nm,
+                "quantity": "censored_transition_not_fixed_command_response",
+            }
+        )
+        stable = [
+            r["command_nm"] for r in self.observations if r["outcome"] == "stationary"
+        ]
+        if not stable:
+            self.state, self.reason = (
+                "incomplete",
+                "holding_transition_without_stable_anchor",
+            )
+            return
+        best = min(stable, key=abs)
+        # A transition unable to withdraw even one resolved command step needs
+        # another hold check, not an endless replay of the same failed ramp.
+        if (command_nm - best) * best >= 0:
+            self._verification = self.candidate_nm = best
+        else:
+            positive = [
+                r["command_nm"]
+                for r in self.observations
+                if r["outcome"] == "positive_motion"
+            ]
+            negative = [
+                r["command_nm"]
+                for r in self.observations
+                if r["outcome"] == "negative_motion"
+            ]
+            self._probe_from_stable(
+                stable,
+                max(negative, default=-math.inf),
+                min(positive, default=math.inf),
+            )
+        # A censored transition is not a successful final trial. Return to the
+        # point and confirm the selected hold again before declaring completion.
+        if self.state == "complete":
+            self.state = "searching"
+        self.reason = (
+            "verify_hold_after_transition"
+            if self._verification is not None
+            else "refine_censored_transition"
+        )
+        if len(self.observations) + len(self.transitions) >= self.config.max_trials:
             self.state, self.reason = "incomplete", "holding_trial_budget_exhausted"
 
     def status(self, *, detailed=False):
@@ -177,6 +249,7 @@ class HoldingForceSearch:
             "reason": self.reason,
             "candidate_nm": self.candidate_nm,
             "trial_count": len(self.observations),
+            "transition_count": len(self.transitions),
             "max_trials": self.config.max_trials,
             "usable_hold_nm": self._verification if self.state == "complete" else None,
             "observed_stationary_range_nm": [min(stable), max(stable)]
@@ -205,4 +278,5 @@ class HoldingForceSearch:
         }
         if detailed:
             view["observations"] = [dict(r) for r in self.observations]
+            view["transitions"] = [dict(r) for r in self.transitions]
         return view
