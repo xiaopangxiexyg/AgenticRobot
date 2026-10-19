@@ -150,7 +150,8 @@ def test_segmentation_model_startup_failure_closes_partial_resources() -> None:
     assert session._segmentation_model_started is False
 
 
-def test_unsettled_passive_read_defers_owned_dependency_cleanup() -> None:
+@pytest.mark.parametrize("state_reader", ["state_executor", "tcp_pose_comparison_executor"])
+def test_unsettled_passive_read_defers_owned_dependency_cleanup(state_reader) -> None:
     wait_timeouts = []
 
     class _Executor:
@@ -175,6 +176,8 @@ def test_unsettled_passive_read_defers_owned_dependency_cleanup() -> None:
             self.close_calls += 1
 
     executor = _Executor()
+    placement_executor = _Executor()
+    placement_executor.settled = True
     localizer = _Localizer()
     artifact_store = _Store()
     lower_close_calls = []
@@ -185,13 +188,14 @@ def test_unsettled_passive_read_defers_owned_dependency_cleanup() -> None:
         _close_outcome=None,
         service=SimpleNamespace(close=lambda **_kwargs: outcome),
         observation_producer=SimpleNamespace(current_station_revision=0),
-        state_executor=executor,
+        state_executor=None,
+        tcp_pose_comparison_executor=None,
         depth_executor=None,
         rgb_executor=None,
         history_executor=None,
         spatial_goal_executor=None,
         segmentation_executor=None,
-        placement_executor=executor,
+        placement_executor=placement_executor,
         _segmentation_model_started=True,
         segmentation_localizer=localizer,
         _finish_lower_close=lambda value: lower_close_calls.append(value),
@@ -202,8 +206,9 @@ def test_unsettled_passive_read_defers_owned_dependency_cleanup() -> None:
         artifact_store=artifact_store,
         _artifact_store_closed=False,
     )
+    setattr(session, state_reader, executor)
 
-    with pytest.raises(RuntimeError, match="state_executor"):
+    with pytest.raises(RuntimeError, match=state_reader):
         MujocoAgentTcpPoseGatewaySession.close(session)
     assert 130.0 in wait_timeouts
     assert localizer.close_calls == 0
@@ -1468,6 +1473,7 @@ def _build_no_model_contract_bundle_fixture(
     *,
     enable_artifact_perception: bool = False,
     segmentation_identity: tuple[str, str, str] | None = None,
+    enable_tcp_pose_comparison: bool = False,
 ):
     _profile, action_schema = _profile_and_schema()
     observation_plan = SimpleNamespace(
@@ -1634,6 +1640,7 @@ def _build_no_model_contract_bundle_fixture(
     bundle = build_mujoco_agent_tcp_pose_contract_bundle(
         application=application,
         enable_artifact_perception=enable_artifact_perception,
+        enable_tcp_pose_comparison=enable_tcp_pose_comparison,
         segmentation_model_profile_id=(
             None if segmentation_identity is None else segmentation_identity[0]
         ),
@@ -1645,6 +1652,31 @@ def _build_no_model_contract_bundle_fixture(
         ),
     )
     return application, runtime, direct, bundle, captured_manifest_args
+
+
+def test_tcp_pose_comparison_is_opt_in_and_retains_the_original_state_contract(monkeypatch):
+    baseline = _build_no_model_contract_bundle_fixture(monkeypatch)[3]
+    candidate = _build_no_model_contract_bundle_fixture(monkeypatch, enable_tcp_pose_comparison=True)[3]
+    assert baseline.tcp_pose_comparison_registration is None
+    with pytest.raises(KeyError):
+        baseline.route_manifest.route("state.read_tcp_pose", "2")
+    assert candidate.schema_catalog.entry("state.read_tcp_pose", "1") == baseline.schema_catalog.entry("state.read_tcp_pose", "1")
+    assert candidate.route_manifest.route("state.read_tcp_pose", "1") == baseline.route_manifest.route("state.read_tcp_pose", "1")
+    assert candidate.definition_catalog.definition("state.read_tcp_pose", "1") == baseline.definition_catalog.definition("state.read_tcp_pose", "1")
+    registration = candidate.tcp_pose_comparison_registration
+    assert candidate.route_manifest.route("state.read_tcp_pose", "2") == registration.entry
+    assert registration.entry.route.control_effect_class == "read_only"
+    assert not registration.entry.route.may_move_robot
+    assert not registration.entry.route.requires_task_evaluation
+    assert candidate.payload_validators.validator_for(registration.entry.route) == registration.payload_validator
+    candidate.io_catalog.contract("state.read_tcp_pose", "2")
+    assert len(candidate.route_manifest.skill_routes) == len(baseline.route_manifest.skill_routes) + 1
+
+
+@pytest.mark.parametrize("enabled", [None, 0, 1, "true"])
+def test_tcp_pose_comparison_enablement_requires_a_boolean(monkeypatch, enabled):
+    with pytest.raises(TypeError, match="enable_tcp_pose_comparison"):
+        _build_no_model_contract_bundle_fixture(monkeypatch, enable_tcp_pose_comparison=enabled)
 
 
 def test_no_model_contract_bundle_exposes_exact_motion_and_state_routes(

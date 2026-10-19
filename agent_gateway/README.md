@@ -1476,6 +1476,39 @@ external reconciliation.
 失败不回退普通 move-to。沿整个路径保持水平、绕开指定区域等持续约束尚不由该 Skill 实现，
 也不能把终点轴对齐解释为全过程满足该约束。
 
+### 可选实测 TCP 与历史动作目标比较（显式 v2）
+
+两端 Gateway 的 `--enable-tcp-pose-comparison` 在保留 `state.read_tcp_pose@1` 的同时，
+额外发布同名 `state.read_tcp_pose@2`，默认关闭。上层通过现有精确 Route 暴露策略选择一个版本，
+不应把两个版本当成两个日常工具，也不能缺少 v2 时悄悄回退到 v1。
+
+v2 保留 v1 的四个参数，并要求显式提供 `target_operation_id`：
+
+```json
+{
+  "component_ids": ["right_arm"],
+  "reference_frame_id": "canonical_station",
+  "controlled_frame_id": "tool_tcp",
+  "max_measurement_age_ms": 200,
+  "target_operation_id": null
+}
+```
+
+`null` 仅读取当前状态；非空值必须引用同一客户端、会话、manifest 中尚被保留的终态
+`motion.move_tcp_to_pose_safe@1/@2` **绝对目标请求**。当前部署没有发布对应运动版本时不能引用它。
+无法找到记录、记录未终止、参数/身份不匹配时明确失败，不猜测“最近一次动作”，也不接受调用方
+重新提供的目标位姿。具体组件、参考系与最大帧龄仍来自当前部署，示例不能跨部署直接套用。
+
+返回原有新鲜单 cut 状态，加 `target_comparison`；其为 `null` 或包含原请求/Route hash、
+原 terminal 状态与 execution/task outcome、原目标、各目标组件的平移误差（米）与完整 SO(3)
+旋转误差（弧度）。比较覆盖原目标的全部组件，允许一次读取双臂而只比较原来有目标的那一臂。
+它复用 `robot_motion` 的位姿转换和距离计算，不引入第二个 FK、采样器、运动 owner 或容差。
+
+本比较不新增历史时间关系声明，不重写样本时间，也不替代原有新鲜度门禁。
+误差描述的是**现在的实测值与历史指令目标**，不是历史
+执行的终态测量，更不证明物体效果、稳定性、HOLD 或任务成功。即使当前误差为零，原失败、取消或
+超时 outcome 仍原样返回。Agent 根据任务给定的容差解释误差，不由本 Skill 新增成功裁决。
+
 ### 真机 TCP 预规划的统一接线
 
 `motion.move_tcp_to_pose_safe@1` 需要单独授权 `move_tcp_to_pose_safe`；普通

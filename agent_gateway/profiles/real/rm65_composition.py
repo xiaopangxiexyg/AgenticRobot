@@ -285,6 +285,7 @@ def assemble_exclusive_rm65_agent_primitive_composition(
     point_grasp_planner: object | None = None,
     enable_grasp_observation: bool = False,
     enable_spatial_goals: bool = False,
+    enable_tcp_pose_comparison: bool = False,
     enable_back_projection: bool = False,
     enable_point_grasp_finger_exchange: bool = False,
     debug_render_object_coordinates: bool = False,
@@ -307,6 +308,8 @@ def assemble_exclusive_rm65_agent_primitive_composition(
         raise TypeError("enable_grasp_observation must be bool.")
     if not isinstance(enable_spatial_goals, bool):
         raise TypeError("enable_spatial_goals must be bool.")
+    if not isinstance(enable_tcp_pose_comparison, bool):
+        raise TypeError("enable_tcp_pose_comparison must be bool.")
     if not isinstance(enable_back_projection, bool):
         raise TypeError("enable_back_projection must be bool.")
     if not isinstance(enable_point_grasp_finger_exchange, bool):
@@ -1038,6 +1041,7 @@ def assemble_exclusive_rm65_agent_primitive_composition(
 
         deployment = assemble_exclusive_rm65_agent_primitive_deployment(
             enable_spatial_goals=enable_spatial_goals,
+            enable_tcp_pose_comparison=enable_tcp_pose_comparison,
             gripper_port=gripper_port,
             gripper_ports=gripper_ports if bilateral else None,
             target_builder=lower.target_builder,

@@ -180,6 +180,8 @@ def build_parser() -> argparse.ArgumentParser:
         help="existing private directory for exact RGB-D, filtered points and safe-move rejection evidence; opt-in, no extra captures")
     parser.add_argument("--enable-spatial-goals", action="store_true",
         help="expose read-only endpoint relation goals; no observation or motion authority")
+    parser.add_argument("--enable-tcp-pose-comparison", action="store_true",
+        help="expose explicit read_tcp_pose v2 against retained authenticated safe targets; no motion or success verdict")
     parser.add_argument("--enable-grasp-observation", action="store_true",
         help="Use frozen stationary RGB-D target selection and optional associated-view fusion (GraspGenX only).")
     parser.add_argument("--enable-back-projection", action="store_true",
@@ -1305,6 +1307,7 @@ def main(argv: list[str] | None = None) -> int:
         point_grasp_planner=point_grasp_planner,
         enable_grasp_observation=args.enable_grasp_observation,
         enable_spatial_goals=args.enable_spatial_goals,
+        enable_tcp_pose_comparison=args.enable_tcp_pose_comparison,
         enable_back_projection=args.enable_back_projection,
         enable_point_grasp_finger_exchange=args.enable_point_grasp_finger_exchange,
         debug_render_object_coordinates=args.debug_render_object_coordinates,

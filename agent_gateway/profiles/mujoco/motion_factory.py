@@ -456,6 +456,7 @@ def build_mujoco_agent_tcp_pose_gateway_session(
     segmentation_localizer: object | None = None,
     enable_safe_tcp_pose: bool = False,
     enable_spatial_goals: bool = False,
+    enable_tcp_pose_comparison: bool = False,
     safe_tcp_planning_clearance_padding_m: float = 0.002,
     enable_grippers: bool = False,
     enable_grasp_approach: bool = False,
@@ -473,6 +474,8 @@ def build_mujoco_agent_tcp_pose_gateway_session(
         raise TypeError("enable_safe_tcp_pose must be boolean.")
     if not isinstance(enable_spatial_goals, bool):
         raise TypeError("enable_spatial_goals must be boolean.")
+    if not isinstance(enable_tcp_pose_comparison, bool):
+        raise TypeError("enable_tcp_pose_comparison must be boolean.")
     if not isinstance(enable_grasp_approach, bool):
         raise TypeError("enable_grasp_approach must be boolean.")
     if enable_grasp_approach and (not enable_grippers or target_config.realtime_worker):
@@ -647,6 +650,7 @@ def build_mujoco_agent_tcp_pose_gateway_session(
             ),
             enable_safe_tcp_pose=enable_safe_tcp_pose,
             enable_spatial_goals=enable_spatial_goals,
+            enable_tcp_pose_comparison=enable_tcp_pose_comparison,
             enable_grasp_approach=enable_grasp_approach,
             grasp_contact_binding=grasp_contact_binding,
         )
