@@ -9,6 +9,7 @@ import time
 from dataclasses import asdict, dataclass, replace
 
 from robot_motion.rebot_b601_rs.calibration import finite, plan_local_sweeps, six
+from robot_motion.rebot_b601_rs.coordinated_holding import CoordinatedHoldingConfig
 from robot_motion.rebot_b601_rs.holding_calibration import HoldingSearchConfig
 from robot_motion.rebot_b601_rs.model import B601_RS_ARM_JOINT_NAMES
 
@@ -46,12 +47,19 @@ class WorkspaceCalibrationConfig:
     setup_label: str = "temporary_end_effector"
     holding_search: HoldingSearchConfig | None = None
     holding_excursion_rad: float | None = None
+    coordinated_holding: CoordinatedHoldingConfig | None = None
 
     def __post_init__(self):
+        if isinstance(self.coordinated_holding, dict):
+            object.__setattr__(self, "coordinated_holding", CoordinatedHoldingConfig(**self.coordinated_holding))
+        if self.coordinated_holding is not None and not isinstance(self.coordinated_holding, CoordinatedHoldingConfig):
+            raise TypeError("coordinated holding requires an explicit configuration object")
         if isinstance(self.holding_search, dict):
             object.__setattr__(self, "holding_search", HoldingSearchConfig(**self.holding_search))
         if self.holding_search is not None and not isinstance(self.holding_search, HoldingSearchConfig):
             raise TypeError("holding search must be an explicit configuration object")
+        if self.coordinated_holding is not None and self.holding_search is None:
+            raise ValueError("coordinated holding requires explicit holding search")
         if self.holding_excursion_rad is not None and (
             self.holding_search is None or finite(self.holding_excursion_rad, "holding excursion") <= 0
         ):
@@ -192,6 +200,10 @@ class B601WorkspaceCalibrationController:
         self._observations, self._acquisitions, self._moves = [], [], []
         self._records = []
         self._lock = threading.RLock()
+        self._coordinated = None
+        if workspace.coordinated_holding is not None:
+            from .coordinated_workspace import CoordinatedWorkspaceController
+            self._coordinated = CoordinatedWorkspaceController(self.settings, config, workspace)
 
     @property
     def _active(self):
@@ -223,6 +235,9 @@ class B601WorkspaceCalibrationController:
                 raise ValueError("workspace J2/J3 range exceeds the pinned owner position limits")
 
     def configure_context(self, condition, position_limits_rad):
+        if self._coordinated is not None:
+            self.validate_position_limits(position_limits_rad)
+            return self._coordinated.configure_context(condition, position_limits_rad)
         with self._lock:
             if self._condition is not None:
                 raise ValueError("workspace context is immutable")
@@ -233,11 +248,15 @@ class B601WorkspaceCalibrationController:
             self._condition, self._position_limits = condition, tuple(limits)
 
     def owner_ready(self):
+        if self._coordinated is not None:
+            return self._coordinated.owner_ready()
         with self._lock:
             self._ready = True
             self._delegate.owner_ready()
 
     def set_human_intervention(self, human):
+        if self._coordinated is not None:
+            return self._coordinated.set_human_intervention(human)
         if type(human) is not bool:
             raise TypeError("human intervention must be boolean")
         with self._lock:
@@ -248,6 +267,8 @@ class B601WorkspaceCalibrationController:
                     self._cancel = "human_intervention"
 
     def submit(self, action, *, now_sec, **fields):
+        if self._coordinated is not None:
+            return self._coordinated.submit(action, now_sec=now_sec, **fields)
         now = finite(now_sec, "intent time")
         with self._lock:
             allowed = {"withdraw_source"} if action == "withdraw" else {"visible"} if action == "visibility" else set()
@@ -366,6 +387,9 @@ class B601WorkspaceCalibrationController:
             self._transition("complete", "all_targets_and_withdrawals_confirmed", now)
 
     def step(self, *, now_sec, qpos_rad, qvel_rad_s, feedback_sequence, control_now_sec):
+        if self._coordinated is not None:
+            return self._coordinated.step(now_sec=now_sec, qpos_rad=qpos_rad, qvel_rad_s=qvel_rad_s,
+                feedback_sequence=feedback_sequence, control_now_sec=control_now_sec)
         now, clock = finite(now_sec, "feedback time"), finite(control_now_sec, "control time")
         q = six(qpos_rad, "workspace position")
         gap = self.settings.staged_assist.motion_control.max_control_gap_sec
@@ -444,14 +468,21 @@ class B601WorkspaceCalibrationController:
             return overlay, {**audit, "automatic_calibration": self._batch_status(detailed=False)}
 
     def validate_final_command(self, **values):
+        if self._coordinated is not None:
+            return self._coordinated.validate_final_command(**values)
         # Staged commands remain bounded by their runtime and the owner.
         return None
 
     def active_driver_damping(self, base_kd, *, final_command_delta_nm=None):
+        if self._coordinated is not None:
+            return self._coordinated.active_driver_damping(base_kd, final_command_delta_nm=final_command_delta_nm)
         with self._lock:
             return self._delegate.active_driver_damping(base_kd, final_command_delta_nm=final_command_delta_nm)
 
     def validate_dispatch_start(self, *, feedback_sequence, feedback_timestamp_sec, now_sec=None):
+        if self._coordinated is not None:
+            return self._coordinated.validate_dispatch_start(feedback_sequence=feedback_sequence,
+                feedback_timestamp_sec=feedback_timestamp_sec, now_sec=now_sec)
         with self._lock:
             clock = time.monotonic() if now_sec is None else finite(now_sec, "dispatch start")
             if self._pending is None or self._pending[:2] != (feedback_sequence, feedback_timestamp_sec) or not feedback_timestamp_sec <= clock <= feedback_timestamp_sec + self.settings.staged_assist.motion_control.max_control_gap_sec:
@@ -459,6 +490,8 @@ class B601WorkspaceCalibrationController:
                 raise ValueError(self._reason)
 
     def record_dispatch(self, *, native_receipt, **values):
+        if self._coordinated is not None:
+            return self._coordinated.record_dispatch(native_receipt=native_receipt, **values)
         with self._lock:
             if self._pending is None:
                 raise ValueError("workspace has no pending dispatch")
@@ -528,6 +561,8 @@ class B601WorkspaceCalibrationController:
 
     @property
     def cycle_disable_confirmation_ready(self):
+        if self._coordinated is not None:
+            return self._coordinated.cycle_disable_confirmation_ready
         with self._lock:
             return (self._phase == "complete" and self._zero_base and self._pending is None
                 and self._origin is not None and self._q is not None
@@ -588,12 +623,16 @@ class B601WorkspaceCalibrationController:
                 "disable_confirmation_available": self.cycle_disable_confirmation_ready}}
 
     def status(self):
+        if self._coordinated is not None:
+            return self._coordinated.status()
         with self._lock:
             return {**self._delegate.status(), "owner_ready": self._ready,
                 "controller_mode": self.controller_mode,
                 "automatic_calibration": self._batch_status(detailed=False)}
 
     def result_record(self):
+        if self._coordinated is not None:
+            return self._coordinated.result_record()
         with self._lock:
             batch = self._batch_status(detailed=True)
             legs = [{**copy.deepcopy(leg), "joint_name": acquisition["task"]["joint"],
@@ -614,16 +653,22 @@ class B601WorkspaceCalibrationController:
                 "motion": {"completed_legs": legs}, **batch}
 
     def drain_records(self):
+        if self._coordinated is not None:
+            return self._coordinated.drain_records()
         with self._lock:
             records, self._records = self._records, []
             return records
 
     def recording_failed(self, reason):
+        if self._coordinated is not None:
+            return self._coordinated.recording_failed(reason)
         with self._lock:
             if self._phase != "failed" or calibration_outcome(self._phase, self._reason)["severity"] != "error":
                 self._transition("failed", str(reason), self._last_feedback or 0.0)
 
     def owner_stopped(self, *, now_sec, reason):
+        if self._coordinated is not None:
+            return self._coordinated.owner_stopped(now_sec=now_sec, reason=reason)
         with self._lock:
             self._closed, self._start_requested, self._ready = True, False, False
             self._delegate.owner_stopped(now_sec=now_sec, reason=reason)

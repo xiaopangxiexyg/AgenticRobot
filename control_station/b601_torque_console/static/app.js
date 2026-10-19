@@ -278,17 +278,21 @@ function renderAutomatic() {
 function renderWorkspace(batch) {
   const workspace = batch.workspace;
   const task = workspace.current_task;
-  const names = {idle: "等待启动", position: "分段换位", sweep: "双向双速采集",
+  const names = {idle: "等待启动", preparing: "六轴静止确认", position: "分段换位", sweep: "双向双速采集",
     observe: "零助力重力观察", return: "分段返回起点", return_observe: "返回后观察",
     advancing: "准备下一阶段", stopping: "撤力停稳", complete: "多位姿采集完成",
     failed: batch.outcome?.severity === "warning" ? "采集未完成 · 告警，数据保留" : "采集故障 · 已停止",
     cancelled: "已撤销"};
   const label = workspace.phase === "sweep" && workspace.holding_search_enabled
-    ? "定点保持命令搜索" : names[workspace.phase] || workspace.phase;
+    ? "定点保持命令搜索" : workspace.coordinated_holding_enabled && ["observe", "return_observe"].includes(workspace.phase)
+      ? "联合姿态保持观察（不是零助力）" : names[workspace.phase] || workspace.phase;
   const ranges = workspace.acquisition_ranges_deg || {joint2: [0, 10], joint3: [0, 10]};
   el("automatic-mode-title").textContent = "J2/J3 多位姿自动采集 · 重力优先";
   if (workspace.holding_search_enabled) {
     el("automatic-mode-title").textContent = "J2/J3 多位姿采集 · 等效保持命令搜索候选";
+  }
+  if (workspace.coordinated_holding_enabled) {
+    el("automatic-mode-title").textContent = "J2/J3 联合姿态维持 · 单轴保持命令试探";
   }
   el("automatic-mode-note").textContent = `本批采集范围 J2 ${ranges.joint2.join("–")}°、J3 ${ranges.joint3.join("–")}°；从 J2/J3 零位附近（不超过 ${workspace.maximum_start_angle_deg ?? 2}°）开始，先展开 J3 再移动 J2，返回时顺序相反。完整机械角度范围不等于任意组合可达；本功能不替代自碰撞/环境检查。J2 −0.3° 只作已有反馈边界处理，不生成负目标。`;
   el("arm").textContent = "开始 J2/J3 多位姿自动采集";
@@ -320,6 +324,10 @@ function renderWorkspace(batch) {
   el("automatic-sequence-note").textContent = "本阶段先采集零驱动力下的重力漂移，再采集 J2/J3 双向双速度运动，不执行额外静摩擦阈值扫描。软件力矩命令不是实测受力；不会自动安装补偿。";
   if (holding?.enabled) {
     el("automatic-sequence-note").textContent = "本候选到点后搜索可重复的零或非零保持命令；已在点上时直接观察零附加命令，不强行起步。撤力回退用于下一次试探，不要求每个点都能零助力保持。取消或结束仍单独确认撤力与停稳，不自动安装补偿。";
+  }
+  if (workspace.coordinated_holding_enabled) {
+    el("automatic-progress").textContent += ` 联合维持偏置 J2 ${number(workspace.holding_bias_nm?.[1])}、J3 ${number(workspace.holding_bias_nm?.[2])} N·m；最近完整发送 J2 ${number(workspace.last_confirmed_delta_nm?.[1])}、J3 ${number(workspace.last_confirmed_delta_nm?.[2])} N·m；两轴附加命令绝对值之和上限 ${number(workspace.combined_l1_cap_nm)} N·m（均非实测受力）。`;
+    el("automatic-sequence-note").textContent = "换位与试探期间 J2/J3 联合维持姿态；每次只试探一个关节，另一关节继续维持。正常点／轴切换不要求助力归零；完成整批或人工撤销才撤销两轴附加助力，确认零命令、基础阻尼和停稳后等待人工确认失能。联合观察不冒充零助力重力观察。";
   }
   const ready = batch.cycle?.disable_confirmation_available === true && state.stop_controls_available === true;
   el("cycle-disable-hint").hidden = !ready;

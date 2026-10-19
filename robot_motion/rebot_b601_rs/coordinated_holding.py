@@ -1,0 +1,221 @@
+"""Receipt-driven J2/J3 pose holding; no I/O or hardware authority."""
+
+from __future__ import annotations
+
+from dataclasses import asdict, dataclass, replace
+
+from .calibration import finite, six
+from .joint_motion import (
+    B601JointMotionTracker,
+    B601WindowStopEvidence,
+    B601WindowVelocityEstimator,
+    window_stationarity_gate_reason,
+)
+
+ZERO = (0.0,) * 6
+AXES = (1, 2)
+
+
+@dataclass(frozen=True)
+class CoordinatedHoldingConfig:
+    """Explicit acquisition parameters, not shared-control defaults."""
+
+    total_assist_cap_nm: float = 1.0
+    bias_cap_nm: float = 1.0
+    bias_gain_nm_per_rad_sec: float = 20.0
+    rise_slew_nm_s: float = 1.0
+    fall_slew_nm_s: float = 0.5
+
+    def __post_init__(self):
+        for name, value in vars(self).items():
+            if finite(value, name) <= 0:
+                raise ValueError(f"coordinated {name} must be positive")
+        if self.bias_cap_nm > self.total_assist_cap_nm:
+            raise ValueError("holding bias must fit the combined assist envelope")
+
+
+class CoordinatedPoseHolding:
+    """Compose two existing motion trackers under ONE combined L1 envelope.
+
+    References and bias only commit on an admitted complete owner receipt.
+    A probe replaces one axis' entire active demand, not its gravity baseline.
+    The other axis keeps its pose feedback and last learned bias.
+    """
+
+    def __init__(self, settings, config: CoordinatedHoldingConfig):
+        self.settings, self.config = settings, config
+        self.motion = settings.staged_assist.motion_control
+        if (self.motion is None or not self.motion.responsive_tracking_brake
+            or self.motion.continuous_speed_limit_rad_s is None
+            or config.total_assist_cap_nm > settings.limits.max_abs_assist_nm
+            or max(config.rise_slew_nm_s, config.fall_slew_nm_s) > self.motion.braking_slew_nm_s):
+            raise ValueError("coordinated holding must fit resolved native motion and assist limits")
+        self.trackers = tuple(B601JointMotionTracker(self.motion) for _ in AXES)
+        self.estimators = tuple(B601WindowVelocityEstimator(self.motion.velocity_window_sec) for _ in range(6))
+        self.q = self.raw = self.velocity = ZERO
+        self.goal = None
+        self.bias = ZERO
+        self.last_delta = ZERO
+        self.last_time = None
+        self.pending = None
+        self.frames = ()
+        self.braking = False
+
+    def observe(self, now, q, raw, *, idle=False):
+        q, raw = six(q, "coordinated position"), six(raw, "coordinated velocity")
+        now = finite(now, "coordinated feedback time")
+        if self.pending is not None:
+            raise ValueError("coordinated previous dispatch not confirmed")
+        if type(idle) is not bool or idle and (self.goal is not None or self.bias != ZERO or self.last_delta != ZERO):
+            raise ValueError("idle reentry requires an unstarted zero-command controller")
+        if self.last_time is not None:
+            elapsed = now-self.last_time
+            if elapsed <= 0 or elapsed > self.motion.max_control_gap_sec and not idle:
+                raise ValueError("coordinated feedback clock or watchdog gap")
+            if elapsed > self.motion.max_control_gap_sec:
+                # GUI modes can be visited again before starting a batch.
+                # Never reuse their old stationary evidence for authorization.
+                for estimator in self.estimators:
+                    estimator.reset()
+                self.last_time = None
+        dt = self.settings.nominal_control_period_sec if self.last_time is None else now - self.last_time
+        self.last_time, self.q, self.raw = now, q, raw
+        self.velocity = tuple(e.update(timestamp_sec=now, qpos_rad=p, fallback_rad_s=v)
+                              for e, p, v in zip(self.estimators, q, raw, strict=True))
+        return dt
+
+    def quiet(self):
+        return window_stationarity_gate_reason(self.estimators, self.raw, self.velocity,
+            soft_limit_rad_s=self.settings.staged_assist.settle_velocity_rad_s,
+            hard_limit_rad_s=self.settings.limits.max_joint_velocity_rad_s) == "ready"
+
+    def set_goal(self, goal, *, max_reference_velocity_rad_s=None):
+        goal = six(goal, "coordinated goal")
+        if self.pending is not None or self.last_time is None:
+            raise ValueError("goal changes require consumed feedback/dispatch")
+        if any(abs(goal[i] - self.q[i]) > self.settings.maximum_target_offset_rad for i in AXES):
+            raise ValueError("coordinated goal exceeds existing local target envelope")
+        speed = (self.motion.max_reference_velocity_rad_s if max_reference_velocity_rad_s is None
+                 else finite(max_reference_velocity_rad_s, "coordinated reference speed"))
+        if not 0 < speed <= self.motion.max_reference_velocity_rad_s:
+            raise ValueError("coordinated reference speed exceeds the resolved ceiling")
+        if any(tracker.config.max_reference_velocity_rad_s != speed for tracker in self.trackers):
+            if not self.quiet():
+                raise ValueError("reference speed changes require fresh six-axis stillness")
+            # Only the reference planner changes at a consumed, quiet handoff.
+            # Keep the actual command and learned support bias continuously.
+            self.trackers = tuple(B601JointMotionTracker(replace(self.motion,
+                max_reference_velocity_rad_s=speed)) for _ in AXES)
+        self.goal = goal
+        for tracker, i in zip(self.trackers, AXES, strict=True):
+            tracker.start(now=self.last_time, q=self.q[i], target=goal[i])
+
+    def adopt_hold(self, joint, command_nm):
+        if type(joint) is not int or joint not in AXES or self.pending is not None:
+            raise ValueError("hold transfer requires a consumed J2/J3 receipt")
+        value = finite(command_nm, "transferred hold")
+        if abs(value) > self.config.bias_cap_nm:
+            raise ValueError("transferred hold exceeds the explicit bias envelope")
+        # Keep the observed command as an explicit bias, never as gravity.
+        bias = list(self.bias)
+        bias[joint] = value
+        self.bias = tuple(bias)
+
+    def step(self, *, sequence, dt, permitted, probe_joint=None, probe_nm=None):
+        if type(sequence) is not int or sequence < 0 or type(permitted) is not bool or not 0 < finite(dt, "control interval") <= self.motion.max_control_gap_sec:
+            raise ValueError("coordinated step requires valid sequence, permit and control interval")
+        if self.pending is not None:
+            raise ValueError("coordinated previous dispatch not confirmed")
+        if probe_joint is not None and (type(probe_joint) is not int or probe_joint not in AXES):
+            raise ValueError("coordinated probes support J2/J3 only")
+        if probe_nm is not None and (probe_joint is None or abs(finite(probe_nm, "probe")) > self.config.total_assist_cap_nm):
+            raise ValueError("probe must fit the combined assist envelope")
+        proposed_bias, demand = list(self.bias), [0.0] * 6
+        frames = []
+        if permitted:
+            if self.goal is None:
+                raise ValueError("coordinated drive requires an admitted goal")
+            if max(abs(v) for v in self.raw) > self.settings.limits.max_joint_velocity_rad_s:
+                raise ValueError("coordinated raw joint velocity exceeded")
+            for tracker, i in zip(self.trackers, AXES, strict=True):
+                evidence = B601WindowStopEvidence(timestamp_sec=self.last_time, qpos_rad=self.q,
+                    raw_qvel_rad_s=self.raw, window_qvel_rad_s=self.velocity,
+                    position_span_rad=tuple(e.position_span_rad for e in self.estimators),
+                    window_span_sec=min(e.span_sec for e in self.estimators),
+                    raw_velocity_limit_rad_s=self.settings.limits.max_joint_velocity_rad_s, joint_index=i)
+                frame = tracker.update(now=self.last_time, q=self.q[i], raw_v=self.raw[i], control_v=self.velocity[i],
+                    control_sequence=sequence, authority=1.0,
+                    kp=self.motion.tracking_kp_nm_per_rad, kd=self.motion.tracking_kd_nm_s_per_rad,
+                    stop_error_rad=self.settings.staged_assist.settle_error_rad,
+                    stop_velocity_rad_s=self.settings.staged_assist.settle_velocity_rad_s,
+                    stop_dwell_sec=self.settings.staged_assist.settle_dwell_sec,
+                    support_max_velocity_rad_s=max(abs(v) for j, v in enumerate(self.velocity) if j != i),
+                    support_raw_max_velocity_rad_s=max(abs(v) for j, v in enumerate(self.raw) if j != i),
+                    stop_evidence=evidence, speed_governor_permitted=True,
+                    zero_dispatch_confirmed=max(abs(v) for v in self.last_delta) <= 1e-9,
+                    calibration_hold_enabled=True,
+                    calibration_probe_nm=probe_nm if i == probe_joint else None)
+                frames.append(frame)
+                if frame.phase == "authority_exhausted":
+                    raise ValueError(frame.reason)
+                is_probe = i == probe_joint and probe_nm is not None and frame.reason == "calibration_fixed_command_observation"
+                if not is_probe and abs(self.velocity[i]) <= self.settings.staged_assist.stuck_max_velocity_rad_s:
+                    error = frame.q_reference_rad - self.q[i]
+                    if abs(error) > (self.motion.position_resolution_rad or 0):
+                        proposed_bias[i] = max(-self.config.bias_cap_nm, min(self.config.bias_cap_nm,
+                            self.bias[i] + self.config.bias_gain_nm_per_rad_sec * error * dt))
+                demand[i] = frame.requested_torque_nm + (0.0 if is_probe else proposed_bias[i])
+        self.braking = any(f.phase == "brake" and f.reason != "target_reached_braking" for f in frames)
+        if self.braking:
+            proposed_bias = [0.0] * 6
+            demand = [0.0] * 6
+            for i, frame in zip(AXES, frames, strict=True):
+                demand[i] = frame.requested_torque_nm if frame.phase == "brake" else -self.motion.braking_kd_nm_s_per_rad * self.velocity[i]
+        norm = sum(abs(v) for v in demand)
+        scale = min(1.0, self.config.total_assist_cap_nm / norm) if norm else 1.0
+        if scale < 1:
+            proposed_bias = list(self.bias)  # No integral windup at saturation.
+        command = [0.0] * 6
+        if permitted:
+            for i in AXES:
+                target = demand[i] * scale
+                rate = (self.motion.braking_slew_nm_s if self.braking else
+                        self.config.rise_slew_nm_s if abs(target) > abs(self.last_delta[i]) else self.config.fall_slew_nm_s)
+                command[i] = self.last_delta[i] + max(-rate * dt, min(rate * dt, target - self.last_delta[i]))
+            # The final sum, including a preceding axis' tail, owns one cap.
+            norm = sum(abs(v) for v in command)
+            if norm > self.config.total_assist_cap_nm:
+                # Retain all requested reductions, then share only the freed
+                # magnitude. Radial projection could violate a slow release
+                # rate on the outgoing support axis during a handoff.
+                increases = [i for i in AXES if abs(command[i]) > abs(self.last_delta[i])]
+                base = [command[i] if i not in increases else self.last_delta[i] for i in range(6)]
+                headroom = max(0.0, self.config.total_assist_cap_nm-sum(abs(v) for v in base))
+                requested = sum(abs(command[i])-abs(self.last_delta[i]) for i in increases)
+                for i in increases:
+                    magnitude = abs(self.last_delta[i]) + (abs(command[i])-abs(self.last_delta[i])) * headroom/requested
+                    command[i] = magnitude if command[i] > 0 else -magnitude
+                proposed_bias = list(self.bias)
+        else:
+            proposed_bias = [0.0] * 6
+        self.frames = tuple(frames)
+        self.pending = (sequence, tuple(command), tuple(proposed_bias))
+        return tuple(command), {"target_qpos_rad": self.goal, "bias_nm": self.bias,
+            "max_reference_velocity_rad_s": self.trackers[0].config.max_reference_velocity_rad_s,
+            "proposed_bias_nm": tuple(proposed_bias), "combined_command_nm": tuple(command),
+            "combined_l1_cap_nm": self.config.total_assist_cap_nm,
+            "saturated": scale < 1, "braking": self.braking,
+            "axes": [asdict(f) for f in frames], "auto_apply": False,
+            "quantity": "software_command_not_measured_force"}
+
+    def record_dispatch(self, sequence, actual_delta):
+        if self.pending is None or sequence != self.pending[0]:
+            raise ValueError("coordinated receipt does not match pending frame")
+        actual = six(actual_delta, "actual coordinated delta")
+        if any(abs(actual[i]) > 1e-9 for i in (0, 3, 4, 5)) or sum(abs(v) for v in actual) > self.config.total_assist_cap_nm + 1e-9:
+            raise ValueError("actual coordinated command exceeds combined envelope")
+        if max(abs(a-b) for a, b in zip(actual, self.pending[1])) <= 1e-9:
+            self.bias = self.pending[2]
+        for tracker in self.trackers:
+            tracker.record_dispatch(sequence)
+        self.last_delta, self.pending = actual, None

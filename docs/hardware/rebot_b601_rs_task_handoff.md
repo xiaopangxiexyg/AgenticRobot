@@ -18,6 +18,69 @@
   基线中已接入的自观测过滤、夹爪等扩展保持原显式启用方式，默认 15 mm／v1／严格碰撞
   行为不随硬件迁移切换。物理验证仍由操作者运行，不把离线回归当成硬件有效性证明。
 
+### J2/J3 协同保持、单轴定力观察候选（2026-10-19）
+
+本增量基于 `82bead03e8dce586bb78524354fe117c78e75b5a`，只在显式
+`b601_j2_j3_coordinated_holding_v1.json` 的 GUI「J2/J3 位姿采集」中启用。
+旧 profile、固定位置模式、完整带启动模式、共享控制注入接口及 owner 执行循环不变。
+新路径复用现有单关节参考/制动控制器、六轴因果窗口、HoldingForceSearch、六轴发送回执
+和最终 owner；不是另一套 CAN 发送器，也不把标定流程扩展成 replay/RM65 框架。
+
+需要修正的结构问题是：过去「另一个轴保持」只表示重力前馈和 Kd、Kp=0；重力模型
+有残差时不能等同于位置不动。逐轴测试中强制归零又会移除刚找到的保持命令。本候选
+把 J2/J3 的姿态目标、学习到的保持偏置和实际发送尾量作为同一组受限状态：
+
+- 搬运和缓慢重新到点时，两轴均有低增益反馈与有界条件偏置；测某一轴时，该轴的
+  **完整附加请求**被定力试探替代，另一轴继续保持姿态，不叠加第二份试探/积分。
+- 原来的逐段快/慢参考速度进入实际 planner；速度切换只在已消费回执且六轴新鲜静止
+  的交接处发生。正常点间、轴间交接保留实际保持命令，不先撤到零。
+- 固定命令观察必须晚于实际完整派发，记录全六轴位置、命令范围和阻尼。其他轴
+  位姿变化超出原 0.003 rad 测量带，或其保持命令仍明显变化，只能记作条件变化/未决，
+  不能据此更新被测轴正负运动边界。实际平台可用于重复核验，但仍需原两次重复确认。
+- 人工撤销、页面关闭、许可超时、故障或整批结束才撤掉全部自主保持/试探项。结束
+  必须确认实际六轴零附加命令、基础 Kd 和新鲜静止；最终失能仍由 GUI 人工确认。
+  人工介入若发生在计算与发送之间，未发送的非零帧同样被否决。
+
+新 profile 保持中心 `J2=3° / J3=3°`、局部半径 `0.01 rad`、原 `0..10°` 采集范围；
+不启用全角度网格。两轴最终软件附加命令满足同一个
+`|u2|+|u3| <= 1.0 N·m` 上限，**不是两轴各自 1.0 N·m**；保持偏置也受该总上限
+约束。正常增力 `1.0 N·m/s`、减力 `0.5 N·m/s`，实际发送后的尾量同样计入上限
+和命令暴露。真正制动沿用现有制动控制，不以正常慢撤力替代故障处理。积分饱和或
+下游实际命令不同于请求时不继续累积偏置。这里的上限约束的是软件前馈附加项，
+不是包含驱动器内部阻尼的真实输出力矩，更不是人手受力测量。
+
+速度、位移、支撑轴、反馈有效性、40 ms watchdog、原段/批时限及暴露预算均未放宽。
+GUI 后台继续/关闭撤销合同不变；尚未开始的模式再次进入时只重新积累窗口，不将
+离开期间的旧静止证据用于授权，运行中的 watchdog 仍严格执行。
+
+报告新增的 `coordinated_pose_observations` 不是 `gravity_observations`。正常交接点
+记录 `handoff_full_dispatch_confirmed=true`、`withdrawal_confirmed=false`，整批最终
+撤力单独记录。采集值是**在记录姿态、进入方向和传动历史下可重复保持的命令区间**；
+静摩擦/预载可能产生多个可保持值，不能证明其为唯一重力残差，也不自动更新模型。
+后续需要相同完整姿态的双向到点、重复交叉验证，再分离可重复偏置和历史依赖区间。
+
+离线证据覆盖 J2/J3 有姿态相关残差、静摩擦死区和非对角运动耦合的声明式简化模型，
+在 40/100 Hz 均可完成 24 个保持采样段、非零轴间交接、回原位和最终撤力；该模型
+没有用真机数据辨识。另覆盖缺失/重复/错误六轴回执、人工撤销、尾量、最终合成限幅、
+模式切换和 watchdog。离线模型通过不等于已证明真机无回弹、保持稳定或完成标定。
+既有 nominal 近零几何审计的约 0.773 mm 间隙警告仍未关闭，新保持修正造成的实际
+双轴轨迹尚未验证；不能以旧的逐轴 nominal 审计宣称本候选碰撞验收通过。J1 Type-24
+约 40 Hz 的既有实际节奏也未在本增量改变。没有连接 CAN、启动真机或应用补偿模型。
+
+定向验证命令及结果（既有 dexteleop310 环境，不安装依赖）：
+
+```bash
+bash scripts/run_pytest.sh -q tests/test_b601_coordinated_holding.py tests/test_b601_holding_calibration.py tests/test_b601_calibration_session.py --tb=short
+# 164 passed
+bash scripts/run_pytest.sh -q tests/test_b601_workspace_calibration.py tests/test_b601_calibration_cycle.py tests/test_b601_automatic_calibration.py -k 'held_probe or result or gui or short_target or terminal or lifecycle or workspace' --tb=short
+# 76 passed, 287 deselected
+bash scripts/run_pytest.sh -q tests/test_control_station_boundaries.py tests/test_hardware_boundaries.py tests/test_runtime_domain_boundaries.py --tb=short
+# 46 passed
+```
+
+Ruff、`node --check control_station/b601_torque_console/static/app.js`、`git diff --check`
+均通过。新 profile 仍需绑定固定提交、按完整参数执行连接前预检；预检不是物理运动验收。
+
 ### Type-24 独立缓存修复（arrival-credit 真机记录之后）
 
 `j2-j3-arrival-credit-acceptance/b601-owner-cr02hmu0` 的首次退出是 J2 原始速度

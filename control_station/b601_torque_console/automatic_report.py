@@ -177,7 +177,7 @@ def build_automatic_report(run_dir: Path) -> dict:
             for leg in child.get("completed_legs", []):
                 if leg.get("holding_calibration") is not None:
                     holds.append({"joint": stage["task"]["joint"], "pose": stage["task"]["pose"],
-                        "trial_id": leg["trial_id"], "withdrawal_confirmed": True,
+                        "trial_id": leg["trial_id"], "withdrawal_confirmed": leg.get("withdrawal_confirmed", True),
                         **leg["holding_calibration"]})
             pending = child.get("holding_calibration")
             if pending and pending.get("search"):
