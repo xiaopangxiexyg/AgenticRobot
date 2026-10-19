@@ -195,22 +195,24 @@ class HoldingForceSearch:
                 **evidence,
                 "command_nm": command_nm,
                 "requested_command_nm": requested_command_nm,
+                "verification_command_nm": self._verification,
                 "quantity": "censored_transition_not_fixed_command_response",
             }
         )
-        stable = [
-            r["command_nm"] for r in self.observations if r["outcome"] == "stationary"
-        ]
+        stable = self._eligible_stationary_commands()
         if not stable:
             self.state, self.reason = (
                 "incomplete",
-                "holding_transition_without_stable_anchor",
+                "holding_no_repeatable_anchor" if self._verification is not None
+                else "holding_transition_without_stable_anchor",
             )
             return
         best = min(stable, key=abs)
-        # A transition unable to withdraw even one resolved command step needs
-        # another hold check, not an endless replay of the same failed ramp.
-        if (command_nm - best) * best >= 0:
+        # A failed return check is not a signed motion bound. Keep its old
+        # observation, but verify another known hold instead of replaying this
+        # same transition until the attempt budget expires.
+        # With no resolved withdrawal step, also recheck before exploring.
+        if self._verification is not None or (command_nm - best) * best >= 0:
             self._verification = self.candidate_nm = best
         else:
             positive = [
@@ -240,6 +242,21 @@ class HoldingForceSearch:
         if len(self.observations) + len(self.transitions) >= self.config.max_trials:
             self.state, self.reason = "incomplete", "holding_trial_budget_exhausted"
 
+    def _eligible_stationary_commands(self):
+        rejected = [r["verification_command_nm"] for r in self.transitions
+                    if r.get("verification_command_nm") is not None]
+        return [r["command_nm"] for r in self.observations
+                if r["outcome"] == "stationary"
+                and not any(abs(r["command_nm"] - v) <= 1e-9 for v in rejected)]
+
+    @property
+    def return_command_nm(self):
+        """Use the selected recheck hold during reacquisition, not a rejected one."""
+        if self._verification is not None:
+            return self._verification
+        return min(self._eligible_stationary_commands(), key=abs,
+                   default=None)
+
     def status(self, *, detailed=False):
         stable = [
             r["command_nm"] for r in self.observations if r["outcome"] == "stationary"
@@ -251,6 +268,8 @@ class HoldingForceSearch:
             "trial_count": len(self.observations),
             "transition_count": len(self.transitions),
             "max_trials": self.config.max_trials,
+            "movement_rad": self.config.movement_rad,
+            "return_command_nm": self.return_command_nm,
             "usable_hold_nm": self._verification if self.state == "complete" else None,
             "observed_stationary_range_nm": [min(stable), max(stable)]
             if stable

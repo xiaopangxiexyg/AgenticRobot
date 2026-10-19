@@ -62,6 +62,7 @@ def test_seed_and_zero_need_not_form_a_valid_bracket_and_expansion_is_bounded():
         )
     assert search.reason == "holding_authority_insufficient"
     assert all(abs(r["command_nm"]) <= 0.4 for r in search.observations)
+    assert search.return_command_nm is None
 
 
 def test_inconsistent_same_level_is_not_forced_into_a_binary_result():
@@ -152,6 +153,64 @@ def test_transition_after_repeated_old_holds_still_needs_a_fresh_return_check():
     assert search.status()["usable_hold_nm"] is None
     search.record(command_nm=-0.3, outcome="stationary", evidence={})
     assert search.state == "complete"
+
+
+@pytest.mark.parametrize("sign", [-1, 1])
+def test_pk81t8jv_failed_recheck_selects_another_observed_hold_not_same_retry(sign):
+    # First six trial outcomes from pk81t8jv, mirrored to cover both signs.
+    # Positions are handled by the session; censored ramps are not motion bounds.
+    search = HoldingForceSearch(HoldingSearchConfig(), seed_nm=sign * 0.3544235726612437, cap_nm=1)
+    search.record(command_nm=search.candidate_nm, outcome="stationary", evidence={})
+    search.record_transition(command_nm=sign * 0.07012636713020526,
+                             requested_command_nm=0, evidence={})
+    for _ in range(3):
+        search.record(command_nm=search.candidate_nm, outcome="stationary", evidence={})
+    weak = search.candidate_nm
+    assert abs(weak) == pytest.approx(0.08789494247589516)
+    search.record_transition(command_nm=weak, requested_command_nm=weak, evidence={})
+    failed = search.candidate_nm
+    assert abs(failed) == pytest.approx(0.10566351782158506)
+    search.record_transition(command_nm=failed, requested_command_nm=failed, evidence={})
+    fallback = search.candidate_nm
+    assert abs(fallback) == pytest.approx(0.14120066851296487)
+    assert search.return_command_nm == fallback
+    assert search.state == "searching"
+    assert search.status()["usable_hold_nm"] is None
+    assert search.transitions[-1]["verification_command_nm"] == failed
+    search.record(command_nm=fallback, outcome="stationary", evidence={"fresh_return": True})
+    result = search.status(detailed=True)
+    assert result["state"] == "complete"
+    assert result["usable_hold_nm"] == fallback
+    assert result["trial_count"] == 5
+    assert result["transition_count"] == 3
+    assert result["negative_motion_below_nm"] is result["positive_motion_above_nm"] is None
+    assert failed in [r["command_nm"] for r in result["observations"]]
+
+
+def test_censored_recheck_without_another_anchor_stops_without_fabricating_hold():
+    search = HoldingForceSearch(HoldingSearchConfig(), seed_nm=-0.3, cap_nm=1)
+    search.record(command_nm=-0.3, outcome="stationary", evidence={})
+    search.record_transition(command_nm=-0.28, requested_command_nm=0, evidence={})
+    assert search.candidate_nm == -0.3
+    search.record_transition(command_nm=-0.3, requested_command_nm=-0.3, evidence={})
+    assert search.state == "incomplete"
+    assert search.reason == "holding_no_repeatable_anchor"
+    assert search.status()["usable_hold_nm"] is None
+    assert len(search.observations) == 1
+
+
+def test_each_failed_return_check_removes_only_that_candidate_from_further_retries():
+    search = HoldingForceSearch(HoldingSearchConfig(), seed_nm=-0.4, cap_nm=1)
+    search.record(command_nm=-0.4, outcome="stationary", evidence={})
+    search.record(command_nm=-0.3, outcome="stationary", evidence={})
+    search.record_transition(command_nm=-0.29, requested_command_nm=0, evidence={})
+    search.record_transition(command_nm=-0.3, requested_command_nm=-0.3, evidence={})
+    assert search.candidate_nm == search.return_command_nm == -0.4
+    search.record_transition(command_nm=-0.4, requested_command_nm=-0.4, evidence={})
+    assert search.state == "incomplete"
+    assert search.reason == "holding_no_repeatable_anchor"
+    assert search.status()["usable_hold_nm"] is None
+    assert len(search.observations) + len(search.transitions) < search.config.max_trials
 
 
 @pytest.mark.parametrize(
@@ -490,6 +549,34 @@ def test_native_point_comparison_uses_actual_sample_not_nominal_arrival_edge(set
     assert observations[1]["final_qpos_rad"][2] - sample < 0.002
 
 
+@pytest.mark.parametrize("period", [0.01, 0.025])
+@pytest.mark.parametrize("movement", [0.002, 0.003])
+def test_explicit_wider_point_band_allows_seven_count_recoil_only_after_quiet_plateau(settings, period, movement):
+    from dataclasses import replace
+    replay = holding_replay(settings, control_period_sec=period)
+    replay.session.holding_search = replace(replay.session.holding_search, movement_rad=movement)
+    sample = prime_offset_arrival(replay)
+    search = replay.session._holding
+    for _ in range(150):
+        if replay.session.status()["state"] in {"complete", "failed"}:
+            break
+        q = list(replay.q)
+        # Seven observed encoder counts: beyond the old band, inside the
+        # explicit 50% wider band. This prescribed recoil then stops.
+        q[2] += min(0.015 * period, max(0, sample + 7 * 0.0003835 - q[2]))
+        replay.tick(q=q)
+    if movement == 0.002:
+        assert search.status()["usable_hold_nm"] is None
+        assert len(search.observations) == 1
+    else:
+        assert search.state == "complete", replay.session.status()
+        assert search.status()["usable_hold_nm"] == 0
+        assert len(search.observations) == 3
+        assert all(r["completed_at_sec"] - r["started_at_sec"] >= search.config.observation_sec
+                   for r in search.observations)
+        assert all(r["started_at_sec"] > r["first_causal_receipt_at_sec"] for r in search.observations)
+
+
 def test_short_plateau_recoil_then_stop_refines_without_claiming_sustained_motion(settings):
     replay = holding_replay(settings)
     prime_offset_arrival(replay)
@@ -544,6 +631,60 @@ def test_native_transition_refinement_reacquires_verifies_then_withdraws(setting
     assert leg["final_zero_and_still_confirmed"]
     assert abs(leg["target_error_rad"]) > result["acquisition_arrival_tolerance_rad"]
     assert all(abs(row["commands"]["total_nm"][2]) <= 0.3 + 1e-9 for row in replay.history)
+
+
+@pytest.mark.parametrize("period", [0.01, 0.025])
+@pytest.mark.parametrize("joint_name", ["joint2", "joint3"])
+def test_native_failed_weak_hold_recheck_returns_with_stronger_bias_and_fresh_receipts(settings, period, joint_name):
+    replay = holding_replay(settings, control_period_sec=period, joint_name=joint_name)
+    j = int(joint_name[-1]) - 1
+    sample = prime_offset_arrival(replay)
+    fallback_bias_seen = False
+    fallback = None
+    for _ in range(3000):
+        state = replay.session.status()["state"]
+        if state in {"complete", "failed"}:
+            break
+        q = list(replay.q)
+        search = replay.session._holding
+        rejected = any(r.get("verification_command_nm") is not None for r in search.transitions)
+        if rejected and state == "moving":
+            failed = [r["verification_command_nm"] for r in search.transitions
+                      if r.get("verification_command_nm") is not None][-1]
+            fallback = replay.session._holding_reacquire_bias_nm
+            assert abs(fallback) > abs(failed)
+            assert fallback in [r["command_nm"] for r in search.observations if r["outcome"] == "stationary"]
+            fallback_bias_seen = True
+        if state == "moving":
+            if replay.session._holding_status()["stage"] == "fixed_command_observation":
+                sent = replay.commands["total_nm"][j]
+                if sent > -0.09:
+                    q[j] += 0.015 * period
+                else:
+                    # A weaker level can be quiet near the point's edge once,
+                    # yet fail its later return check. Do not fake a monotone
+                    # static-friction plant or classify its recoil as a bound.
+                    goal = sample
+                    if rejected:
+                        goal = replay.session._holding_observation["anchor_qpos_rad"][j]
+                    elif search._verification is not None:
+                        goal += 0.0024
+                    elif sent >= -0.15:
+                        goal += 0.0018
+                    q[j] += max(-0.01 * period, min(0.01 * period, goal - q[j]))
+            else:
+                q[j] += max(-0.01 * period, min(0.01 * period, sample - q[j]))
+        replay.tick(q=q)
+    result = replay.session.result_record()
+    assert result["state"] == "complete", (result["reason"], replay.session._holding.status(detailed=True))
+    assert fallback_bias_seen
+    point = result["completed_legs"][0]["holding_calibration"]
+    assert point["usable_hold_nm"] == fallback
+    assert point["negative_motion_below_nm"] is point["positive_motion_above_nm"] is None
+    assert point["observations"][-1]["command_nm"] == fallback
+    assert point["observations"][-1]["completed_at_sec"] > point["transitions"][-1]["completed_at_sec"]
+    assert all(r["started_at_sec"] > r["first_causal_receipt_at_sec"] for r in point["observations"])
+    assert result["completed_legs"][0]["final_zero_and_still_confirmed"]
 
 
 def test_nonzero_hold_survives_subsequent_recoil_and_withdrawal_still_requires_receipts(
@@ -696,7 +837,11 @@ def test_explicit_profile_samples_nearby_points_without_changing_legacy_stop_ban
         max(abs(s["target_qpos_rad"][1] - anchor[1]) for s in session._steps)
         <= 0.01 + 1e-12
     )
-    assert session.acquisition_arrival_tolerance_rad == 0.002
+    assert session.acquisition_arrival_tolerance_rad == 0.003
+    assert session.holding_search.max_trials == 18
+    assert HoldingSearchConfig().movement_rad == 0.002
+    assert HoldingSearchConfig().max_trials == 12
+    assert controller.settings.limits == legacy.settings.limits
     assert (
         controller.settings.staged_assist.settle_error_rad
         == legacy.settings.staged_assist.settle_error_rad

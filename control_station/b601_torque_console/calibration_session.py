@@ -981,8 +981,8 @@ class B601AutomaticCalibrationSession:
             self._abort(now, "holding_search_incomplete")
 
     def _holding_return_command(self):
-        stable = [r["command_nm"] for r in self._holding.observations if r["outcome"] == "stationary"]
-        return min(stable, key=abs) if stable else self._sent_delta[self._joint_index]
+        command = self._holding.return_command_nm
+        return self._sent_delta[self._joint_index] if command is None else command
 
     def _refine_holding_transition(self, view, now, driver_kd, outcome):
         j, q = self._joint_index, view["qpos_rad"]
