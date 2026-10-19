@@ -314,6 +314,42 @@ tests/test_rebot_b601_joint_motion.py`，结果 `1375 passed / 55 skipped`；未
 状态和 J2 绑定用例，最终保持搜索与 session 两模块为 `102 passed`，与大集有重叠。
 四个改动 Python 文件 Ruff、现有 GUI 的 Node syntax 和 `git diff --check` 通过。
 
+#### k3b28lv8 已完成保持点与后续零误差目标（2026-10-19）
+
+基线 `c1892c4f843916c05e9819d4c13a7108620cd89f` 的真机结果已经有一个完整 J2
+保持点：六次定命令观测、一次变力退回，约 `13.62 s` 选出 `-0.150781687 N·m`；
+最后两次均约一秒、J2 位置跨度约一个计数，并完成撤力和停稳确认。
+`automatic_calibration_report.json` 为 `VERIFIED_COMMAND_HOLDS_AVAILABLE / verified_points=1`。
+该值对应实际 J2 约 `2.461°`、J3 约 `2.263°` 及记录中的其余关节姿态；是软件
+附加保持命令，不是唯一重力残差或实测力矩。起步／到达命令不等于最终保持命令。
+
+之后撤力将 J2 带回第二目标约 `2.900477°`，接受目标时 offset 正好为零。
+旧会话仍发布 CUE，但误差不足以授权起步；约 1546 个周期一直为零附加命令、
+`awaiting_breakaway_authorization`，第 2 段耗尽 `39 s`。没有开始该点的保持搜索，
+不是第一点搜索失败，也不是硬限幅或命令暴露预算不足。后续 `operator_interrupt`
+是 owner 的停止原因，与先发生的采集 `leg_timeout` 分开；六轴 safe_stop 回执完整。
+
+修复限定于显式 holding-search 会话：准备时若已在既有采样邻域，先等待原六轴
+静止窗口、完整零附加命令和基础阻尼回执，进入内部 `observing` 状态。
+不 arm、不发布位置目标、CUE 或起步授权；复用原因果定命令观察器，两次静止观测
+确认零为该点可用保持值，再走原单独撤力／新停稳确认，继续后续真正需要移动的段。
+基础阻尼与实际六轴回执逐样本保存；该观测不冒充运动数据或自动安装零重力修正。
+GUI 明示“已在采样点，零附加命令观察（不驱动）”；完成段另存
+`observation_mode=passive_zero_assist`，与主动定命令观测分开。
+
+该被动路径不产生非零驱动。若发生真实漂移、命令变化、人工介入或反馈异常，
+保留已确认观测并按原退出路径停采，不在被动观测中偷偷启用加力。
+复用原段／整批时限和预算，不延长 39 秒；六轴原速度、位移、watchdog 和停止语义不变。
+只新增采集内部状态与报告说明，不改硬件 owner、共享执行接口、profile 或厂商配置。
+
+验证：`bash scripts/run_pytest.sh -q tests/test_b601_holding_calibration.py
+tests/test_b601_calibration_session.py` 为 `115 passed`；workspace/cycle/automatic
+三模块的 `-k 'held_probe or result or gui or short_target or terminal or lifecycle or workspace'`
+为 `76 passed / 287 deselected`。J2/J3、40/100 Hz 的同输入用例覆盖零点先采和
+非零点撤力后落到下一零点，并保留后续正常移动；旧会话方法在零点入场断言失败，
+新方法通过。覆盖命令尾量、硬速度、人工介入／许可撤销、漂移、原段时限和 GUI。
+Ruff、Node syntax、diff 检查通过；均为离线软件证据，没有新真机、CAN、合并或 push。
+
 ## 历史交接记录
 
 > 版本：2026-09-22。本文是 B601-RS 当前代码、真机 commissioning、重力采集和

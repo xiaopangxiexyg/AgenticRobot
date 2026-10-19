@@ -307,7 +307,7 @@ function renderWorkspace(batch) {
   const holding = workspace.holding_calibration;
   if (holding?.enabled) {
     const search = holding.search;
-    const stages = {reacquire: "缓慢返回同一目标并等待稳定", fixed_command_observation: "定命令观察", withdrawal: "观测保留，正在撤力停稳", failed: "采样已停止", cancelled: "已撤销", complete: "已完成"};
+    const stages = {reacquire: "缓慢返回同一目标并等待稳定", observing: "已在采样点，零附加命令观察（不驱动）", fixed_command_observation: "定命令观察", withdrawal: "观测保留，正在撤力停稳", failed: "采样已停止", cancelled: "已撤销", complete: "已完成"};
     el("automatic-progress").textContent += ` 保持命令搜索：${stages[holding.stage] || holding.stage}；尝试 ${holding.attempt_count}/${holding.max_attempts}；本次附加命令 ${number(holding.probe_command_nm)} N·m；已确认观测 ${search?.trial_count ?? 0} 次；变力退回／缩步 ${search?.transition_count ?? 0} 次；下一试探 ${number(search?.candidate_nm)} N·m；${search?.reason ?? "等待到点"}。`;
     el("automatic-trials").textContent = `可用保持命令 ${number(search?.usable_hold_nm)} N·m；已观察静止范围 ${(search?.observed_stationary_range_nm || []).map(v => number(v)).join(" ～ ") || "尚无"}。这是软件命令与编码器响应，不是实测保持力或唯一重力修正。`;
   }
@@ -319,7 +319,7 @@ function renderWorkspace(batch) {
   if (!holding?.enabled) el("automatic-trials").textContent = "";
   el("automatic-sequence-note").textContent = "本阶段先采集零驱动力下的重力漂移，再采集 J2/J3 双向双速度运动，不执行额外静摩擦阈值扫描。软件力矩命令不是实测受力；不会自动安装补偿。";
   if (holding?.enabled) {
-    el("automatic-sequence-note").textContent = "本候选到点后搜索可重复的非零保持命令；撤力回退用于下一次试探，不要求每个点都能零助力保持。取消或结束仍单独确认撤力与停稳，不自动安装补偿。";
+    el("automatic-sequence-note").textContent = "本候选到点后搜索可重复的零或非零保持命令；已在点上时直接观察零附加命令，不强行起步。撤力回退用于下一次试探，不要求每个点都能零助力保持。取消或结束仍单独确认撤力与停稳，不自动安装补偿。";
   }
   const ready = batch.cycle?.disable_confirmation_available === true && state.stop_controls_available === true;
   el("cycle-disable-hint").hidden = !ready;

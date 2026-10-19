@@ -207,6 +207,134 @@ def holding_replay(settings, *, control_period_sec=0.01, joint_name="joint3"):
     )
 
 
+def zero_point_replay(settings, *, period=0.01, joint_name="joint3", limits=None, centre_first=True):
+    resolved = holding_replay(settings, joint_name=joint_name).controller.settings
+    def centre_then_move(plan):
+        first, second = plan["steps"][:2]
+        centre = {**second, "target_qpos_rad": plan["anchor_qpos_rad"]}
+        plan["steps"] = [centre, first] if centre_first else [first, centre]
+    # The local plan revisits its centre; recoil can arrive there before the
+    # next leg starts, as in k3b28lv8. Keep a nonzero next leg in the same plan.
+    return Replay(resolved,
+        plan_change=centre_then_move,
+        acquisition_arrival_tolerance_rad=0.0039,
+        holding_search=HoldingSearchConfig(observation_sec=0.15, observation_timeout_sec=2),
+        control_period_sec=period, limits=limits)
+
+
+@pytest.mark.parametrize("period", [0.01, 0.025])
+@pytest.mark.parametrize("joint_name", ["joint2", "joint3"])
+def test_already_at_point_observes_zero_twice_without_cue_then_runs_next_leg(settings, period, joint_name):
+    replay = zero_point_replay(settings, period=period, joint_name=joint_name)
+    replay.begin(breakaway=True)
+    replay.tick()
+    assert replay.session.status()["state"] == "observing"
+    replay.run_until(lambda: bool(replay.session.status()["completed_legs"]), max_ticks=1000)
+    point = replay.session.status()["completed_legs"][0]["holding_calibration"]
+    assert point["usable_hold_nm"] == 0
+    assert point["observation_mode"] == "passive_zero_assist"
+    assert len(point["observations"]) == 2
+    assert all(r["outcome"] == "stationary" and r["command_nm"] == 0 for r in point["observations"])
+    assert all(r["started_at_sec"] > r["first_causal_receipt_at_sec"] for r in point["observations"])
+    assert all(row["commands"]["total_nm"] == (0.0,) * 6 for row in replay.history)
+    assert all(row["commands"]["driver_kd_nm_s_per_rad"] == (0.0,) * 6 for row in replay.history)
+    assert not any(row["audit"]["phase"] in {"cue", "breakaway", "track"} for row in replay.history)
+    replay.run_until(lambda: replay.session.status()["state"] in {"complete", "failed"},
+                     move=True, max_ticks=3000)
+    assert replay.session.result_record()["state"] == "complete"
+    assert len(replay.session.result_record()["completed_legs"]) == 2
+
+
+@pytest.mark.parametrize("kind", ["human", "permit", "command_tail", "hard_speed"])
+def test_zero_observation_stops_on_lost_authority_or_invalid_command(settings, kind):
+    replay = zero_point_replay(settings)
+    replay.begin(breakaway=True)
+    replay.tick()
+    assert replay.session.status()["state"] == "observing"
+    kwargs = {"human": True} if kind == "human" else {"permit": False} if kind == "permit" else {}
+    if kind == "command_tail":
+        kwargs["command_delta"] = (0, 0, 0.001, 0, 0, 0)
+    elif kind == "hard_speed":
+        q = list(replay.q)
+        q[2] += 1.1 * replay.controller.limits.max_joint_velocity_rad_s * replay.control_period_sec
+        kwargs["q"] = q
+    replay.tick(**kwargs)
+    assert replay.session.status()["state"] in {"releasing", "failed", "cancelled"}
+    assert replay.session.status()["completed_legs"] == []
+    assert replay.session._holding.status()["usable_hold_nm"] is None
+    assert not any(row["audit"]["phase"] in {"cue", "breakaway", "track"} for row in replay.history)
+
+
+def test_zero_observation_keeps_original_leg_deadline(settings):
+    from dataclasses import replace
+    template = zero_point_replay(settings)
+    replay = zero_point_replay(settings, limits=replace(template.session.limits, max_leg_sec=0.12))
+    replay.begin(breakaway=True)
+    replay.run_until(lambda: replay.session.status()["state"] in {"failed", "cancelled"}, max_ticks=100)
+    assert replay.session.result_record()["reason"] == "leg_timeout"
+    assert replay.session.result_record()["completed_legs"] == []
+
+
+def test_near_point_waits_for_quiet_window_instead_of_publishing_tiny_cue(settings):
+    replay = zero_point_replay(settings)
+    for _ in range(17):
+        q = list(replay.q)
+        q[2] += 0.0001
+        replay.tick(q=q)
+    replay.begin(breakaway=True)
+    replay.tick()
+    assert replay.session.status()["state"] == "preparing"
+    assert replay.controller.owner_snapshot()["operator_phase"] == "inactive"
+    replay.run_until(lambda: replay.session.status()["state"] == "observing", max_ticks=50)
+    assert not any(row["audit"]["phase"] in {"cue", "breakaway", "track"} for row in replay.history)
+
+
+def test_zero_observation_drift_is_not_completed_or_retried_with_force(settings):
+    replay = zero_point_replay(settings)
+    replay.begin(breakaway=True)
+    replay.run_until(lambda: replay.session.status()["state"] == "observing")
+    for _ in range(25):
+        q = list(replay.q)
+        q[2] += 0.0001
+        replay.tick(q=q)
+    replay.run_until(lambda: replay.session.status()["state"] == "failed", max_ticks=300)
+    assert replay.session.status()["reason"] == "holding_search_incomplete"
+    assert replay.session.status()["completed_legs"] == []
+    assert all(row["commands"]["total_nm"] == (0.0,) * 6 for row in replay.history)
+
+
+@pytest.mark.parametrize("period", [0.01, 0.025])
+def test_nonzero_hold_recoil_can_land_at_next_zero_hold_point(settings, period):
+    replay = zero_point_replay(settings, period=period, centre_first=False)
+    sample = prime_offset_arrival(replay)
+    for _ in range(4000):
+        status = replay.session.status()
+        if status["state"] in {"complete", "failed"}:
+            break
+        if status["step_index"] == 0 and status["state"] == "releasing":
+            q = list(replay.q)
+            q[2] += max(-0.005 * period, min(0.005 * period, -q[2]))
+            replay.tick(q=q)
+        elif status["step_index"] == 0:
+            q = list(replay.q)
+            if replay.session._holding_status()["stage"] == "fixed_command_observation":
+                sent = replay.commands["total_nm"][2]
+                if sent > -0.12:
+                    q[2] += 0.015 * period
+                elif sent < -0.24:
+                    q[2] -= 0.015 * period
+            else:
+                q[2] += max(-0.01 * period, min(0.01 * period, sample - q[2]))
+            replay.tick(q=q)
+        else:
+            replay.tick()
+    result = replay.session.result_record()
+    assert result["state"] == "complete", result
+    assert result["completed_legs"][0]["holding_calibration"]["usable_hold_nm"] != 0
+    assert result["completed_legs"][1]["holding_calibration"]["usable_hold_nm"] == 0
+    assert not any(e.get("step_index") == 1 and e["state"] in {"arming", "moving"} for e in result["events"])
+
+
 @pytest.mark.parametrize("period", [0.01, 0.025])
 def test_native_session_reaches_fixed_hold_before_zero_and_retains_target(
     settings, period
@@ -644,6 +772,9 @@ assert(nodes["automatic-progress"].textContent.includes("3/12"));
 assert(nodes["automatic-progress"].textContent.includes("变力退回／缩步 1 次"));
 assert(nodes["automatic-progress"].textContent.includes("下一试探 -0.2"));
 assert(nodes["automatic-trials"].textContent.includes("不是实测保持力"));
+context.batch.workspace.holding_calibration.stage="observing";
+vm.runInContext("renderWorkspace(batch);", context);
+assert(nodes["automatic-progress"].textContent.includes("零附加命令观察（不驱动）"));
 context.batch.workspace.holding_calibration.stage="withdrawal";
 vm.runInContext("renderWorkspace(batch);", context);
 assert(nodes["automatic-progress"].textContent.includes("正在撤力停稳"));

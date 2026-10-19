@@ -499,7 +499,7 @@ class B601AutomaticCalibrationSession:
                 ):
                     self._abort(now, "preparation_timeout")
                 elif (
-                    self._state == "moving"
+                    self._state in {"moving", "observing"}
                     and now - self._leg_started > self.limits.max_leg_sec
                 ):
                     self._abort(now, "leg_timeout")
@@ -723,7 +723,10 @@ class B601AutomaticCalibrationSession:
                             "acquisition_arrival_tolerance_rad": self.acquisition_arrival_tolerance_rad,
                             "command_exposure_nm_sec": self._leg_exposure,
                             **({"holding_calibration": self._holding_leg_result,
-                                "arrival_semantics": "verified_nonzero_hold_then_separate_safe_withdrawal"}
+                                "arrival_semantics": (
+                                    "verified_zero_hold_without_motion_then_separate_withdrawal"
+                                    if self._holding_leg_result.get("observation_mode") == "passive_zero_assist"
+                                    else "verified_nonzero_hold_then_separate_safe_withdrawal")}
                                if self._holding_leg_result is not None else {}),
                         }
                     )
@@ -759,6 +762,9 @@ class B601AutomaticCalibrationSession:
                 )
             return
         step = self._steps[self._index]
+        if self._state == "observing":
+            self._advance_holding(view, now, driver_kd, passive=True)
+            return
         if self._state == "preparing":
             if (
                 view["operator_phase"] != "inactive"
@@ -766,6 +772,18 @@ class B601AutomaticCalibrationSession:
                 or not self._zero_dispatch()
                 or driver_kd != self.condition.driver_kd_nm_s_per_rad
             ):
+                return
+            if (self.holding_search is not None
+                and abs(step["target_qpos_rad"][self._joint_index] - view["qpos_rad"][self._joint_index])
+                <= min(self.holding_search.movement_rad, self.acquisition_arrival_tolerance_rad)):
+                if view["arrival_stop_gate"] != "ready":
+                    return
+                # Recoil can already have reached the next sample. Measure
+                # zero without creating a CUE/pulse that has no position error.
+                self._leg_started = now
+                self._holding_approach_origin = view["qpos_rad"]
+                self._transition("observing", "already_at_point_zero_assist_observation", now)
+                self._advance_holding(view, now, driver_kd, passive=True)
                 return
             self.controller.configure_reference_velocity(
                 step["max_reference_velocity_rad_s"]
@@ -820,17 +838,25 @@ class B601AutomaticCalibrationSession:
                 "nominal_target_rad": self._steps[min(self._index, len(self._steps)-1)]["target_qpos_rad"],
                 "quantity": "software_command_not_measured_force", "auto_apply": False}
 
-    def _advance_holding(self, view, now, driver_kd):
+    def _advance_holding(self, view, now, driver_kd, *, passive=False):
         config, j = self.holding_search, self._joint_index
         q, stamp = view["qpos_rad"], view["feedback_timestamp_sec"]
         target = self._steps[self._index]["target_qpos_rad"]
         point = target if self._holding_pose is None else self._holding_pose
-        expected_kd = tuple(max(a,b) for a,b in zip(self.condition.driver_kd_nm_s_per_rad,
-            self.controller.settings.staged_assist.motion_control.drive_driver_kd_nm_s_per_rad))
+        expected_kd = (self.condition.driver_kd_nm_s_per_rad if passive else
+            tuple(max(a,b) for a,b in zip(self.condition.driver_kd_nm_s_per_rad,
+            self.controller.settings.staged_assist.motion_control.drive_driver_kd_nm_s_per_rad)))
+        if passive:
+            if any(abs(v) > self.controller.limits.max_joint_velocity_rad_s for v in view["raw_qvel_rad_s"]):
+                self._abort(now, "holding_zero_observation_velocity_exceeded")
+                return
+            if view["operator_phase"] != "inactive" or not self._zero_dispatch() or tuple(driver_kd) != expected_kd:
+                self._abort(now, "holding_zero_observation_command_changed")
+                return
         if self._holding_probe_nm is None:
             if (abs(q[j]-point[j]) > min(config.movement_rad, self.acquisition_arrival_tolerance_rad)
                 or view["arrival_stop_gate"] != "ready" or tuple(driver_kd) != expected_kd
-                or view["motion_reason"] not in {"bounded_reference_tracking", "target_reached_braking"}):
+                or not passive and view["motion_reason"] not in {"bounded_reference_tracking", "target_reached_braking"}):
                 return
             if self._holding is None:
                 self._holding = HoldingForceSearch(config, seed_nm=self._sent_delta[j],
@@ -846,6 +872,7 @@ class B601AutomaticCalibrationSession:
             self._holding_observation = {"started_at_sec": None, "anchor_qpos_rad": q,
                 "minimum_rad": q, "maximum_rad": q, "ramp_frozen": False,
                 "requested_command_nm": self._holding_probe_nm,
+                "observation_mode": "passive_zero_assist" if passive else "active_fixed_command",
                 "transition_start_command_nm": self._sent_delta[j],
                 "transition_minimum_command_nm": self._sent_delta[j],
                 "transition_maximum_command_nm": self._sent_delta[j],
@@ -855,7 +882,7 @@ class B601AutomaticCalibrationSession:
                 "reacquired_at_sec": now}
             return
         observation = self._holding_observation
-        if view["motion_reason"] != "calibration_fixed_command_observation":
+        if not passive and view["motion_reason"] != "calibration_fixed_command_observation":
             # Real speed braking is never turned into a signed force sample.
             # Resume only via the existing finite governor/point budgets.
             observation.update(outcome="censored_owner_brake", completed_at_sec=now)
@@ -895,6 +922,8 @@ class B601AutomaticCalibrationSession:
         if observation["started_at_sec"] is None:
             if max(abs(a-b) for a,b in zip(q,point)) > config.movement_rad:
                 self._refine_holding_transition(view, now, driver_kd, "censored_plateau_outside_point")
+                if passive:
+                    self._abort(now, "holding_search_incomplete")
                 return
             observation.update(started_at_sec=stamp, first_causal_receipt_at_sec=self._previous_completed,
                 anchor_qpos_rad=q, minimum_rad=q, maximum_rad=q)
@@ -920,6 +949,8 @@ class B601AutomaticCalibrationSession:
                 # Reacquire and repeat; this is not evidence of sustained
                 # movement at the final plateau or an in-pose hold sample.
                 self._refine_holding_transition(view, now, driver_kd, "censored_settled_outside_point")
+                if passive:
+                    self._abort(now, "holding_search_incomplete")
                 return
         if outcome is None:
             return
@@ -942,10 +973,11 @@ class B601AutomaticCalibrationSession:
         self._holding_approach_origin = q
         if self._holding.state == "complete":
             self._holding_leg_result = {**self._holding.status(detailed=True),
-                "sample_pose_rad": self._holding_pose, "nominal_target_rad": target}
+                "sample_pose_rad": self._holding_pose, "nominal_target_rad": target,
+                "observation_mode": "passive_zero_assist" if passive else "active_fixed_command"}
             self.controller.submit("withdraw", now_sec=now)
             self._transition("releasing", "holding_point_verified_withdrawal_pending", now)
-        elif self._holding.state == "incomplete":
+        elif self._holding.state == "incomplete" or passive and self._holding.candidate_nm != 0:
             self._abort(now, "holding_search_incomplete")
 
     def _holding_return_command(self):
