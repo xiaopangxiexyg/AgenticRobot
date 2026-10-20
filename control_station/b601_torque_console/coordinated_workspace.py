@@ -170,7 +170,8 @@ class CoordinatedWorkspaceController:
             distance = task["target"] - self.pose.q[i]
             goal[i] = self.pose.q[i] + max(-self.workspace.maximum_positioning_step_rad,
                                          min(self.workspace.maximum_positioning_step_rad, distance))
-            self.pose.set_goal(goal)
+            self.pose.set_goal(goal,
+                support_soft_speed_recovery=self.workspace.positioning_support_soft_speed_recovery)
             self._segments += 1
             if self._segments > 64:
                 self._stop("workspace_positioning_segment_budget", "failed")

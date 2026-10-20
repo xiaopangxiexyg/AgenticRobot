@@ -354,6 +354,80 @@ def test_position_arrival_accepts_settled_passive_offset_without_retargeting_it(
     assert r.controller.status()["automatic_calibration"]["workspace"]["arrival"]["reason"] == "ready"
 
 
+@pytest.mark.parametrize("enabled", [False, True])
+def test_positioning_support_brake_uses_explicit_stage_recovery_only(tmp_path, enabled):
+    r = replay(tmp_path, positioning_support_soft_speed_recovery=enabled)
+    r.controller.submit("arm", now_sec=r.now)
+    r.tick(dt_sec=.025)
+    workspace = r.controller._coordinated
+    assert all(t.config.support_soft_speed_recovery is enabled for t in workspace.pose.trackers)
+    assert workspace.pose.motion.support_soft_speed_recovery is False
+    # A selected-axis soft stop, then a passive-axis soft stop, as observed
+    # in mc44tra7. Both remain below the original raw hard-speed ceiling.
+    for axis in [2, 2, 2, 3, 3, 3]:
+        q = list(r.q)
+        q[axis] += .002
+        r.tick(q, dt_sec=.025)
+    resumed = False
+    for _ in range(100):
+        r.tick(dt_sec=.025)
+        frames = r.audit.get("coordinated_holding", {}).get("axes", [])
+        resumed |= any(f["reason"] == "speed_governor_resumed_original_target" for f in frames)
+        if r.audit["fault"] or resumed:
+            break
+    if enabled:
+        assert resumed
+        assert workspace._phase == "position"
+        assert workspace._index == 0
+        assert workspace.pose.goal[2] == pytest.approx(.05235987755982989)
+    else:
+        assert not resumed
+        assert r.audit["fault"] == "coordinated_target_stopped_before_goal"
+
+
+def test_stage_recovery_switch_requires_consumed_quiet_handoff(settings):
+    core = runtime(settings)
+    warm(core)
+    core.set_goal(core.goal, support_soft_speed_recovery=True)
+    assert all(t.config.support_soft_speed_recovery for t in core.trackers)
+    for value in [0, 1, "true"]:
+        with pytest.raises(TypeError, match="boolean"):
+            core.set_goal(core.goal, support_soft_speed_recovery=value)
+    dt = core.observe(1.12, ZERO, ZERO)
+    command, _ = core.step(sequence=12, dt=dt, permitted=True)
+    with pytest.raises(ValueError, match="consumed"):
+        core.set_goal(core.goal)
+    core.record_dispatch(12, command)
+    core.raw = (0, .03, 0, 0, 0, 0)
+    core.velocity = core.raw
+    with pytest.raises(ValueError, match="stillness"):
+        core.set_goal(core.goal)
+
+
+def test_positioning_support_resume_waits_for_complete_zero_tail_receipt(tmp_path):
+    r = replay(tmp_path)
+    r.controller.submit("arm", now_sec=r.now)
+    r.tick(dt_sec=.025)
+    for axis in [2, 2, 2, 3, 3, 3]:
+        q = list(r.q)
+        q[axis] += .002
+        r.tick(q, dt_sec=.025)
+    saw_wait = False
+    for _ in range(30):
+        r.tick(dt_sec=.025, final_delta=(0, .01, 0, 0, 0, 0))
+        frames = r.audit.get("coordinated_holding", {}).get("axes", [])
+        assert not r.audit["fault"]
+        assert all(f["reason"] != "speed_governor_resumed_original_target" for f in frames)
+        saw_wait |= any(f["speed_governor_resume_block_reason"] == "native_zero_dispatch_not_confirmed" for f in frames)
+    assert saw_wait
+    for _ in range(30):
+        r.tick(dt_sec=.025)
+        if any(f["reason"] == "speed_governor_resumed_original_target" for f in r.audit["coordinated_holding"]["axes"]):
+            break
+    else:
+        pytest.fail("admitted zero tail and fresh stillness did not resume the original goal")
+
+
 @pytest.mark.parametrize("passive_axis", [0, 3, 4, 5])
 def test_passive_context_change_censors_probe_and_never_reanchors_same_point(tmp_path, passive_axis):
     r = replay(tmp_path)
@@ -521,6 +595,12 @@ def test_full_coupled_batch_and_report_keep_handoffs_distinct_from_withdrawal(tm
             break
         old = len(r.controller._coordinated._acquisitions)
         coupled_tick(r, period=period, passive_offset=passive_offset)
+        controller = r.controller._coordinated
+        flags = [tracker.config.support_soft_speed_recovery for tracker in controller.pose.trackers]
+        if controller._phase in {"position", "return"}:
+            assert flags == [controller.workspace.positioning_support_soft_speed_recovery]*2
+        elif controller._phase == "sweep":
+            assert flags == [controller.pose.motion.support_soft_speed_recovery]*2
         journal.observe(snapshot())
         assert sum(abs(v) for v in r.delta) <= 1+1e-9
         if old != len(r.controller._coordinated._acquisitions):

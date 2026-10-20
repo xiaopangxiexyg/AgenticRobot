@@ -89,7 +89,7 @@ class CoordinatedPoseHolding:
             soft_limit_rad_s=self.settings.staged_assist.settle_velocity_rad_s,
             hard_limit_rad_s=self.settings.limits.max_joint_velocity_rad_s) == "ready"
 
-    def set_goal(self, goal, *, max_reference_velocity_rad_s=None):
+    def set_goal(self, goal, *, max_reference_velocity_rad_s=None, support_soft_speed_recovery=None):
         goal = six(goal, "coordinated goal")
         if self.pending is not None or self.last_time is None:
             raise ValueError("goal changes require consumed feedback/dispatch")
@@ -99,13 +99,18 @@ class CoordinatedPoseHolding:
                  else finite(max_reference_velocity_rad_s, "coordinated reference speed"))
         if not 0 < speed <= self.motion.max_reference_velocity_rad_s:
             raise ValueError("coordinated reference speed exceeds the resolved ceiling")
-        if any(tracker.config.max_reference_velocity_rad_s != speed for tracker in self.trackers):
+        recovery = (self.motion.support_soft_speed_recovery if support_soft_speed_recovery is None
+                    else support_soft_speed_recovery)
+        if type(recovery) is not bool:
+            raise TypeError("coordinated support recovery must be boolean")
+        if any(tracker.config.max_reference_velocity_rad_s != speed
+               or tracker.config.support_soft_speed_recovery != recovery for tracker in self.trackers):
             if not self.quiet():
-                raise ValueError("reference speed changes require fresh six-axis stillness")
-            # Only the reference planner changes at a consumed, quiet handoff.
+                raise ValueError("reference parameter changes require fresh six-axis stillness")
+            # Only stage-owned parameters change at a consumed, quiet handoff.
             # Keep the actual command and learned support bias continuously.
             self.trackers = tuple(B601JointMotionTracker(replace(self.motion,
-                max_reference_velocity_rad_s=speed)) for _ in AXES)
+                max_reference_velocity_rad_s=speed, support_soft_speed_recovery=recovery)) for _ in AXES)
         self.goal = goal
         for tracker, i in zip(self.trackers, AXES, strict=True):
             tracker.start(now=self.last_time, q=self.q[i], target=goal[i])
@@ -209,6 +214,7 @@ class CoordinatedPoseHolding:
         self.pending = (sequence, tuple(command), tuple(proposed_bias))
         return tuple(command), {"target_qpos_rad": self.goal, "bias_nm": self.bias,
             "max_reference_velocity_rad_s": self.trackers[0].config.max_reference_velocity_rad_s,
+            "support_soft_speed_recovery": self.trackers[0].config.support_soft_speed_recovery,
             "proposed_bias_nm": tuple(proposed_bias), "combined_command_nm": tuple(command),
             "combined_l1_cap_nm": self.config.total_assist_cap_nm,
             "saturated": scale < 1, "braking": self.braking,

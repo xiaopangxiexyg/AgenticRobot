@@ -18,6 +18,44 @@
   基线中已接入的自观测过滤、夹爪等扩展保持原显式启用方式，默认 15 mm／v1／严格碰撞
   行为不随硬件迁移切换。物理验证仍由操作者运行，不把离线回归当成硬件有效性证明。
 
+### 协同定位的支撑轴软制动配置传递（2026-10-20）
+
+本增量基于 `38f80a52076260d4274c42c77d32b3f01cf3c512`。记录
+`j2-j3-arrival-context-acceptance/b601-owner-mc44tra7` 在首段约 2.128 秒停止，
+原因是 `coordinated_target_stopped_before_goal`，尚未进入保持搜索。J3 目标 3°，
+实际停点约 0.989°；不能把本次记录当成完整标定点。六轴 safe_stop 回执完整。
+两轴命令 L1 峰值约 0.523/1.0 N·m，协调及最终绝对／变化率限幅均未触发。
+
+根因是配置遗漏，不是硬限幅：profile 已有
+`workspace.positioning_support_soft_speed_recovery=true`，旧单轴 workspace 正确
+传递，但协同路径的原生 tracker 使用了基础 motion 的 False。J3 先软制动，随后
+J4 窗口速度约 0.0621 rad/s 超过既有软门 0.0585，停止原因为支撑轴制动；停稳后
+tracker 未恢复原目标，捕获实际停点，上层正确拒绝这个未到目标的停点。
+
+- 协同 `set_goal` 在既有已消费回执、六轴停稳的阶段交接处接收显式配置；定位及
+  返回传入 workspace 的配置。扫描目标不传此参数，恢复基础 motion 原值 False。
+  不改变原生 tracker、重力、硬保护、watchdog、范围、命令上限或任何数值预算。
+- 复用原有 governor 的同目标恢复，仍须实际尾量归零、完整六轴发送确认和可信
+  停稳。人工撤销、超时及真实故障不改成重试；保留错误停点的终止保护。
+  audit 增加实际使用的 `support_soft_speed_recovery` 字段供核验。
+- 固定本次反馈至第 180 行、使用原 CLI/profile 和合成完整回执：False 复现原错误；
+  True 在同一帧进入 `speed_governor_resumed_original_target`，J3 目标仍是 3°。
+  这只证明控制分支差异，不是恢复后的物理运动反事实或完整真机验收。
+
+验证：`bash scripts/run_pytest.sh -q tests/test_b601_coordinated_holding.py
+tests/test_rebot_b601_joint_motion.py tests/test_b601_workspace_calibration.py --tb=short`
+最终 **496 passed**；边界三模块 **46 passed**。新增用例覆盖配置开关、阶段恢复／
+扫描默认、尾量与回执门；完整耦合模型仍覆盖 40/100 Hz。首次回归有一处测试夹具
+只改变 raw、未改变窗口速度，未能构造预期的“未停稳”；修正一致的移动输入后
+重跑上述完整集合通过，未改停稳判定来迎合测试。Ruff 和 diff 检查通过。
+
+连接前预检重用原始子命令及 owner 的 `_motorbridge_environment`，结果位于
+`hardware-tuning/j2-j3-support-recovery-preflight/b601_owner-bound-environment.json`，
+PASS，`can_opened=false / motor_command_sent=false`。首次直接重放子命令漏掉原 owner
+依赖环境，报缺少 `state_observation_metadata_v1`；失败文件另存未覆盖，未改依赖或
+绕过能力检查。实际约 39.94 Hz、近零几何警告及连续软制动的物理平滑性仍未解决。
+没有执行 CAN／真机、自动应用模型、合并或推送；框架线文件保持不变。
+
 ### 协同到位、六轴停稳与实测采样基准分离（2026-10-20）
 
 本轮基于 `c1966bad693ad23428cc7c2d84d7390f8836fffa`，保持硬件线独立工作区。
