@@ -192,10 +192,10 @@ class CoordinatedWorkspaceController:
         self._leg_started, self._leg_exposure = self.pose.last_time, 0.0
         self._transition("sweep", "coordinated_reacquire")
 
-    def _at_goal(self, radius):
-        # Only J2/J3 have position authority. Passive axes must be still and
-        # inside their existing safety envelope, not return to an unsent target.
-        return (self.pose.goal is not None and self.pose.quiet()
+    def _at_goal(self, radius, *, require_quiet=True):
+        # Only J2/J3 have position authority. Passive axes remain inside their
+        # safety envelope; static acquisition checks their full position window.
+        return (self.pose.goal is not None and (not require_quiet or self.pose.quiet())
                 and max(abs(self.pose.q[i]-self.pose.goal[i]) for i in AXES) <= radius)
 
     def _arrival_status(self):
@@ -408,8 +408,15 @@ class CoordinatedWorkspaceController:
             return
         task = self._tasks[self._index]
         if self._phase in {"position", "return", "observe", "return_observe"}:
-            if not self._at_goal(self.workspace.holding_search.movement_rad / 2):
-                self._quiet_since = None
+            pose_observation = self._phase in {"observe", "return_observe"}
+            # Static acquisition measures the entire six-axis position window.
+            # Do not restart it for a short-window velocity/count fluctuation
+            # inside that band. Native braking, fresh complete receipts and all
+            # owner guards still precede this branch. Transit handoffs and fixed
+            # command bisection keep their original quiet gates.
+            if not self._at_goal(self.workspace.holding_search.movement_rad / 2,
+                                 require_quiet=not pose_observation):
+                self._quiet_since = self._pose_window = None
                 return
             if self._quiet_since is None:
                 self._quiet_since = stamp
@@ -426,14 +433,23 @@ class CoordinatedWorkspaceController:
                     "task": copy.deepcopy(task), **window, "final_qpos_rad": self.pose.q})
                 self._quiet_since = self._pose_window = None
                 return
-            dwell = self.workspace.gravity_observation_sec if self._phase in {"observe", "return_observe"} else self.settings.staged_assist.settle_dwell_sec
+            dwell = self.workspace.gravity_observation_sec if pose_observation else self.settings.staged_assist.settle_dwell_sec
             if stamp-self._quiet_since < dwell:
+                return
+            # Reference speed/damping changes at the next task still require
+            # the original fresh stillness check. Wait without discarding the
+            # valid long window when its last frame has count jitter.
+            if pose_observation and not self.pose.quiet():
                 return
             if self._phase in {"position", "return"} and abs(task["target"]-self.pose.q[int(task["joint"][-1])-1]) > self.workspace.holding_search.movement_rad / 2:
                 self._begin_task()
                 return
-            if self._phase in {"observe", "return_observe"}:
+            if pose_observation:
                 observation = {"task": copy.deepcopy(task), "qpos_rad": self.pose.q, **window,
+                    "completion_criterion": "bounded_six_axis_position_window",
+                    "handoff_quiet_confirmed": True,
+                    "allowed_position_span_rad": self.workspace.holding_search.movement_rad,
+                    "controlled_target_tolerance_rad": self.workspace.holding_search.movement_rad / 2,
                     "nominal_target_rad": self._nominal_target,
                     "command_delta_nm": delta, "gravity_command_nm": commands["gravity_nm"],
                     "driver_kd_nm_s_per_rad": self._last_kd, "completed_at_sec": completed,
@@ -592,6 +608,21 @@ class CoordinatedWorkspaceController:
             "max_attempts": self.workspace.holding_search.max_trials,
             "reacquire_bias_nm": self.pose.bias, "quantity": "software_command_not_measured_force", "auto_apply": False}
 
+    def _static_observation_status(self):
+        active = self._phase in {"observe", "return_observe"}
+        window = self._pose_window if active and self._quiet_since is not None else None
+        return {"active": active, "completion_criterion": "bounded_six_axis_position_window",
+            "required_dwell_sec": self.workspace.gravity_observation_sec,
+            "elapsed_sec": 0.0 if window is None else max(0.0, self.pose.last_time-self._quiet_since),
+            "allowed_position_span_rad": self.workspace.holding_search.movement_rad,
+            "controlled_target_tolerance_rad": self.workspace.holding_search.movement_rad / 2,
+            "position_span_rad": None if window is None else tuple(b-a for a,b in zip(window["minimum_rad"], window["maximum_rad"])),
+            "reason": ("inactive" if not active else "native_braking" if self.pose.braking else
+                       "controlled_target_error" if not self._at_goal(self.workspace.holding_search.movement_rad / 2, require_quiet=False)
+                       else "waiting_for_window" if window is None else
+                       "awaiting_handoff_stillness" if self.pose.last_time-self._quiet_since >= self.workspace.gravity_observation_sec and not self.pose.quiet()
+                       else "collecting_window")}
+
     def _workspace_status(self, detailed=False):
         acquisitions = copy.deepcopy(self._acquisitions) if detailed else []
         if detailed and self._index < len(self._tasks) and self._tasks[self._index]["kind"] == "sweep":
@@ -606,6 +637,7 @@ class CoordinatedWorkspaceController:
             "origin_qpos_rad": self._origin, "current_qpos_rad": self.pose.q,
             "holding_search_enabled": True, "holding_calibration": self._holding_status(detailed),
             "arrival": self._arrival_status(),
+            "static_observation": self._static_observation_status(),
             "maximum_start_angle_deg": self.workspace.maximum_start_angle_deg,
             "acquisition_ranges_deg": {"joint2": self.workspace.joint2_acquisition_range_deg, "joint3": self.workspace.joint3_acquisition_range_deg},
             "pose_centres_rad": self.workspace.pose_centres(), "local_excursion_rad": self.workspace.local_excursion_rad(self.config),

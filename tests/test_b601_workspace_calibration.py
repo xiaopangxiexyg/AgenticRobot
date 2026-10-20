@@ -672,6 +672,12 @@ batch.workspace.max_sweep_leg_sec=58.5;
 batch.workspace.arrival={reason:'controlled_target_error',tolerance_rad:.0015,controlled_error_rad:[0,.002]};
 render();const arrivalWaiting=el('automatic-progress').textContent;
 batch.workspace.arrival.reason='ready';render();const arrivalReady=el('automatic-progress').textContent;
+batch.workspace.phase='observe';
+batch.workspace.static_observation={active:true,elapsed_sec:2.45,required_dwell_sec:5,
+  position_span_rad:[.0004,.0004,.0008,0,.0004,0],allowed_position_span_rad:.0045,reason:'collecting_window'};
+batch.workspace.arrival.reason='six_axis_not_stationary';
+render();const staticWindow=el('automatic-progress').textContent;
+batch.workspace.phase='sweep';delete batch.workspace.static_observation;
 batch.workspace.holding_calibration={enabled:true,context_reason:'support_pose_changed'};
 render();const contextChanged=el('automatic-progress').textContent;
 batch.workspace.holding_calibration={enabled:true,nominal_target_rad:[0,.04235987756,.05235987756,0,0,0],
@@ -687,7 +693,7 @@ const warningInstructions=el('drive-instructions').textContent;
 batch.outcome={severity:'error'};render();const fault=el('phase').textContent;
 const faultInstructions=el('drive-instructions').textContent;
 batch.state='idle';batch.workspace.phase='idle';batch.human_intervention=true;
-console.log(JSON.stringify({idle,active,complete,warning,fault,warningInstructions,faultInstructions,arrivalWaiting,arrivalReady,contextChanged,recheck,rejected,rechecked,human:render(),stopLabel:el('full-disable').textContent}));
+console.log(JSON.stringify({idle,active,complete,warning,fault,warningInstructions,faultInstructions,arrivalWaiting,arrivalReady,staticWindow,contextChanged,recheck,rejected,rechecked,human:render(),stopLabel:el('full-disable').textContent}));
 """
     result = subprocess.run([node, "-e", script, json.dumps(functions)],
         check=True, capture_output=True, text=True)
@@ -710,4 +716,8 @@ console.log(JSON.stringify({idle,active,complete,warning,fault,warningInstructio
     assert "单段时限 58.5 秒" in states["arrivalWaiting"]
     assert "不重置本段预算" in states["arrivalWaiting"]
     assert "J2/J3 已到位，六轴已停稳" in states["arrivalReady"]
+    assert "静态观察 2.45 / 5.00 秒" in states["staticWindow"]
+    assert "0.00080 / 0.00450 rad" in states["staticWindow"]
+    assert "带内微小抖动不重置计时" in states["staticWindow"]
+    assert "等待六轴停稳" not in states["staticWindow"]
     assert "不自动重锚或重试" in states["contextChanged"]

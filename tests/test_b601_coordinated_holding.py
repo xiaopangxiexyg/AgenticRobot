@@ -1106,6 +1106,119 @@ def test_static_pose_dwell_does_not_hide_slow_passive_drift(tmp_path):
     assert workspace._phase == "observe"
 
 
+def advance_to_pose_observation(r):
+    r.controller.submit("arm", now_sec=r.now)
+    for _ in range(2500):
+        scripted_coordinated_tick(r)
+        if r.controller.result_record()["state"] == "observe":
+            return
+    pytest.fail("scripted arrival did not reach pose observation")
+
+
+@pytest.mark.parametrize("axis", range(6))
+@pytest.mark.parametrize("phase", ["observe", "return_observe"])
+def test_pose_observation_accepts_bounded_two_count_jitter_without_short_gate_reset(tmp_path, axis, phase):
+    r = replay(tmp_path, gravity_observation_sec=1)
+    advance_to_pose_observation(r)
+    workspace = r.controller._coordinated
+    workspace._phase = phase
+    anchor, started = r.q, workspace._leg_started
+    saw_not_quiet = False
+    for n in range(160):
+        q = list(anchor)
+        q[axis] += (1 if (n // 20) % 2 else -1) * .000383496
+        r.tick(q, dt_sec=.01)
+        saw_not_quiet |= not workspace.pose.quiet()
+        if workspace._pose_observations:
+            break
+        assert workspace._phase == phase
+    assert saw_not_quiet
+    assert len(workspace._pose_observations) == 1
+    obs = workspace._pose_observations[0]
+    assert obs["completed_at_sec"]-obs["started_at_sec"] >= 1
+    assert obs["completed_at_sec"]-started < 1.6
+    assert obs["completion_criterion"] == "bounded_six_axis_position_window"
+    assert obs["handoff_quiet_confirmed"]
+    assert obs["allowed_position_span_rad"] == workspace.workspace.holding_search.movement_rad
+    assert max(b-a for a,b in zip(obs["minimum_rad"], obs["maximum_rad"])) == pytest.approx(.000766992)
+    assert all(abs(obs["qpos_rad"][i]-obs["nominal_target_rad"][i]) <= .0015 for i in (1, 2))
+
+
+@pytest.mark.parametrize("kind", ["human", "withdraw", "lease", "hard_speed", "watchdog", "receipt"])
+def test_bounded_pose_observation_keeps_authority_clock_speed_and_receipt_guards(tmp_path, kind):
+    r = replay(tmp_path, gravity_observation_sec=1)
+    advance_to_pose_observation(r)
+    workspace = r.controller._coordinated
+    if kind == "human":
+        r.controller.set_human_intervention(True)
+    elif kind == "withdraw":
+        r.controller.submit("withdraw", now_sec=r.now)
+    elif kind == "lease":
+        workspace._permit = r.now-r.controller.limits.command_timeout_sec-1
+    q = list(r.q)
+    if kind == "hard_speed":
+        q[1] += r.controller.limits.max_joint_velocity_rad_s*.011
+    if kind in {"watchdog", "receipt"}:
+        with pytest.raises(ValueError):
+            r.tick(q, dt_sec=.05 if kind == "watchdog" else .01,
+                receipt_updates={"sent_joint_names": ["joint2"]} if kind == "receipt" else None)
+    else:
+        r.tick(q, permit=kind != "lease")
+        assert r.delta == ZERO
+    assert not workspace._pose_observations
+    assert workspace._phase in {"stopping", "failed"}
+
+
+def test_pose_observation_outside_target_band_does_not_complete(tmp_path):
+    r = replay(tmp_path, gravity_observation_sec=.2)
+    advance_to_pose_observation(r)
+    workspace = r.controller._coordinated
+    q = list(r.q)
+    for _ in range(15):
+        q[1] += .0001
+        r.tick(q)
+    for _ in range(35):
+        r.tick(q)
+    assert not workspace._pose_observations
+    assert workspace._quiet_since is None
+
+
+def test_pose_observation_unacknowledged_dwell_does_not_complete(tmp_path):
+    r = replay(tmp_path, gravity_observation_sec=.2)
+    advance_to_pose_observation(r)
+    workspace = r.controller._coordinated
+    for _ in range(18):
+        r.tick()
+    assert workspace._quiet_since is not None
+    # Crossing the dwell boundary in computation alone cannot commit a sample.
+    r.tick(dt_sec=.025, ack=False)
+    assert not workspace._pose_observations
+    assert workspace._pending is not None
+
+
+def test_pose_observation_retains_finished_window_while_waiting_for_quiet_handoff(tmp_path):
+    r = replay(tmp_path, gravity_observation_sec=.3)
+    advance_to_pose_observation(r)
+    workspace = r.controller._coordinated
+    anchor = r.q
+    for n in range(50):
+        q = list(anchor)
+        q[5] += (1 if n % 2 else -1) * .000383496
+        r.tick(q)
+    status = workspace._static_observation_status()
+    assert status["reason"] == "awaiting_handoff_stillness"
+    assert status["elapsed_sec"] >= .3
+    assert not workspace._pose_observations
+    since = workspace._quiet_since
+    for _ in range(20):
+        r.tick()
+        if workspace._pose_observations:
+            break
+    assert len(workspace._pose_observations) == 1
+    assert workspace._pose_observations[0]["started_at_sec"] == since
+    assert workspace._pose_observations[0]["handoff_quiet_confirmed"]
+
+
 def test_passive_offset_still_obeys_original_support_excursion_guard(tmp_path):
     r = replay(tmp_path)
     advance_to_coordinated_probe(r)
