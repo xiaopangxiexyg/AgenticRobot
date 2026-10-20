@@ -59,6 +59,7 @@ class CoordinatedPoseHolding:
         self.last_time = None
         self.pending = None
         self.frames = ()
+        self.fault_frame = None
         self.braking = False
         self.arrival_tolerance_rad = (settings.staged_assist.settle_error_rad
             if arrival_tolerance_rad is None else finite(arrival_tolerance_rad, "coordinated arrival tolerance"))
@@ -119,6 +120,7 @@ class CoordinatedPoseHolding:
             self.trackers = tuple(B601JointMotionTracker(replace(self.motion,
                 max_reference_velocity_rad_s=speed, support_soft_speed_recovery=recovery)) for _ in AXES)
         self.goal = goal
+        self.fault_frame = None
         # Proposals are local to this exact goal/pose context, never a model.
         self._approach_anchor = self.q
         self._approach_moving = (False,) * 6
@@ -173,6 +175,22 @@ class CoordinatedPoseHolding:
         return (max(-self.config.bias_cap_nm, min(self.config.bias_cap_nm, bias)),
                 moving, anchor, reason)
 
+    def _slew_axis(self, i, target, dt, resolved_motion):
+        previous = self.last_delta[i]
+        rate = (self.motion.braking_slew_nm_s if self.braking else
+                self.config.rise_slew_nm_s if abs(target) > abs(previous) else self.config.fall_slew_nm_s)
+        reason = "native_braking" if self.braking else "normal_command_slew"
+        if (not self.braking and resolved_motion
+            and previous * self.velocity[i] > 0 and previous * self.raw[i] > 0
+            and (target - previous) * self.velocity[i] < 0):
+            # Fast removal of existing positive work is not permission for
+            # fast opposite drive. Cross zero on a later normal-rise frame.
+            if target * previous < 0:
+                target = 0.0
+            rate = self.motion.braking_slew_nm_s
+            reason = "resolved_working_tail_unload"
+        return previous + max(-rate * dt, min(rate * dt, target - previous)), reason, rate
+
     def step(self, *, sequence, dt, permitted, probe_joint=None, probe_nm=None):
         if type(sequence) is not int or sequence < 0 or type(permitted) is not bool or not 0 < finite(dt, "control interval") <= self.motion.max_control_gap_sec:
             raise ValueError("coordinated step requires valid sequence, permit and control interval")
@@ -182,6 +200,7 @@ class CoordinatedPoseHolding:
             raise ValueError("coordinated probes support J2/J3 only")
         if probe_nm is not None and (probe_joint is None or abs(finite(probe_nm, "probe")) > self.config.total_assist_cap_nm):
             raise ValueError("probe must fit the combined assist envelope")
+        self.fault_frame = None
         proposed_bias, demand = list(self.bias), [0.0] * 6
         anchors, moving = list(self._approach_anchor), list(self._approach_moving)
         brake_seed = self._brake_seed
@@ -213,6 +232,7 @@ class CoordinatedPoseHolding:
                     calibration_probe_nm=probe_nm if i == probe_joint else None)
                 frames.append(frame)
                 if frame.phase == "authority_exhausted":
+                    self.fault_frame = {"joint_name": f"joint{i+1}", **asdict(frame)}
                     raise ValueError(frame.reason)
                 if (frame.phase == "soft_hold" and frame.brake_trigger_lag_rad is not None
                     and abs(frame.brake_trigger_lag_rad) > self.motion.max_reference_lag_rad):
@@ -263,12 +283,11 @@ class CoordinatedPoseHolding:
         if scale < 1 and not self.braking:
             proposed_bias = list(self.bias)  # No integral windup at saturation.
         command = [0.0] * 6
+        transition_reasons, transition_rates = [None] * 6, [None] * 6
         if permitted:
             for i in AXES:
                 target = demand[i] * scale
-                rate = (self.motion.braking_slew_nm_s if self.braking else
-                        self.config.rise_slew_nm_s if abs(target) > abs(self.last_delta[i]) else self.config.fall_slew_nm_s)
-                command[i] = self.last_delta[i] + max(-rate * dt, min(rate * dt, target - self.last_delta[i]))
+                command[i], transition_reasons[i], transition_rates[i] = self._slew_axis(i, target, dt, moving[i])
             # The final sum, including a preceding axis' tail, owns one cap.
             norm = sum(abs(v) for v in command)
             if norm > self.config.total_assist_cap_nm:
@@ -301,6 +320,7 @@ class CoordinatedPoseHolding:
             "saturated": scale < 1, "braking": self.braking,
             "arrival_tolerance_rad": self.arrival_tolerance_rad,
             "approach_reasons": approach_reasons, "brake_recovery_proposal_nm": brake_seed,
+            "torque_transition_reasons": transition_reasons, "torque_transition_rates_nm_s": transition_rates,
             "axes": [asdict(f) for f in frames], "auto_apply": False,
             "quantity": "software_command_not_measured_force"}
 

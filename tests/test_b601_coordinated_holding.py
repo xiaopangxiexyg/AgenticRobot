@@ -44,6 +44,38 @@ def warm(core):
     core.set_goal((0, .01, .01, 0, 0, 0))
 
 
+@pytest.mark.parametrize("period", [.01, .025])
+@pytest.mark.parametrize("joint", [1, 2])
+@pytest.mark.parametrize("direction", [-1, 1])
+def test_resolved_working_tail_uses_brake_slew_only_toward_zero(settings, period, joint, direction):
+    core = runtime(settings)
+    core.config = CoordinatedHoldingConfig()
+    core.last_delta = tuple(direction*.86248278 if i == joint else 0. for i in range(6))
+    core.velocity = core.raw = tuple(direction*.01381 if i == joint else 0. for i in range(6))
+    command, reason, rate = core._slew_axis(joint, direction*.4312406856, period, True)
+    assert command == pytest.approx(direction*max(.4312406856, .86248278-core.motion.braking_slew_nm_s*period))
+    assert reason == "resolved_working_tail_unload"
+    assert rate == core.motion.braking_slew_nm_s
+    # A reversed target drains the old drive to zero, never fast reverse drive.
+    core.last_delta = tuple(direction*.01 if i == joint else 0. for i in range(6))
+    command, _, _ = core._slew_axis(joint, -direction*.2, period, True)
+    assert command == 0.
+    core.last_delta = ZERO
+    command, _, rate = core._slew_axis(joint, -direction*.2, period, True)
+    assert command == pytest.approx(-direction*core.config.rise_slew_nm_s*period)
+    assert rate == core.config.rise_slew_nm_s
+
+
+@pytest.mark.parametrize("resolved,raw", [(False, .01), (True, 0.), (True, -.01)])
+def test_fast_tail_unload_requires_resolved_and_agreeing_motion(settings, resolved, raw):
+    core = runtime(settings)
+    core.last_delta = (0, 0, .2, 0, 0, 0)
+    core.velocity, core.raw = (0, 0, .01, 0, 0, 0), (0, 0, raw, 0, 0, 0)
+    command, _, rate = core._slew_axis(2, .1, .025, resolved)
+    assert command == pytest.approx(.2-core.config.fall_slew_nm_s*.025)
+    assert rate == core.config.fall_slew_nm_s
+
+
 def test_both_axes_share_one_envelope_and_commit_only_after_actual_receipt(settings):
     core = runtime(settings)
     warm(core)
@@ -103,9 +135,42 @@ def test_resolved_assisting_motion_proposes_half_actual_command_once(settings, p
             events += 1
             native = audit["axes"][joint-1]["requested_torque_nm"]
             assert audit["proposed_bias_nm"][joint]+native == pytest.approx(previous/2)
+            assert audit["torque_transition_reasons"][joint] == "resolved_working_tail_unload"
+            assert audit["torque_transition_rates_nm_s"][joint] == core.motion.braking_slew_nm_s
+            assert abs(command[joint]) == pytest.approx(max(abs(previous/2),
+                abs(previous)-core.motion.braking_slew_nm_s*dt))
         core.record_dispatch(n+11, command)
         assert sum(abs(v) for v in command) <= core.config.total_assist_cap_nm+1e-9
     assert events == 1
+
+
+def test_coordinated_fault_retains_actual_failed_axis_and_new_brake_clock(settings):
+    core = runtime(settings)
+    for tracker in core.trackers:
+        tracker.config = replace(tracker.config, braking_timeout_sec=.2)
+    warm(core)
+    core.set_goal(ZERO)
+    for n in range(1, 41):
+        dt = core.observe(1.11+n*.025, ZERO, ZERO)
+        command, _ = core.step(sequence=n+11, dt=dt, permitted=True)
+        core.record_dispatch(n+11, command)
+    for n in range(1, 21):
+        # Equal peer motion triggers both trackers together; J2 is evaluated
+        # first, regardless of the workspace's displayed active task joint.
+        q = (n*.001, 0, 0, 0, 0, 0)
+        dt = core.observe(2.11+n*.025, q, (.04, 0, 0, 0, 0, 0))
+        try:
+            command, _ = core.step(sequence=n+51, dt=dt, permitted=True)
+        except ValueError as exc:
+            assert str(exc) == "braking_timeout_assist_withdrawn"
+            break
+        core.record_dispatch(n+51, command)
+    else:
+        pytest.fail("continued resolved motion must still exhaust the real brake deadline")
+    assert core.fault_frame["joint_name"] == "joint2"
+    assert core.fault_frame["brake_started_at_sec"] > 2.11
+    assert .2 <= core.fault_frame["brake_elapsed_sec"] <= .225+1e-9
+    assert core.fault_frame["requested_torque_nm"] == 0.
 
 
 def test_one_count_noise_and_opposing_load_do_not_halve_support(settings):

@@ -642,6 +642,7 @@ class CoordinatedWorkspaceController:
             "reason": fault or self._reason, "fault": fault, "qpos_rad": self.pose.q, "qvel_fd_rad_s": self.pose.raw,
             "control_qvel_rad_s": self.pose.velocity, "desired_assist_nm": command[j], "effective_assist_nm": command[j],
             "overlay_torque_nm": command, "coordinated_holding": pose_audit,
+            "motion_fault": self.pose.fault_frame,
             "holding_calibration": self._holding_status(), "automatic_calibration": self._batch_status(),
             "calibration_trial": marker}
 

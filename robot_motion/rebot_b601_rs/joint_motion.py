@@ -352,6 +352,7 @@ class B601JointMotionFrame:
     continuous_speed_start_rad_s: float | None = None
     event_severity: str = "info"
     event_action: str = "continue"
+    brake_started_at_sec: float | None = None
 
 
 class B601JointMotionTracker:
@@ -647,6 +648,7 @@ class B601JointMotionTracker:
                 arrival_unload_exit_error_rad=stop_error_rad if stabilizing else None,
                 event_severity=("error" if args[0] == "authority_exhausted" else "warning" if governing else "info"),
                 event_action=("withdraw" if args[0] == "authority_exhausted" else "brake_zero_still_then_resume" if governing else "continue"),
+                brake_started_at_sec=self._brake_start,
             )
 
         if self._pending is not None:
@@ -747,6 +749,7 @@ class B601JointMotionTracker:
             and (self._governed_speed_brake(self._brake_reason)
                  or self.config.arrival_stabilization
                  and self._brake_reason == "target_reached_braking")):
+            was_calibration_arrival = calibration_hold_enabled and self._brake_reason == "target_reached_braking"
             # Once withdrawn, a permit or stop cannot be undone by a later
             # quiet frame. The caller must start a new authorized action.
             if request_brake:
@@ -768,6 +771,17 @@ class B601JointMotionTracker:
                     and self._recent_velocity.position_span_rad > resolution
                 ):
                     self._brake_reason = "resolved_tracking_speed_braking"
+            if (was_calibration_arrival and not request_brake and speed_governor_permitted
+                and self._brake_reason in {"support_velocity_braking", "soft_velocity_braking",
+                                           "resolved_tracking_speed_braking"}):
+                # Normal calibration arrival may hold a nonzero command for
+                # arbitrarily longer than the brake timeout. A newly triggered
+                # speed brake owns a new clock, never that arrival dwell.
+                self._brake_start = now
+                self._stationary_start = self._stationary_position = None
+                self._stationary_min = self._stationary_max = None
+                self._brake_trigger_reference = self._target
+                self._brake_trigger_lag = self._target - q
             if self._brake_reason != "target_reached_braking":
                 self._arrival_unloading = False
         if self._brake_start is None:

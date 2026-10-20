@@ -179,6 +179,54 @@ def _governed_tracker(**kwargs):
         responsive_tracking_brake=True, reference_pacing=True, speed_governor=True, **kwargs)
 
 
+@pytest.mark.parametrize("trigger", ["support", "selected"])
+def test_calibration_arrival_time_is_not_charged_to_new_speed_brake(trigger):
+    tracker = _governed_tracker(arrival_stabilization=True,
+        continuous_speed_limit_rad_s=.07605, soft_velocity_rad_s=.07605,
+        braking_timeout_sec=8.5683)
+    tracker.start(now=1., q=.006, target=.006)
+    calibration = {"calibration_hold_enabled": True, "calibration_target_hold": True}
+    for n in range(1, 361):
+        frame = _governor_tick(tracker, 1+n*.025, **calibration)
+    assert frame.reason == "target_reached_braking"
+    assert frame.brake_elapsed_sec > tracker.config.braking_timeout_sec
+    start = 10.025
+    motion = {"support": .0830137, "support_span": .002} if trigger == "support" else {
+        "velocity": .0830137, "raw": .115114, "span": .002}
+    frame = _governor_tick(tracker, start, raw_limit=.195, **motion, **calibration)
+    assert frame.phase == "brake"
+    assert frame.reason == ("support_velocity_braking" if trigger == "support" else "soft_velocity_braking")
+    assert frame.brake_elapsed_sec == 0
+    assert frame.brake_started_at_sec == start
+    # A later change between real speed-brake reasons cannot renew the clock.
+    for n in range(1, 345):
+        frame = _governor_tick(tracker, start+n*.025, support=.0830137 if n % 2 else 0.,
+            support_span=.002, velocity=.0830137, raw=.115114, span=.002,
+            raw_limit=.195, **calibration)
+    assert frame.phase == "authority_exhausted"
+    assert frame.reason == "braking_timeout_assist_withdrawn"
+    assert frame.brake_started_at_sec == start
+    assert frame.brake_elapsed_sec == pytest.approx(8.6)
+
+
+@pytest.mark.parametrize("cause", ["operator", "permit", "reference_lag"])
+def test_late_calibration_terminal_stop_cannot_claim_a_new_speed_brake_clock(cause):
+    tracker = _governed_tracker(arrival_stabilization=True, continuous_speed_limit_rad_s=.05,
+        braking_timeout_sec=.3)
+    tracker.start(now=1., q=.006, target=.006)
+    calibration = {"calibration_hold_enabled": True, "calibration_target_hold": True}
+    for n in range(1, 31):
+        frame = _governor_tick(tracker, 1+n*.025, **calibration)
+    started = frame.brake_started_at_sec
+    trigger = {"operator": {"brake": True, "support": .031},
+               "permit": {"permit": False, "support": .031},
+               "reference_lag": {"q": -.02}}[cause]
+    frame = _governor_tick(tracker, 1.775, **trigger, **calibration)
+    assert frame.phase == "authority_exhausted"
+    assert frame.brake_started_at_sec == started
+    assert frame.requested_torque_nm == 0.
+
+
 @pytest.mark.parametrize("axis", range(6))
 @pytest.mark.parametrize("direction", [-1, 1])
 @pytest.mark.parametrize("hard_limit,raw_speed,window_speed,expected", [
