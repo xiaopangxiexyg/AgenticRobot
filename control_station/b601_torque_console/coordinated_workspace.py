@@ -285,7 +285,8 @@ class CoordinatedWorkspaceController:
             joint = self._tasks[self._index].get("joint", "joint2") if self._index < len(self._tasks) else "joint2"
             try:
                 command, audit = self.pose.step(sequence=feedback_sequence, dt=dt, permitted=permitted,
-                    probe_joint=int(joint[-1])-1 if self._probe is not None else None, probe_nm=self._probe)
+                    probe_joint=int(joint[-1])-1 if self._probe is not None else None, probe_nm=self._probe,
+                    point_search=self._phase == "sweep")
             except ValueError as exc:
                 self.recording_failed(str(exc))
                 return ZERO, self._make_audit(ZERO, {}, fault=self._reason)

@@ -139,11 +139,13 @@ class CoordinatedPoseHolding:
         bias[joint] = value
         self.bias = tuple(bias)
 
-    def _approach_bias(self, i, frame, dt, moving, anchor):
-        """Back off a causally sent command once on resolved assisting motion.
+    def _approach_bias(self, i, frame, dt, moving, anchor, *, point_search=True):
+        """Separate resolved motion from optional point-local exploration.
 
         Half is an exploration proposal toward zero, not a measured equilibrium
-        or a signed force bound. Native braking always overrides this path.
+        or a signed force bound. Continuous transit retains its learned bias;
+        motion evidence still permits fast removal of positive working tails.
+        Native braking always overrides this path.
         """
         resolution = self.motion.position_resolution_rad or 0.0
         onset = max(2 * resolution, self.settings.staged_assist.motion_onset_confirm_displacement_rad)
@@ -157,7 +159,7 @@ class CoordinatedPoseHolding:
             and abs(velocity) > self.settings.staged_assist.settle_velocity_rad_s
             and progress * velocity > 0 and self.last_delta[i] * velocity > 0)
         bias, reason = self.bias[i], "retain_bias_during_motion"
-        if onset_confirmed:
+        if onset_confirmed and point_search:
             half = self.last_delta[i] / 2
             original = frame.requested_torque_nm + self.bias[i]
             # Never cancel a stronger decelerating native PD response just
@@ -167,6 +169,8 @@ class CoordinatedPoseHolding:
             moving, reason = True, "resolved_motion_half_command_proposal"
             if target != half:
                 reason = "motion_unload_keeps_stronger_native_braking"
+        elif onset_confirmed:
+            moving, reason = True, "resolved_motion_continuous_tracking"
         elif quiet:
             error = frame.q_reference_rad - self.q[i]
             if abs(error) > resolution:
@@ -191,11 +195,13 @@ class CoordinatedPoseHolding:
             reason = "resolved_working_tail_unload"
         return previous + max(-rate * dt, min(rate * dt, target - previous)), reason, rate
 
-    def step(self, *, sequence, dt, permitted, probe_joint=None, probe_nm=None):
+    def step(self, *, sequence, dt, permitted, probe_joint=None, probe_nm=None, point_search=True):
         if type(sequence) is not int or sequence < 0 or type(permitted) is not bool or not 0 < finite(dt, "control interval") <= self.motion.max_control_gap_sec:
             raise ValueError("coordinated step requires valid sequence, permit and control interval")
         if self.pending is not None:
             raise ValueError("coordinated previous dispatch not confirmed")
+        if type(point_search) is not bool:
+            raise TypeError("coordinated point search must be boolean")
         if probe_joint is not None and (type(probe_joint) is not int or probe_joint not in AXES):
             raise ValueError("coordinated probes support J2/J3 only")
         if probe_nm is not None and (probe_joint is None or abs(finite(probe_nm, "probe")) > self.config.total_assist_cap_nm):
@@ -236,14 +242,16 @@ class CoordinatedPoseHolding:
                     raise ValueError(frame.reason)
                 if (frame.phase == "soft_hold" and frame.brake_trigger_lag_rad is not None
                     and abs(frame.brake_trigger_lag_rad) > self.motion.max_reference_lag_rad):
+                    self.fault_frame = {"joint_name": f"joint{i+1}", **asdict(frame)}
                     raise ValueError("coordinated_reference_lag_stop")
                 if (frame.phase == "soft_hold"
                     and abs(frame.q_reference_rad-self.goal[i]) > (self.motion.position_resolution_rad or 0)):
+                    self.fault_frame = {"joint_name": f"joint{i+1}", **asdict(frame)}
                     raise ValueError("coordinated_target_stopped_before_goal")
                 is_probe = i == probe_joint and probe_nm is not None and frame.reason == "calibration_fixed_command_observation"
                 if not is_probe and brake_seed is None:
                     proposed_bias[i], moving[i], anchors[i], approach_reasons[i] = self._approach_bias(
-                        i, frame, dt, moving[i], anchors[i])
+                        i, frame, dt, moving[i], anchors[i], point_search=point_search)
                 elif is_probe:
                     moving[i], anchors[i] = False, self.q[i]
                 demand[i] = frame.requested_torque_nm + (0.0 if is_probe else proposed_bias[i])
@@ -319,6 +327,7 @@ class CoordinatedPoseHolding:
             "combined_l1_cap_nm": self.config.total_assist_cap_nm,
             "saturated": scale < 1, "braking": self.braking,
             "arrival_tolerance_rad": self.arrival_tolerance_rad,
+            "point_search_enabled": point_search,
             "approach_reasons": approach_reasons, "brake_recovery_proposal_nm": brake_seed,
             "torque_transition_reasons": transition_reasons, "torque_transition_rates_nm_s": transition_rates,
             "axes": [asdict(f) for f in frames], "auto_apply": False,

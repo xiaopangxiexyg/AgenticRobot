@@ -1,6 +1,7 @@
 """Coordinated software contracts; no devices or measured force evidence."""
 
 import json
+import math
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -110,7 +111,8 @@ def test_missing_duplicate_and_mismatched_receipts_never_commit(settings):
 @pytest.mark.parametrize("period", [.01, .025])
 @pytest.mark.parametrize("joint", [1, 2])
 @pytest.mark.parametrize("direction", [-1, 1])
-def test_resolved_assisting_motion_proposes_half_actual_command_once(settings, period, joint, direction):
+@pytest.mark.parametrize("point_search", [False, True])
+def test_resolved_assisting_motion_proposes_half_actual_command_once(settings, period, joint, direction, point_search):
     core = runtime(settings)
     warm(core)
     goal = list(ZERO)
@@ -128,7 +130,8 @@ def test_resolved_assisting_motion_proposes_half_actual_command_once(settings, p
         dt = core.observe(1.11+n*period, q, raw)
         before = core.bias
         previous = core.last_delta[joint]
-        command, audit = core.step(sequence=n+11, dt=dt, permitted=True)
+        command, audit = core.step(sequence=n+11, dt=dt, permitted=True, point_search=point_search)
+        assert audit["point_search_enabled"] is point_search
         assert core.bias == before
         assert not audit["braking"]
         if audit["approach_reasons"][joint] == "resolved_motion_half_command_proposal":
@@ -141,7 +144,58 @@ def test_resolved_assisting_motion_proposes_half_actual_command_once(settings, p
                 abs(previous)-core.motion.braking_slew_nm_s*dt))
         core.record_dispatch(n+11, command)
         assert sum(abs(v) for v in command) <= core.config.total_assist_cap_nm+1e-9
-    assert events == 1
+    assert events == int(point_search)
+
+
+def test_nuhnenxy_return_motion_retains_support_instead_of_proposing_midpoint(settings):
+    # Recorded return at 20362.171582; this tests the causal branch, not
+    # a prediction of what the real arm will do after the changed command.
+    core = runtime(settings)
+    core.config = CoordinatedHoldingConfig()
+    core.q = (0, math.radians(2.41708), 0, 0, 0, 0)
+    core.velocity = (0, -.012335, 0, 0, 0, 0)
+    core.last_delta = (0, -.379231, 0, 0, 0, 0)
+    core.bias = (0, -.162208, 0, 0, 0, 0)
+    core.estimators = (None, SimpleNamespace(position_span_rad=.000767), None)
+    frame = SimpleNamespace(requested_torque_nm=-.210129, q_reference_rad=math.radians(1.38124))
+    anchor = core.q[1]+.002
+    bias, moving, _, reason = core._approach_bias(1, frame, .025, False, anchor, point_search=False)
+    assert bias == core.bias[1]
+    assert moving and reason == "resolved_motion_continuous_tracking"
+    search_bias, _, _, reason = core._approach_bias(1, frame, .025, False, anchor)
+    assert reason == "resolved_motion_half_command_proposal"
+    assert frame.requested_torque_nm+search_bias == pytest.approx(core.last_delta[1]/2)
+
+
+@pytest.mark.parametrize("flag", [None, 0, 1, "false"])
+def test_point_search_flag_requires_explicit_boolean(settings, flag):
+    core = runtime(settings)
+    warm(core)
+    with pytest.raises(TypeError, match="point search must be boolean"):
+        core.step(sequence=12, dt=.01, permitted=True, point_search=flag)
+
+
+@pytest.mark.parametrize("joint", [1, 2])
+@pytest.mark.parametrize("lag_fault", [False, True])
+def test_continuous_transit_keeps_native_terminal_guards_and_failed_axis(settings, monkeypatch, joint, lag_fault):
+    from robot_motion.rebot_b601_rs.joint_motion import (
+        B601JointMotionFrame,
+    )
+
+    core = runtime(settings)
+    warm(core)
+    failed = B601JointMotionFrame(
+        phase="soft_hold", reason="measured_stop", q_reference_rad=.02,
+        qvel_reference_rad_s=0, control_qvel_rad_s=0, position_torque_nm=0,
+        velocity_torque_nm=0, requested_torque_nm=0,
+        brake_trigger_lag_rad=core.motion.max_reference_lag_rad*1.01 if lag_fault else None)
+    monkeypatch.setattr(core.trackers[joint-1], "update", lambda **kwargs: failed)
+    reason = "coordinated_reference_lag_stop" if lag_fault else "coordinated_target_stopped_before_goal"
+    with pytest.raises(ValueError, match=reason):
+        core.step(sequence=12, dt=.01, permitted=True, point_search=False)
+    assert core.fault_frame["joint_name"] == f"joint{joint+1}"
+    assert core.fault_frame["brake_trigger_lag_rad"] == failed.brake_trigger_lag_rad
+    assert core.pending is None
 
 
 def test_coordinated_fault_retains_actual_failed_axis_and_new_brake_clock(settings):
@@ -1131,6 +1185,11 @@ def test_full_coupled_batch_and_report_keep_handoffs_distinct_from_withdrawal(tm
             assert flags == [controller.workspace.positioning_support_soft_speed_recovery]*2
         elif controller._phase == "sweep":
             assert flags == [controller.pose.motion.support_soft_speed_recovery]*2
+        if r.audit.get("coordinated_holding") is not None:
+            # Audit reports the phase that produced this frame, before a
+            # consumed receipt may advance the outer workspace lifecycle.
+            audit = r.audit["coordinated_holding"]
+            assert audit["point_search_enabled"] == (r.audit["automatic_calibration"]["workspace"]["phase"] == "sweep")
         journal.observe(snapshot())
         assert sum(abs(v) for v in r.delta) <= 1+1e-9
         if old != len(r.controller._coordinated._acquisitions):
