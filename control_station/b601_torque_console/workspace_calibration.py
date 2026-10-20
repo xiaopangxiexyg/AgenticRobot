@@ -52,6 +52,7 @@ class WorkspaceCalibrationConfig:
     setup_label: str = "temporary_end_effector"
     holding_search: HoldingSearchConfig | None = None
     holding_excursion_rad: float | None = None
+    holding_arrival_tolerance_rad: float | None = None
     coordinated_holding: CoordinatedHoldingConfig | None = None
     max_sweep_leg_sec: float | None = None
     max_sweep_leg_command_exposure_nm_sec: float | None = None
@@ -72,6 +73,11 @@ class WorkspaceCalibrationConfig:
             raise TypeError("holding search must be an explicit configuration object")
         if self.coordinated_holding is not None and self.holding_search is None:
             raise ValueError("coordinated holding requires explicit holding search")
+        if self.holding_arrival_tolerance_rad is not None and (
+            self.coordinated_holding is None
+            or not 0 < finite(self.holding_arrival_tolerance_rad, "holding arrival tolerance") <= self.holding_search.movement_rad
+        ):
+            raise ValueError("holding arrival tolerance requires explicit coordinated holding and must fit its point neighbourhood")
         for name in COORDINATED_CALIBRATION_OVERRIDES:
             value = getattr(self, name)
             if value is not None and (self.coordinated_holding is None or finite(value, name) <= 0):

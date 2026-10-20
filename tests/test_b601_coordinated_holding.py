@@ -905,16 +905,18 @@ def test_current_margin_profile_resolves_workspace_only_and_keeps_hard_envelopes
     whole = production_controller.__wrapped__(tmp_path)
     old = whole._workspace
     updated = B601WorkspaceCalibrationController(old.settings, old.config, WorkspaceCalibrationConfig(**values))
-    for name, before in {"prepare_timeout_sec": 13, "max_batch_sec": 390,
-                         "max_sweep_command_exposure_nm_sec": 80,
+    for name, before in {"prepare_timeout_sec": 13,
                          "motion_braking_timeout_sec": 6.591,
                          "motion_soft_velocity_rad_s": .0585}.items():
-        factor = 1.3 * (1.5 if name in {"max_batch_sec", "max_sweep_command_exposure_nm_sec"} else 1)
-        assert getattr(updated.config, name) == pytest.approx(before*factor)
+        assert getattr(updated.config, name) == pytest.approx(before*1.3)
         assert getattr(old.config, name) == before
-    assert updated.config.max_sweep_leg_sec == pytest.approx(76.05*1.5)
-    assert updated.config.max_sweep_leg_command_exposure_nm_sec == pytest.approx(31.2*1.5)
-    assert updated._coordinated.pose.arrival_tolerance_rad == .00225
+    assert updated.config.max_batch_sec == 1200
+    assert updated.config.max_sweep_command_exposure_nm_sec == 480
+    assert updated.config.max_sweep_leg_sec == 180
+    assert updated.config.max_sweep_leg_command_exposure_nm_sec == 120
+    assert old.config.max_batch_sec == 390
+    assert old.config.max_sweep_command_exposure_nm_sec == 80
+    assert updated._coordinated.pose.arrival_tolerance_rad == .003375
     motion = updated.settings.staged_assist.motion_control
     assert motion is updated._coordinated.pose.motion
     assert motion.soft_velocity_rad_s == motion.continuous_speed_limit_rad_s == .07605
@@ -929,6 +931,83 @@ def test_current_margin_profile_resolves_workspace_only_and_keeps_hard_envelopes
     assert updated.workspace.holding_search.movement_rad == .0045
     assert updated.workspace.holding_search.observation_sec == 1.5
     assert updated.workspace.holding_search.observation_timeout_sec == pytest.approx(4.5*1.3)
+
+
+@pytest.mark.parametrize("value", [0, -.001, float("nan"), True, .0046])
+def test_explicit_holding_entry_tolerance_must_fit_the_measured_point(tmp_path, value):
+    with pytest.raises(ValueError):
+        replay(tmp_path, holding_arrival_tolerance_rad=value,
+               holding_search=HoldingSearchConfig(movement_rad=.0045))
+    with pytest.raises(ValueError, match="explicit coordinated holding"):
+        WorkspaceCalibrationConfig(holding_arrival_tolerance_rad=.001)
+
+
+@pytest.mark.parametrize("axis", [1, 2])
+@pytest.mark.parametrize("direction", [-1, 1])
+@pytest.mark.parametrize("expanded", [False, True])
+def test_nominal_entry_margin_freezes_measured_pose_without_relaxing_fine_hold(tmp_path, axis, direction, expanded):
+    r = replay(tmp_path, holding_search=HoldingSearchConfig(
+        movement_rad=.0045, observation_sec=.5, observation_timeout_sec=2),
+        holding_arrival_tolerance_rad=.003375 if expanded else None)
+    r.controller.submit("arm", now_sec=r.now)
+    workspace = r.controller._coordinated
+    for _ in range(2500):
+        if workspace._phase == "sweep":
+            break
+        scripted_coordinated_tick(r)
+    else:
+        pytest.fail("no first sweep")
+    nominal = workspace.pose.goal
+    target = list(r.q)
+    target[1:3] = nominal[1:3]
+    target[axis] += direction*.00251055863172895
+    for _ in range(200):
+        q = list(r.q)
+        for i in (1, 2):
+            q[i] += max(-.00015, min(.00015, target[i]-q[i]))
+        r.tick(q, dt_sec=.025)
+        if workspace._probe is not None:
+            break
+    if not expanded:
+        assert workspace._probe is None
+        assert workspace._sample_pose is None
+        return
+    assert workspace._sample_pose == tuple(target)
+    assert workspace._nominal_target == nominal
+    assert workspace.pose.goal[1:3] == tuple(target[1:3])
+    assert workspace._arrival_status()["tolerance_rad"] == .003375
+    search = workspace._search
+    for _ in range(120):
+        r.tick(dt_sec=.025)
+        if search.observations:
+            break
+    assert search.observations[0]["outcome"] == "stationary"
+    assert search.observations[0]["stationary_dwell_sec"] >= .5
+    assert search.observations[0]["allowed_stationary_span_rad"] == 2*workspace.pose.motion.position_resolution_rad
+
+
+@pytest.mark.parametrize("gate,limit,reason", [
+    ("_leg_exposure", 120, "leg_command_exposure_budget"),
+    ("_sweep_exposure", 480, "active_command_exposure_budget"),
+    ("_exposure", 1040, "workspace_command_exposure_budget"),
+])
+def test_expanded_profile_budgets_count_support_and_still_stop_without_renewal(tmp_path, gate, limit, reason):
+    r = replay(tmp_path, max_sweep_leg_sec=180, max_sweep_leg_command_exposure_nm_sec=120,
+        max_sweep_command_exposure_nm_sec=480, max_batch_sec=1200,
+        max_command_exposure_nm_sec=1040)
+    advance_to_coordinated_probe(r)
+    workspace = r.controller._coordinated
+    setattr(workspace, gate, limit*.9)
+    r.tick(dt_sec=.025)
+    assert workspace._phase == "sweep"
+    assert getattr(workspace, gate) >= limit*.9
+    # Pending support work and the last worst-case dispatch reserve count too.
+    workspace._last_delta = (0, .3, -.2, 0, 0, 0)
+    setattr(workspace, gate, limit-.02)
+    r.tick(dt_sec=.025)
+    assert workspace._phase == "stopping"
+    assert workspace._reason == reason
+    assert getattr(workspace, gate) >= limit-.02
 
 
 @pytest.mark.parametrize("expanded", [False, True])
@@ -957,10 +1036,10 @@ def test_native_probe_soft_brake_uses_the_scoped_speed_margin(tmp_path, expanded
 
 
 @pytest.mark.parametrize("gate,field,old_limit,new_limit,reason", [
-    ("leg_time", "_leg_started", 76.05, 114.075, "leg_timeout"),
-    ("leg_exposure", "_leg_exposure", 31.2, 46.8, "leg_command_exposure_budget"),
-    ("sweep_time", "_sweep_started", 507, 760.5, "batch_timeout"),
-    ("sweep_exposure", "_sweep_exposure", 104, 156, "active_command_exposure_budget"),
+    ("leg_time", "_leg_started", 114.075, 180, "leg_timeout"),
+    ("leg_exposure", "_leg_exposure", 46.8, 120, "leg_command_exposure_budget"),
+    ("sweep_time", "_sweep_started", 760.5, 1200, "batch_timeout"),
+    ("sweep_exposure", "_sweep_exposure", 156, 480, "active_command_exposure_budget"),
     ("workspace_time", "_started", 2400, 3120, "workspace_timeout"),
     ("workspace_exposure", "_exposure", 800, 1040, "workspace_command_exposure_budget"),
 ])
@@ -1339,6 +1418,7 @@ def test_full_coupled_batch_and_report_keep_handoffs_distinct_from_withdrawal(tm
         profile = Path(__file__).resolve().parents[1]/"docs/hardware/profiles/b601_j2_j3_coordinated_holding_v1.json"
         values = json.loads(profile.read_text())["workspace"]
         changes["holding_search"] = HoldingSearchConfig(**values["holding_search"])
+        changes["holding_arrival_tolerance_rad"] = values["holding_arrival_tolerance_rad"]
         changes.update({name: values[name] for name in COORDINATED_CALIBRATION_OVERRIDES})
     r = replay(tmp_path, initial_q=(0, .01, .01, 0, 0, 0), **changes)
     movement = r.controller._coordinated.workspace.holding_search.movement_rad

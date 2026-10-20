@@ -37,7 +37,8 @@ class CoordinatedWorkspaceController:
         self.settings, self.limits = settings, settings.limits
         self.config, self.workspace = config, workspace
         self.pose = CoordinatedPoseHolding(settings, workspace.coordinated_holding,
-            arrival_tolerance_rad=workspace.holding_search.movement_rad / 2)
+            arrival_tolerance_rad=(workspace.holding_search.movement_rad / 2
+                if workspace.holding_arrival_tolerance_rad is None else workspace.holding_arrival_tolerance_rad))
         self._condition = self._position_limits = None
         self._ready = self._closed = self._start = False
         self._human = self._permit = self._origin = self._started = None
@@ -199,7 +200,7 @@ class CoordinatedWorkspaceController:
                 and max(abs(self.pose.q[i]-self.pose.goal[i]) for i in AXES) <= radius)
 
     def _arrival_status(self):
-        radius = self.workspace.holding_search.movement_rad / 2
+        radius = self.pose.arrival_tolerance_rad
         goal = self.pose.goal
         quiet = self.pose.quiet()
         error = None if goal is None else tuple(q-g for q, g in zip(self.pose.q, goal))
@@ -414,7 +415,7 @@ class CoordinatedWorkspaceController:
             # inside that band. Native braking, fresh complete receipts and all
             # owner guards still precede this branch. Transit handoffs and fixed
             # command bisection keep their original quiet gates.
-            if not self._at_goal(self.workspace.holding_search.movement_rad / 2,
+            if not self._at_goal(self.pose.arrival_tolerance_rad,
                                  require_quiet=not pose_observation):
                 self._quiet_since = self._pose_window = None
                 return
@@ -441,7 +442,7 @@ class CoordinatedWorkspaceController:
             # valid long window when its last frame has count jitter.
             if pose_observation and not self.pose.quiet():
                 return
-            if self._phase in {"position", "return"} and abs(task["target"]-self.pose.q[int(task["joint"][-1])-1]) > self.workspace.holding_search.movement_rad / 2:
+            if self._phase in {"position", "return"} and abs(task["target"]-self.pose.q[int(task["joint"][-1])-1]) > self.pose.arrival_tolerance_rad:
                 self._begin_task()
                 return
             if pose_observation:
@@ -449,7 +450,7 @@ class CoordinatedWorkspaceController:
                     "completion_criterion": "bounded_six_axis_position_window",
                     "handoff_quiet_confirmed": True,
                     "allowed_position_span_rad": self.workspace.holding_search.movement_rad,
-                    "controlled_target_tolerance_rad": self.workspace.holding_search.movement_rad / 2,
+                    "controlled_target_tolerance_rad": self.pose.arrival_tolerance_rad,
                     "nominal_target_rad": self._nominal_target,
                     "command_delta_nm": delta, "gravity_command_nm": commands["gravity_nm"],
                     "driver_kd_nm_s_per_rad": self._last_kd, "completed_at_sec": completed,
@@ -473,7 +474,10 @@ class CoordinatedWorkspaceController:
                 return
             kd_target = tuple(max(b, a, c) for b, a, c in zip(self._condition.driver_kd_nm_s_per_rad,
                 self.workspace.joint2_drive_kd, self.workspace.joint3_drive_kd))
-            if not self._at_goal(cfg.movement_rad / 2) or self._last_kd != kd_target:
+            # Nominal placement is not the measured point's stability band.
+            # Freeze the actual pose below; keep its fine dwell and subsequent
+            # full-pose/context checks independent of this entry tolerance.
+            if not self._at_goal(self.pose.arrival_tolerance_rad) or self._last_kd != kd_target:
                 self._quiet_since = None
                 return
             if self._quiet_since is None:
@@ -622,10 +626,10 @@ class CoordinatedWorkspaceController:
             "required_dwell_sec": self.workspace.gravity_observation_sec,
             "elapsed_sec": 0.0 if window is None else max(0.0, self.pose.last_time-self._quiet_since),
             "allowed_position_span_rad": self.workspace.holding_search.movement_rad,
-            "controlled_target_tolerance_rad": self.workspace.holding_search.movement_rad / 2,
+            "controlled_target_tolerance_rad": self.pose.arrival_tolerance_rad,
             "position_span_rad": None if window is None else tuple(b-a for a,b in zip(window["minimum_rad"], window["maximum_rad"])),
             "reason": ("inactive" if not active else "native_braking" if self.pose.braking else
-                       "controlled_target_error" if not self._at_goal(self.workspace.holding_search.movement_rad / 2, require_quiet=False)
+                       "controlled_target_error" if not self._at_goal(self.pose.arrival_tolerance_rad, require_quiet=False)
                        else "waiting_for_window" if window is None else
                        "awaiting_handoff_stillness" if self.pose.last_time-self._quiet_since >= self.workspace.gravity_observation_sec and not self.pose.quiet()
                        else "collecting_window")}
