@@ -18,6 +18,50 @@
   基线中已接入的自观测过滤、夹爪等扩展保持原显式启用方式，默认 15 mm／v1／严格碰撞
   行为不随硬件迁移切换。物理验证仍由操作者运行，不把离线回归当成硬件有效性证明。
 
+### 联合采集历史限制的显式 30% 余量（2026-10-20）
+
+基于 `3e9e7b8a35acd246afecd4ecadaae0eb43c2b519`，按操作者本轮进一步放宽 30%
+的要求，只修改 `b601_j2_j3_coordinated_holding_v1.json` 的 workspace 实际执行配置：
+
+| 限制 | 原值 | 新值 |
+| --- | ---: | ---: |
+| 准备超时 | 13 s | 16.9 s |
+| 单局部段时限 | 58.5 s | 76.05 s |
+| 单局部段命令暴露 | 24 N·m·s | 31.2 N·m·s |
+| 单关节局部采集批次时限 | 390 s | 507 s |
+| 单关节局部采集批次命令暴露 | 80 N·m·s | 104 N·m·s |
+| 整个多位姿流程时限 | 2400 s | 3120 s |
+| 整个多位姿流程命令暴露 | 800 N·m·s | 1040 N·m·s |
+| 定力观察超时 | 4.5 s | 5.85 s |
+| 原生制动超时 | 6.591 s | 8.5683 s |
+| 原生软速度上限（含连续限速） | 0.0585 rad/s | 0.07605 rad/s |
+
+这不是将所有数值乘 1.3。共享 1.0 N·m 最终包络、0.195 rad/s CLI 硬速度、
+40 ms watchdog、反馈/派发时钟与新鲜度、TTL、完整回执、碰撞、关节/采集几何范围、
+最终人工确认失能均保持原样；重力和所有 Kd、PI/速度反馈增益与命令变化率不变。
+连续静止驻留仍为 1.5 秒、测量位移带仍为 0.0045 rad、最大尝试仍为 27 次，
+不把慢漂当静止，不将“响应不一致”降格为合格保持点。已经修复的归零回执冲突及
+过去取消的恢复次数门不再增加补丁；约 40 Hz 的真实 Type-24 反馈也不靠改验收线掩盖。
+
+实现复用上一增量的 workspace 参数覆盖，补齐软速度/制动时限及批次预算字段，
+仅显式联合模式可设置。构造 workspace 时复用原 `B601AutomaticCalibrationController`
+的连接前验证与 settings 解析，使配置传入真正的 `CoordinatedPoseHolding` 和 trackers，
+而非只显示在配置文件里；未新增运行状态、重试策略或另一套校验。
+固定位置和 supported-cycle 保持原共享基础 profile，原 JSON 文件未更改。
+非法值、超过硬速度的软门、单段超过批次预算等仍拒绝，计量不因换试探而续期。
+
+原生离线对照以 0.064 rad/s 作为声明反馈：旧软门制动，新软门不因此制动；
+六种旧预算边界均可越过、新边界均停止。完整耦合模型及消费者回归：
+`bash scripts/run_pytest.sh -q tests/test_b601_coordinated_holding.py tests/test_b601_holding_calibration.py tests/test_b601_workspace_calibration.py tests/test_b601_calibration_session.py --tb=short`
+为 **297 passed**；`tests/test_control_station_boundaries.py`、
+`tests/test_hardware_boundaries.py`、`tests/test_runtime_domain_boundaries.py`
+合计 **46 passed**；Ruff、diff 与无 CAN 原参数预检通过。
+预检为 `hardware-tuning/j2-j3-margin30-preflight-Edak6o/b601_owner.json`，
+`status=PASS / can_opened=false / motor_command_sent=false`。
+离线结果不能证明扩大后的真实速度/驻留行为已通过；不自动执行真机、不应用模型、
+不修改 retained 记录、不合并/推送。框架线同期推进至 `84b0773e4`，当前修改路径与
+其新提交不重叠，保留对方未提交内容，历史共享路径仍待固定提交集成时检查。
+
 ### J2 局部维持采集完成、J3 软制动响应传递与单段余量（2026-10-20）
 
 本增量基于 `7e45ee05e3fb5eb2f818fddacd1d17ed6a7ba956`。记录

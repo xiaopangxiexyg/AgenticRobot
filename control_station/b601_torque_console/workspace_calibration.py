@@ -23,6 +23,11 @@ from .staged_controller import B601StagedTorqueConsoleController
 
 ZERO = (0.0,) * 6
 RANGES = ((0.0, math.radians(120)), (0.0, math.radians(90)))
+COORDINATED_CALIBRATION_OVERRIDES = (
+    "prepare_timeout_sec", "max_batch_sec", "max_sweep_leg_sec",
+    "max_sweep_command_exposure_nm_sec", "max_sweep_leg_command_exposure_nm_sec",
+    "motion_braking_timeout_sec", "motion_soft_velocity_rad_s",
+)
 
 
 @dataclass(frozen=True)
@@ -50,6 +55,11 @@ class WorkspaceCalibrationConfig:
     coordinated_holding: CoordinatedHoldingConfig | None = None
     max_sweep_leg_sec: float | None = None
     max_sweep_leg_command_exposure_nm_sec: float | None = None
+    max_sweep_command_exposure_nm_sec: float | None = None
+    max_batch_sec: float | None = None
+    prepare_timeout_sec: float | None = None
+    motion_braking_timeout_sec: float | None = None
+    motion_soft_velocity_rad_s: float | None = None
 
     def __post_init__(self):
         if isinstance(self.coordinated_holding, dict):
@@ -62,10 +72,10 @@ class WorkspaceCalibrationConfig:
             raise TypeError("holding search must be an explicit configuration object")
         if self.coordinated_holding is not None and self.holding_search is None:
             raise ValueError("coordinated holding requires explicit holding search")
-        for name in ("max_sweep_leg_sec", "max_sweep_leg_command_exposure_nm_sec"):
+        for name in COORDINATED_CALIBRATION_OVERRIDES:
             value = getattr(self, name)
             if value is not None and (self.coordinated_holding is None or finite(value, name) <= 0):
-                raise ValueError("workspace leg budgets require explicit coordinated holding and positive limits")
+                raise ValueError("workspace overrides require explicit coordinated holding and positive limits")
         if self.holding_excursion_rad is not None and (
             self.holding_search is None or finite(self.holding_excursion_rad, "holding excursion") <= 0
         ):
@@ -151,11 +161,15 @@ class B601WorkspaceCalibrationController:
     controller_mode = "automatic_calibration"
 
     def __init__(self, settings, config, workspace: WorkspaceCalibrationConfig):
-        overrides = {name: getattr(workspace, name) for name in
-                     ("max_sweep_leg_sec", "max_sweep_leg_command_exposure_nm_sec")
+        overrides = {name: getattr(workspace, name) for name in COORDINATED_CALIBRATION_OVERRIDES
                      if getattr(workspace, name) is not None}
         if overrides:
+            from .automatic_calibration import B601AutomaticCalibrationController
+
             config = replace(config, **overrides)
+            # Reuse canonical pre-CAN validation and settings resolution;
+            # fixed-position/supported-cycle controllers retain their settings.
+            settings = B601AutomaticCalibrationController(settings, config).settings
         self.config, self.workspace = config, workspace
         self.limits = replace(settings.limits, command_timeout_sec=max(
             settings.limits.command_timeout_sec, workspace.background_permit_timeout_sec))

@@ -2,6 +2,7 @@
 
 import json
 from dataclasses import replace
+from pathlib import Path
 
 import pytest
 from test_b601_automatic_calibration import AcquisitionReplay
@@ -9,6 +10,7 @@ from test_b601_calibration_session import settings as shared_settings
 from test_b601_workspace_calibration import LIMITS, production_controller
 
 from control_station.b601_torque_console.workspace_calibration import (
+    COORDINATED_CALIBRATION_OVERRIDES,
     B601WorkspaceCalibrationController,
     WorkspaceCalibrationConfig,
 )
@@ -499,7 +501,7 @@ def test_support_only_brake_does_not_invent_a_selected_axis_holding_response(tmp
 
 
 def test_workspace_leg_overrides_require_the_explicit_coordinated_mode():
-    for name in ("max_sweep_leg_sec", "max_sweep_leg_command_exposure_nm_sec"):
+    for name in COORDINATED_CALIBRATION_OVERRIDES:
         with pytest.raises(ValueError, match="explicit coordinated holding"):
             WorkspaceCalibrationConfig(**{name: 24})
 
@@ -538,6 +540,97 @@ def test_explicit_workspace_leg_margin_replaces_only_the_old_gate_and_remains_fi
     {"max_sweep_leg_command_exposure_nm_sec": 10000},
 ])
 def test_explicit_leg_overrides_are_validated_before_any_acquisition(tmp_path, values):
+    with pytest.raises((ValueError, TypeError)):
+        replay(tmp_path, **values)
+
+
+def test_current_margin_profile_resolves_workspace_only_and_keeps_hard_envelopes(tmp_path):
+    profile = Path(__file__).resolve().parents[1]/"docs/hardware/profiles/b601_j2_j3_coordinated_holding_v1.json"
+    values = json.loads(profile.read_text())["workspace"]
+    whole = production_controller.__wrapped__(tmp_path)
+    old = whole._workspace
+    updated = B601WorkspaceCalibrationController(old.settings, old.config, WorkspaceCalibrationConfig(**values))
+    for name, before in {"prepare_timeout_sec": 13, "max_batch_sec": 390,
+                         "max_sweep_command_exposure_nm_sec": 80,
+                         "motion_braking_timeout_sec": 6.591,
+                         "motion_soft_velocity_rad_s": .0585}.items():
+        assert getattr(updated.config, name) == pytest.approx(before*1.3)
+        assert getattr(old.config, name) == before
+    assert updated.config.max_sweep_leg_sec == pytest.approx(58.5*1.3)
+    assert updated.config.max_sweep_leg_command_exposure_nm_sec == pytest.approx(24*1.3)
+    motion = updated.settings.staged_assist.motion_control
+    assert motion is updated._coordinated.pose.motion
+    assert motion.soft_velocity_rad_s == motion.continuous_speed_limit_rad_s == .07605
+    assert motion.braking_timeout_sec == 8.5683
+    assert old.settings.staged_assist.motion_control.soft_velocity_rad_s == .0585
+    assert whole._fixed.config is old.config
+    assert whole._supported.config is old.config
+    assert updated.limits.max_joint_velocity_rad_s == old.limits.max_joint_velocity_rad_s
+    assert updated.workspace.coordinated_holding.total_assist_cap_nm == 1
+    assert motion.max_control_gap_sec == .04
+    assert motion.drive_driver_kd_nm_s_per_rad == old.settings.staged_assist.motion_control.drive_driver_kd_nm_s_per_rad
+    assert updated.workspace.holding_search.movement_rad == .0045
+    assert updated.workspace.holding_search.observation_sec == 1.5
+    assert updated.workspace.holding_search.observation_timeout_sec == pytest.approx(4.5*1.3)
+
+
+@pytest.mark.parametrize("expanded", [False, True])
+def test_native_probe_soft_brake_uses_the_scoped_speed_margin(tmp_path, expanded):
+    changes = {"holding_search": HoldingSearchConfig(
+        observation_sec=1.5, observation_timeout_sec=4.5, movement_rad=.0045)}
+    if expanded:
+        changes["motion_soft_velocity_rad_s"] = .07605
+    r = replay(tmp_path, **changes)
+    advance_to_coordinated_probe(r)
+    workspace = r.controller._coordinated
+    for _ in range(60):
+        r.tick(dt_sec=.025)
+        if workspace._observation and workspace._observation["started_at_sec"] is not None:
+            break
+    else:
+        pytest.fail("no causal probe plateau")
+    j = int(workspace._tasks[workspace._index]["joint"][-1])-1
+    direction = 1 if workspace._probe >= 0 else -1
+    for _ in range(2):
+        q = list(r.q)
+        q[j] += direction*.0016  # 0.064 rad/s, between the old/new soft ceilings.
+        r.tick(q, dt_sec=.025)
+    assert workspace.pose.braking is (not expanded)
+    assert not r.audit["fault"]
+
+
+@pytest.mark.parametrize("gate,field,old_limit,new_limit,reason", [
+    ("leg_time", "_leg_started", 58.5, 76.05, "leg_timeout"),
+    ("leg_exposure", "_leg_exposure", 24, 31.2, "leg_command_exposure_budget"),
+    ("sweep_time", "_sweep_started", 390, 507, "batch_timeout"),
+    ("sweep_exposure", "_sweep_exposure", 80, 104, "active_command_exposure_budget"),
+    ("workspace_time", "_started", 2400, 3120, "workspace_timeout"),
+    ("workspace_exposure", "_exposure", 800, 1040, "workspace_command_exposure_budget"),
+])
+def test_current_margin_budgets_admit_the_old_edge_but_stop_at_new_finite_edge(
+    tmp_path, gate, field, old_limit, new_limit, reason,
+):
+    profile = Path(__file__).resolve().parents[1]/"docs/hardware/profiles/b601_j2_j3_coordinated_holding_v1.json"
+    r = replay(tmp_path, **json.loads(profile.read_text())["workspace"])
+    advance_to_coordinated_probe(r)
+    workspace = r.controller._coordinated
+    for value in (old_limit+.1, new_limit+.1):
+        setattr(workspace, field, r.now-value if gate.endswith("_time") else value)
+        r.tick(dt_sec=.025)
+        if value < new_limit:
+            assert workspace._phase == "sweep"
+        else:
+            assert workspace._phase == "stopping"
+            assert workspace._reason == reason
+
+
+@pytest.mark.parametrize("values", [
+    {"motion_soft_velocity_rad_s": .2}, {"motion_soft_velocity_rad_s": .02},
+    {"motion_soft_velocity_rad_s": float("nan")}, {"motion_braking_timeout_sec": -1},
+    {"prepare_timeout_sec": True}, {"max_batch_sec": float("inf")},
+    {"max_sweep_command_exposure_nm_sec": 1},
+])
+def test_scoped_margin_overrides_cannot_bypass_native_config_validation(tmp_path, values):
     with pytest.raises((ValueError, TypeError)):
         replay(tmp_path, **values)
 
@@ -776,8 +869,7 @@ def test_full_coupled_batch_and_report_keep_handoffs_distinct_from_withdrawal(tm
         profile = Path(__file__).resolve().parents[1]/"docs/hardware/profiles/b601_j2_j3_coordinated_holding_v1.json"
         values = json.loads(profile.read_text())["workspace"]
         changes["holding_search"] = HoldingSearchConfig(**values["holding_search"])
-        changes.update({name: values[name] for name in
-                        ("max_sweep_leg_sec", "max_sweep_leg_command_exposure_nm_sec")})
+        changes.update({name: values[name] for name in COORDINATED_CALIBRATION_OVERRIDES})
     r = replay(tmp_path, initial_q=(0, .01, .01, 0, 0, 0), **changes)
     movement = r.controller._coordinated.workspace.holding_search.movement_rad
     monkeypatch.setattr(transparency, "time", SimpleNamespace(monotonic=lambda: r.now+.002))
