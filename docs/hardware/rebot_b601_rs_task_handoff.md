@@ -18,6 +18,66 @@
   基线中已接入的自观测过滤、夹爪等扩展保持原显式启用方式，默认 15 mm／v1／严格碰撞
   行为不随硬件迁移切换。物理验证仍由操作者运行，不把离线回归当成硬件有效性证明。
 
+### J2 局部维持采集完成、J3 软制动响应传递与单段余量（2026-10-20）
+
+本增量基于 `7e45ee05e3fb5eb2f818fddacd1d17ed6a7ba956`。记录
+`j2-j3-brake-zero-acceptance/b601-owner-tmnlqa05` 已越过之前的制动归零冲突：
+先完成 J3/J2 的 3° 定位和联合姿态观察，再完成首个中心附近的 J2 **12 个局部段**
+维持值验证。报告为 `VERIFIED_COMMAND_HOLDS_AVAILABLE / verified_points=12`，
+并非 12 个全局位姿；非零值约 −0.0805..−0.1020 N·m，部分中心回测为零。
+这些是软件附加命令与编码器响应，`auto_apply=false / identifies_unique_gravity=false`，
+不能直接当作纯重力误差、测力或已拟合摩擦。
+
+新停采发生在首个 J3 局部段约 36.09 秒，原因 `leg_command_exposure_budget`。
+本段接近 16 N·m·s 后因派发保留额度停止，整批约 68.63/800；随后
+`operator_interrupt` 是人工停机，不是首个采集故障。六轴最终 safe_stop 完整、
+无 cleanup error；实际控制/反馈仍约 39.952 Hz，不因退出码或本增量变为 100 Hz。
+
+该段第一次定力试探 +0.4662366 N·m 后已有同向进展并触发原生软速度制动。
+旧外层记录 `censored_native_brake` 后清空观察，却未通知保持搜索器；搜索仍为
+`verify_arrival_command`、0 次观测/0 次转移，下次仍准备相同命令。
+修复仅对**被测轴自身软速度制动且已达到原有半测量带位移**的响应传递删失记录，
+使用前一份完整回执的实际附加命令，而不是当前撤力帧或未发送的请求。
+搜索复用已有有界提案逻辑，先返回同点后改试新的命令；不新增状态、无期限重试、
+预算续期或自动应用模型。支撑轴单独触发制动、计数量级抖动不构成被测轴力边界。
+
+按已有 50% 放宽授权，仅显式联合保持 profile 的 `workspace` 增加两项覆盖：
+`max_sweep_leg_sec=58.5`（原 39），
+`max_sweep_leg_command_exposure_nm_sec=24`（原 16）。复用原配置验证，在连接前完成
+校验；未启用联合模式不能设置这些覆盖。固定位置/完整单轴流程仍使用原 39 秒/16；
+两轴共享 1.0 N·m、总预算、速度、位移、watchdog、重力、阻尼与人工确认失能均不改。
+GUI 展示有效单段时限及实际累计暴露，切换试探命令不重置计量。
+
+原 trace 第 9138 行的软制动分支同输入回放：旧搜索仍 +0.4662366，新搜索改为
++0.2331183 N·m；新记录 1 次删失转移、0 次已确认静止/运动观测。
+前一实际派发为 +0.4662366，当前制动帧已降到 +0.2197580，不能混用。
+原观察内上一帧进展 0.00383495 rad，制动反馈帧实际净进展 0.00613592 rad；
+重放只验证该分支及候选传递，不推演此后的真实机械臂运动。
+脚本保存在 `hardware-tuning/j2-j3-probe-feedback-preflight-L7ItAH/replay_censored_branch.py`。
+
+验证：
+
+```bash
+bash scripts/run_pytest.sh -q tests/test_b601_coordinated_holding.py tests/test_b601_holding_calibration.py tests/test_b601_workspace_calibration.py tests/test_b601_calibration_session.py --tb=short
+# 281 passed；覆盖原生软制动、另一轴制动、有限新旧预算边界、GUI 及 40/100Hz 完整耦合模型。
+bash scripts/run_pytest.sh -q tests/test_control_station_boundaries.py tests/test_hardware_boundaries.py tests/test_runtime_domain_boundaries.py --tb=short
+# 46 passed；Ruff、JS syntax、diff 检查通过。
+```
+
+原参数加 `--preflight-only` 并复用 owner 的 MotorBridge 环境，PASS：
+`hardware-tuning/j2-j3-probe-feedback-preflight-L7ItAH/b601_owner.json`，
+`can_opened=false / motor_command_sent=false`，workspace 中有效覆盖为 58.5/24。
+完整回归曾有一个新测试输入提前触发腕部上下文变化而非目标制动路径；改为另一受控轴
+的原生软制动后针对用例及上述完整回归通过，未因此修改生产判定或降低断言。
+
+原 J3 返回同点过程中仍出现约 1.01°..3.43° 的往返及反复制动；L1 峰值
+约 0.951/1.0，并非最终力矩饱和。不得声称只扩大预算就能解决平顺性，也不能把新的
+离线提案当作真机成功。下一轮重点是 J3 同点返回和新的试探驻留；已得到的 J2 记录
+保持有效性分层，不因 J3 未完成而丢弃。没有连接 CAN、执行真机、修改原始记录、
+应用补偿、合并或推送。框架线当前固定提交 `0dfbcc9c1` 的新增功能路径与本增量
+不重叠；双方历史相对统一基线仍共享 GUI、交接文档及部分 owner/backend 路径，
+后续固定提交集成时分别检查，不以分支 ancestry 判断是否已吸收，也未修改其工作区。
+
 ### 协同制动与普通到位力的归零回执冲突（2026-10-20）
 
 本增量基于 `8f4b98e8d970c69184e9c5bacaaab4e9f6edd862`。记录

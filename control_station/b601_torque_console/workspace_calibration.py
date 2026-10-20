@@ -48,6 +48,8 @@ class WorkspaceCalibrationConfig:
     holding_search: HoldingSearchConfig | None = None
     holding_excursion_rad: float | None = None
     coordinated_holding: CoordinatedHoldingConfig | None = None
+    max_sweep_leg_sec: float | None = None
+    max_sweep_leg_command_exposure_nm_sec: float | None = None
 
     def __post_init__(self):
         if isinstance(self.coordinated_holding, dict):
@@ -60,6 +62,10 @@ class WorkspaceCalibrationConfig:
             raise TypeError("holding search must be an explicit configuration object")
         if self.coordinated_holding is not None and self.holding_search is None:
             raise ValueError("coordinated holding requires explicit holding search")
+        for name in ("max_sweep_leg_sec", "max_sweep_leg_command_exposure_nm_sec"):
+            value = getattr(self, name)
+            if value is not None and (self.coordinated_holding is None or finite(value, name) <= 0):
+                raise ValueError("workspace leg budgets require explicit coordinated holding and positive limits")
         if self.holding_excursion_rad is not None and (
             self.holding_search is None or finite(self.holding_excursion_rad, "holding excursion") <= 0
         ):
@@ -145,6 +151,11 @@ class B601WorkspaceCalibrationController:
     controller_mode = "automatic_calibration"
 
     def __init__(self, settings, config, workspace: WorkspaceCalibrationConfig):
+        overrides = {name: getattr(workspace, name) for name in
+                     ("max_sweep_leg_sec", "max_sweep_leg_command_exposure_nm_sec")
+                     if getattr(workspace, name) is not None}
+        if overrides:
+            config = replace(config, **overrides)
         self.config, self.workspace = config, workspace
         self.limits = replace(settings.limits, command_timeout_sec=max(
             settings.limits.command_timeout_sec, workspace.background_permit_timeout_sec))

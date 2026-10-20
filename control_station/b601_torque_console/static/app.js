@@ -308,6 +308,9 @@ function renderWorkspace(batch) {
   const target = Number.isFinite(task?.target) ? `，换位目标 ${number(task.target * 180 / Math.PI, 2)}°` : "";
   const reason = workspace.reason === "leg_timeout" ? "本段在时限内未完成（leg_timeout）" : workspace.reason;
   el("automatic-progress").textContent = `${label}；任务 ${workspace.task_index}/${workspace.task_count}；关节采集 ${workspace.completed_joint_acquisitions}/${workspace.expected_joint_acquisitions}；当前 ${task?.joint || "六轴观察"}${target}；原因 ${reason}；命令暴露 ${number(workspace.command_exposure_nm_sec, 2)} / ${number(workspace.max_command_exposure_nm_sec, 2)} N·m·s（非实测能量）。`;
+  if (workspace.coordinated_holding_enabled && workspace.max_sweep_leg_command_exposure_nm_sec != null) {
+    el("automatic-progress").textContent += ` 本段暴露 ${number(workspace.leg_command_exposure_nm_sec, 2)} / ${number(workspace.max_sweep_leg_command_exposure_nm_sec, 2)} N·m·s；单段时限 ${number(workspace.max_sweep_leg_sec, 1)} 秒；换试探命令不重置本段预算。`;
+  }
   const holding = workspace.holding_calibration;
   if (holding?.enabled) {
     const search = holding.search;

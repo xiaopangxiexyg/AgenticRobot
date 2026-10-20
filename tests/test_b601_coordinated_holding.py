@@ -447,6 +447,101 @@ def test_fixed_hold_needs_a_continuous_quiet_dwell_not_just_a_tolerated_displace
     assert workspace._sample_pose == tuple(anchor)
 
 
+def test_native_speed_brake_retains_meaningful_probe_progress_as_a_censored_transition(tmp_path):
+    r = replay(tmp_path, holding_search=HoldingSearchConfig(
+        observation_sec=1.5, observation_timeout_sec=4.5, movement_rad=.0045))
+    advance_to_coordinated_probe(r)
+    workspace = r.controller._coordinated
+    for _ in range(60):
+        r.tick(dt_sec=.025)
+        if workspace._observation and workspace._observation["started_at_sec"] is not None:
+            break
+    else:
+        pytest.fail("no causal probe plateau")
+    search, anchor = workspace._search, workspace._sample_pose
+    j = int(workspace._tasks[workspace._index]["joint"][-1])-1
+    requested = workspace._probe
+    direction = 1 if requested >= 0 else -1
+    for _ in range(8):
+        q = list(r.q)
+        q[j] += direction*.0016
+        previous = r.delta[j]
+        r.tick(q, dt_sec=.025)
+        if search.transitions:
+            break
+    assert len(search.transitions) == 1
+    transition = search.transitions[0]
+    assert transition["outcome"] == "censored_native_brake"
+    assert transition["command_nm"] == pytest.approx(previous)
+    assert transition["requested_command_nm"] == requested
+    assert search.candidate_nm == pytest.approx(previous/2)
+    assert search.observations == []
+    assert search.status()["positive_motion_above_nm"] is search.status()["negative_motion_below_nm"] is None
+    assert workspace._sample_pose == anchor
+    assert workspace._probe is None
+
+
+def test_support_only_brake_does_not_invent_a_selected_axis_holding_response(tmp_path):
+    r = replay(tmp_path)
+    advance_to_coordinated_probe(r)
+    workspace = r.controller._coordinated
+    search, candidate = workspace._search, workspace._probe
+    for _ in range(8):
+        q = list(r.q)
+        q[2] += .002
+        r.tick(q, dt_sec=.025)
+        if workspace.pose.braking:
+            break
+    assert workspace.pose.braking
+    assert search.transitions == search.observations == []
+    assert search.candidate_nm == candidate
+    assert workspace._probe is None
+
+
+def test_workspace_leg_overrides_require_the_explicit_coordinated_mode():
+    for name in ("max_sweep_leg_sec", "max_sweep_leg_command_exposure_nm_sec"):
+        with pytest.raises(ValueError, match="explicit coordinated holding"):
+            WorkspaceCalibrationConfig(**{name: 24})
+
+
+@pytest.mark.parametrize("gate", ["time", "exposure"])
+def test_explicit_workspace_leg_margin_replaces_only_the_old_gate_and_remains_finite(tmp_path, gate):
+    r = replay(tmp_path, max_sweep_leg_sec=58.5, max_sweep_leg_command_exposure_nm_sec=24)
+    advance_to_coordinated_probe(r)
+    workspace = r.controller._coordinated
+    assert r.controller.config.max_sweep_leg_sec == workspace.config.max_sweep_leg_sec == 58.5
+    assert r.controller.config.max_sweep_leg_command_exposure_nm_sec == 24
+    if gate == "time":
+        workspace._leg_started = r.now-39.1
+    else:
+        workspace._leg_exposure = 16.1
+    r.tick(dt_sec=.025)
+    assert workspace._phase == "sweep"
+    if gate == "time":
+        workspace._leg_started = r.now-58.6
+    else:
+        workspace._leg_exposure = 24
+    r.tick(dt_sec=.025)
+    assert workspace._phase == "stopping"
+    assert workspace._reason == ("leg_timeout" if gate == "time" else "leg_command_exposure_budget")
+    view = r.controller.status()["automatic_calibration"]["workspace"]
+    assert view["max_sweep_leg_sec"] == 58.5
+    assert view["max_sweep_leg_command_exposure_nm_sec"] == 24
+    assert view["leg_command_exposure_nm_sec"] == workspace._leg_exposure
+
+
+@pytest.mark.parametrize("values", [
+    {"max_sweep_leg_sec": 0}, {"max_sweep_leg_sec": float("nan")},
+    {"max_sweep_leg_sec": True}, {"max_sweep_leg_sec": 10000},
+    {"max_sweep_leg_command_exposure_nm_sec": -1},
+    {"max_sweep_leg_command_exposure_nm_sec": float("inf")},
+    {"max_sweep_leg_command_exposure_nm_sec": 10000},
+])
+def test_explicit_leg_overrides_are_validated_before_any_acquisition(tmp_path, values):
+    with pytest.raises((ValueError, TypeError)):
+        replay(tmp_path, **values)
+
+
 @pytest.mark.parametrize("enabled", [False, True])
 def test_positioning_support_brake_uses_explicit_stage_recovery_only(tmp_path, enabled):
     r = replay(tmp_path, positioning_support_soft_speed_recovery=enabled)
@@ -679,8 +774,10 @@ def test_full_coupled_batch_and_report_keep_handoffs_distinct_from_withdrawal(tm
         # Exercise the actual explicit profile at the observed cadence too,
         # rather than validating the new margins only with shortened dwells.
         profile = Path(__file__).resolve().parents[1]/"docs/hardware/profiles/b601_j2_j3_coordinated_holding_v1.json"
-        values = json.loads(profile.read_text())["workspace"]["holding_search"]
-        changes["holding_search"] = HoldingSearchConfig(**values)
+        values = json.loads(profile.read_text())["workspace"]
+        changes["holding_search"] = HoldingSearchConfig(**values["holding_search"])
+        changes.update({name: values[name] for name in
+                        ("max_sweep_leg_sec", "max_sweep_leg_command_exposure_nm_sec")})
     r = replay(tmp_path, initial_q=(0, .01, .01, 0, 0, 0), **changes)
     movement = r.controller._coordinated.workspace.holding_search.movement_rad
     monkeypatch.setattr(transparency, "time", SimpleNamespace(monotonic=lambda: r.now+.002))

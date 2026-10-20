@@ -385,10 +385,24 @@ class CoordinatedWorkspaceController:
             return
         if self.pose.braking:
             if self._observation is not None:
+                j = int(self._tasks[self._index]["joint"][-1])-1
+                observation = {**self._observation, "outcome": "censored_native_brake",
+                    "completed_at_sec": completed, "final_qpos_rad": self.pose.q,
+                    "actual_delta_nm": previous,
+                    "net_displacement_rad": self.pose.q[j]-self._observation["anchor_qpos_rad"][j]}
                 self._records.append({"kind": "coordinated_holding_observation", "recorded_monotonic_sec": completed,
-                    "outcome": "censored_native_brake", **self._observation})
+                    **observation})
+                selected = self.pose.frames[AXES.index(j)]
+                if (selected.reason in {"resolved_tracking_speed_braking", "soft_velocity_braking"}
+                    and abs(observation["net_displacement_rad"]) >= self.workspace.holding_search.movement_rad/2):
+                    # This response preceded the new braking command. Retain
+                    # it as censored progress, never as a resolved force bound.
+                    self._search.record_transition(command_nm=previous[j],
+                        requested_command_nm=observation["requested_command_nm"], evidence=observation)
             self._probe = self._observation = None
             self._quiet_since = None
+            if self._search is not None and self._search.state == "incomplete":
+                self._stop("holding_search_incomplete", "failed")
             return
         task = self._tasks[self._index]
         if self._phase in {"position", "return", "observe", "return_observe"}:
@@ -596,6 +610,9 @@ class CoordinatedWorkspaceController:
             "holding_bias_nm": self.pose.bias, "last_confirmed_delta_nm": self._last_delta,
             "combined_l1_cap_nm": self.workspace.coordinated_holding.total_assist_cap_nm,
             "command_exposure_nm_sec": self._exposure, "max_command_exposure_nm_sec": self.workspace.max_command_exposure_nm_sec,
+            "leg_command_exposure_nm_sec": self._leg_exposure,
+            "max_sweep_leg_command_exposure_nm_sec": self.config.max_sweep_leg_command_exposure_nm_sec,
+            "max_sweep_leg_sec": self.config.max_sweep_leg_sec,
             "acquisitions": acquisitions, "moves": [], "gravity_observations": [],
             "coordinated_pose_observations": copy.deepcopy(self._pose_observations) if detailed else [],
             "gravity_parameters_frozen": True, "auto_apply": False}

@@ -643,6 +643,9 @@ const idle = render();
 batch.state='sweep';batch.active=true;batch.workspace.phase='sweep';selection.locked=true;
 const active = render();
 batch.workspace.coordinated_holding_enabled=true;
+batch.workspace.leg_command_exposure_nm_sec=16.1;
+batch.workspace.max_sweep_leg_command_exposure_nm_sec=24;
+batch.workspace.max_sweep_leg_sec=58.5;
 batch.workspace.arrival={reason:'controlled_target_error',tolerance_rad:.0015,controlled_error_rad:[0,.002]};
 render();const arrivalWaiting=el('automatic-progress').textContent;
 batch.workspace.arrival.reason='ready';render();const arrivalReady=el('automatic-progress').textContent;
@@ -680,5 +683,8 @@ console.log(JSON.stringify({idle,active,complete,warning,fault,warningInstructio
     assert "不会自动重试" in states["warningInstructions"]
     assert "停止采集不等于全失能" in states["faultInstructions"]
     assert "等待 J2/J3 到位" in states["arrivalWaiting"]
+    assert "16.10 / 24.00 N·m·s" in states["arrivalWaiting"]
+    assert "单段时限 58.5 秒" in states["arrivalWaiting"]
+    assert "不重置本段预算" in states["arrivalWaiting"]
     assert "J2/J3 已到位，六轴已停稳" in states["arrivalReady"]
     assert "不自动重锚或重试" in states["contextChanged"]

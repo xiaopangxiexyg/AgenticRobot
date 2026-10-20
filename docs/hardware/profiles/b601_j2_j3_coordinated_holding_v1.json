@@ -32,6 +32,8 @@
     "gravity_observation_sec": 5,
     "max_workspace_sec": 2400,
     "max_command_exposure_nm_sec": 800,
+    "max_sweep_leg_sec": 58.5,
+    "max_sweep_leg_command_exposure_nm_sec": 24,
     "background_permit_timeout_sec": 70,
     "setup_label": "temporary_end_effector_coordinated_holding_candidate",
     "holding_excursion_rad": 0.01,
