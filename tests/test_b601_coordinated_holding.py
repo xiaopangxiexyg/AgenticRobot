@@ -230,10 +230,11 @@ def test_cancellation_waits_for_actual_zero_tail_base_damping_and_fresh_stillnes
 def replay(tmp_path, *, initial_q=ZERO, mode_wrapper=False, **changes):
     whole = production_controller.__wrapped__(tmp_path)
     legacy = whole._workspace
-    cfg = replace(legacy.workspace, joint2_centres_deg=(3,), joint3_centres_deg=(3,),
-        gravity_observation_sec=.15, holding_excursion_rad=.01,
-        holding_search=HoldingSearchConfig(observation_sec=.15, observation_timeout_sec=1),
-        coordinated_holding=CoordinatedHoldingConfig(), **changes)
+    cfg = replace(legacy.workspace, **{
+        "joint2_centres_deg": (3,), "joint3_centres_deg": (3,),
+        "gravity_observation_sec": .15, "holding_excursion_rad": .01,
+        "holding_search": HoldingSearchConfig(observation_sec=.15, observation_timeout_sec=1),
+        "coordinated_holding": CoordinatedHoldingConfig(), **changes})
     controller = B601WorkspaceCalibrationController(legacy.settings, legacy.config, cfg)
     if mode_wrapper:
         whole._workspace = controller
@@ -303,7 +304,7 @@ def test_all_axis_authority_and_final_envelope_remain_enforced(tmp_path, kind):
     assert r.controller.result_record()["state"] in {"stopping", "failed"}
 
 
-def coupled_tick(r, *, period=.025):
+def coupled_tick(r, *, period=.025, passive_offset=0):
     """Declared overdamped toy, not identified B601 physics or a force sensor."""
     q = list(r.q)
     # Pose-dependent residual load, a Coulomb dead zone and off-diagonal
@@ -314,7 +315,158 @@ def coupled_tick(r, *, period=.025):
     velocity = ((8*drive[0]-2*drive[1])/60, (8*drive[1]-2*drive[0])/60)
     for i, v in zip((1, 2), velocity):
         q[i] += v*period
+    q[3] += max(-.00015, min(.00015, passive_offset-q[3]))
     r.tick(q, dt_sec=period)
+
+
+def scripted_coordinated_tick(r, *, passive_target=.006519419, period=.025):
+    """Script feedback, not physics; consume real six-axis controller receipts."""
+    q = list(r.q)
+    goal = r.controller._coordinated.pose.goal
+    if goal is not None and r.controller._coordinated._probe is None:
+        for i in (1, 2):
+            q[i] += max(-.00015, min(.00015, goal[i]-q[i]))
+    q[3] += max(-.00015, min(.00015, passive_target-q[3]))
+    r.tick(q, dt_sec=period)
+
+
+def advance_to_coordinated_probe(r):
+    r.controller.submit("arm", now_sec=r.now)
+    for _ in range(2500):
+        scripted_coordinated_tick(r)
+        if r.controller._coordinated._probe is not None:
+            return
+        assert r.controller.result_record()["state"] not in {"failed", "cancelled"}
+    pytest.fail("stationary passive offset prevented holding-probe entry")
+
+
+def test_position_arrival_accepts_settled_passive_offset_without_retargeting_it(tmp_path):
+    r = replay(tmp_path)
+    advance_to_coordinated_probe(r)
+    workspace = r.controller._coordinated
+    assert workspace._index == 3
+    assert r.q[3] == pytest.approx(.006519419)
+    assert workspace.pose.goal[3] == workspace._origin[3]
+    assert all(abs(r.q[i]-workspace.pose.goal[i]) <= .0015 for i in (1, 2))
+    assert workspace.pose.quiet()
+    assert workspace._sample_pose == r.q
+    assert workspace._sample_pose != workspace.pose.goal
+    assert r.controller.status()["automatic_calibration"]["workspace"]["arrival"]["reason"] == "ready"
+
+
+@pytest.mark.parametrize("passive_axis", [0, 3, 4, 5])
+def test_passive_context_change_censors_probe_and_never_reanchors_same_point(tmp_path, passive_axis):
+    r = replay(tmp_path)
+    advance_to_coordinated_probe(r)
+    workspace = r.controller._coordinated
+    anchor = workspace._sample_pose
+    search = workspace._search
+    for _ in range(200):
+        if search.observations and workspace._probe is not None:
+            break
+        r.tick(dt_sec=.025)
+    before = len(search.observations)
+    assert before > 0
+    retained = list(search.observations)
+    for _ in range(40):
+        q = list(r.q)
+        q[passive_axis] += .00015
+        r.tick(q, dt_sec=.025)
+        if workspace._phase == "stopping":
+            break
+    assert workspace._phase == "stopping"
+    assert workspace._reason == "holding_search_incomplete"
+    assert workspace._sample_pose == anchor
+    assert len(search.observations) == before
+    assert search.observations == retained
+    assert any(row.get("outcome") == "censored_support_pose_changed" for row in r.records)
+    for _ in range(100):
+        r.tick(dt_sec=.025)
+        if workspace._phase == "failed":
+            break
+    assert workspace._phase == "failed"
+    assert workspace._search is search
+    assert r.delta == r.last_kd == ZERO
+    assert not r.controller.cycle_disable_confirmation_ready
+
+
+def test_controlled_support_reacquires_same_frozen_sample_without_global_withdrawal(tmp_path):
+    r = replay(tmp_path)
+    advance_to_coordinated_probe(r)
+    workspace = r.controller._coordinated
+    anchor = workspace._sample_pose
+    search = workspace._search
+    measured = int(workspace._tasks[workspace._index]["joint"][-1])-1
+    support = 3-measured
+    for _ in range(20):
+        q = list(r.q)
+        q[support] += .00015
+        r.tick(q, dt_sec=.025)
+        if workspace._probe is None:
+            break
+    assert workspace._phase == "sweep"
+    assert workspace._probe is None
+    assert workspace._sample_pose == anchor
+    for _ in range(200):
+        scripted_coordinated_tick(r)
+        if workspace._probe is not None:
+            break
+    assert workspace._probe is not None
+    assert workspace._search is search
+    assert workspace._sample_pose == anchor
+    assert workspace._phase == "sweep"
+
+
+def test_position_arrival_still_requires_six_axis_stationarity(tmp_path):
+    r = replay(tmp_path)
+    for _ in range(12):
+        q = list(r.q)
+        q[3] += .0002
+        r.tick(q, dt_sec=.025)
+    r.controller.submit("arm", now_sec=r.now)
+    for _ in range(25):
+        q = list(r.q)
+        q[3] += .0002
+        r.tick(q, dt_sec=.025)
+    assert r.controller.result_record()["state"] == "preparing"
+    assert not r.controller._coordinated.pose.quiet()
+    assert r.delta == ZERO
+
+
+def test_static_pose_dwell_does_not_hide_slow_passive_drift(tmp_path):
+    r = replay(tmp_path, gravity_observation_sec=2)
+    r.controller.submit("arm", now_sec=r.now)
+    for _ in range(2500):
+        scripted_coordinated_tick(r)
+        if r.controller.result_record()["state"] == "observe":
+            break
+    workspace = r.controller._coordinated
+    assert workspace._phase == "observe"
+    started = workspace._leg_started
+    # Below the quiet-window velocity gate, but beyond the full dwell's
+    # original position band. It must not become a static pose observation.
+    for _ in range(60):
+        q = list(r.q)
+        q[3] += .00005
+        r.tick(q, dt_sec=.025)
+        if any(row["kind"] == "workspace_pose_observation_rejected" for row in r.records):
+            break
+    assert workspace.pose.quiet()
+    assert not workspace._pose_observations
+    assert any(row["kind"] == "workspace_pose_observation_rejected" for row in r.records)
+    assert workspace._leg_started == started
+    assert workspace._phase == "observe"
+
+
+def test_passive_offset_still_obeys_original_support_excursion_guard(tmp_path):
+    r = replay(tmp_path)
+    advance_to_coordinated_probe(r)
+    workspace = r.controller._coordinated
+    q = list(r.q)
+    q[3] = workspace._origin[3]+r.controller.limits.max_support_drift_rad+.001
+    r.tick(q, dt_sec=.025)
+    assert r.audit["fault"] == "workspace_support_excursion"
+    assert r.delta == ZERO
 
 
 def test_coupled_partial_batch_holds_other_axis_handoffs_and_final_withdrawal(tmp_path, monkeypatch):
@@ -346,7 +498,8 @@ def test_coupled_partial_batch_holds_other_axis_handoffs_and_final_withdrawal(tm
 
 
 @pytest.mark.parametrize("period", [.01, .025])
-def test_full_coupled_batch_and_report_keep_handoffs_distinct_from_withdrawal(tmp_path, period, monkeypatch):
+@pytest.mark.parametrize("passive_offset", [0, .006519419])
+def test_full_coupled_batch_and_report_keep_handoffs_distinct_from_withdrawal(tmp_path, period, passive_offset, monkeypatch):
     from types import SimpleNamespace
 
     from control_station.b601_torque_console import transparency
@@ -367,7 +520,7 @@ def test_full_coupled_batch_and_report_keep_handoffs_distinct_from_withdrawal(tm
         if state in {"complete", "failed", "cancelled"}:
             break
         old = len(r.controller._coordinated._acquisitions)
-        coupled_tick(r, period=period)
+        coupled_tick(r, period=period, passive_offset=passive_offset)
         journal.observe(snapshot())
         assert sum(abs(v) for v in r.delta) <= 1+1e-9
         if old != len(r.controller._coordinated._acquisitions):
@@ -387,9 +540,13 @@ def test_full_coupled_batch_and_report_keep_handoffs_distinct_from_withdrawal(tm
     assert all(not p["withdrawal_confirmed"] for p in report["holding_calibration"]["points"])
     assert report["workspace"]["gravity_observations"] == []
     assert len(report["workspace"]["coordinated_pose_observations"]) == 2
+    for observation in report["workspace"]["coordinated_pose_observations"]:
+        assert max(b-a for a,b in zip(observation["minimum_rad"], observation["maximum_rad"])) <= .003
+        assert observation["qpos_rad"][3] == pytest.approx(passive_offset)
     assert report["cycle"]["zero_assist_base_damping_confirmed"]
     assert (tmp_path / "b601_owner.transparency.jsonl").stat().st_size > 0
     for point in report["holding_calibration"]["points"]:
+        assert point["sample_pose_rad"][3] == pytest.approx(passive_offset)
         for obs in point["observations"]:
             if obs["outcome"] != "stationary":
                 continue

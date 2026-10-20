@@ -18,6 +18,67 @@
   基线中已接入的自观测过滤、夹爪等扩展保持原显式启用方式，默认 15 mm／v1／严格碰撞
   行为不随硬件迁移切换。物理验证仍由操作者运行，不把离线回归当成硬件有效性证明。
 
+### 协同到位、六轴停稳与实测采样基准分离（2026-10-20）
+
+本轮基于 `c1966bad693ad23428cc7c2d84d7390f8836fffa`，保持硬件线独立工作区。
+`j2-j3-coordinated-holding-acceptance/b601-owner-suwuriqm` 的首段 J3 已到约 3.01°，
+但 J4 从约 0.747° 停到 1.121°，相对旧名义目标偏移约 0.006519 rad。旧 `_at_goal`
+要求六轴都在名义目标 ±0.0015 rad 内，而实际位置反馈只控制 J2/J3；1,559 个定位
+周期中 J2/J3 在带内且六轴停稳有 872 个，最长连续约 17 秒，六轴名义误差门却没有
+一次通过，最终 39 秒 `leg_timeout`。本段两轴 L1 命令峰值约 0.610/1.0 N·m，
+协调合成／owner 最终绝对与变化率限幅均未触发，不是靠增力或延长等待能解决的问题。
+
+修复只作用于显式 coordinated workspace；不改原生 tracker、底层 owner、backend、
+MotorBridge、profile、重力参数、共享控制或框架线：
+
+- 到位仅比较 J2/J3 的受控目标，容差仍为既有 `movement_rad / 2`。六轴继续使用
+  原因果窗口停稳条件；J1/J4/J5/J6 的原支撑漂移、位置、速度和反馈有效性保护不变。
+  不增加这些轴的位置控制，也不把其名义目标改写成实测值来假装执行过目标。
+- 定力搜索只在已消费完整发送回执、实际到位和六轴停稳后，冻结完整**实测**姿态
+  `sample_pose_rad`；`nominal_target_rad` 另存。后续同点观测不重锚到新的被动轴姿态。
+  受控的另一轴偏移仍按原路径有界重到位；未受控轴超出原测量带时保留已确认观测，
+  本点按既有 `holding_search_incomplete` 告警撤力停采，不空耗尝试数或继续混合条件。
+  这不是安全故障自动恢复；原段／整批时限、曝光和尝试预算均不续期。
+- 普通驻留／位姿观察记录完整六轴窗口的起点、最小值和最大值。若慢漂在整段驻留
+  中累计越过既有测量带，记录 `workspace_pose_observation_rejected`，不冒充静态样本；
+  新驻留仍占同一段预算。联合维持观察仍不是纯重力观测或真实力传感器数据。
+- GUI／结果新增有界 `workspace.arrival` 诊断，区分等待 J2/J3 到位与等待六轴停稳，
+  显示受控误差和容差；名义被动轴偏差另存，不作到位门。保持上下文变化明确显示
+  停采、保留数据、不自动重锚／重试。旧 profile／GUI 消费者无需新增输入。
+
+固定原始反馈对照复用本轮 CLI/profile 与 J2/J3 原生控制器、六轴合成命令和合成完整
+回执：旧实现消耗 1,596 帧后进入首段 `leg_timeout`；候选在 735 帧、约 17.472 秒
+完成首段，转到原有 J2 3° 任务。比较止于首次任务交接；固定反馈与合成回执不构成
+后续运动的反事实物理仿真或真机验收，原记录不修改、不重建成成功报告。
+
+保留原 1.0 N·m **两轴共享**上限、0.195 rad/s 原始硬速度、40 ms watchdog、
+0..10° 当前采集范围、支撑漂移、命令暴露、真实故障撤力和 GUI 最终人工确认失能。
+约 39.947 Hz 实际反馈／派发以及上一轮偶发发送前 54.37 ms 延迟是独立未结项，
+本修复不声称解决它们，不降频率验收线、不延长 watchdog，也不重复使用旧反馈。
+正常软制动清除整组偏置的平滑性问题同样没有在本轮未经依据修改；当前修复先消除
+定位已完成但上层永远不承认的合同错误，再以实际采集评估连续驱动效果。
+
+定向验证（集合有重叠，不相加）：
+
+```bash
+bash scripts/run_pytest.sh -q tests/test_b601_coordinated_holding.py tests/test_b601_holding_calibration.py tests/test_b601_calibration_session.py tests/test_b601_workspace_calibration.py tests/test_b601_calibration_cycle.py tests/test_b601_automatic_calibration.py --tb=short
+# 547 passed；后补的受控支撑轴重到位用例在下面最终选集中执行。
+bash scripts/run_pytest.sh -q tests/test_b601_coordinated_holding.py tests/test_b601_workspace_calibration.py::test_workspace_gui_start_stop_and_background_semantics --tb=short
+# 45 passed，包括最后新增的同点重到位与冻结基准不变用例。
+bash scripts/run_pytest.sh -q tests/test_control_station_boundaries.py tests/test_hardware_boundaries.py tests/test_runtime_domain_boundaries.py --tb=short
+# 46 passed
+```
+
+完整 24 点的声明式耦合模型覆盖 10/25 ms 周期及腕轴 0/0.006519 rad 偏移；原始
+未受控轴漂移保护、六轴静止、完整回执、人工撤销、尾量、最终零命令和基础阻尼、
+GUI 最终确认仍有正反例。四个被动轴采样中改变会保留先前观测后告警停采；受控的
+另一轴则在同一冻结基准及原预算中重到位，不新增另一套复位或无限重试机制。
+新完整启动参数的连接前预检通过，记录在
+`hardware-tuning/j2-j3-arrival-contract-preflight/b601-owner-e9ex3cqa/b601_owner.json`，
+`can_opened=false / motor_command_sent=false`。Ruff、JS syntax、diff 检查通过。
+没有执行 CAN、真机运动、补偿模型自动应用、分支合并或推送；原近零几何间隙警告
+仍未关闭，不将流程回归或连接前预检说成物理／碰撞验收。
+
 ### 协同保持首次真机记录后的衔接修复（2026-10-20）
 
 本增量基于 `df5aa53d541a558b3b2b9605ef04690cce72d2ee`。首次记录

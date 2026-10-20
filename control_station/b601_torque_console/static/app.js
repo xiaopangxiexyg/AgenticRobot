@@ -327,7 +327,15 @@ function renderWorkspace(batch) {
   }
   if (workspace.coordinated_holding_enabled) {
     el("automatic-progress").textContent += ` 联合维持偏置 J2 ${number(workspace.holding_bias_nm?.[1])}、J3 ${number(workspace.holding_bias_nm?.[2])} N·m；最近完整发送 J2 ${number(workspace.last_confirmed_delta_nm?.[1])}、J3 ${number(workspace.last_confirmed_delta_nm?.[2])} N·m；两轴附加命令绝对值之和上限 ${number(workspace.combined_l1_cap_nm)} N·m（均非实测受力）。`;
-    el("automatic-sequence-note").textContent = "换位与试探期间 J2/J3 联合维持姿态；每次只试探一个关节，另一关节继续维持。正常点／轴切换不要求助力归零；完成整批或人工撤销才撤销两轴附加助力，确认零命令、基础阻尼和停稳后等待人工确认失能。联合观察不冒充零助力重力观察。";
+    const arrival = workspace.arrival;
+    if (arrival) {
+      const reasons = {no_goal: "尚无定位目标", six_axis_not_stationary: "等待六轴停稳", controlled_target_error: "等待 J2/J3 到位", ready: "J2/J3 已到位，六轴已停稳"};
+      el("automatic-progress").textContent += ` 定位条件：${reasons[arrival.reason] || arrival.reason}；J2/J3 误差 ${(arrival.controlled_error_rad || []).map(v => number(v, 5)).join(" / ")} rad，容差 ${number(arrival.tolerance_rad, 5)} rad。`;
+    }
+    if (holding?.context_reason === "support_pose_changed") {
+      el("automatic-progress").textContent += " 实测采样基准冻结后支撑轴姿态改变，本点停止采集并进入撤力流程；已有观测保留，不自动重锚或重试，撤力是否完成以上方 owner 回执为准。";
+    }
+    el("automatic-sequence-note").textContent = "J2/J3 按受控目标到位，六轴须停稳；未受控轴不要求回到旧名义角度，仍受原漂移及速度保护。定力观察冻结到位后的完整实测姿态，不在观察中重锚。每次只试探一个关节，另一关节继续维持；正常点／轴切换不要求助力归零。完成整批或撤销后确认零命令、基础阻尼和停稳，再等待人工确认失能。联合观察不冒充零助力重力观察。";
   }
   const ready = batch.cycle?.disable_confirmation_available === true && state.stop_controls_available === true;
   el("cycle-disable-hint").hidden = !ready;

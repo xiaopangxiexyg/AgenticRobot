@@ -49,6 +49,7 @@ class CoordinatedWorkspaceController:
         self._search = self._probe = self._observation = None
         self._attempts = 0
         self._sample_pose = None
+        self._pose_window = None
         self._leg_anchor = None
         self._pending = self._receipt = None
         self._last_commands = None
@@ -140,6 +141,7 @@ class CoordinatedWorkspaceController:
         self._probe = self._observation = None
 
     def _begin_task(self):
+        self._pose_window = None
         if self._index == len(self._tasks):
             self._stop("all_targets_and_withdrawals_confirmed", "complete")
             return
@@ -186,7 +188,27 @@ class CoordinatedWorkspaceController:
         self._transition("sweep", "coordinated_reacquire")
 
     def _at_goal(self, radius):
-        return self.pose.quiet() and max(abs(a-b) for a, b in zip(self.pose.q, self.pose.goal)) <= radius
+        # Only J2/J3 have position authority. Passive axes must be still and
+        # inside their existing safety envelope, not return to an unsent target.
+        return (self.pose.goal is not None and self.pose.quiet()
+                and max(abs(self.pose.q[i]-self.pose.goal[i]) for i in AXES) <= radius)
+
+    def _arrival_status(self):
+        radius = self.workspace.holding_search.movement_rad / 2
+        goal = self.pose.goal
+        quiet = self.pose.quiet()
+        error = None if goal is None else tuple(q-g for q, g in zip(self.pose.q, goal))
+        return {"controlled_joint_names": ["joint2", "joint3"],
+            "tolerance_rad": radius, "six_axis_stationary": quiet,
+            "controlled_error_rad": None if error is None else [error[i] for i in AXES],
+            "passive_offset_from_nominal_rad": None if error is None else {f"joint{i+1}": error[i] for i in (0, 3, 4, 5)},
+            "reason": ("no_goal" if goal is None else "six_axis_not_stationary" if not quiet
+                       else "controlled_target_error" if max(abs(error[i]) for i in AXES) > radius else "ready")}
+
+    def _passive_sample_changed(self):
+        return (self._sample_pose is not None and any(
+            abs(self.pose.q[i]-self._sample_pose[i]) > self.workspace.holding_search.movement_rad
+            for i in (0, 3, 4, 5)))
 
     def step(self, *, now_sec, qpos_rad, qvel_rad_s, feedback_sequence, control_now_sec):
         with self._lock:
@@ -371,6 +393,19 @@ class CoordinatedWorkspaceController:
                 return
             if self._quiet_since is None:
                 self._quiet_since = stamp
+                self._pose_window = {"started_at_sec": stamp, "anchor_qpos_rad": self.pose.q,
+                    "minimum_rad": self.pose.q, "maximum_rad": self.pose.q}
+            window = self._pose_window
+            window["minimum_rad"] = tuple(min(a, b) for a, b in zip(window["minimum_rad"], self.pose.q))
+            window["maximum_rad"] = tuple(max(a, b) for a, b in zip(window["maximum_rad"], self.pose.q))
+            if max(b-a for a, b in zip(window["minimum_rad"], window["maximum_rad"])) > self.workspace.holding_search.movement_rad:
+                # A rejected dwell never contributes to a completed static
+                # window. Waiting for a new dwell retains the original budget.
+                self._records.append({"kind": "workspace_pose_observation_rejected",
+                    "recorded_monotonic_sec": completed, "reason": "pose_changed_during_dwell",
+                    "task": copy.deepcopy(task), **window, "final_qpos_rad": self.pose.q})
+                self._quiet_since = self._pose_window = None
+                return
             dwell = self.workspace.gravity_observation_sec if self._phase in {"observe", "return_observe"} else self.settings.staged_assist.settle_dwell_sec
             if stamp-self._quiet_since < dwell:
                 return
@@ -378,7 +413,8 @@ class CoordinatedWorkspaceController:
                 self._begin_task()
                 return
             if self._phase in {"observe", "return_observe"}:
-                observation = {"task": copy.deepcopy(task), "qpos_rad": self.pose.q,
+                observation = {"task": copy.deepcopy(task), "qpos_rad": self.pose.q, **window,
+                    "nominal_target_rad": self.pose.goal,
                     "command_delta_nm": delta, "gravity_command_nm": commands["gravity_nm"],
                     "driver_kd_nm_s_per_rad": self._last_kd, "completed_at_sec": completed,
                     "quantity": "coupled_command_hold_not_gravity_only_or_measured_force"}
@@ -394,6 +430,11 @@ class CoordinatedWorkspaceController:
         cfg = self.workspace.holding_search
         j = int(self._tasks[self._index]["joint"][-1])-1
         if self._probe is None:
+            if self._passive_sample_changed():
+                # These axes cannot be repositioned by this controller. Do not
+                # repeatedly probe or reanchor an already frozen sample point.
+                self._stop("holding_search_incomplete", "failed")
+                return
             kd_target = tuple(max(b, a, c) for b, a, c in zip(self._condition.driver_kd_nm_s_per_rad,
                 self.workspace.joint2_drive_kd, self.workspace.joint3_drive_kd))
             if not self._at_goal(cfg.movement_rad / 2) or self._last_kd != kd_target:
@@ -408,7 +449,9 @@ class CoordinatedWorkspaceController:
                 return
             if self._search is None:
                 self._search = HoldingForceSearch(cfg, seed_nm=delta[j], cap_nm=self.workspace.coordinated_holding.total_assist_cap_nm)
-                self._sample_pose = self.pose.goal
+                # Freeze the complete measured pose after the admitted quiet
+                # handoff. The nominal J2/J3 target remains separate and fixed.
+                self._sample_pose = self.pose.q
             self._attempts += 1
             self._probe = self._search.candidate_nm
             self._observation = {"requested_command_nm": self._probe, "ramp_frozen": False,
@@ -423,6 +466,8 @@ class CoordinatedWorkspaceController:
                 **obs, "outcome": "censored_support_pose_changed", "final_qpos_rad": q, "actual_delta_nm": previous})
             self._probe = self._observation = None
             self._quiet_since = None
+            if self._passive_sample_changed():
+                self._stop("holding_search_incomplete", "failed")
             return
         plateau = previous_receipt is not None and previous_receipt["completed_at_sec"] < stamp and abs(previous[j]-self._probe) <= 1e-9 and abs(delta[j]-self._probe) <= 1e-9
         if not plateau:
@@ -497,6 +542,9 @@ class CoordinatedWorkspaceController:
             "search": None if self._search is None else self._search.status(detailed=detailed),
             "probe_command_nm": self._probe, "sample_pose_rad": self._sample_pose,
             "nominal_target_rad": self.pose.goal, "attempt_count": self._attempts,
+            "context_reason": ("inactive" if self._phase != "sweep" and self._reason != "holding_search_incomplete" else
+                               "awaiting_sample_pose" if self._sample_pose is None else
+                               "support_pose_changed" if self._passive_sample_changed() else "ready"),
             "max_attempts": self.workspace.holding_search.max_trials,
             "reacquire_bias_nm": self.pose.bias, "quantity": "software_command_not_measured_force", "auto_apply": False}
 
@@ -513,6 +561,7 @@ class CoordinatedWorkspaceController:
             "completed_joint_acquisitions": len(self._acquisitions), "expected_joint_acquisitions": 2*len(self.workspace.pose_centres()),
             "origin_qpos_rad": self._origin, "current_qpos_rad": self.pose.q,
             "holding_search_enabled": True, "holding_calibration": self._holding_status(detailed),
+            "arrival": self._arrival_status(),
             "maximum_start_angle_deg": self.workspace.maximum_start_angle_deg,
             "acquisition_ranges_deg": {"joint2": self.workspace.joint2_acquisition_range_deg, "joint3": self.workspace.joint3_acquisition_range_deg},
             "pose_centres_rad": self.workspace.pose_centres(), "local_excursion_rad": self.workspace.local_excursion_rad(self.config),

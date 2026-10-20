@@ -642,6 +642,13 @@ const render = () => {c.renderAutomatic(); return {arm:el('arm').disabled,joint:
 const idle = render();
 batch.state='sweep';batch.active=true;batch.workspace.phase='sweep';selection.locked=true;
 const active = render();
+batch.workspace.coordinated_holding_enabled=true;
+batch.workspace.arrival={reason:'controlled_target_error',tolerance_rad:.0015,controlled_error_rad:[0,.002]};
+render();const arrivalWaiting=el('automatic-progress').textContent;
+batch.workspace.arrival.reason='ready';render();const arrivalReady=el('automatic-progress').textContent;
+batch.workspace.holding_calibration={enabled:true,context_reason:'support_pose_changed'};
+render();const contextChanged=el('automatic-progress').textContent;
+batch.workspace.coordinated_holding_enabled=false;delete batch.workspace.holding_calibration;
 batch.state='complete';batch.active=false;batch.workspace.phase='complete';batch.cycle.disable_confirmation_available=true;
 const complete = render();
 batch.state='failed';batch.workspace.phase='failed';batch.cycle.disable_confirmation_available=false;
@@ -650,7 +657,7 @@ const warningInstructions=el('drive-instructions').textContent;
 batch.outcome={severity:'error'};render();const fault=el('phase').textContent;
 const faultInstructions=el('drive-instructions').textContent;
 batch.state='idle';batch.workspace.phase='idle';batch.human_intervention=true;
-console.log(JSON.stringify({idle,active,complete,warning,fault,warningInstructions,faultInstructions,human:render(),stopLabel:el('full-disable').textContent}));
+console.log(JSON.stringify({idle,active,complete,warning,fault,warningInstructions,faultInstructions,arrivalWaiting,arrivalReady,contextChanged,human:render(),stopLabel:el('full-disable').textContent}));
 """
     result = subprocess.run([node, "-e", script, json.dumps(functions)],
         check=True, capture_output=True, text=True)
@@ -665,3 +672,6 @@ console.log(JSON.stringify({idle,active,complete,warning,fault,warningInstructio
     assert "当前仅重力补偿" in states["warningInstructions"]
     assert "不会自动重试" in states["warningInstructions"]
     assert "停止采集不等于全失能" in states["faultInstructions"]
+    assert "等待 J2/J3 到位" in states["arrivalWaiting"]
+    assert "J2/J3 已到位，六轴已停稳" in states["arrivalReady"]
+    assert "不自动重锚或重试" in states["contextChanged"]
