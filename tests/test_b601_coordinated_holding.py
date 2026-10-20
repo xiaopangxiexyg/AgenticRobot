@@ -3,6 +3,7 @@
 import json
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from test_b601_automatic_calibration import AcquisitionReplay
@@ -72,6 +73,177 @@ def test_missing_duplicate_and_mismatched_receipts_never_commit(settings):
     core.record_dispatch(12, command)
     with pytest.raises(ValueError, match="pending frame"):
         core.record_dispatch(12, command)
+
+
+@pytest.mark.parametrize("period", [.01, .025])
+@pytest.mark.parametrize("joint", [1, 2])
+@pytest.mark.parametrize("direction", [-1, 1])
+def test_resolved_assisting_motion_proposes_half_actual_command_once(settings, period, joint, direction):
+    core = runtime(settings)
+    warm(core)
+    goal = list(ZERO)
+    goal[joint] = direction*.04
+    core.set_goal(goal)
+    for n in range(1, 61):
+        dt = core.observe(1.11+n*period, ZERO, ZERO)
+        command, _ = core.step(sequence=n+11, dt=dt, permitted=True)
+        core.record_dispatch(n+11, command)
+    events = 0
+    for n in range(61, 101):
+        q = list(ZERO)
+        q[joint] = direction*(n-60)*period*.008
+        raw = tuple((a-b)/period for a,b in zip(q, core.q))
+        dt = core.observe(1.11+n*period, q, raw)
+        before = core.bias
+        previous = core.last_delta[joint]
+        command, audit = core.step(sequence=n+11, dt=dt, permitted=True)
+        assert core.bias == before
+        assert not audit["braking"]
+        if audit["approach_reasons"][joint] == "resolved_motion_half_command_proposal":
+            events += 1
+            native = audit["axes"][joint-1]["requested_torque_nm"]
+            assert audit["proposed_bias_nm"][joint]+native == pytest.approx(previous/2)
+        core.record_dispatch(n+11, command)
+        assert sum(abs(v) for v in command) <= core.config.total_assist_cap_nm+1e-9
+    assert events == 1
+
+
+def test_one_count_noise_and_opposing_load_do_not_halve_support(settings):
+    for opposing in (False, True):
+        core = runtime(settings)
+        warm(core)
+        core.adopt_hold(2, -.1 if opposing else .1)
+        for n in range(1, 100):
+            q = (0, 0, n*.0002 if opposing else (n%2)*.000383496, 0, 0, 0)
+            raw = tuple((a-b)/.025 for a,b in zip(q, core.q))
+            dt = core.observe(1.11+n*.025, q, raw)
+            command, audit = core.step(sequence=n+11, dt=dt, permitted=True)
+            assert "resolved_motion_half_command_proposal" not in audit["approach_reasons"]
+            core.record_dispatch(n+11, command)
+
+
+def test_fqpl1w8y_same_motion_sample_reduces_instead_of_accumulating_bias(settings):
+    # Recorded cw4:sweep-3 at 12585.719749760. This is a branch replay,
+    # not a counterfactual simulation of subsequent physical motion.
+    core = runtime(settings)
+    core.config = CoordinatedHoldingConfig()
+    core.q = (0, 0, .052923835813999176, 0, 0, 0)
+    core.velocity = (0, 0, -.007647546304050753, 0, 0, 0)
+    core.last_delta = (0, 0, -.4194492729307253, 0, 0, 0)
+    core.bias = (0, 0, -.2972894895922154, 0, 0, 0)
+    core.estimators = (None, None, SimpleNamespace(position_span_rad=.0003834962844848633))
+    frame = SimpleNamespace(requested_torque_nm=-.11911995274598071,
+                            q_reference_rad=.04235987755982989)
+    before = core.bias
+    bias, moving, _, reason = core._approach_bias(2, frame, .025, False, .05522480607032776)
+    old_bias = before[2]+20*(frame.q_reference_rad-core.q[2])*.025
+    assert abs(old_bias) > abs(before[2])
+    assert frame.requested_torque_nm+bias == pytest.approx(core.last_delta[2]/2)
+    assert moving and reason == "resolved_motion_half_command_proposal"
+    assert core.bias == before
+
+
+@pytest.mark.parametrize("direction", [-1, 1])
+def test_motion_midpoint_cannot_cancel_stronger_native_deceleration(settings, direction):
+    core = runtime(settings)
+    core.q = (0, 0, direction*.002, 0, 0, 0)
+    core.velocity = (0, 0, direction*.01, 0, 0, 0)
+    core.last_delta = (0, 0, direction*.2, 0, 0, 0)
+    core.bias = (0, 0, direction*.1, 0, 0, 0)
+    core.estimators = (None, None, SimpleNamespace(position_span_rad=.002))
+    frame = SimpleNamespace(requested_torque_nm=-direction*.25, q_reference_rad=0)
+    bias, _, _, reason = core._approach_bias(2, frame, .025, False, 0)
+    assert reason == "motion_unload_keeps_stronger_native_braking"
+    assert bias == core.bias[2]
+    assert (frame.requested_torque_nm+bias)*core.velocity[2] < 0
+
+
+def test_unmatched_receipt_cannot_commit_motion_half_or_recovery_state(settings):
+    core = runtime(settings)
+    warm(core)
+    core.adopt_hold(2, .1)
+    for n in range(1, 60):
+        q = (0, 0, n*.0002, 0, 0, 0)
+        dt = core.observe(1.11+n*.025, q, (0, 0, .008, 0, 0, 0))
+        before = (core.bias, core._approach_anchor, core._approach_moving, core._brake_seed)
+        command, audit = core.step(sequence=n+11, dt=dt, permitted=True)
+        if "resolved_motion_half_command_proposal" in audit["approach_reasons"]:
+            core.record_dispatch(n+11, ZERO)
+            assert (core.bias, core._approach_anchor, core._approach_moving, core._brake_seed) == before
+            return
+        core.record_dispatch(n+11, command)
+    pytest.fail("no resolved assisting-motion proposal")
+
+
+@pytest.mark.parametrize("joint", [1, 2])
+def test_brake_recovery_proposal_waits_for_zero_receipt_and_cannot_survive_revocation(settings, joint):
+    core = runtime(settings)
+    warm(core)
+    goal = list(ZERO)
+    goal[joint] = .04
+    core.set_goal(goal)
+    saw_brake = saw_proposal = False
+    for n in range(1, 150):
+        q = list(ZERO)
+        if n > 30:
+            q[joint] = min(n-30, 4)*.0008
+        raw = tuple((a-b)/.025 for a,b in zip(q, core.q))
+        dt = core.observe(1.11+n*.025, q, raw)
+        previous = core.last_delta
+        command, audit = core.step(sequence=n+11, dt=dt, permitted=True)
+        if audit["braking"]:
+            saw_brake = True
+            assert audit["proposed_bias_nm"] == ZERO
+        if "post_brake_reduced_command_proposal" in audit["approach_reasons"]:
+            assert n > 65 and max(abs(v) for v in previous) == 0 and core.quiet()
+            saw_proposal = True
+        actual = list(command)
+        if 30 < n <= 65:
+            actual[3-joint] = .01  # Final conditioner tail blocks native resume.
+        core.record_dispatch(n+11, actual)
+        if saw_proposal:
+            break
+    assert saw_brake and saw_proposal
+    # A withdrawal is not a soft-brake handoff: no stale recovery survives it.
+    core._brake_seed = (0, .1, .1, 0, 0, 0)
+    dt = core.observe(core.last_time+.025, core.q, ZERO)
+    command, _ = core.step(sequence=1000, dt=dt, permitted=False)
+    core.record_dispatch(1000, command)
+    assert command == core.bias == ZERO and core._brake_seed is None
+    core._brake_seed = (0, .1, .1, 0, 0, 0)
+    core.set_goal(core.goal)
+    assert core._brake_seed is None and core._approach_anchor == core.q
+    core._brake_seed = (0, .1, .1, 0, 0, 0)
+    dt = core.observe(core.last_time+.025, core.q, ZERO)
+    core.step(sequence=1001, dt=dt, permitted=False)
+    core.record_dispatch(1001, (0, .01, .01, 0, 0, 0))
+    assert core._brake_seed is None
+
+
+def test_saturated_native_brake_cannot_restore_a_prebrake_integral(settings):
+    core = runtime(settings)
+    warm(core)
+    core.config = CoordinatedHoldingConfig(total_assist_cap_nm=.05, bias_cap_nm=.05)
+    core.set_goal((0, .04, .04, 0, 0, 0))
+    core.adopt_hold(1, .02)
+    core.adopt_hold(2, .02)
+    for n in range(1, 20):
+        q = (0, min(n, 4)*.0008, min(n, 4)*.0008, 0, 0, 0)
+        raw = tuple((a-b)/.025 for a,b in zip(q, core.q))
+        dt = core.observe(1.11+n*.025, q, raw)
+        command, audit = core.step(sequence=n+11, dt=dt, permitted=True)
+        core.record_dispatch(n+11, command)
+        if audit["braking"] and audit["saturated"]:
+            assert audit["proposed_bias_nm"] == core.bias == ZERO
+            return
+    pytest.fail("native braking did not exercise the common final limiter")
+
+
+@pytest.mark.parametrize("value", [0, -.001, .1, float("nan"), True])
+def test_stage_arrival_alignment_cannot_relax_the_native_arrival_envelope(settings, value):
+    core = runtime(settings)
+    with pytest.raises(ValueError):
+        CoordinatedPoseHolding(core.settings, core.config, arrival_tolerance_rad=value)
 
 
 @pytest.mark.parametrize("period", [.01, .025])
@@ -554,10 +726,12 @@ def test_current_margin_profile_resolves_workspace_only_and_keeps_hard_envelopes
                          "max_sweep_command_exposure_nm_sec": 80,
                          "motion_braking_timeout_sec": 6.591,
                          "motion_soft_velocity_rad_s": .0585}.items():
-        assert getattr(updated.config, name) == pytest.approx(before*1.3)
+        factor = 1.3 * (1.5 if name in {"max_batch_sec", "max_sweep_command_exposure_nm_sec"} else 1)
+        assert getattr(updated.config, name) == pytest.approx(before*factor)
         assert getattr(old.config, name) == before
-    assert updated.config.max_sweep_leg_sec == pytest.approx(58.5*1.3)
-    assert updated.config.max_sweep_leg_command_exposure_nm_sec == pytest.approx(24*1.3)
+    assert updated.config.max_sweep_leg_sec == pytest.approx(76.05*1.5)
+    assert updated.config.max_sweep_leg_command_exposure_nm_sec == pytest.approx(31.2*1.5)
+    assert updated._coordinated.pose.arrival_tolerance_rad == .00225
     motion = updated.settings.staged_assist.motion_control
     assert motion is updated._coordinated.pose.motion
     assert motion.soft_velocity_rad_s == motion.continuous_speed_limit_rad_s == .07605
@@ -600,10 +774,10 @@ def test_native_probe_soft_brake_uses_the_scoped_speed_margin(tmp_path, expanded
 
 
 @pytest.mark.parametrize("gate,field,old_limit,new_limit,reason", [
-    ("leg_time", "_leg_started", 58.5, 76.05, "leg_timeout"),
-    ("leg_exposure", "_leg_exposure", 24, 31.2, "leg_command_exposure_budget"),
-    ("sweep_time", "_sweep_started", 390, 507, "batch_timeout"),
-    ("sweep_exposure", "_sweep_exposure", 80, 104, "active_command_exposure_budget"),
+    ("leg_time", "_leg_started", 76.05, 114.075, "leg_timeout"),
+    ("leg_exposure", "_leg_exposure", 31.2, 46.8, "leg_command_exposure_budget"),
+    ("sweep_time", "_sweep_started", 507, 760.5, "batch_timeout"),
+    ("sweep_exposure", "_sweep_exposure", 104, 156, "active_command_exposure_budget"),
     ("workspace_time", "_started", 2400, 3120, "workspace_timeout"),
     ("workspace_exposure", "_exposure", 800, 1040, "workspace_command_exposure_budget"),
 ])
@@ -895,12 +1069,15 @@ def test_full_coupled_batch_and_report_keep_handoffs_distinct_from_withdrawal(tm
         journal.observe(snapshot())
         assert sum(abs(v) for v in r.delta) <= 1+1e-9
         if old != len(r.controller._coordinated._acquisitions):
+            assert tuple(r.delta) == tuple(r.audit["coordinated_holding"]["combined_command_nm"])
             handoffs.append(tuple(r.delta))
     result = r.controller.result_record()
     assert result["state"] == "complete", (result["reason"], r.q, r.controller._coordinated._holding_status())
     assert len(result["motion"]["completed_legs"]) == 24
     assert {leg["max_reference_velocity_rad_s"] for leg in result["motion"]["completed_legs"]} == set(r.controller.config.sweep_speeds_rad_s)
-    assert len(handoffs) == 2 and all(any(abs(v) > .01 for v in h) for h in handoffs)
+    # A learned small hold is valid too. Handoff must preserve the actual
+    # dispatched composite, not manufacture a minimum support magnitude.
+    assert len(handoffs) == 2 and all(any(abs(v) > 1e-9 for v in h) for h in handoffs)
     assert r.delta == r.last_kd == ZERO
     assert r.controller.cycle_disable_confirmation_ready
     assert all(abs(r.q[i]-.01) < .003 for i in (1, 2))

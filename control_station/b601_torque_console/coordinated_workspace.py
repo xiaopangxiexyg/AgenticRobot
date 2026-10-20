@@ -36,7 +36,8 @@ class CoordinatedWorkspaceController:
             raise ValueError("coordinated acquisition requires the explicit per-leg exposure budget")
         self.settings, self.limits = settings, settings.limits
         self.config, self.workspace = config, workspace
-        self.pose = CoordinatedPoseHolding(settings, workspace.coordinated_holding)
+        self.pose = CoordinatedPoseHolding(settings, workspace.coordinated_holding,
+            arrival_tolerance_rad=workspace.holding_search.movement_rad / 2)
         self._condition = self._position_limits = None
         self._ready = self._closed = self._start = False
         self._human = self._permit = self._origin = self._started = None

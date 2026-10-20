@@ -42,7 +42,7 @@ class CoordinatedPoseHolding:
     The other axis keeps its pose feedback and last learned bias.
     """
 
-    def __init__(self, settings, config: CoordinatedHoldingConfig):
+    def __init__(self, settings, config: CoordinatedHoldingConfig, *, arrival_tolerance_rad=None):
         self.settings, self.config = settings, config
         self.motion = settings.staged_assist.motion_control
         if (self.motion is None or not self.motion.responsive_tracking_brake
@@ -60,6 +60,13 @@ class CoordinatedPoseHolding:
         self.pending = None
         self.frames = ()
         self.braking = False
+        self.arrival_tolerance_rad = (settings.staged_assist.settle_error_rad
+            if arrival_tolerance_rad is None else finite(arrival_tolerance_rad, "coordinated arrival tolerance"))
+        if not 0 < self.arrival_tolerance_rad <= settings.staged_assist.settle_error_rad:
+            raise ValueError("coordinated arrival tolerance must fit the native arrival envelope")
+        self._approach_anchor = ZERO
+        self._approach_moving = (False,) * 6
+        self._brake_seed = None
 
     def observe(self, now, q, raw, *, idle=False):
         q, raw = six(q, "coordinated position"), six(raw, "coordinated velocity")
@@ -112,6 +119,10 @@ class CoordinatedPoseHolding:
             self.trackers = tuple(B601JointMotionTracker(replace(self.motion,
                 max_reference_velocity_rad_s=speed, support_soft_speed_recovery=recovery)) for _ in AXES)
         self.goal = goal
+        # Proposals are local to this exact goal/pose context, never a model.
+        self._approach_anchor = self.q
+        self._approach_moving = (False,) * 6
+        self._brake_seed = None
         for tracker, i in zip(self.trackers, AXES, strict=True):
             tracker.start(now=self.last_time, q=self.q[i], target=goal[i])
 
@@ -126,6 +137,42 @@ class CoordinatedPoseHolding:
         bias[joint] = value
         self.bias = tuple(bias)
 
+    def _approach_bias(self, i, frame, dt, moving, anchor):
+        """Back off a causally sent command once on resolved assisting motion.
+
+        Half is an exploration proposal toward zero, not a measured equilibrium
+        or a signed force bound. Native braking always overrides this path.
+        """
+        resolution = self.motion.position_resolution_rad or 0.0
+        onset = max(2 * resolution, self.settings.staged_assist.motion_onset_confirm_displacement_rad)
+        velocity = self.velocity[i]
+        quiet = (abs(velocity) <= self.settings.staged_assist.settle_velocity_rad_s
+                 and self.estimators[i].position_span_rad <= resolution)
+        if quiet:
+            moving, anchor = False, self.q[i]
+        progress = self.q[i] - anchor
+        onset_confirmed = (not moving and abs(progress) >= onset
+            and abs(velocity) > self.settings.staged_assist.settle_velocity_rad_s
+            and progress * velocity > 0 and self.last_delta[i] * velocity > 0)
+        bias, reason = self.bias[i], "retain_bias_during_motion"
+        if onset_confirmed:
+            half = self.last_delta[i] / 2
+            original = frame.requested_torque_nm + self.bias[i]
+            # Never cancel a stronger decelerating native PD response just
+            # to reach the midpoint. Only reduce positive commanded work.
+            target = min(half, original) if velocity > 0 else max(half, original)
+            bias = target - frame.requested_torque_nm
+            moving, reason = True, "resolved_motion_half_command_proposal"
+            if target != half:
+                reason = "motion_unload_keeps_stronger_native_braking"
+        elif quiet:
+            error = frame.q_reference_rad - self.q[i]
+            if abs(error) > resolution:
+                bias += self.config.bias_gain_nm_per_rad_sec * error * dt
+            reason = "stationary_bias_refinement"
+        return (max(-self.config.bias_cap_nm, min(self.config.bias_cap_nm, bias)),
+                moving, anchor, reason)
+
     def step(self, *, sequence, dt, permitted, probe_joint=None, probe_nm=None):
         if type(sequence) is not int or sequence < 0 or type(permitted) is not bool or not 0 < finite(dt, "control interval") <= self.motion.max_control_gap_sec:
             raise ValueError("coordinated step requires valid sequence, permit and control interval")
@@ -136,6 +183,9 @@ class CoordinatedPoseHolding:
         if probe_nm is not None and (probe_joint is None or abs(finite(probe_nm, "probe")) > self.config.total_assist_cap_nm):
             raise ValueError("probe must fit the combined assist envelope")
         proposed_bias, demand = list(self.bias), [0.0] * 6
+        anchors, moving = list(self._approach_anchor), list(self._approach_moving)
+        brake_seed = self._brake_seed
+        approach_reasons = [None] * 6
         frames = []
         if permitted:
             if self.goal is None:
@@ -151,7 +201,7 @@ class CoordinatedPoseHolding:
                 frame = tracker.update(now=self.last_time, q=self.q[i], raw_v=self.raw[i], control_v=self.velocity[i],
                     control_sequence=sequence, authority=1.0,
                     kp=self.motion.tracking_kp_nm_per_rad, kd=self.motion.tracking_kd_nm_s_per_rad,
-                    stop_error_rad=self.settings.staged_assist.settle_error_rad,
+                    stop_error_rad=self.arrival_tolerance_rad,
                     stop_velocity_rad_s=self.settings.staged_assist.settle_velocity_rad_s,
                     stop_dwell_sec=self.settings.staged_assist.settle_dwell_sec,
                     support_max_velocity_rad_s=max(abs(v) for j, v in enumerate(self.velocity) if j != i),
@@ -171,14 +221,26 @@ class CoordinatedPoseHolding:
                     and abs(frame.q_reference_rad-self.goal[i]) > (self.motion.position_resolution_rad or 0)):
                     raise ValueError("coordinated_target_stopped_before_goal")
                 is_probe = i == probe_joint and probe_nm is not None and frame.reason == "calibration_fixed_command_observation"
-                if not is_probe and abs(self.velocity[i]) <= self.settings.staged_assist.stuck_max_velocity_rad_s:
-                    error = frame.q_reference_rad - self.q[i]
-                    if abs(error) > (self.motion.position_resolution_rad or 0):
-                        proposed_bias[i] = max(-self.config.bias_cap_nm, min(self.config.bias_cap_nm,
-                            self.bias[i] + self.config.bias_gain_nm_per_rad_sec * error * dt))
+                if not is_probe and brake_seed is None:
+                    proposed_bias[i], moving[i], anchors[i], approach_reasons[i] = self._approach_bias(
+                        i, frame, dt, moving[i], anchors[i])
+                elif is_probe:
+                    moving[i], anchors[i] = False, self.q[i]
                 demand[i] = frame.requested_torque_nm + (0.0 if is_probe else proposed_bias[i])
         self.braking = any(f.phase == "brake" and f.reason != "target_reached_braking" for f in frames)
         if self.braking:
+            if brake_seed is None:
+                # Remember the preceding complete dispatch, not the new brake
+                # frame. This cannot act until native zero/still handoff.
+                seed = list(self.last_delta)
+                for i, frame in zip(AXES, frames, strict=True):
+                    if (frame.reason in {"resolved_tracking_speed_braking", "soft_velocity_braking"}
+                        and self.last_delta[i] * self.velocity[i] > 0
+                        and self.estimators[i].position_span_rad >= max(
+                            2 * (self.motion.position_resolution_rad or 0.0),
+                            self.settings.staged_assist.motion_onset_confirm_displacement_rad)):
+                        seed[i] /= 2
+                brake_seed = tuple(seed)
             proposed_bias = [0.0] * 6
             demand = [0.0] * 6
             for i, frame in zip(AXES, frames, strict=True):
@@ -188,9 +250,17 @@ class CoordinatedPoseHolding:
                 demand[i] = (frame.requested_torque_nm
                              if frame.phase == "brake" and frame.reason != "target_reached_braking"
                              else -self.motion.braking_kd_nm_s_per_rad * self.velocity[i])
+        elif permitted and brake_seed is not None and self.quiet() and max(abs(v) for v in self.last_delta) <= 1e-9:
+            for i, frame in zip(AXES, frames, strict=True):
+                proposed_bias[i] = max(-self.config.bias_cap_nm, min(self.config.bias_cap_nm,
+                    brake_seed[i] - frame.requested_torque_nm))
+                demand[i] = frame.requested_torque_nm + proposed_bias[i]
+                moving[i], anchors[i] = False, self.q[i]
+                approach_reasons[i] = "post_brake_reduced_command_proposal"
+            brake_seed = None
         norm = sum(abs(v) for v in demand)
         scale = min(1.0, self.config.total_assist_cap_nm / norm) if norm else 1.0
-        if scale < 1:
+        if scale < 1 and not self.braking:
             proposed_bias = list(self.bias)  # No integral windup at saturation.
         command = [0.0] * 6
         if permitted:
@@ -212,17 +282,25 @@ class CoordinatedPoseHolding:
                 for i in increases:
                     magnitude = abs(self.last_delta[i]) + (abs(command[i])-abs(self.last_delta[i])) * headroom/requested
                     command[i] = magnitude if command[i] > 0 else -magnitude
-                proposed_bias = list(self.bias)
+                if not self.braking:
+                    proposed_bias = list(self.bias)
         else:
             proposed_bias = [0.0] * 6
+            # Revocation invalidates a proposal immediately, even if a final
+            # conditioner tail prevents matching this requested zero frame.
+            self._brake_seed = None
+            brake_seed = None
+            moving, anchors = [False] * 6, list(self.q)
         self.frames = tuple(frames)
-        self.pending = (sequence, tuple(command), tuple(proposed_bias))
+        self.pending = (sequence, tuple(command), tuple(proposed_bias), tuple(anchors), tuple(moving), brake_seed)
         return tuple(command), {"target_qpos_rad": self.goal, "bias_nm": self.bias,
             "max_reference_velocity_rad_s": self.trackers[0].config.max_reference_velocity_rad_s,
             "support_soft_speed_recovery": self.trackers[0].config.support_soft_speed_recovery,
             "proposed_bias_nm": tuple(proposed_bias), "combined_command_nm": tuple(command),
             "combined_l1_cap_nm": self.config.total_assist_cap_nm,
             "saturated": scale < 1, "braking": self.braking,
+            "arrival_tolerance_rad": self.arrival_tolerance_rad,
+            "approach_reasons": approach_reasons, "brake_recovery_proposal_nm": brake_seed,
             "axes": [asdict(f) for f in frames], "auto_apply": False,
             "quantity": "software_command_not_measured_force"}
 
@@ -234,6 +312,7 @@ class CoordinatedPoseHolding:
             raise ValueError("actual coordinated command exceeds combined envelope")
         if max(abs(a-b) for a, b in zip(actual, self.pending[1])) <= 1e-9:
             self.bias = self.pending[2]
+            self._approach_anchor, self._approach_moving, self._brake_seed = self.pending[3:]
         for tracker in self.trackers:
             tracker.record_dispatch(sequence)
         self.last_delta, self.pending = actual, None
