@@ -740,6 +740,70 @@ def test_fixed_hold_needs_a_continuous_quiet_dwell_not_just_a_tolerated_displace
     assert workspace._sample_pose == tuple(anchor)
 
 
+@pytest.mark.parametrize("axis", [0, 1, 3, 4, 5])
+@pytest.mark.parametrize("period", [.01, .025])
+def test_fixed_probe_keeps_fine_position_dwell_through_bounded_count_jitter(tmp_path, axis, period):
+    r = replay(tmp_path, holding_search=HoldingSearchConfig(
+        observation_sec=.5, observation_timeout_sec=1.5, movement_rad=.003))
+    advance_to_coordinated_probe(r)
+    workspace = r.controller._coordinated
+    for _ in range(100):
+        r.tick(dt_sec=period)
+        if workspace._observation and workspace._observation["started_at_sec"] is not None:
+            break
+    else:
+        pytest.fail("no actually dispatched constant-command plateau")
+    anchor, search, command = r.q, workspace._search, workspace._probe
+    not_quiet = False
+    for n in range(int(1.3/period)):
+        q = list(anchor)
+        q[axis] += (1 if (n // round(.2/period)) % 2 else -1) * .000383496
+        r.tick(q, dt_sec=period)
+        not_quiet |= not workspace.pose.quiet()
+        if search.observations:
+            break
+    assert not_quiet
+    assert search.observations
+    obs = search.observations[0]
+    assert obs["outcome"] == "stationary"
+    assert obs["command_nm"] == command
+    assert obs["stationary_dwell_sec"] >= .5
+    assert obs["completion_criterion"] == "fixed_command_fine_position_dwell"
+    assert obs["handoff_quiet_confirmed"]
+    assert obs["allowed_stationary_span_rad"] == 2*workspace.pose.motion.position_resolution_rad
+    assert obs["stationary_maximum_rad"]-obs["stationary_minimum_rad"] <= obs["allowed_stationary_span_rad"]+1e-9
+    assert max(b-a for a,b in zip(obs["minimum_rad"], obs["maximum_rad"])) <= .003
+    assert workspace._sample_pose == anchor
+
+
+@pytest.mark.parametrize("period", [.01, .025])
+def test_fixed_probe_rejects_varying_support_effort_even_with_bounded_encoder_jitter(tmp_path, period):
+    r = replay(tmp_path, holding_search=HoldingSearchConfig(
+        observation_sec=.5, observation_timeout_sec=1.5, movement_rad=.003))
+    advance_to_coordinated_probe(r)
+    workspace = r.controller._coordinated
+    for _ in range(100):
+        r.tick(dt_sec=period)
+        if workspace._observation and workspace._observation["started_at_sec"] is not None:
+            break
+    anchor, search = r.q, workspace._search
+    for n in range(int(1.8/period)):
+        q = list(anchor)
+        # J3 is the actively held support axis during this J2 probe. Its PD
+        # response varies by more than the admitted command-context bound.
+        q[2] += (1 if (n // round(.2/period)) % 2 else -1) * .000383496
+        r.tick(q, dt_sec=period)
+        rejected = [v for v in r.records if v["kind"] == "coordinated_holding_observation"
+                    and v["outcome"] == "censored_context_not_stationary"]
+        if rejected:
+            break
+    assert not search.observations
+    assert rejected
+    obs = rejected[0]
+    assert max(b-a for a,b in zip(obs["minimum_rad"], obs["maximum_rad"])) < .003
+    assert obs["maximum_delta_nm"][2]-obs["minimum_delta_nm"][2] > workspace.workspace.holding_search.torque_resolution_nm
+
+
 def test_native_speed_brake_retains_meaningful_probe_progress_as_a_censored_transition(tmp_path):
     r = replay(tmp_path, holding_search=HoldingSearchConfig(
         observation_sec=1.5, observation_timeout_sec=4.5, movement_rad=.0045))

@@ -538,14 +538,16 @@ class CoordinatedWorkspaceController:
             elapsed = stamp-obs["started_at_sec"]
             displacement = q[j]-obs["anchor_qpos_rad"][j]
             # A tolerated pose error is not proof of a constant-command hold.
-            # Restart only the stationary dwell, not the observation budget,
-            # after progress beyond +/- one encoder count or lost quietness.
+            # Use the selected axis' fine position band for its dwell, rather
+            # than repeatedly clearing it for any axis' short-window velocity
+            # fluctuation. Whole-pose and support-command bounds below remain
+            # independent; completion still requires fresh six-axis stillness.
             obs["net_displacement_rad"] = displacement
             obs["stationary_minimum_rad"] = min(obs["stationary_minimum_rad"], q[j])
             obs["stationary_maximum_rad"] = max(obs["stationary_maximum_rad"], q[j])
             span = obs["stationary_maximum_rad"]-obs["stationary_minimum_rad"]
             resolution = self.pose.motion.position_resolution_rad
-            if not self.pose.quiet() or resolution is not None and span > 2*resolution + 1e-9:
+            if (span > 2*resolution + 1e-9 if resolution is not None else not self.pose.quiet()):
                 obs.update(stationary_since_sec=stamp, stationary_minimum_rad=q[j], stationary_maximum_rad=q[j])
             obs["stationary_dwell_sec"] = stamp-obs["stationary_since_sec"]
             if elapsed >= self.pose.motion.velocity_window_sec and abs(displacement) >= cfg.movement_rad and displacement*self.pose.velocity[j] > 0 and displacement*self.pose.raw[j] > 0:
@@ -561,6 +563,11 @@ class CoordinatedWorkspaceController:
                 outcome = "censored_context_not_stationary"
         if outcome is None:
             return
+        if outcome == "stationary":
+            obs.update(completion_criterion=("fixed_command_fine_position_dwell" if resolution is not None
+                                            else "fixed_command_quiet_dwell"),
+                allowed_stationary_span_rad=None if resolution is None else 2*resolution,
+                handoff_quiet_confirmed=True)
         obs.update(outcome=outcome, completed_at_sec=completed, final_qpos_rad=q,
             net_displacement_rad=q[j]-obs["anchor_qpos_rad"][j],
             actual_delta_nm=previous, gravity_command_nm=commands["gravity_nm"],
