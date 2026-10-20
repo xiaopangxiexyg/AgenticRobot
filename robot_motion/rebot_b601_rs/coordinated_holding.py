@@ -154,10 +154,17 @@ class CoordinatedPoseHolding:
                     stop_evidence=evidence, speed_governor_permitted=True,
                     zero_dispatch_confirmed=max(abs(v) for v in self.last_delta) <= 1e-9,
                     calibration_hold_enabled=True,
+                    calibration_target_hold=True,
                     calibration_probe_nm=probe_nm if i == probe_joint else None)
                 frames.append(frame)
                 if frame.phase == "authority_exhausted":
                     raise ValueError(frame.reason)
+                if (frame.phase == "soft_hold" and frame.brake_trigger_lag_rad is not None
+                    and abs(frame.brake_trigger_lag_rad) > self.motion.max_reference_lag_rad):
+                    raise ValueError("coordinated_reference_lag_stop")
+                if (frame.phase == "soft_hold"
+                    and abs(frame.q_reference_rad-self.goal[i]) > (self.motion.position_resolution_rad or 0)):
+                    raise ValueError("coordinated_target_stopped_before_goal")
                 is_probe = i == probe_joint and probe_nm is not None and frame.reason == "calibration_fixed_command_observation"
                 if not is_probe and abs(self.velocity[i]) <= self.settings.staged_assist.stuck_max_velocity_rad_s:
                     error = frame.q_reference_rad - self.q[i]

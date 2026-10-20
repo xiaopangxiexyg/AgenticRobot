@@ -475,7 +475,12 @@ class B601JointMotionTracker:
         zero_dispatch_confirmed: bool = False,
         calibration_hold_enabled: bool = False,
         calibration_probe_nm: float | None = None,
+        calibration_target_hold: bool = False,
     ) -> B601JointMotionFrame:
+        if type(calibration_target_hold) is not bool:
+            raise TypeError("calibration target hold must be boolean")
+        if calibration_target_hold and not (calibration_hold_enabled and self.config.speed_governor):
+            raise ValueError("calibration target hold requires explicit governed calibration")
         if type(calibration_hold_enabled) is not bool:
             raise TypeError("calibration hold permit must be boolean")
         if calibration_hold_enabled and not (
@@ -490,6 +495,8 @@ class B601JointMotionTracker:
             raise ValueError("fixed holding probe requires explicit finite calibration demand")
         if type(speed_governor_permitted) is not bool or type(zero_dispatch_confirmed) is not bool:
             raise TypeError("governor permit and zero receipt must be boolean")
+        if calibration_target_hold and not speed_governor_permitted:
+            request_brake, brake_reason = True, "speed_governor_permission_withdrawn"
         support_raw = support_max_velocity_rad_s if support_raw_max_velocity_rad_s is None else support_raw_max_velocity_rad_s
         if not all(
             math.isfinite(x)
@@ -697,20 +704,23 @@ class B601JointMotionTracker:
                 self._planner.accept_target((self._target,), sequence=0,
                     published_monotonic_time=now, monotonic_time=now)
             self._calibration_probe_active = False
+        active_target_hold = (calibration_target_hold and self._hold_position == self._target
+                              and self._brake_reason == "calibration_target_tracking")
         if (
             self._hold_position is not None
             and not request_brake
             and soft_speed < selected_stop_limit
             and support_max_velocity_rad_s < self.config.soft_velocity_rad_s
-            and (resolution is None or evidence_reason is None)
+            and (abs(self._target-q) <= self.config.max_reference_lag_rad if active_target_hold
+                 else resolution is None or evidence_reason is None)
         ):
             p = self.config.hold_kp_nm_per_rad * (self._hold_position - q)
             damping_v = control_v if self.config.windowed_soft_velocity else raw_v if raw_v * control_v < 0 else control_v
             d = -self.config.hold_kd_nm_s_per_rad * damping_v
             cap = self.config.hold_torque_cap_nm
             return frame(
-                "soft_hold",
-                "holding_measured_stop_point",
+                "track" if active_target_hold else "soft_hold",
+                "calibration_target_tracking" if active_target_hold else "holding_measured_stop_point",
                 self._hold_position,
                 0.0,
                 control_v,
@@ -720,13 +730,19 @@ class B601JointMotionTracker:
                 self._hold_position,
             )
         if self._hold_position is not None:
+            hold_reference = self._hold_position
             self._hold_position = None
             self._brake_start = now
             self._stationary_start = None
             self._stationary_position = None
-            self._brake_reason = "soft_hold_motion_braking"
-            self._brake_trigger_reference = q
-            self._brake_trigger_lag = 0.0
+            self._brake_reason = (
+                brake_reason if request_brake else
+                "reference_lag_braking" if active_target_hold and abs(self._target-q) > self.config.max_reference_lag_rad else
+                "support_velocity_braking" if active_target_hold and support_max_velocity_rad_s >= self.config.soft_velocity_rad_s else
+                "soft_velocity_braking" if active_target_hold and soft_speed >= selected_stop_limit else
+                "soft_hold_motion_braking") if active_target_hold else "soft_hold_motion_braking"
+            self._brake_trigger_reference = hold_reference if active_target_hold else q
+            self._brake_trigger_lag = hold_reference-q if active_target_hold else 0.0
         if (self.config.speed_governor and self._brake_start is not None
             and (self._governed_speed_brake(self._brake_reason)
                  or self.config.arrival_stabilization
@@ -797,7 +813,11 @@ class B601JointMotionTracker:
                 # BEFORE the unchanged hard lead boundary, not after a trip.
                 reference_position_reserve_rad = resolution or 0.0
                 reference_headroom_rad = reference_safety_headroom_rad - reference_position_reserve_rad
-                pacing_exhausted = reference_safety_headroom_rad <= 0.0
+                # A paused reference can consume the reserved encoder count
+                # during finite-rate deceleration. Stop before the next count
+                # violates the unchanged absolute reference-lag boundary.
+                pacing_exhausted = (reference_headroom_rad <= 0.0 if calibration_target_hold
+                                    else reference_safety_headroom_rad <= 0.0)
                 if not pacing_exhausted:
                     acceleration = self.config.max_reference_acceleration_rad_s2
                     # Positive root of v*gap + v^2/(2*a) = headroom, in a
@@ -980,17 +1000,35 @@ class B601JointMotionTracker:
                     self._brake_trigger_reference = self._brake_trigger_lag = None
                     return frame("track", "speed_governor_resumed_original_target",
                                  q, 0.0, control_v, 0.0, 0.0, 0.0)
-                self._hold_position = q
+                retain_target = (
+                    calibration_target_hold and not request_brake and speed_governor_permitted
+                    and (self._governed_speed_brake(self._brake_reason)
+                         or self._brake_reason in {"soft_hold_motion_braking", "support_velocity_braking"})
+                    and abs(self._target-q) <= min(stop_error_rad, self.config.max_reference_lag_rad)
+                )
+                if retain_target and not zero_dispatch_confirmed:
+                    return frame("brake", "speed_governor_waiting_for_zero_dispatch",
+                                 q, 0.0, control_v, 0.0, 0.0, 0.0,
+                                 brake_elapsed_sec=elapsed)
+                # Only retain an already-admitted nearby calibration target.
+                # Terminal reference-lag/operator stops still capture q.
+                self._hold_position = self._target if retain_target else q
+                if retain_target:
+                    # This completed stop now owns an active target servo.
+                    # Keep its goal/count/deadline; do not leave a stale brake
+                    # latch that would veto the next fixed-command probe.
+                    self._brake_start = self._stationary_start = None
+                    self._brake_reason = "calibration_target_tracking"
                 return frame(
                     "soft_hold",
-                    "measured_stop_point_captured",
-                    q,
+                    "calibration_target_hold_captured" if retain_target else "measured_stop_point_captured",
+                    self._hold_position,
                     0.0,
                     control_v,
                     0.0,
                     0.0,
                     0.0,
-                    q,
+                    self._hold_position,
                     elapsed,
                 )
             if stop_capture_block_reason is None:

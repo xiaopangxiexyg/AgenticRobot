@@ -18,6 +18,61 @@
   基线中已接入的自观测过滤、夹爪等扩展保持原显式启用方式，默认 15 mm／v1／严格碰撞
   行为不随硬件迁移切换。物理验证仍由操作者运行，不把离线回归当成硬件有效性证明。
 
+### 协同保持首次真机记录后的衔接修复（2026-10-20）
+
+本增量基于 `df5aa53d541a558b3b2b9605ef04690cce72d2ee`。首次记录
+`j2-j3-coordinated-holding-acceptance/b601-owner-8cndxas0` 在首个 J3 3° 定位任务
+停止：约 9.438 秒时参考偏差 0.019530 rad 越过 0.0195 rad 门，9.588 秒捕获约
+1.406° 的实际停点，之后上层仍等 3°，直到 39 秒 `leg_timeout`。清理六轴 safe_stop
+回执完整；随后离线报告因空身份／非运动拟合角色标记异常，将退出码升为 2。
+没有合格保持采样点，不能将定位段当作已完成标定。
+
+本轮不把真正的参考偏差故障改成自动重试，也不扩大任何阈值：
+
+- 在显式协同模式中，已暂停参考的减速尾量若吃掉预留的一个编码器计数余量，提前
+  请求现有 `reference_pacing_headroom_braking`。实际偏差仍在原门内时，完成原六轴
+  零命令／静止确认后沿既有 governor 恢复同一目标；不调用 start 重置时限或计数。
+  实际参考偏差已越界时仍是终止路径，不转成预测性恢复。
+- 原生 tracker 新增默认 False 的 `calibration_target_hold`，只有协同采集显式传 True。
+  合格软制动后，若原目标在原到位及参考偏差范围内，必须先有完整零命令与六轴
+  停稳确认，才能保持原目标，而不是把当前停点冒充目标。进入后是有界主动
+  `calibration_target_tracking`，不是六轴静止声明；允许另一轴在原软速度边界内受控
+  移动，不再用静态停点的跨轴累计范围去反复撤力。真实到位、固定命令观察和最终
+  撤力仍由原六轴窗口、驻留和回执判断；硬速度、反馈新鲜度、实际参考偏差始终检查。
+- 完成上述停稳交接后清除已结束的制动锁存，保留目标与 governor 计数，下一次
+  定命令探测可正常接入。人工撤销、许可撤回、硬保护和真实参考偏差停止不能恢复。
+  真正参考偏差终止报 `coordinated_reference_lag_stop`；底层捕获非目标终止停点则报
+  `coordinated_target_stopped_before_goal`，均进入原 owner 故障撤力路径，不再空等整段超时。
+- 没有批次时 `calibration_trial=null`，有批次后试次／阶段身份非空。报告在校验运动
+  拟合专用标记前，先执行既有保持采集排除规则；独立 admission 调用也保留该规则。
+  这允许只读分析旧的空身份非拟合记录，不放宽正常运动试次身份或将保持数据纳入拟合。
+
+对同一轮原始 1,594 个反馈样本做固定输入对照，基线出现 1,161 个 J3 错误停点保持
+样本，候选为 0；候选仍保持原 3° 目标。此为输入重放／控制状态证据，不是反事实
+物理轨迹预测，不能据此宣称真机已经到位。旧数据的报告可只读重建，仍显示
+`leg_timeout`、`INSUFFICIENT_DATA`，不修改原 owner 结果、trace 或注释。
+
+回归覆盖正负方向、10/25 ms 周期、量化静止、真实参考偏差不恢复、许可/人工/硬保护
+停止、零回执前不得接管、近目标保持后可进入固定命令观察，以及非空真实 GUI 注释
+下的完整 24 点报告。现有 profile、重力、总助力、速度、几何范围、段时限、预算、
+watchdog 和最终 GUI 失能确认均不变；没有连接 CAN 或运行真机。框架默认调用不传
+新增关键字，保留原行为；集成须同时带入 tracker 和唯一新调用方，不复制另一套控制环。
+
+最终定向验证：
+
+```bash
+bash scripts/run_pytest.sh -q tests/test_b601_coordinated_holding.py tests/test_rebot_b601_joint_motion.py tests/test_b601_command_calibration.py tests/test_b601_holding_calibration.py tests/test_b601_calibration_session.py --tb=short
+# 652 passed
+bash scripts/run_pytest.sh -q tests/test_b601_workspace_calibration.py tests/test_b601_calibration_cycle.py tests/test_b601_automatic_calibration.py -k 'held_probe or result or gui or short_target or terminal or lifecycle or workspace' --tb=short
+# 76 passed, 287 deselected
+bash scripts/run_pytest.sh -q tests/test_control_station_boundaries.py tests/test_hardware_boundaries.py tests/test_runtime_domain_boundaries.py --tb=short
+# 46 passed
+```
+
+开发中的一次扩展兼容回归为 503 passed / 1 failed：提前排除保持记录时，曾遗漏独立
+`_admission_reason` 调用的保持拒绝合同。该实现遗漏已恢复，原失败用例在上述最终
+652 项内复测通过；不修改该用例预期，也不将早期失败检查计为整套通过证据。
+
 ### J2/J3 协同保持、单轴定力观察候选（2026-10-19）
 
 本增量基于 `82bead03e8dce586bb78524354fe117c78e75b5a`，只在显式

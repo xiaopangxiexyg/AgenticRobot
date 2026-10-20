@@ -47,8 +47,7 @@ class _CommandWindow:
 
 def _admission_reason(row: dict[str, Any], trial: dict[str, Any]) -> str | None:
     if ((row.get("torque_console") or {}).get("holding_calibration") or {}).get("enabled"):
-        # Holding/reacquisition deliberately probes static bias and preload.
-        # Keep its raw data, but never silently train the running model on it.
+        # Independent admission callers must exclude static observations too.
         return "holding_search_not_running_resistance"
     if trial["end_sec"] is None or trial["end_reason"] not in (
         "context_change",
@@ -279,6 +278,14 @@ def summarize_calibration(
             continue
         trial = trials[trial_index]
         console = row.get("torque_console")
+        if isinstance(console, dict) and (console.get("holding_calibration") or {}).get("enabled"):
+            # Static observations own distinct markers. Apply their existing
+            # nonfit exclusion before requiring running-trial identities.
+            # Retained pre-trial v1 coordinated records are nonfit too.
+            rejected["holding_search_not_running_resistance"] += 1
+            clear_window()
+            previous_feedback = None
+            continue
         marker = console.get("calibration_trial") if isinstance(console, dict) else None
         if marker is not None:
             if (

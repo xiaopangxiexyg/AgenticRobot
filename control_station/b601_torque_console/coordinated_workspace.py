@@ -537,14 +537,18 @@ class CoordinatedWorkspaceController:
         joint = task.get("joint", "joint2")
         j = int(joint[-1])-1
         moving = self._phase in {"position", "return", "sweep", "observe", "return_observe"}
+        marker = None if self._batch_id is None else {
+            "batch_id": self._batch_id,
+            "trial_id": (self._steps[self._leg_index]["trial_id"] if self._phase == "sweep" and self._leg_index < len(self._steps)
+                         else f"cw{self._index}:{self._phase}"),
+            "role": "holding_not_for_running_fit", "state": "observing" if self._probe is not None else self._phase}
         return {"time_sec": self.pose.last_time, "controller_mode": self.controller_mode, "joint_name": joint,
             "owner_ready": self._ready, "operator_armed": moving, "phase": "fault" if fault else "track" if moving else "inactive",
             "reason": fault or self._reason, "fault": fault, "qpos_rad": self.pose.q, "qvel_fd_rad_s": self.pose.raw,
             "control_qvel_rad_s": self.pose.velocity, "desired_assist_nm": command[j], "effective_assist_nm": command[j],
             "overlay_torque_nm": command, "coordinated_holding": pose_audit,
             "holding_calibration": self._holding_status(), "automatic_calibration": self._batch_status(),
-            "calibration_trial": {"batch_id": self._batch_id, "trial_id": None if not self._steps else self._steps[min(self._leg_index, len(self._steps)-1)]["trial_id"],
-                "role": "holding_not_for_running_fit", "state": "observing" if self._probe is not None else self._phase}}
+            "calibration_trial": marker}
 
     def status(self):
         with self._lock:

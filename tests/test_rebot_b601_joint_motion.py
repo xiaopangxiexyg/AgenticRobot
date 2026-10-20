@@ -158,7 +158,7 @@ def test_responsive_tracking_cannot_advance_with_unusable_motion_evidence(invali
 
 def _governor_tick(tracker, now, *, q=.006, velocity=0., raw=0., span=0.,
                    permit=True, zero=True, brake=False, support=0., evidence=True, stop_error=.003,
-                   support_span=0., raw_limit=.05):
+                   support_span=0., raw_limit=.05, **calibration):
     positions = (0., 0., q, 0., 0., 0.)
     raw_values = (0., 0., raw, 0., 0., 0.)
     velocities = (support, 0., velocity, 0., 0., 0.)
@@ -169,7 +169,7 @@ def _governor_tick(tracker, now, *, q=.006, velocity=0., raw=0., span=0.,
         stop_error_rad=stop_error, stop_velocity_rad_s=.005, stop_dwell_sec=.15,
         request_brake=brake, support_max_velocity_rad_s=support,
         stop_evidence=stop, speed_governor_permitted=permit,
-        zero_dispatch_confirmed=zero)
+        zero_dispatch_confirmed=zero, **calibration)
     tracker.record_dispatch(round(now*1000))
     return frame
 
@@ -597,6 +597,50 @@ def test_transfer_actual_reference_lag_remains_terminal_not_predictive_recovery(
     for n in range(2, 35):
         frame = _governor_tick(tracker, 1.+n*.01, q=q)
         assert frame.phase != "track" and frame.speed_governor_resume_count == 0
+
+
+@pytest.mark.parametrize("cause", ["reference_lag", "operator", "permit", "hard"])
+@pytest.mark.parametrize("at_target", [False, True])
+def test_coordinated_hold_never_recovers_terminal_stops(cause, at_target):
+    tracker = _governed_tracker(continuous_speed_limit_rad_s=.05)
+    kwargs = {"calibration_hold_enabled": True, "calibration_target_hold": True}
+    q = .05 if at_target else -.014 if cause == "reference_lag" else .047
+    if cause != "reference_lag":
+        tracker.start(now=1., q=q, target=.05)
+    trigger = {"reference_lag": {}, "operator": {"brake": True},
+               "permit": {"support": .031, "permit": False}, "hard": {"raw": .051}}[cause]
+    first = _governor_tick(tracker, 1.01, q=q, **trigger, **kwargs)
+    if cause == "reference_lag":
+        assert first.reason == "reference_lag_braking" and not first.speed_governor_active
+    for n in range(2, 35):
+        frame = _governor_tick(tracker, 1.+n*.01, q=q, **kwargs)
+        assert frame.speed_governor_resume_count == 0
+        assert frame.reason not in {"calibration_target_hold_captured", "calibration_target_tracking"}
+
+
+@pytest.mark.parametrize("probe", [False, True])
+def test_coordinated_near_target_hold_requires_actual_zero_before_retaining_goal(probe):
+    tracker = _governed_tracker(continuous_speed_limit_rad_s=.05)
+    tracker.start(now=1., q=.0475, target=.05)
+    kwargs = {"calibration_hold_enabled": True, "calibration_target_hold": True}
+    _governor_tick(tracker, 1.01, q=.0475, support=.031, zero=False, **kwargs)
+    for n in range(2, 35):
+        frame = _governor_tick(tracker, 1.+n*.01, q=.0475, zero=False, **kwargs)
+        assert frame.phase == "brake" and frame.hold_position_rad is None
+    frame = _governor_tick(tracker, 1.35, q=.0475, zero=True, **kwargs)
+    assert frame.reason == "calibration_target_hold_captured"
+    assert frame.hold_position_rad == frame.target_position_rad == .05
+    frame = _governor_tick(tracker, 1.36, q=.0475, support=.01, support_span=.001, **kwargs)
+    assert frame.reason == "calibration_target_tracking" and frame.phase == "track"
+    assert frame.requested_torque_nm > 0
+    if probe:
+        frame = _governor_tick(tracker, 1.37, q=.0475, calibration_probe_nm=.02, **kwargs)
+        assert frame.reason == "calibration_fixed_command_observation"
+        assert frame.requested_torque_nm == .02
+    else:
+        # An actual reference-lag violation still exits the active target servo.
+        frame = _governor_tick(tracker, 1.37, q=.03, **kwargs)
+        assert frame.reason == "reference_lag_braking" and frame.phase == "brake"
 
 
 def test_continuous_transfer_arrival_still_unloads_and_requires_zero_receipt():

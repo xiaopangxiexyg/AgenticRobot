@@ -72,6 +72,81 @@ def test_missing_duplicate_and_mismatched_receipts_never_commit(settings):
         core.record_dispatch(12, command)
 
 
+@pytest.mark.parametrize("period", [.01, .025])
+@pytest.mark.parametrize("direction", [-1, 1])
+def test_coordinated_quantized_stall_preserves_goal_through_predictive_stop(settings, period, direction):
+    core = runtime(settings)
+    warm(core)
+    goal = (0, 0, direction*.04, 0, 0, 0)
+    core.set_goal(goal)
+    saw_predictive_stop = saw_resume = False
+    for n in range(1, 1001):
+        # A static joint with one-count changes; no identified plant claimed.
+        q = (0, 0, direction*(n//17 % 2)*.000383496, 0, 0, 0)
+        raw = tuple((a-b)/period for a,b in zip(q, core.q))
+        dt = core.observe(1.11+n*period, q, raw)
+        command, audit = core.step(sequence=11+n, dt=dt, permitted=True)
+        selected = audit["axes"][1]
+        assert selected["reason"] != "reference_lag_braking"
+        assert selected["target_position_rad"] == goal[2]
+        saw_predictive_stop |= selected["reason"] == "reference_pacing_headroom_braking"
+        saw_resume |= selected["reason"] == "speed_governor_resumed_original_target"
+        core.record_dispatch(11+n, command)
+    assert saw_predictive_stop and saw_resume
+
+
+def test_coordinated_soft_stop_near_goal_does_not_reanchor_to_wrong_point(settings):
+    core = runtime(settings)
+    warm(core)
+    goal = (0, 0, .004, 0, 0, 0)
+    core.set_goal(goal)
+    # Support-axis motion requests the native stop; the selected axis remains
+    # short of its goal. Subsequent feedback is quiet, not a new target.
+    for n in range(1, 150):
+        q = (0, 0, .0008, min(n, 4)*.0009, 0, 0)
+        raw = tuple((a-b)/.025 for a,b in zip(q, core.q))
+        dt = core.observe(1.11+n*.025, q, raw)
+        command, audit = core.step(sequence=11+n, dt=dt, permitted=True)
+        core.record_dispatch(11+n, command)
+    assert audit["axes"][1]["q_reference_rad"] == goal[2]
+    assert core.bias[2] > 0
+
+
+@pytest.mark.parametrize("state", ["idle", "position", "observing", "failed"])
+def test_real_annotation_windows_exclude_coordinated_holds_without_report_error(state):
+    from test_b601_command_calibration import trace_fixture
+
+    from control_station.b601_torque_console.calibration_report import (
+        summarize_calibration,
+    )
+    events, rows = trace_fixture()
+    for row in rows:
+        if row.get("kind") == "active_dispatch":
+            row["torque_console"].update(
+                holding_calibration={"enabled": True},
+                automatic_calibration={"workspace": {"coordinated_holding_enabled": True}},
+                calibration_trial={"batch_id": None if state == "idle" else "batch",
+                    "trial_id": None, "role": "holding_not_for_running_fit", "state": state})
+    report = summarize_calibration(events, rows, run_id="nonfit-coordinated")
+    assert report["rejected"]["holding_search_not_running_resistance"] > 0
+    assert not report["motion_windows"]
+
+
+def test_non_holding_running_trials_still_reject_unknown_markers():
+    from test_b601_command_calibration import trace_fixture
+
+    from control_station.b601_torque_console.calibration_report import (
+        summarize_calibration,
+    )
+    events, rows = trace_fixture()
+    for row in rows:
+        if row.get("kind") == "active_dispatch":
+            row["torque_console"]["calibration_trial"] = {
+                "batch_id": None, "trial_id": None, "role": "unknown", "state": "moving"}
+    with pytest.raises(ValueError, match="invalid automatic calibration trial marker"):
+        summarize_calibration(events, rows, run_id="invalid-running")
+
+
 def test_reference_speed_is_bounded_and_changes_only_at_quiet_consumed_handoff(settings):
     core = runtime(settings)
     warm(core)
@@ -271,11 +346,20 @@ def test_coupled_partial_batch_holds_other_axis_handoffs_and_final_withdrawal(tm
 
 
 @pytest.mark.parametrize("period", [.01, .025])
-def test_full_coupled_batch_and_report_keep_handoffs_distinct_from_withdrawal(tmp_path, period):
+def test_full_coupled_batch_and_report_keep_handoffs_distinct_from_withdrawal(tmp_path, period, monkeypatch):
+    from types import SimpleNamespace
+
+    from control_station.b601_torque_console import transparency
     from control_station.b601_torque_console.automatic_report import (
         build_automatic_report,
     )
     r = replay(tmp_path, initial_q=(0, .01, .01, 0, 0, 0))
+    monkeypatch.setattr(transparency, "time", SimpleNamespace(monotonic=lambda: r.now+.002))
+    journal = transparency.TransparencyAssessment(tmp_path / "b601_owner.transparency.jsonl", automatic=True)
+    def snapshot():
+        return {**r.controller.status(), "feedback_age_sec": 0.0}
+    journal.record({"action": "context", "human_intervention": False}, snapshot())
+    assert snapshot()["calibration_trial"] is None
     r.controller.submit("arm", now_sec=r.now)
     handoffs = []
     for _ in range(50000):
@@ -284,6 +368,7 @@ def test_full_coupled_batch_and_report_keep_handoffs_distinct_from_withdrawal(tm
             break
         old = len(r.controller._coordinated._acquisitions)
         coupled_tick(r, period=period)
+        journal.observe(snapshot())
         assert sum(abs(v) for v in r.delta) <= 1+1e-9
         if old != len(r.controller._coordinated._acquisitions):
             handoffs.append(tuple(r.delta))
@@ -295,14 +380,15 @@ def test_full_coupled_batch_and_report_keep_handoffs_distinct_from_withdrawal(tm
     assert r.delta == r.last_kd == ZERO
     assert r.controller.cycle_disable_confirmation_ready
     assert all(abs(r.q[i]-.01) < .003 for i in (1, 2))
+    journal.close()
     (tmp_path / "b601_owner.debug.jsonl").write_text("\n".join(json.dumps(x) for x in [*r.records, result])+"\n")
-    (tmp_path / "b601_owner.transparency.jsonl").write_text("")
     report = build_automatic_report(tmp_path)
     assert report["holding_calibration"]["verified_points"] == 24
     assert all(not p["withdrawal_confirmed"] for p in report["holding_calibration"]["points"])
     assert report["workspace"]["gravity_observations"] == []
     assert len(report["workspace"]["coordinated_pose_observations"]) == 2
     assert report["cycle"]["zero_assist_base_damping_confirmed"]
+    assert (tmp_path / "b601_owner.transparency.jsonl").stat().st_size > 0
     for point in report["holding_calibration"]["points"]:
         for obs in point["observations"]:
             if obs["outcome"] != "stationary":
