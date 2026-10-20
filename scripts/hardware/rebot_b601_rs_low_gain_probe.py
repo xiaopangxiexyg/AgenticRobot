@@ -149,6 +149,7 @@ import json
 import math
 import os
 import pickle
+import queue
 import signal
 import sys
 import tempfile
@@ -7416,17 +7417,100 @@ def _read_admitted_control_feedback(
     )
 
 
+class _QueuedTraceStream:
+    """One bounded FIFO writer; the control thread never waits for file I/O.
+
+    Only immutable encoded strings cross this boundary, never control state or
+    actuator access. Overflow/write failure is visible to the existing trace
+    fault path. The writer owns the stream and drains only after motor cleanup.
+    """
+
+    def __init__(self, stream: TextIO, *, capacity: int = 256) -> None:
+        if type(capacity) is not int or capacity < 1:
+            raise ValueError("trace queue capacity must be a positive integer")
+        self._stream = stream
+        self._queue: queue.Queue[str] = queue.Queue(maxsize=capacity)
+        self._closing = threading.Event()
+        self.error: str | None = None
+        self.submitted = self.written = 0
+        self._worker = threading.Thread(target=self._run, name="b601-trace-writer", daemon=True)
+        try:
+            self._worker.start()
+        except RuntimeError:
+            stream.close()
+            raise
+
+    def write(self, text: str) -> int:
+        if not isinstance(text, str):
+            raise TypeError("trace writer accepts only encoded strings")
+        if self.error is not None or self._closing.is_set():
+            raise OSError(self.error or "trace writer is closed")
+        try:
+            self._queue.put_nowait(text)
+        except queue.Full as exc:
+            self.error = "OSError: trace writer queue overflow"
+            raise OSError("trace writer queue overflow") from exc
+        self.submitted += 1
+        return len(text)
+
+    def flush(self) -> None:
+        # Each FIFO item is flushed by the writer. This is not a disk receipt.
+        if self.error is not None:
+            raise OSError(self.error)
+
+    def _run(self) -> None:
+        try:
+            while not self._closing.is_set() or not self._queue.empty():
+                try:
+                    text = self._queue.get(timeout=.02)
+                except queue.Empty:
+                    continue
+                self._stream.write(text)
+                self._stream.flush()
+                self.written += 1
+        except (OSError, TypeError, ValueError) as exc:
+            self.error = self.error or f"{type(exc).__name__}: {exc}"
+        finally:
+            try:
+                self._stream.close()
+            except (OSError, TypeError, ValueError) as exc:
+                self.error = self.error or f"{type(exc).__name__}: {exc}"
+
+    def close(self, *, timeout_sec: float = 5.) -> None:
+        self._closing.set()
+        self._worker.join(timeout=timeout_sec)
+        if self._worker.is_alive():
+            self.error = self.error or "OSError: trace writer drain timeout"
+
+    def status(self) -> dict[str, object]:
+        return {"mode": "bounded_fifo_file_writer", "capacity_records": self._queue.maxsize,
+            "submitted_records": self.submitted, "written_records": self.written,
+            "unconfirmed_records": self.submitted-self.written,
+            "drain_complete": not self._worker.is_alive() and self.submitted == self.written and self.error is None,
+            "error": self.error, "flush_semantics": "file_flush_not_fsync_or_physical_durability"}
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_exc):
+        self.close()
+
+
 class _DynamicsTrace:
-    """Best-effort diagnostic sink; a storage fault cannot change motor control."""
+    """Encoded diagnostic sink; capture failures remain visible to the owner."""
 
     def __init__(self, stream: TextIO, gc_observer: _ProbeGCObserver | None = None) -> None:
         self.stream = stream
         self.gc_observer = gc_observer
         self.sample_count = 0
-        self.error: str | None = None
+        self._error: str | None = None
         self.last_record_timing: dict[str, object] | None = None
         self.last_feedback_read_diagnostics: _ProbeFeedbackTiming | None = None
         self.gc_observation_end: dict[str, object] | None = None
+
+    @property
+    def error(self) -> str | None:
+        return self._error or getattr(self.stream, "error", None)
 
     def finish_control_observation(self, *, cleanup_errors: Sequence[str]) -> None:
         """Close the online observation before bulk post-cleanup evaluation.
@@ -7469,12 +7553,13 @@ class _DynamicsTrace:
             timing.mark("flush")
             self.sample_count += 1
         except (OSError, TypeError, ValueError) as exc:
-            self.error = f"{type(exc).__name__}: {exc}"
+            self._error = f"{type(exc).__name__}: {exc}"
         finally:
             self.last_record_timing = {
                 "kind": kind,
                 "sequence": fields.get("sequence"),
                 "completed": self.error is None,
+                "write_scope": "fifo_enqueue_not_disk_completion" if isinstance(self.stream, _QueuedTraceStream) else "inline_file_write",
                 **timing.snapshot(),
             }
 
@@ -13399,7 +13484,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         gc_observer = None
         if debug_trace_path is not None:
             debug_trace_path.parent.mkdir(parents=True, exist_ok=True)
-            debug_stream = stack.enter_context(debug_trace_path.open("x", encoding="utf-8"))
+            debug_stream = stack.enter_context(_QueuedTraceStream(debug_trace_path.open("x", encoding="utf-8")))
             gc_observer = stack.enter_context(_ProbeGCObserver())
             debug_trace = _DynamicsTrace(debug_stream, gc_observer=gc_observer)
         print(
@@ -13547,10 +13632,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
         if debug_trace is not None:
             gc_observer.close()
+            # run_probe has already completed its hardware cleanup. Flush the
+            # queued final acquisition record before reporting disk completion.
+            debug_trace.stream.close()
             payload["debug_dynamics_trace"] = {
                 "path": str(debug_trace_path),
                 "sample_count": debug_trace.sample_count,
                 "error": debug_trace.error,
+                "writer": debug_trace.stream.status(),
                 "last_feedback_read_diagnostics": (
                     debug_trace.last_feedback_read_diagnostics.snapshot()
                     if debug_trace.last_feedback_read_diagnostics is not None else None

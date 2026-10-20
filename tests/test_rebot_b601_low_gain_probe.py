@@ -5359,6 +5359,131 @@ def test_trace_timing_retains_origin_sequence_without_changing_record_payload():
     assert previous["completed"] is True
 
 
+def test_queued_trace_keeps_control_records_nonblocking_ordered_and_immutable():
+    import threading
+
+    entered, release = threading.Event(), threading.Event()
+    rows = []
+
+    class BlockedStream:
+        def write(self, text):
+            entered.set()
+            if not release.wait(2):
+                raise OSError("test writer was not released")
+            rows.append(text)
+
+        def flush(self):
+            pass
+
+        def close(self):
+            pass
+
+    stream = probe._QueuedTraceStream(BlockedStream())
+    trace = probe._DynamicsTrace(stream)
+    try:
+        values = [0]
+        trace.record("frame", sequence=0, values=values)
+        assert entered.wait(1)
+        values.append(99)
+        # The disk writer remains blocked throughout these owner submissions.
+        for sequence in range(1, 65):
+            trace.record("frame", sequence=sequence)
+        assert trace.error is None
+        assert stream.submitted == trace.sample_count == 65
+        assert stream.written == 0
+        assert not release.is_set()
+    finally:
+        release.set()
+        stream.close()
+    decoded = [json.loads(row) for row in rows]
+    assert [row["sequence"] for row in decoded] == list(range(65))
+    assert decoded[0]["values"] == [0]
+    assert stream.status()["drain_complete"]
+    assert stream.status()["unconfirmed_records"] == 0
+
+
+def test_queued_trace_overflow_is_visible_without_waiting_or_claiming_capture():
+    import threading
+
+    entered, release = threading.Event(), threading.Event()
+
+    class BlockedStream:
+        def write(self, _text):
+            entered.set()
+            release.wait(2)
+
+        def flush(self):
+            pass
+
+        def close(self):
+            pass
+
+    stream = probe._QueuedTraceStream(BlockedStream(), capacity=1)
+    trace = probe._DynamicsTrace(stream)
+    try:
+        trace.record("frame", sequence=1)
+        assert entered.wait(1)
+        trace.record("frame", sequence=2)
+        trace.record("frame", sequence=3)
+        assert "queue overflow" in trace.error
+        assert trace.sample_count == stream.submitted == 2
+    finally:
+        release.set()
+        stream.close()
+    assert not stream.status()["drain_complete"]
+    assert stream.written == 2
+
+
+def test_queued_trace_background_error_is_visible_before_next_owner_record():
+    class BrokenStream:
+        def write(self, _text):
+            raise OSError("disk full")
+
+        def close(self):
+            pass
+
+    stream = probe._QueuedTraceStream(BrokenStream())
+    trace = probe._DynamicsTrace(stream)
+    trace.record("frame", sequence=1)
+    stream.close()
+    assert trace.error == "OSError: disk full"
+    assert stream.status()["unconfirmed_records"] == 1
+    assert not stream.status()["drain_complete"]
+    trace.record("frame", sequence=2)
+    assert stream.submitted == 1
+
+
+def test_queued_trace_close_timeout_does_not_close_an_inflight_stream():
+    import threading
+
+    entered, release, closed = threading.Event(), threading.Event(), threading.Event()
+
+    class BlockedStream:
+        def write(self, _text):
+            entered.set()
+            release.wait(2)
+
+        def flush(self):
+            pass
+
+        def close(self):
+            closed.set()
+
+    stream = probe._QueuedTraceStream(BlockedStream())
+    try:
+        stream.write('{}\n')
+        assert entered.wait(1)
+        stream.close(timeout_sec=.001)
+        assert "drain timeout" in stream.error
+        assert not closed.is_set()
+        assert stream.status()["unconfirmed_records"] == 1
+    finally:
+        release.set()
+        stream.close()
+    assert closed.is_set()
+    assert not stream.status()["drain_complete"]
+
+
 @pytest.mark.parametrize("handled_error", [False, True])
 def test_debug_trace_main_writes_separate_jsonl_without_hardware(
     monkeypatch: pytest.MonkeyPatch,
@@ -5406,6 +5531,8 @@ def test_debug_trace_main_writes_separate_jsonl_without_hardware(
     trace_path = tmp_path / "result.debug.jsonl"
     assert result["debug_dynamics_trace"]["path"] == str(trace_path)
     assert result["debug_dynamics_trace"]["sample_count"] == 1
+    assert result["debug_dynamics_trace"]["writer"]["drain_complete"]
+    assert result["debug_dynamics_trace"]["writer"]["written_records"] == 1
     assert result["debug_dynamics_trace"]["gc_observation"]["registered_after_cleanup"] is False
     assert result["debug_dynamics_trace"]["gc_observation"]["settings_at_start"]["enabled"] == probe.gc.isenabled()
     assert result["debug_dynamics_trace"]["last_feedback_read_diagnostics"]["stages"]["backend_poll"]["interval_count"] == 1
