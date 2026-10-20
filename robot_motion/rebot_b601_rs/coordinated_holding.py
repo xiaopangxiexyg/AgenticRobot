@@ -182,7 +182,12 @@ class CoordinatedPoseHolding:
             proposed_bias = [0.0] * 6
             demand = [0.0] * 6
             for i, frame in zip(AXES, frames, strict=True):
-                demand[i] = frame.requested_torque_nm if frame.phase == "brake" else -self.motion.braking_kd_nm_s_per_rad * self.velocity[i]
+                # Normal arrival can still request position effort while a
+                # peer needs an all-axis zero receipt. Drain that effort too;
+                # otherwise the peer cannot leave its genuine soft brake.
+                demand[i] = (frame.requested_torque_nm
+                             if frame.phase == "brake" and frame.reason != "target_reached_braking"
+                             else -self.motion.braking_kd_nm_s_per_rad * self.velocity[i])
         norm = sum(abs(v) for v in demand)
         scale = min(1.0, self.config.total_assist_cap_nm / norm) if norm else 1.0
         if scale < 1:

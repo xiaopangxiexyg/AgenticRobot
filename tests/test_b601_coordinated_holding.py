@@ -112,6 +112,60 @@ def test_coordinated_soft_stop_near_goal_does_not_reanchor_to_wrong_point(settin
     assert core.bias[2] > 0
 
 
+@pytest.mark.parametrize("moving_axis", [1, 2])
+@pytest.mark.parametrize("direction", [-1, 1])
+@pytest.mark.parametrize("conditioned_tail", [False, True])
+def test_50txgbn2_peer_arrival_effort_cannot_deadlock_the_full_zero_receipt(
+    settings, moving_axis, direction, conditioned_tail,
+):
+    core = runtime(settings)
+    warm(core)
+    peer = 3-moving_axis
+    goal = list(ZERO)
+    goal[moving_axis], goal[peer] = direction*.04, -direction*.0017
+    core.set_goal(goal)
+    saw_conflict = saw_wait = resumed = False
+    for n in range(1, 100):
+        q = list(ZERO)
+        # Two early-speed steps trigger one tracker, but do not cross the
+        # peer's support soft-speed ceiling. Remaining feedback is quiet.
+        q[moving_axis] = direction*min(n, 2)*.0008
+        raw = tuple((a-b)/.025 for a, b in zip(q, core.q))
+        dt = core.observe(1.11+n*.025, q, raw)
+        command, audit = core.step(sequence=n+11, dt=dt, permitted=True)
+        moving, support = audit["axes"][moving_axis-1], audit["axes"][peer-1]
+        saw_conflict |= (audit["braking"] and support["reason"] == "target_reached_braking"
+                         and abs(support["requested_torque_nm"]) > .001)
+        saw_wait |= moving["reason"] == "speed_governor_waiting_for_zero_dispatch"
+        if moving["reason"] == "speed_governor_resumed_original_target":
+            assert not conditioned_tail or n > 30
+            resumed = True
+        actual = list(command)
+        if conditioned_tail and n <= 30:
+            actual[peer] = direction*.01
+        core.record_dispatch(n+11, actual)
+        assert core.goal == tuple(goal)
+        assert sum(abs(v) for v in command) <= core.config.total_assist_cap_nm+1e-9
+        if resumed:
+            break
+    assert saw_conflict and resumed
+    if conditioned_tail:
+        assert saw_wait
+
+
+def test_normal_arrival_without_a_coordinated_stop_keeps_position_effort(settings):
+    core = runtime(settings)
+    warm(core)
+    core.set_goal((0, .04, -.0017, 0, 0, 0))
+    for n in range(1, 30):
+        dt = core.observe(1.11+n*.025, ZERO, ZERO)
+        command, audit = core.step(sequence=n+11, dt=dt, permitted=True)
+        core.record_dispatch(n+11, command)
+        assert not audit["braking"]
+    assert audit["axes"][1]["reason"] == "target_reached_braking"
+    assert command[2] < -.01
+
+
 @pytest.mark.parametrize("state", ["idle", "position", "observing", "failed"])
 def test_real_annotation_windows_exclude_coordinated_holds_without_report_error(state):
     from test_b601_command_calibration import trace_fixture

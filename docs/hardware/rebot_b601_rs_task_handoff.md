@@ -18,6 +18,40 @@
   基线中已接入的自观测过滤、夹爪等扩展保持原显式启用方式，默认 15 mm／v1／严格碰撞
   行为不随硬件迁移切换。物理验证仍由操作者运行，不把离线回归当成硬件有效性证明。
 
+### 协同制动与普通到位力的归零回执冲突（2026-10-20）
+
+本增量基于 `8f4b98e8d970c69184e9c5bacaaab4e9f6edd862`。记录
+`j2-j3-holding-adaptive-acceptance/b601-owner-50txgbn2` 在 J3 完成定位后、首段
+J2 定位时停止，约 25.233 秒报 `braking_timeout_assist_withdrawn`。没有进入保持
+搜索、没有完成位姿驻留或保持标定点。两轴 L1 命令峰值约 0.687/1.0 N·m，
+协调及最终力矩／变化率限幅未触发；最终六轴 safe_stop 完整、无 cleanup error。
+
+J2 触发正常软速度制动后约 0.45 秒已请求零命令，但 J3 的原生阶段仍是
+`target_reached_braking`。该名字虽含 braking，采集模式下实际仍输出位置到位力，
+约 −0.02057 N·m。旧协同合成保留所有 brake 阶段的原生需求，导致这项非零命令
+一直存在；J2 却要求完整六轴零命令回执才能恢复，最终耗尽原 6.591 秒制动时限。
+这不是把时限加长就能消除的问题，也不是硬速度或力矩上限触发。
+
+修复仅在已经存在的 coordinated braking 分支内，把另一轴的普通
+`target_reached_braking` 当作正常到位需求暂时退出，使用原制动阻尼／变化率撤掉
+该位置项。真实制动器本身的需求照旧；完整零命令、六轴停稳和原生恢复门仍保留。
+无协同制动时，正常到位非零维持力不变。重力、driver Kd、原目标、预算、profile、
+watchdog、最终包络、共享控制和最终人工确认均不改。
+
+同输入对照使用原 CLI/profile、截至原 guard 的反馈和合成完整回执：旧版本在原
+第 1097 行、25.233 秒复现超时，J2 无恢复；候选约 19.199 秒恢复原 3° 目标，
+回放至原故障行不再报错。此后物理运动没有被执行，不能把固定反馈当作真机反事实。
+新增九个原生控制用例覆盖 J2/J3 互换、正负方向、最终调理尾量未归零时禁止恢复，
+以及没有全局制动时仍保留普通到位力。
+`bash scripts/run_pytest.sh -q tests/test_b601_coordinated_holding.py
+tests/test_rebot_b601_joint_motion.py tests/test_b601_workspace_calibration.py --tb=short`
+最终 **508 passed**；Ruff 和 diff 检查通过。原命令加 `--preflight-only`、使用 owner
+依赖环境的预检 PASS，保存在
+`hardware-tuning/j2-j3-brake-zero-preflight-DxrGY1/b601_owner.json`，
+`can_opened=false / motor_command_sent=false`。
+没有连接 CAN、启动真机、修改原始日志、应用模型、合并或推送；实际约 39.946 Hz
+及既有几何／连续平滑性问题仍未解决。
+
 ### 同点保持复测、内部维持值与显式 50% 采集余量（2026-10-20）
 
 本增量基于 `59dbd875e87aaa605f42d5072856efb3fb9bbb64`。记录
