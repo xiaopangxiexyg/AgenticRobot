@@ -100,6 +100,8 @@ def build_automatic_report(run_dir: Path) -> dict:
     started = None
     trials = []
     dispatch_rejection = None
+    first_guard = None
+    cleanup_boundary = None
     stages, observations, last_workspace = [], [], None
     for row in _jsonl(trace):
         if row.get("kind") == "automatic_calibration_started":
@@ -114,6 +116,10 @@ def build_automatic_report(run_dir: Path) -> dict:
             stages.append({k: v for k, v in row.items() if k in {"task", "result", "final_qpos_rad", "partial_stage"}})
         elif row.get("kind") == "workspace_gravity_observation":
             observations.append({k: v for k, v in row.items() if k != "gc_observation"})
+        elif row.get("kind") == "torque_console_guard" and first_guard is None:
+            first_guard = {k: row.get(k) for k in ("reason", "joint_name", "time_sec", "motion_fault")}
+        elif row.get("kind") == "control_observation_complete":
+            cleanup_boundary = {k: row.get(k) for k in ("boundary", "recorded_monotonic_sec", "cleanup_errors")}
         elif row.get("kind") == "active_dispatch":
             workspace = ((row.get("torque_console") or {}).get("automatic_calibration") or {}).get("workspace")
             if workspace is not None:
@@ -127,7 +133,8 @@ def build_automatic_report(run_dir: Path) -> dict:
             ):
                 raise ValueError("conflicting automatic results")
             result = row
-    if result is None:
+    recovered = result is None
+    if recovered:
         if started is None:
             raise ValueError("no automatic acquisition record")
         result = {
@@ -155,6 +162,12 @@ def build_automatic_report(run_dir: Path) -> dict:
                 {**leg, "joint_name": stage["task"]["joint"], "pose_index": stage["task"]["pose"]}
                 for stage in acquisitions for leg in stage["result"]["completed_legs"]]}
     report = summarize_automatic_acquisition(result)
+    if recovered:
+        report["recovery"] = {
+            "terminal_record_missing": True, "first_guard": first_guard,
+            "control_cleanup_boundary": cleanup_boundary,
+            "semantics": "recorded_stages_only; missing_terminal_result_is_not_success_or_disable_receipt",
+        }
     # Do not reinterpret old records without an explicit acquisition outcome.
     report["acquisition_outcome"] = result.get("outcome")
     report["cycle"] = result.get("cycle")
@@ -239,13 +252,18 @@ def build_automatic_report(run_dir: Path) -> dict:
     return report
 
 
-def save_automatic_report(run_dir: Path) -> Path:
-    """Run only after the owner and its journal writers have closed."""
+def save_automatic_report(run_dir: Path, *, output_dir: Path | None = None) -> Path:
+    """Read closed journals; optionally recover into a separate fresh directory.
+
+    Source paths and failure semantics remain those of the original run.
+    Neither publication path may replace a retained report.
+    """
     report = build_automatic_report(run_dir)
-    output = run_dir / "automatic_calibration_report.json"
+    destination = run_dir if output_dir is None else output_dir
+    output = destination / "automatic_calibration_report.json"
     temporary = None
     try:
-        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=run_dir,
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=destination,
                 prefix=".automatic-report.", suffix=".tmp", delete=False) as stream:
             temporary = Path(stream.name)
             json.dump(report, stream, indent=2, ensure_ascii=False, allow_nan=False)

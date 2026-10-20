@@ -152,6 +152,9 @@ def test_workspace_config_rejects_unbounded_or_outside_targets(values):
 
 
 def test_workspace_native_both_axis_sweeps_segmented_positioning_return_and_trace(settings, tmp_path):
+    from control_station.b601_torque_console.automatic_report import (
+        save_automatic_report,
+    )
     replay = replay_workspace(settings)
     origin = replay.q
     replay.begin()
@@ -190,7 +193,11 @@ def test_workspace_native_both_axis_sweeps_segmented_positioning_return_and_trac
     assert report["gravity_identification"]["auto_apply"] is False
     # Missing final serialization must not erase already committed stage data.
     (tmp_path / "b601_owner.debug.jsonl").write_text(
-        "".join(json.dumps(row) + "\n" for row in rows))
+        "".join(json.dumps(row) + "\n" for row in [*rows,
+            {"kind": "torque_console_guard", "reason": "coordinated_reference_lag_stop",
+             "joint_name": "joint2", "time_sec": 10., "motion_fault": {"brake_trigger_lag_rad": -.019647}},
+            {"kind": "control_observation_complete", "boundary": "after_control_cleanup_and_backend_close_attempt",
+             "recorded_monotonic_sec": 11., "cleanup_errors": []}]))
     recovered = build_automatic_report(tmp_path)
     assert recovered["acquisition_complete"] is False
     assert recovered["acquisition_outcome"]["reason"] == "terminal_record_missing"
@@ -199,6 +206,22 @@ def test_workspace_native_both_axis_sweeps_segmented_positioning_return_and_trac
     assert len(recovered["workspace"]["gravity_observations"]) == 2
     assert len(recovered["workspace"]["acquisitions"]) == 2
     assert recovered["gravity_identification"]["auto_apply"] is False
+    assert recovered["recovery"]["first_guard"]["reason"] == "coordinated_reference_lag_stop"
+    assert recovered["recovery"]["first_guard"]["motion_fault"]["brake_trigger_lag_rad"] == -.019647
+    assert recovered["recovery"]["control_cleanup_boundary"]["cleanup_errors"] == []
+    # Recovery output must not mutate or write into the retained source run.
+    source_before = {p.name: p.read_bytes() for p in tmp_path.iterdir() if p.is_file()}
+    destination = tmp_path / "fresh-recovery"
+    destination.mkdir()
+    report_path = save_automatic_report(tmp_path, output_dir=destination)
+    exported = json.loads(report_path.read_text())
+    assert exported == json.loads(json.dumps(recovered))
+    assert exported["source_trace"] == str(tmp_path / "b601_owner.debug.jsonl")
+    assert exported["acquisition_complete"] is False
+    assert {p.name: p.read_bytes() for p in tmp_path.iterdir() if p.is_file()} == source_before
+    with pytest.raises(FileExistsError):
+        save_automatic_report(tmp_path, output_dir=destination)
+    assert json.loads(report_path.read_text()) == exported
 
 
 def test_workspace_native_gui_wrapper_advances_between_pose_centres(settings):

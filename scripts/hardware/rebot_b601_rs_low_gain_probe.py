@@ -6959,6 +6959,28 @@ def _finalize_automatic_result(payload: dict, acquisition: dict) -> int:
     return 2 if payload.get("status") == "ERROR" else 0 if payload.get("status") == "OK" else 1
 
 
+def _automatic_execution_status(stop_reason, cleanup_ok, commands_sent):
+    if not cleanup_ok or commands_sent <= 0:
+        return "FAILED"
+    if stop_reason in {"explicit_full_disable", "operator_interrupt"}:
+        return "STOPPED_BY_OPERATOR"
+    return "COMPLETED" if stop_reason is None else "FAILED"
+
+
+def _workspace_analysis_samples(samples):
+    """Decode each rich frame once for the applicable workspace summaries.
+
+    Keep the original archive for lossless export. Workspace mode is hold,
+    with no shared/cartesian assist evaluator; those evaluators return N/A.
+    """
+    fields = (
+        "elapsed_sec", "startup_state", "qpos_rad", "requested_tau_nm",
+        "conditioned_tau_nm", "torque_limited", "slew_limited",
+        "boundary_normalized_joint_names",
+    )
+    return [{key: sample[key] for key in fields if key in sample} for sample in samples]
+
+
 def _write_result_json(payload: dict[str, object], output: Path) -> None:
     """Atomically replace only this run's primary result, after control cleanup."""
     output = output.expanduser().resolve()
@@ -8592,6 +8614,7 @@ def run_probe(
     debug_trace: _DynamicsTrace | None = None,
     torque_console: _TorqueConsoleController | None = None,
     console_stop_binding: Callable[[Callable[[str], None] | None], None] | None = None,
+    post_cleanup_checkpoint: Callable[[dict[str, object]], None] | None = None,
 ) -> dict[str, object]:
     """Run the guarded active probe; callers must provide explicit authority."""
 
@@ -11477,6 +11500,44 @@ def run_probe(
     if debug_trace is not None:
         debug_trace.finish_control_observation(cleanup_errors=cleanup_errors)
 
+    # This boundary precedes all sample decoding and report work. Even a
+    # subsequent interrupt must leave the actual stop and cleanup evidence.
+    if (post_cleanup_checkpoint is not None and torque_console is not None
+        and getattr(args, "torque_console_auto_calibration_profile", None) is not None):
+        checkpoint_frequency = ledger.summarize(target_hz=args.rate_hz)
+        checkpoint = {
+            "status": "ERROR" if primary_error is not None else "FAIL",
+            "execution_status": "ERROR" if primary_error is not None else _automatic_execution_status(
+                stop_reason, device_cleanup_confirmed and not cleanup_errors, commands_sent),
+            "mode": args.mode, "stop_reason": stop_reason,
+            "acceptance_status": "NOT_EVALUATED", "hardware_acceptance": "NOT_CLAIMED",
+            "commands_sent": commands_sent, "initial_qpos_rad": initial_q,
+            "final_qpos_rad": final_q, "cleanup": cleanup_record,
+            "cleanup_errors": tuple(cleanup_errors),
+            "cleanup_receipt": _mode_receipt_payload(cleanup_receipt),
+            "protective_hold": {"latched": protective_hold_latched,
+                "entry_reason": protective_hold_entry_reason,
+                "degraded": dict(protective_hold_degraded)},
+            "frequency": {event: stats.as_dict() for event, stats in checkpoint_frequency.items()},
+            "frequency_acceptance": {event: evaluate_frequency_target(
+                checkpoint_frequency[event], minimum_rate_ratio=.95,
+                maximum_deadline_miss_ratio=.02).as_dict()
+                for event in ("feedback", "compute", "tx")},
+            "sample_storage": {**samples.diagnostics(), "sample_archive_status": "NOT_STARTED"},
+            "postprocessing": {"status": "PENDING", "stage": "summary"},
+            "automatic_calibration_report_status": "PENDING",
+        }
+        if primary_error is not None:
+            checkpoint["error"] = str(primary_error)
+        try:
+            checkpoint["automatic_calibration"] = torque_console.result_record()
+            _finalize_automatic_result(checkpoint, checkpoint["automatic_calibration"])
+        except (OSError, TypeError, ValueError, KeyError) as exc:
+            checkpoint.update(status="ERROR", execution_status="ERROR",
+                automatic_calibration_export_error=f"{type(exc).__name__}: {exc}")
+            checkpoint.setdefault("error", checkpoint["automatic_calibration_export_error"])
+        post_cleanup_checkpoint(checkpoint)
+
     if calibration_capture is not None and calibration_capture.state in (
         "SETTLING",
         "RECORDING",
@@ -11493,15 +11554,17 @@ def run_probe(
             detail += "; cleanup: " + "; ".join(cleanup_errors)
         raise LowGainProbeError(detail, cleanup=cleanup_record) from primary_error
 
-    # Restore once, only after the existing owner cleanup. Repeated lazy
-    # archive traversal otherwise unpickles the entire history for each
-    # evaluator and allocates diagnostic garbage without an online drain.
+    # Decode summary fields once, only after the existing owner cleanup.
+    # Keep the rich archive for lossless export; repeated summary traversal
+    # must not repeatedly unpickle the entire diagnostic history.
     sample_storage = samples.diagnostics()
     workspace_mode = (torque_console is not None
         and torque_console.status().get("automatic_calibration", {}).get("operation_mode") == "workspace")
     result_samples = samples if workspace_mode else samples.materialize()
+    analysis_samples = _workspace_analysis_samples(result_samples) if workspace_mode else result_samples
     if workspace_mode:
         sample_storage["result_materialization"] = "streamed_after_cleanup_without_bulk_expansion"
+        sample_storage["summary_materialization"] = "one_pass_compact_fields; original_archive_retained"
     frequency = ledger.summarize(target_hz=args.rate_hz)
     required_events = ("feedback", "compute", "tx")
     frequency_acceptance = {
@@ -11539,7 +11602,7 @@ def run_probe(
     startup_replay_acceptance = evaluate_startup_replay_capture(
         startup_replay_capture,
         final_qpos_rad=final_q,
-        sample_count=len(result_samples),
+        sample_count=len(analysis_samples),
     )
     calibration_passed = calibration_acceptance["status"] in (
         "PASS",
@@ -11561,7 +11624,7 @@ def run_probe(
         step_rad=args.step_rad,
         step_direction=args.step_direction,
         initial_qpos_rad=initial_q,
-        samples=result_samples,
+        samples=analysis_samples,
         active_joint_names=active_joint_names,
     )
     response_passed = bool(slow_step_response["passed"])
@@ -11575,7 +11638,7 @@ def run_probe(
     # Historical decoding/evaluation must not delay the protective-hold entry.
     assist_commissioning_response = evaluate_assist_commissioning_response(
         session=shared_control_commissioning,
-        samples=result_samples,
+        samples=analysis_samples,
         active_joint_names=active_joint_names,
         minimum_response_rad=args.assist_min_response_rad,
         maximum_response_ratio=args.assist_max_response_ratio,
@@ -11588,7 +11651,7 @@ def run_probe(
     )
     cartesian_assist_commissioning_response = evaluate_cartesian_assist_commissioning_response(
         session=cartesian_assist_commissioning,
-        samples=result_samples,
+        samples=analysis_samples,
         minimum_response_m=args.cartesian_assist_min_response_m,
         maximum_response_ratio=args.cartesian_assist_max_response_ratio,
         maximum_lateral_drift_m=args.cartesian_assist_max_lateral_drift_m,
@@ -11609,22 +11672,22 @@ def run_probe(
         and cartesian_assist_commissioning_passed
     )
     max_abs_requested = max(
-        (max(abs(value) for value in sample["requested_tau_nm"]) for sample in result_samples),
+        (max(abs(value) for value in sample["requested_tau_nm"]) for sample in analysis_samples),
         default=0.0,
     )
     max_abs_conditioned = max(
-        (max(abs(value) for value in sample["conditioned_tau_nm"]) for sample in result_samples),
+        (max(abs(value) for value in sample["conditioned_tau_nm"]) for sample in analysis_samples),
         default=0.0,
     )
     torque_conditioning_summary = summarize_torque_conditioning(
-        result_samples,
+        analysis_samples,
         absolute_limits_nm=torque_limits,
     )
     startup_diagnostics = summarize_startup_diagnostics(
         pre_enable_qpos_rad=pre_enable_q,
         lock_reference_qpos_rad=initial_q,
         pre_control_observations=startup_diagnostic_observations,
-        samples=result_samples,
+        samples=analysis_samples,
     )
     if interactive_pose_axis_guide is not None:
         operator_guidance_payload: dict[str, object] = {
@@ -11707,11 +11770,9 @@ def run_probe(
         }
     return {
         "status": "OK" if acceptance_passed else "FAIL",
-        **({"execution_status": (
-            "STOPPED_BY_OPERATOR" if stop_reason in {"explicit_full_disable", "operator_interrupt"}
-            and cleanup_ok and commands_sent > 0 else
-            "COMPLETED" if stop_reason is None and cleanup_ok and commands_sent > 0 else "FAILED"
-        )} if getattr(args, "torque_console_auto_calibration_profile", None) is not None else {}),
+        **({"execution_status": _automatic_execution_status(stop_reason, cleanup_ok, commands_sent),
+            "postprocessing": {"status": "COMPLETE", "stage": "summary"}}
+            if getattr(args, "torque_console_auto_calibration_profile", None) is not None else {}),
         "mode": args.mode,
         "confirmation": CONFIRMATION,
         "channel": config.channel,
@@ -12391,12 +12452,12 @@ def run_probe(
             "interval_semantics": "inclusive_lower_exclusive_upper",
             "applied_sample_count": sum(
                 bool(sample.get("boundary_normalized_joint_names"))
-                for sample in result_samples
+                for sample in analysis_samples
             ),
             "applied_joint_counts": {
                 joint_name: sum(
                     joint_name in sample.get("boundary_normalized_joint_names", ())
-                    for sample in result_samples
+                    for sample in analysis_samples
                 )
                 for joint_name in _FEEDBACK_BOUNDARY_NORMALIZATION_JOINTS
             },
@@ -13345,6 +13406,16 @@ def main(argv: Sequence[str] | None = None) -> int:
             f"[B601] run started mode={args.mode} pid={os.getpid()}",
             flush=True,
         )
+        cleanup_checkpoint = None
+
+        def save_cleanup_checkpoint(checkpoint):
+            nonlocal cleanup_checkpoint
+            checkpoint = {**checkpoint, "runtime_log_path": str(runtime_log_path),
+                "debug_dynamics_trace": {"path": str(debug_trace_path)}}
+            _write_result_json(checkpoint, args.output)
+            cleanup_checkpoint = checkpoint
+            _operator_notice(f"[B601] cleanup result saved: {args.output}; summarizing offline (no motor control). Ctrl-C retains this checkpoint.")
+
         try:
             torque_console = None
             if args.torque_console:
@@ -13423,9 +13494,23 @@ def main(argv: Sequence[str] | None = None) -> int:
                 console_stop_binding=(
                     console_server.set_stop_handler if torque_console is not None else None
                 ),
+                post_cleanup_checkpoint=save_cleanup_checkpoint,
             )
+        except KeyboardInterrupt:
+            if cleanup_checkpoint is None:
+                raise
+            cleanup_checkpoint["postprocessing"] = {
+                "status": "INTERRUPTED", "stage": "summary",
+                "reason": "operator_interrupted_after_control_cleanup",
+            }
+            _write_result_json(cleanup_checkpoint, args.output)
+            _operator_notice("[B601] offline summary interrupted; primary cleanup result and raw trace retained.")
+            _emit_result_summary(cleanup_checkpoint, args.output)
+            return 130
         except (LowGainProbeError, B601HardwareError, OSError, ValueError) as exc:
-            payload = {"status": "ERROR", "mode": args.mode, "error": str(exc)}
+            payload = {**(cleanup_checkpoint or {}), "status": "ERROR", "mode": args.mode, "error": str(exc)}
+            if cleanup_checkpoint is not None:
+                payload["postprocessing"] = {"status": "ERROR", "stage": "summary", "error": str(exc)}
             if isinstance(exc, LowGainProbeError) and exc.cleanup is not None:
                 payload["cleanup"] = exc.cleanup
             if getattr(args, "torque_console_auto_calibration_profile", None) is not None:

@@ -1095,9 +1095,30 @@ def test_enabled_startup_exit_attempts_recovery_before_stop(monkeypatch, tmp_pat
         trace = Trace(io.StringIO())
     old_handlers = {s: probe.signal.getsignal(s) for s in (signal.SIGINT, signal.SIGUSR1)}
     bindings = []
+    checkpoints = []
+    if console is not None:
+        def result_record():
+            if cleanup_fault == "owner_stopped":
+                raise ValueError("unconsumed terminal receipt")
+            return {"state": "failed", "outcome": {"severity": "error", "reason": "startup_failure"}}
+        monkeypatch.setattr(console, "result_record", result_record, raising=False)
+
+    def checkpoint(record):
+        # Real run_probe with synthetic I/O, not a mocked lifecycle: save
+        # only after all device cleanup and host release were attempted.
+        assert events[-1] == "close"
+        assert trace.gc_observation_end is not None
+        assert record["status"] == record["execution_status"] == "ERROR"
+        assert record["cleanup"]["transport_release"]["completed"]
+        assert record["postprocessing"]["status"] == "PENDING"
+        if cleanup_fault == "owner_stopped":
+            assert record["automatic_calibration_export_error"] == "ValueError: unconsumed terminal receipt"
+        checkpoints.append(record)
+
     with pytest.raises(probe.LowGainProbeError, match="operator interrupt|injected RX failure") as raised:
         probe.run_probe(args, torque_console=console, debug_trace=trace,
-                        console_stop_binding=bindings.append)
+                        console_stop_binding=bindings.append, post_cleanup_checkpoint=checkpoint)
+    assert len(checkpoints) == int(console is not None)
     if cleanup_fault:
         if cleanup_fault == "operator_keys":
             assert events.index("keys_close") < events.index("hold")
@@ -4617,6 +4638,36 @@ def test_sample_archive_preserves_completed_fields_and_builtin_types() -> None:
     assert archive.diagnostics()["packing_fallback_count"] == 0
 
 
+def test_workspace_summary_decodes_once_and_keeps_original_metrics(monkeypatch):
+    archive = probe._ProbeSampleArchive()
+    originals = [{"sequence": n, "elapsed_sec": n*.025,
+        "qpos_rad": (n*.001,)*6, "startup_state": "ACTIVE" if n > 1 else "HANDOFF",
+        "requested_tau_nm": (n*.1,)*6, "conditioned_tau_nm": (n*.09,)*6,
+        "boundary_normalized_joint_names": ("joint2",) if n%2 else (),
+        "torque_console": {"large_nested_history": list(range(100))}}
+        for n in range(10)]
+    for sample in originals:
+        archive.append(sample)
+    loads = probe.pickle.loads
+    decoded = []
+
+    def count(blob):
+        decoded.append(len(blob))
+        return loads(blob)
+
+    monkeypatch.setattr(probe.pickle, "loads", count)
+    compact = probe._workspace_analysis_samples(archive)
+    assert len(decoded) == len(originals)-1
+    assert all("torque_console" not in sample for sample in compact)
+    assert probe.summarize_torque_conditioning(compact, absolute_limits_nm=(.5,)*6) == probe.summarize_torque_conditioning(originals, absolute_limits_nm=(.5,)*6)
+    startup = {"pre_enable_qpos_rad": (0.,)*6, "lock_reference_qpos_rad": (0.,)*6,
+        "pre_control_observations": []}
+    assert probe.summarize_startup_diagnostics(**startup, samples=compact) == probe.summarize_startup_diagnostics(**startup, samples=originals)
+    assert sum(bool(s.get("boundary_normalized_joint_names")) for s in compact) == 5
+    assert len(decoded) == len(originals)-1
+    assert archive.materialize() == originals
+
+
 def test_automatic_rejection_record_is_flushed_once_with_current_cycle_timing() -> None:
     from collections import deque
 
@@ -4723,12 +4774,12 @@ def test_probe_bulk_sample_evaluation_and_materialization_follow_cleanup() -> No
     )]
     assert len(cleanup_blocks) == 1
     cold_evaluators = {"evaluate_slow_step_response", "evaluate_assist_commissioning_response",
-                       "evaluate_cartesian_assist_commissioning_response"}
+                       "evaluate_cartesian_assist_commissioning_response", "_workspace_analysis_samples"}
     bulk_calls = [node for node in ast.walk(tree) if isinstance(node, ast.Call) and (
         isinstance(node.func, ast.Name) and node.func.id in cold_evaluators
         or isinstance(node.func, ast.Attribute) and node.func.attr == "materialize"
     )]
-    assert len(bulk_calls) == 4
+    assert len(bulk_calls) == 5
     assert all(node.lineno > cleanup_blocks[0].end_lineno for node in bulk_calls)
     finish_calls = [node for node in ast.walk(tree) if isinstance(node, ast.Call)
                     and isinstance(node.func, ast.Attribute)
@@ -4737,8 +4788,13 @@ def test_probe_bulk_sample_evaluation_and_materialization_follow_cleanup() -> No
     assert cleanup_blocks[0].end_lineno < finish_calls[0].lineno < min(node.lineno for node in bulk_calls)
     restores = [node for node in bulk_calls if isinstance(node.func, ast.Attribute)]
     assert len(restores) == 1
-    # Cold evaluators share the restored list, never re-decode the archive.
-    assert all(keyword.value.id == "result_samples"
+    checkpoints = [node for node in ast.walk(tree) if isinstance(node, ast.Call)
+                   and isinstance(node.func, ast.Name) and node.func.id == "post_cleanup_checkpoint"]
+    assert len(checkpoints) == 1
+    assert finish_calls[0].lineno < checkpoints[0].lineno < min(node.lineno for node in bulk_calls)
+    # Cold evaluators share full or compact analysis, never re-decode the
+    # original archive. Lossless export still owns result_samples separately.
+    assert all(keyword.value.id == "analysis_samples"
                for node in bulk_calls if isinstance(node.func, ast.Name)
                for keyword in node.keywords if keyword.arg == "samples")
 
@@ -5442,6 +5498,62 @@ def test_main_result_export_error_still_writes_primary_failure_json(monkeypatch,
         "operator_interrupted_report_after_control_cleanup" if interrupt_report else "terminal record missing")
     assert result["automatic_calibration_report_status"] == ("INTERRUPTED" if interrupt_report else "ERROR")
     assert result["debug_dynamics_trace"]["gc_observation"]["registered_after_cleanup"] is False
+
+
+@pytest.mark.parametrize("checkpoint_saved", [False, True])
+@pytest.mark.parametrize("failed", [False, True])
+def test_main_interrupt_after_cleanup_keeps_primary_result(monkeypatch, tmp_path, checkpoint_saved, failed):
+    import control_station.b601_torque_console as console_module
+
+    closed = []
+
+    class Console:
+        set_human_intervention = recording_failed = lambda *args: None
+
+    class Server:
+        url = "http://127.0.0.1:1"
+        def __init__(self, *args, **kwargs):
+            pass
+        start = set_stop_handler = lambda *args: None
+        def close(self):
+            closed.append(True)
+
+    output = tmp_path / "b601_owner.json"
+    def interrupted(_args, **kwargs):
+        if checkpoint_saved:
+            kwargs["post_cleanup_checkpoint"]({
+                "mode": "hold", "status": "FAIL" if failed else "STOPPED_WITH_WARNINGS",
+                "execution_status": "FAILED" if failed else "STOPPED_BY_OPERATOR",
+                "stop_reason": "coordinated_reference_lag_stop" if failed else "explicit_full_disable",
+                "cleanup": {"device_cleanup_confirmed": True, "transport_release": {"completed": True}},
+                "postprocessing": {"status": "PENDING", "stage": "summary"},
+            })
+            assert json.loads(output.read_text())["postprocessing"]["status"] == "PENDING"
+        raise KeyboardInterrupt
+
+    monkeypatch.setenv("DISPLAY", ":synthetic-offline")
+    monkeypatch.setattr(probe, "_validate_cli", lambda args: None)
+    monkeypatch.setattr(probe, "_automatic_calibration_controller_from_args", lambda args: Console())
+    monkeypatch.setattr(console_module, "B601TorqueConsoleServer", Server)
+    monkeypatch.setattr(probe.webbrowser, "open_new_tab", lambda url: True)
+    monkeypatch.setattr(probe, "run_probe", interrupted)
+    args = ["--mode", "hold", "--config", str(tmp_path/"unused.yaml"),
+        "--rebot-source-root", str(tmp_path/"unused-vendor"), "--output", str(output),
+        "--log", str(tmp_path/"runtime.log"), "--torque-console",
+        "--torque-console-auto-calibration-profile", str(tmp_path/"unused-profile.json")]
+    if checkpoint_saved:
+        assert probe.main(args) == 130
+        result = json.loads(output.read_text())
+        assert result["cleanup"]["device_cleanup_confirmed"]
+        assert result["cleanup"]["transport_release"]["completed"]
+        assert result["postprocessing"]["status"] == "INTERRUPTED"
+        assert result["execution_status"] == ("FAILED" if failed else "STOPPED_BY_OPERATOR")
+        assert result["stop_reason"] == ("coordinated_reference_lag_stop" if failed else "explicit_full_disable")
+    else:
+        with pytest.raises(KeyboardInterrupt):
+            probe.main(args)
+        assert not output.exists()
+    assert closed == [True]
 
 
 def test_degraded_fault_hold_recovers_live_gravity_without_disable(

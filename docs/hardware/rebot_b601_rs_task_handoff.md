@@ -18,6 +18,73 @@
   基线中已接入的自观测过滤、夹爪等扩展保持原显式启用方式，默认 15 mm／v1／严格碰撞
   行为不随硬件迁移切换。物理验证仍由操作者运行，不把离线回归当成硬件有效性证明。
 
+### 连续定位与测点搜索分离，cleanup 后先保存结果（2026-10-20）
+
+本增量基于 `95838772fddb8e7692524647cdc3157d240ff4fa`。真实记录
+`hardware-tuning/j2-j3-clean-stop-acceptance/b601-owner-nuhnenxy` 已完成两个关节
+各 12 个维持点；失败发生在返回 J2，而不是维持点采集。随后设备清理确认，
+第二次 Ctrl-C 在 cleanup 后反复解码历史样本的汇总中中断，原目录因此缺少 owner JSON。
+
+控制修复仅作用于显式 coordinated workspace：
+
+- `position / return` 使用连续跟踪，保留当前受限支撑偏置；不再因“刚确认运动”
+  自动提出减半命令。`sweep` 的重新接近／固定点搜索仍保留原二分提案与重复验证。
+- 运动证据仍独立更新，原有确认方向后的快速正功尾量移除仍可工作；不是关闭
+  运动检测或制动。真实速度制动及零命令回执后的有界恢复仍由原生控制负责。
+- `CoordinatedPoseHolding.step` 新增可选 `point_search` 布尔参数，默认 true 保持
+  原直接消费者语义；workspace 显式传入阶段选择，审计新增 `point_search_enabled`。
+  参考滞后/提前停住异常现在也保留实际轴的原生 `fault_frame`，不再只有显示任务标签。
+
+旧记录 J2 返回途中，上一完整附加命令约 −0.379231 N·m，在运动确认帧提出
+−0.1896155 N·m 中点；J2 随后回退。参考滞后触发量约 0.0196473 rad，门为
+0.0195 rad，超出约 0.76%；暴露约 7.63/46.8 N·m·s，L1 峰值约 0.831/1.0 N·m。
+所以不是预算或力矩上限耗尽；继续放宽门不能修正连续途中错误卸载。
+同输入分支回归验证新路径保留偏置，旧测点路径仍提出中点；这不是物理反事实预测。
+
+结果可靠性修复：
+
+- `run_probe` 新增可选 `post_cleanup_checkpoint` 回调，不改变已有调用方要求。
+  仅自动采集在设备清理/host release 尝试完成后、任何样本解码统计前原子保存最小结果，
+  包括真实 stop、cleanup 回执/错误、保护保持故障、计数、终态采集快照、频率告警。
+  acceptance 为 `NOT_EVALUATED`，不提前宣称通过。
+- cleanup 后汇总被 Ctrl-C 中断时，保留该结果并记录 `postprocessing=INTERRUPTED`，
+  正常关闭 GUI/日志并返回 130；控制期没有检查点时的中断不被该路径吞掉。
+  真实 fault/ERROR、导出失败或不完整清理不提升为成功。
+- workspace 统计一次解码必要字段，后续评估共用精简列表；丰富原样本仍走既有无损归档，
+  不把整个嵌套 GUI/搜索历史整体展开，也不反复为各个统计反序列化。
+- canonical `save_automatic_report` 支持显式独立输出目录，保持默认路径兼容与排他发布。
+  缺少终态记录的恢复报告保留 `terminal_record_missing`、首个 guard 和 cleanup 边界，
+  不补造失能回执或把完成的局部点等同于整批成功。
+
+旧运行已离线恢复到
+`hardware-tuning/j2-j3-clean-stop-recovered-b8g5h6vd/automatic_calibration_report.json`，
+原始四个文件恢复前后大小/SHA-256 相同，完整指纹见同目录 `recovery_evidence.md`。
+保留 24 个已核验维持点：J2 六个非零点约 −0.079～−0.124 N·m，另六点为零；
+J3 12 点均为零附加命令。仍为软件命令/当前基线，不是实测输出力、唯一重力或已拟合摩擦。
+`ACQUISITION_PARTIAL / auto_apply=false`，运行摩擦合格稳态窗口仍为零。
+
+本轮不改任何 profile、重力/Kd、总 L1≤1.0 N·m、CLI 硬速度 0.195 rad/s、
+软速度、时限/暴露、几何/碰撞、Type-24 反馈时钟/TTL、40 ms watchdog、最终限幅、
+完整回执或 GUI 最终人工失能确认。未连接 CAN、执行真机、复位接口、应用模型、合并或推送。
+共享 runtime、replay/RM65 生命周期不改；同伴 `edecc9cccd83b86390367c34ec76bb362d6672d7`
+只读检查干净。主线现为 `ad89186db0bcbceb808c4746c3d5e3b9e60fd336` 且有既有修改，
+本轮未迁移基线或触碰主线。历史 owner/probe 重叠仍须固定提交集成验证。
+
+验证：联合控制 **138 passed**；owner/probe 与 workspace **359 passed**；底层运动、
+维持力搜索、session、cycle、子模块边界 **646 passed**；automatic calibration 与
+runtime 边界 **265 passed**，以上文件组不重叠，共 **1408 passed**。前两组包括四种原生终止
+原因/关节诊断、40/100 Hz 正负向与完整 24 点耦合模型、cleanup 后/前中断、导出错误、
+无损样本与一次解码指标一致性、排他恢复报告和原记录不改写。首轮组合的一个旧结构
+断言要求统计仍引用完整样本变量；现已更新并加强为“cleanup→检查点→精简统计”顺序，
+不改变任何控制验收断言。上述模型不是实机辨识模型。
+原完整参数无 CAN 预检结果：`hardware-tuning/j2-j3-systemic-preflight-g8urd2vf/preflight.json`；
+通过 canonical owner 构造的交付命令预检：
+`hardware-tuning/j2-j3-systemic-command-preflight-yl055eju/b601_owner.json`。
+后者 motion、automatic/cycle/workspace、支撑/保护阻尼、breakaway 包络和最终力矩限幅
+与前者逐项一致；均为 `can_opened=false / motor_command_sent=false`，不代表物理验收。
+Ruff、`git diff --check` 和本地资源审计通过。实际约 39.94 Hz 接收节奏、物理返回收敛、
+USB 稳定性和更大位姿范围的重力/摩擦辨识仍未由本轮离线验证证明。
+
 ### 正常第二次停止不再误报为执行失败（2026-10-20）
 
 本增量基于 `a37493bfc9ba6bba542e4ad212251c42d0059d3c`，只修改 cleanup 后的自动采集
