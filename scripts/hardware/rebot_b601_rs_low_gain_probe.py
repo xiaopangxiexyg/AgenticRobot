@@ -6939,7 +6939,11 @@ def _finalize_automatic_result(payload: dict, acquisition: dict) -> int:
     outcome = acquisition["outcome"]
     payload["acquisition_outcome"] = outcome
     degraded = payload.get("protective_hold", {}).get("degraded", {})
-    if payload.get("status") != "ERROR" and (degraded.get("entry_count", 0) or degraded.get("escalation_reason")):
+    escalation = degraded.get("escalation_reason")
+    # The existing hold telemetry also records the normal second-stop request
+    # here. It is not a fault; actual degraded entries still veto a clean stop.
+    fault_escalation = bool(escalation and escalation != "explicit second stop request")
+    if payload.get("status") != "ERROR" and (degraded.get("entry_count", 0) or fault_escalation):
         payload["execution_status"] = "FAILED"
     payload["execution_warnings"] = [
         {"scope": "timing_quality", "reason": f"{event}_frequency_acceptance_not_met"}

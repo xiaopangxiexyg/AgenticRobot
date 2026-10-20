@@ -18,6 +18,27 @@
   基线中已接入的自观测过滤、夹爪等扩展保持原显式启用方式，默认 15 mm／v1／严格碰撞
   行为不随硬件迁移切换。物理验证仍由操作者运行，不把离线回归当成硬件有效性证明。
 
+### 正常第二次停止不再误报为执行失败（2026-10-20）
+
+本增量基于 `a37493bfc9ba6bba542e4ad212251c42d0059d3c`，只修改 cleanup 后的自动采集
+结果分类，不改保护保持、失能、GUI、控制循环、profile 或任何运行阈值。真实记录
+`j2-j3-brake-context-acceptance/b601-owner-583q9z4i` 在操作者关闭/刷新/跳转页面后
+按约定 `page_unload` 取消采集，随后终端两次停止并完整清理。原生控制无故障帧、
+降级进入次数为零，却因正常 `explicit second stop request` 写在 `escalation_reason`
+中，被汇总层误判为 `FAILED / exit 1`。
+
+现在仅这一条已知正常停止说明不作为故障升级；真实降级进入次数、其他或未知升级
+原因仍阻止正常停止分类。上游已经判定的 ERROR/FAILED、清理失败和采集 error 不提升。
+保留原始停止说明及频率告警，未完成采集仍为 cancelled/partial，严格 acceptance 不改。
+新增回归先在旧代码复现四个误判；真实结果仅在内存重建原有 cleanup 后、finalizer 前
+的 `STOPPED_BY_OPERATOR`，新分类为 `STOPPED_WITH_WARNINGS / exit 0`，同时保留六个
+J2 维持点、未完成第七段、三个频率告警及 acceptance FAIL。原始运行文件未重写。
+验证命令 `bash scripts/run_pytest.sh -q tests/test_rebot_b601_low_gain_probe.py
+tests/test_b601_automatic_calibration.py tests/test_runtime_domain_boundaries.py` 为 **571 passed**；
+Ruff 与 `git diff --check` 通过。框架同伴 `edecc9cccd83b86390367c34ec76bb362d6672d7`
+只读检查保持干净，本批三个文件没有并发修改；共享 runtime 和命令接口不改。
+本增量不提供新的力控或硬件验收结论，不连接 CAN、不执行真机、不合并或推送。
+
 ### 正常到位与实际制动分开计时、及时移除同向驱动尾量（2026-10-20）
 
 本增量基于 `1a17696dcdbeab57a0a932ac613c708393ae0981`，修复同一显式联合采集路径，

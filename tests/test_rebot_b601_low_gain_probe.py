@@ -1628,6 +1628,52 @@ def test_automatic_clean_stop_classification_cannot_hide_a_degraded_protective_h
     assert payload['status']=='FAIL' and payload['execution_status']=='FAILED'
 
 
+@pytest.mark.parametrize('reason', ['page_unload', 'operator_withdraw'])
+@pytest.mark.parametrize('timing_warning', [False, True])
+def test_automatic_normal_second_stop_is_not_a_degraded_fault(reason, timing_warning):
+    payload = {'status': 'FAIL', 'execution_status': 'STOPPED_BY_OPERATOR',
+        'acceptance_status': 'FAIL', 'stop_reason': 'operator_interrupt',
+        'protective_hold': {'degraded': {'entry_count': 0,
+            'escalation_reason': 'explicit second stop request'}},
+        'frequency_acceptance': {'tx': {'passed': not timing_warning}}}
+    record = {'state': 'cancelled', 'acquisition_complete': False,
+        'outcome': {'severity': 'info', 'scope': 'acquisition', 'reason': reason}}
+    assert probe._finalize_automatic_result(payload, record) == 0
+    assert payload['status'] == ('STOPPED_WITH_WARNINGS' if timing_warning else 'STOPPED')
+    assert payload['execution_status'] == 'STOPPED_BY_OPERATOR'
+    assert payload['acceptance_status'] == 'FAIL'
+    assert not record['acquisition_complete']
+    assert payload['acquisition_outcome'] == record['outcome']
+    assert payload['protective_hold']['degraded']['escalation_reason'] == 'explicit second stop request'
+
+
+@pytest.mark.parametrize('entries,escalation', [
+    (1, 'explicit second stop request'),
+    (0, 'no verified degraded hold cache'),
+    (0, 'live and cached all-six-joint hold dispatch failed after retry'),
+    (0, 'unknown future failure'),
+])
+def test_automatic_second_stop_fix_keeps_real_and_unknown_faults_failed(entries, escalation):
+    payload = {'status': 'FAIL', 'execution_status': 'STOPPED_BY_OPERATOR',
+        'protective_hold': {'degraded': {'entry_count': entries, 'escalation_reason': escalation}}}
+    record = {'state': 'cancelled', 'outcome': {'severity': 'info', 'scope': 'acquisition'}}
+    assert probe._finalize_automatic_result(payload, record) == 1
+    assert payload['status'] == 'FAIL'
+    assert payload['execution_status'] == 'FAILED'
+
+
+@pytest.mark.parametrize('status,execution,code', [('FAIL', 'FAILED', 1), ('ERROR', 'ERROR', 2)])
+def test_automatic_normal_second_stop_cannot_promote_upstream_cleanup_or_control_failure(status, execution, code):
+    payload = {'status': status, 'execution_status': execution,
+        'cleanup': {'device_cleanup_confirmed': False, 'errors': ['disable not confirmed']},
+        'protective_hold': {'degraded': {'entry_count': 0,
+            'escalation_reason': 'explicit second stop request'}}}
+    record = {'state': 'cancelled', 'outcome': {'severity': 'info', 'scope': 'acquisition'}}
+    assert probe._finalize_automatic_result(payload, record) == code
+    assert payload['status'] == status and payload['execution_status'] == execution
+    assert not payload['cleanup']['device_cleanup_confirmed']
+
+
 def test_receive_interval_above_watchdog_is_valid_when_paired_snapshot_and_ages_are_fresh():
     # Preserved J1 timing from the field failure: advancing, fresh metadata,
     # not a backwards clock. No snapshot/vendor speed fallback is allowed.
