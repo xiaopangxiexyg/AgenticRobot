@@ -922,3 +922,78 @@ def test_native_task_timeline_preserves_failure_then_recovery_success(
     assert tuple(
         event.outcome for event in loaded.task_events if event.event_kind == "finish"
     ) == ("failure", "success")
+
+
+@pytest.mark.integration
+@pytest.mark.optional
+@pytest.mark.parametrize("compression", ["none", "zstd"])
+def test_missing_fixed_vectors_keep_native_seal_and_random_read_identity(tmp_path, compression):
+    from dataclasses import replace
+
+    embodiment, native, _ = _profiles()
+    native = replace(native, streams=tuple(
+        replace(stream, required_for_sample=False) if stream.dataset_role == "state" else stream
+        for stream in native.streams
+    ))
+    identity = _identity()
+
+    def capture(root, layout):
+        store = V25pNativeEpisodeStore(
+            dataset_root=root, dataset_id="native-dataset",
+            embodiment_profile=embodiment, component_stream_profile=native,
+            physical_storage_layout=layout, parquet_chunk_rows=2,
+            parquet_compression=compression,
+        )
+        try:
+            store.prepare_episode(identity)
+            store.bind_prepared_episode(identity, bound_at=1.0, bound_clock_domain_id="capture")
+            for sample_index in range(5):
+                timestamp = 2.0 + sample_index * .1
+                values = _sample_values(timestamp)
+                if sample_index in (0, 3, 4):
+                    values = {
+                        key: replace(value, values=None, valid=False, invalid_reason="not_available")
+                        if key == "arm.primary.measured" else value
+                        for key, value in values.items()
+                    }
+                elif sample_index == 1:
+                    values = {key: replace(value, values=(0.0, 0.0, 0.0)) for key, value in values.items()}
+                store.append_sample(
+                    identity, sample_index=sample_index, cut_at=timestamp,
+                    cut_clock_domain_id="capture", values_by_stream=values,
+                )
+            seal = store.seal_native_episode(identity, sealed_at=3.0, sealed_clock_domain_id="capture")
+            store.commit_episode(identity, committed_at=3.1, committed_clock_domain_id="capture")
+            return seal, load_v25p_native_episode(root, identity.episode_uuid)
+        except BaseException as original:
+            try:
+                store.close_unsealed(identity)
+            except BaseException as cleanup_error:
+                raise original from cleanup_error
+            raise
+
+    cjson_seal, cjson = capture(tmp_path / "cjson", "record_cjson_v1")
+    parquet_root = tmp_path / "parquet"
+    parquet_seal, parquet = capture(parquet_root, V25P_PARQUET_CHUNK_LAYOUT_V1)
+    assert cjson_seal.native_storage_manifest_hash is None
+    assert parquet_seal.native_storage_manifest_hash is not None
+    assert parquet.native_capture_manifest.semantic_content_hash == cjson.native_capture_manifest.semantic_content_hash
+    assert parquet.records_by_stream == cjson.records_by_stream
+    assert parquet.samples == cjson.samples
+    assert all(len(records) == 5 for records in parquet.records_by_stream.values())
+    records = parquet.records_by_stream["arm.primary.measured"]
+    assert records[0].values is None and records[0].valid is False
+    assert records[1].values == (0.0, 0.0, 0.0) and records[1].valid is True
+    assert records[3].values is None and records[3].valid is False
+    assert records[4].values is None and records[4].valid is False
+    assert all(record.valid for record in parquet.records_by_stream["arm.primary.accepted"])
+    episode_dir = parquet_root / "meta/v25p/native/episodes/native-episode"
+    assert len(tuple((episode_dir / "chunks").glob("*.cjson"))) == 3
+    for sample_index, expected_sample in enumerate(parquet.samples):
+        sample, records = load_v25p_parquet_sample(
+            episode_dir=episode_dir, identity=identity, profile=native,
+            sample_index=sample_index, stream_ids=tuple(native.stream_by_id),
+        )
+        assert sample == expected_sample
+        assert set(records) == set(native.stream_by_id)
+        assert records == {key: value[sample_index] for key, value in parquet.records_by_stream.items()}
