@@ -18,6 +18,46 @@
   基线中已接入的自观测过滤、夹爪等扩展保持原显式启用方式，默认 15 mm／v1／严格碰撞
   行为不随硬件迁移切换。物理验证仍由操作者运行，不把离线回归当成硬件有效性证明。
 
+### 结束阶段的设备确认与本地通信资源释放（2026-10-20）
+
+本增量基于 `f89da4ef9873e5d41d34711ebf2a59e38d9002c9`，仅修复终止阶段，
+不调整采集 profile、重力、Kd、速度/位移/力矩保护、watchdog、TTL 或 GUI 失能确认。
+`j2-j3-margin30-acceptance/b601-owner-9ld3h0ej` 首次 active-report 写入已报
+`Network is down`，随后撤销上报失败，旧 `close()` 因保留的设备状态锁存而拒绝关闭。
+这不是程序结束时主动将 can0 DOWN 的证据；之前 `tmnlqa05` 的六轴失能、临时力矩
+上限恢复及主动上报关闭均完整，无 cleanup error。单独的 USB 消失事件不能由此归因。
+
+正常结束仍先执行原有保护保持/人工失能协议，再恢复临时上限、撤销主动上报。
+之后正常 `close()` 保留原检查；设备清理未确认时，owner 改用新增终止接口
+`B601RSBackend.release_transport()`，只关闭本进程资源，不新增电机指令，也不执行
+`ip link down`、USB 重置、重新连接或自动恢复驱动。新增接口不用于运行中换连接。
+
+核对 MotorBridge 源码发现，Python `Controller.close()` 只调用原生 controller free，
+而独立 motor handles 保留 native Arc 引用；清空 Python 容器不是释放这些句柄的证明。
+后端现在显式按 `Controller.close_bus()` → 每个 `Motor.close()` → `Controller.close()`
+释放。现有自包含 `close()` 的测试/注入适配器保持兼容。释放失败保留原对象或未释放
+句柄供显式重试，显式 False 也算失败；不丢失错误，不自动无界重试。
+
+设备状态锁存仍保留：尚未确认失能、主动上报撤销或临时上限恢复的 backend 实例
+不能再次连接。只释放 host transport 不代表机械臂失能，也不会将失败提升为 PASS。
+正常及异常结果都增加 `cleanup`，分别记录设备阶段确认、transport release 方法/
+完成与错误；原 `cleanup_receipt`、`cleanup_errors` 等正常结果字段保持兼容。
+终端仅新增一条清理摘要；设备未确认时仍需操作者根据真实支撑和动力状态处置。
+
+故障注入覆盖首次上报写入/回滚失败、六轴 disable 失败、bus/motor/controller 释放
+异常与显式 False、部分资源重试及错误 JSON 持久化；全部不连接真实 CAN。
+`tests/test_rebot_b601_low_gain_probe.py`、`tests/test_rebot_b601_hardware_backend.py`、
+`tests/test_b601_workspace_calibration.py` 合计 **471 passed**；三个 package/runtime
+边界测试文件合计 **46 passed**。修改的 owner/tests Ruff 通过；backend 的 33 项
+历史 Ruff 诊断未新增；diff 检查通过。沿用 tmnlqa05 完整 child argv，仅替换输出并追加
+`--preflight-only`，预检为 `hardware-tuning/j2-j3-terminal-cleanup-preflight-aldiqef5`，
+`status=PASS / can_opened=false / motor_command_sent=false`。
+这些是离线/故障注入证据，不是真机结束资源释放或 USB 链路稳定性验收；原真机命令
+无须改参数。无 CAN 操作、物理运动、接口/电源重启、模型应用、合并或推送。
+框架线元数据只读刷新至 `edecc9cccd83b86390367c34ec76bb362d6672d7`，当时工作区
+干净；其本轮六个应用/说明/测试路径与这批五文件无重叠。历史 backend/owner 接口
+重叠仍需固定提交集成，未访问/修改对方实现内容或替对方合并。
+
 ### 联合采集历史限制的显式 30% 余量（2026-10-20）
 
 基于 `3e9e7b8a35acd246afecd4ecadaae0eb43c2b519`，按操作者本轮进一步放宽 30%

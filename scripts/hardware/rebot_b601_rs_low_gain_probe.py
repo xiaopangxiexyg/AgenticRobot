@@ -465,6 +465,10 @@ class B601GravityCompensationDebugProfile:
 class LowGainProbeError(RuntimeError):
     """A guarded probe precondition, safety stop, or vendor operation failed."""
 
+    def __init__(self, message: str, *, cleanup: dict[str, object] | None = None):
+        super().__init__(message)
+        self.cleanup = cleanup
+
 
 class OperatorKeyReader:
     """Read single operator keys from the controlling terminal without Enter."""
@@ -8560,6 +8564,21 @@ def _run_latched_fault_hold(
     )
 
 
+def _release_owner_transport(
+    backend: B601RSBackend, *, device_cleanup_confirmed: bool, cleanup_errors: list[str],
+) -> dict[str, object]:
+    """Called only after the owner's existing hold/disable/restore protocol."""
+    release = getattr(backend, "release_transport", None)
+    method = "release_transport" if not device_cleanup_confirmed and callable(release) else "close"
+    try:
+        if getattr(backend, method)() is False:
+            raise B601HardwareError("host transport release is incomplete")
+    except Exception as exc:  # noqa: BLE001 - retain terminal release failure separately
+        cleanup_errors.append(f"{method}: {exc}")
+        return {"method": method, "completed": False, "error": str(exc)}
+    return {"method": method, "completed": True, "error": None}
+
+
 def run_probe(
     args: argparse.Namespace,
     *,
@@ -11412,10 +11431,38 @@ def run_probe(
                         )
             except Exception as exc:  # noqa: BLE001 - preserve cleanup evidence
                 cleanup_errors.append(f"disable active reporting: {exc}")
-        try:
-            backend.close()
-        except Exception as exc:  # noqa: BLE001 - preserve cleanup evidence
-            cleanup_errors.append(f"close: {exc}")
+        motor_disable_confirmed = cleanup_receipt is not None and cleanup_receipt.completed
+        limits_restored = (
+            driver_limit_restore_receipt is not None and driver_limit_restore_receipt.completed
+            if connected and getattr(args, "apply_driver_torque_limits", False)
+            else None
+        )
+        reporting_disabled = (
+            active_report_disable_receipt is not None and active_report_disable_receipt.completed
+            if connected and active_report_enable_attempted
+            else None
+        )
+        device_cleanup_confirmed = bool(
+            connected and motor_disable_confirmed
+            and limits_restored is not False and reporting_disabled is not False
+        )
+        transport_release = _release_owner_transport(
+            backend, device_cleanup_confirmed=device_cleanup_confirmed,
+            cleanup_errors=cleanup_errors,
+        )
+        cleanup_record = {
+            "device_cleanup_confirmed": device_cleanup_confirmed,
+            "motor_disable_confirmed": motor_disable_confirmed,
+            "driver_limits_restore_confirmed": limits_restored,
+            "active_report_disable_confirmed": reporting_disabled,
+            "transport_release": transport_release,
+            "errors": tuple(cleanup_errors),
+            "semantics": "host_transport_release_is_not_motor_disable_or_can_interface_reset",
+        }
+        _operator_notice(
+            f"[B601] CLEANUP: device cleanup {'CONFIRMED' if device_cleanup_confirmed else 'UNCONFIRMED'}; "
+            f"host transport release {'COMPLETE' if transport_release['completed'] else 'FAILED'}."
+        )
         try:
             if console_stop_binding is not None:
                 console_stop_binding(None)
@@ -11440,7 +11487,7 @@ def run_probe(
         detail = str(primary_error)
         if cleanup_errors:
             detail += "; cleanup: " + "; ".join(cleanup_errors)
-        raise LowGainProbeError(detail) from primary_error
+        raise LowGainProbeError(detail, cleanup=cleanup_record) from primary_error
 
     # Restore once, only after the existing owner cleanup. Repeated lazy
     # archive traversal otherwise unpickles the entire history for each
@@ -11928,6 +11975,7 @@ def run_probe(
             ),
         },
         "cleanup_errors": tuple(cleanup_errors),
+        "cleanup": cleanup_record,
         "preflight_disable_receipt": _mode_receipt_payload(preflight_disable),
         "mode_receipt": _mode_receipt_payload(mode_receipt),
         "enable_receipt": _mode_receipt_payload(enable_receipt),
@@ -13374,6 +13422,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
         except (LowGainProbeError, B601HardwareError, OSError, ValueError) as exc:
             payload = {"status": "ERROR", "mode": args.mode, "error": str(exc)}
+            if isinstance(exc, LowGainProbeError) and exc.cleanup is not None:
+                payload["cleanup"] = exc.cleanup
             if getattr(args, "torque_console_auto_calibration_profile", None) is not None:
                 payload["execution_status"] = "ERROR"
             exit_code = 2

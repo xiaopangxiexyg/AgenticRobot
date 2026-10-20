@@ -716,6 +716,81 @@ def test_enabled_shutdown_always_attempts_hold_before_disable() -> None:
     )
 
 
+@pytest.mark.parametrize("confirmed", [False, True])
+@pytest.mark.parametrize("fails", [False, True])
+def test_terminal_host_release_is_separate_from_device_cleanup(confirmed, fails):
+    events, errors = [], ["safe_stop: unconfirmed"] if not confirmed else []
+    class Backend:
+        def close(self):
+            events.append("close")
+            if fails:
+                raise OSError("synthetic release failure")
+        def release_transport(self):
+            events.append("release_transport")
+            if fails:
+                raise OSError("synthetic release failure")
+    outcome = probe._release_owner_transport(Backend(), device_cleanup_confirmed=confirmed,
+                                              cleanup_errors=errors)
+    assert events == ["close" if confirmed else "release_transport"]
+    assert outcome["completed"] is (not fails)
+    assert bool(outcome["error"]) is fails
+    assert ("safe_stop: unconfirmed" in errors) is (not confirmed)
+    assert len(errors) == int(not confirmed)+int(fails)
+
+
+def test_incomplete_legacy_transport_release_is_not_success():
+    errors = []
+    outcome = probe._release_owner_transport(SimpleNamespace(close=lambda: False),
+        device_cleanup_confirmed=False, cleanup_errors=errors)
+    assert outcome["method"] == "close"
+    assert outcome["completed"] is False
+    assert errors == ["close: host transport release is incomplete"]
+
+
+def test_failed_active_report_cleanup_releases_real_backend_handle_without_confirming_safety(monkeypatch, tmp_path):
+    from test_rebot_b601_hardware_backend import _config, _FakeController
+
+    from hardware.rebot_b601_rs.backend import B601HardwareError, B601RSBackend
+
+    class Controller(_FakeController):
+        def add_robstride_motor(self, *args):
+            motor = super().add_robstride_motor(*args)
+            motor.fail_active_report_calls = {1, 2, 3}
+            motor.fail_method = "disable"
+            return motor
+    controller = Controller()
+    config = _config(allow_motion=True, allow_active_reporting=True)
+    backend = B601RSBackend(config, controller_factory=lambda _channel: controller)
+    path = tmp_path/"config.yaml"
+    path.write_text("offline fixture\n")
+    monkeypatch.setattr(probe.B601RSBackendConfig, "from_rs_yaml", lambda *a, **kw: config)
+    monkeypatch.setattr(probe, "B601RSBackend", lambda _config: backend)
+    monkeypatch.setattr(probe, "_resolve_model_and_limits", lambda root: (
+        SimpleNamespace(urdf_path=path), _fault_hold_limits()))
+    monkeypatch.setattr(probe, "_resolve_effort_limits", lambda *a, **kw: (1.,)*6)
+    args = probe.build_parser().parse_args([
+        "--mode", "hold", "--config", str(path), "--rebot-source-root", str(tmp_path),
+        "--allow-motion", "--auto-disable", "--confirmation", probe.CONFIRMATION,
+        "--apply-driver-torque-limits",
+        "--feedback-source", "active-report", "--allow-active-report", "--auto-disable-active-report",
+    ])
+    with pytest.raises(probe.LowGainProbeError, match="active-report enable failed") as caught:
+        probe.run_probe(args)
+    cleanup = caught.value.cleanup
+    assert cleanup["device_cleanup_confirmed"] is False
+    assert cleanup["motor_disable_confirmed"] is False
+    assert cleanup["active_report_disable_confirmed"] is False
+    assert cleanup["transport_release"] == {"method": "release_transport", "completed": True, "error": None}
+    assert cleanup["errors"] and any("safe_stop" in e for e in cleanup["errors"])
+    assert controller.calls[-1] == "close"
+    assert not backend.connected
+    assert backend.active_report_joint_names == ("joint1",)
+    assert all(any(method == "disable" for method, args in motor.calls) for motor in controller.motors.values())
+    assert not any(method in {"enable", "send_mit"} for motor in controller.motors.values() for method, args in motor.calls)
+    with pytest.raises(B601HardwareError, match="unconfirmed device state"):
+        backend.connect()
+
+
 @pytest.fixture
 def startup_recovery(monkeypatch):
     q = (0.1, 0.7, 1.1, 0.0, -0.1, 0.2)
@@ -4596,9 +4671,8 @@ def test_automatic_dispatch_admission_and_fault_flush_are_wired_before_send_and_
 def test_probe_bulk_sample_evaluation_and_materialization_follow_cleanup() -> None:
     tree = ast.parse(inspect.getsource(probe.run_probe)).body[0]
     cleanup_blocks = [node for node in tree.body if isinstance(node, ast.Try) and any(
-        isinstance(call, ast.Call) and isinstance(call.func, ast.Attribute)
-        and isinstance(call.func.value, ast.Name) and call.func.value.id == "backend"
-        and call.func.attr == "close"
+        isinstance(call, ast.Call) and isinstance(call.func, ast.Name)
+        and call.func.id == "_release_owner_transport"
         for statement in node.finalbody for call in ast.walk(statement)
     )]
     assert len(cleanup_blocks) == 1
@@ -5200,7 +5274,11 @@ def test_debug_trace_main_writes_separate_jsonl_without_hardware(
         diagnostics.mark("backend_poll")
         trace.last_feedback_read_diagnostics = diagnostics
         if handled_error:
-            raise probe.LowGainProbeError("synthetic feedback timeout")
+            raise probe.LowGainProbeError("synthetic feedback timeout", cleanup={
+                "device_cleanup_confirmed": False,
+                "transport_release": {"completed": True, "method": "release_transport", "error": None},
+                "errors": ["safe_stop: synthetic failure"],
+            })
         return {"status": "OK", "mode": "hold"}
 
     monkeypatch.setattr(probe, "run_probe", fake_run_probe)
@@ -5218,6 +5296,11 @@ def test_debug_trace_main_writes_separate_jsonl_without_hardware(
 
     assert status == (2 if handled_error else 0)
     result = json.loads(output.read_text(encoding="utf-8"))
+    if handled_error:
+        assert result["status"] == "ERROR"
+        assert result["cleanup"]["device_cleanup_confirmed"] is False
+        assert result["cleanup"]["transport_release"]["completed"] is True
+        assert result["cleanup"]["errors"] == ["safe_stop: synthetic failure"]
     trace_path = tmp_path / "result.debug.jsonl"
     assert result["debug_dynamics_trace"]["path"] == str(trace_path)
     assert result["debug_dynamics_trace"]["sample_count"] == 1
