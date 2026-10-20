@@ -65,6 +65,59 @@ def test_seed_and_zero_need_not_form_a_valid_bracket_and_expansion_is_bounded():
     assert search.return_command_nm is None
 
 
+@pytest.mark.parametrize("sign", [-1, 1])
+@pytest.mark.parametrize("explicit", [False, True])
+def test_motion_then_censored_zero_can_propose_midpoint_without_a_stable_anchor(sign, explicit):
+    seed = sign*.8855391221587121
+    search = HoldingForceSearch(HoldingSearchConfig(max_trials=27, movement_rad=.0045),
+        seed_nm=seed, cap_nm=1, recheck_interior_on_conflict=explicit)
+    search.record(command_nm=seed, requested_command_nm=seed,
+        outcome="negative_motion" if sign < 0 else "positive_motion", evidence={})
+    assert search.candidate_nm == 0
+    search.record_transition(command_nm=0, requested_command_nm=0,
+        evidence={"outcome":"censored_settled_outside_point", "net_displacement_rad":-sign*.0015339814})
+    if not explicit:
+        assert search.state == "incomplete"
+        return
+    assert search.state == "searching"
+    assert search.candidate_nm == pytest.approx(seed/2)
+    view = search.status(detailed=True)
+    assert view["trial_count"] == view["transition_count"] == 1
+    assert view["observed_stationary_range_nm"] is None
+    assert view["return_command_nm"] is view["usable_hold_nm"] is None
+    assert view["negative_motion_below_nm"] == (seed if sign < 0 else None)
+    assert view["positive_motion_above_nm"] == (seed if sign > 0 else None)
+    # An intermediate proposal is not a successful observation or completion.
+    for _ in range(12):
+        if search.state != "searching":
+            break
+        u = search.candidate_nm
+        if abs(u) < .4:
+            search.record_transition(command_nm=u, requested_command_nm=u,
+                evidence={"outcome":"censored_settled_outside_point"})
+        else:
+            search.record(command_nm=u, requested_command_nm=u, outcome="stationary", evidence={})
+    assert search.state == "complete"
+    assert search.status()["auto_apply"] is search.status()["identifies_unique_gravity"] is False
+    hold = search.status()["usable_hold_nm"]
+    assert sum(r["outcome"] == "stationary" and r["command_nm"] == hold for r in search.observations) >= 2
+
+
+@pytest.mark.parametrize("budget", [2, 3, 5])
+def test_unanchored_midpoint_transitions_keep_original_budget_and_never_complete(budget):
+    search = HoldingForceSearch(HoldingSearchConfig(max_trials=budget), seed_nm=-.8, cap_nm=1,
+        recheck_interior_on_conflict=True)
+    search.record(command_nm=-.8, outcome="negative_motion", evidence={})
+    while search.state == "searching":
+        u = search.candidate_nm
+        search.record_transition(command_nm=u, requested_command_nm=u,
+            evidence={"outcome":"censored_settled_outside_point"})
+        assert abs(search.candidate_nm) <= 1
+    assert search.reason == "holding_trial_budget_exhausted"
+    assert len(search.observations)+len(search.transitions) == budget
+    assert search.status()["usable_hold_nm"] is None
+
+
 def test_inconsistent_same_level_is_not_forced_into_a_binary_result():
     search = HoldingForceSearch(HoldingSearchConfig(), seed_nm=-0.3, cap_nm=1)
     search.record(command_nm=-0.3, outcome="stationary", evidence={})

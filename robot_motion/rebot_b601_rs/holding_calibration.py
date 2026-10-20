@@ -248,6 +248,31 @@ class HoldingForceSearch:
         )
         stable = self._eligible_stationary_commands()
         if not stable:
+            if (self._recheck_interior_on_conflict and self._verification is None
+                and self.observations and not any(r["outcome"] == "stationary" for r in self.observations)):
+                lower = max((r["command_nm"] for r in self.observations
+                             if r["outcome"] == "negative_motion"), default=-math.inf)
+                upper = min((r["command_nm"] for r in self.observations
+                             if r["outcome"] == "positive_motion"), default=math.inf)
+                # An arrival command can move, while the next trial settles
+                # outside the frozen point. Neither is a holding anchor yet.
+                # Use the censored endpoint only to propose an interior test;
+                # do not promote it to a signed motion or stationary bound.
+                left = right = command_nm
+                if math.isfinite(lower) and math.isfinite(upper):
+                    left, right = lower, upper
+                elif math.isfinite(lower) and command_nm > lower:
+                    left, right = lower, command_nm
+                elif math.isfinite(upper) and command_nm < upper:
+                    left, right = command_nm, upper
+                if math.isfinite(left) and math.isfinite(right) and right > left:
+                    self.candidate_nm = (left + right) / 2
+                    self.reason = "refine_unverified_hold_between_motion_and_transition"
+                    if right-left <= self.config.torque_resolution_nm:
+                        self.state, self.reason = "incomplete", "holding_no_verified_anchor_in_search_interval"
+                    else:
+                        self._check_trial_budget()
+                    return
             if (self._recheck_interior_on_conflict and not self.observations
                 and self._verification is None and progress is not None
                 and abs(progress) >= self.config.movement_rad/2):
