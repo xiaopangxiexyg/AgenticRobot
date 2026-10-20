@@ -45,9 +45,12 @@ class HoldingForceSearch:
     a bracket; a quiet observation provides a feasible value, not a root.
     """
 
-    def __init__(self, config: HoldingSearchConfig, *, seed_nm: float, cap_nm: float):
+    def __init__(self, config: HoldingSearchConfig, *, seed_nm: float, cap_nm: float,
+                 recheck_interior_on_conflict: bool = False):
         if not isinstance(config, HoldingSearchConfig):
             raise TypeError("holding search requires explicit validated settings")
+        if type(recheck_interior_on_conflict) is not bool:
+            raise TypeError("interior holding recheck must be boolean")
         if (
             any(isinstance(v, bool) or not math.isfinite(v) for v in (seed_nm, cap_nm))
             or not 0 < cap_nm
@@ -60,6 +63,8 @@ class HoldingForceSearch:
         self.transitions = []
         self.state, self.reason = "searching", "verify_arrival_command"
         self._verification = None
+        self._recheck_interior_on_conflict = recheck_interior_on_conflict
+        self._interior_recheck_start = None
 
     def record(
         self, *, command_nm: float, outcome: str, evidence: dict,
@@ -105,14 +110,28 @@ class HoldingForceSearch:
             r["command_nm"] for r in self.observations if r["outcome"] == "stationary"
         ]
         lower, upper = max(negative, default=-math.inf), min(positive, default=math.inf)
-        # This also detects a repeated level changing class. Do not hide
-        # history dependence by forcing an inconsistent binary search to fit.
-        if lower >= upper or any(not lower < v < upper for v in stable):
-            self.state, self.reason = (
-                "incomplete",
-                "holding_response_not_repeatable_or_monotone",
-            )
-            return
+        # Keep every conflicting observation. The coordinated acquisition may
+        # verify another observed interior hold, never fit the rejected edge.
+        eligible = self._eligible_stationary_commands()
+        excluded_plateau = (
+            changed_plateau
+            and outcome == "stationary"
+            and command_nm not in eligible
+        )
+        if lower >= upper or any(not lower < v < upper for v in stable) or excluded_plateau:
+            if not self._recheck_interior_on_conflict or lower >= upper or not eligible:
+                self.state, self.reason = (
+                    "incomplete",
+                    "holding_response_not_repeatable_or_monotone",
+                )
+                return
+            if (self._interior_recheck_start is None
+                or self._verification not in eligible or excluded_plateau):
+                self._verification = self.candidate_nm = min(eligible, key=abs)
+                self._interior_recheck_start = len(self.observations)
+                self.reason = "verify_interior_hold_after_inconsistent_boundary"
+                self._check_trial_budget()
+                return
         if self._verification is not None:
             if outcome != "stationary" or (
                 abs(command_nm - self._verification) > 1e-9 and not changed_plateau
@@ -125,10 +144,12 @@ class HoldingForceSearch:
             # Recheck this actual level; do not count the requested level as
             # another observation or relax command equality for completion.
             self._verification = self.candidate_nm = command_nm
+            if changed_plateau and self._interior_recheck_start is not None:
+                self._interior_recheck_start = len(self.observations)-1
             count = sum(
                 r["outcome"] == "stationary"
                 and abs(r["command_nm"] - command_nm) <= 1e-9
-                for r in self.observations
+                for r in self.observations[self._interior_recheck_start or 0:]
             )
             if count >= self.config.verification_repeats:
                 self.state, self.reason = (
@@ -165,6 +186,9 @@ class HoldingForceSearch:
             if self._verification is not None
             else "next_bounded_probe"
         )
+        self._check_trial_budget()
+
+    def _check_trial_budget(self):
         if len(self.observations) + len(self.transitions) >= self.config.max_trials:
             self.state, self.reason = "incomplete", "holding_trial_budget_exhausted"
 
@@ -214,6 +238,11 @@ class HoldingForceSearch:
             raise ValueError("holding transition must fit the command envelope")
         if abs(requested_command_nm - self.candidate_nm) > 1e-9:
             raise ValueError("holding transition must belong to the current probe")
+        progress = evidence.get("net_displacement_rad")
+        if self._recheck_interior_on_conflict and progress is not None and (
+            isinstance(progress, bool) or not math.isfinite(progress)
+        ):
+            raise ValueError("holding transition progress must be finite")
         self.transitions.append(
             {
                 **evidence,
@@ -225,6 +254,22 @@ class HoldingForceSearch:
         )
         stable = self._eligible_stationary_commands()
         if not stable:
+            if (self._recheck_interior_on_conflict and not self.observations
+                and self._verification is None and progress is not None
+                and abs(progress) >= self.config.movement_rad/2):
+                # An unverified arrival command is not yet a holding anchor.
+                # Censored progress guides a new bounded proposal only; it
+                # never enters the resolved force bounds or static samples.
+                proposal = (command_nm/2 if progress*command_nm > 0 else
+                            command_nm-math.copysign(max(self.config.torque_resolution_nm,
+                                                       abs(command_nm)), progress))
+                self.candidate_nm = max(-self.cap_nm, min(self.cap_nm, proposal))
+                self.reason = "refine_unverified_arrival_command"
+                if abs(self.candidate_nm-command_nm) <= 1e-9:
+                    self.state, self.reason = "incomplete", "holding_authority_insufficient"
+                else:
+                    self._check_trial_budget()
+                return
             self.state, self.reason = (
                 "incomplete",
                 "holding_no_repeatable_anchor" if self._verification is not None
@@ -258,25 +303,33 @@ class HoldingForceSearch:
         # point and confirm the selected hold again before declaring completion.
         if self.state == "complete":
             self.state = "searching"
+        if self._interior_recheck_start is not None:
+            self._interior_recheck_start = len(self.observations)
         self.reason = (
             "verify_hold_after_transition"
             if self._verification is not None
             else "refine_censored_transition"
         )
-        if len(self.observations) + len(self.transitions) >= self.config.max_trials:
-            self.state, self.reason = "incomplete", "holding_trial_budget_exhausted"
+        self._check_trial_budget()
 
     def _eligible_stationary_commands(self):
         rejected = [r["verification_command_nm"] for r in self.transitions
                     if r.get("verification_command_nm") is not None]
+        lower = max((r["command_nm"] for r in self.observations
+                     if r["outcome"] == "negative_motion"), default=-math.inf)
+        upper = min((r["command_nm"] for r in self.observations
+                     if r["outcome"] == "positive_motion"), default=math.inf)
         return [r["command_nm"] for r in self.observations
                 if r["outcome"] == "stationary"
+                and lower < r["command_nm"] < upper
                 and not any(abs(r["command_nm"] - v) <= 1e-9 for v in rejected)]
 
     @property
     def return_command_nm(self):
         """Use the selected recheck hold during reacquisition, not a rejected one."""
         if self._verification is not None:
+            if self._verification not in self._eligible_stationary_commands():
+                return None
             return self._verification
         return min(self._eligible_stationary_commands(), key=abs,
                    default=None)
@@ -318,6 +371,9 @@ class HoldingForceSearch:
             "auto_apply": False,
             "identifies_unique_gravity": False,
             "verification_semantics": "same_pose_command_rechecks_not_independent_history_validation",
+            "interior_recheck_enabled": self._recheck_interior_on_conflict,
+            "interior_recheck_start_observation": self._interior_recheck_start,
+            "rejected_stationary_commands_nm": sorted(set(stable)-set(self._eligible_stationary_commands())),
         }
         if detailed:
             view["observations"] = [dict(r) for r in self.observations]
