@@ -49,6 +49,7 @@ class CoordinatedWorkspaceController:
         self._search = self._probe = self._observation = None
         self._attempts = 0
         self._sample_pose = None
+        self._nominal_target = None
         self._pose_window = None
         self._leg_anchor = None
         self._pending = self._receipt = None
@@ -156,7 +157,7 @@ class CoordinatedWorkspaceController:
             self._sweep_exposure = 0.0
             self._sweep_started = self.pose.last_time
             plan = plan_local_sweeps(condition=self._condition, joint_name=task["joint"],
-                anchor_qpos_rad=self.pose.goal, position_limits_rad=self._position_limits,
+                anchor_qpos_rad=self._nominal_target or self.pose.goal, position_limits_rad=self._position_limits,
                 excursion_rad=self.workspace.local_excursion_rad(self.config), speeds_rad_s=self.config.sweep_speeds_rad_s,
                 max_reference_velocity_rad_s=self.pose.motion.max_reference_velocity_rad_s, purpose="local_identification")
             self._steps = plan["steps"]
@@ -165,13 +166,14 @@ class CoordinatedWorkspaceController:
             self._leg_index, self._legs = 0, []
             self._begin_leg()
         else:
-            goal = list(self.pose.goal)
+            goal = list(self._nominal_target or self.pose.goal)
             i = int(task["joint"][-1]) - 1
             distance = task["target"] - self.pose.q[i]
             goal[i] = self.pose.q[i] + max(-self.workspace.maximum_positioning_step_rad,
                                          min(self.workspace.maximum_positioning_step_rad, distance))
             self.pose.set_goal(goal,
                 support_soft_speed_recovery=self.workspace.positioning_support_soft_speed_recovery)
+            self._nominal_target = self.pose.goal
             self._segments += 1
             if self._segments > 64:
                 self._stop("workspace_positioning_segment_budget", "failed")
@@ -183,6 +185,7 @@ class CoordinatedWorkspaceController:
         step = self._steps[self._leg_index]
         self.pose.set_goal(step["target_qpos_rad"],
             max_reference_velocity_rad_s=step["max_reference_velocity_rad_s"])
+        self._nominal_target = self.pose.goal
         self._search = self._probe = self._observation = self._sample_pose = None
         self._attempts = 0
         self._leg_started, self._leg_exposure = self.pose.last_time, 0.0
@@ -415,7 +418,7 @@ class CoordinatedWorkspaceController:
                 return
             if self._phase in {"observe", "return_observe"}:
                 observation = {"task": copy.deepcopy(task), "qpos_rad": self.pose.q, **window,
-                    "nominal_target_rad": self.pose.goal,
+                    "nominal_target_rad": self._nominal_target,
                     "command_delta_nm": delta, "gravity_command_nm": commands["gravity_nm"],
                     "driver_kd_nm_s_per_rad": self._last_kd, "completed_at_sec": completed,
                     "quantity": "coupled_command_hold_not_gravity_only_or_measured_force"}
@@ -449,10 +452,19 @@ class CoordinatedWorkspaceController:
                 self._stop("holding_search_incomplete", "failed")
                 return
             if self._search is None:
-                self._search = HoldingForceSearch(cfg, seed_nm=delta[j], cap_nm=self.workspace.coordinated_holding.total_assist_cap_nm)
-                # Freeze the complete measured pose after the admitted quiet
-                # handoff. The nominal J2/J3 target remains separate and fixed.
+                self._search = HoldingForceSearch(cfg, seed_nm=delta[j],
+                    cap_nm=self.workspace.coordinated_holding.total_assist_cap_nm,
+                    recheck_interior_on_conflict=True)
+                # Freeze the complete measured pose and hold its controlled
+                # axes, not alternating edges of the nominal arrival band.
+                # Keep the nominal plan and all passive targets separately.
                 self._sample_pose = self.pose.q
+                hold_goal = list(self.pose.goal)
+                for i in AXES:
+                    hold_goal[i] = self._sample_pose[i]
+                self.pose.set_goal(hold_goal,
+                    max_reference_velocity_rad_s=self.pose.trackers[0].config.max_reference_velocity_rad_s,
+                    support_soft_speed_recovery=self.pose.trackers[0].config.support_soft_speed_recovery)
             self._attempts += 1
             self._probe = self._search.candidate_nm
             self._observation = {"requested_command_nm": self._probe, "ramp_frozen": False,
@@ -483,6 +495,7 @@ class CoordinatedWorkspaceController:
             else:
                 obs.update(started_at_sec=stamp, first_causal_receipt_at_sec=previous_receipt["completed_at_sec"],
                     anchor_qpos_rad=q, minimum_rad=q, maximum_rad=q,
+                    stationary_since_sec=stamp, stationary_minimum_rad=q[j], stationary_maximum_rad=q[j],
                     minimum_delta_nm=previous, maximum_delta_nm=previous)
                 return
         if outcome is None:
@@ -492,12 +505,24 @@ class CoordinatedWorkspaceController:
             obs["maximum_delta_nm"] = tuple(max(a,b) for a,b in zip(obs["maximum_delta_nm"],previous))
             elapsed = stamp-obs["started_at_sec"]
             displacement = q[j]-obs["anchor_qpos_rad"][j]
+            # A tolerated pose error is not proof of a constant-command hold.
+            # Restart only the stationary dwell, not the observation budget,
+            # after progress beyond +/- one encoder count or lost quietness.
+            obs["net_displacement_rad"] = displacement
+            obs["stationary_minimum_rad"] = min(obs["stationary_minimum_rad"], q[j])
+            obs["stationary_maximum_rad"] = max(obs["stationary_maximum_rad"], q[j])
+            span = obs["stationary_maximum_rad"]-obs["stationary_minimum_rad"]
+            resolution = self.pose.motion.position_resolution_rad
+            if not self.pose.quiet() or resolution is not None and span > 2*resolution + 1e-9:
+                obs.update(stationary_since_sec=stamp, stationary_minimum_rad=q[j], stationary_maximum_rad=q[j])
+            obs["stationary_dwell_sec"] = stamp-obs["stationary_since_sec"]
             if elapsed >= self.pose.motion.velocity_window_sec and abs(displacement) >= cfg.movement_rad and displacement*self.pose.velocity[j] > 0 and displacement*self.pose.raw[j] > 0:
                 outcome = "positive_motion" if displacement > 0 else "negative_motion"
             elif elapsed >= cfg.observation_sec and self.pose.quiet():
                 if abs(q[j]-self._sample_pose[j]) > cfg.movement_rad:
                     outcome = "censored_settled_outside_point"
-                elif (max(b-a for a,b in zip(obs["minimum_rad"],obs["maximum_rad"])) <= cfg.movement_rad
+                elif (obs["stationary_dwell_sec"] >= cfg.observation_sec
+                      and max(b-a for a,b in zip(obs["minimum_rad"],obs["maximum_rad"])) <= cfg.movement_rad
                       and max(obs["maximum_delta_nm"][i]-obs["minimum_delta_nm"][i] for i in range(6) if i != j) <= cfg.torque_resolution_nm):
                     outcome = "stationary"
             if outcome is None and elapsed > cfg.observation_timeout_sec:
@@ -505,8 +530,9 @@ class CoordinatedWorkspaceController:
         if outcome is None:
             return
         obs.update(outcome=outcome, completed_at_sec=completed, final_qpos_rad=q,
+            net_displacement_rad=q[j]-obs["anchor_qpos_rad"][j],
             actual_delta_nm=previous, gravity_command_nm=commands["gravity_nm"],
-            driver_kd_nm_s_per_rad=self._last_kd, nominal_target_rad=self.pose.goal)
+            driver_kd_nm_s_per_rad=self._last_kd, nominal_target_rad=self._nominal_target)
         self._records.append({"kind": "coordinated_holding_observation", "recorded_monotonic_sec": completed, **obs})
         if outcome in {"stationary", "positive_motion", "negative_motion"}:
             self._search.record(command_nm=self._probe, requested_command_nm=obs["requested_command_nm"], outcome=outcome, evidence=dict(obs))
@@ -520,13 +546,13 @@ class CoordinatedWorkspaceController:
             self.pose.adopt_hold(j, self._search.status()["usable_hold_nm"])
             self._legs.append({"trial_id": self._steps[self._leg_index]["trial_id"], "role": self._steps[self._leg_index]["role"],
                 "max_reference_velocity_rad_s": self._steps[self._leg_index]["max_reference_velocity_rad_s"],
-                "completed_at_sec": completed, "target_position_rad": self.pose.goal[j], "measured_position_rad": q[j],
-                "target_error_rad": self.pose.goal[j]-q[j],
-                "tracking_target_reached": abs(self.pose.goal[j]-q[j]) <= self.settings.staged_assist.settle_error_rad,
+                "completed_at_sec": completed, "target_position_rad": self._nominal_target[j], "measured_position_rad": q[j],
+                "target_error_rad": self._nominal_target[j]-q[j],
+                "tracking_target_reached": abs(self._nominal_target[j]-q[j]) <= self.settings.staged_assist.settle_error_rad,
                 "final_zero_and_still_confirmed": False, "handoff_full_dispatch_confirmed": True,
                 "withdrawal_confirmed": False, "command_exposure_nm_sec": self._leg_exposure,
                 "holding_calibration": {**self._search.status(detailed=True), "sample_pose_rad": self._sample_pose,
-                    "nominal_target_rad": self.pose.goal, "support_bias_nm": self.pose.bias,
+                    "nominal_target_rad": self._nominal_target, "support_bias_nm": self.pose.bias,
                     "observation_mode": "coordinated_pose_hold", "withdrawal_confirmed": False}})
             self._leg_index += 1
             if self._leg_index < len(self._steps):
@@ -542,7 +568,8 @@ class CoordinatedWorkspaceController:
         return {"enabled": True, "stage": "fixed_command_observation" if self._probe is not None else "reacquire",
             "search": None if self._search is None else self._search.status(detailed=detailed),
             "probe_command_nm": self._probe, "sample_pose_rad": self._sample_pose,
-            "nominal_target_rad": self.pose.goal, "attempt_count": self._attempts,
+            "nominal_target_rad": self._nominal_target, "holding_reference_rad": self.pose.goal,
+            "attempt_count": self._attempts,
             "context_reason": ("inactive" if self._phase != "sweep" and self._reason != "holding_search_incomplete" else
                                "awaiting_sample_pose" if self._sample_pose is None else
                                "support_pose_changed" if self._passive_sample_changed() else "ready"),

@@ -312,8 +312,18 @@ function renderWorkspace(batch) {
   if (holding?.enabled) {
     const search = holding.search;
     const stages = {reacquire: "缓慢返回同一目标并等待稳定", observing: "已在采样点，零附加命令观察（不驱动）", fixed_command_observation: "定命令观察", withdrawal: "观测保留，正在撤力停稳", failed: "采样已停止", cancelled: "已撤销", complete: "已完成"};
-    el("automatic-progress").textContent += ` 保持命令搜索：${stages[holding.stage] || holding.stage}；尝试 ${holding.attempt_count}/${holding.max_attempts}；本次附加命令 ${number(holding.probe_command_nm)} N·m；已确认观测 ${search?.trial_count ?? 0} 次；变力退回／缩步 ${search?.transition_count ?? 0} 次；下一试探 ${number(search?.candidate_nm)} N·m；${search?.reason ?? "等待到点"}。`;
+    const holdReasons = {refine_unverified_arrival_command: "首次到点驱动力尚不能维持，返回同点后试探新命令（未认定为力边界）",
+      verify_interior_hold_after_inconsistent_boundary: "临界值复测不一致，重新复核内部维持值"};
+    el("automatic-progress").textContent += ` 保持命令搜索：${stages[holding.stage] || holding.stage}；尝试 ${holding.attempt_count}/${holding.max_attempts}；本次附加命令 ${number(holding.probe_command_nm)} N·m；已确认观测 ${search?.trial_count ?? 0} 次；变力退回／缩步 ${search?.transition_count ?? 0} 次；下一试探 ${number(search?.candidate_nm)} N·m；${holdReasons[search?.reason] || search?.reason || "等待到点"}。`;
     el("automatic-trials").textContent = `可用保持命令 ${number(search?.usable_hold_nm)} N·m；已观察静止范围 ${(search?.observed_stationary_range_nm || []).map(v => number(v)).join(" ～ ") || "尚无"}。这是软件命令与编码器响应，不是实测保持力或唯一重力修正。`;
+    if (search?.interior_recheck_start_observation != null) {
+      el("automatic-progress").textContent += search.state === "complete"
+        ? " 已完成内部维持命令重新复核；历史边界矛盾仍保留，不冒充唯一重力修正。"
+        : " 临界保持命令复测不一致，正在原预算内重新复核已观察的内部维持命令；不是重新开始整批，也不将矛盾边界用于拟合。";
+    }
+    if (search?.rejected_stationary_commands_nm?.length) {
+      el("automatic-trials").textContent += ` 已排除的旧维持候选：${search.rejected_stationary_commands_nm.map(v => number(v)).join("、")} N·m；原始观测保留。`;
+    }
   }
   const centres = (workspace.pose_centres_rad || []).map(q => `(${number(q[0] * 180 / Math.PI, 0)}°, ${number(q[1] * 180 / Math.PI, 0)}°)`).join(" → ");
   el("automatic-data-status").textContent = `配置组：${workspace.setup_label}。采样中心 (J2,J3)：${centres}。重力参数本轮冻结；保存已完成段与未完成段，数据质量和流程状态分开。不自动安装重力或摩擦补偿；本阶段不执行静摩擦阈值扫描。`;
@@ -327,6 +337,12 @@ function renderWorkspace(batch) {
   }
   if (workspace.coordinated_holding_enabled) {
     el("automatic-progress").textContent += ` 联合维持偏置 J2 ${number(workspace.holding_bias_nm?.[1])}、J3 ${number(workspace.holding_bias_nm?.[2])} N·m；最近完整发送 J2 ${number(workspace.last_confirmed_delta_nm?.[1])}、J3 ${number(workspace.last_confirmed_delta_nm?.[2])} N·m；两轴附加命令绝对值之和上限 ${number(workspace.combined_l1_cap_nm)} N·m（均非实测受力）。`;
+    if (holding?.nominal_target_rad) {
+      el("automatic-progress").textContent += ` 当前局部目标 J2 ${number(holding.nominal_target_rad[1] * 180 / Math.PI, 3)}°、J3 ${number(holding.nominal_target_rad[2] * 180 / Math.PI, 3)}°；局部回移是采样计划，不是仍在追赶中心点。`;
+    }
+    if (holding?.sample_pose_rad) {
+      el("automatic-progress").textContent += ` 本点冻结实测 J2 ${number(holding.sample_pose_rad[1] * 180 / Math.PI, 3)}°、J3 ${number(holding.sample_pose_rad[2] * 180 / Math.PI, 3)}°；重复试探返回该点，不改写原计划目标。`;
+    }
     const arrival = workspace.arrival;
     if (arrival) {
       const reasons = {no_goal: "尚无定位目标", six_axis_not_stationary: "等待六轴停稳", controlled_target_error: "等待 J2/J3 到位", ready: "J2/J3 已到位，六轴已停稳"};

@@ -648,6 +648,10 @@ render();const arrivalWaiting=el('automatic-progress').textContent;
 batch.workspace.arrival.reason='ready';render();const arrivalReady=el('automatic-progress').textContent;
 batch.workspace.holding_calibration={enabled:true,context_reason:'support_pose_changed'};
 render();const contextChanged=el('automatic-progress').textContent;
+batch.workspace.holding_calibration={enabled:true,nominal_target_rad:[0,.04235987756,.05235987756,0,0,0],
+  search:{state:'searching',interior_recheck_start_observation:6,rejected_stationary_commands_nm:[-.14209]}};
+render();const recheck=el('automatic-progress').textContent;const rejected=el('automatic-trials').textContent;
+batch.workspace.holding_calibration.search.state='complete';render();const rechecked=el('automatic-progress').textContent;
 batch.workspace.coordinated_holding_enabled=false;delete batch.workspace.holding_calibration;
 batch.state='complete';batch.active=false;batch.workspace.phase='complete';batch.cycle.disable_confirmation_available=true;
 const complete = render();
@@ -657,11 +661,14 @@ const warningInstructions=el('drive-instructions').textContent;
 batch.outcome={severity:'error'};render();const fault=el('phase').textContent;
 const faultInstructions=el('drive-instructions').textContent;
 batch.state='idle';batch.workspace.phase='idle';batch.human_intervention=true;
-console.log(JSON.stringify({idle,active,complete,warning,fault,warningInstructions,faultInstructions,arrivalWaiting,arrivalReady,contextChanged,human:render(),stopLabel:el('full-disable').textContent}));
+console.log(JSON.stringify({idle,active,complete,warning,fault,warningInstructions,faultInstructions,arrivalWaiting,arrivalReady,contextChanged,recheck,rejected,rechecked,human:render(),stopLabel:el('full-disable').textContent}));
 """
     result = subprocess.run([node, "-e", script, json.dumps(functions)],
         check=True, capture_output=True, text=True)
     states = json.loads(result.stdout)
+    assert "原预算内重新复核" in states["recheck"] and "2.427°" in states["recheck"]
+    assert "已排除的旧维持候选" in states["rejected"]
+    assert "已完成内部维持命令重新复核" in states["rechecked"]
     assert states["idle"] == {"arm": False, "joint": True, "targetHidden": True,
         "authorizeHidden": True, "confirm": True, "background": True}
     assert states["active"]["arm"] is True

@@ -351,7 +351,46 @@ def test_position_arrival_accepts_settled_passive_offset_without_retargeting_it(
     assert workspace.pose.quiet()
     assert workspace._sample_pose == r.q
     assert workspace._sample_pose != workspace.pose.goal
+    assert all(workspace.pose.goal[i] == workspace._sample_pose[i] for i in (1, 2))
+    assert workspace._holding_status()["nominal_target_rad"] == workspace._nominal_target
+    assert workspace._holding_status()["holding_reference_rad"] == workspace.pose.goal
+    assert workspace.pose.trackers[0].config.max_reference_velocity_rad_s == workspace._steps[0]["max_reference_velocity_rad_s"]
     assert r.controller.status()["automatic_calibration"]["workspace"]["arrival"]["reason"] == "ready"
+
+
+@pytest.mark.parametrize("response", ["creep", "settle", "one_count_jitter"])
+def test_fixed_hold_needs_a_continuous_quiet_dwell_not_just_a_tolerated_displacement(tmp_path, response):
+    r = replay(tmp_path, holding_search=HoldingSearchConfig(
+        observation_sec=.5, observation_timeout_sec=1.5, movement_rad=.003))
+    advance_to_coordinated_probe(r)
+    workspace = r.controller._coordinated
+    for _ in range(50):
+        r.tick(dt_sec=.025)
+        if workspace._observation and workspace._observation["started_at_sec"] is not None:
+            break
+    else:
+        pytest.fail("no causal constant-command plateau")
+    assert workspace._search.status()["interior_recheck_enabled"]
+    anchor = list(r.q)
+    j = int(workspace._tasks[workspace._index]["joint"][-1])-1
+    resolution = workspace.pose.motion.position_resolution_rad
+    command = workspace._probe
+    for n in range(1, 75):
+        q = list(anchor)
+        progress = n % 2 if response == "one_count_jitter" else min(n, 22) // 5 if response == "settle" else n // 5
+        q[j] += resolution*progress
+        r.tick(q, dt_sec=.025)
+        if response != "one_count_jitter" and n <= 22:
+            assert workspace._search.observations == []
+        if workspace._search.observations:
+            break
+    observations = workspace._search.observations
+    assert observations
+    assert observations[0]["command_nm"] == command
+    assert observations[0]["outcome"] == ("positive_motion" if response == "creep" else "stationary")
+    if response != "creep":
+        assert observations[0]["stationary_dwell_sec"] >= .5
+    assert workspace._sample_pose == tuple(anchor)
 
 
 @pytest.mark.parametrize("enabled", [False, True])
@@ -574,13 +613,22 @@ def test_coupled_partial_batch_holds_other_axis_handoffs_and_final_withdrawal(tm
 @pytest.mark.parametrize("period", [.01, .025])
 @pytest.mark.parametrize("passive_offset", [0, .006519419])
 def test_full_coupled_batch_and_report_keep_handoffs_distinct_from_withdrawal(tmp_path, period, passive_offset, monkeypatch):
+    from pathlib import Path
     from types import SimpleNamespace
 
     from control_station.b601_torque_console import transparency
     from control_station.b601_torque_console.automatic_report import (
         build_automatic_report,
     )
-    r = replay(tmp_path, initial_q=(0, .01, .01, 0, 0, 0))
+    changes = {}
+    if period == .025 and passive_offset:
+        # Exercise the actual explicit profile at the observed cadence too,
+        # rather than validating the new margins only with shortened dwells.
+        profile = Path(__file__).resolve().parents[1]/"docs/hardware/profiles/b601_j2_j3_coordinated_holding_v1.json"
+        values = json.loads(profile.read_text())["workspace"]["holding_search"]
+        changes["holding_search"] = HoldingSearchConfig(**values)
+    r = replay(tmp_path, initial_q=(0, .01, .01, 0, 0, 0), **changes)
+    movement = r.controller._coordinated.workspace.holding_search.movement_rad
     monkeypatch.setattr(transparency, "time", SimpleNamespace(monotonic=lambda: r.now+.002))
     journal = transparency.TransparencyAssessment(tmp_path / "b601_owner.transparency.jsonl", automatic=True)
     def snapshot():
@@ -621,7 +669,7 @@ def test_full_coupled_batch_and_report_keep_handoffs_distinct_from_withdrawal(tm
     assert report["workspace"]["gravity_observations"] == []
     assert len(report["workspace"]["coordinated_pose_observations"]) == 2
     for observation in report["workspace"]["coordinated_pose_observations"]:
-        assert max(b-a for a,b in zip(observation["minimum_rad"], observation["maximum_rad"])) <= .003
+        assert max(b-a for a,b in zip(observation["minimum_rad"], observation["maximum_rad"])) <= movement
         assert observation["qpos_rad"][3] == pytest.approx(passive_offset)
     assert report["cycle"]["zero_assist_base_damping_confirmed"]
     assert (tmp_path / "b601_owner.transparency.jsonl").stat().st_size > 0
@@ -631,7 +679,7 @@ def test_full_coupled_batch_and_report_keep_handoffs_distinct_from_withdrawal(tm
             if obs["outcome"] != "stationary":
                 continue
             assert obs["started_at_sec"] > obs["first_causal_receipt_at_sec"]
-            assert max(b-a for a,b in zip(obs["minimum_rad"], obs["maximum_rad"])) <= .003
+            assert max(b-a for a,b in zip(obs["minimum_rad"], obs["maximum_rad"])) <= movement
             assert sum(abs(v) for v in obs["actual_delta_nm"]) <= 1+1e-9
 
 
