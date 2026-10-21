@@ -7,6 +7,7 @@ This module never opens CAN, a motor backend, or the torque-console server.
 from __future__ import annotations
 
 import argparse
+import gzip
 import json
 import math
 import sys
@@ -301,18 +302,32 @@ def summarize_trace(
     }
 
 
+def _resolve_jsonl_path(path: Path) -> Path:
+    # Old run-directory references remain readable after lossless archival.
+    if not path.exists() and path.suffix != ".gz":
+        compressed = path.with_name(path.name+".gz")
+        if compressed.exists():
+            return compressed
+    return path
+
+
 def _jsonl(path: Path) -> Iterable[dict[str, object]]:
-    with path.open(encoding="utf-8") as stream:
-        for line_number, line in enumerate(stream, start=1):
-            if not line.strip():
-                continue
-            try:
-                row = json.loads(line)
-            except json.JSONDecodeError as error:
-                raise ValueError(f"{path}:{line_number}: invalid JSON") from error
-            if not isinstance(row, dict):
-                raise TypeError(f"{path}:{line_number}: expected JSON object")
-            yield row
+    path = _resolve_jsonl_path(path)
+    opener = gzip.open if path.suffix == ".gz" else open
+    try:
+        with opener(path, "rt", encoding="utf-8") as stream:
+            for line_number, line in enumerate(stream, start=1):
+                if not line.strip():
+                    continue
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError as error:
+                    raise ValueError(f"{path}:{line_number}: invalid JSON") from error
+                if not isinstance(row, dict):
+                    raise TypeError(f"{path}:{line_number}: expected JSON object")
+                yield row
+    except EOFError as error:
+        raise ValueError(f"{path}: incomplete compressed trace") from error
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -328,7 +343,7 @@ def main(argv: list[str] | None = None) -> int:
     mode.add_argument("--automatic-calibration", action="store_true", help="automatic onset, return and running-resistance acquisition summary")
     parser.add_argument("--pair-pose-tolerance-rad", type=float, default=0.03)
     args = parser.parse_args(argv)
-    trace = args.run_dir.resolve() / "b601_owner.debug.jsonl"
+    trace = _resolve_jsonl_path(args.run_dir.resolve() / "b601_owner.debug.jsonl")
     try:
         if args.automatic_calibration:
             from .automatic_report import build_automatic_report

@@ -5485,10 +5485,12 @@ def test_queued_trace_close_timeout_does_not_close_an_inflight_stream():
 
 
 @pytest.mark.parametrize("handled_error", [False, True])
+@pytest.mark.parametrize("compressed", [False, True])
 def test_debug_trace_main_writes_separate_jsonl_without_hardware(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     handled_error: bool,
+    compressed: bool,
 ) -> None:
     callbacks_before = tuple(probe.gc.callbacks)
 
@@ -5518,6 +5520,7 @@ def test_debug_trace_main_writes_separate_jsonl_without_hardware(
             "--output", str(output),
             "--log", str(tmp_path / "runtime.log"),
             "--debug-dynamics-trace",
+            *(["--gzip-dynamics-trace"] if compressed else []),
         ]
     )
 
@@ -5528,7 +5531,7 @@ def test_debug_trace_main_writes_separate_jsonl_without_hardware(
         assert result["cleanup"]["device_cleanup_confirmed"] is False
         assert result["cleanup"]["transport_release"]["completed"] is True
         assert result["cleanup"]["errors"] == ["safe_stop: synthetic failure"]
-    trace_path = tmp_path / "result.debug.jsonl"
+    trace_path = tmp_path / ("result.debug.jsonl.gz" if compressed else "result.debug.jsonl")
     assert result["debug_dynamics_trace"]["path"] == str(trace_path)
     assert result["debug_dynamics_trace"]["sample_count"] == 1
     assert result["debug_dynamics_trace"]["writer"]["drain_complete"]
@@ -5537,7 +5540,27 @@ def test_debug_trace_main_writes_separate_jsonl_without_hardware(
     assert result["debug_dynamics_trace"]["gc_observation"]["settings_at_start"]["enabled"] == probe.gc.isenabled()
     assert result["debug_dynamics_trace"]["last_feedback_read_diagnostics"]["stages"]["backend_poll"]["interval_count"] == 1
     assert tuple(probe.gc.callbacks) == callbacks_before
-    assert json.loads(trace_path.read_text(encoding="utf-8"))["kind"] == "synthetic"
+    from control_station.b601_torque_console.report import _jsonl
+
+    rows = list(_jsonl(tmp_path / "result.debug.jsonl"))
+    assert rows[0]["kind"] == "synthetic"
+    assert rows[0]["commanded_power_w"] == [.1]*6
+
+
+def test_compressed_trace_reader_retains_rows_and_rejects_missing_footer(tmp_path):
+    import gzip
+
+    from control_station.b601_torque_console.report import _jsonl, _resolve_jsonl_path
+
+    plain = tmp_path / "b601_owner.debug.jsonl"
+    compressed = plain.with_name(plain.name+".gz")
+    encoded = gzip.compress(b'{"kind":"active_dispatch","sequence":1}\n')
+    compressed.write_bytes(encoded)
+    assert _resolve_jsonl_path(plain) == compressed
+    assert list(_jsonl(plain)) == [{"kind":"active_dispatch", "sequence":1}]
+    compressed.write_bytes(encoded[:-8])
+    with pytest.raises(ValueError, match="incomplete compressed trace"):
+        list(_jsonl(plain))
 
 
 def test_main_without_debug_does_not_register_gc_observer(monkeypatch, tmp_path):

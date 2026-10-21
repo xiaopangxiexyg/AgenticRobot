@@ -144,6 +144,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import gc
+import gzip
 import hashlib
 import json
 import math
@@ -7545,6 +7546,7 @@ class _DynamicsTrace:
                 {"kind": kind, "recorded_monotonic_sec": time.monotonic(), **fields},
                 allow_nan=False,
                 default=list,
+                separators=(",", ":"),
             )
             timing.mark("encode")
             self.stream.write(encoded + "\n")
@@ -13357,6 +13359,8 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         help="write detailed stdout/stderr; defaults beside --output with a .log suffix",
     )
+    parser.add_argument("--gzip-dynamics-trace", action="store_true",
+                        help="lossless gzip trace; compression stays in the bounded writer thread")
     return parser
 
 
@@ -13452,7 +13456,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         if code:
             print(f"[B601] {payload['error']}", flush=True)
         return code
-    if args.torque_console:
+    if args.torque_console or args.gzip_dynamics_trace:
         args.debug_dynamics_trace = True
     if args.debug_dynamics_trace and args.output is None:
         build_parser().error("--debug-dynamics-trace requires --output")
@@ -13471,7 +13475,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             flush=True,
         )
     debug_trace_path = (
-        Path(args.output).expanduser().resolve().with_suffix(".debug.jsonl")
+        Path(args.output).expanduser().resolve().with_suffix(
+            ".debug.jsonl.gz" if args.gzip_dynamics_trace else ".debug.jsonl")
         if args.debug_dynamics_trace
         else None
     )
@@ -13484,7 +13489,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         gc_observer = None
         if debug_trace_path is not None:
             debug_trace_path.parent.mkdir(parents=True, exist_ok=True)
-            debug_stream = stack.enter_context(_QueuedTraceStream(debug_trace_path.open("x", encoding="utf-8")))
+            sink = (gzip.open(debug_trace_path, "xt", encoding="utf-8", compresslevel=1)  # noqa: SIM115 - writer owns close, including drain timeout
+                    if args.gzip_dynamics_trace else debug_trace_path.open("x", encoding="utf-8"))
+            debug_stream = stack.enter_context(_QueuedTraceStream(sink))
             gc_observer = stack.enter_context(_ProbeGCObserver())
             debug_trace = _DynamicsTrace(debug_stream, gc_observer=gc_observer)
         print(

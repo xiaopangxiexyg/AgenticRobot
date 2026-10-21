@@ -107,6 +107,8 @@ def _parser() -> argparse.ArgumentParser:
         help="write per-cycle feedback/torque and protective-hold diagnostics to JSONL",
     )
     parser.add_argument("--warmup-sec", type=float, default=2.0)
+    parser.add_argument("--gzip-dynamics-trace", action="store_true",
+                        help="losslessly compress the complete trace in the existing writer thread")
     parser.add_argument("--rate-hz", type=float, default=20.0)
     parser.add_argument(
         "--show-joint-angles",
@@ -582,6 +584,8 @@ def build_probe_command(
         command.append("--gravity-debug-mode")
     if args.debug_dynamics_trace:
         command.append("--debug-dynamics-trace")
+    if args.gzip_dynamics_trace:
+        command.append("--gzip-dynamics-trace")
     if args.show_joint_angles:
         command.append("--show-joint-angles")
     if args.torque_console_quantized_velocity_debug:
@@ -805,6 +809,8 @@ def _motorbridge_environment(root: Path | None = None) -> dict[str, str]:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
+    if args.gzip_dynamics_trace:
+        args.debug_dynamics_trace = True
     if args.torque_console_auto_calibration_profile is not None:
         args.torque_console = args.torque_console_staged_assist = True
     if args.torque_console:
@@ -937,7 +943,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     print(f"[B601] run directory: {run_dir}", flush=True)
     print(f"[B601] terminal log: {run_dir / 'terminal.log'}", flush=True)
     if args.debug_dynamics_trace:
-        print(f"[B601] dynamics trace: {run_dir / 'b601_owner.debug.jsonl'}", flush=True)
+        suffix = 'b601_owner.debug.jsonl.gz' if args.gzip_dynamics_trace else 'b601_owner.debug.jsonl'
+        print(f"[B601] dynamics trace: {run_dir / suffix}", flush=True)
     if args.torque_console:
         print(f"[B601] transparency annotations: {run_dir / 'b601_owner.transparency.jsonl'}", flush=True)
     status = _run_foreground(
@@ -950,7 +957,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     print(f"[B601] result: {run_dir / 'b601_owner.json'}", flush=True)
     print(f"[B601] log: {run_dir / 'b601_owner.log'}", flush=True)
     if args.debug_dynamics_trace:
-        print(f"[B601] dynamics trace: {run_dir / 'b601_owner.debug.jsonl'}", flush=True)
+        suffix = 'b601_owner.debug.jsonl.gz' if args.gzip_dynamics_trace else 'b601_owner.debug.jsonl'
+        print(f"[B601] dynamics trace: {run_dir / suffix}", flush=True)
     print(f"[B601] terminal log: {run_dir / 'terminal.log'}", flush=True)
     print("[B601] parent shell remains active", flush=True)
     if args.pause_on_exit and sys.stdin.isatty():

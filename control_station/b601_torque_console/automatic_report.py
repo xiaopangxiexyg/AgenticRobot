@@ -13,7 +13,7 @@ from robot_motion.rebot_b601_rs.calibration import summarize_automatic_acquisiti
 
 from .calibration_report import summarize_calibration
 from .calibration_session import calibration_outcome, calibration_receipt_rejection
-from .report import _jsonl
+from .report import _jsonl, _resolve_jsonl_path
 
 
 def _workspace_motion_windows(trace: Path, workspace: dict) -> dict:
@@ -94,7 +94,7 @@ def _workspace_motion_windows(trace: Path, workspace: dict) -> dict:
 
 
 def build_automatic_report(run_dir: Path) -> dict:
-    trace = run_dir / "b601_owner.debug.jsonl"
+    trace = _resolve_jsonl_path(run_dir / "b601_owner.debug.jsonl")
     annotations = run_dir / "b601_owner.transparency.jsonl"
     result = None
     started = None
