@@ -18,6 +18,27 @@
   基线中已接入的自观测过滤、夹爪等扩展保持原显式启用方式，默认 15 mm／v1／严格碰撞
   行为不随硬件迁移切换。物理验证仍由操作者运行，不把离线回归当成硬件有效性证明。
 
+### 四中心配置交付（2026-10-21，未执行新真机）
+
+基于近零候选 `0b2627ca1552f70d6c34483e12871c50a151246a`。远端
+`near-zero-smooth-drive-acceptance/b601-owner-117zswqu` 已完成单中心两轴 24 段，
+报告 `ACQUISITION_COMPLETE`，保持复验 24 条；完整 trace 87359 行，反馈／计算／发送
+约 99.05 Hz，deadline miss 为零。最终通过操作者中断失能，原始 acceptance FAIL
+不重写；GUI 确认按钮已可用但该轮未点击，不能声称其交互已验收。
+
+新增独立 `b601_j2_j3_four_centres_holding_v1.json`：中心为 3/8 度蛇形四组合、
+两轴合计 96 段；采集范围显式为 0–12 度，保留原 0.04 rad 中心边界余量校验。
+整 workspace 仅按四倍任务量变为 12480 秒／4160 N·m·s；单组／单段预算、
+所有控制源码、接口、瞬时合成上限、速度／反馈／派发／watchdog 及人工失能确认不变。
+原单中心 profile 不修改，不合并／推送，不触碰框架线正在编辑的文件。
+
+已运行配置与生命周期／联合保持组合测试 `262 passed, 1 skipped`；skip 是默认资源
+路径无 pinned reBotArm。另外指定既有来源实际执行新 profile 几何审计：74 个唯一配置，
+无三角相交／低于 2 mm 的三角间距，保留两次近零起点／返回凸包间距警告，状态仍为
+`CLEARANCE_REVIEW_REQUIRED`。不把名义路径结果当成现场环境或跟踪误差包络保证。
+新增完整参数 preflight 对比必须确认仅六个 workspace 字段变化，禁止 backend/CAN
+构造；对应远端结果和部署回执放在硬件专用目录外部日志，不污染源码。
+
 ### 日志无损压缩与旧 trace 归档（2026-10-21）
 
 owner/probe 新增显式 `--gzip-dynamics-trace`，输出 `b601_owner.debug.jsonl.gz`。

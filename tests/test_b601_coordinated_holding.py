@@ -935,6 +935,50 @@ def test_explicit_leg_overrides_are_validated_before_any_acquisition(tmp_path, v
         replay(tmp_path, **values)
 
 
+def test_four_centres_profile_scales_only_whole_workspace_and_reuses_controller(tmp_path):
+    from control_station.b601_torque_console.automatic_calibration import (
+        load_automatic_profile,
+    )
+
+    profiles = Path(__file__).resolve().parents[1]/"docs/hardware/profiles"
+    baseline = load_automatic_profile(profiles/"b601_j2_j3_coordinated_holding_v1.json")
+    expanded = load_automatic_profile(profiles/"b601_j2_j3_four_centres_holding_v1.json")
+    before = baseline.pop("workspace")
+    after = expanded.pop("workspace")
+    assert expanded == baseline
+    assert {k for k in before if before[k] != after[k]} == {
+        "joint2_centres_deg", "joint3_centres_deg",
+        "joint2_acquisition_range_deg", "joint3_acquisition_range_deg",
+        "max_workspace_sec", "max_command_exposure_nm_sec",
+    }
+    assert after == {**before, "joint2_centres_deg": [3, 8], "joint3_centres_deg": [3, 8],
+                     "joint2_acquisition_range_deg": [0, 12], "joint3_acquisition_range_deg": [0, 12],
+                     "max_workspace_sec": before["max_workspace_sec"]*4,
+                     "max_command_exposure_nm_sec": before["max_command_exposure_nm_sec"]*4}
+    whole = production_controller.__wrapped__(tmp_path)
+    old = whole._workspace
+    controller = B601WorkspaceCalibrationController(old.settings, old.config, WorkspaceCalibrationConfig(**after))
+    controller.validate_position_limits(LIMITS)
+    centres = tuple(tuple(math.degrees(v) for v in q) for q in controller.workspace.pose_centres())
+    assert len(centres) == 4
+    for actual, expected in zip(centres, ((3, 3), (3, 8), (8, 8), (8, 3))):
+        assert actual == pytest.approx(expected)
+    tasks = controller.workspace.tasks(ZERO)
+    sweeps = [t for t in tasks if t["kind"] == "sweep"]
+    assert [(t["pose"], t["joint"]) for t in sweeps] == [
+        (pose, joint) for pose in range(4) for joint in ("joint2", "joint3")]
+    assert sum(t["kind"] == "observe" for t in tasks) == 4
+    assert [t["joint"] for t in tasks if t["kind"] == "return"] == ["joint2", "joint3"]
+    assert tasks[-1]["kind"] == "return_observe"
+    assert controller.config.max_sweep_leg_sec == before["max_sweep_leg_sec"]
+    assert controller.config.max_sweep_leg_command_exposure_nm_sec == before["max_sweep_leg_command_exposure_nm_sec"]
+    assert controller.workspace.coordinated_holding == WorkspaceCalibrationConfig(**before).coordinated_holding
+    assert controller.settings.staged_assist.motion_control.max_control_gap_sec == .04
+    with pytest.raises(ValueError, match="insufficient room"):
+        B601WorkspaceCalibrationController(old.settings, old.config, replace(controller.workspace,
+            joint2_acquisition_range_deg=(0, 10), joint3_acquisition_range_deg=(0, 10)))
+
+
 def test_current_margin_profile_resolves_workspace_only_and_keeps_hard_envelopes(tmp_path):
     profile = Path(__file__).resolve().parents[1]/"docs/hardware/profiles/b601_j2_j3_coordinated_holding_v1.json"
     values = json.loads(profile.read_text())["workspace"]
