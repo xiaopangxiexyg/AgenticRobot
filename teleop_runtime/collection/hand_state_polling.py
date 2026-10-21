@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import threading
 
-from utils.owned_thread import OwnedThread
+from robot_motion.runtime.owned_thread import OwnedThread
 import time
 from dataclasses import dataclass
 from typing import Any, Mapping

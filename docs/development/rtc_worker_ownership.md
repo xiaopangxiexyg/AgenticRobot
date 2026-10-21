@@ -65,8 +65,15 @@ factory/close 竞态、严格停止证明、诊断失败和 backend 依赖；随
 先登记 owner，再显式启动，并通过 teardown 排空所有 owner。不得删除原有行为断言。
 
 原始报告、绑定的文件 hash、进程与超时记录和独立审查收束记录保存在机器上的
-`AgenticRobotEvidence/defect-repair-20261015T074029Z/rtc-worker-ownership-20261021-r2/`。
+`AgenticRobotEvidence/defect-repair-20261015T074029Z/rtc-worker-ownership-20261021-r3/`。
 具体通过数量与主线提交以该阶段最终验收记录为准，未完成的 gate 不得标为通过。
 
-首轮全量验收发现本文未接入文档导航，修复前的测试和停止证明保留在相邻的 r1 证据目录；
-补齐架构页链接后，以新的文档提交和全新完整验收收束，不复用未完成的首轮全量结果。
+首轮全量验收的已完成分片暴露了本文未接入导航以及两个 writer 导入回归。后两项来自本批
+hand poller 新增的顶层 utils 引用，在 SDK 同名模块或预加载 utils 环境中会遮蔽线程工具。
+这些是真实集成缺陷，不能归因于取消。r2 补齐了导航；发现 writer 回归后也中止并排空，
+r1/r2 均不作为完整通过证据。原始失败、取消收据和部分报告分别保留在相邻证据目录。
+
+r3 将唯一线程 owner 实现放到纯标准库的 robot_motion.runtime.owned_thread，utils.owned_thread
+只重导出同一类；本批四个生产消费者直接使用 canonical 路径。collection 原本已依赖同层
+runtime，不调整 sys.path、不替换 sys.modules、不复制 owner。新增类 identity 检查，并保留
+原有两个 writer shadowed-utils 测试。以新的固定候选和全新完整验收收束本阶段。

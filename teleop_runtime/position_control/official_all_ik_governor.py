@@ -16,7 +16,7 @@ import os
 import queue
 import threading
 
-from utils.owned_thread import OwnedThread
+from robot_motion.runtime.owned_thread import OwnedThread
 import time
 from collections import OrderedDict
 from dataclasses import dataclass

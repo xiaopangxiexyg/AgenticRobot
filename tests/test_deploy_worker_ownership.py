@@ -519,3 +519,8 @@ def test_c2_ipc_close_failure_after_child_exit_is_retryable_without_notifying_cl
         first.failed = second.failed = True
         planner.close()
     assert first.closed and second.closed and len(puts) == len(joins) == 1
+
+
+def test_canonical_owned_thread_and_compatibility_export_share_one_class():
+    from robot_motion.runtime.owned_thread import OwnedThread as CanonicalOwnedThread
+    assert CanonicalOwnedThread is OwnedThread

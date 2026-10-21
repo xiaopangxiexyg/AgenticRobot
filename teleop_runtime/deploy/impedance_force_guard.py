@@ -11,7 +11,7 @@ from dataclasses import dataclass
 import math
 import threading
 
-from utils.owned_thread import OwnedThread
+from robot_motion.runtime.owned_thread import OwnedThread
 import time
 from typing import Any, Callable, Mapping
 

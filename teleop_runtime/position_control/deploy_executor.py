@@ -12,7 +12,7 @@ from typing import Any, Callable, Mapping
 
 import numpy as np
 
-from utils.owned_thread import OwnedThread
+from robot_motion.runtime.owned_thread import OwnedThread
 
 from dataset_contracts.canonical_encoding import canonical_content_hash
 from robot_motion.deploy.actions import (
