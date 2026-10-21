@@ -173,3 +173,6 @@ Conda 仍是唯一受支持的环境安装方式；`pyproject.toml` 中的 extra
 
 边界回归由 `tests/test_runtime_domain_boundaries.py` 以及各领域现有 boundary tests 共同保护。
 本页描述当前已实施的依赖规则；未完成的拆分会明确标为迁移债务，不能据此宣称已完成运行时集成。
+
+部署后台 worker 的获取、关闭重试、严格停止证明与后续 RTC 接入约定见
+[RTC 后台资源所有权与退出屏障](../development/rtc_worker_ownership.md)。
