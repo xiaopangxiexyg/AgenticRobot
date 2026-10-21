@@ -38,13 +38,14 @@
     "max_sweep_leg_command_exposure_nm_sec": 120,
     "max_sweep_command_exposure_nm_sec": 480,
     "motion_braking_timeout_sec": 8.5683,
+    "motion_braking_slew_nm_s": 20,
     "motion_soft_velocity_rad_s": 0.07605,
     "background_permit_timeout_sec": 70,
     "setup_label": "temporary_end_effector_coordinated_holding_candidate",
     "holding_excursion_rad": 0.01,
     "holding_arrival_tolerance_rad": 0.003375,
     "holding_search": {
-      "observation_sec": 1.5,
+      "observation_sec": 1.0,
       "observation_timeout_sec": 5.85,
       "movement_rad": 0.0045,
       "torque_resolution_nm": 0.025,
@@ -55,8 +56,8 @@
       "total_assist_cap_nm": 1,
       "bias_cap_nm": 1,
       "bias_gain_nm_per_rad_sec": 20,
-      "rise_slew_nm_s": 1,
-      "fall_slew_nm_s": 0.5
+      "rise_slew_nm_s": 1.5,
+      "fall_slew_nm_s": 1.0
     }
   }
 }

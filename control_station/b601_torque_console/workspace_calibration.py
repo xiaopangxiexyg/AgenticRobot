@@ -26,7 +26,7 @@ RANGES = ((0.0, math.radians(120)), (0.0, math.radians(90)))
 COORDINATED_CALIBRATION_OVERRIDES = (
     "prepare_timeout_sec", "max_batch_sec", "max_sweep_leg_sec",
     "max_sweep_command_exposure_nm_sec", "max_sweep_leg_command_exposure_nm_sec",
-    "motion_braking_timeout_sec", "motion_soft_velocity_rad_s",
+    "motion_braking_timeout_sec", "motion_soft_velocity_rad_s", "motion_braking_slew_nm_s",
 )
 
 
@@ -61,6 +61,7 @@ class WorkspaceCalibrationConfig:
     prepare_timeout_sec: float | None = None
     motion_braking_timeout_sec: float | None = None
     motion_soft_velocity_rad_s: float | None = None
+    motion_braking_slew_nm_s: float | None = None
 
     def __post_init__(self):
         if isinstance(self.coordinated_holding, dict):

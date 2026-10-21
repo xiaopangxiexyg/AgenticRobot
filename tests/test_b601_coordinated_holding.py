@@ -77,6 +77,42 @@ def test_fast_tail_unload_requires_resolved_and_agreeing_motion(settings, resolv
     assert rate == core.config.fall_slew_nm_s
 
 
+@pytest.mark.parametrize("sign", [-1, 1])
+@pytest.mark.parametrize("probe", [False, True])
+@pytest.mark.parametrize("scale", [0., .4, 1.])
+@pytest.mark.parametrize("driving", [False, True])
+def test_speed_governor_limits_composed_bias_but_not_fixed_probes(settings, monkeypatch, sign, probe, scale, driving):
+    core = runtime(settings)
+    warm(core)
+    core.config = CoordinatedHoldingConfig()
+    bias = sign*.8*(1 if driving else -1)
+    core.bias = (0., 0., bias, 0., 0., 0.)
+    core.velocity = core.raw = (0., 0., sign*.05, 0., 0., 0.)
+    # Reuse complete native frames; isolate only the already-authoritative
+    # speed factor so this tests composition, not a second velocity estimator.
+    template = core.trackers[1].update(now=core.last_time, q=core.q[2], raw_v=0., control_v=0.,
+        control_sequence=12, authority=1., kp=2., kd=2.,
+        stop_error_rad=.003, stop_velocity_rad_s=.005, stop_dwell_sec=.15)
+    first = replace(template, phase="track", reason="bounded_reference_tracking",
+        requested_torque_nm=0., continuous_speed_scale=1.)
+    second = replace(template, phase="track",
+        reason="calibration_fixed_command_observation" if probe else "bounded_reference_tracking",
+        requested_torque_nm=sign*.2 if probe else 0., continuous_speed_scale=scale)
+    monkeypatch.setattr(core.trackers[0], "update", lambda **kwargs:first)
+    monkeypatch.setattr(core.trackers[1], "update", lambda **kwargs:second)
+    monkeypatch.setattr(core, "_slew_axis", lambda i, target, dt, resolved_motion:(target, "isolated_composition", 1.))
+    command, audit = core.step(sequence=12, dt=.01, permitted=True,
+        probe_joint=2 if probe else None, probe_nm=sign*.2 if probe else None,
+        point_search=False)
+    expected_scale = scale if driving and not probe else 1.
+    assert audit["composed_speed_scales"][2] == expected_scale
+    assert command[2] == pytest.approx(sign*.2 if probe else bias*expected_scale)
+    assert core.bias[2] == bias  # No persistent state commit before receipt.
+    assert sum(abs(v) for v in command) <= 1.
+    if not probe and driving and scale == 0:
+        assert command[2] == 0.
+
+
 def test_both_axes_share_one_envelope_and_commit_only_after_actual_receipt(settings):
     core = runtime(settings)
     warm(core)
@@ -921,6 +957,8 @@ def test_current_margin_profile_resolves_workspace_only_and_keeps_hard_envelopes
     assert motion is updated._coordinated.pose.motion
     assert motion.soft_velocity_rad_s == motion.continuous_speed_limit_rad_s == .07605
     assert motion.braking_timeout_sec == 8.5683
+    assert motion.braking_slew_nm_s == 20
+    assert old.settings.staged_assist.motion_control.braking_slew_nm_s == 10
     assert old.settings.staged_assist.motion_control.soft_velocity_rad_s == .0585
     assert whole._fixed.config is old.config
     assert whole._supported.config is old.config
@@ -929,7 +967,9 @@ def test_current_margin_profile_resolves_workspace_only_and_keeps_hard_envelopes
     assert motion.max_control_gap_sec == .04
     assert motion.drive_driver_kd_nm_s_per_rad == old.settings.staged_assist.motion_control.drive_driver_kd_nm_s_per_rad
     assert updated.workspace.holding_search.movement_rad == .0045
-    assert updated.workspace.holding_search.observation_sec == 1.5
+    assert updated.workspace.holding_search.observation_sec == 1.0
+    assert updated.workspace.coordinated_holding.rise_slew_nm_s == 1.5
+    assert updated.workspace.coordinated_holding.fall_slew_nm_s == 1.0
     assert updated.workspace.holding_search.observation_timeout_sec == pytest.approx(4.5*1.3)
 
 

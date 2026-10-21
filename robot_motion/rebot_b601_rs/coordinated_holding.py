@@ -211,6 +211,7 @@ class CoordinatedPoseHolding:
         anchors, moving = list(self._approach_anchor), list(self._approach_moving)
         brake_seed = self._brake_seed
         approach_reasons = [None] * 6
+        composed_speed_scales = [1.0] * 6
         frames = []
         if permitted:
             if self.goal is None:
@@ -255,6 +256,16 @@ class CoordinatedPoseHolding:
                 elif is_probe:
                     moving[i], anchors[i] = False, self.q[i]
                 demand[i] = frame.requested_torque_nm + (0.0 if is_probe else proposed_bias[i])
+                # The existing reference governor cannot constrain an additive
+                # maintenance bias by itself. Limit the complete positive-work
+                # demand, not just the reference, before final slew/L1 bounds.
+                # A causal fixed-command probe is a separate measurement mode;
+                # preserve its exact plateau and the original soft/hard brakes.
+                if (not is_probe and frame.phase == "track"
+                    and frame.continuous_speed_scale is not None
+                    and demand[i] * self.velocity[i] > 0):
+                    composed_speed_scales[i] = frame.continuous_speed_scale
+                    demand[i] *= composed_speed_scales[i]
         self.braking = any(f.phase == "brake" and f.reason != "target_reached_braking" for f in frames)
         if self.braking:
             if brake_seed is None:
@@ -329,6 +340,7 @@ class CoordinatedPoseHolding:
             "arrival_tolerance_rad": self.arrival_tolerance_rad,
             "point_search_enabled": point_search,
             "approach_reasons": approach_reasons, "brake_recovery_proposal_nm": brake_seed,
+            "composed_speed_scales": composed_speed_scales,
             "torque_transition_reasons": transition_reasons, "torque_transition_rates_nm_s": transition_rates,
             "axes": [asdict(f) for f in frames], "auto_apply": False,
             "quantity": "software_command_not_measured_force"}
