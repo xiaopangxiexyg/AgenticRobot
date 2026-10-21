@@ -163,7 +163,7 @@ class HoldingForceSearch:
             if self.state == "complete":
                 return
         elif math.isfinite(lower) and math.isfinite(upper):
-            self.candidate_nm = (lower + upper) / 2
+            self.candidate_nm = lower / 2 + upper / 2
             if upper - lower <= self.config.torque_resolution_nm:
                 self.state, self.reason = (
                     "incomplete",
@@ -223,7 +223,7 @@ class HoldingForceSearch:
                     "verified_usable_hold_not_unique_gravity",
                 )
         else:
-            self.candidate_nm = 0.0 if endpoint is None else (best + endpoint) / 2
+            self.candidate_nm = 0.0 if endpoint is None else best / 2 + endpoint / 2
 
     def record_transition(
         self, *, command_nm: float, requested_command_nm: float, evidence: dict
@@ -254,6 +254,35 @@ class HoldingForceSearch:
         )
         stable = self._eligible_stationary_commands()
         if not stable:
+            if (self._recheck_interior_on_conflict and self._verification is None
+                and self.observations and not any(r["outcome"] == "stationary" for r in self.observations)):
+                lower = max((r["command_nm"] for r in self.observations
+                             if r["outcome"] == "negative_motion"), default=-math.inf)
+                upper = min((r["command_nm"] for r in self.observations
+                             if r["outcome"] == "positive_motion"), default=math.inf)
+                # An arrival command can move, while the next trial settles
+                # outside the frozen point. Neither is a holding anchor yet.
+                # Use the censored endpoint only to propose an interior test;
+                # do not promote it to a signed motion or stationary bound.
+                left = right = command_nm
+                if math.isfinite(lower) and math.isfinite(upper):
+                    left, right = lower, upper
+                elif math.isfinite(lower) and command_nm > lower:
+                    left, right = lower, command_nm
+                elif math.isfinite(upper) and command_nm < upper:
+                    left, right = command_nm, upper
+                if math.isfinite(left) and math.isfinite(right) and right > left:
+                    proposal = left / 2 + right / 2
+                    if not math.isfinite(proposal) or not left <= proposal <= right:
+                        self.state, self.reason = "incomplete", "holding_no_finite_trial_in_search_interval"
+                        return
+                    self.candidate_nm = proposal
+                    self.reason = "refine_unverified_hold_between_motion_and_transition"
+                    if right-left <= self.config.torque_resolution_nm:
+                        self.state, self.reason = "incomplete", "holding_no_verified_anchor_in_search_interval"
+                    else:
+                        self._check_trial_budget()
+                    return
             if (self._recheck_interior_on_conflict and not self.observations
                 and self._verification is None and progress is not None
                 and abs(progress) >= self.config.movement_rad/2):
