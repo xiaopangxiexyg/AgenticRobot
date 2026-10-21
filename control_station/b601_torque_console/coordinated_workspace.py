@@ -8,7 +8,7 @@ import threading
 import time
 from dataclasses import asdict
 
-from robot_motion.rebot_b601_rs.calibration import finite, plan_local_sweeps, six
+from robot_motion.rebot_b601_rs.calibration import finite, six
 from robot_motion.rebot_b601_rs.coordinated_holding import (
     AXES,
     ZERO,
@@ -158,10 +158,9 @@ class CoordinatedWorkspaceController:
         if task["kind"] == "sweep":
             self._sweep_exposure = 0.0
             self._sweep_started = self.pose.last_time
-            plan = plan_local_sweeps(condition=self._condition, joint_name=task["joint"],
+            plan = self.workspace.sweep_plan(condition=self._condition, joint_name=task["joint"],
                 anchor_qpos_rad=self._nominal_target or self.pose.goal, position_limits_rad=self._position_limits,
-                excursion_rad=self.workspace.local_excursion_rad(self.config), speeds_rad_s=self.config.sweep_speeds_rad_s,
-                max_reference_velocity_rad_s=self.pose.motion.max_reference_velocity_rad_s, purpose="local_identification")
+                calibration=self.config)
             self._steps = plan["steps"]
             for step in self._steps:
                 step["trial_id"] = f"cw{self._index}:{task['joint']}:{step['trial_id']}"
@@ -287,7 +286,7 @@ class CoordinatedWorkspaceController:
             try:
                 command, audit = self.pose.step(sequence=feedback_sequence, dt=dt, permitted=permitted,
                     probe_joint=int(joint[-1])-1 if self._probe is not None else None, probe_nm=self._probe,
-                    point_search=self._phase == "sweep")
+                    point_search=(self._phase == "sweep" and self.workspace.holding_sampling_plan != "coverage"))
             except ValueError as exc:
                 self.recording_failed(str(exc))
                 return ZERO, self._make_audit(ZERO, {}, fault=self._reason)
@@ -641,6 +640,9 @@ class CoordinatedWorkspaceController:
                 "result": {"state": self._phase, "reason": self._reason, "completed_legs": copy.deepcopy(self._legs),
                     "holding_calibration": self._holding_status(detailed=True)}})
         return {"phase": self._phase, "reason": self._reason, "coordinated_holding_enabled": True,
+            "holding_sampling_plan": self.workspace.holding_sampling_plan,
+            "supported_soft_stop": (self._active and self._phase != "stopping"
+                and bool(self._audit.get("coordinated_holding", {}).get("supported_soft_stop"))),
             "setup_label": self.workspace.setup_label, "settings": asdict(self.workspace) if detailed else None,
             "task_index": self._index, "task_count": len(self._tasks), "pose_count": len(self.workspace.pose_centres()),
             "current_task": copy.deepcopy(self._tasks[self._index]) if self._index < len(self._tasks) else None,

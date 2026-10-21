@@ -45,6 +45,105 @@ def warm(core):
     core.set_goal((0, .01, .01, 0, 0, 0))
 
 
+@pytest.mark.parametrize("direction", [-1, 1])
+@pytest.mark.parametrize("conditioned_tail", [False, True])
+def test_supported_soft_stop_opposes_slip_and_resumes_only_after_actual_support_receipt(
+    settings, direction, conditioned_tail,
+):
+    core = runtime(settings)
+    core.config = CoordinatedHoldingConfig(total_assist_cap_nm=.3, bias_cap_nm=.2,
+        supported_soft_recovery=True)
+    warm(core)
+    core.adopt_hold(1, .1)
+    core.adopt_hold(2, -direction*.1)
+    before_goal = core.goal
+    saw_support = resumed = False
+    for n in range(1, 100):
+        q = (0., 0., direction*min(n, 3)*.0008, 0., 0., 0.)
+        raw = tuple((a-b)/.025 for a, b in zip(q, core.q))
+        dt = core.observe(1.11+n*.025, q, raw)
+        previous = core.last_delta
+        command, audit = core.step(sequence=n+11, dt=dt, permitted=True, point_search=False)
+        assert sum(abs(v) for v in command) <= .3+1e-9
+        if audit["supported_soft_stop"]:
+            saw_support = True
+            if abs(core.velocity[2]) > .02:
+                assert command[2]*core.velocity[2] < 0
+                assert command[1] > 0  # Do not drop a quiet peer's support.
+        if any(f["reason"] == "speed_governor_resumed_supported_target" for f in audit["axes"]):
+            assert core.quiet() and core._support_receipt
+            assert max(abs(v) for v in previous) > 0
+            assert not conditioned_tail or n > 30
+            resumed = True
+        actual = list(command)
+        if conditioned_tail and n <= 30:
+            actual[1] = .001 if command[1] != .001 else .002
+        core.record_dispatch(n+11, actual)
+        assert core.goal == before_goal
+        if resumed:
+            break
+    assert saw_support and resumed
+    dt = core.observe(core.last_time+.025, core.q, ZERO)
+    command, _ = core.step(sequence=1000, dt=dt, permitted=False)
+    core.record_dispatch(1000, command)
+    assert command == ZERO and core.bias == ZERO
+    assert core._support_anchor is None and not core._support_receipt
+
+
+def test_supported_recovery_does_not_bypass_reference_lag_or_raw_velocity(settings, monkeypatch):
+    from robot_motion.rebot_b601_rs.joint_motion import (
+        B601JointMotionFrame,
+    )
+
+    core = runtime(settings)
+    core.config = replace(core.config, supported_soft_recovery=True)
+    warm(core)
+    failed = B601JointMotionFrame(phase="soft_hold", reason="measured_stop_point_captured",
+        q_reference_rad=.02, qvel_reference_rad_s=0, control_qvel_rad_s=0,
+        position_torque_nm=0, velocity_torque_nm=0, requested_torque_nm=0,
+        brake_trigger_lag_rad=core.motion.max_reference_lag_rad*1.01)
+    monkeypatch.setattr(core.trackers[0], "update", lambda **kwargs: failed)
+    with pytest.raises(ValueError, match="coordinated_reference_lag_stop"):
+        core.step(sequence=12, dt=.01, permitted=True)
+    core.raw = (0, 0, core.settings.limits.max_joint_velocity_rad_s*1.01, 0, 0, 0)
+    with pytest.raises(ValueError, match="raw joint velocity"):
+        core.step(sequence=12, dt=.01, permitted=True)
+
+
+@pytest.mark.parametrize("direction", [-1, 1])
+def test_recorded_slip_speed_requests_fast_bounded_support_not_zero(settings, monkeypatch, direction):
+    from robot_motion.rebot_b601_rs.joint_motion import B601JointMotionFrame
+
+    # x5ipi26g at 946231.407: |window v3|=0.1309, brake overlay=0.2618.
+    # Compare commands at that same state, not future physical trajectories.
+    outputs = []
+    for supported in (False, True):
+        core = runtime(settings)
+        core.config = CoordinatedHoldingConfig(supported_soft_recovery=supported)
+        core.settings = replace(core.settings, limits=replace(core.settings.limits,
+            max_abs_assist_nm=1., max_joint_velocity_rad_s=.195))
+        warm(core)
+        core.velocity = core.raw = (0., 0., direction*.1309, 0., 0., 0.)
+        core.last_delta = (0., .1, -direction*.2618, 0., 0., 0.)
+        core.bias = (0., .1, 0., 0., 0., 0.)
+        for i, tracker in zip((1, 2), core.trackers):
+            frame = B601JointMotionFrame(phase="brake", reason="soft_velocity_braking",
+                q_reference_rad=core.q[i], qvel_reference_rad_s=0,
+                control_qvel_rad_s=core.velocity[i], position_torque_nm=0,
+                velocity_torque_nm=-2*core.velocity[i], requested_torque_nm=-2*core.velocity[i],
+                speed_governor_active=True)
+            monkeypatch.setattr(tracker, "update", lambda frame=frame, **kwargs: frame)
+        command, audit = core.step(sequence=12, dt=.025, permitted=True)
+        assert sum(abs(v) for v in command) <= 1+1e-9
+        assert command[2]*core.velocity[2] < 0
+        assert audit["supported_soft_stop"] == supported
+        core.record_dispatch(12, command)
+        outputs.append(command)
+    assert outputs[0][2] == pytest.approx(-direction*.2618)
+    assert abs(outputs[1][2]) > abs(outputs[0][2])
+    assert outputs[1][1] == pytest.approx(.1)
+
+
 @pytest.mark.parametrize("period", [.01, .025])
 @pytest.mark.parametrize("joint", [1, 2])
 @pytest.mark.parametrize("direction", [-1, 1])
@@ -234,12 +333,14 @@ def test_continuous_transit_keeps_native_terminal_guards_and_failed_axis(setting
     assert core.pending is None
 
 
-def test_coordinated_fault_retains_actual_failed_axis_and_new_brake_clock(settings):
+@pytest.mark.parametrize("supported", [False, True])
+def test_coordinated_fault_retains_actual_failed_axis_and_new_brake_clock(settings, supported):
     core = runtime(settings)
-    for tracker in core.trackers:
-        tracker.config = replace(tracker.config, braking_timeout_sec=.2)
+    core.config = replace(core.config, supported_soft_recovery=supported)
     warm(core)
     core.set_goal(ZERO)
+    for tracker in core.trackers:
+        tracker.config = replace(tracker.config, braking_timeout_sec=.2)
     for n in range(1, 41):
         dt = core.observe(1.11+n*.025, ZERO, ZERO)
         command, _ = core.step(sequence=n+11, dt=dt, permitted=True)
@@ -663,8 +764,11 @@ def test_coordinated_profile_is_explicit_and_does_not_change_legacy(tmp_path):
 
 
 @pytest.mark.parametrize("kind", ["human", "withdraw", "lease", "hard_speed", "receipt", "cap"])
-def test_all_axis_authority_and_final_envelope_remain_enforced(tmp_path, kind):
+@pytest.mark.parametrize("supported", [False, True])
+def test_all_axis_authority_and_final_envelope_remain_enforced(tmp_path, kind, supported):
     r = replay(tmp_path)
+    core = r.controller._coordinated.pose
+    core.config = replace(core.config, supported_soft_recovery=supported)
     r.controller.submit("arm", now_sec=r.now)
     for _ in range(80):
         r.tick()
@@ -840,9 +944,11 @@ def test_fixed_probe_rejects_varying_support_effort_even_with_bounded_encoder_ji
     assert obs["maximum_delta_nm"][2]-obs["minimum_delta_nm"][2] > workspace.workspace.holding_search.torque_resolution_nm
 
 
-def test_native_speed_brake_retains_meaningful_probe_progress_as_a_censored_transition(tmp_path):
+@pytest.mark.parametrize("supported", [False, True])
+def test_native_speed_brake_retains_meaningful_probe_progress_as_a_censored_transition(tmp_path, supported):
     r = replay(tmp_path, holding_search=HoldingSearchConfig(
-        observation_sec=1.5, observation_timeout_sec=4.5, movement_rad=.0045))
+        observation_sec=1.5, observation_timeout_sec=4.5, movement_rad=.0045),
+        coordinated_holding=CoordinatedHoldingConfig(supported_soft_recovery=supported))
     advance_to_coordinated_probe(r)
     workspace = r.controller._coordinated
     for _ in range(60):
@@ -874,8 +980,9 @@ def test_native_speed_brake_retains_meaningful_probe_progress_as_a_censored_tran
     assert workspace._probe is None
 
 
-def test_support_only_brake_does_not_invent_a_selected_axis_holding_response(tmp_path):
-    r = replay(tmp_path)
+@pytest.mark.parametrize("supported", [False, True])
+def test_support_only_brake_does_not_invent_a_selected_axis_holding_response(tmp_path, supported):
+    r = replay(tmp_path, coordinated_holding=CoordinatedHoldingConfig(supported_soft_recovery=supported))
     advance_to_coordinated_probe(r)
     workspace = r.controller._coordinated
     search, candidate = workspace._search, workspace._probe
@@ -1015,6 +1122,35 @@ def test_current_margin_profile_resolves_workspace_only_and_keeps_hard_envelopes
     assert updated.workspace.coordinated_holding.rise_slew_nm_s == 1.5
     assert updated.workspace.coordinated_holding.fall_slew_nm_s == 1.0
     assert updated.workspace.holding_search.observation_timeout_sec == pytest.approx(4.5*1.3)
+
+
+def test_coverage_profile_reuses_paths_with_four_legs_and_keeps_hold_verification(tmp_path):
+    profiles = Path(__file__).resolve().parents[1]/"docs/hardware/profiles"
+    baseline = json.loads((profiles/"b601_j2_j3_four_centres_holding_v1.json").read_text())
+    candidate = json.loads((profiles/"b601_j2_j3_coverage_support_v1.json").read_text())
+    assert candidate["cycle"] == baseline["cycle"]
+    assert candidate["workspace"]["holding_search"] == baseline["workspace"]["holding_search"]
+    r = replay(tmp_path, **candidate["workspace"])
+    controller = r.controller._coordinated
+    workspace = controller.workspace
+    total = 0
+    for joint in ("joint2", "joint3"):
+        plan = workspace.sweep_plan(condition=controller._condition, joint_name=joint,
+            anchor_qpos_rad=(0, .05236, .05236, 0, 0, 0),
+            position_limits_rad=controller._position_limits, calibration=controller.config)
+        assert len(plan["steps"]) == 4
+        assert [s["role"] for s in plan["steps"]] == ["training", "training", "validation", "validation"]
+        assert {s["max_reference_velocity_rad_s"] for s in plan["steps"]} == {.015}
+        assert len({tuple(s["target_qpos_rad"]) for s in plan["steps"]}) == 2
+        total += len(plan["steps"])*len(workspace.pose_centres())
+    assert total == 32
+    assert workspace.holding_search.verification_repeats == 2
+    assert workspace.coordinated_holding.total_assist_cap_nm == 1
+    assert workspace.coordinated_holding.bias_gain_nm_per_rad_sec == 40
+    assert workspace.coordinated_holding.supported_soft_recovery
+    assert controller.config.max_sweep_leg_sec == 180
+    assert controller.pose.motion.max_control_gap_sec == .04
+    assert not WorkspaceCalibrationConfig().coordinated_holding
 
 
 @pytest.mark.parametrize("value", [0, -.001, float("nan"), True, .0046])
@@ -1458,13 +1594,12 @@ def test_passive_offset_still_obeys_original_support_excursion_guard(tmp_path):
 
 
 def test_coupled_partial_batch_holds_other_axis_handoffs_and_final_withdrawal(tmp_path, monkeypatch):
-    from control_station.b601_torque_console import coordinated_workspace as module
-    original = module.plan_local_sweeps
-    def one_leg(**kwargs):
-        plan = original(**kwargs)
+    original = WorkspaceCalibrationConfig.sweep_plan
+    def one_leg(self, **kwargs):
+        plan = original(self, **kwargs)
         plan["steps"] = plan["steps"][:1]
         return plan
-    monkeypatch.setattr(module, "plan_local_sweeps", one_leg)
+    monkeypatch.setattr(WorkspaceCalibrationConfig, "sweep_plan", one_leg)
     r = replay(tmp_path, initial_q=(0, .01, .01, 0, 0, 0))
     r.controller.submit("arm", now_sec=r.now)
     nonzero_support = False
@@ -1485,9 +1620,11 @@ def test_coupled_partial_batch_holds_other_axis_handoffs_and_final_withdrawal(tm
     assert r.controller.cycle_disable_confirmation_ready
 
 
-@pytest.mark.parametrize("period", [.01, .025])
-@pytest.mark.parametrize("passive_offset", [0, .006519419])
-def test_full_coupled_batch_and_report_keep_handoffs_distinct_from_withdrawal(tmp_path, period, passive_offset, monkeypatch):
+@pytest.mark.parametrize("period,passive_offset,coverage", [
+    (.01, 0, False), (.01, .006519419, False),
+    (.025, 0, False), (.025, .006519419, False), (.01, 0, True),
+])
+def test_full_coupled_batch_and_report_keep_handoffs_distinct_from_withdrawal(tmp_path, period, passive_offset, coverage, monkeypatch):
     from pathlib import Path
     from types import SimpleNamespace
 
@@ -1496,6 +1633,9 @@ def test_full_coupled_batch_and_report_keep_handoffs_distinct_from_withdrawal(tm
         build_automatic_report,
     )
     changes = {}
+    if coverage:
+        changes.update(holding_sampling_plan="coverage", coordinated_holding=CoordinatedHoldingConfig(
+            bias_gain_nm_per_rad_sec=40, supported_soft_recovery=True))
     if period == .025 and passive_offset:
         # Exercise the actual explicit profile at the observed cadence too,
         # rather than validating the new margins only with shortened dwells.
@@ -1523,14 +1663,14 @@ def test_full_coupled_batch_and_report_keep_handoffs_distinct_from_withdrawal(tm
         controller = r.controller._coordinated
         flags = [tracker.config.support_soft_speed_recovery for tracker in controller.pose.trackers]
         if controller._phase in {"position", "return"}:
-            assert flags == [controller.workspace.positioning_support_soft_speed_recovery]*2
+            assert flags == [coverage or controller.workspace.positioning_support_soft_speed_recovery]*2
         elif controller._phase == "sweep":
-            assert flags == [controller.pose.motion.support_soft_speed_recovery]*2
+            assert flags == [coverage or controller.pose.motion.support_soft_speed_recovery]*2
         if r.audit.get("coordinated_holding") is not None:
             # Audit reports the phase that produced this frame, before a
             # consumed receipt may advance the outer workspace lifecycle.
             audit = r.audit["coordinated_holding"]
-            assert audit["point_search_enabled"] == (r.audit["automatic_calibration"]["workspace"]["phase"] == "sweep")
+            assert audit["point_search_enabled"] == (not coverage and r.audit["automatic_calibration"]["workspace"]["phase"] == "sweep")
         journal.observe(snapshot())
         assert sum(abs(v) for v in r.delta) <= 1+1e-9
         if old != len(r.controller._coordinated._acquisitions):
@@ -1538,8 +1678,10 @@ def test_full_coupled_batch_and_report_keep_handoffs_distinct_from_withdrawal(tm
             handoffs.append(tuple(r.delta))
     result = r.controller.result_record()
     assert result["state"] == "complete", (result["reason"], r.q, r.controller._coordinated._holding_status())
-    assert len(result["motion"]["completed_legs"]) == 24
-    assert {leg["max_reference_velocity_rad_s"] for leg in result["motion"]["completed_legs"]} == set(r.controller.config.sweep_speeds_rad_s)
+    legs = 8 if coverage else 24
+    assert len(result["motion"]["completed_legs"]) == legs
+    assert {leg["max_reference_velocity_rad_s"] for leg in result["motion"]["completed_legs"]} == (
+        {max(r.controller.config.sweep_speeds_rad_s)} if coverage else set(r.controller.config.sweep_speeds_rad_s))
     # A learned small hold is valid too. Handoff must preserve the actual
     # dispatched composite, not manufacture a minimum support magnitude.
     assert len(handoffs) == 2 and all(any(abs(v) > 1e-9 for v in h) for h in handoffs)
@@ -1549,7 +1691,7 @@ def test_full_coupled_batch_and_report_keep_handoffs_distinct_from_withdrawal(tm
     journal.close()
     (tmp_path / "b601_owner.debug.jsonl").write_text("\n".join(json.dumps(x) for x in [*r.records, result])+"\n")
     report = build_automatic_report(tmp_path)
-    assert report["holding_calibration"]["verified_points"] == 24
+    assert report["holding_calibration"]["verified_points"] == legs
     assert all(not p["withdrawal_confirmed"] for p in report["holding_calibration"]["points"])
     assert report["workspace"]["gravity_observations"] == []
     assert len(report["workspace"]["coordinated_pose_observations"]) == 2

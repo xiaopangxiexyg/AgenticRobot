@@ -51,6 +51,7 @@ class WorkspaceCalibrationConfig:
     background_permit_timeout_sec: float = 70.0
     setup_label: str = "temporary_end_effector"
     holding_search: HoldingSearchConfig | None = None
+    holding_sampling_plan: str = "detailed"
     holding_excursion_rad: float | None = None
     holding_arrival_tolerance_rad: float | None = None
     coordinated_holding: CoordinatedHoldingConfig | None = None
@@ -74,6 +75,10 @@ class WorkspaceCalibrationConfig:
             raise TypeError("holding search must be an explicit configuration object")
         if self.coordinated_holding is not None and self.holding_search is None:
             raise ValueError("coordinated holding requires explicit holding search")
+        if self.holding_sampling_plan not in {"detailed", "coverage"} or (
+            self.holding_sampling_plan == "coverage" and self.coordinated_holding is None
+        ):
+            raise ValueError("coverage sampling requires explicit coordinated holding")
         if self.holding_arrival_tolerance_rad is not None and (
             self.coordinated_holding is None
             or not 0 < finite(self.holding_arrival_tolerance_rad, "holding arrival tolerance") <= self.holding_search.movement_rad
@@ -155,6 +160,22 @@ class WorkspaceCalibrationConfig:
                      for joint in reversed(self.positioning_joint_order))
         tasks.append({"kind": "return_observe"})
         return tasks
+
+    def sweep_plan(self, *, condition, joint_name, anchor_qpos_rad, position_limits_rad, calibration):
+        """One canonical path for runtime and offline geometry consumers."""
+        coverage = self.holding_sampling_plan == "coverage"
+        plan = plan_local_sweeps(condition=condition, joint_name=joint_name,
+            anchor_qpos_rad=anchor_qpos_rad, position_limits_rad=position_limits_rad,
+            excursion_rad=self.local_excursion_rad(calibration),
+            speeds_rad_s=calibration.sweep_speeds_rad_s,
+            max_reference_velocity_rad_s=max(calibration.sweep_speeds_rad_s),
+            training_repeats=1 if coverage else 2, validation_repeats=1, purpose="local_identification")
+        if coverage:
+            # Holding coverage needs both approach directions and a later
+            # recheck, not two-speed kinetic-friction identification.
+            speed = max(calibration.sweep_speeds_rad_s)
+            plan["steps"] = [s for s in plan["steps"] if s["max_reference_velocity_rad_s"] == speed]
+        return plan
 
 
 class B601WorkspaceCalibrationController:

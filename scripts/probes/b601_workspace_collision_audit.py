@@ -25,7 +25,6 @@ from control_station.b601_torque_console.workspace_calibration import (
 )
 from robot_motion.rebot_b601_rs.calibration import (
     CalibrationCondition,
-    plan_local_sweeps,
     six,
 )
 from robot_motion.rebot_b601_rs.model import B601_RS_URDF_RELATIVE_PATH
@@ -114,10 +113,9 @@ def nominal_segments(workspace, config, origin, condition):
         if task["kind"] in {"position", "return"}:
             targets = [task["target"]]
         elif task["kind"] == "sweep":
-            plan = plan_local_sweeps(condition=condition, joint_name=task["joint"],
+            plan = workspace.sweep_plan(condition=condition, joint_name=task["joint"],
                 anchor_qpos_rad=q, position_limits_rad=limits,
-                excursion_rad=workspace.local_excursion_rad(config), speeds_rad_s=config.sweep_speeds_rad_s,
-                max_reference_velocity_rad_s=max(config.sweep_speeds_rad_s), purpose="local_identification")
+                calibration=config)
             targets = [step["target_qpos_rad"][int(task["joint"][-1])-1] for step in plan["steps"]]
         else:
             continue

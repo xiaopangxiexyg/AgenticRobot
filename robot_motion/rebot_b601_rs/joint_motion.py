@@ -477,7 +477,18 @@ class B601JointMotionTracker:
         calibration_hold_enabled: bool = False,
         calibration_probe_nm: float | None = None,
         calibration_target_hold: bool = False,
+        calibration_support_dispatch_confirmed: bool | None = None,
     ) -> B601JointMotionFrame:
+        if calibration_support_dispatch_confirmed is not None and (
+            type(calibration_support_dispatch_confirmed) is not bool or not calibration_target_hold
+        ):
+            raise ValueError("support receipt requires explicit calibration target holding")
+        supported_stop = calibration_support_dispatch_confirmed is not None
+        # The coordinated owner may confirm a bounded support frame instead
+        # of a zero frame during an explicitly authorized SOFT stop. This is
+        # not a motor acknowledgement or permission to recover terminal stops.
+        stop_dispatch_confirmed = (calibration_support_dispatch_confirmed if supported_stop
+                                   else zero_dispatch_confirmed)
         if type(calibration_target_hold) is not bool:
             raise TypeError("calibration target hold must be boolean")
         if calibration_target_hold and not (calibration_hold_enabled and self.config.speed_governor):
@@ -994,15 +1005,17 @@ class B601JointMotionTracker:
                     and self._governed_speed_brake(self._brake_reason)
                     and not request_brake and speed_governor_permitted
                     and abs(self._target - q) > stop_error_rad):
-                    if not zero_dispatch_confirmed:
-                        # Request an exact zero plateau so the owner can
-                        # confirm removal of every final conditioned tail.
-                        speed_governor_resume_block_reason = "native_zero_dispatch_not_confirmed"
-                        return frame("brake", "speed_governor_waiting_for_zero_dispatch",
+                    if not stop_dispatch_confirmed:
+                        # Confirm the owner's selected stop baseline; never
+                        # call a nonzero support frame a zero receipt.
+                        speed_governor_resume_block_reason = ("support_dispatch_not_confirmed" if supported_stop
+                                                             else "native_zero_dispatch_not_confirmed")
+                        return frame("brake", "speed_governor_waiting_for_support_dispatch" if supported_stop
+                                     else "speed_governor_waiting_for_zero_dispatch",
                                      q, 0.0, control_v, 0.0, 0.0, 0.0,
                                      brake_elapsed_sec=elapsed)
                     # Reuse the authoritative planner at fresh measured state
-                    # after a confirmed zero. Keep the SAME goal and the
+                    # after a confirmed stop baseline. Keep the SAME goal and the
                     # caller's leg clock/budget; no new onset authorization.
                     self._planner.reset((q,), monotonic_time=now)
                     self._planner.accept_target((self._target,), sequence=0,
@@ -1012,7 +1025,8 @@ class B601JointMotionTracker:
                     self._stationary_position = None
                     self._stationary_min = self._stationary_max = None
                     self._brake_trigger_reference = self._brake_trigger_lag = None
-                    return frame("track", "speed_governor_resumed_original_target",
+                    return frame("track", "speed_governor_resumed_supported_target" if supported_stop
+                                 else "speed_governor_resumed_original_target",
                                  q, 0.0, control_v, 0.0, 0.0, 0.0)
                 retain_target = (
                     calibration_target_hold and not request_brake and speed_governor_permitted
@@ -1020,8 +1034,9 @@ class B601JointMotionTracker:
                          or self._brake_reason in {"soft_hold_motion_braking", "support_velocity_braking"})
                     and abs(self._target-q) <= min(stop_error_rad, self.config.max_reference_lag_rad)
                 )
-                if retain_target and not zero_dispatch_confirmed:
-                    return frame("brake", "speed_governor_waiting_for_zero_dispatch",
+                if retain_target and not stop_dispatch_confirmed:
+                    return frame("brake", "speed_governor_waiting_for_support_dispatch" if supported_stop
+                                 else "speed_governor_waiting_for_zero_dispatch",
                                  q, 0.0, control_v, 0.0, 0.0, 0.0,
                                  brake_elapsed_sec=elapsed)
                 # Only retain an already-admitted nearby calibration target.

@@ -283,7 +283,7 @@ function renderWorkspace(batch) {
     advancing: "准备下一阶段", stopping: "撤力停稳", complete: "多位姿采集完成",
     failed: batch.outcome?.severity === "warning" ? "采集未完成 · 告警，数据保留" : "采集故障 · 已停止",
     cancelled: "已撤销"};
-  const label = workspace.phase === "sweep" && workspace.holding_search_enabled
+  const label = workspace.supported_soft_stop ? "有界支撑恢复 · 停稳后继续原段" : workspace.phase === "sweep" && workspace.holding_search_enabled
     ? "定点保持命令搜索" : workspace.coordinated_holding_enabled && ["observe", "return_observe"].includes(workspace.phase)
       ? "联合姿态保持观察（不是零助力）" : names[workspace.phase] || workspace.phase;
   const ranges = workspace.acquisition_ranges_deg || {joint2: [0, 10], joint3: [0, 10]};
@@ -295,9 +295,15 @@ function renderWorkspace(batch) {
     el("automatic-mode-title").textContent = "J2/J3 联合姿态维持 · 单轴保持命令试探";
   }
   el("automatic-mode-note").textContent = `本批采集范围 J2 ${ranges.joint2.join("–")}°、J3 ${ranges.joint3.join("–")}°；从 J2/J3 零位附近（不超过 ${workspace.maximum_start_angle_deg ?? 2}°）开始，先展开 J3 再移动 J2，返回时顺序相反。完整机械角度范围不等于任意组合可达；本功能不替代自碰撞/环境检查。J2 −0.3° 只作已有反馈边界处理，不生成负目标。`;
+  if (workspace.holding_sampling_plan === "coverage") {
+    el("automatic-mode-note").textContent += " 当前为保持覆盖方案：每轴每中心 4 段、单参考速度，每个保持命令仍须两次复验；不等同于双速度动摩擦辨识。";
+  }
   el("arm").textContent = "开始 J2/J3 多位姿自动采集";
   el("withdraw").textContent = "停止采集并撤力（不自动返回）";
   el("drive-instructions").textContent = "起点须有可靠支撑，并清空整个采集区域。无人介入后启动；后台继续，关闭页面或人工介入撤力停止。正常完成后逐轴返回起点，等待 GUI 人工确认失能。";
+  if (workspace.supported_soft_stop) {
+    el("drive-instructions").textContent = "正在用有界支撑、位置恢复和阻尼制止滑动，不是只做重力补偿；完整发送并停稳后继续原目标，不重置时间或暴露预算。硬保护、反馈异常或人工撤销不会自动恢复。";
+  }
   if (["failed", "cancelled"].includes(workspace.phase)) {
     const gravityOnly = batch.outcome?.severity === "warning" && state.owner_ready && !state.fault;
     el("drive-instructions").textContent = gravityOnly
