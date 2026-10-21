@@ -214,6 +214,28 @@ class CoordinatedPoseHolding:
             reason = "resolved_working_tail_unload"
         return previous + max(-rate * dt, min(rate * dt, target - previous)), reason, rate
 
+    def _composed_speed_scale(self, i, frame, demand):
+        # The planner's factor follows the goal direction. An additive bias
+        # can drive AWAY from that goal, including during normal arrival or a
+        # supported stop. Govern the complete demand in its own direction,
+        # using the same resolved windows and speed envelope, not raw jitter.
+        if demand == 0:
+            return 1.0
+        direction = 1 if demand > 0 else -1
+        resolution = self.motion.position_resolution_rad or 0.0
+        speed = (max(0.0, direction*self.velocity[i])
+                 if self.estimators[i].position_span_rad > resolution else 0.0)
+        if (frame.tracking_recent_velocity_rad_s is not None
+            and frame.tracking_recent_position_span_rad is not None
+            and frame.tracking_recent_position_span_rad > resolution):
+            speed = max(speed, direction*frame.tracking_recent_velocity_rad_s)
+        limit = self.motion.continuous_speed_limit_rad_s
+        scale = max(0.0, min(1.0,
+            (limit-speed)/(limit-self.motion.resolved_soft_velocity_rad_s)))
+        if frame.continuous_speed_scale is not None and demand*self.velocity[i] > 0:
+            scale = min(scale, frame.continuous_speed_scale)
+        return scale
+
     def step(self, *, sequence, dt, permitted, probe_joint=None, probe_nm=None, point_search=True):
         if type(sequence) is not int or sequence < 0 or type(permitted) is not bool or not 0 < finite(dt, "control interval") <= self.motion.max_control_gap_sec:
             raise ValueError("coordinated step requires valid sequence, permit and control interval")
@@ -235,6 +257,7 @@ class CoordinatedPoseHolding:
         support_damping_velocity = [None] * 6
         composed_speed_scales = [1.0] * 6
         frames = []
+        fixed_probes = set()
         if permitted:
             if self.goal is None:
                 raise ValueError("coordinated drive requires an admitted goal")
@@ -279,17 +302,8 @@ class CoordinatedPoseHolding:
                         i, frame, dt, moving[i], anchors[i], point_search=point_search)
                 elif is_probe:
                     moving[i], anchors[i] = False, self.q[i]
+                    fixed_probes.add(i)
                 demand[i] = frame.requested_torque_nm + (0.0 if is_probe else proposed_bias[i])
-                # The existing reference governor cannot constrain an additive
-                # maintenance bias by itself. Limit the complete positive-work
-                # demand, not just the reference, before final slew/L1 bounds.
-                # A causal fixed-command probe is a separate measurement mode;
-                # preserve its exact plateau and the original soft/hard brakes.
-                if (not is_probe and frame.phase == "track"
-                    and frame.continuous_speed_scale is not None
-                    and demand[i] * self.velocity[i] > 0):
-                    composed_speed_scales[i] = frame.continuous_speed_scale
-                    demand[i] *= composed_speed_scales[i]
         self.braking = any(f.phase == "brake" and f.reason != "target_reached_braking" for f in frames)
         if self.braking:
             supported_braking = self.config.supported_soft_recovery and all(
@@ -362,6 +376,14 @@ class CoordinatedPoseHolding:
                                        else "post_brake_reduced_command_proposal")
             brake_seed = None
             support_anchor = None
+        for i, frame in zip(AXES if permitted else (), frames, strict=True):
+            # Fixed-command observations retain their admitted exact plateau.
+            # A genuine brake censors the observation and owns the demand.
+            if i not in fixed_probes or self.braking:
+                composed_speed_scales[i] = self._composed_speed_scale(i, frame, demand[i])
+                demand[i] *= composed_speed_scales[i]
+                if composed_speed_scales[i] < 1:
+                    proposed_bias[i] = self.bias[i]  # No windup behind a speed-limited command.
         norm = sum(abs(v) for v in demand)
         scale = min(1.0, self.config.total_assist_cap_nm / norm) if norm else 1.0
         if scale < 1 and not self.braking:

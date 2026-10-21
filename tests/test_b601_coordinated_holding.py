@@ -298,6 +298,73 @@ def test_speed_governor_limits_composed_bias_but_not_fixed_probes(settings, monk
         assert command[2] == 0.
 
 
+@pytest.mark.parametrize("joint", [1, 2])
+@pytest.mark.parametrize("sign", [-1, 1])
+@pytest.mark.parametrize("phase", ["track", "arrival", "supported_stop"])
+@pytest.mark.parametrize("source", ["window", "recent"])
+def test_composite_governor_covers_arrival_away_motion_and_supported_stop(
+    settings, monkeypatch, joint, sign, phase, source,
+):
+    from robot_motion.rebot_b601_rs.joint_motion import B601JointMotionFrame
+
+    core = runtime(settings)
+    core.config = CoordinatedHoldingConfig(supported_soft_recovery=True, recovery_kd_nm_s_per_rad=0.)
+    warm(core)
+    # The nominal goal is in the opposite direction to this retained drive.
+    goal = list(core.goal)
+    goal[joint] = -sign*.01
+    core.goal = tuple(goal)
+    core.bias = core.last_delta = tuple(sign*.6 if i == joint else 0. for i in range(6))
+    limit = core.motion.continuous_speed_limit_rad_s
+    start = core.motion.resolved_soft_velocity_rad_s
+    speed = (limit+start)/2
+    core.observe(core.last_time+.01,
+                 tuple(sign*.002 if i == joint and source == "window" else 0. for i in range(6)), ZERO)
+    core.velocity = tuple(sign*speed if i == joint and source == "window" else 0. for i in range(6))
+    for i in (1, 2):
+        frame = B601JointMotionFrame(
+            phase="track" if phase == "track" else "brake",
+            reason={"track": "bounded_reference_tracking", "arrival": "target_reached_braking",
+                    "supported_stop": "soft_velocity_braking"}[phase],
+            q_reference_rad=core.q[i], qvel_reference_rad_s=0., control_qvel_rad_s=core.velocity[i],
+            position_torque_nm=0., velocity_torque_nm=0., requested_torque_nm=0.,
+            speed_governor_active=phase == "supported_stop",
+            tracking_recent_velocity_rad_s=sign*speed if i == joint and source == "recent" else 0.,
+            tracking_recent_position_span_rad=.002 if i == joint and source == "recent" else 0.,
+            # A goal-directed governor sees no toward-goal movement here.
+            continuous_speed_scale=1. if phase == "track" else None)
+        monkeypatch.setattr(core.trackers[i-1], "update", lambda frame=frame, **kwargs: frame)
+    monkeypatch.setattr(core, "_slew_axis", lambda i, target, dt, resolved_motion:(target, "isolated_composition", 1.))
+    command, audit = core.step(sequence=12, dt=.01, permitted=True, point_search=False)
+    assert audit["composed_speed_scales"][joint] == pytest.approx(.5)
+    assert command[joint] == pytest.approx(sign*.3)
+    assert core.bias[joint] == sign*.6  # Receipt still owns all persistent state.
+    assert sum(abs(v) for v in command) <= 1.
+    core.record_dispatch(12, command)
+    assert core.last_delta == command
+
+
+@pytest.mark.parametrize("sign", [-1, 1])
+def test_composite_speed_envelope_preserves_static_support_jitter_and_opposing_effort(settings, sign):
+    from robot_motion.rebot_b601_rs.joint_motion import B601JointMotionFrame
+
+    core = runtime(settings)
+    warm(core)
+    frame = B601JointMotionFrame(phase="brake", reason="target_reached_braking",
+        q_reference_rad=0., qvel_reference_rad_s=0., control_qvel_rad_s=0.,
+        position_torque_nm=0., velocity_torque_nm=0., requested_torque_nm=0.)
+    core.raw = (0., 0., sign*.19, 0., 0., 0.)
+    core.velocity = (0., 0., sign*.1, 0., 0., 0.)
+    # Unresolved windows, regardless of a raw spike, cannot unload support.
+    assert core._composed_speed_scale(2, frame, sign*.6) == 1.
+    core.observe(core.last_time+.01, (0., 0., sign*.002, 0., 0., 0.), ZERO)
+    core.velocity = (0., 0., sign*core.motion.continuous_speed_limit_rad_s, 0., 0., 0.)
+    assert core._composed_speed_scale(2, frame, sign*.6) == 0.
+    assert core._composed_speed_scale(2, frame, -sign*.6) == 1.
+    core.velocity = ZERO
+    assert core._composed_speed_scale(2, frame, sign*.6) == 1.
+
+
 def test_both_axes_share_one_envelope_and_commit_only_after_actual_receipt(settings):
     core = runtime(settings)
     warm(core)
