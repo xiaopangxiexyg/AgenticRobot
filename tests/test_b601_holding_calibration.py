@@ -118,6 +118,73 @@ def test_unanchored_midpoint_transitions_keep_original_budget_and_never_complete
     assert search.status()["usable_hold_nm"] is None
 
 
+@pytest.mark.parametrize("sign", [-1, 1])
+def test_rdsb_m51_same_direction_censored_zero_explores_across_zero(sign):
+    seed = sign*.12737109345797037
+    search = HoldingForceSearch(HoldingSearchConfig(max_trials=27, movement_rad=.0045),
+        seed_nm=seed, cap_nm=1, recheck_interior_on_conflict=True)
+    search.record(command_nm=seed, requested_command_nm=seed,
+        outcome="positive_motion" if sign > 0 else "negative_motion",
+        evidence={"net_displacement_rad":sign*.0046019405126571655})
+    search.record_transition(command_nm=0, requested_command_nm=0,
+        evidence={"outcome":"censored_plateau_outside_point",
+                  "net_displacement_rad":sign*.003067959100008011})
+    assert search.state == "searching"
+    assert search.candidate_nm == pytest.approx(-seed)
+    assert search.status()["observed_stationary_range_nm"] is None
+    assert search.return_command_nm is None
+    assert len(search.observations) == len(search.transitions) == 1
+    # Only the factual prefix above is replayed. This hypothetical static
+    # interval lies outside [zero, arrival]; it is not a measured B601 force.
+    for _ in range(27):
+        if search.state != "searching":
+            break
+        u = search.candidate_nm
+        aligned = sign*u
+        outcome = ("stationary" if -.24 <= aligned <= -.18 else
+                   "positive_motion" if aligned > -.18 else "negative_motion")
+        if sign < 0 and outcome != "stationary":
+            outcome = "negative_motion" if outcome == "positive_motion" else "positive_motion"
+        search.record(command_nm=u, requested_command_nm=u, outcome=outcome, evidence={})
+    assert search.state == "complete", search.status(detailed=True)
+    hold = search.status()["usable_hold_nm"]
+    assert -.24 <= sign*hold <= -.18
+    assert sum(r["outcome"] == "stationary" and r["command_nm"] == hold
+               for r in search.observations) >= 2
+    assert search.status()["auto_apply"] is search.status()["identifies_unique_gravity"] is False
+
+
+@pytest.mark.parametrize("sign", [-1, 1])
+def test_unanchored_directed_censors_expand_finitely_without_fabricating_bounds(sign):
+    search = HoldingForceSearch(HoldingSearchConfig(max_trials=27, movement_rad=.0045),
+        seed_nm=sign*.1, cap_nm=.3, recheck_interior_on_conflict=True)
+    search.record(command_nm=sign*.1,
+        outcome="positive_motion" if sign > 0 else "negative_motion", evidence={})
+    while search.state == "searching":
+        u = search.candidate_nm
+        search.record_transition(command_nm=u, requested_command_nm=u,
+            evidence={"net_displacement_rad":sign*.003})
+        assert abs(search.candidate_nm) <= .3
+    assert search.reason == "holding_authority_insufficient"
+    assert [r["command_nm"] for r in search.transitions] == pytest.approx([0, -sign*.1, -sign*.3])
+    assert len(search.observations) == 1
+    assert search.status()["usable_hold_nm"] is None
+    assert search.status()["negative_motion_below_nm" if sign > 0 else "positive_motion_above_nm"] is None
+
+
+def test_censored_narrow_interval_is_not_a_resolved_force_bracket():
+    search = HoldingForceSearch(HoldingSearchConfig(max_trials=12), seed_nm=.03,
+        cap_nm=1, recheck_interior_on_conflict=True)
+    search.record(command_nm=.03, outcome="positive_motion", evidence={})
+    search.record_transition(command_nm=0, requested_command_nm=0, evidence={})
+    u = search.candidate_nm
+    search.record_transition(command_nm=u, requested_command_nm=u, evidence={})
+    assert .03-u < search.config.torque_resolution_nm
+    assert search.state == "searching"
+    assert search.status()["negative_motion_below_nm"] is None
+    assert search.status()["usable_hold_nm"] is None
+
+
 def test_inconsistent_same_level_is_not_forced_into_a_binary_result():
     search = HoldingForceSearch(HoldingSearchConfig(), seed_nm=-0.3, cap_nm=1)
     search.record(command_nm=-0.3, outcome="stationary", evidence={})

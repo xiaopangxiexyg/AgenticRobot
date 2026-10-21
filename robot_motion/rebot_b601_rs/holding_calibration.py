@@ -254,10 +254,31 @@ class HoldingForceSearch:
                              if r["outcome"] == "negative_motion"), default=-math.inf)
                 upper = min((r["command_nm"] for r in self.observations
                              if r["outcome"] == "positive_motion"), default=math.inf)
-                # An arrival command can move, while the next trial settles
-                # outside the frozen point. Neither is a holding anchor yet.
-                # Use the censored endpoint only to propose an interior test;
-                # do not promote it to a signed motion or stationary bound.
+                # A censored endpoint is not the other side of a physical
+                # bracket. If progress agrees with the only resolved motion
+                # direction, explore away from it, including across zero.
+                # This is a proposal only: the new command still needs a
+                # constant-command observation at the original sample point.
+                directed = (progress is not None
+                            and abs(progress) >= self.config.movement_rad/2)
+                one_sided_progress = directed and (
+                    (math.isfinite(upper) and not math.isfinite(lower) and progress > 0)
+                    or (math.isfinite(lower) and not math.isfinite(upper) and progress < 0)
+                )
+                if one_sided_progress:
+                    bound = upper if progress > 0 else lower
+                    step = max(self.config.torque_resolution_nm, abs(command_nm),
+                               abs(command_nm-bound))
+                    proposal = command_nm-math.copysign(step, progress)
+                    self.candidate_nm = max(-self.cap_nm, min(self.cap_nm, proposal))
+                    self.reason = "explore_unverified_hold_beyond_censored_endpoint"
+                    if abs(self.candidate_nm-command_nm) <= 1e-9:
+                        self.state, self.reason = "incomplete", "holding_authority_insufficient"
+                    else:
+                        self._check_trial_budget()
+                    return
+                # Opposing or unresolved transient progress can propose an
+                # interior test, but never certify a bracket's resolution.
                 left = right = command_nm
                 if math.isfinite(lower) and math.isfinite(upper):
                     left, right = lower, upper
@@ -268,10 +289,7 @@ class HoldingForceSearch:
                 if math.isfinite(left) and math.isfinite(right) and right > left:
                     self.candidate_nm = (left + right) / 2
                     self.reason = "refine_unverified_hold_between_motion_and_transition"
-                    if right-left <= self.config.torque_resolution_nm:
-                        self.state, self.reason = "incomplete", "holding_no_verified_anchor_in_search_interval"
-                    else:
-                        self._check_trial_budget()
+                    self._check_trial_budget()
                     return
             if (self._recheck_interior_on_conflict and not self.observations
                 and self._verification is None and progress is not None
