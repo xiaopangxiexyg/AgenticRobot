@@ -804,6 +804,10 @@ async function refresh() {
     el("phase").textContent = phaseNames[state.phase] || state.phase;
     if (!staged) el("phase").textContent = directDriveLabel(state);
     el("fault").textContent = state.fault || "";
+    if (state.fault === "joint_velocity_exceeded" && state.motion_fault?.joint_name) {
+      const fault = state.motion_fault;
+      el("fault").textContent += `：${fault.joint_name} 接收差分 ${number(fault.raw_qvel_rad_s, 5)} rad/s，硬门 ${number(fault.limit_rad_s, 5)} rad/s；窗口 ${number(fault.window_qvel_rad_s, 5)} rad/s。任务关节不一定是故障关节。`;
+    }
     const jointSelect = el("joint-select");
     for (const option of jointSelect.options) option.disabled = Boolean(state.motion_control_enabled || state.quantized_velocity_debug) && option.value !== "joint3";
     if (document.activeElement !== jointSelect) jointSelect.value = state.joint_name;

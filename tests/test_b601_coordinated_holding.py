@@ -144,6 +144,44 @@ def test_recorded_slip_speed_requests_fast_bounded_support_not_zero(settings, mo
     assert outputs[1][1] == pytest.approx(.1)
 
 
+@pytest.mark.parametrize("direction", [-1, 1])
+@pytest.mark.parametrize("recent_ratio", [None, 2., .5, 0., -1.])
+def test_supported_damping_releases_stale_window_tail_without_amplifying_or_erasing_support(
+    settings, monkeypatch, direction, recent_ratio,
+):
+    from robot_motion.rebot_b601_rs.joint_motion import B601JointMotionFrame
+
+    core = runtime(settings)
+    core.config = CoordinatedHoldingConfig(supported_soft_recovery=True)
+    core.settings = replace(core.settings, limits=replace(core.settings.limits,
+        max_abs_assist_nm=1., max_joint_velocity_rad_s=.195))
+    warm(core)
+    # Same-state command comparison of 9b78u5th's late brake window.
+    velocity = direction*.06047901995951213
+    core.velocity = (0., 0., velocity, 0., 0., 0.)
+    core.raw = ZERO
+    core.bias = (0., .1, 0., 0., 0., 0.)
+    core.last_delta = (0., .1, -6*velocity, 0., 0., 0.)
+    for i, tracker in zip((1, 2), core.trackers):
+        recent = None if recent_ratio is None else core.velocity[i]*recent_ratio
+        frame = B601JointMotionFrame(phase="brake", reason="resolved_tracking_speed_braking",
+            q_reference_rad=core.q[i], qvel_reference_rad_s=0,
+            control_qvel_rad_s=core.velocity[i], position_torque_nm=0,
+            velocity_torque_nm=-2*core.velocity[i], requested_torque_nm=-2*core.velocity[i],
+            speed_governor_active=True, tracking_recent_velocity_rad_s=recent)
+        monkeypatch.setattr(tracker, "update", lambda frame=frame, **kwargs: frame)
+    command, audit = core.step(sequence=12, dt=.025, permitted=True)
+    fraction = 1. if recent_ratio is None else max(0., min(1., recent_ratio))
+    assert audit["support_damping_velocity_rad_s"][2] == pytest.approx(velocity*fraction)
+    expected = -6*velocity*fraction
+    previous = core.last_delta[2]
+    bound = core.motion.braking_slew_nm_s*.025
+    assert command[2] == pytest.approx(previous+max(-bound, min(bound, expected-previous)))
+    assert command[1] == .1
+    assert sum(abs(v) for v in command) <= 1+1e-9
+    core.record_dispatch(12, command)
+
+
 @pytest.mark.parametrize("period", [.01, .025])
 @pytest.mark.parametrize("joint", [1, 2])
 @pytest.mark.parametrize("direction", [-1, 1])
@@ -791,6 +829,44 @@ def test_all_axis_authority_and_final_envelope_remain_enforced(tmp_path, kind, s
     assert r.controller.result_record()["state"] in {"stopping", "failed"}
 
 
+def test_passive_joint_hard_velocity_reports_actual_fault_axis_not_task_axis(tmp_path):
+    r = replay(tmp_path, coordinated_holding=CoordinatedHoldingConfig(supported_soft_recovery=True))
+    r.controller.submit("arm", now_sec=r.now)
+    for _ in range(80):
+        r.tick()
+    q = list(r.q)
+    q[3] += .20159287702047662*.01
+    r.tick(q)
+    assert r.audit["fault"] == "joint_velocity_exceeded"
+    fault = r.audit["motion_fault"]
+    assert fault["joint_name"] == "joint4"
+    assert abs(fault["raw_qvel_rad_s"]) > fault["limit_rad_s"]
+    assert r.audit["joint_name"] != fault["joint_name"]
+    assert r.delta == ZERO
+    assert r.controller.result_record()["state"] == "failed"
+
+
+def test_coverage_local_damping_ramps_through_complete_receipts_and_restores_on_withdrawal(tmp_path):
+    profile = Path(__file__).resolve().parents[1]/"docs/hardware/profiles/b601_j2_j3_coverage_support_v1.json"
+    r = replay(tmp_path, **json.loads(profile.read_text())["workspace"])
+    r.controller.submit("arm", now_sec=r.now)
+    workspace = r.controller._coordinated
+    target = workspace.workspace.joint3_drive_kd
+    previous = r.last_kd
+    for _ in range(140):
+        r.tick()
+        assert max(abs(a-b) for a, b in zip(previous, r.last_kd)) <= .02+1e-9
+        previous = r.last_kd
+    assert r.last_kd == target == (.4, .6, 1.2, 1.2, .2, .1)
+    r.controller.submit("withdraw", now_sec=r.now)
+    for _ in range(200):
+        r.tick()
+        if r.controller.result_record()["state"] == "cancelled":
+            break
+    assert r.last_kd == r.delta == ZERO
+    assert r.controller.result_record()["state"] == "cancelled"
+
+
 def coupled_tick(r, *, period=.025, passive_offset=0):
     """Declared overdamped toy, not identified B601 physics or a force sensor."""
     q = list(r.q)
@@ -1148,6 +1224,7 @@ def test_coverage_profile_reuses_paths_with_four_legs_and_keeps_hold_verificatio
     assert workspace.coordinated_holding.total_assist_cap_nm == 1
     assert workspace.coordinated_holding.bias_gain_nm_per_rad_sec == 40
     assert workspace.coordinated_holding.supported_soft_recovery
+    assert workspace.joint2_drive_kd == workspace.joint3_drive_kd == (.4, .6, 1.2, 1.2, .2, .1)
     assert controller.config.max_sweep_leg_sec == 180
     assert controller.pose.motion.max_control_gap_sec == .04
     assert not WorkspaceCalibrationConfig().coordinated_holding
@@ -1635,7 +1712,8 @@ def test_full_coupled_batch_and_report_keep_handoffs_distinct_from_withdrawal(tm
     changes = {}
     if coverage:
         changes.update(holding_sampling_plan="coverage", coordinated_holding=CoordinatedHoldingConfig(
-            bias_gain_nm_per_rad_sec=40, supported_soft_recovery=True))
+            bias_gain_nm_per_rad_sec=40, supported_soft_recovery=True),
+            joint2_drive_kd=(.4, .6, 1.2, 1.2, .2, .1), joint3_drive_kd=(.4, .6, 1.2, 1.2, .2, .1))
     if period == .025 and passive_offset:
         # Exercise the actual explicit profile at the observed cadence too,
         # rather than validating the new margins only with shortened dwells.

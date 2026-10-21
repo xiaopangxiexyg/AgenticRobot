@@ -224,6 +224,7 @@ class CoordinatedPoseHolding:
         approach_reasons = [None] * 6
         support_anchor = self._support_anchor
         supported_braking = False
+        support_damping_velocity = [None] * 6
         composed_speed_scales = [1.0] * 6
         frames = []
         if permitted:
@@ -323,7 +324,17 @@ class CoordinatedPoseHolding:
                             seed = 0.0
                         if restoring*self.velocity[i] > 0:
                             restoring = 0.0
-                    demand[i] = seed + restoring - self.config.recovery_kd_nm_s_per_rad*self.velocity[i]
+                    # The full window remains authoritative for stop capture.
+                    # Its deceleration tail must not keep requesting reverse
+                    # effort after the existing recent window has slowed down.
+                    recent = frame.tracking_recent_velocity_rad_s
+                    damping_v = self.velocity[i]
+                    if recent is not None:
+                        recent = finite(recent, "recent recovery velocity")
+                        damping_v = (min(abs(damping_v), abs(recent)) * (1 if damping_v >= 0 else -1)
+                                     if damping_v*recent > 0 else 0.0)
+                    support_damping_velocity[i] = damping_v
+                    demand[i] = seed + restoring - self.config.recovery_kd_nm_s_per_rad*damping_v
                     approach_reasons[i] = "supported_soft_stop_not_gravity_only"
             if not supported_braking:
                 support_anchor = None
@@ -389,6 +400,7 @@ class CoordinatedPoseHolding:
             "supported_soft_stop": supported_braking,
             "support_anchor_rad": support_anchor,
             "support_dispatch_confirmed": self._support_receipt,
+            "support_damping_velocity_rad_s": support_damping_velocity if supported_braking else None,
             "approach_reasons": approach_reasons, "brake_recovery_proposal_nm": brake_seed,
             "composed_speed_scales": composed_speed_scales,
             "torque_transition_reasons": transition_reasons, "torque_transition_rates_nm_s": transition_rates,

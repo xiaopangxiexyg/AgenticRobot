@@ -677,6 +677,15 @@ class CoordinatedWorkspaceController:
         task = self._tasks[self._index] if self._index < len(self._tasks) else {}
         joint = task.get("joint", "joint2")
         j = int(joint[-1])-1
+        motion_fault = self.pose.fault_frame
+        if fault == "joint_velocity_exceeded":
+            # The task joint is not necessarily the joint that tripped.
+            failed = max(range(6), key=lambda i: abs(self.pose.raw[i]))
+            motion_fault = {"joint_name": f"joint{failed+1}", "reason": fault,
+                "feedback_timestamp_sec": self.pose.last_time,
+                "raw_qvel_rad_s": self.pose.raw[failed],
+                "window_qvel_rad_s": self.pose.velocity[failed],
+                "limit_rad_s": self.limits.max_joint_velocity_rad_s}
         moving = self._phase in {"position", "return", "sweep", "observe", "return_observe"}
         marker = None if self._batch_id is None else {
             "batch_id": self._batch_id,
@@ -688,7 +697,7 @@ class CoordinatedWorkspaceController:
             "reason": fault or self._reason, "fault": fault, "qpos_rad": self.pose.q, "qvel_fd_rad_s": self.pose.raw,
             "control_qvel_rad_s": self.pose.velocity, "desired_assist_nm": command[j], "effective_assist_nm": command[j],
             "overlay_torque_nm": command, "coordinated_holding": pose_audit,
-            "motion_fault": self.pose.fault_frame,
+            "motion_fault": motion_fault,
             "holding_calibration": self._holding_status(), "automatic_calibration": self._batch_status(),
             "calibration_trial": marker}
 
