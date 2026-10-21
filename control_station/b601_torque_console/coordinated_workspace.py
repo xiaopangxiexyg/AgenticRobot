@@ -241,7 +241,6 @@ class CoordinatedWorkspaceController:
                 self._start, self._origin, self._started = False, self.pose.q, clock
                 self._batch_id = f"coordinated-{clock:.9f}"
                 self._tasks = self.workspace.tasks(self._origin)
-                self.pose.set_goal(self._origin)
                 self._transition("preparing", "coordinated_batch_authorized")
                 self._records.append({**self.result_record(), "kind": "automatic_calibration_started", "recorded_monotonic_sec": clock})
             if self._active:
@@ -277,7 +276,14 @@ class CoordinatedWorkspaceController:
                         self._stop("active_command_exposure_budget", "failed")
                     elif self._phase == "sweep" and now-self._sweep_started > self.config.max_batch_sec:
                         self._stop("batch_timeout", "failed")
-            if self._phase == "preparing" and self.pose.quiet() and self._zero_base:
+            prepare_confirmed = self._zero_base
+            if self.workspace.coordinated_holding.motor_local_recovery:
+                prepare_confirmed = (max(abs(v) for v in self._last_delta) <= 1e-9 and self._last_commands is not None
+                    and self._last_commands["overlay_nm"] == ZERO and self._last_kd == self._drive_kd_target())
+            if self._phase == "preparing" and self.pose.quiet() and prepare_confirmed:
+                # Parameter changes and the first goal belong after preparation,
+                # never to the GUI Start request's possibly moving feedback.
+                self.pose.set_goal(self._origin)
                 self._begin_task()
             if self._phase == "failed" and (calibration_outcome(self._phase, self._reason)["severity"] == "error" or not self._zero_base):
                 return ZERO, self._make_audit(ZERO, {}, fault=self._reason)
@@ -300,13 +306,17 @@ class CoordinatedWorkspaceController:
             self.recording_failed("coordinated_final_command_envelope")
             raise ValueError(self._reason)
 
+    def _drive_kd_target(self):
+        return tuple(max(b, a, c) for b, a, c in zip(self._condition.driver_kd_nm_s_per_rad,
+            self.workspace.joint2_drive_kd, self.workspace.joint3_drive_kd))
+
     def active_driver_damping(self, base_kd, *, final_command_delta_nm=None):
         base = six(base_kd, "base damping")
         target = base
-        if self._active and self._phase != "preparing":
+        if self._active and (self._phase != "preparing" or self.workspace.coordinated_holding.motor_local_recovery):
             delta = self._last_delta if final_command_delta_nm is None else six(final_command_delta_nm, "final delta")
             if self._phase != "stopping" or any(abs(v) > 1e-9 for v in delta) or any(abs(v) > 1e-9 for v in self._last_delta):
-                target = tuple(max(b, a, c) for b, a, c in zip(base, self.workspace.joint2_drive_kd, self.workspace.joint3_drive_kd))
+                target = tuple(max(b, a) for b, a in zip(base, self._drive_kd_target()))
         dt = (self.settings.nominal_control_period_sec if self._receipt_feedback_stamp is None else
               self.pose.last_time-self._receipt_feedback_stamp)
         return slew_driver_damping(self._last_kd or base, target,
@@ -471,8 +481,7 @@ class CoordinatedWorkspaceController:
                 # repeatedly probe or reanchor an already frozen sample point.
                 self._stop("holding_search_incomplete", "failed")
                 return
-            kd_target = tuple(max(b, a, c) for b, a, c in zip(self._condition.driver_kd_nm_s_per_rad,
-                self.workspace.joint2_drive_kd, self.workspace.joint3_drive_kd))
+            kd_target = self._drive_kd_target()
             # Nominal placement is not the measured point's stability band.
             # Freeze the actual pose below; keep its fine dwell and subsequent
             # full-pose/context checks independent of this entry tolerance.
@@ -641,6 +650,8 @@ class CoordinatedWorkspaceController:
                     "holding_calibration": self._holding_status(detailed=True)}})
         return {"phase": self._phase, "reason": self._reason, "coordinated_holding_enabled": True,
             "holding_sampling_plan": self.workspace.holding_sampling_plan,
+            "recovery_damping_owner": ("motor_local_profile" if self.workspace.coordinated_holding.motor_local_recovery
+                else "software_window"),
             "supported_soft_stop": (self._active and self._phase != "stopping"
                 and bool(self._audit.get("coordinated_holding", {}).get("supported_soft_stop"))),
             "setup_label": self.workspace.setup_label, "settings": asdict(self.workspace) if detailed else None,

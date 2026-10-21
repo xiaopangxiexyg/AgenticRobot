@@ -34,10 +34,18 @@ class CoordinatedHoldingConfig:
                 if type(value) is not bool:
                     raise TypeError("supported soft recovery must be boolean")
                 continue
+            if name == "recovery_kd_nm_s_per_rad":
+                if finite(value, name) < 0:
+                    raise ValueError("recovery software damping must be nonnegative")
+                continue
             if finite(value, name) <= 0:
                 raise ValueError(f"coordinated {name} must be positive")
         if self.bias_cap_nm > self.total_assist_cap_nm:
             raise ValueError("holding bias must fit the combined assist envelope")
+
+    @property
+    def motor_local_recovery(self):
+        return self.supported_soft_recovery and self.recovery_kd_nm_s_per_rad == 0
 
 
 class CoordinatedPoseHolding:
@@ -292,7 +300,11 @@ class CoordinatedPoseHolding:
                 # frame. Resume requires the selected stop receipt and dwell.
                 seed = list(self.last_delta)
                 for i, frame in zip(AXES, frames, strict=True):
-                    if (not supported_braking and frame.reason in {"resolved_tracking_speed_braking", "soft_velocity_braking"}
+                    if supported_braking:
+                        seed[i] = (min(abs(self.bias[i]), abs(self.last_delta[i]))
+                                   * (1 if self.bias[i] >= 0 else -1)
+                                   if self.bias[i]*self.last_delta[i] > 0 else 0.0)
+                    elif (frame.reason in {"resolved_tracking_speed_braking", "soft_velocity_braking"}
                         and self.last_delta[i] * self.velocity[i] > 0
                         and self.estimators[i].position_span_rad >= max(
                             2 * (self.motion.position_resolution_rad or 0.0),
@@ -311,12 +323,11 @@ class CoordinatedPoseHolding:
                              if frame.phase == "brake" and frame.reason != "target_reached_braking"
                              else -self.motion.braking_kd_nm_s_per_rad * self.velocity[i])
                 if supported_braking:
-                    # Only retain bias witnessed in the preceding complete
-                    # command. Never resurrect an untransmitted integral.
-                    seed = (min(abs(self.bias[i]), abs(self.last_delta[i]))
-                            if self.bias[i]*self.last_delta[i] > 0 else 0.0)
-                    seed = seed if self.bias[i] >= 0 else -seed
-                    resolved = (self.estimators[i].position_span_rad > (self.motion.position_resolution_rad or 0)
+                    # Latch support once at entry. Recomputing it from every
+                    # composite would repeatedly debit the same spring effort.
+                    seed = brake_seed[i]
+                    resolved = (not self.config.motor_local_recovery
+                                and self.estimators[i].position_span_rad > (self.motion.position_resolution_rad or 0)
                                 and abs(self.velocity[i]) > self.settings.staged_assist.settle_velocity_rad_s)
                     restoring = self.motion.tracking_kp_nm_per_rad*(support_anchor[i]-self.q[i])
                     if resolved:
@@ -328,8 +339,8 @@ class CoordinatedPoseHolding:
                     # Its deceleration tail must not keep requesting reverse
                     # effort after the existing recent window has slowed down.
                     recent = frame.tracking_recent_velocity_rad_s
-                    damping_v = self.velocity[i]
-                    if recent is not None:
+                    damping_v = 0.0 if self.config.motor_local_recovery else self.velocity[i]
+                    if not self.config.motor_local_recovery and recent is not None:
                         recent = finite(recent, "recent recovery velocity")
                         damping_v = (min(abs(damping_v), abs(recent)) * (1 if damping_v >= 0 else -1)
                                      if damping_v*recent > 0 else 0.0)
@@ -400,6 +411,7 @@ class CoordinatedPoseHolding:
             "supported_soft_stop": supported_braking,
             "support_anchor_rad": support_anchor,
             "support_dispatch_confirmed": self._support_receipt,
+            "support_damping_owner": "motor_local_profile" if self.config.motor_local_recovery else "software_window",
             "support_damping_velocity_rad_s": support_damping_velocity if supported_braking else None,
             "approach_reasons": approach_reasons, "brake_recovery_proposal_nm": brake_seed,
             "composed_speed_scales": composed_speed_scales,

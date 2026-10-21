@@ -47,12 +47,13 @@ def warm(core):
 
 @pytest.mark.parametrize("direction", [-1, 1])
 @pytest.mark.parametrize("conditioned_tail", [False, True])
+@pytest.mark.parametrize("software_kd", [0., 6.])
 def test_supported_soft_stop_opposes_slip_and_resumes_only_after_actual_support_receipt(
-    settings, direction, conditioned_tail,
+    settings, direction, conditioned_tail, software_kd,
 ):
     core = runtime(settings)
     core.config = CoordinatedHoldingConfig(total_assist_cap_nm=.3, bias_cap_nm=.2,
-        supported_soft_recovery=True)
+        supported_soft_recovery=True, recovery_kd_nm_s_per_rad=software_kd)
     warm(core)
     core.adopt_hold(1, .1)
     core.adopt_hold(2, -direction*.1)
@@ -108,6 +109,53 @@ def test_supported_recovery_does_not_bypass_reference_lag_or_raw_velocity(settin
     core.raw = (0, 0, core.settings.limits.max_joint_velocity_rad_s*1.01, 0, 0, 0)
     with pytest.raises(ValueError, match="raw joint velocity"):
         core.step(sequence=12, dt=.01, permitted=True)
+
+
+@pytest.mark.parametrize("software_kd", [0., 6.])
+def test_supported_stop_retains_one_witnessed_seed_without_recursive_spring_debit(settings, monkeypatch, software_kd):
+    from robot_motion.rebot_b601_rs.joint_motion import B601JointMotionFrame
+
+    core = runtime(settings)
+    core.config = CoordinatedHoldingConfig(supported_soft_recovery=True, recovery_kd_nm_s_per_rad=software_kd)
+    core.settings = replace(core.settings, limits=replace(core.settings.limits,
+        max_abs_assist_nm=1., max_joint_velocity_rad_s=.195))
+    warm(core)
+    core.bias = core.last_delta = (0., .2, .3, 0., 0., 0.)
+    for tracker in core.trackers:
+        frame = B601JointMotionFrame(phase="brake", reason="soft_velocity_braking",
+            q_reference_rad=0, qvel_reference_rad_s=0, control_qvel_rad_s=0,
+            position_torque_nm=0, velocity_torque_nm=0, requested_torque_nm=0,
+            speed_governor_active=True)
+        monkeypatch.setattr(tracker, "update", lambda frame=frame, **kwargs: frame)
+    for n in range(30):
+        q = (0., 0., min(n, 5)*.001, 0., 0., 0.)
+        raw = tuple((a-b)/.01 for a, b in zip(q, core.q))
+        dt = core.observe(1.12+n*.01, q, raw)
+        command, audit = core.step(sequence=12+n, dt=dt, permitted=True)
+        core.record_dispatch(12+n, command)
+        assert core._brake_seed == (0., .2, .3, 0., 0., 0.)
+        if software_kd == 0:
+            assert audit["support_damping_owner"] == "motor_local_profile"
+            assert audit["support_damping_velocity_rad_s"][2] == 0
+    # Allow the original finite torque slew to reach the stable plateau.
+    assert command[2] == pytest.approx(.3-core.motion.tracking_kp_nm_per_rad*.005)
+    assert command[1] == .2
+
+
+@pytest.mark.parametrize("axis,value", [(1, 0), (2, 0), (2, 5.01)])
+def test_motor_local_recovery_requires_configured_bounded_driver_damping(axis, value):
+    gains = [.4, 3., 3., 1.2, .2, .1]
+    gains[axis] = value
+    with pytest.raises(ValueError, match="motor-local recovery"):
+        WorkspaceCalibrationConfig(coordinated_holding=CoordinatedHoldingConfig(
+            supported_soft_recovery=True, recovery_kd_nm_s_per_rad=0),
+            holding_search=HoldingSearchConfig(), joint2_drive_kd=gains, joint3_drive_kd=gains)
+
+
+@pytest.mark.parametrize("value", ["0", True, float("nan"), -.1])
+def test_recovery_software_damping_rejects_invalid_coefficients(value):
+    with pytest.raises(ValueError, match="recovery"):
+        CoordinatedHoldingConfig(supported_soft_recovery=True, recovery_kd_nm_s_per_rad=value)
 
 
 @pytest.mark.parametrize("direction", [-1, 1])
@@ -371,10 +419,10 @@ def test_continuous_transit_keeps_native_terminal_guards_and_failed_axis(setting
     assert core.pending is None
 
 
-@pytest.mark.parametrize("supported", [False, True])
-def test_coordinated_fault_retains_actual_failed_axis_and_new_brake_clock(settings, supported):
+@pytest.mark.parametrize("supported,software_kd", [(False, 6.), (True, 6.), (True, 0.)])
+def test_coordinated_fault_retains_actual_failed_axis_and_new_brake_clock(settings, supported, software_kd):
     core = runtime(settings)
-    core.config = replace(core.config, supported_soft_recovery=supported)
+    core.config = replace(core.config, supported_soft_recovery=supported, recovery_kd_nm_s_per_rad=software_kd)
     warm(core)
     core.set_goal(ZERO)
     for tracker in core.trackers:
@@ -802,11 +850,10 @@ def test_coordinated_profile_is_explicit_and_does_not_change_legacy(tmp_path):
 
 
 @pytest.mark.parametrize("kind", ["human", "withdraw", "lease", "hard_speed", "receipt", "cap"])
-@pytest.mark.parametrize("supported", [False, True])
-def test_all_axis_authority_and_final_envelope_remain_enforced(tmp_path, kind, supported):
-    r = replay(tmp_path)
-    core = r.controller._coordinated.pose
-    core.config = replace(core.config, supported_soft_recovery=supported)
+@pytest.mark.parametrize("supported,software_kd", [(False, 6.), (True, 6.), (True, 0.)])
+def test_all_axis_authority_and_final_envelope_remain_enforced(tmp_path, kind, supported, software_kd):
+    r = replay(tmp_path, coordinated_holding=CoordinatedHoldingConfig(
+        supported_soft_recovery=supported, recovery_kd_nm_s_per_rad=software_kd))
     r.controller.submit("arm", now_sec=r.now)
     for _ in range(80):
         r.tick()
@@ -853,11 +900,15 @@ def test_coverage_local_damping_ramps_through_complete_receipts_and_restores_on_
     workspace = r.controller._coordinated
     target = workspace.workspace.joint3_drive_kd
     previous = r.last_kd
-    for _ in range(140):
+    for _ in range(200):
         r.tick()
         assert max(abs(a-b) for a, b in zip(previous, r.last_kd)) <= .02+1e-9
+        if workspace._phase == "preparing":
+            assert r.delta == ZERO and workspace.pose.goal is None
+        else:
+            assert previous == target
         previous = r.last_kd
-    assert r.last_kd == target == (.4, .6, 1.2, 1.2, .2, .1)
+    assert r.last_kd == target == (.4, 3., 3., 1.2, .2, .1)
     r.controller.submit("withdraw", now_sec=r.now)
     for _ in range(200):
         r.tick()
@@ -865,6 +916,17 @@ def test_coverage_local_damping_ramps_through_complete_receipts_and_restores_on_
             break
     assert r.last_kd == r.delta == ZERO
     assert r.controller.result_record()["state"] == "cancelled"
+
+
+def test_missing_local_damping_receipt_aborts_preparation_before_active_force(tmp_path):
+    profile = Path(__file__).resolve().parents[1]/"docs/hardware/profiles/b601_j2_j3_coverage_support_v1.json"
+    r = replay(tmp_path, **json.loads(profile.read_text())["workspace"])
+    r.controller.submit("arm", now_sec=r.now)
+    with pytest.raises(ValueError, match="coordinated_damping_receipt_mismatch"):
+        r.tick(kd_override=ZERO)
+    assert r.delta == ZERO
+    assert r.controller._coordinated.pose.goal is None
+    assert r.controller.result_record()["state"] == "failed"
 
 
 def coupled_tick(r, *, period=.025, passive_offset=0):
@@ -1224,7 +1286,9 @@ def test_coverage_profile_reuses_paths_with_four_legs_and_keeps_hold_verificatio
     assert workspace.coordinated_holding.total_assist_cap_nm == 1
     assert workspace.coordinated_holding.bias_gain_nm_per_rad_sec == 40
     assert workspace.coordinated_holding.supported_soft_recovery
-    assert workspace.joint2_drive_kd == workspace.joint3_drive_kd == (.4, .6, 1.2, 1.2, .2, .1)
+    assert workspace.joint2_drive_kd == workspace.joint3_drive_kd == (.4, 3., 3., 1.2, .2, .1)
+    assert workspace.coordinated_holding.recovery_kd_nm_s_per_rad == 0
+    assert workspace.coordinated_holding.motor_local_recovery
     assert controller.config.max_sweep_leg_sec == 180
     assert controller.pose.motion.max_control_gap_sec == .04
     assert not WorkspaceCalibrationConfig().coordinated_holding
@@ -1505,8 +1569,10 @@ def test_controlled_support_reacquires_same_frozen_sample_without_global_withdra
     assert workspace._phase == "sweep"
 
 
-def test_position_arrival_still_requires_six_axis_stationarity(tmp_path):
-    r = replay(tmp_path)
+@pytest.mark.parametrize("supported,software_kd", [(False, 6.), (True, 6.), (True, 0.)])
+def test_position_arrival_still_requires_six_axis_stationarity(tmp_path, supported, software_kd):
+    r = replay(tmp_path, coordinated_holding=CoordinatedHoldingConfig(
+        supported_soft_recovery=supported, recovery_kd_nm_s_per_rad=software_kd))
     for _ in range(12):
         q = list(r.q)
         q[3] += .0002
@@ -1519,6 +1585,14 @@ def test_position_arrival_still_requires_six_axis_stationarity(tmp_path):
     assert r.controller.result_record()["state"] == "preparing"
     assert not r.controller._coordinated.pose.quiet()
     assert r.delta == ZERO
+    assert r.controller._coordinated.pose.goal is None
+    started = r.controller._coordinated._started
+    for _ in range(100):
+        r.tick(dt_sec=.025)
+        if r.controller.result_record()["state"] == "position":
+            break
+    assert r.controller.result_record()["state"] == "position"
+    assert r.controller._coordinated._started == started
 
 
 def test_static_pose_dwell_does_not_hide_slow_passive_drift(tmp_path):
@@ -1712,8 +1786,8 @@ def test_full_coupled_batch_and_report_keep_handoffs_distinct_from_withdrawal(tm
     changes = {}
     if coverage:
         changes.update(holding_sampling_plan="coverage", coordinated_holding=CoordinatedHoldingConfig(
-            bias_gain_nm_per_rad_sec=40, supported_soft_recovery=True),
-            joint2_drive_kd=(.4, .6, 1.2, 1.2, .2, .1), joint3_drive_kd=(.4, .6, 1.2, 1.2, .2, .1))
+            bias_gain_nm_per_rad_sec=40, supported_soft_recovery=True, recovery_kd_nm_s_per_rad=0),
+            joint2_drive_kd=(.4, 3., 3., 1.2, .2, .1), joint3_drive_kd=(.4, 3., 3., 1.2, .2, .1))
     if period == .025 and passive_offset:
         # Exercise the actual explicit profile at the observed cadence too,
         # rather than validating the new margins only with shortened dwells.

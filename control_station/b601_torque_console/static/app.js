@@ -283,6 +283,9 @@ function renderWorkspace(batch) {
     advancing: "准备下一阶段", stopping: "撤力停稳", complete: "多位姿采集完成",
     failed: batch.outcome?.severity === "warning" ? "采集未完成 · 告警，数据保留" : "采集故障 · 已停止",
     cancelled: "已撤销"};
+  if (workspace.recovery_damping_owner === "motor_local_profile") {
+    names.preparing = "建立电机本地阻尼并确认静止（零附加驱动力）";
+  }
   const label = workspace.supported_soft_stop ? "有界支撑恢复 · 停稳后继续原段" : workspace.phase === "sweep" && workspace.holding_search_enabled
     ? "定点保持命令搜索" : workspace.coordinated_holding_enabled && ["observe", "return_observe"].includes(workspace.phase)
       ? "联合姿态保持观察（不是零助力）" : names[workspace.phase] || workspace.phase;

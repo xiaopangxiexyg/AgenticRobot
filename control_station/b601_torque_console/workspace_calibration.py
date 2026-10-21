@@ -117,6 +117,12 @@ class WorkspaceCalibrationConfig:
             if min(gains) < 0:
                 raise ValueError("workspace damping must be nonnegative")
             object.__setattr__(self, name, gains)
+        if (self.coordinated_holding is not None and self.coordinated_holding.motor_local_recovery
+            and any(max(self.joint2_drive_kd[i], self.joint3_drive_kd[i]) <= 0 for i in (1, 2))):
+            raise ValueError("motor-local recovery requires positive J2/J3 driver damping")
+        if (self.coordinated_holding is not None and self.coordinated_holding.motor_local_recovery
+            and max(*self.joint2_drive_kd, *self.joint3_drive_kd) > 5):
+            raise ValueError("motor-local recovery driver damping exceeds the 0..5 envelope")
         for name in (
             "maximum_positioning_step_rad", "positioning_velocity_rad_s",
             "positioning_torque_rise_nm_s", "positioning_torque_fall_nm_s",
