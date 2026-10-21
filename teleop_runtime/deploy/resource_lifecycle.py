@@ -243,151 +243,135 @@ class PolicyDeployResourceLifecycle:
         *,
         keyboard_interrupt_stop_error: str | None,
     ) -> tuple[str, ...]:
+        """Drain owners before backend I/O; diagnostics cannot interrupt cleanup."""
         cleanup_errors: list[str] = []
-        position_workers_stopped = True
+        control_error: BaseException | None = None
 
-        try:
-            self.submit_legacy_owner_state(
-                lifecycle_state="stopped",
-                execution_gate="hold",
-                reason="policy_deploy_cleanup_started",
-            )
-        except Exception as exc:  # noqa: BLE001 - cleanup must continue.
-            cleanup_errors.append(
-                "legacy_control_owner_stop: " + f"{type(exc).__name__}: {exc}"
-            )
-        if keyboard_interrupt_stop_error is not None:
-            cleanup_errors.append(
-                "keyboard_interrupt_emergency_stop: "
-                + keyboard_interrupt_stop_error
-            )
+        def emit(message: str) -> None:
+            nonlocal control_error
+            try:
+                print(message, file=sys.stderr)
+            except BaseException as exc:
+                cleanup_errors.append(f"cleanup_stderr: {type(exc).__name__}: {exc}")
+                if not isinstance(exc, Exception) and control_error is None:
+                    control_error = exc
 
-        def close_resource(label: str, resource: Any) -> None:
+        def record_error(label: str, exc: BaseException) -> None:
+            nonlocal control_error
+            if not isinstance(exc, Exception) and control_error is None:
+                control_error = exc
+            error = f"{label}: {type(exc).__name__}: {exc}"
+            cleanup_errors.append(error)
+            emit(f"[DeployCleanup] {error}")
+
+        def log_event(event: str, payload: Any) -> None:
+            try:
+                self.debug_logger.log_event(event, payload)
+            except BaseException as exc:
+                record_error(f"debug_event:{event}", exc)
+
+        def close_resource(label: str, resource: Any) -> bool:
             try:
                 resource.close()
-            except Exception as exc:  # noqa: BLE001 - close every resource.
-                error = f"{label}: {type(exc).__name__}: {exc}"
-                cleanup_errors.append(error)
-                self.debug_logger.log_event(
-                    "cleanup_error",
-                    {
-                        "resource": str(label),
-                        "error_type": type(exc).__name__,
-                        "error": str(exc),
-                    },
-                )
-                print(f"[DeployCleanup] {error}", file=sys.stderr)
+                return True
+            except BaseException as exc:
+                record_error(label, exc)
+                log_event("cleanup_error", {"resource": label,
+                    "error_type": type(exc).__name__, "error": str(exc)})
+                return False
+
+        try:
+            self.submit_legacy_owner_state(lifecycle_state="stopped",
+                execution_gate="hold", reason="policy_deploy_cleanup_started")
+        except BaseException as exc:
+            record_error("legacy_control_owner_stop", exc)
+        if keyboard_interrupt_stop_error is not None:
+            cleanup_errors.append("keyboard_interrupt_emergency_stop: " + keyboard_interrupt_stop_error)
 
         if self.rtc_frontend is not None:
             try:
                 rtc_stop = self.rtc_frontend.close(now=time.monotonic())
                 if self.rtc_debug_observer is not None:
-                    self.rtc_debug_observer.offer(
-                        "rtc_frontend_close",
-                        {
-                            "worker_stop_hash": rtc_stop.semantic_content_hash,
-                            "worker_session_state": rtc_stop.session_state,
-                            "thread_exited": rtc_stop.thread_exited,
-                            "execution_drain_evidence": (
-                                rtc_stop.execution_drain_evidence
-                            ),
-                            "stop_status": rtc_stop.status,
-                        },
-                    )
-            except Exception as exc:  # noqa: BLE001 - continue all cleanup.
-                error = f"rtc_frontend: {type(exc).__name__}: {exc}"
-                cleanup_errors.append(error)
-                print(f"[DeployCleanup] {error}", file=sys.stderr)
+                    self.rtc_debug_observer.offer("rtc_frontend_close", {
+                        "worker_stop_hash": rtc_stop.semantic_content_hash,
+                        "worker_session_state": rtc_stop.session_state,
+                        "thread_exited": rtc_stop.thread_exited,
+                        "execution_drain_evidence": rtc_stop.execution_drain_evidence,
+                        "stop_status": rtc_stop.status})
+            except BaseException as exc:
+                record_error("rtc_frontend", exc)
         if self.rtc_debug_observer is not None:
             try:
-                rtc_debug_was_enabled = self.rtc_debug_observer.enabled
-                rtc_debug_status = self.rtc_debug_observer.close()
-                if rtc_debug_was_enabled:
-                    self.debug_logger.log_event(
-                        "rtc_debug_observer_status",
-                        rtc_debug_status.to_payload(),
-                    )
-            except Exception as exc:  # noqa: BLE001 - diagnostic shutdown only.
-                error = f"rtc_debug_observer: {type(exc).__name__}: {exc}"
-                cleanup_errors.append(error)
-                print(f"[DeployCleanup] {error}", file=sys.stderr)
+                enabled = self.rtc_debug_observer.enabled
+                status = self.rtc_debug_observer.close()
+                if enabled:
+                    log_event("rtc_debug_observer_status", status.to_payload())
+            except BaseException as exc:
+                record_error("rtc_debug_observer", exc)
+
+        position_workers_stopped = self.position_deploy_executor is None
         if self.position_deploy_executor is not None:
+            close_error = None
             try:
                 self.position_deploy_executor.close()
-            except Exception as exc:  # noqa: BLE001
-                close_snapshot = self.position_deploy_executor.snapshot()
-                position_workers_stopped = not bool(
-                    close_snapshot.get("reference_worker_alive")
-                    or close_snapshot.get("discrete_worker_alive")
-                )
-                print(
-                    f"[PositionDeploy] close/hold error: "
-                    f"{type(exc).__name__}: {exc}",
-                    file=sys.stderr,
-                )
-                cleanup_errors.append(
-                    f"position_executor: {type(exc).__name__}: {exc}"
-                )
-                self.debug_logger.log_event(
-                    "position_executor_close_error",
-                    {
-                        "error_type": type(exc).__name__,
-                        "error": str(exc),
-                        "snapshot": close_snapshot,
-                        "backend_close_skipped": bool(not position_workers_stopped),
-                    },
-                )
-            self.flush_position_executor_debug_events()
-            self.debug_logger.log_event(
-                "position_executor_final_snapshot",
-                self.position_deploy_executor.snapshot(),
-            )
+            except BaseException as exc:
+                close_error = exc
+                record_error("position_executor", exc)
+            # This positive receipt is mandatory on both success and failure.
+            # Missing fields, truthy non-bools and snapshot failures are unknown.
+            close_snapshot = None
+            try:
+                close_snapshot = self.position_deploy_executor.shutdown_snapshot()
+                position_workers_stopped = (
+                    isinstance(close_snapshot, Mapping)
+                    and close_snapshot.get("dispatch_workers_stopped") is True)
+            except BaseException as exc:
+                record_error("position_executor_snapshot", exc)
+            if close_error is not None:
+                log_event("position_executor_close_error", {
+                    "error_type": type(close_error).__name__, "error": str(close_error),
+                    "snapshot": close_snapshot,
+                    "backend_close_skipped": not position_workers_stopped})
+            try:
+                self.flush_position_executor_debug_events()
+            except BaseException as exc:
+                record_error("position_executor_debug_flush", exc)
+            log_event("position_executor_final_snapshot", close_snapshot)
+
+        arm_dependencies_stopped = position_workers_stopped
         if self.position_force_guard_monitor is not None:
-            self.debug_logger.log_event(
-                "position_force_guard_final_snapshot",
-                self.position_force_guard_monitor.snapshot(),
-            )
-            close_resource(
-                "position_force_guard",
-                self.position_force_guard_monitor,
-            )
+            try:
+                snapshot = self.position_force_guard_monitor.snapshot()
+                log_event("position_force_guard_final_snapshot", snapshot)
+            except BaseException as exc:
+                record_error("position_force_guard_snapshot", exc)
+            if not close_resource("position_force_guard", self.position_force_guard_monitor):
+                arm_dependencies_stopped = False
         if self.impedance_force_guard_monitor is not None:
-            close_resource(
-                "impedance_force_guard",
-                self.impedance_force_guard_monitor,
-            )
-        if self.fixed_init_controller is not None:
+            if not close_resource("impedance_force_guard", self.impedance_force_guard_monitor):
+                arm_dependencies_stopped = False
+        if self.fixed_init_controller is not None and arm_dependencies_stopped:
             try:
                 self.fixed_init_controller.restore_speed(self.arm_backends)
-            except Exception as exc:  # noqa: BLE001
-                error = f"fixed_init_restore_speed: {type(exc).__name__}: {exc}"
-                cleanup_errors.append(error)
-                self.debug_logger.log_event(
-                    "cleanup_error",
-                    {
-                        "resource": "fixed_init_restore_speed",
-                        "error_type": type(exc).__name__,
-                        "error": str(exc),
-                    },
-                )
-                print(f"[DeployCleanup] {error}", file=sys.stderr)
+            except BaseException as exc:
+                record_error("fixed_init_restore_speed", exc)
+                log_event("cleanup_error", {"resource": "fixed_init_restore_speed",
+                    "error_type": type(exc).__name__, "error": str(exc)})
+        hand_dependencies_stopped = position_workers_stopped
         if self.hand_state_poller is not None:
-            close_resource("hand_state_poller", self.hand_state_poller)
-        if position_workers_stopped:
+            if not close_resource("hand_state_poller", self.hand_state_poller):
+                hand_dependencies_stopped = False
+
+        if arm_dependencies_stopped:
             for side, backend in self.arm_backends.items():
                 close_resource(f"{side}_arm_backend", backend)
+        if hand_dependencies_stopped:
             for side, backend in self.hand_backends.items():
                 close_resource(f"{side}_hand_backend", backend)
-        else:
-            cleanup_errors.append(
-                "position_backends: close skipped because a dispatch worker is still alive"
-            )
-            print(
-                "[PositionDeploy] ERROR: a dispatch worker is still alive; "
-                "arm/hand backend close was intentionally skipped to avoid "
-                "concurrent I/O.",
-                file=sys.stderr,
-            )
+        if not position_workers_stopped:
+            cleanup_errors.append("position_backends: close skipped because worker shutdown is unconfirmed")
+        elif not arm_dependencies_stopped or not hand_dependencies_stopped:
+            cleanup_errors.append("position_backends: dependent backend close skipped because guard/poller shutdown is unconfirmed")
         for camera_key, camera_source in self.camera_sources.items():
             close_resource(f"camera:{camera_key}", camera_source)
         if self.camera_previewer is not None:
@@ -396,17 +380,15 @@ class PolicyDeployResourceLifecycle:
             close_resource("tactile_visualizer", self.tactile_visualizer)
         try:
             self.debug_logger.close()
-        except Exception as exc:  # noqa: BLE001
-            cleanup_errors.append(f"debug_logger: {type(exc).__name__}: {exc}")
-            print(
-                f"[DeployCleanup] debug_logger: {type(exc).__name__}: {exc}",
-                file=sys.stderr,
-            )
+        except BaseException as exc:
+            record_error("debug_logger", exc)
         if cleanup_errors:
-            print(
-                f"[DeployCleanup] completed with {len(cleanup_errors)} error(s).",
-                file=sys.stderr,
-            )
+            emit(f"[DeployCleanup] completed with {len(cleanup_errors)} error(s).")
+        if control_error is not None:
+            # Preserve interrupt/exit semantics after the independent owners
+            # have been attempted; ordinary failures keep the tuple API.
+            control_error.cleanup_errors = tuple(cleanup_errors)
+            raise control_error
         return tuple(cleanup_errors)
 
 

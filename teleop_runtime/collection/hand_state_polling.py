@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import threading
+
+from utils.owned_thread import OwnedThread
 import time
 from dataclasses import dataclass
 from typing import Any, Mapping
@@ -148,65 +150,70 @@ class HandStateHistoryPoller:
         }
         self._lock = threading.RLock()
         self._stop_event = threading.Event()
-        self._threads: list[threading.Thread] = []
+        self._threads: list[OwnedThread] = []
+        self._worker_lifecycle_lock = threading.RLock()
+        self._worker_closed = False
 
     @property
     def enabled(self) -> bool:
         return bool(self.backends_by_side)
 
     def start(self) -> None:
-        if not self.enabled or self._threads:
-            return
-        self._stop_event.clear()
-        try:
-            for side, backend in self.backends_by_side.items():
-                thread = threading.Thread(
-                    target=self._poll_loop,
-                    args=(side, backend),
-                    daemon=True,
-                    name=f"hand_state_history_{side}",
+        with self._worker_lifecycle_lock:
+            if self._worker_closed:
+                raise RuntimeError("worker owner is closed")
+            if not self.enabled or self._threads:
+                return
+            self._stop_event.clear()
+            try:
+                for side, backend in self.backends_by_side.items():
+                    thread = OwnedThread(
+                        target=self._poll_loop,
+                        args=(side, backend),
+                        daemon=True,
+                        name=f"hand_state_history_{side}",
+                    )
+                    self._threads.append(thread)
+                    thread.start()
+            except BaseException as start_error:  # noqa: BLE001
+                self._stop_event.set()
+                rollback_failures = collect_lifecycle_failures(
+                    (
+                        (
+                            f"worker[{thread.name}]",
+                            lambda thread=thread: self._join_thread_or_raise(thread),
+                        )
+                        for thread in reversed(tuple(self._threads))
+                    )
                 )
-                thread.start()
-                self._threads.append(thread)
-        except BaseException as start_error:  # noqa: BLE001
+                if rollback_failures:
+                    raise LifecycleStartupError(
+                        "hand_state_history_poller.start", start_error, rollback_failures
+                    ) from start_error
+                raise
+
+    def close(self) -> None:
+        with self._worker_lifecycle_lock:
+            self._worker_closed = True
             self._stop_event.set()
-            rollback_failures = collect_lifecycle_failures(
+            failures = collect_lifecycle_failures(
                 (
                     (
                         f"worker[{thread.name}]",
                         lambda thread=thread: self._join_thread_or_raise(thread),
                     )
-                    for thread in reversed(self._threads)
+                    for thread in reversed(tuple(self._threads))
                 )
             )
-            self._threads = [thread for thread in self._threads if thread.is_alive()]
-            if rollback_failures:
-                raise LifecycleStartupError(
-                    "hand_state_history_poller.start", start_error, rollback_failures
-                ) from start_error
-            raise
+            raise_lifecycle_failures("hand_state_history_poller.close", failures)
 
-    def close(self) -> None:
-        self._stop_event.set()
-        failures = collect_lifecycle_failures(
-            (
-                (
-                    f"worker[{thread.name}]",
-                    lambda thread=thread: self._join_thread_or_raise(thread),
-                )
-                for thread in reversed(self._threads)
-            )
-        )
-        self._threads = [thread for thread in self._threads if thread.is_alive()]
-        raise_lifecycle_failures("hand_state_history_poller.close", failures)
-
-    @staticmethod
-    def _join_thread_or_raise(thread: threading.Thread) -> None:
-        thread.join(timeout=1.0)
-        if thread.is_alive():
+    def _join_thread_or_raise(self, thread: OwnedThread) -> None:
+        if not thread.join_and_confirm(timeout=1.0):
             raise RuntimeError(
                 f"hand state history worker {thread.name!r} did not stop within 1.000s"
             )
+
+        self._threads.remove(thread)
 
     def _poll_loop(self, side: str, backend: Any) -> None:
         period = 1.0 / float(self.config.poll_hz)

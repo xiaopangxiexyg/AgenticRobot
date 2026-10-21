@@ -4377,7 +4377,9 @@ def test_failed_close_is_rethrown_to_concurrent_and_later_callers(
 
     with pytest.raises(RuntimeError) as later:
         executor.close()
-    assert later.value is close_error
+    assert later.value is not close_error
+    assert "unit close hold failure" in str(later.value)
+    assert errors["waiter"] is close_error
 
 
 @pytest.mark.parametrize("healthy", [True, False])

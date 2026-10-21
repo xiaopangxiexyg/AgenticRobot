@@ -47,14 +47,19 @@ class OwnedThread(threading.Thread):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._launch_attempted = False
+        self._launch_lock = threading.Lock()
+        self._launch_abandoned = False
         self._allocation_failed = False
         self._runner_entered = threading.Event()
         self._runner_completed = threading.Event()
 
     def start(self) -> None:
-        if self._launch_attempted:
-            raise RuntimeError("owned thread starts once")
-        self._launch_attempted = True
+        with self._launch_lock:
+            if self._launch_abandoned:
+                raise RuntimeError("owned thread launch was abandoned during close")
+            if self._launch_attempted:
+                raise RuntimeError("owned thread starts once")
+            self._launch_attempted = True
         try:
             super().start()
         except BaseException as error:
@@ -71,6 +76,12 @@ class OwnedThread(threading.Thread):
     def join_and_confirm(self, *, timeout: float) -> bool:
         """Confirm no launch or a completed target followed by normal join."""
 
+        with self._launch_lock:
+            if not self._launch_attempted:
+                # Atomically cancel acquisition. Every existing consumer is
+                # safe even if start() races after this no-launch receipt.
+                self._launch_abandoned = True
+                return True
         if self._allocation_failed:
             return True
         if self is threading.current_thread():

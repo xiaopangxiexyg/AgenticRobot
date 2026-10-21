@@ -6,10 +6,13 @@ import queue
 import threading
 import time
 from collections import OrderedDict, deque
+from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Mapping
 
 import numpy as np
+
+from utils.owned_thread import OwnedThread
 
 from dataset_contracts.canonical_encoding import canonical_content_hash
 from robot_motion.deploy.actions import (
@@ -594,6 +597,12 @@ def _slim_observation(observation: DeploymentObservation) -> DeploymentObservati
     )
 
 
+@dataclass
+class _CloseAttempt:
+    completed: threading.Event
+    error: BaseException | None = None
+
+
 class PositionDeployExecutor:
     """Generate causal arm references from already-safe policy keyframes.
 
@@ -699,7 +708,12 @@ class PositionDeployExecutor:
         self._execution_epoch_guard = execution_epoch_guard
         self._worker_drain_participant = worker_drain_participant
         self._collision_planner: RM65PositionPlannerProtocol | None = None
+        self._collision_planner_ready = False
         self._collision_planner_initialized = False
+        self._planner_lifecycle_lock = threading.Lock()
+        self._planner_prepare_error: BaseException | None = None
+        self._planner_acquisition_unconfirmed = False
+        self._planner_worker_acquisition_attempted = False
         self._clock = clock
         self._wall_clock = wall_clock
 
@@ -721,15 +735,21 @@ class PositionDeployExecutor:
         self._discrete_dispatch_lock = threading.Lock()
         self._wake = threading.Event()
         self._stop = threading.Event()
-        self._thread: threading.Thread | None = None
-        self._discrete_thread: threading.Thread | None = None
+        self._thread: OwnedThread | None = None
+        self._discrete_thread: OwnedThread | None = None
         self._reference_worker_affinity_ready = threading.Event()
 
         self._started = False
+        self._worker_start_error: BaseException | None = None
         self._closing = False
         self._closed = False
+        self._close_call_lock = threading.Lock()
         self._closed_event = threading.Event()
         self._close_error: BaseException | None = None
+        self._close_attempt = _CloseAttempt(self._closed_event)
+        self._dispatch_workers_stopped = False
+        self._shutdown_receipt: dict[str, Any] = {"dispatch_workers_stopped": False}
+        self._close_stream_invalidated = False
         self._active = False
         self._generation = 0
         self._next_source_index = 0
@@ -826,75 +846,96 @@ class PositionDeployExecutor:
         return self.dispatch_callback is None and self.discrete_dispatch_callback is None
 
     def prepare_collision_planner(self) -> None:
-        """Construct the coupled planner after real backends loaded active TCPs.
+        """Retain a pure-constructed planner before acquiring its workers.
 
-        Construction is intentionally separate from ``__init__`` because RM65
-        can auto-load its active tool profile during ``backend.start()``.  The
-        first accepted stream still resets the planner from that observation's
-        complete measured/authoritative dual-arm qpos.
+        Factories must not launch resources before returning their owner.
+        An uncertain factory failure remains sticky and blocks backend release.
         """
-
-        with self._lock:
-            if self._closing or self._closed:
-                raise RuntimeError("position deploy executor is closed")
-            if self._collision_planner is not None:
+        with self._planner_lifecycle_lock:
+            with self._lock:
+                if self._closing or self._closed:
+                    raise RuntimeError("position deploy executor is closed")
+                if self._planner_prepare_error is not None:
+                    raise self._planner_prepare_error
+                if self._collision_planner_ready:
+                    return
+                factory = self._collision_planner_factory
+            if factory is None:
+                if self.config.collision_required:
+                    raise RuntimeError("required collision planner factory is unavailable")
                 return
-            factory = self._collision_planner_factory
-        if factory is None:
-            if self.config.collision_required:
-                raise RuntimeError("required collision planner factory is unavailable")
-            return
-        planner = factory()
-        if planner is None:
-            raise RuntimeError("collision planner factory returned None")
-        for method_name in ("reset", "plan_pose_reference"):
-            if not callable(getattr(planner, method_name, None)):
-                raise TypeError(
-                    f"collision planner must provide callable {method_name}()"
-                )
-        with self._lock:
-            if self._closing or self._closed:
-                raise RuntimeError("position deploy executor closed while preparing collision planner")
-            if self._collision_planner is None:
-                self._collision_planner = planner
+            try:
+                self._planner_acquisition_unconfirmed = True
+                planner = factory()
+                # Publish even an invalid returned owner before fallible validation.
+                with self._lock:
+                    self._collision_planner = planner
+                    self._planner_acquisition_unconfirmed = False
+                if planner is None:
+                    raise RuntimeError("collision planner factory returned None")
+                for name in ("reset", "plan_pose_reference"):
+                    if not callable(getattr(planner, name, None)):
+                        raise TypeError(f"collision planner must provide callable {name}()")
+                with self._lock:
+                    if self._closing or self._closed:
+                        raise RuntimeError("position deploy executor closed while preparing collision planner")
+                start = getattr(planner, "start_background_workers", None)
+                if callable(start):
+                    if not callable(getattr(planner, "shutdown_background_workers", None)):
+                        raise TypeError("planner worker start requires shutdown_background_workers()")
+                    with self._lock:
+                        with self._close_call_lock:
+                            if self._closing or self._closed:
+                                raise RuntimeError("position deploy executor closed while preparing collision planner")
+                            # Acquisition committed before the permanent fence.
+                            self._planner_worker_acquisition_attempted = True
+                    start()
+                with self._lock:
+                    with self._close_call_lock:
+                        if self._closing or self._closed:
+                            raise RuntimeError("position deploy executor closed while preparing collision planner")
+                        self._collision_planner_ready = True
+            except BaseException as exc:
+                with self._lock:
+                    self._planner_prepare_error = exc
+                raise
 
     def start(self) -> None:
         with self._lock:
-            if self._closing or self._closed:
-                raise RuntimeError("position deploy executor is closed")
-            if self._started:
-                return
-            self._started = True
-            self._stop.clear()
-            self._thread = threading.Thread(
-                target=self._run,
-                name=f"position-deploy-{_rate_label(self.config.reference_hz)}hz",
-                daemon=True,
-            )
-            thread = self._thread
-            if self.discrete_dispatch_callback is not None:
-                self._discrete_thread = threading.Thread(
-                    target=self._run_discrete_dispatch,
-                    name="position-deploy-discrete-dispatch",
-                    daemon=True,
-                )
-            discrete_thread = self._discrete_thread
-            # Publish only started Thread objects; close() can therefore never
-            # race into join() on a not-yet-started worker.
-            thread.start()
-            if discrete_thread is not None:
-                discrete_thread.start()
+            with self._close_call_lock:
+                if self._closing or self._closed:
+                    raise RuntimeError("position deploy executor is closed")
+                if self._planner_prepare_error is not None:
+                    raise self._planner_prepare_error
+                if self._worker_start_error is not None:
+                    raise self._worker_start_error
+                if self._started:
+                    return
+                self._started = True
+                self._stop.clear()
+            try:
+                self._thread = OwnedThread(target=self._run,
+                    name=f"position-deploy-{_rate_label(self.config.reference_hz)}hz", daemon=True)
+                if self.discrete_dispatch_callback is not None:
+                    self._discrete_thread = OwnedThread(target=self._run_discrete_dispatch,
+                        name="position-deploy-discrete-dispatch", daemon=True)
+                # All handles precede the first launch, under the start/close gate.
+                self._thread.start()
+                if self._discrete_thread is not None:
+                    self._discrete_thread.start()
+            except BaseException as exc:
+                self._worker_start_error = exc
+                raise
         if self.config.reference_worker_cpu is not None:
-            if not self._reference_worker_affinity_ready.wait(timeout=1.0):
-                raise RuntimeError(
-                    "position reference worker did not publish its CPU-affinity "
-                    "receipt within 1.000s"
-                )
-            if self._reference_worker_affinity_error is not None:
-                raise RuntimeError(
-                    "position reference worker CPU-affinity setup failed: "
-                    f"{self._reference_worker_affinity_error}"
-                )
+            try:
+                if not self._reference_worker_affinity_ready.wait(timeout=1.0):
+                    raise RuntimeError("position reference worker did not publish its CPU-affinity receipt within 1.000s")
+                if self._reference_worker_affinity_error is not None:
+                    raise RuntimeError("position reference worker CPU-affinity setup failed: " + self._reference_worker_affinity_error)
+            except BaseException as exc:
+                with self._lock:
+                    self._worker_start_error = exc
+                raise
 
     def prepare_first_submission(self) -> dict[str, Any]:
         """Finish process-wide stream setup before capturing live robot state.
@@ -913,6 +954,10 @@ class PositionDeployExecutor:
         """
 
         with self._lock:
+            if self._planner_prepare_error is not None:
+                raise self._planner_prepare_error
+            if self._worker_start_error is not None:
+                raise self._worker_start_error
             if self._closing or self._closed:
                 raise RuntimeError("position deploy executor is closed")
             if self._submission_stream_initialized:
@@ -925,7 +970,7 @@ class PositionDeployExecutor:
                 }
             prepare_collision_planner = bool(
                 self.config.collision_required
-                and self._collision_planner is None
+                and not self._collision_planner_ready
             )
 
         # Planner construction may load the active coupled-IK/collision model.
@@ -943,7 +988,7 @@ class PositionDeployExecutor:
                     "prepared": False,
                     "reason": "stream_already_initialized",
                     "collision_planner_prepared": bool(
-                        self._collision_planner is not None
+                        self._collision_planner_ready
                     ),
                     "cyclic_gc_guard_acquired": bool(
                         self._cyclic_gc_guard_acquired
@@ -960,7 +1005,7 @@ class PositionDeployExecutor:
                 "prepared": True,
                 "reason": "first_submission_ready",
                 "collision_planner_prepared": bool(
-                    self._collision_planner is not None
+                    self._collision_planner_ready
                 ),
                 "cyclic_gc_guard_activated": activated,
                 "cyclic_gc_guard_acquired": bool(
@@ -996,10 +1041,14 @@ class PositionDeployExecutor:
         """
 
         with self._lock:
+            if self._planner_prepare_error is not None:
+                raise self._planner_prepare_error
+            if self._worker_start_error is not None:
+                raise self._worker_start_error
             prepare_collision_planner = bool(
                 not self._submission_stream_initialized
                 and self.config.collision_required
-                and self._collision_planner is None
+                and not self._collision_planner_ready
             )
         if prepare_collision_planner:
             # Live application callers prepare this before their hardware cut.
@@ -2468,7 +2517,10 @@ class PositionDeployExecutor:
                     self.config.allow_non_authoritative_collision_reset_in_dry_run
                     and self.dispatch_callback is None
                 ),
-                "collision_planner_prepared": self._collision_planner is not None,
+                "collision_planner_prepared": self._collision_planner_ready,
+                "dispatch_workers_stopped": self._dispatch_workers_stopped,
+                "planner_acquisition_unconfirmed": self._planner_acquisition_unconfirmed,
+                "planner_prepare_error": None if self._planner_prepare_error is None else f"{type(self._planner_prepare_error).__name__}: {self._planner_prepare_error}",
                 "collision_planner_initialized": bool(
                     self._collision_planner_initialized
                 ),
@@ -2621,143 +2673,155 @@ class PositionDeployExecutor:
             self._debug_events.clear()
             return events
 
+    def shutdown_snapshot(self) -> dict[str, Any]:
+        """Read the published stop receipt without locks or diagnostic callbacks.
+
+        Receipt dictionaries are replaced as a whole and never mutated after
+        publication. This port must stay independent of the full snapshot.
+        """
+        return dict(self._shutdown_receipt)
+
     def close(self) -> None:
+        """Close admission permanently; retries drain the same retained owners.
+
+        Concurrent callers share one immutable attempt result. A later call can
+        retry a failed drain without changing that result for existing waiters.
+        """
+        timeout = float(self.config.shutdown_timeout_sec)
         self._reject_worker_lifecycle_call("close")
-        wait_for_existing_close = False
-        already_closed = False
-        completed_close_error: BaseException | None = None
-        with self._lock:
+        with self._close_call_lock:
             if self._closing:
-                wait_for_existing_close = True
-            elif self._closed:
-                already_closed = True
-                completed_close_error = self._close_error
+                attempt = self._close_attempt
+                owner = False
+            elif self._closed and self._close_error is None:
+                return
             else:
-                # Reject every later submit before waiting for either dispatch
-                # barrier. A submit already completed before this assignment is
-                # part of the stream that close clears below.
+                if self._close_attempt.completed.is_set():
+                    self._closed_event = threading.Event()
+                    self._close_attempt = _CloseAttempt(self._closed_event)
+                attempt = self._close_attempt
                 self._closing = True
-        if already_closed:
-            if completed_close_error is not None:
-                raise completed_close_error
-            return
-        if wait_for_existing_close:
-            timeout = float(self.config.shutdown_timeout_sec)
-            if not self._closed_event.wait(timeout=timeout):
-                raise RuntimeError(
-                    "concurrent position deploy close did not finish within "
-                    f"{timeout:.3f}s"
-                )
-            with self._lock:
-                completed_close_error = self._close_error
-            if completed_close_error is not None:
-                raise completed_close_error
+                self._closed = True
+                self._dispatch_workers_stopped = False
+                self._shutdown_receipt = {"dispatch_workers_stopped": False}
+                owner = True
+        if not owner:
+            if not attempt.completed.wait(timeout=timeout):
+                raise RuntimeError("concurrent position deploy close did not finish within " + f"{timeout:.3f}s")
+            if attempt.error is not None:
+                raise attempt.error
             return
 
-        close_errors: list[BaseException] = []
-        should_hold = False
+        @contextmanager
+        def dispatch_barrier(lock, label):
+            if not lock.acquire(timeout=timeout):
+                raise RuntimeError(f"{label} did not drain within {timeout:.3f}s")
+            try:
+                yield
+            finally:
+                lock.release()
+
+        errors: list[BaseException] = []
+        workers_stopped = True
         try:
             try:
-                with self._dispatch_lock:
-                    with self._lock:
-                        should_hold = bool(
-                            self._active
-                            or not self._queue.empty()
-                            or not self._discrete_queue.empty()
-                            or self._hold_retry_required
-                        )
-                        invalidated_generation = self._generation
-                        self._generation += 1
-                        self._notify_reference_generation_invalidation_locked(
-                            legacy_worker_generation=invalidated_generation,
-                            reason="executor_close",
-                            terminal_status="canceled",
-                        )
-                        self._reset_stream_locked()
-                        self._append_debug_event_locked(
-                            "executor_closing",
-                            {
-                                "generation": int(self._generation),
-                                "hold_requested": bool(should_hold),
-                            },
-                        )
-                    with self._discrete_dispatch_lock:
+                with dispatch_barrier(self._dispatch_lock, "arm dispatch barrier"):
+                    with dispatch_barrier(self._lock, "executor state barrier"):
+                        should_hold = bool(self._active or not self._queue.empty()
+                            or not self._discrete_queue.empty() or self._hold_retry_required)
+                        if should_hold and self.hold_callback is not None:
+                            self._hold_retry_required = True
+                        if not self._close_stream_invalidated:
+                            invalidated = self._generation
+                            self._generation += 1
+                            self._notify_reference_generation_invalidation_locked(
+                                legacy_worker_generation=invalidated,
+                                reason="executor_close", terminal_status="canceled")
+                            self._reset_stream_locked()
+                            self._close_stream_invalidated = True
+                            self._append_debug_event_locked("executor_closing", {
+                                "generation": int(self._generation), "hold_requested": should_hold})
+                    with dispatch_barrier(self._discrete_dispatch_lock, "discrete dispatch barrier"):
                         if should_hold:
-                            try:
-                                self._invoke_hold()
-                            except BaseException as exc:  # still stop both workers.
-                                close_errors.append(exc)
+                            self._invoke_hold()
             except BaseException as exc:
-                close_errors.append(exc)
-        finally:
-            with self._lock:
-                self._closed = True
-                self._active = False
+                errors.append(exc)
+            finally:
                 self._stop.set()
-                thread = self._thread
-                discrete_thread = self._discrete_thread
-            self._wake.set()
-            timeout = float(self.config.shutdown_timeout_sec)
-            for worker in (thread, discrete_thread):
-                if worker is not None and worker is not threading.current_thread():
-                    try:
-                        worker.join(timeout=timeout)
-                        if worker.is_alive():
-                            close_errors.append(
-                                RuntimeError(
-                                    f"position deploy worker {worker.name!r} did not stop "
-                                    f"within {timeout:.3f}s"
-                                )
-                            )
-                    except BaseException as exc:
-                        close_errors.append(exc)
-            planner = self._collision_planner
-            shutdown_planner_workers = (
-                None
-                if planner is None
-                else getattr(planner, "shutdown_background_workers", None)
-            )
-            if callable(shutdown_planner_workers):
+                self._wake.set()
+                with dispatch_barrier(self._lock, "executor state barrier"):
+                    if self.hold_callback is not None and (self._active
+                            or not self._queue.empty() or not self._discrete_queue.empty()):
+                        self._hold_retry_required = True
+                    self._active = False
+                    self._stop.set()
+                    workers = (self._thread, self._discrete_thread)
+                self._wake.set()
+            for worker in workers:
+                if worker is None:
+                    continue
                 try:
-                    shutdown_planner_workers(timeout_sec=timeout)
+                    if not worker.join_and_confirm(timeout=timeout):
+                        raise RuntimeError(f"position deploy worker {worker.name!r} did not stop within {timeout:.3f}s")
                 except BaseException as exc:
-                    close_errors.append(exc)
-            if close_errors:
-                with self._lock:
-                    if self._cyclic_gc_guard_acquired:
-                        self._defer_cyclic_gc_guard_release_locked(
-                            reason="executor_close_failed",
-                            error_count=len(close_errors),
-                        )
+                    workers_stopped = False
+                    errors.append(exc)
+            acquired = workers_stopped and self._planner_lifecycle_lock.acquire(timeout=timeout)
+            if not acquired:
+                workers_stopped = False
+                errors.append(RuntimeError("collision planner acquisition is still in progress"))
             else:
                 try:
-                    with self._lock:
-                        self._release_cyclic_gc_guard_locked()
+                    if self._planner_acquisition_unconfirmed:
+                        raise RuntimeError("collision planner factory acquisition is unconfirmed")
+                    planner = self._collision_planner
+                    shutdown = getattr(planner, "shutdown_background_workers", None)
+                    if self._planner_worker_acquisition_attempted and not callable(shutdown):
+                        raise RuntimeError("planner worker drain port is unavailable")
+                    if callable(shutdown):
+                        shutdown(timeout_sec=timeout)
                 except BaseException as exc:
-                    close_errors.append(exc)
-                    with self._lock:
+                    workers_stopped = False
+                    errors.append(exc)
+                finally:
+                    self._planner_lifecycle_lock.release()
+            with dispatch_barrier(self._lock, "executor state barrier"):
+                self._dispatch_workers_stopped = bool(workers_stopped
+                    and self._close_stream_invalidated and not self._hold_retry_required)
+                if errors:
+                    if self._cyclic_gc_guard_acquired:
+                        self._defer_cyclic_gc_guard_release_locked(
+                            reason="executor_close_failed", error_count=len(errors))
+                else:
+                    try:
+                        self._release_cyclic_gc_guard_locked()
+                    except BaseException as exc:
+                        errors.append(exc)
                         if self._cyclic_gc_guard_acquired:
                             self._defer_cyclic_gc_guard_release_locked(
-                                reason="gc_restore_failed",
-                                error_count=len(close_errors),
-                            )
-            if close_errors:
-                details = "; ".join(
-                    f"{type(error).__name__}: {error}" for error in close_errors
-                )
-                completed_close_error = RuntimeError(
-                    f"position deploy executor close failed: {details}"
-                )
-                completed_close_error.__cause__ = close_errors[0]
-                completed_close_error.__suppress_context__ = True
-            with self._lock:
-                # Publish the completed close result before waking concurrent
-                # waiters. Reusing the exception object keeps every caller's
-                # view of a failed close identical, including its root cause.
-                self._close_error = completed_close_error
-            self._closed_event.set()
-        if completed_close_error is not None:
-            raise completed_close_error
+                                reason="gc_restore_failed", error_count=len(errors))
+        except BaseException as exc:
+            # Keep the owner retryable even if diagnostics/finalization fail.
+            errors.append(exc)
+            self._dispatch_workers_stopped = False
+        finally:
+            if errors:
+                attempt.error = RuntimeError("position deploy executor close failed: "
+                    + "; ".join(f"{type(e).__name__}: {e}" for e in errors))
+                attempt.error.__cause__ = errors[0]
+                attempt.error.__suppress_context__ = True
+            with self._close_call_lock:
+                self._close_error = attempt.error
+                self._shutdown_receipt = {
+                    "dispatch_workers_stopped": self._dispatch_workers_stopped,
+                    "closed": self._closed,
+                    "hold_retry_required": self._hold_retry_required,
+                    "close_error": None if attempt.error is None else str(attempt.error),
+                }
+                self._closing = False
+                attempt.completed.set()
+        if attempt.error is not None:
+            raise attempt.error
 
     def __enter__(self) -> PositionDeployExecutor:
         self.start()
@@ -5675,8 +5739,7 @@ class PositionDeployExecutor:
 
     def _reject_worker_lifecycle_call(self, operation: str) -> None:
         current = threading.current_thread()
-        with self._lock:
-            in_hold_callback = self._hold_callback_thread_id == threading.get_ident()
+        in_hold_callback = self._hold_callback_thread_id == threading.get_ident()
         if (
             current is self._thread
             or current is self._discrete_thread
@@ -5770,7 +5833,7 @@ class PositionDeployExecutor:
             self._hold_callback_thread_id = callback_thread_id
         try:
             self.hold_callback()
-        except Exception as exc:
+        except BaseException as exc:
             with self._lock:
                 self._hold_failure_count += 1
                 self._last_hold_error = f"{type(exc).__name__}: {exc}"
