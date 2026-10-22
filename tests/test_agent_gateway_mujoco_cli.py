@@ -21,6 +21,39 @@ from agent_gateway.profiles.mujoco.gateway_cli import (
 pytestmark = [pytest.mark.unit, pytest.mark.contract]
 
 
+def test_motion_side_is_explicit_fixed_and_defaults_to_right():
+    parser = build_parser()
+    required = ["--socket-path", "/unused/socket", "--task-config", "/unused/task.json"]
+    assert parser.parse_args(required).motion_side == "right"
+    assert parser.parse_args([*required, "--motion-side", "left"]).motion_side == "left"
+    with pytest.raises(SystemExit) as captured:
+        parser.parse_args([*required, "--motion-side", "both"])
+    assert captured.value.code == 2
+
+
+@pytest.mark.parametrize("unsupported", [
+    ["--enable-grippers"],
+    ["--enable-grasp-approach"],
+    ["--enable-spatial-goals"],
+    ["--history-root", "/unused/history"],
+    ["--segmentation-asset-bundle", "/unused/segmentation"],
+    ["--grasp-contact-target-body", "cube"],
+])
+def test_left_unsupported_combinations_fail_before_resources(monkeypatch, capsys, unsupported):
+    def forbidden(*args, **kwargs):
+        pytest.fail("Unsupported left combination must fail before path or resource work")
+
+    monkeypatch.setattr(gateway_cli, "_absolute_existing_file", forbidden)
+    monkeypatch.setattr(gateway_cli, "build_mujoco_agent_tcp_pose_gateway_session", forbidden)
+    with pytest.raises(SystemExit) as captured:
+        gateway_cli.main([
+            "--socket-path", "/unused/socket", "--task-config", "/unused/task.json",
+            "--motion-side", "left", *unsupported,
+        ])
+    assert captured.value.code == 2
+    assert "baseline TCP/state Routes only" in capsys.readouterr().err
+
+
 def test_bilateral_grippers_refuse_realtime_physics_before_session_construction(monkeypatch, tmp_path, capsys):
     from pathlib import Path
 

@@ -211,7 +211,12 @@ class MujocoPlannedTcpMotion:
         pose_projector: Any,
         reference_hz: float,
         planning_clearance_padding_m: float = 0.002,
+        motion_side: str = "right",
     ):
+        if type(motion_side) is not str or motion_side not in ("left", "right"):
+            raise ValueError("motion_side must be exactly 'left' or 'right'.")
+        self._motion_side = motion_side
+        self._inactive_side = "left" if motion_side == "right" else "right"
         self.rig = rig
         self.scene = rig.scene
         self.task_config = task_config
@@ -234,6 +239,14 @@ class MujocoPlannedTcpMotion:
         self._live_oracle: MujocoJointSceneOracle | None = None
         self._contact_guard_bound = False
 
+    @property
+    def motion_side(self) -> str:
+        return self._motion_side
+
+    @property
+    def component_id(self) -> str:
+        return self.motion_side + "_arm"
+
     def _model_qpos(self) -> np.ndarray:
         return self.rig.capture_scene(lambda scene: scene.data.qpos.copy())
 
@@ -244,8 +257,8 @@ class MujocoPlannedTcpMotion:
         return self.pose_projector.project(
             model_qpos=model_qpos,
             qpos_by_source=pair,
-            component_ids=("right_arm",),
-        )["right_arm"]
+            component_ids=(self.component_id,),
+        )[self.component_id]
 
     def plan(
         self,
@@ -260,6 +273,10 @@ class MujocoPlannedTcpMotion:
         contact_binding: MujocoGraspContactBinding | None = None,
         preview_model_qpos: np.ndarray | None = None,
     ) -> MujocoTcpMotionPlan:
+        side = self.motion_side
+        if side == "left" and contact_binding is not None:
+            # Existing contact bindings resolve right-hand sensors only.
+            raise MujocoTcpPlanRejected("safe_tcp_left_grasp_contact_unsupported")
         if (
             isinstance(path_search_time_budget_sec, bool)
             or not math.isfinite(path_search_time_budget_sec)
@@ -326,18 +343,18 @@ class MujocoPlannedTcpMotion:
             solver = self._solver
             offset = endpoint_to_tool_transform(
                 load_rm65_tool_profile(
-                    self.task_config.right_tool_profile_path, side="right"
+                    getattr(self.task_config, side + "_tool_profile_path"), side=side
                 )
             )
             measured = xyzquat_to_matrix(self.pose_for_configuration(model_qpos, start))
             if not np.allclose(
-                solver.compute_pose(start["right"]) @ offset, measured, atol=1e-5
+                solver.compute_pose(start[side]) @ offset, measured, atol=1e-5
             ):
                 raise MujocoTcpPlanRejected("safe_tcp_ik_model_tool_mismatch")
             goal = xyzquat_to_matrix(target_pose)
             endpoint_goal = goal @ np.linalg.inv(offset)
             rng = np.random.default_rng(0)
-            seeds = [start["right"], np.clip(np.zeros(6), solver.q_min, solver.q_max)]
+            seeds = [start[side], np.clip(np.zeros(6), solver.q_min, solver.q_max)]
             seeds.extend(rng.uniform(solver.q_min, solver.q_max) for _ in range(6))
             targets = []
             endpoint_attempts = []
@@ -357,7 +374,7 @@ class MujocoPlannedTcpMotion:
                     tolerance=1e-5,
                     deadline_monotonic=deadline,
                 )
-                pair = {"left": start["left"], "right": np.asarray(q)}
+                pair = {**start, side: np.asarray(q)}
                 actual = xyzquat_to_matrix(
                     self.pose_for_configuration(model_qpos, pair)
                 )
@@ -373,19 +390,19 @@ class MujocoPlannedTcpMotion:
                     position_error <= translation_tolerance_m
                     and angle <= rotation_tolerance_rad
                 ):
-                    delta = np.abs(pair["right"] - start["right"])
+                    delta = np.abs(pair[side] - start[side])
                     compact = float(np.max(delta[:3])) <= quality_limits.maximum_proximal_joint_travel_rad
                     safe = oracle.check(pair).safe
                     endpoint_attempts.append({
                         "seed_index": seed_index,
-                        "joint_net_delta_deg": np.rad2deg(pair["right"] - start["right"]).tolist(),
+                        "joint_net_delta_deg": np.rad2deg(pair[side] - start[side]).tolist(),
                         "position_error_m": position_error,
                         "rotation_error_rad": angle,
                         "collision_and_constraint_safe": safe,
                         "proximal_travel_within_limit": compact,
                     })
                     if safe and compact and not any(
-                        np.max(np.abs(other["right"] - pair["right"])) < 0.001 for other in targets
+                        np.max(np.abs(other[side] - pair[side])) < 0.001 for other in targets
                     ):
                         targets.append(pair)
                     # Zero travel is the only provable minimum; a converged
@@ -408,11 +425,11 @@ class MujocoPlannedTcpMotion:
                 np.deg2rad(self.rig.config.max_command_step_deg) * self.rig.config.timing.command_hz,
             )
             targets.sort(key=lambda pair: (
-                float(np.max(np.abs(pair["right"] - start["right"]) / velocity)),
-                float(np.max(np.abs(pair["right"][:3] - start["right"][:3]))),
-                float(np.linalg.norm(pair["right"] - start["right"])),
+                float(np.max(np.abs(pair[side] - start[side]) / velocity)),
+                float(np.max(np.abs(pair[side][:3] - start[side][:3]))),
+                float(np.linalg.norm(pair[side] - start[side])),
             ))
-            world_from_base = self.scene.body_pose("right_arm_base_link")
+            world_from_base = self.scene.body_pose(side + "_arm_base_link")
 
             def world_pose(pair):
                 return world_from_base @ xyzquat_to_matrix(self.pose_for_configuration(model_qpos, pair))
@@ -427,34 +444,34 @@ class MujocoPlannedTcpMotion:
                     start_qpos_by_component=start,
                     target_qpos_by_component=targets[0],
                     alternative_target_qpos_by_component=targets[1:],
-                    movable_components=("right",), oracle=oracle,
+                    movable_components=(side,), oracle=oracle,
                     config=JointPathPlannerConfig(
                         time_budget_sec=remaining, edge_resolution_rad=0.01,
                         adaptive_edge_resolution_rad=0.002, adaptive_refinement_distance_m=0.01,
                     ),
-                    joint_lower_by_component={"right": solver.q_min},
-                    joint_upper_by_component={"right": solver.q_max}, scene_hash=oracle.scene_hash,
-                    edge_cost=lambda a, b: tcp_path_edge_cost(a, b, side="right",
+                    joint_lower_by_component={side: solver.q_min},
+                    joint_upper_by_component={side: solver.q_max}, scene_hash=oracle.scene_hash,
+                    edge_cost=lambda a, b: tcp_path_edge_cost(a, b, side=side,
                         pose_for_pair=world_pose, step_rad=0.1),
                 )
                 if not path.path_found:
                     break
-                samples = [path.waypoints[0]["right"]]
+                samples = [path.waypoints[0][side]]
                 for a, b in zip(path.waypoints, path.waypoints[1:]):
-                    count = max(1, math.ceil(float(np.max(np.abs(b["right"] - a["right"]))) / 0.01))
-                    samples.extend(a["right"] + alpha * (b["right"] - a["right"])
+                    count = max(1, math.ceil(float(np.max(np.abs(b[side] - a[side]))) / 0.01))
+                    samples.extend(a[side] + alpha * (b[side] - a[side])
                         for alpha in np.linspace(0, 1, count + 1)[1:])
                 xyz = []
                 for sample in samples:
                     if cancel_requested():
                         raise MujocoTcpPlanRejected("safe_tcp_planning_cancelled")
-                    xyz.append(world_pose({"left": start["left"], "right": sample})[:3, 3])
+                    xyz.append(world_pose({**start, side: sample})[:3, 3])
                 quality = sampled_path_motion_quality(np.asarray(samples), np.asarray(xyz))
                 if not quality_limits.exceeded(quality):
                     break
                 rejected_paths.append({"motion_quality": quality, "path_hash": path.semantic_content_hash})
                 targets = [item for item in targets if not np.array_equal(
-                    item["right"], path.target_qpos_by_component["right"])]
+                    item[side], path.target_qpos_by_component[side])]
             else:
                 raise MujocoTcpPlanRejected("safe_tcp_motion_quality_exceeded",
                     {"rejected_paths": rejected_paths, "motion_quality_limits": quality_limits.to_dict()})
@@ -464,7 +481,7 @@ class MujocoPlannedTcpMotion:
                 raise MujocoTcpPlanRejected(
                     f"safe_tcp_{path.status.value}", path.to_dict()
                 )
-            q = np.asarray([point["right"] for point in path.waypoints])
+            q = np.asarray([point[side] for point in path.waypoints])
             if q.shape[0] == 1:
                 q = np.repeat(q, 2, axis=0)
             velocity = np.minimum(
@@ -507,7 +524,7 @@ class MujocoPlannedTcpMotion:
             for index, current in enumerate(trajectory.q_rad):
                 if cancel_requested():
                     raise MujocoTcpPlanRejected("safe_tcp_planning_cancelled")
-                pair = {"left": start["left"], "right": current}
+                pair = {**start, side: current}
                 # Smoothing may leave the polyline. Recheck each reference and
                 # every intervening joint-space edge, not only the waypoints.
                 previous = trajectory.q_rad[max(0, index - 1)]
@@ -516,7 +533,7 @@ class MujocoPlannedTcpMotion:
                 )
                 for alpha in np.linspace(0, 1, count + 1):
                     check = oracle.check(
-                        {**pair, "right": previous + alpha * (current - previous)}
+                        {**pair, side: previous + alpha * (current - previous)}
                     )
                     if not check.safe:
                         raise MujocoTcpPlanRejected(
@@ -610,7 +627,9 @@ class MujocoPlannedTcpMotion:
             self._live_oracle = None
 
     def check_measured_contact(self, binding, target_pose) -> JointConfigurationCheck:
-        """Check realized geometry, including after HOLD cleared the active plan."""
+        """Check right-hand geometry, including after HOLD cleared the plan."""
+        if self.motion_side == "left":
+            raise MujocoTcpPlanRejected("safe_tcp_left_grasp_contact_unsupported")
         with self._lock:
             model_qpos = self._model_qpos()
             oracle = MujocoJointSceneOracle(self.scene, model_qpos, contact_binding=binding)
@@ -659,7 +678,7 @@ class MujocoPlannedTcpMotion:
                     rtol=0,
                 )
             ):
-                measured = self.rig.measured_qpos_by_side()["right"]
+                measured = self.rig.measured_qpos_by_side()[self.motion_side]
                 if np.max(
                     np.abs(measured - self._active.trajectory.q_rad[index])
                 ) > np.deg2rad(self.rig.config.max_command_step_deg):
@@ -678,7 +697,7 @@ class MujocoPlannedTcpMotion:
             index = self._reference_index
             if plan is None or index < 0:
                 raise MujocoTcpPlanRejected("safe_tcp_reference_not_selected")
-            requested = np.asarray(action.arm_pose_by_side["right"])
+            requested = np.asarray(action.arm_pose_by_side[self.motion_side])
             expected = np.asarray(plan.reference_poses[index], dtype=np.float32)
             if not np.allclose(
                 xyzquat_to_matrix(requested),
@@ -687,10 +706,8 @@ class MujocoPlannedTcpMotion:
                 rtol=0,
             ):
                 raise MujocoTcpPlanRejected("safe_tcp_reference_changed_after_safety")
-            q = {
-                "left": plan.path.start_qpos_by_component["left"],
-                "right": plan.trajectory.q_rad[index],
-            }
+            q = {**plan.path.start_qpos_by_component,
+                 self.motion_side: plan.trajectory.q_rad[index]}
             # Recheck the prescribed reference against today's scene; no
             # projection or replacement IK branch may silently change it.
             oracle = self._live_oracle
@@ -698,8 +715,8 @@ class MujocoPlannedTcpMotion:
                 raise MujocoTcpPlanRejected("safe_tcp_live_scene_unavailable")
             oracle.source.qpos[:] = self._model_qpos()
             if not np.allclose(
-                oracle.source.qpos[oracle.addresses["left"]],
-                q["left"],
+                oracle.source.qpos[oracle.addresses[self._inactive_side]],
+                q[self._inactive_side],
                 atol=1e-3,
                 rtol=0,
             ):
@@ -761,8 +778,8 @@ class MujocoPlannedTcpMotion:
                 success=True,
                 iterations=0,
                 qpos_by_side={side: values.tolist() for side, values in q.items()},
-                position_error_m={"right": 0.0},
-                orientation_error_rad={"right": 0.0},
+                position_error_m={self.motion_side: 0.0},
+                orientation_error_rad={self.motion_side: 0.0},
                 status="planned_joint_reference",
                 solver="mujoco.registered_collision_checked_joint_path",
                 metadata={

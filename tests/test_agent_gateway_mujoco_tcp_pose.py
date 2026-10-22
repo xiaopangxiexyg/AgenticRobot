@@ -2627,10 +2627,12 @@ def test_installed_rpent_toolkit_consumes_exact_motion_and_state_routes(
         route_manifest=bundle.route_manifest.to_wire(),
         observation_snapshot=snapshot.to_wire(),
     )
+    from itertools import count
+    request_sequence = count(1)
     consumer_session = DexTeleopConsumerSession(
         client=client,
         client_id="rpent:fixture",
-        request_id_factory=lambda: "request:rpent-agent-motion-fixture",
+        request_id_factory=lambda: f"request:rpent-agent-motion-fixture:{next(request_sequence)}",
     )
     toolkit = DexTeleopToolkit(session=consumer_session)
     motion_spec = next(

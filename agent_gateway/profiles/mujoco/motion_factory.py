@@ -30,6 +30,7 @@ from collection_runtime.source_observation_history import (
 )
 from dataset_contracts.canonical_encoding import canonical_content_hash
 from robot_motion.action import ExecutionObservationPlan
+from robot_motion.rm65 import load_rm65_tool_profile
 from robot_motion.target_safety import (
     TCPPoseEnvelopeCatalogEntry,
     TCPPoseEnvelopeProfile,
@@ -51,6 +52,7 @@ from sim.mujoco.deploy.grasp_contact import (
     bind_task_grasp_contact,
 )
 from sim.mujoco.deploy.target_config import DEFAULT_STATION_POSE_CONTRACT_PATH
+from sim.mujoco.tasks.cube_lift.config import CubeLiftTaskConfig
 
 from .gripper_skill import MujocoGripperControlPort
 from .motion_application import MujocoAgentSkillMotionApplication
@@ -174,43 +176,76 @@ class MujocoAgentTcpPoseHistoryStorageConfig:
 
 
 def mujoco_agent_tcp_pose_execution_observation_plan_v1(
+    *,
+    motion_side: str = "right",
 ) -> ExecutionObservationPlan:
+    side = _validated_motion_side(motion_side)
+    component = f"{side}_arm"
     return ExecutionObservationPlan(
-        plan_id=MUJOCO_AGENT_TCP_POSE_OBSERVATION_PLAN_ID_V1,
+        plan_id=(
+            MUJOCO_AGENT_TCP_POSE_OBSERVATION_PLAN_ID_V1
+            if side == "right"
+            else "control-station-agent-tcp-pose-left-arm-observation-v1"
+        ),
         reference_mode="full_frames",
         measurement_mode="full_frames",
-        component_ids=("right_arm",),
+        component_ids=(component,),
         required_representation_by_component={
-            "right_arm": "cartesian_pose",
+            component: "cartesian_pose",
         },
     )
 
 
 def validate_mujoco_agent_tcp_pose_target_config(
     config: MujocoSimHILTargetConfig,
+    *,
+    motion_side: str = "right",
 ) -> None:
     """Fail before scene construction when another Sim-HIL profile is used."""
 
     if not isinstance(config, MujocoSimHILTargetConfig):
         raise TypeError("config must be a MujocoSimHILTargetConfig.")
+    side = _validated_motion_side(motion_side)
     plan = config.execution_observation_plan
-    expected = mujoco_agent_tcp_pose_execution_observation_plan_v1()
+    expected = mujoco_agent_tcp_pose_execution_observation_plan_v1(motion_side=side)
     if config.allow_scripted_task_reset:
         raise ValueError(
             "Agent TCP pose config requires allow_scripted_task_reset=False."
         )
-    if config.exposed_pose_sides != ("right",):
+    if config.exposed_pose_sides != (side,):
         raise ValueError(
-            "Agent TCP pose config must expose exactly the right pose side."
+            f"Agent TCP pose config must expose exactly the {side} pose side."
         )
     if (
         not isinstance(plan, ExecutionObservationPlan)
         or plan.semantic_content_hash != expected.semantic_content_hash
     ):
         raise ValueError(
-            "Agent TCP pose config requires the exact right-arm Cartesian "
+            f"Agent TCP pose config requires the exact {side}-arm Cartesian "
             "execution observation plan."
         )
+
+
+def _validated_motion_side(value: str) -> str:
+    if type(value) is not str or value not in {"left", "right"}:
+        raise ValueError("motion_side must be exactly left or right.")
+    return value
+
+
+def _validate_left_tool_sources(config: MujocoSimHILTargetConfig) -> None:
+    """Check actual side metadata before constructing the new left graph.
+
+    Both tool sources matter: the other arm remains a measured support target.
+    Existing right-only loading semantics are deliberately not changed here.
+    """
+    task = CubeLiftTaskConfig.load(config.task_config_path)
+    for side in ("left", "right"):
+        path = getattr(task, f"{side}_tool_profile_path")
+        profile = load_rm65_tool_profile(path, side=side)
+        if profile.get("arm") != side:
+            raise ValueError(
+                f"Left motion graph requires an explicit {side} tool profile: {path}."
+            )
 
 
 def _calibration_hash(target: Any) -> str:
@@ -244,6 +279,7 @@ def _build_standard_tcp_pose_envelope_runtime(
     enable_safe_tcp_pose: bool = False,
     enable_grasp_approach: bool = False,
     grasp_contact_binding: MujocoGraspContactBinding | None = None,
+    motion_side: str = "right",
 ) -> TCPPoseEnvelopeSafetyRuntime:
     """Bind separate lower envelopes for bounded pose and fixed heading Routes.
 
@@ -252,17 +288,21 @@ def _build_standard_tcp_pose_envelope_runtime(
     envelope used by the generic pose and cardinal-step Routes.
     """
 
+    side = _validated_motion_side(motion_side)
+    component = f"{side}_arm"
+    if side == "left" and enable_grasp_approach:
+        raise ValueError("Left motion mode does not expose grasp approach envelopes.")
     target_profile = prepared.target_frame_profile
     tool_profile = prepared.tool_frame_profile
-    reference_frame = target_profile.reference_frame_by_component["right_arm"]
+    reference_frame = target_profile.reference_frame_by_component[component]
     tool_binding_hash = tool_profile.binding_by_component[
-        "right_arm"
+        component
     ].semantic_content_hash
     target_binding_hash = canonical_content_hash(
         {
             "target_frame_profile_hash": target_profile.semantic_content_hash,
-            "component_id": "right_arm",
-            "side": "right",
+            "component_id": component,
+            "side": side,
             "reference_frame_id": reference_frame,
             "controlled_frame_id": "tool_tcp",
         },
@@ -271,20 +311,22 @@ def _build_standard_tcp_pose_envelope_runtime(
     bounds = MUJOCO_AGENT_TCP_POSE_WORKSPACE_BOUNDS_V1
     delta = MUJOCO_AGENT_TCP_POSE_MAX_TRANSLATION_DELTA_M_V1
     profile = TCPPoseEnvelopeProfile(
-        profile_id="mujoco-agent-tcp-pose-standard-envelope-v1",
+        profile_id=(
+            "mujoco-agent-tcp-pose-standard-envelope-v1"
+            if side == "right"
+            else "mujoco-agent-left-tcp-pose-standard-envelope-v1"
+        ),
         target_frame_binding_hash=target_binding_hash,
-        tool_frame_binding_hash_by_side={"right": tool_binding_hash},
-        reference_frame_by_side={"right": reference_frame},
+        tool_frame_binding_hash_by_side={side: tool_binding_hash},
+        reference_frame_by_side={side: reference_frame},
         side_config_by_side={
-            "right": TCPPoseEnvelopeSideConfig(
+            side: TCPPoseEnvelopeSideConfig(
                 absolute_min_xyz_m=(bounds[0], bounds[2], bounds[4]),
                 absolute_max_xyz_m=(bounds[1], bounds[3], bounds[5]),
                 relative_min_xyz_m=(-delta, -delta, -delta),
                 relative_max_xyz_m=(delta, delta, delta),
                 relative_axes="canonical_axes",
-                max_rotation_rad=(
-                    MUJOCO_AGENT_TCP_POSE_MAX_ROTATION_DELTA_RAD_V1
-                ),
+                max_rotation_rad=(MUJOCO_AGENT_TCP_POSE_MAX_ROTATION_DELTA_RAD_V1),
             )
         },
     )
@@ -311,12 +353,16 @@ def _build_standard_tcp_pose_envelope_runtime(
         ),
     )
     orientation_profile = TCPPoseEnvelopeProfile(
-        profile_id="mujoco-agent-tcp-fixed-orientation-envelope-v1",
+        profile_id=(
+            "mujoco-agent-tcp-fixed-orientation-envelope-v1"
+            if side == "right"
+            else "mujoco-agent-left-tcp-fixed-orientation-envelope-v1"
+        ),
         target_frame_binding_hash=target_binding_hash,
-        tool_frame_binding_hash_by_side={"right": tool_binding_hash},
-        reference_frame_by_side={"right": reference_frame},
+        tool_frame_binding_hash_by_side={side: tool_binding_hash},
+        reference_frame_by_side={side: reference_frame},
         side_config_by_side={
-            "right": TCPPoseEnvelopeSideConfig(
+            side: TCPPoseEnvelopeSideConfig(
                 absolute_min_xyz_m=(bounds[0], bounds[2], bounds[4]),
                 absolute_max_xyz_m=(bounds[1], bounds[3], bounds[5]),
                 relative_min_xyz_m=(0.0, 0.0, 0.0),
@@ -391,8 +437,8 @@ def _build_standard_tcp_pose_envelope_runtime(
     return TCPPoseEnvelopeSafetyRuntime(
         catalog_entries=tuple(entries),
         target_frame_binding_hash=target_binding_hash,
-        tool_frame_binding_hash_by_side={"right": tool_binding_hash},
-        reference_frame_by_side={"right": reference_frame},
+        tool_frame_binding_hash_by_side={side: tool_binding_hash},
+        reference_frame_by_side={side: reference_frame},
         clock_domain_id=target_config.clock_domain_id,
     )
 
@@ -448,6 +494,7 @@ def build_mujoco_agent_tcp_pose_gateway_session(
     *,
     target_config: MujocoSimHILTargetConfig,
     allowed_client_ids: tuple[str, ...],
+    motion_side: str = "right",
     max_retained_operations: int = 16,
     max_session_admissions_per_route: int | None = None,
     trace_sink: Callable[[Any], None] | None = None,
@@ -466,10 +513,15 @@ def build_mujoco_agent_tcp_pose_gateway_session(
 
     if not isinstance(target_config, MujocoSimHILTargetConfig):
         raise TypeError("target_config must be MujocoSimHILTargetConfig.")
+    side = _validated_motion_side(motion_side)
+    component = f"{side}_arm"
+    inactive = "left" if side == "right" else "right"
     if not isinstance(enable_grippers, bool):
         raise TypeError("enable_grippers must be boolean.")
     if enable_grippers and target_config.realtime_worker:
-        raise ValueError("Composed gripper Skills require deterministic physics ownership.")
+        raise ValueError(
+            "Composed gripper Skills require deterministic physics ownership."
+        )
     if not isinstance(enable_safe_tcp_pose, bool):
         raise TypeError("enable_safe_tcp_pose must be boolean.")
     if not isinstance(enable_spatial_goals, bool):
@@ -478,6 +530,18 @@ def build_mujoco_agent_tcp_pose_gateway_session(
         raise TypeError("enable_tcp_pose_comparison must be boolean.")
     if not isinstance(enable_grasp_approach, bool):
         raise TypeError("enable_grasp_approach must be boolean.")
+    if side == "left" and (
+        enable_grippers
+        or enable_grasp_approach
+        or grasp_contact_target_body is not None
+        or enable_spatial_goals
+        or history_storage is not None
+        or segmentation_localizer is not None
+    ):
+        raise ValueError(
+            "Left motion mode currently supports baseline TCP/state Routes only; "
+            "gripper, grasp, spatial goal, history and segmentation combinations are not enabled."
+        )
     if enable_grasp_approach and (not enable_grippers or target_config.realtime_worker):
         raise ValueError(
             "Grasp approach requires composed grippers and deterministic physics ownership."
@@ -514,7 +578,9 @@ def build_mujoco_agent_tcp_pose_gateway_session(
             target_config,
             station_pose_contract_path=DEFAULT_STATION_POSE_CONTRACT_PATH,
         )
-    validate_mujoco_agent_tcp_pose_target_config(target_config)
+    validate_mujoco_agent_tcp_pose_target_config(target_config, motion_side=side)
+    if side == "left":
+        _validate_left_tool_sources(target_config)
     prepared = prepare_mujoco_sim_hil_target(target_config)
     grasp_contact_binding = (
         None if grasp_contact_target_body is None else bind_task_grasp_contact(
@@ -522,11 +588,15 @@ def build_mujoco_agent_tcp_pose_gateway_session(
     )
     component_profile = build_mujoco_pose_component_target_profile(
         prepared.scene,
-        profile_id=MUJOCO_AGENT_TCP_POSE_COMPONENT_PROFILE_ID_V1,
-        arm_side_by_component={"right_arm": "right"},
-        arm_reference_frame_by_component={"right_arm": "right_arm_base"},
-        arm_controlled_frame_by_component={"right_arm": "tool_tcp"},
-        selection_group_by_component={"right_arm": "arms"},
+        profile_id=(
+            MUJOCO_AGENT_TCP_POSE_COMPONENT_PROFILE_ID_V1
+            if side == "right"
+            else "mujoco.rm65.left_agent_tcp_pose.v1"
+        ),
+        arm_side_by_component={component: side},
+        arm_reference_frame_by_component={component: f"{side}_arm_base"},
+        arm_controlled_frame_by_component={component: "tool_tcp"},
+        selection_group_by_component={component: "arms"},
     )
     runtime_rig_holder: dict[str, Any] = {}
 
@@ -538,10 +608,10 @@ def build_mujoco_agent_tcp_pose_gateway_session(
             )
         return rig.capture_scene(
             lambda scene: {
-                "left": capture_mujoco_sim_hil_tool_tcp_pose_by_side(
+                inactive: capture_mujoco_sim_hil_tool_tcp_pose_by_side(
                     scene,
                     prepared.task_config,
-                )["left"]
+                )[inactive]
             }
         )
 
@@ -550,9 +620,9 @@ def build_mujoco_agent_tcp_pose_gateway_session(
         component_profile,
         hand_action_spec_by_component={},
         support_arm_pose_provider=capture_support_arm_pose,
-        support_arm_sides=("left",),
+        support_arm_sides=(inactive,),
         support_pose_contract_id=(
-            "mujoco.measured_left_tool_tcp_support_for_agent_coupled_ik.v1"
+            f"mujoco.measured_{inactive}_tool_tcp_support_for_agent_coupled_ik.v1"
         ),
     )
     component_execution_binding = build_mujoco_component_execution_binding(
@@ -561,7 +631,7 @@ def build_mujoco_agent_tcp_pose_gateway_session(
     )
     observation_sink = MujocoExecutionDifferenceObserver(
         selection_group_id="arms",
-        component_ids=("right_arm",),
+        component_ids=(component,),
     )
     tcp_pose_envelope_runtime = _build_standard_tcp_pose_envelope_runtime(
         prepared=prepared,
@@ -569,6 +639,7 @@ def build_mujoco_agent_tcp_pose_gateway_session(
         enable_safe_tcp_pose=enable_safe_tcp_pose,
         enable_grasp_approach=enable_grasp_approach,
         grasp_contact_binding=grasp_contact_binding,
+        motion_side=side,
     )
     target = build_mujoco_agent_skill_motion_target(
         config=target_config,
@@ -579,6 +650,7 @@ def build_mujoco_agent_tcp_pose_gateway_session(
         tcp_pose_envelope_runtime=tcp_pose_envelope_runtime,
         enable_safe_tcp_pose=enable_safe_tcp_pose or enable_grasp_approach,
         safe_tcp_planning_clearance_padding_m=safe_tcp_planning_clearance_padding_m,
+        motion_side=side,
     )
     runtime_rig_holder["rig"] = target.runtime.rig
     captured_at = float(target.runtime.clock())
@@ -586,23 +658,21 @@ def build_mujoco_agent_tcp_pose_gateway_session(
         lambda scene: capture_mujoco_sim_hil_tool_tcp_pose_by_side(
             scene,
             prepared.task_config,
-        )["right"]
+        )[side]
     )
     initialization_event_hash = canonical_content_hash(
         {
             "task_initialization_info": dict(prepared.task_initialization_info),
-            "measured_right_tool_tcp": initial_pose,
+            f"measured_{side}_tool_tcp": initial_pose,
             "captured_at": captured_at,
             "clock_domain_id": target_config.clock_domain_id,
         },
         domain="dexteleop.mujoco.agent_tcp_pose_qpos_initialization.v1",
     )
     tcp_pose_envelope_runtime.commit_reference(
-        reference_id=(
-            "mujoco-agent-qpos-init-reference:" + initialization_event_hash
-        ),
-        tcp_pose_by_side={"right": initial_pose},
-        captured_at_by_side={"right": captured_at},
+        reference_id=("mujoco-agent-qpos-init-reference:" + initialization_event_hash),
+        tcp_pose_by_side={side: initial_pose},
+        captured_at_by_side={side: captured_at},
         source_event_ids=(
             "mujoco-qpos-initialization-completed:" + initialization_event_hash,
         ),
@@ -615,6 +685,7 @@ def build_mujoco_agent_tcp_pose_gateway_session(
     application = MujocoAgentSkillMotionApplication(
         target=target,
         calibration_hash=_calibration_hash(target),
+        motion_side=side,
     )
     history_store = None
     artifact_store = None

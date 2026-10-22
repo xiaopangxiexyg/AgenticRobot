@@ -993,6 +993,13 @@ class MujocoAgentTcpPoseContractBundle:
         self.payload_validators.validate_manifest(self.route_manifest)
 
 
+def _application_component_id(application: Any) -> str:
+    components = tuple(application.runtime.action_schema.component_ids)
+    if len(components) != 1 or components[0] not in {"left_arm", "right_arm"}:
+        raise ValueError("Agent motion requires exactly one configured arm component.")
+    return components[0]
+
+
 def _build_station_manifests(application: Any) -> tuple[Any, Any]:
     runtime = application.runtime
     config = runtime.config
@@ -1004,7 +1011,8 @@ def _build_station_manifests(application: Any) -> tuple[Any, Any]:
         or config.enable_composer_authority
         or config.enable_replay_authority
         or config.initial_control_mode != "agent_skill"
-        or tuple(runtime.action_schema.component_ids) != ("right_arm",)
+        or tuple(runtime.action_schema.component_ids)
+        not in {("left_arm",), ("right_arm",)}
     ):
         raise ValueError("Runtime is not the exact no-model Agent motion profile.")
     target = ExecutionDomainBinding(
@@ -1151,6 +1159,7 @@ def _build_station_manifests(application: Any) -> tuple[Any, Any]:
 
 def _exact_application(application: Any) -> dict[str, str]:
     runtime = application.runtime
+    component = _application_component_id(application)
     runtime_config = runtime.config
     observation_plan = runtime_config.execution_observation_plan
     observation_binding = runtime.execution_observation_binding
@@ -1158,19 +1167,20 @@ def _exact_application(application: Any) -> dict[str, str]:
     if (
         not bool(getattr(observation_plan, "enabled", False))
         or getattr(observation_plan, "measurement_mode", None) == "off"
-        or tuple(getattr(observation_plan, "component_ids", ()))
-        != ("right_arm",)
+        or tuple(getattr(observation_plan, "component_ids", ())) != (component,)
         or dict(getattr(observation_plan, "required_representation_by_component", {}))
-        != {"right_arm": "cartesian_pose"}
+        != {component: "cartesian_pose"}
         or getattr(observation_binding, "plan_hash", None)
         != getattr(observation_plan, "semantic_content_hash", None)
         or dict(getattr(observation_capability, "representation_by_component", {}))
-        != {"right_arm": "cartesian_pose"}
+        != {component: "cartesian_pose"}
     ):
-        raise ValueError("Agent motion requires exact right-arm TCP observations.")
+        raise ValueError(
+            f"Agent motion requires exact {component.replace('_', '-')} TCP observations."
+        )
     target_profile = application.target_frame_profile
     frame_graph = target_profile.frame_graph
-    reference_frame_id = target_profile.reference_frame_by_component["right_arm"]
+    reference_frame_id = target_profile.reference_frame_by_component[component]
     frame_spec = frame_graph.frame_by_id[reference_frame_id]
     primitive_reference_frame_id = target_profile.canonical_reference_frame_id
     primitive_frame_spec = frame_graph.frame_by_id[primitive_reference_frame_id]
@@ -1198,10 +1208,10 @@ def _exact_application(application: Any) -> dict[str, str]:
     frame_graph.resolve(reference_frame_id, primitive_reference_frame_id)
     frame_graph.resolve(source_frame_spec.frame_id, primitive_reference_frame_id)
     tool_profile = application.tool_frame_profile
-    if tool_profile.binding_by_component["right_arm"].controlled_frame_id != (
-        "tool_tcp"
-    ):
-        raise ValueError("Agent motion requires the right-arm tool_tcp binding.")
+    if tool_profile.binding_by_component[component].controlled_frame_id != ("tool_tcp"):
+        raise ValueError(
+            f"Agent motion requires the {component.replace('_', '-')} tool_tcp binding."
+        )
     pose_schemas = dict(observation_capability.schema_hash_by_component)
     return {
         "runtime_session_id": _required(
@@ -1233,7 +1243,7 @@ def _exact_application(application: Any) -> dict[str, str]:
             field_name="observation_capability_hash",
         ),
         "pose_schema_hash": _required(
-            pose_schemas["right_arm"],
+            pose_schemas[component],
             field_name="pose_schema_hash",
         ),
         "reference_frame_id": _required(
@@ -1294,11 +1304,13 @@ def _motion_validators(
         validate_agent_motion_parameters_v1(
             schema_kind="tcp_pose_target",
             parameters=payload,
-            allowed_component_ids=("right_arm",),
+            allowed_component_ids=(profile.component_id,),
         )
         poses = payload["pose_targets_by_component"]
-        if not isinstance(poses, Mapping) or set(poses) != {"right_arm"}:
-            raise ValueError("TCP pose target must exactly cover right_arm.")
+        if not isinstance(poses, Mapping) or set(poses) != {profile.component_id}:
+            raise ValueError(
+                f"TCP pose target must exactly cover {profile.component_id}."
+            )
         exact = {
             "reference_frame_id": profile.reference_frame_id,
             "reference_frame_spec_hash": profile.reference_frame_spec_hash,
@@ -1310,7 +1322,7 @@ def _motion_validators(
         for field_name, expected in exact.items():
             if payload[field_name] != expected:
                 raise ValueError(f"TCP pose target {field_name} mismatch.")
-        pose = tuple(float(item) for item in poses["right_arm"])
+        pose = tuple(float(item) for item in poses[profile.component_id])
         bounds = profile.workspace_bounds
         if not (
             bounds[0] <= pose[0] <= bounds[1]
@@ -1588,6 +1600,7 @@ def _state_validators(
     route: SkillExecutionRoute,
     schema_entry: Any,
     exact: Mapping[str, str],
+    component_id: str = "right_arm",
 ) -> AgentSkillPayloadValidatorSet:
     parameter_fields = {
         "component_ids",
@@ -1603,10 +1616,10 @@ def _state_validators(
         validate_agent_state_parameters_v1(
             schema_kind="tcp_pose",
             parameters=payload,
-            allowed_component_ids=("right_arm",),
+            allowed_component_ids=(component_id,),
         )
-        if tuple(payload["component_ids"]) != ("right_arm",):
-            raise ValueError("TCP pose query must exactly select right_arm.")
+        if tuple(payload["component_ids"]) != (component_id,):
+            raise ValueError(f"TCP pose query must exactly select {component_id}.")
         if payload["reference_frame_id"] != exact["reference_frame_id"]:
             raise ValueError("TCP pose query reference frame mismatch.")
         age = payload["max_measurement_age_ms"]
@@ -1626,7 +1639,7 @@ def _state_validators(
             schema_kind="tcp_pose",
             parameters=parameters,
             result=payload,
-            allowed_component_ids=("right_arm",),
+            allowed_component_ids=(component_id,),
         )
 
     def validate_result(payload: Mapping[str, Any]) -> None:
@@ -1634,7 +1647,7 @@ def _state_validators(
             raise ValueError("TCP pose result schema mismatch.")
         validate_result_for(
             {
-                "component_ids": ["right_arm"],
+                "component_ids": [component_id],
                 "reference_frame_id": exact["reference_frame_id"],
                 "controlled_frame_id": "tool_tcp",
                 "max_measurement_age_ms": (
@@ -1655,7 +1668,7 @@ def _state_validators(
             if payload[field_name] != value:
                 raise ValueError(f"TCP pose result {field_name} mismatch.")
         if payload["pose_schema_hash_by_component"] != {
-            "right_arm": exact["pose_schema_hash"]
+            component_id: exact["pose_schema_hash"]
         }:
             raise ValueError("TCP pose result pose schema mismatch.")
 
@@ -1824,6 +1837,18 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
     if not isinstance(enable_tcp_pose_comparison, bool):
         raise TypeError("enable_tcp_pose_comparison must be boolean.")
     exact = _exact_application(application)
+    component = _application_component_id(application)
+    side = component.removesuffix("_arm")
+    if side == "left" and (
+        history_profile is not None
+        or enable_spatial_goals
+        or enable_grasp_approach
+        or grasp_contact_binding is not None
+        or any(item is not None for item in segmentation_identity)
+    ):
+        raise ValueError(
+            "Left motion mode does not expose history, spatial, grasp or segmentation Routes."
+        )
     if not isinstance(enable_grasp_approach, bool):
         raise TypeError("enable_grasp_approach must be boolean.")
     if (
@@ -1848,6 +1873,8 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
         )
     )
     profile = MujocoAgentTcpPoseMotionProfile(
+        component_id=component,
+        profile_id=f"{side}-arm-bounded-tool-tcp-target-v1",
         reference_frame_id=exact["primitive_reference_frame_id"],
         reference_frame_spec_hash=exact["primitive_reference_frame_spec_hash"],
         execution_reference_frame_id=exact["reference_frame_id"],
@@ -1858,11 +1885,9 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
         physics_ticks_per_control_cycle=max(1, round(physics_hz / decision_hz)),
     )
     cardinal_step_profile = MujocoAgentTcpCardinalStepProfile(
-        component_id="right_arm",
+        component_id=component,
         reference_frame_id=exact["primitive_reference_frame_id"],
-        reference_frame_spec_hash=(
-            exact["primitive_reference_frame_spec_hash"]
-        ),
+        reference_frame_spec_hash=(exact["primitive_reference_frame_spec_hash"]),
         execution_reference_frame_id=profile.execution_reference_frame_id,
         execution_reference_frame_spec_hash=(
             profile.execution_reference_frame_spec_hash
@@ -1967,16 +1992,16 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
             "Cardinal TCP primitive exceeds the lower motion delta profile."
         )
     definition = tcp_pose_target_skill_definition_v1(
-        controlled_component_ids=("right_arm",),
+        controlled_component_ids=(component,),
     )
     schema_entry = tcp_pose_target_schema_entry_v1(
         skill_definition_hash=definition.semantic_content_hash,
-        parameter_profile_id=MUJOCO_AGENT_TCP_POSE_PARAMETER_PROFILE_ID_V1,
+        parameter_profile_id=profile.profile_id,
         parameter_profile_hash=profile.semantic_content_hash,
-        allowed_component_ids=("right_arm",),
+        allowed_component_ids=(component,),
         allowed_reference_frame_ids=(profile.reference_frame_id,),
         max_requested_duration_ms=None,
-        workspace_bounds_by_component={"right_arm": profile.workspace_bounds},
+        workspace_bounds_by_component={component: profile.workspace_bounds},
     )
     route = SkillExecutionRoute(
         skill_id=definition.skill_id,
@@ -2002,19 +2027,15 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
     )
     validate_agent_motion_route_schema_v1(route=route, schema_entry=schema_entry)
     cardinal_step_definition = cardinal_tcp_step_skill_definition_v1(
-        controlled_component_ids=("right_arm",),
+        controlled_component_ids=(component,),
     )
     cardinal_step_schema = cardinal_tcp_step_schema_entry_v1(
         skill_definition_hash=cardinal_step_definition.semantic_content_hash,
-        parameter_profile_id=(
-            MUJOCO_AGENT_TCP_CARDINAL_STEP_PARAMETER_PROFILE_ID_V1
-        ),
+        parameter_profile_id=(cardinal_step_profile.parameter_profile_id),
         parameter_profile_hash=cardinal_step_profile.semantic_content_hash,
-        allowed_component_ids=("right_arm",),
+        allowed_component_ids=(component,),
         allowed_reference_frame_ids=(cardinal_step_profile.reference_frame_id,),
-        reference_frame_spec_hash=(
-            cardinal_step_profile.reference_frame_spec_hash
-        ),
+        reference_frame_spec_hash=(cardinal_step_profile.reference_frame_spec_hash),
         frame_graph_hash=profile.frame_graph_hash,
         tool_config_hash=profile.tool_config_hash,
         calibration_hash=profile.calibration_hash,
@@ -2061,22 +2082,16 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
     for skill_id in FIXED_CARDINAL_TCP_STEP_SKILL_IDS_V1:
         fixed_definition = fixed_cardinal_tcp_step_skill_definition_v1(
             skill_id=skill_id,
-            controlled_component_ids=("right_arm",),
+            controlled_component_ids=(component,),
         )
         fixed_schema = fixed_cardinal_tcp_step_schema_entry_v1(
             skill_id=skill_id,
             skill_definition_hash=fixed_definition.semantic_content_hash,
-            parameter_profile_id=(
-                MUJOCO_AGENT_TCP_CARDINAL_STEP_PARAMETER_PROFILE_ID_V1
-            ),
+            parameter_profile_id=(cardinal_step_profile.parameter_profile_id),
             parameter_profile_hash=cardinal_step_profile.semantic_content_hash,
-            allowed_component_ids=("right_arm",),
-            allowed_reference_frame_ids=(
-                cardinal_step_profile.reference_frame_id,
-            ),
-            reference_frame_spec_hash=(
-                cardinal_step_profile.reference_frame_spec_hash
-            ),
+            allowed_component_ids=(component,),
+            allowed_reference_frame_ids=(cardinal_step_profile.reference_frame_id,),
+            reference_frame_spec_hash=(cardinal_step_profile.reference_frame_spec_hash),
             frame_graph_hash=profile.frame_graph_hash,
             tool_config_hash=profile.tool_config_hash,
             calibration_hash=profile.calibration_hash,
@@ -2120,6 +2135,7 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
         fixed_cardinal_schemas.append(fixed_schema)
         fixed_cardinal_routes.append(fixed_route)
     orientation_motion_profile = MujocoAgentTcpPoseMotionProfile(
+        component_id=component,
         reference_frame_id=profile.reference_frame_id,
         reference_frame_spec_hash=profile.reference_frame_spec_hash,
         execution_reference_frame_id=profile.execution_reference_frame_id,
@@ -2129,7 +2145,7 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
         frame_graph_hash=profile.frame_graph_hash,
         tool_config_hash=profile.tool_config_hash,
         calibration_hash=profile.calibration_hash,
-        profile_id="right-arm-fixed-level-tool-tcp-orientation-v1",
+        profile_id=f"{side}-arm-fixed-level-tool-tcp-orientation-v1",
         max_translation_delta_m=(
             MUJOCO_AGENT_TCP_FIXED_ORIENTATION_MAX_TRANSLATION_DELTA_M_V1
         ),
@@ -2158,11 +2174,9 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
         )
         orientation_profile = MujocoAgentTcpFixedOrientationProfile(
             skill_id=skill_id,
-            component_id="right_arm",
+            component_id=component,
             reference_frame_id=exact["primitive_reference_frame_id"],
-            reference_frame_spec_hash=(
-                exact["primitive_reference_frame_spec_hash"]
-            ),
+            reference_frame_spec_hash=(exact["primitive_reference_frame_spec_hash"]),
             execution_reference_frame_id=profile.execution_reference_frame_id,
             execution_reference_frame_spec_hash=(
                 profile.execution_reference_frame_spec_hash
@@ -2175,20 +2189,19 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
         orientation_definition = fixed_level_tcp_orientation_skill_definition_v1(
             skill_id=skill_id,
         )
+        if side == "left":
+            # Scope only the new deployment; preserve legacy right definition bytes.
+            orientation_definition = replace(
+                orientation_definition, controlled_component_ids=(component,)
+            )
         orientation_schema = fixed_level_tcp_orientation_schema_entry_v1(
             skill_id=skill_id,
-            skill_definition_hash=(
-                orientation_definition.semantic_content_hash
-            ),
+            skill_definition_hash=(orientation_definition.semantic_content_hash),
             parameter_profile_id=orientation_profile.parameter_profile_id,
             parameter_profile_hash=orientation_profile.semantic_content_hash,
-            allowed_component_ids=("right_arm",),
-            allowed_reference_frame_ids=(
-                orientation_profile.reference_frame_id,
-            ),
-            reference_frame_spec_hash=(
-                orientation_profile.reference_frame_spec_hash
-            ),
+            allowed_component_ids=(component,),
+            allowed_reference_frame_ids=(orientation_profile.reference_frame_id,),
+            reference_frame_spec_hash=(orientation_profile.reference_frame_spec_hash),
             frame_graph_hash=orientation_profile.frame_graph_hash,
             tool_config_hash=orientation_profile.tool_config_hash,
             calibration_hash=orientation_profile.calibration_hash,
@@ -2259,6 +2272,7 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
         return refs
 
     binding = MujocoAgentTcpPoseDeploymentBinding(
+        component_id=component,
         deployment_binding_id=(
             "sim.mujoco.agent_tcp_pose:" + exact["runtime_session_id"]
         ),
@@ -2301,6 +2315,7 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
         safety_envelope_refs=safety_envelope_refs_for_route(route.route_id),
     )
     cardinal_step_binding = MujocoAgentTcpPoseDeploymentBinding(
+        component_id=component,
         deployment_binding_id=(
             "sim.mujoco.agent_tcp_cardinal_step:" + exact["runtime_session_id"]
         ),
@@ -2326,9 +2341,7 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
         pose_schema_hash=exact["pose_schema_hash"],
         motion_profile_hash=profile.semantic_content_hash,
         reference_frame_id=cardinal_step_profile.reference_frame_id,
-        reference_frame_spec_hash=(
-            cardinal_step_profile.reference_frame_spec_hash
-        ),
+        reference_frame_spec_hash=(cardinal_step_profile.reference_frame_spec_hash),
         frame_graph_hash=profile.frame_graph_hash,
         tool_config_hash=profile.tool_config_hash,
         calibration_hash=profile.calibration_hash,
@@ -2402,15 +2415,21 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
             skill_definition_hash=motion_definition.semantic_content_hash,
             parameter_profile_id=motion_profile.profile_id,
             parameter_profile_hash=motion_profile.semantic_content_hash,
-            allowed_component_ids=("right_arm",),
+            allowed_component_ids=(component,),
             allowed_reference_frame_ids=(profile.reference_frame_id,),
             max_requested_duration_ms=None,
-            workspace_bounds_by_component={"right_arm": profile.workspace_bounds},
-            parameter_description=(None if contact_binding is None else
-                "Terminal contact target=" + contact_binding.target_body_name +
-                "; sensor geoms=" + ",".join(contact_binding.sensor_geom_names) +
-                "; max approach metres=" + str(contact_binding.max_approach_m) +
-                "; no other contact permission; no automatic closure or carry."),
+            workspace_bounds_by_component={component: profile.workspace_bounds},
+            parameter_description=(
+                None
+                if contact_binding is None
+                else "Terminal contact target="
+                + contact_binding.target_body_name
+                + "; sensor geoms="
+                + ",".join(contact_binding.sensor_geom_names)
+                + "; max approach metres="
+                + str(contact_binding.max_approach_m)
+                + "; no other contact permission; no automatic closure or carry."
+            ),
         )
         motion_route = replace(
             route,
@@ -2460,7 +2479,7 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
     if enable_safe_tcp_pose:
         item = planned_motion_contract(
             safe_tcp_pose_target_skill_definition_v1(
-                controlled_component_ids=("right_arm",)
+                controlled_component_ids=(component,)
             ),
             replace(
                 profile,
@@ -2571,6 +2590,7 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
         skill_id = fixed_definition.skill_id
         direction = FIXED_CARDINAL_TCP_STEP_DIRECTION_BY_SKILL_ID_V1[skill_id]
         fixed_binding = MujocoAgentTcpPoseDeploymentBinding(
+            component_id=component,
             deployment_binding_id=(
                 "sim.mujoco.agent_tcp_fixed_cardinal_step:"
                 + skill_id
@@ -2599,9 +2619,7 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
             pose_schema_hash=exact["pose_schema_hash"],
             motion_profile_hash=profile.semantic_content_hash,
             reference_frame_id=cardinal_step_profile.reference_frame_id,
-            reference_frame_spec_hash=(
-                cardinal_step_profile.reference_frame_spec_hash
-            ),
+            reference_frame_spec_hash=(cardinal_step_profile.reference_frame_spec_hash),
             frame_graph_hash=profile.frame_graph_hash,
             tool_config_hash=profile.tool_config_hash,
             calibration_hash=profile.calibration_hash,
@@ -2621,9 +2639,7 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
                 "trajectory_streaming",
                 "upper_target_derivation",
             ),
-            safety_envelope_refs=safety_envelope_refs_for_route(
-                fixed_route.route_id
-            ),
+            safety_envelope_refs=safety_envelope_refs_for_route(fixed_route.route_id),
         )
         fixed_evaluator = SkillEvaluatorSpec(
             evaluator_id=f"motion.tcp_fixed_{direction}_step_arrival_rule",
@@ -2672,7 +2688,12 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
             )
         )
     orientation_contracts: list[MujocoAgentTcpFixedOrientationContract] = []
-    for orientation_profile, orientation_definition, orientation_schema, orientation_route in zip(
+    for (
+        orientation_profile,
+        orientation_definition,
+        orientation_schema,
+        orientation_route,
+    ) in zip(
         orientation_profiles,
         orientation_definitions,
         orientation_schemas,
@@ -2681,6 +2702,7 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
     ):
         skill_id = orientation_profile.skill_id
         orientation_binding = MujocoAgentTcpPoseDeploymentBinding(
+            component_id=component,
             deployment_binding_id=(
                 "sim.mujoco.agent_tcp_fixed_orientation:"
                 + skill_id
@@ -2709,17 +2731,13 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
             pose_schema_hash=exact["pose_schema_hash"],
             motion_profile_hash=orientation_motion_profile.semantic_content_hash,
             reference_frame_id=orientation_profile.reference_frame_id,
-            reference_frame_spec_hash=(
-                orientation_profile.reference_frame_spec_hash
-            ),
+            reference_frame_spec_hash=(orientation_profile.reference_frame_spec_hash),
             frame_graph_hash=orientation_profile.frame_graph_hash,
             tool_config_hash=orientation_profile.tool_config_hash,
             calibration_hash=orientation_profile.calibration_hash,
             trace_requirement_profile_id=station.trace_requirement_profile_id,
             executor_id=(
-                MUJOCO_AGENT_TCP_FIXED_ORIENTATION_EXECUTOR_ID_BY_SKILL_ID_V1[
-                    skill_id
-                ]
+                MUJOCO_AGENT_TCP_FIXED_ORIENTATION_EXECUTOR_ID_BY_SKILL_ID_V1[skill_id]
             ),
             explicit_exclusions=(
                 "agent_authored_angle",
@@ -2803,25 +2821,24 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
         )
 
     state_definition = tcp_pose_state_definition_v1(
-        controlled_component_ids=("right_arm",)
+        controlled_component_ids=(component,)
     )
+    state_profile_id = f"{side}-arm-agent-motion-tcp-pose-read-v1"
     state_profile_hash = canonical_content_hash(
         {
-            "profile_id": MUJOCO_AGENT_TCP_POSE_STATE_PROFILE_ID_V1,
-            "component_ids": ("right_arm",),
+            "profile_id": state_profile_id,
+            "component_ids": (component,),
             "reference_frame_id": profile.reference_frame_id,
             "controlled_frame_id": "tool_tcp",
-            "max_measurement_age_ms": (
-                MUJOCO_AGENT_TCP_POSE_MAX_MEASUREMENT_AGE_MS_V1
-            ),
+            "max_measurement_age_ms": (MUJOCO_AGENT_TCP_POSE_MAX_MEASUREMENT_AGE_MS_V1),
         },
         domain="dexteleop.agent_state.mujoco_agent_tcp_pose_profile.v1",
     )
     state_schema = tcp_pose_state_schema_entry_v1(
         skill_definition_hash=state_definition.semantic_content_hash,
-        parameter_profile_id=MUJOCO_AGENT_TCP_POSE_STATE_PROFILE_ID_V1,
+        parameter_profile_id=state_profile_id,
         parameter_profile_hash=state_profile_hash,
-        allowed_component_ids=("right_arm",),
+        allowed_component_ids=(component,),
         allowed_reference_frame_ids=(profile.reference_frame_id,),
         max_measurement_age_ms=MUJOCO_AGENT_TCP_POSE_MAX_MEASUREMENT_AGE_MS_V1,
     )
@@ -2852,6 +2869,7 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
         schema_entry=state_schema,
     )
     state_binding = MujocoPassiveTcpPoseStateDeploymentBinding(
+        component_id=component,
         deployment_binding_id=(
             "sim.mujoco.agent_passive_tcp_pose:" + exact["runtime_session_id"]
         ),
@@ -3023,7 +3041,10 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
         "reference_frame_spec_hash": state_binding.reference_frame_spec_hash,
     }
     state_validator = _state_validators(
-        route=state_route, schema_entry=state_schema, exact=public_state_exact,
+        route=state_route,
+        schema_entry=state_schema,
+        exact=public_state_exact,
+        component_id=component,
     )
     state_availability = canonical_content_hash(
         {

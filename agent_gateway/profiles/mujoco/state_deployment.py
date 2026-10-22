@@ -70,8 +70,13 @@ class MujocoPassiveTcpPoseStateDeploymentBinding:
     calibration_hash: str
     executor_id: str
     explicit_exclusions: tuple[str, ...]
+    component_id: str = "right_arm"
 
     def __post_init__(self) -> None:
+        if not isinstance(self.component_id, str) or self.component_id not in {
+            "left_arm", "right_arm",
+        }:
+            raise ValueError("State deployment component_id must be left_arm or right_arm.")
         for field_name in (
             "deployment_binding_id",
             "deployment_binding_version",
@@ -133,7 +138,7 @@ class MujocoPassiveTcpPoseStateDeploymentBinding:
                 "tool_config_hash": self.tool_config_hash,
                 "calibration_hash": self.calibration_hash,
                 "executor_id": self.executor_id,
-                "controlled_component_ids": ("right_arm",),
+                "controlled_component_ids": (self.component_id,),
                 "controlled_frame_id": "tool_tcp",
                 "target_kind": "sim",
                 "read_semantics": "application_locked_passive_cut",

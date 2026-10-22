@@ -1098,3 +1098,40 @@ def test_session_repeats_passive_tcp_pose_reads_without_consuming_motion_worker(
     ) == 0
     assert session.service.operation_store.total_admitted == 2
     consumer_session.close()
+
+
+def _cube_lift_observer_fixture(monkeypatch):
+    application = _application()
+    application.runtime.clock = lambda: 10.0
+    application.capture_passive_application_cut = lambda **_: pytest.fail("constructor must not capture")
+    return application, _contract_bundle(monkeypatch, application)
+
+
+def test_cube_lift_observer_keeps_task_action_and_right_state_projection(monkeypatch):
+    application, bundle = _cube_lift_observer_fixture(monkeypatch)
+    original_action_schema = application.runtime.action_schema
+    assert not hasattr(bundle.deployment_binding, "component_id")
+    producer = MujocoCubeLiftAgentObservationProducer(application=application, contract_bundle=bundle)
+    assert producer.component_id == "right_arm" and producer.motion_side == "right"
+    assert producer.source_binding.source_kind == "policy"
+    assert bundle.state_deployment_binding.component_id == "right_arm"
+    assert application.runtime.action_schema is original_action_schema
+
+
+@pytest.mark.parametrize("components", [("left_arm",), ("left_arm", "right_arm")])
+def test_cube_lift_observer_rejects_a_wrong_or_multi_component_observation_plan(monkeypatch, components):
+    application, bundle = _cube_lift_observer_fixture(monkeypatch)
+    application.runtime.config.execution_observation_plan.component_ids = components
+    with pytest.raises(ValueError, match="exact right TCP plan"):
+        MujocoCubeLiftAgentObservationProducer(application=application, contract_bundle=bundle)
+
+
+def test_cube_lift_observer_rejects_a_corrupted_left_state_binding(monkeypatch):
+    from copy import copy
+    application, bundle = _cube_lift_observer_fixture(monkeypatch)
+    # Inject an incompatible immutable binding to exercise constructor admission,
+    # without claiming this corrupted bundle passed its own assembly validation.
+    corrupted = copy(bundle)
+    object.__setattr__(corrupted, "state_deployment_binding", replace(bundle.state_deployment_binding, component_id="left_arm"))
+    with pytest.raises(ValueError, match="typed right_arm state binding"):
+        MujocoCubeLiftAgentObservationProducer(application=application, contract_bundle=corrupted)
