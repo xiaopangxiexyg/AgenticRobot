@@ -165,7 +165,7 @@ class CoordinatedPoseHolding:
         departure[joint] = value
         self._departure_bias = tuple(departure)
 
-    def _approach_bias(self, i, frame, dt, moving, anchor, *, point_search=True):
+    def _approach_bias(self, i, frame, dt, moving, anchor, *, point_search=True, point_reacquire=False):
         """Separate resolved motion from optional point-local exploration.
 
         Half is an exploration proposal toward zero, not a measured equilibrium
@@ -188,7 +188,8 @@ class CoordinatedPoseHolding:
         target_error = self.goal[i]-self.q[i] if self.goal is not None else frame.q_reference_rad-self.q[i]
         arrival = (self.config.motor_local_recovery
                    and getattr(frame, "reason", None) in {"target_reached_braking", "calibration_target_tracking"})
-        if (arrival and not point_search and (moving or onset_confirmed)
+        continuous_return = not point_search or point_reacquire
+        if (arrival and continuous_return and (moving or onset_confirmed)
             and abs(velocity) > self.settings.staged_assist.settle_velocity_rad_s
             and self.estimators[i].position_span_rad > resolution
             and bias*velocity > 0 and self.last_delta[i]*velocity > 0
@@ -199,7 +200,7 @@ class CoordinatedPoseHolding:
             reduction = min(abs(bias), self.config.fall_slew_nm_s*dt)
             bias -= reduction*(1 if bias > 0 else -1)
             moving, reason = True, "arrival_feedback_unloading"
-        elif onset_confirmed and point_search:
+        elif onset_confirmed and point_search and not point_reacquire:
             half = self.last_delta[i] / 2
             original = frame.requested_torque_nm + self.bias[i]
             # A point-local half is a proposal, not a measured holding force.
@@ -208,7 +209,7 @@ class CoordinatedPoseHolding:
             moving, reason = True, "resolved_motion_half_command_proposal"
             if target != half:
                 reason = "motion_unload_keeps_stronger_native_braking"
-        elif (self.config.motor_local_recovery and not point_search
+        elif (self.config.motor_local_recovery and continuous_return
               and abs(target_error) > resolution and bias*target_error < 0
               and bias*velocity > 0 and abs(velocity) > self.settings.staged_assist.settle_velocity_rad_s
               and self.estimators[i].position_span_rad > resolution):
@@ -268,13 +269,17 @@ class CoordinatedPoseHolding:
             scale = min(scale, frame.continuous_speed_scale)
         return scale
 
-    def step(self, *, sequence, dt, permitted, probe_joint=None, probe_nm=None, point_search=True):
+    def step(self, *, sequence, dt, permitted, probe_joint=None, probe_nm=None, point_search=True, point_reacquire=False):
         if type(sequence) is not int or sequence < 0 or type(permitted) is not bool or not 0 < finite(dt, "control interval") <= self.motion.max_control_gap_sec:
             raise ValueError("coordinated step requires valid sequence, permit and control interval")
         if self.pending is not None:
             raise ValueError("coordinated previous dispatch not confirmed")
         if type(point_search) is not bool:
             raise TypeError("coordinated point search must be boolean")
+        if type(point_reacquire) is not bool:
+            raise TypeError("coordinated point reacquire must be boolean")
+        if point_reacquire and (not point_search or not self.config.motor_local_recovery or probe_nm is not None):
+            raise ValueError("point reacquire requires motor-local frozen-point return, not a fixed probe")
         if probe_joint is not None and (type(probe_joint) is not int or probe_joint not in AXES):
             raise ValueError("coordinated probes support J2/J3 only")
         if probe_nm is not None and (probe_joint is None or abs(finite(probe_nm, "probe")) > self.config.total_assist_cap_nm):
@@ -331,7 +336,8 @@ class CoordinatedPoseHolding:
                 is_probe = i == probe_joint and probe_nm is not None and frame.reason == "calibration_fixed_command_observation"
                 if not is_probe and brake_seed is None:
                     proposed_bias[i], moving[i], anchors[i], approach_reasons[i] = self._approach_bias(
-                        i, frame, dt, moving[i], anchors[i], point_search=point_search)
+                        i, frame, dt, moving[i], anchors[i], point_search=point_search,
+                        point_reacquire=point_reacquire)
                 elif is_probe:
                     moving[i], anchors[i] = False, self.q[i]
                     fixed_probes.add(i)
@@ -429,7 +435,7 @@ class CoordinatedPoseHolding:
                 # unloading even across zero-count feedback.
                 # The fast path can only reduce toward zero, never reverse.
                 arrival_unload = (self.config.motor_local_recovery
-                                  and not point_search
+                                  and (not point_search or point_reacquire)
                                   and frame.reason in {"target_reached_braking", "calibration_target_tracking"})
                 command[i], transition_reasons[i], transition_rates[i] = self._slew_axis(
                     i, target, dt, moving[i], arrival_unload=arrival_unload)
@@ -472,6 +478,7 @@ class CoordinatedPoseHolding:
             "saturated": scale < 1, "braking": self.braking,
             "arrival_tolerance_rad": self.arrival_tolerance_rad,
             "point_search_enabled": point_search,
+            "point_reacquire_enabled": point_reacquire,
             "supported_soft_stop": supported_braking,
             "support_anchor_rad": support_anchor,
             "support_dispatch_confirmed": self._support_receipt,

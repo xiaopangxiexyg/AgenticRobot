@@ -17,4 +17,5 @@ button[aria-pressed="true"] { background:#245d53; border-color:#6ac4b1; color:#e
 #joint-overview.stale-feedback tbody { opacity:.55; }
 details summary { cursor:pointer; color:#d3ebff; }
 #assessment-path { overflow-wrap:anywhere; font-size:.85rem; }
+#supported-return { width:auto; margin-right:8px; vertical-align:middle; }
 @media(max-width:800px) { .experiment-options { grid-template-columns:1fr; } }

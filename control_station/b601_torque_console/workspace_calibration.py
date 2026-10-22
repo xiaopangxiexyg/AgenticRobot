@@ -615,6 +615,10 @@ class B601WorkspaceCalibrationController:
                     self._transition("advancing", "gravity_observation_complete", now)
 
     @property
+    def automatic_disable_ready(self):
+        return self._coordinated is not None and self._coordinated.automatic_disable_ready
+
+    @property
     def cycle_disable_confirmation_required(self):
         return True
 

@@ -1631,6 +1631,27 @@ def test_automatic_result_separates_clean_stop_from_acceptance_without_hiding_er
     assert payload['acquisition_outcome']==record['outcome']
 
 
+@pytest.mark.parametrize("execution,state,severity,initial,entries,code,status", [
+    ("COMPLETED", "complete", "info", "FAIL", 0, 0, "OK"),
+    ("COMPLETED", "failed", "warning", "FAIL", 0, 0, "COMPLETED_WITH_WARNINGS"),
+    ("FAILED", "failed", "warning", "FAIL", 0, 1, "FAIL"),
+    ("COMPLETED", "failed", "warning", "ERROR", 0, 2, "ERROR"),
+    ("COMPLETED", "failed", "warning", "FAIL", 1, 1, "FAIL"),
+    ("COMPLETED", "sweep", "info", "FAIL", 0, 1, "FAIL"),
+])
+def test_supported_return_completion_keeps_acquisition_and_cleanup_faults_distinct(
+    execution, state, severity, initial, entries, code, status,
+):
+    payload = {"status": initial, "execution_status": execution, "acceptance_status": "FAIL",
+        "stop_reason": "supported_origin_return_complete", "protective_hold": {"degraded": {"entry_count": entries}}}
+    acquisition = {"state": state, "outcome": {"severity": severity, "scope": "acquisition"}}
+    assert probe._finalize_automatic_result(payload, acquisition) == code
+    assert payload["status"] == status and payload["acceptance_status"] == "FAIL"
+    assert payload["acquisition_outcome"] == acquisition["outcome"]
+    assert probe._automatic_execution_status("supported_origin_return_complete", False, 1) == "FAILED"
+    assert probe._automatic_execution_status("supported_origin_return_complete", True, 0) == "FAILED"
+
+
 def test_automatic_postrun_timing_quality_is_a_visible_warning_not_a_live_guard_override():
     payload={'status':'FAIL','execution_status':'STOPPED_BY_OPERATOR','acceptance_status':'FAIL',
         'frequency_acceptance':{'tx':{'passed':False},'feedback':{'passed':True}}}

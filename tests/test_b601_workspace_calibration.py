@@ -642,6 +642,35 @@ def test_workspace_production_profile_scripted_feedback_crosses_j3_j2_and_sweeps
     assert controller.cycle_disable_confirmation_ready
 
 
+def test_gui_supported_return_requires_an_explicit_single_round_grant():
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("Node is required for GUI contracts")
+    source = Path("control_station/b601_torque_console/static/app.js").read_text()
+    handler = source[source.index('el("arm").onclick ='):source.index('el("mode-fixed-position").onclick =')]
+    script = """
+const vm=require('node:vm');const nodes={arm:{},'supported-return':{checked:false}};
+const calls=[];let confirms=0;let accepted=false;
+const context={el:id=>nodes[id],state:{mode_selection:{selected:'workspace',supported_return_available:true}},
+  intent:(action,fields)=>calls.push({action,...fields}),window:{confirm:()=>{confirms++;return accepted;}}};
+vm.runInNewContext(JSON.parse(process.argv[1]),context);
+nodes.arm.onclick();
+nodes['supported-return'].checked=true;nodes.arm.onclick();
+accepted=true;nodes.arm.onclick();
+context.state.mode_selection.supported_return_available=false;nodes.arm.onclick();
+console.log(JSON.stringify({calls,confirms}));
+"""
+    completed = subprocess.run([node, "-e", script, json.dumps(handler)],
+        check=True, capture_output=True, text=True)
+    result = json.loads(completed.stdout)
+    assert result["confirms"] == 2
+    assert result["calls"] == [
+        {"action": "arm", "operation_mode": "workspace"},
+        {"action": "arm", "operation_mode": "workspace", "return_and_disable": True},
+        {"action": "arm", "operation_mode": "workspace"},
+    ]
+
+
 def test_workspace_gui_start_stop_and_background_semantics():
     node = shutil.which("node")
     if node is None:

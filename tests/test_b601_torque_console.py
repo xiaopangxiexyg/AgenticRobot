@@ -2658,6 +2658,14 @@ def test_console_withdraw_source_and_cycle_visibility_are_validated_and_forwarde
         assert controller.calls[1][0] == "visibility"
         assert controller.calls[1][1]["visible"] is False
         assert isinstance(controller.calls[1][1]["now_sec"], float)
+        with send({"action": "arm", "operation_mode": "workspace", "return_and_disable": True}) as response:
+            assert json.load(response)["status"] == "accepted"
+        assert controller.calls[-1][1]["return_and_disable"] is True
+        for bad in (1, "true", None):
+            with pytest.raises(HTTPError) as invalid_grant:
+                send({"action": "arm", "operation_mode": "workspace", "return_and_disable": bad})
+            assert invalid_grant.value.code == 400
+        assert len(controller.calls) == 3
         with pytest.raises(HTTPError) as invalid:
             send({"action": "withdraw", "source": "arbitrary"})
         assert invalid.value.code == 400

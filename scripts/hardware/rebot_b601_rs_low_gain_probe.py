@@ -6952,6 +6952,12 @@ def _finalize_automatic_result(payload: dict, acquisition: dict) -> int:
         for event, check in payload.get("frequency_acceptance", {}).items()
         if check["passed"] is False
     ]
+    if (payload.get("status") != "ERROR" and payload.get("execution_status") == "COMPLETED"
+        and payload.get("stop_reason") == "supported_origin_return_complete"
+        and acquisition["state"] in {"complete", "failed"}
+        and outcome["severity"] in {"info", "warning"}):
+        payload["status"] = "COMPLETED_WITH_WARNINGS" if outcome["severity"] == "warning" or payload["execution_warnings"] else "OK"
+        return 0
     if (payload.get("status") != "ERROR"
         and payload.get("execution_status") == "STOPPED_BY_OPERATOR"
         and acquisition["state"] in {"complete", "failed", "cancelled"}
@@ -6966,6 +6972,8 @@ def _automatic_execution_status(stop_reason, cleanup_ok, commands_sent):
         return "FAILED"
     if stop_reason in {"explicit_full_disable", "operator_interrupt"}:
         return "STOPPED_BY_OPERATOR"
+    if stop_reason == "supported_origin_return_complete":
+        return "COMPLETED"
     return "COMPLETED" if stop_reason is None else "FAILED"
 
 
@@ -7635,6 +7643,17 @@ def _console_stop_request(stop: dict[str, bool], action: str) -> None:
         stop["full_disable_requested"] = True
     else:
         raise ValueError("unsupported console stop action")
+
+
+def _request_supported_return_disable(stop, torque_console, confirmation):
+    """A one-shot GUI grant, consumed only after the owner's return receipts."""
+    if (not getattr(torque_console, "automatic_disable_ready", False)
+        or stop.get("requested", False) or stop.get("full_disable_requested", False)):
+        return False
+    _console_stop_request(stop, "full_disable")
+    confirmation.update(confirmed=True, source="single_cycle_supported_return",
+        confirmed_at_monotonic_sec=time.monotonic())
+    return True
 
 
 def _confirm_completed_cycle_disable(
@@ -9683,7 +9702,9 @@ def run_probe(
             fault_qvel_for_hold = None
             fault_observed_at_sec = None
             if stop["full_disable_requested"]:
-                stop_reason = "explicit_full_disable"
+                stop_reason = ("supported_origin_return_complete"
+                    if cycle_disable_confirmation.get("source") == "single_cycle_supported_return"
+                    else "explicit_full_disable")
                 break
             if stop["requested"]:
                 stop_reason = "operator_interrupt"
@@ -10813,6 +10834,13 @@ def run_probe(
                        if getattr(args, "torque_console_auto_calibration_profile", None) is not None else {}),
                 )
                 if (
+                    _request_supported_return_disable(stop, torque_console, cycle_disable_confirmation)
+                ):
+                    _operator_notice(
+                        "[B601] SUPPORTED RETURN COMPLETE: six-axis origin window, final zero assist, "
+                        "base damping and stillness confirmed; using the existing full-disable protocol."
+                    )
+                elif (
                     not cycle_completion_notice_sent
                     and getattr(torque_console, "cycle_disable_confirmation_ready", False)
                 ):

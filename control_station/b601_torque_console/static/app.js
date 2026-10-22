@@ -109,6 +109,18 @@ function renderAutomatic() {
   const selection = automatic ? state.mode_selection : null;
   el("mode-workspace").hidden = !selection?.available_modes?.includes("workspace");
   el("mode-selector").hidden = !selection;
+  const supportedReturn = selection?.supported_return_available === true;
+  el("supported-return-control").hidden = !supportedReturn;
+  el("supported-return").disabled = !supportedReturn || selection.locked;
+  const returnStatus = state?.automatic_calibration?.workspace?.supported_return;
+  el("supported-return-status").hidden = !supportedReturn;
+  if (supportedReturn) {
+    if (selection.locked) el("supported-return").checked = returnStatus?.enabled === true;
+    const origin = returnStatus?.supported_origin_qpos_rad;
+    el("supported-return-status").textContent = `本次首次停稳、零助力回执锁定原位：${origin ? origin.map(v => number(v*180/Math.PI, 2)).join(" / ") + "°" : "等待确认"}。仅 J2/J3 按已有路线慢速返回；其他轴也必须在原位窗口内才可自动失能。不自动重试，不循环重启；故障、有人介入、页面关闭或许可失效不自动回位。`;
+    if (returnStatus?.active) el("supported-return-status").textContent += " 正在回位，采集结果单独保留。";
+    if (returnStatus?.completed) el("supported-return-status").textContent += " 回位及撤力停稳已确认。";
+  }
   el("cycle-angle-control").hidden = !selection || selection.selected !== "supported_cycle";
   if (selection) {
     if (!cycleAngleInitialized && Number.isFinite(selection.cycle_angle_deg)) {
@@ -304,6 +316,9 @@ function renderWorkspace(batch) {
   el("arm").textContent = "开始 J2/J3 多位姿自动采集";
   el("withdraw").textContent = "停止采集并撤力（不自动返回）";
   el("drive-instructions").textContent = "起点须有可靠支撑，并清空整个采集区域。无人介入后启动；后台继续，关闭页面或人工介入撤力停止。正常完成后逐轴返回起点，等待 GUI 人工确认失能。";
+  if (workspace.supported_return?.enabled) {
+    el("drive-instructions").textContent = "本次已授权单轮回位失能：正常结束或允许的采集软停止后，按原有逐轴路线缓慢返回本次托架原位；零助力、基础阻尼、停稳及六轴原位窗口回执确认后自动失能。人工介入、关闭页面、反馈/CAN故障及整批预算耗尽不会自动回位；不循环重试。";
+  }
   if (workspace.supported_soft_stop) {
     el("drive-instructions").textContent = "正在用有界支撑、位置恢复和阻尼制止滑动，不是只做重力补偿；完整发送并停稳后继续原目标，不重置时间或暴露预算。硬保护、反馈异常或人工撤销不会自动恢复。";
   }
@@ -594,6 +609,10 @@ el("arm").onclick = () => {
       return;
     }
     fields.cycle_angle_deg = angle;
+  }
+  if (selection?.supported_return_available && el("supported-return").checked) {
+    if (!window.confirm("确认本次启动原位有可靠托架？本次授权一轮采集；正常结束或允许的采集软停止后慢速回位，六轴原位窗口、停稳、零助力及基础阻尼回执确认后自动失能。硬件故障不会自动回位。")) return;
+    fields.return_and_disable = true;
   }
   return intent("arm", fields);
 };

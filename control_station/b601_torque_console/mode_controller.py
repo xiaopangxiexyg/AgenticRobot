@@ -52,7 +52,15 @@ class B601CalibrationModeController:
                 "generation": self._generation, "selected_at_sec": self._selected_at,
                 "available_modes": ["fixed_position", "supported_cycle"] + (["workspace"] if self._workspace is not None else []),
                 "cycle_angle_deg": math.degrees(self.cycle.offset_rad),
+                "supported_return_available": (self._selected == "workspace" and self._workspace is not None
+                    and self._workspace.workspace.coordinated_holding is not None),
                 "maximum_cycle_angle_deg": math.degrees(self._supported.maximum_offset_rad)}
+
+    @property
+    def automatic_disable_ready(self):
+        with self._lock:
+            return (self._selected == "workspace" and self._locked
+                    and self._workspace.automatic_disable_ready)
 
     @property
     def cycle(self):
@@ -136,7 +144,8 @@ class B601CalibrationModeController:
                 raise ValueError("owner has stopped; mode selection cannot restart it")
             if action == "arm":
                 if (fields.get("operation_mode") != self._selected
-                    or set(fields) - {"operation_mode", "cycle_angle_deg"}
+                    or set(fields) - {"operation_mode", "cycle_angle_deg", "return_and_disable"}
+                    or "return_and_disable" in fields and not self._selection()["supported_return_available"]
                     or "cycle_angle_deg" in fields and self._selected != "supported_cycle"):
                     raise ValueError("displayed mode changed; refresh the GUI before starting")
                 if not self._mode_ready:

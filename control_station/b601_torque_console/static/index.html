@@ -45,6 +45,8 @@
     <section id="automatic-panel" class="card" hidden>
       <h2 id="automatic-mode-title">J3 自动采集</h2><p id="automatic-mode-note" class="subtle"></p><p id="automatic-progress" class="command-state" role="status"></p><p id="cycle-disable-hint" class="command-state" role="status" hidden></p>
       <p id="automatic-data-status" class="subtle" role="status"></p>
+      <label id="supported-return-control" hidden><input id="supported-return" type="checkbox">本次原位有可靠托架：单轮结束／采集软停止后，缓慢回原位并自动失能</label>
+      <p id="supported-return-status" class="subtle" role="status" hidden></p>
       <p id="automatic-sequence-note">先采集正负起动与撤力回退，再采集双速度小范围运动。编码器进展不等于输出侧运动或真实摩擦力；不会自动安装补偿。</p>
       <pre id="automatic-trials"></pre>
     </section>

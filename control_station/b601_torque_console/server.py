@@ -306,7 +306,8 @@ class _Handler(BaseHTTPRequestHandler):
                     fields_match = True
                 if allowed is None or (not fields_match and not (
                     action == "arm" and set(payload) in (
-                        {"action", "operation_mode"}, {"action", "operation_mode", "cycle_angle_deg"})
+                        {"action", "operation_mode"}, {"action", "operation_mode", "cycle_angle_deg"},
+                        {"action", "operation_mode", "return_and_disable"})
                 )):
                     raise ValueError("invalid intent request fields")
                 if action == "withdraw":
@@ -345,6 +346,10 @@ class _Handler(BaseHTTPRequestHandler):
                     submit_args["target_offset_rad"] = target_offset
                 if joint_name is not None:
                     submit_args["joint_name"] = joint_name
+                if "return_and_disable" in payload:
+                    if type(payload["return_and_disable"]) is not bool:
+                        raise ValueError("return_and_disable must be boolean")
+                    submit_args["return_and_disable"] = payload["return_and_disable"]
                 self.server.controller.submit(
                     action,
                     **submit_args,

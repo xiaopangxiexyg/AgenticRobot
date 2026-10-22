@@ -17,6 +17,7 @@ from control_station.b601_torque_console.workspace_calibration import (
     WorkspaceCalibrationConfig,
 )
 from robot_motion.rebot_b601_rs.coordinated_holding import (
+    AXES,
     ZERO,
     CoordinatedHoldingConfig,
     CoordinatedPoseHolding,
@@ -521,6 +522,85 @@ def test_arrival_feedback_waits_for_resolved_onset_and_preserves_stronger_native
         assert reason == "resolved_motion_continuous_tracking" and bias == core.bias[2]
     else:
         assert reason == "arrival_feedback_unloading" and bias == pytest.approx(mirror*(.6-core.config.fall_slew_nm_s*.01))
+
+
+@pytest.mark.parametrize("joint", [1, 2])
+@pytest.mark.parametrize("sign", [-1, 1])
+def test_eu09g9pb_frozen_point_reacquire_keeps_starting_support_not_half_command(settings, monkeypatch, joint, sign):
+    from robot_motion.rebot_b601_rs.joint_motion import B601JointMotionFrame
+
+    def axis(value):
+        return tuple(sign*value if i == joint else 0. for i in range(6))
+    outputs = []
+    for reacquire in (False, True):
+        core = runtime(settings)
+        core.config = CoordinatedHoldingConfig(bias_gain_nm_per_rad_sec=40., fall_slew_nm_s=1.,
+            supported_soft_recovery=True, recovery_kd_nm_s_per_rad=0.)
+        warm(core)
+        core.motion = replace(core.motion, braking_slew_nm_s=20.)
+        core.goal = axis(.13077636063098907)
+        core.q = axis(.12655791640281677)
+        core.velocity, core.raw = axis(.012585526241937385), axis(.03812820262755943)
+        core._approach_anchor = axis(.124)
+        core.bias = axis(.6709583688522128)
+        core.last_delta = axis(.7146761956402345)
+        core.estimators = tuple(SimpleNamespace(position_span_rad=.002, span_sec=.08) for _ in range(6))
+        for i, tracker in zip(AXES, core.trackers):
+            frame = B601JointMotionFrame(phase="track", reason="tracking_reference",
+                q_reference_rad=core.goal[i], qvel_reference_rad_s=0., control_qvel_rad_s=core.velocity[i],
+                position_torque_nm=sign*.03803580449613024 if i == joint else 0., velocity_torque_nm=0.,
+                requested_torque_nm=sign*.03803580449613024 if i == joint else 0.)
+            monkeypatch.setattr(tracker, "update", lambda frame=frame, **kwargs: frame)
+        command, audit = core.step(sequence=12, dt=.010058074, permitted=True,
+            point_search=True, point_reacquire=reacquire)
+        assert core.bias == axis(.6709583688522128)
+        if reacquire:
+            assert audit["approach_reasons"][joint] == "resolved_motion_continuous_tracking"
+            assert audit["proposed_bias_nm"][joint] == pytest.approx(sign*.6709583688522128)
+            assert command[joint]*sign > .7
+        else:
+            assert audit["approach_reasons"][joint] == "resolved_motion_half_command_proposal"
+            assert audit["proposed_bias_nm"][joint] == pytest.approx(sign*.319302293323987)
+            assert command[joint] == pytest.approx(sign*.5135147156402345)
+        core.record_dispatch(12, command)
+        assert sum(abs(u) for u in command) <= 1.
+        outputs.append(command[joint]*sign)
+    assert outputs[1] > outputs[0]
+
+
+@pytest.mark.parametrize("sign", [-1, 1])
+def test_frozen_reacquire_retains_fine_refinement_and_feedback_unloads_only_at_arrival(settings, sign):
+    core = runtime(settings)
+    core.config = CoordinatedHoldingConfig(bias_gain_nm_per_rad_sec=40.,
+        supported_soft_recovery=True, recovery_kd_nm_s_per_rad=0.)
+    core.goal = (0., 0., sign*.01, 0., 0., 0.)
+    core.q = (0., 0., sign*.009, 0., 0., 0.)
+    core.bias = core.last_delta = (0., 0., sign*.6, 0., 0., 0.)
+    core.estimators = tuple(SimpleNamespace(position_span_rad=0.) for _ in range(6))
+    frame = SimpleNamespace(reason="target_reached_braking", q_reference_rad=core.goal[2], requested_torque_nm=0.)
+    bias, _, _, reason = core._approach_bias(2, frame, .01, False, core.q[2],
+        point_search=True, point_reacquire=True)
+    assert reason == "stationary_bias_refinement" and bias*sign > .6
+    # Once moving near the target, preserve the existing feedback-driven fall
+    # rate rather than the old one-shot half; no repeated integration in motion.
+    core.velocity = core.raw = (0., 0., sign*.01, 0., 0., 0.)
+    core.estimators[2].position_span_rad = .002
+    bias, _, _, reason = core._approach_bias(2, frame, .01, True, core.q[2]-sign*.002,
+        point_search=True, point_reacquire=True)
+    assert reason == "arrival_feedback_unloading"
+    assert bias == pytest.approx(sign*(.6-core.config.fall_slew_nm_s*.01))
+
+
+@pytest.mark.parametrize("values", [
+    {"point_reacquire": "true"}, {"point_reacquire": True, "point_search": False},
+    {"point_reacquire": True, "probe_joint": 2, "probe_nm": .1},
+])
+def test_point_reacquire_requires_a_distinct_valid_non_probe_purpose(settings, values):
+    core = runtime(settings)
+    core.config = CoordinatedHoldingConfig(supported_soft_recovery=True, recovery_kd_nm_s_per_rad=0.)
+    warm(core)
+    with pytest.raises((TypeError, ValueError), match="reacquire"):
+        core.step(sequence=12, dt=.01, permitted=True, **values)
 
 
 def test_recorded_uirvzgyc_arrival_proposal_keeps_support_not_departure_assumption(settings):
@@ -1310,6 +1390,171 @@ def advance_to_coordinated_probe(r):
             return
         assert r.controller.result_record()["state"] not in {"failed", "cancelled"}
     pytest.fail("stationary passive offset prevented holding-probe entry")
+
+
+def start_supported_return_replay(tmp_path, *, mode_wrapper=False):
+    r = replay(tmp_path, mode_wrapper=mode_wrapper)
+    fields = {"operation_mode": "workspace"} if mode_wrapper else {}
+    r.controller.submit("arm", now_sec=r.now, return_and_disable=True, **fields)
+    workspace = r.controller._workspace._coordinated if mode_wrapper else r.controller._coordinated
+    for _ in range(2500):
+        if mode_wrapper:
+            q = list(r.q)
+            if workspace.pose.goal is not None:
+                for i in (1, 2):
+                    q[i] += max(-.00015, min(.00015, workspace.pose.goal[i]-q[i]))
+            r.tick(q, dt_sec=.025)
+        else:
+            scripted_coordinated_tick(r, passive_target=0.)
+        if workspace._probe is not None:
+            return r, workspace
+    pytest.fail("supported-return replay never reached its first probe")
+
+
+def finish_supported_return_replay(r, workspace):
+    for _ in range(3500):
+        if not workspace._active:
+            return
+        if workspace._phase == "stopping":
+            r.tick(dt_sec=.025)
+        else:
+            q = list(r.q)
+            for i in (1, 2):
+                q[i] += max(-.00015, min(.00015, workspace.pose.goal[i]-q[i]))
+            r.tick(q, dt_sec=.025)
+    pytest.fail(str(workspace.result_record()))
+
+
+@pytest.mark.parametrize("mode_wrapper", [False, True])
+def test_supported_return_after_real_leg_deadline_preserves_partial_data_and_owner_budget(tmp_path, mode_wrapper):
+    from scripts.hardware import rebot_b601_rs_low_gain_probe as owner_probe
+
+    r, workspace = start_supported_return_replay(tmp_path, mode_wrapper=mode_wrapper)
+    origin = workspace._supported_origin
+    started, exposure = workspace._started, workspace._exposure
+    # Exercise the real deadline branch, not a manufactured terminal result.
+    workspace._leg_started = r.now-workspace.config.max_sweep_leg_sec
+    finish_supported_return_replay(r, workspace)
+    result = r.controller.result_record()
+    assert result["state"] == "failed" and result["reason"] == "leg_timeout"
+    assert result["outcome"]["severity"] == "warning"
+    assert workspace._return_context["partial_acquisition"] is not None
+    assert result["workspace"]["acquisitions"][-1]["partial_stage"]
+    assert result["workspace"]["completed_joint_acquisitions"] == 0
+    assert workspace._started == started and workspace._exposure >= exposure
+    assert workspace._return_completed and r.controller.automatic_disable_ready
+    assert workspace._zero_base and workspace.pose.quiet()
+    assert all(abs(q-o) <= workspace.workspace.holding_search.movement_rad for q, o in zip(r.q, origin))
+    assert all(t.config.max_reference_velocity_rad_s == workspace.workspace.positioning_velocity_rad_s
+               for t in workspace.pose.trackers)
+    stop = {"requested": False, "full_disable_requested": False}
+    confirmation = {}
+    assert owner_probe._request_supported_return_disable(stop, r.controller, confirmation)
+    assert stop["full_disable_requested"] and confirmation["source"] == "single_cycle_supported_return"
+    assert owner_probe._automatic_execution_status("supported_origin_return_complete", True, 10) == "COMPLETED"
+    payload = {"status": "FAIL", "stop_reason": "supported_origin_return_complete",
+        "execution_status": "COMPLETED", "acceptance_status": "FAIL"}
+    assert owner_probe._finalize_automatic_result(payload, result) == 0
+    assert payload["status"] == "COMPLETED_WITH_WARNINGS"
+    assert payload["acquisition_outcome"]["reason"] == "leg_timeout"
+    assert payload["acceptance_status"] == "FAIL"
+    assert not owner_probe._request_supported_return_disable(stop, r.controller, confirmation)
+    with pytest.raises(ValueError, match="idle owner"):
+        r.controller.submit("arm", now_sec=r.now, return_and_disable=True,
+                            **({"operation_mode": "workspace"} if mode_wrapper else {}))
+
+
+@pytest.mark.parametrize("reason", ["human_intervention", "page_unload", "gui_permit_expired",
+                                  "workspace_timeout", "workspace_command_exposure_budget"])
+def test_supported_return_never_recovers_revoked_authority_or_exhausted_global_budget(tmp_path, reason):
+    r, workspace = start_supported_return_replay(tmp_path)
+    workspace._stop(reason, "cancelled" if reason in {"human_intervention", "page_unload", "gui_permit_expired"} else "failed")
+    finish_supported_return_replay(r, workspace)
+    assert workspace._return_context is None and workspace._return_revoked == reason
+    assert not r.controller.automatic_disable_ready and not workspace._return_completed
+
+
+@pytest.mark.parametrize("failure", ["joint_velocity_exceeded", "workspace_dispatch_clock_or_identity",
+                                   "workspace_feedback_clock_or_gap"])
+def test_supported_return_hardware_fault_does_not_initiate_return_or_disable(tmp_path, failure):
+    r, workspace = start_supported_return_replay(tmp_path)
+    workspace.recording_failed(failure)
+    assert workspace._return_context is None and not r.controller.automatic_disable_ready
+    assert workspace.result_record()["reason"] == failure
+
+
+def test_supported_return_failure_during_return_does_not_recycle_same_soft_failure(tmp_path):
+    r, workspace = start_supported_return_replay(tmp_path)
+    workspace._leg_started = r.now-workspace.config.max_sweep_leg_sec
+    for _ in range(150):
+        r.tick(dt_sec=.025)
+        if workspace._return_context is not None:
+            break
+    assert workspace._phase == "return"
+    workspace._leg_started = r.now-workspace.config.max_sweep_leg_sec
+    finish_supported_return_replay(r, workspace)
+    assert not workspace._return_completed and not r.controller.automatic_disable_ready
+    assert len([record for record in r.records if record["kind"] == "workspace_return_started"]) == 1
+
+
+def test_supported_return_origin_is_first_consumed_stationary_zero_receipt_not_start_click(tmp_path):
+    r = replay(tmp_path)
+    workspace = r.controller._coordinated
+    assert workspace._supported_origin == ZERO
+    for n in range(1, 40):
+        r.tick((0., 0., n*.00015, 0., 0., 0.), dt_sec=.025)
+    for _ in range(12):
+        r.tick(dt_sec=.025)
+    r.controller.submit("arm", now_sec=r.now, return_and_disable=True)
+    r.tick()
+    assert workspace._origin != workspace._supported_origin
+    assert [t["target"] for t in workspace._tasks[-3:-1]] == [0., 0.]
+
+
+@pytest.mark.parametrize("bad", [1, "true", None])
+def test_supported_return_grant_rejects_non_boolean(tmp_path, bad):
+    r = replay(tmp_path)
+    with pytest.raises(TypeError, match="boolean"):
+        r.controller.submit("arm", now_sec=r.now, return_and_disable=bad)
+    assert not r.controller._coordinated._start
+
+
+@pytest.mark.parametrize("revoke", ["human", "withdraw", "page_unload", "owner_fault"])
+def test_supported_return_late_revocation_prevents_automatic_disable(tmp_path, revoke):
+    r, workspace = start_supported_return_replay(tmp_path)
+    workspace._leg_started = r.now-workspace.config.max_sweep_leg_sec
+    finish_supported_return_replay(r, workspace)
+    assert r.controller.automatic_disable_ready
+    if revoke == "human":
+        r.controller.set_human_intervention(True)
+        r.controller.set_human_intervention(False)
+    elif revoke == "owner_fault":
+        workspace.recording_failed("receipt_failed")
+    else:
+        r.controller.submit("withdraw", now_sec=r.now,
+            withdraw_source="page_unload" if revoke == "page_unload" else "operator_button")
+    assert not r.controller.automatic_disable_ready
+
+
+def test_supported_return_still_requires_all_six_axes_at_origin_and_final_zero_receipt(tmp_path):
+    r, workspace = start_supported_return_replay(tmp_path)
+    workspace._leg_started = r.now-workspace.config.max_sweep_leg_sec
+    finish_supported_return_replay(r, workspace)
+    assert r.controller.automatic_disable_ready
+    q = list(r.q)
+    q[3] += workspace.workspace.holding_search.movement_rad*1.01
+    r.tick(q, dt_sec=.025)
+    assert not r.controller.automatic_disable_ready
+    for _ in range(12):
+        r.tick(dt_sec=.025)
+    assert workspace.pose.quiet() and not r.controller.automatic_disable_ready
+    # Matching J2/J3 alone is not proof of the supported six-axis origin.
+    r.tick(workspace._supported_origin, dt_sec=.025)
+    for _ in range(12):
+        r.tick(dt_sec=.025)
+    assert r.controller.automatic_disable_ready
+    r.tick(ack=False)
+    assert not r.controller.automatic_disable_ready
 
 
 def test_position_arrival_accepts_settled_passive_offset_without_retargeting_it(tmp_path):
@@ -2239,7 +2484,8 @@ def test_passive_offset_still_obeys_original_support_excursion_guard(tmp_path):
 
 @pytest.mark.parametrize("direction", [-1, 1])
 @pytest.mark.parametrize("load", [.45, .65])
-def test_loaded_arrival_retains_support_in_declared_inertial_counterexample(tmp_path, direction, load):
+@pytest.mark.parametrize("point_reacquire", [False, True])
+def test_loaded_arrival_retains_support_in_declared_inertial_counterexample(tmp_path, direction, load, point_reacquire):
     # Hypothetical unit inertia, residual load and Coulomb friction, NOT
     # identified B601 dynamics. A small residual-load toy alone cannot expose
     # dropping a destination's support back to a zero departure prior.
@@ -2274,10 +2520,12 @@ def test_loaded_arrival_retains_support_in_declared_inertial_counterexample(tmp_
         assert abs(v) <= core.settings.limits.max_joint_velocity_rad_s
         assert abs(q-goal[2]) <= core.motion.max_reference_lag_rad
         period = core.observe(1+n*dt, (0., .05, q, 0., 0., 0.), (0., 0., v, 0., 0., 0.))
-        command, _ = core.step(sequence=n, dt=period, permitted=True, point_search=False)
+        command, _ = core.step(sequence=n, dt=period, permitted=True,
+            point_search=point_reacquire, point_reacquire=point_reacquire)
         core.record_dispatch(n, command)
         assert sum(abs(u) for u in command) <= core.config.total_assist_cap_nm
-        if core.quiet() and abs(q-goal[2]) <= core.arrival_tolerance_rad:
+        radius = min(core.arrival_tolerance_rad, 2*core.motion.position_resolution_rad) if point_reacquire else core.arrival_tolerance_rad
+        if core.quiet() and abs(q-goal[2]) <= radius:
             quiet_since = core.last_time if quiet_since is None else quiet_since
             if core.last_time-quiet_since >= core.settings.staged_assist.settle_dwell_sec:
                 break
@@ -2316,11 +2564,12 @@ def test_coupled_partial_batch_holds_other_axis_handoffs_and_final_withdrawal(tm
     assert r.controller.cycle_disable_confirmation_ready
 
 
-@pytest.mark.parametrize("period,passive_offset,coverage", [
-    (.01, 0, False), (.01, .006519419, False),
-    (.025, 0, False), (.025, .006519419, False), (.01, 0, True),
+@pytest.mark.parametrize("period,passive_offset,coverage,automatic_return", [
+    (.01, 0, False, False), (.01, .006519419, False, False),
+    (.025, 0, False, False), (.025, .006519419, False, False), (.01, 0, True, False),
+    (.01, 0, True, True),
 ])
-def test_full_coupled_batch_and_report_keep_handoffs_distinct_from_withdrawal(tmp_path, period, passive_offset, coverage, monkeypatch):
+def test_full_coupled_batch_and_report_keep_handoffs_distinct_from_withdrawal(tmp_path, period, passive_offset, coverage, automatic_return, monkeypatch):
     from pathlib import Path
     from types import SimpleNamespace
 
@@ -2349,7 +2598,7 @@ def test_full_coupled_batch_and_report_keep_handoffs_distinct_from_withdrawal(tm
         return {**r.controller.status(), "feedback_age_sec": 0.0}
     journal.record({"action": "context", "human_intervention": False}, snapshot())
     assert snapshot()["calibration_trial"] is None
-    r.controller.submit("arm", now_sec=r.now)
+    r.controller.submit("arm", now_sec=r.now, return_and_disable=automatic_return)
     handoffs = []
     for _ in range(50000):
         state = r.controller.status()["automatic_calibration"]["state"]
@@ -2371,6 +2620,10 @@ def test_full_coupled_batch_and_report_keep_handoffs_distinct_from_withdrawal(tm
             assert audit["point_search_enabled"] == (
                 r.audit["automatic_calibration"]["workspace"]["phase"] == "sweep"
                 and (not coverage or frozen_search))
+            assert audit["point_reacquire_enabled"] == (
+                coverage and r.audit["automatic_calibration"]["workspace"]["phase"] == "sweep"
+                and r.audit["holding_calibration"]["sample_pose_rad"] is not None
+                and r.audit["holding_calibration"]["probe_command_nm"] is None)
         journal.observe(snapshot())
         assert sum(abs(v) for v in r.delta) <= 1+1e-9
         if old != len(r.controller._coordinated._acquisitions):
@@ -2387,6 +2640,7 @@ def test_full_coupled_batch_and_report_keep_handoffs_distinct_from_withdrawal(tm
     assert len(handoffs) == 2 and all(any(abs(v) > 1e-9 for v in h) for h in handoffs)
     assert r.delta == r.last_kd == ZERO
     assert r.controller.cycle_disable_confirmation_ready
+    assert r.controller.automatic_disable_ready == automatic_return
     assert all(abs(r.q[i]-.01) < .003 for i in (1, 2))
     journal.close()
     (tmp_path / "b601_owner.debug.jsonl").write_text("\n".join(json.dumps(x) for x in [*r.records, result])+"\n")
