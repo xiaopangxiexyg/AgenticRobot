@@ -28,6 +28,7 @@ from agent_gateway.protocol.evaluation_contracts import (
     SkillEvaluationReceipt,
 )
 from agent_gateway.protocol.skill_catalog import SkillExecutionRoute
+from agent_gateway.skills.motion.schemas import safe_tcp_pose_goal_policy_v1
 from agent_gateway.runtime.station_operation_worker import (
     StationLifecycleActivationEvidence,
     StationLifecycleControlEvidence,
@@ -37,6 +38,7 @@ from agent_gateway.runtime.station_operation_worker import (
 from dataset_contracts.canonical_encoding import canonical_content_hash
 from robot_motion.action import ComponentAction
 from robot_motion.path_planning import JointConfigurationCheck
+from robot_motion.pose import pose_delta_metrics
 from robot_motion.relative_action import xyzquat_to_pose_matrix
 from robot_motion.target_safety import (
     TCPPoseEnvelopeLifecycleError,
@@ -1043,6 +1045,21 @@ class MujocoAgentTcpPoseSkillLifecycle:
             "execution_receipt_refs": list(refs),
             "final_measured_state_hash": final_state_hash,
         }
+        if self.route.skill_id == "motion.move_tcp_to_pose_safe":
+            requested_public_pose = request.parameters["pose_targets_by_component"][self.component_id]
+            translation_error, rotation_error_deg = pose_delta_metrics(
+                xyzquat_to_pose_matrix(public_final_pose, name="safe_tcp_report_achieved"),
+                xyzquat_to_pose_matrix(requested_public_pose, name="safe_tcp_report_requested"))
+            result["pose_goal_report"] = {
+                "pose_goal_policy": safe_tcp_pose_goal_policy_v1(request.parameters),
+                "reference_frame_id": self.motion_profile.reference_frame_id,
+                "requested_pose_xyz_quat_xyzw": list(requested_public_pose),
+                "achieved_pose_xyz_quat_xyzw": list(public_final_pose),
+                "translation_error_m": translation_error,
+                "rotation_error_rad": math.radians(rotation_error_deg),
+                "arrival_translation_tolerance_m": self.motion_profile.translation_tolerance_m,
+                "arrival_rotation_tolerance_rad": self.motion_profile.rotation_tolerance_rad,
+            }
         return StationLifecycleExecutionCompletion(
             succeeded=True,
             reason_code="tcp_pose_target_reached_and_held",
@@ -1178,11 +1195,18 @@ class MujocoAgentSafeTcpPoseSkillLifecycle(MujocoAgentTcpPoseSkillLifecycle):
                     metadata=projection.to_payload(),
                 )
 
+        preserve_target = safe_tcp_pose_goal_policy_v1(self.request.parameters) == "preserve_target"
         try:
             plan = self._planner.plan(
                 self.target_pose,
-                translation_tolerance_m=self.motion_profile.translation_tolerance_m,
-                rotation_tolerance_rad=self.motion_profile.rotation_tolerance_rad,
+                translation_tolerance_m=(
+                    min(self.motion_profile.translation_tolerance_m, 0.003)
+                    if preserve_target else self.motion_profile.translation_tolerance_m
+                ),
+                rotation_tolerance_rad=(
+                    min(self.motion_profile.rotation_tolerance_rad, math.radians(1.0))
+                    if preserve_target else self.motion_profile.rotation_tolerance_rad
+                ),
                 cancel_requested=cancel_requested,
                 configuration_constraint=constraint,
                 constraint_identity=constraint_identity,

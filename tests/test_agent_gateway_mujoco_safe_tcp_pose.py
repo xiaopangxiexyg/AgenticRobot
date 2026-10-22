@@ -59,7 +59,7 @@ def _session(trace, *, after_fact=None, task=TASK, spatial=False, grasp=False,
     )
 
 
-def _request(session, adapter, target, *, sequence=0, skill_id="motion.move_tcp_to_pose_safe"):
+def _request(session, adapter, target, *, sequence=0, skill_id="motion.move_tcp_to_pose_safe", policy=None):
     observation = adapter.get_observation_snapshot()
     entry = session.contract_bundle.route_manifest.route(
         skill_id, "1"
@@ -92,6 +92,7 @@ def _request(session, adapter, target, *, sequence=0, skill_id="motion.move_tcp_
             "frame_graph_hash": profile.frame_graph_hash,
             "tool_config_hash": profile.tool_config_hash,
             "calibration_hash": profile.calibration_hash,
+            **({"pose_goal_policy": policy} if policy is not None else {}),
         },
         observation_snapshot_id=observation["snapshot_id"],
         requested_mode="sim_active",
@@ -784,3 +785,202 @@ def test_safe_gateway_close_fences_an_inflight_request(record_property):
 @pytest.mark.integration
 def test_left_safe_gateway_close_fences_an_inflight_request(record_property):
     _exercise_safe_gateway_close_fences_an_inflight_request(record_property, "left")
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("policy", [None, "within_arrival_tolerance", "preserve_target"])
+@pytest.mark.parametrize("motion_side", ["left", "right"])
+@pytest.mark.parametrize("task", [TASK, Path("sim/configs/tasks/rm65_right_dmtacm_blue_cube_70mm_agent_v1.json")])
+def test_safe_tcp_consumes_planned_joints_without_re_ik_pose_goal_policy(monkeypatch, record_property, policy, motion_side, task):
+    import agent_gateway.profiles.mujoco.motion_skill as lifecycle_module
+    terminal_hash_inputs = []
+    original_hash = lifecycle_module.canonical_content_hash
+    def capture_terminal_hash(value, *, domain):
+        digest = original_hash(value, domain=domain)
+        if domain == "dexteleop.agent_skill.mujoco_tcp_terminal_state.v1":
+            terminal_hash_inputs.append((dict(value), digest))
+        return digest
+    monkeypatch.setattr(lifecycle_module, "canonical_content_hash", capture_terminal_hash)
+    facts = []
+    session = _session(facts, motion_side=motion_side, task=task)
+    plans = []
+    try:
+        session.application.start_observation_ready()
+        adapter = session.wire_adapter(authenticated_client_id=CLIENT)
+        initial = adapter.get_observation_snapshot()["measurement_summary"][
+            "pose_xyz_quat_xyzw_by_component"
+        ][motion_side + "_arm"]
+        target = list(initial)
+        target[2] += 0.03
+        planner = session.application.target.planned_tcp_motion
+        original = planner.plan
+
+        def capture_plan(*args, **kwargs):
+            profile = session.contract_bundle.motion_profile
+            assert kwargs["translation_tolerance_m"] == (
+                min(profile.translation_tolerance_m, .003) if policy == "preserve_target"
+                else profile.translation_tolerance_m)
+            assert kwargs["rotation_tolerance_rad"] == pytest.approx(
+                min(profile.rotation_tolerance_rad, np.deg2rad(1)) if policy == "preserve_target"
+                else profile.rotation_tolerance_rad)
+            try:
+                plan = original(*args, **kwargs)
+            except MujocoTcpPlanRejected as error:
+                record_property(
+                    "planning_rejection_json", json.dumps(error.details, default=str)
+                )
+                raise
+            plans.append(plan)
+            return plan
+
+        monkeypatch.setattr(planner, "plan", capture_plan)
+        monkeypatch.setattr(
+            session.application.runtime.pose_resolver.ik,
+            "solve",
+            lambda *a, **kw: pytest.fail("Safe path must not be replaced by new IK."),
+        )
+        admitted = adapter.submit_skill_request(
+            _request(session, adapter, target, policy=policy).to_wire()
+        )
+        assert admitted["accepted"]
+        assert session.wait(timeout_sec=35)
+        operation = session.service.operation_store.get(
+            admitted["operation"]["operation_id"]
+        )
+        if operation.status != "completed":
+            record_property(
+                "failure_trace_json",
+                json.dumps([fact.to_payload() for fact in facts[-16:]], default=str),
+            )
+        assert operation.status == "completed", (
+            f"{operation.reason_code}: {operation.progress_summary}"
+        )
+        assert operation.task_outcome == "succeeded", operation
+        report = operation.execution_result["pose_goal_report"]
+        assert report["pose_goal_policy"] == (policy or "within_arrival_tolerance")
+        assert report["reference_frame_id"] == session.contract_bundle.motion_profile.reference_frame_id
+        np.testing.assert_allclose(report["requested_pose_xyz_quat_xyzw"], target)
+        assert report["translation_error_m"] <= report["arrival_translation_tolerance_m"]
+        assert report["rotation_error_rad"] <= report["arrival_rotation_tolerance_rad"]
+        assert len(terminal_hash_inputs) == 1
+        preimage, terminal_hash = terminal_hash_inputs[0]
+        assert operation.execution_result["final_measured_state_hash"] == terminal_hash
+        assert preimage["component_id"] == motion_side + "_arm"
+        assert preimage["reference_frame_id"] == report["reference_frame_id"]
+        np.testing.assert_allclose(preimage["pose_xyz_quat_xyzw"], report["achieved_pose_xyz_quat_xyzw"])
+        measured = np.asarray(report["achieved_pose_xyz_quat_xyzw"], dtype=float)
+        requested = np.asarray(report["requested_pose_xyz_quat_xyzw"], dtype=float)
+        distance = float(np.linalg.norm(measured[:3] - requested[:3]))
+        qa, qb = measured[3:] / np.linalg.norm(measured[3:]), requested[3:] / np.linalg.norm(requested[3:])
+        angle = 2. * float(np.arccos(np.clip(abs(np.dot(qa, qb)), 0., 1.)))
+        assert report["translation_error_m"] == pytest.approx(distance, abs=1e-7)
+        assert report["rotation_error_rad"] == pytest.approx(angle, abs=1e-7)
+        assert len(plans) == 1
+        plan = plans[0]
+        rig_config = session.application.runtime.rig.config
+        effective_velocity = np.minimum(
+            rig_config.max_velocity_rad_s,
+            np.deg2rad(rig_config.max_command_step_deg) * rig_config.timing.command_hz,
+        )
+        certificate = plan.trajectory.metadata["continuous_hard_limit_certificate"]
+        assert np.all(
+            np.asarray(certificate["max_abs_velocity_rad_s"])
+            <= effective_velocity + 1e-7
+        )
+        references = [
+            fact.payload["payload"]["output_values_by_effector"][motion_side + "_arm"]
+            for fact in facts
+            if fact.event_type == "component_execution_target"
+        ]
+        assert len(references) >= len(plan.trajectory.q_rad)
+        np.testing.assert_allclose(
+            references[: len(plan.trajectory.q_rad)], plan.trajectory.q_rad, atol=1e-7
+        )
+        assert any(
+            "mujoco-safe-joint-trajectory:" in ref
+            for ref in operation.execution_receipt_refs
+        )
+        final = adapter.get_observation_snapshot()["measurement_summary"][
+            "pose_xyz_quat_xyzw_by_component"
+        ][motion_side + "_arm"]
+        error = float(np.linalg.norm(np.asarray(final[:3]) - target[:3]))
+        assert error <= session.contract_bundle.motion_profile.translation_tolerance_m
+        assert not planner.active
+        record_property(
+            "evidence_json",
+            json.dumps(
+                {
+                    "plan_hash": plan.trajectory_hash,
+                    "path_metadata": dict(plan.path.metadata),
+                    "reference_count": len(references),
+                    "planned_reference_count": len(plan.trajectory.q_rad),
+                    "target_error_m": error,
+                    "hardware_used": False,
+                },
+                default=str,
+            ),
+        )
+    finally:
+        outcome = session.close()
+        assert outcome.accepted
+
+
+@pytest.mark.integration
+def test_safe_tcp_policy_rejects_invalid_values_before_planning_pose_goal_policy(monkeypatch):
+    session = _session([])
+    try:
+        session.application.start_observation_ready()
+        adapter = session.wire_adapter(authenticated_client_id=CLIENT)
+        pose = adapter.get_observation_snapshot()["measurement_summary"][
+            "pose_xyz_quat_xyzw_by_component"]["right_arm"]
+        planner = session.application.target.planned_tcp_motion
+        monkeypatch.setattr(planner, "plan", lambda *_, **__: pytest.fail("invalid policy reached planner"))
+        request = _request(session, adapter, pose)
+        route = session.contract_bundle.route_manifest.route("motion.move_tcp_to_pose_safe", "1").route
+        schema = session.contract_bundle.schema_catalog.entry("motion.move_tcp_to_pose_safe", "1")
+        assert schema.parameter_schema["properties"]["pose_goal_policy"]["default"] == "within_arrival_tolerance"
+        assert route.parameter_schema_hash == schema.parameter_schema_hash
+        for index, policy in enumerate(("invalid", "", None, True, [], {})):
+            bad = replace(request, request_id=f"invalid-policy:{index}", idempotency_key=f"invalid-policy:{index}",
+                parameters={**request.parameters, "pose_goal_policy": policy})
+            result = adapter.submit_skill_request(bad.to_wire())
+            assert not result["accepted"], result
+        forged = replace(request, request_id="forged-policy-profile", idempotency_key="forged-policy-profile",
+            parameter_profile_hash="0" * 64,
+            parameters={**request.parameters, "pose_goal_policy": "preserve_target"})
+        result = adapter.submit_skill_request(forged.to_wire())
+        assert not result["accepted"], result
+        assert not planner.active
+    finally:
+        assert session.close().accepted
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("motion_side", ["left", "right"])
+def test_preserve_target_reports_existing_arrival_region_without_claiming_exact_convergence(
+    monkeypatch, motion_side, record_property,
+):
+    facts = []
+    session = _session(facts, motion_side=motion_side)
+    try:
+        session.application.start_observation_ready()
+        adapter = session.wire_adapter(authenticated_client_id=CLIENT)
+        component = motion_side + "_arm"
+        target = list(adapter.get_observation_snapshot()["measurement_summary"][
+            "pose_xyz_quat_xyzw_by_component"][component])
+        target[2] += .006
+        request = _request(session, adapter, target, policy="preserve_target")
+        admitted = adapter.submit_skill_request(request.to_wire())
+        assert admitted["accepted"], admitted
+        assert session.wait(timeout_sec=35)
+        operation = session.service.operation_store.get(admitted["operation"]["operation_id"])
+        assert operation.status == "completed" and operation.task_outcome == "succeeded", operation
+        report = operation.execution_result["pose_goal_report"]
+        assert .003 < report["translation_error_m"] <= report["arrival_translation_tolerance_m"]
+        assert not any(f.event_type == "component_execution_target" for f in facts)
+        session.contract_bundle.payload_validators.validate_execution_result(
+            route=session.contract_bundle.route_manifest.route("motion.move_tcp_to_pose_safe", "1").route,
+            payload=operation.execution_result)
+        record_property("pose_goal_report_json", json.dumps(dict(report)))
+    finally:
+        assert session.close().accepted

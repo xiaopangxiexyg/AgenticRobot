@@ -194,6 +194,8 @@ class RM65GraspTrajectoryPlanningConfig:
         0.35,
     )
 
+    pose_goal_policy: str = "within_arrival_tolerance"
+
     def for_tcp_pose_move(
         self, *, translation_tolerance_m: float, rotation_tolerance_rad: float,
     ) -> RM65GraspTrajectoryPlanningConfig:
@@ -213,6 +215,10 @@ class RM65GraspTrajectoryPlanningConfig:
         )
 
     def __post_init__(self) -> None:
+        if not isinstance(self.pose_goal_policy, str) or self.pose_goal_policy not in (
+            "preserve_target", "within_arrival_tolerance",
+        ):
+            raise ValueError("Invalid pose_goal_policy.")
         if not isinstance(self.allow_unconstrained_terminal_fallback, bool):
             raise ValueError("allow_unconstrained_terminal_fallback must be bool.")
         for name in (
@@ -823,13 +829,44 @@ class RM65GraspJointTrajectoryPlanner:
         request._local_chain_cache_lock = threading.Lock()
         return request
 
-    def plan_with_observed_cloud(self, cloud: ObservedObstacleCloud, **kwargs):
+    def _for_pose_goal_policy(
+        self, *, pose_goal_policy: str, require_grasp_approach: bool,
+    ) -> RM65GraspJointTrajectoryPlanner:
+        if not isinstance(pose_goal_policy, str) or pose_goal_policy not in (
+            "preserve_target", "within_arrival_tolerance",
+        ):
+            raise ValueError("Invalid pose_goal_policy.")
+        if require_grasp_approach and pose_goal_policy != "within_arrival_tolerance":
+            raise ValueError("pose_goal_policy is only supported for ordinary safe TCP moves.")
+        config = self.config
+        position = config.endpoint_position_tolerance_m
+        orientation = config.endpoint_orientation_tolerance_deg
+        if pose_goal_policy == "preserve_target":
+            position = min(position, 0.003)
+            orientation = min(orientation, 1.0)
+        if (pose_goal_policy == config.pose_goal_policy
+                and position == config.endpoint_position_tolerance_m
+                and orientation == config.endpoint_orientation_tolerance_deg):
+            return self
+        request = copy(self)
+        request.config = replace(config, pose_goal_policy=pose_goal_policy,
+            endpoint_position_tolerance_m=position,
+            endpoint_orientation_tolerance_deg=orientation)
+        return request
+
+    def plan_with_observed_cloud(
+        self, cloud: ObservedObstacleCloud, *,
+        pose_goal_policy: str = "within_arrival_tolerance", **kwargs,
+    ):
         """Serialize shared target-builder use across observed requests."""
         monotonic = kwargs.get("monotonic", time.perf_counter)
         started = float(monotonic())
         with self._observed_planning_lock:
-            return self.for_observed_cloud(cloud)._plan(
-                _planning_started_at=started, **kwargs)
+            request = self.for_observed_cloud(cloud)._for_pose_goal_policy(
+                pose_goal_policy=pose_goal_policy,
+                require_grasp_approach=kwargs.get("require_grasp_approach", True),
+            )
+            return request._plan(_planning_started_at=started, **kwargs)
 
     def require_static_grasp_scene(
         self, *, qpos_by_side: Mapping[str, np.ndarray], side: str,
@@ -2910,7 +2947,7 @@ class RM65GraspJointTrajectoryPlanner:
         # accepted result is still measured against the original requested
         # pose, the same envelope, and the unchanged production collision
         # clearance.  True penetrations do not activate this rescue.
-        if accepted == [] and clearance_rescue_seeds and (
+        if self.config.pose_goal_policy != "preserve_target" and accepted == [] and clearance_rescue_seeds and (
             deadline is None or float(monotonic()) < deadline
         ):
             _distance, source_seed_index, rescue_seed = max(
@@ -4580,6 +4617,7 @@ class RM65GraspJointTrajectoryPlanner:
                     raise RM65GraspTrajectoryPlanningError(error.reason_code,
                         details={**error.details, "local_continuation_attempts": local_attempts}) from error
                 if (candidate_kind == "requested_pose"
+                        and self.config.pose_goal_policy != "preserve_target"
                         and error.reason_code == "approach_endpoint_clearance_blocked"):
                     # Use the existing bounded endpoint tolerance probes even
                     # when a distant exact IK branch could pass collision.
@@ -5427,12 +5465,17 @@ class RM65GraspJointTrajectoryPlanner:
         monotonic: Callable[[], float] = time.perf_counter,
         require_grasp_approach: bool = True,
         time_budget_sec: float | None = None,
+        pose_goal_policy: str = "within_arrival_tolerance",
     ) -> RealAgentJointTrajectory:
         # Request planners share a mutable target builder with their template.
         # Keep diagnostics inspectable without allowing concurrent plan state.
         started = float(monotonic())
         with self._observed_planning_lock:
-            return self._plan(
+            request = self._for_pose_goal_policy(
+                pose_goal_policy=pose_goal_policy,
+                require_grasp_approach=require_grasp_approach,
+            )
+            return request._plan(
                 qpos_by_side=qpos_by_side, side=side,
                 target_tool_tcp_world=target_tool_tcp_world, speed_scale=speed_scale,
                 visible_scene=visible_scene, monotonic=monotonic,
@@ -6399,6 +6442,29 @@ class RM65GraspJointTrajectoryPlanner:
             samples, side=selected_side, deadline=deadline, monotonic=monotonic)
         if not require_grasp_approach:
             parameterization_metadata["path_search_attempts"] = _plain_search_evidence(search_attempts)
+            self._remaining_path_planning_time_sec(deadline=deadline, monotonic=monotonic,
+                planning_phase="safe_tcp_final_endpoint")
+            with self._solver_lock:
+                achieved = self.target_builder.tool_tcp_world_targets_for_qpos_pair(
+                    left_qpos=samples["left"][-1], right_qpos=samples["right"][-1])[selected_side]
+            self._remaining_path_planning_time_sec(deadline=deadline, monotonic=monotonic,
+                planning_phase="safe_tcp_final_endpoint")
+            position_error, orientation_error = pose_delta_metrics(achieved, target_pose)
+            if (not math.isfinite(position_error) or not math.isfinite(orientation_error)
+                    or position_error > self.config.endpoint_position_tolerance_m
+                    or orientation_error > self.config.endpoint_orientation_tolerance_deg):
+                raise RM65GraspTrajectoryPlanningError("safe_tcp_endpoint_pose_tolerance_exceeded",
+                    details={"position_residual_m": position_error,
+                             "orientation_residual_deg": orientation_error})
+            parameterization_metadata["pose_goal"] = {
+                "pose_goal_policy": self.config.pose_goal_policy,
+                "requested_tool_tcp_world": target_pose.tolist(),
+                "planned_tool_tcp_world": achieved.tolist(),
+                "position_residual_m": position_error,
+                "orientation_residual_deg": orientation_error,
+                "planning_position_tolerance_m": self.config.endpoint_position_tolerance_m,
+                "planning_orientation_tolerance_deg": self.config.endpoint_orientation_tolerance_deg,
+            }
         planning_timing = {
             "clock": "host_perf_counter",
             "pre_path_search_wall_duration_sec": float(

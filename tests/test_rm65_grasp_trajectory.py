@@ -4396,6 +4396,7 @@ def test_observed_planner_template_serializes_builder_and_drops_path_cache(monke
     cls = grasp_trajectory_module.RM65GraspJointTrajectoryPlanner
     template = object.__new__(cls)
     template.observed_obstacles = None
+    template.config = RM65GraspTrajectoryPlanningConfig()
     template._observed_planning_lock = threading.RLock()
     template.target_builder = object()
     template._local_chain_cache = OrderedDict(old='previous-plan')
@@ -5888,3 +5889,335 @@ def test_observed_start_admission_copies_existing_check_without_extra_query(avai
     assert caught.value.details["start_qpos_source"] == "input_qpos"
     assert caught.value.details["start_check"] == grasp_trajectory_module._plain_search_evidence(check.to_dict())
     assert caught.value.details["planning_phase"] == "observed_scene_start_admission"
+
+
+@pytest.mark.parametrize("side", ["left", "right"])
+@pytest.mark.parametrize("policy", ["within_arrival_tolerance", "preserve_target"])
+def test_safe_pose_move_supports_either_arm_without_moving_the_other_pose_goal_policy(side, policy, tmp_path):
+    profile = _real_profile(envelope_profile_name=f"agent_grasp_{side}_absolute_standard_v1.json")
+    builder = build_exclusive_rm65_skill_target_builder(profile)
+    planner = RM65GraspJointTrajectoryPlanner(
+        profile=profile, planning_target_builder=builder,
+        target_envelope_filter=builder.pre_ik_target_safety_filter,
+        trajectory_record_dir=tmp_path,
+    )
+    target_qpos = {name: values.copy() for name, values in SAFE_QPOS.items()}
+    target_qpos[side][0] += 0.03
+    target = builder.tool_tcp_world_targets_for_qpos_pair(
+        left_qpos=target_qpos["left"], right_qpos=target_qpos["right"],
+    )[side]
+    trajectory = planner(qpos_by_side=SAFE_QPOS, side=side,
+        target_tool_tcp_world=target, speed_scale=0.2, require_grasp_approach=False,
+        pose_goal_policy=policy)
+    fixed = "left" if side == "right" else "right"
+    np.testing.assert_array_equal(trajectory.qpos_by_side[fixed],
+        np.broadcast_to(SAFE_QPOS[fixed], trajectory.qpos_by_side[fixed].shape))
+    from teleop_runtime.skill_deploy.grasp_trajectory_record import load_grasp_trajectory_record
+    _, metadata = load_grasp_trajectory_record(next(tmp_path.glob("*.npz")))
+    goal = metadata["parameterization"]["pose_goal"]
+    assert goal["pose_goal_policy"] == policy
+    np.testing.assert_allclose(goal["requested_tool_tcp_world"], target)
+    final = builder.tool_tcp_world_targets_for_qpos_pair(**{
+        name+"_qpos": trajectory.qpos_by_side[name][-1] for name in ("left", "right")})[side]
+    np.testing.assert_allclose(goal["planned_tool_tcp_world"], final)
+    assert goal["position_residual_m"] <= goal["planning_position_tolerance_m"] <= .003
+    assert goal["orientation_residual_deg"] <= goal["planning_orientation_tolerance_deg"] <= 1.
+
+
+@pytest.mark.parametrize("policy", ["within_arrival_tolerance", "preserve_target"])
+@pytest.mark.parametrize("rescue", ["rotation", "translation"])
+def test_safe_pose_local_clearance_rescue_keeps_original_arrival_and_collision_bounds_pose_goal_policy(policy, rescue):
+    planner = _planner_without_assets(config=RM65GraspTrajectoryPlanningConfig().for_tcp_pose_move(
+        translation_tolerance_m=.01, rotation_tolerance_rad=np.deg2rad(5)))
+    planner.target_builder = _CartesianQposBuilder()
+    planner.config = grasp_trajectory_module.replace(planner.config, pose_goal_policy=policy)
+    planner.scene = SimpleNamespace(semantic_content_hash="scene:test")
+    queries = []
+
+    def check(pair):
+        queries.append(pair["right"].copy())
+        # Synthetic occupied points obstruct the exact terminal orientation;
+        # the existing four-degree tolerance probe has full clearance.
+        safe = pair["right"][2] <= .02 or (
+            pair["right"][3] < -.02 if rescue == "rotation" else pair["right"][0] > .0045)
+        return JointConfigurationCheck(safe=safe, minimum_distance_m=.03 if safe else .01)
+
+    planner.oracle = SimpleNamespace(check=check)
+    def global_path(**kwargs):
+        assert policy == "preserve_target"
+        np.testing.assert_array_equal(kwargs["target_tool_tcp_world"], target)
+        raise RM65GraspTrajectoryPlanningError("ik_clearance_blocked")
+    planner._plan_path_leg = global_path
+    contact_checks = []
+    def visible(waypoints, **kwargs):
+        contact_checks.append(kwargs["terminal_tool_tcp_world"])
+        return {"sample_count": len(waypoints)}
+    planner._revalidate_visible_gripper_path = visible
+    current = {name: np.zeros(6) for name in ("left", "right")}
+    target = np.eye(4)
+    target[2, 3] = .03
+    arguments = dict(qpos_by_side=current, side="right",
+        start_tool_tcp_world=np.eye(4), target_tool_tcp_world=target,
+        visible_scene=object(), deadline=10., monotonic=lambda: 0.)
+    if policy == "preserve_target":
+        with pytest.raises(RM65GraspTrajectoryPlanningError, match="ik_clearance_blocked") as caught:
+            planner._plan_safe_pose_leg(**arguments)
+        attempts = caught.value.details["local_continuation_attempts"]
+        assert len(attempts) == 1 and attempts[0]["candidate_kind"] == "requested_pose"
+        assert contact_checks == []
+        return
+    leg = planner._plan_safe_pose_leg(**arguments)
+    attempts = leg.search_attempts
+    assert attempts[0]["reason_code"] == "approach_endpoint_clearance_blocked"
+    accepted = next(item for item in attempts if item.get("status") == "path_found")
+    assert accepted["candidate_kind"] == ("tool_rotation_x_neg" if rescue == "rotation"
+                                           else "world_translation_x_pos")
+    assert leg.endpoint.position_residual_m <= .01
+    assert leg.endpoint.orientation_residual_deg == pytest.approx(4. if rescue == "rotation" else 0.)
+    assert leg.endpoint.position_residual_m == pytest.approx(0. if rescue == "rotation" else .008)
+    assert contact_checks == [None]
+    assert len(queries) > len(leg.path.waypoints)  # Dense checks still run.
+    assert all(check(pair).safe for pair in leg.path.waypoints)
+    assert planner.config.minimum_clearance_m == .02
+    assert planner.config.maximum_proximal_joint_travel_rad == np.pi
+    assert leg.path.metadata["planning_phase"] == "safe_pose_target"
+
+
+@pytest.mark.parametrize("policy", ["within_arrival_tolerance", "preserve_target"])
+def test_safe_pose_local_candidate_still_faces_final_retimed_quality_gate_pose_goal_policy(monkeypatch, policy):
+    profile = _real_profile(envelope_profile_name="agent_grasp_right_absolute_standard_v1.json")
+    builder = build_exclusive_rm65_skill_target_builder(profile)
+    planner = RM65GraspJointTrajectoryPlanner(profile=profile, planning_target_builder=builder,
+        target_envelope_filter=builder.pre_ik_target_safety_filter)
+    start = builder.tool_tcp_world_targets_for_qpos_pair(
+        left_qpos=SAFE_QPOS["left"], right_qpos=SAFE_QPOS["right"])["right"]
+    target = start.copy()
+    target[2, 3] += .01
+    original = planner._require_motion_quality
+    samples = []
+    def quality(values, **kwargs):
+        samples.append(len(values["right"]))
+        if len(samples) == 2:
+            raise RM65GraspTrajectoryPlanningError("grasp_path_motion_quality_exceeded",
+                details={"retimed_rejection": True})
+        return original(values, **kwargs)
+    monkeypatch.setattr(planner, "_require_motion_quality", quality)
+    with pytest.raises(RM65GraspTrajectoryPlanningError, match="grasp_path_motion_quality_exceeded") as caught:
+        planner(qpos_by_side=SAFE_QPOS, side="right", target_tool_tcp_world=target,
+            speed_scale=.3, require_grasp_approach=False, pose_goal_policy=policy)
+    assert caught.value.details["retimed_rejection"]
+    assert len(samples) == 2 and samples[1] > samples[0]
+
+
+@pytest.mark.parametrize("policy", ["within_arrival_tolerance", "preserve_target"])
+def test_endpoint_planner_uses_pose_tolerance_for_positive_gap_clearance_rescue_pose_goal_policy(
+    monkeypatch: pytest.MonkeyPatch, policy,
+) -> None:
+    planner = _planner_without_assets(
+        config=RM65GraspTrajectoryPlanningConfig(
+            maximum_endpoint_solve_cycles=1,
+            endpoint_seed_count=1,
+            pose_goal_policy=policy,
+        )
+    )
+    planner.target_builder = _CartesianQposBuilder()
+    planner.target_envelope_filter = lambda targets: targets
+    current = {side: np.zeros(6) for side in ("left", "right")}
+
+    def solve(*, target_tool_tcp_world, **_kwargs):
+        target = np.asarray(target_tool_tcp_world, dtype=float)
+        candidate = {side: value.copy() for side, value in current.items()}
+        candidate["right"][:3] = target[:3, 3]
+        candidate["right"][3:] = grasp_trajectory_module.Rotation.from_matrix(
+            target[:3, :3]
+        ).as_rotvec()
+        return candidate, 1, 0.0, 0.0
+
+    def check(qpos):
+        displaced = not np.allclose(qpos["right"], 0.0, atol=1e-12, rtol=0.0)
+        return JointConfigurationCheck(
+            safe=displaced,
+            collision_check_available=True,
+            reason=(
+                "collision_clearance_satisfied"
+                if displaced
+                else "collision_clearance_violated"
+            ),
+            minimum_distance_m=0.03 if displaced else 0.003,
+            metadata={
+                "closest_geometry_names": ("arm", "camera_pole"),
+                "closest_obstacle_id": "camera_pole",
+            },
+        )
+
+    planner.oracle = SimpleNamespace(check=check)
+    monkeypatch.setattr(
+        planner,
+        "_endpoint_seed_qpos",
+        lambda *_args, **_kwargs: (current,),
+    )
+    monkeypatch.setattr(planner, "_least_squares_endpoint_from_seed", solve)
+
+    arguments = dict(qpos_by_side=current, side="right", target_tool_tcp_world=np.eye(4))
+    if policy == "preserve_target":
+        monkeypatch.setattr(planner, "_clearance_rescue_target_poses",
+            lambda *_, **__: pytest.fail("strict goal must not generate a replacement pose"))
+        with pytest.raises(RM65GraspTrajectoryPlanningError, match="clearance"):
+            planner._endpoint_qpos_candidates(**arguments)
+        return
+    candidates = planner._endpoint_qpos_candidates(**arguments)
+
+    assert len(candidates) == 1
+    assert candidates[0].orientation_residual_deg < (
+        planner.config.endpoint_orientation_tolerance_deg
+    )
+    assert planner.oracle.check(candidates[0].qpos_by_side).safe is True
+
+
+@pytest.mark.parametrize("observed", [False, True])
+@pytest.mark.parametrize("strict_bounds", [False, True])
+@pytest.mark.parametrize("policy", [None, "within_arrival_tolerance", "preserve_target"])
+def test_safe_pose_policy_covers_both_entries_without_resetting_lock_budget(
+    monkeypatch, observed, strict_bounds, policy,
+):
+    config = RM65GraspTrajectoryPlanningConfig().for_tcp_pose_move(
+        translation_tolerance_m=.01, rotation_tolerance_rad=np.deg2rad(5))
+    if strict_bounds:
+        config = grasp_trajectory_module.replace(config,
+            endpoint_position_tolerance_m=.001, endpoint_orientation_tolerance_deg=.5)
+    planner = _planner_without_assets(config=config)
+    clock = [0.]
+    entered, seen = [], []
+
+    class Lock:
+        def __enter__(self):
+            entered.append(True)
+            clock[0] += .2
+        def __exit__(self, *_):
+            entered.pop()
+
+    planner._observed_planning_lock = Lock()
+    cloud = object()
+    observed_oracle = object()
+    planner.oracle = SimpleNamespace(for_observed_cloud=lambda value: (
+        observed_oracle if value is cloud else pytest.fail("wrong cloud")))
+
+    def plan(request, **kwargs):
+        assert entered == [True]
+        assert kwargs["_planning_started_at"] == pytest.approx(clock[0] - .2)
+        assert kwargs["time_budget_sec"] == .1
+        assert request._solver_lock is planner._solver_lock
+        assert request._observed_planning_lock is planner._observed_planning_lock
+        assert request.oracle is (observed_oracle if observed else planner.oracle)
+        assert request.observed_obstacles is (cloud if observed else None)
+        seen.append(request.config)
+        return "planned"
+
+    monkeypatch.setattr(RM65GraspJointTrajectoryPlanner, "_plan", plan)
+    args = dict(qpos_by_side={s: np.zeros(6) for s in ("left", "right")},
+        side="right", target_tool_tcp_world=np.eye(4), speed_scale=.2,
+        require_grasp_approach=False, time_budget_sec=.1, monotonic=lambda: clock[0])
+    entry = (lambda **kw: planner.plan_with_observed_cloud(cloud, **kw)) if observed else planner
+    assert entry(**args, **({"pose_goal_policy": policy} if policy is not None else {})) == "planned"
+    expected = policy or "within_arrival_tolerance"
+    assert seen[-1].pose_goal_policy == expected
+    assert seen[-1].endpoint_position_tolerance_m == (
+        min(config.endpoint_position_tolerance_m, .003)
+        if expected == "preserve_target" else config.endpoint_position_tolerance_m)
+    assert seen[-1].endpoint_orientation_tolerance_deg == (
+        min(config.endpoint_orientation_tolerance_deg, 1.)
+        if expected == "preserve_target" else config.endpoint_orientation_tolerance_deg)
+    assert entry(**args) == "planned"
+    assert seen[-1] is config  # Default requests retain the cache/config identity.
+    assert planner.config is config and entered == []
+
+
+@pytest.mark.parametrize("observed", [False, True])
+@pytest.mark.parametrize("policy", ["invalid", "", None, True, [], {}])
+def test_safe_pose_policy_invalid_input_stops_both_entries(monkeypatch, observed, policy):
+    planner = _planner_without_assets(config=RM65GraspTrajectoryPlanningConfig())
+    monkeypatch.setattr(RM65GraspJointTrajectoryPlanner, "_plan",
+        lambda *a, **k: pytest.fail("invalid policy reached planning"))
+    planner.oracle = SimpleNamespace(for_observed_cloud=lambda _: object())
+    args = dict(qpos_by_side={s: np.zeros(6) for s in ("left", "right")},
+        side="right", target_tool_tcp_world=np.eye(4), speed_scale=.2,
+        require_grasp_approach=False, pose_goal_policy=policy)
+    with pytest.raises(ValueError, match="pose_goal_policy"):
+        planner.plan_with_observed_cloud(object(), **args) if observed else planner(**args)
+
+
+def test_preserve_target_cannot_change_grasp_approach_policy(monkeypatch):
+    planner = _planner_without_assets(config=RM65GraspTrajectoryPlanningConfig())
+    monkeypatch.setattr(RM65GraspJointTrajectoryPlanner, "_plan",
+        lambda *a, **k: pytest.fail("strict goal reached grasp planning"))
+    with pytest.raises(ValueError, match="only supported"):
+        planner(qpos_by_side=SAFE_QPOS, side="right", target_tool_tcp_world=np.eye(4),
+                speed_scale=.2, pose_goal_policy="preserve_target")
+
+
+def test_safe_pose_policy_keeps_existing_config_positional_constructor():
+    from dataclasses import fields
+    original = RM65GraspTrajectoryPlanningConfig()
+    names = [field.name for field in fields(original) if field.name != "pose_goal_policy"]
+    values = [getattr(original, name) for name in names]
+    values[names.index("final_edge_resolution_rad")] = .0017
+    values[names.index("path_envelope_ingress_waypoint_fractions")] = (.1, .2)
+    rebuilt = RM65GraspTrajectoryPlanningConfig(*values)
+    assert rebuilt.final_edge_resolution_rad == .0017
+    assert rebuilt.path_envelope_ingress_waypoint_fractions == (.1, .2)
+    assert rebuilt.pose_goal_policy == "within_arrival_tolerance"
+
+
+
+@pytest.mark.parametrize("residual", ["translation", "rotation", "deadline", "nan", "inf"])
+def test_safe_pose_checks_final_retimed_endpoint_before_publishing(monkeypatch, tmp_path, residual):
+    profile = _real_profile(envelope_profile_name="agent_grasp_right_absolute_standard_v1.json")
+    builder = build_exclusive_rm65_skill_target_builder(profile)
+    planner = RM65GraspJointTrajectoryPlanner(profile=profile, planning_target_builder=builder,
+        target_envelope_filter=builder.pre_ik_target_safety_filter, trajectory_record_dir=tmp_path)
+    start = builder.tool_tcp_world_targets_for_qpos_pair(
+        left_qpos=SAFE_QPOS["left"], right_qpos=SAFE_QPOS["right"])["right"]
+    target = start.copy()
+    target[2, 3] += .01
+    quality_calls, final_queries = [], []
+    quality = RM65GraspJointTrajectoryPlanner._require_motion_quality
+    fk = builder.tool_tcp_world_targets_for_qpos_pair
+    metrics = grasp_trajectory_module.pose_delta_metrics
+    clock = [0.]
+
+    def check_quality(request, values, **kwargs):
+        result = quality(request, values, **kwargs)
+        quality_calls.append(len(values))
+        return result
+
+    def final_fk(**kwargs):
+        result = fk(**kwargs)
+        if len(quality_calls) == 2:
+            final_queries.append({name: values.copy() for name, values in kwargs.items()})
+            if residual == "deadline":
+                clock[0] = 2.
+            elif residual in ("translation", "rotation"):
+                result = {name: pose.copy() for name, pose in result.items()}
+                if residual == "translation":
+                    result["right"][:3, 3] += .01
+                else:
+                    result["right"][:3, :3] = result["right"][:3, :3] @ Rotation.from_euler(
+                        "x", 3., degrees=True).as_matrix()
+        return result
+
+    def final_metrics(*args, **kwargs):
+        if len(quality_calls) == 2 and residual in ("nan", "inf"):
+            return (float(residual), 0.)
+        return metrics(*args, **kwargs)
+
+    monkeypatch.setattr(RM65GraspJointTrajectoryPlanner, "_require_motion_quality", check_quality)
+    monkeypatch.setattr(builder, "tool_tcp_world_targets_for_qpos_pair", final_fk)
+    monkeypatch.setattr(grasp_trajectory_module, "pose_delta_metrics", final_metrics)
+    reason = ("path_planning_time_budget_exhausted" if residual == "deadline"
+              else "safe_tcp_endpoint_pose_tolerance_exceeded")
+    with pytest.raises(RM65GraspTrajectoryPlanningError, match=reason):
+        planner(qpos_by_side=SAFE_QPOS, side="right", target_tool_tcp_world=target,
+            speed_scale=.2, require_grasp_approach=False, pose_goal_policy="preserve_target",
+            monotonic=lambda: clock[0], time_budget_sec=1.)
+    assert len(quality_calls) == 2 and len(final_queries) == 1
+    assert not list(tmp_path.iterdir())

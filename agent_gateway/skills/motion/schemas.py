@@ -49,6 +49,46 @@ AGENT_MOTION_SCHEMA_KINDS_V1 = (
     "tcp_pose_target",
 )
 
+SAFE_TCP_POSE_GOAL_POLICIES_V1 = ("preserve_target", "within_arrival_tolerance")
+
+
+def safe_tcp_pose_goal_policy_v1(parameters: Mapping[str, Any]) -> str:
+    policy = parameters.get("pose_goal_policy", "within_arrival_tolerance")
+    if not isinstance(policy, str) or policy not in SAFE_TCP_POSE_GOAL_POLICIES_V1:
+        raise ValueError("Invalid pose_goal_policy.")
+    return policy
+
+
+def _pose_goal_report_schema() -> dict[str, Any]:
+    properties = {
+        "pose_goal_policy": {"enum": list(SAFE_TCP_POSE_GOAL_POLICIES_V1)},
+        "reference_frame_id": {"type": "string", "minLength": 1},
+        "requested_pose_xyz_quat_xyzw": {"type": "array", "minItems": 7,
+            "maxItems": 7, "items": {"type": "number"}},
+        "achieved_pose_xyz_quat_xyzw": {"type": "array", "minItems": 7,
+            "maxItems": 7, "items": {"type": "number"}},
+        "translation_error_m": {"type": "number", "minimum": 0},
+        "rotation_error_rad": {"type": "number", "minimum": 0},
+        "arrival_translation_tolerance_m": {"type": "number", "exclusiveMinimum": 0},
+        "arrival_rotation_tolerance_rad": {"type": "number", "exclusiveMinimum": 0},
+    }
+    return {"type": "object", "additionalProperties": False,
+        "properties": properties, "required": list(properties)}
+
+
+def validate_safe_tcp_pose_goal_report_v1(report: Mapping[str, Any]) -> None:
+    if not isinstance(report, Mapping) or set(report) != set(_pose_goal_report_schema()["required"]):
+        raise ValueError("Invalid safe TCP pose_goal_report fields.")
+    safe_tcp_pose_goal_policy_v1(report)
+    _required(report["reference_frame_id"], field_name="reference_frame_id")
+    for field in ("requested_pose_xyz_quat_xyzw", "achieved_pose_xyz_quat_xyzw"):
+        _poses_by_component({"arm": report[field]}, allowed_component_ids=("arm",), field_name=field)
+    for field in ("translation_error_m", "rotation_error_rad",
+                  "arrival_translation_tolerance_m", "arrival_rotation_tolerance_rad"):
+        value = _finite(report[field], field_name=field)
+        if value < 0 or ("tolerance" in field and value == 0):
+            raise ValueError(f"Invalid {field}.")
+
 
 def _required(value: object, *, field_name: str) -> str:
     if not isinstance(value, str):
@@ -201,12 +241,15 @@ def _schema_entry(
             schema_kind="parameter",
         ),
     )
+    result_schema = _execution_result_schema()
+    if skill_id == SAFE_TCP_POSE_TARGET_SKILL_ID_V1:
+        result_schema["properties"]["pose_goal_report"] = _pose_goal_report_schema()
     return AgentSkillSchemaEntry(
         skill_id=skill_id,
         skill_version="1",
         skill_definition_hash=skill_definition_hash,
         parameter_schema=parameter_schema,
-        execution_result_schema=_execution_result_schema(),
+        execution_result_schema=result_schema,
         task_evaluation_schema=_task_evaluation_schema(),
         parameter_profiles=(profile,),
     )
@@ -271,6 +314,18 @@ def tcp_pose_target_schema_entry_v1(
         "tool_config_hash": {"type": "string", "minLength": 1},
         "calibration_hash": {"type": "string", "minLength": 1},
     }
+    if selected_skill_id == SAFE_TCP_POSE_TARGET_SKILL_ID_V1:
+        properties["pose_goal_policy"] = {
+            "type": "string", "enum": list(SAFE_TCP_POSE_GOAL_POLICIES_V1),
+            "default": "within_arrival_tolerance",
+            "description": (
+                "preserve_target aims at the requested pose with the lower precise "
+                "planning bounds and prohibits translation/rotation rescue goals. "
+                "within_arrival_tolerance (also when omitted) retains the existing "
+                "arrival-region planning. Measured arrival tolerances remain "
+                "deployment-owned and are not a claim of exact convergence."
+            ),
+        }
     if maximum_duration is not None:
         properties["requested_duration_ms"] = {
             "type": "integer",
@@ -873,6 +928,8 @@ def validate_agent_motion_parameters_v1(
             )
         return
     if schema_kind == "tcp_pose_target":
+        if "pose_goal_policy" in parameters:
+            safe_tcp_pose_goal_policy_v1(parameters)
         _poses_by_component(
             parameters.get("pose_targets_by_component"),
             allowed_component_ids=components,
@@ -1002,6 +1059,9 @@ def validate_agent_motion_route_schema_v1(
 
 
 __all__ = [
+    "SAFE_TCP_POSE_GOAL_POLICIES_V1",
+    "safe_tcp_pose_goal_policy_v1",
+    "validate_safe_tcp_pose_goal_report_v1",
     "AGENT_MOTION_SCHEMA_KINDS_V1",
     "CARDINAL_TCP_STEP_DIRECTIONS_V1",
     "EXECUTE_GRASP_APPROACH_PLAN_SKILL_ID_V1",

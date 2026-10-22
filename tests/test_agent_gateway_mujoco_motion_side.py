@@ -616,6 +616,7 @@ def _safe_fixture(monkeypatch, side, *, reject_at=None, basis_change=False, plan
         return plan
 
     lifecycle = object.__new__(motion_skill.MujocoAgentSafeTcpPoseSkillLifecycle)
+    lifecycle.request = SimpleNamespace(parameters={})
     lifecycle.component_id = side + "_arm"
     lifecycle.application = SimpleNamespace(tcp_pose_envelope_runtime=SimpleNamespace(project=project))
     lifecycle.motion_profile = SimpleNamespace(max_translation_delta_m=0.1, max_rotation_delta_rad=0.2,

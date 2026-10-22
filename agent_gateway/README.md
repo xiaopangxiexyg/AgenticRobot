@@ -1558,6 +1558,28 @@ v2 保留 v1 的四个参数，并要求显式提供 `target_operation_id`：
 碰撞、路径质量、目标包络和最终轨迹检查，再由原控制 owner 执行，不回退到在线 IK。
 safe planner 的到位容差绑定当前 convergence profile，不改抓取规划的原有配置。
 
+该 Skill 在 real / MuJoCo 上共用可选请求字段 `pose_goal_policy`：
+
+- 省略或 `within_arrival_tolerance`：保留 v1 原有到达区域规划语义；真机可在部署的
+  10 mm / 5° 到达范围内尝试 clearance 平移／旋转救援，小步仍优先局部延续。
+- `preserve_target`：固定调用方请求的 TCP 终点，禁止局部及多分支终点搜索主动改写
+  平移或姿态目标。沿用原 IK、局部延续、全局关节路径搜索和安全／HOLD owner；
+  规划终点按既有 lower 的 3 mm / 1° 检查，部署已有更严容差时保留更严值。
+  MuJoCo 用同样上限审核其既有目标 IK。无满足条件的安全路径就拒绝。
+
+此字段只在 `motion.move_tcp_to_pose_safe@1` 接受，非法枚举拒绝；普通 move-to、抓取靠近
+和各自原参数含义不变。它选择终点语义，不增加全过程姿态约束或携物碰撞能力。
+例如“仅 Z +3 cm、终点姿态保持”可用原有绝对目标加 `"pose_goal_policy": "preserve_target"`。
+
+规划精度与执行到达是两层事实：执行仍按各端既有 arrival 容差、连续实测、完整路径条件和
+下层 HOLD 判定；`preserve_target` 不承诺零误差，也不把到达容差称为精确收敛。
+成功结果增加可选 `pose_goal_report`，包含 `pose_goal_policy`、`reference_frame_id`、
+`requested_pose_xyz_quat_xyzw`、`achieved_pose_xyz_quat_xyzw`、`translation_error_m`、
+`rotation_error_rad` 及 `arrival_translation_tolerance_m` / `arrival_rotation_tolerance_rad`。
+位姿使用请求的公开参考系；achieved 是到达判定使用的实测位姿，不能当作规划目标。
+真机轨迹记录另在 `parameterization.pose_goal` 保存 requested / planned 矩阵、残差及实际规划
+容差。新增可选字段会自动更新 definition / schema / Route 等哈希，消费者须重新发现目录。
+
 在已装配抓取 planner 的部署中，普通 `motion.move_tcp_to_pose@1` 也可复用它的
 `plan_tcp_pose` 做预规划。固定朝向的平移保留笛卡尔直线，调用共用的求解、连续 C2
 时序、硬限制、密集复验和记录路径；它没有携带物碰撞认证或目标接触豁免。
@@ -1580,3 +1602,20 @@ planned_trajectory_dir/observations 留存每次尝试的 snapshot.json、原始
 相机/FK 绑定、障碍与 result.json；可选调试记录使用同一批视图，不再采集。
 path_found 只证明找到规划路径，execution_verified 仍为 false。采集、场景准备、
 规划、记录和请求锁等待都计入剩余操作预算；最后一项落盘后仍检查视图有效期与预算。
+
+
+#### 目标策略的目录迁移与测量口径
+
+本次保留 `motion.move_tcp_to_pose_safe@1`：新增策略是可选项，省略时维持原规划和执行语义。
+参数、结果、definition、I/O 合同、Route 及部署绑定的身份会按内容更新；这是显式的目录迁移。
+客户端应重新发现目录并使用同一批目录中的参数 profile、Route、绑定及授权信息，不能复用旧哈希。
+旧的严格参数验证器会拒绝新增策略，旧的严格结果验证器会拒绝新增报告；新验证器仍接受旧格式请求与结果。
+普通 move-to 与抓取靠近的目录合同不接受这两个新增字段。
+
+real 报告取自触发连续到达判定的不可变测量 cut，与 `final_measured_state_hash` 相同；
+随后仍要求下层确认 HOLD，报告并不声称它是 HOLD 后的再次测量。
+MuJoCo 报告取自原有 HOLD 后复核的最终样本，与其最终状态哈希使用相同公开位姿。
+两端位姿都使用公开参考系，残差从报告发布的 requested / achieved 位姿经下层规范化位姿数学计算，
+旋转单位为弧度；不以规划目标或预测位姿代替实测，也不更改既有到达判定。
+MuJoCo 原有 already-satisfied 路径仍可在执行 arrival 容差内直接确认 HOLD；
+严格策略不会为了达到规划数值上限而强制制造运动，也不保证实测达到 3 mm / 1°。

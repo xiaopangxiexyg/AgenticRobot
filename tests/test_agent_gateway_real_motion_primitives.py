@@ -345,3 +345,76 @@ def test_convergence_profile_is_content_addressed() -> None:
 def test_convergence_profile_requires_positive_hold_confirmation_timeout() -> None:
     with pytest.raises(ValueError, match="hold_confirmation_timeout_sec"):
         RealAgentPrimitiveConvergenceProfile(hold_confirmation_timeout_sec=0.0)
+
+
+@pytest.mark.parametrize("component", ["left_arm", "right_arm"])
+@pytest.mark.parametrize("skill", ["motion.move_tcp_to_pose_safe", "motion.move_tcp_to_pose",
+                                   "motion.approach_grasp_pose"])
+def test_safe_goal_policy_contract_is_confined_to_safe_pose_route(component, skill):
+    attachment, config, graph, envelope = _inputs()
+    side = component.removesuffix("_arm")
+    attachment = replace(attachment, component_ids=(component,))
+    config = replace(config, active_sides=(side,), component_id_by_side={side: component})
+    envelope = replace(envelope, allowed_route_ids=real_agent_motion_route_ids_v1(
+        include_safe_pose=True, include_grasp_approach=True))
+    bundle = build_real_agent_primitive_contract_bundle(attachment=attachment,
+        port_config=config, frame_graph=graph, primitive_reference_frame_id="canonical_station",
+        safety_envelope_refs=(envelope,))
+    profile = bundle.pose_target_profile
+    route = bundle.route_manifest.route(skill, "1").route
+    entry = bundle.schema_catalog.entry(skill, "1")
+    payload = {"pose_targets_by_component": {component: [0., 0., .3, 0., 0., 0., 1.]},
+        "reference_frame_id": profile.reference_frame_id,
+        "reference_frame_spec_hash": profile.reference_frame_spec_hash,
+        "controlled_frame_id": "tool_tcp", "frame_graph_hash": profile.frame_graph_hash,
+        "tool_config_hash": profile.tool_config_hash, "calibration_hash": profile.calibration_hash}
+    bundle.payload_validators.validate_parameters(route=route, payload=payload)
+    safe = skill == "motion.move_tcp_to_pose_safe"
+    assert ("pose_goal_policy" in entry.parameter_schema["properties"]) is safe
+    assert ("pose_goal_report" in entry.execution_result_schema["properties"]) is safe
+    assert "pose_goal_policy" not in entry.parameter_schema["required"]
+    assert "pose_goal_report" not in entry.execution_result_schema["required"]
+    assert route.parameter_schema_hash == entry.parameter_schema_hash
+    if safe:
+        assert entry.parameter_schema["properties"]["pose_goal_policy"]["default"] == "within_arrival_tolerance"
+    for policy in ("preserve_target", "within_arrival_tolerance", "bad", "", None, True, [], {}):
+        if safe and policy in ("preserve_target", "within_arrival_tolerance"):
+            bundle.payload_validators.validate_parameters(route=route,
+                payload={**payload, "pose_goal_policy": policy})
+        else:
+            with pytest.raises((ValueError, TypeError)):
+                bundle.payload_validators.validate_parameters(route=route,
+                    payload={**payload, "pose_goal_policy": policy})
+    legacy_result = {"execution_receipt_refs": ["execution:test"], "final_measured_state_hash": "state:test"}
+    bundle.payload_validators.validate_execution_result(route=route, payload=legacy_result)
+    report = {"pose_goal_policy": "preserve_target", "reference_frame_id": profile.reference_frame_id,
+        "requested_pose_xyz_quat_xyzw": [0., 0., .3, 0., 0., 0., 1.],
+        "achieved_pose_xyz_quat_xyzw": [0., 0., .306, 0., 0., 0., 1.],
+        "translation_error_m": .006, "rotation_error_rad": 0.,
+        "arrival_translation_tolerance_m": .01, "arrival_rotation_tolerance_rad": .1}
+    if safe:
+        bundle.payload_validators.validate_execution_result(route=route,
+            payload={**legacy_result, "pose_goal_report": report})
+    else:
+        with pytest.raises(ValueError):
+            bundle.payload_validators.validate_execution_result(route=route,
+                payload={**legacy_result, "pose_goal_report": report})
+
+
+@pytest.mark.parametrize("changes", [
+    {"extra": True}, {"pose_goal_policy": None}, {"reference_frame_id": " "},
+    {"requested_pose_xyz_quat_xyzw": [0.] * 7},
+    {"achieved_pose_xyz_quat_xyzw": [0., 0., .3, 0., 0., 0., 2.]},
+    {"translation_error_m": True}, {"translation_error_m": float("inf")},
+    {"rotation_error_rad": float("nan")}, {"rotation_error_rad": -.1},
+    {"arrival_translation_tolerance_m": 0.}, {"arrival_rotation_tolerance_rad": -.1},
+])
+def test_safe_pose_goal_report_rejects_malformed_values(changes):
+    from agent_gateway.skills.motion.schemas import validate_safe_tcp_pose_goal_report_v1
+    report = {"pose_goal_policy": "preserve_target", "reference_frame_id": "canonical_station",
+        "requested_pose_xyz_quat_xyzw": [0., 0., .3, 0., 0., 0., 1.],
+        "achieved_pose_xyz_quat_xyzw": [0., 0., .306, 0., 0., 0., 1.],
+        "translation_error_m": .006, "rotation_error_rad": 0.,
+        "arrival_translation_tolerance_m": .01, "arrival_rotation_tolerance_rad": .1}
+    with pytest.raises((ValueError, TypeError)):
+        validate_safe_tcp_pose_goal_report_v1({**report, **changes})

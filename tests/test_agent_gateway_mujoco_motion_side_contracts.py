@@ -101,6 +101,21 @@ RIGHT_EXPORT_SHA256 = {
 }
 
 
+# Explicit pose-goal catalogue migration. Preserve both original 79b6 export
+# tables; only the five reviewed Safe-related extended exports change.
+LEGACY_RIGHT_EXPORT_SHA256 = RIGHT_EXPORT_SHA256
+RIGHT_EXPORT_SHA256 = {
+    "False": LEGACY_RIGHT_EXPORT_SHA256["False"],
+    "True": {**LEGACY_RIGHT_EXPORT_SHA256["True"],
+        'definition_catalog': 'dd0bd376821b44f2dc447ab1461e3fb43b932f8777c120f5bf8282ec76ced8cf',
+        'io_catalog': 'a6fa428bcbca79da7ba65ac60cdbd8f0916cd7e2fea43ba9d6db9dcdb269e43b',
+        'route_manifest': 'd0699c7fc69bf1f3fe676bd30f8cccb6b6986c5f681202b5a0d15568acc34966',
+        'safe_tcp_pose_contract': 'f398ac39fe893ec29edd7c9ceaef1e8fe3d82b3ef71eeaa7c69fb182a2e59832',
+        'schema_catalog': 'c024295cb57ee0bfcf2afe82eb16c69afcfee9d2c733a928417358fe852ac6a7',
+    },
+}
+
+
 def _load_offline(
     monkeypatch, relative, *, omit=(), namespace=None, source=None, names=None
 ):
@@ -440,6 +455,7 @@ def _parameters(bundle, entry):
             )
         },
         "controlled_frame_id": "tool_tcp",
+        "pose_goal_policy": "within_arrival_tolerance",
         "component_id": profile.component_id,
         "component_ids": [profile.component_id],
         "max_measurement_age_ms": 250,

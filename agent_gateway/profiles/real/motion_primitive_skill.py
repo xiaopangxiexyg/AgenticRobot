@@ -27,6 +27,7 @@ from agent_gateway.skills.motion.definition import (
     TCP_POSE_TARGET_SKILL_ID_V1,
 )
 from dataset_contracts.canonical_encoding import canonical_content_hash
+from robot_motion.pose import pose_delta_metrics
 from robot_motion.relative_action import (
     pose_matrix_to_xyzquat,
     xyzquat_to_pose_matrix,
@@ -472,7 +473,9 @@ class RealAgentPrimitiveSkillLifecycle:
                         **({"time_budget_sec": operation.deadline_at - float(self.clock())}
                            if planned_tcp or self.route.skill_id == SAFE_TCP_POSE_TARGET_SKILL_ID_V1
                            else {}),
-                        **({"require_grasp_approach": False}
+                        **({"require_grasp_approach": False,
+                            "pose_goal_policy": self.request.parameters.get(
+                                "pose_goal_policy", "within_arrival_tolerance")}
                            if self.route.skill_id == SAFE_TCP_POSE_TARGET_SKILL_ID_V1 else {}),
                     )
             except RM65GraspTrajectoryPlanningError as exc:
@@ -1118,17 +1121,39 @@ class RealAgentPrimitiveSkillLifecycle:
                         )
                     assert latest_cut is not None
                     refs = tuple(sorted(evidence))
+                    result = {
+                        "execution_receipt_refs": list(refs),
+                        "final_measured_state_hash": latest_cut.semantic_content_hash,
+                    }
+                    if self.route.skill_id == SAFE_TCP_POSE_TARGET_SKILL_ID_V1:
+                        public_measured, _ = self.contract_bundle.frame_graph.transform_pose_matrix(
+                            xyzquat_to_pose_matrix(measured_pose, name="safe_tcp_measured_execution"),
+                            source_reference_frame_id=self.profile.execution_reference_frame_id,
+                            target_reference_frame_id=self.profile.reference_frame_id)
+                        requested_public_pose = self.request.parameters[
+                            "pose_targets_by_component"][self.profile.component_id]
+                        achieved_public_pose = tuple(float(value) for value in pose_matrix_to_xyzquat(
+                            public_measured, name="safe_tcp_measured_public"))
+                        report_translation, report_rotation_deg = pose_delta_metrics(
+                            xyzquat_to_pose_matrix(achieved_public_pose, name="safe_tcp_report_achieved"),
+                            xyzquat_to_pose_matrix(requested_public_pose, name="safe_tcp_report_requested"))
+                        result["pose_goal_report"] = {
+                            "pose_goal_policy": self.request.parameters.get(
+                                "pose_goal_policy", "within_arrival_tolerance"),
+                            "reference_frame_id": self.profile.reference_frame_id,
+                            "requested_pose_xyz_quat_xyzw": list(requested_public_pose),
+                            "achieved_pose_xyz_quat_xyzw": list(achieved_public_pose),
+                            "translation_error_m": report_translation,
+                            "rotation_error_rad": math.radians(report_rotation_deg),
+                            "arrival_translation_tolerance_m": self.contract_bundle.convergence_profile.translation_tolerance_m,
+                            "arrival_rotation_tolerance_rad": self.contract_bundle.convergence_profile.rotation_tolerance_rad,
+                        }
                     return StationLifecycleExecutionCompletion(
                         succeeded=True,
                         reason_code="real_primitive_completed_after_lower_hold",
                         execution_receipt_refs=refs,
                         terminal_hold_confirmed=True,
-                        execution_result={
-                            "execution_receipt_refs": list(refs),
-                            "final_measured_state_hash": (
-                                latest_cut.semantic_content_hash
-                            ),
-                        },
+                        execution_result=result,
                     )
             self.sleep(self.contract_bundle.convergence_profile.poll_interval_sec)
         return self._failed_execution(

@@ -69,6 +69,7 @@ from agent_gateway.skills.motion.schemas import (
     fixed_cardinal_tcp_step_schema_entry_v1,
     fixed_level_tcp_orientation_schema_entry_v1,
     tcp_pose_target_schema_entry_v1,
+    validate_safe_tcp_pose_goal_report_v1,
     validate_agent_motion_parameters_v1,
     validate_agent_motion_route_schema_v1,
 )
@@ -1299,7 +1300,8 @@ def _motion_validators(
     }
 
     def validate_parameters(payload: Mapping[str, Any]) -> None:
-        if not isinstance(payload, Mapping) or set(payload) != parameter_fields:
+        optional = {"pose_goal_policy"} if route.skill_id == "motion.move_tcp_to_pose_safe" else set()
+        if not isinstance(payload, Mapping) or not parameter_fields <= set(payload) <= parameter_fields | optional:
             raise ValueError("TCP pose target must exactly match its profile schema.")
         validate_agent_motion_parameters_v1(
             schema_kind="tcp_pose_target",
@@ -1332,11 +1334,12 @@ def _motion_validators(
             raise ValueError("TCP pose target is outside the profile workspace.")
 
     def validate_execution_result(payload: Mapping[str, Any]) -> None:
-        if not isinstance(payload, Mapping) or set(payload) != {
-            "execution_receipt_refs",
-            "final_measured_state_hash",
-        }:
+        required = {"execution_receipt_refs", "final_measured_state_hash"}
+        optional = {"pose_goal_report"} if route.skill_id == "motion.move_tcp_to_pose_safe" else set()
+        if not isinstance(payload, Mapping) or not required <= set(payload) <= required | optional:
             raise ValueError("TCP pose execution result schema mismatch.")
+        if "pose_goal_report" in payload:
+            validate_safe_tcp_pose_goal_report_v1(payload["pose_goal_report"])
         refs = payload["execution_receipt_refs"]
         if (
             not isinstance(refs, (tuple, list))

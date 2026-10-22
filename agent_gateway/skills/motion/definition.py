@@ -154,6 +154,10 @@ def safe_tcp_pose_target_skill_definition_v1(
         summary=(
             "Move one selected arm tool_tcp to an absolute pose after finding "
             "and validating a collision-free joint path in the deployed scene. "
+            "Optional pose_goal_policy=preserve_target keeps the requested goal "
+            "without translation/rotation rescue; omitted or "
+            "within_arrival_tolerance retains deployment arrival-region planning. "
+            "Execution reports requested versus achieved pose under arrival bounds. "
             "Unknown obstacles and unmodeled carried objects are not covered. "
             "No path means no motion; never fall back to an unchecked pose move."
         ),

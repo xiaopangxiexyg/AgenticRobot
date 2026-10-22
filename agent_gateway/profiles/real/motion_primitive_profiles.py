@@ -65,6 +65,7 @@ from agent_gateway.skills.motion.schemas import (
     fixed_cardinal_tcp_step_schema_entry_v1,
     fixed_level_tcp_orientation_schema_entry_v1,
     tcp_pose_target_schema_entry_v1,
+    validate_safe_tcp_pose_goal_report_v1,
     validate_agent_motion_parameters_v1,
     validate_agent_motion_route_schema_v1,
 )
@@ -915,6 +916,8 @@ def _payload_validator(
         allowed_parameter_fields = (
             parameter_fields | {"speed_scale"} if pose_target else parameter_fields
         )
+        if route.skill_id == SAFE_TCP_POSE_TARGET_SKILL_ID_V1:
+            allowed_parameter_fields |= {"pose_goal_policy"}
         if (
             not isinstance(payload, Mapping)
             or not parameter_fields <= payload_fields <= allowed_parameter_fields
@@ -988,11 +991,13 @@ def _payload_validator(
                 raise ValueError("Fixed cardinal Skill direction changed.")
 
     def validate_execution_result(payload: Mapping[str, Any]) -> None:
-        if not isinstance(payload, Mapping) or set(payload) != {
-            "execution_receipt_refs",
-            "final_measured_state_hash",
-        }:
+        required = {"execution_receipt_refs", "final_measured_state_hash"}
+        allowed = required | ({"pose_goal_report"}
+            if route.skill_id == SAFE_TCP_POSE_TARGET_SKILL_ID_V1 else set())
+        if not isinstance(payload, Mapping) or not required <= set(payload) <= allowed:
             raise ValueError("Real primitive result schema mismatch.")
+        if "pose_goal_report" in payload:
+            validate_safe_tcp_pose_goal_report_v1(payload["pose_goal_report"])
         refs = payload["execution_receipt_refs"]
         if (
             not isinstance(refs, (tuple, list))

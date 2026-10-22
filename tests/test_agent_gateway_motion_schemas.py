@@ -358,7 +358,7 @@ def test_motion_skill_definition_hashes_match_protocol_v2_domains() -> None:
             "595e9c6f4c34cc1629e5a973268cd91b1c9490d8b8064a662c437465b0f7930c"
         ),
         "motion.move_tcp_to_pose_safe": (
-            "74fc01559bb1441d8d486beb8a2b81b87a35e4a959842b53a81c9af55cf59457"
+            "dcf19df2fc402065a3f40f1e7383120b233fbea9514eb06a0b83ddd546fc5a12"
         ),
         "motion.step_tcp_cardinal": (
             "28c5d8cd1315785b4287fad3fe2e926cf17cc1650ebd0f99cee6451113550249"
