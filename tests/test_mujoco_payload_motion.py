@@ -1,13 +1,16 @@
 """Native attached-geometry queries and measured guards; no physics stepping."""
 
 import math
+import threading
 import time
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
 
+from robot_motion.action import BIMANUAL_EE_POSE_V1, RobotAction
 from robot_motion.path_planning import JointConfigurationCheck
+from robot_motion.relative_action import pose_matrix_to_xyzquat
 from sim.mujoco.collision_safety import KinematicCollisionProjector
 from sim.mujoco.collision_safety.policy import CollisionSafetyPolicy
 from sim.mujoco.deploy import planned_tcp_motion as motion
@@ -23,7 +26,7 @@ def _pose(data, model, name):
 
 
 def _scene(*, shape="box", extra="", table=False, table_shape="plane", second_geom=False,
-           sensor_y=.0245, table_mocap=False):
+           sensor_y=.0245, table_mocap=False, payload_side="right"):
     import mujoco
 
     def joints_for(side):
@@ -44,12 +47,13 @@ def _scene(*, shape="box", extra="", table=False, table_shape="plane", second_ge
         table_xml = table_xml.replace('<body name="table"', '<body name="table" mocap="true"')
     tail = '''<geom name="payload_tail" pos=".07 0 0" type="box" size=".01 .01 .01"
       contype="8" conaffinity="15"/>''' if second_geom else ""
+    passive_side = "left" if payload_side == "right" else "right"
     model = mujoco.MjModel.from_xml_string(f'''<mujoco>{asset}<option gravity="0 0 0"/>
       <worldbody>
-        <body name="left_tool" pos="-2 0 .4">{joints_for("left")}
+        <body name="passive_tool" pos="-2 0 .4">{joints_for(passive_side)}
           <geom name="left_arm_geom" type="sphere" size=".01" contype="2" conaffinity="15"/>
         </body>
-        <body name="tool" pos="0 0 .4">{joints_for("right")}
+        <body name="tool" pos="0 0 .4">{joints_for(payload_side)}
           <geom name="right_arm_geom" pos="-.2 0 0" type="sphere" size=".01" contype="2" conaffinity="15"/>
           <body name="sensor_left_body" pos=".08 {-sensor_y:.9f} 0"><geom name="sensor_left"
             type="box" size=".01 .01 .01" contype="4" conaffinity="15"/></body>
@@ -100,6 +104,66 @@ def _pair(oracle, *, x=0., y=0., z=0., yaw=0.):
     result = {side: oracle.source.qpos[indices].copy() for side, indices in oracle.addresses.items()}
     result["right"][:] = (x, y, z, 0., 0., yaw)
     return result
+
+
+def _planner(scene, monkeypatch, *, side="right"):
+    """Native query/resolver fixture; analytic IK is not an RM65 acceptance."""
+    class Projector:
+        def project(self, *, model_qpos, qpos_by_source, component_ids):
+            data = scene.mujoco.MjData(scene.model)
+            data.qpos[:] = model_qpos
+            for name, q in qpos_by_source.items():
+                for joint, value in zip(scene.arm_specs[name].joint_names, q):
+                    data.qpos[scene.joint_qpos_addr(joint)] = value
+            scene.mujoco.mj_kinematics(scene.model, data)
+            return {side + "_arm": tuple(pose_matrix_to_xyzquat(_pose(data, scene.model, "tool")))}
+
+    guard = {"oracle": None, "lock_depth": 0}
+    lock = threading.RLock()
+
+    def capture(callback):
+        with lock:
+            guard["lock_depth"] += 1
+            try:
+                return callback(scene)
+            finally:
+                guard["lock_depth"] -= 1
+
+    def install(value):
+        assert guard["lock_depth"] > 0 or value is None
+        guard["oracle"] = value
+
+    scene.body_pose = lambda name: np.eye(4)
+    rig = SimpleNamespace(scene=scene, capture_scene=capture,
+        measured_qpos_by_side=scene.arm_qpos_by_side, set_additional_contact_oracle=install,
+        config=SimpleNamespace(max_velocity_rad_s=(1.,) * 6, max_acceleration_rad_s2=(2.,) * 6,
+            max_command_step_deg=5., velocity_ramp_sec=.2, timing=SimpleNamespace(command_hz=60.)))
+    planner = motion.MujocoPlannedTcpMotion(rig=rig,
+        task_config=SimpleNamespace(left_tool_profile_path="unused", right_tool_profile_path="unused"),
+        pose_projector=Projector(), reference_hz=60., motion_side=side)
+
+    def fk(q):
+        return motion.xyzquat_to_matrix(planner.pose_for_configuration(scene.data.qpos, {side: q}))
+
+    def solve(**kwargs):
+        return np.array([*kwargs["target_pose"][:3, 3] - (0, 0, .4), 0., 0., 0.])
+
+    planner._solver = SimpleNamespace(q_min=np.full(6, -2.), q_max=np.full(6, 2.),
+        compute_pose=fk, solve_iterative=solve)
+    monkeypatch.setattr(motion, "load_rm65_tool_profile", lambda *args, **kwargs: None)
+    monkeypatch.setattr(motion, "endpoint_to_tool_transform", lambda _: np.eye(4))
+    return planner, guard
+
+
+def _plan(planner, binding, *, x=0., z=.03, **kwargs):
+    return planner.plan((x, 0., .4 + z, 0., 0., 0., 1.),
+        translation_tolerance_m=.001, rotation_tolerance_rad=.01,
+        cancel_requested=lambda: False, payload_binding=binding, **kwargs)
+
+
+def _action(planner, pose):
+    return RobotAction(action_space=BIMANUAL_EE_POSE_V1,
+                       arm_pose_by_side={planner.motion_side: pose})
 
 
 @pytest.mark.unit
@@ -685,3 +749,244 @@ def test_full_signature_is_boundary_only_and_record_narrow_native_cost(monkeypat
     record_property("narrow_native_candidate_us", candidate_s * 1e6)
     record_property("narrow_native_actual_guard_us", actual_s * 1e6)
     record_property("narrow_native_measured_api_us", measured_api_s * 1e6)
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("side", ["left", "right"])
+def test_payload_owned_plan_resolves_exact_references_and_clear_releases_only_guard(monkeypatch, side):
+    scene = _scene(table=True, payload_side=side)
+    binding = _binding(scene, support=_support())
+    planner, installed = _planner(scene, monkeypatch, side=side)
+    before = scene.data.qpos.copy()
+    plan = _plan(planner, binding)
+    assert plan.payload_binding is binding
+    assert len(plan.reference_poses) == len(plan.trajectory.q_rad) > 2
+    assert installed["oracle"] is None and not planner.active
+    planner.activate(plan)
+    assert installed["oracle"] is binding.contact_oracle(scene)
+    reference = planner.reference(0)
+    from sim.mujoco.deploy import payload_motion
+
+    def forbidden_hash(*args):
+        raise AssertionError("A live reference must not rehash immutable CAD")
+
+    with monkeypatch.context() as context:
+        context.setattr(payload_motion, "_model_signature", forbidden_hash)
+        answer = planner.resolve(_action(planner, reference))
+    assert answer.success and answer.qpos_by_side[side] == plan.trajectory.q_rad[0].tolist()
+    np.testing.assert_array_equal(scene.data.qpos, before)
+    planner.clear()
+    planner.clear()
+    assert installed["oracle"] is None and not planner.active
+    assert binding.check_measured(scene).safe
+    with pytest.raises(motion.MujocoTcpPlanRejected, match="reference_not_selected"):
+        planner.resolve(_action(planner, reference))
+    with pytest.raises(motion.MujocoTcpPlanRejected, match="not_owned"):
+        planner.activate(plan)
+
+
+@pytest.mark.integration
+def test_payload_preview_cannot_activate_or_replace_owned_plan(monkeypatch):
+    scene = _scene()
+    binding = _binding(scene)
+    planner, installed = _planner(scene, monkeypatch)
+    owned = _plan(planner, binding)
+    preview = _plan(planner, binding, preview_model_qpos=scene.data.qpos)
+    with pytest.raises(motion.MujocoTcpPlanRejected, match="not_owned"):
+        planner.activate(preview)
+    assert planner._pending_plan is owned and installed["oracle"] is None
+    planner.activate(owned)
+    planner.clear()
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("changed_part", ["arm", "object"])
+def test_payload_preview_must_retain_frozen_cut_and_keeps_original_owned_plan(monkeypatch, changed_part):
+    scene = _scene()
+    binding = _binding(scene)
+    planner, installed = _planner(scene, monkeypatch)
+    owned = _plan(planner, binding)
+    preview_source = scene.data.qpos.copy()
+    address = (scene.joint_qpos_addr("right_z") if changed_part == "arm" else
+        int(scene.model.jnt_qposadr[scene.model.body_jntadr[scene.model.body("payload").id]]))
+    preview_source[address] += .001
+    before = scene.data.qpos.copy()
+    with pytest.raises(ValueError, match="binding's exact same-cut source qpos"):
+        _plan(planner, binding, preview_model_qpos=preview_source)
+    assert planner._pending_plan is owned and installed["oracle"] is None and not planner.active
+    np.testing.assert_array_equal(scene.data.qpos, before)
+    assert scene.data.time == 0.
+    planner.clear()
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("change", ["slip", "geometry", "mocap"])
+def test_payload_activation_checks_actual_state_before_installing_guard(monkeypatch, change):
+    scene = _scene(extra='''<body name="foreign" mocap="true" pos="1 0 .4">
+      <geom type="box" size=".004 .004 .004" contype="8" conaffinity="15"/></body>''')
+    binding = _binding(scene)
+    planner, installed = _planner(scene, monkeypatch)
+    plan = _plan(planner, binding)
+    if change == "slip":
+        address = int(scene.model.jnt_qposadr[scene.model.body_jntadr[scene.model.body("payload").id]])
+        scene.data.qpos[address] += .004
+    elif change == "geometry":
+        scene.model.geom_size[scene.model.geom("payload_geom").id, 0] += .01
+    else:
+        scene.data.mocap_pos[0] = (.08, 0., .4)
+    with pytest.raises((ValueError, motion.MujocoTcpPlanRejected)):
+        planner.activate(plan)
+    assert installed["oracle"] is None and not planner.active
+
+
+@pytest.mark.integration
+def test_payload_live_sweep_uses_full_current_cut_under_rig_lock_without_reanchoring(monkeypatch):
+    scene = _scene(extra='''<body name="foreign" mocap="true" pos="1 0 .4">
+      <geom type="box" size=".004 .004 .004" contype="8" conaffinity="15"/></body>''')
+    planner, installed = _planner(scene, monkeypatch)
+    guard_calls = []
+
+    def measured_guard(data):
+        assert installed["lock_depth"] > 0
+        guard_calls.append(float(data.time))
+        return JointConfigurationCheck(safe=True)
+
+    binding = planner.rig.capture_scene(lambda s: _binding(
+        s, measured_guard=measured_guard, guard_identity="test:one-current-observer"))
+    frozen = binding.tool_from_object
+    plan = _plan(planner, binding)
+    planner.activate(plan)
+    # Deterministic native cut perturbation, not a physical transport claim.
+    scene.data.time = .002
+    scene.data.qvel[:] = .1
+    scene.data.qpos[scene.joint_qpos_addr("right_z")] += .004
+    address = int(scene.model.body_jntadr[scene.model.body("payload").id])
+    scene.data.qpos[int(scene.model.jnt_qposadr[address]) + 2] += .004
+    scene.data.mocap_pos[0, 2] += .03
+    planner._reference_index = len(plan.reference_poses) - 1
+    before = scene.data.qpos.copy()
+    count = len(guard_calls)
+    assert planner.resolve(_action(planner, plan.reference_poses[-1])).success
+    assert len(guard_calls) == count + 1
+    source = planner._live_oracle.source
+    for name in ("qpos", "qvel", "mocap_pos", "mocap_quat", "eq_active"):
+        np.testing.assert_array_equal(getattr(source, name), getattr(scene.data, name))
+    assert source.time == scene.data.time and binding.tool_from_object == frozen
+    np.testing.assert_array_equal(scene.data.qpos, before)
+    planner.clear()
+
+
+@pytest.mark.integration
+def test_payload_dispatch_rejects_new_swept_obstacle_then_actual_slip(monkeypatch):
+    scene = _scene(extra='''<body name="foreign" mocap="true" pos="1 0 .4">
+      <geom type="box" size=".004 .004 .004" contype="8" conaffinity="15"/></body>''')
+    binding = _binding(scene)
+    planner, installed = _planner(scene, monkeypatch)
+    plan = _plan(planner, binding, x=.3, z=0.)
+    planner.activate(plan)
+    planner._reference_index = len(plan.reference_poses) - 1
+    action = _action(planner, plan.reference_poses[-1])
+    scene.data.mocap_pos[0] = (.425, 0., .4)
+    with pytest.raises(motion.MujocoTcpPlanRejected, match="live_reference_sweep_blocked"):
+        planner.resolve(action)
+    address = int(scene.model.jnt_qposadr[scene.model.body_jntadr[scene.model.body("payload").id]])
+    scene.data.qpos[address] += .004
+    with pytest.raises(motion.MujocoTcpPlanRejected, match="payload_measured_blocked"):
+        planner.resolve(action)
+    assert installed["oracle"] is binding.contact_oracle(scene)
+    planner.clear()
+
+
+@pytest.mark.integration
+def test_payload_shared_measured_guard_rejects_without_publishing_query_history(monkeypatch):
+    scene = _scene()
+    allowed = True
+    binding = _binding(scene, measured_guard=lambda data: JointConfigurationCheck(safe=allowed),
+                       guard_identity="test:existing-observer")
+    planner, installed = _planner(scene, monkeypatch)
+    plan = _plan(planner, binding)
+    planner.activate(plan)
+    allowed = False
+    with pytest.raises(motion.MujocoTcpPlanRejected, match="payload_measured_blocked"):
+        planner.resolve(_action(planner, planner.reference(0)))
+    assert installed["oracle"] is binding.contact_oracle(scene)
+    planner.clear()
+
+
+@pytest.mark.integration
+def test_payload_resolve_retains_passive_arm_and_configuration_constraints(monkeypatch):
+    scene = _scene()
+    binding = _binding(scene)
+    planner, _ = _planner(scene, monkeypatch)
+    allowed = True
+    constraint = lambda source, pair: JointConfigurationCheck(safe=allowed, reason="test:constraint")
+    plan = _plan(planner, binding, configuration_constraint=constraint, constraint_identity="test:fixed")
+    planner.activate(plan)
+    action = _action(planner, planner.reference(0))
+    allowed = False
+    with pytest.raises(motion.MujocoTcpPlanRejected, match="live_reference_constraint_blocked"):
+        planner.resolve(action)
+    allowed = True
+    scene.data.qpos[scene.joint_qpos_addr("left_x")] += .002
+    with pytest.raises(motion.MujocoTcpPlanRejected, match="passive_arm_changed"):
+        planner.resolve(action)
+    planner.clear()
+
+
+@pytest.mark.integration
+def test_payload_invalid_binding_mix_and_tool_side_fail_closed(monkeypatch):
+    scene = _scene()
+    binding = _binding(scene)
+    planner, installed = _planner(scene, monkeypatch)
+    with pytest.raises(TypeError, match="MujocoPayloadBinding"):
+        _plan(planner, True)
+    with pytest.raises(ValueError, match="distinct operation bindings"):
+        _plan(planner, binding, contact_binding=MujocoGraspContactBinding(
+            "payload", ("sensor_left", "sensor_right")))
+    # A wrong calibration callback cannot attach a payload to another TCP.
+    wrong_base = np.eye(4)
+    wrong_base[0, 3] = .1
+    planner.scene.body_pose = lambda name: wrong_base
+    with pytest.raises(motion.MujocoTcpPlanRejected, match="payload_tool_frame_mismatch"):
+        _plan(planner, binding)
+    assert installed["oracle"] is None and not planner.active
+
+
+@pytest.mark.integration
+def test_payload_cancelled_plan_and_failed_guard_install_do_not_become_active(monkeypatch):
+    scene = _scene()
+    binding = _binding(scene)
+    planner, installed = _planner(scene, monkeypatch)
+    with pytest.raises(motion.MujocoTcpPlanRejected, match="planning_cancelled"):
+        planner.plan((0., 0., .43, 0., 0., 0., 1.),
+            translation_tolerance_m=.001, rotation_tolerance_rad=.01,
+            cancel_requested=lambda: True, payload_binding=binding)
+    assert planner._pending_plan is None and not planner.active and installed["oracle"] is None
+    plan = _plan(planner, binding)
+
+    def reject_install(oracle):
+        raise RuntimeError("test:scoped guard installation unavailable")
+
+    monkeypatch.setattr(planner.rig, "set_additional_contact_oracle", reject_install)
+    with pytest.raises(RuntimeError, match="installation unavailable"):
+        planner.activate(plan)
+    assert planner._pending_plan is plan and not planner.active and installed["oracle"] is None
+    assert not planner._contact_guard_bound
+    planner.clear()
+
+
+@pytest.mark.integration
+def test_payload_timestep_change_invalidates_active_guard_without_dispatch(monkeypatch):
+    scene = _scene()
+    binding = _binding(scene)
+    planner, installed = _planner(scene, monkeypatch)
+    plan = _plan(planner, binding)
+    planner.activate(plan)
+    action = _action(planner, planner.reference(0))
+    before = scene.data.qpos.copy()
+    scene.model.opt.timestep *= .5
+    with pytest.raises(ValueError, match="timestep changed"):
+        planner.resolve(action)
+    np.testing.assert_array_equal(scene.data.qpos, before)
+    assert installed["oracle"] is binding._measured_oracle
+    planner.clear()

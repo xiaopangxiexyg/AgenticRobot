@@ -318,7 +318,7 @@ This is an interactive GLFW viewer, so Linux requires `DISPLAY` or
 `WAYLAND_DISPLAY`. `MUJOCO_GL=egl` and `MUJOCO_GL=osmesa` are offscreen render
 options and do not provide an interactive desktop window.
 
-## 显式携物几何查询（无动作）
+## 显式携物几何与规划绑定
 
 `sim.mujoco.deploy.payload_motion` 提供可选的 `MujocoPayloadBinding` 与
 `MujocoPayloadProjector`。`MujocoJointSceneOracle(..., payload_binding=binding)`
@@ -343,9 +343,25 @@ options and do not provide an interactive desktop window.
 直接 projector 点查询也检查冻结 cut；扫掠起点必须是当前实测 cut。扫掠的源几何／关系检查
 不发布新的实测历史或调用外部观测器，不是完整抓持验证或执行授权。
 
+`MujocoPlannedTcpMotion.plan(..., payload_binding=binding)` 将绑定纳入原有 IK、
+BiRRT-Connect、C2 重定时和逐参考检查，仍返回本实例独占的不可变计划。
+携物查询使用绑定的冻结 cut；显式 preview 不替换待执行计划，也不能被激活。
+携物 preview 同样拒绝不同源 cut；如需当前新状态，须在原 rig 锁内重新捕获绑定，
+继续传入原始手物关系，不能用任意 preview qpos 绕过冻结来源。
+标定 world-TCP 必须与本实例所选左右臂的执行 TCP 一致，不能用另一只手的绑定规划。
+
+激活时复核模型、两臂起点和当前实测关系，只有检查通过后才把绑定的同一个实测 oracle
+挂到既有 position rig 的附加物理 guard；canonical guard 仍先执行。
+逐参考 resolve 在原 rig 锁内复核实测并复制完整当前 `MjData`，包括 time、qvel、
+mocap 和 equality 输入，再检查被动臂、原有 configuration constraint 及完整携物扫掠。
+冻结查询与当前扫掠各自保留来源要求；当前扫掠不重新锚定，也不发布候选的接触历史。
+新障碍、滑移、错误参考或失效绑定均拒绝，不投影成另一条未经规划的指令。
+
+`clear()` 撤销本次计划、参考和附加 guard，重复调用无副作用；绑定本身的实测接口及
+原 observer 不被清除，调用方继续负责释放前后的持续观测。
 这一层不拥有 physics、调度或 dispatch，不证明抓持成功，也不授予携物执行权限。
-本批尚未把它接入 `MujocoPlannedTcpMotion.plan` 或发布携物 Gateway Route；原有运动与
-单帧默认行为不变。接通完整执行链时仍须成套绑定规划、实际物理 guard、HOLD／取消及清理，
+携物 Gateway Route／上层生命周期尚未装配；原有运动与单帧默认行为不变。
+公开该 Route 前仍须成套绑定同一 observer、HOLD／取消／释放／close，并完成原生验收；
 不能把 `approach_grasp_contact` 当作携物抬升接口。
 
 ## DMTAC CAD 方块接触诊断（仅离线）
