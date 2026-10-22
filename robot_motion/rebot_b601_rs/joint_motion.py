@@ -774,6 +774,8 @@ class B601JointMotionTracker:
             elif self._brake_reason == "target_reached_braking":
                 if abs(self._target - q) > self.config.max_reference_lag_rad:
                     self._brake_reason = "reference_lag_braking"
+                    self._brake_trigger_reference = self._target
+                    self._brake_trigger_lag = self._target-q
                 elif (
                     abs(control_v) >= (continuous_limit or tracking_speed_limit)
                     and stop_evidence.position_span_rad[stop_evidence.joint_index] > resolution

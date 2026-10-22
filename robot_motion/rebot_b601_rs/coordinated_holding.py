@@ -194,12 +194,19 @@ class CoordinatedPoseHolding:
             and self.estimators[i].position_span_rad > resolution
             and bias*velocity > 0 and self.last_delta[i]*velocity > 0
             and (frame.requested_torque_nm+bias)*velocity > 0):
-            # Support at the destination is unknown. Remove only the existing
-            # fall-slew increment while motion persists; stop unloading when
-            # it slows instead of substituting a departure value or fixed half.
-            reduction = min(abs(bias), self.config.fall_slew_nm_s*dt)
+            # Support at the destination is unknown. Before crossing it, use
+            # the normal fall rate only while assisted motion persists; never
+            # substitute a departure value or a fixed half.
+            # Outside the arrival band AND above the existing resolved speed
+            # gate, old drive continuing away from the target is not a slow
+            # support adjustment. Remove it at the existing brake rate. Slow
+            # load support keeps its fall rate; opposite drive keeps its rise.
+            passed_target = (abs(target_error) > self.arrival_tolerance_rad and target_error*velocity < 0
+                and abs(velocity) > self.motion.resolved_soft_velocity_rad_s)
+            rate = self.motion.braking_slew_nm_s if passed_target else self.config.fall_slew_nm_s
+            reduction = min(abs(bias), rate*dt)
             bias -= reduction*(1 if bias > 0 else -1)
-            moving, reason = True, "arrival_feedback_unloading"
+            moving, reason = True, ("arrival_overshoot_drive_unloading" if passed_target else "arrival_feedback_unloading")
         elif onset_confirmed and point_search and not point_reacquire:
             half = self.last_delta[i] / 2
             original = frame.requested_torque_nm + self.bias[i]

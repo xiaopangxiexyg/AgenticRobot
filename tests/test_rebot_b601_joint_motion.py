@@ -691,6 +691,32 @@ def test_coordinated_near_target_hold_requires_actual_zero_before_retaining_goal
         assert frame.reason == "reference_lag_braking" and frame.phase == "brake"
 
 
+@pytest.mark.parametrize("sign", [-1, 1])
+def test_arrival_reference_lag_records_new_fault_not_old_arrival_trigger(sign):
+    tracker = _governed_tracker(arrival_stabilization=True,
+        continuous_speed_limit_rad_s=.07605, soft_velocity_rad_s=.07605,
+        max_reference_lag_rad=.0195)
+    goal = sign*.13962634015954636
+    tracker.start(now=1., q=goal-sign*.002330544236230331, target=goal)
+    flags = {"calibration_hold_enabled": True, "calibration_target_hold": True}
+    first = _governor_tick(tracker, 1.01, q=goal-sign*.002330544236230331, **flags)
+    assert first.reason == "target_reached_braking"
+    q = sign*.11927000433206558
+    frame = _governor_tick(tracker, 1.02, q=q, velocity=-sign*.001, span=.002, **flags)
+    assert frame.reason == "reference_lag_braking" and not frame.speed_governor_active
+    assert frame.brake_trigger_reference_rad == goal
+    assert frame.brake_trigger_lag_rad == pytest.approx(goal-q)
+    assert abs(frame.brake_trigger_lag_rad) > tracker.config.max_reference_lag_rad
+    assert frame.brake_started_at_sec == first.brake_started_at_sec
+    captured = False
+    for n in range(3, 25):
+        frame = _governor_tick(tracker, 1.+n*.01, q=q, **flags)
+        captured |= frame.reason == "measured_stop_point_captured"
+    assert captured and frame.reason == "holding_measured_stop_point"
+    assert frame.speed_governor_resume_count == 0 and frame.hold_position_rad == q
+    assert frame.brake_trigger_lag_rad == pytest.approx(goal-q)
+
+
 def test_continuous_transfer_arrival_still_unloads_and_requires_zero_receipt():
     tracker = _governed_tracker(continuous_speed_limit_rad_s=.05,
         arrival_stabilization=True, arrival_margin_rad=.0008)

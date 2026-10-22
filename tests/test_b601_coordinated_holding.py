@@ -409,6 +409,75 @@ def test_arrival_feedback_unload_commits_only_through_actual_receipt(
     assert sum(abs(v) for v in actual) <= 1.
 
 
+@pytest.mark.parametrize("joint", [1, 2])
+@pytest.mark.parametrize("sign", [-1, 1])
+@pytest.mark.parametrize("point_search,point_reacquire", [(False, False), (True, True)])
+@pytest.mark.parametrize("mismatched_receipt", [False, True])
+def test_j3jmntm1_crossed_target_removes_old_drive_before_reverse_rise(
+    settings, monkeypatch, joint, sign, point_search, point_reacquire, mismatched_receipt,
+):
+    from robot_motion.rebot_b601_rs.joint_motion import B601JointMotionFrame
+
+    def axis(value):
+        return tuple(sign*value if i == joint else 0. for i in range(6))
+
+    core = runtime(settings)
+    core.config = CoordinatedHoldingConfig(supported_soft_recovery=True, recovery_kd_nm_s_per_rad=0.)
+    core.motion = replace(core.motion, braking_slew_nm_s=20.)
+    warm(core)
+    core.observe(core.last_time+.01, axis(.1338443160057068), ZERO)
+    core.set_goal(axis(.13962634015954636))
+    core.velocity = core.raw = axis(-.034946293459466024)
+    core.bias = axis(-.3684211577713461)
+    core.last_delta = axis(-.2227165048327754)
+    core._approach_moving = (True,)*6
+    for tracker, i in zip(core.trackers, AXES):
+        frame = B601JointMotionFrame(phase="brake", reason="target_reached_braking",
+            q_reference_rad=core.goal[i], qvel_reference_rad_s=0., control_qvel_rad_s=core.velocity[i],
+            position_torque_nm=0., velocity_torque_nm=0.,
+            requested_torque_nm=sign*.06751493999499407 if i == joint else 0.)
+        monkeypatch.setattr(tracker, "update", lambda frame=frame, **kwargs: frame)
+    original = core.bias
+    command, audit = core.step(sequence=12, dt=.01, permitted=True,
+        point_search=point_search, point_reacquire=point_reacquire)
+    assert audit["approach_reasons"][joint] == "arrival_overshoot_drive_unloading"
+    expected = -sign*max(0., abs(original[joint])-core.motion.braking_slew_nm_s*.01)
+    assert audit["proposed_bias_nm"][joint] == pytest.approx(expected)
+    assert command[joint]*sign > -.2127165048327754  # Baseline same-state command.
+    assert command[joint]*sign <= 0  # Removal cannot jump into opposite drive.
+    assert core.bias == original
+    actual = ZERO if mismatched_receipt else command
+    core.record_dispatch(12, actual)
+    if mismatched_receipt:
+        assert core.bias == original
+    else:
+        assert core.bias[joint] == pytest.approx(expected)
+    assert core.last_delta == actual
+    assert sum(abs(v) for v in command) <= core.config.total_assist_cap_nm
+
+
+@pytest.mark.parametrize("case", ["one_count", "quiet", "no_onset", "opposing_command", "fixed_search", "legacy", "within_arrival_band", "slow_support"])
+def test_overshoot_fast_unload_requires_resolved_working_drive_not_unknown_support(settings, case):
+    core = runtime(settings)
+    core.config = CoordinatedHoldingConfig(supported_soft_recovery=True, recovery_kd_nm_s_per_rad=0.)
+    core.goal = (0., 0., .02, 0., 0., 0.)
+    core.q = (0., 0., .02+(core.arrival_tolerance_rad/2 if case == "within_arrival_band" else .005), 0., 0., 0.)
+    core.bias = core.last_delta = (0., 0., .6, 0., 0., 0.)
+    speed = (0. if case == "quiet" else core.motion.resolved_soft_velocity_rad_s/2
+        if case == "slow_support" else core.motion.resolved_soft_velocity_rad_s+.01)
+    core.velocity = core.raw = (0., 0., speed, 0., 0., 0.)
+    core.estimators = tuple(SimpleNamespace(position_span_rad=(core.motion.position_resolution_rad
+        if case == "one_count" else .002)) for _ in range(6))
+    frame = SimpleNamespace(reason="target_reached_braking", q_reference_rad=.02,
+        requested_torque_nm=-1. if case == "opposing_command" else 0.)
+    if case == "legacy":
+        core.config = replace(core.config, recovery_kd_nm_s_per_rad=6.)
+    bias, _, _, reason = core._approach_bias(2, frame, .01, case != "no_onset", core.q[2],
+        point_search=case == "fixed_search")
+    assert reason != "arrival_overshoot_drive_unloading"
+    assert bias > .6-core.motion.braking_slew_nm_s*.01
+
+
 @pytest.mark.parametrize("sign", [-1, 1])
 def test_released_arrival_drive_does_not_return_when_velocity_drops(settings, monkeypatch, sign):
     from robot_motion.rebot_b601_rs.joint_motion import B601JointMotionFrame
