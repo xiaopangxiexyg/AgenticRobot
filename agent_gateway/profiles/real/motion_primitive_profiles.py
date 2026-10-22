@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from agent_gateway.profiles.spatial_goal import SpatialGoalRegistration
+    from agent_gateway.profiles.tcp_pose_comparison import TcpPoseComparisonRegistration
 
 from agent_gateway.profiles.segmentation import SegmentationRegistration
 from agent_gateway.profiles.placement import (
@@ -609,6 +610,7 @@ class RealAgentPrimitiveContractBundle:
     object_transport_registration: ObjectTransportRegistration | None = None
     gripper_contract: GripperSkillContractBundle | None = None
     spatial_goal_registration: SpatialGoalRegistration | None = None
+    tcp_pose_comparison_registration: TcpPoseComparisonRegistration | None = None
     rgbd_geometry_registrations: tuple[RgbdGeometryRegistration, ...] = ()
 
     def __post_init__(self) -> None:
@@ -619,6 +621,9 @@ class RealAgentPrimitiveContractBundle:
             io_catalog=self.io_catalog,
         )
         self.payload_validators.validate_manifest(self.route_manifest)
+        if (self.tcp_pose_comparison_registration is not None
+                and self.route_manifest.route("state.read_tcp_pose", "2") != self.tcp_pose_comparison_registration.entry):
+            raise ValueError("TCP comparison registration differs from its manifest entry.")
         if self.spatial_goal_registration is not None:
             if self.route_manifest.route("perception.compute_spatial_goal", "1") != self.spatial_goal_registration.entry:
                 raise ValueError("Spatial goal registration differs from its manifest entry.")
@@ -821,6 +826,7 @@ class RealAgentPrimitiveContractBundle:
             + int(transport_enabled)
             + int(self.gripper_contract is not None)
             + int(self.spatial_goal_registration is not None)
+            + int(self.tcp_pose_comparison_registration is not None)
             + int(
                 self.station_point_grasp_registration is not None
                 and self.station_point_grasp_registration.observation_registration
@@ -1053,6 +1059,7 @@ def build_real_agent_primitive_contract_bundle(
     grasp_execution_operation_timeout_sec: float = DEFAULT_REAL_GRASP_EXECUTION_OPERATION_TIMEOUT_SEC,
     domain_emergency_stop_available: bool = False,
     enable_spatial_goals: bool = False,
+    enable_tcp_pose_comparison: bool = False,
 ) -> RealAgentPrimitiveContractBundle:
     """Build exact motion and optional passive Routes without runtime effects."""
 
@@ -1066,6 +1073,8 @@ def build_real_agent_primitive_contract_bundle(
         raise TypeError("domain_emergency_stop_available must be boolean.")
     if not isinstance(enable_spatial_goals, bool):
         raise TypeError("enable_spatial_goals must be boolean.")
+    if not isinstance(enable_tcp_pose_comparison, bool):
+        raise TypeError("enable_tcp_pose_comparison must be boolean.")
     refs = tuple(safety_envelope_refs)
     if not refs:
         raise ValueError("Real primitive Routes require lower safety-envelope refs.")
@@ -1681,6 +1690,18 @@ def build_real_agent_primitive_contract_bundle(
     tcp_pose_definition = tcp_pose_observe.definition_catalog.skill_definitions[0]
     tcp_pose_schema = tcp_pose_observe.schema_catalog.schema_entries[0]
     tcp_pose_entry = tcp_pose_observe.route_manifest.skill_routes[0]
+    tcp_pose_comparison_registration = None
+    if enable_tcp_pose_comparison:
+        from agent_gateway.profiles.tcp_pose_comparison import (
+            build_tcp_pose_comparison_registration,
+        )
+
+        tcp_pose_comparison_registration = build_tcp_pose_comparison_registration(
+            base_definition=tcp_pose_definition, base_schema=tcp_pose_schema,
+            base_entry=tcp_pose_entry,
+            base_validator=tcp_pose_observe.payload_validators.validator_for(tcp_pose_entry.route),
+        )
+        perception_registrations = (*perception_registrations, tcp_pose_comparison_registration.skill)
     spatial_goal_registration = None
     if enable_spatial_goals:
         from agent_gateway.profiles.spatial_goal import build_spatial_goal_registration
@@ -1883,6 +1904,8 @@ def build_real_agent_primitive_contract_bundle(
             availability_hash=object_transport_registration.binding.deployment_binding_hash))
     if spatial_goal_registration is not None:
         route_items.append(spatial_goal_registration.entry)
+    if tcp_pose_comparison_registration is not None:
+        route_items.append(tcp_pose_comparison_registration.entry)
     artifact_contract_by_skill = {
         (item.definition.skill_id, item.definition.skill_version): item.io_contract
         for item in perception_registrations
@@ -2061,6 +2084,7 @@ def build_real_agent_primitive_contract_bundle(
                 else ()
             ),
             *((spatial_goal_registration.payload_validator,) if spatial_goal_registration is not None else ()),
+            *((tcp_pose_comparison_registration.payload_validator,) if tcp_pose_comparison_registration is not None else ()),
             *(
                 (
                     gripper_contract.payload_validators.validator_for(
@@ -2102,6 +2126,7 @@ def build_real_agent_primitive_contract_bundle(
         grasp_approach_plan_registration=grasp_approach_plan_registration,
         object_transport_registration=object_transport_registration,
         spatial_goal_registration=spatial_goal_registration,
+        tcp_pose_comparison_registration=tcp_pose_comparison_registration,
         gripper_contract=gripper_contract,
     )
 

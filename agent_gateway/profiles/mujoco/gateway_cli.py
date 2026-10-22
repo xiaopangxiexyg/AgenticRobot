@@ -163,6 +163,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--enable-spatial-goals", action="store_true",
                         help="Expose read-only endpoint relation calculation; does not authorize motion.")
+    parser.add_argument("--enable-tcp-pose-comparison", action="store_true",
+                        help="Expose explicit read_tcp_pose v2 comparison with a retained absolute safe target; no motion authority.")
     parser.add_argument(
         "--enable-safe-tcp-pose",
         action="store_true",
@@ -497,6 +499,7 @@ def main(argv: list[str] | None = None) -> int:
         segmentation_localizer=segmentation_localizer,
         enable_safe_tcp_pose=args.enable_safe_tcp_pose,
         enable_spatial_goals=args.enable_spatial_goals,
+        enable_tcp_pose_comparison=args.enable_tcp_pose_comparison,
         enable_grasp_approach=args.enable_grasp_approach,
         grasp_contact_target_body=args.grasp_contact_target_body,
         safe_tcp_planning_clearance_padding_m=args.safe_tcp_planning_clearance_padding_m,

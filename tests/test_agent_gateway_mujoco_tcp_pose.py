@@ -138,7 +138,9 @@ def test_segmentation_model_startup_failure_closes_partial_resources() -> None:
     localizer = _FaultyLocalizer()
     session = SimpleNamespace(
         _close_lock=threading.Lock(),
+        _close_started=False,
         _close_outcome=None,
+        service=SimpleNamespace(is_closed=False),
         segmentation_localizer=localizer,
         _segmentation_model_started=False,
     )
@@ -150,7 +152,7 @@ def test_segmentation_model_startup_failure_closes_partial_resources() -> None:
     assert session._segmentation_model_started is False
 
 
-def test_unsettled_passive_read_defers_owned_dependency_cleanup() -> None:
+def _assert_unsettled_passive_read_defers_owned_dependency_cleanup(state_reader) -> None:
     wait_timeouts = []
 
     class _Executor:
@@ -175,23 +177,28 @@ def test_unsettled_passive_read_defers_owned_dependency_cleanup() -> None:
             self.close_calls += 1
 
     executor = _Executor()
+    placement_executor = _Executor()
+    placement_executor.settled = True
     localizer = _Localizer()
     artifact_store = _Store()
     lower_close_calls = []
-    outcome = object()
+    from agent_gateway.runtime.service import AgentGatewayOperationOutcome
+
+    outcome = AgentGatewayOperationOutcome(True, "fixture_close_accepted")
     session = SimpleNamespace(
         _close_lock=threading.Lock(),
         history_recorder=None,
         _close_outcome=None,
         service=SimpleNamespace(close=lambda **_kwargs: outcome),
         observation_producer=SimpleNamespace(current_station_revision=0),
-        state_executor=executor,
+        state_executor=None,
+        tcp_pose_comparison_executor=None,
         depth_executor=None,
         rgb_executor=None,
         history_executor=None,
         spatial_goal_executor=None,
         segmentation_executor=None,
-        placement_executor=executor,
+        placement_executor=placement_executor,
         _segmentation_model_started=True,
         segmentation_localizer=localizer,
         _finish_lower_close=lambda value: lower_close_calls.append(value),
@@ -202,8 +209,9 @@ def test_unsettled_passive_read_defers_owned_dependency_cleanup() -> None:
         artifact_store=artifact_store,
         _artifact_store_closed=False,
     )
+    setattr(session, state_reader, executor)
 
-    with pytest.raises(RuntimeError, match="state_executor"):
+    with pytest.raises(RuntimeError, match=state_reader):
         MujocoAgentTcpPoseGatewaySession.close(session)
     assert 130.0 in wait_timeouts
     assert localizer.close_calls == 0
@@ -215,6 +223,14 @@ def test_unsettled_passive_read_defers_owned_dependency_cleanup() -> None:
     assert localizer.close_calls == 1
     assert lower_close_calls == [outcome]
     assert artifact_store.close_calls == 1
+
+
+def test_unsettled_passive_read_defers_owned_dependency_cleanup() -> None:
+    _assert_unsettled_passive_read_defers_owned_dependency_cleanup("state_executor")
+
+
+def test_unsettled_tcp_pose_comparison_defers_owned_dependency_cleanup() -> None:
+    _assert_unsettled_passive_read_defers_owned_dependency_cleanup("tcp_pose_comparison_executor")
 
 
 def _profile_and_schema(component_id: str = "right_arm"):
@@ -1468,6 +1484,7 @@ def _build_no_model_contract_bundle_fixture(
     *,
     enable_artifact_perception: bool = False,
     segmentation_identity: tuple[str, str, str] | None = None,
+    enable_tcp_pose_comparison: bool = False,
 ):
     _profile, action_schema = _profile_and_schema()
     observation_plan = SimpleNamespace(
@@ -1634,6 +1651,7 @@ def _build_no_model_contract_bundle_fixture(
     bundle = build_mujoco_agent_tcp_pose_contract_bundle(
         application=application,
         enable_artifact_perception=enable_artifact_perception,
+        enable_tcp_pose_comparison=enable_tcp_pose_comparison,
         segmentation_model_profile_id=(
             None if segmentation_identity is None else segmentation_identity[0]
         ),
@@ -1645,6 +1663,31 @@ def _build_no_model_contract_bundle_fixture(
         ),
     )
     return application, runtime, direct, bundle, captured_manifest_args
+
+
+def test_tcp_pose_comparison_is_opt_in_and_retains_the_original_state_contract(monkeypatch):
+    baseline = _build_no_model_contract_bundle_fixture(monkeypatch)[3]
+    candidate = _build_no_model_contract_bundle_fixture(monkeypatch, enable_tcp_pose_comparison=True)[3]
+    assert baseline.tcp_pose_comparison_registration is None
+    with pytest.raises(KeyError):
+        baseline.route_manifest.route("state.read_tcp_pose", "2")
+    assert candidate.schema_catalog.entry("state.read_tcp_pose", "1") == baseline.schema_catalog.entry("state.read_tcp_pose", "1")
+    assert candidate.route_manifest.route("state.read_tcp_pose", "1") == baseline.route_manifest.route("state.read_tcp_pose", "1")
+    assert candidate.definition_catalog.definition("state.read_tcp_pose", "1") == baseline.definition_catalog.definition("state.read_tcp_pose", "1")
+    registration = candidate.tcp_pose_comparison_registration
+    assert candidate.route_manifest.route("state.read_tcp_pose", "2") == registration.entry
+    assert registration.entry.route.control_effect_class == "read_only"
+    assert not registration.entry.route.may_move_robot
+    assert not registration.entry.route.requires_task_evaluation
+    assert candidate.payload_validators.validator_for(registration.entry.route) == registration.payload_validator
+    candidate.io_catalog.contract("state.read_tcp_pose", "2")
+    assert len(candidate.route_manifest.skill_routes) == len(baseline.route_manifest.skill_routes) + 1
+
+
+@pytest.mark.parametrize("enabled", [None, 0, 1, "true"])
+def test_tcp_pose_comparison_enablement_requires_a_boolean(monkeypatch, enabled):
+    with pytest.raises(TypeError, match="enable_tcp_pose_comparison"):
+        _build_no_model_contract_bundle_fixture(monkeypatch, enable_tcp_pose_comparison=enabled)
 
 
 def test_no_model_contract_bundle_exposes_exact_motion_and_state_routes(
@@ -2622,3 +2665,261 @@ def test_installed_rpent_toolkit_consumes_exact_motion_and_state_routes(
         cardinal_entry.route.semantic_content_hash
     )
     consumer_session.close()
+
+
+def _gateway_close_outcomes():
+    from agent_gateway.runtime.operation_port import AgentGatewayAuthoritativePortReceipt
+    from agent_gateway.runtime.service import AgentGatewayOperationOutcome
+
+    rejected = AgentGatewayOperationOutcome(
+        False, "station_hold_not_confirmed_no_active_operation",
+        port_receipt=AgentGatewayAuthoritativePortReceipt(
+            port_id="fixture:domain", operation_kind="hold", operation_id=None,
+            succeeded=False, status="hold_pending", completed_at=1.0,
+            call_sequence=1, proves_motion_or_hold=False,
+        ),
+    )
+    accepted = AgentGatewayOperationOutcome(
+        True, "station_hold_confirmed_no_active_operation",
+        port_receipt=AgentGatewayAuthoritativePortReceipt(
+            port_id="fixture:domain", operation_kind="hold", operation_id=None,
+            succeeded=True, status="held", completed_at=2.0,
+            call_sequence=2, proves_motion_or_hold=True,
+            evidence_refs=("fixture:lower-confirmed-hold:2",),
+        ),
+    )
+    return rejected, accepted
+
+
+def _gateway_close_retry_session(outcomes, *, started=True):
+    pending = list(outcomes)
+    calls = {"service": [], "lower": [], "executor": [], "model_start": [],
+             "model_close": [], "history_store": [], "artifact_store": []}
+
+    def service_close(**kwargs):
+        calls["service"].append(kwargs)
+        result = pending.pop(0)
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    application = SimpleNamespace(started=started, closed=False)
+
+    def lower_close():
+        calls["lower"].append("closed")
+        application.closed = True
+
+    application.close_after_hold = lower_close
+    motion_executor = SimpleNamespace(
+        close_after_hold=lambda **kwargs: calls["executor"].append(kwargs),
+        workers=(), active_operation_id=None,
+    )
+    session = object.__new__(MujocoAgentTcpPoseGatewaySession)
+    for name, value in dict(
+        _close_lock=threading.Lock(), _close_started=False, _close_outcome=None,
+        service=SimpleNamespace(close=service_close, is_closed=False),
+        observation_producer=SimpleNamespace(current_station_revision=0),
+        application=application, motion_executor=motion_executor,
+        _motion_executors=lambda: (motion_executor,), history_recorder=None,
+        state_executor=None, tcp_pose_comparison_executor=None, depth_executor=None,
+        rgb_executor=None, back_projection_executor=None, history_executor=None,
+        spatial_goal_executor=None, segmentation_executor=None, placement_executor=None,
+        _segmentation_model_started=False,
+        segmentation_localizer=SimpleNamespace(
+            start=lambda: calls["model_start"].append("started"),
+            close=lambda: calls["model_close"].append("closed"),
+        ),
+        owns_source_observation_history_store=True,
+        source_observation_history_store=SimpleNamespace(
+            close=lambda: calls["history_store"].append("closed")),
+        _source_observation_history_store_closed=False,
+        owns_artifact_store=True,
+        artifact_store=SimpleNamespace(close=lambda: calls["artifact_store"].append("closed")),
+        _artifact_store_closed=False,
+    ).items():
+        setattr(session, name, value)
+    return session, calls
+
+
+def test_session_close_retries_rejected_hold_then_caches_confirmed_hold() -> None:
+    rejected, accepted = _gateway_close_outcomes()
+    session, calls = _gateway_close_retry_session([rejected, accepted])
+
+    assert session.close() is rejected
+    assert not session.application.closed
+    assert calls["executor"] == []
+    second = session.close()
+
+    assert len(calls["service"]) == 2
+    assert second is accepted
+    assert session._close_outcome is accepted
+    assert session.application.closed
+    assert calls["executor"] == [{"hold_receipt": accepted.port_receipt}]
+    assert calls["lower"] == ["closed"]
+    assert session.close() is accepted
+    assert len(calls["service"]) == 2
+    assert calls["lower"] == ["closed"]
+    assert calls["history_store"] == calls["artifact_store"] == ["closed"]
+
+
+@pytest.mark.parametrize("first_failure", ["rejected", "exception"])
+def test_session_close_attempt_permanently_fences_model_start(first_failure) -> None:
+    rejected, accepted = _gateway_close_outcomes()
+    first = rejected if first_failure == "rejected" else RuntimeError("fixture HOLD error")
+    session, calls = _gateway_close_retry_session([first, accepted])
+
+    if first_failure == "rejected":
+        assert session.close() is rejected
+    else:
+        with pytest.raises(RuntimeError, match="gateway_service.*fixture HOLD error"):
+            session.close()
+    with pytest.raises(RuntimeError, match="Closed Gateway session"):
+        session.start_perception_resources()
+    assert session._close_started
+    assert calls["model_start"] == []
+    assert session._close_outcome is None
+    assert session.close() is accepted
+    assert len(calls["service"]) == 2
+
+
+def test_session_model_start_rejects_directly_closed_service() -> None:
+    _, accepted = _gateway_close_outcomes()
+    session, calls = _gateway_close_retry_session([accepted])
+    session.service.is_closed = True
+
+    with pytest.raises(RuntimeError, match="Closed Gateway session"):
+        session.start_perception_resources()
+    assert calls["model_start"] == []
+    assert calls["service"] == []
+
+
+@pytest.mark.parametrize("state_reader", ["state_executor", "tcp_pose_comparison_executor"])
+def test_session_confirmed_close_retries_passive_drain_without_new_hold(state_reader) -> None:
+    _, accepted = _gateway_close_outcomes()
+    session, calls = _gateway_close_retry_session([accepted])
+    settled = threading.Event()
+    waits = []
+    setattr(session, state_reader, SimpleNamespace(
+        wait_all=lambda **kwargs: waits.append(kwargs) or settled.is_set()))
+    session._segmentation_model_started = True
+
+    with pytest.raises(RuntimeError, match=state_reader):
+        session.close()
+    assert len(calls["service"]) == 1
+    assert session._close_outcome is accepted
+    assert not session.application.closed
+    assert calls["model_close"] == calls["lower"] == []
+    assert calls["history_store"] == calls["artifact_store"] == []
+    settled.set()
+
+    assert session.close() is accepted
+    assert len(calls["service"]) == 1
+    assert waits == [{"timeout_sec": 5.0}] * 2
+    assert calls["model_close"] == calls["lower"] == ["closed"]
+    assert calls["history_store"] == calls["artifact_store"] == ["closed"]
+    assert session.close() is accepted
+    assert calls["model_close"] == calls["lower"] == ["closed"]
+    assert len(calls["service"]) == 1
+
+
+def test_session_concurrent_close_attempts_serialize_and_retry_hold() -> None:
+    rejected, accepted = _gateway_close_outcomes()
+    session, calls = _gateway_close_retry_session([rejected, accepted])
+    entered = threading.Event()
+    release = threading.Event()
+    second_ready = threading.Event()
+    original = session.service.close
+
+    def blocked_first_close(**kwargs):
+        if not entered.is_set():
+            entered.set()
+            assert release.wait(3.0)
+        return original(**kwargs)
+
+    session.service.close = blocked_first_close
+    results, errors = {}, []
+
+    def close_session(*, second=False):
+        if second:
+            second_ready.set()
+        try:
+            results["second" if second else "first"] = session.close()
+        except Exception as error:
+            errors.append(error)
+
+    first = threading.Thread(target=close_session)
+    second = threading.Thread(target=close_session, kwargs={"second": True})
+    first.start()
+    try:
+        assert entered.wait(3.0)
+        second.start()
+        assert second_ready.wait(3.0)
+    finally:
+        release.set()
+        first.join(5.0)
+        if second.ident is not None:
+            second.join(5.0)
+    assert not first.is_alive() and not second.is_alive()
+    assert errors == []
+    assert results == {"first": rejected, "second": accepted}
+    assert len(calls["service"]) == 2
+    assert calls["executor"] == [{"hold_receipt": accepted.port_receipt}]
+    assert calls["lower"] == ["closed"]
+
+
+def test_session_model_start_waiting_on_failed_close_remains_fenced() -> None:
+    rejected, _ = _gateway_close_outcomes()
+    session, calls = _gateway_close_retry_session([rejected])
+    entered, release, start_ready = threading.Event(), threading.Event(), threading.Event()
+    original = session.service.close
+
+    def blocked_close(**kwargs):
+        entered.set()
+        assert release.wait(3.0)
+        return original(**kwargs)
+
+    session.service.close = blocked_close
+    results, errors = [], []
+
+    def close_session():
+        try:
+            results.append(session.close())
+        except Exception as error:
+            errors.append(error)
+
+    def start_model():
+        start_ready.set()
+        try:
+            session.start_perception_resources()
+        except RuntimeError as error:
+            errors.append(error)
+
+    closer, starter = threading.Thread(target=close_session), threading.Thread(target=start_model)
+    closer.start()
+    try:
+        assert entered.wait(3.0)
+        starter.start()
+        assert start_ready.wait(3.0)
+    finally:
+        release.set()
+        closer.join(5.0)
+        if starter.ident is not None:
+            starter.join(5.0)
+    assert not closer.is_alive() and not starter.is_alive()
+    assert results == [rejected]
+    assert len(errors) == 1 and "Closed Gateway session" in str(errors[0])
+    assert calls["model_start"] == []
+    assert session._close_started
+
+
+def test_session_unstarted_lower_can_close_without_claiming_hold_success() -> None:
+    rejected, accepted = _gateway_close_outcomes()
+    session, calls = _gateway_close_retry_session([rejected, accepted], started=False)
+
+    assert session.close() is rejected
+    assert session.application.closed
+    assert calls["executor"] == []
+    assert session.close() is accepted
+    assert len(calls["service"]) == 2
+    assert calls["executor"] == []
+    assert calls["lower"] == ["closed"]

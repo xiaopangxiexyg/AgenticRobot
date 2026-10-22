@@ -512,6 +512,17 @@ class RealAgentPrimitiveObservationProducer:
         active_operation_id: str,
         parameters: Mapping[str, object],
     ) -> PassiveReadResult:
+        return self.capture_tcp_pose(
+            active_operation_id=active_operation_id, parameters=parameters,
+        )
+
+    def capture_tcp_pose(
+        self,
+        *,
+        active_operation_id: str,
+        parameters: Mapping[str, object],
+    ) -> PassiveReadResult:
+        """Capture the original V1 projection once for either read Route."""
         route = self.contract_bundle.route_manifest.route(
             "state.read_tcp_pose",
             "1",
@@ -698,6 +709,7 @@ class RealAgentPrimitiveGatewaySession:
     grasp_observation_executor: PassiveReadSkillExecutor | None = None
     object_transport_executor: PassiveReadSkillExecutor | None = None
     spatial_goal_executor: PassiveReadSkillExecutor | None = None
+    tcp_pose_comparison_executor: PassiveReadSkillExecutor | None = None
     gripper_port: RealDmtacGripperControlPort | None = None
     rgbd_geometry_executors: tuple[PassiveReadSkillExecutor, ...] = ()
     gripper_ports: Mapping[str, RealDmtacGripperControlPort] = field(default_factory=dict)
@@ -711,6 +723,10 @@ class RealAgentPrimitiveGatewaySession:
     _closed_executor_ids: set[int] = field(default_factory=set, init=False)
 
     def __post_init__(self) -> None:
+        if (self.contract_bundle.tcp_pose_comparison_registration is not None) != (self.tcp_pose_comparison_executor is not None):
+            raise ValueError("TCP comparison registration and executor must coexist.")
+        if self.tcp_pose_comparison_executor is not None and not isinstance(self.tcp_pose_comparison_executor, PassiveReadSkillExecutor):
+            raise TypeError("TCP comparison executor must be passive.")
         if (self.contract_bundle.spatial_goal_registration is not None) != (self.spatial_goal_executor is not None):
             raise ValueError("Spatial goal registration and executor must coexist.")
         advertised = (
@@ -818,7 +834,6 @@ class RealAgentPrimitiveGatewaySession:
             "perception.compute_spatial_goal": self.spatial_goal_executor,
             "perception.plan_object_move": self.object_transport_executor,
             "perception.capture_grasp_observation": self.grasp_observation_executor,
-            "state.read_tcp_pose": self.state_executor,
             "perception.capture_rgb": self.rgb_executor,
             "perception.capture_depth": self.depth_executor,
             "perception.back_project": self.back_projection_executor,
@@ -836,13 +851,16 @@ class RealAgentPrimitiveGatewaySession:
             for item, executor in zip(self.contract_bundle.rgbd_geometry_registrations,
                                       self.rgbd_geometry_executors, strict=True)
         }
+        state = {("state.read_tcp_pose", "1"): self.state_executor}
+        if self.tcp_pose_comparison_executor is not None:
+            state["state.read_tcp_pose", "2"] = self.tcp_pose_comparison_executor
         return {
             (entry.route.skill_id, entry.route.skill_version): executors[entry.route.skill_id]
             for entry in self.contract_bundle.route_manifest.skill_routes
             if entry.route.skill_id in executors
             and executors[entry.route.skill_id] is not None
             and (entry.route.skill_id, entry.route.skill_version) not in geometry
-        } | geometry
+        } | geometry | state
 
     def wire_adapter(
         self,
@@ -933,6 +951,7 @@ class RealAgentPrimitiveGatewaySession:
                 executor is None or executor.wait_all(timeout_sec=timeout_sec)
                 for executor, timeout_sec in (
                     (self.state_executor, 5.0),
+                    (self.tcp_pose_comparison_executor, 5.0),
                     (self.rgb_executor, 5.0),
                     (self.depth_executor, 5.0),
                     (self.back_projection_executor, 5.0),
@@ -1446,6 +1465,34 @@ def assemble_real_agent_primitive_gateway_session(
     execution_port_by_route_hash[state_entry.route.semantic_content_hash] = (
         state_executor
     )
+    tcp_pose_comparison_executor = None
+    if contract_bundle.tcp_pose_comparison_registration is not None:
+        from agent_gateway.profiles.tcp_pose_comparison import (
+            build_tcp_pose_comparison_executor,
+        )
+
+        # The same service/store is bound before any passive reader can run.
+        def lookup_target(operation_id):
+            operation = service.operation_store.get(operation_id)
+            request = service.operation_store.request_for_operation(operation_id)
+            if operation is None or request is None:
+                return None
+            return request, operation
+
+        registration = contract_bundle.tcp_pose_comparison_registration
+        tcp_pose_comparison_executor = build_tcp_pose_comparison_executor(
+            registration=registration,
+            capture_state=lambda parameters, active_operation_id: producer.capture_tcp_pose(
+                parameters=parameters, active_operation_id=active_operation_id,
+            ),
+            lookup_target=lookup_target,
+            route_manifest=contract_bundle.route_manifest,
+            payload_validators=contract_bundle.payload_validators,
+            clock_domain_id=contract_bundle.attachment.clock_domain_id,
+            current_station_revision=lambda: producer.current_station_revision,
+            clock=clock, max_retained_operations=max_retained_operations,
+        )
+        execution_port_by_route_hash[registration.entry.route.semantic_content_hash] = tcp_pose_comparison_executor
     spatial_goal_executor = None
     if contract_bundle.spatial_goal_registration is not None:
         from agent_gateway.profiles.spatial_goal import build_spatial_goal_executor
@@ -2022,6 +2069,7 @@ def assemble_real_agent_primitive_gateway_session(
         grasp_observation_executor=grasp_observation_executor,
         object_transport_executor=object_transport_executor,
         spatial_goal_executor=spatial_goal_executor,
+        tcp_pose_comparison_executor=tcp_pose_comparison_executor,
         rgbd_geometry_executors=rgbd_geometry_executors,
     )
 

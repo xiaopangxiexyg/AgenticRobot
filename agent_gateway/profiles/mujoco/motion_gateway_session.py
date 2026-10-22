@@ -175,6 +175,7 @@ class MujocoAgentTcpPoseGatewaySession:
     service: AgentGatewayService
     safe_tcp_pose_executor: ReusableStationAgentSkillOperationExecutor | None = None
     spatial_goal_executor: PassiveReadSkillExecutor | None = None
+    tcp_pose_comparison_executor: PassiveReadSkillExecutor | None = None
     grasp_approach_executor: ReusableStationAgentSkillOperationExecutor | None = None
     grasp_contact_executor: ReusableStationAgentSkillOperationExecutor | None = None
     gripper_executor: ReusableStationAgentSkillOperationExecutor | None = None
@@ -184,6 +185,7 @@ class MujocoAgentTcpPoseGatewaySession:
         init=False,
         repr=False,
     )
+    _close_started: bool = field(default=False, init=False, repr=False)
     _close_outcome: AgentGatewayOperationOutcome | None = field(
         default=None,
         init=False,
@@ -208,6 +210,8 @@ class MujocoAgentTcpPoseGatewaySession:
     def __post_init__(self) -> None:
         if (self.contract_bundle.spatial_goal_registration is not None) != (self.spatial_goal_executor is not None):
             raise ValueError("Spatial goal registration and executor must coexist.")
+        if (self.contract_bundle.tcp_pose_comparison_registration is not None) != (self.tcp_pose_comparison_executor is not None):
+            raise ValueError("TCP comparison registration and executor must coexist.")
         hand_parts = (self.contract_bundle.gripper_contract is not None,
                       self.gripper_executor is not None, bool(self.gripper_ports))
         if any(hand_parts) and not all(hand_parts):
@@ -325,7 +329,7 @@ class MujocoAgentTcpPoseGatewaySession:
         """Start optional model resources before transport publication."""
 
         with self._close_lock:
-            if self._close_outcome is not None:
+            if self._close_started or self.service.is_closed:
                 raise RuntimeError("Closed Gateway session cannot start resources.")
             if self.segmentation_localizer is None or self._segmentation_model_started:
                 return
@@ -455,6 +459,9 @@ class MujocoAgentTcpPoseGatewaySession:
         """Fence admissions, establish lower HOLD, then close when quiescent."""
 
         with self._close_lock:
+            # A failed HOLD remains retryable, but resource startup never reopens.
+            self._close_started = True
+            outcome = self._close_outcome
             cleanup_errors: list[tuple[str, Exception]] = []
             recorder_settled = True
             if self.history_recorder is not None:
@@ -467,16 +474,18 @@ class MujocoAgentTcpPoseGatewaySession:
                 except Exception as error:  # noqa: BLE001 - continue owned cleanup.
                     recorder_settled = False
                     cleanup_errors.append(("history_recorder", error))
-            if self._close_outcome is None:
+            if outcome is None:
                 try:
-                    self._close_outcome = self.service.close(
+                    outcome = self.service.close(
                         current_station_revision=(
                             self.observation_producer.current_station_revision
                         )
                     )
+                    if outcome.accepted:
+                        self._close_outcome = outcome
                 except Exception as error:  # noqa: BLE001 - continue owned cleanup.
                     cleanup_errors.append(("gateway_service", error))
-            gateway_closed = self._close_outcome is not None
+            gateway_closed = outcome is not None
             passive_settled = gateway_closed
             if gateway_closed:
                 for name, executor, timeout_sec in (
@@ -490,6 +499,7 @@ class MujocoAgentTcpPoseGatewaySession:
                     ),
                     ("history", self.history_executor, 5.0),
                     ("spatial_goal", self.spatial_goal_executor, 5.0),
+                    ("tcp_pose_comparison", self.tcp_pose_comparison_executor, 5.0),
                     ("segmentation", self.segmentation_executor, 65.0),
                     (
                         "placement",
@@ -526,8 +536,8 @@ class MujocoAgentTcpPoseGatewaySession:
                         self._segmentation_model_started = False
             if passive_settled and recorder_settled:
                 try:
-                    assert self._close_outcome is not None
-                    self._finish_lower_close(self._close_outcome)
+                    assert outcome is not None
+                    self._finish_lower_close(outcome)
                 except Exception as error:  # noqa: BLE001 - continue owned cleanup.
                     cleanup_errors.append(("lower_application", error))
             if (
@@ -565,8 +575,8 @@ class MujocoAgentTcpPoseGatewaySession:
                 raise RuntimeError(
                     "MuJoCo Gateway close cleanup failed: " + details
                 ) from cleanup_errors[0][1]
-            assert self._close_outcome is not None
-            return self._close_outcome
+            assert outcome is not None
+            return outcome
 
 
 def _mujoco_runtime_health(
@@ -1277,16 +1287,19 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
             )
         )
 
-    def read_tcp_pose(request, operation) -> PassiveReadResult:
+    def capture_tcp_pose(parameters, active_operation_id) -> PassiveReadResult:
         state_read = observation_producer.capture_tcp_pose_state(
-            active_operation_id=operation.operation_id,
-            parameters=request.parameters,
+            active_operation_id=active_operation_id,
+            parameters=parameters,
         )
         return PassiveReadResult(
             execution_result=state_read.execution_result,
             evidence_refs=state_read.evidence_refs,
             reason_code="passive_tcp_pose_read_completed",
         )
+
+    def read_tcp_pose(request, operation) -> PassiveReadResult:
+        return capture_tcp_pose(request.parameters, operation.operation_id)
 
     state_executor = PassiveReadSkillExecutor(
         port_id=("agent-gateway:passive-tcp-pose:" + binding.runtime_session_id),
@@ -1536,6 +1549,31 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
         cardinal_step_route.semantic_content_hash: cardinal_step_executor,
         state_entry.route.semantic_content_hash: state_executor,
     }
+    tcp_pose_comparison_executor = None
+    if contract_bundle.tcp_pose_comparison_registration is not None:
+        from agent_gateway.profiles.tcp_pose_comparison import (
+            build_tcp_pose_comparison_executor,
+        )
+
+        def lookup_comparison_target(operation_id):
+            # The service owns this bounded store; never scan or copy history.
+            source_request = service.operation_store.request_for_operation(operation_id)
+            source_operation = service.operation_store.get(operation_id)
+            if source_request is None or source_operation is None:
+                return None
+            return source_request, source_operation
+
+        registration = contract_bundle.tcp_pose_comparison_registration
+        tcp_pose_comparison_executor = build_tcp_pose_comparison_executor(
+            registration=registration, capture_state=capture_tcp_pose,
+            lookup_target=lookup_comparison_target,
+            route_manifest=contract_bundle.route_manifest,
+            payload_validators=contract_bundle.payload_validators,
+            clock_domain_id=runtime.config.clock_domain_id,
+            current_station_revision=lambda: observation_producer.current_station_revision,
+            clock=runtime_clock, max_retained_operations=retention,
+        )
+        execution_port_by_route_hash[registration.entry.route.semantic_content_hash] = tcp_pose_comparison_executor
     spatial_goal_executor = None
     if contract_bundle.spatial_goal_registration is not None:
         from agent_gateway.profiles.spatial_goal import build_spatial_goal_executor
@@ -1780,6 +1818,7 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
         fixed_cardinal_step_executors=fixed_cardinal_step_executors,
         fixed_orientation_executors=fixed_orientation_executors,
         state_executor=state_executor,
+        tcp_pose_comparison_executor=tcp_pose_comparison_executor,
         spatial_goal_executor=spatial_goal_executor,
         depth_executor=depth_executor,
         rgb_executor=rgb_executor,

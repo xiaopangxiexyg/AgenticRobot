@@ -88,6 +88,14 @@ def test_spatial_goal_cli_is_explicitly_optional():
     assert action.const is True
 
 
+def test_tcp_pose_comparison_cli_is_explicitly_optional():
+    parser = build_parser()
+    assert parser.get_default("enable_tcp_pose_comparison") is False
+    action = next(item for item in parser._actions if item.dest == "enable_tcp_pose_comparison")
+    assert action.option_strings == ["--enable-tcp-pose-comparison"]
+    assert action.const is True
+
+
 def test_never_activated_gateway_closes_safely_without_hold_claim() -> None:
     payload = _stopped_payload(
         server=_server(),

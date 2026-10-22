@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from agent_gateway.profiles.spatial_goal import SpatialGoalRegistration
+    from agent_gateway.profiles.tcp_pose_comparison import TcpPoseComparisonRegistration
 
 from agent_gateway.profiles.placement import (
     PlacementRegistration,
@@ -733,6 +734,7 @@ class MujocoAgentTcpPoseContractBundle:
         MujocoPassiveTcpPoseHistoryDeploymentBinding | None
     ) = None
     spatial_goal_registration: SpatialGoalRegistration | None = None
+    tcp_pose_comparison_registration: TcpPoseComparisonRegistration | None = None
     gripper_contract: GripperSkillContractBundle | None = None
     grasp_approach_contract: MujocoAgentSafeTcpPoseContract | None = None
     grasp_contact_contract: MujocoAgentSafeTcpPoseContract | None = None
@@ -747,6 +749,9 @@ class MujocoAgentTcpPoseContractBundle:
         if self.spatial_goal_registration is not None:
             if self.route_manifest.route("perception.compute_spatial_goal", "1") != self.spatial_goal_registration.entry:
                 raise ValueError("Spatial goal registration differs from its manifest entry.")
+        if (self.tcp_pose_comparison_registration is not None
+                and self.route_manifest.route("state.read_tcp_pose", "2") != self.tcp_pose_comparison_registration.entry):
+            raise ValueError("TCP comparison registration differs from its manifest entry.")
         if self.gripper_contract is not None:
             hand = self.gripper_contract
             for name in ("runtime_session_id", "control_domain_id", "target_binding_id", "target_kind", "current_mode",
@@ -1788,6 +1793,7 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
     segmentation_inference_implementation_hash: str | None = None,
     enable_safe_tcp_pose: bool = False,
     enable_spatial_goals: bool = False,
+    enable_tcp_pose_comparison: bool = False,
     enable_grasp_approach: bool = False,
     grasp_contact_binding: MujocoGraspContactBinding | None = None,
 ) -> MujocoAgentTcpPoseContractBundle:
@@ -1815,6 +1821,8 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
         raise TypeError("enable_safe_tcp_pose must be boolean.")
     if not isinstance(enable_spatial_goals, bool):
         raise TypeError("enable_spatial_goals must be boolean.")
+    if not isinstance(enable_tcp_pose_comparison, bool):
+        raise TypeError("enable_tcp_pose_comparison must be boolean.")
     exact = _exact_application(application)
     if not isinstance(enable_grasp_approach, bool):
         raise TypeError("enable_grasp_approach must be boolean.")
@@ -3008,6 +3016,38 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
             component_ids=state_definition.controlled_component_ids,
             reference_frame_id=profile.reference_frame_id,
         )
+    # Use exactly the original passive state identity and freshness validator.
+    public_state_exact = {
+        **exact,
+        "reference_frame_id": state_binding.reference_frame_id,
+        "reference_frame_spec_hash": state_binding.reference_frame_spec_hash,
+    }
+    state_validator = _state_validators(
+        route=state_route, schema_entry=state_schema, exact=public_state_exact,
+    )
+    state_availability = canonical_content_hash(
+        {
+            "status": "configured_passive_read_ready",
+            "route_hash": state_route.semantic_content_hash,
+            "deployment_binding_hash": state_binding.semantic_content_hash,
+            "observation_binding_hash": exact["observation_binding_hash"],
+        },
+        domain="dexteleop.agent_state.mujoco_agent_tcp_pose_availability.v1",
+    )
+    state_entry = SkillRouteManifestEntry(
+        route=state_route, deployment_binding=state_binding.to_ref(),
+        evaluation_plan_hash=None, availability_hash=state_availability,
+    )
+    tcp_pose_comparison_registration = None
+    if enable_tcp_pose_comparison:
+        from agent_gateway.profiles.tcp_pose_comparison import (
+            build_tcp_pose_comparison_registration,
+        )
+
+        tcp_pose_comparison_registration = build_tcp_pose_comparison_registration(
+            base_definition=state_definition, base_schema=state_schema,
+            base_entry=state_entry, base_validator=state_validator,
+        )
     definition_items = [
         definition,
         cardinal_step_definition,
@@ -3025,6 +3065,9 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
     if spatial_goal_registration is not None:
         definition_items.append(spatial_goal_registration.skill.definition)
         schema_items.append(spatial_goal_registration.skill.schema_entry)
+    if tcp_pose_comparison_registration is not None:
+        definition_items.append(tcp_pose_comparison_registration.skill.definition)
+        schema_items.append(tcp_pose_comparison_registration.skill.schema_entry)
     for motion_definition, motion_schema, _, _ in planned_motions:
         definition_items.append(motion_definition)
         schema_items.append(motion_schema)
@@ -3065,15 +3108,6 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
         },
         domain="dexteleop.agent_skill.mujoco_tcp_pose_availability.v1",
     )
-    state_availability = canonical_content_hash(
-        {
-            "status": "configured_passive_read_ready",
-            "route_hash": state_route.semantic_content_hash,
-            "deployment_binding_hash": state_binding.semantic_content_hash,
-            "observation_binding_hash": exact["observation_binding_hash"],
-        },
-        domain="dexteleop.agent_state.mujoco_agent_tcp_pose_availability.v1",
-    )
     route_items = [
         SkillRouteManifestEntry(
             route=route,
@@ -3103,13 +3137,10 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
                 ),
             ),
         ),
-        SkillRouteManifestEntry(
-            route=state_route,
-            deployment_binding=state_binding.to_ref(),
-            evaluation_plan_hash=None,
-            availability_hash=state_availability,
-        ),
+        state_entry,
     ]
+    if tcp_pose_comparison_registration is not None:
+        route_items.append(tcp_pose_comparison_registration.entry)
     for _, _, safe_route, planned_contract in planned_motions:
         route_items.append(
             SkillRouteManifestEntry(
@@ -3350,12 +3381,6 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
             "second_dispatch_owner",
         ),
     )
-    # Passive state schemas expose the Station frame, not the IK execution frame.
-    public_state_exact = {
-        **exact,
-        "reference_frame_id": state_binding.reference_frame_id,
-        "reference_frame_spec_hash": state_binding.reference_frame_spec_hash,
-    }
     validator_items = [
         _motion_validators(
             route=route,
@@ -3366,11 +3391,7 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
             route=cardinal_step_route,
             profile=cardinal_step_profile,
         ),
-        _state_validators(
-            route=state_route,
-            schema_entry=state_schema,
-            exact=public_state_exact,
-        ),
+        state_validator,
     ]
     validator_items[2:2] = [
         _cardinal_step_validators(
@@ -3418,6 +3439,8 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
         validator_items.append(rgb_capture.payload_validator)
     if spatial_goal_registration is not None:
         validator_items.append(spatial_goal_registration.payload_validator)
+    if tcp_pose_comparison_registration is not None:
+        validator_items.append(tcp_pose_comparison_registration.payload_validator)
     if segmentation is not None:
         validator_items.append(segmentation.payload_validator)
     if placement is not None:
@@ -3456,6 +3479,7 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
         execution_manifest=execution,
         safe_tcp_pose_contract=safe_contract,
         spatial_goal_registration=spatial_goal_registration,
+        tcp_pose_comparison_registration=tcp_pose_comparison_registration,
         grasp_approach_contract=grasp_contract,
         grasp_contact_contract=contact_contract,
         depth_capture=depth_capture,

@@ -154,6 +154,7 @@ def assemble_exclusive_real_agent_primitive_deployment(
     measured_qpos_observer: RealSkillMeasuredQposObserver | None = None,
     convergence_profile: RealAgentPrimitiveConvergenceProfile | None = None,
     enable_spatial_goals: bool = False,
+    enable_tcp_pose_comparison: bool = False,
     perception_capture: RealPerceptionCaptureRegistration | None = None,
     rgbd_geometry_registrations: tuple[RgbdGeometryRegistration, ...] = (),
     localization_registration: RealObjectLocalizationRegistration | None = None,
@@ -206,6 +207,7 @@ def assemble_exclusive_real_agent_primitive_deployment(
         )
     bundle = build_real_agent_primitive_contract_bundle(
         enable_spatial_goals=enable_spatial_goals,
+        enable_tcp_pose_comparison=enable_tcp_pose_comparison,
         gripper_contract=gripper_contract,
         attachment=observation_attachment,
         port_config=port_config,
@@ -307,6 +309,7 @@ def assemble_exclusive_rm65_agent_primitive_deployment(
     allowed_client_ids: tuple[str, ...],
     convergence_profile: RealAgentPrimitiveConvergenceProfile | None = None,
     enable_spatial_goals: bool = False,
+    enable_tcp_pose_comparison: bool = False,
     perception_capture: RealPerceptionCaptureRegistration | None = None,
     rgbd_geometry_registrations: tuple[RgbdGeometryRegistration, ...] = (),
     localization_registration: RealObjectLocalizationRegistration | None = None,
@@ -351,6 +354,7 @@ def assemble_exclusive_rm65_agent_primitive_deployment(
         )
     return assemble_exclusive_real_agent_primitive_deployment(
         enable_spatial_goals=enable_spatial_goals,
+        enable_tcp_pose_comparison=enable_tcp_pose_comparison,
         gripper_port=gripper_port,
         gripper_ports=gripper_ports,
         target_builder=target_builder,
