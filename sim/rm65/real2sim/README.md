@@ -93,8 +93,23 @@ fixed historical values rather than silently reinterpreting the fit against
 the current files.
 
 当前运行时源码绑定是
+`artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261022_v9.json`。
+它在冻结 v8 的基础上，登记固定左右单臂 Skill 会话的 planned-motion 更新，
+并补充 `agent_skill_target.py` 依赖；会话只选一臂，另一臂保留实测碰撞支持，
+默认仍为右臂。左臂抓取、夹爪、历史、空间推理及模型组合仍拒绝启用。
+源码修订为 `e4ab4e5d0580dd4cae3d2ce8aa783979025e5c0c`，这是添加本清单之前
+的实现提交；聚焦测试实际运行于 HEAD `11c34162e` 加 MERGE_HEAD `71faf8b1d`，
+其暂存树与 e4 的 `84cc94c8` 完全相同，并非提交 e4 后重跑。
+本清单、说明和回归迁移不改动所绑定的运行时代码。
+v9 按精确哈希引用 78 模块、1893 通过／6 跳过的聚焦离线报告及其源码树绑定，
+不把可选依赖跳过计为通过，也不把 v8 的 401 项报告解释成新实现的证据。
+首轮完整验收发现旧绑定未更新，此问题和修复后的完整重跑另行留存于阶段验收记录。
+本次没有重拟合、没有新增真机或 held-out 证据；`provisional` 与 held-out
+`not_run` 保持不变。v8、v7、v5 和 v4 拟合清单均按原字节保留。
+
+v8 历史运行时源码绑定冻结于
 `artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261018_v8.json`。
-它绑定当前 actuator、MuJoCo executor、最终命令准入、rig／assembly，以及显式
+它绑定当时 actuator、MuJoCo executor、最终命令准入、rig／assembly，以及显式
 目标接触的 oracle、projection、result、binding 和 planned-motion 源码，同时保留
 原 simulation contract、相机登记、冻结 v4 拟合及 v7／v5 运行时绑定的精确身份。
 本次相对 v7 改动两个既有源码文件，并新增五项接触路径源码依赖；没有调整执行器
