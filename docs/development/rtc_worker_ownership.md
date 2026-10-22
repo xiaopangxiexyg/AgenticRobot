@@ -77,3 +77,22 @@ r3 将唯一线程 owner 实现放到纯标准库的 robot_motion.runtime.owned_
 只重导出同一类；本批四个生产消费者直接使用 canonical 路径。collection 原本已依赖同层
 runtime，不调整 sys.path、不替换 sys.modules、不复制 owner。新增类 identity 检查，并保留
 原有两个 writer shadowed-utils 测试。以新的固定候选和全新完整验收收束本阶段。
+
+
+## 发布前二次复核：真实 stale 恢复
+
+旧版恢复入口只清故障，但 reference worker 已由外层异常处理退出；旧用例只手工
+注入 fault，未验证重新派发。修复仅在真实 source-stale 分支保留原线程等待，
+完成原 generation 失效和 Hold 后发布同一 owner/fault 的 parked 事实；不重建线程、
+不重绑 affinity、不自动恢复目标，也不导入未合并 native 调度栈。
+
+显式恢复与 stale handler 使用同一 dispatch 序列，成功 Hold 后再次核对 fault identity、
+parked owner、pending/fatal blocker 和永久 close fence。新的 secondary worker failure
+始终阻断恢复，clear、成功 Hold 和流重置不能清除它。worker 内中断也记录为 fatal 后
+退出；同步 start/clear/close 的中断传播规则保持。非 stale 故障仍退出原线程。
+原有窄分类用例改为真实线程触发，新增恢复后再次派发、关闭与双故障竞争回归。
+
+手动安全复位同样在观测校验前后核对同一 fault，并通过短 close gate 与关闭建立
+先后顺序；pending、secondary fatal、启动失败或 Hold 未完成时拒绝清故障。故障与
+generation 的变更在 close gate 内提交，观测校验、诊断和流重置不跨该 gate。
+secondary fatal 的有界诊断在 pending-first 与 primary-first 顺序下均进入公开快照。

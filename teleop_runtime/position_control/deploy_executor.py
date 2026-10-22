@@ -781,6 +781,9 @@ class PositionDeployExecutor:
         self._fault_pending = False
         self._fault_pending_stage: str | None = None
         self._fault_pending_error: str | None = None
+        self._fault_pending_token: int | None = None
+        self._stale_reference_pause: tuple[OwnedThread, BaseException] | None = None
+        self._stale_recovery_blocker: dict[str, Any] | None = None
 
         self._submitted_count = 0
         self._reference_count = 0
@@ -1858,85 +1861,77 @@ class PositionDeployExecutor:
         self._wake.set()
 
     def recover_stale_reference_fault(self, *, reason: str) -> Mapping[str, Any]:
-        """Recover one explicitly classified RTC source-stream stale fault.
+        """Release one real source-stale pause after Hold, never revive an owner.
 
-        A slow RTC exchange can outlive the position reference queue while the
-        reference worker is still running.  The worker then latches its
-        ``TimeoutError`` before the deployment loop gets a chance to observe
-        the corresponding RTC deadline result.  ``clear()`` intentionally
-        does not clear latched faults, so without a narrow recovery seam the
-        deployment exits on the next loop even though the producer failure is
-        recoverable.
-
-        This method is deliberately *not* a general executor re-arm.  It only
-        accepts the exact background fault produced by the stale-source guard;
-        reference deadline overruns, backend failures, collision/safety gates,
-        and every other fault remain restart/manual-rearm paths.  Clearing the
-        stream first preserves the existing generation invalidation and Hold
-        ordering.  A real-hardware Hold callback must succeed before the
-        stale fault is released.
+        The reference owner retains its thread and CPU-affinity receipt while
+        parked on this fault. Other worker failures remain terminal. A new
+        fault, secondary fatal, failed Hold, or permanent close fence prevents
+        recovery. No reference or discrete owner is constructed here.
         """
-
         self._reject_worker_lifecycle_call("recover_stale_reference_fault")
         normalized_reason = str(reason).strip()
         if not normalized_reason:
             raise ValueError("reason must be non-empty")
-
-        with self._lock:
-            fault = self._fault
-            fault_stage = self._fault_stage
-            fault_text = "" if fault is None else str(fault)
-            recoverable = bool(
-                isinstance(fault, TimeoutError)
-                and fault_stage == "reference_worker"
-                and "position keyframe stream is stale" in fault_text
-            )
-            fault_payload = {
-                "fault_type": None if fault is None else type(fault).__name__,
-                "fault_stage": fault_stage,
-                "fault": fault_text or None,
-                "fault_metadata": (
-                    None if self._fault_metadata is None else dict(self._fault_metadata)
-                ),
-            }
-        if not recoverable:
-            raise PositionDeployExecutorFault(
-                "only the explicit stale reference-worker TimeoutError can be "
-                "recovered; restart/manual re-arm is required for the current "
-                f"executor fault ({fault_stage or 'none'}: {fault_text or 'none'})"
-            )
-
-        # clear() invalidates every queued/in-flight generation and performs
-        # the normal backend Hold ordering.  If the Hold callback fails, the
-        # original fault remains latched and this method propagates that error.
-        self.clear()
+        # The stale handler publishes latch/Hold/park in this same sequence.
+        # clear() deliberately re-enters this RLock; the brief close gate is
+        # never held across its callbacks or waits.
         with self._dispatch_lock:
             with self._lock:
-                current_fault = self._fault
-                current_text = "" if current_fault is None else str(current_fault)
-                if not (
-                    isinstance(current_fault, TimeoutError)
-                    and self._fault_stage == "reference_worker"
-                    and "position keyframe stream is stale" in current_text
-                ):
-                    raise PositionDeployExecutorFault(
-                        "stale reference fault changed while recovery was in progress"
-                    )
-                self._fault = None
-                self._fault_stage = None
-                self._fault_metadata = None
-                self._fault_pending = False
-                self._fault_pending_stage = None
-                self._fault_pending_error = None
-                recovery_payload = {
-                    "reason": normalized_reason,
-                    **fault_payload,
-                    "generation": int(self._generation),
-                }
-                self._append_debug_event_locked(
-                    "recoverable_stale_reference_fault_cleared",
-                    recovery_payload,
-                )
+                with self._close_call_lock:
+                    if self._closing or self._closed or self._stop.is_set():
+                        raise RuntimeError("position deploy executor is closed")
+                    fault = self._fault
+                    fault_stage = self._fault_stage
+                    fault_text = "" if fault is None else str(fault)
+                    if not (isinstance(fault, TimeoutError)
+                            and fault_stage == "reference_worker"
+                            and "position keyframe stream is stale" in fault_text):
+                        raise PositionDeployExecutorFault(
+                            "only the explicit stale reference-worker TimeoutError can be "
+                            "recovered; restart/manual re-arm is required for the current "
+                            f"executor fault ({fault_stage or 'none'}: {fault_text or 'none'})")
+                    pause = self._stale_reference_pause
+                    if (pause is None or pause[0] is not self._thread
+                            or pause[1] is not fault):
+                        raise PositionDeployExecutorFault(
+                            "stale reference owner did not publish its parked recovery receipt")
+                    if (self._fault_pending or self._stale_recovery_blocker is not None
+                            or self._worker_start_error is not None):
+                        raise PositionDeployExecutorFault(
+                            "stale reference recovery is blocked by another worker failure")
+                    fault_payload = {
+                        "fault_type": type(fault).__name__, "fault_stage": fault_stage,
+                        "fault": fault_text,
+                        "fault_metadata": None if self._fault_metadata is None else dict(self._fault_metadata),
+                    }
+            # Invalidate the old generation and drain the hand callback before
+            # Hold. A failed/interrupted Hold propagates and leaves this fault.
+            self.clear()
+            with self._lock:
+                with self._close_call_lock:
+                    if self._closing or self._closed or self._stop.is_set():
+                        raise RuntimeError("position deploy executor is closed")
+                    if self._fault is not fault:
+                        raise PositionDeployExecutorFault(
+                            "stale reference fault changed while recovery was in progress")
+                    pause = self._stale_reference_pause
+                    if (pause is None or pause[0] is not self._thread or pause[1] is not fault
+                            or self._fault_pending or self._stale_recovery_blocker is not None
+                            or self._worker_start_error is not None or self._hold_retry_required):
+                        raise PositionDeployExecutorFault(
+                            "stale reference recovery is blocked by another worker failure")
+                    self._fault = None
+                    self._fault_stage = None
+                    self._fault_metadata = None
+                    self._fault_pending = False
+                    self._fault_pending_stage = None
+                    self._fault_pending_error = None
+                    self._fault_pending_token = None
+                    self._stale_reference_pause = None
+                    recovery_payload = {"reason": normalized_reason, **fault_payload,
+                        "generation": int(self._generation), "reference_worker_retained": True}
+                    self._append_debug_event_locked(
+                        "recoverable_stale_reference_fault_cleared", recovery_payload)
         self._wake.set()
         return recovery_payload
 
@@ -2083,6 +2078,11 @@ class PositionDeployExecutor:
         self._reject_worker_lifecycle_call("manual_rearm")
         if not isinstance(observation, DeploymentObservation):
             raise TypeError("observation must be a DeploymentObservation")
+        with self._lock:
+            with self._close_call_lock:
+                if self._closing or self._closed or self._stop.is_set():
+                    raise RuntimeError("position deploy executor is closed")
+                fault = self._fault
         details = self._validate_observation_reference_domain(
             observation,
             pose_sides=tuple(self.canonical_pipeline.active_sides),
@@ -2091,25 +2091,38 @@ class PositionDeployExecutor:
         )
         with self._dispatch_lock:
             with self._lock:
-                if self._fault is None:
-                    return {"rearmed": False, "reason": "not_faulted", **details}
-                if self._fault_stage not in {
-                    "safety_gate",
-                    "15hz_keyframe_safety",
-                    "reference_anchor_safety",
-                }:
-                    raise PositionDeployExecutorFault(
-                        "manual re-arm is permitted only for a latched safety-gate fault; "
-                        "restart and re-home after other executor faults"
-                    )
-                self._fault = None
-                self._fault_stage = None
-                self._fault_metadata = None
-                self._fault_pending = False
-                self._fault_pending_stage = None
-                self._fault_pending_error = None
-                invalidated_generation = self._generation
-                self._generation += 1
+                with self._close_call_lock:
+                    if self._closing or self._closed or self._stop.is_set():
+                        raise RuntimeError("position deploy executor is closed")
+                    if self._fault is not fault:
+                        raise PositionDeployExecutorFault(
+                            "safety fault changed while manual re-arm was in progress"
+                        )
+                    if (self._fault_pending or self._stale_recovery_blocker is not None
+                            or self._worker_start_error is not None or self._hold_retry_required):
+                        raise PositionDeployExecutorFault(
+                            "manual re-arm is blocked by another worker failure"
+                        )
+                    if self._fault is None:
+                        return {"rearmed": False, "reason": "not_faulted", **details}
+                    if self._fault_stage not in {
+                        "safety_gate",
+                        "15hz_keyframe_safety",
+                        "reference_anchor_safety",
+                    }:
+                        raise PositionDeployExecutorFault(
+                            "manual re-arm is permitted only for a latched safety-gate fault; "
+                            "restart and re-home after other executor faults"
+                        )
+                    self._fault = None
+                    self._fault_stage = None
+                    self._fault_metadata = None
+                    self._fault_pending = False
+                    self._fault_pending_stage = None
+                    self._fault_pending_error = None
+                    self._fault_pending_token = None
+                    invalidated_generation = self._generation
+                    self._generation += 1
                 self._notify_reference_generation_invalidation_locked(
                     legacy_worker_generation=invalidated_generation,
                     reason="manual_safety_rearm",
@@ -3211,6 +3224,14 @@ class PositionDeployExecutor:
                 )
             self._reference_worker_affinity_ready.set()
             while not self._stop.is_set():
+                with self._lock:
+                    fault_wait = self._fault is not None or self._fault_pending or self._closing
+                if fault_wait:
+                    # A parked owner must not consume old submissions or read
+                    # clocks until an explicit recovery or close wakes it.
+                    self._wake.wait(timeout=0.05)
+                    self._wake.clear()
+                    continue
                 # Admit at most one 15 Hz source update before returning to the
                 # authoritative 60 Hz deadline.  An unbounded drain can starve
                 # the first reference when a second source point arrives while
@@ -3236,10 +3257,20 @@ class PositionDeployExecutor:
 
                 now = _finite_time(self._clock(), name="clock")
                 if now - last_source > self.config.stale_after_sec:
-                    raise TimeoutError(
+                    stale_fault = TimeoutError(
                         f"{self.config.sample_hz:g} Hz position keyframe stream is stale: "
                         f"age={now - last_source:.6f}s limit={self.config.stale_after_sec:.6f}s"
                     )
+                    self._mark_fault_pending(stale_fault, stage="reference_worker")
+                    with self._dispatch_lock:
+                        self._latch_fault(stale_fault, stage="reference_worker",
+                            metadata={"worker": "reference"})
+                        with self._lock:
+                            if (self._fault is stale_fault and not self._closing
+                                    and not self._closed and not self._stop.is_set()
+                                    and threading.current_thread() is self._thread):
+                                self._stale_reference_pause = (self._thread, stale_fault)
+                    continue
                 if now + _TIME_EPSILON_SEC < next_tick:
                     self._wake.wait(timeout=min(next_tick - now, 0.05))
                     self._wake.clear()
@@ -3452,7 +3483,7 @@ class PositionDeployExecutor:
                                 f"{planner_timing_labels['precompute_submit']}"
                             )
                     self._next_tick_timestamp = following
-        except Exception as exc:  # noqa: BLE001 - a worker failure must be latched.
+        except BaseException as exc:  # noqa: BLE001 - a worker failure must be latched.
             self._mark_fault_pending(exc, stage="reference_worker")
             self._latch_fault(
                 exc,
@@ -3460,10 +3491,16 @@ class PositionDeployExecutor:
                 metadata={"worker": "reference"},
             )
 
+        finally:
+            with self._lock:
+                pause = self._stale_reference_pause
+                if pause is not None and pause[0] is threading.current_thread():
+                    self._stale_reference_pause = None
+
     def _run_discrete_dispatch(self) -> None:
         try:
             self._run_discrete_dispatch_impl()
-        except Exception as exc:  # noqa: BLE001 - every worker exit must fault-latch.
+        except BaseException as exc:  # noqa: BLE001 - every worker exit must fault-latch.
             self._mark_fault_pending(exc, stage="discrete_dispatch_worker_internal")
             self._latch_fault(
                 exc,
@@ -3528,7 +3565,7 @@ class PositionDeployExecutor:
                         accepted, skipped, receipt = self._classify_discrete_result(
                             callback_result
                         )
-                    except Exception as exc:  # fault is latched after releasing this lock.
+                    except BaseException as exc:  # fault is latched after releasing this lock.
                         # Close the arm-dispatch gate before doing any logging
                         # or receipt formatting. A reference tick that has not yet
                         # crossed its final pre-dispatch check must stop now.
@@ -5749,21 +5786,35 @@ class PositionDeployExecutor:
                 f"position deploy {operation} cannot be called from its worker/hold callback"
             )
 
+    def _block_stale_recovery_locked(self, *, stage: str, error: str) -> None:
+        if self._stale_recovery_blocker is not None:
+            return
+        # Retain bounded diagnostic text, never a second traceback/owner. This
+        # fatal blocker survives clear(), Hold and all stream resets.
+        self._stale_recovery_blocker = {"stage": str(stage), "error": str(error)[:1000]}
+        if self._fault_metadata is not None:
+            self._fault_metadata["stale_recovery_blocker"] = dict(self._stale_recovery_blocker)
+        self._append_debug_event_locked("stale_reference_recovery_blocked",
+            dict(self._stale_recovery_blocker))
+
     def _mark_fault_pending(self, exc: BaseException, *, stage: str) -> None:
         with self._lock:
             if self._fault is not None:
+                if exc is not self._fault:
+                    self._block_stale_recovery_locked(stage=stage,
+                        error=f"{type(exc).__name__}: {exc}")
+                return
+            if self._fault_pending:
+                if self._fault_pending_token != id(exc):
+                    self._block_stale_recovery_locked(stage=stage,
+                        error=f"{type(exc).__name__}: {exc}")
                 return
             self._fault_pending = True
             self._fault_pending_stage = str(stage)
             self._fault_pending_error = f"{type(exc).__name__}: {exc}"
-            self._append_debug_event_locked(
-                "fault_pending",
-                {
-                    "stage": str(stage),
-                    "error_type": type(exc).__name__,
-                    "error": str(exc),
-                },
-            )
+            self._fault_pending_token = id(exc)
+            self._append_debug_event_locked("fault_pending", {
+                "stage": str(stage), "error_type": type(exc).__name__, "error": str(exc)})
 
     def _latch_fault(
         self,
@@ -5776,12 +5827,20 @@ class PositionDeployExecutor:
         with self._dispatch_lock:
             with self._lock:
                 if self._fault is not None:
+                    if exc is not self._fault:
+                        self._block_stale_recovery_locked(stage=stage,
+                            error=f"{type(exc).__name__}: {exc}")
                     return
+                if self._fault_pending and self._fault_pending_token != id(exc):
+                    self._block_stale_recovery_locked(
+                        stage=self._fault_pending_stage or stage,
+                        error=self._fault_pending_error or "different pending worker failure")
                 self._fault = exc
                 self._fault_stage = str(stage)
                 self._fault_pending = False
                 self._fault_pending_stage = None
                 self._fault_pending_error = None
+                self._fault_pending_token = None
                 self._fault_metadata = dict(metadata or {})
                 self._fault_metadata.update(
                     {
@@ -5790,6 +5849,10 @@ class PositionDeployExecutor:
                         "error": str(exc),
                     }
                 )
+                if self._stale_recovery_blocker is not None:
+                    self._fault_metadata["stale_recovery_blocker"] = dict(
+                        self._stale_recovery_blocker
+                    )
                 should_hold = bool(
                     self.dispatch_callback is not None
                     or self._active

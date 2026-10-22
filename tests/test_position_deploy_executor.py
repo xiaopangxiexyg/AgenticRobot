@@ -2762,35 +2762,16 @@ def test_dispatch_fault_is_latched_and_requests_hold() -> None:
 
 
 def test_stale_reference_fault_has_narrow_rtc_recovery_seam() -> None:
-    holds: list[str] = []
-    executor = PositionDeployExecutor(
-        config=PositionDeployExecutorConfig(stale_after_sec=0.5),
-        canonical_pipeline=_pipeline(("left",)),
-        dispatch_callback=lambda _command: None,
-        hold_callback=lambda: holds.append("hold"),
-    )
+    executor, _clock, _commands, holds = _real_stale_recovery_case()
     try:
-        executor._latch_fault(
-            TimeoutError(
-                "15 Hz position keyframe stream is stale: "
-                "age=0.251713s limit=0.250000s"
-            ),
-            stage="reference_worker",
-            metadata={"source": "test"},
-        )
-        receipt = executor.recover_stale_reference_fault(
-            reason="rtc_result_timeout",
-        )
+        receipt = executor.recover_stale_reference_fault(reason="rtc_result_timeout")
         assert receipt["fault_type"] == "TimeoutError"
         assert receipt["fault_stage"] == "reference_worker"
         assert executor.snapshot()["fault_latched"] is False
         assert executor.snapshot()["active"] is False
         assert holds == ["hold", "hold"]
-
-        executor._latch_fault(
-            TimeoutError("reference deadline burst exceeded"),
-            stage="reference_worker",
-        )
+        executor._latch_fault(TimeoutError("reference deadline burst exceeded"),
+            stage="reference_worker")
         with pytest.raises(PositionDeployExecutorFault, match="only the explicit stale"):
             executor.recover_stale_reference_fault(reason="rtc_result_timeout")
         assert executor.snapshot()["fault_latched"] is True
@@ -4605,3 +4586,474 @@ def test_shared_backend_health_error_preserves_typed_readiness_receipt():
     health = caught.value.health
     assert health["ready"] is False
     assert health["sides"]["right"]["state_error"] == "TypeError: single-read typed failure"
+
+
+class _StaleRecoveryWake:
+    """Expose the real reference owner's post-dispatch wait without retiming it."""
+
+    def __init__(self, executor, dispatched):
+        self.executor = executor
+        self.dispatched = dispatched
+        self.event = threading.Event()
+        self.ready = threading.Event()
+
+    def wait(self, timeout=None):
+        if (threading.current_thread() is self.executor._thread
+                and self.dispatched.is_set() and self.executor._fault is None):
+            self.ready.set()
+        return self.event.wait(timeout)
+
+    def set(self):
+        self.event.set()
+
+    def clear(self):
+        self.event.clear()
+
+
+def _real_stale_recovery_case(*, hold_callback=None, discrete_callback=None):
+    clock = {"value": 10.0}
+    commands = []
+    dispatched = threading.Event()
+    holds = []
+
+    def dispatch(command):
+        commands.append(command)
+        dispatched.set()
+
+    def hold():
+        holds.append("hold")
+        if hold_callback is not None:
+            hold_callback()
+
+    executor = PositionDeployExecutor(
+        config=PositionDeployExecutorConfig(stale_after_sec=0.5),
+        canonical_pipeline=_pipeline(("left",)),
+        dispatch_callback=dispatch,
+        discrete_dispatch_callback=discrete_callback,
+        hold_callback=hold,
+        clock=lambda: clock["value"],
+        wall_clock=lambda: 1_700_000_000.0 + clock["value"],
+    )
+    wake = _StaleRecoveryWake(executor, dispatched)
+    executor._wake = wake
+    executor.start()
+    try:
+        executor.submit(_filtered_pose("left", _pose(0.16)), _observation(), "before-stale")
+        assert wake.ready.wait(1.0), "reference owner did not reach its next-tick wait"
+        clock["value"] = 11.0
+        wake.set()
+        _wait_until(lambda: executor.snapshot()["fault_latched"])
+        _wait_until(lambda: executor._thread._runner_completed.is_set()
+                    or getattr(executor, "_stale_reference_pause", None) is not None)
+        assert "position keyframe stream is stale" in executor.snapshot()["fault"]
+        return executor, clock, commands, holds
+    except BaseException:
+        executor.close()
+        raise
+
+
+def test_real_stale_recovery_resumes_same_reference_owner():
+    executor, clock, commands, holds = _real_stale_recovery_case()
+    owner = executor._thread
+    try:
+        before = len(commands)
+        receipt = executor.recover_stale_reference_fault(reason="rtc_result_timeout")
+        assert receipt["fault_type"] == "TimeoutError"
+        assert executor.snapshot()["active"] is False
+        executor.submit(_filtered_pose("left", _pose(0.17)), _observation(), "after-stale")
+        _wait_until(lambda: len(commands) > before)
+        assert executor._thread is owner
+        assert not owner._runner_completed.is_set()
+        assert executor.snapshot()["fault_latched"] is False
+        assert holds == ["hold", "hold"]
+    finally:
+        executor.close()
+    assert executor.shutdown_snapshot()["dispatch_workers_stopped"] is True
+
+
+def test_stale_recovery_rejects_closed_executor():
+    executor, _clock, _commands, _holds = _real_stale_recovery_case()
+    fault = executor._fault
+    executor.close()
+    with pytest.raises(RuntimeError, match="closed"):
+        executor.recover_stale_reference_fault(reason="rtc_result_timeout")
+    assert executor._fault is fault
+    assert executor.shutdown_snapshot()["dispatch_workers_stopped"] is True
+
+
+def test_stale_recovery_rejects_replaced_fault_identity(monkeypatch):
+    executor, _clock, _commands, _holds = _real_stale_recovery_case()
+    old = executor._fault
+    replacement = TimeoutError(str(old))
+    original_clear = executor.clear
+
+    def replace_during_clear():
+        original_clear()
+        with executor._lock:
+            executor._fault = replacement
+
+    monkeypatch.setattr(executor, "clear", replace_during_clear)
+    try:
+        with pytest.raises(PositionDeployExecutorFault, match="changed"):
+            executor.recover_stale_reference_fault(reason="rtc_result_timeout")
+        assert executor._fault is replacement
+        assert executor.snapshot()["fault_latched"] is True
+    finally:
+        executor.close()
+
+
+def _fresh_rearm_observation():
+    return _observation(arm_state_overrides={
+        "left": {"hardware_measurement_timestamp": time.time()}})
+
+
+def test_stale_park_does_not_read_clock_or_dispatch_before_explicit_recovery():
+    executor, clock, commands, _holds = _real_stale_recovery_case()
+    fault = executor._fault
+    generation = executor._generation
+    before = len(commands)
+    clock_read = threading.Event()
+    original_clock = executor._clock
+
+    def forbidden_clock():
+        clock_read.set()
+        raise RuntimeError("parked owner must not read clock")
+
+    try:
+        executor._clock = forbidden_clock
+        executor._wake.set()
+        assert not clock_read.wait(0.08)
+        assert len(commands) == before
+        assert executor._fault is fault
+        assert executor.snapshot()["queue_depth"] == 0
+        with pytest.raises(PositionDeployExecutorFault):
+            executor.submit(_filtered_pose("left", _pose(0.18)), _observation(),
+                            "rejected-old-generation", timestamp_monotonic=clock["value"])
+        executor._clock = original_clock
+        executor.recover_stale_reference_fault(reason="explicit-new-session")
+        assert executor._generation > generation
+        assert executor.snapshot()["active"] is False
+        assert executor.snapshot()["queue_depth"] == 0
+        assert len(commands) == before
+    finally:
+        executor._clock = original_clock
+        executor.close()
+    assert executor.shutdown_snapshot()["dispatch_workers_stopped"] is True
+
+
+def test_stale_recovery_repeated_cycles_retain_both_owners_and_affinity(monkeypatch):
+    affinity_calls = []
+    original_bind = deploy_executor_module.bind_current_thread_to_cpu
+
+    def counted_bind(cpu, *, role):
+        affinity_calls.append(threading.current_thread())
+        return original_bind(cpu, role=role)
+
+    monkeypatch.setattr(deploy_executor_module, "bind_current_thread_to_cpu", counted_bind)
+    executor, clock, commands, holds = _real_stale_recovery_case(
+        discrete_callback=lambda _command: True)
+    owners = executor._thread, executor._discrete_thread
+    receipt = executor.snapshot()["reference_worker_affinity_receipt"]
+    try:
+        for cycle in range(3):
+            before = len(commands)
+            executor.recover_stale_reference_fault(reason=f"cycle-{cycle}")
+            executor._wake.ready.clear()
+            executor.submit(_filtered_pose("left", _pose(0.17)), _observation(),
+                            f"fresh-{cycle}", discrete_command=_hand_command("left", 0.4))
+            _wait_until(lambda: len(commands) > before)
+            _wait_until(lambda: executor._next_tick_timestamp > clock["value"])
+            assert (executor._thread, executor._discrete_thread) == owners
+            assert executor.snapshot()["reference_worker_affinity_receipt"] == receipt
+            if cycle < 2:
+                clock["value"] += 1.0
+                executor._wake.set()
+                _wait_until(lambda: executor._stale_reference_pause is not None)
+        assert affinity_calls == [owners[0]]
+        assert len(holds) == 6
+    finally:
+        executor.close()
+    assert executor.shutdown_snapshot()["dispatch_workers_stopped"] is True
+    assert all(owner._runner_completed.is_set() for owner in owners)
+
+
+def test_stale_recovery_failed_hold_preserves_pause_then_allows_successful_retry():
+    fail = {"enabled": True}
+
+    def hold():
+        if fail["enabled"]:
+            raise RuntimeError("unit hold failure")
+
+    executor, _clock, _commands, _holds = _real_stale_recovery_case(hold_callback=hold)
+    fault = executor._fault
+    pause = executor._stale_reference_pause
+    try:
+        assert executor.snapshot()["hold_retry_required"] is True
+        with pytest.raises(RuntimeError, match="unit hold failure"):
+            executor.recover_stale_reference_fault(reason="failed-hold")
+        assert executor._fault is fault
+        assert executor._stale_reference_pause is pause
+        assert executor.snapshot()["hold_retry_required"] is True
+        fail["enabled"] = False
+        executor.recover_stale_reference_fault(reason="successful-hold")
+        assert executor.snapshot()["hold_retry_required"] is False
+        assert executor._fault is None
+    finally:
+        fail["enabled"] = False
+        executor.close()
+
+
+@pytest.mark.parametrize("interrupt_type", [KeyboardInterrupt, SystemExit])
+def test_stale_hold_interrupt_exits_owner_and_permanently_blocks_recovery(interrupt_type):
+    calls = {"count": 0}
+
+    def hold():
+        calls["count"] += 1
+        if calls["count"] == 1:
+            raise interrupt_type("unit hold interrupt")
+
+    executor, _clock, _commands, _holds = _real_stale_recovery_case(hold_callback=hold)
+    fault = executor._fault
+    try:
+        assert executor._thread._runner_completed.wait(1.0)
+        assert executor._stale_reference_pause is None
+        assert executor.snapshot()["fault_metadata"]["stale_recovery_blocker"]["stage"] == "reference_worker"
+        with pytest.raises(PositionDeployExecutorFault, match="parked recovery receipt"):
+            executor.recover_stale_reference_fault(reason="interrupted-owner")
+        assert executor._fault is fault
+    finally:
+        executor.close()
+    assert executor.shutdown_snapshot()["dispatch_workers_stopped"] is True
+
+
+def test_stale_recovery_close_fence_wins_while_hold_is_inflight():
+    entered = threading.Event()
+    release = threading.Event()
+    calls = {"count": 0}
+
+    def hold():
+        calls["count"] += 1
+        if calls["count"] == 2:
+            entered.set()
+            assert release.wait(1.0)
+
+    executor, _clock, _commands, _holds = _real_stale_recovery_case(hold_callback=hold)
+    fault = executor._fault
+    errors = []
+
+    def recover():
+        try:
+            executor.recover_stale_reference_fault(reason="concurrent-close")
+        except BaseException as exc:
+            errors.append(exc)
+
+    recovery = threading.Thread(target=recover)
+    closer = threading.Thread(target=executor.close)
+    try:
+        recovery.start()
+        assert entered.wait(1.0)
+        closer.start()
+        _wait_until(lambda: executor._closed)
+    finally:
+        release.set()
+        recovery.join(1.0)
+        if closer.ident is not None:
+            closer.join(1.0)
+        executor.close()
+    assert not recovery.is_alive() and not closer.is_alive()
+    assert len(errors) == 1 and isinstance(errors[0], RuntimeError)
+    assert "closed" in str(errors[0])
+    assert executor._fault is fault
+    assert executor.shutdown_snapshot()["dispatch_workers_stopped"] is True
+
+
+def test_concurrent_stale_recovery_has_one_success_and_no_recreated_owner():
+    executor, _clock, _commands, _holds = _real_stale_recovery_case()
+    owner = executor._thread
+    barrier = threading.Barrier(3)
+    results, errors = [], []
+
+    def recover():
+        barrier.wait(1.0)
+        try:
+            results.append(executor.recover_stale_reference_fault(reason="concurrent"))
+        except BaseException as exc:
+            errors.append(exc)
+
+    workers = [threading.Thread(target=recover) for _ in range(2)]
+    try:
+        for worker in workers:
+            worker.start()
+        barrier.wait(1.0)
+        for worker in workers:
+            worker.join(1.0)
+        assert not any(worker.is_alive() for worker in workers)
+        assert len(results) == len(errors) == 1
+        assert isinstance(errors[0], PositionDeployExecutorFault)
+        assert executor._thread is owner and not owner._runner_completed.is_set()
+    finally:
+        executor.close()
+
+
+@pytest.mark.parametrize("primary", ["stale", "safety", "pending-first"])
+@pytest.mark.parametrize("error_type", [RuntimeError, KeyboardInterrupt, SystemExit])
+def test_recovery_never_masks_real_inflight_discrete_failure(primary, error_type):
+    clock = {"value": 10.0}
+    hand_entered = threading.Event()
+    release_hand = threading.Event()
+    arm_dispatched = threading.Event()
+    latch_errors = []
+
+    def hand(_command):
+        hand_entered.set()
+        assert release_hand.wait(1.5)
+        raise error_type("unit secondary discrete failure")
+
+    executor = PositionDeployExecutor(
+        config=PositionDeployExecutorConfig(stale_after_sec=0.5),
+        canonical_pipeline=_pipeline(("left",)),
+        dispatch_callback=lambda _command: arm_dispatched.set(),
+        discrete_dispatch_callback=hand, hold_callback=lambda: None,
+        clock=lambda: clock["value"])
+    executor._wake = _StaleRecoveryWake(executor, arm_dispatched)
+    executor.start()
+    latcher = None
+    try:
+        executor.submit(_filtered_pose("left", _pose(0.16)), _observation(), "inflight",
+                        discrete_command=_hand_command("left", 0.4))
+        assert executor._wake.ready.wait(1.0)
+        # The causal hand command becomes due only after the reference query
+        # reaches the source stamp. Advance complete logical ticks, never
+        # retime a callback or skip straight beyond the deadline budget.
+        for _ in range(6):
+            if hand_entered.is_set():
+                break
+            clock["value"] = executor._next_tick_timestamp
+            executor._wake.set()
+            _wait_until(lambda: executor._next_tick_timestamp > clock["value"])
+        assert hand_entered.wait(1.0)
+        if primary == "pending-first":
+            with executor._dispatch_lock:
+                release_hand.set()
+                _wait_until(lambda: executor._fault_pending)
+                executor._latch_fault(TimeoutError("position keyframe stream is stale"),
+                                      stage="reference_worker")
+        elif primary == "stale":
+            clock["value"] = 11.0
+            executor._wake.set()
+            _wait_until(lambda: executor._fault is not None)
+            release_hand.set()
+        else:
+            def latch():
+                try:
+                    executor.latch_safety_fault(["unit safety gate"])
+                except BaseException as exc:
+                    latch_errors.append(exc)
+
+            latcher = threading.Thread(target=latch)
+            latcher.start()
+            _wait_until(lambda: executor._fault is not None)
+            release_hand.set()
+        assert executor._discrete_thread._runner_completed.wait(1.0)
+        if latcher is not None:
+            latcher.join(1.0)
+            assert not latcher.is_alive() and not latch_errors
+        if primary == "stale":
+            _wait_until(lambda: executor._stale_reference_pause is not None)
+        fault = executor._fault
+        blocker = executor.snapshot()["fault_metadata"]["stale_recovery_blocker"]
+        assert "unit secondary discrete failure" in blocker["error"]
+        executor.clear()
+        assert executor.snapshot()["fault_metadata"]["stale_recovery_blocker"] == blocker
+        if primary == "safety":
+            with pytest.raises(PositionDeployExecutorFault, match="another worker failure"):
+                executor.manual_rearm(_fresh_rearm_observation())
+        else:
+            with pytest.raises(PositionDeployExecutorFault):
+                executor.recover_stale_reference_fault(reason="must-not-mask-secondary")
+        assert executor._fault is fault
+        assert executor._stale_recovery_blocker == blocker
+    finally:
+        release_hand.set()
+        if latcher is not None:
+            latcher.join(1.0)
+        executor.close()
+    assert executor.shutdown_snapshot()["dispatch_workers_stopped"] is True
+
+
+@pytest.mark.parametrize("during_validation", [False, True])
+def test_manual_rearm_preserves_fault_after_close(monkeypatch, during_validation):
+    executor = PositionDeployExecutor(
+        config=PositionDeployExecutorConfig(stale_after_sec=0.5),
+        canonical_pipeline=_pipeline(("left",)))
+    executor.start()
+    executor.latch_safety_fault(["unit safety gate"])
+    fault = executor._fault
+    original_validate = executor._validate_observation_reference_domain
+    if during_validation:
+        def validate(*args, **kwargs):
+            details = original_validate(*args, **kwargs)
+            executor.close()
+            return details
+
+        monkeypatch.setattr(executor, "_validate_observation_reference_domain", validate)
+    else:
+        executor.close()
+    try:
+        with pytest.raises(RuntimeError, match="closed"):
+            executor.manual_rearm(_fresh_rearm_observation())
+        assert executor._fault is fault
+    finally:
+        executor.close()
+    assert executor.shutdown_snapshot()["dispatch_workers_stopped"] is True
+
+
+@pytest.mark.parametrize("faulted", [False, True])
+def test_manual_rearm_preserves_new_fault_during_validation(monkeypatch, faulted):
+    executor = PositionDeployExecutor(
+        config=PositionDeployExecutorConfig(stale_after_sec=0.5),
+        canonical_pipeline=_pipeline(("left",)))
+    executor.start()
+    if faulted:
+        executor.latch_safety_fault(["unit safety gate"])
+    original_validate = executor._validate_observation_reference_domain
+    replacement = RuntimeError("safety gate rejected keyframe: unit safety gate")
+
+    def validate(*args, **kwargs):
+        details = original_validate(*args, **kwargs)
+        with executor._lock:
+            executor._fault = replacement
+            executor._fault_stage = "safety_gate"
+        return details
+
+    monkeypatch.setattr(executor, "_validate_observation_reference_domain", validate)
+    try:
+        with pytest.raises(PositionDeployExecutorFault, match="changed"):
+            executor.manual_rearm(_fresh_rearm_observation())
+        assert executor._fault is replacement
+    finally:
+        executor.close()
+
+
+@pytest.mark.parametrize("error_type", [RuntimeError, TimeoutError, KeyboardInterrupt, SystemExit])
+def test_nonstale_reference_worker_failure_stays_terminal(monkeypatch, error_type):
+    executor = PositionDeployExecutor(
+        config=PositionDeployExecutorConfig(stale_after_sec=0.5),
+        canonical_pipeline=_pipeline(("left",)), hold_callback=lambda: None)
+    error = error_type("unit nonstale clock failure")
+
+    def failing_clock():
+        if threading.current_thread() is executor._thread:
+            raise error
+        return time.monotonic()
+
+    monkeypatch.setattr(executor, "_clock", failing_clock)
+    executor.start()
+    try:
+        assert executor._thread._runner_completed.wait(1.0)
+        assert executor._fault is error
+        assert executor._stale_reference_pause is None
+        with pytest.raises(PositionDeployExecutorFault, match="only the explicit stale"):
+            executor.recover_stale_reference_fault(reason="nonstale")
+    finally:
+        executor.close()
