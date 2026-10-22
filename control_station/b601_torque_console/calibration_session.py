@@ -44,7 +44,7 @@ def calibration_outcome(state: str, reason: str) -> dict[str, str]:
         if reason in {
             "human_intervention", "human_contact_or_unknown",
             "human_intervention_unknown", "operator_withdraw", "operator_zero",
-            "page_hidden", "page_unload", "owner_cancel",
+            "page_hidden", "page_unload", "owner_cancel", "operator_return",
         }:
             severity, action = "info", "operator_withdrawal"
         elif reason in incomplete or reason in {"operator_permit_expired", "gui_permit_expired"}:

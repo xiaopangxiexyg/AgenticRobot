@@ -52,6 +52,8 @@ class B601CalibrationModeController:
                 "generation": self._generation, "selected_at_sec": self._selected_at,
                 "available_modes": ["fixed_position", "supported_cycle"] + (["workspace"] if self._workspace is not None else []),
                 "cycle_angle_deg": math.degrees(self.cycle.offset_rad),
+                "supported_return_configured": (self._workspace is not None
+                    and self._workspace.workspace.coordinated_holding is not None),
                 "supported_return_available": (self._selected == "workspace" and self._workspace is not None
                     and self._workspace.workspace.coordinated_holding is not None),
                 "maximum_cycle_angle_deg": math.degrees(self._supported.maximum_offset_rad)}
@@ -142,6 +144,9 @@ class B601CalibrationModeController:
                 return
             if action == "arm" and self._closed:
                 raise ValueError("owner has stopped; mode selection cannot restart it")
+            if action == "return_to_origin" and (self._closed or self._selected != "workspace"
+                or not self._selection()["supported_return_available"]):
+                raise ValueError("supported return requires the configured workspace mode")
             if action == "arm":
                 if (fields.get("operation_mode") != self._selected
                     or set(fields) - {"operation_mode", "cycle_angle_deg", "return_and_disable"}
@@ -152,7 +157,7 @@ class B601CalibrationModeController:
                     raise ValueError("waiting for the owner's zero-assist cycle to confirm this mode")
                 fields = {k: v for k, v in fields.items() if k != "operation_mode"}
             self._delegate().submit(action, now_sec=now, **fields)
-            if action == "arm":
+            if action in {"arm", "return_to_origin"}:
                 self._locked = True
 
     def step(self, **values):

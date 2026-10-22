@@ -13,12 +13,6 @@
   <main>
     <header><div><p class="eyebrow">B601 · LOCAL COMMISSIONING</p><h1>重力与摩擦调试</h1></div><div id="connection" class="badge">连接中</div></header>
     <p class="warning">物理急停优先。软件全失能可能导致机械臂下坠；关闭页面会撤销附加驱动力，重力补偿继续由原 owner 保持。</p>
-    <section class="card jointcard">
-      <h2>实时六轴角度与命令</h2><p class="subtle">角度以模型零点为基准，不是相对启动位置的位移。复用 owner 的控制反馈，不另行查询电机；微小越界值可能已投影至边界，原值保留在 debug trace。力矩列均为软件命令，不是实测受力。</p>
-      <p id="joint-feedback-status" class="subtle" role="status">等待六轴反馈…</p>
-      <div class="table-scroll"><table id="joint-overview"><thead><tr><th>关节</th><th>角度 · °</th><th>角度 · rad</th><th>速度 · rad/s</th><th>本段位移 · rad</th><th>重力 · N·m</th><th>附加驱动 · N·m</th><th>总命令 · N·m</th></tr></thead><tbody id="joint-rows"></tbody></table></div>
-      <p id="joint-observation" class="subtle"></p>
-    </section>
     <section id="mode-selector" class="card experimentcard" hidden>
       <h2>选择本轮测试模式</h2>
       <div class="buttonrow" role="group" aria-label="测试模式">
@@ -26,12 +20,24 @@
         <button id="mode-supported-cycle" type="button" aria-pressed="false">完整流程 · 抬升后测试并返回</button>
         <button id="mode-workspace" type="button" aria-pressed="false" hidden>J2 / J3 · 多位姿自动采集</button>
       </div>
+      <div id="supported-return-panel" class="return-controls" hidden>
+        <h3>回位与停机</h3>
+        <label id="supported-return-control"><input id="supported-return" type="checkbox">本次原位有可靠托架：单轮结束／采集软停止后，缓慢回原位并自动失能</label>
+        <div class="buttonrow"><button id="return-to-origin" type="button" disabled>缓慢回到本次原位</button></div>
+        <p id="supported-return-status" class="subtle" role="status"></p>
+      </div>
       <div id="cycle-angle-control" hidden>
         <label for="cycle-angle">J3 抬升角度 · °（启动前可调）</label>
         <input id="cycle-angle" type="number" min="0.1" max="20" step="0.1" value="20">
         <p id="cycle-angle-note" class="subtle">随“开始完整流程”一起提交，启动后锁定；返回位置仍为本轮起点。</p>
       </div>
       <p id="mode-selection-status" class="command-state" role="status">默认选择当前位置测试；选择模式不会驱动机械臂。</p>
+    </section>
+    <section class="card jointcard">
+      <h2>实时六轴角度与命令</h2><p class="subtle">角度以模型零点为基准，不是相对启动位置的位移。复用 owner 的控制反馈，不另行查询电机；微小越界值可能已投影至边界，原值保留在 debug trace。力矩列均为软件命令，不是实测受力。</p>
+      <p id="joint-feedback-status" class="subtle" role="status">等待六轴反馈…</p>
+      <div class="table-scroll"><table id="joint-overview"><thead><tr><th>关节</th><th>角度 · °</th><th>角度 · rad</th><th>速度 · rad/s</th><th>本段位移 · rad</th><th>重力 · N·m</th><th>附加驱动 · N·m</th><th>总命令 · N·m</th></tr></thead><tbody id="joint-rows"></tbody></table></div>
+      <p id="joint-observation" class="subtle"></p>
     </section>
     <section class="card experimentcard">
       <div class="experiment-options">
@@ -45,8 +51,6 @@
     <section id="automatic-panel" class="card" hidden>
       <h2 id="automatic-mode-title">J3 自动采集</h2><p id="automatic-mode-note" class="subtle"></p><p id="automatic-progress" class="command-state" role="status"></p><p id="cycle-disable-hint" class="command-state" role="status" hidden></p>
       <p id="automatic-data-status" class="subtle" role="status"></p>
-      <label id="supported-return-control" hidden><input id="supported-return" type="checkbox">本次原位有可靠托架：单轮结束／采集软停止后，缓慢回原位并自动失能</label>
-      <p id="supported-return-status" class="subtle" role="status" hidden></p>
       <p id="automatic-sequence-note">先采集正负起动与撤力回退，再采集双速度小范围运动。编码器进展不等于输出侧运动或真实摩擦力；不会自动安装补偿。</p>
       <pre id="automatic-trials"></pre>
     </section>

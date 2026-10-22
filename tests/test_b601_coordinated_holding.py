@@ -1519,6 +1519,88 @@ def test_supported_return_grant_rejects_non_boolean(tmp_path, bad):
     assert not r.controller._coordinated._start
 
 
+@pytest.mark.parametrize("mode_wrapper", [False, True])
+def test_manual_return_from_gravity_without_starting_acquisition_keeps_disable_manual(tmp_path, mode_wrapper):
+    r = replay(tmp_path, mode_wrapper=mode_wrapper)
+    workspace = r.controller._workspace._coordinated if mode_wrapper else r.controller._coordinated
+    for n in range(1, 101):
+        r.tick((0., n*.0002, n*.0003, 0., 0., 0.), dt_sec=.025)
+    for _ in range(15):
+        r.tick(dt_sec=.025)
+    assert workspace._supported_origin == ZERO and workspace._manual_return_gate() == "ready"
+    with pytest.raises(ValueError, match="accepts no manual targets"):
+        r.controller.submit("return_to_origin", now_sec=r.now, target=0.2)
+    r.controller.submit("return_to_origin", now_sec=r.now)
+    assert workspace.pose.goal is None  # The GUI only queues intent.
+    with pytest.raises(ValueError, match="idle owner"):
+        r.controller.submit("arm", now_sec=r.now, **({"operation_mode": "workspace"} if mode_wrapper else {}))
+    r.tick(dt_sec=.025)
+    assert workspace._phase == "return"
+    finish_supported_return_replay(r, workspace)
+    result = r.controller.result_record()
+    assert result["state"] == "cancelled" and result["reason"] == "operator_return"
+    assert result["outcome"]["severity"] == "info"
+    assert workspace._return_completed and not r.controller.automatic_disable_ready
+    assert r.controller.cycle_disable_confirmation_ready and r.delta == r.last_kd == ZERO
+    assert result["motion"]["completed_legs"] == []
+    with pytest.raises(ValueError, match="already_requested"):
+        r.controller.submit("return_to_origin", now_sec=r.now)
+
+
+def test_manual_return_after_soft_failure_retains_partial_acquisition_and_budgets(tmp_path):
+    r = replay(tmp_path)
+    advance_to_coordinated_probe(r)
+    workspace = r.controller._coordinated
+    workspace._leg_started = r.now-workspace.config.max_sweep_leg_sec
+    for _ in range(100):
+        r.tick(dt_sec=.025)
+        if workspace._phase == "failed":
+            break
+    started, exposure = workspace._started, workspace._exposure
+    assert workspace._manual_return_gate() == "ready"
+    r.controller.submit("return_to_origin", now_sec=r.now)
+    r.tick(dt_sec=.025)
+    finish_supported_return_replay(r, workspace)
+    result = r.controller.result_record()
+    assert result["state"] == "failed" and result["reason"] == "leg_timeout"
+    assert result["workspace"]["acquisitions"][-1]["partial_stage"]
+    assert workspace._started == started and workspace._exposure >= exposure
+    assert workspace._return_route_complete and not r.controller.automatic_disable_ready
+    assert r.controller.cycle_disable_confirmation_ready
+    assert not workspace._return_completed  # The passive offset was not driven back.
+
+
+@pytest.mark.parametrize("case", ["fault", "page_unload", "stale", "human", "budget"])
+def test_manual_return_rejects_faults_revocation_stale_feedback_and_exhausted_budget(tmp_path, case):
+    r = replay(tmp_path)
+    workspace = r.controller._coordinated
+    if case == "fault":
+        workspace.recording_failed("workspace_dispatch_clock_or_identity")
+    elif case == "page_unload":
+        workspace._phase, workspace._reason = "cancelled", "page_unload"
+    elif case == "human":
+        workspace.set_human_intervention(True)
+    elif case == "budget":
+        workspace._exposure = workspace.workspace.max_command_exposure_nm_sec
+    with pytest.raises(ValueError, match="supported return"):
+        r.controller.submit("return_to_origin", now_sec=r.now+.1 if case == "stale" else r.now)
+    assert workspace._manual_return_requested is None and workspace._return_context is None
+
+
+@pytest.mark.parametrize("action", ["human", "withdraw", "owner_stop"])
+def test_manual_return_queued_intent_is_revocable_before_owner_execution(tmp_path, action):
+    r = replay(tmp_path)
+    workspace = r.controller._coordinated
+    r.controller.submit("return_to_origin", now_sec=r.now)
+    if action == "human":
+        r.controller.set_human_intervention(True)
+    elif action == "withdraw":
+        r.controller.submit("withdraw", now_sec=r.now, withdraw_source="page_unload")
+    else:
+        r.controller.owner_stopped(now_sec=r.now, reason="operator_interrupt")
+    assert workspace._manual_return_requested is None and workspace.pose.goal is None
+
+
 @pytest.mark.parametrize("revoke", ["human", "withdraw", "page_unload", "owner_fault"])
 def test_supported_return_late_revocation_prevents_automatic_disable(tmp_path, revoke):
     r, workspace = start_supported_return_replay(tmp_path)

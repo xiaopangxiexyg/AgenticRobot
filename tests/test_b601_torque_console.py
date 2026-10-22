@@ -70,7 +70,7 @@ console.log(JSON.stringify({fresh:render(base),updated:render({...base,qpos_rad:
         assert views[name]["stale"] is True
         assert all(row[1:3] == ["—", "—"] for row in views[name]["rows"])
     html = Path("control_station/b601_torque_console/static/index.html").read_text()
-    assert html.index('id="joint-overview"') < html.index('id="mode-selector"')
+    assert html.index('id="mode-selector"') < html.index('id="supported-return-panel"') < html.index('id="joint-overview"')
     assert html.count('id="joint-overview"') == 1
 
 
@@ -2666,6 +2666,12 @@ def test_console_withdraw_source_and_cycle_visibility_are_validated_and_forwarde
                 send({"action": "arm", "operation_mode": "workspace", "return_and_disable": bad})
             assert invalid_grant.value.code == 400
         assert len(controller.calls) == 3
+        with send({"action": "return_to_origin"}) as response:
+            assert json.load(response)["status"] == "accepted"
+        assert controller.calls[-1][0] == "return_to_origin"
+        with pytest.raises(HTTPError) as invalid_return:
+            send({"action": "return_to_origin", "target_offset_rad": 1.0})
+        assert invalid_return.value.code == 400
         with pytest.raises(HTTPError) as invalid:
             send({"action": "withdraw", "source": "arbitrary"})
         assert invalid.value.code == 400

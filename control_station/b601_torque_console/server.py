@@ -295,6 +295,7 @@ class _Handler(BaseHTTPRequestHandler):
                     "arm": {"action"},
                     "authorize_breakaway": {"action"},
                     "stop_and_hold": {"action"},
+                    "return_to_origin": {"action"},
                     "heartbeat": {"action"},
                     "visibility": {"action", "visible"},
                     "zero": {"action"},

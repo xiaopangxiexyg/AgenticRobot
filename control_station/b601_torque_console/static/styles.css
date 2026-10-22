@@ -18,4 +18,7 @@ button[aria-pressed="true"] { background:#245d53; border-color:#6ac4b1; color:#e
 details summary { cursor:pointer; color:#d3ebff; }
 #assessment-path { overflow-wrap:anywhere; font-size:.85rem; }
 #supported-return { width:auto; margin-right:8px; vertical-align:middle; }
+.return-controls { margin-top:14px; padding:12px; border:1px solid #6ab1ff; border-radius:8px; background:#163348; }
+.return-controls h3 { margin:0 0 10px; }
+.return-controls .buttonrow { margin-top:12px; }
 @media(max-width:800px) { .experiment-options { grid-template-columns:1fr; } }

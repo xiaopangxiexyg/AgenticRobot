@@ -671,6 +671,29 @@ console.log(JSON.stringify({calls,confirms}));
     ]
 
 
+def test_gui_manual_return_confirmation_uses_owner_readiness_not_acquisition_success():
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("Node is required for GUI contracts")
+    source = Path("control_station/b601_torque_console/static/app.js").read_text()
+    handler = source[source.index('el("full-disable").onclick ='):source.index('document.addEventListener("visibilitychange"')]
+    script = """
+const vm=require('node:vm');const nodes={'full-disable':{}};const calls=[];
+const cycle={phase:'failed',disable_confirmation_available:true,zero_assist_base_damping_confirmed:true};
+const c={el:id=>nodes[id],state:{automatic_calibration:{cycle}},window:{confirm:()=>true},
+  post:(path,body)=>calls.push({path,...body})};
+vm.runInNewContext(JSON.parse(process.argv[1]),c);
+nodes['full-disable'].onclick();cycle.disable_confirmation_available=false;nodes['full-disable'].onclick();
+console.log(JSON.stringify(calls));
+"""
+    result = subprocess.run([node, "-e", script, json.dumps(handler)],
+        check=True, capture_output=True, text=True)
+    assert json.loads(result.stdout) == [
+        {"path": "/api/stop", "action": "confirm_cycle_full_disable"},
+        {"path": "/api/stop", "action": "full_disable"},
+    ]
+
+
 def test_workspace_gui_start_stop_and_background_semantics():
     node = shutil.which("node")
     if node is None:
@@ -680,18 +703,23 @@ def test_workspace_gui_start_stop_and_background_semantics():
     script = """
 const vm = require('node:vm'); const elements = {};
 const el = id => elements[id] ||= {value:'20',setAttribute(k,v){this[k]=v;}};
-const selection = {selected:'workspace',available_modes:['fixed_position','supported_cycle','workspace'],ready:true,locked:false};
+const selection = {selected:'workspace',available_modes:['fixed_position','supported_cycle','workspace'],ready:true,locked:false,
+  supported_return_available:true,supported_return_configured:true};
 const batch = {state:'idle',active:false,start_requested:false,human_intervention:false,
   workspace:{phase:'idle',reason:'waiting',task_count:48,task_index:0,completed_joint_acquisitions:0,
-    expected_joint_acquisitions:18,pose_centres_rad:[[.1,.1]],setup_label:'test'},cycle:{}};
+    expected_joint_acquisitions:18,pose_centres_rad:[[.1,.1]],setup_label:'test',supported_return:{manual_available:true,manual_gate_reason:'ready',supported_origin_qpos_rad:[0,0,0,0,0,0]}},cycle:{}};
 const c = {el,state:{controller_mode:'automatic_calibration',mode_selection:selection,
-  owner_ready:true,stop_controls_available:true,transparency_assessment:{available:true},automatic_calibration:batch},
+  owner_ready:true,feedback_age_sec:0,stop_controls_available:true,transparency_assessment:{available:true},automatic_calibration:batch},
   cycleAngleInitialized:false};
 vm.runInNewContext(JSON.parse(process.argv[1]),c);
 const render = () => {c.renderAutomatic(); return {arm:el('arm').disabled,joint:el('joint-select').disabled,
   targetHidden:el('target').hidden,authorizeHidden:el('authorize-breakaway').hidden,
   confirm:el('cycle-disable-hint').hidden,background:c.isSupportedCycle()};};
 const idle = render();
+const returnIdle={panelHidden:el('supported-return-panel').hidden,buttonDisabled:el('return-to-origin').disabled};
+selection.selected='fixed_position';selection.supported_return_available=false;render();
+const returnFixed={panelHidden:el('supported-return-panel').hidden,buttonDisabled:el('return-to-origin').disabled};
+selection.selected='workspace';selection.supported_return_available=true;
 batch.state='sweep';batch.active=true;batch.workspace.phase='sweep';selection.locked=true;
 const active = render();
 batch.workspace.coordinated_holding_enabled=true;
@@ -721,12 +749,18 @@ batch.outcome={severity:'warning'};render();const warning=el('phase').textConten
 const warningInstructions=el('drive-instructions').textContent;
 batch.outcome={severity:'error'};render();const fault=el('phase').textContent;
 const faultInstructions=el('drive-instructions').textContent;
+batch.state='cancelled';batch.workspace.phase='cancelled';
+batch.workspace.supported_return.acquisition_stop={state:'cancelled',reason:'operator_return'};
+batch.cycle.disable_confirmation_available=true;batch.cycle.zero_assist_base_damping_confirmed=true;
+render();const returned=el('phase').textContent;const returnInstructions=el('drive-instructions').textContent;
 batch.state='idle';batch.workspace.phase='idle';batch.human_intervention=true;
-console.log(JSON.stringify({idle,active,complete,warning,fault,warningInstructions,faultInstructions,arrivalWaiting,arrivalReady,staticWindow,contextChanged,recheck,rejected,rechecked,human:render(),stopLabel:el('full-disable').textContent}));
+console.log(JSON.stringify({idle,returnIdle,returnFixed,active,complete,warning,fault,warningInstructions,faultInstructions,returned,returnInstructions,arrivalWaiting,arrivalReady,staticWindow,contextChanged,recheck,rejected,rechecked,human:render(),stopLabel:el('full-disable').textContent}));
 """
     result = subprocess.run([node, "-e", script, json.dumps(functions)],
         check=True, capture_output=True, text=True)
     states = json.loads(result.stdout)
+    assert states["returnIdle"] == {"panelHidden": False, "buttonDisabled": False}
+    assert states["returnFixed"] == {"panelHidden": False, "buttonDisabled": True}
     assert "原预算内重新复核" in states["recheck"] and "2.427°" in states["recheck"]
     assert "已排除的旧维持候选" in states["rejected"]
     assert "已完成内部维持命令重新复核" in states["rechecked"]
@@ -740,6 +774,8 @@ console.log(JSON.stringify({idle,active,complete,warning,fault,warningInstructio
     assert "当前仅重力补偿" in states["warningInstructions"]
     assert "不会自动重试" in states["warningInstructions"]
     assert "停止采集不等于全失能" in states["faultInstructions"]
+    assert states["returned"] == "回位完成 · 等待人工确认失能"
+    assert "回位完成不等于采集完成" in states["returnInstructions"]
     assert "等待 J2/J3 到位" in states["arrivalWaiting"]
     assert "16.10 / 24.00 N·m·s" in states["arrivalWaiting"]
     assert "单段时限 58.5 秒" in states["arrivalWaiting"]

@@ -78,6 +78,7 @@ class CoordinatedWorkspaceController:
         self._return_completed = False
         self._return_route_complete = False
         self._return_revoked = None
+        self._manual_return_requested = None
         self._lock = threading.RLock()
 
     @property
@@ -106,6 +107,7 @@ class CoordinatedWorkspaceController:
             self._human = human
             if human:
                 self._return_revoked = "human_intervention"
+                self._manual_return_requested = None
                 self._start = False
                 if self._active:
                     self._stop("human_intervention", "cancelled")
@@ -121,7 +123,7 @@ class CoordinatedWorkspaceController:
                 return_and_disable = fields.get("return_and_disable", False)
                 if type(return_and_disable) is not bool:
                     raise TypeError("return_and_disable must be boolean")
-                if self._phase != "idle" or self._start or self._closed or not self._ready or self._human is not False or self._condition is None:
+                if self._phase != "idle" or self._start or self._manual_return_requested is not None or self._closed or not self._ready or self._human is not False or self._condition is None:
                     raise ValueError("coordinated start requires idle owner and no human intervention")
                 if self.pose.last_time is None or any(abs(self.pose.q[i]) > math.radians(self.workspace.maximum_start_angle_deg) for i in AXES):
                     raise ValueError("coordinated start requires the near-zero start window")
@@ -132,17 +134,27 @@ class CoordinatedWorkspaceController:
                 self._return_revoked = None
                 self._start, self._permit = True, now
             elif action in {"heartbeat", "visibility"}:
-                if not self._active and not self._start:
+                if not self._active and not self._start and self._manual_return_requested is None:
                     raise ValueError("workspace permit requires an active or pending batch")
                 if action == "visibility" and type(fields.get("visible")) is not bool:
                     raise ValueError("visibility must be boolean")
                 self._permit = now
+            elif action == "return_to_origin":
+                reason = self._manual_return_gate()
+                if reason != "ready":
+                    raise ValueError(f"supported return unavailable: {reason}")
+                if self.pose.last_time is None or not 0 <= now-self.pose.last_time <= self.pose.motion.max_control_gap_sec:
+                    raise ValueError("supported return requires fresh owner feedback")
+                self._manual_return_requested = (self._phase, self._reason, now)
+                self._permit = now
+                self._return_revoked = None
             elif action in {"withdraw", "zero"}:
                 source = fields.get("withdraw_source", "operator_button")
                 reasons = {"operator_button": "operator_withdraw", "page_unload": "page_unload", "page_hidden": "page_hidden", "owner_cancel": "owner_cancel"}
                 if source not in reasons:
                     raise ValueError("unsupported withdrawal source")
                 self._return_revoked = "operator_zero" if action == "zero" else reasons[source]
+                self._manual_return_requested = None
                 self._start = False
                 if self._active:
                     self._stop("operator_zero" if action == "zero" else reasons[source], "cancelled")
@@ -156,7 +168,9 @@ class CoordinatedWorkspaceController:
             "phase": phase, "reason": reason, "task_index": self._index, "batch_id": self._batch_id})
 
     def _stop(self, reason, destination):
-        if reason not in RETURNABLE_STOPS and reason != "all_targets_and_withdrawals_confirmed":
+        finishing_return = (self._return_context is not None and self._return_route_complete
+            and reason == self._return_context["reason"] and destination == self._return_context["state"])
+        if not finishing_return and reason not in RETURNABLE_STOPS and reason != "all_targets_and_withdrawals_confirmed":
             self._return_revoked = reason
         if self._phase != "stopping":
             self._withdraw_started = self.pose.last_time
@@ -204,7 +218,7 @@ class CoordinatedWorkspaceController:
                                          min(self.workspace.maximum_positioning_step_rad, distance))
             self.pose.set_goal(goal,
                 max_reference_velocity_rad_s=(self.workspace.positioning_velocity_rad_s
-                    if self._return_and_disable and task["kind"] == "return" else None),
+                    if (self._return_and_disable or self._return_context is not None) and task["kind"] == "return" else None),
                 support_soft_speed_recovery=self.workspace.positioning_support_soft_speed_recovery)
             self._nominal_target = self.pose.goal
             self._segments += 1
@@ -229,10 +243,40 @@ class CoordinatedWorkspaceController:
         # This is the same segmented J2-then-J3 route used by normal completion,
         # not a new straight-line six-axis move or an arbitrary-pose planner.
         self._tasks = self.workspace.tasks(self._supported_origin)[-3:]
+        self._return_route_complete = self._return_completed = False
         self._index = self._segments = 0
         self._nominal_target = self.pose.q
         self._search = self._probe = self._observation = self._sample_pose = None
         self._begin_task()
+
+    def _manual_return_gate(self):
+        if self._closed or not self._ready:
+            return "owner_unavailable"
+        if self._return_context is not None or self._manual_return_requested is not None:
+            return "return_already_requested"
+        if self._human is not False:
+            return "human_intervention_or_unknown"
+        if self._supported_origin is None or self._condition is None:
+            return "origin_unavailable"
+        if any(abs(self._supported_origin[i]) > math.radians(self.workspace.maximum_start_angle_deg) for i in AXES):
+            return "origin_outside_start_window"
+        if self._phase not in {"idle", "complete", "failed", "cancelled"} or self._start:
+            return "stop_acquisition_first"
+        if self._phase == "failed" and self._reason not in RETURNABLE_STOPS:
+            return "fault_requires_resolution"
+        if self._phase == "cancelled" and self._reason not in {"operator_withdraw", "operator_zero"}:
+            return "authority_revoked"
+        if self._started is not None and self.pose.last_time-self._started >= self.workspace.max_workspace_sec:
+            return "workspace_timeout"
+        if self._exposure + self.workspace.coordinated_holding.total_assist_cap_nm*self.pose.motion.max_control_gap_sec >= self.workspace.max_command_exposure_nm_sec:
+            return "workspace_command_exposure_budget"
+        if any(not lo <= q <= hi for q, (lo, hi) in zip(self.pose.q, self._position_limits)):
+            return "workspace_position_envelope"
+        if any(abs(self.pose.q[i]-self._supported_origin[i]) > self.limits.max_support_drift_rad for i in (0, 3, 4, 5)):
+            return "workspace_support_excursion"
+        if not self._zero_base or not self.pose.quiet():
+            return "waiting_for_zero_base_and_stillness"
+        return "ready"
 
     def _begin_leg(self):
         self._leg_anchor = self.pose.q
@@ -287,6 +331,21 @@ class CoordinatedWorkspaceController:
                 self.recording_failed("workspace_feedback_clock_or_gap")
                 raise
             self._last_sequence = feedback_sequence
+            if self._manual_return_requested is not None:
+                state, reason, requested = self._manual_return_requested
+                if clock-requested > self.config.prepare_timeout_sec:
+                    self._manual_return_requested = None
+                    self._return_revoked = "return_preparation_timeout"
+                    self._records.append({"kind": "workspace_return_rejected", "recorded_monotonic_sec": clock,
+                        "reason": self._return_revoked})
+                elif self._zero_base and self.pose.quiet():
+                    self._manual_return_requested = None
+                    if self._started is None:
+                        self._started, self._origin = clock, self.pose.q
+                        self._batch_id = f"supported-return-{clock:.9f}"
+                    self._destination = "cancelled" if state == "idle" else state
+                    self._reason = "operator_return" if state == "idle" else reason
+                    self._begin_return()
             if self._start:
                 if any(abs(self.pose.q[i]) > math.radians(self.workspace.maximum_start_angle_deg) for i in AXES):
                     self._start = False
@@ -746,6 +805,9 @@ class CoordinatedWorkspaceController:
                 "acquisition_stop": None if self._return_context is None else {
                     k: v for k, v in self._return_context.items() if k != "partial_acquisition"},
                 "automatic_disable_ready": self.automatic_disable_ready,
+                "manual_available": self._manual_return_gate() == "ready",
+                "manual_gate_reason": self._manual_return_gate(),
+                "manual_requested": self._manual_return_requested is not None,
                 "max_cycles": 1},
             "holding_search_enabled": True, "holding_calibration": self._holding_status(detailed),
             "arrival": self._arrival_status(),
@@ -765,7 +827,7 @@ class CoordinatedWorkspaceController:
 
     def _batch_status(self, detailed=False):
         return {"operation_mode": "workspace", "state": self._phase, "reason": self._reason,
-            "active": self._active, "start_requested": self._start, "stage": "motion", "human_intervention": self._human,
+            "active": self._active, "start_requested": self._start or self._manual_return_requested is not None, "stage": "motion", "human_intervention": self._human,
             "outcome": calibration_outcome(self._phase, self._reason), "onset_trials": [], "onset_index": 0, "expected_onset_trials": 0,
             "workspace": self._workspace_status(detailed), "cycle": {"phase": self._phase,
                 "background_permit_timeout_sec": self.limits.command_timeout_sec,
@@ -842,12 +904,14 @@ class CoordinatedWorkspaceController:
     def recording_failed(self, reason):
         with self._lock:
             self._start = False
+            self._manual_return_requested = None
             self._return_revoked = str(reason)
             self._transition("failed", str(reason))
 
     def owner_stopped(self, *, now_sec, reason):
         with self._lock:
             self._closed, self._ready, self._start = True, False, False
+            self._manual_return_requested = None
             if self._active:
                 self.recording_failed(f"owner_stopped:{reason}")
 
@@ -857,9 +921,12 @@ class CoordinatedWorkspaceController:
 
     @property
     def cycle_disable_confirmation_ready(self):
-        return (self._phase == "complete" and self._pending is None and self._zero_base
-            and self._origin is not None and self.pose.quiet()
-            and max(abs(self.pose.q[i]-self._origin[i]) for i in AXES) <= self.workspace.holding_search.movement_rad)
+        origin = self._supported_origin if self._return_context is not None else self._origin
+        finished = (self._phase == "complete" or self._return_context is not None
+            and self._return_route_complete and not self._active and self._return_revoked is None)
+        return (finished and self._pending is None and self._zero_base
+            and origin is not None and self.pose.quiet()
+            and max(abs(self.pose.q[i]-origin[i]) for i in AXES) <= self.workspace.holding_search.movement_rad)
 
     @property
     def automatic_disable_ready(self):

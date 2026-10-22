@@ -110,15 +110,26 @@ function renderAutomatic() {
   el("mode-workspace").hidden = !selection?.available_modes?.includes("workspace");
   el("mode-selector").hidden = !selection;
   const supportedReturn = selection?.supported_return_available === true;
-  el("supported-return-control").hidden = !supportedReturn;
+  el("supported-return-panel").hidden = selection?.supported_return_configured !== true;
   el("supported-return").disabled = !supportedReturn || selection.locked;
   const returnStatus = state?.automatic_calibration?.workspace?.supported_return;
-  el("supported-return-status").hidden = !supportedReturn;
-  if (supportedReturn) {
+  el("return-to-origin").disabled = !supportedReturn || returnStatus?.manual_available !== true
+    || !state.owner_ready || state?.automatic_calibration?.human_intervention !== false
+    || !Number.isFinite(state.feedback_age_sec) || state.feedback_age_sec < 0 || state.feedback_age_sec > 0.15;
+  if (selection?.supported_return_configured) {
     if (selection.locked) el("supported-return").checked = returnStatus?.enabled === true;
     const origin = returnStatus?.supported_origin_qpos_rad;
     el("supported-return-status").textContent = `本次首次停稳、零助力回执锁定原位：${origin ? origin.map(v => number(v*180/Math.PI, 2)).join(" / ") + "°" : "等待确认"}。仅 J2/J3 按已有路线慢速返回；其他轴也必须在原位窗口内才可自动失能。不自动重试，不循环重启；故障、有人介入、页面关闭或许可失效不自动回位。`;
-    if (returnStatus?.active) el("supported-return-status").textContent += " 正在回位，采集结果单独保留。";
+    const gates = {stop_acquisition_first: "正在采集：先点“停止采集并撤力”，停稳后可单独回位",
+      waiting_for_zero_base_and_stillness: "等待零助力、基础阻尼回执与六轴停稳",
+      human_intervention_or_unknown: "请先声明无人施加外力", origin_unavailable: "等待 owner 锁定本次原位",
+      fault_requires_resolution: "硬件／控制故障未解决，不允许回位", authority_revoked: "许可被撤销，需重新启动 owner",
+      workspace_timeout: "整批时限已用尽，不再发起回位", workspace_command_exposure_budget: "整批预算已用尽，不再发起回位",
+      return_already_requested: "本次回位已请求或已执行", owner_unavailable: "owner 已停止"};
+    if (!supportedReturn) el("supported-return-status").textContent = "本配置支持回位。先选择上方“J2 / J3 · 多位姿自动采集”，此处即可操作；切换模式本身不会驱动。";
+    else if (returnStatus?.manual_requested) el("supported-return-status").textContent += " 已请求手动回位，等待 owner 的停稳交接。";
+    else if (returnStatus?.active) el("supported-return-status").textContent += " 正在回位，采集结果单独保留。";
+    else el("supported-return-status").textContent += ` ${returnStatus?.manual_gate_reason === "ready" ? "可点击“缓慢回到本次原位”；未授权自动失能时，回位后保持，等待人工确认失能。" : gates[returnStatus?.manual_gate_reason] || returnStatus?.manual_gate_reason || "等待 owner 状态"}。`;
     if (returnStatus?.completed) el("supported-return-status").textContent += " 回位及撤力停稳已确认。";
   }
   el("cycle-angle-control").hidden = !selection || selection.selected !== "supported_cycle";
@@ -298,7 +309,10 @@ function renderWorkspace(batch) {
   if (workspace.recovery_damping_owner === "motor_local_profile") {
     names.preparing = "建立电机本地阻尼并确认静止（零附加驱动力）";
   }
-  const label = workspace.supported_soft_stop ? "有界支撑恢复 · 停稳后继续原段" : workspace.phase === "sweep" && workspace.holding_search_enabled
+  const returnReady = workspace.supported_return?.acquisition_stop != null
+    && batch.cycle?.disable_confirmation_available === true
+    && batch.cycle?.zero_assist_base_damping_confirmed === true;
+  const label = returnReady ? "回位完成 · 等待人工确认失能" : workspace.supported_soft_stop ? "有界支撑恢复 · 停稳后继续原段" : workspace.phase === "sweep" && workspace.holding_search_enabled
     ? "定点保持命令搜索" : workspace.coordinated_holding_enabled && ["observe", "return_observe"].includes(workspace.phase)
       ? "联合姿态保持观察（不是零助力）" : names[workspace.phase] || workspace.phase;
   const ranges = workspace.acquisition_ranges_deg || {joint2: [0, 10], joint3: [0, 10]};
@@ -327,6 +341,12 @@ function renderWorkspace(batch) {
     el("drive-instructions").textContent = gravityOnly
       ? "本批采集已停止，当前仅重力补偿；不会自动重试、继续加力或返回起点。数据已保留。需要结束时，先确认可靠支撑，再使用全失能按钮；这不是程序仍在等待下一段。"
       : "本批采集已停止提交新目标，不会自动重试或返回。撤力、保护保持和失能是否完成，以上方 owner 状态及回执为准；停止采集不等于全失能。";
+    if (workspace.supported_return?.manual_available) {
+      el("drive-instructions").textContent += " 当前满足手动回位条件，可点击上方“缓慢回托架原位”；回位后仍需人工确认失能，不重新启动采集。";
+    }
+  }
+  if (returnReady) {
+    el("drive-instructions").textContent = "J2/J3 已按回位路线返回，零助力、基础阻尼及停稳已确认；其他关节未主动换位。请人工确认整臂已由可靠托架承托，再点击全失能。原采集结果单独保留，回位完成不等于采集完成。";
   }
   el("phase").textContent = label;
   const target = Number.isFinite(task?.target) ? `，换位目标 ${number(task.target * 180 / Math.PI, 2)}°` : "";
@@ -561,7 +581,7 @@ function post(path, body, hintId = "hint", fetchOptions = {}) {
 function intent(action, extra = {}, fetchOptions = {}) {
   // A cached armed status must not renew a lease after the operator withdrew it.
   if (action === "withdraw") heartbeatEnabled = false;
-  if (action === "arm") heartbeatEnabled = true;
+  if (action === "arm" || action === "return_to_origin") heartbeatEnabled = true;
   return post("/api/intent", {action, ...extra}, "hint", fetchOptions);
 }
 
@@ -619,6 +639,10 @@ el("arm").onclick = () => {
 el("mode-fixed-position").onclick = () => intent("select_mode", {operation_mode: "fixed_position"});
 el("mode-supported-cycle").onclick = () => intent("select_mode", {operation_mode: "supported_cycle"});
 el("mode-workspace").onclick = () => intent("select_mode", {operation_mode: "workspace"});
+el("return-to-origin").onclick = () => {
+  if (!window.confirm("确认本次记录原位有可靠支撑、回程无人阻挡？将缓慢移动 J2/J3 回到本次原位；未在启动时授权自动失能，则回位后继续重力/阻尼保持，等待你确认失能。")) return;
+  return intent("return_to_origin");
+};
 el("authorize-breakaway").onclick = () => intent("authorize_breakaway");
 el("stop-and-hold").onclick = () => intent("stop_and_hold");
 el("zero").onclick = () => {
@@ -638,8 +662,7 @@ el("minus").onclick = () => adjustTarget(-1);
 el("plus").onclick = () => adjustTarget(1);
 el("protective-hold").onclick = () => post("/api/stop", {action: "protective_hold"}, "stop-hint");
 el("full-disable").onclick = () => {
-  const cycleReady = state?.automatic_calibration?.cycle?.phase === "complete"
-    && state.automatic_calibration.cycle.disable_confirmation_available === true
+  const cycleReady = state?.automatic_calibration?.cycle?.disable_confirmation_available === true
     && state.automatic_calibration.cycle.zero_assist_base_damping_confirmed === true;
   const message = cycleReady
     ? "自动流程已回到支撑原位并确认零助力/基础阻尼。请先确认机械臂已由可靠支撑承托；继续将请求 J1–J6 全失能。"
@@ -973,6 +996,8 @@ async function refresh() {
     for (const id of ["minus", "plus", "target", "apply", "arm", "joint-select", "authorize-breakaway", "stop-and-hold", "zero", "mode-fixed-position", "mode-supported-cycle", "mode-workspace", "cycle-angle"]) {
       el(id).disabled = true;
     }
+    el("return-to-origin").disabled = true;
+    el("supported-return").disabled = true;
     el("protective-hold").disabled = !stopControlsAvailable;
     el("full-disable").disabled = !stopControlsAvailable;
   } finally {
