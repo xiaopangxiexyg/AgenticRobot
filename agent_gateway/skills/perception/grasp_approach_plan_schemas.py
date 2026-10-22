@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import math
 from collections.abc import Mapping
 from typing import Any
@@ -149,6 +150,8 @@ def grasp_approach_plan_schema_entry_v1(
                 "items": {"type": "string", "enum": ["left", "right"]},
             },
             "path_status": {"type": "string", "minLength": 1},
+            "start_qpos_source": {"type": "string", "enum": ["input_qpos", "envelope_ingress_endpoint"]},
+            "start_check_json": {"type": "string", "minLength": 1, "maxLength": 2048},
             "segment_index": {"type": "integer", "minimum": 0},
             "edge_sample_index": {"type": "integer", "minimum": 0},
             "exception_type": {"type": "string", "minLength": 1},
@@ -524,6 +527,8 @@ def validate_grasp_approach_plan_result_v1(
         "best_orientation_residual_deg",
         "modified_sides",
         "path_status",
+        "start_qpos_source",
+        "start_check_json",
         "segment_index",
         "edge_sample_index",
         "exception_type",
@@ -543,6 +548,28 @@ def validate_grasp_approach_plan_result_v1(
         or not diagnostics["envelope_projection_subject"]
     ):
         raise ValueError("envelope_projection_subject must be a nonempty string")
+    if "start_qpos_source" in diagnostics and (
+        not isinstance(diagnostics["start_qpos_source"], str)
+        or diagnostics["start_qpos_source"] not in {"input_qpos", "envelope_ingress_endpoint"}
+    ):
+        raise ValueError("start_qpos_source must identify the actual start state")
+    if "start_check_json" in diagnostics:
+        encoded = diagnostics["start_check_json"]
+        if not isinstance(encoded, str) or not 1 <= len(encoded) <= 2048:
+            raise ValueError("start_check_json must contain at most 2048 decoded characters")
+        def finite_float(text: str) -> float:
+            number = float(text)
+            if not math.isfinite(number):
+                raise ValueError("start_check_json numbers must be finite")
+            return number
+        def reject_constant(_text: str) -> None:
+            raise ValueError("start_check_json numbers must be finite")
+        try:
+            decoded = json.loads(encoded, parse_float=finite_float, parse_constant=reject_constant)
+        except (ValueError, RecursionError) as exc:
+            raise ValueError("start_check_json must be a bounded finite JSON object") from exc
+        if not isinstance(decoded, dict):
+            raise ValueError("start_check_json must encode an object")
     status = payload["planning_status"]
     plan_fields = (
         "grasp_approach_plan_id",

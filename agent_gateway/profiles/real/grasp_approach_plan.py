@@ -11,6 +11,7 @@ from __future__ import annotations
 from contextlib import nullcontext
 import numpy as np
 
+import json
 import logging
 import math
 import threading
@@ -80,6 +81,90 @@ from teleop_runtime.skill_deploy.rm65_grasp_trajectory import (
 from .station_point_grasp_deployment import (
     StationBoundPointGraspRegistration, REAL_STATION_POINT_GRASP_SNAPSHOT_SLOT_ID,
 )
+
+
+def _bounded_start_check_value(value: object, *, depth: int = 0,
+                               budget: list[int]) -> Any:
+    """Copy bounded finite evidence before serialization or hashing."""
+    budget[0] -= 1
+    if budget[0] < 0 or depth > 6:
+        raise ValueError("start-check evidence exceeds projection bounds")
+    if isinstance(value, np.generic):
+        value = value.item()
+    if value is None or isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        if len(value) > 512:
+            raise ValueError("start-check evidence string is too long")
+        return value
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        if not math.isfinite(value):
+            raise ValueError("start-check evidence must be finite")
+        return value
+    if isinstance(value, np.ndarray):
+        if value.size > 16 or value.ndim > 2:
+            raise ValueError("start-check evidence array is too large")
+        value = value.tolist()
+    if isinstance(value, Mapping):
+        if len(value) > 16:
+            raise ValueError("start-check evidence object is too large")
+        result = {}
+        for key, item in value.items():
+            if not isinstance(key, str) or len(key) > 128:
+                raise ValueError("start-check evidence key is invalid")
+            result[key] = _bounded_start_check_value(item, depth=depth+1, budget=budget)
+        return result
+    if isinstance(value, (list, tuple)) and len(value) <= 16:
+        return [_bounded_start_check_value(item, depth=depth+1, budget=budget) for item in value]
+    raise ValueError("start-check evidence cannot be projected")
+
+
+def _start_check_json(value: object) -> str | None:
+    """Publish a projection, never let optional diagnostics replace a refusal.
+
+    The digest covers the final projection including detail_scope, excluding
+    detail_hash itself. It is not an identity for omitted lower metadata.
+    """
+    try:
+        if not isinstance(value, Mapping):
+            return None
+        if any(not isinstance(value.get(key), bool) for key in ("safe", "collision_check_available")):
+            return None
+        projected = {key: _bounded_start_check_value(value.get(key), budget=[128]) for key in
+                     ("safe", "collision_check_available", "reason", "minimum_distance_m")}
+        if projected["reason"] is not None and not isinstance(projected["reason"], str):
+            return None
+        distance = projected["minimum_distance_m"]
+        if distance is not None and (isinstance(distance, bool) or not isinstance(distance, (int, float))):
+            return None
+        metadata = value.get("metadata")
+        if metadata is not None:
+            try:
+                if not isinstance(metadata, Mapping):
+                    raise ValueError("start-check metadata must be an object")
+                selected = {key: metadata[key] for key in (
+                    "closest_geometry_names", "closest_geometry_ids", "nearest_observed",
+                    "collision_check", "target_envelope") if key in metadata}
+                projected["metadata"] = _bounded_start_check_value(selected, budget=[128])
+                if len(selected) != len(metadata):
+                    projected["details_omitted"] = True
+            except Exception:
+                projected["details_omitted"] = True
+        projected["detail_scope"] = "published_projection"
+        for _ in range(2):
+            # Recompute after any trimming: only the final published preimage is hashed.
+            digest = canonical_content_hash(projected,
+                domain="dexteleop.grasp_start_check_projection.v1")
+            encoded = json.dumps({**projected, "detail_hash": digest}, ensure_ascii=False,
+                                 allow_nan=False, sort_keys=True, separators=(",", ":"))
+            if len(encoded) <= 2048:
+                return encoded
+            projected.pop("metadata", None)
+            projected["details_omitted"] = True
+    except Exception:
+        # Lower already decided the rejection. Encoding is optional evidence.
+        return None
+    return None
 
 
 def build_grasp_visible_scene_reader(*, artifact_store: RecoverableAgentArtifactStore,
@@ -1139,6 +1224,12 @@ class RealGraspApproachPlanProvider:
         path = details.get("path")
         if isinstance(path, Mapping) and isinstance(path.get("status"), str):
             diagnostics["path_status"] = path["status"]
+        source = details.get("start_qpos_source")
+        if isinstance(source, str) and source in {"input_qpos", "envelope_ingress_endpoint"}:
+            diagnostics["start_qpos_source"] = source
+        encoded_start_check = _start_check_json(details.get("start_check"))
+        if encoded_start_check is not None:
+            diagnostics["start_check_json"] = encoded_start_check
         return diagnostics
 
     def _base_result(

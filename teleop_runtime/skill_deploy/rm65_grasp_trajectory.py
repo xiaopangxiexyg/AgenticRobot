@@ -3836,6 +3836,7 @@ class RM65GraspJointTrajectoryPlanner:
         endpoint_candidates: tuple[_EndpointIKCandidate, ...] | None = None,
         deadline: float | None = None,
         monotonic: Callable[[], float] = time.perf_counter,
+        start_qpos_source: str | None = None,
     ) -> _PlannedPathLeg:
         if deadline is not None:
             self._remaining_path_planning_time_sec(
@@ -3934,9 +3935,15 @@ class RM65GraspJointTrajectoryPlanner:
                 } for item in endpoint_candidates)
             if path.status is not JointPathStatus.PATH_FOUND:
                 if path.status is JointPathStatus.START_BLOCKED:
+                    start_details: dict[str, object] = {"path_status": path.status.value}
+                    if start_qpos_source is not None:
+                        start_details["start_qpos_source"] = start_qpos_source
+                    if "start_check" in path.metadata:
+                        start_details["start_check"] = _plain_search_evidence(path.metadata["start_check"])
+                    attempt_record.update(start_details)
                     raise RM65GraspTrajectoryPlanningError(
                         "path_start_collision_blocked",
-                        details={"planning_phase": planning_phase,
+                        details={**start_details, "planning_phase": planning_phase,
                                  "path": path.to_dict(), "search_attempts": search_attempts},
                     )
                 if path.status is JointPathStatus.INVALID_REQUEST:
@@ -4595,6 +4602,7 @@ class RM65GraspJointTrajectoryPlanner:
                 qpos_by_side=qpos_by_side, side=side, target_tool_tcp_world=target_tool_tcp_world,
                 planning_phase="safe_pose_target", visible_scene=visible_scene,
                 prefer_closest_tolerance=False, deadline=deadline, monotonic=monotonic,
+                start_qpos_source="input_qpos",
             )
         except RM65GraspTrajectoryPlanningError as error:
             raise RM65GraspTrajectoryPlanningError(error.reason_code,
@@ -5045,6 +5053,7 @@ class RM65GraspJointTrajectoryPlanner:
         monotonic: Callable[[], float],
         visible_scene: VisibleGraspScene | None = None,
         prepared_approaches: _PreparedGraspApproaches | None = None,
+        start_qpos_source: str | None = None,
     ) -> tuple[_PlannedPathLeg, _PlannedPathLeg]:
         """Connect to an exact prevalidated local branch, without re-solving IK."""
 
@@ -5063,6 +5072,7 @@ class RM65GraspJointTrajectoryPlanner:
                 prefer_closest_tolerance=False,
                 endpoint_candidates=tuple(endpoint for endpoint, _ in prepared.candidates),
                 deadline=deadline, monotonic=monotonic,
+                start_qpos_source=start_qpos_source,
             )
         except RM65GraspTrajectoryPlanningError as error:
             if error.reason_code in {"path_search_exhausted", "path_target_collision_blocked",
@@ -5084,7 +5094,9 @@ class RM65GraspJointTrajectoryPlanner:
                 return self._plan_pregrasp_and_approach(qpos_by_side=qpos_by_side, side=side,
                     pregrasp_tool_tcp_world=pregrasp_tool_tcp_world,
                     grasp_tool_tcp_world=grasp_tool_tcp_world, visible_scene=visible_scene,
-                    deadline=deadline, monotonic=monotonic, prepared_approaches=fresh)
+                    deadline=deadline, monotonic=monotonic, prepared_approaches=fresh,
+                    start_qpos_source=start_qpos_source,
+                )
             raise RM65GraspTrajectoryPlanningError(
                 error.reason_code,
                 details={**error.details,
@@ -5142,6 +5154,7 @@ class RM65GraspJointTrajectoryPlanner:
                 monotonic=monotonic,
                 visible_scene=visible_scene,
                 prepared_approaches=prepared,
+                start_qpos_source="input_qpos",
             )
             return (pregrasp_leg, approach_leg), None, []
 
@@ -5170,6 +5183,7 @@ class RM65GraspJointTrajectoryPlanner:
                     visible_scene=visible_scene,
                     deadline=route_deadline,
                     monotonic=monotonic,
+                    start_qpos_source="input_qpos",
                 )
                 pregrasp_leg, approach_leg = self._plan_pregrasp_and_approach(
                     qpos_by_side=ingress_leg.endpoint.qpos_by_side,
@@ -5180,6 +5194,7 @@ class RM65GraspJointTrajectoryPlanner:
                     monotonic=monotonic,
                     visible_scene=visible_scene,
                     prepared_approaches=prepared,
+                    start_qpos_source="envelope_ingress_endpoint",
                 )
                 combined_waypoints = (
                     *ingress_leg.path.waypoints,
@@ -5343,7 +5358,9 @@ class RM65GraspJointTrajectoryPlanner:
             leg = self._plan_path_leg(
                 qpos_by_side=current, side=side, target_tool_tcp_world=target,
                 planning_phase="tcp_pose_target", prefer_closest_tolerance=False,
-                deadline=deadline, monotonic=monotonic)
+                deadline=deadline, monotonic=monotonic,
+                start_qpos_source="input_qpos",
+            )
         waypoints = tuple(leg.path.waypoints)
         if len(waypoints) == 1:
             waypoints = (waypoints[0], waypoints[0])
@@ -5468,7 +5485,9 @@ class RM65GraspJointTrajectoryPlanner:
                     else "path_start_collision_blocked", details={
                         **initial_check.metadata, "minimum_distance_m": initial_check.minimum_distance_m,
                         "collision_query_reason": initial_check.reason,
-                        "planning_phase": "observed_scene_start_admission"})
+                        "planning_phase": "observed_scene_start_admission",
+                        "start_qpos_source": "input_qpos",
+                        "start_check": _plain_search_evidence(initial_check.to_dict())})
         planning_started_at = time.perf_counter()
         capture_self_observation_evidence = (
             None
@@ -5566,6 +5585,7 @@ class RM65GraspJointTrajectoryPlanner:
                     visible_scene=visible_scene,
                     deadline=deadline,
                     monotonic=monotonic,
+                    start_qpos_source="input_qpos",
                 ),
             )
         else:
@@ -5642,6 +5662,7 @@ class RM65GraspJointTrajectoryPlanner:
                                         prefer_closest_tolerance=False,
                                         deadline=deadline,
                                         monotonic=monotonic,
+                                        start_qpos_source="input_qpos",
                                     )
                                 except RM65GraspTrajectoryPlanningError as error:
                                     direct_fallback_attempt.update(
@@ -5742,6 +5763,7 @@ class RM65GraspJointTrajectoryPlanner:
                             prefer_closest_tolerance=False,
                             deadline=deadline,
                             monotonic=monotonic,
+                            start_qpos_source="input_qpos",
                         )
                     except RM65GraspTrajectoryPlanningError as error:
                         direct_fallback_attempt.update(

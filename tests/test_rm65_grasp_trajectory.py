@@ -5733,3 +5733,158 @@ def test_grasp_cad_table_is_consistent_in_builder_planner_and_native_oracle(
         .015772 + (.02 if admitted else 0), abs=1e-5)
     assert model.getGeometryId("left_d405_safety_proxy") < len(model.geometryObjects)
     assert model.getGeometryId("right_d405_safety_proxy") < len(model.geometryObjects)
+
+
+@pytest.mark.parametrize("source", [None, "input_qpos", "envelope_ingress_endpoint"])
+@pytest.mark.parametrize("failure", ["collision", "envelope"])
+def test_path_leg_start_blocked_preserves_composed_check_without_extra_query(source, failure):
+    planner = _planner_without_assets(config=RM65GraspTrajectoryPlanningConfig())
+    planner.planner_config = JointPathPlannerConfig()
+    current = {side: np.zeros(6) for side in ("left", "right")}
+    target = {side: values.copy() for side, values in current.items()}
+    target["right"] += .1
+    endpoint = grasp_trajectory_module._EndpointIKCandidate(qpos_by_side=target,
+        seed_index=0, solve_cycles=1, position_residual_m=0, orientation_residual_deg=0)
+    calls = []
+    collision = JointConfigurationCheck(safe=failure != "collision",
+        minimum_distance_m=.03 if failure != "collision" else -.001,
+        reason="fixture_collision_check", metadata={"pair": ["arm", "fixture"]})
+    def check(_):
+        calls.append("collision")
+        return collision
+    def envelope(_):
+        calls.append("envelope")
+        raise RM65GraspTrajectoryPlanningError("path_target_safety_envelope_blocked",
+            details={"constraint": "fixture_envelope"})
+    composed = grasp_trajectory_module._TargetEnvelopePathOracle(
+        collision_oracle=SimpleNamespace(check=check, scene_hash="scene:test"),
+        envelope_check=envelope)
+    planner._path_search_oracle = lambda **_: composed
+    with pytest.raises(RM65GraspTrajectoryPlanningError, match="path_start_collision_blocked") as caught:
+        planner._plan_path_leg(qpos_by_side=current, side="right",
+            target_tool_tcp_world=np.eye(4), planning_phase="pregrasp_target",
+            endpoint_candidates=(endpoint,), start_qpos_source=source)
+    details = caught.value.details
+    assert details["path_status"] == "start_blocked"
+    if source is None:
+        assert "start_qpos_source" not in details
+    else:
+        assert details["start_qpos_source"] == source
+    check = details["start_check"]
+    assert check == grasp_trajectory_module._plain_search_evidence(details["path"]["metadata"]["start_check"])
+    assert check == details["search_attempts"][0]["start_check"]
+    assert calls == (["collision"] if failure == "collision" else ["collision", "envelope"])
+    assert check["reason"] == ("fixture_collision_check" if failure == "collision"
+                               else "path_target_safety_envelope_blocked")
+    if failure == "envelope":
+        assert check["metadata"]["collision_check"]["safe"]
+        assert check["metadata"]["target_envelope"]["constraint"] == "fixture_envelope"
+
+
+
+def test_local_chain_records_input_and_planned_ingress_start_provenance():
+    planner = _planner_without_assets(config=RM65GraspTrajectoryPlanningConfig())
+    current = {side: np.zeros(6) for side in ("left", "right")}
+    def qpos(value):
+        pair = {side: q.copy() for side, q in current.items()}
+        pair["right"][0] = value
+        return pair
+    def endpoint(value):
+        return grasp_trajectory_module._EndpointIKCandidate(
+            qpos_by_side=qpos(value), seed_index=0, solve_cycles=1,
+            position_residual_m=0, orientation_residual_deg=0,
+        )
+    pre, final, ingress = (endpoint(value) for value in (.1, .12, .05))
+    def leg(start, end, name):
+        return grasp_trajectory_module._PlannedPathLeg(
+            endpoint=end, path=SimpleNamespace(waypoints=(start, end.qpos_by_side), semantic_content_hash=name),
+            dense_revalidation={}, search_attempts=(),
+        )
+    calls = []
+    def endpoints(**arguments):
+        np.testing.assert_array_equal(arguments["qpos_by_side"]["right"], current["right"])
+        calls.append("local_ik")
+        return (pre,)
+    planner._endpoint_qpos_candidates = endpoints
+    local = leg(pre.qpos_by_side, final, "local:test")
+    def approach(**arguments):
+        np.testing.assert_array_equal(arguments["qpos_by_side"]["right"], pre.qpos_by_side["right"])
+        calls.append("local_approach")
+        return local
+    planner._plan_constrained_approach_leg = approach
+    planner._envelope_ingress_targets = lambda **_: ((.05, np.eye(4)),)
+    def global_path(**arguments):
+        if arguments["planning_phase"] == "envelope_ingress":
+            assert arguments["start_qpos_source"] == "input_qpos"
+            calls.append("ingress")
+            return leg(current, ingress, "ingress:test")
+        assert arguments["start_qpos_source"] == "envelope_ingress_endpoint"
+        assert arguments["endpoint_candidates"] == (pre,)
+        np.testing.assert_array_equal(arguments["qpos_by_side"]["right"], ingress.qpos_by_side["right"])
+        calls.append("global_connection")
+        return leg(ingress.qpos_by_side, pre, "global:test")
+    planner._plan_path_leg = global_path
+    planner._revalidate = lambda *_args, **_kwargs: {}
+    legs, route, _ = planner._plan_chain_for_pregrasp(
+        qpos_by_side=current, side="right", pregrasp_tool_tcp_world=np.eye(4),
+        grasp_tool_tcp_world=np.eye(4), deadline=10, monotonic=lambda: 0,
+    )
+    assert calls == ["local_ik", "local_approach", "ingress", "global_connection"]
+    assert legs[1].endpoint is pre
+    assert legs[2] is local
+    assert route["ingress_path_hash"] == "ingress:test"
+
+
+@pytest.mark.parametrize("source", (None, "input_qpos", "envelope_ingress_endpoint"))
+def test_start_diagnostic_provenance_survives_fresh_connection_retry(source):
+    planner = _planner_without_assets(config=RM65GraspTrajectoryPlanningConfig())
+    current = {side: np.zeros(6) for side in ("left", "right")}
+    prepared = grasp_trajectory_module._PreparedGraspApproaches((),
+        ({"planning_phase": "local_grasp_chain_reuse"},))
+    fresh = grasp_trajectory_module._PreparedGraspApproaches((), ())
+    attempts = []
+    def path(**arguments):
+        attempts.append((arguments["start_qpos_source"], arguments["deadline"]))
+        raise RM65GraspTrajectoryPlanningError(
+            "path_search_exhausted" if len(attempts) == 1 else "path_start_collision_blocked",
+            details={"start_qpos_source": arguments["start_qpos_source"], "retained": True})
+    planner._plan_path_leg = path
+    preparations = []
+    def prepare(**arguments):
+        preparations.append(arguments)
+        return fresh
+    planner._prepare_grasp_approaches = prepare
+    with pytest.raises(RM65GraspTrajectoryPlanningError, match="path_start_collision_blocked") as caught:
+        planner._plan_pregrasp_and_approach(qpos_by_side=current, side="right",
+            pregrasp_tool_tcp_world=np.eye(4), grasp_tool_tcp_world=np.eye(4),
+            deadline=10, monotonic=lambda: 0, prepared_approaches=prepared,
+            start_qpos_source=source)
+    assert attempts == [(source, 10), (source, 10)]
+    assert len(preparations) == 1 and preparations[0]["reuse_previous"] is False
+    assert preparations[0]["deadline"] == 10
+    assert caught.value.details["retained"] is True
+    assert caught.value.details["start_qpos_source"] == source
+
+
+@pytest.mark.parametrize("available", (True, False))
+def test_observed_start_admission_copies_existing_check_without_extra_query(available):
+    planner = _planner_without_assets(config=RM65GraspTrajectoryPlanningConfig())
+    planner.observed_obstacles = object()
+    calls = []
+    check = JointConfigurationCheck(safe=False, collision_check_available=available,
+        minimum_distance_m=-.003, reason="observed_obstacle_clearance_blocked",
+        metadata={"nearest_observed": {"occupied_center_world_m": [.1, .2, .3]}})
+    def query(_):
+        calls.append("check")
+        return check
+    planner.oracle = SimpleNamespace(check=query)
+    with pytest.raises(RM65GraspTrajectoryPlanningError) as caught:
+        planner(qpos_by_side={side: np.zeros(6) for side in ("left", "right")},
+            side="right", target_tool_tcp_world=np.eye(4), speed_scale=.2,
+            require_grasp_approach=False, monotonic=lambda: 0)
+    assert calls == ["check"]
+    assert caught.value.reason_code == ("path_start_collision_blocked" if available
+                                       else "path_start_collision_check_unavailable")
+    assert caught.value.details["start_qpos_source"] == "input_qpos"
+    assert caught.value.details["start_check"] == grasp_trajectory_module._plain_search_evidence(check.to_dict())
+    assert caught.value.details["planning_phase"] == "observed_scene_start_admission"

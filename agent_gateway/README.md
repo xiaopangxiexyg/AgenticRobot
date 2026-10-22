@@ -880,8 +880,36 @@ geometric resolution used by the collision/envelope checks. An already-reached
 exact target remains a HOLD trajectory; it does not back away and approach again.
 These values belong to `RM65GraspTrajectoryPlanningConfig`, not caller-controlled
 motion permits. Rejected near-field stages return typed reasons and preserve
-the complete lower diagnostics in the Gateway log; the published v1 result
-schema remains unchanged.
+the complete lower diagnostics in the Gateway log; the published diagnostics use the optional fields and contract migration described below.
+
+Start rejection diagnostics (2026-10-22 integration): `path_start_collision_blocked`
+continues to mean that the composed path admission rejected the start; it does
+not by itself prove physical FCL contact. Optional `diagnostics.start_qpos_source`
+identifies `input_qpos` or the planned `envelope_ingress_endpoint`. Private callers
+that do not know the source omit it. The lower copies the actual composed check
+already used by the sampler; no additional collision, FK or envelope query runs.
+The observed-scene admission also copies its existing check once.
+
+Optional `diagnostics.start_check_json` contains a finite JSON object, limited to
+2048 decoded characters (not total wire bytes). It includes safe/available,
+distance and reason, plus bounded geometry, observed and composed
+`collision_check` / `target_envelope` metadata when representable. A projection
+may mark `details_omitted`; full lower details remain in Gateway logs. Its
+`detail_scope=published_projection` and `detail_hash` cover exactly the final
+published object excluding `detail_hash`, including `detail_scope`, using
+`dexteleop.grasp_start_check_projection.v1`. This is not a full-detail hash.
+Trimming occurs before hashing. If projection, hashing or encoding fails, the
+optional JSON field is omitted and the original refusal remains authoritative.
+
+This intentionally changes the result-schema, IO-contract and planning Route /
+deployment-binding hashes for `perception.plan_grasp_approach@1`. Consumers must
+rediscover the current catalog and rebind to its hashes before submitting new
+requests. An old strict result validator rejects these new optional fields; the
+new validator continues to accept legacy results without them. Parameters, Skill
+semantics, top-level refusal codes and the separate execution contract retain
+their existing meaning. Planning remains read-only, with no motion or HOLD,
+no fallback enabled by this diagnostic addition, and the same lock and deadline
+owners. Offline tests do not constitute physical grasp acceptance.
 
 Grasp planning uses `dual_arm_hand_proxy_grasp_full`: the existing strict URDF
 with non-adjacent real-arm mesh self-collision pairs, complete cross-arm pairs,
