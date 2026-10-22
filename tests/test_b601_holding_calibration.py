@@ -45,6 +45,66 @@ def test_search_finds_repeatable_nonzero_hold_boundary_without_claiming_unique_g
     assert result["identifies_unique_gravity"] is result["auto_apply"] is False
 
 
+@pytest.mark.parametrize("sign", [-1, 1])
+@pytest.mark.parametrize("explicit", [False, True])
+def test_fg_jfuuv_failed_zero_recheck_explores_midpoint_without_reusing_rejected_hold(sign, explicit):
+    seed = sign*.8606178885310145
+    search = HoldingForceSearch(HoldingSearchConfig(max_trials=27, movement_rad=.0045),
+        seed_nm=seed, cap_nm=1, recheck_interior_on_conflict=explicit)
+    search.record(command_nm=seed, requested_command_nm=seed,
+        outcome="negative_motion" if sign < 0 else "positive_motion", evidence={})
+    search.record(command_nm=0, requested_command_nm=0, outcome="stationary", evidence={})
+    retained = list(search.observations)
+    search.record_transition(command_nm=0, requested_command_nm=0, evidence={
+        "outcome": "censored_settled_outside_point", "net_displacement_rad": -sign*.0015339814126491547})
+    if not explicit:
+        assert search.state == "incomplete" and search.reason == "holding_no_repeatable_anchor"
+        return
+    assert search.state == "searching"
+    assert search.candidate_nm == pytest.approx(seed/2)
+    assert search.return_command_nm is search.status()["usable_hold_nm"] is None
+    assert search.status()["rejected_stationary_commands_nm"] == [0]
+    assert search.status()["negative_motion_below_nm" if sign < 0 else "positive_motion_above_nm"] == seed
+    assert search.status()["positive_motion_above_nm" if sign < 0 else "negative_motion_below_nm"] is None
+    # Only the prefix above is recorded hardware evidence. A hypothetical
+    # static interval below tests continuation, not a physical B601 prediction.
+    search.record(command_nm=search.candidate_nm, requested_command_nm=search.candidate_nm,
+        outcome="stationary", evidence={"fresh": True})
+    assert search.candidate_nm == pytest.approx(seed/4)  # Not the rejected zero.
+    for _ in range(27):
+        if search.state != "searching":
+            break
+        u = search.candidate_nm
+        if abs(u) >= .25:
+            search.record(command_nm=u, requested_command_nm=u,
+                outcome="stationary", evidence={"fresh": True})
+        else:
+            search.record_transition(command_nm=u, requested_command_nm=u,
+                evidence={"outcome": "censored_settled_outside_point"})
+    assert search.state == "complete", search.status(detailed=True)
+    result = search.status(detailed=True)
+    assert .25 <= abs(result["usable_hold_nm"]) < .29
+    assert result["observations"][:len(retained)] == retained
+    assert sum(r["command_nm"] == result["usable_hold_nm"] and r["outcome"] == "stationary"
+               for r in result["observations"][len(retained):]) >= 2
+    assert result["auto_apply"] is result["identifies_unique_gravity"] is False
+
+
+@pytest.mark.parametrize("budget", [3, 4, 6])
+def test_failed_zero_recheck_continuation_never_renews_budget_or_certifies_transitions(budget):
+    search = HoldingForceSearch(HoldingSearchConfig(max_trials=budget),
+        seed_nm=-.86, cap_nm=1, recheck_interior_on_conflict=True)
+    search.record(command_nm=-.86, outcome="negative_motion", evidence={})
+    search.record(command_nm=0, outcome="stationary", evidence={})
+    while search.state == "searching":
+        search.record_transition(command_nm=search.candidate_nm,
+            requested_command_nm=search.candidate_nm, evidence={})
+        assert search.status()["usable_hold_nm"] is search.return_command_nm is None
+        assert -.86 < search.candidate_nm < 0
+    assert search.reason == "holding_trial_budget_exhausted"
+    assert len(search.observations)+len(search.transitions) == budget
+
+
 def test_zero_is_a_valid_hold_and_requires_repetition():
     search = HoldingForceSearch(HoldingSearchConfig(), seed_nm=0, cap_nm=1)
     search.record(command_nm=0, outcome="stationary", evidence={})

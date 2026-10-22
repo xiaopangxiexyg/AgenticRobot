@@ -1830,6 +1830,88 @@ def test_controlled_support_reacquires_same_frozen_sample_without_global_withdra
     assert workspace._phase == "sweep"
 
 
+def test_coverage_failed_zero_recheck_returns_for_midpoint_in_same_leg(tmp_path):
+    profile = Path(__file__).resolve().parents[1]/"docs/hardware/profiles/b601_j2_j3_coverage_support_v1.json"
+    r = replay(tmp_path, **json.loads(profile.read_text())["workspace"])
+    r.controller.submit("arm", now_sec=r.now)
+    workspace = r.controller._coordinated
+    for _ in range(2500):
+        q = list(r.q)
+        if workspace.pose.goal is not None:
+            desired = list(workspace.pose.goal)
+            if workspace._phase == "sweep":
+                desired[int(workspace._tasks[workspace._index]["joint"][-1])-1] += .003
+            for i in (1, 2):
+                q[i] += max(-.00015, min(.00015, desired[i]-q[i]))
+        q[3] += max(-.00015, min(.00015, .006519419-q[3]))
+        r.tick(q, dt_sec=.025)
+        if workspace._probe is not None:
+            break
+    else:
+        pytest.fail("offset arrival did not dispatch a probe")
+    search, sample, started = workspace._search, workspace._sample_pose, workspace._leg_started
+    j = int(workspace._tasks[workspace._index]["joint"][-1])-1
+    seed = workspace._probe
+    assert abs(seed) > 1e-6
+    sign = math.copysign(1, seed)
+    for _ in range(200):
+        r.tick(dt_sec=.025)
+        if workspace._observation["started_at_sec"] is not None:
+            break
+    else:
+        pytest.fail("seed plateau was not dispatched")
+    for _ in range(12):
+        q = list(r.q)
+        q[j] += sign*.0004
+        r.tick(q, dt_sec=.025)
+        if workspace._probe is None:
+            break
+    assert search.observations[-1]["outcome"] == ("positive_motion" if sign > 0 else "negative_motion")
+    assert search.candidate_nm == 0
+    # Script a return inside the unchanged placement tolerance but toward
+    # the far edge of the frozen-point envelope, as in the recorded run.
+    offset = list(sample)
+    offset[j] -= sign*.003
+    for _ in range(300):
+        q = [a+max(-.00015, min(.00015, b-a)) for a, b in zip(r.q, offset)]
+        r.tick(q, dt_sec=.025)
+        if workspace._probe is not None:
+            break
+    assert workspace._probe == 0
+    for _ in range(150):
+        r.tick(dt_sec=.025)
+        if len(search.observations) == 2:
+            break
+    assert search.observations[-1]["outcome"] == "stationary"
+    for _ in range(100):
+        r.tick(dt_sec=.025)
+        if workspace._observation is not None and workspace._observation["started_at_sec"] is not None:
+            break
+    assert workspace._probe == 0
+    for _ in range(17):
+        q = list(r.q)
+        q[j] -= sign*.0001
+        r.tick(q, dt_sec=.025)
+    for _ in range(100):
+        r.tick(dt_sec=.025)
+        if search.transitions:
+            break
+    assert search.transitions[-1]["outcome"] == "censored_settled_outside_point"
+    assert workspace._phase == "sweep" and search.state == "searching"
+    assert search.candidate_nm == pytest.approx(seed/2)
+    assert workspace._sample_pose == sample and workspace._leg_started == started
+    exposure = workspace._leg_exposure
+    for _ in range(300):
+        scripted_coordinated_tick(r)
+        assert not r.audit["fault"]
+        assert workspace._search is search and workspace._sample_pose == sample
+        assert workspace._leg_started == started and workspace._leg_exposure >= exposure
+        if workspace._probe is not None:
+            break
+    assert workspace._probe == pytest.approx(seed/2)
+    assert search.status()["usable_hold_nm"] is None
+
+
 def test_coverage_frozen_point_reacquisition_uses_local_search_without_renewing_leg(tmp_path):
     profile = Path(__file__).resolve().parents[1]/"docs/hardware/profiles/b601_j2_j3_coverage_support_v1.json"
     r = replay(tmp_path, **json.loads(profile.read_text())["workspace"])
