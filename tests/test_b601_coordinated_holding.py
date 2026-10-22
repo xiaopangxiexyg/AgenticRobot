@@ -480,6 +480,29 @@ def test_recorded_uirvzgyc_arrival_releases_increment_not_departure_support(sett
     assert frame.requested_torque_nm+bias == pytest.approx(-.2130525719251231)
 
 
+@pytest.mark.parametrize("point_search", [False, True])
+@pytest.mark.parametrize("mirror", [-1, 1])
+@pytest.mark.parametrize("error", [.0030679628252983093, .0003834962844848633])
+def test_brmz_point_return_keeps_refining_inside_transit_tolerance(settings, point_search, mirror, error):
+    core = runtime(settings)
+    core.config = CoordinatedHoldingConfig(supported_soft_recovery=True, recovery_kd_nm_s_per_rad=0.)
+    core.arrival_tolerance_rad = .003375
+    core.goal = (0., 0., .0494723804295063, 0., 0., 0.)
+    core.q = (0., 0., core.goal[2]+mirror*error, 0., 0., 0.)
+    core.raw = core.velocity = ZERO
+    core.bias = (0., 0., -mirror*.19047410443571045, 0., 0., 0.)
+    core.estimators = tuple(SimpleNamespace(position_span_rad=0.) for _ in range(6))
+    frame = SimpleNamespace(reason="target_reached_braking", q_reference_rad=core.goal[2], requested_torque_nm=0.)
+    bias, _, _, reason = core._approach_bias(2, frame, .01, False, core.q[2], point_search=point_search)
+    if point_search:
+        assert reason == "stationary_bias_refinement"
+        increment = -mirror*core.config.bias_gain_nm_per_rad_sec*error*.01 if error > core.motion.position_resolution_rad else 0
+        assert bias == pytest.approx(core.bias[2]+increment)
+    else:
+        assert bias == core.bias[2]
+        assert reason == "arrival_retains_support_without_extra_integration"
+
+
 @pytest.mark.parametrize("mirror", [-1, 1])
 @pytest.mark.parametrize("moving", [False, True])
 def test_recorded_jyz_point_return_never_restores_opposite_departure_bias(settings, mirror, moving):
@@ -1868,10 +1891,10 @@ def test_coverage_failed_zero_recheck_returns_for_midpoint_in_same_leg(tmp_path)
             break
     assert search.observations[-1]["outcome"] == ("positive_motion" if sign > 0 else "negative_motion")
     assert search.candidate_nm == 0
-    # Script a return inside the unchanged placement tolerance but toward
-    # the far edge of the frozen-point envelope, as in the recorded run.
+    # Start near the frozen point. A later drift can still censor a recheck;
+    # the tighter return must not change the existing search continuation.
     offset = list(sample)
-    offset[j] -= sign*.003
+    offset[j] -= sign*.0007
     for _ in range(300):
         q = [a+max(-.00015, min(.00015, b-a)) for a, b in zip(r.q, offset)]
         r.tick(q, dt_sec=.025)
@@ -1888,7 +1911,7 @@ def test_coverage_failed_zero_recheck_returns_for_midpoint_in_same_leg(tmp_path)
         if workspace._observation is not None and workspace._observation["started_at_sec"] is not None:
             break
     assert workspace._probe == 0
-    for _ in range(17):
+    for _ in range(40):
         q = list(r.q)
         q[j] -= sign*.0001
         r.tick(q, dt_sec=.025)
@@ -1910,6 +1933,41 @@ def test_coverage_failed_zero_recheck_returns_for_midpoint_in_same_leg(tmp_path)
             break
     assert workspace._probe == pytest.approx(seed/2)
     assert search.status()["usable_hold_nm"] is None
+
+
+def test_brmz_frozen_point_return_centres_before_spending_next_probe(tmp_path):
+    profile = Path(__file__).resolve().parents[1]/"docs/hardware/profiles/b601_j2_j3_coverage_support_v1.json"
+    r = replay(tmp_path, **json.loads(profile.read_text())["workspace"])
+    advance_to_coordinated_probe(r)
+    workspace = r.controller._coordinated
+    search, sample, started = workspace._search, workspace._sample_pose, workspace._leg_started
+    j = int(workspace._tasks[workspace._index]["joint"][-1])-1
+    support = 3-j
+    for _ in range(40):
+        q = list(r.q)
+        q[support] += .00015
+        r.tick(q, dt_sec=.025)
+        if workspace._probe is None:
+            break
+    assert workspace._probe is None
+    attempts = workspace._attempts
+    edge = list(sample)
+    edge[j] += .0030679628252983093
+    for _ in range(100):
+        q = [a+max(-.00015, min(.00015, b-a)) for a, b in zip(r.q, edge)]
+        r.tick(q, dt_sec=.025)
+        assert workspace._probe is None and workspace._attempts == attempts
+        assert workspace._search is search and workspace._sample_pose == sample
+        assert workspace._leg_started == started
+    exposure = workspace._leg_exposure
+    for _ in range(300):
+        scripted_coordinated_tick(r)
+        assert not r.audit["fault"]
+        assert workspace._leg_started == started and workspace._leg_exposure >= exposure
+        if workspace._probe is not None:
+            break
+    assert workspace._probe is not None and workspace._attempts == attempts+1
+    assert max(abs(r.q[i]-sample[i]) for i in (1, 2)) <= 2*workspace.pose.motion.position_resolution_rad
 
 
 def test_coverage_frozen_point_reacquisition_uses_local_search_without_renewing_leg(tmp_path):

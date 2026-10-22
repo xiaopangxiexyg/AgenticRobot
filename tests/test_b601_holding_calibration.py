@@ -105,6 +105,36 @@ def test_failed_zero_recheck_continuation_never_renews_budget_or_certifies_trans
     assert len(search.observations)+len(search.transitions) == budget
 
 
+@pytest.mark.parametrize("sign", [-1, 1])
+@pytest.mark.parametrize("budget", [3, 27])
+def test_brmz_censored_zero_and_opposite_probe_do_not_cycle_or_claim_a_bracket(sign, budget):
+    seed = sign*.07311570353575814
+    search = HoldingForceSearch(HoldingSearchConfig(max_trials=budget, movement_rad=.0045),
+        seed_nm=seed, cap_nm=1, recheck_interior_on_conflict=True)
+    search.record(command_nm=seed, requested_command_nm=seed,
+        outcome="positive_motion" if sign > 0 else "negative_motion", evidence={})
+    search.record_transition(command_nm=0, requested_command_nm=0, evidence={
+        "outcome": "censored_plateau_outside_point", "net_displacement_rad": sign*.0026844628155231476})
+    assert search.candidate_nm == pytest.approx(-seed)
+    search.record_transition(command_nm=-seed, requested_command_nm=-seed, evidence={
+        "outcome": "censored_settled_outside_point", "net_displacement_rad": sign*.0015339814126491547})
+    assert search.candidate_nm == pytest.approx(-seed/2)  # Old proposal was the already censored zero.
+    assert search.status()["observed_stationary_range_nm"] is None
+    assert search.status()["usable_hold_nm"] is search.return_command_nm is None
+    assert search.status()["positive_motion_above_nm" if sign > 0 else "negative_motion_below_nm"] == seed
+    assert search.status()["negative_motion_below_nm" if sign > 0 else "positive_motion_above_nm"] is None
+    seen = [0, -seed]
+    while search.state == "searching":
+        u = search.candidate_nm
+        assert not any(abs(u-v) <= 1e-9 for v in seen)
+        seen.append(u)
+        search.record_transition(command_nm=u, requested_command_nm=u,
+            evidence={"outcome": "censored_plateau_outside_point"})
+        assert abs(search.candidate_nm) <= 1 and search.status()["usable_hold_nm"] is None
+    assert search.reason == "holding_trial_budget_exhausted"
+    assert len(search.observations)+len(search.transitions) == budget
+
+
 def test_zero_is_a_valid_hold_and_requires_repetition():
     search = HoldingForceSearch(HoldingSearchConfig(), seed_nm=0, cap_nm=1)
     search.record(command_nm=0, outcome="stationary", evidence={})

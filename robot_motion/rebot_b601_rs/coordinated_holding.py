@@ -214,7 +214,7 @@ class CoordinatedPoseHolding:
                 reason = "motion_unload_keeps_stronger_native_braking"
         elif onset_confirmed:
             moving, reason = True, "resolved_motion_continuous_tracking"
-        elif quiet and arrival and abs(target_error) <= self.arrival_tolerance_rad:
+        elif quiet and arrival and not point_search and abs(target_error) <= self.arrival_tolerance_rad:
             reason = "arrival_retains_support_without_extra_integration"
         elif quiet:
             error = frame.q_reference_rad - self.q[i]

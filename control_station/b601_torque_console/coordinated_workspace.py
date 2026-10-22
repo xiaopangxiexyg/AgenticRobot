@@ -489,7 +489,14 @@ class CoordinatedWorkspaceController:
             # Nominal placement is not the measured point's stability band.
             # Freeze the actual pose below; keep its fine dwell and subsequent
             # full-pose/context checks independent of this entry tolerance.
-            if not self._at_goal(self.pose.arrival_tolerance_rad) or self._last_kd != kd_target:
+            tolerance = self.pose.arrival_tolerance_rad
+            if self._sample_pose is not None:
+                # Return near the frozen point, not merely inside its outer
+                # transit band. Otherwise the ramp consumes the observation's
+                # displacement room before a causal plateau can even start.
+                resolution = self.pose.motion.position_resolution_rad
+                tolerance = min(tolerance, 2*resolution if resolution is not None else cfg.movement_rad/2)
+            if not self._at_goal(tolerance) or self._last_kd != kd_target:
                 self._quiet_since = None
                 return
             if self._quiet_since is None:

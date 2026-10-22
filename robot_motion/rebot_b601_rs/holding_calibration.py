@@ -188,6 +188,21 @@ class HoldingForceSearch:
         if len(self.observations) + len(self.transitions) >= self.config.max_trials:
             self.state, self.reason = "incomplete", "holding_trial_budget_exhausted"
 
+    def _propose_after_transition(self, command_nm, proposal, reason):
+        proposal = max(-self.cap_nm, min(self.cap_nm, proposal))
+        # A censored command supplies exploration history, never a signed
+        # force bound. Subdivide a repeated proposal rather than cycle through
+        # the same unobserved levels until the original trial budget expires.
+        while any(abs(proposal-r["command_nm"]) <= 1e-9 for r in self.transitions):
+            if abs(proposal-command_nm) <= 1e-9:
+                self.state, self.reason = "incomplete", "holding_authority_insufficient"
+                return
+            proposal = (command_nm+proposal)/2
+        self.candidate_nm, self.reason = proposal, reason
+        self._verification = None
+        self._interior_recheck_start = len(self.observations)
+        self._check_trial_budget()
+
     def _probe_from_stable(self, stable, lower, upper):
         best = min(stable, key=abs)
         # Transition endpoints guide exploration only. They never enter the
@@ -277,14 +292,8 @@ class HoldingForceSearch:
                     step = max(self.config.torque_resolution_nm, abs(command_nm),
                                abs(command_nm-bound))
                     proposal = command_nm-math.copysign(step, progress)
-                    self.candidate_nm = max(-self.cap_nm, min(self.cap_nm, proposal))
-                    self.reason = "explore_unverified_hold_beyond_censored_endpoint"
-                    if abs(self.candidate_nm-command_nm) <= 1e-9:
-                        self.state, self.reason = "incomplete", "holding_authority_insufficient"
-                    else:
-                        self._verification = None
-                        self._interior_recheck_start = len(self.observations)
-                        self._check_trial_budget()
+                    self._propose_after_transition(command_nm, proposal,
+                        "explore_unverified_hold_beyond_censored_endpoint")
                     return
                 # Opposing or unresolved transient progress can propose an
                 # interior test, but never certify a bracket's resolution.
@@ -296,11 +305,8 @@ class HoldingForceSearch:
                 elif math.isfinite(upper) and command_nm < upper:
                     left, right = command_nm, upper
                 if math.isfinite(left) and math.isfinite(right) and right > left:
-                    self.candidate_nm = (left + right) / 2
-                    self._verification = None
-                    self._interior_recheck_start = len(self.observations)
-                    self.reason = "refine_unverified_hold_between_motion_and_transition"
-                    self._check_trial_budget()
+                    self._propose_after_transition(command_nm, (left+right)/2,
+                        "refine_unverified_hold_between_motion_and_transition")
                     return
             if (self._recheck_interior_on_conflict and not self.observations
                 and self._verification is None and progress is not None
@@ -311,12 +317,7 @@ class HoldingForceSearch:
                 proposal = (command_nm/2 if progress*command_nm > 0 else
                             command_nm-math.copysign(max(self.config.torque_resolution_nm,
                                                        abs(command_nm)), progress))
-                self.candidate_nm = max(-self.cap_nm, min(self.cap_nm, proposal))
-                self.reason = "refine_unverified_arrival_command"
-                if abs(self.candidate_nm-command_nm) <= 1e-9:
-                    self.state, self.reason = "incomplete", "holding_authority_insufficient"
-                else:
-                    self._check_trial_budget()
+                self._propose_after_transition(command_nm, proposal, "refine_unverified_arrival_command")
                 return
             self.state, self.reason = (
                 "incomplete",
