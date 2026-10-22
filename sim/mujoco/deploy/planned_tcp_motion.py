@@ -43,12 +43,13 @@ from robot_motion.rm65 import (
     load_rm65_tool_profile,
 )
 from sim.mujoco.collision_safety import (
-    CollisionSafetyPolicy,
     KinematicCollisionProjector,
 )
+from sim.mujoco.collision_safety.policy import NonContactObjectMovePolicy
 from sim.mujoco.ik import IKResult
 
 from .grasp_contact import MujocoGraspContactBinding
+from .payload_motion import MujocoPayloadBinding, MujocoPayloadProjector
 
 
 class MujocoTcpPlanRejected(RuntimeError):
@@ -63,21 +64,8 @@ ConfigurationConstraint = Callable[
 ]
 
 
-@dataclass(frozen=True)
-class _NonContactMovePolicy(CollisionSafetyPolicy):
-    @property
-    def distance_query_limit_m(self) -> float:
-        # Match the existing exact-shadow admission query: broad-radius GJK
-        # diagnostics may report zero for separated convex CAD meshes. This
-        # is a clipped clearance lower bound, not a measured distance. The
-        # required prevention margin itself is unchanged.
-        return float(self.minimum_clearance_m)
-
-    def pair_is_forbidden(self, first_group: int, second_group: int) -> bool:
-        # A free-space move has no grasp-stage permission to touch an object.
-        return super().pair_is_forbidden(first_group, second_group) or frozenset(
-            (int(first_group), int(second_group))
-        ) == frozenset((4, 8))
+# Preserve the historical private import as the same canonical policy type.
+_NonContactMovePolicy = NonContactObjectMovePolicy
 
 
 class MujocoJointSceneOracle:
@@ -93,7 +81,14 @@ class MujocoJointSceneOracle:
         constraint_identity: str | None = None,
         cancel_requested: Callable[[], bool] | None = None,
         contact_binding: MujocoGraspContactBinding | None = None,
+        payload_binding: MujocoPayloadBinding | None = None,
     ):
+        if payload_binding is not None and not isinstance(payload_binding, MujocoPayloadBinding):
+            raise TypeError("payload_binding must be a measured MujocoPayloadBinding.")
+        if payload_binding is not None and contact_binding is not None:
+            raise ValueError("Terminal grasp contact and attached payload are distinct operation bindings.")
+        if payload_binding is not None:
+            payload_binding.validate_planning_source(scene, model_qpos)
         if (configuration_constraint is None) != (constraint_identity is None):
             raise ValueError(
                 "Configuration constraint and identity must be bound together."
@@ -110,12 +105,15 @@ class MujocoJointSceneOracle:
         self.constraint_identity = constraint_identity
         self.cancel_requested = cancel_requested
         self.contact_binding = contact_binding
+        self.payload_binding = payload_binding
         clearance_padding_m = float(clearance_padding_m)
         if not math.isfinite(clearance_padding_m) or clearance_padding_m < 0:
             raise ValueError("clearance_padding_m must be finite and non-negative.")
         self.scene = scene
         self.source = scene.mujoco.MjData(scene.model)
         self.source.qpos[:] = model_qpos
+        if payload_binding is not None:
+            payload_binding._restore_planning_auxiliary_state(self.source)
         self.addresses = {
             side: np.asarray(
                 [
@@ -129,18 +127,17 @@ class MujocoJointSceneOracle:
         original = scene.collision_projector()
         if original is None or not original.oracle.forbidden_pair_count:
             raise MujocoTcpPlanRejected("safe_tcp_collision_geometry_unavailable")
-        self.projector = KinematicCollisionProjector(
-            scene.mujoco,
-            scene.model,
-            np.concatenate(tuple(self.addresses.values())),
-            _NonContactMovePolicy(
-                **{
-                    **vars(original.policy),
-                    "minimum_clearance_m": original.policy.minimum_clearance_m
-                    + clearance_padding_m,
-                }
-            ),
-            pair_clearance_m=(None if contact_binding is None else contact_binding.pair_clearances(scene)),
+        policy = _NonContactMovePolicy(
+            **{
+                **vars(original.policy),
+                "minimum_clearance_m": original.policy.minimum_clearance_m + clearance_padding_m,
+            }
+        )
+        indices = np.concatenate(tuple(self.addresses.values()))
+        self.projector = (
+            KinematicCollisionProjector(scene.mujoco, scene.model, indices, policy,
+                pair_clearance_m=(None if contact_binding is None else contact_binding.pair_clearances(scene)))
+            if payload_binding is None else MujocoPayloadProjector(scene, indices, policy, payload_binding)
         )
         payload = {
             "model_qpos": np.asarray(model_qpos).tolist(),
@@ -153,6 +150,8 @@ class MujocoJointSceneOracle:
             payload["configuration_constraint"] = constraint_identity
         if contact_binding is not None:
             payload["contact_binding"] = contact_binding.to_payload()
+        if payload_binding is not None:
+            payload["payload_binding"] = payload_binding.to_payload()
         self.scene_hash = canonical_content_hash(
             payload,
             domain="dexteleop.mujoco.safe_tcp_scene.v1",
@@ -182,7 +181,7 @@ class MujocoJointSceneOracle:
                 # distance. Zero requests the planner's finest existing edge
                 # sampling; it does not reinterpret contact as free space.
                 **({"adaptive_edge_distance_m": max(0.0, distance)}
-                   if self.contact_binding is not None else {}),
+                   if self.contact_binding is not None or self.payload_binding is not None else {}),
             },
         )
 

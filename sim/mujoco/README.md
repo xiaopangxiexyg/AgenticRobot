@@ -318,6 +318,36 @@ This is an interactive GLFW viewer, so Linux requires `DISPLAY` or
 `WAYLAND_DISPLAY`. `MUJOCO_GL=egl` and `MUJOCO_GL=osmesa` are offscreen render
 options and do not provide an interactive desktop window.
 
+## 显式携物几何查询（无动作）
+
+`sim.mujoco.deploy.payload_motion` 提供可选的 `MujocoPayloadBinding` 与
+`MujocoPayloadProjector`。`MujocoJointSceneOracle(..., payload_binding=binding)`
+复用原有碰撞查询／扫掠；候选只在私有 `MjData` 中移动完整物体碰撞几何，不修改真实场景。
+本批支持顶层自由刚体的 box／convex mesh，以及明确命名的固定 plane／box 支撑面。
+未支持的物体形状会拒绝，不自动改成较小碰撞体。
+
+绑定必须由调用方在原有 rig 场景锁内，从同一 cut 的标定 TCP、实测闭合和双侧传感器接触
+构造。冻结关系使用物体原生 body frame，不是质心或包围盒；后续捕获必须继续传入原始关系，
+不能通过重新锚定掩盖滑动。查询 source 必须与绑定的完整 qpos cut 一致；终端接触 binding
+和携物 binding 不能混用。
+
+物理 timestep 纳入绑定身份；改变 timestep 或更换 live `MjData` owner 后，原绑定不可继续使用。
+实测入口只接受当前 live cut 或其 time／qpos／qvel／mocap／equality 状态一致的私有副本，
+不能用历史或构造数据推进实测接触历史。候选源也绑定冻结的 mocap／equality 几何状态，
+避免只复制 qpos 而漏掉可移动环境几何。
+
+`check_measured` 及 `contact_oracle` 检查实际物体、冻结的 3mm／2deg 关系和全部原生几何。
+拉取测量与物理 guard 复用同一个实测接触历史；预测查询使用独立历史，不能延长真实证据。
+仅对指定传感器／物体及支撑面按阶段配置接触许可，保持场景 1mm 硬穿透边界。
+单物理步接触缺口不能延长成多步，也不能豁免物体滑移或其他碰撞。
+直接 projector 点查询也检查冻结 cut；扫掠起点必须是当前实测 cut。扫掠的源几何／关系检查
+不发布新的实测历史或调用外部观测器，不是完整抓持验证或执行授权。
+
+这一层不拥有 physics、调度或 dispatch，不证明抓持成功，也不授予携物执行权限。
+本批尚未把它接入 `MujocoPlannedTcpMotion.plan` 或发布携物 Gateway Route；原有运动与
+单帧默认行为不变。接通完整执行链时仍须成套绑定规划、实际物理 guard、HOLD／取消及清理，
+不能把 `approach_grasp_contact` 当作携物抬升接口。
+
 ## DMTAC CAD 方块接触诊断（仅离线）
 
 ```bash
