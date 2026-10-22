@@ -1383,7 +1383,7 @@ class RealAgentMotionPort:
                 BimanualPoseTarget(
                     timestamp=observation.timestamp,
                     target_pose_by_side=target_pose_by_side,
-                    active_sides=self.config.active_sides,
+                    active_sides=(activation.side,),
                     hard_hold_inactive_sides=True,
                     source_by_side=source_by_side,
                 )

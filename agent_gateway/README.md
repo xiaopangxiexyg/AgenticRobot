@@ -1063,6 +1063,14 @@ action is the distinct `execute_grasp_approach_plan`; authorizing the legacy
 | 夹爪闭合 / 松开 | `manipulation.set_gripper_state@1`（显式启用、仅右夹爪） | 独立授权和请求；只证明开闭/停稳，不证明抓牢 |
 | 空手移动 | `motion.move_tcp_to_pose@1` | 不能作为携物碰撞验证的替代品 |
 
+串行双臂验收可显式设置 `--authorized-motion-sides left right`，并使用
+`agent_grasp_dual_absolute_standard_v1.json`；左右边界均为 X [-0.39, 0.75]、
+Y [-0.7, 0.7]、Z [0.03, 0.85] 米。两侧均须在下层包络中启用，缺一侧即拒绝装配。
+普通/safe 位姿 Route 允许每次选择其中一臂，不接受同一请求的双臂目标；同一个
+motion port、排他 owner 和控制循环串行执行，未请求的一臂仍硬保持。
+`--authorized-side` 继续选择固定方向 Skill 和抓姿生成/执行的主臂，不因双侧移动
+授权而隐式切换抓取手。省略新选项保持原有单臂范围；双夹爪授权仍独立设置。
+
 当前 reach 准入验证真实机械臂连杆网格与部署的代理几何、固定桌面/相机杆和 TCP
 包络。成对规划另验证可见目标/背景与名义张开夹爪的非接触接近，但没有将
 观测障碍纳入整臂检查，也尚未验证随开度变化的真实夹爪实体、闭合过程、

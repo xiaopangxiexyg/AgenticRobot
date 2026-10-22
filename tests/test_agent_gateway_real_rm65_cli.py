@@ -893,6 +893,7 @@ def test_cli_assembles_then_reports_ready_and_lower_hold(
         socket_path=socket_path,
         client_id="rpent.dexteleop",
         authorized_side="right",
+        authorized_motion_sides=("right",),
         authorized_action="forward",
         lower=SimpleNamespace(
             profile=resolved,

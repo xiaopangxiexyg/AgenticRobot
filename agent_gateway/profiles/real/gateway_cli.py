@@ -340,6 +340,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--rm65-udp-port", type=int, default=8090,
         help="exclusive UDP feedback receive port when feedback-source=udp")
     parser.add_argument("--authorized-side", choices=("left", "right"), required=True)
+    parser.add_argument("--authorized-motion-sides", nargs="+", choices=("left", "right"),
+        help="opt-in sides for move_tcp_to_pose[_safe], one arm per request; includes --authorized-side; grasp and fixed primitives retain the primary side")
     parser.add_argument(
         "--authorized-action",
         choices=REAL_AGENT_PRIMITIVE_ACTIONS,
@@ -581,6 +583,7 @@ def _ready_payload(
         "execution_manifest_hash": manifest.execution_manifest_hash,
         "deployment_profile_hash": composition.lower.profile.semantic_content_hash,
         "authorized_side": composition.authorized_side,
+        "authorized_motion_sides": list(composition.authorized_motion_sides),
         "authorized_action": composition.authorized_action,
         "authorized_actions": list(authorized_actions),
         "authorization_scope": (
@@ -1276,6 +1279,8 @@ def main(argv: list[str] | None = None) -> int:
         lower=lower,
         socket_path=socket_path,
         authorized_side=args.authorized_side,
+        authorized_motion_sides=(None if args.authorized_motion_sides is None
+                                 else tuple(args.authorized_motion_sides)),
         authorized_action=args.authorized_action,
         authorized_actions=(
             None if args.authorized_actions is None else tuple(args.authorized_actions)
