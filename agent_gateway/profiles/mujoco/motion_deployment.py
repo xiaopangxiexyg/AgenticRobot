@@ -8,6 +8,7 @@ from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
+    from agent_gateway.profiles.object_state import ObjectStateRegistration
     from agent_gateway.profiles.spatial_goal import SpatialGoalRegistration
     from agent_gateway.profiles.tcp_pose_comparison import TcpPoseComparisonRegistration
 
@@ -736,6 +737,7 @@ class MujocoAgentTcpPoseContractBundle:
     ) = None
     spatial_goal_registration: SpatialGoalRegistration | None = None
     tcp_pose_comparison_registration: TcpPoseComparisonRegistration | None = None
+    object_state_registration: ObjectStateRegistration | None = None
     gripper_contract: GripperSkillContractBundle | None = None
     grasp_approach_contract: MujocoAgentSafeTcpPoseContract | None = None
     grasp_contact_contract: MujocoAgentSafeTcpPoseContract | None = None
@@ -753,6 +755,9 @@ class MujocoAgentTcpPoseContractBundle:
         if (self.tcp_pose_comparison_registration is not None
                 and self.route_manifest.route("state.read_tcp_pose", "2") != self.tcp_pose_comparison_registration.entry):
             raise ValueError("TCP comparison registration differs from its manifest entry.")
+        if (self.object_state_registration is not None
+                and self.route_manifest.route("state.read_object_state", "1") != self.object_state_registration.entry):
+            raise ValueError("Object-state registration differs from its manifest entry.")
         if self.gripper_contract is not None:
             hand = self.gripper_contract
             for name in ("runtime_session_id", "control_domain_id", "target_binding_id", "target_kind", "current_mode",
@@ -1810,6 +1815,7 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
     enable_safe_tcp_pose: bool = False,
     enable_spatial_goals: bool = False,
     enable_tcp_pose_comparison: bool = False,
+    enable_object_state: bool = False,
     enable_grasp_approach: bool = False,
     grasp_contact_binding: MujocoGraspContactBinding | None = None,
 ) -> MujocoAgentTcpPoseContractBundle:
@@ -1839,6 +1845,10 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
         raise TypeError("enable_spatial_goals must be boolean.")
     if not isinstance(enable_tcp_pose_comparison, bool):
         raise TypeError("enable_tcp_pose_comparison must be boolean.")
+    if type(enable_object_state) is not bool:
+        raise TypeError("enable_object_state must be boolean.")
+    if enable_object_state and grasp_contact_binding is None:
+        raise ValueError("Object-state feedback requires an explicit bound contact target.")
     exact = _exact_application(application)
     component = _application_component_id(application)
     side = component.removesuffix("_arm")
@@ -3072,6 +3082,24 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
             base_definition=state_definition, base_schema=state_schema,
             base_entry=state_entry, base_validator=state_validator,
         )
+    object_state_registration = None
+    if enable_object_state:
+        from agent_gateway.profiles.object_state import ObjectStateProfile, build_object_state_registration
+
+        object_profile = ObjectStateProfile(
+            object_id=grasp_contact_binding.target_body_name,
+            reference_frame_id=profile.reference_frame_id,
+            reference_frame_spec_hash=profile.reference_frame_spec_hash,
+            frame_graph_hash=profile.frame_graph_hash,
+            clock_domain_id="mujoco-native-physics:" + exact["runtime_session_id"],
+            observation_source="mujoco_native_physics",
+            source_binding_hash=canonical_content_hash({
+                "state_source_binding": state_binding.semantic_content_hash,
+                "contact_binding": grasp_contact_binding.semantic_content_hash,
+                "support_body": application.task_config.table_body_name,
+                "measurement": "native_body_origin_jacobian_contact_private_copy.v1",
+            }, domain="agenticrobot.mujoco_object_state.source.v1"))
+        object_state_registration = build_object_state_registration(base_entry=state_entry, profile=object_profile)
     definition_items = [
         definition,
         cardinal_step_definition,
@@ -3092,6 +3120,9 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
     if tcp_pose_comparison_registration is not None:
         definition_items.append(tcp_pose_comparison_registration.skill.definition)
         schema_items.append(tcp_pose_comparison_registration.skill.schema_entry)
+    if object_state_registration is not None:
+        definition_items.append(object_state_registration.skill.definition)
+        schema_items.append(object_state_registration.skill.schema_entry)
     for motion_definition, motion_schema, _, _ in planned_motions:
         definition_items.append(motion_definition)
         schema_items.append(motion_schema)
@@ -3165,6 +3196,8 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
     ]
     if tcp_pose_comparison_registration is not None:
         route_items.append(tcp_pose_comparison_registration.entry)
+    if object_state_registration is not None:
+        route_items.append(object_state_registration.entry)
     for _, _, safe_route, planned_contract in planned_motions:
         route_items.append(
             SkillRouteManifestEntry(
@@ -3465,6 +3498,8 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
         validator_items.append(spatial_goal_registration.payload_validator)
     if tcp_pose_comparison_registration is not None:
         validator_items.append(tcp_pose_comparison_registration.payload_validator)
+    if object_state_registration is not None:
+        validator_items.append(object_state_registration.payload_validator)
     if segmentation is not None:
         validator_items.append(segmentation.payload_validator)
     if placement is not None:
@@ -3504,6 +3539,7 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
         safe_tcp_pose_contract=safe_contract,
         spatial_goal_registration=spatial_goal_registration,
         tcp_pose_comparison_registration=tcp_pose_comparison_registration,
+        object_state_registration=object_state_registration,
         grasp_approach_contract=grasp_contract,
         grasp_contact_contract=contact_contract,
         depth_capture=depth_capture,
