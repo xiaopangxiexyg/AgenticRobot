@@ -14,7 +14,7 @@ import threading
 import math
 from functools import partial
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, replace
 from pathlib import Path
 
 import numpy as np
@@ -1056,6 +1056,9 @@ def assemble_exclusive_rm65_agent_primitive_composition(
             safe_config = (grasp_trajectory_config or RM65GraspTrajectoryPlanningConfig()).for_tcp_pose_move(
                 translation_tolerance_m=convergence_profile.translation_tolerance_m,
                 rotation_tolerance_rad=convergence_profile.rotation_tolerance_rad)
+            if observed_safe_enabled:
+                safe_config = replace(safe_config,
+                    minimum_observed_clearance_m=safe_motion_observation_config.minimum_clearance_m)
 
             safe_static_planner = None
             safe_static_planner_lock = threading.Lock()

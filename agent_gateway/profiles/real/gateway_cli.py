@@ -207,6 +207,8 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_const", const=False,
         help="Reject observed safe-move starts below the ordinary 20 mm clearance (the pre-2026-10-29 default).")
     parser.set_defaults(enable_inherited_start_clearance=None)
+    parser.add_argument("--safe-motion-observed-clearance-m", type=float,
+        help="explicit observed-cloud clearance for safe TCP only; default inherits fixed-scene margin; no contact exemption")
     parser.add_argument("--safe-motion-debug-dir", type=Path,
         help="existing private directory for exact RGB-D, filtered points and safe-move rejection evidence; opt-in, no extra captures")
     parser.add_argument("--enable-spatial-goals", action=argparse.BooleanOptionalAction,
@@ -1100,6 +1102,8 @@ def main(argv: list[str] | None = None) -> int:
                                       else args.tool_hover_candidate_budget_sec))
         except ValueError as error:
             parser.error(f"invalid tool hover budget: {error}")
+    if args.safe_motion_observed_clearance_m is not None and args.safe_motion_observation_roles is None:
+        parser.error("--safe-motion-observed-clearance-m requires --safe-motion-observation-roles")
     if args.enable_grasp_observation and (not args.enable_point_grasp or args.point_grasp_backend != "graspgenx"):
         parser.error("--enable-grasp-observation requires --enable-point-grasp and GraspGenX")
     if args.sam3_multi_instance_text and (
@@ -1471,6 +1475,7 @@ def main(argv: list[str] | None = None) -> int:
         enable_point_grasp_arm_reachability=(args.enable_point_grasp_arm_reachability),
         safe_motion_observation_config=(None if args.safe_motion_observation_roles is None
             else SafeMotionObservationConfig(roles=tuple(args.safe_motion_observation_roles),
+                minimum_clearance_m=args.safe_motion_observed_clearance_m,
                 maximum_depth_m=args.safe_motion_maximum_depth_m,
                 maximum_scene_age_sec=args.safe_motion_scene_max_age_sec)),
         safe_motion_debug_dir=safe_motion_debug_dir,

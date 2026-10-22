@@ -165,7 +165,8 @@ def test_snapshot_loader_uses_frame_near_qpos_and_closed_lifecycle(tmp_path):
         probe.load_captures(tmp_path, object(), SimpleNamespace(semantic_content_hash='binding'), Geometry())
 
 
-def test_inspection_saves_inputs_masks_and_actual_projections_without_path_search(tmp_path, monkeypatch):
+@pytest.mark.parametrize('observed_margin', [None, .01])
+def test_inspection_saves_inputs_masks_and_actual_projections_without_path_search(tmp_path, monkeypatch, observed_margin):
     events = []
     pose = np.eye(4)
     pose[2, 3] = .50
@@ -185,6 +186,7 @@ def test_inspection_saves_inputs_masks_and_actual_projections_without_path_searc
             self.oracle = Oracle()
             self.scene = SimpleNamespace(minimum_clearance_m=.02)
             assert kwargs['observed_obstacles'].reference_frame_id == 'world'
+            assert kwargs['config'].minimum_observed_clearance_m == observed_margin
 
         def __call__(self, **kwargs):
             pytest.fail('A read-only scene inspection cannot invoke path search')
@@ -201,7 +203,8 @@ def test_inspection_saves_inputs_masks_and_actual_projections_without_path_searc
     captures = [capture(role) for role in probe.ROLES]
     output = tmp_path / 'inspection'
     report = probe.inspect_captures(captures, cleaner=clean,
-        config=probe.SafeMotionObservationConfig(), profile=SimpleNamespace(station_world_frame_id='world'),
+        config=probe.SafeMotionObservationConfig(minimum_clearance_m=observed_margin),
+        profile=SimpleNamespace(station_world_frame_id='world'),
         builder=object(), output=output, maximum_display_points=12)
     assert events == ['construct', 'check']
     assert report['device_connections'] is False and report['path_search_invoked'] is False

@@ -217,6 +217,7 @@ class RM65GraspTrajectoryPlanningConfig:
     )
 
     pose_goal_policy: str = "within_arrival_tolerance"
+    minimum_observed_clearance_m: float | None = None
 
     def for_tcp_pose_move(
         self, *, translation_tolerance_m: float, rotation_tolerance_rad: float,
@@ -239,6 +240,12 @@ class RM65GraspTrajectoryPlanningConfig:
     def __post_init__(self) -> None:
         if not isinstance(self.enable_inherited_start_clearance, bool):
             raise ValueError("enable_inherited_start_clearance must be bool.")
+        observed_clearance = self.minimum_observed_clearance_m
+        if observed_clearance is not None:
+            if (isinstance(observed_clearance, bool) or not np.isfinite(observed_clearance)
+                    or observed_clearance <= 0):
+                raise ValueError("minimum_observed_clearance_m must be finite and positive.")
+            object.__setattr__(self, "minimum_observed_clearance_m", float(observed_clearance))
         if not isinstance(self.pose_goal_policy, str) or self.pose_goal_policy not in (
             "preserve_target", "within_arrival_tolerance",
         ):
@@ -840,14 +847,17 @@ class RM65GraspJointTrajectoryPlanner:
         )
         self.observed_obstacles = observed_obstacles
         if observed_obstacles is not None:
-            self.oracle.bind_observed_cloud(observed_obstacles)
+            self.oracle.bind_observed_cloud(observed_obstacles,
+                minimum_clearance_m=self.config.minimum_observed_clearance_m)
 
     def for_observed_cloud(self, cloud: ObservedObstacleCloud) -> RM65GraspJointTrajectoryPlanner:
         """Bind request-owned collision state while retaining the static model."""
         if self.observed_obstacles is not None:
             raise ValueError("Observed planning requires a static planner template.")
         request = copy(self)
-        request.oracle = self.oracle.for_observed_cloud(cloud)
+        request.oracle = (self.oracle.for_observed_cloud(cloud)
+            if self.config.minimum_observed_clearance_m is None else
+            self.oracle.for_observed_cloud(cloud, minimum_clearance_m=self.config.minimum_observed_clearance_m))
         request.observed_obstacles = cloud
         request._local_chain_cache = OrderedDict()
         request._local_chain_cache_lock = threading.Lock()
@@ -3011,6 +3021,7 @@ class RM65GraspJointTrajectoryPlanner:
                                     "closest_obstacle_id"
                                 ),
                                 "minimum_distance_m": check.minimum_distance_m,
+                                "nearest_observed": check.metadata.get("nearest_observed"),
                             }
                         else:
                             accepted.append(
@@ -3143,6 +3154,7 @@ class RM65GraspJointTrajectoryPlanner:
                             "closest_obstacle_id"
                         ),
                         "minimum_distance_m": check.minimum_distance_m,
+                        "nearest_observed": check.metadata.get("nearest_observed"),
                     }
                 )
                 if not check.collision_check_available:
@@ -3265,6 +3277,7 @@ class RM65GraspJointTrajectoryPlanner:
                         "closest_geometry_names": item["closest_geometry_names"],
                         "closest_obstacle_id": item["closest_obstacle_id"],
                         "minimum_distance_m": item["minimum_distance_m"],
+                        "nearest_observed": item.get("nearest_observed"),
                     }
                     for item in attempts
                     if item.get("outcome") in {

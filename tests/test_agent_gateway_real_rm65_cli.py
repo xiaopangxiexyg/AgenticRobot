@@ -96,6 +96,10 @@ def test_cli_observed_safe_move_does_not_require_grasp_models(tmp_path):
     assert args.safe_motion_scene_max_age_sec == 30
     assert args.safe_motion_maximum_depth_m == 1.5
     assert args.safe_motion_debug_dir == tmp_path
+    assert args.safe_motion_observed_clearance_m is None
+    selected = parser.parse_args([*_argv(confirmation=REAL_AGENT_PRIMITIVE_SESSION_CONFIRM_TOKEN),
+        "--safe-motion-observation-roles", "main", "--safe-motion-observed-clearance-m", ".01"])
+    assert selected.safe_motion_observed_clearance_m == .01
 
 
 @pytest.mark.parametrize("extra", [[], ["--enable-back-projection"],

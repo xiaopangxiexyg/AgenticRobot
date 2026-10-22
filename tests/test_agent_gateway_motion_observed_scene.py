@@ -375,6 +375,28 @@ def test_debug_projects_nested_rejection_points_into_the_same_saved_frame(tmp_pa
     assert projection["depth_residual_m"] == 0
 
 
+def test_debug_voxel_sources_use_retained_pixels_not_center_projection(tmp_path):
+    record = SafeMotionDebugRecord(tmp_path, reference_frame_id="world", config=SafeMotionObservationConfig(),
+        request={})
+    frame = capture()
+    record.capture(frame)
+    depth = frame.depth_m.copy()
+    filtered = RM65CapturedRobotObservationFilterResult(depth, np.zeros(depth.shape, bool), {})
+    valid = np.zeros(depth.shape, bool)
+    valid[1, 1] = True
+    # Quantization moves the witness projection away from the contributing pixel.
+    record.filtered(frame, filtered, valid, np.array([[-.001, -.001, .5]]), {})
+    error = RM65GraspTrajectoryPlanningError("path_start_collision_blocked", details={
+        "nearest_observed": {"geometry_name": "proxy", "occupied_center_world_m": [-.002, -.002, .502]}})
+    record.finish(error=error)
+    data = json.loads((record.directory / "record.json").read_text())
+    assert data["nearest_point_projections"][0]["sampled_pixel_uv"] == [2, 2]
+    source, = data["nearest_voxel_sources"][0]["sources"]
+    assert source["pixel_uv"] == [1, 1] and source["role"] == "main"
+    assert source["view_voxel_support_count"] == 1
+    assert source["observed_depth_m"] == .5
+
+
 def test_debug_directory_creation_failure_is_explicit_and_never_captures(tmp_path, monkeypatch):
     from agent_gateway.profiles.real import motion_observed_scene_debug
     adapter, kwargs, events = debug_adapter(tmp_path)

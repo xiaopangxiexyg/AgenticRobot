@@ -3948,6 +3948,7 @@ def test_endpoint_planner_distinguishes_positive_gap_from_penetration(
             metadata={
                 "closest_geometry_names": ("arm", "camera_pole"),
                 "closest_obstacle_id": "camera_pole",
+                "nearest_observed": {"geometry_name": "arm", "occupied_center_world_m": [.1, .2, .3]},
             },
         )
     )
@@ -3978,6 +3979,9 @@ def test_endpoint_planner_distinguishes_positive_gap_from_penetration(
     assert error.value.details["collision_examples"][0][
         "minimum_distance_m"
     ] == pytest.approx(minimum_distance_m)
+    witness = error.value.details["collision_examples"][0]["nearest_observed"]
+    assert witness["geometry_name"] == "arm"
+    np.testing.assert_allclose(witness["occupied_center_world_m"], [.1, .2, .3])
 
 
 def test_endpoint_planner_uses_pose_tolerance_for_positive_gap_clearance_rescue(
@@ -6631,8 +6635,8 @@ def test_safe_pose_policy_keeps_existing_config_positional_constructor():
     original = RM65GraspTrajectoryPlanningConfig()
     assert next(field for field in fields(original)
                 if field.name == "enable_inherited_start_clearance").kw_only
-    names = [field.name for field in fields(original)
-             if field.name not in {"pose_goal_policy", "enable_inherited_start_clearance"}]
+    all_names = [field.name for field in fields(original) if field.name != "enable_inherited_start_clearance"]
+    names = all_names[:all_names.index("pose_goal_policy")]
     values = [getattr(original, name) for name in names]
     values[names.index("final_edge_resolution_rad")] = .0017
     values[names.index("path_envelope_ingress_waypoint_fractions")] = (.1, .2)
@@ -6640,6 +6644,7 @@ def test_safe_pose_policy_keeps_existing_config_positional_constructor():
     assert rebuilt.final_edge_resolution_rad == .0017
     assert rebuilt.path_envelope_ingress_waypoint_fractions == (.1, .2)
     assert rebuilt.pose_goal_policy == "within_arrival_tolerance"
+    assert rebuilt.minimum_observed_clearance_m is None
 
 
 

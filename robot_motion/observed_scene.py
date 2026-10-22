@@ -28,6 +28,8 @@ class SafeMotionObservationConfig:
     maximum_depth_m: float = 1.5
     maximum_scene_age_sec: float = 30.0
     voxel_size_m: float = 0.004
+    # Explicit observed-cloud clearance for safe TCP; None inherits the fixed-scene margin.
+    minimum_clearance_m: float | None = None
 
     def __post_init__(self):
         roles = tuple(self.roles)
@@ -40,6 +42,11 @@ class SafeMotionObservationConfig:
                 raise ValueError(f"{name} must be finite and positive.")
             object.__setattr__(self, name, value)
         object.__setattr__(self, "roles", roles)
+        if self.minimum_clearance_m is not None:
+            value = self.minimum_clearance_m
+            if isinstance(value, bool) or not np.isfinite(value) or value <= 0:
+                raise ValueError("Observed minimum clearance must be finite and positive.")
+            object.__setattr__(self, "minimum_clearance_m", float(value))
 
 
 @contextmanager

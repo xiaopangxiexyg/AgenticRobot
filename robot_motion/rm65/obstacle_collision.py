@@ -304,22 +304,28 @@ class RM65ObstacleCollisionOracle:
         self._observed_distance: ObservedBoxDistance | None = None
         self._observed_scene_hash: str | None = None
 
-    def bind_observed_cloud(self, cloud: ObservedObstacleCloud) -> None:
+    def bind_observed_cloud(self, cloud: ObservedObstacleCloud, *, minimum_clearance_m: float | None = None) -> None:
         """Bind once, before any query, to this request-owned oracle."""
         if (self._observed_distance is not None or self._check_cache
                 or self._clearance_check_cache or self._search_check_cache):
             raise ValueError("Observed cloud must be bound before collision queries.")
         if cloud.reference_frame_id != self._scene.reference_frame_id:
             raise ValueError("Observed cloud and collision model reference frames differ.")
+        required = self._scene.minimum_clearance_m if minimum_clearance_m is None else minimum_clearance_m
+        if (isinstance(required, bool) or not np.isfinite(required) or required < 0
+                or (minimum_clearance_m is not None and required == 0)):
+            raise ValueError("Observed minimum clearance must be finite and positive.")
         self.world_obstacle_proxy_boxes({
             name: self._reference_full_q[list(indices)] for name, indices in self._indices.items()})
         self._observed_distance = ObservedBoxDistance(cloud)
+        self._observed_minimum_clearance_m = float(required)
         self._observed_scene_hash = canonical_content_hash({
             "fixed_scene": self._scene.semantic_content_hash,
             "observed_scene": cloud.semantic_content_hash,
+            **({"observed_minimum_clearance_m": float(required)} if minimum_clearance_m is not None else {}),
         }, domain="dexteleop.rm65.combined_obstacle_scene.v1")
 
-    def for_observed_cloud(self, cloud: ObservedObstacleCloud) -> RM65ObstacleCollisionOracle:
+    def for_observed_cloud(self, cloud: ObservedObstacleCloud, *, minimum_clearance_m: float | None = None) -> RM65ObstacleCollisionOracle:
         """Reuse static models with new request-owned FK, queries and obstacles."""
         if self._observed_distance is not None:
             raise ValueError("Observed requests must originate from a static oracle.")
@@ -334,7 +340,7 @@ class RM65ObstacleCollisionOracle:
         request._check_cache = {}
         request._clearance_check_cache = {}
         request._search_check_cache = {}
-        request.bind_observed_cloud(cloud)
+        request.bind_observed_cloud(cloud, minimum_clearance_m=minimum_clearance_m)
         return request
 
     @classmethod
@@ -428,11 +434,11 @@ class RM65ObstacleCollisionOracle:
         cloud = self._observed_distance.cloud
         try:
             distance, nearest = self._observed_distance.check_boxes(
-                self.world_obstacle_proxy_boxes(qpos), clearance_m=distance_bound_m)
+                self.world_obstacle_proxy_boxes(qpos), clearance_m=max(distance_bound_m, self._observed_minimum_clearance_m))
         except (ValueError, RuntimeError) as error:
             return JointConfigurationCheck(safe=False, collision_check_available=False,
                 reason="observed_obstacle_collision_check_unavailable", metadata={"error": str(error)})
-        safe = distance >= self._scene.minimum_clearance_m
+        safe = distance >= self._observed_minimum_clearance_m
         closest = {}
         if nearest is not None and (result.minimum_distance_m is None or distance < result.minimum_distance_m):
             closest = {"closest_geometry_names": (nearest["geometry_name"], "observed_voxels"),
@@ -442,6 +448,7 @@ class RM65ObstacleCollisionOracle:
             if result.minimum_distance_m is not None else distance,
             metadata={**result.metadata, **closest, "scene_hash": self.scene_hash,
                       "observed_scene_hash": cloud.semantic_content_hash,
+                      "observed_minimum_clearance_m": self._observed_minimum_clearance_m,
                       "observed_scope": "occupied_voxels_against_profile_obstacle_box_proxies",
                       "observed_distance_is_lower_bound": True, "nearest_observed": nearest})
 
@@ -976,6 +983,10 @@ class RM65InheritedStartClearanceOracle:
         self._model_data = source._model.createData()
         self._collision_data = source._pin.GeometryData(source._collision_model)
         self._margin = float(source._scene.minimum_clearance_m)
+        # Observed voxels use the request's observed clearance (explicit or the
+        # fixed-scene margin); fixed pairs keep the ordinary scene margin.
+        self._observed_margin = (float(source._observed_minimum_clearance_m)
+                                 if source._observed_distance is not None else self._margin)
         self._baseline = self._distances(self._start)
         if np.any(self._baseline <= 0.0):
             index = int(np.argmin(self._baseline))
@@ -1009,7 +1020,7 @@ class RM65InheritedStartClearanceOracle:
                 raise RM65InheritedStartBlocked(source="observed_rgbd",
                     distance_m=distance, geometry_name=name)
         self._observed_inherited = tuple(name for name, (distance, _) in self._observed_baseline.items()
-            if distance <= self._margin)
+            if distance <= self._observed_margin)
         if not self._inherited and not self._observed_inherited:
             raise ValueError("The start already satisfies the ordinary clearance margin.")
         geometry_by_name = {str(geometry.name): index
@@ -1026,6 +1037,8 @@ class RM65InheritedStartClearanceOracle:
             "inherited_observed_boxes": [(name, float(self._observed_baseline[name][0]))
                 for name in self._observed_inherited],
             "ordinary_margin_m": self._margin,
+            **({} if self._observed_margin == self._margin
+               else {"observed_margin_m": self._observed_margin}),
         }, domain="dexteleop.rm65.inherited_start_clearance.v1")
 
     @property
@@ -1064,7 +1077,7 @@ class RM65InheritedStartClearanceOracle:
             name = box[0]
             if name in values:
                 raise RuntimeError("Observed proxy names must be unique.")
-            values[name] = distance_query.check_boxes((box,), clearance_m=self._margin)
+            values[name] = distance_query.check_boxes((box,), clearance_m=self._observed_margin)
         return values
 
     def new_dense_progress(self) -> RM65StartClearanceProgress:
@@ -1080,7 +1093,7 @@ class RM65InheritedStartClearanceOracle:
             pair_indices=self.observed_active_names,
             initial_distances=tuple(self._observed_baseline[name][0]
                 for name in self.observed_active_names),
-            ordinary_clearance_m=self._margin,
+            ordinary_clearance_m=self._observed_margin,
             tolerance_m=self._DISTANCE_TOLERANCE_M)
 
     def check(self, qpos_by_component: Mapping[str, np.ndarray]) -> JointConfigurationCheck:
@@ -1120,7 +1133,7 @@ class RM65InheritedStartClearanceOracle:
                 return JointConfigurationCheck(safe=False, collision_check_available=False,
                     reason="inherited_observed_proxy_set_changed")
             threshold = (max(0.0, baseline[0] - self._DISTANCE_TOLERANCE_M)
-                         if name in self._observed_inherited else self._margin)
+                         if name in self._observed_inherited else self._observed_margin)
             if distance <= 0.0 or distance <= threshold:
                 observed_blocked = (name, distance, nearest)
                 break
@@ -1144,7 +1157,8 @@ class RM65InheritedStartClearanceOracle:
                       "observed_inherited_box_count": len(self._observed_inherited),
                       "observed_active_box_count": len(self.observed_active_names),
                       "nearest_observed": None if observed_blocked is None else observed_blocked[2],
-                      "ordinary_clearance_m": self._margin})
+                      "ordinary_clearance_m": self._margin,
+                      "observed_clearance_m": self._observed_margin})
         return result
 
     def check_clearance_only(self, qpos_by_component):

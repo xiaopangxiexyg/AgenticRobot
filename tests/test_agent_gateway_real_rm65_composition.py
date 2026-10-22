@@ -66,7 +66,8 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 @pytest.mark.parametrize('mode', ['legacy', 'cad_surface'])
-def test_explicit_capture_filter_binds_one_owner_without_starting_resources(monkeypatch, tmp_path, mode):
+@pytest.mark.parametrize('observed_margin', [None, .01])
+def test_explicit_capture_filter_binds_one_owner_without_starting_resources(monkeypatch, tmp_path, mode, observed_margin):
     from robot_motion.rm65.captured_robot_observations import RM65CapturedRobotObservationFilterConfig
     from agent_gateway.profiles.real.motion_observed_scene import SafeMotionObservationConfig
     bindings = []
@@ -87,10 +88,14 @@ def test_explicit_capture_filter_binds_one_owner_without_starting_resources(monk
         camera_config_path=REPO_ROOT / 'teleop_runtime/configs/devices/agent_gateway_realsense.json',
         camera_registry_path=DEFAULT_RM65_CAMERA_REGISTRY_V4, artifact_root=tmp_path / 'artifacts',
         camera_mount_urdf_path=DEFAULT_RM65_CAMERA_MOUNT_URDF,
-        safe_motion_observation_config=SafeMotionObservationConfig(), captured_robot_filter_config=cfg)
+        safe_motion_observation_config=SafeMotionObservationConfig(minimum_clearance_m=observed_margin),
+        captured_robot_filter_config=cfg)
     cleaner = bindings[0]['self_filter']
     assert cleaner.config is cfg and cleaner._runtime is None
     assert bool(cleaner.input_binding_hash) == (mode != 'legacy')
+    planned = bindings[0]['planner_factory']('unqueried-cloud')
+    assert planned.func.__self__.config.minimum_observed_clearance_m == observed_margin
+    assert planned.func.__self__.config.minimum_clearance_m == .02
     assert all(backend.starts == 0 for backend in lower.arm_backends.values())
     assert guard.starts == 0 and not (tmp_path / 'gateway.sock').exists()
     result.deployment.gateway_session.close()

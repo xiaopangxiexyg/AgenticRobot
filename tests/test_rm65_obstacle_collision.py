@@ -616,6 +616,44 @@ def test_observed_voxels_block_search_and_final_checks_and_permit_a_detour():
         oracle.bind_observed_cloud(cloud)
 
 
+def test_explicit_observed_margin_is_separate_from_fixed_collision_and_query_cache():
+    from robot_motion.observed_obstacles import ObservedObstacleCloud
+    model = pin.Model()
+    joint = model.addJoint(0, pin.JointModelTranslation(), pin.SE3.Identity(), 'hand')
+    geometry = pin.GeometryModel()
+    geometry.addGeometryObject(pin.GeometryObject('hand', joint, 0,
+        pin.SE3.Identity(), hppfcl.Box(.04, .04, .04)))
+    template = RM65ObstacleCollisionOracle(model=model, base_collision_model=geometry,
+        reference_full_q=np.zeros(3), qpos_indices_by_component={'arm': (0, 1, 2)},
+        scene=_scene(center_x=1, clearance=.02))
+    cloud = ObservedObstacleCloud(reference_frame_id='world', points_m=np.array([[.037, 0, 0]]), evidence={})
+    strict = template.for_observed_cloud(cloud)
+    relaxed = template.for_observed_cloud(cloud, minimum_clearance_m=.01)
+    assert strict.scene_hash != relaxed.scene_hash
+    q = {'arm': np.zeros(3)}
+    for request, safe in ((strict, False), (relaxed, True)):
+        for query in (request.check, request.check_clearance_only,
+                      lambda p: request.check_for_search(p, refinement_distance_m=.03)):
+            result = query(q)
+            assert result.safe is safe
+            assert result.metadata['observed_minimum_clearance_m'] == (.02 if request is strict else .01)
+    # A real close obstacle remains blocked, even after voxel quantization.
+    close = template.for_observed_cloud(ObservedObstacleCloud(reference_frame_id='world',
+        points_m=np.array([[.027, 0, 0]]), evidence={}), minimum_clearance_m=.01)
+    assert not close.check(q).safe
+    # The independent fixed obstacle still requires 20 mm (here the gap is 15 mm).
+    fixed_gap = relaxed.check({'arm': np.array([.865, 0, 0])})
+    assert not fixed_gap.safe and fixed_gap.minimum_distance_m == pytest.approx(.015)
+    assert template.check(q).safe and template._observed_distance is None
+
+
+@pytest.mark.parametrize('value', [0, -.01, True, np.nan, np.inf])
+def test_explicit_observed_margin_rejects_invalid_config(value):
+    from agent_gateway.profiles.real.motion_observed_scene import SafeMotionObservationConfig
+    with pytest.raises(ValueError, match='clearance'):
+        SafeMotionObservationConfig(minimum_clearance_m=value)
+
+
 
 @pytest.mark.parametrize('early_stop', [False, True])
 def test_static_template_has_independent_observed_query_data_and_no_cross_scene_cache(early_stop):

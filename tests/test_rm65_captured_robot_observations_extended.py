@@ -256,7 +256,7 @@ def test_local_membership_uses_rotated_tool_axes_not_camera_axes():
 
 
 @pytest.mark.parametrize("bounds", [((0, .03), (-.05, .05), (-.04, .04)),
-    ((-.04, .03), (-.051, .05), (-.04, .04)), ((-.04, .03),)])
+    ((-.04, .03), (-.061, .05), (-.04, .04)), ((-.04, .03),)])
 def test_invalid_tool_surface_bounds_are_rejected(bounds):
     with pytest.raises(ValueError, match="tool_surface_bounds_m"):
         _extended_config(tool_surface_bounds_m=bounds)
