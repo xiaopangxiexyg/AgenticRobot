@@ -189,7 +189,7 @@ class CoordinatedPoseHolding:
         arrival = (self.config.motor_local_recovery
                    and getattr(frame, "reason", None) in {"target_reached_braking", "calibration_target_tracking"})
         extra_drive = bias-self._departure_bias[i]
-        if arrival and (moving or onset_confirmed) and extra_drive*velocity > 0:
+        if arrival and not point_search and (moving or onset_confirmed) and extra_drive*velocity > 0:
             # Remove this leg's starting increment, not the peer's support or
             # all compensation. Commit only through the actual dispatch below.
             bias, moving, reason = self._departure_bias[i], True, "arrival_releases_departure_drive"
@@ -424,6 +424,7 @@ class CoordinatedPoseHolding:
                 # tail must keep unloading even across zero-count feedback.
                 # The fast path can only reduce toward zero, never reverse.
                 arrival_unload = (self.config.motor_local_recovery
+                                  and not point_search
                                   and frame.reason in {"target_reached_braking", "calibration_target_tracking"}
                                   and proposed_bias[i] == self._departure_bias[i])
                 command[i], transition_reasons[i], transition_rates[i] = self._slew_axis(

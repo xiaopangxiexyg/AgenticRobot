@@ -480,6 +480,33 @@ def test_recorded_uirvzgyc_arrival_releases_increment_not_departure_support(sett
     assert frame.requested_torque_nm+bias == pytest.approx(-.2130525719251231)
 
 
+@pytest.mark.parametrize("mirror", [-1, 1])
+@pytest.mark.parametrize("moving", [False, True])
+def test_recorded_jyz_point_return_never_restores_opposite_departure_bias(settings, mirror, moving):
+    # jyz_rz22's frozen-point return at 1026237.236: a valid corrective bias
+    # must not be replaced by the old positive probe/departure command.
+    core = runtime(settings)
+    core.config = CoordinatedHoldingConfig(supported_soft_recovery=True, recovery_kd_nm_s_per_rad=0.)
+    core.goal = (0., 0., mirror*.0494723804295063, 0., 0., 0.)
+    core.q = (0., 0., mirror*.051773350685834885, 0., 0., 0.)
+    core.velocity = core.raw = (0., 0., -mirror*.01587, 0., 0., 0.)
+    core.bias = (0., 0., -mirror*.43652105172147376, 0., 0., 0.)
+    core._departure_bias = (0., 0., mirror*.07924675845996011, 0., 0., 0.)
+    core.last_delta = (0., 0., -mirror*.45, 0., 0., 0.)
+    core.estimators = tuple(SimpleNamespace(position_span_rad=.002) for _ in range(6))
+    frame = SimpleNamespace(reason="target_reached_braking", q_reference_rad=core.goal[2],
+        requested_torque_nm=-mirror*.011742097670144308)
+    bias, _, _, reason = core._approach_bias(2, frame, .01, moving,
+        core.q[2]+mirror*.002, point_search=True)
+    assert reason != "arrival_releases_departure_drive"
+    assert (frame.requested_torque_nm+bias)*mirror < 0
+    if moving:
+        assert bias == core.bias[2]
+    else:
+        assert reason == "resolved_motion_half_command_proposal"
+        assert frame.requested_torque_nm+bias == pytest.approx(core.last_delta[2]/2)
+
+
 @pytest.mark.parametrize("sign", [-1, 1])
 def test_arrival_tail_fast_release_cannot_turn_into_fast_reverse_drive(settings, sign):
     core = runtime(settings)
@@ -1803,6 +1830,35 @@ def test_controlled_support_reacquires_same_frozen_sample_without_global_withdra
     assert workspace._phase == "sweep"
 
 
+def test_coverage_frozen_point_reacquisition_uses_local_search_without_renewing_leg(tmp_path):
+    profile = Path(__file__).resolve().parents[1]/"docs/hardware/profiles/b601_j2_j3_coverage_support_v1.json"
+    r = replay(tmp_path, **json.loads(profile.read_text())["workspace"])
+    advance_to_coordinated_probe(r)
+    workspace = r.controller._coordinated
+    search, sample, started = workspace._search, workspace._sample_pose, workspace._leg_started
+    measured = int(workspace._tasks[workspace._index]["joint"][-1])-1
+    support = 3-measured
+    r.tick()
+    assert r.audit["coordinated_holding"]["point_search_enabled"]
+    exposure = workspace._leg_exposure
+    for _ in range(60):
+        q = list(r.q)
+        q[support] += .00015
+        r.tick(q, dt_sec=.025)
+        if workspace._probe is None:
+            break
+    assert workspace._probe is None and workspace._phase == "sweep"
+    for _ in range(200):
+        scripted_coordinated_tick(r)
+        assert r.audit["coordinated_holding"]["point_search_enabled"]
+        assert workspace._search is search and workspace._sample_pose == sample
+        assert workspace._leg_started == started
+        assert workspace._leg_exposure >= exposure
+        if workspace._probe is not None:
+            break
+    assert workspace._probe is not None
+
+
 @pytest.mark.parametrize("supported,software_kd", [(False, 6.), (True, 6.), (True, 0.)])
 def test_position_arrival_still_requires_six_axis_stationarity(tmp_path, supported, software_kd):
     r = replay(tmp_path, coordinated_holding=CoordinatedHoldingConfig(
@@ -2056,7 +2112,10 @@ def test_full_coupled_batch_and_report_keep_handoffs_distinct_from_withdrawal(tm
             # Audit reports the phase that produced this frame, before a
             # consumed receipt may advance the outer workspace lifecycle.
             audit = r.audit["coordinated_holding"]
-            assert audit["point_search_enabled"] == (not coverage and r.audit["automatic_calibration"]["workspace"]["phase"] == "sweep")
+            frozen_search = r.audit["holding_calibration"]["search"] is not None
+            assert audit["point_search_enabled"] == (
+                r.audit["automatic_calibration"]["workspace"]["phase"] == "sweep"
+                and (not coverage or frozen_search))
         journal.observe(snapshot())
         assert sum(abs(v) for v in r.delta) <= 1+1e-9
         if old != len(r.controller._coordinated._acquisitions):

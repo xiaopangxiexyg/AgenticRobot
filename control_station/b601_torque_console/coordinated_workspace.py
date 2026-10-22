@@ -292,7 +292,11 @@ class CoordinatedWorkspaceController:
             try:
                 command, audit = self.pose.step(sequence=feedback_sequence, dt=dt, permitted=permitted,
                     probe_joint=int(joint[-1])-1 if self._probe is not None else None, probe_nm=self._probe,
-                    point_search=(self._phase == "sweep" and self.workspace.holding_sampling_plan != "coverage"))
+                    # Once a point is frozen, returning after a probe is local
+                    # force search, not another transit. Its departure bias
+                    # may be exactly the command that moved away from the point.
+                    point_search=(self._phase == "sweep" and (
+                        self.workspace.holding_sampling_plan != "coverage" or self._search is not None)))
             except ValueError as exc:
                 self.recording_failed(str(exc))
                 return ZERO, self._make_audit(ZERO, {}, fault=self._reason)
