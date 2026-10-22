@@ -1585,7 +1585,8 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
 
         registration = contract_bundle.object_state_registration
         source = MujocoObjectStateSource(application=application, profile=registration.profile,
-            contact_binding=contract_bundle.grasp_contact_contract.contact_binding)
+            contact_binding=contract_bundle.grasp_contact_contract.contact_binding,
+            gripper_port=(gripper_ports.get("right_gripper") if registration.profile.release_supported else None))
         object_state_executor = build_object_state_executor(registration=registration, capture=source.capture,
             current_station_revision=lambda: observation_producer.current_station_revision,
             clock=runtime_clock, max_retained_operations=retention)

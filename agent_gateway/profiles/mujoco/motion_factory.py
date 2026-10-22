@@ -505,6 +505,7 @@ def build_mujoco_agent_tcp_pose_gateway_session(
     enable_spatial_goals: bool = False,
     enable_tcp_pose_comparison: bool = False,
     enable_object_state: bool = False,
+    enable_object_follow_observation: bool = False,
     safe_tcp_planning_clearance_padding_m: float = 0.002,
     enable_grippers: bool = False,
     enable_grasp_approach: bool = False,
@@ -531,6 +532,10 @@ def build_mujoco_agent_tcp_pose_gateway_session(
         raise TypeError("enable_tcp_pose_comparison must be boolean.")
     if type(enable_object_state) is not bool:
         raise TypeError("enable_object_state must be boolean.")
+    if type(enable_object_follow_observation) is not bool:
+        raise TypeError("enable_object_follow_observation must be boolean.")
+    if enable_object_follow_observation and not enable_object_state:
+        raise ValueError("Object follow observation requires explicit object-state feedback.")
     if enable_object_state and grasp_contact_target_body is None:
         raise ValueError("Object-state feedback requires an explicit grasp contact target.")
     if not isinstance(enable_grasp_approach, bool):
@@ -728,6 +733,7 @@ def build_mujoco_agent_tcp_pose_gateway_session(
             enable_spatial_goals=enable_spatial_goals,
             enable_tcp_pose_comparison=enable_tcp_pose_comparison,
             enable_object_state=enable_object_state,
+            enable_object_follow_observation=enable_object_follow_observation,
             enable_grasp_approach=enable_grasp_approach,
             grasp_contact_binding=grasp_contact_binding,
         )

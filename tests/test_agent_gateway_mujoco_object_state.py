@@ -1,4 +1,4 @@
-"""Native single-cut feedback and actual Gateway wiring, not pick/place success."""
+"""Native feedback and actual Gateway wiring, not pick/place success."""
 
 from dataclasses import replace
 from pathlib import Path
@@ -48,6 +48,32 @@ def test_object_state_requires_the_explicit_contact_target_before_resource_creat
             allowed_client_ids=(CLIENT,), enable_object_state=True)
 
 
+def test_follow_observation_requires_explicit_state_before_resource_creation():
+    with pytest.raises(ValueError, match="object-state"):
+        build_mujoco_agent_tcp_pose_gateway_session(
+            target_config=MujocoSimHILTargetConfig(task_config_path=resolve_path(TASK), realtime_worker=False,
+                runtime_session_id=CLIENT, control_domain_id=CLIENT,
+                execution_observation_plan=mujoco_agent_tcp_pose_execution_observation_plan_v1(),
+                exposed_pose_sides=("right",), allow_scripted_task_reset=False),
+            allowed_client_ids=(CLIENT,), enable_object_follow_observation=True)
+
+
+def test_existing_single_cut_deployment_does_not_bind_a_follow_observer():
+    session = build_mujoco_agent_tcp_pose_gateway_session(
+        target_config=MujocoSimHILTargetConfig(task_config_path=resolve_path(TASK), realtime_worker=False,
+            runtime_session_id=CLIENT, control_domain_id=CLIENT,
+            execution_observation_plan=mujoco_agent_tcp_pose_execution_observation_plan_v1(),
+            exposed_pose_sides=("right",), allow_scripted_task_reset=False),
+        allowed_client_ids=(CLIENT,), enable_grippers=True, enable_grasp_approach=True,
+        grasp_contact_target_body="debug_cube", enable_object_state=True)
+    try:
+        session.application.start_observation_ready()
+        assert not session.contract_bundle.object_state_registration.profile.release_supported
+        assert session.application.runtime.rig._physics_step_observer is None
+    finally:
+        assert session.close().accepted
+
+
 def test_current_native_feedback_uses_the_public_frame_and_never_advances_physics():
     from test_agent_gateway_mujoco_tcp_pose_comparison import _request
 
@@ -58,12 +84,14 @@ def test_current_native_feedback_uses_the_public_frame_and_never_advances_physic
             execution_observation_plan=mujoco_agent_tcp_pose_execution_observation_plan_v1(),
             exposed_pose_sides=("right",), allow_scripted_task_reset=False),
         allowed_client_ids=(CLIENT,), enable_grippers=True, enable_grasp_approach=True,
-        grasp_contact_target_body="debug_cube", enable_object_state=True, trace_sink=facts.append)
+        grasp_contact_target_body="debug_cube", enable_object_state=True,
+        enable_object_follow_observation=True, trace_sink=facts.append)
     try:
         session.application.start_observation_ready()
         adapter = session.wire_adapter(authenticated_client_id=CLIENT, read_only_access=True)
         reg = session.contract_bundle.object_state_registration
         assert reg is not None
+        assert reg.profile.release_supported
         rig = session.application.runtime.rig
         before = rig.capture_scene(lambda s: (s.data.qpos.copy(), s.data.qvel.copy(), float(s.data.time)))
         params = {"object_id": "debug_cube", "reference_frame_id": reg.profile.reference_frame_id,
@@ -77,6 +105,7 @@ def test_current_native_feedback_uses_the_public_frame_and_never_advances_physic
         state = op.execution_result
         assert state["observation_source"] == "mujoco_native_physics"
         assert state["release_observation"] is None
+        assert rig._physics_step_observer is not None
         assert state["clock_domain_id"] == "mujoco-native-physics:" + CLIENT
         after = rig.capture_scene(lambda s: (s.data.qpos.copy(), s.data.qvel.copy(), float(s.data.time)))
         assert all(np.array_equal(a, b) for a, b in zip(before, after, strict=True))
@@ -85,6 +114,34 @@ def test_current_native_feedback_uses_the_public_frame_and_never_advances_physic
             source_frame_id="mujoco_sim_hil/world", target_frame_id=reg.profile.reference_frame_id)
         np.testing.assert_allclose(state["pose_xyz_quat_xyzw"], expected, atol=1e-10)
         assert not any(f.event_type == "component_execution_target" for f in facts)
+    finally:
+        assert session.close().accepted
+    assert rig._physics_step_observer is None
+
+
+def test_native_close_command_generation_is_owner_bound_and_rejected_commands_do_not_renew_it():
+    session = build_mujoco_agent_tcp_pose_gateway_session(
+        target_config=MujocoSimHILTargetConfig(task_config_path=resolve_path(TASK), realtime_worker=False,
+            runtime_session_id=CLIENT, control_domain_id=CLIENT,
+            execution_observation_plan=mujoco_agent_tcp_pose_execution_observation_plan_v1(),
+            exposed_pose_sides=("right",), allow_scripted_task_reset=False),
+        allowed_client_ids=(CLIENT,), enable_grippers=True, enable_grasp_approach=True,
+        grasp_contact_target_body="debug_cube", enable_object_state=True, enable_object_follow_observation=True)
+    try:
+        session.application.start_observation_ready()
+        rig = session.application.runtime.rig
+        right, left = (session.gripper_ports[side + "_gripper"].gripper_name for side in ("right", "left"))
+        assert rig.latest_gripper_command(right) == (0, None)
+        sequence = rig.queue_gripper_close_targets({right: 1.})
+        assert rig.latest_gripper_command(right) == (sequence, 1.)
+        assert rig.latest_gripper_command(left) == (0, None)
+        with pytest.raises(ValueError):
+            rig.queue_gripper_close_targets({right: float("nan")})
+        assert rig.latest_gripper_command(right) == (sequence, 1.)
+        rig.step_physics()
+        rig.hold_gripper_motion("test: original intent is not a HOLD reference")
+        assert rig.latest_gripper_command(right) == (sequence, 1.)
+        assert rig._physics_step_observer.__self__.latest is None
     finally:
         assert session.close().accepted
 
@@ -143,7 +200,7 @@ def test_positive_contact_margin_does_not_become_measured_support():
         source.capture()
 
 
-def test_native_source_cannot_advertise_unimplemented_release_history():
+def test_native_release_capability_requires_its_bound_producer():
     _, source = _small_source()
     with pytest.raises(ValueError, match="release-window"):
         MujocoObjectStateSource(application=source.application,

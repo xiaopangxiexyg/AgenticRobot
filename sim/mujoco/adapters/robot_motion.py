@@ -372,6 +372,7 @@ class MujocoPositionExecutionRig(Rig):
         self._worker: threading.Thread | None = None
         self._started = False
         self._clock_origin = 0.0
+        self._physics_step_observer = None
         self._next_reference_sequence = 1
         self._next_command_sequence = 1
         self._pending_reference: _QueuedReference | None = None
@@ -1086,6 +1087,13 @@ class MujocoPositionExecutionRig(Rig):
                 raise RuntimeError("No MuJoCo gripper executor is configured.")
             return self._gripper_execution.snapshot()
 
+    def latest_gripper_command(self, gripper_name: str) -> tuple[int, float | None]:
+        """Read admitted user intent on the same owner cut as native state."""
+        with self._lock:
+            if self._gripper_execution is None:
+                raise RuntimeError("No MuJoCo gripper command source is configured.")
+            return self._gripper_execution.latest_command(gripper_name)
+
     def hold_gripper_motion(self, reason: str = "manual gripper hold") -> None:
         """Freeze only gripper targets; leave arm planners untouched."""
 
@@ -1401,6 +1409,19 @@ class MujocoPositionExecutionRig(Rig):
                 ),
             )
 
+    def set_physics_step_observer(self, observer) -> None:
+        """Bind one measurement callback; it must not step or dispatch.
+
+        Runs under the existing rig lock after each successful physics tick,
+        including HOLD. Normal close releases it after the worker has joined.
+        """
+        if not callable(observer):
+            raise TypeError("physics step observer must be callable.")
+        with self._lock:
+            if self._physics_step_observer is not None:
+                raise RuntimeError("A physics step observer is already bound.")
+            self._physics_step_observer = observer
+
     def step_physics(self) -> None:
         """Advance one deterministic physics tick; used by tests and offline replay."""
 
@@ -1428,6 +1449,8 @@ class MujocoPositionExecutionRig(Rig):
                         timestep_sec=self.config.timing.physics_timestep_sec,
                     )
                 self._execution.step_physics(command)
+                if self._physics_step_observer is not None:
+                    self._physics_step_observer(self.scene)
                 if proposals:
                     accepted = {
                         side: self._execution.accepted_arm_qpos(side)
@@ -1875,6 +1898,8 @@ class MujocoPositionExecutionRig(Rig):
             self._last_reference = None
             self._hold_reason = None
             self._pending_proposals = {}
+
+            self._physics_step_observer = None
 
 
 __all__ = ["MujocoPositionExecutionConfig", "MujocoPositionExecutionRig"]

@@ -1378,10 +1378,19 @@ MuJoCo 可显式组合 `--enable-grasp-approach --enable-grippers --no-realtime-
 不把质心速度或世界坐标直接标成公开 Station。
 
 `measured_at`、`cutoff_at` 属于返回的 native physics clock；暂停仿真时重复读取
-同一时刻不会产生新物理证据。这是当前状态反馈，不是连续释放判定：当前适配器固定
-返回 `release_observation=null`，不可由一次静止、张爪或动作完成推断放置稳定。
-通用结果允许未来显式部署的连续观测 producer 提供窗口，但稳定声明仍须具有完整
-窗口起点、实测最大采样缺口和固定稳定策略；缺失测量必须返回 null。
+同一时刻不会产生新物理证据。单独启用 `--enable-object-state` 保留原单帧反馈，
+`release_observation=null`。额外启用 `--enable-object-follow-observation` 才将既有物体关系观察器绑定到唯一 rig 的
+physics tick（包括 HOLD），不新增采样线程或 step loop。新闭爪命令后，只有实测双侧
+触觉接触、实际闭合且物体仍有支撑时才冻结 contact-secured 关系；这不授予携物权限。
+随后物体和 TCP 都实际抬升至少 3 cm、无支撑且保持 3 mm/2° 内的冻结关系，连续观察
+至少 0.5 s、缺口不超过 50 ms，才形成 held-verified 历史。失效后不重新锚定。
+
+只有此前验证抓持且随后出现新的张爪代次，才开始 `release_observation`；启动时静止、
+初始张爪、闭爪命令或动作完成都不触发它。释放稳定仍要求完整的 0.6 s/60 个实测样本、
+最大缺口 50 ms、漂移不超过 2 mm/0.05 rad，有支撑且没有夹爪或其他接触。
+读取只返回已有窗口，不延长窗口；新运动、未知接触和缺测均撤销稳定声明。
+窗口未启动时返回 null。该 producer 改变显式部署的 source/profile/schema 哈希，消费者
+必须重新发现目录，不能复用旧绑定。它既不是放置目标内判定，也不是物理任务成功评价。
 本入口不提供真机物体位姿估计源，也不表示完整抓取、搬运或放置验收已通过。
 
 MuJoCo 的 ``state.read_tcp_pose`` 与可选 TCP history 发布同一公开 Station 坐标系。

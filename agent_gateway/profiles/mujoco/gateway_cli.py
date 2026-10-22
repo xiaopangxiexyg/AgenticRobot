@@ -198,7 +198,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--enable-object-state", action="store_true",
-        help="publish passive native read_object_state for the explicit contact target; no release-history or task-success inference",
+        help="publish passive native object pose/velocity/contact for the explicit target; no task-success inference",
+    )
+    parser.add_argument(
+        "--enable-object-follow-observation", action="store_true",
+        help="also observe frozen follow/release on existing physics ticks; requires object-state feedback; no motion authorization",
     )
     parser.add_argument(
         "--safe-tcp-planning-clearance-padding-m",
@@ -540,6 +544,7 @@ def main(argv: list[str] | None = None) -> int:
         enable_spatial_goals=args.enable_spatial_goals,
         enable_tcp_pose_comparison=args.enable_tcp_pose_comparison,
         enable_object_state=args.enable_object_state,
+        enable_object_follow_observation=args.enable_object_follow_observation,
         enable_grasp_approach=args.enable_grasp_approach,
         grasp_contact_target_body=args.grasp_contact_target_body,
         safe_tcp_planning_clearance_padding_m=args.safe_tcp_planning_clearance_padding_m,

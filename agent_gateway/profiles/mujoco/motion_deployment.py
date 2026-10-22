@@ -1816,6 +1816,7 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
     enable_spatial_goals: bool = False,
     enable_tcp_pose_comparison: bool = False,
     enable_object_state: bool = False,
+    enable_object_follow_observation: bool = False,
     enable_grasp_approach: bool = False,
     grasp_contact_binding: MujocoGraspContactBinding | None = None,
 ) -> MujocoAgentTcpPoseContractBundle:
@@ -1847,6 +1848,10 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
         raise TypeError("enable_tcp_pose_comparison must be boolean.")
     if type(enable_object_state) is not bool:
         raise TypeError("enable_object_state must be boolean.")
+    if type(enable_object_follow_observation) is not bool:
+        raise TypeError("enable_object_follow_observation must be boolean.")
+    if enable_object_follow_observation and not enable_object_state:
+        raise ValueError("Object follow observation requires explicit object-state feedback.")
     if enable_object_state and grasp_contact_binding is None:
         raise ValueError("Object-state feedback requires an explicit bound contact target.")
     exact = _exact_application(application)
@@ -3098,7 +3103,10 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
                 "contact_binding": grasp_contact_binding.semantic_content_hash,
                 "support_body": application.task_config.table_body_name,
                 "measurement": "native_body_origin_jacobian_contact_private_copy.v1",
-            }, domain="agenticrobot.mujoco_object_state.source.v1"))
+                **({"follow_producer": "rig_tick_frozen_contact_lift_release.v1"}
+                   if enable_object_follow_observation else {}),
+            }, domain="agenticrobot.mujoco_object_state.source.v1"),
+            release_supported=enable_object_follow_observation)
         object_state_registration = build_object_state_registration(base_entry=state_entry, profile=object_profile)
     definition_items = [
         definition,

@@ -79,6 +79,7 @@ class MujocoDmtacGripperExecutor:
         self._actuator_target_close_by_gripper: dict[str, float] = {}
         self._actuator_target_rate_by_gripper: dict[str, float] = {}
         self._last_status_by_gripper: dict[str, str] = {}
+        self._latest_command_by_gripper: dict[str, tuple[int, float | None]] = {}
         self._last_physics_time_sec = 0.0
         self._reset = False
 
@@ -200,9 +201,14 @@ class MujocoDmtacGripperExecutor:
             core_snapshot["actuator_rate_by_side"]
         )
         self._last_status_by_gripper = {name: "reset" for name in expected}
+        self._latest_command_by_gripper = {name: (0, None) for name in expected}
         self._last_physics_time_sec = float(initial_physics_time_sec)
         self._reset = True
         self._write_ctrl()
+
+    def latest_command(self, gripper_name: str) -> tuple[int, float | None]:
+        """Return queued intent, not an internal HOLD target; the rig owns locking."""
+        return self._latest_command_by_gripper[gripper_name]
 
     def queue_close_targets(self, close_by_gripper: Mapping[str, float]) -> int:
         if not self._reset:
@@ -210,12 +216,14 @@ class MujocoDmtacGripperExecutor:
         unknown = set(close_by_gripper) - set(self.profile.joint_names_by_gripper)
         if unknown:
             raise KeyError(f"unknown gripper target(s): {sorted(unknown)}")
-        targets = {
-            self.profile.side_by_gripper[name]: self._validate_close(value, name=name)
+        validated = {
+            name: self._validate_close(value, name=name)
             for name, value in close_by_gripper.items()
         }
+        targets = {self.profile.side_by_gripper[name]: value for name, value in validated.items()}
         sequence = self._position_actuator.queue_targets(targets)
-        for name in close_by_gripper:
+        for name, target in validated.items():
+            self._latest_command_by_gripper[name] = (sequence, target)
             self._last_status_by_gripper[name] = "queued"
         return sequence
 

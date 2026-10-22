@@ -26,6 +26,8 @@ def test_motion_side_is_explicit_fixed_and_defaults_to_right():
     required = ["--socket-path", "/unused/socket", "--task-config", "/unused/task.json"]
     assert parser.parse_args(required).motion_side == "right"
     assert parser.parse_args([*required, "--motion-side", "left"]).motion_side == "left"
+    assert not parser.parse_args(required).enable_object_follow_observation
+    assert parser.parse_args([*required, "--enable-object-follow-observation"]).enable_object_follow_observation
     with pytest.raises(SystemExit) as captured:
         parser.parse_args([*required, "--motion-side", "both"])
     assert captured.value.code == 2
