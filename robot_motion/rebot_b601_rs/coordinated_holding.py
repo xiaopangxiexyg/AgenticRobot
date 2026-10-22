@@ -69,6 +69,7 @@ class CoordinatedPoseHolding:
         self.q = self.raw = self.velocity = ZERO
         self.goal = None
         self.bias = ZERO
+        self._departure_bias = ZERO
         self.last_delta = ZERO
         self.last_time = None
         self.pending = None
@@ -137,6 +138,9 @@ class CoordinatedPoseHolding:
             self.trackers = tuple(B601JointMotionTracker(replace(self.motion,
                 max_reference_velocity_rad_s=speed, support_soft_speed_recovery=recovery)) for _ in AXES)
         self.goal = goal
+        # A consumed command at departure is a handoff prior, not an estimate
+        # of the holding force at the destination or a gravity correction.
+        self._departure_bias = self.bias
         self.fault_frame = None
         # Proposals are local to this exact goal/pose context, never a model.
         self._approach_anchor = self.q
@@ -157,14 +161,17 @@ class CoordinatedPoseHolding:
         bias = list(self.bias)
         bias[joint] = value
         self.bias = tuple(bias)
+        departure = list(self._departure_bias)
+        departure[joint] = value
+        self._departure_bias = tuple(departure)
 
     def _approach_bias(self, i, frame, dt, moving, anchor, *, point_search=True):
         """Separate resolved motion from optional point-local exploration.
 
         Half is an exploration proposal toward zero, not a measured equilibrium
-        or a signed force bound. Continuous transit retains its learned bias;
-        motion evidence still permits fast removal of positive working tails.
-        Native braking always overrides this path.
+        or a signed force bound. Motor-local recovery can remove a leg's
+        starting increment at arrival and unwind wrong-direction bias while
+        moving. Native braking always overrides this path.
         """
         resolution = self.motion.position_resolution_rad or 0.0
         onset = max(2 * resolution, self.settings.staged_assist.motion_onset_confirm_displacement_rad)
@@ -178,7 +185,24 @@ class CoordinatedPoseHolding:
             and abs(velocity) > self.settings.staged_assist.settle_velocity_rad_s
             and progress * velocity > 0 and self.last_delta[i] * velocity > 0)
         bias, reason = self.bias[i], "retain_bias_during_motion"
-        if onset_confirmed and point_search:
+        target_error = self.goal[i]-self.q[i] if self.goal is not None else frame.q_reference_rad-self.q[i]
+        arrival = (self.config.motor_local_recovery
+                   and getattr(frame, "reason", None) in {"target_reached_braking", "calibration_target_tracking"})
+        extra_drive = bias-self._departure_bias[i]
+        if arrival and (moving or onset_confirmed) and extra_drive*velocity > 0:
+            # Remove this leg's starting increment, not the peer's support or
+            # all compensation. Commit only through the actual dispatch below.
+            bias, moving, reason = self._departure_bias[i], True, "arrival_releases_departure_drive"
+        elif (self.config.motor_local_recovery and not point_search
+              and abs(target_error) > resolution and bias*target_error < 0
+              and bias*velocity > 0 and abs(velocity) > self.settings.staged_assist.settle_velocity_rad_s
+              and self.estimators[i].position_span_rad > resolution):
+            # Error reversal may unwind an obsolete drive while moving. It
+            # cannot integrate a new opposite drive or claim a measured hold.
+            reduction = min(abs(bias), self.config.bias_gain_nm_per_rad_sec*abs(target_error)*dt)
+            bias -= reduction*(1 if bias > 0 else -1)
+            reason = "moving_target_error_unwinds_bias"
+        elif onset_confirmed and point_search:
             half = self.last_delta[i] / 2
             original = frame.requested_torque_nm + self.bias[i]
             # Never cancel a stronger decelerating native PD response just
@@ -190,6 +214,8 @@ class CoordinatedPoseHolding:
                 reason = "motion_unload_keeps_stronger_native_braking"
         elif onset_confirmed:
             moving, reason = True, "resolved_motion_continuous_tracking"
+        elif quiet and arrival and abs(target_error) <= self.arrival_tolerance_rad:
+            reason = "arrival_retains_support_without_extra_integration"
         elif quiet:
             error = frame.q_reference_rad - self.q[i]
             if abs(error) > resolution:
@@ -198,20 +224,21 @@ class CoordinatedPoseHolding:
         return (max(-self.config.bias_cap_nm, min(self.config.bias_cap_nm, bias)),
                 moving, anchor, reason)
 
-    def _slew_axis(self, i, target, dt, resolved_motion):
+    def _slew_axis(self, i, target, dt, resolved_motion, *, arrival_unload=False):
         previous = self.last_delta[i]
         rate = (self.motion.braking_slew_nm_s if self.braking else
                 self.config.rise_slew_nm_s if abs(target) > abs(previous) else self.config.fall_slew_nm_s)
         reason = "native_braking" if self.braking else "normal_command_slew"
-        if (not self.braking and resolved_motion
-            and previous * self.velocity[i] > 0 and previous * self.raw[i] > 0
-            and (target - previous) * self.velocity[i] < 0):
+        arrival_reduction = arrival_unload and previous*(previous-target) > 0
+        resolved_reduction = (resolved_motion and previous*self.velocity[i] > 0
+                              and previous*self.raw[i] > 0 and (target-previous)*self.velocity[i] < 0)
+        if not self.braking and (arrival_reduction or resolved_reduction):
             # Fast removal of existing positive work is not permission for
             # fast opposite drive. Cross zero on a later normal-rise frame.
             if target * previous < 0:
                 target = 0.0
             rate = self.motion.braking_slew_nm_s
-            reason = "resolved_working_tail_unload"
+            reason = "arrival_drive_tail_unload" if arrival_reduction else "resolved_working_tail_unload"
         return previous + max(-rate * dt, min(rate * dt, target - previous)), reason, rate
 
     def _composed_speed_scale(self, i, frame, demand):
@@ -383,17 +410,24 @@ class CoordinatedPoseHolding:
                 composed_speed_scales[i] = self._composed_speed_scale(i, frame, demand[i])
                 demand[i] *= composed_speed_scales[i]
                 if composed_speed_scales[i] < 1:
-                    proposed_bias[i] = self.bias[i]  # No windup behind a speed-limited command.
+                    proposed_bias[i] = self._unwind_only(i, proposed_bias[i])
         norm = sum(abs(v) for v in demand)
         scale = min(1.0, self.config.total_assist_cap_nm / norm) if norm else 1.0
         if scale < 1 and not self.braking:
-            proposed_bias = list(self.bias)  # No integral windup at saturation.
+            proposed_bias = [self._unwind_only(i, value) for i, value in enumerate(proposed_bias)]
         command = [0.0] * 6
         transition_reasons, transition_rates = [None] * 6, [None] * 6
         if permitted:
-            for i in AXES:
+            for i, frame in zip(AXES, frames, strict=True):
                 target = demand[i] * scale
-                command[i], transition_reasons[i], transition_rates[i] = self._slew_axis(i, target, dt, moving[i])
+                # Once the starting increment is removed, its actual command
+                # tail must keep unloading even across zero-count feedback.
+                # The fast path can only reduce toward zero, never reverse.
+                arrival_unload = (self.config.motor_local_recovery
+                                  and frame.reason in {"target_reached_braking", "calibration_target_tracking"}
+                                  and proposed_bias[i] == self._departure_bias[i])
+                command[i], transition_reasons[i], transition_rates[i] = self._slew_axis(
+                    i, target, dt, moving[i], arrival_unload=arrival_unload)
             # The final sum, including a preceding axis' tail, owns one cap.
             norm = sum(abs(v) for v in command)
             if norm > self.config.total_assist_cap_nm:
@@ -408,7 +442,7 @@ class CoordinatedPoseHolding:
                     magnitude = abs(self.last_delta[i]) + (abs(command[i])-abs(self.last_delta[i])) * headroom/requested
                     command[i] = magnitude if command[i] > 0 else -magnitude
                 if not self.braking:
-                    proposed_bias = list(self.bias)
+                    proposed_bias = [self._unwind_only(i, value) for i, value in enumerate(proposed_bias)]
         else:
             proposed_bias = [0.0] * 6
             # Revocation invalidates a proposal immediately, even if a final
@@ -416,6 +450,7 @@ class CoordinatedPoseHolding:
             self._brake_seed = None
             self._support_anchor = None
             self._support_receipt = False
+            self._departure_bias = ZERO
             brake_seed = None
             support_anchor = None
             moving, anchors = [False] * 6, list(self.q)
@@ -426,6 +461,8 @@ class CoordinatedPoseHolding:
             "max_reference_velocity_rad_s": self.trackers[0].config.max_reference_velocity_rad_s,
             "support_soft_speed_recovery": self.trackers[0].config.support_soft_speed_recovery,
             "proposed_bias_nm": tuple(proposed_bias), "combined_command_nm": tuple(command),
+            "departure_bias_nm": self._departure_bias,
+            "departure_bias_semantics": "consumed_handoff_prior_not_destination_holding_force",
             "combined_l1_cap_nm": self.config.total_assist_cap_nm,
             "saturated": scale < 1, "braking": self.braking,
             "arrival_tolerance_rad": self.arrival_tolerance_rad,
@@ -440,6 +477,14 @@ class CoordinatedPoseHolding:
             "torque_transition_reasons": transition_reasons, "torque_transition_rates_nm_s": transition_rates,
             "axes": [asdict(f) for f in frames], "auto_apply": False,
             "quantity": "software_command_not_measured_force"}
+
+    def _unwind_only(self, i, proposed):
+        # Saturation blocks accumulation, not a reduction already requested by
+        # the position controller. Crossing zero may only unload to zero here.
+        previous = self.bias[i]
+        if previous*proposed < 0:
+            return 0.0
+        return proposed if abs(proposed) <= abs(previous) else previous
 
     def record_dispatch(self, sequence, actual_delta):
         if self.pending is None or sequence != self.pending[0]:

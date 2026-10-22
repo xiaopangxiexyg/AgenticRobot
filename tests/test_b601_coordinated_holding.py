@@ -285,7 +285,7 @@ def test_speed_governor_limits_composed_bias_but_not_fixed_probes(settings, monk
         requested_torque_nm=sign*.2 if probe else 0., continuous_speed_scale=scale)
     monkeypatch.setattr(core.trackers[0], "update", lambda **kwargs:first)
     monkeypatch.setattr(core.trackers[1], "update", lambda **kwargs:second)
-    monkeypatch.setattr(core, "_slew_axis", lambda i, target, dt, resolved_motion:(target, "isolated_composition", 1.))
+    monkeypatch.setattr(core, "_slew_axis", lambda i, target, dt, resolved_motion, **kwargs:(target, "isolated_composition", 1.))
     command, audit = core.step(sequence=12, dt=.01, permitted=True,
         probe_joint=2 if probe else None, probe_nm=sign*.2 if probe else None,
         point_search=False)
@@ -321,6 +321,10 @@ def test_composite_governor_covers_arrival_away_motion_and_supported_stop(
     core.observe(core.last_time+.01,
                  tuple(sign*.002 if i == joint and source == "window" else 0. for i in range(6)), ZERO)
     core.velocity = tuple(sign*speed if i == joint and source == "window" else 0. for i in range(6))
+    # Isolate full-demand speed composition from position-aware bias release,
+    # which has its own receipt/reversal regressions below.
+    monkeypatch.setattr(core, "_approach_bias",
+        lambda i, frame, dt, moving, anchor, **kwargs: (core.bias[i], moving, anchor, "isolated_bias"))
     for i in (1, 2):
         frame = B601JointMotionFrame(
             phase="track" if phase == "track" else "brake",
@@ -334,7 +338,7 @@ def test_composite_governor_covers_arrival_away_motion_and_supported_stop(
             # A goal-directed governor sees no toward-goal movement here.
             continuous_speed_scale=1. if phase == "track" else None)
         monkeypatch.setattr(core.trackers[i-1], "update", lambda frame=frame, **kwargs: frame)
-    monkeypatch.setattr(core, "_slew_axis", lambda i, target, dt, resolved_motion:(target, "isolated_composition", 1.))
+    monkeypatch.setattr(core, "_slew_axis", lambda i, target, dt, resolved_motion, **kwargs:(target, "isolated_composition", 1.))
     command, audit = core.step(sequence=12, dt=.01, permitted=True, point_search=False)
     assert audit["composed_speed_scales"][joint] == pytest.approx(.5)
     assert command[joint] == pytest.approx(sign*.3)
@@ -363,6 +367,169 @@ def test_composite_speed_envelope_preserves_static_support_jitter_and_opposing_e
     assert core._composed_speed_scale(2, frame, -sign*.6) == 1.
     core.velocity = ZERO
     assert core._composed_speed_scale(2, frame, sign*.6) == 1.
+
+
+@pytest.mark.parametrize("joint", [1, 2])
+@pytest.mark.parametrize("sign", [-1, 1])
+@pytest.mark.parametrize("mismatched_receipt", [False, True])
+def test_arrival_releases_starting_increment_only_through_actual_receipt(
+    settings, monkeypatch, joint, sign, mismatched_receipt,
+):
+    from robot_motion.rebot_b601_rs.joint_motion import B601JointMotionFrame
+
+    core = runtime(settings)
+    core.config = CoordinatedHoldingConfig(supported_soft_recovery=True, recovery_kd_nm_s_per_rad=0.)
+    warm(core)
+    core.adopt_hold(joint, sign*.216)
+    core.adopt_hold(3-joint, -.1)
+    core.set_goal(tuple(sign*.01 if i == joint else core.q[i] for i in range(6)))
+    core.bias = tuple(sign*.84 if i == joint else value for i, value in enumerate(core.bias))
+    core.last_delta = core.bias
+    core.observe(core.last_time+.01,
+        tuple(sign*.009 if i == joint else 0. for i in range(6)), ZERO)
+    core.velocity = core.raw = tuple(sign*.01 if i == joint else 0. for i in range(6))
+    for i, tracker in zip((1, 2), core.trackers):
+        frame = B601JointMotionFrame(phase="brake", reason="target_reached_braking",
+            q_reference_rad=core.goal[i], qvel_reference_rad_s=0., control_qvel_rad_s=core.velocity[i],
+            position_torque_nm=0., velocity_torque_nm=0., requested_torque_nm=0.)
+        monkeypatch.setattr(tracker, "update", lambda frame=frame, **kwargs: frame)
+    old_bias = core.bias
+    command, audit = core.step(sequence=12, dt=.01, permitted=True, point_search=False)
+    assert audit["approach_reasons"][joint] == "arrival_releases_departure_drive"
+    assert audit["proposed_bias_nm"][joint] == pytest.approx(sign*.216)
+    assert command[joint] == pytest.approx(sign*(.84-core.motion.braking_slew_nm_s*.01))
+    assert command[3-joint] == -.1
+    assert core.bias == old_bias
+    actual = tuple(value/2 if i == joint else value for i, value in enumerate(command)) if mismatched_receipt else command
+    core.record_dispatch(12, actual)
+    assert core.bias[joint] == pytest.approx(sign*(.84 if mismatched_receipt else .216))
+    assert core.last_delta == actual
+    assert sum(abs(v) for v in actual) <= 1.
+
+
+@pytest.mark.parametrize("sign", [-1, 1])
+def test_released_arrival_drive_does_not_return_when_velocity_drops(settings, monkeypatch, sign):
+    from robot_motion.rebot_b601_rs.joint_motion import B601JointMotionFrame
+
+    core = runtime(settings)
+    core.config = CoordinatedHoldingConfig(supported_soft_recovery=True, recovery_kd_nm_s_per_rad=0.)
+    warm(core)
+    core.adopt_hold(2, sign*.2)
+    core.set_goal((0., 0., sign*.01, 0., 0., 0.))
+    core.bias = core.last_delta = (0., 0., sign*.8, 0., 0., 0.)
+    for n in range(1, 45):
+        dt = core.observe(1.11+n*.01, (0., 0., sign*.009, 0., 0., 0.), ZERO)
+        if n == 1:
+            core.velocity = core.raw = (0., 0., sign*.01, 0., 0., 0.)
+        for i, tracker in zip((1, 2), core.trackers):
+            frame = B601JointMotionFrame(phase="brake", reason="target_reached_braking",
+                q_reference_rad=core.goal[i], qvel_reference_rad_s=0., control_qvel_rad_s=core.velocity[i],
+                position_torque_nm=0., velocity_torque_nm=0., requested_torque_nm=0.)
+            monkeypatch.setattr(tracker, "update", lambda frame=frame, **kwargs: frame)
+        command, audit = core.step(sequence=11+n, dt=dt, permitted=True, point_search=False)
+        core.record_dispatch(11+n, command)
+        assert core.bias[2] == pytest.approx(sign*.2)
+        assert abs(command[2]) <= .8+1e-9
+    assert command[2] == pytest.approx(sign*.2)
+    assert audit["approach_reasons"][2] == "arrival_retains_support_without_extra_integration"
+    core.adopt_hold(2, sign*.35)
+    assert core._departure_bias[2] == sign*.35  # A later verified hold replaces the prior.
+    dt = core.observe(core.last_time+.01, core.q, ZERO)
+    command, _ = core.step(sequence=100, dt=dt, permitted=False)
+    core.record_dispatch(100, command)
+    assert core.bias == ZERO and core._departure_bias == ZERO
+
+
+@pytest.mark.parametrize("sign", [-1, 1])
+def test_moving_error_unwinds_obsolete_bias_without_integrating_reverse_drive(settings, sign):
+    core = runtime(settings)
+    core.config = CoordinatedHoldingConfig(supported_soft_recovery=True, recovery_kd_nm_s_per_rad=0.)
+    core.goal = (0., 0., 0., 0., 0., 0.)
+    core.q = (0., 0., sign*.006, 0., 0., 0.)
+    core.velocity = (0., 0., sign*.01, 0., 0., 0.)
+    core.estimators = tuple(SimpleNamespace(position_span_rad=.002) for _ in range(6))
+    core.bias = (0., 0., sign*.84, 0., 0., 0.)
+    frame = SimpleNamespace(reason="bounded_reference_tracking", q_reference_rad=0., requested_torque_nm=-sign*.1)
+    bias, _, _, reason = core._approach_bias(2, frame, .01, True, 0., point_search=False)
+    assert reason == "moving_target_error_unwinds_bias"
+    assert bias == pytest.approx(sign*(.84-core.config.bias_gain_nm_per_rad_sec*.006*.01))
+    for _ in range(800):
+        core.bias = (0., 0., bias, 0., 0., 0.)
+        bias, _, _, _ = core._approach_bias(2, frame, .01, True, 0., point_search=False)
+        assert bias*sign >= 0
+    assert bias == pytest.approx(0.)
+
+
+def test_recorded_uirvzgyc_arrival_releases_increment_not_departure_support(settings):
+    # Same-state branch comparison, not a prediction of later real motion.
+    core = runtime(settings)
+    core.config = CoordinatedHoldingConfig(bias_gain_nm_per_rad_sec=40.,
+        supported_soft_recovery=True, recovery_kd_nm_s_per_rad=0.)
+    core.goal = (0., 0., .04235987755982989, 0., 0., 0.)
+    core.q = (0., 0., math.radians(2.4610234527745525), 0., 0., 0.)
+    core.velocity = core.raw = (0., 0., -.010164443993499674, 0., 0., 0.)
+    core.bias = (0., 0., -.8423252060973547, 0., 0., 0.)
+    core._departure_bias = (0., 0., -.2161, 0., 0., 0.)
+    core.last_delta = (0., 0., -.8392777780224778, 0., 0., 0.)
+    core.estimators = tuple(SimpleNamespace(position_span_rad=.002) for _ in range(6))
+    frame = SimpleNamespace(reason="target_reached_braking", q_reference_rad=core.goal[2],
+                            requested_torque_nm=.003047428074876908)
+    bias, moving, _, reason = core._approach_bias(2, frame, .01, True, .04525, point_search=False)
+    assert reason == "arrival_releases_departure_drive" and moving
+    assert bias == -.2161
+    assert frame.requested_torque_nm+bias == pytest.approx(-.2130525719251231)
+
+
+@pytest.mark.parametrize("sign", [-1, 1])
+def test_arrival_tail_fast_release_cannot_turn_into_fast_reverse_drive(settings, sign):
+    core = runtime(settings)
+    core.config = CoordinatedHoldingConfig()
+    core.last_delta = (0., 0., sign*.1, 0., 0., 0.)
+    command, reason, rate = core._slew_axis(2, -sign*.5, .025, False, arrival_unload=True)
+    assert reason == "arrival_drive_tail_unload"
+    assert rate == core.motion.braking_slew_nm_s
+    assert command*sign >= 0
+    core.last_delta = ZERO
+    command, _, rate = core._slew_axis(2, -sign*.5, .025, False, arrival_unload=True)
+    assert command == pytest.approx(-sign*core.config.rise_slew_nm_s*.025)
+    assert rate == core.config.rise_slew_nm_s
+
+
+@pytest.mark.parametrize("sign", [-1, 1])
+def test_anti_windup_keeps_reductions_but_blocks_growth_and_reverse_integration(settings, sign):
+    core = runtime(settings)
+    core.bias = (0., 0., sign*.6, 0., 0., 0.)
+    assert core._unwind_only(2, sign*.2) == sign*.2
+    assert core._unwind_only(2, sign*.8) == sign*.6
+    assert core._unwind_only(2, -sign*.1) == 0.
+
+
+@pytest.mark.parametrize("limit", ["speed", "combined_envelope"])
+def test_limited_arrival_cannot_restore_the_unloaded_increment(settings, monkeypatch, limit):
+    from robot_motion.rebot_b601_rs.joint_motion import B601JointMotionFrame
+
+    core = runtime(settings)
+    core.config = CoordinatedHoldingConfig(supported_soft_recovery=True, recovery_kd_nm_s_per_rad=0.)
+    warm(core)
+    core.adopt_hold(1, .1)
+    core.adopt_hold(2, .2)
+    core.set_goal((0., 0., .01, 0., 0., 0.))
+    core.bias = core.last_delta = (0., .1, .8, 0., 0., 0.)
+    core.observe(core.last_time+.01, (0., 0., .009, 0., 0., 0.), ZERO)
+    core.velocity = core.raw = (0., 0., .01, 0., 0., 0.)
+    for i, tracker in zip((1, 2), core.trackers):
+        frame = B601JointMotionFrame(phase="brake", reason="target_reached_braking",
+            q_reference_rad=core.goal[i], qvel_reference_rad_s=0., control_qvel_rad_s=core.velocity[i],
+            position_torque_nm=0., velocity_torque_nm=0.,
+            requested_torque_nm=.8 if limit == "combined_envelope" and i == 1 else 0.,
+            continuous_speed_scale=.4 if limit == "speed" and i == 2 else None)
+        monkeypatch.setattr(tracker, "update", lambda frame=frame, **kwargs: frame)
+    command, audit = core.step(sequence=12, dt=.01, permitted=True, point_search=False)
+    assert audit["composed_speed_scales"][2] < 1 if limit == "speed" else audit["saturated"]
+    assert audit["proposed_bias_nm"][2] == .2
+    assert core.bias[2] == .8
+    core.record_dispatch(12, command)
+    assert core.bias[2] == .2 and sum(abs(v) for v in command) <= 1.
 
 
 def test_both_axes_share_one_envelope_and_commit_only_after_actual_receipt(settings):
