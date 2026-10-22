@@ -372,7 +372,7 @@ def test_composite_speed_envelope_preserves_static_support_jitter_and_opposing_e
 @pytest.mark.parametrize("joint", [1, 2])
 @pytest.mark.parametrize("sign", [-1, 1])
 @pytest.mark.parametrize("mismatched_receipt", [False, True])
-def test_arrival_releases_starting_increment_only_through_actual_receipt(
+def test_arrival_feedback_unload_commits_only_through_actual_receipt(
     settings, monkeypatch, joint, sign, mismatched_receipt,
 ):
     from robot_motion.rebot_b601_rs.joint_motion import B601JointMotionFrame
@@ -389,20 +389,21 @@ def test_arrival_releases_starting_increment_only_through_actual_receipt(
         tuple(sign*.009 if i == joint else 0. for i in range(6)), ZERO)
     core.velocity = core.raw = tuple(sign*.01 if i == joint else 0. for i in range(6))
     for i, tracker in zip((1, 2), core.trackers):
-        frame = B601JointMotionFrame(phase="brake", reason="target_reached_braking",
+        frame = B601JointMotionFrame(phase="brake", reason="target_reached_braking", brake_elapsed_sec=0.,
             q_reference_rad=core.goal[i], qvel_reference_rad_s=0., control_qvel_rad_s=core.velocity[i],
             position_torque_nm=0., velocity_torque_nm=0., requested_torque_nm=0.)
         monkeypatch.setattr(tracker, "update", lambda frame=frame, **kwargs: frame)
     old_bias = core.bias
     command, audit = core.step(sequence=12, dt=.01, permitted=True, point_search=False)
-    assert audit["approach_reasons"][joint] == "arrival_releases_departure_drive"
-    assert audit["proposed_bias_nm"][joint] == pytest.approx(sign*.216)
-    assert command[joint] == pytest.approx(sign*(.84-core.motion.braking_slew_nm_s*.01))
+    assert audit["approach_reasons"][joint] == "arrival_feedback_unloading"
+    expected = sign*(.84-core.config.fall_slew_nm_s*.01)
+    assert audit["proposed_bias_nm"][joint] == pytest.approx(expected)
+    assert command[joint] == pytest.approx(expected)
     assert command[3-joint] == -.1
     assert core.bias == old_bias
     actual = tuple(value/2 if i == joint else value for i, value in enumerate(command)) if mismatched_receipt else command
     core.record_dispatch(12, actual)
-    assert core.bias[joint] == pytest.approx(sign*(.84 if mismatched_receipt else .216))
+    assert core.bias[joint] == pytest.approx(sign*.84 if mismatched_receipt else expected)
     assert core.last_delta == actual
     assert sum(abs(v) for v in actual) <= 1.
 
@@ -417,20 +418,30 @@ def test_released_arrival_drive_does_not_return_when_velocity_drops(settings, mo
     core.adopt_hold(2, sign*.2)
     core.set_goal((0., 0., sign*.01, 0., 0., 0.))
     core.bias = core.last_delta = (0., 0., sign*.8, 0., 0., 0.)
+    unloads, quiet_bias = 0, None
     for n in range(1, 45):
         dt = core.observe(1.11+n*.01, (0., 0., sign*.009, 0., 0., 0.), ZERO)
         if n == 1:
             core.velocity = core.raw = (0., 0., sign*.01, 0., 0., 0.)
         for i, tracker in zip((1, 2), core.trackers):
-            frame = B601JointMotionFrame(phase="brake", reason="target_reached_braking",
+            frame = B601JointMotionFrame(phase="brake", reason="target_reached_braking", brake_elapsed_sec=(n-1)*.01,
                 q_reference_rad=core.goal[i], qvel_reference_rad_s=0., control_qvel_rad_s=core.velocity[i],
                 position_torque_nm=0., velocity_torque_nm=0., requested_torque_nm=0.)
             monkeypatch.setattr(tracker, "update", lambda frame=frame, **kwargs: frame)
+        previous = core.bias[2]
         command, audit = core.step(sequence=11+n, dt=dt, permitted=True, point_search=False)
         core.record_dispatch(11+n, command)
-        assert core.bias[2] == pytest.approx(sign*.2)
+        if audit["approach_reasons"][2] == "arrival_feedback_unloading":
+            unloads += 1
+            assert core.bias[2] == pytest.approx(previous-sign*core.config.fall_slew_nm_s*dt)
+        else:
+            assert core.bias[2] == previous
+        if audit["approach_reasons"][2] == "arrival_retains_support_without_extra_integration":
+            quiet_bias = core.bias[2] if quiet_bias is None else quiet_bias
+            assert core.bias[2] == quiet_bias
         assert abs(command[2]) <= .8+1e-9
-    assert command[2] == pytest.approx(sign*.2)
+    assert unloads > 0 and quiet_bias is not None and quiet_bias*sign > 0
+    assert command[2] == pytest.approx(quiet_bias)
     assert audit["approach_reasons"][2] == "arrival_retains_support_without_extra_integration"
     core.adopt_hold(2, sign*.35)
     assert core._departure_bias[2] == sign*.35  # A later verified hold replaces the prior.
@@ -460,7 +471,59 @@ def test_moving_error_unwinds_obsolete_bias_without_integrating_reverse_drive(se
     assert bias == pytest.approx(0.)
 
 
-def test_recorded_uirvzgyc_arrival_releases_increment_not_departure_support(settings):
+@pytest.mark.parametrize("mirror", [-1, 1])
+@pytest.mark.parametrize("departure", [0., .2, -.3])
+@pytest.mark.parametrize("velocity", [.01713290530406895, .004])
+def test_f1znk_arrival_unloads_with_motion_not_departure_support(settings, mirror, departure, velocity):
+    # Exact selected-axis state and preceding sent command at sequence 24504.
+    # The continuation is a same-state contract check, not a physical rollout.
+    core = runtime(settings)
+    core.config = CoordinatedHoldingConfig(bias_gain_nm_per_rad_sec=40.,
+        supported_soft_recovery=True, recovery_kd_nm_s_per_rad=0.)
+    core.goal = (0., 0., mirror*.12962634015954635, 0., 0., 0.)
+    core.q = (0., 0., mirror*.1273249089717865, 0., 0., 0.)
+    core.raw = (0., 0., mirror*.03824909841920095, 0., 0., 0.)
+    core.velocity = (0., 0., mirror*velocity, 0., 0., 0.)
+    previous = mirror*.7285417890950698
+    native = mirror*.01048426894904932
+    core.bias = (0., 0., mirror*.7115409167637613, 0., 0., 0.)
+    core.last_delta = (0., 0., previous, 0., 0., 0.)
+    core._departure_bias = (0., 0., mirror*departure, 0., 0., 0.)
+    core.estimators = tuple(SimpleNamespace(position_span_rad=.0007669925689697266) for _ in range(6))
+    frame = SimpleNamespace(reason="target_reached_braking", brake_elapsed_sec=0.,
+        q_reference_rad=core.goal[2], requested_torque_nm=native)
+    bias, _, _, reason = core._approach_bias(2, frame, .01, True, core.q[2], point_search=False)
+    expected = core.bias[2]-(mirror*core.config.fall_slew_nm_s*.01 if velocity > core.settings.staged_assist.settle_velocity_rad_s else 0)
+    assert bias == pytest.approx(expected)
+    assert (bias+native)*mirror > 0
+    assert reason == ("arrival_feedback_unloading" if velocity > core.settings.staged_assist.settle_velocity_rad_s else "retain_bias_during_motion")
+
+
+@pytest.mark.parametrize("mirror", [-1, 1])
+@pytest.mark.parametrize("strong_native_brake", [False, True])
+def test_arrival_feedback_waits_for_resolved_onset_and_preserves_stronger_native_braking(settings, mirror, strong_native_brake):
+    core = runtime(settings)
+    core.config = CoordinatedHoldingConfig(supported_soft_recovery=True, recovery_kd_nm_s_per_rad=0.)
+    core.goal = (0., 0., mirror*.02, 0., 0., 0.)
+    core.bias = core.last_delta = (0., 0., mirror*.6, 0., 0., 0.)
+    core.q = (0., 0., mirror*.018, 0., 0., 0.)
+    core.raw = core.velocity = (0., 0., mirror*.01, 0., 0., 0.)
+    core.estimators = tuple(SimpleNamespace(position_span_rad=.002) for _ in range(6))
+    frame = SimpleNamespace(reason="target_reached_braking", brake_elapsed_sec=.1,
+        q_reference_rad=core.goal[2], requested_torque_nm=-mirror if strong_native_brake else 0.)
+    # No displacement witness at the arrival entry: do not infer onset from speed alone.
+    bias, _, _, _ = core._approach_bias(2, frame, .01, False, core.q[2], point_search=False)
+    assert bias == core.bias[2]
+    bias, moving, _, reason = core._approach_bias(2, frame, .01, False,
+        core.q[2]-mirror*.002, point_search=False)
+    assert moving
+    if strong_native_brake:
+        assert reason == "resolved_motion_continuous_tracking" and bias == core.bias[2]
+    else:
+        assert reason == "arrival_feedback_unloading" and bias == pytest.approx(mirror*(.6-core.config.fall_slew_nm_s*.01))
+
+
+def test_recorded_uirvzgyc_arrival_proposal_keeps_support_not_departure_assumption(settings):
     # Same-state branch comparison, not a prediction of later real motion.
     core = runtime(settings)
     core.config = CoordinatedHoldingConfig(bias_gain_nm_per_rad_sec=40.,
@@ -472,12 +535,11 @@ def test_recorded_uirvzgyc_arrival_releases_increment_not_departure_support(sett
     core._departure_bias = (0., 0., -.2161, 0., 0., 0.)
     core.last_delta = (0., 0., -.8392777780224778, 0., 0., 0.)
     core.estimators = tuple(SimpleNamespace(position_span_rad=.002) for _ in range(6))
-    frame = SimpleNamespace(reason="target_reached_braking", q_reference_rad=core.goal[2],
+    frame = SimpleNamespace(reason="target_reached_braking", brake_elapsed_sec=0., q_reference_rad=core.goal[2],
                             requested_torque_nm=.003047428074876908)
     bias, moving, _, reason = core._approach_bias(2, frame, .01, True, .04525, point_search=False)
-    assert reason == "arrival_releases_departure_drive" and moving
-    assert bias == -.2161
-    assert frame.requested_torque_nm+bias == pytest.approx(-.2130525719251231)
+    assert reason == "arrival_feedback_unloading" and moving
+    assert bias == pytest.approx(core.bias[2]+core.config.fall_slew_nm_s*.01)
 
 
 @pytest.mark.parametrize("point_search", [False, True])
@@ -568,7 +630,7 @@ def test_limited_arrival_cannot_restore_the_unloaded_increment(settings, monkeyp
     core.observe(core.last_time+.01, (0., 0., .009, 0., 0., 0.), ZERO)
     core.velocity = core.raw = (0., 0., .01, 0., 0., 0.)
     for i, tracker in zip((1, 2), core.trackers):
-        frame = B601JointMotionFrame(phase="brake", reason="target_reached_braking",
+        frame = B601JointMotionFrame(phase="brake", reason="target_reached_braking", brake_elapsed_sec=0.,
             q_reference_rad=core.goal[i], qvel_reference_rad_s=0., control_qvel_rad_s=core.velocity[i],
             position_torque_nm=0., velocity_torque_nm=0.,
             requested_torque_nm=.8 if limit == "combined_envelope" and i == 1 else 0.,
@@ -576,10 +638,11 @@ def test_limited_arrival_cannot_restore_the_unloaded_increment(settings, monkeyp
         monkeypatch.setattr(tracker, "update", lambda frame=frame, **kwargs: frame)
     command, audit = core.step(sequence=12, dt=.01, permitted=True, point_search=False)
     assert audit["composed_speed_scales"][2] < 1 if limit == "speed" else audit["saturated"]
-    assert audit["proposed_bias_nm"][2] == .2
+    expected = .8-core.config.fall_slew_nm_s*.01
+    assert audit["proposed_bias_nm"][2] == pytest.approx(expected)
     assert core.bias[2] == .8
     core.record_dispatch(12, command)
-    assert core.bias[2] == .2 and sum(abs(v) for v in command) <= 1.
+    assert core.bias[2] == pytest.approx(expected) and sum(abs(v) for v in command) <= 1.
 
 
 def test_both_axes_share_one_envelope_and_commit_only_after_actual_receipt(settings):
@@ -2172,6 +2235,58 @@ def test_passive_offset_still_obeys_original_support_excursion_guard(tmp_path):
     r.tick(q, dt_sec=.025)
     assert r.audit["fault"] == "workspace_support_excursion"
     assert r.delta == ZERO
+
+
+@pytest.mark.parametrize("direction", [-1, 1])
+@pytest.mark.parametrize("load", [.45, .65])
+def test_loaded_arrival_retains_support_in_declared_inertial_counterexample(tmp_path, direction, load):
+    # Hypothetical unit inertia, residual load and Coulomb friction, NOT
+    # identified B601 dynamics. A small residual-load toy alone cannot expose
+    # dropping a destination's support back to a zero departure prior.
+    profile = Path(__file__).resolve().parents[1]/"docs/hardware/profiles/b601_j2_j3_coverage_support_v1.json"
+    r = replay(tmp_path, **json.loads(profile.read_text())["workspace"])
+    workspace = r.controller._coordinated
+    core = CoordinatedPoseHolding(workspace.settings, workspace.workspace.coordinated_holding,
+        arrival_tolerance_rad=workspace.pose.arrival_tolerance_rad)
+    goal = (0., .05, .12962634015954635, 0., 0., 0.)
+    q, v, dt = goal[2]-direction*.002301431187759856, direction*.01713290530406895, .01
+    for n in range(20):
+        period = core.observe(1+n*dt, (0., .05, q, 0., 0., 0.), ZERO)
+        command, _ = core.step(sequence=n, dt=period, permitted=False)
+        core.record_dispatch(n, command)
+    core.set_goal(goal)
+    assert core._departure_bias == ZERO
+    core.bias = (0., 0., direction*.7115409167637613, 0., 0., 0.)
+    core.last_delta = (0., 0., direction*.7285417890950698, 0., 0., 0.)
+    core._approach_moving = (False, False, True, False, False, False)
+    quiet_since = None
+    for n in range(20, 3020):
+        drive = core.last_delta[2]-direction*load-3*v
+        if abs(v) < 1e-6 and abs(drive) <= .2:
+            new_v = 0.
+        else:
+            friction = math.copysign(.05, v if v else drive)
+            new_v = v+(drive-friction)*dt
+            if v*new_v < 0 and abs(core.last_delta[2]-direction*load) <= .2:
+                new_v = 0.
+        v = new_v
+        q += v*dt
+        assert abs(v) <= core.settings.limits.max_joint_velocity_rad_s
+        assert abs(q-goal[2]) <= core.motion.max_reference_lag_rad
+        period = core.observe(1+n*dt, (0., .05, q, 0., 0., 0.), (0., 0., v, 0., 0., 0.))
+        command, _ = core.step(sequence=n, dt=period, permitted=True, point_search=False)
+        core.record_dispatch(n, command)
+        assert sum(abs(u) for u in command) <= core.config.total_assist_cap_nm
+        if core.quiet() and abs(q-goal[2]) <= core.arrival_tolerance_rad:
+            quiet_since = core.last_time if quiet_since is None else quiet_since
+            if core.last_time-quiet_since >= core.settings.staged_assist.settle_dwell_sec:
+                break
+        else:
+            quiet_since = None
+    else:
+        pytest.fail("loaded toy never reached a stable arrival before its finite horizon")
+    assert command[2]*direction > 0
+    assert abs(command[2]-direction*load) <= .2
 
 
 def test_coupled_partial_batch_holds_other_axis_handoffs_and_final_withdrawal(tmp_path, monkeypatch):

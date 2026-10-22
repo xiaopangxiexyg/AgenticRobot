@@ -169,9 +169,9 @@ class CoordinatedPoseHolding:
         """Separate resolved motion from optional point-local exploration.
 
         Half is an exploration proposal toward zero, not a measured equilibrium
-        or a signed force bound. Motor-local recovery can remove a leg's
-        starting increment at arrival and unwind wrong-direction bias while
-        moving. Native braking always overrides this path.
+        or a signed force bound. Motor-local arrival unloads gradually while
+        resolved motion is still assisted, never to a presumed support value.
+        Native braking always overrides this path.
         """
         resolution = self.motion.position_resolution_rad or 0.0
         onset = max(2 * resolution, self.settings.staged_assist.motion_onset_confirm_displacement_rad)
@@ -188,11 +188,26 @@ class CoordinatedPoseHolding:
         target_error = self.goal[i]-self.q[i] if self.goal is not None else frame.q_reference_rad-self.q[i]
         arrival = (self.config.motor_local_recovery
                    and getattr(frame, "reason", None) in {"target_reached_braking", "calibration_target_tracking"})
-        extra_drive = bias-self._departure_bias[i]
-        if arrival and not point_search and (moving or onset_confirmed) and extra_drive*velocity > 0:
-            # Remove this leg's starting increment, not the peer's support or
-            # all compensation. Commit only through the actual dispatch below.
-            bias, moving, reason = self._departure_bias[i], True, "arrival_releases_departure_drive"
+        if (arrival and not point_search and (moving or onset_confirmed)
+            and abs(velocity) > self.settings.staged_assist.settle_velocity_rad_s
+            and self.estimators[i].position_span_rad > resolution
+            and bias*velocity > 0 and self.last_delta[i]*velocity > 0
+            and (frame.requested_torque_nm+bias)*velocity > 0):
+            # Support at the destination is unknown. Remove only the existing
+            # fall-slew increment while motion persists; stop unloading when
+            # it slows instead of substituting a departure value or fixed half.
+            reduction = min(abs(bias), self.config.fall_slew_nm_s*dt)
+            bias -= reduction*(1 if bias > 0 else -1)
+            moving, reason = True, "arrival_feedback_unloading"
+        elif onset_confirmed and point_search:
+            half = self.last_delta[i] / 2
+            original = frame.requested_torque_nm + self.bias[i]
+            # A point-local half is a proposal, not a measured holding force.
+            target = min(half, original) if velocity > 0 else max(half, original)
+            bias = target - frame.requested_torque_nm
+            moving, reason = True, "resolved_motion_half_command_proposal"
+            if target != half:
+                reason = "motion_unload_keeps_stronger_native_braking"
         elif (self.config.motor_local_recovery and not point_search
               and abs(target_error) > resolution and bias*target_error < 0
               and bias*velocity > 0 and abs(velocity) > self.settings.staged_assist.settle_velocity_rad_s
@@ -202,16 +217,6 @@ class CoordinatedPoseHolding:
             reduction = min(abs(bias), self.config.bias_gain_nm_per_rad_sec*abs(target_error)*dt)
             bias -= reduction*(1 if bias > 0 else -1)
             reason = "moving_target_error_unwinds_bias"
-        elif onset_confirmed and point_search:
-            half = self.last_delta[i] / 2
-            original = frame.requested_torque_nm + self.bias[i]
-            # Never cancel a stronger decelerating native PD response just
-            # to reach the midpoint. Only reduce positive commanded work.
-            target = min(half, original) if velocity > 0 else max(half, original)
-            bias = target - frame.requested_torque_nm
-            moving, reason = True, "resolved_motion_half_command_proposal"
-            if target != half:
-                reason = "motion_unload_keeps_stronger_native_braking"
         elif onset_confirmed:
             moving, reason = True, "resolved_motion_continuous_tracking"
         elif quiet and arrival and not point_search and abs(target_error) <= self.arrival_tolerance_rad:
@@ -420,13 +425,12 @@ class CoordinatedPoseHolding:
         if permitted:
             for i, frame in zip(AXES, frames, strict=True):
                 target = demand[i] * scale
-                # Once the starting increment is removed, its actual command
-                # tail must keep unloading even across zero-count feedback.
+                # An arrival reduction's actual command tail must keep
+                # unloading even across zero-count feedback.
                 # The fast path can only reduce toward zero, never reverse.
                 arrival_unload = (self.config.motor_local_recovery
                                   and not point_search
-                                  and frame.reason in {"target_reached_braking", "calibration_target_tracking"}
-                                  and proposed_bias[i] == self._departure_bias[i])
+                                  and frame.reason in {"target_reached_braking", "calibration_target_tracking"})
                 command[i], transition_reasons[i], transition_rates[i] = self._slew_axis(
                     i, target, dt, moving[i], arrival_unload=arrival_unload)
             # The final sum, including a preceding axis' tail, owns one cap.
