@@ -79,6 +79,7 @@ class CoordinatedWorkspaceController:
         self._return_route_complete = False
         self._return_revoked = None
         self._manual_return_requested = None
+        self._dispatch_withdrawal = None
         self._lock = threading.RLock()
 
     @property
@@ -443,15 +444,33 @@ class CoordinatedWorkspaceController:
             rate_per_sec=self.pose.motion.drive_damping_rise_per_sec, dt_sec=dt)
 
     def validate_dispatch_start(self, *, feedback_sequence, feedback_timestamp_sec, now_sec=None):
-        clock = time.monotonic() if now_sec is None else finite(now_sec, "dispatch start")
-        if self._pending is None or self._pending[:2] != (feedback_sequence, feedback_timestamp_sec) or not feedback_timestamp_sec <= clock <= feedback_timestamp_sec + self.pose.motion.max_control_gap_sec:
-            self.recording_failed("workspace_dispatch_start_identity_or_deadline")
-            raise ValueError(self._reason)
-        if any(abs(v) > 1e-9 for v in self._pending[3]) and (
-            self._human is not False or self._closed or self._phase in {"stopping", "failed", "cancelled"}
-            or self._permit is None or not 0 <= clock-self._permit <= self.limits.command_timeout_sec):
-            self.recording_failed("coordinated_authority_changed_before_dispatch")
-            raise ValueError(self._reason)
+        """False vetoes this unsent frame on normal lease expiry; faults raise."""
+        with self._lock:
+            clock = time.monotonic() if now_sec is None else finite(now_sec, "dispatch start")
+            if self._pending is None or self._pending[:2] != (feedback_sequence, feedback_timestamp_sec) or not feedback_timestamp_sec <= clock <= feedback_timestamp_sec + self.pose.motion.max_control_gap_sec:
+                self.recording_failed("workspace_dispatch_start_identity_or_deadline")
+                raise ValueError(self._reason)
+            nonzero = any(abs(v) > 1e-9 for v in self._pending[3])
+            if (nonzero and self._human is False and not self._closed and self._active
+                and self._phase not in {"preparing", "stopping"} and self._permit is not None
+                and clock-self._permit > self.limits.command_timeout_sec):
+                self._dispatch_withdrawal = {"reason": "gui_permit_expired", "feedback_sequence": feedback_sequence,
+                    "feedback_timestamp_sec": feedback_timestamp_sec, "observed_at_sec": clock,
+                    "last_permit_at_sec": self._permit, "permit_age_sec": clock-self._permit,
+                    "permit_timeout_sec": self.limits.command_timeout_sec,
+                    "command_sent": False, "withdrawal_receipt_confirmed": False}
+                self._stop("gui_permit_expired", "cancelled")
+                # The owner must leave the loop without sending this pending
+                # command. Physical withdrawal belongs to its existing hold/
+                # cleanup protocol; cancellation is NOT a zero receipt.
+                self._transition("cancelled", "gui_permit_expired")
+                self._records.append({"kind": "workspace_dispatch_withdrawn", "recorded_monotonic_sec": clock,
+                    **self._dispatch_withdrawal})
+                return False
+            if nonzero and (self._human is not False or self._closed or self._phase in {"stopping", "failed", "cancelled"}
+                or self._permit is None or not 0 <= clock-self._permit <= self.limits.command_timeout_sec):
+                self.recording_failed("coordinated_authority_changed_before_dispatch")
+                raise ValueError(self._reason)
 
     def record_dispatch(self, *, native_receipt, **values):
         with self._lock:
@@ -809,6 +828,7 @@ class CoordinatedWorkspaceController:
                 "manual_gate_reason": self._manual_return_gate(),
                 "manual_requested": self._manual_return_requested is not None,
                 "max_cycles": 1},
+            "dispatch_withdrawal": copy.deepcopy(self._dispatch_withdrawal),
             "holding_search_enabled": True, "holding_calibration": self._holding_status(detailed),
             "arrival": self._arrival_status(),
             "static_observation": self._static_observation_status(),

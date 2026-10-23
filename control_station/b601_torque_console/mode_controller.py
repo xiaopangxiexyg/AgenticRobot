@@ -182,9 +182,9 @@ class B601CalibrationModeController:
             return self._dispatch_delegate().active_driver_damping(
                 base_kd, final_command_delta_nm=final_command_delta_nm)
 
-    def validate_dispatch_start(self, **values) -> None:
+    def validate_dispatch_start(self, **values) -> bool | None:
         with self._lock:
-            self._dispatch_delegate().validate_dispatch_start(**values)
+            return self._dispatch_delegate().validate_dispatch_start(**values)
 
     def record_dispatch(self, **values) -> None:
         with self._lock:

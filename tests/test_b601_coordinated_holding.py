@@ -2815,6 +2815,35 @@ def test_full_coupled_batch_and_report_keep_handoffs_distinct_from_withdrawal(tm
             assert sum(abs(v) for v in obs["actual_delta_nm"]) <= 1+1e-9
 
 
+@pytest.mark.parametrize("mode_wrapper", [False, True])
+def test_gui_lease_expiry_between_compute_and_send_vetoes_without_false_receipt(tmp_path, mode_wrapper):
+    r = replay(tmp_path, mode_wrapper=mode_wrapper)
+    r.controller.submit("arm", now_sec=r.now, **({"operation_mode": "workspace"} if mode_wrapper else {}))
+    for _ in range(80):
+        r.tick()
+    r.tick(ack=False)
+    assert any(r.delta)
+    w = r.controller._workspace._coordinated if mode_wrapper else r.controller._coordinated
+    w._permit = r.now-r.controller.limits.command_timeout_sec+.0002
+    previous = w._receipt["sequence"]
+    assert r.controller.validate_dispatch_start(feedback_sequence=r.sequence,
+        feedback_timestamp_sec=r.now, now_sec=r.now+.0003) is False
+    result = r.controller.result_record()
+    assert result["state"] == "cancelled" and result["reason"] == "gui_permit_expired"
+    assert result["outcome"]["severity"] == "warning"
+    assert result["pending_dispatch"]["receipt_confirmed"] is False
+    assert w._receipt["sequence"] == previous and w._return_revoked == "gui_permit_expired"
+    assert not r.controller.automatic_disable_ready
+    withdrawal = result["workspace"]["dispatch_withdrawal"]
+    assert withdrawal["command_sent"] is False
+    assert withdrawal["permit_age_sec"] > withdrawal["permit_timeout_sec"]
+    r.controller.owner_stopped(now_sec=r.now+.001, reason="gui_permit_expired")
+    assert r.controller.result_record()["reason"] == "gui_permit_expired"
+    with pytest.raises(ValueError, match="closed|stopped|previous six-axis dispatch"):
+        r.controller.step(now_sec=r.now+.01, qpos_rad=r.q, qvel_rad_s=ZERO,
+            feedback_sequence=r.sequence+1, control_now_sec=r.now+.01)
+
+
 def test_authority_revoked_between_computation_and_dispatch_vetoes_old_nonzero_frame(tmp_path):
     r = replay(tmp_path)
     r.controller.submit("arm", now_sec=r.now)

@@ -6959,7 +6959,10 @@ def _finalize_automatic_result(payload: dict, acquisition: dict) -> int:
         payload["status"] = "COMPLETED_WITH_WARNINGS" if outcome["severity"] == "warning" or payload["execution_warnings"] else "OK"
         return 0
     if (payload.get("status") != "ERROR"
-        and payload.get("execution_status") == "STOPPED_BY_OPERATOR"
+        and (payload.get("execution_status") == "STOPPED_BY_OPERATOR"
+             or payload.get("execution_status") == "STOPPED_BY_AUTHORITY"
+             and payload.get("stop_reason") == "gui_permit_expired"
+             and acquisition["state"] == "cancelled" and acquisition.get("reason") == "gui_permit_expired")
         and acquisition["state"] in {"complete", "failed", "cancelled"}
         and outcome["severity"] in {"info", "warning"}):
         payload["status"] = "STOPPED_WITH_WARNINGS" if outcome["severity"] == "warning" or payload["execution_warnings"] else "STOPPED"
@@ -6972,6 +6975,8 @@ def _automatic_execution_status(stop_reason, cleanup_ok, commands_sent):
         return "FAILED"
     if stop_reason in {"explicit_full_disable", "operator_interrupt"}:
         return "STOPPED_BY_OPERATOR"
+    if stop_reason == "gui_permit_expired":
+        return "STOPPED_BY_AUTHORITY"
     if stop_reason == "supported_origin_return_complete":
         return "COMPLETED"
     return "COMPLETED" if stop_reason is None else "FAILED"
@@ -7194,6 +7199,7 @@ def _flush_automatic_calibration_records(torque_console, debug_trace, cycle_timi
         ):
             raise LowGainProbeError(f"automatic calibration record {kind!r} has invalid recorded_monotonic_sec")
         timestamp_key = {
+            "workspace_dispatch_withdrawn": "withdrawal_observed_at_sec",
             "automatic_calibration_dispatch_rejected": "rejection_observed_at_sec",
             "automatic_calibration_cycle_transition": "transition_observed_at_sec",
             "automatic_calibration_mode_selected": "mode_selected_at_sec",
@@ -10782,10 +10788,14 @@ def run_probe(
                     total_nm=conditioned_tau,
                 )
             if getattr(args, "torque_console_auto_calibration_profile", None) is not None and torque_console_audit is not None:
-                torque_console.validate_dispatch_start(
+                admission = torque_console.validate_dispatch_start(
                     feedback_sequence=state.sequence,
                     feedback_timestamp_sec=state.receive_timestamp_sec,
                 )
+                if admission is False:
+                    stop_reason = torque_console.status()["reason"]
+                    _operator_notice(f"[B601] GUI permit expired before dispatch; unsent command vetoed, entering protective hold: {stop_reason}")
+                    break
             receipt = backend.send_mit(
                 dispatch_reference,
                 # The temporary lock runs in the drive's high-rate MIT loop.

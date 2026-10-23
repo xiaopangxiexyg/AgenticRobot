@@ -305,7 +305,7 @@ function renderWorkspace(batch) {
     observe: "零助力重力观察", return: "分段返回起点", return_observe: "返回后观察",
     advancing: "准备下一阶段", stopping: "撤力停稳", complete: "多位姿采集完成",
     failed: batch.outcome?.severity === "warning" ? "采集未完成 · 告警，数据保留" : "采集故障 · 已停止",
-    cancelled: "已撤销"};
+    cancelled: workspace.reason === "gui_permit_expired" ? "页面许可已超时 · 采集已停止" : "已撤销"};
   if (workspace.recovery_damping_owner === "motor_local_profile") {
     names.preparing = "建立电机本地阻尼并确认静止（零附加驱动力）";
   }
@@ -547,17 +547,30 @@ function gateMessage(value) {
   return "等待 owner 确认静止状态。";
 }
 
+async function fetchJson(path, options = {}) {
+  // Bound both headers and body so a stalled request cannot permanently
+  // occupy refreshInFlight or the ordered intent queue. Never retry an action.
+  const controller = new AbortController();
+  const timer = options.keepalive ? null : setTimeout(() => controller.abort(), 5000);
+  try {
+    const response = await fetch(path, options.keepalive ? options : {...options, signal: controller.signal});
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.error || `HTTP ${response.status}`);
+    return result;
+  } finally {
+    if (timer !== null) clearTimeout(timer);
+  }
+}
+
 function post(path, body, hintId = "hint", fetchOptions = {}) {
   const send = async () => {
     try {
-      const response = await fetch(path, {
+      await fetchJson(path, {
         method: "POST",
         headers: {"Content-Type": "application/json", "X-B601-Console-Token": token},
         body: JSON.stringify(body),
         ...fetchOptions,
       });
-      const result = await response.json();
-      if (!response.ok) throw new Error(result.error || `HTTP ${response.status}`);
       if (path === "/api/stop") {
         el(hintId).textContent = "停机请求已接收，尚非电机执行回执；请观察 owner 终端状态并保持物理急停可用。";
       } else if (body.action !== "heartbeat") {
@@ -825,9 +838,7 @@ async function refresh() {
   if (refreshInFlight) return;
   refreshInFlight = true;
   try {
-    const response = await fetch("/api/status?view=operator", {cache: "no-store"});
-    if (!response.ok) throw new Error(`HTTP ${response.status}`);
-    state = await response.json();
+    state = await fetchJson("/api/status?view=operator", {cache: "no-store"});
     stopControlsAvailable = state.stop_controls_available === true;
     if (isSupportedCycle() && ["complete", "cancelled", "failed"].includes(state.automatic_calibration?.cycle?.phase)) {
       heartbeatEnabled = false;

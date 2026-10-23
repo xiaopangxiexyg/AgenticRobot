@@ -4761,6 +4761,55 @@ def test_workspace_terminal_notice_is_immediate_and_emitted_once(monkeypatch):
     assert len(stream.getvalue().splitlines()) == 1
 
 
+def test_workspace_unsent_withdrawal_record_does_not_fabricate_completion():
+    records = [{"kind": "workspace_dispatch_withdrawn", "recorded_monotonic_sec": 40.,
+        "command_sent": False, "withdrawal_receipt_confirmed": False, "reason": "gui_permit_expired"}]
+    controller = SimpleNamespace(drain_records=lambda: records)
+    stream = io.StringIO()
+    probe._flush_automatic_calibration_records(controller, probe._DynamicsTrace(stream))
+    row = json.loads(stream.getvalue())
+    assert row["withdrawal_observed_at_sec"] == 40.
+    assert "acquisition_completed_at_sec" not in row
+    assert row["command_sent"] is row["withdrawal_receipt_confirmed"] is False
+
+
+@pytest.mark.parametrize("admitted", [None, False])
+def test_automatic_owner_honors_dispatch_veto_before_sending(admitted):
+    tree = ast.parse(inspect.getsource(probe.run_probe)).body[0]
+    guard = next(n for n in ast.walk(tree) if isinstance(n, ast.If)
+        and any(isinstance(s, ast.Assign) and isinstance(s.value, ast.Call)
+            and isinstance(s.value.func, ast.Attribute) and s.value.func.attr == "validate_dispatch_start"
+            for s in n.body))
+    sent, notices = [], []
+    loop = ast.For(target=ast.Name(id="unused", ctx=ast.Store()), iter=ast.List(elts=[ast.Constant(0)], ctx=ast.Load()),
+        body=[guard, ast.Expr(value=ast.Call(func=ast.Name(id="send", ctx=ast.Load()), args=[], keywords=[]))], orelse=[])
+    module = ast.fix_missing_locations(ast.Module(body=[loop], type_ignores=[]))
+    namespace = {"args": SimpleNamespace(torque_console_auto_calibration_profile="configured"),
+        "torque_console_audit": {}, "state": SimpleNamespace(sequence=10, receive_timestamp_sec=1.),
+        "torque_console": SimpleNamespace(validate_dispatch_start=lambda **kw: admitted,
+            status=lambda: {"reason": "gui_permit_expired"}),
+        "send": lambda: sent.append(True), "_operator_notice": notices.append}
+    exec(compile(module, "<owner-admission>", "exec"), namespace)  # noqa: S102 - execute only the local owner AST
+    assert sent == ([] if admitted is False else [True])
+    if admitted is False:
+        assert namespace["stop_reason"] == "gui_permit_expired"
+
+
+@pytest.mark.parametrize("cleanup,entries,reason", [(True, 0, "gui_permit_expired"),
+    (False, 0, "gui_permit_expired"), (True, 1, "gui_permit_expired"), (True, 0, "unknown")])
+def test_gui_expiry_classification_never_promotes_cleanup_or_hold_faults(cleanup, entries, reason):
+    execution = probe._automatic_execution_status(reason, cleanup, 10)
+    acquisition = {"state": "cancelled", "reason": reason,
+        "outcome": {"severity": "warning", "scope": "acquisition"}}
+    payload = {"status": "FAIL", "execution_status": execution, "stop_reason": reason,
+        "acceptance_status": "FAIL", "protective_hold": {"degraded": {"entry_count": entries}}}
+    code = probe._finalize_automatic_result(payload, acquisition)
+    expected = cleanup and entries == 0 and reason == "gui_permit_expired"
+    assert code == (0 if expected else 1)
+    assert payload["acceptance_status"] == "FAIL"
+    assert payload["execution_status"] == ("STOPPED_BY_AUTHORITY" if expected else "FAILED")
+
+
 def test_automatic_dispatch_admission_and_fault_flush_are_wired_before_send_and_hold():
     tree = ast.parse(inspect.getsource(probe.run_probe)).body[0]
     calls = [n for n in ast.walk(tree) if isinstance(n, ast.Call)]

@@ -2618,6 +2618,53 @@ def test_console_loopback_intents_require_origin_and_random_token() -> None:
         server.close()
 
 
+def test_gui_stalled_request_bounds_headers_body_and_ordered_intent_queue():
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("Node is required for GUI contracts")
+    source = Path("control_station/b601_torque_console/static/app.js").read_text()
+    functions = source[source.index("async function fetchJson("):source.index("function intent(")]
+    refresh = source[source.index("async function refresh("):source.index("setInterval(refresh, 200)")]
+    script = r"""
+const vm=require('node:vm');const timers=new Map();let next=0;const sent=[];const nodes={};
+const c={AbortController,token:'test',heartbeatQueued:false,requestQueue:Promise.resolve(),state:null,
+  ACTION_NAMES:{},el:id=>nodes[id]??=({textContent:''}),
+  setTimeout:(fn,ms)=>{if(ms!==5000)throw Error('unexpected request deadline');timers.set(++next,fn);return next;},
+  clearTimeout:id=>timers.delete(id)};
+vm.runInNewContext(JSON.parse(process.argv[1]),c);
+const flush=()=>new Promise(resolve=>setImmediate(resolve));
+const hanging=signal=>new Promise((resolve,reject)=>signal.addEventListener('abort',()=>reject(Error('aborted'))));
+(async()=>{
+  const results=[];
+  for(const body of [false,true]){
+    c.fetch=(path,options)=>body ? Promise.resolve({ok:true,json:()=>hanging(options.signal)}) : hanging(options.signal);
+    const pending=c.fetchJson('/api/status').then(()=>false,()=>true);await flush();
+    [...timers.values()][0]();results.push(await pending);if(timers.size)throw Error('timer leaked');
+  }
+  c.fetch=(path,options)=>{sent.push(JSON.parse(options.body).action);
+    return sent.length===1 ? hanging(options.signal) : Promise.resolve({ok:true,json:async()=>({status:'accepted'})});};
+  const arm=c.post('/api/intent',{action:'arm'});const heartbeat=c.post('/api/intent',{action:'heartbeat'});
+  await flush();if(sent.length!==1)throw Error('intent order changed');[...timers.values()][0]();
+  await Promise.all([arm,heartbeat]);
+  c.fetch=async(path,options)=>{if(options.signal)throw Error('page unload must retain keepalive');
+    return {ok:true,json:async()=>({status:'accepted'})};};
+  await c.post('/api/intent',{action:'withdraw'},'hint',{keepalive:true});
+  c.refreshInFlight=false;c.stopControlsAvailable=false;c.document={dispatchEvent:()=>{}};
+  c.CustomEvent=class{};vm.runInNewContext(JSON.parse(process.argv[2]),c);
+  let polls=0;c.fetch=(path,options)=>{polls++;return hanging(options.signal);};
+  for(let n=0;n<2;n++){
+    const pending=c.refresh();await flush();[...timers.values()][0]();await pending;
+    if(c.refreshInFlight)throw Error('refresh permanently occupied');
+  }
+  console.log(JSON.stringify({results,sent,polls,queued:c.heartbeatQueued,timers:timers.size}));
+})().catch(e=>{console.error(e);process.exitCode=1});
+"""
+    result = subprocess.run([node, "-e", script, json.dumps(functions), json.dumps(refresh)],
+        check=True, capture_output=True, text=True, timeout=10)
+    assert json.loads(result.stdout) == {"results": [True, True], "sent": ["arm", "heartbeat"],
+        "polls": 2, "queued": False, "timers": 0}
+
+
 def test_console_withdraw_source_and_cycle_visibility_are_validated_and_forwarded():
     class Controller:
         def __init__(self):
