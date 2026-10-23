@@ -3,6 +3,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 
 from robot_motion.rm65 import (
     ARM_LINK6_FRAME,
@@ -201,3 +202,72 @@ def test_build_rm65_dual_arm_collision_ik_solver_adds_shared_tasks(monkeypatch) 
     assert bundle.solver.tasks[0][2]["position_cost"] == 11.0
     assert bundle.solver.tasks[0][2]["orientation_cost"] == 7.0
     assert np.isclose(bundle.solver.tasks[-1][2]["cost"], 1e-1)
+
+
+@pytest.mark.integration
+def test_bounded_endpoint_recovers_retained_joint_limit_pose_without_relaxation():
+    import time
+    from scipy.spatial.transform import Rotation
+    from robot_motion.relative_action import xyzquat_to_pose_matrix
+    from robot_motion.rm65 import endpoint_to_tool_transform, load_rm65_tool_profile
+    from sim.mujoco.tasks.cube_lift.config import CubeLiftTaskConfig
+
+    # Public execution target + measured qpos retained from the native failure.
+    solver = build_rm65_single_arm_ik_solver(RM65SingleArmIKConfig(controlled_frame="arm_endpoint"))
+    task = CubeLiftTaskConfig.load("sim/configs/tasks/rm65_right_dmtacm_blue_cube_70mm_agent_v1.json")
+    offset = endpoint_to_tool_transform(load_rm65_tool_profile(task.right_tool_profile_path, side="right"))
+    goal = xyzquat_to_pose_matrix((-0.13153217732906342, 0.37592002749443054, 0.31350964307785034,
+        -0.5068175792694092, 0.47981807589530945, 0.5144783854484558, 0.49821937084198))
+    seed = np.array((-1.1277308463248954, 0.044836936395145556, 2.3451965163401622,
+        0.5130340600007749, -0.9148705461150649, -0.3531572823752068))
+    original_seed = seed.copy()
+    lower, upper = solver.q_min.copy(), solver.q_max.copy()
+    missed = solver.solve_iterative(goal @ np.linalg.inv(offset), q_init=seed,
+        max_iterations=100, max_joint_step=.2, damping=.01, tolerance=1e-5)
+    assert np.linalg.norm((solver.compute_pose(missed) @ offset)[:3, 3] - goal[:3, 3]) > .03
+    candidate = solver.solve_bounded_pose(goal, missed, controlled_frame_offset=offset,
+        translation_tolerance_m=.01, rotation_tolerance_rad=np.deg2rad(5),
+        deadline_monotonic=time.perf_counter()+2., cancel_requested=lambda:False)
+    actual = solver.compute_pose(candidate) @ offset
+    assert np.linalg.norm(actual[:3, 3]-goal[:3, 3]) <= .01
+    assert Rotation.from_matrix(goal[:3, :3] @ actual[:3, :3].T).magnitude() <= np.deg2rad(5)
+    assert np.all(candidate >= lower) and np.all(candidate <= upper)
+    assert solver.last_solve_converged and not solver.last_solve_deadline_exceeded
+    np.testing.assert_array_equal(seed, original_seed)
+    np.testing.assert_array_equal(solver.q_min, lower)
+    np.testing.assert_array_equal(solver.q_max, upper)
+
+
+def test_bounded_endpoint_deadline_and_cancel_never_query_fk(monkeypatch):
+    from robot_motion.rm65.single_arm_ik import SingleArmIKSolver
+    solver = object.__new__(SingleArmIKSolver)
+    solver.q_min, solver.q_max = np.full(6, -1.), np.full(6, 1.)
+    solver.compute_pose = lambda _: pytest.fail("Expired or cancelled query must not reach FK")
+    kwargs = dict(controlled_frame_offset=np.eye(4), translation_tolerance_m=.003,
+        rotation_tolerance_rad=.03, deadline_monotonic=-1.)
+    np.testing.assert_array_equal(solver.solve_bounded_pose(np.eye(4), np.zeros(6),
+        cancel_requested=lambda:False, **kwargs), np.zeros(6))
+    assert solver.last_solve_deadline_exceeded and not solver.last_solve_converged
+    with pytest.raises(InterruptedError):
+        solver.solve_bounded_pose(np.eye(4), np.zeros(6), cancel_requested=lambda:True, **kwargs)
+    for seed in (np.full(6, np.nan), np.full(6, 2.), np.zeros(5)):
+        with pytest.raises(ValueError, match="seed"):
+            solver.solve_bounded_pose(np.eye(4), seed, cancel_requested=lambda:False, **kwargs)
+    with pytest.raises(ValueError, match="deadline"):
+        solver.solve_bounded_pose(np.eye(4), np.zeros(6), cancel_requested=lambda:False,
+            **{**kwargs, "deadline_monotonic":float("nan")})
+    with pytest.raises(ValueError, match="tolerances"):
+        solver.solve_bounded_pose(np.eye(4), np.zeros(6), cancel_requested=lambda:False,
+            **{**kwargs, "translation_tolerance_m":0.})
+
+
+def test_bounded_endpoint_nonfinite_fk_has_typed_rejection():
+    import time
+    from robot_motion.rm65.single_arm_ik import SingleArmIKSolver, BoundedIKNumericalError
+    solver = object.__new__(SingleArmIKSolver)
+    solver.q_min, solver.q_max = np.full(6, -1.), np.full(6, 1.)
+    solver.compute_pose = lambda _: np.full((4, 4), np.nan)
+    with pytest.raises(BoundedIKNumericalError, match="FK"):
+        solver.solve_bounded_pose(np.eye(4), np.zeros(6), controlled_frame_offset=np.eye(4),
+            translation_tolerance_m=.003, rotation_tolerance_rad=.03,
+            deadline_monotonic=time.perf_counter()+1., cancel_requested=lambda:False)

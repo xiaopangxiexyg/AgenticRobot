@@ -3153,6 +3153,11 @@ def test_close_retries_only_the_resource_that_remains_pending() -> None:
 
 def test_start_rollback_failure_keeps_only_failed_resource_closeable() -> None:
     runtime, _scene, _clock = build_runtime()
+    assert runtime.capture_lifecycle_diagnostics() == {
+        "started": False, "lifecycle_entered": False,
+        "rig_close_pending": False, "trace_close_pending": False,
+        "trace_terminal": False,
+    }
     events: list[str] = []
     rig_close_attempts = 0
     runtime._sync_reference_trace = lambda: events.append("trace.sync")
@@ -3180,6 +3185,11 @@ def test_start_rollback_failure_keeps_only_failed_resource_closeable() -> None:
         failure.label for failure in caught.value.rollback_failures
     ) == ("mujoco_execution_rig.close",)
     assert events == ["rig.start", "rig.close:1"]
+    assert runtime.capture_lifecycle_diagnostics() == {
+        "started": False, "lifecycle_entered": True,
+        "rig_close_pending": True, "trace_close_pending": True,
+        "trace_terminal": False,
+    }
 
     runtime.close()
 
@@ -3190,6 +3200,11 @@ def test_start_rollback_failure_keeps_only_failed_resource_closeable() -> None:
         "trace.sync",
         "trace.close",
     ]
+    assert runtime.capture_lifecycle_diagnostics() == {
+        "started": False, "lifecycle_entered": False,
+        "rig_close_pending": False, "trace_close_pending": False,
+        "trace_terminal": True,
+    }
 
 
 def test_close_does_not_retry_trace_after_terminal_sink_failure() -> None:
@@ -3211,6 +3226,12 @@ def test_close_does_not_retry_trace_after_terminal_sink_failure() -> None:
 
     assert events == ["rig.close", "trace.sync", "trace.terminal_sink"]
     assert runtime._started is False
+    # Terminalization and release state must not swallow publication failure.
+    assert runtime.capture_lifecycle_diagnostics() == {
+        "started": False, "lifecycle_entered": False,
+        "rig_close_pending": False, "trace_close_pending": False,
+        "trace_terminal": True,
+    }
     assert sum(
         fact.event_type == "runtime_trace_terminal"
         for fact in runtime.core.trace_facts

@@ -664,8 +664,10 @@ class MujocoAgentSkillMotionApplication:
                 return
             if self._started and not self._held:
                 raise RuntimeError("Closing a started motion application requires HOLD.")
-            if self._started:
-                self.runtime.close()
+            # A failed start can leave lower-owned rollback work pending even
+            # though the application never reached _started. The lower owner
+            # makes close idempotent and retains failed releases for retry.
+            self.runtime.close()
             snapshot_sources = tuple(
                 source
                 for source in (

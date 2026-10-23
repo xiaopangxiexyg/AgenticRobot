@@ -3801,6 +3801,22 @@ class MujocoDeployRuntime:
         self._trace_close_pending = False
         self._lifecycle_terminal = True
 
+    def capture_lifecycle_diagnostics(self) -> dict[str, bool]:
+        """Report owner state at a serialized lifecycle boundary, without I/O.
+
+        This is diagnostic evidence about pending resource releases, not a
+        successful HOLD receipt or proof that terminal trace publication
+        succeeded. Callers must retain any start/close exception separately.
+        """
+
+        return {
+            "started": self._started,
+            "lifecycle_entered": self._lifecycle_entered,
+            "rig_close_pending": self._rig_close_pending,
+            "trace_close_pending": self._trace_close_pending,
+            "trace_terminal": self._lifecycle_terminal,
+        }
+
     def _close_rig_once(self) -> None:
         if not self._rig_close_pending:
             return

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from collections.abc import Callable
 import time
 
 import numpy as np
@@ -13,6 +14,10 @@ from .ik_tuning import (
     weighted_joint_distance_score,
 )
 from robot_motion.rm65.assets import require_asset_path
+
+
+class BoundedIKNumericalError(RuntimeError):
+    """A query's FK/residual was non-finite; no candidate may be admitted."""
 
 
 def _to_pose_matrix(pose: np.ndarray) -> np.ndarray:
@@ -204,6 +209,87 @@ class SingleArmIKSolver:
                 self.last_solve_deadline_exceeded = True
                 break
         return self._normalize_branch(candidate_qpos=q, reference_qpos=reference_q)
+
+    def solve_bounded_pose(
+        self,
+        target_pose: np.ndarray,
+        q_init: np.ndarray,
+        *,
+        controlled_frame_offset: np.ndarray,
+        translation_tolerance_m: float,
+        rotation_tolerance_rad: float,
+        deadline_monotonic: float,
+        cancel_requested: Callable[[], bool],
+        maximum_evaluations: int = 100,
+    ) -> np.ndarray:
+        """Query one bounded endpoint candidate; never authorize its execution.
+
+        Trust-region least squares handles active joint limits without clipping
+        an unconstrained update. Residuals use the caller's actual TCP, not its
+        flange. Callers still own FK, collision, path and dispatch admission.
+        This explicit offline-query path does not change solve_step/iterative.
+        """
+        from scipy.optimize import least_squares
+
+        goal = _to_pose_matrix(target_pose)
+        offset = _to_pose_matrix(controlled_frame_offset)
+        for pose in (goal, offset):
+            if (not np.isfinite(pose).all()
+                    or not np.allclose(pose[3], (0., 0., 0., 1.), atol=1e-9)
+                    or not np.allclose(pose[:3, :3].T @ pose[:3, :3], np.eye(3), atol=1e-6)
+                    or not np.isclose(np.linalg.det(pose[:3, :3]), 1., atol=1e-6)):
+                raise ValueError("Bounded pose query requires rigid finite transforms.")
+        seed = np.asarray(q_init, dtype=float).copy()
+        if (seed.shape != self.q_min.shape or not np.isfinite(seed).all()
+                or np.any(seed < self.q_min) or np.any(seed > self.q_max)):
+            raise ValueError("Bounded pose seed must satisfy the original joint bounds.")
+        tolerances = np.asarray((translation_tolerance_m, rotation_tolerance_rad), dtype=float)
+        if not np.isfinite(tolerances).all() or np.any(tolerances <= 0):
+            raise ValueError("Bounded pose tolerances must be finite and positive.")
+        if (isinstance(maximum_evaluations, bool) or not isinstance(maximum_evaluations, int)
+                or maximum_evaluations <= 0 or isinstance(deadline_monotonic, bool)
+                or not np.isfinite(deadline_monotonic)):
+            raise ValueError("Bounded pose query requires a finite deadline and evaluation budget.")
+        if not callable(cancel_requested):
+            raise TypeError("cancel_requested must be callable.")
+        self.last_solve_iterations = 0
+        self.last_solve_converged = False
+        self.last_solve_deadline_exceeded = False
+        self.last_solve_residual_evaluations = 0
+        best_q = seed.copy()
+        best_score = float("inf")
+
+        class DeadlineExceeded(Exception):
+            pass
+
+        def residual(q):
+            nonlocal best_q, best_score
+            if cancel_requested():
+                raise InterruptedError("Bounded endpoint query cancelled.")
+            if time.perf_counter() >= deadline_monotonic:
+                raise DeadlineExceeded
+            tcp = self.compute_pose(q) @ offset
+            if not np.isfinite(tcp).all():
+                raise BoundedIKNumericalError("Bounded endpoint FK is non-finite.")
+            value = np.concatenate(((goal[:3, 3] - tcp[:3, 3]) / tolerances[0],
+                self.pin.log3(goal[:3, :3] @ tcp[:3, :3].T) / tolerances[1]))
+            if not np.isfinite(value).all():
+                raise BoundedIKNumericalError("Bounded endpoint residual is non-finite.")
+            self.last_solve_residual_evaluations += 1
+            score = float(max(np.linalg.norm(value[:3]), np.linalg.norm(value[3:])))
+            if score < best_score:
+                best_q, best_score = np.asarray(q).copy(), score
+            return value
+
+        try:
+            solved = least_squares(residual, seed, bounds=(self.q_min, self.q_max),
+                max_nfev=maximum_evaluations, xtol=1e-9, ftol=1e-9, gtol=1e-9)
+            self.last_solve_iterations = int(solved.nfev)
+        except DeadlineExceeded:
+            self.last_solve_deadline_exceeded = True
+        self.last_solve_converged = best_score <= 1.0
+        # Do not normalize to another branch after evaluating this candidate.
+        return best_q
 
     def _normalize_branch(
         self,

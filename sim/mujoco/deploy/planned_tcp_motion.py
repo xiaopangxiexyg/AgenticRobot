@@ -11,6 +11,7 @@ from __future__ import annotations
 import math
 import threading
 import time
+from types import MappingProxyType
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from functools import wraps
@@ -201,6 +202,7 @@ class MujocoTcpMotionPlan:
     payload_binding: MujocoPayloadBinding | None = None
     # The lower cursor owns stage changes and their original contact policy.
     stages: tuple[tuple[int, MujocoTcpMotionPlan], ...] = ()
+    endpoint_search_diagnostics: Mapping[str, Any] | None = None
 
 
 # Bound fixed-rate materialization before allocating a native grid.
@@ -612,57 +614,100 @@ class MujocoPlannedTcpMotion:
                 seeds.extend(rng.uniform(solver.q_min, solver.q_max) for _ in range(6))
                 targets = []
                 endpoint_attempts = []
+                endpoint_check_reasons = []
+                ik_seed_attempts = []
+                best_pose_miss = None
                 quality_limits = DEFAULT_PATH_MOTION_QUALITY_LIMITS
-                deadline = time.perf_counter() + 2.0
+                endpoint_started_at = time.perf_counter()
+                deadline = endpoint_started_at + 2.0
+
+                def consider_endpoint(q, seed_index, search_method):
+                    nonlocal best_pose_miss
+                    pair = {**start, side: np.asarray(q)}
+                    actual = xyzquat_to_matrix(self.pose_for_configuration(model_qpos, pair))
+                    position_error = float(np.linalg.norm(actual[:3, 3] - goal[:3, 3]))
+                    angle = float(np.arccos(np.clip(
+                        (np.trace(actual[:3, :3].T @ goal[:3, :3]) - 1) / 2, -1, 1)))
+                    within = position_error <= translation_tolerance_m and angle <= rotation_tolerance_rad
+                    ik_seed_attempts.append({
+                        "seed_index": seed_index, "search_method": search_method,
+                        "position_error_m": position_error, "rotation_error_rad": angle,
+                        "pose_within_tolerance": within,
+                        "iterations": getattr(solver, "last_solve_iterations", None),
+                        "solver_converged": getattr(solver, "last_solve_converged", None),
+                        "solver_deadline_exceeded": getattr(solver, "last_solve_deadline_exceeded", None),
+                        "residual_evaluations": (getattr(solver, "last_solve_residual_evaluations", None)
+                                                 if search_method == "bounded_least_squares" else None),
+                    })
+                    if not within:
+                        score = max(position_error / translation_tolerance_m, angle / rotation_tolerance_rad)
+                        if best_pose_miss is None or score < best_pose_miss[0]:
+                            best_pose_miss = (score, pair[side].copy(), seed_index)
+                        return False
+                    delta = np.abs(pair[side] - start[side])
+                    compact = float(np.max(delta[:3])) <= quality_limits.maximum_proximal_joint_travel_rad
+                    endpoint_check = oracle.check(pair)
+                    endpoint_check_reasons.append(endpoint_check.reason)
+                    safe = endpoint_check.safe
+                    endpoint_attempts.append({
+                        "seed_index": seed_index,
+                        **({"search_method": search_method} if search_method != "iterative" else {}),
+                        "joint_net_delta_deg": np.rad2deg(pair[side] - start[side]).tolist(),
+                        "position_error_m": position_error, "rotation_error_rad": angle,
+                        "collision_and_constraint_safe": safe,
+                        "proximal_travel_within_limit": compact,
+                    })
+                    if safe and compact and not any(
+                        np.max(np.abs(other[side] - pair[side])) < 0.001 for other in targets
+                    ):
+                        targets.append(pair)
+                    return safe and float(np.max(delta)) < 1e-8
+
                 for seed_index, seed in enumerate(seeds):
                     if cancel_requested():
                         raise MujocoTcpPlanRejected("safe_tcp_planning_cancelled")
                     if time.perf_counter() >= deadline:
                         break
                     q = solver.solve_iterative(
-                        target_pose=endpoint_goal,
-                        q_init=seed,
-                        max_iterations=100,
-                        max_joint_step=0.2,
-                        damping=0.01,
-                        tolerance=1e-5,
+                        target_pose=endpoint_goal, q_init=seed, max_iterations=100,
+                        max_joint_step=0.2, damping=0.01, tolerance=1e-5,
                         deadline_monotonic=deadline,
                     )
-                    pair = {**start, side: np.asarray(q)}
-                    actual = xyzquat_to_matrix(
-                        self.pose_for_configuration(model_qpos, pair)
-                    )
-                    position_error = float(np.linalg.norm(actual[:3, 3] - goal[:3, 3]))
-                    angle = float(
-                        np.arccos(
-                            np.clip(
-                                (np.trace(actual[:3, :3].T @ goal[:3, :3]) - 1) / 2, -1, 1
-                            )
+                    # Zero travel is the only provable minimum; a converged
+                    # current-state seed is not generally the closest branch.
+                    if consider_endpoint(q, seed_index, "iterative"):
+                        break
+                if not endpoint_attempts and best_pose_miss is not None and time.perf_counter() < deadline:
+                    from robot_motion.rm65.single_arm_ik import BoundedIKNumericalError
+
+                    # Only a complete pose miss may use the remaining endpoint
+                    # budget. A collision/quality refusal is not a solver failure.
+                    try:
+                        q = solver.solve_bounded_pose(
+                            goal, best_pose_miss[1], controlled_frame_offset=offset,
+                            translation_tolerance_m=translation_tolerance_m,
+                            rotation_tolerance_rad=rotation_tolerance_rad,
+                            deadline_monotonic=deadline, cancel_requested=cancel_requested,
+                            maximum_evaluations=100,
                         )
-                    )
-                    if (
-                        position_error <= translation_tolerance_m
-                        and angle <= rotation_tolerance_rad
-                    ):
-                        delta = np.abs(pair[side] - start[side])
-                        compact = float(np.max(delta[:3])) <= quality_limits.maximum_proximal_joint_travel_rad
-                        safe = oracle.check(pair).safe
-                        endpoint_attempts.append({
-                            "seed_index": seed_index,
-                            "joint_net_delta_deg": np.rad2deg(pair[side] - start[side]).tolist(),
-                            "position_error_m": position_error,
-                            "rotation_error_rad": angle,
-                            "collision_and_constraint_safe": safe,
-                            "proximal_travel_within_limit": compact,
-                        })
-                        if safe and compact and not any(
-                            np.max(np.abs(other[side] - pair[side])) < 0.001 for other in targets
-                        ):
-                            targets.append(pair)
-                        # Zero travel is the only provable minimum; a converged
-                        # current-state seed is not generally the closest branch.
-                        if safe and float(np.max(delta)) < 1e-8:
-                            break
+                    except InterruptedError as error:
+                        raise MujocoTcpPlanRejected("safe_tcp_planning_cancelled") from error
+                    except BoundedIKNumericalError as error:
+                        raise MujocoTcpPlanRejected("safe_tcp_endpoint_numerical_failure",
+                            {"seed_index": best_pose_miss[2], "search_method": "bounded_least_squares",
+                             "endpoint_attempts": endpoint_attempts,
+                             "ik_seed_attempts": ik_seed_attempts}) from error
+                    consider_endpoint(q, best_pose_miss[2], "bounded_least_squares")
+                if cancel_requested():
+                    raise MujocoTcpPlanRejected("safe_tcp_planning_cancelled")
+                endpoint_search_diagnostics = {
+                    "seed_count": len(seeds), "attempted_seed_count": len(ik_seed_attempts),
+                    "elapsed_sec": time.perf_counter() - endpoint_started_at, "budget_sec": 2.0,
+                    "deadline_exceeded": time.perf_counter() >= deadline,
+                    "translation_tolerance_m": translation_tolerance_m,
+                    "rotation_tolerance_rad": rotation_tolerance_rad,
+                    "attempts": ik_seed_attempts,
+                }
                 if not targets:
                     quality_rejected = any(
                         item["collision_and_constraint_safe"] and not item["proximal_travel_within_limit"]
@@ -670,9 +715,16 @@ class MujocoPlannedTcpMotion:
                     )
                     raise MujocoTcpPlanRejected(
                         "safe_tcp_motion_quality_exceeded" if quality_rejected
+                        else "safe_tcp_target_envelope_blocked"
+                        if endpoint_check_reasons and all(
+                            reason == "tcp_envelope_blocked" for reason in endpoint_check_reasons
+                        )
                         else "safe_tcp_target_blocked" if endpoint_attempts
                         else "safe_tcp_endpoint_search_exhausted",
-                        {"endpoint_attempts": endpoint_attempts, "motion_quality_limits": quality_limits.to_dict()},
+                        {"endpoint_attempts": endpoint_attempts,
+                         "endpoint_check_reasons": endpoint_check_reasons,
+                         "endpoint_search_diagnostics": endpoint_search_diagnostics,
+                         "motion_quality_limits": quality_limits.to_dict()},
                     )
                 velocity = np.minimum(
                     np.asarray(self.rig.config.max_velocity_rad_s),
@@ -837,6 +889,10 @@ class MujocoPlannedTcpMotion:
                     constraint_identity,
                     contact_binding,
                     payload_binding,
+                    endpoint_search_diagnostics=MappingProxyType({
+                        **endpoint_search_diagnostics,
+                        "attempts": tuple(MappingProxyType(row) for row in ik_seed_attempts),
+                    }),
                 )
                 if not preview:
                     self._pending_plan = plan

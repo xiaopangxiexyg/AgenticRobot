@@ -237,3 +237,17 @@ PYTHONNOUSERSITE=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
 
 这些检查只证明 CLI、合同、transport 和装配的离线行为；不能替代 MuJoCo、SSH 主机或
 真机运行证据。
+
+
+### MuJoCo 安全目标与初始几何复核
+
+安全 TCP 的公开单目标路线先检查目标容差区域是否可能与原稳定包络相交；不将投影值
+替换用户目标。候选、路径、实测输出和 HOLD 门禁仍分别执行。关节限位附近的普通迭代
+全部未命中时，只用原 2 秒端点预算的剩余时间查询有界 IK；碰撞或路径质量拒绝不会
+触发该查询。已有抓取链仍沿原分段绑定及 prepared resolver 执行。
+
+[qualify_mujoco_scene.py](../../scripts/probes/qualify_mujoco_scene.py) 提供独立的零运动
+初始几何资格检查。用 `python -m scripts.probes.qualify_mujoco_scene --help` 查看参数；
+输出写入新文件，不覆盖已有报告。资格成立只说明该初始几何通过检查，不代表规划、
+执行或抓取成功，也不启动 RGB-D、模型服务或真机。失败启动后的关闭会继续交给原
+runtime 清理，并保留其未完成释放供同一 owner 重试。
