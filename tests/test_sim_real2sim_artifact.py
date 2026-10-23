@@ -413,11 +413,30 @@ def test_current_arm_runtime_binding_uses_exact_current_inputs() -> None:
     assert {path for path, digest in previous_sources.items() if current_sources[path] != digest} == changed_sources
     assert tuple(binding.metadata["changed_previous_runtime_sources"]) == tuple(sorted(changed_sources))
     assert tuple(binding.metadata["new_runtime_sources"]) == tuple(sorted(new_sources))
+    content = next(e for e in binding.validation_evidence if e.validation_id == "runtime-source-content-binding-integrity-v10")
+    assert content.status == "passed"
+    assert content.metrics["bound_runtime_input_file_count"] == len(current_sources) == 21
+    assert content.metrics["bound_runtime_source_file_count"] == 20
+    assert content.metrics["changed_runtime_source_file_count_from_previous_binding"] == len(changed_sources) == 3
+    assert content.metrics["new_runtime_source_file_count"] == len(new_sources) == 7
+    assert content.metrics["arm_profile_refit_count"] == content.metrics["mutated_historical_artifact_count"] == 0
+    offline = next(e for e in binding.validation_evidence if e.validation_id == "offline-object-follow-payload-consumers-v10")
+    assert offline.status == "passed" and offline.split == "validation"
+    assert dict(offline.metrics) == {"passed_cases": 115.0, "skipped_cases": 0.0, "failed_cases": 0.0, "error_cases": 0.0}
+    assert artifacts[binding.metadata["offline_validation_report_artifact_id"]].sha256 == (
+        "e1ef7b83610f7b4e8f5055287f7784a7ed182274494215470e7824e4ad82c2e7"
+    )
+    assert binding.metadata["offline_validation_source_tree"] == "c5b5fa16e7cdd202e30990e4b9c3c6dd086d9166"
+    assert binding.metadata["offline_validation_execution_head"] == binding.metadata["runtime_source_commit"]
 
 
 def test_v9_arm_runtime_binding_remains_frozen_after_native_payload_extension() -> None:
     binding = Real2SimArtifactManifest.load(ARM_RUNTIME_BINDING_V9_PATH)
     artifacts = {artifact.artifact_id: artifact for artifact in binding.dependency_artifacts}
+    historical_sources = {
+        artifact.locator: artifact.sha256 for artifact in binding.dependency_artifacts
+        if "-runtime-20261022-v9" in artifact.artifact_id
+    }
     assert binding.artifact_sha256 == "016de1e5b798f4858caba54fcf568423a62a3f3e9d25f8842076158563d1f591"
     assert ArtifactRef.from_file(
         ARM_RUNTIME_BINDING_V9_PATH, artifact_id="frozen-v9-check",
@@ -439,7 +458,7 @@ def test_v9_arm_runtime_binding_remains_frozen_after_native_payload_extension() 
     assert tuple(binding.metadata["new_runtime_sources"]) == ("sim/mujoco/deploy/agent_skill_target.py",)
     content = next(e for e in binding.validation_evidence if e.validation_id == "runtime-source-content-binding-integrity-v9")
     assert content.status == "passed"
-    assert content.metrics["bound_runtime_input_file_count"] == len(current_sources) == 14
+    assert content.metrics["bound_runtime_input_file_count"] == len(historical_sources) == 14
     assert content.metrics["bound_runtime_source_file_count"] == 13
     assert content.metrics["arm_profile_refit_count"] == content.metrics["mutated_historical_artifact_count"] == 0
     offline = next(e for e in binding.validation_evidence if e.validation_id == "offline-fixed-arm-mujoco-skills-v9")
