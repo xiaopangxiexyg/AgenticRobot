@@ -23,6 +23,10 @@ ARM_BASELINE_PATH = Path(
 )
 ARM_RUNTIME_BINDING_PATH = Path(
     "sim/rm65/real2sim/artifacts/"
+    "rm65_arm_free_motion_20260721_v4_runtime_binding_20261023_v10.json"
+)
+ARM_RUNTIME_BINDING_V9_PATH = Path(
+    "sim/rm65/real2sim/artifacts/"
     "rm65_arm_free_motion_20260721_v4_runtime_binding_20261022_v9.json"
 )
 ARM_RUNTIME_BINDING_V8_PATH = Path(
@@ -278,7 +282,7 @@ def test_v4_arm_fit_baseline_remains_frozen_and_provisional() -> None:
 def test_current_arm_runtime_binding_uses_exact_current_inputs() -> None:
     binding = Real2SimArtifactManifest.load(ARM_RUNTIME_BINDING_PATH)
     fit = Real2SimArtifactManifest.load(ARM_BASELINE_PATH)
-    previous = Real2SimArtifactManifest.load(ARM_RUNTIME_BINDING_V8_PATH)
+    previous = Real2SimArtifactManifest.load(ARM_RUNTIME_BINDING_V9_PATH)
     artifacts = {
         artifact.artifact_id: artifact
         for artifact in binding.dependency_artifacts
@@ -296,28 +300,28 @@ def test_current_arm_runtime_binding_uses_exact_current_inputs() -> None:
             artifact_kind="real2sim_fit_artifact",
         ).sha256
     )
-    assert artifacts["rm65-arm-profile-runtime-20261022-v9"].sha256 == (
+    assert artifacts["rm65-arm-profile-runtime-20261023-v10"].sha256 == (
         ArtifactRef.from_file(
             ARM_PROFILE_PATH,
             artifact_id="profile-check",
             artifact_kind="actuation_profile",
         ).sha256
     )
-    assert artifacts["rm65-arm-actuator-core-runtime-20261022-v9"].sha256 == (
+    assert artifacts["rm65-arm-actuator-core-runtime-20261023-v10"].sha256 == (
         ArtifactRef.from_file(
             ARM_CORE_PATH,
             artifact_id="core-check",
             artifact_kind="sim_actuator_core_source",
         ).sha256
     )
-    assert artifacts["rm65-arm-mujoco-executor-runtime-20261022-v9"].sha256 == (
+    assert artifacts["rm65-arm-mujoco-executor-runtime-20261023-v10"].sha256 == (
         ArtifactRef.from_file(
             ARM_MUJOCO_ADAPTER_PATH,
             artifact_id="executor-check",
             artifact_kind="sim_backend_adapter_source",
         ).sha256
     )
-    assert artifacts["rm65-camera-registry-runtime-20261022-v9"].sha256 == (
+    assert artifacts["rm65-camera-registry-runtime-20261023-v10"].sha256 == (
         ArtifactRef.from_file(
             CAMERA_REGISTRY_PATH,
             artifact_id="camera-registry-check",
@@ -346,10 +350,10 @@ def test_current_arm_runtime_binding_uses_exact_current_inputs() -> None:
     assert binding.metadata["runtime_behavior_change"] is True
     assert (
         binding.metadata["runtime_behavior_change_scope"]
-        == "offline_mujoco_fixed_single_arm_skill_sessions"
+        == "offline_mujoco_native_object_follow_payload_and_post_step_guard"
     )
     assert binding.metadata["runtime_source_commit"] == (
-        "e4ab4e5d0580dd4cae3d2ce8aa783979025e5c0c"
+        "7d66cb491d44c891ef41678f066b80d072f87315"
     )
     assert binding.fidelity_claims[0].status == "provisional"
     held_out = next(
@@ -369,35 +373,69 @@ def test_current_arm_runtime_binding_uses_exact_current_inputs() -> None:
         "command-guard", "envelope-adapter", "position-rig", "position-assembly",
         "collision-oracle", "collision-projection", "collision-result",
         "grasp-contact", "planned-tcp-motion", "agent-skill-target",
+        "gripper-executor", "collision-policy", "contact-timing",
+        "grasped-object-observer", "payload-motion", "object-release", "object-transport",
     ):
-        artifact = artifacts[f"rm65-{label}-runtime-20261022-v9"]
+        artifact = artifacts[f"rm65-{label}-runtime-20261023-v10"]
         assert artifact.sha256 == ArtifactRef.from_file(
             artifact.locator, artifact_id="command-source-check",
             artifact_kind="sim_command_admission_source",
         ).sha256
 
 
-    assert binding.artifact_sha256 == "016de1e5b798f4858caba54fcf568423a62a3f3e9d25f8842076158563d1f591"
+    assert binding.artifact_sha256 == "c341a48710ce7743941a0980b820c0627ec98dba8a27bb7df574d5418736a880"
     assert binding.code_revision == binding.environment_fingerprint["source_commit"] == binding.metadata["runtime_source_commit"]
     assert binding.metadata["previous_runtime_binding_file_sha256"] == ArtifactRef.from_file(
-        ARM_RUNTIME_BINDING_V8_PATH, artifact_id="previous-v8-file-check",
+        ARM_RUNTIME_BINDING_V9_PATH, artifact_id="previous-v9-file-check",
         artifact_kind="real2sim_runtime_binding",
     ).sha256
-    assert artifacts["rm65-arm-runtime-binding-20261018-v8"].sha256 == binding.metadata["previous_runtime_binding_file_sha256"]
+    assert artifacts["rm65-arm-runtime-binding-20261022-v9"].sha256 == binding.metadata["previous_runtime_binding_file_sha256"]
     previous_sources = {
         artifact.locator: artifact.sha256 for artifact in previous.dependency_artifacts
-        if "-runtime-20261018-v8" in artifact.artifact_id
+        if "-runtime-20261022-v9" in artifact.artifact_id
     }
     current_sources = {
         artifact.locator: artifact.sha256 for artifact in binding.dependency_artifacts
-        if "-runtime-20261022-v9" in artifact.artifact_id
+        if "-runtime-20261023-v10" in artifact.artifact_id
     }
-    assert set(current_sources) - set(previous_sources) == {"sim/mujoco/deploy/agent_skill_target.py"}
+    new_sources = {
+        "robot_motion/object_release.py", "robot_motion/object_transport.py",
+        "sim/mujoco/actuation/gripper_executor.py", "sim/mujoco/collision_safety/policy.py",
+        "sim/mujoco/deploy/contact_timing.py", "sim/mujoco/deploy/grasped_object.py",
+        "sim/mujoco/deploy/payload_motion.py",
+    }
+    assert set(current_sources) - set(previous_sources) == new_sources
     assert set(previous_sources) - set(current_sources) == set()
-    assert {path for path, digest in previous_sources.items() if current_sources[path] != digest} == {
-        "sim/mujoco/deploy/planned_tcp_motion.py"
+    changed_sources = {
+        "sim/mujoco/actuation/executor.py", "sim/mujoco/adapters/robot_motion.py",
+        "sim/mujoco/deploy/planned_tcp_motion.py",
     }
-    assert tuple(binding.metadata["changed_previous_runtime_sources"]) == ("sim/mujoco/deploy/planned_tcp_motion.py",)
+    assert {path for path, digest in previous_sources.items() if current_sources[path] != digest} == changed_sources
+    assert tuple(binding.metadata["changed_previous_runtime_sources"]) == tuple(sorted(changed_sources))
+    assert tuple(binding.metadata["new_runtime_sources"]) == tuple(sorted(new_sources))
+
+
+def test_v9_arm_runtime_binding_remains_frozen_after_native_payload_extension() -> None:
+    binding = Real2SimArtifactManifest.load(ARM_RUNTIME_BINDING_V9_PATH)
+    artifacts = {artifact.artifact_id: artifact for artifact in binding.dependency_artifacts}
+    assert binding.artifact_sha256 == "016de1e5b798f4858caba54fcf568423a62a3f3e9d25f8842076158563d1f591"
+    assert ArtifactRef.from_file(
+        ARM_RUNTIME_BINDING_V9_PATH, artifact_id="frozen-v9-check",
+        artifact_kind="real2sim_runtime_binding",
+    ).sha256 == "092b48c008aba04d647ff2fa8da5677f2dde18529a6db26dc4330053c8f71f43"
+    assert binding.code_revision == binding.environment_fingerprint["source_commit"] == (
+        binding.metadata["runtime_source_commit"]
+    ) == "e4ab4e5d0580dd4cae3d2ce8aa783979025e5c0c"
+    assert artifacts["rm65-arm-mujoco-executor-runtime-20261022-v9"].sha256 == (
+        "313aac56f4fcdfc17176bfc433af75776aa34f40e577caa3e8f3a8b1eb53928e"
+    )
+    assert binding.metadata["previous_runtime_binding_artifact_sha256"] == (
+        Real2SimArtifactManifest.load(ARM_RUNTIME_BINDING_V8_PATH).artifact_sha256
+    )
+    assert binding.metadata["arm_profile_refit"] is False
+    assert binding.metadata["fit_artifact_sha256"] == Real2SimArtifactManifest.load(ARM_BASELINE_PATH).artifact_sha256
+    assert binding.fidelity_claims[0].status == "provisional"
+    assert next(e for e in binding.validation_evidence if e.split == "held_out").status == "not_run"
     assert tuple(binding.metadata["new_runtime_sources"]) == ("sim/mujoco/deploy/agent_skill_target.py",)
     content = next(e for e in binding.validation_evidence if e.validation_id == "runtime-source-content-binding-integrity-v9")
     assert content.status == "passed"

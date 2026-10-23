@@ -591,6 +591,7 @@ def _safe_fixture(monkeypatch, side, *, reject_at=None, basis_change=False, plan
         events.append("lower.activate")
         if cancel_requested():
             return StationLifecycleActivationEvidence(False, "cancelled", "lower:fixture", ("hold:fixture",), True)
+        self._activation_measured_pose = self._capture_pose()
         return activation
 
     monkeypatch.setattr(motion_skill.MujocoAgentTcpPoseSkillLifecycle, "activate", parent_activate)

@@ -93,6 +93,18 @@ fixed historical values rather than silently reinterpreting the fit against
 the current files.
 
 当前运行时源码绑定是
+`artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261023_v10.json`。
+它在冻结 v9 的基础上登记原生物体跟随、携物几何及物理步后保护：重新绑定
+executor、position rig 与 planned TCP 三项既有源码，并显式登记七项相关依赖。
+实现来源是 `7d66cb491d44c891ef41678f066b80d072f87315`；本次夹具与元数据
+迁移不改变所绑定的运行时代码。所引用的 115 项消费者回归确实运行于该提交及
+`c5b5fa16e7cdd202e30990e4b9c3c6dd086d9166` 源码树，未借用 v9 的旧报告。
+首轮完整验收的 11 项夹具／绑定失败以及旧课程正向实验的会话构造拒绝均另行保留，
+不将其记为通过；修复后的完整验收也单独记录。该绑定不提供完整抓放或真机验收，
+未重拟合参数，`provisional` 与新 held-out `not_run` 保持不变。
+v9 及全部更早清单按原字节保留。
+
+v9 历史运行时源码绑定冻结于
 `artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261022_v9.json`。
 它在冻结 v8 的基础上，登记固定左右单臂 Skill 会话的 planned-motion 更新，
 并补充 `agent_skill_target.py` 依赖；会话只选一臂，另一臂保留实测碰撞支持，
