@@ -504,6 +504,7 @@ def build_mujoco_agent_tcp_pose_gateway_session(
     enable_safe_tcp_pose: bool = False,
     enable_spatial_goals: bool = False,
     enable_tcp_pose_comparison: bool = False,
+    enable_object_state: bool = False,
     safe_tcp_planning_clearance_padding_m: float = 0.002,
     enable_grippers: bool = False,
     enable_grasp_approach: bool = False,
@@ -528,6 +529,10 @@ def build_mujoco_agent_tcp_pose_gateway_session(
         raise TypeError("enable_spatial_goals must be boolean.")
     if not isinstance(enable_tcp_pose_comparison, bool):
         raise TypeError("enable_tcp_pose_comparison must be boolean.")
+    if type(enable_object_state) is not bool:
+        raise TypeError("enable_object_state must be boolean.")
+    if enable_object_state and grasp_contact_target_body is None:
+        raise ValueError("Object-state feedback requires an explicit grasp contact target.")
     if not isinstance(enable_grasp_approach, bool):
         raise TypeError("enable_grasp_approach must be boolean.")
     if side == "left" and (
@@ -722,6 +727,7 @@ def build_mujoco_agent_tcp_pose_gateway_session(
             enable_safe_tcp_pose=enable_safe_tcp_pose,
             enable_spatial_goals=enable_spatial_goals,
             enable_tcp_pose_comparison=enable_tcp_pose_comparison,
+            enable_object_state=enable_object_state,
             enable_grasp_approach=enable_grasp_approach,
             grasp_contact_binding=grasp_contact_binding,
         )

@@ -176,6 +176,7 @@ class MujocoAgentTcpPoseGatewaySession:
     safe_tcp_pose_executor: ReusableStationAgentSkillOperationExecutor | None = None
     spatial_goal_executor: PassiveReadSkillExecutor | None = None
     tcp_pose_comparison_executor: PassiveReadSkillExecutor | None = None
+    object_state_executor: PassiveReadSkillExecutor | None = None
     grasp_approach_executor: ReusableStationAgentSkillOperationExecutor | None = None
     grasp_contact_executor: ReusableStationAgentSkillOperationExecutor | None = None
     gripper_executor: ReusableStationAgentSkillOperationExecutor | None = None
@@ -212,6 +213,8 @@ class MujocoAgentTcpPoseGatewaySession:
             raise ValueError("Spatial goal registration and executor must coexist.")
         if (self.contract_bundle.tcp_pose_comparison_registration is not None) != (self.tcp_pose_comparison_executor is not None):
             raise ValueError("TCP comparison registration and executor must coexist.")
+        if (self.contract_bundle.object_state_registration is not None) != (self.object_state_executor is not None):
+            raise ValueError("Object-state registration and executor must coexist.")
         hand_parts = (self.contract_bundle.gripper_contract is not None,
                       self.gripper_executor is not None, bool(self.gripper_ports))
         if any(hand_parts) and not all(hand_parts):
@@ -500,6 +503,7 @@ class MujocoAgentTcpPoseGatewaySession:
                     ("history", self.history_executor, 5.0),
                     ("spatial_goal", self.spatial_goal_executor, 5.0),
                     ("tcp_pose_comparison", self.tcp_pose_comparison_executor, 5.0),
+                    ("object_state", self.object_state_executor, 5.0),
                     ("segmentation", self.segmentation_executor, 65.0),
                     (
                         "placement",
@@ -1574,6 +1578,18 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
             clock=runtime_clock, max_retained_operations=retention,
         )
         execution_port_by_route_hash[registration.entry.route.semantic_content_hash] = tcp_pose_comparison_executor
+    object_state_executor = None
+    if contract_bundle.object_state_registration is not None:
+        from agent_gateway.profiles.object_state import build_object_state_executor
+        from .object_state import MujocoObjectStateSource
+
+        registration = contract_bundle.object_state_registration
+        source = MujocoObjectStateSource(application=application, profile=registration.profile,
+            contact_binding=contract_bundle.grasp_contact_contract.contact_binding)
+        object_state_executor = build_object_state_executor(registration=registration, capture=source.capture,
+            current_station_revision=lambda: observation_producer.current_station_revision,
+            clock=runtime_clock, max_retained_operations=retention)
+        execution_port_by_route_hash[registration.entry.route.semantic_content_hash] = object_state_executor
     spatial_goal_executor = None
     if contract_bundle.spatial_goal_registration is not None:
         from agent_gateway.profiles.spatial_goal import build_spatial_goal_executor
@@ -1819,6 +1835,7 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
         fixed_orientation_executors=fixed_orientation_executors,
         state_executor=state_executor,
         tcp_pose_comparison_executor=tcp_pose_comparison_executor,
+        object_state_executor=object_state_executor,
         spatial_goal_executor=spatial_goal_executor,
         depth_executor=depth_executor,
         rgb_executor=rgb_executor,

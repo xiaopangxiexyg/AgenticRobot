@@ -1368,6 +1368,22 @@ MuJoCo 可显式组合 `--enable-grasp-approach --enable-grippers --no-realtime-
 分支选择和路径质量检查，因此普通 safe TCP 的排序／拒绝结果也可能变化，
 其默认碰撞政策不变。以上能力均不自动闭合、携物或证明物理抓取成功。
 
+该显式末端接触组合还可用 `--enable-object-state` 发布只读
+`state.read_object_state@1`，默认不发布，且必须已绑定 `--grasp-contact-target-body`。
+查询只接受目录中绑定的物体、公开 Station 坐标系及 1–50 ms 测量帧龄上限。
+当前 MuJoCo 实现从同一 private `MjData` cut 计算 body-origin pose、线/角速度
+及目标与支撑、触觉接触面、其他物体的接触；不推进物理、不发送动作或 HOLD，
+不读取命令目标冒充测量。结果携带 frame/spec、source binding 和会话物理时钟身份。
+速度通过同一 body-origin Jacobian 与 qvel 计算，再用公共 FrameGraph 转换，
+不把质心速度或世界坐标直接标成公开 Station。
+
+`measured_at`、`cutoff_at` 属于返回的 native physics clock；暂停仿真时重复读取
+同一时刻不会产生新物理证据。这是当前状态反馈，不是连续释放判定：当前适配器固定
+返回 `release_observation=null`，不可由一次静止、张爪或动作完成推断放置稳定。
+通用结果允许未来显式部署的连续观测 producer 提供窗口，但稳定声明仍须具有完整
+窗口起点、实测最大采样缺口和固定稳定策略；缺失测量必须返回 null。
+本入口不提供真机物体位姿估计源，也不表示完整抓取、搬运或放置验收已通过。
+
 MuJoCo 的 ``state.read_tcp_pose`` 与可选 TCP history 发布同一公开 Station 坐标系。
 其参数及结果校验从公开 state binding 获取坐标身份，不使用内部 IK execution frame；
 Agent 必须按当前 schema 查询和复制身份，不能以 arm-base 查询替代 Station 查询。

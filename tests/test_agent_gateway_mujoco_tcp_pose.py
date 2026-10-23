@@ -193,6 +193,7 @@ def _assert_unsettled_passive_read_defers_owned_dependency_cleanup(state_reader)
         observation_producer=SimpleNamespace(current_station_revision=0),
         state_executor=None,
         tcp_pose_comparison_executor=None,
+        object_state_executor=None,
         depth_executor=None,
         rgb_executor=None,
         history_executor=None,
@@ -231,6 +232,10 @@ def test_unsettled_passive_read_defers_owned_dependency_cleanup() -> None:
 
 def test_unsettled_tcp_pose_comparison_defers_owned_dependency_cleanup() -> None:
     _assert_unsettled_passive_read_defers_owned_dependency_cleanup("tcp_pose_comparison_executor")
+
+
+def test_unsettled_object_state_defers_owned_dependency_cleanup() -> None:
+    _assert_unsettled_passive_read_defers_owned_dependency_cleanup("object_state_executor")
 
 
 def _profile_and_schema(component_id: str = "right_arm"):

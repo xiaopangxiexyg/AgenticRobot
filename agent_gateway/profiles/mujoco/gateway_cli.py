@@ -197,6 +197,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="also publish bounded terminal contact for this task object and its profile-bound right sensors",
     )
     parser.add_argument(
+        "--enable-object-state", action="store_true",
+        help="publish passive native read_object_state for the explicit contact target; no release-history or task-success inference",
+    )
+    parser.add_argument(
         "--safe-tcp-planning-clearance-padding-m",
         type=float,
         default=0.002,
@@ -535,6 +539,7 @@ def main(argv: list[str] | None = None) -> int:
         enable_safe_tcp_pose=args.enable_safe_tcp_pose,
         enable_spatial_goals=args.enable_spatial_goals,
         enable_tcp_pose_comparison=args.enable_tcp_pose_comparison,
+        enable_object_state=args.enable_object_state,
         enable_grasp_approach=args.enable_grasp_approach,
         grasp_contact_target_body=args.grasp_contact_target_body,
         safe_tcp_planning_clearance_padding_m=args.safe_tcp_planning_clearance_padding_m,

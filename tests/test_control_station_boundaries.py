@@ -260,6 +260,8 @@ def test_gateway_sim_dependencies_are_confined_to_mujoco_profile() -> None:
         # The concrete safe-TCP lifecycle binds its lower simulation planner.
         "agent_gateway/profiles/mujoco/motion_skill.py": ["sim"],
         "agent_gateway/profiles/mujoco/observation.py": ["sim"],
+        # Native object measurements resolve simulation frames in this leaf.
+        "agent_gateway/profiles/mujoco/object_state.py": ["sim"],
         "agent_gateway/profiles/mujoco/policy_application.py": ["sim"],
         "agent_gateway/profiles/mujoco/policy_factory.py": ["sim"],
         "agent_gateway/profiles/mujoco/skills/cube_lift/deployment.py": ["sim"],
@@ -310,6 +312,8 @@ def test_gateway_numerical_dependencies_are_confined_to_concrete_profiles() -> N
         "agent_gateway/profiles/segmentation.py": ["numpy"],
         "agent_gateway/profiles/mujoco/motion_skill.py": ["numpy"],
         "agent_gateway/profiles/mujoco/grasp_candidate_selection.py": ["numpy"],
+        # Private-copy body Jacobians and frame projection stay in this leaf.
+        "agent_gateway/profiles/mujoco/object_state.py": ["numpy"],
         # The concrete real-RM65 CLI validates reviewed camera/tool geometry
         # while assembling its profile; Gateway core remains numerical-neutral.
         "agent_gateway/profiles/real/gateway_cli.py": ["numpy"],
