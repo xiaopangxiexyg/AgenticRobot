@@ -13,6 +13,7 @@ import threading
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
+from functools import wraps
 from typing import Any
 
 import numpy as np
@@ -198,6 +199,223 @@ class MujocoTcpMotionPlan:
     constraint_identity: str | None = None
     contact_binding: MujocoGraspContactBinding | None = None
     payload_binding: MujocoPayloadBinding | None = None
+    # The lower cursor owns stage changes and their original contact policy.
+    stages: tuple[tuple[int, MujocoTcpMotionPlan], ...] = ()
+
+
+# Bound fixed-rate materialization before allocating a native grid.
+_MAX_TRAJECTORY_DURATION_SEC = 120.0
+_MAX_TRAJECTORY_SAMPLES = 100_000
+
+
+def _trajectory_duration_limit(reference_hz: float) -> float:
+    if not math.isfinite(reference_hz) or reference_hz <= 0:
+        raise ValueError("reference_hz must be finite and positive.")
+    # Reserve one tick for floating-point endpoint rounding in the fixed grid.
+    return min(_MAX_TRAJECTORY_DURATION_SEC, (_MAX_TRAJECTORY_SAMPLES - 2) / reference_hz)
+
+
+
+def _require_bounded_grid(duration: float, reference_hz: float) -> None:
+    if not math.isfinite(duration) or not 0 < duration <= _trajectory_duration_limit(reference_hz):
+        raise MujocoTcpPlanRejected("safe_tcp_trajectory_budget_exhausted", {
+            "duration_sec": duration if math.isfinite(duration) else None,
+            "maximum_duration_sec": _trajectory_duration_limit(reference_hz),
+            "maximum_samples": _MAX_TRAJECTORY_SAMPLES,
+        })
+
+
+
+@dataclass(frozen=True)
+class MujocoTcpPlanGoal:
+    """One explicitly bound goal in a complete, lower-owned approach chain."""
+
+    target_pose: tuple[float, ...]
+    translation_tolerance_m: float
+    rotation_tolerance_rad: float
+    configuration_constraint: ConfigurationConstraint | None = None
+    constraint_identity: str | None = None
+    contact_binding: MujocoGraspContactBinding | None = None
+    speed_scale: float = 1.0
+
+    def __post_init__(self):
+        pose = np.asarray(self.target_pose, dtype=float)
+        if (
+            pose.shape != (7,)
+            or not np.isfinite(pose).all()
+            or abs(float(np.linalg.norm(pose[3:])) - 1.0) > 1e-5
+        ):
+            raise ValueError("Chain goals require finite normalized xyz+quat_xyzw.")
+        object.__setattr__(self, "target_pose", tuple(float(v) for v in pose))
+        for name in ("translation_tolerance_m", "rotation_tolerance_rad"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not math.isfinite(value) or value <= 0:
+                raise ValueError(f"{name} must be finite and positive.")
+        if (self.configuration_constraint is None) != (
+            self.constraint_identity is None
+        ):
+            raise ValueError(
+                "Configuration constraint and identity must be bound together."
+            )
+        if self.configuration_constraint is not None and (
+            not callable(self.configuration_constraint)
+            or not isinstance(self.constraint_identity, str)
+            or not self.constraint_identity.strip()
+        ):
+            raise ValueError("Chain constraints require a callable and identity.")
+        if self.contact_binding is not None and not isinstance(
+            self.contact_binding, MujocoGraspContactBinding
+        ):
+            raise TypeError("Chain contact policy must be a bound contact policy.")
+        if (
+            isinstance(self.speed_scale, bool)
+            or not math.isfinite(self.speed_scale)
+            or not 0 < self.speed_scale <= 1
+        ):
+            raise ValueError("speed_scale must be finite and in (0, 1].")
+
+
+
+def _join_motion_plans(plans: tuple[MujocoTcpMotionPlan, ...]) -> MujocoTcpMotionPlan:
+    """Concatenate certified zero-velocity/acceleration knots, without retiming.
+
+    These stages were produced under one lower planner lock from the preceding
+    stage's exact terminal joint state. Joining does not smooth across a policy
+    boundary, cut a corner, or rerun IK. Each continuous stage certificate remains
+    applicable because the join has the same q, qd=0 and qdd=0 on both sides.
+    """
+    for previous, following in zip(plans, plans[1:]):
+        if any(
+            not np.array_equal(
+                previous.path.target_qpos_by_component[side],
+                following.path.start_qpos_by_component[side],
+            )
+            for side in ("left", "right")
+        ):
+            raise ValueError("Motion chain joint configurations are not continuous.")
+    for plan in plans:
+        trajectory = plan.trajectory
+        if (
+            trajectory.timestamps[0] != 0
+            or np.any(np.diff(trajectory.timestamps) <= 0)
+            or not np.allclose(trajectory.qd_rad_s[[0, -1]], 0, atol=1e-10, rtol=0)
+            or not np.allclose(trajectory.qdd_rad_s2[[0, -1]], 0, atol=1e-10, rtol=0)
+        ):
+            raise ValueError(
+                "Motion chain requires certified stopped stage boundaries."
+            )
+    offsets = np.cumsum(
+        [0.0] + [float(p.trajectory.timestamps[-1]) for p in plans[:-1]]
+    )
+
+    def joined(name, *, offset=False):
+        return np.concatenate(
+            [
+                (getattr(p.trajectory, name) + (offsets[i] if offset else 0))[
+                    1 if i else 0 :
+                ]
+                for i, p in enumerate(plans)
+            ]
+        )
+
+    trajectory = OfflineJointWaypointTrajectory(
+        timestamps=joined("timestamps", offset=True),
+        q_rad=joined("q_rad"),
+        qd_rad_s=joined("qd_rad_s"),
+        qdd_rad_s2=joined("qdd_rad_s2"),
+        jerk_rad_s3=joined("jerk_rad_s3"),
+        source_waypoint_timestamps=joined("source_waypoint_timestamps", offset=True),
+        waypoint_timestamps=joined("waypoint_timestamps", offset=True),
+        waypoint_q_rad=joined("waypoint_q_rad"),
+        knot_qd_rad_s=joined("knot_qd_rad_s"),
+        knot_qdd_rad_s2=joined("knot_qdd_rad_s2"),
+        metadata={
+            "join_policy": "certified_stopped_stage_knots_v1",
+            "stage_trajectory_hashes": tuple(p.trajectory_hash for p in plans),
+        },
+    )
+    path = replace(
+        plans[0].path,
+        target_qpos_by_component=plans[-1].path.target_qpos_by_component,
+        waypoints=tuple(
+            point
+            for i, p in enumerate(plans)
+            for point in p.path.waypoints[1 if i else 0 :]
+        ),
+        scene_hash=canonical_content_hash(
+            tuple(p.path.scene_hash for p in plans),
+            domain="dexteleop.mujoco.tcp_chain_scenes.v1",
+        ),
+        metadata={
+            "stage_path_hashes": tuple(p.path.semantic_content_hash for p in plans)
+        },
+    )
+    starts = np.cumsum([0] + [len(p.reference_poses) - 1 for p in plans[:-1]])
+    identity = canonical_content_hash(
+        {
+            "stages": tuple((int(i), p.trajectory_hash) for i, p in zip(starts, plans)),
+            "timestamps": trajectory.timestamps.tolist(),
+            "q": trajectory.q_rad.tolist(),
+        },
+        domain="dexteleop.mujoco.tcp_approach_chain_trajectory.v1",
+    )
+    return MujocoTcpMotionPlan(
+        path=path,
+        trajectory=trajectory,
+        source_model_qpos=plans[0].source_model_qpos,
+        reference_poses=tuple(
+            pose
+            for i, p in enumerate(plans)
+            for pose in p.reference_poses[1 if i else 0 :]
+        ),
+        trajectory_hash=identity,
+        stages=tuple((int(i), p) for i, p in zip(starts, plans)),
+    )
+
+
+
+def _scene_serialized(*, total_budget=False):
+    """Use the rig -> planner lock order already used by live resolution.
+
+    Planning is a frozen-scene operation, not concurrent trajectory execution.
+    Holding this existing reentrant scene boundary also prevents a new motion
+    from racing a native query; no second mutex or physics owner is introduced.
+    """
+
+    def decorate(method):
+        @wraps(method)
+        def call(self, *args, **kwargs):
+            clock = kwargs.get("monotonic", time.perf_counter)
+            if total_budget:
+                budget = kwargs["time_budget_sec"]
+                if isinstance(budget, bool) or not math.isfinite(budget) or budget <= 0:
+                    raise ValueError("time_budget_sec must be finite and positive.")
+            began = float(clock()) if total_budget else None
+            if total_budget and not math.isfinite(began):
+                raise ValueError("Motion chain planning clock must be finite.")
+
+            def invoke(_scene):
+                if total_budget:
+                    remaining = kwargs["time_budget_sec"] - (float(clock()) - began)
+                    if not math.isfinite(remaining):
+                        raise ValueError(
+                            "Motion chain planning clock and budget must be finite."
+                        )
+                    if remaining <= 0:
+                        raise MujocoTcpPlanRejected(
+                            "safe_tcp_planning_budget_exhausted"
+                        )
+                    return method(
+                        self, *args, **{**kwargs, "time_budget_sec": remaining}
+                    )
+                return method(self, *args, **kwargs)
+
+            return self.rig.capture_scene(invoke)
+
+        return call
+
+    return decorate
+
 
 
 class MujocoPlannedTcpMotion:
@@ -237,6 +455,7 @@ class MujocoPlannedTcpMotion:
         self._reference_index = -1
         self._last_cycle = -1
         self._live_oracle: MujocoJointSceneOracle | None = None
+        self._live_stage: MujocoTcpMotionPlan | None = None
         self._contact_guard_bound = False
 
     @property
@@ -260,6 +479,7 @@ class MujocoPlannedTcpMotion:
             component_ids=(self.component_id,),
         )[self.component_id]
 
+    @_scene_serialized()
     def plan(
         self,
         target_pose: tuple[float, ...],
@@ -273,6 +493,7 @@ class MujocoPlannedTcpMotion:
         contact_binding: MujocoGraspContactBinding | None = None,
         payload_binding: MujocoPayloadBinding | None = None,
         preview_model_qpos: np.ndarray | None = None,
+        speed_scale: float = 1.0,
     ) -> MujocoTcpMotionPlan:
         """Plan without dispatch; a payload preview retains its binding's cut.
 
@@ -296,6 +517,8 @@ class MujocoPlannedTcpMotion:
             or path_search_time_budget_sec <= 0
         ):
             raise ValueError("path_search_time_budget_sec must be finite and positive.")
+        if isinstance(speed_scale, bool) or not math.isfinite(speed_scale) or not 0 < speed_scale <= 1:
+            raise ValueError("speed_scale must be finite and in (0, 1].")
         with self._lock:
             if self._active is not None:
                 raise MujocoTcpPlanRejected("safe_tcp_another_plan_active")
@@ -519,16 +742,20 @@ class MujocoPlannedTcpMotion:
                 np.deg2rad(self.rig.config.max_command_step_deg)
                 * self.rig.config.timing.command_hz,
             )
-            acceleration = np.asarray(self.rig.config.max_acceleration_rad_s2)
-            intervals = np.maximum(
-                0.2, np.max(np.abs(np.diff(q, axis=0)) / velocity, axis=1)
-            )
+            velocity = velocity * speed_scale
+            acceleration = np.asarray(self.rig.config.max_acceleration_rad_s2) * speed_scale**2
+            with np.errstate(divide="ignore", over="ignore", invalid="ignore"):
+                intervals = np.maximum(
+                    0.2, np.max(np.abs(np.diff(q, axis=0)) / velocity, axis=1)
+                )
+            source_duration = float(np.sum(intervals))
+            _require_bounded_grid(source_duration, self.reference_hz)
             limits = JointHorizonLimits(
                 min_position_rad=solver.q_min,
                 max_position_rad=solver.q_max,
                 max_velocity_rad_s=velocity,
                 max_acceleration_rad_s2=acceleration,
-                max_jerk_rad_s3=acceleration / self.rig.config.velocity_ramp_sec,
+                max_jerk_rad_s3=acceleration * speed_scale / self.rig.config.velocity_ramp_sec,
             )
             retimed = build_offline_quintic_waypoint_trajectory(
                 np.concatenate(([0.0], np.cumsum(intervals))),
@@ -536,13 +763,14 @@ class MujocoPlannedTcpMotion:
                 command_hz=self.reference_hz,
                 limits=limits,
                 timing_mode="safe_retime_global",
-                max_time_scale=100.0,
+                max_time_scale=min(100.0, _trajectory_duration_limit(self.reference_hz) / source_duration),
                 stop_at_waypoints=True,
             )
             # Keep RRT corners on the actual reference clock. Otherwise an
             # executor could connect the samples on opposite sides of a knot
             # and cut the verified corner even with zero knot velocities.
             ticks = np.ceil(np.diff(retimed.waypoint_timestamps) * self.reference_hz)
+            _require_bounded_grid(float(np.sum(ticks)) / self.reference_hz, self.reference_hz)
             trajectory = build_offline_quintic_waypoint_trajectory(
                 np.concatenate(([0.0], np.cumsum(ticks) / self.reference_hz)),
                 q,
@@ -613,8 +841,254 @@ class MujocoPlannedTcpMotion:
                 self._pending_plan = plan
             return plan
 
-    def activate(self, plan: MujocoTcpMotionPlan) -> None:
+    @_scene_serialized(total_budget=True)
+    def plan_chain(
+        self,
+        goals: tuple[MujocoTcpPlanGoal, ...],
+        *,
+        cancel_requested: Callable[[], bool],
+        time_budget_sec: float,
+        preview_model_qpos: np.ndarray | None = None,
+        monotonic: Callable[[], float] = time.perf_counter,
+    ) -> MujocoTcpMotionPlan:
+        """Plan all approach stages before any execution, with one total budget.
+
+        Preview remains unowned and cannot replace a pending plan. A normal
+        query retains only the complete successful chain; rejection, timeout,
+        scene drift or cancellation cannot leave a partial executable prefix.
+        """
+        goals = tuple(goals)
+        if not 1 <= len(goals) <= 8 or any(
+            not isinstance(g, MujocoTcpPlanGoal) for g in goals
+        ):
+            raise ValueError("A motion chain requires one to eight typed goals.")
+        if (
+            isinstance(time_budget_sec, bool)
+            or not math.isfinite(time_budget_sec)
+            or time_budget_sec <= 0
+        ):
+            raise ValueError("time_budget_sec must be finite and positive.")
+
+        def now():
+            value = float(monotonic())
+            if not math.isfinite(value):
+                raise ValueError("Motion chain planning clock must be finite.")
+            return value
+
+        deadline = now() + time_budget_sec
+
+        def stopped():
+            return cancel_requested() or now() >= deadline
+
+        def check_request():
+            if cancel_requested():
+                raise MujocoTcpPlanRejected("safe_tcp_planning_cancelled")
+            if now() >= deadline:
+                raise MujocoTcpPlanRejected("safe_tcp_planning_budget_exhausted")
+
         with self._lock:
+            if self._active is not None:
+                raise MujocoTcpPlanRejected("safe_tcp_another_plan_active")
+            preview = preview_model_qpos is not None
+            if not preview:
+                self._pending_plan = None
+            check_request()
+            source = (
+                self._model_qpos()
+                if not preview
+                else np.asarray(preview_model_qpos, dtype=float).copy()
+            )
+            if source.shape != (self.scene.model.nq,) or not np.isfinite(source).all():
+                raise ValueError("Planning requires a finite complete model qpos cut.")
+            cut = source.copy()
+            addresses = {
+                side: [
+                    self.scene.joint_qpos_addr(n)
+                    for n in self.scene.arm_specs[side].joint_names
+                ]
+                for side in ("left", "right")
+            }
+            plans = []
+            for index, goal in enumerate(goals):
+                check_request()
+                try:
+                    stage = self.plan(
+                        goal.target_pose,
+                        translation_tolerance_m=goal.translation_tolerance_m,
+                        rotation_tolerance_rad=goal.rotation_tolerance_rad,
+                        cancel_requested=stopped,
+                        configuration_constraint=goal.configuration_constraint,
+                        constraint_identity=goal.constraint_identity,
+                        path_search_time_budget_sec=max(0.001, deadline - now()),
+                        contact_binding=goal.contact_binding,
+                        preview_model_qpos=cut,
+                        speed_scale=goal.speed_scale,
+                    )
+                except MujocoTcpPlanRejected as error:
+                    check_request()
+                    raise MujocoTcpPlanRejected(
+                        error.reason_code,
+                        {
+                            **error.details,
+                            "chain_stage_index": index,
+                            "completed_stage_count": len(plans),
+                        },
+                    ) from error
+                plans.append(stage)
+                _require_bounded_grid(sum(float(p.trajectory.timestamps[-1]) for p in plans), self.reference_hz)
+                for side, address in addresses.items():
+                    cut[address] = stage.path.target_qpos_by_component[side]
+            check_request()
+            combined = _join_motion_plans(tuple(plans))
+            world_from_base = self.scene.body_pose(self.motion_side + "_arm_base_link")
+            quality = sampled_path_motion_quality(
+                combined.trajectory.q_rad,
+                np.asarray(
+                    [
+                        (world_from_base @ xyzquat_to_matrix(p))[:3, 3]
+                        for p in combined.reference_poses
+                    ]
+                ),
+            )
+            if DEFAULT_PATH_MOTION_QUALITY_LIMITS.exceeded(quality):
+                raise MujocoTcpPlanRejected(
+                    "safe_tcp_motion_quality_exceeded",
+                    {
+                        "motion_quality": quality,
+                        "scope": "complete_approach_chain",
+                    },
+                )
+            combined = replace(
+                combined,
+                path=replace(
+                    combined.path,
+                    metadata={
+                        **dict(combined.path.metadata),
+                        "motion_quality": quality,
+                        "motion_quality_limits": DEFAULT_PATH_MOTION_QUALITY_LIMITS.to_dict(),
+                    },
+                ),
+            )
+            check_request()
+            if not preview:
+                if not np.array_equal(source, self._model_qpos()):
+                    raise MujocoTcpPlanRejected(
+                        "safe_tcp_scene_changed_during_planning"
+                    )
+                check_request()
+                self._pending_plan = combined
+            return combined
+
+
+    @_scene_serialized(total_budget=True)
+    def refine_pending_chain(
+        self, original: MujocoTcpMotionPlan, goals: tuple[MujocoTcpPlanGoal, ...], *,
+        cancel_requested: Callable[[], bool], time_budget_sec: float,
+        validate_plan: Callable[[MujocoTcpMotionPlan], None], deadline_at: float,
+        monotonic: Callable[[], float] = time.perf_counter,
+    ) -> MujocoTcpMotionPlan:
+        """Atomically replace an unconsumed chain only after full refinement.
+
+        Preview uses the same lower planner without clearing the valid handle.
+        Rejection leaves that exact handle intact; cancellation and scene drift
+        remain errors and never authorize consuming either plan.
+        """
+        with self._lock:
+            if (isinstance(time_budget_sec, bool) or not math.isfinite(time_budget_sec)
+                    or time_budget_sec <= 0 or not math.isfinite(deadline_at)
+                    or not callable(validate_plan)):
+                raise ValueError("Refinement requires a finite budget, deadline and validation port.")
+            if self._active is not None or self._pending_plan is not original:
+                raise MujocoTcpPlanRejected("safe_tcp_plan_not_owned_by_runtime")
+            if not np.array_equal(original.source_model_qpos, self._model_qpos()):
+                raise MujocoTcpPlanRejected("safe_tcp_scene_changed_during_planning")
+            if cancel_requested():
+                raise MujocoTcpPlanRejected("safe_tcp_planning_cancelled")
+            started = float(monotonic())
+            if not math.isfinite(started):
+                raise ValueError("Refinement clock must be finite.")
+            deadline = min(started + time_budget_sec, deadline_at)
+            if started >= deadline:
+                raise MujocoTcpPlanRejected("safe_tcp_planning_budget_exhausted")
+            refined = self.plan_chain(goals, cancel_requested=cancel_requested,
+                time_budget_sec=deadline - started, preview_model_qpos=original.source_model_qpos,
+                monotonic=monotonic)
+            validate_plan(refined)
+            if cancel_requested():
+                raise MujocoTcpPlanRejected("safe_tcp_planning_cancelled")
+            finished = float(monotonic())
+            if not math.isfinite(finished):
+                raise ValueError("Refinement clock must be finite.")
+            if finished >= deadline:
+                raise MujocoTcpPlanRejected("safe_tcp_planning_budget_exhausted")
+            if (self._pending_plan is not original or self._active is not None
+                    or not np.array_equal(original.source_model_qpos, self._model_qpos())):
+                raise MujocoTcpPlanRejected("safe_tcp_scene_changed_during_planning")
+            self._pending_plan = refined
+            return refined
+
+
+    @staticmethod
+    def _stage_at(plan: MujocoTcpMotionPlan, index: int) -> MujocoTcpMotionPlan:
+        for start, stage in reversed(plan.stages):
+            # A stopped join belongs to the incoming stage. The next stage's
+            # policy takes effect only when its first outgoing sample is used.
+            if index > start or start == 0:
+                return stage
+        return plan
+
+
+    @_scene_serialized()
+    def owns_pending_plan(self, plan: MujocoTcpMotionPlan) -> bool:
+        """Inspect ownership without registering a preview or activating motion."""
+        with self._lock:
+            return self._active is None and self._pending_plan is plan
+
+
+    @_scene_serialized()
+    def discard_pending_plan(self, plan: MujocoTcpMotionPlan) -> None:
+        """Withdraw only this unpublished handle, never HOLD or clear active motion."""
+        with self._lock:
+            if self._pending_plan is plan:
+                self._pending_plan = None
+
+
+    def _oracle_for_stage(self, stage: MujocoTcpMotionPlan) -> MujocoJointSceneOracle:
+        return MujocoJointSceneOracle(
+            self.scene,
+            stage.source_model_qpos if stage.payload_binding is not None else self._model_qpos(),
+            configuration_constraint=stage.configuration_constraint,
+            constraint_identity=stage.constraint_identity,
+            contact_binding=stage.contact_binding,
+            payload_binding=stage.payload_binding,
+        )
+
+    def _bind_live_stage(self, stage, oracle):
+        if stage.payload_binding is not None:
+            def bind_payload(scene):
+                pair = scene.arm_qpos_by_side()
+                if any(not np.allclose(pair[side], stage.path.start_qpos_by_component[side],
+                                       atol=1e-3, rtol=0) for side in ("left", "right")):
+                    raise MujocoTcpPlanRejected("safe_tcp_start_state_changed")
+                self._capture_current_payload(stage, oracle, scene)
+                self.rig.set_additional_contact_oracle(stage.payload_binding.contact_oracle(scene))
+
+            self.rig.capture_scene(bind_payload)
+        else:
+            # Noncontact stages retain their stricter hand/object policy too.
+            self.rig.set_additional_contact_oracle(oracle.projector.oracle)
+        self._contact_guard_bound = True
+        self._live_stage = stage
+        self._live_oracle = oracle
+
+    @_scene_serialized()
+    def activate(self, plan: MujocoTcpMotionPlan, *, deadline_at: float | None = None,
+                 clock: Callable[[], float] = time.monotonic) -> None:
+        with self._lock:
+            if deadline_at is not None and (
+                isinstance(deadline_at, bool) or not math.isfinite(deadline_at) or not callable(clock)
+            ):
+                raise ValueError("Native activation deadline requires a finite same-domain clock binding.")
             if self._active is not None:
                 raise MujocoTcpPlanRejected("safe_tcp_another_plan_active")
             if plan is not self._pending_plan:
@@ -630,36 +1104,22 @@ class MujocoPlannedTcpMotion:
                 for side in ("left", "right")
             ):
                 raise MujocoTcpPlanRejected("safe_tcp_start_state_changed")
-            live_oracle = MujocoJointSceneOracle(
-                self.scene,
-                (plan.source_model_qpos if plan.payload_binding is not None else self._model_qpos()),
-                configuration_constraint=plan.configuration_constraint,
-                constraint_identity=plan.constraint_identity,
-                contact_binding=plan.contact_binding,
-                payload_binding=plan.payload_binding,
-            )
-            if plan.payload_binding is not None:
-                def bind_payload(scene):
-                    # Recheck both arms at the same cut as the measured guard
-                    # and installation; the earlier read is not a lock fence.
-                    pair = scene.arm_qpos_by_side()
-                    if any(not np.allclose(pair[side], plan.path.start_qpos_by_component[side],
-                                           atol=1e-3, rtol=0) for side in ("left", "right")):
-                        raise MujocoTcpPlanRejected("safe_tcp_start_state_changed")
-                    self._capture_current_payload(plan, live_oracle, scene)
-                    self.rig.set_additional_contact_oracle(plan.payload_binding.contact_oracle(scene))
-
-                self.rig.capture_scene(bind_payload)
-                self._contact_guard_bound = True
-            elif plan.contact_binding is not None:
-                self.rig.set_additional_contact_oracle(live_oracle.projector.oracle)
-                self._contact_guard_bound = True
-            self._live_oracle = live_oracle
+            stage = self._stage_at(plan, 0)
+            oracle = self._oracle_for_stage(stage)
+            # Validate at the consumption boundary, after scene/planner lock
+            # wait and oracle construction. No caller/app callback may acquire
+            # another owner here; the injected clock is a read-only time port.
+            if deadline_at is not None:
+                timestamp = float(clock())
+                if not math.isfinite(timestamp) or timestamp >= deadline_at:
+                    raise MujocoTcpPlanRejected("grasp_path_plan_expired")
+            self._bind_live_stage(stage, oracle)
             self._active = plan
             self._pending_plan = None
             self._reference_index = -1
             self._last_cycle = -1
 
+    @_scene_serialized()
     def clear(self) -> None:
         with self._lock:
             if self._contact_guard_bound:
@@ -671,6 +1131,7 @@ class MujocoPlannedTcpMotion:
             self._last_cycle = -1
             self._live_oracle = None
 
+            self._live_stage = None
     def _capture_current_payload(self, plan, oracle, scene) -> None:
         """Caller holds the rig scene lock through the following live sweep."""
         check = plan.payload_binding.check_measured(scene)
@@ -680,6 +1141,7 @@ class MujocoPlannedTcpMotion:
         # Never regenerate the frozen hand-object relation from this cut.
         scene.mujoco.mj_copyData(oracle.source, scene.model, scene.data)
 
+    @_scene_serialized()
     def check_measured_contact(self, binding, target_pose) -> JointConfigurationCheck:
         """Check right-hand geometry, including after HOLD cleared the plan."""
         if self.motion_side == "left":
@@ -712,6 +1174,7 @@ class MujocoPlannedTcpMotion:
                 and self._reference_index == len(self._active.reference_poses) - 1
             )
 
+    @_scene_serialized()
     def reference(self, cycle: int) -> tuple[float, ...]:
         if isinstance(cycle, bool) or not isinstance(cycle, int) or cycle < 0:
             raise ValueError("cycle must be a non-negative integer.")
@@ -724,6 +1187,22 @@ class MujocoPlannedTcpMotion:
                 return self._active.reference_poses[self._reference_index]
             self._last_cycle = cycle
             index = self._reference_index
+            next_index = min(index + 1, len(self._active.reference_poses) - 1)
+            current_stage = self._stage_at(self._active, max(0, index))
+            next_stage = self._stage_at(self._active, next_index)
+            if next_stage is not current_stage and next_stage.configuration_constraint is not None:
+                # A commanded near-pose is not measured arrival. Keep the
+                # already selected stopped knot until the plant enters the
+                # original terminal corridor; never widen it or skip ahead.
+                model_qpos = self._model_qpos()
+                pair = {side: model_qpos[[self.scene.joint_qpos_addr(n)
+                        for n in self.scene.arm_specs[side].joint_names]]
+                        for side in ("left", "right")}
+                check = next_stage.configuration_constraint(model_qpos, pair)
+                if not check.safe:
+                    if check.reason == "grasp_contact_outside_terminal_corridor":
+                        return self._active.reference_poses[index]
+                    raise MujocoTcpPlanRejected("safe_tcp_stage_transition_blocked", check.to_dict())
             if index > 0 and np.any(
                 np.isclose(
                     self._active.trajectory.timestamps[index],
@@ -740,11 +1219,10 @@ class MujocoPlannedTcpMotion:
                     # reached the corner. Keep that same planned reference;
                     # do not start the next leg or catch up by skipping points.
                     return self._active.reference_poses[index]
-            self._reference_index = min(
-                index + 1, len(self._active.reference_poses) - 1
-            )
+            self._reference_index = next_index
             return self._active.reference_poses[self._reference_index]
 
+    @_scene_serialized()
     def resolve(self, action: RobotAction) -> IKResult:
         with self._lock:
             plan = self._active
@@ -764,7 +1242,8 @@ class MujocoPlannedTcpMotion:
                  self.motion_side: plan.trajectory.q_rad[index]}
             # Recheck the prescribed reference against today's scene; no
             # projection or replacement IK branch may silently change it.
-            oracle = self._live_oracle
+            stage = self._stage_at(plan, index)
+            oracle = self._live_oracle if stage is self._live_stage else self._oracle_for_stage(stage)
             if oracle is None:
                 raise MujocoTcpPlanRejected("safe_tcp_live_scene_unavailable")
             if plan.payload_binding is not None:
@@ -776,7 +1255,10 @@ class MujocoPlannedTcpMotion:
                 # candidate sweep under the one existing physics-owner lock.
                 return self.rig.capture_scene(resolve_payload)
             oracle.source.qpos[:] = self._model_qpos()
-            return self._resolve_checked_reference(plan, index, q, oracle)
+            result = self._resolve_checked_reference(plan, index, q, oracle)
+            if stage is not self._live_stage:
+                self._bind_live_stage(stage, oracle)
+            return result
 
     def _resolve_checked_reference(self, plan, index, q, oracle) -> IKResult:
         if not np.allclose(

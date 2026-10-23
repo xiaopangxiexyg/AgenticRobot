@@ -334,7 +334,7 @@ class MujocoAgentTcpPoseSkillLifecycle:
                 raise ValueError(f"TCP pose lifecycle {label} mismatch.")
         if request.runtime_session_id != application.runtime.config.runtime_session_id:
             raise ValueError("TCP pose lifecycle runtime session mismatch.")
-        parameters = request.parameters
+        parameters = self._motion_parameters(request.parameters)
         if not isinstance(parameters, Mapping):
             raise TypeError("request.parameters must be a mapping.")
         if target_resolver is not None and not callable(target_resolver):
@@ -490,6 +490,10 @@ class MujocoAgentTcpPoseSkillLifecycle:
         self._first_step_refs: tuple[str, ...] = ()
         self._latest_step_refs: tuple[str, ...] = ()
         self._activation_measured_pose: tuple[float, ...] | None = None
+
+    def _motion_parameters(self, parameters):
+        """Ordinary pose Routes consume their admitted wire parameters unchanged."""
+        return parameters
 
     def _reference_action_for_cycle(self, cycle: int) -> ComponentAction:
         if self.action is None or self.target_pose is None:
@@ -1151,6 +1155,27 @@ class MujocoAgentSafeTcpPoseSkillLifecycle(MujocoAgentTcpPoseSkillLifecycle):
             reason_code = self._lower_failure_code
         return super()._failure(reason_code=reason_code, hold=hold)
 
+    def _prepare_plan(self, *, constraint, constraint_identity, cancel_requested):
+        preserve_target = (self.route.skill_id == "motion.move_tcp_to_pose_safe"
+            and safe_tcp_pose_goal_policy_v1(self.request.parameters) == "preserve_target")
+        payload_binding = self._planning_payload_binding()
+        return self._planner.plan(
+            self.target_pose,
+            translation_tolerance_m=(min(self.motion_profile.translation_tolerance_m, 0.003)
+                if preserve_target else self.motion_profile.translation_tolerance_m),
+            rotation_tolerance_rad=(min(self.motion_profile.rotation_tolerance_rad, math.radians(1.0))
+                if preserve_target else self.motion_profile.rotation_tolerance_rad),
+            cancel_requested=cancel_requested,
+            configuration_constraint=constraint,
+            constraint_identity=constraint_identity,
+            path_search_time_budget_sec=self._path_search_time_budget_sec,
+            contact_binding=self._contact_binding,
+            **({"payload_binding": payload_binding} if payload_binding is not None else {}),
+        )
+
+    def _activate_plan(self, plan):
+        self._planner.activate(plan)
+
     def activate(self, *, request, operation, cancel_requested):
         # Bind the exact admitted envelope before search, without submitting
         # a reference. The base also owns cancellation, measured target
@@ -1193,25 +1218,11 @@ class MujocoAgentSafeTcpPoseSkillLifecycle(MujocoAgentTcpPoseSkillLifecycle):
                     metadata=projection.to_payload(),
                 )
 
-        preserve_target = safe_tcp_pose_goal_policy_v1(self.request.parameters) == "preserve_target"
-        payload_binding = self._planning_payload_binding()
         try:
-            plan = self._planner.plan(
-                self.target_pose,
-                translation_tolerance_m=(
-                    min(self.motion_profile.translation_tolerance_m, 0.003)
-                    if preserve_target else self.motion_profile.translation_tolerance_m
-                ),
-                rotation_tolerance_rad=(
-                    min(self.motion_profile.rotation_tolerance_rad, math.radians(1.0))
-                    if preserve_target else self.motion_profile.rotation_tolerance_rad
-                ),
-                cancel_requested=cancel_requested,
-                configuration_constraint=constraint,
+            plan = self._prepare_plan(
+                constraint=constraint,
                 constraint_identity=constraint_identity,
-                path_search_time_budget_sec=self._path_search_time_budget_sec,
-                contact_binding=self._contact_binding,
-                **({"payload_binding": payload_binding} if payload_binding is not None else {}),
+                cancel_requested=cancel_requested,
             )
             if (
                 len(plan.reference_poses) + self.motion_profile.stable_measurement_count
@@ -1240,7 +1251,7 @@ class MujocoAgentSafeTcpPoseSkillLifecycle(MujocoAgentTcpPoseSkillLifecycle):
                                 "projection": projection.to_payload(),
                             },
                         )
-            self._planner.activate(plan)
+            self._activate_plan(plan)
             self._contact_check_enabled = self._contact_binding is not None
         except MujocoTcpPlanRejected as error:
             logging.getLogger(__name__).warning(
@@ -1291,7 +1302,98 @@ class MujocoAgentSafeTcpPoseSkillLifecycle(MujocoAgentTcpPoseSkillLifecycle):
         ) and super()._within_terminal_tolerance(pose)
 
 
+class MujocoAgentPreparedTcpPoseSkillLifecycle(MujocoAgentSafeTcpPoseSkillLifecycle):
+    """Consume an exact lower-retained chain through the normal Skill lifecycle.
+
+    This is an internal profile adapter, not a new Route or a plan grant. The
+    Route's future paired-plan owner must validate provenance/TTL/one-use before
+    constructing it. Lower activation independently rejects foreign, preview,
+    superseded, consumed and start-drifted plans; it never replans them.
+    """
+
+    def __init__(self, *, prepared_plan, **kwargs):
+        from sim.mujoco.deploy.planned_tcp_motion import MujocoTcpMotionPlan
+
+        if not isinstance(prepared_plan, MujocoTcpMotionPlan):
+            raise TypeError("prepared_plan must be a native MuJoCo TCP plan.")
+        if "contact_binding" in kwargs:
+            raise ValueError("A retained chain owns its per-stage contact bindings.")
+        self._prepared_plan = prepared_plan
+        self._prepared_parameters = None
+        if kwargs["request"].skill_id == "motion.execute_grasp_approach_plan":
+            # The public request remains an immutable plan reference. Only this
+            # trusted adapter resolves its lower-owned target for the existing
+            # pose lifecycle; it never rewrites request/operation identity.
+            profile = kwargs["motion_profile"]
+            app = kwargs["application"]
+            pose = app.transform_tcp_pose_xyzquat(
+                prepared_plan.reference_poses[-1],
+                source_frame_id=profile.execution_reference_frame_id,
+                target_frame_id=profile.reference_frame_id,
+            )
+            self._prepared_parameters = {
+                "pose_targets_by_component": {profile.component_id: pose},
+                "reference_frame_id": profile.reference_frame_id,
+                "reference_frame_spec_hash": profile.reference_frame_spec_hash,
+                "controlled_frame_id": "tool_tcp",
+                "frame_graph_hash": profile.frame_graph_hash,
+                "tool_config_hash": profile.tool_config_hash,
+                "calibration_hash": profile.calibration_hash,
+            }
+        super().__init__(**kwargs)
+
+    def _motion_parameters(self, parameters):
+        return self._prepared_parameters if self._prepared_parameters is not None else parameters
+
+    def _prepare_plan(self, *, constraint, constraint_identity, cancel_requested):
+        del constraint, constraint_identity  # Original stage bindings are kept.
+        if cancel_requested():
+            raise MujocoTcpPlanRejected("safe_tcp_planning_cancelled")
+        plan = self._prepared_plan
+        # Match the canonical exact-reference resolver's float32 conversion
+        # tolerance. Raw quaternion-dot acos is ill-conditioned at identity.
+        expected = xyzquat_to_pose_matrix(plan.reference_poses[-1])
+        requested = xyzquat_to_pose_matrix(self.target_pose)
+        if not np.allclose(expected, requested, atol=2e-6, rtol=0):
+            raise MujocoTcpPlanRejected(
+                "safe_tcp_retained_plan_target_mismatch",
+                {
+                    "maximum_matrix_difference": float(
+                        np.max(np.abs(expected - requested))
+                    ),
+                },
+            )
+        return plan
+
+    def _within_terminal_tolerance(self, pose):
+        # An immutable chain may return to its source pose. Endpoint equality
+        # must not skip that chain or manufacture successful consumption.
+        return (
+            self._path_completed
+            and MujocoAgentTcpPoseSkillLifecycle._within_terminal_tolerance(self, pose)
+        )
+
+    def _capture_pose(self):
+        pose = super()._capture_pose()
+        if self._path_completed:
+            stage = (
+                self._prepared_plan.stages[-1][1]
+                if self._prepared_plan.stages
+                else self._prepared_plan
+            )
+            if stage.contact_binding is not None:
+                check = self._planner.check_measured_contact(
+                    stage.contact_binding, self.target_pose
+                )
+                if not check.safe:
+                    raise MujocoTcpPlanRejected(
+                        "grasp_contact_measured_state_blocked", check.to_dict()
+                    )
+        return pose
+
+
 __all__ = [
+    "MujocoAgentPreparedTcpPoseSkillLifecycle",
     "MujocoAgentSafeTcpPoseSkillLifecycle",
     "MujocoAgentTcpPoseSkillLifecycle",
     "MujocoAgentTcpTargetResolution",

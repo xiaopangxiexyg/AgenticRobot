@@ -30,6 +30,20 @@ python -m sim.mujoco.run_control \
   --mjcf-out /tmp/rm65_bimanual_physics_v1.xml
 ```
 
+## 完整 TCP 规划链
+
+`sim.mujoco.deploy.planned_tcp_motion` 的 `MujocoTcpPlanGoal`、`plan_chain` 和
+`refine_pending_chain` 复用原 IK、碰撞查询和 C2 重定时，先规划所有阶段，再保留一个完整
+pending handle。阶段在已认证的零速、零加速度节点拼接，原阶段约束和接触权限由同一个
+lower reference cursor 选择；失败不留下可执行前缀。预览不能激活，也不能覆盖现有 pending
+plan；细化只在最终校验、预算和场景检查通过后原子替换原 handle。
+
+`MujocoAgentPreparedTcpPoseSkillLifecycle` 通过原 Skill 生命周期消费该计划，不重新解 IK，
+不跳过 measured arrival、碰撞、另一臂 HOLD、取消及最终输出门禁。普通 TCP 与携物路径
+保留原臂侧和实时 payload 校验。native 查询和执行统一使用 rig→planner 的锁序；完整链
+预算包括等待，轨迹长度在固定时钟网格分配前有界。该内部适配器不授予公共 Route 或运动权限；
+MuJoCo 快速抓取的冻结采集和公共配对入口仍需完成后续装配。
+
 ## Real-aligned VIVE position-teleop debug
 
 The shared position path can be exercised without a real RM65 through the
