@@ -205,6 +205,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="also observe frozen follow/release on existing physics ticks; requires object-state feedback; no motion authorization",
     )
     parser.add_argument(
+        "--enable-object-motion", action="store_true",
+        help="publish carried-object lift/carry/place on the existing planner; requires grippers, grasp approach, contact target and explicit follow observation",
+    )
+    parser.add_argument(
         "--safe-tcp-planning-clearance-padding-m",
         type=float,
         default=0.002,
@@ -545,6 +549,7 @@ def main(argv: list[str] | None = None) -> int:
         enable_tcp_pose_comparison=args.enable_tcp_pose_comparison,
         enable_object_state=args.enable_object_state,
         enable_object_follow_observation=args.enable_object_follow_observation,
+        enable_object_motion=args.enable_object_motion,
         enable_grasp_approach=args.enable_grasp_approach,
         grasp_contact_target_body=args.grasp_contact_target_body,
         safe_tcp_planning_clearance_padding_m=args.safe_tcp_planning_clearance_padding_m,

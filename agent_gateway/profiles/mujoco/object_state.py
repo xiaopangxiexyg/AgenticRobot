@@ -59,6 +59,11 @@ class MujocoObjectStateSource:
                 world_tcp_from_scene=world_tcp, track_close_contacts=True)
             rig.set_physics_step_observer(self._follow.observe_physics_step)
 
+    @property
+    def follow_observer(self):
+        """The one rig-tick producer, shared only by explicit motion assembly."""
+        return self._follow
+
     def capture(self):
         def project(scene):
             mj, model = scene.mujoco, scene.model

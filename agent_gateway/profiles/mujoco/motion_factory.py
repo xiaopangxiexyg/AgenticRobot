@@ -59,6 +59,7 @@ from .motion_application import MujocoAgentSkillMotionApplication
 from .motion_deployment import (
     MUJOCO_AGENT_GRASP_APPROACH_ROUTE_ID_V1,
     MUJOCO_AGENT_GRASP_CONTACT_ROUTE_ID_V1,
+    MUJOCO_AGENT_OBJECT_MOVE_ROUTE_ID_V1,
     MUJOCO_AGENT_SAFE_TCP_POSE_ROUTE_ID_V1,
     MUJOCO_AGENT_TCP_POSE_MAX_ROTATION_DELTA_RAD_V1,
     MUJOCO_AGENT_TCP_POSE_MAX_TRANSLATION_DELTA_M_V1,
@@ -279,6 +280,7 @@ def _build_standard_tcp_pose_envelope_runtime(
     enable_safe_tcp_pose: bool = False,
     enable_grasp_approach: bool = False,
     grasp_contact_binding: MujocoGraspContactBinding | None = None,
+    enable_object_motion: bool = False,
     motion_side: str = "right",
 ) -> TCPPoseEnvelopeSafetyRuntime:
     """Bind separate lower envelopes for bounded pose and fixed heading Routes.
@@ -434,6 +436,18 @@ def _build_standard_tcp_pose_envelope_runtime(
                     domain="mujoco.grasp_contact.absolute_envelope.v1"),
                 allowed_route_ids=(MUJOCO_AGENT_GRASP_CONTACT_ROUTE_ID_V1,),
             ))
+            if enable_object_motion:
+                object_profile = replace(grasp_profile, profile_id="mujoco-agent-object-motion-envelope-v1")
+                entries.append(TCPPoseEnvelopeCatalogEntry(
+                    envelope_id="mujoco.agent_object_motion.safety.absolute.v1",
+                    profile=object_profile,
+                    constraint_set_hash=canonical_content_hash({
+                        "profile": object_profile.semantic_content_hash,
+                        "target_contact_binding": grasp_contact_binding.to_payload(),
+                        "payload_policy": "frozen_measured_relation_full_native_geometry_v1",
+                    }, domain="mujoco.object_motion.absolute_envelope.v1"),
+                    allowed_route_ids=(MUJOCO_AGENT_OBJECT_MOVE_ROUTE_ID_V1,),
+                ))
     return TCPPoseEnvelopeSafetyRuntime(
         catalog_entries=tuple(entries),
         target_frame_binding_hash=target_binding_hash,
@@ -506,6 +520,7 @@ def build_mujoco_agent_tcp_pose_gateway_session(
     enable_tcp_pose_comparison: bool = False,
     enable_object_state: bool = False,
     enable_object_follow_observation: bool = False,
+    enable_object_motion: bool = False,
     safe_tcp_planning_clearance_padding_m: float = 0.002,
     enable_grippers: bool = False,
     enable_grasp_approach: bool = False,
@@ -536,6 +551,11 @@ def build_mujoco_agent_tcp_pose_gateway_session(
         raise TypeError("enable_object_follow_observation must be boolean.")
     if enable_object_follow_observation and not enable_object_state:
         raise ValueError("Object follow observation requires explicit object-state feedback.")
+    if type(enable_object_motion) is not bool:
+        raise TypeError("enable_object_motion must be boolean.")
+    if enable_object_motion and (not enable_object_follow_observation or not enable_grippers
+                                 or not enable_grasp_approach or grasp_contact_target_body is None):
+        raise ValueError("Object motion requires explicit follow observation, grippers, grasp approach and contact target.")
     if enable_object_state and grasp_contact_target_body is None:
         raise ValueError("Object-state feedback requires an explicit grasp contact target.")
     if not isinstance(enable_grasp_approach, bool):
@@ -649,6 +669,7 @@ def build_mujoco_agent_tcp_pose_gateway_session(
         enable_safe_tcp_pose=enable_safe_tcp_pose,
         enable_grasp_approach=enable_grasp_approach,
         grasp_contact_binding=grasp_contact_binding,
+        enable_object_motion=enable_object_motion,
         motion_side=side,
     )
     target = build_mujoco_agent_skill_motion_target(
@@ -734,6 +755,7 @@ def build_mujoco_agent_tcp_pose_gateway_session(
             enable_tcp_pose_comparison=enable_tcp_pose_comparison,
             enable_object_state=enable_object_state,
             enable_object_follow_observation=enable_object_follow_observation,
+            enable_object_motion=enable_object_motion,
             enable_grasp_approach=enable_grasp_approach,
             grasp_contact_binding=grasp_contact_binding,
         )

@@ -1393,6 +1393,26 @@ physics tick（包括 HOLD），不新增采样线程或 step loop。新闭爪�
 必须重新发现目录，不能复用旧绑定。它既不是放置目标内判定，也不是物理任务成功评价。
 本入口不提供真机物体位姿估计源，也不表示完整抓取、搬运或放置验收已通过。
 
+### 显式携物目标（MuJoCo）
+
+在上述末端接触、双夹爪、object-state及follow观测组合上，另加
+`--enable-object-motion` 才发布 `motion.move_grasped_object_to_pose@1`；默认不发布。
+它接受目录中绑定的 `object_id`、`phase=lift|carry|place`，以及公开参考系中的
+物体body-origin绝对位姿或平移增量（二选一）。由下层记忆原始手物关系并推导TCP，
+调用者不必复制手物变换，不能提交任意接触例外。
+
+该Route与object-state共享同一个原rig逐物理步observer，不创建额外线程或步进所有者。
+lift先要求实测闭合和双侧接触；carry/place要求已观察到的无支撑抬升及完整稳定窗口。
+lift/place的支撑接触仅限命名支撑面与其法向走廊；carry不允许支撑接触。
+规划、重定时、逐参考扫掠及物理guard均复用已有链，保持1mm、3mm/2deg和50ms边界。
+阶段只在计划成功激活后提交到live cut，失败不得通过重新锚定恢复。
+
+完成回执将实际物体位姿、原生物理时钟、抓持状态及阶段接触加入最终状态hash，
+仍要求原domain HOLD。完成指到达物体目标并保持抓持，不自动张爪，也不代表稳定放置；
+释放仍需独立gripper v2与既有release观测。取消和close包含同一个携物worker及原HOLD路径。
+当前公开装配仍为右臂、确定性物理时钟；下层左右臂planner支持不等于左臂组合已发布。
+本软件接线不表示完整物理抓放或Agent验收已经通过。
+
 MuJoCo 的 ``state.read_tcp_pose`` 与可选 TCP history 发布同一公开 Station 坐标系。
 其参数及结果校验从公开 state binding 获取坐标身份，不使用内部 IK execution frame；
 Agent 必须按当前 schema 查询和复制身份，不能以 arm-base 查询替代 Station 查询。

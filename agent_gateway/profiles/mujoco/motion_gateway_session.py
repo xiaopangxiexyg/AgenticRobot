@@ -11,6 +11,10 @@ from __future__ import annotations
 import threading
 from collections.abc import Callable, Collection, Mapping
 from dataclasses import dataclass, field, replace
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from sim.mujoco.deploy.grasped_object import MujocoGraspedObjectObserver
 
 from agent_gateway.profiles.back_projection import (
     LiveBackProjectionProvider,
@@ -179,6 +183,8 @@ class MujocoAgentTcpPoseGatewaySession:
     object_state_executor: PassiveReadSkillExecutor | None = None
     grasp_approach_executor: ReusableStationAgentSkillOperationExecutor | None = None
     grasp_contact_executor: ReusableStationAgentSkillOperationExecutor | None = None
+    object_motion_executor: ReusableStationAgentSkillOperationExecutor | None = None
+    object_observer: MujocoGraspedObjectObserver | None = None
     gripper_executor: ReusableStationAgentSkillOperationExecutor | None = None
     gripper_ports: Mapping[str, MujocoGripperControlPort] = field(default_factory=dict)
     _close_lock: threading.Lock = field(
@@ -215,6 +221,10 @@ class MujocoAgentTcpPoseGatewaySession:
             raise ValueError("TCP comparison registration and executor must coexist.")
         if (self.contract_bundle.object_state_registration is not None) != (self.object_state_executor is not None):
             raise ValueError("Object-state registration and executor must coexist.")
+        object_parts = (self.contract_bundle.object_motion_contract is not None,
+                        self.object_motion_executor is not None, self.object_observer is not None)
+        if any(object_parts) and not all(object_parts):
+            raise ValueError("Object motion registration, observer and executor must coexist.")
         hand_parts = (self.contract_bundle.gripper_contract is not None,
                       self.gripper_executor is not None, bool(self.gripper_ports))
         if any(hand_parts) and not all(hand_parts):
@@ -447,6 +457,7 @@ class MujocoAgentTcpPoseGatewaySession:
                 else ()
             ),
             *((self.grasp_contact_executor,) if self.grasp_contact_executor is not None else ()),
+            *((self.object_motion_executor,) if self.object_motion_executor is not None else ()),
             self.cardinal_step_executor,
             *tuple(
                 self.fixed_cardinal_step_executors[skill_id]
@@ -704,6 +715,11 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
             raise ValueError("Composed grippers require an arm-HOLD-bound port.")
     for hand in gripper_ports.values():
         hand.bind_motion_guard(lambda: application.held)
+    if contract_bundle.object_motion_contract is not None and (
+            contract_bundle.object_state_registration is None
+            or not contract_bundle.object_state_registration.profile.release_supported
+            or contract_bundle.grasp_contact_contract is None or "right_gripper" not in gripper_ports):
+        raise ValueError("Object motion requires the same explicit follow observer, target and right gripper.")
     if not isinstance(owns_source_observation_history_store, bool):
         raise TypeError("owns_source_observation_history_store must be boolean.")
     if not isinstance(owns_artifact_store, bool):
@@ -1579,6 +1595,7 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
         )
         execution_port_by_route_hash[registration.entry.route.semantic_content_hash] = tcp_pose_comparison_executor
     object_state_executor = None
+    object_observer = None
     if contract_bundle.object_state_registration is not None:
         from agent_gateway.profiles.object_state import build_object_state_executor
         from .object_state import MujocoObjectStateSource
@@ -1587,6 +1604,10 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
         source = MujocoObjectStateSource(application=application, profile=registration.profile,
             contact_binding=contract_bundle.grasp_contact_contract.contact_binding,
             gripper_port=(gripper_ports.get("right_gripper") if registration.profile.release_supported else None))
+        if contract_bundle.object_motion_contract is not None:
+            object_observer = source.follow_observer
+            if object_observer is None:
+                raise ValueError("Object motion lacks its existing rig-tick follow observer.")
         object_state_executor = build_object_state_executor(registration=registration, capture=source.capture,
             current_station_revision=lambda: observation_producer.current_station_revision,
             clock=runtime_clock, max_retained_operations=retention)
@@ -1618,6 +1639,11 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
             "grasp-contact",
             contract_bundle.grasp_contact_contract,
         ),
+        (
+            "motion.move_grasped_object_to_pose",
+            "grasped-object-motion",
+            contract_bundle.object_motion_contract,
+        ),
     ):
         if safe_contract is None:
             continue
@@ -1627,7 +1653,15 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
         def safe_lifecycle_factory(
             *, request, operation, _route=safe_route, _contract=safe_contract
         ):
-            return MujocoAgentSafeTcpPoseSkillLifecycle(
+            lifecycle = MujocoAgentSafeTcpPoseSkillLifecycle
+            extra = {}
+            if _route.skill_id == "motion.move_grasped_object_to_pose":
+                from .object_motion import MujocoAgentObjectMotionLifecycle
+
+                lifecycle = MujocoAgentObjectMotionLifecycle
+                extra["object_observer"] = object_observer
+            return lifecycle(
+                **extra,
                 path_search_time_budget_sec=_contract.path_search_time_budget_sec,
                 contact_binding=_contract.contact_binding,
                 application=application,
@@ -1859,6 +1893,8 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
         safe_tcp_pose_executor=planned_executors.get("motion.move_tcp_to_pose_safe"),
         grasp_approach_executor=planned_executors.get("motion.approach_grasp_pose"),
         grasp_contact_executor=planned_executors.get("motion.approach_grasp_contact"),
+        object_motion_executor=planned_executors.get("motion.move_grasped_object_to_pose"),
+        object_observer=object_observer,
         gripper_executor=gripper_executor,
         gripper_ports=gripper_ports,
     )
