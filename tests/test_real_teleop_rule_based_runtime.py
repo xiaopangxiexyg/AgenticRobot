@@ -5340,7 +5340,7 @@ def test_gripper_settle_requires_consecutive_distinct_feedback(interruption) -> 
     )
     extension._manual_gripper_progress_by_side["right"] = (
         rule_runtime_module._ManualGripperProgress(
-            last_progress_at=10.0, last_dispatch_at=10.0,
+            last_progress_at=10.0, last_dispatch_at=10.0, last_command=1.0,
         )
     )
 
@@ -5700,6 +5700,79 @@ def test_manual_gripper_failure_precedence_blocks_the_whole_dispatch(
     assert extension.status().gripper_action_result == "failed"
     assert expected in extension.status().gripper_action_status
     assert extension._pending_gripper_action is None
+
+
+@pytest.mark.parametrize("intent", [
+    "release_grippers", "close_grippers", "release_right_gripper", "close_right_gripper",
+])
+@pytest.mark.parametrize("backend_status", ["rate_limited", "io_busy"])
+@pytest.mark.parametrize("always_rejected", [False, True])
+@pytest.mark.parametrize(("sides", "writing"), [
+    (("right",), True), (("left", "right"), False),
+])
+def test_manual_gripper_initial_endpoint_requires_an_accepted_mode_command(
+    intent: str, backend_status: str, always_rejected: bool,
+    sides: tuple[str, ...], writing: bool,
+) -> None:
+    extension = RuleBasedRealTeleopExtension(
+        deployment=_deployment(),
+        plan=RuleBasedCollectionPlan(steps=(RuleBasedCustomAction(
+            step_id="collect", action=RobotAction.bimanual_qpos(left_arm=np.zeros(6)),
+        ),)),
+        trajectory_groups={},
+        config=RuleBasedRealTeleopConfig(
+            gripper_sides=sides, manual_gripper_timeout_sec=0.5,
+            manual_gripper_resend_interval_sec=0.25,
+        ),
+        source_selection={"collection_mode": "rule_based_writing"} if writing else {},
+    )
+    session, _clutch, ui = _bind(
+        extension, _Recorder(_Poller()), arm=False, hand_sides=sides,
+    )
+    backends = {side: getattr(extension._components, f"{side}_hand_backend") for side in sides}
+    for backend in backends.values():
+        backend.set_measured_scalar(0.0 if intent.startswith("release") else 1.0)
+
+    def dispatch(command, _observation, _now, *, record, transition_to_running):
+        assert record is False and transition_to_running is False
+        session.external_commands.append(command)
+        accepted = len(session.external_commands) > 1 and not always_rejected
+        for backend in backends.values():
+            backend._last_send_status = "sent" if accepted else backend_status
+        return SimpleNamespace(
+            dispatched=True, dispatch_receipts={name: accepted for name in command.commands},
+        )
+
+    session.dispatch_external_command = dispatch
+    ui.intents.append(intent)
+    extension.after_control_input_poll(now=10.0)
+    for now in (10.0, 10.05, 10.10, 10.15, 10.24):
+        session.command_override_provider(SimpleNamespace(), now)
+        assert extension.status().gripper_action_result == "pending"
+        assert len(session.external_commands) == 1
+
+    session.command_override_provider(SimpleNamespace(), 10.26)
+    assert len(session.external_commands) == 2
+    assert extension.status().gripper_action_result == "pending"
+    for now in (10.27, 10.28):
+        session.command_override_provider(SimpleNamespace(), now)
+        assert extension.status().gripper_action_result == "pending"
+    session.command_override_provider(SimpleNamespace(), 10.29)
+    if always_rejected:
+        assert extension.status().gripper_action_result == "pending"
+        session.command_override_provider(SimpleNamespace(), 10.51)
+        assert extension.status().gripper_action_result == "failed"
+        assert "控制超时" in extension.status().gripper_action_status
+    else:
+        assert extension.status().gripper_action_result == "succeeded"
+    assert len(session.external_commands) == 2
+    expected_sides = ("right",) if "right_gripper" in intent else sides
+    continuous_grasp = intent == "close_grippers" and not writing
+    for command in session.external_commands:
+        assert set(command.commands) == {f"{side}_hand" for side in expected_sides}
+        for effector in command.commands.values():
+            assert effector.metadata["dmtac_continuous_grasp_override"] is continuous_grasp
+            assert effector.metadata["dmtac_preserve_existing_grip"] is False
 
 
 def test_prestart_configuration_rebuild_updates_numeric_alignment_speed_off_loop() -> None:

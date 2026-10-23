@@ -516,9 +516,11 @@ class _ManualGripperProgress:
     """One side's causal command and measured-progress history for this action."""
 
     last_progress_at: float
+    # Only an accepted receipt establishes this action's command fact.
     last_command: float | None = None
     command_baseline: float | None = None
     initial_baseline: float | None = None
+    # Attempts pace resends; this clock alone cannot authorize completion.
     last_dispatch_at: float | None = None
     settle_samples: int = 0
     last_settle_feedback_token: tuple[str, float] | None = None
@@ -2783,7 +2785,7 @@ class RuleBasedRealTeleopExtension:
 
         feedback_timestamp = self._manual_gripper_feedback_timestamp(state)
         last_dispatch = progress.last_dispatch_at
-        if last_dispatch is None:
+        if progress.last_command is None or last_dispatch is None:
             return interrupted("等待本次夹爪命令后的反馈")
         if (
             feedback_timestamp is not None
@@ -3073,6 +3075,7 @@ class RuleBasedRealTeleopExtension:
                 and one_shot_right_hand
                 and side == "right"
                 and status_code == 6
+                and last_target is not None
                 and progress.last_dispatch_at is not None
             )
             closed_idle_progress = self._manual_gripper_closed_idle_progress(
@@ -3100,7 +3103,18 @@ class RuleBasedRealTeleopExtension:
                     # mode and task-chain close establishes a one-shot closed
                     # state before the writing replay preserves that physical
                     # grip without another serial write.
-                    if at_endpoint and progress.last_dispatch_at is None:
+                    # A transient rejection is only an attempt. Retry at the
+                    # bounded cadence until this action has an accepted write.
+                    last_attempt = progress.last_dispatch_at
+                    if (
+                        at_endpoint
+                        and last_target is None
+                        and (
+                            last_attempt is None
+                            or float(now) - last_attempt
+                            >= float(self.config.manual_gripper_resend_interval_sec)
+                        )
+                    ):
                         qpos = np.zeros(6, dtype=np.float32)
                         qpos[command_dim] = final_target
                         hand_qpos[side] = qpos
