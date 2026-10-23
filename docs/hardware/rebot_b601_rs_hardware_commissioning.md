@@ -914,11 +914,11 @@ GUI 应选择「J2/J3 位姿采集」，不是「固定位置」或另一项 20�
 ### 近零 J2/J3 双向多速度连续辨识（显式候选）
 
 现有 `b601_j2_j3_coverage_support_v1.json` 及程序默认参数保持不变。新参数另存为
-`b601_j2_j3_coverage_support_v2.json`，只有显式传入该 profile 才启用；
+[b601_j2_j3_coverage_support_v2.json](profiles/b601_j2_j3_coverage_support_v2.json)，只有显式传入该 profile 才启用；
 `motion_max_reference_lag_rad=0.02925` 不替代原 motion 默认 `0.013 rad`。
 连续辨识同样须显式传入下面的 v2 profile，默认不采集、不拟合、不应用候选。
 
-`b601_j2_j3_continuous_identification_v2.json` 复用相同的 workspace controller、
+[b601_j2_j3_continuous_identification_v2.json](profiles/b601_j2_j3_continuous_identification_v2.json) 复用相同的 workspace controller、
 六轴 owner、协调支撑、派发回执和逐轴回位，不替代原 `detailed`／`coverage` 保持搜索。
 其 `workspace.holding_sampling_plan=identification` 只改变采样目的：
 
