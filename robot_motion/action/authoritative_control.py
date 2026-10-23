@@ -1337,8 +1337,13 @@ class AuthoritativeControlRuntime:
             else self._compound_profile_for_decision(decision)
         )
         action_adaptation: ActionAdaptationResult | None = None
+        adaptation_support_expired = False
         if decision is not None:
             adaptation_requested_at = float(self.clock())
+            adaptation_support_expired = (
+                adaptation_requested_at >= decision.supported_until
+            )
+        if decision is not None and not adaptation_support_expired:
             adaptation_request = build_action_adaptation_request(
                 authoritative_decision_id=decision.decision_id,
                 authoritative_decision_hash=decision.semantic_content_hash,
@@ -1486,6 +1491,7 @@ class AuthoritativeControlRuntime:
         if (
             decision is None
             or adaptation_rejected
+            or adaptation_support_expired
             or directive.global_status != "normal"
         ):
             cancellation = None
@@ -1537,6 +1543,11 @@ class AuthoritativeControlRuntime:
                 status = "execution_hold_active"
             elif adaptation_rejected:
                 status = "action_adaptation_rejected_keep_existing"
+            elif adaptation_support_expired:
+                # No request or target was created. Retain the actual published
+                # support deadline, while still honoring the directive's HOLDs
+                # and cancellations above; expiry alone is not an adapter fault.
+                status = "target_support_expired_before_adaptation_keep_existing"
             else:
                 status = "execution_kept_existing"
             self._emit(step_facts)

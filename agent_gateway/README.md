@@ -1010,6 +1010,12 @@ IK 临时生成未评分的旋转候选或沿用另一预测的分数。
 观测体素覆盖全部占用格，顺序与内容哈希保持一致；未知区域不作为已验证自由空间。
 捕获自体过滤只缓存不可变 CAD 网格，逐帧重算相机/FK/射线；既有 15 mm 深度门槛、
 目标掩码保护、碰撞余量与最终轨迹复核保持不变。
+CAD 表面以所选 URDF 引用的完整本地网格及其缩放为准，而不以原生 OBJ 导入器
+返回的三角面索引近似它。多材质网格可出现顶点范围相同、面片连接不同的导入结果，
+会使真实自体像素成为障碍残留。射线、工具表面采样及显式启用的手臂表面 BVH
+统一使用同一网格拓扑；只缓存局部网格和查询结构，逐帧位姿仍从该次测量计算。
+无外部网格资源的原生 primitive/BVH 仍保留其自身几何；资源加载或表面构造失败直接
+报错，不退回不一致的表面，也不靠扩大 15 mm 默认自体范围规避。
 模型无关的 RGB-D 障碍投影现在由 `robot_motion.observed_scene` 统一实现，
 接收已采集或已保存的深度、相机标定及采集时关节测量，不持有相机、分割模型或仿真场景。
 真机 profile 保留原导入入口，并显式传入原有起点关节漂移阈值；30 s 场景时效、
@@ -1343,6 +1349,12 @@ level orientations.
 when the lower Skill is activated. Distance, frame/tool/calibration identities,
 primitive hash, safety envelope, IK, dispatch, evaluation, and HOLD remain
 trusted deployment facts.
+
+控制结果发布后、适配请求创建前若原 support 窗口已过期，下层保留真实发布记录，
+不创建适配请求或伪造回执，继续执行原 directive 中要求的 HOLD/取消。
+只有无停止要求的正常结果才返回 `target_support_expired_before_adaptation_keep_existing`；
+MuJoCo Skill 仅在该精确状态及无适配、提交、安全或派发结果的证据组合下，
+在原调用预算内重试同一 reference。过期周期不计作执行成功，不延长 TTL 或旧 segment。
 
 MuJoCo 的现有入口可显式增加 `--enable-safe-tcp-pose`，为会话选定的一臂发布
 `motion.move_tcp_to_pose_safe@1`；默认不发布。该 Route 使用当前场景、另一臂的

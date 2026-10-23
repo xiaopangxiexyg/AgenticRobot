@@ -12,7 +12,6 @@ from robot_motion.rm65.captured_robot_observations import (
     _native_body_surface_membership,
     _self_proxy_membership,
     RM65CapturedRobotObservationFilterConfig,
-    RM65CapturedRobotObservationFilterResult,
     captured_robot_observation_mask,
 )
 
@@ -30,6 +29,9 @@ def _filter_without_runtime():
     filt._mesh_buffers = {}
     filt._input_binding_hash = "test:extended-inputs"
     filt._tool_queries = {}
+    # Primitive-only fixtures have no external URDF mesh resource.
+    filt._runtime = (None, None, None, None,
+        SimpleNamespace(geometryObjects=[SimpleNamespace(meshPath="")]), (0,))
     return filt
 
 

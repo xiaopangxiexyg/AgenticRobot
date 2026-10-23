@@ -588,6 +588,7 @@ class RM65CapturedRobotObservationFilter:
         self._tool_surfaces: dict[str, dict[str, np.ndarray]] | None = None
         self._body_surfaces: dict[str, tuple[Any, np.ndarray, np.ndarray]] | None = None
         self._mesh_buffers: dict[int, tuple[np.ndarray, np.ndarray]] = {}
+        self._surface_geometry: dict[int, Any] = {}
         self._tool_queries: dict[tuple[str, tuple[str, ...]], tuple[np.ndarray, cKDTree]] = {}
         self._body_sample_trees: dict[str, tuple[cKDTree, float]] = {}
         self._input_binding_hash = (
@@ -628,6 +629,13 @@ class RM65CapturedRobotObservationFilter:
     @property
     def input_binding_hash(self) -> str | None:
         return self._input_binding_hash
+
+    def prepare_geometry(self) -> None:
+        """Materialize this filter's static mesh snapshot without camera/FK reads."""
+        with self._lock:
+            _, _, _, _, visual, selected = self._runtime_components()
+            for index in selected:
+                self._mesh_buffers_for(index, visual.geometryObjects[index].geometry)
 
     def _capture_primitive_geometry(self, arm, source_from_camera):
         """Return capture-only boxes plus immutable local query references.
@@ -825,16 +833,28 @@ class RM65CapturedRobotObservationFilter:
         # are recomputed for every view and sampled finger state.
         buffers = self._mesh_buffers.get(geometry_index)
         if buffers is None:
-            vertices = np.asarray(shape.vertices(), dtype=float).copy(order="K")
-            faces = np.asarray(
-                [
+            _, trimesh, _, _, visual, _ = self._runtime_components()
+            item = visual.geometryObjects[geometry_index]
+            path = getattr(item, "meshPath", "")
+            if path:
+                # Use the actual URDF mesh topology. Some native OBJ loaders
+                # expose different indexed faces for material-partitioned
+                # meshes even though their vertex bounds/counts agree.
+                mesh = trimesh.load(path, force="mesh", process=False)
+                vertices = np.asarray(mesh.vertices, dtype=float).copy()
+                vertices *= np.asarray(item.meshScale, dtype=float).reshape(3)
+                faces = np.asarray(mesh.faces, dtype=np.int64).copy()
+            else:
+                # Native primitive/BVH inputs have no external mesh resource.
+                vertices = np.asarray(shape.vertices(), dtype=float).copy(order="K")
+                faces = np.asarray([
                     (int(triangle[0]), int(triangle[1]), int(triangle[2]))
-                    for triangle in (
-                        shape.tri_indices(index) for index in range(int(shape.num_tris))
-                    )
-                ],
-                dtype=np.int64,
-            )
+                    for triangle in (shape.tri_indices(i) for i in range(int(shape.num_tris)))
+                ], dtype=np.int64)
+            if (vertices.ndim != 2 or vertices.shape[1] != 3 or not np.isfinite(vertices).all()
+                    or faces.ndim != 2 or faces.shape[1] != 3 or not len(faces)
+                    or np.any(faces < 0) or np.any(faces >= len(vertices))):
+                raise ValueError("Captured-robot CAD requires finite vertices and valid triangle topology")
             vertices.setflags(write=False)
             faces.setflags(write=False)
             buffers = vertices, faces
@@ -870,7 +890,24 @@ class RM65CapturedRobotObservationFilter:
             if not _is_arm_body_surface(item.name):
                 continue
             shape = item.geometry
-            vertices = np.asarray(shape.vertices(), dtype=float)
+            vertices, faces = self._geometry_mesh(index, shape)
+            if getattr(item, "meshPath", ""):
+                if index not in self._surface_geometry:
+                    import hppfcl
+
+                    complete = hppfcl.BVHModelOBBRSS()
+                    native_vertices = hppfcl.StdVec_Vec3s()
+                    native_vertices.extend(vertices)
+                    native_faces = hppfcl.StdVec_Triangle()
+                    native_faces.extend(hppfcl.Triangle(int(a), int(b), int(c)) for a, b, c in faces)
+                    if complete.beginModel(len(faces), len(vertices)) != 0:
+                        raise RuntimeError("Captured-robot surface BVH initialization failed")
+                    if complete.addSubModel(native_vertices, native_faces) != 0:
+                        raise RuntimeError("Captured-robot surface BVH assembly failed")
+                    if complete.endModel() != 0:
+                        raise RuntimeError("Captured-robot surface BVH finalization failed")
+                    self._surface_geometry[index] = complete
+                shape = self._surface_geometry[index]
             references[item.name] = (shape, vertices.min(axis=0), vertices.max(axis=0))
         self._body_surfaces = references
         return references
@@ -1308,6 +1345,7 @@ class RM65CapturedRobotObservationFilter:
                 "urdf_cad_depth_finger_sweep_depth_consistent_neighborhood_v2"
             ),
             "urdf_sha256": self.urdf_sha256,
+            "mesh_topology_source": "complete_local_urdf_resources_or_native_primitives",
             "filter_config_hash": self.config.semantic_content_hash,
             "silhouette_radius_px": self.config.silhouette_radius_px,
             "depth_tolerance_m": self.config.depth_tolerance_m,

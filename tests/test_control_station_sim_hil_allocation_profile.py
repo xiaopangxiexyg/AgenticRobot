@@ -580,11 +580,12 @@ def test_allocation_profiles_virtual_policy_and_human_run_button_operations(
                 "proposal_admitted"
             ):
                 return None
-            if candidate.execution.status == (
-                "target_lifecycle_rejected_keep_existing"
-            ):
+            if candidate.execution.status in {
+                "target_lifecycle_rejected_keep_existing",
+                "target_support_expired_before_adaptation_keep_existing",
+            }:
                 # The 250 ms virtual emission may expire while the real
-                # MuJoCo/IK target is resolving under full-suite CPU load.
+                # adaptation/IK target is preparing under full-suite CPU load.
                 # Preserve that fail-closed result and request a fresh
                 # emission; this operation test must still observe a later
                 # executable admission before it continues.

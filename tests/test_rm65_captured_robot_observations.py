@@ -234,3 +234,57 @@ def test_static_mesh_cache_keeps_both_arm_fk_and_finger_states_live(tmp_path):
     for index, finger_q in enumerate(renderer.config.finger_sweep_q_rad[1:], start=1):
         assert first[index][0, 0] == pytest.approx(.45 + .01 * finger_q)
         assert changed[index][0, 0] == pytest.approx(.48 + .01 * finger_q)
+
+
+def test_observation_topology_comes_from_complete_urdf_mesh_not_native_indices(tmp_path):
+    import trimesh
+
+    renderer = _mesh_cache_renderer(tmp_path)
+    resource = tmp_path / "complete.obj"
+    resource.write_text("v 0 0 0.8\nv 1 0 0.8\nv 0 1 0.8\nf 1 2 3\n")
+    pin, _, intersector, model, visual, selected = renderer._runtime
+    item = visual.geometryObjects[3]
+    item.meshPath, item.meshScale = str(resource), np.array([2., 3., 1.])
+    # This native shape's indexed surface is deliberately different; equal
+    # resource/model labels cannot justify using it as the observed CAD.
+    renderer._runtime = (pin, trimesh, intersector, model, visual, selected)
+    vertices, faces = renderer._mesh_buffers_for(3, item.geometry)
+    np.testing.assert_array_equal(vertices, [[0., 0., .8], [2., 0., .8], [0., 3., .8]])
+    np.testing.assert_array_equal(faces, [[0, 1, 2]])
+    assert renderer._mesh_buffers_for(3, item.geometry)[0] is vertices
+    resource.unlink()
+    assert renderer._mesh_buffers_for(3, item.geometry)[0] is vertices
+    with pytest.raises(ValueError):
+        vertices[0] = 0.
+
+
+def test_static_preparation_needs_no_pose_or_camera_cut(tmp_path):
+    renderer = _mesh_cache_renderer(tmp_path)
+    def forbidden(*args, **kwargs):
+        pytest.fail("Static mesh preparation must not read FK or camera state")
+    renderer._runtime[0].forwardKinematics = forbidden
+    renderer._runtime[0].updateGeometryPlacements = forbidden
+    renderer.prepare_geometry()
+    buffers = dict(renderer._mesh_buffers)
+    renderer.prepare_geometry()
+    assert set(buffers) == {1, 2, 3}
+    assert all(renderer._mesh_buffers[key] is value for key, value in buffers.items())
+
+
+@pytest.mark.integration
+def test_complete_body_surface_query_uses_same_topology_and_original_tolerance(tmp_path):
+    import trimesh
+    from robot_motion.rm65.captured_robot_observations import _native_body_surface_membership
+
+    renderer = _mesh_cache_renderer(tmp_path)
+    resource = tmp_path / "complete.obj"
+    resource.write_text("v 0 0 0.8\nv 1 0 0.8\nv 0 1 0.8\nf 1 2 3\n")
+    pin, _, intersector, model, visual, selected = renderer._runtime
+    item = visual.geometryObjects[3]
+    item.name, item.meshPath, item.meshScale = "left_arm_link2_0", str(resource), np.ones(3)
+    renderer._runtime = (pin, trimesh, intersector, model, visual, selected)
+    geometry, lower, upper = renderer._body_surface_references()[item.name]
+    points = np.array([[.1, .1, .8], [.1, .1, .82]])
+    matched, _ = _native_body_surface_membership(points, geometry, lower, upper, .015)
+    np.testing.assert_array_equal(matched, [True, False])
+    assert renderer._body_surface_references()[item.name][0] is geometry

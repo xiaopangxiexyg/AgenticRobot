@@ -970,7 +970,7 @@ def test_tcp_pose_lifecycle_dispatches_through_lower_and_finishes_under_hold() -
 
 @pytest.mark.parametrize(
     "transient_kind",
-    ("publication_miss", "target_support_expired"),
+    ("publication_miss", "target_support_expired", "adaptation_support_expired"),
 )
 def test_tcp_pose_lifecycle_retries_same_reference_after_bounded_no_action(
     transient_kind: str,
@@ -998,7 +998,7 @@ def test_tcp_pose_lifecycle_retries_same_reference_after_bounded_no_action(
         attempts += 1
         if attempts == 1:
             calls["submit"].append(kwargs)
-            if transient_kind == "target_support_expired":
+            if transient_kind in {"target_support_expired", "adaptation_support_expired"}:
                 return MujocoAgentSkillMotionStep(
                     proposal_admission=SimpleNamespace(
                         accepted=True,
@@ -1010,6 +1010,8 @@ def test_tcp_pose_lifecycle_retries_same_reference_after_bounded_no_action(
                     ),
                     authoritative_step=SimpleNamespace(
                         status=(
+                            "target_support_expired_before_adaptation_keep_existing"
+                            if transient_kind == "adaptation_support_expired" else
                             "target_support_expired_before_submission_keep_existing"
                         ),
                         decision=SimpleNamespace(decision_id="decision:fixture"),
@@ -1020,7 +1022,7 @@ def test_tcp_pose_lifecycle_retries_same_reference_after_bounded_no_action(
                                 "arms": SimpleNamespace(directive="publish_selected")
                             },
                         ),
-                        action_adaptation=SimpleNamespace(
+                        action_adaptation=None if transient_kind == "adaptation_support_expired" else SimpleNamespace(
                             receipt=SimpleNamespace(accepted=True)
                         ),
                         target_execution_request=None,
@@ -1101,6 +1103,24 @@ def test_tcp_pose_lifecycle_retries_same_reference_after_bounded_no_action(
     assert second == pytest.approx(first)
     assert ":target-attempt:0:reference:0" in calls["submit"][0]["source_event_id"]
     assert ":target-attempt:1:reference:0" in calls["submit"][1]["source_event_id"]
+
+
+@pytest.mark.parametrize("field", (
+    "action_adaptation", "target_execution_request", "cancellation",
+    "cancellation_receipt", "safety_result", "command", "dispatch_context",
+    "dispatch_validation", "dispatch_receipts",
+))
+def test_adaptation_expiry_retry_rejects_execution_or_hold_evidence(field) -> None:
+    step = SimpleNamespace(
+        status="target_support_expired_before_adaptation_keep_existing",
+        decision=SimpleNamespace(decision_id="decision:expired"),
+        publication_attempt=SimpleNamespace(accepted=True),
+        directive=SimpleNamespace(global_status="normal", directive_by_selection_group={
+            "arms": SimpleNamespace(directive="publish_selected")}),
+    )
+    assert motion_skill._authoritative_step_keeps_existing_for_retry(step)
+    setattr(step, field, SimpleNamespace())
+    assert not motion_skill._authoritative_step_keeps_existing_for_retry(step)
 
 
 def test_tcp_pose_lifecycle_fails_closed_on_unclassified_keep_existing() -> None:
