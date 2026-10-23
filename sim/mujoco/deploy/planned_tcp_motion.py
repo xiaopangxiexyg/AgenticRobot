@@ -993,37 +993,42 @@ class MujocoPlannedTcpMotion:
         Rejection leaves that exact handle intact; cancellation and scene drift
         remain errors and never authorize consuming either plan.
         """
+        if (isinstance(time_budget_sec, bool) or not math.isfinite(time_budget_sec)
+                or time_budget_sec <= 0 or not math.isfinite(deadline_at)
+                or not callable(validate_plan)):
+            raise ValueError("Refinement requires a finite budget, deadline and validation port.")
+        started = float(monotonic())
+        if not math.isfinite(started):
+            raise ValueError("Refinement clock must be finite.")
+        # The decorator already deducted rig-lock wait; this slice must also
+        # include planner-lock wait and the final measured-scene read.
+        deadline = min(started + time_budget_sec, deadline_at)
+
+        def check_request():
+            if cancel_requested():
+                raise MujocoTcpPlanRejected("safe_tcp_planning_cancelled")
+            timestamp = float(monotonic())
+            if not math.isfinite(timestamp):
+                raise ValueError("Refinement clock must be finite.")
+            if timestamp >= deadline:
+                raise MujocoTcpPlanRejected("safe_tcp_planning_budget_exhausted")
+            return timestamp
+
         with self._lock:
-            if (isinstance(time_budget_sec, bool) or not math.isfinite(time_budget_sec)
-                    or time_budget_sec <= 0 or not math.isfinite(deadline_at)
-                    or not callable(validate_plan)):
-                raise ValueError("Refinement requires a finite budget, deadline and validation port.")
             if self._active is not None or self._pending_plan is not original:
                 raise MujocoTcpPlanRejected("safe_tcp_plan_not_owned_by_runtime")
             if not np.array_equal(original.source_model_qpos, self._model_qpos()):
                 raise MujocoTcpPlanRejected("safe_tcp_scene_changed_during_planning")
-            if cancel_requested():
-                raise MujocoTcpPlanRejected("safe_tcp_planning_cancelled")
-            started = float(monotonic())
-            if not math.isfinite(started):
-                raise ValueError("Refinement clock must be finite.")
-            deadline = min(started + time_budget_sec, deadline_at)
-            if started >= deadline:
-                raise MujocoTcpPlanRejected("safe_tcp_planning_budget_exhausted")
+            checked_at = check_request()
             refined = self.plan_chain(goals, cancel_requested=cancel_requested,
-                time_budget_sec=deadline - started, preview_model_qpos=original.source_model_qpos,
+                time_budget_sec=deadline - checked_at, preview_model_qpos=original.source_model_qpos,
                 monotonic=monotonic)
             validate_plan(refined)
-            if cancel_requested():
-                raise MujocoTcpPlanRejected("safe_tcp_planning_cancelled")
-            finished = float(monotonic())
-            if not math.isfinite(finished):
-                raise ValueError("Refinement clock must be finite.")
-            if finished >= deadline:
-                raise MujocoTcpPlanRejected("safe_tcp_planning_budget_exhausted")
+            check_request()
             if (self._pending_plan is not original or self._active is not None
                     or not np.array_equal(original.source_model_qpos, self._model_qpos())):
                 raise MujocoTcpPlanRejected("safe_tcp_scene_changed_during_planning")
+            check_request()
             self._pending_plan = refined
             return refined
 

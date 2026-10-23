@@ -296,6 +296,106 @@ def test_total_budget_includes_planner_lock_wait(monkeypatch):
 
 
 @pytest.mark.integration
+@pytest.mark.parametrize("elapsed,cancel,reason", (
+    (0.25, False, None),
+    (1.0, False, "safe_tcp_planning_budget_exhausted"),
+    (1.01, False, "safe_tcp_planning_budget_exhausted"),
+    (1.0, True, "safe_tcp_planning_cancelled"),
+))
+def test_refinement_slice_includes_planner_lock_wait(monkeypatch, elapsed, cancel, reason):
+    session = _session([])
+    try:
+        app = session.application
+        app.start_observation_ready()
+        planner = app.target.planned_tcp_motion
+        original = planner.plan_chain(_vertical_goals(app),
+            cancel_requested=lambda: False, time_budget_sec=15)
+        refined = replace(original, trajectory_hash="test:refined-after-lock-wait")
+        clock, cancelled = [0.0], [False]
+        waiting = threading.Event()
+        owner = threading.get_ident()
+        lock = planner._lock
+
+        class ObservedLock:
+            def __enter__(self):
+                if threading.get_ident() != owner:
+                    waiting.set()
+                lock.acquire()
+                return self
+
+            def __exit__(self, *args):
+                lock.release()
+
+        monkeypatch.setattr(planner, "_lock", ObservedLock())
+        calls, validated = [], []
+
+        def preview(*args, **kwargs):
+            calls.append(kwargs["time_budget_sec"])
+            return refined
+
+        monkeypatch.setattr(planner, "plan_chain", preview)
+        with ThreadPoolExecutor(max_workers=1) as workers:
+            with lock:
+                pending = workers.submit(planner.refine_pending_chain,
+                    original, (), cancel_requested=lambda: cancelled[0],
+                    time_budget_sec=1.0, deadline_at=10.0,
+                    monotonic=lambda: clock[0], validate_plan=validated.append)
+                assert waiting.wait(timeout=2), "Worker must reach the planner lock after taking the rig."
+                clock[0], cancelled[0] = elapsed, cancel
+            if reason is not None:
+                with pytest.raises(MujocoTcpPlanRejected) as error:
+                    pending.result(timeout=3)
+                assert error.value.reason_code == reason
+                assert calls == validated == []
+                assert planner._pending_plan is original
+            else:
+                assert pending.result(timeout=3) is refined
+                assert calls == [pytest.approx(1.0 - elapsed)]
+                assert validated == [refined] and planner._pending_plan is refined
+        assert not planner.active
+    finally:
+        assert session.close().accepted
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("cancel", (False, True))
+def test_refinement_final_scene_read_cannot_replace_after_cancel_or_expiry(monkeypatch, cancel):
+    session = _session([])
+    try:
+        app = session.application
+        app.start_observation_ready()
+        planner = app.target.planned_tcp_motion
+        original = planner.plan_chain(_vertical_goals(app),
+            cancel_requested=lambda: False, time_budget_sec=15)
+        refined = replace(original, trajectory_hash="test:refined-before-final-cut")
+        clock, cancelled, reads = [0.0], [False], []
+        model_qpos = planner._model_qpos
+
+        def read():
+            result = model_qpos()
+            reads.append(True)
+            if len(reads) == 2:
+                if cancel:
+                    cancelled[0] = True
+                else:
+                    clock[0] = 1.0
+            return result
+
+        monkeypatch.setattr(planner, "_model_qpos", read)
+        monkeypatch.setattr(planner, "plan_chain", lambda *args, **kwargs: refined)
+        with pytest.raises(MujocoTcpPlanRejected) as error:
+            planner.refine_pending_chain(original, (),
+                cancel_requested=lambda: cancelled[0], time_budget_sec=1.0,
+                deadline_at=10.0, monotonic=lambda: clock[0], validate_plan=lambda plan: None)
+        assert error.value.reason_code == (
+            "safe_tcp_planning_cancelled" if cancel else "safe_tcp_planning_budget_exhausted"
+        )
+        assert len(reads) == 2 and planner._pending_plan is original and not planner.active
+    finally:
+        assert session.close().accepted
+
+
+@pytest.mark.integration
 def test_native_query_and_execution_use_the_same_rig_then_planner_lock_order(
     monkeypatch,
 ):
