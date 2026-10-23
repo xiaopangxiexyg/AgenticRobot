@@ -587,6 +587,39 @@ INFO 日志分别记录 provider 的锁等待、采集准备、提案、标注�
 发布和总耗时。提案旧总字段仍包含机械臂筛选，新增排除该筛选的耗时不能与总值重复相加。
 失败保留原错误及已运行阶段的耗时，新请求清空旧阶段；这些本地阶段时钟不改变观测时间和 TTL。
 
+### 离线闭爪首触诊断
+
+`python -m scripts.probes.diagnose_grasp_closure --help` 提供独立、离线的末端闭爪实验。
+该工具不启动相机、网络、模型或真机，不是另一个运动生产入口；复用现有任务装配、
+工具标定、canonical IK 和 guarded MuJoCo rig。夹爪/机械臂在开始后的控制仍由原执行器负责。
+仅 reset fixture 可以直接设置初始 qpos。默认不试抬，显式 `--lift` 也只是原执行器内的局部
+3 cm 试抬，不代表完整接近路径、Gateway 接线、携物避障或物理抓稳验收。
+
+外部 JSON fixture 指定已有 `task_config`、`object_edge_m`、`object_center_world_m`、
+单位四元数 `object_quaternion_wxyz`、`support_width_m`、`object_pose_evidence`，以及命名
+`grasps`。每个 grasp 包含 `model_pose_world` 和 `qpos_by_side`（双臂各 6 个弧度值）。
+工具按明确尺寸构建方块和静态支撑体，不从图片推断真实质量；沿用任务的质量、摩擦和 servo。
+这是方块实验 fixture，不是任意形状的通用物理成功标签生成器。方块尺寸不写入生产抓姿规则。
+`--center A --orientation B` 固定的是已标定 GraspGenX model-origin，而非旧 TCP 或实测压力中心；
+交叉组合的端点局部 IK 默认共享 8 秒预算，失败如实保存，不修改目标或放宽容差。
+四组合的被动臂必须一致；输出保存实际选中 qpos、实测初始 TCP/model pose 和 FK 残差。
+
+新输出目录中 `events.jsonl` 逐次 flush 首次接触事件，`trace.jsonl` 每 40 个物理步保存一次轨迹
+（4000 Hz 时约 10 ms，1000 Hz 时约 40 ms）。每个成功返回的物理步均用于瞬时极值统计；
+若原执行器在故障步抛错，该步保留原拒绝原因，不保证生成完整接触行。
+记录包含左右首触时间、闭合进度、接触位置/力、物体与 TCP
+的运动，以及穿透量。闭合进度无量纲，不冒充毫米行程。MuJoCo 的接触位置是两表面的中点，
+诊断按 signed distance 和 geom 顺序恢复传感器碰撞体表面点，并保留完整接触坐标系与力方向。
+当前 implicit/Euler 步进的接触/力/派生位姿属于积分前求值，记录与同阶段的 qpos/时间配对，
+另留积分后时间；不为记日志在 live scene 额外调用 `mj_forward`，RK4 的多 stage 时序不受此工具支持。
+中断和早期失败尽可能保存 `result.json`；原始错误与各资源关闭失败分别记录，不用后者覆盖前者。
+
+传感器 body、内侧半空间、碰撞 box 内侧面、box 边缘和真实有效触觉垫片不是同一概念。
+工具将当前可见事实标为 collision face/edge，`physical_tactile_pad_membership` 始终为 unknown，
+直到存在经过审核的有限有效垫片定义。原 URDF 的传感器 collision box 不是自动获得的真实垫片合同。
+`--lift` 前连续双侧 body 受力只是复用实验的试抬条件，不是抓牢证明；大穿透、未知接触面或
+不准确物体假设必须单独评估，不能因脚本完成或方块上升就给生产候选增加成功标签。
+
 #### 线缆掩码诊断（离线，不改变碰撞场景）
 
 `deployments.perception.cable_diagnostics` 提供纯数组诊断，不启动模型或设备，也不接入生产删点：
