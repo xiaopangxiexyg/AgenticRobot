@@ -16,8 +16,10 @@ import json
 import math
 import sys
 import threading
+import time
 from collections.abc import Mapping
 from dataclasses import fields, is_dataclass, replace
+from functools import wraps
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
@@ -1200,11 +1202,13 @@ def test_inactive_joint_reference_and_original_drift_guard_are_preserved(
     planning = _load_offline(
         monkeypatch,
         "sim/mujoco/deploy/planned_tcp_motion.py",
-        names={"MujocoTcpPlanRejected", "MujocoPlannedTcpMotion"},
+        names={"MujocoTcpPlanRejected", "MujocoPlannedTcpMotion", "_scene_serialized"},
         namespace={
             "np": np,
             "math": math,
             "threading": threading,
+            "time": time,
+            "wraps": wraps,
             "xyzquat_to_matrix": xyzquat_to_pose_matrix,
             "IKResult": SimpleNamespace,
         },
@@ -1224,6 +1228,7 @@ def test_inactive_joint_reference_and_original_drift_guard_are_preserved(
     reference_pose = [0.2, -0.1, 0.3, 0, 0, 0, 1]
     active_q = qpos[addresses[side]] + 0.002
     planner._active = SimpleNamespace(
+        stages=(),
         reference_poses=(reference_pose,),
         trajectory=SimpleNamespace(q_rad=[active_q]),
         path=SimpleNamespace(
@@ -1236,6 +1241,7 @@ def test_inactive_joint_reference_and_original_drift_guard_are_preserved(
         payload_binding=None,
     )
     planner._reference_index = 0
+    planner._live_stage = planner._active
     check = SimpleNamespace(safe=True)
     planner._live_oracle = SimpleNamespace(
         source=SimpleNamespace(qpos=qpos.copy()),

@@ -429,6 +429,7 @@ def test_corner_progress_uses_the_selected_arm_measurement(monkeypatch, side):
     samples = np.array([q + i * 0.2 for i in range(4)])
     poses = tuple((float(i), 0., 0., 0., 0., 0., 1.) for i in range(4))
     planner._active = SimpleNamespace(
+        stages=(),
         trajectory=SimpleNamespace(q_rad=samples, timestamps=np.array([0., 1., 2., 3.]),
                                    waypoint_timestamps=np.array([0., 1., 3.])),
         reference_poses=poses,

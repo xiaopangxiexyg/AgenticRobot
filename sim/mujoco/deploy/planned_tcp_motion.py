@@ -479,7 +479,6 @@ class MujocoPlannedTcpMotion:
             component_ids=(self.component_id,),
         )[self.component_id]
 
-    @_scene_serialized()
     def plan(
         self,
         target_pose: tuple[float, ...],
@@ -519,327 +518,332 @@ class MujocoPlannedTcpMotion:
             raise ValueError("path_search_time_budget_sec must be finite and positive.")
         if isinstance(speed_scale, bool) or not math.isfinite(speed_scale) or not 0 < speed_scale <= 1:
             raise ValueError("speed_scale must be finite and in (0, 1].")
-        with self._lock:
-            if self._active is not None:
-                raise MujocoTcpPlanRejected("safe_tcp_another_plan_active")
-            preview = preview_model_qpos is not None
-            if not preview:
-                self._pending_plan = None
-            if cancel_requested():
-                raise MujocoTcpPlanRejected("safe_tcp_planning_cancelled")
-            if payload_binding is not None:
-                # Search is a frozen query; activation and every dispatch
-                # separately validate the current measured relation/geometry.
-                model_qpos = np.asarray(
-                    payload_binding.source_model_qpos if not preview else preview_model_qpos,
-                    dtype=float,
-                ).copy()
-            else:
-                model_qpos = (
-                    self._model_qpos() if not preview
-                    else np.asarray(preview_model_qpos, dtype=float).copy()
-                )
-            if model_qpos.shape != (self.scene.model.nq,) or not np.isfinite(model_qpos).all():
-                raise ValueError("Planning requires a finite complete model qpos cut.")
-            if contact_binding is not None:
-                if not isinstance(contact_binding, MujocoGraspContactBinding):
-                    raise TypeError("contact_binding must be a bound grasp contact policy.")
-                target_matrix = xyzquat_to_matrix(target_pose)
-                outer_constraint = configuration_constraint
-                constraint_identity = canonical_content_hash(
-                    {"envelope": constraint_identity, "contact": contact_binding.semantic_content_hash,
-                     "target_pose": target_pose}, domain="mujoco.grasp_terminal_constraint.v1")
-
-                def configuration_constraint(model_qpos, pair):
-                    if outer_constraint is not None:
-                        check = outer_constraint(model_qpos, pair)
-                        if not check.safe:
-                            return check
-                    pose = xyzquat_to_matrix(self.pose_for_configuration(model_qpos, pair))
-                    inside = contact_binding.in_corridor(pose, target_matrix)
-                    return JointConfigurationCheck(
-                        safe=inside, minimum_distance_m=None,
-                        reason=None if inside else "grasp_contact_outside_terminal_corridor",
-                        metadata=contact_binding.to_payload())
-            # Keep an explicit planning reserve for the physical gripper's
-            # small joint/servo motion. Live admission keeps the original
-            # scene margin; no collision threshold is reduced or bypassed.
-            oracle = MujocoJointSceneOracle(
-                self.scene,
-                model_qpos,
-                clearance_padding_m=self.planning_clearance_padding_m,
-                configuration_constraint=configuration_constraint,
-                constraint_identity=constraint_identity,
-                cancel_requested=cancel_requested,
-                contact_binding=contact_binding,
-                payload_binding=payload_binding,
-            )
-            start = {
-                side: model_qpos[address].copy()
-                for side, address in oracle.addresses.items()
-            }
-            initial = oracle.check(start)
-            if not initial.safe:
-                raise MujocoTcpPlanRejected("safe_tcp_start_blocked", initial.to_dict())
-            if self._solver is None:
-                self._solver = build_rm65_single_arm_ik_solver(
-                    RM65SingleArmIKConfig(controlled_frame="arm_endpoint")
-                )
-            solver = self._solver
-            offset = endpoint_to_tool_transform(
-                load_rm65_tool_profile(
-                    getattr(self.task_config, side + "_tool_profile_path"), side=side
-                )
-            )
-            measured = xyzquat_to_matrix(self.pose_for_configuration(model_qpos, start))
-            if payload_binding is not None:
-                self.scene.mujoco.mj_kinematics(self.scene.model, oracle.source)
-                world_tcp = payload_binding._tcp(oracle.source)
-                if not np.allclose(
-                    world_tcp, self.scene.body_pose(side + "_arm_base_link") @ measured,
-                    atol=1e-5, rtol=0,
-                ):
-                    raise MujocoTcpPlanRejected("safe_tcp_payload_tool_frame_mismatch")
-            if not np.allclose(
-                solver.compute_pose(start[side]) @ offset, measured, atol=1e-5
-            ):
-                raise MujocoTcpPlanRejected("safe_tcp_ik_model_tool_mismatch")
-            goal = xyzquat_to_matrix(target_pose)
-            endpoint_goal = goal @ np.linalg.inv(offset)
-            rng = np.random.default_rng(0)
-            seeds = [start[side], np.clip(np.zeros(6), solver.q_min, solver.q_max)]
-            seeds.extend(rng.uniform(solver.q_min, solver.q_max) for _ in range(6))
-            targets = []
-            endpoint_attempts = []
-            quality_limits = DEFAULT_PATH_MOTION_QUALITY_LIMITS
-            deadline = time.perf_counter() + 2.0
-            for seed_index, seed in enumerate(seeds):
+        def capture(_scene):
+            nonlocal configuration_constraint, constraint_identity
+            with self._lock:
+                if self._active is not None:
+                    raise MujocoTcpPlanRejected("safe_tcp_another_plan_active")
+                preview = preview_model_qpos is not None
+                if not preview:
+                    self._pending_plan = None
                 if cancel_requested():
                     raise MujocoTcpPlanRejected("safe_tcp_planning_cancelled")
-                if time.perf_counter() >= deadline:
-                    break
-                q = solver.solve_iterative(
-                    target_pose=endpoint_goal,
-                    q_init=seed,
-                    max_iterations=100,
-                    max_joint_step=0.2,
-                    damping=0.01,
-                    tolerance=1e-5,
-                    deadline_monotonic=deadline,
+                if payload_binding is not None:
+                    # Search is a frozen query; activation and every dispatch
+                    # separately validate the current measured relation/geometry.
+                    model_qpos = np.asarray(
+                        payload_binding.source_model_qpos if not preview else preview_model_qpos,
+                        dtype=float,
+                    ).copy()
+                else:
+                    model_qpos = (
+                        self._model_qpos() if not preview
+                        else np.asarray(preview_model_qpos, dtype=float).copy()
+                    )
+                if model_qpos.shape != (self.scene.model.nq,) or not np.isfinite(model_qpos).all():
+                    raise ValueError("Planning requires a finite complete model qpos cut.")
+                if contact_binding is not None:
+                    if not isinstance(contact_binding, MujocoGraspContactBinding):
+                        raise TypeError("contact_binding must be a bound grasp contact policy.")
+                    target_matrix = xyzquat_to_matrix(target_pose)
+                    outer_constraint = configuration_constraint
+                    constraint_identity = canonical_content_hash(
+                        {"envelope": constraint_identity, "contact": contact_binding.semantic_content_hash,
+                         "target_pose": target_pose}, domain="mujoco.grasp_terminal_constraint.v1")
+
+                    def configuration_constraint(model_qpos, pair):
+                        if outer_constraint is not None:
+                            check = outer_constraint(model_qpos, pair)
+                            if not check.safe:
+                                return check
+                        pose = xyzquat_to_matrix(self.pose_for_configuration(model_qpos, pair))
+                        inside = contact_binding.in_corridor(pose, target_matrix)
+                        return JointConfigurationCheck(
+                            safe=inside, minimum_distance_m=None,
+                            reason=None if inside else "grasp_contact_outside_terminal_corridor",
+                            metadata=contact_binding.to_payload())
+                # Keep an explicit planning reserve for the physical gripper's
+                # small joint/servo motion. Live admission keeps the original
+                # scene margin; no collision threshold is reduced or bypassed.
+                oracle = MujocoJointSceneOracle(
+                    self.scene,
+                    model_qpos,
+                    clearance_padding_m=self.planning_clearance_padding_m,
+                    configuration_constraint=configuration_constraint,
+                    constraint_identity=constraint_identity,
+                    cancel_requested=cancel_requested,
+                    contact_binding=contact_binding,
+                    payload_binding=payload_binding,
                 )
-                pair = {**start, side: np.asarray(q)}
-                actual = xyzquat_to_matrix(
-                    self.pose_for_configuration(model_qpos, pair)
-                )
-                position_error = float(np.linalg.norm(actual[:3, 3] - goal[:3, 3]))
-                angle = float(
-                    np.arccos(
-                        np.clip(
-                            (np.trace(actual[:3, :3].T @ goal[:3, :3]) - 1) / 2, -1, 1
-                        )
+                start = {
+                    side: model_qpos[address].copy()
+                    for side, address in oracle.addresses.items()
+                }
+                initial = oracle.check(start)
+                if not initial.safe:
+                    raise MujocoTcpPlanRejected("safe_tcp_start_blocked", initial.to_dict())
+                if self._solver is None:
+                    self._solver = build_rm65_single_arm_ik_solver(
+                        RM65SingleArmIKConfig(controlled_frame="arm_endpoint")
+                    )
+                solver = self._solver
+                offset = endpoint_to_tool_transform(
+                    load_rm65_tool_profile(
+                        getattr(self.task_config, side + "_tool_profile_path"), side=side
                     )
                 )
-                if (
-                    position_error <= translation_tolerance_m
-                    and angle <= rotation_tolerance_rad
-                ):
-                    delta = np.abs(pair[side] - start[side])
-                    compact = float(np.max(delta[:3])) <= quality_limits.maximum_proximal_joint_travel_rad
-                    safe = oracle.check(pair).safe
-                    endpoint_attempts.append({
-                        "seed_index": seed_index,
-                        "joint_net_delta_deg": np.rad2deg(pair[side] - start[side]).tolist(),
-                        "position_error_m": position_error,
-                        "rotation_error_rad": angle,
-                        "collision_and_constraint_safe": safe,
-                        "proximal_travel_within_limit": compact,
-                    })
-                    if safe and compact and not any(
-                        np.max(np.abs(other[side] - pair[side])) < 0.001 for other in targets
+                measured = xyzquat_to_matrix(self.pose_for_configuration(model_qpos, start))
+                if payload_binding is not None:
+                    self.scene.mujoco.mj_kinematics(self.scene.model, oracle.source)
+                    world_tcp = payload_binding._tcp(oracle.source)
+                    if not np.allclose(
+                        world_tcp, self.scene.body_pose(side + "_arm_base_link") @ measured,
+                        atol=1e-5, rtol=0,
                     ):
-                        targets.append(pair)
-                    # Zero travel is the only provable minimum; a converged
-                    # current-state seed is not generally the closest branch.
-                    if safe and float(np.max(delta)) < 1e-8:
-                        break
-            if not targets:
-                quality_rejected = any(
-                    item["collision_and_constraint_safe"] and not item["proximal_travel_within_limit"]
-                    for item in endpoint_attempts
-                )
-                raise MujocoTcpPlanRejected(
-                    "safe_tcp_motion_quality_exceeded" if quality_rejected
-                    else "safe_tcp_target_blocked" if endpoint_attempts
-                    else "safe_tcp_endpoint_search_exhausted",
-                    {"endpoint_attempts": endpoint_attempts, "motion_quality_limits": quality_limits.to_dict()},
-                )
-            velocity = np.minimum(
-                np.asarray(self.rig.config.max_velocity_rad_s),
-                np.deg2rad(self.rig.config.max_command_step_deg) * self.rig.config.timing.command_hz,
-            )
-            targets.sort(key=lambda pair: (
-                float(np.max(np.abs(pair[side] - start[side]) / velocity)),
-                float(np.max(np.abs(pair[side][:3] - start[side][:3]))),
-                float(np.linalg.norm(pair[side] - start[side])),
-            ))
-            world_from_base = self.scene.body_pose(side + "_arm_base_link")
-
-            def world_pose(pair):
-                return world_from_base @ xyzquat_to_matrix(self.pose_for_configuration(model_qpos, pair))
-
-            search_deadline = time.perf_counter() + path_search_time_budget_sec
-            rejected_paths = []
-            while targets:
-                remaining = search_deadline - time.perf_counter()
-                if remaining <= 0:
-                    raise MujocoTcpPlanRejected("safe_tcp_path_search_exhausted", {"rejected_paths": rejected_paths})
-                path = plan_collision_aware_joint_path(
-                    start_qpos_by_component=start,
-                    target_qpos_by_component=targets[0],
-                    alternative_target_qpos_by_component=targets[1:],
-                    movable_components=(side,), oracle=oracle,
-                    config=JointPathPlannerConfig(
-                        time_budget_sec=remaining, edge_resolution_rad=0.01,
-                        adaptive_edge_resolution_rad=0.002, adaptive_refinement_distance_m=0.01,
-                    ),
-                    joint_lower_by_component={side: solver.q_min},
-                    joint_upper_by_component={side: solver.q_max}, scene_hash=oracle.scene_hash,
-                    edge_cost=lambda a, b: tcp_path_edge_cost(a, b, side=side,
-                        pose_for_pair=world_pose, step_rad=0.1),
-                )
-                if not path.path_found:
-                    break
-                samples = [path.waypoints[0][side]]
-                for a, b in zip(path.waypoints, path.waypoints[1:]):
-                    count = max(1, math.ceil(float(np.max(np.abs(b[side] - a[side]))) / 0.01))
-                    samples.extend(a[side] + alpha * (b[side] - a[side])
-                        for alpha in np.linspace(0, 1, count + 1)[1:])
-                xyz = []
-                for sample in samples:
+                        raise MujocoTcpPlanRejected("safe_tcp_payload_tool_frame_mismatch")
+                if not np.allclose(
+                    solver.compute_pose(start[side]) @ offset, measured, atol=1e-5
+                ):
+                    raise MujocoTcpPlanRejected("safe_tcp_ik_model_tool_mismatch")
+                goal = xyzquat_to_matrix(target_pose)
+                endpoint_goal = goal @ np.linalg.inv(offset)
+                rng = np.random.default_rng(0)
+                seeds = [start[side], np.clip(np.zeros(6), solver.q_min, solver.q_max)]
+                seeds.extend(rng.uniform(solver.q_min, solver.q_max) for _ in range(6))
+                targets = []
+                endpoint_attempts = []
+                quality_limits = DEFAULT_PATH_MOTION_QUALITY_LIMITS
+                deadline = time.perf_counter() + 2.0
+                for seed_index, seed in enumerate(seeds):
                     if cancel_requested():
                         raise MujocoTcpPlanRejected("safe_tcp_planning_cancelled")
-                    xyz.append(world_pose({**start, side: sample})[:3, 3])
-                quality = sampled_path_motion_quality(np.asarray(samples), np.asarray(xyz))
-                if not quality_limits.exceeded(quality):
-                    break
-                rejected_paths.append({"motion_quality": quality, "path_hash": path.semantic_content_hash})
-                targets = [item for item in targets if not np.array_equal(
-                    item[side], path.target_qpos_by_component[side])]
-            else:
-                raise MujocoTcpPlanRejected("safe_tcp_motion_quality_exceeded",
-                    {"rejected_paths": rejected_paths, "motion_quality_limits": quality_limits.to_dict()})
-            if cancel_requested():
-                raise MujocoTcpPlanRejected("safe_tcp_planning_cancelled")
-            if not path.path_found:
-                raise MujocoTcpPlanRejected(
-                    f"safe_tcp_{path.status.value}", path.to_dict()
+                    if time.perf_counter() >= deadline:
+                        break
+                    q = solver.solve_iterative(
+                        target_pose=endpoint_goal,
+                        q_init=seed,
+                        max_iterations=100,
+                        max_joint_step=0.2,
+                        damping=0.01,
+                        tolerance=1e-5,
+                        deadline_monotonic=deadline,
+                    )
+                    pair = {**start, side: np.asarray(q)}
+                    actual = xyzquat_to_matrix(
+                        self.pose_for_configuration(model_qpos, pair)
+                    )
+                    position_error = float(np.linalg.norm(actual[:3, 3] - goal[:3, 3]))
+                    angle = float(
+                        np.arccos(
+                            np.clip(
+                                (np.trace(actual[:3, :3].T @ goal[:3, :3]) - 1) / 2, -1, 1
+                            )
+                        )
+                    )
+                    if (
+                        position_error <= translation_tolerance_m
+                        and angle <= rotation_tolerance_rad
+                    ):
+                        delta = np.abs(pair[side] - start[side])
+                        compact = float(np.max(delta[:3])) <= quality_limits.maximum_proximal_joint_travel_rad
+                        safe = oracle.check(pair).safe
+                        endpoint_attempts.append({
+                            "seed_index": seed_index,
+                            "joint_net_delta_deg": np.rad2deg(pair[side] - start[side]).tolist(),
+                            "position_error_m": position_error,
+                            "rotation_error_rad": angle,
+                            "collision_and_constraint_safe": safe,
+                            "proximal_travel_within_limit": compact,
+                        })
+                        if safe and compact and not any(
+                            np.max(np.abs(other[side] - pair[side])) < 0.001 for other in targets
+                        ):
+                            targets.append(pair)
+                        # Zero travel is the only provable minimum; a converged
+                        # current-state seed is not generally the closest branch.
+                        if safe and float(np.max(delta)) < 1e-8:
+                            break
+                if not targets:
+                    quality_rejected = any(
+                        item["collision_and_constraint_safe"] and not item["proximal_travel_within_limit"]
+                        for item in endpoint_attempts
+                    )
+                    raise MujocoTcpPlanRejected(
+                        "safe_tcp_motion_quality_exceeded" if quality_rejected
+                        else "safe_tcp_target_blocked" if endpoint_attempts
+                        else "safe_tcp_endpoint_search_exhausted",
+                        {"endpoint_attempts": endpoint_attempts, "motion_quality_limits": quality_limits.to_dict()},
+                    )
+                velocity = np.minimum(
+                    np.asarray(self.rig.config.max_velocity_rad_s),
+                    np.deg2rad(self.rig.config.max_command_step_deg) * self.rig.config.timing.command_hz,
                 )
-            q = np.asarray([point[side] for point in path.waypoints])
-            if q.shape[0] == 1:
-                q = np.repeat(q, 2, axis=0)
-            velocity = np.minimum(
-                np.asarray(self.rig.config.max_velocity_rad_s),
-                np.deg2rad(self.rig.config.max_command_step_deg)
-                * self.rig.config.timing.command_hz,
-            )
-            velocity = velocity * speed_scale
-            acceleration = np.asarray(self.rig.config.max_acceleration_rad_s2) * speed_scale**2
-            with np.errstate(divide="ignore", over="ignore", invalid="ignore"):
-                intervals = np.maximum(
-                    0.2, np.max(np.abs(np.diff(q, axis=0)) / velocity, axis=1)
-                )
-            source_duration = float(np.sum(intervals))
-            _require_bounded_grid(source_duration, self.reference_hz)
-            limits = JointHorizonLimits(
-                min_position_rad=solver.q_min,
-                max_position_rad=solver.q_max,
-                max_velocity_rad_s=velocity,
-                max_acceleration_rad_s2=acceleration,
-                max_jerk_rad_s3=acceleration * speed_scale / self.rig.config.velocity_ramp_sec,
-            )
-            retimed = build_offline_quintic_waypoint_trajectory(
-                np.concatenate(([0.0], np.cumsum(intervals))),
-                q,
-                command_hz=self.reference_hz,
-                limits=limits,
-                timing_mode="safe_retime_global",
-                max_time_scale=min(100.0, _trajectory_duration_limit(self.reference_hz) / source_duration),
-                stop_at_waypoints=True,
-            )
-            # Keep RRT corners on the actual reference clock. Otherwise an
-            # executor could connect the samples on opposite sides of a knot
-            # and cut the verified corner even with zero knot velocities.
-            ticks = np.ceil(np.diff(retimed.waypoint_timestamps) * self.reference_hz)
-            _require_bounded_grid(float(np.sum(ticks)) / self.reference_hz, self.reference_hz)
-            trajectory = build_offline_quintic_waypoint_trajectory(
-                np.concatenate(([0.0], np.cumsum(ticks) / self.reference_hz)),
-                q,
-                command_hz=self.reference_hz,
-                limits=limits,
-                stop_at_waypoints=True,
-            )
-            poses = []
-            for index, current in enumerate(trajectory.q_rad):
+                targets.sort(key=lambda pair: (
+                    float(np.max(np.abs(pair[side] - start[side]) / velocity)),
+                    float(np.max(np.abs(pair[side][:3] - start[side][:3]))),
+                    float(np.linalg.norm(pair[side] - start[side])),
+                ))
+                world_from_base = self.scene.body_pose(side + "_arm_base_link")
+
+                def world_pose(pair):
+                    return world_from_base @ xyzquat_to_matrix(self.pose_for_configuration(model_qpos, pair))
+
+                search_deadline = time.perf_counter() + path_search_time_budget_sec
+                rejected_paths = []
+                while targets:
+                    remaining = search_deadline - time.perf_counter()
+                    if remaining <= 0:
+                        raise MujocoTcpPlanRejected("safe_tcp_path_search_exhausted", {"rejected_paths": rejected_paths})
+                    path = plan_collision_aware_joint_path(
+                        start_qpos_by_component=start,
+                        target_qpos_by_component=targets[0],
+                        alternative_target_qpos_by_component=targets[1:],
+                        movable_components=(side,), oracle=oracle,
+                        config=JointPathPlannerConfig(
+                            time_budget_sec=remaining, edge_resolution_rad=0.01,
+                            adaptive_edge_resolution_rad=0.002, adaptive_refinement_distance_m=0.01,
+                        ),
+                        joint_lower_by_component={side: solver.q_min},
+                        joint_upper_by_component={side: solver.q_max}, scene_hash=oracle.scene_hash,
+                        edge_cost=lambda a, b: tcp_path_edge_cost(a, b, side=side,
+                            pose_for_pair=world_pose, step_rad=0.1),
+                    )
+                    if not path.path_found:
+                        break
+                    samples = [path.waypoints[0][side]]
+                    for a, b in zip(path.waypoints, path.waypoints[1:]):
+                        count = max(1, math.ceil(float(np.max(np.abs(b[side] - a[side]))) / 0.01))
+                        samples.extend(a[side] + alpha * (b[side] - a[side])
+                            for alpha in np.linspace(0, 1, count + 1)[1:])
+                    xyz = []
+                    for sample in samples:
+                        if cancel_requested():
+                            raise MujocoTcpPlanRejected("safe_tcp_planning_cancelled")
+                        xyz.append(world_pose({**start, side: sample})[:3, 3])
+                    quality = sampled_path_motion_quality(np.asarray(samples), np.asarray(xyz))
+                    if not quality_limits.exceeded(quality):
+                        break
+                    rejected_paths.append({"motion_quality": quality, "path_hash": path.semantic_content_hash})
+                    targets = [item for item in targets if not np.array_equal(
+                        item[side], path.target_qpos_by_component[side])]
+                else:
+                    raise MujocoTcpPlanRejected("safe_tcp_motion_quality_exceeded",
+                        {"rejected_paths": rejected_paths, "motion_quality_limits": quality_limits.to_dict()})
                 if cancel_requested():
                     raise MujocoTcpPlanRejected("safe_tcp_planning_cancelled")
-                pair = {**start, side: current}
-                # Smoothing may leave the polyline. Recheck each reference and
-                # every intervening joint-space edge, not only the waypoints.
-                previous = trajectory.q_rad[max(0, index - 1)]
-                count = max(
-                    1, math.ceil(float(np.max(np.abs(current - previous))) / 0.01)
-                )
-                for alpha in np.linspace(0, 1, count + 1):
-                    check = oracle.check(
-                        {**pair, side: previous + alpha * (current - previous)}
+                if not path.path_found:
+                    raise MujocoTcpPlanRejected(
+                        f"safe_tcp_{path.status.value}", path.to_dict()
                     )
-                    if not check.safe:
-                        raise MujocoTcpPlanRejected(
-                            "safe_tcp_retimed_path_blocked",
-                            {
-                                "reference_index": index,
-                                "edge_alpha": float(alpha),
-                                "check": check.to_dict(),
-                                "path_metadata": dict(path.metadata),
-                            },
+                q = np.asarray([point[side] for point in path.waypoints])
+                if q.shape[0] == 1:
+                    q = np.repeat(q, 2, axis=0)
+                velocity = np.minimum(
+                    np.asarray(self.rig.config.max_velocity_rad_s),
+                    np.deg2rad(self.rig.config.max_command_step_deg)
+                    * self.rig.config.timing.command_hz,
+                )
+                velocity = velocity * speed_scale
+                acceleration = np.asarray(self.rig.config.max_acceleration_rad_s2) * speed_scale**2
+                with np.errstate(divide="ignore", over="ignore", invalid="ignore"):
+                    intervals = np.maximum(
+                        0.2, np.max(np.abs(np.diff(q, axis=0)) / velocity, axis=1)
+                    )
+                source_duration = float(np.sum(intervals))
+                _require_bounded_grid(source_duration, self.reference_hz)
+                limits = JointHorizonLimits(
+                    min_position_rad=solver.q_min,
+                    max_position_rad=solver.q_max,
+                    max_velocity_rad_s=velocity,
+                    max_acceleration_rad_s2=acceleration,
+                    max_jerk_rad_s3=acceleration * speed_scale / self.rig.config.velocity_ramp_sec,
+                )
+                retimed = build_offline_quintic_waypoint_trajectory(
+                    np.concatenate(([0.0], np.cumsum(intervals))),
+                    q,
+                    command_hz=self.reference_hz,
+                    limits=limits,
+                    timing_mode="safe_retime_global",
+                    max_time_scale=min(100.0, _trajectory_duration_limit(self.reference_hz) / source_duration),
+                    stop_at_waypoints=True,
+                )
+                # Keep RRT corners on the actual reference clock. Otherwise an
+                # executor could connect the samples on opposite sides of a knot
+                # and cut the verified corner even with zero knot velocities.
+                ticks = np.ceil(np.diff(retimed.waypoint_timestamps) * self.reference_hz)
+                _require_bounded_grid(float(np.sum(ticks)) / self.reference_hz, self.reference_hz)
+                trajectory = build_offline_quintic_waypoint_trajectory(
+                    np.concatenate(([0.0], np.cumsum(ticks) / self.reference_hz)),
+                    q,
+                    command_hz=self.reference_hz,
+                    limits=limits,
+                    stop_at_waypoints=True,
+                )
+                poses = []
+                for index, current in enumerate(trajectory.q_rad):
+                    if cancel_requested():
+                        raise MujocoTcpPlanRejected("safe_tcp_planning_cancelled")
+                    pair = {**start, side: current}
+                    # Smoothing may leave the polyline. Recheck each reference and
+                    # every intervening joint-space edge, not only the waypoints.
+                    previous = trajectory.q_rad[max(0, index - 1)]
+                    count = max(
+                        1, math.ceil(float(np.max(np.abs(current - previous))) / 0.01)
+                    )
+                    for alpha in np.linspace(0, 1, count + 1):
+                        check = oracle.check(
+                            {**pair, side: previous + alpha * (current - previous)}
                         )
-                poses.append(
-                    tuple(
-                        float(item)
-                        for item in self.pose_for_configuration(model_qpos, pair)
+                        if not check.safe:
+                            raise MujocoTcpPlanRejected(
+                                "safe_tcp_retimed_path_blocked",
+                                {
+                                    "reference_index": index,
+                                    "edge_alpha": float(alpha),
+                                    "check": check.to_dict(),
+                                    "path_metadata": dict(path.metadata),
+                                },
+                            )
+                    poses.append(
+                        tuple(
+                            float(item)
+                            for item in self.pose_for_configuration(model_qpos, pair)
+                        )
                     )
+                quality = sampled_path_motion_quality(trajectory.q_rad, np.asarray([
+                    (world_from_base @ xyzquat_to_matrix(pose))[:3, 3] for pose in poses
+                ]))
+                if quality_limits.exceeded(quality):
+                    raise MujocoTcpPlanRejected("safe_tcp_motion_quality_exceeded", {"motion_quality": quality})
+                path = replace(path, metadata={**dict(path.metadata), "motion_quality": quality,
+                    "motion_quality_limits": quality_limits.to_dict(), "endpoint_attempts": endpoint_attempts,
+                    "quality_rejected_paths": rejected_paths})
+                identity = canonical_content_hash(
+                    {
+                        "path": path.semantic_content_hash,
+                        "timestamps": trajectory.timestamps.tolist(),
+                        "q": trajectory.q_rad.tolist(),
+                    },
+                    domain="dexteleop.mujoco.safe_tcp_joint_trajectory.v1",
                 )
-            quality = sampled_path_motion_quality(trajectory.q_rad, np.asarray([
-                (world_from_base @ xyzquat_to_matrix(pose))[:3, 3] for pose in poses
-            ]))
-            if quality_limits.exceeded(quality):
-                raise MujocoTcpPlanRejected("safe_tcp_motion_quality_exceeded", {"motion_quality": quality})
-            path = replace(path, metadata={**dict(path.metadata), "motion_quality": quality,
-                "motion_quality_limits": quality_limits.to_dict(), "endpoint_attempts": endpoint_attempts,
-                "quality_rejected_paths": rejected_paths})
-            identity = canonical_content_hash(
-                {
-                    "path": path.semantic_content_hash,
-                    "timestamps": trajectory.timestamps.tolist(),
-                    "q": trajectory.q_rad.tolist(),
-                },
-                domain="dexteleop.mujoco.safe_tcp_joint_trajectory.v1",
-            )
-            model_qpos.setflags(write=False)
-            plan = MujocoTcpMotionPlan(
-                path,
-                trajectory,
-                model_qpos,
-                tuple(poses),
-                identity,
-                configuration_constraint,
-                constraint_identity,
-                contact_binding,
-                payload_binding,
-            )
-            if not preview:
-                self._pending_plan = plan
-            return plan
+                model_qpos.setflags(write=False)
+                plan = MujocoTcpMotionPlan(
+                    path,
+                    trajectory,
+                    model_qpos,
+                    tuple(poses),
+                    identity,
+                    configuration_constraint,
+                    constraint_identity,
+                    contact_binding,
+                    payload_binding,
+                )
+                if not preview:
+                    self._pending_plan = plan
+                return plan
+
+
+        return self.rig.capture_scene(capture)
 
     @_scene_serialized(total_budget=True)
     def plan_chain(
@@ -1068,7 +1072,7 @@ class MujocoPlannedTcpMotion:
             payload_binding=stage.payload_binding,
         )
 
-    def _bind_live_stage(self, stage, oracle):
+    def _bind_live_stage(self, stage, oracle, *, bind_noncontact=True):
         if stage.payload_binding is not None:
             def bind_payload(scene):
                 pair = scene.arm_qpos_by_side()
@@ -1079,10 +1083,11 @@ class MujocoPlannedTcpMotion:
                 self.rig.set_additional_contact_oracle(stage.payload_binding.contact_oracle(scene))
 
             self.rig.capture_scene(bind_payload)
-        else:
+            self._contact_guard_bound = True
+        elif stage.contact_binding is not None or bind_noncontact:
             # Noncontact stages retain their stricter hand/object policy too.
             self.rig.set_additional_contact_oracle(oracle.projector.oracle)
-        self._contact_guard_bound = True
+            self._contact_guard_bound = True
         self._live_stage = stage
         self._live_oracle = oracle
 
@@ -1118,7 +1123,7 @@ class MujocoPlannedTcpMotion:
                 timestamp = float(clock())
                 if not math.isfinite(timestamp) or timestamp >= deadline_at:
                     raise MujocoTcpPlanRejected("grasp_path_plan_expired")
-            self._bind_live_stage(stage, oracle)
+            self._bind_live_stage(stage, oracle, bind_noncontact=bool(plan.stages))
             self._active = plan
             self._pending_plan = None
             self._reference_index = -1
@@ -1146,25 +1151,28 @@ class MujocoPlannedTcpMotion:
         # Never regenerate the frozen hand-object relation from this cut.
         scene.mujoco.mj_copyData(oracle.source, scene.model, scene.data)
 
-    @_scene_serialized()
     def check_measured_contact(self, binding, target_pose) -> JointConfigurationCheck:
         """Check right-hand geometry, including after HOLD cleared the plan."""
         if self.motion_side == "left":
             raise MujocoTcpPlanRejected("safe_tcp_left_grasp_contact_unsupported")
-        with self._lock:
-            model_qpos = self._model_qpos()
-            oracle = MujocoJointSceneOracle(self.scene, model_qpos, contact_binding=binding)
-            pair = {side: model_qpos[address] for side, address in oracle.addresses.items()}
-            check = oracle.check(pair)
-            if not check.safe:
+        def capture(_scene):
+            with self._lock:
+                model_qpos = self._model_qpos()
+                oracle = MujocoJointSceneOracle(self.scene, model_qpos, contact_binding=binding)
+                pair = {side: model_qpos[address] for side, address in oracle.addresses.items()}
+                check = oracle.check(pair)
+                if not check.safe:
+                    return check
+                pose = xyzquat_to_matrix(self.pose_for_configuration(model_qpos, pair))
+                if not binding.in_corridor(pose, xyzquat_to_matrix(target_pose)):
+                    return JointConfigurationCheck(
+                        safe=False, minimum_distance_m=None,
+                        reason="grasp_contact_measured_outside_terminal_corridor",
+                        metadata=binding.to_payload())
                 return check
-            pose = xyzquat_to_matrix(self.pose_for_configuration(model_qpos, pair))
-            if not binding.in_corridor(pose, xyzquat_to_matrix(target_pose)):
-                return JointConfigurationCheck(
-                    safe=False, minimum_distance_m=None,
-                    reason="grasp_contact_measured_outside_terminal_corridor",
-                    metadata=binding.to_payload())
-            return check
+
+
+        return self.rig.capture_scene(capture)
 
     @property
     def active(self) -> bool:
@@ -1262,7 +1270,7 @@ class MujocoPlannedTcpMotion:
             oracle.source.qpos[:] = self._model_qpos()
             result = self._resolve_checked_reference(plan, index, q, oracle)
             if stage is not self._live_stage:
-                self._bind_live_stage(stage, oracle)
+                self._bind_live_stage(stage, oracle, bind_noncontact=bool(plan.stages))
             return result
 
     def _resolve_checked_reference(self, plan, index, q, oracle) -> IKResult:

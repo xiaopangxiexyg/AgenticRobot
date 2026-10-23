@@ -736,9 +736,9 @@ def test_full_grasp_chain_keeps_contact_rights_only_in_terminal_stage(
         # observe the same owner's stage publication instead of replacing it.
         original_bind = planner._bind_live_stage
 
-        def bind(stage, oracle):
+        def bind(stage, oracle, **kwargs):
             policies.append(stage.contact_binding is not None)
-            return original_bind(stage, oracle)
+            return original_bind(stage, oracle, **kwargs)
 
         monkeypatch.setattr(planner, "_bind_live_stage", bind)
         admitted = adapter.submit_skill_request(
