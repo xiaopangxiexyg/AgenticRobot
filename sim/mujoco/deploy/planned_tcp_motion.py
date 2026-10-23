@@ -43,12 +43,13 @@ from robot_motion.rm65 import (
     load_rm65_tool_profile,
 )
 from sim.mujoco.collision_safety import (
-    CollisionSafetyPolicy,
     KinematicCollisionProjector,
 )
+from sim.mujoco.collision_safety.policy import NonContactObjectMovePolicy
 from sim.mujoco.ik import IKResult
 
 from .grasp_contact import MujocoGraspContactBinding
+from .payload_motion import MujocoPayloadBinding, MujocoPayloadProjector
 
 
 class MujocoTcpPlanRejected(RuntimeError):
@@ -63,21 +64,8 @@ ConfigurationConstraint = Callable[
 ]
 
 
-@dataclass(frozen=True)
-class _NonContactMovePolicy(CollisionSafetyPolicy):
-    @property
-    def distance_query_limit_m(self) -> float:
-        # Match the existing exact-shadow admission query: broad-radius GJK
-        # diagnostics may report zero for separated convex CAD meshes. This
-        # is a clipped clearance lower bound, not a measured distance. The
-        # required prevention margin itself is unchanged.
-        return float(self.minimum_clearance_m)
-
-    def pair_is_forbidden(self, first_group: int, second_group: int) -> bool:
-        # A free-space move has no grasp-stage permission to touch an object.
-        return super().pair_is_forbidden(first_group, second_group) or frozenset(
-            (int(first_group), int(second_group))
-        ) == frozenset((4, 8))
+# Preserve the historical private import as the same canonical policy type.
+_NonContactMovePolicy = NonContactObjectMovePolicy
 
 
 class MujocoJointSceneOracle:
@@ -93,7 +81,14 @@ class MujocoJointSceneOracle:
         constraint_identity: str | None = None,
         cancel_requested: Callable[[], bool] | None = None,
         contact_binding: MujocoGraspContactBinding | None = None,
+        payload_binding: MujocoPayloadBinding | None = None,
     ):
+        if payload_binding is not None and not isinstance(payload_binding, MujocoPayloadBinding):
+            raise TypeError("payload_binding must be a measured MujocoPayloadBinding.")
+        if payload_binding is not None and contact_binding is not None:
+            raise ValueError("Terminal grasp contact and attached payload are distinct operation bindings.")
+        if payload_binding is not None:
+            payload_binding.validate_planning_source(scene, model_qpos)
         if (configuration_constraint is None) != (constraint_identity is None):
             raise ValueError(
                 "Configuration constraint and identity must be bound together."
@@ -110,12 +105,15 @@ class MujocoJointSceneOracle:
         self.constraint_identity = constraint_identity
         self.cancel_requested = cancel_requested
         self.contact_binding = contact_binding
+        self.payload_binding = payload_binding
         clearance_padding_m = float(clearance_padding_m)
         if not math.isfinite(clearance_padding_m) or clearance_padding_m < 0:
             raise ValueError("clearance_padding_m must be finite and non-negative.")
         self.scene = scene
         self.source = scene.mujoco.MjData(scene.model)
         self.source.qpos[:] = model_qpos
+        if payload_binding is not None:
+            payload_binding._restore_planning_auxiliary_state(self.source)
         self.addresses = {
             side: np.asarray(
                 [
@@ -129,18 +127,17 @@ class MujocoJointSceneOracle:
         original = scene.collision_projector()
         if original is None or not original.oracle.forbidden_pair_count:
             raise MujocoTcpPlanRejected("safe_tcp_collision_geometry_unavailable")
-        self.projector = KinematicCollisionProjector(
-            scene.mujoco,
-            scene.model,
-            np.concatenate(tuple(self.addresses.values())),
-            _NonContactMovePolicy(
-                **{
-                    **vars(original.policy),
-                    "minimum_clearance_m": original.policy.minimum_clearance_m
-                    + clearance_padding_m,
-                }
-            ),
-            pair_clearance_m=(None if contact_binding is None else contact_binding.pair_clearances(scene)),
+        policy = _NonContactMovePolicy(
+            **{
+                **vars(original.policy),
+                "minimum_clearance_m": original.policy.minimum_clearance_m + clearance_padding_m,
+            }
+        )
+        indices = np.concatenate(tuple(self.addresses.values()))
+        self.projector = (
+            KinematicCollisionProjector(scene.mujoco, scene.model, indices, policy,
+                pair_clearance_m=(None if contact_binding is None else contact_binding.pair_clearances(scene)))
+            if payload_binding is None else MujocoPayloadProjector(scene, indices, policy, payload_binding)
         )
         payload = {
             "model_qpos": np.asarray(model_qpos).tolist(),
@@ -153,6 +150,8 @@ class MujocoJointSceneOracle:
             payload["configuration_constraint"] = constraint_identity
         if contact_binding is not None:
             payload["contact_binding"] = contact_binding.to_payload()
+        if payload_binding is not None:
+            payload["payload_binding"] = payload_binding.to_payload()
         self.scene_hash = canonical_content_hash(
             payload,
             domain="dexteleop.mujoco.safe_tcp_scene.v1",
@@ -182,7 +181,7 @@ class MujocoJointSceneOracle:
                 # distance. Zero requests the planner's finest existing edge
                 # sampling; it does not reinterpret contact as free space.
                 **({"adaptive_edge_distance_m": max(0.0, distance)}
-                   if self.contact_binding is not None else {}),
+                   if self.contact_binding is not None or self.payload_binding is not None else {}),
             },
         )
 
@@ -198,6 +197,7 @@ class MujocoTcpMotionPlan:
     configuration_constraint: ConfigurationConstraint | None = None
     constraint_identity: str | None = None
     contact_binding: MujocoGraspContactBinding | None = None
+    payload_binding: MujocoPayloadBinding | None = None
 
 
 class MujocoPlannedTcpMotion:
@@ -271,9 +271,22 @@ class MujocoPlannedTcpMotion:
         constraint_identity: str | None = None,
         path_search_time_budget_sec: float = 3.0,
         contact_binding: MujocoGraspContactBinding | None = None,
+        payload_binding: MujocoPayloadBinding | None = None,
         preview_model_qpos: np.ndarray | None = None,
     ) -> MujocoTcpMotionPlan:
+        """Plan without dispatch; a payload preview retains its binding's cut.
+
+        An arbitrary preview qpos is supported only for ordinary TCP queries.
+        Payload queries require their frozen complete source. A later native
+        cut needs a new binding carrying the original tool-object transform,
+        not a bypass of source validation or a new grasp anchor.
+        """
         side = self.motion_side
+        if payload_binding is not None:
+            if not isinstance(payload_binding, MujocoPayloadBinding):
+                raise TypeError("payload_binding must be a measured MujocoPayloadBinding.")
+            if contact_binding is not None:
+                raise ValueError("Terminal grasp contact and attached payload are distinct operation bindings.")
         if side == "left" and contact_binding is not None:
             # Existing contact bindings resolve right-hand sensors only.
             raise MujocoTcpPlanRejected("safe_tcp_left_grasp_contact_unsupported")
@@ -291,10 +304,18 @@ class MujocoPlannedTcpMotion:
                 self._pending_plan = None
             if cancel_requested():
                 raise MujocoTcpPlanRejected("safe_tcp_planning_cancelled")
-            model_qpos = (
-                self._model_qpos() if not preview
-                else np.asarray(preview_model_qpos, dtype=float).copy()
-            )
+            if payload_binding is not None:
+                # Search is a frozen query; activation and every dispatch
+                # separately validate the current measured relation/geometry.
+                model_qpos = np.asarray(
+                    payload_binding.source_model_qpos if not preview else preview_model_qpos,
+                    dtype=float,
+                ).copy()
+            else:
+                model_qpos = (
+                    self._model_qpos() if not preview
+                    else np.asarray(preview_model_qpos, dtype=float).copy()
+                )
             if model_qpos.shape != (self.scene.model.nq,) or not np.isfinite(model_qpos).all():
                 raise ValueError("Planning requires a finite complete model qpos cut.")
             if contact_binding is not None:
@@ -328,6 +349,7 @@ class MujocoPlannedTcpMotion:
                 constraint_identity=constraint_identity,
                 cancel_requested=cancel_requested,
                 contact_binding=contact_binding,
+                payload_binding=payload_binding,
             )
             start = {
                 side: model_qpos[address].copy()
@@ -347,6 +369,14 @@ class MujocoPlannedTcpMotion:
                 )
             )
             measured = xyzquat_to_matrix(self.pose_for_configuration(model_qpos, start))
+            if payload_binding is not None:
+                self.scene.mujoco.mj_kinematics(self.scene.model, oracle.source)
+                world_tcp = payload_binding._tcp(oracle.source)
+                if not np.allclose(
+                    world_tcp, self.scene.body_pose(side + "_arm_base_link") @ measured,
+                    atol=1e-5, rtol=0,
+                ):
+                    raise MujocoTcpPlanRejected("safe_tcp_payload_tool_frame_mismatch")
             if not np.allclose(
                 solver.compute_pose(start[side]) @ offset, measured, atol=1e-5
             ):
@@ -577,6 +607,7 @@ class MujocoPlannedTcpMotion:
                 configuration_constraint,
                 constraint_identity,
                 contact_binding,
+                payload_binding,
             )
             if not preview:
                 self._pending_plan = plan
@@ -601,12 +632,26 @@ class MujocoPlannedTcpMotion:
                 raise MujocoTcpPlanRejected("safe_tcp_start_state_changed")
             live_oracle = MujocoJointSceneOracle(
                 self.scene,
-                self._model_qpos(),
+                (plan.source_model_qpos if plan.payload_binding is not None else self._model_qpos()),
                 configuration_constraint=plan.configuration_constraint,
                 constraint_identity=plan.constraint_identity,
                 contact_binding=plan.contact_binding,
+                payload_binding=plan.payload_binding,
             )
-            if plan.contact_binding is not None:
+            if plan.payload_binding is not None:
+                def bind_payload(scene):
+                    # Recheck both arms at the same cut as the measured guard
+                    # and installation; the earlier read is not a lock fence.
+                    pair = scene.arm_qpos_by_side()
+                    if any(not np.allclose(pair[side], plan.path.start_qpos_by_component[side],
+                                           atol=1e-3, rtol=0) for side in ("left", "right")):
+                        raise MujocoTcpPlanRejected("safe_tcp_start_state_changed")
+                    self._capture_current_payload(plan, live_oracle, scene)
+                    self.rig.set_additional_contact_oracle(plan.payload_binding.contact_oracle(scene))
+
+                self.rig.capture_scene(bind_payload)
+                self._contact_guard_bound = True
+            elif plan.contact_binding is not None:
                 self.rig.set_additional_contact_oracle(live_oracle.projector.oracle)
                 self._contact_guard_bound = True
             self._live_oracle = live_oracle
@@ -625,6 +670,15 @@ class MujocoPlannedTcpMotion:
             self._reference_index = -1
             self._last_cycle = -1
             self._live_oracle = None
+
+    def _capture_current_payload(self, plan, oracle, scene) -> None:
+        """Caller holds the rig scene lock through the following live sweep."""
+        check = plan.payload_binding.check_measured(scene)
+        if not check.safe:
+            raise MujocoTcpPlanRejected("safe_tcp_payload_measured_blocked", check.to_dict())
+        # qpos alone omits time/velocity and mocap/equality geometry inputs.
+        # Never regenerate the frozen hand-object relation from this cut.
+        scene.mujoco.mj_copyData(oracle.source, scene.model, scene.data)
 
     def check_measured_contact(self, binding, target_pose) -> JointConfigurationCheck:
         """Check right-hand geometry, including after HOLD cleared the plan."""
@@ -713,77 +767,69 @@ class MujocoPlannedTcpMotion:
             oracle = self._live_oracle
             if oracle is None:
                 raise MujocoTcpPlanRejected("safe_tcp_live_scene_unavailable")
+            if plan.payload_binding is not None:
+                def resolve_payload(scene):
+                    self._capture_current_payload(plan, oracle, scene)
+                    return self._resolve_checked_reference(plan, index, q, oracle)
+
+                # Keep the current-cut test, measured observer and complete
+                # candidate sweep under the one existing physics-owner lock.
+                return self.rig.capture_scene(resolve_payload)
             oracle.source.qpos[:] = self._model_qpos()
-            if not np.allclose(
-                oracle.source.qpos[oracle.addresses[self._inactive_side]],
-                q[self._inactive_side],
-                atol=1e-3,
-                rtol=0,
-            ):
-                raise MujocoTcpPlanRejected("safe_tcp_passive_arm_changed")
+            return self._resolve_checked_reference(plan, index, q, oracle)
+
+    def _resolve_checked_reference(self, plan, index, q, oracle) -> IKResult:
+        if not np.allclose(
+            oracle.source.qpos[oracle.addresses[self._inactive_side]],
+            q[self._inactive_side], atol=1e-3, rtol=0,
+        ):
+            raise MujocoTcpPlanRejected("safe_tcp_passive_arm_changed")
+        # The payload sweep checks the whole live edge including its endpoint.
+        # Its source must be today's cut, not the frozen search-only qpos.
+        if plan.payload_binding is None:
             check = oracle.check(q)
             if not check.safe:
                 background = set(range(oracle.source.qpos.size)) - set(
                     np.concatenate(tuple(oracle.addresses.values())).tolist()
                 )
                 changed = {
-                    str(i): [
-                        float(plan.source_model_qpos[i]),
-                        float(oracle.source.qpos[i]),
-                    ]
+                    str(i): [float(plan.source_model_qpos[i]), float(oracle.source.qpos[i])]
                     for i in sorted(background)
                     if abs(plan.source_model_qpos[i] - oracle.source.qpos[i]) > 1e-8
                 }
-                raise MujocoTcpPlanRejected(
-                    "safe_tcp_live_scene_blocked",
-                    {
-                        "check": check.to_dict(),
-                        "reference_index": index,
-                        "changed_background_qpos": changed,
-                    },
-                )
-            start_q = np.concatenate(
-                [
-                    oracle.source.qpos[oracle.addresses[side]]
-                    for side in ("left", "right")
-                ]
+                raise MujocoTcpPlanRejected("safe_tcp_live_scene_blocked", {
+                    "check": check.to_dict(), "reference_index": index,
+                    "changed_background_qpos": changed,
+                })
+        start_q = np.concatenate([
+            oracle.source.qpos[oracle.addresses[side]] for side in ("left", "right")
+        ])
+        requested_q = np.concatenate([q[side] for side in ("left", "right")])
+        if oracle.configuration_constraint is not None:
+            count = max(1, math.ceil(float(np.max(np.abs(requested_q - start_q))) / 0.01))
+            for alpha in np.linspace(0, 1, count + 1):
+                point = start_q + alpha * (requested_q - start_q)
+                constraint = oracle.configuration_constraint(oracle.source.qpos, {
+                    "left": point[:len(oracle.addresses["left"])],
+                    "right": point[len(oracle.addresses["left"]):],
+                })
+                if not constraint.safe:
+                    raise MujocoTcpPlanRejected("safe_tcp_live_reference_constraint_blocked", {
+                        "edge_alpha": float(alpha), "check": constraint.to_dict(),
+                    })
+        sweep = oracle.projector.project(
+            oracle.source, start_qpos=start_q, requested_qpos=requested_q
+        )
+        if sweep.modified or not sweep.check.safe:
+            raise MujocoTcpPlanRejected(
+                "safe_tcp_live_reference_sweep_blocked", sweep.to_dict()
             )
-            requested_q = np.concatenate([q[side] for side in ("left", "right")])
-            if oracle.configuration_constraint is not None:
-                count = max(
-                    1, math.ceil(float(np.max(np.abs(requested_q - start_q))) / 0.01)
-                )
-                for alpha in np.linspace(0, 1, count + 1):
-                    point = start_q + alpha * (requested_q - start_q)
-                    constraint = oracle.configuration_constraint(
-                        oracle.source.qpos,
-                        {
-                            "left": point[: len(oracle.addresses["left"])],
-                            "right": point[len(oracle.addresses["left"]) :],
-                        },
-                    )
-                    if not constraint.safe:
-                        raise MujocoTcpPlanRejected(
-                            "safe_tcp_live_reference_constraint_blocked",
-                            {"edge_alpha": float(alpha), "check": constraint.to_dict()},
-                        )
-            sweep = oracle.projector.project(
-                oracle.source, start_qpos=start_q, requested_qpos=requested_q
-            )
-            if sweep.modified or not sweep.check.safe:
-                raise MujocoTcpPlanRejected(
-                    "safe_tcp_live_reference_sweep_blocked", sweep.to_dict()
-                )
-            return IKResult(
-                success=True,
-                iterations=0,
-                qpos_by_side={side: values.tolist() for side, values in q.items()},
-                position_error_m={self.motion_side: 0.0},
-                orientation_error_rad={self.motion_side: 0.0},
-                status="planned_joint_reference",
-                solver="mujoco.registered_collision_checked_joint_path",
-                metadata={
-                    "trajectory_hash": plan.trajectory_hash,
-                    "reference_index": index,
-                },
-            )
+        return IKResult(
+            success=True, iterations=0,
+            qpos_by_side={side: values.tolist() for side, values in q.items()},
+            position_error_m={self.motion_side: 0.0},
+            orientation_error_rad={self.motion_side: 0.0},
+            status="planned_joint_reference",
+            solver="mujoco.registered_collision_checked_joint_path",
+            metadata={"trajectory_hash": plan.trajectory_hash, "reference_index": index},
+        )

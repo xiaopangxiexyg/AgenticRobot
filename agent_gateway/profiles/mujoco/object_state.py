@@ -1,8 +1,8 @@
 """Current native body measurements on a private copy under the existing lock.
 
-No physics step, grasp establishment, release history or command inference. A
-future bound release producer may supply the optional history through the
-shared profile; this native single-cut source deliberately reports null.
+Reads never step physics or renew history. An explicitly bound follow observer
+consumes the sole rig's ticks and admitted close/open generations; commands
+alone do not prove a grasp or a stable release.
 """
 
 import numpy as np
@@ -12,9 +12,11 @@ from sim.mujoco.transforms import pose_to_xyz_quat_xyzw
 
 
 class MujocoObjectStateSource:
-    def __init__(self, *, application, profile, contact_binding):
-        if profile.observation_source != "mujoco_native_physics" or profile.release_supported:
-            raise ValueError("Native single-cut source cannot claim release-window evidence")
+    def __init__(self, *, application, profile, contact_binding, gripper_port=None):
+        if profile.observation_source != "mujoco_native_physics":
+            raise ValueError("Native object source requires its explicit observation identity")
+        if profile.release_supported != (gripper_port is not None):
+            raise ValueError("Native release-window evidence requires its bound gripper producer")
         if profile.object_id != contact_binding.target_body_name:
             raise ValueError("Observed object differs from the bound contact target")
         graph = application.target_frame_profile.frame_graph
@@ -33,6 +35,34 @@ class MujocoObjectStateSource:
         if not self._target_geoms:
             raise ValueError("Observed target has no native collision geometry")
         self._scratch = None
+        self._follow = None
+        if gripper_port is not None:
+            from agent_gateway.profiles.mujoco.gripper_skill import MujocoGripperControlPort
+            from sim.mujoco.deploy import capture_mujoco_sim_hil_tool_tcp_pose_by_side
+            from sim.mujoco.deploy.grasped_object import MujocoGraspedObjectObserver
+
+            rig = application.runtime.rig
+            if not isinstance(gripper_port, MujocoGripperControlPort) or gripper_port.rig is not rig:
+                raise ValueError("Object follow observation requires the same physics owner")
+            side = gripper_port.component_id.removesuffix("_gripper")
+
+            def world_tcp(view):
+                return (view.body_pose(side + "_arm_base_link")
+                        @ capture_mujoco_sim_hil_tool_tcp_pose_by_side(view, application.task_config)[side])
+
+            self._follow = MujocoGraspedObjectObserver(
+                rig=rig, object_body_name=profile.object_id,
+                sensor_geom_names=contact_binding.sensor_geom_names,
+                support_body_names=(application.task_config.table_body_name,),
+                gripper_name=gripper_port.gripper_name,
+                command_state=lambda: rig.latest_gripper_command(gripper_port.gripper_name),
+                world_tcp_from_scene=world_tcp, track_close_contacts=True)
+            rig.set_physics_step_observer(self._follow.observe_physics_step)
+
+    @property
+    def follow_observer(self):
+        """The one rig-tick producer, shared only by explicit motion assembly."""
+        return self._follow
 
     def capture(self):
         def project(scene):
@@ -72,7 +102,8 @@ class MujocoObjectStateSource:
                 "support_contact": any(int(model.geom_bodyid[g]) == self._support for g in touching),
                 "gripper_contact": any(g in self._sensors for g in touching),
                 "other_contact": any(g not in self._sensors and int(model.geom_bodyid[g]) != self._support for g in touching),
-                "release_observation": None,
+                "release_observation": (None if self._follow is None else
+                    self._follow.release_snapshot()),
             }
 
         cut = self.application.capture_passive_application_cut(scene_projector=project)

@@ -257,9 +257,13 @@ def test_gateway_sim_dependencies_are_confined_to_mujoco_profile() -> None:
         "agent_gateway/profiles/mujoco/motion_application.py": ["sim"],
         "agent_gateway/profiles/mujoco/motion_deployment.py": ["sim"],
         "agent_gateway/profiles/mujoco/motion_factory.py": ["sim"],
+        # The concrete assembly names its lower measured-object observer type.
+        "agent_gateway/profiles/mujoco/motion_gateway_session.py": ["sim"],
         # The concrete safe-TCP lifecycle binds its lower simulation planner.
         "agent_gateway/profiles/mujoco/motion_skill.py": ["sim"],
         "agent_gateway/profiles/mujoco/observation.py": ["sim"],
+        # Carried-object composition binds the existing lower payload planner.
+        "agent_gateway/profiles/mujoco/object_motion.py": ["sim"],
         # Native object measurements resolve simulation frames in this leaf.
         "agent_gateway/profiles/mujoco/object_state.py": ["sim"],
         "agent_gateway/profiles/mujoco/policy_application.py": ["sim"],
@@ -312,6 +316,8 @@ def test_gateway_numerical_dependencies_are_confined_to_concrete_profiles() -> N
         "agent_gateway/profiles/segmentation.py": ["numpy"],
         "agent_gateway/profiles/mujoco/motion_skill.py": ["numpy"],
         "agent_gateway/profiles/mujoco/grasp_candidate_selection.py": ["numpy"],
+        # Object goals project the measured relation only in the concrete leaf.
+        "agent_gateway/profiles/mujoco/object_motion.py": ["numpy"],
         # Private-copy body Jacobians and frame projection stay in this leaf.
         "agent_gateway/profiles/mujoco/object_state.py": ["numpy"],
         # The concrete real-RM65 CLI validates reviewed camera/tool geometry

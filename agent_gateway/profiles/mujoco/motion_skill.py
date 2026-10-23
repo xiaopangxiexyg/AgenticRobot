@@ -962,6 +962,18 @@ class MujocoAgentTcpPoseSkillLifecycle:
             hold=hold,
         )
 
+    def _terminal_state_evidence(self, public_final_pose, measured_at):
+        return {
+            "runtime_session_id": self.request.runtime_session_id,
+            "control_domain_id": self.deployment_binding.control_domain_id,
+            "operation_id": self.operation.operation_id,
+            "component_id": self.component_id,
+            "pose_xyz_quat_xyzw": public_final_pose,
+            "measured_at": measured_at,
+            "reference_frame_id": self.motion_profile.reference_frame_id,
+            "controlled_frame_id": "tool_tcp",
+        }
+
     def _success(
         self,
         *,
@@ -976,16 +988,7 @@ class MujocoAgentTcpPoseSkillLifecycle:
             target_frame_id=self.motion_profile.reference_frame_id,
         )
         final_state_hash = canonical_content_hash(
-            {
-                "runtime_session_id": request.runtime_session_id,
-                "control_domain_id": self.deployment_binding.control_domain_id,
-                "operation_id": operation.operation_id,
-                "component_id": self.component_id,
-                "pose_xyz_quat_xyzw": public_final_pose,
-                "measured_at": measured_at,
-                "reference_frame_id": self.motion_profile.reference_frame_id,
-                "controlled_frame_id": "tool_tcp",
-            },
+            self._terminal_state_evidence(public_final_pose, measured_at),
             domain="dexteleop.agent_skill.mujoco_tcp_terminal_state.v1",
         )
         if len(self.evaluation_plan.evaluator_specs) != 1:
@@ -1142,27 +1145,15 @@ class MujocoAgentSafeTcpPoseSkillLifecycle(MujocoAgentTcpPoseSkillLifecycle):
         return super()._failure(reason_code=reason_code, hold=hold)
 
     def activate(self, *, request, operation, cancel_requested):
-        self._validate_call(request=request, operation=operation)
-        if self.target_pose is None:
-            raise ValueError("Safe TCP motion requires an absolute target.")
-        measured = self._capture_pose()
-        translation, rotation = _pose_error(measured, self.target_pose)
-        if (
-            cancel_requested()
-            or translation > self.motion_profile.max_translation_delta_m
-            or rotation > self.motion_profile.max_rotation_delta_rad
-        ):
-            # Preserve the ordinary cancellation/delta gate before planning.
-            return super().activate(
-                request=request, operation=operation, cancel_requested=cancel_requested
-            )
         # Bind the exact admitted envelope before search, without submitting
-        # a reference. Search and execution then consult the same lower owner.
+        # a reference. The base also owns cancellation, measured target
+        # resolution and delta admission for absolute and composed targets.
         evidence = super().activate(
             request=request, operation=operation, cancel_requested=cancel_requested
         )
         if not evidence.succeeded:
             return evidence
+        measured = self._activation_measured_pose
         safety = self.application.tcp_pose_envelope_runtime
         motion_side = self.component_id.removesuffix("_arm")
         constraint = None
@@ -1196,6 +1187,7 @@ class MujocoAgentSafeTcpPoseSkillLifecycle(MujocoAgentTcpPoseSkillLifecycle):
                 )
 
         preserve_target = safe_tcp_pose_goal_policy_v1(self.request.parameters) == "preserve_target"
+        payload_binding = self._planning_payload_binding()
         try:
             plan = self._planner.plan(
                 self.target_pose,
@@ -1212,6 +1204,7 @@ class MujocoAgentSafeTcpPoseSkillLifecycle(MujocoAgentTcpPoseSkillLifecycle):
                 constraint_identity=constraint_identity,
                 path_search_time_budget_sec=self._path_search_time_budget_sec,
                 contact_binding=self._contact_binding,
+                **({"payload_binding": payload_binding} if payload_binding is not None else {}),
             )
             if (
                 len(plan.reference_poses) + self.motion_profile.stable_measurement_count
@@ -1256,6 +1249,10 @@ class MujocoAgentSafeTcpPoseSkillLifecycle(MujocoAgentTcpPoseSkillLifecycle):
             )
         self._execution_refs.add("mujoco-safe-joint-trajectory:" + plan.trajectory_hash)
         return evidence
+
+    def _planning_payload_binding(self):
+        """Only an explicitly composed lifecycle may supply carried geometry."""
+        return None
 
     def _capture_pose(self):
         pose = super()._capture_pose()

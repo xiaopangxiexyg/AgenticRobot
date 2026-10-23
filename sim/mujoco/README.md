@@ -318,6 +318,56 @@ This is an interactive GLFW viewer, so Linux requires `DISPLAY` or
 `WAYLAND_DISPLAY`. `MUJOCO_GL=egl` and `MUJOCO_GL=osmesa` are offscreen render
 options and do not provide an interactive desktop window.
 
+## 显式携物几何与规划绑定
+
+`sim.mujoco.deploy.payload_motion` 提供可选的 `MujocoPayloadBinding` 与
+`MujocoPayloadProjector`。`MujocoJointSceneOracle(..., payload_binding=binding)`
+复用原有碰撞查询／扫掠；候选只在私有 `MjData` 中移动完整物体碰撞几何，不修改真实场景。
+本批支持顶层自由刚体的 box／convex mesh，以及明确命名的固定 plane／box 支撑面。
+未支持的物体形状会拒绝，不自动改成较小碰撞体。
+
+绑定必须由调用方在原有 rig 场景锁内，从同一 cut 的标定 TCP、实测闭合和双侧传感器接触
+构造。冻结关系使用物体原生 body frame，不是质心或包围盒；后续捕获必须继续传入原始关系，
+不能通过重新锚定掩盖滑动。查询 source 必须与绑定的完整 qpos cut 一致；终端接触 binding
+和携物 binding 不能混用。
+
+物理 timestep 纳入绑定身份；改变 timestep 或更换 live `MjData` owner 后，原绑定不可继续使用。
+实测入口只接受当前 live cut 或其 time／qpos／qvel／mocap／equality 状态一致的私有副本，
+不能用历史或构造数据推进实测接触历史。候选源也绑定冻结的 mocap／equality 几何状态，
+避免只复制 qpos 而漏掉可移动环境几何。
+
+`check_measured` 及 `contact_oracle` 检查实际物体、冻结的 3mm／2deg 关系和全部原生几何。
+拉取测量与物理 guard 复用同一个实测接触历史；预测查询使用独立历史，不能延长真实证据。
+仅对指定传感器／物体及支撑面按阶段配置接触许可，保持场景 1mm 硬穿透边界。
+单物理步接触缺口不能延长成多步，也不能豁免物体滑移或其他碰撞。
+直接 projector 点查询也检查冻结 cut；扫掠起点必须是当前实测 cut。扫掠的源几何／关系检查
+不发布新的实测历史或调用外部观测器，不是完整抓持验证或执行授权。
+
+`MujocoPlannedTcpMotion.plan(..., payload_binding=binding)` 将绑定纳入原有 IK、
+BiRRT-Connect、C2 重定时和逐参考检查，仍返回本实例独占的不可变计划。
+携物查询使用绑定的冻结 cut；显式 preview 不替换待执行计划，也不能被激活。
+携物 preview 同样拒绝不同源 cut；如需当前新状态，须在原 rig 锁内重新捕获绑定，
+继续传入原始手物关系，不能用任意 preview qpos 绕过冻结来源。
+标定 world-TCP 必须与本实例所选左右臂的执行 TCP 一致，不能用另一只手的绑定规划。
+
+激活时复核模型、两臂起点和当前实测关系，只有检查通过后才把绑定的同一个实测 oracle
+挂到既有 position rig 的附加物理 guard；canonical guard 仍先执行。
+同一个附加 guard 在每次 `mj_step` 前后都运行；步后违规立即保留具体碰撞对并锁存，
+不能等到下一步才拒绝，也不能先向连续观测器发布该步为正常测量。没有附加绑定时，
+仍只执行原 canonical 检查；硬穿透限制、控制频率和物理参数均不改变。
+逐参考 resolve 在原 rig 锁内复核实测并复制完整当前 `MjData`，包括 time、qvel、
+mocap 和 equality 输入，再检查被动臂、原有 configuration constraint 及完整携物扫掠。
+冻结查询与当前扫掠各自保留来源要求；当前扫掠不重新锚定，也不发布候选的接触历史。
+新障碍、滑移、错误参考或失效绑定均拒绝，不投影成另一条未经规划的指令。
+
+`clear()` 撤销本次计划、参考和附加 guard，重复调用无副作用；绑定本身的实测接口及
+原 observer 不被清除，调用方继续负责释放前后的持续观测。
+这一层不拥有 physics、调度或 dispatch，不证明抓持成功，也不授予携物执行权限。
+本层不装配 Gateway Route；显式应用接线见
+[Gateway 携物运动说明](../../agent_gateway/README.md#显式携物目标mujoco)。原有运动与单帧默认行为不变。
+该 Route 必须成套绑定同一 observer、HOLD／取消／释放／close，并完成原生验收；
+不能把 `approach_grasp_contact` 当作携物抬升接口。
+
 ## DMTAC CAD 方块接触诊断（仅离线）
 
 ```bash

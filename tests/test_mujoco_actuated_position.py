@@ -20,7 +20,9 @@ from sim.mujoco.adapters import (
 )
 from sim.mujoco.control import DirectQposCommand
 from sim.mujoco.scene import MujocoScene
-from sim.mujoco.collision_safety import CollisionCheckResult, CollisionProjectionResult
+from sim.mujoco.collision_safety import (
+    CollisionCheckResult, CollisionProjectionResult, CollisionSafetyOracle,
+)
 from sim.rm65.actuation import PositionActuationProfile
 
 
@@ -371,11 +373,14 @@ def _fake_projection(start, requested) -> CollisionProjectionResult:
 
 
 @pytest.mark.parametrize("post_contact_is_safe", [True, False])
+@pytest.mark.parametrize("guard_source", ["canonical", "additional"])
 def test_physical_executor_runs_full_scene_guard_and_latches_hard_contact(
     post_contact_is_safe: bool,
+    guard_source: str,
 ) -> None:
-    class _Oracle:
+    class _Oracle(CollisionSafetyOracle):
         def __init__(self) -> None:
+            # This fake supplies contact results, not native geometry queries.
             self.calls = 0
 
         def check_contacts(self, _data):
@@ -411,8 +416,13 @@ def test_physical_executor_runs_full_scene_guard_and_latches_hard_contact(
         ),
     )
     scene = _PhysicalFakeScene(projector)
+    oracle.model = scene.model
+    if guard_source == "additional":
+        projector.oracle = SimpleNamespace(check_contacts=lambda _data: _safe_check())
     profile = _physical_test_profile()
     sender = MujocoActuatedPositionExecutor(scene, _timing(), profile)
+    if guard_source == "additional":
+        sender.set_additional_contact_oracle(oracle)
     initial = {side: np.zeros(6) for side in ("left", "right")}
     sender.reset(_command(0, initial))
     while not sender.command_due:
@@ -422,9 +432,12 @@ def test_physical_executor_runs_full_scene_guard_and_latches_hard_contact(
         else:
             with pytest.raises(RuntimeError, match="forbidden hard contact"):
                 sender.step_physics()
+            assert scene.data.physics_steps == 1
             assert sender.hard_contact_latched
+            assert sender.last_active_collision_check.body2_name == "obstacle"
             with pytest.raises(RuntimeError, match="latched"):
                 sender.step_physics()
+            assert scene.data.physics_steps == 1
             return
     target = {side: np.full(6, 0.2) for side in ("left", "right")}
     tick = sender.step_physics(_command(1, target))

@@ -53,3 +53,19 @@ class CollisionSafetyPolicy:
     @property
     def distance_query_limit_m(self) -> float:
         return max(0.05, self.minimum_clearance_m * 2.0)
+
+
+@dataclass(frozen=True)
+class NonContactObjectMovePolicy(CollisionSafetyPolicy):
+    """Existing noncontact TCP query policy, shared with attached geometry."""
+
+    @property
+    def distance_query_limit_m(self) -> float:
+        # Broad-radius GJK diagnostics may return zero for separated CAD
+        # meshes. The clipped query retains the required prevention margin.
+        return float(self.minimum_clearance_m)
+
+    def pair_is_forbidden(self, first_group: int, second_group: int) -> bool:
+        return super().pair_is_forbidden(first_group, second_group) or frozenset(
+            (int(first_group), int(second_group))
+        ) == frozenset((4, 8))
