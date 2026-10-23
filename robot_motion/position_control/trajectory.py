@@ -612,6 +612,35 @@ class AccelerationLimitedJointTrajectoryPlanner:
             # Kept in snapshot/debug without adding a public mutable field.
             self._last_anchor_resynced = anchor_resynced
 
+    def pause_reference(
+        self, *, monotonic_time: float | None = None, reason: str,
+    ) -> None:
+        """Decelerate to zero using normal proposals, preserving the endpoint.
+
+        Unlike quick_stop, this changes only desired reference velocity. The
+        committed position/velocity and receipt history remain authoritative;
+        a later accept_target resumes from them under the existing limits.
+        """
+        now = self._resolve_time(monotonic_time)
+        normalized_reason = str(reason).strip()
+        if not normalized_reason:
+            raise ValueError("pause reason must be non-empty")
+        with self._lock:
+            self._require_target()
+            if now < max(self._last_commit_monotonic, self._target_published_monotonic):
+                raise ValueError("pause cannot precede the committed reference or target")
+            if self._pending is not None or self._quick_stop:
+                raise RuntimeError("pause requires an acknowledged tracking reference")
+            if self._speed_scale == 0.0:
+                return
+            for name in ("_target_qd_raw", "_target_qd_unfiltered", "_target_qd_reference",
+                         "_target_qd_desired", "_target_qd_desired_raw"):
+                setattr(self, name, np.zeros_like(self._q))
+            self._speed_scale = 0.0
+            self._mode = "reference_paused"
+            self._reason = normalized_reason
+            self._generation += 1
+
     def quick_stop(
         self,
         *,

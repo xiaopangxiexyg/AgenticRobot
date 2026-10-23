@@ -686,3 +686,17 @@ def test_v12_binding_remains_frozen_after_collision_query_extension() -> None:
     assert dict(offline.metrics) == {"passed_cases": 304.0, "skipped_cases": 0.0, "failed_cases": 0.0, "error_cases": 0.0}
     artifacts = {item.artifact_id: item for item in previous.dependency_artifacts}
     assert artifacts[previous.metadata["offline_validation_report_artifact_id"]].sha256 == "99dd8b4b6cf21d72113a660d7076014097c4ae7648dce3e92fa38c7cca8298df"
+
+
+def test_v10_binding_remains_frozen_after_read_only_collision_query() -> None:
+    previous = Real2SimArtifactManifest.load(ARM_RUNTIME_BINDING_V10_PATH)
+    assert previous.artifact_sha256 == "c341a48710ce7743941a0980b820c0627ec98dba8a27bb7df574d5418736a880"
+    assert previous.metadata["arm_profile_refit"] is False
+    content = next(e for e in previous.validation_evidence if e.validation_id == "runtime-source-content-binding-integrity-v10")
+    assert content.metrics["bound_runtime_source_file_count"] == 20
+    assert content.metrics["bound_runtime_input_file_count"] == 21
+    assert content.metrics["changed_runtime_source_file_count_from_previous_binding"] == 3
+    assert content.metrics["new_runtime_source_file_count"] == 7
+    offline = next(e for e in previous.validation_evidence if e.validation_id == "offline-object-follow-payload-consumers-v10")
+    assert dict(offline.metrics) == {"passed_cases":115.,"skipped_cases":0.,"failed_cases":0.,"error_cases":0.}
+    assert next(e for e in previous.validation_evidence if e.split == "held_out").status == "not_run"

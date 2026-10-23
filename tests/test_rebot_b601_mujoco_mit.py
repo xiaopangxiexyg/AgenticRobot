@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import xml.etree.ElementTree as ET
 from dataclasses import replace
 from pathlib import Path
@@ -29,7 +30,7 @@ from sim.mujoco.rebot_b601_rs.scene import (
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-REBOT_SOURCE_ROOT = REPO_ROOT / "hardware" / "reBotArm_control_py"
+REBOT_SOURCE_ROOT = Path(os.environ.get("B601_REBOT_SOURCE_ROOT", REPO_ROOT / "hardware" / "reBotArm_control_py"))
 pytestmark = [pytest.mark.optional, pytest.mark.contract]
 
 

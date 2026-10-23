@@ -1,3 +1,4 @@
+import os
 from dataclasses import replace
 from pathlib import Path
 
@@ -16,7 +17,9 @@ from sim.mujoco.rebot_b601_rs.real2sim import (
 )
 
 pytestmark = [pytest.mark.contract, pytest.mark.optional]
-SOURCE = Path(__file__).resolve().parents[1] / "hardware/reBotArm_control_py"
+SOURCE = Path(os.environ.get(
+    "B601_REBOT_SOURCE_ROOT", Path(__file__).resolve().parents[1] / "hardware/reBotArm_control_py",
+))
 
 
 @pytest.mark.parametrize("field", ["damping_nm_s_per_rad", "frictionloss_nm", "armature_kg_m2"])
@@ -179,6 +182,52 @@ def reference(driver, sequence=0, frame_id="b601_rs/joint_mit_reference"):
         qpos_rad=tuple(driver._measured_qpos()),
         frame_id=frame_id,
     )
+
+
+@pytest.mark.parametrize("source", ["previous_overlay", "changed_gravity"])
+def test_final_host_packet_gates_native_damping_restoration(driver, source):
+    driver.timing = TimingSpec(command_hz=100., physics_hz=1000.)
+    driver.profile = replace(driver.profile, max_torque_rate_nm_s=(28.8,)*6)
+    driver.real2sim_profile = replace(driver.real2sim_profile, driver_kd_nm_s_per_rad=(.4,)*6)
+    q, v = driver._measured_qpos(), driver._measured_qvel()
+    # Seed a known accepted host packet to isolate the final-boundary test;
+    # this is not an experiment asserting physical motion or delivered force.
+    driver._host_command_torque = driver._controller_gravity(q, v).copy()
+    if source == "previous_overlay":
+        driver._host_command_torque[2] += 1.
+    else:
+        bias = list(driver.real2sim_profile.gravity_joint_bias_nm)
+        bias[2] -= .8
+        driver.real2sim_profile = replace(driver.real2sim_profile, gravity_joint_bias_nm=tuple(bias))
+    gains = (.4,)*6
+    for step in range(100):
+        due = driver.command_due
+        tick = driver.step_physics(
+            reference(driver, step) if due else None,
+            restore_driver_kd_nm_s_per_rad=(0.,)*6 if due else None,
+        )
+        assert not tick.driver_faulted
+        if due:
+            delta = np.asarray(tick.host_command_torque_nm) - tick.torque_breakdown.gravity_torque_nm
+            if max(abs(delta)) > 1e-9:
+                assert tick.driver_kd_nm_s_per_rad == gains
+            else:
+                assert tick.driver_kd_nm_s_per_rad == (0.,)*6
+                break
+        np.testing.assert_allclose(tick.driver_damping_torque_nm, -np.asarray(gains)*tick.control_qvel)
+    else:
+        pytest.fail("final host tail never reached zero for native gain handoff")
+
+
+def test_native_damping_restore_request_does_not_bypass_packet_admission(driver):
+    with pytest.raises(ValueError, match="due real2sim reference"):
+        driver.step_physics(restore_driver_kd_nm_s_per_rad=(0.,)*6)
+    with pytest.raises(ValueError, match="six"):
+        driver.step_physics(reference(driver), restore_driver_kd_nm_s_per_rad=(0.,)*5)
+    before = driver.real2sim_profile
+    tick = driver.step_physics(replace(reference(driver), valid=False), restore_driver_kd_nm_s_per_rad=(0.,)*6)
+    assert not tick.command_applied
+    assert driver.real2sim_profile == before
 
 
 def test_host_zoh_and_physics_rate_damping(driver):

@@ -35,6 +35,23 @@ def _command(sequence: int, timestamp: float) -> B601PolicyAssistCommand:
     )
 
 
+@pytest.mark.parametrize("now,accepted,reason", [
+    (.9, False, "policy_command_from_future"),
+    (1.01, True, "accepted"),
+    (1.11, False, "policy_command_stale"),
+])
+def test_read_only_policy_sampling_reuses_validity_without_advancing_state(now, accepted, reason):
+    runtime = B601SharedControlRuntime(_config())
+    assert runtime.publish_policy(_command(1, 1.0)).accepted
+    state = runtime.state
+    for _ in range(3):
+        sample = runtime.sample_policy(now_sec=now)
+        assert sample.accepted is accepted
+        assert sample.reason == reason
+        assert runtime.state is state
+    assert not runtime.publish_policy(_command(1, 1.0)).accepted
+
+
 def test_runtime_emits_current_position_reference_with_bounded_overlay() -> None:
     runtime = B601SharedControlRuntime(_config())
     assert runtime.publish_policy(_command(1, 1.0)).accepted is True

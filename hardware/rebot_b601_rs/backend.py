@@ -790,6 +790,14 @@ class B601RSBackend:
 
         if self.connected:
             return
+        if (
+            self._enabled_joint_names
+            or self._active_report_joint_names
+            or self._driver_torque_limit_original_nm
+        ):
+            raise B601HardwareError(
+                "cannot reconnect a released backend with unconfirmed device state"
+            )
         try:
             if self._controller_factory is None:
                 module = self._load_motorbridge_module()
@@ -870,17 +878,51 @@ class B601RSBackend:
                 "temporary driver torque limits must be restored before close"
             )
 
+        self.release_transport()
+        self._enabled_joint_names.clear()
+        self._disabled_joint_names.clear()
+
+    def release_transport(self) -> None:
+        """Release host resources at terminal shutdown, without device I/O.
+
+        Unlike normal close, this may follow failed device cleanup. Keep all
+        unresolved device-state bookkeeping; releasing a handle confirms
+        neither disable, active-report withdrawal nor torque-limit restoration.
+        An instance with unresolved state must not be reconnected or reused.
+        """
+
         controller = self._controller
+        if controller is None:
+            return
+        close_bus = getattr(controller, "close_bus", None)
+        if callable(close_bus) and close_bus() is False:
+            raise B601HardwareError("vendor bus transport release is incomplete")
+        # MotorBridge's motor handles retain native Arc references. Dropping
+        # only their Python wrappers does not free those native handles.
+        handle_errors = []
+        for name, motor in tuple(self._motors.items()):
+            close_motor = getattr(motor, "close", None)
+            if not callable(close_motor):
+                continue
+            try:
+                if close_motor() is False:
+                    raise B601HardwareError("motor handle release is incomplete")
+            except Exception as exc:  # noqa: BLE001 - retain remaining native handles for retry
+                handle_errors.append(f"{name}: {exc}")
+            else:
+                self._motors.pop(name)
+        if handle_errors:
+            raise B601HardwareError("motor host handle release failed: " + "; ".join(handle_errors))
+        close = getattr(controller, "close", None)
+        if not callable(close):
+            raise B601HardwareError("vendor controller has no transport release operation")
+        if close() is False:
+            raise B601HardwareError("vendor controller transport release is incomplete")
+        # A failed close keeps the original handle for explicit retry and
+        # must never be reported as a completed resource release.
         self._controller = None
         self._motors = {}
         self._motorbridge_runtime_evidence = None
-        self._enabled_joint_names.clear()
-        self._disabled_joint_names.clear()
-        if controller is None:
-            return
-        close = getattr(controller, "close", None)
-        if callable(close):
-            close()
 
     def _require_connected(self) -> object:
         if self._controller is None:
