@@ -147,6 +147,40 @@ def test_spatial_goal_is_optional_and_binds_the_current_component(component):
             validator.validate_execution_result_for_parameters(parameters, {**result, **changes})
 
 
+@pytest.mark.parametrize("primary", ["left", "right"])
+def test_dual_pose_routes_allow_either_one_arm_but_not_both(primary):
+    attachment, config, graph, envelope = _inputs()
+    attachment = replace(attachment, component_ids=("left_arm", "right_arm"))
+    config = replace(config, active_sides=("left", "right"),
+        component_id_by_side={"left": "left_arm", "right": "right_arm"})
+    envelope = replace(envelope, allowed_route_ids=(*envelope.allowed_route_ids,
+        "real.rm65.agent_skill_tcp_pose_target_safe"))
+    kwargs = {"attachment": attachment, "port_config": config, "frame_graph": graph,
+        "primitive_reference_frame_id": "canonical_station", "safety_envelope_refs": (envelope,)}
+    with pytest.raises(ValueError, match="explicit primary"):
+        build_real_agent_primitive_contract_bundle(**kwargs)
+    bundle = build_real_agent_primitive_contract_bundle(**kwargs, primary_component_id=primary+"_arm")
+    profile = bundle.pose_target_profile
+    assert profile.component_ids == ("left_arm", "right_arm")
+    assert bundle.cardinal_profile.side == primary
+    for skill in ("motion.move_tcp_to_pose", "motion.move_tcp_to_pose_safe"):
+        route = bundle.route_manifest.route(skill, "1").route
+        schema = bundle.schema_catalog.entry(skill, "1").parameter_schema
+        assert schema["properties"]["pose_targets_by_component"]["maxProperties"] == 1
+        payload = {"reference_frame_id": profile.reference_frame_id,
+            "reference_frame_spec_hash": profile.reference_frame_spec_hash,
+            "controlled_frame_id": "tool_tcp", "frame_graph_hash": profile.frame_graph_hash,
+            "tool_config_hash": profile.tool_config_hash, "calibration_hash": profile.calibration_hash}
+        for arm in ("left", "right"):
+            assert profile.side_for_component(arm+"_arm") == arm
+            payload["pose_targets_by_component"] = {arm+"_arm": [0, 0, .3, 0, 0, 0, 1]}
+            bundle.payload_validators.validate_parameters(route=route, payload=payload)
+        payload["pose_targets_by_component"] = {arm+"_arm": [0, 0, .3, 0, 0, 0, 1]
+                                              for arm in ("left", "right")}
+        with pytest.raises(ValueError, match="exactly the bound component"):
+            bundle.payload_validators.validate_parameters(route=route, payload=payload)
+
+
 def test_real_bundle_exposes_read_diagnostic_and_fixed_motion_primitives() -> None:
     bundle = _bundle()
 

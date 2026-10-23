@@ -137,6 +137,7 @@ class RealAgentPrimitiveSessionAuthorization:
         action: str | None = None,
         authorized_actions: tuple[str, ...] | None = None,
         authorized_gripper_sides: tuple[str, ...] | None = None,
+        authorized_motion_sides: tuple[str, ...] | None = None,
         client_id: str,
         confirmation_token: str,
         grant_lifetime_sec: float = 5.0,
@@ -183,6 +184,14 @@ class RealAgentPrimitiveSessionAuthorization:
 
         self.gateway_session = gateway_session
         self.side = normalized_side
+        self.authorized_motion_sides = tuple(sorted(set(
+            (normalized_side,) if authorized_motion_sides is None else authorized_motion_sides)))
+        if (not self.authorized_motion_sides or normalized_side not in self.authorized_motion_sides
+                or not set(self.authorized_motion_sides) <= {"left", "right"}):
+            raise ValueError("authorized_motion_sides must contain the primary side and select left/right.")
+        if not {arm + "_arm" for arm in self.authorized_motion_sides} <= set(
+                gateway_session.contract_bundle.attachment.component_ids):
+            raise ValueError("Motion authorization exceeds the bound arm components.")
         self.authorized_actions = normalized_actions
         self.authorized_gripper_sides = tuple(
             sorted(
@@ -231,6 +240,7 @@ class RealAgentPrimitiveSessionAuthorization:
                     "side": self.side,
                     **({"authorized_gripper_sides": self.authorized_gripper_sides}
                        if gripper_contract is not None and gripper_contract.deployment_binding.skill_version == "2" else {}),
+                    "authorized_motion_sides": self.authorized_motion_sides,
                     "authorized_actions": self.authorized_actions,
                     "client_id": self.client_id,
                     "confirmation": REAL_AGENT_PRIMITIVE_SESSION_CONFIRM_TOKEN,
@@ -273,6 +283,10 @@ class RealAgentPrimitiveSessionAuthorization:
             if len(component_ids) != 1 or component_ids[0] not in {
                 side + "_gripper" for side in self.authorized_gripper_sides
             }:
+                return None
+        elif requested_action in {REAL_AGENT_ABSOLUTE_TCP_POSE_ACTION, REAL_AGENT_SAFE_TCP_POSE_ACTION}:
+            if len(component_ids) != 1 or component_ids[0] not in {
+                    arm + "_arm" for arm in self.authorized_motion_sides}:
                 return None
         elif component_ids != (f"{self.side}_arm",):
             return None

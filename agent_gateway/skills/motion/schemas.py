@@ -272,6 +272,7 @@ def tcp_pose_target_schema_entry_v1(
     max_speed_scale: float | None = None,
     skill_id: str = TCP_POSE_TARGET_SKILL_ID_V1,
     parameter_description: str | None = None,
+    max_target_components: int | None = None,
 ) -> AgentSkillSchemaEntry:
     selected_skill_id = _required(skill_id, field_name="skill_id")
     if selected_skill_id not in {
@@ -326,6 +327,11 @@ def tcp_pose_target_schema_entry_v1(
                 "deployment-owned and are not a claim of exact convergence."
             ),
         }
+    if max_target_components is not None:
+        maximum_components = _positive_integer(max_target_components, field_name="max_target_components")
+        if maximum_components > len(components):
+            raise ValueError("max_target_components exceeds the allowed component count.")
+        properties["pose_targets_by_component"]["maxProperties"] = maximum_components
     if maximum_duration is not None:
         properties["requested_duration_ms"] = {
             "type": "integer",

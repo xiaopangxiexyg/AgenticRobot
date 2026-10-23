@@ -116,6 +116,7 @@ def _runtime_fixture(
     include_grasp_approach: bool = False,
     include_safe_pose: bool = False,
     convergence_profile: RealAgentPrimitiveConvergenceProfile | None = None,
+    dual: bool = False,
 ):
     execution_frame = CoordinateFrameSpec(frame_id="dual_arm_solver_world")
     station_frame = CoordinateFrameSpec(
@@ -144,7 +145,7 @@ def _runtime_fixture(
         control_domain_id="real-domain:lifecycle-test",
         embodiment_instance_id="dual-rm65:lifecycle-test",
         target_binding_id="real-target:lifecycle-test",
-        component_ids=("right_arm",),
+        component_ids=("left_arm", "right_arm") if dual else ("right_arm",),
         station_manifest_hash="station-manifest:lifecycle-test",
         execution_manifest_hash="execution-manifest:lifecycle-test",
         backend_inventory_hash="backend-inventory:lifecycle-test",
@@ -164,8 +165,8 @@ def _runtime_fixture(
         producer_epoch=1,
     )
     port_config = RealAgentMotionPortConfig(
-        active_sides=("right",),
-        component_id_by_side={"right": "right_arm"},
+        active_sides=("left", "right") if dual else ("right",),
+        component_id_by_side={side: side+"_arm" for side in (("left", "right") if dual else ("right",))},
         execution_frame_id=execution_frame.frame_id,
         execution_frame_spec_hash=execution_frame.semantic_content_hash,
     )
@@ -180,6 +181,7 @@ def _runtime_fixture(
         ),
     )
     bundle = build_real_agent_primitive_contract_bundle(
+        primary_component_id="right_arm",
         attachment=attachment,
         port_config=port_config,
         frame_graph=graph,
@@ -399,6 +401,41 @@ def test_grasp_approach_activates_only_the_preplanned_joint_trajectory(skill_id,
     assert isinstance(command, TeleopCommand)
     metadata = command.metadata[REAL_AGENT_MOTION_COMMAND_METADATA_KEY]
     assert metadata["joint_trajectory_hash"] == trajectory.semantic_content_hash
+    assert builder.last_target is None
+
+
+@pytest.mark.parametrize("side", ["left", "right"])
+@pytest.mark.parametrize("skill_id,planner_key", [
+    ("motion.move_tcp_to_pose_safe", "grasp_trajectory_planner"),
+    ("motion.move_tcp_to_pose", "tcp_trajectory_planner"),
+])
+def test_dual_profile_routes_exact_requested_side_to_planner_and_activation(side, skill_id, planner_key):
+    bundle, port, builder = _runtime_fixture(dual=True, include_safe_pose=True)
+    clock, owner = _Clock(), _OwnerSession()
+    request, operation, route, binding = _pose_request_and_operation(
+        bundle, clock=clock, speed_scale=.2, skill_id=skill_id)
+    request = replace(request, parameters={**request.parameters,
+        "pose_targets_by_component": {side+"_arm": [0, 0, .03, 0, 0, 0, 1]}})
+    operation = replace(operation, request_hash=request.semantic_content_hash)
+    qpos = {arm: np.zeros(6) for arm in ("left", "right")}
+    _publish_qpos(port, qpos_by_side=qpos, measured_at=clock(), available_at=clock())
+    calls = []
+    trajectory = _stationary_grasp_trajectory(qpos)
+    def planner(**kwargs):
+        calls.append(kwargs)
+        return trajectory
+    def advance(duration):
+        clock.value += duration
+        _publish_qpos(port, qpos_by_side=qpos, measured_at=clock(), available_at=clock())
+        port.apply_owner_requests(session=owner, now=clock())
+    lifecycle = RealAgentPrimitiveSkillLifecycle(port=port, contract_bundle=bundle,
+        route=route, binding=binding, profile=bundle.pose_target_profile,
+        request=request, operation=operation, clock=clock, sleep=advance, **{planner_key: planner})
+    assert lifecycle.activate(request=request, operation=operation, cancel_requested=lambda: False).succeeded
+    assert len(calls) == 1 and calls[0]["side"] == side
+    command = port.command_for_observation(TeleopObservation(timestamp=clock()), clock())
+    metadata = command.metadata[REAL_AGENT_MOTION_COMMAND_METADATA_KEY]
+    assert metadata["side"] == side and metadata["component_id"] == side+"_arm"
     assert builder.last_target is None
 
 
@@ -1427,6 +1464,7 @@ def _pose_goal_runtime_fixture(
     include_grasp_approach: bool = False,
     include_safe_pose: bool = False,
     convergence_profile: RealAgentPrimitiveConvergenceProfile | None = None,
+    dual: bool = False,
 ):
     execution_frame = CoordinateFrameSpec(frame_id="dual_arm_solver_world")
     station_frame = CoordinateFrameSpec(
@@ -1456,7 +1494,7 @@ def _pose_goal_runtime_fixture(
         control_domain_id="real-domain:lifecycle-test",
         embodiment_instance_id="dual-rm65:lifecycle-test",
         target_binding_id="real-target:lifecycle-test",
-        component_ids=(motion_side + "_arm",),
+        component_ids=("left_arm", "right_arm") if dual else (motion_side + "_arm",),
         station_manifest_hash="station-manifest:lifecycle-test",
         execution_manifest_hash="execution-manifest:lifecycle-test",
         backend_inventory_hash="backend-inventory:lifecycle-test",
@@ -1476,8 +1514,9 @@ def _pose_goal_runtime_fixture(
         producer_epoch=1,
     )
     port_config = RealAgentMotionPortConfig(
-        active_sides=(motion_side,),
-        component_id_by_side={motion_side: motion_side + "_arm"},
+        active_sides=("left", "right") if dual else (motion_side,),
+        component_id_by_side=({side: side + "_arm" for side in ("left", "right")}
+                              if dual else {motion_side: motion_side + "_arm"}),
         execution_frame_id=execution_frame.frame_id,
         execution_frame_spec_hash=execution_frame.semantic_content_hash,
     )
@@ -1492,6 +1531,7 @@ def _pose_goal_runtime_fixture(
         ),
     )
     bundle = build_real_agent_primitive_contract_bundle(
+        primary_component_id="right_arm" if dual else None,
         attachment=attachment,
         port_config=port_config,
         frame_graph=graph,
@@ -1660,9 +1700,10 @@ def test_safe_pose_move_never_falls_back_to_online_ik_pose_goal_policy(failure, 
 
 @pytest.mark.parametrize("policy", [None, "within_arrival_tolerance", "preserve_target"])
 @pytest.mark.parametrize("motion_side", ["left", "right"])
-def test_grasp_approach_cannot_complete_before_planned_trajectory_elapsed_pose_goal_policy(policy, motion_side) -> None:
+@pytest.mark.parametrize("dual", [False, True])
+def test_grasp_approach_cannot_complete_before_planned_trajectory_elapsed_pose_goal_policy(policy, motion_side, dual) -> None:
     bundle, port, _builder = _pose_goal_runtime_fixture(include_grasp_approach=True, include_safe_pose=True,
-        station_from_execution_x=.1, motion_side=motion_side)
+        station_from_execution_x=.1, motion_side=motion_side, dual=dual)
     clock = _Clock()
     owner = _OwnerSession()
     request, operation, route, binding = _pose_request_and_operation(
@@ -1673,6 +1714,10 @@ def test_grasp_approach_cannot_complete_before_planned_trajectory_elapsed_pose_g
     )
     if policy is not None:
         request = replace(request, parameters={**request.parameters, "pose_goal_policy": policy})
+        operation = replace(operation, request_hash=request.semantic_content_hash)
+    if dual:
+        request = replace(request, parameters={**request.parameters,
+            "pose_targets_by_component": {motion_side + "_arm": [.4, .2, .3, 0, 0, 0, 1]}})
         operation = replace(operation, request_hash=request.semantic_content_hash)
     qpos_by_side = {
         "left": np.zeros(6, dtype=float),
@@ -1710,7 +1755,8 @@ def test_grasp_approach_cannot_complete_before_planned_trajectory_elapsed_pose_g
         port.observe_session_step(command=command, command_dispatched=True)
         dispatch_times.append(clock())
         port.publish_measured_pose(
-            pose_world_by_component={motion_side + "_arm": target_pose},
+            pose_world_by_component=({side + "_arm": target_pose if side == motion_side else np.eye(4)
+                                     for side in ("left", "right")} if dual else {motion_side + "_arm": target_pose}),
             measured_at=clock(),
             available_at=clock(),
             source_evidence_refs=(
@@ -1746,7 +1792,9 @@ def test_grasp_approach_cannot_complete_before_planned_trajectory_elapsed_pose_g
         held = original_hold(**kwargs)
         later_pose = target_pose.copy()
         later_pose[2, 3] += .001
-        port.publish_measured_pose(pose_world_by_component={motion_side + "_arm": later_pose},
+        port.publish_measured_pose(pose_world_by_component=(
+            {side + "_arm": later_pose if side == motion_side else np.eye(4) for side in ("left", "right")}
+            if dual else {motion_side + "_arm": later_pose}),
             measured_at=clock(), available_at=clock(), source_evidence_refs=("later-hold-cut",))
         return held
     lifecycle.request_hold = capture_arrival_then_hold

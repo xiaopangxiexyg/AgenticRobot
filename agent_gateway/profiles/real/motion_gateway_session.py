@@ -1133,8 +1133,7 @@ def _real_hardware_view_provider(
 ) -> HardwareViewProvider:
     """Bind profile-owned ownership units to existing semantic Routes."""
 
-    component_id = contract_bundle.cardinal_profile.component_id
-    arm_route_hashes = []
+    arm_route_hashes = {component: [] for component in contract_bundle.attachment.component_ids}
     perception_route_hashes = []
     for entry in contract_bundle.route_manifest.skill_routes:
         route = entry.route
@@ -1142,9 +1141,10 @@ def _real_hardware_view_provider(
             route.skill_id,
             route.skill_version,
         )
-        if component_id in definition.controlled_component_ids:
-            arm_route_hashes.append(route.semantic_content_hash)
-        elif route.control_effect_class == "read_only" and route.skill_id.startswith(
+        for component, hashes in arm_route_hashes.items():
+            if component in definition.controlled_component_ids:
+                hashes.append(route.semantic_content_hash)
+        if route.control_effect_class == "read_only" and route.skill_id.startswith(
             "perception."
         ):
             perception_route_hashes.append(route.semantic_content_hash)
@@ -1152,7 +1152,7 @@ def _real_hardware_view_provider(
         HardwareResourceBinding(
             resource_id=component_id,
             resource_kind="robot_arm",
-            route_hashes=tuple(arm_route_hashes),
+            route_hashes=tuple(hashes),
             health_provider=lambda: _real_motion_resource_health(
                 port=port,
                 clock=clock,
@@ -1161,7 +1161,7 @@ def _real_hardware_view_provider(
                 ),
             ),
             control_claimed_provider=lambda: _real_motion_control_claimed(port),
-        )
+        ) for component_id, hashes in arm_route_hashes.items()
     ]
     for component, gripper_port in _configured_gripper_ports(gripper_port, gripper_ports).items():
         hand_route = contract_bundle.route_manifest.route(

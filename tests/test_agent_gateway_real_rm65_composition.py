@@ -220,7 +220,7 @@ class _ForceGuard:
         return None
 
 
-def _lower(monkeypatch, *, envelope_side: str = "right"):
+def _lower(monkeypatch, *, envelope_side: str = "right", absolute: bool = False):
     monkeypatch.setattr(
         profile_module,
         "load_assignment",
@@ -246,7 +246,8 @@ def _lower(monkeypatch, *, envelope_side: str = "right"):
             },
             envelope_profile_path=(
                 REPO_ROOT / "teleop_runtime/configs/skill_deploy/"
-                f"agent_primitive_{envelope_side}_relative_tight_v1.json"
+                / (f"agent_grasp_{envelope_side}_absolute_standard_v1.json" if absolute
+                   else f"agent_primitive_{envelope_side}_relative_tight_v1.json")
             ),
         )
     )
@@ -360,6 +361,43 @@ def test_model_free_three_view_projection_uses_the_existing_owner_cut(monkeypatc
         assert len(reads) == read_count == 3
     finally:
         session.close()
+
+
+@pytest.mark.parametrize("primary", ["left", "right"])
+def test_dual_motion_composition_has_one_owner_and_primary_bound_grasp(monkeypatch, tmp_path, primary):
+    lower, guard = _lower(monkeypatch, envelope_side="dual", absolute=True)
+    localizer = _Localizer()
+    composition = assemble_exclusive_rm65_agent_primitive_composition(
+        lower=lower, socket_path=tmp_path / "gateway.sock", authorized_side=primary,
+        authorized_action=None,
+        authorized_motion_sides=("left", "right"),
+        authorized_actions=("move_tcp_to_pose_safe", "execute_grasp_approach_plan"),
+        confirmation_token=REAL_AGENT_PRIMITIVE_CONFIRM_TOKEN, client_id="rpent:test", client_uid=1000,
+        runtime_session_id="dual:test", control_domain_id="dual:domain", embodiment_instance_id="dual:arms",
+        camera_config_path=REPO_ROOT / "teleop_runtime/configs/devices/agent_gateway_realsense.json",
+        camera_registry_path=DEFAULT_RM65_CAMERA_REGISTRY_V4,
+        artifact_root=tmp_path, camera_mount_urdf_path=DEFAULT_RM65_CAMERA_MOUNT_URDF,
+        object_localizer=localizer, point_grasp_planner=_PointGraspPlanner(localizer))
+    session = composition.deployment.gateway_session
+    try:
+        assert session.port is composition.deployment.control_runtime.motion_port
+        assert composition.attachment.component_ids == ("left_arm", "right_arm")
+        assert session.contract_bundle.grasp_approach_plan_registration.profile.side == primary
+        assert session.contract_bundle.pose_target_profile.component_ids == ("left_arm", "right_arm")
+        assert all(backend.starts == 0 for backend in lower.arm_backends.values())
+        assert guard.starts == 0
+    finally:
+        session.artifact_store.close()
+
+
+def test_dual_motion_rejects_single_side_envelope_before_start(monkeypatch, tmp_path):
+    lower, guard = _lower(monkeypatch)
+    with pytest.raises(ValueError, match="does not actively constrain 'left'"):
+        assemble_exclusive_rm65_agent_primitive_composition(lower=lower, socket_path=tmp_path / "gateway.sock",
+            authorized_side="right", authorized_motion_sides=("left", "right"), authorized_action="move_tcp_to_pose_safe",
+            confirmation_token=REAL_AGENT_PRIMITIVE_CONFIRM_TOKEN, client_id="rpent:test", client_uid=1000,
+            runtime_session_id="dual:test", control_domain_id="dual:domain", embodiment_instance_id="dual:arms")
+    assert guard.starts == 0 and all(backend.starts == 0 for backend in lower.arm_backends.values())
 
 
 def test_composition_advertises_right_gripper_without_starting_any_backend(monkeypatch):

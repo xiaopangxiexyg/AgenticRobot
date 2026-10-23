@@ -20,7 +20,8 @@ class _Manifest:
 
 class _Gateway:
     def __init__(self) -> None:
-        self.contract_bundle = SimpleNamespace(route_manifest=_Manifest())
+        self.contract_bundle = SimpleNamespace(route_manifest=_Manifest(),
+            attachment=SimpleNamespace(component_ids=("left_arm", "right_arm")))
         self.service = SimpleNamespace(access_policy=SimpleNamespace())
 
 
@@ -40,6 +41,33 @@ def _request(*, component_id: str = "right_arm", action: str = "move_tcp_to_pose
             }
         },
     )
+
+
+def test_dual_pose_authority_mints_only_separate_single_arm_grants(monkeypatch):
+    monkeypatch.setattr(motion_gateway_session, "RealAgentPrimitiveGatewaySession", _Gateway)
+    issued = []
+    monkeypatch.setattr(session_authorization, "issue_skill_execution_grant",
+        lambda **kwargs: issued.append(kwargs) or SimpleNamespace(grant_id=str(len(issued))))
+    authority = session_authorization.RealAgentPrimitiveSessionAuthorization(
+        gateway_session=_Gateway(), side="right", authorized_motion_sides=("left", "right"),
+        action="move_tcp_to_pose_safe", client_id="rpent.dexteleop",
+        confirmation_token=session_authorization.REAL_AGENT_PRIMITIVE_SESSION_CONFIRM_TOKEN)
+    for arm in ("left", "right"):
+        assert authority.grant_resolver(_request(component_id=arm+"_arm", action="move_tcp_to_pose_safe"))
+    both = _request(action="move_tcp_to_pose_safe")
+    both.parameters["pose_targets_by_component"]["left_arm"] = [0, 0, .3, 0, 0, 0, 1]
+    assert authority.grant_resolver(both) is None
+    assert len(issued) == 2
+
+
+@pytest.mark.parametrize("sides", [(), ("left",), ("right", "other")])
+def test_dual_authority_rejects_invalid_scope(monkeypatch, sides):
+    monkeypatch.setattr(motion_gateway_session, "RealAgentPrimitiveGatewaySession", _Gateway)
+    with pytest.raises(ValueError, match="authorized_motion_sides"):
+        session_authorization.RealAgentPrimitiveSessionAuthorization(
+            gateway_session=_Gateway(), side="right", authorized_motion_sides=sides,
+            action="move_tcp_to_pose_safe", client_id="rpent.dexteleop",
+            confirmation_token=session_authorization.REAL_AGENT_PRIMITIVE_SESSION_CONFIRM_TOKEN)
 
 
 @pytest.mark.parametrize("action", ["move_tcp_to_pose", "move_tcp_to_pose_safe"])

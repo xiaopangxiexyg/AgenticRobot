@@ -167,12 +167,17 @@ class RealAgentPrimitiveSkillLifecycle:
             raise ValueError("Real primitive runtime session mismatch.")
         if profile.component_id != binding.component_id or profile.side != binding.side:
             raise ValueError("Real primitive component/side binding mismatch.")
+        component_id, side = profile.component_id, profile.side
         if isinstance(profile, RealAgentTcpPoseTargetProfile):
             targets = request.parameters.get("pose_targets_by_component")
-            if not isinstance(targets, Mapping) or set(targets) != {
-                profile.component_id
-            }:
+            allowed = (profile.component_ids if route.skill_id in {
+                TCP_POSE_TARGET_SKILL_ID_V1, SAFE_TCP_POSE_TARGET_SKILL_ID_V1,
+            } else (profile.component_id,))
+            if (not isinstance(targets, Mapping) or len(targets) != 1
+                    or not set(targets) <= set(allowed)):
                 raise ValueError("Real absolute-pose request component mismatch.")
+            component_id = next(iter(targets))
+            side = profile.side_for_component(component_id)
         elif request.parameters.get("component_id") != profile.component_id:
             raise ValueError("Real primitive request component mismatch.")
 
@@ -182,6 +187,7 @@ class RealAgentPrimitiveSkillLifecycle:
         self.route = route
         self.binding = binding
         self.profile = profile
+        self.component_id, self.side = component_id, side
         self.request = request
         self.operation = operation
         self.grasp_trajectory_planner = grasp_trajectory_planner
@@ -215,7 +221,7 @@ class RealAgentPrimitiveSkillLifecycle:
             if wait_for_fresh:
                 return None
             raise RuntimeError("No lower measured TCP-pose cut is available.")
-        if self.profile.component_id not in cut.pose_world_by_component:
+        if self.component_id not in cut.pose_world_by_component:
             raise RuntimeError("Measured TCP-pose cut omits the selected component.")
         if cut.measured_at > now or cut.available_at > now:
             if wait_for_fresh:
@@ -274,7 +280,7 @@ class RealAgentPrimitiveSkillLifecycle:
             targets = parameters.get("pose_targets_by_component")
             assert isinstance(targets, Mapping)
             public_pose = xyzquat_to_pose_matrix(
-                targets[self.profile.component_id],
+                targets[self.component_id],
                 name="real_agent_absolute_tool_tcp_target",
             )
             execution_pose, frame_resolution = (
@@ -289,7 +295,7 @@ class RealAgentPrimitiveSkillLifecycle:
             target_hash = canonical_content_hash(
                 {
                     "profile_hash": self.profile.semantic_content_hash,
-                    "component_id": self.profile.component_id,
+                    "component_id": self.component_id,
                     "public_target_pose": tuple(
                         float(value)
                         for value in pose_matrix_to_xyzquat(
@@ -373,7 +379,7 @@ class RealAgentPrimitiveSkillLifecycle:
         measured_pose = tuple(
             float(value)
             for value in pose_matrix_to_xyzquat(
-                cut.pose_world_by_component[self.profile.component_id],
+                cut.pose_world_by_component[self.component_id],
                 name="real_agent_activation_measured_pose",
             )
         )
@@ -389,7 +395,7 @@ class RealAgentPrimitiveSkillLifecycle:
                         operation_id=operation.operation_id,
                         runtime_session_id=self.request.runtime_session_id,
                         profile_hash=self.profile.semantic_content_hash,
-                        component_id=self.profile.component_id,
+                        component_id=self.component_id,
                         expected_station_revision=(
                             self.request.expected_station_revision
                         ),
@@ -466,7 +472,7 @@ class RealAgentPrimitiveSkillLifecycle:
                 with self.non_motion_read_window() if planned_tcp else nullcontext():
                     joint_trajectory = planner(
                         qpos_by_side=qpos_cut.qpos_by_side,
-                        side=self.profile.side,
+                        side=self.side,
                         target_tool_tcp_world=xyzquat_to_pose_matrix(
                             resolution.target_pose, name="real_agent_planned_tcp_target"),
                         speed_scale=float(self.request.parameters.get("speed_scale", 1.0)),
@@ -486,7 +492,7 @@ class RealAgentPrimitiveSkillLifecycle:
                     "side=%s reason_code=%s details=%r",
                     operation.operation_id,
                     self.route.skill_id,
-                    self.profile.side,
+                    self.side,
                     exc.reason_code,
                     exc.details,
                 )
@@ -581,7 +587,7 @@ class RealAgentPrimitiveSkillLifecycle:
             }
             _LOGGER.log(logging.ERROR if postplan_qpos_problem else logging.INFO,
                 "Real TCP postplan_qpos: operation_id=%s skill_id=%s side=%s diagnostic=%r",
-                operation.operation_id, self.route.skill_id, self.profile.side, postplan_diagnostic)
+                operation.operation_id, self.route.skill_id, self.side, postplan_diagnostic)
             if postplan_qpos_problem is not None:
                 reason = "grasp_path_postplan_measured_qpos_" + postplan_qpos_problem
                 hold = self.request_hold(operation=operation, reason=reason)
@@ -788,8 +794,8 @@ class RealAgentPrimitiveSkillLifecycle:
             request_id=request.request_id,
             activation_grant_id=grant_id,
             activation_grant_hash=grant_hash,
-            component_id=self.profile.component_id,
-            side=self.profile.side,
+            component_id=self.component_id,
+            side=self.side,
             primitive_id=primitive_id,
             primitive_hash=primitive_hash,
             target_pose_world=xyzquat_to_pose_matrix(
@@ -1074,7 +1080,7 @@ class RealAgentPrimitiveSkillLifecycle:
                 measured_pose = tuple(
                     float(value)
                     for value in pose_matrix_to_xyzquat(
-                        cut.pose_world_by_component[self.profile.component_id],
+                        cut.pose_world_by_component[self.component_id],
                         name="real_agent_terminal_measured_pose",
                     )
                 )
@@ -1131,7 +1137,7 @@ class RealAgentPrimitiveSkillLifecycle:
                             source_reference_frame_id=self.profile.execution_reference_frame_id,
                             target_reference_frame_id=self.profile.reference_frame_id)
                         requested_public_pose = self.request.parameters[
-                            "pose_targets_by_component"][self.profile.component_id]
+                            "pose_targets_by_component"][self.component_id]
                         achieved_public_pose = tuple(float(value) for value in pose_matrix_to_xyzquat(
                             public_measured, name="safe_tcp_measured_public"))
                         report_translation, report_rotation_deg = pose_delta_metrics(

@@ -123,6 +123,41 @@ def _port(builder: _TargetBuilder | None = None) -> RealAgentMotionPort:
     )
 
 
+@pytest.mark.parametrize("side", ["left", "right"])
+def test_dual_authorized_port_keeps_unrequested_arm_out_of_ik(side):
+    class Builder(_TargetBuilder):
+        def build_command_for_target_pair(self, target):
+            self.targets.append(target)
+            command = TeleopCommand(timestamp=target.timestamp)
+            selected = target.active_sides[0]
+            command.add_command(EffectorCommand(effector_name=selected+"_arm", side=selected,
+                command_type="joint_vector", value=np.zeros(6)))
+            return command
+    builder = Builder()
+    port = RealAgentMotionPort(config=RealAgentMotionPortConfig(
+        active_sides=("left", "right"),
+        component_id_by_side={"left": "left-tool-tcp", "right": "right-tool-tcp"},
+        execution_frame_id="dual-arm-solver-world", execution_frame_spec_hash="solver-world-spec-hash-1"),
+        target_builder=builder)
+    activation = replace(_activation(), side=side, component_id=side+"-tool-tcp")
+    forbidden = RealAgentJointTrajectory(time_from_start_sec=np.array([0., .1]),
+        qpos_by_side={arm: np.array([[0.] * 6, [.1] * 6]) for arm in ("left", "right")},
+        planner_evidence_refs=("test:both-arms-moving",))
+    with pytest.raises(ValueError, match="unauthorized inactive arm"):
+        port.submit_activation(replace(activation, joint_trajectory=forbidden))
+    port.submit_activation(activation)
+    other = "left" if side == "right" else "right"
+    with pytest.raises(RuntimeError, match="busy"):
+        port.submit_activation(replace(activation, operation_id="second-operation",
+            side=other, component_id=other+"-tool-tcp"))
+    port.apply_owner_requests(session=_Session(TeleopRunState.ARMED), now=1.1)
+    port.command_for_observation(TeleopObservation(timestamp=1.2), 1.2)
+    assert builder.targets[-1].active_sides == (side,)
+    assert builder.targets[-1].hard_hold_inactive_sides is True
+    np.testing.assert_array_equal(builder.targets[-1].target_pose_by_side[other],
+                                  builder.current_tool_tcp_world_targets()[other])
+
+
 def _components_for_attachment(
     *,
     session: object,

@@ -356,6 +356,7 @@ class RealAgentTcpPoseTargetProfile:
     convergence_profile_hash: str
     min_speed_scale: float = 0.05
     max_speed_scale: float = 1.0
+    additional_components: tuple[tuple[str, str], ...] = ()
 
     def __post_init__(self) -> None:
         for field_name in (
@@ -388,6 +389,21 @@ class RealAgentTcpPoseTargetProfile:
             raise ValueError("speed scales must satisfy 0 < min <= max <= 1.")
         object.__setattr__(self, "min_speed_scale", minimum)
         object.__setattr__(self, "max_speed_scale", maximum)
+        extra = tuple(sorted(tuple(pair) for pair in self.additional_components))
+        components = ((self.component_id, self.side), *extra)
+        if (any(len(pair) != 2 or not isinstance(pair[0], str) or not pair[0]
+                or pair[1] not in {"left", "right"} for pair in components)
+                or len({pair[0] for pair in components}) != len(components)
+                or len({pair[1] for pair in components}) != len(components)):
+            raise ValueError("Pose profile requires unique component/side bindings.")
+        object.__setattr__(self, "additional_components", extra)
+
+    @property
+    def component_ids(self) -> tuple[str, ...]:
+        return tuple(sorted((self.component_id, *(item[0] for item in self.additional_components))))
+
+    def side_for_component(self, component_id: str) -> str:
+        return dict(((self.component_id, self.side), *self.additional_components))[component_id]
 
     @property
     def skill_id(self) -> str:
@@ -405,7 +421,8 @@ class RealAgentTcpPoseTargetProfile:
     def semantic_content_hash(self) -> str:
         return canonical_content_hash(
             {
-                **self.__dict__,
+                **{key: value for key, value in self.__dict__.items()
+                   if key != "additional_components" or value},
                 "profile_id": self.parameter_profile_id,
                 "controlled_frame_id": "tool_tcp",
                 "target_semantics": "absolute_pose_in_public_reference_frame",
@@ -866,6 +883,9 @@ def _payload_validator(
     cardinal = isinstance(profile, RealAgentTcpCardinalStepProfile)
     pose_target = isinstance(profile, RealAgentTcpPoseTargetProfile)
     plan_execution = isinstance(profile, RealGraspApproachPlanProfile)
+    pose_components = (profile.component_ids if pose_target and route.skill_id in {
+        TCP_POSE_TARGET_SKILL_ID_V1, SAFE_TCP_POSE_TARGET_SKILL_ID_V1,
+    } else (profile.component_id,))
     parameter_fields = (
         {
             "component_id",
@@ -945,7 +965,7 @@ def _payload_validator(
                 )
             ),
             "parameters": payload,
-            "allowed_component_ids": (profile.component_id,),
+            "allowed_component_ids": pose_components,
         }
         if isinstance(profile, RealAgentTcpCardinalStepProfile):
             validation_kwargs["allowed_cardinal_directions"] = (
@@ -976,9 +996,8 @@ def _payload_validator(
                 raise ValueError(f"Real primitive {field_name} mismatch.")
         if pose_target:
             targets = payload["pose_targets_by_component"]
-            if not isinstance(targets, Mapping) or set(targets) != {
-                profile.component_id
-            }:
+            if (not isinstance(targets, Mapping) or len(targets) != 1
+                    or not set(targets) <= set(pose_components)):
                 raise ValueError(
                     "Real absolute-pose target must select exactly the bound component."
                 )
@@ -1047,6 +1066,7 @@ def build_real_agent_primitive_contract_bundle(
     *,
     attachment: RealTcpPoseObserveAttachmentSpec,
     port_config: RealAgentMotionPortConfig,
+    primary_component_id: str | None = None,
     frame_graph: CoordinateFrameGraph,
     primitive_reference_frame_id: str,
     safety_envelope_refs: tuple[SkillDeploymentSafetyEnvelopeRef, ...],
@@ -1160,11 +1180,12 @@ def build_real_agent_primitive_contract_bundle(
 
     if set(attachment.component_ids) != set(port_config.component_id_by_side.values()):
         raise ValueError("Observation and motion-port component sets disagree.")
-    if len(attachment.component_ids) != 1:
-        raise ValueError(
-            "The v1 real primitive profile binds exactly one arm component."
-        )
-    component_id = attachment.component_ids[0]
+    if len(attachment.component_ids) != 1 and primary_component_id is None:
+        raise ValueError("Multiple arms require an explicit primary component for grasp/fixed primitives.")
+    component_id = (attachment.component_ids[0] if primary_component_id is None
+                    else _required(primary_component_id, field_name="primary_component_id"))
+    if component_id not in attachment.component_ids:
+        raise ValueError("Primary component is absent from the motion attachment.")
     side = next(
         side
         for side, bound_component in port_config.component_id_by_side.items()
@@ -1190,6 +1211,9 @@ def build_real_agent_primitive_contract_bundle(
     pose_target_profile = RealAgentTcpPoseTargetProfile(
         component_id=component_id,
         side=side,
+        additional_components=tuple((component, arm_side)
+            for arm_side, component in port_config.component_id_by_side.items()
+            if component != component_id),
         reference_frame_id=primitive_frame.frame_id,
         reference_frame_spec_hash=primitive_frame.semantic_content_hash,
         execution_reference_frame_id=port_config.execution_frame_id,
@@ -1229,13 +1253,14 @@ def build_real_agent_primitive_contract_bundle(
         else None
     )
     pose_target_definition = tcp_pose_target_skill_definition_v1(
-        controlled_component_ids=(component_id,),
+        controlled_component_ids=pose_target_profile.component_ids,
     )
     pose_target_schema = tcp_pose_target_schema_entry_v1(
+        max_target_components=1 if pose_target_profile.additional_components else None,
         skill_definition_hash=pose_target_definition.semantic_content_hash,
         parameter_profile_id=pose_target_profile.parameter_profile_id,
         parameter_profile_hash=pose_target_profile.semantic_content_hash,
-        allowed_component_ids=(component_id,),
+        allowed_component_ids=pose_target_profile.component_ids,
         allowed_reference_frame_ids=(pose_target_profile.reference_frame_id,),
         max_requested_duration_ms=None,
         min_speed_scale=pose_target_profile.min_speed_scale,
@@ -1245,14 +1270,15 @@ def build_real_agent_primitive_contract_bundle(
         controlled_component_ids=(component_id,),
     )
     safe_pose_definition = safe_tcp_pose_target_skill_definition_v1(
-        controlled_component_ids=(component_id,),
+        controlled_component_ids=pose_target_profile.component_ids,
     )
     safe_pose_schema = tcp_pose_target_schema_entry_v1(
+        max_target_components=1 if pose_target_profile.additional_components else None,
         skill_id=SAFE_TCP_POSE_TARGET_SKILL_ID_V1,
         skill_definition_hash=safe_pose_definition.semantic_content_hash,
         parameter_profile_id=pose_target_profile.parameter_profile_id,
         parameter_profile_hash=pose_target_profile.semantic_content_hash,
-        allowed_component_ids=(component_id,),
+        allowed_component_ids=pose_target_profile.component_ids,
         allowed_reference_frame_ids=(pose_target_profile.reference_frame_id,),
         max_requested_duration_ms=None,
         min_speed_scale=pose_target_profile.min_speed_scale,
