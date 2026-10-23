@@ -1350,6 +1350,12 @@ when the lower Skill is activated. Distance, frame/tool/calibration identities,
 primitive hash, safety envelope, IK, dispatch, evaluation, and HOLD remain
 trusted deployment facts.
 
+控制结果发布后、适配请求创建前若原 support 窗口已过期，下层保留真实发布记录，
+不创建适配请求或伪造回执，继续执行原 directive 中要求的 HOLD/取消。
+只有无停止要求的正常结果才返回 `target_support_expired_before_adaptation_keep_existing`；
+MuJoCo Skill 仅在该精确状态及无适配、提交、安全或派发结果的证据组合下，
+在原调用预算内重试同一 reference。过期周期不计作执行成功，不延长 TTL 或旧 segment。
+
 MuJoCo 的现有入口可显式增加 `--enable-safe-tcp-pose`，为会话选定的一臂发布
 `motion.move_tcp_to_pose_safe@1`；默认不发布。该 Route 使用当前场景、另一臂的
 实测起点和已绑定工具配置，复用下层 RM65 IK、BiRRT-Connect、C2 时间参数化

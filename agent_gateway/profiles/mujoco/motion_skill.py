@@ -136,7 +136,10 @@ def _authoritative_step_keeps_existing_for_retry(authoritative: Any) -> bool:
     """
 
     status = getattr(authoritative, "status", None)
-    if status == "target_support_expired_before_submission_keep_existing":
+    if status in {
+        "target_support_expired_before_adaptation_keep_existing",
+        "target_support_expired_before_submission_keep_existing",
+    }:
         publication = getattr(authoritative, "publication_attempt", None)
         directive = getattr(authoritative, "directive", None)
         directives = getattr(directive, "directive_by_selection_group", None)
@@ -145,6 +148,7 @@ def _authoritative_step_keeps_existing_for_retry(authoritative: Any) -> bool:
             getattr(authoritative, "decision", None) is not None
             and publication is not None
             and bool(getattr(publication, "accepted", False))
+            and getattr(publication, "required_fallback", None) is None
             and getattr(directive, "global_status", None) == "normal"
             and isinstance(directives, Mapping)
             and directives
@@ -152,12 +156,11 @@ def _authoritative_step_keeps_existing_for_retry(authoritative: Any) -> bool:
                 getattr(item, "directive", None) == "publish_selected"
                 for item in directives.values()
             )
-            and adaptation is not None
-            and bool(
-                getattr(
-                    getattr(adaptation, "receipt", None),
-                    "accepted",
-                    False,
+            and (
+                adaptation is None
+                if status == "target_support_expired_before_adaptation_keep_existing"
+                else adaptation is not None and bool(
+                    getattr(getattr(adaptation, "receipt", None), "accepted", False)
                 )
             )
             and getattr(authoritative, "target_execution_request", None) is None
@@ -165,8 +168,12 @@ def _authoritative_step_keeps_existing_for_retry(authoritative: Any) -> bool:
             and getattr(authoritative, "target_dispatch_result", None) is None
             and getattr(authoritative, "target_completion_receipt", None) is None
             and getattr(authoritative, "cancellation", None) is None
+            and getattr(authoritative, "cancellation_receipt", None) is None
+            and getattr(authoritative, "cancellation_dispatch_validation", None) is None
             and getattr(authoritative, "safety_result", None) is None
             and getattr(authoritative, "resolution_failure", None) is None
+            and getattr(authoritative, "command", None) is None
+            and getattr(authoritative, "dispatch_context", None) is None
             and getattr(authoritative, "dispatch_validation", None) is None
             and getattr(authoritative, "dispatch_receipts", None) is None
         )
