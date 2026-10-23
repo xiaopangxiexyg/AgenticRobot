@@ -187,6 +187,16 @@ class MujocoAgentTcpPoseGatewaySession:
     object_observer: MujocoGraspedObjectObserver | None = None
     gripper_executor: ReusableStationAgentSkillOperationExecutor | None = None
     gripper_ports: Mapping[str, MujocoGripperControlPort] = field(default_factory=dict)
+    grasp_observation_executor: PassiveReadSkillExecutor | None = None
+    fast_grasp_executor: PassiveReadSkillExecutor | None = None
+    execute_grasp_plan_executor: ReusableStationAgentSkillOperationExecutor | None = None
+    fast_grasp_provider: Any | None = None
+    fast_grasp_planner: Any | None = None
+    _fast_grasp_model_started: bool = field(default=False, init=False, repr=False)
+    _fast_grasp_segmenter_started: bool = field(default=False, init=False, repr=False)
+    _fast_grasp_model_closed: bool = field(default=False, init=False, repr=False)
+    _fast_grasp_segmenter_closed: bool = field(default=False, init=False, repr=False)
+    _fast_grasp_start_failed: bool = field(default=False, init=False, repr=False)
     _close_lock: threading.Lock = field(
         default_factory=threading.Lock,
         init=False,
@@ -215,6 +225,12 @@ class MujocoAgentTcpPoseGatewaySession:
     )
 
     def __post_init__(self) -> None:
+        fast_parts = (self.contract_bundle.fast_grasp_contract is not None,
+                      self.grasp_observation_executor is not None, self.fast_grasp_executor is not None,
+                      self.execute_grasp_plan_executor is not None, self.fast_grasp_provider is not None,
+                      self.fast_grasp_planner is not None)
+        if any(fast_parts) and not all(fast_parts):
+            raise ValueError("Fast grasp contract, model, provider and executors must coexist.")
         if (self.contract_bundle.spatial_goal_registration is not None) != (self.spatial_goal_executor is not None):
             raise ValueError("Spatial goal registration and executor must coexist.")
         if (self.contract_bundle.tcp_pose_comparison_registration is not None) != (self.tcp_pose_comparison_executor is not None):
@@ -344,28 +360,63 @@ class MujocoAgentTcpPoseGatewaySession:
         with self._close_lock:
             if self._close_started or self.service.is_closed:
                 raise RuntimeError("Closed Gateway session cannot start resources.")
-            if self.segmentation_localizer is None or self._segmentation_model_started:
-                return
-            start = getattr(self.segmentation_localizer, "start", None)
-            if not callable(start):
-                raise TypeError("Segmentation localizer must expose start().")
-            try:
-                start()
-            except Exception as start_error:
-                close_model = getattr(self.segmentation_localizer, "close", None)
-                if not callable(close_model):
-                    raise TypeError(
-                        "Segmentation model startup failed without a cleanup port."
-                    ) from start_error
+            if self._fast_grasp_start_failed:
+                raise RuntimeError("Failed fast grasp startup cannot restart resources.")
+            if self.segmentation_localizer is not None and not self._segmentation_model_started:
+                start = getattr(self.segmentation_localizer, "start", None)
+                if not callable(start):
+                    raise TypeError("Segmentation localizer must expose start().")
                 try:
-                    close_model()
-                except Exception as cleanup_error:  # noqa: BLE001 - preserve both failures.
-                    raise RuntimeError(
-                        "Segmentation model startup cleanup failed: "
-                        f"{type(cleanup_error).__name__}:{cleanup_error}"
-                    ) from start_error
-                raise
-            self._segmentation_model_started = True
+                    start()
+                except Exception as start_error:
+                    close_model = getattr(self.segmentation_localizer, "close", None)
+                    if not callable(close_model):
+                        raise TypeError(
+                            "Segmentation model startup failed without a cleanup port."
+                        ) from start_error
+                    try:
+                        close_model()
+                    except Exception as cleanup_error:  # noqa: BLE001 - preserve both failures.
+                        raise RuntimeError(
+                            "Segmentation model startup cleanup failed: "
+                            f"{type(cleanup_error).__name__}:{cleanup_error}"
+                        ) from start_error
+                    raise
+                self._segmentation_model_started = True
+            if self.fast_grasp_planner is not None:
+                for name, resource in (
+                    ("segmenter", self.fast_grasp_planner.point_segmenter),
+                    ("model", self.fast_grasp_planner),
+                ):
+                    started_flag = "_fast_grasp_" + name + "_started"
+                    closed_flag = "_fast_grasp_" + name + "_closed"
+                    if getattr(self, closed_flag):
+                        raise RuntimeError("Closed fast grasp resource cannot restart.")
+                    if getattr(self, started_flag):
+                        continue
+                    start = getattr(resource, "start", None)
+                    if not callable(start):
+                        continue  # A stateless injected segmenter has no startup work.
+                    close = getattr(resource, "close", None)
+                    if not callable(close):
+                        raise TypeError("A stateful fast grasp resource must expose close().")
+                    # Partial startup stays owned until cleanup is confirmed.
+                    setattr(self, started_flag, True)
+                    try:
+                        start()
+                    except BaseException as start_error:
+                        self._fast_grasp_start_failed = True
+                        try:
+                            close()
+                        except BaseException as cleanup_error:  # noqa: BLE001 - preserve both failures.
+                            raise RuntimeError(
+                                f"Fast grasp {name} startup cleanup failed: "
+                                f"{type(cleanup_error).__name__}:{cleanup_error}"
+                            ) from start_error
+                        setattr(self, started_flag, False)
+                        setattr(self, closed_flag, True)
+                        raise
+
 
     def build_unix_json_server(
         self,
@@ -458,6 +509,7 @@ class MujocoAgentTcpPoseGatewaySession:
             ),
             *((self.grasp_contact_executor,) if self.grasp_contact_executor is not None else ()),
             *((self.object_motion_executor,) if self.object_motion_executor is not None else ()),
+            *((self.execute_grasp_plan_executor,) if self.execute_grasp_plan_executor is not None else ()),
             self.cardinal_step_executor,
             *tuple(
                 self.fixed_cardinal_step_executors[skill_id]
@@ -516,6 +568,8 @@ class MujocoAgentTcpPoseGatewaySession:
                     ("tcp_pose_comparison", self.tcp_pose_comparison_executor, 5.0),
                     ("object_state", self.object_state_executor, 5.0),
                     ("segmentation", self.segmentation_executor, 65.0),
+                    ("grasp_observation", self.grasp_observation_executor, 65.0),
+                    ("fast_grasp", self.fast_grasp_executor, 65.0),
                     (
                         "placement",
                         getattr(self, "placement_executor", None),
@@ -549,6 +603,28 @@ class MujocoAgentTcpPoseGatewaySession:
                         cleanup_errors.append(("segmentation_model", error))
                     else:
                         self._segmentation_model_started = False
+            if passive_settled and self.fast_grasp_provider is not None:
+                try:
+                    self.fast_grasp_provider.close()
+                except Exception as error:  # noqa: BLE001 - continue owned cleanup.
+                    cleanup_errors.append(("fast_grasp_provider", error))
+            if passive_settled and self.fast_grasp_planner is not None:
+                for name, resource in (
+                    ("model", self.fast_grasp_planner),
+                    ("segmenter", self.fast_grasp_planner.point_segmenter),
+                ):
+                    closed_flag = "_fast_grasp_" + name + "_closed"
+                    if getattr(self, closed_flag):
+                        continue
+                    close_resource = getattr(resource, "close", None)
+                    try:
+                        if callable(close_resource):
+                            close_resource()
+                    except Exception as error:  # noqa: BLE001 - preserve retryable cleanup.
+                        cleanup_errors.append(("fast_grasp_" + name, error))
+                    else:
+                        setattr(self, closed_flag, True)
+                        setattr(self, "_fast_grasp_" + name + "_started", False)
             if passive_settled and recorder_settled:
                 try:
                     assert outcome is not None
@@ -686,6 +762,7 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
     owns_artifact_store: bool = False,
     segmentation_localizer: object | None = None,
     gripper_ports: Mapping[str, MujocoGripperControlPort] | None = None,
+    fast_grasp_planner: Any | None = None,
 ) -> MujocoAgentTcpPoseGatewaySession:
     """Wire exact Routes without starting the application or history recorder."""
 
@@ -749,6 +826,8 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
         raise ValueError("Artifact store cannot be bound without an Artifact Skill.")
     if owns_artifact_store and artifact_store is None:
         raise ValueError("Owned Artifact store must be injected.")
+    if (fast_grasp_planner is not None) != (contract_bundle.fast_grasp_contract is not None):
+        raise ValueError("Fast grasp contract and model must coexist.")
     segmentation_enabled = contract_bundle.segmentation is not None
     if segmentation_enabled != (segmentation_localizer is not None):
         raise ValueError("Segmentation registration and localizer must coexist.")
@@ -1753,6 +1832,52 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
             domain_hold=domain_hold, clock=runtime_clock)
         hand_route = contract_bundle.gripper_contract.route_manifest.skill_routes[0].route
         execution_port_by_route_hash[hand_route.semantic_content_hash] = gripper_executor
+    grasp_observation_executor = fast_grasp_executor = execute_grasp_plan_executor = fast_grasp_provider = None
+    if contract_bundle.fast_grasp_contract is not None:
+        from .grasp_observation import build_mujoco_grasp_observation_executor
+        from .grasp_fast_plan import (
+            MujocoFastGraspPlanProvider, MujocoPairedGraspPlanLifecycle, build_mujoco_fast_grasp_executor,
+        )
+
+        fast = contract_bundle.fast_grasp_contract
+        revision = lambda: observation_producer.current_station_revision
+        grasp_observation_executor = build_mujoco_grasp_observation_executor(
+            application=application, contract=fast, artifact_store=artifact_store,
+            current_station_revision=revision, clock=runtime_clock, max_retained_operations=retention)
+        # The existing service store remains the sole completion authority. No
+        # provider callback runs before this assembly has constructed service.
+        fast_grasp_provider = MujocoFastGraspPlanProvider(
+            application=application, bundle=contract_bundle, model=fast_grasp_planner,
+            observation_executor=grasp_observation_executor, artifact_store=artifact_store,
+            operation_lookup=lambda identifier: service.get_operation(identifier),
+            current_station_revision=revision, clock=runtime_clock)
+        fast_grasp_executor = build_mujoco_fast_grasp_executor(provider=fast_grasp_provider,
+            current_station_revision=revision, clock=runtime_clock, max_retained_operations=retention)
+        execute_route = fast.execute.skill.routes[0]
+        execute_contract = fast.execution_contract
+        execute_binding = execute_contract.deployment_binding
+
+        def paired_lifecycle_factory(*, request, operation):
+            return MujocoPairedGraspPlanLifecycle(plan_provider=fast_grasp_provider,
+                application=application, domain_hold=domain_hold, route=execute_route,
+                deployment_binding=execute_binding, evaluation_plan=execute_contract.evaluation_plan,
+                motion_profile=execute_contract.motion_profile, request=request, operation=operation,
+                clock=runtime_clock)
+
+        execute_grasp_plan_executor = ReusableStationAgentSkillOperationExecutor(
+            port_id="agent-gateway:mujoco-retained-grasp:" + execute_binding.runtime_session_id,
+            binding=StationOperationWorkerBinding(worker_id="mujoco-retained-grasp:" + execute_binding.runtime_session_id,
+                executor_id=execute_binding.executor_id, runtime_session_id=execute_binding.runtime_session_id,
+                skill_id=execute_route.skill_id, skill_version=execute_route.skill_version,
+                route_id=execute_route.route_id, route_version=execute_route.route_version,
+                deployment_binding_hash=execute_binding.semantic_content_hash),
+            lifecycle_factory=paired_lifecycle_factory, domain_hold=domain_hold,
+            current_station_revision=revision, clock=runtime_clock)
+        execution_port_by_route_hash.update({
+            fast.observation.entry.route.semantic_content_hash: grasp_observation_executor,
+            fast.fast.entry.route.semantic_content_hash: fast_grasp_executor,
+            fast.execute.entry.route.semantic_content_hash: execute_grasp_plan_executor,
+        })
     executor_registry = SkillExecutorRegistry(
         manifest=contract_bundle.route_manifest,
         bindings=tuple(
@@ -1897,6 +2022,11 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
         object_observer=object_observer,
         gripper_executor=gripper_executor,
         gripper_ports=gripper_ports,
+        grasp_observation_executor=grasp_observation_executor,
+        fast_grasp_executor=fast_grasp_executor,
+        execute_grasp_plan_executor=execute_grasp_plan_executor,
+        fast_grasp_provider=fast_grasp_provider,
+        fast_grasp_planner=fast_grasp_planner,
     )
 
 

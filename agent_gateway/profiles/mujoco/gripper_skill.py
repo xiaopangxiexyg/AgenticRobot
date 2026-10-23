@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import time
 from collections.abc import Callable
 from typing import Any
@@ -35,11 +36,16 @@ class MujocoGripperControlPort:
         component_id: str | None = None,
         clock=time.monotonic,
         arm_held: Callable[[], bool] | None = None,
+        stationary_joint_speed_rad_sec: float = 0.02,
     ) -> None:
         if not callable(clock):
             raise TypeError("clock must be callable.")
         if arm_held is not None and not callable(arm_held):
             raise TypeError("arm_held must be callable or None.")
+        stationary_joint_speed_rad_sec = float(stationary_joint_speed_rad_sec)
+        if not math.isfinite(stationary_joint_speed_rad_sec) or stationary_joint_speed_rad_sec <= 0:
+            raise ValueError("stationary_joint_speed_rad_sec must be finite and positive.")
+        self._stationary_joint_speed_rad_sec = stationary_joint_speed_rad_sec
         self._arm_held = arm_held
         self._requires_arm_hold = arm_held is not None
         for method_name in (
@@ -81,6 +87,7 @@ class MujocoGripperControlPort:
                 "gripper_name": self.gripper_name,
                 "actuation_profile": None if actuator_profile is None else actuator_profile.to_metadata(),
                 "requires_arm_hold": arm_held is not None,
+                "stationary_joint_speed_rad_sec": stationary_joint_speed_rad_sec,
             },
             domain="dexteleop.agent_skill.gripper_port_binding.v1",
         )
@@ -146,7 +153,12 @@ class MujocoGripperControlPort:
         measured = float(snapshot["measured_close_by_gripper"][self.gripper_name])
         rate = float(snapshot["actuator_target_rate_by_gripper"][self.gripper_name])
         pending = self.gripper_name in snapshot["pending_close_by_gripper"]
-        moving = bool(pending or abs(rate) > 1e-5)
+        joint_speed = float(snapshot["measured_max_joint_speed_rad_sec_by_gripper"][self.gripper_name])
+        if not math.isfinite(joint_speed) or joint_speed < 0:
+            raise RuntimeError("MuJoCo measured gripper joint speed is invalid.")
+        # A settled interpolator is not proof that the physical hand stopped.
+        moving = bool(pending or abs(rate) > 1e-5
+                      or joint_speed > self._stationary_joint_speed_rad_sec)
         observed_at = float(self.clock())
         return GripperStateSample(
             measured_close=measured,
@@ -158,6 +170,7 @@ class MujocoGripperControlPort:
                 {
                     "measured_close": measured,
                     "moving": moving,
+                    "max_joint_speed_rad_sec": joint_speed,
                     "observed_at": observed_at,
                 },
             ),

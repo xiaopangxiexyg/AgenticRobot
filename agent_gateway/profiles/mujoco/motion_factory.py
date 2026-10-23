@@ -282,6 +282,7 @@ def _build_standard_tcp_pose_envelope_runtime(
     grasp_contact_binding: MujocoGraspContactBinding | None = None,
     enable_object_motion: bool = False,
     motion_side: str = "right",
+    enable_fast_grasp: bool = False,
 ) -> TCPPoseEnvelopeSafetyRuntime:
     """Bind separate lower envelopes for bounded pose and fixed heading Routes.
 
@@ -418,11 +419,15 @@ def _build_standard_tcp_pose_envelope_runtime(
                 constraint_set_hash=canonical_content_hash(
                     {
                         "profile": grasp_profile.semantic_content_hash,
-                        "contact_permission": "none_noncontact_joint_path_only",
+                        "contact_permission": ("ordinary_approach_noncontact;paired_execution_uses_retained_terminal_policy"
+                            if enable_fast_grasp else "none_noncontact_joint_path_only"),
+                        **({"retained_terminal_policy_hash": grasp_contact_binding.semantic_content_hash}
+                           if enable_fast_grasp and grasp_contact_binding is not None else {}),
                     },
                     domain="mujoco.grasp_approach.absolute_envelope.v1",
                 ),
-                allowed_route_ids=(MUJOCO_AGENT_GRASP_APPROACH_ROUTE_ID_V1,),
+                allowed_route_ids=(MUJOCO_AGENT_GRASP_APPROACH_ROUTE_ID_V1,
+                    *(("sim.mujoco.motion.execute_grasp_approach_plan.v1",) if enable_fast_grasp else ())),
             )
         )
         if grasp_contact_binding is not None:
@@ -525,6 +530,8 @@ def build_mujoco_agent_tcp_pose_gateway_session(
     enable_grippers: bool = False,
     enable_grasp_approach: bool = False,
     grasp_contact_target_body: str | None = None,
+    fast_grasp_planner: Any | None = None,
+    fast_grasp_approach_config: Mapping[str, float] | None = None,
 ) -> MujocoAgentTcpPoseGatewaySession:
     """Build the exact default-off graph; do not start, record, or serve it."""
 
@@ -578,6 +585,17 @@ def build_mujoco_agent_tcp_pose_gateway_session(
         )
     if grasp_contact_target_body is not None and not enable_grasp_approach:
         raise ValueError("Terminal contact requires explicit grasp approach enablement.")
+    if fast_grasp_planner is not None:
+        if side != "right":
+            raise ValueError("Fast grasp currently requires the native right arm.")
+        from deployments.perception.sam2_graspgenx_point_grasp import Sam2GraspGenXPointGraspPlanner
+
+        if not isinstance(fast_grasp_planner, Sam2GraspGenXPointGraspPlanner):
+            raise TypeError("fast_grasp_planner must be the existing typed GraspGenX planner.")
+        if (not enable_grasp_approach or grasp_contact_target_body is None or artifact_storage is None):
+            raise ValueError("Fast grasp requires Artifact storage and the complete target-bound native approach graph.")
+    elif fast_grasp_approach_config is not None:
+        raise ValueError("A fast grasp configuration requires its model binding.")
     if history_storage is not None and not isinstance(
         history_storage,
         MujocoAgentTcpPoseHistoryStorageConfig,
@@ -612,6 +630,21 @@ def build_mujoco_agent_tcp_pose_gateway_session(
     if side == "left":
         _validate_left_tool_sources(target_config)
     prepared = prepare_mujoco_sim_hil_target(target_config)
+    if fast_grasp_planner is not None:
+        from deployments.perception.dmtac_grasp_overlay import (
+            DMTAC_M_REVIEWED_TOOL_TCP_POSE_FLANGE_M_RAD, reviewed_graspgenx_dmtac_solid_geometry,
+        )
+        from robot_motion.rm65 import load_rm65_tool_profile, tool_tcp_pose_flange_m_rad
+
+        actual_tcp = tool_tcp_pose_flange_m_rad(load_rm65_tool_profile(
+            prepared.task_config.right_tool_profile_path, side="right"))
+        if (any(not math.isclose(float(a), float(b), abs_tol=1e-9, rel_tol=0)
+                for a, b in zip(actual_tcp, DMTAC_M_REVIEWED_TOOL_TCP_POSE_FLANGE_M_RAD))
+                or fast_grasp_planner.solid_geometry != reviewed_graspgenx_dmtac_solid_geometry(
+                    maximum_opening_m=fast_grasp_planner.max_gripper_width_m)
+                or not all(prepared.scene.has_body(name) for name in (
+                    "right_gripper_l_dm_tac_w2m_sensor", "right_gripper_r_dm_tac_w2m_sensor"))):
+            raise ValueError("Fast GraspGenX requires the reviewed DMTAC M tool TCP and native sensor assembly.")
     grasp_contact_binding = (
         None if grasp_contact_target_body is None else bind_task_grasp_contact(
             prepared.scene, prepared.gripper_profile, grasp_contact_target_body)
@@ -669,6 +702,7 @@ def build_mujoco_agent_tcp_pose_gateway_session(
         enable_safe_tcp_pose=enable_safe_tcp_pose,
         enable_grasp_approach=enable_grasp_approach,
         grasp_contact_binding=grasp_contact_binding,
+        enable_fast_grasp=fast_grasp_planner is not None,
         enable_object_motion=enable_object_motion,
         motion_side=side,
     )
@@ -761,6 +795,14 @@ def build_mujoco_agent_tcp_pose_gateway_session(
         )
         if enable_grippers:
             contract_bundle = _bind_grippers(contract_bundle, gripper_ports)
+        if fast_grasp_planner is not None:
+            from .grasp_deployment import build_mujoco_fast_grasp_contract
+
+            config = ({"pregrasp_distance_m": .07, "near_distance_m": .025,
+                       "terminal_offset_m": 0., "terminal_speed_scale": .25}
+                      if fast_grasp_approach_config is None else dict(fast_grasp_approach_config))
+            contract_bundle = build_mujoco_fast_grasp_contract(contract_bundle,
+                model_profile_hash=fast_grasp_planner.semantic_content_hash, approach_config=config)
         if history_storage is not None:
             source_binding = contract_bundle.history_source_binding
             if source_binding is None:
@@ -793,6 +835,7 @@ def build_mujoco_agent_tcp_pose_gateway_session(
             artifact_store=artifact_store,
             owns_artifact_store=artifact_store is not None,
             segmentation_localizer=segmentation_localizer,
+            fast_grasp_planner=fast_grasp_planner,
             gripper_ports=gripper_ports,
         )
     except Exception:

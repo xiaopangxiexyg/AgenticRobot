@@ -208,6 +208,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--enable-object-motion", action="store_true",
         help="publish carried-object lift/carry/place on the existing planner; requires grippers, grasp approach, contact target and explicit follow observation",
     )
+    parser.add_argument("--enable-fast-grasp", action="store_true",
+        help="publish frozen observation, first-acceptable GraspGenX planning and paired one-use native execution")
+    parser.add_argument("--sam2-grounding-dino-bundle", type=Path)
+    parser.add_argument("--graspgenx-point-grasp-bundle", type=Path)
+    parser.add_argument("--graspgenx-source-root", type=Path)
+    parser.add_argument("--point-grasp-device", default="cuda")
     parser.add_argument(
         "--safe-tcp-planning-clearance-padding-m",
         type=float,
@@ -426,11 +432,46 @@ def _prepare_gateway_before_ready(*, session: Any, viewer: Any | None) -> None:
         session.history_recorder.start()
 
 
+def _fast_grasp_model_from_args(parser, args):
+    paths = (args.sam2_grounding_dino_bundle, args.graspgenx_point_grasp_bundle, args.graspgenx_source_root)
+    if not args.enable_fast_grasp:
+        if any(path is not None for path in paths):
+            parser.error("model/source bundle flags require --enable-fast-grasp")
+        return None
+    if (not all(path is not None for path in paths) or args.artifact_root is None
+            or not args.enable_grasp_approach or not args.enable_grippers
+            or args.grasp_contact_target_body is None or not args.no_realtime_worker):
+        parser.error("fast grasp requires all three model/source paths, Artifact storage, grippers, target-bound grasp approach and no realtime worker")
+    if any(not p.is_absolute() or not p.is_dir() for p in paths):
+        parser.error("fast grasp model/source paths must be absolute existing directories")
+    from deployments.perception.dmtac_grasp_overlay import reviewed_graspgenx_dmtac_solid_geometry
+    from deployments.perception.graspgenx_client import GraspGenXInProcessBackend
+    from deployments.perception.sam2_graspgenx_point_grasp import (
+        GraspGenXPointGraspModelSpec, Sam2GraspGenXPointGraspPlanner,
+        GRASPGENX_DMTAC_REACHABILITY_ORIENTATION_VARIANTS_LOCAL_AXIS_DEG,
+    )
+    from deployments.perception.sam2_grounding_dino import (
+        Sam2GroundingDinoLocalizer, Sam2GroundingDinoModelSpec,
+    )
+
+    spec = GraspGenXPointGraspModelSpec.from_asset_bundle(args.graspgenx_point_grasp_bundle)
+    localizer = Sam2GroundingDinoLocalizer(
+        model_spec=Sam2GroundingDinoModelSpec.from_asset_bundle(args.sam2_grounding_dino_bundle),
+        device=args.point_grasp_device)
+    return Sam2GraspGenXPointGraspPlanner(model_spec=spec, point_segmenter=localizer,
+        client=GraspGenXInProcessBackend(model_spec=spec, source_root=args.graspgenx_source_root,
+            device=args.point_grasp_device), solid_geometry=reviewed_graspgenx_dmtac_solid_geometry(),
+        orientation_variants_local_axis_degrees=(
+            GRASPGENX_DMTAC_REACHABILITY_ORIENTATION_VARIANTS_LOCAL_AXIS_DEG),
+        enable_finger_exchange=True)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     if args.motion_side == "left" and (
-        args.enable_grippers
+        args.enable_fast_grasp
+        or args.enable_grippers
         or args.enable_grasp_approach
         or args.grasp_contact_target_body is not None
         or args.enable_spatial_goals
@@ -534,6 +575,7 @@ def main(argv: list[str] | None = None) -> int:
         exposed_pose_sides=(args.motion_side,),
         allow_scripted_task_reset=False,
     )
+    fast_grasp_planner = _fast_grasp_model_from_args(parser, args)
     session = build_mujoco_agent_tcp_pose_gateway_session(
         motion_side=args.motion_side,
         enable_grippers=args.enable_grippers,
@@ -552,6 +594,7 @@ def main(argv: list[str] | None = None) -> int:
         enable_object_motion=args.enable_object_motion,
         enable_grasp_approach=args.enable_grasp_approach,
         grasp_contact_target_body=args.grasp_contact_target_body,
+        fast_grasp_planner=fast_grasp_planner,
         safe_tcp_planning_clearance_padding_m=args.safe_tcp_planning_clearance_padding_m,
     )
     viewer = None

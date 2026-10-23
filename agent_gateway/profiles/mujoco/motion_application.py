@@ -31,6 +31,7 @@ from sim.mujoco.deploy.target_measurement import (
 from sim.mujoco.depth_snapshot import (
     EncodedMujocoDepthFrame,
     MujocoDepthSnapshotSource,
+    MujocoRawRgbdCut,
 )
 from sim.mujoco.rgb_snapshot import (
     EncodedMujocoRgbFrame,
@@ -512,10 +513,43 @@ class MujocoAgentSkillMotionApplication:
     ) -> tuple[EncodedMujocoRgbFrame, EncodedMujocoDepthFrame]:
         """Render RGB and depth from one rig-owned scene cut."""
 
-        with self._lock:
-            if self._closed:
-                raise RuntimeError("Agent motion application is closed.")
-            return self._depth_snapshot_source.capture_jpeg_npy_cut(view_id=view_id)
+        if self._closed:
+            raise RuntimeError("Agent motion application is closed.")
+        return self._depth_snapshot_source.capture_jpeg_npy_cut(view_id=view_id)
+
+    def capture_frozen_rgbd_cut(self, *, source_ids: tuple[str, ...]) -> MujocoRawRgbdCut:
+        """Capture native multi-view RGB-D and both arms without advancing physics."""
+        def require_state() -> None:
+            # The source calls this inside _capture_visual_scene's application
+            # and rig locks. Do not invert source -> application -> rig ordering.
+            if (
+                not self._started
+                or not self._held
+                or self._active_operation_id is not None
+                or self.target.planned_tcp_motion is None
+            ):
+                raise RuntimeError(
+                    "Frozen RGB-D requires a started, stationary held motion application."
+                )
+
+        return self._depth_snapshot_source.capture_rgbd_cut(
+            view_ids=source_ids,
+            require_capture_state=require_state,
+        )
+
+
+    def capture_grasp_scene_state(self):
+        """Read the complete native state without rendering or advancing physics.
+
+        Revision alone does not identify joint, gripper or task-object state.
+        The profile uses this cut before publishing/activating retained plans.
+        """
+        return self._capture_visual_scene(lambda scene: {
+            "model_qpos": scene.data.qpos.tolist(),
+            "model_qvel": scene.data.qvel.tolist(),
+            "simulation_time_sec": float(scene.data.time),
+        })
+
 
     def _capture_visual_scene(self, capture: Callable[[Any], Any]) -> Any:
         """Keep renderer access serialized with motion and lifecycle changes."""

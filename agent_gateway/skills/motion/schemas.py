@@ -380,10 +380,14 @@ def grasp_approach_plan_execution_schema_entry_v1(
     parameter_profile_id: str,
     parameter_profile_hash: str,
     allowed_component_ids: tuple[str, ...],
+    plan_id_prefix: str = "real-grasp-approach-plan",
 ) -> AgentSkillSchemaEntry:
     """Build the motion schema that accepts only one immutable plan reference."""
 
     components = _component_ids(allowed_component_ids)
+    if (not isinstance(plan_id_prefix, str) or not plan_id_prefix
+            or any(c not in "abcdefghijklmnopqrstuvwxyz0123456789-" for c in plan_id_prefix)):
+        raise ValueError("plan_id_prefix must be a deployment-owned lowercase identifier.")
     parameter_schema = {
         "type": "object",
         "additionalProperties": False,
@@ -391,7 +395,7 @@ def grasp_approach_plan_execution_schema_entry_v1(
             "component_id": {"type": "string", "enum": list(components)},
             "grasp_approach_plan_id": {
                 "type": "string",
-                "pattern": "^real-grasp-approach-plan:[0-9a-f]{64}$",
+                "pattern": "^" + plan_id_prefix + ":[0-9a-f]{64}$",
             },
             "grasp_approach_plan_hash": {
                 "type": "string",

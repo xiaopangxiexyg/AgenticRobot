@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -144,6 +145,75 @@ def test_rgbd_cut_uses_one_scene_capture_when_scene_changes_between_captures() -
     assert np.load(io.BytesIO(depth.data), allow_pickle=False)[0, 0] == 10.0
 
 
+def test_rgbd_cut_is_one_atomic_scene_copy_and_reuses_depth_renderer_cache():
+    scene = _Scene()
+    scene.data = SimpleNamespace(qpos=np.arange(12, dtype=float), qvel=np.zeros(12), time=1.5)
+    scene.arm_qpos_by_side = lambda: {"left": scene.data.qpos[:6], "right": scene.data.qpos[6:]}
+    cuts = []
+    renderers = []
+    guards = []
+
+    class Renderer(_Renderer):
+        def render(self, view_id):
+            self.calls.append("rgb:" + view_id)
+            return np.full((self.height, self.width, 3), int(scene.data.qpos[0]), dtype=np.uint8)
+
+    def factory(*args, **kw):
+        renderer = Renderer(*args, **kw)
+        renderers.append(renderer)
+        return renderer
+
+    def capture(project):
+        cuts.append(True)
+        result = project(scene)
+        scene.data.qpos[:] += 10
+        return result
+
+    source = MujocoDepthSnapshotSource(capture_scene=capture, clock=lambda: 12.5, renderer_factory=factory)
+    try:
+        cut = source.capture_rgbd_cut(view_ids=("front", "wrist"), require_capture_state=lambda: guards.append(True))
+        assert len(cuts) == len(guards) == 1
+        assert cut.simulation_time_sec == 1.5 and cut.captured_at == 12.5
+        assert [v.view_id for v in cut.views] == ["front", "wrist"]
+        np.testing.assert_array_equal(cut.model_qpos, np.arange(12))
+        np.testing.assert_array_equal(cut.arm_qpos_by_side["left"], np.arange(6))
+        for view in cut.views:
+            assert not view.rgb.any() and not view.rgb.flags.writeable
+            assert not view.depth_m.flags.writeable
+            assert view.optical_camera_pose_world_xyz_quat_xyzw[3:] == (1, 0, 0, 0)
+            assert view.intrinsics["width"] == view.rgb.shape[1]
+        with pytest.raises(TypeError):
+            cut.views[0].intrinsics["fx"] = 5
+        source.capture_npy_frame(view_id="front")
+        assert len(renderers) == 2
+    finally:
+        source.close()
+    assert all(renderer.closed for renderer in renderers)
+    with pytest.raises(RuntimeError, match="closed"):
+        source.capture_rgbd_cut(view_ids=("front",), require_capture_state=lambda: None)
+
+@pytest.mark.parametrize("views", ((), ("front", "front"), ("unknown",), (" front",)))
+def test_rgbd_cut_rejects_invalid_source_requests_without_rendering(views):
+    source, renderers = _source()
+    try:
+        with pytest.raises(ValueError):
+            source.capture_rgbd_cut(view_ids=views, require_capture_state=lambda: None)
+        assert not renderers
+    finally:
+        source.close()
+
+def test_rgbd_state_guard_runs_under_scene_capture_and_precedes_renderer_creation():
+    source, renderers = _source()
+    def reject():
+        raise RuntimeError("test:motion-active")
+    try:
+        with pytest.raises(RuntimeError, match="motion-active"):
+            source.capture_rgbd_cut(view_ids=("front",), require_capture_state=reject)
+        assert not renderers
+    finally:
+        source.close()
+
+
 def test_depth_snapshot_catalog_bounds_cache_and_close() -> None:
     source, renderers = _source(max_renderer_dimensions=1)
     assert source.source_catalog() == (
@@ -177,9 +247,12 @@ def test_depth_snapshot_rejects_ambiguous_view_ids(view_id) -> None:
         source.capture_npy_frame(view_id=view_id)
 
 
-@pytest.mark.parametrize("kind", ["rgb", "depth", "rgbd"])
+@pytest.mark.parametrize("kind", ["rgb", "depth", "rgbd", "frozen_rgbd"])
 def test_snapshot_renderer_lifetime_stays_on_one_thread(kind) -> None:
     scene = _Scene()
+    if kind == "frozen_rgbd":
+        scene.data = SimpleNamespace(qpos=np.arange(12, dtype=float), qvel=np.zeros(12), time=1.5)
+        scene.arm_qpos_by_side = lambda: {"left": scene.data.qpos[:6], "right": scene.data.qpos[6:]}
     scene_lock = threading.RLock()
     events = []
     fail_render = False
@@ -232,6 +305,8 @@ def test_snapshot_renderer_lifetime_stays_on_one_thread(kind) -> None:
                 return source.capture_jpeg_snapshot(source_ids=("front",), width=2, height=2)
             if kind == "depth":
                 return source.capture_npy_frame(view_id="front")
+            if kind == "frozen_rgbd":
+                return source.capture_rgbd_cut(view_ids=("front",), require_capture_state=lambda: None)
             return source.capture_jpeg_npy_cut(view_id="front")
 
     try:

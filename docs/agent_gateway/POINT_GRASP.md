@@ -35,8 +35,34 @@ owner、碰撞场景和安全门禁。
 原 finally 记录耗时并传播。已经运行的模型调用保持协作式停止边界，预算耗尽后不
 启动下一受保护阶段。诊断和失败回放仅供排查，不能替代成功结果或执行授权。
 
-本批验证范围为本地合同、假模型端口、CPU 原生几何及非硬件组合验收。MuJoCo 的
-快速规划生命周期另批接入；本节不声明真机、模型服务、真实接触或抓取成功验收。
+验证范围为本地合同、假模型端口、CPU 原生几何及非硬件组合验收；不声明真机、
+模型服务或真实抓取成功验收。
+
+## MuJoCo 冻结观测与快速完整路径
+
+MuJoCo 在显式配置完整的右臂 approach/contact、双夹爪、Artifact 存储与 GraspGenX
+模型绑定后，追加 `perception.capture_grasp_observation@1`、
+`perception.plan_grasp_fast@1` 和 `motion.execute_grasp_approach_plan@1`。
+默认配置不加载这些模型或发布这三条 Route。启动器使用 `--enable-fast-grasp`，
+要求 `--no-realtime-worker`、`--enable-grippers`、`--enable-grasp-approach`、
+`--grasp-contact-target-body`、`--artifact-root` 及三个显式绝对目录：
+`--sam2-grounding-dino-bundle`、`--graspgenx-point-grasp-bundle`、`--graspgenx-source-root`。
+模型由会话已有的 `start_perception_resources()` 在传输发布前启动，关闭时先等待
+只读 worker 退出，再释放模型、renderer、应用和存储；不在 Skill 中创建或重启资源。
+
+冻结观测要求应用已启动、处于 HOLD、没有活动运动且已绑定原生规划器。RGB-D、
+光学相机几何、双臂及完整模型状态取自同一个 rig scene cut，不推进物理。
+采集统一按 source→application→rig 加锁，沿用现有渲染缓存及关闭检查。
+真实与仿真消费者共用有大小上限的留存 Artifact 读取器，完整性仍由原 CAS store 验证。
+
+快速规划只接收本会话完成的 observation operation，复用共享的候选生成、首条完整路径
+搜索和原生链 owner。主视角与辅助视角准备均检查调用方原始预算和取消状态；
+模型调用中止仍是协作式边界。规划不执行运动或 HOLD；执行必须另行提交本会话
+`mujoco-grasp-approach-plan:<sha256>` 的精确 ID/hash，校验来源、场景、TTL 和 pending
+所有权后单次消费已有完整链，不重新规划或接受真实机器人计划 ID。
+
+本地原生 MuJoCo 测试使用固定候选及假推理端口，覆盖状态冻结、路径留存、取消、
+失效拒绝和执行接线；这类证据不代表新模型推理质量或真机接触成功。
 
 ## 算法与第三方源码
 

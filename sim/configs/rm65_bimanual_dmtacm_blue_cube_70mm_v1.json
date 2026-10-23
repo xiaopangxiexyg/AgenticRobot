@@ -14,9 +14,9 @@
   },
   "timing": {
     "schema_version": "dexteleop.sim.timing_spec.v1",
-    "physics_hz": 1000.0,
+    "physics_hz": 4000.0,
     "camera_hz": 30.0,
-    "parameter_source": "project_default_pending_real_system_id"
+    "parameter_source": "native_cad_contact_recovery_timestep_convergence_not_hardware_identified"
   },
   "scene": {
     "schema_version": "dexteleop.sim.scene_spec.v1",
@@ -247,6 +247,7 @@
     "cube_edge_source": "operator_confirmed_70mm",
     "cube_mass_source": "simulation_assumption_not_measured",
     "grasp_constraint": "physical_contact_no_object_latch",
-    "real_material_calibration": false
+    "real_material_calibration": false,
+    "physics_timestep_basis": "0.25 ms resolves stiff CAD mimic/contact dynamics; 1 ms retained grazing close/open fails without a model change"
   }
 }

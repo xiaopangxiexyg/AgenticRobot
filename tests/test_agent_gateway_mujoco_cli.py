@@ -35,6 +35,7 @@ def test_motion_side_is_explicit_fixed_and_defaults_to_right():
 
 @pytest.mark.parametrize("unsupported", [
     ["--enable-grippers"],
+    ["--enable-fast-grasp"],
     ["--enable-grasp-approach"],
     ["--enable-spatial-goals"],
     ["--history-root", "/unused/history"],
@@ -70,6 +71,23 @@ def test_bilateral_grippers_refuse_realtime_physics_before_session_construction(
         gateway_cli.main([*args, "--enable-grippers"])
     assert captured.value.code == 2
     assert "--enable-grippers requires --no-realtime-worker" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("flags", [
+    [], ["--enable-fast-grasp"],
+    ["--graspgenx-source-root", "/unused/graspgenx"],
+])
+def test_fast_grasp_is_explicit_and_requires_its_complete_resource_graph(flags):
+    parser = build_parser()
+    args = parser.parse_args([
+        "--socket-path", "/unused/socket", "--task-config", "/unused/task.json", *flags,
+    ])
+    if not flags:
+        assert gateway_cli._fast_grasp_model_from_args(parser, args) is None
+    else:
+        with pytest.raises(SystemExit) as captured:
+            gateway_cli._fast_grasp_model_from_args(parser, args)
+        assert captured.value.code == 2
 
 
 def test_cli_import_does_not_load_optional_perception_models() -> None:

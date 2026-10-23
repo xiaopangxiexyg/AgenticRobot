@@ -541,6 +541,7 @@ def test_mujoco_adapter_observation_is_passive_and_command_is_gripper_only() -> 
             self.target = 0.0
             self.steps = 0
             self.held = []
+            self.joint_speed = 0.0
 
         def is_ready(self):
             return True
@@ -552,6 +553,7 @@ def test_mujoco_adapter_observation_is_passive_and_command_is_gripper_only() -> 
         def gripper_execution_snapshot(self):
             return {
                 "measured_close_by_gripper": {"right_gripper": self.close},
+                "measured_max_joint_speed_rad_sec_by_gripper": {"right_gripper": self.joint_speed},
                 "actuator_target_rate_by_gripper": {
                     "right_gripper": 0.5 if self.close != self.target else 0.0
                 },
@@ -576,6 +578,11 @@ def test_mujoco_adapter_observation_is_passive_and_command_is_gripper_only() -> 
     assert receipt.accepted is True
     assert sample.measured_close == 1.0
     assert rig.steps == 1
+    rig.joint_speed = 0.03
+    assert port.observe_state().moving
+    assert rig.steps == 1
+    rig.joint_speed = 0.0
+    assert not port.observe_state().moving
     composed = MujocoGripperControlPort(
         rig=rig, gripper_name="right_gripper", arm_held=lambda: False,
     )

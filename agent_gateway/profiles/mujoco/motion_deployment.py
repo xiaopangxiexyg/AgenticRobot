@@ -750,6 +750,7 @@ class MujocoAgentTcpPoseContractBundle:
     grasp_approach_contract: MujocoAgentSafeTcpPoseContract | None = None
     grasp_contact_contract: MujocoAgentSafeTcpPoseContract | None = None
     object_motion_contract: MujocoAgentSafeTcpPoseContract | None = None
+    fast_grasp_contract: Any | None = None
 
     def __post_init__(self) -> None:
         validate_skill_route_catalog_closure(
@@ -758,6 +759,19 @@ class MujocoAgentTcpPoseContractBundle:
             route_manifest=self.route_manifest,
             io_catalog=self.io_catalog,
         )
+        if self.fast_grasp_contract is not None:
+            from .grasp_deployment import MujocoFastGraspContract
+
+            if not isinstance(self.fast_grasp_contract, MujocoFastGraspContract):
+                raise TypeError("fast_grasp_contract must be a native typed contract.")
+            fast = self.fast_grasp_contract
+            if (self.grasp_approach_contract is None or self.grasp_contact_contract is None
+                    or self.gripper_contract is None or self.rgb_capture is None):
+                raise ValueError("Fast grasp requires the complete native observation/contact graph.")
+            for registration in (fast.observation, fast.fast, fast.execute):
+                route = registration.skill.routes[0]
+                if self.route_manifest.route(route.skill_id, route.skill_version) != registration.entry:
+                    raise ValueError("Fast grasp registration differs from its manifest entry.")
         if self.spatial_goal_registration is not None:
             if self.route_manifest.route("perception.compute_spatial_goal", "1") != self.spatial_goal_registration.entry:
                 raise ValueError("Spatial goal registration differs from its manifest entry.")
