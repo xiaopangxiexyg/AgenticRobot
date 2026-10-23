@@ -1454,7 +1454,8 @@ def test_coverage_local_damping_ramps_through_complete_receipts_and_restores_on_
     workspace = r.controller._coordinated
     target = workspace.workspace.joint3_drive_kd
     previous = r.last_kd
-    for _ in range(200):
+    ramp_ticks = math.ceil(max(target)/(workspace.pose.motion.drive_damping_rise_per_sec*.01))+20
+    for _ in range(ramp_ticks):
         r.tick()
         assert max(abs(a-b) for a, b in zip(previous, r.last_kd)) <= .02+1e-9
         if workspace._phase == "preparing":
@@ -1462,9 +1463,9 @@ def test_coverage_local_damping_ramps_through_complete_receipts_and_restores_on_
         else:
             assert previous == target
         previous = r.last_kd
-    assert r.last_kd == target == (.4, 3., 3., 1.2, .2, .1)
+    assert r.last_kd == target == (.4, 4.5, 4.5, 1.2, .2, .1)
     r.controller.submit("withdraw", now_sec=r.now)
-    for _ in range(200):
+    for _ in range(ramp_ticks):
         r.tick()
         if r.controller.result_record()["state"] == "cancelled":
             break
@@ -1856,9 +1857,10 @@ def test_fixed_probe_keeps_fine_position_dwell_through_bounded_count_jitter(tmp_
 
 
 @pytest.mark.parametrize("period", [.01, .025])
-def test_fixed_probe_rejects_varying_support_effort_even_with_bounded_encoder_jitter(tmp_path, period):
+@pytest.mark.parametrize("timeout", [1.5, 3.0])
+def test_fixed_probe_rejects_varying_support_effort_even_with_bounded_encoder_jitter(tmp_path, period, timeout):
     r = replay(tmp_path, holding_search=HoldingSearchConfig(
-        observation_sec=.5, observation_timeout_sec=1.5, movement_rad=.003))
+        observation_sec=.5, observation_timeout_sec=timeout, movement_rad=.003))
     advance_to_coordinated_probe(r)
     workspace = r.controller._coordinated
     for _ in range(100):
@@ -1866,7 +1868,8 @@ def test_fixed_probe_rejects_varying_support_effort_even_with_bounded_encoder_ji
         if workspace._observation and workspace._observation["started_at_sec"] is not None:
             break
     anchor, search = r.q, workspace._search
-    for n in range(int(1.8/period)):
+    leg_started, candidate = workspace._leg_started, workspace._probe
+    for n in range(math.ceil((timeout+.3)/period)):
         q = list(anchor)
         # J3 is the actively held support axis during this J2 probe. Its PD
         # response varies by more than the admitted command-context bound.
@@ -1879,6 +1882,10 @@ def test_fixed_probe_rejects_varying_support_effort_even_with_bounded_encoder_ji
     assert not search.observations
     assert rejected
     obs = rejected[0]
+    assert timeout < obs["completed_at_sec"]-obs["started_at_sec"] < timeout+2*period
+    assert workspace._leg_started == leg_started
+    assert workspace._probe is None and search.candidate_nm == candidate
+    assert search.status()["usable_hold_nm"] is None
     assert max(b-a for a,b in zip(obs["minimum_rad"], obs["maximum_rad"])) < .003
     assert obs["maximum_delta_nm"][2]-obs["minimum_delta_nm"][2] > workspace.workspace.holding_search.torque_resolution_nm
 
@@ -2068,7 +2075,8 @@ def test_coverage_profile_reuses_paths_with_four_legs_and_keeps_hold_verificatio
     baseline = json.loads((profiles/"b601_j2_j3_four_centres_holding_v1.json").read_text())
     candidate = json.loads((profiles/"b601_j2_j3_coverage_support_v1.json").read_text())
     assert candidate["cycle"] == baseline["cycle"]
-    assert candidate["workspace"]["holding_search"] == baseline["workspace"]["holding_search"]
+    assert candidate["workspace"]["holding_search"] == {
+        **baseline["workspace"]["holding_search"], "observation_timeout_sec": 3.0}
     r = replay(tmp_path, **candidate["workspace"])
     controller = r.controller._coordinated
     workspace = controller.workspace
@@ -2087,12 +2095,59 @@ def test_coverage_profile_reuses_paths_with_four_legs_and_keeps_hold_verificatio
     assert workspace.coordinated_holding.total_assist_cap_nm == 1
     assert workspace.coordinated_holding.bias_gain_nm_per_rad_sec == 40
     assert workspace.coordinated_holding.supported_soft_recovery
-    assert workspace.joint2_drive_kd == workspace.joint3_drive_kd == (.4, 3., 3., 1.2, .2, .1)
+    assert workspace.joint2_drive_kd == workspace.joint3_drive_kd == (.4, 4.5, 4.5, 1.2, .2, .1)
     assert workspace.coordinated_holding.recovery_kd_nm_s_per_rad == 0
     assert workspace.coordinated_holding.motor_local_recovery
     assert controller.config.max_sweep_leg_sec == 180
     assert controller.pose.motion.max_control_gap_sec == .04
     assert not WorkspaceCalibrationConfig().coordinated_holding
+
+
+@pytest.mark.parametrize("sign", [-1, 1])
+def test_coverage_lag_margin_reaches_native_trackers_and_still_has_terminal_boundary(tmp_path, sign):
+    from test_rebot_b601_joint_motion import _governor_tick
+
+    from robot_motion.rebot_b601_rs.joint_motion import B601JointMotionTracker
+
+    profile = Path(__file__).resolve().parents[1]/"docs/hardware/profiles/b601_j2_j3_coverage_support_v1.json"
+    whole = production_controller.__wrapped__(tmp_path)
+    old = whole._workspace
+    candidate = B601WorkspaceCalibrationController(old.settings, old.config,
+        WorkspaceCalibrationConfig(**json.loads(profile.read_text())["workspace"]))
+    core = candidate._coordinated.pose
+    motion = core.motion
+    assert motion.max_reference_lag_rad == pytest.approx(.0195*1.5)
+    assert candidate.config.motion_max_reference_lag_rad == motion.max_reference_lag_rad
+    assert all(t.config.max_reference_lag_rad == motion.max_reference_lag_rad for t in core.trackers)
+    assert old.settings.staged_assist.motion_control.max_reference_lag_rad == .0195
+    assert whole._fixed.config is whole._supported.config is old.config
+    assert candidate.limits == old.limits
+    assert motion.max_control_gap_sec == .04
+    assert candidate.workspace.coordinated_holding.total_assist_cap_nm == 1
+    assert candidate.workspace.coordinated_holding.rise_slew_nm_s == 2.25
+    assert candidate.workspace.coordinated_holding.fall_slew_nm_s == 1
+    assert candidate.workspace.holding_search.observation_sec == 1
+    assert candidate.workspace.holding_search.verification_repeats == 2
+    # The run's 0.024191 rad excursion is admitted, not declared arrived.
+    # No gate, reference reset or automatic retry is added to the tracker.
+    goal = sign*.13962634015954636
+    flags = {"calibration_hold_enabled": True, "calibration_target_hold": True}
+    for lag, fault in ((.02419128377116822, False), (motion.max_reference_lag_rad+.0001, True)):
+        tracker = B601JointMotionTracker(motion)
+        tracker.start(now=1., q=goal-sign*.002, target=goal)
+        assert _governor_tick(tracker, 1.01, q=goal-sign*.002, **flags).reason == "target_reached_braking"
+        frame = _governor_tick(tracker, 1.02, q=goal-sign*lag, velocity=-sign*.001, span=.002, **flags)
+        assert (frame.reason == "reference_lag_braking") == fault
+        assert frame.hold_position_rad is None
+        if fault:
+            assert not frame.speed_governor_active
+            assert abs(frame.brake_trigger_lag_rad) > motion.max_reference_lag_rad
+
+
+@pytest.mark.parametrize("value", [0., -.001, True, float("inf"), .01, .091])
+def test_workspace_lag_override_reuses_preconnect_validation(tmp_path, value):
+    with pytest.raises((ValueError, TypeError)):
+        replay(tmp_path, motion_max_reference_lag_rad=value)
 
 
 @pytest.mark.parametrize("value", [0, -.001, float("nan"), True, .0046])
@@ -2798,7 +2853,7 @@ def test_full_coupled_batch_and_report_keep_handoffs_distinct_from_withdrawal(tm
         values = json.loads(profile.read_text())["workspace"]
         changes["holding_search"] = HoldingSearchConfig(**values["holding_search"])
         changes["holding_arrival_tolerance_rad"] = values["holding_arrival_tolerance_rad"]
-        changes.update({name: values[name] for name in COORDINATED_CALIBRATION_OVERRIDES})
+        changes.update({name: values.get(name) for name in COORDINATED_CALIBRATION_OVERRIDES})
     r = replay(tmp_path, initial_q=(0, .01, .01, 0, 0, 0), **changes)
     movement = r.controller._coordinated.workspace.holding_search.movement_rad
     monkeypatch.setattr(transparency, "time", SimpleNamespace(monotonic=lambda: r.now+.002))
