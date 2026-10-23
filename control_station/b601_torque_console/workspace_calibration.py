@@ -77,10 +77,10 @@ class WorkspaceCalibrationConfig:
             raise TypeError("holding search must be an explicit configuration object")
         if self.coordinated_holding is not None and self.holding_search is None:
             raise ValueError("coordinated holding requires explicit holding search")
-        if self.holding_sampling_plan not in {"detailed", "coverage"} or (
-            self.holding_sampling_plan == "coverage" and self.coordinated_holding is None
+        if self.holding_sampling_plan not in {"detailed", "coverage", "identification"} or (
+            self.holding_sampling_plan in {"coverage", "identification"} and self.coordinated_holding is None
         ):
-            raise ValueError("coverage sampling requires explicit coordinated holding")
+            raise ValueError("coverage/identification sampling requires explicit coordinated holding")
         if self.holding_arrival_tolerance_rad is not None and (
             self.coordinated_holding is None
             or not 0 < finite(self.holding_arrival_tolerance_rad, "holding arrival tolerance") <= self.holding_search.movement_rad
@@ -177,7 +177,8 @@ class WorkspaceCalibrationConfig:
             excursion_rad=self.local_excursion_rad(calibration),
             speeds_rad_s=calibration.sweep_speeds_rad_s,
             max_reference_velocity_rad_s=max(calibration.sweep_speeds_rad_s),
-            training_repeats=1 if coverage else 2, validation_repeats=1, purpose="local_identification")
+            training_repeats=1 if coverage else 2, validation_repeats=1,
+            purpose="model_sweeps" if self.holding_sampling_plan == "identification" else "local_identification")
         if coverage:
             # Holding coverage needs both approach directions and a later
             # recheck, not two-speed kinetic-friction identification.

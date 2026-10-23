@@ -14,6 +14,7 @@ from robot_motion.rebot_b601_rs.calibration import summarize_automatic_acquisiti
 from .calibration_report import summarize_calibration
 from .calibration_session import calibration_outcome, calibration_receipt_rejection
 from .report import _jsonl, _resolve_jsonl_path
+from .workspace_identification import summarize_workspace_identification
 
 
 def _workspace_motion_windows(trace: Path, workspace: dict) -> dict:
@@ -177,13 +178,24 @@ def build_automatic_report(run_dir: Path) -> dict:
     report["mode_selection"] = result.get("mode_selection")
     if result.get("workspace") is not None:
         report["workspace"] = result["workspace"]
-        report["workspace_motion"] = _workspace_motion_windows(trace, result["workspace"])
+        if result["workspace"].get("holding_sampling_plan") == "identification":
+            identification = summarize_workspace_identification(_jsonl(trace),
+                condition=report["condition"], workspace=result["workspace"])
+            report["command_identification"] = identification
+            report["workspace_motion"] = {"status": "CONTINUOUS_IDENTIFICATION_WINDOWS",
+                "window_count": len(identification["windows"]), "auto_apply": False}
+        else:
+            report["workspace_motion"] = _workspace_motion_windows(trace, result["workspace"])
         report["onset_data_assessment"] = {
             "status": "NOT_REQUESTED_GRAVITY_FIRST", "completed_trial_count": 0,
             "expected_trial_count": 0, "semantics": "reacquire onset friction after the gravity baseline is optimized"}
         report["gravity_identification"] = {
             "status": "REQUIRES_PAIRED_MOTION_ANALYSIS", "auto_apply": False,
             "gravity_parameters_frozen": True, "setup_label": result["workspace"]["setup_label"]}
+        if report.get("command_identification") is not None:
+            report["gravity_identification"] = {**report["command_identification"]["gravity_fit"],
+                "gravity_parameters_frozen": True,
+                "setup_label": result["workspace"]["setup_label"]}
         holds = []
         for stage in result["workspace"].get("acquisitions", []):
             child = stage["result"]
@@ -211,14 +223,16 @@ def build_automatic_report(run_dir: Path) -> dict:
     report["dispatch_rejection"] = result.get("dispatch_rejection") or dispatch_rejection
     report["source_trace"] = str(trace)
     report["source_annotations"] = str(annotations)
-    events = list(_jsonl(annotations))
-    report["running_resistance"] = (
-        summarize_calibration(
-            events, _jsonl(trace), run_id=str(run_dir.resolve()), max_window_sec=2.0
-        )
-        if events
-        else {"status": "INSUFFICIENT_LABELLED_WINDOWS", "auto_apply": False}
-    )
+    if report.get("command_identification"):
+        # The new workspace mode owns role/authority labels in its trace.
+        # Do not require an unrelated legacy manual-annotation journal.
+        report["source_annotations"] = None
+        report["running_resistance"] = report["command_identification"]["running_resistance"]
+    else:
+        events = list(_jsonl(annotations))
+        report["running_resistance"] = (
+            summarize_calibration(events, _jsonl(trace), run_id=str(run_dir.resolve()), max_window_sec=2.0)
+            if events else {"status": "INSUFFICIENT_LABELLED_WINDOWS", "auto_apply": False})
     resistance = report["running_resistance"]
     if resistance.get("observed_steady_motion_windows", 0):
         data_status = "STEADY_WINDOWS_AVAILABLE"

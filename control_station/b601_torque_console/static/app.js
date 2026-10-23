@@ -327,6 +327,11 @@ function renderWorkspace(batch) {
   if (workspace.holding_sampling_plan === "coverage") {
     el("automatic-mode-note").textContent += " 当前为保持覆盖方案：每轴每中心 4 段、单参考速度，每个保持命令仍须两次复验；不等同于双速度动摩擦辨识。";
   }
+  if (workspace.continuous_identification?.enabled) {
+    const motion = workspace.continuous_identification;
+    el("automatic-mode-title").textContent = "J2/J3 双向多速度连续辨识";
+    el("automatic-mode-note").textContent += ` 连续往返不在端点搜索最小维持力；参考速度 ${motion.speeds_rad_s.map(v => number(v, 4)).join(" / ")} rad/s。训练与验证整段预先分开，拟合在失能清理后离线运行，不自动安装补偿。`;
+  }
   el("arm").textContent = "开始 J2/J3 多位姿自动采集";
   el("withdraw").textContent = "停止采集并撤力（不自动返回）";
   el("drive-instructions").textContent = "起点须有可靠支撑，并清空整个采集区域。无人介入后启动；后台继续，关闭页面或人工介入撤力停止。正常完成后逐轴返回起点，等待 GUI 人工确认失能。";
@@ -352,6 +357,10 @@ function renderWorkspace(batch) {
   const target = Number.isFinite(task?.target) ? `，换位目标 ${number(task.target * 180 / Math.PI, 2)}°` : "";
   const reason = workspace.reason === "leg_timeout" ? "本段在时限内未完成（leg_timeout）" : workspace.reason;
   el("automatic-progress").textContent = `${label}；任务 ${workspace.task_index}/${workspace.task_count}；关节采集 ${workspace.completed_joint_acquisitions}/${workspace.expected_joint_acquisitions}；当前 ${task?.joint || "六轴观察"}${target}；原因 ${reason}；命令暴露 ${number(workspace.command_exposure_nm_sec, 2)} / ${number(workspace.max_command_exposure_nm_sec, 2)} N·m·s（非实测能量）。`;
+  if (workspace.continuous_identification?.enabled && workspace.phase === "sweep") {
+    const motion = workspace.continuous_identification;
+    el("automatic-progress").textContent += ` 连续运动段 ${motion.leg_index + 1}/${motion.leg_count}；端点仅停稳交接，不执行维持力二分。`;
+  }
   if (workspace.coordinated_holding_enabled && workspace.max_sweep_leg_command_exposure_nm_sec != null) {
     el("automatic-progress").textContent += ` 本段暴露 ${number(workspace.leg_command_exposure_nm_sec, 2)} / ${number(workspace.max_sweep_leg_command_exposure_nm_sec, 2)} N·m·s；单段时限 ${number(workspace.max_sweep_leg_sec, 1)} 秒；换试探命令不重置本段预算。`;
   }
