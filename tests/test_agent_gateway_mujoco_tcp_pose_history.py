@@ -70,7 +70,11 @@ def _build_application(monkeypatch):
     state = {
         "time": 10.0,
         "pose": [0.1, 0.2, 0.3, 0.0, 0.0, 0.0, 1.0],
+        "runtime_close_count": 0,
     }
+    def close_runtime():
+        state["runtime_close_count"] += 1
+
     runtime = SimpleNamespace(
         config=SimpleNamespace(
             runtime_session_id="runtime:agent-history-fixture",
@@ -120,6 +124,7 @@ def _build_application(monkeypatch):
             ),
         ),
         clock=lambda: state["time"],
+        close=close_runtime,
     )
     frame_graph = CoordinateFrameGraph(
         graph_id="frame-graph:history-fixture",
@@ -347,6 +352,7 @@ def test_history_is_opt_in_exactly_bound_and_default_off(
         assert len(history_read.evidence_refs) == 3
         assert not application.started
         session.close()
+        assert state["runtime_close_count"] == 1
         assert store.closed
 
 
