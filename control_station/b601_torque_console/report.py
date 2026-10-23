@@ -341,11 +341,25 @@ def main(argv: list[str] | None = None) -> int:
     mode.add_argument("--transparency", action="store_true", help="join operator-labelled transparency trials; do not infer hand force")
     mode.add_argument("--calibration", action="store_true", help="offline, gravity-conditioned command identification; never applies compensation")
     mode.add_argument("--automatic-calibration", action="store_true", help="automatic onset, return and running-resistance acquisition summary")
+    mode.add_argument("--organize-identification", action="store_true", help="organize retained automatic reports without reading or rewriting raw traces")
+    parser.add_argument("--include-run-dir", type=Path, action="append", default=[],
+        help="additional closed run for --organize-identification; conditions remain separate")
     parser.add_argument("--pair-pose-tolerance-rad", type=float, default=0.03)
     args = parser.parse_args(argv)
-    trace = _resolve_jsonl_path(args.run_dir.resolve() / "b601_owner.debug.jsonl")
     try:
-        if args.automatic_calibration:
+        if args.include_run_dir and not args.organize_identification:
+            raise ValueError("--include-run-dir requires --organize-identification")
+        if args.organize_identification:
+            from .workspace_identification import organize_automatic_reports
+
+            trace = args.run_dir.resolve() / "automatic_calibration_report.json"
+            report = organize_automatic_reports([directory / "automatic_calibration_report.json"
+                for directory in [args.run_dir, *args.include_run_dir]])
+        else:
+            trace = _resolve_jsonl_path(args.run_dir.resolve() / "b601_owner.debug.jsonl")
+        if args.organize_identification:
+            pass
+        elif args.automatic_calibration:
             from .automatic_report import build_automatic_report
 
             report = build_automatic_report(trace.parent)
@@ -371,7 +385,8 @@ def main(argv: list[str] | None = None) -> int:
                 onset_consecutive_samples=args.onset_consecutive_samples,
                 post_zero_sec=args.post_zero_sec,
             )
-        report["source_trace"] = str(trace)
+        if not args.organize_identification:
+            report["source_trace"] = str(trace)
         output_root = (args.output_root or trace.parent.parent).resolve()
         output_root.mkdir(parents=True, exist_ok=True)
         output_dir = Path(tempfile.mkdtemp(prefix="b601-torque-report-", dir=output_root))
@@ -383,6 +398,9 @@ def main(argv: list[str] | None = None) -> int:
         print(f"[B601-REPORT] ERROR: {error}", file=sys.stderr)
         return 2
     print(f"[B601-REPORT] trials={len(report['trials'])} report={output}")
+    if args.organize_identification:
+        print(f"[B601-REPORT] runs={report['run_count']} observations={report['record_count']}; no source changed or compensation applied")
+        return 0
     if args.automatic_calibration:
         print(f"[B601-REPORT] acquisition={report['status']}; commanded torque only; no compensation applied")
         windows = report["motion_data_assessment"]

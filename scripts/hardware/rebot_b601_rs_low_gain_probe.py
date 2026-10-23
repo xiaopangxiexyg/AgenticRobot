@@ -224,6 +224,7 @@ from robot_motion.rebot_b601_rs.gravity_defaults import (
     B601_DEFAULT_KD,
     B601_DEFAULT_KP,
 )
+from robot_motion.rebot_b601_rs.gravity_identification import solve_gravity_design
 from robot_motion.rebot_b601_rs.torque_experiment import (
     B601MotionOnsetCaptureConfig,
     B601OnsetProbeConfig,
@@ -2254,11 +2255,8 @@ def fit_gravity_calibration(
             "pose_selection": selection,
         }
 
-    solution, _residuals, rank, singular_values = np.linalg.lstsq(
-        design,
-        observed,
-        rcond=None,
-    )
+    solution, rank, singular_values = solve_gravity_design(
+        design, observed, model=model, nominal_scale=nominal_scale)
     delta_scale = float(solution[0])
     bias = np.zeros(6, dtype=float)
     payload_parameters = np.zeros(4, dtype=float)
@@ -2266,33 +2264,6 @@ def fit_gravity_calibration(
         bias[:] = solution[1:]
     elif model == "global-scale-payload":
         payload_parameters[:] = solution[1:]
-        if payload_parameters[0] < 0.0:
-            # Mass is physically non-negative.  Hold it at the boundary and
-            # re-solve the remaining first-moment/global-scale columns.
-            payload_parameters[0] = 0.0
-            free_solution, *_ = np.linalg.lstsq(
-                design[:, (0, 2, 3, 4)],
-                observed,
-                rcond=None,
-            )
-            delta_scale = float(free_solution[0])
-            payload_parameters[1:] = free_solution[1:]
-    if delta_scale < -nominal_scale:
-        delta_scale = -nominal_scale
-        if model == "global-scale-joint-bias":
-            corrected = observed - design[:, 0] * delta_scale
-            for joint_index in range(6):
-                bias[joint_index] = float(
-                    np.mean(
-                        corrected[joint_index :: 6]
-                    )
-                )
-        elif model == "global-scale-payload":
-            payload_parameters[1:] = np.linalg.lstsq(
-                design[:, 2:],
-                observed - design[:, 0] * delta_scale,
-                rcond=None,
-            )[0]
     prediction = design[:, 0] * delta_scale
     if model == "global-scale-joint-bias":
         prediction += np.asarray(
@@ -6980,6 +6951,19 @@ def _automatic_execution_status(stop_reason, cleanup_ok, commands_sent):
     if stop_reason == "supported_origin_return_complete":
         return "COMPLETED"
     return "COMPLETED" if stop_reason is None else "FAILED"
+
+
+def _control_sequence_completed(stop_reason, acquisition=None):
+    """A proven autonomous return is a normal end, not a timed-hold abort."""
+    if stop_reason is None:
+        return True
+    if stop_reason != "supported_origin_return_complete" or not isinstance(acquisition, dict):
+        return False
+    returned = (acquisition.get("workspace") or {}).get("supported_return") or {}
+    return (acquisition.get("state") == "complete"
+        and (acquisition.get("outcome") or {}).get("action") == "complete"
+        and returned.get("completed") is True and returned.get("revoked_reason") is None
+        and acquisition.get("pending_dispatch") is None)
 
 
 def _workspace_analysis_samples(samples):
@@ -11820,7 +11804,8 @@ def run_probe(
         "NOT_APPLICABLE",
     )
     control_passed = (
-        stop_reason is None
+        _control_sequence_completed(stop_reason, torque_console.result_record()
+            if getattr(args, "torque_console_auto_calibration_profile", None) is not None and torque_console is not None else None)
         and commands_sent > 0
         and cleanup_ok
         and all(result.passed for result in frequency_acceptance.values())

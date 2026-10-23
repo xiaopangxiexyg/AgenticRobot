@@ -86,6 +86,10 @@ class CoordinatedWorkspaceController:
     def _active(self):
         return self._phase not in {"idle", "complete", "failed", "cancelled"}
 
+    @property
+    def _continuous_identification(self):
+        return self.workspace.holding_sampling_plan == "identification"
+
     def configure_context(self, condition, position_limits_rad):
         with self._lock:
             if self._condition is not None:
@@ -408,7 +412,7 @@ class CoordinatedWorkspaceController:
                     # Once a point is frozen, returning after a probe is local
                     # force search, not another transit. Its departure bias
                     # may be exactly the command that moved away from the point.
-                    point_search=(self._phase == "sweep" and (
+                    point_search=(not self._continuous_identification and self._phase == "sweep" and (
                         self.workspace.holding_sampling_plan != "coverage" or self._search is not None)),
                     # Reacquiring the frozen point is continuous transport.
                     # Only actual plateau observations own force bisection.
@@ -618,7 +622,23 @@ class CoordinatedWorkspaceController:
             self._segments = 0
             self._begin_task()
             return
-        self._observe_probe(stamp, completed, previous, previous_receipt, delta, commands)
+        if self._continuous_identification:
+            # Transport retains the other axis' support and the same final
+            # envelope. Endpoint dwell is only a handoff, not force bisection.
+            if not self._at_goal(self.pose.arrival_tolerance_rad):
+                self._quiet_since = None
+                return
+            if self._quiet_since is None:
+                self._quiet_since = stamp
+            if stamp-self._quiet_since >= self.settings.staged_assist.settle_dwell_sec:
+                j = int(task["joint"][-1])-1
+                self._complete_leg(completed, {"sampling_mode": "continuous_identification",
+                    "target_position_rad": self._nominal_target[j],
+                    "measured_position_rad": self.pose.q[j],
+                    "target_error_rad": self._nominal_target[j]-self.pose.q[j],
+                    "tracking_target_reached": True})
+        else:
+            self._observe_probe(stamp, completed, previous, previous_receipt, delta, commands)
 
     def _observe_probe(self, stamp, completed, previous, previous_receipt, delta, commands):
         cfg = self.workspace.holding_search
@@ -750,28 +770,34 @@ class CoordinatedWorkspaceController:
             self._stop("holding_search_incomplete", "failed")
         elif self._search.state == "complete":
             self.pose.adopt_hold(j, self._search.status()["usable_hold_nm"])
-            self._legs.append({"trial_id": self._steps[self._leg_index]["trial_id"], "role": self._steps[self._leg_index]["role"],
-                "max_reference_velocity_rad_s": self._steps[self._leg_index]["max_reference_velocity_rad_s"],
-                "completed_at_sec": completed, "target_position_rad": self._nominal_target[j], "measured_position_rad": q[j],
+            self._complete_leg(completed, {"target_position_rad": self._nominal_target[j], "measured_position_rad": q[j],
                 "target_error_rad": self._nominal_target[j]-q[j],
                 "tracking_target_reached": abs(self._nominal_target[j]-q[j]) <= self.settings.staged_assist.settle_error_rad,
-                "final_zero_and_still_confirmed": False, "handoff_full_dispatch_confirmed": True,
-                "withdrawal_confirmed": False, "command_exposure_nm_sec": self._leg_exposure,
                 "holding_calibration": {**self._search.status(detailed=True), "sample_pose_rad": self._sample_pose,
                     "nominal_target_rad": self._nominal_target, "support_bias_nm": self.pose.bias,
                     "observation_mode": "coordinated_pose_hold", "withdrawal_confirmed": False}})
-            self._leg_index += 1
-            if self._leg_index < len(self._steps):
-                self._begin_leg()
-            else:
-                result = {"state": "complete", "reason": "holding_points_and_handoffs_confirmed", "completed_legs": copy.deepcopy(self._legs)}
-                self._acquisitions.append({"task": copy.deepcopy(self._tasks[self._index]), "result": result, "final_qpos_rad": q})
-                self._records.append({"kind": "workspace_calibration_stage_result", "recorded_monotonic_sec": completed, **self._acquisitions[-1]})
-                self._index += 1
-                self._begin_task()
+
+    def _complete_leg(self, completed, evidence):
+        step = self._steps[self._leg_index]
+        self._legs.append({"trial_id": step["trial_id"], "role": step["role"],
+            "max_reference_velocity_rad_s": step["max_reference_velocity_rad_s"],
+            "completed_at_sec": completed, "final_zero_and_still_confirmed": False,
+            "handoff_full_dispatch_confirmed": True, "withdrawal_confirmed": False,
+            "command_exposure_nm_sec": self._leg_exposure, **evidence})
+        self._leg_index += 1
+        if self._leg_index < len(self._steps):
+            self._begin_leg()
+        else:
+            result = {"state": "complete", "reason": ("continuous_sweeps_and_handoffs_confirmed"
+                if self._continuous_identification else "holding_points_and_handoffs_confirmed"),
+                "completed_legs": copy.deepcopy(self._legs)}
+            self._acquisitions.append({"task": copy.deepcopy(self._tasks[self._index]), "result": result, "final_qpos_rad": self.pose.q})
+            self._records.append({"kind": "workspace_calibration_stage_result", "recorded_monotonic_sec": completed, **self._acquisitions[-1]})
+            self._index += 1
+            self._begin_task()
 
     def _holding_status(self, detailed=False):
-        return {"enabled": True, "stage": "fixed_command_observation" if self._probe is not None else "reacquire",
+        return {"enabled": not self._continuous_identification, "stage": "fixed_command_observation" if self._probe is not None else "reacquire",
             "search": None if self._search is None else self._search.status(detailed=detailed),
             "probe_command_nm": self._probe, "sample_pose_rad": self._sample_pose,
             "nominal_target_rad": self._nominal_target, "holding_reference_rad": self.pose.goal,
@@ -829,7 +855,11 @@ class CoordinatedWorkspaceController:
                 "manual_requested": self._manual_return_requested is not None,
                 "max_cycles": 1},
             "dispatch_withdrawal": copy.deepcopy(self._dispatch_withdrawal),
-            "holding_search_enabled": True, "holding_calibration": self._holding_status(detailed),
+            "holding_search_enabled": not self._continuous_identification, "holding_calibration": self._holding_status(detailed),
+            "continuous_identification": {"enabled": self._continuous_identification,
+                "leg_index": self._leg_index, "leg_count": len(self._steps),
+                "speeds_rad_s": self.config.sweep_speeds_rad_s,
+                "fits_after_cleanup_only": True, "auto_apply": False},
             "arrival": self._arrival_status(),
             "static_observation": self._static_observation_status(),
             "maximum_start_angle_deg": self.workspace.maximum_start_angle_deg,
@@ -873,6 +903,11 @@ class CoordinatedWorkspaceController:
             "trial_id": (self._steps[self._leg_index]["trial_id"] if self._phase == "sweep" and self._leg_index < len(self._steps)
                          else f"cw{self._index}:{self._phase}"),
             "role": "holding_not_for_running_fit", "state": "observing" if self._probe is not None else self._phase}
+        if marker is not None and self._continuous_identification:
+            step = self._steps[self._leg_index] if self._phase == "sweep" and self._leg_index < len(self._steps) else None
+            marker.update(role=step["role"] if step else "return_not_for_fit" if self._phase.startswith("return") else "positioning_not_for_fit",
+                state="moving" if step and not self.pose.braking else self._phase,
+                reference_speed_rad_s=None if step is None else step["max_reference_velocity_rad_s"])
         return {"time_sec": self.pose.last_time, "controller_mode": self.controller_mode, "joint_name": joint,
             "owner_ready": self._ready, "operator_armed": moving, "phase": "fault" if fault else "track" if moving else "inactive",
             "reason": fault or self._reason, "fault": fault, "qpos_rad": self.pose.q, "qvel_fd_rad_s": self.pose.raw,
