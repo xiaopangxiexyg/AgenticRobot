@@ -255,6 +255,9 @@ def test_gateway_sim_dependencies_are_confined_to_mujoco_profile() -> None:
         # Native grasp preview and target-bound contact stay in concrete leaves.
         "agent_gateway/profiles/mujoco/grasp_candidate_selection.py": ["sim"],
         # Frozen capture and exact paired execution are native profile edges.
+        "agent_gateway/profiles/mujoco/grasp_deployment.py": ["sim"],
+        "agent_gateway/profiles/mujoco/grasp_fast_plan.py": ["sim"],
+        "agent_gateway/profiles/mujoco/grasp_observation.py": ["sim"],
         "agent_gateway/profiles/mujoco/motion_application.py": ["sim"],
         "agent_gateway/profiles/mujoco/motion_deployment.py": ["sim"],
         "agent_gateway/profiles/mujoco/motion_factory.py": ["sim"],
@@ -317,6 +320,8 @@ def test_gateway_numerical_dependencies_are_confined_to_concrete_profiles() -> N
         "agent_gateway/profiles/segmentation.py": ["numpy"],
         "agent_gateway/profiles/mujoco/motion_skill.py": ["numpy"],
         "agent_gateway/profiles/mujoco/grasp_candidate_selection.py": ["numpy"],
+        "agent_gateway/profiles/mujoco/grasp_fast_plan.py": ["numpy"],
+        "agent_gateway/profiles/mujoco/grasp_observation.py": ["numpy"],
         # Object goals project the measured relation only in the concrete leaf.
         "agent_gateway/profiles/mujoco/object_motion.py": ["numpy"],
         # Private-copy body Jacobians and frame projection stay in this leaf.

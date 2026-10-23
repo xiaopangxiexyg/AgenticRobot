@@ -143,6 +143,8 @@ def test_segmentation_model_startup_failure_closes_partial_resources() -> None:
         service=SimpleNamespace(is_closed=False),
         segmentation_localizer=localizer,
         _segmentation_model_started=False,
+        fast_grasp_planner=None,
+        _fast_grasp_start_failed=False,
     )
 
     with pytest.raises(RuntimeError, match="model allocation failed"):
@@ -200,6 +202,10 @@ def _assert_unsettled_passive_read_defers_owned_dependency_cleanup(state_reader)
         spatial_goal_executor=None,
         segmentation_executor=None,
         placement_executor=placement_executor,
+        grasp_observation_executor=None,
+        fast_grasp_executor=None,
+        fast_grasp_provider=None,
+        fast_grasp_planner=None,
         _segmentation_model_started=True,
         segmentation_localizer=localizer,
         _finish_lower_close=lambda value: lower_close_calls.append(value),

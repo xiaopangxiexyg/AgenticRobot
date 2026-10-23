@@ -655,6 +655,7 @@ def test_motion_and_bilateral_grippers_share_one_session_and_physics_owner(keep_
             exposed_pose_sides=("right",), allow_scripted_task_reset=False,
             execution_observation_plan=mujoco_agent_tcp_pose_execution_observation_plan_v1()),
         allowed_client_ids=("test:composed",), enable_grippers=True, enable_safe_tcp_pose=True)
+    restore_collision_fixture = None
     try:
         app = session.application
         app.start_observation_ready()
@@ -680,6 +681,36 @@ def test_motion_and_bilateral_grippers_share_one_session_and_physics_owner(keep_
             ("manipulation.set_gripper_state", {"component_id": "right_gripper", "target_state": "open"}),
             ("motion.move_tcp_to_pose", None),
         ), 1):
+            if keep_left_closed and sequence == 2:
+                def introduce_checked_finger_overlap(scene):
+                    # Closed fingers may only touch. Seed a genuine forbidden
+                    # self-overlap in this private fixture before the next tick.
+                    mj, model, data = scene.mujoco, scene.model, scene.data
+                    first, second = (mj.mj_name2id(model, mj.mjtObj.mjOBJ_GEOM, name)
+                        for name in ("left_gripper_left_finger_collision_0",
+                                     "left_gripper_right_finger_collision_0"))
+                    assert first >= 0 and second >= 0
+                    body = int(model.geom_bodyid[first])
+                    original = model.geom_pos[first].copy()
+                    def restore(scene):
+                        model.geom_pos[first] = original
+                        mj.mj_forward(model, data)
+
+                    try:
+                        model.geom_pos[first] = np.asarray(data.xmat[body]).reshape(3, 3).T @ (
+                            data.geom_xpos[second] - data.xpos[body])
+                        mj.mj_kinematics(model, data)
+                        projector = scene.collision_projector()
+                        check = projector.check_qpos(data, data.qpos[projector.controlled_qpos_indices],
+                            minimum_clearance_m=-projector.policy.hard_penetration_m)
+                        assert not check.safe and check.pair_class == "4:4"
+                        assert check.penetration_depth_m > projector.policy.hard_penetration_m
+                        return restore
+                    except BaseException:
+                        restore(scene)
+                        raise
+
+                restore_collision_fixture = app.runtime.rig.capture_scene(introduce_checked_finger_overlap)
             observed = session.observation_producer.capture_and_publish(session.service)
             assert observed.accepted
             target = list(initial)
@@ -704,11 +735,13 @@ def test_motion_and_bilateral_grippers_share_one_session_and_physics_owner(keep_
             assert session.wait(timeout_sec=20)
             result = session.service.get_operation(admitted.operation.operation_id)
             if keep_left_closed and sequence == 2:
-                # The old parallel-finger fixture has forbidden finger self-contact
-                # when held fully closed. Composition must preserve that rejection.
+                # Composition must reject the explicitly checked self-contact.
                 assert result.execution_outcome == "failed"
                 assert result.reason_code == "station_operation_worker_exception_after_hold"
-                assert "collision-safe segment" in result.progress_summary["worker_error"]["message"]
+                # This explicit overlap is caught by the canonical post-step
+                # hard-contact fence before the next arm command is due.
+                assert "forbidden hard contact after physics step" in result.progress_summary["worker_error"]["message"]
+                assert "left_gripper_left_finger_collision_0" in result.progress_summary["worker_error"]["message"]
                 assert app.held
                 return
             assert result.execution_outcome == "completed", (skill, result.reason_code, result.progress_summary)
@@ -718,6 +751,8 @@ def test_motion_and_bilateral_grippers_share_one_session_and_physics_owner(keep_
         final = public_pose()
         assert abs(final[2] - initial[2] - .03) < .01
     finally:
+        if restore_collision_fixture is not None:
+            app.runtime.rig.capture_scene(restore_collision_fixture)
         closed = session.close()
         assert closed.accepted
         assert closed.port_receipt.proves_motion_or_hold

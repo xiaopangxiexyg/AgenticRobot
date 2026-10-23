@@ -2080,8 +2080,18 @@ def test_contact_curriculum_v3_projection_preserves_locked_gripper_target(
             # CCD artifacts; corrected geometry can admit all five lift steps.
             qpos_by_side = dict(step.ik_result.qpos_by_side)
             right = env.kernel.scene.get_arm_qpos("right").copy()
-            right[5] += 0.08
+            right[1] += 0.2
             qpos_by_side["right"] = right.tolist()
+            scene = env.kernel.scene
+            candidate = scene.data.qpos.copy()
+            for side, values in qpos_by_side.items():
+                for joint, value in zip(scene.arm_specs[side].joint_names, values):
+                    candidate[scene.joint_qpos_addr(joint)] = value
+            projector = env.kernel._collision_projector
+            check = projector.check_qpos(scene.data, candidate[projector.controlled_qpos_indices])
+            assert not check.safe
+            assert "table" in (check.body1_name, check.body2_name)
+            assert check.penetration_depth_m > projector.policy.hard_penetration_m
             return replace(
                 step, ik_result=replace(step.ik_result, qpos_by_side=qpos_by_side)
             )
