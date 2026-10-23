@@ -352,6 +352,9 @@ BiRRT-Connect、C2 重定时和逐参考检查，仍返回本实例独占的不�
 
 激活时复核模型、两臂起点和当前实测关系，只有检查通过后才把绑定的同一个实测 oracle
 挂到既有 position rig 的附加物理 guard；canonical guard 仍先执行。
+同一个附加 guard 在每次 `mj_step` 前后都运行；步后违规立即保留具体碰撞对并锁存，
+不能等到下一步才拒绝，也不能先向连续观测器发布该步为正常测量。没有附加绑定时，
+仍只执行原 canonical 检查；硬穿透限制、控制频率和物理参数均不改变。
 逐参考 resolve 在原 rig 锁内复核实测并复制完整当前 `MjData`，包括 time、qvel、
 mocap 和 equality 输入，再检查被动臂、原有 configuration constraint 及完整携物扫掠。
 冻结查询与当前扫掠各自保留来源要求；当前扫掠不重新锚定，也不发布候选的接触历史。
@@ -360,8 +363,9 @@ mocap 和 equality 输入，再检查被动臂、原有 configuration constraint
 `clear()` 撤销本次计划、参考和附加 guard，重复调用无副作用；绑定本身的实测接口及
 原 observer 不被清除，调用方继续负责释放前后的持续观测。
 这一层不拥有 physics、调度或 dispatch，不证明抓持成功，也不授予携物执行权限。
-携物 Gateway Route／上层生命周期尚未装配；原有运动与单帧默认行为不变。
-公开该 Route 前仍须成套绑定同一 observer、HOLD／取消／释放／close，并完成原生验收；
+本层不装配 Gateway Route；显式应用接线见
+[Gateway 携物运动说明](../../agent_gateway/README.md#显式携物目标mujoco)。原有运动与单帧默认行为不变。
+该 Route 必须成套绑定同一 observer、HOLD／取消／释放／close，并完成原生验收；
 不能把 `approach_grasp_contact` 当作携物抬升接口。
 
 ## DMTAC CAD 方块接触诊断（仅离线）
