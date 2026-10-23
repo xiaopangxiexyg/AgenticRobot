@@ -408,9 +408,17 @@ class CoordinatedPoseHolding:
                     approach_reasons[i] = "supported_soft_stop_not_gravity_only"
             if not supported_braking:
                 support_anchor = None
-        elif (permitted and brake_seed is not None and self.quiet()
-              and (self._support_receipt if self.config.supported_soft_recovery
-                   else max(abs(v) for v in self.last_delta) <= 1e-9)):
+        elif (permitted and brake_seed is not None
+              and (self.config.supported_soft_recovery
+                   or self.quiet() and max(abs(v) for v in self.last_delta) <= 1e-9)):
+            # With supported recovery, every native tracker has now left its
+            # genuine brake using the same-tick resolution-aware dwell and an
+            # exact support receipt. Do not re-gate that transition with the
+            # preparation-only quiet test: one-count slope can fail it on the
+            # resume tick, then the following tracking receipt clears the
+            # support flag and strands the seed forever. Rebase from the last
+            # actual command; a conditioned handoff retries this proposal on
+            # the next receipt without reusing an expired support flag.
             for i, frame in zip(AXES, frames, strict=True):
                 proposed_bias[i] = max(-self.config.bias_cap_nm, min(self.config.bias_cap_nm,
                     (self.last_delta[i] if self.config.supported_soft_recovery else brake_seed[i])

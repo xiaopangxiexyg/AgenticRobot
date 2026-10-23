@@ -112,6 +112,64 @@ def test_supported_recovery_does_not_bypass_reference_lag_or_raw_velocity(settin
         core.step(sequence=12, dt=.01, permitted=True)
 
 
+@pytest.mark.parametrize("joint", [1, 2])
+@pytest.mark.parametrize("direction", [-1, 1])
+@pytest.mark.parametrize("conditioned_handoff", [False, True])
+@pytest.mark.parametrize("software_kd", [0., 6.])
+def test_native_supported_resume_consumes_recovery_despite_one_count_jitter(
+    settings, joint, direction, conditioned_handoff, software_kd,
+):
+    # cv8z3tlt resumed natively at 1102982.299658 and 1103162.037996.
+    # A sub-resolution encoder slope failed the redundant outer quiet gate;
+    # its recovery seed then suppressed bias refinement until the leg ended.
+    core = runtime(settings)
+    core.config = replace(core.config, supported_soft_recovery=True,
+        recovery_kd_nm_s_per_rad=software_kd)
+    core.settings = replace(core.settings, limits=replace(core.settings.limits,
+        max_joint_velocity_rad_s=.195))
+    warm(core)
+    goal = list(core.goal)
+    goal[joint] = direction*.01
+    core.set_goal(goal)
+    core.adopt_hold(joint, direction*.1)
+    resumed_at = None
+    confirmed = saw_refinement = False
+    for n in range(1, 250):
+        q = list(ZERO)
+        q[joint] = direction*min(n, 3)*.0008
+        q[0] = .0003834962844848633 if n % 16 >= 8 else 0.
+        raw = tuple((a-b)/.01 for a, b in zip(q, core.q))
+        dt = core.observe(1.11+n*.01, q, raw)
+        before_bias, before_seed = core.bias, core._brake_seed
+        command, audit = core.step(sequence=n+11, dt=dt, permitted=True, point_search=False)
+        native_resume = any(f["reason"] == "speed_governor_resumed_supported_target" for f in audit["axes"])
+        if native_resume:
+            assert core._support_receipt and before_seed is not None
+            assert not core.quiet()  # Native same-tick resolution-aware dwell did pass.
+            assert audit["approach_reasons"][joint] == "resume_confirmed_support"
+            assert audit["brake_recovery_proposal_nm"] is None
+            assert core._brake_seed == before_seed  # Proposal is not a receipt.
+            resumed_at = n
+        actual = list(command)
+        if native_resume and conditioned_handoff:
+            actual[joint] += direction*.001
+        core.record_dispatch(n+11, actual)
+        if native_resume and conditioned_handoff:
+            assert core.bias == before_bias and core._brake_seed == before_seed
+            assert not core._support_receipt
+        elif not confirmed and resumed_at is not None and core._brake_seed is None:
+            assert n-resumed_at <= 1
+            confirmed = True
+        if (confirmed and audit["approach_reasons"][joint] == "stationary_bias_refinement"
+            and audit["proposed_bias_nm"][joint] != before_bias[joint]):
+            saw_refinement = True
+        assert sum(abs(v) for v in command) <= core.config.total_assist_cap_nm+1e-9
+        assert core.goal == tuple(goal)
+        if saw_refinement:
+            break
+    assert resumed_at is not None and confirmed and saw_refinement
+
+
 @pytest.mark.parametrize("software_kd", [0., 6.])
 def test_supported_stop_retains_one_witnessed_seed_without_recursive_spring_debit(settings, monkeypatch, software_kd):
     from robot_motion.rebot_b601_rs.joint_motion import B601JointMotionFrame
