@@ -93,6 +93,15 @@ fixed historical values rather than silently reinterpreting the fit against
 the current files.
 
 当前运行时源码绑定是
+`artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261023_v12.json`。
+V12直接以冻结V10为前驱，登记完整native chain、分阶段接触策略和prepared Skill消费口；
+重绑planned TCP一项既有源码，新增显式motion_skill.py消费依赖，共21项源码、22项输入。
+实现及304项消费者报告绑定 `73b40a4b177ffe59026b40ff193b8e4ef93b7b7d` /
+`54b2d891fb66149da2453e727ef1d9ffe5e058d1`，不借用首次失败的完整验收或未提交工作树结果。
+本批没有新公开fast Route，不重拟合参数，不增加物理抓取或arm-response声明；
+`provisional` 与新held-out `not_run` 保持。独立B601候选V11未合入，不作为此前驱。
+
+v10历史运行时源码绑定冻结于
 `artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261023_v10.json`。
 它在冻结 v9 的基础上登记原生物体跟随、携物几何及物理步后保护：重新绑定
 executor、position rig 与 planned TCP 三项既有源码，并显式登记七项相关依赖。
