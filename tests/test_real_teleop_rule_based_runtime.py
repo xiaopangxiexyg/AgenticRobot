@@ -5104,8 +5104,8 @@ def test_manual_gripper_resends_same_segment_until_measured_progress() -> None:
     )
     assert resent_target == pytest.approx(first_target)
     assert "重发同一安全分段" in extension.status().gripper_action_status
-    assert extension._manual_gripper_last_progress_at_by_side["right"] == pytest.approx(
-        10.0
+    assert extension._manual_gripper_progress_by_side["right"].last_progress_at == (
+        pytest.approx(10.0)
     )
 
     measured = resent_target
@@ -5338,12 +5338,16 @@ def test_gripper_settle_requires_consecutive_distinct_feedback(interruption) -> 
         ),)),
         trajectory_groups={},
     )
-    extension._manual_gripper_last_dispatch_at_by_side["right"] = 10.0
+    extension._manual_gripper_progress_by_side["right"] = (
+        rule_runtime_module._ManualGripperProgress(
+            last_progress_at=10.0, last_dispatch_at=10.0,
+        )
+    )
 
     def sample(timestamp, **updates):
         return extension._manual_gripper_endpoint_settled(
             {"joint_timestamp": timestamp, "gripper_status_code": 6, **updates},
-            side="right", now=timestamp + 0.01, final_target=1.0,
+            side="right", now=timestamp + 0.01,
         )[0]
 
     assert not sample(10.1)
@@ -5380,6 +5384,8 @@ def test_right_release_invalidates_height_until_explicit_recapture(
     extension._components.right_hand_backend.set_measured_scalar(0.9)
     if dispatch_failure is True:
         def failed_dispatch(*_args, **_kwargs):
+            assert extension._height_calibration is None
+            assert extension._height_calibration_required_after_release
             raise OSError("ambiguous transport failure after release write")
 
         session.dispatch_external_command = failed_dispatch
@@ -5408,6 +5414,44 @@ def test_right_release_invalidates_height_until_explicit_recapture(
     )
     assert "rule.writing_height" not in extension.status().readiness_blockers
     assert extension._height_calibration.calibrated_z_m == pytest.approx(0.25)
+
+
+@pytest.mark.parametrize("failure", ["resolve", "missing_dispatch"])
+def test_manual_release_preparation_failure_preserves_height(failure, monkeypatch) -> None:
+    extension = RuleBasedRealTeleopExtension(
+        deployment=_deployment(),
+        plan=RuleBasedCollectionPlan(steps=(RuleBasedCustomAction(
+            step_id="collect", action=RobotAction.bimanual_qpos(left_arm=np.zeros(6)),
+        ),)),
+        trajectory_groups={},
+        config=RuleBasedRealTeleopConfig(gripper_sides=("right",)),
+        source_selection={"collection_mode": "rule_based_writing"},
+    )
+    session, _clutch, ui = _bind(
+        extension, _Recorder(_Poller()), arm=False, hand_sides=("right",),
+    )
+    calibration = RuleBasedWritingHeightCalibration(
+        calibrated_z_m=0.2, lower_tolerance_m=0.001, upper_tolerance_m=0.001,
+        captured_at=1.0, source_timestamp=1.0,
+        pose_frame_contract_hash=extension.runtime_pose_frame_contract.contract_hash,
+    )
+    extension._height_calibration = calibration
+    extension._components.right_hand_backend.set_measured_scalar(0.9)
+    if failure == "resolve":
+        def reject_action(_action):
+            raise ValueError("invalid action")
+
+        monkeypatch.setattr(extension.adapter.resolver, "resolve", reject_action)
+    else:
+        session.dispatch_external_command = None
+    ui.intents.append("release_right_gripper")
+    extension.after_control_input_poll(now=10.0)
+    session.command_override_provider(SimpleNamespace(), 10.0)
+
+    assert not session.external_commands
+    assert extension.status().gripper_action_result == "failed"
+    assert extension._height_calibration is calibration
+    assert not extension._height_calibration_required_after_release
 
 
 def test_manual_gripper_stops_on_measured_reverse_motion() -> None:
@@ -5613,6 +5657,49 @@ def test_manual_gripper_terminal_backend_rejection_stops_instead_of_retrying(
     assert extension._pending_gripper_action is None
     assert expected in extension.status().gripper_action_status
     assert "等待重试" not in extension.status().gripper_action_status
+
+
+@pytest.mark.parametrize(
+    ("now", "right_measured", "expected"),
+    (
+        (10.6, 0.47, "与请求方向相反"),
+        (10.6, 0.5, "控制超时"),
+        (10.1, 0.5, "未就绪侧 left"),
+    ),
+)
+def test_manual_gripper_failure_precedence_blocks_the_whole_dispatch(
+    now: float, right_measured: float, expected: str,
+) -> None:
+    extension = RuleBasedRealTeleopExtension(
+        deployment=_deployment(),
+        plan=RuleBasedCollectionPlan(steps=(RuleBasedCustomAction(
+            step_id="collect", action=RobotAction.bimanual_qpos(left_arm=np.zeros(6)),
+        ),)),
+        trajectory_groups={},
+        config=RuleBasedRealTeleopConfig(
+            gripper_sides=("left", "right"), manual_gripper_timeout_sec=0.5,
+        ),
+    )
+    session, _clutch, ui = _bind(
+        extension, _Recorder(_Poller()), arm=False, hand_sides=("left", "right"),
+    )
+    left = extension._components.left_hand_backend
+    right = extension._components.right_hand_backend
+    left.set_measured_scalar(0.5)
+    right.set_measured_scalar(0.5)
+    ui.intents.append("close_grippers")
+    extension.after_control_input_poll(now=10.0)
+    session.command_override_provider(SimpleNamespace(), 10.0)
+    assert len(session.external_commands) == 1
+
+    left.is_ready = lambda: False
+    right.set_measured_scalar(right_measured)
+    session.command_override_provider(SimpleNamespace(), now)
+
+    assert len(session.external_commands) == 1
+    assert extension.status().gripper_action_result == "failed"
+    assert expected in extension.status().gripper_action_status
+    assert extension._pending_gripper_action is None
 
 
 def test_prestart_configuration_rebuild_updates_numeric_alignment_speed_off_loop() -> None:

@@ -63,6 +63,12 @@ lower domains must not import application/profile layers
 store、producer 和投影；保留 real-teleop 与 UMI 各自的动作时序语义。启用条件、数据集身份、
 参与侧和存储格式仍由调用方明确传入，不新增 episode owner 或第二套配置状态。
 
+规则采集的手动夹爪维护仍由同一个 real-teleop extension 持有动作生命周期。
+各侧的命令、实测进展和端点稳定历史集中存放；反馈准备、canonical command 构造、
+Session 派发和回执消费分开处理。准备结果仅携带目标及派发前反馈，不是运动授权，
+不读取第二次后端状态，也不替代 Session/Rig 门禁。实测进展超时与重发间隔分别计时，
+一次性终点动作不因中途进展重发；右夹爪松开仍在调用派发前使高度标定失效。
+
 真实遥操的正式 writer 由 `EpisodeRecordingRuntime` 的异步准备／数据集选择事务构造，
 ready 后才发布；配置未变的 ready recorder 直接复用，不重新扫描已封存数据。全局启动不构造
 writer，recorder 自身不再提供关闭后原地重建的第二套生命周期。旧的
