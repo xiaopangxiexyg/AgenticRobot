@@ -661,8 +661,12 @@ class RM65ArmBackendConfig:
     # init fields so legacy positional construction keeps its old meaning.
     observation_only: bool = False
     udp_feedback_reader: Callable[[], RM65RealtimeFeedback] | None = field(default=None, repr=False)
+    # Deployment policy for rate diagnostics only; preserve positional callers.
+    background_streaming_low_rate_warning_only: bool = False
 
     def __post_init__(self) -> None:
+        if not isinstance(self.background_streaming_low_rate_warning_only, bool):
+            raise TypeError("background_streaming_low_rate_warning_only must be boolean.")
         if self.udp_feedback_reader is not None and not callable(self.udp_feedback_reader):
             raise TypeError("udp_feedback_reader must be callable or None")
         if self.effector_name is None:
@@ -5709,7 +5713,8 @@ class RM65ArmBackend(EffectorBackend):
             health_reasons.append("fault_latched")
         if target_stale:
             health_reasons.append("target_stale")
-        if self._stream_warning is not None and bool(self._stream_warning.get("active")):
+        low_send_rate = self._stream_warning is not None and bool(self._stream_warning.get("active"))
+        if low_send_rate and not self.config.background_streaming_low_rate_warning_only:
             health_reasons.append("low_send_rate")
         if (
             self.config.background_streaming_enabled
@@ -5870,6 +5875,8 @@ class RM65ArmBackend(EffectorBackend):
             ),
             "healthy": not health_reasons,
             "health_reasons": health_reasons,
+            "warnings": ["low_send_rate"] if low_send_rate else [],
+            "low_rate_warning_only": self.config.background_streaming_low_rate_warning_only,
             "warning": None if self._stream_warning is None else dict(self._stream_warning),
         }
 

@@ -78,10 +78,15 @@ treat absent or unreadable state as unknown rather than infer readiness from
 transport `status=ok`.
 
 The real application binds its existing fault/lifecycle reader once during
-startup. `control_fault_reason` is bounded and read afresh; the transport keeps
-no second fault latch. Non-running/faulted application states remain visible
-to clients, and failed reads produce an error instead of a healthy snapshot.
-Queue orchestration remains an upper-framework responsibility.
+startup. `control_fault_reason` is bounded and read afresh from that reader.
+The only transport latch is the submission fence that a session without a
+gripper owner retains after a control-loop fault (see
+`docs/agent_gateway/README.md`); once set, `healthz` reports its stable reason
+code, for example `lower_backend_not_ready`, and both Skill submission methods
+are rejected with `control_fault_latched`. Non-running/faulted application
+states remain visible to clients, and failed reads produce an error instead of
+a healthy snapshot. Queue orchestration remains an upper-framework
+responsibility.
 
 There is no RGB- or depth-image method in the protocol. A capture Skill declares
 its selection parameters, output Artifact slots with media/schema/size

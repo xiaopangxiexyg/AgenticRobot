@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import math
 import threading
 import time
@@ -15,6 +16,8 @@ from teleop_runtime.skill_deploy.control_runtime import RealSkillControlLifecycl
 from utils.owned_thread import OwnedThread
 
 from .exclusive_factory import ExclusiveRealAgentPrimitiveDeployment
+
+_LOGGER = logging.getLogger(__name__)
 
 
 class ExclusiveRealSkillResources(Protocol):
@@ -235,12 +238,28 @@ class ExclusiveRealSkillApplication:
             try:
                 self.deployment.control_runtime.step()
             except BaseException as exc:  # noqa: BLE001 - fail closed then stop.
+                reason = (
+                    "lower_backend_not_ready"
+                    if isinstance(exc, PositionDispatchNotReady)
+                    else "exclusive_skill_control_cycle_failed"
+                )
+                self.deployment.control_runtime.motion_port.fence_activations(reason)
+                with self._lock:
+                    server = self._server
+                retain_fault = getattr(server, "retain_control_fault", None)
+                diagnostics_retained = False
+                if (callable(retain_fault)
+                        and self.deployment.gateway_session.contract_bundle.gripper_contract is None):
+                    try:
+                        # Fence all submissions before HOLD. Only the existing
+                        # transport may retain queries; it never resumes control.
+                        diagnostics_retained = retain_fault(reason) is True
+                    except Exception:  # noqa: BLE001 - old shutdown remains fail-closed.
+                        _LOGGER.exception("Unable to fence diagnostic transport after control fault")
+                        diagnostics_retained = False
+                # Composed hand owners still require their existing close path
+                # to stop active gripper commands; arm HOLD alone is not enough.
                 try:
-                    reason = (
-                        "lower_backend_not_ready"
-                        if isinstance(exc, PositionDispatchNotReady)
-                        else "exclusive_skill_control_cycle_failed"
-                    )
                     diagnostic = " ".join(str(exc).split())[:512]
                     self.deployment.control_runtime.fail_closed(
                         reason + (f": {diagnostic}" if diagnostic else "")
@@ -255,7 +274,7 @@ class ExclusiveRealSkillApplication:
                     self._state = ExclusiveRealSkillApplicationState.FAULT
                     server = self._server
                 self._control_stop.set()
-                if self._serving.is_set() and server is not None:
+                if self._serving.is_set() and server is not None and not diagnostics_retained:
                     server.shutdown()
                 return
             deadline += period
@@ -266,7 +285,7 @@ class ExclusiveRealSkillApplication:
         *,
         ready_callback: Callable[[], None] | None = None,
     ) -> None:
-        """Run the sole Gateway server until shutdown or a lower control fault.
+        """Serve until explicit shutdown; faults retain fenced diagnostics.
 
         The callback is a process-host seam: it runs only after lower startup
         admission and server construction, immediately before transport

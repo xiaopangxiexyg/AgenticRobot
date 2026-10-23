@@ -181,6 +181,50 @@ def test_rm65_new_target_does_not_count_idle_gap_as_low_send_rate() -> None:
     assert restarted["low_rate_count"] == 1
 
 
+@pytest.mark.parametrize("rate,warns", [(104., False), (80., False), (79., True), (40., True)])
+@pytest.mark.parametrize("warning_only", [False, True])
+@pytest.mark.parametrize("other_fault", [None, "fault", "stale", "thread_dead", "emergency", "shutdown", "send_error"])
+def test_rate_warning_policy_preserves_other_dispatch_faults(rate, warns, warning_only, other_fault):
+    from teleop_runtime.deploy.dispatch import inspect_arm_backends_for_position_dispatch
+
+    backend = RM65ArmBackend(RM65ArmBackendConfig(
+        arm_ip="0.0.0.0", side="left", connect_hardware=False,
+        initial_qpos=np.zeros(6), singularity_protection_enabled=False,
+        background_streaming_enabled=True, background_streaming_hz=120.,
+        background_streaming_warning_ratio=80 / 120,
+        background_streaming_low_rate_warning_only=warning_only,
+    ))
+    backend.arm = _FakeArm()
+    backend._hardware_ready = True
+    backend._stream_thread = SimpleNamespace(is_alive=lambda: other_fault != "thread_dead")
+    backend._record_background_stream_send(qpos_rad=np.zeros(6), sent_at_perf=0.,
+        call_ms=.1, deadline_lag_ms=0.)
+    backend._record_background_stream_send(qpos_rad=np.zeros(6), sent_at_perf=1 / rate,
+        call_ms=.1, deadline_lag_ms=0.)
+    with backend._state_lock:
+        if other_fault == "fault":
+            backend._stream_fault = "test SDK failure"
+        elif other_fault == "stale":
+            backend._stream_target_qpos = np.zeros(6)
+            backend._stream_target_monotonic = time.monotonic() - 1.
+        elif other_fault == "emergency":
+            backend._emergency_stopped = True
+        elif other_fault == "shutdown":
+            backend._stream_shutdown_requested = True
+        elif other_fault == "send_error":
+            backend._last_send_result_code = 7
+    stream = backend.get_state()["background_streaming"]
+    assert stream["warning_threshold_hz"] == pytest.approx(80.)
+    assert stream["warning"]["active"] is warns
+    assert ("low_send_rate" in stream["warnings"]) is warns
+    assert ("low_send_rate" in stream["health_reasons"]) is (warns and not warning_only)
+    health = inspect_arm_backends_for_position_dispatch({"left": backend},
+        required_sides=("left",), require_background_target=False)
+    assert health["ready"] is (other_fault is None and (warning_only or not warns))
+    assert ("low_send_rate" in health["sides"]["left"]["warnings"]) is warns
+    assert health["sides"]["left"]["background_streaming"]["low_rate_warning_only"] is warning_only
+
+
 def test_rm65_stream_skips_late_tick_without_sending_catchup_command(monkeypatch) -> None:
     backend = RM65ArmBackend(
         RM65ArmBackendConfig(

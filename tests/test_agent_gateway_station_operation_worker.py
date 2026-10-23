@@ -4,6 +4,8 @@ import threading
 from collections.abc import Mapping
 from dataclasses import replace
 
+import pytest
+
 from agent_gateway.protocol.contracts import (
     AgentObservationSnapshot,
     AgentSkillRequest,
@@ -464,6 +466,104 @@ def test_activation_exception_records_lower_hold_before_terminal_failure() -> No
     assert not activation_receipt.succeeded
     assert activation_receipt.proves_motion_or_hold
     assert lifecycle.calls == ["activate", "hold", "close"]
+
+
+def test_activation_failure_context_is_progress_not_lower_receipt_authority() -> None:
+    context = {"stage": "observation_window", "exception_type": "PositionForceGuardTripped",
+               "message": "left force 30.620N exceeds 30.000N"}
+
+    class Rejected(_FakeStationLifecycle):
+        def activate(self, **kwargs):
+            return StationLifecycleActivationEvidence(
+                succeeded=False, status="safe_motion_observation_unavailable",
+                lower_operation_id=None, evidence_refs=("lower:confirmed-hold",),
+                lower_hold_confirmed=True, failure_diagnostic=context)
+
+    service, worker, admitted = _setup(Rejected())
+    assert worker.launch(service=service, operation_id=admitted.operation_id).accepted
+    assert worker.wait(timeout_sec=1.)
+    failed = service.get_operation(admitted.operation_id)
+    assert failed.status == "failed"
+    assert failed.reason_code == "safe_motion_observation_unavailable"
+    assert failed.progress_summary["failure_diagnostic"] == context
+    assert failed.progress_summary["lower_hold_confirmed"] is True
+    receipt = worker.receipts[0]
+    assert receipt.receipt_id == replace(receipt, failure_diagnostic=None).receipt_id
+    assert "failure_diagnostic" not in receipt.to_wire()
+    context["message"] = "changed caller object"
+    assert receipt.failure_diagnostic["message"] != context["message"]
+    assert failed.progress_summary["failure_diagnostic"]["message"] != context["message"]
+
+
+def test_execution_failure_context_survives_terminal_operation_commit() -> None:
+    class Failed(_FakeStationLifecycle):
+        def run(self, **kwargs):
+            return StationLifecycleExecutionCompletion(
+                succeeded=False, reason_code="real_primitive_lower_backend_not_ready",
+                execution_receipt_refs=("lower:confirmed-hold",), terminal_hold_confirmed=True,
+                failure_diagnostic={"stage": "execution", "message": "SDK fault"})
+
+    service, worker, admitted = _setup(Failed())
+    assert worker.launch(service=service, operation_id=admitted.operation_id).accepted
+    assert worker.wait(timeout_sec=1.)
+    failed = service.get_operation(admitted.operation_id)
+    assert failed.status == "failed" and failed.execution_result is None
+    assert failed.progress_summary["failure_diagnostic"] == {"stage": "execution", "message": "SDK fault"}
+    assert failed.semantic_content_hash != replace(failed, progress_summary={"phase": "failed"}).semantic_content_hash
+
+
+def test_failure_context_is_frozen_utf8_bounded_and_marks_truncation() -> None:
+    import json
+    from agent_gateway.runtime.operation_port import freeze_failure_diagnostic
+
+    context = freeze_failure_diagnostic({"message": "故障" * 300})
+    assert len(context["message"].encode("utf-8")) <= 512
+    assert context["diagnostic_truncated"] == "true"
+    assert freeze_failure_diagnostic(context) == context
+    escaped = freeze_failure_diagnostic({str(i): "\x00" * 600 for i in range(8)})
+    assert len(json.dumps(dict(escaped), ensure_ascii=False).encode("utf-8")) < 10_000
+    assert escaped["diagnostic_truncated"] == "true"
+    with pytest.raises(TypeError):
+        context["message"] = "modified"
+    for invalid in ({str(i): "v" for i in range(9)}, {"message": 1},
+                    {"k" * 65: "v"}, {"diagnostic_truncated": "false"}):
+        with pytest.raises(ValueError):
+            freeze_failure_diagnostic(invalid)
+
+
+def test_successful_lifecycle_evidence_cannot_claim_failure_context() -> None:
+    with pytest.raises(ValueError, match="failure diagnostic"):
+        StationLifecycleActivationEvidence(
+            succeeded=True, status="active", lower_operation_id="lower:test",
+            evidence_refs=("lower:evidence",), failure_diagnostic={"message": "fault"})
+    with pytest.raises(ValueError, match="failure diagnostic"):
+        StationLifecycleExecutionCompletion(
+            succeeded=True, reason_code="completed", execution_receipt_refs=("lower:evidence",),
+            terminal_hold_confirmed=True, execution_result={},
+            failure_diagnostic={"message": "fault"})
+
+
+def test_unconfirmed_terminal_hold_keeps_the_original_failure_context() -> None:
+    class Failed(_FakeStationLifecycle):
+        def run(self, **kwargs):
+            return StationLifecycleExecutionCompletion(
+                succeeded=False, reason_code="real_primitive_lower_fault",
+                execution_receipt_refs=("lower:failure",), terminal_hold_confirmed=False,
+                failure_diagnostic={"stage": "execution", "message": "original SDK failure"})
+
+        def request_hold(self, **kwargs):
+            return StationLifecycleControlEvidence(
+                succeeded=False, status="hold_failed",
+                lower_operation_id=f"lower:{kwargs['operation'].operation_id}",
+                evidence_refs=("lower:hold-failed",), lower_hold_confirmed=False)
+
+    service, worker, admitted = _setup(Failed())
+    assert worker.launch(service=service, operation_id=admitted.operation_id).accepted
+    assert worker.wait(timeout_sec=1.)
+    failed = service.get_operation(admitted.operation_id)
+    assert failed.reason_code == "terminal_hold_not_confirmed"
+    assert failed.progress_summary["lower_hold_confirmed"] is False
+    assert failed.progress_summary["failure_diagnostic"]["message"] == "original SDK failure"
 
 
 def test_worker_exception_publishes_bounded_phase_diagnostic_after_hold() -> None:

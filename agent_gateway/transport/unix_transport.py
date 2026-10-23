@@ -624,6 +624,8 @@ class AgentGatewayUnixJsonServer(
             maxlen=max_disconnect_events
         )
         self._close_lock = threading.Lock()
+        self._control_fault_lock = threading.Lock()
+        self._control_fault_reason: str | None = None
         self._transport_closed = False
         self._gateway_close_complete = False
         self._gateway_close_outcome: Any | None = None
@@ -679,6 +681,26 @@ class AgentGatewayUnixJsonServer(
     def active_client_ids(self) -> tuple[str, ...]:
         with self._connection_lock:
             return tuple(sorted(self._active_connections))
+
+    def retain_control_fault(self, reason: str) -> bool:
+        """Fence new submissions and retain diagnostics without lower I/O.
+
+        The first reason is sticky for this server's lifetime. Calls already
+        past the transport gate remain owned by the lower lifecycle; do not
+        wait for them or hold this lock while invoking a facade.
+        """
+        if not isinstance(reason, str) or not reason.strip():
+            raise ValueError("control fault reason must be non-empty text")
+        bounded_reason = reason.strip()[:512]
+        with self._control_fault_lock:
+            if self._control_fault_reason is None:
+                self._control_fault_reason = bounded_reason
+            return True
+
+    @property
+    def control_fault_reason(self) -> str | None:
+        with self._control_fault_lock:
+            return self._control_fault_reason
 
     @property
     def disconnect_events(self) -> tuple[AgentGatewayUnixDisconnectEvent, ...]:
@@ -780,9 +802,19 @@ class AgentGatewayUnixJsonServer(
         request: _ValidatedRequest,
     ) -> tuple[Mapping[str, Any], bool]:
         try:
+            fault_reason = self.control_fault_reason
+            if fault_reason is not None and request.method in {
+                "submit_skill_request", "submit_read_only_skill_request",
+            }:
+                return _error_response(request.request_id,
+                    code="control_fault_latched", message=fault_reason), False
             if request.method == "healthz":
-                reader = self.control_fault_reader
-                fault = reader() if reader is not None else None
+                # A retained fence reports its stable reason code; otherwise
+                # read the application's fault/lifecycle owner afresh.
+                fault = fault_reason
+                if fault is None:
+                    reader = self.control_fault_reader
+                    fault = reader() if reader is not None else None
                 if fault is not None:
                     fault = _required_text(fault, field_name="control_fault_reason", max_length=512)
                 result: object = {

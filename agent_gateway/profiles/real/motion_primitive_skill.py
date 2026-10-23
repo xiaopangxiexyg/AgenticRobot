@@ -37,6 +37,7 @@ from teleop_runtime.skill_deploy.motion_port import (
     REAL_AGENT_TRAJECTORY_START_MAX_DRIFT_RAD,
     RealAgentJointTrajectory,
     RealAgentMotionActivation,
+    RealAgentMotionActivationFenced,
     RealAgentMotionMeasuredQposCut,
     RealAgentMotionPhase,
     RealAgentMotionPort,
@@ -521,6 +522,13 @@ class RealAgentPrimitiveSkillLifecycle:
                 return StationLifecycleActivationEvidence(
                     succeeded=False,
                     status=exc.reason_code,
+                    failure_diagnostic={
+                        "reason_code": exc.reason_code, "side": self.side,
+                        **{name: str(exc.details[name])
+                           for name in ("stage", "role", "exception_type", "message",
+                                        "observation_reason_code", "debug_record_dir")
+                           if exc.details.get(name) is not None},
+                    },
                     lower_operation_id=self.lower_operation_id,
                     evidence_refs=tuple(
                         sorted(
@@ -842,7 +850,18 @@ class RealAgentPrimitiveSkillLifecycle:
             ),
             joint_trajectory=joint_trajectory,
         )
-        snapshot = self.port.submit_activation(activation)
+        try:
+            snapshot = self.port.submit_activation(activation)
+        except RealAgentMotionActivationFenced as error:
+            hold = self.request_hold(operation=operation, reason=error.reason)
+            return StationLifecycleActivationEvidence(
+                succeeded=False, status="real_primitive_control_fault_latched",
+                lower_operation_id=self.lower_operation_id,
+                evidence_refs=hold.evidence_refs,
+                lower_hold_confirmed=hold.lower_hold_confirmed,
+                failure_diagnostic={"stage": "activation", "side": self.side,
+                    "message": str(error)},
+            )
         self._planned_joint_trajectory = joint_trajectory
         self.target_resolution = resolution
         self.target_pose = resolution.target_pose
@@ -1020,6 +1039,7 @@ class RealAgentPrimitiveSkillLifecycle:
         *,
         reason_code: str,
         evidence_refs: set[str],
+        failure_diagnostic: Mapping[str, str] | None = None,
     ) -> StationLifecycleExecutionCompletion:
         hold = self.request_hold(operation=self.operation, reason=reason_code)
         return StationLifecycleExecutionCompletion(
@@ -1027,6 +1047,7 @@ class RealAgentPrimitiveSkillLifecycle:
             reason_code=reason_code,
             execution_receipt_refs=tuple(sorted({*evidence_refs, *hold.evidence_refs})),
             terminal_hold_confirmed=hold.lower_hold_confirmed,
+            failure_diagnostic=failure_diagnostic,
         )
 
     def run(
@@ -1070,6 +1091,9 @@ class RealAgentPrimitiveSkillLifecycle:
                 return self._failed_execution(
                     reason_code="real_primitive_lower_fault",
                     evidence_refs=current_evidence(),
+                    failure_diagnostic={"stage": "execution", "side": self.side,
+                        "lower_phase": snapshot.phase.value,
+                        "message": str(snapshot.fault or snapshot.hold_reason or "lower fault")},
                 )
             if snapshot.phase != RealAgentMotionPhase.ACTIVE:
                 lower_reason = (snapshot.hold_reason or "").split(":", 1)[0]
@@ -1084,6 +1108,9 @@ class RealAgentPrimitiveSkillLifecycle:
                         "exclusive_skill_control_cycle_failed": "real_primitive_lower_control_cycle_failed",
                     }.get(lower_reason, "real_primitive_lower_not_active"),
                     evidence_refs=current_evidence(),
+                    failure_diagnostic={"stage": "execution", "side": self.side,
+                        "lower_phase": snapshot.phase.value,
+                        "message": str(snapshot.hold_reason or "lower operation not active")},
                 )
             cut = self._latest_measured(wait_for_fresh=True)
             if cut is None:

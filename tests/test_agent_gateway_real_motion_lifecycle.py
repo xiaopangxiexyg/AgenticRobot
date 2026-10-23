@@ -606,6 +606,39 @@ def test_safe_pose_move_never_falls_back_to_online_ik(failure, monkeypatch, capl
         assert repr(rejection_details) in message
 
 
+def test_late_safe_planner_cannot_rearm_hold_after_control_fault_fence():
+    bundle, port, _ = _runtime_fixture(include_safe_pose=True)
+    clock, owner = _Clock(), _OwnerSession()
+    request, operation, route, binding = _pose_request_and_operation(
+        bundle, clock=clock, speed_scale=.2, skill_id="motion.move_tcp_to_pose_safe")
+    qpos = {side: np.zeros(6) for side in ("left", "right")}
+    _publish_qpos(port, qpos_by_side=qpos, measured_at=clock(), available_at=clock())
+
+    def planner(**kwargs):
+        port.fence_activations("exclusive_skill_control_cycle_failed")
+        port.request_domain_hold(reason="exclusive_skill_control_cycle_failed", requested_at=clock())
+        port.apply_owner_requests(session=owner, now=clock())
+        assert port.snapshot().phase == RealAgentMotionPhase.HELD
+        clock.value += .01
+        _publish_qpos(port, qpos_by_side=qpos, measured_at=clock(), available_at=clock())
+        return _stationary_grasp_trajectory(qpos)
+
+    def sleep(duration):
+        clock.value += duration
+        port.apply_owner_requests(session=owner, now=clock())
+
+    lifecycle = RealAgentPrimitiveSkillLifecycle(
+        port=port, contract_bundle=bundle, route=route, binding=binding,
+        profile=bundle.pose_target_profile, request=request, operation=operation,
+        grasp_trajectory_planner=planner, clock=clock, sleep=sleep)
+    result = lifecycle.activate(request=request, operation=operation, cancel_requested=lambda: False)
+    assert not result.succeeded and result.lower_hold_confirmed
+    assert result.status == "real_primitive_control_fault_latched"
+    assert port.snapshot().phase == RealAgentMotionPhase.HELD
+    assert port.snapshot().dispatch_count == 0
+    assert len(owner.holds) == 1
+
+
 def test_grasp_approach_rejects_stale_qpos_after_planning_and_holds() -> None:
     bundle, port, _builder = _runtime_fixture(include_grasp_approach=True)
     clock = _Clock()
@@ -1353,6 +1386,7 @@ def test_real_lifecycle_reports_lower_failure_and_preserves_reason(caplog, lower
     assert result.execution_result is None
     assert port.snapshot().hold_reason == native_reason
     assert native_reason in caplog.text
+    assert result.failure_diagnostic["message"] == native_reason
     assert len(owner.holds) == 1
 
 

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import socket
 import subprocess
 import sys
 import threading
@@ -635,6 +637,162 @@ def test_control_fault_retains_typed_cause_without_misclassifying_other_faults(
     application._run_control_loop()
     assert holds == [expected_prefix + ": native cause with new line"]
     assert isinstance(application.control_fault, error_type)
+
+
+@pytest.mark.parametrize("retained", [False, None, "raises"])
+def test_failed_transport_fence_keeps_original_shutdown_path(monkeypatch, retained):
+    deployment = _deployment(observation_provider=_fresh_observation_cut, hold_reasons=[])
+    server = _Server()
+
+    def retain(reason):
+        if retained == "raises":
+            raise RuntimeError("injected transport fence failure")
+        return retained
+
+    server.retain_control_fault = retain
+    application = ExclusiveRealSkillApplication(
+        deployment=deployment, resources=_Resources(), startup_admission=lambda: "fixture",
+        server_factory=lambda: server)
+    application._server = server
+    application._serving.set()
+    monkeypatch.setattr(deployment.control_runtime, "step", lambda: (_ for _ in ()).throw(RuntimeError("fault")))
+    monkeypatch.setattr(deployment.control_runtime, "fail_closed", lambda reason: None)
+    application._run_control_loop()
+    assert server.shutdown_event.is_set()
+    assert application.state == ExclusiveRealSkillApplicationState.FAULT
+
+
+def test_native_unix_application_retains_fault_queries_and_fences_new_work(
+    monkeypatch, short_unix_socket_path_factory,
+):
+    from tests.test_agent_gateway_unix_transport import _raw_call, _wait_for
+    from teleop_runtime.skill_deploy.motion_port import RealAgentMotionPhase
+
+    holds = []
+    resources = _Resources()
+    deployment = _deployment(observation_provider=_fresh_observation_cut, hold_reasons=holds)
+    path = short_unix_socket_path_factory("fault")
+    server = deployment.gateway_session.build_unix_json_server(
+        socket_path=str(path), client_id_by_uid={os.getuid(): "rpent:test"})
+    application = ExclusiveRealSkillApplication(
+        deployment=deployment, resources=resources, startup_admission=lambda: "fixture:admitted",
+        server_factory=lambda: server)
+    step = deployment.control_runtime.step
+    inject = threading.Event()
+
+    def maybe_fault():
+        if inject.is_set():
+            raise PositionDispatchNotReady("injected SDK send fault", health={})
+        return step()
+
+    monkeypatch.setattr(deployment.control_runtime, "step", maybe_fault)
+    ready, failures = threading.Event(), []
+
+    def serve():
+        try:
+            application.serve_forever(ready_callback=ready.set)
+        except Exception as exc:
+            failures.append(exc)
+
+    thread = threading.Thread(target=serve)
+    thread.start()
+    try:
+        assert ready.wait(2)
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+            sock.settimeout(2)
+            sock.connect(str(path))
+            health = _raw_call(sock, request_id="before", method="healthz", payload=None)
+            assert health["result"]["control_fault_reason"] is None
+            inject.set()
+            _wait_for(lambda: application.state == ExclusiveRealSkillApplicationState.FAULT)
+            assert thread.is_alive() and resources.closes == 0
+            assert deployment.gateway_session.port.snapshot().phase == RealAgentMotionPhase.HELD
+            health = _raw_call(sock, request_id="after", method="healthz", payload=None)
+            assert health["result"]["control_fault_reason"] == "lower_backend_not_ready"
+            assert health["result"]["domain_control_state"]["emergency_stop_confirmed"] is False
+            assert _raw_call(sock, request_id="catalog", method="get_skill_route_manifest", payload=None)["ok"]
+            for method in ("submit_skill_request", "submit_read_only_skill_request"):
+                response = _raw_call(sock, request_id=method, method=method, payload={})
+                assert response["error"]["code"] == "control_fault_latched"
+            manifest = deployment.gateway_session.service.manifest
+            query = {"client_id": "rpent:test", "query_id": "fault-query",
+                     "runtime_session_id": manifest.runtime_session_id,
+                     "skill_route_manifest_hash": manifest.semantic_content_hash,
+                     "operation_id": "missing-operation"}
+            # A negative ownership query still returns normally on the same channel.
+            assert _raw_call(sock, request_id="query", method="get_own_operation", payload=query)["ok"]
+            assert _raw_call(sock, request_id="still", method="healthz", payload=None)["ok"]
+            assert deployment.gateway_session.port.snapshot().dispatch_count == 0
+    finally:
+        application.request_shutdown()
+        thread.join(3)
+        if thread.is_alive():
+            application.close()
+            thread.join(3)
+    assert not thread.is_alive()
+    assert resources.closes == 1 and holds
+    assert len(failures) == 1 and "control loop failed" in str(failures[0])
+
+
+@pytest.mark.parametrize("hand_stop_proved", [True, False])
+def test_arm_fault_still_closes_composed_hand_with_an_accepted_command(
+    monkeypatch, hand_stop_proved,
+):
+    from agent_gateway.profiles.real.gripper_skill import ExclusiveRealGripperResources, RealDmtacGripperControlPort
+    from tests.test_agent_gateway_gripper_skill import _FakeDmtacBackend
+
+    backend = _FakeDmtacBackend()
+    backend.samples = [(0., False)]
+    hand = RealDmtacGripperControlPort(backend=backend, clock=time.time)
+    lower = _Resources()
+    deployment = _deployment(observation_provider=_fresh_observation_cut, hold_reasons=[], gripper_port=hand)
+    server, retain_calls = _Server(), []
+    server.retain_control_fault = lambda reason: retain_calls.append(reason) or True
+    app = ExclusiveRealSkillApplication(deployment=deployment,
+        resources=ExclusiveRealGripperResources(lower=lower, port=hand),
+        startup_admission=lambda: "fixture:admitted", server_factory=lambda: server)
+    inject, ready = threading.Event(), threading.Event()
+    failures = []
+    step = deployment.control_runtime.step
+
+    def maybe_fault():
+        if inject.is_set():
+            raise RuntimeError("injected arm failure")
+        return step()
+
+    monkeypatch.setattr(deployment.control_runtime, "step", maybe_fault)
+
+    def serve():
+        try:
+            app.serve_forever(ready_callback=ready.set)
+        except Exception as error:
+            failures.append(error)
+
+    thread = threading.Thread(target=serve)
+    thread.start()
+    real_stop = backend.hold_gripper_motion
+    try:
+        assert ready.wait(2)
+        assert hand.command_close(.5).accepted
+        assert backend.commands == [.5] and not backend.held
+        if not hand_stop_proved:
+            backend.hold_gripper_motion = lambda reason: backend.holds.append(reason) or False
+        inject.set()
+        thread.join(3)
+        assert not thread.is_alive() and failures
+        assert retain_calls == [] and server.shutdown_event.is_set()
+        assert backend.holds
+        if hand_stop_proved:
+            assert backend.held and lower.closes == 1
+        else:
+            assert app.state == ExclusiveRealSkillApplicationState.FAULT
+            assert lower.closes == 0 and "hand_close" not in backend.events
+    finally:
+        backend.hold_gripper_motion = real_stop
+        app.request_shutdown()
+        thread.join(3)
+        app.close()
+    assert lower.closes == 1 and "hand_close" in backend.events
 
 
 @pytest.mark.parametrize("with_grippers", [False, True])

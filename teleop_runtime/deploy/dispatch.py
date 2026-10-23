@@ -249,11 +249,10 @@ def inspect_arm_backends_for_position_dispatch(
                 str(reason)
                 for reason in (background_state.get("health_reasons") or ())
             )
-            if "low_send_rate" in health_reasons:
-                # Keep the warning in the receipt for diagnosis, but do not
-                # downgrade it: a measured stream below its contract rate is
-                # unsafe for position dispatch and must stop the lane.  The
-                # next command must never be used to "catch up" a late slot.
+            if ("low_send_rate" in health_reasons
+                    or "low_send_rate" in (background_state.get("warnings") or ())):
+                # The backend's explicit deployment policy owns rate health.
+                # Faults, stale targets and unknown unhealthy states still block.
                 background_warnings.append("low_send_rate")
             blocking_health_reasons = health_reasons
             if background_state.get("healthy") is False:
@@ -333,6 +332,12 @@ def require_arm_backends_ready_for_position_dispatch(
                 if isinstance(background, Mapping) and background.get("fault"):
                     fault = " ".join(str(background["fault"]).split())[:512]
                     failure += f" [background_fault={fault}]"
+                if isinstance(background, Mapping) and background.get("healthy") is False:
+                    detail = {key: background.get(key) for key in (
+                        "health_reasons", "warnings", "low_rate_warning_only", "warning_threshold_hz",
+                        "target_active", "target_stale", "actual_hz", "last_send_dt_sec",
+                        "current_inter_send_gap_sec", "last_phase_timing_ms")}
+                    failure += f" [background_health={detail!r}]"
                 failures.append(failure)
         if not failures:
             failures.append("no_arm_backends")
@@ -507,6 +512,9 @@ def _compact_background_streaming_state(state: Mapping[str, Any]) -> dict[str, A
         "no_catch_up_after_send",
         "healthy",
         "health_reasons",
+        "warnings",
+        "low_rate_warning_only",
+        "warning_threshold_hz",
         "thread_alive",
         "target_active",
         "target_sequence",
@@ -526,6 +534,8 @@ def _compact_background_streaming_state(state: Mapping[str, Any]) -> dict[str, A
         "last_call_ms",
         "last_deadline_lag_ms",
         "last_send_dt_sec",
+        "current_inter_send_gap_sec",
+        "last_phase_timing_ms",
         "max_inter_send_gap_sec",
         "deadline_miss_count",
         "skipped_tick_count",

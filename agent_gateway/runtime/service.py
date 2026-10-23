@@ -1101,6 +1101,9 @@ class AgentGatewayService:
                     "lower_hold_confirmed": bool(
                         not executor_no_io and receipt.proves_motion_or_hold
                     ),
+                    **({"failure_diagnostic": dict(receipt.failure_diagnostic)}
+                       if isinstance(receipt, AgentGatewayAuthoritativePortReceipt)
+                       and receipt.failure_diagnostic is not None else {}),
                 },
             )
         if not projection.accepted:

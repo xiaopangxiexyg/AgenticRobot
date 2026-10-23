@@ -22,7 +22,7 @@ from ..protocol.contracts import (
     AgentSkillOperation,
     AgentSkillRequest,
 )
-from .operation_port import AgentGatewayAuthoritativePortReceipt
+from .operation_port import AgentGatewayAuthoritativePortReceipt, freeze_failure_diagnostic
 
 STATION_OPERATION_WORKER_STATES_V1 = (
     "idle",
@@ -166,10 +166,14 @@ class StationLifecycleActivationEvidence:
     lower_operation_id: str | None
     evidence_refs: tuple[str, ...]
     lower_hold_confirmed: bool = False
+    failure_diagnostic: Mapping[str, str] | None = None
 
     def __post_init__(self) -> None:
+        object.__setattr__(self, "failure_diagnostic", freeze_failure_diagnostic(self.failure_diagnostic))
         if not isinstance(self.succeeded, bool):
             raise TypeError("succeeded must be a boolean.")
+        if self.succeeded and self.failure_diagnostic is not None:
+            raise ValueError("Successful activation cannot claim a failure diagnostic.")
         object.__setattr__(self, "status", _required(self.status, field_name="status"))
         if self.lower_operation_id is not None:
             object.__setattr__(
@@ -286,10 +290,14 @@ class StationLifecycleExecutionCompletion:
     terminal_hold_confirmed: bool
     execution_result: Mapping[str, Any] | None = None
     evaluation: StationLifecycleEvaluationCompletion | None = None
+    failure_diagnostic: Mapping[str, str] | None = None
 
     def __post_init__(self) -> None:
+        object.__setattr__(self, "failure_diagnostic", freeze_failure_diagnostic(self.failure_diagnostic))
         if not isinstance(self.succeeded, bool):
             raise TypeError("succeeded must be a boolean.")
+        if self.succeeded and self.failure_diagnostic is not None:
+            raise ValueError("Successful execution cannot claim a failure diagnostic.")
         object.__setattr__(
             self,
             "reason_code",
@@ -841,6 +849,7 @@ class BoundedStationAgentSkillOperationWorker:
             lower_operation_id=evidence.lower_operation_id,
             evidence_refs=evidence.evidence_refs,
             proves_motion_or_hold=evidence.lower_hold_confirmed,
+            failure_diagnostic=evidence.failure_diagnostic,
         )
 
     def _receipt_from_control(
@@ -870,6 +879,7 @@ class BoundedStationAgentSkillOperationWorker:
         lower_operation_id: str | None = None,
         evidence_refs: tuple[str, ...] = (),
         proves_motion_or_hold: bool = False,
+        failure_diagnostic: Mapping[str, str] | None = None,
     ) -> AgentGatewayAuthoritativePortReceipt:
         with self._receipt_lock:
             if lower_operation_id is not None:
@@ -891,6 +901,7 @@ class BoundedStationAgentSkillOperationWorker:
                 lower_operation_id=lower_operation_id,
                 evidence_refs=evidence_refs,
                 proves_motion_or_hold=proves_motion_or_hold,
+                failure_diagnostic=failure_diagnostic,
             )
             self._next_call_sequence += 1
             self._receipts.append(receipt)
@@ -945,6 +956,7 @@ class BoundedStationAgentSkillOperationWorker:
                         reason_code="terminal_hold_not_confirmed",
                         execution_receipt_refs=receipt_refs,
                         terminal_hold_confirmed=False,
+                        failure_diagnostic=completion.failure_diagnostic,
                     )
             worker_phase = "execution_result_commit"
             outcome = service.complete_operation(
@@ -955,6 +967,10 @@ class BoundedStationAgentSkillOperationWorker:
                 current_station_revision=self._revision(),
                 execution_result=completion.execution_result,
                 execution_receipt_refs=receipt_refs,
+                **({"progress_summary": {"phase": "failed",
+                    "lower_hold_confirmed": completion.terminal_hold_confirmed,
+                    "failure_diagnostic": dict(completion.failure_diagnostic)}}
+                   if completion.failure_diagnostic is not None else {}),
             )
             if (
                 not bool(getattr(outcome, "accepted", False))
