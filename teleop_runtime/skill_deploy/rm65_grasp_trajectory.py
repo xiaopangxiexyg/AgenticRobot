@@ -2495,6 +2495,8 @@ class RM65GraspJointTrajectoryPlanner:
         def residual(values: np.ndarray) -> np.ndarray:
             nonlocal cached_values, cached_residual, cached_jacobian
             nonlocal cached_tcp_jacobian, cached_rotation_error
+            if deadline is not None and float(monotonic()) >= deadline:
+                raise RM65GraspTrajectoryPlanningError("path_planning_time_budget_exhausted")
             # SciPy supplies fixed-shape six-joint iterates. Compare exactly,
             # not by identity or tolerance, including after an in-place update.
             if cached_values is not None and not (values != cached_values).any():
@@ -2660,6 +2662,8 @@ class RM65GraspJointTrajectoryPlanner:
                 target_tool_tcp_world=target_pose,
                 seed_qpos=np.asarray(seed_qpos, dtype=float),
                 solved_qpos=np.asarray(candidate[side], dtype=float),
+                deadline=deadline,
+                monotonic=monotonic,
             )
         return candidate, evaluations, position, orientation
 
@@ -2671,6 +2675,8 @@ class RM65GraspJointTrajectoryPlanner:
         target_tool_tcp_world: np.ndarray,
         seed_qpos: np.ndarray,
         solved_qpos: np.ndarray,
+        deadline: float | None = None,
+        monotonic: Callable[[], float] = time.perf_counter,
     ) -> tuple[dict[str, np.ndarray], float, float]:
         """Keep the earliest seed-to-solution point inside a strict margin.
 
@@ -2693,6 +2699,8 @@ class RM65GraspJointTrajectoryPlanner:
         solved = np.asarray(solved_qpos, dtype=float)
 
         def evaluate(alpha: float) -> tuple[dict[str, np.ndarray], float, float]:
+            if deadline is not None and float(monotonic()) >= deadline:
+                raise RM65GraspTrajectoryPlanningError("path_planning_time_budget_exhausted")
             pair = {
                 name: np.asarray(qpos_by_side[name], dtype=float).copy()
                 for name in _SIDES
@@ -3316,6 +3324,26 @@ class RM65GraspJointTrajectoryPlanner:
                             monotonic=monotonic,
                         )
                     )
+                except RM65GraspTrajectoryPlanningError as error:
+                    if error.reason_code != "path_planning_time_budget_exhausted":
+                        raise
+                    termination = "time_budget_exhausted"
+                    if best is None and initial_seed_qpos is None:
+                        # Keep the legacy no-hint diagnostic: one factual
+                        # FK sample, no new seed or optimization budget.
+                        # This cannot produce a late standard label.
+                        pair = {name: np.asarray(qpos_by_side[name], dtype=float).copy()
+                                for name in _SIDES}
+                        realized = self.target_builder.tool_tcp_world_targets_for_qpos_pair(
+                            left_qpos=pair["left"], right_qpos=pair["right"])[side]
+                        position, orientation = pose_delta_metrics(realized, target_pose)
+                        if not math.isfinite(position) or not math.isfinite(orientation):
+                            raise RuntimeError("RM65 reachability diagnostic residual must be finite.")
+                        best = (max(position / config.basic_position_tolerance_m,
+                                    orientation / config.basic_orientation_tolerance_deg),
+                                position, orientation)
+                        cycles += 1
+                    break
                 except (RuntimeError, ValueError, np.linalg.LinAlgError):
                     continue
                 cycles += evaluations

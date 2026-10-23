@@ -6221,3 +6221,150 @@ def test_safe_pose_checks_final_retimed_endpoint_before_publishing(monkeypatch, 
             monotonic=lambda: clock[0], time_budget_sec=1.)
     assert len(quality_calls) == 2 and len(final_queries) == 1
     assert not list(tmp_path.iterdir())
+
+
+@pytest.mark.parametrize("query", ("residual", "jacobian"))
+@pytest.mark.parametrize("cached", (False, True))
+def test_phase15_endpoint_deadline_precedes_cached_residual_and_jacobian(monkeypatch, query, cached):
+    planner = _planner_without_assets(config=RM65GraspTrajectoryPlanningConfig())
+    clock, native = [0.], []
+    def pose_jacobian(**kwargs):
+        native.append(kwargs)
+        return np.eye(4), np.eye(6)
+    planner.target_builder = SimpleNamespace(
+        tool_tcp_world_pose_and_jacobian_for_qpos_pair=pose_jacobian,
+        tool_tcp_world_targets_for_qpos_pair=lambda **_: {s: np.eye(4) for s in ("left", "right")})
+    def solve(fun, values, *, jac, **_kwargs):
+        if cached:
+            fun(values)
+        clock[0] = 1.
+        (jac if query == "jacobian" else fun)(values.copy())
+        return SimpleNamespace(x=values.copy(), nfev=1)
+    monkeypatch.setattr(grasp_trajectory_module, "least_squares", solve)
+    with pytest.raises(RM65GraspTrajectoryPlanningError) as error:
+        planner._least_squares_endpoint_from_seed(
+            qpos_by_side={s: np.zeros(6) for s in ("left", "right")}, side="right",
+            target_tool_tcp_world=np.eye(4), seed_qpos=np.zeros(6), maximum_evaluations=1,
+            prefer_closest_tolerance=False, deadline=1., monotonic=lambda: clock[0])
+    assert error.value.reason_code == "path_planning_time_budget_exhausted"
+    assert len(native) == int(cached)
+
+
+@pytest.mark.parametrize("expire_after_fk", (2, 3, 5))
+def test_phase15_closest_tolerance_backoff_shares_solve_deadline(monkeypatch, expire_after_fk):
+    planner = _planner_without_assets(config=RM65GraspTrajectoryPlanningConfig())
+    clock, fk_calls = [0.], []
+    def fk(**kwargs):
+        fk_calls.append(kwargs)
+        if len(fk_calls) == expire_after_fk:
+            clock[0] = 1.
+        return {s: np.eye(4) for s in ("left", "right")}
+    planner.target_builder = SimpleNamespace(tool_tcp_world_targets_for_qpos_pair=fk,
+        solver_world_targets_for_qpos_pair=lambda **_: {s: np.eye(4) for s in ("left", "right")})
+    def solve(fun, values, **_kwargs):
+        fun(values)
+        return SimpleNamespace(x=values.copy(), nfev=1)
+    monkeypatch.setattr(grasp_trajectory_module, "least_squares", solve)
+    with pytest.raises(RM65GraspTrajectoryPlanningError) as error:
+        planner._least_squares_endpoint_from_seed(
+            qpos_by_side={s: np.zeros(6) for s in ("left", "right")}, side="right",
+            target_tool_tcp_world=np.eye(4), seed_qpos=np.zeros(6), maximum_evaluations=1,
+            deadline=1., monotonic=lambda: clock[0])
+    assert error.value.reason_code == "path_planning_time_budget_exhausted"
+    assert len(fk_calls) == expire_after_fk
+
+
+@pytest.mark.parametrize("residual,classification", ((0., "basically_reachable"),
+    (.03, "basically_reachable"), (.06, "difficult_to_reach")))
+def test_phase15_no_hint_timeout_keeps_one_factual_basic_diagnostic(monkeypatch, residual, classification):
+    planner = _planner_without_assets(config=RM65GraspTrajectoryPlanningConfig())
+    planner.reachability_config = RM65GraspReachabilityConfig(time_budget_ms=1000.)
+    current = {s: np.zeros(6) for s in ("left", "right")}
+    clock, fk_calls, solves = [0.], [], []
+    def fk(**kwargs):
+        fk_calls.append(kwargs)
+        for side in current:
+            np.testing.assert_array_equal(kwargs[side + "_qpos"], current[side])
+        pose = np.eye(4)
+        pose[0, 3] = residual
+        return {s: pose.copy() for s in ("left", "right")}
+    def solve(fun, values, **_kwargs):
+        solves.append(values.copy())
+        clock[0] = 1.1
+        fun(values)
+        return SimpleNamespace(x=values.copy(), nfev=1)
+    planner.target_builder = SimpleNamespace(tool_tcp_world_targets_for_qpos_pair=fk,
+        solver_world_targets_for_qpos_pair=lambda **_: {s: np.eye(4) for s in ("left", "right")})
+    monkeypatch.setattr(planner, "_endpoint_seed_qpos", lambda *_args, **_kwargs: (current,))
+    monkeypatch.setattr(grasp_trajectory_module, "least_squares", solve)
+    result = planner.assess_endpoint_ik(qpos_by_side=current, side="right",
+        target_tool_tcp_world=np.eye(4), monotonic=lambda: clock[0])
+    assert result.classification == classification
+    assert result.position_residual_m == pytest.approx(residual)
+    assert result.orientation_residual_deg == pytest.approx(0.)
+    assert result.termination_reason == "time_budget_exhausted" and result.solve_cycles == 1
+    assert len(fk_calls) == len(solves) == 1
+    for values in current.values():
+        np.testing.assert_array_equal(values, np.zeros(6))
+
+
+def test_phase15_hinted_timeout_has_no_postdeadline_diagnostic_measurement(monkeypatch):
+    planner = _planner_without_assets(config=RM65GraspTrajectoryPlanningConfig())
+    planner.reachability_config = RM65GraspReachabilityConfig(time_budget_ms=1000.)
+    current = {s: np.zeros(6) for s in ("left", "right")}
+    clock, fk_calls = [0.], []
+    def fk(**kwargs):
+        fk_calls.append(kwargs)
+        pose = np.eye(4)
+        pose[0, 3] = .03  # hint misses standard, so ordinary seeds get remaining time
+        return {s: pose.copy() for s in ("left", "right")}
+    def solve(fun, values, **_kwargs):
+        clock[0] = 1.1
+        fun(values)
+        return SimpleNamespace(x=values.copy(), nfev=1)
+    planner.target_builder = SimpleNamespace(tool_tcp_world_targets_for_qpos_pair=fk,
+        solver_world_targets_for_qpos_pair=lambda **_: {s: np.eye(4) for s in ("left", "right")})
+    monkeypatch.setattr(planner, "_endpoint_seed_qpos", lambda *_args, **_kwargs: (current,))
+    monkeypatch.setattr(grasp_trajectory_module, "least_squares", solve)
+    with pytest.raises(RuntimeError, match="time budget exhausted without a candidate"):
+        planner.assess_endpoint_ik(qpos_by_side=current, side="right", initial_seed_qpos=np.zeros(6),
+            target_tool_tcp_world=np.eye(4), monotonic=lambda: clock[0])
+    assert len(fk_calls) == 1  # only the original in-budget hint FK
+
+
+def test_phase15_timeout_retains_existing_best_without_extra_fk(monkeypatch):
+    planner = _planner_without_assets(config=RM65GraspTrajectoryPlanningConfig())
+    planner.reachability_config = RM65GraspReachabilityConfig(time_budget_ms=1000., seed_count=2)
+    current = {s: np.zeros(6) for s in ("left", "right")}
+    clock, calls = [0.], []
+    planner.target_builder = SimpleNamespace(tool_tcp_world_targets_for_qpos_pair=
+        lambda **_: pytest.fail("Existing best needs no extra FK"))
+    monkeypatch.setattr(planner, "_endpoint_seed_qpos", lambda *_args, **_kwargs: (current, current))
+    def solve(**kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1:
+            return current, 1, .03, 0.
+        clock[0] = 1.1
+        raise RM65GraspTrajectoryPlanningError("path_planning_time_budget_exhausted")
+    monkeypatch.setattr(planner, "_least_squares_endpoint_from_seed", solve)
+    result = planner.assess_endpoint_ik(qpos_by_side=current, side="right",
+        target_tool_tcp_world=np.eye(4), monotonic=lambda: clock[0])
+    assert result.position_residual_m == .03 and result.solve_cycles == 1
+    assert result.classification == "basically_reachable"
+    assert result.termination_reason == "time_budget_exhausted" and len(calls) == 2
+
+
+@pytest.mark.parametrize("reason", ("path_collision_check_unavailable", "invalid_target"))
+def test_phase15_typed_nonbudget_solver_faults_escape_diagnostics(monkeypatch, reason):
+    planner = _planner_without_assets(config=RM65GraspTrajectoryPlanningConfig())
+    current = {s: np.zeros(6) for s in ("left", "right")}
+    planner.target_builder = SimpleNamespace(tool_tcp_world_targets_for_qpos_pair=
+        lambda **_: pytest.fail("Request faults cannot trigger fallback FK"))
+    monkeypatch.setattr(planner, "_endpoint_seed_qpos", lambda *_args, **_kwargs: (current,))
+    def solve(**_kwargs):
+        raise RM65GraspTrajectoryPlanningError(reason)
+    monkeypatch.setattr(planner, "_least_squares_endpoint_from_seed", solve)
+    with pytest.raises(RM65GraspTrajectoryPlanningError) as error:
+        planner.assess_endpoint_ik(qpos_by_side=current, side="right",
+            target_tool_tcp_world=np.eye(4), monotonic=lambda: 0.)
+    assert error.value.reason_code == reason
