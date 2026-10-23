@@ -202,9 +202,9 @@ class OfflinePlanAdmission:
         )
         plan = RealGraspApproachPlan(runtime_session_id="offline-session",
             profile_hash="offline-profile", planning_operation_id=f"offline-planning:{name}",
-            planning_request_hash="offline-request", point_grasp_operation_id="frozen-grasp",
-            point_grasp_request_hash="offline-grasp-request", point_grasp_result_hash="offline-grasp-result",
-            point_grasp_candidate_hash="offline-candidate", source_station_revision=0,
+            planning_request_hash="offline-request", source_operation_id="frozen-grasp",
+            source_request_hash="offline-grasp-request", source_result_hash="offline-grasp-result",
+            source_grasp_hash="offline-candidate", source_station_revision=0,
             component_id=f"{self.side}-tool-tcp", side=self.side, target_pose_reference=target,
             target_pose_execution=target, speed_scale=1., measured_qpos_revision=cut.revision,
             measured_qpos_hash=cut.semantic_content_hash, measured_qpos_at=cut.measured_at,
