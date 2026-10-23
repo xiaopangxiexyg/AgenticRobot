@@ -7562,3 +7562,42 @@ def test_feedback_warmup_keeps_single_poll_outer_budget_and_wait(monkeypatch, tm
     assert len(fixture.polls) == 3
     assert waits == [.01]*3
     assert "enable" not in fixture.events and "dispatch" not in fixture.events
+
+
+@pytest.mark.parametrize("window", [0.0, .015])
+def test_actual_shared_owner_call_forwards_joint_receive_time_only_when_enabled(window):
+    import ast
+    import inspect
+    from dataclasses import replace
+    from types import SimpleNamespace
+
+    runtime = probe.B601SharedControlRuntime(replace(_shared_runtime().config,
+        damping_velocity_window_sec=window))
+    captured = []
+    original_step = runtime.step
+    def step(**kwargs):
+        captured.append(kwargs)
+        return original_step(**kwargs)
+    runtime.step = step
+    now = 1.0
+    state = SimpleNamespace(sequence=7, receive_timestamp_sec=now)
+    observed = tuple(now-.001*j for j in range(6))
+    if window:
+        state.joints = tuple(SimpleNamespace(observed_at_sec=t) for t in observed)
+    owner = ast.parse(inspect.getsource(probe.run_probe))
+    calls = [n for n in ast.walk(owner) if isinstance(n, ast.Call)
+        and isinstance(n.func, ast.Name) and n.func.id == "_step_shared_control_runtime"]
+    assert len(calls) == 1
+    expression = ast.Expression(body=calls[0])
+    code = compile(ast.fix_missing_locations(expression), "actual-owner-shared-call", "eval")
+    reference, payload = eval(code, {
+        "_step_shared_control_runtime": probe._step_shared_control_runtime,
+        "shared_control_runtime": runtime, "state": state,
+        "q": (0.,) * 6, "qvel": (.1,) * 6, "dt": .01,
+    })
+    assert len(captured) == 1
+    assert captured[0].get("joint_observation_timestamps_sec") == (observed if window else None)
+    assert captured[0]["measured_qvel_rad_s"] == (.1,) * 6
+    assert reference.source_timestamp_sec == reference.receive_timestamp_sec == now
+    assert reference.qpos_rad == (0.,) * 6 and reference.joint_torque_overlay_nm == (0.,) * 6
+    assert ("control_qvel_rad_s" in payload) is bool(window)

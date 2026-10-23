@@ -284,6 +284,7 @@ class B601SharedControlConfig:
     policy_stale_timeout_sec: float
     maximum_future_skew_sec: float = 0.01
     joint_names: tuple[str, ...] = B601_RS_ARM_JOINT_NAMES
+    damping_velocity_window_sec: float = 0.0
 
     def __post_init__(self) -> None:
         if tuple(self.joint_names) != B601_RS_ARM_JOINT_NAMES:
@@ -352,6 +353,12 @@ class B601SharedControlConfig:
             raise ValueError("maximum_future_skew_sec must be non-negative")
         object.__setattr__(self, "maximum_future_skew_sec", future_skew)
         object.__setattr__(self, "joint_names", tuple(self.joint_names))
+        window = _finite(
+            self.damping_velocity_window_sec, name="damping_velocity_window_sec"
+        )
+        if window < 0:
+            raise ValueError("damping_velocity_window_sec must be non-negative")
+        object.__setattr__(self, "damping_velocity_window_sec", window)
 
 
 @dataclass(frozen=True)

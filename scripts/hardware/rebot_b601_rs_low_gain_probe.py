@@ -6122,6 +6122,7 @@ def _shared_control_config_payload(
         "max_target_error_rad": config.max_target_error_rad,
         "max_abs_assist_torque_nm": config.max_abs_assist_torque_nm,
         "max_assist_torque_rate_nm_s": config.max_assist_torque_rate_nm_s,
+        "damping_velocity_window_sec": config.damping_velocity_window_sec,
         "authority_rise_per_sec": config.authority_rise_per_sec,
         "policy_stale_timeout_sec": config.policy_stale_timeout_sec,
         "maximum_future_skew_sec": config.maximum_future_skew_sec,
@@ -6180,6 +6181,7 @@ def _step_shared_control_runtime(
     measured_qpos_rad: Sequence[float],
     measured_qvel_rad_s: Sequence[float],
     dt_sec: float,
+    joint_observation_timestamps_sec: Sequence[float] | None = None,
 ) -> tuple[B601MitReference, dict[str, object]]:
     """Produce one auditable assist reference for the sole hardware owner."""
 
@@ -6189,8 +6191,13 @@ def _step_shared_control_runtime(
         measured_qpos_rad=measured_qpos_rad,
         measured_qvel_rad_s=measured_qvel_rad_s,
         dt_sec=dt_sec,
+        **({"joint_observation_timestamps_sec": joint_observation_timestamps_sec}
+           if joint_observation_timestamps_sec is not None else {}),
     )
-    return frame.reference, _shared_control_frame_payload(frame)
+    payload = _shared_control_frame_payload(frame)
+    if runtime.config.damping_velocity_window_sec:
+        payload["control_qvel_rad_s"] = frame.control_qvel_rad_s
+    return frame.reference, payload
 
 
 def compute_software_torque_breakdown(
@@ -10562,6 +10569,10 @@ def run_probe(
                         measured_qpos_rad=q,
                         measured_qvel_rad_s=qvel,
                         dt_sec=dt,
+                        joint_observation_timestamps_sec=(
+                            tuple(joint.observed_at_sec for joint in state.joints)
+                            if shared_control_runtime.config.damping_velocity_window_sec else None
+                        ),
                     )
                 )
                 qref = shared_reference.qpos_rad
