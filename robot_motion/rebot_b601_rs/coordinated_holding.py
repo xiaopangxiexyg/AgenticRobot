@@ -439,9 +439,15 @@ class CoordinatedPoseHolding:
                     proposed_bias[i] = self._unwind_only(i, proposed_bias[i])
         norm = sum(abs(v) for v in demand)
         scale = min(1.0, self.config.total_assist_cap_nm / norm) if norm else 1.0
+        bias_before_cap = tuple(proposed_bias)
+        cap_feedback = (scale < 1 and permitted and not self.braking
+            and self.config.motor_local_recovery and not fixed_probes
+            and (not point_search or point_reacquire))
         if scale < 1 and not self.braking:
             proposed_bias = [self._unwind_only(i, value) for i, value in enumerate(proposed_bias)]
         command = [0.0] * 6
+        uncapped_command = [0.0] * 6
+        cap_shortfall = [0.0] * 6
         transition_reasons, transition_rates = [None] * 6, [None] * 6
         if permitted:
             for i, frame in zip(AXES, frames, strict=True):
@@ -454,6 +460,9 @@ class CoordinatedPoseHolding:
                                   and frame.reason in {"target_reached_braking", "calibration_target_tracking"})
                 command[i], transition_reasons[i], transition_rates[i] = self._slew_axis(
                     i, target, dt, moving[i], arrival_unload=arrival_unload)
+                if cap_feedback:
+                    uncapped_command[i] = self._slew_axis(
+                        i, demand[i], dt, moving[i], arrival_unload=arrival_unload)[0]
             # The final sum, including a preceding axis' tail, owns one cap.
             norm = sum(abs(v) for v in command)
             if norm > self.config.total_assist_cap_nm:
@@ -469,6 +478,29 @@ class CoordinatedPoseHolding:
                     command[i] = magnitude if command[i] > 0 else -magnitude
                 if not self.braking:
                     proposed_bias = [self._unwind_only(i, value) for i, value in enumerate(proposed_bias)]
+            if cap_feedback:
+                for i, frame in zip(AXES, frames, strict=True):
+                    shortfall = command[i]-uncapped_command[i]
+                    if (composed_speed_scales[i] == 1 and shortfall*uncapped_command[i] < 0
+                        and shortfall*bias_before_cap[i] < 0):
+                        # Back-calculate only the final L1 clip, relative to
+                        # the SAME native demand and slew rule without it.
+                        # Ordinary slowing/unloading is not debited again.
+                        # Include the pre-cap proposal so blocked integration
+                        # is not also subtracted from the retained old bias.
+                        cap_shortfall[i] = shortfall
+                        value = bias_before_cap[i]+shortfall
+                        if value*bias_before_cap[i] <= 0 or value*self.bias[i] < 0:
+                            value = 0.0
+                        # Conditional integration can retain growth already
+                        # realized inside the cap, not unexecuted slew debt.
+                        # Otherwise a roundoff-sized clip freezes growth again.
+                        realized = command[i]-frame.requested_torque_nm
+                        if abs(value) > abs(self.bias[i]) and not (
+                            value*realized >= 0 and abs(value) <= abs(realized)+1e-12
+                        ):
+                            value = self._unwind_only(i, value)
+                        proposed_bias[i] = value
         else:
             proposed_bias = [0.0] * 6
             # Revocation invalidates a proposal immediately, even if a final
@@ -490,6 +522,7 @@ class CoordinatedPoseHolding:
             "departure_bias_nm": self._departure_bias,
             "departure_bias_semantics": "consumed_handoff_prior_not_destination_holding_force",
             "combined_l1_cap_nm": self.config.total_assist_cap_nm,
+            "combined_cap_shortfall_nm": tuple(cap_shortfall),
             "saturated": scale < 1, "braking": self.braking,
             "arrival_tolerance_rad": self.arrival_tolerance_rad,
             "point_search_enabled": point_search,
