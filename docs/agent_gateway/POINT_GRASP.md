@@ -18,6 +18,26 @@
 姿态只绑定用户提供的本地标定文件，不是 Gateway 可信 Station pose，不能绕过下游正式 motion
 owner、碰撞场景和安全门禁。
 
+## 真实 Gateway 的快速完整路径规划
+
+`perception.plan_grasp_fast@1` 只在已有冻结观测、具身 GraspGenX 和 paired-plan
+装配条件闭合时注册。调用方提供留存 observation operation ID、点击像素、角色和
+有界搜索参数；profile 复用原模型、几何、IK 与路径规划器，返回第一条完整可行路径的
+会话内计划 ID/hash。旧候选审阅及 `perception.plan_grasp_approach@1` 入口继续可用。
+
+该 Skill 为只读规划，不发动作或 HOLD，不闭合夹爪。实际执行仍走已授权的
+`motion.execute_grasp_approach_plan@1`，复用同一个单次消费计划库；未完成、失败、
+取消或过期的生产 operation 不得使计划成为可执行结果。来源观测、选中抓姿、双臂
+起始状态、场景版本及原计划 TTL 保持绑定。
+
+整请求使用调用方的原绝对 deadline 和 monotonic clock。读取窗口/锁等待后、主及
+辅助 SAM2 前后、GraspGenX 前后检查同一预算和取消状态，取消优先；模型原异常仍经
+原 finally 记录耗时并传播。已经运行的模型调用保持协作式停止边界，预算耗尽后不
+启动下一受保护阶段。诊断和失败回放仅供排查，不能替代成功结果或执行授权。
+
+本批验证范围为本地合同、假模型端口、CPU 原生几何及非硬件组合验收。MuJoCo 的
+快速规划生命周期另批接入；本节不声明真机、模型服务、真实接触或抓取成功验收。
+
 ## 算法与第三方源码
 
 - [SAM2](https://github.com/facebookresearch/sam2.git) 使用正点击点分割点击所在物体/部位；

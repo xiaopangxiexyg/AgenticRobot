@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from robot_motion.grasp_visible_scene import VisibleGraspScene
+
 import json
 import math
 import time
@@ -68,6 +70,9 @@ def arm_base_origin_in_candidate_frame(
         np.linalg.inv(world_from_candidate) @ world_from_arm_base
     )
     return tuple(float(value) for value in candidate_from_arm_base[:3, 3])
+
+
+_ARM_SHORTLIST_VISIBLE_CHAIN_BUDGET_SEC = 0.3
 
 
 class RM65PointGraspReachabilityAdapter:
@@ -193,6 +198,26 @@ class RM65PointGraspReachabilityAdapter:
             raise RuntimeError("Reachability frame resolution identity changed.")
         return solver_pose
 
+    def approach_preference(self, reference_pose, target_point_reference_m):
+        """Shared arm-side and radial-camera prior, not IK/path admission."""
+        desired = np.asarray(target_point_reference_m, dtype=np.float64)[:2] - np.asarray(
+            self.arm_base_origin_candidate_m[:2], dtype=np.float64)
+        length = float(np.linalg.norm(desired))
+        if length < 1e-6:
+            raise RuntimeError("Arm base and grasp target have no horizontal separation.")
+        desired = desired / length
+        approach = reference_pose[:3, 2]
+        horizontal = approach[:2]
+        horizontal_length = float(np.linalg.norm(horizontal))
+        angle = (25.0 if -float(approach[2]) >= .7
+            else 180.0 if horizontal_length < 1e-6
+            else math.degrees(math.acos(float(np.clip(
+                np.dot(horizontal / horizontal_length, desired), -1., 1.)))))
+        camera_axis = getattr(self.profile, "wrist_camera_side_axis_tool", None)
+        camera_side_up = None if camera_axis is None else float(reference_pose[2, :3] @ camera_axis)
+        upright = camera_side_up is None or abs(float(approach[2])) >= .7 or camera_side_up > 1e-6
+        return angle, angle <= 85., camera_side_up, upright
+
     def select_candidates(
         self,
         candidates: tuple[Any, ...],
@@ -202,6 +227,7 @@ class RM65PointGraspReachabilityAdapter:
         measured_qpos_cut: Any | None = None,
         measurement_reference_time: float | None = None,
         endpoint_seeds: dict[tuple[float, ...], tuple[float, ...]] | None = None,
+        visible_scene: VisibleGraspScene | None = None,
     ) -> GraspGenXCandidateSelection:
         """Admit candidates whose production local grasp chain is feasible."""
 
@@ -223,6 +249,16 @@ class RM65PointGraspReachabilityAdapter:
             measured_qpos_cut=measured_qpos_cut,
             measurement_reference_time=measurement_reference_time,
         )
+        if visible_scene is not None:
+            if not isinstance(visible_scene, VisibleGraspScene):
+                raise TypeError("visible_scene must be a candidate-reference VisibleGraspScene.")
+            solver_from_reference = self._solver_pose(np.eye(4))
+            visible_scene = VisibleGraspScene(
+                points=visible_scene.points @ solver_from_reference[:3, :3].T + solver_from_reference[:3, 3],
+                target_mask=visible_scene.target_mask, geometry=visible_scene.geometry,
+                capture_qpos_by_side=visible_scene.capture_qpos_by_side,
+                capture_self_observation_evidence=visible_scene.capture_self_observation_evidence,
+                depth_preprocessing_evidence=visible_scene.depth_preprocessing_evidence)
         static_check = getattr(self.planner, "require_static_grasp_scene", None)
         if callable(static_check):
             try:
@@ -239,14 +275,6 @@ class RM65PointGraspReachabilityAdapter:
                         "reason_code": error.reason_code, **error.details,
                     }),
                 })
-        desired_horizontal = target[:2] - np.asarray(
-            self.arm_base_origin_candidate_m[:2], dtype=np.float64
-        )
-        desired_norm = float(np.linalg.norm(desired_horizontal))
-        if desired_norm < 1e-6:
-            raise RuntimeError("Arm base and grasp target have no horizontal separation.")
-        desired_horizontal /= desired_norm
-
         candidate_evidence: list[dict[str, Any]] = []
         camera_axis = getattr(self.profile, "wrist_camera_side_axis_tool", None)
         for index, candidate in enumerate(candidates):
@@ -255,40 +283,10 @@ class RM65PointGraspReachabilityAdapter:
             )
             solver_pose = self._solver_pose(reference_pose)
             approach = reference_pose[:3, 2]
-            top_approach = -float(approach[2]) >= 0.7
-            horizontal = approach[:2]
-            horizontal_norm = float(np.linalg.norm(horizontal))
-            if top_approach:
-                side_angle_deg = 25.0
-                side_admissible = True
-            elif horizontal_norm < 1e-6:
-                side_angle_deg = 180.0
-                side_admissible = False
-            else:
-                # This slice aliases the pose's approach column.  Normalizing
-                # it in place corrupts both the rotation and 3-D diversity dots.
-                horizontal = horizontal / horizontal_norm
-                side_angle_deg = math.degrees(
-                    math.acos(
-                        float(
-                            np.clip(
-                                np.dot(horizontal, desired_horizontal), -1.0, 1.0
-                            )
-                        )
-                    )
-                )
-                side_admissible = side_angle_deg <= 85.0
+            side_angle_deg, side_admissible, camera_side_up, camera_upright = (
+                self.approach_preference(reference_pose, target))
             score = float(candidate.score)
             heuristic_score = score * math.exp(-side_angle_deg / 90.0)
-            camera_side_up = (
-                None if camera_axis is None else float(reference_pose[2, :3] @ camera_axis)
-            )
-            # Only side/inclined approaches have an unambiguous upper radial
-            # side. Do not apply a wrist-roll preference to a vertical grasp.
-            camera_upright = (
-                camera_side_up is None or abs(float(approach[2])) >= 0.7
-                or camera_side_up > 1e-6
-            )
             candidate_evidence.append(
                 {
                     "index": index,
@@ -314,7 +312,30 @@ class RM65PointGraspReachabilityAdapter:
 
         side_eligible = [item for item in candidate_evidence if item["side_admissible"]]
         inverted = [item for item in side_eligible if not item["camera_upright"]]
-        eligible = [item for item in side_eligible if item["camera_upright"]]
+        geometric_query = getattr(self.planner, "check_grasp_geometric_reach", None)
+        geometric_started = float(self.monotonic())
+        geometric_checked_count = 0
+        geometric_rejected_count = 0
+        geometric_examples: list[dict[str, Any]] = []
+        eligible = []
+        for item in side_eligible:
+            if not item["camera_upright"]:
+                continue
+            reach = geometric_query(
+                qpos_by_side=qpos_cut.qpos_by_side, side=self.profile.arm_side,
+                target_tool_tcp_world=item["solver_pose"],
+            ) if callable(geometric_query) else None
+            if reach is not None:
+                geometric_checked_count += 1
+                if reach.outside:
+                    geometric_rejected_count += 1
+                    if len(geometric_examples) < _ARM_SHORTLIST_PROBE_MAX_COUNT:
+                        geometric_examples.append({"index": int(item["index"]), **reach.to_dict()})
+                    continue
+            # Inside the outer bound (or unavailable native geometry) is NOT
+            # an admission. Every retained pose still needs the full local chain.
+            eligible.append(item)
+        geometric_elapsed_ms = max(0.0, (float(self.monotonic()) - geometric_started) * 1_000.0)
         symmetry_pairs = {}
         for item in eligible:
             parent = item["symmetry_parent_index"]
@@ -480,17 +501,68 @@ class RM65PointGraspReachabilityAdapter:
         rescue_assessment_count = 0
         feasible: list[dict[str, Any]] = []
         shortlist_attempts: list[dict[str, Any]] = []
-        rejection_counts: dict[str, int] = {}
-        feasible_limit = int(maximum) * (2 if half_turn_priority else 1)
+        rejection_counts: dict[str, int] = (
+            {"endpoint_geometric_reach_exceeded": geometric_rejected_count}
+            if geometric_rejected_count else {}
+        )
+        # Observed local validity is not global travel quality. Overfetch the
+        # same bounded two-page reserve used for finger exchange, so a full
+        # first display page does not hide a cheaper approach immediately next.
+        feasible_limit = int(maximum) * (
+            2 if half_turn_priority or visible_scene is not None else 1
+        )
         assessed_indices = set()
+        visible_checked = 0
+        visible_feasible = 0
+        visible_elapsed_ms = 0.0
+        visible_comparison_started = False
+
+        def compare_visible_proposals():
+            nonlocal visible_checked, visible_feasible, visible_elapsed_ms
+            for proposal in feasible:
+                if "visible_chain" in proposal:
+                    continue
+                remaining = shortlist_deadline - float(self.monotonic())
+                if remaining <= 0:
+                    break
+                assessment = self.planner.assess_local_grasp_chain(
+                    qpos_by_side=qpos_cut.qpos_by_side,
+                    side=self.profile.arm_side,
+                    target_tool_tcp_world=proposal["solver_pose"],
+                    visible_scene=visible_scene,
+                    time_budget_sec=min(_ARM_SHORTLIST_VISIBLE_CHAIN_BUDGET_SEC, remaining),
+                    monotonic=self.monotonic,
+                )
+                visible_checked += 1
+                visible_feasible += int(assessment.feasible)
+                visible_elapsed_ms += float(assessment.elapsed_ms)
+                proposal["visible_chain"] = assessment
+                if assessment.feasible:
+                    proposal["local_chain"] = assessment
+                proposal["attempt"]["visible_scene_assessment"] = {
+                    "feasible": assessment.feasible,
+                    "reason_code": assessment.reason_code,
+                    "elapsed_ms": assessment.elapsed_ms,
+                    "scope": "advisory_ordering_not_full_path_or_execution_authority",
+                }
+
         for evaluation_index, item in enumerate(evaluation):
             remaining_sec = shortlist_deadline - float(self.monotonic())
+            if (visible_scene is not None and feasible and not visible_comparison_started
+                and remaining_sec < _ARM_SHORTLIST_CANDIDATE_BUDGET_SEC):
+                # A sparse static shortlist may never fill both pages. Check
+                # it before its deadline, otherwise a zero-observed-solution
+                # rescue can never be reached, regardless of later proposals.
+                visible_comparison_started = True
+                compare_visible_proposals()
+                remaining_sec = shortlist_deadline - float(self.monotonic())
             if (
                 remaining_sec < _ARM_SHORTLIST_CANDIDATE_BUDGET_SEC
-                and not feasible
+                and (not feasible or (visible_comparison_started and not visible_feasible))
                 and not rescue_activated
             ):
-                # Only a zero-solution shortlist spends a second bounded window.
+                # Only a zero-solution (static or observed) shortlist spends
+                # the existing second bounded window.
                 # Do not start a nearly-zero-budget IK and mistake its timeout
                 # for evidence that this candidate is physically unreachable.
                 shortlist_deadline += _ARM_SHORTLIST_RESCUE_BUDGET_SEC
@@ -524,6 +596,7 @@ class RM65PointGraspReachabilityAdapter:
                 {
                     "index": int(item["index"]),
                     "score": float(item["score"]),
+                        "target_tool_tcp_world": np.asarray(item["solver_pose"], dtype=float).reshape(-1).tolist(),
                     "side_angle_deg": float(item["side_angle_deg"]),
                     "elapsed_ms": float(local_chain.elapsed_ms),
                     "reason_code": reason,
@@ -534,6 +607,7 @@ class RM65PointGraspReachabilityAdapter:
                     "endpoint_probe": item.get("endpoint_probe"),
                     "rigid_endpoint_check": item.get("rigid_endpoint_check"),
                     "joint_travel_rad": local_chain.joint_travel_rad,
+                    "estimated_execution_time_sec": getattr(local_chain, "estimated_execution_time_sec", None),
                 }
             )
             if not local_chain.feasible:
@@ -543,36 +617,53 @@ class RM65PointGraspReachabilityAdapter:
                     == "path_planning_time_budget_exhausted"
                 )
                 continue
-            feasible.append(
-                {
-                    **item,
-                    "local_chain": local_chain,
-                    "pregrasp_distance_m": (
-                        local_chain.selected_pregrasp_distance_m
-                    ),
-                }
-            )
+            item = {
+                **item,
+                "local_chain": local_chain,
+                "pregrasp_distance_m": local_chain.selected_pregrasp_distance_m,
+            }
+            item["attempt"] = shortlist_attempts[-1]
+            feasible.append(item)
             paired_index = symmetry_pairs.get(int(item["index"]))
             if paired_index is not None and paired_index not in assessed_indices:
                 for next_index in range(evaluation_index + 1, len(evaluation)):
                     if int(evaluation[next_index]["index"]) == paired_index:
                         evaluation.insert(evaluation_index + 1, evaluation.pop(next_index))
                         break
+            # First retain the original static shortlist. Interleaving these
+            # optional comparisons earlier would consume its solve budget and
+            # silently hide previously available fallback poses.
+            if visible_scene is not None and (
+                visible_comparison_started or len(feasible) >= feasible_limit
+            ):
+                visible_comparison_started = True
+                compare_visible_proposals()
             # A lower-scored finger-exchange proposal must be compared, not
             # hidden by the first full display page. Same total time budget.
-            if len(feasible) >= feasible_limit:
+            if len(feasible) >= feasible_limit and (
+                visible_scene is None or visible_feasible >= min(2, int(maximum))
+            ):
                 break
 
-        feasible.sort(
-            key=lambda item: (
-                float(np.max(item["local_chain"].joint_travel_rad[:3])),
-                float(np.linalg.norm(item["local_chain"].joint_travel_rad)),
+        if visible_scene is not None:
+            compare_visible_proposals()
+
+        def motion_preference(item):
+            chain = item["local_chain"]
+            estimated = getattr(chain, "estimated_execution_time_sec", None)
+            proximal = float(np.max(chain.joint_travel_rad[:3]))
+            return (
+                0 if getattr(item.get("visible_chain"), "feasible", False) else 1,
+                estimated if estimated is not None else proximal,
+                proximal,
+                float(np.linalg.norm(chain.joint_travel_rad)),
                 float(item["side_angle_deg"]),
                 -float(item["pregrasp_distance_m"]),
                 -float(item["score"]),
                 int(item["index"]),
             )
-        )
+
+        feasible.sort(key=motion_preference)
         selected: list[dict[str, Any]] = []
         deferred = []
         represented = set()
@@ -618,12 +709,23 @@ class RM65PointGraspReachabilityAdapter:
                      "reason": "side_grasp_wrist_camera_not_above"}
                     for item in inverted[:_ARM_SHORTLIST_PROBE_MAX_COUNT]
                 ], separators=(",", ":")),
+                "arm_shortlist_geometric_checked_count": geometric_checked_count,
+                "arm_shortlist_geometric_rejected_count": geometric_rejected_count,
+                "arm_shortlist_geometric_retained_count": len(eligible),
+                "arm_shortlist_geometric_elapsed_ms": geometric_elapsed_ms,
+                "arm_shortlist_geometric_rejection_examples_json": json.dumps(
+                    geometric_examples, separators=(",", ":"),
+                ),
                 "arm_shortlist_evaluated_count": local_chain_assessment_count,
                 "arm_shortlist_local_chain_assessment_count": (
                     local_chain_assessment_count
                 ),
                 "arm_shortlist_local_chain_feasible_count": len(feasible),
-                "arm_shortlist_motion_cost_policy": "proximal_max_then_joint_travel_v1",
+                "arm_shortlist_motion_cost_policy": "whole_arm_estimated_time_then_proximal_travel_v2",
+                "arm_shortlist_visible_scene_check_count": visible_checked,
+                "arm_shortlist_visible_scene_feasible_count": visible_feasible,
+                "arm_shortlist_visible_scene_elapsed_ms": visible_elapsed_ms,
+                "arm_shortlist_visible_scene_scope": "advisory_ordering_with_static_feasible_reserve",
                 "arm_shortlist_local_chain_elapsed_ms": (
                     local_chain_elapsed_ms
                 ),
@@ -657,8 +759,8 @@ class RM65PointGraspReachabilityAdapter:
                 ),
                 "arm_shortlist_selected_count": len(selected),
                 "arm_shortlist_policy": (
-                    "arm_side_family_then_rigid_endpoint_advisory_then_"
-                    "advisory_endpoint_probe_then_production_local_grasp_chain_motion_cost_v5"
+                    "arm_side_then_native_reach_then_family_advisory_endpoint_probe_"
+                    "rigid_endpoint_advisory_production_local_grasp_chain_motion_cost_v6"
                 ),
             },
         )

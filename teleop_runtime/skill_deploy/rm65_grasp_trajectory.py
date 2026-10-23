@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from robot_motion.rm65.dual_arm_target_solver import DualArmToolTCPReachCheck
+
 import math
 import threading
 import time
@@ -131,6 +133,19 @@ _RM65_GLOBAL_GRASP_TARGET_FALLBACK_REASONS = frozenset(
 def _joint_proposals_match(first: np.ndarray, second: np.ndarray, *, atol: float) -> bool:
     """Compare normalized finite joint proposals at zero relative tolerance."""
     return bool(np.all(np.abs(first - second) <= atol))
+
+
+RM65_GRASP_CANDIDATE_REJECTION_REASONS = _RM65_GLOBAL_GRASP_TARGET_FALLBACK_REASONS | {
+    "grasp_path_motion_quality_exceeded",
+    "visible_gripper_terminal_collision",
+    "visible_gripper_approach_collision",
+    "visible_gripper_path_collision",
+    "approach_progress_out_of_bounds",
+    "approach_progress_reversed",
+    "approach_lateral_deviation",
+    "approach_orientation_deviation",
+    "path_planning_time_budget_exhausted",
+}
 
 
 class RM65GraspTrajectoryPlanningError(RuntimeError):
@@ -867,6 +882,38 @@ class RM65GraspJointTrajectoryPlanner:
                 require_grasp_approach=kwargs.get("require_grasp_approach", True),
             )
             return request._plan(_planning_started_at=started, **kwargs)
+
+    def tool_tcp_poses_for_qpos_pair(self, *, qpos_by_side):
+        """Return explicit-pair FK without exposing mutable native scratch."""
+        with self._observed_planning_lock, self._solver_lock:
+            return self.target_builder.tool_tcp_world_targets_for_qpos_pair(
+            left_qpos=qpos_by_side["left"], right_qpos=qpos_by_side["right"])
+
+    def _check_grasp_geometric_reach(
+        self, *, qpos_by_side: Mapping[str, np.ndarray], side: str,
+        target_tool_tcp_world: np.ndarray, orientation_tolerance_deg: float | None = None,
+    ) -> DualArmToolTCPReachCheck | None:
+        query = getattr(self.target_builder, "tool_tcp_geometric_reach_check", None)
+        if not callable(query):
+            return None
+        return query(
+            qpos_by_side=qpos_by_side, side=side,
+            target_tool_tcp_world=target_tool_tcp_world,
+            position_tolerance_m=self.config.endpoint_position_tolerance_m,
+            orientation_tolerance_deg=(self.config.endpoint_orientation_tolerance_deg
+                if orientation_tolerance_deg is None else orientation_tolerance_deg),
+        )
+
+    def check_grasp_geometric_reach(
+        self, *, qpos_by_side: Mapping[str, np.ndarray], side: str,
+        target_tool_tcp_world: np.ndarray,
+    ) -> DualArmToolTCPReachCheck | None:
+        """Cheap necessary terminal test, sharing the lower native geometry owner."""
+        with self._observed_planning_lock, self._solver_lock:
+            return self._check_grasp_geometric_reach(
+                qpos_by_side=qpos_by_side, side=side,
+                target_tool_tcp_world=target_tool_tcp_world,
+            )
 
     def require_static_grasp_scene(
         self, *, qpos_by_side: Mapping[str, np.ndarray], side: str,

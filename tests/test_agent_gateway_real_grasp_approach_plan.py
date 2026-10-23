@@ -114,7 +114,8 @@ def _no_op_point_grasp_validator(
 
 def _planning_fixture(
     *, planner, execution_operation_timeout_sec=DEFAULT_REAL_GRASP_EXECUTION_OPERATION_TIMEOUT_SEC,
-    finger_exchange=False,
+    finger_exchange=False, frozen_observation=False,
+    plan_store_clock=None, planning_operation_lookup=None,
 ):
     from robot_motion.grasp_visible_scene import VisibleGraspScene, ParallelJawSolidGeometry
     # Explicit geometry fixture: route tests exercise control/plan lifecycles,
@@ -167,6 +168,7 @@ def _planning_fixture(
         execution_manifest_hash="execution-manifest:grasp-plan-test",
         current_mode="real_active",
         finger_exchange=finger_exchange,
+        frozen_observation=frozen_observation,
         arm_reachability_profile=(StationPointGraspArmReachabilityProfile(arm_side="right",
             evaluator_profile_id="fixture:reachability", evaluator_profile_hash="fixture:reachability-hash",
             solver_reference_frame_id=execution_frame.frame_id,
@@ -261,7 +263,8 @@ def _planning_fixture(
         available_at=10.0,
         source_evidence_refs=("measured-qpos:grasp-plan-test",),
     )
-    store = BoundedRealGraspApproachPlanStore(max_retained_plans=4)
+    store = BoundedRealGraspApproachPlanStore(max_retained_plans=4,
+        clock=plan_store_clock, planning_operation_lookup=planning_operation_lookup)
     provider = RealGraspApproachPlanProvider(
         registration=registration,
         point_grasp_registration=point_grasp,
@@ -948,6 +951,13 @@ def test_grasp_start_diagnostic_contract_migration_requires_fresh_result_and_rou
     schema = registration.skill.schema_entry
     current = thaw_json(schema.execution_result_schema)
     old = deepcopy(current)
+    added_failure_fields = {
+        "planning_phase", "target_collision_points", "background_collision_points",
+        "terminal_target_contact_points", "terminal_contact_allowed",
+        "path_gripper_proxy_padding_m", "terminal_position_error_m", "terminal_orientation_error_deg",
+    }
+    for field in added_failure_fields:
+        del old["properties"]["diagnostics"]["properties"][field]
     for field in ("start_qpos_source", "start_check_json"):
         del old["properties"]["diagnostics"]["properties"][field]
     old_hash = agent_skill_schema_document_hash(old, schema_kind="execution_result")
@@ -966,7 +976,11 @@ def test_grasp_start_diagnostic_contract_migration_requires_fresh_result_and_rou
     # schema engine dependency. Its closed property set forbids the new keys.
     old_diagnostics = old["properties"]["diagnostics"]
     assert old_diagnostics["additionalProperties"] is False
-    assert set(result["diagnostics"]) - set(old_diagnostics["properties"]) == {
+    original_start_diagnostics = {
+        key: value for key, value in result["diagnostics"].items()
+        if key not in added_failure_fields
+    }
+    assert set(original_start_diagnostics) - set(old_diagnostics["properties"]) == {
         "start_qpos_source", "start_check_json"}
     legacy_result = {**result, "diagnostics": {"path_status": "start_blocked"}}
     assert not set(legacy_result["diagnostics"]) - set(old_diagnostics["properties"])
@@ -975,3 +989,74 @@ def test_grasp_start_diagnostic_contract_migration_requires_fresh_result_and_rou
     execute = registration.execute_skill.routes[0]
     assert execute.execution_result_schema_hash == "528c66fcead63efdf3ec16d4eda7545cef32104e68ec6720d712d11f6f2440b1"
     assert execute.skill_io_contract_hash == "9f5af1fa1e28933cd5dbcd47e92035ef95566098550c7e3a949c23669bb215f7"
+
+
+
+
+def test_approach_rejection_retains_unpublished_details_in_logs(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    def planner(**_kwargs):
+        raise RM65GraspTrajectoryPlanningError(
+            "approach_lateral_deviation",
+            details={
+                "segment_index": 2,
+                "edge_sample_index": 4,
+                "lateral_error_m": 0.0034,
+                "maximum_lateral_error_m": 0.002,
+            },
+        )
+
+    registration, provider, _store, port, request, operation = _planning_fixture(
+        planner=planner
+    )
+
+    result, plan = provider.plan_request(request, operation)
+
+    assert plan is None
+    assert result["reason_code"] == "approach_lateral_deviation"
+    assert result["diagnostics"] == {"segment_index": 2, "edge_sample_index": 4}
+    assert "lateral_error_m" in caplog.text
+    assert "0.0034" in caplog.text
+    registration.payload_validator.validate_execution_result(result)
+    assert port.snapshot().phase == RealAgentMotionPhase.INACTIVE
+    assert port.snapshot().dispatch_count == 0
+
+
+def test_missing_collision_pose_metrics_do_not_invalidate_the_rejection():
+    error = RM65GraspTrajectoryPlanningError("visible_gripper_path_collision", details={
+        "planning_phase": "visible_scene_dense_revalidation", "target_collision_points": 1,
+        "background_collision_points": 0, "terminal_position_error_m": None,
+        "terminal_orientation_error_deg": None,
+    })
+    assert RealGraspApproachPlanProvider._diagnostics(error) == {
+        "planning_phase": "visible_scene_dense_revalidation", "target_collision_points": 1,
+        "background_collision_points": 0,
+    }
+
+
+@pytest.mark.parametrize("field,invalid", [
+    (None, None), ("target_collision_points", True), ("background_collision_points", -1),
+    ("terminal_contact_allowed", 1), ("path_gripper_proxy_padding_m", float("nan")),
+    ("terminal_position_error_m", -1), ("terminal_orientation_error_deg", 181),
+    ("planning_phase", ""),
+])
+def test_visible_collision_rejection_publishes_bounded_evidence_without_motion(field, invalid):
+    details = {
+        "planning_phase": "visible_scene_dense_revalidation", "target_collision_points": 1,
+        "background_collision_points": 0, "terminal_target_contact_points": 0,
+        "terminal_contact_allowed": False, "path_gripper_proxy_padding_m": .003,
+        "terminal_position_error_m": .0184, "terminal_orientation_error_deg": .001,
+    }
+    def planner(**_kwargs):
+        raise RM65GraspTrajectoryPlanningError("visible_gripper_path_collision", details=details)
+    registration, provider, _, port, request, operation = _planning_fixture(planner=planner)
+    result, plan = provider.plan_request(request, operation)
+    assert plan is None and not result["motion_or_hold_performed"]
+    assert result["diagnostics"] == details
+    assert port.snapshot().dispatch_count == 0
+    registration.payload_validator.validate_execution_result(result)
+    if field is not None:
+        result["diagnostics"][field] = invalid
+        with pytest.raises((TypeError, ValueError)):
+            registration.payload_validator.validate_execution_result(result)

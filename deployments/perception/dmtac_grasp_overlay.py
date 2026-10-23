@@ -418,6 +418,7 @@ def project_dmtac_grasp(
     intrinsics: Mapping[str, Any],
     near_clip_m: float = 0.005,
     solid_geometry: ParallelJawSolidGeometry | None = None,
+    opening_m: float | None = None,
 ) -> DmtacGraspProjection:
     """Project one DMTAC M wireframe and classify its image visibility."""
 
@@ -429,8 +430,13 @@ def project_dmtac_grasp(
         reference_from_tcp=candidate.reference_from_tcp,
         reference_from_camera=reference_from_camera,
     )
+    if opening_m is not None:
+        maximum = (solid_geometry or reviewed_4b2_cad_solid_geometry()).maximum_opening_m
+        if (isinstance(opening_m, bool) or not math.isfinite(opening_m)
+                or not 0 < opening_m <= maximum):
+            raise ValueError("opening_m must be finite and within the bound geometry.")
     local_segments = _wireframe_segments(
-        candidate.gripper_width_m,
+        candidate.gripper_width_m if opening_m is None else opening_m,
         geometry=solid_geometry,
     )
     projected: list[ProjectedGraspSegment] = []
@@ -524,6 +530,7 @@ def render_dmtac_grasp_overlays(
     target_pixel_uv: tuple[int, int] | None = None,
     target_bbox_xyxy: tuple[int, int, int, int] | None = None,
     solid_geometry: ParallelJawSolidGeometry | None = None,
+    opening_m: float | None = None,
 ) -> tuple[Image.Image, tuple[DmtacGraspProjection, ...]]:
     """Overlay ranked candidates and return machine-readable projection records."""
 
@@ -546,6 +553,7 @@ def render_dmtac_grasp_overlays(
             reference_from_camera=camera_pose,
             intrinsics=intrinsics,
             solid_geometry=solid_geometry,
+            opening_m=opening_m,
         )
         for candidate in candidates
     )
@@ -595,7 +603,7 @@ def render_dmtac_grasp_overlays(
 
     # Always list every candidate, including ones that could not be drawn.
     row_height = 14
-    legend_height = max(row_height, row_height * len(projections))
+    legend_height = max(row_height, row_height * (len(projections) + (opening_m is not None)))
     legend_top = max(0, height - legend_height - 1)
     draw.rectangle((0, legend_top, min(width - 1, 300), height - 1), fill=(0, 0, 0))
     for row, projection in enumerate(projections):
@@ -610,6 +618,10 @@ def render_dmtac_grasp_overlays(
             ),
             fill=color,
         )
+    if opening_m is not None:
+        draw.text((4, legend_top + row_height * len(projections) + 2),
+                  f"Planner opening {opening_m*1000:.1f} mm (not proposal width)",
+                  fill=(255, 255, 255))
     return output, projections
 
 

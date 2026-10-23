@@ -99,6 +99,7 @@ from .grasp_approach_plan import (
 )
 from .back_projection import RealSenseBackProjectionCapturePort
 from .placement import RealPlacementRobotStatePort
+from .grasp_fast_plan import RealFastGraspPlanProvider, build_real_fast_grasp_plan_executor
 from .grasp_observation import (
     build_grasp_observation_executor,
     read_retained_grasp_observation,
@@ -713,6 +714,7 @@ class RealAgentPrimitiveGatewaySession:
     gripper_port: RealDmtacGripperControlPort | None = None
     rgbd_geometry_executors: tuple[PassiveReadSkillExecutor, ...] = ()
     gripper_ports: Mapping[str, RealDmtacGripperControlPort] = field(default_factory=dict)
+    grasp_fast_plan_executor: PassiveReadSkillExecutor | None = None
     _close_lock: threading.Lock = field(default_factory=threading.Lock, init=False)
     _close_outcome: AgentGatewayOperationOutcome | None = field(
         default=None,
@@ -800,6 +802,11 @@ class RealAgentPrimitiveGatewaySession:
         grasp_plan_enabled = (
             self.contract_bundle.grasp_approach_plan_registration is not None
         )
+        fast_enabled = self.contract_bundle.grasp_fast_plan_registration is not None
+        if fast_enabled != (self.grasp_fast_plan_executor is not None):
+            raise ValueError("Fast grasp registration and executor must coexist.")
+        if fast_enabled and not grasp_plan_enabled:
+            raise ValueError("Fast grasp planning requires the existing paired plan store.")
         point_registration = self.contract_bundle.station_point_grasp_registration
         if (self.contract_bundle.object_transport_registration is not None) != (self.object_transport_executor is not None):
             raise ValueError("Object transport registration and executor disagree.")
@@ -845,6 +852,7 @@ class RealAgentPrimitiveGatewaySession:
                 self.station_point_grasp_render_executor
             ),
             "perception.plan_grasp_approach": self.grasp_approach_plan_executor,
+            "perception.plan_grasp_fast": self.grasp_fast_plan_executor,
         }
         geometry = {
             (item.skill.definition.skill_id, item.skill.definition.skill_version): executor
@@ -963,6 +971,7 @@ class RealAgentPrimitiveGatewaySession:
                     (self.station_point_grasp_executor, 5.0),
                     (self.station_point_grasp_render_executor, 5.0),
                     (self.grasp_approach_plan_executor, 5.0),
+                    (self.grasp_fast_plan_executor, 5.0),
                     (self.grasp_observation_executor, 5.0),
                     (self.object_transport_executor, 5.0),
                     (self.spatial_goal_executor, 5.0),
@@ -1506,6 +1515,8 @@ def assemble_real_agent_primitive_gateway_session(
     grasp_approach_plan_store = (
         BoundedRealGraspApproachPlanStore(
             max_retained_plans=max_retained_operations,
+            planning_operation_lookup=lambda identifier: service.operation_store.get(identifier),
+            clock=clock,
         )
         if grasp_approach_plan_enabled
         else None
@@ -1639,6 +1650,7 @@ def assemble_real_agent_primitive_gateway_session(
     station_point_grasp_render_executor = None
     grasp_approach_plan_provider = None
     grasp_approach_plan_executor = None
+    grasp_fast_plan_executor = None
     grasp_observation_executor = None
     object_transport_executor = None
     rgbd_geometry_executors = ()
@@ -1887,6 +1899,22 @@ def assemble_real_agent_primitive_gateway_session(
                     max_retained_operations=max_retained_operations,
                     clock=clock,
                 )
+                fast_registration = contract_bundle.grasp_fast_plan_registration
+                if fast_registration is not None:
+                    if grasp_observation_executor is None:
+                        raise ValueError("Fast grasp planning requires the retained observation executor.")
+                    fast_provider = RealFastGraspPlanProvider(
+                        registration=fast_registration, point_provider=station_point_grasp_provider,
+                        paired_provider=grasp_approach_plan_provider,
+                        observation_executor=grasp_observation_executor)
+                    grasp_fast_plan_executor = build_real_fast_grasp_plan_executor(
+                        registration=fast_registration, provider=fast_provider,
+                        runtime_session_id=contract_bundle.attachment.runtime_session_id,
+                        current_station_revision=lambda: producer.current_station_revision,
+                        max_retained_operations=max_retained_operations, clock=clock,
+                        artifact_store=artifact_store)
+                    execution_port_by_route_hash[
+                        fast_registration.skill.routes[0].semantic_content_hash] = grasp_fast_plan_executor
             execution_port_by_route_hash.update(
                 {
                     localization_registration.skill.routes[
@@ -2062,6 +2090,7 @@ def assemble_real_agent_primitive_gateway_session(
         grasp_approach_plan_store=grasp_approach_plan_store,
         grasp_approach_plan_provider=grasp_approach_plan_provider,
         grasp_approach_plan_executor=grasp_approach_plan_executor,
+        grasp_fast_plan_executor=grasp_fast_plan_executor,
         artifact_store=artifact_store,
         owns_artifact_store=owns_artifact_store,
         hardware_view_provider=hardware_view_provider,

@@ -975,10 +975,10 @@ def test_preplanned_grasp_execution_consumes_exact_path_without_replanning(
             profile_hash=registration.profile.semantic_content_hash,
             planning_operation_id="grasp-plan-operation:execution-test",
             planning_request_hash="1" * 64,
-            point_grasp_operation_id="point-grasp-operation:execution-test",
-            point_grasp_request_hash="2" * 64,
-            point_grasp_result_hash="3" * 64,
-            point_grasp_candidate_hash="4" * 64,
+            source_operation_id="point-grasp-operation:execution-test",
+            source_request_hash="2" * 64,
+            source_result_hash="3" * 64,
+            source_grasp_hash="4" * 64,
             source_station_revision=0,
             component_id=registration.profile.component_id,
             side=registration.profile.side,
@@ -1116,11 +1116,12 @@ def test_preplanned_grasp_execution_consumes_exact_path_without_replanning(
         session.artifact_store.close()
 
 
-@pytest.mark.parametrize("backend", ("vgn", "graspgenx"))
+@pytest.mark.parametrize("backend,frozen", (("vgn", False), ("graspgenx", False), ("graspgenx", True)))
 def test_composition_opt_in_binds_point_grasp_v3_to_lower_ik_without_starting(
     monkeypatch,
     tmp_path,
     backend,
+    frozen,
 ) -> None:
     lower, guard = _lower(monkeypatch)
     localizer = _Localizer()
@@ -1147,13 +1148,24 @@ def test_composition_opt_in_binds_point_grasp_v3_to_lower_ik_without_starting(
         object_localizer=localizer,
         point_grasp_planner=planner,
         enable_point_grasp_arm_reachability=True,
+        enable_grasp_observation=frozen,
         clock=lambda: 10.0,
     )
     session = composition.deployment.gateway_session
     try:
         registration = composition.station_point_grasp_registration
         assert registration is not None
-        assert registration.skill.definition.skill_version == "3"
+        assert registration.skill.definition.skill_version == ("4" if frozen else "3")
+        fast = session.contract_bundle.grasp_fast_plan_registration
+        assert (fast is not None) is frozen
+        assert (session.grasp_fast_plan_executor is not None) is frozen
+        if frozen:
+            assert fast.skill.definition.skill_id == "perception.plan_grasp_fast"
+            assert fast.skill.routes[0].control_effect_class == "read_only"
+            assert fast.skill.routes[0].may_move_robot is False
+            assert session.passive_read_executors_by_skill_ref[("perception.plan_grasp_fast", "1")] is session.grasp_fast_plan_executor
+            assert session.grasp_approach_plan_store is session.grasp_approach_plan_provider.plan_store
+            assert session.grasp_fast_plan_executor.wait_all(timeout_sec=1.)
         reachability = registration.profile.arm_reachability_profile
         assert reachability is not None
         assert reachability.arm_side == "right"

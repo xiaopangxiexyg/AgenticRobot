@@ -91,6 +91,7 @@ from .grasp_approach_plan import (
     RealGraspApproachPlanRegistration,
     build_real_grasp_approach_plan_registration,
 )
+from .grasp_fast_plan import RealFastGraspPlanRegistration, build_real_fast_grasp_plan_registration
 from .localization_deployment import RealObjectLocalizationRegistration
 from .object_transport import ObjectTransportRegistration
 from .observation_gateway import (
@@ -630,6 +631,7 @@ class RealAgentPrimitiveContractBundle:
     spatial_goal_registration: SpatialGoalRegistration | None = None
     tcp_pose_comparison_registration: TcpPoseComparisonRegistration | None = None
     rgbd_geometry_registrations: tuple[RgbdGeometryRegistration, ...] = ()
+    grasp_fast_plan_registration: RealFastGraspPlanRegistration | None = None
 
     def __post_init__(self) -> None:
         validate_skill_route_catalog_closure(
@@ -679,6 +681,20 @@ class RealAgentPrimitiveContractBundle:
         ):
             raise ValueError("Absolute-pose Routes require their bound target profile.")
         grasp_approach_plan_enabled = self.grasp_approach_plan_registration is not None
+        fast = self.grasp_fast_plan_registration
+        fast_entry = next((entry for entry in self.route_manifest.skill_routes
+            if entry.route.skill_id == "perception.plan_grasp_fast"), None)
+        if (fast is not None) != (fast_entry is not None):
+            raise ValueError("Fast grasp registration and manifest must coexist.")
+        if fast is not None:
+            point = self.station_point_grasp_registration
+            if (not grasp_approach_plan_enabled or point is None or not point.profile.frozen_observation
+                    or point.profile.arm_reachability_profile is None):
+                raise ValueError("Fast grasp requires frozen embodied grasp and paired execution.")
+            if (fast_entry.route != fast.skill.routes[0]
+                    or fast_entry.deployment_binding != fast.binding
+                    or fast_entry.availability_hash != fast.availability_hash):
+                raise ValueError("Fast grasp registration differs from its manifest entry.")
         transport_enabled = self.object_transport_registration is not None
         if transport_enabled != any(entry.route.skill_id == "perception.plan_object_move"
                                     for entry in self.route_manifest.skill_routes):
@@ -845,6 +861,7 @@ class RealAgentPrimitiveContractBundle:
             + int(self.gripper_contract is not None)
             + int(self.spatial_goal_registration is not None)
             + int(self.tcp_pose_comparison_registration is not None)
+            + int(fast is not None)
             + int(
                 self.station_point_grasp_registration is not None
                 and self.station_point_grasp_registration.observation_registration
@@ -1250,6 +1267,16 @@ def build_real_agent_primitive_contract_bundle(
             execution_operation_timeout_sec=grasp_execution_operation_timeout_sec,
         )
         if grasp_approach_plan_enabled
+        else None
+    )
+    grasp_fast_plan_registration = (
+        build_real_fast_grasp_plan_registration(
+            paired=grasp_approach_plan_registration,
+            point_grasp_registration=station_point_grasp_registration)
+        if (grasp_approach_plan_registration is not None
+            and station_point_grasp_registration.profile.frozen_observation
+            and station_point_grasp_registration.profile.backend_id == "graspgenx"
+            and station_point_grasp_registration.profile.arm_reachability_profile is not None)
         else None
     )
     pose_target_definition = tcp_pose_target_skill_definition_v1(
@@ -1709,6 +1736,8 @@ def build_real_agent_primitive_contract_bundle(
         perception_registrations.append(placement_registration.skill)
     if grasp_approach_plan_registration is not None:
         perception_registrations.append(grasp_approach_plan_registration.skill)
+    if grasp_fast_plan_registration is not None:
+        perception_registrations.append(grasp_fast_plan_registration.skill)
     grasp_observation_registration = (None if station_point_grasp_registration is None
                                       else station_point_grasp_registration.observation_registration)
     if grasp_observation_registration is not None:
@@ -1927,6 +1956,12 @@ def build_real_agent_primitive_contract_bundle(
             route=grasp_observation_registration.skill.routes[0],
             deployment_binding=grasp_observation_registration.binding, evaluation_plan_hash=None,
             availability_hash=grasp_observation_registration.availability_hash))
+    if grasp_fast_plan_registration is not None:
+        route_items.append(SkillRouteManifestEntry(
+            route=grasp_fast_plan_registration.skill.routes[0],
+            deployment_binding=grasp_fast_plan_registration.binding,
+            evaluation_plan_hash=None,
+            availability_hash=grasp_fast_plan_registration.availability_hash))
     if object_transport_registration is not None:
         route_items.append(SkillRouteManifestEntry(
             route=object_transport_registration.skill.routes[0],
@@ -2104,6 +2139,8 @@ def build_real_agent_primitive_contract_bundle(
                 if grasp_approach_plan_registration is None
                 else (grasp_approach_plan_registration.payload_validator,)
             ),
+            *((grasp_fast_plan_registration.payload_validator,)
+              if grasp_fast_plan_registration is not None else ()),
             *(
                 (grasp_observation_registration.payload_validator,)
                 if grasp_observation_registration is not None
@@ -2155,6 +2192,7 @@ def build_real_agent_primitive_contract_bundle(
             station_point_grasp_render_registration
         ),
         grasp_approach_plan_registration=grasp_approach_plan_registration,
+        grasp_fast_plan_registration=grasp_fast_plan_registration,
         object_transport_registration=object_transport_registration,
         spatial_goal_registration=spatial_goal_registration,
         tcp_pose_comparison_registration=tcp_pose_comparison_registration,

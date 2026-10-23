@@ -9,6 +9,7 @@ bounded read and can be reused for sequential operations.
 from __future__ import annotations
 
 import math
+import json
 import threading
 import time
 from collections import OrderedDict
@@ -184,6 +185,35 @@ class _PassiveReadGatewayService(Protocol):
     def expire_due_operation(self, **kwargs: Any) -> Any: ...
 
 
+class PassiveReadError(RuntimeError):
+    """Provider-owned, bounded failure facts, without a success result or grant.
+
+    Ordinary exceptions retain the legacy 512-character message projection.
+    Providers may opt into this carrier when their failure has useful typed
+    facts; the neutral executor never interprets those domain-specific facts.
+    """
+
+    def __init__(self, message: str, *, reason_code: str,
+                 diagnostic: Mapping[str, Any]) -> None:
+        super().__init__(_required(message, field_name="message"))
+        self.reason_code = _required(reason_code, field_name="reason_code")
+        if len(self.reason_code) > 128:
+            raise ValueError("reason_code exceeds 128 characters.")
+        if not isinstance(diagnostic, Mapping) or any(
+            not isinstance(key, str) for key in diagnostic
+        ) or {"message", "exception_type"}.intersection(diagnostic):
+            raise ValueError("diagnostic must be an object without reserved keys.")
+        encoded = json.dumps(dict(diagnostic), allow_nan=False, sort_keys=True,
+                             separators=(",", ":"))
+        if len(encoded.encode("utf-8")) > 4096:
+            raise ValueError("diagnostic exceeds its 4096-byte bound.")
+        self._diagnostic_json = encoded
+
+    @property
+    def diagnostic(self) -> dict[str, Any]:
+        return json.loads(self._diagnostic_json)
+
+
 class PassiveReadSkillExecutor:
     """Reusable thread-per-operation executor for sequential passive reads."""
 
@@ -251,7 +281,8 @@ class PassiveReadSkillExecutor:
         """Return bounded local diagnostics without changing wire reason codes."""
 
         with self._lock:
-            return tuple(dict(item) for item in self._failure_diagnostics.values())
+            return tuple(json.loads(json.dumps(item, allow_nan=False))
+                         for item in self._failure_diagnostics.values())
 
     def completion_for(self, operation_id: str) -> Any | None:
         normalized = _required(operation_id, field_name="operation_id")
@@ -369,6 +400,12 @@ class PassiveReadSkillExecutor:
                 f"passive-read-executor:{self.executor_id}:activated",
             ),
         )
+
+    def cancel_requested(self, operation_id: str) -> bool:
+        """Allow a bounded read to cooperate with its existing cancel owner."""
+        with self._lock:
+            event = self._cancel_events.get(operation_id)
+            return event is None or event.is_set()
 
     def cancel(
         self,
@@ -546,11 +583,15 @@ class PassiveReadSkillExecutor:
                 self._trim_records_locked()
         except Exception as error:  # noqa: BLE001 - convert reader failure to CAS.
             message = " ".join(str(error).split())
+            failure = {
+                "exception_type": type(error).__name__,
+                "message": message[:512],
+                **(error.diagnostic if isinstance(error, PassiveReadError) else {}),
+            }
             diagnostic = {
                 "executor_id": self.executor_id,
                 "operation_id": admitted.operation_id,
-                "exception_type": type(error).__name__,
-                "message": message[:512],
+                **failure,
                 "failed_at": self._time(),
             }
             with self._lock:
@@ -564,16 +605,14 @@ class PassiveReadSkillExecutor:
                     expected_operation_hash=current.semantic_content_hash,
                     succeeded=False,
                     reason_code=(
+                        error.reason_code if isinstance(error, PassiveReadError) else
                         "passive_read_executor_exception:"
                         + type(error).__name__
                     ),
                     current_station_revision=self._revision(),
                     progress_summary={
                         "phase": "failed",
-                        "failure_diagnostic": {
-                            "exception_type": diagnostic["exception_type"],
-                            "message": diagnostic["message"],
-                        },
+                        "failure_diagnostic": failure,
                     },
                 )
 

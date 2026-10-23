@@ -680,13 +680,13 @@ def test_embodied_shortlist_checks_nearby_pose_before_spending_first_window() ->
 
 
 class _Source:
-    def __init__(self) -> None:
+    def __init__(self, *, width=4, height=3) -> None:
         self.config = SimpleNamespace(
             camera_key="front",
-            width=4,
-            height=3,
-            depth_width=4,
-            depth_height=3,
+            width=width,
+            height=height,
+            depth_width=width,
+            depth_height=height,
             align_depth_to_color=True,
             enable_depth=True,
             color_space="rgb",
@@ -694,7 +694,7 @@ class _Source:
         )
         self.read_count = 0
         self.frame = VideoFrame(
-            image=np.full((3, 4, 3), 32, dtype=np.uint8),
+            image=np.full((height, width, 3), 32, dtype=np.uint8),
             source_timestamp=9.95,
             receive_timestamp=9.951,
             available_timestamp=9.952,
@@ -704,7 +704,7 @@ class _Source:
                 "serial": "front-serial",
                 "source_generation": 2,
             },
-            depth_image=np.full((3, 4), 500, dtype=np.uint16),
+            depth_image=np.full((height, width), 500, dtype=np.uint16),
             depth_metadata={
                 "aligned_to": "color",
                 "depth_scale_m_per_unit": 0.001,
@@ -723,8 +723,8 @@ class _Source:
             "serial_number": "front-serial",
             "generation": 2,
             "intrinsics": {
-                "width": 4,
-                "height": 3,
+                "width": self.config.width,
+                "height": self.config.height,
                 "fx": 4.0,
                 "fy": 3.0,
                 "ppx": 2.0,
@@ -867,8 +867,10 @@ def _provider_stack(
     arm_reachability_evaluator=None,
     backend_id="vgn",
     captured_robot_observation_filter=None,
+    image_shape=(3, 4),
 ):
-    source = _Source()
+    height, width = image_shape
+    source = _Source(width=width, height=height)
     binding = RealPerceptionSourceBinding(
         camera_sources={"front": source},
         world_from_depth_camera_by_source={"front": np.eye(4)},
@@ -882,8 +884,8 @@ def _provider_stack(
     )
     perception.bind_profile(
         RealPerceptionCaptureProfile(
-            rgb_sources=(("front", "main", 4, 3),),
-            depth_sources=(("front", "main", 4, 3),),
+            rgb_sources=(("front", "main", width, height),),
+            depth_sources=(("front", "main", width, height),),
             source_binding_hash=binding.semantic_content_hash,
         )
     )
@@ -978,6 +980,96 @@ def test_station_point_grasp_plan_runs_inside_non_motion_read_window() -> None:
     provider.plan_request(_request())
 
     assert events == ["enter", "exit"]
+
+
+@pytest.mark.parametrize("stage", ("sam2", "graspgenx"))
+@pytest.mark.parametrize("outcome", ("expired", "cancelled", "model_error"))
+def test_preparation_guard_reaches_actual_planner_model_boundaries(stage, outcome):
+    import threading
+    from deployments.perception.sam2_graspgenx_point_grasp import Sam2GraspGenXPointGraspPlanner
+    from teleop_runtime.skill_deploy.rm65_grasp_trajectory import RM65GraspTrajectoryPlanningError
+
+    _, _, original, _, provider = _provider_stack(backend_id="graspgenx", image_shape=(8, 8))
+    now, cancelled, calls = [0.0], [False], []
+    model_error = ValueError("original model failure")
+
+    def guard():
+        if cancelled[0]:
+            raise RuntimeError("cancelled during preparation")
+        if now[0] >= 1.0:
+            raise RM65GraspTrajectoryPlanningError("grasp_fast_search_budget_exhausted")
+
+    def finish(name):
+        calls.append(name)
+        if name == stage:
+            now[0] = 1.0
+            cancelled[0] = outcome in {"cancelled", "model_error"}
+            if outcome == "model_error":
+                raise model_error
+
+    def segment(image, *, pixel_uv):
+        finish("sam2")
+        return np.ones((image.height, image.width), dtype=bool)
+
+    def infer(*args, **kwargs):
+        finish("graspgenx")
+        return np.eye(4)[None], np.asarray([0.8])
+
+    # Use actual provider/plan/_prepare_pool methods with already-running fake
+    # model ports. No constructor, model start, device or output publication.
+    planner = object.__new__(Sam2GraspGenXPointGraspPlanner)
+    planner._lock = threading.RLock()
+    planner._started, planner._closed = True, False
+    planner.point_segmenter = SimpleNamespace(segment_point=segment)
+    planner.client = SimpleNamespace(infer_object=infer)
+    planner._solid_geometry = original.solid_geometry
+    planner.planner, planner.num_grasps = "fake", 1
+    planner.score_threshold, planner.server_top_k = 0.0, 1
+    provider.planner = planner
+
+    expected = ValueError if outcome == "model_error" else RuntimeError
+    with pytest.raises(expected) as caught:
+        provider.plan_request(_request(), preparation_guard=guard)
+    if outcome == "model_error":
+        assert caught.value is model_error
+    elif outcome == "expired":
+        assert isinstance(caught.value, RM65GraspTrajectoryPlanningError)
+        assert caught.value.reason_code == "grasp_fast_search_budget_exhausted"
+    else:
+        assert not isinstance(caught.value, RM65GraspTrajectoryPlanningError)
+    assert calls == (["sam2"] if stage == "sam2" else ["sam2", "graspgenx"])
+    assert planner.last_plan_timing_ms[stage + "_inference"] >= 0.0
+
+
+@pytest.mark.parametrize("boundary", ("window", "lock"))
+def test_preparation_guard_stops_after_actual_provider_wait_boundary(boundary):
+    from contextlib import nullcontext
+    from teleop_runtime.skill_deploy.rm65_grasp_trajectory import RM65GraspTrajectoryPlanningError
+
+    source, _, planner, _, provider = _provider_stack(backend_id="graspgenx")
+    now = [0.0]
+
+    class Wait:
+        def __enter__(self):
+            now[0] = 1.0
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+    if boundary == "window":
+        provider.non_motion_read_window = Wait
+    else:
+        provider.non_motion_read_window = nullcontext
+        provider._lock = Wait()
+
+    def guard():
+        if now[0] >= 1.0:
+            raise RM65GraspTrajectoryPlanningError("grasp_fast_search_budget_exhausted")
+
+    with pytest.raises(RM65GraspTrajectoryPlanningError, match="grasp_fast_search_budget_exhausted"):
+        provider.plan_request(_request(), preparation_guard=guard)
+    assert source.read_count == 0
 
 
 def test_graspgenx_capture_filter_is_wired_to_planner() -> None:
@@ -2188,3 +2280,393 @@ def test_uninspectable_selector_does_not_replace_original_model_failure(monkeypa
     monkeypatch.setattr(planner, "plan", fail)
     with pytest.raises(RuntimeError, match="original_model_failure"):
         provider.plan_request(_request(include_arm_reachability=True))
+
+
+import io
+
+@pytest.mark.parametrize("visible_feasible", [True, False])
+def test_shortlist_uses_capture_bound_scene_as_advisory_without_vetoing_full_search(visible_feasible):
+    from robot_motion.grasp_visible_scene import (
+        ParallelJawSolidGeometry,
+        VisibleGraspScene,
+    )
+    adapter = object.__new__(RM65PointGraspReachabilityAdapter)
+    adapter.profile = SimpleNamespace(max_measured_qpos_age_ms=200., arm_side="right")
+    adapter.arm_base_origin_candidate_m = (-1., 0., 0.)
+    adapter.monotonic = lambda: 0.
+    transform = np.eye(4)
+    transform[:3, 3] = [1., 2., 3.]
+    adapter._solver_pose = lambda value: transform @ value
+    scene = VisibleGraspScene(points=np.array([[0., 0., .1], [.2, .1, .3]]),
+        target_mask=np.array([True, False]), geometry=ParallelJawSolidGeometry(-.04, .05, .01, .02, .07))
+    seen = []
+
+    def assess(**kwargs):
+        seen.append(kwargs)
+        visible = kwargs.get("visible_scene")
+        return SimpleNamespace(feasible=True if visible is None else visible_feasible,
+            selected_pregrasp_distance_m=.06, elapsed_ms=1.,
+            reason_code=None if visible is None or visible_feasible else "visible_gripper_path_collision",
+            attempts=(), joint_travel_rad=(.1,) * 6, estimated_execution_time_sec=.4)
+
+    adapter.planner = SimpleNamespace(assess_local_grasp_chain=assess)
+    candidate = SimpleNamespace(base_from_tcp=np.diag([1., -1., -1., 1.]), score=.8)
+    result = adapter.select_candidates((candidate,), (0.,0.,0.), 1, visible_scene=scene,
+        measured_qpos_cut=SimpleNamespace(measured_at=10., qpos_by_side={}), measurement_reference_time=10.)
+    assert result.selected_indices == (0,)  # A preliminary miss is not an execution permit or veto.
+    assert len(seen) == 2 and "visible_scene" not in seen[0]
+    np.testing.assert_array_equal(seen[1]["visible_scene"].points, scene.points+[1.,2.,3.])
+    np.testing.assert_array_equal(seen[1]["visible_scene"].target_mask, scene.target_mask)
+    np.testing.assert_array_equal(scene.points, [[0.,0.,.1],[.2,.1,.3]])
+    assert result.diagnostics["arm_shortlist_visible_scene_check_count"] == 1
+    assert result.diagnostics["arm_shortlist_visible_scene_feasible_count"] == int(visible_feasible)
+
+
+@pytest.mark.parametrize("side", ("left", "right"))
+def test_shortlist_searches_beyond_static_page_and_ranks_whole_arm_time(side):
+    from robot_motion.grasp_visible_scene import (
+        ParallelJawSolidGeometry,
+        VisibleGraspScene,
+    )
+
+    adapter = object.__new__(RM65PointGraspReachabilityAdapter)
+    adapter.profile = SimpleNamespace(max_measured_qpos_age_ms=200., arm_side=side)
+    adapter.arm_base_origin_candidate_m = (-1., 0., 0.)
+    adapter.monotonic = lambda: 0.
+    adapter._solver_pose = lambda value: value
+    scene = VisibleGraspScene(points=np.array([[0., 0., .1]]),
+        target_mask=np.array([False]), geometry=ParallelJawSolidGeometry(-.04, .05, .01, .02, .07))
+    candidates = []
+    for index in range(7):
+        pose = np.diag([1., -1., -1., 1.])
+        pose[0, 3] = index * .001
+        candidates.append(SimpleNamespace(base_from_tcp=pose, score=.9-index*.01))
+    checked = []
+
+    def assess(**kwargs):
+        index = round(kwargs["target_tool_tcp_world"][0, 3] * 1000)
+        visible = kwargs.get("visible_scene") is not None
+        checked.append((index, visible))
+        # The first five are statically feasible, but observed local checking
+        # fails. Keep them as reserve, and continue to the later compact wrist.
+        feasible = not visible or index >= 5
+        return SimpleNamespace(feasible=feasible, selected_pregrasp_distance_m=.06,
+            elapsed_ms=1., reason_code=None if feasible else "visible_gripper_path_collision",
+            attempts=(), joint_travel_rad=(.1,)*3 + ((3.,)*3 if index < 6 else (.2,)*3),
+            estimated_execution_time_sec=3. if index < 6 else .3)
+
+    adapter.planner = SimpleNamespace(assess_local_grasp_chain=assess)
+    result = adapter.select_candidates(candidates, (0., 0., 0.), 5, visible_scene=scene,
+        measured_qpos_cut=SimpleNamespace(measured_at=10., qpos_by_side={}), measurement_reference_time=10.)
+    assert result.selected_indices[:2] == (6, 5)
+    assert len(result.selected_indices) == 5  # Three static-feasible reserves remain.
+    assert checked[:5] == [(index, False) for index in range(5)]
+    assert sorted(checked) == [(index, visible) for index in range(7) for visible in (False, True)]
+    assert result.diagnostics["arm_shortlist_visible_scene_feasible_count"] == 2
+
+
+@pytest.mark.parametrize("side", ("left", "right"))
+@pytest.mark.parametrize("initial_visible_feasible", [False, True])
+def test_sparse_static_pool_reaches_observed_rescue_without_unbounded_budget(side, initial_visible_feasible):
+    from robot_motion.grasp_visible_scene import (
+        ParallelJawSolidGeometry,
+        VisibleGraspScene,
+    )
+
+    adapter = object.__new__(RM65PointGraspReachabilityAdapter)
+    adapter.profile = SimpleNamespace(max_measured_qpos_age_ms=200., arm_side=side)
+    adapter.arm_base_origin_candidate_m = (-1., 0., 0.)
+    now = [0.]
+    adapter.monotonic = lambda: now[0]
+    adapter._solver_pose = lambda value: value
+    scene = VisibleGraspScene(points=np.array([[0., 0., .1]]),
+        target_mask=np.array([False]), geometry=ParallelJawSolidGeometry(-.04, .05, .01, .02, .07))
+    candidates = []
+    for index in range(20):
+        pose = np.diag([1., -1., -1., 1.])
+        pose[0, 3] = index*.001
+        candidates.append(SimpleNamespace(base_from_tcp=pose, score=.9-index*.01))
+    checked = []
+
+    def assess(**kwargs):
+        index = round(kwargs["target_tool_tcp_world"][0, 3]*1000)
+        visible = kwargs.get("visible_scene") is not None
+        checked.append((index, visible))
+        now[0] += min(.3 if visible else .7, kwargs["time_budget_sec"])
+        feasible = index == 14 or (index == 0 and (not visible or initial_visible_feasible))
+        return SimpleNamespace(feasible=feasible, selected_pregrasp_distance_m=.06,
+            elapsed_ms=1., reason_code=None if feasible else "visible_gripper_path_collision",
+            attempts=(), joint_travel_rad=(.1,)*6, estimated_execution_time_sec=.3)
+
+    adapter.planner = SimpleNamespace(assess_local_grasp_chain=assess)
+    result = adapter.select_candidates(candidates, (0., 0., 0.), 1, visible_scene=scene,
+        measured_qpos_cut=SimpleNamespace(measured_at=10., qpos_by_side={}), measurement_reference_time=10.)
+    assert result.selected_indices == ((0,) if initial_visible_feasible else (14,))
+    assert (0, True) in checked
+    assert ((14, True) in checked) is not initial_visible_feasible
+    assert result.diagnostics["arm_shortlist_rescue_activated"] is not initial_visible_feasible
+    assert now[0] <= result.diagnostics["arm_shortlist_budget_sec"] == (
+        8. if initial_visible_feasible else 16.)
+
+
+@pytest.mark.parametrize("side", ("left", "right"))
+def test_shortlist_native_reach_preserves_independent_pair_and_unknown_geometry(side):
+    from robot_motion.rm65.dual_arm_target_solver import DualArmToolTCPReachCheck
+    adapter = object.__new__(RM65PointGraspReachabilityAdapter)
+    adapter.profile = SimpleNamespace(max_measured_qpos_age_ms=200., arm_side=side)
+    adapter.arm_base_origin_candidate_m = (1., 0., 0.)
+    adapter.clock = lambda: 10.
+    adapter.monotonic = lambda: 0.
+    adapter._solver_pose = lambda pose: pose.copy()
+    pair = {name: np.zeros(6) for name in ("left", "right")}
+    candidates = []
+    for index in range(3):
+        pose = np.diag([-1., 1., -1., 1.])
+        pose[0, 3] = index * .01
+        candidates.append(SimpleNamespace(base_from_tcp=pose, score=.9-index*.1,
+            symmetry_parent_index=0 if index == 1 else None,
+            orientation_variant_axis="z" if index == 1 else None,
+            orientation_variant_angle_deg=180. if index == 1 else 0.))
+    before = [c.base_from_tcp.copy() for c in candidates]
+    checked, probed, assessed = [], [], []
+    def ordinal(kwargs):
+        assert kwargs["side"] == side and kwargs["qpos_by_side"] is pair
+        return round(kwargs["target_tool_tcp_world"][0, 3] * 100)
+    def geometric(**kwargs):
+        index = ordinal(kwargs)
+        checked.append(index)
+        return (DualArmToolTCPReachCheck(.6 if index == 0 else .4, .466, .008)
+                if index < 2 else None)
+    def probe(**kwargs):
+        probed.append(ordinal(kwargs))
+        return SimpleNamespace(classification="clearance_safe", elapsed_ms=1., reason_code=None,
+            best_minimum_distance_m=.04, attempted_seed_count=1)
+    def assess(**kwargs):
+        index = ordinal(kwargs)
+        assessed.append(index)
+        return SimpleNamespace(feasible=index == 1, selected_pregrasp_distance_m=.06,
+            joint_travel_rad=(.1,) * 6, elapsed_ms=1.,
+            reason_code=None if index == 1 else "endpoint_collision_blocked", attempts=())
+    adapter.planner = SimpleNamespace(check_grasp_geometric_reach=geometric,
+        probe_grasp_endpoint_clearance=probe, assess_local_grasp_chain=assess)
+    result = adapter.select_candidates(tuple(candidates), (0., 0., 0.), 1,
+        measured_qpos_cut=SimpleNamespace(measured_at=10., qpos_by_side=pair), measurement_reference_time=10.)
+    assert checked == [0, 1, 2] and set(probed) == set(assessed) == {1, 2}
+    assert result.selected_indices == (1,)
+    assert result.diagnostics["arm_shortlist_geometric_checked_count"] == 2
+    assert result.diagnostics["arm_shortlist_geometric_rejected_count"] == 1
+    assert result.diagnostics["arm_shortlist_geometric_retained_count"] == 2
+    assert result.diagnostics["arm_shortlist_side_admissible_count"] == 3
+    examples = json.loads(result.diagnostics["arm_shortlist_geometric_rejection_examples_json"])
+    assert examples[0]["index"] == 0 and examples[0]["outside"]
+    assert json.loads(result.diagnostics["arm_shortlist_rejections_json"])["endpoint_geometric_reach_exceeded"] == 1
+    for actual, expected in zip(candidates, before):
+        np.testing.assert_array_equal(actual.base_from_tcp, expected)
+
+
+@pytest.mark.parametrize("prepare_fails", [False, True])
+def test_provider_prepares_static_filter_before_model_and_propagates_start_failure(prepare_fails):
+    events = []
+
+    def prepare():
+        events.append("static.prepare")
+        if prepare_fails:
+            raise RuntimeError("static CAD unavailable")
+
+    def filter_capture(**kwargs):
+        pytest.fail("startup must not read or filter a captured frame")
+
+    filter_capture.prepare = prepare
+    _, _, planner, _, provider = _provider_stack(
+        captured_robot_observation_filter=filter_capture)
+    planner.start = lambda: events.append("model.start")
+    if prepare_fails:
+        with pytest.raises(RuntimeError, match="static CAD unavailable"):
+            provider.start()
+        assert events == ["static.prepare"]
+        assert not provider.started
+    else:
+        provider.start()
+        assert events == ["static.prepare", "model.start"]
+        assert provider.started
+
+
+def test_provider_passes_same_capture_scene_in_candidate_frame_with_controlled_tcp_geometry():
+    from deployments.perception.sam2_graspgenx_point_grasp import (
+        GraspGenXCandidateSelection,
+    )
+    from robot_motion.grasp_visible_scene import ParallelJawSolidGeometry
+    from teleop_runtime.skill_deploy.motion_port import RealAgentMotionMeasuredQposCut
+
+    received = []
+
+    def select(candidates, point, maximum, *, visible_scene, measured_qpos_cut, **_):
+        received.append((visible_scene, measured_qpos_cut))
+        return GraspGenXCandidateSelection(tuple(range(len(candidates))), {})
+
+    adapter = object.__new__(RM65PointGraspReachabilityAdapter)
+    _, _, planner, registration, provider = _provider_stack(
+        backend_id="graspgenx", arm_reachability_evaluator=adapter)
+    adapter.select_candidates = select
+    adapter.profile = registration.profile.arm_reachability_profile
+    adapter.candidate_reference_frame_id = registration.profile.reference_frame_id
+    adapter._solver_pose = lambda value: value
+    adapter.monotonic = lambda: 0.
+    adapter.planner = SimpleNamespace(assess_endpoint_ik=lambda **_: SimpleNamespace(
+        to_dict=lambda: {"classification": "standard_reachable", "position_residual_m": .001,
+            "orientation_residual_deg": .5, "solve_cycles": 1, "elapsed_ms": 1.,
+            "termination_reason": "standard_tolerance_met"}))
+    cut = RealAgentMotionMeasuredQposCut(revision=4, measured_at=9.95, available_at=9.96,
+        qpos_by_side={s: np.zeros(6) for s in ("left", "right")}, source_evidence_refs=("test-cut",))
+    provider.motion_port = SimpleNamespace(latest_measured_qpos=lambda: cut)
+    original_plan = planner.plan
+    model_geometry = ParallelJawSolidGeometry(-.01, .02, .01, .02, .07)
+    from robot_motion.grasp_visible_scene import VisibleGraspScene
+
+    original_scene = VisibleGraspScene(points=np.array([[.1, .2, .3], [.2, .3, .4]]),
+        target_mask=np.array([True, False]), geometry=model_geometry)
+
+    # Exercise the actual provider's wrapper without depending on depth denoising.
+    # Its inner factory is called through the single-view capture filter path.
+    from unittest.mock import patch
+
+    def plan(*args, visible_scene_factory, candidate_selector, **kwargs):
+        with patch.object(VisibleGraspScene, "from_depth", return_value=original_scene):
+            returned = visible_scene_factory(depth_m=args[1], target_mask=np.ones((3, 4), bool),
+                intrinsics=kwargs["intrinsics"], geometry=model_geometry)
+        result = original_plan(*args, **kwargs)
+        candidate_selector(result.candidates, result.target_point_base_m, kwargs["max_candidates"])
+        assert returned is original_scene
+        return result
+
+    from robot_motion.rm65.captured_robot_observations import (
+        RM65CapturedRobotObservationFilterResult,
+    )
+    provider.captured_robot_observation_filter = lambda **kw: RM65CapturedRobotObservationFilterResult(
+        depth_m=kw["depth_m"], removed_mask=np.zeros_like(kw["depth_m"], dtype=bool), evidence={})
+    planner.plan = plan
+    provider.plan_request(_request(include_arm_reachability=True))
+    scene, seen_cut = received[0]
+    assert seen_cut is cut
+    assert scene.geometry is planner.solid_geometry and scene.geometry is not model_geometry
+    np.testing.assert_allclose(scene.points,
+        original_scene.points @ planner.base_from_camera[:3, :3].T + planner.base_from_camera[:3, 3])
+    np.testing.assert_array_equal(scene.target_mask, original_scene.target_mask)
+    for side in ("left", "right"):
+        np.testing.assert_array_equal(scene.capture_qpos_by_side[side], cut.qpos_by_side[side])
+
+
+@pytest.mark.parametrize("retention_mode", ("ok", "store_rejected", "oversized", "object_array"))
+def test_known_grasp_failure_projects_stage_and_keeps_mask_pool_and_scene_for_debug(retention_mode):
+    from agent_gateway.runtime.passive_read_executor import PassiveReadError
+    from deployments.perception.point_grasp_failure import PointGraspPlanningError
+    source, _, planner, _, provider = _provider_stack(backend_id="graspgenx")
+    target_mask = np.zeros((3, 4), dtype=bool)
+    target_mask[1, 1] = True
+    scene_points = np.array([[1., 2., 3.], [2., 3., 4.]])
+    summary = {"arm_shortlist_local_chain_assessment_count": 31,
+               "arm_shortlist_local_chain_feasible_count": 0,
+               "arm_shortlist_rejections_json": '{"approach_ik_search_exhausted":31}',
+               "arm_shortlist_attempts_json": "x" * 10000}
+    def fail(*_args, **_kwargs):
+        arrays = {
+            "target_mask": target_mask, "raw_grasps_reference": np.eye(4)[None],
+            "raw_scores": np.ones(1), "scene_points_camera": scene_points,
+            "scene_target_mask": np.array([True, False])}
+        if retention_mode == "oversized":
+            arrays["oversized"] = np.zeros(16 * 1024 * 1024 + 1, dtype=np.uint8)
+        if retention_mode == "object_array":
+            arrays["invalid"] = np.array([object()])
+        raise PointGraspPlanningError(summary, replay_arrays=arrays)
+    planner.plan = fail
+    retained = []
+    def save(data):
+        if retention_mode == "store_rejected":
+            raise OSError("fixture store is full")
+        retained.append(data)
+        return {"sha256": "fixture-content-hash"}
+    request = _request()
+    request.request_id = "fixture-request"
+    with pytest.raises(PassiveReadError) as raised:
+        provider.plan_request(request, failure_snapshot_sink=save)
+    assert source.read_count == 1
+    assert raised.value.reason_code == "point_grasp_no_local_grasp_chain_candidate"
+    assert raised.value.diagnostic["counts"]["local_chain_assessed"] == 31
+    if retention_mode != "ok":
+        assert retained == []
+        assert "debug_evidence" not in raised.value.diagnostic
+        failure = raised.value.diagnostic["debug_evidence_failure"]
+        assert failure["exception_type"] == ("OSError" if retention_mode == "store_rejected" else "ValueError")
+        return
+    assert len(retained) == 1
+    assert raised.value.diagnostic["debug_evidence"]["sha256"] == "fixture-content-hash"
+    with np.load(io.BytesIO(retained[0]), allow_pickle=False) as data:
+        np.testing.assert_array_equal(data["target_mask"], target_mask)
+        np.testing.assert_array_equal(data["scene_points_camera"], scene_points)
+        metadata = json.loads(data["metadata"].tobytes())
+    assert metadata["filter_summary"] == summary
+    assert metadata["scope"] == "rejected_proposals_not_an_executable_plan"
+    assert metadata["request_id"] == request.request_id
+
+
+def test_failed_evidence_retention_is_timed_separately_from_model_planning(monkeypatch, caplog):
+    import json
+    import logging
+    from agent_gateway.runtime.passive_read_executor import PassiveReadError
+    from deployments.perception.point_grasp_failure import PointGraspPlanningError
+
+    now = [0.]
+    monkeypatch.setattr("agent_gateway.profiles.real.point_grasp_gateway.time.perf_counter", lambda: now[0])
+    _, _, planner, _, provider = _provider_stack(backend_id="graspgenx")
+
+    def fail(*args, **kwargs):
+        now[0] += 2.
+        raise PointGraspPlanningError({"detected": 1})
+
+    def retain(data):
+        now[0] += 3.
+        return {"sha256": "retained:test"}
+
+    planner.plan = fail
+    request = _request()
+    request.request_id = "timing:test"
+    caplog.set_level(logging.INFO, logger="agent_gateway.profiles.real.point_grasp_gateway")
+    with pytest.raises(PassiveReadError):
+        provider.plan_request(request, failure_snapshot_sink=retain)
+    record = next(json.loads(row.message.split("Point-grasp provider timing: ")[1])
+        for row in caplog.records if row.message.startswith("Point-grasp provider timing: "))
+    assert record["timing_ms"]["proposal_planning"] == 2000.
+    assert record["timing_ms"]["failure_evidence_retention"] == 3000.
+    assert record["timing_ms"]["provider_total"] == 5000.
+
+
+@pytest.mark.parametrize("options", [
+    {"refine_grasp_centers": "true"},
+    {"refine_grasp_centers": True},
+    {"refine_grasp_centers": True, "annotate_result": False},
+    {"refine_grasp_centers": True, "selection_factory": lambda *_: None},
+    {"refine_grasp_axial_depth": "true"},
+    {"refine_grasp_axial_depth": True},
+    {"refine_grasp_axial_depth": True, "annotate_result": False},
+    {"refine_grasp_axial_depth": True, "selection_factory": lambda *_: None},
+])
+def test_center_refinement_cannot_leak_into_public_candidate_review(options):
+    _, _, _, _, provider = _provider_stack(backend_id="graspgenx")
+    with pytest.raises((TypeError, ValueError), match="refinement|refine_grasp"):
+        provider.plan_request(_request(), **options)
+
+
+def test_public_candidate_review_preserves_default_model_call():
+    _, _, planner, registration, provider = _provider_stack(backend_id="graspgenx")
+    original = planner.plan
+    received = []
+
+    def spy(*args, **kwargs):
+        received.append(kwargs.copy())
+        return original(*args, **kwargs)
+
+    planner.plan = spy
+    prepared = provider.plan_request(_request())
+    assert len(received) == 1 and "refine_grasp_centers" not in received[0]
+    assert "refine_grasp_axial_depth" not in received[0]
+    registration.payload_validator.validate_execution_result(prepared.execution_result)

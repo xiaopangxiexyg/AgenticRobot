@@ -1049,7 +1049,7 @@ def test_planner_does_not_translate_scored_offset_grasp_to_hide_solid_collision(
     )
     planner.start()
 
-    with pytest.raises(RuntimeError, match="No visible collision-free"):
+    with pytest.raises(PointGraspPlanningError, match="physical_filtering"):
         planner.plan(
             Image.new("RGB", (20, 20)),
             depth,
@@ -1312,7 +1312,7 @@ def test_planner_fails_closed_when_model_pose_misses_clicked_object(
     )
     planner.start()
 
-    with pytest.raises(RuntimeError, match='"target_capture_valid":0'):
+    with pytest.raises(PointGraspPlanningError) as raised:
         planner.plan(
             Image.new("RGB", (20, 20)),
             depth,
@@ -1328,6 +1328,8 @@ def test_planner_fails_closed_when_model_pose_misses_clicked_object(
             base_from_camera=np.eye(4),
             max_candidates=1,
         )
+    assert raised.value.diagnostic["stage"] == "physical_filtering"
+    assert raised.value.diagnostic["counts"]["target_capture_valid"] == 0
 
 
 def test_batched_pose_dedup_preserves_greedy_order_and_original_objects():
@@ -1601,7 +1603,7 @@ def test_no_arm_admitted_is_distinct_from_no_physical_proposals(tmp_path):
         assert result.candidate_pool and all(not view.candidates for view in result.results_by_component.values())
         planner.client.grasps = np.empty((0, 4, 4))
         planner.client.scores = np.empty((0,))
-        with pytest.raises(RuntimeError, match="No visible collision-free"):
+        with pytest.raises(PointGraspPlanningError, match="physical_filtering"):
             planner.plan_for_components(image, depth, candidate_selectors={"left_arm": select}, **options)
         assert len(calls) == 2
     finally:
@@ -1622,3 +1624,905 @@ def test_multiple_origins_preserve_single_origin_identity_and_validate_inputs(tm
     with pytest.raises(ValueError, match="not both"):
         _shared_proposal_fixture(tmp_path, preferred_approach_origin_base_m=(0., 0., 0.),
             preferred_approach_origins_base_m=((1., 0., 0.),))
+
+
+from deployments.perception.sam2_graspgenx_point_grasp import (
+    DMTAC_M_GRASPGENX_SWEEP_VOLUME_V1,
+    GRASPGENX_CHECKPOINT_REVIEWED_REVISION,
+    GRASPGENX_REVIEWED_REVISION,
+    GraspGenXCandidateSelection,
+    GraspGenXPointGraspModelSpec,
+    Sam2GraspGenXPointGraspPlanner,
+    _RankedGraspCandidate,
+    _deduplicate_ranked_poses,
+    _pad_height_shifts,
+    _pose_is_duplicate,
+)
+from deployments.perception.point_grasp_failure import PointGraspPlanningError
+from robot_motion.grasp_visible_scene import VisibleGraspScene, parallel_jaw_pad_height_support
+
+@pytest.mark.parametrize('refine', [False, True])
+def test_capture_support_is_available_to_selector_but_not_public_candidates(tmp_path, refine):
+    planner, image, depth, options = _shared_proposal_fixture(tmp_path)
+    observed = []
+    surfaces = []
+
+    def select(pool, target, maximum):
+        observed.extend(candidate.capture_support_score for candidate in pool)
+        surfaces.extend(candidate.surface_alignment_score for candidate in pool)
+        return GraspGenXCandidateSelection((0,), {})
+
+    try:
+        planner.start()
+        result = planner.plan(image, depth, candidate_selector=select, refine_grasp_centers=refine, **options)
+        assert observed and all(0 <= value <= 1 for value in observed)
+        assert planner.last_filter_summary["min_selected_capture_support_score"] == observed[0]
+        assert all(not hasattr(candidate, "capture_support_score") for candidate in result.candidates)
+        assert all(not hasattr(candidate, 'surface_alignment_score') for candidate in result.candidates)
+        selected = json.loads(planner.last_filter_summary['selected_capture_geometry_json'])[0]
+        assert selected['surface_alignment_score'] == surfaces[0]
+        assert 0 <= selected['surface_alignment_observed_sides'] <= 2
+        assert any(value < 1 for value in surfaces) if refine else all(value == 1 for value in surfaces)
+    finally:
+        planner.close()
+
+
+def _axial_pool(tmp_path, *, enabled=True, background=False, count=1, target_z=.570,
+                deep_prefix=0, priority=None):
+    planner, _, depth, options = _shared_proposal_fixture(tmp_path)
+    camera_from_model = np.repeat(np.eye(4)[None], count, axis=0)
+    camera_from_model[:, 2, 3] = .5
+    camera_from_model[:deep_prefix, 2, 3] = .515
+    camera_from_model[:, 0, 3] = np.linspace(-.003, .003, count) if count > 1 else 0.
+    base_from_camera = np.array([[0., 0., 1., .1], [0., 1., 0., -.2], [-1., 0., 0., .3], [0., 0., 0., 1.]])
+    target = np.array([[-.01, 0., target_z], [0., 0., target_z], [.01, 0., target_z]])
+    geometry = planner.solid_geometry
+    from dataclasses import replace
+    model_geometry = replace(geometry, tool_from_solid_xyz_m=(0., 0., 0.),
+        solid_yaw_rad=0., tool_from_solid_rotation=(1., 0., 0., 0., 1., 0., 0., 0., 1.))
+    points = np.concatenate((target, [[.039, 0., .580]])) if background else target
+    scene = VisibleGraspScene(points=points, target_mask=np.arange(len(points)) < len(target), geometry=model_geometry)
+    counts = {}
+    pool = planner._rank_pool(base_from_camera @ camera_from_model, np.full(count, .9),
+        target_points_camera=target, target_camera=target[1], base_from_camera=base_from_camera,
+        depth=depth, intrinsics=options["intrinsics"], maximum=1, visible_scene=scene,
+        for_embodiment=True, filter_summary=counts, refine_grasp_axial_depth=enabled,
+        proposal_priority=priority)
+    return planner, pool, counts, base_from_camera
+
+
+def test_axial_refinement_is_a_new_calibrated_local_z_pose_and_preserves_parent(tmp_path):
+    planner, pool, counts, extrinsic = _axial_pool(tmp_path)
+    children = [c for c in pool.candidates if c.axial_parent_index is not None
+        and pool.candidates[c.axial_parent_index].pose_source == "model_scored"]
+    assert len(children) == 1
+    child, = children
+    parent = pool.candidates[child.axial_parent_index]
+    assert parent.pose_source == "model_scored" and parent.axial_parent_index is None
+    parent_model = planner.solid_geometry.solid_pose(np.asarray(parent.base_from_tcp).reshape(4, 4))
+    child_model = planner.solid_geometry.solid_pose(np.asarray(child.base_from_tcp).reshape(4, 4))
+    expected = parent_model.copy()
+    expected[:3, 3] += parent_model[:3, 2] * .020
+    np.testing.assert_allclose(child_model, expected, atol=1e-12)
+    assert child.axial_shift_m == .020 and child.capture_support_score > parent.capture_support_score
+    assert child.model_score == parent.model_score == .9
+    assert child.pose_source == "dmtac_axial_insertion_variant_v1"
+    original_model = extrinsic.copy()
+    original_model[:3, 3] += extrinsic[:3, 2] * .5
+    np.testing.assert_allclose(parent_model, original_model, atol=1e-12)
+    original = planner._publish_pool(pool, target=(0., 0., 0.), maximum=1,
+        selector=lambda *_: GraspGenXCandidateSelection((pool.candidates.index(child),), {}))[0][0]
+    assert original.base_from_tcp == child.base_from_tcp
+    assert not hasattr(original, "axial_parent_index")
+    from deployments.perception.dmtac_grasp_overlay import (
+        DmtacGraspOverlayCandidate,
+        project_dmtac_grasp,
+    )
+    projected = project_dmtac_grasp(DmtacGraspOverlayCandidate.from_pose(ordinal=0,
+        score=original.score, gripper_width_m=original.gripper_width_m,
+        reference_from_tcp=np.asarray(original.base_from_tcp).reshape(4, 4), selected=True),
+        reference_from_camera=extrinsic,
+        intrinsics={"width": 640, "height": 480, "fx": 20., "fy": 20., "cx": 320., "cy": 240.},
+        solid_geometry=planner.solid_geometry)
+    camera_tcp = np.asarray(original.camera_from_tcp).reshape(4, 4)
+    point = camera_tcp[:3, 3]
+    assert projected.tcp_pixel_uv == (round(20. * point[0] / point[2] + 320.),
+        round(20. * point[1] / point[2] + 240.))
+    assert counts["axial_variant_attempted"] == 4 * counts["axial_variant_source_count"]
+
+
+def test_axial_depth_still_rejects_real_background_and_keeps_only_safe_improvement(tmp_path):
+    _, pool, counts, _ = _axial_pool(tmp_path, background=True)
+    child, = [c for c in pool.candidates if c.axial_parent_index is not None
+        and pool.candidates[c.axial_parent_index].pose_source == "model_scored"]
+    assert child.axial_shift_m == .005
+    assert counts["axial_variant_background_solid_collision_rejected"] >= 3
+
+
+def test_axial_is_default_off_and_its_generation_is_bounded(tmp_path):
+    _, pool, counts, _ = _axial_pool(tmp_path, enabled=False)
+    assert all(c.axial_parent_index is None for c in pool.candidates)
+    assert "axial_variant_attempted" not in counts
+    _, pool, counts, _ = _axial_pool(tmp_path, count=20)
+    assert counts["axial_variant_source_count"] == 16
+    assert counts["axial_variant_attempted"] == 64
+    assert counts["axial_variant_pool_count"] <= 16
+    assert len(counts["axial_variant_sources_json"]) < 8192
+    for child in pool.candidates:
+        if child.axial_parent_index is not None:
+            parent = pool.candidates[child.axial_parent_index]
+            assert parent.axial_parent_index is None
+            assert child.score == pytest.approx(parent.score * math.exp(
+                (parent.click_distance_m - child.click_distance_m) / .060))
+
+
+def test_axial_does_not_spend_proposals_on_already_deep_captures(tmp_path):
+    _, pool, counts, _ = _axial_pool(tmp_path, target_z=.560)
+    assert counts["axial_variant_attempted"] == counts["axial_variant_source_count"] == 0
+    assert all(c.axial_parent_index is None for c in pool.candidates)
+
+
+def test_deep_sources_do_not_exhaust_the_shallow_refinement_allowance(tmp_path, monkeypatch):
+    import deployments.perception.sam2_graspgenx_point_grasp as module
+    monkeypatch.setattr(module, "GRASPGENX_DMTAC_AXIAL_SOURCE_LIMIT", 1)
+    _, pool, counts, _ = _axial_pool(tmp_path, count=3, deep_prefix=2,
+        priority=lambda *_: 0.)
+    assert counts["axial_variant_source_count"] == 1
+    assert counts["axial_variant_attempted"] == 4
+    assert any(c.axial_parent_index is not None for c in pool.candidates)
+    assert all(pool.candidates[c.axial_parent_index].capture_support_score < .25
+        for c in pool.candidates if c.axial_parent_index is not None)
+
+
+@pytest.mark.parametrize("enabled", [1, "true", None])
+def test_axial_flag_is_strict_before_model_inference(tmp_path, enabled):
+    planner, image, depth, options = _shared_proposal_fixture(tmp_path)
+    planner.start()
+    try:
+        with pytest.raises(TypeError, match="refine_grasp_axial_depth"):
+            planner.plan(image, depth, refine_grasp_axial_depth=enabled, **options)
+        assert not planner.client.calls
+    finally:
+        planner.close()
+
+
+@pytest.mark.parametrize("name,value", [
+    ("GRASPGENX_DMTAC_AXIAL_SOURCE_LIMIT", 8),
+    ("GRASPGENX_DMTAC_AXIAL_SOURCE_ORDER", "test:changed-source-order"),
+    ("GRASPGENX_DMTAC_AXIAL_SHIFTS_M", (.005, .010)),
+    ("GRASPGENX_DMTAC_AXIAL_SHALLOW_SUPPORT", .3),
+])
+def test_axial_constants_are_bound_to_model_deployment_identity(tmp_path, monkeypatch, name, value):
+    import deployments.perception.sam2_graspgenx_point_grasp as module
+    planner, *_ = _shared_proposal_fixture(tmp_path)
+    before = planner.semantic_content_hash
+    monkeypatch.setattr(module, name, value)
+    assert planner.semantic_content_hash != before
+
+
+def test_centering_source_limit_preserves_a_later_approach_cone(tmp_path):
+    depth = np.zeros((20, 20), dtype=np.float32)
+    depth[8:13, 8:13] = 1.
+    poses = np.repeat(np.eye(4)[None], 41, axis=0)
+    poses[:40, 0, 3] = -.009
+    poses[:40, 2, 3] = np.linspace(.973, .977, 40)
+    poses[-1] = np.diag([1., -1., -1., 1.])
+    poses[-1, :3, 3] = [-.009, 0, 1.025]
+    planner = Sam2GraspGenXPointGraspPlanner(model_spec=_model_spec(tmp_path),
+        point_segmenter=_Segmenter(depth > 0), client=_PlannerClient(poses, np.linspace(.9, .5, 41)))
+
+    def select(pool, target, maximum):
+        indices = [i for i, candidate in enumerate(pool)
+            if candidate.pose_source == "dmtac_centering_variant_v1"
+            and planner.solid_geometry.solid_pose(np.array(candidate.base_from_tcp).reshape(4, 4))[2, 2] < -.9]
+        assert indices, "A lower-priority approach must survive source allocation before rechecking"
+        return GraspGenXCandidateSelection((indices[0],), {})
+
+    try:
+        planner.start()
+        planner.plan(Image.new("RGB", (20, 20)), depth, pixel_uv=(10, 10),
+            intrinsics={"width":20, "height":20, "fx":100., "fy":100., "cx":10., "cy":10.},
+            base_from_camera=np.eye(4), max_candidates=1,
+            candidate_selector=select, refine_grasp_centers=True,
+            proposal_priority=lambda pose, score, target: int(pose[2, 2] < 0))
+        counts = planner.last_filter_summary
+        assert counts["centering_variant_source_count"] == 32
+        assert counts["centering_variant_source_limit_rejected"] == 9
+        assert counts["centering_variant_selected"] == 1
+    finally:
+        planner.close()
+
+
+def test_empty_local_chain_reports_aggregate_stage_and_retains_real_request_arrays(tmp_path):
+    planner, image, depth, options = _shared_proposal_fixture(tmp_path)
+    def select(pool, _target, _maximum):
+        return GraspGenXCandidateSelection((), {
+            "arm_shortlist_pool_count": len(pool),
+            "arm_shortlist_local_chain_assessment_count": 31,
+            "arm_shortlist_local_chain_feasible_count": 0,
+            "arm_shortlist_visible_scene_check_count": 0,
+            "arm_shortlist_budget_exhausted": False,
+            "arm_shortlist_status": "no_production_local_grasp_chain_candidate",
+            "arm_shortlist_attempts_json": "x" * 10000,
+            "arm_shortlist_rejections_json": json.dumps({
+                "ik_search_exhausted": 15, "approach_ik_search_exhausted": 15,
+                "grasp_path_motion_quality_exceeded": 1}),
+        })
+    planner.start()
+    try:
+        with pytest.raises(PointGraspPlanningError) as raised:
+            planner.plan(image, depth, candidate_selector=select, **options)
+        error = raised.value
+        assert error.reason_code == "point_grasp_no_local_grasp_chain_candidate"
+        assert error.diagnostic["counts"]["local_chain_assessed"] == 31
+        assert error.diagnostic["counts"]["observed_chain_checked"] == 0
+        assert error.diagnostic["rejections_by_stage"] == {
+            "endpoint_ik": 15, "local_grasp_chain": 15, "motion_quality": 1}
+        assert error.diagnostic["search_budget_exhausted"]["local_chain"] is False
+        assert len(str(error)) < 512
+        assert "clicked region" not in str(error)
+        assert error.filter_summary["arm_shortlist_attempts_json"] == "x" * 10000
+        np.testing.assert_array_equal(error.replay_arrays["target_mask"], depth > 0)
+        np.testing.assert_array_equal(error.replay_arrays["raw_grasps_reference"], planner.client.grasps)
+        assert len(error.replay_arrays["pool_tool_poses_reference"]) > 0
+    finally:
+        planner.close()
+
+
+@pytest.mark.parametrize("extra,stage", [
+    ({"arm_shortlist_status": "grasp_fast_search_budget_exhausted",
+      "arm_shortlist_full_path_query_count": 5}, "full_path_search"),
+    ({"arm_shortlist_status": "static_scene_blocked"}, "static_scene"),
+    ({"arm_shortlist_geometric_retained_count": 0,
+      "arm_shortlist_geometric_rejected_count": 4}, "geometric_reach"),
+    ({"arm_shortlist_status": "no_production_local_grasp_chain_candidate",
+      "arm_shortlist_wrist_orientation_rejected_count": 4,
+      "arm_shortlist_geometric_checked_count": 0,
+      "arm_shortlist_geometric_retained_count": 0}, "arm_candidate_selection"),
+    ({"arm_shortlist_local_chain_assessment_count": 1,
+      "arm_shortlist_rejections_json": '{"grasp_path_motion_quality_exceeded":1}'}, "motion_quality"),
+    ({"arm_shortlist_local_chain_assessment_count": 1,
+      "arm_shortlist_rejections_json": '{"endpoint_geometric_reach_exceeded":4,"grasp_path_motion_quality_exceeded":1}'}, "motion_quality"),
+    ({}, "physical_filtering"),
+])
+def test_point_grasp_failure_does_not_conflate_stages(extra, stage):
+    error = PointGraspPlanningError(extra)
+    assert error.diagnostic["stage"] == stage
+    assert error.diagnostic["same_frozen_pixel_retry_recommended"] is False
+    assert error.diagnostic["counts"]["endpoint_probed"] is None
+
+
+def test_fast_failure_reports_complete_rejection_counts_and_bounded_native_examples():
+    import json
+    from agent_gateway.runtime.passive_read_executor import PassiveReadError
+
+    attempts = [{"index": i, "reason_code": "ik_search_exhausted", "elapsed_sec": 1.2}
+                for i in range(63)]
+    attempts.append({"index": 63, "reason_code": "path_planning_time_budget_exhausted", "elapsed_sec": .3})
+    native = [{"index": row["index"], "allocated_budget_sec": 8.,
+               "reason_code": row["reason_code"], "planning_phase": "terminal_branch_selection",
+               "cycles": 2360, "endpoint_seed_count": 47,
+               "best_position_residual_m": .039864, "best_orientation_residual_deg": 19.56}
+              for row in attempts]
+    error = PointGraspPlanningError({"arm_shortlist_full_path_query_count": 64,
+        "arm_shortlist_full_path_attempts_json": json.dumps(attempts),
+        "arm_shortlist_native_path_attempts_json": json.dumps(native)})
+    diagnostic = error.diagnostic
+    assert diagnostic["full_path_rejections_by_reason"] == {
+        "ik_search_exhausted": 63, "path_planning_time_budget_exhausted": 1}
+    assert diagnostic["rejections_by_stage"] == {"endpoint_ik": 63, "search_budget": 1}
+    assert len(diagnostic["native_path_attempts"]) == 4
+    assert diagnostic["native_path_attempts_omitted"] == 60
+    assert diagnostic["counts"]["endpoint_probed"] is None
+    # Include the actual provider's budget fields within the neutral 4 KiB limit.
+    PassiveReadError(str(error), reason_code=error.reason_code, diagnostic={
+        **diagnostic, "elapsed_sec": 20.1, "budget_sec": 20.,
+        "budget_scope": "complete_request_including_preparation",
+        "debug_evidence": {"artifact_id": "artifact:"+"a"*64, "sha256": "b"*64,
+                           "scope": "operator_debug_only_not_success_output_or_motion_authority"}})
+    from deployments.perception.point_grasp_failure import bounded_point_grasp_failure_diagnostic
+    oversized = {**diagnostic, "debug_evidence_failure": {
+        "exception_type": "OSError", "message": "😀"*256},
+        "elapsed_sec": 20.1, "budget_sec": 20.,
+        "budget_scope": "complete_request_including_preparation"}
+    assert len(json.dumps(oversized, separators=(",", ":")).encode()) > 4096
+    bounded = bounded_point_grasp_failure_diagnostic(oversized)
+    projected = PassiveReadError(str(error), reason_code=error.reason_code, diagnostic=bounded)
+    assert projected.reason_code == error.reason_code
+    assert bounded["counts"] == diagnostic["counts"]
+    assert bounded["full_path_rejections_by_reason"] == diagnostic["full_path_rejections_by_reason"]
+    assert len(bounded["native_path_attempts"]) + bounded["native_path_attempts_omitted"] == 64
+    assert bounded["debug_evidence_failure"]["message_truncated"]
+    # Required oversized facts still fail rather than being silently discarded.
+    with pytest.raises(ValueError, match="Required point-grasp failure"):
+        bounded_point_grasp_failure_diagnostic({"reason_code": "required"*1000})
+
+
+def test_dmtac_model_conditioning_and_solid_share_axial_origin():
+    # The reviewed model origin is not its palm. An origin-free length would
+    # tell OBB generation to place the fingertips 29 mm beyond the real solid.
+    geometry = reviewed_graspgenx_dmtac_solid_geometry()
+    params = DMTAC_M_GRASPGENX_SWEEP_VOLUME_V1
+    for state in ("open", "mid"):
+        half = np.array(params[f"extents_{state}"]) / 2
+        offset = np.array(params[f"offset_{state}"])
+        low, high = offset - half, offset + half
+        assert low[2] == pytest.approx(geometry.palm_z_m)
+        assert high[2] == pytest.approx(params["fingertip_depth"])
+        # Collision alone includes the reviewed 1 mm CAD tip extension. It is
+        # not extra physical reach for the neural or OBB grasp proposals.
+        assert high[2] < geometry.palm_z_m + geometry.finger_length_m
+        assert geometry.palm_z_m + geometry.finger_length_m - high[2] == pytest.approx(.001)
+
+
+@pytest.mark.parametrize("padding", [-.001, float("nan"), float("inf"), True])
+def test_planner_rejects_invalid_background_padding(tmp_path, padding):
+    with pytest.raises(ValueError, match="background_proxy_padding_m"):
+        Sam2GraspGenXPointGraspPlanner(
+            model_spec=_model_spec(tmp_path), point_segmenter=_Segmenter(np.ones((4, 4), bool)),
+            client=_PlannerClient(np.eye(4)[None], np.array([.9])),
+            background_proxy_padding_m=padding,
+        )
+
+
+@pytest.mark.parametrize("padding", [0., .003])
+def test_terminal_prefilter_preserves_real_background_padding_geometry(tmp_path, padding):
+    # This external point misses the nominal finger's height by 1 mm, but
+    # overlaps its required padded volume. Do not relabel or remove the point.
+    pose = np.eye(4)
+    pose[2, 3] = .975
+    geometry = reviewed_graspgenx_dmtac_solid_geometry()
+    from dataclasses import replace
+    geometry = replace(geometry, tool_from_solid_xyz_m=(0, 0, 0),
+        tool_from_solid_rotation=(1, 0, 0, 0, 1, 0, 0, 0, 1))
+    point = np.array([[geometry.maximum_opening_m / 2 + .002, .016, 1.015]])
+    scene = VisibleGraspScene(points=point, target_mask=np.array([False]), geometry=geometry)
+    planner = Sam2GraspGenXPointGraspPlanner(
+        model_spec=_model_spec(tmp_path), point_segmenter=_Segmenter(np.ones((4, 4), bool)),
+        client=_PlannerClient(pose[None], np.array([.9])), background_proxy_padding_m=padding,
+    )
+    summary = {}
+    planner._rank_pool(pose[None], np.array([.9]),
+        target_points_camera=np.array([[0., 0., 1.]]), target_camera=np.array([0., 0., 1.]),
+        base_from_camera=np.eye(4), depth=np.ones((4, 4)),
+        intrinsics={"fx": 100., "fy": 100., "cx": 2., "cy": 2., "width": 4, "height": 4},
+        maximum=1, filter_summary=summary, visible_scene=scene)
+    assert summary['terminal_background_collision_rejected'] == int(padding > 0)
+    np.testing.assert_array_equal(scene.points, point)
+    np.testing.assert_array_equal(scene.target_mask, [False])
+
+
+def _centering_fixture(tmp_path, *, shift_m=.010, yaw_degrees=0.0):
+    depth = np.zeros((20, 20), dtype=np.float32)
+    depth[8:13, 8:13] = 1.0
+    angle = math.radians(yaw_degrees)
+    grasp = np.eye(4)
+    grasp[:3, :3] = (
+        (math.cos(angle), -math.sin(angle), 0),
+        (math.sin(angle), math.cos(angle), 0),
+        (0, 0, 1),
+    )
+    grasp[:3, 3] = np.asarray((0., 0., .975)) - grasp[:3, 0] * shift_m
+    planner = Sam2GraspGenXPointGraspPlanner(
+        model_spec=_model_spec(tmp_path), point_segmenter=_Segmenter(depth > 0),
+        client=_PlannerClient(grasp[None], np.array([.9])),
+    )
+    options = {
+        "pixel_uv": (10, 10),
+        "intrinsics": {"width": 20, "height": 20, "fx": 100., "fy": 100., "cx": 10., "cy": 10.},
+        "base_from_camera": np.eye(4), "max_candidates": 1,
+    }
+    return planner, Image.new("RGB", (20, 20)), depth, options
+
+
+@pytest.mark.parametrize("shift_m", [-.010, .010])
+@pytest.mark.parametrize("yaw_degrees", [0., 90.])
+def test_centering_opt_in_generates_separate_model_x_pose(tmp_path, shift_m, yaw_degrees):
+    planner, image, depth, options = _centering_fixture(
+        tmp_path, shift_m=shift_m, yaw_degrees=yaw_degrees)
+    camera_parent = planner.client.grasps[0].copy()
+    angle = math.radians(30)
+    base_from_camera = np.eye(4)
+    base_from_camera[:3, :3] = (
+        (math.cos(angle), -math.sin(angle), 0),
+        (math.sin(angle), math.cos(angle), 0), (0, 0, 1),
+    )
+    base_from_camera[:3, 3] = (.1, -.2, .05)
+    options["base_from_camera"] = base_from_camera
+    planner.client.grasps = base_from_camera @ planner.client.grasps
+    raw = planner.client.grasps.copy()
+    planner.start()
+    try:
+        with pytest.raises(PointGraspPlanningError, match="physical_filtering"):
+            planner.plan(image, depth, **options)
+        result = planner.plan(image, depth, refine_grasp_centers=True, **options)
+        candidate, = result.candidates
+        expected = camera_parent.copy()
+        expected[:3, 3] += expected[:3, 0] * shift_m
+        np.testing.assert_allclose(
+            planner.solid_geometry.solid_pose(np.asarray(candidate.camera_from_tcp).reshape(4, 4)),
+            expected, atol=1e-9)
+        np.testing.assert_allclose(
+            np.asarray(candidate.base_from_tcp).reshape(4, 4),
+            base_from_camera @ np.asarray(candidate.camera_from_tcp).reshape(4, 4), atol=1e-9)
+        np.testing.assert_array_equal(planner.client.grasps, raw)
+        np.testing.assert_array_equal(planner.client.scores, [.9])
+        assert candidate.pose_source == "dmtac_centering_variant_v1"
+        assert candidate.orientation_variant_axis is None
+        assert candidate.orientation_variant_angle_deg == 0
+        assert candidate.model_score == .9
+        assert candidate.score == pytest.approx(.9 * math.exp(-.025/.060) * math.exp(-abs(shift_m)/.060))
+        counts = planner.last_filter_summary
+        for stage in ("source_eligible", "source_count", "attempted", "width_valid", "target_capture_valid",
+                      "click_distance_valid", "visible_collision_valid", "visible_approach_valid", "pool_count", "selected"):
+            assert counts[f"centering_variant_{stage}"] == 1
+        assert counts["target_capture_valid"] == 0
+        assert counts["orientation_variant_attempted"] == 0
+        parents = json.loads(counts["centering_variant_sources_json"])
+        assert parents == [{"raw_index": 0, "shift_m": pytest.approx(shift_m), "pool_index": 0}]
+        with pytest.raises(PointGraspPlanningError, match="physical_filtering"):
+            planner.plan(image, depth, refine_grasp_centers=False, **options)
+        assert "centering_variant_attempted" not in planner.last_filter_summary
+    finally:
+        planner.close()
+
+
+@pytest.mark.parametrize("shift_m,accepted", [(.015, True), (-.015, True), (.015001, False), (-.015001, False), (.020, False)])
+def test_centering_shift_limit_does_not_clamp_excessive_offset(tmp_path, shift_m, accepted):
+    planner, image, depth, options = _centering_fixture(tmp_path, shift_m=shift_m)
+    raw = planner.client.grasps.copy()
+    planner.start()
+    try:
+        if accepted:
+            assert planner.plan(image, depth, refine_grasp_centers=True, **options).candidates
+        else:
+            with pytest.raises(PointGraspPlanningError, match="physical_filtering"):
+                planner.plan(image, depth, refine_grasp_centers=True, **options)
+        counts = planner.last_filter_summary
+        assert counts["centering_variant_attempted"] == int(accepted)
+        assert counts["centering_variant_shift_limit_rejected"] == int(not accepted)
+        np.testing.assert_array_equal(planner.client.grasps, raw)
+    finally:
+        planner.close()
+
+
+@pytest.mark.parametrize("failed_gate", ["width", "y", "z"])
+def test_centering_requires_raw_width_and_yz_capture_overlap(tmp_path, failed_gate):
+    planner, image, depth, options = _centering_fixture(tmp_path)
+    if failed_gate == "width":
+        options["intrinsics"]["fx"] = 50.
+    elif failed_gate == "y":
+        planner.client.grasps[0, 1, 3] = -.060
+    else:
+        planner.client.grasps[0, 2, 3] = .900
+    planner.start()
+    try:
+        with pytest.raises(PointGraspPlanningError, match="physical_filtering"):
+            planner.plan(image, depth, refine_grasp_centers=True, **options)
+        counts = planner.last_filter_summary
+        assert counts["centering_variant_source_count"] == counts["centering_variant_attempted"] == 0
+        assert counts["centering_variant_yz_capture_rejected"] == int(failed_gate != "width")
+    finally:
+        planner.close()
+
+
+def test_centering_still_rejects_real_visible_background_collision(tmp_path):
+    planner, image, depth, options = _centering_fixture(tmp_path)
+
+    def scene_factory(*, depth_m, target_mask, intrinsics, geometry):
+        points = Sam2VgnPointGraspPlanner._masked_points_camera(depth_m, target_mask, intrinsics)
+        return VisibleGraspScene(
+            points=np.vstack((points, (.040, 0., 1.))),
+            target_mask=np.r_[np.ones(len(points), dtype=bool), False], geometry=geometry)
+
+    planner.start()
+    try:
+        with pytest.raises(PointGraspPlanningError, match="physical_filtering"):
+            planner.plan(image, depth, refine_grasp_centers=True, visible_scene_factory=scene_factory, **options)
+        counts = planner.last_filter_summary
+        assert counts["centering_variant_target_capture_valid"] == 1
+        assert counts["centering_variant_background_solid_collision_rejected"] == 1
+        assert counts["centering_variant_visible_collision_valid"] == counts["centering_variant_pool_count"] == 0
+        assert counts["centering_variant_selected"] == 0
+        assert json.loads(counts["centering_variant_sources_json"])[0]["pool_index"] is None
+    finally:
+        planner.close()
+
+
+@pytest.mark.parametrize("use_priority", [False, True])
+def test_centering_source_cap_keeps_best_32_and_bounds_lineage(tmp_path, use_priority):
+    planner, image, depth, options = _centering_fixture(tmp_path)
+    planner.client.grasps = np.repeat(planner.client.grasps, 40, axis=0)
+    planner.client.scores = np.linspace(.1, .9, 40)
+    priority = (lambda _pose, score, _target: score) if use_priority else None
+    planner.start()
+    try:
+        planner.plan(image, depth, refine_grasp_centers=True, proposal_priority=priority, **options)
+        counts = planner.last_filter_summary
+        assert counts["centering_variant_source_eligible"] == 40
+        assert counts["centering_variant_source_count"] == counts["centering_variant_attempted"] == 32
+        assert counts["centering_variant_source_limit_rejected"] == 8
+        assert counts["centering_variant_pool_count"] == 1
+        parents = json.loads(counts["centering_variant_sources_json"])
+        assert [row["raw_index"] for row in parents] == (list(range(32)) if use_priority else list(range(39, 7, -1)))
+        assert len(counts["centering_variant_sources_json"]) < 4096
+    finally:
+        planner.close()
+
+
+def test_centering_keeps_admitted_scored_candidates_and_their_scores(tmp_path):
+    planner, image, depth, options = _centering_fixture(tmp_path)
+    admitted = np.eye(4)
+    admitted[2, 3] = .965
+    planner.client.grasps = np.concatenate((admitted[None], planner.client.grasps))
+    planner.client.scores = np.array([.8, .9])
+    options["max_candidates"] = 2
+    planner.start()
+    try:
+        original = planner.plan(image, depth, **options)
+        refined = planner.plan(image, depth, refine_grasp_centers=True, **options)
+        preserved = tuple(c for c in refined.candidates if c.pose_source == "model_scored")
+        assert preserved == tuple(c for c in original.candidates if c.pose_source == "model_scored")
+        assert any(c.pose_source == "dmtac_centering_variant_v1" for c in refined.candidates)
+        assert planner.plan(image, depth, refine_grasp_centers=False, **options) == original
+    finally:
+        planner.close()
+
+
+def test_centering_does_not_override_embodiment_selector_rejection(tmp_path):
+    planner, image, depth, options = _centering_fixture(tmp_path)
+    checked = []
+
+    def reject(pool, _target, _maximum):
+        checked.extend(pool)
+        return GraspGenXCandidateSelection((), {})
+
+    planner.start()
+    try:
+        with pytest.raises(PointGraspPlanningError):
+            planner.plan(image, depth, refine_grasp_centers=True, candidate_selector=reject, **options)
+        assert len(checked) == 1 and checked[0].pose_source == "dmtac_centering_variant_v1"
+        assert planner.last_filter_summary["centering_variant_selected"] == 0
+    finally:
+        planner.close()
+
+
+def test_centering_rechecks_real_visible_approach_before_owner_admission(tmp_path):
+    planner, image, depth, options = _centering_fixture(tmp_path)
+    checked = []
+
+    def scene_factory(*, depth_m, target_mask, intrinsics, geometry):
+        points = Sam2VgnPointGraspPlanner._masked_points_camera(depth_m, target_mask, intrinsics)
+        return VisibleGraspScene(
+            points=np.vstack((points, (.040, 0., .910))),
+            target_mask=np.r_[np.ones(len(points), dtype=bool), False], geometry=geometry)
+
+    def reject(pool, _target, _maximum):
+        # The existing owner still admits/rejects full paths, including ingress.
+        checked.extend(pool)
+        return GraspGenXCandidateSelection((), {})
+
+    planner.start()
+    try:
+        with pytest.raises(PointGraspPlanningError):
+            planner.plan(image, depth, refine_grasp_centers=True, visible_scene_factory=scene_factory,
+                         candidate_selector=reject, **options)
+        assert len(checked) == 1 and checked[0].pose_source == "dmtac_centering_variant_v1"
+        counts = planner.last_filter_summary
+        assert counts["centering_variant_visible_collision_valid"] == 1
+        assert counts["centering_variant_visible_approach_collision_candidates"] == 1
+        assert counts["centering_variant_visible_approach_background_collision_candidates"] == 1
+        assert counts["centering_variant_visible_approach_valid"] == counts["centering_variant_selected"] == 0
+    finally:
+        planner.close()
+
+
+def test_centering_fixed_limits_are_bound_to_planner_identity(tmp_path, monkeypatch):
+    from deployments.perception import sam2_graspgenx_point_grasp as module
+
+    planner, *_ = _centering_fixture(tmp_path)
+    baseline = planner.semantic_content_hash
+    for name, value in (("GRASPGENX_DMTAC_CENTERING_MAX_SHIFT_M", .016),
+                        ("GRASPGENX_DMTAC_CENTERING_SOURCE_LIMIT", 33),
+                        ("GRASPGENX_DMTAC_CENTERING_SCORE_DECAY_M", .061)):
+        with monkeypatch.context() as patch:
+            patch.setattr(module, name, value)
+            assert planner.semantic_content_hash != baseline
+
+
+@pytest.mark.parametrize("enabled", [1, None, "true"])
+def test_centering_rejects_non_boolean_opt_in_before_inference(tmp_path, enabled):
+    planner, image, depth, options = _centering_fixture(tmp_path)
+    planner.start()
+    try:
+        with pytest.raises(TypeError, match="refine_grasp_centers must be bool"):
+            planner.plan(image, depth, refine_grasp_centers=enabled, **options)
+        assert not planner.client.calls
+    finally:
+        planner.close()
+
+
+@pytest.mark.parametrize("angle", (0., 90.))
+@pytest.mark.parametrize("blocked", (False, True))
+def test_pad_height_refinement_is_local_and_rechecks_background(tmp_path, angle, blocked):
+    from dataclasses import replace
+
+    from scipy.spatial.transform import Rotation
+    planner = Sam2GraspGenXPointGraspPlanner(model_spec=_model_spec(tmp_path),
+        point_segmenter=_Segmenter(np.ones((20,20),dtype=bool)),
+        client=_PlannerClient(np.eye(4)[None],np.array([.8])))
+    pose = np.eye(4)
+    pose[:3,:3] = Rotation.from_euler("x",angle,degrees=True).as_matrix()
+    pose[2,3] = 1.
+    local = np.array([[x,y,z] for x in (-.025,0.,.025)
+                      for y in np.linspace(.010,.045,40) for z in (.020,.030,.040)])
+    points = local@pose[:3,:3].T+pose[:3,3]
+    geometry = replace(planner.solid_geometry, tool_from_solid_xyz_m=(0,0,0),
+        tool_from_solid_rotation=(1,0,0,0,1,0,0,0,1))
+    background = np.array([[.042,.027,.03]])@pose[:3,:3].T+pose[:3,3]
+    scene = VisibleGraspScene(points=np.concatenate((points,background)) if blocked else points,
+        target_mask=np.r_[np.ones(len(points),dtype=bool),False] if blocked else np.ones(len(points),dtype=bool),
+        geometry=geometry)
+    counts = {}
+    pool = planner._rank_pool(pose[None],np.array([.8]),target_points_camera=points,
+        target_camera=points.mean(0),base_from_camera=np.eye(4),
+        depth=np.ones((20,20)),intrinsics={"fx":100.,"fy":100.,"cx":10.,"cy":10.},
+        maximum=1,filter_summary=counts,visible_scene=scene,refine_grasp_centers=True)
+    parents = [c for c in pool.candidates if c.pose_source == "model_scored"]
+    children = [c for c in pool.candidates if c.pose_source == "dmtac_pad_height_centering_variant_v1"]
+    assert len(parents) == 1 and parents[0].capture_height_support_score < .5
+    if blocked:
+        assert not children and counts["height_variant_background_solid_collision_rejected"] > 0
+    else:
+        assert children
+        for child in children:
+            actual = planner.solid_geometry.solid_pose(np.array(child.base_from_tcp).reshape(4,4))
+            np.testing.assert_allclose(actual[:3,3]-pose[:3,3],pose[:3,1]*child.height_shift_m,atol=1e-12)
+            assert abs(child.height_shift_m) <= .040
+            assert child.capture_height_support_score >= .5 and child.raw_index == 0
+
+
+@pytest.mark.parametrize("width,height,angle", ((.02, .03, 0.), (.05, .05, 0.), (.06, .09, 90.)))
+@pytest.mark.parametrize("blocked", (False, True))
+@pytest.mark.parametrize("offset", (0., .010, .020))
+def test_contact_band_refinement_survives_dense_top_and_density_miss(
+    tmp_path, width, height, angle, blocked, offset,
+):
+    from dataclasses import replace
+    from scipy.spatial.transform import Rotation
+
+    planner = Sam2GraspGenXPointGraspPlanner(model_spec=_model_spec(tmp_path),
+        point_segmenter=_Segmenter(np.ones((20, 20), dtype=bool)),
+        client=_PlannerClient(np.eye(4)[None], np.array([.8])))
+    pose = np.eye(4)
+    pose[:3, :3] = Rotation.from_euler("x", angle, degrees=True).as_matrix()
+    pose[2, 3] = 1.
+    sides = np.array([(x, y, z) for x in (-width/2, width/2)
+                      for y in np.linspace(-.001, height-.001, 41)
+                      for z in np.linspace(.02, .04, 13)])
+    top = np.array([(x, -.001, z) for x in np.linspace(-width/2, width/2, 101)
+                    for z in np.linspace(.02, .04, 61)])
+    local = np.unique(np.vstack((sides, top)), axis=0)
+    local[:, 1] += offset
+    points = local @ pose[:3, :3].T + pose[:3, 3]
+    geometry = replace(planner.solid_geometry, tool_from_solid_xyz_m=(0., 0., 0.),
+        solid_yaw_rad=0., tool_from_solid_rotation=(1., 0., 0., 0., 1., 0., 0., 0., 1.))
+    # A strip alongside the hand intersects both proposed translations while
+    # staying outside the original pad band; one point need not block both.
+    background = np.array([[.042, y, .03] for y in np.linspace(.019, .09, 72)]) @ pose[:3, :3].T + pose[:3, 3]
+    scene = VisibleGraspScene(points=np.vstack((points, background)) if blocked else points,
+        target_mask=np.r_[np.ones(len(points), dtype=bool), np.zeros(len(background), dtype=bool)] if blocked else np.ones(len(points), dtype=bool),
+        geometry=geometry)
+    summary = {}
+    pool = planner._rank_pool(pose[None], np.array([.8]), target_points_camera=points,
+        target_camera=points.mean(0), base_from_camera=np.eye(4), depth=np.ones((20, 20)),
+        intrinsics={"fx": 100., "fy": 100., "cx": 10., "cy": 10.}, maximum=1,
+        filter_summary=summary, visible_scene=scene, refine_grasp_centers=True)
+    parents = [c for c in pool.candidates if c.pose_source == "model_scored"]
+    children = [c for c in pool.candidates if c.pose_source == "dmtac_pad_height_centering_variant_v1"]
+    assert len(parents) == (0 if offset == .020 else 1)
+    if parents:
+        parent = parents[0]
+        assert (parent.capture_height_support_score > .9 if offset == 0.
+                else parent.capture_height_support_score < .5)
+        assert parent.contact_height_evidence_weight >= 3.
+        assert parent.contact_height_support_score < .85
+    assert summary["height_variant_contact_source_count"] == 1
+    assert summary["height_variant_attempted"] <= 2
+    if blocked:
+        assert not children and summary["height_variant_background_solid_collision_rejected"] > 0
+    else:
+        assert children
+        for child in children:
+            assert child.height_shift_basis == "observed_contact_band"
+            assert child.contact_height_support_score >= .5
+            if parents:
+                assert child.contact_height_support_score > parent.contact_height_support_score
+            actual = planner.solid_geometry.solid_pose(np.array(child.base_from_tcp).reshape(4, 4))
+            np.testing.assert_allclose(actual[:3, 3]-pose[:3, 3], pose[:3, 1]*child.height_shift_m, atol=1e-12)
+            assert 0. < abs(child.height_shift_m) <= .040
+            from deployments.perception.grasp_first_path import FirstGraspPathPolicy, grasp_capture_height_acceptable
+            assert grasp_capture_height_acceptable(child, policy=FirstGraspPathPolicy())
+
+
+@pytest.mark.parametrize(("shift", "expected"), (
+    (.060, (.030,)), (-.060, (-.030,)), (.040, (.020, .040)),
+    (.081, ()), (0., ()),
+))
+def test_pad_height_budget_uses_permitted_actual_shifts(shift, expected):
+    assert _pad_height_shifts(shift) == expected
+
+
+@pytest.mark.parametrize("source_limit", (1, 32))
+def test_contact_height_children_receive_bounded_rechecked_orientation_neighbours(tmp_path, source_limit):
+    planner = Sam2GraspGenXPointGraspPlanner(model_spec=_model_spec(tmp_path),
+        point_segmenter=_Segmenter(np.ones((20,20),dtype=bool)),
+        client=_PlannerClient(np.eye(4)[None],np.array([.8])),
+        orientation_variants_local_axis_degrees=(("x", -10.), ("x", 10.)),
+        orientation_variant_source_limit=source_limit)
+    pose = np.eye(4); pose[2,3] = 1.
+    local = np.array([(x,y,z) for x in (-.025,.025)
+        for y in np.linspace(.009,.055,41) for z in np.linspace(.02,.04,13)]
+        + [(x,.009,z) for x in np.linspace(-.025,.025,101) for z in np.linspace(.02,.04,61)])
+    points = local + pose[:3,3]
+    counts = {}
+    pool = planner._rank_pool(pose[None],np.array([.8]),target_points_camera=points,
+        target_camera=points.mean(0),base_from_camera=np.eye(4),depth=np.ones((20,20)),
+        intrinsics={"fx":100.,"fy":100.,"cx":10.,"cy":10.},maximum=1,filter_summary=counts,
+        refine_grasp_centers=True,for_embodiment=True,proposal_priority=lambda *_:(0,0.))
+    links = json.loads(counts["contact_orientation_sources_json"])
+    assert 0 < len(links) <= min(source_limit,8)*2
+    assert counts["contact_orientation_pool_count"] == len(links)
+    assert len({link["parent_index"] for link in links}) <= min(source_limit,8)
+    for link in links:
+        parent,child = (pool.candidates[link[k]] for k in ("parent_index","pool_index"))
+        assert parent.pose_source == "dmtac_pad_height_centering_variant_v1"
+        assert child.pose_source == "dmtac_local_orientation_variant_v1"
+        assert child.visible_collision_free and child.contact_height_support_score >= .5
+        pp,cp = (planner.solid_geometry.solid_pose(np.array(c.base_from_tcp).reshape(4,4)) for c in (parent,child))
+        local_points = (points-pp[:3,3])@pp[:3,:3]
+        centre = np.percentile(local_points,(5,95),axis=0).mean(0)
+        world_centre = pp[:3,:3]@centre+pp[:3,3]
+        np.testing.assert_allclose((world_centre-cp[:3,3])@cp[:3,:3],centre,atol=1e-10)
+
+
+def test_overlap_miss_is_not_discarded_by_distant_density_before_contact_enrichment(tmp_path):
+    planner = Sam2GraspGenXPointGraspPlanner(model_spec=_model_spec(tmp_path),
+        point_segmenter=_Segmenter(np.ones((20,20),dtype=bool)),
+        client=_PlannerClient(np.eye(4)[None],np.array([.8])))
+    pose = np.eye(4); pose[2,3] = 1.
+    local = np.array([(x,y,z) for x in (-.025,.025)
+        for y in np.linspace(.020,.055,41) for z in np.linspace(.02,.04,13)]
+        + [(x,.120,z) for x in np.linspace(-.025,.025,61) for z in np.linspace(.02,.04,61)])
+    density = parallel_jaw_pad_height_support(local,geometry=planner.solid_geometry,opening_m=.0705)
+    assert density.center_shift_m == pytest.approx(.120)
+    assert not _pad_height_shifts(density.center_shift_m)
+    points = local + pose[:3,3]
+    counts = {}
+    pool = planner._rank_pool(pose[None],np.array([.8]),target_points_camera=points,
+        target_camera=np.array([0.,.035,1.03]),base_from_camera=np.eye(4),depth=np.ones((20,20)),
+        intrinsics={"fx":100.,"fy":100.,"cx":10.,"cy":10.},maximum=1,filter_summary=counts,
+        refine_grasp_centers=True)
+    assert counts["height_variant_source_count"] == 1 and counts["height_variant_attempted"] <= 2
+    assert pool.candidates
+    assert all(c.pose_source == "dmtac_pad_height_centering_variant_v1" and
+        c.height_shift_basis == "observed_contact_band" and c.contact_height_support_score >= .5
+        for c in pool.candidates)
+
+
+@pytest.mark.parametrize("rejection", ("capture_bounds", "joint_empty", "click_distance"))
+def test_rejected_pose_does_not_compute_unused_capture_preferences(tmp_path, monkeypatch, rejection):
+    from deployments.perception import sam2_graspgenx_point_grasp as module
+
+    planner, _, depth, options = _shared_proposal_fixture(
+        tmp_path, max_click_distance_m=.01 if rejection == "click_distance" else .1)
+    tip = module.DMTAC_M_GRASPGENX_PALM_Z_M + module.DMTAC_M_GRASPGENX_FINGER_LENGTH_M
+    if rejection == "capture_bounds":
+        local = np.array([[-.01, 0., tip+.1], [0., 0., tip+.1], [.01, 0., tip+.1]])
+    elif rejection == "joint_empty":
+        # Every marginal interval overlaps, but no point is inside all axes.
+        local = np.array([[-.01, .03, .02], [.01, -.03, .02], [0., 0., tip+.02]])
+    else:
+        local = np.array([[x, y, .025] for x in (-.01, .01) for y in (-.002, 0., .002)])
+    pose = np.eye(4)
+    pose[2, 3] = 1.
+    points = local + pose[:3, 3]
+
+    def unused(*_args, **_kwargs):
+        raise AssertionError("Rejected pose computed an unused capture preference")
+
+    for name in ("parallel_jaw_pad_height_support", "parallel_jaw_opposed_capture_support",
+                 "parallel_jaw_surface_alignment"):
+        monkeypatch.setattr(module, name, unused)
+    summary = {}
+    pool = planner._rank_pool(pose[None], np.array([.8]), target_points_camera=points,
+        target_camera=points.mean(0), base_from_camera=np.eye(4), depth=depth,
+        intrinsics=options["intrinsics"], maximum=1, filter_summary=summary,
+        refine_grasp_centers=True)
+    assert not pool.candidates
+    assert summary["width_valid"] == 1
+    assert summary["target_capture_joint_empty_rejected"] == int(rejection == "joint_empty")
+    assert summary["target_capture_valid"] == int(rejection == "click_distance")
+    assert summary["click_distance_valid"] == 0
+
+
+@pytest.mark.parametrize("callback", ("parallel_jaw_pad_height_support",
+    "parallel_jaw_opposed_capture_support", "parallel_jaw_surface_alignment"))
+def test_surviving_pose_does_not_hide_capture_preference_errors(tmp_path, monkeypatch, callback):
+    from deployments.perception import sam2_graspgenx_point_grasp as module
+
+    planner, image, depth, options = _shared_proposal_fixture(tmp_path)
+
+    def fail(*_args, **_kwargs):
+        raise RuntimeError("capture preference failed")
+
+    monkeypatch.setattr(module, callback, fail)
+    planner.start()
+    try:
+        with pytest.raises(RuntimeError, match="capture preference failed"):
+            planner.plan(image, depth, refine_grasp_centers=True, **options)
+    finally:
+        planner.close()
+
+
+def test_terminal_collision_does_not_compute_an_unused_surface_preference(tmp_path, monkeypatch):
+    from dataclasses import replace
+    from deployments.perception import sam2_graspgenx_point_grasp as module
+
+    planner, _, depth, options = _shared_proposal_fixture(tmp_path)
+    pose = np.eye(4)
+    pose[2, 3] = .5
+    points = np.array([[-.01, 0., .525], [0., 0., .525], [.01, 0., .525]])
+    background = np.array([[.042, 0., z] for z in np.linspace(.43, .71, 281)])
+    geometry = replace(planner.solid_geometry, tool_from_solid_xyz_m=(0., 0., 0.),
+        solid_yaw_rad=0., tool_from_solid_rotation=(1., 0., 0., 0., 1., 0., 0., 0., 1.))
+    scene = VisibleGraspScene(points=np.vstack((points, background)),
+        target_mask=np.r_[np.ones(len(points), dtype=bool), np.zeros(len(background), dtype=bool)],
+        geometry=geometry)
+
+    def unused(*_args, **_kwargs):
+        raise AssertionError("Terminal-collision rejection computed an unused surface preference")
+
+    monkeypatch.setattr(module, "parallel_jaw_surface_alignment", unused)
+    summary = {}
+    pool = planner._rank_pool(pose[None], np.array([.8]), target_points_camera=points,
+        target_camera=points.mean(0), base_from_camera=np.eye(4), depth=depth,
+        intrinsics=options["intrinsics"], maximum=1, visible_scene=scene,
+        filter_summary=summary, refine_grasp_centers=True)
+    assert not pool.candidates
+    assert summary["background_solid_collision_rejected"] > 0
+
+
+@pytest.mark.parametrize("blocked", (False, True))
+def test_rejected_height_band_still_produces_rechecked_recovery_candidates(tmp_path, blocked):
+    from dataclasses import replace
+
+    planner, _, depth, options = _shared_proposal_fixture(tmp_path)
+    pose = np.eye(4)
+    pose[2, 3] = 1.
+    local = np.array([[x, y, .025] for x in (-.01, .01)
+        for y in np.linspace(.025, .035, 20)])
+    points = local + pose[:3, 3]
+    geometry = replace(planner.solid_geometry, tool_from_solid_xyz_m=(0, 0, 0),
+        solid_yaw_rad=0., tool_from_solid_rotation=(1, 0, 0, 0, 1, 0, 0, 0, 1))
+    background = np.array([[.042, .025, .025]]) + pose[:3, 3]
+    scene = VisibleGraspScene(points=np.vstack((points, background)) if blocked else points,
+        target_mask=np.r_[np.ones(len(points), dtype=bool), False] if blocked else np.ones(len(points), dtype=bool),
+        geometry=geometry)
+    summary = {}
+    pool = planner._rank_pool(pose[None], np.array([.8]), target_points_camera=points,
+        target_camera=points.mean(0), base_from_camera=np.eye(4), depth=depth,
+        intrinsics=options["intrinsics"], maximum=1, filter_summary=summary,
+        refine_grasp_centers=True, visible_scene=scene)
+    assert not [candidate for candidate in pool.candidates if candidate.pose_source == "model_scored"]
+    assert summary["height_variant_source_count"] == 1
+    children = [candidate for candidate in pool.candidates
+        if candidate.pose_source == "dmtac_pad_height_centering_variant_v1"]
+    if blocked:
+        assert not children and summary["height_variant_background_solid_collision_rejected"] > 0
+        return
+    assert children and all(candidate.visible_collision_free for candidate in children)
+    for candidate in children:
+        assert candidate.raw_index == 0
+        assert 0 < abs(candidate.height_shift_m) <= .040
+        assert candidate.capture_height_support_score > .5

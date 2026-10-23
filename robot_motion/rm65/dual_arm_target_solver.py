@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import copy
+from robot_motion.transforms import validate_pose_matrix
+from itertools import pairwise
 from dataclasses import InitVar, dataclass, field
 import math
 import time
@@ -117,6 +119,30 @@ def _normalize_ik_framework(value: object) -> str:
             f"Unsupported dual-arm IK framework {value!r}. Expected one of {IK_FRAMEWORK_CHOICES}."
         )
     return resolved
+
+
+@dataclass(frozen=True)
+class DualArmToolTCPReachCheck:
+    """Necessary outer-radius test; passing never certifies an IK or path."""
+
+    required_wrist_distance_m: float
+    maximum_wrist_distance_m: float
+    wrist_pose_allowance_m: float
+
+    @property
+    def outside(self) -> bool:
+        return self.required_wrist_distance_m > (
+            self.maximum_wrist_distance_m + self.wrist_pose_allowance_m
+        )
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "proof_scope": "native_wrist_outer_radius_with_pose_tolerance",
+            "required_wrist_distance_m": self.required_wrist_distance_m,
+            "maximum_wrist_distance_m": self.maximum_wrist_distance_m,
+            "wrist_pose_allowance_m": self.wrist_pose_allowance_m,
+            "outside": self.outside,
+        }
 
 
 @dataclass(frozen=True)
@@ -1732,6 +1758,88 @@ class DualArmCollisionAwareRetargeter(Retargeter):
             {"left": left_qpos, "right": right_qpos}
         )
         return self._solver_world_targets_for_full_q(full_q)
+
+    def tool_tcp_geometric_reach_check(
+        self,
+        *,
+        side: str,
+        qpos_by_side: Mapping[str, Sequence[float] | np.ndarray],
+        target_tool_tcp_world: np.ndarray,
+        position_tolerance_m: float,
+        orientation_tolerance_deg: float,
+    ) -> DualArmToolTCPReachCheck | None:
+        """Bound wrist reach using the active native chain and real tool offset.
+
+        Unsupported injected/nonserial models return None: they retain full
+        IK, not a guessed workspace. No configuration or target is admitted.
+        """
+
+        side = self._validated_side(side)
+        target = as_pose_matrix(target_tool_tcp_world)
+        valid, reason = validate_pose_matrix(target, atol=1e-8)
+        if not valid:
+            raise ValueError(f"Geometric reach requires a rigid target: {reason}")
+        position = float(position_tolerance_m)
+        orientation = float(orientation_tolerance_deg)
+        if not math.isfinite(position) or position < 0.0:
+            raise ValueError("position_tolerance_m must be finite and nonnegative.")
+        if not math.isfinite(orientation) or orientation < 0.0:
+            raise ValueError("orientation_tolerance_deg must be finite and nonnegative.")
+        full_q = self.solver_q_from_qpos_by_side(qpos_by_side)
+        model = self.ik_solver.robot.model
+        if not hasattr(model, "joints") or not hasattr(model, "frames"):
+            return None
+        indices = self._arm_joint_indices(full_q.size)[side]
+        joint_ids = sorted(
+            (index for index, joint in enumerate(model.joints)
+             if joint.nq == joint.nv == 1 and joint.idx_q in indices),
+            key=lambda index: model.joints[index].idx_q,
+        )
+        if (
+            len(joint_ids) != 6
+            or any(model.joints[index].shortname() != "JointModelRZ" for index in joint_ids)
+            or any(model.parents[child] != parent
+                   for parent, child in pairwise(joint_ids))
+        ):
+            return None
+        frame_name = self.profile.left_frame_name if side == "left" else self.profile.right_frame_name
+        frame_id = model.getFrameId(frame_name)
+        if frame_id >= len(model.frames):
+            raise ValueError(f"Solver frame {frame_name!r} is absent from the native model.")
+        frame = model.frames[frame_id]
+        if frame.parentJoint != joint_ids[-1]:
+            return None
+        shoulder_frame = str(model.names[joint_ids[0]])
+        if model.getFrameId(shoulder_frame) >= len(model.frames):
+            return None
+        tcp_from_last_joint = (
+            self._solver_from_tool_tcp[side] @ frame.placement.inverse().homogeneous
+        )
+        last_placement = model.jointPlacements[joint_ids[-1]]
+        parent_offset = last_placement.rotation.T @ (-last_placement.translation)
+        # The last RZ joint only rotates the transverse component. Keep its
+        # entire radius as uncertainty, including rounded URDF axis alignment.
+        nominal_offset = np.array((0.0, 0.0, parent_offset[2], 1.0))
+        offset_uncertainty = float(np.linalg.norm(parent_offset[:2]))
+        tcp_from_nominal_wrist = tcp_from_last_joint @ nominal_offset
+        required_wrist = (target @ tcp_from_nominal_wrist)[:3]
+        shoulder = as_pose_matrix(self.ik_solver.compute_frame_pose(
+            shoulder_frame, full_q,
+        ))[:3, 3]
+        maximum = sum(float(np.linalg.norm(model.jointPlacements[index].translation))
+                      for index in joint_ids[1:-1])
+        lever = float(np.linalg.norm(tcp_from_nominal_wrist[:3]))
+        rotation_roundoff = float(np.linalg.norm(
+            target[:3, :3].T @ target[:3, :3] - np.eye(3), ord=2,
+        )) * lever
+        allowance = (
+            position + 2.0 * lever * math.sin(math.radians(min(orientation, 180.0)) / 2.0)
+            + offset_uncertainty + rotation_roundoff + 1e-9
+        )
+        required = float(np.linalg.norm(required_wrist - shoulder))
+        if not all(math.isfinite(value) for value in (required, maximum, allowance)):
+            raise ValueError("Native wrist reach geometry must be finite.")
+        return DualArmToolTCPReachCheck(required, maximum, allowance)
 
     def tool_tcp_world_targets_for_qpos_pair(
         self,

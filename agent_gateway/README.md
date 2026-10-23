@@ -866,6 +866,16 @@ either `path_found` or a bounded rejection reason. This inspection Route cannot
 dispatch motion or request HOLD. A successful result contains an immutable,
 session-local plan ID/hash with a maximum 30-second lifetime.
 
+在已有 paired-plan、冻结观测和具身 GraspGenX 装配同时有效时，真实 profile 另行注册
+`perception.plan_grasp_fast@1`。它从留存观测直接寻找第一条完整可行路径，复用现有
+SAM2/GraspGenX、只读 FK/IK、碰撞规划与单次执行计划库，不经过公开候选序号选择。
+计划仍由独立的 `motion.execute_grasp_approach_plan@1` 在授权后消费。
+
+准备、等待锁和模型调用共享调用方原有的绝对 deadline 与取消信号；在阶段边界检查，
+不会抢占已经运行的模型调用，也不延长计划 TTL。发布和取用均核验生产 operation 的
+成功完成、来源身份及新鲜度；失败诊断或调试回放不成为执行依据。此项本地离线接入
+不表示模型部署、相机标定、真机运动或物理抓取已经验收。
+
 The reach planner first validates a fixed-orientation Cartesian approach along
 tool +Z for each pregrasp IK branch, then connects globally to the set of exact,
 validated pregrasp joint states using a shared start tree and goal forest. The

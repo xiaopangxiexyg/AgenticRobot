@@ -254,6 +254,7 @@ def test_gateway_sim_dependencies_are_confined_to_mujoco_profile() -> None:
         "agent_gateway/profiles/mujoco/gateway_cli.py": ["sim"],
         # Native grasp preview and target-bound contact stay in concrete leaves.
         "agent_gateway/profiles/mujoco/grasp_candidate_selection.py": ["sim"],
+        # Frozen capture and exact paired execution are native profile edges.
         "agent_gateway/profiles/mujoco/motion_application.py": ["sim"],
         "agent_gateway/profiles/mujoco/motion_deployment.py": ["sim"],
         "agent_gateway/profiles/mujoco/motion_factory.py": ["sim"],
@@ -326,6 +327,8 @@ def test_gateway_numerical_dependencies_are_confined_to_concrete_profiles() -> N
         # The concrete RM65 approach profile decodes RGBD and binds its
         # retained visible scene; numerical work stays outside Gateway core.
         "agent_gateway/profiles/real/grasp_approach_plan.py": ["numpy"],
+        "agent_gateway/profiles/real/grasp_fast_plan.py": ["numpy"],
+        "agent_gateway/profiles/real/grasp_first_path.py": ["numpy"],
         # Frozen RGB-D/FK decoding and held-object/tool transforms belong to
         # these concrete real-profile leaves, not to Gateway core.
         "agent_gateway/profiles/real/grasp_observation.py": ["numpy"],

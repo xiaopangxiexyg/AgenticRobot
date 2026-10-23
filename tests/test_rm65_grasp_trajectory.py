@@ -6368,3 +6368,100 @@ def test_phase15_typed_nonbudget_solver_faults_escape_diagnostics(monkeypatch, r
         planner.assess_endpoint_ik(qpos_by_side=current, side="right",
             target_tool_tcp_world=np.eye(4), monotonic=lambda: 0.)
     assert error.value.reason_code == reason
+
+
+
+@pytest.mark.parametrize("side", ("left", "right"))
+def test_native_wrist_bound_never_rejects_fk_or_pose_tolerance_region(derivative_builder, side):
+    builder = derivative_builder
+    original = builder.ik_solver.current_q.copy()
+    random = np.random.default_rng(42)
+    limits = (np.array(grasp_trajectory_module.RM65_ABSOLUTE_Q_MIN_RAD),
+              np.array(grasp_trajectory_module.RM65_ABSOLUTE_Q_MAX_RAD))
+    for sample in range(32):
+        pair = {name: random.uniform(*limits) for name in ("left", "right")}
+        if sample < 4:
+            pair[side][2] = 0.0  # Stretched elbow is near the outer boundary.
+            pair[side][4] = (sample - 1) * 1e-6
+        target = builder.tool_tcp_world_targets_for_qpos_pair(
+            left_qpos=pair["left"], right_qpos=pair["right"],
+        )[side]
+        for position, angle in ((0., 0.), (.003, 1.)):
+            perturbed = target.copy()
+            axis = random.normal(size=3)
+            axis /= np.linalg.norm(axis)
+            perturbed[:3, 3] += position * axis
+            perturbed[:3, :3] = Rotation.from_rotvec(np.deg2rad(angle) * axis).as_matrix() @ target[:3, :3]
+            check = builder.tool_tcp_geometric_reach_check(
+                qpos_by_side=pair, side=side, target_tool_tcp_world=perturbed,
+                position_tolerance_m=position, orientation_tolerance_deg=angle,
+            )
+            assert check is not None and not check.outside
+            assert check.maximum_wrist_distance_m == pytest.approx(.466)
+    np.testing.assert_array_equal(builder.ik_solver.current_q, original)
+
+
+@pytest.mark.parametrize("side", ("left", "right"))
+def test_native_wrist_bound_uses_tool_offset_and_reports_only_outer_exclusion(derivative_builder, side):
+    builder = derivative_builder
+    target = builder.tool_tcp_world_targets_for_qpos_pair(
+        left_qpos=FIELD_TRACE_QPOS["left"], right_qpos=FIELD_TRACE_QPOS["right"],
+    )[side]
+    before = target.copy()
+    plain = builder.tool_tcp_geometric_reach_check(qpos_by_side=FIELD_TRACE_QPOS,
+        side=side, target_tool_tcp_world=target, position_tolerance_m=0., orientation_tolerance_deg=0.)
+    tolerant = builder.tool_tcp_geometric_reach_check(qpos_by_side=FIELD_TRACE_QPOS,
+        side=side, target_tool_tcp_world=target, position_tolerance_m=.003, orientation_tolerance_deg=1.)
+    assert plain is not None and tolerant is not None
+    model = builder.ik_solver.robot.model
+    frame_name = builder.profile.left_frame_name if side == "left" else builder.profile.right_frame_name
+    j6 = model.jointPlacements[model.frames[model.getFrameId(frame_name)].parentJoint]
+    offset = j6.rotation.T @ (-j6.translation)
+    nominal = np.array((0., 0., offset[2], 1.))
+    solver_pose = builder.solver_world_target_from_tool_tcp_world_target(side=side, tool_tcp_world_target=target)
+    lever = np.linalg.norm((np.linalg.inv(target) @ solver_pose @ nominal)[:3])
+    assert tolerant.wrist_pose_allowance_m - plain.wrist_pose_allowance_m == pytest.approx(
+        .003 + 2 * lever * np.sin(np.deg2rad(.5)), abs=1e-10)
+    target[0, 3] += 2.
+    outside = builder.tool_tcp_geometric_reach_check(qpos_by_side=FIELD_TRACE_QPOS,
+        side=side, target_tool_tcp_world=target, position_tolerance_m=.003, orientation_tolerance_deg=1.)
+    assert outside is not None and outside.outside
+    assert outside.to_dict()["proof_scope"] == "native_wrist_outer_radius_with_pose_tolerance"
+    for bad in (np.nan, -.01):
+        with pytest.raises(ValueError, match="position_tolerance"):
+            builder.tool_tcp_geometric_reach_check(qpos_by_side=FIELD_TRACE_QPOS,
+                side=side, target_tool_tcp_world=before, position_tolerance_m=bad, orientation_tolerance_deg=1.)
+    broken = before.copy()
+    broken[0, 0] += .2
+    with pytest.raises(ValueError, match="rigid"):
+        builder.tool_tcp_geometric_reach_check(qpos_by_side=FIELD_TRACE_QPOS,
+            side=side, target_tool_tcp_world=broken, position_tolerance_m=.003, orientation_tolerance_deg=1.)
+
+
+@pytest.mark.parametrize("side", ("left", "right"))
+def test_native_wrist_bound_keeps_fixed_solver_frame_and_unknown_model_semantics(derivative_builder, side):
+    import copy
+    from dataclasses import replace
+    builder = derivative_builder
+    clone = copy.copy(builder)
+    model = builder.ik_solver.robot.model
+    original_frame = builder.profile.left_frame_name if side == "left" else builder.profile.right_frame_name
+    last_id = model.frames[model.getFrameId(original_frame)].parentJoint
+    frame = next(f for f in model.frames
+                 if f.parentJoint == last_id and np.linalg.norm(f.placement.translation) > .001)
+    clone.profile = replace(builder.profile, **{side + "_frame_name": frame.name})
+    clone._solver_from_tool_tcp = dict(builder._solver_from_tool_tcp)
+    clone._solver_from_tool_tcp[side] = (builder._solver_from_tool_tcp[side]
+        @ model.frames[model.getFrameId(original_frame)].placement.inverse().homogeneous
+        @ frame.placement.homogeneous)
+    target = builder.tool_tcp_world_targets_for_qpos_pair(
+        left_qpos=FIELD_TRACE_QPOS["left"], right_qpos=FIELD_TRACE_QPOS["right"],
+    )[side]
+    queries = {"qpos_by_side": FIELD_TRACE_QPOS, "side": side,
+        "target_tool_tcp_world": target, "position_tolerance_m": .003, "orientation_tolerance_deg": 1.}
+    expected = builder.tool_tcp_geometric_reach_check(**queries)
+    actual = clone.tool_tcp_geometric_reach_check(**queries)
+    assert actual == expected
+    clone.ik_solver = SimpleNamespace(current_q=builder.ik_solver.current_q.copy(),
+        robot=SimpleNamespace(model=SimpleNamespace()))
+    assert clone.tool_tcp_geometric_reach_check(**queries) is None
