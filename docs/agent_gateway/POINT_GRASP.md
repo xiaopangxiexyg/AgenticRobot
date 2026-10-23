@@ -587,6 +587,12 @@ INFO 日志分别记录 provider 的锁等待、采集准备、提案、标注�
 发布和总耗时。提案旧总字段仍包含机械臂筛选，新增排除该筛选的耗时不能与总值重复相加。
 失败保留原错误及已运行阶段的耗时，新请求清空旧阶段；这些本地阶段时钟不改变观测时间和 TTL。
 
+in-process GraspGenX 的 `GraspGenX inference diagnostics` 细分输入验证、锁等待、sampler
+准备、模型调用、已有输出转 CPU、阈值/top-k 和来源标签汇总。这是一条有界主机时钟日志，
+不增加 CUDA 同步，也不是 kernel 耗时；只统计实际返回且可识别的主机来源标签，未知则明确
+标为 unavailable。日志或序列化的普通故障以有界 stderr 提示；两个诊断通道都不可用时允许
+丢失诊断，保留原推理结果与原异常／中断。诊断期间新发生的操作员中断继续传播。
+
 ### 离线闭爪首触诊断
 
 `python -m scripts.probes.diagnose_grasp_closure --help` 提供独立、离线的末端闭爪实验。
