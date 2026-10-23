@@ -166,6 +166,7 @@ class B601EffortTick:
     driver_position_torque_nm: tuple[float, ...] = _ZERO_SIX
     control_phase: str = "ACTIVE"
     phase_reason: str | None = None
+    driver_kd_nm_s_per_rad: tuple[float, ...] = _ZERO_SIX
 
 
 class B601MujocoEffortDriver:
@@ -544,10 +545,16 @@ class B601MujocoEffortDriver:
     def step_physics(
         self,
         reference: B601MitReference | None = None,
+        *, restore_driver_kd_nm_s_per_rad: tuple[float, ...] | None = None,
     ) -> B601EffortTick:
         """Admit one due reference and attempt one 1 kHz effort step."""
 
         due = self.command_due
+        restore_profile = None
+        if restore_driver_kd_nm_s_per_rad is not None:
+            if self.real2sim_profile is None or reference is None or not due:
+                raise ValueError("damping restoration requires a due real2sim reference")
+            restore_profile = replace(self.real2sim_profile, driver_kd_nm_s_per_rad=restore_driver_kd_nm_s_per_rad)
         scheduled_time = self._next_command_time_sec if due else None
         applied = False
         rejection_reason = None
@@ -698,6 +705,16 @@ class B601MujocoEffortDriver:
                         slew_limited = not np.array_equal(
                             host_clipped, self._host_command_torque
                         )
+                        if (
+                            restore_profile is not None and applied and self._control_phase == "ACTIVE"
+                            and self._lock_fraction == 0.0
+                            and np.max(np.abs(
+                                self._host_command_torque - np.asarray(breakdown.gravity_torque_nm)
+                            )) <= 1e-9
+                        ):
+                            # This packet, not a previous zero receipt, gates
+                            # the gain handoff. Never change the final torque.
+                            self.real2sim_profile = restore_profile
                     local_kd = np.asarray(
                         self.real2sim_profile.driver_kd_nm_s_per_rad
                     )
@@ -847,6 +864,7 @@ class B601MujocoEffortDriver:
             driver_position_torque_nm=tuple(float(v) for v in driver_position),
             control_phase=self._control_phase,
             phase_reason=self._phase_reason,
+            driver_kd_nm_s_per_rad=tuple(float(v) for v in local_kd),
         )
 
     def request_protective_hold(self, reason: str = "operator_stop") -> None:

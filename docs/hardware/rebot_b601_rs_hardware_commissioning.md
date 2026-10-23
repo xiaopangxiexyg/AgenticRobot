@@ -4,6 +4,45 @@
 SocketCAN/MotorBridge 的接入边界和频率验收顺序，不替代急停、机械支撑或硬件负责人
 批准。离线、被动监听和 MuJoCo 结果都不是 `HARDWARE_PASS`，也不构成使能或运动授权。
 
+## 本地关节助力 GUI（待真机验收）
+
+`rebot_b601_rs_owner.py --torque-console` 复用现有 J1–J6 重力/阻尼 owner，网页
+仅在 `127.0.0.1` 提交短时附加力矩意图，不直接操作 CAN。未准备、附加助力归零时
+可切换 J1–J6，切换后清空旧关节的锚点、曲线与发送显示，必须重新从当前静止位姿
+准备。界面区分 HTTP 已接收、owner 限速后数值、六轴完整 MIT 发送回执和实测
+关节位移；终端近期状态与保护原因也可在网页查看。心跳不覆盖结果中的操作者事件。
+
+“进入保护保持”只请求原 owner 的保护保持，重复点击不会升级；“软件急停：全失能”
+经确认后请求同一 owner 的六轴全失能，保护保持期间仍可使用。网页/进程/CAN
+异常时不能保证软件请求送达，物理急停始终优先。此次界面改动不放宽位置、速度、
+支撑关节漂移或力矩边界；命令回执不等于实测电机输出力矩。
+
+助力期间还对所选关节使用 `mechPos` 有限差分速度作独立保护，默认阈值
+`0.05 rad/s`（`--torque-console-max-joint-velocity-rad-s`）。越界时本周期不再
+发送助力，转入原有保护保持；网页显示当前速度和阈值。此阈值不用于未加力的
+手动摆位，也不替代原有速度/位移门禁。保护保持只是撤销助力并继续重力补偿，
+不是位置锁。显式 motion profile 的保护保持沿用该 profile 的六轴驱动器阻尼，
+不会因调试基线为零而撤掉阻尼；没有 motion profile 的纯重力调试仍可保持零阻尼。
+阻尼不保证消除重力残差引起的漂移，操作者仍需保持支撑和物理急停可用。
+
+### GUI 助力试次的离线归约
+
+运行结束后，可对 `--debug-dynamics-trace` 的逐帧 JSONL 做只读归约，无需连接 CAN：
+
+```bash
+python -m control_station.b601_torque_console.report --run-dir /path/to/b601-owner-RUN
+```
+
+脚本逐行读取 `b601_owner.debug.jsonl`，在相邻目标值变化处分段，输出新建的
+`b601-torque-report-*/report.json`；输入记录保持不变。每段包含关节、目标与
+实际确认发送的最大附加助力、起始六轴姿态、模型重力、位移范围、首次连续两帧
+达到 `1 mrad` 位移的观测点、限幅计数和保护原因。目标归零后还区分撤力斜率期
+与**完整发送回执确认助力为零**的时刻，后者起算默认 `0.5 s` 的姿态观察窗口。
+这些阈值仅定义离线报告指标，不改变 owner 保护。`active_dispatch` 表示软件发送
+已获完整回执，不是实测电机力矩；“未观察到持续位移”也不是静摩擦阈值的下界。
+人为接触、传动弹性、反馈量化或未校准的驱动力矩比例仍可能解释同一记录，须与
+操作者标注一同判断，不可据此自动放宽力矩或速度限制。
+
 ## 当前实现边界
 
 `hardware/rebot_b601_rs` 是 AgenticRobot 中的薄适配层：
@@ -563,8 +602,8 @@ Kd，软件最终 profile 同步接管。`--torque-rise-time-sec` 决定主机�
 `--gravity-scale 0.95`、`--torque-limit-scale 0.25`，而 `0.5/0.15` 只提供半重力并把
 J1--J3 限到约 5.4 N·m，不能宣称完整重力平衡。这是现场命令配置，不是代码或测试中的
 固定数值限制。
-`--gravity-joint-scales J1 J2 J3 J4 J5 J6` 是显式、可回退的逐关节重力比例。经操作者
-真机验证后，默认值为 `1 0.95 1 1 1 1`。该向量在全局 `--gravity-scale` 之后生效，并贯穿
+`--gravity-joint-scales J1 J2 J3 J4 J5 J6` 是显式、可回退的逐关节重力比例。操作者最新
+确认后，默认值为 `1 0.96 1 1 1 1`。该向量在全局 `--gravity-scale` 之后生效，并贯穿
 启动锁、ACTIVE、正常 protective hold 以及从最后完整命令恢复的 degraded hold；不能只在
 ACTIVE 中临时修正，否则第一次 Ctrl-C 或一般异常会产生力矩跳变。每个值只要求有限且
 非负，不把常规调参范围写成代码硬限制；实际总输出仍受现有 URDF effort 比例、驱动器
@@ -573,22 +612,28 @@ ACTIVE 中临时修正，否则第一次 Ctrl-C 或一般异常会产生力矩�
 
 `--gravity-joint-offsets-rad`、`--gravity-joint-bias-nm` 和
 `--gravity-coulomb-friction-nm` 同样按 J1--J6 顺序显式给出。默认 offset 和 friction 均为
-六个零，默认 bias 为 `0 -0.105 -0.1 -0.05 0 0 N·m`。offset 只改变 Pinocchio 重力求值
+六个零，默认 bias 为 `0 -0.22 -0.11 -0.08 0 0 N·m`。offset 只改变 Pinocchio 重力求值
 姿态 `q+offset`；bias 是有符号常值力矩；Coulomb
 项的幅值必须非负，方向来自 `mechPos` 有限差分速度。为防止零速量化噪声让非零摩擦项
-逐帧换向，`--gravity-coulomb-velocity-threshold-rad-s` 定义方向为零的速度区间，默认零且
-只有启用非零摩擦项时才有实际影响。这些配置和比例一样贯穿启动、ACTIVE 与 protective
+逐帧换向，`--gravity-coulomb-velocity-threshold-rad-s` 定义方向为零的速度区间，默认
+`0.02 rad/s`，且只有启用非零摩擦项时才有实际影响。这些配置和比例一样贯穿启动、ACTIVE 与 protective
 hold，并完整写入结果 `profile`；省略参数时使用上述默认值。
 
 ### 重力参数调试模式的保持契约
 
 当现场需要比较重力比例、offset、bias、Coulomb 或 driver Kd 对手感的影响时，
-必须显式给 active probe/owner 增加 `--gravity-debug-mode`。该开关只改变参数
+canonical `rebot_b601_rs_owner.py` 默认启用 `--gravity-debug-mode`；直接调用
+low-gain probe 或其他模式仍需显式传入该开关，owner 可用
+`--no-gravity-debug-mode` 恢复普通保护保持语义。该开关只改变参数
 来源的可审计语义，不放宽任何安全门禁：程序在使能前把本次命令中的
 `gravity_scale`、六轴 scales/offsets/bias/friction、Coulomb 速度阈值和
-`driver_kd` 复制为不可变的 run snapshot。ACTIVE、首次 protective hold、
-反馈恢复后的 live hold，以及无可信反馈时的 degraded cached hold 都只能使用
-这个 snapshot；结果 JSON 的 `gravity_debug` 和 `protective_hold` 会记录其来源。
+`driver_kd` 复制为不可变的 run snapshot。重力标定参数贯穿 ACTIVE、首次 protective
+hold、反馈恢复后的 live hold，以及无可信反馈时的 degraded cached hold。
+普通重力调试的 driver Kd 也使用该 snapshot；显式 motion profile 的保护阻尼
+使用已配置的 `drive_driver_kd_nm_s_per_rad` 与基线 Kd 的逐轴较大值。这样自动标定
+发生故障时不会从运行阻尼切换成零阻尼，也不引入高于已有 profile 的新增益。
+结果 JSON 的 `gravity_debug` 保留调试基线，`protective_hold` 和动态轨迹记录实际
+保护阻尼及其来源；离线 preflight 同样显示保护阻尼。两者不再混为同一参数组。
 
 因此，调试期间第一次 Ctrl-C、普通故障或 duration 到期不会偷偷切回默认重力
 profile，操作者可以把姿态变化归因于当前正在测试的参数。degraded hold 仍只
@@ -597,15 +642,15 @@ profile，操作者可以把姿态变化归因于当前正在测试的参数。d
 限制、active-report 门禁、完整六轴发送重试、protective hold 的二次失能规则或
 物理急停要求；显式取消该开关的普通 `hold`、遥操和其他模式完全沿用原路径。
 
-调试模式还会关闭 protective hold 的默认主机阻尼 fallback：如果冻结快照中的某个
+调试模式仍关闭 protective hold 的默认主机阻尼 fallback：没有 motion profile 时，冻结快照中的某个
 `driver Kd` 为零，live protective hold 和 degraded cached hold 都保持该关节的
 `Kd=0`，不会在故障边界偷偷加入 `protective_hold_kd`。这样保护阶段不会改变正在
 调试的手感。普通模式仍保持原有语义：`driver Kd=0` 的关节使用
 `protective_hold_kd` 作为保护保持阻尼；这条差异只由显式 `--gravity-debug-mode`
-触发，并记录在 `protective_hold` 的 `gain_source`、
+触发；显式 motion profile 的保护阻尼按上面的规则独立确定，并记录在 `protective_hold` 的 `damping_owner`、
 `software_damping_fallback_enabled` 和 `preserve_zero_driver_damping` 字段中。
 
-典型调试命令只需在现有前台 owner 命令中加入：
+典型的直接 probe 调试命令需要加入：
 
 ```text
 --gravity-debug-mode
@@ -615,21 +660,35 @@ profile，操作者可以把姿态变化归因于当前正在测试的参数。d
 依赖运行时外部文件热改；这样 live 与 protective/degraded 证据始终属于同一
 组冻结参数。
 
+需要排查速度异常、力矩方向或 protective hold 切换时，可给 owner 加
+`--debug-dynamics-trace`。它默认关闭，开启后在每次唯一 run 目录写入
+`b601_owner.debug.jsonl`；终端仍只显示简短状态。`active_dispatch` 记录含单调时间、
+六轴位置、由相邻 `mechPos` 样本差分得到的速度、命令重力/阻尼/助力/最终力矩、
+限幅标记以及 protective hold 的 live/cached-gravity 来源。`commanded_power_w`
+是“发送力矩 × 差分速度”的诊断量，**不是实测电机输出功率**；vendor 状态字段只作
+旁证，不参与控制速度计算。该开关不增加 CAN 读取、不更改控制参数或安全限值。
+写盘发生故障时，诊断停止，结果 JSON 的 `debug_dynamics_trace.error` 会说明原因，
+控制与保护路径不因日志故障改动。鉴于该模式每周期写本地文件，真机再运行前仍须
+离线核对本机日志开销与控制频率；不能用它替代急停或解释尚未证实的反驱动根因。
+
 这些参数现在组成操作者确认的默认重力补偿 profile；原始 URDF 模型不再是省略参数时的
 默认行为。Seeed 的 RS 实机报告曾得到 J2/J3 约
 `0.948/0.952` 的有效重力比例；本机第 10 个无接触窗口也观察到 J2 在正重力方向发生延迟
 breakaway，位置锁最终提供约 `-0.268 N·m` 修正，方向和量级均支持先测试 J2 `0.95`。
-最终采用的默认比例保持 `1 0.95 1 1 1 1`，J3 仍为 `1.0`；配合上述 J2--J4 bias 使用。
+当前默认比例为 `1 0.96 1 1 1 1`，配合新的 J2--J4 bias 使用。
 要回退原始模型，需显式传入六个 scale `1`、六个 offset/bias/friction `0`。
 进入最终 active 后向 upstream MotorBridge 发送 vendor `kp=0` 的 MIT 帧；只有上述有明确
 起止状态的临时启动锁允许非零 vendor Kp。
 为避免 20 Hz 有限差分阻尼产生阶梯，可显式令软件 `--kd 0` 并用 `--driver-kd` 把纯速度
-耗散交给电机内部环。正常重力补偿的已验证默认值按 J1--J6 为
-`0.2 0.3 0.2 0.15 0.1 0.05`；显式单值仍表示六轴共用。driver `kp` 仍固定为零，
+耗散交给电机内部环。当前正常重力补偿的默认 driver Kd 按 J1--J6 为
+`0 0 0 0 0 0`；显式单值仍表示六轴共用。driver `kp` 仍固定为零，
 因此末端 `J^T wrench` 仍是唯一最终位置
 恢复项。正常重力补偿的软件默认值为 `--kp 0 --kd 0`；`gravity-calibration` 若要在按下
 `R` 后用位置残差采样，必须为该采集显式选择经过审核的非零 `--kp`。非零 driver Kd 只有在
-`--apply-driver-torque-limits` 成功完成六轴写入和回读后才允许使能。最终总力矩先做 URDF effort ceiling 的
+`--apply-driver-torque-limits` 成功完成六轴写入和回读后才允许使能。本次默认值变更限定在
+B601 硬件 owner/probe 及其 protective/degraded hold；已有 MuJoCo
+`B601Real2SimControllerProfile` 保持独立的仿真契约，避免未经单独验收就改变既有仿真动力学
+和回归结果。最终总力矩先做 URDF effort ceiling 的
 `torque-limit-scale`（默认 0.25）绝对限幅，再做 torque slew 限制；超出速度、
 位置误差、非有限差分或部分发送会结束 ACTIVE 阶段并优先进入 protective/degraded hold；
 单个有限的速度/加速度越限帧按上述两帧确认策略先隔离。上述路径都不直接失能；只有明确
@@ -639,6 +698,218 @@ safe_stop。由于当前
 只是低速 commissioning 节拍，不是高频 haptic loop，也不声明 freshness、力传感器
 或真实重力参数已验收。Pinocchio 重力模型使用中性辅助夹爪坐标，实际夹爪负载和
 摩擦仍须后续标定。
+
+### 手动确认活动范围时显示六轴角度
+
+前台 owner 可加 `--show-joint-angles`，每 0.5 秒显示一行 J1–J6 带符号的反馈角度，单位为度。
+显示复用同一 owner 已取得并通过本周期检查的六轴反馈，不另开 CAN、不产生助力，
+也不改变参考、重力、阻尼或保护阈值。角度保留边界投影前的关节实测值，使用模型关节
+坐标零点，不是相对启动位置的位移；终端和 owner 日志均可查看。只在收到有效反馈并
+完成本周期发送后刷新，正常 protective hold 继续显示；反馈不可信的 degraded hold
+不重复旧角度冒充新测量。该选项默认关闭，显示频率独立于控制频率。
+
+使用 GUI 时不附加 `--show-joint-angles`，避免终端刷屏。页面上方的“实时六轴角度与命令”
+表同时显示 J1–J6 的度、弧度、速度及命令；复用既有状态快照，不增加 CAN 查询或发送。
+角度列使用 owner 控制反馈（小幅边界外读数可能已投影，原始读数在 debug trace），
+不是相对起点位移；表头显示反馈年龄。过期值置灰并明确标记“最近值”，连接中断时清空。
+终端角度选项仍保留给无 GUI 的活动范围检查，不改变显式启用该选项时的行为。
+
+仅检查手动活动范围时使用普通 `--mode hold --kp 0 --kd 0` 及已确认的重力参数，
+不要附加 torque-console、自动标定或 policy-assist 选项。等待 `STARTUP ACTIVE` 后手动
+缓慢移动，记录边界姿态的完整六轴角度以及接触／托架限制；各轴的独立最小、最大值不能
+证明它们的任意组合都可达或无碰撞。原有第一次 Ctrl-C 保持重力、再次 Ctrl-C 请求
+最终失能的协议不变。
+
+### J2/J3 多位姿自动采集（重力优先，离线实现，待真机验收）
+
+新增 `docs/hardware/profiles/b601_j2_j3_workspace_calibration_v1.json`。仍由原有
+`rebot_b601_rs_owner.py --torque-console-auto-calibration-profile <profile>` 启动；
+GUI 保留“当前位置小范围测试”和“完整流程”两个旧按钮，并增加“J2/J3 多位姿自动采集”。
+默认仍选旧的定点模式，选择新按钮本身不会驱动；声明无人介入并点击开始才执行本批次。
+本模式只负责硬件采集，不接入 replay、policy 或 RM65。
+
+操作者确认的**目标范围**为 J2 `[0,120]°`、J3 `[0,90]°`。J2 偶尔出现的
+`−0.3°` 是弹性反馈，不是负方向目标授权；继续沿用原 owner 的反馈边界处理，原始读数
+仍保存。连接前核对 pinned URDF 范围能覆盖该目标范围，不扩大 URDF 或 owner 的硬边界。
+关节区间本身不是自碰撞或环境碰撞证明，开始前必须清空各组合位姿及过渡路径的运动空间。
+
+首轮仅从 J2/J3 近零位开始（各不超过 `2°`），使用 J2 `3/6°` × J3 `3/6°` 四个中心，
+本批实际反馈和目标范围限定为两轴 `[0,10]°`。**撤回此前未经碰撞审查的九姿态宽网格测试方案**；
+机械区间合规不代表组合位姿无碰撞。后续扩大范围必须先检查组合及路径，不能直接做笛卡尔积。
+每个中心依次执行：
+
+1. 先 J3、后 J2 分别换位，每次最多 `0.06 rad`，不同时给两轴添加定位助力；
+   避免保持 J3 折叠零位时先搬动 J2。
+2. 撤去附加驱动力，观察五秒重力补偿下的六轴姿态范围和漂移；不使用位置锁掩盖漂移。
+3. 先 J2、后 J3，复用原有局部双向、双速度采集。每轴十二段，四姿态共八组、96 段；
+   记录实际六轴姿态，不把计划中心当作真实姿态。
+4. 正常完成后先 J2、再 J3 分段返回本批起点，确认零助力、基础阻尼和原有停稳门；
+   保持重力补偿，等 GUI 人工确认机械支撑后才全失能。
+
+换位和局部采集都复用原 staged controller、运动 session、完整六轴发送回执与最终
+conditioner。J2/J3 使用各自显式配置的六轴 driver Kd；本 profile 两组暂均为
+`0.4/0.6/0.4/0.6/0.2/0.1`，基础重力模式和重力参数不变。既有速度、单段位移、
+支撑轴、最终力矩和 `40 ms` watchdog 继续生效。首轮 profile 有 `2400 s` 时限和
+`800 N·m·s` 软件命令暴露预算；子段仍受原时限和暴露预算约束，不无限恢复或重试。
+这些是命令预算，不是实测力矩冲量、人体受力或实测能量。
+
+J2/J3 均可使用同一显式解析运动配置中的定力起步观察和 TRACK 交接。所有 J2/J3 的
+换位／采集子控制器配置均在 CAN 连接前构造校验，避免完成 J3 换位后才遇到旧 J3 专用
+校验异常。该通路不开放给 J1/J4–J6，且不改变各阶段数值包络、重力参数或最终停止规则。
+
+后台继续，关闭/刷新页面、人工介入声明或撤销会停止本批并撤力，**不自动返回**。
+停止后不能自动恢复旧目标。完成和故障的已采数据分别保留，后续停止不能回溯删除前面段。
+全程无独立接触传感器，人工介入仍来自已有 GUI 声明，不把它冒充自动人体检测。
+
+已确认六轴零助力、基础阻尼和停稳之后的 `stopped_short_of_target` 属于采集未完成告警：
+停止本批，不自动重试或返回，GUI 和原 owner 的重力补偿继续运行。它不会记作到位，
+也不再仅因采集状态为 `failed` 就升级为硬件故障。反馈失效、越限、部分发送、回执缺失、
+撤力未确认等仍保持故障处理。结束的子任务在最后回执后立即归档，不再产生新待发送帧。
+控制中断时，部分阶段保存实际状态及 `pending_dispatch`，不会补造回执或停稳结论。
+
+显式连续调速将正常 TRACK 的有界维持项与 PD 推进量分开：连续速度缩放只削减
+同向 PD 推进量；比例速度误差反馈则必须能够削减完整同向合成输出，不能被
+较小或已经反向的 PD 项封顶。两项取较严格的减力，只应用一次，不新增力矩反向。
+积分记忆不被这项瞬时输出减力递归扣除，但仍接受原有速度误差积分、派发短缺和上限约束。
+维持项仍由窗口速度误差积分、原有积分变化率、最终力矩上限和派发短缺约束更新，
+不是固定力矩下限，也不是已辨识的重力／摩擦补偿。反向 PD 制动保留，积分仍能衰减。
+原始速度硬门、窗口／近期速度软制动、力矩上限、变化率、撤销和 watchdog 保留。
+trace 的 `tracking_velocity_correction_nm` 和 `continuous_speed_drive_cut_nm` 仍分别记录
+速度反馈减力及额外调速减力；新增 `continuous_speed_bound_cut_nm` 是第二项独立约束，
+`applied_drive_cut_nm` 是两项约束合成后的总减力；`unscaled_maintenance_nm` 和
+`regulatable_propulsion_nm` 分别显示本周期单独合成的维持项和可调推进量。它们均非实测力矩。
+`velocity_feedback_baseline_mode=continuous_pd_scaling_with_net_velocity_feedback`
+说明“PD 缩放、净输出速度反馈”的区别；维持项不是必须发送的最低驱动力。
+
+workspace 的定位／回位使用独立的 `workspace.positioning_support_soft_speed_recovery`，
+默认关闭，当前近零显式 profile 开启；原 `cycle` 同名配置仍只属于完整启动模式。
+它只复用已有的支撑轴软速度制动恢复：先撤力，六轴停稳及完整零发送确认后，
+在原目标、原段时限和原命令暴露预算内恢复。扫掠阶段不隐式开启这个定位选项。
+持续支撑轴运动、硬速度、位移、反馈／回执异常、人工撤销均不能由此恢复。
+
+本轮 `w2f7j86f` 在第一段 J3 定位的 2.325 秒附近，J4 窗口速度约 0.0393 rad/s
+越过 0.039 rad/s 软门，继而达到约 0.057 rad/s；定位子控制器未接入上述恢复选项，
+因此停在约 1.362°，未达到 3° 目标。这是实际支撑轴运动证据，不标为噪声误报。
+同段 2.204 秒附近 J3 窗口速度约 0.0252 rad/s，目标速度约 0.0092 rad/s，
+维持偏置约 0.619 N·m；旧合成仍请求约 0.607 N·m。
+修复净输出反馈后，同一固定输入约请求 0.447 N·m；这只是命令反事实，
+不是闭环运动预测或真机平顺性验收。不改变重力、阻尼及任何门限来通过本例。
+
+同一有效目标内的选定轴软速度制动，会先把维持记忆限制到此前实际完整发送过的
+同向附加命令幅值，只冻结记忆，不在 BRAKE 输出这项力，也不继续积分。
+`tracking_bias_frozen_for_governed_stop` 标记该状态。仍须原有六轴零发送／停稳确认，
+才能沿原 TRACK 上升率恢复；不重置目标、段时限或命令暴露预算。
+人工介入、撤销、权限失效、支撑轴制动、反馈／硬保护和到位卸载不保留这份记忆。
+起步交接也不把大脉冲当成已验证维持负载：首周期仍执行原有快速 DROP，
+被撤掉的起步尾量不会存成潜在维持项。默认非连续路径保持原行为。
+
+连续模式中的速度误差减力与维持助力积分统一使用同一份 80 ms 因果窗口速度，
+不再把单帧差分或更短近期窗口的最大值混入该正常调节回路。否则一次编码器计数
+可能在窗口显示低速时触发较大瞬时减力，并与下一周期恢复驱动形成往复。
+`tracking_cut_velocity_source=causal_window_same_as_maintenance` 标明这一来源；
+近期位移／速度仍独立约束连续速度缩放、快速撤力和软制动，原始差分仍执行硬速度保护。
+默认非连续模式、补偿参数、力矩／位移／预算上限及退出收尾语义不变。
+
+连续到位稳定阶段沿用 TRACK 的派发短缺计算，不把已计划的速度减力反复扣入维持记忆。
+只在首次进入到位阶段时，以最近完整发送总量为上界并预留当期同向 PD，裁掉隐藏记忆；
+随后只扣“上一 owner 请求与其实际完整回执之间的额外差额”。进入最终卸载后再次约束
+到实际发送值并按原卸载率减力，不能从隐藏记忆恢复输出。`dispatch_credit_mode` 分别为
+`arrival_entry_reserve_pd_from_sent_total`、`receipt_shortfall_from_previous_owner_request`、
+`arrival_unload_sent_total`。到位稳定中的缓慢修正不是最终卸载；人工介入、权限撤销、
+硬保护、原参考偏差门、段时限、暴露预算和六轴零后停稳确认仍保持原行为。
+
+`w36ya827` 已完成 J3/J2 定位及首组 5 秒重力观察；首段 J2 负向扫掠进入到位区后，
+维持记忆连续由约 -0.485 降为 -0.271、再降为零，随后回退并触发参考偏差制动。
+这些是软件命令和编码器证据，不是独立输出测力。修复重复扣减不等于放行参考偏差越限，
+也不能证明重力残差与传动弹性已经分离；原始报告和诊断窗口保留，不自动安装拟合值。
+
+两轮实际 39.94 Hz 的主要时间仍在反馈准入重试。每周期 `feedback_read_diagnostics`
+新增固定三类 `rejection_counts`：`backend_poll`、`host_freshness_admission`、
+`baseline_not_advanced`；`first_rejection`／`last_rejection` 只保存首末阶段、序号及
+最多 400 字符的原因，不保存异常对象或全部尝试，不额外读取控制时钟或请求 CAN 帧。
+这些字段不改变准入、1 ms 重试等待、超时和派发锚点。现有记录缺少具体拒绝原因，
+本候选只补齐证据，尚不能声称 40 Hz 已恢复为 100 Hz；不得降低验收线掩盖该问题。
+
+采集进入失败／撤销时，现有终端日志立即显示停止原因及“不自动重试／返回”。
+GUI 说明批次已经结束推进，并区分已确认仅重力补偿与尚需查看保护／撤力回执的状态，
+不再让“采集停止”看起来像等待下一段；它不表示六轴已失能。
+
+退出时先原子保存主结果检查点，样本归档状态为 `PENDING`；归档完成后写为 `COMPLETE`，
+再开始离线报告。归档中断会保留主结果、原轨迹及已有部分归档，明确标记 `INTERRUPTED`，
+不会声称全部样本已归档。报告汇总中断不覆盖控制结果及首次停止原因，
+以 `automatic_calibration_report_status=INTERRUPTED` 和退出码 130 表示后处理被中断。
+正常报告状态为 `COMPLETE`；已知报告数据／序列化异常仍作为显式 ERROR 写入主结果。
+主结果先于大轨迹扫描落盘，不再依赖报告完成才能拿到退出证据。
+控制节拍拒绝记录补充当前阶段耗时、反馈读取和上一条 trace 写入耗时，便于定位长间隔；
+不在原因未知时延长 40 ms watchdog，也不把调度／写盘假设当成已确认原因。
+若旧 run 缺少最终结果记录，离线报告只从已落盘的阶段、重力观察和运动窗口恢复证据，
+保留 `terminal_record_missing`，绝不将其改成采集完成或自动安装补偿。
+
+结果中的 `workspace` 保存配置组标签、实际完整姿态、换位、重力观察、完成段及未完成段。
+`automatic_calibration_report.json` 新增 `workspace_motion`：逐轴保存带完整回执的运动窗口，
+包括命令变化范围、实际速度、线性残差及 driver Kd；变化中的闭环命令不会再因不满足
+旧“近恒定命令”条件而整段丢弃，也不会直接当成纯摩擦。此阶段不另做静摩擦阈值扫描，
+不自动拟合或安装重力/摩擦参数。后续先做相近完整姿态下的正反方向、双速度分析，得到
+有效重力修正候选并重新采集，再进入起步摩擦优化。没有外部测力时不能承诺绝对力矩校准。
+
+`setup_label` 默认 `temporary_end_effector`，与每次 run ID、config/URDF 哈希及冻结补偿参数
+一起保存。最终末端确定后改用新的配置组重采，不能把不同负载默认为同一拟合数据集。
+中心网格及两组阻尼都只通过连接前 profile 调整，批次运行时不改配置。
+
+离线几何检查入口（不执行真机、不覆盖已有输出）：
+
+```bash
+python -m scripts.probes.b601_workspace_collision_audit \
+  --source-root /path/to/reBotArm_control_py \
+  --profile docs/hardware/profiles/b601_j2_j3_workspace_calibration_v1.json \
+  --origin-deg 0 0 0 0 0 0 \
+  --compare-previous-grid \
+  --output /path/to/new-workspace-collision-report.json
+```
+
+该工具使用启用碰撞几何的 MuJoCo 场景，复用 owner 的任务顺序和局部往返计划，按不超过
+`0.5°` 采样整条名义路径；另用已安装 FCL 核对原始三角网格表面，不复制碰撞过滤规则。
+MuJoCo STL 碰撞使用凸包，不能把凸包近似重叠与真实网格表面相交混为一谈；两种结果均保留。
+默认不虚构现场地面；只有提供 `--ground-z-m` 才加入该高度的示例平面，不能当成已测量环境。
+零位可能无表面相交但小于既有 `2 mm` 预防间距，报告会标为 `CLEARANCE_REVIEW_REQUIRED`，
+不会伪称无碰撞余量充足。名义路径检查不覆盖动力学跟踪误差、支撑轴漂移、线缆和最终末端。
+该诊断不在硬件控制循环内，不授权运动，也没有关闭或放宽既有碰撞保护。
+
+新模式的完整 `samples` 在停止和后端清理之后逐帧压缩为
+`b601_owner.samples.jsonl.gz`，结果 JSON 通过 `sample_storage` 指向它，避免结束时将全历史
+展开成巨大的重复 JSON；完整 debug JSONL 仍保留。旧模式输出不变。长批次仍需足够的
+内存、磁盘和可靠供电，压缩归档不代表控制期间没有资源开销。
+
+### 四中心 J2/J3 保持采集（显式扩展，不改变近零默认配置）
+
+`b601_j2_j3_four_centres_holding_v1.json` 复用近零已运行的 coordinated holding
+控制器，只将中心从 `(3°,3°)` 扩为蛇形 `(3°,3°) → (3°,8°) → (8°,8°) → (8°,3°)`。
+每中心两个关节各 12 段，总计 8 组关节采集、96 段；完成后返回本轮实测原位，
+确认零附加助力和基础阻尼，并等待 GUI 人工确认最终失能。失败不自动重试或返回。
+GUI 应选择「J2/J3 位姿采集」，不是「固定位置」或另一项 20° 完整流程。
+
+整 workspace 时限由 3120 扩为 12480 秒，累计命令暴露由 1040 扩为
+4160 N·m·s，仅按四倍中心任务量扩展。每组 1200 秒／480 N·m·s、每段
+180 秒／120 N·m·s不变；时间／暴露不会因换候选、制动或重到位而自动续期。
+命令暴露不是实测能量。两轴共享 L1 附加助力上限仍为 1.0 N·m，原速度、
+位移、阻尼、加减力、保持搜索、40 ms watchdog 和反馈／派发保护不变。
+该配置是独立显式 profile；原单中心 profile 和所有程序默认值不变。
+采集边界显式设为 0–12°，给 8° 中心保留原 `global_excursion_rad=0.04`（约 2.29°）
+扫掠／撤力准入余量；不删除这项连接前校验，也不生成 12° 目标。局部往返仍约 ±0.573°。
+启动 owner 的 `--duration-sec` 应覆盖整批时限，例如 14400，避免沿用 3600 秒
+导致长批次被外层时限截断；14400 是上限，不是预期采集时间。
+
+几何检查必须使用实际起始六轴姿态，并同时覆盖中心间路径和局部往返。
+上一轮 `117zswqu` 起点约 `[-1.428°,0.461°,0.374°,0.901°,1.121°,-2.285°]`；
+对应四中心名义路径检查了 74 个唯一配置，无三角表面相交或低于 2 mm 的三角表面间距，
+但保留起点／返回近零处既有凸包间距警告，状态为 `CLEARANCE_REVIEW_REQUIRED`。
+这不是任意起始姿态、跟踪误差、线缆、支架或最终末端的碰撞保证，也没有放宽严格碰撞模型。
+不得据此直接扫描 J2 0–120° × J3 0–90° 整个矩形：较大范围存在基座／夹爪自碰撞。
+换末端或其余四轴姿态后需重新检查，不把旧起点的名义报告当成新路径验收。
+
+采集保持原物理配置组标签，不把 profile 文件名当成不同负载。96 条完成记录
+仍是完整姿态与软件保持命令的观测，不是 96 个独立中心、唯一重力残差或实测输出力；
+不自动拟合／安装补偿。后续以方向配对和跨姿态分析生成候选，再显式启用重采。
 
 ### 交互式多姿态重力残差采集
 
@@ -1181,6 +1452,73 @@ commissioning；不得据此声明触觉带宽、接触稳定性或最终 impeda
 人工单轴档只把上方命令的 `--velocity-abort-rad-s` 从 no-touch 的 `0.05` 改为 `0.12`；
 不得同时改变 qacc、fault-hold、力矩/slew、`5 mm` 位移或 wrench 参数。每次运行只允许一个
 平移轴，并在日志中明确写出轴名，避免再次产生无法拆分逐轴结论的聚合 JSON。
+
+#### J2/J3 启动静摩擦补偿（默认关闭）
+
+若重力参数已经在无外力状态下验收，但同一 Cartesian assist 在 X 方向持续出现“有明确
+`J^T F` 力矩、J2/J3 仍停在静摩擦死区，而 Y/Z 方向能够响应”，可以在原有单次
+Cartesian assist 内显式加入 J2/J3 breakaway 补偿。它不是新的控制 owner，也不改变重力
+模型；其方向只取自当帧未限幅的 `J^T F` 任务力矩，不使用速度符号猜测运动方向。
+
+对应参数为：
+
+```text
+--cartesian-assist-breakaway-positive-nm J1 J2 J3 J4 J5 J6
+--cartesian-assist-breakaway-negative-nm J1 J2 J3 J4 J5 J6
+--cartesian-assist-breakaway-velocity-fade-rad-s VALUE
+--cartesian-assist-breakaway-intent-deadband-nm VALUE
+--cartesian-assist-breakaway-intent-ramp-nm VALUE
+```
+
+所有关节的正、负方向补偿默认都严格为 `0 N·m`。当前只允许 J2/J3 为非零，其他关节非零
+会在使能前失败。正负方向分别配置是为了容纳减速器、线束与装配造成的方向不对称；数值
+必须来自独立的现场 breakaway 标定，不能从官方相邻关节摩擦值或本次 Cartesian force
+反推。任务力矩绝对值低于 deadband 时补偿为零，随后在 intent ramp 内线性增大；实测有限
+差分速度从静止增至 velocity fade 时，补偿线性衰减到零。因此它只帮助脱离静摩擦，不应在
+已经运动后继续充当恒定推力。
+
+组合顺序固定为：
+
+```text
+J^T F task torque
+  + bounded J2/J3 breakaway torque
+  -> existing assist authority ramp
+  -> existing per-joint absolute overlay cap
+  -> existing torque slew limit
+  -> gravity and final hardware torque envelope
+```
+
+任一 breakaway 标定值大于既有 `--cartesian-assist-max-joint-torque-nm` 会在使能前失败；不能
+通过 breakaway 参数绕过原有绝对力矩、slew、速度/加速度、位移或 protective-hold 边界。
+JSON 会同时记录 `raw_task_joint_torque_overlay_nm`、breakaway 配置、逐轴 velocity/intent
+权重、实际 breakaway 力矩以及合成后力矩，便于区分“任务力不足”“静摩擦补偿生效但被总
+包络截断”和“机械臂已经运动、补偿正常衰减”。在完成 J2/J3 正反方向独立标定前，真机命令
+必须继续使用全零默认值。
+
+#### Cartesian 助力的非对称力矩变化率
+
+Cartesian assist 的启动推力仍由
+`--cartesian-assist-joint-torque-slew-nm-s` 缓慢加入，限制主动助力注入能量的速度。现场反向
+试验表明，若同一个很小的 slew 同时用于撤销旧力矩，TCP 越过目标后即使 `J^T F` 已经要求
+反向制动，实际发送的关节 overlay 仍可能在数个 20 Hz 周期内保持旧符号。为避免把安全的
+慢启动错误地复用成迟滞制动，可显式配置：
+
+```text
+--cartesian-assist-joint-torque-release-slew-nm-s VALUE
+```
+
+该参数只控制逐关节的快速撤销与耗散制动。请求力矩与可信有限差分关节速度方向相反、且速度
+绝对值超过既有 `--cartesian-assist-stationarity-limit-rad-s` 时，才允许用 release rate 接近
+制动力矩；这避免把静止附近的位置差分噪声误判为可快速施加的新力矩。请求只是在非耗散条件
+下换符号时，先用 release rate 把旧力矩撤到零，新方向的加力仍回到慢 rise rate。未传入该
+参数时，它严格等于 rise rate，输出与历史对称 slew 行为一致。
+
+这不是第二套限幅器：实现仍复用现有 `condition_torque()`，只是为每个关节选择 conditioner
+目标和 rate。原有 assist 绝对力矩上限、最终总力矩包络、速度/加速度和 Cartesian 位移/姿态
+guard 均保持不变。每帧审计新增 `conditioning_target_joint_torque_nm`、
+`joint_torque_slew_mode` 和 `joint_torque_selected_rate_nm_s`，必须结合
+`authority_joint_torque_overlay_nm` 与最终 `joint_torque_overlay_nm` 判断制动是否及时；不能通过
+提高所有方向的 rise rate 来掩盖旧力矩撤销迟滞。
 
 ### P4.3 当前末端 SE(3) 锚定的低增益位姿阻抗（操作者手动运行）
 
