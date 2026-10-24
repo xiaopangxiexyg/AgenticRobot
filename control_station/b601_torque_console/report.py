@@ -345,6 +345,8 @@ def main(argv: list[str] | None = None) -> int:
     mode.add_argument("--organize-identification", action="store_true", help="organize retained automatic reports without reading or rewriting raw traces")
     mode.add_argument("--closed-loop-identification", action="store_true",
         help="reprocess a closed continuous run with time-integrated dispatched inputs; no device I/O or automatic application")
+    parser.add_argument("--position-bin-width-rad", type=float,
+        help="with --closed-loop-identification, reduce complete measured-position cells instead of time windows")
     parser.add_argument("--include-run-dir", type=Path, action="append", default=[],
         help="additional closed run for --organize-identification; conditions remain separate")
     parser.add_argument("--pair-pose-tolerance-rad", type=float, default=0.03)
@@ -352,6 +354,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.include_run_dir and not args.organize_identification:
             raise ValueError("--include-run-dir requires --organize-identification")
+        if args.position_bin_width_rad is not None and not args.closed_loop_identification:
+            raise ValueError("--position-bin-width-rad requires --closed-loop-identification")
         if args.organize_identification:
             from .workspace_identification import organize_automatic_reports
 
@@ -387,7 +391,7 @@ def main(argv: list[str] | None = None) -> int:
                     digest.update(block)
             report = workspace_identification.summarize_workspace_identification(_jsonl(trace),
                 condition=condition, workspace=workspace,
-                reduction_method="closed_loop_average")
+                reduction_method="closed_loop_average", position_bin_width_rad=args.position_bin_width_rad)
             after = trace.stat()
             if ((before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
                 != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
@@ -452,7 +456,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.closed_loop_identification:
         print(f"[B601-REPORT] windows={len(report['windows'])} admitted={report['admitted_motion_windows']} "
               f"candidates={report['running_resistance']['offline_candidates']} "
-              f"gravity={report['gravity_fit']['status']}; offline command evidence only; no compensation applied")
+              f"gravity={report['gravity_fit']['status']} "
+              f"paired_resistance={report['paired_resistance_fit']['status']}; "
+              "offline command evidence only; no compensation applied")
         return 0
     if args.organize_identification:
         print(f"[B601-REPORT] runs={report['run_count']} observations={report['record_count']}; no source changed or compensation applied")

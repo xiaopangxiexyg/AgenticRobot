@@ -22,7 +22,8 @@ from control_station.b601_torque_console.workspace_identification import (
     summarize_workspace_identification,
 )
 from robot_motion.rebot_b601_rs.gravity_identification import (
-    fit_paired_gravity_command, pair_motion_observations, solve_gravity_design,
+    fit_paired_gravity_command, fit_paired_resistance_command,
+    pair_motion_observations, solve_gravity_design, summarize_pairing_coverage,
 )
 from robot_motion.rebot_b601_rs.mit import B601_RS_JOINT_MIT_FRAME
 from scripts.hardware import rebot_b601_rs_low_gain_probe as probe
@@ -138,6 +139,7 @@ def test_paired_gravity_fit_reuses_scale_bias_solver_but_does_not_claim_physical
         assert profile["gravity_joint_scales"][j] == train[0].condition.gravity_joint_scales[j]
         assert profile["gravity_joint_bias_nm"][j] == train[0].condition.gravity_joint_bias_nm[j]
     assert result["validation_rmse_nm"] < 1e-10
+    assert result["validation_rmse_nm"] < result["zero_correction_validation_rmse_nm"]
     assert not result["auto_apply"] and not result["identifies_unique_physical_gravity"]
     for pair in result["training_pairs"]:
         assert pair["maximum_pose_mismatch_rad"] == 0
@@ -152,6 +154,53 @@ def test_one_sided_mismatched_pose_and_leaked_trials_cannot_be_gravity_labels():
     assert result["reasons"] == ["whole_trial_validation_leakage"]
     result = fit_paired_gravity_command(train, [replace(o, command_residual_nm=o.command_residual_nm+.2) for o in valid])
     assert result["status"] == "VALIDATION_FAILED"
+    outside = [replace(o, qpos_rad=tuple(q+.02 for q in o.qpos_rad)) for o in valid]
+    result = fit_paired_gravity_command(train, outside)
+    assert result["reasons"] == ["validation_outside_training_pose_coverage"]
+    assert result["covered_validation_pairs"] == 0
+    assert result["outside_coverage_predictions_are_extrapolation"]
+    assert "validation_rmse_nm" in result and not result["auto_apply"]
+
+
+def test_paired_odd_resistance_uses_real_pairs_and_independent_speed_load_validation():
+    train, valid = paired_observations()
+    result = fit_paired_resistance_command(train, valid)
+    assert result["status"] == "OFFLINE_CANDIDATE"
+    assert not result["auto_apply"] and not result["identifies_physical_friction"]
+    for fit in result["fits"]:
+        assert fit["status"] == "OFFLINE_CANDIDATE", fit["reasons"]
+        assert fit["reference_speed_rad_s"] == pytest.approx(.009)
+        assert fit["reference_abs_gravity_command_nm"] == pytest.approx(4)
+        assert fit["coefficients"] == pytest.approx([.256, 4, .025])
+        assert fit["validation_rmse_nm"] < 1e-10
+        assert fit["validation_rmse_nm"] < fit["zero_correction_validation_rmse_nm"]
+        assert fit["covered_validation_pairs"] == fit["validation_pairs"]
+    bad = [replace(o, command_residual_nm=o.command_residual_nm+math.copysign(.2, o.velocity_rad_s)) for o in valid]
+    assert all(f["status"] == "VALIDATION_FAILED" for f in fit_paired_resistance_command(train, bad)["fits"])
+    assert fit_paired_resistance_command(train, [train[0], *valid])["reasons"] == ["whole_trial_validation_leakage"]
+    outside_speed = [replace(o, velocity_rad_s=3*o.velocity_rad_s) for o in valid]
+    for fit in fit_paired_resistance_command(train, outside_speed)["fits"]:
+        assert fit["status"] == "INSUFFICIENT_DATA"
+        assert fit["covered_validation_pairs"] == 0
+        assert fit["validation_rmse_nm"] > 0
+    changed = [replace(o, condition=condition(run_id="other")) for o in valid]
+    assert fit_paired_resistance_command(train, changed)["reasons"] == ["mixed_gravity_source_or_active_damping"]
+    one_way = [o for o in train if o.velocity_rad_s > 0]
+    assert all(f["status"] == "INSUFFICIENT_DATA" for f in fit_paired_resistance_command(one_way, valid)["fits"])
+
+
+def test_pairing_coverage_distinguishes_pose_from_actual_speed_without_using_commands():
+    train, _ = observations(joint="joint3")
+    a = train[0]
+    b = replace(a, trial_id="opposite", velocity_rad_s=-a.velocity_rad_s*2)
+    group = summarize_pairing_coverage([a, b])["groups"][0]
+    assert group["pose_matched_combinations"] == 1
+    assert group["speed_matched_combinations"] == 0
+    assert group["matched_disjoint_pairs"] == 0 and group["unmatched_windows"] == 2
+    assert group["closest_pose_examples"][0]["speed_magnitude_ratio"] == 2
+    b = replace(b, velocity_rad_s=-a.velocity_rad_s, qpos_rad=(.9,)*6)
+    group = summarize_pairing_coverage([a, b])["groups"][0]
+    assert group["pose_matched_combinations"] == 0 and group["speed_matched_combinations"] == 1
 
 
 def test_shared_gravity_solver_preserves_scale_bias_and_payload_constraints():
@@ -217,6 +266,58 @@ def test_streaming_previous_dispatch_windows_feed_both_existing_fits_and_survive
     assert result["later_stop_invalidates_completed_windows"] is False
     assert result["running_resistance"]["retained_partial_leg_windows"] > 0
     assert all(w["input_receipt_sequence_end"] > w["input_receipt_sequence_start"] for w in result["windows"])
+
+
+def test_position_cells_reduce_complete_measured_traversals_with_original_receipt_admission():
+    rows, context = motion_records()
+    result = summarize_workspace_identification(rows, condition=asdict(context), workspace={},
+        reduction_method="closed_loop_average", position_bin_width_rad=.0045)
+    admitted = [w for w in result["windows"] if w["model_eligible"]]
+    assert len(admitted) > 100
+    assert not result["settings"]["minimum_duration_gate_applied"]
+    assert all(w["complete_position_traversal"] for w in admitted)
+    for w in admitted:
+        j = int(w["joint_name"][-1])-1
+        lo, hi = w["position_bin_bounds_rad"]
+        assert lo-1e-12 <= w["qpos_min_rad"][j] <= w["qpos_max_rad"][j] < hi+1e-12
+        assert w["input_receipt_sequence_start"] < w["input_receipt_sequence_end"]
+    assert result["gravity_fit"]["status"] == "OFFLINE_CANDIDATE", result["gravity_fit"]["reasons"]
+    assert result["paired_resistance_fit"]["status"] == "OFFLINE_CANDIDATE"
+    assert all(g["matched_disjoint_pairs"] > 0 for g in result["pairing_coverage"]["validation"]["groups"])
+
+
+def test_position_tail_without_an_exit_never_becomes_a_complete_pairing_window():
+    rows, context = motion_records()
+    short = []
+    for row in rows:
+        short.append(row)
+        if row.get("kind") == "active_dispatch" and row["qpos_rad"][1] <= .114:
+            break
+    result = summarize_workspace_identification(short, condition=asdict(context), workspace={},
+        reduction_method="closed_loop_average", position_bin_width_rad=.0045)
+    assert result["windows"]
+    assert result["admitted_motion_windows"] == 0
+    assert all(not w["complete_position_traversal"] for w in result["windows"])
+    assert result["rejected"]["partial_position_bin_not_for_pairing"] > 0
+
+
+def test_entering_and_leaving_the_same_cell_edge_is_not_a_full_position_traversal():
+    rows, context = motion_records()
+    active = [r for r in rows if r["kind"] == "active_dispatch"][:220]
+    for i, row in enumerate(active):
+        row["qpos_rad"][1] = .118-.00004*i if i <= 100 else .114+.00004*min(i-100, 100)
+    result = summarize_workspace_identification(active, condition=asdict(context), workspace={},
+        reduction_method="closed_loop_average", position_bin_width_rad=.0045)
+    assert result["windows"]
+    assert all(not w["complete_position_traversal"] for w in result["windows"])
+    assert result["admitted_motion_windows"] == 0
+
+
+@pytest.mark.parametrize("width", [0, -.01, .002, float("nan"), float("inf"), True])
+def test_position_window_configuration_rejects_unresolved_or_invalid_bins(width):
+    with pytest.raises(ValueError, match="position bins require"):
+        summarize_workspace_identification([], condition=asdict(condition()), workspace={},
+            reduction_method="closed_loop_average", position_bin_width_rad=width)
 
 
 @pytest.mark.parametrize("method", ["quasisteady", "closed_loop_average"])
@@ -301,7 +402,8 @@ def test_changing_closed_loop_commands_can_be_observed_without_weakening_admissi
                     if w["joint_name"] == joint and w["role"] == role} == {-1, 1}
 
 
-def test_closed_loop_cli_preserves_sources_and_exposes_independent_reprocessing(tmp_path):
+@pytest.mark.parametrize("width", [None, .0045])
+def test_closed_loop_cli_preserves_sources_and_exposes_independent_reprocessing(tmp_path, width):
     from control_station.b601_torque_console.report import main
     rows, context = motion_records()
     trace = tmp_path/"b601_owner.debug.jsonl"
@@ -311,8 +413,11 @@ def test_closed_loop_cli_preserves_sources_and_exposes_independent_reprocessing(
         "batch_state": "failed", "acquisition_complete": False,
         "condition": asdict(context), "workspace": {"holding_sampling_plan": "identification"}}))
     original = (trace.read_bytes(), source.read_bytes())
-    assert main(["--run-dir", str(tmp_path), "--closed-loop-identification",
-                 "--output-root", str(tmp_path/"derived")]) == 0
+    command = ["--run-dir", str(tmp_path), "--closed-loop-identification",
+               "--output-root", str(tmp_path/"derived")]
+    if width is not None:
+        command += ["--position-bin-width-rad", str(width)]
+    assert main(command) == 0
     report = json.loads(next((tmp_path/"derived").glob("*/report.json")).read_text())
     assert report["source_batch_state"] == "failed"
     assert not report["source_acquisition_complete"]
@@ -320,6 +425,8 @@ def test_closed_loop_cli_preserves_sources_and_exposes_independent_reprocessing(
     assert report["source_report_sha256"] == hashlib.sha256(original[1]).hexdigest()
     assert report["running_resistance"]["offline_candidates"] == 2
     assert (trace.read_bytes(), source.read_bytes()) == original
+    assert report["settings"]["position_bin_width_rad"] == width
+    assert main(["--run-dir", str(tmp_path), "--position-bin-width-rad", ".0045"]) == 2
     source.write_text(json.dumps({"schema": "b601.automatic-calibration-report.v1",
         "batch_state": "moving", "workspace": {"holding_sampling_plan": "identification"}}))
     assert main(["--run-dir", str(tmp_path), "--closed-loop-identification"]) == 2
@@ -348,8 +455,14 @@ def test_automatic_report_wires_continuous_fits_and_keeps_later_stop_separate(tm
 
 
 @pytest.mark.parametrize("method", ["quasisteady", "closed_loop_average"])
+@pytest.mark.parametrize("width", [None, .0045])
 @pytest.mark.parametrize("fault", ["holding", "receipt", "future", "kp", "human", "saturation", "startup"])
-def test_motion_admission_never_fits_unproven_context(fault, method):
+def test_motion_admission_never_fits_unproven_context(fault, method, width):
+    if width is not None and method == "quasisteady":
+        with pytest.raises(ValueError, match="position bins require"):
+            summarize_workspace_identification([], condition=asdict(condition()), workspace={},
+                reduction_method=method, position_bin_width_rad=width)
+        return
     rows, context = motion_records()
     rows = rows[:200]
     for row in rows:
@@ -363,7 +476,7 @@ def test_motion_admission_never_fits_unproven_context(fault, method):
         elif fault == "saturation": row["overlay_limited"] = True
         elif fault == "startup": row["gravity_ramp_fraction"] = .5
     result = summarize_workspace_identification(rows, condition=asdict(context), workspace={"acquisitions": []},
-                                               reduction_method=method)
+                                               reduction_method=method, position_bin_width_rad=width)
     assert result["admitted_motion_windows"] == 0
     assert result["gravity_fit"]["status"] == "INSUFFICIENT_DATA"
     assert result["rejected"]

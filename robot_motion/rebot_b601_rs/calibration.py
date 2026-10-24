@@ -205,15 +205,23 @@ def reduce_command_window(
     displacement = float(q[-1, j] - q[0, j])
     if abs(displacement) < minimum_motion_rad:
         return None, "insufficient_motion_not_zero_friction"
-    velocity = B601WindowVelocityEstimator(float(times[-1] - times[0]))
-    speed = 0.0
-    for t, position in zip(times, q[:, j]):
-        speed = velocity.update(
-            timestamp_sec=float(t), qpos_rad=float(position), fallback_rad_s=0.0
-        )
-    if not velocity.ready:
-        return None, "velocity_window_not_complete"
-    centered_time = times - times.mean()
+    if reduction_method == "closed_loop_average":
+        # A complete offline interval may exceed the online estimator's
+        # 256-frame history. Fit all admitted samples without truncating it.
+        local_time = times-times[0]
+        centered_time = local_time-local_time.mean()
+        local_q = q[:, j]-q[0, j]
+        speed = float(np.dot(centered_time, local_q-local_q.mean())/np.dot(centered_time, centered_time))
+    else:
+        velocity = B601WindowVelocityEstimator(float(times[-1] - times[0]))
+        speed = 0.0
+        for t, position in zip(times, q[:, j]):
+            speed = velocity.update(
+                timestamp_sec=float(t), qpos_rad=float(position), fallback_rad_s=0.0
+            )
+        if not velocity.ready:
+            return None, "velocity_window_not_complete"
+        centered_time = times - times.mean()
     deviation = q[:, j] - q[:, j].mean() - speed * centered_time
     if (
         speed * displacement <= 0

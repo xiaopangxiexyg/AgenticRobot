@@ -201,6 +201,24 @@ def test_closed_loop_window_uses_integrated_input_and_displacement_not_frame_med
         assert reduce_command_window(**changed)[1] == why
 
 
+def test_offline_closed_loop_interval_is_not_truncated_by_online_256_sample_history():
+    zero = (0.0,)*6
+    times = [1e6+i*.01 for i in range(401)]
+    args = {"condition": condition(), "joint_name": "joint3", "trial_id": "long-cruise",
+        "times_sec": times, "qpos_rad": [(0, 0, .003*(t-times[0]), 0, 0, 0) for t in times],
+        "gravity_command_nm": [zero]*len(times),
+        "conditioned_command_nm": [(0, 0, .1, 0, 0, 0)]*len(times),
+        "driver_kd_nm_s_per_rad": [zero]*len(times), "minimum_motion_rad": .002,
+        "maximum_line_error_rad": .0008, "maximum_residual_span_nm": .15}
+    assert reduce_command_window(**args)[1] == "velocity_window_not_complete"
+    observation, reason = reduce_command_window(**args, reduction_method="closed_loop_average",
+        interval_command_integrals_nm_sec=[(0, 0, .1*(b-a), 0, 0, 0) for a, b in zip(times, times[1:])],
+        interval_gravity_integrals_nm_sec=[zero]*(len(times)-1))
+    assert reason is None
+    assert observation.velocity_rad_s == pytest.approx(.003)
+    assert observation.command_residual_nm == pytest.approx(.1)
+
+
 def test_one_speed_or_one_direction_does_not_identify_friction_parameters():
     train, valid = observations()
     fixed_speed = [

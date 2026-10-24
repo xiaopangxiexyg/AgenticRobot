@@ -15,7 +15,11 @@ from robot_motion.rebot_b601_rs.calibration import (
     reduce_command_window,
     six,
 )
-from robot_motion.rebot_b601_rs.gravity_identification import fit_paired_gravity_command
+from robot_motion.rebot_b601_rs.gravity_identification import (
+    fit_paired_gravity_command,
+    fit_paired_resistance_command,
+    summarize_pairing_coverage,
+)
 
 from .calibration_session import calibration_receipt_rejection
 
@@ -183,7 +187,7 @@ def _dispatch_integrals(commands, start, end):
 
 
 def summarize_workspace_identification(records, *, condition, workspace,
-                                       reduction_method="quasisteady"):
+                                       reduction_method="quasisteady", position_bin_width_rad=None):
     """Admit response windows, then reuse the existing resistance/gravity fits.
 
     A sample uses the latest complete dispatch preceding that joint's host
@@ -193,6 +197,11 @@ def summarize_workspace_identification(records, *, condition, workspace,
     """
     if reduction_method not in {"quasisteady", "closed_loop_average"}:
         raise ValueError("unknown command window reduction method")
+    if position_bin_width_rad is not None and (
+            reduction_method != "closed_loop_average" or isinstance(position_bin_width_rad, bool)
+            or not isinstance(position_bin_width_rad, (float, int))
+            or not math.isfinite(position_bin_width_rad) or position_bin_width_rad <= .002):
+        raise ValueError("position bins require closed-loop averaging and width greater than minimum motion .002 rad")
     condition = CalibrationCondition.from_mapping(condition, run_id=condition["run_id"])
     completed = {leg["trial_id"] for stage in workspace.get("acquisitions", [])
                  for leg in stage["result"].get("completed_legs", [])}
@@ -205,14 +214,17 @@ def summarize_workspace_identification(records, *, condition, workspace,
     settings = {"minimum_window_sec": .6, "maximum_window_sec": 2.0,
         "maximum_feedback_gap_sec": .04, "minimum_motion_rad": .002,
         "maximum_line_error_rad": .0008, "maximum_residual_span_nm": .15,
-        "residual_span_is_admission_gate": reduction_method == "quasisteady"}
+        "residual_span_is_admission_gate": reduction_method == "quasisteady",
+        "window_basis": "position" if position_bin_width_rad is not None else "time",
+        "position_bin_width_rad": position_bin_width_rad,
+        "minimum_duration_gate_applied": position_bin_width_rad is None}
 
-    def flush(force=False):
+    def flush(force=False, position_exit=False):
         if len(buffer) < 3:
             buffer.clear()
             return
         duration = buffer[-1]["time"]-buffer[0]["time"]
-        if duration < settings["minimum_window_sec"]:
+        if position_bin_width_rad is None and duration < settings["minimum_window_sec"]:
             rejected["short_interval_at_boundary"] += 1
             buffer.clear()
             return
@@ -234,6 +246,11 @@ def summarize_workspace_identification(records, *, condition, workspace,
         if (not force and reason == "insufficient_motion_not_zero_friction"
             and duration < settings["maximum_window_sec"]):
             return
+        kinematic_reason = reason
+        if position_bin_width_rad is not None and (not first["position_entry"] or not position_exit):
+            # Retain partial boundary intervals, but do not label a tail or
+            # interrupted cell as a complete position traversal.
+            observation, reason = None, "partial_position_bin_not_for_pairing"
         record = {"joint_name": first["joint"], "pose_index": first["pose"],
             "trial_id": first["trial"], "role": first["role"],
             "reference_speed_rad_s": first["speed"], "start_sec": first["time"],
@@ -242,6 +259,12 @@ def summarize_workspace_identification(records, *, condition, workspace,
             "input_receipt_sequence_start": first["input_sequence"],
             "input_receipt_sequence_end": last["input_sequence"],
             "model_eligible": reason is None, "exclusion_reason": reason}
+        if position_bin_width_rad is not None:
+            cell = first["position_cell"]
+            record.update(position_bin_index=cell,
+                position_bin_bounds_rad=[cell*position_bin_width_rad, (cell+1)*position_bin_width_rad],
+                complete_position_traversal=first["position_entry"] and position_exit,
+                kinematic_exclusion_reason=kinematic_reason)
         j = int(first["joint"][-1])-1
         residual = [r["command"][j]-r["gravity"][j] for r in buffer]
         record.update(qpos_start_rad=first["q"], qpos_end_rad=last["q"],
@@ -355,6 +378,14 @@ def summarize_workspace_identification(records, *, condition, workspace,
                 commands.clear()
             else:
                 marker = row["torque_console"]["calibration_trial"]
+                cell, entry_direction = None, 0
+                if position_bin_width_rad is not None:
+                    j = int(key[1][-1])-1
+                    cell = math.floor(six(row["qpos_rad"], "qpos_rad")[j]/position_bin_width_rad)
+                    previous_cell = math.floor(commands[-1]["qpos_rad"][j]/position_bin_width_rad)
+                    entry_direction = cell-previous_cell if abs(cell-previous_cell) == 1 else 0
+                    if buffer and cell != buffer[0]["position_cell"]:
+                        flush(force=True, position_exit=cell-buffer[0]["position_cell"] == buffer[0]["position_entry_direction"])
                 integral = (_dispatch_integrals(commands, buffer[-1]["time"], stamp)
                     if buffer and reduction_method == "closed_loop_average" else (None, None))
                 buffer.append({"time": stamp, "q": row["qpos_rad"],
@@ -362,15 +393,18 @@ def summarize_workspace_identification(records, *, condition, workspace,
                     "kd": prior["vendor_kd_nm_s_per_rad"], "input_sequence": prior["dispatch_receipt"]["sequence"],
                     "pose": key[0], "joint": key[1], "trial": key[2], "role": key[3],
                     "speed": marker.get("reference_speed_rad_s"),
+                    "position_cell": cell, "position_entry": bool(entry_direction),
+                    "position_entry_direction": entry_direction,
                     "command_integral": integral[0], "gravity_integral": integral[1]})
-                if buffer[-1]["time"]-buffer[0]["time"] >= settings["minimum_window_sec"]:
+                if (position_bin_width_rad is None
+                    and buffer[-1]["time"]-buffer[0]["time"] >= settings["minimum_window_sec"]):
                     flush()
         commands.append(row)
     flush(force=True)
     groups = defaultdict(list)
     for pose, role, observation in observations:
         groups[(pose, observation.joint_name, observation.active_driver_kd_nm_s_per_rad)].append((role, observation))
-    fits = []
+    fits, paired_models = [], []
     for (pose, joint, kd), group in sorted(groups.items()):
         fit = fit_local_command_model([o for role, o in group if role == "training"],
             [o for role, o in group if role == "validation"])
@@ -382,6 +416,11 @@ def summarize_workspace_identification(records, *, condition, workspace,
                 local_repeat_prediction=_local_repeat_prediction(
                 [o for role, o in group if role == "training"],
                 [o for role, o in group if role == "validation"]))
+            paired_models.append({"pose_index": pose, "joint_name": joint,
+                "active_driver_kd_nm_s_per_rad": kd,
+                "analysis": fit_paired_resistance_command(
+                    [o for role, o in group if role == "training"],
+                    [o for role, o in group if role == "validation"])})
         fits.append(item)
     gravity = fit_paired_gravity_command(
         [o for _, role, o in observations if role == "training"],
@@ -398,7 +437,7 @@ def summarize_workspace_identification(records, *, condition, workspace,
         "cruise_diagnostic_semantics": "half-speed ratio <= 1.25 is diagnostic only, not proof of zero inertia",
         "retained_partial_leg_windows": sum(w["model_eligible"] and not w["source_leg_completed"] for w in windows),
         "fits": fits, "auto_apply": False}
-    return {"schema": "b601.workspace-command-identification.v1", "auto_apply": False,
+    result = {"schema": "b601.workspace-command-identification.v1", "auto_apply": False,
         "reduction_method": reduction_method,
         "quantity": "software_command_not_measured_output_torque",
         "condition": asdict(condition), "settings": settings, "windows": windows,
@@ -414,3 +453,15 @@ def summarize_workspace_identification(records, *, condition, workspace,
             for w in windows if w["model_eligible"])),
         "motor_damping_semantics": "fixed active Kd is a fit condition; never subtract an unmeasured physical damping torque",
         "later_stop_invalidates_completed_windows": False}
+    if reduction_method == "closed_loop_average":
+        training = [o for _, role, o in observations if role == "training"]
+        validation = [o for _, role, o in observations if role == "validation"]
+        candidates = sum(f["status"] == "OFFLINE_CANDIDATE"
+            for group in paired_models for f in group["analysis"]["fits"])
+        result.update(paired_resistance_fit={"status": "OFFLINE_CANDIDATE" if candidates else "NOT_READY",
+            "offline_candidates": candidates, "auto_apply": False, "hardware_approved": False,
+            "quantity": "paired_odd_software_command_residual", "scope": "separate_local_pose_and_fixed_damping_regions",
+            "fits": paired_models},
+            pairing_coverage={role: summarize_pairing_coverage(subset)
+                for role, subset in (("training", training), ("validation", validation))})
+    return result
