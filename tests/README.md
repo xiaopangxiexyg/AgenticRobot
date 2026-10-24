@@ -122,6 +122,13 @@ neither net line reductions nor test-count quotas are acceptance criteria.
 
 ### 同输入仿真与模型构建去重
 
+MJCF 的 `MeshAssetRegistry` 在一次转换内为同一路径复用 OBJ/MTL 视觉材质解析结果，
+避免左右臂重复解析同一组网格。注册器由每次 `convert_urdf_to_mjcf_xml` 新建，
+下一次转换会重新读取 OBJ、MTL 以及此前缺失的材质输入；不会复用 MuJoCo 模型或状态。
+每次视觉调用仍构建独立属性字典、检查源网格存在，碰撞网格继续独立注册原始文件。
+既有材质分区测试同时覆盖重复视觉的颜色、位置、属性隔离和原始碰撞网格，
+新增参数用例检查跨转换输入更新，包含缺失材质库恢复。原有物理闭环与安全矩阵保持完整。
+
 `test_mujoco_trajectory_composition_publication.py` 在同一真实 MuJoCo session 中
 先验证 `residual_effective_until == target_effective_at` 的到期拒绝，再以相同
 producer sequence 0 验证有效发布。拒绝发生在输入登记前；显式检查 editor hash、

@@ -10,6 +10,8 @@ from sim.mujoco.backend import MuJoCoGripperBackend, MuJoCoGripperBackendConfig
 from sim.mujoco.config import CameraMount, GripperSpec
 from sim.mujoco.controllers import GripperController
 from sim.mujoco.mjcf import convert_urdf_to_mjcf_xml
+from sim.mujoco.modeling import geometry as modeling_geometry
+from sim.mujoco.modeling.geometry import MeshAssetRegistry
 from sim.mujoco.modeling.obj_materials import obj_material_mesh_parts
 from sim.mujoco.run_control import build_arg_parser, run
 from sim.mujoco.scene import MujocoScene
@@ -122,7 +124,10 @@ def test_mjcf_conversion_preserves_prismatic_joint_limits(tmp_path: Path) -> Non
 
 
 @pytest.mark.integration
-def test_mjcf_conversion_splits_obj_mtl_visual_meshes_by_diffuse_color(tmp_path: Path) -> None:
+def test_mjcf_conversion_splits_obj_mtl_visual_meshes_by_diffuse_color(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     obj_path = tmp_path / "colored.obj"
     mtl_path = tmp_path / "colored.mtl"
     urdf_path = tmp_path / "colored.urdf"
@@ -157,13 +162,22 @@ f 1 3 4
 <robot name="colored">
   <link name="base">
     <visual><geometry><mesh filename="colored.obj"/></geometry></visual>
+    <visual><origin xyz="0.1 0 0"/><geometry><mesh filename="colored.obj"/></geometry></visual>
   </link>
 </robot>
 """,
         encoding="utf-8",
     )
 
-    root = ET.fromstring(convert_urdf_to_mjcf_xml(parse_urdf(urdf_path), camera_mounts=()))
+    resolved_sources = []
+
+    def resolve_parts(path):
+        resolved_sources.append(path)
+        return obj_material_mesh_parts(path)
+
+    monkeypatch.setattr(modeling_geometry, "obj_material_mesh_parts", resolve_parts)
+    model = parse_urdf(urdf_path)
+    root = ET.fromstring(convert_urdf_to_mjcf_xml(model, camera_mounts=()))
     red = root.find(".//geom[@name='base_visual_0__red']")
     blue = root.find(".//geom[@name='base_visual_0__blue']")
     assert red is not None
@@ -173,6 +187,69 @@ f 1 3 4
     mesh_paths = [element.attrib["file"] for element in root.findall("./asset/mesh")]
     assert len(mesh_paths) == 2
     assert all("dexteleop_mujoco_obj_materials_v1" in path for path in mesh_paths)
+    assert resolved_sources == [obj_path]
+    repeated_red = root.find(".//geom[@name='base_visual_1__red']")
+    repeated_blue = root.find(".//geom[@name='base_visual_1__blue']")
+    assert repeated_red is not None and repeated_blue is not None
+    assert repeated_red.attrib["rgba"] == red.attrib["rgba"]
+    assert repeated_blue.attrib["rgba"] == blue.attrib["rgba"]
+    assert repeated_red.attrib["pos"] == repeated_blue.attrib["pos"] == "0.1 0 0"
+
+    asset = ET.Element("asset")
+    registry = MeshAssetRegistry(asset, model)
+    mesh_geometry = model.links["base"].visuals[0].geometry
+    first_parts = registry.visual_geom_parts(mesh_geometry)
+    second_parts = registry.visual_geom_parts(mesh_geometry)
+    assert first_parts == second_parts
+    assert first_parts[0].attributes is not second_parts[0].attributes
+    assert resolved_sources == [obj_path, obj_path]
+    collision = registry.geom_attributes(mesh_geometry)
+    collision_mesh = asset.find(f"mesh[@name='{collision['mesh']}']")
+    assert collision_mesh is not None
+    assert collision_mesh.attrib["file"] == str(obj_path)
+    assert "inertia" not in collision_mesh.attrib
+    obj_path.unlink()
+    with pytest.raises(FileNotFoundError, match="URDF mesh not found"):
+        registry.visual_geom_parts(mesh_geometry)
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("changed_input", ("obj", "mtl", "missing_mtl"))
+def test_new_mjcf_conversion_rereads_visual_material_inputs(
+    tmp_path: Path,
+    changed_input: str,
+) -> None:
+    obj_path = tmp_path / "part.obj"
+    mtl_path = tmp_path / "part.mtl"
+    obj_text = (
+        "mtllib part.mtl\nv 0 0 0\nv 1 0 0\nv 0 1 0\n"
+        "usemtl red\nf 1 2 3\n"
+    )
+    mtl_text = "newmtl red\nKd 1 0 0\nnewmtl green\nKd 0 1 0\n"
+    obj_path.write_text(obj_text, encoding="utf-8")
+    if changed_input != "missing_mtl":
+        mtl_path.write_text(mtl_text, encoding="utf-8")
+    urdf_path = tmp_path / "part.urdf"
+    urdf_path.write_text(
+        '<robot name="part"><link name="base">'
+        '<visual><geometry><mesh filename="part.obj"/></geometry></visual>'
+        '<visual><geometry><mesh filename="part.obj"/></geometry></visual>'
+        '</link></robot>',
+        encoding="utf-8",
+    )
+    model = parse_urdf(urdf_path)
+    first_xml = convert_urdf_to_mjcf_xml(model, camera_mounts=())
+
+    if changed_input == "obj":
+        obj_path.write_text(obj_text.replace("usemtl red", "usemtl green"), encoding="utf-8")
+    else:
+        mtl_path.write_text(mtl_text.replace("Kd 1 0 0", "Kd 0 1 0"), encoding="utf-8")
+
+    second_xml = convert_urdf_to_mjcf_xml(model, camera_mounts=())
+    assert first_xml != second_xml
+    assert [
+        geom.attrib["rgba"] for geom in ET.fromstring(second_xml).findall(".//geom")
+    ] == ["0 1 0 1", "0 1 0 1"]
 
 
 @pytest.mark.integration
