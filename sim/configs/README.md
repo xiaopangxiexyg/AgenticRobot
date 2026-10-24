@@ -15,6 +15,13 @@ Current profiles:
 
 ## Scene expansion for manipulation tasks
 
+The opt-in [Skill scene suite](../../docs/sim/SKILL_SCENE_SUITE.md) provides
+13 layouts with three fixed variants, materialized through the existing scene
+and task loaders. It separates public language tasks from evaluation-only data;
+its placement tasks remain pending physical-contact/payload acceptance.
+These fixture manifests live in `scene_suites/`; generated scene files are
+complete `SimulationContract` values consumed by the ordinary loaders.
+
 Scene contracts remain shared by MuJoCo tasks and robot-facing adapters;
 task-specific geometry must not be hidden in Agent prompts or renderer code.
 

@@ -1,0 +1,1348 @@
+{
+  "name": "rm65_dmtac_skill_scene_suite_v1",
+  "base_task": "sim/configs/tasks/rm65_right_dmtacm_blue_cube_70mm_agent_v1.json",
+  "variants_xy_m": [
+    [
+      0,
+      0
+    ],
+    [
+      -0.02,
+      0.015
+    ],
+    [
+      0.015,
+      -0.02
+    ]
+  ],
+  "parameter_provenance": "Synthetic primitive fixtures; contact tuple inherited from the unchanged source scene, not measured material parameters.",
+  "ycb_proxy_provenance": "Four previously audited YCB dimensions/masses, visual meshes not required or automatically bound. Proxy geometry does not reproduce scanned appearance.",
+  "prototypes": {
+    "blue_cube": {
+      "shape": "box",
+      "size_m": [
+        0.07,
+        0.07,
+        0.07
+      ],
+      "mass_kg": 0.08,
+      "rgba": [
+        0.08,
+        0.24,
+        0.9,
+        1
+      ]
+    },
+    "blue_small_cube": {
+      "shape": "box",
+      "size_m": [
+        0.035,
+        0.035,
+        0.035
+      ],
+      "mass_kg": 0.025,
+      "rgba": [
+        0.08,
+        0.24,
+        0.9,
+        1
+      ]
+    },
+    "blue_large_cube": {
+      "shape": "box",
+      "size_m": [
+        0.09,
+        0.09,
+        0.09
+      ],
+      "mass_kg": 0.14,
+      "rgba": [
+        0.08,
+        0.24,
+        0.9,
+        1
+      ]
+    },
+    "red_cube": {
+      "shape": "box",
+      "size_m": [
+        0.05,
+        0.05,
+        0.05
+      ],
+      "mass_kg": 0.06,
+      "rgba": [
+        0.82,
+        0.09,
+        0.1,
+        1
+      ]
+    },
+    "green_box": {
+      "shape": "box",
+      "size_m": [
+        0.075,
+        0.045,
+        0.055
+      ],
+      "mass_kg": 0.07,
+      "rgba": [
+        0.08,
+        0.62,
+        0.23,
+        1
+      ]
+    },
+    "dark_box": {
+      "shape": "box",
+      "size_m": [
+        0.07,
+        0.05,
+        0.04
+      ],
+      "mass_kg": 0.055,
+      "rgba": [
+        0.1,
+        0.1,
+        0.11,
+        1
+      ]
+    },
+    "red_cylinder": {
+      "shape": "cylinder",
+      "size_m": [
+        0.055,
+        0.055,
+        0.09
+      ],
+      "mass_kg": 0.07,
+      "rgba": [
+        0.82,
+        0.09,
+        0.1,
+        1
+      ]
+    },
+    "blue_cylinder": {
+      "shape": "cylinder",
+      "size_m": [
+        0.045,
+        0.045,
+        0.085
+      ],
+      "mass_kg": 0.055,
+      "rgba": [
+        0.08,
+        0.24,
+        0.9,
+        1
+      ]
+    },
+    "yellow_cylinder": {
+      "shape": "cylinder",
+      "size_m": [
+        0.05,
+        0.05,
+        0.06
+      ],
+      "mass_kg": 0.05,
+      "rgba": [
+        0.95,
+        0.77,
+        0.09,
+        1
+      ]
+    },
+    "white_sphere": {
+      "shape": "sphere",
+      "size_m": [
+        0.045,
+        0.045,
+        0.045
+      ],
+      "mass_kg": 0.035,
+      "rgba": [
+        0.9,
+        0.9,
+        0.87,
+        1
+      ]
+    },
+    "blue_sphere": {
+      "shape": "sphere",
+      "size_m": [
+        0.05,
+        0.05,
+        0.05
+      ],
+      "mass_kg": 0.04,
+      "rgba": [
+        0.08,
+        0.24,
+        0.9,
+        1
+      ]
+    },
+    "yellow_ellipsoid": {
+      "shape": "ellipsoid",
+      "size_m": [
+        0.065,
+        0.05,
+        0.045
+      ],
+      "mass_kg": 0.035,
+      "rgba": [
+        0.95,
+        0.77,
+        0.09,
+        1
+      ]
+    },
+    "green_bar": {
+      "shape": "box",
+      "size_m": [
+        0.16,
+        0.025,
+        0.03
+      ],
+      "mass_kg": 0.065,
+      "rgba": [
+        0.08,
+        0.62,
+        0.23,
+        1
+      ]
+    },
+    "tall_occluder": {
+      "shape": "box",
+      "size_m": [
+        0.08,
+        0.1,
+        0.14
+      ],
+      "mass_kg": 0.35,
+      "rgba": [
+        0.5,
+        0.5,
+        0.5,
+        1
+      ]
+    },
+    "corridor_barrier": {
+      "shape": "box",
+      "size_m": [
+        0.18,
+        0.045,
+        0.09
+      ],
+      "mass_kg": 0.35,
+      "rgba": [
+        0.5,
+        0.5,
+        0.5,
+        1
+      ]
+    },
+    "pedestal": {
+      "shape": "box",
+      "size_m": [
+        0.11,
+        0.13,
+        0.055
+      ],
+      "mass_kg": 0.3,
+      "rgba": [
+        0.5,
+        0.5,
+        0.5,
+        1
+      ]
+    },
+    "green_region": {
+      "shape": "box",
+      "size_m": [
+        0.14,
+        0.12,
+        0.004
+      ],
+      "mass_kg": 0.08,
+      "rgba": [
+        0.12,
+        0.68,
+        0.29,
+        1
+      ]
+    },
+    "yellow_region": {
+      "shape": "box",
+      "size_m": [
+        0.14,
+        0.12,
+        0.004
+      ],
+      "mass_kg": 0.08,
+      "rgba": [
+        0.97,
+        0.8,
+        0.15,
+        1
+      ]
+    },
+    "ycb_sugar_box": {
+      "shape": "box",
+      "size_m": [
+        0.044879,
+        0.096426,
+        0.176864
+      ],
+      "mass_kg": 0.514,
+      "rgba": [
+        0.88,
+        0.72,
+        0.22,
+        1
+      ]
+    },
+    "ycb_strawberry_proxy": {
+      "shape": "box",
+      "size_m": [
+        0.0449,
+        0.049048,
+        0.0537
+      ],
+      "mass_kg": 0.018,
+      "rgba": [
+        0.82,
+        0.09,
+        0.1,
+        1
+      ]
+    },
+    "ycb_golf_ball_proxy": {
+      "shape": "sphere",
+      "size_m": [
+        0.04968,
+        0.04968,
+        0.04968
+      ],
+      "mass_kg": 0.046,
+      "rgba": [
+        0.9,
+        0.9,
+        0.87,
+        1
+      ]
+    },
+    "ycb_lemon_proxy": {
+      "shape": "box",
+      "size_m": [
+        0.052568,
+        0.05726,
+        0.066177
+      ],
+      "mass_kg": 0.029,
+      "rgba": [
+        0.95,
+        0.77,
+        0.09,
+        1
+      ]
+    },
+    "high_support": {
+      "shape": "box",
+      "size_m": [
+        0.12,
+        0.14,
+        0.17
+      ],
+      "mass_kg": 0.45,
+      "rgba": [
+        0.5,
+        0.5,
+        0.5,
+        1
+      ]
+    }
+  },
+  "cases": [
+    {
+      "id": "shape_palette",
+      "focus": "blue_cube",
+      "objects": [
+        {
+          "name": "blue_cube",
+          "prototype": "blue_cube",
+          "xy_m": [
+            -0.3,
+            -0.18
+          ]
+        },
+        {
+          "name": "red_cylinder",
+          "prototype": "red_cylinder",
+          "xy_m": [
+            -0.3,
+            0
+          ]
+        },
+        {
+          "name": "white_sphere",
+          "prototype": "white_sphere",
+          "xy_m": [
+            -0.3,
+            0.18
+          ]
+        },
+        {
+          "name": "yellow_ellipsoid",
+          "prototype": "yellow_ellipsoid",
+          "xy_m": [
+            -0.46,
+            -0.18
+          ]
+        },
+        {
+          "name": "green_bar",
+          "prototype": "green_bar",
+          "xy_m": [
+            -0.46,
+            0
+          ]
+        },
+        {
+          "name": "dark_box",
+          "prototype": "dark_box",
+          "xy_m": [
+            -0.46,
+            0.18
+          ]
+        }
+      ],
+      "tasks": [
+        {
+          "id": "inspect",
+          "phase": "observation",
+          "instruction": "查看三个视角，区分蓝色方块、红色圆柱、白球、黄色椭球与绿色长条。报告哪些视角能看清它们。",
+          "evaluation": {
+            "kind": "identify",
+            "target": "blue_cube"
+          }
+        },
+        {
+          "id": "hover",
+          "phase": "safe_motion",
+          "instruction": "让右手 TCP 到达红色圆柱的实测可见顶面上方 8 cm，保持当前朝向。",
+          "evaluation": {
+            "kind": "measured_surface_hover",
+            "target": "red_cylinder",
+            "side": "right",
+            "offset_m": 0.08,
+            "preserve_orientation": true
+          }
+        },
+        {
+          "id": "compare_shapes",
+          "phase": "observation",
+          "instruction": "比较黄色椭球与白球的可见形状和尺寸；只报告图像与深度能够支持的差异。",
+          "evaluation": {
+            "kind": "compare",
+            "target": "yellow_ellipsoid",
+            "reference": "white_sphere"
+          }
+        }
+      ]
+    },
+    {
+      "id": "same_color_shapes",
+      "focus": "blue_sphere",
+      "objects": [
+        {
+          "name": "blue_sphere",
+          "prototype": "blue_sphere",
+          "xy_m": [
+            -0.3,
+            0
+          ]
+        },
+        {
+          "name": "blue_cube",
+          "prototype": "blue_cube",
+          "xy_m": [
+            -0.45,
+            -0.16
+          ]
+        },
+        {
+          "name": "blue_cylinder",
+          "prototype": "blue_cylinder",
+          "xy_m": [
+            -0.45,
+            0.16
+          ]
+        },
+        {
+          "name": "red_cube",
+          "prototype": "red_cube",
+          "xy_m": [
+            -0.3,
+            0.2
+          ]
+        }
+      ],
+      "tasks": [
+        {
+          "id": "inspect",
+          "phase": "observation",
+          "instruction": "找到蓝色球体，区分它与同色方块、同色圆柱；不要仅按颜色选择。",
+          "evaluation": {
+            "kind": "identify",
+            "target": "blue_sphere"
+          }
+        },
+        {
+          "id": "hover",
+          "phase": "safe_motion",
+          "instruction": "让右手 TCP 到达蓝色球体的实测可见表面上方 8 cm，保持当前朝向。",
+          "evaluation": {
+            "kind": "measured_surface_hover",
+            "target": "blue_sphere",
+            "side": "right",
+            "offset_m": 0.08,
+            "preserve_orientation": true
+          }
+        },
+        {
+          "id": "two_targets",
+          "phase": "safe_motion",
+          "instruction": "依次到达蓝色方块、蓝色圆柱各自实测可见顶面上方 8 cm，保持右手 TCP 当前朝向。",
+          "evaluation": {
+            "kind": "ordered_surface_hovers",
+            "target": "blue_cube",
+            "reference": "blue_cylinder",
+            "side": "right",
+            "offset_m": 0.08
+          }
+        }
+      ]
+    },
+    {
+      "id": "same_color_sizes",
+      "focus": "small_blue_cube",
+      "objects": [
+        {
+          "name": "small_blue_cube",
+          "prototype": "blue_small_cube",
+          "xy_m": [
+            -0.3,
+            0
+          ]
+        },
+        {
+          "name": "large_blue_cube",
+          "prototype": "blue_large_cube",
+          "xy_m": [
+            -0.46,
+            0.16
+          ]
+        },
+        {
+          "name": "medium_blue_cube",
+          "prototype": "blue_cube",
+          "xy_m": [
+            -0.45,
+            -0.17
+          ]
+        },
+        {
+          "name": "yellow_region",
+          "prototype": "yellow_region",
+          "xy_m": [
+            -0.3,
+            0.23
+          ]
+        }
+      ],
+      "tasks": [
+        {
+          "id": "inspect",
+          "phase": "observation",
+          "instruction": "比较三个蓝色方块，找到最小的一个，并说明选择依据。",
+          "evaluation": {
+            "kind": "identify",
+            "target": "small_blue_cube"
+          }
+        },
+        {
+          "id": "hover",
+          "phase": "safe_motion",
+          "instruction": "让右手 TCP 到达最小蓝色方块实测顶面上方 6 cm，保持当前朝向。",
+          "evaluation": {
+            "kind": "measured_surface_hover",
+            "target": "small_blue_cube",
+            "side": "right",
+            "offset_m": 0.06,
+            "preserve_orientation": true
+          }
+        },
+        {
+          "id": "place",
+          "phase": "payload_pending",
+          "instruction": "抓取最小蓝色方块，放到黄色平面区域中央并稳定释放。",
+          "evaluation": {
+            "kind": "stable_placement",
+            "target": "small_blue_cube",
+            "destination": "yellow_region",
+            "requires_payload_validation": true
+          }
+        }
+      ]
+    },
+    {
+      "id": "rotated_neighbors",
+      "focus": "red_cube",
+      "objects": [
+        {
+          "name": "red_cube",
+          "prototype": "red_cube",
+          "xy_m": [
+            -0.3,
+            0
+          ]
+        },
+        {
+          "name": "green_bar",
+          "prototype": "green_bar",
+          "xy_m": [
+            -0.46,
+            -0.17
+          ],
+          "yaw_deg": 35
+        },
+        {
+          "name": "green_box",
+          "prototype": "green_box",
+          "xy_m": [
+            -0.47,
+            0.12
+          ],
+          "yaw_deg": -25
+        },
+        {
+          "name": "blue_cylinder",
+          "prototype": "blue_cylinder",
+          "xy_m": [
+            -0.3,
+            0.2
+          ]
+        }
+      ],
+      "tasks": [
+        {
+          "id": "inspect",
+          "phase": "observation",
+          "instruction": "比较绿色长条与绿色盒子的朝向，区分二者并找到红色方块。",
+          "evaluation": {
+            "kind": "identify",
+            "target": "red_cube",
+            "reference": "green_bar"
+          }
+        },
+        {
+          "id": "hover",
+          "phase": "safe_motion",
+          "instruction": "让右手 TCP 到达红色方块实测顶面上方 8 cm，保持当前朝向。",
+          "evaluation": {
+            "kind": "measured_surface_hover",
+            "target": "red_cube",
+            "side": "right",
+            "offset_m": 0.08,
+            "preserve_orientation": true
+          }
+        },
+        {
+          "id": "bar_hover",
+          "phase": "safe_motion",
+          "instruction": "让右手 TCP 到达斜放绿色长条的实测可见表面上方 8 cm；避免碰到邻近物体。",
+          "evaluation": {
+            "kind": "measured_surface_hover",
+            "target": "green_bar",
+            "side": "right",
+            "offset_m": 0.08,
+            "preserve_orientation": true
+          }
+        }
+      ]
+    },
+    {
+      "id": "dense_clutter",
+      "focus": "blue_cube",
+      "objects": [
+        {
+          "name": "blue_cube",
+          "prototype": "blue_cube",
+          "xy_m": [
+            -0.29,
+            0
+          ]
+        },
+        {
+          "name": "red_cylinder",
+          "prototype": "red_cylinder",
+          "xy_m": [
+            -0.39,
+            -0.095
+          ]
+        },
+        {
+          "name": "green_box",
+          "prototype": "green_box",
+          "xy_m": [
+            -0.41,
+            0.08
+          ]
+        },
+        {
+          "name": "yellow_ellipsoid",
+          "prototype": "yellow_ellipsoid",
+          "xy_m": [
+            -0.51,
+            -0.09
+          ]
+        },
+        {
+          "name": "yellow_cylinder",
+          "prototype": "yellow_cylinder",
+          "xy_m": [
+            -0.51,
+            0.07
+          ]
+        },
+        {
+          "name": "white_sphere",
+          "prototype": "white_sphere",
+          "xy_m": [
+            -0.34,
+            0.17
+          ]
+        }
+      ],
+      "tasks": [
+        {
+          "id": "inspect",
+          "phase": "observation",
+          "instruction": "在密集物体中找到蓝色方块，描述红色圆柱、绿色盒子与它的相对位置。",
+          "evaluation": {
+            "kind": "identify",
+            "target": "blue_cube",
+            "reference": "red_cylinder"
+          }
+        },
+        {
+          "id": "hover",
+          "phase": "safe_motion",
+          "instruction": "让右手 TCP 无碰撞地到达蓝色方块实测顶面上方 8 cm，保持当前朝向。",
+          "evaluation": {
+            "kind": "measured_surface_hover",
+            "target": "blue_cube",
+            "side": "right",
+            "offset_m": 0.08,
+            "preserve_orientation": true
+          }
+        },
+        {
+          "id": "offset_change",
+          "phase": "safe_motion",
+          "instruction": "先到蓝色方块实测顶面上方 8 cm，再到同一保存观测点上方 6 cm；场景障碍检查仍使用新鲜观测。",
+          "evaluation": {
+            "kind": "ordered_surface_offsets",
+            "target": "blue_cube",
+            "side": "right",
+            "offsets_m": [
+              0.08,
+              0.06
+            ],
+            "preserve_orientation": true
+          }
+        }
+      ]
+    },
+    {
+      "id": "partial_occlusion",
+      "focus": "blue_cube",
+      "objects": [
+        {
+          "name": "blue_cube",
+          "prototype": "blue_small_cube",
+          "xy_m": [
+            -0.43,
+            0
+          ]
+        },
+        {
+          "name": "gray_occluder",
+          "prototype": "tall_occluder",
+          "xy_m": [
+            -0.3,
+            0
+          ]
+        },
+        {
+          "name": "red_cylinder",
+          "prototype": "red_cylinder",
+          "xy_m": [
+            -0.48,
+            -0.2
+          ]
+        },
+        {
+          "name": "white_sphere",
+          "prototype": "white_sphere",
+          "xy_m": [
+            -0.45,
+            0.2
+          ]
+        }
+      ],
+      "tasks": [
+        {
+          "id": "inspect",
+          "phase": "observation",
+          "instruction": "蓝色方块可能被灰色高盒遮挡。比较三个真实相机视图，找到可见证据；不可见时如实报告。",
+          "evaluation": {
+            "kind": "identify",
+            "target": "blue_cube",
+            "reference": "gray_occluder"
+          }
+        },
+        {
+          "id": "hover",
+          "phase": "safe_motion",
+          "instruction": "仅在得到蓝色方块的实测表面点后，让右手 TCP 到该点上方 8 cm，保持当前朝向。",
+          "evaluation": {
+            "kind": "measured_surface_hover",
+            "target": "blue_cube",
+            "side": "right",
+            "offset_m": 0.08,
+            "preserve_orientation": true
+          }
+        },
+        {
+          "id": "visibility",
+          "phase": "observation",
+          "instruction": "比较蓝色方块和灰色高盒在三个相机中的可见程度，说明哪个视图更适合定位方块。",
+          "evaluation": {
+            "kind": "visibility_comparison",
+            "target": "blue_cube",
+            "reference": "gray_occluder"
+          }
+        }
+      ]
+    },
+    {
+      "id": "narrow_corridor",
+      "focus": "blue_cube",
+      "objects": [
+        {
+          "name": "blue_cube",
+          "prototype": "blue_cube",
+          "xy_m": [
+            -0.34,
+            0
+          ]
+        },
+        {
+          "name": "gray_barrier_a",
+          "prototype": "corridor_barrier",
+          "xy_m": [
+            -0.43,
+            -0.105
+          ]
+        },
+        {
+          "name": "gray_barrier_b",
+          "prototype": "corridor_barrier",
+          "xy_m": [
+            -0.43,
+            0.105
+          ]
+        },
+        {
+          "name": "white_sphere",
+          "prototype": "white_sphere",
+          "xy_m": [
+            -0.59,
+            0
+          ]
+        }
+      ],
+      "tasks": [
+        {
+          "id": "inspect",
+          "phase": "observation",
+          "instruction": "识别两块灰色长障碍之间的通道，以及通道中的蓝色方块。",
+          "evaluation": {
+            "kind": "identify",
+            "target": "blue_cube",
+            "reference": "gray_barrier_a"
+          }
+        },
+        {
+          "id": "hover",
+          "phase": "safe_motion",
+          "instruction": "让右手 TCP 无碰撞地到达通道中蓝色方块的实测顶面上方 8 cm；保持当前朝向，无法规划时报告拒绝。",
+          "evaluation": {
+            "kind": "measured_surface_hover",
+            "target": "blue_cube",
+            "side": "right",
+            "offset_m": 0.08,
+            "preserve_orientation": true
+          }
+        },
+        {
+          "id": "corridor_compare",
+          "phase": "observation",
+          "instruction": "依据 RGB-D 比较蓝色方块与通道两侧障碍的间距；不要把未观测区域当成空闲。",
+          "evaluation": {
+            "kind": "clearance_evidence",
+            "target": "blue_cube",
+            "reference": "gray_barrier_b"
+          }
+        }
+      ]
+    },
+    {
+      "id": "raised_support",
+      "focus": "blue_cube",
+      "objects": [
+        {
+          "name": "gray_support",
+          "prototype": "pedestal",
+          "xy_m": [
+            -0.34,
+            0
+          ]
+        },
+        {
+          "name": "blue_cube",
+          "prototype": "blue_small_cube",
+          "xy_m": [
+            -0.34,
+            0
+          ],
+          "support": "gray_support"
+        },
+        {
+          "name": "red_cube",
+          "prototype": "red_cube",
+          "xy_m": [
+            -0.48,
+            -0.18
+          ]
+        },
+        {
+          "name": "green_region",
+          "prototype": "green_region",
+          "xy_m": [
+            -0.49,
+            0.18
+          ]
+        }
+      ],
+      "tasks": [
+        {
+          "id": "inspect",
+          "phase": "observation",
+          "instruction": "找到灰色台阶上的蓝色小方块，比较它和桌面红色方块的支撑高度。",
+          "evaluation": {
+            "kind": "identify",
+            "target": "blue_cube",
+            "reference": "red_cube"
+          }
+        },
+        {
+          "id": "hover",
+          "phase": "safe_motion",
+          "instruction": "让右手 TCP 到达台阶上蓝色小方块的实测顶面上方 6 cm，保持当前朝向。",
+          "evaluation": {
+            "kind": "measured_surface_hover",
+            "target": "blue_cube",
+            "side": "right",
+            "offset_m": 0.06,
+            "preserve_orientation": true
+          }
+        },
+        {
+          "id": "place",
+          "phase": "payload_pending",
+          "instruction": "把台阶上的蓝色小方块抓起，放到绿色区域并稳定释放。",
+          "evaluation": {
+            "kind": "stable_placement",
+            "target": "blue_cube",
+            "destination": "green_region",
+            "requires_payload_validation": true
+          }
+        }
+      ]
+    },
+    {
+      "id": "placement_regions",
+      "focus": "blue_cube",
+      "objects": [
+        {
+          "name": "blue_cube",
+          "prototype": "blue_cube",
+          "xy_m": [
+            -0.3,
+            0
+          ]
+        },
+        {
+          "name": "green_region",
+          "prototype": "green_region",
+          "xy_m": [
+            -0.5,
+            0.17
+          ]
+        },
+        {
+          "name": "yellow_region",
+          "prototype": "yellow_region",
+          "xy_m": [
+            -0.5,
+            -0.17
+          ]
+        },
+        {
+          "name": "white_sphere",
+          "prototype": "white_sphere",
+          "xy_m": [
+            -0.5,
+            0
+          ]
+        }
+      ],
+      "tasks": [
+        {
+          "id": "inspect",
+          "phase": "observation",
+          "instruction": "找到蓝色方块、绿色区域和黄色区域；区分目标放置区域与白球。",
+          "evaluation": {
+            "kind": "identify",
+            "target": "blue_cube",
+            "reference": "green_region"
+          }
+        },
+        {
+          "id": "hover",
+          "phase": "safe_motion",
+          "instruction": "让右手 TCP 到达绿色区域的实测表面点上方 8 cm，保持当前朝向。",
+          "evaluation": {
+            "kind": "measured_surface_hover",
+            "target": "green_region",
+            "side": "right",
+            "offset_m": 0.08,
+            "preserve_orientation": true
+          }
+        },
+        {
+          "id": "place",
+          "phase": "payload_pending",
+          "instruction": "抓取蓝色方块，将其放在绿色区域内，不放到黄色区域。",
+          "evaluation": {
+            "kind": "stable_placement",
+            "target": "blue_cube",
+            "destination": "green_region",
+            "requires_payload_validation": true
+          }
+        }
+      ]
+    },
+    {
+      "id": "long_object",
+      "focus": "green_bar",
+      "objects": [
+        {
+          "name": "green_bar",
+          "prototype": "green_bar",
+          "xy_m": [
+            -0.37,
+            0
+          ]
+        },
+        {
+          "name": "red_cylinder",
+          "prototype": "red_cylinder",
+          "xy_m": [
+            -0.53,
+            0.16
+          ]
+        },
+        {
+          "name": "blue_cube",
+          "prototype": "blue_cube",
+          "xy_m": [
+            -0.32,
+            -0.19
+          ]
+        },
+        {
+          "name": "green_region",
+          "prototype": "green_region",
+          "xy_m": [
+            -0.57,
+            -0.16
+          ]
+        }
+      ],
+      "tasks": [
+        {
+          "id": "inspect",
+          "phase": "observation",
+          "instruction": "找到绿色长条，判断其长轴方向并与蓝色方块的形状比较。",
+          "evaluation": {
+            "kind": "identify",
+            "target": "green_bar",
+            "reference": "blue_cube"
+          }
+        },
+        {
+          "id": "hover",
+          "phase": "safe_motion",
+          "instruction": "让右手 TCP 到达绿色长条的实测可见表面上方 8 cm，保持当前朝向。",
+          "evaluation": {
+            "kind": "measured_surface_hover",
+            "target": "green_bar",
+            "side": "right",
+            "offset_m": 0.08,
+            "preserve_orientation": true
+          }
+        },
+        {
+          "id": "place",
+          "phase": "payload_pending",
+          "instruction": "抓取绿色长条，携物避开红色圆柱后放到绿色区域；整体物体占用需要参与避障。",
+          "evaluation": {
+            "kind": "stable_placement",
+            "target": "green_bar",
+            "destination": "green_region",
+            "requires_payload_validation": true
+          }
+        }
+      ]
+    },
+    {
+      "id": "bilateral_targets",
+      "focus": "blue_cube",
+      "objects": [
+        {
+          "name": "red_cube",
+          "prototype": "red_cube",
+          "xy_m": [
+            -0.31,
+            -0.2
+          ]
+        },
+        {
+          "name": "blue_cube",
+          "prototype": "blue_cube",
+          "xy_m": [
+            -0.31,
+            0.2
+          ]
+        },
+        {
+          "name": "white_sphere",
+          "prototype": "white_sphere",
+          "xy_m": [
+            -0.49,
+            0
+          ]
+        }
+      ],
+      "tasks": [
+        {
+          "id": "inspect",
+          "phase": "observation",
+          "instruction": "在三个视角中分别定位红色方块和蓝色方块，保留各自的观测引用。",
+          "evaluation": {
+            "kind": "identify",
+            "target": "red_cube",
+            "reference": "blue_cube"
+          }
+        },
+        {
+          "id": "sequential_hands",
+          "phase": "safe_motion",
+          "instruction": "先让左手 TCP 到蓝色方块实测顶面上方 8 cm，再让右手 TCP 到红色方块实测顶面上方 8 cm；各自保持当前朝向，依次执行。",
+          "evaluation": {
+            "kind": "sequential_bilateral_hovers",
+            "target": "blue_cube",
+            "reference": "red_cube",
+            "offset_m": 0.08
+          }
+        },
+        {
+          "id": "size_compare",
+          "phase": "observation",
+          "instruction": "比较红色方块和蓝色方块的实测尺寸，说明哪一个较大。",
+          "evaluation": {
+            "kind": "compare",
+            "target": "blue_cube",
+            "reference": "red_cube"
+          }
+        }
+      ]
+    },
+    {
+      "id": "ycb_proxy_palette",
+      "focus": "red_strawberry_proxy",
+      "objects": [
+        {
+          "name": "red_strawberry_proxy",
+          "prototype": "ycb_strawberry_proxy",
+          "xy_m": [
+            -0.3,
+            -0.15
+          ]
+        },
+        {
+          "name": "white_golf_ball_proxy",
+          "prototype": "ycb_golf_ball_proxy",
+          "xy_m": [
+            -0.3,
+            0.15
+          ]
+        },
+        {
+          "name": "yellow_lemon_proxy",
+          "prototype": "ycb_lemon_proxy",
+          "xy_m": [
+            -0.45,
+            0
+          ]
+        },
+        {
+          "name": "sugar_box_proxy",
+          "prototype": "ycb_sugar_box",
+          "xy_m": [
+            -0.58,
+            0.23
+          ]
+        }
+      ],
+      "tasks": [
+        {
+          "id": "inspect",
+          "phase": "observation",
+          "instruction": "区分红色小盒、白球、黄色盒与高的棕黄色盒；这些是简化几何代理，不按图像外观猜测扫描资产身份。",
+          "evaluation": {
+            "kind": "identify",
+            "target": "red_strawberry_proxy"
+          }
+        },
+        {
+          "id": "hover",
+          "phase": "safe_motion",
+          "instruction": "让右手 TCP 到红色小盒实测顶面上方 8 cm，保持当前朝向。",
+          "evaluation": {
+            "kind": "measured_surface_hover",
+            "target": "red_strawberry_proxy",
+            "side": "right",
+            "offset_m": 0.08,
+            "preserve_orientation": true
+          }
+        },
+        {
+          "id": "heavy_object",
+          "phase": "observation",
+          "instruction": "比较棕黄色高盒和三个小物体的几何尺寸；仅从图像不能确定实际质量或可抓取性。",
+          "evaluation": {
+            "kind": "geometry_evidence_limits",
+            "target": "sugar_box_proxy",
+            "reference": "white_golf_ball_proxy"
+          }
+        }
+      ]
+    },
+    {
+      "id": "wrist_supports",
+      "focus": "blue_cube",
+      "objects": [
+        {
+          "name": "left_support",
+          "prototype": "high_support",
+          "xy_m": [
+            -0.78,
+            -0.27
+          ]
+        },
+        {
+          "name": "right_support",
+          "prototype": "high_support",
+          "xy_m": [
+            -0.78,
+            0.23
+          ]
+        },
+        {
+          "name": "red_cube",
+          "prototype": "red_cube",
+          "xy_m": [
+            -0.78,
+            -0.27
+          ],
+          "support": "left_support"
+        },
+        {
+          "name": "blue_cube",
+          "prototype": "blue_small_cube",
+          "xy_m": [
+            -0.78,
+            0.23
+          ],
+          "support": "right_support"
+        },
+        {
+          "name": "white_sphere",
+          "prototype": "white_sphere",
+          "xy_m": [
+            -0.48,
+            0
+          ]
+        }
+      ],
+      "tasks": [
+        {
+          "id": "inspect",
+          "phase": "observation",
+          "instruction": "比较主相机和两个腕部相机，找到高台上的红色方块与蓝色方块；报告哪些视图能看到各自目标。",
+          "evaluation": {
+            "kind": "visibility_comparison",
+            "target": "blue_cube",
+            "reference": "red_cube"
+          }
+        },
+        {
+          "id": "localize",
+          "phase": "observation",
+          "instruction": "从可见视图定位高台上的蓝色方块，保留定位来源；不要把白球作为目标。",
+          "evaluation": {
+            "kind": "identify",
+            "target": "blue_cube",
+            "reference": "white_sphere"
+          }
+        },
+        {
+          "id": "cross_view_identity",
+          "phase": "observation",
+          "instruction": "判断两个腕部视图中的方块是否为同一个物体，并结合主视角说明依据；分别保留红色方块与蓝色方块的观测身份。",
+          "evaluation": {
+            "kind": "cross_view_identity",
+            "target": "blue_cube",
+            "reference": "red_cube"
+          }
+        }
+      ]
+    }
+  ]
+}
