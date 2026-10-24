@@ -4,16 +4,105 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 from collections import Counter, defaultdict, deque
 from dataclasses import asdict
 from pathlib import Path
 
 from robot_motion.rebot_b601_rs.calibration import (
-    CalibrationCondition, fit_local_command_model, reduce_command_window, six,
+    CalibrationCondition,
+    fit_local_command_model,
+    reduce_command_window,
+    six,
 )
 from robot_motion.rebot_b601_rs.gravity_identification import fit_paired_gravity_command
 
 from .calibration_session import calibration_receipt_rejection
+
+
+def _matched_response_distance(a, b, *, pose_tolerance_rad=.0045, maximum_speed_ratio=1.25):
+    if (a.trial_id == b.trial_id or a.condition != b.condition or a.joint_name != b.joint_name
+        or a.active_driver_kd_nm_s_per_rad != b.active_driver_kd_nm_s_per_rad
+        or a.velocity_rad_s*b.velocity_rad_s <= 0):
+        return None
+    distance = max(abs(x-y) for x, y in zip(a.qpos_rad, b.qpos_rad))
+    ratio = max(abs(a.velocity_rad_s), abs(b.velocity_rad_s))/min(abs(a.velocity_rad_s), abs(b.velocity_rad_s))
+    return (distance, ratio) if distance <= pose_tolerance_rad and ratio <= maximum_speed_ratio else None
+
+
+def _repeatability(observations, *, pose_tolerance_rad=.0045, maximum_speed_ratio=1.25):
+    """Disjoint same-direction, different-trial matches inside one split.
+
+    This measures observed repeat differences, not sensor accuracy or an
+    independent validation score. Matching uses no command/target labels.
+    """
+    used, pairs = set(), []
+    for i, a in enumerate(observations):
+        if i in used:
+            continue
+        choices = []
+        for k in range(i+1, len(observations)):
+            b = observations[k]
+            if k in used:
+                continue
+            match = _matched_response_distance(a, b, pose_tolerance_rad=pose_tolerance_rad,
+                                               maximum_speed_ratio=maximum_speed_ratio)
+            if match is not None:
+                choices.append((*match, k))
+        if choices:
+            distance, ratio, k = min(choices)
+            b = observations[k]
+            used.update((i, k))
+            pairs.append({"first_trial_id": a.trial_id, "second_trial_id": b.trial_id,
+                "first_qpos_rad": a.qpos_rad, "second_qpos_rad": b.qpos_rad,
+                "direction": int(math.copysign(1, a.velocity_rad_s)),
+                "maximum_pose_mismatch_rad": distance, "speed_magnitude_ratio": ratio,
+                "command_difference_nm": b.command_residual_nm-a.command_residual_nm})
+    return {"source_windows": len(observations), "matched_pairs": len(pairs),
+        "unmatched_windows": len(observations)-len(used), "pairs": pairs,
+        "rms_pair_difference_nm": (math.sqrt(sum(p["command_difference_nm"]**2 for p in pairs)/len(pairs))
+            if pairs else None),
+        "maximum_abs_pair_difference_nm": max((abs(p["command_difference_nm"]) for p in pairs), default=None),
+        "pose_tolerance_rad": pose_tolerance_rad, "maximum_speed_ratio": maximum_speed_ratio,
+        "semantics": "matched_encoder_pose_and_speed_not_identical_preload_temperature_or_output_force"}
+
+
+def _local_repeat_prediction(training, validation):
+    """Test local repeatability using training neighbours only, never deploy.
+
+    One nearest observation per training trial prevents a long leg from
+    dominating. Retain every unpredicted validation window in the denominator.
+    """
+    if {o.trial_id for o in training} & {o.trial_id for o in validation}:
+        raise ValueError("whole trial leakage in local repeat prediction")
+    predictions, errors = [], defaultdict(list)
+    for target in validation:
+        nearest = {}
+        for source in training:
+            match = _matched_response_distance(target, source)
+            if match is not None and (source.trial_id not in nearest or match < nearest[source.trial_id][0]):
+                nearest[source.trial_id] = (match, source.command_residual_nm)
+        record = {"validation_trial_id": target.trial_id, "qpos_rad": target.qpos_rad,
+            "velocity_rad_s": target.velocity_rad_s, "training_trial_ids": sorted(nearest),
+            "predicted": len(nearest) >= 2, "observed_command_residual_nm": target.command_residual_nm}
+        if len(nearest) >= 2:
+            values = [value for _, value in nearest.values()]
+            predicted = sum(values)/len(values)
+            error = predicted-target.command_residual_nm
+            record.update(predicted_command_residual_nm=predicted, error_nm=error,
+                          training_command_residual_range_nm=[min(values), max(values)])
+            errors[target.trial_id].append(error)
+        predictions.append(record)
+    return {"status": "DIAGNOSTIC_ONLY", "auto_apply": False,
+        "pose_tolerance_rad": .0045, "maximum_speed_ratio": 1.25,
+        "minimum_training_trials_per_prediction": 2,
+        "validation_windows": len(validation), "predicted_windows": sum(p["predicted"] for p in predictions),
+        "unpredicted_windows": sum(not p["predicted"] for p in predictions),
+        "all_validation_windows_predicted": bool(validation) and all(p["predicted"] for p in predictions),
+        "equal_trial_rmse_on_predicted_windows_nm": (math.sqrt(sum(sum(e*e for e in values)/len(values)
+            for values in errors.values())/len(errors)) if errors else None),
+        "predictions": predictions,
+        "semantics": "partial_local_command_predictability_not_full_model_validation_or_physical_friction"}
 
 
 def organize_automatic_reports(paths):
@@ -67,7 +156,34 @@ def organize_automatic_reports(paths):
         "semantics": "retain completed observations despite later withdrawal failure; do not pool unknown physical conditions"}
 
 
-def summarize_workspace_identification(records, *, condition, workspace):
+def _dispatch_integrals(commands, start, end):
+    """Integrate the latest-complete-command proxy over a receive interval.
+
+    Six-joint completion is the only verified dispatch boundary in this trace.
+    It is not the motor's sampling/actuation clock. Never interpolate a future
+    command backwards into an earlier position response.
+    """
+    held = next((r for r in reversed(commands)
+                 if r["dispatch_receipt"]["completed_at_sec"] < start), None)
+    if held is None:
+        raise ValueError("missing causal command at response interval start")
+    total, gravity = [0.0]*6, [0.0]*6
+    cursor = start
+    events = [r for r in commands if start <= r["dispatch_receipt"]["completed_at_sec"] < end]
+    for event in [*events, None]:
+        boundary = end if event is None else event["dispatch_receipt"]["completed_at_sec"]
+        dt = boundary-cursor
+        command = six(held["conditioned_tau_nm"], "dispatched command")
+        baseline = six(held["gravity_tau_nm"], "dispatched gravity")
+        for j in range(6):
+            total[j] += command[j]*dt
+            gravity[j] += baseline[j]*dt
+        cursor, held = boundary, event
+    return total, gravity
+
+
+def summarize_workspace_identification(records, *, condition, workspace,
+                                       reduction_method="quasisteady"):
     """Admit response windows, then reuse the existing resistance/gravity fits.
 
     A sample uses the latest complete dispatch preceding that joint's host
@@ -75,6 +191,8 @@ def summarize_workspace_identification(records, *, condition, workspace):
     time still does not establish a device-side encoder sampling timestamp.
     Native support brakes, role changes and gaps split windows, never budgets.
     """
+    if reduction_method not in {"quasisteady", "closed_loop_average"}:
+        raise ValueError("unknown command window reduction method")
     condition = CalibrationCondition.from_mapping(condition, run_id=condition["run_id"])
     completed = {leg["trial_id"] for stage in workspace.get("acquisitions", [])
                  for leg in stage["result"].get("completed_legs", [])}
@@ -86,7 +204,8 @@ def summarize_workspace_identification(records, *, condition, workspace):
     identity = None
     settings = {"minimum_window_sec": .6, "maximum_window_sec": 2.0,
         "maximum_feedback_gap_sec": .04, "minimum_motion_rad": .002,
-        "maximum_line_error_rad": .0008, "maximum_residual_span_nm": .15}
+        "maximum_line_error_rad": .0008, "maximum_residual_span_nm": .15,
+        "residual_span_is_admission_gate": reduction_method == "quasisteady"}
 
     def flush(force=False):
         if len(buffer) < 3:
@@ -106,7 +225,12 @@ def summarize_workspace_identification(records, *, condition, workspace):
             driver_kd_nm_s_per_rad=[r["kd"] for r in buffer],
             minimum_motion_rad=settings["minimum_motion_rad"],
             maximum_line_error_rad=settings["maximum_line_error_rad"],
-            maximum_residual_span_nm=settings["maximum_residual_span_nm"])
+            maximum_residual_span_nm=settings["maximum_residual_span_nm"],
+            reduction_method=reduction_method,
+            interval_command_integrals_nm_sec=[r["command_integral"] for r in buffer[1:]]
+                if reduction_method == "closed_loop_average" else None,
+            interval_gravity_integrals_nm_sec=[r["gravity_integral"] for r in buffer[1:]]
+                if reduction_method == "closed_loop_average" else None)
         if (not force and reason == "insufficient_motion_not_zero_friction"
             and duration < settings["maximum_window_sec"]):
             return
@@ -123,7 +247,22 @@ def summarize_workspace_identification(records, *, condition, workspace):
         record.update(qpos_start_rad=first["q"], qpos_end_rad=last["q"],
             qpos_min_rad=[min(r["q"][i] for r in buffer) for i in range(6)],
             qpos_max_rad=[max(r["q"][i] for r in buffer) for i in range(6)],
-            command_residual_span_nm=max(residual)-min(residual))
+            command_residual_span_nm=max(residual)-min(residual),
+            reduction_method=reduction_method,
+            command_variation_exceeds_quasisteady_limit=max(residual)-min(residual) > settings["maximum_residual_span_nm"])
+        if reduction_method == "closed_loop_average":
+            mid = len(buffer)//2
+            v_start = (buffer[mid]["q"][j]-first["q"][j])/(buffer[mid]["time"]-first["time"])
+            v_end = (last["q"][j]-buffer[mid]["q"][j])/(last["time"]-buffer[mid]["time"])
+            record.update(motion_class="linear_single_axis" if observation else reason,
+                          half_window_speeds_rad_s=[v_start, v_end],
+                          acceleration_proxy_rad_s2=2*(v_end-v_start)/duration,
+                          inertia_identified=False)
+            record["half_speed_magnitude_ratio"] = (max(abs(v_start), abs(v_end))/min(abs(v_start), abs(v_end))
+                if v_start*v_end > 0 else None)
+            ratio = record["half_speed_magnitude_ratio"]
+            record["kinematic_phase_diagnostic"] = ("cruise_candidate" if ratio is not None and ratio <= 1.25
+                else "speed_change_or_encoder_resolution_unresolved")
         if observation is not None:
             record["observation"] = {k: v for k, v in asdict(observation).items() if k != "condition"}
             observations.append((first["pose"], first["role"], observation))
@@ -216,11 +355,14 @@ def summarize_workspace_identification(records, *, condition, workspace):
                 commands.clear()
             else:
                 marker = row["torque_console"]["calibration_trial"]
+                integral = (_dispatch_integrals(commands, buffer[-1]["time"], stamp)
+                    if buffer and reduction_method == "closed_loop_average" else (None, None))
                 buffer.append({"time": stamp, "q": row["qpos_rad"],
                     "gravity": prior["gravity_tau_nm"], "command": prior["conditioned_tau_nm"],
                     "kd": prior["vendor_kd_nm_s_per_rad"], "input_sequence": prior["dispatch_receipt"]["sequence"],
                     "pose": key[0], "joint": key[1], "trial": key[2], "role": key[3],
-                    "speed": marker.get("reference_speed_rad_s")})
+                    "speed": marker.get("reference_speed_rad_s"),
+                    "command_integral": integral[0], "gravity_integral": integral[1]})
                 if buffer[-1]["time"]-buffer[0]["time"] >= settings["minimum_window_sec"]:
                     flush()
         commands.append(row)
@@ -232,23 +374,43 @@ def summarize_workspace_identification(records, *, condition, workspace):
     for (pose, joint, kd), group in sorted(groups.items()):
         fit = fit_local_command_model([o for role, o in group if role == "training"],
             [o for role, o in group if role == "validation"])
-        fits.append({"pose_index": pose, "joint_name": joint,
-            "active_driver_kd_nm_s_per_rad": kd, "fit": fit})
+        item = {"pose_index": pose, "joint_name": joint,
+            "active_driver_kd_nm_s_per_rad": kd, "fit": fit}
+        if reduction_method == "closed_loop_average":
+            item.update(repeatability_by_split={role: _repeatability([o for r, o in group if r == role])
+                for role in ("training", "validation")},
+                local_repeat_prediction=_local_repeat_prediction(
+                [o for role, o in group if role == "training"],
+                [o for role, o in group if role == "validation"]))
+        fits.append(item)
     gravity = fit_paired_gravity_command(
         [o for _, role, o in observations if role == "training"],
         [o for _, role, o in observations if role == "validation"])
     candidates = sum(f["fit"]["status"] == "OFFLINE_CANDIDATE" for f in fits)
+    cruise_count = (sum(w.get("kinematic_phase_diagnostic") == "cruise_candidate"
+                       for w in windows if w["model_eligible"])
+                    if reduction_method == "closed_loop_average" else len(observations))
     resistance = {"status": "OFFLINE_CANDIDATE" if candidates else "INSUFFICIENT_DATA",
-        "offline_candidates": candidates, "steady_motion_windows": len(observations),
-        "observed_steady_motion_windows": len(observations), "recorded_command_windows": len(windows),
+        "fit_scope": "equivalent_window_command_prediction_not_identified_physical_friction",
+        "offline_candidates": candidates, "steady_motion_windows": cruise_count,
+        "observed_steady_motion_windows": cruise_count, "recorded_command_windows": len(windows),
+        "admitted_command_response_windows": len(observations),
+        "cruise_diagnostic_semantics": "half-speed ratio <= 1.25 is diagnostic only, not proof of zero inertia",
         "retained_partial_leg_windows": sum(w["model_eligible"] and not w["source_leg_completed"] for w in windows),
         "fits": fits, "auto_apply": False}
     return {"schema": "b601.workspace-command-identification.v1", "auto_apply": False,
+        "reduction_method": reduction_method,
         "quantity": "software_command_not_measured_output_torque",
         "condition": asdict(condition), "settings": settings, "windows": windows,
         "admitted_motion_windows": len(observations), "rejected": dict(rejected),
         "input_alignment": "latest_complete_dispatch_before_selected_joint_host_receive",
         "device_sampling_timestamp_verified": False,
+        "reduction_semantics": ("time_integral_of_latest_complete_dispatched_input_over_duration; "
+            "velocity_is_measured_displacement_over_duration; fixed_Kd_condition; "
+            "kinematic_linearity_is_not_proof_of_zero_inertia_or_physical_friction"
+            if reduction_method == "closed_loop_average" else "median_quasisteady_command"),
         "gravity_fit": gravity, "running_resistance": resistance,
+        "kinematic_phase_counts": dict(Counter(w.get("kinematic_phase_diagnostic", "quasisteady")
+            for w in windows if w["model_eligible"])),
         "motor_damping_semantics": "fixed active Kd is a fit condition; never subtract an unmeasured physical damping torque",
         "later_stop_invalidates_completed_windows": False}

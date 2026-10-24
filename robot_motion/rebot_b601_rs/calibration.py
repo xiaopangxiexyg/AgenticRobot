@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import math
 import statistics
+from collections import Counter
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass
 
@@ -153,8 +154,19 @@ def reduce_command_window(
     minimum_motion_rad: float,
     maximum_line_error_rad: float,
     maximum_residual_span_nm: float,
+    reduction_method: str = "quasisteady",
+    interval_command_integrals_nm_sec: Sequence[Sequence[float]] | None = None,
+    interval_gravity_integrals_nm_sec: Sequence[Sequence[float]] | None = None,
 ) -> tuple[CalibrationObservation | None, str | None]:
-    """Reduce one steady interval without depending on a trace/UI schema."""
+    """Reduce one interval without depending on a trace/UI schema.
+
+    The explicit closed-loop method averages the *dispatched input history*,
+    rather than treating a changing feedback command as a constant force.
+    Kinematic linearity and fixed support/damping are still required. This is
+    an equivalent command observation, not an inertia-free torque measurement.
+    """
+    if reduction_method not in {"quasisteady", "closed_loop_average"}:
+        raise ValueError("unknown command window reduction method")
     j = joint_index(joint_name)
     for name, value in (
         ("minimum_motion_rad", minimum_motion_rad),
@@ -187,7 +199,8 @@ def reduce_command_window(
         raise ValueError("driver damping must be non-negative")
     if any(gains != driver_kd[0] for gains in driver_kd):
         return None, "changing_motor_local_damping"
-    if float(np.ptp(command[:, j] - gravity[:, j])) > maximum_residual_span_nm:
+    if (reduction_method == "quasisteady"
+        and float(np.ptp(command[:, j] - gravity[:, j])) > maximum_residual_span_nm):
         return None, "changing_command_not_quasisteady_identification"
     displacement = float(q[-1, j] - q[0, j])
     if abs(displacement) < minimum_motion_rad:
@@ -209,6 +222,31 @@ def reduce_command_window(
         > maximum_line_error_rad * 2
     ):
         return None, "nonsteady_or_coupled_motion"
+    if reduction_method == "closed_loop_average":
+        # A stop/reversal can average to an apparently valid slow slope.
+        # Require progress in each half and bound reverse excursions by the
+        # existing position-linearity resolution, not single-frame velocity.
+        middle = count // 2
+        if (displacement * (q[middle, j]-q[0, j]) <= 0
+            or displacement * (q[-1, j]-q[middle, j]) <= 0
+            or float(np.max(np.maximum.accumulate(q[:, j]*math.copysign(1, displacement))
+                            - q[:, j]*math.copysign(1, displacement))) > maximum_line_error_rad):
+            return None, "stop_or_reversal_not_cruise"
+        integrals = []
+        for values, name in ((interval_command_integrals_nm_sec, "command integrals"),
+                             (interval_gravity_integrals_nm_sec, "gravity integrals")):
+            if values is None or len(values) != count-1:
+                raise ValueError(f"{name} require every inter-sample interval")
+            integrals.append(np.asarray([six(v, name) for v in values]))
+        duration = float(times[-1]-times[0])
+        mean_q = np.sum((q[:-1]+q[1:])*.5*np.diff(times)[:, None], axis=0)/duration
+        mean_gravity = integrals[1].sum(axis=0)/duration
+        mean_residual = float((integrals[0][:, j]-integrals[1][:, j]).sum()/duration)
+        return CalibrationObservation(condition=condition, joint_name=joint_name,
+            trial_id=trial_id, qpos_rad=tuple(mean_q),
+            gravity_command_nm=tuple(mean_gravity), velocity_rad_s=displacement/duration,
+            command_residual_nm=mean_residual,
+            active_driver_kd_nm_s_per_rad=driver_kd[0]), None
     # One interval is one observation, not a collection of independent frames.
     return CalibrationObservation(
         condition=condition,
@@ -339,9 +377,7 @@ def fit_local_command_model(
         "speed_min_rad_s": min(abs(o.velocity_rad_s) for o in training),
         "speed_max_rad_s": max(abs(o.velocity_rad_s) for o in training),
     }
-    for observation in validation:
-        if not _in_coverage(observation, coverage):
-            return reject("validation_outside_training_pose_load_or_speed_coverage")
+    covered = [_in_coverage(observation, coverage) for observation in validation]
     xv = np.asarray(
         [
             _features(
@@ -382,6 +418,26 @@ def fit_local_command_model(
         max_validation_rmse_nm=max_validation_rmse_nm,
         unresolved="preload_temperature_and_continuous_control_improvement_not_validated",
     )
+    # Coverage failures must not hide prediction error. These are diagnostics
+    # on the original whole-trial split, never a filtered replacement test set.
+    result["validation_diagnostics"] = {
+        "covered_windows": sum(covered), "total_windows": len(validation),
+        "whole_trial_split_preserved": True,
+        "trial_errors": [{"trial_id": trial,
+            "windows": sum(o.trial_id == trial for o in validation),
+            "covered_windows": sum(ok and o.trial_id == trial for ok, o in zip(covered, validation)),
+            "rmse_nm": math.sqrt(float(np.mean([e*e for e, o in zip(residual, validation) if o.trial_id == trial]))),
+            "zero_correction_rmse_nm": math.sqrt(float(np.mean([o.command_residual_nm**2 for o in validation if o.trial_id == trial])))}
+            for trial in sorted(validation_ids)],
+        "outside_coverage_predictions_are_extrapolation": not all(covered),
+        "coverage_violations": dict(Counter(item[0] for o in validation
+            for item in _coverage_violations(o, coverage))),
+        "maximum_coverage_exceedance": {key: max(gap for o in validation
+            for field, gap in _coverage_violations(o, coverage) if field == key)
+            for key in sorted({field for o in validation for field, _ in _coverage_violations(o, coverage)})},
+    }
+    if not all(covered):
+        return reject("validation_outside_training_pose_load_or_speed_coverage")
     if rmse > max_validation_rmse_nm:
         result["status"] = "VALIDATION_FAILED"
         return reject("held_out_command_prediction_error")
@@ -389,10 +445,11 @@ def fit_local_command_model(
     return result
 
 
-def _in_coverage(
+def _coverage_violations(
     observation: CalibrationObservation, coverage: Mapping[str, object]
-) -> bool:
+) -> list[tuple[str, float]]:
     # Numeric tolerance is not an extrapolation allowance.
+    violations = []
     for values, low_key, high_key in (
         (observation.qpos_rad, "qpos_min_rad", "qpos_max_rad"),
         (observation.gravity_command_nm, "gravity_min_nm", "gravity_max_nm"),
@@ -403,16 +460,25 @@ def _in_coverage(
         )
         if any(lo > hi for lo, hi in zip(lower, upper)):
             raise ValueError("invalid calibration coverage interval")
-        if any(
-            v < lo - 1e-9 or v > hi + 1e-9 for v, lo, hi in zip(values, lower, upper)
-        ):
-            return False
+        for j, (v, lo, hi) in enumerate(zip(values, lower, upper)):
+            gap = max(lo-v, v-hi, 0.0)
+            if gap > 1e-9:
+                violations.append((f"{low_key.removesuffix('_min_rad').removesuffix('_min_nm')}:joint{j+1}", gap))
     speed = abs(observation.velocity_rad_s)
     lo = finite(coverage["speed_min_rad_s"], "speed_min_rad_s")
     hi = finite(coverage["speed_max_rad_s"], "speed_max_rad_s")
     if not 0 < lo <= hi:
         raise ValueError("invalid calibration speed interval")
-    return lo - 1e-9 <= speed <= hi + 1e-9
+    gap = max(lo-speed, speed-hi, 0.0)
+    if gap > 1e-9:
+        violations.append(("speed_rad_s", gap))
+    return violations
+
+
+def _in_coverage(
+    observation: CalibrationObservation, coverage: Mapping[str, object]
+) -> bool:
+    return not _coverage_violations(observation, coverage)
 
 
 def predict_command_residual(

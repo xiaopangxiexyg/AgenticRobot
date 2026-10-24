@@ -151,6 +151,56 @@ def test_whole_trial_validation_rejects_leakage_unseen_regions_and_bad_predictio
     assert fit_local_command_model(train, bad)["status"] == "VALIDATION_FAILED"
 
 
+def test_coverage_rejection_still_reports_original_whole_trial_prediction_errors():
+    train, valid = observations()
+    outside = [replace(o, velocity_rad_s=math.copysign(.02, o.velocity_rad_s),
+                       command_residual_nm=o.command_residual_nm+.3) for o in valid]
+    result = fit_local_command_model(train, outside)
+    assert result["status"] == "INSUFFICIENT_DATA"
+    assert result["reasons"] == ["validation_outside_training_pose_load_or_speed_coverage"]
+    diagnostic = result["validation_diagnostics"]
+    assert diagnostic["covered_windows"] == 0
+    assert diagnostic["total_windows"] == len(valid)
+    assert diagnostic["whole_trial_split_preserved"]
+    assert len(diagnostic["trial_errors"]) == 2
+    assert result["validation_rmse_nm"] > .1
+    assert not result["auto_apply"]
+
+
+def test_closed_loop_window_uses_integrated_input_and_displacement_not_frame_medians():
+    zero = (0.0,)*6
+    args = {"condition": condition(), "joint_name": "joint3", "trial_id": "closed-loop",
+        "times_sec": [0, .1, 1.0],
+        "qpos_rad": [(0, 0, q, 0, 0, 0) for q in (0, .001, .01)],
+        "gravity_command_nm": [zero]*3,
+        "conditioned_command_nm": [(0, 0, u, 0, 0, 0) for u in (0, 1, 1)],
+        "driver_kd_nm_s_per_rad": [zero]*3,
+        "minimum_motion_rad": .002, "maximum_line_error_rad": .0008,
+        "maximum_residual_span_nm": .15}
+    assert reduce_command_window(**args)[1] == "changing_command_not_quasisteady_identification"
+    args.update(reduction_method="closed_loop_average",
+        interval_command_integrals_nm_sec=[zero, (0, 0, .9, 0, 0, 0)],
+        interval_gravity_integrals_nm_sec=[zero]*2)
+    observation, reason = reduce_command_window(**args)
+    assert reason is None
+    assert observation.command_residual_nm == pytest.approx(.9)
+    assert observation.velocity_rad_s == pytest.approx(.01)
+    assert observation.qpos_rad[2] == pytest.approx(.005)
+    for integrals in (None, [zero], [zero, (float("nan"),)*6]):
+        with pytest.raises(ValueError):
+            reduce_command_window(**{**args, "interval_command_integrals_nm_sec": integrals})
+    # A steady command cannot make coupled motion, reversal or a stop cruise.
+    for positions, why in (([0, .004, .003], "nonsteady_or_coupled_motion"),
+                           ([0, 0, .01], "stop_or_reversal_not_cruise")):
+        # Use equal time intervals and a loose line residual only for the
+        # explicit stop case, so its extra cruise condition is exercised.
+        changed = {**args, "times_sec": [0, .5, 1],
+                   "qpos_rad": [(0, 0, q, 0, 0, 0) for q in positions]}
+        if why == "stop_or_reversal_not_cruise":
+            changed["maximum_line_error_rad"] = .01
+        assert reduce_command_window(**changed)[1] == why
+
+
 def test_one_speed_or_one_direction_does_not_identify_friction_parameters():
     train, valid = observations()
     fixed_speed = [

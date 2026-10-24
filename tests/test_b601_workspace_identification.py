@@ -15,7 +15,11 @@ from test_b601_coordinated_holding import replay, scripted_coordinated_tick
 from control_station.b601_torque_console.automatic_calibration import load_automatic_profile
 from control_station.b601_torque_console.workspace_calibration import WorkspaceCalibrationConfig
 from control_station.b601_torque_console.workspace_identification import (
-    organize_automatic_reports, summarize_workspace_identification,
+    _dispatch_integrals,
+    _local_repeat_prediction,
+    _repeatability,
+    organize_automatic_reports,
+    summarize_workspace_identification,
 )
 from robot_motion.rebot_b601_rs.gravity_identification import (
     fit_paired_gravity_command, pair_motion_observations, solve_gravity_design,
@@ -215,19 +219,110 @@ def test_streaming_previous_dispatch_windows_feed_both_existing_fits_and_survive
     assert all(w["input_receipt_sequence_end"] > w["input_receipt_sequence_start"] for w in result["windows"])
 
 
-def test_receive_clock_may_require_an_older_input_than_the_previous_snapshot():
+@pytest.mark.parametrize("method", ["quasisteady", "closed_loop_average"])
+def test_receive_clock_may_require_an_older_input_than_the_previous_snapshot(method):
     rows, context = motion_records()
     rows = rows[:220]
     for row in rows:
         if row["kind"] == "active_dispatch":
             for source in row["host_observation"]["joints"]:
                 source["observed_at_sec"] = row["feedback_timestamp_sec"]-.018
-    result = summarize_workspace_identification(rows, condition=asdict(context), workspace={"acquisitions": []})
+    result = summarize_workspace_identification(rows, condition=asdict(context), workspace={"acquisitions": []},
+                                               reduction_method=method)
     assert result["admitted_motion_windows"]
     # The first observation is source sequence 4, received before command 3
     # completed: command 2 is its newest available complete input.
     assert result["windows"][0]["input_receipt_sequence_start"] == 1
     assert result["device_sampling_timestamp_verified"] is False
+
+
+def test_input_integral_uses_dispatch_events_and_never_backdates_future_input():
+    def sent(t, value):
+        return {"dispatch_receipt": {"completed_at_sec": t},
+                "conditioned_tau_nm": [value]*6, "gravity_tau_nm": [1.0]*6}
+    commands = [sent(.1, 2), sent(.3, 5), sent(.9, 100)]
+    command, gravity = _dispatch_integrals(commands, .2, .5)
+    assert command == pytest.approx([.1*2+.2*5]*6)
+    assert gravity == pytest.approx([.3]*6)
+    with pytest.raises(ValueError, match="missing causal command"):
+        _dispatch_integrals(commands, 0, .5)
+
+
+def test_repeatability_matches_disjoint_trials_without_using_command_for_selection():
+    train, _ = observations(joint="joint2")
+    a = train[0]
+    b = replace(a, trial_id="repeat", command_residual_nm=a.command_residual_nm+.2)
+    result = _repeatability([a, replace(a), b])
+    assert result["matched_pairs"] == 1
+    assert result["unmatched_windows"] == 1
+    assert result["rms_pair_difference_nm"] == pytest.approx(.2)
+    assert _repeatability([a, replace(b, velocity_rad_s=-b.velocity_rad_s)])["matched_pairs"] == 0
+    assert _repeatability([a, replace(b, qpos_rad=(.9,)*6)])["matched_pairs"] == 0
+    assert _repeatability([a, replace(b, condition=condition(run_id="other"))])["matched_pairs"] == 0
+
+
+def test_local_prediction_uses_equal_training_trials_and_retains_uncovered_validation():
+    train, _ = observations(joint="joint2")
+    a = train[0]
+    b = replace(a, trial_id="second-train", command_residual_nm=a.command_residual_nm+.2)
+    target = replace(a, trial_id="valid", command_residual_nm=a.command_residual_nm+.1)
+    outside = replace(target, qpos_rad=(.9,)*6)
+    result = _local_repeat_prediction([a, replace(a), b], [target, outside])
+    assert result["predicted_windows"] == 1 and result["unpredicted_windows"] == 1
+    assert not result["all_validation_windows_predicted"]
+    assert result["equal_trial_rmse_on_predicted_windows_nm"] == pytest.approx(0)
+    assert result["status"] == "DIAGNOSTIC_ONLY" and not result["auto_apply"]
+    assert _local_repeat_prediction([a], [target])["predicted_windows"] == 0
+    with pytest.raises(ValueError, match="whole trial leakage"):
+        _local_repeat_prediction([a], [a])
+
+
+def test_changing_closed_loop_commands_can_be_observed_without_weakening_admission():
+    rows, context = motion_records()
+    for row in rows:
+        if row["kind"] == "active_dispatch":
+            j = int(row["torque_console"]["automatic_calibration"]["workspace"]["current_task"]["joint"][-1])-1
+            # Changing control input with a zero-mean short periodic component;
+            # this is synthetic command evidence, not a physics simulation.
+            row["conditioned_tau_nm"][j] += .25*math.sin(row["sequence"]*math.pi/3)
+    legacy = summarize_workspace_identification(rows, condition=asdict(context), workspace={})
+    result = summarize_workspace_identification(iter(rows), condition=asdict(context), workspace={},
+                                               reduction_method="closed_loop_average")
+    assert legacy["admitted_motion_windows"] == 0
+    assert result["admitted_motion_windows"] > 100
+    assert result["running_resistance"]["offline_candidates"] == 2
+    assert result["gravity_fit"]["status"] == "OFFLINE_CANDIDATE"
+    assert not result["auto_apply"] and not result["device_sampling_timestamp_verified"]
+    admitted = [w for w in result["windows"] if w["model_eligible"]]
+    assert all(w["command_variation_exceeds_quasisteady_limit"] for w in admitted)
+    for joint in ("joint2", "joint3"):
+        for role in ("training", "validation"):
+            assert {math.copysign(1, w["observation"]["velocity_rad_s"]) for w in admitted
+                    if w["joint_name"] == joint and w["role"] == role} == {-1, 1}
+
+
+def test_closed_loop_cli_preserves_sources_and_exposes_independent_reprocessing(tmp_path):
+    from control_station.b601_torque_console.report import main
+    rows, context = motion_records()
+    trace = tmp_path/"b601_owner.debug.jsonl"
+    trace.write_text("".join(json.dumps(r)+"\n" for r in rows))
+    source = tmp_path/"automatic_calibration_report.json"
+    source.write_text(json.dumps({"schema": "b601.automatic-calibration-report.v1",
+        "batch_state": "failed", "acquisition_complete": False,
+        "condition": asdict(context), "workspace": {"holding_sampling_plan": "identification"}}))
+    original = (trace.read_bytes(), source.read_bytes())
+    assert main(["--run-dir", str(tmp_path), "--closed-loop-identification",
+                 "--output-root", str(tmp_path/"derived")]) == 0
+    report = json.loads(next((tmp_path/"derived").glob("*/report.json")).read_text())
+    assert report["source_batch_state"] == "failed"
+    assert not report["source_acquisition_complete"]
+    assert report["source_trace_sha256"] == hashlib.sha256(original[0]).hexdigest()
+    assert report["source_report_sha256"] == hashlib.sha256(original[1]).hexdigest()
+    assert report["running_resistance"]["offline_candidates"] == 2
+    assert (trace.read_bytes(), source.read_bytes()) == original
+    source.write_text(json.dumps({"schema": "b601.automatic-calibration-report.v1",
+        "batch_state": "moving", "workspace": {"holding_sampling_plan": "identification"}}))
+    assert main(["--run-dir", str(tmp_path), "--closed-loop-identification"]) == 2
 
 
 def test_automatic_report_wires_continuous_fits_and_keeps_later_stop_separate(tmp_path):
@@ -252,8 +347,9 @@ def test_automatic_report_wires_continuous_fits_and_keeps_later_stop_separate(tm
     assert not report["auto_apply"]
 
 
+@pytest.mark.parametrize("method", ["quasisteady", "closed_loop_average"])
 @pytest.mark.parametrize("fault", ["holding", "receipt", "future", "kp", "human", "saturation", "startup"])
-def test_motion_admission_never_fits_unproven_context(fault):
+def test_motion_admission_never_fits_unproven_context(fault, method):
     rows, context = motion_records()
     rows = rows[:200]
     for row in rows:
@@ -266,7 +362,8 @@ def test_motion_admission_never_fits_unproven_context(fault):
         elif fault == "human": row["torque_console"]["automatic_calibration"]["human_intervention"] = True
         elif fault == "saturation": row["overlay_limited"] = True
         elif fault == "startup": row["gravity_ramp_fraction"] = .5
-    result = summarize_workspace_identification(rows, condition=asdict(context), workspace={"acquisitions": []})
+    result = summarize_workspace_identification(rows, condition=asdict(context), workspace={"acquisitions": []},
+                                               reduction_method=method)
     assert result["admitted_motion_windows"] == 0
     assert result["gravity_fit"]["status"] == "INSUFFICIENT_DATA"
     assert result["rejected"]
