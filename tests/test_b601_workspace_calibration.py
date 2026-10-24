@@ -744,6 +744,15 @@ batch.workspace.holding_calibration.search.state='complete';render();const reche
 batch.workspace.coordinated_holding_enabled=false;delete batch.workspace.holding_calibration;
 batch.state='complete';batch.active=false;batch.workspace.phase='complete';batch.cycle.disable_confirmation_available=true;
 const complete = render();
+batch.workspace.supported_return.route_completed=true;
+batch.workspace.supported_return.manual_disable_confirmation_available=true;
+batch.workspace.supported_return.origin_window={blocking_joints:[{joint_name:'joint5',offset_rad:-.00498545,limit_rad:.0045}]};
+batch.cycle.zero_assist_base_damping_confirmed=true;
+render();const blockedReturn=el('cycle-disable-hint').textContent;
+const blockedInstructions=el('drive-instructions').textContent;
+delete batch.workspace.supported_return.route_completed;
+delete batch.workspace.supported_return.manual_disable_confirmation_available;
+delete batch.workspace.supported_return.origin_window;
 batch.state='failed';batch.workspace.phase='failed';batch.cycle.disable_confirmation_available=false;
 batch.outcome={severity:'warning'};render();const warning=el('phase').textContent;
 const warningInstructions=el('drive-instructions').textContent;
@@ -754,7 +763,7 @@ batch.workspace.supported_return.acquisition_stop={state:'cancelled',reason:'ope
 batch.cycle.disable_confirmation_available=true;batch.cycle.zero_assist_base_damping_confirmed=true;
 render();const returned=el('phase').textContent;const returnInstructions=el('drive-instructions').textContent;
 batch.state='idle';batch.workspace.phase='idle';batch.human_intervention=true;
-console.log(JSON.stringify({idle,returnIdle,returnFixed,active,complete,warning,fault,warningInstructions,faultInstructions,returned,returnInstructions,arrivalWaiting,arrivalReady,staticWindow,contextChanged,recheck,rejected,rechecked,human:render(),stopLabel:el('full-disable').textContent}));
+console.log(JSON.stringify({idle,returnIdle,returnFixed,active,complete,blockedReturn,blockedInstructions,warning,fault,warningInstructions,faultInstructions,returned,returnInstructions,arrivalWaiting,arrivalReady,staticWindow,contextChanged,recheck,rejected,rechecked,human:render(),stopLabel:el('full-disable').textContent}));
 """
     result = subprocess.run([node, "-e", script, json.dumps(functions)],
         check=True, capture_output=True, text=True)
@@ -768,6 +777,10 @@ console.log(JSON.stringify({idle,returnIdle,returnFixed,active,complete,warning,
         "authorizeHidden": True, "confirm": True, "background": True}
     assert states["active"]["arm"] is True
     assert states["complete"]["confirm"] is False
+    assert "joint5 偏差 -0.286°（限 ±0.258°）" in states["blockedReturn"]
+    assert "六轴原位窗口尚未满足" in states["blockedInstructions"]
+    assert "当前保持重力补偿／阻尼" in states["blockedInstructions"]
+    assert "确认已支撑并全失能" in states["blockedReturn"]
     assert states["human"]["arm"] is True
     assert "告警，数据保留" in states["warning"]
     assert "采集故障" in states["fault"]

@@ -30,10 +30,11 @@ class CoordinatedHoldingConfig:
     cruise_velocity_kp_nm_s_per_rad: float = 0.0
     cruise_velocity_ki_nm_per_rad: float = 0.0
     cruise_velocity_window_sec: float = .2
+    cruise_arrival_feedback: bool = False
 
     def __post_init__(self):
         for name, value in vars(self).items():
-            if name == "supported_soft_recovery":
+            if name in {"supported_soft_recovery", "cruise_arrival_feedback"}:
                 if type(value) is not bool:
                     raise TypeError("supported soft recovery must be boolean")
                 continue
@@ -47,6 +48,8 @@ class CoordinatedHoldingConfig:
             raise ValueError("holding bias must fit the combined assist envelope")
         if self.cruise_enabled and not self.motor_local_recovery:
             raise ValueError("cruise velocity feedback requires the explicit motor-local recovery profile")
+        if self.cruise_arrival_feedback and not self.cruise_enabled:
+            raise ValueError("arrival velocity feedback requires explicit cruise feedback")
 
     @property
     def motor_local_recovery(self):
@@ -308,14 +311,17 @@ class CoordinatedPoseHolding:
         if not self.config.cruise_enabled:
             return 0.0, self.bias[i], audit
         audit["reason"] = "native_transition_owns_command"
-        if frame.phase != "track" or frame.reason != "bounded_reference_tracking":
+        arrival = self.config.cruise_arrival_feedback and frame.reason in {
+            "target_reached_braking", "calibration_target_tracking"}
+        audit["arrival"] = arrival
+        if not arrival and (frame.phase != "track" or frame.reason != "bounded_reference_tracking"):
             return 0.0, self.bias[i], audit
         estimator = self.cruise_estimators[AXES.index(i)]
         relative = self.cruise_error_estimators[AXES.index(i)]
         latest = relative.latest_observation
-        reference, velocity = frame.qvel_reference_rad_s, self.cruise_velocity[i]
+        reference, velocity = (0.0 if arrival else frame.qvel_reference_rad_s), self.cruise_velocity[i]
         audit.update(reference_velocity_rad_s=reference, measured_velocity_rad_s=velocity,
-            aligned_reference_velocity_rad_s=velocity+self.cruise_error_velocity[i],
+            aligned_reference_velocity_rad_s=0.0 if arrival else velocity+self.cruise_error_velocity[i],
             observed_at_sec=None if latest is None else latest[0],
             window_span_sec=estimator.span_sec, position_span_rad=estimator.position_span_rad)
         if (not estimator.ready or not relative.ready or latest is None
@@ -323,17 +329,19 @@ class CoordinatedPoseHolding:
             or estimator.position_span_rad < 2*(self.motion.position_resolution_rad or 0)):
             audit["reason"] = "waiting_for_resolved_cruise_motion"
             return 0.0, self.bias[i], audit
-        if reference*velocity <= 0 or reference*(self.goal[i]-self.q[i]) <= 0:
+        if not arrival and (reference*velocity <= 0 or reference*(self.goal[i]-self.q[i]) <= 0):
             audit["reason"] = "motion_not_aligned_with_reference"
             return 0.0, self.bias[i], audit
         # Both slopes use the same acknowledged frames/timestamps. Comparing
         # an instantaneous reference with a filtered measurement would charge
         # normal reference acceleration/deceleration into the retained bias.
-        error = self.cruise_error_velocity[i]
+        # Arrival owns a zero velocity objective. Do not differentiate the
+        # native reference jump from the paced trajectory to the endpoint.
+        error = -velocity if arrival else self.cruise_error_velocity[i]
         proportional = self.config.cruise_velocity_kp_nm_s_per_rad*error
         increment = self.config.cruise_velocity_ki_nm_per_rad*error*dt
         bias = max(-self.config.bias_cap_nm, min(self.config.bias_cap_nm, self.bias[i]+increment))
-        audit.update(active=True, reason="resolved_cruise_velocity_feedback", error_rad_s=error,
+        audit.update(active=True, reason="resolved_arrival_velocity_feedback" if arrival else "resolved_cruise_velocity_feedback", error_rad_s=error,
             proportional_request_nm=proportional, requested_bias_increment_nm=increment)
         return proportional, bias, audit
 
@@ -426,6 +434,13 @@ class CoordinatedPoseHolding:
                         proposed_bias[i], moving[i] = cruise_bias, True
                         cruise_p[i] = proportional
                         approach_reasons[i] = "cruise_velocity_bias_refinement"
+                    elif status.get("arrival") and approach_reasons[i] in {
+                        "arrival_feedback_unloading", "arrival_overshoot_drive_unloading", "moving_target_error_unwinds_bias"}:
+                        # Keep support while the committed velocity window is
+                        # warming. Native brakes and the composed speed cap
+                        # still own actual excessive motion.
+                        proposed_bias[i] = self.bias[i]
+                        approach_reasons[i] = "arrival_observer_warming_retains_support"
                 demand[i] = frame.requested_torque_nm + cruise_p[i] + (0.0 if is_probe else proposed_bias[i])
         self.braking = any(f.phase == "brake" and f.reason != "target_reached_braking" for f in frames)
         if self.braking:
@@ -608,7 +623,8 @@ class CoordinatedPoseHolding:
         cruise_sample = None
         if self.config.cruise_enabled and permitted and not self.braking and cruise_joint is not None:
             frame = frames[AXES.index(cruise_joint)]
-            if frame.phase == "track" and frame.reason == "bounded_reference_tracking":
+            if (frame.phase == "track" and frame.reason == "bounded_reference_tracking"
+                or self.config.cruise_arrival_feedback and frame.reason in {"target_reached_braking", "calibration_target_tracking"}):
                 cruise_sample = (cruise_joint, self.last_time, self.q[cruise_joint], frame.q_reference_rad)
         self.pending = (sequence, tuple(command), tuple(proposed_bias), tuple(anchors), tuple(moving), brake_seed,
                         support_anchor, supported_braking, cruise_sample)

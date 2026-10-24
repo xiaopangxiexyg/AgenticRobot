@@ -188,6 +188,7 @@ def build_automatic_report(run_dir: Path) -> dict:
                 position_bin_width_rad=width)
             report["command_identification"] = identification
             report["local_even_command_identification"] = identification["local_even_command_fit"]
+            report["local_command_predictability"] = identification["local_command_predictability"]
             if "paired_resistance_fit" in identification:
                 report["paired_resistance_identification"] = identification["paired_resistance_fit"]
             report["workspace_motion"] = {"status": "CONTINUOUS_IDENTIFICATION_WINDOWS",

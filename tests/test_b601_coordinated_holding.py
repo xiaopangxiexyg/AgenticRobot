@@ -1793,6 +1793,16 @@ def test_manual_return_after_soft_failure_retains_partial_acquisition_and_budget
     assert workspace._return_route_complete and not r.controller.automatic_disable_ready
     assert r.controller.cycle_disable_confirmation_ready
     assert not workspace._return_completed  # The passive offset was not driven back.
+    returned = result["workspace"]["supported_return"]
+    assert returned["route_completed"]
+    assert not returned["origin_window"]["within_window"]
+    assert returned["origin_window"]["blocking_joints"]
+    assert returned["manual_disable_confirmation_available"]
+    observation = returned["completion_observation"]
+    assert observation["zero_assist_base_damping_confirmed"] and observation["six_axis_stationary"]
+    assert not observation["automatic_origin_confirmed"]
+    workspace.owner_stopped(now_sec=r.now, reason="operator_interrupt")
+    assert workspace.result_record()["workspace"]["supported_return"]["completion_observation"] == observation
 
 
 @pytest.mark.parametrize("case", ["fault", "page_unload", "stale", "human", "budget"])

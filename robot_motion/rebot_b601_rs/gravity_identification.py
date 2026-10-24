@@ -228,8 +228,12 @@ def fit_paired_resistance_command(training, validation, *, max_validation_rmse_n
             validation_rmse_nm=rmse, covered_validation_pairs=sum(p["covered"] for p in prediction_rows),
             zero_correction_validation_rmse_nm=math.sqrt(float(np.mean([np.mean(v) for v in zero_errors.values()]))),
             coefficient_semantics="empirical_odd_command_coefficients_not_coulomb_or_viscous_motor_parameters")
+        fit["validation_checks"] = {"coverage_passed": all(p["covered"] for p in prediction_rows),
+            "prediction_error_passed": rmse <= max_validation_rmse_nm}
         if not all(p["covered"] for p in prediction_rows):
             fit["reasons"] = ["validation_outside_training_pose_load_or_speed_coverage"]
+            if rmse > max_validation_rmse_nm:
+                fit["reasons"].append("held_out_odd_command_prediction_error")
         elif rmse > max_validation_rmse_nm:
             fit.update(status="VALIDATION_FAILED", reasons=["held_out_odd_command_prediction_error"])
         else:
@@ -370,8 +374,13 @@ def fit_paired_gravity_command(training, validation, *, max_validation_rmse_nm=.
         covered_validation_pairs=sum(covered), validation_pairs_count=len(valid_pairs),
         outside_coverage_predictions_are_extrapolation=not all(covered),
         coverage={"qpos_min_rad": q.min(axis=0).tolist(), "qpos_max_rad": q.max(axis=0).tolist()})
+    result["validation_checks"] = {"coverage_passed": all(covered),
+        "prediction_error_passed": rmse <= max_validation_rmse_nm}
     if not all(covered):
-        return reject("validation_outside_training_pose_coverage")
+        reject("validation_outside_training_pose_coverage")
+        if rmse > max_validation_rmse_nm:
+            result["reasons"].append("held_out_paired_command_prediction_error")
+        return result
     if rmse > max_validation_rmse_nm:
         result["status"] = "VALIDATION_FAILED"
         return reject("held_out_paired_command_prediction_error")

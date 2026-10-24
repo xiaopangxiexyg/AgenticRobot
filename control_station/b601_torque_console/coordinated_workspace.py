@@ -77,6 +77,7 @@ class CoordinatedWorkspaceController:
         self._return_context = None
         self._return_completed = False
         self._return_route_complete = False
+        self._return_completion_observation = None
         self._return_revoked = None
         self._manual_return_requested = None
         self._dispatch_withdrawal = None
@@ -249,6 +250,7 @@ class CoordinatedWorkspaceController:
         # not a new straight-line six-axis move or an arbitrary-pose planner.
         self._tasks = self.workspace.tasks(self._supported_origin)[-3:]
         self._return_route_complete = self._return_completed = False
+        self._return_completion_observation = None
         self._index = self._segments = 0
         self._nominal_target = self.pose.q
         self._search = self._probe = self._observation = self._sample_pose = None
@@ -539,9 +541,17 @@ class CoordinatedWorkspaceController:
                         and self._reason in RETURNABLE_STOPS):
                         self._begin_return()
                     else:
-                        self._return_completed = self._return_route_complete and self._supported_origin is not None and all(
-                            abs(q-o) <= self.workspace.holding_search.movement_rad
-                            for q, o in zip(self.pose.q, self._supported_origin))
+                        window = self._supported_origin_window()
+                        self._return_completed = self._return_route_complete and window is not None and window["within_window"]
+                        if self._return_route_complete:
+                            self._return_completion_observation = {
+                                "qpos_rad": self.pose.q, "origin_window": window,
+                                "zero_assist_base_damping_confirmed": self._zero_base,
+                                "six_axis_stationary": self.pose.quiet(),
+                                "automatic_origin_confirmed": self._return_completed,
+                                "completed_at_sec": completed}
+                            self._records.append({"kind": "workspace_return_evaluation",
+                                "recorded_monotonic_sec": completed, **copy.deepcopy(self._return_completion_observation)})
                         self._transition(self._destination, self._reason)
             else:
                 self._quiet_since = None
@@ -847,6 +857,10 @@ class CoordinatedWorkspaceController:
             "origin_qpos_rad": self._origin, "current_qpos_rad": self.pose.q,
             "supported_return": {"enabled": self._return_and_disable,
                 "supported_origin_qpos_rad": self._supported_origin,
+                "route_completed": self._return_route_complete,
+                "origin_window": self._supported_origin_window(),
+                "completion_observation": copy.deepcopy(self._return_completion_observation) if detailed else None,
+                "manual_disable_confirmation_available": self.cycle_disable_confirmation_ready,
                 "active": self._return_context is not None and self._active,
                 "completed": self._return_completed,
                 "revoked_reason": self._return_revoked,
@@ -998,3 +1012,13 @@ class CoordinatedWorkspaceController:
                 for q, o in zip(self.pose.q, self._supported_origin))
             and (self._phase == "complete" or self._return_context is not None
                  and self._reason == self._return_context["reason"] and self._reason in RETURNABLE_STOPS))
+
+    def _supported_origin_window(self):
+        """Describe the existing six-axis gate without widening or bypassing it."""
+        if self._supported_origin is None:
+            return None
+        limit = self.workspace.holding_search.movement_rad
+        blocking = [{"joint_name": f"joint{i+1}", "offset_rad": q-o, "limit_rad": limit}
+            for i, (q, o) in enumerate(zip(self.pose.q, self._supported_origin)) if abs(q-o) > limit]
+        return {"tolerance_rad": limit, "within_window": not blocking, "blocking_joints": blocking,
+            "semantics": "encoder_window_not_physical_support_detection"}

@@ -886,6 +886,34 @@ GUI 应选择「J2/J3 位姿采集」，不是「固定位置」或另一项 20�
 
 ### 近零 J2/J3 双向多速度连续辨识（显式候选）
 
+运动拟合还需核对所选关节 native tracker 的阶段：外层 console 为 `track` 不代表内部
+仍在巡航。已记录 native axes 时，只接纳所选轴 `track/bounded_reference_tracking` 的
+区间；端点 `target_reached_braking`、到位调整及其他阶段记为
+`endpoint_servo_not_cruise_identification`。完整派发与其他准入条件仍先后保持原约束，
+退出阶段不使此前合格窗口失效。旧报告不会被原地重写，须用新处理器读取原始轨迹另存
+派生报告；仅重算旧报告中已准入观察不能证明已重新检查 native 阶段。
+
+四中心显式 profile 另启用 `coordinated_holding.cruise_arrival_feedback=true`；默认及旧单中心
+profile 仍关闭。正常到位时，复用已确认的实际速度窗口，以零速度误差调节原有偏置，
+不再一边解析到运动就持续删除支撑偏置、一边停住后重新积分补力。该阶段不对从规划
+参考跳到端点的变化求导；窗口未解析时保留支撑而不进行该卸载，静止且未到位仍复用
+原有有界修正。原生真正制动、撤销、总助力、slew、速度和 watchdog 优先级不变。
+离线合成 plant 只检查到位和界限，不能证明真实传动下的端点振荡或耗时已经消除。
+
+回位报告区分 `supported_return.route_completed`（既有 J2/J3 路线已执行）和
+`supported_return.completed`（六轴原位窗口也在最终停稳时通过）。新增 `origin_window`
+列出未满足窗口的关节、实际偏差和原限值；`completion_observation` 保留结束瞬间的零助力、
+基础阻尼、停稳及六轴窗口结果，避免 owner 退出后只剩一个无法解释的布尔值。
+这不改变自动失能的六轴门，也不驱动未受控关节回位。路线完成但其他轴窗口未通过时，
+GUI 明确显示阻塞轴，继续重力／阻尼保持；已有人工支撑确认入口仍由 owner 原条件决定。
+角度窗口不是物理支撑传感器，不能以路线完成替代托架确认。
+
+离线模型的 `validation_checks` 分别报告覆盖与误差是否通过；若两项都失败，保留两个
+原因，不再用“覆盖不足”遮住已有预测误差超标。状态、误差上限和不外推规则不变。
+`local_command_predictability` 汇总同方向、完整姿态及实际速度邻域的整段留出预测，明确
+覆盖分母及已覆盖子集误差；即使子集误差通过，也仍为 `DIAGNOSTIC_ONLY`、
+`physical_compensation_ready=false`，不冒充全覆盖模型或已经分离的重力／摩擦参数。
+
 `b601_j2_j3_four_centres_cruise_identification_v1.json` 将单中心巡航候选的中心改为
 `(3°,3°)、(3°,6°)、(6°,6°)、(6°,3°)`；其余配置完全相同，仍在 `0–10°` 声明范围内。
 两轴四中心共 112 段，包含 64 段训练、32 段整段留出验证和 16 段非拟合搬运。

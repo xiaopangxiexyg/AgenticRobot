@@ -347,6 +347,32 @@ def test_local_even_reports_are_per_pose_and_damping_and_cruise_diagnostics_are_
         assert "sum_abs_selected_command_nm" not in trial
 
 
+def test_native_arrival_frames_cannot_enter_motion_fits_through_outer_track_label():
+    rows, context = motion_records()
+    ends = {}
+    for row in rows:
+        if row.get("kind") == "active_dispatch":
+            marker = row["torque_console"]["calibration_trial"]
+            ends[marker["trial_id"]] = row["feedback_timestamp_sec"]
+    cutoffs = {}
+    for row in rows:
+        if row.get("kind") != "active_dispatch":
+            continue
+        console = row["torque_console"]
+        marker = console["calibration_trial"]
+        trial = marker["trial_id"]
+        cutoffs.setdefault(trial, (row["feedback_timestamp_sec"]+ends[trial])/2)
+        selected = int(console["automatic_calibration"]["workspace"]["current_task"]["joint"][-1])-2
+        axes = [{"phase": "brake", "reason": "target_reached_braking"} for _ in range(2)]
+        if row["feedback_timestamp_sec"] < cutoffs[trial]:
+            axes[selected] = {"phase": "track", "reason": "bounded_reference_tracking"}
+        console["coordinated_holding"] = {"axes": axes}
+    result = summarize_workspace_identification(rows, condition=asdict(context), workspace={"acquisitions": []})
+    assert result["admitted_motion_windows"] > 0
+    assert result["rejected"]["endpoint_servo_not_cruise_identification"] > 0
+    assert all(w["end_sec"] < cutoffs[w["trial_id"]] for w in result["windows"])
+
+
 def test_position_cells_reduce_complete_measured_traversals_with_original_receipt_admission():
     rows, context = motion_records()
     result = summarize_workspace_identification(rows, condition=asdict(context), workspace={},
@@ -452,9 +478,28 @@ def test_local_prediction_uses_equal_training_trials_and_retains_uncovered_valid
     assert not result["all_validation_windows_predicted"]
     assert result["equal_trial_rmse_on_predicted_windows_nm"] == pytest.approx(0)
     assert result["status"] == "DIAGNOSTIC_ONLY" and not result["auto_apply"]
+    assert result["validation_coverage_fraction"] == .5
+    assert result["covered_subset_error_passed"]
+    assert not result["physical_compensation_ready"]
     assert _local_repeat_prediction([a], [target])["predicted_windows"] == 0
     with pytest.raises(ValueError, match="whole trial leakage"):
         _local_repeat_prediction([a], [a])
+
+
+def test_validation_reports_both_coverage_and_error_failure_without_changing_admission():
+    train, valid = paired_observations()
+    outside = [replace(o, qpos_rad=tuple(q+.2 for q in o.qpos_rad),
+        command_residual_nm=o.command_residual_nm+.2) for o in valid]
+    gravity = fit_paired_gravity_command(train, outside)
+    assert gravity["status"] == "INSUFFICIENT_DATA"
+    assert gravity["validation_checks"] == {"coverage_passed": False, "prediction_error_passed": False}
+    assert gravity["reasons"] == ["validation_outside_training_pose_coverage", "held_out_paired_command_prediction_error"]
+    outside = [replace(o, qpos_rad=tuple(q+.2 for q in o.qpos_rad),
+        command_residual_nm=o.command_residual_nm+math.copysign(.2, o.velocity_rad_s)) for o in valid]
+    for fit in fit_paired_resistance_command(train, outside)["fits"]:
+        assert fit["status"] == "INSUFFICIENT_DATA"
+        assert fit["validation_checks"] == {"coverage_passed": False, "prediction_error_passed": False}
+        assert fit["reasons"] == ["validation_outside_training_pose_load_or_speed_coverage", "held_out_odd_command_prediction_error"]
 
 
 def test_changing_closed_loop_commands_can_be_observed_without_weakening_admission():

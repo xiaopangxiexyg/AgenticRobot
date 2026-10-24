@@ -2,6 +2,7 @@
 
 import json
 import math
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -62,11 +63,12 @@ def test_profile_changes_only_explicit_velocity_feedback_and_keeps_existing_enve
     assert controller_from_profile(tmp_path, candidate=False)._workspace._coordinated.pose.cruise_estimators == ()
 
 
-def test_four_centre_profile_changes_only_centres_inside_existing_near_zero_range():
+def test_four_centre_profile_changes_only_centres_and_explicit_arrival_feedback():
     old, new = load_automatic_profile(CANDIDATE), load_automatic_profile(FOUR_CENTRES)
     for name in ("joint2_centres_deg", "joint3_centres_deg"):
         assert new["workspace"][name] == [3, 6]
         new["workspace"][name] = old["workspace"][name]
+    assert new["workspace"]["coordinated_holding"].pop("cruise_arrival_feedback") is True
     assert new == old
 
 
@@ -194,8 +196,10 @@ def test_matched_accelerating_reference_never_accumulates_filtered_velocity_lag(
     assert active
 
 
-def test_native_brake_resets_cruise_and_retains_raw_speed_and_watchdog_guards(tmp_path, monkeypatch):
+@pytest.mark.parametrize("arrival", [False, True])
+def test_native_brake_resets_cruise_and_retains_raw_speed_and_watchdog_guards(tmp_path, monkeypatch, arrival):
     core = controller_from_profile(tmp_path)._workspace._coordinated.pose
+    core.config = replace(core.config, cruise_arrival_feedback=arrival)
     warm_core(core)
     core.adopt_hold(2, .2)
     braking = False
@@ -229,6 +233,36 @@ def test_native_brake_resets_cruise_and_retains_raw_speed_and_watchdog_guards(tm
     dt = core.observe(1.70, core.q, (0, 0, .196, 0, 0, 0))
     with pytest.raises(ValueError, match="raw joint velocity exceeded"):
         core.step(sequence=101, dt=dt, permitted=True, point_search=False, cruise_joint=2)
+
+
+@pytest.mark.parametrize("direction", [-1, 1])
+def test_arrival_velocity_feedback_preserves_support_and_ignores_endpoint_reference_jump(tmp_path, monkeypatch, direction):
+    core = controller_from_profile(tmp_path)._workspace._coordinated.pose
+    core.config = replace(core.config, cruise_arrival_feedback=True)
+    warm_core(core)
+    core.adopt_hold(2, .3)
+    for tracker, i in zip(core.trackers, AXES, strict=True):
+        def frame(*, i=i, **kwargs):
+            return B601JointMotionFrame(phase="brake", reason="target_reached_braking",
+                q_reference_rad=.02 if i == 2 else 0, qvel_reference_rad_s=0,
+                control_qvel_rad_s=0, position_torque_nm=0, velocity_torque_nm=0, requested_torque_nm=0)
+        monkeypatch.setattr(tracker, "update", frame)
+    active = False
+    for n in range(1, 41):
+        dt = core.observe(1.29+n*.01, (0, 0, direction*n*.0001, 0, 0, 0), (0, 0, direction*.01, 0, 0, 0))
+        before = core.bias
+        command, audit = core.step(sequence=30+n, dt=dt, permitted=True, point_search=False, cruise_joint=2)
+        status = audit["cruise_velocity_control"]
+        if status["active"]:
+            active = True
+            assert status["arrival"] and status["error_rad_s"] == pytest.approx(-direction*.01)
+            assert status["aligned_reference_velocity_rad_s"] == 0
+            assert status["proportional_request_nm"] == pytest.approx(-direction*.06)
+            assert (audit["proposed_bias_nm"][2]-before[2])*direction <= 0
+        assert core.bias == before
+        core.record_dispatch(30+n, command)
+        assert sum(abs(v) for v in command) <= 1+1e-12
+    assert active and not core.braking
 
 
 @pytest.mark.parametrize("width", [True, .002, float("nan"), float("inf"), -.1])
@@ -277,7 +311,8 @@ def test_complete_identification_wires_cruise_only_to_training_validation_axis(t
     assert controller.cycle_disable_confirmation_ready
 
 
-def simulate_motion(tmp_path, *, candidate, speed, direction, inertia=.2, period=.01):
+def simulate_motion(tmp_path, *, candidate, speed, direction, inertia=.2, period=.01, arrival=False,
+                    static_scale=1., load_offset=0.):
     """Declared stick/slip plant, not identified B601 mechanics.
 
     Known motor damping is instantaneous in this toy. Gravity residual and
@@ -285,6 +320,8 @@ def simulate_motion(tmp_path, *, candidate, speed, direction, inertia=.2, period
     same initial conditions and drive limits are used for both controllers.
     """
     core = controller_from_profile(tmp_path, candidate=candidate)._workspace._coordinated.pose
+    if arrival:
+        core.config = replace(core.config, cruise_arrival_feedback=True)
     centre = math.radians(5)
     q = [0, centre, centre-direction*.035, 0, 0, 0]
     measured = tuple(round(v/RESOLUTION)*RESOLUTION for v in q)
@@ -305,8 +342,8 @@ def simulate_motion(tmp_path, *, candidate, speed, direction, inertia=.2, period
     for n in range(1, int(40/period)+1):
         for _ in range(round(period/.001)):
             for i in AXES:
-                load = .08+.2*(q[3-i]-centre)
-                static = .24+.04*math.sin(45*q[i])
+                load = .08+.2*(q[3-i]-centre)+load_offset
+                static = static_scale*(.24+.04*math.sin(45*q[i]))
                 kinetic = .10+.02*math.cos(45*q[i])
                 net = command[i]-load
                 v = velocity[i]
@@ -362,3 +399,20 @@ def test_quantized_stick_slip_cruise_improves_actual_speed_without_relaxing_limi
     assert candidate["active_cycles"] > 0 and candidate["samples"] > 10
     assert candidate["peak_speed_rad_s"] < .195
     assert candidate["rms_speed_error_rad_s"] < baseline["rms_speed_error_rad_s"]
+
+
+@pytest.mark.parametrize("direction,inertia,static_scale,load", [
+    (1, .2, 2., .15), (1, .6, 2., .15), (-1, .2, 2., -.15), (1, .2, 1., 0),
+])
+def test_arrival_feedback_keeps_cruise_and_reaches_existing_tolerance_in_declared_plant(
+    tmp_path, direction, inertia, static_scale, load,
+):
+    results = [simulate_motion(tmp_path, candidate=True, speed=.0075, direction=direction,
+        inertia=inertia, static_scale=static_scale, load_offset=load, arrival=enabled)
+        for enabled in (False, True)]
+    print(json.dumps({"declared_plant_not_identified_hardware": True, "comparisons": results}))
+    for result in results:
+        assert result["outcome"] == "arrived", result
+        assert abs(result["final_error_rad"]) <= .003375
+        assert result["peak_speed_rad_s"] < .195
+    assert results[1]["rms_speed_error_rad_s"] == pytest.approx(results[0]["rms_speed_error_rad_s"], abs=1e-12)

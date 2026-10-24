@@ -97,14 +97,19 @@ def _local_repeat_prediction(training, validation):
                           training_command_residual_range_nm=[min(values), max(values)])
             errors[target.trial_id].append(error)
         predictions.append(record)
+    rmse = (math.sqrt(sum(sum(e*e for e in values)/len(values)
+        for values in errors.values())/len(errors)) if errors else None)
     return {"status": "DIAGNOSTIC_ONLY", "auto_apply": False,
         "pose_tolerance_rad": .0045, "maximum_speed_ratio": 1.25,
         "minimum_training_trials_per_prediction": 2,
         "validation_windows": len(validation), "predicted_windows": sum(p["predicted"] for p in predictions),
         "unpredicted_windows": sum(not p["predicted"] for p in predictions),
         "all_validation_windows_predicted": bool(validation) and all(p["predicted"] for p in predictions),
-        "equal_trial_rmse_on_predicted_windows_nm": (math.sqrt(sum(sum(e*e for e in values)/len(values)
-            for values in errors.values())/len(errors)) if errors else None),
+        "validation_coverage_fraction": sum(p["predicted"] for p in predictions)/len(validation) if validation else None,
+        "equal_trial_rmse_on_predicted_windows_nm": rmse,
+        "max_diagnostic_rmse_nm": .05,
+        "covered_subset_error_passed": rmse is not None and rmse <= .05,
+        "physical_compensation_ready": False,
         "predictions": predictions,
         "semantics": "partial_local_command_predictability_not_full_model_validation_or_physical_friction"}
 
@@ -312,6 +317,14 @@ def summarize_workspace_identification(records, *, condition, workspace,
         if (batch.get("human_intervention") is not False or console.get("fault")
             or console.get("phase") != "track" or (batch.get("workspace") or {}).get("supported_soft_stop")):
             return None, "authority_or_braking_interval"
+        holding = console.get("coordinated_holding") or {}
+        axes = holding.get("axes")
+        if axes is not None:
+            if not isinstance(axes, list) or len(axes) != 2 or not all(isinstance(a, dict) for a in axes):
+                raise ValueError("invalid selected native tracking phase evidence")
+            selected = axes[int(task["joint"][-1])-2]
+            if selected.get("phase") != "track" or selected.get("reason") != "bounded_reference_tracking":
+                return None, "endpoint_servo_not_cruise_identification"
         if any(row.get(flag) is not False for flag in ("torque_limited", "slew_limited", "overlay_limited")):
             return None, "limited_or_unknown_command"
         if six(row.get("vendor_kp_nm_per_rad"), "driver kp") != (0.0,)*6:
@@ -488,6 +501,12 @@ def summarize_workspace_identification(records, *, condition, workspace,
         "local_even_command_fit": {"scope": "separate_local_full_pose_and_fixed_damping_regions",
             "gravity_scales_frozen": True, "auto_apply": False, "profile_export_allowed": False,
             "fits": local_even},
+        "local_command_predictability": {"status": "DIAGNOSTIC_ONLY", "auto_apply": False,
+            "quantity": "direction_conditioned_software_command_not_separated_gravity_or_friction",
+            "regions": [{"pose_index": f["pose_index"], "joint_name": f["joint_name"],
+                "active_driver_kd_nm_s_per_rad": f["active_driver_kd_nm_s_per_rad"],
+                **{k: v for k, v in f["local_repeat_prediction"].items() if k != "predictions"}}
+                for f in fits if "local_repeat_prediction" in f]},
         "cruise_execution_diagnostic": {"quantity": "software_commands_not_measured_force",
             "scope": "admitted_complete_training_validation_dispatches_not_just_fit_windows",
             "unavailable_samples": unavailable_execution_samples,
