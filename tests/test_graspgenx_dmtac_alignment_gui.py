@@ -106,7 +106,7 @@ print(side + ": current-only geometry, controls, defaults and legacy JSON passed
 def test_actual_tk_load_save_keeps_complete_new_pose_and_selected_reset(tmp_path, monkeypatch, profile_name):
     from utils import graspgenx_dmtac_alignment_gui as gui
     from deployments.perception.dmtac_grasp_overlay import (
-        DMTAC_M_GRASPGENX_ALIGNMENT_PROFILE_ID,
+        DMTAC_M_GRASPGENX_ALIGNMENT_PROFILE_ID_V4,
         DMTAC_M_GRASPGENX_ALIGNMENT_PROFILE_ID_V5,
         dmtac_graspgenx_alignment_profile,
     )
@@ -119,7 +119,7 @@ def test_actual_tk_load_save_keeps_complete_new_pose_and_selected_reset(tmp_path
         def set(self, value):
             self.value = value
 
-    profile_id = (DMTAC_M_GRASPGENX_ALIGNMENT_PROFILE_ID if profile_name == "v4"
+    profile_id = (DMTAC_M_GRASPGENX_ALIGNMENT_PROFILE_ID_V4 if profile_name == "v4"
         else DMTAC_M_GRASPGENX_ALIGNMENT_PROFILE_ID_V5)
     old_pose = [.01, -.02, .14, .03, -.04, .05]
     new_pose = [-.06, .07, .18, -.2, .15, -.1]
@@ -133,7 +133,6 @@ def test_actual_tk_load_save_keeps_complete_new_pose_and_selected_reset(tmp_path
     source.write_text(json.dumps(payload))
     app = gui.AlignmentApp.__new__(gui.AlignmentApp)
     app.model, app.output, app.alignment_profile_id = model, output, profile_id
-    app._alignment_profile = dmtac_graspgenx_alignment_profile(profile_id)
     names = ("side gripper_q tcp_z production_model_from_tcp_z production_opening production_palm_z "
         "production_finger_length production_finger_thickness production_pad_height opening palm_z "
         "finger_length finger_thickness pad_height grasp_center_x grasp_center_y grasp_center_z "
@@ -157,7 +156,7 @@ def test_actual_tk_load_save_keeps_complete_new_pose_and_selected_reset(tmp_path
     model.state.model_finger_length_m = .123
     app.reset()
     assert gui._state_tool_tcp_pose(model.state) == pytest.approx(new_pose)
-    assert model.state.model_finger_length_m == app._alignment_profile.nominal_geometry.finger_length_m
+    assert model.state.model_finger_length_m == dmtac_graspgenx_alignment_profile(profile_id).nominal_geometry.finger_length_m
 
 
 @pytest.mark.parametrize("pose", (None, [0.] * 5, [0., 0., float("nan"), 0., 0., 0.],
@@ -176,12 +175,12 @@ def test_legacy_scalar_tcp_still_loads_without_a_complete_pose():
 
 
 @pytest.mark.parametrize("entry", ("headless", "tk_startup"))
-def test_v5_startup_rejects_loaded_left_origin_before_relabelling(tmp_path, monkeypatch, capsys, entry):
+def test_startup_rejects_unknown_loaded_side_before_relabelling(tmp_path, monkeypatch, capsys, entry):
     import sys
     from utils import graspgenx_dmtac_alignment_gui as gui
     from deployments.perception.dmtac_grasp_overlay import DMTAC_M_GRASPGENX_ALIGNMENT_PROFILE_ID_V5
-    source, output = tmp_path/"left.json", tmp_path/"blocked.json"
-    content = json.dumps({"side": "left", "profile_unchanged_fields": {
+    source, output = tmp_path/"invalid.json", tmp_path/"blocked.json"
+    content = json.dumps({"side": "invalid", "profile_unchanged_fields": {
         "tool_tcp_pose_endpoint_m_rad": [0., 0., .14, 0., 0., 0.]}})
     source.write_text(content)
     args = ["alignment", "--urdf", str(ROOT/"assets/realman_dual_arm_inspire_gripper_dmtacm/realman_dual_arm_inspire_gripper_dmtacm.urdf"),
@@ -193,21 +192,20 @@ def test_v5_startup_rejects_loaded_left_origin_before_relabelling(tmp_path, monk
     monkeypatch.setattr(gui.tk, "Tk", lambda: pytest.fail("Reject origin before opening Tk"))
     monkeypatch.setattr(gui, "AlignmentModel", lambda *args: pytest.fail("Reject origin before model assembly"))
     assert gui.main() == 2
-    assert "one right-arm" in capsys.readouterr().out
+    assert "side must be left or right" in capsys.readouterr().out
     assert source.read_text() == content and not output.exists()
 
 
-def test_headless_export_uses_the_explicit_selected_profile(tmp_path):
+@pytest.mark.parametrize("side", ("left", "right"))
+def test_headless_export_uses_common_new_default_for_both_sides(tmp_path, side):
     from utils.graspgenx_dmtac_alignment_gui import export_payload
-    from deployments.perception.dmtac_grasp_overlay import DMTAC_M_GRASPGENX_ALIGNMENT_PROFILE_ID_V5
-    output = tmp_path/"right-v5.json"
+    output = tmp_path/f"{side}-v5.json"
     export_payload(ROOT/"assets/realman_dual_arm_inspire_gripper_dmtacm/realman_dual_arm_inspire_gripper_dmtacm.urdf",
-        output, "right", [0.] * 6, None,
-        ROOT/"hardware/rm65/utils/configs/calibrations/rm65_right_DMTAC_M.json",
-        DMTAC_M_GRASPGENX_ALIGNMENT_PROFILE_ID_V5)
+        output, side, [0.] * 6, None,
+        ROOT/f"hardware/rm65/utils/configs/calibrations/rm65_{side}_DMTAC_M.json")
     value = json.loads(output.read_text())
-    assert value["side"] == "right"
+    assert value["side"] == side
     assert value["graspgenx_model"]["finger_length_m"] == .0867
     assert value["graspgenx_model"]["palm_z_m"] == pytest.approx(-.024)
-    expected_tcp = json.loads((ROOT/"hardware/rm65/utils/configs/calibrations/rm65_right_DMTAC_M.json").read_text())["tcp"]["pose_flange_m_rad"]
+    expected_tcp = json.loads((ROOT/f"hardware/rm65/utils/configs/calibrations/rm65_{side}_DMTAC_M.json").read_text())["tcp"]["pose_flange_m_rad"]
     assert value["profile_unchanged_fields"]["tool_tcp_pose_endpoint_m_rad"] == expected_tcp

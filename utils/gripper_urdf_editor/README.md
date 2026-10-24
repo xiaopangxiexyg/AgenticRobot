@@ -108,8 +108,9 @@ mass/inertia、控制器 TCP 或运行中的推理 profile；保存只产生独�
 
 Tk 入口接受 `--urdf`、`--side`、`--tool-profile`、`--load-alignment`、
 `--headless-export`；Qt 使用同一初值与 JSON reader，并接受 `--urdf`、`--side`、
-`--tool-profile`。两者的 `--alignment-profile` 默认保持 v4；显式
-`DMTAC_M_graspgenx_alignment_v5_right_q0` 只支持右侧。启动、重置和 headless export
+`--tool-profile`。两者的 `--alignment-profile` 默认使用左右共用的
+`DMTAC_M_graspgenx_alignment_v5_q0`（指长 86.7 mm、palm Z −24 mm）；显式
+`DMTAC_M_graspgenx_alignment_v4_q0` 可重建旧尺寸。启动、重置和 headless export
 读取同一个几何 owner，原 4B2 字段仅用于既有 JSON/对照视图兼容。
 
 完整 `tool_tcp_pose_endpoint_m_rad` 为六个有限 xyz/rpy 数值，存在时优先于 legacy z；

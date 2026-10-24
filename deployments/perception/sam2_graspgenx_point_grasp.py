@@ -78,7 +78,7 @@ GRASPGENX_CHECKPOINT_LICENSE = "NVIDIA-Open-Model-License"
 
 # DMTAC M's inner closing volume in the calibrated tool convention.  GraspGenX
 # expects +Z approach and +X closing in the supplied model frame. The reviewed
-# DMTAC origin is 29 mm distal to the nominal palm, not at that boundary. Both
+# DMTAC origin is 24 mm distal to the nominal palm, not at that boundary. Both
 # conditioning boxes and the OBB fingertip depth must therefore use the same
 # axial interval as capture/collision checks; the backend does not rebase it.
 # The linkage keeps opposing pads parallel, so this is a parallel_2f embodiment.
@@ -962,7 +962,6 @@ class Sam2GraspGenXPointGraspPlanner:
         max_candidates: int, candidate_selectors: Mapping[str, CandidateSelector],
         visible_scene_factory: Callable[..., VisibleGraspScene] | None = None,
         use_visible_target_points: bool = False,
-        component_sides: Mapping[str, str] | None = None,
     ) -> GraspGenXComponentProposals:
         """Generate once for components sharing the same gripper and scene.
 
@@ -977,13 +976,6 @@ class Sam2GraspGenXPointGraspPlanner:
             _required(name, field_name="component name")
             if not callable(selector):
                 raise TypeError("Each component selector must be callable.")
-        if component_sides is not None and (
-                not isinstance(component_sides, Mapping) or set(component_sides) != set(selectors)):
-            raise ValueError("Component side bindings must match every selector.")
-        if self._alignment.source_content_hash is not None:
-            if component_sides is None:
-                raise ValueError("Explicit v5 shared proposals require named arm-side bindings.")
-            self.require_alignment_motion_sides(tuple(component_sides[name] for name in selectors))
         observation, pool = self._prepare_pool(
             image, depth_m, pixel_uv=pixel_uv, intrinsics=intrinsics,
             base_from_camera=base_from_camera, max_candidates=max_candidates,
@@ -2983,9 +2975,6 @@ class Sam2GraspGenXPointGraspPlanner:
     @property
     def alignment_profile_id(self) -> str:
         return self._alignment.profile_id
-
-    def require_alignment_motion_sides(self, sides) -> None:
-        self._alignment.require_motion_sides(sides)
 
     @property
     def solid_geometry(self) -> ParallelJawSolidGeometry:

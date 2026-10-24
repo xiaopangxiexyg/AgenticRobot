@@ -29,7 +29,6 @@ from agent_gateway.profiles.real.rm65_grasp_reachability import RM65PointGraspRe
 from agent_gateway.profiles.real.station_point_grasp_deployment import StationPointGraspArmReachabilityProfile
 from deployments.perception.dmtac_grasp_overlay import (
     reviewed_graspgenx_dmtac_solid_geometry,
-    dmtac_graspgenx_alignment_profile,
 )
 from deployments.perception.grasp_multiview import GraspRgbdView, fuse_grasp_views
 from deployments.perception.grasp_planning_priority import grasp_planning_candidate_ordinals
@@ -196,9 +195,6 @@ def prepare(args):
 
 
 def replay(args):
-    selected_alignment = dmtac_graspgenx_alignment_profile(
-        getattr(args, "graspgenx_alignment_profile", DMTAC_M_GRASPGENX_ALIGNMENT_PROFILE_ID))
-    selected_alignment.require_motion_sides(args.sides)
     if len(set(args.sides)) != len(args.sides):
         raise ValueError("Each executing arm must be named only once")
     started = time.perf_counter()
@@ -280,7 +276,7 @@ def replay(args):
             pixel_uv=tuple(args.pixel), intrinsics=anchor.intrinsics,
             base_from_camera=anchor.reference_from_camera, max_candidates=5,
             use_visible_target_points=True, visible_scene_factory=scene_factory,
-            candidate_selectors=selectors, component_sides={side: side for side in args.sides})
+            candidate_selectors=selectors)
     except RuntimeError as exc:
         perception_error = {"type": type(exc).__name__, "message": str(exc)}
     finally:
@@ -375,7 +371,7 @@ def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--graspgenx-alignment-profile",
         choices=DMTAC_M_GRASPGENX_ALIGNMENT_PROFILE_IDS, default=DMTAC_M_GRASPGENX_ALIGNMENT_PROFILE_ID,
-        help="Explicit nominal alignment; v5 is restricted to the right-arm q0 calibration.")
+        help="Default v5 nominal alignment; select v4 explicitly for legacy geometry.")
     for name in ("repo", "canonical", "capture", "mask", "urdf", "output", "bundle"):
         p.add_argument("--"+name, required=True, type=Path)
     p.add_argument("--inference", type=Path)

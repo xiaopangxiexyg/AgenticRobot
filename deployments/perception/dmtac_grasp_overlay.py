@@ -22,6 +22,7 @@ from PIL import Image, ImageDraw
 from robot_motion.grasp_visible_scene import ParallelJawSolidGeometry
 from deployments.dmtac_graspgenx_alignment_ids import (
     DMTAC_M_GRASPGENX_ALIGNMENT_PROFILE_ID,
+    DMTAC_M_GRASPGENX_ALIGNMENT_PROFILE_ID_V4,
     DMTAC_M_GRASPGENX_ALIGNMENT_PROFILE_ID_V5,
     DMTAC_M_GRASPGENX_ALIGNMENT_PROFILE_IDS,
 )
@@ -53,47 +54,6 @@ DMTAC_M_FINGER_LENGTH_M = 0.050
 DMTAC_M_FINGER_THICKNESS_M = 0.010
 DMTAC_M_PAD_HEIGHT_M = 0.0255
 
-# The saved DMTAC-GraspGenX alignment is a separate model profile.  The
-# legacy constants above remain the original 4B2 proxy used by the older
-# VGN/GraspNet and diagnostic paths.  These values are copied from the
-# reviewed ``graspgenx-dmtac-alignment-right.json`` payload and are expressed
-# in the GraspGenX model frame, not in the legacy 4B2 solid frame.
-DMTAC_M_GRASPGENX_MAX_OPENING_M = 0.0705
-DMTAC_M_GRASPGENX_PALM_Z_M = -0.029
-DMTAC_M_GRASPGENX_FINGER_LENGTH_M = 0.100
-# The CAD fingertips extend 0.5963 mm beyond the nominal model solid. Only
-# extend the collision/overlay envelope; inference dimensions and TCP stay fixed.
-DMTAC_M_GRASPGENX_PROXY_FINGERTIP_EXTENSION_M = 0.001
-DMTAC_M_GRASPGENX_FINGER_THICKNESS_M = 0.0199
-DMTAC_M_GRASPGENX_PAD_HEIGHT_M = 0.030
-DMTAC_M_GRASPGENX_GRASP_CENTER_FROM_TACTILE_XYZ_M = (0.0, 0.0, -0.022)
-DMTAC_M_GRASPGENX_GRASP_CENTER_FROM_TACTILE_Z_M = (
-    DMTAC_M_GRASPGENX_GRASP_CENTER_FROM_TACTILE_XYZ_M[2]
-)
-
-# T_tool_tcp_from_graspgenx_model at the reviewed URDF pose (q=0, master q=0).
-# Keeping this as a full rigid transform preserves the small CAD/tactile frame
-# tilt that a yaw-only proxy cannot represent.  It is a fixed deployment
-# calibration; the current point-grasp contract does not yet carry a live
-# DMTAC opening/q-position into the perception planner.
-DMTAC_M_GRASPGENX_TOOL_FROM_MODEL_ROTATION = (
-    -0.005883664976856,
-    0.9999446749409,
-    0.008719492172192,
-    -0.9999826899785,
-    -0.005883853041647,
-    -0.000004084338666,
-    0.00004722009784,
-    -0.008719365268476,
-    0.9999619844972,
-)
-DMTAC_M_GRASPGENX_TOOL_FROM_MODEL_XYZ_M = (
-    0.02283489505130,
-    -0.000005278121116,
-    0.02618158377488,
-)
-
-
 def reviewed_4b2_cad_solid_geometry(*, maximum_opening_m: float = 0.070) -> ParallelJawSolidGeometry:
     """Bind the reviewed full 4B2 assembly to the unchanged 140 mm real TCP.
 
@@ -114,14 +74,14 @@ def reviewed_4b2_cad_solid_geometry(*, maximum_opening_m: float = 0.070) -> Para
     )
 
 
+
 @dataclass(frozen=True)
 class DmtacGraspGenXAlignmentProfile:
-    """One immutable selection for nominal, collision and inference geometry."""
+    """One immutable geometry choice for nominal, collision and inference use."""
 
     profile_id: str
     nominal_geometry: ParallelJawSolidGeometry
     collision_tip_extension_m: float
-    supported_motion_sides: tuple[str, ...]
     source_content_hash: str | None = None
 
     def __post_init__(self):
@@ -133,11 +93,8 @@ class DmtacGraspGenXAlignmentProfile:
                 or not math.isfinite(self.collision_tip_extension_m)
                 or not 0 <= self.collision_tip_extension_m <= .01):
             raise ValueError("Alignment collision extension must be finite and bounded.")
-        if self.supported_motion_sides != (("left", "right")
-                if self.profile_id == DMTAC_M_GRASPGENX_ALIGNMENT_PROFILE_ID else ("right",)):
-            raise ValueError("Alignment side coverage differs from the selected profile.")
         if (self.profile_id == DMTAC_M_GRASPGENX_ALIGNMENT_PROFILE_ID_V5) != (self.source_content_hash is not None):
-            raise ValueError("Explicit v5 alignment requires its frozen source identity.")
+            raise ValueError("Alignment source identity differs from the selected version.")
         if self.source_content_hash is not None and (
                 len(self.source_content_hash) != 64
                 or any(c not in "0123456789abcdef" for c in self.source_content_hash)):
@@ -156,52 +113,65 @@ class DmtacGraspGenXAlignmentProfile:
             "offset_mid": offset, "gripper_type": 0,
             "fingertip_depth": geometry.palm_z_m + geometry.finger_length_m}
 
-    def require_motion_sides(self, sides: Sequence[str]) -> None:
-        # v4 keeps the existing generic/read-only and shared-pool contract.
-        if self.profile_id != DMTAC_M_GRASPGENX_ALIGNMENT_PROFILE_ID and tuple(sides) != ("right",):
-            raise ValueError("Explicit v5 alignment supports one right-arm context at q0 only.")
+
+def _read_default_alignment() -> DmtacGraspGenXAlignmentProfile:
+    raw = (Path(__file__).parent / "profiles/dmtac_graspgenx_alignment_v5_q0.json").read_bytes()
+    value = json.loads(raw)
+    if (not isinstance(value, dict) or set(value) != {
+            "schema", "profile_id", "nominal_sides", "gripper_master_q_rad",
+            "nominal_geometry", "collision_tip_extension_m", "evidence_status", "proxy_scope", "provenance"}
+            or value["schema"] != "agenticrobot.dmtac_graspgenx_alignment_profile.v1"
+            or value["profile_id"] != DMTAC_M_GRASPGENX_ALIGNMENT_PROFILE_ID_V5
+            or isinstance(value["gripper_master_q_rad"], bool)
+            or not isinstance(value["gripper_master_q_rad"], (int, float))
+            or value["gripper_master_q_rad"] != 0.
+            or value["nominal_sides"] != ["left", "right"]
+            or value["evidence_status"] != "offline_nominal_alignment"):
+        raise ValueError("Default DMTAC alignment record is invalid.")
+    geometry = value["nominal_geometry"]
+    if not isinstance(geometry, dict) or set(geometry) != {
+            "palm_z_m", "finger_length_m", "finger_thickness_m", "pad_height_m",
+            "maximum_opening_m", "tool_from_solid_xyz_m", "solid_yaw_rad", "tool_from_solid_rotation"}:
+        raise ValueError("Default DMTAC alignment geometry is incomplete.")
+    geometry = {**geometry, "tool_from_solid_xyz_m": tuple(geometry["tool_from_solid_xyz_m"]),
+        "tool_from_solid_rotation": tuple(geometry["tool_from_solid_rotation"])}
+    return DmtacGraspGenXAlignmentProfile(DMTAC_M_GRASPGENX_ALIGNMENT_PROFILE_ID_V5,
+        ParallelJawSolidGeometry(**geometry), value["collision_tip_extension_m"], hashlib.sha256(raw).hexdigest())
+
+
+# Preserve the published v4 values independently of the current default.
+_V4_ALIGNMENT = DmtacGraspGenXAlignmentProfile(DMTAC_M_GRASPGENX_ALIGNMENT_PROFILE_ID_V4,
+    ParallelJawSolidGeometry(palm_z_m=-.029, finger_length_m=.100, finger_thickness_m=.0199,
+        pad_height_m=.030, maximum_opening_m=.0705,
+        tool_from_solid_xyz_m=(.02283489505130, -.000005278121116, .02618158377488),
+        tool_from_solid_rotation=(-.005883664976856, .9999446749409, .008719492172192,
+            -.9999826899785, -.005883853041647, -.000004084338666,
+            .00004722009784, -.008719365268476, .9999619844972)), .001)
+_DEFAULT_ALIGNMENT = _read_default_alignment()
+
+# Public unversioned geometry means the current default. The v4 choice above
+# remains complete and immutable; it never reads these default aliases.
+DMTAC_M_GRASPGENX_MAX_OPENING_M = _DEFAULT_ALIGNMENT.nominal_geometry.maximum_opening_m
+DMTAC_M_GRASPGENX_PALM_Z_M = _DEFAULT_ALIGNMENT.nominal_geometry.palm_z_m
+DMTAC_M_GRASPGENX_FINGER_LENGTH_M = _DEFAULT_ALIGNMENT.nominal_geometry.finger_length_m
+DMTAC_M_GRASPGENX_PROXY_FINGERTIP_EXTENSION_M = _DEFAULT_ALIGNMENT.collision_tip_extension_m
+DMTAC_M_GRASPGENX_FINGER_THICKNESS_M = _DEFAULT_ALIGNMENT.nominal_geometry.finger_thickness_m
+DMTAC_M_GRASPGENX_PAD_HEIGHT_M = _DEFAULT_ALIGNMENT.nominal_geometry.pad_height_m
+DMTAC_M_GRASPGENX_TOOL_FROM_MODEL_XYZ_M = _DEFAULT_ALIGNMENT.nominal_geometry.tool_from_solid_xyz_m
+DMTAC_M_GRASPGENX_TOOL_FROM_MODEL_ROTATION = _DEFAULT_ALIGNMENT.nominal_geometry.tool_from_solid_rotation
+DMTAC_M_GRASPGENX_GRASP_CENTER_FROM_TACTILE_XYZ_M = (0., 0., -.022)
+DMTAC_M_GRASPGENX_GRASP_CENTER_FROM_TACTILE_Z_M = DMTAC_M_GRASPGENX_GRASP_CENTER_FROM_TACTILE_XYZ_M[2]
 
 
 def dmtac_graspgenx_alignment_profile(
     profile_id: str = DMTAC_M_GRASPGENX_ALIGNMENT_PROFILE_ID,
 ) -> DmtacGraspGenXAlignmentProfile:
-    """Select an explicit calibration; never infer it from dimensions or files."""
+    """Select current v5 by default, or explicitly reconstruct historical v4."""
     if profile_id == DMTAC_M_GRASPGENX_ALIGNMENT_PROFILE_ID_V5:
-        raw = (Path(__file__).parent / "profiles/dmtac_graspgenx_alignment_v5_right_q0.json").read_bytes()
-        value = json.loads(raw)
-        if (not isinstance(value, dict) or set(value) != {
-                "schema", "profile_id", "supported_motion_sides", "gripper_master_q_rad",
-                "nominal_geometry", "collision_tip_extension_m", "evidence_status", "proxy_scope", "provenance"}
-                or value["schema"] != "agenticrobot.dmtac_graspgenx_alignment_profile.v1"
-                or value["profile_id"] != profile_id
-                or isinstance(value["gripper_master_q_rad"], bool)
-                or not isinstance(value["gripper_master_q_rad"], (int, float))
-                or value["gripper_master_q_rad"] != 0.
-                or value["supported_motion_sides"] != ["right"]
-                or value["evidence_status"] != "offline_nominal_alignment"):
-            raise ValueError("Explicit DMTAC alignment record is invalid.")
-        geometry = value["nominal_geometry"]
-        if not isinstance(geometry, dict) or set(geometry) != {
-                "palm_z_m", "finger_length_m", "finger_thickness_m", "pad_height_m",
-                "maximum_opening_m", "tool_from_solid_xyz_m", "solid_yaw_rad", "tool_from_solid_rotation"}:
-            raise ValueError("Explicit DMTAC alignment geometry is incomplete.")
-        geometry = {**geometry, "tool_from_solid_xyz_m": tuple(geometry["tool_from_solid_xyz_m"]),
-            "tool_from_solid_rotation": tuple(geometry["tool_from_solid_rotation"])}
-        return DmtacGraspGenXAlignmentProfile(profile_id, ParallelJawSolidGeometry(**geometry),
-            value["collision_tip_extension_m"], ("right",), hashlib.sha256(raw).hexdigest())
-    if profile_id != DMTAC_M_GRASPGENX_ALIGNMENT_PROFILE_ID:
-        raise ValueError("Unsupported DMTAC GraspGenX alignment profile.")
-    nominal = ParallelJawSolidGeometry(
-        palm_z_m=DMTAC_M_GRASPGENX_PALM_Z_M,
-        finger_length_m=DMTAC_M_GRASPGENX_FINGER_LENGTH_M,
-        finger_thickness_m=DMTAC_M_GRASPGENX_FINGER_THICKNESS_M,
-        pad_height_m=DMTAC_M_GRASPGENX_PAD_HEIGHT_M,
-        maximum_opening_m=DMTAC_M_GRASPGENX_MAX_OPENING_M,
-        tool_from_solid_xyz_m=DMTAC_M_GRASPGENX_TOOL_FROM_MODEL_XYZ_M,
-        tool_from_solid_rotation=DMTAC_M_GRASPGENX_TOOL_FROM_MODEL_ROTATION,
-    )
-    return DmtacGraspGenXAlignmentProfile(profile_id, nominal,
-        DMTAC_M_GRASPGENX_PROXY_FINGERTIP_EXTENSION_M, ("left", "right"))
+        return _DEFAULT_ALIGNMENT
+    if profile_id == DMTAC_M_GRASPGENX_ALIGNMENT_PROFILE_ID_V4:
+        return _V4_ALIGNMENT
+    raise ValueError("Unsupported DMTAC GraspGenX alignment profile.")
 
 
 def reviewed_graspgenx_dmtac_solid_geometry(
@@ -711,6 +681,7 @@ def render_dmtac_grasp_overlays(
 
 __all__ = [
     "DMTAC_M_GRASPGENX_ALIGNMENT_PROFILE_ID",
+    "DMTAC_M_GRASPGENX_ALIGNMENT_PROFILE_ID_V4",
     "DMTAC_M_GRASPGENX_ALIGNMENT_PROFILE_ID_V5",
     "DMTAC_M_GRASPGENX_ALIGNMENT_PROFILE_IDS",
     "DmtacGraspGenXAlignmentProfile",

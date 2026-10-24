@@ -117,7 +117,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--graspgenx-alignment-profile",
         choices=DMTAC_M_GRASPGENX_ALIGNMENT_PROFILE_IDS, default=DMTAC_M_GRASPGENX_ALIGNMENT_PROFILE_ID,
-        help="Explicit nominal alignment; v5 is restricted to the right-arm q0 calibration.")
+        help="Default v5 nominal alignment; select v4 explicitly for legacy geometry.")
     parser.add_argument(
         "--socket-path",
         type=Path,
@@ -860,11 +860,6 @@ def main(argv: list[str] | None = None) -> int:
             parser.error("--graspgenx-alignment-profile requires the GraspGenX backend")
         if not args.enable_point_grasp:
             parser.error("--graspgenx-alignment-profile requires --enable-point-grasp")
-        from deployments.perception.dmtac_grasp_overlay import dmtac_graspgenx_alignment_profile
-        try:
-            dmtac_graspgenx_alignment_profile(args.graspgenx_alignment_profile).require_motion_sides((args.authorized_side,))
-        except ValueError as error:
-            parser.error(str(error))
     if args.confirm != REAL_AGENT_PRIMITIVE_SESSION_CONFIRM_TOKEN:
         parser.error(
             "--confirm must exactly equal " + REAL_AGENT_PRIMITIVE_SESSION_CONFIRM_TOKEN

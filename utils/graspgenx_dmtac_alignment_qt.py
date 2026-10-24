@@ -45,7 +45,6 @@ from .graspgenx_dmtac_alignment_gui import (
     AlignmentState,
     current_dmtac_state,
     DMTAC_M_GRASPGENX_ALIGNMENT_PROFILE_ID,
-    dmtac_graspgenx_alignment_profile,
     _frame_angle,
     _mat4_translation,
     _parallel_jaw_triangles,
@@ -376,8 +375,6 @@ class AlignmentWindow(QMainWindow):
         super().__init__()
         self.model = model
         self.alignment_profile_id = alignment_profile_id
-        self._alignment_profile = dmtac_graspgenx_alignment_profile(alignment_profile_id)
-        self._alignment_profile.require_motion_sides((model.state.side,))
         self.builder = ComponentSceneBuilder(model)
         self.controls: dict[str, QDoubleSpinBox] = {}
         self.updating = False
@@ -464,7 +461,7 @@ class AlignmentWindow(QMainWindow):
         state_group = QGroupBox("离线状态")
         state_form = QFormLayout(state_group)
         side = QComboBox()
-        side.addItems([side for side in ("right", "left") if side in self._alignment_profile.supported_motion_sides])
+        side.addItems(["right", "left"])
         side.currentTextChanged.connect(self.side_changed)
         self.side_combo = side
         state_form.addRow("机械臂侧", side)
@@ -642,7 +639,6 @@ class AlignmentWindow(QMainWindow):
         try:
             payload = json.loads(Path(source).read_text(encoding="utf-8"))
             state = _state_from_payload(payload)
-            self._alignment_profile.require_motion_sides((state.side,))
             self.model.state = state
             self._apply_state_to_controls()
             self.model._refresh_pair()

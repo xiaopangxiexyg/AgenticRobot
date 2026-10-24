@@ -55,7 +55,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--graspgenx-alignment-profile",
         choices=DMTAC_M_GRASPGENX_ALIGNMENT_PROFILE_IDS, default=DMTAC_M_GRASPGENX_ALIGNMENT_PROFILE_ID,
-        help="Explicit nominal alignment; v5 is restricted to the right-arm q0 calibration.")
+        help="Default v5 nominal alignment; select v4 explicitly for legacy geometry.")
     parser.add_argument(
         "--socket-path",
         type=Path,
@@ -478,7 +478,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     if args.graspgenx_alignment_profile != DMTAC_M_GRASPGENX_ALIGNMENT_PROFILE_ID and not args.enable_fast_grasp:
-        parser.error("--graspgenx-alignment-profile v5 requires --enable-fast-grasp")
+        parser.error("--graspgenx-alignment-profile requires --enable-fast-grasp")
     if args.motion_side == "left" and (
         args.enable_fast_grasp
         or args.enable_grippers

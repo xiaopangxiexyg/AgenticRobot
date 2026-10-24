@@ -279,6 +279,8 @@ class AlignmentState:
     profile_id: str = DEFAULT_PROFILE_ID
 
     def __post_init__(self) -> None:
+        if self.side not in {"left", "right"}:
+            raise ValueError("Alignment side must be left or right.")
         if self.arm_qpos is None:
             self.arm_qpos = [0.0] * 6
         if self.tool_tcp_pose_endpoint_m_rad is None:
@@ -293,7 +295,6 @@ def current_dmtac_state(side: str, tcp_pose: Sequence[float], arm_qpos: Sequence
     alignment_profile_id: str = DMTAC_M_GRASPGENX_ALIGNMENT_PROFILE_ID) -> AlignmentState:
     """Read selected nominal geometry without changing hardware calibration."""
     profile = dmtac_graspgenx_alignment_profile(alignment_profile_id)
-    profile.require_motion_sides((side,))
     _pose6_matrix(tcp_pose)
     if len(arm_qpos) != 6 or not all(math.isfinite(value) for value in arm_qpos):
         raise ValueError("Arm preview requires six finite joint values.")
@@ -760,8 +761,6 @@ class AlignmentApp:
         self.model = model
         self.output = output
         self.alignment_profile_id = alignment_profile_id
-        self._alignment_profile = dmtac_graspgenx_alignment_profile(alignment_profile_id)
-        self._alignment_profile.require_motion_sides((model.state.side,))
         self.root.title("GraspGenX ↔ DMTAC 坐标对齐 · offline diagnostic")
         self.root.geometry("1540x940")
         self.root.minsize(1200, 760)
@@ -824,9 +823,7 @@ class AlignmentApp:
         row.grid(row=1, column=0, columnspan=3, sticky="ew", pady=4)
         ttk.Label(row, text="机械臂").pack(side=tk.LEFT)
         side_var = self._var("side", self.model.state.side)
-        combo = ttk.Combobox(row, textvariable=side_var,
-            values=tuple(side for side in ("right", "left") if side in self._alignment_profile.supported_motion_sides),
-            state="readonly", width=9)
+        combo = ttk.Combobox(row, textvariable=side_var, values=("right", "left"), state="readonly", width=9)
         combo.pack(side=tk.LEFT, padx=5)
         combo.bind("<<ComboboxSelected>>", lambda _event: self._side_changed())
         self._field(base, 2, "DMTAC master q", "gripper_q", self.model.state.gripper_q, "q", -10.0, 10.0, 1.0)
@@ -957,7 +954,6 @@ class AlignmentApp:
         self.status.set(f"已保存独立 alignment JSON：{selected}")
 
     def _apply_state(self, state: AlignmentState) -> None:
-        self._alignment_profile.require_motion_sides((state.side,))
         values = {
             "side": state.side,
             "gripper_q": state.gripper_q,
@@ -1127,7 +1123,6 @@ def export_payload(
     state = current_dmtac_state(side, tcp_pose, arm_qpos, alignment_profile_id=alignment_profile_id)
     if alignment is not None:
         state = _state_from_payload(json.loads(alignment.read_text(encoding="utf-8")))
-        dmtac_graspgenx_alignment_profile(alignment_profile_id).require_motion_sides((state.side,))
         state.side = side
         state.arm_qpos = list(arm_qpos)
     model = AlignmentModel(urdf, state)
@@ -1180,7 +1175,6 @@ def main() -> int:
         state.profile_id = args.profile_id
         if args.load_alignment:
             state = _state_from_payload(json.loads(args.load_alignment.read_text(encoding="utf-8")))
-            dmtac_graspgenx_alignment_profile(args.alignment_profile).require_motion_sides((state.side,))
             state.side = args.side
             state.arm_qpos = qpos
         root = tk.Tk()

@@ -22,7 +22,8 @@ from robot_motion.grasp_visible_scene import (
 
 
 def geometry():
-    return replace(reviewed_graspgenx_dmtac_solid_geometry(), finger_length_m=.100)
+    # Fixed analytic interval [-29, 71] mm, independent of live calibration.
+    return replace(reviewed_graspgenx_dmtac_solid_geometry(), palm_z_m=-.029, finger_length_m=.100)
 
 
 def support(points):

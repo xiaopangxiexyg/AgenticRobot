@@ -129,9 +129,6 @@ class MujocoFastGraspPlanProvider:
             raise ValueError(
                 "Fast grasp model does not match its published deployment."
             )
-        model.require_alignment_motion_sides(({
-            "left_arm": "left", "right_arm": "right",
-        }.get(self.contract.execution_contract.motion_profile.component_id),))
         self.observation_executor, self.artifact_store = (
             observation_executor,
             artifact_store,

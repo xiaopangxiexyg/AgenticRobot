@@ -73,7 +73,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--graspgenx-alignment-profile",
         choices=DMTAC_M_GRASPGENX_ALIGNMENT_PROFILE_IDS, default=DMTAC_M_GRASPGENX_ALIGNMENT_PROFILE_ID,
-        help="Explicit nominal alignment; v5 is restricted to the right-arm q0 calibration.")
+        help="Default v5 nominal alignment; select v4 explicitly for legacy geometry.")
     parser.add_argument("--socket-path", type=Path, required=True)
     parser.add_argument("--camera-config", type=Path, required=True)
     parser.add_argument(
