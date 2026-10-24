@@ -35,6 +35,7 @@ from agent_gateway.transport.client_bindings import (
     compile_agent_gateway_unix_client_bindings,
 )
 from agent_gateway.transport.unix_transport import (
+    AgentGatewayUnixJsonServer,
     validate_agent_gateway_unix_group_parent,
     validate_agent_gateway_unix_server_preflight,
 )
@@ -60,6 +61,7 @@ from .exclusive_application import (
     ExclusiveRealSkillApplication,
     ExclusiveRealSkillApplicationConfig,
 )
+from .hardware_connection import ResidentPerceptionResources
 from .exclusive_factory import (
     ExclusiveRealAgentPrimitiveDeployment,
     assemble_exclusive_rm65_agent_primitive_deployment,
@@ -339,6 +341,8 @@ def assemble_exclusive_rm65_agent_primitive_composition(
     safe_motion_debug_dir: str | Path | None = None,
     clock: Callable[[], float] = time.time,
     sleep: Callable[[float], None] = time.sleep,
+    resident_perception: ResidentPerceptionResources | None = None,
+    retained_transport: AgentGatewayUnixJsonServer | None = None,
 ) -> ExclusiveRM65AgentPrimitiveComposition:
     """Bind one lower RM65 graph to the existing real Skill/Gateway contracts."""
 
@@ -443,12 +447,17 @@ def assemble_exclusive_rm65_agent_primitive_composition(
         primary_client_uid=uid,
         ssh_read_only_clients=read_only_pairs,
     )
-    if client_bindings.read_only_client_ids:
-        validate_agent_gateway_unix_group_parent(socket_path=socket_path)
-    endpoint_value, peer_timeout = validate_agent_gateway_unix_server_preflight(
-        socket_path=socket_path,
-        peer_idle_timeout_sec=peer_idle_timeout_sec,
-    )
+    if retained_transport is not None:
+        if not isinstance(retained_transport, AgentGatewayUnixJsonServer):
+            raise TypeError("Retained transport must be its live Unix server owner")
+        endpoint_value, peer_timeout = retained_transport.validate_retained_endpoint(
+            socket_path=socket_path, peer_idle_timeout_sec=peer_idle_timeout_sec,
+            client_id_by_uid=client_bindings.client_id_by_uid, socket_mode=client_bindings.socket_mode)
+    else:
+        if client_bindings.read_only_client_ids:
+            validate_agent_gateway_unix_group_parent(socket_path=socket_path)
+        endpoint_value, peer_timeout = validate_agent_gateway_unix_server_preflight(
+            socket_path=socket_path, peer_idle_timeout_sec=peer_idle_timeout_sec)
     endpoint = Path(endpoint_value)
     if not callable(clock) or not callable(sleep):
         raise TypeError("clock and sleep must be callable.")
@@ -830,14 +839,18 @@ def assemble_exclusive_rm65_agent_primitive_composition(
         root = Path(artifact_root)
         if not root.is_absolute():
             raise ValueError("artifact_root must be an absolute path.")
-        perception_source_binding = build_real_perception_source_binding(
+        perception_source_binding = (resident_perception.source_binding
+            if resident_perception is not None and resident_perception.source_binding is not None
+            else build_real_perception_source_binding(
             camera_config_path=camera_config_path,
             camera_registry_path=camera_registry_path,
             scene_world_from_arm_base_by_side=(
                 lower.profile.scene_world_from_arm_base_by_side
             ),
             single_start=camera_single_start,
-        )
+        ))
+        if resident_perception is not None:
+            resident_perception.source_binding = perception_source_binding
         perception_frame_binding = station_frame_binding
         if grasp_enabled or enable_back_projection or observed_safe_enabled:
             assert camera_mount_urdf_path is not None
@@ -1355,6 +1368,10 @@ def assemble_exclusive_rm65_agent_primitive_composition(
                 planning_geometry_resources.start
                 if planning_geometry_resources is not None else None
             ),
+            # Cameras stay owned by the process across hardware generations.
+            **({"start_cameras": resident_perception.start_cameras,
+                "close_cameras": resident_perception.retain_cameras}
+               if resident_perception is not None else {}),
         )
     if gripper_ports:
         resources = ExclusiveRealGripperResources(lower=resources,

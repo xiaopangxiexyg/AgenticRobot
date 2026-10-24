@@ -1245,6 +1245,35 @@ motion port、排他 owner 和控制循环串行执行，未请求的一臂仍�
 仅当控制运行时从未启动、入口未发布且 Gateway 从未接纳请求时，才允许无 HOLD 的构造资源清理；
 已取得控制资源的正常关闭仍须确认原有下层 HOLD，线程关闭以实际完成凭据为准。
 
+#### 操作者断开与重新连接双臂、双夹爪
+
+真机进程显式增加 `--enable-hardware-connection-control`，并配置夹爪 v2 的左右两份
+配置后，Dashboard 可提供断开／重连按钮。此能力属于应用生命周期，不注册成 Agent
+Skill，也不允许只读身份调用。默认启动和原有真机授权参数保持不变。
+
+断开先封住新请求，复用原应用的操作取消、下层组合 HOLD／停止证明、worker 排空、
+控制线程退出与设备关闭事务。只有完整关闭成功才返回 `disconnected`；关闭失败保留
+原 owner 和错误，允许继续完成同一次释放，禁止创建替代连接。相机取流与感知模型由
+外层会话持续持有，不随断开或重连重新启动、reset 或卸载；退出整个进程才关闭它们。
+断联期间不接纳新的 Skill，GUI 的急停入口仍保留。
+
+重新连接创建全新的双臂 backend、双夹爪适配器、测量／力监控、控制运行时和 Gateway
+执行会话，沿用冻结的部署配置及原 startup admission。它只建立初始 HOLD，不重放
+目标、开闭夹爪、回零或自动继续旧任务。新 `runtime_session_id` 和目录身份使旧请求、
+计划、批准失效，上层需重新发现并显式开始新任务；任务队列保持暂停。关闭屏障前后都
+保留已有及关闭过程中到达的下层急停锁存，重连不能用于解除它。
+
+传输的 `healthz.hardware_connection_control` 声明
+`agent_gateway.hardware_connection.v1`。操作者 RPC 为无参数的
+`read_hardware_connection_state` 和带 `{action, expected_generation}` 的
+`request_hardware_connection`。`disconnect_components` 固定列出双臂、双夹爪的作用
+范围；实际释放事实由状态表示。断开保持当前代次，重连开始时推进代次，失败也不回退。
+重建只能借用仍由本服务器持有、inode／权限／身份映射均未改变的 endpoint，不能跳过
+新服务器的独占绑定预检。诊断记录当前代次、运行身份、转换状态及有界错误；运动轨迹按
+各自执行会话分别记录。
+
+离线生命周期、真实 Unix 传输及假 SDK 验证不构成设备释放／重连或物理运动验收。
+
 #### 显式夹爪 v2 合同基础
 
 `manipulation.set_gripper_state@1` 及现有右夹爪接入保持默认行为。

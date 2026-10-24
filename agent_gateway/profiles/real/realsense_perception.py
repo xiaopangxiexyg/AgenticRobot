@@ -479,6 +479,7 @@ class ExclusiveRealPerceptionResources:
         start_cameras: Callable[[Mapping[str, Any]], None] | None = None,
         admit_cameras: Callable[[Mapping[str, Any]], None] | None = None,
         prepare_static_geometry: Callable[[], None] | None = None,
+        close_cameras: Callable[[Mapping[str, Any]], None] | None = None,
     ) -> None:
         if not callable(getattr(lower, "start", None)) or not callable(
             getattr(lower, "close", None)
@@ -514,6 +515,7 @@ class ExclusiveRealPerceptionResources:
         self._start_cameras = start_cameras
         self._admit_cameras = admit_cameras
         self._prepare_static_geometry = prepare_static_geometry
+        self._close_camera_sources = close_cameras or _formal_close_camera_sources
         self._lock = threading.Lock()
         self._close_lock = threading.Lock()
         self._start_attempted = False
@@ -601,7 +603,7 @@ class ExclusiveRealPerceptionResources:
             if self._cameras_closed:
                 return []
         try:
-            _formal_close_camera_sources(self.camera_sources)
+            self._close_camera_sources(self.camera_sources)
         except Exception as exc:  # noqa: BLE001 - formal cleanup already tried all cameras.
             return [f"cameras:{type(exc).__name__}:{exc}"]
         with self._lock:

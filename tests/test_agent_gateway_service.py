@@ -647,6 +647,92 @@ def test_domain_state_observes_latch_before_lower_receipt_without_new_io(succeed
     assert emergency_port.calls == calls
 
 
+def test_closed_generation_rejects_fresh_stop_but_replays_exact_stop_proof():
+    service, station, emergency, _, manifest, _ = _authoritative_emergency_service()
+    request = _emergency_stop_request(manifest)
+    first = service.request_emergency_stop_own_domain(request=request)
+    assert first.accepted and service.close(current_station_revision=4).accepted
+    calls = list(emergency.calls)
+    fresh = service.request_emergency_stop_own_domain(
+        request=_emergency_stop_request(manifest, idempotency_key="new:after-release"))
+    assert not fresh.accepted and fresh.reason_code == "control_generation_closed"
+    replay = service.request_emergency_stop_own_domain(request=request)
+    assert replay.accepted and replay.idempotent_replay
+    assert replay.port_receipt == first.port_receipt and emergency.calls == calls
+
+
+def test_unused_generation_seals_stop_admission_without_lower_io():
+    service, station, emergency, _, manifest, _ = _authoritative_emergency_service()
+    service.fence_if_unused()
+    outcome = service.request_emergency_stop_own_domain(request=_emergency_stop_request(manifest))
+    assert not outcome.accepted and outcome.reason_code == "control_generation_closed"
+    assert station.calls == emergency.calls == []
+
+
+def test_close_retains_resources_until_independent_emergency_call_exits():
+    from concurrent.futures import ThreadPoolExecutor
+    service, _, emergency, _, manifest, _ = _authoritative_emergency_service()
+    entered, release = threading.Event(), threading.Event()
+    original = emergency.request_emergency_stop
+    def blocked(**kwargs):
+        entered.set()
+        assert release.wait(3)
+        return original(**kwargs)
+    emergency.request_emergency_stop = blocked
+    with ThreadPoolExecutor() as pool:
+        stopping = pool.submit(service.request_emergency_stop_own_domain,
+                               request=_emergency_stop_request(manifest))
+        try:
+            assert entered.wait(1)
+            closing = service.close(current_station_revision=4)
+            assert not closing.accepted
+            assert closing.reason_code == "emergency_control_still_inflight_at_close"
+        finally:
+            release.set()
+        assert stopping.result(timeout=2).accepted
+    assert service.close(current_station_revision=4).accepted
+
+
+def test_close_serializes_reserved_cancel_before_releasing_lower_port():
+    from concurrent.futures import ThreadPoolExecutor
+    service, port, _, clock, manifest, capability = _authoritative_emergency_service()
+    submitted = _submit(service, manifest, capability)
+    operation = _activate_running(service, submitted.operation.operation_id, clock)
+    clock.set(10.4)
+    entered, release, close_started, close_done = (threading.Event() for _ in range(4))
+    reserve = service.operation_store.reserve_control
+    def paused(**kwargs):
+        result = reserve(**kwargs)
+        if kwargs["reason_code"] == "hold_on_cancel_reserved":
+            entered.set()
+            assert release.wait(3)
+        return result
+    service.operation_store.reserve_control = paused
+    def close():
+        close_started.set()
+        try:
+            return service.close(current_station_revision=4, now=10.4)
+        finally:
+            close_done.set()
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        cancelling = pool.submit(service.cancel_operation, operation_id=operation.operation_id,
+            reason="explicit_cancel", current_station_revision=4, now=10.2)
+        try:
+            assert entered.wait(1)
+            closing = pool.submit(close)
+            assert close_started.wait(1)
+            assert not close_done.wait(.05)
+        finally:
+            release.set()
+        assert cancelling.result(timeout=2).accepted
+        closed = closing.result(timeout=2)
+        assert closed.accepted
+    calls = list(port.calls)
+    assert service.request_hold(reason="late-close", current_station_revision=4) is closed
+    service.cancel_operation(operation_id=operation.operation_id, reason="late-cancel", current_station_revision=4)
+    assert port.calls == calls
+
+
 def test_domain_emergency_stop_preempts_motion_and_latches_admission() -> None:
     service, _, emergency_port, clock, manifest, capability = (
         _authoritative_emergency_service()

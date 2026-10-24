@@ -28,6 +28,8 @@ from agent_gateway.transport.client_bindings import (
     compile_agent_gateway_unix_client_bindings,
 )
 from agent_gateway.transport.unix_transport import (
+    AgentGatewayUnixJsonServer,
+    AgentGatewayUnixPeerClientMap,
     validate_agent_gateway_unix_group_parent,
     validate_agent_gateway_unix_server_preflight,
 )
@@ -75,6 +77,7 @@ from teleop_runtime.skill_deploy.rm65_grasp_trajectory import (
 )
 
 from .exclusive_application import ExclusiveRealSkillApplicationState
+from .hardware_connection import RealHardwareConnectionOwner, ResidentPerceptionResources
 from .grasp_approach_plan import (
     DEFAULT_REAL_GRASP_EXECUTION_OPERATION_TIMEOUT_SEC,
     REAL_GRASP_APPROACH_PLAN_OPERATION_GRACE_SEC,
@@ -488,6 +491,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-retained-operations", type=int, default=16)
     parser.add_argument("--peer-idle-timeout-sec", type=float, default=10.0)
     parser.add_argument("--grant-lifetime-sec", type=float, default=5.0)
+    parser.add_argument("--enable-hardware-connection-control", action="store_true",
+        help="operator-only bilateral arm/gripper release and fresh reconnect; retain cameras/models")
     return parser
 
 
@@ -1066,6 +1071,8 @@ def main(argv: list[str] | None = None) -> int:
             else "set_gripper_state v1 requires --right-gripper-config"
         )
     gripper_backends = {}
+    if args.enable_hardware_connection_control and not bilateral:
+        parser.error("--enable-hardware-connection-control requires explicit bilateral gripper configs")
     for hand_side, config_path in hand_configs.items():
         if config_path is None:
             continue
@@ -1445,6 +1452,7 @@ def main(argv: list[str] | None = None) -> int:
             "--graspgenx-mode applies only to an enabled "
             "--point-grasp-backend graspgenx"
         )
+    resident = ResidentPerceptionResources() if args.enable_hardware_connection_control else None
     object_localizer = None
     point_grasp_planner = None
     if (args.enable_surface_anchor_v2 or args.enable_tool_object_relations) and not args.enable_point_grasp:
@@ -1482,6 +1490,8 @@ def main(argv: list[str] | None = None) -> int:
                     min_score=args.sam3_min_score,
                     multi_instance_text=args.sam3_multi_instance_text,
                 )
+            if resident is not None:
+                object_localizer = resident.model(object_localizer)
             if args.point_grasp_backend == "vgn":
                 point_grasp_spec = VgnPointGraspModelSpec.from_asset_bundle(
                     point_grasp_bundle
@@ -1553,14 +1563,13 @@ def main(argv: list[str] | None = None) -> int:
         else "dual-rm65:" + resolved.semantic_content_hash[:16]
     )
     runtime_session_id = _runtime_session_id(args.runtime_session_id)
-    composition = assemble_exclusive_rm65_agent_primitive_composition(
-        right_gripper_backend=None if bilateral else gripper_backends.get("right"),
-        gripper_backends=gripper_backends if bilateral else None,
+    if resident is not None:
+        point_grasp_planner = resident.model(point_grasp_planner)
+    composition_kwargs = dict(
         gripper_startup_reconnect_on_fault16=args.gripper_startup_reconnect_on_fault16,
         authorized_gripper_sides=None
         if args.authorized_gripper_sides is None
         else tuple(args.authorized_gripper_sides),
-        lower=lower,
         socket_path=socket_path,
         authorized_side=args.authorized_side,
         authorized_motion_sides=(None if args.authorized_motion_sides is None
@@ -1577,7 +1586,6 @@ def main(argv: list[str] | None = None) -> int:
             for uid, client_id in client_bindings.client_id_by_uid.items()
             if client_id in client_bindings.read_only_client_ids
         },
-        runtime_session_id=runtime_session_id,
         control_domain_id=args.control_domain_id,
         embodiment_instance_id=embodiment_instance_id,
         grasp_execution_operation_timeout_sec=args.execution_operation_timeout_sec,
@@ -1624,53 +1632,93 @@ def main(argv: list[str] | None = None) -> int:
             endpoint_joint_limit_margin_rad=math.radians(args.grasp_endpoint_joint_limit_margin_deg),
             table_hand_clearance_m=args.table_hand_clearance_m,
         ),
+        resident_perception=resident,
     )
-
-    motion_trace: SkillMotionTraceRecorder | None = None
-    if motion_trace_root is not None:
-        trace_session_dir = motion_trace_root / (
-            time.strftime("%Y%m%d_%H%M%S")
-            + "_exclusive_rm65_skill_"
-            + uuid.uuid4().hex[:8]
+    def build_generation(*, initial=False):
+        hands = (gripper_backends if initial else {
+            side: type(backend)(backend.config) for side, backend in gripper_backends.items()
+        })
+        generation = assemble_exclusive_rm65_agent_primitive_composition(
+            lower=lower if initial else assemble_exclusive_rm65_skill_lower(**lower_kwargs),
+            right_gripper_backend=None if bilateral else hands.get("right"),
+            gripper_backends=hands if bilateral else None,
+            runtime_session_id=runtime_session_id if initial else _runtime_session_id(None),
+            retained_transport=None if initial else application.transport,
+            **composition_kwargs,
         )
-        motion_trace = SkillMotionTraceRecorder(
-            SkillMotionTraceConfig(
-                output_dir=trace_session_dir,
-                reference_hz=resolved.position_profile.rates.reference_hz,
-                command_hz=resolved.position_profile.rates.command_hz,
-                measurement_hz=composition.lower.ports.profile.state_refresh_hz,
-                max_duration_sec=args.motion_trace_max_duration_sec,
-                metadata={
-                    "entrypoint": "python -m agent_gateway real-rm65",
-                    "runtime_session_id": runtime_session_id,
-                    "control_domain_id": args.control_domain_id,
-                    "authorized_side": args.authorized_side,
-                    "authorized_action": args.authorized_action,
-                    "authorized_actions": args.authorized_actions,
-                    "position_profile": args.position_profile,
-                    "position_profile_hash": (
-                        resolved.position_profile.to_metadata()["sha256"]
-                    ),
-                    "collision_scene_profile": args.collision_scene_profile,
-                    "lower_profile_hash": resolved.semantic_content_hash,
-                    "debug_motion_skill": args.debug_motion_skill,
-                    "grasp_trajectory_parameterization": (
-                        args.grasp_trajectory_parameterization
-                    ),
-                    "grasp_trajectory_speed_profile": (
-                        args.grasp_trajectory_speed_profile
-                    ),
-                    "grasp_endpoint_candidate_ordering": (
-                        args.grasp_endpoint_candidate_ordering
-                    ),
-                },
+        return generation
+    composition = build_generation(initial=True)
+    application = composition.application
+    if resident is not None:
+        def operator_server(owner):
+            return AgentGatewayUnixJsonServer(
+                socket_path=socket_path,
+                peer_client_map=AgentGatewayUnixPeerClientMap(client_bindings.client_id_by_uid),
+                facade_factory=owner.facade,
+                close_gateway=lambda: owner.current.deployment.gateway_session.close(),
+                socket_mode=client_bindings.socket_mode,
+                peer_idle_timeout_sec=args.peer_idle_timeout_sec,
+                hardware_connection_control=owner,
             )
+        application = RealHardwareConnectionOwner(
+            initial=composition, rebuild=build_generation, resident=resident,
+            operator_client_ids=frozenset({args.client_id}), server_factory=operator_server,
+            prepare_generation=lambda generation: attach_generation_trace(generation),
+            event_sink=_emit_lifecycle_event,
         )
-        try:
-            _attach_motion_trace(composition, motion_trace)
-        except Exception:
-            motion_trace.close()
-            raise
+
+    generation_traces = []
+    def attach_generation_trace(composition):
+        motion_trace = None
+        if motion_trace_root is not None:
+            trace_session_dir = motion_trace_root / (
+                time.strftime("%Y%m%d_%H%M%S")
+                + "_exclusive_rm65_skill_"
+                + uuid.uuid4().hex[:8]
+            )
+            motion_trace = SkillMotionTraceRecorder(
+                SkillMotionTraceConfig(
+                    output_dir=trace_session_dir,
+                    reference_hz=resolved.position_profile.rates.reference_hz,
+                    command_hz=resolved.position_profile.rates.command_hz,
+                    measurement_hz=composition.lower.ports.profile.state_refresh_hz,
+                    max_duration_sec=args.motion_trace_max_duration_sec,
+                    metadata={
+                        "entrypoint": "python -m agent_gateway real-rm65",
+                        "runtime_session_id": composition.deployment.gateway_session.contract_bundle.route_manifest.runtime_session_id,
+                        "control_domain_id": args.control_domain_id,
+                        "authorized_side": args.authorized_side,
+                        "authorized_action": args.authorized_action,
+                        "authorized_actions": args.authorized_actions,
+                        "position_profile": args.position_profile,
+                        "position_profile_hash": (
+                            resolved.position_profile.to_metadata()["sha256"]
+                        ),
+                        "collision_scene_profile": args.collision_scene_profile,
+                        "lower_profile_hash": resolved.semantic_content_hash,
+                        "debug_motion_skill": args.debug_motion_skill,
+                        "grasp_trajectory_parameterization": (
+                            args.grasp_trajectory_parameterization
+                        ),
+                        "grasp_trajectory_speed_profile": (
+                            args.grasp_trajectory_speed_profile
+                        ),
+                        "grasp_endpoint_candidate_ordering": (
+                            args.grasp_endpoint_candidate_ordering
+                        ),
+                    },
+                )
+            )
+            try:
+                _attach_motion_trace(composition, motion_trace)
+            except Exception:
+                motion_trace.close()
+                raise
+        if motion_trace is not None:
+            generation_traces.append((composition, motion_trace))
+        return motion_trace
+
+    motion_trace = attach_generation_trace(composition)
 
     ready = threading.Event()
     stop_requested = threading.Event()
@@ -1678,7 +1726,7 @@ def main(argv: list[str] | None = None) -> int:
 
     def serve() -> None:
         try:
-            composition.application.serve_forever(ready_callback=ready.set)
+            application.serve_forever(ready_callback=ready.set)
         except BaseException as error:  # noqa: BLE001 - surfaced to main.
             application_error.append(error)
         finally:
@@ -1711,16 +1759,16 @@ def main(argv: list[str] | None = None) -> int:
         if not ready.is_set():
             raise RuntimeError("real RM65 Skill application stopped before ready")
         if (
-            composition.application.state != ExclusiveRealSkillApplicationState.RUNNING
+            application.state != ExclusiveRealSkillApplicationState.RUNNING
             or not application_thread.is_alive()
         ):
             raise RuntimeError("real RM65 Skill application lost readiness")
         _emit_lifecycle_event(_ready_payload(composition))
         if stop_requested.is_set():
-            composition.application.request_shutdown()
+            application.request_shutdown()
         while application_thread.is_alive():
             if stop_requested.wait(0.25):
-                composition.application.request_shutdown()
+                application.request_shutdown()
                 break
         application_thread.join(timeout=3.0)
         if application_thread.is_alive():
@@ -1731,7 +1779,7 @@ def main(argv: list[str] | None = None) -> int:
             )
     finally:
         if application_thread.is_alive():
-            composition.application.request_shutdown()
+            application.request_shutdown()
             application_thread.join(timeout=3.0)
         for signum, previous in previous_handlers.items():
             signal.signal(signum, previous)
@@ -1741,19 +1789,21 @@ def main(argv: list[str] | None = None) -> int:
                 "lower application thread did not stop; motion trace was not "
                 "detached or written"
             )
-        elif motion_trace is not None:
-            detach_errors = _detach_motion_trace(composition)
-            if detach_errors:
-                motion_trace_close_error = RuntimeError(
-                    "motion trace detach failed: " + "; ".join(detach_errors)
-                )
-            try:
-                motion_trace.close()
-            except BaseException as error:  # noqa: BLE001 - report after HOLD proof.
-                if motion_trace_close_error is None:
-                    motion_trace_close_error = error
+        else:
+            for traced_composition, recorder in generation_traces:
+                detach_errors = _detach_motion_trace(traced_composition)
+                if detach_errors:
+                    motion_trace_close_error = RuntimeError(
+                        "motion trace detach failed: " + "; ".join(detach_errors))
+                try:
+                    recorder.close()
+                except BaseException as error:  # noqa: BLE001 - report after HOLD proof.
+                    if motion_trace_close_error is None:
+                        motion_trace_close_error = error
+            if generation_traces:
+                motion_trace = generation_traces[-1][1]
         stopped_payload = _stopped_payload(
-            composition,
+            application.current if isinstance(application, RealHardwareConnectionOwner) else composition,
             motion_trace=motion_trace,
             motion_trace_close_error=motion_trace_close_error,
         )
