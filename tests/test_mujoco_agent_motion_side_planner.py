@@ -539,8 +539,9 @@ def test_target_builder_forwards_side_without_replacing_the_dual_rig(monkeypatch
     config, prepared, binding = _target_inputs(side, scene)
     rig_configs = []
 
-    def rig_for(captured_scene, rig_config):
+    def rig_for(captured_scene, rig_config, *, monotonic_clock):
         assert captured_scene is scene
+        assert monotonic_clock is targets.time.monotonic
         rig_configs.append(rig_config)
         return fixture.rig
 

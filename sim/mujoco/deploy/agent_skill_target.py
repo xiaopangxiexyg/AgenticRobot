@@ -55,6 +55,7 @@ def build_mujoco_agent_skill_motion_target(
     enable_safe_tcp_pose: bool = False,
     safe_tcp_planning_clearance_padding_m: float = 0.002,
     motion_side: str = "right",
+    clock: Callable[[], float] = time.monotonic,
 ) -> MujocoAgentSkillMotionTarget:
     """Build one no-model Agent Skill target with a fixed motion side.
 
@@ -65,6 +66,8 @@ def build_mujoco_agent_skill_motion_target(
 
     if not isinstance(config, MujocoSimHILTargetConfig):
         raise TypeError("config must be a MujocoSimHILTargetConfig.")
+    if not callable(clock):
+        raise TypeError("clock must be callable.")
     if type(motion_side) is not str or motion_side not in ("left", "right"):
         raise ValueError("motion_side must be exactly 'left' or 'right'.")
     component_id = motion_side + "_arm"
@@ -146,6 +149,7 @@ def build_mujoco_agent_skill_motion_target(
             realtime_worker=config.realtime_worker,
             follow_qpos_alpha=1.0,
         ),
+        monotonic_clock=clock,
     )
     safety_profile = CanonicalKeyframeSafetyProfile(
         profile_id="control-station-mujoco-agent-skill-arms-safety-v1",
@@ -159,7 +163,7 @@ def build_mujoco_agent_skill_motion_target(
                 captured_scene,
                 prepared.task_config,
                 {},
-                now=time.monotonic(),
+                now=clock(),
             )
         )
         return apply_canonical_keyframe_safety(
@@ -374,6 +378,7 @@ def build_mujoco_agent_skill_motion_target(
         execution_observation_sink=execution_observation_sink,
         execution_pose_observation_projector=pose_projector,
         trace_sink=trace_sink,
+        clock=clock,
     )
     return MujocoAgentSkillMotionTarget(
         task_config=prepared.task_config,

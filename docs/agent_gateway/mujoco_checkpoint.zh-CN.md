@@ -2,8 +2,9 @@
 
 2026-10-24：继续原隔离分支，并合入固定 development `05b769efe9c5`，保留其
 primitive scene v2 与观察改进。在 native scene、acceleration planner 和 actuated
-owner 组件上新增完整 manual execution rig 的可信内部 cut。target、Gateway 会话
-及 RPent 联合恢复仍待装配，现有入口不自动启用这些组件。
+owner 组件上新增完整 manual execution rig 的可信内部 cut；随后补齐 source admission、
+execution authority、decision owners 三个控制状态组件及原 no-model target 的时钟接缝。
+完整 target、Gateway 会话及 RPent 联合恢复仍待装配，现有入口不自动启用恢复。
 
 ## 已保存的实现
 
@@ -133,6 +134,54 @@ fork 子进程验证检查的是独立恢复与同输入续跑，不等于 fresh
 代码/owner/profile/父分支身份和原子存储由后续统一 store/应用负责，不能用组件通过来
 跳过已有源码、SDK、记录前缀或恢复 owner 检查。native ABI、MjSpec 限制仍如前述。
 
+## 运行控制状态与实际 target 接线
+
+控制状态保留在原 owning package 的 companion module，不另建 dispatcher、调度器
+或模型调用循环。三个组件均为可信内部数据；调用方须排除完整操作期间的并发写入，
+单个 store 的锁不能证明整个 runtime 已静止。
+
+| 组件 | 入口 | 保存内容与明确边界 |
+| --- | --- | --- |
+| Source admission | `robot_motion.action.admission_checkpoint` | 全局 admission 水位、producer 激活历史/活跃 epoch/计数、保留 proposal 及独立 producer sequence 水位；过期记录清空后也不能重新接纳旧 sequence |
+| Execution authority | `robot_motion.runtime.execution_checkpoint` | 当前逻辑 token、acquisition/live epochs、owner generation、issued/consumed permit、取消/ACK 历史与期限、fault latch；拒绝未消费 permit 和进行中的 owner transition |
+| Decision owners | `robot_motion.action.decision_checkpoint` | 原调度网格、tick index、pending trigger 总数与截断证据、最后成功 publication 的两个时间；不补 tick、不重播 trigger 或 publication |
+
+恢复创建新锁和新容器，直接恢复原 typed facts；不重新 commit、activate、admit、grant、
+cancel、register 或 acknowledge。Source proposal 的 admission 必须位于所属 epoch
+激活与被替换之间；合法旧 epoch 的保留事实仍保留，不能只检查当前 active epoch。
+全局 admission 水位可以高于所有 source 记录，因为 authority/gate 等 store 共享它；
+这些 store 的状态仍须由后续父组件补齐，不能只恢复 source 就发布完整 runtime。
+
+Decision pending evidence 数必须严格等于 `min(total_count, evidence_capacity)`。
+否则恢复时会改变下一个 tick 的因果证据和 hash。两项先失败的反例分别覆盖截断前、
+截断后的证据丢失；修复没有改写计数、补造证据或改变既有 scheduler 算法。
+
+Dispatch token 的 acquisition epochs 可以早于当前 live epochs，正常 cancel/recovery
+后不能为求相等而重授 token。旧 consumed permit 的拒绝保持；pending ACK 不伪造为
+完成，仍由原 tracker 按保存的 deadline 计算。`in_process_only` 的逻辑 registry 历史
+仅可在独立 native 仿真 backend 的父合同内重建；它不授权重新控制同一个 live backend，
+也不提供跨进程或分布式控制锁。实际 owner 转移继续使用原 HOLD/ACK/新 generation。
+
+现有 `build_mujoco_agent_skill_motion_target` 新增显式 `clock` 参数，默认仍为
+`time.monotonic`。同一 callable 传给原 rig、runtime/control owners 与 shared safety
+anchor 采样。它不替换 IK 内部的墙钟性能计时或自适应预算，不创建另一套建场入口。
+非法非 callable 在 native 资源准备前拒绝；左右臂选择、原 collision/IK 与正常 lifecycle
+保持原实现。
+
+实际接线用例：
+
+```bash
+bash scripts/run_pytest.sh tests/test_mujoco_agent_control_checkpoint.py -q
+```
+
+用例通过原 factory 构建真实 CAD/no-model target，正常 start 后推进17个 physics tick，
+生成一个 no-action decision，再接纳一个未 dispatch 的当前位姿 proposal。在测试独占的
+相同逻辑时刻保存四个组件（含 rig），恢复到独立 native rig 的同一个新 clock，核对
+proposal/epoch/permit/schedule 状态及 qpos/qvel/ctrl/warmstart，另验证真实 safety anchor
+使用注入时钟。该用例没有装配完整恢复 target、执行恢复后的 IK 或请求模型，不能据此
+宣称 Gateway、teacher/student 分支 rollout 或任务成功。完整 SDK/runtime/记录前缀
+的原恢复门禁保持不变。
+
 ## 修正的延迟队列时间窗
 
 原 arm/gripper 恢复校验错误要求所有待处理事件都不早于“当前 tick 结束时刻”。
@@ -150,8 +199,9 @@ fork 子进程验证检查的是独立恢复与同输入续跑，不等于 fresh
 ## 尚未完成，不能据此放开上层
 
 1. Gateway admission、物理线程和控制 owner 的联合静止边界。
-2. 将已有 manual rig cut 接到 target 的 authority、执行 gate、IK/safety、保留引用与
-   已知 observer；不能把本阶段明确排除的绑定直接放行。
+2. 基于已完成的 source/执行权/decision 组件补齐 authority、执行 gate、candidate
+   authorization、active/pending segment、trace 水位和 target 的保留引用；统一证明
+   来自同一 cut，再接 IK/safety 的连续性与已知 observer。不能将明确排除的绑定放行。
 3. 新实例中 FK、collision、payload、observer、scratch 等消费者的统一绑定。
 4. profile 身份、持久化/原子提交、历史产物与恢复分支的来源关系。
 5. sleep 混合状态、完整 no-model profile、渲染和远端组合验收。
