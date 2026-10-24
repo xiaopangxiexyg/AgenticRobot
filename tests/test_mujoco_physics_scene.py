@@ -8,6 +8,7 @@ import numpy as np
 import pytest
 
 from sim.contracts import FreeBodyObjectSpec, GroundSpec, SceneSpec, SimulationContract
+from sim.contracts.scene import SCENE_SPEC_VERSION_V2
 from sim.mujoco.mjcf import convert_urdf_to_mjcf_xml
 from sim.mujoco.scene import MujocoScene
 from sim.mujoco.urdf import parse_urdf
@@ -124,14 +125,19 @@ def test_scene_composition_adds_ground_and_explicit_inertial_free_body(
 
 
 @pytest.mark.optional
-def test_isolated_free_body_falls_and_settles_reproducibly(tmp_path: Path) -> None:
+@pytest.mark.parametrize("shape", ["box", "sphere"])
+def test_isolated_free_body_falls_and_settles_reproducibly(tmp_path: Path, shape) -> None:
     mujoco = pytest.importorskip("mujoco")
     urdf_path = _isolated_table_world(tmp_path)
+    spec = _drop_scene(urdf_path)
+    if shape == "sphere":
+        spec = replace(spec, schema_version=SCENE_SPEC_VERSION_V2,
+            objects=(replace(spec.objects[0], shape="sphere", inertia_diagonal_kg_m2=None),))
     xml_text = convert_urdf_to_mjcf_xml(
         parse_urdf(urdf_path),
         camera_mounts=(),
         timestep=0.001,
-        scene_spec=_drop_scene(urdf_path),
+        scene_spec=spec,
     )
 
     def rollout() -> tuple[np.ndarray, np.ndarray, int]:
@@ -147,7 +153,7 @@ def test_isolated_free_body_falls_and_settles_reproducibly(tmp_path: Path) -> No
 
     np.testing.assert_allclose(position_a, position_b, atol=1e-12)
     np.testing.assert_allclose(qvel_a, qvel_b, atol=1e-12)
-    # The table top is world z=0.01 and the cube half-height is 0.02.
+    # The table top is world z=0.01; both bodies have vertical radius/half-height 0.02.
     assert position_a[2] == pytest.approx(0.03, abs=0.004)
     assert np.linalg.norm(qvel_a) < 0.05
     assert contacts_a >= 1 and contacts_b >= 1
@@ -200,3 +206,112 @@ def test_rm65_physics_profile_has_one_urdf_table_and_no_initial_contact() -> Non
     for spec in scene.gripper_specs.values():
         assert spec.open_qpos == pytest.approx((0.0,) * 6)
         assert spec.closed_qpos == pytest.approx((0.864,) * 6)
+
+
+@pytest.mark.parametrize(
+    ("shape", "dimensions", "mujoco_size"),
+    [
+        ("box", (0.07, 0.05, 0.04), (0.035, 0.025, 0.02)),
+        ("cylinder", (0.05, 0.05, 0.10), (0.025, 0.05)),
+        ("sphere", (0.048, 0.048, 0.048), (0.024,)),
+        ("ellipsoid", (0.06, 0.045, 0.035), (0.03, 0.0225, 0.0175)),
+    ],
+)
+def test_scene_v2_maps_full_object_extents_to_mujoco_primitive_sizes(
+    tmp_path: Path, shape, dimensions, mujoco_size
+) -> None:
+    urdf_path = _isolated_table_world(tmp_path)
+    spec = FreeBodyObjectSpec(name="test_object", shape=shape, size_m=dimensions)
+    scene = SceneSpec(
+        schema_version=SCENE_SPEC_VERSION_V2,
+        profile_name="primitive_size_test_v2",
+        urdf_path=str(urdf_path),
+        camera_registry_path="unused.json",
+        objects=(spec,),
+    )
+    root = ET.fromstring(
+        convert_urdf_to_mjcf_xml(
+            parse_urdf(urdf_path), camera_mounts=(), scene_spec=scene
+        )
+    )
+
+    for role in ("visual", "collision"):
+        geom = root.find(f".//geom[@name='test_object_{role}']")
+        assert geom is not None
+        assert geom.get("type") == shape
+        np.testing.assert_allclose(
+            [float(value) for value in geom.get("size").split()], mujoco_size
+        )
+    inertial = root.find(".//body[@name='test_object']/inertial")
+    assert inertial is not None
+    assert all(value > 0 for value in spec.inertia_diagonal_kg_m2)
+
+
+@pytest.mark.optional
+def test_scene_v2_primitive_shapes_compile_with_mujoco(tmp_path: Path) -> None:
+    mujoco = pytest.importorskip("mujoco")
+    urdf_path = _isolated_table_world(tmp_path)
+    objects = tuple(
+        FreeBodyObjectSpec(
+            name=name,
+            shape=shape,
+            size_m=size,
+            initial_position_m=(0.0, offset, 0.5),
+        )
+        for name, shape, size, offset in (
+            ("box", "box", (0.07, 0.05, 0.04), -0.15),
+            ("can", "cylinder", (0.05, 0.05, 0.10), -0.05),
+            ("ball", "sphere", (0.048, 0.048, 0.048), 0.05),
+            ("fruit", "ellipsoid", (0.06, 0.045, 0.035), 0.15),
+        )
+    )
+    scene = SceneSpec(
+        schema_version=SCENE_SPEC_VERSION_V2,
+        profile_name="primitive_compile_test_v2",
+        urdf_path=str(urdf_path),
+        camera_registry_path="unused.json",
+        objects=objects,
+    )
+    xml_text = convert_urdf_to_mjcf_xml(
+        parse_urdf(urdf_path), camera_mounts=(), scene_spec=scene
+    )
+
+    model = mujoco.MjModel.from_xml_string(xml_text)
+
+    for name in ("box", "can", "ball", "fruit"):
+        geom_id = mujoco.mj_name2id(
+            model, mujoco.mjtObj.mjOBJ_GEOM, f"{name}_collision"
+        )
+        assert geom_id >= 0
+
+
+@pytest.mark.integration
+def test_scene_v2_sphere_uses_existing_dmtac_assembly_without_contact_changes() -> None:
+    import mujoco
+    from sim.mujoco.tasks.cube_lift.config import CubeLiftTaskConfig
+
+    task = CubeLiftTaskConfig.load("sim/configs/tasks/rm65_right_dmtacm_blue_cube_70mm_agent_v1.json")
+    baseline = task.base_contract()
+    target = replace(baseline.scene.objects[0], shape="sphere", size_m=(.05, .05, .05),
+                     inertia_diagonal_kg_m2=None)
+    candidate = replace(baseline, scene=replace(baseline.scene,
+        schema_version=SCENE_SPEC_VERSION_V2, objects=(target,)))
+    models = [MujocoScene.from_contract(contract,
+        gripper_actuation_profile=task.gripper_actuation_profile()).model
+        for contract in (baseline, candidate)]
+    old, new = models
+    assert old.ngeom == new.ngeom and old.nbody == new.nbody
+    body = int(new.body(target.name).id)
+    geom = int(new.geom(target.name+"_collision").id)
+    assert new.geom_type[geom] == mujoco.mjtGeom.mjGEOM_SPHERE
+    assert new.geom_size[geom, 0] == pytest.approx(.025)
+    np.testing.assert_allclose(new.body_inertia[body], [.4*target.mass_kg*.025**2]*3)
+    keep_geoms = np.asarray(new.geom_bodyid != body)
+    for name in ("geom_type", "geom_size", "geom_pos", "geom_quat"):
+        np.testing.assert_array_equal(getattr(old, name)[keep_geoms], getattr(new, name)[keep_geoms])
+    for name in ("geom_contype", "geom_conaffinity", "geom_friction", "geom_solref", "geom_solimp",
+                 "pair_geom1", "pair_geom2", "pair_friction", "pair_solref", "pair_solimp",
+                 "actuator_gainprm", "actuator_biasprm", "actuator_forcerange", "eq_type", "eq_data"):
+        np.testing.assert_array_equal(getattr(old, name), getattr(new, name))
+    assert old.opt.timestep == new.opt.timestep
+    np.testing.assert_array_equal(old.opt.gravity, new.opt.gravity)
