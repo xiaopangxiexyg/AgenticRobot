@@ -6,6 +6,7 @@ import copy
 import json
 import math
 from dataclasses import asdict, replace
+from itertools import pairwise
 
 import pytest
 
@@ -212,7 +213,7 @@ def test_offline_closed_loop_interval_is_not_truncated_by_online_256_sample_hist
         "maximum_line_error_rad": .0008, "maximum_residual_span_nm": .15}
     assert reduce_command_window(**args)[1] == "velocity_window_not_complete"
     observation, reason = reduce_command_window(**args, reduction_method="closed_loop_average",
-        interval_command_integrals_nm_sec=[(0, 0, .1*(b-a), 0, 0, 0) for a, b in zip(times, times[1:])],
+        interval_command_integrals_nm_sec=[(0, 0, .1*(b-a), 0, 0, 0) for a, b in pairwise(times)],
         interval_gravity_integrals_nm_sec=[zero]*(len(times)-1))
     assert reason is None
     assert observation.velocity_rad_s == pytest.approx(.003)
