@@ -259,6 +259,7 @@ def assemble_exclusive_rm65_agent_primitive_composition(
     right_gripper_backend: object | None = None,
     gripper_backends: Mapping[str, object] | None = None,
     authorized_gripper_sides: tuple[str, ...] | None = None,
+    gripper_startup_reconnect_on_fault16: bool = False,
     socket_path: str | Path,
     authorized_side: str,
     authorized_motion_sides: tuple[str, ...] | None = None,
@@ -358,6 +359,8 @@ def assemble_exclusive_rm65_agent_primitive_composition(
                         {} if right_gripper_backend is None else {"right": right_gripper_backend})
     if bilateral and set(gripper_backends) != {"left", "right"}:
         raise ValueError("Gripper v2 requires both left and right backend configurations.")
+    if gripper_startup_reconnect_on_fault16 and not gripper_backends:
+        raise ValueError("Startup gripper reconnect requires configured gripper backends.")
     if "set_gripper_state" in normalized_actions and not gripper_backends:
         raise ValueError("set_gripper_state requires configured gripper backends.")
     gripper_ports = {
@@ -1120,6 +1123,7 @@ def assemble_exclusive_rm65_agent_primitive_composition(
         )
     if gripper_ports:
         resources = ExclusiveRealGripperResources(lower=resources,
+            startup_reconnect_on_fault16=gripper_startup_reconnect_on_fault16,
             **({"ports": gripper_ports} if bilateral else {"port": gripper_port}))
     authorization = RealAgentPrimitiveOneShotAuthorization(
         authorized_motion_sides=motion_sides,

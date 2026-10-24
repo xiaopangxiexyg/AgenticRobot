@@ -381,6 +381,247 @@ def test_gripper_startup_moving_state_is_rejected_and_cleans_owned_resources():
     assert backend.commands == []
 
 
+@pytest.mark.parametrize("failed_side", ["left", "right"])
+def test_startup_readiness_failure_preserves_backend_diagnostic_before_cleanup(caplog, failed_side):
+    backends = {side: _FakeDmtacBackend() for side in ("left", "right")}
+    diagnostic = {
+        "ready": False, "reason": "fresh state read failed",
+        "details": {"gripper_port": "/dev/test-" + failed_side,
+                    "startup_error": "serial response timeout", "gripper_error_code": 16},
+    }
+    for side, backend in backends.items():
+        backend.config.side = side
+        backend.samples = [(0.0, False)]
+    failed = backends[failed_side]
+    failed.is_ready = lambda: False
+    failed.readiness_report = lambda: diagnostic.copy()
+    original_close = failed.close
+
+    def close_failed():
+        diagnostic.clear()
+        original_close()
+
+    failed.close = close_failed
+    events = []
+
+    class Lower:
+        def start(self):
+            events.append("start")
+
+        def close(self):
+            events.append("close")
+
+    resources = ExclusiveRealGripperResources(lower=Lower(), ports={
+        side + "_gripper": RealDmtacGripperControlPort(backend=backend, component_id=side+"_gripper")
+        for side, backend in backends.items()
+    })
+    with pytest.raises(RuntimeError, match=failed_side + "_gripper startup is not ready"):
+        resources.start()
+    assert diagnostic == {} and events == ["start", "close"]
+    assert failed_side + "_gripper" in caplog.text
+    assert "/dev/test-" + failed_side in caplog.text
+    assert "serial response timeout" in caplog.text and "gripper_error_code" in caplog.text
+    assert all(not backend.commands and not backend.holds for backend in backends.values())
+
+
+@pytest.mark.parametrize("failed_side", ["left", "right"])
+@pytest.mark.parametrize(
+    "enabled,error_code,recovered,post_state,expected_calls,success",
+    [
+        (False, 16, True, "valid", 0, False),
+        (True, 16, True, "valid", 1, True),
+        (True, 16, False, "valid", 1, False),
+        (True, 16, True, "fault", 1, False),
+        (True, 16, True, "moving", 1, False),
+        (True, 16, True, "stale", 1, False),
+        (True, 16, True, "raised", 1, False),
+        (True, 17, True, "valid", 0, False),
+        (True, None, True, "valid", 0, False),
+        (True, 0, True, "valid", 0, False),
+    ],
+)
+def test_startup_fault16_reconnect_is_scoped_once_and_requires_fresh_stopped_state(
+    caplog, failed_side, enabled, error_code, recovered, post_state, expected_calls, success
+):
+    class Hand(_FakeDmtacBackend):
+        def __init__(self, side):
+            super().__init__()
+            self.config.side = side
+            self.samples = [(0.0, False)]
+            self.ready = side != failed_side
+            self.reconnect_calls = []
+
+        def is_ready(self):
+            return self.ready
+
+        def readiness_report(self):
+            return {"ready": self.ready, "details": {
+                "gripper_port": "/dev/test-" + self.config.side,
+                "gripper_error_code": 0 if self.ready else error_code,
+            }}
+
+        def force_reconnect_gripper(self, reason):
+            self.reconnect_calls.append(reason)
+            if post_state == "raised":
+                raise RuntimeError("reconnect failed")
+            self.ready = recovered
+            return recovered
+
+        def read_gripper_state_now(self):
+            if self.config.side == failed_side and post_state == "stale":
+                return {"timestamp": time.time() - 10.0}
+            return super().read_gripper_state_now()
+
+        def get_state(self, **kwargs):
+            state = super().get_state(**kwargs)
+            if self.config.side == failed_side:
+                state["gripper_error_code"] = 16 if post_state == "fault" else 0
+                state["gripper_is_moving"] = post_state == "moving"
+            return state
+
+    events = []
+
+    class Lower:
+        def start(self):
+            events.append("start")
+
+        def close(self):
+            events.append("close")
+
+    backends = {side: Hand(side) for side in ("left", "right")}
+    resources = ExclusiveRealGripperResources(
+        lower=Lower(), ports={
+            side + "_gripper": RealDmtacGripperControlPort(backend=backend, component_id=side+"_gripper")
+            for side, backend in backends.items()
+        }, startup_reconnect_on_fault16=enabled,
+    )
+    if success:
+        resources.start()
+        resources.close()
+    else:
+        with pytest.raises(RuntimeError):
+            resources.start()
+    assert events == ["start", "close"]
+    for side, backend in backends.items():
+        assert len(backend.reconnect_calls) == (expected_calls if side == failed_side else 0)
+        assert backend.events.count("hand_start") <= 1
+        assert backend.events.count("hand_close") == backend.events.count("hand_start")
+        assert not backend.commands and not backend.holds
+    if expected_calls:
+        assert "attempt=1/1" in caplog.text
+        assert "/dev/test-" + failed_side in caplog.text
+
+
+def test_startup_reconnect_requires_backend_api_before_starting_lower():
+    class Lower:
+        def start(self):
+            raise AssertionError("must not start")
+
+        def close(self):
+            raise AssertionError("must not close")
+
+    backend = _FakeDmtacBackend()
+    with pytest.raises(TypeError, match="force_reconnect_gripper"):
+        ExclusiveRealGripperResources(
+            lower=Lower(), ports={"right_gripper": RealDmtacGripperControlPort(backend=backend)},
+            startup_reconnect_on_fault16=True,
+        )
+
+
+@pytest.mark.parametrize("enabled", [1, "true", None])
+def test_startup_reconnect_flag_does_not_accept_implicit_truth_values(enabled):
+    backend = _FakeDmtacBackend()
+    with pytest.raises(TypeError, match="must be bool"):
+        ExclusiveRealGripperResources(lower=SimpleNamespace(),
+            port=RealDmtacGripperControlPort(backend=backend), startup_reconnect_on_fault16=enabled)
+    assert not backend.events
+
+
+@pytest.mark.parametrize("reconnect_error", [0, 16])
+def test_real_backend_startup_fault16_reconnect_without_fault_clear_or_position_command(
+    reconnect_error, monkeypatch
+):
+    from types import SimpleNamespace
+
+    from teleop_runtime.backends.grippers.dmtac import (
+        DMTacGripperBackend,
+        DMTacGripperBackendConfig,
+    )
+
+    events = []
+
+    class Device:
+        tactile = None
+
+        def __init__(self, error_code):
+            self.gripper = self
+            self.error_code = error_code
+
+        def read_gripper_state(self):
+            events.append(("read", self.error_code))
+            return SimpleNamespace(
+                joint_pos=0.0, timestamp=time.time(), error_code=self.error_code,
+                status_code=1, status_text="open idle", is_moving=False,
+            )
+
+        def close(self):
+            events.append(("close", self.error_code))
+
+        def set_speed(self, value):
+            events.append(("speed", value))
+
+        def set_torque(self, value):
+            events.append(("torque", value))
+
+        def clear_fault(self):
+            raise AssertionError("Startup reconnect must not clear faults")
+
+        def open(self, **kwargs):
+            raise AssertionError("Startup reconnect must not move the hand")
+
+    backend = DMTacGripperBackend(DMTacGripperBackendConfig(
+        side="right", connect_hardware=True, connect_tactile=False, enable_telemetry=False,
+        clear_fault_on_start=False, reconnect_on_error=False,
+        auto_recover_internal_communication_fault=False, open_on_start=False,
+        startup_connection_settle_sec=0.0,
+    ))
+    devices = [Device(16), Device(reconnect_error)]
+    created = []
+
+    def create_device():
+        device = devices[len(created)]
+        created.append(device)
+        return device
+
+    monkeypatch.setattr(backend, "_create_device", create_device)
+
+    class Lower:
+        def start(self):
+            events.append("lower_start")
+
+        def close(self):
+            events.append("lower_close")
+
+    resources = ExclusiveRealGripperResources(
+        lower=Lower(), ports={"right_gripper": RealDmtacGripperControlPort(backend=backend)},
+        startup_reconnect_on_fault16=True,
+    )
+    if reconnect_error == 0:
+        resources.start()
+        assert backend.is_ready()
+        # Startup and admission both read the replacement serial session.
+        assert events.count(("read", 0)) >= 2
+        resources.close()
+    else:
+        with pytest.raises(RuntimeError, match="startup is not ready"):
+            resources.start()
+        assert not backend.is_ready()
+    assert created == devices
+    assert events.count("lower_start") == events.count("lower_close") == 1
+    assert ("close", 16) in events
+    assert backend.device is None
+
+
 @pytest.mark.parametrize(
     "reading", [None, {"timestamp": 0.0}, {"timestamp": float("inf")}]
 )

@@ -139,6 +139,18 @@ def test_cli_gripper_authorization_requires_explicit_config_before_hardware():
     assert error.value.code == 2
 
 
+def test_cli_gripper_startup_reconnect_requires_configs_before_hardware(monkeypatch):
+    def forbidden(*args, **kwargs):
+        raise AssertionError("Invalid reconnect option must not resolve hardware")
+
+    monkeypatch.setattr(gateway_cli, "resolve_exclusive_rm65_skill_deployment_profile", forbidden)
+    args = _argv(confirmation=REAL_AGENT_PRIMITIVE_SESSION_CONFIRM_TOKEN)
+    assert not gateway_cli.build_parser().parse_args(args).gripper_startup_reconnect_on_fault16
+    with pytest.raises(SystemExit) as error:
+        gateway_cli.main([*args, "--gripper-startup-reconnect-on-fault16"])
+    assert error.value.code == 2
+
+
 @pytest.mark.parametrize(
     "flag",
     [
@@ -149,8 +161,10 @@ def test_cli_gripper_authorization_requires_explicit_config_before_hardware():
         "tactile_reset_on_start",
     ],
 )
+@pytest.mark.parametrize("startup_reconnect", [False, True])
+@pytest.mark.parametrize("version", ["1", "2"])
 def test_cli_gripper_rejects_implicit_motion_or_recovery_before_hardware(
-    tmp_path, flag
+    tmp_path, flag, startup_reconnect, version
 ):
     config = tmp_path / "hand.json"
     config.write_text(
@@ -158,6 +172,12 @@ def test_cli_gripper_rejects_implicit_motion_or_recovery_before_hardware(
     )
     args = _argv(confirmation=REAL_AGENT_PRIMITIVE_SESSION_CONFIRM_TOKEN)
     args.extend(["--right-gripper-config", str(config)])
+    if version == "2":
+        left_config = tmp_path / "left.json"
+        left_config.write_text(json.dumps({"side": "left", "gripper_port": "/dev/fake-left"}))
+        args.extend(["--gripper-skill-version", "2", "--left-gripper-config", str(left_config)])
+    if startup_reconnect:
+        args.append("--gripper-startup-reconnect-on-fault16")
     with pytest.raises(SystemExit) as error:
         gateway_cli.main(args)
     assert error.value.code == 2
