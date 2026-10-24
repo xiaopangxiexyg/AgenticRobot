@@ -6,10 +6,9 @@ the camera used to observe an object never selects the arm that will grasp it.
 """
 from __future__ import annotations
 
-from deployments.perception.dmtac_grasp_overlay import (
+from deployments.dmtac_graspgenx_alignment_ids import (
     DMTAC_M_GRASPGENX_ALIGNMENT_PROFILE_ID,
     DMTAC_M_GRASPGENX_ALIGNMENT_PROFILE_IDS,
-    dmtac_graspgenx_alignment_profile,
 )
 
 import argparse
@@ -28,7 +27,10 @@ from agent_gateway.profiles.real.realsense_perception import build_real_percepti
 from agent_gateway.profiles.real.rm65_camera_geometry import build_rm65_rgb_camera_geometry, load_rm65_wrist_camera_side_axis_tool
 from agent_gateway.profiles.real.rm65_grasp_reachability import RM65PointGraspReachabilityAdapter, arm_base_origin_in_candidate_frame
 from agent_gateway.profiles.real.station_point_grasp_deployment import StationPointGraspArmReachabilityProfile
-from deployments.perception.dmtac_grasp_overlay import reviewed_graspgenx_dmtac_solid_geometry
+from deployments.perception.dmtac_grasp_overlay import (
+    reviewed_graspgenx_dmtac_solid_geometry,
+    dmtac_graspgenx_alignment_profile,
+)
 from deployments.perception.grasp_multiview import GraspRgbdView, fuse_grasp_views
 from deployments.perception.grasp_planning_priority import grasp_planning_candidate_ordinals
 from deployments.perception.sam2_graspgenx_point_grasp import (

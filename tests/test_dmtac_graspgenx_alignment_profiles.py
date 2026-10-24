@@ -208,3 +208,21 @@ print(json.dumps(dict(selected=selected, selected_without_explicit_pattern=selec
     result = subprocess.run([sys.executable, "-c", program, str(ROOT)], text=True,
         capture_output=True, timeout=30, check=True)
     assert json.loads(result.stdout) == {"selected": True, "selected_without_explicit_pattern": False}
+
+
+def test_mujoco_parser_keeps_optional_perception_unloaded():
+    program = r'''
+import importlib.abc, sys
+class BlockOptionalPerception(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname == "deployments.perception" or fullname.startswith("deployments.perception."):
+            raise AssertionError("optional perception imported: " + fullname)
+        return None
+sys.meta_path.insert(0, BlockOptionalPerception())
+from agent_gateway.profiles.mujoco import gateway_cli
+from deployments.dmtac_graspgenx_alignment_ids import DMTAC_M_GRASPGENX_ALIGNMENT_PROFILE_ID
+parser = gateway_cli.build_parser()
+assert parser.get_default("graspgenx_alignment_profile") == DMTAC_M_GRASPGENX_ALIGNMENT_PROFILE_ID
+assert "deployments.perception" not in sys.modules
+'''
+    subprocess.run([sys.executable, "-c", program], cwd=ROOT, check=True, timeout=30)

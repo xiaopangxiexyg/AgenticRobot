@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from deployments.perception.dmtac_grasp_overlay import (
+from deployments.dmtac_graspgenx_alignment_ids import (
     DMTAC_M_GRASPGENX_ALIGNMENT_PROFILE_ID,
     DMTAC_M_GRASPGENX_ALIGNMENT_PROFILE_IDS,
 )

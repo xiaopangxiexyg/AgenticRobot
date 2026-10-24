@@ -20,6 +20,11 @@ from typing import Any
 import numpy as np
 from PIL import Image, ImageDraw
 from robot_motion.grasp_visible_scene import ParallelJawSolidGeometry
+from deployments.dmtac_graspgenx_alignment_ids import (
+    DMTAC_M_GRASPGENX_ALIGNMENT_PROFILE_ID,
+    DMTAC_M_GRASPGENX_ALIGNMENT_PROFILE_ID_V5,
+    DMTAC_M_GRASPGENX_ALIGNMENT_PROFILE_IDS,
+)
 
 GRASP_VISIBILITY_STATES = frozenset(
     {"visible", "partially_visible", "behind_camera", "out_of_frame"}
@@ -64,12 +69,6 @@ DMTAC_M_GRASPGENX_PAD_HEIGHT_M = 0.030
 DMTAC_M_GRASPGENX_GRASP_CENTER_FROM_TACTILE_XYZ_M = (0.0, 0.0, -0.022)
 DMTAC_M_GRASPGENX_GRASP_CENTER_FROM_TACTILE_Z_M = (
     DMTAC_M_GRASPGENX_GRASP_CENTER_FROM_TACTILE_XYZ_M[2]
-)
-DMTAC_M_GRASPGENX_ALIGNMENT_PROFILE_ID = "DMTAC_M_graspgenx_alignment_v4_q0"
-DMTAC_M_GRASPGENX_ALIGNMENT_PROFILE_ID_V5 = "DMTAC_M_graspgenx_alignment_v5_right_q0"
-DMTAC_M_GRASPGENX_ALIGNMENT_PROFILE_IDS = (
-    DMTAC_M_GRASPGENX_ALIGNMENT_PROFILE_ID,
-    DMTAC_M_GRASPGENX_ALIGNMENT_PROFILE_ID_V5,
 )
 
 # T_tool_tcp_from_graspgenx_model at the reviewed URDF pose (q=0, master q=0).

@@ -2,10 +2,9 @@
 
 from __future__ import annotations
 
-from deployments.perception.dmtac_grasp_overlay import (
+from deployments.dmtac_graspgenx_alignment_ids import (
     DMTAC_M_GRASPGENX_ALIGNMENT_PROFILE_ID,
     DMTAC_M_GRASPGENX_ALIGNMENT_PROFILE_IDS,
-    dmtac_graspgenx_alignment_profile,
 )
 
 import argparse
@@ -861,6 +860,7 @@ def main(argv: list[str] | None = None) -> int:
             parser.error("--graspgenx-alignment-profile requires the GraspGenX backend")
         if not args.enable_point_grasp:
             parser.error("--graspgenx-alignment-profile requires --enable-point-grasp")
+        from deployments.perception.dmtac_grasp_overlay import dmtac_graspgenx_alignment_profile
         try:
             dmtac_graspgenx_alignment_profile(args.graspgenx_alignment_profile).require_motion_sides((args.authorized_side,))
         except ValueError as error:
