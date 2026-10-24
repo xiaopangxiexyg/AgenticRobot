@@ -299,6 +299,13 @@ may set new absolute `DEXTELEOP_FULL_ACCEPTANCE_RUN_ROOT` and
 the protected Run directory. Explicit test targets are rejected because this
 entrypoint represents complete-suite acceptance.
 
+完整验收会显式加载 `scripts.pytest_native_memory`：在当前模块的测试和 teardown
+完成后，使用 Linux/glibc 的 `malloc_trim` 将已经空闲的原生堆页归还操作系统，
+为主堆保留 128 KiB。它不强制 Python GC、不清空模型缓存、不关闭仍存活的资源，
+也不改变测试、断言、并发或内存保护。其他平台或缺少该符号时保持原有内存分配行为；
+实际加载或调用异常仍会使验证失败。普通 `run_pytest.sh` 不自动加载该插件。
+此优化针对长批次中已释放却仍占 RSS 的原生内存，不替代对选定并发度的完整资源验证。
+
 在内存受限的主机上，可以把分片数量与同时运行的进程数分开配置：
 
 ```bash
