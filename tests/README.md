@@ -270,6 +270,15 @@ artifact migration / resolution 两个 I/O 模块按 `c3c06be6` 在 2026-09-25 �
 2026-10-18 的绿色完整基线 `298221fc`（六分片串行、Node 22）补齐了九个此前未加权、
 实际累计至少五秒的模块，包括 DMTAC 接触、Gateway 安全位姿和 worker 清理等。
 既有模块与函数权重保留，避免把单一远端的 I/O 差异当作全局变化。
+绿色完整基线 `54edca481`（Run `full-20261023-mainline12j1geom`，十二批串行）
+补齐十三个此前未加权的慢模块。2026-10-24 的绿色完整基线 `dfff99b81`
+（Run `full-20261024-visualfull2`，十二批、两并发、Node 22、Trimesh 5.1.1 /
+Embreex 4.4.0.post1）再补齐十三个累计至少五秒的新模块，包含 B601 calibration、
+coordinated holding、staged assist 与 Gateway fast grasp 等测试族，并按新源码刷新
+safe TCP pose、gripper contact、real RM65 composition 三个模块。
+该基线有 18,107 个普通用例和 24 个子测试通过、16 个跳过；单并发运行因三十分钟
+上限未完成，不作为绿色权重来源。其他历史模块与函数权重继续保留。
+这些证据绑定固定源码和环境；选择并发度后仍需验证内存余量及完整测试结果。
 这些值只用于调度，不是 timeout 或验收阈值；不改变测试内容、真实 `fsync`、
 模块隔离边界、参数矩阵或 fast Profile 的权重。
 The default remains four shards. Each shard has separate pytest, Python, XDG,
