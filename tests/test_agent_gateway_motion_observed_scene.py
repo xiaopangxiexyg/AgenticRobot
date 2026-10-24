@@ -8,6 +8,7 @@ import numpy as np
 import pytest
 
 from agent_gateway.profiles.real.motion_observed_scene import (
+    MotionPlanningGeometryResources,
     ObservedSafeMovePlanner,
     SafeMotionObservationConfig,
     obstacle_cloud_from_captures,
@@ -853,3 +854,51 @@ def test_capture_error_then_window_interrupt_survives_input_record_failure(
     assert isinstance(caught.value.__cause__, OSError)
     result = json.loads((next(tmp_path.iterdir()) / "result.json").read_text())
     assert result["exception_type"] == interrupt.__name__
+
+
+def test_geometry_preparation_is_static_and_propagates_failure():
+    events = []
+    def prepare():
+        events.append('filter')
+        return {'visual_model': .2}
+    resource = MotionPlanningGeometryResources(
+        self_filter=SimpleNamespace(prepare=prepare), planner_factory=lambda: events.append('planner'))
+    resource.start()
+    resource.close()
+    assert events == ['filter', 'planner']
+    def broken():
+        raise ValueError('invalid mesh')
+    resource.self_filter = SimpleNamespace(prepare=broken)
+    with pytest.raises(ValueError, match='invalid mesh'):
+        resource.start()
+    assert events == ['filter', 'planner']
+
+
+@pytest.mark.parametrize('failure', [None, 'filter', 'planner'])
+def test_geometry_preparation_uses_aggregate_startup_and_failure_cleanup(monkeypatch, failure):
+    from agent_gateway.profiles.real.realsense_perception import ExclusiveRealPerceptionResources
+    events = []
+    def stage(name):
+        events.append(name)
+        if name == failure:
+            raise ValueError('preparation failed')
+        return {}
+    monkeypatch.setattr('agent_gateway.profiles.real.realsense_perception._formal_close_camera_sources',
+                        lambda _: events.append('cameras.close'))
+    resources = ExclusiveRealPerceptionResources(
+        lower=SimpleNamespace(start=lambda: stage('lower'), close=lambda: stage('lower.close')),
+        camera_sources={'fixture': object()},
+        start_cameras=lambda _: stage('cameras.start'), admit_cameras=lambda _: stage('cameras.admit'),
+        additional_resources=(MotionPlanningGeometryResources(
+            self_filter=SimpleNamespace(prepare=lambda: stage('filter')),
+            planner_factory=lambda: stage('planner')),))
+    if failure is None:
+        resources.start()
+        assert events == ['cameras.start', 'cameras.admit', 'filter', 'planner', 'lower']
+    else:
+        with pytest.raises(ValueError, match='preparation failed'):
+            resources.start()
+        assert 'lower' not in events
+        assert events[-1] == 'cameras.close'
+    resources.close()
+    assert events.count('cameras.start') == 1 and events.count('cameras.close') == 1

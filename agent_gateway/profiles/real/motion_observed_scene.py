@@ -42,6 +42,30 @@ def obstacle_cloud_from_captures(*, captures, config, reference_frame_id, self_f
         debug_record=debug_record, record_timing=record_timing)
 
 
+class MotionPlanningGeometryResources:
+    """Prepare shared static geometry before the arm control threads start."""
+
+    def __init__(self, *, self_filter, planner_factory=None):
+        self.self_filter = self_filter
+        self.planner_factory = planner_factory
+
+    def start(self):
+        started = time.perf_counter()
+        phases = self.self_filter.prepare()
+        if self.planner_factory is not None:
+            before = time.perf_counter()
+            self.planner_factory()
+            phases['planner_prepare'] = time.perf_counter() - before
+        logging.getLogger(__name__).warning(
+            'Motion geometry ready %.3fs; phases=%s; no observation or motion cached',
+            time.perf_counter() - started, phases)
+
+    def close(self):
+        # No device, worker, file or request state is owned by this resource.
+        # The in-memory references belong to the enclosing session.
+        pass
+
+
 class ObservedSafeMovePlanner:
     """Freeze one scene and pass it through the existing lower planner."""
 
