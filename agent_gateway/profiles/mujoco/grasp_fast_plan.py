@@ -30,6 +30,7 @@ from deployments.perception.grasp_first_path import (
     GraspPathQueryRejected,
     find_first_grasp_path,
     grasp_capture_height_acceptable,
+    grasp_contact_evidence,
     grasp_search_preference,
     original_grasp_neighbors,
     refine_first_grasp_path,
@@ -388,7 +389,8 @@ class MujocoFastGraspPlanProvider:
                     eligible_indices=tuple(i for _, _, i in costs),
                     plan=lambda candidate, budget, refinement_deadline: query(candidate, budget,
                         original_plan=original_plan, refinement_deadline=refinement_deadline),
-                    policy=c.policy, deadline=deadline, monotonic=self.monotonic)
+                    policy=c.policy, deadline=deadline, monotonic=self.monotonic,
+                    preference_costs={i: total for total, _, i in costs})
             except BaseException:
                 if pending[0] is not None:
                     native.discard_pending_plan(pending[0])
@@ -564,6 +566,8 @@ class MujocoFastGraspPlanProvider:
                     "motion_or_hold_performed": False,
                     "planning_policy": "first_acceptable_v1",
                     "diagnostics": {
+                        **({"contact_evidence": grasp_contact_evidence(box["candidate"])}
+                           if box["candidate"] is not None else {}),
                         "pool_count": box["pool_count"],
                         "path_query_count": (
                             0 if search is None else len(search.attempts)

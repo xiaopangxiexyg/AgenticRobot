@@ -190,7 +190,8 @@ def localize_objects_skill_definition_v1() -> SkillDefinition:
         summary=(
             "Locate object bounding boxes in one supplied image, either "
             "automatically or using one language prompt, without changing "
-            "downstream control state."
+            "downstream control state. Labels and scores are model proposals, "
+            "not verified object identity, distinct-object tracking or 3D motion evidence."
         ),
         intended_target_kind="target_agnostic",
         cross_target_deployment_policy="not_applicable",

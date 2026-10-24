@@ -191,6 +191,10 @@ def test_local_path_mode_is_bounded_to_explicit_test_root(tmp_path: Path) -> Non
     ]
     assert Image.open(io.BytesIO(prepared.annotated_jpeg)).size == (12, 10)
     registration.payload_validator.validate_execution_result(prepared.execution_result)
+    assert prepared.execution_result["semantic_identity_status"] == "unverified_proposal"
+    with pytest.raises(ValueError, match="semantic identity"):
+        registration.payload_validator.validate_execution_result({
+            **prepared.execution_result, "semantic_identity_status": "confirmed"})
 
     request.parameters["local_image_path"] = str(outside)
     with pytest.raises(PermissionError, match="outside"):

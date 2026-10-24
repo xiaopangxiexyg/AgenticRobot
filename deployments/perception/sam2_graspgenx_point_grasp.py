@@ -47,6 +47,8 @@ from .dmtac_grasp_overlay import (
 from .grasp_first_path import (
     FirstGraspPathPolicy,
     diverse_grasp_search_order,
+    grasp_axial_refinement_support,
+    grasp_axial_refinement_improves,
     grasp_capture_height_acceptable,
     grasp_capture_support_cost,
     grasp_contact_height_observed,
@@ -152,7 +154,7 @@ GRASPGENX_DMTAC_CENTERING_POSE_SOURCE = "dmtac_centering_variant_v1"
 GRASPGENX_DMTAC_AXIAL_POSE_SOURCE = "dmtac_axial_insertion_variant_v1"
 GRASPGENX_DMTAC_AXIAL_SHIFTS_M = (0.005, 0.010, 0.015, 0.020)
 GRASPGENX_DMTAC_AXIAL_SOURCE_LIMIT = 16
-GRASPGENX_DMTAC_AXIAL_SOURCE_ORDER = "shallow_filter_then_bounded_motion_family_anchors_v2"
+GRASPGENX_DMTAC_AXIAL_SOURCE_ORDER = "interleaved_central_and_observed_weak_side_families_v4"
 # The support score normalizes depth over 20% of the nominal finger length:
 # 0.25 identifies a median observed insertion below 5 mm, not grasp success.
 GRASPGENX_DMTAC_AXIAL_SHALLOW_SUPPORT = 0.25
@@ -478,6 +480,7 @@ class GraspGenXSelectionCandidate(PointGraspCandidate):
     height_shift_m: float = 0.0
     raw_index: int | None = None
     opposed_capture_support_score: float = 1.0
+    opposed_capture_support_observed_sides: int = 0
     surface_alignment_score: float = 1.0
     surface_alignment_observed_sides: int = 0
     surface_opposition_score: float = 0.0
@@ -509,6 +512,7 @@ class _RankedGraspCandidate:
     height_shift_m: float = 0.0
     raw_index: int | None = None
     opposed_capture_support_score: float = 1.0
+    opposed_capture_support_observed_sides: int = 0
     surface_alignment_score: float = 1.0
     surface_alignment_observed_sides: int = 0
     surface_opposition_score: float = 0.0
@@ -1708,6 +1712,8 @@ class Sam2GraspGenXPointGraspPlanner:
                 support_clearance_world_z_m=support_clearance_world_z_m,
                 capture_support_score=support_score,
                 opposed_capture_support_score=opposed_support.score,
+                opposed_capture_support_observed_sides=sum(
+                    count >= 3 for count in opposed_support.side_point_counts),
                 capture_height_support_score=height_support.score,
                 capture_height_center_shift_m=height_support.center_shift_m,
                 raw_index=raw_index,
@@ -2581,16 +2587,24 @@ class Sam2GraspGenXPointGraspPlanner:
             # Only refine already admitted, distinct parent poses. Keep each
             # original intact; a child is never a newly neurally scored pose.
             axial_policy = FirstGraspPathPolicy()
-            # Deep grasps need no axial proposal and must not consume the
-            # finite shallow-source allowance before its eligibility filter.
+            # A deep central median can hide a shallow closing edge. Only
+            # observed edge evidence extends the existing shallow-source rule.
             shallow = [item for item in deduplicated
-                if item.capture_support_score < GRASPGENX_DMTAC_AXIAL_SHALLOW_SUPPORT]
+                if grasp_axial_refinement_support(item)[0] < GRASPGENX_DMTAC_AXIAL_SHALLOW_SUPPORT]
             sources = sorted(shallow, key=lambda item: (
                 source_priority(item), grasp_capture_support_cost(item, policy=axial_policy)
             )) if proposal_priority else shallow
             source_order = diverse_grasp_search_order(
                 tuple(item.base_from_grasp_geometry @ geometry_from_tool for item in sources),
                 tuple(range(len(sources))), policy=axial_policy)
+            # Newly visible weak edges must not evict every existing shallow
+            # central family from the same finite proposal allowance.
+            central = [i for i in source_order
+                if sources[i].capture_support_score < GRASPGENX_DMTAC_AXIAL_SHALLOW_SUPPORT]
+            central_indices = set(central)
+            edge = [i for i in source_order if i not in central_indices]
+            source_order = tuple(group[depth] for depth in range(max(len(central), len(edge)))
+                for group in (central, edge) if depth < len(group))
             for index in source_order[:GRASPGENX_DMTAC_AXIAL_SOURCE_LIMIT]:
                 source = sources[index]
                 counts["axial_variant_source_count"] += 1
@@ -2619,10 +2633,11 @@ class Sam2GraspGenXPointGraspPlanner:
                         score=source.score * math.exp(
                             (source.click_distance_m - child.click_distance_m) / 0.060))
                     child = admit_visible_scene(child)
-                    if child is not None and child.capture_support_score > source.capture_support_score + 1e-9:
+                    if child is not None and grasp_axial_refinement_improves(child, source):
                         admitted_children.append(child)
                 best = min(admitted_children,
-                    key=lambda item: (-item.capture_support_score, item.axial_shift_m), default=None)
+                    key=lambda item: (*(-value for value in grasp_axial_refinement_support(item)),
+                                      item.axial_shift_m), default=None)
                 axial_readmissions.append((source, best))
                 if best is not None and not _pose_is_duplicate(
                     best.camera_from_grasp_geometry,
@@ -2717,6 +2732,7 @@ class Sam2GraspGenXPointGraspPlanner:
                 symmetry_parent_index=pool_indices.get(id(item.symmetry_parent)),
                 capture_support_score=item.capture_support_score,
                 opposed_capture_support_score=item.opposed_capture_support_score,
+                opposed_capture_support_observed_sides=item.opposed_capture_support_observed_sides,
                 surface_alignment_score=item.surface_alignment_score,
                 surface_alignment_observed_sides=item.surface_alignment_observed_sides,
                 surface_opposition_score=item.surface_opposition_score,

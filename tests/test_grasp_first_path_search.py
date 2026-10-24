@@ -11,6 +11,8 @@ from deployments.perception.grasp_first_path import (
     GraspPathQueryRejected,
     diverse_grasp_search_order,
     find_first_grasp_path,
+    grasp_axial_refinement_improves,
+    grasp_axial_refinement_support,
     grasp_capture_height_acceptable,
     grasp_capture_support_cost_components,
     grasp_search_preference,
@@ -138,6 +140,83 @@ def test_capture_support_is_a_soft_shared_search_cost_not_a_hard_gate():
         policy=FirstGraspPathPolicy(capture_support_weight=0.0)) == (0.1, 0.1)
     assert grasp_search_preference(SimpleNamespace(capture_support_score=.5), .1,
         policy=policy) == grasp_search_preference(deep, .1, policy=policy)
+
+
+def test_axial_source_support_accounts_for_an_observed_shallow_closing_edge():
+    candidate = SimpleNamespace(capture_support_score=.8,
+        opposed_capture_support_score=.04, opposed_capture_support_observed_sides=2)
+    assert grasp_axial_refinement_support(candidate) == (.04, .8)
+    # Height/central support improving alone must not conceal a worse edge.
+    worse = SimpleNamespace(capture_support_score=1.,
+        opposed_capture_support_score=.02, opposed_capture_support_observed_sides=2)
+    assert grasp_axial_refinement_support(worse) < grasp_axial_refinement_support(candidate)
+    # Sparse/uncomputed side evidence is unknown, not a new negative gate.
+    candidate.opposed_capture_support_observed_sides = 0
+    assert grasp_axial_refinement_support(candidate) == (.8, .8)
+    assert grasp_axial_refinement_support(SimpleNamespace()) == (1., 1.)
+
+
+def test_missing_opposed_observation_is_not_evidence_of_improving_a_measured_edge():
+    parent = SimpleNamespace(capture_support_score=.5, opposed_capture_support_score=.1,
+        opposed_capture_support_observed_sides=2)
+    unknown = SimpleNamespace(capture_support_score=.9, opposed_capture_support_score=0.,
+        opposed_capture_support_observed_sides=0)
+    assert grasp_axial_refinement_support(unknown) > grasp_axial_refinement_support(parent)
+    assert not grasp_axial_refinement_improves(unknown, parent)
+
+
+def test_refinement_keeps_native_committed_handle_when_shared_clock_crosses_subdeadline():
+    original = FirstGraspPathResult(0, "old", ({"index":0},), "path_found", 1.)
+    clock, owner = [0.], ["old"]
+    def query(_candidate, _budget, deadline):
+        # Commit within the native transaction; the caller resumes just after
+        # its subdeadline but still before the whole-request deadline.
+        clock[0] = deadline-.000001
+        owner[0] = "new"
+        clock[0] += .000002
+        return "new"
+    result = refine_first_grasp_path(original, candidates=(SimpleNamespace(),
+        SimpleNamespace(axial_parent_index=0)), eligible_indices=(0,1), plan=query,
+        policy=FirstGraspPathPolicy(), deadline=20., monotonic=lambda:clock[0])
+    assert result.trajectory == owner[0] == "new"
+    assert result.selected_index == 1 and result.attempts[-1]["reason_code"] == "path_found"
+
+
+@pytest.mark.parametrize("sides", (True, -1, 3, 1.5, "2"))
+def test_axial_source_support_rejects_invalid_observation_counts(sides):
+    with pytest.raises(ValueError, match="observed sides"):
+        grasp_axial_refinement_support(SimpleNamespace(opposed_capture_support_observed_sides=sides))
+
+
+@pytest.mark.parametrize("width", (.02, .04, .06))
+@pytest.mark.parametrize("tilt_deg", (0., 30., 70.))
+def test_weak_edge_refinement_uses_local_geometry_across_sizes_and_world_orientations(width, tilt_deg):
+    from scipy.spatial.transform import Rotation
+
+    from robot_motion.grasp_visible_scene import (
+        ParallelJawSolidGeometry,
+        parallel_jaw_capture_support,
+        parallel_jaw_opposed_capture_support,
+    )
+    geometry = ParallelJawSolidGeometry(palm_z_m=-.024, finger_length_m=.0867,
+        finger_thickness_m=.0199, pad_height_m=.03, maximum_opening_m=.0705)
+    tip = geometry.palm_z_m + geometry.finger_length_m
+    y = np.linspace(-.005, .005, 9)
+    points = np.concatenate([np.column_stack((np.full(9, sign*width/2), y,
+        np.full(9, tip-inset))) for sign,inset in ((-1., .014), (1., .0006))])
+    transform = Rotation.from_euler("xy", [tilt_deg, 17.], degrees=True).as_matrix()
+    world = points @ transform.T + [.1, -.3, .2]
+    local = (world - [.1, -.3, .2]) @ transform
+    def score(local_points):
+        _, central = parallel_jaw_capture_support(local_points, geometry=geometry, opening_m=.0705)
+        opposed = parallel_jaw_opposed_capture_support(local_points, geometry=geometry, opening_m=.0705)
+        return SimpleNamespace(capture_support_score=central, opposed_capture_support_score=opposed.score,
+            opposed_capture_support_observed_sides=sum(n >= 3 for n in opposed.side_point_counts))
+    parent = score(local)
+    assert parent.capture_support_score > .25  # The old source rule missed it.
+    assert grasp_axial_refinement_support(parent)[0] < .25
+    child = score(local - [0., 0., .005])
+    assert grasp_axial_refinement_support(child) > grasp_axial_refinement_support(parent)
 
 
 @pytest.mark.parametrize("score", [True, 0., -1., 1.01, float("nan"), float("inf"), "0.5"])
@@ -548,7 +627,7 @@ def test_axial_child_keeps_parent_motion_priority_and_failed_child_uses_original
         for pose, parent in zip(poses, (None, None, 0, 1)))
     # Child 3 has the best new score, but cannot promote the farther parent 1.
     order = refined_grasp_search_order(candidates, (3, 0, 2, 1), policy=FirstGraspPathPolicy())
-    assert order == (0, 1)
+    assert order == (0, 1, 3, 2)
     seen = []
     def query(candidate, budget):
         seen.append((next(i for i, c in enumerate(candidates) if c is candidate), budget))
@@ -560,8 +639,26 @@ def test_axial_child_keeps_parent_motion_priority_and_failed_child_uses_original
     result = refine_first_grasp_path(result, candidates=candidates, eligible_indices=(0, 1, 2, 3),
         plan=lambda c, b, _: query(c, b), policy=FirstGraspPathPolicy(), deadline=20., monotonic=lambda: 0.)
     assert result.selected_index == 0 and seen == [(0, 8.), (2, 3.)]
-    # Refinement never adds primary queries for an ineligible parent.
-    assert refined_grasp_search_order(candidates, (2,), policy=FirstGraspPathPolicy()) == ()
+    # An independently eligible child does not resurrect its ineligible parent.
+    assert refined_grasp_search_order(candidates, (2,), policy=FirstGraspPathPolicy()) == (2,)
+
+
+def test_blocked_parent_does_not_remove_independently_checked_axial_child():
+    candidates = tuple(SimpleNamespace(base_from_tcp=np.eye(4), axial_parent_index=parent)
+        for parent in (None, 0))
+    seen = []
+    def query(candidate, budget):
+        index = next(i for i, value in enumerate(candidates) if value is candidate)
+        seen.append((index, budget))
+        if index == 0:
+            raise GraspPathQueryRejected("visible_gripper_approach_collision")
+        return "independently_checked_child_path"
+    policy = FirstGraspPathPolicy()
+    order = refined_grasp_search_order(candidates, (1, 0), policy=policy)
+    result = find_first_grasp_path(candidates=candidates, ordered_indices=order,
+        plan=query, policy=policy, deadline=20., monotonic=lambda: 0.)
+    assert result.selected_index == 1
+    assert seen == [(0, 8.), (1, 3.)]
 
 
 @pytest.mark.parametrize("parent", [True, -1, 2, 1])
@@ -732,3 +829,94 @@ def test_phase15_large_finite_ranking_cost_is_preserved():
     candidate = SimpleNamespace(capture_support_score=0.)
     policy = FirstGraspPathPolicy(capture_support_weight=1e308)
     assert grasp_search_preference(candidate, 0., policy=policy) == (1e308, 0.)
+
+
+def test_contact_refinement_can_try_an_independent_nearby_pose_after_child_collision():
+    poses = [np.eye(4) for _ in range(4)]
+    poses[1][2, 3] = .005
+    poses[2][1, 3] = .002
+    poses[3][0, 3] = .2  # Better support alone must not add a distant replan.
+    candidates = tuple(SimpleNamespace(base_from_tcp=pose, axial_parent_index=parent,
+        capture_support_score=.6, opposed_capture_support_score=score,
+        opposed_capture_support_observed_sides=2)
+        for pose,parent,score in zip(poses, (None,0,None,None), (.04,.8,.5,1.)))
+    original = FirstGraspPathResult(0, "validated_parent", ({"index":0},), "path_found", 1.)
+    clock, seen = [0.], []
+    def query(candidate, budget, deadline):
+        seen.append((next(i for i,c in enumerate(candidates) if c is candidate), budget, deadline))
+        clock[0] += .1
+        if candidate is candidates[1]:
+            raise GraspPathQueryRejected("visible_gripper_terminal_collision")
+        return "validated_nearby_pose"
+    result = refine_first_grasp_path(original, candidates=candidates, eligible_indices=(0,1,2,3),
+        plan=query, policy=FirstGraspPathPolicy(), deadline=20., monotonic=lambda:clock[0],
+        preference_costs={0:1., 1:.8, 2:.9, 3:.7})
+    assert [i for i,_,_ in seen] == [1,2]
+    assert seen[1][1] == pytest.approx(2.9)
+    assert all(deadline == 3. for _,_,deadline in seen)
+    assert result.selected_index == 2 and result.trajectory == "validated_nearby_pose"
+
+
+@pytest.mark.parametrize("count", (True, -1, 3, "2"))
+def test_contact_refinement_has_a_small_validated_query_bound(count):
+    with pytest.raises(ValueError, match="maximum_contact_refinement_queries"):
+        FirstGraspPathPolicy(maximum_contact_refinement_queries=count)
+
+
+def test_optional_refinement_reuses_bounded_probe_without_rejecting_original_on_unknown():
+    original = FirstGraspPathResult(0, "validated_parent", ({"index":0},), "path_found", 1.)
+    candidates = (SimpleNamespace(), SimpleNamespace(axial_parent_index=0))
+    clock = [0.]
+    def probe(candidate, budget):
+        assert candidate is candidates[1] and budget == .08
+        clock[0] += budget
+        return False
+    result = refine_first_grasp_path(original, candidates=candidates, eligible_indices=(0,1),
+        plan=lambda *_: pytest.fail("Optional unresolved endpoint must not spend a full path query"),
+        policy=FirstGraspPathPolicy(), deadline=20., monotonic=lambda:clock[0], endpoint_probe=probe)
+    assert result.selected_index == 0 and result.trajectory == "validated_parent"
+    assert result.attempts == original.attempts
+    assert result.endpoint_probes == ({"index":1, "promising":False, "elapsed_sec":.08},)
+
+
+@pytest.mark.parametrize("limit", ("elapsed", "count", "partial"))
+def test_refinement_inherits_primary_endpoint_probe_allowance(limit):
+    policy = FirstGraspPathPolicy(
+        maximum_path_queries=2 if limit == "count" else 64,
+        endpoint_probe_total_budget_sec=.2 if limit == "partial" else
+            .16 if limit == "elapsed" else 2.)
+    candidates = (SimpleNamespace(), SimpleNamespace(),
+        SimpleNamespace(axial_parent_index=1))
+    clock, budgets, plans = [0.], [], []
+
+    def probe(candidate, budget):
+        budgets.append(budget)
+        clock[0] += budget
+        return candidate is candidates[1]
+
+    original = find_first_grasp_path(candidates=candidates, ordered_indices=(0, 1),
+        plan=lambda *_: "original", policy=policy, deadline=20.,
+        endpoint_probe=probe, monotonic=lambda: clock[0])
+    assert original.selected_index == 1 and len(original.endpoint_probes) == 2
+
+    def improve(candidate, budget, deadline):
+        assert candidate is candidates[2] and 0 < budget <= 3.
+        plans.append(candidate)
+        clock[0] += .01
+        assert clock[0] < deadline
+        return "improved"
+
+    result = refine_first_grasp_path(original, candidates=candidates,
+        eligible_indices=(1, 2), plan=improve, policy=policy, deadline=20.,
+        endpoint_probe=probe, monotonic=lambda: clock[0])
+    assert result.endpoint_probes[:2] == original.endpoint_probes
+    assert len(result.endpoint_probes) <= policy.maximum_path_queries
+    assert sum(budgets) <= policy.endpoint_probe_total_budget_sec + 1e-12
+    if limit == "partial":
+        assert budgets == pytest.approx([.08, .08, .04])
+        assert result.selected_index == 1 and result.trajectory == "original"
+        assert plans == []
+    else:
+        assert budgets == [.08, .08]
+        assert result.selected_index == 2 and result.trajectory == "improved"
+        assert len(plans) == 1

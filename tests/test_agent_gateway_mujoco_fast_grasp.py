@@ -195,6 +195,102 @@ def test_native_refinement_replaces_only_owned_unchanged_fully_validated_plan(tm
 
 
 @pytest.mark.integration
+@pytest.mark.parametrize("boundary", ["owner_reject", "cross_subdeadline", "cross_global_deadline"])
+def test_native_refinement_shared_deadlines_preserve_pending_owner(tmp_path, monkeypatch, boundary):
+    from robot_motion.relative_action import xyzquat_to_pose_matrix
+    from sim.mujoco.deploy.planned_tcp_motion import MujocoTcpMotionPlan
+    from sim.mujoco.transforms import pose_to_xyz_quat_xyzw
+
+    session = _session(tmp_path)
+    try:
+        app = session.application
+        app.start_observation_ready()
+        provider = session.fast_grasp_provider
+        native = app.target.planned_tcp_motion
+        clock = [0.]
+        provider.monotonic = lambda: clock[0]
+        original = MujocoTcpMotionPlan(
+            path=None,
+            trajectory=SimpleNamespace(timestamps=np.array([0., 1.])),
+            source_model_qpos=native._model_qpos().copy(),
+            reference_poses=((0., 0., 0., 0., 0., 0., 1.),),
+            trajectory_hash="a" * 64,
+        )
+        refined = replace(original, trajectory_hash="b" * 64)
+        pose = xyzquat_to_pose_matrix(pose_to_xyz_quat_xyzw(_retained_world_grasp()))
+        child_pose = pose.copy()
+        child_pose[:3, 3] += pose[:3, 2] * .005
+        candidates = (
+            SimpleNamespace(base_from_tcp=pose, score=.8, visible_collision_free=True,
+                capture_support_score=.1, opposed_capture_support_score=.1,
+                opposed_capture_support_observed_sides=2),
+            SimpleNamespace(base_from_tcp=child_pose, score=.8, visible_collision_free=True,
+                capture_support_score=.8, opposed_capture_support_score=.8,
+                opposed_capture_support_observed_sides=2, axial_parent_index=0),
+        )
+        # Use the actual provider/shared refinement and native transaction.
+        # Only the expensive path result and controlled clock are substituted.
+        preview_finished = [False]
+        queries, discarded = [], []
+
+        def plan_chain(goals, **kwargs):
+            queries.append(kwargs["time_budget_sec"])
+            assert len(goals) == 3
+            if "preview_model_qpos" not in kwargs:
+                native._pending_plan = original
+                return original
+            assert native.owns_pending_plan(original)
+            np.testing.assert_array_equal(kwargs["preview_model_qpos"], original.source_model_qpos)
+            clock[0] = 3.0000001 if boundary == "owner_reject" else 2.9999999
+            preview_finished[0] = True
+            return refined
+
+        model_qpos = native._model_qpos
+
+        def captured_model_qpos():
+            state = model_qpos()
+            if preview_finished[0] and boundary != "owner_reject":
+                # Cross during the final scene read. The owner must check
+                # again before replacing the original pending handle.
+                clock[0] = 20.0000001 if boundary == "cross_global_deadline" else 3.0000001
+            return state
+
+        discard = native.discard_pending_plan
+
+        def discard_pending(plan):
+            discarded.append(plan)
+            discard(plan)
+
+        monkeypatch.setattr(native, "plan_chain", plan_chain)
+        monkeypatch.setattr(native, "_model_qpos", captured_model_qpos)
+        monkeypatch.setattr(native, "discard_pending_plan", discard_pending)
+        select, _, box = provider._selector(parameters={"speed_scale": 1.},
+            deadline=20., cancelled=lambda: False)
+        selected = select(candidates, pose[:3, 3], 1)
+        result = box["result"]
+        assert queries == [8., 3.]
+        assert len(result.attempts) == 2
+        if boundary in {"owner_reject", "cross_subdeadline"}:
+            assert selected.selected_indices == (0,)
+            assert result.trajectory is original and result.reason_code == "path_found"
+            assert result.attempts[-1]["reason_code"] == "safe_tcp_planning_budget_exhausted"
+            assert native.owns_pending_plan(original) and not native.owns_pending_plan(refined)
+            assert not discarded
+        else:
+            assert selected.selected_indices == ()
+            assert result.trajectory is None and box["candidate"] is None
+            assert result.reason_code == "grasp_fast_search_budget_exhausted"
+            assert result.attempts[-1]["reason_code"] == result.reason_code
+            # This must come from the existing provider cleanup branch, not
+            # from test cleanup or a simulated shared-layer rollback.
+            assert len(discarded) == 1 and discarded[0] is original
+            assert not native.owns_pending_plan(original) and not native.owns_pending_plan(refined)
+        assert app.held and not native.active
+    finally:
+        assert session.close().accepted
+
+
+@pytest.mark.integration
 @pytest.mark.parametrize("candidate_order", [(0, 1), (1, 0)])
 @pytest.mark.parametrize("distance_m,farther_support,expected", [
     (.01, 1., 1), (.20, 1., 0), (.01, .20, 0),

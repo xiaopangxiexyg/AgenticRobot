@@ -238,6 +238,28 @@ def test_real_fast_selector_prefers_deeper_support_at_equal_motion_cost():
     assert provider.plan_request(request, operation).execution_result["planning_status"] == "path_found"
 
 
+def test_selected_contact_geometry_is_returned_without_claiming_physical_grasp_success():
+    pose = np.diag([1., -1., -1., 1.]); pose[:3, 3] = [.25, -.1, .3]
+    candidate = SimpleNamespace(base_from_tcp=pose, score=.8, visible_collision_free=True,
+        capture_support_score=.39, opposed_capture_support_score=.04,
+        opposed_capture_support_observed_sides=2, contact_height_support_score=.99,
+        surface_alignment_score=.2, surface_alignment_observed_sides=2)
+    provider, _, _, request, operation, _, _ = _fast_fixture(generated_pool=[candidate])
+    result = provider.plan_request(request, operation).execution_result
+    evidence = result["diagnostics"]["contact_evidence"]
+    assert evidence["opposed_capture_support_score"] == .04
+    assert evidence["opposed_capture_support_observed_sides"] == 2
+    assert evidence["contact_height_support_score"] == .99
+    assert "grasp_success" not in evidence
+    assert result["motion_or_hold_performed"] is False
+    provider.registration.payload_validator.validate_execution_result(result)
+    for invalid in (True, float("nan"), -1., 1.01):
+        modified = {**result, "diagnostics": {**result["diagnostics"], "contact_evidence": {
+            **evidence, "opposed_capture_support_score": invalid}}}
+        with pytest.raises((TypeError, ValueError)):
+            provider.registration.payload_validator.validate_execution_result(modified)
+
+
 def test_real_fast_selector_skips_top_rim_even_with_full_axial_support():
     def check(selector, _kwargs):
         pose = np.diag([1.,-1.,-1.,1.]);pose[:3,3] = [.25,-.1,.3]
