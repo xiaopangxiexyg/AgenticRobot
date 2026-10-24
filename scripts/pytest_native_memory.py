@@ -28,7 +28,8 @@ _MALLOC_TRIM = _load_malloc_trim()
 def pytest_runtest_protocol(
     item: pytest.Item, nextitem: pytest.Item | None,
 ) -> Iterator[None]:
-    yield
+    outcome = yield
+    outcome.get_result()
     if _MALLOC_TRIM is None or (nextitem is not None and nextitem.path == item.path):
         return
     # All current-item teardown has finished. This returns already-free pages;

@@ -120,3 +120,26 @@ def test_native_trim_failure_cannot_be_reported_as_success(tmp_path: Path):
 
     assert result.returncode != 0
     assert "native trim fault" in result.stdout + result.stderr
+
+
+def test_aborted_protocol_does_not_run_optional_cleanup(tmp_path: Path):
+    marker = tmp_path / "unexpected-trim"
+    (tmp_path / "conftest.py").write_text(
+        "from pathlib import Path\n"
+        "from scripts import pytest_native_memory as native_memory\n"
+        "def pytest_configure(config):\n"
+        "    def trim(padding):\n"
+        f"        Path({str(marker)!r}).write_text('trimmed')\n"
+        "        return 1\n"
+        "    native_memory._MALLOC_TRIM = trim\n"
+        "def pytest_runtest_protocol(item, nextitem):\n"
+        "    raise RuntimeError('inner protocol fault')\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "test_probe.py").write_text("def test_passes():\n    pass\n", encoding="utf-8")
+
+    result = _run_probe(tmp_path, enabled=True)
+
+    assert result.returncode != 0
+    assert "inner protocol fault" in result.stdout + result.stderr
+    assert not marker.exists()
