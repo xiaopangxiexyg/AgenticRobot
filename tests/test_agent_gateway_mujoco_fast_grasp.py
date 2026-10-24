@@ -23,6 +23,10 @@ from dataset_contracts.perception_artifacts import (
     PARALLEL_JAW_FINGER_EXCHANGE_POSE_SOURCE_V1,
 )
 from deployments.perception.point_grasp_failure import PointGraspPlanningError
+from deployments.dmtac_graspgenx_alignment_ids import (
+    DMTAC_M_GRASPGENX_ALIGNMENT_PROFILE_ID,
+    DMTAC_M_GRASPGENX_ALIGNMENT_PROFILE_IDS,
+)
 from deployments.perception.sam2_graspgenx_point_grasp import (
     Sam2GraspGenXPointGraspPlanner,
 )
@@ -33,6 +37,23 @@ from sim.mujoco.deploy.target_measurement import MUJOCO_SIM_HIL_WORLD_FRAME_ID_V
 
 CLIENT = "test:native-fast-grasp"
 TASK = Path("sim/configs/tasks/rm65_right_dmtacm_blue_cube_70mm_agent_v1.json")
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("profile_id", DMTAC_M_GRASPGENX_ALIGNMENT_PROFILE_IDS)
+def test_native_factory_preserves_the_explicit_alignment_choice(tmp_path, profile_id):
+    from deployments.perception.dmtac_grasp_overlay import reviewed_graspgenx_dmtac_solid_geometry
+
+    session = _session(tmp_path, alignment_profile_id=profile_id)
+    try:
+        session.application.start_observation_ready()
+        model = session.fast_grasp_planner
+        assert model.alignment_profile_id == profile_id
+        assert model.solid_geometry == reviewed_graspgenx_dmtac_solid_geometry(
+            maximum_opening_m=model.max_gripper_width_m, alignment_profile_id=profile_id)
+        assert not model.client.calls and not session.application.target.planned_tcp_motion.active
+    finally:
+        assert session.close().accepted
 
 
 @pytest.mark.integration
@@ -458,13 +479,14 @@ class _BlueMask:
 
 
 def _session(tmp_path, *, trace=None, retained_selector=False, terminal_offset_m=0.01,
-             pregrasp_distance_m=0.07):
+             pregrasp_distance_m=0.07, alignment_profile_id=DMTAC_M_GRASPGENX_ALIGNMENT_PROFILE_ID):
     (tmp_path / "artifacts").mkdir()
     client = _PlannerClient(np.empty((0, 4, 4)), np.empty(0))
     model = Sam2GraspGenXPointGraspPlanner(
         model_spec=_model_spec(tmp_path),
         point_segmenter=_BlueMask(),
         client=client,
+        alignment_profile_id=alignment_profile_id,
         enable_finger_exchange=True,
     )
     session = build_mujoco_agent_tcp_pose_gateway_session(
