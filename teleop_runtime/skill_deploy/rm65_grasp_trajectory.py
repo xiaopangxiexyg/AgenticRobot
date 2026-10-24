@@ -3936,6 +3936,20 @@ class RM65GraspJointTrajectoryPlanner:
             })
         return quality
 
+    def _connection_motion_cost(self, path, *, side: str, deadline, monotonic):
+        values = np.stack([waypoint[side] for waypoint in path.waypoints])
+        travel = np.abs(np.diff(values, axis=0)).sum(axis=0)
+        tcp_cost = 0.0
+        for start, end in pairwise(path.waypoints):
+            if deadline is not None:
+                self._remaining_path_planning_time_sec(deadline=deadline, monotonic=monotonic,
+                    planning_phase="pregrasp_connection_cost")
+            tcp_cost += self._tcp_path_edge_cost(start, end, side=side)
+        if deadline is not None:
+            self._remaining_path_planning_time_sec(deadline=deadline, monotonic=monotonic,
+                planning_phase="pregrasp_connection_cost")
+        return float(max(travel[:3])), tcp_cost, float(np.linalg.norm(travel))
+
     def _plan_path_leg(
         self,
         *,
@@ -3979,6 +3993,18 @@ class RM65GraspJointTrajectoryPlanner:
         )
         search_attempts: list[dict[str, object]] = []
         terminal_error: RM65GraspTrajectoryPlanningError | None = None
+        best_connection: _PlannedPathLeg | None = None
+        best_connection_cost: tuple[float, float, float] | None = None
+        best_connection_corridor = None
+
+        def checked_leg(leg):
+            # Neither optional comparison nor FK cost evaluation may return a
+            # successful leg beyond the original request deadline.
+            if deadline is not None:
+                self._remaining_path_planning_time_sec(deadline=deadline,
+                    monotonic=monotonic, planning_phase=planning_phase)
+            return replace(leg, search_attempts=tuple(search_attempts))
+
         if not endpoint_candidates:
             raise RM65GraspTrajectoryPlanningError("ik_search_exhausted")
         target_values = np.stack([endpoint.qpos_by_side[side] for endpoint in endpoint_candidates])
@@ -3994,6 +4020,10 @@ class RM65GraspJointTrajectoryPlanner:
             corridor_upper = upper if full_joint_range else np.minimum(
                 upper, np.maximum(qpos_by_side[side], target_values.max(axis=0)) + padding,
             )
+            if best_connection is not None:
+                # A valid corridor needs a second sample, not the broader
+                # domain reserved for failed-connection recovery.
+                corridor_lower, corridor_upper, full_joint_range, padding = best_connection_corridor
             attempt_config = replace(
                 cfg,
                 seed=cfg.seed + path_attempt,
@@ -4009,6 +4039,18 @@ class RM65GraspJointTrajectoryPlanner:
                     )
                 ),
             )
+            if best_connection is not None:
+                # One optional comparison uses the same corridor and next seed, not
+                # another planner or a renewed request deadline. Cap optional
+                # tree search at 10% of the remaining budget; dense validation
+                # and finalization still use the original global deadline.
+                comparison_budget = 1.0 if deadline is None else min(
+                    1.0, .1 * self._remaining_path_planning_time_sec(
+                        deadline=deadline, monotonic=monotonic,
+                        planning_phase="pregrasp_connection_comparison"))
+                attempt_config = replace(attempt_config,
+                    time_budget_sec=min(comparison_budget, attempt_config.time_budget_sec)
+                    if attempt_config.time_budget_sec is not None else comparison_budget)
             path = plan_collision_aware_joint_path(
                 start_qpos_by_component=qpos_by_side,
                 target_qpos_by_component=target,
@@ -4037,6 +4079,8 @@ class RM65GraspJointTrajectoryPlanner:
                 "reason": path.reason,
             }
             search_attempts.append(attempt_record)
+            if best_connection is not None:
+                attempt_record["connection_comparison_time_budget_sec"] = attempt_config.time_budget_sec
             if path_attempt == 0:
                 attempt_record["endpoint_generation_attempts"] = endpoint_candidates[0].generation_attempts
                 attempt_record["endpoint_candidates"] = tuple({
@@ -4064,7 +4108,13 @@ class RM65GraspJointTrajectoryPlanner:
                         details={"planning_phase": planning_phase,
                                  "path": path.to_dict(), "search_attempts": search_attempts},
                     )
-                if path.reason == "time_budget_exhausted":
+                if path.reason == "time_budget_exhausted" and path.status is JointPathStatus.PATH_SEARCH_EXHAUSTED:
+                    if best_connection is not None:
+                        if deadline is not None:
+                            self._remaining_path_planning_time_sec(deadline=deadline,
+                                monotonic=monotonic, planning_phase=planning_phase)
+                        attempt_record["comparison_budget_exhausted"] = True
+                        break
                     terminal_error = RM65GraspTrajectoryPlanningError(
                         "path_planning_time_budget_exhausted",
                         details={"planning_phase": planning_phase,
@@ -4079,6 +4129,20 @@ class RM65GraspJointTrajectoryPlanner:
                                  "path": path.to_dict(), "search_attempts": search_attempts},
                     )
                     break
+                recoverable = (
+                    path.status is JointPathStatus.TARGET_BLOCKED
+                    and path.reason == "target_configuration_blocked"
+                ) or (
+                    path.status is JointPathStatus.PATH_SEARCH_EXHAUSTED
+                    and path.reason in {"bounded_search_exhausted", "final_path_revalidation_failed"}
+                )
+                if not recoverable:
+                    raise RM65GraspTrajectoryPlanningError("path_planner_error", details={
+                        "planning_phase": planning_phase, "path": path.to_dict(),
+                        "search_attempts": search_attempts,
+                    })
+                if best_connection is not None:
+                    return checked_leg(best_connection)
                 continue
             selected_index = int(path.metadata.get("selected_target_index", 0))
             if not 0 <= selected_index < len(endpoint_candidates):
@@ -4125,6 +4189,15 @@ class RM65GraspJointTrajectoryPlanner:
                     "path_target_safety_envelope_unavailable",
                 }:
                     break
+                if error.reason_code not in {
+                    "path_collision_blocked", "visible_gripper_path_collision",
+                    "path_target_safety_envelope_blocked",
+                }:
+                    # An unknown typed fault is not a rejected optional route
+                    # and must not be remapped to an earlier search miss.
+                    raise
+                if best_connection is not None:
+                    return checked_leg(best_connection)
                 # Keep this goal available, but do not let a rejected direct
                 # connection hide the other local branches in the next round.
                 search_candidates = tuple(e for e in search_candidates if e is not endpoint) + (endpoint,)
@@ -4146,10 +4219,30 @@ class RM65GraspJointTrajectoryPlanner:
                     # corridor while giving other branches the next attempt.
                     search_candidates = tuple(e for e in search_candidates if e is not endpoint) + (endpoint,)
                     continue
-            return _PlannedPathLeg(
+            leg = _PlannedPathLeg(
                 endpoint=endpoint, path=path, dense_revalidation=dense,
                 search_attempts=tuple(search_attempts),
             )
+            terminal_error = None
+            if best_connection is not None:
+                cost = self._connection_motion_cost(path, side=side,
+                    deadline=deadline, monotonic=monotonic)
+                attempt_record["connection_motion_cost"] = cost
+                assert best_connection_cost is not None
+                if cost < best_connection_cost:
+                    best_connection = leg
+                return checked_leg(best_connection)
+            if (planning_phase == "pregrasp_target" and path.metadata.get("direct_path") is False
+                    and path_attempt + 1 < self.config.path_search_attempts_per_endpoint):
+                best_connection = leg
+                best_connection_cost = self._connection_motion_cost(path, side=side,
+                    deadline=deadline, monotonic=monotonic)
+                best_connection_corridor = (corridor_lower, corridor_upper, full_joint_range, padding)
+                attempt_record["connection_motion_cost"] = best_connection_cost
+                continue
+            return checked_leg(leg)
+        if best_connection is not None and terminal_error is None:
+            return checked_leg(best_connection)
         if terminal_error is not None and terminal_error.reason_code in {
             "path_collision_check_unavailable",
             "path_planning_time_budget_exhausted",
@@ -4193,6 +4286,7 @@ class RM65GraspJointTrajectoryPlanner:
                 ),
             },
         )
+
 
     def _plan_constrained_approach_leg(
         self,

@@ -6465,3 +6465,190 @@ def test_native_wrist_bound_keeps_fixed_solver_frame_and_unknown_model_semantics
     clone.ik_solver = SimpleNamespace(current_q=builder.ik_solver.current_q.copy(),
         robot=SimpleNamespace(model=SimpleNamespace()))
     assert clone.tool_tcp_geometric_reach_check(**queries) is None
+
+
+@pytest.mark.parametrize("side", ("left", "right"))
+@pytest.mark.parametrize("outcome", (
+    "better", "worse", "timeout", "global_timeout", "unavailable",
+    "dense_blocked", "dense_fault", "direct", "one_attempt", "no_global_deadline", "short_deadline",
+))
+def test_pregrasp_compares_one_connection_in_the_same_corridor_without_bypassing_faults(
+    monkeypatch, side, outcome,
+):
+    planner = _planner_without_assets(config=RM65GraspTrajectoryPlanningConfig(
+        path_search_attempts_per_endpoint=1 if outcome == "one_attempt" else 4))
+    planner.planner_config = JointPathPlannerConfig()
+    planner.oracle = SimpleNamespace(scene_hash="scene:test")
+    planner.target_builder = _CartesianQposBuilder()
+    current = {s: np.zeros(6) for s in ("left", "right")}
+    goal = {s: q.copy() for s, q in current.items()}
+    goal[side][0] = .2
+    endpoint = grasp_trajectory_module._EndpointIKCandidate(qpos_by_side=goal,
+        seed_index=0, solve_cycles=1, position_residual_m=0., orientation_residual_deg=0.)
+    clock, calls, checked = [0.], [], []
+
+    def search(**kwargs):
+        calls.append(kwargs)
+        second = len(calls) == 2
+        if second and outcome in {"timeout", "global_timeout", "unavailable"}:
+            clock[0] = 10. if outcome == "global_timeout" else clock[0] + .01
+            return JointPathPlanResult(
+                status=JointPathStatus.COLLISION_CHECK_UNAVAILABLE if outcome == "unavailable"
+                    else JointPathStatus.PATH_SEARCH_EXHAUSTED,
+                start_qpos_by_component=current, target_qpos_by_component=goal,
+                movable_components=(side,), reason="time_budget_exhausted")
+        middle = {s: q.copy() for s, q in current.items()}
+        middle[side][0] = (.9 if outcome == "worse" else .1) if second else .8
+        clock[0] += .1
+        return JointPathPlanResult(status=JointPathStatus.PATH_FOUND,
+            start_qpos_by_component=current, target_qpos_by_component=goal,
+            movable_components=(side,), waypoints=(current, middle, goal),
+            metadata={"direct_path": outcome == "direct", "selected_target_index": 0})
+
+    def dense(waypoints, **kwargs):
+        checked.append(waypoints)
+        assert kwargs["moving_side"] == side
+        if len(checked) == 2 and outcome in {"dense_blocked", "dense_fault"}:
+            raise RM65GraspTrajectoryPlanningError("path_collision_check_unavailable"
+                if outcome == "dense_fault" else "path_collision_blocked")
+        return {"checked": True}
+
+    monkeypatch.setattr(grasp_trajectory_module, "plan_collision_aware_joint_path", search)
+    planner._revalidate = dense
+    kwargs = dict(qpos_by_side=current, side=side, target_tool_tcp_world=np.eye(4),
+        planning_phase="pregrasp_target", endpoint_candidates=(endpoint,),
+        deadline=None if outcome == "no_global_deadline" else (5. if outcome == "short_deadline" else 10.),
+        monotonic=lambda: clock[0])
+    if outcome in {"global_timeout", "unavailable", "dense_fault"}:
+        reason = "path_planning_time_budget_exhausted" if outcome == "global_timeout" else "path_collision_check_unavailable"
+        with pytest.raises(RM65GraspTrajectoryPlanningError, match=reason):
+            planner._plan_path_leg(**kwargs)
+    else:
+        result = planner._plan_path_leg(**kwargs)
+        assert result.endpoint is endpoint
+        expected_middle = .1 if outcome in {"better", "no_global_deadline", "short_deadline"} else .8
+        assert result.path.waypoints[1][side][0] == expected_middle
+        if outcome == "timeout":
+            assert result.search_attempts[-1]["comparison_budget_exhausted"]
+    assert len(calls) == (1 if outcome in {"direct", "one_attempt"} else 2)
+    if len(calls) == 2:
+        np.testing.assert_array_equal(calls[0]["joint_lower_by_component"][side], calls[1]["joint_lower_by_component"][side])
+        np.testing.assert_array_equal(calls[0]["joint_upper_by_component"][side], calls[1]["joint_upper_by_component"][side])
+        assert calls[1]["config"].seed == calls[0]["config"].seed + 1
+        assert calls[1]["config"].time_budget_sec <= 1.
+        if outcome == "short_deadline":
+            assert calls[1]["config"].time_budget_sec == pytest.approx(.1 * (5. - .1))
+    assert len(checked) == (1 if outcome in {"direct", "one_attempt", "timeout", "global_timeout", "unavailable"} else 2)
+
+
+
+@pytest.mark.parametrize("failure", ("unknown_search", "unknown_dense", "exhausted_after_deadline",
+    "blocked_after_deadline", "cost_after_deadline", None))
+def test_pregrasp_comparison_after_a_failed_corridor_keeps_faults_and_parent_deadline(monkeypatch, failure):
+    planner = _planner_without_assets(config=RM65GraspTrajectoryPlanningConfig(path_search_attempts_per_endpoint=4))
+    planner.planner_config = JointPathPlannerConfig()
+    planner.oracle = SimpleNamespace(scene_hash="scene:test")
+    planner.target_builder = _CartesianQposBuilder()
+    current = {side: np.zeros(6) for side in ("left", "right")}
+    goal = {side: q.copy() for side, q in current.items()}
+    goal["right"][0] = .2
+    endpoint = grasp_trajectory_module._EndpointIKCandidate(qpos_by_side=goal,
+        seed_index=0, solve_cycles=1, position_residual_m=0., orientation_residual_deg=0.)
+    clock, calls, checked = [0.], [], []
+
+    def search(**kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1 or (len(calls) == 3 and failure in {"unknown_search", "exhausted_after_deadline"}):
+            if failure == "exhausted_after_deadline" and len(calls) == 3:
+                clock[0] = 10.
+            return JointPathPlanResult(status=JointPathStatus.PATH_SEARCH_EXHAUSTED,
+                start_qpos_by_component=current, target_qpos_by_component=goal,
+                movable_components=("right",), reason="unexpected_native_fault"
+                    if len(calls) == 3 and failure == "unknown_search" else "bounded_search_exhausted")
+        middle = {side: q.copy() for side, q in current.items()}
+        middle["right"][0] = .8 if len(calls) == 2 else .1
+        return JointPathPlanResult(status=JointPathStatus.PATH_FOUND,
+            start_qpos_by_component=current, target_qpos_by_component=goal,
+            movable_components=("right",), waypoints=(current, middle, goal),
+            metadata={"direct_path": False})
+
+    def dense(waypoints, **_):
+        checked.append(waypoints)
+        if len(checked) == 2:
+            if failure == "unknown_dense":
+                raise RM65GraspTrajectoryPlanningError("unexpected_dense_fault", details={"origin": "native"})
+            if failure == "blocked_after_deadline":
+                clock[0] = 10.
+                raise RM65GraspTrajectoryPlanningError("path_collision_blocked")
+        return {"sample_count": 3}
+
+    native_cost = planner._tcp_path_edge_cost
+    cost_calls = 0
+
+    def cost(*args, **kwargs):
+        nonlocal cost_calls
+        cost_calls += 1
+        result = native_cost(*args, **kwargs)
+        if cost_calls == 4 and failure == "cost_after_deadline":
+            clock[0] = 10.
+        return result
+
+    monkeypatch.setattr(grasp_trajectory_module, "plan_collision_aware_joint_path", search)
+    planner._revalidate = dense
+    planner._tcp_path_edge_cost = cost
+    args = dict(qpos_by_side=current, side="right", target_tool_tcp_world=np.eye(4),
+        planning_phase="pregrasp_target", endpoint_candidates=(endpoint,), deadline=10.,
+        monotonic=lambda: clock[0])
+    if failure is None:
+        leg = planner._plan_path_leg(**args)
+        assert leg.path.waypoints[1]["right"][0] == .1
+    else:
+        reason = {"unknown_search": "path_planner_error", "unknown_dense": "unexpected_dense_fault"}.get(
+            failure, "path_planning_time_budget_exhausted")
+        with pytest.raises(RM65GraspTrajectoryPlanningError, match=reason) as error:
+            planner._plan_path_leg(**args)
+        if failure == "unknown_dense":
+            assert error.value.details["origin"] == "native"
+    assert len(calls) == 3
+    assert not np.array_equal(calls[0]["joint_lower_by_component"]["right"], calls[1]["joint_lower_by_component"]["right"])
+    for boundary in ("joint_lower_by_component", "joint_upper_by_component"):
+        np.testing.assert_array_equal(calls[1][boundary]["right"], calls[2][boundary]["right"])
+
+
+
+@pytest.mark.parametrize("tie_break", ("tcp", "all_joints"))
+def test_pregrasp_connection_cost_breaks_equal_proximal_travel_by_existing_tcp_and_joint_cost(monkeypatch, tie_break):
+    planner = _planner_without_assets(config=RM65GraspTrajectoryPlanningConfig())
+    planner.planner_config = JointPathPlannerConfig()
+    planner.oracle = SimpleNamespace(scene_hash="scene:test")
+    planner.target_builder = _CartesianQposBuilder()
+    current = {side: np.zeros(6) for side in ("left", "right")}
+    goal = {side: q.copy() for side, q in current.items()}
+    goal["right"][0] = .2
+    endpoint = grasp_trajectory_module._EndpointIKCandidate(qpos_by_side=goal,
+        seed_index=0, solve_cycles=1, position_residual_m=0., orientation_residual_deg=0.)
+    calls = []
+
+    def search(**_):
+        middle = {side: q.copy() for side, q in current.items()}
+        middle["right"][0] = .8
+        middle["right"][1 if tie_break == "tcp" else 3] = .1 if calls else .6
+        path = JointPathPlanResult(status=JointPathStatus.PATH_FOUND,
+            start_qpos_by_component=current, target_qpos_by_component=goal,
+            movable_components=("right",), waypoints=(current, middle, goal),
+            metadata={"direct_path": False})
+        calls.append(path)
+        return path
+
+    monkeypatch.setattr(grasp_trajectory_module, "plan_collision_aware_joint_path", search)
+    planner._revalidate = lambda *_a, **_kw: {"sample_count": 3}
+    leg = planner._plan_path_leg(qpos_by_side=current, side="right", target_tool_tcp_world=np.eye(4),
+        planning_phase="pregrasp_target", endpoint_candidates=(endpoint,), deadline=10., monotonic=lambda: 0.)
+    assert leg.path is calls[1]
+    costs = [row["connection_motion_cost"] for row in leg.search_attempts]
+    assert costs[0][0] == costs[1][0]
+    if tie_break == "tcp":
+        assert costs[1][1] < costs[0][1]
+    else:
+        assert costs[1][1] == pytest.approx(costs[0][1])
+        assert costs[1][2] < costs[0][2]
