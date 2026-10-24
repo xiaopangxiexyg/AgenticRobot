@@ -206,6 +206,8 @@ def summarize_workspace_identification(records, *, condition, workspace,
     completed = {leg["trial_id"] for stage in workspace.get("acquisitions", [])
                  for leg in stage["result"].get("completed_legs", [])}
     rejected, windows, observations = Counter(), [], []
+    execution = {}
+    unavailable_execution_samples = 0
     buffer = []
     commands = deque(maxlen=16)
     previous_source_sequence = previous_receipt_sequence = None
@@ -368,6 +370,32 @@ def summarize_workspace_identification(records, *, condition, workspace,
             flush(force=True)
             commands.clear()
         previous_receive_time = stamp
+        holding = (row.get("torque_console") or {}).get("coordinated_holding") or {}
+        if all(name in holding for name in ("combined_command_nm", "combined_cap_shortfall_nm", "saturated")):
+            j = int(key[1][-1])-1
+            delta = six(holding["combined_command_nm"], "coordinated command diagnostic")
+            shortfall = six(holding["combined_cap_shortfall_nm"], "coordinated cap diagnostic")
+            cruise = holding.get("cruise_velocity_control") or {}
+            item = execution.setdefault(key, {"pose_index": key[0], "joint_name": key[1],
+                "trial_id": key[2], "role": key[3], "dispatch_samples": 0,
+                "cruise_telemetry_samples": 0,
+                "cruise_active_samples": 0, "combined_cap_samples": 0,
+                "integral_growth_blocked_samples": 0, "cruise_reasons": Counter(),
+                "sum_abs_selected_command_nm": 0.0, "sum_abs_support_command_nm": 0.0,
+                "sum_abs_selected_cap_shortfall_nm": 0.0})
+            item["dispatch_samples"] += 1
+            item["cruise_telemetry_samples"] += type(cruise.get("active")) is bool
+            item["cruise_active_samples"] += cruise.get("active") is True
+            item["combined_cap_samples"] += holding.get("saturated") is True
+            item["integral_growth_blocked_samples"] += cruise.get("integral_growth_blocked") is True
+            item["cruise_reasons"][cruise.get("reason", "not_recorded")] += 1
+            item["sum_abs_selected_command_nm"] += abs(delta[j])
+            item["sum_abs_support_command_nm"] += abs(delta[3-j])
+            item["sum_abs_selected_cap_shortfall_nm"] += abs(shortfall[j])
+        else:
+            # Historical traces may predate command-allocation telemetry.
+            # Its absence is not evidence of either zero clipping or bad data.
+            unavailable_execution_samples += 1
         prior = next((r for r in reversed(commands)
             if r["dispatch_receipt"]["completed_at_sec"] < stamp
             and stamp-r["dispatch_receipt"]["completed_at_sec"] <= .04), None)
@@ -425,6 +453,14 @@ def summarize_workspace_identification(records, *, condition, workspace,
     gravity = fit_paired_gravity_command(
         [o for _, role, o in observations if role == "training"],
         [o for _, role, o in observations if role == "validation"])
+    local_groups = defaultdict(list)
+    for pose, role, observation in observations:
+        local_groups[(pose, observation.active_driver_kd_nm_s_per_rad)].append((role, observation))
+    local_even = [{"pose_index": pose, "active_driver_kd_nm_s_per_rad": kd,
+        "analysis": fit_paired_gravity_command(
+            [o for role, o in group if role == "training"],
+            [o for role, o in group if role == "validation"], model="local-joint-bias")}
+        for (pose, kd), group in sorted(local_groups.items())]
     candidates = sum(f["fit"]["status"] == "OFFLINE_CANDIDATE" for f in fits)
     cruise_count = (sum(w.get("kinematic_phase_diagnostic") == "cruise_candidate"
                        for w in windows if w["model_eligible"])
@@ -449,6 +485,17 @@ def summarize_workspace_identification(records, *, condition, workspace,
             "kinematic_linearity_is_not_proof_of_zero_inertia_or_physical_friction"
             if reduction_method == "closed_loop_average" else "median_quasisteady_command"),
         "gravity_fit": gravity, "running_resistance": resistance,
+        "local_even_command_fit": {"scope": "separate_local_full_pose_and_fixed_damping_regions",
+            "gravity_scales_frozen": True, "auto_apply": False, "profile_export_allowed": False,
+            "fits": local_even},
+        "cruise_execution_diagnostic": {"quantity": "software_commands_not_measured_force",
+            "scope": "admitted_complete_training_validation_dispatches_not_just_fit_windows",
+            "unavailable_samples": unavailable_execution_samples,
+            "trials": [{**{k: v for k, v in item.items() if not k.startswith("sum_")},
+                "mean_abs_selected_command_nm": item["sum_abs_selected_command_nm"]/item["dispatch_samples"],
+                "mean_abs_support_command_nm": item["sum_abs_support_command_nm"]/item["dispatch_samples"],
+                "mean_abs_selected_cap_shortfall_nm": item["sum_abs_selected_cap_shortfall_nm"]/item["dispatch_samples"]}
+                for item in execution.values()]},
         "kinematic_phase_counts": dict(Counter(w.get("kinematic_phase_diagnostic", "quasisteady")
             for w in windows if w["model_eligible"])),
         "motor_damping_semantics": "fixed active Kd is a fit condition; never subtract an unmeasured physical damping torque",

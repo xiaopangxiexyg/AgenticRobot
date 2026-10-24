@@ -238,15 +238,22 @@ def fit_paired_resistance_command(training, validation, *, max_validation_rmse_n
     return result
 
 
-def fit_paired_gravity_command(training, validation, *, max_validation_rmse_nm=.05):
-    """Fit a scale plus J2/J3 biases, reserving whole trials for validation."""
+def fit_paired_gravity_command(training, validation, *, max_validation_rmse_nm=.05,
+                               model="global-scale-joint-bias"):
+    """Fit paired even commands with whole-trial validation.
+
+    A local bias keeps every gravity scale fixed and never exports a profile.
+    It tests local repeatability, not unique gravity or a global correction.
+    """
+    if model not in {"global-scale-joint-bias", "local-joint-bias"}:
+        raise ValueError("unknown paired even-command model")
     finite(max_validation_rmse_nm, "validation error limit")
     if max_validation_rmse_nm <= 0:
         raise ValueError("validation error limit must be positive")
     result = {"status": "INSUFFICIENT_DATA", "auto_apply": False,
         "hardware_approved": False, "identifies_unique_physical_gravity": False,
         "quantity": "paired_even_software_command_residual",
-        "model": "global-scale-joint-bias", "reasons": [],
+        "model": model, "reasons": [],
         "assumptions": ["odd resistance approximately cancels at matched speed and full pose",
                         "asymmetric friction and elastic preload remain in the effective correction"],
         "training_pairs": [], "validation_pairs": []}
@@ -280,11 +287,15 @@ def fit_paired_gravity_command(training, validation, *, max_validation_rmse_nm=.
         for direction in (-1, 1):
             if len({o.trial_id for o in training if o.joint_name == joint and o.velocity_rad_s*direction > 0}) < 2:
                 return reject("requires_independent_training_repeats_per_direction_and_joint")
-    if len(train_pairs) < 2*(1+len(joints)):
+    if len(train_pairs) < 2*(len(joints)+(model == "global-scale-joint-bias")):
         return reject("too_few_independent_paired_windows")
+    q = np.asarray([p["qpos_rad"] for p in train_pairs])
+    if model == "local-joint-bias" and np.max(np.ptp(q, axis=0)) > .10:
+        return reject("local_bias_region_too_wide_split_full_poses")
 
     def design(pairs):
-        return np.asarray([[p["gravity_command_nm"]/first.condition.gravity_scale,
+        return np.asarray([[*([p["gravity_command_nm"]/first.condition.gravity_scale]
+                               if model == "global-scale-joint-bias" else []),
             *[float(p["joint_name"] == joint) for joint in joints]] for p in pairs])
 
     x = design(train_pairs)
@@ -293,13 +304,25 @@ def fit_paired_gravity_command(training, validation, *, max_validation_rmse_nm=.
     identities = [(p["joint_name"], p["positive_trial_id"], p["negative_trial_id"]) for p in train_pairs]
     counts = Counter(identities)
     weights = np.asarray([1/math.sqrt(counts[key]) for key in identities])
-    solution, rank, singular = solve_gravity_design(x*weights[:, None], y*weights, model="global-scale-joint-bias",
-        nominal_scale=first.condition.gravity_scale, bias_count=len(joints))
+    if model == "global-scale-joint-bias":
+        solution, rank, singular = solve_gravity_design(x*weights[:, None], y*weights, model=model,
+            nominal_scale=first.condition.gravity_scale, bias_count=len(joints))
+        # Residualize the scale column against joint intercepts. A large raw
+        # gravity baseline is not independent information about its scale.
+        scale_column = x[:, 0]*weights
+        nuisance = x[:, 1:]*weights[:, None]
+        remaining = scale_column-nuisance@np.linalg.lstsq(nuisance, scale_column, rcond=None)[0]
+        result["scale_information"] = {
+            "fraction_after_joint_intercepts": float(np.linalg.norm(remaining)/max(np.linalg.norm(scale_column), 1e-12)),
+            "gravity_span_by_joint_nm": {joint: float(np.ptp([p["gravity_command_nm"]
+                for p in train_pairs if p["joint_name"] == joint])) for joint in joints},
+            "semantics": "diagnostic_only; no_new_admission_threshold"}
+    else:
+        solution, _, rank, singular = np.linalg.lstsq(x*weights[:, None], y*weights, rcond=None)
     conditioning = float(singular[0]/singular[-1]) if singular[-1] > 0 else math.inf
-    result.update(design_rank=rank, design_condition_number=conditioning if math.isfinite(conditioning) else None)
+    result.update(design_rank=int(rank), design_condition_number=conditioning if math.isfinite(conditioning) else None)
     if rank < x.shape[1] or conditioning > 1e4:
         return reject("gravity_features_not_identifiable_expand_pose_information")
-    q = np.asarray([p["qpos_rad"] for p in train_pairs])
     # Validation must not silently extrapolate outside the training region.
     covered = [not (np.any(np.asarray(p["qpos_rad"]) < q.min(axis=0)-.0045)
                    or np.any(np.asarray(p["qpos_rad"]) > q.max(axis=0)+.0045)) for p in valid_pairs]
@@ -314,24 +337,32 @@ def fit_paired_gravity_command(training, validation, *, max_validation_rmse_nm=.
     rmse = math.sqrt(sum(v*v for v in per_joint.values())/len(per_joint))
     zero_per_joint = {joint: math.sqrt(float(np.mean([np.mean(values) for key, values in zero_trial_errors.items()
         if key[0] == joint]))) for joint in joints}
-    factor = 1+float(solution[0])/first.condition.gravity_scale
-    scales = list(first.condition.gravity_joint_scales)
-    biases = list(first.condition.gravity_joint_bias_nm)
-    correction = {}
-    for joint, intercept in zip(joints, solution[1:]):
-        j = joint_index(joint)
-        # The recorded baseline already contains its configured bias. Scale
-        # that bias too when translating the regression to profile parameters.
-        correction[joint] = float((factor-1)*biases[j]+intercept)
-        scales[j] *= factor
-        biases[j] += correction[joint]
-    result.update(scale_correction=float(solution[0]),
-        joint_intercept_nm={joint: float(v) for joint, v in zip(joints, solution[1:])},
-        joint_bias_correction_nm=correction,
-        parameterization="delta = scale_correction * recorded_gravity_command / old_gravity_scale + joint_intercept",
-        application_scope=joints,
-        candidate_profile_fields={"gravity_scale": first.condition.gravity_scale,
-            "gravity_joint_scales": scales, "gravity_joint_bias_nm": biases},
+    if model == "global-scale-joint-bias":
+        factor = 1+float(solution[0])/first.condition.gravity_scale
+        scales = list(first.condition.gravity_joint_scales)
+        biases = list(first.condition.gravity_joint_bias_nm)
+        correction = {}
+        for joint, intercept in zip(joints, solution[1:]):
+            j = joint_index(joint)
+            # The recorded baseline already contains its configured bias. Scale
+            # that bias too when translating to profile parameters.
+            correction[joint] = float((factor-1)*biases[j]+intercept)
+            scales[j] *= factor
+            biases[j] += correction[joint]
+        result.update(scale_correction=float(solution[0]),
+            joint_intercept_nm={joint: float(v) for joint, v in zip(joints, solution[1:])},
+            joint_bias_correction_nm=correction,
+            parameterization="delta = scale_correction * recorded_gravity_command / old_gravity_scale + joint_intercept",
+            application_scope=joints,
+            candidate_profile_fields={"gravity_scale": first.condition.gravity_scale,
+                "gravity_joint_scales": scales, "gravity_joint_bias_nm": biases})
+    else:
+        result.update(scale_correction=0.0, gravity_scales_frozen=True,
+            local_command_bias_nm={joint: float(v) for joint, v in zip(joints, solution)},
+            parameterization="delta = local_joint_intercept; all_existing_gravity_scales_fixed",
+            application_scope="recorded_local_full_pose_and_fixed_damping_region_only",
+            profile_export_allowed=False)
+    result.update(
         validation_rmse_nm=rmse, validation_rmse_by_joint_nm=per_joint,
         zero_correction_validation_rmse_nm=math.sqrt(sum(v*v for v in zero_per_joint.values())/len(zero_per_joint)),
         zero_correction_validation_rmse_by_joint_nm=zero_per_joint,

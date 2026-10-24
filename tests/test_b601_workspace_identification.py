@@ -154,6 +154,42 @@ def test_paired_gravity_fit_reuses_scale_bias_solver_but_does_not_claim_physical
         assert pair["maximum_pose_mismatch_rad"] == 0
 
 
+def test_local_even_bias_freezes_scale_and_never_exports_a_gravity_profile():
+    train, valid = paired_observations()
+
+    def local(o):
+        j = int(o.joint_name[-1])-1
+        return replace(o, qpos_rad=(0, .06, .06, 0, 0, 0),
+            command_residual_nm=(-.2 if j == 1 else .1)+math.copysign(.3, o.velocity_rad_s))
+
+    train, valid = [local(o) for o in train], [local(o) for o in valid]
+    result = fit_paired_gravity_command(train, valid, model="local-joint-bias")
+    assert result["status"] == "OFFLINE_CANDIDATE", result["reasons"]
+    assert result["scale_correction"] == 0 and result["gravity_scales_frozen"]
+    assert result["local_command_bias_nm"] == pytest.approx({"joint2": -.2, "joint3": .1})
+    assert result["validation_rmse_nm"] < 1e-12
+    assert result["design_rank"] == 2
+    assert "candidate_profile_fields" not in result and not result["profile_export_allowed"]
+    assert not result["auto_apply"] and not result["identifies_unique_physical_gravity"]
+    json.dumps(result, allow_nan=False)
+    bad = [replace(o, command_residual_nm=o.command_residual_nm+.2) for o in valid]
+    assert fit_paired_gravity_command(train, bad, model="local-joint-bias")["status"] == "VALIDATION_FAILED"
+    outside = [replace(o, qpos_rad=(0, .15, .15, 0, 0, 0)) for o in valid]
+    assert fit_paired_gravity_command(train, outside, model="local-joint-bias")["reasons"] == ["validation_outside_training_pose_coverage"]
+    assert fit_paired_gravity_command(train, [train[0], *valid], model="local-joint-bias")["reasons"] == ["whole_trial_validation_leakage"]
+
+
+def test_scale_information_detects_large_baseline_without_independent_scale_excitation():
+    train, valid = paired_observations()
+    flat = [replace(o, gravity_command_nm=tuple(6.0 if j == 2 else 1.0 for j in range(6))) for o in train]
+    result = fit_paired_gravity_command(flat, valid)
+    assert result["status"] == "INSUFFICIENT_DATA"
+    assert result["scale_information"]["fraction_after_joint_intercepts"] < 1e-12
+    assert result["reasons"] == ["gravity_features_not_identifiable_expand_pose_information"]
+    with pytest.raises(ValueError, match="unknown paired"):
+        fit_paired_gravity_command(train, valid, model="automatic_fallback")
+
+
 def test_one_sided_mismatched_pose_and_leaked_trials_cannot_be_gravity_labels():
     train, valid = paired_observations()
     assert pair_motion_observations([o for o in train if o.velocity_rad_s > 0]) == []
@@ -273,8 +309,42 @@ def test_streaming_previous_dispatch_windows_feed_both_existing_fits_and_survive
     assert result["gravity_fit"]["status"] == "OFFLINE_CANDIDATE", result["gravity_fit"]["reasons"]
     assert result["gravity_fit"]["scale_correction"] == pytest.approx(.03, abs=.002)
     assert result["later_stop_invalidates_completed_windows"] is False
+    assert result["cruise_execution_diagnostic"]["trials"] == []
+    assert result["cruise_execution_diagnostic"]["unavailable_samples"] > 0
     assert result["running_resistance"]["retained_partial_leg_windows"] > 0
     assert all(w["input_receipt_sequence_end"] > w["input_receipt_sequence_start"] for w in result["windows"])
+
+
+def test_local_even_reports_are_per_pose_and_damping_and_cruise_diagnostics_are_compact():
+    rows, context = motion_records()
+    count = 0
+    for row in rows:
+        if row.get("kind") != "active_dispatch":
+            continue
+        count += 1
+        row["torque_console"]["coordinated_holding"] = {
+            "combined_command_nm": [0, -.25, -.5, 0, 0, 0],
+            "combined_cap_shortfall_nm": [0, .01, .02, 0, 0, 0], "saturated": True,
+            "cruise_velocity_control": {"active": True, "integral_growth_blocked": False,
+                "reason": "resolved_cruise_velocity_feedback"}}
+    report = summarize_workspace_identification(rows, condition=asdict(context), workspace={"acquisitions": []},
+        reduction_method="closed_loop_average", position_bin_width_rad=.0045)
+    local = report["local_even_command_fit"]
+    assert local["gravity_scales_frozen"] and not local["profile_export_allowed"]
+    assert len(local["fits"]) == 1
+    assert local["fits"][0]["pose_index"] == 0
+    assert local["fits"][0]["analysis"]["model"] == "local-joint-bias"
+    trials = report["cruise_execution_diagnostic"]["trials"]
+    assert report["cruise_execution_diagnostic"]["unavailable_samples"] == 0
+    assert len(trials) == 24
+    assert sum(t["dispatch_samples"] for t in trials) == count
+    for trial in trials:
+        assert trial["cruise_active_samples"] == trial["combined_cap_samples"] == trial["dispatch_samples"]
+        assert trial["integral_growth_blocked_samples"] == 0
+        assert trial["cruise_telemetry_samples"] == trial["dispatch_samples"]
+        assert trial["mean_abs_support_command_nm"] == pytest.approx(.5 if trial["joint_name"] == "joint2" else .25)
+        assert trial["mean_abs_selected_cap_shortfall_nm"] == pytest.approx(.01 if trial["joint_name"] == "joint2" else .02)
+        assert "sum_abs_selected_command_nm" not in trial
 
 
 def test_position_cells_reduce_complete_measured_traversals_with_original_receipt_admission():

@@ -187,6 +187,7 @@ def build_automatic_report(run_dir: Path) -> dict:
                 reduction_method="closed_loop_average" if width is not None else "quasisteady",
                 position_bin_width_rad=width)
             report["command_identification"] = identification
+            report["local_even_command_identification"] = identification["local_even_command_fit"]
             if "paired_resistance_fit" in identification:
                 report["paired_resistance_identification"] = identification["paired_resistance_fit"]
             report["workspace_motion"] = {"status": "CONTINUOUS_IDENTIFICATION_WINDOWS",

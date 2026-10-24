@@ -26,13 +26,14 @@ pytestmark = [pytest.mark.unit, pytest.mark.contract]
 PROFILES = Path(__file__).resolve().parents[1]/"docs/hardware/profiles"
 BASE = PROFILES/"b601_j2_j3_continuous_identification_v1.json"
 CANDIDATE = PROFILES/"b601_j2_j3_cruise_identification_v1.json"
+FOUR_CENTRES = PROFILES/"b601_j2_j3_four_centres_cruise_identification_v1.json"
 RESOLUTION = .0003834962844848633
 
 
-def controller_from_profile(tmp_path, *, candidate=True):
+def controller_from_profile(tmp_path, *, candidate=True, profile=None):
     args = owner._parser().parse_args([
         "--allow-motion", "--rate-hz", "100", "--preflight-only",
-        "--torque-console-auto-calibration-profile", str(CANDIDATE if candidate else BASE),
+        "--torque-console-auto-calibration-profile", str(profile or (CANDIDATE if candidate else BASE)),
         "--torque-console-confirmation", "B601_RS_TORQUE_CONSOLE", "--torque-console-joint", "joint3",
         "--torque-console-max-assist-nm", "1", "--torque-console-max-joint-velocity-rad-s", ".195",
         "--torque-console-max-excursion-rad", ".15", "--torque-console-staged-target-offset-limit-rad", ".09",
@@ -59,6 +60,14 @@ def test_profile_changes_only_explicit_velocity_feedback_and_keeps_existing_enve
     assert core.motion.max_control_gap_sec == .04
     assert core.settings.limits.max_joint_velocity_rad_s == .195
     assert controller_from_profile(tmp_path, candidate=False)._workspace._coordinated.pose.cruise_estimators == ()
+
+
+def test_four_centre_profile_changes_only_centres_inside_existing_near_zero_range():
+    old, new = load_automatic_profile(CANDIDATE), load_automatic_profile(FOUR_CENTRES)
+    for name in ("joint2_centres_deg", "joint3_centres_deg"):
+        assert new["workspace"][name] == [3, 6]
+        new["workspace"][name] = old["workspace"][name]
+    assert new == old
 
 
 @pytest.mark.parametrize("changes", [
@@ -230,19 +239,20 @@ def test_invalid_position_bin_option_rejected_before_start(width):
             identification_position_bin_width_rad=width)
 
 
-@pytest.mark.parametrize("period", [.01, .025])
-def test_complete_identification_wires_cruise_only_to_training_validation_axis(tmp_path, period):
+@pytest.mark.parametrize("period,profile", [(.01, CANDIDATE), (.025, CANDIDATE), (.01, FOUR_CENTRES)])
+def test_complete_identification_wires_cruise_only_to_training_validation_axis(tmp_path, period, profile):
     from test_b601_automatic_calibration import AcquisitionReplay
     from test_b601_workspace_calibration import LIMITS
 
-    controller = controller_from_profile(tmp_path)
+    controller = controller_from_profile(tmp_path, profile=profile)
     r = AcquisitionReplay(controller._workspace.settings, controller=controller, position_limits=LIMITS)
     controller.submit("select_mode", now_sec=r.now, operation_mode="workspace")
     for _ in range(20):
         r.tick()
     controller.submit("arm", now_sec=r.now, operation_mode="workspace", return_and_disable=True)
     active_roles = set()
-    for _ in range(math.ceil(450/period)):
+    centres = len(controller._workspace.workspace.pose_centres())
+    for _ in range(math.ceil(450*centres/period)):
         # Prescribed encoder motion exercises the real GUI-mode owner/receipt
         # adapter. Plant response is assessed separately below.
         q = list(r.q)
@@ -258,11 +268,11 @@ def test_complete_identification_wires_cruise_only_to_training_validation_axis(t
             assert marker["role"] in {"training", "validation"}
             assert cruise["joint_name"] == r.audit["joint_name"]
             active_roles.add(marker["role"])
-        if controller.result_record()["state"] in {"complete", "failed", "cancelled"}:
+        if (r.audit.get("automatic_calibration") or {}).get("state") in {"complete", "failed", "cancelled"}:
             break
     result = controller.result_record()
     assert result["state"] == "complete", result["reason"]
-    assert len(result["motion"]["completed_legs"]) == 28
+    assert len(result["motion"]["completed_legs"]) == 28*centres
     assert active_roles == {"training", "validation"}
     assert controller.cycle_disable_confirmation_ready
 
