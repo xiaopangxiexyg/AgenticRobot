@@ -7,6 +7,7 @@ import os
 import subprocess
 import sys
 from dataclasses import asdict, replace
+from pathlib import Path
 
 import mujoco
 import numpy as np
@@ -240,6 +241,119 @@ print(json.dumps(_continuation_witness(data)))
     actual = json.loads(result.stdout)
     assert actual.keys() == expected.keys()
     assert not [name for name in expected if actual[name] != expected[name]]
+
+
+def test_scene_rebind_preserves_pipeline_and_uses_no_source_caches(native, monkeypatch):
+    from sim.contracts import SceneSpec
+    from sim.mujoco.mjcf import MJCFConversion
+    from sim.mujoco.scene import MujocoScene, SceneLoadResult
+
+    metadata = SceneLoadResult(
+        conversion=MJCFConversion(
+            urdf_path=Path("scene.urdf"),
+            mjcf_path=Path("scene.xml"),
+            camera_mounts=(),
+            joint_names=("left", "right"),
+            body_names=(),
+        ),
+        cameras=(),
+        arms={},
+        grippers={},
+        scene_spec=SceneSpec(visual_rgba_by_link={"world": (0.1, 0.2, 0.3, 1.0)}),
+    )
+    state = capture_native_state(native, max_native_bytes=_BUDGET)
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("A scene rebind must not re-evaluate captured physics.")
+
+    with monkeypatch.context() as patch:
+        for name in ("mj_forward", "mj_resetData", "mj_step"):
+            patch.setattr(mujoco, name, forbidden)
+        scene = MujocoScene.from_native_checkpoint(
+            state,
+            load_result=metadata,
+            max_native_bytes=_BUDGET,
+        )
+    assert scene.data is not native and scene.model is scene.data.model
+    assert scene.data.__getstate__() == native.__getstate__() == state.data
+    assert (
+        capture_native_state(scene.data, max_native_bytes=_BUDGET).auxiliary
+        == state.auxiliary
+    )
+    assert scene.joint_id("left") == mujoco.mj_name2id(
+        native.model, mujoco.mjtObj.mjOBJ_JOINT, "left"
+    )
+    assert scene._collision_projector is None
+    assert scene._collision_projectors_by_gripper_self_contact == {}
+    assert scene.arm_specs is not metadata.arms
+    assert scene.gripper_specs is not metadata.grippers
+    assert scene.scene_spec.to_dict() == metadata.scene_spec.to_dict()
+    assert scene.scene_spec is not metadata.scene_spec
+    assert (
+        scene.scene_spec.visual_rgba_by_link
+        is not metadata.scene_spec.visual_rgba_by_link
+    )
+    assert not np.shares_memory(scene.data.qpos, native.qpos)
+
+
+def test_scene_restore_rejects_untyped_metadata_before_native_parse(native):
+    from sim.mujoco.scene import MujocoScene
+
+    state = capture_native_state(native, max_native_bytes=_BUDGET)
+    with pytest.raises(ValueError, match="metadata type"):
+        MujocoScene.from_native_checkpoint(
+            state, load_result={}, max_native_bytes=_BUDGET
+        )
+    assert native.__getstate__() == state.data
+
+
+def test_actual_dual_arm_cad_scene_rebind_keeps_native_state_and_all_camera_bindings(
+    monkeypatch,
+):
+    from sim.contracts import SimulationContract
+    from sim.mujoco.scene import MujocoScene
+
+    source = MujocoScene.from_contract(
+        SimulationContract.load("sim/configs/rm65_bimanual_physics_v1.json")
+    )
+    budget = 128 * 1024 * 1024
+    state = capture_native_state(source.data, max_native_bytes=budget)
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("Native CAD scene restore must preserve its pipeline.")
+
+    with monkeypatch.context() as patch:
+        for name in ("mj_forward", "mj_resetData", "mj_step"):
+            patch.setattr(mujoco, name, forbidden)
+        restored = MujocoScene.from_native_checkpoint(
+            state,
+            load_result=source.load_result,
+            max_native_bytes=budget,
+        )
+    assert restored.data.__getstate__() == state.data == source.data.__getstate__()
+    assert (
+        capture_native_state(restored.data, max_native_bytes=budget).auxiliary
+        == state.auxiliary
+    )
+    assert set(restored.arm_specs) == {"left", "right"}
+    assert set(restored.gripper_specs) == set(source.gripper_specs)
+    assert set(restored.camera_names) == {"front", "left_wrist", "right_wrist"}
+    for side in ("left", "right"):
+        np.testing.assert_array_equal(
+            restored.get_arm_qpos(side), source.get_arm_qpos(side)
+        )
+    for name in source.camera_names:
+        assert restored.camera_id(name) == source.camera_id(name)
+        np.testing.assert_array_equal(
+            restored.camera_pose(name), source.camera_pose(name)
+        )
+    assert restored.scene_spec.to_dict() == source.scene_spec.to_dict()
+    assert restored.load_result is not source.load_result
+    assert (
+        restored.scene_spec.visual_rgba_by_link
+        is not source.scene_spec.visual_rgba_by_link
+    )
+    assert restored._collision_projector is None
 
 
 def test_native_codec_omissions_are_preserved_without_recomputation(native):

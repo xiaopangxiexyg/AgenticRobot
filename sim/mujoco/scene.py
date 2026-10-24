@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Mapping, Sequence
@@ -222,6 +223,16 @@ class MujocoScene:
         data,
         load_result: SceneLoadResult,
     ):
+        self._bind_native_layout(
+            mujoco=mujoco,
+            model=model,
+            data=data,
+            load_result=load_result,
+        )
+        self.forward()
+
+    def _bind_native_layout(self, *, mujoco, model, data, load_result: SceneLoadResult):
+        """Bind this fresh scene's indices/caches without evaluating physics."""
         self.mujoco = mujoco
         self.model = model
         self.data = data
@@ -243,10 +254,46 @@ class MujocoScene:
             for offset, address in enumerate(self._kinematic_qpos_indices)
         }
         self._collision_projector = None
-        self._collision_projectors_by_gripper_self_contact: dict[
-            bool, object
-        ] = {}
-        self.forward()
+        self._collision_projectors_by_gripper_self_contact: dict[bool, object] = {}
+
+    @classmethod
+    def from_native_checkpoint(
+        cls,
+        state,
+        *,
+        load_result: SceneLoadResult,
+        max_native_bytes: int,
+    ) -> MujocoScene:
+        """Bind a fresh scene to an independently restored native candidate.
+
+        This restores the physics facade only, not a task or execution rig.
+        The concrete profile must bind trusted scene metadata and all owners.
+        Renderers, collision projectors and their scratch data are never shared.
+        """
+        from .native_checkpoint import restore_native_state
+
+        if cls is not MujocoScene or type(load_result) is not SceneLoadResult:
+            raise ValueError(
+                "Native scene restore requires the exact scene metadata type."
+            )
+        # SceneSpec owns an immutable mappingproxy, which is not pickleable.
+        # Reuse its typed roundtrip instead of sharing it or adding a generic
+        # deepcopy fallback for unknown metadata types.
+        memo = {}
+        if load_result.scene_spec is not None:
+            memo[id(load_result.scene_spec)] = SceneSpec.from_dict(
+                load_result.scene_spec.to_dict()
+            )
+        metadata = copy.deepcopy(load_result, memo)
+        data = restore_native_state(state, max_native_bytes=max_native_bytes)
+        scene = cls.__new__(cls)
+        scene._bind_native_layout(
+            mujoco=_load_mujoco(),
+            model=data.model,
+            data=data,
+            load_result=metadata,
+        )
+        return scene
 
     @classmethod
     def from_contract(
