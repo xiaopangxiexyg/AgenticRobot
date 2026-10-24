@@ -250,6 +250,10 @@ def test_motion_application_marks_closed_before_closing_visual_source() -> None:
     application._held = False
     application._closed = False
     application._active_operation_id = "operation:fixture"
+    runtime_closed_states: list[bool] = []
+    application.runtime = SimpleNamespace(
+        close=lambda: runtime_closed_states.append(application._closed)
+    )
     closed_states: list[bool] = []
     application._visual_snapshot_source = SimpleNamespace(
         close=lambda: closed_states.append(application._closed)
@@ -257,6 +261,7 @@ def test_motion_application_marks_closed_before_closing_visual_source() -> None:
 
     application.close_after_hold()
 
+    assert runtime_closed_states == [False]
     assert closed_states == [True]
     assert application._active_operation_id is None
 

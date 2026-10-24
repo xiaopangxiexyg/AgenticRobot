@@ -60,6 +60,10 @@ class CollisionSafetyOracle:
     def forbidden_pair_count(self) -> int:
         return len(self._pairs)
 
+    def forbidden_geom_pairs(self) -> tuple[tuple[int, int], ...]:
+        """Expose the compiled pair selection for read-only geometry audits."""
+        return tuple((pair.geom1, pair.geom2) for pair in self._pairs)
+
     def _name(self, object_type, object_id: int, fallback: str) -> str:
         value = self.mujoco.mj_id2name(self.model, object_type, int(object_id))
         return fallback if value is None else str(value)

@@ -1,0 +1,20 @@
+{
+  "tracking_kp_nm_per_rad": 12.0,
+  "tracking_kd_nm_s_per_rad": 1.0,
+  "max_reference_velocity_rad_s": 0.015,
+  "max_reference_acceleration_rad_s2": 0.03,
+  "max_reference_lag_rad": 0.013,
+  "soft_velocity_rad_s": 0.03,
+  "braking_kd_nm_s_per_rad": 2.0,
+  "braking_slew_nm_s": 2.0,
+  "hold_kp_nm_per_rad": 2.0,
+  "hold_kd_nm_s_per_rad": 1.0,
+  "hold_torque_cap_nm": 0.05,
+  "braking_timeout_sec": 3.9,
+  "max_control_gap_sec": 0.04,
+  "velocity_window_sec": 0.08,
+  "drive_driver_kd_nm_s_per_rad": [0.4, 0.6, 0.4, 0.6, 0.2, 0.1],
+  "drive_damping_rise_per_sec": 2.0,
+  "minimum_owner_rate_hz": 100.0,
+  "windowed_soft_velocity": true
+}

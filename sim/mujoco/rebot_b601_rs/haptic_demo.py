@@ -33,6 +33,11 @@ from sim.mujoco.viewer import MujocoPassiveViewerSession
 from utils.terminal_commands import ImmediateTerminalCommands
 
 from .contact import build_b601_contact_box_fixture, read_b601_contact_observation
+from .joint_motion_demo import (
+    JOINT_MOTION_FIXTURE,
+    JOINT_MOTION_SCENARIOS,
+    run_b601_joint_motion_demo,
+)
 from .mit_driver import B601MujocoEffortDriver, default_b601_mit_profile
 from .real2sim import B601Real2SimControllerProfile, B601SimStartupProfile
 from .scene import B601_RS_PHYSICS_HZ, build_b601_mujoco_scene
@@ -86,6 +91,7 @@ def _parser() -> argparse.ArgumentParser:
             CONTACT_FIXTURE,
             REFLECTION_FIXTURE,
             SHARED_CONTROL_FIXTURE,
+            JOINT_MOTION_FIXTURE,
             CARTESIAN_ASSIST_FIXTURE,
             *POSE_FIXTURES,
         ),
@@ -114,7 +120,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--duration-sec",
         type=float,
-        default=DEFAULT_HAPTIC_DURATION_SEC,
+        help=f"Default: 6 seconds for joint-motion; {DEFAULT_HAPTIC_DURATION_SEC:g} seconds for other fixtures.",
     )
     parser.add_argument(
         "--viewer",
@@ -132,6 +138,14 @@ def _parser() -> argparse.ArgumentParser:
         help=(
             "Cartesian-assist only: signed target displacement from the "
             "operator-captured TCP, limited by the shared commissioning contract."
+        ),
+    )
+    parser.add_argument(
+        "--cartesian-assist-max-offset-m",
+        type=float,
+        help=(
+            "Cartesian-assist only: explicit excursion envelope for the "
+            "requested offset."
         ),
     )
     parser.add_argument(
@@ -173,7 +187,41 @@ def _parser() -> argparse.ArgumentParser:
         "--host-hz",
         type=float,
         default=20.0,
-        help="Host torque rate for --real2sim-controller only.",
+        help="Host torque rate for real2sim, policy-assist or joint-motion.",
+    )
+    parser.add_argument(
+        "--joint-motion-scenario", choices=JOINT_MOTION_SCENARIOS,
+        help="Joint-motion only: distinguish stop lifecycle from target-arrival acceptance.",
+    )
+    parser.add_argument(
+        "--joint-motion-profile", type=Path,
+        help="Joint-motion only: offline B601JointMotionConfig JSON; never changes hardware defaults.",
+    )
+    parser.add_argument(
+        "--joint-motion-friction-nm", type=float,
+        help="Joint-motion only: declared synthetic J3 dry friction, not an identified hardware value.",
+    )
+    parser.add_argument(
+        "--joint-motion-target-offset-rad", type=float,
+        help="Joint-motion only: signed simulation target offset; acceptance tolerance stays fixed.",
+    )
+    parser.add_argument(
+        "--joint-motion-breakaway-rise-slew-nm-s", type=float,
+        help="Joint-motion only: explicit offline breakaway rise slope; never changes hardware defaults.",
+    )
+    parser.add_argument("--joint-motion-static-friction-nm", type=float, help="Declared static friction limit; moving friction remains --joint-motion-friction-nm.")
+    parser.add_argument("--joint-motion-friction-transition-rad-s", type=float, help="Simulation-only Stribeck-like transition velocity; not identified hardware friction.")
+    parser.add_argument("--joint-motion-breakaway-torque-nm", type=float)
+    parser.add_argument("--joint-motion-breakaway-duration-sec", type=float)
+    parser.add_argument("--joint-motion-breakaway-impulse-nm-sec", type=float)
+    parser.add_argument("--joint-motion-overlay-cap-nm", type=float)
+    parser.add_argument("--joint-motion-feedback-quantum-rad", type=float)
+    parser.add_argument("--joint-motion-onset-rad", type=float)
+    parser.add_argument("--joint-motion-initial-qpos-rad", type=float, nargs=6, metavar=("J1", "J2", "J3", "J4", "J5", "J6"), help="Declared simulation initial pose; never a hardware motion command.")
+    parser.add_argument(
+        "--joint-motion-driver-kd", type=float, nargs=6,
+        metavar=("D1", "D2", "D3", "D4", "D5", "D6"),
+        help="Joint-motion only: explicit motor-local damping counterfactual; omission retains the raw-model baseline damping.",
     )
     parser.add_argument(
         "--torque-rise-time-sec", type=float,
@@ -1407,6 +1455,31 @@ def _emit_payload(
     print(
         f"[B601-SIM] fixture={args.fixture} status={status} exit_code={code}"
     )
+    evaluation = payload.get("target_evaluation")
+    if args.fixture == JOINT_MOTION_FIXTURE and isinstance(evaluation, dict):
+        print(
+            f"[B601-SIM] acceptance={acceptance['kind']} "
+            f"target_arrived={evaluation['arrived']} "
+            f"target_error_rad={evaluation['final_error_before_withdraw_rad']}"
+        )
+        if acceptance["failed_checks"]:
+            print(f"[B601-SIM] failed checks: {', '.join(acceptance['failed_checks'])}")
+        violation = acceptance["first_velocity_violation"]
+        if violation is not None:
+            print(
+                f"[B601-SIM] first velocity violation: {violation['joint_name']} "
+                f"at {violation['time_sec']:.3f}s ({violation['phase']}), "
+                f"{violation['raw_velocity_rad_s']:.6f} rad/s; "
+                f"limit={violation['limit_rad_s']:.6f} rad/s"
+            )
+        physics_violation = acceptance["first_physics_velocity_violation"]
+        if physics_violation is not None:
+            print(
+                f"[B601-SIM] first physics velocity violation: {physics_violation['joint_name']} "
+                f"at {physics_violation['time_sec']:.3f}s ({physics_violation['phase']}), "
+                f"{physics_violation['velocity_rad_s']:.6f} rad/s; "
+                f"limit={physics_violation['limit_rad_s']:.6f} rad/s"
+            )
     print(f"[B601-SIM] full result: {result_path}")
     print("[B601-SIM] shell remains active")
     return code
@@ -1415,9 +1488,25 @@ def _emit_payload(
 def main(argv: Sequence[str] | None = None) -> int:
     parser = _parser()
     args = parser.parse_args(argv)
+    if args.duration_sec is None:
+        args.duration_sec = 6.0 if args.fixture == JOINT_MOTION_FIXTURE else DEFAULT_HAPTIC_DURATION_SEC
+    if args.fixture != JOINT_MOTION_FIXTURE and args.joint_motion_scenario is not None:
+        parser.error("--joint-motion-scenario requires --fixture joint-motion")
+    if args.fixture != JOINT_MOTION_FIXTURE and any(value is not None for value in (
+        args.joint_motion_profile, args.joint_motion_friction_nm,
+        args.joint_motion_target_offset_rad, args.joint_motion_breakaway_rise_slew_nm_s,
+        args.joint_motion_driver_kd,
+        args.joint_motion_static_friction_nm, args.joint_motion_friction_transition_rad_s,
+        args.joint_motion_breakaway_torque_nm, args.joint_motion_breakaway_duration_sec,
+        args.joint_motion_breakaway_impulse_nm_sec, args.joint_motion_overlay_cap_nm,
+        args.joint_motion_feedback_quantum_rad, args.joint_motion_onset_rad,
+        args.joint_motion_initial_qpos_rad,
+    )):
+        parser.error("joint-motion tuning requires --fixture joint-motion")
     cartesian_overrides = {
         "axis": args.cartesian_assist_axis,
         "offset_m": args.cartesian_assist_offset_m,
+        "max_offset_m": args.cartesian_assist_max_offset_m,
         "stiffness_n_per_m": args.cartesian_assist_stiffness_n_per_m,
         "max_abs_force_n": args.cartesian_assist_max_force_n,
         "max_abs_joint_torque_nm": (
@@ -1435,7 +1524,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         and any(value is not None for value in cartesian_overrides.values())
     ):
         parser.error("cartesian-assist tuning requires --fixture cartesian-assist")
-    if args.fixture == SHARED_CONTROL_FIXTURE:
+    if args.fixture in {SHARED_CONTROL_FIXTURE, JOINT_MOTION_FIXTURE}:
         if (
             args.real2sim_controller
             or args.gravity_control_baseline != "operator"
@@ -1448,14 +1537,58 @@ def main(argv: Sequence[str] | None = None) -> int:
             or args.trace_jsonl is not None
         ):
             parser.error(
-                "policy-assist uses its fixed offline lifecycle profile; unrelated fixture tuning is unsupported"
+                f"{args.fixture} uses its fixed offline lifecycle profile; unrelated fixture tuning is unsupported"
             )
-        code, payload = run_b601_shared_control_demo(
-            source_root=args.rebot_source_root,
-            duration_sec=args.duration_sec,
-            viewer=bool(args.viewer),
-            host_hz=args.host_hz,
-        )
+        if args.fixture == JOINT_MOTION_FIXTURE:
+            from robot_motion.rebot_b601_rs.joint_motion import B601JointMotionConfig
+
+            motion_config = None
+            if args.joint_motion_profile is not None:
+                try:
+                    values = json.loads(args.joint_motion_profile.read_text(encoding="utf-8"))
+                    if not isinstance(values, dict):
+                        raise TypeError("motion profile must be a JSON object")
+                    motion_config = B601JointMotionConfig(**values)
+                except (OSError, ValueError, TypeError) as error:
+                    parser.error(f"invalid offline joint-motion profile: {error}")
+            code, payload = run_b601_joint_motion_demo(
+                source_root=args.rebot_source_root,
+                duration_sec=args.duration_sec,
+                viewer=bool(args.viewer),
+                host_hz=args.host_hz,
+                scenario=args.joint_motion_scenario or "lifecycle",
+                motion_config=motion_config,
+                synthetic_friction_nm=(
+                    0.06 if args.joint_motion_friction_nm is None else args.joint_motion_friction_nm
+                ),
+                target_offset_rad=(
+                    0.02 if args.joint_motion_target_offset_rad is None else args.joint_motion_target_offset_rad
+                ),
+                breakaway_rise_slew_nm_s=(
+                    2.0 if args.joint_motion_breakaway_rise_slew_nm_s is None else args.joint_motion_breakaway_rise_slew_nm_s
+                ),
+                driver_kd_nm_s_per_rad=(
+                    None if args.joint_motion_driver_kd is None else tuple(args.joint_motion_driver_kd)
+                ),
+                **{name: value for name, value in {
+                    "synthetic_static_friction_nm": args.joint_motion_static_friction_nm,
+                    "friction_transition_velocity_rad_s": args.joint_motion_friction_transition_rad_s,
+                    "breakaway_torque_nm": args.joint_motion_breakaway_torque_nm,
+                    "breakaway_max_duration_sec": args.joint_motion_breakaway_duration_sec,
+                    "breakaway_max_impulse_nm_sec": args.joint_motion_breakaway_impulse_nm_sec,
+                    "total_overlay_cap_nm": args.joint_motion_overlay_cap_nm,
+                    "feedback_position_quantum_rad": args.joint_motion_feedback_quantum_rad,
+                    "motion_onset_displacement_rad": args.joint_motion_onset_rad,
+                    "initial_arm_qpos_rad": None if args.joint_motion_initial_qpos_rad is None else tuple(args.joint_motion_initial_qpos_rad),
+                }.items() if value is not None},
+            )
+        else:
+            code, payload = run_b601_shared_control_demo(
+                source_root=args.rebot_source_root,
+                duration_sec=args.duration_sec,
+                viewer=bool(args.viewer),
+                host_hz=args.host_hz,
+            )
         return _emit_payload(args=args, code=code, payload=payload)
     if args.fixture == REFLECTION_FIXTURE:
         if (

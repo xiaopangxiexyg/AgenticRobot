@@ -42,6 +42,7 @@ from robot_motion.pose import pose_delta_metrics
 from robot_motion.relative_action import xyzquat_to_pose_matrix
 from robot_motion.target_safety import (
     TCPPoseEnvelopeLifecycleError,
+    TCPPoseEnvelopeRotationCutLocusError,
     TCPPoseEnvelopeSafetyRuntime,
     TCPPoseEnvelopeSelection,
 )
@@ -1155,16 +1156,23 @@ class MujocoAgentSafeTcpPoseSkillLifecycle(MujocoAgentTcpPoseSkillLifecycle):
             reason_code = self._lower_failure_code
         return super()._failure(reason_code=reason_code, hold=hold)
 
-    def _prepare_plan(self, *, constraint, constraint_identity, cancel_requested):
+    def _planning_goal_tolerances(self):
         preserve_target = (self.route.skill_id == "motion.move_tcp_to_pose_safe"
             and safe_tcp_pose_goal_policy_v1(self.request.parameters) == "preserve_target")
+        return (
+            min(self.motion_profile.translation_tolerance_m, 0.003)
+                if preserve_target else self.motion_profile.translation_tolerance_m,
+            min(self.motion_profile.rotation_tolerance_rad, math.radians(1.0))
+                if preserve_target else self.motion_profile.rotation_tolerance_rad,
+        )
+
+    def _prepare_plan(self, *, constraint, constraint_identity, cancel_requested):
+        translation_tolerance, rotation_tolerance = self._planning_goal_tolerances()
         payload_binding = self._planning_payload_binding()
         return self._planner.plan(
             self.target_pose,
-            translation_tolerance_m=(min(self.motion_profile.translation_tolerance_m, 0.003)
-                if preserve_target else self.motion_profile.translation_tolerance_m),
-            rotation_tolerance_rad=(min(self.motion_profile.rotation_tolerance_rad, math.radians(1.0))
-                if preserve_target else self.motion_profile.rotation_tolerance_rad),
+            translation_tolerance_m=translation_tolerance,
+            rotation_tolerance_rad=rotation_tolerance,
             cancel_requested=cancel_requested,
             configuration_constraint=constraint,
             constraint_identity=constraint_identity,
@@ -1219,6 +1227,34 @@ class MujocoAgentSafeTcpPoseSkillLifecycle(MujocoAgentTcpPoseSkillLifecycle):
                 )
 
         try:
+            if cancel_requested():
+                raise MujocoTcpPlanRejected("safe_tcp_planning_cancelled")
+            # This query owns the public single-goal route. Retained chains
+            # keep their original per-stage constraints and prepared resolver.
+            if self.route.skill_id == "motion.move_tcp_to_pose_safe" and safety is not None:
+                translation_tolerance, rotation_tolerance = self._planning_goal_tolerances()
+                try:
+                    goal_projection = safety.project(
+                        {motion_side: xyzquat_to_pose_matrix(self.target_pose)}
+                    )
+                except TCPPoseEnvelopeRotationCutLocusError:
+                    # A non-unique nominal projection does not prove the
+                    # tolerance region infeasible; candidate/path gates remain.
+                    goal_projection = None
+                if goal_projection is not None and (
+                    goal_projection.envelope_profile_hash, goal_projection.anchor_hash
+                ) != basis:
+                    raise MujocoTcpPlanRejected("safe_tcp_envelope_binding_changed")
+                if goal_projection is not None and not goal_projection.intersects_goal_tolerance(
+                    translation_tolerance_m=translation_tolerance,
+                    rotation_tolerance_rad=rotation_tolerance,
+                ):
+                    raise MujocoTcpPlanRejected("safe_tcp_goal_outside_safety_envelope", {
+                        "goal_policy": safe_tcp_pose_goal_policy_v1(self.request.parameters),
+                        "translation_tolerance_m": translation_tolerance,
+                        "rotation_tolerance_rad": rotation_tolerance,
+                        "projection": goal_projection.to_payload(),
+                    })
             plan = self._prepare_plan(
                 constraint=constraint,
                 constraint_identity=constraint_identity,

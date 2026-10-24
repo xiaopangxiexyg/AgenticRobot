@@ -1478,6 +1478,103 @@ def test_failed_active_report_rollback_stays_latched_and_blocks_close() -> None:
     backend.close()
 
 
+@pytest.mark.parametrize("pending", ["active_report", "torque_limit", "enabled"])
+def test_terminal_transport_release_preserves_unconfirmed_device_state_and_sends_nothing(pending):
+    controller = _FakeController()
+    backend = B601RSBackend(_config(allow_motion=True, allow_active_reporting=True),
+                            controller_factory=lambda _channel: controller)
+    backend.connect()
+    if pending == "active_report":
+        assert backend.set_active_reporting(True, joint_names=("joint1",)).completed
+    elif pending == "torque_limit":
+        controller.motors[1].parameter_values[B601_RS_TORQUE_LIMIT_PARAM_ID] = 36.
+        assert backend.safe_stop(joint_names=("joint1",)).completed
+        assert backend.apply_temporary_driver_torque_limits((.5,)*6, joint_names=("joint1",)).completed
+    else:
+        assert backend.enable(joint_names=("joint1",)).completed
+    before = {i: list(motor.calls) for i, motor in controller.motors.items()}
+    backend.release_transport()
+    backend.release_transport()
+    assert not backend.connected
+    assert controller.calls.count("close") == 1
+    assert {i: motor.calls for i, motor in controller.motors.items()} == before
+    assert backend.active_report_joint_names == (("joint1",) if pending == "active_report" else ())
+    assert backend.temporary_driver_torque_limit_joint_names == (("joint1",) if pending == "torque_limit" else ())
+    assert backend.enabled_joint_names == (("joint1",) if pending == "enabled" else ())
+    with pytest.raises(B601HardwareError, match="unconfirmed device state"):
+        backend.connect()
+
+
+@pytest.mark.parametrize("method", ["close", "release_transport"])
+def test_transport_close_failure_keeps_the_original_handle_until_explicit_retry(method):
+    controller = _FakeController()
+    backend = B601RSBackend(_config(), controller_factory=lambda _channel: controller)
+    backend.connect()
+    original = controller.close
+    def fail():
+        raise OSError("synthetic host release failure")
+    controller.close = fail
+    with pytest.raises(OSError, match="host release failure"):
+        getattr(backend, method)()
+    assert backend.connected
+    assert backend.registered_joint_names == B601_RS_ARM_JOINT_NAMES
+    controller.close = original
+    getattr(backend, method)()
+    assert not backend.connected
+    assert controller.calls.count("close") == 1
+
+
+def test_incomplete_vendor_release_cannot_clear_the_handle():
+    controller = _FakeController()
+    backend = B601RSBackend(_config(), controller_factory=lambda _channel: controller)
+    backend.connect()
+    controller.close = lambda: False
+    with pytest.raises(B601HardwareError, match="release is incomplete"):
+        backend.release_transport()
+    assert backend.connected
+
+
+@pytest.mark.parametrize("failure", [None, "bus", "motor", "controller"])
+def test_native_bus_and_motor_handles_are_released_explicitly_with_retry(failure):
+    events, failed = [], [failure]
+    class Controller(_FakeController):
+        def close_bus(self):
+            events.append("bus")
+            if failed[0] == "bus":
+                raise OSError("synthetic bus close failure")
+        def add_robstride_motor(self, motor_id, *args):
+            motor = super().add_robstride_motor(motor_id, *args)
+            def close():
+                events.append(f"motor:{motor_id}")
+                if failed[0] == "motor" and motor_id == 3:
+                    raise OSError("synthetic motor handle close failure")
+            motor.close = close
+            return motor
+        def close(self):
+            events.append("controller")
+            if failed[0] == "controller":
+                raise OSError("synthetic controller close failure")
+    controller = Controller()
+    backend = B601RSBackend(_config(allow_active_reporting=True),
+                            controller_factory=lambda _channel: controller)
+    backend.connect()
+    assert backend.set_active_reporting(True, joint_names=("joint1",)).completed
+    before = {i: list(m.calls) for i, m in controller.motors.items()}
+    if failure:
+        with pytest.raises((OSError, B601HardwareError), match="close failure"):
+            backend.release_transport()
+        assert backend.connected
+        assert backend.active_report_joint_names == ("joint1",)
+        failed[0] = None
+    backend.release_transport()
+    assert not backend.connected
+    assert events[0] == "bus" and events[-1] == "controller"
+    assert all(events.count(f"motor:{i}") == (2 if failure == "motor" and i == 3 else 1)
+               for i in range(1, 7))
+    assert {i: m.calls for i, m in controller.motors.items()} == before
+    assert backend.active_report_joint_names == ("joint1",)
+
+
 def test_temporary_driver_torque_limit_requires_motion_authorization() -> None:
     controller = _FakeController()
     backend = B601RSBackend(_config(), controller_factory=lambda _channel: controller)

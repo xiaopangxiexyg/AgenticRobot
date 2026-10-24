@@ -907,6 +907,35 @@ class TCPPoseEnvelopeProjectionResult:
             if projection.modified
         )
 
+    def intersects_goal_tolerance(
+        self, *, translation_tolerance_m: float, rotation_tolerance_rad: float,
+    ) -> bool:
+        """Necessary geometric feasibility, never IK or execution authority.
+
+        Translation projects onto the convex box intersection; orientation
+        projects onto the independent SO(3) ball. Their projection distances
+        are the minimum goal errors. Do not execute the projected pose or
+        reject an otherwise feasible tolerance region just because the nominal
+        pose needs projection. The original candidate/path gates still apply.
+        """
+        tolerances = []
+        for name, value in (
+            ("translation_tolerance_m", translation_tolerance_m),
+            ("rotation_tolerance_rad", rotation_tolerance_rad),
+        ):
+            if isinstance(value, (bool, np.bool_)):
+                raise TCPPoseEnvelopeError(f"{name} must be finite and non-negative")
+            number = float(value)
+            if not math.isfinite(number) or number < 0:
+                raise TCPPoseEnvelopeError(f"{name} must be finite and non-negative")
+            tolerances.append(number)
+        translation, rotation = tolerances
+        return all(
+            side.translation_adjustment_m <= translation + _CONSTRAINT_TOL
+            and side.rotation_adjustment_rad <= rotation + _CONSTRAINT_TOL
+            for side in self.side_projection_by_side.values()
+        )
+
     def to_payload(self) -> dict[str, Any]:
         return {
             "raw_tcp_pose_by_side": {

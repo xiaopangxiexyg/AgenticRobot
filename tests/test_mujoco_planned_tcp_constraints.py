@@ -1,5 +1,6 @@
 """Planning constraints remain bound through native exact-reference admission."""
 
+
 import numpy as np
 import pytest
 from test_agent_gateway_mujoco_safe_tcp_pose import _session
@@ -179,3 +180,73 @@ def test_preview_does_not_replace_pending_plan_or_allow_activation():
         assert app.request_hold(reason="preview-test").snapshot.status == "hold"
     finally:
         assert session.close().accepted
+
+
+@pytest.mark.parametrize("scenario,reason,expected_queries", (
+    ("all_miss", "safe_tcp_endpoint_search_exhausted", 1),
+    ("rescued_collision", "safe_tcp_target_blocked", 1),
+    ("rescued_envelope", "safe_tcp_target_envelope_blocked", 1),
+    ("original_collision", "safe_tcp_target_blocked", 0),
+    ("cancel", "safe_tcp_planning_cancelled", 1),
+    ("nonfinite", "safe_tcp_endpoint_numerical_failure", 1),
+    ("expired", "safe_tcp_endpoint_search_exhausted", 0),
+))
+def test_endpoint_rescue_preserves_admission_deadline_and_diagnostics(monkeypatch, scenario, reason, expected_queries):
+    from types import SimpleNamespace
+    from threading import RLock
+
+    planner = object.__new__(planning_module.MujocoPlannedTcpMotion)
+    planner._motion_side = "right"
+    planner._lock = RLock()
+    planner._active = planner._pending_plan = None
+    planner.scene = SimpleNamespace(model=SimpleNamespace(nq=12))
+    scene_cuts = []
+    def capture_scene(operation):
+        scene_cuts.append("capture")
+        return operation(planner.scene)
+    planner.rig = SimpleNamespace(capture_scene=capture_scene)
+    planner._model_qpos = lambda: np.zeros(12)
+    planner.task_config = SimpleNamespace(right_tool_profile_path="unused")
+    planner.planning_clearance_padding_m = .002
+    planner.pose_for_configuration = lambda model,pair:(float(pair["right"][0]),0.,0.,0.,0.,0.,1.)
+    query_calls = []
+    def solve_iterative(**kwargs):
+        assert kwargs["max_iterations"]==100 and kwargs["deadline_monotonic"]==2.
+        return np.array([1. if scenario=="original_collision" else .2,0.,0.,0.,0.,0.])
+    def solve_bounded(goal, seed, **kwargs):
+        query_calls.append(kwargs)
+        assert kwargs["deadline_monotonic"]==2. and kwargs["maximum_evaluations"]==100
+        assert kwargs["translation_tolerance_m"]==.003 and kwargs["rotation_tolerance_rad"]==.03
+        if scenario=="cancel":
+            raise InterruptedError("fixture cancel")
+        if scenario=="nonfinite":
+            from robot_motion.rm65.single_arm_ik import BoundedIKNumericalError
+            raise BoundedIKNumericalError("fixture non-finite FK")
+        return np.array([1. if scenario in ("rescued_collision", "rescued_envelope") else .3,0.,0.,0.,0.,0.])
+    planner._solver = SimpleNamespace(q_min=np.full(6,-np.pi),q_max=np.full(6,np.pi),
+        compute_pose=lambda q:np.eye(4),solve_iterative=solve_iterative,
+        solve_bounded_pose=solve_bounded,last_solve_iterations=100,
+        last_solve_converged=False,last_solve_deadline_exceeded=False)
+    def check(pair):
+        return JointConfigurationCheck(safe=not np.any(pair["right"]),
+            reason="tcp_envelope_blocked" if scenario=="rescued_envelope" else "fixture_collision")
+    monkeypatch.setattr(planning_module,"MujocoJointSceneOracle",lambda *a,**kw:SimpleNamespace(
+        addresses={"left":np.arange(6),"right":np.arange(6,12)},check=check))
+    monkeypatch.setattr(planning_module,"load_rm65_tool_profile",lambda *a,**kw:None)
+    monkeypatch.setattr(planning_module,"endpoint_to_tool_transform",lambda _:np.eye(4))
+    times=iter([0.]+[3.]*40 if scenario=="expired" else [0.]+[.1]*40)
+    monkeypatch.setattr(planning_module,"time",SimpleNamespace(perf_counter=lambda:next(times)))
+    with pytest.raises(MujocoTcpPlanRejected) as failure:
+        planner.plan((1.,0.,0.,0.,0.,0.,1.),translation_tolerance_m=.003,
+            rotation_tolerance_rad=.03,cancel_requested=lambda:False)
+    assert failure.value.reason_code==reason
+    assert len(query_calls)==expected_queries
+    assert scene_cuts == ["capture"]
+    assert planner._pending_plan is None and planner._active is None
+    if scenario not in ("cancel", "nonfinite"):
+        diagnostic=failure.value.details["endpoint_search_diagnostics"]
+        assert diagnostic["budget_sec"]==2. and diagnostic["seed_count"]==8
+        assert diagnostic["attempted_seed_count"]==(0 if scenario=="expired" else 8+expected_queries)
+        if scenario=="all_miss":
+            assert failure.value.details["endpoint_attempts"]==[]
+            assert len(diagnostic["attempts"])==9

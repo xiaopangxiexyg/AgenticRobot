@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from dataclasses import replace
 
 import pytest
 
@@ -631,3 +632,14 @@ def test_human_override_signal_uses_same_fail_passive_contract() -> None:
     assert output.state.mode is B601SharedControlMode.HUMAN_OVERRIDE
     assert output.reason == "human_override_detected"
     assert output.assist_torque_nm == ZERO
+
+
+def test_receive_window_is_explicit_and_default_zero():
+    assert _config().damping_velocity_window_sec == 0.0
+    assert replace(_config(), damping_velocity_window_sec=.015).damping_velocity_window_sec == .015
+
+
+@pytest.mark.parametrize("value", [-.001, True, float("nan"), float("inf")])
+def test_receive_window_rejects_invalid_configuration(value):
+    with pytest.raises((ValueError, TypeError)):
+        replace(_config(), damping_velocity_window_sec=value)

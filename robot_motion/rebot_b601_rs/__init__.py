@@ -10,10 +10,15 @@ from .assist_commissioning import (
     B601CartesianAssistConfig,
     B601CartesianAssistResponseCriteria,
     B601CartesianAssistSession,
+    B601CartesianBreakawayConfig,
+    B601CartesianBreakawayResult,
+    B601CartesianTorqueSlewDecision,
     B601SingleJointAssistConfig,
     B601SingleJointAssistSession,
+    compute_cartesian_breakaway_compensation,
     evaluate_cartesian_assist_response,
     evaluate_single_joint_assist_response,
+    select_cartesian_assist_torque_slew,
 )
 from .gripper_mapping import (
     B601_RM65_GRIPPER_MAPPING_SCHEMA_V1,
@@ -100,6 +105,12 @@ from .shared_control_runtime import (
     B601SharedControlFrame,
     B601SharedControlRuntime,
 )
+from .staged_assist import (
+    B601StagedAssistConfig,
+    B601StagedAssistFrame,
+    B601StagedAssistPhase,
+    B601StagedSingleJointAssistRuntime,
+)
 
 __all__ = [
     "B601_RM65_GRIPPER_MAPPING_SCHEMA_V1",
@@ -129,6 +140,9 @@ __all__ = [
     "B601CartesianAssistConfig",
     "B601CartesianAssistResponseCriteria",
     "B601CartesianAssistSession",
+    "B601CartesianBreakawayConfig",
+    "B601CartesianBreakawayResult",
+    "B601CartesianTorqueSlewDecision",
     "B601DampedLeastSquaresIK",
     "B601HapticWrenchChannel",
     "B601HapticWrenchOutput",
@@ -159,6 +173,10 @@ __all__ = [
     "B601SingleJointAssistSession",
     "B601SingularityMetrics",
     "B601SpatialWrench",
+    "B601StagedAssistConfig",
+    "B601StagedAssistFrame",
+    "B601StagedAssistPhase",
+    "B601StagedSingleJointAssistRuntime",
     "B601TranslationalVirtualSpring",
     "B601VirtualSpringResult",
     "B601VirtualWall",
@@ -175,10 +193,12 @@ __all__ = [
     "RM65ToB601Retargeter",
     "compute_b601_mit_torque",
     "compute_b601_shared_control_step",
+    "compute_cartesian_breakaway_compensation",
     "evaluate_cartesian_assist_response",
     "evaluate_single_joint_assist_response",
     "load_b601_rm65_gripper_mapping_profile",
     "map_world_aligned_ee_wrench_to_joint_torque",
+    "select_cartesian_assist_torque_slew",
     "transform_spatial_twist",
     "transform_spatial_wrench",
 ]

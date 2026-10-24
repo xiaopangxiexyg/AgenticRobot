@@ -92,7 +92,7 @@ core and MuJoCo adapter used for the 20260721 fit; tests compare those hashes to
 fixed historical values rather than silently reinterpreting the fit against
 the current files.
 
-当前运行时源码绑定为 `artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261023_v13.json`。
+当前运行时源码绑定为 `artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261023_v14.json`。
 
 历史 V12 绑定为
 `artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261023_v12.json`。
@@ -296,8 +296,14 @@ surfaces. Real logs and calibration outputs are read-only evidence. Changes to
 canonical entrypoints require a separate mainline decision and are outside this
 plan.
 
-当前 V13 以冻结 V12 为前驱，仅重绑 canonical collision projector 的安全准入查询范围；
+历史 V13 以冻结 V12 为前驱，仅重绑 canonical collision projector 的安全准入查询范围；
 诊断与单调撤退保留原报告范围，原硬穿透、接触和最终输出门禁保持。22 项输入／21 项源码
 绑定固定提交 `b74fd69c52ab4bd107fd3860dd8c253f68cfc3b3`；本地消费者报告为 285 passed，
 不修改旧拟合参数或历史证据。新 held-out 仍为 not_run，fidelity 仍为 provisional。
 70 mm CAD 的 4000 Hz 配置仅用于该仿真接触任务，不代表真实系统响应重新标定。
+
+当前 V14 直接以前驱 V13 的冻结字节为基础，只重绑 oracle.py 中只读 forbidden geometry-pair
+清单接口；22 输入／21 源码仅该项改变，没有新增输入。原碰撞准入、诊断、撤退与最终输出
+门禁以及 RM65 响应配置保持；绑定固定提交 `b978c73d386bab608a0febb5ba1ba51e9cafded6`，原生离线消费者 77 passed。
+V11 为独立 B601 候选的历史绑定，不作为当前绑定；V12/V13 及旧 fit 均保留原字节。
+未重拟合响应参数，fidelity 仍 provisional，新 held-out 仍 not_run，不代表设备或抓取验收。

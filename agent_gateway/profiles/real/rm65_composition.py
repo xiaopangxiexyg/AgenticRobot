@@ -23,7 +23,9 @@ from agent_gateway.protocol.skill_catalog import (
     SkillDeploymentSafetyEnvelopeRef,
 )
 from agent_gateway.runtime.artifact_store import RecoverableAgentArtifactStore
-from .motion_observed_scene import ObservedSafeMovePlanner, SafeMotionObservationConfig
+from .motion_observed_scene import (
+    MotionPlanningGeometryResources, ObservedSafeMovePlanner, SafeMotionObservationConfig,
+)
 from .motion_observed_scene_debug import validate_debug_directory
 from agent_gateway.transport.client_bindings import (
     compile_agent_gateway_unix_client_bindings,
@@ -971,6 +973,10 @@ def assemble_exclusive_rm65_agent_primitive_composition(
         )
         safe_pose_trajectory_planner = None
         safe_pose_trajectory_planner_factory = None
+        planning_geometry_resources = None
+        if captured_robot_observation_filter is not None:
+            planning_geometry_resources = MotionPlanningGeometryResources(
+                self_filter=captured_robot_observation_filter)
         if "move_tcp_to_pose_safe" in normalized_actions:
             safe_config = (grasp_trajectory_config or RM65GraspTrajectoryPlanningConfig()).for_tcp_pose_move(
                 translation_tolerance_m=convergence_profile.translation_tolerance_m,
@@ -993,6 +999,7 @@ def assemble_exclusive_rm65_agent_primitive_composition(
 
             if observed_safe_enabled:
                 assert captured_robot_observation_filter is not None
+                planning_geometry_resources.planner_factory = safe_planner_factory
                 assert perception_source_binding is not None
                 aligned_roles = {item["role"] for item in catalog_provider.aligned_rgbd_source_catalog()}
                 if not set(safe_motion_observation_config.roles) <= aligned_roles:
@@ -1107,6 +1114,7 @@ def assemble_exclusive_rm65_agent_primitive_composition(
         additional_resources = tuple(
             resource
             for resource in (
+                planning_geometry_resources,
                 localization_provider,
                 deployment.gateway_session.station_point_grasp_provider,
             )

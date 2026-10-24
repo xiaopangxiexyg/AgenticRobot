@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="csrf-token" content="__CSRF_TOKEN__">
+  <title>B601 重力与摩擦调试</title>
+  <link rel="stylesheet" href="/styles.css">
+  <script src="/app.js" defer></script>
+  <script src="/assessment.js" defer></script>
+</head>
+<body>
+  <main>
+    <header><div><p class="eyebrow">B601 · LOCAL COMMISSIONING</p><h1>重力与摩擦调试</h1></div><div id="connection" class="badge">连接中</div></header>
+    <p class="warning">物理急停优先。软件全失能可能导致机械臂下坠；关闭页面会撤销附加驱动力，重力补偿继续由原 owner 保持。</p>
+    <section id="mode-selector" class="card experimentcard" hidden>
+      <h2>选择本轮测试模式</h2>
+      <div class="buttonrow" role="group" aria-label="测试模式">
+        <button id="mode-fixed-position" type="button" aria-pressed="true">当前位置 · 小范围测试</button>
+        <button id="mode-supported-cycle" type="button" aria-pressed="false">完整流程 · 抬升后测试并返回</button>
+        <button id="mode-workspace" type="button" aria-pressed="false" hidden>J2 / J3 · 多位姿自动采集</button>
+      </div>
+      <div id="supported-return-panel" class="return-controls" hidden>
+        <h3>回位与停机</h3>
+        <label id="supported-return-control"><input id="supported-return" type="checkbox">本次原位有可靠托架：单轮结束／采集软停止后，缓慢回原位并自动失能</label>
+        <div class="buttonrow"><button id="return-to-origin" type="button" disabled>缓慢回到本次原位</button></div>
+        <p id="supported-return-status" class="subtle" role="status"></p>
+      </div>
+      <div id="cycle-angle-control" hidden>
+        <label for="cycle-angle">J3 抬升角度 · °（启动前可调）</label>
+        <input id="cycle-angle" type="number" min="0.1" max="20" step="0.1" value="20">
+        <p id="cycle-angle-note" class="subtle">随“开始完整流程”一起提交，启动后锁定；返回位置仍为本轮起点。</p>
+      </div>
+      <p id="mode-selection-status" class="command-state" role="status">默认选择当前位置测试；选择模式不会驱动机械臂。</p>
+    </section>
+    <section class="card jointcard">
+      <h2>实时六轴角度与命令</h2><p class="subtle">角度以模型零点为基准，不是相对启动位置的位移。复用 owner 的控制反馈，不另行查询电机；微小越界值可能已投影至边界，原值保留在 debug trace。力矩列均为软件命令，不是实测受力。</p>
+      <p id="joint-feedback-status" class="subtle" role="status">等待六轴反馈…</p>
+      <div class="table-scroll"><table id="joint-overview"><thead><tr><th>关节</th><th>角度 · °</th><th>角度 · rad</th><th>速度 · rad/s</th><th>本段位移 · rad</th><th>重力 · N·m</th><th>附加驱动 · N·m</th><th>总命令 · N·m</th></tr></thead><tbody id="joint-rows"></tbody></table></div>
+      <p id="joint-observation" class="subtle"></p>
+    </section>
+    <section class="card experimentcard">
+      <div class="experiment-options">
+        <div><h2>当前是否有人施加外力？</h2><div class="buttonrow" role="group" aria-label="人工外力"><button id="human-no" type="button" aria-pressed="false">无人施加外力</button><button id="human-yes" type="button" aria-pressed="false">有人施加外力</button></div><p id="human-context-note" class="subtle">拖动、托住或阻挡都算有外力；此选项只标记数据。接管前先撤销驱动力。</p></div>
+        <div><h2>控制方式</h2><div class="buttonrow" role="group" aria-label="控制方式"><button id="withdraw" type="button" aria-pressed="true">只做重力补偿</button><button id="arm" type="button" aria-pressed="false">允许驱动（先准备）</button></div><p id="drive-instructions" class="subtle">允许驱动只授权和检查静止，不会自动加力。通过后填写下方目标并点击提交；以 owner 的发送回执为准。</p></div>
+      </div>
+      <p id="assessment-state" class="command-state" role="status">等待自动记录…</p>
+      <p id="assessment-message" class="subtle" role="status">只需声明当前是否有人施加外力。姿态、方向、力矩和运动自动记录。</p>
+      <p id="assessment-path" class="subtle"></p>
+    </section>
+    <section id="automatic-panel" class="card" hidden>
+      <h2 id="automatic-mode-title">J3 自动采集</h2><p id="automatic-mode-note" class="subtle"></p><p id="automatic-progress" class="command-state" role="status"></p><p id="cycle-disable-hint" class="command-state" role="status" hidden></p>
+      <p id="automatic-data-status" class="subtle" role="status"></p>
+      <p id="automatic-sequence-note">先采集正负起动与撤力回退，再采集双速度小范围运动。编码器进展不等于输出侧运动或真实摩擦力；不会自动安装补偿。</p>
+      <pre id="automatic-trials"></pre>
+    </section>
+    <section class="grid">
+      <article class="card">
+        <div class="label">控制状态</div><div id="phase" class="large">未连接</div><div id="fault" class="subtle"></div>
+        <label for="joint-select">调试关节</label><select id="joint-select"><option value="joint1">J1</option><option value="joint2">J2</option><option value="joint3">J3</option><option value="joint4">J4</option><option value="joint5">J5</option><option value="joint6">J6</option></select>
+        <dl><dt>反馈角度</dt><dd id="qpos">—</dd><dt>差分速度 / 驱动速度保护</dt><dd id="qvel">—</dd><dt>驱动准备后位移</dt><dd id="displacement">—</dd><dt>最大其他关节漂移</dt><dd id="support-drift">—</dd></dl>
+        <p id="gate" class="subtle">等待 owner 状态…</p>
+      </article>
+      <article class="card">
+        <div class="label">附加驱动力 · N·m</div><div class="figures"><div><span id="desired-label">目标驱动力</span><strong id="desired">0.000</strong></div><div><span>最近已发送的 profile 附加命令</span><strong id="dispatched">—</strong></div></div>
+        <p id="command-state" class="command-state" role="status">等待发送确认…</p>
+        <dl><dt>owner 限速后的驱动力</dt><dd id="effective">—</dd><dt>发送周期 / 回执年龄</dt><dd id="receipt">—</dd><dt>重力补偿命令</dt><dd id="gravity">—</dd><dt>最终总力矩命令</dt><dd id="total">—</dd><dt>最终命令相对重力基线差（非实测）</dt><dd id="conditioned-delta">—</dd></dl>
+        <div class="controls"><label id="step-label" for="step">调整步长 · N·m</label><input id="step" type="number" min="0.001" max="0.300" step="0.005" value="0.025"><div class="buttonrow"><button id="minus" type="button">− 步长</button><button id="plus" type="button">+ 步长</button></div><label id="target-label" for="target">目标驱动力 · N·m</label><input id="target" type="number" step="0.005" value="0"><button id="apply" type="button">设置目标</button><button id="authorize-breakaway" type="button" hidden>授权一次静摩擦起步</button><button id="zero" type="button">驱动力归零</button></div>
+        <p id="hint" class="subtle">只做重力补偿时，附加驱动力为零。</p>
+        <button id="stop-and-hold" type="button" hidden>停止并保持实际停点</button>
+        <p id="motion-state" class="command-state" role="status" hidden></p>
+        <p id="stop-capture-state" class="command-state" role="status" hidden></p>
+        <p id="breakaway-envelope" class="subtle" hidden></p>
+        <details id="staged-details-box" hidden><summary>分阶段驱动详情</summary><p id="staged-details" class="subtle"></p></details>
+      </article>
+    </section>
+    <section class="card stopcard"><div class="label">停机控制</div><div class="buttonrow"><button id="protective-hold" type="button">进入重力补偿保护保持</button><button id="full-disable" class="danger" type="button">软件急停：J1–J6 全失能</button></div><p id="stop-hint" class="subtle">全失能前请支撑机械臂。保护原因在下方状态栏中显示。</p></section>
+    <section class="card chartcard"><div class="label">当前关节的最近过程</div><canvas id="chart" width="1080" height="300" aria-label="驱动力和关节位移曲线"></canvas><div id="chart-legend" class="legend"><span class="blue">● 目标驱动力</span><span class="orange">● 已发送驱动力</span><span class="green">● 关节位移</span></div></section>
+    <details class="card statuscard"><summary>终端状态与日志路径</summary><pre id="terminal-statuses" aria-live="polite">等待运行状态…</pre><p id="log-path" class="subtle"></p></details>
+    <footer>全程自动记录；切换外力、控制方式、关节或目标时自动分段。完整逐周期数据保存在 <code>*.debug.jsonl</code>。</footer>
+  </main>
+</body>
+</html>

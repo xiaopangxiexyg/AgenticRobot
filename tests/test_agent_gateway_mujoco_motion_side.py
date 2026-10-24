@@ -603,6 +603,7 @@ def _safe_fixture(monkeypatch, side, *, reject_at=None, basis_change=False, plan
             envelope_profile_hash="envelope:fixture",
             anchor_hash="anchor:changed" if basis_change and len(projects) > 1 else "anchor:fixture",
             modified_sides=modified, to_payload=lambda: {"modified_sides": modified},
+            intersects_goal_tolerance=lambda **_tolerances: not modified,
         )
 
     plan = SimpleNamespace(reference_poses=(measured, target), trajectory_hash="trajectory:fixture")
@@ -630,6 +631,7 @@ def _safe_fixture(monkeypatch, side, *, reject_at=None, basis_change=False, plan
     lifecycle._execution_refs = set()
     lifecycle._path_search_time_budget_sec = 3.0
     lifecycle._contact_binding = None
+    lifecycle._observed_planning_provider = None
     lifecycle._planner = SimpleNamespace(
         pose_for_configuration=lambda _qpos, _pair: target, plan=search,
         activate=lambda _plan: events.append("planner.activate"),
@@ -648,7 +650,8 @@ def test_safe_initial_constraint_and_reference_projections_use_only_selected_sid
     lifecycle, events, projects = _safe_fixture(monkeypatch, side)
     evidence = lifecycle.activate(request=object(), operation=object(), cancel_requested=lambda: False)
     assert evidence.succeeded
-    assert [set(value) for value in projects] == [{side}] * 4
+    # Initial basis, goal preflight, candidate, and two path references.
+    assert [set(value) for value in projects] == [{side}] * 5
     assert events == ["lower.activate", "planner.plan", "planner.activate"]
     assert lifecycle._execution_refs == {"mujoco-safe-joint-trajectory:trajectory:fixture"}
 
@@ -657,7 +660,7 @@ def test_safe_initial_constraint_and_reference_projections_use_only_selected_sid
 @pytest.mark.parametrize("rejection", ["constraint", "reference", "basis", "cancel"])
 def test_safe_projection_planning_failure_preserves_hold_and_no_activation(monkeypatch, side, rejection):
     lifecycle, events, projects = _safe_fixture(
-        monkeypatch, side, reject_at={"constraint": 2, "reference": 3}.get(rejection),
+        monkeypatch, side, reject_at={"constraint": 3, "reference": 4}.get(rejection),
         basis_change=rejection == "basis", planning_cancel=rejection == "cancel",
     )
     evidence = lifecycle.activate(request=object(), operation=object(), cancel_requested=lambda: False)
@@ -674,6 +677,39 @@ def test_safe_precancel_keeps_original_lower_gate_without_search(monkeypatch, si
     evidence = lifecycle.activate(request=object(), operation=object(), cancel_requested=lambda: True)
     assert not evidence.succeeded and evidence.lower_hold_confirmed
     assert events == ["lower.activate"] and projects == []
+
+
+@pytest.mark.parametrize("side", ["right", "left"])
+def test_application_close_retries_runtime_cleanup_after_failed_start(monkeypatch, side):
+    fixture = _fixture(monkeypatch, side)
+    app = fixture.app
+    close_attempts = 0
+
+    def fail_start():
+        raise RuntimeError("startup rollback still has a pending rig")
+
+    def close_runtime():
+        nonlocal close_attempts
+        close_attempts += 1
+        fixture.events.append(f"runtime.close:{close_attempts}")
+        if close_attempts == 1:
+            raise RuntimeError("rig join still pending")
+
+    fixture.runtime.start = fail_start
+    fixture.runtime.close = close_runtime
+    with pytest.raises(RuntimeError, match="pending rig"):
+        app.start_observation_ready()
+    assert not app.started and not app.held
+    with pytest.raises(RuntimeError, match="rig join still pending"):
+        app.close_after_hold()
+    assert not app.closed
+    assert fixture.events == ["runtime.close:1"]
+    app.close_after_hold()
+    app.close_after_hold()
+    assert app.closed and not app.held
+    assert fixture.events == [
+        "runtime.close:1", "runtime.close:2", "snapshot.close", "snapshot.close",
+    ]
 
 
 @pytest.mark.parametrize("side", ["right", "left"])

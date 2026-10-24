@@ -1,10 +1,15 @@
 from __future__ import annotations
 
+import ast
+import inspect
 import io
+import json
 import math
 import os
 import pty
 import termios
+import weakref
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -21,6 +26,29 @@ from robot_motion.rebot_b601_rs import (
 from scripts.hardware import rebot_b601_rs_low_gain_probe as probe
 
 pytestmark = [pytest.mark.unit, pytest.mark.contract]
+
+
+def test_joint_angle_display_uses_signed_measured_degrees_and_is_rate_limited(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    notices = []
+    monkeypatch.setattr(probe, "_operator_notice", notices.append)
+    display = probe._JointAngleDisplay()
+    q = (0.0, -0.005, math.pi / 6, -math.pi / 2, 0.2, -0.3)
+    display.observe(q, observed_at_sec=10.0, phase="ACTIVE")
+    display.observe(q, observed_at_sec=10.49, phase="ACTIVE")
+    moved = (*q[:2], math.pi / 3, *q[3:])
+    display.observe(moved, observed_at_sec=10.5, phase="PROTECTIVE_HOLD")
+
+    assert len(notices) == 2
+    assert "phase=ACTIVE unit=deg" in notices[0]
+    assert "J2=  -0.286" in notices[0]
+    assert "J3= +30.000" in notices[0]
+    assert "J4= -90.000" in notices[0]
+    assert "J6=" in notices[0]
+    assert "J7=" not in notices[0]
+    assert "phase=PROTECTIVE_HOLD" in notices[1]
+    assert "J3= +60.000" in notices[1]
 
 
 def _shared_runtime() -> B601SharedControlRuntime:
@@ -155,6 +183,125 @@ def test_condition_torque_applies_absolute_then_slew_limits() -> None:
     assert conditioned == (0.5, -0.5, 0.1, 0.0, 0.0, 0.0)
     assert torque_limited is True
     assert slew_limited is True
+
+
+def test_cartesian_assist_release_slew_reaches_braking_torque_faster() -> None:
+    decision = probe.select_cartesian_assist_torque_slew(
+        requested_nm=(0.5,) + (0.0,) * 5,
+        previous_nm=(-0.2,) + (0.0,) * 5,
+        measured_qvel_rad_s=(-0.7,) + (0.0,) * 5,
+        rise_rate_nm_s=0.15,
+        release_rate_nm_s=2.0,
+        brake_velocity_deadband_rad_s=0.02,
+    )
+    conditioned, torque_limited, slew_limited = probe.condition_torque(
+        decision.conditioning_target_nm,
+        (-0.2,) + (0.0,) * 5,
+        absolute_limits_nm=(0.5,) * 6,
+        max_rate_nm_s=decision.selected_rate_nm_s,
+        dt_sec=0.05,
+    )
+
+    assert decision.mode[0] == "brake"
+    assert conditioned[0] == pytest.approx(-0.1)
+    assert torque_limited is False
+    assert slew_limited is True
+
+
+def test_cartesian_assist_brake_reverses_obsolete_j2_torque_before_target_crossing() -> None:
+    # Reduced samples from a pre-fix negative-X commissioning trace: J2 was
+    # moving negative while its requested overlay had turned positive.
+    requests_nm = (0.00084, 0.03767, 0.09491, 0.19049, 0.25739)
+    previous_nm = (-0.09676,) + (0.0,) * 5
+    sent_j2_nm = []
+
+    for requested_j2_nm in requests_nm:
+        decision = probe.select_cartesian_assist_torque_slew(
+            requested_nm=(requested_j2_nm,) + (0.0,) * 5,
+            previous_nm=previous_nm,
+            measured_qvel_rad_s=(-0.3,) + (0.0,) * 5,
+            rise_rate_nm_s=0.15,
+            release_rate_nm_s=2.0,
+            brake_velocity_deadband_rad_s=0.02,
+        )
+        previous_nm, _, _ = probe.condition_torque(
+            decision.conditioning_target_nm,
+            previous_nm,
+            absolute_limits_nm=(0.4,) * 6,
+            max_rate_nm_s=decision.selected_rate_nm_s,
+            dt_sec=0.05,
+        )
+        assert decision.mode[0] == "brake"
+        sent_j2_nm.append(previous_nm[0])
+
+    assert sent_j2_nm[0] == pytest.approx(requests_nm[0])
+    assert sent_j2_nm[-1] == pytest.approx(requests_nm[-1])
+    assert sent_j2_nm == sorted(sent_j2_nm)
+
+
+def test_cartesian_assist_response_notice_distinguishes_target_from_minimum() -> None:
+    notice = probe.format_cartesian_assist_response_notice(
+        {
+            "status": "PASS",
+            "settled_signed_displacement_m": 0.0015,
+            "commanded_offset_m": -0.015,
+            "minimum_response_m": 0.001,
+            "peak_signed_force_n": 0.89,
+            "max_lateral_drift_m": 0.0035,
+            "max_rotation_drift_rad": 0.01,
+        }
+    )
+
+    assert "status=PASS" in notice
+    assert "displacement=1.500mm target=15.000mm minimum=1.000mm" in notice
+
+
+def test_torque_conditioning_sample_diagnostics_identifies_absolute_and_slew_limits() -> None:
+    audit = probe.torque_conditioning_sample_diagnostics(
+        (3.0, -0.5, 0.0, 0.0, 0.0, 0.0),
+        (0.0,) * 6,
+        (0.5, -0.5, 0.0, 0.0, 0.0, 0.0),
+        absolute_limits_nm=(2.0,) * 6,
+        max_rate_nm_s=(1.0,) * 6,
+        dt_sec=0.5,
+    )
+
+    assert audit["absolute_torque_saturated_joint_names"] == ("joint1",)
+    assert audit["slew_torque_saturated_joint_names"] == ("joint1",)
+    assert audit["absolute_torque_margin_nm"][0] == pytest.approx(-1.0)
+    assert audit["absolute_torque_request_ratio"][0] == pytest.approx(1.5)
+    assert audit["absolute_clipped_tau_nm"][0] == pytest.approx(2.0)
+
+
+def test_summarize_torque_conditioning_reports_per_joint_authority() -> None:
+    samples = [
+        {
+            "elapsed_sec": 0.0,
+            "requested_tau_nm": (1.0, 3.0, 0.0, 0.0, 0.0, 0.0),
+            "conditioned_tau_nm": (1.0, 2.0, 0.0, 0.0, 0.0, 0.0),
+            "torque_limited": True,
+            "slew_limited": False,
+        },
+        {
+            "elapsed_sec": 0.05,
+            "requested_tau_nm": (1.0, 1.0, 0.0, 0.0, 0.0, 0.0),
+            "conditioned_tau_nm": (0.5, 1.0, 0.0, 0.0, 0.0, 0.0),
+            "torque_limited": False,
+            "slew_limited": True,
+        },
+    ]
+
+    summary = probe.summarize_torque_conditioning(
+        samples,
+        absolute_limits_nm=(2.0,) * 6,
+    )
+
+    assert summary["sample_count"] == 2
+    assert summary["any_absolute_saturation"] is True
+    assert summary["any_slew_saturation"] is True
+    assert summary["per_joint"]["joint2"]["absolute_saturation_count"] == 1
+    assert summary["per_joint"]["joint1"]["slew_saturation_count"] == 1
+    assert summary["per_joint"]["joint2"]["minimum_absolute_margin_nm"] == pytest.approx(-1.0)
 
 
 def test_condition_torque_rejects_nonpositive_dt() -> None:
@@ -569,6 +716,81 @@ def test_enabled_shutdown_always_attempts_hold_before_disable() -> None:
     )
 
 
+@pytest.mark.parametrize("confirmed", [False, True])
+@pytest.mark.parametrize("fails", [False, True])
+def test_terminal_host_release_is_separate_from_device_cleanup(confirmed, fails):
+    events, errors = [], ["safe_stop: unconfirmed"] if not confirmed else []
+    class Backend:
+        def close(self):
+            events.append("close")
+            if fails:
+                raise OSError("synthetic release failure")
+        def release_transport(self):
+            events.append("release_transport")
+            if fails:
+                raise OSError("synthetic release failure")
+    outcome = probe._release_owner_transport(Backend(), device_cleanup_confirmed=confirmed,
+                                              cleanup_errors=errors)
+    assert events == ["close" if confirmed else "release_transport"]
+    assert outcome["completed"] is (not fails)
+    assert bool(outcome["error"]) is fails
+    assert ("safe_stop: unconfirmed" in errors) is (not confirmed)
+    assert len(errors) == int(not confirmed)+int(fails)
+
+
+def test_incomplete_legacy_transport_release_is_not_success():
+    errors = []
+    outcome = probe._release_owner_transport(SimpleNamespace(close=lambda: False),
+        device_cleanup_confirmed=False, cleanup_errors=errors)
+    assert outcome["method"] == "close"
+    assert outcome["completed"] is False
+    assert errors == ["close: host transport release is incomplete"]
+
+
+def test_failed_active_report_cleanup_releases_real_backend_handle_without_confirming_safety(monkeypatch, tmp_path):
+    from test_rebot_b601_hardware_backend import _config, _FakeController
+
+    from hardware.rebot_b601_rs.backend import B601HardwareError, B601RSBackend
+
+    class Controller(_FakeController):
+        def add_robstride_motor(self, *args):
+            motor = super().add_robstride_motor(*args)
+            motor.fail_active_report_calls = {1, 2, 3}
+            motor.fail_method = "disable"
+            return motor
+    controller = Controller()
+    config = _config(allow_motion=True, allow_active_reporting=True)
+    backend = B601RSBackend(config, controller_factory=lambda _channel: controller)
+    path = tmp_path/"config.yaml"
+    path.write_text("offline fixture\n")
+    monkeypatch.setattr(probe.B601RSBackendConfig, "from_rs_yaml", lambda *a, **kw: config)
+    monkeypatch.setattr(probe, "B601RSBackend", lambda _config: backend)
+    monkeypatch.setattr(probe, "_resolve_model_and_limits", lambda root: (
+        SimpleNamespace(urdf_path=path), _fault_hold_limits()))
+    monkeypatch.setattr(probe, "_resolve_effort_limits", lambda *a, **kw: (1.,)*6)
+    args = probe.build_parser().parse_args([
+        "--mode", "hold", "--config", str(path), "--rebot-source-root", str(tmp_path),
+        "--allow-motion", "--auto-disable", "--confirmation", probe.CONFIRMATION,
+        "--apply-driver-torque-limits",
+        "--feedback-source", "active-report", "--allow-active-report", "--auto-disable-active-report",
+    ])
+    with pytest.raises(probe.LowGainProbeError, match="active-report enable failed") as caught:
+        probe.run_probe(args)
+    cleanup = caught.value.cleanup
+    assert cleanup["device_cleanup_confirmed"] is False
+    assert cleanup["motor_disable_confirmed"] is False
+    assert cleanup["active_report_disable_confirmed"] is False
+    assert cleanup["transport_release"] == {"method": "release_transport", "completed": True, "error": None}
+    assert cleanup["errors"] and any("safe_stop" in e for e in cleanup["errors"])
+    assert controller.calls[-1] == "close"
+    assert not backend.connected
+    assert backend.active_report_joint_names == ("joint1",)
+    assert all(any(method == "disable" for method, args in motor.calls) for motor in controller.motors.values())
+    assert not any(method in {"enable", "send_mit"} for motor in controller.motors.values() for method, args in motor.calls)
+    with pytest.raises(B601HardwareError, match="unconfirmed device state"):
+        backend.connect()
+
+
 @pytest.fixture
 def startup_recovery(monkeypatch):
     q = (0.1, 0.7, 1.1, 0.0, -0.1, 0.2)
@@ -705,8 +927,13 @@ def test_hold_entry_does_not_send_after_explicit_full_stop(monkeypatch):
     assert stopped == [probe._ALL_JOINTS]
 
 
-@pytest.mark.parametrize("failure", ["interrupt", "first_rx_error", "persistent_rx_error"])
-def test_enabled_startup_exit_attempts_recovery_before_stop(monkeypatch, tmp_path, failure):
+@pytest.mark.parametrize("failure,cleanup_fault", [
+    ("interrupt", None), ("first_rx_error", None), ("persistent_rx_error", None),
+    ("first_rx_error", "owner_stopped"), ("first_rx_error", "record_flush"),
+    ("first_rx_error", "hold_trace"), ("first_rx_error", "combined"),
+    ("first_rx_error", "operator_keys"),
+])
+def test_enabled_startup_exit_attempts_recovery_before_stop(monkeypatch, tmp_path, failure, cleanup_fault):
     import signal
 
     events = []
@@ -718,6 +945,7 @@ def test_enabled_startup_exit_attempts_recovery_before_stop(monkeypatch, tmp_pat
     config = SimpleNamespace(
         channel="fake-no-hardware",
         joints=[SimpleNamespace(mit_kp=1.0, mit_kd=0.1) for _ in range(6)],
+        feedback_timeout_sec=0.05,
     )
 
     def receipt():
@@ -731,19 +959,33 @@ def test_enabled_startup_exit_attempts_recovery_before_stop(monkeypatch, tmp_pat
     class Backend:
         enabled = False
         reads = 0
+        enabled_reads = 0
 
         def connect(self):
             pass
 
         def poll_feedback(self, **kwargs):
             self.reads += 1
+            self.enabled_reads += int(self.enabled)
             clock[0] += 0.05
             events.append("read")
             if self.enabled and (
                 failure == "persistent_rx_error"
-                or (failure == "first_rx_error" and self.reads == 2)
+                or (failure == "first_rx_error" and self.enabled_reads == 1)
             ):
                 raise OSError("injected RX failure")
+            if cleanup_fault:
+                joints = tuple(B601JointState(
+                    name=name, motor_id=i + 1, feedback_id=0xFD, arbitration_id=24 << 24,
+                    status_code=0, position_rad=q[i], velocity_reported=0., torque_reported_nm=0.,
+                    observed_at_sec=clock[0], sample_sequence=self.reads, valid=True, stale=False,
+                    position_source="robstride_operation_status_cache", status_sequence=self.reads,
+                    receive_age_sec=0., host_receive_freshness_verified=True,
+                ) for i, name in enumerate(probe._ALL_JOINTS))
+                return B601HardwareState(
+                    sequence=self.reads, receive_timestamp_sec=clock[0], joints=joints,
+                    valid=True, stale=False, host_receive_freshness_verified=True,
+                )
             return SimpleNamespace(
                 valid=True, stale=False, positions_rad=q, sequence=self.reads,
                 receive_timestamp_sec=clock[0], joints=(),
@@ -753,9 +995,17 @@ def test_enabled_startup_exit_attempts_recovery_before_stop(monkeypatch, tmp_pat
             events.append("disable")
             return receipt()
 
+        def set_active_reporting(self, enabled, **kwargs):
+            events.append("report_on" if enabled else "report_off")
+            return receipt()
+
         def enable(self, **kwargs):
             self.enabled = True
             events.append("enable")
+            if cleanup_fault and cleanup_fault != "operator_keys":
+                # Enable queued-record cleanup only after CLI admission. The
+                # external backend and its failures remain entirely synthetic.
+                args.torque_console_auto_calibration_profile = tmp_path / "unused-profile.json"
             if failure == "interrupt":
                 handlers[signal.SIGINT](signal.SIGINT, None)
             return receipt()
@@ -801,8 +1051,87 @@ def test_enabled_startup_exit_attempts_recovery_before_stop(monkeypatch, tmp_pat
         "--rebot-source-root", str(tmp_path), "--allow-motion", "--auto-disable",
         "--apply-driver-torque-limits", "--confirmation", probe.CONFIRMATION,
     ])
-    with pytest.raises(probe.LowGainProbeError, match="operator interrupt|injected RX failure"):
-        probe.run_probe(args)
+    console = None
+    trace = None
+    if cleanup_fault:
+        args.feedback_source = "active-report"
+        args.allow_active_report = args.auto_disable_active_report = True
+        def owner_stopped(**kwargs):
+            events.append("owner_stopped")
+            if cleanup_fault in {"owner_stopped", "combined"}:
+                raise RuntimeError("injected console finalization failure")
+            real_owner_stopped(**kwargs)
+
+        def drain_records():
+            events.append("record_flush")
+            if cleanup_fault in {"record_flush", "combined"}:
+                return [{"kind": "automatic_calibration_cycle_transition", "time_sec": clock[0]}]
+            return []
+
+        if cleanup_fault == "operator_keys":
+            args.mode = "gravity-calibration"
+
+            class Keys:
+                def close(self):
+                    events.append("keys_close")
+                    raise OSError("injected terminal cleanup failure")
+
+            monkeypatch.setattr(probe, "OperatorKeyReader", Keys)
+        else:
+            args.torque_console = True
+            args.gravity_debug_mode = True
+            args.torque_console_confirmation = "B601_RS_TORQUE_CONSOLE"
+            console = probe._direct_torque_console_from_args(args)
+            real_owner_stopped = console.owner_stopped
+            monkeypatch.setattr(console, "owner_stopped", owner_stopped)
+            monkeypatch.setattr(console, "drain_records", drain_records, raising=False)
+
+        class Trace(probe._DynamicsTrace):
+            def record(self, kind, **fields):
+                if kind == "protective_hold_attempt" and cleanup_fault in {"hold_trace", "combined"}:
+                    raise RuntimeError("injected hold trace failure")
+                super().record(kind, **fields)
+
+        trace = Trace(io.StringIO())
+    old_handlers = {s: probe.signal.getsignal(s) for s in (signal.SIGINT, signal.SIGUSR1)}
+    bindings = []
+    checkpoints = []
+    if console is not None:
+        def result_record():
+            if cleanup_fault == "owner_stopped":
+                raise ValueError("unconsumed terminal receipt")
+            return {"state": "failed", "outcome": {"severity": "error", "reason": "startup_failure"}}
+        monkeypatch.setattr(console, "result_record", result_record, raising=False)
+
+    def checkpoint(record):
+        # Real run_probe with synthetic I/O, not a mocked lifecycle: save
+        # only after all device cleanup and host release were attempted.
+        assert events[-1] == "close"
+        assert trace.gc_observation_end is not None
+        assert record["status"] == record["execution_status"] == "ERROR"
+        assert record["cleanup"]["transport_release"]["completed"]
+        assert record["postprocessing"]["status"] == "PENDING"
+        if cleanup_fault == "owner_stopped":
+            assert record["automatic_calibration_export_error"] == "ValueError: unconsumed terminal receipt"
+        checkpoints.append(record)
+
+    with pytest.raises(probe.LowGainProbeError, match="operator interrupt|injected RX failure") as raised:
+        probe.run_probe(args, torque_console=console, debug_trace=trace,
+                        console_stop_binding=bindings.append, post_cleanup_checkpoint=checkpoint)
+    assert len(checkpoints) == int(console is not None)
+    if cleanup_fault:
+        if cleanup_fault == "operator_keys":
+            assert events.index("keys_close") < events.index("hold")
+            assert "injected terminal cleanup failure" in str(raised.value)
+        else:
+            assert events.index("owner_stopped") < events.index("record_flush") < events.index("hold")
+        assert trace.gc_observation_end["cleanup_errors"]
+        if cleanup_fault in {"record_flush", "combined"}:
+            assert "requires recorded_monotonic_sec" in str(raised.value)
+        if cleanup_fault in {"owner_stopped", "combined"}:
+            assert "injected console finalization failure" in str(raised.value)
+        if cleanup_fault in {"hold_trace", "combined"}:
+            assert "injected hold trace failure" in str(raised.value)
     after_enable = events[events.index("enable") + 1:]
     if failure == "persistent_rx_error":
         assert "hold" not in after_enable
@@ -810,14 +1139,23 @@ def test_enabled_startup_exit_attempts_recovery_before_stop(monkeypatch, tmp_pat
     else:
         assert after_enable.index("hold") < after_enable.index("disable")
         assert after_enable.count("read") >= 2
-    assert after_enable[-2:] == ["restore", "close"]
+    if cleanup_fault:
+        assert after_enable[-3:] == ["restore", "report_off", "close"]
+    else:
+        assert after_enable[-2:] == ["restore", "close"]
+    assert bindings[-1] is None
+    assert handlers == old_handlers
 
 
+@pytest.mark.parametrize("trace_enabled", [False, True])
 def test_active_report_warmup_requires_advancing_type24_and_disables_stream(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    trace_enabled: bool,
 ) -> None:
     events: list[str] = []
+    trace_stream = io.StringIO()
+    debug_trace = probe._DynamicsTrace(trace_stream) if trace_enabled else None
     q = (0.1, 0.7, 1.1, 0.0, -0.1, 0.2)
     config_path = tmp_path / "config.yaml"
     config_path.write_text("test fixture\n", encoding="utf-8")
@@ -862,6 +1200,15 @@ def test_active_report_warmup_requires_advancing_type24_and_disables_stream(
         sequence = 0
 
         def connect(self) -> None:
+            if trace_enabled:
+                context = json.loads(trace_stream.getvalue())
+                assert context["kind"] == "calibration_context"
+                assert context["schema"] == "b601.command-calibration-context.v1"
+                assert context["profile"]["gravity_joint_scales"] == list(probe._DEFAULT_GRAVITY_JOINT_SCALES)
+                assert context["profile"]["gravity_joint_bias_nm"] == list(probe._DEFAULT_GRAVITY_JOINT_BIAS_NM)
+                assert context["profile"]["driver_kd_nm_s_per_rad"] == list(probe._DEFAULT_DRIVER_KD)
+                assert context["profile"]["config_sha256"] == probe.hashlib.sha256(config_path.read_bytes()).hexdigest()
+                assert context["physical_load_source"] == "not_independently_measured_run_local_only"
             events.append("connect")
 
         def set_active_reporting(self, enabled: bool, **_kwargs: object) -> object:
@@ -935,7 +1282,7 @@ def test_active_report_warmup_requires_advancing_type24_and_disables_stream(
     )
 
     with pytest.raises(probe.LowGainProbeError, match="drive countdown"):
-        probe.run_probe(args)
+        probe.run_probe(args, debug_trace=debug_trace)
 
     assert events[:4] == ["connect", "report_on", "type24_1", "type24_2"]
     assert events[-3:] == ["limits_off", "report_off", "close"]
@@ -1201,13 +1548,344 @@ def test_vendor_status_cache_diagnostics_is_passive_and_explicitly_unverified() 
         "freshness_verified": False,
         "velocity_source": "motorbridge_operation_status_cache_unverified",
         "velocity_role": "diagnostic_only_not_used_for_control",
+        "velocity_scale_sign_calibrated": False,
+        "observation_timing": None,
+        "velocity_semantics": None,
         "control_qvel_source": "normalized_qpos_finite_difference_over_feedback_dt",
         "semantics": (
             "passive_motorbridge_operation_status_cache_unverified; "
+            "host_receive_metadata_if_available; device_source_time_unavailable; "
             "no_extra_can_request; not command-response correlated; "
             "diagnostic_only_not_used_for_control"
         ),
     }
+
+
+@pytest.mark.parametrize("verified", [True, False])
+def test_vendor_status_timing_copies_the_admitted_snapshot_without_trusting_velocity(verified):
+    joints = tuple(B601JointState(
+        name=f"joint{i}", motor_id=i, feedback_id=0xFD, arbitration_id=None,
+        status_code=0, position_rad=0.1, velocity_reported=.02,
+        torque_reported_nm=.1, observed_at_sec=1 - .001 * i,
+        sample_sequence=10, valid=True, stale=False,
+        position_source="robstride_operation_status_cache",
+        status_sequence=100 + i if verified else None,
+        receive_age_sec=.001 * i if verified else None,
+        host_receive_freshness_verified=verified,
+    ) for i in range(1, 7))
+    state = B601HardwareState(
+        sequence=10, receive_timestamp_sec=1, joints=joints, valid=True, stale=False,
+        host_receive_freshness_verified=verified, velocity_semantics="test_cached_state",
+    )
+    result = probe.vendor_status_cache_diagnostics(state)
+    timing = result["observation_timing"]
+    assert timing["snapshot_observed_at_sec"] == 1
+    assert timing["host_receive_freshness_verified"] is verified
+    assert timing["device_source_timestamp_available"] is False
+    assert len(timing["joint_observations"]) == 6
+    for original, copied in zip(joints, timing["joint_observations"], strict=True):
+        assert copied["status_sequence"] == original.status_sequence
+        assert copied["receive_age_sec"] == original.receive_age_sec
+        assert copied["observed_at_sec"] == original.observed_at_sec
+    assert result["velocity_scale_sign_calibrated"] is False
+    assert result["velocity_role"] == "diagnostic_only_not_used_for_control"
+    assert result["control_qvel_source"] == "normalized_qpos_finite_difference_over_feedback_dt"
+    assert result["velocity_semantics"] == "test_cached_state"
+    assert state.joints is joints
+
+
+def _velocity_observation_state(snapshot_time, joint_time, sequence):
+    return B601HardwareState(
+        sequence=sequence, receive_timestamp_sec=snapshot_time, valid=True, stale=False,
+        host_receive_freshness_verified=True,
+        joints=tuple(B601JointState(
+            name=f"joint{i}", motor_id=i, feedback_id=0xFD, arbitration_id=(24<<24)|i,
+            status_code=0, position_rad=0., velocity_reported=99., torque_reported_nm=0.,
+            observed_at_sec=joint_time, sample_sequence=sequence, valid=True, stale=False,
+            position_source="robstride_operation_status_cache", status_sequence=sequence,
+            receive_age_sec=snapshot_time-joint_time, host_receive_freshness_verified=True,
+        ) for i in range(1,7)),
+    )
+
+
+def _joint_receive_velocity_console():
+    return SimpleNamespace(config=SimpleNamespace(feedback_velocity_timebase="joint_receive"),
+        settings=SimpleNamespace(staged_assist=SimpleNamespace(
+            motion_control=SimpleNamespace(max_control_gap_sec=.04))))
+
+
+@pytest.mark.parametrize('execution,initial,severity,state,expected_code,expected_status',[
+    ('STOPPED_BY_OPERATOR','FAIL','warning','failed',0,'STOPPED_WITH_WARNINGS'),
+    ('STOPPED_BY_OPERATOR','FAIL','info','complete',0,'STOPPED'),
+    ('STOPPED_BY_OPERATOR','FAIL','error','failed',1,'FAIL'),
+    ('STOPPED_BY_OPERATOR','FAIL','info','onset_scan',1,'FAIL'),
+    ('FAILED','FAIL','warning','failed',1,'FAIL'),
+    ('ERROR','ERROR','warning','failed',2,'ERROR'),
+])
+def test_automatic_result_separates_clean_stop_from_acceptance_without_hiding_errors(execution,initial,severity,state,expected_code,expected_status):
+    payload={'execution_status':execution,'status':initial,'acceptance_status':'FAIL'}
+    record={'state':state,'outcome':{'severity':severity,'scope':'acquisition'}}
+    assert probe._finalize_automatic_result(payload,record)==expected_code
+    assert payload['status']==expected_status
+    assert payload['acceptance_status']=='FAIL'
+    assert payload['acquisition_outcome']==record['outcome']
+
+
+@pytest.mark.parametrize("execution,state,severity,initial,entries,code,status", [
+    ("COMPLETED", "complete", "info", "FAIL", 0, 0, "OK"),
+    ("COMPLETED", "failed", "warning", "FAIL", 0, 0, "COMPLETED_WITH_WARNINGS"),
+    ("FAILED", "failed", "warning", "FAIL", 0, 1, "FAIL"),
+    ("COMPLETED", "failed", "warning", "ERROR", 0, 2, "ERROR"),
+    ("COMPLETED", "failed", "warning", "FAIL", 1, 1, "FAIL"),
+    ("COMPLETED", "sweep", "info", "FAIL", 0, 1, "FAIL"),
+])
+def test_supported_return_completion_keeps_acquisition_and_cleanup_faults_distinct(
+    execution, state, severity, initial, entries, code, status,
+):
+    payload = {"status": initial, "execution_status": execution, "acceptance_status": "FAIL",
+        "stop_reason": "supported_origin_return_complete", "protective_hold": {"degraded": {"entry_count": entries}}}
+    acquisition = {"state": state, "outcome": {"severity": severity, "scope": "acquisition"}}
+    assert probe._finalize_automatic_result(payload, acquisition) == code
+    assert payload["status"] == status and payload["acceptance_status"] == "FAIL"
+    assert payload["acquisition_outcome"] == acquisition["outcome"]
+    assert probe._automatic_execution_status("supported_origin_return_complete", False, 1) == "FAILED"
+    assert probe._automatic_execution_status("supported_origin_return_complete", True, 0) == "FAILED"
+
+
+def test_automatic_postrun_timing_quality_is_a_visible_warning_not_a_live_guard_override():
+    payload={'status':'FAIL','execution_status':'STOPPED_BY_OPERATOR','acceptance_status':'FAIL',
+        'frequency_acceptance':{'tx':{'passed':False},'feedback':{'passed':True}}}
+    record={'state':'complete','outcome':{'severity':'info','scope':'acquisition'}}
+    assert probe._finalize_automatic_result(payload,record)==0
+    assert payload['status']=='STOPPED_WITH_WARNINGS'
+    assert payload['execution_warnings']==[{'scope':'timing_quality','reason':'tx_frequency_acceptance_not_met'}]
+    assert payload['frequency_acceptance']['tx']['passed'] is False
+
+
+def test_automatic_clean_stop_classification_cannot_hide_a_degraded_protective_hold():
+    payload={'status':'FAIL','execution_status':'STOPPED_BY_OPERATOR','acceptance_status':'FAIL',
+        'protective_hold':{'degraded':{'entry_count':1,'recovery_count':1}}}
+    record={'state':'failed','outcome':{'severity':'warning','scope':'acquisition'}}
+    assert probe._finalize_automatic_result(payload,record)==1
+    assert payload['status']=='FAIL' and payload['execution_status']=='FAILED'
+
+
+@pytest.mark.parametrize('reason', ['page_unload', 'operator_withdraw'])
+@pytest.mark.parametrize('timing_warning', [False, True])
+def test_automatic_normal_second_stop_is_not_a_degraded_fault(reason, timing_warning):
+    payload = {'status': 'FAIL', 'execution_status': 'STOPPED_BY_OPERATOR',
+        'acceptance_status': 'FAIL', 'stop_reason': 'operator_interrupt',
+        'protective_hold': {'degraded': {'entry_count': 0,
+            'escalation_reason': 'explicit second stop request'}},
+        'frequency_acceptance': {'tx': {'passed': not timing_warning}}}
+    record = {'state': 'cancelled', 'acquisition_complete': False,
+        'outcome': {'severity': 'info', 'scope': 'acquisition', 'reason': reason}}
+    assert probe._finalize_automatic_result(payload, record) == 0
+    assert payload['status'] == ('STOPPED_WITH_WARNINGS' if timing_warning else 'STOPPED')
+    assert payload['execution_status'] == 'STOPPED_BY_OPERATOR'
+    assert payload['acceptance_status'] == 'FAIL'
+    assert not record['acquisition_complete']
+    assert payload['acquisition_outcome'] == record['outcome']
+    assert payload['protective_hold']['degraded']['escalation_reason'] == 'explicit second stop request'
+
+
+@pytest.mark.parametrize('entries,escalation', [
+    (1, 'explicit second stop request'),
+    (0, 'no verified degraded hold cache'),
+    (0, 'live and cached all-six-joint hold dispatch failed after retry'),
+    (0, 'unknown future failure'),
+])
+def test_automatic_second_stop_fix_keeps_real_and_unknown_faults_failed(entries, escalation):
+    payload = {'status': 'FAIL', 'execution_status': 'STOPPED_BY_OPERATOR',
+        'protective_hold': {'degraded': {'entry_count': entries, 'escalation_reason': escalation}}}
+    record = {'state': 'cancelled', 'outcome': {'severity': 'info', 'scope': 'acquisition'}}
+    assert probe._finalize_automatic_result(payload, record) == 1
+    assert payload['status'] == 'FAIL'
+    assert payload['execution_status'] == 'FAILED'
+
+
+@pytest.mark.parametrize('status,execution,code', [('FAIL', 'FAILED', 1), ('ERROR', 'ERROR', 2)])
+def test_automatic_normal_second_stop_cannot_promote_upstream_cleanup_or_control_failure(status, execution, code):
+    payload = {'status': status, 'execution_status': execution,
+        'cleanup': {'device_cleanup_confirmed': False, 'errors': ['disable not confirmed']},
+        'protective_hold': {'degraded': {'entry_count': 0,
+            'escalation_reason': 'explicit second stop request'}}}
+    record = {'state': 'cancelled', 'outcome': {'severity': 'info', 'scope': 'acquisition'}}
+    assert probe._finalize_automatic_result(payload, record) == code
+    assert payload['status'] == status and payload['execution_status'] == execution
+    assert not payload['cleanup']['device_cleanup_confirmed']
+
+
+def test_receive_interval_above_watchdog_is_valid_when_paired_snapshot_and_ages_are_fresh():
+    # Preserved J1 timing from the field failure: advancing, fresh metadata,
+    # not a backwards clock. No snapshot/vendor speed fallback is allowed.
+    snapshot_dt=.03896361100487411
+    previous_age=.004892083
+    current_age=.003755465
+    previous=_velocity_observation_state(100., 100.-previous_age, 10)
+    current=_velocity_observation_state(100.+snapshot_dt,100.+snapshot_dt-current_age,11)
+    delta=.000383496
+    diagnostic=probe.feedback_velocity_timebase_diagnostics(current,previous,
+        qpos_rad=(delta,)*6,previous_qpos_rad=(0.,)*6,snapshot_dt_sec=snapshot_dt,
+        raw_qvel_rad_s=(99.,)*6)
+    assert diagnostic['joint_observations'][0]['joint_receive_dt_sec'] > .04
+    velocity=probe._torque_console_feedback_velocity(_joint_receive_velocity_console(),(99.,)*6,diagnostic)
+    assert velocity == pytest.approx((delta/(snapshot_dt+previous_age-current_age),)*6)
+    assert max(velocity) < .01
+
+
+@pytest.mark.parametrize('case',['snapshot_gap','old_previous','old_current','identity','nonadvancing'])
+def test_receive_clock_correction_keeps_watchdog_freshness_and_identity_independent(case):
+    previous=_velocity_observation_state(1.,.99,10)
+    current=_velocity_observation_state(1.01,1.,11)
+    diagnostic=probe.feedback_velocity_timebase_diagnostics(current,previous,
+        qpos_rad=(0.,)*6,previous_qpos_rad=(0.,)*6,snapshot_dt_sec=.01,raw_qvel_rad_s=(0.,)*6)
+    if case == 'snapshot_gap':diagnostic['snapshot_dt_sec']=.040001
+    elif case == 'old_previous':diagnostic['joint_observations'][0]['previous_receive_age_sec']=.040001
+    elif case == 'old_current':diagnostic['joint_observations'][0]['receive_age_sec']=.040001
+    elif case == 'identity':diagnostic['joint_observations'][0]['joint_receive_dt_sec']=.02
+    else:diagnostic['joint_observations'][0]['joint_receive_dt_sec']=0.
+    with pytest.raises(probe.LowGainProbeError,match='joint receive velocity'):
+        probe._torque_console_feedback_velocity(_joint_receive_velocity_console(),(0.,)*6,diagnostic)
+
+
+@pytest.mark.parametrize('joint_dt,delta,expected_block',[
+    (.018227736,-.0007669925689697266,False),
+    (.009,-.0007669925689697266,True),
+    (.007536903955042362,-.0003834962844848633,True),
+])
+def test_joint_receive_velocity_aligns_recorded_two_count_guard_without_filtering(joint_dt,delta,expected_block):
+    from robot_motion.rebot_b601_rs.joint_motion import (
+        B601JointMotionConfig,
+        B601JointMotionTracker,
+        B601WindowStopEvidence,
+    )
+    previous=_velocity_observation_state(1.,.99,10)
+    current=_velocity_observation_state(1.011199411,.99+joint_dt,11)
+    snapshot=(0.,0.,delta/.011199411,0.,0.,0.)
+    q=(0.,0.,.1+delta,0.,0.,0.)
+    diagnostic=probe.feedback_velocity_timebase_diagnostics(current,previous,
+        qpos_rad=q,previous_qpos_rad=(0.,0.,.1,0.,0.,0.),snapshot_dt_sec=.011199411,
+        raw_qvel_rad_s=snapshot)
+    corrected=probe._torque_console_feedback_velocity(_joint_receive_velocity_console(),snapshot,diagnostic)
+    assert corrected[2]==pytest.approx(delta/joint_dt)
+    assert (abs(snapshot[2])>.05) is (abs(delta)>.0004)
+    window=(0.,0.,-.0157743905,0.,0.,0.)
+    tracker=B601JointMotionTracker(B601JointMotionConfig(windowed_soft_velocity=True,
+        position_resolution_rad=.0004,responsive_tracking_brake=True))
+    tracker.start(now=1.,q=.1,target=.08)
+    frame=tracker.update(now=1.011199411,q=q[2],raw_v=corrected[2],control_v=window[2],
+        control_sequence=1,authority=1.,kp=12.,kd=1.,stop_error_rad=.003,
+        stop_velocity_rad_s=.005,stop_dwell_sec=.15,
+        stop_evidence=B601WindowStopEvidence(1.011199411,q,corrected,window,
+            (0.,0.,.001534,0.,0.,0.),.08,.05))
+    assert (frame.motion_evidence_block_reason=='raw_velocity_hard_guard') is expected_block
+    assert frame.phase==('authority_exhausted' if expected_block else 'track')
+
+
+@pytest.mark.parametrize('case',['missing','incomplete','unverified','wrong_joint','gap','age','nonfinite'])
+def test_joint_receive_velocity_fails_closed_without_snapshot_or_vendor_fallback(case):
+    previous=_velocity_observation_state(1.,.99,10)
+    current=_velocity_observation_state(1.01,1.,11)
+    raw=(.168,)*6
+    diagnostic=probe.feedback_velocity_timebase_diagnostics(current,previous,
+        qpos_rad=(0.,)*6,previous_qpos_rad=(0.,)*6,snapshot_dt_sec=.01,raw_qvel_rad_s=raw)
+    if case=='missing': diagnostic=None
+    elif case=='incomplete': diagnostic['joint_observations'].pop()
+    else:
+        edits={'unverified':{'comparison_valid':False},'wrong_joint':{'joint_name':'joint7'},
+            'gap':{'joint_receive_dt_sec':.041},'age':{'receive_age_sec':.041},
+            'nonfinite':{'delta_qpos_rad':float('nan')}}[case]
+        diagnostic['joint_observations'][2].update(edits)
+    with pytest.raises(probe.LowGainProbeError,match='joint receive velocity'):
+        probe._torque_console_feedback_velocity(_joint_receive_velocity_console(),raw,diagnostic)
+    # Absent explicit selection keeps the original snapshot path unchanged.
+    assert probe._torque_console_feedback_velocity(SimpleNamespace(),raw,diagnostic)==raw
+
+
+def test_velocity_timebase_comparison_preserves_snapshot_speed_and_uses_only_host_receive_metadata():
+    previous = _velocity_observation_state(1., .99, 10)
+    current = _velocity_observation_state(1.00228362, 1., 11)
+    count = .0003834962844848633
+    q = (0.,0.,-count,0.,0.,0.)
+    raw = (0.,0.,-count/.00228362,0.,0.,0.)
+    result = probe.feedback_velocity_timebase_diagnostics(current,previous,
+        qpos_rad=q,previous_qpos_rad=(0.,)*6,snapshot_dt_sec=.00228362,raw_qvel_rad_s=raw)
+    j3 = result['joint_observations'][2]
+    assert j3['raw_snapshot_qvel_rad_s'] == raw[2]
+    assert j3['joint_receive_dt_sec'] == pytest.approx(.01)
+    assert j3['diagnostic_joint_qvel_rad_s'] == pytest.approx(-count/.01)
+    assert j3['comparison_valid'] and j3['status_sequence'] == 11 and j3['previous_status_sequence'] == 10
+    assert result['role'] == 'diagnostic_only_not_used_for_control'
+    assert result['device_source_timestamp_available'] is False
+    assert current.joints[2].velocity_reported == 99.  # Never used in the estimate.
+
+
+@pytest.mark.parametrize('case,reason',[
+    ('missing','paired_metadata_unavailable'),
+    ('unaligned','snapshot_history_not_aligned'),
+    ('unverified','host_metadata_unverified'),
+    ('stale','host_metadata_unverified'),
+    ('wrong_type','host_metadata_unverified'),
+    ('time_missing','joint_receive_time_unavailable'),
+    ('time_reversed','joint_receive_time_not_advanced'),
+    ('sequence','joint_status_sequence_not_advanced'),
+    ('inconsistent_age','inconsistent_host_receive_metadata'),
+])
+def test_velocity_timebase_invalid_metadata_never_falls_back_to_raw_or_vendor_speed(case,reason):
+    previous = _velocity_observation_state(1., .99, 10)
+    current = _velocity_observation_state(1.01, 1., 11)
+    dt = .01
+    if case == 'missing': previous = None
+    elif case == 'unaligned': dt = .02
+    elif case == 'unverified': current = replace(current,host_receive_freshness_verified=False)
+    elif case == 'stale': current = replace(current,stale=True)
+    else:
+        edits = {
+            'wrong_type':{'arbitration_id':(2<<24)|3},
+            'time_missing':{'observed_at_sec':None},
+            'time_reversed':{'observed_at_sec':.98,'receive_age_sec':.03},
+            'sequence':{'status_sequence':10},
+            'inconsistent_age':{'receive_age_sec':.02},
+        }[case]
+        current = replace(current,joints=(*current.joints[:2],replace(current.joints[2],**edits),*current.joints[3:]))
+    result = probe.feedback_velocity_timebase_diagnostics(current,previous,
+        qpos_rad=(0.,)*6,previous_qpos_rad=(0.,)*6,snapshot_dt_sec=dt,raw_qvel_rad_s=(.168,)*6)
+    j3 = result['joint_observations'][2]
+    assert j3['reason'] == reason and not j3['comparison_valid']
+    assert j3['diagnostic_joint_qvel_rad_s'] is None
+    assert j3['raw_snapshot_qvel_rad_s'] == .168
+    with pytest.raises(probe.LowGainProbeError,match='joint receive velocity'):
+        probe._torque_console_feedback_velocity(_joint_receive_velocity_console(),(.168,)*6,result)
+
+
+def test_velocity_timebase_wiring_records_fault_and_quarantine_without_rebasing_the_observer():
+    source = inspect.getsource(probe.run_probe)
+    tree = ast.parse(source)
+    assignments = [node for node in ast.walk(tree) if isinstance(node,ast.Assign)
+        and any(isinstance(t,ast.Name) and t.id=='previous_velocity_diagnostic_state' for t in node.targets)]
+    assert len(assignments)==1 and ast.unparse(assignments[0].value)=='state'
+    assert source.index('continue',source.index('if motion_rejection_action == "quarantine"')) < source.index('previous_velocity_diagnostic_state = state')
+    guard = next(n for n in ast.walk(tree) if isinstance(n,ast.Call) and isinstance(n.func,ast.Attribute)
+        and n.func.attr=='record' and n.args and isinstance(n.args[0],ast.Constant) and n.args[0].value=='torque_console_guard')
+    fields = {n.arg:ast.unparse(n.value) for n in guard.keywords if n.arg}
+    assert fields['velocity_timebase']=='velocity_timebase'
+    assert fields['vendor_status_diagnostic_only']=='velocity_vendor_status'
+    assert fields['previous_qpos_rad']=='previous_q'
+    step = next(n for n in ast.walk(tree) if isinstance(n,ast.Call) and isinstance(n.func,ast.Attribute)
+        and isinstance(n.func.value,ast.Name) and n.func.value.id=='torque_console' and n.func.attr=='step')
+    assert next(n.value.id for n in step.keywords if n.arg=='qvel_rad_s')=='console_qvel'
+    selection=next(n for n in ast.walk(tree) if isinstance(n,ast.Assign)
+        and any(isinstance(t,ast.Name) and t.id=='console_qvel' for t in n.targets))
+    assert ast.unparse(selection.value)=='_torque_console_feedback_velocity(torque_console, qvel, velocity_timebase)'
+    rejection=next(n for n in ast.walk(tree) if isinstance(n,ast.Call) and isinstance(n.func,ast.Attribute)
+        and n.func.attr=='record' and n.args and isinstance(n.args[0],ast.Constant)
+        and n.args[0].value=='torque_console_velocity_rejected')
+    assert next(n.value.value for n in rejection.keywords if n.arg=='command_dispatched') is False
+    fields = {keyword.arg for keyword in rejection.keywords}
+    assert {"cycle_timing", "feedback_read_diagnostics", "requested_schedule_wait_sec",
+            "previous_trace_record_timing"} <= fields
+    assert selection.lineno < step.lineno
 
 
 def test_vendor_status_cache_diagnostics_does_not_fail_when_cache_is_absent() -> None:
@@ -1406,6 +2084,63 @@ def test_gravity_compensation_applies_offset_bias_and_directional_friction() -> 
         (0.61, -0.32, 1.8, -0.6, 3.0, -0.9)
     )
     assert breakdown.requested_torque_nm == breakdown.gravity_torque_nm
+
+
+def test_same_tick_lock_composition_reuses_calibrated_gravity_without_cross_tick_cache() -> None:
+    class Model:
+        def __init__(self):
+            self.calls = []
+
+        def arm_generalized_gravity(self, qpos):
+            self.calls.append(tuple(qpos))
+            return tuple((i + 1) * math.sin(q) for i, q in enumerate(qpos))
+
+    kwargs = {
+        "gravity_scale": .8,
+        "gravity_joint_scales": (1., .96, 1., .9, 1., 1.),
+        "gravity_joint_offsets_rad": (.01, -.02, .03, -.04, .05, -.06),
+        "gravity_joint_bias_nm": (0., -.22, -.11, -.08, 0., 0.),
+        "gravity_coulomb_friction_nm": (.01, .02, .03, .04, .05, .06),
+        "gravity_coulomb_velocity_threshold_rad_s": .02,
+    }
+    profile = probe.build_software_profile(
+        kp=2., kd=.3, torque_limits_nm=(20.,) * 6,
+        torque_rise_time_sec=.5, velocity_limit_rad_s=5.,
+        overlay_limits_nm=(.2,) * 6,
+    )
+    lock_profile = probe.build_startup_lock_profile(
+        mit_kp_nm_per_rad=(50.,) * 6, mit_kd_nm_s_per_rad=(4.,) * 6,
+        torque_limits_nm=(20.,) * 6, torque_rise_time_sec=.5,
+        velocity_limit_rad_s=5.,
+    )
+    optimized_model, baseline_model = Model(), Model()
+    for i in range(3):
+        q = tuple(.1 * (j + i + 1) for j in range(6))
+        v = (.03, -.03, .01, -.01, 0., .02)
+        reference = probe.build_reference(sequence=i, timestamp_sec=1.+i, qpos_rad=(.2,) * 6,
+                                          joint_torque_overlay_nm=(.1,) * 6)
+        lock_ref = probe.build_reference(sequence=i, timestamp_sec=1.+i, qpos_rad=(.1,) * 6)
+        active = probe.compute_software_torque_breakdown(
+            optimized_model, reference=reference, measured_qpos_rad=q,
+            measured_qvel_rad_s=v, profile=profile, **kwargs,
+        )
+        reused_lock = probe.compute_b601_mit_torque(
+            lock_ref, lock_profile, measured_qpos_rad=q,
+            measured_qvel_rad_s=v, gravity_torque_nm=active.gravity_torque_nm,
+        )
+        baseline_lock = probe.compute_software_torque_breakdown(
+            baseline_model, reference=lock_ref, measured_qpos_rad=q,
+            measured_qvel_rad_s=v, profile=lock_profile, **kwargs,
+        )
+        assert reused_lock == baseline_lock
+        assert len(optimized_model.calls) == i + 1
+        assert optimized_model.calls[-1] == pytest.approx(tuple(a+b for a,b in zip(q,kwargs["gravity_joint_offsets_rad"])))
+        for fraction in (0., .25, .5, 1.):
+            assert probe.blend_startup_lock_torque_breakdown(
+                reused_lock, active, gravity_fraction=1., handoff_fraction=fraction,
+            ) == probe.blend_startup_lock_torque_breakdown(
+                baseline_lock, active, gravity_fraction=1., handoff_fraction=fraction,
+            )
 
 
 def test_driver_local_lock_gain_blend_has_clean_active_endpoints() -> None:
@@ -3244,13 +3979,17 @@ def test_protective_hold_feedback_rejects_motion_above_hold_monitor_limit() -> N
         )
 
 
+@pytest.mark.parametrize("display_enabled", [False, True])
 def test_latched_protective_hold_references_current_pose_after_manual_drag(
     monkeypatch: pytest.MonkeyPatch,
+    display_enabled: bool,
 ) -> None:
     q0 = (0.1, 0.7, 1.1, 0.0, -0.1, 0.2)
     q1 = (0.1, 0.71, 1.1, 0.0, -0.1, 0.2)
     command_qrefs: list[tuple[float, ...]] = []
     measured_qvels: list[tuple[float, ...]] = []
+    displayed = []
+    display = SimpleNamespace(observe=lambda q, **kwargs: displayed.append((q, kwargs)))
 
     def fake_send_hold(
         _backend: object,
@@ -3316,6 +4055,7 @@ def test_latched_protective_hold_references_current_pose_after_manual_drag(
         max_iterations=3,
         operator_interrupt=True,
         monitor_velocity_rad_s=1.0,
+        joint_angle_display=display if display_enabled else None,
     )
 
     hold_count, _latest_tau, _first, non_hold, full, errors = result
@@ -3326,6 +4066,8 @@ def test_latched_protective_hold_references_current_pose_after_manual_drag(
     assert non_hold is None
     assert full is None
     assert errors == []
+    assert [q for q, _ in displayed] == (command_qrefs[1:] if display_enabled else [])
+    assert all(metadata["phase"] == "PROTECTIVE_HOLD" for _, metadata in displayed)
 
 
 def test_latched_protective_hold_uses_injected_control_feedback_reader(
@@ -3555,8 +4297,13 @@ def test_latched_fault_hold_uses_explicit_protective_hold_profile(
     assert errors == []
 
 
+@pytest.mark.parametrize("safety_damping", [None, (0.4, 0.6, 0.4, 0.6, 0.2, 0.1)])
+@pytest.mark.parametrize("frozen_kd", [(0.0,) * 6, (0.11, 0.12, 0.13, 0.14, 0.15, 0.16)])
 def test_gravity_debug_hold_uses_frozen_profile_over_mutable_arguments(
     monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    safety_damping: tuple[float, ...] | None,
+    frozen_kd: tuple[float, ...],
 ) -> None:
     q = (0.1, 0.7, 1.1, 0.0, -0.1, 0.2)
     frozen = probe.B601GravityCompensationDebugProfile.capture(
@@ -3566,7 +4313,7 @@ def test_gravity_debug_hold_uses_frozen_profile_over_mutable_arguments(
         gravity_joint_bias_nm=(0.01, -0.02, -0.03, -0.04, 0.05, 0.06),
         gravity_coulomb_friction_nm=(0.01, 0.02, 0.03, 0.04, 0.05, 0.06),
         gravity_coulomb_velocity_threshold_rad_s=0.07,
-        driver_kd_nm_s_per_rad=(0.11, 0.12, 0.13, 0.14, 0.15, 0.16),
+        driver_kd_nm_s_per_rad=frozen_kd,
     )
     observed: dict[str, object] = {}
 
@@ -3606,6 +4353,7 @@ def test_gravity_debug_hold_uses_frozen_profile_over_mutable_arguments(
         gravity_coulomb_velocity_threshold_rad_s=0.0,
         driver_kd_nm_s_per_rad=(0.0,) * 6,
         gravity_debug_profile=frozen,
+        protective_driver_kd_nm_s_per_rad=safety_damping,
         previous_tau=(0.0,) * 6,
         torque_limits_nm=(1.0,) * 6,
         rate_hz=20.0,
@@ -3626,7 +4374,59 @@ def test_gravity_debug_hold_uses_frozen_profile_over_mutable_arguments(
     assert observed["gravity_coulomb_velocity_threshold_rad_s"] == pytest.approx(
         0.07
     )
-    assert observed["driver_kd_nm_s_per_rad"] == frozen.driver_kd_nm_s_per_rad
+    expected_kd = frozen.driver_kd_nm_s_per_rad if safety_damping is None else safety_damping
+    assert observed["driver_kd_nm_s_per_rad"] == expected_kd
+    terminal = capsys.readouterr().out
+    assert ("damping are ACTIVE" in terminal) == any(expected_kd)
+    if not any(expected_kd):
+        assert "damping is NOT configured" in terminal
+
+
+def test_motion_fault_handoff_sends_damping_with_frozen_zero_debug_baseline() -> None:
+    # Recorded J2 fault state; replay only the command boundary, not the plant.
+    q = (0.050239369, 0.030297620, 0.313324571, 0.019174760, -0.065579928, -0.005368933)
+    v = (0.0, 0.149171745, 0.0, -0.038226257, 0.0, 0.0)
+    raw_gravity = (0.0, 2.425241056, 5.877818163, 1.843219289, 0.016251496, -0.000782174)
+    frozen = probe.B601GravityCompensationDebugProfile.capture(
+        gravity_scale=1.0, gravity_joint_scales=(1.0, .96, 1.0, 1.0, 1.0, 1.0),
+        gravity_joint_offsets_rad=(0.0,) * 6,
+        gravity_joint_bias_nm=(0.0, -.22, -.11, -.08, 0.0, 0.0),
+        gravity_coulomb_friction_nm=(0.0,) * 6,
+        gravity_coulomb_velocity_threshold_rad_s=.02,
+        driver_kd_nm_s_per_rad=(0.0,) * 6,
+    )
+    safety_kd = (.4, .6, .4, .6, .2, .1)
+    limits = (14.4, 14.4, 14.4, 2.4, 2.4, 2.4)
+    gravity = tuple(g*s+b for g,s,b in zip(
+        raw_gravity, frozen.gravity_joint_scales, frozen.gravity_joint_bias_nm, strict=True,
+    ))
+    profile = probe.build_software_profile(
+        kp=0.0, kd=0.0, torque_limits_nm=limits,
+        torque_rise_time_sec=.5, velocity_limit_rad_s=5.0,
+    )
+    hold = probe.build_protective_hold_profile(
+        profile, driver_kd_nm_s_per_rad=safety_kd, preserve_zero_driver_damping=True,
+    )
+    backend = _FaultHoldBackend(cached_receipts=(_fault_hold_command_receipt(accepted=True),))
+    result = probe._run_latched_fault_hold(
+        backend, SimpleNamespace(arm_generalized_gravity=lambda _q: raw_gravity),
+        qpos_rad=q, qvel_rad_s=v, observed_age_sec=.01,
+        fault_qpos_rad=q, fault_qvel_rad_s=v, position_limits_rad=_fault_hold_limits(),
+        max_age_sec=.15, max_velocity_rad_s=.02, max_rebase_rad=.05,
+        profile=profile, hold_profile=hold, gravity_scale=1.0,
+        previous_tau=gravity, torque_limits_nm=limits, rate_hz=100.,
+        stop={"requested": False, "full_disable_requested": False},
+        fault_entry=True, fault_entry_max_velocity_rad_s=5.0, max_iterations=1,
+        gravity_debug_profile=frozen, protective_driver_kd_nm_s_per_rad=safety_kd,
+    )
+    assert result[0] == 1 and result[-1] == []
+    sent = backend.cached_dispatches[0]
+    assert sent["kp"] == (0.0,) * 6
+    assert sent["kd"] == safety_kd
+    assert sent["tau_nm"] == pytest.approx(gravity)
+    assert sent["reference"].joint_torque_overlay_nm == (0.0,) * 6
+    assert sent["reference"].qvel_rad_s == (0.0,) * 6
+    assert not backend.safe_stop_names
 
 
 def test_fault_entry_uses_current_snapshot_when_last_safe_is_stale(
@@ -3723,14 +4523,26 @@ def test_fault_entry_uses_current_snapshot_when_last_safe_is_stale(
     assert errors == []
 
 
+@pytest.mark.parametrize("debug_motion", [False, True])
 def test_latched_fault_hold_uses_cached_gravity_on_invalid_feedback(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
+    debug_motion: bool,
 ) -> None:
     q = (0.1, 0.7, 1.1, 0.0, -0.1, 0.2)
     gravity = (0.0, 0.8, 0.4, 0.1, 0.0, 0.0)
     command_qrefs: list[tuple[float, ...]] = []
     telemetry: dict[str, object] = {}
+    trace_stream = io.StringIO()
+    debug_trace = probe._DynamicsTrace(trace_stream)
+    safety_kd = (0.4, 0.6, 0.4, 0.6, 0.2, 0.1) if debug_motion else (1.0,) * 6
+    frozen = probe.B601GravityCompensationDebugProfile.capture(
+        gravity_scale=1.0, gravity_joint_scales=(1.0,) * 6,
+        gravity_joint_offsets_rad=(0.0,) * 6, gravity_joint_bias_nm=(0.0,) * 6,
+        gravity_coulomb_friction_nm=(0.0,) * 6,
+        gravity_coulomb_velocity_threshold_rad_s=0.02,
+        driver_kd_nm_s_per_rad=(0.0,) * 6,
+    ) if debug_motion else None
 
     def fake_send_hold(
         _backend: object,
@@ -3743,6 +4555,7 @@ def test_latched_fault_hold_uses_cached_gravity_on_invalid_feedback(
     ) -> tuple[probe.B601CommandReceipt, tuple[float, ...], tuple[float, ...]]:
         assert measured_qpos_rad == q
         assert measured_qvel_rad_s == (0.0,) * 6
+        assert _kwargs["driver_kd_nm_s_per_rad"] == safety_kd
         command_qrefs.append(qpos_rad)
         return _fault_hold_command_receipt(accepted=True), gravity, gravity
 
@@ -3779,8 +4592,11 @@ def test_latched_fault_hold_uses_cached_gravity_on_invalid_feedback(
         stop={"requested": True, "full_disable_requested": False},
         max_iterations=2,
         driver_kd_nm_s_per_rad=(1.0,) * 6,
+        gravity_debug_profile=frozen,
+        protective_driver_kd_nm_s_per_rad=safety_kd if debug_motion else None,
         cached_gravity_tau_nm=gravity,
         degraded_telemetry=telemetry,
+        debug_trace=debug_trace,
     )
 
     hold_count, _latest_tau, first_receipt, non_hold_receipt, full_receipt, errors = result
@@ -3788,7 +4604,7 @@ def test_latched_fault_hold_uses_cached_gravity_on_invalid_feedback(
     assert command_qrefs == [q]
     assert len(backend.cached_dispatches) == 1
     assert backend.cached_dispatches[0]["kp"] == (0.0,) * 6
-    assert backend.cached_dispatches[0]["kd"] == (1.0,) * 6
+    assert backend.cached_dispatches[0]["kd"] == safety_kd
     assert backend.cached_dispatches[0]["tau_nm"] == gravity
     assert backend.cached_dispatches[0]["joint_names"] == probe._ALL_JOINTS
     assert first_receipt is not None and first_receipt.accepted
@@ -3804,6 +4620,1160 @@ def test_latched_fault_hold_uses_cached_gravity_on_invalid_feedback(
     assert "!!! PROTECTIVE HOLD DEGRADED !!!" in terminal
     assert "DAMPING: motor-local damping remains ACTIVE." in terminal
     assert "REASON: fault hold: protective hold feedback is not complete" in terminal
+    trace = [json.loads(line) for line in trace_stream.getvalue().splitlines()]
+    assert trace[0]["kind"] == "protective_hold_entry"
+    assert trace[-1]["kind"] == "protective_hold_cycle"
+    assert trace[-1]["command_source"] == "cached_gravity"
+    assert trace[-1]["cycle_error"] is not None
+
+
+def test_dynamics_trace_writer_failure_is_diagnostic_only() -> None:
+    class BrokenStream:
+        def write(self, _text: str) -> None:
+            raise OSError("disk full")
+
+    trace = probe._DynamicsTrace(BrokenStream())
+    trace.record("active_dispatch", qpos_rad=(0.0,) * 6)
+    trace.record("active_dispatch", qpos_rad=(0.0,) * 6)
+
+    assert trace.sample_count == 0
+    assert trace.error == "OSError: disk full"
+    assert trace.last_record_timing["completed"] is False
+
+
+def test_sample_archive_preserves_completed_fields_and_builtin_types() -> None:
+    archive = probe._ProbeSampleArchive()
+    first = {"sequence": 1, "qpos_rad": (0.0,) * 6, "nested": {"values": [1, None, True]}}
+    archive.append(first)
+    first["control_cycle_timing"] = {"total_wall_sec": 0.01}
+    second = {"sequence": 2, "qpos_rad": (0.1,) * 6}
+    archive.append(second)
+
+    assert archive[-1] is second
+    assert archive[0] == first
+    assert isinstance(archive[0]["qpos_rad"], tuple)
+    assert isinstance(archive[0]["nested"]["values"], list)
+    assert isinstance(archive._completed[0], bytes)
+    assert archive.materialize() == [first, second]
+    assert archive.diagnostics()["packed_sample_count"] == 1
+    assert archive.diagnostics()["packing_fallback_count"] == 0
+
+
+def test_workspace_summary_decodes_once_and_keeps_original_metrics(monkeypatch):
+    archive = probe._ProbeSampleArchive()
+    originals = [{"sequence": n, "elapsed_sec": n*.025,
+        "qpos_rad": (n*.001,)*6, "startup_state": "ACTIVE" if n > 1 else "HANDOFF",
+        "requested_tau_nm": (n*.1,)*6, "conditioned_tau_nm": (n*.09,)*6,
+        "boundary_normalized_joint_names": ("joint2",) if n%2 else (),
+        "torque_console": {"large_nested_history": list(range(100))}}
+        for n in range(10)]
+    for sample in originals:
+        archive.append(sample)
+    loads = probe.pickle.loads
+    decoded = []
+
+    def count(blob):
+        decoded.append(len(blob))
+        return loads(blob)
+
+    monkeypatch.setattr(probe.pickle, "loads", count)
+    compact = probe._workspace_analysis_samples(archive)
+    assert len(decoded) == len(originals)-1
+    assert all("torque_console" not in sample for sample in compact)
+    assert probe.summarize_torque_conditioning(compact, absolute_limits_nm=(.5,)*6) == probe.summarize_torque_conditioning(originals, absolute_limits_nm=(.5,)*6)
+    startup = {"pre_enable_qpos_rad": (0.,)*6, "lock_reference_qpos_rad": (0.,)*6,
+        "pre_control_observations": []}
+    assert probe.summarize_startup_diagnostics(**startup, samples=compact) == probe.summarize_startup_diagnostics(**startup, samples=originals)
+    assert sum(bool(s.get("boundary_normalized_joint_names")) for s in compact) == 5
+    assert len(decoded) == len(originals)-1
+    assert archive.materialize() == originals
+
+
+def test_automatic_rejection_record_is_flushed_once_with_current_cycle_timing() -> None:
+    from collections import deque
+
+    queued = deque([{
+        "kind": "automatic_calibration_dispatch_rejected",
+        "recorded_monotonic_sec": 12.041,
+        "reason": "dispatch_completion_deadline_exceeded",
+        "native_receipt": {"accepted": True, "sent_joint_names": list(probe._ALL_JOINTS)},
+    }])
+
+    def drain():
+        result = list(queued)
+        queued.clear()
+        return result
+
+    stream = io.StringIO()
+    trace = probe._DynamicsTrace(stream)
+    timing = probe._ProbeStageTiming()
+    timing.mark("six_joint_dispatch")
+    controller = SimpleNamespace(drain_records=drain)
+    probe._flush_automatic_calibration_records(controller, trace, timing)
+    probe._flush_automatic_calibration_records(controller, trace, timing)
+    records = [json.loads(line) for line in stream.getvalue().splitlines()]
+    assert len(records) == 1
+    assert records[0]["rejection_observed_at_sec"] == 12.041
+    assert records[0]["native_receipt"]["accepted"] is True
+    assert "six_joint_dispatch" in records[0]["cycle_timing"]["stages"]
+    assert "dispatch_rejection_capture" in records[0]["cycle_timing"]["stages"]
+
+
+@pytest.mark.parametrize("timestamp", [None, True, "12.0", float("nan"), float("inf")])
+def test_automatic_records_reject_missing_or_invalid_event_time_without_fabricating_one(timestamp):
+    controller = SimpleNamespace(drain_records=lambda: [{
+        "kind": "automatic_calibration_cycle_transition",
+        **({} if timestamp is None else {"recorded_monotonic_sec": timestamp}),
+    }])
+    stream = io.StringIO()
+    with pytest.raises(probe.LowGainProbeError, match="(requires|has invalid) recorded_monotonic_sec"):
+        probe._flush_automatic_calibration_records(controller, probe._DynamicsTrace(stream))
+    assert stream.getvalue() == ""
+
+
+def test_automatic_pre_dispatch_snapshot_preserves_explicit_null_receipt_time():
+    controller = SimpleNamespace(drain_records=lambda: [{
+        "kind": "automatic_calibration_started", "recorded_monotonic_sec": None,
+    }])
+    stream = io.StringIO()
+    probe._flush_automatic_calibration_records(controller, probe._DynamicsTrace(stream))
+    assert json.loads(stream.getvalue())["acquisition_completed_at_sec"] is None
+
+
+def test_workspace_terminal_notice_is_immediate_and_emitted_once(monkeypatch):
+    notices = []
+    monkeypatch.setattr(probe, "_operator_notice", notices.append)
+    queued = [{"kind": "workspace_calibration_transition", "recorded_monotonic_sec": 40.,
+        "phase": "failed", "reason": "leg_timeout", "task_index": 3}]
+
+    def drain():
+        records = queued[:]
+        queued.clear()
+        return records
+
+    controller = SimpleNamespace(drain_records=drain)
+    stream = io.StringIO()
+    probe._flush_automatic_calibration_records(controller, probe._DynamicsTrace(stream))
+    probe._flush_automatic_calibration_records(controller, probe._DynamicsTrace(stream))
+    assert len(notices) == 1
+    assert "leg_timeout" in notices[0]
+    assert "no automatic retry or return" in notices[0]
+    assert len(stream.getvalue().splitlines()) == 1
+
+
+def test_workspace_unsent_withdrawal_record_does_not_fabricate_completion():
+    records = [{"kind": "workspace_dispatch_withdrawn", "recorded_monotonic_sec": 40.,
+        "command_sent": False, "withdrawal_receipt_confirmed": False, "reason": "gui_permit_expired"}]
+    controller = SimpleNamespace(drain_records=lambda: records)
+    stream = io.StringIO()
+    probe._flush_automatic_calibration_records(controller, probe._DynamicsTrace(stream))
+    row = json.loads(stream.getvalue())
+    assert row["withdrawal_observed_at_sec"] == 40.
+    assert "acquisition_completed_at_sec" not in row
+    assert row["command_sent"] is row["withdrawal_receipt_confirmed"] is False
+
+
+@pytest.mark.parametrize("admitted", [None, False])
+def test_automatic_owner_honors_dispatch_veto_before_sending(admitted):
+    tree = ast.parse(inspect.getsource(probe.run_probe)).body[0]
+    guard = next(n for n in ast.walk(tree) if isinstance(n, ast.If)
+        and any(isinstance(s, ast.Assign) and isinstance(s.value, ast.Call)
+            and isinstance(s.value.func, ast.Attribute) and s.value.func.attr == "validate_dispatch_start"
+            for s in n.body))
+    sent, notices = [], []
+    loop = ast.For(target=ast.Name(id="unused", ctx=ast.Store()), iter=ast.List(elts=[ast.Constant(0)], ctx=ast.Load()),
+        body=[guard, ast.Expr(value=ast.Call(func=ast.Name(id="send", ctx=ast.Load()), args=[], keywords=[]))], orelse=[])
+    module = ast.fix_missing_locations(ast.Module(body=[loop], type_ignores=[]))
+    namespace = {"args": SimpleNamespace(torque_console_auto_calibration_profile="configured"),
+        "torque_console_audit": {}, "state": SimpleNamespace(sequence=10, receive_timestamp_sec=1.),
+        "torque_console": SimpleNamespace(validate_dispatch_start=lambda **kw: admitted,
+            status=lambda: {"reason": "gui_permit_expired"}),
+        "send": lambda: sent.append(True), "_operator_notice": notices.append}
+    exec(compile(module, "<owner-admission>", "exec"), namespace)  # noqa: S102 - execute only the local owner AST
+    assert sent == ([] if admitted is False else [True])
+    if admitted is False:
+        assert namespace["stop_reason"] == "gui_permit_expired"
+
+
+@pytest.mark.parametrize("cleanup,entries,reason", [(True, 0, "gui_permit_expired"),
+    (False, 0, "gui_permit_expired"), (True, 1, "gui_permit_expired"), (True, 0, "unknown")])
+def test_gui_expiry_classification_never_promotes_cleanup_or_hold_faults(cleanup, entries, reason):
+    execution = probe._automatic_execution_status(reason, cleanup, 10)
+    acquisition = {"state": "cancelled", "reason": reason,
+        "outcome": {"severity": "warning", "scope": "acquisition"}}
+    payload = {"status": "FAIL", "execution_status": execution, "stop_reason": reason,
+        "acceptance_status": "FAIL", "protective_hold": {"degraded": {"entry_count": entries}}}
+    code = probe._finalize_automatic_result(payload, acquisition)
+    expected = cleanup and entries == 0 and reason == "gui_permit_expired"
+    assert code == (0 if expected else 1)
+    assert payload["acceptance_status"] == "FAIL"
+    assert payload["execution_status"] == ("STOPPED_BY_AUTHORITY" if expected else "FAILED")
+
+
+def test_automatic_dispatch_admission_and_fault_flush_are_wired_before_send_and_hold():
+    tree = ast.parse(inspect.getsource(probe.run_probe)).body[0]
+    calls = [n for n in ast.walk(tree) if isinstance(n, ast.Call)]
+    admission = next(n for n in calls if isinstance(n.func, ast.Attribute)
+                     and n.func.attr == "validate_dispatch_start")
+    guards = [n for n in ast.walk(tree) if isinstance(n, ast.If)
+              and n.lineno < admission.lineno <= n.end_lineno]
+    assert any("torque_console_audit is not None" in ast.unparse(n.test) for n in guards)
+    sends = [n for n in calls if isinstance(n.func, ast.Attribute)
+             and isinstance(n.func.value, ast.Name) and n.func.value.id == "backend"
+             and n.func.attr == "send_mit" and n.lineno > admission.lineno]
+    assert sends and min(n.lineno for n in sends) > admission.lineno
+    cleanup = next(n for n in ast.walk(tree) if isinstance(n, ast.Try)
+                   and any(isinstance(c, ast.Call) and isinstance(c.func, ast.Attribute)
+                           and c.func.attr == "owner_stopped"
+                           for statement in n.finalbody for c in ast.walk(statement)))
+    cleanup_calls = [c for statement in cleanup.finalbody for c in ast.walk(statement)
+                     if isinstance(c, ast.Call)]
+    flush = next(c for c in cleanup_calls if isinstance(c.func, ast.Name)
+                 and c.func.id == "_flush_automatic_calibration_records")
+    hold = next(c for c in cleanup_calls if isinstance(c.func, ast.Name)
+                and c.func.id == "_run_latched_fault_hold")
+    assert flush.lineno < hold.lineno
+
+
+def test_probe_bulk_sample_evaluation_and_materialization_follow_cleanup() -> None:
+    tree = ast.parse(inspect.getsource(probe.run_probe)).body[0]
+    cleanup_blocks = [node for node in tree.body if isinstance(node, ast.Try) and any(
+        isinstance(call, ast.Call) and isinstance(call.func, ast.Name)
+        and call.func.id == "_release_owner_transport"
+        for statement in node.finalbody for call in ast.walk(statement)
+    )]
+    assert len(cleanup_blocks) == 1
+    cold_evaluators = {"evaluate_slow_step_response", "evaluate_assist_commissioning_response",
+                       "evaluate_cartesian_assist_commissioning_response", "_workspace_analysis_samples"}
+    bulk_calls = [node for node in ast.walk(tree) if isinstance(node, ast.Call) and (
+        isinstance(node.func, ast.Name) and node.func.id in cold_evaluators
+        or isinstance(node.func, ast.Attribute) and node.func.attr == "materialize"
+    )]
+    assert len(bulk_calls) == 5
+    assert all(node.lineno > cleanup_blocks[0].end_lineno for node in bulk_calls)
+    finish_calls = [node for node in ast.walk(tree) if isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "finish_control_observation"]
+    assert len(finish_calls) == 1
+    assert cleanup_blocks[0].end_lineno < finish_calls[0].lineno < min(node.lineno for node in bulk_calls)
+    restores = [node for node in bulk_calls if isinstance(node.func, ast.Attribute)]
+    assert len(restores) == 1
+    checkpoints = [node for node in ast.walk(tree) if isinstance(node, ast.Call)
+                   and isinstance(node.func, ast.Name) and node.func.id == "post_cleanup_checkpoint"]
+    assert len(checkpoints) == 1
+    assert finish_calls[0].lineno < checkpoints[0].lineno < min(node.lineno for node in bulk_calls)
+    # Cold evaluators share full or compact analysis, never re-decode the
+    # original archive. Lossless export still owns result_samples separately.
+    assert all(keyword.value.id == "analysis_samples"
+               for node in bulk_calls if isinstance(node.func, ast.Name)
+               for keyword in node.keywords if keyword.arg == "samples")
+
+
+def test_sample_archive_preserves_existing_response_evaluation() -> None:
+    samples = _slow_step_samples((0.0, 0.005, 0.01, 0.015, 0.019, 0.02))
+    archive = probe._ProbeSampleArchive()
+    for sample in samples:
+        archive.append(sample)
+    args = {"mode": "slow-step", "target_joint": "joint6", "step_rad": 0.02,
+            "step_direction": 1, "initial_qpos_rad": (0.0,) * 6,
+            "active_joint_names": probe.resolve_active_joint_names()}
+
+    assert probe.evaluate_slow_step_response(samples=archive, **args) == probe.evaluate_slow_step_response(samples=samples, **args)
+
+
+def test_sample_archive_does_not_alias_frozen_frames_to_decoded_consumers() -> None:
+    archive = probe._ProbeSampleArchive()
+    archive.append({"sequence": 1, "nested": {"values": [1, 2]}})
+    archive.append({"sequence": 2})
+    restored = archive[0]
+    restored["nested"]["values"].append(3)
+
+    assert archive[0]["nested"]["values"] == [1, 2]
+    assert [sample["sequence"] for sample in archive] == [1, 2]
+
+
+@pytest.mark.parametrize("index", [0, -1, 3, -4])
+def test_empty_sample_archive_rejects_indexes(index: int) -> None:
+    archive = probe._ProbeSampleArchive()
+    assert archive.materialize() == []
+    assert archive.diagnostics()["sample_count"] == 0
+    with pytest.raises(IndexError):
+        archive[index]
+
+
+def test_sample_archive_supports_slices_for_existing_evaluators() -> None:
+    archive = probe._ProbeSampleArchive()
+    for sequence in range(4):
+        archive.append({"sequence": sequence})
+
+    assert archive[1:3] == [{"sequence": 1}, {"sequence": 2}]
+    assert archive[::-1] == [{"sequence": sequence} for sequence in reversed(range(4))]
+    with pytest.raises(IndexError):
+        archive[4]
+    with pytest.raises(IndexError):
+        archive[-5]
+
+
+def test_sample_archive_preserves_numpy_buffer_types() -> None:
+    archive = probe._ProbeSampleArchive()
+    first = {"sequence": 1, "diagnostic_array": np.asarray([0.1, 0.2])}
+    archive.append(first)
+    archive.append({"sequence": 2})
+    restored = archive[0]
+
+    assert isinstance(restored["diagnostic_array"], np.ndarray)
+    np.testing.assert_array_equal(restored["diagnostic_array"], first["diagnostic_array"])
+    assert archive.diagnostics()["packing_fallback_count"] == 0
+
+
+def test_sample_archive_retains_a_diagnostic_that_rejects_pickling() -> None:
+    class Diagnostic:
+        def __reduce__(self):
+            raise ValueError("diagnostic cannot be packed")
+
+        def __iter__(self):
+            return iter([1, 2])
+
+    archive = probe._ProbeSampleArchive()
+    first = {"sequence": 1, "diagnostic": Diagnostic()}
+    archive.append(first)
+    archive.append({"sequence": 2})
+
+    assert archive[0] is first
+    assert archive.diagnostics()["first_packing_error"] == "ValueError: diagnostic cannot be packed"
+    assert json.loads(json.dumps(archive.materialize(), default=list))[0]["diagnostic"] == [1, 2]
+
+
+def test_sample_archive_retains_unsupported_diagnostic_values_without_losing_frames() -> None:
+    archive = probe._ProbeSampleArchive()
+    first = {"sequence": 1, "diagnostic_values": (value for value in [0.1, 0.2])}
+    archive.append(first)
+    archive.append({"sequence": 2})
+    archive.append({"sequence": 3})
+
+    assert archive[0] is first
+    assert [sample["sequence"] for sample in archive] == [1, 2, 3]
+    audit = archive.diagnostics()
+    assert audit["sample_count"] == 3
+    assert audit["packed_sample_count"] == 1
+    assert audit["packing_fallback_count"] == 1
+    assert audit["first_packing_error"]
+    assert json.loads(json.dumps(archive.materialize(), default=list))[0]["diagnostic_values"] == [0.1, 0.2]
+
+
+def test_probe_stage_timing_separates_wall_and_owner_cpu_and_snapshots_do_not_alias(monkeypatch):
+    wall, cpu = iter((10., 10.03, 10.08)), iter((2., 2.002, 2.004))
+    monkeypatch.setattr(probe.time, "perf_counter", lambda: next(wall))
+    monkeypatch.setattr(probe.time, "thread_time", lambda: next(cpu))
+    timer = probe._ProbeStageTiming()
+    timer.mark("feedback_read_and_admission")
+    first = timer.snapshot()
+    timer.mark("gravity_and_active_torque")
+    second = timer.snapshot()
+    assert first["stages"]["feedback_read_and_admission"]["wall_sec"] == pytest.approx(.03)
+    assert first["stages"]["feedback_read_and_admission"]["thread_cpu_sec"] == pytest.approx(.002)
+    assert "gravity_and_active_torque" not in first["stages"]
+    assert second["total_wall_sec"] == pytest.approx(.08)
+    assert second["total_thread_cpu_sec"] == pytest.approx(.004)
+    assert first["stages"]["feedback_read_and_admission"]["started_perf_counter_sec"] == 10.
+    assert first["stages"]["feedback_read_and_admission"]["completed_perf_counter_sec"] == 10.03
+
+
+def test_feedback_substage_timing_sums_disjoint_intervals_without_hiding_retry_counts(monkeypatch):
+    wall, cpu = iter((10., 10.03, 10.04, 10.09)), iter((2., 2.002, 2.003, 2.007))
+    monkeypatch.setattr(probe.time, "perf_counter", lambda: next(wall))
+    monkeypatch.setattr(probe.time, "thread_time", lambda: next(cpu))
+    diagnostics = probe._ProbeFeedbackTiming()
+    diagnostics.mark("backend_poll")
+    before = diagnostics.snapshot()
+    diagnostics.mark("retry_wait")
+    diagnostics.mark("backend_poll")
+    after = diagnostics.snapshot()
+    poll = after["stages"]["backend_poll"]
+    assert poll["wall_sec"] == pytest.approx(.08)
+    assert poll["thread_cpu_sec"] == pytest.approx(.006)
+    assert poll["max_interval_wall_sec"] == pytest.approx(.05)
+    assert poll["interval_count"] == 2
+    assert after["total_wall_sec"] == pytest.approx(.09)
+    assert before["stages"]["backend_poll"]["interval_count"] == 1
+    assert "not_contiguous" in after["interval_semantics"]
+
+
+def test_feedback_rejection_evidence_is_bounded_and_snapshot_does_not_change():
+    diagnostics = probe._ProbeFeedbackTiming()
+    diagnostics.reject("host_freshness_admission", "joint1 latest status frame is communication type 2, not Type-24")
+    before = diagnostics.snapshot()
+    for _ in range(1000):
+        diagnostics.reject("backend_poll", "x"*2000)
+    after = diagnostics.snapshot()
+    assert before["last_rejection"]["ordinal"] == 1
+    assert after["first_rejection"] == before["first_rejection"]
+    assert after["rejection_counts"] == {"host_freshness_admission": 1, "backend_poll": 1000}
+    assert after["last_rejection"]["ordinal"] == 1001
+    assert len(after["last_rejection"]["reason"]) == 400
+    assert not any(isinstance(v, BaseException) for v in after["last_rejection"].values())
+
+
+def test_feedback_rejection_distinguishes_backend_retry_from_gate_retry(monkeypatch):
+    now, calls = [10.], []
+    frames = iter((None, _timed_feedback_state(1), _timed_feedback_state(2)))
+
+    def poll(**kwargs):
+        calls.append(kwargs)
+        state = next(frames)
+        if state is None:
+            raise probe.LowGainProbeError("declared transient backend rejection")
+        return state
+
+    monkeypatch.setattr(probe.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(probe.time, "sleep", lambda delay: now.__setitem__(0, now[0]+delay))
+    diagnostics = probe._ProbeFeedbackTiming()
+    gate = probe.B601ActiveReportControlGate(probe._ALL_JOINTS, maximum_receive_age_sec=.10)
+    state = probe._read_admitted_control_feedback(SimpleNamespace(poll_feedback=poll), gate, .01, diagnostics)
+    assert state.sequence == 2 and len(calls) == 3
+    evidence = diagnostics.snapshot()
+    assert evidence["rejection_counts"] == {"backend_poll": 1, "baseline_not_advanced": 1}
+    assert evidence["first_rejection"]["reason"] == "declared transient backend rejection"
+    assert evidence["last_rejection"]["stage"] == "baseline_not_advanced"
+
+
+def test_gc_observer_bounds_events_distinguishes_threads_and_does_not_change_gc(monkeypatch):
+    settings = probe.gc.isenabled(), probe.gc.get_threshold()
+    observer = probe._ProbeGCObserver(max_pending_events=2)
+    owner_thread = probe.threading.get_ident()
+    thread = [owner_thread]
+    monkeypatch.setattr(probe.threading, "get_ident", lambda: thread[0])
+    wall, cpu = iter((1., 1.02, 2., 2.03, 3., 3.04)), iter((0., .01, 1., 1.005, 2., 2.02))
+    monkeypatch.setattr(probe.time, "perf_counter", lambda: next(wall))
+    monkeypatch.setattr(probe.time, "thread_time", lambda: next(cpu))
+    for generation in range(3):
+        thread[0] = owner_thread + 1 if generation == 1 else owner_thread
+        observer._observe("start", {"generation": generation})
+        observer._observe("stop", {"generation": generation, "collected": 0, "uncollectable": 0})
+    captured = observer.drain()
+    assert captured["completed_count"] == 3
+    assert captured["dropped_event_count"] == 1
+    assert len(captured["events"]) == captured["max_pending_events"] == 2
+    worker, owner = captured["events"]
+    assert worker["sequence"] == 2 and worker["generation"] == 1
+    assert worker["collector_is_owner_thread"] is False
+    assert worker["collector_thread_cpu_sec"] == pytest.approx(.005)
+    assert owner["collector_is_owner_thread"] is True
+    assert owner["wall_sec"] == pytest.approx(.04)
+    assert owner["started_perf_counter_sec"] == 3.
+    assert owner["completed_perf_counter_sec"] == 3.04
+    assert observer.drain()["events"] == ()
+    assert (probe.gc.isenabled(), probe.gc.get_threshold()) == settings
+
+
+def test_gc_observer_registration_preserves_foreign_callbacks_on_exception(monkeypatch):
+    foreign = lambda _phase, _info: None
+    callbacks = [foreign]
+    monkeypatch.setattr(probe.gc, "callbacks", callbacks)
+    settings = probe.gc.isenabled(), probe.gc.get_threshold()
+    observer = probe._ProbeGCObserver()
+    with pytest.raises(RuntimeError, match="trial error"), observer:
+        assert callbacks == [foreign, observer._callback]
+        raise RuntimeError("trial error")
+    assert callbacks == [foreign]
+    observer.close()
+    assert callbacks == [foreign]
+    assert (probe.gc.isenabled(), probe.gc.get_threshold()) == settings
+
+
+def test_gc_observer_does_not_report_loss_when_full_queue_is_drained_before_append():
+    from collections import deque
+
+    append_pending, resume_append = probe.threading.Event(), probe.threading.Event()
+    errors = []
+
+    class PausingDeque(deque):
+        def append(self, event):
+            if event[0] == 3:
+                append_pending.set()
+                if not resume_append.wait(2):
+                    raise RuntimeError("offline interleave did not resume")
+            super().append(event)
+
+    observer = probe._ProbeGCObserver(max_pending_events=2)
+    observer._events = PausingDeque(maxlen=2)
+
+    def complete_collection():
+        observer._observe("start", {"generation": 0})
+        observer._observe("stop", {"generation": 0, "collected": 0, "uncollectable": 0})
+
+    complete_collection()
+    complete_collection()
+
+    def third_collection():
+        try:
+            complete_collection()
+        except RuntimeError as exc:
+            errors.append(exc)
+
+    worker = probe.threading.Thread(target=third_collection)
+    worker.start()
+    try:
+        assert append_pending.wait(2)
+        first = observer.drain()
+    finally:
+        resume_append.set()
+        worker.join(2)
+    assert not worker.is_alive()
+    assert not errors
+    second = observer.drain()
+    delivered = [event["sequence"] for batch in (first, second) for event in batch["events"]]
+    assert delivered == [1, 2, 3]
+    assert first["dropped_event_count"] == second["dropped_event_count"] == 0
+
+
+def test_gc_event_is_deferred_to_next_trace_with_original_bounds_and_no_control_changes():
+    stream = io.StringIO()
+    settings = probe.gc.isenabled(), probe.gc.get_threshold()
+    with probe._ProbeGCObserver() as observer:
+        trace = probe._DynamicsTrace(stream, gc_observer=observer)
+        trace.record("active_dispatch", sequence=7, qpos_rad=(0.,) * 6)
+        probe.gc.collect(0)  # Offline test only; production never requests collection.
+        trace.record("active_dispatch", sequence=8, qpos_rad=(0.,) * 6)
+    rows = [json.loads(line) for line in stream.getvalue().splitlines()]
+    assert [row["sequence"] for row in rows] == [7, 8]
+    assert all(row["qpos_rad"] == [0.] * 6 for row in rows)
+    events = rows[1]["gc_observation"]["events"]
+    assert any(event["generation"] == 0 for event in events)
+    assert all(event["completed_perf_counter_sec"] >= event["started_perf_counter_sec"] for event in events)
+    assert (probe.gc.isenabled(), probe.gc.get_threshold()) == settings
+    assert observer._callback not in probe.gc.callbacks
+
+
+def test_gc_observation_ends_after_cleanup_before_bulk_result_collections():
+    settings = probe.gc.isenabled(), probe.gc.get_threshold()
+    stream = io.StringIO()
+    with probe._ProbeGCObserver(max_pending_events=2) as observer:
+        trace = probe._DynamicsTrace(stream, gc_observer=observer)
+        trace.record("active_dispatch", sequence=1)
+        probe.gc.collect(0)
+        trace.record("protective_hold_cycle", command_count=1)
+        probe.gc.collect(0)  # Cleanup work must still be observed.
+        trace.finish_control_observation(cleanup_errors=())
+        count_at_end = observer._completed
+        assert observer._callback not in probe.gc.callbacks
+        for _ in range(80):
+            probe.gc.collect(0)  # Offline result allocations must not overflow the online queue.
+        trace.finish_control_observation(cleanup_errors=("must not overwrite first boundary",))
+        final = observer.drain()
+    rows = [json.loads(line) for line in stream.getvalue().splitlines()]
+    assert [row["kind"] for row in rows] == [
+        "active_dispatch", "protective_hold_cycle", "control_observation_complete",
+    ]
+    assert rows[-1]["boundary"] == "after_control_cleanup_and_backend_close_attempt"
+    assert rows[-1]["cleanup_errors"] == []
+    assert "sample_materialization" in rows[-1]["excluded_phases"]
+    events = [event for row in rows for event in row["gc_observation"]["events"]]
+    assert len(events) == count_at_end == final["completed_count"]
+    assert [event["sequence"] for event in events] == list(range(1, count_at_end + 1))
+    assert final["dropped_event_count"] == 0
+    assert final["events"] == ()
+    assert (probe.gc.isenabled(), probe.gc.get_threshold()) == settings
+
+
+def test_broken_trace_still_ends_gc_observation_and_preserves_cleanup_failure():
+    class BrokenStream:
+        def write(self, _text):
+            raise OSError("disk full")
+
+    with probe._ProbeGCObserver() as observer:
+        trace = probe._DynamicsTrace(BrokenStream(), gc_observer=observer)
+        trace.record("active_dispatch", sequence=1)
+        probe.gc.collect(0)
+        trace.finish_control_observation(cleanup_errors=("close: synthetic failure",))
+        assert observer._callback not in probe.gc.callbacks
+        final = observer.drain()
+    assert trace.error == "OSError: disk full"
+    assert trace.gc_observation_end["cleanup_errors"] == ("close: synthetic failure",)
+    assert final["completed_count"] >= 1 and final["dropped_event_count"] == 0
+
+
+def _timed_feedback_state(sequence: int, *, age: float = .005) -> B601HardwareState:
+    joints = tuple(B601JointState(
+        name=f"joint{i}", motor_id=i, feedback_id=0xFD, arbitration_id=24 << 24,
+        status_code=0, position_rad=.1, velocity_reported=99., torque_reported_nm=99.,
+        observed_at_sec=10. - age, sample_sequence=sequence, valid=True, stale=False,
+        position_source="robstride_operation_status_cache", status_sequence=sequence,
+        receive_age_sec=age, host_receive_freshness_verified=True,
+    ) for i in range(1, 7))
+    return B601HardwareState(
+        sequence=sequence, receive_timestamp_sec=10., joints=joints,
+        valid=True, stale=False, host_receive_freshness_verified=True,
+    )
+
+
+@pytest.mark.parametrize("planned,previous,period,expected", [
+    (1.00228362, 1., .01, 1.01),
+    (1.010, 1., .01, 1.010),
+    (1.020, 1., .01, 1.020),
+    (1.050, 1., .05, 1.050),
+    (1.002, None, .01, 1.002),
+])
+def test_feedback_cadence_floor_preserves_later_deadlines_and_actual_period(
+    planned, previous, period, expected,
+):
+    assert probe._active_report_feedback_deadline(
+        planned, previous_feedback_timestamp_sec=previous, period_sec=period,
+    ) == pytest.approx(expected)
+
+
+@pytest.mark.parametrize("planned,previous,period", [
+    (math.nan, 1., .01),
+    (1., math.inf, .01),
+    (1., 1., 0.),
+    (1., 1., -.01),
+    (1., 1., math.nan),
+    (1., 1e308, 1e308),
+])
+def test_feedback_cadence_floor_rejects_invalid_clocks_and_periods(planned, previous, period):
+    with pytest.raises(ValueError):
+        probe._active_report_feedback_deadline(
+            planned, previous_feedback_timestamp_sec=previous, period_sec=period,
+        )
+
+
+@pytest.mark.parametrize("counts", [1, 2])
+def test_feedback_cadence_reads_after_real_wait_and_preserves_raw_overspeed_guard(monkeypatch, counts):
+    now = [1.00228362]
+    waits = []
+    def sleep(delay):
+        waits.append(delay)
+        now[0] += delay
+    monkeypatch.setattr(probe.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(probe.time, "sleep", sleep)
+    next_read = probe._active_report_feedback_deadline(
+        now[0], previous_feedback_timestamp_sec=1., period_sec=.01,
+    )
+    probe.time.sleep(next_read - probe.time.monotonic())
+    q = (0., 0., counts * .0003834962844848633, 0., 0., 0.)
+    actual_snapshot_time = probe.time.monotonic()
+    actual_dt = actual_snapshot_time - 1.
+    raw = tuple(value / actual_dt for value in q)
+    _, rejection = probe.evaluate_feedback_motion_guard(
+        sequence=2, feedback_timestamp_sec=actual_snapshot_time, dt_sec=actual_dt,
+        raw_qpos_rad=q, normalized_qpos_rad=q, previous_qvel_rad_s=None,
+        current_qvel_rad_s=raw, velocity_abort_rad_s=.05, acceleration_abort_rad_s2=80.,
+    )
+    assert waits == pytest.approx([.00771638])
+    assert actual_dt == pytest.approx(.01)
+    assert raw[2] == pytest.approx(counts * .03834962844848633)
+    if counts == 1:
+        assert rejection is None
+    else:
+        assert rejection["guard"] == "velocity"
+        assert rejection["limit"] == .05
+        assert rejection["command_dispatched"] is False
+
+
+def test_feedback_cadence_wiring_only_precedes_active_report_read_without_changing_velocity():
+    source = inspect.getsource(probe.run_probe)
+    tree = ast.parse(source)
+    branches = [node for node in ast.walk(tree) if isinstance(node, ast.If)
+                and ast.unparse(node.test) == "active_report_gate is not None"]
+    calls = [node for branch in branches for node in ast.walk(branch)
+             if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+             and node.func.id == "_active_report_feedback_deadline"]
+    assert len(calls) == 1
+    assert {arg.arg: ast.unparse(arg.value) for arg in calls[0].keywords} == {
+        "previous_feedback_timestamp_sec": "previous_feedback_time", "period_sec": "period",
+    }
+    assert source.index("next_deadline = _active_report_feedback_deadline(") < source.index(
+        "requested_schedule_wait_sec = max(0.0, next_deadline - now)"
+    ) < source.index("state = _read_admitted_control_feedback(", source.index("next_deadline = _active_report_feedback_deadline("))
+    assert "dt = state.receive_timestamp_sec - previous_feedback_time" in source
+    assert "(current - previous) / dt" in source
+
+
+@pytest.mark.parametrize("advances", [False, True])
+def test_feedback_retries_release_rejected_tracebacks_without_waiting_for_gc(monkeypatch, advances):
+    errors = []
+    original_error = probe.LowGainProbeError
+
+    class ObservedError(original_error):
+        def __init__(self, message):
+            super().__init__(message)
+            errors.append(weakref.ref(self))
+
+    monkeypatch.setattr(probe, "LowGainProbeError", ObservedError)
+    now, polls = [10.], [0]
+    monkeypatch.setattr(probe.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(probe.time, "sleep", lambda delay: now.__setitem__(0, now[0] + delay))
+    gate = probe.B601ActiveReportControlGate(probe._ALL_JOINTS, maximum_receive_age_sec=.10)
+    gate.observe(_timed_feedback_state(1))
+
+    def poll(**kwargs):
+        assert kwargs == {"require_host_freshness": True, "prefer_active_report": True}
+        polls[0] += 1
+        return _timed_feedback_state(2 if advances and polls[0] > 3 else 1)
+
+    diagnostics = probe._ProbeFeedbackTiming()
+    enabled = probe.gc.isenabled()
+    # Offline lifetime assertion: automatic GC must not hide retained cycles.
+    probe.gc.disable()
+    try:
+        if advances:
+            state = probe._read_admitted_control_feedback(SimpleNamespace(poll_feedback=poll), gate, .01, diagnostics)
+            assert state.sequence == 2 and polls[0] == 4
+            assert all(reference() is None for reference in errors)
+        else:
+            with pytest.raises(ObservedError, match="joint1 status_sequence did not advance") as caught:
+                probe._read_admitted_control_feedback(SimpleNamespace(poll_feedback=poll), gate, .002, diagnostics)
+            assert all(reference() is None for reference in errors[:-1])
+            assert errors[-1]() is caught.value  # The delivered timeout remains inspectable.
+        assert diagnostics.retryable_error_count == polls[0] - int(advances)
+        assert gate.last_status_sequences == {f"joint{i}": 2 if advances else 1 for i in range(1, 7)}
+    finally:
+        if enabled:
+            probe.gc.enable()
+
+
+@pytest.mark.parametrize("observe", [False, True])
+def test_feedback_diagnostics_preserve_real_admission_retries_and_source_requests(monkeypatch, observe):
+    baseline, advancing = _timed_feedback_state(1), _timed_feedback_state(2)
+    frames = iter((baseline, baseline, _timed_feedback_state(2, age=.20), advancing))
+    calls, waits, now = [], [], [10.]
+
+    def poll(**kwargs):
+        calls.append(kwargs)
+        return next(frames)
+
+    def sleep(delay):
+        waits.append(delay)
+        now[0] += delay
+
+    monkeypatch.setattr(probe.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(probe.time, "sleep", sleep)
+    gate = probe.B601ActiveReportControlGate(probe._ALL_JOINTS, maximum_receive_age_sec=.10)
+    diagnostics = probe._ProbeFeedbackTiming() if observe else None
+    admitted = probe._read_admitted_control_feedback(SimpleNamespace(poll_feedback=poll), gate, .05, diagnostics)
+    assert admitted is advancing
+    assert calls == [{"require_host_freshness": True, "prefer_active_report": True}] * 4
+    assert waits == [.001] * 3
+    assert gate.last_status_sequences == {f"joint{i}": 2 for i in range(1, 7)}
+    if diagnostics is not None:
+        report = diagnostics.snapshot()
+        assert report["not_advanced_count"] == 1
+        assert report["retryable_error_count"] == 2
+        assert report["stages"]["backend_poll"]["interval_count"] == 4
+        assert report["stages"]["host_freshness_admission"]["interval_count"] == 4
+        assert report["stages"]["retry_wait"]["interval_count"] == 3
+        assert report["rejection_counts"] == {"baseline_not_advanced": 1, "host_freshness_admission": 2}
+        assert report["first_rejection"]["stage"] == "baseline_not_advanced"
+        assert "did not advance" in report["last_rejection"]["reason"] or "receive_age_sec" in report["last_rejection"]["reason"]
+        assert report["last_rejection"]["ordinal"] == 3
+
+
+@pytest.mark.parametrize("observe", [False, True])
+def test_feedback_diagnostics_keep_parameter_source_and_fatal_backend_errors(monkeypatch, observe):
+    state, calls = _timed_feedback_state(1), []
+    diagnostics = probe._ProbeFeedbackTiming() if observe else None
+
+    def poll(**kwargs):
+        calls.append(kwargs)
+        return state
+
+    backend = SimpleNamespace(poll_feedback=poll)
+    assert probe._read_admitted_control_feedback(backend, None, .10, diagnostics) is state
+    assert calls == [{"request_feedback": True}]
+    if diagnostics is not None:
+        assert set(diagnostics.snapshot()["stages"]) == {"backend_poll"}
+
+    def fatal(**_kwargs):
+        raise RuntimeError("transport failed")
+
+    failed_diagnostics = probe._ProbeFeedbackTiming() if observe else None
+    with pytest.raises(RuntimeError, match="transport failed"):
+        probe._read_admitted_control_feedback(SimpleNamespace(poll_feedback=fatal), None, .10, failed_diagnostics)
+    if failed_diagnostics is not None:
+        assert failed_diagnostics.snapshot()["stages"]["backend_poll"]["interval_count"] == 1
+
+
+@pytest.mark.parametrize("observe", [False, True])
+def test_feedback_diagnostics_preserve_timeout_and_last_rejection(monkeypatch, observe):
+    state, now, calls = _timed_feedback_state(1), [10.], []
+
+    def poll(**kwargs):
+        calls.append(kwargs)
+        return state
+
+    monkeypatch.setattr(probe.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(probe.time, "sleep", lambda delay: now.__setitem__(0, now[0] + delay))
+    gate = probe.B601ActiveReportControlGate(probe._ALL_JOINTS, maximum_receive_age_sec=.10)
+    diagnostics = probe._ProbeFeedbackTiming() if observe else None
+    with pytest.raises(probe.LowGainProbeError, match=r"within 0.002000s: active-report feedback rejected: joint1 status_sequence did not advance"):
+        probe._read_admitted_control_feedback(SimpleNamespace(poll_feedback=poll), gate, .002, diagnostics)
+    assert gate.last_status_sequences == {f"joint{i}": 1 for i in range(1, 7)}
+    if diagnostics is not None:
+        assert diagnostics.snapshot()["retryable_error_count"] == len(calls) - 1
+
+
+def test_trace_timing_retains_origin_sequence_without_changing_record_payload():
+    stream = io.StringIO()
+    trace = probe._DynamicsTrace(stream)
+    trace.record("active_dispatch", sequence=7, qpos_rad=(0.,) * 6)
+    previous = trace.last_record_timing
+    trace.record("active_dispatch", sequence=8, previous_trace_record_timing=previous)
+    rows = [json.loads(line) for line in stream.getvalue().splitlines()]
+    assert rows[0]["sequence"] == 7
+    assert rows[0]["qpos_rad"] == [0.] * 6
+    assert rows[1]["previous_trace_record_timing"]["sequence"] == 7
+    assert trace.last_record_timing["sequence"] == 8
+    assert previous["sequence"] == 7
+    assert trace.sample_count == 2
+    assert set(previous["stages"]) == {"encode", "write", "flush"}
+    assert previous["completed"] is True
+
+
+def test_queued_trace_keeps_control_records_nonblocking_ordered_and_immutable():
+    import threading
+
+    entered, release = threading.Event(), threading.Event()
+    rows = []
+
+    class BlockedStream:
+        def write(self, text):
+            entered.set()
+            if not release.wait(2):
+                raise OSError("test writer was not released")
+            rows.append(text)
+
+        def flush(self):
+            pass
+
+        def close(self):
+            pass
+
+    stream = probe._QueuedTraceStream(BlockedStream())
+    trace = probe._DynamicsTrace(stream)
+    try:
+        values = [0]
+        trace.record("frame", sequence=0, values=values)
+        assert entered.wait(1)
+        values.append(99)
+        # The disk writer remains blocked throughout these owner submissions.
+        for sequence in range(1, 65):
+            trace.record("frame", sequence=sequence)
+        assert trace.error is None
+        assert stream.submitted == trace.sample_count == 65
+        assert stream.written == 0
+        assert not release.is_set()
+    finally:
+        release.set()
+        stream.close()
+    decoded = [json.loads(row) for row in rows]
+    assert [row["sequence"] for row in decoded] == list(range(65))
+    assert decoded[0]["values"] == [0]
+    assert stream.status()["drain_complete"]
+    assert stream.status()["unconfirmed_records"] == 0
+
+
+def test_queued_trace_overflow_is_visible_without_waiting_or_claiming_capture():
+    import threading
+
+    entered, release = threading.Event(), threading.Event()
+
+    class BlockedStream:
+        def write(self, _text):
+            entered.set()
+            release.wait(2)
+
+        def flush(self):
+            pass
+
+        def close(self):
+            pass
+
+    stream = probe._QueuedTraceStream(BlockedStream(), capacity=1)
+    trace = probe._DynamicsTrace(stream)
+    try:
+        trace.record("frame", sequence=1)
+        assert entered.wait(1)
+        trace.record("frame", sequence=2)
+        trace.record("frame", sequence=3)
+        assert "queue overflow" in trace.error
+        assert trace.sample_count == stream.submitted == 2
+    finally:
+        release.set()
+        stream.close()
+    assert not stream.status()["drain_complete"]
+    assert stream.written == 2
+
+
+def test_queued_trace_background_error_is_visible_before_next_owner_record():
+    class BrokenStream:
+        def write(self, _text):
+            raise OSError("disk full")
+
+        def close(self):
+            pass
+
+    stream = probe._QueuedTraceStream(BrokenStream())
+    trace = probe._DynamicsTrace(stream)
+    trace.record("frame", sequence=1)
+    stream.close()
+    assert trace.error == "OSError: disk full"
+    assert stream.status()["unconfirmed_records"] == 1
+    assert not stream.status()["drain_complete"]
+    trace.record("frame", sequence=2)
+    assert stream.submitted == 1
+
+
+def test_queued_trace_close_timeout_does_not_close_an_inflight_stream():
+    import threading
+
+    entered, release, closed = threading.Event(), threading.Event(), threading.Event()
+
+    class BlockedStream:
+        def write(self, _text):
+            entered.set()
+            release.wait(2)
+
+        def flush(self):
+            pass
+
+        def close(self):
+            closed.set()
+
+    stream = probe._QueuedTraceStream(BlockedStream())
+    try:
+        stream.write('{}\n')
+        assert entered.wait(1)
+        stream.close(timeout_sec=.001)
+        assert "drain timeout" in stream.error
+        assert not closed.is_set()
+        assert stream.status()["unconfirmed_records"] == 1
+    finally:
+        release.set()
+        stream.close()
+    assert closed.is_set()
+    assert not stream.status()["drain_complete"]
+
+
+@pytest.mark.parametrize("handled_error", [False, True])
+@pytest.mark.parametrize("compressed", [False, True])
+def test_debug_trace_main_writes_separate_jsonl_without_hardware(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    handled_error: bool,
+    compressed: bool,
+) -> None:
+    callbacks_before = tuple(probe.gc.callbacks)
+
+    def fake_run_probe(_args: object, **kwargs: object) -> dict[str, object]:
+        trace = kwargs["debug_trace"]
+        assert isinstance(trace, probe._DynamicsTrace)
+        assert trace.gc_observer._callback in probe.gc.callbacks
+        trace.record("synthetic", commanded_power_w=(0.1,) * 6)
+        diagnostics = probe._ProbeFeedbackTiming()
+        diagnostics.mark("backend_poll")
+        trace.last_feedback_read_diagnostics = diagnostics
+        if handled_error:
+            raise probe.LowGainProbeError("synthetic feedback timeout", cleanup={
+                "device_cleanup_confirmed": False,
+                "transport_release": {"completed": True, "method": "release_transport", "error": None},
+                "errors": ["safe_stop: synthetic failure"],
+            })
+        return {"status": "OK", "mode": "hold"}
+
+    monkeypatch.setattr(probe, "run_probe", fake_run_probe)
+    output = tmp_path / "result.json"
+    status = probe.main(
+        [
+            "--mode", "hold",
+            "--config", str(tmp_path / "unused-config.yaml"),
+            "--rebot-source-root", str(tmp_path / "unused-vendor"),
+            "--output", str(output),
+            "--log", str(tmp_path / "runtime.log"),
+            "--debug-dynamics-trace",
+            *(["--gzip-dynamics-trace"] if compressed else []),
+        ]
+    )
+
+    assert status == (2 if handled_error else 0)
+    result = json.loads(output.read_text(encoding="utf-8"))
+    if handled_error:
+        assert result["status"] == "ERROR"
+        assert result["cleanup"]["device_cleanup_confirmed"] is False
+        assert result["cleanup"]["transport_release"]["completed"] is True
+        assert result["cleanup"]["errors"] == ["safe_stop: synthetic failure"]
+    trace_path = tmp_path / ("result.debug.jsonl.gz" if compressed else "result.debug.jsonl")
+    assert result["debug_dynamics_trace"]["path"] == str(trace_path)
+    assert result["debug_dynamics_trace"]["sample_count"] == 1
+    assert result["debug_dynamics_trace"]["writer"]["drain_complete"]
+    assert result["debug_dynamics_trace"]["writer"]["written_records"] == 1
+    assert result["debug_dynamics_trace"]["gc_observation"]["registered_after_cleanup"] is False
+    assert result["debug_dynamics_trace"]["gc_observation"]["settings_at_start"]["enabled"] == probe.gc.isenabled()
+    assert result["debug_dynamics_trace"]["last_feedback_read_diagnostics"]["stages"]["backend_poll"]["interval_count"] == 1
+    assert tuple(probe.gc.callbacks) == callbacks_before
+    from control_station.b601_torque_console.report import _jsonl
+
+    rows = list(_jsonl(tmp_path / "result.debug.jsonl"))
+    assert rows[0]["kind"] == "synthetic"
+    assert rows[0]["commanded_power_w"] == [.1]*6
+
+
+def test_compressed_trace_reader_retains_rows_and_rejects_missing_footer(tmp_path):
+    import gzip
+
+    from control_station.b601_torque_console.report import _jsonl, _resolve_jsonl_path
+
+    plain = tmp_path / "b601_owner.debug.jsonl"
+    compressed = plain.with_name(plain.name+".gz")
+    encoded = gzip.compress(b'{"kind":"active_dispatch","sequence":1}\n')
+    compressed.write_bytes(encoded)
+    assert _resolve_jsonl_path(plain) == compressed
+    assert list(_jsonl(plain)) == [{"kind":"active_dispatch", "sequence":1}]
+    compressed.write_bytes(encoded[:-8])
+    with pytest.raises(ValueError, match="incomplete compressed trace"):
+        list(_jsonl(plain))
+
+
+def test_main_without_debug_does_not_register_gc_observer(monkeypatch, tmp_path):
+    def forbidden_observer():
+        pytest.fail("plain owner must not construct the diagnostic GC observer")
+
+    def fake_run_probe(_args, **kwargs):
+        assert kwargs["debug_trace"] is None
+        return {"status": "OK", "mode": "hold"}
+
+    monkeypatch.setattr(probe, "_ProbeGCObserver", forbidden_observer)
+    monkeypatch.setattr(probe, "run_probe", fake_run_probe)
+    output = tmp_path / "result.json"
+    assert probe.main([
+        "--mode", "hold", "--config", str(tmp_path / "unused.yaml"),
+        "--rebot-source-root", str(tmp_path / "unused-vendor"),
+        "--output", str(output), "--log", str(tmp_path / "runtime.log"),
+    ]) == 0
+    assert "debug_dynamics_trace" not in json.loads(output.read_text())
+
+
+@pytest.mark.parametrize("export_error", [None, ValueError("unconsumed receipt"), TypeError("invalid snapshot"), KeyError("outcome")])
+@pytest.mark.parametrize("interrupt_report", [False, True])
+def test_main_result_export_error_still_writes_primary_failure_json(monkeypatch, tmp_path, export_error, interrupt_report):
+    import control_station.b601_torque_console as console_module
+    from control_station.b601_torque_console import automatic_report
+
+    class Console:
+        set_human_intervention = recording_failed = lambda *args: None
+
+        def result_record(self):
+            if export_error is None:
+                return {"kind": "automatic_calibration_result", "recorded_monotonic_sec": 1.,
+                    "operation_mode": "workspace", "state": "failed", "reason": "leg_timeout",
+                    "outcome": {"severity": "warning", "reason": "leg_timeout"}}
+            raise export_error
+
+    class Server:
+        url = "http://127.0.0.1:1"
+
+        def __init__(self, *args, **kwargs):
+            pass
+
+        start = close = set_stop_handler = lambda *args: None
+        assessment_status = status_response_diagnostics = lambda *args: {}
+
+    def no_report(_path):
+        # The primary control/cleanup result must already survive a slow or
+        # interrupted report, independent of whether export itself succeeded.
+        saved = json.loads((tmp_path / "b601_owner.json").read_text())
+        assert saved["stop_reason"] == "original_acquisition_failure"
+        assert saved["automatic_calibration_report_status"] == "PENDING"
+        if export_error is None:
+            assert saved["sample_storage"]["sample_archive_status"] == "COMPLETE"
+            assert Path(saved["sample_storage"]["sample_archive_path"]).is_file()
+        if interrupt_report:
+            raise KeyboardInterrupt
+        raise ValueError("terminal record missing")
+
+    monkeypatch.setenv("DISPLAY", ":synthetic-offline")
+    monkeypatch.setattr(probe, "_validate_cli", lambda args: None)
+    monkeypatch.setattr(probe, "_automatic_calibration_controller_from_args", lambda args: Console())
+    monkeypatch.setattr(console_module, "B601TorqueConsoleServer", Server)
+    monkeypatch.setattr(probe.webbrowser, "open_new_tab", lambda url: True)
+    monkeypatch.setattr(probe, "run_probe", lambda *args, **kwargs: {
+        "status": "FAIL", "mode": "hold", "stop_reason": "original_acquisition_failure", "samples": []})
+    monkeypatch.setattr(automatic_report, "save_automatic_report", no_report)
+    output = tmp_path / "b601_owner.json"
+    assert probe.main([
+        "--mode", "hold", "--config", str(tmp_path / "unused.yaml"),
+        "--rebot-source-root", str(tmp_path / "unused-vendor"),
+        "--output", str(output), "--log", str(tmp_path / "runtime.log"),
+        "--torque-console", "--torque-console-auto-calibration-profile", str(tmp_path / "unused-profile.json"),
+    ]) == (130 if interrupt_report else 2)
+    result = json.loads(output.read_text())
+    if export_error is not None or not interrupt_report:
+        assert result["status"] == result["execution_status"] == "ERROR"
+    else:
+        assert result["status"] == "FAIL"
+        assert result["acquisition_outcome"]["reason"] == "leg_timeout"
+    assert result["stop_reason"] == "original_acquisition_failure"
+    if export_error is not None:
+        assert type(export_error).__name__ in result["automatic_calibration_export_error"]
+    assert result["automatic_calibration_report_error"] == (
+        "operator_interrupted_report_after_control_cleanup" if interrupt_report else "terminal record missing")
+    assert result["automatic_calibration_report_status"] == ("INTERRUPTED" if interrupt_report else "ERROR")
+    assert result["debug_dynamics_trace"]["gc_observation"]["registered_after_cleanup"] is False
+
+
+@pytest.mark.parametrize("checkpoint_saved", [False, True])
+@pytest.mark.parametrize("failed", [False, True])
+def test_main_interrupt_after_cleanup_keeps_primary_result(monkeypatch, tmp_path, checkpoint_saved, failed):
+    import control_station.b601_torque_console as console_module
+
+    closed = []
+
+    class Console:
+        set_human_intervention = recording_failed = lambda *args: None
+
+    class Server:
+        url = "http://127.0.0.1:1"
+        def __init__(self, *args, **kwargs):
+            pass
+        start = set_stop_handler = lambda *args: None
+        def close(self):
+            closed.append(True)
+
+    output = tmp_path / "b601_owner.json"
+    def interrupted(_args, **kwargs):
+        if checkpoint_saved:
+            kwargs["post_cleanup_checkpoint"]({
+                "mode": "hold", "status": "FAIL" if failed else "STOPPED_WITH_WARNINGS",
+                "execution_status": "FAILED" if failed else "STOPPED_BY_OPERATOR",
+                "stop_reason": "coordinated_reference_lag_stop" if failed else "explicit_full_disable",
+                "cleanup": {"device_cleanup_confirmed": True, "transport_release": {"completed": True}},
+                "postprocessing": {"status": "PENDING", "stage": "summary"},
+            })
+            assert json.loads(output.read_text())["postprocessing"]["status"] == "PENDING"
+        raise KeyboardInterrupt
+
+    monkeypatch.setenv("DISPLAY", ":synthetic-offline")
+    monkeypatch.setattr(probe, "_validate_cli", lambda args: None)
+    monkeypatch.setattr(probe, "_automatic_calibration_controller_from_args", lambda args: Console())
+    monkeypatch.setattr(console_module, "B601TorqueConsoleServer", Server)
+    monkeypatch.setattr(probe.webbrowser, "open_new_tab", lambda url: True)
+    monkeypatch.setattr(probe, "run_probe", interrupted)
+    args = ["--mode", "hold", "--config", str(tmp_path/"unused.yaml"),
+        "--rebot-source-root", str(tmp_path/"unused-vendor"), "--output", str(output),
+        "--log", str(tmp_path/"runtime.log"), "--torque-console",
+        "--torque-console-auto-calibration-profile", str(tmp_path/"unused-profile.json")]
+    if checkpoint_saved:
+        assert probe.main(args) == 130
+        result = json.loads(output.read_text())
+        assert result["cleanup"]["device_cleanup_confirmed"]
+        assert result["cleanup"]["transport_release"]["completed"]
+        assert result["postprocessing"]["status"] == "INTERRUPTED"
+        assert result["execution_status"] == ("FAILED" if failed else "STOPPED_BY_OPERATOR")
+        assert result["stop_reason"] == ("coordinated_reference_lag_stop" if failed else "explicit_full_disable")
+    else:
+        with pytest.raises(KeyboardInterrupt):
+            probe.main(args)
+        assert not output.exists()
+    assert closed == [True]
 
 
 def test_degraded_fault_hold_recovers_live_gravity_without_disable(
@@ -4604,14 +6574,28 @@ def test_parser_help_is_read_only() -> None:
     assert args.acceleration_abort_rad_s2 == pytest.approx(80.0)
     assert args.gravity_scale == pytest.approx(1.0)
     assert args.gravity_joint_scales == pytest.approx(
-        (1.0, 0.95, 1.0, 1.0, 1.0, 1.0)
+        (1.0, 0.96, 1.0, 1.0, 1.0, 1.0)
     )
     assert args.gravity_joint_offsets_rad == pytest.approx((0.0,) * 6)
     assert args.gravity_joint_bias_nm == pytest.approx(
-        (0.0, -0.105, -0.1, -0.05, 0.0, 0.0)
+        (0.0, -0.22, -0.11, -0.08, 0.0, 0.0)
     )
     assert args.gravity_coulomb_friction_nm == pytest.approx((0.0,) * 6)
-    assert args.gravity_coulomb_velocity_threshold_rad_s == pytest.approx(0.0)
+    assert args.gravity_coulomb_velocity_threshold_rad_s == pytest.approx(0.02)
+    assert args.cartesian_assist_breakaway_positive_nm == pytest.approx(
+        (0.0,) * 6
+    )
+    assert args.cartesian_assist_breakaway_negative_nm == pytest.approx(
+        (0.0,) * 6
+    )
+    assert args.cartesian_assist_breakaway_velocity_fade_rad_s == pytest.approx(
+        0.03
+    )
+    assert args.cartesian_assist_breakaway_intent_deadband_nm == pytest.approx(
+        0.01
+    )
+    assert args.cartesian_assist_breakaway_intent_ramp_nm == pytest.approx(0.04)
+    assert args.cartesian_assist_joint_torque_release_slew_nm_s is None
     assert args.apply_driver_torque_limits is False
     calibration_args = parser.parse_args(
         [
@@ -4893,6 +6877,32 @@ def test_cartesian_cli_uses_all_six_joints() -> None:
 
     probe._validate_cli(args)
     assert probe.resolve_active_joint_names() == tuple(probe._ALL_JOINTS)
+
+
+def test_cartesian_breakaway_torque_requires_explicit_assist_mode() -> None:
+    args = probe.build_parser().parse_args(
+        [
+            "--mode",
+            "hold",
+            "--config",
+            "config.yaml",
+            "--rebot-source-root",
+            "source",
+            "--cartesian-assist-breakaway-positive-nm",
+            "0",
+            "0.1",
+            "0",
+            "0",
+            "0",
+            "0",
+        ]
+    )
+
+    with pytest.raises(
+        probe.LowGainProbeError,
+        match="breakaway torque requires --cartesian-assist",
+    ):
+        probe._validate_cartesian_assist_cli(args)
 
 
 def _parse_pose_args(*extra: str) -> object:
@@ -5552,3 +7562,42 @@ def test_feedback_warmup_keeps_single_poll_outer_budget_and_wait(monkeypatch, tm
     assert len(fixture.polls) == 3
     assert waits == [.01]*3
     assert "enable" not in fixture.events and "dispatch" not in fixture.events
+
+
+@pytest.mark.parametrize("window", [0.0, .015])
+def test_actual_shared_owner_call_forwards_joint_receive_time_only_when_enabled(window):
+    import ast
+    import inspect
+    from dataclasses import replace
+    from types import SimpleNamespace
+
+    runtime = probe.B601SharedControlRuntime(replace(_shared_runtime().config,
+        damping_velocity_window_sec=window))
+    captured = []
+    original_step = runtime.step
+    def step(**kwargs):
+        captured.append(kwargs)
+        return original_step(**kwargs)
+    runtime.step = step
+    now = 1.0
+    state = SimpleNamespace(sequence=7, receive_timestamp_sec=now)
+    observed = tuple(now-.001*j for j in range(6))
+    if window:
+        state.joints = tuple(SimpleNamespace(observed_at_sec=t) for t in observed)
+    owner = ast.parse(inspect.getsource(probe.run_probe))
+    calls = [n for n in ast.walk(owner) if isinstance(n, ast.Call)
+        and isinstance(n.func, ast.Name) and n.func.id == "_step_shared_control_runtime"]
+    assert len(calls) == 1
+    expression = ast.Expression(body=calls[0])
+    code = compile(ast.fix_missing_locations(expression), "actual-owner-shared-call", "eval")
+    reference, payload = eval(code, {
+        "_step_shared_control_runtime": probe._step_shared_control_runtime,
+        "shared_control_runtime": runtime, "state": state,
+        "q": (0.,) * 6, "qvel": (.1,) * 6, "dt": .01,
+    })
+    assert len(captured) == 1
+    assert captured[0].get("joint_observation_timestamps_sec") == (observed if window else None)
+    assert captured[0]["measured_qvel_rad_s"] == (.1,) * 6
+    assert reference.source_timestamp_sec == reference.receive_timestamp_sec == now
+    assert reference.qpos_rad == (0.,) * 6 and reference.joint_torque_overlay_nm == (0.,) * 6
+    assert ("control_qvel_rad_s" in payload) is bool(window)

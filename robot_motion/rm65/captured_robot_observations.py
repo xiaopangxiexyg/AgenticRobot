@@ -12,6 +12,7 @@ import hashlib
 import json
 import math
 import threading
+import time
 import xml.etree.ElementTree as ET
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass
@@ -427,7 +428,11 @@ def _surface_samples(trimesh: Any, vertices: np.ndarray, faces: np.ndarray) -> n
     # Retain an actual triangle point per 1 mm cell, never the cell center.
     # A continuous surface is within 2 mm + sqrt(3)*1 mm of a reference;
     # this coverage error is NOT added to the removal tolerance.
-    _, first = np.unique(np.floor(vertices / 0.001).astype(np.int64), axis=0, return_index=True)
+    cells = np.ascontiguousarray(np.floor(vertices / 0.001).astype(np.int64))
+    # Sort one opaque cell key, not three structured integer fields. Only the
+    # first original sample matters; restore its original order below.
+    keys = cells.view(np.dtype((np.void, cells.dtype.itemsize * 3))).ravel()
+    _, first = np.unique(keys, return_index=True)
     return vertices[np.sort(first)]
 
 
@@ -469,6 +474,13 @@ def _asymmetric_surface_membership(
     if tree is None:
         tree = cKDTree(surface / extent)
     queries = observed / extent
+    if np.array_equal(bounds[:, 0], -bounds[:, 1]):
+        # With equal signed radii the split ellipsoid is exactly this metric's
+        # ball. Its nearest neighbour alone decides membership; no finite-k
+        # or neighborhood materialization is necessary.
+        distances, _ = tree.query(queries, distance_upper_bound=(
+            math.sqrt(normalized_squared_limit) + 1e-12))
+        return np.isfinite(distances) & (distances ** 2 <= normalized_squared_limit + 1e-12)
     count = min(fast_neighbors, len(surface))
     search_radius = math.sqrt(normalized_squared_limit) + 1e-12
     distances, indices = tree.query(queries, k=count, distance_upper_bound=search_radius)
@@ -591,6 +603,7 @@ class RM65CapturedRobotObservationFilter:
         self._surface_geometry: dict[int, Any] = {}
         self._tool_queries: dict[tuple[str, tuple[str, ...]], tuple[np.ndarray, cKDTree]] = {}
         self._body_sample_trees: dict[str, tuple[cKDTree, float]] = {}
+        self._ray_meshes: dict[int, tuple[Any, np.ndarray, np.ndarray]] = {}
         self._input_binding_hash = (
             None if self.config.geometry_mode == "legacy" else canonical_content_hash(
                 {"urdf_sha256": self.urdf_sha256,
@@ -637,6 +650,103 @@ class RM65CapturedRobotObservationFilter:
             for index in selected:
                 self._mesh_buffers_for(index, visual.geometryObjects[index].geometry)
 
+    def prepare(self) -> dict[str, float]:
+        """Prepare static geometry only, without a device or measured pose.
+
+        Application resources call this before publishing readiness. Calls made
+        without an application lifecycle still use the same lazy caches.
+        """
+        phases = {}
+        with self._lock:
+            started = time.perf_counter()
+            _, _, _, _, visual, selected = self._runtime_components()
+            phases['visual_model'] = time.perf_counter() - started
+            started = time.perf_counter()
+            if self.config.geometry_mode == 'link_primitives' and (
+                    self._flange_from_tool is None or any(not _has_primitive_rule(
+                        visual.geometryObjects[i].name) for i in selected)):
+                raise ValueError('link primitives require calibrated tools and supported accessories')
+            # Match the current filtering contract: legacy and an explicitly
+            # disabled tool surface must not acquire extended queries.
+            if (self.config.geometry_mode != "legacy"
+                    and self._flange_from_tool is not None
+                    and self.config.tool_surface_bounds_m is not None):
+                self._tool_query_references(self._tool_surface_references(), set())
+            if self.config.geometry_mode == 'link_primitives':
+                self._prepare_body_queries()
+                for index in selected:
+                    self._ray_mesh(index, visual.geometryObjects[index].geometry)
+            phases['local_queries'] = time.perf_counter() - started
+        return phases
+
+    def _prepare_body_queries(self):
+        _, _, _, _, visual, selected = self._runtime_components()
+        bodies = self._body_surface_references()
+        for index in selected:
+            item = visual.geometryObjects[index]
+            if item.name in bodies and item.name not in self._body_sample_trees:
+                vertices, faces = self._geometry_mesh(index, item.geometry)
+                triangles = vertices[faces]
+                samples = np.concatenate((vertices, triangles.mean(axis=1)))
+                _, first = np.unique(np.floor(samples / .005).astype(np.int64),
+                                     axis=0, return_index=True)
+                max_edge = float(np.linalg.norm(
+                    triangles - triangles[:, [1, 2, 0]], axis=2).max())
+                self._body_sample_trees[item.name] = (
+                    cKDTree(samples[first]), max_edge + math.sqrt(3) * .005)
+        return bodies
+
+    def _ray_mesh(self, index, shape):
+        """Keep a library-owned BVH in fixed link coordinates, never a pose."""
+        if index not in self._ray_meshes:
+            _, trimesh, intersector_type, _, _, _ = self._runtime_components()
+            vertices, faces = self._geometry_mesh(index, shape)
+            mesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
+            intersector = intersector_type(mesh)
+            # Trimesh lazily builds its acceleration structure on first query.
+            intersector.intersects_first(np.zeros((1, 3)), np.array([[0., 0., 1.]]))
+            self._ray_meshes[index] = (intersector, vertices.min(axis=0), vertices.max(axis=0))
+        return self._ray_meshes[index]
+
+    def _render_primitive_base(self, *, depth_m, intrinsics, source_from_camera,
+                               capture_qpos_by_side):
+        """Nearest original-CAD hit across links, with every tool as occluder."""
+        pin, _, _, model, visual, selected = self._runtime_components()
+        q = np.r_[capture_qpos_by_side['left'], np.zeros(6),
+                  capture_qpos_by_side['right'], np.zeros(6)]
+        data, visual_data = model.createData(), pin.GeometryData(visual)
+        pin.forwardKinematics(model, data, q)
+        pin.updateGeometryPlacements(model, data, visual, visual_data, q)
+        camera_from_source = np.linalg.inv(source_from_camera)
+        nearest = np.full(depth_m.shape, np.inf)
+        body = np.zeros(depth_m.shape, bool)
+        for index in selected:
+            item = visual.geometryObjects[index]
+            camera_from_geometry = camera_from_source @ np.asarray(visual_data.oMg[index].homogeneous)
+            vertices, _ = self._geometry_mesh(index, item.geometry)
+            if _camera_mesh_contains_optical_origin(item.name,
+                    vertices @ camera_from_geometry[:3, :3].T + camera_from_geometry[:3, 3]):
+                continue
+            intersector, lower, upper = self._ray_mesh(index, item.geometry)
+            rs, cs = _projected_box_roi(camera_from_geometry, lower, upper, intrinsics, depth_m.shape)
+            if rs.start >= rs.stop or cs.start >= cs.stop:
+                continue
+            rows, cols = np.mgrid[rs, cs]
+            rows, cols = rows.ravel(), cols.ravel()
+            directions = np.column_stack(((cols-intrinsics['cx'])/intrinsics['fx'],
+                (rows-intrinsics['cy'])/intrinsics['fy'], np.ones(len(rows))))
+            rotation, translation = camera_from_geometry[:3, :3], camera_from_geometry[:3, 3]
+            origins = np.broadcast_to(-translation @ rotation, directions.shape).copy()
+            hits, rays, _ = intersector.intersects_location(origins, directions @ rotation,
+                                                           multiple_hits=False)
+            z = (hits @ rotation.T + translation)[:, 2]
+            r, c = rows[rays], cols[rays]
+            closer = (z > 0) & (z < nearest[r, c])
+            nearest[r[closer], c[closer]] = z[closer]
+            body[r[closer], c[closer]] = _tool_surface_side(item.name) is None
+        rendered = np.where(body & np.isfinite(nearest), nearest, np.nan)
+        return (rendered,), {}
+
     def _capture_primitive_geometry(self, arm, source_from_camera):
         """Return capture-only boxes plus immutable local query references.
 
@@ -649,22 +759,7 @@ class RM65CapturedRobotObservationFilter:
         pin, _, _, model, visual, selected = self._runtime_components()
         if any(not _has_primitive_rule(visual.geometryObjects[i].name) for i in selected):
             raise ValueError('Unrecognized self accessory requires geometry_mode=cad_surface')
-        bodies = self._body_surface_references()
-        for index in selected:
-            item = visual.geometryObjects[index]
-            if item.name in bodies and item.name not in self._body_sample_trees:
-                vertices, faces = self._geometry_mesh(index, item.geometry)
-                # Vertices and triangle centers are actual surface points.
-                # Their mesh-derived coverage bound sends uncertain cases to
-                # the original BVH; expensive dense body subdivision is unnecessary.
-                triangles = vertices[faces]
-                samples = np.concatenate((vertices, triangles.mean(axis=1)))
-                _, first = np.unique(np.floor(samples / .005).astype(np.int64),
-                                     axis=0, return_index=True)
-                max_edge = float(np.linalg.norm(
-                    triangles - triangles[:, [1, 2, 0]], axis=2).max())
-                self._body_sample_trees[item.name] = (
-                    cKDTree(samples[first]), max_edge + math.sqrt(3) * .005)
+        bodies = self._prepare_body_queries()
         data, visual_data = model.createData(), pin.GeometryData(visual)
         q = np.r_[arm[0], np.zeros(6), arm[1], np.zeros(6)]
         pin.forwardKinematics(model, data, q)
@@ -795,7 +890,7 @@ class RM65CapturedRobotObservationFilter:
             cropped = depth[rows, columns]
             cropped_intrinsics = dict(intrinsics, cx=cx - columns.start, cy=cy - rows.start)
             with self._lock:
-                rendered, _ = self._render_depth_maps(depth_m=cropped, intrinsics=cropped_intrinsics,
+                rendered, _ = self._render_primitive_base(depth_m=cropped, intrinsics=cropped_intrinsics,
                     source_from_camera=source_from_camera, capture_qpos_by_side=capture_qpos_by_side)
             # The original renderer includes every occluder, even when only
             # the small base projection is ray-tested. Separate base meshes
@@ -975,9 +1070,12 @@ class RM65CapturedRobotObservationFilter:
                 "captured robot depth rendering requires the reviewed Pinocchio, "
                 "trimesh, and Embree runtime"
             ) from error
-        model, _, visual_model = pin.buildModelsFromUrdf(
+        # Observation filtering never queries collision geometry. Its owner
+        # builds that separately; avoid loading the same CAD twice here.
+        model, visual_model = pin.buildModelsFromUrdf(
             str(self.physical_urdf_path),
             package_dirs=[str(self.physical_urdf_path.parent)],
+            geometry_types=(pin.GeometryType.VISUAL,),
         )
         if int(model.nq) != 24:
             raise ValueError("captured-robot filter requires the reviewed 24-DoF URDF")

@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 
 from .model import B601_RS_ARM_JOINT_NAMES
@@ -26,10 +26,11 @@ _DEFAULT_MAXIMUM_RESPONSE_RATIO = 1.5
 _DEFAULT_MAXIMUM_SUPPORT_DRIFT_RAD = math.radians(0.5)
 _DEFAULT_MINIMUM_ASSIST_DELIVERY_RATIO = 0.9
 _CARTESIAN_AXIS_INDEX = {"x": 0, "y": 1, "z": 2}
-_MAX_CARTESIAN_COMMISSIONING_OFFSET_M = 0.05
+_DEFAULT_CARTESIAN_MAX_OFFSET_M = 0.05
 _DEFAULT_CARTESIAN_MINIMUM_RESPONSE_M = 0.001
 _DEFAULT_CARTESIAN_MAXIMUM_RESPONSE_RATIO = 1.5
 _DEFAULT_CARTESIAN_MAXIMUM_LATERAL_DRIFT_M = 0.005
+_BREAKAWAY_SUPPORTED_JOINT_INDICES = (1, 2)
 
 
 def _finite(value: object, *, name: str) -> float:
@@ -109,6 +110,237 @@ class B601AssistCommissioningState(str, Enum):
     ACTIVE = "active"
     COMPLETE = "complete"
     CANCELLED = "cancelled"
+
+
+@dataclass(frozen=True)
+class B601CartesianBreakawayConfig:
+    """Bounded J2/J3 stiction compensation for Cartesian commissioning.
+
+    This compensation is deliberately separate from gravity Coulomb friction.
+    At zero measured velocity, a velocity-directed Coulomb model has no motion
+    direction and therefore cannot help the task wrench cross joint stiction.
+    Here the sign comes from the existing ``J.T @ force`` task intent, while a
+    continuous velocity weight removes the extra torque after motion starts.
+
+    All torque values default to zero.  Constructing a normal Cartesian assist
+    therefore preserves the historical behavior exactly.
+    """
+
+    positive_torque_nm: tuple[float, ...] = _ZERO_SIX
+    negative_torque_nm: tuple[float, ...] = _ZERO_SIX
+    velocity_fade_rad_s: float = 0.03
+    intent_deadband_nm: float = 0.01
+    intent_ramp_nm: float = 0.04
+
+    def __post_init__(self) -> None:
+        for name in ("positive_torque_nm", "negative_torque_nm"):
+            values = _six(getattr(self, name), name=name)
+            if any(value < 0.0 for value in values):
+                raise ValueError(f"{name} must be non-negative")
+            unsupported = tuple(
+                B601_RS_ARM_JOINT_NAMES[index]
+                for index, value in enumerate(values)
+                if value > 0.0 and index not in _BREAKAWAY_SUPPORTED_JOINT_INDICES
+            )
+            if unsupported:
+                raise ValueError(
+                    f"{name} supports only joint2/joint3; non-zero: "
+                    + ", ".join(unsupported)
+                )
+            object.__setattr__(self, name, values)
+        object.__setattr__(
+            self,
+            "velocity_fade_rad_s",
+            _positive(self.velocity_fade_rad_s, name="velocity_fade_rad_s"),
+        )
+        deadband = _finite(self.intent_deadband_nm, name="intent_deadband_nm")
+        if deadband < 0.0:
+            raise ValueError("intent_deadband_nm must be non-negative")
+        object.__setattr__(self, "intent_deadband_nm", deadband)
+        object.__setattr__(
+            self,
+            "intent_ramp_nm",
+            _positive(self.intent_ramp_nm, name="intent_ramp_nm"),
+        )
+
+    @property
+    def enabled(self) -> bool:
+        return any(
+            value > 0.0
+            for values in (self.positive_torque_nm, self.negative_torque_nm)
+            for value in values
+        )
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "enabled": self.enabled,
+            "positive_torque_nm": self.positive_torque_nm,
+            "negative_torque_nm": self.negative_torque_nm,
+            "velocity_fade_rad_s": self.velocity_fade_rad_s,
+            "intent_deadband_nm": self.intent_deadband_nm,
+            "intent_ramp_nm": self.intent_ramp_nm,
+        }
+
+
+@dataclass(frozen=True)
+class B601CartesianBreakawayResult:
+    """Auditable output of one stateless breakaway-compensation step."""
+
+    torque_nm: tuple[float, ...]
+    velocity_weight: tuple[float, ...]
+    intent_weight: tuple[float, ...]
+    active: tuple[bool, ...]
+
+
+@dataclass(frozen=True)
+class B601CartesianTorqueSlewDecision:
+    """Per-joint targets and rates for an asymmetric assist conditioner.
+
+    A slow rise rate limits how quickly Cartesian assistance can inject energy.
+    A separately configured release rate may remove an obsolete command or
+    apply a command opposing measured motion more quickly.  A sign-changing
+    request that is not dissipative is first brought to zero; it cannot use the
+    release rate to accelerate in its new direction.
+    """
+
+    conditioning_target_nm: tuple[float, ...]
+    selected_rate_nm_s: tuple[float, ...]
+    mode: tuple[str, ...]
+
+
+def select_cartesian_assist_torque_slew(
+    *,
+    requested_nm: Sequence[float],
+    previous_nm: Sequence[float],
+    measured_qvel_rad_s: Sequence[float],
+    rise_rate_nm_s: float,
+    release_rate_nm_s: float,
+    brake_velocity_deadband_rad_s: float,
+) -> B601CartesianTorqueSlewDecision:
+    """Select bounded rise, release, or dissipative-brake slew per joint.
+
+    ``brake`` is selected only when the requested torque opposes measured
+    motion. ``release`` removes magnitude or unwinds an obsolete sign.  All
+    other requests use the slower ``rise`` rate.  Equal rise/release rates
+    return the original request unchanged, preserving historical conditioning
+    exactly.
+    """
+
+    requested = _six(requested_nm, name="requested_nm")
+    previous = _six(previous_nm, name="previous_nm")
+    velocity = _six(measured_qvel_rad_s, name="measured_qvel_rad_s")
+    rise_rate = _positive(rise_rate_nm_s, name="rise_rate_nm_s")
+    release_rate = _positive(release_rate_nm_s, name="release_rate_nm_s")
+    velocity_deadband = _finite(
+        brake_velocity_deadband_rad_s,
+        name="brake_velocity_deadband_rad_s",
+    )
+    if velocity_deadband < 0.0:
+        raise ValueError("brake_velocity_deadband_rad_s must be non-negative")
+    if release_rate < rise_rate:
+        raise ValueError("release_rate_nm_s must be >= rise_rate_nm_s")
+
+    targets: list[float] = []
+    rates: list[float] = []
+    modes: list[str] = []
+    rates_are_equal = release_rate == rise_rate
+    for request, prior, qvel in zip(
+        requested,
+        previous,
+        velocity,
+        strict=True,
+    ):
+        dissipative = (
+            request != 0.0
+            and abs(qvel) > velocity_deadband
+            and request * qvel < 0.0
+        )
+        unwinding = prior != 0.0 and (
+            request == 0.0
+            or request * prior < 0.0
+            or abs(request) < abs(prior)
+        )
+        if dissipative:
+            mode = "brake"
+            target = request
+            rate = release_rate
+        elif unwinding:
+            mode = "release"
+            # A non-dissipative sign reversal may shed the old command quickly,
+            # but acceleration in the new direction still uses the rise rate.
+            target = (
+                request
+                if rates_are_equal or request * prior >= 0.0
+                else 0.0
+            )
+            rate = release_rate
+        else:
+            mode = "rise"
+            target = request
+            rate = rise_rate
+        targets.append(target)
+        rates.append(rate)
+        modes.append(mode)
+    return B601CartesianTorqueSlewDecision(
+        conditioning_target_nm=tuple(targets),
+        selected_rate_nm_s=tuple(rates),
+        mode=tuple(modes),
+    )
+
+
+def compute_cartesian_breakaway_compensation(
+    config: B601CartesianBreakawayConfig,
+    *,
+    task_torque_nm: Sequence[float],
+    measured_qvel_rad_s: Sequence[float],
+) -> B601CartesianBreakawayResult:
+    """Return smooth intent-directed stiction compensation for J2/J3.
+
+    The function is pure and owns no timer or hardware state.  Cartesian
+    authority ramping plus the existing joint-overlay torque conditioner remain
+    the only output ramp and absolute bound in the command path.
+    """
+
+    task = _six(task_torque_nm, name="task_torque_nm")
+    velocity = _six(measured_qvel_rad_s, name="measured_qvel_rad_s")
+    compensation: list[float] = []
+    velocity_weights: list[float] = []
+    intent_weights: list[float] = []
+    active: list[bool] = []
+    for index, (intent, qvel) in enumerate(zip(task, velocity, strict=True)):
+        velocity_weight = max(
+            0.0,
+            min(1.0, 1.0 - abs(qvel) / config.velocity_fade_rad_s),
+        )
+        intent_weight = max(
+            0.0,
+            min(
+                1.0,
+                (abs(intent) - config.intent_deadband_nm)
+                / config.intent_ramp_nm,
+            ),
+        )
+        magnitude = (
+            config.positive_torque_nm[index]
+            if intent > 0.0
+            else config.negative_torque_nm[index]
+            if intent < 0.0
+            else 0.0
+        )
+        value = math.copysign(
+            magnitude * velocity_weight * intent_weight,
+            intent,
+        ) if magnitude > 0.0 and intent != 0.0 else 0.0
+        compensation.append(value)
+        velocity_weights.append(velocity_weight)
+        intent_weights.append(intent_weight)
+        active.append(value != 0.0)
+    return B601CartesianBreakawayResult(
+        torque_nm=tuple(compensation),
+        velocity_weight=tuple(velocity_weights),
+        intent_weight=tuple(intent_weights),
+        active=tuple(active),
+    )
 
 
 @dataclass(frozen=True)
@@ -246,6 +478,7 @@ class B601CartesianAssistConfig:
 
     axis: str = "x"
     offset_m: float = 0.01
+    max_offset_m: float = _DEFAULT_CARTESIAN_MAX_OFFSET_M
     stiffness_n_per_m: float = 50.0
     damping_n_s_per_m: float = 3.0
     lateral_stiffness_n_per_m: float = 30.0
@@ -253,10 +486,14 @@ class B601CartesianAssistConfig:
     max_abs_force_n: float = 0.5
     max_abs_joint_torque_nm: float = 0.15
     max_joint_torque_rate_nm_s: float = 0.10
+    max_joint_torque_release_rate_nm_s: float | None = None
     authority_rise_per_sec: float = 0.5
     countdown_sec: float = 3.0
     assist_duration_sec: float = 6.0
     stationarity_limit_rad_s: float = 0.02
+    breakaway: B601CartesianBreakawayConfig = field(
+        default_factory=B601CartesianBreakawayConfig
+    )
 
     def __post_init__(self) -> None:
         axis = str(self.axis).strip().lower()
@@ -264,9 +501,16 @@ class B601CartesianAssistConfig:
             raise ValueError("axis must be x, y, or z")
         object.__setattr__(self, "axis", axis)
         offset = _finite(self.offset_m, name="offset_m")
-        if offset == 0.0 or abs(offset) > _MAX_CARTESIAN_COMMISSIONING_OFFSET_M:
-            raise ValueError("offset_m must be non-zero and within 0.05 m")
+        max_offset = _positive(self.max_offset_m, name="max_offset_m")
+        if offset == 0.0:
+            raise ValueError("offset_m must be non-zero")
+        if abs(offset) > max_offset:
+            raise ValueError(
+                "abs(offset_m) must not exceed configured max_offset_m="
+                f"{max_offset:g} m"
+            )
         object.__setattr__(self, "offset_m", offset)
+        object.__setattr__(self, "max_offset_m", max_offset)
         for name in (
             "stiffness_n_per_m",
             "max_abs_force_n",
@@ -278,6 +522,23 @@ class B601CartesianAssistConfig:
             "stationarity_limit_rad_s",
         ):
             object.__setattr__(self, name, _positive(getattr(self, name), name=name))
+        release_rate = self.max_joint_torque_release_rate_nm_s
+        if release_rate is None:
+            release_rate = self.max_joint_torque_rate_nm_s
+        normalized_release_rate = _positive(
+            release_rate,
+            name="max_joint_torque_release_rate_nm_s",
+        )
+        if normalized_release_rate < self.max_joint_torque_rate_nm_s:
+            raise ValueError(
+                "max_joint_torque_release_rate_nm_s must be >= "
+                "max_joint_torque_rate_nm_s"
+            )
+        object.__setattr__(
+            self,
+            "max_joint_torque_release_rate_nm_s",
+            normalized_release_rate,
+        )
         damping = _finite(self.damping_n_s_per_m, name="damping_n_s_per_m")
         if damping < 0.0:
             raise ValueError("damping_n_s_per_m must be non-negative")
@@ -290,6 +551,17 @@ class B601CartesianAssistConfig:
             if value < 0.0:
                 raise ValueError(f"{name} must be non-negative")
             object.__setattr__(self, name, value)
+        if not isinstance(self.breakaway, B601CartesianBreakawayConfig):
+            raise TypeError("breakaway must be B601CartesianBreakawayConfig")
+        for name, values in (
+            ("positive_torque_nm", self.breakaway.positive_torque_nm),
+            ("negative_torque_nm", self.breakaway.negative_torque_nm),
+        ):
+            if any(value > self.max_abs_joint_torque_nm for value in values):
+                raise ValueError(
+                    f"breakaway {name} must not exceed "
+                    "max_abs_joint_torque_nm"
+                )
 
     @property
     def axis_index(self) -> int:
@@ -326,8 +598,6 @@ class B601CartesianAssistResponseCriteria:
             "minimum_assist_delivery_ratio",
         ):
             object.__setattr__(self, name, _positive(getattr(self, name), name=name))
-        if self.minimum_response_m > _MAX_CARTESIAN_COMMISSIONING_OFFSET_M:
-            raise ValueError("minimum_response_m must be within 0.05 m")
         if self.maximum_response_ratio < 1.0:
             raise ValueError("maximum_response_ratio must be >= 1")
         if self.minimum_assist_delivery_ratio > 1.0:
@@ -547,11 +817,11 @@ def evaluate_cartesian_assist_response(
     expected_peak_force = config.maximum_static_force_n
     assist_delivery_ratio = max(0.0, peak_signed_force) / expected_peak_force
     maximum_response_m = min(
-        _MAX_CARTESIAN_COMMISSIONING_OFFSET_M,
+        config.max_offset_m,
         abs(config.offset_m) * acceptance.maximum_response_ratio,
     )
 
-    if max_abs_axis_excursion > _MAX_CARTESIAN_COMMISSIONING_OFFSET_M:
+    if max_abs_axis_excursion > config.max_offset_m:
         status = "HARD_EXCURSION_LIMIT_EXCEEDED"
     elif max_abs_axis_excursion > maximum_response_m:
         status = "EXCESSIVE_RESPONSE"
@@ -578,6 +848,9 @@ def evaluate_cartesian_assist_response(
         "direction": direction,
         "commanded_offset_m": config.offset_m,
         "settled_signed_displacement_m": settled_signed_displacement,
+        "settled_target_progress_ratio": (
+            settled_signed_displacement / abs(config.offset_m)
+        ),
         "peak_signed_displacement_m": peak_signed_displacement,
         "max_abs_axis_excursion_m": max_abs_axis_excursion,
         "minimum_response_m": acceptance.minimum_response_m,
@@ -1015,7 +1288,7 @@ class B601CartesianAssistSession:
         )
         signed_displacement = self.config.direction * delta[self.config.axis_index]
         maximum_response = min(
-            _MAX_CARTESIAN_COMMISSIONING_OFFSET_M,
+            self.config.max_offset_m,
             abs(self.config.offset_m) * criteria.maximum_response_ratio,
         )
         if abs(delta[self.config.axis_index]) > maximum_response:
@@ -1077,9 +1350,11 @@ class B601CartesianAssistSession:
             "state": self.state.value,
             "axis": self.config.axis,
             "offset_m": self.config.offset_m,
+            "max_offset_m": self.config.max_offset_m,
             "anchor_position_m": self.anchor_position_m,
             "anchor_rotation": self.anchor_rotation,
             "target_position_m": self.target_position_m,
+            "breakaway": self.config.breakaway.as_dict(),
             "armed_at_sec": self.armed_at_sec,
             "active_at_sec": self.active_at_sec,
             "completed_at_sec": self.completed_at_sec,
@@ -1102,8 +1377,11 @@ __all__ = [
     "B601CartesianAssistConfig",
     "B601CartesianAssistResponseCriteria",
     "B601CartesianAssistSession",
+    "B601CartesianBreakawayConfig",
+    "B601CartesianBreakawayResult",
     "B601SingleJointAssistConfig",
     "B601SingleJointAssistSession",
+    "compute_cartesian_breakaway_compensation",
     "evaluate_cartesian_assist_response",
     "evaluate_single_joint_assist_response",
 ]

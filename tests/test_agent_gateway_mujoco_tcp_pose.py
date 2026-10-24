@@ -1530,6 +1530,7 @@ def _build_no_model_contract_bundle_fixture(
         producer_id="control-station-agent-skill-fixture",
         producer_epoch=1,
     )
+    resource_close_calls = []
     runtime = SimpleNamespace(
         config=SimpleNamespace(
             runtime_session_id="runtime:agent-motion-bundle-fixture",
@@ -1579,6 +1580,8 @@ def _build_no_model_contract_bundle_fixture(
             ),
         ),
         clock=lambda: 10.0,
+        close=lambda: resource_close_calls.append("runtime.close"),
+        resource_close_calls=resource_close_calls,
     )
     frame_graph = CoordinateFrameGraph(
         graph_id="frame-graph:fixture",
@@ -1995,6 +1998,8 @@ def test_no_model_contract_bundle_exposes_exact_motion_and_state_routes(
         "station_hold_not_confirmed_no_active_operation"
     )
     assert motion_application.closed
+
+    assert motion_application.runtime.resource_close_calls == ["runtime.close"]
 
 
 def test_depth_artifact_route_uses_passive_executor_and_artifact_runtime(
