@@ -93,6 +93,9 @@ _NO_PAYLOAD_METHODS = frozenset(
 class AgentGatewayHardwareConnectionControl(Protocol):
     """Trusted application lifecycle port, absent from Skill discovery."""
 
+    @property
+    def control_fault_reason(self) -> str | None: ...
+
     def snapshot(self, client_id: str) -> Mapping[str, Any]: ...
 
     def request(self, client_id: str, payload: Mapping[str, Any]) -> Mapping[str, Any]: ...
