@@ -53,6 +53,7 @@ class WorkspaceCalibrationConfig:
     setup_label: str = "temporary_end_effector"
     holding_search: HoldingSearchConfig | None = None
     holding_sampling_plan: str = "detailed"
+    identification_position_bin_width_rad: float | None = None
     holding_excursion_rad: float | None = None
     holding_arrival_tolerance_rad: float | None = None
     coordinated_holding: CoordinatedHoldingConfig | None = None
@@ -81,6 +82,14 @@ class WorkspaceCalibrationConfig:
             self.holding_sampling_plan in {"coverage", "identification"} and self.coordinated_holding is None
         ):
             raise ValueError("coverage/identification sampling requires explicit coordinated holding")
+        if (self.coordinated_holding is not None and self.coordinated_holding.cruise_enabled
+            and self.holding_sampling_plan != "identification"):
+            raise ValueError("cruise velocity feedback requires explicit continuous identification")
+        if self.identification_position_bin_width_rad is not None and (
+            self.holding_sampling_plan != "identification"
+            or finite(self.identification_position_bin_width_rad, "identification position bin") <= .002
+        ):
+            raise ValueError("position-bin analysis requires continuous identification and width above 0.002 rad")
         if self.holding_arrival_tolerance_rad is not None and (
             self.coordinated_holding is None
             or not 0 < finite(self.holding_arrival_tolerance_rad, "holding arrival tolerance") <= self.holding_search.movement_rad

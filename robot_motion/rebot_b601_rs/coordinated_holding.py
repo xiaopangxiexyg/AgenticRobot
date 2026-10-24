@@ -27,6 +27,9 @@ class CoordinatedHoldingConfig:
     fall_slew_nm_s: float = 0.5
     supported_soft_recovery: bool = False
     recovery_kd_nm_s_per_rad: float = 6.0
+    cruise_velocity_kp_nm_s_per_rad: float = 0.0
+    cruise_velocity_ki_nm_per_rad: float = 0.0
+    cruise_velocity_window_sec: float = .2
 
     def __post_init__(self):
         for name, value in vars(self).items():
@@ -34,18 +37,24 @@ class CoordinatedHoldingConfig:
                 if type(value) is not bool:
                     raise TypeError("supported soft recovery must be boolean")
                 continue
-            if name == "recovery_kd_nm_s_per_rad":
+            if name in {"recovery_kd_nm_s_per_rad", "cruise_velocity_kp_nm_s_per_rad", "cruise_velocity_ki_nm_per_rad"}:
                 if finite(value, name) < 0:
-                    raise ValueError("recovery software damping must be nonnegative")
+                    raise ValueError(f"coordinated {name} must be nonnegative")
                 continue
             if finite(value, name) <= 0:
                 raise ValueError(f"coordinated {name} must be positive")
         if self.bias_cap_nm > self.total_assist_cap_nm:
             raise ValueError("holding bias must fit the combined assist envelope")
+        if self.cruise_enabled and not self.motor_local_recovery:
+            raise ValueError("cruise velocity feedback requires the explicit motor-local recovery profile")
 
     @property
     def motor_local_recovery(self):
         return self.supported_soft_recovery and self.recovery_kd_nm_s_per_rad == 0
+
+    @property
+    def cruise_enabled(self):
+        return self.cruise_velocity_kp_nm_s_per_rad > 0 or self.cruise_velocity_ki_nm_per_rad > 0
 
 
 class CoordinatedPoseHolding:
@@ -66,6 +75,15 @@ class CoordinatedPoseHolding:
             raise ValueError("coordinated holding must fit resolved native motion and assist limits")
         self.trackers = tuple(B601JointMotionTracker(self.motion) for _ in AXES)
         self.estimators = tuple(B601WindowVelocityEstimator(self.motion.velocity_window_sec) for _ in range(6))
+        if config.cruise_enabled and not (self.motion.velocity_window_sec <= config.cruise_velocity_window_sec
+            < 255*settings.nominal_control_period_sec):
+            raise ValueError("cruise window must fit the native velocity window and bounded observer history")
+        self.cruise_estimators = (tuple(B601WindowVelocityEstimator(config.cruise_velocity_window_sec) for _ in AXES)
+                                  if config.cruise_enabled else ())
+        self.cruise_error_estimators = (tuple(B601WindowVelocityEstimator(config.cruise_velocity_window_sec) for _ in AXES)
+                                        if config.cruise_enabled else ())
+        self.cruise_velocity = ZERO
+        self.cruise_error_velocity = ZERO
         self.q = self.raw = self.velocity = ZERO
         self.goal = None
         self.bias = ZERO
@@ -102,12 +120,18 @@ class CoordinatedPoseHolding:
                 # Never reuse their old stationary evidence for authorization.
                 for estimator in self.estimators:
                     estimator.reset()
+                self._reset_cruise_observers()
                 self.last_time = None
         dt = self.settings.nominal_control_period_sec if self.last_time is None else now - self.last_time
         self.last_time, self.q, self.raw = now, q, raw
         self.velocity = tuple(e.update(timestamp_sec=now, qpos_rad=p, fallback_rad_s=v)
                               for e, p, v in zip(self.estimators, q, raw, strict=True))
         return dt
+
+    def _reset_cruise_observers(self):
+        for estimator in (*self.cruise_estimators, *self.cruise_error_estimators):
+            estimator.reset()
+        self.cruise_velocity = self.cruise_error_velocity = ZERO
 
     def quiet(self):
         return window_stationarity_gate_reason(self.estimators, self.raw, self.velocity,
@@ -138,6 +162,9 @@ class CoordinatedPoseHolding:
             self.trackers = tuple(B601JointMotionTracker(replace(self.motion,
                 max_reference_velocity_rad_s=speed, support_soft_speed_recovery=recovery)) for _ in AXES)
         self.goal = goal
+        # A new leg must resolve motion after this handoff. Do not reuse the
+        # preceding leg's direction or deceleration tail for cruise control.
+        self._reset_cruise_observers()
         # A consumed command at departure is a handoff prior, not an estimate
         # of the holding force at the destination or a gravity correction.
         self._departure_bias = self.bias
@@ -276,7 +303,42 @@ class CoordinatedPoseHolding:
             scale = min(scale, frame.continuous_speed_scale)
         return scale
 
-    def step(self, *, sequence, dt, permitted, probe_joint=None, probe_nm=None, point_search=True, point_reacquire=False):
+    def _cruise_feedback(self, i, frame, dt):
+        audit = {"enabled": self.config.cruise_enabled, "active": False, "reason": "disabled"}
+        if not self.config.cruise_enabled:
+            return 0.0, self.bias[i], audit
+        audit["reason"] = "native_transition_owns_command"
+        if frame.phase != "track" or frame.reason != "bounded_reference_tracking":
+            return 0.0, self.bias[i], audit
+        estimator = self.cruise_estimators[AXES.index(i)]
+        relative = self.cruise_error_estimators[AXES.index(i)]
+        latest = relative.latest_observation
+        reference, velocity = frame.qvel_reference_rad_s, self.cruise_velocity[i]
+        audit.update(reference_velocity_rad_s=reference, measured_velocity_rad_s=velocity,
+            aligned_reference_velocity_rad_s=velocity+self.cruise_error_velocity[i],
+            observed_at_sec=None if latest is None else latest[0],
+            window_span_sec=estimator.span_sec, position_span_rad=estimator.position_span_rad)
+        if (not estimator.ready or not relative.ready or latest is None
+            or not 0 < self.last_time-latest[0] <= self.motion.max_control_gap_sec
+            or estimator.position_span_rad < 2*(self.motion.position_resolution_rad or 0)):
+            audit["reason"] = "waiting_for_resolved_cruise_motion"
+            return 0.0, self.bias[i], audit
+        if reference*velocity <= 0 or reference*(self.goal[i]-self.q[i]) <= 0:
+            audit["reason"] = "motion_not_aligned_with_reference"
+            return 0.0, self.bias[i], audit
+        # Both slopes use the same acknowledged frames/timestamps. Comparing
+        # an instantaneous reference with a filtered measurement would charge
+        # normal reference acceleration/deceleration into the retained bias.
+        error = self.cruise_error_velocity[i]
+        proportional = self.config.cruise_velocity_kp_nm_s_per_rad*error
+        increment = self.config.cruise_velocity_ki_nm_per_rad*error*dt
+        bias = max(-self.config.bias_cap_nm, min(self.config.bias_cap_nm, self.bias[i]+increment))
+        audit.update(active=True, reason="resolved_cruise_velocity_feedback", error_rad_s=error,
+            proportional_request_nm=proportional, requested_bias_increment_nm=increment)
+        return proportional, bias, audit
+
+    def step(self, *, sequence, dt, permitted, probe_joint=None, probe_nm=None, point_search=True, point_reacquire=False,
+             cruise_joint=None):
         if type(sequence) is not int or sequence < 0 or type(permitted) is not bool or not 0 < finite(dt, "control interval") <= self.motion.max_control_gap_sec:
             raise ValueError("coordinated step requires valid sequence, permit and control interval")
         if self.pending is not None:
@@ -291,6 +353,9 @@ class CoordinatedPoseHolding:
             raise ValueError("coordinated probes support J2/J3 only")
         if probe_nm is not None and (probe_joint is None or abs(finite(probe_nm, "probe")) > self.config.total_assist_cap_nm):
             raise ValueError("probe must fit the combined assist envelope")
+        if cruise_joint is not None and (type(cruise_joint) is not int or cruise_joint not in AXES
+            or point_search or point_reacquire or probe_nm is not None):
+            raise ValueError("cruise feedback requires continuous J2/J3 tracking without point probes")
         self.fault_frame = None
         proposed_bias, demand = list(self.bias), [0.0] * 6
         anchors, moving = list(self._approach_anchor), list(self._approach_moving)
@@ -300,6 +365,10 @@ class CoordinatedPoseHolding:
         supported_braking = False
         support_damping_velocity = [None] * 6
         composed_speed_scales = [1.0] * 6
+        cruise_p = [0.0]*6
+        cruise_audit = {"enabled": self.config.cruise_enabled, "active": False,
+            "joint_name": None if cruise_joint is None else f"joint{cruise_joint+1}",
+            "reason": "outside_identification_sweep"}
         frames = []
         fixed_probes = set()
         if permitted:
@@ -348,9 +417,21 @@ class CoordinatedPoseHolding:
                 elif is_probe:
                     moving[i], anchors[i] = False, self.q[i]
                     fixed_probes.add(i)
-                demand[i] = frame.requested_torque_nm + (0.0 if is_probe else proposed_bias[i])
+                if i == cruise_joint and not is_probe and brake_seed is None:
+                    proportional, cruise_bias, status = self._cruise_feedback(i, frame, dt)
+                    cruise_audit.update(status)
+                    if status["active"]:
+                        # Replace, rather than double-count, a short-window
+                        # stationary proposal during resolved slow motion.
+                        proposed_bias[i], moving[i] = cruise_bias, True
+                        cruise_p[i] = proportional
+                        approach_reasons[i] = "cruise_velocity_bias_refinement"
+                demand[i] = frame.requested_torque_nm + cruise_p[i] + (0.0 if is_probe else proposed_bias[i])
         self.braking = any(f.phase == "brake" and f.reason != "target_reached_braking" for f in frames)
         if self.braking:
+            cruise_p = [0.0]*6
+            cruise_audit.update(active=False, reason="native_braking_owns_command",
+                                proportional_request_nm=0.0, requested_bias_increment_nm=0.0)
             supported_braking = self.config.supported_soft_recovery and all(
                 f.phase != "brake" or f.reason == "target_reached_braking" or f.speed_governor_active
                 for f in frames)
@@ -495,12 +576,23 @@ class CoordinatedPoseHolding:
                         # Conditional integration can retain growth already
                         # realized inside the cap, not unexecuted slew debt.
                         # Otherwise a roundoff-sized clip freezes growth again.
-                        realized = command[i]-frame.requested_torque_nm
+                        realized = command[i]-frame.requested_torque_nm-cruise_p[i]
                         if abs(value) > abs(self.bias[i]) and not (
                             value*realized >= 0 and abs(value) <= abs(realized)+1e-12
                         ):
                             value = self._unwind_only(i, value)
                         proposed_bias[i] = value
+            if cruise_audit["active"]:
+                i = cruise_joint
+                # PI growth blocked by slew/cap is not an executed bias.
+                # Existing-bias reductions and native cap back-calculation
+                # remain allowed; they never grant a new opposite drive.
+                blocked = (abs(proposed_bias[i]) > abs(self.bias[i])
+                    and (proposed_bias[i]-self.bias[i])*(demand[i]-command[i]) > 1e-12)
+                if blocked:
+                    proposed_bias[i] = self._unwind_only(i, proposed_bias[i])
+                cruise_audit.update(integral_growth_blocked=blocked,
+                    proposed_bias_after_limits_nm=proposed_bias[i])
         else:
             proposed_bias = [0.0] * 6
             # Revocation invalidates a proposal immediately, even if a final
@@ -513,8 +605,13 @@ class CoordinatedPoseHolding:
             support_anchor = None
             moving, anchors = [False] * 6, list(self.q)
         self.frames = tuple(frames)
+        cruise_sample = None
+        if self.config.cruise_enabled and permitted and not self.braking and cruise_joint is not None:
+            frame = frames[AXES.index(cruise_joint)]
+            if frame.phase == "track" and frame.reason == "bounded_reference_tracking":
+                cruise_sample = (cruise_joint, self.last_time, self.q[cruise_joint], frame.q_reference_rad)
         self.pending = (sequence, tuple(command), tuple(proposed_bias), tuple(anchors), tuple(moving), brake_seed,
-                        support_anchor, supported_braking)
+                        support_anchor, supported_braking, cruise_sample)
         return tuple(command), {"target_qpos_rad": self.goal, "bias_nm": self.bias,
             "max_reference_velocity_rad_s": self.trackers[0].config.max_reference_velocity_rad_s,
             "support_soft_speed_recovery": self.trackers[0].config.support_soft_speed_recovery,
@@ -527,6 +624,7 @@ class CoordinatedPoseHolding:
             "arrival_tolerance_rad": self.arrival_tolerance_rad,
             "point_search_enabled": point_search,
             "point_reacquire_enabled": point_reacquire,
+            "cruise_velocity_control": cruise_audit,
             "supported_soft_stop": supported_braking,
             "support_anchor_rad": support_anchor,
             "support_dispatch_confirmed": self._support_receipt,
@@ -552,7 +650,8 @@ class CoordinatedPoseHolding:
         actual = six(actual_delta, "actual coordinated delta")
         if any(abs(actual[i]) > 1e-9 for i in (0, 3, 4, 5)) or sum(abs(v) for v in actual) > self.config.total_assist_cap_nm + 1e-9:
             raise ValueError("actual coordinated command exceeds combined envelope")
-        if max(abs(a-b) for a, b in zip(actual, self.pending[1])) <= 1e-9:
+        matching = max(abs(a-b) for a, b in zip(actual, self.pending[1])) <= 1e-9
+        if matching:
             self.bias = self.pending[2]
             self._approach_anchor, self._approach_moving, self._brake_seed = self.pending[3:6]
             self._support_anchor, self._support_receipt = self.pending[6:8]
@@ -560,4 +659,24 @@ class CoordinatedPoseHolding:
             self._support_receipt = False
         for tracker in self.trackers:
             tracker.record_dispatch(sequence)
+        if self.config.cruise_enabled:
+            sample = self.pending[8] if matching else None
+            if sample is None:
+                self._reset_cruise_observers()
+            else:
+                i, stamp, q, reference = sample
+                k = AXES.index(i)
+                latest = self.cruise_error_estimators[k].latest_observation
+                if latest is not None and stamp <= latest[0]:
+                    self._reset_cruise_observers()
+                else:
+                    for other in range(len(AXES)):
+                        if other != k:
+                            self.cruise_estimators[other].reset()
+                            self.cruise_error_estimators[other].reset()
+                    values, errors = [0.0]*6, [0.0]*6
+                    values[i] = self.cruise_estimators[k].update(timestamp_sec=stamp, qpos_rad=q, fallback_rad_s=0.0)
+                    errors[i] = self.cruise_error_estimators[k].update(timestamp_sec=stamp,
+                        qpos_rad=reference-q, fallback_rad_s=0.0)
+                    self.cruise_velocity, self.cruise_error_velocity = tuple(values), tuple(errors)
         self.last_delta, self.pending = actual, None

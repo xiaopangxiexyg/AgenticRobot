@@ -9,11 +9,15 @@ from dataclasses import asdict, replace
 from pathlib import Path
 
 import pytest
-
 from test_b601_command_calibration import condition, observations
 from test_b601_coordinated_holding import replay, scripted_coordinated_tick
-from control_station.b601_torque_console.automatic_calibration import load_automatic_profile
-from control_station.b601_torque_console.workspace_calibration import WorkspaceCalibrationConfig
+
+from control_station.b601_torque_console.automatic_calibration import (
+    load_automatic_profile,
+)
+from control_station.b601_torque_console.workspace_calibration import (
+    WorkspaceCalibrationConfig,
+)
 from control_station.b601_torque_console.workspace_identification import (
     _dispatch_integrals,
     _local_repeat_prediction,
@@ -22,8 +26,11 @@ from control_station.b601_torque_console.workspace_identification import (
     summarize_workspace_identification,
 )
 from robot_motion.rebot_b601_rs.gravity_identification import (
-    fit_paired_gravity_command, fit_paired_resistance_command,
-    pair_motion_observations, solve_gravity_design, summarize_pairing_coverage,
+    fit_paired_gravity_command,
+    fit_paired_resistance_command,
+    pair_motion_observations,
+    solve_gravity_design,
+    summarize_pairing_coverage,
 )
 from robot_motion.rebot_b601_rs.mit import B601_RS_JOINT_MIT_FRAME
 from scripts.hardware import rebot_b601_rs_low_gain_probe as probe
@@ -39,7 +46,9 @@ def test_continuous_plan_is_opt_in_multispeed_bidirectional_with_reserved_valida
     workspace = WorkspaceCalibrationConfig(**values["workspace"])
     cfg = probe._automatic_profile_values(PROFILE)
     assert WorkspaceCalibrationConfig().holding_sampling_plan == "detailed"
-    from control_station.b601_torque_console.automatic_calibration import AutomaticCalibrationConfig
+    from control_station.b601_torque_console.automatic_calibration import (
+        AutomaticCalibrationConfig,
+    )
     calibration = AutomaticCalibrationConfig(**{k: v for k, v in cfg.items() if k not in {"motion_profile", "cycle", "workspace"}})
     for joint in ("joint2", "joint3"):
         plan = workspace.sweep_plan(condition=condition(), joint_name=joint,
@@ -432,15 +441,19 @@ def test_closed_loop_cli_preserves_sources_and_exposes_independent_reprocessing(
     assert main(["--run-dir", str(tmp_path), "--closed-loop-identification"]) == 2
 
 
-def test_automatic_report_wires_continuous_fits_and_keeps_later_stop_separate(tmp_path):
-    from control_station.b601_torque_console.automatic_report import build_automatic_report
+@pytest.mark.parametrize("width", [None, .0045])
+def test_automatic_report_wires_continuous_fits_and_keeps_later_stop_separate(tmp_path, width):
+    from control_station.b601_torque_console.automatic_report import (
+        build_automatic_report,
+    )
 
     rows, context = motion_records()
     terminal = {"schema": "b601.automatic-joint-calibration.v1", "batch_id": "test",
         "state": "failed", "reason": "leg_timeout", "onset_trials": [],
         "condition": asdict(context), "outcome": {"severity": "warning", "reason": "leg_timeout"},
         "motion": {"completed_legs": []}, "workspace": {"holding_sampling_plan": "identification",
-            "setup_label": "synthetic", "acquisitions": []}}
+            "setup_label": "synthetic", "acquisitions": [],
+            "settings": {"identification_position_bin_width_rad": width}}}
     trace = tmp_path/"b601_owner.debug.jsonl"
     with trace.open("x") as stream:
         for row in [{**terminal, "kind": "automatic_calibration_started"}, *rows,
@@ -448,9 +461,14 @@ def test_automatic_report_wires_continuous_fits_and_keeps_later_stop_separate(tm
             stream.write(json.dumps(row)+"\n")
     report = build_automatic_report(tmp_path)
     assert not report["acquisition_complete"]
-    assert report["model_readiness"]["offline_candidates"] == 2
-    assert report["gravity_identification"]["status"] == "OFFLINE_CANDIDATE"
-    assert report["motion_data_assessment"]["model_eligible_windows"] > 0
+    assert report["command_identification"]["settings"]["position_bin_width_rad"] == width
+    if width is None:
+        assert report["model_readiness"]["offline_candidates"] == 2
+        assert report["gravity_identification"]["status"] == "OFFLINE_CANDIDATE"
+        assert report["motion_data_assessment"]["model_eligible_windows"] > 0
+    else:
+        assert report["command_identification"]["reduction_method"] == "closed_loop_average"
+        assert report["paired_resistance_identification"] == report["command_identification"]["paired_resistance_fit"]
     assert not report["auto_apply"]
 
 

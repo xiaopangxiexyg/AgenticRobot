@@ -417,7 +417,10 @@ class CoordinatedWorkspaceController:
                     # Reacquiring the frozen point is continuous transport.
                     # Only actual plateau observations own force bisection.
                     point_reacquire=(self.workspace.coordinated_holding.motor_local_recovery
-                        and self._phase == "sweep" and self._sample_pose is not None and self._probe is None))
+                        and self._phase == "sweep" and self._sample_pose is not None and self._probe is None),
+                    cruise_joint=(int(joint[-1])-1 if self._continuous_identification and self._phase == "sweep"
+                        and self._leg_index < len(self._steps)
+                        and self._steps[self._leg_index]["role"] in {"training", "validation"} else None))
             except ValueError as exc:
                 self.recording_failed(str(exc))
                 return ZERO, self._make_audit(ZERO, {}, fault=self._reason)
