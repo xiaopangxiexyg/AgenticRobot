@@ -1,8 +1,9 @@
 # MuJoCo checkpoint 组件与接入进度
 
-2026-10-24：已按用户要求恢复开发，并在原保存点上合入固定 development
-`b48d23aac3f0`。本轮完成 native scene、acceleration planner 和 actuated owner
-组件；完整 rig、Gateway 会话及 RPent 联合恢复仍待装配。现有入口不自动启用这些组件。
+2026-10-24：继续原隔离分支，并合入固定 development `05b769efe9c5`，保留其
+primitive scene v2 与观察改进。在 native scene、acceleration planner 和 actuated
+owner 组件上新增完整 manual execution rig 的可信内部 cut。target、Gateway 会话
+及 RPent 联合恢复仍待装配，现有入口不自动启用这些组件。
 
 ## 已保存的实现
 
@@ -32,7 +33,7 @@
 bash scripts/run_pytest.sh tests/test_mujoco_native_checkpoint.py tests/test_robot_motion_trajectory_checkpoint.py tests/test_mujoco_actuation_checkpoint.py tests/test_sim_actuation_checkpoint_clock.py -q
 ```
 
-本轮加上原 actuator、gripper、planner 与 execution rig 的受影响回归，共 **202 passed**。
+上一阶段加上原 actuator、gripper、planner 与 execution rig 的受影响回归，共 **202 passed**。
 新增模块与测试的 Ruff check/format 通过；旧 `scene.py` 和 `gripper.py` 原有的
 11 条 lint 告警未增加，保留基线状态。本轮未做完整 profile、渲染、远端、模型或任务验收。
 
@@ -67,12 +68,70 @@ faulted owner、额外 guard/oracle、未知 owner 实现不在该首阶段资�
 真实 CAD 用例在第 193 个 physics tick 保存非稳定状态：arm 有延迟命令、gripper
 有非零速率和新 queued intent。新 scene 与新 owner 装配后，对相同后续输入逐 tick
 比较了 40 个 tick 的 qpos/qvel/ctrl/act/warmstart、公开 snapshot 及 queued receipt。
-Native 与 planner 各自有新解释器测试；完整 owner bundle 尚没有磁盘/跨进程验收。
+Native 与 planner 各自有新解释器测试；完整 owner bundle 的磁盘/fresh-exec 格式
+仍待后续 store 验证，manual rig 的 fork 子进程验证见下节。
 
 既有 `reset(initial_state=...)` 可恢复 core pending，同时将新 wrapper 的本地 receipt
 初始化为 `(0,None)`；该状态原样保存，不由 core 补造历史。若已有非零本地 receipt，
 对应 pending 的 sequence/target 必须一致。完整 payload、来源及生命周期绑定由后续
 profile/store 负责；本层不证明任意两个组件来自同一段历史。
+
+## Manual execution rig 的完整 cut
+
+`sim.mujoco.adapters.checkpoint` 将上述组件接入现有 rig，提供
+`capture_execution_rig`、`restore_execution_rig` 与显式 `ManualExecutionClock`。
+实现位于 rig 所属 adapter 包内，没有改写控制算法、增加 scheduler 或创建第二执行环。
+
+首片资格明确限定为标准双臂、manual-step、acceleration-limited、physical arm＋gripper，
+collision projection 由原 executor 承担。realtime worker、sample-aligned QP、direct-qpos、
+upstream admission、physics observer、scheduled generation guards、额外 oracle/final guard、
+faulted owner、未完成 proposal、未知实例字段及未消费 bootstrap 参数都拒绝。其他原有
+运行模式仍按原语义运行；checkpoint 不隐式降级它们，也不清空状态帮助通过检查。
+
+保存内容包括完整 pending/active reference、双臂 qref 及 metadata、accepted qcmd、
+reference/command 水位、逻辑 clock 当前值与 origin、rig lifecycle tick 计数、完整
+planner 和 arm/gripper core/wrapper。metadata 顶层按侧保留字典，内部支持闭合的基础
+数据、tuple/list 和有限 numeric ndarray；复制后与源分离，未知 live binding 明确拒绝。
+即时手部 intent 已进入独立 gripper 队列，不能伪造到 reference 的 scheduled gripper 字段。
+正常 HOLD 在同一锁内同步完成；非空的待处理 HOLD reason 不属于合格完整事务。
+
+Capture 在 rig→clock 锁中取完整 cut，前后检查 ready/stop/fault。排除 observer 是为了
+避免 RLock 重入取得 `mj_step` 后、planner commit 前的半 tick；仅有 pending 为空不能证明
+完整边界。`close()` 在取得 rig 锁之前设置 stop event，因此结束检查会拒绝已经观察到的
+并发 close。应用仍必须先排空外部 admission；本地锁不冻结尚未提交的外部命令。
+
+恢复构造未发布的新 scene/rig/owners/planners，不调用 rig `start()`、wrapper `reset()`、
+native forward/reset/step，也不重放旧目标。检查配置、scene metadata 和调用方可信 profile
+提供的 `expected_model_sha256`；保留原时钟坐标，不换成接收进程的 `time.monotonic()`。
+核对两侧 committed/accepted q、held/core/next command sequence、active reference 与
+planner target 身份，全部通过后才返回 ready 候选。失败不改变源对象。
+Standalone planner codec 允许 initialized/reset-only 状态，但 started rig 的两侧必须
+已有 priming target（sequence=0 有效）；不能把无目标组件装配为 ready rig。
+
+既有 `start()` 仍只在已启动时幂等返回；后续 close→start 仍按旧语义创建新生命周期。
+这不自动重新满足 checkpoint 资格：旧 start 重置 core 时钟但不重置 native time，若两者
+已经不在同一完整 tick，就继续拒绝捕获。不能为了支持该模式而忽略时间错配。
+另一方面，公开 bootstrap API 在非零绝对 physics time、已有 command 水位上构造的
+一致 rig 可以封存；rig lifecycle tick 计数不得被误当成 actuator 的绝对 tick。
+
+可运行的本地仿真验证：
+
+```bash
+bash scripts/run_pytest.sh tests/test_mujoco_execution_checkpoint.py -q
+```
+
+测试包含有运动与延迟状态的第193 tick、pending mailbox、后续相同输入、HOLD 与正常
+生命周期、双分支隔离、并发 close、错误 metadata/reference 身份和不支持的 bindings。
+另验证合入主线后的 v2 cylinder scene 与原 metadata/native 绑定。完整 native 字段比较
+复用本页说明的官方分配条件和墙钟遥测边界，不丢弃 solver/contact/auxiliary 状态。
+本阶段最终将新模块与原 actuator/gripper/planner/rig、native/scene、domain boundary
+相关的15个完整测试文件组合运行：**303 passed，105.91秒**；独立评审已关闭发现的
+三项组合检查缺口，新模块及测试的 Ruff check/format 和 diff 检查通过。
+
+`ExecutionRigCheckpoint` 仍是可信内部对象，**没有定义磁盘导入格式或完整 profile 来源认证**。
+fork 子进程验证检查的是独立恢复与同输入续跑，不等于 fresh interpreter 从磁盘恢复。
+代码/owner/profile/父分支身份和原子存储由后续统一 store/应用负责，不能用组件通过来
+跳过已有源码、SDK、记录前缀或恢复 owner 检查。native ABI、MjSpec 限制仍如前述。
 
 ## 修正的延迟队列时间窗
 
@@ -91,8 +150,8 @@ profile/store 负责；本层不证明任意两个组件来自同一段历史。
 ## 尚未完成，不能据此放开上层
 
 1. Gateway admission、物理线程和控制 owner 的联合静止边界。
-2. 将上述 owner 组件组合成完整 rig，补 mailbox/reference、序号、逻辑时钟和严格资格；
-   再处理 target 的 authority、执行 gate、IK/safety 与保留引用。
+2. 将已有 manual rig cut 接到 target 的 authority、执行 gate、IK/safety、保留引用与
+   已知 observer；不能把本阶段明确排除的绑定直接放行。
 3. 新实例中 FK、collision、payload、observer、scratch 等消费者的统一绑定。
 4. profile 身份、持久化/原子提交、历史产物与恢复分支的来源关系。
 5. sleep 混合状态、完整 no-model profile、渲染和远端组合验收。
