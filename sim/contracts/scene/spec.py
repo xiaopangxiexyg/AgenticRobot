@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Any
 
-from ..versions import SCENE_SPEC_VERSION, require_version
+from ..versions import SCENE_SPEC_VERSION, SCENE_SPEC_VERSION_V2
 from .collision import CollisionSpec
 from .object import FreeBodyObjectSpec
 from .validation import finite_tuple
@@ -38,15 +38,26 @@ class SceneSpec:
     )
 
     def __post_init__(self) -> None:
-        require_version(self.schema_version, SCENE_SPEC_VERSION, field="scene spec version")
+        schema_version = str(self.schema_version)
+        if schema_version not in {SCENE_SPEC_VERSION, SCENE_SPEC_VERSION_V2}:
+            raise ValueError(
+                "Unsupported scene spec version "
+                f"{schema_version!r}; expected {SCENE_SPEC_VERSION!r} or "
+                f"{SCENE_SPEC_VERSION_V2!r}."
+            )
         if self.backend != "mujoco":
-            raise ValueError("MuJoCo is the canonical task-physics backend for SceneSpec v1.")
+            raise ValueError("MuJoCo is the canonical task-physics backend for SceneSpec.")
         if not self.profile_name or not self.urdf_path or not self.camera_registry_path:
             raise ValueError("Scene profile and asset paths must be non-empty.")
         gravity = finite_tuple(self.gravity_mps2, 3, "gravity_mps2")
         names = [obj.name for obj in self.objects]
         if len(names) != len(set(names)):
             raise ValueError("Scene object names must be unique.")
+        if schema_version == SCENE_SPEC_VERSION and any(
+            obj.shape != "box" for obj in self.objects
+        ):
+            raise ValueError("SceneSpec v1 supports box free bodies only; use v2 for other shapes.")
+        object.__setattr__(self, "schema_version", schema_version)
         object.__setattr__(self, "gravity_mps2", gravity)
         object.__setattr__(self, "objects", tuple(self.objects))
         if not isinstance(self.visual_rgba_by_link, Mapping):

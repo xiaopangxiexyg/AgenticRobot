@@ -179,11 +179,13 @@ annotation = [
     { name = "pyarrow" },
 ]
 core = [
+    { name = "embreex" },
     { name = "loop-rate-limiters" },
     { name = "numpy" },
     { name = "osqp" },
     { name = "qpsolvers" },
     { name = "scipy" },
+    { name = "trimesh" },
     { name = "typing-extensions" },
 ]
 dataset = [
@@ -232,6 +234,7 @@ vla-scratch = [
 requires-dist = [
     { name = "cryptography", marker = "extra == 'hardware'", specifier = ">=41,<50" },
     { name = "dearpygui", marker = "extra == 'hardware'", specifier = "==1.9.0" },
+    { name = "embreex", marker = "extra == 'core'", specifier = "==4.4.0.post1" },
     { name = "evdev", marker = "extra == 'hardware'", specifier = ">=1.7,<2" },
     { name = "grpcio", marker = "extra == 'hardware'", specifier = "==1.81.1" },
     { name = "grpcio-tools", marker = "extra == 'hardware'", specifier = "==1.81.1" },
@@ -262,11 +265,26 @@ requires-dist = [
     { name = "scipy", marker = "extra == 'core'", specifier = "==1.13.1" },
     { name = "torch", marker = "platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'model'", url = "https://download.pytorch.org/whl/cu126/torch-2.10.0%2Bcu126-cp310-cp310-manylinux_2_28_x86_64.whl" },
     { name = "transforms3d", marker = "extra == 'hardware'", specifier = "==0.4.1" },
+    { name = "trimesh", marker = "extra == 'core'", specifier = "==5.1.1" },
     { name = "typing-extensions", marker = "extra == 'core'", specifier = ">=4.12,<5" },
     { name = "websockets", marker = "extra == 'openpi'", specifier = "==16.0" },
     { name = "zstandard", marker = "extra == 'dataset'", specifier = "==0.25.0" },
 ]
 provides-extras = ["core", "test", "dataset", "annotation", "sim", "model", "openpi", "vla-scratch", "hardware"]
+
+[[package]]
+name = "embreex"
+version = "4.4.0.post1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "numpy" },
+]
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/60/2c/defbe43af0d4af6b375213b1c08f5addc9d0cdd2c14d9c6b7376c506fd71/embreex-4.4.0.post1-cp310-cp310-macosx_13_0_arm64.whl", hash = "sha256:131d756ccc3e6d99fa14ad8fd5edae42c62162e506daf1776def73654652a428", size = 5053734, upload-time = "2026-10-21T22:48:11.576Z" },
+    { url = "https://files.pythonhosted.org/packages/e9/7e/a532f579a9524e8aa079b217fb34ee50600da632a02c4c9789efea474564/embreex-4.4.0.post1-cp310-cp310-macosx_13_0_x86_64.whl", hash = "sha256:f01a5fb9c20ace516f0409ada42068abbbdd54ac1e71c465237f32204041d27d", size = 13226500, upload-time = "2026-10-21T22:48:13.789Z" },
+    { url = "https://files.pythonhosted.org/packages/a7/98/dc0136418609735ed1f62e81e8704d6bfc633eac83332cf05082733a18e6/embreex-4.4.0.post1-cp310-cp310-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:83d36eea60b097c367713102747cc1779152c289affe8cd0c2e9910805de05ca", size = 14514870, upload-time = "2026-10-21T22:48:16.293Z" },
+    { url = "https://files.pythonhosted.org/packages/ba/06/f5c033006bcf672d607f5e338d0177e366da944fd2cbc4ed49fdf352734c/embreex-4.4.0.post1-cp310-cp310-win_amd64.whl", hash = "sha256:5e2ef5c34d50fecb518a9c7d51c6545fd0e4797f80815b91e7b0eb565104a084", size = 13125076, upload-time = "2026-10-21T22:48:18.857Z" },
+]
 
 [[package]]
 name = "etils"
@@ -1279,6 +1297,18 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/bd/65/915840e94f946e878f3081da6f42c313162d23118bc2e81d7206600eaf00/transforms3d-0.4.1.tar.gz", hash = "sha256:31c755266a0b0a222488b8d039f6f325cf486c52728c03e307ce047b2fad1179", size = 1386381, upload-time = "2022-09-01T17:24:33.44Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/56/94/65e0fe886c6d5c86f4a0552dc98f49f9ed9d77c4d925a0af97d48a8226de/transforms3d-0.4.1-py3-none-any.whl", hash = "sha256:aea08776c1c915c8b424418994202aced8e46301c375ce63423d14f1d0045aa7", size = 1376757, upload-time = "2023-10-13T22:14:23.365Z" },
+]
+
+[[package]]
+name = "trimesh"
+version = "5.1.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "numpy" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/ab/bf/a7efaef127e0f1a228a03e5d00c04f5aeb2c25a60adb4d47003d4d0855bc/trimesh-5.1.1.tar.gz", hash = "sha256:56070be44cd97ac87544c9bd3da4b7a298c6f728e83183aeb1f3524d673d5fac", size = 874580, upload-time = "2026-10-02T21:06:07.704Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/8f/f6/fb68b8c08f864ecee8f7f7ee2f1203ed5cba2335215de69e4f621eb47db5/trimesh-5.1.1-py3-none-any.whl", hash = "sha256:c5be85a3e31e9ff749f9b0aecc204e37a2cf7cca4e92cd066bb5f3d3c1127765", size = 750449, upload-time = "2026-10-02T21:06:05.958Z" },
 ]
 
 [[package]]

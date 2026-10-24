@@ -12,8 +12,8 @@ import numpy as np
 
 from robot_motion.pose import pose_delta_metrics
 
-AXIAL_GRASP_SEARCH_ORDER = "original_motion_first_then_budgeted_axial_refinement_v1"
-GRASP_SEARCH_PREFERENCE = "observed_closing_contact_height_v10"
+AXIAL_GRASP_SEARCH_ORDER = "original_motion_first_then_bounded_axial_fallback_v2"
+GRASP_SEARCH_PREFERENCE = "observed_closing_contact_and_weak_side_insertion_v11"
 
 
 @dataclass(frozen=True)
@@ -29,6 +29,7 @@ class FirstGraspPathPolicy:
     endpoint_probe_total_budget_sec: float = 2.0
     axial_path_query_budget_sec: float = 3.0
     axial_publication_reserve_sec: float = 0.5
+    maximum_contact_refinement_queries: int = 2
     maximum_original_neighbor_queries: int = 2
     original_neighbor_query_budget_sec: float = 3.0
     cheap_endpoint_rejection_sec: float = 2.0
@@ -55,6 +56,9 @@ class FirstGraspPathPolicy:
         if (type(self.maximum_original_neighbor_queries) is not int
                 or not 0 <= self.maximum_original_neighbor_queries <= 2):
             raise ValueError("maximum_original_neighbor_queries must be an integer in [0, 2].")
+        if (type(self.maximum_contact_refinement_queries) is not int
+                or not 0 <= self.maximum_contact_refinement_queries <= 2):
+            raise ValueError("maximum_contact_refinement_queries must be an integer in [0, 2].")
         for name in ("total_budget_sec", "path_query_budget_sec", "axial_path_query_budget_sec",
                      "endpoint_probe_budget_sec", "endpoint_probe_total_budget_sec",
                      "axial_publication_reserve_sec", "original_neighbor_query_budget_sec",
@@ -178,6 +182,49 @@ def grasp_capture_support_cost(candidate: Any, *, policy: FirstGraspPathPolicy) 
     return cost
 
 
+def grasp_axial_refinement_support(candidate: Any) -> tuple[float, float]:
+    """Prefer improving the weaker observed closing edge, not just the median.
+
+    Sparse/uncomputed opposed evidence is unknown: it cannot turn an already
+    deep central patch into a measured shallow edge. This is only allocation
+    of existing bounded proposals, never a grasp or collision admission gate.
+    The central score breaks ties when the weaker side cannot yet be seen.
+    """
+    central = _capture_score(candidate, "capture_support_score")
+    opposed = _capture_score(candidate, "opposed_capture_support_score")
+    observed = getattr(candidate, "opposed_capture_support_observed_sides", 0)
+    if type(observed) is not int or not 0 <= observed <= 2:
+        raise ValueError("Opposed capture observed sides must be an integer in [0, 2].")
+    return (min(central, opposed) if observed else central), central
+
+
+def grasp_contact_evidence(candidate: Any) -> dict[str, float | int]:
+    """Bounded observed geometry, not a contact or physical grasp verdict."""
+    evidence = {}
+    for name in ("capture_support_score", "opposed_capture_support_score",
+                 "surface_alignment_score", "surface_opposition_score",
+                 "contact_height_support_score"):
+        if hasattr(candidate, name):
+            evidence[name] = _capture_score(candidate, name)
+    for name in ("opposed_capture_support_observed_sides", "surface_alignment_observed_sides"):
+        if hasattr(candidate, name):
+            value = getattr(candidate, name)
+            if type(value) is not int or not 0 <= value <= 2:
+                raise ValueError("Contact observed sides must be an integer in [0, 2].")
+            evidence[name] = value
+    return evidence
+
+
+def grasp_axial_refinement_improves(candidate: Any, source: Any) -> bool:
+    """Do not promote loss of a measured edge to improvement of that edge."""
+    before = grasp_axial_refinement_support(source)
+    after = grasp_axial_refinement_support(candidate)
+    if (getattr(candidate, "opposed_capture_support_observed_sides", 0)
+            < getattr(source, "opposed_capture_support_observed_sides", 0)):
+        return False
+    return after > before
+
+
 def grasp_search_preference(
     candidate: Any, motion_cost: float, *, policy: FirstGraspPathPolicy,
 ) -> tuple[float, float]:
@@ -291,7 +338,8 @@ def refined_grasp_search_order(
 
     Children do not displace other families by their inherited model score or
     improved capture score. Both the child and unchanged parent still need
-    separate complete path validation. Noneligible parents are not resurrected.
+    separate complete path validation. A failed parent path is not evidence
+    against its child. Noneligible parents are not resurrected.
     """
     indices = tuple(ordered_indices)
     if any(type(index) is not int or not 0 <= index < len(candidates) for index in indices
@@ -309,7 +357,7 @@ def refined_grasp_search_order(
     roots = [index for index in indices if index not in children]
     order = diverse_grasp_search_order(
         [candidate.base_from_tcp for candidate in candidates], roots, policy=policy)
-    return order
+    return order + tuple(index for index in indices if index in children)
 
 
 class GraspPathQueryRejected(RuntimeError):
@@ -336,6 +384,8 @@ def refine_first_grasp_path(
     result: FirstGraspPathResult, *, candidates: Sequence[Any],
     eligible_indices: Sequence[int], plan: Callable[[Any, float, float], Any],
     policy: FirstGraspPathPolicy, deadline: float,
+    preference_costs: Mapping[int, float] | None = None,
+    endpoint_probe: Callable[[Any, float], bool] | None = None,
     monotonic: Callable[[], float] = time.perf_counter,
 ) -> FirstGraspPathResult:
     """Refine only a complete success, retaining it on ordinary goal rejection.
@@ -363,35 +413,84 @@ def refine_first_grasp_path(
     # Every early return must still enforce the caller-owned global deadline.
     if deadline - began < policy.axial_path_query_budget_sec + policy.axial_publication_reserve_sec:
         return retain_original(monotonic())
-    children = [i for i in eligible_indices
-        if getattr(candidates[i], "axial_parent_index", None) == result.selected_index]
-    if not children:
+    tried = {attempt["index"] for attempt in result.attempts}
+    selected = candidates[result.selected_index]
+    alternatives = []
+    for i in eligible_indices:
+        if i in tried:
+            continue
+        candidate = candidates[i]
+        if getattr(candidate, "axial_parent_index", None) == result.selected_index:
+            if (not getattr(selected, "opposed_capture_support_observed_sides", 0)
+                    or grasp_axial_refinement_improves(candidate, selected)):
+                alternatives.append(i)
+        elif (preference_costs is not None
+                and preference_costs[i] < preference_costs[result.selected_index]
+                and grasp_axial_refinement_improves(candidate, selected)):
+            distance, rotation = pose_delta_metrics(
+                np.asarray(selected.base_from_tcp).reshape(4, 4),
+                np.asarray(candidate.base_from_tcp).reshape(4, 4))
+            if distance < policy.family_translation_m and rotation < policy.family_orientation_deg:
+                alternatives.append(i)
+    if not alternatives or not policy.maximum_contact_refinement_queries:
         return retain_original(monotonic())
-    child = min(children, key=lambda i: (-getattr(candidates[i], "capture_support_score", 1.), i))
+    alternatives.sort(key=lambda i: (
+        *(-value for value in grasp_axial_refinement_support(candidates[i])), i))
     index, trajectory, reason = result.selected_index, result.trajectory, "path_found"
     refinement_deadline = min(began + policy.axial_path_query_budget_sec,
                               deadline - policy.axial_publication_reserve_sec)
-    # Selection can consume time; retain the original absolute slice.
-    remaining = refinement_deadline - monotonic()
-    if remaining <= 0:
+    # Keep the original handle when selection has spent the optional slice.
+    if refinement_deadline - monotonic() <= 0:
         return retain_original(monotonic())
-    try:
-        improved = plan(candidates[child], min(policy.path_query_budget_sec,
-            remaining), refinement_deadline)
-    except GraspPathQueryRejected as error:
-        attempt_reason = error.reason_code
-    else:
-        if improved is None:
-            raise TypeError("A successful refinement must return a trajectory.")
-        index, trajectory, attempt_reason = child, improved, "path_found"
+    attempts = list(result.attempts)
+    endpoint_probes = list(result.endpoint_probes)
+    # Refinement shares the primary search's advisory probe allowance.
+    # Exhaustion skips only the probe, never the full path validation.
+    probe_remaining = max(0.0, policy.endpoint_probe_total_budget_sec
+        - sum(probe["elapsed_sec"] for probe in endpoint_probes))
+    for child in alternatives[:policy.maximum_contact_refinement_queries]:
+        now = monotonic()
+        if len(attempts) >= policy.maximum_path_queries or now >= refinement_deadline:
+            break
+        if (endpoint_probe is not None and probe_remaining > 0
+                and len(endpoint_probes) < policy.maximum_path_queries):
+            promising = endpoint_probe(candidates[child], min(policy.endpoint_probe_budget_sec,
+                probe_remaining, refinement_deadline-now))
+            if type(promising) is not bool:
+                raise TypeError("Endpoint probes must return an advisory bool.")
+            probe_elapsed = max(0., monotonic()-now)
+            endpoint_probes.append({"index": child, "promising": promising,
+                "elapsed_sec": probe_elapsed})
+            probe_remaining = max(0.0, probe_remaining - probe_elapsed)
+            now = monotonic()
+            if not promising or now >= refinement_deadline:
+                # Optional improvement only: an unknown endpoint is not a
+                # veto on the original fully checked path or a new retry loop.
+                continue
+        try:
+            improved = plan(candidates[child], min(policy.path_query_budget_sec,
+                refinement_deadline - now), refinement_deadline)
+        except GraspPathQueryRejected as error:
+            attempt_reason = error.reason_code
+        else:
+            if improved is None:
+                raise TypeError("A successful refinement must return a trajectory.")
+            # The native owner checks the subdeadline atomically with pending
+            # replacement. A later shared clock read cannot restore a handle
+            # that this successful transaction has already invalidated.
+            index, trajectory, attempt_reason = child, improved, "path_found"
+        attempts.append({"index": child, "reason_code": attempt_reason,
+            "elapsed_sec": max(0., monotonic()-now)})
+        if attempt_reason == "path_found":
+            break
     finished = monotonic()
     elapsed = max(0., finished - began)
     if finished >= deadline:
         index, trajectory, reason = None, None, "grasp_fast_search_budget_exhausted"
-        attempt_reason = reason
-    attempts = result.attempts + ({"index": child, "reason_code": attempt_reason, "elapsed_sec": elapsed},)
-    return FirstGraspPathResult(index, trajectory, attempts, reason, result.elapsed_sec + elapsed,
-                               result.endpoint_probes)
+        if len(attempts) > len(result.attempts):
+            attempts[-1]["reason_code"] = reason
+    return FirstGraspPathResult(index, trajectory, tuple(attempts), reason, result.elapsed_sec + elapsed,
+                               tuple(endpoint_probes))
 
 
 def find_first_grasp_path(

@@ -507,6 +507,8 @@ class RealFastGraspPlanProvider:
                 path_query_count=len(selected.result.attempts),
                 attempts_json=grasp_path_attempts_json(selected.result.attempts),
             )
+            if selected.contact_evidence:
+                result["diagnostics"]["contact_evidence"] = selected.contact_evidence
         result["diagnostics"]["elapsed_sec"] = max(0.0, self.monotonic() - started)
         self.registration.payload_validator.validate_execution_result(result)
         self.registration.payload_validator.validate_execution_result_for_parameters(

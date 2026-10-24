@@ -196,6 +196,18 @@ def fast_grasp_plan_schema_entry_v1(
                 "path_query_count": {"type": "integer", "minimum": 0, "maximum": 65536},
                 "elapsed_sec": {"type": "number", "minimum": 0, "maximum": 3600},
                 "attempts_json": {"type": "string", "maxLength": 8192},
+                "contact_evidence": {
+                    "type": "object", "additionalProperties": False,
+                    "properties": {
+                        **{name: {"type": "number", "minimum": 0, "maximum": 1}
+                           for name in ("capture_support_score", "opposed_capture_support_score",
+                               "surface_alignment_score", "surface_opposition_score",
+                               "contact_height_support_score")},
+                        **{name: {"type": "integer", "minimum": 0, "maximum": 2}
+                           for name in ("opposed_capture_support_observed_sides",
+                                        "surface_alignment_observed_sides")},
+                    },
+                },
             },
         },
     }
@@ -317,7 +329,15 @@ def validate_fast_grasp_plan_result_v1(
     diagnostics = _closed_payload(value["diagnostics"], diagnostics_schema)
     for field, item in diagnostics.items():
         spec = diagnostics_schema["properties"][field]
-        if spec["type"] == "integer":
+        if field == "contact_evidence":
+            contact = _closed_payload(item, spec)
+            for name, score in contact.items():
+                entry = spec["properties"][name]
+                if entry["type"] == "integer":
+                    nonnegative_integer(score, field_name=name, maximum=2)
+                else:
+                    _bounded_number(score, entry, field=name)
+        elif spec["type"] == "integer":
             nonnegative_integer(item, field_name=field, maximum=spec["maximum"])
         elif spec["type"] == "number":
             _bounded_number(item, spec, field=field)

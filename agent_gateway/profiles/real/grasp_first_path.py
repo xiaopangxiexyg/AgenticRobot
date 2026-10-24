@@ -15,6 +15,7 @@ from deployments.perception.grasp_first_path import (
     find_first_grasp_path,
     grasp_capture_height_acceptable,
     grasp_capture_support_cost_components,
+    grasp_contact_evidence,
     grasp_search_preference,
     original_grasp_neighbors,
     refine_first_grasp_path,
@@ -66,6 +67,7 @@ class RM65FirstGraspPathSelector:
         self.monotonic = monotonic
         self.cancelled = cancelled
         self.result = None
+        self.contact_evidence = {}
         self.pool_count = 0
         self.native_attempts = []
         self._preference_cache = {}
@@ -276,7 +278,12 @@ class RM65FirstGraspPathSelector:
         )
         self.result = refine_first_grasp_path(self.result, candidates=candidates,
             eligible_indices=tuple(index for _, _, index in eligible), plan=plan,
-            policy=self.policy, deadline=self.deadline, monotonic=self.monotonic)
+            policy=self.policy, deadline=self.deadline, monotonic=self.monotonic,
+            preference_costs={index: total for total, _, index in eligible},
+            endpoint_probe=(endpoint_probe if callable(
+                getattr(self.planner, "probe_grasp_endpoint_clearance", None)) else None))
+        if self.result.selected_index is not None:
+            self.contact_evidence = grasp_contact_evidence(candidates[self.result.selected_index])
         if _LOGGER.isEnabledFor(logging.INFO):
             # Keep bounded counterfactual evidence in the owner log, not in the
             # Agent's result payload. No extra solver/model queries are issued.
@@ -303,6 +310,8 @@ class RM65FirstGraspPathSelector:
                     "observed_contact": {
                         name: getattr(candidate, name, None) for name in (
                             "surface_alignment_score", "surface_alignment_observed_sides",
+                            "capture_support_score", "opposed_capture_support_score",
+                            "opposed_capture_support_observed_sides",
                             "surface_opposition_score", "contact_height_support_score",
                             "contact_height_center_shift_m", "contact_height_evidence_weight",
                             "height_shift_m", "height_shift_basis")

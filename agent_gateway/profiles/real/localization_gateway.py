@@ -317,6 +317,7 @@ class ObjectLocalizationProvider:
             "image_width": image.width,
             "image_height": image.height,
             "coordinate_format": "xyxy_pixel_0based_half_open",
+            "semantic_identity_status": "unverified_proposal",
             "detections": normalized,
             "detection_count": len(normalized),
             "model_profile_id": self.registration.profile.model_profile_id,

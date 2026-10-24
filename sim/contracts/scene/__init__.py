@@ -7,6 +7,7 @@ from .spec import (
     SceneSpec,
 )
 from .world import GroundSpec
+from ..versions import SCENE_SPEC_VERSION, SCENE_SPEC_VERSION_V2
 
 __all__ = [
     "CollisionSpec",
@@ -16,4 +17,6 @@ __all__ = [
     "FreeBodyObjectSpec",
     "GroundSpec",
     "SceneSpec",
+    "SCENE_SPEC_VERSION",
+    "SCENE_SPEC_VERSION_V2",
 ]
