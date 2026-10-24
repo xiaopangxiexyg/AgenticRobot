@@ -986,6 +986,7 @@ def test_station_point_grasp_plan_runs_inside_non_motion_read_window() -> None:
 @pytest.mark.parametrize("outcome", ("expired", "cancelled", "model_error"))
 def test_preparation_guard_reaches_actual_planner_model_boundaries(stage, outcome):
     import threading
+    from deployments.perception.dmtac_grasp_overlay import dmtac_graspgenx_alignment_profile
     from deployments.perception.sam2_graspgenx_point_grasp import Sam2GraspGenXPointGraspPlanner
     from teleop_runtime.skill_deploy.rm65_grasp_trajectory import RM65GraspTrajectoryPlanningError
 
@@ -1018,6 +1019,7 @@ def test_preparation_guard_reaches_actual_planner_model_boundaries(stage, outcom
     # Use actual provider/plan/_prepare_pool methods with already-running fake
     # model ports. No constructor, model start, device or output publication.
     planner = object.__new__(Sam2GraspGenXPointGraspPlanner)
+    planner._alignment = dmtac_graspgenx_alignment_profile()
     planner._lock = threading.RLock()
     planner._started, planner._closed = True, False
     planner.point_segmenter = SimpleNamespace(segment_point=segment)

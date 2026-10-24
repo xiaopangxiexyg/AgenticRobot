@@ -98,3 +98,20 @@ GUI 中的闭合和张开按实际内侧开口大小推断，而不是假定数�
 - 修改几何尺寸不会自动重估 mass/inertia。若导出的 URDF 用于动力学仿真，应在确定材料、质量和转动惯量后单独更新 inertial；本工具不会用未经授权的密度假设改写它们。
 - 自动贴合 contact frame 选择朝向另一 jaw 的主表面中心。非盒状或斜面接触件应在导出前结合 CAD/碰撞模型复核。
 - 这里的 3D 检查和 XML 校验是离线资产证据，不代表真实夹爪行程、碰撞安全或硬件标定已经验证。
+
+## GraspGenX/DMTAC 对齐预览
+
+现有 URDF/FK/mesh viewer 被 `utils.graspgenx_dmtac_alignment_gui`（Tk）与
+`utils.graspgenx_dmtac_alignment_qt`（可选 PyQt5）复用，展示 endpoint、真实安装法兰、
+控制 TCP、DMTAC sensing/tactile frame 与名义抓取模型。工具不连接机器人，不修改 URDF、
+mass/inertia、控制器 TCP 或运行中的推理 profile；保存只产生独立 JSON 提案。
+
+Tk 入口接受 `--urdf`、`--side`、`--tool-profile`、`--load-alignment`、
+`--headless-export`；Qt 使用同一初值与 JSON reader，并接受 `--urdf`、`--side`、
+`--tool-profile`。两者的 `--alignment-profile` 默认保持 v4；显式
+`DMTAC_M_graspgenx_alignment_v5_right_q0` 只支持右侧。启动、重置和 headless export
+读取同一个几何 owner，原 4B2 字段仅用于既有 JSON/对照视图兼容。
+
+完整 `tool_tcp_pose_endpoint_m_rad` 为六个有限 xyz/rpy 数值，存在时优先于 legacy z；
+只缺失该字段时才读取旧 z 格式。Tk 加载后保存保留全部六维，不能沿用上一个文件的 x/y/rpy。
+新名义模型的资源来源、适用侧与证据边界见 `docs/agent_gateway/POINT_GRASP.md`。

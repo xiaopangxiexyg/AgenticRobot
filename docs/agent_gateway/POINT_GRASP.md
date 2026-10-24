@@ -965,3 +965,28 @@ registry。生产 Skill 只广告当前部署已经具备可信 RGB 和相机 po
 `--captured-robot-self-envelope-urdf` 只用于捕获时删点，不会替换运动碰撞模型。
 扩展配置与几何参数哈希进入执行 manifest 及过滤证据，默认 manifest 和旧过滤证据不变。
 本地几何、离线或仿真验证不代表附件已获现场复核或真实动作已获验收。
+
+## 显式 DMTAC 名义对齐 profile
+
+现有默认 `DMTAC_M_graspgenx_alignment_v4_q0` 保留：finger length 100 mm、palm Z −29 mm，
+碰撞指尖扩展 1 mm；旧默认的几何、推理 sweep 和 semantic hash 不变。
+可选 `DMTAC_M_graspgenx_alignment_v5_right_q0` 采用 86.7 mm、−24 mm 与 3 mm 扩展，
+同时绑定新的完整 TCP→model 变换。使用现有入口的 `--graspgenx-alignment-profile` 显式选择，
+或在 Python planner 构造时传入 `alignment_profile_id`；不得只替换某个全局尺寸常量。
+
+同一个不可变 profile 供给推理 sweep、capture 名义尺寸、候选转换、碰撞几何及身份。
+3 mm 扩展只用于碰撞/渲染，不加入推理抓取深度。新 profile 拒绝旧尺寸或另一变换的
+`solid_geometry` override。原生运动、碰撞、截止时间、取消与最终输出保护继续由原 owner 负责。
+
+新 profile 的来源仅覆盖右臂、gripper q=0：执行/可达性消费者核对所选侧，
+共享候选调用须显式提供 `component_sides` 且只包含一个右臂 context；左臂或多臂共享被拒绝。
+q=0 描述标定来源及名义开爪模型，不是当前夹爪状态的实测证明；实时状态与完整碰撞检查仍由原链负责。
+冻结输入为 `1013deb1546c97599caa928bb24ddb4098d5169f` 的 alignment blob，
+父提交 `10f06a710` 本身不含该未跟踪 JSON。版本化记录
+`deployments/perception/profiles/dmtac_graspgenx_alignment_v5_right_q0.json`
+保存原 blob、URDF、工具配置摘要和名义参数；原绝对路径没有带入生产绑定。
+其证据等级为 `offline_nominal_alignment`，不是物理抓稳或整 CAD/闭爪扫掠包络认证。
+
+离线对齐工具见 `utils/gripper_urdf_editor/README.md` 的“GraspGenX/DMTAC 对齐预览”。
+Tk、Qt 和 headless 共用 profile 初值和完整 6D TCP 解析；完整 pose 存在时优先于旧 z scalar。
+导出的 GUI JSON 是可审查提案，不会自动修改工具标定或应用到运行中的 planner。

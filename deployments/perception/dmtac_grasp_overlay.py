@@ -9,9 +9,12 @@ wireframe, and draws it over an already captured image.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import math
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -63,6 +66,11 @@ DMTAC_M_GRASPGENX_GRASP_CENTER_FROM_TACTILE_Z_M = (
     DMTAC_M_GRASPGENX_GRASP_CENTER_FROM_TACTILE_XYZ_M[2]
 )
 DMTAC_M_GRASPGENX_ALIGNMENT_PROFILE_ID = "DMTAC_M_graspgenx_alignment_v4_q0"
+DMTAC_M_GRASPGENX_ALIGNMENT_PROFILE_ID_V5 = "DMTAC_M_graspgenx_alignment_v5_right_q0"
+DMTAC_M_GRASPGENX_ALIGNMENT_PROFILE_IDS = (
+    DMTAC_M_GRASPGENX_ALIGNMENT_PROFILE_ID,
+    DMTAC_M_GRASPGENX_ALIGNMENT_PROFILE_ID_V5,
+)
 
 # T_tool_tcp_from_graspgenx_model at the reviewed URDF pose (q=0, master q=0).
 # Keeping this as a full rigid transform preserves the small CAD/tactile frame
@@ -107,26 +115,103 @@ def reviewed_4b2_cad_solid_geometry(*, maximum_opening_m: float = 0.070) -> Para
     )
 
 
-def reviewed_graspgenx_dmtac_solid_geometry(
-    *, maximum_opening_m: float = DMTAC_M_GRASPGENX_MAX_OPENING_M
-) -> ParallelJawSolidGeometry:
-    """Return the saved DMTAC-specific GraspGenX geometry profile.
+@dataclass(frozen=True)
+class DmtacGraspGenXAlignmentProfile:
+    """One immutable selection for nominal, collision and inference geometry."""
 
-    This profile is intentionally independent of ``reviewed_4b2_cad_solid_geometry``.
-    Its local dimensions and the calibrated TCP-to-model transform come from
-    the saved GUI alignment; the legacy proxy remains available to consumers
-    that explicitly request it.
-    """
-    return ParallelJawSolidGeometry(
+    profile_id: str
+    nominal_geometry: ParallelJawSolidGeometry
+    collision_tip_extension_m: float
+    supported_motion_sides: tuple[str, ...]
+    source_content_hash: str | None = None
+
+    def __post_init__(self):
+        if self.profile_id not in DMTAC_M_GRASPGENX_ALIGNMENT_PROFILE_IDS:
+            raise ValueError("Unsupported DMTAC GraspGenX alignment profile.")
+        if not isinstance(self.nominal_geometry, ParallelJawSolidGeometry):
+            raise TypeError("Alignment nominal geometry must be typed.")
+        if (isinstance(self.collision_tip_extension_m, bool)
+                or not math.isfinite(self.collision_tip_extension_m)
+                or not 0 <= self.collision_tip_extension_m <= .01):
+            raise ValueError("Alignment collision extension must be finite and bounded.")
+        if self.supported_motion_sides != (("left", "right")
+                if self.profile_id == DMTAC_M_GRASPGENX_ALIGNMENT_PROFILE_ID else ("right",)):
+            raise ValueError("Alignment side coverage differs from the selected profile.")
+        if (self.profile_id == DMTAC_M_GRASPGENX_ALIGNMENT_PROFILE_ID_V5) != (self.source_content_hash is not None):
+            raise ValueError("Explicit v5 alignment requires its frozen source identity.")
+        if self.source_content_hash is not None and (
+                len(self.source_content_hash) != 64
+                or any(c not in "0123456789abcdef" for c in self.source_content_hash)):
+            raise ValueError("Alignment source hash must be lowercase SHA256.")
+
+    def collision_geometry(self, *, maximum_opening_m: float) -> ParallelJawSolidGeometry:
+        return replace(self.nominal_geometry, maximum_opening_m=maximum_opening_m,
+            finger_length_m=self.nominal_geometry.finger_length_m + self.collision_tip_extension_m)
+
+    def sweep_volume(self) -> dict[str, object]:
+        geometry = self.nominal_geometry
+        offset = (0., 0., geometry.palm_z_m + geometry.finger_length_m / 2.)
+        return {"extents_open": (geometry.maximum_opening_m, geometry.pad_height_m, geometry.finger_length_m),
+            "offset_open": offset,
+            "extents_mid": (geometry.maximum_opening_m / 2., geometry.pad_height_m, geometry.finger_length_m),
+            "offset_mid": offset, "gripper_type": 0,
+            "fingertip_depth": geometry.palm_z_m + geometry.finger_length_m}
+
+    def require_motion_sides(self, sides: Sequence[str]) -> None:
+        # v4 keeps the existing generic/read-only and shared-pool contract.
+        if self.profile_id != DMTAC_M_GRASPGENX_ALIGNMENT_PROFILE_ID and tuple(sides) != ("right",):
+            raise ValueError("Explicit v5 alignment supports one right-arm context at q0 only.")
+
+
+def dmtac_graspgenx_alignment_profile(
+    profile_id: str = DMTAC_M_GRASPGENX_ALIGNMENT_PROFILE_ID,
+) -> DmtacGraspGenXAlignmentProfile:
+    """Select an explicit calibration; never infer it from dimensions or files."""
+    if profile_id == DMTAC_M_GRASPGENX_ALIGNMENT_PROFILE_ID_V5:
+        raw = (Path(__file__).parent / "profiles/dmtac_graspgenx_alignment_v5_right_q0.json").read_bytes()
+        value = json.loads(raw)
+        if (not isinstance(value, dict) or set(value) != {
+                "schema", "profile_id", "supported_motion_sides", "gripper_master_q_rad",
+                "nominal_geometry", "collision_tip_extension_m", "evidence_status", "proxy_scope", "provenance"}
+                or value["schema"] != "agenticrobot.dmtac_graspgenx_alignment_profile.v1"
+                or value["profile_id"] != profile_id
+                or isinstance(value["gripper_master_q_rad"], bool)
+                or not isinstance(value["gripper_master_q_rad"], (int, float))
+                or value["gripper_master_q_rad"] != 0.
+                or value["supported_motion_sides"] != ["right"]
+                or value["evidence_status"] != "offline_nominal_alignment"):
+            raise ValueError("Explicit DMTAC alignment record is invalid.")
+        geometry = value["nominal_geometry"]
+        if not isinstance(geometry, dict) or set(geometry) != {
+                "palm_z_m", "finger_length_m", "finger_thickness_m", "pad_height_m",
+                "maximum_opening_m", "tool_from_solid_xyz_m", "solid_yaw_rad", "tool_from_solid_rotation"}:
+            raise ValueError("Explicit DMTAC alignment geometry is incomplete.")
+        geometry = {**geometry, "tool_from_solid_xyz_m": tuple(geometry["tool_from_solid_xyz_m"]),
+            "tool_from_solid_rotation": tuple(geometry["tool_from_solid_rotation"])}
+        return DmtacGraspGenXAlignmentProfile(profile_id, ParallelJawSolidGeometry(**geometry),
+            value["collision_tip_extension_m"], ("right",), hashlib.sha256(raw).hexdigest())
+    if profile_id != DMTAC_M_GRASPGENX_ALIGNMENT_PROFILE_ID:
+        raise ValueError("Unsupported DMTAC GraspGenX alignment profile.")
+    nominal = ParallelJawSolidGeometry(
         palm_z_m=DMTAC_M_GRASPGENX_PALM_Z_M,
-        finger_length_m=(DMTAC_M_GRASPGENX_FINGER_LENGTH_M
-                         + DMTAC_M_GRASPGENX_PROXY_FINGERTIP_EXTENSION_M),
+        finger_length_m=DMTAC_M_GRASPGENX_FINGER_LENGTH_M,
         finger_thickness_m=DMTAC_M_GRASPGENX_FINGER_THICKNESS_M,
         pad_height_m=DMTAC_M_GRASPGENX_PAD_HEIGHT_M,
-        maximum_opening_m=maximum_opening_m,
+        maximum_opening_m=DMTAC_M_GRASPGENX_MAX_OPENING_M,
         tool_from_solid_xyz_m=DMTAC_M_GRASPGENX_TOOL_FROM_MODEL_XYZ_M,
         tool_from_solid_rotation=DMTAC_M_GRASPGENX_TOOL_FROM_MODEL_ROTATION,
     )
+    return DmtacGraspGenXAlignmentProfile(profile_id, nominal,
+        DMTAC_M_GRASPGENX_PROXY_FINGERTIP_EXTENSION_M, ("left", "right"))
+
+
+def reviewed_graspgenx_dmtac_solid_geometry(
+    *, maximum_opening_m: float = DMTAC_M_GRASPGENX_MAX_OPENING_M,
+    alignment_profile_id: str = DMTAC_M_GRASPGENX_ALIGNMENT_PROFILE_ID,
+) -> ParallelJawSolidGeometry:
+    """Return collision geometry from the same explicitly selected alignment."""
+    return dmtac_graspgenx_alignment_profile(alignment_profile_id).collision_geometry(
+        maximum_opening_m=maximum_opening_m)
 
 
 def _rigid_transform(value: Any, *, field_name: str) -> np.ndarray:
@@ -627,6 +712,10 @@ def render_dmtac_grasp_overlays(
 
 __all__ = [
     "DMTAC_M_GRASPGENX_ALIGNMENT_PROFILE_ID",
+    "DMTAC_M_GRASPGENX_ALIGNMENT_PROFILE_ID_V5",
+    "DMTAC_M_GRASPGENX_ALIGNMENT_PROFILE_IDS",
+    "DmtacGraspGenXAlignmentProfile",
+    "dmtac_graspgenx_alignment_profile",
     "DMTAC_M_GRASPGENX_FINGER_LENGTH_M",
     "DMTAC_M_GRASPGENX_FINGER_THICKNESS_M",
     "DMTAC_M_GRASPGENX_GRASP_CENTER_FROM_TACTILE_XYZ_M",

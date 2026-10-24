@@ -2,6 +2,12 @@
 
 from __future__ import annotations
 
+from deployments.perception.dmtac_grasp_overlay import (
+    DMTAC_M_GRASPGENX_ALIGNMENT_PROFILE_ID,
+    DMTAC_M_GRASPGENX_ALIGNMENT_PROFILE_IDS,
+    dmtac_graspgenx_alignment_profile,
+)
+
 import argparse
 import json
 import os
@@ -110,6 +116,9 @@ def build_parser() -> argparse.ArgumentParser:
             "trusted profile resolves and the exact confirmation is present."
         ),
     )
+    parser.add_argument("--graspgenx-alignment-profile",
+        choices=DMTAC_M_GRASPGENX_ALIGNMENT_PROFILE_IDS, default=DMTAC_M_GRASPGENX_ALIGNMENT_PROFILE_ID,
+        help="Explicit nominal alignment; v5 is restricted to the right-arm q0 calibration.")
     parser.add_argument(
         "--socket-path",
         type=Path,
@@ -847,6 +856,15 @@ def _emit_lifecycle_event(payload: dict[str, Any]) -> None:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.graspgenx_alignment_profile != DMTAC_M_GRASPGENX_ALIGNMENT_PROFILE_ID:
+        if args.point_grasp_backend != "graspgenx":
+            parser.error("--graspgenx-alignment-profile requires the GraspGenX backend")
+        if not args.enable_point_grasp:
+            parser.error("--graspgenx-alignment-profile requires --enable-point-grasp")
+        try:
+            dmtac_graspgenx_alignment_profile(args.graspgenx_alignment_profile).require_motion_sides((args.authorized_side,))
+        except ValueError as error:
+            parser.error(str(error))
     if args.confirm != REAL_AGENT_PRIMITIVE_SESSION_CONFIRM_TOKEN:
         parser.error(
             "--confirm must exactly equal " + REAL_AGENT_PRIMITIVE_SESSION_CONFIRM_TOKEN
@@ -1253,7 +1271,7 @@ def main(argv: list[str] | None = None) -> int:
                     model_spec=point_grasp_spec,
                     point_segmenter=object_localizer,
                     client=graspgenx_backend,
-                    solid_geometry=reviewed_graspgenx_dmtac_solid_geometry(),
+                    alignment_profile_id=getattr(args, "graspgenx_alignment_profile", DMTAC_M_GRASPGENX_ALIGNMENT_PROFILE_ID),
                     orientation_variants_local_axis_degrees=(
                         GRASPGENX_DMTAC_REACHABILITY_ORIENTATION_VARIANTS_LOCAL_AXIS_DEG
                     ),

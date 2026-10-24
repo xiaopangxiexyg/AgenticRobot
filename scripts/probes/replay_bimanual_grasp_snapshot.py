@@ -6,6 +6,12 @@ the camera used to observe an object never selects the arm that will grasp it.
 """
 from __future__ import annotations
 
+from deployments.perception.dmtac_grasp_overlay import (
+    DMTAC_M_GRASPGENX_ALIGNMENT_PROFILE_ID,
+    DMTAC_M_GRASPGENX_ALIGNMENT_PROFILE_IDS,
+    dmtac_graspgenx_alignment_profile,
+)
+
 import argparse
 import json
 import time
@@ -169,7 +175,8 @@ def prepare(args):
 
     segment_aux = RetainedAuxiliarySegmenter(getattr(args, "aux_segmentation", ()))
 
-    solid = reviewed_graspgenx_dmtac_solid_geometry()
+    solid = reviewed_graspgenx_dmtac_solid_geometry(alignment_profile_id=getattr(
+        args, "graspgenx_alignment_profile", DMTAC_M_GRASPGENX_ALIGNMENT_PROFILE_ID))
     fused = fuse_grasp_views(anchor=anchor, anchor_mask=mask,
         anchor_pixel_uv=tuple(args.pixel) if args.refine_target_depth else None,
         auxiliary=tuple(v for k, v in views.items() if k != args.anchor),
@@ -187,6 +194,9 @@ def prepare(args):
 
 
 def replay(args):
+    selected_alignment = dmtac_graspgenx_alignment_profile(
+        getattr(args, "graspgenx_alignment_profile", DMTAC_M_GRASPGENX_ALIGNMENT_PROFILE_ID))
+    selected_alignment.require_motion_sides(args.sides)
     if len(set(args.sides)) != len(args.sides):
         raise ValueError("Each executing arm must be named only once")
     started = time.perf_counter()
@@ -257,7 +267,7 @@ def replay(args):
 
     point = Sam2GraspGenXPointGraspPlanner(model_spec=spec,
         point_segmenter=SimpleNamespace(segment_point=lambda *_a, **_k: mask.copy()), client=backend,
-        solid_geometry=reviewed_graspgenx_dmtac_solid_geometry(), enable_finger_exchange=True,
+        alignment_profile_id=getattr(args, "graspgenx_alignment_profile", DMTAC_M_GRASPGENX_ALIGNMENT_PROFILE_ID), enable_finger_exchange=True,
         orientation_variants_local_axis_degrees=GRASPGENX_DMTAC_REACHABILITY_ORIENTATION_VARIANTS_LOCAL_AXIS_DEG,
         preferred_approach_origins_base_m=tuple(context.origin for context in contexts.values()))
     shared, perception_error = None, None
@@ -268,7 +278,7 @@ def replay(args):
             pixel_uv=tuple(args.pixel), intrinsics=anchor.intrinsics,
             base_from_camera=anchor.reference_from_camera, max_candidates=5,
             use_visible_target_points=True, visible_scene_factory=scene_factory,
-            candidate_selectors=selectors)
+            candidate_selectors=selectors, component_sides={side: side for side in args.sides})
     except RuntimeError as exc:
         perception_error = {"type": type(exc).__name__, "message": str(exc)}
     finally:
@@ -361,6 +371,9 @@ def replay(args):
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("--graspgenx-alignment-profile",
+        choices=DMTAC_M_GRASPGENX_ALIGNMENT_PROFILE_IDS, default=DMTAC_M_GRASPGENX_ALIGNMENT_PROFILE_ID,
+        help="Explicit nominal alignment; v5 is restricted to the right-arm q0 calibration.")
     for name in ("repo", "canonical", "capture", "mask", "urdf", "output", "bundle"):
         p.add_argument("--"+name, required=True, type=Path)
     p.add_argument("--inference", type=Path)

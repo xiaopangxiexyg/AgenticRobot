@@ -436,6 +436,9 @@ class StationBoundPointGraspProvider:
         if not callable(current_station_revision):
             raise TypeError("current_station_revision must be callable.")
         reachability_profile = registration.profile.arm_reachability_profile
+        alignment_guard = getattr(planner, "require_alignment_motion_sides", None)
+        if reachability_profile is not None and callable(alignment_guard):
+            alignment_guard((reachability_profile.arm_side,))
         if bool(getattr(planner, "enable_finger_exchange", False)) != registration.profile.finger_exchange:
             raise ValueError("Finger-exchange generator and point-grasp registration differ.")
         if (reachability_profile is None) != (arm_reachability_evaluator is None):
