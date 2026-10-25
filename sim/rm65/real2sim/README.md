@@ -92,7 +92,13 @@ core and MuJoCo adapter used for the 20260721 fit; tests compare those hashes to
 fixed historical values rather than silently reinterpreting the fit against
 the current files.
 
-当前运行时源码绑定为 `artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261025_v20.json`。
+当前运行时源码绑定为 `artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261025_v21.json`。
+V21冻结V20，仅重绑motion_deployment一项源码，仍为60项源码、61项输入，无新增输入。
+显式profile导出恢复原79b6默认字节；归一化模式仅启用时明确输出，原语义hash、IK、
+控制及执行门禁不变。固定217项通过、零跳过的消费者报告绑定
+`d1a54844dcc27a9f24f48e7dd77788bbb11c7319` / `306fdc47e383abe480f92b0403ee7f213e4b3152`。
+
+历史V20为 `artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261025_v20.json`。
 V20在冻结V19之上登记默认关闭的对象/关系查询、认证表面锚点v1/v2/v3及显式safe profile，
 复用原规划、留存操作、CAS和资源关闭owner；更新5项来源，新增15项，共60项源码、61项输入。
 固定源码与567项通过、1项原RPent配对轮子缺失跳过、零失败的离线消费者报告绑定
@@ -100,7 +106,7 @@ V20在冻结V19之上登记默认关闭的对象/关系查询、认证表面锚�
 冻结计划不能激活；查询保留原碰撞、质量、rig→planner锁序、绝对deadline和执行保护。
 候选局部包络拒绝可继续比较后续候选；稠密查询只对逐种子诊断做内联摘要，保留实际残差、
 覆盖、容差及拒因，不改变lower完整诊断、排名或认证。普通/观测点Route保留原范围。
-V19、V18及历史绑定逐字保留，已有segment v2/v3仍按显式配置启用。
+V20、V19、V18及历史绑定逐字保留，已有segment v2/v3仍按显式配置启用。
 本批不重拟合arm参数，`provisional`及新held-out `not_run`保留，不构成真机或模型能力验收。
 历史V17、V16及更早绑定字节保持。
 
