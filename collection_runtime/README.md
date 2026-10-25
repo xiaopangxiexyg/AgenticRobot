@@ -81,6 +81,12 @@ manifest，再移除本轮生成的压缩载荷；目录同步失败也必须走
 替换可能已经生效。恢复失败时继续报错并保留 raw 和新压缩载荷，不删除可能仍被引用
 的数据。正常成功后的校验、原始载荷移除和 receipt 顺序不变。
 
+Native tactile bundle 重压缩也使用一个恢复出口，按原 metadata、原 manifests、
+本轮压缩载荷的顺序处理；任一恢复失败即中断后续清理，避免内层恢复失败后外层仍删掉
+被引用的数据。恢复快照逐 Episode 建立，不回退此前已成功提交的 Episode。恢复失败时
+metadata 图可能仍不一致，两套载荷保留不代表完整回滚；成功验证后的 raw 回收失败则
+保留已提交的新图，不回退到可能引用已删除 raw 的旧版本。
+
 Capture-time progress effective time is monotonic within the bound Episode
 clock. Nested Hold/Resume operation times must also be knowable by the receipt's
 availability time. The live reducer and read-time resolver enforce the same
