@@ -1,6 +1,6 @@
 # MuJoCo checkpoint 组件与接入进度
 
-2026-10-25：继续原隔离分支，并合入固定 development `b9286ded3fcc`，保留其
+2026-10-25：继续原隔离分支，并合入固定 development `9dd06cbbb8be`，保留其
 primitive scene v2、观察和 DMTAC 对齐改进。在 native scene、acceleration planner 和 actuated
 owner 组件上新增完整 manual execution rig 的可信内部 cut；随后补齐 source admission、
 execution authority、decision owners 三个控制状态组件及原 no-model target 的时钟接缝。
@@ -44,6 +44,11 @@ embodiment、terminal 伪装及目的配置错配。新解释器从磁盘读取�
 变化后，经过原 IK/dispatch 和30个 physics tick，对完整非空 core 做编码往返。
 前者证明逻辑 core 冷续跑；后者证明真实执行路径的数据可封存，均不证明恢复后的
 完整 native target 或 Gateway 已可执行。原生任务成功、真实模型与硬件未在此验收。
+
+本阶段合入固定 development `9dd06cbbb8be` 后，完整 core、三个 owner 组件、旧 runtime/
+dispatch、原生 target、MuJoCo 与 domain boundary 的组合回归为 **153 passed，15.74秒**。
+另保留三个先失败的反例，证实旧 active/previous 状态回退及错误 embodiment 会被拒绝。
+没有以补发 grant、删历史或跳过执行回执来取得恢复通过。
 
 ## 已保存的实现
 
