@@ -633,6 +633,9 @@ def _safe_fixture(monkeypatch, side, *, reject_at=None, basis_change=False, plan
     lifecycle._path_search_time_budget_sec = 3.0
     lifecycle._contact_binding = None
     lifecycle._observed_planning_provider = None
+    lifecycle._path_policy = None
+    lifecycle._axis_cone = None
+    lifecycle._path_constraint_evidence = None
     lifecycle._planner = SimpleNamespace(
         pose_for_configuration=lambda _qpos, _pair: target, plan=search,
         activate=lambda _plan: events.append("planner.activate"),

@@ -41,7 +41,6 @@ from agent_gateway.profiles.mujoco.motion_gateway_session import (
     assemble_mujoco_agent_tcp_pose_gateway_session,
 )
 from agent_gateway.profiles.mujoco.motion_primitive_profiles import (
-    MUJOCO_AGENT_TCP_FIXED_CARDINAL_STEP_ROUTE_ID_BY_SKILL_ID_V1,
     MUJOCO_AGENT_TCP_FIXED_ORIENTATION_ROUTE_ID_BY_SKILL_ID_V1,
     MujocoAgentTcpCardinalStepProfile,
     MujocoAgentTcpFixedOrientationProfile,
@@ -72,9 +71,7 @@ from agent_gateway.protocol.skill_catalog import (
 )
 from agent_gateway.runtime.artifact_store import RecoverableAgentArtifactStore
 from agent_gateway.skills.motion.definition import (
-    FIXED_CARDINAL_TCP_STEP_DIRECTION_BY_SKILL_ID_V1,
-    FIXED_CARDINAL_TCP_STEP_SKILL_IDS_V1,
-    FIXED_LEVEL_TCP_ORIENTATION_SKILL_IDS_V1,
+    ARCHIVED_DEBUG_MOTION_SKILL_IDS_V1,
 )
 from agent_gateway.skills.perception.definition import (
     CAPTURE_DEPTH_SKILL_ID_V1,
@@ -201,7 +198,8 @@ def _assert_unsettled_passive_read_defers_owned_dependency_cleanup(state_reader)
         history_executor=None,
         spatial_goal_executor=None, rgbd_capture_executor=None,
         object_goal_query_executor=None, surface_anchor_executors=(), localization_executor=None,
-        contract_bundle=SimpleNamespace(surface_anchor_registrations=()),
+        tcp_continuation_query_executor=None, candidate_query_executors=(), safe_tcp_pose_v2_executor=None,
+        contract_bundle=SimpleNamespace(surface_anchor_registrations=(), candidate_query_registrations=()),
         segmentation_executor=None,
         placement_executor=placement_executor,
         grasp_observation_executor=None,
@@ -587,9 +585,7 @@ def test_tcp_observation_transforms_raw_arm_base_pose_before_publication(
     )
 
 
-def test_mujoco_fixed_orientation_routes_use_a_separate_full_rotation_envelope() -> (
-    None
-):
+def test_mujoco_envelopes_no_longer_publish_archived_debug_routes() -> None:
     runtime = _build_standard_tcp_pose_envelope_runtime(
         prepared=SimpleNamespace(
             target_frame_profile=SimpleNamespace(
@@ -608,23 +604,15 @@ def test_mujoco_fixed_orientation_routes_use_a_separate_full_rotation_envelope()
     )
     entry_by_id = {entry.envelope_id: entry for entry in runtime.catalog_entries}
     standard = entry_by_id[MUJOCO_AGENT_TCP_POSE_STANDARD_ENVELOPE_ID_V1]
-    orientation = entry_by_id[MUJOCO_AGENT_TCP_FIXED_ORIENTATION_ENVELOPE_ID_V1]
-
+    assert set(entry_by_id) == {MUJOCO_AGENT_TCP_POSE_STANDARD_ENVELOPE_ID_V1}
     assert standard.profile.side_config_by_side["right"].max_rotation_rad == (
         pytest.approx(0.2617993877991494)
     )
-    assert orientation.profile.side_config_by_side["right"].max_rotation_rad == (
-        pytest.approx(3.141592653589793)
-    )
-    assert orientation.profile.side_config_by_side["right"].relative_min_xyz_m == (
-        0.0,
-        0.0,
-        0.0,
-    )
-    assert set(orientation.allowed_route_ids) == set(
+    assert standard.allowed_route_ids == ("sim.mujoco.rm65.agent_skill_tcp_pose",)
+    assert MUJOCO_AGENT_TCP_FIXED_ORIENTATION_ENVELOPE_ID_V1 not in entry_by_id
+    assert set(standard.allowed_route_ids).isdisjoint(
         MUJOCO_AGENT_TCP_FIXED_ORIENTATION_ROUTE_ID_BY_SKILL_ID_V1.values()
     )
-    assert set(standard.allowed_route_ids).isdisjoint(orientation.allowed_route_ids)
 
 
 def _contracts(motion_profile):
@@ -1736,10 +1724,6 @@ def test_no_model_contract_bundle_exposes_exact_motion_and_state_routes(
         "motion.move_tcp_to_pose",
         "1",
     )
-    cardinal_step_entry = bundle.route_manifest.route(
-        "motion.step_tcp_cardinal",
-        "1",
-    )
     state_entry = bundle.route_manifest.route("state.read_tcp_pose", "1")
     schema_entry = bundle.schema_catalog.entry(
         "motion.move_tcp_to_pose",
@@ -1756,29 +1740,11 @@ def test_no_model_contract_bundle_exposes_exact_motion_and_state_routes(
         "tool_config_hash": "tool-config:fixture",
         "calibration_hash": "calibration:agent-motion-bundle-fixture",
     }
-    cardinal_parameters = {
-        "component_id": "right_arm",
-        "direction": "up",
-        "reference_frame_id": bundle.cardinal_step_profile.reference_frame_id,
-        "reference_frame_spec_hash": (
-            bundle.cardinal_step_profile.reference_frame_spec_hash
-        ),
-        "controlled_frame_id": "tool_tcp",
-        "frame_graph_hash": bundle.cardinal_step_profile.frame_graph_hash,
-        "tool_config_hash": bundle.cardinal_step_profile.tool_config_hash,
-        "calibration_hash": bundle.cardinal_step_profile.calibration_hash,
-        "primitive_catalog_hash": (bundle.cardinal_step_profile.primitive_catalog_hash),
-    }
-
     assert bundle.route_manifest.current_mode == "sim_active"
     assert motion_entry.route.control_effect_class == "motion"
     assert motion_entry.route.privilege_tier == "t1_sim_or_no_motion"
     assert motion_entry.route.route_id == ("sim.mujoco.rm65.agent_skill_tcp_pose")
-    assert cardinal_step_entry.route.control_effect_class == "motion"
-    assert cardinal_step_entry.route.route_id == (
-        "sim.mujoco.rm65.agent_skill_tcp_cardinal_step"
-    )
-    assert bundle.cardinal_step_profile.reference_frame_id == ("mujoco_sim_hil/station")
+
     assert bundle.motion_profile.reference_frame_id == "mujoco_sim_hil/station"
     assert bundle.motion_profile.execution_reference_frame_id == "right_arm_base"
     assert bundle.state_deployment_binding.reference_frame_id == (
@@ -1798,25 +1764,24 @@ def test_no_model_contract_bundle_exposes_exact_motion_and_state_routes(
             route=state_entry.route,
             payload={**state_parameters, "reference_frame_id": "right_arm_base"},
         )
-    assert bundle.cardinal_step_profile.execution_reference_frame_id == (
-        "right_arm_base"
-    )
     assert tuple(
-        item.object_id
-        for item in bundle.cardinal_step_deployment_binding.safety_envelope_refs
+        item.object_id for item in bundle.deployment_binding.safety_envelope_refs
     ) == (MUJOCO_AGENT_TCP_POSE_STANDARD_ENVELOPE_ID_V1,)
     published_skill_ids = {
         entry.route.skill_id for entry in bundle.route_manifest.skill_routes
     }
-    assert set(FIXED_LEVEL_TCP_ORIENTATION_SKILL_IDS_V1) <= published_skill_ids
-    assert set(FIXED_CARDINAL_TCP_STEP_SKILL_IDS_V1) <= published_skill_ids
-    assert (
-        "distance_m"
-        not in bundle.schema_catalog.entry(
-            "motion.step_tcp_cardinal",
-            "1",
-        ).parameter_schema["properties"]
-    )
+    assert published_skill_ids == {"motion.move_tcp_to_pose", "state.read_tcp_pose"}
+    assert set(ARCHIVED_DEBUG_MOTION_SKILL_IDS_V1).isdisjoint(published_skill_ids)
+    for skill_id in ARCHIVED_DEBUG_MOTION_SKILL_IDS_V1:
+        with pytest.raises(KeyError):
+            bundle.route_manifest.route(skill_id, "1")
+        with pytest.raises(KeyError):
+            bundle.definition_catalog.definition(skill_id, "1")
+        with pytest.raises(KeyError):
+            bundle.schema_catalog.entry(skill_id, "1")
+        with pytest.raises(KeyError):
+            bundle.io_catalog.contract(skill_id, "1")
+
     assert state_entry.route.control_effect_class == "read_only"
     assert "requested_duration_ms" not in schema_entry.parameter_schema["properties"]
     assert captured_manifest_args["motion_authority_sources"] == (
@@ -1827,96 +1792,6 @@ def test_no_model_contract_bundle_exposes_exact_motion_and_state_routes(
         route=motion_entry.route,
         payload=parameters,
     )
-    bundle.payload_validators.validate_parameters(
-        route=cardinal_step_entry.route,
-        payload=cardinal_parameters,
-    )
-    for fixed_contract in bundle.fixed_cardinal_step_contracts:
-        fixed_route = bundle.route_manifest.route(
-            fixed_contract.skill_id,
-            "1",
-        ).route
-        assert (
-            fixed_route.route_id
-            == (
-                MUJOCO_AGENT_TCP_FIXED_CARDINAL_STEP_ROUTE_ID_BY_SKILL_ID_V1[
-                    fixed_contract.skill_id
-                ]
-            )
-        )
-        assert (
-            fixed_contract.direction
-            == (
-                FIXED_CARDINAL_TCP_STEP_DIRECTION_BY_SKILL_ID_V1[
-                    fixed_contract.skill_id
-                ]
-            )
-        )
-        fixed_parameters = {
-            **cardinal_parameters,
-            "direction": fixed_contract.direction,
-        }
-        bundle.payload_validators.validate_parameters(
-            route=fixed_route,
-            payload=fixed_parameters,
-        )
-        with pytest.raises(ValueError, match="unsupported direction"):
-            bundle.payload_validators.validate_parameters(
-                route=fixed_route,
-                payload={**fixed_parameters, "direction": "diagonal"},
-            )
-    for orientation_contract in bundle.fixed_orientation_contracts:
-        orientation_profile = orientation_contract.profile
-        orientation_route = bundle.route_manifest.route(
-            orientation_profile.skill_id,
-            "1",
-        ).route
-        assert (
-            orientation_route.route_id
-            == (
-                MUJOCO_AGENT_TCP_FIXED_ORIENTATION_ROUTE_ID_BY_SKILL_ID_V1[
-                    orientation_profile.skill_id
-                ]
-            )
-        )
-        assert orientation_profile.reference_frame_id == "mujoco_sim_hil/station"
-        assert orientation_profile.execution_reference_frame_id == "right_arm_base"
-        assert tuple(
-            item.object_id
-            for item in orientation_contract.deployment_binding.safety_envelope_refs
-        ) == (MUJOCO_AGENT_TCP_FIXED_ORIENTATION_ENVELOPE_ID_V1,)
-        assert orientation_contract.motion_profile.max_translation_delta_m == (
-            pytest.approx(1e-6)
-        )
-        assert orientation_contract.motion_profile.max_rotation_delta_rad == (
-            pytest.approx(math.pi)
-        )
-        orientation_parameters = {
-            "component_id": orientation_profile.component_id,
-            "reference_frame_id": orientation_profile.reference_frame_id,
-            "reference_frame_spec_hash": (
-                orientation_profile.reference_frame_spec_hash
-            ),
-            "controlled_frame_id": "tool_tcp",
-            "frame_graph_hash": orientation_profile.frame_graph_hash,
-            "tool_config_hash": orientation_profile.tool_config_hash,
-            "calibration_hash": orientation_profile.calibration_hash,
-            "primitive_hash": (orientation_profile.primitive.semantic_content_hash),
-        }
-        bundle.payload_validators.validate_parameters(
-            route=orientation_route,
-            payload=orientation_parameters,
-        )
-        with pytest.raises(ValueError, match="exactly match"):
-            bundle.payload_validators.validate_parameters(
-                route=orientation_route,
-                payload={**orientation_parameters, "yaw_deg": 30.0},
-            )
-    with pytest.raises(ValueError, match="unsupported direction"):
-        bundle.payload_validators.validate_parameters(
-            route=cardinal_step_entry.route,
-            payload={**cardinal_parameters, "direction": "diagonal"},
-        )
     with pytest.raises(ValueError, match="exactly match"):
         bundle.payload_validators.validate_parameters(
             route=motion_entry.route,
@@ -1944,17 +1819,8 @@ def test_no_model_contract_bundle_exposes_exact_motion_and_state_routes(
         for item in session.service.executor_registry.bindings
     }
     assert route_to_port["motion.move_tcp_to_pose"] is session.motion_executor
-    assert route_to_port["motion.step_tcp_cardinal"] is (session.cardinal_step_executor)
-    assert set(FIXED_CARDINAL_TCP_STEP_SKILL_IDS_V1) <= set(route_to_port)
-    for skill_id in FIXED_CARDINAL_TCP_STEP_SKILL_IDS_V1:
-        assert (
-            route_to_port[skill_id] is session.fixed_cardinal_step_executors[skill_id]
-        )
-    assert set(FIXED_LEVEL_TCP_ORIENTATION_SKILL_IDS_V1) <= set(route_to_port)
-    for skill_id in FIXED_LEVEL_TCP_ORIENTATION_SKILL_IDS_V1:
-        assert route_to_port[skill_id] is session.fixed_orientation_executors[
-            skill_id
-        ]
+    assert set(ARCHIVED_DEBUG_MOTION_SKILL_IDS_V1).isdisjoint(route_to_port)
+    assert session._motion_executors() == (session.motion_executor,)
     assert route_to_port["state.read_tcp_pose"] is session.state_executor
     assert session.service.operation_store.max_retained_operations == 3
     assert session.service.operation_store.max_admissions_by_route_hash == {}
@@ -1972,9 +1838,9 @@ def test_no_model_contract_bundle_exposes_exact_motion_and_state_routes(
     assert {item["skill_id"] for item in simulation["read_skill_refs"]} == {
         "state.read_tcp_pose"
     }
-    assert "motion.step_tcp_forward" in {
+    assert {
         item["skill_id"] for item in simulation["drive_skill_refs"]
-    }
+    } == {"motion.move_tcp_to_pose"}
     configured = adapter.get_hardware_status_views()["resources"][0]
     assert configured["occupancy"] == "free"
     assert configured["health"] == "unavailable"
@@ -2604,10 +2470,6 @@ def test_installed_rpent_toolkit_consumes_exact_motion_and_state_routes(
         "motion.move_tcp_to_pose",
         "1",
     )
-    cardinal_entry = bundle.route_manifest.route(
-        "motion.step_tcp_cardinal",
-        "1",
-    )
     parameters = {
         "pose_targets_by_component": {
             "right_arm": [0.4, -0.1, 0.5, 0.0, 0.0, 0.0, 1.0]
@@ -2619,20 +2481,6 @@ def test_installed_rpent_toolkit_consumes_exact_motion_and_state_routes(
         "tool_config_hash": "tool-config:fixture",
         "calibration_hash": "calibration:agent-motion-bundle-fixture",
     }
-    cardinal_parameters = {
-        "component_id": bundle.cardinal_step_profile.component_id,
-        "direction": "forward",
-        "reference_frame_id": bundle.cardinal_step_profile.reference_frame_id,
-        "reference_frame_spec_hash": (
-            bundle.cardinal_step_profile.reference_frame_spec_hash
-        ),
-        "controlled_frame_id": "tool_tcp",
-        "frame_graph_hash": bundle.cardinal_step_profile.frame_graph_hash,
-        "tool_config_hash": bundle.cardinal_step_profile.tool_config_hash,
-        "calibration_hash": bundle.cardinal_step_profile.calibration_hash,
-        "primitive_catalog_hash": (bundle.cardinal_step_profile.primitive_catalog_hash),
-    }
-
     source_slot = bundle.station_manifest.source_slots[0]
     snapshot = AgentObservationSnapshot(
         snapshot_id="agent-observation:agent-motion-bundle-fixture",
@@ -2678,11 +2526,6 @@ def test_installed_rpent_toolkit_consumes_exact_motion_and_state_routes(
         for spec in toolkit.get_tools_spec()
         if spec["name"].startswith("dex__motion_move_tcp_to_pose")
     )
-    cardinal_spec = next(
-        spec
-        for spec in toolkit.get_tools_spec()
-        if spec["name"].startswith("dex__motion_step_tcp_cardinal")
-    )
 
     assert set(motion_spec["input_schema"]["properties"]) == set(parameters)
     assert "requested_duration_ms" not in motion_spec["input_schema"]["properties"]
@@ -2694,15 +2537,10 @@ def test_installed_rpent_toolkit_consumes_exact_motion_and_state_routes(
     assert client.submitted_requests[0]["route_hash"] == (
         motion_entry.route.semantic_content_hash
     )
-    assert set(cardinal_spec["input_schema"]["properties"]) == set(cardinal_parameters)
-    assert "distance_m" not in cardinal_spec["input_schema"]["properties"]
-    cardinal_response = toolkit.execute_tool(
-        cardinal_spec["name"],
-        cardinal_parameters,
-    ).result
-    assert cardinal_response["accepted"]
-    assert client.submitted_requests[1]["route_hash"] == (
-        cardinal_entry.route.semantic_content_hash
+    assert not any(
+        any(skill_id.replace(".", "_") in spec["name"]
+            for skill_id in ARCHIVED_DEBUG_MOTION_SKILL_IDS_V1)
+        for spec in toolkit.get_tools_spec()
     )
     consumer_session.close()
 
@@ -2765,7 +2603,8 @@ def _gateway_close_retry_session(outcomes, *, started=True):
         rgb_executor=None, back_projection_executor=None, history_executor=None,
         spatial_goal_executor=None, segmentation_executor=None, placement_executor=None,
         object_goal_query_executor=None, surface_anchor_executors=(), localization_executor=None,
-        contract_bundle=SimpleNamespace(surface_anchor_registrations=()),
+        tcp_continuation_query_executor=None, candidate_query_executors=(), safe_tcp_pose_v2_executor=None,
+        contract_bundle=SimpleNamespace(surface_anchor_registrations=(), candidate_query_registrations=()),
         _segmentation_model_started=False,
         segmentation_localizer=SimpleNamespace(
             start=lambda: calls["model_start"].append("started"),
@@ -2982,6 +2821,7 @@ def test_unsettled_frozen_query_or_anchor_defers_shared_cleanup(kind):
     registration = SimpleNamespace(skill=SimpleNamespace(
         routes=(SimpleNamespace(max_operation_duration_ms=30_000),)))
     session.contract_bundle = SimpleNamespace(
+        candidate_query_registrations=(),
         object_goal_query_registration=registration if kind == "query" else None,
         surface_anchor_registrations=(registration,) if kind == "anchor" else ())
     session.object_goal_query_executor = reader if kind == "query" else None

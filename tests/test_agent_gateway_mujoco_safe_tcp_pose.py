@@ -4,6 +4,7 @@ import json
 import threading
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -16,6 +17,7 @@ from agent_gateway.protocol.contracts import (
     AgentOwnOperationCancelRequest,
     AgentSkillRequest,
 )
+from agent_gateway.skills.motion.definition import ARCHIVED_DEBUG_MOTION_SKILL_IDS_V1
 from project_paths import resolve_path
 from sim.mujoco.collision_safety import CollisionSafetyOracle
 from sim.mujoco.deploy import MujocoSimHILTargetConfig
@@ -30,7 +32,7 @@ CLIENT = "test:mujoco-safe-tcp"
 
 
 def _session(trace, *, after_fact=None, task=TASK, spatial=False, grasp=False,
-             contact_target=None, motion_side="right", safe_profile="local_step", queries=False):
+             contact_target=None, motion_side="right", safe_profile="local_step", queries=False, path_constraints=False, continuations=False):
     def consume(fact):
         trace.append(fact)
         if after_fact is not None:
@@ -52,6 +54,8 @@ def _session(trace, *, after_fact=None, task=TASK, spatial=False, grasp=False,
         motion_side=motion_side,
         trace_sink=consume,
         enable_safe_tcp_pose=True,
+        enable_safe_tcp_path_constraints=path_constraints,
+        enable_tcp_continuation_queries=continuations,
         enable_spatial_goals=spatial,
         enable_object_goal_queries=queries,
         safe_tcp_motion_profile=safe_profile,
@@ -61,10 +65,10 @@ def _session(trace, *, after_fact=None, task=TASK, spatial=False, grasp=False,
     )
 
 
-def _request(session, adapter, target, *, sequence=0, skill_id="motion.move_tcp_to_pose_safe", policy=None, timeout_ms=120_000):
+def _request(session, adapter, target, *, sequence=0, skill_id="motion.move_tcp_to_pose_safe", policy=None, timeout_ms=120_000, version="1", path_constraint=None):
     observation = adapter.get_observation_snapshot()
     entry = session.contract_bundle.route_manifest.route(
-        skill_id, "1"
+        skill_id, version
     )
     route = entry.route
     profile = session.contract_bundle.motion_profile
@@ -95,6 +99,7 @@ def _request(session, adapter, target, *, sequence=0, skill_id="motion.move_tcp_
             "tool_config_hash": profile.tool_config_hash,
             "calibration_hash": profile.calibration_hash,
             **({"pose_goal_policy": policy} if policy is not None else {}),
+            **({"path_constraint": path_constraint} if version == "2" else {}),
         },
         observation_snapshot_id=observation["snapshot_id"],
         requested_mode="sim_active",
@@ -174,6 +179,60 @@ def _place_cube_at_collision(application, plan, *, terminal):
     raise AssertionError(
         "Could not construct the declared start-free collision fixture"
     )
+
+
+@pytest.mark.parametrize("safe_profile", ["local_step", "object_relation_precise"])
+def test_native_safe_session_does_not_republish_archived_debug_skills(safe_profile):
+    session = _session([], safe_profile=safe_profile, queries=True)
+    try:
+        bundle = session.contract_bundle
+        published = {entry.route.skill_id for entry in bundle.route_manifest.skill_routes}
+        assert {"motion.move_tcp_to_pose", "motion.move_tcp_to_pose_safe"} <= published
+        assert ARCHIVED_DEBUG_MOTION_SKILL_IDS_V1.isdisjoint(published)
+        assert len(session._motion_executors()) == 2
+        for skill_id in sorted(ARCHIVED_DEBUG_MOTION_SKILL_IDS_V1):
+            with pytest.raises(KeyError):
+                bundle.route_manifest.route(skill_id, "1")
+            with pytest.raises(KeyError):
+                bundle.definition_catalog.definition(skill_id, "1")
+            with pytest.raises(KeyError):
+                bundle.schema_catalog.entry(skill_id, "1")
+            with pytest.raises(KeyError):
+                bundle.io_catalog.contract(skill_id, "1")
+        assert not session.application.started
+    finally:
+        outcome = session.close()
+        assert not outcome.accepted
+        assert outcome.reason_code == "station_hold_not_confirmed_no_active_operation"
+        assert session.application.closed
+
+
+def test_native_gateway_rejects_archived_skill_requests_without_dispatch():
+    facts = []
+    session = _session(facts)
+    try:
+        session.application.start_observation_ready()
+        adapter = session.wire_adapter(authenticated_client_id=CLIENT)
+        data = session.application.scene.data
+        before = (data.qpos.copy(), data.qvel.copy(), float(data.time), len(facts))
+        for sequence, skill_id in enumerate(sorted(ARCHIVED_DEBUG_MOTION_SKILL_IDS_V1)):
+            request = replace(
+                _request(session, adapter, [.4, -.1, .5, 0., 0., 0., 1.], sequence=sequence),
+                skill_id=skill_id,
+            )
+            outcome = adapter.submit_skill_request(request.to_wire())
+            assert not outcome["accepted"], outcome
+            assert outcome["reason_code"] == "skill_route_not_advertised"
+        assert session.motion_executor.workers == ()
+        assert session.safe_tcp_pose_executor.workers == ()
+        np.testing.assert_array_equal(data.qpos, before[0])
+        np.testing.assert_array_equal(data.qvel, before[1])
+        assert float(data.time) == before[2]
+        assert len(facts) == before[3]
+    finally:
+        assert session.close().accepted
+
+
 
 
 @pytest.mark.integration
@@ -1346,3 +1405,395 @@ def test_observed_object_goal_region_selects_shorter_path_then_executes_existing
         assert measured_q and application.held
     finally:
         assert session.close().accepted
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("constraint", [None, {
+    "kind": "preserve_start_tool_axis", "tool_axis": "z", "max_deviation_rad": .17453292519943295,
+}])
+def test_safe_tcp_v2_preserves_sampled_axis_and_retains_null_behavior(constraint, record_property):
+    facts = []
+    session = _session(facts, path_constraints=True)
+    try:
+        application = session.application
+        application.start_observation_ready()
+        adapter = session.wire_adapter(authenticated_client_id=CLIENT)
+        target = list(adapter.get_observation_snapshot()["measurement_summary"]["pose_xyz_quat_xyzw_by_component"]["right_arm"])
+        target[2] += .03
+        request = _request(session, adapter, target, version="2", path_constraint=constraint)
+        admitted = adapter.submit_skill_request(request.to_wire())
+        assert admitted["accepted"], admitted
+        assert session.wait(timeout_sec=35)
+        operation = session.service.operation_store.get(admitted["operation"]["operation_id"])
+        assert operation.execution_outcome == "completed", (operation.reason_code, operation.progress_summary)
+        evidence = operation.execution_result["path_constraint_evidence"]
+        if constraint is None:
+            assert evidence is None
+        else:
+            assert evidence["planned_max_deviation_rad"] <= constraint["max_deviation_rad"] + 1e-9
+            assert evidence["scope"] == "sampled_planned_and_live_references"
+            assert evidence["validated_reference_count"] > 1
+            assert np.linalg.norm(evidence["activation_axis_in_reference_frame"]) == pytest.approx(1.)
+        entry = session.contract_bundle.route_manifest.route("motion.move_tcp_to_pose_safe", "2")
+        validator = session.contract_bundle.payload_validators.validator_for(entry.route)
+        validator.validate_execution_result_for_parameters(request.parameters, operation.execution_result)
+        record_property("path_constraint_evidence_json", json.dumps(
+            operation.to_wire()["execution_result"]["path_constraint_evidence"]))
+        assert any("mujoco-safe-joint-trajectory:" in ref for ref in operation.execution_receipt_refs)
+        assert not application.target.planned_tcp_motion.active
+    finally:
+        assert session.close().accepted
+
+
+@pytest.mark.integration
+def test_safe_tcp_v2_endpoint_outside_axis_cone_is_rejected_without_dispatch(record_property):
+    from scipy.spatial.transform import Rotation
+
+    facts = []
+    session = _session(facts, path_constraints=True)
+    try:
+        session.application.start_observation_ready()
+        adapter = session.wire_adapter(authenticated_client_id=CLIENT)
+        target = list(adapter.get_observation_snapshot()["measurement_summary"]["pose_xyz_quat_xyzw_by_component"]["right_arm"])
+        initial = Rotation.from_quat(target[3:])
+        target[3:] = (initial * Rotation.from_euler("x", 10., degrees=True)).as_quat().tolist()
+        constraint = {"kind": "preserve_start_tool_axis", "tool_axis": "z", "max_deviation_rad": .08726646259971647}
+        admitted = adapter.submit_skill_request(_request(
+            session, adapter, target, version="2", path_constraint=constraint).to_wire())
+        assert admitted["accepted"], admitted
+        assert session.wait(timeout_sec=35)
+        operation = session.service.operation_store.get(admitted["operation"]["operation_id"])
+        assert operation.execution_outcome == "failed"
+        assert operation.progress_summary["lower_hold_confirmed"]
+        assert not any(fact.event_type == "component_execution_target" for fact in facts)
+        assert not session.application.target.planned_tcp_motion.active
+        record_property("rejection_json", json.dumps(operation.to_wire(), default=str))
+    finally:
+        assert session.close().accepted
+
+
+@pytest.mark.integration
+def test_safe_tcp_v2_rechecks_actual_to_reference_axis_before_dispatch(monkeypatch, record_property):
+    from agent_gateway.profiles.mujoco.motion_skill import (
+        mujoco_agent_skill_hold_evidence_from_transition,
+    )
+    from robot_motion.path_constraints import ToolAxisCone
+
+    facts, injected, holds = [], {}, []
+    session = _session(facts, path_constraints=True)
+    try:
+        app = session.application
+        app.start_observation_ready()
+        adapter = session.wire_adapter(authenticated_client_id=CLIENT)
+        planner = app.target.planned_tcp_motion
+        original_hold = app.request_hold
+
+        def remember_hold(**kwargs):
+            transition = original_hold(**kwargs)
+            holds.append(mujoco_agent_skill_hold_evidence_from_transition(
+                transition, lower_operation_id=kwargs.get("operation_id")))
+            return transition
+
+        monkeypatch.setattr(app, "request_hold", remember_hold)
+        target = list(adapter.get_observation_snapshot()["measurement_summary"]["pose_xyz_quat_xyzw_by_component"]["right_arm"])
+        target[2] += .03
+        original_activate = planner.activate
+
+        def displace_simulated_plant_after_activation(plan):
+            original_activate(plan)
+            source = planner._model_qpos()
+            oracle = MujocoJointSceneOracle(app.scene, source)
+            pair = {side: source[address].copy() for side, address in oracle.addresses.items()}
+            cone = ToolAxisCone.from_pose(planner.pose_for_configuration(source, pair),
+                tool_axis="z", max_deviation_rad=np.deg2rad(5.))
+            # Model an unexpected plant displacement, not a command. Pick a
+            # collision-free joint perturbation so the axis check is decisive.
+            for index in reversed(range(len(pair["right"]))):
+                candidate = {side: q.copy() for side, q in pair.items()}
+                candidate["right"][index] += .25
+                deviation = cone.deviation_rad(planner.pose_for_configuration(source, candidate))
+                if deviation > cone.max_deviation_rad and oracle.check(candidate).safe:
+                    app.scene.data.qpos[oracle.addresses["right"]] = candidate["right"]
+                    app.scene.mujoco.mj_forward(app.scene.model, app.scene.data)
+                    injected.update(deviation_rad=deviation, joint_index=index,
+                        constraint_identity=plan.constraint_identity)
+                    return
+            raise AssertionError("No collision-free axis-violating test perturbation")
+
+        monkeypatch.setattr(planner, "activate", displace_simulated_plant_after_activation)
+        policy = {"kind": "preserve_start_tool_axis", "tool_axis": "z", "max_deviation_rad": np.deg2rad(5.)}
+        admitted = adapter.submit_skill_request(_request(
+            session, adapter, target, version="2", path_constraint=policy).to_wire())
+        assert admitted["accepted"], admitted
+        assert session.wait(timeout_sec=35)
+        operation = session.service.operation_store.get(admitted["operation"]["operation_id"])
+        assert injected
+        assert operation.execution_outcome == "failed", operation
+        assert operation.reason_code == "safe_tcp_live_reference_constraint_blocked", operation
+        assert app.held and any(hold.lower_hold_confirmed for hold in holds)
+        assert not any(fact.event_type == "component_execution_target" for fact in facts)
+        assert not planner.active
+        record_property("live_axis_rejection_json", json.dumps({
+            "injected_simulator_state_only": injected, "operation": operation.to_wire()}))
+    finally:
+        assert session.close().accepted
+
+
+@pytest.mark.integration
+def test_safe_tcp_v2_narrow_cone_accounts_for_published_float32_qref(record_property):
+    from robot_motion.path_constraints import ToolAxisCone
+
+    facts = []
+    session = _session(facts, path_constraints=True)
+    try:
+        app = session.application
+        app.start_observation_ready()
+        planner = app.target.planned_tcp_motion
+        source = planner._model_qpos()
+        oracle = MujocoJointSceneOracle(app.scene, source)
+        pair = {side: source[address].copy() for side, address in oracle.addresses.items()}
+        rounding_deviation = None
+        for index in reversed(range(len(pair["right"]))):
+            candidate = {side: q.copy() for side, q in pair.items()}
+            candidate["right"][index] += .123456789
+            cone = ToolAxisCone.from_pose(planner.pose_for_configuration(source, candidate),
+                tool_axis="z", max_deviation_rad=1e-12)
+            rounded = {side: q.astype(np.float32) for side, q in candidate.items()}
+            deviation = cone.deviation_rad(planner.pose_for_configuration(source, rounded))
+            if deviation > 2e-9 and oracle.check(candidate).safe:
+                app.scene.data.qpos[oracle.addresses["right"]] = candidate["right"]
+                app.scene.mujoco.mj_forward(app.scene.model, app.scene.data)
+                rounding_deviation = deviation
+                break
+        assert rounding_deviation is not None
+        adapter = session.wire_adapter(authenticated_client_id=CLIENT)
+        target = list(adapter.get_observation_snapshot()["measurement_summary"]["pose_xyz_quat_xyzw_by_component"]["right_arm"])
+        target[2] += .03
+        policy = {"kind": "preserve_start_tool_axis", "tool_axis": "z", "max_deviation_rad": 1e-12}
+        admitted = adapter.submit_skill_request(_request(
+            session, adapter, target, version="2", path_constraint=policy).to_wire())
+        assert admitted["accepted"], admitted
+        assert session.wait(timeout_sec=35)
+        operation = session.service.operation_store.get(admitted["operation"]["operation_id"])
+        assert operation.execution_outcome == "failed", operation
+        assert operation.reason_code == "safe_tcp_start_blocked", operation
+        assert operation.progress_summary["lower_hold_confirmed"]
+        assert not any(fact.event_type == "component_execution_target" for fact in facts)
+        record_property("float32_constraint_json", json.dumps({
+            "rounding_deviation_rad": rounding_deviation, "policy": policy,
+            "operation": operation.to_wire(), "hardware_used": False}))
+    finally:
+        assert session.close().accepted
+
+
+@pytest.mark.integration
+def test_native_continuation_query_rejects_retained_dead_end_before_motion(record_property):
+    from agent_gateway.skills.perception.tcp_continuation_query import SKILL_ID
+
+    facts = []
+    session = _session(facts, safe_profile="object_relation_precise", path_constraints=True,
+        continuations=True, task=Path("sim/configs/tasks/rm65_right_dmtacm_clutter_boxes_agent_v1.json"))
+    try:
+        app = session.application
+        app.start_observation_ready()
+        adapter = session.wire_adapter(authenticated_client_id=CLIENT)
+        entry = session.contract_bundle.route_manifest.route(SKILL_ID, "1")
+        parameter_profile = entry.route.allowed_parameter_profiles[0]
+        live = app.target.planned_tcp_motion
+        before = (app.scene.data.qpos.copy(), app.scene.data.qvel.copy(), float(app.scene.data.time),
+            app.tcp_pose_envelope_runtime.snapshot(), len(facts), live._pending_plan)
+        # First candidate replays the retained first-stage endpoint, not its
+        # future measurement. The second leaves room for the required +3 cm.
+        pose = [-.17339, -.028584, .211701, -.7260692119598389,
+                .6876216530799866, 3.8281362883582485e-17, -3.63948782349818e-17]
+        parameters = {"component_id": "right_arm",
+            "reference_frame_id": session.contract_bundle.motion_profile.reference_frame_id,
+            "first_pose_candidates_xyz_quat_xyzw": [pose, [pose[0], pose[1]-.04, pose[2], *pose[3:]]],
+            "continuation_delta_xyz_m": [0, 0, .03],
+            "path_constraint": {"kind": "preserve_start_tool_axis", "tool_axis": "z",
+                                "max_deviation_rad": np.deg2rad(10.)}, "time_budget_sec": 30.}
+        request = replace(_request(session, adapter, pose, timeout_ms=40_000),
+            skill_id=SKILL_ID, skill_definition_hash=entry.route.skill_definition_hash,
+            route_id=entry.route.route_id, route_hash=entry.route.semantic_content_hash,
+            deployment_binding_hash=entry.deployment_binding.deployment_binding_hash,
+            parameter_profile_id=parameter_profile.parameter_profile_id,
+            parameter_profile_hash=parameter_profile.parameter_profile_hash, parameters=parameters)
+        admitted = adapter.submit_skill_request(request.to_wire())
+        assert admitted["accepted"], admitted
+        assert session.tcp_continuation_query_executor.wait_all(timeout_sec=40)
+        operation = session.service.operation_store.get(admitted["operation"]["operation_id"])
+        assert operation.execution_outcome == "completed", (operation,
+            session.tcp_continuation_query_executor.failure_diagnostics)
+        result = operation.to_wire()["execution_result"]
+        record_property("continuation_evidence_json", json.dumps(result))
+        assert result["query_status"] == "path_found" and result["selected_index"] == 1, result
+        diagnostics = {row["candidate_index"]: row for row in result["candidate_diagnostics"]}
+        assert diagnostics[0]["failed_stage"] == "continuation", result
+        assert diagnostics[0]["stage_diagnostics"][0]["reason_code"] == "path_found"
+        assert diagnostics[1]["reason_code"] == "path_found" and len(diagnostics[1]["stage_diagnostics"]) == 2
+        np.testing.assert_allclose(np.asarray(result["continuation_pose_target_xyz_quat_xyzw"][:3])
+            - result["predicted_first_tcp_pose_xyz_quat_xyzw"][:3], [0, 0, .03], atol=1e-12)
+        assert result["continuation_source"] == "planned_first_endpoint"
+        assert not result["motion_executed"] and not result["execution_authorized"]
+        np.testing.assert_array_equal(app.scene.data.qpos, before[0])
+        np.testing.assert_array_equal(app.scene.data.qvel, before[1])
+        assert float(app.scene.data.time) == before[2]
+        assert app.tcp_pose_envelope_runtime.snapshot() == before[3]
+        assert len(facts) == before[4] and live._pending_plan is before[5] and not live.active
+    finally:
+        assert session.close().accepted
+
+
+def test_continuation_query_requires_matching_safe_v2_before_resources():
+    with pytest.raises(ValueError, match="Continuation queries require"):
+        _session([], continuations=True)
+
+
+@pytest.mark.parametrize("outcome", ["success", "cancel", "budget", "fault", "rank_pruned", "prefix_failed",
+    "source_start_fault", "binding_fault", "continuation_start_blocked", "target_envelope_blocked"])
+@pytest.mark.parametrize("relation_input", [False, True, "region"])
+def test_continuation_query_propagates_joint_state_and_clears_only_private_plans(monkeypatch, outcome, relation_input):
+    from agent_gateway.profiles.mujoco import object_goal_query as module
+
+    now, cancelled, contexts = [0.], [False], []
+    source = np.array([9., 1., 42.])
+    captured, invocations = [], []
+    # Region sampling checks the centre before the lower endpoint, unlike the
+    # historical explicit list. Both still exercise the identical planning loop.
+    alternative = -4. if relation_input == "region" else 8.
+
+    class Planner:
+        def __init__(self, **kwargs):
+            self.source = kwargs["source_model_qpos"].copy()
+            self.cleared = False
+            contexts.append(self)
+
+        def pose_for_configuration(self, qpos, pair):
+            return (float(pair["right"][0]), 0., 0., 0., 0., 0., 1.)
+
+        def plan(self, target, **kwargs):
+            invocations.append((self.source[1], target[0], kwargs.get("incumbent_max_joint_excursion_rad")))
+            np.testing.assert_array_equal(self.source[[0, 2]], source[[0, 2]])
+            assert kwargs["deadline_monotonic"] == 1.
+            if self.source[1] != 1.:
+                assert "incumbent_max_joint_excursion_rad" not in kwargs
+            if self.source[1] == 1. and target[0] == alternative:
+                if outcome == "rank_pruned":
+                    assert kwargs["incumbent_max_joint_excursion_rad"] == 2.
+                    raise MujocoTcpPlanRejected("safe_tcp_candidate_rank_pruned", {
+                        "lower_bound_max_joint_excursion_rad": abs(alternative - 1.),
+                        "incumbent_max_joint_excursion_rad": 2., "path_search_skipped": True})
+                assert "incumbent_max_joint_excursion_rad" not in kwargs
+            if self.source[1] == 1. and target[0] == 2.:
+                if outcome == "source_start_fault":
+                    raise MujocoTcpPlanRejected("safe_tcp_start_blocked")
+                if outcome == "binding_fault":
+                    raise MujocoTcpPlanRejected("safe_tcp_envelope_binding_changed")
+                if outcome == "target_envelope_blocked":
+                    raise MujocoTcpPlanRejected("safe_tcp_target_envelope_blocked")
+            if self.source[1] == 2:
+                if outcome == "cancel":
+                    cancelled[0] = True
+                    raise MujocoTcpPlanRejected("safe_tcp_planning_cancelled")
+                if outcome == "fault":
+                    raise RuntimeError("unexpected solver failure")
+                if outcome == "prefix_failed":
+                    raise MujocoTcpPlanRejected("safe_tcp_target_blocked")
+                if outcome == "continuation_start_blocked":
+                    raise MujocoTcpPlanRejected("safe_tcp_start_blocked")
+            if outcome == "budget":
+                now[0] = 2.
+            return SimpleNamespace(reference_poses=[target, target], trajectory_hash="a"*64,
+                phase_timing_sec={"joint_path_search": .01},
+                path=SimpleNamespace(metadata={"direct_path": True, "search_iterations": 0,
+                    "search_node_count": 2}),
+                trajectory=SimpleNamespace(q_rad=np.array([[self.source[1]], [target[0]]]),
+                                           timestamps=np.array([0., 1.])))
+
+        def clear(self):
+            self.cleared = True
+
+    monkeypatch.setattr(module, "MujocoPlannedTcpMotion", Planner)
+    monkeypatch.setattr(module, "MujocoJointSceneOracle", lambda *a, **kw: SimpleNamespace(scene_hash="b"*64))
+    monkeypatch.setattr(module.time, "perf_counter", lambda: now[0])
+    scene = SimpleNamespace(arm_specs={side: SimpleNamespace(joint_names=[name])
+                                      for side, name in (("left", "0"), ("right", "1"))}, joint_qpos_addr=int)
+
+    def capture(callback):
+        captured.append(True)
+        return callback(SimpleNamespace(data=SimpleNamespace(qpos=source, time=0.)))
+
+    query = module.MujocoObjectGoalQuery(scene=scene, rig_config=None, task_config=None,
+        pose_projector=None, reference_hz=60., capture_scene=capture,
+        transform_pose=lambda pose, **kw: pose,
+        prepare_projection=lambda: (lambda poses: SimpleNamespace(modified_sides=()), "envelope:test"),
+        profile=SimpleNamespace(reference_frame_id="station", execution_reference_frame_id="execution",
+            max_translation_delta_m=10., max_rotation_delta_rad=3.14, stable_measurement_count=1,
+            max_control_cycles=10, translation_tolerance_m=.003, rotation_tolerance_rad=.02,
+            normalize_ik_objective=True), clearance_padding_m=.002)
+    parameters = {"component_id": "right_arm", "reference_frame_id": "station",
+        "first_pose_candidates_xyz_quat_xyzw": [[2., 0, 0, 0, 0, 0, 1]],
+        "continuation_delta_xyz_m": [1., 0, 0], "path_constraint": None, "time_budget_sec": 1.}
+    if outcome in {"rank_pruned", "prefix_failed", "continuation_start_blocked", "target_envelope_blocked"}:
+        parameters["first_pose_candidates_xyz_quat_xyzw"].append([alternative, 0, 0, 0, 0, 0, 1])
+    expected_poses = parameters["first_pose_candidates_xyz_quat_xyzw"]
+    invoke = query.query_continuations
+    if relation_input == "region":
+        parameters = {key: value for key, value in parameters.items() if key != "first_pose_candidates_xyz_quat_xyzw"}
+        parameters.update(anchor_xyz_m=[0., 0., 0.], offset_frame="tool", orientation_mode="preserve",
+            offset_bounds_xyz_m=[[-4., 8.] if len(expected_poses) == 2 else [2., 2.], [0., 0.], [0., 0.]],
+            tool_axis=None, axis_reference_xyz=None, tool_axis_rotation_bounds_rad=[0., 0.],
+            max_candidates=len(expected_poses))
+        invoke = query.query_region_continuations
+    elif relation_input:
+        parameters = {key: value for key, value in parameters.items() if key != "first_pose_candidates_xyz_quat_xyzw"}
+        parameters.update(anchor_xyz_m=[0., 0., 0.], offset_frame="tool", orientation_mode="preserve",
+            offsets_xyz_m=[pose[:3] for pose in expected_poses], tool_axis=None, axis_reference_xyz=None,
+            tool_axis_rotation_offsets_rad=[0.])
+        invoke = query.query_relation_continuations
+    fatal_reasons = {"fault": "unexpected solver failure", "cancel": "safe_tcp_planning_cancelled",
+        "source_start_fault": "safe_tcp_start_blocked", "binding_fault": "safe_tcp_envelope_binding_changed"}
+    if outcome in fatal_reasons:
+        with pytest.raises(RuntimeError, match=fatal_reasons[outcome]):
+            invoke(parameters, cancel_requested=lambda: cancelled[0])
+    else:
+        result = invoke(parameters, cancel_requested=lambda: cancelled[0])
+        if relation_input:
+            assert result["first_pose_candidates_xyz_quat_xyzw"] == expected_poses
+        assert result["query_status"] == ("no_path_found" if outcome == "budget" else "path_found")
+        if outcome == "success":
+            assert result["predicted_first_tcp_pose_xyz_quat_xyzw"][0] == 2.
+            assert result["continuation_pose_target_xyz_quat_xyzw"][0] == 3.
+            assert [item.source[1] for item in contexts] == [1., 2.]
+        elif outcome == "target_envelope_blocked":
+            assert result["attempted_count"] == 2 and result["all_candidates_attempted"]
+            assert result["selected_index"] == 1
+            assert invocations == [(1., 2., None), (1., alternative, None), (alternative, alternative + 1., None)]
+            rejected = result["candidate_diagnostics"][0]
+            assert rejected["reason_code"] == "safe_tcp_target_envelope_blocked"
+            assert rejected["failed_stage"] == "first" and len(rejected["stage_diagnostics"]) == 1
+        elif outcome in {"rank_pruned", "prefix_failed", "continuation_start_blocked"}:
+            assert result["attempted_count"] == 2 and result["all_candidates_attempted"]
+            assert invocations[:2] == [(1., 2., None), (2., 3., None)]
+            first = result["candidate_diagnostics"][0]["stage_diagnostics"][0]
+            assert first["details"]["phase_timing_sec"] == {"joint_path_search": .01}
+            assert first["details"]["path_search"]["direct_path"] is True
+            if outcome == "rank_pruned":
+                assert result["selected_index"] == 0 and invocations[-1] == (1., alternative, 2.)
+                pruned = result["candidate_diagnostics"][1]
+                assert pruned["reason_code"] == "safe_tcp_candidate_rank_pruned"
+                assert pruned["failed_stage"] == "first" and len(pruned["stage_diagnostics"]) == 1
+                assert "trajectory_hash" not in pruned["stage_diagnostics"][0]
+                assert len(contexts) == 2
+            else:
+                assert result["selected_index"] == 1
+                assert invocations[-2:] == [(1., alternative, None), (alternative, alternative + 1., None)]
+                rejected = result["candidate_diagnostics"][0]
+                assert rejected["failed_stage"] == "continuation"
+                assert rejected["reason_code"] == ("safe_tcp_start_blocked"
+                    if outcome == "continuation_start_blocked" else "safe_tcp_target_blocked")
+        else:
+            assert result["candidate_diagnostics"][0]["reason_code"] == "query_budget_exhausted"
+    assert captured == [True] and all(item.cleared for item in contexts)
+    np.testing.assert_array_equal(source, [9., 1., 42.])
+    assert not query._lock.locked()

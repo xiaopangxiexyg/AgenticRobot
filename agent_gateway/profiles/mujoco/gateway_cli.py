@@ -137,6 +137,18 @@ def build_parser() -> argparse.ArgumentParser:
         default="cuda",
         help="Torch device used by the optional SAM2/Grounding DINO segmenter",
     )
+    parser.add_argument("--enable-safe-tcp-path-constraints", action="store_true",
+                        help="Additionally publish safe TCP v2 with explicit sampled tool-axis path constraints.")
+    parser.add_argument("--enable-tcp-continuation-queries", action="store_true",
+                        help="Expose read-only two-stage path lookahead; requires safe TCP path constraints.")
+    parser.add_argument("--enable-tcp-candidate-artifacts", action="store_true",
+                        help="Publish relation v3 candidate Artifacts and index-based continuation v2; requires the complete v2 anchor/relation and continuation family.")
+    parser.add_argument("--enable-relation-tcp-continuation-queries", action="store_true",
+                        help="Publish continuation v3: generate relation endpoints and check both paths once from a v2 anchor.")
+    parser.add_argument("--enable-region-tcp-continuation-queries", action="store_true",
+                        help="Additionally publish a bounded-region continuation query; requires relation continuation v3.")
+    parser.add_argument("--region-tcp-continuation-version", choices=("4", "5"), default="4",
+                        help="Explicit region sampler: 4 preserves centre/Halton; 5 adds continuation-direction extrema.")
     parser.add_argument("--enable-rgbd-capture-v3", action="store_true",
                         help="Publish capture_rgb v3 with optional native-grid paired RGB-D Artifacts; default off.")
     parser.add_argument("--enable-object-localization", action="store_true",
@@ -509,6 +521,11 @@ def main(argv: list[str] | None = None) -> int:
         or args.enable_surface_anchor_v2
         or args.enable_surface_anchor_v3
         or args.enable_object_localization
+        or args.enable_safe_tcp_path_constraints
+        or args.enable_tcp_continuation_queries
+        or args.enable_tcp_candidate_artifacts
+        or args.enable_relation_tcp_continuation_queries
+        or args.enable_region_tcp_continuation_queries
         or args.enable_relation_goal_queries
         or args.history_root is not None
         or args.segmentation_asset_bundle is not None
@@ -546,6 +563,20 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--enable-relation-goal-queries requires --enable-surface-anchors")
     if args.safe_tcp_motion_profile != "local_step" and not args.enable_safe_tcp_pose:
         parser.error("--safe-tcp-motion-profile requires --enable-safe-tcp-pose")
+    if args.enable_safe_tcp_path_constraints and not args.enable_safe_tcp_pose:
+        parser.error("--enable-safe-tcp-path-constraints requires --enable-safe-tcp-pose")
+    if args.enable_tcp_continuation_queries and not args.enable_safe_tcp_path_constraints:
+        parser.error("--enable-tcp-continuation-queries requires --enable-safe-tcp-path-constraints")
+    if args.enable_tcp_candidate_artifacts and not (args.enable_tcp_continuation_queries
+            and args.enable_surface_anchor_v2 and args.enable_relation_goal_queries):
+        parser.error("--enable-tcp-candidate-artifacts requires continuation queries and the v2 anchor/relation family")
+    if args.enable_relation_tcp_continuation_queries and not (args.enable_tcp_continuation_queries
+            and args.enable_surface_anchor_v2 and args.enable_relation_goal_queries):
+        parser.error("--enable-relation-tcp-continuation-queries requires continuation queries and the v2 anchor/relation family")
+    if args.enable_region_tcp_continuation_queries and not args.enable_relation_tcp_continuation_queries:
+        parser.error("--enable-region-tcp-continuation-queries requires --enable-relation-tcp-continuation-queries")
+    if args.region_tcp_continuation_version != "4" and not args.enable_region_tcp_continuation_queries:
+        parser.error("--region-tcp-continuation-version 5 requires --enable-region-tcp-continuation-queries")
     task_config = _absolute_existing_file(parser, args.task_config)
     socket_path = _absolute_path(parser, args.socket_path, flag="--socket-path")
     if args.client_uid < 0:
@@ -657,6 +688,12 @@ def main(argv: list[str] | None = None) -> int:
         segmentation_localizer=segmentation_localizer,
         enable_object_localization=args.enable_object_localization,
         enable_safe_tcp_pose=args.enable_safe_tcp_pose,
+        enable_safe_tcp_path_constraints=args.enable_safe_tcp_path_constraints,
+        enable_tcp_continuation_queries=args.enable_tcp_continuation_queries,
+        enable_tcp_candidate_artifacts=args.enable_tcp_candidate_artifacts,
+        enable_relation_tcp_continuation_queries=args.enable_relation_tcp_continuation_queries,
+        enable_region_tcp_continuation_queries=args.enable_region_tcp_continuation_queries,
+        region_tcp_continuation_version=args.region_tcp_continuation_version,
         enable_spatial_goals=args.enable_spatial_goals,
         enable_object_goal_queries=args.enable_object_goal_queries,
         enable_surface_anchors=args.enable_surface_anchors,

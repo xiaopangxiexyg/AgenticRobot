@@ -42,6 +42,7 @@ from agent_gateway.runtime.payload_validation import (
 )
 from agent_gateway.skills.gripper.deployment import GripperSkillContractBundle
 from agent_gateway.skills.motion.definition import (
+    ARCHIVED_DEBUG_MOTION_SKILL_IDS_V1,
     EXECUTE_GRASP_APPROACH_PLAN_SKILL_ID_V1,
     FIXED_CARDINAL_TCP_STEP_DIRECTION_BY_SKILL_ID_V1,
     FIXED_CARDINAL_TCP_STEP_SKILL_IDS_V1,
@@ -52,18 +53,12 @@ from agent_gateway.skills.motion.definition import (
     TCP_LEVEL_FORWARD_RIGHT_30_SKILL_ID_V1,
     TCP_LEVEL_FORWARD_SKILL_ID_V1,
     TCP_POSE_TARGET_SKILL_ID_V1,
-    cardinal_tcp_step_skill_definition_v1,
-    fixed_cardinal_tcp_step_skill_definition_v1,
-    fixed_level_tcp_orientation_skill_definition_v1,
     grasp_approach_skill_definition_v1,
     safe_tcp_pose_target_skill_definition_v1,
     tcp_pose_target_skill_definition_v1,
 )
 from agent_gateway.skills.motion.schemas import (
     CARDINAL_TCP_STEP_DIRECTIONS_V1,
-    cardinal_tcp_step_schema_entry_v1,
-    fixed_cardinal_tcp_step_schema_entry_v1,
-    fixed_level_tcp_orientation_schema_entry_v1,
     tcp_pose_target_schema_entry_v1,
     validate_safe_tcp_pose_goal_report_v1,
     validate_agent_motion_parameters_v1,
@@ -77,7 +72,6 @@ from robot_motion.primitives import (
     LevelTCPOrientationPrimitive,
     TCPPoseDisplacementPrimitive,
     cardinal_tcp_short_step,
-    level_tcp_orientation,
 )
 from teleop_runtime.skill_deploy.motion_port import RealAgentMotionPortConfig
 
@@ -205,10 +199,7 @@ def real_agent_motion_route_ids_v1(
         sorted(
             {
                 REAL_AGENT_TCP_POSE_TARGET_ROUTE_ID_V1,
-                REAL_AGENT_TCP_CARDINAL_STEP_ROUTE_ID_V1,
                 *optional_routes,
-                *REAL_AGENT_TCP_FIXED_CARDINAL_STEP_ROUTE_ID_BY_SKILL_ID_V1.values(),
-                *REAL_AGENT_TCP_FIXED_ORIENTATION_ROUTE_ID_BY_SKILL_ID_V1.values(),
             }
         )
     )
@@ -634,6 +625,14 @@ class RealAgentPrimitiveContractBundle:
     grasp_fast_plan_registration: RealFastGraspPlanRegistration | None = None
 
     def __post_init__(self) -> None:
+        published_skill_ids = {
+            *(item.skill_id for item in self.definition_catalog.skill_definitions),
+            *(item.skill_id for item in self.schema_catalog.schema_entries),
+            *(item.route.skill_id for item in self.route_manifest.skill_routes),
+            *(item.skill_id for item in self.io_catalog.io_contracts),
+        }
+        if published_skill_ids.intersection(ARCHIVED_DEBUG_MOTION_SKILL_IDS_V1):
+            raise ValueError("Archived debug motion Skills cannot be published.")
         validate_skill_route_catalog_closure(
             definition_catalog=self.definition_catalog,
             schema_catalog=self.schema_catalog,
@@ -717,24 +716,20 @@ class RealAgentPrimitiveContractBundle:
         ):
             raise ValueError("Paired grasp-approach planning Routes must coexist.")
         expected_binding_count = (
-            10
+            0
             + int(pose_target_enabled)
             + int(safe_pose_enabled)
             + int(grasp_approach_enabled)
             + int(grasp_approach_plan_enabled)
         )
         if (
-            len(self.orientation_profiles) != 3
+            self.orientation_profiles
             or len(self.deployment_bindings) != expected_binding_count
         ):
             raise ValueError(
-                "Real primitive bundle requires one generic cardinal, six "
-                "fixed-cardinal and three orientation bindings, plus exactly one "
-                "absolute-pose, legacy grasp-approach, and paired-plan execution "
-                "binding when their lower envelopes authorize them."
+                "Real motion bindings must match only the retained absolute-pose, "
+                "grasp-approach, and paired-plan execution Routes."
             )
-        for skill_id in FIXED_CARDINAL_TCP_STEP_SKILL_IDS_V1:
-            self.route_manifest.route(skill_id, "1")
         if (
             self.route_manifest.skill_io_catalog_hash
             != self.io_catalog.semantic_content_hash
@@ -845,7 +840,7 @@ class RealAgentPrimitiveContractBundle:
         ):
             raise ValueError("Grasp-approach planning requires retained point grasps.")
         expected_route_count = (
-            (11 + int(pose_target_enabled) + int(grasp_approach_enabled)
+            (1 + int(pose_target_enabled) + int(grasp_approach_enabled)
              + int(safe_pose_enabled))
             + (2 if self.perception_capture is not None else 0)
             + int(
@@ -1322,92 +1317,6 @@ def build_real_agent_primitive_contract_bundle(
         min_speed_scale=pose_target_profile.min_speed_scale,
         max_speed_scale=pose_target_profile.max_speed_scale,
     )
-    cardinal_definition = cardinal_tcp_step_skill_definition_v1(
-        controlled_component_ids=(component_id,),
-    )
-    cardinal_schema = cardinal_tcp_step_schema_entry_v1(
-        skill_definition_hash=cardinal_definition.semantic_content_hash,
-        parameter_profile_id=cardinal_profile.parameter_profile_id,
-        parameter_profile_hash=cardinal_profile.semantic_content_hash,
-        allowed_component_ids=(component_id,),
-        allowed_reference_frame_ids=(cardinal_profile.reference_frame_id,),
-        reference_frame_spec_hash=cardinal_profile.reference_frame_spec_hash,
-        frame_graph_hash=cardinal_profile.frame_graph_hash,
-        tool_config_hash=cardinal_profile.tool_config_hash,
-        calibration_hash=cardinal_profile.calibration_hash,
-        primitive_catalog_hash=cardinal_profile.primitive_catalog_hash,
-        allowed_directions=tuple(
-            item.direction.value for item in cardinal_profile.primitives
-        ),
-    )
-    fixed_cardinal_definitions = tuple(
-        fixed_cardinal_tcp_step_skill_definition_v1(
-            skill_id=skill_id,
-            controlled_component_ids=(component_id,),
-        )
-        for skill_id in FIXED_CARDINAL_TCP_STEP_SKILL_IDS_V1
-    )
-    fixed_cardinal_schemas = tuple(
-        fixed_cardinal_tcp_step_schema_entry_v1(
-            skill_id=definition.skill_id,
-            skill_definition_hash=definition.semantic_content_hash,
-            parameter_profile_id=cardinal_profile.parameter_profile_id,
-            parameter_profile_hash=cardinal_profile.semantic_content_hash,
-            allowed_component_ids=(component_id,),
-            allowed_reference_frame_ids=(cardinal_profile.reference_frame_id,),
-            reference_frame_spec_hash=cardinal_profile.reference_frame_spec_hash,
-            frame_graph_hash=cardinal_profile.frame_graph_hash,
-            tool_config_hash=cardinal_profile.tool_config_hash,
-            calibration_hash=cardinal_profile.calibration_hash,
-            primitive_catalog_hash=cardinal_profile.primitive_catalog_hash,
-        )
-        for definition in fixed_cardinal_definitions
-    )
-
-    orientation_profiles = tuple(
-        RealAgentTcpFixedOrientationProfile(
-            skill_id=skill_id,
-            component_id=component_id,
-            side=side,
-            reference_frame_id=primitive_frame.frame_id,
-            reference_frame_spec_hash=primitive_frame.semantic_content_hash,
-            execution_reference_frame_id=port_config.execution_frame_id,
-            execution_reference_frame_spec_hash=port_config.execution_frame_spec_hash,
-            frame_graph_hash=frame_graph.semantic_content_hash,
-            tool_config_hash=attachment.tool_config_hash,
-            calibration_hash=attachment.calibration_hash,
-            convergence_profile_hash=convergence.semantic_content_hash,
-            primitive=level_tcp_orientation(
-                REAL_AGENT_TCP_FIXED_ORIENTATION_HEADING_BY_SKILL_ID_V1[skill_id]
-            ),
-        )
-        for skill_id in FIXED_LEVEL_TCP_ORIENTATION_SKILL_IDS_V1
-    )
-    orientation_definitions = tuple(
-        fixed_level_tcp_orientation_skill_definition_v1(skill_id=profile.skill_id)
-        for profile in orientation_profiles
-    )
-    orientation_schemas = tuple(
-        fixed_level_tcp_orientation_schema_entry_v1(
-            skill_id=profile.skill_id,
-            skill_definition_hash=definition.semantic_content_hash,
-            parameter_profile_id=profile.parameter_profile_id,
-            parameter_profile_hash=profile.semantic_content_hash,
-            allowed_component_ids=(component_id,),
-            allowed_reference_frame_ids=(profile.reference_frame_id,),
-            reference_frame_spec_hash=profile.reference_frame_spec_hash,
-            frame_graph_hash=profile.frame_graph_hash,
-            tool_config_hash=profile.tool_config_hash,
-            calibration_hash=profile.calibration_hash,
-            primitive_hash=profile.primitive.semantic_content_hash,
-        )
-        for profile, definition in zip(
-            orientation_profiles,
-            orientation_definitions,
-            strict=True,
-        )
-    )
-
     def route_for(
         *,
         definition: Any,
@@ -1440,11 +1349,6 @@ def build_real_agent_primitive_contract_bundle(
         validate_agent_motion_route_schema_v1(route=route, schema_entry=schema)
         return route
 
-    cardinal_route = route_for(
-        definition=cardinal_definition,
-        schema=cardinal_schema,
-        route_id=REAL_AGENT_TCP_CARDINAL_STEP_ROUTE_ID_V1,
-    )
     pose_target_route = route_for(
         definition=pose_target_definition,
         schema=pose_target_schema,
@@ -1476,37 +1380,6 @@ def build_real_agent_primitive_contract_bundle(
         if grasp_approach_plan_registration is None
         else grasp_approach_plan_registration.execute_skill.routes[0]
     )
-    fixed_cardinal_routes = tuple(
-        route_for(
-            definition=definition,
-            schema=schema,
-            route_id=(
-                REAL_AGENT_TCP_FIXED_CARDINAL_STEP_ROUTE_ID_BY_SKILL_ID_V1[
-                    definition.skill_id
-                ]
-            ),
-        )
-        for definition, schema in zip(
-            fixed_cardinal_definitions,
-            fixed_cardinal_schemas,
-            strict=True,
-        )
-    )
-    orientation_routes = tuple(
-        route_for(
-            definition=definition,
-            schema=schema,
-            route_id=REAL_AGENT_TCP_FIXED_ORIENTATION_ROUTE_ID_BY_SKILL_ID_V1[
-                profile.skill_id
-            ],
-        )
-        for profile, definition, schema in zip(
-            orientation_profiles,
-            orientation_definitions,
-            orientation_schemas,
-            strict=True,
-        )
-    )
     all_routes = (
         *((safe_pose_route,) if safe_pose_enabled else ()),
         *((pose_target_route,) if pose_target_enabled else ()),
@@ -1516,9 +1389,6 @@ def build_real_agent_primitive_contract_bundle(
             if execute_grasp_approach_plan_route is None
             else (execute_grasp_approach_plan_route,)
         ),
-        cardinal_route,
-        *fixed_cardinal_routes,
-        *orientation_routes,
     )
     expected_route_ids = set(
         real_agent_motion_route_ids_v1(
@@ -1574,19 +1444,6 @@ def build_real_agent_primitive_contract_bundle(
             and grasp_approach_plan_registration is not None
             else {}
         ),
-        cardinal_route.semantic_content_hash: cardinal_profile,
-        **{
-            route.semantic_content_hash: cardinal_profile
-            for route in fixed_cardinal_routes
-        },
-        **{
-            route.semantic_content_hash: profile
-            for route, profile in zip(
-                orientation_routes,
-                orientation_profiles,
-                strict=True,
-            )
-        },
     }
     executor_by_route_hash = {
         **({safe_pose_route.semantic_content_hash: REAL_AGENT_SAFE_TCP_POSE_TARGET_EXECUTOR_ID_V1}
@@ -1618,27 +1475,6 @@ def build_real_agent_primitive_contract_bundle(
             if execute_grasp_approach_plan_route is not None
             else {}
         ),
-        cardinal_route.semantic_content_hash: REAL_AGENT_TCP_CARDINAL_STEP_EXECUTOR_ID_V1,
-        **{
-            route.semantic_content_hash: (
-                REAL_AGENT_TCP_FIXED_CARDINAL_STEP_EXECUTOR_ID_BY_SKILL_ID_V1[
-                    route.skill_id
-                ]
-            )
-            for route in fixed_cardinal_routes
-        },
-        **{
-            route.semantic_content_hash: (
-                REAL_AGENT_TCP_FIXED_ORIENTATION_EXECUTOR_ID_BY_SKILL_ID_V1[
-                    profile.skill_id
-                ]
-            )
-            for route, profile in zip(
-                orientation_routes,
-                orientation_profiles,
-                strict=True,
-            )
-        },
     }
     bindings = tuple(
         RealAgentPrimitiveDeploymentBinding(
@@ -1784,9 +1620,6 @@ def build_real_agent_primitive_contract_bundle(
                 if grasp_approach_plan_registration is None
                 else (grasp_approach_plan_registration.execute_skill.definition,)
             ),
-            cardinal_definition,
-            *fixed_cardinal_definitions,
-            *orientation_definitions,
             *(item.definition for item in perception_registrations),
             *(
                 (gripper_contract.definition_catalog.skill_definitions)
@@ -1808,9 +1641,6 @@ def build_real_agent_primitive_contract_bundle(
                 if grasp_approach_plan_registration is None
                 else (grasp_approach_plan_registration.execute_skill.schema_entry,)
             ),
-            cardinal_schema,
-            *fixed_cardinal_schemas,
-            *orientation_schemas,
             *(item.schema_entry for item in perception_registrations),
             *(
                 (gripper_contract.schema_catalog.schema_entries)
@@ -2038,6 +1868,7 @@ def build_real_agent_primitive_contract_bundle(
                     "direct_hardware_refresh",
                     "raw_action_submission",
                     "second_dispatch_owner",
+                    *ARCHIVED_DEBUG_MOTION_SKILL_IDS_V1,
                     *(("agent_estop",) if not domain_emergency_stop_available else ()),
                 }
             )
@@ -2081,27 +1912,8 @@ def build_real_agent_primitive_contract_bundle(
                 if grasp_approach_enabled
                 else ()
             ),
-            _payload_validator(route=cardinal_route, profile=cardinal_profile),
             *((_payload_validator(route=safe_pose_route, profile=pose_target_profile),)
               if safe_pose_enabled else ()),
-            *tuple(
-                _payload_validator(
-                    route=route,
-                    profile=cardinal_profile,
-                    fixed_cardinal_direction=(
-                        FIXED_CARDINAL_TCP_STEP_DIRECTION_BY_SKILL_ID_V1[route.skill_id]
-                    ),
-                )
-                for route in fixed_cardinal_routes
-            ),
-            *tuple(
-                _payload_validator(route=route, profile=profile)
-                for route, profile in zip(
-                    orientation_routes,
-                    orientation_profiles,
-                    strict=True,
-                )
-            ),
             *(
                 ()
                 if perception_capture is None
@@ -2175,7 +1987,7 @@ def build_real_agent_primitive_contract_bundle(
             if pose_target_enabled or safe_pose_enabled or grasp_approach_enabled
             else None
         ),
-        orientation_profiles=orientation_profiles,
+        orientation_profiles=(),
         deployment_bindings=bindings,
         convergence_profile=convergence,
         payload_validators=validators,

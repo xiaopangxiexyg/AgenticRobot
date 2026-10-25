@@ -67,6 +67,13 @@ FIXED_LEVEL_TCP_ORIENTATION_SKILL_IDS_V1 = (
     TCP_LEVEL_FORWARD_LEFT_30_SKILL_ID_V1,
     TCP_LEVEL_FORWARD_RIGHT_30_SKILL_ID_V1,
 )
+# Historical debug contracts remain readable, but current deployments must not
+# publish them. Relative moves use the shared absolute-pose Skills instead.
+ARCHIVED_DEBUG_MOTION_SKILL_IDS_V1 = frozenset((
+    TCP_CARDINAL_STEP_SKILL_ID_V1,
+    *FIXED_CARDINAL_TCP_STEP_SKILL_IDS_V1,
+    *FIXED_LEVEL_TCP_ORIENTATION_SKILL_IDS_V1,
+))
 FIXED_LEVEL_TCP_ORIENTATION_SKILL_SUMMARY_BY_ID_V1: Mapping[str, str] = (
     MappingProxyType(
         {
@@ -343,6 +350,7 @@ def fixed_level_tcp_orientation_skill_definition_v1(
 
 
 __all__ = [
+    "ARCHIVED_DEBUG_MOTION_SKILL_IDS_V1",
     "CARDINAL_TCP_STEP_DIRECTIONS_V1",
     "EXECUTE_GRASP_APPROACH_PLAN_SKILL_ID_V1",
     "FIXED_CARDINAL_TCP_STEP_DIRECTION_BY_SKILL_ID_V1",

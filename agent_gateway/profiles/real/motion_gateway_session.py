@@ -70,7 +70,6 @@ from agent_gateway.skills.gripper.runtime import (
 )
 from agent_gateway.skills.motion.definition import (
     EXECUTE_GRASP_APPROACH_PLAN_SKILL_ID_V1,
-    FIXED_CARDINAL_TCP_STEP_SKILL_IDS_V1,
     GRASP_APPROACH_SKILL_ID_V1,
     SAFE_TCP_POSE_TARGET_SKILL_ID_V1,
     TCP_POSE_TARGET_SKILL_ID_V1,
@@ -675,6 +674,44 @@ def _shared_port_hold_evidence(
         evidence_refs=(snapshot.evidence_ref,),
         lower_hold_confirmed=False,
     )
+
+
+@dataclass
+class _RealAgentDomainHoldPort:
+    """Retain the existing lower HOLD boundary when no motion Route is published."""
+
+    no_io = False
+    port_id: str
+    domain_hold: Callable[..., StationLifecycleControlEvidence]
+    clock: Callable[[], float]
+    _lock: threading.Lock = field(default_factory=threading.Lock, init=False)
+    _next_sequence: int = field(default=0, init=False)
+
+    def request_hold(
+        self,
+        *,
+        operation: AgentSkillOperation | None,
+        reason: str,
+    ) -> AgentGatewayAuthoritativePortReceipt:
+        evidence = self.domain_hold(
+            operation=operation,
+            reason=_required(reason, field_name="reason"),
+        )
+        with self._lock:
+            sequence = self._next_sequence
+            self._next_sequence += 1
+        return AgentGatewayAuthoritativePortReceipt(
+            port_id=self.port_id,
+            operation_kind="hold",
+            operation_id=None if operation is None else operation.operation_id,
+            succeeded=evidence.succeeded,
+            status=evidence.status,
+            completed_at=float(self.clock()),
+            call_sequence=sequence,
+            lower_operation_id=evidence.lower_operation_id,
+            evidence_refs=evidence.evidence_refs,
+            proves_motion_or_hold=(evidence.succeeded and evidence.lower_hold_confirmed),
+        )
 
 
 @dataclass
@@ -1547,12 +1584,8 @@ def assemble_real_agent_primitive_gateway_session(
                 raise RuntimeError(
                     "Absolute TCP-pose Route exists without its authorized profile."
                 )
-        elif route.skill_id == "motion.step_tcp_cardinal" or (
-            route.skill_id in FIXED_CARDINAL_TCP_STEP_SKILL_IDS_V1
-        ):
-            profile = contract_bundle.cardinal_profile
         else:
-            profile = contract_bundle.orientation_profile(route.skill_id)
+            raise ValueError(f"Unsupported real motion Skill {route.skill_id!r}.")
 
         def lifecycle_factory(
             *,
@@ -1976,7 +2009,16 @@ def assemble_real_agent_primitive_gateway_session(
         max_grant_lifetime_sec=30.0,
         max_grant_invocations=1,
     )
-    domain_executor = executors["motion.step_tcp_cardinal"]
+    domain_executor = next(iter(executors.values()), None)
+    if domain_executor is None:
+        domain_executor = _RealAgentDomainHoldPort(
+            port_id=(
+                "agent-gateway:real-domain-hold:"
+                + contract_bundle.route_manifest.runtime_session_id
+            ),
+            domain_hold=domain_hold,
+            clock=clock,
+        )
     emergency_stop_port = (
         None
         if emergency_stop is None

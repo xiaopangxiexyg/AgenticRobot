@@ -19,18 +19,12 @@ from agent_gateway.profiles.real.exclusive_factory import (
     assemble_exclusive_real_agent_primitive_deployment,
 )
 from agent_gateway.profiles.real.motion_primitive_profiles import (
-    REAL_AGENT_TCP_CARDINAL_STEP_ROUTE_ID_V1,
-    REAL_AGENT_TCP_FIXED_CARDINAL_STEP_ROUTE_ID_BY_SKILL_ID_V1,
-    REAL_AGENT_TCP_FIXED_ORIENTATION_ROUTE_ID_BY_SKILL_ID_V1,
+    real_agent_motion_route_ids_v1,
 )
 from agent_gateway.profiles.real.observation_gateway import (
     RealTcpPoseObserveAttachmentSpec,
 )
 from agent_gateway.protocol.skill_catalog import SkillDeploymentSafetyEnvelopeRef
-from agent_gateway.skills.motion.definition import (
-    FIXED_CARDINAL_TCP_STEP_SKILL_IDS_V1,
-    FIXED_LEVEL_TCP_ORIENTATION_SKILL_IDS_V1,
-)
 from robot_motion.coordinate_frames import (
     CoordinateFrameGraph,
     CoordinateFrameSpec,
@@ -139,17 +133,7 @@ def _assembly_inputs():
         execution_frame_spec_hash=execution_frame.semantic_content_hash,
         exclusive_command_claim=True,
     )
-    route_ids = (
-        REAL_AGENT_TCP_CARDINAL_STEP_ROUTE_ID_V1,
-        *tuple(
-            REAL_AGENT_TCP_FIXED_CARDINAL_STEP_ROUTE_ID_BY_SKILL_ID_V1[skill_id]
-            for skill_id in FIXED_CARDINAL_TCP_STEP_SKILL_IDS_V1
-        ),
-        *tuple(
-            REAL_AGENT_TCP_FIXED_ORIENTATION_ROUTE_ID_BY_SKILL_ID_V1[skill_id]
-            for skill_id in FIXED_LEVEL_TCP_ORIENTATION_SKILL_IDS_V1
-        ),
-    )
+    route_ids = real_agent_motion_route_ids_v1()
     envelope = SkillDeploymentSafetyEnvelopeRef(
         object_id="real-envelope:test",
         schema="dexteleop.deployment_safety_envelope.v1",

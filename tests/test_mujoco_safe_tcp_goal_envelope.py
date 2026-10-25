@@ -45,6 +45,9 @@ def test_preflight_preserves_goal_policy_and_hold(monkeypatch, policy, goal_x, c
     lifecycle._contact_binding = None
     lifecycle._observed_planning_provider = None
     lifecycle._path_search_time_budget_sec = 3.
+    lifecycle._path_policy = None
+    lifecycle._axis_cone = None
+    lifecycle._path_constraint_evidence = None
 
     def plan(target, **kwargs):
         calls.append("plan")

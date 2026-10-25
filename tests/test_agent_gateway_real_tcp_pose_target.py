@@ -21,7 +21,7 @@ def test_standard_rm65_composition_authorizes_absolute_grasp_pose_route() -> Non
     assert REAL_AGENT_TCP_POSE_TARGET_ROUTE_ID_V1 in route_ids
     assert REAL_AGENT_GRASP_APPROACH_ROUTE_ID_V1 in route_ids
     assert _route_ids() == route_ids
-    assert len(route_ids) == 12
+    assert len(route_ids) == 2
 
 
 def test_absolute_grasp_pose_route_has_an_exact_operator_action_class() -> None:

@@ -486,7 +486,7 @@ def test_batch_close_keeps_shared_dependencies_until_the_original_executor_drain
         object_state_executor=None,
         spatial_goal_executor=None,
         object_goal_query_executor=None,
-        localization_executor=None,
+        localization_executor=None, tcp_continuation_query_executor=None, safe_tcp_pose_v2_executor=None,
         history_executor=None,
         segmentation_executor=None,
         segmentation_geometry_executor=None,
@@ -499,7 +499,7 @@ def test_batch_close_keeps_shared_dependencies_until_the_original_executor_drain
         candidate_query_executors=(),
         segmentation_batch_executor=SimpleNamespace(wait_all=wait_all),
         contract_bundle=SimpleNamespace(
-            surface_anchor_registrations=(),
+            surface_anchor_registrations=(), candidate_query_registrations=(),
             segmentation_batch=SimpleNamespace(
                 skill=SimpleNamespace(
                     routes=(SimpleNamespace(max_operation_duration_ms=60_000),)

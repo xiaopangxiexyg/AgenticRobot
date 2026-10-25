@@ -21,11 +21,6 @@ from agent_gateway.profiles.back_projection import (
     LiveBackProjectionProvider,
     build_back_projection_executor,
 )
-from agent_gateway.profiles.motion_primitive_resolution import (
-    MotionPrimitiveTargetResolution,
-    resolve_level_tcp_orientation_primitive_target,
-    resolve_tcp_displacement_primitive_target,
-)
 from agent_gateway.profiles.placement import (
     PLACEMENT_MAX_OPERATION_DURATION_MS_V1,
     PlacementProvider,
@@ -78,10 +73,6 @@ from agent_gateway.skills.gripper.runtime import (
     GripperConvergenceProfile,
     build_gripper_skill_executor,
     hold_gripper_ports,
-)
-from agent_gateway.skills.motion.definition import (
-    FIXED_CARDINAL_TCP_STEP_SKILL_IDS_V1,
-    FIXED_LEVEL_TCP_ORIENTATION_SKILL_IDS_V1,
 )
 from agent_gateway.skills.perception.definition import (
     BACK_PROJECT_SKILL_ID_V1,
@@ -153,13 +144,6 @@ class MujocoAgentTcpPoseGatewaySession:
     observation_producer: MujocoAgentObservationProducer
     rgb_capture_provider: MujocoAgentRgbCaptureProvider
     motion_executor: ReusableStationAgentSkillOperationExecutor
-    cardinal_step_executor: ReusableStationAgentSkillOperationExecutor
-    fixed_cardinal_step_executors: Mapping[
-        str, ReusableStationAgentSkillOperationExecutor
-    ]
-    fixed_orientation_executors: Mapping[
-        str, ReusableStationAgentSkillOperationExecutor
-    ]
     state_executor: PassiveReadSkillExecutor
     depth_executor: PassiveReadSkillExecutor | None
     rgb_executor: PassiveReadSkillExecutor | None
@@ -180,6 +164,7 @@ class MujocoAgentTcpPoseGatewaySession:
     hardware_view_provider: HardwareViewProvider
     service: AgentGatewayService
     safe_tcp_pose_executor: ReusableStationAgentSkillOperationExecutor | None = None
+    safe_tcp_pose_v2_executor: ReusableStationAgentSkillOperationExecutor | None = None
     spatial_goal_executor: PassiveReadSkillExecutor | None = None
     tcp_pose_comparison_executor: PassiveReadSkillExecutor | None = None
     object_state_executor: PassiveReadSkillExecutor | None = None
@@ -204,6 +189,8 @@ class MujocoAgentTcpPoseGatewaySession:
     segmentation_batch_executor: PassiveReadSkillExecutor | None = None
     segmentation_geometry_executor: PassiveReadSkillExecutor | None = None
     object_goal_query_executor: PassiveReadSkillExecutor | None = None
+    tcp_continuation_query_executor: PassiveReadSkillExecutor | None = None
+    candidate_query_executors: tuple[PassiveReadSkillExecutor, ...] = ()
     localization_provider: ObjectLocalizationProvider | None = None
     localization_executor: PassiveReadSkillExecutor | None = None
     surface_anchor_executors: tuple[PassiveReadSkillExecutor, ...] = ()
@@ -235,6 +222,12 @@ class MujocoAgentTcpPoseGatewaySession:
     )
 
     def __post_init__(self) -> None:
+        if (self.contract_bundle.safe_tcp_pose_v2_contract is not None) != (self.safe_tcp_pose_v2_executor is not None):
+            raise ValueError("Safe TCP v2 registration and executor must coexist.")
+        if len(self.candidate_query_executors) != len(self.contract_bundle.candidate_query_registrations):
+            raise ValueError("Candidate query registrations and executors disagree.")
+        if (self.contract_bundle.tcp_continuation_query_registration is not None) != (self.tcp_continuation_query_executor is not None):
+            raise ValueError("Continuation query registration and executor must coexist.")
         localization_enabled = self.contract_bundle.localization is not None
         if (localization_enabled != (self.localization_provider is not None)
                 or localization_enabled != (self.localization_executor is not None)):
@@ -277,18 +270,6 @@ class MujocoAgentTcpPoseGatewaySession:
                       self.gripper_executor is not None, bool(self.gripper_ports))
         if any(hand_parts) and not all(hand_parts):
             raise ValueError("Composed gripper contract and executor must coexist.")
-        if set(self.fixed_cardinal_step_executors) != set(
-            FIXED_CARDINAL_TCP_STEP_SKILL_IDS_V1
-        ):
-            raise ValueError(
-                "fixed_cardinal_step_executors must exactly cover six Skills."
-            )
-        if set(self.fixed_orientation_executors) != set(
-            FIXED_LEVEL_TCP_ORIENTATION_SKILL_IDS_V1
-        ):
-            raise ValueError(
-                "fixed_orientation_executors must exactly cover three Skills."
-            )
         if not isinstance(self.owns_source_observation_history_store, bool):
             raise TypeError("owns_source_observation_history_store must be boolean.")
         if not isinstance(self.owns_artifact_store, bool):
@@ -539,19 +520,11 @@ class MujocoAgentTcpPoseGatewaySession:
                 if self.grasp_approach_executor is not None
                 else ()
             ),
+            *((self.safe_tcp_pose_v2_executor,) if self.safe_tcp_pose_v2_executor is not None else ()),
             *((self.grasp_contact_executor,) if self.grasp_contact_executor is not None else ()),
             *((self.object_motion_executor,) if self.object_motion_executor is not None else ()),
             *((self.execute_grasp_plan_executor,) if self.execute_grasp_plan_executor is not None else ()),
             *((self.observed_point_executor,) if self.observed_point_executor is not None else ()),
-            self.cardinal_step_executor,
-            *tuple(
-                self.fixed_cardinal_step_executors[skill_id]
-                for skill_id in FIXED_CARDINAL_TCP_STEP_SKILL_IDS_V1
-            ),
-            *tuple(
-                self.fixed_orientation_executors[skill_id]
-                for skill_id in FIXED_LEVEL_TCP_ORIENTATION_SKILL_IDS_V1
-            ),
         )
 
     def close(self) -> AgentGatewayOperationOutcome:
@@ -610,6 +583,13 @@ class MujocoAgentTcpPoseGatewaySession:
                     ("object_state", self.object_state_executor, 5.0),
                     ("segmentation", self.segmentation_executor, 65.0),
                     ("localization", self.localization_executor, 65.0),
+                    *((( "tcp_continuation_query", self.tcp_continuation_query_executor,
+                        self.contract_bundle.tcp_continuation_query_registration.entry.route.max_operation_duration_ms / 1000 + 5.0),)
+                        if self.tcp_continuation_query_executor is not None else ()),
+                    *(("candidate_query", executor,
+                        registration.entry.route.max_operation_duration_ms / 1000 + 5.0)
+                        for registration, executor in zip(self.contract_bundle.candidate_query_registrations,
+                            self.candidate_query_executors, strict=True)),
                     *((("segmentation_batch", self.segmentation_batch_executor,
                         self.contract_bundle.segmentation_batch.skill.routes[0].max_operation_duration_ms / 1000 + 5.0),)
                         if self.segmentation_batch_executor is not None else ()),
@@ -975,26 +955,6 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
         "1",
     )
     motion_route = motion_entry.route
-    cardinal_step_entry = contract_bundle.route_manifest.route(
-        "motion.step_tcp_cardinal",
-        "1",
-    )
-    cardinal_step_route = cardinal_step_entry.route
-    fixed_cardinal_entry_by_skill_id = {
-        skill_id: contract_bundle.route_manifest.route(skill_id, "1")
-        for skill_id in FIXED_CARDINAL_TCP_STEP_SKILL_IDS_V1
-    }
-    fixed_cardinal_contract_by_skill_id = {
-        item.skill_id: item for item in contract_bundle.fixed_cardinal_step_contracts
-    }
-    fixed_orientation_entry_by_skill_id = {
-        skill_id: contract_bundle.route_manifest.route(skill_id, "1")
-        for skill_id in FIXED_LEVEL_TCP_ORIENTATION_SKILL_IDS_V1
-    }
-    fixed_orientation_contract_by_skill_id = {
-        item.profile.skill_id: item
-        for item in contract_bundle.fixed_orientation_contracts
-    }
     state_entry = contract_bundle.route_manifest.route(
         "state.read_tcp_pose",
         "1",
@@ -1203,81 +1163,6 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
             clock=runtime_clock,
         )
 
-    frame_graph = application.target_frame_profile.frame_graph
-    reference_frame_spec = frame_graph.frame_by_id[
-        contract_bundle.cardinal_step_profile.reference_frame_id
-    ]
-
-    def build_cardinal_step_lifecycle(
-        *,
-        request,
-        operation,
-        route,
-        deployment_binding,
-        evaluation_plan,
-        fixed_direction: str | None = None,
-    ):
-        parameters = request.parameters
-        if not isinstance(parameters, Mapping):
-            raise TypeError("Cardinal-step parameters must be an object.")
-        requested_direction = str(parameters.get("direction"))
-        if fixed_direction is not None and requested_direction != fixed_direction:
-            raise ValueError("Fixed cardinal-step direction changed in request.")
-        primitive = contract_bundle.cardinal_step_profile.primitive(requested_direction)
-
-        def resolve_target(
-            measured_pose: tuple[float, ...],
-        ) -> MotionPrimitiveTargetResolution:
-            return resolve_tcp_displacement_primitive_target(
-                measured_pose=measured_pose,
-                primitive=primitive,
-                reference_frame_spec=reference_frame_spec,
-                frame_graph=frame_graph,
-                measured_reference_frame_id=(
-                    contract_bundle.cardinal_step_profile.execution_reference_frame_id
-                ),
-            )
-
-        return MujocoAgentTcpPoseSkillLifecycle(
-            application=application,
-            domain_hold=domain_hold if gripper_ports else None,
-            route=route,
-            deployment_binding=deployment_binding,
-            evaluation_plan=evaluation_plan,
-            motion_profile=contract_bundle.motion_profile,
-            request=request,
-            operation=operation,
-            target_resolver=resolve_target,
-            parameter_lineage={
-                "reference_frame_id": (
-                    contract_bundle.cardinal_step_profile.reference_frame_id
-                ),
-                "reference_frame_spec_hash": (
-                    contract_bundle.cardinal_step_profile.reference_frame_spec_hash
-                ),
-                "controlled_frame_id": "tool_tcp",
-                "frame_graph_hash": (
-                    contract_bundle.cardinal_step_profile.frame_graph_hash
-                ),
-                "tool_config_hash": (
-                    contract_bundle.cardinal_step_profile.tool_config_hash
-                ),
-                "calibration_hash": (
-                    contract_bundle.cardinal_step_profile.calibration_hash
-                ),
-            },
-            clock=runtime_clock,
-        )
-
-    def cardinal_step_lifecycle_factory(*, request, operation):
-        return build_cardinal_step_lifecycle(
-            request=request,
-            operation=operation,
-            route=cardinal_step_route,
-            deployment_binding=(contract_bundle.cardinal_step_deployment_binding),
-            evaluation_plan=(contract_bundle.cardinal_step_evaluation_plan),
-        )
-
     def domain_hold(*, operation, reason):
         failure = None
         try:
@@ -1329,178 +1214,6 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
         current_station_revision=lambda: observation_producer.current_station_revision,
         clock=runtime_clock,
     )
-    cardinal_step_binding = contract_bundle.cardinal_step_deployment_binding
-    cardinal_step_executor = ReusableStationAgentSkillOperationExecutor(
-        port_id=(
-            "agent-gateway:cardinal-step-worker:"
-            + cardinal_step_binding.runtime_session_id
-        ),
-        binding=StationOperationWorkerBinding(
-            worker_id=(
-                "agent-tcp-cardinal-step-worker:"
-                + cardinal_step_binding.runtime_session_id
-            ),
-            executor_id=cardinal_step_binding.executor_id,
-            runtime_session_id=cardinal_step_binding.runtime_session_id,
-            skill_id=cardinal_step_route.skill_id,
-            skill_version=cardinal_step_route.skill_version,
-            route_id=cardinal_step_route.route_id,
-            route_version=cardinal_step_route.route_version,
-            deployment_binding_hash=(cardinal_step_binding.semantic_content_hash),
-        ),
-        lifecycle_factory=cardinal_step_lifecycle_factory,
-        domain_hold=domain_hold,
-        current_station_revision=lambda: observation_producer.current_station_revision,
-        clock=runtime_clock,
-    )
-    fixed_cardinal_step_executors: dict[
-        str, ReusableStationAgentSkillOperationExecutor
-    ] = {}
-    for skill_id in FIXED_CARDINAL_TCP_STEP_SKILL_IDS_V1:
-        fixed_entry = fixed_cardinal_entry_by_skill_id[skill_id]
-        fixed_route = fixed_entry.route
-        fixed_contract = fixed_cardinal_contract_by_skill_id[skill_id]
-
-        def fixed_cardinal_lifecycle_factory(
-            *,
-            request,
-            operation,
-            _route=fixed_route,
-            _contract=fixed_contract,
-        ):
-            return build_cardinal_step_lifecycle(
-                request=request,
-                operation=operation,
-                route=_route,
-                deployment_binding=_contract.deployment_binding,
-                evaluation_plan=_contract.evaluation_plan,
-                fixed_direction=_contract.direction,
-            )
-
-        fixed_binding = fixed_contract.deployment_binding
-        fixed_cardinal_step_executors[skill_id] = (
-            ReusableStationAgentSkillOperationExecutor(
-                port_id=(
-                    "agent-gateway:fixed-cardinal-step-worker:"
-                    + skill_id
-                    + ":"
-                    + fixed_binding.runtime_session_id
-                ),
-                binding=StationOperationWorkerBinding(
-                    worker_id=(
-                        "agent-tcp-fixed-cardinal-step-worker:"
-                        + skill_id
-                        + ":"
-                        + fixed_binding.runtime_session_id
-                    ),
-                    executor_id=fixed_binding.executor_id,
-                    runtime_session_id=fixed_binding.runtime_session_id,
-                    skill_id=fixed_route.skill_id,
-                    skill_version=fixed_route.skill_version,
-                    route_id=fixed_route.route_id,
-                    route_version=fixed_route.route_version,
-                    deployment_binding_hash=(fixed_binding.semantic_content_hash),
-                ),
-                lifecycle_factory=fixed_cardinal_lifecycle_factory,
-                domain_hold=domain_hold,
-                current_station_revision=lambda: (
-                    observation_producer.current_station_revision
-                ),
-                clock=runtime_clock,
-            )
-        )
-    fixed_orientation_executors: dict[
-        str, ReusableStationAgentSkillOperationExecutor
-    ] = {}
-    for skill_id in FIXED_LEVEL_TCP_ORIENTATION_SKILL_IDS_V1:
-        orientation_entry = fixed_orientation_entry_by_skill_id[skill_id]
-        orientation_route = orientation_entry.route
-        orientation_contract = fixed_orientation_contract_by_skill_id[skill_id]
-        orientation_profile = orientation_contract.profile
-        orientation_reference_frame_spec = frame_graph.frame_by_id[
-            orientation_profile.reference_frame_id
-        ]
-
-        def orientation_lifecycle_factory(
-            *,
-            request,
-            operation,
-            _route=orientation_route,
-            _contract=orientation_contract,
-            _profile=orientation_profile,
-            _reference_frame_spec=orientation_reference_frame_spec,
-        ):
-            def resolve_target(
-                measured_pose: tuple[float, ...],
-            ) -> MotionPrimitiveTargetResolution:
-                return resolve_level_tcp_orientation_primitive_target(
-                    measured_pose=measured_pose,
-                    primitive=_profile.primitive,
-                    reference_frame_spec=_reference_frame_spec,
-                    frame_graph=frame_graph,
-                    measured_reference_frame_id=(_profile.execution_reference_frame_id),
-                )
-
-            return MujocoAgentTcpPoseSkillLifecycle(
-                application=application,
-                domain_hold=domain_hold if gripper_ports else None,
-                route=_route,
-                deployment_binding=_contract.deployment_binding,
-                evaluation_plan=_contract.evaluation_plan,
-                motion_profile=_contract.motion_profile,
-                request=request,
-                operation=operation,
-                target_resolver=resolve_target,
-                max_reference_rotation_step_rad=(
-                    _profile.max_reference_rotation_step_rad
-                ),
-                max_measured_translation_excursion_m=(
-                    _profile.max_measured_translation_excursion_m
-                ),
-                parameter_lineage={
-                    "reference_frame_id": _profile.reference_frame_id,
-                    "reference_frame_spec_hash": (_profile.reference_frame_spec_hash),
-                    "controlled_frame_id": "tool_tcp",
-                    "frame_graph_hash": _profile.frame_graph_hash,
-                    "tool_config_hash": _profile.tool_config_hash,
-                    "calibration_hash": _profile.calibration_hash,
-                },
-                clock=runtime_clock,
-            )
-
-        orientation_binding = orientation_contract.deployment_binding
-        fixed_orientation_executors[skill_id] = (
-            ReusableStationAgentSkillOperationExecutor(
-                port_id=(
-                    "agent-gateway:fixed-orientation-worker:"
-                    + skill_id
-                    + ":"
-                    + orientation_binding.runtime_session_id
-                ),
-                binding=StationOperationWorkerBinding(
-                    worker_id=(
-                        "agent-tcp-fixed-orientation-worker:"
-                        + skill_id
-                        + ":"
-                        + orientation_binding.runtime_session_id
-                    ),
-                    executor_id=orientation_binding.executor_id,
-                    runtime_session_id=orientation_binding.runtime_session_id,
-                    skill_id=orientation_route.skill_id,
-                    skill_version=orientation_route.skill_version,
-                    route_id=orientation_route.route_id,
-                    route_version=orientation_route.route_version,
-                    deployment_binding_hash=(orientation_binding.semantic_content_hash),
-                ),
-                lifecycle_factory=orientation_lifecycle_factory,
-                domain_hold=domain_hold,
-                current_station_revision=lambda: (
-                    observation_producer.current_station_revision
-                ),
-                clock=runtime_clock,
-            )
-        )
-
     def capture_tcp_pose(parameters, active_operation_id) -> PassiveReadResult:
         state_read = observation_producer.capture_tcp_pose_state(
             active_operation_id=active_operation_id,
@@ -1760,7 +1473,6 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
         )
     execution_port_by_route_hash = {
         motion_route.semantic_content_hash: motion_executor,
-        cardinal_step_route.semantic_content_hash: cardinal_step_executor,
         state_entry.route.semantic_content_hash: state_executor,
     }
     if localization_executor is not None:
@@ -1844,8 +1556,11 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
         )
         execution_port_by_route_hash[registration.entry.route.semantic_content_hash] = spatial_goal_executor
     object_goal_query_executor = None
+    tcp_continuation_query_executor = None
+    candidate_query_executors = ()
     surface_anchor_executors = ()
-    if contract_bundle.object_goal_query_registration is not None:
+    if (contract_bundle.object_goal_query_registration is not None
+            or contract_bundle.tcp_continuation_query_registration is not None):
         from .object_goal_query import MujocoObjectGoalQuery, build_object_goal_query_executor
         registration = contract_bundle.object_goal_query_registration
         safe_contract_for_query = contract_bundle.safe_tcp_pose_contract
@@ -1860,6 +1575,15 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
         if registration is not None:
             object_goal_query_executor = build_object_goal_query_executor(registration=registration, query_port=query_port, current_station_revision=lambda: observation_producer.current_station_revision, clock=runtime_clock, max_retained_operations=retention)
             execution_port_by_route_hash[registration.entry.route.semantic_content_hash] = object_goal_query_executor
+        if contract_bundle.tcp_continuation_query_registration is not None:
+            from .tcp_continuation_query import build_tcp_continuation_query_executor
+
+            extra_registration = contract_bundle.tcp_continuation_query_registration
+            tcp_continuation_query_executor = build_tcp_continuation_query_executor(
+                registration=extra_registration, query_port=query_port,
+                current_station_revision=lambda: observation_producer.current_station_revision,
+                clock=runtime_clock, max_retained_operations=retention)
+            execution_port_by_route_hash[extra_registration.entry.route.semantic_content_hash] = tcp_continuation_query_executor
         if contract_bundle.surface_anchor_registrations:
             from agent_gateway.profiles.surface_anchor import build_anchored_goal_executor, build_anchored_query_executor, build_surface_anchor_capture_executor
             from agent_gateway.skills.perception.surface_anchor import CAPTURE_SKILL_ID, GOAL_SKILL_ID
@@ -1867,6 +1591,28 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
             shared = {'current_station_revision': lambda: observation_producer.current_station_revision, 'clock': runtime_clock, 'clock_domain_id': runtime.config.clock_domain_id, 'max_retained_operations': retention, 'store': artifact_store}
             surface_anchor_executors = ()
             for item in contract_bundle.surface_anchor_registrations:
+                if (item.skill.definition.skill_id == "perception.query_tcp_continuation_paths"
+                        and item.skill.definition.skill_version in {"4", "5"}):
+                    from agent_gateway.profiles.region_continuation_query import (
+                        build_region_continuation_executor,
+                    )
+
+                    extra = build_region_continuation_executor(registration=item,
+                        capture_registration=captures["2"], query_port=query_port,
+                        lookup_operation=lookup_retained_operation, **shared)
+                    surface_anchor_executors += (extra,)
+                    continue
+                if (item.skill.definition.skill_id, item.skill.definition.skill_version) == (
+                        "perception.query_tcp_continuation_paths", "3"):
+                    from agent_gateway.profiles.relation_continuation_query import (
+                        build_relation_continuation_executor,
+                    )
+
+                    extra = build_relation_continuation_executor(registration=item,
+                        capture_registration=captures["2"], query_port=query_port,
+                        lookup_operation=lookup_retained_operation, **shared)
+                    surface_anchor_executors += (extra,)
+                    continue
                 capture_registration = captures[item.skill.definition.skill_version]
                 if item.skill.definition.skill_id == CAPTURE_SKILL_ID:
                     if item.skill.definition.skill_version == '3':
@@ -1881,6 +1627,20 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
                 surface_anchor_executors += (extra,)
             for item, executor in zip(contract_bundle.surface_anchor_registrations, surface_anchor_executors, strict=True):
                 execution_port_by_route_hash[item.entry.route.semantic_content_hash] = executor
+            if contract_bundle.candidate_query_registrations:
+                from agent_gateway.profiles.pose_candidate_set import (
+                    build_candidate_continuation_executor,
+                )
+
+                producer, consumer = contract_bundle.candidate_query_registrations
+                candidate_query_executors = (
+                    build_anchored_query_executor(registration=producer, capture_registration=captures["2"],
+                        query_port=query_port, lookup_operation=lookup_retained_operation, **shared),
+                    build_candidate_continuation_executor(registration=consumer, relation_registration=producer,
+                        query_port=query_port, lookup_operation=lookup_retained_operation, **shared),
+                )
+                for item, executor in zip(contract_bundle.candidate_query_registrations, candidate_query_executors, strict=True):
+                    execution_port_by_route_hash[item.entry.route.semantic_content_hash] = executor
     observed_planning_provider = None
     if safe_motion_observation is not None:
         if back_projection_capture_port is None or safe_contract is None:
@@ -1893,32 +1653,17 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
             source_binding_hash=back_projection_registration.profile.semantic_content_hash,
             planning_clearance_padding_m=application.target.planned_tcp_motion.planning_clearance_padding_m)
     planned_executors = {}
-    for skill_id, label, safe_contract in (
-        ("motion.move_to_observed_point", "observed-point-safe", contract_bundle.observed_point_contract),
-        (
-            "motion.move_tcp_to_pose_safe",
-            "safe-tcp-pose",
-            contract_bundle.safe_tcp_pose_contract,
-        ),
-        (
-            "motion.approach_grasp_pose",
-            "grasp-approach",
-            contract_bundle.grasp_approach_contract,
-        ),
-        (
-            "motion.approach_grasp_contact",
-            "grasp-contact",
-            contract_bundle.grasp_contact_contract,
-        ),
-        (
-            "motion.move_grasped_object_to_pose",
-            "grasped-object-motion",
-            contract_bundle.object_motion_contract,
-        ),
+    for skill_id, version, label, safe_contract in (
+        ('motion.move_to_observed_point', "1", 'observed-point-safe', contract_bundle.observed_point_contract),
+        ('motion.move_tcp_to_pose_safe', "1", 'safe-tcp-pose', contract_bundle.safe_tcp_pose_contract),
+        ("motion.move_tcp_to_pose_safe", "2", "safe-tcp-pose-v2", contract_bundle.safe_tcp_pose_v2_contract),
+        ('motion.approach_grasp_pose', "1", 'grasp-approach', contract_bundle.grasp_approach_contract),
+        ('motion.approach_grasp_contact', "1", 'grasp-contact', contract_bundle.grasp_contact_contract),
+        ('motion.move_grasped_object_to_pose', "1", 'grasped-object-motion', contract_bundle.object_motion_contract),
     ):
         if safe_contract is None:
             continue
-        safe_route = contract_bundle.route_manifest.route(skill_id, "1").route
+        safe_route = contract_bundle.route_manifest.route(skill_id, version).route
         safe_binding = safe_contract.deployment_binding
 
         def safe_lifecycle_factory(
@@ -1984,23 +1729,7 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
         execution_port_by_route_hash[safe_route.semantic_content_hash] = (
             planned_executor
         )
-        planned_executors[skill_id] = planned_executor
-    execution_port_by_route_hash.update(
-        {
-            fixed_cardinal_entry_by_skill_id[
-                skill_id
-            ].route.semantic_content_hash: fixed_cardinal_step_executors[skill_id]
-            for skill_id in FIXED_CARDINAL_TCP_STEP_SKILL_IDS_V1
-        }
-    )
-    execution_port_by_route_hash.update(
-        {
-            fixed_orientation_entry_by_skill_id[
-                skill_id
-            ].route.semantic_content_hash: fixed_orientation_executors[skill_id]
-            for skill_id in FIXED_LEVEL_TCP_ORIENTATION_SKILL_IDS_V1
-        }
-    )
+        planned_executors[skill_id, version] = planned_executor
     if history_entry is not None and history_executor is not None:
         execution_port_by_route_hash[history_entry.route.semantic_content_hash] = (
             history_executor
@@ -2194,14 +1923,13 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
         observation_producer=observation_producer,
         rgb_capture_provider=rgb_capture_provider,
         motion_executor=motion_executor,
-        cardinal_step_executor=cardinal_step_executor,
-        fixed_cardinal_step_executors=fixed_cardinal_step_executors,
-        fixed_orientation_executors=fixed_orientation_executors,
         state_executor=state_executor,
         tcp_pose_comparison_executor=tcp_pose_comparison_executor,
         object_state_executor=object_state_executor,
         spatial_goal_executor=spatial_goal_executor,
         object_goal_query_executor=object_goal_query_executor,
+        tcp_continuation_query_executor=tcp_continuation_query_executor,
+        candidate_query_executors=candidate_query_executors,
         localization_provider=localization_provider,
         localization_executor=localization_executor,
         surface_anchor_executors=surface_anchor_executors,
@@ -2226,11 +1954,12 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
         owns_artifact_store=owns_artifact_store,
         hardware_view_provider=hardware_view_provider,
         service=service,
-        safe_tcp_pose_executor=planned_executors.get("motion.move_tcp_to_pose_safe"),
-        observed_point_executor=planned_executors.get("motion.move_to_observed_point"),
-        grasp_approach_executor=planned_executors.get("motion.approach_grasp_pose"),
-        grasp_contact_executor=planned_executors.get("motion.approach_grasp_contact"),
-        object_motion_executor=planned_executors.get("motion.move_grasped_object_to_pose"),
+        safe_tcp_pose_executor=planned_executors.get(("motion.move_tcp_to_pose_safe", "1")),
+        safe_tcp_pose_v2_executor=planned_executors.get(("motion.move_tcp_to_pose_safe", "2")),
+        observed_point_executor=planned_executors.get(("motion.move_to_observed_point", "1")),
+        grasp_approach_executor=planned_executors.get(("motion.approach_grasp_pose", "1")),
+        grasp_contact_executor=planned_executors.get(("motion.approach_grasp_contact", "1")),
+        object_motion_executor=planned_executors.get(("motion.move_grasped_object_to_pose", "1")),
         object_observer=object_observer,
         gripper_executor=gripper_executor,
         gripper_ports=gripper_ports,

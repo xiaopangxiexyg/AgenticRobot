@@ -21,10 +21,8 @@ from agent_gateway.profiles.real.motion_gateway_session import (
     assemble_real_agent_primitive_gateway_session,
 )
 from agent_gateway.profiles.real.motion_primitive_profiles import (
-    REAL_AGENT_TCP_CARDINAL_STEP_ROUTE_ID_V1,
-    REAL_AGENT_TCP_FIXED_CARDINAL_STEP_ROUTE_ID_BY_SKILL_ID_V1,
-    REAL_AGENT_TCP_FIXED_ORIENTATION_ROUTE_ID_BY_SKILL_ID_V1,
     build_real_agent_primitive_contract_bundle,
+    real_agent_motion_route_ids_v1,
 )
 from agent_gateway.profiles.real.observation_gateway import (
     RealControlOwnerState,
@@ -50,13 +48,6 @@ from agent_gateway.protocol.contracts import AgentSkillRequest
 from agent_gateway.protocol.skill_catalog import SkillDeploymentSafetyEnvelopeRef
 from agent_gateway.runtime.access_policy import issue_skill_execution_grant
 from agent_gateway.runtime.artifact_store import RecoverableAgentArtifactStore
-from agent_gateway.skills.motion.definition import (
-    FIXED_CARDINAL_TCP_STEP_DIRECTION_BY_SKILL_ID_V1,
-    FIXED_CARDINAL_TCP_STEP_SKILL_ID_BY_DIRECTION_V1,
-    FIXED_CARDINAL_TCP_STEP_SKILL_IDS_V1,
-    FIXED_LEVEL_TCP_ORIENTATION_SKILL_IDS_V1,
-)
-from agent_gateway.skills.motion.schemas import CARDINAL_TCP_STEP_DIRECTIONS_V1
 from agent_gateway.transport.wire_adapter import BoundAgentGatewayWireAdapter
 from deployments.perception.sam2_grounding_dino import (
     GroundedObjectSegment,
@@ -184,6 +175,7 @@ def _runtime_fixture(
     exclusive_owner: bool = False,
     station_from_execution: np.ndarray | None = None,
     spatial: bool = False,
+    publish_motion: bool = True,
 ):
     if station_from_execution is None:
         station_from_execution = np.eye(4, dtype=float)
@@ -239,17 +231,7 @@ def _runtime_fixture(
         execution_frame_spec_hash=execution_frame.semantic_content_hash,
         exclusive_command_claim=exclusive_owner,
     )
-    route_ids = (
-        REAL_AGENT_TCP_CARDINAL_STEP_ROUTE_ID_V1,
-        *tuple(
-            REAL_AGENT_TCP_FIXED_CARDINAL_STEP_ROUTE_ID_BY_SKILL_ID_V1[skill_id]
-            for skill_id in FIXED_CARDINAL_TCP_STEP_SKILL_IDS_V1
-        ),
-        *tuple(
-            REAL_AGENT_TCP_FIXED_ORIENTATION_ROUTE_ID_BY_SKILL_ID_V1[skill_id]
-            for skill_id in FIXED_LEVEL_TCP_ORIENTATION_SKILL_IDS_V1
-        ),
-    )
+    route_ids = real_agent_motion_route_ids_v1() if publish_motion else ("real.unpublished",)
     envelope = SkillDeploymentSafetyEnvelopeRef(
         object_id="real-envelope:gateway-test",
         schema="dexteleop.deployment_safety_envelope.v1",
@@ -356,41 +338,25 @@ def _request(
     snapshot,
     *,
     skill_id: str,
-    direction: str | None,
+    target_x_m: float = 0.04,
     client_sequence: int = 1,
     request_suffix: str | None = None,
 ):
     entry = bundle.route_manifest.route(skill_id, "1")
     route = entry.route
-    if skill_id == "motion.step_tcp_cardinal" or skill_id in (
-        FIXED_CARDINAL_TCP_STEP_SKILL_IDS_V1
-    ):
-        profile = bundle.cardinal_profile
-        fixed_direction = FIXED_CARDINAL_TCP_STEP_DIRECTION_BY_SKILL_ID_V1.get(skill_id)
-        parameters = {
-            "component_id": profile.component_id,
-            "direction": fixed_direction or direction,
-            "reference_frame_id": profile.reference_frame_id,
-            "reference_frame_spec_hash": profile.reference_frame_spec_hash,
-            "controlled_frame_id": "tool_tcp",
-            "frame_graph_hash": profile.frame_graph_hash,
-            "tool_config_hash": profile.tool_config_hash,
-            "calibration_hash": profile.calibration_hash,
-            "primitive_catalog_hash": profile.primitive_catalog_hash,
-        }
-    else:
-        profile = bundle.orientation_profile(skill_id)
-        parameters = {
-            "component_id": profile.component_id,
-            "reference_frame_id": profile.reference_frame_id,
-            "reference_frame_spec_hash": profile.reference_frame_spec_hash,
-            "controlled_frame_id": "tool_tcp",
-            "frame_graph_hash": profile.frame_graph_hash,
-            "tool_config_hash": profile.tool_config_hash,
-            "calibration_hash": profile.calibration_hash,
-            "primitive_hash": profile.primitive.semantic_content_hash,
-        }
-    identity = request_suffix or direction or "fixed"
+    profile = bundle.pose_target_profile
+    parameters = {
+        "pose_targets_by_component": {
+            profile.component_id: [target_x_m, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+        },
+        "reference_frame_id": profile.reference_frame_id,
+        "reference_frame_spec_hash": profile.reference_frame_spec_hash,
+        "controlled_frame_id": "tool_tcp",
+        "frame_graph_hash": profile.frame_graph_hash,
+        "tool_config_hash": profile.tool_config_hash,
+        "calibration_hash": profile.calibration_hash,
+    }
+    identity = request_suffix or str(target_x_m)
     return AgentSkillRequest(
         client_id=CLIENT_ID,
         request_id=f"request:{skill_id}:{identity}",
@@ -448,20 +414,41 @@ def _read_request(bundle, snapshot) -> AgentSkillRequest:
     )
 
 
-PRIMITIVE_CASES = (
-    *tuple(
-        ("motion.step_tcp_cardinal", direction)
-        for direction in CARDINAL_TCP_STEP_DIRECTIONS_V1
-    ),
-    *tuple(
-        (
-            skill_id,
-            FIXED_CARDINAL_TCP_STEP_DIRECTION_BY_SKILL_ID_V1[skill_id],
-        )
-        for skill_id in FIXED_CARDINAL_TCP_STEP_SKILL_IDS_V1
-    ),
-    *tuple((skill_id, None) for skill_id in FIXED_LEVEL_TCP_ORIENTATION_SKILL_IDS_V1),
-)
+@pytest.mark.parametrize("hold_succeeds", (True, False))
+def test_real_read_only_composition_closes_only_with_lower_hold_proof(hold_succeeds):
+    bundle, port, builder = _runtime_fixture(publish_motion=False)
+    clock = _Clock()
+    owner = _OwnerSession()
+    if not hold_succeeds:
+        owner.hold_hardware = lambda *_args, **_kwargs: False
+
+    def lower_sleep(duration):
+        clock.value += duration
+        port.apply_owner_requests(session=owner, now=clock())
+
+    gateway = assemble_real_agent_primitive_gateway_session(
+        contract_bundle=bundle,
+        port=port,
+        owner_state_provider=lambda: _owner_state(bundle, captured_at=clock()),
+        allowed_client_ids=(CLIENT_ID,),
+        clock=clock,
+        sleep=lower_sleep,
+    )
+    assert gateway.executors_by_skill_id == {}
+    assert {entry.route.skill_id for entry in bundle.route_manifest.skill_routes} == {
+        "state.read_tcp_pose"
+    }
+    outcome = gateway.close()
+    assert outcome.accepted is hold_succeeds
+    assert outcome.port_receipt is not None
+    assert outcome.port_receipt.authoritative_lower_receipt
+    assert outcome.port_receipt.succeeded is hold_succeeds
+    assert outcome.port_receipt.proves_motion_or_hold is hold_succeeds
+    assert outcome.port_receipt.lower_operation_id is None
+    assert outcome.port_receipt.evidence_refs == (port.snapshot().evidence_ref,)
+    assert builder.last_target is None
+    assert port.snapshot().dispatch_count == 0
+    assert gateway._close_outcome is (outcome if hold_succeeds else None)
 
 
 class _ComposedGripperBackend:
@@ -598,7 +585,7 @@ def test_composed_gripper_requires_separate_authorization_and_executes_under_hol
         arm_auth = RealAgentPrimitiveSessionAuthorization(
             gateway_session=gateway,
             side="right",
-            authorized_actions=("forward",),
+            authorized_actions=("move_tcp_to_pose",),
             client_id=CLIENT_ID,
             confirmation_token=REAL_AGENT_PRIMITIVE_SESSION_CONFIRM_TOKEN,
             clock=clock,
@@ -643,7 +630,7 @@ def test_composed_gripper_reserves_the_same_operation_slot_as_arm_motion(_compos
         auth = RealAgentPrimitiveSessionAuthorization(
             gateway_session=gateway,
             side="right",
-            authorized_actions=("forward", "set_gripper_state"),
+            authorized_actions=("move_tcp_to_pose", "set_gripper_state"),
             client_id=CLIENT_ID,
             confirmation_token=REAL_AGENT_PRIMITIVE_SESSION_CONFIRM_TOKEN,
             clock=clock,
@@ -658,8 +645,7 @@ def test_composed_gripper_reserves_the_same_operation_slot_as_arm_motion(_compos
         arm = _request(
             gateway.contract_bundle,
             snapshot,
-            skill_id="motion.step_tcp_forward",
-            direction="forward",
+            skill_id="motion.move_tcp_to_pose",
             client_sequence=2,
         )
         grant = auth.grant_resolver(arm)
@@ -905,7 +891,7 @@ def test_real_wire_adapter_projects_lower_owned_arm_resource_while_idle() -> Non
     assert {item["skill_id"] for item in arm["read_skill_refs"]} == {
         "state.read_tcp_pose"
     }
-    assert "motion.step_tcp_forward" in {
+    assert "motion.move_tcp_to_pose" in {
         item["skill_id"] for item in arm["drive_skill_refs"]
     }
 
@@ -997,7 +983,7 @@ def test_real_gateway_reads_tcp_pose_without_consuming_motion_grant() -> None:
     authorization = RealAgentPrimitiveSessionAuthorization(
         gateway_session=gateway,
         side="right",
-        action="forward",
+        action="move_tcp_to_pose",
         client_id=CLIENT_ID,
         confirmation_token=REAL_AGENT_PRIMITIVE_SESSION_CONFIRM_TOKEN,
         clock=clock,
@@ -1236,11 +1222,8 @@ def test_future_owner_cut_remains_rejected() -> None:
         )
 
 
-@pytest.mark.parametrize(("skill_id", "direction"), PRIMITIVE_CASES)
-def test_real_gateway_executes_each_reviewed_primitive_through_grant_and_hold(
-    skill_id: str,
-    direction: str | None,
-) -> None:
+def test_real_gateway_executes_retained_motion_through_grant_and_hold() -> None:
+    skill_id = "motion.move_tcp_to_pose"
     bundle, port, target_builder = _runtime_fixture()
     clock = _Clock()
     owner_session = _OwnerSession()
@@ -1294,7 +1277,6 @@ def test_real_gateway_executes_each_reviewed_primitive_through_grant_and_hold(
         bundle,
         snapshot,
         skill_id=skill_id,
-        direction=direction,
     )
     rejected = gateway.service.submit_request(
         request=pre_grant_request,
@@ -1313,7 +1295,7 @@ def test_real_gateway_executes_each_reviewed_primitive_through_grant_and_hold(
         route=route,
         request=pre_grant_request,
         operator_authorization_receipt_id=(
-            f"operator-confirmation:{skill_id}:{direction or 'fixed'}"
+            f"operator-confirmation:{skill_id}"
         ),
         client_id=CLIENT_ID,
         parameter_profile_id=pre_grant_request.parameter_profile_id,
@@ -1395,23 +1377,23 @@ def test_session_authorization_issues_a_distinct_bound_grant_per_request() -> No
     first_request = _request(
         bundle,
         snapshot,
-        skill_id="motion.step_tcp_cardinal",
-        direction="forward",
+        skill_id="motion.move_tcp_to_pose",
+        target_x_m=0.04,
         client_sequence=1,
         request_suffix="session-1",
     )
     second_request = _request(
         bundle,
         snapshot,
-        skill_id="motion.step_tcp_cardinal",
-        direction="backward",
+        skill_id="motion.move_tcp_to_pose",
+        target_x_m=-0.04,
         client_sequence=2,
         request_suffix="session-2",
     )
     authorization = RealAgentPrimitiveSessionAuthorization(
         gateway_session=gateway,
         side="right",
-        authorized_actions=("forward", "backward"),
+        authorized_actions=("move_tcp_to_pose",),
         client_id=CLIENT_ID,
         confirmation_token=REAL_AGENT_PRIMITIVE_SESSION_CONFIRM_TOKEN,
         clock=clock,
@@ -1420,11 +1402,14 @@ def test_session_authorization_issues_a_distinct_bound_grant_per_request() -> No
     mismatched_client = replace(first_request, client_id="another-client")
     mismatched_side = replace(
         first_request,
-        parameters={**first_request.parameters, "component_id": "left_arm"},
+        parameters={
+            **first_request.parameters,
+            "pose_targets_by_component": {"left_arm": [0.0] * 6 + [1.0]},
+        },
     )
     unlisted_action = replace(
         first_request,
-        parameters={**first_request.parameters, "direction": "right"},
+        skill_id="motion.approach_grasp_pose",
     )
     assert authorization.grant_resolver(mismatched_client) is None
     assert authorization.grant_resolver(mismatched_side) is None
@@ -1471,7 +1456,7 @@ def test_session_authorization_rejects_the_retired_one_shot_confirmation() -> No
         RealAgentPrimitiveSessionAuthorization(
             gateway_session=gateway,
             side="right",
-            action="forward",
+            action="move_tcp_to_pose",
             client_id=CLIENT_ID,
             confirmation_token="AUTHORIZE_ONE_REAL_TCP_PRIMITIVE",
             clock=clock,
@@ -1507,13 +1492,13 @@ def test_session_authorization_accepts_requests_from_listed_actions() -> None:
     request = _request(
         bundle,
         snapshot,
-        skill_id=FIXED_CARDINAL_TCP_STEP_SKILL_ID_BY_DIRECTION_V1["backward"],
-        direction="backward",
+        skill_id="motion.move_tcp_to_pose",
+        target_x_m=-0.04,
     )
     authorization = RealAgentPrimitiveSessionAuthorization(
         gateway_session=gateway,
         side="right",
-        authorized_actions=("forward", "backward"),
+        authorized_actions=("move_tcp_to_pose", "execute_grasp_approach_plan"),
         client_id=CLIENT_ID,
         confirmation_token=REAL_AGENT_PRIMITIVE_SESSION_CONFIRM_TOKEN,
         clock=clock,
@@ -1521,7 +1506,7 @@ def test_session_authorization_accepts_requests_from_listed_actions() -> None:
     grant = authorization.grant_resolver(request)
     assert grant is not None
     assert authorization.action is None
-    assert authorization.authorized_actions == ("backward", "forward")
+    assert authorization.authorized_actions == ("execute_grasp_approach_plan", "move_tcp_to_pose")
 
 
 def test_one_gateway_session_executes_two_motion_requests_and_holds_between() -> None:
@@ -1577,7 +1562,7 @@ def test_one_gateway_session_executes_two_motion_requests_and_holds_between() ->
     authorization = RealAgentPrimitiveSessionAuthorization(
         gateway_session=gateway,
         side="right",
-        authorized_actions=("forward", "backward"),
+        authorized_actions=("move_tcp_to_pose",),
         client_id=CLIENT_ID,
         confirmation_token=REAL_AGENT_PRIMITIVE_SESSION_CONFIRM_TOKEN,
         clock=clock,
@@ -1588,15 +1573,15 @@ def test_one_gateway_session_executes_two_motion_requests_and_holds_between() ->
     )
     operation_ids = []
 
-    for client_sequence, direction in enumerate(("forward", "backward"), start=1):
+    for client_sequence, target_x_m in enumerate((0.04, -0.04), start=1):
         observation = gateway.observation_producer.capture_and_publish(gateway.service)
         assert observation.accepted and observation.snapshot is not None
         assert observation.snapshot.lifecycle_state == ("running" if client_sequence == 1 else "hold")
         request = _request(
             bundle,
             observation.snapshot,
-            skill_id="motion.step_tcp_cardinal",
-            direction=direction,
+            skill_id="motion.move_tcp_to_pose",
+            target_x_m=target_x_m,
             client_sequence=client_sequence,
             request_suffix=f"persistent-session-{client_sequence}",
         )
@@ -1680,9 +1665,7 @@ def test_real_factory_attaches_gateway_and_realteleop_to_one_lower_port() -> Non
         attached.gateway_session.port.command_for_observation
     )
     assert set(attached.gateway_session.executors_by_skill_id) == {
-        "motion.step_tcp_cardinal",
-        *FIXED_CARDINAL_TCP_STEP_SKILL_IDS_V1,
-        *FIXED_LEVEL_TCP_ORIENTATION_SKILL_IDS_V1,
+        "motion.move_tcp_to_pose",
     }
 
 
@@ -1710,8 +1693,7 @@ def test_wire_adapter_atomically_binds_one_use_grant_to_exact_request() -> None:
     request = _request(
         bundle,
         observation.snapshot,
-        skill_id=FIXED_CARDINAL_TCP_STEP_SKILL_ID_BY_DIRECTION_V1["forward"],
-        direction="forward",
+        skill_id="motion.move_tcp_to_pose",
     )
     assert request.skill_execution_grant_id is None
 
@@ -2279,7 +2261,7 @@ def test_v2_composed_gripper_requires_separate_authorization_and_executes_under_
         arm_auth = RealAgentPrimitiveSessionAuthorization(
             gateway_session=gateway,
             side="right",
-            authorized_actions=("forward",),
+            authorized_actions=("move_tcp_to_pose",),
             client_id=CLIENT_ID,
             confirmation_token=REAL_AGENT_PRIMITIVE_SESSION_CONFIRM_TOKEN,
             clock=clock,
@@ -2325,7 +2307,7 @@ def test_v2_composed_gripper_reserves_the_same_operation_slot_as_arm_motion(_bil
         auth = RealAgentPrimitiveSessionAuthorization(
             gateway_session=gateway,
             side="right",
-            authorized_actions=("forward", "set_gripper_state"),
+            authorized_actions=("move_tcp_to_pose", "set_gripper_state"),
             client_id=CLIENT_ID,
             confirmation_token=REAL_AGENT_PRIMITIVE_SESSION_CONFIRM_TOKEN,
             clock=clock,
@@ -2340,8 +2322,7 @@ def test_v2_composed_gripper_reserves_the_same_operation_slot_as_arm_motion(_bil
         arm = _request(
             gateway.contract_bundle,
             snapshot,
-            skill_id="motion.step_tcp_forward",
-            direction="forward",
+            skill_id="motion.move_tcp_to_pose",
             client_sequence=2,
         )
         grant = auth.grant_resolver(arm)

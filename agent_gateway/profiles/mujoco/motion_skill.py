@@ -8,6 +8,7 @@ import threading
 import time
 from collections.abc import Callable, Mapping
 from typing import Any
+from dataclasses import replace
 
 import numpy as np
 
@@ -29,6 +30,7 @@ from agent_gateway.protocol.evaluation_contracts import (
 )
 from agent_gateway.protocol.skill_catalog import SkillExecutionRoute
 from agent_gateway.skills.motion.schemas import safe_tcp_pose_goal_policy_v1
+from agent_gateway.skills.motion.path_constraint import validate_path_constraint
 from agent_gateway.runtime.station_operation_worker import (
     StationLifecycleActivationEvidence,
     StationLifecycleControlEvidence,
@@ -37,6 +39,7 @@ from agent_gateway.runtime.station_operation_worker import (
 )
 from dataset_contracts.canonical_encoding import canonical_content_hash
 from robot_motion.action import ComponentAction
+from robot_motion.path_constraints import ToolAxisCone
 from robot_motion.path_planning import JointConfigurationCheck
 from robot_motion.pose import pose_delta_metrics
 from robot_motion.relative_action import xyzquat_to_pose_matrix
@@ -1134,10 +1137,24 @@ class MujocoAgentSafeTcpPoseSkillLifecycle(MujocoAgentTcpPoseSkillLifecycle):
     def __init__(self, *, path_search_time_budget_sec: float = 3.0,
                  contact_binding=None, observed_planning_provider=None, **kwargs: Any) -> None:
         super().__init__(**kwargs)
+        self._axis_cone = None
+        self._path_constraint_evidence = None
+        self._path_policy = None
+        is_safe_v2 = (self.route.skill_id == "motion.move_tcp_to_pose_safe"
+                      and self.route.skill_version == "2")
+        if is_safe_v2:
+            if "path_constraint" not in self.request.parameters:
+                raise ValueError("Safe TCP v2 requires an explicit path_constraint.")
+            self._path_policy = self.request.parameters["path_constraint"]
+            validate_path_constraint(self._path_policy)
+        elif "path_constraint" in self.request.parameters:
+            raise ValueError("Path constraints require the explicit safe TCP v2 Route.")
         self._observed_planning_provider = observed_planning_provider
         expected = self.motion_profile.profile_id
         actual = (None if observed_planning_provider is None else
                   "mujoco.agent_safe_tcp_pose.rgbd." + observed_planning_provider.semantic_content_hash)
+        if actual is not None and is_safe_v2:
+            actual += ".path_axis.v2"
         if ((actual is not None and actual != expected)
                 or (actual is None and expected.startswith("mujoco.agent_safe_tcp_pose.rgbd."))):
             raise ValueError("Observed planner and admitted motion profile must match.")
@@ -1166,6 +1183,15 @@ class MujocoAgentSafeTcpPoseSkillLifecycle(MujocoAgentTcpPoseSkillLifecycle):
         ):
             reason_code = self._lower_failure_code
         return super()._failure(reason_code=reason_code, hold=hold)
+
+    def _axis_deviation_including_published_qref(self, model_qpos, pair, pose):
+        # The existing qref publisher normalizes joints to float32. Check that
+        # exact representation too; tight cones must not be widened by the
+        # later deterministic numeric conversion.
+        published_pair = {side: np.asarray(q, dtype=np.float32) for side, q in pair.items()}
+        published_pose = self._planner.pose_for_configuration(model_qpos, published_pair)
+        return max(self._axis_cone.deviation_rad(pose),
+                   self._axis_cone.deviation_rad(published_pose))
 
     def _planning_goal_tolerances(self):
         preserve_target = (self.route.skill_id == "motion.move_tcp_to_pose_safe"
@@ -1216,6 +1242,10 @@ class MujocoAgentSafeTcpPoseSkillLifecycle(MujocoAgentTcpPoseSkillLifecycle):
         motion_side = self.component_id.removesuffix("_arm")
         constraint = None
         constraint_identity = None
+        if self._path_policy is not None:
+            self._axis_cone = ToolAxisCone.from_pose(
+                measured, tool_axis=self._path_policy["tool_axis"],
+                max_deviation_rad=self._path_policy["max_deviation_rad"])
         if safety is not None:
             initial = safety.project({motion_side: xyzquat_to_pose_matrix(measured)})
             basis = (initial.envelope_profile_hash, initial.anchor_hash)
@@ -1243,6 +1273,30 @@ class MujocoAgentSafeTcpPoseSkillLifecycle(MujocoAgentTcpPoseSkillLifecycle):
                     ),
                     metadata=projection.to_payload(),
                 )
+
+        if self._axis_cone is not None:
+            envelope_constraint = constraint
+            constraint_identity = canonical_content_hash({
+                "envelope_identity": constraint_identity,
+                "tool_axis_cone": self._axis_cone.to_payload(),
+                "execution_reference_frame": self.motion_profile.execution_reference_frame_spec_hash,
+                "public_reference_frame": self.motion_profile.reference_frame_spec_hash,
+            }, domain="dexteleop.mujoco.planned_tcp_axis_constraint.v2")
+
+            def constraint(model_qpos, pair):
+                if envelope_constraint is not None:
+                    answer = envelope_constraint(model_qpos, pair)
+                    if not answer.safe:
+                        return answer
+                else:
+                    answer = JointConfigurationCheck(safe=True)
+                pose = self._planner.pose_for_configuration(model_qpos, pair)
+                deviation = self._axis_deviation_including_published_qref(model_qpos, pair, pose)
+                if deviation > self._axis_cone.max_deviation_rad + 1e-9:
+                    return JointConfigurationCheck(safe=False, reason="tcp_tool_axis_cone_blocked",
+                        metadata={"deviation_rad": deviation,
+                                  "max_deviation_rad": self._axis_cone.max_deviation_rad})
+                return answer
 
         try:
             if cancel_requested():
@@ -1283,6 +1337,26 @@ class MujocoAgentSafeTcpPoseSkillLifecycle(MujocoAgentTcpPoseSkillLifecycle):
                 >= self.motion_profile.max_control_cycles
             ):
                 raise MujocoTcpPlanRejected("safe_tcp_path_exceeds_control_budget")
+            if self._axis_cone is not None:
+                maximum = max(self._axis_deviation_including_published_qref(
+                    plan.source_model_qpos, {**plan.path.start_qpos_by_component, motion_side: q}, pose)
+                    for pose, q in zip(plan.reference_poses, plan.trajectory.q_rad))
+                if maximum > self._axis_cone.max_deviation_rad + 1e-9:
+                    raise MujocoTcpPlanRejected("safe_tcp_planned_tool_axis_constraint_blocked")
+                public_activation = self.application.transform_tcp_pose_xyzquat(
+                    self._activation_measured_pose,
+                    source_frame_id=self.motion_profile.execution_reference_frame_id,
+                    target_frame_id=self.motion_profile.reference_frame_id)
+                public_cone = ToolAxisCone.from_pose(public_activation,
+                    tool_axis=self._axis_cone.tool_axis, max_deviation_rad=self._axis_cone.max_deviation_rad)
+                self._path_constraint_evidence = {
+                    **dict(self._path_policy),
+                    "activation_axis_in_reference_frame": list(public_cone.reference_axis),
+                    "constraint_identity": constraint_identity,
+                    "planned_max_deviation_rad": maximum,
+                    "validated_reference_count": len(plan.reference_poses),
+                    "scope": "sampled_planned_and_live_references",
+                }
         except MujocoTcpPlanRejected as error:
             logging.getLogger(__name__).warning("Safe TCP planning rejected: %s", error)
             hold = self._hold(reason=error.reason_code)
@@ -1321,6 +1395,18 @@ class MujocoAgentSafeTcpPoseSkillLifecycle(MujocoAgentTcpPoseSkillLifecycle):
             )
         self._execution_refs.add("mujoco-safe-joint-trajectory:" + plan.trajectory_hash)
         return evidence
+
+    def _success(self, **kwargs):
+        completion = super()._success(**kwargs)
+        if (self.route.skill_id == "motion.move_tcp_to_pose_safe"
+                and self.route.skill_version == "2"):
+            if self._path_policy is not None and self._path_constraint_evidence is None:
+                raise RuntimeError("A constrained move cannot complete without validated path evidence.")
+            return replace(completion, execution_result={
+                **completion.execution_result,
+                "path_constraint_evidence": self._path_constraint_evidence,
+            })
+        return completion
 
     def _planning_payload_binding(self):
         """Only an explicitly composed lifecycle may supply carried geometry."""
