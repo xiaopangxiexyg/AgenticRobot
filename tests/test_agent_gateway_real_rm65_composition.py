@@ -706,13 +706,15 @@ def test_safe_planner_binding_uses_arrival_tolerances_and_can_observe_without_mo
         safe_motion_debug_dir=tmp_path if debug_enabled else None)
     session = observed.deployment.gateway_session
     assert len(planners) == 1  # Safe static template is lazy, not a fixed-only fallback.
-    geometry_resources = [r for r in observed.resources.additional_resources
-        if isinstance(r, composition_module.MotionPlanningGeometryResources)]
-    assert len(geometry_resources) == 1
+    prepare = observed.resources._prepare_static_geometry
+    assert prepare is not None
+    geometry_resources = prepare.__self__
+    assert isinstance(geometry_resources, composition_module.MotionPlanningGeometryResources)
+    assert geometry_resources not in observed.resources.additional_resources
     prepared = []
-    monkeypatch.setattr(geometry_resources[0].self_filter, 'prepare',
+    monkeypatch.setattr(geometry_resources.self_filter, 'prepare',
                         lambda: prepared.append(True) or {})
-    geometry_resources[0].start()
+    prepare()
     assert prepared == [True] and len(planners) == 2
     for cloud in (object(), object()):
         request = adapter_bindings[0]['planner_factory'](cloud)

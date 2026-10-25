@@ -424,6 +424,7 @@ class ExclusiveRealPerceptionResources:
         additional_resources: tuple[_LifecycleResource, ...] = (),
         start_cameras: Callable[[Mapping[str, Any]], None] | None = None,
         admit_cameras: Callable[[Mapping[str, Any]], None] | None = None,
+        prepare_static_geometry: Callable[[], None] | None = None,
     ) -> None:
         if not callable(getattr(lower, "start", None)) or not callable(
             getattr(lower, "close", None)
@@ -450,12 +451,15 @@ class ExclusiveRealPerceptionResources:
         )
         if not callable(start_cameras) or not callable(admit_cameras):
             raise TypeError("camera lifecycle callbacks must be callable.")
+        if prepare_static_geometry is not None and not callable(prepare_static_geometry):
+            raise TypeError("prepare_static_geometry must be callable.")
         self.lower = lower
         self.camera_sources = dict(camera_sources)
         self.artifact_store = artifact_store
         self.additional_resources = resources
         self._start_cameras = start_cameras
         self._admit_cameras = admit_cameras
+        self._prepare_static_geometry = prepare_static_geometry
         self._lock = threading.Lock()
         self._close_lock = threading.Lock()
         self._start_attempted = False
@@ -482,6 +486,8 @@ class ExclusiveRealPerceptionResources:
         lower_attempted = False
         attempted_resource_indexes: list[int] = []
         try:
+            if self._prepare_static_geometry is not None:
+                self._prepare_static_geometry()
             cameras_attempted = True
             self._start_cameras(self.camera_sources)
             self._admit_cameras(self.camera_sources)
@@ -514,6 +520,10 @@ class ExclusiveRealPerceptionResources:
                 self._additional_closed[index] = True
             if cameras_attempted:
                 self._close_cameras()
+            else:
+                # Static preparation owns no devices. Do not stop unopened
+                # camera sources while unwinding this failed start.
+                self._cameras_closed = True
             if self.artifact_store is not None:
                 try:
                     self.artifact_store.close()

@@ -1244,7 +1244,6 @@ def assemble_exclusive_rm65_agent_primitive_composition(
         additional_resources = tuple(
             resource
             for resource in (
-                planning_geometry_resources,
                 localization_provider if localization_provider is not None else object_localizer,
                 deployment.gateway_session.station_point_grasp_provider,
             )
@@ -1255,6 +1254,10 @@ def assemble_exclusive_rm65_agent_primitive_composition(
             camera_sources=perception_source_binding.camera_sources,
             artifact_store=artifact_store,
             additional_resources=additional_resources,
+            prepare_static_geometry=(
+                planning_geometry_resources.start
+                if planning_geometry_resources is not None else None
+            ),
         )
     if gripper_ports:
         resources = ExclusiveRealGripperResources(lower=resources,

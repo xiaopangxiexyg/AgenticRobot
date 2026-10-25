@@ -43,7 +43,7 @@ def obstacle_cloud_from_captures(*, captures, config, reference_frame_id, self_f
 
 
 class MotionPlanningGeometryResources:
-    """Prepare shared static geometry before the arm control threads start."""
+    """Prepare shared static geometry before any camera or arm is started."""
 
     def __init__(self, *, self_filter, planner_factory=None):
         self.self_filter = self_filter
