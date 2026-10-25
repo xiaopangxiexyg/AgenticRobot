@@ -27,6 +27,11 @@ python -m teleop_runtime.debug.run_vive_rm65_real_teleop --gui
 ndarray也使用同一共享内存槽；`--collection-process-extra-array-mb`控制每槽为这些
 非相机数组预留的容量，默认8 MiB。队列/共享槽过载会显式暂停episode，不能阻塞位控。
 
+共享内存打包与还原使用同一份固定 payload 字段遍历，保持相机 image/标量/metadata/depth、
+再 arm/hand/position-reference 的既有顺序。相机载荷继续支持 array-like，嵌套容器只转换
+对应的 ndarray 或共享数组描述符；metadata 内数组、其他 snapshot 字段及诊断深度的处理不变。
+它不管理槽位：64 字节对齐、容量与描述符校验仍由原转换操作负责，写盘 job 完成后才确认释放。
+
 v2.4 native stream仍为default-off。process worker现提供小型pose/qpos的bounded inline
 接缝：提交不等待写盘，queue full或消息超限返回typed rejection，并在episode seal时记入
 drop/gap。RGBD和tactile大数组禁止使用该pickle通道。首个opt-in `selected_rgb` bridge会从

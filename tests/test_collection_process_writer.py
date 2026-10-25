@@ -4,8 +4,10 @@ import json
 import queue
 import shutil
 import time
+from dataclasses import replace
+from multiprocessing.reduction import ForkingPickler
 from pathlib import Path
-from types import SimpleNamespace
+from types import MappingProxyType, SimpleNamespace
 
 import numpy as np
 import pytest
@@ -397,6 +399,248 @@ def test_native_worker_freeze_failure_and_new_episode_keep_finalize_blocked(
     assert replies[6]["ok"] and replies[6]["result"]["discarded"]
     assert replies[7]["ok"] and replies[7]["result"] == 0
     assert replies[8]["error"] == expected
+
+
+def test_shared_snapshot_layout_preserves_copy_views_and_excluded_fields() -> None:
+    rgb = np.arange(48, dtype=np.uint8).reshape(4, 4, 3)[:, ::2]
+    depth = np.arange(12, dtype=np.uint16).reshape(3, 4).T
+    joints = np.arange(6, dtype=np.float32)
+    metadata_array = np.eye(2)
+    frame = VideoFrame(
+        image=rgb,
+        source_timestamp=np.float64(10.0),
+        receive_timestamp=10.1,
+        available_timestamp=10.2,
+        frame_index=7,
+        metadata={"calibration": metadata_array},
+        depth_image=depth,
+        depth_metadata={"scale": 0.001},
+        unaligned_depth_image=np.ones((5, 5), dtype=np.uint16),
+        unaligned_depth_metadata={"diagnostic": True},
+    )
+    snapshot = replace(
+        _snapshot(),
+        camera_frames={
+            "missing": None,
+            "front": frame,
+            7: VideoFrame(image=[[1, 2], [3, 4]], source_timestamp=11.0),
+        },
+        arm_states=MappingProxyType({
+            "left": {"qpos": joints, "plain_list": [1, None, "unchanged"]},
+        }),
+        hand_states={"left": {"nested": [joints, (None, np.array([3, 4], dtype=">i2"))]}},
+        position_reference={"target": (np.array(3.5),)},
+        component_metadata={"not_shared": metadata_array},
+        include_debug_metadata=True,
+        include_action_debug_metadata=True,
+    )
+
+    def payloads(value):
+        return [
+            value.camera_frames["front"].image,
+            value.camera_frames["front"].depth_image,
+            value.camera_frames["7"].image,
+            value.arm_states["left"]["qpos"],
+            value.hand_states["left"]["nested"][0],
+            value.hand_states["left"]["nested"][1][1],
+            value.position_reference["target"][0],
+        ]
+
+    originals = [
+        rgb, depth, [[1, 2], [3, 4]], joints, joints,
+        np.array([3, 4], dtype=">i2"), np.array(3.5),
+    ]
+    expected = [np.ascontiguousarray(array).copy() for array in originals]
+    pool = process_writer._SharedSlotPool(slot_count=1, slot_bytes=4096)
+    try:
+        slot = pool.acquire()
+        assert slot == 0
+        packed, byte_count = pool.pack_snapshot(snapshot, slot_id=slot)
+        refs = payloads(packed)
+        end = 0
+        for ref, array in zip(refs, expected, strict=True):
+            assert isinstance(ref, process_writer.SharedArrayRef)
+            aligned = (end + 63) // 64 * 64
+            assert (ref.slot_id, ref.shm_name, ref.offset) == (slot, pool.names[0], aligned)
+            assert (ref.shape, ref.dtype, ref.nbytes) == (
+                array.shape, array.dtype.str, array.nbytes,
+            )
+            assert bytes(pool.blocks[0].buf[aligned:aligned + array.nbytes]) == array.tobytes()
+            end = aligned + array.nbytes
+        assert byte_count == end
+        assert refs[3].offset != refs[4].offset
+        assert list(packed.camera_frames) == ["missing", "front", "7"]
+        assert packed.camera_frames["missing"] is None
+        assert packed.camera_frames["front"].source_timestamp == 10.0
+        assert type(packed.camera_frames["front"].source_timestamp) is float
+        assert packed.camera_frames["front"].metadata is not frame.metadata
+        assert packed.camera_frames["front"].metadata["calibration"] is metadata_array
+        assert packed.camera_frames["front"].unaligned_depth_image is None
+        assert packed.camera_frames["front"].unaligned_depth_metadata == {}
+        assert packed.component_metadata is snapshot.component_metadata
+        assert packed.step_result is snapshot.step_result
+        assert packed.snapshot_timings_s is snapshot.snapshot_timings_s
+        assert type(packed.arm_states) is dict
+
+        decoded = ForkingPickler.loads(ForkingPickler.dumps(packed))
+        assert payloads(decoded) == refs
+        hydrated, hydrated_slot = process_writer._hydrate_snapshot(
+            decoded, {block.name: block for block in pool.blocks}
+        )
+        assert hydrated_slot == slot
+        views = payloads(hydrated)
+        raw = np.ndarray((pool.slot_bytes,), dtype=np.uint8, buffer=pool.blocks[0].buf)
+        for view, array in zip(views, expected, strict=True):
+            np.testing.assert_array_equal(view, array)
+            assert view.dtype == array.dtype
+            assert np.shares_memory(view, raw)
+        assert not np.shares_memory(views[3], views[4])
+        rgb.fill(255)
+        joints.fill(255)
+        np.testing.assert_array_equal(views[0], expected[0])
+        np.testing.assert_array_equal(views[3], expected[3])
+        raw[refs[0].offset] = 99
+        assert views[0].reshape(-1)[0] == 99
+        views[3][0] = 42
+        assert views[4][0] == expected[4][0]
+        assert isinstance(hydrated.hand_states["left"]["nested"], list)
+        assert isinstance(hydrated.hand_states["left"]["nested"][1], tuple)
+        assert hydrated.hand_states["left"]["nested"][1][0] is None
+        assert hydrated.arm_states["left"]["plain_list"] == [1, None, "unchanged"]
+        assert hydrated.component_metadata is decoded.component_metadata
+        assert hydrated.step_result is decoded.step_result
+        assert hydrated.snapshot_timings_s is decoded.snapshot_timings_s
+        assert hydrated.include_debug_metadata and hydrated.include_action_debug_metadata
+        assert hydrated.camera_frames["front"].unaligned_depth_image is None
+        assert hydrated.camera_frames["front"].unaligned_depth_metadata == {}
+    finally:
+        pool.close()
+
+
+@pytest.mark.parametrize("empty_array", [False, True])
+def test_shared_snapshot_zero_bytes_keeps_empty_array_distinct_from_no_payload(empty_array) -> None:
+    values = {"empty": np.empty((0, 6), dtype=np.float32)} if empty_array else {"plain": [1, None]}
+    snapshot = replace(
+        _snapshot(), camera_frames={"front": None}, arm_states={"left": values},
+        hand_states={}, position_reference=None,
+        component_metadata={"not_shared": np.ones(10)},
+    )
+    pool = process_writer._SharedSlotPool(slot_count=1, slot_bytes=64)
+    try:
+        slot = pool.acquire()
+        packed, byte_count = pool.pack_snapshot(snapshot, slot_id=slot)
+        assert byte_count == 0
+        hydrated, hydrated_slot = process_writer._hydrate_snapshot(
+            packed, {block.name: block for block in pool.blocks}
+        )
+        assert hydrated_slot == (slot if empty_array else None)
+        assert hydrated.camera_frames == {"front": None}
+        assert hydrated.position_reference is None
+        assert hydrated.component_metadata is snapshot.component_metadata
+        if empty_array:
+            assert hydrated.arm_states["left"]["empty"].shape == (0, 6)
+        else:
+            assert hydrated.arm_states == snapshot.arm_states
+    finally:
+        pool.close()
+
+
+def test_shared_snapshot_capacity_error_precedes_camera_timestamp_and_retains_lease() -> None:
+    snapshot = replace(
+        _snapshot(), camera_frames={"front": VideoFrame(
+            image=np.ones(128, dtype=np.uint8), source_timestamp=object(),
+        )},
+    )
+    pool = process_writer._SharedSlotPool(slot_count=1, slot_bytes=64)
+    try:
+        slot = pool.acquire()
+        with pytest.raises(BufferError, match="required=128 configured=64"):
+            pool.pack_snapshot(snapshot, slot_id=slot)
+        assert pool.available_count == 0
+        pool.release(slot)
+        assert pool.acquire() == slot
+    finally:
+        pool.close()
+
+
+@pytest.mark.parametrize("bad_field", ["source_timestamp", "metadata"])
+def test_shared_snapshot_camera_fields_fail_before_depth_or_state_payloads(bad_field) -> None:
+    frame = VideoFrame(
+        image=np.ones(1, dtype=np.uint8), source_timestamp=1.0,
+        depth_image=np.ones(128, dtype=np.uint8),
+    )
+    frame = replace(frame, **{bad_field: object() if bad_field == "source_timestamp" else None})
+    snapshot = replace(_snapshot(), camera_frames={"front": frame})
+    pool = process_writer._SharedSlotPool(slot_count=1, slot_bytes=64)
+    try:
+        slot = pool.acquire()
+        with pytest.raises(TypeError):
+            pool.pack_snapshot(snapshot, slot_id=slot)
+    finally:
+        pool.close()
+
+
+@pytest.mark.parametrize("corruption", ["slot", "bytes", "missing_block", "bounds"])
+def test_shared_snapshot_hydration_retains_descriptor_validation(corruption) -> None:
+    pool = process_writer._SharedSlotPool(slot_count=1, slot_bytes=4096)
+    try:
+        slot = pool.acquire()
+        packed, _ = pool.pack_snapshot(_snapshot(), slot_id=slot)
+        ref = packed.hand_states["left"]["tactile_dict"]["sensor_a"]
+        if corruption == "slot":
+            broken = replace(ref, slot_id=slot + 1, shm_name="unavailable")
+            error, message = RuntimeError, "multiple shared slots"
+        elif corruption == "bytes":
+            broken = replace(ref, nbytes=ref.nbytes + 1)
+            error, message = RuntimeError, "byte count mismatch"
+        elif corruption == "missing_block":
+            broken = replace(ref, shm_name="unavailable")
+            error, message = KeyError, "unavailable"
+        else:
+            broken = replace(ref, offset=pool.slot_bytes)
+            error, message = TypeError, "buffer is too small"
+        packed.hand_states["left"]["tactile_dict"]["sensor_a"] = broken
+        with pytest.raises(error, match=message):
+            process_writer._hydrate_snapshot(packed, {block.name: block for block in pool.blocks})
+    finally:
+        pool.close()
+
+
+def test_shared_snapshot_hydration_keeps_non_reference_values() -> None:
+    snapshot = _snapshot()
+    hydrated, slot = process_writer._hydrate_snapshot(snapshot, {})
+    assert slot is None
+    assert hydrated.camera_frames["front"].image is snapshot.camera_frames["front"].image
+    assert hydrated.hand_states["left"]["tactile_dict"]["sensor_a"] is (
+        snapshot.hand_states["left"]["tactile_dict"]["sensor_a"]
+    )
+
+
+def test_shared_snapshot_serialization_failure_releases_the_only_parent_slot(tmp_path) -> None:
+    worker = ProcessCollectionWorker(
+        writer_config=LeRobotV21WriterConfig(
+            root_dir=tmp_path, write_parquet=False, write_video=False,
+        ),
+        sample_builder_config=CollectorSampleBuilderConfig(),
+        config=ProcessCollectionConfig(
+            queue_size=1, shared_slot_count=1, shared_slot_bytes=4096, worker_nice=0,
+        ),
+    )
+    try:
+        worker.start()
+        episode = worker.start_episode({})
+        snapshot = _snapshot()
+        unpicklable = replace(snapshot, component_metadata={"invalid": lambda: None})
+        with pytest.raises(TypeError, match="sample is not serializable"):
+            worker.submit_snapshot(unpicklable)
+        assert worker.stats().submitted_samples == 0
+        assert worker.submit_snapshot(snapshot)
+        worker.flush()
+        assert worker.stats().completed_samples == 1
+        assert worker.stats().worker_error is None
+        worker.finalize_episode(episode, summary={"test": "shared-slot-recovery"})
+    finally:
+        worker.close()
 
 
 def test_process_collection_worker_writes_and_finalizes_without_hardware(tmp_path) -> None:
