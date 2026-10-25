@@ -324,6 +324,7 @@ def test_gateway_numerical_dependencies_are_confined_to_concrete_profiles() -> N
         "agent_gateway/profiles/paired_rgbd.py": ["numpy"],
         "agent_gateway/profiles/real/back_projection.py": ["numpy"],
         "agent_gateway/profiles/segmentation.py": ["numpy"],
+        "agent_gateway/profiles/segmentation_batch.py": ["numpy", "scipy"],
         "agent_gateway/profiles/mujoco/motion_skill.py": ["numpy"],
         "agent_gateway/profiles/mujoco/grasp_candidate_selection.py": ["numpy"],
         "agent_gateway/profiles/mujoco/grasp_fast_plan.py": ["numpy"],

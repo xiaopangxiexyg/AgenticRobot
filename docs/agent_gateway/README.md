@@ -33,6 +33,9 @@ MuJoCo 留存观测点移动和可选观测障碍规划的调用合同、启用�
 同源RGB-D留存基础可显式启用 `--enable-rgbd-capture-v3 --artifact-root ...`，
 增加默认关闭的 `perception.capture_rgb@3`；原生网格、原始媒体与失败边界见
 [`agent_gateway/README.md`](../../agent_gateway/README.md#entrypoints)。
+多目标分割v2和认证留存RGB的二维几何v3也分别通过显式
+`--enable-segmentation-batch-v2`、`--enable-segmentation-geometry-v3` 启用；
+两者复用原分割模型，输出不提供身份验证、三维物理间隙或运动授权。
 运行资产包的下载、解压和共享根登记统一见项目根 [`README.md`](../../README.md) 的“运行资产”章节；
 本目录不重复资产包说明。
 

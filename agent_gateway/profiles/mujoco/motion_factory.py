@@ -525,6 +525,8 @@ def build_mujoco_agent_tcp_pose_gateway_session(
     artifact_storage: MujocoAgentArtifactStorageConfig | None = None,
     segmentation_localizer: object | None = None,
     enable_rgbd_capture_v3: bool = False,
+    enable_segmentation_batch_v2: bool = False,
+    enable_segmentation_geometry_v3: bool = False,
     enable_safe_tcp_pose: bool = False,
     enable_observed_point_motion: bool = False,
     enable_spatial_goals: bool = False,
@@ -542,6 +544,28 @@ def build_mujoco_agent_tcp_pose_gateway_session(
 ) -> MujocoAgentTcpPoseGatewaySession:
     """Build the exact default-off graph; do not start, record, or serve it."""
 
+    for name, enabled, version in (
+        ("enable_segmentation_batch_v2", enable_segmentation_batch_v2, "2"),
+        ("enable_segmentation_geometry_v3", enable_segmentation_geometry_v3, "3"),
+    ):
+        if type(enabled) is not bool:
+            raise TypeError(f"{name} must be boolean.")
+        if enabled and (segmentation_localizer is None or artifact_storage is None):
+            raise ValueError(f"Segmentation batch v{version} requires Artifact storage and a segmentation model.")
+    if enable_segmentation_geometry_v3 and max_retained_operations < 2:
+        raise ValueError("RGB-input geometry requires retention for at least producer and consumer operations.")
+    if enable_segmentation_batch_v2 or enable_segmentation_geometry_v3:
+        if not isinstance(artifact_storage, MujocoAgentArtifactStorageConfig):
+            raise TypeError("artifact_storage must be typed or None.")
+        for name in ("start", "close", "segment", "encode_segment_artifacts"):
+            if not callable(getattr(segmentation_localizer, name, None)):
+                raise TypeError(f"segmentation_localizer must expose {name}().")
+        model_spec = getattr(segmentation_localizer, "model_spec", None)
+        if any(not isinstance(value, str) or not value or value != value.strip() for value in (
+                getattr(model_spec, "model_profile_id", None),
+                getattr(model_spec, "semantic_content_hash", None),
+                getattr(segmentation_localizer, "semantic_content_hash", None))):
+            raise ValueError("Segmentation batch v2/v3 requires typed model identity strings.")
     if not isinstance(target_config, MujocoSimHILTargetConfig):
         raise TypeError("target_config must be MujocoSimHILTargetConfig.")
     side = _validated_motion_side(motion_side)
@@ -592,6 +616,8 @@ def build_mujoco_agent_tcp_pose_gateway_session(
         or enable_grasp_approach
         or grasp_contact_target_body is not None
         or enable_rgbd_capture_v3
+        or enable_segmentation_batch_v2
+        or enable_segmentation_geometry_v3
         or enable_spatial_goals
         or history_storage is not None
         or segmentation_localizer is not None
@@ -793,6 +819,8 @@ def build_mujoco_agent_tcp_pose_gateway_session(
             ),
             enable_artifact_perception=artifact_storage is not None,
             enable_rgbd_capture_v3=enable_rgbd_capture_v3,
+            enable_segmentation_batch_v2=enable_segmentation_batch_v2,
+            enable_segmentation_geometry_v3=enable_segmentation_geometry_v3,
             segmentation_model_profile_id=(
                 None
                 if segmentation_localizer is None

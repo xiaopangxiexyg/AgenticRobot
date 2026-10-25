@@ -200,6 +200,8 @@ class MujocoAgentTcpPoseGatewaySession:
     _fast_grasp_start_failed: bool = field(default=False, init=False, repr=False)
     observed_point_executor: ReusableStationAgentSkillOperationExecutor | None = None
     rgbd_capture_executor: PassiveReadSkillExecutor | None = None
+    segmentation_batch_executor: PassiveReadSkillExecutor | None = None
+    segmentation_geometry_executor: PassiveReadSkillExecutor | None = None
     _close_lock: threading.Lock = field(
         default_factory=threading.Lock,
         init=False,
@@ -238,6 +240,13 @@ class MujocoAgentTcpPoseGatewaySession:
             raise ValueError("Spatial goal registration and executor must coexist.")
         if (self.contract_bundle.rgbd_capture is not None) != (self.rgbd_capture_executor is not None):
             raise ValueError("RGB-D capture registration and executor must coexist.")
+        for version, registration, executor in (
+            ("2", self.contract_bundle.segmentation_batch, self.segmentation_batch_executor),
+            ("3", self.contract_bundle.segmentation_geometry, self.segmentation_geometry_executor),
+        ):
+            if (registration is not None) != (executor is not None):
+                label = "batch" if version == "2" else "geometry"
+                raise ValueError(f"Segmentation {label} registration and executor must coexist.")
         if (self.contract_bundle.tcp_pose_comparison_registration is not None) != (self.tcp_pose_comparison_executor is not None):
             raise ValueError("TCP comparison registration and executor must coexist.")
         if (self.contract_bundle.object_state_registration is not None) != (self.object_state_executor is not None):
@@ -575,6 +584,12 @@ class MujocoAgentTcpPoseGatewaySession:
                     ("tcp_pose_comparison", self.tcp_pose_comparison_executor, 5.0),
                     ("object_state", self.object_state_executor, 5.0),
                     ("segmentation", self.segmentation_executor, 65.0),
+                    *((("segmentation_batch", self.segmentation_batch_executor,
+                        self.contract_bundle.segmentation_batch.skill.routes[0].max_operation_duration_ms / 1000 + 5.0),)
+                        if self.segmentation_batch_executor is not None else ()),
+                    *((("segmentation_geometry", self.segmentation_geometry_executor,
+                        self.contract_bundle.segmentation_geometry.skill.routes[0].max_operation_duration_ms / 1000 + 5.0),)
+                        if self.segmentation_geometry_executor is not None else ()),
                     ("grasp_observation", self.grasp_observation_executor, 65.0),
                     ("fast_grasp", self.fast_grasp_executor, 65.0),
                     (
@@ -774,6 +789,9 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
 ) -> MujocoAgentTcpPoseGatewaySession:
     """Wire exact Routes without starting the application or history recorder."""
 
+    if (isinstance(contract_bundle, MujocoAgentTcpPoseContractBundle)
+            and contract_bundle.segmentation_geometry is not None and max_retained_operations < 2):
+        raise ValueError("Geometry requires retained producer and consumer operations.")
     if not isinstance(application, MujocoAgentSkillMotionApplication):
         raise TypeError("application must be a motion application.")
     if not isinstance(contract_bundle, MujocoAgentTcpPoseContractBundle):
@@ -1691,6 +1709,30 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
             return None
         return source_request, source_operation
 
+    segmentation_batch_executor = None
+    segmentation_geometry_executor = None
+    for registration in (contract_bundle.segmentation_batch, contract_bundle.segmentation_geometry):
+        if registration is None:
+            continue
+        from agent_gateway.profiles.segmentation_batch import build_segmentation_batch_executor
+
+        version = registration.skill.definition.skill_version
+        executor = build_segmentation_batch_executor(
+            registration=registration, provider=segmentation_provider, artifact_store=artifact_store,
+            runtime_session_id=contract_bundle.route_manifest.runtime_session_id,
+            current_station_revision=lambda: observation_producer.current_station_revision,
+            clock=runtime_clock, max_retained_operations=retention,
+            **({"rgb_capture_registration": (contract_bundle.rgbd_capture.skill
+                    if contract_bundle.rgbd_capture is not None else contract_bundle.rgb_capture.registration),
+                "rgb_capture_validator": (contract_bundle.rgbd_capture.payload_validator
+                    if contract_bundle.rgbd_capture is not None else contract_bundle.rgb_capture.payload_validator),
+                "lookup_operation": lookup_retained_operation} if version == "3" else {}))
+        if version == "2":
+            segmentation_batch_executor = executor
+        else:
+            segmentation_geometry_executor = executor
+        execution_port_by_route_hash[registration.skill.routes[0].semantic_content_hash] = executor
+
     if contract_bundle.tcp_pose_comparison_registration is not None:
         from agent_gateway.profiles.tcp_pose_comparison import (
             build_tcp_pose_comparison_executor,
@@ -2063,6 +2105,8 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
         segmentation_localizer=segmentation_localizer,
         segmentation_provider=segmentation_provider,
         segmentation_executor=segmentation_executor,
+        segmentation_batch_executor=segmentation_batch_executor,
+        segmentation_geometry_executor=segmentation_geometry_executor,
         placement_provider=placement_provider,
         placement_executor=placement_executor,
         history_provider=history_provider,
