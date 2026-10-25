@@ -170,6 +170,24 @@ class CoordinatedPoseHolding:
             soft_limit_rad_s=self.settings.staged_assist.settle_velocity_rad_s,
             hard_limit_rad_s=self.settings.limits.max_joint_velocity_rad_s) == "ready"
 
+    def arrival_quiet(self):
+        # Explicit cruise arrival already uses the native resolution-aware
+        # stop evidence. Its consumed handoff must use that SAME predicate,
+        # not restart a second, stricter dwell on one-count fitted slopes.
+        # Preparation, probes and final supported-origin disable keep quiet().
+        if not self.config.cruise_arrival_feedback:
+            return self.quiet()
+        if self.last_time is None or not all(e.ready for e in self.estimators):
+            return False
+        evidence = B601WindowStopEvidence(timestamp_sec=self.last_time, qpos_rad=self.q,
+            raw_qvel_rad_s=self.raw, window_qvel_rad_s=self.velocity,
+            position_span_rad=tuple(e.position_span_rad for e in self.estimators),
+            window_span_sec=min(e.span_sec for e in self.estimators),
+            raw_velocity_limit_rad_s=self.settings.limits.max_joint_velocity_rad_s)
+        return evidence.gate_reason(window_sec=self.motion.velocity_window_sec,
+            velocity_limit=self.settings.staged_assist.settle_velocity_rad_s,
+            resolution=self.motion.position_resolution_rad or 0.0) is None
+
     def set_goal(self, goal, *, max_reference_velocity_rad_s=None, support_soft_speed_recovery=None):
         goal = six(goal, "coordinated goal")
         if self.pending is not None or self.last_time is None:
@@ -187,7 +205,7 @@ class CoordinatedPoseHolding:
         recovery = recovery or self.config.supported_soft_recovery
         if any(tracker.config.max_reference_velocity_rad_s != speed
                or tracker.config.support_soft_speed_recovery != recovery for tracker in self.trackers):
-            if not self.quiet():
+            if not self.arrival_quiet():
                 raise ValueError("reference parameter changes require fresh six-axis stillness")
             # Only stage-owned parameters change at a consumed, quiet handoff.
             # Keep the actual command and learned support bias continuously.

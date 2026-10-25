@@ -472,6 +472,107 @@ def test_one_count_position_chatter_does_not_ratchet_arrival_support(
         assert saw_slew
 
 
+def test_explicit_arrival_handoff_reuses_native_stop_evidence_without_changing_preparation(tmp_path):
+    core = controller_from_profile(tmp_path, profile=FOUR_CENTRES)._workspace._coordinated.pose
+    origin = (0, .05, .08, 0, 0, 0)
+    warm_core(core, q=origin, target=0)
+    saw_false_strict_gate = False
+    for n in range(1, 81):
+        q = list(origin)
+        q[2] += RESOLUTION if n % 8 >= 4 else 0
+        raw = tuple((a-b)/.01 for a,b in zip(q, core.q))
+        core.observe(core.last_time+.01, q, raw)
+        assert core.arrival_quiet()
+        if not core.quiet():
+            saw_false_strict_gate = True
+            core.set_goal(core.goal, max_reference_velocity_rad_s=.0075)
+    assert saw_false_strict_gate
+    # Multi-count resolved motion and the raw hard guard are unchanged.
+    for n in range(1, 13):
+        q = list(core.q)
+        q[2] += RESOLUTION
+        core.observe(core.last_time+.01, q, (0, 0, RESOLUTION/.01, 0, 0, 0))
+    assert not core.arrival_quiet()
+    core.raw = (0, 0, .196, 0, 0, 0)
+    assert not core.arrival_quiet()
+
+
+@pytest.mark.parametrize('case,passed', [
+    ('passed_intermediate', True), ('before_intermediate', False), ('beyond_origin', False),
+    ('final_origin', False), ('peer_outside_band', False), ('raw_hard_guard', False),
+    ('acquisition_pose', False), ('legacy', False),
+])
+def test_return_waypoint_progress_does_not_reverse_toward_an_intermediate_point(tmp_path, case, passed):
+    workspace = controller_from_profile(tmp_path, profile=FOUR_CENTRES)._workspace._coordinated
+    core = workspace.pose
+    q = (0, .01, .07401756942272186, 0, 0, 0)
+    warm_core(core, q=q, target=0)
+    target = list(q)
+    target[2] = .07844627141952515
+    core.set_goal(target)
+    workspace._phase = 'return'
+    workspace._index = 0
+    workspace._tasks = [{'kind':'return', 'joint':'joint3', 'target':.006902913562953472}]
+    if case == 'before_intermediate':
+        core.q = (*q[:2], .085, *q[3:])
+    elif case == 'beyond_origin':
+        core.q = (*q[:2], .003, *q[3:])
+    elif case == 'final_origin':
+        core.goal = (*target[:2], .006902913562953472, *target[3:])
+    elif case == 'peer_outside_band':
+        core.q = (0, .02, *q[2:])
+    elif case == 'raw_hard_guard':
+        core.raw = (0, 0, .196, 0, 0, 0)
+    elif case == 'acquisition_pose':
+        workspace._phase = 'position'
+    elif case == 'legacy':
+        core.config = replace(core.config, cruise_arrival_feedback=False,
+            arrival_displacement_gains_nm_per_rad=None)
+    assert workspace._return_waypoint_passed() is passed
+
+
+def test_passed_return_waypoint_advances_only_after_consumed_dwell_and_finishes_origin(tmp_path):
+    from test_b601_automatic_calibration import AcquisitionReplay
+    from test_b601_workspace_calibration import LIMITS
+    controller = controller_from_profile(tmp_path, profile=FOUR_CENTRES)
+    w = controller._workspace._coordinated
+    w.workspace = replace(w.workspace, joint2_centres_deg=(3,), joint3_centres_deg=(6,))
+    controller._workspace.workspace = w.workspace
+    r = AcquisitionReplay(controller._workspace.settings, controller=controller,
+        position_limits=LIMITS, initial_q=(0, .01, .01, 0, 0, 0))
+    controller.submit('select_mode', now_sec=r.now, operation_mode='workspace')
+    for _ in range(20):
+        r.tick()
+    controller.submit('arm', now_sec=r.now, operation_mode='workspace', return_and_disable=True)
+    stopped = passed = False
+    for _ in range(6000):
+        if not stopped and w._phase == 'position' and r.q[2] > .08:
+            w._stop('leg_timeout', 'failed')
+            stopped = True
+        goal = w.pose.goal or r.q
+        desired, speed = list(goal), .008
+        if w._phase == 'return':
+            task = w._tasks[w._index]
+            i = int(task['joint'][-1])-1
+            if abs(goal[i]-task['target']) > w.pose.arrival_tolerance_rad:
+                direction = 1 if task['target'] > goal[i] else -1
+                desired[i] += direction*.0045
+                # Only the final .01 rad is prescribed faster,
+                # so the fixture does not outrun the admitted reference.
+                if abs(r.q[i]-goal[i]) < .01:
+                    speed = .05
+                passed |= direction*(r.q[i]-goal[i]) > w.pose.arrival_tolerance_rad
+        q = tuple(v+max(-speed*.01, min(speed*.01, g-v)) for v,g in zip(r.q,desired))
+        r.tick(q=q)
+        if w._return_completed:
+            break
+    assert stopped and passed
+    assert w._return_completed and controller.automatic_disable_ready
+    records = [*r.records, *w.drain_records()]
+    assert any(d.get('kind') == 'workspace_return_waypoint_passed' for d in records)
+    assert max(abs(q-o) for q,o in zip(r.q,w._supported_origin)) <= w.workspace.holding_search.movement_rad
+
+
 @pytest.mark.parametrize("width", [True, .002, float("nan"), float("inf"), -.1])
 def test_invalid_position_bin_option_rejected_before_start(width):
     with pytest.raises(ValueError):

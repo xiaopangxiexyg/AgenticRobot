@@ -307,16 +307,34 @@ class CoordinatedWorkspaceController:
     def _at_goal(self, radius, *, require_quiet=True):
         # Only J2/J3 have position authority. Passive axes remain inside their
         # safety envelope; static acquisition checks their full position window.
-        return (self.pose.goal is not None and (not require_quiet or self.pose.quiet())
+        return (self.pose.goal is not None and (not require_quiet or self.pose.arrival_quiet())
                 and max(abs(self.pose.q[i]-self.pose.goal[i]) for i in AXES) <= radius)
+
+    def _return_waypoint_passed(self):
+        # A segmented return waypoint is a path-progress marker, not a new
+        # measurement pose. Do not reverse away from home to recover a small
+        # overshoot. Final origin, peer pose and all owner guards stay strict.
+        if (not self.pose.config.cruise_arrival_feedback or self._phase != "return"
+            or self.pose.goal is None or not self.pose.arrival_quiet()):
+            return False
+        task = self._tasks[self._index]
+        i = int(task["joint"][-1])-1
+        target, waypoint, q = task["target"], self.pose.goal[i], self.pose.q[i]
+        direction = target-waypoint
+        return (direction != 0 and (q-waypoint)*direction >= 0 and (target-q)*direction >= 0
+            and all(abs(self.pose.q[j]-self.pose.goal[j]) <= self.pose.arrival_tolerance_rad
+                    for j in AXES if j != i))
 
     def _arrival_status(self):
         radius = self.pose.arrival_tolerance_rad
         goal = self.pose.goal
-        quiet = self.pose.quiet()
+        quiet = self.pose.arrival_quiet()
         error = None if goal is None else tuple(q-g for q, g in zip(self.pose.q, goal))
         return {"controlled_joint_names": ["joint2", "joint3"],
             "tolerance_rad": radius, "six_axis_stationary": quiet,
+            "preparation_stationary": self.pose.quiet(),
+            "stationarity_basis": ("native_resolution_aware_arrival" if self.pose.config.cruise_arrival_feedback
+                                   else "strict_preparation"),
             "controlled_error_rad": None if error is None else [error[i] for i in AXES],
             "passive_offset_from_nominal_rad": None if error is None else {f"joint{i+1}": error[i] for i in (0, 3, 4, 5)},
             "reason": ("no_goal" if goal is None else "six_axis_not_stationary" if not quiet
@@ -599,10 +617,11 @@ class CoordinatedWorkspaceController:
             # Static acquisition measures the entire six-axis position window.
             # Do not restart it for a short-window velocity/count fluctuation
             # inside that band. Native braking, fresh complete receipts and all
-            # owner guards still precede this branch. Transit handoffs and fixed
-            # command bisection keep their original quiet gates.
-            if not self._at_goal(self.pose.arrival_tolerance_rad,
-                                 require_quiet=not pose_observation):
+            # owner guards still precede this branch. Explicit cruise handoffs
+            # reuse native stop evidence; fixed-command bisection stays strict.
+            waypoint_passed = self._return_waypoint_passed()
+            if not (self._at_goal(self.pose.arrival_tolerance_rad,
+                                 require_quiet=not pose_observation) or waypoint_passed):
                 self._quiet_since = self._pose_window = None
                 return
             if self._quiet_since is None:
@@ -624,11 +643,16 @@ class CoordinatedWorkspaceController:
             if stamp-self._quiet_since < dwell:
                 return
             # Reference speed/damping changes at the next task still require
-            # the original fresh stillness check. Wait without discarding the
+            # the same fresh arrival check. Wait without discarding the
             # valid long window when its last frame has count jitter.
-            if pose_observation and not self.pose.quiet():
+            if pose_observation and not self.pose.arrival_quiet():
                 return
             if self._phase in {"position", "return"} and abs(task["target"]-self.pose.q[int(task["joint"][-1])-1]) > self.pose.arrival_tolerance_rad:
+                if waypoint_passed:
+                    self._records.append({"kind": "workspace_return_waypoint_passed",
+                        "recorded_monotonic_sec": completed, "waypoint_qpos_rad": self.pose.goal,
+                        "measured_qpos_rad": self.pose.q, "task": copy.deepcopy(task),
+                        "semantics": "consumed_stationary_progress_on_existing_return_segment_not_origin_confirmation"})
                 self._begin_task()
                 return
             if pose_observation:
