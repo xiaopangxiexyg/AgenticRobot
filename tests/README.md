@@ -90,6 +90,16 @@ do not establish equivalent coverage. Record this reasoning in the existing
 review, with measured runtime impact when execution cost motivates the change;
 neither net line reductions nor test-count quotas are acceptance criteria.
 
+### 只读快照重试的采样历史
+
+`test_persistent_failed_state_can_retry_without_restart` 在 `_capture_history`
+测试输入端提供可控历史，分别验证过大采样间隔和关节移动被真实 `stationarity`
+校验器拒绝，再用正常历史验证同一设备会话可以重试成功。它不替换校验器，
+不依赖共享测试进程恰好获得足够密集的线程调度，也不改变生产采样周期、时钟或门限。
+原有首次失败、第二次成功、机械臂和相机不重启断言保留；其他采集、历史选择、
+freshness 和静止性边界测试继续覆盖原路径。该用例中的可控历史是测试输入，
+不能作为真实设备采样时序的验证证据。
+
 ### Runtime artifact 重复迁移压缩
 
 `test_runtime_artifact_migration.py` 将已发布迁移的幂等检查接在已有完整成功场景后，
