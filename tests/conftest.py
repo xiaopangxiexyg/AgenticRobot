@@ -32,6 +32,14 @@ _LINUX_UNIX_SOCKET_PATH_LIMIT_BYTES = 107
 _MUJOCO_DEFAULT_LOG_NAME = "MUJOCO_LOG.TXT"
 _MUJOCO_ORIGINAL_LOG_CONFIG = None
 
+
+@pytest.fixture(autouse=True)
+def _cached_gateway_session_lifetime():
+    from mujoco_gateway_fixture import gateway_session_test_scope
+
+    with gateway_session_test_scope():
+        yield
+
 OPTIONAL_MODULES = frozenset(
     {
         "test_dataset_media_integrity.py",
