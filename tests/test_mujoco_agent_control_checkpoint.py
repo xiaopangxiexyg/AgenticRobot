@@ -67,12 +67,8 @@ def test_invalid_clock_is_rejected_before_preparing_any_resource(monkeypatch, cl
         )
 
 
-@pytest.mark.integration
-@pytest.mark.slow_sim
-def test_native_no_model_target_components_share_an_exact_clock_and_history(
-    monkeypatch,
-):
-    """A caller-fenced cut; restored components are never published as a target."""
+def _native_target():
+    """Build the original fixture once per test, without starting its owners."""
     config = _configuration()
     prepared = prepare_mujoco_sim_hil_target(config)
     scene = prepared.scene
@@ -105,6 +101,17 @@ def test_native_no_model_target_components_share_an_exact_clock_and_history(
         ),
         clock=clock,
     )
+    return config, prepared, profile, clock, target
+
+
+@pytest.mark.integration
+@pytest.mark.slow_sim
+def test_native_no_model_target_components_share_an_exact_clock_and_history(
+    monkeypatch,
+):
+    """A caller-fenced cut; restored components are never published as a target."""
+    config, prepared, profile, clock, target = _native_target()
+    scene = prepared.scene
     runtime, rig = target.runtime, target.runtime.rig
     core = runtime.core
     restored_rig = None

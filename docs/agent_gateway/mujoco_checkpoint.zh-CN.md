@@ -1,9 +1,10 @@
 # MuJoCo checkpoint 组件与接入进度
 
-2026-10-25：继续原隔离分支，并合入固定 development `9dd06cbbb8be`，保留其
+2026-10-25：继续原隔离分支，并合入固定 development `40943f56abc2`，保留其
 primitive scene v2、观察和 DMTAC 对齐改进。在 native scene、acceleration planner 和 actuated
 owner 组件上新增完整 manual execution rig 的可信内部 cut；随后补齐 source admission、
-execution authority、decision owners 三个控制状态组件及原 no-model target 的时钟接缝。
+execution authority、decision owners 三个控制状态组件及原 no-model target 的时钟接缝，
+随后补齐完整 logical core 和标准 coupled IK/retargeter 的 native 数据恢复组件。
 完整 target、Gateway 会话及 RPent 联合恢复仍待装配，现有入口不自动启用恢复。
 
 ## 完整逻辑 control core 的冷恢复
@@ -51,6 +52,64 @@ dispatch、原生 target、MuJoCo 与 domain boundary 的组合回归为 **153 p
 没有以补发 grant、删历史或跳过执行回执来取得恢复通过。
 
 ## 已保存的实现
+
+### Coupled IK 与 retargeter 的冷恢复
+
+`robot_motion.rm65.ik_checkpoint` 保存标准 `MultiTaskIKSolver` 的 native 状态、
+原任务目标、barrier cache、积分步长/频率及诊断；`retargeter_checkpoint` 保存
+last-safe/raw/target、admitted velocity、jump-HOLD、奇异性/分支锁存、平滑历史、
+certificate sequence 等控制历史。两个 companion 没有创建第二执行环。
+
+恢复复用原 `DualArmCollisionAwareRetargeter` 构造器的私有入口，在首次 tracking
+reset 之前装配未发布的新 owner。调用者须提供源的**原始启动配置**，不能把 cut 时的
+measured q 替换为 initial q。普通构造、原安全/碰撞约束、QP 和墙钟预算保持不变。
+`restore_ik_solver` 是内部的未发布候选装配接口，不可用于运行中 owner 原地恢复。
+
+```python
+from robot_motion.rm65.retargeter_checkpoint import (
+    capture_retargeter, restore_retargeter,
+    encode_retargeter_checkpoint, decode_retargeter_checkpoint,
+)
+
+# The caller fences complete solving and owns the persistent publication.
+state = capture_retargeter(source, max_native_bytes=128 * 1024 * 1024)
+encoded = encode_retargeter_checkpoint(state)
+decoded = decode_retargeter_checkpoint(encoded, max_bytes=8 * 1024 * 1024)
+branch = restore_retargeter(
+    decoded, config=source.config, max_native_bytes=128 * 1024 * 1024
+)
+```
+
+编码复用已有 canonical envelope，仅承载固定 typed data、精确数字 bits/flags 和原生
+bytes。未知 mutable alias 在复制前拒绝；仅保留明确的当前 q 与 barrier q-cache alias。
+父 store 仍负责来源认证、代码/profile 身份、完整事务互斥和原子提交。最大 bytes 参数
+是载荷限制，原生 serializer 在检查返回尺寸之前可能已分配缓冲区，不是内存沙箱。
+
+首片固定 Pinocchio3.7.0/Pink4.2.0/Coal3.0.1，比较实际 SDK/ABI、原生库身份、解析后
+QP solver、native 模型和 collision-pair 顺序。只有原两个 FrameTask、一个 PostureTask、
+SelfCollisionBarrier 和默认 Pink limits 路径可用；`limits=None` 不表示无保护。
+额外 constraints/tasks、retargeter/filter、observer、smoother、未知字段与替代 owner
+明确拒绝，不在恢复时清空它们。实际开启的 query timings 也不在本片资格内。
+
+Pinocchio 官方 binary codec 保留两份互不共享的 Pin.Data，以及 solver/configuration
+共同持有的一份 GeometryData；不从当前 q 重算 FK/Jacobian/collision 来覆盖合法的旧
+算法阶段。GeometryData 在可信同模型上先构造，重绑 fresh functors 后加载原 request/
+result，包括 cached GJK/support guesses。恢复不执行碰撞查询或 QP。
+
+官方 codec 将 result/contact 的旧 geometry 指针置空，也不序列化 result timings。
+当前 Pink/原 solver 的消费依赖模型索引、distance/nearest points 和缓存，不依赖旧指针；
+这里不能推广到其他 native 消费者，也不能用 GeometryData `==` 当完整性判据。数据
+bytes 往返之外，测试另比较首个真实 native query、连续原 one-QP 和独立新解释器续跑。
+barrier 的 safe-displacement 在初始化和 QP 后可以分别是 `(dim,)` 与 `(nv,)`，原值原样保存。
+
+```bash
+bash scripts/run_pytest.sh tests/test_rm65_ik_checkpoint.py -q
+```
+
+这仍不是完整 MuJoCo target。新解释器用例验证的是同配置独立 IK owner，未将整个
+runtime/Gateway 一起恢复。未来 adaptive outer solve 会受实际墙钟影响；另外原
+`ik_frame_total_ms` 位于 resolution hash 内，因此不能把未来整条 trace hash 相同当成
+恢复正确的唯一条件。本片不删除遥测，也不修改其安全或时间预算语义。
 
 `sim/mujoco/native_checkpoint.py` 是仅支持已验证 MuJoCo 3.10.0 的原生物理组件。
 调用方必须已持有物理状态的排他边界；组件自身不暂停线程、不取得 Gateway admission
@@ -243,8 +302,8 @@ proposal/epoch/permit/schedule 状态及 qpos/qvel/ctrl/warmstart，另验证真
 ## 尚未完成，不能据此放开上层
 
 1. Gateway admission、物理线程和控制 owner 的联合静止边界。
-2. 将已完成的完整 logical core 与 rig 接到实际 target，补齐 target 的保留引用、
-   trace/observation 游标与 IK/safety 连续性；统一证明同一 cut。scheduled/pending
+2. 将已完成的完整 logical core、rig 和标准 coupled IK 接到实际 target，补齐 target
+   保留引用、trace/observation 游标及外层 safety/plan 连续性；统一证明同一 cut。scheduled/pending
    activation 等未纳入本片资格的绑定，不能直接放行。
 3. 新实例中 FK、collision、payload、observer、scratch 等消费者的统一绑定。
 4. profile 身份、持久化/原子提交、历史产物与恢复分支的来源关系。
