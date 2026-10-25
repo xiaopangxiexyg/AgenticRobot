@@ -90,6 +90,16 @@ do not establish equivalent coverage. Record this reasoning in the existing
 review, with measured runtime impact when execution cost motivates the change;
 neither net line reductions nor test-count quotas are acceptance criteria.
 
+### 只读快照重试的采样历史
+
+`test_persistent_failed_state_can_retry_without_restart` 在 `_capture_history`
+测试输入端提供可控历史，分别验证过大采样间隔和关节移动被真实 `stationarity`
+校验器拒绝，再用正常历史验证同一设备会话可以重试成功。它不替换校验器，
+不依赖共享测试进程恰好获得足够密集的线程调度，也不改变生产采样周期、时钟或门限。
+原有首次失败、第二次成功、机械臂和相机不重启断言保留；其他采集、历史选择、
+freshness 和静止性边界测试继续覆盖原路径。该用例中的可控历史是测试输入，
+不能作为真实设备采样时序的验证证据。
+
 ### Runtime artifact 重复迁移压缩
 
 `test_runtime_artifact_migration.py` 将已发布迁移的幂等检查接在已有完整成功场景后，
@@ -121,6 +131,13 @@ neither net line reductions nor test-count quotas are acceptance criteria.
 中较窄的重复用例，不改变 canonical 检查、白名单或验收 selector。
 
 ### 同输入仿真与模型构建去重
+
+MJCF 的 `MeshAssetRegistry` 在一次转换内为同一路径复用 OBJ/MTL 视觉材质解析结果，
+避免左右臂重复解析同一组网格。注册器由每次 `convert_urdf_to_mjcf_xml` 新建，
+下一次转换会重新读取 OBJ、MTL 以及此前缺失的材质输入；不会复用 MuJoCo 模型或状态。
+每次视觉调用仍构建独立属性字典、检查源网格存在，碰撞网格继续独立注册原始文件。
+既有材质分区测试同时覆盖重复视觉的颜色、位置、属性隔离和原始碰撞网格，
+新增参数用例检查跨转换输入更新，包含缺失材质库恢复。原有物理闭环与安全矩阵保持完整。
 
 `test_mujoco_trajectory_composition_publication.py` 在同一真实 MuJoCo session 中
 先验证 `residual_effective_until == target_effective_at` 的到期拒绝，再以相同
@@ -263,6 +280,15 @@ artifact migration / resolution 两个 I/O 模块按 `c3c06be6` 在 2026-09-25 �
 2026-10-18 的绿色完整基线 `298221fc`（六分片串行、Node 22）补齐了九个此前未加权、
 实际累计至少五秒的模块，包括 DMTAC 接触、Gateway 安全位姿和 worker 清理等。
 既有模块与函数权重保留，避免把单一远端的 I/O 差异当作全局变化。
+绿色完整基线 `54edca481`（Run `full-20261023-mainline12j1geom`，十二批串行）
+补齐十三个此前未加权的慢模块。2026-10-24 的绿色完整基线 `dfff99b81`
+（Run `full-20261024-visualfull2`，十二批、两并发、Node 22、Trimesh 5.1.1 /
+Embreex 4.4.0.post1）再补齐十三个累计至少五秒的新模块，包含 B601 calibration、
+coordinated holding、staged assist 与 Gateway fast grasp 等测试族，并按新源码刷新
+safe TCP pose、gripper contact、real RM65 composition 三个模块。
+该基线有 18,107 个普通用例和 24 个子测试通过、16 个跳过；单并发运行因三十分钟
+上限未完成，不作为绿色权重来源。其他历史模块与函数权重继续保留。
+这些证据绑定固定源码和环境；选择并发度后仍需验证内存余量及完整测试结果。
 这些值只用于调度，不是 timeout 或验收阈值；不改变测试内容、真实 `fsync`、
 模块隔离边界、参数矩阵或 fast Profile 的权重。
 The default remains four shards. Each shard has separate pytest, Python, XDG,
@@ -282,6 +308,13 @@ may set new absolute `DEXTELEOP_FULL_ACCEPTANCE_RUN_ROOT` and
 `DEXTELEOP_FULL_ACCEPTANCE_JUNIT` paths so the aggregate evidence remains in
 the protected Run directory. Explicit test targets are rejected because this
 entrypoint represents complete-suite acceptance.
+
+完整验收会显式加载 `scripts.pytest_native_memory`：在当前模块的测试和 teardown
+完成后，使用 Linux/glibc 的 `malloc_trim` 将已经空闲的原生堆页归还操作系统，
+为主堆保留 128 KiB。它不强制 Python GC、不清空模型缓存、不关闭仍存活的资源，
+也不改变测试、断言、并发或内存保护。其他平台或缺少该符号时保持原有内存分配行为；
+实际加载或调用异常仍会使验证失败。普通 `run_pytest.sh` 不自动加载该插件。
+此优化针对长批次中已释放却仍占 RSS 的原生内存，不替代对选定并发度的完整资源验证。
 
 在内存受限的主机上，可以把分片数量与同时运行的进程数分开配置：
 
