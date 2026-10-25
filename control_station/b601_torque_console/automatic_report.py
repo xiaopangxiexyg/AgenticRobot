@@ -190,6 +190,7 @@ def build_automatic_report(run_dir: Path) -> dict:
             report["local_even_command_identification"] = identification["local_even_command_fit"]
             report["local_command_predictability"] = identification["local_command_predictability"]
             report["empirical_command_field"] = identification["empirical_command_field"]
+            report["command_field_runtime"] = identification["command_field_runtime"]
             if "paired_resistance_fit" in identification:
                 report["paired_resistance_identification"] = identification["paired_resistance_fit"]
             report["workspace_motion"] = {"status": "CONTINUOUS_IDENTIFICATION_WINDOWS",

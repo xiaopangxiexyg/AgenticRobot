@@ -506,6 +506,27 @@ def field_observations():
     return training, validation
 
 
+def test_native_window_witness_and_runtime_summary_do_not_create_extra_fit_admission():
+    rows, context = motion_records()
+    old = summarize_workspace_identification(rows, condition=asdict(context), workspace={}, reduction_method="closed_loop_average")
+    assert not any(w["native_phase_verified"] for w in old["windows"])
+    for row in rows:
+        if row.get("kind") == "active_dispatch":
+            row["torque_console"]["coordinated_holding"] = {
+                "axes": [{"phase": "track", "reason": "bounded_reference_tracking"}]*2,
+                "command_field": {"mode": "shadow", "predicted": True, "reason": "matched", "requested_increment_nm": 0.0}}
+    result = summarize_workspace_identification(rows, condition=asdict(context), workspace={"setup_label": "test", "pose_centres_rad": [[.1, .1]]}, reduction_method="closed_loop_average")
+    assert result["admitted_motion_windows"] == old["admitted_motion_windows"]
+    assert all(w["native_phase_verified"] for w in result["windows"])
+    assert result["command_field_runtime"]["predicted_samples"] > 0
+    assert result["command_field_runtime"]["requested_increment_samples"] == 0
+    assert result["command_field_context"]["setup_label"] == "test"
+    active = next(r for r in rows if r.get("kind") == "active_dispatch")
+    active["torque_console"]["coordinated_holding"]["command_field"]["requested_increment_nm"] = .1
+    with pytest.raises(ValueError, match="shadow.*increment"):
+        summarize_workspace_identification(rows, condition=asdict(context), workspace={}, reduction_method="closed_loop_average")
+
+
 def test_command_field_predicts_pose_speed_and_direction_and_validates_components():
     training, validation = field_observations()
     field = LocalCommandField(tuple(training))

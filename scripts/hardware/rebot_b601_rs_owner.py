@@ -160,6 +160,9 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--torque-console-auto-calibration-profile", type=Path,
                         help="opt-in one-click J3 onset, low-speed and withdrawal acquisition profile")
+    parser.add_argument("--torque-console-command-field-report", type=Path,
+                        help="closed native-track command report for explicit experimental workspace field")
+    parser.add_argument("--torque-console-command-field-mode", choices=("off", "shadow", "candidate"), default="off")
     parser.add_argument("--torque-console-staged-target-offset-limit-rad", type=float, default=0.065)
     parser.add_argument(
         "--torque-console-staged-authority-rise-per-sec",
@@ -508,6 +511,10 @@ def build_probe_command(
     *,
     run_dir: Path,
 ) -> list[str]:
+    field_report = getattr(args, "torque_console_command_field_report", None)
+    field_mode = getattr(args, "torque_console_command_field_mode", "off")
+    if (field_report is not None or field_mode != "off") and args.torque_console_auto_calibration_profile is None:
+        raise ValueError("command field requires the explicit automatic workspace profile")
     if args.torque_console_auto_calibration_profile is not None:
         args.torque_console = args.torque_console_staged_assist = True
         if args.torque_console_staged_motion_confirm_rad is None:
@@ -611,6 +618,10 @@ def build_probe_command(
     if args.torque_console:
         if args.torque_console_auto_calibration_profile is not None:
             command.extend(("--torque-console-auto-calibration-profile", str(args.torque_console_auto_calibration_profile.resolve())))
+        if field_report is not None:
+            command.extend(("--torque-console-command-field-report", str(field_report.resolve())))
+        if field_report is not None or field_mode != "off":
+            command.extend(("--torque-console-command-field-mode", field_mode))
         command.extend(
             (
                 "--torque-console",

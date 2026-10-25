@@ -3676,6 +3676,10 @@ def resolve_active_joint_names() -> tuple[str, ...]:
 
 
 def _validate_cli(args: argparse.Namespace) -> None:
+    if (getattr(args, "torque_console_command_field_mode", "off") != "off"
+        or getattr(args, "torque_console_command_field_report", None) is not None
+    ) and getattr(args, "torque_console_auto_calibration_profile", None) is None:
+        raise LowGainProbeError("command field requires the explicit automatic workspace profile")
     _validate_single_joint_assist_cli(args)
     _validate_cartesian_assist_cli(args)
     _validate_torque_console_cli(args)
@@ -5833,6 +5837,19 @@ def _automatic_calibration_controller_from_args(args: argparse.Namespace):
     workspace = values.pop("workspace", None)
     controller = B601AutomaticCalibrationController(_staged_torque_console_settings_from_args(args), AutomaticCalibrationConfig(**values))
     workspace_controller = None
+    field_mode = getattr(args, "torque_console_command_field_mode", "off")
+    field_report = getattr(args, "torque_console_command_field_report", None)
+    if (field_mode == "off") != (field_report is None):
+        raise ValueError("command field requires both an explicit mode and a source report")
+    command_field_source = None
+    if field_report is not None:
+        from robot_motion.rebot_b601_rs.command_field_source import CommandFieldSource
+
+        if not isinstance(workspace, dict) or not isinstance(workspace.get("coordinated_holding"), dict):
+            raise ValueError("command field requires coordinated workspace acquisition")
+        workspace["coordinated_holding"]["command_field_mode"] = field_mode
+        command_field_source = CommandFieldSource.load(field_report,
+            total_assist_cap_nm=workspace["coordinated_holding"]["total_assist_cap_nm"])
     if workspace is not None:
         if cycle is None or not isinstance(workspace, dict):
             raise ValueError("workspace mode requires explicit cycle and workspace settings")
@@ -5841,7 +5858,8 @@ def _automatic_calibration_controller_from_args(args: argparse.Namespace):
             WorkspaceCalibrationConfig,
         )
         workspace_controller = B601WorkspaceCalibrationController(
-            controller.settings, controller.config, WorkspaceCalibrationConfig(**workspace))
+            controller.settings, controller.config, WorkspaceCalibrationConfig(**workspace),
+            command_field_source=command_field_source)
     if cycle is not None:
         from control_station.b601_torque_console.calibration_cycle import (
             B601AutomaticCalibrationCycleController,
@@ -12818,6 +12836,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--torque-console-auto-calibration-profile", type=Path,
                         help="opt-in one-click J3 onset, low-speed and withdrawal acquisition profile")
+    parser.add_argument("--torque-console-command-field-report", type=Path,
+                        help="closed native-track command report for explicit experimental workspace field")
+    parser.add_argument("--torque-console-command-field-mode", choices=("off", "shadow", "candidate"), default="off",
+                        help="default off; shadow observes only, candidate changes bounded total support increments")
     parser.add_argument(
         "--torque-console-staged-target-offset-limit-rad",
         type=float,
@@ -13419,6 +13441,17 @@ def _preflight_probe(args: argparse.Namespace) -> dict[str, object]:
         settings = automatic.settings
         if hasattr(automatic, "validate_position_limits"):
             automatic.validate_position_limits(limits)
+        if getattr(args, "torque_console_command_field_report", None) is not None:
+            from robot_motion.rebot_b601_rs.calibration import CalibrationCondition
+
+            automatic.configure_context(CalibrationCondition(
+                run_id="offline-preflight", config_sha256=hashlib.sha256(Path(args.config).read_bytes()).hexdigest(),
+                urdf_sha256=hashlib.sha256(model.urdf_path.read_bytes()).hexdigest(),
+                gravity_scale=args.gravity_scale, gravity_joint_scales=args.gravity_joint_scales,
+                gravity_joint_offsets_rad=args.gravity_joint_offsets_rad, gravity_joint_bias_nm=args.gravity_joint_bias_nm,
+                gravity_coulomb_friction_nm=args.gravity_coulomb_friction_nm,
+                gravity_coulomb_velocity_threshold_rad_s=args.gravity_coulomb_velocity_threshold_rad_s,
+                driver_kd_nm_s_per_rad=(_DEFAULT_DRIVER_KD if args.driver_kd is None else base_driver_kd)), limits)
     elif args.torque_console_staged_assist:
         settings = _staged_torque_console_settings_from_args(args)
     if args.torque_console and any(args.torque_console_max_assist_nm > cap for cap in torque_limits):
@@ -13441,6 +13474,7 @@ def _preflight_probe(args: argparse.Namespace) -> dict[str, object]:
             asdict(automatic.cycle) if automatic is not None and hasattr(automatic,"cycle") else None
         ),
         "automatic_mode_selection": None if automatic is None else automatic.status().get("mode_selection"),
+        "command_field_source": getattr(automatic, "command_field_source_metadata", None),
         "automatic_workspace_settings": (
             None if getattr(automatic, "workspace_configuration", None) is None
             else asdict(automatic.workspace_configuration)

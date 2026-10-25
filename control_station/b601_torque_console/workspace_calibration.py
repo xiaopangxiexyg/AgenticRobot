@@ -206,7 +206,7 @@ class B601WorkspaceCalibrationController:
 
     controller_mode = "automatic_calibration"
 
-    def __init__(self, settings, config, workspace: WorkspaceCalibrationConfig):
+    def __init__(self, settings, config, workspace: WorkspaceCalibrationConfig, *, command_field_source=None):
         overrides = {name: getattr(workspace, name) for name in COORDINATED_CALIBRATION_OVERRIDES
                      if getattr(workspace, name) is not None}
         if overrides:
@@ -274,11 +274,19 @@ class B601WorkspaceCalibrationController:
         self._coordinated = None
         if workspace.coordinated_holding is not None:
             from .coordinated_workspace import CoordinatedWorkspaceController
-            self._coordinated = CoordinatedWorkspaceController(self.settings, config, workspace)
+            self._coordinated = CoordinatedWorkspaceController(self.settings, config, workspace,
+                command_field_source=command_field_source)
+        elif command_field_source is not None:
+            raise ValueError("command field requires coordinated workspace acquisition")
 
     @property
     def _active(self):
         return self._phase not in {"idle", "complete", "failed", "cancelled"}
+
+    @property
+    def command_field_source_metadata(self):
+        source = None if self._coordinated is None else self._coordinated.pose.command_field_source
+        return None if source is None else source.metadata()
 
     def _make_controller(self, joint, *, positioning):
         gains = getattr(self.workspace, f"{joint}_drive_kd")

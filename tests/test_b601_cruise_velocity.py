@@ -31,7 +31,7 @@ FOUR_CENTRES = PROFILES/"b601_j2_j3_four_centres_cruise_identification_v1.json"
 RESOLUTION = .0003834962844848633
 
 
-def controller_from_profile(tmp_path, *, candidate=True, profile=None):
+def controller_from_profile(tmp_path, *, candidate=True, profile=None, extra=()):
     args = owner._parser().parse_args([
         "--allow-motion", "--rate-hz", "100", "--preflight-only",
         "--torque-console-auto-calibration-profile", str(profile or (CANDIDATE if candidate else BASE)),
@@ -40,7 +40,7 @@ def controller_from_profile(tmp_path, *, candidate=True, profile=None):
         "--torque-console-max-excursion-rad", ".15", "--torque-console-staged-target-offset-limit-rad", ".09",
         "--torque-console-staged-breakaway-torque-nm", "1", "--torque-console-staged-breakaway-rise-slew-nm-s", "1",
         "--torque-console-staged-breakaway-duration-sec", "3", "--torque-console-staged-breakaway-impulse-nm-sec", "1.5",
-        "--torque-console-staged-tracking-overlay-cap-nm", "1"])
+        "--torque-console-staged-tracking-overlay-cap-nm", "1", *extra])
     parsed = probe.build_parser().parse_args(owner.build_probe_command(args, run_dir=tmp_path)[2:])
     probe._validate_cli(parsed)
     return probe._automatic_calibration_controller_from_args(parsed)
@@ -312,7 +312,7 @@ def test_complete_identification_wires_cruise_only_to_training_validation_axis(t
 
 
 def simulate_motion(tmp_path, *, candidate, speed, direction, inertia=.2, period=.01, arrival=False,
-                    static_scale=1., load_offset=0.):
+                    static_scale=1., load_offset=0., field_mode="off", field_source=None):
     """Declared stick/slip plant, not identified B601 mechanics.
 
     Known motor damping is instantaneous in this toy. Gravity residual and
@@ -320,6 +320,13 @@ def simulate_motion(tmp_path, *, candidate, speed, direction, inertia=.2, period
     same initial conditions and drive limits are used for both controllers.
     """
     core = controller_from_profile(tmp_path, candidate=candidate)._workspace._coordinated.pose
+    if field_source is not None:
+        from robot_motion.rebot_b601_rs.coordinated_holding import (
+            CoordinatedPoseHolding,
+        )
+
+        core = CoordinatedPoseHolding(core.settings, replace(core.config, command_field_mode=field_mode),
+            arrival_tolerance_rad=core.arrival_tolerance_rad, command_field_source=field_source)
     if arrival:
         core.config = replace(core.config, cruise_arrival_feedback=True)
     centre = math.radians(5)
@@ -337,7 +344,7 @@ def simulate_motion(tmp_path, *, candidate, speed, direction, inertia=.2, period
     velocity = [0.0]*6
     command = ZERO
     now = core.last_time
-    samples, active, peak_speed = [], 0, 0.0
+    samples, active, peak_speed, field_predictions, field_increments = [], 0, 0.0, 0, 0
     outcome = "timeout"
     for n in range(1, int(40/period)+1):
         for _ in range(round(period/.001)):
@@ -364,7 +371,9 @@ def simulate_motion(tmp_path, *, candidate, speed, direction, inertia=.2, period
         dt = core.observe(now, measured, raw)
         try:
             command, audit = core.step(sequence=30+n, dt=dt, permitted=True, point_search=False,
-                                      cruise_joint=2 if candidate else None)
+                                      cruise_joint=2 if candidate else None,
+                                      field_pose_index=0 if field_source is not None else None,
+                                      field_driver_kd=(.4, 4.5, 4.5, 1.2, .2, .1) if field_source is not None else None)
         except ValueError as error:
             outcome = str(error)
             break
@@ -375,6 +384,8 @@ def simulate_motion(tmp_path, *, candidate, speed, direction, inertia=.2, period
         if .2 <= progress <= .8:
             samples.append(velocity[2]-direction*speed)
         active += audit["cruise_velocity_control"]["active"]
+        field_predictions += (audit.get("command_field") or {}).get("predicted", False)
+        field_increments += abs((audit.get("command_field") or {}).get("requested_increment_nm", 0)) > 1e-12
         if abs(q[2]-goal[2]) <= .003375 and core.quiet():
             outcome = "arrived"
             break
@@ -382,7 +393,8 @@ def simulate_motion(tmp_path, *, candidate, speed, direction, inertia=.2, period
         "rms_speed_error_rad_s": math.sqrt(sum(v*v for v in samples)/len(samples)) if samples else None,
         "peak_speed_rad_s": peak_speed, "duration_sec": now-1.29,
         "final_error_rad": q[2]-goal[2], "inertia": inertia, "period_sec": period,
-        "reference_speed_rad_s": speed, "direction": direction}
+        "reference_speed_rad_s": speed, "direction": direction,
+        "field_predicted_cycles": field_predictions, "field_increment_cycles": field_increments}
 
 
 @pytest.mark.parametrize("speed,direction,inertia,period", [

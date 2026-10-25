@@ -36,7 +36,7 @@ class CoordinatedWorkspaceController:
 
     controller_mode = "automatic_calibration"
 
-    def __init__(self, settings, config, workspace):
+    def __init__(self, settings, config, workspace, *, command_field_source=None):
         if workspace.holding_search is None:
             raise ValueError("coordinated acquisition requires explicit holding search")
         if config.max_sweep_leg_command_exposure_nm_sec is None:
@@ -45,7 +45,9 @@ class CoordinatedWorkspaceController:
         self.config, self.workspace = config, workspace
         self.pose = CoordinatedPoseHolding(settings, workspace.coordinated_holding,
             arrival_tolerance_rad=(workspace.holding_search.movement_rad / 2
-                if workspace.holding_arrival_tolerance_rad is None else workspace.holding_arrival_tolerance_rad))
+                if workspace.holding_arrival_tolerance_rad is None else workspace.holding_arrival_tolerance_rad),
+            command_field_source=command_field_source)
+        self._field_pose_indices = None
         self._condition = self._position_limits = None
         self._ready = self._closed = self._start = False
         self._human = self._permit = self._origin = self._started = None
@@ -101,7 +103,12 @@ class CoordinatedWorkspaceController:
                 if not limits[i][0] <= lo < hi <= limits[i][1]:
                     raise ValueError("coordinated range exceeds owner limits")
                 limits[i] = (lo, hi)
+            field_pose_indices = None
+            if self.pose.command_field_source is not None:
+                field_pose_indices = self.pose.command_field_source.validate_context(condition,
+                    setup_label=self.workspace.setup_label, pose_centres_rad=self.workspace.pose_centres())
             self._condition, self._position_limits = condition, tuple(limits)
+            self._field_pose_indices = field_pose_indices
 
     def owner_ready(self):
         self._ready = True
@@ -422,7 +429,11 @@ class CoordinatedWorkspaceController:
                         and self._phase == "sweep" and self._sample_pose is not None and self._probe is None),
                     cruise_joint=(int(joint[-1])-1 if self._continuous_identification and self._phase == "sweep"
                         and self._leg_index < len(self._steps)
-                        and self._steps[self._leg_index]["role"] in {"training", "validation"} else None))
+                        and self._steps[self._leg_index]["role"] in {"training", "validation"} else None),
+                    field_pose_index=(self._field_pose_indices[self._tasks[self._index]["pose"]]
+                        if self._field_pose_indices is not None and self._index < len(self._tasks)
+                        and self._phase == "sweep" else None),
+                    field_driver_kd=self._last_kd)
             except ValueError as exc:
                 self.recording_failed(str(exc))
                 return ZERO, self._make_audit(ZERO, {}, fault=self._reason)
@@ -874,9 +885,13 @@ class CoordinatedWorkspaceController:
             "dispatch_withdrawal": copy.deepcopy(self._dispatch_withdrawal),
             "holding_search_enabled": not self._continuous_identification, "holding_calibration": self._holding_status(detailed),
             "continuous_identification": {"enabled": self._continuous_identification,
+                "command_field_mode": self.workspace.coordinated_holding.command_field_mode,
                 "leg_index": self._leg_index, "leg_count": len(self._steps),
                 "speeds_rad_s": self.config.sweep_speeds_rad_s,
                 "fits_after_cleanup_only": True, "auto_apply": False},
+            **({"command_field_source": self.pose.command_field_source.metadata(),
+                "command_field_mode": self.workspace.coordinated_holding.command_field_mode}
+               if self.pose.command_field_source is not None and detailed else {}),
             "arrival": self._arrival_status(),
             "static_observation": self._static_observation_status(),
             "maximum_start_angle_deg": self.workspace.maximum_start_angle_deg,

@@ -763,7 +763,11 @@ batch.workspace.supported_return.acquisition_stop={state:'cancelled',reason:'ope
 batch.cycle.disable_confirmation_available=true;batch.cycle.zero_assist_base_damping_confirmed=true;
 render();const returned=el('phase').textContent;const returnInstructions=el('drive-instructions').textContent;
 batch.state='idle';batch.workspace.phase='idle';batch.human_intervention=true;
-console.log(JSON.stringify({idle,returnIdle,returnFixed,active,complete,blockedReturn,blockedInstructions,warning,fault,warningInstructions,faultInstructions,returned,returnInstructions,arrivalWaiting,arrivalReady,staticWindow,contextChanged,recheck,rejected,rechecked,human:render(),stopLabel:el('full-disable').textContent}));
+batch.workspace.continuous_identification={enabled:true,speeds_rad_s:[.0075,.015],command_field_mode:'shadow'};
+render();const fieldShadow=el('automatic-mode-note').textContent;
+batch.workspace.continuous_identification.command_field_mode='candidate';render();
+const fieldCandidate=el('automatic-mode-note').textContent;
+console.log(JSON.stringify({idle,returnIdle,returnFixed,active,complete,blockedReturn,blockedInstructions,warning,fault,warningInstructions,faultInstructions,returned,returnInstructions,arrivalWaiting,arrivalReady,staticWindow,contextChanged,recheck,rejected,rechecked,fieldShadow,fieldCandidate,human:render(),stopLabel:el('full-disable').textContent}));
 """
     result = subprocess.run([node, "-e", script, json.dumps(functions)],
         check=True, capture_output=True, text=True)
@@ -782,6 +786,8 @@ console.log(JSON.stringify({idle,returnIdle,returnFixed,active,complete,blockedR
     assert "当前保持重力补偿／阻尼" in states["blockedInstructions"]
     assert "确认已支撑并全失能" in states["blockedReturn"]
     assert states["human"]["arm"] is True
+    assert "只记录预测，不参与驱动力输出" in states["fieldShadow"]
+    assert "实验前馈已显式启用" in states["fieldCandidate"]
     assert "告警，数据保留" in states["warning"]
     assert "采集故障" in states["fault"]
     assert "当前仅重力补偿" in states["warningInstructions"]

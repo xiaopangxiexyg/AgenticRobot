@@ -332,6 +332,11 @@ function renderWorkspace(batch) {
     const motion = workspace.continuous_identification;
     el("automatic-mode-title").textContent = "J2/J3 双向多速度连续辨识";
     el("automatic-mode-note").textContent += ` 连续往返不在端点搜索最小维持力；参考速度 ${motion.speeds_rad_s.map(v => number(v, 4)).join(" / ")} rad/s。训练与验证整段预先分开，拟合在失能清理后离线运行，不自动安装补偿。`;
+    if (motion.command_field_mode === "shadow") {
+      el("automatic-mode-note").textContent += " 局部命令模型为影子模式：只记录预测，不参与驱动力输出。";
+    } else if (motion.command_field_mode === "candidate") {
+      el("automatic-mode-note").textContent += " 实验前馈已显式启用：在原总助力包络内参与运动控制，不用于静止保持和起动。";
+    }
   }
   el("arm").textContent = "开始 J2/J3 多位姿自动采集";
   el("withdraw").textContent = "停止采集并撤力（不自动返回）";

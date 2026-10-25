@@ -181,6 +181,8 @@ def summarize_workspace_identification(records, *, condition, workspace,
     previous_source_sequence = previous_receipt_sequence = None
     previous_receive_time = None
     identity = None
+    field_runtime = {"dispatch_samples": 0, "predicted_samples": 0, "requested_increment_samples": 0,
+        "modes": Counter(), "reasons": Counter(), "max_abs_requested_increment_nm": 0.0}
     settings = {"minimum_window_sec": .6, "maximum_window_sec": 2.0,
         "maximum_feedback_gap_sec": .04, "minimum_motion_rad": .002,
         "maximum_line_error_rad": .0008, "maximum_residual_span_nm": .15,
@@ -228,6 +230,7 @@ def summarize_workspace_identification(records, *, condition, workspace,
             "source_leg_completed": first["trial"] in completed,
             "input_receipt_sequence_start": first["input_sequence"],
             "input_receipt_sequence_end": last["input_sequence"],
+            "native_phase_verified": all(r["native_phase_verified"] for r in buffer),
             "model_eligible": reason is None, "exclusion_reason": reason}
         if position_bin_width_rad is not None:
             cell = first["position_cell"]
@@ -313,6 +316,21 @@ def summarize_workspace_identification(records, *, condition, workspace,
             identity = None
             previous_receive_time = None
             continue
+        field = ((row.get("torque_console") or {}).get("coordinated_holding") or {}).get("command_field")
+        if field is not None:
+            if not isinstance(field, dict) or field.get("mode") not in {"shadow", "candidate"} or type(field.get("predicted")) is not bool:
+                raise ValueError("invalid runtime command field evidence")
+            increment = field.get("requested_increment_nm")
+            if isinstance(increment, bool) or not isinstance(increment, (int, float)) or not math.isfinite(increment):
+                raise ValueError("invalid runtime command field increment")
+            if field["mode"] == "shadow" and abs(increment) > 1e-12:
+                raise ValueError("shadow command field cannot request a drive increment")
+            field_runtime["dispatch_samples"] += 1
+            field_runtime["predicted_samples"] += field["predicted"]
+            field_runtime["requested_increment_samples"] += abs(increment) > 1e-12
+            field_runtime["modes"][field["mode"]] += 1
+            field_runtime["reasons"][field.get("reason", "not_recorded")] += 1
+            field_runtime["max_abs_requested_increment_nm"] = max(field_runtime["max_abs_requested_increment_nm"], abs(increment))
         key, reason = admission(row)
         if reason:
             rejected[reason] += 1
@@ -397,6 +415,7 @@ def summarize_workspace_identification(records, *, condition, workspace,
                     "kd": prior["vendor_kd_nm_s_per_rad"], "input_sequence": prior["dispatch_receipt"]["sequence"],
                     "pose": key[0], "joint": key[1], "trial": key[2], "role": key[3],
                     "speed": marker.get("reference_speed_rad_s"),
+                    "native_phase_verified": isinstance(holding.get("axes"), list),
                     "position_cell": cell, "position_entry": bool(entry_direction),
                     "position_entry_direction": entry_direction,
                     "command_integral": integral[0], "gravity_integral": integral[1]})
@@ -456,6 +475,8 @@ def summarize_workspace_identification(records, *, condition, workspace,
         "retained_partial_leg_windows": sum(w["model_eligible"] and not w["source_leg_completed"] for w in windows),
         "fits": fits, "auto_apply": False}
     result = {"schema": "b601.workspace-command-identification.v1", "auto_apply": False,
+        "command_field_context": {"setup_label": workspace.get("setup_label"),
+            "pose_centres_rad": workspace.get("pose_centres_rad")},
         "reduction_method": reduction_method,
         "quantity": "software_command_not_measured_output_torque",
         "condition": asdict(condition), "settings": settings, "windows": windows,
@@ -479,6 +500,10 @@ def summarize_workspace_identification(records, *, condition, workspace,
         "empirical_command_field": {"status": "OFFLINE_ONLY", "auto_apply": False,
             "live_compensation_enabled": False, "regions": fields,
             "scope": "separate_local_full_pose_and_fixed_damping_regions; no_static_or_breakaway_model"},
+        "command_field_runtime": {**field_runtime, "modes": dict(field_runtime["modes"]), "reasons": dict(field_runtime["reasons"]),
+            "scope": "recorded_active_dispatches_not_only_admitted_fit_windows",
+            "query_velocity": "causal_committed_reference_window_not_measured_overspeed",
+            "increments_are_requested_not_isolated_executed_force": True},
         "cruise_execution_diagnostic": {"quantity": "software_commands_not_measured_force",
             "scope": "admitted_complete_training_validation_dispatches_not_just_fit_windows",
             "unavailable_samples": unavailable_execution_samples,

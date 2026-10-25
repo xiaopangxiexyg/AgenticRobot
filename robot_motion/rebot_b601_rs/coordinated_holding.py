@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, replace
 
 from .calibration import finite, six
+from .command_field_source import CommandFieldSource
 from .joint_motion import (
     B601JointMotionTracker,
     B601WindowStopEvidence,
@@ -31,9 +32,14 @@ class CoordinatedHoldingConfig:
     cruise_velocity_ki_nm_per_rad: float = 0.0
     cruise_velocity_window_sec: float = .2
     cruise_arrival_feedback: bool = False
+    command_field_mode: str = "off"
 
     def __post_init__(self):
         for name, value in vars(self).items():
+            if name == "command_field_mode":
+                if not isinstance(value, str) or value not in {"off", "shadow", "candidate"}:
+                    raise ValueError("command field mode must be off, shadow or candidate")
+                continue
             if name in {"supported_soft_recovery", "cruise_arrival_feedback"}:
                 if type(value) is not bool:
                     raise TypeError("supported soft recovery must be boolean")
@@ -50,6 +56,8 @@ class CoordinatedHoldingConfig:
             raise ValueError("cruise velocity feedback requires the explicit motor-local recovery profile")
         if self.cruise_arrival_feedback and not self.cruise_enabled:
             raise ValueError("arrival velocity feedback requires explicit cruise feedback")
+        if self.command_field_mode != "off" and not self.cruise_enabled:
+            raise ValueError("command field requires explicit cruise feedback")
 
     @property
     def motor_local_recovery(self):
@@ -68,7 +76,7 @@ class CoordinatedPoseHolding:
     The other axis keeps its pose feedback and last learned bias.
     """
 
-    def __init__(self, settings, config: CoordinatedHoldingConfig, *, arrival_tolerance_rad=None):
+    def __init__(self, settings, config: CoordinatedHoldingConfig, *, arrival_tolerance_rad=None, command_field_source=None):
         self.settings, self.config = settings, config
         self.motion = settings.staged_assist.motion_control
         if (self.motion is None or not self.motion.responsive_tracking_brake
@@ -106,6 +114,15 @@ class CoordinatedPoseHolding:
         self._brake_seed = None
         self._support_anchor = None
         self._support_receipt = False
+        if (config.command_field_mode == "off") != (command_field_source is None):
+            raise ValueError("command field mode and frozen source must be configured together")
+        if command_field_source is not None and not isinstance(command_field_source, CommandFieldSource):
+            raise TypeError("command field requires the validated source loader")
+        if command_field_source is not None and command_field_source.total_assist_cap_nm > config.total_assist_cap_nm:
+            raise ValueError("command field source must fit the existing combined assist envelope")
+        self.command_field_source = command_field_source
+        self.field_component = ZERO
+        self._field_joint = None
 
     def observe(self, now, q, raw, *, idle=False):
         q, raw = six(q, "coordinated position"), six(raw, "coordinated velocity")
@@ -168,6 +185,9 @@ class CoordinatedPoseHolding:
         # A new leg must resolve motion after this handoff. Do not reuse the
         # preceding leg's direction or deceleration tail for cruise control.
         self._reset_cruise_observers()
+        # Retained total support is unchanged; only its model allocation ends.
+        self.field_component = ZERO
+        self._field_joint = None
         # A consumed command at departure is a handoff prior, not an estimate
         # of the holding force at the destination or a gravity correction.
         self._departure_bias = self.bias
@@ -346,7 +366,7 @@ class CoordinatedPoseHolding:
         return proportional, bias, audit
 
     def step(self, *, sequence, dt, permitted, probe_joint=None, probe_nm=None, point_search=True, point_reacquire=False,
-             cruise_joint=None):
+             cruise_joint=None, field_pose_index=None, field_driver_kd=None):
         if type(sequence) is not int or sequence < 0 or type(permitted) is not bool or not 0 < finite(dt, "control interval") <= self.motion.max_control_gap_sec:
             raise ValueError("coordinated step requires valid sequence, permit and control interval")
         if self.pending is not None:
@@ -377,6 +397,11 @@ class CoordinatedPoseHolding:
         cruise_audit = {"enabled": self.config.cruise_enabled, "active": False,
             "joint_name": None if cruise_joint is None else f"joint{cruise_joint+1}",
             "reason": "outside_identification_sweep"}
+        field_proposal = [0.0]*6
+        field_joint = None
+        field_audit = {"mode": self.config.command_field_mode, "predicted": False,
+            "reason": "outside_resolved_native_cruise", "prediction_nm": None,
+            "requested_increment_nm": 0.0, "previous_component_nm": self.field_component}
         frames = []
         fixed_probes = set()
         if permitted:
@@ -443,6 +468,39 @@ class CoordinatedPoseHolding:
                         approach_reasons[i] = "arrival_observer_warming_retains_support"
                 demand[i] = frame.requested_torque_nm + cruise_p[i] + (0.0 if is_probe else proposed_bias[i])
         self.braking = any(f.phase == "brake" and f.reason != "target_reached_braking" for f in frames)
+        if (self.command_field_source is not None and permitted and not self.braking
+            and cruise_joint is not None and field_pose_index is not None and field_driver_kd is not None):
+            i = cruise_joint
+            frame = frames[AXES.index(i)]
+            if cruise_audit["active"] and frame.phase == "track" and frame.reason == "bounded_reference_tracking":
+                # Predict the command needed at the causal reference-window
+                # speed. Chasing measured overspeed with the model would add
+                # positive velocity feedback; the existing PI owns that error.
+                reference_velocity = cruise_audit["aligned_reference_velocity_rad_s"]
+                field_audit["query_reference_velocity_rad_s"] = reference_velocity
+                field_audit["observed_velocity_rad_s"] = self.cruise_velocity[i]
+                prediction = self.command_field_source.predict(pose_index=field_pose_index,
+                    joint_name=f"joint{i+1}", qpos_rad=self.q, velocity_rad_s=reference_velocity,
+                    active_driver_kd_nm_s_per_rad=field_driver_kd) if reference_velocity*self.cruise_velocity[i] > 0 else {
+                        "predicted": False, "reason": "reference_window_direction_unresolved"}
+                field_audit.update(predicted=prediction["predicted"], reason=prediction["reason"])
+                if prediction["predicted"]:
+                    target = prediction["predicted_command_residual_nm"]
+                    field_audit["prediction_nm"] = target
+                    if self.config.command_field_mode == "candidate":
+                        # First engagement transfers the existing support into
+                        # model + residual without adding the model twice.
+                        previous = self.field_component[i]
+                        value = target if self._field_joint != i else max(previous-self.config.rise_slew_nm_s*dt,
+                            min(previous+self.config.rise_slew_nm_s*dt, target))
+                        increment = value-previous if self._field_joint == i else 0.0
+                        field_proposal[i] = value
+                        field_joint = i
+                        updated = max(-self.config.bias_cap_nm,
+                            min(self.config.bias_cap_nm, proposed_bias[i]+increment))
+                        field_audit["requested_increment_nm"] = updated-proposed_bias[i]
+                        demand[i] += updated-proposed_bias[i]
+                        proposed_bias[i] = updated
         if self.braking:
             cruise_p = [0.0]*6
             cruise_audit.update(active=False, reason="native_braking_owns_command",
@@ -616,6 +674,8 @@ class CoordinatedPoseHolding:
             self._support_anchor = None
             self._support_receipt = False
             self._departure_bias = ZERO
+            self.field_component = ZERO
+            self._field_joint = None
             brake_seed = None
             support_anchor = None
             moving, anchors = [False] * 6, list(self.q)
@@ -627,7 +687,7 @@ class CoordinatedPoseHolding:
                 or self.config.cruise_arrival_feedback and frame.reason in {"target_reached_braking", "calibration_target_tracking"}):
                 cruise_sample = (cruise_joint, self.last_time, self.q[cruise_joint], frame.q_reference_rad)
         self.pending = (sequence, tuple(command), tuple(proposed_bias), tuple(anchors), tuple(moving), brake_seed,
-                        support_anchor, supported_braking, cruise_sample)
+                        support_anchor, supported_braking, cruise_sample, tuple(field_proposal), field_joint)
         return tuple(command), {"target_qpos_rad": self.goal, "bias_nm": self.bias,
             "max_reference_velocity_rad_s": self.trackers[0].config.max_reference_velocity_rad_s,
             "support_soft_speed_recovery": self.trackers[0].config.support_soft_speed_recovery,
@@ -650,6 +710,9 @@ class CoordinatedPoseHolding:
             "composed_speed_scales": composed_speed_scales,
             "torque_transition_reasons": transition_reasons, "torque_transition_rates_nm_s": transition_rates,
             "axes": [asdict(f) for f in frames], "auto_apply": False,
+            **({"command_field": {**field_audit, "proposed_component_nm": tuple(field_proposal),
+                "proposed_feedback_bias_nm": tuple(b-f for b, f in zip(proposed_bias, field_proposal))}}
+               if self.config.command_field_mode != "off" else {}),
             "quantity": "software_command_not_measured_force"}
 
     def _unwind_only(self, i, proposed):
@@ -669,10 +732,14 @@ class CoordinatedPoseHolding:
         matching = max(abs(a-b) for a, b in zip(actual, self.pending[1])) <= 1e-9
         if matching:
             self.bias = self.pending[2]
+            self.field_component = self.pending[9]
+            self._field_joint = self.pending[10]
             self._approach_anchor, self._approach_moving, self._brake_seed = self.pending[3:6]
             self._support_anchor, self._support_receipt = self.pending[6:8]
         else:
             self._support_receipt = False
+            self.field_component = ZERO
+            self._field_joint = None
         for tracker in self.trackers:
             tracker.record_dispatch(sequence)
         if self.config.cruise_enabled:
