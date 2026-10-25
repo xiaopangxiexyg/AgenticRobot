@@ -199,7 +199,7 @@ def _assert_unsettled_passive_read_defers_owned_dependency_cleanup(state_reader)
         depth_executor=None,
         rgb_executor=None,
         history_executor=None,
-        spatial_goal_executor=None,
+        spatial_goal_executor=None, rgbd_capture_executor=None,
         segmentation_executor=None,
         placement_executor=placement_executor,
         grasp_observation_executor=None,
@@ -2831,7 +2831,7 @@ def test_session_model_start_rejects_directly_closed_service() -> None:
     assert calls["service"] == []
 
 
-@pytest.mark.parametrize("state_reader", ["state_executor", "tcp_pose_comparison_executor"])
+@pytest.mark.parametrize("state_reader", ["state_executor", "tcp_pose_comparison_executor", "rgbd_capture_executor"])
 def test_session_confirmed_close_retries_passive_drain_without_new_hold(state_reader) -> None:
     _, accepted = _gateway_close_outcomes()
     session, calls = _gateway_close_retry_session([accepted])

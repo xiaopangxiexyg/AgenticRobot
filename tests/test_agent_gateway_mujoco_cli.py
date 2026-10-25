@@ -27,6 +27,8 @@ def test_motion_side_is_explicit_fixed_and_defaults_to_right():
     assert parser.parse_args(required).motion_side == "right"
     assert parser.parse_args([*required, "--motion-side", "left"]).motion_side == "left"
     assert not parser.parse_args(required).enable_object_follow_observation
+    assert not parser.parse_args(required).enable_rgbd_capture_v3
+    assert parser.parse_args([*required, "--enable-rgbd-capture-v3"]).enable_rgbd_capture_v3
     assert parser.parse_args([*required, "--enable-object-follow-observation"]).enable_object_follow_observation
     with pytest.raises(SystemExit) as captured:
         parser.parse_args([*required, "--motion-side", "both"])
@@ -38,6 +40,7 @@ def test_motion_side_is_explicit_fixed_and_defaults_to_right():
     ["--enable-fast-grasp"],
     ["--enable-grasp-approach"],
     ["--enable-spatial-goals"],
+    ["--enable-rgbd-capture-v3"],
     ["--history-root", "/unused/history"],
     ["--segmentation-asset-bundle", "/unused/segmentation"],
     ["--grasp-contact-target-body", "cube"],

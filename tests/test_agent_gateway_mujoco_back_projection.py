@@ -59,6 +59,88 @@ def test_raw_and_encoded_depth_cuts_share_content_and_capture_identity():
 @pytest.mark.integration
 @pytest.mark.optional
 @pytest.mark.slow_sim
+@pytest.mark.parametrize("include_depth", [False, True], ids=["rgb", "paired"])
+def test_native_rgb_v3_uses_registered_passive_owner_and_original_media(tmp_path, monkeypatch, include_depth):
+    from agent_gateway.profiles.mujoco.motion_deployment import build_mujoco_agent_tcp_pose_contract_bundle
+
+    pytest.importorskip("mujoco")
+    artifact_root = tmp_path / "artifacts"
+    artifact_root.mkdir()
+    client = "test:native-rgbd-v3"
+    session = build_mujoco_agent_tcp_pose_gateway_session(
+        target_config=MujocoSimHILTargetConfig(
+            task_config_path=_REPOSITORY_ROOT / "sim/configs/tasks/rm65_right_dmtacm_blue_cube_70mm_agent_v1.json",
+            realtime_worker=False, runtime_session_id=client,
+            execution_observation_plan=mujoco_agent_tcp_pose_execution_observation_plan_v1(),
+            exposed_pose_sides=("right",), allow_scripted_task_reset=False),
+        allowed_client_ids=(client,), artifact_storage=MujocoAgentArtifactStorageConfig(root=artifact_root),
+        enable_rgbd_capture_v3=True)
+    try:
+        default = build_mujoco_agent_tcp_pose_contract_bundle(
+            application=session.application, enable_artifact_perception=True)
+        assert default.rgbd_capture is None
+        assert all(item in session.contract_bundle.route_manifest.skill_routes
+                   for item in default.route_manifest.skill_routes)
+        assert len(session.contract_bundle.route_manifest.skill_routes) == len(default.route_manifest.skill_routes) + 1
+        session.application.start_observation_ready()
+        session.start_perception_resources()
+        observed = session.observation_producer.capture_and_publish(session.service)
+        assert observed.accepted and observed.snapshot is not None
+        snapshot = observed.snapshot
+        entry = session.contract_bundle.route_manifest.route("perception.capture_rgb", "3")
+        route = entry.route
+        parameter = route.allowed_parameter_profiles[0]
+        width, height = session.back_projection_provider.registration.profile.dimensions_by_role["main"]
+        cuts = []
+        original = session.back_projection_provider.capture_port.capture_placement_rgbd
+
+        def capture(**kwargs):
+            cut = original(**kwargs)
+            cuts.append(cut)
+            return cut
+
+        monkeypatch.setattr(session.back_projection_provider.capture_port, "capture_placement_rgbd", capture)
+        before = session.application.scene.data.qpos.copy()
+        request = AgentSkillRequest(
+            client_id=client, request_id="request:rgbd", idempotency_key="rgbd", client_sequence=1,
+            runtime_session_id=session.contract_bundle.route_manifest.runtime_session_id,
+            skill_route_manifest_hash=session.contract_bundle.route_manifest.semantic_content_hash,
+            expected_station_revision=snapshot.station_revision,
+            skill_id=route.skill_id, skill_version=route.skill_version,
+            skill_definition_hash=route.skill_definition_hash, route_id=route.route_id,
+            route_version=route.route_version, route_hash=route.semantic_content_hash,
+            deployment_binding_hash=entry.deployment_binding.deployment_binding_hash,
+            parameter_profile_id=parameter.parameter_profile_id, parameter_profile_hash=parameter.parameter_profile_hash,
+            parameters={"selected_roles": ["main"], "width": width, "height": height,
+                        "max_total_bytes": 16 * 1024 * 1024, "include_depth": include_depth},
+            observation_snapshot_id=snapshot.snapshot_id, requested_mode="sim_active", requested_timeout_ms=3000)
+        admitted = session.service.submit_request(request=request, current_station_revision=snapshot.station_revision)
+        assert admitted.accepted and admitted.operation is not None
+        operation_id = admitted.operation.operation_id
+        assert session.service.launch_operation(operation_id).accepted
+        assert session.rgbd_capture_executor.wait(operation_id, timeout_sec=10.)
+        completed = session.service.get_operation(operation_id)
+        assert completed.status == "completed", completed
+        assert completed.execution_result["include_depth"] is include_depth
+        np.testing.assert_array_equal(session.application.scene.data.qpos, before)
+        bindings = {b.slot_id: b.artifact for b in completed.output_artifact_bindings}
+        if include_depth:
+            assert len(cuts) == 1 and set(bindings) == {"rgb_frames", "depth_frames", "paired_observations"}
+            for slot, data in (("rgb_frames", cuts[0].rgb_jpeg), ("depth_frames", cuts[0].depth_npy)):
+                assert session.artifact_store.read_bytes(bindings[slot], maximum=16 * 1024 * 1024) == data
+            paired = json.loads(session.artifact_store.read_bytes(bindings["paired_observations"], maximum=65536))
+            assert paired["source_operation_id"] == operation_id
+            assert paired["source_request_hash"] == request.semantic_content_hash
+        else:
+            assert not cuts and set(bindings) == {"rgb_frames"}
+    finally:
+        session.close()
+    assert session.application.closed
+
+
+@pytest.mark.integration
+@pytest.mark.optional
+@pytest.mark.slow_sim
 def test_mujoco_back_project_skill_returns_scene_frame_point(tmp_path: Path) -> None:
     pytest.importorskip("mujoco")
 

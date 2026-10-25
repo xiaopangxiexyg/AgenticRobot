@@ -13,6 +13,7 @@ RGB_FRAME_MEDIA_TYPE_V1 = "image/jpeg"
 RGB_FRAME_SCHEMA_ID_V1 = "dexteleop.perception.rgb_frame.v1"
 RGB_FRAME_ENCODING_V1 = "jpeg.rgb8.v1"
 RGB_FRAME_COMPRESSION_V1 = "none"
+PAIRED_RGBD_SCHEMA_ID_V1 = "dexteleop.perception.paired_rgbd_observation.v1"
 
 LOCALIZATION_INPUT_IMAGE_SCHEMA_ID_V1 = (
     "dexteleop.perception.object_localization_input_image.v1"
@@ -76,6 +77,7 @@ __all__ = [
     "POINT_GRASP_DEPTH_MEDIA_TYPE_V1",
     "POINT_GRASP_DEPTH_SCHEMA_ID_V1",
     "POINT_GRASP_RGB_SCHEMA_ID_V1",
+    "PAIRED_RGBD_SCHEMA_ID_V1",
     "RGB_FRAME_COMPRESSION_V1",
     "RGB_FRAME_ENCODING_V1",
     "RGB_FRAME_MEDIA_TYPE_V1",
