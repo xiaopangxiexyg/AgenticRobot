@@ -92,7 +92,15 @@ core and MuJoCo adapter used for the 20260721 fit; tests compare those hashes to
 fixed historical values rather than silently reinterpreting the fit against
 the current files.
 
-当前运行时源码绑定为 `artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261025_v23.json`。
+当前运行时源码绑定为 `artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261025_v24.json`。
+V24 冻结 V23，并补齐 ControlStation 兼容调用方的源码绑定。继承的 86 项输入
+保持 V23 字节，新增兼容入口与 Real factory 两项，共 88 项输入、85 项源码，
+匹配固定提交 `9156ae01d`；对应调用方验收为 125 项通过、零失败。
+该默认关闭入口只装配既有绝对位姿 motion 与 measured-state Route，在资源创建前
+拒绝已退休或未装配的动作。双臂安全观察、所选单臂授权、原数值包络、执行 owner
+及 lower HOLD 关闭证据保留。本绑定不新增真机、模型或 held-out 认证。
+
+历史 V23 为 `artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261025_v23.json`。
 V23 冻结 V22，登记显式可选的 safe TCP v2、只读连续查询 v1–v5，以及已授权的
 十个调试运动入口归档。86 项输入匹配固定源码提交 `6b36561dc`；直接调用方验收
 为 1,744 通过、1 项原有可选依赖跳过。工具轴证据只覆盖采样参考与 float32
