@@ -45,3 +45,22 @@ def test_success_and_other_failure_evidence_remain_exact():
         row = _candidate_diagnostic(item, [0., 0., .3, 0., 0., 0., 1.])
         assert item == before
         assert {key: row[key] for key in item} == item
+
+
+@pytest.mark.parametrize("normalized", [False, True])
+def test_motion_profile_payload_preserves_legacy_values_and_explicit_mode(normalized):
+    from agent_gateway.profiles.mujoco.motion_deployment import MujocoAgentTcpPoseMotionProfile
+
+    profile = MujocoAgentTcpPoseMotionProfile("ref", "ref-spec", "graph", "tool", "calibration",
+        normalize_ik_objective=normalized)
+    payload = profile.to_payload()
+    assert payload["contact_policy_hash"] is None
+    assert isinstance(payload["workspace_bounds"], tuple)
+    assert payload["workspace_bounds"] == profile.workspace_bounds
+    if normalized:
+        assert payload["normalize_ik_objective"] is True
+    else:
+        assert "normalize_ik_objective" not in payload
+    restored = MujocoAgentTcpPoseMotionProfile(**json.loads(json.dumps(payload)))
+    assert restored.normalize_ik_objective is normalized
+    assert restored.semantic_content_hash == profile.semantic_content_hash

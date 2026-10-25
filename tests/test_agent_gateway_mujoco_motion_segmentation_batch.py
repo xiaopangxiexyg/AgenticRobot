@@ -472,6 +472,7 @@ def test_batch_close_keeps_shared_dependencies_until_the_original_executor_drain
         tcp_pose_comparison_executor=None,
         object_state_executor=None,
         spatial_goal_executor=None,
+        object_goal_query_executor=None,
         history_executor=None,
         segmentation_executor=None,
         segmentation_geometry_executor=None,

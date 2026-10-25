@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Mapping
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, fields, replace
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -394,6 +394,14 @@ class MujocoAgentTcpPoseMotionProfile:
             },
             domain="dexteleop.agent_skill.mujoco_tcp_pose_profile.v1",
         )
+
+    def to_payload(self) -> dict[str, Any]:
+        """Preserve the original default export and publish opt-in IK mode explicitly."""
+        return {
+            item.name: getattr(self, item.name)
+            for item in fields(self)
+            if item.name != "normalize_ik_objective" or self.normalize_ik_objective
+        }
 
 
 @dataclass(frozen=True)
