@@ -33,7 +33,7 @@ pytestmark = pytest.mark.contract
 
 
 def _composition(monkeypatch, tmp_path, *, primary="right", dual=False, action="move_to_observed_point",
-                 projection=True, observed=True, max_age=30., anchor_v2=False):
+                 projection=True, observed=True, max_age=30., anchor_v2=False, camera_single_start=False):
     lower, guard = _lower(monkeypatch, envelope_side="dual" if dual else primary, absolute=True)
     # Pure wiring only while the shared native-resource lock belongs to the operator.
     def forbidden_native(**_):
@@ -60,6 +60,7 @@ def _composition(monkeypatch, tmp_path, *, primary="right", dual=False, action="
         enable_surface_anchor_v2=anchor_v2,
         enable_anchor_motion_v2=anchor_v2,
         object_localizer=_Localizer() if anchor_v2 else None,
+        camera_single_start=camera_single_start,
         safe_motion_observation_config=SafeMotionObservationConfig(roles=("main",), maximum_scene_age_sec=max_age) if observed else None,
         clock=lambda: now[0], sleep=lambda dt: now.__setitem__(0, now[0]+dt))
     assert guard.starts == 0 and all(backend.starts == 0 for backend in lower.arm_backends.values())
@@ -259,6 +260,31 @@ def test_observed_anchor_v2_uses_request_bound_real_motion_grant(monkeypatch, tm
         assert all(backend.starts == 0 for backend in lower.arm_backends.values())
     finally:
         session.close_unused()
+
+
+@pytest.mark.parametrize("single_start", (False, True))
+def test_composed_observed_motion_reuses_existing_camera_single_start_policy(monkeypatch, tmp_path, single_start):
+    composition, lower, _ = _composition(monkeypatch, tmp_path, camera_single_start=single_start)
+    try:
+        source_binding = composition.deployment.gateway_session.perception_provider.source_binding
+        configs = {name: source.config for name, source in source_binding.camera_sources.items()}
+        assert list(sorted(configs, key=lambda key: configs[key].metadata["startup_priority"])) == ["left_wrist", "front", "right_wrist"]
+        assert all(config.width == 640 and config.height == 480 and config.fps == 15
+                   and config.enable_depth and config.align_depth_to_color for config in configs.values())
+        if single_start:
+            for config in configs.values():
+                assert config.metadata["perception_single_start"] is True
+                assert config.startup_software_retry_attempts == 0
+                assert not any((config.startup_reset, config.startup_hardware_reset,
+                    config.startup_hardware_reset_on_failure, config.startup_hardware_reset_on_warmup_failure,
+                    config.restart_on_stale_timeout, config.restart_on_runtime_error,
+                    config.restart_on_black_frames, config.restart_on_incomplete_frameset))
+        else:
+            assert configs["front"].startup_software_retry_attempts == 2
+            assert configs["front"].startup_hardware_reset_on_warmup_failure
+        assert all(backend.starts == 0 for backend in lower.arm_backends.values())
+    finally:
+        composition.application.close()
 
 
 def _request(bundle, skill_id, parameters, *, sequence=1, version="1"):

@@ -228,6 +228,8 @@ def build_parser() -> argparse.ArgumentParser:
         help=("Publish read-only perception.query_tool_hover_paths@1 (gripper-box hover paths checked by the "
               "observed safe-move planner, never dispatched); requires surface anchor v2, "
               "--safe-motion-observation-roles and move_tcp_to_pose_safe; default off."))
+    parser.add_argument("--camera-single-start", action="store_true",
+        help="Use the existing single-start camera policy: no retries, restart or reset; default off.")
     parser.add_argument("--enable-point-grasp-finger-exchange", action="store_true",
         help="Register point-grasp v5 with separately readmitted 180-degree finger exchanges; requires GraspGenX and arm reachability.")
     parser.add_argument(
@@ -1050,6 +1052,8 @@ def main(argv: list[str] | None = None) -> int:
         )
     if (args.enable_point_grasp or args.enable_back_projection or args.safe_motion_observation_roles is not None) and not all(perception_supplied):
         parser.error("Point-grasp, back projection or observed safe motion requires the composed camera options")
+    if args.camera_single_start and not all(perception_supplied):
+        parser.error("--camera-single-start requires the composed camera options")
     if args.safe_motion_debug_dir is not None and args.safe_motion_observation_roles is None:
         parser.error("--safe-motion-debug-dir requires --safe-motion-observation-roles")
     if args.enable_inherited_start_clearance and args.safe_motion_observation_roles is None:
@@ -1423,6 +1427,7 @@ def main(argv: list[str] | None = None) -> int:
         grant_lifetime_sec=args.grant_lifetime_sec,
         camera_config_path=camera_config,
         camera_registry_path=camera_registry,
+        camera_single_start=args.camera_single_start,
         artifact_root=artifact_root,
         planned_trajectory_dir=planned_trajectory_dir,
         camera_mount_urdf_path=camera_mount_urdf,

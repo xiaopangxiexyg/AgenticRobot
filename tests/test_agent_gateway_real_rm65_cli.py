@@ -59,6 +59,16 @@ def test_read_only_defaults_and_explicit_opt_out_preserve_motion_and_model_choic
     assert args.enable_point_grasp_finger_exchange is False
 
 
+def test_single_start_camera_policy_is_explicit_and_requires_perception():
+    parser = gateway_cli.build_parser()
+    assert parser.get_default("camera_single_start") is False
+    args = [*_argv(confirmation=REAL_AGENT_PRIMITIVE_SESSION_CONFIRM_TOKEN), "--camera-single-start"]
+    assert parser.parse_args(args).camera_single_start is True
+    with pytest.raises(SystemExit) as error:
+        gateway_cli.main(args)
+    assert error.value.code == 2
+
+
 def test_cli_back_projection_resolves_measured_geometry_without_grasp_models():
     parser = gateway_cli.build_parser()
     args = parser.parse_args([*_argv(confirmation=REAL_AGENT_PRIMITIVE_SESSION_CONFIRM_TOKEN),

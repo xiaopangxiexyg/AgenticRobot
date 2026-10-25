@@ -292,6 +292,7 @@ def assemble_exclusive_rm65_agent_primitive_composition(
     grant_lifetime_sec: float = 5.0,
     camera_config_path: str | Path | None = None,
     camera_registry_path: str | Path | None = None,
+    camera_single_start: bool = False,
     artifact_root: str | Path | None = None,
     planned_trajectory_dir: str | Path | None = None,
     camera_mount_urdf_path: str | Path | None = None,
@@ -432,6 +433,10 @@ def assemble_exclusive_rm65_agent_primitive_composition(
         artifact_root,
     )
     perception_enabled = all(value is not None for value in perception_values)
+    if type(camera_single_start) is not bool:
+        raise TypeError("camera_single_start must be boolean.")
+    if camera_single_start and not perception_enabled:
+        raise ValueError("camera_single_start requires the composed perception resources.")
     if perception_enabled != any(value is not None for value in perception_values):
         raise ValueError(
             "camera_config_path, camera_registry_path, and artifact_root must be "
@@ -781,6 +786,7 @@ def assemble_exclusive_rm65_agent_primitive_composition(
             scene_world_from_arm_base_by_side=(
                 lower.profile.scene_world_from_arm_base_by_side
             ),
+            single_start=camera_single_start,
         )
         perception_frame_binding = station_frame_binding
         if grasp_enabled or enable_back_projection or observed_safe_enabled:

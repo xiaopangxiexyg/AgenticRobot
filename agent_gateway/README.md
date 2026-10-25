@@ -621,6 +621,13 @@ lower 测量发布与 `RM65RgbCameraGeometry`。这条入口按已对齐 RGB-D �
 
 `--enable-object-localization` adds the supplied-image localization Route using
 the default SAM3 service client. `--enable-point-grasp` is a separate,
+可选 `real-rm65 --camera-single-start` 复用相机只读入口已有的单次启动策略，并在
+来源绑定计算前关闭软件重试、运行时重开和 hardware reset。该开关默认关闭，要求
+完整的相机/registry/Artifact 配置；不改变序列号、流格式、串行优先级、新鲜度准入或
+相机 owner。现场验收可以显式启用，避免把旧配置中的 reset/retry 带入本轮会话。
+
+`--enable-object-localization` adds the supplied-image localization Route after
+loading its reviewed model bundle. `--enable-point-grasp` is a separate,
 default-off module and requires that same localizer plus a reviewed point-grasp
 bundle. GraspGenX in-process inference is the default and does not require a
 loopback service; VGN, GraspNet, and service-mode GraspGenX are explicit
