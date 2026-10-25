@@ -402,13 +402,22 @@ class CoordinatedPoseHolding:
             gain = (self.config.cruise_velocity_ki_nm_per_rad if gains is None else gains[AXES.index(i)])
             motion_increment = -gain*displacement
             increment = position_rate*dt+motion_increment
+            # This is reversible position feedback, not learned integral
+            # growth. Condition the latter relative to this baseline: treating
+            # a slew-limited return count as windup, while accepting the
+            # outgoing count, would ratchet support on encoder chatter.
+            feedback_baseline = max(-self.config.bias_cap_nm,
+                min(self.config.bias_cap_nm, self.bias[i]+motion_increment))
             audit.update(arrival_displacement_rad=displacement,
                 arrival_displacement_gain_nm_per_rad=gain,
                 arrival_motion_bias_increment_nm=motion_increment,
+                arrival_feedback_baseline_nm=feedback_baseline,
+                arrival_adaptive_bias_increment_nm=position_rate*dt,
                 bias_feedback_source="last_confirmed_position_increment")
         else:
             increment = self.config.cruise_velocity_ki_nm_per_rad*error*dt
-        bias = max(-self.config.bias_cap_nm, min(self.config.bias_cap_nm, self.bias[i]+increment))
+        bias = max(-self.config.bias_cap_nm, min(self.config.bias_cap_nm,
+            feedback_baseline+position_rate*dt if arrival else self.bias[i]+increment))
         audit.update(active=True, reason="resolved_arrival_velocity_feedback" if arrival else "resolved_cruise_velocity_feedback", error_rad_s=error,
             proportional_request_nm=proportional, requested_bias_increment_nm=increment)
         return proportional, bias, audit
@@ -707,13 +716,16 @@ class CoordinatedPoseHolding:
                         proposed_bias[i] = value
             if cruise_audit["active"]:
                 i = cruise_joint
-                # PI growth blocked by slew/cap is not an executed bias.
-                # Existing-bias reductions and native cap back-calculation
-                # remain allowed; they never grant a new opposite drive.
-                blocked = (abs(proposed_bias[i]) > abs(self.bias[i])
-                    and (proposed_bias[i]-self.bias[i])*(demand[i]-command[i]) > 1e-12)
+                # Only adaptive growth is an integral. The arrival baseline
+                # already includes reversible displacement feedback, which
+                # must recover on a return count even if native PD consumes
+                # the available slew. Earlier speed/cap reductions stay in
+                # proposed_bias; this gate never reconstructs their demand.
+                baseline = cruise_audit.get("arrival_feedback_baseline_nm", self.bias[i])
+                blocked = (abs(proposed_bias[i]) > abs(baseline)
+                    and (proposed_bias[i]-baseline)*(demand[i]-command[i]) > 1e-12)
                 if blocked:
-                    proposed_bias[i] = self._unwind_only(i, proposed_bias[i])
+                    proposed_bias[i] = (0.0 if baseline*proposed_bias[i] < 0 else baseline)
                 cruise_audit.update(integral_growth_blocked=blocked,
                     proposed_bias_after_limits_nm=proposed_bias[i])
         else:

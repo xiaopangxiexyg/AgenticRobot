@@ -420,28 +420,56 @@ def test_arrival_bias_follows_confirmed_displacement_without_a_filtered_stop_tai
 
 
 @pytest.mark.parametrize("direction", [-1, 1])
-def test_one_count_position_chatter_does_not_ratchet_arrival_support(tmp_path, monkeypatch, direction):
+@pytest.mark.parametrize("native_pd", [False, True])
+@pytest.mark.parametrize("period", [.0075, .01])
+@pytest.mark.parametrize("offset", [.001, .006])
+def test_one_count_position_chatter_does_not_ratchet_arrival_support(
+    tmp_path, monkeypatch, direction, native_pd, period, offset,
+):
     core = controller_from_profile(tmp_path, profile=FOUR_CENTRES)._workspace._coordinated.pose
     core.config = replace(core.config, arrival_displacement_gains_nm_per_rad=(20, 40))
     q = (0, .05, .08, 0, 0, 0)
-    warm_core(core, q=q, target=direction*.001)
+    warm_core(core, q=q, target=direction*offset)
     core.adopt_hold(2, direction*.3)
     core.last_delta = core.bias
     for tracker, i in zip(core.trackers, AXES, strict=True):
-        monkeypatch.setattr(tracker, "update", lambda i=i, **kwargs: B601JointMotionFrame(
-            phase="brake", reason="target_reached_braking", q_reference_rad=core.goal[i],
-            qvel_reference_rad_s=0, control_qvel_rad_s=0, position_torque_nm=0,
-            velocity_torque_nm=0, requested_torque_nm=0))
-    for n in range(1, 121):
+        def frame(*, q, control_v, i=i, **kwargs):
+            p = core.motion.tracking_kp_nm_per_rad*(core.goal[i]-q) if native_pd else 0
+            d = -core.motion.tracking_kd_nm_s_per_rad*control_v if native_pd else 0
+            return B601JointMotionFrame(
+                phase="brake", reason="target_reached_braking", q_reference_rad=core.goal[i],
+                qvel_reference_rad_s=0, control_qvel_rad_s=control_v,
+                position_torque_nm=p, velocity_torque_nm=d, requested_torque_nm=p+d)
+        monkeypatch.setattr(tracker, "update", frame)
+    saw_slew = False
+    for n in range(1, 241):
         current = list(q)
-        if n > 40 and n % 2:
+        # Two quantized plateaus, then a return count. Native position and
+        # 80-ms velocity feedback also consume the final command's slew;
+        # the previous zero-PD fixture hid the real one-count ratchet.
+        if n > 40 and (0b00101100 >> (n % 8)) & 1:
             current[2] += direction*RESOLUTION
-        raw = tuple((a-b)/.01 for a,b in zip(current,core.q))
-        dt = core.observe(core.last_time+.01, current, raw)
-        command, _ = core.step(sequence=200+n, dt=dt, permitted=True, point_search=False, cruise_joint=2)
+        raw = tuple((a-b)/period for a,b in zip(current,core.q))
+        dt = core.observe(core.last_time+period, current, raw)
+        command, audit = core.step(sequence=200+n, dt=dt, permitted=True, point_search=False, cruise_joint=2)
+        status = audit["cruise_velocity_control"]
+        if status["active"]:
+            if offset == .001:
+                assert status.get("arrival_adaptive_bias_increment_nm", 0) == 0
+            # A blocked adaptive increment may withhold new support, but
+            # cannot discard the reversible return count. No cap is active
+            # in this short test, and both selected offsets remain one-sided.
+            baseline = core.bias[2]+status["arrival_motion_bias_increment_nm"]
+            assert direction*(audit["proposed_bias_nm"][2]-baseline) >= -1e-12
+            demand = (audit["axes"][1]["requested_torque_nm"]
+                +status["proportional_request_nm"]+audit["proposed_bias_nm"][2])
+            saw_slew |= abs(demand-command[2]) > 1e-9
         core.record_dispatch(200+n, command)
-        if n % 2 == 0:
+        if n % 8 == 0 and offset == .001:
             assert core.bias[2] == pytest.approx(direction*.3)
+        assert sum(abs(v) for v in command) <= core.config.total_assist_cap_nm+1e-12
+    if native_pd and period == .0075:
+        assert saw_slew
 
 
 @pytest.mark.parametrize("width", [True, .002, float("nan"), float("inf"), -.1])
