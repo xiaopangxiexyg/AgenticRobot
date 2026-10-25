@@ -1,6 +1,6 @@
 # MuJoCo checkpoint 组件与接入进度
 
-2026-10-25：继续原隔离分支，并合入固定 development `40943f56abc2`，保留其
+2026-10-25：继续原隔离分支，并合入固定 development `52c30c8cfe8b`，保留其
 primitive scene v2、观察和 DMTAC 对齐改进。在 native scene、acceleration planner 和 actuated
 owner 组件上新增完整 manual execution rig 的可信内部 cut；随后补齐 source admission、
 execution authority、decision owners 三个控制状态组件及原 no-model target 的时钟接缝，
@@ -105,6 +105,13 @@ barrier 的 safe-displacement 在初始化和 QP 后可以分别是 `(dim,)` 与
 ```bash
 bash scripts/run_pytest.sh tests/test_rm65_ik_checkpoint.py -q
 ```
+
+本阶段标准 IK 的19项验收覆盖在最终组合中。原 owner/constructor/rig/core 的13文件
+受影响回归为239通过、104.86秒；再合入固定 development 的 paired RGB-D 增量后，
+checkpoint、原 pose resolver、观察/反投影和边界组合为314通过、83.55秒。
+两组不能相加为独立样本。独立评审已关闭 signed-zero、alias 资格、默认 limit/tangent
+身份和合法 cache phase 的缺口；保留先失败的反例。新模块和测试的 Ruff/format通过，
+原 target solver 的14项既有lint告警未增加，未为此重排或修改无关算法。
 
 这仍不是完整 MuJoCo target。新解释器用例验证的是同配置独立 IK owner，未将整个
 runtime/Gateway 一起恢复。未来 adaptive outer solve 会受实际墙钟影响；另外原
