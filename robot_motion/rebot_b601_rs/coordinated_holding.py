@@ -345,8 +345,13 @@ class CoordinatedPoseHolding:
             observed_at_sec=None if latest is None else latest[0],
             window_span_sec=estimator.span_sec, position_span_rad=estimator.position_span_rad)
         if (not estimator.ready or not relative.ready or latest is None
-            or not 0 < self.last_time-latest[0] <= self.motion.max_control_gap_sec
-            or estimator.position_span_rad < 2*(self.motion.position_resolution_rad or 0)):
+            or not 0 < self.last_time-latest[0] <= self.motion.max_control_gap_sec):
+            audit["reason"] = "waiting_for_causal_arrival_window" if arrival else "waiting_for_resolved_cruise_motion"
+            return 0.0, self.bias[i], audit
+        # Zero-count observations are valid for arrival stabilization, even
+        # though they cannot establish a moving identification sample. Do not
+        # switch back to a different integrator on every quantized plateau.
+        if not arrival and estimator.position_span_rad < 2*(self.motion.position_resolution_rad or 0):
             audit["reason"] = "waiting_for_resolved_cruise_motion"
             return 0.0, self.bias[i], audit
         if not arrival and (reference*velocity <= 0 or reference*(self.goal[i]-self.q[i]) <= 0):
@@ -359,7 +364,21 @@ class CoordinatedPoseHolding:
         # native reference jump from the paced trajectory to the endpoint.
         error = -velocity if arrival else self.cruise_error_velocity[i]
         proportional = self.config.cruise_velocity_kp_nm_s_per_rad*error
-        increment = self.config.cruise_velocity_ki_nm_per_rad*error*dt
+        position_rate = 0.0
+        if arrival:
+            target_error = self.goal[i]-self.q[i]
+            outside_band = max(0.0, abs(target_error)-self.arrival_tolerance_rad)
+            position_rate = self.config.bias_gain_nm_per_rad_sec*outside_band*(1 if target_error > 0 else -1)
+            # Restore a stopped-short axis with the same retained bias owner.
+            # Its integral velocity objective cannot exceed this leg's chosen
+            # reference speed. Inside the accepted position band, only actual
+            # velocity adjusts support; the holding force is not assumed zero.
+            limit = (self.config.cruise_velocity_ki_nm_per_rad
+                     * self.trackers[AXES.index(i)].config.max_reference_velocity_rad_s)
+            position_rate = max(-limit, min(limit, position_rate))
+            audit.update(arrival_position_error_rad=target_error,
+                arrival_position_bias_rate_nm_s=position_rate)
+        increment = (position_rate+self.config.cruise_velocity_ki_nm_per_rad*error)*dt
         bias = max(-self.config.bias_cap_nm, min(self.config.bias_cap_nm, self.bias[i]+increment))
         audit.update(active=True, reason="resolved_arrival_velocity_feedback" if arrival else "resolved_cruise_velocity_feedback", error_rad_s=error,
             proportional_request_nm=proportional, requested_bias_increment_nm=increment)
@@ -458,12 +477,14 @@ class CoordinatedPoseHolding:
                         # stationary proposal during resolved slow motion.
                         proposed_bias[i], moving[i] = cruise_bias, True
                         cruise_p[i] = proportional
-                        approach_reasons[i] = "cruise_velocity_bias_refinement"
-                    elif status.get("arrival") and approach_reasons[i] in {
-                        "arrival_feedback_unloading", "arrival_overshoot_drive_unloading", "moving_target_error_unwinds_bias"}:
-                        # Keep support while the committed velocity window is
-                        # warming. Native brakes and the composed speed cap
-                        # still own actual excessive motion.
+                        approach_reasons[i] = ("arrival_position_velocity_bias_refinement" if status.get("arrival")
+                                               else "cruise_velocity_bias_refinement")
+                    elif status.get("arrival"):
+                        # A missing causal window permits neither velocity
+                        # integration nor the old stationary-only integrator.
+                        # Retain confirmed support while the observer warms;
+                        # native brakes and the composed speed cap still own
+                        # actual excessive motion.
                         proposed_bias[i] = self.bias[i]
                         approach_reasons[i] = "arrival_observer_warming_retains_support"
                 demand[i] = frame.requested_torque_nm + cruise_p[i] + (0.0 if is_probe else proposed_bias[i])

@@ -239,7 +239,10 @@ def test_native_brake_resets_cruise_and_retains_raw_speed_and_watchdog_guards(tm
 def test_arrival_velocity_feedback_preserves_support_and_ignores_endpoint_reference_jump(tmp_path, monkeypatch, direction):
     core = controller_from_profile(tmp_path)._workspace._coordinated.pose
     core.config = replace(core.config, cruise_arrival_feedback=True)
-    warm_core(core)
+    # Stay inside the accepted position band to isolate velocity damping from
+    # the separate, bounded stopped-short restoration term.
+    start = .02-direction*.002
+    warm_core(core, q=(0, 0, start, 0, 0, 0), target=direction*.002)
     core.adopt_hold(2, .3)
     for tracker, i in zip(core.trackers, AXES, strict=True):
         def frame(*, i=i, **kwargs):
@@ -249,7 +252,7 @@ def test_arrival_velocity_feedback_preserves_support_and_ignores_endpoint_refere
         monkeypatch.setattr(tracker, "update", frame)
     active = False
     for n in range(1, 41):
-        dt = core.observe(1.29+n*.01, (0, 0, direction*n*.0001, 0, 0, 0), (0, 0, direction*.01, 0, 0, 0))
+        dt = core.observe(1.29+n*.01, (0, 0, start+direction*n*.0001, 0, 0, 0), (0, 0, direction*.01, 0, 0, 0))
         before = core.bias
         command, audit = core.step(sequence=30+n, dt=dt, permitted=True, point_search=False, cruise_joint=2)
         status = audit["cruise_velocity_control"]
@@ -263,6 +266,95 @@ def test_arrival_velocity_feedback_preserves_support_and_ignores_endpoint_refere
         core.record_dispatch(30+n, command)
         assert sum(abs(v) for v in command) <= 1+1e-12
     assert active and not core.braking
+
+
+@pytest.mark.parametrize("direction", [-1, 1])
+@pytest.mark.parametrize("one_count_jitter", [False, True])
+def test_soy9sdfx_arrival_keeps_one_feedback_owner_across_quantized_plateaus(
+    tmp_path, monkeypatch, direction, one_count_jitter,
+):
+    core = controller_from_profile(tmp_path, profile=FOUR_CENTRES)._workspace._coordinated.pose
+    # Recorded sweep-12: the endpoint had already been reached, then native
+    # arrival lasted 172 seconds. Low-count windows repeatedly selected the
+    # stationary integrator instead of arrival velocity feedback.
+    goal = .0873598775598299
+    position = goal + direction*.01043439444572812
+    warm_core(core, q=(0, .05235987755982989, position, 0, 0, 0), target=goal-position)
+    core.adopt_hold(1, .06)
+    core.adopt_hold(2, direction*.24518015077561686)
+    core.last_delta = core.bias
+    for tracker, i in zip(core.trackers, AXES, strict=True):
+        def frame(*, q, i=i, **kwargs):
+            target = core.goal[i]
+            effort = core.motion.tracking_kp_nm_per_rad*(target-q)
+            return B601JointMotionFrame(phase="brake", reason="target_reached_braking",
+                q_reference_rad=target, qvel_reference_rad_s=0,
+                control_qvel_rad_s=0, position_torque_nm=effort,
+                velocity_torque_nm=0, requested_torque_nm=effort)
+        monkeypatch.setattr(tracker, "update", frame)
+    active = 0
+    for n in range(1, 81):
+        q = list(core.q)
+        q[2] = position + (RESOLUTION if one_count_jitter and n % 2 else 0)
+        raw = tuple((a-b)/.01 for a, b in zip(q, core.q))
+        dt = core.observe(core.last_time+.01, q, raw)
+        command, audit = core.step(sequence=30+n, dt=dt, permitted=True, point_search=False, cruise_joint=2)
+        status = audit["cruise_velocity_control"]
+        if n >= 25:
+            active += status["active"]
+            assert status["active"] and status["arrival"]
+            assert audit["approach_reasons"][2] == "arrival_position_velocity_bias_refinement"
+            assert status["arrival_position_bias_rate_nm_s"]*direction < 0
+            assert abs(status["arrival_position_bias_rate_nm_s"]) <= (
+                core.config.cruise_velocity_ki_nm_per_rad*core.trackers[1].config.max_reference_velocity_rad_s)
+        elif n <= 20:
+            assert audit["proposed_bias_nm"] == core.bias
+        core.record_dispatch(30+n, command)
+        assert core.bias[1] == .06
+        assert sum(abs(v) for v in command) <= 1+1e-12
+    assert active == 56
+    # Rejected conditioning must not commit the restoration proposal or feed
+    # a velocity observer. The following warm-up cannot revive the old
+    # stationary integrator. Revocation still clears all active support.
+    before = core.bias
+    dt = core.observe(core.last_time+.01, core.q, ZERO)
+    command, _ = core.step(sequence=111, dt=dt, permitted=True, point_search=False, cruise_joint=2)
+    core.record_dispatch(111, tuple(v*.99 for v in command))
+    assert core.bias == before
+    dt = core.observe(core.last_time+.01, core.q, ZERO)
+    command, audit = core.step(sequence=112, dt=dt, permitted=True, point_search=False, cruise_joint=2)
+    assert not audit["cruise_velocity_control"]["active"]
+    assert audit["proposed_bias_nm"] == before
+    core.record_dispatch(112, command)
+    command, _ = core.step(sequence=113, dt=.01, permitted=False, point_search=False, cruise_joint=2)
+    core.record_dispatch(113, command)
+    assert core.bias == command == ZERO
+
+
+@pytest.mark.parametrize("direction", [-1, 1])
+def test_arrival_still_window_inside_tolerance_retains_unknown_support(tmp_path, monkeypatch, direction):
+    core = controller_from_profile(tmp_path, profile=FOUR_CENTRES)._workspace._coordinated.pose
+    q = (0, .05, .08, 0, 0, 0)
+    warm_core(core, q=q, target=direction*core.arrival_tolerance_rad/2)
+    core.adopt_hold(2, direction*.3)
+    core.last_delta = core.bias
+    for tracker, i in zip(core.trackers, AXES, strict=True):
+        def frame(*, i=i, **kwargs):
+            return B601JointMotionFrame(phase="brake", reason="target_reached_braking",
+                q_reference_rad=core.goal[i], qvel_reference_rad_s=0,
+                control_qvel_rad_s=0, position_torque_nm=0,
+                velocity_torque_nm=0, requested_torque_nm=0)
+        monkeypatch.setattr(tracker, "update", frame)
+    for n in range(1, 51):
+        dt = core.observe(core.last_time+.01, q, ZERO)
+        command, audit = core.step(sequence=30+n, dt=dt, permitted=True, point_search=False, cruise_joint=2)
+        if n >= 25:
+            status = audit["cruise_velocity_control"]
+            assert status["active"] and status["position_span_rad"] == 0
+            assert status["arrival_position_bias_rate_nm_s"] == 0
+            assert status["requested_bias_increment_nm"] == 0
+        core.record_dispatch(30+n, command)
+        assert core.bias[2] == pytest.approx(direction*.3)
 
 
 @pytest.mark.parametrize("width", [True, .002, float("nan"), float("inf"), -.1])
@@ -346,6 +438,7 @@ def simulate_motion(tmp_path, *, candidate, speed, direction, inertia=.2, period
     now = core.last_time
     samples, active, peak_speed, field_predictions, field_increments = [], 0, 0.0, 0, 0
     outcome = "timeout"
+    quiet_since = None
     for n in range(1, int(40/period)+1):
         for _ in range(round(period/.001)):
             for i in AXES:
@@ -386,9 +479,16 @@ def simulate_motion(tmp_path, *, candidate, speed, direction, inertia=.2, period
         active += audit["cruise_velocity_control"]["active"]
         field_predictions += (audit.get("command_field") or {}).get("predicted", False)
         field_increments += abs((audit.get("command_field") or {}).get("requested_increment_nm", 0)) > 1e-12
-        if abs(q[2]-goal[2]) <= .003375 and core.quiet():
-            outcome = "arrived"
-            break
+        # The real continuous-acquisition handoff requires a continuous
+        # settle dwell. A single quiet, in-band sample can precede rebound.
+        if max(abs(q[i]-goal[i]) for i in AXES) <= .003375 and core.quiet():
+            if quiet_since is None:
+                quiet_since = now
+            if now-quiet_since >= core.settings.staged_assist.settle_dwell_sec:
+                outcome = "arrived"
+                break
+        else:
+            quiet_since = None
     return {"outcome": outcome, "samples": len(samples), "active_cycles": active,
         "rms_speed_error_rad_s": math.sqrt(sum(v*v for v in samples)/len(samples)) if samples else None,
         "peak_speed_rad_s": peak_speed, "duration_sec": now-1.29,
