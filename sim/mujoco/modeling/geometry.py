@@ -10,7 +10,7 @@ import numpy as np
 
 from ..transforms import format_float_list
 from ..urdf import URDFGeometry, URDFModel
-from .obj_materials import obj_material_mesh_parts
+from .obj_materials import ObjMaterialMeshPart, obj_material_mesh_parts
 
 
 def safe_name(text: str) -> str:
@@ -37,6 +37,9 @@ class MeshAssetRegistry:
         self.model = model
         self._by_path: dict[tuple[Path, str | None], str] = {}
         self._used_names: set[str] = set()
+        # A registry belongs to one MJCF conversion. Repeated left/right
+        # visuals share resolution here; new conversions reread their inputs.
+        self._visual_parts_by_path: dict[Path, tuple[ObjMaterialMeshPart, ...]] = {}
 
     def _mesh_name(self, path: Path, *, inertia: str | None = None) -> str:
         key = (path, inertia)
@@ -91,7 +94,9 @@ class MeshAssetRegistry:
         mesh_path = self.model.resolve_mesh_path(geometry.filename)
         if not mesh_path.exists():
             raise FileNotFoundError(f"URDF mesh not found: {mesh_path}")
-        parts = obj_material_mesh_parts(mesh_path)
+        if mesh_path not in self._visual_parts_by_path:
+            self._visual_parts_by_path[mesh_path] = obj_material_mesh_parts(mesh_path)
+        parts = self._visual_parts_by_path[mesh_path]
         if not parts:
             return (VisualGeomPart(attributes=self.geom_attributes(geometry)),)
         return tuple(

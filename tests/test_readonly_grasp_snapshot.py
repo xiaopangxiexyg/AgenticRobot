@@ -1,5 +1,6 @@
 import ast
 import json
+import math
 import threading
 import time
 from dataclasses import replace
@@ -585,24 +586,45 @@ def test_persistent_unclean_close_does_not_claim_disconnection(capture_args, cam
     assert report["hardware_connected"] is None and not report["cleanup_complete"]
 
 
-def test_persistent_failed_state_can_retry_without_restart(capture_args, camera_rig, tmp_path, monkeypatch):
+@pytest.mark.parametrize("failure", ["gap", "motion"])
+def test_persistent_failed_state_can_retry_without_restart(capture_args, camera_rig, tmp_path, monkeypatch, failure):
     args, context = collection_fixture(tmp_path)
     capture_args.output = args.output / "devices"
-    original = probe.stationarity
     calls = []
 
-    def first_fail(*values):
-        calls.append(1)
-        if len(calls) == 1:
-            raise RuntimeError("moving scene")
-        return original(*values)
+    def capture_history(session, started, finished):
+        # Retry ownership must not depend on host scheduling. Control only the
+        # history input; the sampler, freshness checks and validator stay real.
+        calls.append((started, finished))
+        assert finished >= started
+        template = session.history()[-1]
+        count = math.ceil((finished - started + .1) / .05) + 1
+        times = [started - .05 + index * (finished - started + .1) / (count - 1)
+                 for index in range(count)]
+        if len(calls) == 1 and failure == "gap":
+            times = [started - .05, started + .195, max(finished + .05, started + .245)]
+        rows = [
+            {side: {**template[side], "started_at": tick, "finished_at": tick + .005,
+                    "qpos_rad": list(template[side]["qpos_rad"])}
+             for side in ("left", "right")}
+            for tick in times
+        ]
+        if len(calls) == 1 and failure == "motion":
+            rows[len(rows) // 2]["left"]["qpos_rad"][0] += .01
+        return rows
 
-    monkeypatch.setattr(probe, "stationarity", first_fail)
+    monkeypatch.setattr(probe.ReadOnlySnapshotSession, "_capture_history", capture_history)
     answers = iter(("3", "", "q"))
     assert probe.interactive_capture(args, context=context, arm_factory=camera_rig.arm_factory,
         input_fn=lambda _: next(answers)) == 0
     records = [json.loads(line) for line in (args.output / "samples.jsonl").read_text().splitlines()]
     assert [row["status"] for row in records] == ["failed", "captured"]
+    snapshots = [json.loads((args.output / row["snapshot"]).read_text()) for row in records]
+    assert snapshots[0]["error"]["type"] == "RuntimeError"
+    assert "stationary evidence failed" in snapshots[0]["error"]["message"]
+    assert len(calls) == 2
+    assert all(snapshots[1]["stationarity"][side]["max_gap_sec"] <= .051
+               for side in ("left", "right"))
     assert sum(event[0] == "arm_open" for event in camera_rig.events) == 2
     assert sum(event[0] == "start" for event in camera_rig.events) == 3
 
