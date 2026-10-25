@@ -35,7 +35,6 @@ FULL_WEIGHTS = {
     "tests/test_control_station_sim_hil_allocation_profile.py": 21.878,
     "tests/test_replay_position_admittance_ik_trace.py": 17.637,
     "tests/test_sim_point_grasp_experiment.py": 16.729,
-    "tests/test_agent_gateway_real_rm65_composition.py": 16.526,
     "tests/test_mujoco_trajectory_composition_publication.py": 14.943,
     "tests/test_real_shadow_acceptance.py": 14.336,
     "tests/test_camera_semantic_materialize.py": 13.292,
@@ -74,14 +73,47 @@ FULL_WEIGHTS = {
     # Previously unweighted modules >= 5 s in the green 298221fc full Run
     # full-20261018-baseline6j1node22 (six serial batches, Node 22).
     "tests/test_dmtac_cube_contact_probe.py": 66.941,
-    "tests/test_agent_gateway_mujoco_safe_tcp_pose.py": 33.811,
     "tests/test_rm65_dmtac_sweep_probe.py": 15.684,
     "tests/test_owned_worker_cleanup.py": 12.397,
     "tests/test_mujoco_planned_tcp_constraints.py": 11.803,
     "tests/test_openpi_cpu_resources.py": 10.931,
-    "tests/test_agent_gateway_mujoco_gripper_contact.py": 9.849,
     "tests/test_sam3_service.py": 9.564,
     "tests/test_agent_gateway_mujoco_back_projection.py": 8.847,
+    # Previously unweighted modules >= 5 s in green 54edca481,
+    # full-20261023-mainline12j1geom (12 serial batches, Node 22).
+    "tests/test_mujoco_tcp_motion_chain.py": 94.914,
+    "tests/test_agent_gateway_mujoco_grasp_approach.py": 55.823,
+    "tests/test_agent_gateway_mujoco_tcp_pose_comparison.py": 20.082,
+    "tests/test_agent_gateway_mujoco_object_state.py": 14.244,
+    "tests/test_readonly_grasp_snapshot.py": 12.538,
+    "tests/test_rm65_self_observation_urdf.py": 11.843,
+    "tests/test_agent_gateway_mujoco_object_motion.py": 11.066,
+    "tests/test_agent_gateway_mujoco_left_visual.py": 7.841,
+    "tests/test_run_full_acceptance.py": 7.472,
+    "tests/test_rm65_dual_arm_scene_profile.py": 6.747,
+    "tests/test_mujoco_dmtac_gripper.py": 6.714,
+    "tests/test_rm65_dual_safe_sequence.py": 6.501,
+    "tests/test_rm65_object_transport.py": 5.720,
+    # Green dfff99b81 full-20261024-visualfull2 (12 batches, 2 jobs,
+    # Node 22, Trimesh 5.1.1 / Embreex 4.4.0.post1): new modules >= 5 s
+    # and three source-grown Gateway modules. Other historical module and
+    # function estimates remain stable across hosts.
+    "tests/test_b601_calibration_cycle.py": 140.659,
+    "tests/test_agent_gateway_mujoco_fast_grasp.py": 135.296,
+    "tests/test_b601_automatic_calibration.py": 124.182,
+    "tests/test_b601_coordinated_holding.py": 84.632,
+    "tests/test_agent_gateway_mujoco_safe_tcp_pose.py": 78.291,
+    "tests/test_rebot_b601_staged_assist.py": 73.882,
+    "tests/test_agent_gateway_real_rm65_composition.py": 41.812,
+    "tests/test_b601_workspace_calibration.py": 28.918,
+    "tests/test_agent_gateway_mujoco_gripper_contact.py": 27.250,
+    "tests/test_agent_gateway_mujoco_fast_grasp_boundaries.py": 23.369,
+    "tests/test_b601_workspace_collision.py": 17.290,
+    "tests/test_mujoco_scene_qualification.py": 10.128,
+    "tests/test_b601_workspace_identification.py": 6.312,
+    "tests/test_mujoco_safe_tcp_goal_envelope.py": 6.025,
+    "tests/test_dataset_dependency_boundaries.py": 5.427,
+    "tests/test_b601_torque_console.py": 5.419,
 }
 
 # Modules normally remain the isolation unit. These two long-running modules

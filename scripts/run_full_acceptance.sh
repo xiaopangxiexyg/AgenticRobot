@@ -230,6 +230,7 @@ run_shard() {
   NUMBA_CACHE_DIR="$RUN_ROOT/${name}-numba-cache" \
   TMPDIR="$shard_tmp" \
   "$REPO_ROOT/scripts/run_pytest.sh" \
+    -p scripts.pytest_native_memory \
     -m 'not hardware' \
     -q \
     -o "cache_dir=$RUN_ROOT/${name}-pytest-cache" \
