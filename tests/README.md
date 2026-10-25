@@ -125,6 +125,15 @@ wrapper 时使用进程私有的 `/tmp` 临时目录。只复用校验过的编�
 初始状态逐项比较；修改一个会话的质量和 qpos 后，其他会话与后续加载必须不受影响。
 原有 `test_mujoco_fast_runtime.py` 中的冷启动、损坏恢复、跨进程发布和失效检查仍保留。
 
+加速构造后，已关闭场景的原生内存可能在 Python 自动循环回收前积累。完整验收将
+`test_agent_gateway_mujoco_fast_grasp.py` 和 `test_agent_gateway_mujoco_safe_tcp_pose.py`
+加入现有的独立函数分片许可表，把测试族分配到同一批数的不同进程；每个参数族仍
+不可拆分。两个模块只有函数局部会话，没有共享的运行中模块 fixture；跨进程只共享
+该次 Run 的校验编译产物。其函数初始估值均分已有模块估值，没有使用中断验收或
+focused 结果充当完整绿色计时证据。GC 设置和调用、原生堆页归还实现、分片算法、
+批数、并发上限及内存停止门禁均不变。未来增加共享运行时 fixture 时，需要重新
+核对这一分片边界。
+
 所有权事务的 7 个失败/成功分支，以及锁等待预算 1 例、refinement 锁等待 4 例、
 最终场景读取后的取消/过期 2 例，使用真实 `MujocoPlannedTcpMotion` 和真实可重入锁，
 配合小型内存场景。它们原本就替换了几何查询，重复编译完整机器人没有增加该事务
@@ -313,9 +322,11 @@ planner parses the source without importing it, assigns every statically
 discovered top-level `test_*` function exactly once, and fails closed on test
 classes or dynamic collection hooks. Parameterized functions remain a single
 target, so their complete case matrix stays together. The manifest records both
-source modules and exact pytest targets. The temp pipeline and replay active
-pipeline use this exception to share shard capacity without reducing test
-coverage or physics work. Replay tests create their own temporary logs and
+source modules and exact pytest targets. The temp pipeline, replay active
+pipeline and the two independent native Gateway modules described above use
+this exception to share shard capacity and bound process-local scene
+accumulation. The split itself preserves each complete function parameter
+family. Replay tests create their own temporary logs and
 fresh runtimes; the four-rollout combined-control test and each parameterized
 envelope matrix remain indivisible. Grasp trajectory stays module-local to
 preserve its shared planning fixture instead of repeating that expensive plan.

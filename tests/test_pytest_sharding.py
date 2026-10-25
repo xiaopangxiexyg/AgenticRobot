@@ -143,6 +143,8 @@ def test_fast_integration_profile_tracks_its_unsharded_critical_path() -> None:
     (
         "tests/test_mujoco_temp_pipeline.py",
         "tests/test_replay_position_admittance_active_pipeline.py",
+        "tests/test_agent_gateway_mujoco_fast_grasp.py",
+        "tests/test_agent_gateway_mujoco_safe_tcp_pose.py",
     ),
 )
 def test_full_plan_splits_registered_large_module_without_losing_tests(
@@ -155,7 +157,9 @@ def test_full_plan_splits_registered_large_module_without_losing_tests(
     tests_root.mkdir(parents=True)
     split_path = repository / relative_path
     registered = module.FULL_SPLIT_NODE_WEIGHTS[relative_path]
-    test_names = sorted(registered) + ["test_new_profile_is_still_collected"]
+    test_names = sorted(set(registered) | {
+        "test_new_profile_is_still_collected", "test_unmeasured_peer_is_collected",
+    })
     split_path.write_text(
         "\n\n".join(f"def {name}():\n    pass" for name in test_names) + "\n",
         encoding="utf-8",
