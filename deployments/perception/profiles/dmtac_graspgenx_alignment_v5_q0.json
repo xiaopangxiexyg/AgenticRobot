@@ -1,0 +1,36 @@
+{
+  "schema": "agenticrobot.dmtac_graspgenx_alignment_profile.v1",
+  "profile_id": "DMTAC_M_graspgenx_alignment_v5_q0",
+  "nominal_sides": ["left", "right"],
+  "gripper_master_q_rad": 0.0,
+  "nominal_geometry": {
+    "palm_z_m": -0.024,
+    "finger_length_m": 0.0867,
+    "finger_thickness_m": 0.0199,
+    "pad_height_m": 0.03,
+    "maximum_opening_m": 0.0705,
+    "tool_from_solid_xyz_m": [0.0228928796742485, -0.0000053052819678, 0.0328313309717877],
+    "solid_yaw_rad": 0.0,
+    "tool_from_solid_rotation": [-0.005883664976856, 0.9999446749409, 0.008719492172192, -0.9999826899785, -0.005883853041647, -0.000004084338666, 0.00004722009784, -0.008719365268476, 0.9999619844972]
+  },
+  "collision_tip_extension_m": 0.003,
+  "evidence_status": "offline_nominal_alignment",
+  "proxy_scope": "measured fingertip axial margin only; not a whole-CAD or closing-sweep enclosure",
+  "provenance": {
+    "frozen_input_commit": "1013deb1546c97599caa928bb24ddb4098d5169f",
+    "source_parent_commit": "10f06a710497c6cdd4869d59831bc07ab838d1fd",
+    "alignment_path_in_frozen_input": "graspgenx-dmtac-alignment-right.json",
+    "alignment_git_blob": "ceedf12223eb384e1d9cc9a2e19d78877cacfc63",
+    "alignment_sha256": "b022f09c992235e5a5db67b3900da960a34b2c3a3f5e199a3c56f5fec69c13f6",
+    "source_urdf": "assets/realman_dual_arm_inspire_gripper_dmtacm/realman_dual_arm_inspire_gripper_dmtacm.urdf",
+    "source_urdf_sha256": "310c3e440d4725ab2511b7bf84b32cf8ad6cefbb90586fbac50893f95c4a1411",
+    "tool_profile": "hardware/rm65/utils/configs/calibrations/rm65_right_DMTAC_M.json",
+    "tool_profile_sha256": "71a4c9967ed7634d643da251ea34160dcbdfc51b8d4a4260123f2f658ea772d8",
+    "arm_qpos_rad": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+    "left_tool_profile": "hardware/rm65/utils/configs/calibrations/rm65_left_DMTAC_M.json",
+    "left_tool_profile_sha256": "b15df082549d3d5227f3f9c7318edab3a6e71161314110d289edb48e75eb4074",
+    "both_sides_nominal_fk_crosscheck_max_abs_delta": 3.3084646133829665e-14,
+    "crosscheck_scope": "current URDF and each tool TCP at q0; nominal CAD/FK equivalence only",
+    "physical_acceptance": "not_assessed"
+  }
+}

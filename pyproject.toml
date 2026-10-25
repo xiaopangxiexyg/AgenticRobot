@@ -114,6 +114,7 @@ include-package-data = true
 
 [tool.setuptools.package-data]
 "*" = ["*.json", "*.yaml", "*.yml", "*.xml", "*.urdf", "*.obj", "*.stl"]
+"deployments.perception" = ["profiles/*.json"]
 control_station = [
     "web/*.js",
     "web/static/*.html",

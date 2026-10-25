@@ -743,9 +743,10 @@ GraspGenX 的 arm reachability 在绑定同侧腕相机标定后，会从 tool T
 
 ## DMTAC M 和坐标语义
 
-DMTAC/GraspGenX 的名义模型指长仍为 100 mm；碰撞及渲染 proxy 在最前端单独加长 1 mm，
-覆盖开口 q=0 CAD 指尖约 0.596 mm 的轴向漏包。TCP、模型输入尺寸、抓取中心和原版 4B2
-profile 保持原值；这不补偿相机外参偏差，也不表示外壳横向已完全包络。
+DMTAC/GraspGenX 默认使用 v5 名义模型：指长 86.7 mm、palm Z −24 mm，以及对应的完整
+TCP→model 变换。碰撞及渲染 proxy 在指尖单独扩展 3 mm；推理与 capture 仍使用名义尺寸。
+控制器 TCP、物理抓取中心和原版 4B2 profile 保持原值；这不补偿相机外参偏差，也不表示
+外壳横向已完全包络。旧 v4 几何通过显式 profile 保留，详见本文“DMTAC 名义对齐 profile”。
 
 当前 simulation 默认 URDF 由 `sim/contracts/scene/spec.py` 选定为：
 
@@ -965,3 +966,30 @@ registry。生产 Skill 只广告当前部署已经具备可信 RGB 和相机 po
 `--captured-robot-self-envelope-urdf` 只用于捕获时删点，不会替换运动碰撞模型。
 扩展配置与几何参数哈希进入执行 manifest 及过滤证据，默认 manifest 和旧过滤证据不变。
 本地几何、离线或仿真验证不代表附件已获现场复核或真实动作已获验收。
+
+## DMTAC 名义对齐 profile
+
+默认 `DMTAC_M_graspgenx_alignment_v5_q0` 采用 finger length 86.7 mm、palm Z −24 mm、
+碰撞指尖扩展 3 mm，并绑定对应的完整 TCP→model 变换。原 v4 的 100 mm、−29 mm 和
+1 mm 扩展保留为 `DMTAC_M_graspgenx_alignment_v4_q0`；选择显式 v4 时，旧几何、推理
+sweep 和 semantic hash 保持不变。现有入口使用 `--graspgenx-alignment-profile` 选择，
+Python planner 使用 `alignment_profile_id`；未指定时使用新 v5。已有不可变候选及计划仍
+按照其原身份解释，不能借默认值变化重新标记。不得只替换某个全局尺寸常量。
+
+同一个不可变 profile 供给推理 sweep、capture 名义尺寸、候选转换、碰撞几何及身份。
+3 mm 扩展只用于碰撞/渲染，不加入推理抓取深度。新 profile 拒绝旧尺寸或另一变换的
+`solid_geometry` override。原生运动、碰撞、截止时间、取消与最终输出保护继续由原 owner 负责。
+
+原始对齐 JSON 来自右臂 gripper q=0；用当前固定 URDF 和左右各自的工具 TCP 重新核验，
+两侧的名义 TCP→model 变换与新记录的最大元素差均约 3.31e−14，因此默认名义几何由左右
+共用，沿用原双臂共享候选池及各组件独立的可达性/执行检查。q=0 描述名义开爪模型，
+不是当前夹爪状态的实测证明；实时状态与完整碰撞检查仍由原链负责。
+冻结输入为 `1013deb1546c97599caa928bb24ddb4098d5169f` 的 alignment blob，
+父提交 `10f06a710` 本身不含该未跟踪 JSON。版本化记录
+`deployments/perception/profiles/dmtac_graspgenx_alignment_v5_q0.json`
+保存原 blob、URDF、左右工具配置摘要、两侧 FK 核验范围和名义参数；原绝对路径没有带入生产绑定。
+其证据等级为 `offline_nominal_alignment`，不是物理抓稳或整 CAD/闭爪扫掠包络认证。
+
+离线对齐工具见 `utils/gripper_urdf_editor/README.md` 的“GraspGenX/DMTAC 对齐预览”。
+Tk、Qt 和 headless 共用 profile 初值和完整 6D TCP 解析；完整 pose 存在时优先于旧 z scalar。
+导出的 GUI JSON 是可审查提案，不会自动修改工具标定或应用到运行中的 planner。

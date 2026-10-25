@@ -641,7 +641,8 @@ def build_mujoco_agent_tcp_pose_gateway_session(
         if (any(not math.isclose(float(a), float(b), abs_tol=1e-9, rel_tol=0)
                 for a, b in zip(actual_tcp, DMTAC_M_REVIEWED_TOOL_TCP_POSE_FLANGE_M_RAD))
                 or fast_grasp_planner.solid_geometry != reviewed_graspgenx_dmtac_solid_geometry(
-                    maximum_opening_m=fast_grasp_planner.max_gripper_width_m)
+                    maximum_opening_m=fast_grasp_planner.max_gripper_width_m,
+                    alignment_profile_id=fast_grasp_planner.alignment_profile_id)
                 or not all(prepared.scene.has_body(name) for name in (
                     "right_gripper_l_dm_tac_w2m_sensor", "right_gripper_r_dm_tac_w2m_sensor"))):
             raise ValueError("Fast GraspGenX requires the reviewed DMTAC M tool TCP and native sensor assembly.")

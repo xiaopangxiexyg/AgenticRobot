@@ -115,15 +115,30 @@ def test_graspgenx_dmtac_profile_is_separate_from_legacy_4b2_profile() -> None:
 def test_distal_proxy_covers_observed_cad_tip_without_moving_tcp_or_model(finger_sign):
     from robot_motion.grasp_visible_scene import VisibleGraspScene
     geometry = reviewed_graspgenx_dmtac_solid_geometry()
-    # Maximum distal CAD coordinate in the calibrated model frame, measured
-    # on both open DMTAC fingers. The original nominal boundary was 71 mm.
-    tip = np.array([[finger_sign*.04, 0., .07159621825942611]])
+    # The same physical CAD tip is re-expressed after the reviewed model
+    # origin moved +6.65 mm. It must not disappear when nominal solids shrink.
+    tip = np.array([[finger_sign*.04, 0., .06494621825942611]])
     solid_from_tool = geometry.solid_pose(np.eye(4))
     point = tip @ solid_from_tool[:3, :3].T + solid_from_tool[:3, 3]
     view = VisibleGraspScene(points=point, target_mask=np.array([False]), geometry=geometry)
     assert view.collision_counts(np.eye(4), opening_m=geometry.maximum_opening_m) == (0, 1)
-    assert DMTAC_M_GRASPGENX_FINGER_LENGTH_M == .100
-    assert geometry.palm_z_m + geometry.finger_length_m == pytest.approx(.072)
+    assert DMTAC_M_GRASPGENX_FINGER_LENGTH_M == .0867
+    assert geometry.palm_z_m + geometry.finger_length_m == pytest.approx(.0657)
+
+
+def test_shorter_reviewed_model_preserves_the_physical_grasp_center() -> None:
+    from deployments.perception.dmtac_grasp_overlay import (
+        DMTAC_M_GRASPGENX_TOOL_FROM_MODEL_ROTATION,
+    )
+
+    rotation = np.asarray(DMTAC_M_GRASPGENX_TOOL_FROM_MODEL_ROTATION).reshape(3, 3)
+    # This is the former calibrated origin, not another runtime geometry owner.
+    old_origin = np.array([.02283489505130, -.000005278121116, .02618158377488])
+    old_center = old_origin + rotation @ np.array([0., 0., .100/2])
+    geometry = reviewed_graspgenx_dmtac_solid_geometry()
+    current = geometry.solid_pose(np.eye(4))
+    new_center = current[:3, 3] + current[:3, :3] @ np.array([0., 0., .0867/2])
+    np.testing.assert_allclose(new_center, old_center, rtol=0., atol=1e-12)
 
 
 def test_projection_classifies_full_partial_outside_and_behind() -> None:

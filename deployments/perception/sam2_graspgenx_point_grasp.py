@@ -43,6 +43,7 @@ from .dmtac_grasp_overlay import (
     DMTAC_M_GRASPGENX_PROXY_FINGERTIP_EXTENSION_M,
     DMTAC_M_TOOL_TCP_FROM_FLANGE_Z_M,
     reviewed_graspgenx_dmtac_solid_geometry,
+    dmtac_graspgenx_alignment_profile,
 )
 from .grasp_first_path import (
     FirstGraspPathPolicy,
@@ -77,7 +78,7 @@ GRASPGENX_CHECKPOINT_LICENSE = "NVIDIA-Open-Model-License"
 
 # DMTAC M's inner closing volume in the calibrated tool convention.  GraspGenX
 # expects +Z approach and +X closing in the supplied model frame. The reviewed
-# DMTAC origin is 29 mm distal to the nominal palm, not at that boundary. Both
+# DMTAC origin is 24 mm distal to the nominal palm, not at that boundary. Both
 # conditioning boxes and the OBB fingertip depth must therefore use the same
 # axial interval as capture/collision checks; the backend does not rebase it.
 # The linkage keeps opposing pads parallel, so this is a parallel_2f embodiment.
@@ -560,6 +561,7 @@ class Sam2GraspGenXPointGraspPlanner:
         max_gripper_width_m: float = DMTAC_M_GRASPGENX_MAX_OPENING_M,
         max_click_distance_m: float = 0.100,
         solid_geometry: ParallelJawSolidGeometry | None = None,
+        alignment_profile_id: str = DMTAC_M_GRASPGENX_ALIGNMENT_PROFILE_ID,
         orientation_variants_local_axis_degrees: tuple[tuple[str, float], ...] = (),
         orientation_variant_source_limit: int = (
             GRASPGENX_DMTAC_ORIENTATION_VARIANT_SOURCE_LIMIT
@@ -673,34 +675,20 @@ class Sam2GraspGenXPointGraspPlanner:
                 )
             preferred_origins.append(tuple(float(value) for value in preferred_origin_array))
         self.preferred_approach_origins_base_m = tuple(dict.fromkeys(preferred_origins))
-        expected_collision_geometry = ParallelJawSolidGeometry(
-            DMTAC_M_GRASPGENX_PALM_Z_M,
-            DMTAC_M_GRASPGENX_FINGER_LENGTH_M + DMTAC_M_GRASPGENX_PROXY_FINGERTIP_EXTENSION_M,
-            DMTAC_M_GRASPGENX_FINGER_THICKNESS_M,
-            DMTAC_M_GRASPGENX_PAD_HEIGHT_M,
-            self.max_gripper_width_m,
-        )
-        self._solid_geometry = (
-            solid_geometry
-            if solid_geometry is not None
-            else reviewed_graspgenx_dmtac_solid_geometry(
-                maximum_opening_m=self.max_gripper_width_m
-            )
-        )
+        self._alignment = dmtac_graspgenx_alignment_profile(alignment_profile_id)
+        expected_collision_geometry = self._alignment.collision_geometry(
+            maximum_opening_m=self.max_gripper_width_m)
+        self._solid_geometry = solid_geometry if solid_geometry is not None else expected_collision_geometry
         if not isinstance(self._solid_geometry, ParallelJawSolidGeometry):
             raise TypeError("solid_geometry must be typed")
-        if (
-            replace(
-                self._solid_geometry,
-                tool_from_solid_xyz_m=(0, 0, 0),
-                solid_yaw_rad=0,
-                tool_from_solid_rotation=_DMTAC_GRASPGENX_IDENTITY_ROTATION,
-            )
-            != expected_collision_geometry
-        ):
-            raise ValueError(
-                "GraspGenX adapter requires the reviewed nominal DMTAC M dimensions"
-            )
+        def dimensions(geometry):
+            return replace(geometry, tool_from_solid_xyz_m=(0, 0, 0), solid_yaw_rad=0,
+                tool_from_solid_rotation=_DMTAC_GRASPGENX_IDENTITY_ROTATION)
+        if dimensions(self._solid_geometry) != dimensions(expected_collision_geometry):
+            raise ValueError("GraspGenX adapter requires the selected reviewed nominal DMTAC M dimensions")
+        if (self._alignment.source_content_hash is not None
+                and self._solid_geometry != expected_collision_geometry):
+            raise ValueError("Explicit v5 alignment cannot use another profile's geometry or transform")
         self._lock = threading.RLock()
         self._started = False
         self._closed = False
@@ -836,9 +824,11 @@ class Sam2GraspGenXPointGraspPlanner:
                 },
                 "gripper": {
                     "profile": "DMTAC_M",
-                    "graspgenx_alignment_profile": DMTAC_M_GRASPGENX_ALIGNMENT_PROFILE_ID,
+                    "graspgenx_alignment_profile": self._alignment.profile_id,
+                    **({"alignment_source_content_hash": self._alignment.source_content_hash}
+                       if self._alignment.source_content_hash is not None else {}),
                     "solid_geometry": asdict(self.solid_geometry),
-                    "sweep_volume_v1": DMTAC_M_GRASPGENX_SWEEP_VOLUME_V1,
+                    "sweep_volume_v1": self._alignment.sweep_volume(),
                     "model_base_from_output_z_m": 0.0,
                     "maximum_opening_m": self.max_gripper_width_m,
                     "width_clearance_m": DMTAC_M_GRASPGENX_WIDTH_CLEARANCE_M,
@@ -877,10 +867,10 @@ class Sam2GraspGenXPointGraspPlanner:
                         DMTAC_M_GRASPGENX_GRASP_CENTER_FROM_TACTILE_XYZ_M
                     ),
                     "grasp_center_from_tactile_z_m": DMTAC_M_GRASPGENX_GRASP_CENTER_FROM_TACTILE_Z_M,
-                    "model_palm_z_m": DMTAC_M_GRASPGENX_PALM_Z_M,
-                    "finger_length_m": DMTAC_M_GRASPGENX_FINGER_LENGTH_M,
-                    "finger_thickness_m": DMTAC_M_GRASPGENX_FINGER_THICKNESS_M,
-                    "pad_height_m": DMTAC_M_GRASPGENX_PAD_HEIGHT_M,
+                    "model_palm_z_m": self._alignment.nominal_geometry.palm_z_m,
+                    "finger_length_m": self._alignment.nominal_geometry.finger_length_m,
+                    "finger_thickness_m": self._alignment.nominal_geometry.finger_thickness_m,
+                    "pad_height_m": self._alignment.nominal_geometry.pad_height_m,
                     "tool_tcp_from_flange_m": [
                         0.0,
                         0.0,
@@ -1165,7 +1155,7 @@ class Sam2GraspGenXPointGraspPlanner:
         try:
             grasps, scores = self.client.infer_object(
                 # OBB top is gravity aligned; fuse before this single invocation.
-                target_points_base, sweep_volume_params=DMTAC_M_GRASPGENX_SWEEP_VOLUME_V1,
+                target_points_base, sweep_volume_params=self._alignment.sweep_volume(),
                 planner=self.planner, num_grasps=self.num_grasps,
                 score_threshold=self.score_threshold, top_k=self.server_top_k)
         finally:
@@ -1288,7 +1278,7 @@ class Sam2GraspGenXPointGraspPlanner:
             tool_from_solid_rotation=_DMTAC_GRASPGENX_IDENTITY_ROTATION,
         )
         capture_geometry = replace(
-            grasp_geometry, finger_length_m=DMTAC_M_GRASPGENX_FINGER_LENGTH_M)
+            grasp_geometry, finger_length_m=self._alignment.nominal_geometry.finger_length_m)
         # Fast-search quality only. Reuse one request-local normal estimate;
         # ordinary candidate ordering and collision point arrays stay intact.
         surface_normals = surface_confidence = None
@@ -1344,14 +1334,14 @@ class Sam2GraspGenXPointGraspPlanner:
             "closest_downward_target_center_tcp_x_m": None,
             "closest_downward_target_center_tcp_y_m": None,
             "closest_downward_target_center_tcp_z_m": None,
-            "capture_palm_z_m": DMTAC_M_GRASPGENX_PALM_Z_M,
+            "capture_palm_z_m": self._alignment.nominal_geometry.palm_z_m,
             "capture_fingertip_z_m": (
-                DMTAC_M_GRASPGENX_PALM_Z_M + DMTAC_M_GRASPGENX_FINGER_LENGTH_M
+                self._alignment.nominal_geometry.palm_z_m + self._alignment.nominal_geometry.finger_length_m
             ),
-            "capture_half_pad_height_m": DMTAC_M_GRASPGENX_PAD_HEIGHT_M / 2.0,
+            "capture_half_pad_height_m": self._alignment.nominal_geometry.pad_height_m / 2.0,
             "capture_coordinate_frame": "grasp_geometry",
             "collision_opening_m": self.max_gripper_width_m,
-            "graspgenx_alignment_profile": DMTAC_M_GRASPGENX_ALIGNMENT_PROFILE_ID,
+            "graspgenx_alignment_profile": self._alignment.profile_id,
             "visible_collision_scope": (
                 "target_surface_terminal_proxy_plus_capture_filtered_"
                 "background_terminal_proxy"
@@ -1554,8 +1544,8 @@ class Sam2GraspGenXPointGraspPlanner:
                         if previous is None
                         else combine(float(previous), visible_collision_opening)
                     )
-            palm_z = DMTAC_M_GRASPGENX_PALM_Z_M
-            fingertip_z = palm_z + DMTAC_M_GRASPGENX_FINGER_LENGTH_M
+            palm_z = self._alignment.nominal_geometry.palm_z_m
+            fingertip_z = palm_z + self._alignment.nominal_geometry.finger_length_m
             # Keep the closing-axis centre close to the jaw mid-plane, while
             # requiring overlap (rather than centroid containment) on the pad
             # height and finger-length axes.  The latter is important for tall
@@ -1569,8 +1559,8 @@ class Sam2GraspGenXPointGraspPlanner:
                 0.0,
                 abs(float(target_center[0]))
                 - DMTAC_M_GRASPGENX_WIDTH_CLEARANCE_M,
-                float(low[1]) - DMTAC_M_GRASPGENX_PAD_HEIGHT_M / 2.0,
-                -DMTAC_M_GRASPGENX_PAD_HEIGHT_M / 2.0 - float(high[1]),
+                float(low[1]) - self._alignment.nominal_geometry.pad_height_m / 2.0,
+                -self._alignment.nominal_geometry.pad_height_m / 2.0 - float(high[1]),
                 palm_z - float(high[2]),
                 float(low[2]) - fingertip_z,
             )
@@ -1627,8 +1617,8 @@ class Sam2GraspGenXPointGraspPlanner:
                     and abs(float(target_center[0])) > DMTAC_M_GRASPGENX_WIDTH_CLEARANCE_M
                 ):
                     yz_violation = max(
-                        0.0, float(low[1]) - DMTAC_M_GRASPGENX_PAD_HEIGHT_M / 2.0,
-                        -DMTAC_M_GRASPGENX_PAD_HEIGHT_M / 2.0 - float(high[1]),
+                        0.0, float(low[1]) - self._alignment.nominal_geometry.pad_height_m / 2.0,
+                        -self._alignment.nominal_geometry.pad_height_m / 2.0 - float(high[1]),
                         palm_z - float(high[2]), float(low[2]) - fingertip_z,
                     )
                     shift = float(target_center[0])
@@ -2981,6 +2971,10 @@ class Sam2GraspGenXPointGraspPlanner:
                 if len(selected_indices) == maximum:
                     break
         return representative_indices, selected_indices
+
+    @property
+    def alignment_profile_id(self) -> str:
+        return self._alignment.profile_id
 
     @property
     def solid_geometry(self) -> ParallelJawSolidGeometry:

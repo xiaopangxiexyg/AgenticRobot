@@ -8,6 +8,11 @@ deployments; only this lower-owned launcher and its published manifest change.
 
 from __future__ import annotations
 
+from deployments.dmtac_graspgenx_alignment_ids import (
+    DMTAC_M_GRASPGENX_ALIGNMENT_PROFILE_ID,
+    DMTAC_M_GRASPGENX_ALIGNMENT_PROFILE_IDS,
+)
+
 import argparse
 import json
 import os
@@ -48,6 +53,9 @@ def build_parser() -> argparse.ArgumentParser:
             "This starts no Agent planner and connects no real device."
         ),
     )
+    parser.add_argument("--graspgenx-alignment-profile",
+        choices=DMTAC_M_GRASPGENX_ALIGNMENT_PROFILE_IDS, default=DMTAC_M_GRASPGENX_ALIGNMENT_PROFILE_ID,
+        help="Default v5 nominal alignment; select v4 explicitly for legacy geometry.")
     parser.add_argument(
         "--socket-path",
         type=Path,
@@ -460,7 +468,7 @@ def _fast_grasp_model_from_args(parser, args):
         device=args.point_grasp_device)
     return Sam2GraspGenXPointGraspPlanner(model_spec=spec, point_segmenter=localizer,
         client=GraspGenXInProcessBackend(model_spec=spec, source_root=args.graspgenx_source_root,
-            device=args.point_grasp_device), solid_geometry=reviewed_graspgenx_dmtac_solid_geometry(),
+            device=args.point_grasp_device), alignment_profile_id=getattr(args, "graspgenx_alignment_profile", DMTAC_M_GRASPGENX_ALIGNMENT_PROFILE_ID),
         orientation_variants_local_axis_degrees=(
             GRASPGENX_DMTAC_REACHABILITY_ORIENTATION_VARIANTS_LOCAL_AXIS_DEG),
         enable_finger_exchange=True)
@@ -469,6 +477,8 @@ def _fast_grasp_model_from_args(parser, args):
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.graspgenx_alignment_profile != DMTAC_M_GRASPGENX_ALIGNMENT_PROFILE_ID and not args.enable_fast_grasp:
+        parser.error("--graspgenx-alignment-profile requires --enable-fast-grasp")
     if args.motion_side == "left" and (
         args.enable_fast_grasp
         or args.enable_grippers

@@ -44,6 +44,9 @@ from deployments.perception.sam2_graspgenx_point_grasp import (
 )
 from deployments.perception.sam2_vgn_point_grasp import Sam2VgnPointGraspPlanner
 from deployments.perception.dmtac_grasp_overlay import (
+    DMTAC_M_GRASPGENX_FINGER_LENGTH_M,
+    DMTAC_M_GRASPGENX_PALM_Z_M,
+    DMTAC_M_GRASPGENX_PROXY_FINGERTIP_EXTENSION_M,
     reviewed_4b2_cad_solid_geometry,
     reviewed_graspgenx_dmtac_solid_geometry,
 )
@@ -602,7 +605,7 @@ def test_client_sends_dmtac_sweep_volume_and_sorts_top_k() -> None:
     assert request["sweep_volume_params"]["gripper_type"] == 0
     np.testing.assert_allclose(
         request["sweep_volume_params"]["extents_open"],
-        (0.0705, 0.030, 0.100),
+        (0.0705, 0.030, 0.0867),
     )
     assert scores.tolist() == pytest.approx([0.8])
     np.testing.assert_allclose(grasps[0], second)
@@ -1667,7 +1670,7 @@ def test_capture_support_is_available_to_selector_but_not_public_candidates(tmp_
         planner.close()
 
 
-def _axial_pool(tmp_path, *, enabled=True, background=False, count=1, target_z=.570,
+def _axial_pool(tmp_path, *, enabled=True, background=False, count=1, tip_inset_m=.001,
                 deep_prefix=0, priority=None):
     planner, _, depth, options = _shared_proposal_fixture(tmp_path)
     camera_from_model = np.repeat(np.eye(4)[None], count, axis=0)
@@ -1675,12 +1678,13 @@ def _axial_pool(tmp_path, *, enabled=True, background=False, count=1, target_z=.
     camera_from_model[:deep_prefix, 2, 3] = .515
     camera_from_model[:, 0, 3] = np.linspace(-.003, .003, count) if count > 1 else 0.
     base_from_camera = np.array([[0., 0., 1., .1], [0., 1., 0., -.2], [-1., 0., 0., .3], [0., 0., 0., 1.]])
+    target_z = .5 + DMTAC_M_GRASPGENX_PALM_Z_M + DMTAC_M_GRASPGENX_FINGER_LENGTH_M - tip_inset_m
     target = np.array([[-.01, 0., target_z], [0., 0., target_z], [.01, 0., target_z]])
     geometry = planner.solid_geometry
     from dataclasses import replace
     model_geometry = replace(geometry, tool_from_solid_xyz_m=(0., 0., 0.),
         solid_yaw_rad=0., tool_from_solid_rotation=(1., 0., 0., 0., 1., 0., 0., 0., 1.))
-    points = np.concatenate((target, [[.039, 0., .580]])) if background else target
+    points = np.concatenate((target, [[.039, 0., target_z + .010]])) if background else target
     scene = VisibleGraspScene(points=points, target_mask=np.arange(len(points)) < len(target), geometry=model_geometry)
     counts = {}
     pool = planner._rank_pool(base_from_camera @ camera_from_model, np.full(count, .9),
@@ -1757,7 +1761,7 @@ def test_axial_is_default_off_and_its_generation_is_bounded(tmp_path):
 
 
 def test_axial_does_not_spend_proposals_on_already_deep_captures(tmp_path):
-    _, pool, counts, _ = _axial_pool(tmp_path, target_z=.560)
+    _, pool, counts, _ = _axial_pool(tmp_path, tip_inset_m=.011)
     assert counts["axial_variant_attempted"] == counts["axial_variant_source_count"] == 0
     assert all(c.axial_parent_index is None for c in pool.candidates)
 
@@ -1940,7 +1944,7 @@ def test_fast_failure_reports_complete_rejection_counts_and_bounded_native_examp
 
 def test_dmtac_model_conditioning_and_solid_share_axial_origin():
     # The reviewed model origin is not its palm. An origin-free length would
-    # tell OBB generation to place the fingertips 29 mm beyond the real solid.
+    # tell OBB generation to place the fingertips 24 mm beyond the real solid.
     geometry = reviewed_graspgenx_dmtac_solid_geometry()
     params = DMTAC_M_GRASPGENX_SWEEP_VOLUME_V1
     for state in ("open", "mid"):
@@ -1949,10 +1953,11 @@ def test_dmtac_model_conditioning_and_solid_share_axial_origin():
         low, high = offset - half, offset + half
         assert low[2] == pytest.approx(geometry.palm_z_m)
         assert high[2] == pytest.approx(params["fingertip_depth"])
-        # Collision alone includes the reviewed 1 mm CAD tip extension. It is
+        # Collision alone includes the reviewed CAD tip extension. It is
         # not extra physical reach for the neural or OBB grasp proposals.
         assert high[2] < geometry.palm_z_m + geometry.finger_length_m
-        assert geometry.palm_z_m + geometry.finger_length_m - high[2] == pytest.approx(.001)
+        assert geometry.palm_z_m + geometry.finger_length_m - high[2] == pytest.approx(
+            DMTAC_M_GRASPGENX_PROXY_FINGERTIP_EXTENSION_M)
 
 
 @pytest.mark.parametrize("padding", [-.001, float("nan"), float("inf"), True])
