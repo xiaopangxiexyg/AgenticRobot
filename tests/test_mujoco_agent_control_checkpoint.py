@@ -11,6 +11,11 @@ from robot_motion.action.admission_checkpoint import (
     capture_source_admission,
     restore_source_admission,
 )
+from robot_motion.action.authoritative_checkpoint import capture_authoritative_control
+from robot_motion.action.checkpoint_codec import (
+    decode_control_checkpoint,
+    encode_control_checkpoint,
+)
 from robot_motion.action.decision_checkpoint import (
     capture_decision_owners,
     restore_decision_owners,
@@ -225,8 +230,33 @@ def test_native_no_model_target_components_share_an_exact_clock_and_history(
             np.testing.assert_array_equal(
                 getattr(restored_rig.scene.data, name), getattr(scene.data, name)
             )
-        # No missing authority/gate/IK/trace owner is invented by this test.
-        # A complete runtime/Gateway resume remains a separate integration.
+        # Exercise the complete core cut with a real nonzero Cartesian command
+        # through the existing target, including IK, dispatch and measurement.
+        clock.advance_to(10.2)
+        moved = pose_matrix_to_xyzquat(
+            capture_mujoco_sim_hil_tool_tcp_pose_by_side(scene, prepared.task_config)[
+                "right"
+            ]
+        )
+        moved[0] += 0.005
+        assert runtime.submit_component_action(
+            ComponentAction(
+                action_schema=profile.action_schema,
+                values_by_component={"right_arm": moved},
+            ),
+            source_event_id="test:moved-target",
+        ).accepted
+        executed = runtime.step(physics_ticks_after_dispatch=30)
+        assert executed.status == "dispatched"
+        clock.advance_to(10.3)
+        full_core = capture_authoritative_control(core)
+        assert full_core.state["_active_segment_by_group"]
+        encoded = encode_control_checkpoint(full_core)
+        decoded = decode_control_checkpoint(encoded, max_bytes=16 * 1024 * 1024)
+        assert encode_control_checkpoint(decoded) == encoded
+        assert decoded.state["_previous_decision_id"] == executed.decision.decision_id
+        # These components are not published as a restored target. Its IK,
+        # observation and lifecycle closure remain a separate integration.
     finally:
         if restored_rig is not None:
             restored_rig.close()

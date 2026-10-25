@@ -1,10 +1,49 @@
 # MuJoCo checkpoint 组件与接入进度
 
-2026-10-24：继续原隔离分支，并合入固定 development `05b769efe9c5`，保留其
-primitive scene v2 与观察改进。在 native scene、acceleration planner 和 actuated
+2026-10-25：继续原隔离分支，并合入固定 development `b9286ded3fcc`，保留其
+primitive scene v2、观察和 DMTAC 对齐改进。在 native scene、acceleration planner 和 actuated
 owner 组件上新增完整 manual execution rig 的可信内部 cut；随后补齐 source admission、
 execution authority、decision owners 三个控制状态组件及原 no-model target 的时钟接缝。
 完整 target、Gateway 会话及 RPent 联合恢复仍待装配，现有入口不自动启用恢复。
+
+## 完整逻辑 control core 的冷恢复
+
+`robot_motion.action.authoritative_checkpoint` 将三个已验证组件与 authority、gate、
+candidate authorization stores、active segments、previous selection、完整 trace journal
+及各自水位合为同一内部 bundle。首片限定 immediate activation、完整同步 decision/
+admission/取消事务结束且调用方排他的边界；不支持 active scheduled segment 或独立
+异步 ACK。后端、IK、安全、adapter、observer 等外层状态仍由 target profile 负责。
+
+原 `AuthoritativeControlRuntime` 的私有 `_checkpoint` 构造参数在普通依赖/能力检查
+之后、owner 创建与 grant 之前装配恢复状态。普通初始 owner 注入仍按原 initial epoch
+检查；恢复既有 live epoch 不改写 `config.initial_*`，不新发 token，不重放旧 trace。
+绑定 backend 名称；stateless arbiter、trace context、compound-profile 派生索引偏离
+固定实现时拒绝。回调来源及独立 backend 的证明由外层 profile/store 完成。
+
+验证不仅检查每个 owner 自身的 hash，还通过原 projector 核对它们与 journal 同源。
+按已应用的 dispatch/cancel/ACK 事实检查最终 active/previous/HOLD 状态，拒绝将另一个
+合法分支的同 ID proposal 拼入当前历史，或复活已经被 HOLD 清除的 segment。该过程
+只核对事实，不运行 arbiter、工具、IK 或动作。segment generation 与 execution registry
+generation 是不同计数，不强迫相等；合法 READY＋hold_active、已过期但尚未处理的
+segment、已 prune proposal 的旧 authorization/previous 引用均保留。
+
+`robot_motion.action.checkpoint_codec` 提供固定 record 白名单的 data-only 字节编码，
+不接受载荷指定模块/工厂，不保存 Python callable，不用 pickle。未知字段/类型、重复
+JSON 键、错误数组字节数与输入 byte budget 均拒绝；解码不等于恢复或来源认证。
+外层 store 负责可信来源、固定实现/profile、原子发布和磁盘配额；`max_bytes` 不等于
+进程内存硬上限。此格式只承载逻辑 core，不是完整 MuJoCo 或 Gateway 节点格式。
+
+```bash
+bash scripts/run_pytest.sh tests/test_authoritative_checkpoint.py tests/test_authoritative_checkpoint_codec.py -q
+```
+
+验证包括非空 active 后再接纳新 proposal/dispatch、取消后非零 epoch、READY＋HOLD、
+非空 authority 与 prune 后 replay authorization、旧状态回退、跨历史拼接、错误
+embodiment、terminal 伪装及目的配置错配。新解释器从磁盘读取后恢复独立 fake backend
+并继续原到期取消，事实 hash 与原进程相同。另在真实 CAD target 的 Cartesian 请求
+变化后，经过原 IK/dispatch 和30个 physics tick，对完整非空 core 做编码往返。
+前者证明逻辑 core 冷续跑；后者证明真实执行路径的数据可封存，均不证明恢复后的
+完整 native target 或 Gateway 已可执行。原生任务成功、真实模型与硬件未在此验收。
 
 ## 已保存的实现
 
@@ -150,7 +189,7 @@ fork 子进程验证检查的是独立恢复与同输入续跑，不等于 fresh
 cancel、register 或 acknowledge。Source proposal 的 admission 必须位于所属 epoch
 激活与被替换之间；合法旧 epoch 的保留事实仍保留，不能只检查当前 active epoch。
 全局 admission 水位可以高于所有 source 记录，因为 authority/gate 等 store 共享它；
-这些 store 的状态仍须由后续父组件补齐，不能只恢复 source 就发布完整 runtime。
+这些 store 的状态由上述完整 core bundle 关联装配，不能只恢复 source 就发布 runtime。
 
 Decision pending evidence 数必须严格等于 `min(total_count, evidence_capacity)`。
 否则恢复时会改变下一个 tick 的因果证据和 hash。两项先失败的反例分别覆盖截断前、
@@ -199,9 +238,9 @@ proposal/epoch/permit/schedule 状态及 qpos/qvel/ctrl/warmstart，另验证真
 ## 尚未完成，不能据此放开上层
 
 1. Gateway admission、物理线程和控制 owner 的联合静止边界。
-2. 基于已完成的 source/执行权/decision 组件补齐 authority、执行 gate、candidate
-   authorization、active/pending segment、trace 水位和 target 的保留引用；统一证明
-   来自同一 cut，再接 IK/safety 的连续性与已知 observer。不能将明确排除的绑定放行。
+2. 将已完成的完整 logical core 与 rig 接到实际 target，补齐 target 的保留引用、
+   trace/observation 游标与 IK/safety 连续性；统一证明同一 cut。scheduled/pending
+   activation 等未纳入本片资格的绑定，不能直接放行。
 3. 新实例中 FK、collision、payload、observer、scratch 等消费者的统一绑定。
 4. profile 身份、持久化/原子提交、历史产物与恢复分支的来源关系。
 5. sleep 混合状态、完整 no-model profile、渲染和远端组合验收。
