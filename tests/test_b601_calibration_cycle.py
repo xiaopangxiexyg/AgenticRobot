@@ -74,8 +74,42 @@ def advance(replay, *, ticks=40000, until=None, permit=True, move=True):
                 and abs(q[2] - replay.audit["anchor_rad"]) < 0.001
             ):
                 q[2] += 0.0001 if state["target_offset_rad"] > 0 else -0.0001
-        replay.tick(q, permit=permit)
+        replay.tick(q, permit=permit,
+            heartbeat_active=batch["active"] if until is None else None)
     pytest.fail(str(replay.controller.status()["automatic_calibration"]["cycle"]))
+
+
+@pytest.mark.parametrize("driver", ["automatic", "cycle"])
+def test_replay_driver_refreshes_heartbeat_after_callback_stops_owner(settings, monkeypatch, driver):
+    replay = AcquisitionReplay(settings) if driver == "automatic" else replay_cycle(settings)
+    replay.begin()
+    replay.tick()
+    assert replay.controller.status()["automatic_calibration"]["active"]
+    submitted = []
+    submit = replay.controller.submit
+
+    def record_submit(action, **values):
+        submitted.append(action)
+        return submit(action, **values)
+
+    def stop_owner(state):
+        batch = state if driver == "automatic" else state["automatic_calibration"]
+        assert batch["active"]
+        replay.controller.owner_stopped(now_sec=replay.now, reason="callback_stop")
+        return False
+
+    def stop_at_step(**values):
+        raise RuntimeError("test_step_boundary")
+
+    monkeypatch.setattr(replay.controller, "submit", record_submit)
+    monkeypatch.setattr(replay.controller, "step", stop_at_step)
+    with pytest.raises(RuntimeError, match="test_step_boundary"):
+        if driver == "automatic":
+            replay.run(ticks=1, until=stop_owner)
+        else:
+            advance(replay, ticks=1, until=stop_owner)
+    assert submitted == []
+    assert replay.controller.status()["automatic_calibration"]["state"] == "cancelled"
 
 
 @pytest.mark.parametrize("offset", [0.02, math.radians(20)])
@@ -639,6 +673,7 @@ def _exercise_transfer_with_quantized_stiction_plant(
     controller.submit("select_mode", now_sec=replay.now, operation_mode="supported_cycle")
     replay.tick()
     controller.submit("arm", now_sec=replay.now+.001, operation_mode="supported_cycle")
+    batch = controller.status()["automatic_calibration"]
     def plant_step(q, velocity):
         # Inertia + dry friction + angle-dependent load/cogging. Gravity is
         # residual can hold at rest but exceed kinetic friction after release,
@@ -655,7 +690,8 @@ def _exercise_transfer_with_quantized_stiction_plant(
                 q += velocity*.001
         feedback = list(replay.q)
         feedback[2] = round(q/.000383496)*.000383496
-        replay.tick(feedback, dt_sec=control_dt)
+        # The plant calculation does not mutate the controller between ticks.
+        replay.tick(feedback, dt_sec=control_dt, heartbeat_active=batch["active"])
         return q, velocity
     q, velocity = 0., 0.
     maximum_speed = maximum_torque = maximum_resume = regulation_ticks = feedback_ticks = 0
@@ -667,7 +703,8 @@ def _exercise_transfer_with_quantized_stiction_plant(
         maximum_resume = max(maximum_resume, motion.get("speed_governor_resume_count", 0))
         regulation_ticks += motion.get("continuous_speed_scale") is not None and motion["continuous_speed_scale"] < 1.
         feedback_ticks += (replay.audit.get("tracking_recovery") or {}).get("tracking_velocity_correction_nm", 0.) > 0.
-        cycle = controller.status()["automatic_calibration"]["cycle"]
+        batch = controller.status()["automatic_calibration"]
+        cycle = batch["cycle"]
         replay.audits.clear()
         replay.records.clear()
         if cycle["phase"] != "positioning_out":
@@ -702,12 +739,14 @@ def _exercise_transfer_with_quantized_stiction_plant(
         # mechanical model above. Then test the SAME native return controller
         # from that actual boundary with a negative physical-motion direction.
         advance(replay, until=lambda s: s["automatic_calibration"]["cycle"]["phase"] == "returning")
-        cycle = controller.status()["automatic_calibration"]["cycle"]
+        batch = controller.status()["automatic_calibration"]
+        cycle = batch["cycle"]
         assert cycle["phase"] == "returning", cycle["reason"]
         q, velocity = replay.q[2], 0.
         for _ in range(round(180/control_dt)):
             q, velocity = plant_step(q, velocity)
-            cycle = controller.status()["automatic_calibration"]["cycle"]
+            batch = controller.status()["automatic_calibration"]
+            cycle = batch["cycle"]
             replay.audits.clear()
             replay.records.clear()
             if cycle["phase"] != "returning":

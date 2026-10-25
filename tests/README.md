@@ -90,6 +90,20 @@ do not establish equivalent coverage. Record this reasoning in the existing
 review, with measured runtime impact when execution cost motivates the change;
 neither net line reductions nor test-count quotas are acceptance criteria.
 
+### B601 虚拟反馈驱动的重复状态读取
+
+`AcquisitionReplay.run` 与 cycle 的 `advance` 在没有 `until` 回调时，复用本次同步
+循环已经读取的 `active` 状态；前者同时复用目标偏移，避免为驱动下一 tick 反复
+深拷贝完整 GUI 历史。`tick` 的默认路径仍实时读取状态。存在回调时，heartbeat
+与目标偏移沿用原有的再次读取行为，因为回调即使返回 `False` 也可能修改控制器。
+回归用例用真实 `owner_stopped` 验证回调之后不会依据旧状态补发 heartbeat。
+
+量化摩擦机械模型在每次 dispatch 后仍读取完整状态，下一 tick 的纯机械计算期间
+复用其中的 `active`；进入返回阶段前重新读取。控制周期、1000 Hz 机械子步、
+240/180 秒循环上限、摩擦与残余负载矩阵、原生回执、驱动阻尼、全部保护校验及
+原有断言保持不变。这只减少测试驱动器中重复的观察开销，不改变生产状态接口，
+也不把虚拟反馈证据当作真机验证。
+
 ### 只读快照重试的采样历史
 
 `test_persistent_failed_state_can_retry_without_restart` 在 `_capture_history`
