@@ -10,17 +10,22 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
+from collection_runtime import stream_sink
 from dataset_contracts.canonical_encoding import canonical_content_hash
 from dataset_contracts.episode_identity import EpisodeCaptureIdentity
 from dataset_contracts.v25p_native_storage import V25P_PARQUET_CHUNK_LAYOUT_V1
 from dataset_contracts.v25p_native import V25pComponentStreamProfileV2
 from dataset_contracts.v22 import PolicyIOLayout
-from dataset_contracts.stream_catalog import NativeStreamContract
+from dataset_contracts.stream_catalog import (
+    NATIVE_STREAM_EPISODE_RELATIVE_ROOT_V1,
+    NativeStreamContract,
+)
 from dataset_interface.v25p_native import load_v25p_native_episode
 from dataset_interface.streams import (
     NativeStreamExternalPayloadReference,
     load_native_stream_episode,
 )
+from teleop_runtime.collection import process_writer
 from teleop_runtime.collection.process_writer import (
     ProcessCollectionConfig,
     ProcessCollectionWorker,
@@ -182,6 +187,216 @@ def _selected_rgb_contract() -> NativeStreamContract:
         compression="none",
         access_role="actor_input",
     )
+
+
+def _run_native_worker_messages(tmp_path, messages, *, active, external=True):
+    """Exercise the child message loop with real temporary writers, no devices."""
+
+    contract = _selected_rgb_contract() if external else _native_q6_contract()
+    bindings = (
+        {
+            contract.stream_id: ProcessExternalNativeStreamBinding(
+                stream_id=contract.stream_id,
+                source_kind="selected_rgb",
+                source_key="front",
+            )
+        }
+        if external
+        else {}
+    )
+    incoming, replies, acknowledgements = queue.Queue(), queue.Queue(), queue.Queue()
+    if active:
+        incoming.put(
+            {
+                "kind": "start_episode",
+                "request_id": 1,
+                "episode_uuid": "native-guard-episode",
+            }
+        )
+    for request_id, message in enumerate(messages, start=2):
+        incoming.put({"request_id": request_id, **message})
+    close_request_id = len(messages) + 2
+    incoming.put({"kind": "close", "request_id": close_request_id})
+    process_writer._worker_main(
+        writer_config=LeRobotV21WriterConfig(
+            root_dir=tmp_path,
+            task_id="native-message-guards",
+            write_parquet=False,
+            write_video=False,
+        ),
+        sample_builder_config=CollectorSampleBuilderConfig(),
+        process_config=ProcessCollectionConfig(worker_nice=0),
+        v25p_shadow_config=None,
+        native_stream_contracts={contract.stream_id: contract},
+        external_stream_bindings=bindings,
+        shm_names=(),
+        input_queue=incoming,
+        reply_queue=replies,
+        ack_queue=acknowledgements,
+    )
+    # The synchronous loop has exited, so no producer can change these queues.
+    messages = [replies.get_nowait() for _ in range(replies.qsize())]
+    replies_by_id = {
+        item["request_id"]: item for item in messages if item["kind"] == "reply"
+    }
+    assert any(item["kind"] == "ready" and item["ok"] for item in messages)
+    if active:
+        assert replies_by_id[1]["ok"]
+    assert replies_by_id[close_request_id]["ok"]
+    assert not list(
+        (tmp_path / NATIVE_STREAM_EPISODE_RELATIVE_ROOT_V1).glob("*/manifest.cjson")
+    )
+    indexes = list(tmp_path.glob("streams/**/samples.cjsonl"))
+    assert bool(indexes) == active
+    assert all(path.stat().st_size == 0 for path in indexes)
+    return replies_by_id, [
+        acknowledgements.get_nowait() for _ in range(acknowledgements.qsize())
+    ]
+
+
+@pytest.mark.parametrize(
+    "kind,mismatch",
+    [
+        (
+            "native_stream_sample",
+            "Native stream sample does not match the active episode.",
+        ),
+        (
+            "native_stream_note_drops",
+            "Native stream drops do not match the active episode.",
+        ),
+        (
+            "freeze_native_stream_episode",
+            "Native stream freeze does not match the active episode.",
+        ),
+        (
+            "seal_native_stream_episode",
+            "Native stream seal does not match the active episode.",
+        ),
+        (
+            "seal_native_stream_episode_after_legacy_finalize",
+            "Post-finalize native stream seal does not match the active episode.",
+        ),
+        (
+            "close_native_stream_episode",
+            "Native stream close does not match the active episode.",
+        ),
+    ],
+)
+@pytest.mark.parametrize(
+    "active,episode_uuid,episode_index",
+    [
+        (False, "wrong-episode", "invalid-index"),
+        (True, "wrong-episode", "invalid-index"),
+        (True, "native-guard-episode", None),
+        (True, "native-guard-episode", 1),
+    ],
+)
+def test_native_worker_message_identity_guards_preserve_error_channel_and_order(
+    tmp_path, kind, mismatch, active, episode_uuid, episode_index
+) -> None:
+    replies, acknowledgements = _run_native_worker_messages(
+        tmp_path,
+        [{
+            "kind": kind,
+            "episode_uuid": episode_uuid,
+            "legacy_episode_index": episode_index,
+        }],
+        active=active,
+    )
+    if not active and kind == "close_native_stream_episode":
+        assert replies[2]["ok"] and replies[2]["result"] is True
+        assert not acknowledgements
+        return
+    if kind == "native_stream_sample":
+        assert 2 not in replies
+        assert len(acknowledgements) == 1
+        result = acknowledgements[0]
+        assert result["kind"] == "worker_error"
+        prefix = "worker.native_stream_append: "
+    else:
+        assert not acknowledgements
+        result = replies[2]
+        assert not result["ok"]
+        prefix = ""
+    if not active:
+        assert result["error"] == prefix + (
+            "RuntimeError: No native stream episode is active in the process worker."
+        )
+    elif episode_index is None:
+        assert result["error"].startswith(prefix + "TypeError: ")
+    else:
+        assert result["error"] == prefix + "ValueError: " + mismatch
+    assert "Traceback" in result["traceback"]
+
+
+@pytest.mark.parametrize(
+    "episode_uuid,episode_index", [("native-guard-episode", 0), ("wrong", None)]
+)
+def test_native_worker_inline_freeze_rejects_mode_before_identity(
+    tmp_path, episode_uuid, episode_index
+) -> None:
+    replies, acknowledgements = _run_native_worker_messages(
+        tmp_path,
+        [{
+            "kind": "freeze_native_stream_episode",
+            "episode_uuid": episode_uuid,
+            "legacy_episode_index": episode_index,
+        }],
+        active=True,
+        external=False,
+    )
+    assert not acknowledgements
+    assert replies[2]["error"] == (
+        "RuntimeError: Inline native streams do not use post-finalize freeze."
+    )
+
+
+def test_native_worker_freeze_failure_and_new_episode_keep_finalize_blocked(
+    tmp_path, monkeypatch
+) -> None:
+    fail_next_freeze = True
+
+    def fail_fsync(fd):
+        raise OSError("injected worker freeze failure")
+
+    class FailFirstFreezeWriter(stream_sink.NativeStreamEpisodeWriter):
+        def freeze_ingestion(self):
+            nonlocal fail_next_freeze
+            if fail_next_freeze:
+                fail_next_freeze = False
+                with monkeypatch.context() as patch:
+                    patch.setattr(stream_sink.os, "fsync", fail_fsync)
+                    return super().freeze_ingestion()
+            return super().freeze_ingestion()
+
+    monkeypatch.setattr(process_writer, "NativeStreamEpisodeWriter", FailFirstFreezeWriter)
+    identity = {"episode_uuid": "native-guard-episode", "legacy_episode_index": 0}
+    replies, acknowledgements = _run_native_worker_messages(
+        tmp_path,
+        [
+            {"kind": "freeze_native_stream_episode", **identity},
+            {"kind": "finalize_episode", "episode_index": 0},
+            {"kind": "freeze_native_stream_episode", **identity},
+            {"kind": "close_native_stream_episode", **identity},
+            {"kind": "discard_episode", "episode_index": 0},
+            {"kind": "start_episode", "episode_uuid": "next-native-episode"},
+            {"kind": "finalize_episode", "episode_index": 0},
+        ],
+        active=True,
+    )
+    assert not acknowledgements
+    assert replies[2]["error"] == "OSError: injected worker freeze failure"
+    expected = (
+        "RuntimeError: External native stream episode must freeze "
+        "before legacy finalize."
+    )
+    assert replies[3]["error"] == expected
+    assert replies[4]["ok"] and replies[4]["result"] is True
+    assert replies[5]["ok"] and replies[5]["result"] is True
+    assert replies[6]["ok"] and replies[6]["result"]["discarded"]
+    assert replies[7]["ok"] and replies[7]["result"] == 0
+    assert replies[8]["error"] == expected
 
 
 def test_process_collection_worker_writes_and_finalizes_without_hardware(tmp_path) -> None:

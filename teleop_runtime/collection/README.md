@@ -36,6 +36,12 @@ artifact receipt，native manifest才seal；reader会复核artifact hash并返�
 它只保存decision/sample已选中的RGB，同一源帧复用时native index只记一次，不等于相机
 native-rate stream。高频RGBD/tactile artifact bundle及GUI/真机profile仍未启用。
 
+子进程内的冻结事实只由 `NativeStreamEpisodeWriter.ingestion_frozen` 提供；它在所有
+index 的 `fsync` 成功后才变为真，seal/close 后仍可读取，但不表示 writer 仍可操作。
+worker 不再保存另一份冻结标志。六类 native stream 消息共用 episode 身份校验，保留各自的
+模式检查顺序和错误通道；父进程的 RPC 确认状态与 legacy episode 防重复提交保护仍独立保留。
+冻结失败不能放行 legacy finalize；新 episode 使用新的 writer，不继承旧 writer 的冻结事实。
+
 `--collection-worker-mode thread` 保留原实现作为回退。force/impedance的 `auto` 始终
 解析为 `thread`，因此该变更不改变力控数采链路。这里的headless兼容入口也仍使用原有
 共享writer runtime；不要从 `legacy/` 导入进程实现。
