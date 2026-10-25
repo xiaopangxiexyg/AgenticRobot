@@ -13,13 +13,15 @@ Usage:
     --rebot-source-root /vendor/rebot --motorbridge-root /vendor/bridge --output-root /runs \
     [--recipe near-zero|four-centres] [--field-report /closed-source.json]
   remote_b601_managed_cycle.sh -H HOST --project /repo --python /env/bin/python \
-    --operation status|stop --run-directory /runs/managed-ID
+    --operation status|stop|supported-disable --run-directory /runs/managed-ID
 
 Purpose-built B601 single-cycle management. Start requires explicit
 hardware authorization. Fixed existing owner/profile/limits; no arbitrary
 command, profile, torque override, reset, retry or kill. Stop requests protective
 hold only; it cannot request full disable. Status and preflight do not send motor
 commands. --dry-run previews without SSH. No authority token is created.
+supported-disable requires the operator's explicit physical-support confirmation;
+it only requests the existing GUI full-disable protocol for a stopped batch.
 EOF
   common_ssh_usage
 }
@@ -46,10 +48,14 @@ while [[ $# -gt 0 ]]; do
 done
 [[ -n "$REMOTE_HOST" ]] || die 'explicit -H/--host is required'
 [[ "$PROJECT" == /* && "$PROJECT" != / ]] || die '--project must be an absolute checkout path'
-case "$OPERATION" in preflight|start|status|stop) ;; *) die 'invalid --operation';; esac
+case "$OPERATION" in preflight|start|status|stop|supported-disable) ;; *) die 'invalid --operation';; esac
 assert_python_bin_name "$PYTHON_BIN"
 finalize_common_ssh
 print_wrapper_header 'purpose-built B601 single-cycle; preflight/status read-only, start motion, stop protective hold' "$PROJECT"
+if [[ "$OPERATION" == supported-disable ]]; then
+  [[ ${#ARGS[@]} -eq 2 && "${ARGS[0]}" == --run-directory ]] || die 'supported-disable requires only --run-directory'
+  printf '[supported-disable] explicit operator support required; existing owner protocol only\n'
+fi
 command="cd -- $(shell_single_quote "$PROJECT") && exec $(shell_single_quote "$PYTHON_BIN") -u -m control_station.b601_torque_console.managed_run"
 command+=" --operation $(shell_single_quote "$OPERATION")"
 for value in "${ARGS[@]}"; do command+=" $(shell_single_quote "$value")"; done

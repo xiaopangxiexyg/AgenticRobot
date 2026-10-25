@@ -137,6 +137,36 @@ def test_managed_stop_cannot_escalate_to_full_disable(tmp_path, monkeypatch):
         assert result['full_disable_requested'] is False
 
 
+@pytest.mark.parametrize('phase,matching', [('running', True), ('stopped', False), ('stopped', True)])
+def test_supported_disable_wrapper_only_addresses_stopped_identity_bound_owner(tmp_path, monkeypatch, phase, matching):
+    monkeypatch.setattr(managed, 'inspect', lambda run: {'launcher_running': True, 'process': {'pid': 2}})
+    monkeypatch.setattr(managed, 'process_matches', lambda receipt: matching)
+    monkeypatch.setattr(managed, 'console_state', lambda *a:
+        ('http://127.0.0.1:1234', {'managed_cycle': {'phase': phase}}))
+    requests = []
+    class Response:
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            return False
+        def read(self):
+            return b'{"ok":true}' if requests else b'<meta name="csrf-token" content="local-token">'
+    def open_url(request, **kwargs):
+        if not isinstance(request, str):
+            assert request.full_url == 'http://127.0.0.1:1234/api/stop'
+            requests.append(json.loads(request.data))
+        return Response()
+    monkeypatch.setattr(managed, 'urlopen', open_url)
+    if phase != 'stopped' or not matching:
+        with pytest.raises(ValueError):
+            managed.request_supported_disable(tmp_path)
+        assert not requests
+    else:
+        result = managed.request_supported_disable(tmp_path)
+        assert requests == [{'action': 'full_disable'}]
+        assert result['full_disable_requested'] and not result['cleanup_confirmed']
+
+
 def test_live_endpoint_uses_flushed_child_log_even_when_launcher_output_is_buffered(tmp_path, monkeypatch):
     run = tmp_path/'managed-live'
     runtime = run/'owner/b601-owner-live/b601_owner.log'

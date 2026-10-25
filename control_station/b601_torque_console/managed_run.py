@@ -243,28 +243,43 @@ def console_state(run, process):
 
 
 def request_protective_hold(run):
+    return _request_stop(run, full_disable=False)
+
+
+def request_supported_disable(run):
+    """Explicit operator-confirmed physical support; never called by the cycle."""
+    return _request_stop(run, full_disable=True)
+
+
+def _request_stop(run, *, full_disable):
     state = inspect(run)
     if not state['launcher_running']:
         raise ValueError('the exact managed launcher is no longer running')
-    url, _ = console_state(run, state['process'])
+    url, snapshot = console_state(run, state['process'])
+    if full_disable and (snapshot.get('managed_cycle') or {}).get('phase') not in {
+        'stopped', 'operator_required', 'cancelled', 'origin_confirmed',
+    }:
+        raise ValueError('supported disable requires a stopped batch')
     with urlopen(url, timeout=2) as response:
         page = response.read().decode()
     token = re.search(r'<meta name="csrf-token" content="([A-Za-z0-9_-]+)">', page)
     if token is None:
         raise ValueError('local console token is unavailable')
-    request = Request(url+'/api/stop', method='POST', data=b'{"action":"protective_hold"}',
+    action = 'full_disable' if full_disable else 'protective_hold'
+    request = Request(url+'/api/stop', method='POST', data=json.dumps({'action':action}).encode(),
         headers={'Content-Type': 'application/json', 'Origin': url, 'X-B601-Console-Token': token[1]})
     if not process_matches(state['process']):
         raise ValueError('managed process identity changed before the stop request')
     with urlopen(request, timeout=2) as response:
         json.load(response)
-    return {'status': 'PROTECTIVE_HOLD_REQUESTED', 'run_directory': str(run),
-            'full_disable_requested': False, 'automatic_retry': False}
+    return {'status': 'SUPPORTED_FULL_DISABLE_REQUESTED' if full_disable else 'PROTECTIVE_HOLD_REQUESTED',
+            'run_directory': str(run), 'cleanup_confirmed': False,
+            'full_disable_requested': full_disable, 'automatic_retry': False}
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--operation', choices=('preflight', 'start', 'status', 'stop'), default='preflight')
+    parser.add_argument('--operation', choices=('preflight', 'start', 'status', 'stop', 'supported-disable'), default='preflight')
     parser.add_argument('--recipe', choices=tuple(PROFILES), default='near-zero')
     parser.add_argument('--expected-revision')
     parser.add_argument('--config', type=Path)
@@ -274,10 +289,11 @@ def main(argv=None):
     parser.add_argument('--output-root', type=Path)
     parser.add_argument('--run-directory', type=Path)
     args = parser.parse_args(argv)
-    if args.operation in {'status', 'stop'}:
+    if args.operation in {'status', 'stop', 'supported-disable'}:
         if args.run_directory is None:
-            parser.error('status/stop require --run-directory')
-        result = inspect(args.run_directory) if args.operation == 'status' else request_protective_hold(args.run_directory)
+            parser.error('status/stop/supported-disable require --run-directory')
+        operation = {'status': inspect, 'stop': request_protective_hold, 'supported-disable': request_supported_disable}
+        result = operation[args.operation](args.run_directory)
     else:
         if any(getattr(args, k) is None for k in ('config', 'rebot_source_root', 'motorbridge_root', 'output_root')):
             parser.error('preflight/start require config, rebot-source-root, motorbridge-root and output-root')

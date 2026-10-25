@@ -169,6 +169,13 @@ SSH 返回后子进程继续执行，连接超时不会以 SIGTERM 杀死控制�
 硬件故障后不自动重试或重新加力；需要人工处理时，保持进程和原有重力／阻尼协议。
 通用 Python/module/pytest wrapper 继续拒绝这些控制入口；不使用新的授权口令或令牌。
 
+若单轮已停止，但未成功回到托架，禁止把采集停止或 RPC 接受当作已经失能。
+操作者在现场确认已经可靠支撑并明确要求失能后，才可显式使用
+`--operation supported-disable --run-directory <returned-directory>`。该操作复用原本地
+GUI 的 `full_disable` 协议，验证启动进程、进程组、运行目录与控制端口身份，且拒绝
+仍在运行的批次；不发送 CAN、不发信号、不修改活动 owner 源码。请求成功只代表接受，
+仍须核对最终 `motor_disable_confirmed` 与 `transport_release.completed`。
+
 ### 冻结抓姿数据的限定探针
 
 `remote_readonly_agent_acceptance.sh` 是另一个显式授权的只读验收入口：仅运行已有
