@@ -92,8 +92,16 @@ core and MuJoCo adapter used for the 20260721 fit; tests compare those hashes to
 fixed historical values rather than silently reinterpreting the fit against
 the current files.
 
-当前运行时源码绑定为 `artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261025_v22.json`。
-V22冻结V21，登记共享 supplied-image localization、真机兼容入口及默认关闭的 MuJoCo 定位。
+当前运行时源码绑定为 `artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261025_v23.json`。
+V23 冻结 V22，登记显式可选的 safe TCP v2、只读连续查询 v1–v5，以及已授权的
+十个调试运动入口归档。86 项输入匹配固定源码提交 `6b36561dc`；直接调用方验收
+为 1,744 通过、1 项原有可选依赖跳过。工具轴证据只覆盖采样参考与 float32
+发布表示；查询不能激活计划。既有运动、观测障碍检查、授权及下层 HOLD owner
+保留。新可选杂物任务显式使用其源合同的 1 kHz，既有 4 kHz 默认不变。
+未重新拟合机械臂响应，不代表新留出数据、模型服务、真机或六路并发调度验收。
+
+历史 V22 为 `artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261025_v22.json`。
+V22 冻结 V21，登记共享 supplied-image localization、真机兼容入口及默认关闭的 MuJoCo 定位。
 真机 v1 的既有契约身份和有界 CAS 读取保持一致；MuJoCo 保留原始图像坐标，
 复用现有分割模型及关闭门禁。更新4项来源，新增4项，共64项源码、65项输入。
 固定631项通过、1项原RPent配对轮子缺失跳过、零失败的消费者报告绑定
