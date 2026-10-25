@@ -1,6 +1,6 @@
 # MuJoCo checkpoint 组件与接入进度
 
-2026-10-25：继续原隔离分支，并合入固定 development `52c30c8cfe8b`，保留其
+2026-10-25：继续原隔离分支，已合入固定 development `4f9f242ab823`，保留其
 primitive scene v2、观察和 DMTAC 对齐改进。在 native scene、acceleration planner 和 actuated
 owner 组件上新增完整 manual execution rig 的可信内部 cut；随后补齐 source admission、
 execution authority、decision owners 三个控制状态组件及原 no-model target 的时钟接缝，
@@ -8,6 +8,15 @@ execution authority、decision owners 三个控制状态组件及原 no-model ta
 本轮进一步将这些 owner 与 runtime 水位通过原 no-model factory 装配成独立的
 manual/immediate target；这是可信内存内分支，不是完整节点磁盘格式。Gateway 会话、
 上层 agent 上下文与 RPent 联合恢复仍待接入，现有入口不自动启用恢复。
+
+当前组合源码 `25d5df1cbfda` 的21模块回归为 **708通过、1跳过、1失败**。
+唯一失败是 `test_current_arm_runtime_binding_uses_exact_current_inputs`：V18冻结源
+绑定与候选的 actuator `core.py`、`agent_skill_target.py`、`runtime.py` 三项源码不同。
+原 V18 文件与其历史验证未改写，arm profile、simulation contract 和 MuJoCo executor
+未更改；不能用原 V18 的验证声明替代当前候选资格。后续须派生独立 source binding，
+登记这三项变化及新增 checkpoint 依赖和固定验证证据，再申请集成，不仅替换旧哈希。
+完整 non-hardware 验收另在预检因缺少固定 B601 子模块 URDF 返回2，未启动任何 shard。
+因此本分支仍是**未准入的独立候选**，不是绿色全仓基线，也未提升 development。
 
 ## Manual no-model target 的独立分支
 
@@ -377,7 +386,8 @@ proposal/epoch/permit/schedule 状态及 qpos/qvel/ctrl/warmstart，另验证真
    开启的 execution observer、外层 safety/plan 的续跑合同。immediate pending reference
    已验证；scheduled segment 及异步 activation 仍未纳入资格，不能直接放行。
 3. 新实例中 FK、collision、payload、observer、scratch 等消费者的统一绑定。
-4. profile 身份、持久化/原子提交、历史产物与恢复分支的来源关系。
+4. 当前候选新的 runtime source binding、完整验收资源，以及 profile 身份、持久化/
+   原子提交、历史产物与恢复分支的来源关系。旧 V18 不能冒充新源码的资格证据。
 5. sleep 混合状态、完整 no-model profile、渲染和远端组合验收。
 6. RPent SDK/runtime/记录前缀与上述下层合同的联合恢复。
 
