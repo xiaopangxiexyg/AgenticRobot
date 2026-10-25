@@ -57,9 +57,11 @@ def test_cached_gateway_models_match_cold_build_and_keep_mutable_state_private(t
 
     monkeypatch.setattr(MujocoScene, "from_contract", compile_scene)
     sessions = []
+    mutated = None
     try:
         for cached in (False, True, True):
             sessions.append(_session([], task=task, use_model_cache=cached))
+            sessions[-1].application.start_observation_ready()
         assert len(compiles) == 2  # One uncached reference, one cold artifact.
         reference, first, second = [s.application.scene for s in sessions]
         fields = (
@@ -77,9 +79,11 @@ def test_cached_gateway_models_match_cold_build_and_keep_mutable_state_private(t
             for name in ("qpos", "qvel", "ctrl"):
                 np.testing.assert_array_equal(getattr(actual.data, name), getattr(reference.data, name))
         assert first.model is not second.model and first.data is not second.data
+        mutated = first, first.data.qpos.copy(), first.model.body_mass.copy()
         first.data.qpos[0] += .1
         first.model.body_mass[-1] += 1.
         sessions.append(_session([], task=task))
+        sessions[-1].application.start_observation_ready()
         third = sessions[-1].application.scene
         assert len(compiles) == 2
         for actual in (second, third):
@@ -89,6 +93,11 @@ def test_cached_gateway_models_match_cold_build_and_keep_mutable_state_private(t
         assert len({id(p) for p in planners}) == len(planners)
         assert all(p._pending_plan is None and not p.active for p in planners)
     finally:
+        if mutated is not None:
+            scene, qpos, mass = mutated
+            scene.data.qpos[:] = qpos
+            scene.model.body_mass[:] = mass
+            scene.forward()
         for session in reversed(sessions):
             assert session.close().accepted
 
