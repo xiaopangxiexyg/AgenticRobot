@@ -376,15 +376,18 @@ class CoordinatedPoseHolding:
             window_span_sec=estimator.span_sec, position_span_rad=estimator.position_span_rad)
         if (not estimator.ready or not relative.ready or latest is None
             or not 0 < self.last_time-latest[0] <= self.motion.max_control_gap_sec):
-            audit["reason"] = "waiting_for_causal_arrival_window" if arrival else "waiting_for_resolved_cruise_motion"
+            audit["reason"] = "waiting_for_causal_arrival_window" if arrival else "waiting_for_causal_cruise_window"
             return 0.0, self.bias[i], audit
         # Zero-count observations are valid for arrival stabilization, even
         # though they cannot establish a moving identification sample. Do not
         # switch back to a different integrator on every quantized plateau.
-        if not arrival and estimator.position_span_rad < 2*(self.motion.position_resolution_rad or 0):
-            audit["reason"] = "waiting_for_resolved_cruise_motion"
-            return 0.0, self.bias[i], audit
-        if not arrival and (reference*velocity <= 0 or reference*(self.goal[i]-self.q[i]) <= 0):
+        # A ready zero-count or reverse-motion window is valid CONTROL
+        # feedback, though it cannot identify moving friction. Falling back
+        # to position-error integration here charges the growing reference
+        # lag into support on every stick/slip plateau, then releases that
+        # stored drive at breakaway. Keep one velocity integrator through
+        # these windows; model admission independently requires real motion.
+        if not arrival and reference*(self.goal[i]-self.q[i]) < 0:
             audit["reason"] = "motion_not_aligned_with_reference"
             return 0.0, self.bias[i], audit
         # Both slopes use the same acknowledged frames/timestamps. Comparing
@@ -535,14 +538,17 @@ class CoordinatedPoseHolding:
                         cruise_p[i] = proportional
                         approach_reasons[i] = ("arrival_position_velocity_bias_refinement" if status.get("arrival")
                                                else "cruise_velocity_bias_refinement")
-                    elif status.get("arrival"):
-                        # A missing causal window permits neither velocity
-                        # integration nor the old stationary-only integrator.
+                    elif (status.get("arrival") or status["reason"] in {
+                        "waiting_for_causal_cruise_window", "motion_not_aligned_with_reference"}):
+                        # A missing causal window or a reference pointing
+                        # away permits neither velocity integration nor the
+                        # old stationary-only integrator.
                         # Retain confirmed support while the observer warms;
                         # native brakes and the composed speed cap still own
                         # actual excessive motion.
                         proposed_bias[i] = self.bias[i]
-                        approach_reasons[i] = "arrival_observer_warming_retains_support"
+                        approach_reasons[i] = ("arrival_observer_warming_retains_support"
+                            if status.get("arrival") else "cruise_feedback_wait_retains_support")
                 demand[i] = frame.requested_torque_nm + cruise_p[i] + (0.0 if is_probe else proposed_bias[i])
         self.braking = any(f.phase == "brake" and f.reason != "target_reached_braking" for f in frames)
         if (self.command_field_source is not None and permitted and not self.braking

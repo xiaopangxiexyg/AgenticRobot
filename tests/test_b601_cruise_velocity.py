@@ -177,6 +177,55 @@ def test_cruise_integral_does_not_accumulate_unrealized_cap_or_slew_growth(tmp_p
     assert saw_active
 
 
+@pytest.mark.parametrize("direction", [-1, 1])
+@pytest.mark.parametrize("observed", ["stopped", "one_count", "reverse", "paused"])
+def test_cruise_plateau_and_reverse_keep_velocity_owner_without_position_windup(
+    tmp_path, monkeypatch, direction, observed,
+):
+    core = controller_from_profile(tmp_path)._workspace._coordinated.pose
+    warm_core(core, target=direction*.07)
+    core.adopt_hold(2, direction*.2)
+    core.last_delta = core.bias
+    for tracker, i in zip(core.trackers, AXES, strict=True):
+        def frame(*, now, i=i, **kwargs):
+            speed = 0 if observed == "paused" else direction*.0075
+            reference = direction*.02+speed*(now-1.29) if i == 2 else 0
+            return B601JointMotionFrame(phase="track", reason="bounded_reference_tracking",
+                q_reference_rad=reference, qvel_reference_rad_s=speed if i == 2 else 0,
+                control_qvel_rad_s=0, position_torque_nm=0, velocity_torque_nm=0,
+                requested_torque_nm=0)
+        monkeypatch.setattr(tracker, "update", frame)
+    active = 0
+    for n in range(1, 101):
+        q = (0 if observed in {"stopped", "paused"} else direction*RESOLUTION*(n % 2)
+             if observed == "one_count" else -direction*.005*n*.01)
+        raw = (q-core.q[2])/.01
+        dt = core.observe(1.29+n*.01, (0, 0, q, 0, 0, 0), (0, 0, raw, 0, 0, 0))
+        before = core.bias
+        command, audit = core.step(sequence=30+n, dt=dt, permitted=True,
+            point_search=False, cruise_joint=2)
+        status = audit["cruise_velocity_control"]
+        if status["active"]:
+            active += 1
+            if observed == "paused":
+                assert status["error_rad_s"] == pytest.approx(0, abs=1e-12)
+            else:
+                assert status["error_rad_s"]*direction > 0
+            expected = core.config.cruise_velocity_ki_nm_per_rad*status["error_rad_s"]*dt
+            assert status["requested_bias_increment_nm"] == pytest.approx(expected)
+            assert abs(audit["proposed_bias_nm"][2]-before[2]) <= abs(expected)+1e-12
+        else:
+            assert status["reason"] == "waiting_for_causal_cruise_window"
+            assert audit["proposed_bias_nm"] == before
+        assert core.bias == before
+        core.record_dispatch(30+n, command)
+        assert sum(abs(v) for v in command) <= 1+1e-12
+    assert active > 60
+    # The old position fallback adds about 1 N.m during this growing-lag
+    # second, versus <= 0.25 N.m of bounded velocity-error adaptation.
+    assert abs(core.bias[2]) < .45
+
+
 def test_matched_accelerating_reference_never_accumulates_filtered_velocity_lag(tmp_path, monkeypatch):
     core = controller_from_profile(tmp_path)._workspace._coordinated.pose
     warm_core(core)

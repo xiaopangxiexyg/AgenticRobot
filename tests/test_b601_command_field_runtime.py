@@ -350,8 +350,11 @@ def plant_source():
     return CommandFieldSource(report, source_sha256="e"*64, source_path="declared-toy", total_assist_cap_nm=1)
 
 
-@pytest.mark.parametrize("direction,inertia,speed", [(1, .08, .0075), (-1, .2, .0075), (1, .2, .015), (-1, .6, .015)])
-def test_native_closed_loop_field_comparison(tmp_path, direction, inertia, speed):
+@pytest.mark.parametrize("direction,inertia,speed,improves", [
+    (1, .08, .0075, True), (-1, .2, .0075, True),
+    (1, .2, .015, False), (-1, .6, .015, True),
+])
+def test_native_closed_loop_field_comparison(tmp_path, direction, inertia, speed, improves):
     bank = plant_source()
     options = {"candidate": True, "direction": direction, "inertia": inertia, "speed": speed, "arrival": True}
     baseline = simulate_motion(tmp_path, **options)
@@ -365,4 +368,10 @@ def test_native_closed_loop_field_comparison(tmp_path, direction, inertia, speed
     for key in ("duration_sec", "final_error_rad", "rms_speed_error_rad_s", "peak_speed_rad_s"):
         assert shadow[key] == baseline[key]
     assert candidate["field_predicted_cycles"] > 0 and candidate["field_increment_cycles"] > 0
-    assert candidate["rms_speed_error_rad_s"] < baseline["rms_speed_error_rad_s"]
+    # A command field is an experimental controller-dependent prediction,
+    # not identified physical friction. The plateau-safe PI improves the
+    # no-field baseline enough that this old field slightly worsens one
+    # fixture (0.000471 -> 0.000511 rad/s). Preserve that counterexample,
+    # rather than tuning the field or asserting universal improvement.
+    actual_improvement = candidate["rms_speed_error_rad_s"] < baseline["rms_speed_error_rad_s"]
+    assert actual_improvement is improves
