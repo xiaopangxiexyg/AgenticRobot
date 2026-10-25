@@ -67,14 +67,19 @@ class AcquisitionReplay:
         dt_sec=.01,
         dispatch_start_delay_sec=.0002,
         completion_delay_sec=.0008,
+        heartbeat_active=None,
     ):
         self.now = round(self.now + dt_sec, 9)
         self.sequence += 1
         position = self.q if q is None else tuple(q)
         velocity = tuple((a - b) / dt_sec for a, b in zip(position, self.q))
         self.q = position
-        status = self.controller.status()["automatic_calibration"]
-        if status["active"] and permit:
+        # Reuse only a caller's snapshot from before any controller mutation.
+        active = (
+            self.controller.status()["automatic_calibration"]["active"]
+            if heartbeat_active is None else heartbeat_active
+        )
+        if active and permit:
             self.controller.submit("heartbeat", now_sec=self.now)
         self.delta, self.audit = self.controller.step(
             now_sec=self.now,
@@ -144,7 +149,8 @@ class AcquisitionReplay:
 
     def run(self, *, onset_move=True, motion_move=True, ticks=20000, until=None):
         for _ in range(ticks):
-            state = self.controller.status()["automatic_calibration"]
+            view = self.controller.status()
+            state = view["automatic_calibration"]
             if until is not None and until(state):
                 return
             if state["state"] in {"complete", "failed", "cancelled"}:
@@ -161,7 +167,10 @@ class AcquisitionReplay:
                 and state["stage"] == "motion"
                 and state["state"] == "motion"
             ):
-                offset = self.controller.status().get("target_offset_rad")
+                # A callback may mutate the controller even when it returns false.
+                offset = (
+                    view if until is None else self.controller.status()
+                ).get("target_offset_rad")
                 audit = self.audit
                 motion = audit.get("motion_control")
                 if motion and motion["phase"] == "track":
@@ -177,7 +186,7 @@ class AcquisitionReplay:
                     )
                 ):
                     q[2] += 0.0001 if offset > 0 else -0.0001
-            self.tick(q)
+            self.tick(q, heartbeat_active=state["active"] if until is None else None)
         pytest.fail(str(self.controller.status()["automatic_calibration"]))
 
 
