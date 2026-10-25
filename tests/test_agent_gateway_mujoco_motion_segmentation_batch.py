@@ -50,7 +50,7 @@ def bundle_pair(monkeypatch):
     return application, baseline, enabled, kwargs
 
 
-@pytest.mark.parametrize("flag", ["enable_segmentation_batch_v2", "enable_segmentation_geometry_v3"])
+@pytest.mark.parametrize("flag", ["enable_segmentation_batch_v2", "enable_segmentation_geometry_v3", "enable_object_localization"])
 def test_batch_cli_flag_is_default_off_and_explicit(flag):
     parser = gateway_cli.build_parser()
     assert parser.get_default(flag) is False
@@ -78,7 +78,7 @@ def test_batch_cli_flag_is_default_off_and_explicit(flag):
         ["--segmentation-asset-bundle", "/not-used/model"],
     ],
 )
-@pytest.mark.parametrize("flag", ["--enable-segmentation-batch-v2", "--enable-segmentation-geometry-v3"])
+@pytest.mark.parametrize("flag", ["--enable-segmentation-batch-v2", "--enable-segmentation-geometry-v3", "--enable-object-localization"])
 def test_batch_cli_rejects_missing_dependency_before_reading_paths(
     monkeypatch, capsys, dependencies, flag
 ):
@@ -104,7 +104,7 @@ def test_batch_cli_rejects_missing_dependency_before_reading_paths(
 
 @pytest.mark.parametrize("owner", ["factory", "deployment"])
 @pytest.mark.parametrize("enabled", [None, 0, 1, "true", []])
-@pytest.mark.parametrize("flag", ["enable_segmentation_batch_v2", "enable_segmentation_geometry_v3"])
+@pytest.mark.parametrize("flag", ["enable_segmentation_batch_v2", "enable_segmentation_geometry_v3", "enable_object_localization"])
 def test_batch_flag_is_strict_boolean_before_resources(monkeypatch, owner, enabled, flag):
     monkeypatch.setattr(
         motion_factory,
@@ -347,17 +347,23 @@ def test_bundle_rejects_batch_wrong_version_and_orphan_route(bundle_pair):
         replace(enabled, segmentation_batch=None)
 
 
-@pytest.mark.parametrize("geometry,paired", [(False, False), (True, False), (True, True)])
+@pytest.mark.parametrize("geometry,paired,localization", [
+    pytest.param(False, False, False, id="False-False"),
+    pytest.param(True, False, False, id="True-False"),
+    pytest.param(True, True, False, id="True-True"),
+    pytest.param(False, False, True, id="localization"),
+    pytest.param(True, True, True, id="paired-localization"),
+])
 def test_session_registers_batch_with_the_same_provider_and_one_model_owner(
-    bundle_pair, tmp_path, monkeypatch, geometry, paired
+    bundle_pair, tmp_path, monkeypatch, geometry, paired, localization
 ):
     from agent_gateway.profiles import segmentation_batch
 
     application, _baseline, bundle, kwargs = bundle_pair
-    if geometry:
+    if geometry or localization:
         bundle = motion_deployment.build_mujoco_agent_tcp_pose_contract_bundle(
-            **kwargs, enable_segmentation_batch_v2=True, enable_segmentation_geometry_v3=True,
-            enable_rgbd_capture_v3=paired)
+            **kwargs, enable_segmentation_batch_v2=True, enable_segmentation_geometry_v3=geometry,
+            enable_rgbd_capture_v3=paired, enable_object_localization=localization)
     motion_application = object.__new__(MujocoAgentSkillMotionApplication)
     motion_application.__dict__.update(application.__dict__)
     motion_application._lock = threading.RLock()
@@ -375,6 +381,7 @@ def test_session_registers_batch_with_the_same_provider_and_one_model_owner(
             model_profile_id=MODEL_IDENTITY[0], semantic_content_hash=MODEL_IDENTITY[1]
         ),
         segment=lambda *_args, **_kwargs: pytest.fail("inference during assembly"),
+        localize=lambda *_args, **_kwargs: pytest.fail("localization during assembly"),
         encode_segment_artifacts=lambda *_args, **_kwargs: pytest.fail(
             "encoding during assembly"
         ),
@@ -420,6 +427,12 @@ def test_session_registers_batch_with_the_same_provider_and_one_model_owner(
         assert ports["perception.segment", "1"] is session.segmentation_executor
         assert ports["perception.segment", "2"] is session.segmentation_batch_executor
         assert session.segmentation_executor is not session.segmentation_batch_executor
+        if localization:
+            assert session.localization_provider.localizer is localizer
+            assert session.localization_provider.registration is bundle.localization
+            assert ports["perception.localize_objects", "1"] is session.localization_executor
+        else:
+            assert session.localization_provider is session.localization_executor is None
         if geometry:
             assert captured["3"]["provider"] is session.segmentation_provider
             assert captured["3"]["registration"] is bundle.segmentation_geometry
@@ -473,6 +486,7 @@ def test_batch_close_keeps_shared_dependencies_until_the_original_executor_drain
         object_state_executor=None,
         spatial_goal_executor=None,
         object_goal_query_executor=None,
+        localization_executor=None,
         history_executor=None,
         segmentation_executor=None,
         segmentation_geometry_executor=None,
@@ -597,3 +611,91 @@ def test_paired_geometry_rejects_a_registration_bound_to_the_legacy_rgb_route(bu
         **kwargs, enable_segmentation_geometry_v3=True, enable_rgbd_capture_v3=True)
     with pytest.raises(ValueError, match="exact selected RGB producer Route"):
         replace(paired, segmentation_geometry=legacy.segmentation_geometry)
+
+
+def test_localization_publication_is_opt_in_and_closes_existing_catalogs(bundle_pair):
+    _, baseline, _, kwargs = bundle_pair
+    disabled = motion_deployment.build_mujoco_agent_tcp_pose_contract_bundle(
+        **kwargs, enable_object_localization=False,
+    )
+    assert disabled.localization is baseline.localization is None
+    for name in ("definition_catalog", "schema_catalog", "io_catalog", "route_manifest"):
+        assert getattr(disabled, name).semantic_content_hash == getattr(baseline, name).semantic_content_hash
+    enabled = motion_deployment.build_mujoco_agent_tcp_pose_contract_bundle(
+        **kwargs, enable_object_localization=True,
+    )
+    registration = enabled.localization
+    entry = enabled.route_manifest.route("perception.localize_objects", "1")
+    assert entry.route == registration.skill.routes[0]
+    assert entry.deployment_binding == registration.binding.to_ref()
+    assert entry.route.target_kind == "sim" and entry.route.supported_modes == ("sim_active",)
+    assert entry.route.control_effect_class == "read_only" and not entry.route.may_move_robot
+    assert registration.skill.definition in enabled.definition_catalog.skill_definitions
+    assert registration.skill.io_contract in enabled.io_catalog.io_contracts
+    assert enabled.schema_catalog.entry("perception.localize_objects", "1") == registration.skill.schema_entry
+    enabled.payload_validators.validator_for(entry.route).validate_route(entry.route)
+    for old_entry in baseline.route_manifest.skill_routes:
+        route = old_entry.route
+        assert enabled.route_manifest.route(route.skill_id, route.skill_version) == old_entry
+    assert not registration.profile.local_path_enabled
+    with pytest.raises(ValueError, match="typed registration"):
+        replace(enabled, localization=None)
+
+
+@pytest.mark.parametrize("artifact,model", [(False, False), (False, True), (True, False)])
+@pytest.mark.parametrize("owner", ["factory", "deployment"])
+def test_localization_dependencies_fail_before_resources(owner, artifact, model):
+    with pytest.raises(ValueError, match="Object localization requires"):
+        if owner == "factory":
+            motion_factory.build_mujoco_agent_tcp_pose_gateway_session(
+                target_config=None, allowed_client_ids=("test",), enable_object_localization=True,
+                artifact_storage=object() if artifact else None,
+                segmentation_localizer=SimpleNamespace(localize=lambda: None) if model else None,
+            )
+        else:
+            motion_deployment.build_mujoco_agent_tcp_pose_contract_bundle(
+                application=None, enable_object_localization=True, enable_artifact_perception=artifact,
+                segmentation_model_profile_id=MODEL_IDENTITY[0] if model else None,
+                segmentation_model_profile_hash=MODEL_IDENTITY[1] if model else None,
+                segmentation_inference_implementation_hash=MODEL_IDENTITY[2] if model else None,
+            )
+
+
+def test_localization_requires_model_method_and_full_chain_retention_before_scene():
+    with pytest.raises(ValueError, match="shared segmentation localizer"):
+        motion_factory.build_mujoco_agent_tcp_pose_gateway_session(
+            target_config=None, allowed_client_ids=("test",), enable_object_localization=True,
+            artifact_storage=object(), segmentation_localizer=object(),
+        )
+    with pytest.raises(ValueError, match="capture, localization, segmentation and anchor retention"):
+        motion_factory.build_mujoco_agent_tcp_pose_gateway_session(
+            target_config=None, allowed_client_ids=("test",), enable_object_localization=True,
+            artifact_storage=object(), segmentation_localizer=SimpleNamespace(localize=lambda: None),
+            enable_surface_anchor_v3=True, max_retained_operations=3,
+        )
+
+
+@pytest.mark.parametrize("field", [
+    "runtime_session_id", "control_domain_id", "target_binding_id", "station_manifest_hash",
+    "execution_manifest_hash", "model_profile_id", "model_profile_hash", "inference_implementation_hash",
+])
+def test_localization_bundle_rejects_foreign_model_or_owner(bundle_pair, field):
+    from agent_gateway.profiles.localization_deployment import (
+        build_object_localization_registration,
+    )
+
+    _, _, _, kwargs = bundle_pair
+    bundle = motion_deployment.build_mujoco_agent_tcp_pose_contract_bundle(**kwargs, enable_object_localization=True)
+    registration = bundle.localization
+    values = {name: getattr(registration.binding, name) for name in (
+        "runtime_session_id", "control_domain_id", "target_binding_id", "station_manifest_hash", "execution_manifest_hash",
+    )}
+    values.update({name: getattr(registration.profile, name) for name in (
+        "model_profile_id", "model_profile_hash", "inference_implementation_hash",
+    )})
+    values[field] = "foreign-owner-or-model"
+    foreign = build_object_localization_registration(
+        **values, target_kind="sim", current_mode="sim_active", local_path_enabled=False,
+    )
+    with pytest.raises(ValueError, match="localization differs"):
+        replace(bundle, localization=foreign)

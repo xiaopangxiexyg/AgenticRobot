@@ -631,7 +631,348 @@ def test_session_binding_changes_do_not_change_static_anchor_contract(case, fiel
             clock_domain_id="clock:test",
             max_retained_operations=3,
         )
+
+
     assert not case.projection_calls
+
+
+def test_mujoco_service_localized_paired_anchor_chain_at_capacity_four(
+    monkeypatch, tmp_path
+):
+    """Real service/store wiring, with only application cuts and model inference fake."""
+    from test_agent_gateway_mujoco_tcp_pose import (
+        _build_no_model_contract_bundle_fixture,
+    )
+    from test_agent_gateway_surface_anchor import _goal_parameters
+
+    from agent_gateway.profiles.mujoco.motion_application import (
+        MujocoAgentSkillMotionApplication,
+    )
+    from agent_gateway.profiles.mujoco.motion_deployment import (
+        build_mujoco_agent_tcp_pose_contract_bundle,
+    )
+    from agent_gateway.profiles.mujoco.motion_factory import (
+        _build_standard_tcp_pose_envelope_runtime,
+    )
+    from agent_gateway.profiles.mujoco.motion_gateway_session import (
+        assemble_mujoco_agent_tcp_pose_gateway_session,
+    )
+    from control_station.sim_hil_profile.application import (
+        MujocoSimHILPassiveApplicationCut,
+    )
+    from deployments.perception.sam2_grounding_dino import (
+        GroundedObjectDetection,
+        GroundedObjectSegment,
+        encode_grounded_object_segment_artifacts,
+    )
+    from robot_motion.runtime.control_admission import ControlCut
+    from sim.mujoco.depth_snapshot import EncodedMujocoDepthFrame
+    from sim.mujoco.rgb_snapshot import EncodedMujocoRgbFrame
+
+    identity = ("sam2:test", "sam2-model:test", "sam2-localizer:test")
+    application, runtime, _direct, _baseline, _manifest = (
+        _build_no_model_contract_bundle_fixture(
+            monkeypatch,
+            enable_artifact_perception=True,
+            segmentation_identity=identity,
+        )
+    )
+
+    def forbidden(*_args, **_kwargs):
+        pytest.fail("This supplied-image chain must not render, recapture or plan motion")
+
+    # Supply the existing assembler's lower ports without constructing a Scene/rig.
+    application.scene = object()
+    runtime.rig = SimpleNamespace(config=SimpleNamespace(), capture_scene=forbidden)
+    application.target = SimpleNamespace(
+        planned_tcp_motion=SimpleNamespace(
+            pose_projector=forbidden, reference_hz=15.0, planning_clearance_padding_m=0.002
+        )
+    )
+    application.depth_source_catalog = lambda: (
+        {"view_id": "front", "native_width": 8, "native_height": 7},
+    )
+    application.visual_source_catalog = lambda: (
+        {"source_id": "front", "native_width": 8, "native_height": 7},
+    )
+    application.tcp_pose_envelope_runtime = _build_standard_tcp_pose_envelope_runtime(
+        prepared=application,
+        target_config=SimpleNamespace(clock_domain_id=runtime.config.clock_domain_id),
+        enable_safe_tcp_pose=True,
+    )
+    bundle = build_mujoco_agent_tcp_pose_contract_bundle(
+        application=application,
+        enable_artifact_perception=True,
+        segmentation_model_profile_id=identity[0],
+        segmentation_model_profile_hash=identity[1],
+        segmentation_inference_implementation_hash=identity[2],
+        enable_object_localization=True,
+        enable_segmentation_geometry_v3=True,
+        enable_rgbd_capture_v3=True,
+        enable_safe_tcp_pose=True,
+        enable_spatial_goals=True,
+        enable_object_goal_queries=True,
+        enable_surface_anchors=True,
+        enable_surface_anchor_v2=True,
+        enable_surface_anchor_v3=True,
+    )
+    motion_application = object.__new__(MujocoAgentSkillMotionApplication)
+    motion_application.__dict__.update(application.__dict__)
+    motion_application._lock = threading.RLock()
+    motion_application._started = motion_application._held = (
+        motion_application._closed
+    ) = False
+    motion_application._active_operation_id = None
+    motion_application.capture_passive_application_cut = lambda **_: (
+        MujocoSimHILPassiveApplicationCut(
+            captured_at=10.0,
+            authority_epoch=0,
+            execution_epoch=0,
+            dispatch_owner_generation=1,
+            lifecycle_state="configured",
+            execution_gate="not_started",
+            execution_gate_epoch=0,
+            fault_class=None,
+            fault_rearmable=False,
+            scene_projection={
+                "finite_state": True,
+                "pose_xyz_quat_xyzw_by_component": {
+                    "right_arm": [0, 0, 0.5, 0, 0, 0, 1]
+                },
+            },
+            control_cut=ControlCut(
+                runtime_session_id=runtime.config.runtime_session_id,
+                control_domain_id=runtime.config.control_domain_id,
+                clock_domain_id=runtime.config.clock_domain_id,
+                clock_reset_epoch=0,
+                cutoff_at=10.0,
+                cutoff_admission_sequence=0,
+            ),
+        )
+    )
+    rgb_bytes = _jpeg(color=(48, 96, 144))
+    depth_bytes = _npy(np.full((7, 8), 0.5, dtype=np.float32))
+    with Image.open(io.BytesIO(rgb_bytes)) as source:
+        expected_pixels = np.asarray(source.convert("RGB")).copy()
+    capture_calls = []
+
+    def capture_visual_depth_cut(*, view_id):
+        capture_calls.append(view_id)
+        assert capture_calls == ["front"]
+        return (
+            EncodedMujocoRgbFrame("front", 8, 7, "image/jpeg", rgb_bytes),
+            EncodedMujocoDepthFrame(
+                view_id="front", captured_at=10.0, width=8, height=7,
+                media_type=DEPTH_FRAME_MEDIA_TYPE_V1,
+                schema_id=DEPTH_FRAME_SCHEMA_ID_V1,
+                encoding=DEPTH_FRAME_ENCODING_V1,
+                compression=DEPTH_FRAME_COMPRESSION_V1,
+                data=depth_bytes,
+                camera_pose_world_xyz_quat_xyzw=(0, 0, 0, 0, 0, 0, 1),
+                intrinsics={"width": 8, "height": 7, "fx": 4., "fy": 4., "cx": 4., "cy": 3.},
+            ),
+        )
+
+    motion_application.capture_visual_depth_cut = capture_visual_depth_cut
+    motion_application.capture_visual_jpeg_snapshot = forbidden
+    motion_application.capture_depth_npy_frame = forbidden
+
+    class Localizer:
+        semantic_content_hash = identity[2]
+        model_spec = SimpleNamespace(
+            model_profile_id=identity[0], semantic_content_hash=identity[1]
+        )
+        encode_segment_artifacts = staticmethod(encode_grounded_object_segment_artifacts)
+
+        def __init__(self):
+            self.starts = self.closes = 0
+            self.started = False
+            self.calls = []
+
+        def start(self):
+            self.starts += 1
+            self.started = True
+
+        def close(self):
+            self.closes += 1
+            self.started = False
+
+        def localize(self, image, *, language_prompt, max_detections):
+            assert self.started and language_prompt == "proposal" and max_detections == 1
+            np.testing.assert_array_equal(np.asarray(image), expected_pixels)
+            self.calls.append("localize")
+            return (GroundedObjectDetection((1, 1, 7, 6), 0.9, "proposal"),)
+
+        def segment(self, image, *, language_prompt, pixel_uv, min_score):
+            assert self.started and language_prompt is None
+            assert pixel_uv == (4, 3) and min_score == 0.25
+            np.testing.assert_array_equal(np.asarray(image), expected_pixels)
+            self.calls.append("segment")
+            mask = np.zeros((7, 8), dtype=bool)
+            mask[1:6, 1:7] = True
+            return GroundedObjectSegment(mask, 0.9, "proposal", (1, 1, 7, 6))
+
+    localizer = Localizer()
+    store = RecoverableAgentArtifactStore(
+        root=tmp_path / "artifacts", quota_bytes=32 << 20, max_artifact_bytes=16 << 20,
+        max_chunk_bytes=1 << 20,
+    )
+    session = assemble_mujoco_agent_tcp_pose_gateway_session(
+        application=motion_application, contract_bundle=bundle,
+        allowed_client_ids=("test:combo",), max_retained_operations=4,
+        artifact_store=store, owns_artifact_store=True,
+        segmentation_localizer=localizer,
+    )
+    try:
+        session.start_perception_resources()
+        session.start_perception_resources()
+        assert localizer.starts == 1
+        assert session.localization_provider.localizer is localizer
+        assert session.segmentation_provider.localizer is localizer
+        published = session.observation_producer.capture_and_publish(session.service)
+        assert published.accepted and published.snapshot is not None
+        snapshot = published.snapshot
+        ports = {(item.skill_id, item.skill_version): item.execution_port
+                 for item in session.service.executor_registry.bindings}
+        assert ports["perception.capture_rgb", "3"] is session.rgbd_capture_executor
+        assert ports["perception.localize_objects", "1"] is session.localization_executor
+        assert ports["perception.segment", "3"] is session.segmentation_geometry_executor
+        sequence = 0
+
+        def submit(
+            skill, version, parameters, inputs=(), *, status="completed", rejection_reason=None
+        ):
+            nonlocal sequence
+            sequence += 1
+            entry = bundle.route_manifest.route(skill, version)
+            route, profile = entry.route, entry.route.allowed_parameter_profiles[0]
+            request = AgentSkillRequest(
+                client_id="test:combo", request_id=f"request:combo:{sequence}",
+                idempotency_key=f"idempotency:combo:{sequence}", client_sequence=sequence,
+                runtime_session_id=bundle.route_manifest.runtime_session_id,
+                skill_route_manifest_hash=bundle.route_manifest.semantic_content_hash,
+                expected_station_revision=snapshot.station_revision,
+                observation_snapshot_id=snapshot.snapshot_id,
+                skill_id=skill, skill_version=version,
+                skill_definition_hash=route.skill_definition_hash,
+                route_id=route.route_id, route_version=route.route_version,
+                route_hash=route.semantic_content_hash,
+                deployment_binding_hash=entry.deployment_binding.deployment_binding_hash,
+                parameter_profile_id=profile.parameter_profile_id,
+                parameter_profile_hash=profile.parameter_profile_hash,
+                parameters=parameters, requested_mode="sim_active",
+                requested_timeout_ms=route.max_operation_duration_ms,
+                input_artifact_bindings=inputs,
+            )
+            admitted = session.service.submit_request(
+                request=request, current_station_revision=snapshot.station_revision
+            )
+            if rejection_reason is not None:
+                assert not admitted.accepted and admitted.operation is None
+                assert admitted.reason_code == rejection_reason
+                return admitted
+            assert admitted.accepted and admitted.operation is not None, admitted
+            op_id = admitted.operation.operation_id
+            assert session.service.operation_store.request_for_operation(op_id) == request
+            assert session.service.launch_operation(op_id).accepted
+            assert ports[skill, version].wait(op_id, timeout_sec=5.0)
+            outcome = session.service.get_operation(op_id)
+            assert outcome is not None and outcome.status == status, (
+                outcome, ports[skill, version].failure_diagnostics
+            )
+            assert outcome.execution_outcome == status
+            return outcome
+
+        def output(operation, source_slot, target_slot):
+            matching = [b for b in operation.output_artifact_bindings if b.slot_id == source_slot]
+            assert len(matching) == 1
+            return replace(matching[0], slot_id=target_slot, ordinal=0, production_receipt_ref=None)
+
+        captured = submit("perception.capture_rgb", "3", {
+            "selected_roles": ["main"], "width": 8, "height": 7,
+            "max_total_bytes": 65536, "include_depth": True,
+        })
+        original = output(captured, "rgb_frames", "input_image")
+        assert store.managed_read_path(original.artifact.artifact_id).read_bytes() == rgb_bytes
+        rgb_hash = hashlib.sha256(rgb_bytes).hexdigest()
+        assert original.artifact.sha256 == rgb_hash
+        localized = submit("perception.localize_objects", "1", {
+            "input_source": "artifact", "local_image_path": None,
+            "language_prompt": "proposal", "max_detections": 1,
+        }, (original,))
+        assert localized.execution_result["input_media_content_hash"] == rgb_hash
+        assert (localized.execution_result["image_width"], localized.execution_result["image_height"]) == (8, 7)
+        annotated = output(localized, "annotated_image", "input_image")
+        assert annotated.artifact.sha256 != rgb_hash
+        x0, y0, x1, y1 = localized.execution_result["detections"][0]["box_xyxy"]
+        pixel = [(x0 + x1) // 2, (y0 + y1) // 2]
+        segment_parameters = {
+            "role": "main", "rgb_capture_operation_id": captured.operation_id,
+            "targets": [{"target_pixel_uv": pixel, "language_prompt": None, "min_score": 0.25}],
+        }
+        segmented = submit("perception.segment", "3", segment_parameters, (original,))
+        segment = segmented.execution_result
+        assert segment["input_rgb_content_hash"] == rgb_hash
+        assert segment["input_rgb_artifact_id"] == original.artifact.artifact_id
+        assert segment["rgb_capture_request_hash"] == captured.request_hash
+        assert segment["rgb_capture_operation_id"] == captured.operation_id
+        assert segment["input_rgb_frame_ordinal"] == 0
+        assert (segment["image_width"], segment["image_height"]) == (8, 7)
+        pair = output(captured, "paired_observations", "paired_observation")
+        metadata = json.loads(store.managed_read_path(pair.artifact.artifact_id).read_bytes())
+        anchor_parameters = {
+            "role": "main", "selection_mode": "mask_interior", "target_pixel_uv": None,
+            "rgb_capture_operation_id": captured.operation_id,
+            "segmentation_operation_id": segmented.operation_id, "target_index": 0,
+        }
+        anchor_inputs = (pair, output(segmented, "segmentation_mask", "segmentation_mask"))
+        anchored = submit("perception.capture_surface_anchor", "3", anchor_parameters, anchor_inputs)
+        answer = anchored.execution_result
+        validate_anchor_v2(answer)
+        assert answer["selection"]["input_rgb_content_hash"] == rgb_hash == metadata["rgb_artifact"]["sha256"]
+        assert answer["selection"]["mask_media_content_hash"] == anchor_inputs[1].artifact.sha256
+        assert tuple(answer["selection"]["requested_pixel_uv"]) == tuple(pixel)
+        assert answer["measurement"]["capture_group_id"] == metadata["capture_group_id"]
+        assert answer["measurement"]["depth_content_hash"] == metadata["depth_content_hash"]
+        assert answer["captured_at"] == metadata["captured_at"] == 10.0
+        assert metadata["source_operation_id"] == captured.operation_id
+        assert metadata["source_request_hash"] == captured.request_hash
+        assert answer["source_operation_id"] == anchored.operation_id
+        assert answer["source_request_hash"] == anchored.request_hash
+        for key in ("reference_frame_id", "reference_frame_spec_hash", "frame_graph_hash"):
+            assert answer["measurement"][key] == metadata[key]
+        assert session.service.operation_store.retained_operation_count == 4
+        assert session.service.operation_store.total_evicted == 0
+        assert {op.operation_id for op in session.service.operation_store.operations()} == {
+            captured.operation_id, localized.operation_id, segmented.operation_id, anchored.operation_id
+        }
+
+        # The preview is not an original RGB Artifact; reject before allocating an operation.
+        submit("perception.segment", "3", segment_parameters, (annotated,),
+               rejection_reason="input_artifact_bindings_rejected")
+        assert session.service.operation_store.total_admitted == 4
+        assert session.service.operation_store.total_evicted == 0
+        assert localizer.calls == ["localize", "segment"]
+
+        # A real fifth, model-free operation evicts capture, not its CAS bytes.
+        submit("perception.compute_spatial_goal_from_anchor", "2", {
+            **_goal_parameters(), "reference_frame_id": bundle.motion_profile.reference_frame_id,
+        }, (output(anchored, "surface_anchor", "surface_anchor"),))
+        assert session.service.get_operation(captured.operation_id) is None
+        assert session.service.operation_store.request_for_operation(captured.operation_id) is None
+        assert session.service.operation_store.total_evicted == 1
+        assert store.managed_read_path(pair.artifact.artifact_id).read_bytes()
+        rejected = submit("perception.capture_surface_anchor", "3", anchor_parameters, anchor_inputs, status="failed")
+        assert rejected.execution_outcome == "failed"
+        assert rejected.execution_result is None and not rejected.output_artifact_bindings
+        assert rejected.progress_summary["failure_diagnostic"]["message"] == "Reuse producer is unavailable in this session."
+        assert session.service.get_operation(segmented.operation_id) is not None
+        assert capture_calls == ["front"] and localizer.calls == ["localize", "segment"]
+        assert localizer.starts == 1 and not motion_application.started
+        # These synthetic model proposals establish wiring, not object identity or a grasp.
+    finally:
+        session.close()
+    assert localizer.closes == 1 and motion_application.closed
 
 
 @pytest.mark.parametrize("changed", ["session", "binding", "both"])

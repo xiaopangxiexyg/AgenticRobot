@@ -14,6 +14,7 @@ from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from agent_gateway.profiles.localization import ObjectLocalizationProvider
     from sim.mujoco.deploy.grasped_object import MujocoGraspedObjectObserver
 
 from agent_gateway.profiles.back_projection import (
@@ -203,6 +204,8 @@ class MujocoAgentTcpPoseGatewaySession:
     segmentation_batch_executor: PassiveReadSkillExecutor | None = None
     segmentation_geometry_executor: PassiveReadSkillExecutor | None = None
     object_goal_query_executor: PassiveReadSkillExecutor | None = None
+    localization_provider: ObjectLocalizationProvider | None = None
+    localization_executor: PassiveReadSkillExecutor | None = None
     surface_anchor_executors: tuple[PassiveReadSkillExecutor, ...] = ()
     _close_lock: threading.Lock = field(
         default_factory=threading.Lock,
@@ -232,6 +235,15 @@ class MujocoAgentTcpPoseGatewaySession:
     )
 
     def __post_init__(self) -> None:
+        localization_enabled = self.contract_bundle.localization is not None
+        if (localization_enabled != (self.localization_provider is not None)
+                or localization_enabled != (self.localization_executor is not None)):
+            raise ValueError("Object localization registration and executor must coexist.")
+        if self.localization_provider is not None and (
+            self.segmentation_localizer is None
+            or self.localization_provider.localizer is not self.segmentation_localizer
+        ):
+            raise ValueError("Object localization must borrow the session segmentation model.")
         if (self.contract_bundle.object_goal_query_registration is not None) != (self.object_goal_query_executor is not None):
             raise ValueError("Object goal query registration and executor must coexist.")
         if len(self.surface_anchor_executors) != len(self.contract_bundle.surface_anchor_registrations):
@@ -597,6 +609,7 @@ class MujocoAgentTcpPoseGatewaySession:
                     ("tcp_pose_comparison", self.tcp_pose_comparison_executor, 5.0),
                     ("object_state", self.object_state_executor, 5.0),
                     ("segmentation", self.segmentation_executor, 65.0),
+                    ("localization", self.localization_executor, 65.0),
                     *((("segmentation_batch", self.segmentation_batch_executor,
                         self.contract_bundle.segmentation_batch.skill.routes[0].max_operation_duration_ms / 1000 + 5.0),)
                         if self.segmentation_batch_executor is not None else ()),
@@ -751,6 +764,8 @@ def _mujoco_hardware_view_provider(
             if contract_bundle.segmentation_batch is not None else ()),
         *((contract_bundle.segmentation_geometry.skill.routes[0].semantic_content_hash,)
             if contract_bundle.segmentation_geometry is not None else ()),
+        *((contract_bundle.localization.skill.routes[0].semantic_content_hash,)
+            if contract_bundle.localization is not None else ()),
         *(item.entry.route.semantic_content_hash for item in contract_bundle.surface_anchor_registrations
             if item.skill.definition.skill_id == "perception.capture_surface_anchor"
             and item.skill.definition.skill_version == "2")))
@@ -907,6 +922,12 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
            and item.skill.definition.skill_version == "3"
            for item in contract_bundle.surface_anchor_registrations) and retention < 3:
         raise ValueError("Surface anchor v3 requires capture, segmentation and anchor retention.")
+    if contract_bundle.localization is not None and any(
+        item.skill.definition.skill_id == "perception.capture_surface_anchor"
+        and item.skill.definition.skill_version == "3"
+        for item in contract_bundle.surface_anchor_registrations
+    ) and retention < 4:
+        raise ValueError("Localized paired anchors require capture, localization, segmentation and anchor retention.")
     session_admission_limit = (
         None
         if max_session_admissions_per_route is None
@@ -1057,6 +1078,25 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
             ),
             max_retained_operations=retention,
             clock=runtime_clock,
+        )
+    localization_provider = None
+    localization_executor = None
+    if contract_bundle.localization is not None:
+        from agent_gateway.profiles.localization import (
+            ObjectLocalizationProvider,
+            build_object_localization_executor,
+        )
+        if segmentation_provider is None or segmentation_localizer is None or artifact_store is None:
+            raise ValueError("Object localization requires the session segmentation model and Artifact store.")
+        localization_provider = ObjectLocalizationProvider(
+            localizer=segmentation_localizer, registration=contract_bundle.localization,
+        )
+        localization_executor = build_object_localization_executor(
+            registration=contract_bundle.localization,
+            provider=localization_provider, artifact_store=artifact_store,
+            runtime_session_id=binding.runtime_session_id,
+            current_station_revision=lambda: observation_producer.current_station_revision,
+            max_retained_operations=retention, clock=runtime_clock,
         )
     back_projection_capture_port = None
     back_projection_provider = None
@@ -1723,6 +1763,9 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
         cardinal_step_route.semantic_content_hash: cardinal_step_executor,
         state_entry.route.semantic_content_hash: state_executor,
     }
+    if localization_executor is not None:
+        localization_route = contract_bundle.localization.skill.routes[0]
+        execution_port_by_route_hash[localization_route.semantic_content_hash] = localization_executor
     tcp_pose_comparison_executor = None
     def lookup_retained_operation(operation_id):
         # The service owns retention and eviction for both state and motion references.
@@ -2159,6 +2202,8 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
         object_state_executor=object_state_executor,
         spatial_goal_executor=spatial_goal_executor,
         object_goal_query_executor=object_goal_query_executor,
+        localization_provider=localization_provider,
+        localization_executor=localization_executor,
         surface_anchor_executors=surface_anchor_executors,
         depth_executor=depth_executor,
         rgb_executor=rgb_executor,

@@ -544,6 +544,7 @@ def build_mujoco_agent_tcp_pose_gateway_session(
     history_storage: MujocoAgentTcpPoseHistoryStorageConfig | None = None,
     artifact_storage: MujocoAgentArtifactStorageConfig | None = None,
     segmentation_localizer: object | None = None,
+    enable_object_localization: bool = False,
     enable_rgbd_capture_v3: bool = False,
     enable_segmentation_batch_v2: bool = False,
     enable_segmentation_geometry_v3: bool = False,
@@ -571,6 +572,15 @@ def build_mujoco_agent_tcp_pose_gateway_session(
 ) -> MujocoAgentTcpPoseGatewaySession:
     """Build the exact default-off graph; do not start, record, or serve it."""
 
+    if type(enable_object_localization) is not bool:
+        raise TypeError("enable_object_localization must be boolean.")
+    if enable_object_localization and (
+        artifact_storage is None or segmentation_localizer is None
+        or not callable(getattr(segmentation_localizer, "localize", None))
+    ):
+        raise ValueError("Object localization requires Artifact storage and the shared segmentation localizer.")
+    if enable_object_localization and enable_surface_anchor_v3 and max_retained_operations < 4:
+        raise ValueError("Localized paired anchors require capture, localization, segmentation and anchor retention.")
     from agent_gateway.skills.perception.surface_anchor_v2 import INTERIOR_SELECTION_POLICIES
     if not isinstance(enable_object_goal_queries, bool) or (enable_object_goal_queries and not enable_safe_tcp_pose):
         raise ValueError("Object goal queries require explicitly enabled safe TCP geometry.")
@@ -681,6 +691,7 @@ def build_mujoco_agent_tcp_pose_gateway_session(
         or enable_surface_anchors
         or enable_surface_anchor_v2
         or enable_surface_anchor_v3
+        or enable_object_localization
         or enable_relation_goal_queries
         or history_storage is not None
         or segmentation_localizer is not None
@@ -882,6 +893,7 @@ def build_mujoco_agent_tcp_pose_gateway_session(
                 None if history_storage is None else history_storage.profile
             ),
             enable_artifact_perception=artifact_storage is not None,
+            enable_object_localization=enable_object_localization,
             enable_rgbd_capture_v3=enable_rgbd_capture_v3,
             enable_segmentation_batch_v2=enable_segmentation_batch_v2,
             enable_segmentation_geometry_v3=enable_segmentation_geometry_v3,

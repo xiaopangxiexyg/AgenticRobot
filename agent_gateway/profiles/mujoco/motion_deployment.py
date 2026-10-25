@@ -16,6 +16,10 @@ from agent_gateway.profiles.placement import (
     PlacementRegistration,
     build_placement_registration,
 )
+from agent_gateway.profiles.localization_deployment import (
+    ObjectLocalizationRegistration,
+    build_object_localization_registration,
+)
 from agent_gateway.profiles.segmentation import (
     SegmentationRegistration,
     build_segmentation_registration,
@@ -805,6 +809,7 @@ class MujocoAgentTcpPoseContractBundle:
     rgbd_capture: SpatialGoalRegistration | None = None
     segmentation_batch: SegmentationRegistration | None = None
     segmentation_geometry: SegmentationRegistration | None = None
+    localization: ObjectLocalizationRegistration | None = None
 
     object_goal_query_registration: SpatialGoalRegistration | None = None
     surface_anchor_registrations: tuple[SpatialGoalRegistration, ...] = ()
@@ -825,6 +830,26 @@ class MujocoAgentTcpPoseContractBundle:
             route_manifest=self.route_manifest,
             io_catalog=self.io_catalog,
         )
+        if self.localization is not None:
+            if not isinstance(self.localization, ObjectLocalizationRegistration):
+                raise TypeError("localization must be a typed registration.")
+            entry = self.route_manifest.route("perception.localize_objects", "1")
+            if (entry.route != self.localization.skill.routes[0]
+                    or entry.deployment_binding != self.localization.binding.to_ref()
+                    or entry.availability_hash != self.localization.availability_hash
+                    or self.localization.binding.target_kind != "sim"):
+                raise ValueError("Object localization differs from its simulation manifest entry.")
+            if self.segmentation is None or self.localization.profile.local_path_enabled:
+                raise ValueError("Simulation localization requires the shared segmentation model and Artifact-only input.")
+            for name in ("model_profile_id", "model_profile_hash", "inference_implementation_hash"):
+                if getattr(self.localization.profile, name) != getattr(self.segmentation.profile, name):
+                    raise ValueError("Object localization must share the exact segmentation model identity.")
+            for name in ("runtime_session_id", "control_domain_id", "target_binding_id",
+                         "station_manifest_hash", "execution_manifest_hash", "target_kind"):
+                if getattr(self.localization.binding, name) != getattr(self.segmentation.binding, name):
+                    raise ValueError("Object localization must share the exact segmentation deployment context.")
+        elif any(entry.route.skill_id == "perception.localize_objects" for entry in self.route_manifest.skill_routes):
+            raise ValueError("A localization Route requires its typed registration.")
         if self.fast_grasp_contract is not None:
             from .grasp_deployment import MujocoFastGraspContract
 
@@ -1966,6 +1991,7 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
     application: Any,
     history_profile: MujocoAgentTcpPoseHistoryProfile | None = None,
     enable_artifact_perception: bool = False,
+    enable_object_localization: bool = False,
     enable_rgbd_capture_v3: bool = False,
     segmentation_model_profile_id: str | None = None,
     segmentation_model_profile_hash: str | None = None,
@@ -1999,6 +2025,12 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
         raise TypeError("history_profile must be typed or None.")
     if not isinstance(enable_artifact_perception, bool):
         raise TypeError("enable_artifact_perception must be boolean.")
+    if type(enable_object_localization) is not bool:
+        raise TypeError("enable_object_localization must be boolean.")
+    if enable_object_localization and (
+        not enable_artifact_perception or segmentation_model_profile_id is None
+    ):
+        raise ValueError("Object localization requires Artifact perception and the shared model identity.")
     if type(enable_rgbd_capture_v3) is not bool or (enable_rgbd_capture_v3 and not enable_artifact_perception):
         raise ValueError("RGB-D capture v3 requires explicit Artifact perception.")
     if type(enable_observed_point_motion) is not bool:
@@ -2088,6 +2120,7 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
         or enable_surface_anchors
         or enable_surface_anchor_v2
         or enable_surface_anchor_v3
+        or enable_object_localization
         or enable_relation_goal_queries
         or enable_grasp_approach
         or grasp_contact_binding is not None
@@ -2239,6 +2272,19 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
 
     segmentation_batch = same_cut_registration("2") if enable_segmentation_batch_v2 else None
     segmentation_geometry = same_cut_registration("3") if enable_segmentation_geometry_v3 else None
+    localization = (
+        build_object_localization_registration(
+            target_kind="sim", current_mode="sim_active", local_path_enabled=False,
+            model_profile_id=segmentation_model_profile_id,
+            model_profile_hash=segmentation_model_profile_hash,
+            inference_implementation_hash=segmentation_inference_implementation_hash,
+            runtime_session_id=exact["runtime_session_id"],
+            control_domain_id=exact["control_domain_id"],
+            target_binding_id=target_binding.binding_id,
+            station_manifest_hash=station.semantic_content_hash,
+            execution_manifest_hash=execution.semantic_content_hash,
+        ) if enable_object_localization else None
+    )
     placement = (
         build_placement_registration(
             segmentation=segmentation,
@@ -3476,6 +3522,9 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
     for registration in surface_anchor_registrations:
         definition_items.append(registration.skill.definition)
         schema_items.append(registration.skill.schema_entry)
+    if localization is not None:
+        definition_items.append(localization.skill.definition)
+        schema_items.append(localization.skill.schema_entry)
     if tcp_pose_comparison_registration is not None:
         definition_items.append(tcp_pose_comparison_registration.skill.definition)
         schema_items.append(tcp_pose_comparison_registration.skill.schema_entry)
@@ -3721,6 +3770,11 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
     if object_goal_query_registration is not None:
         route_items.append(object_goal_query_registration.entry)
     route_items.extend(registration.entry for registration in surface_anchor_registrations)
+    if localization is not None:
+        route_items.append(SkillRouteManifestEntry(
+            route=localization.skill.routes[0],
+            deployment_binding=localization.binding.to_ref(),
+            evaluation_plan_hash=None, availability_hash=localization.availability_hash))
     io_contract_by_skill = {}
     for item in route_items:
         route_item = item.route
@@ -3761,7 +3815,7 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
         if rgbd_capture is not None and key == ("perception.capture_rgb", "3"):
             explicit_contracts += (rgbd_capture.skill.io_contract,)
         explicit_contracts += tuple(registration.skill.io_contract
-            for registration in (object_goal_query_registration, *surface_anchor_registrations)
+            for registration in (object_goal_query_registration, localization, *surface_anchor_registrations)
             if registration is not None and key == (
                 registration.skill.definition.skill_id, registration.skill.definition.skill_version))
         contract = (
@@ -3886,6 +3940,8 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
     if object_goal_query_registration is not None:
         validator_items.append(object_goal_query_registration.payload_validator)
     validator_items.extend(registration.payload_validator for registration in surface_anchor_registrations)
+    if localization is not None:
+        validator_items.append(localization.payload_validator)
     if tcp_pose_comparison_registration is not None:
         validator_items.append(tcp_pose_comparison_registration.payload_validator)
     if object_state_registration is not None:
@@ -3948,6 +4004,7 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
         segmentation=segmentation,
         segmentation_batch=segmentation_batch,
         segmentation_geometry=segmentation_geometry,
+        localization=localization,
         placement=placement,
         history_profile=history_profile,
         history_source_binding=history_source_binding,

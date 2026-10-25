@@ -200,7 +200,7 @@ def _assert_unsettled_passive_read_defers_owned_dependency_cleanup(state_reader)
         rgb_executor=None, segmentation_batch_executor=None, segmentation_geometry_executor=None,
         history_executor=None,
         spatial_goal_executor=None, rgbd_capture_executor=None,
-        object_goal_query_executor=None, surface_anchor_executors=(),
+        object_goal_query_executor=None, surface_anchor_executors=(), localization_executor=None,
         contract_bundle=SimpleNamespace(surface_anchor_registrations=()),
         segmentation_executor=None,
         placement_executor=placement_executor,
@@ -2764,7 +2764,7 @@ def _gateway_close_retry_session(outcomes, *, started=True):
         state_executor=None, tcp_pose_comparison_executor=None, depth_executor=None,
         rgb_executor=None, back_projection_executor=None, history_executor=None,
         spatial_goal_executor=None, segmentation_executor=None, placement_executor=None,
-        object_goal_query_executor=None, surface_anchor_executors=(),
+        object_goal_query_executor=None, surface_anchor_executors=(), localization_executor=None,
         contract_bundle=SimpleNamespace(surface_anchor_registrations=()),
         _segmentation_model_started=False,
         segmentation_localizer=SimpleNamespace(
@@ -2835,7 +2835,7 @@ def test_session_model_start_rejects_directly_closed_service() -> None:
     assert calls["service"] == []
 
 
-@pytest.mark.parametrize("state_reader", ["state_executor", "tcp_pose_comparison_executor", "rgbd_capture_executor"])
+@pytest.mark.parametrize("state_reader", ["state_executor", "tcp_pose_comparison_executor", "rgbd_capture_executor", "localization_executor"])
 def test_session_confirmed_close_retries_passive_drain_without_new_hold(state_reader) -> None:
     _, accepted = _gateway_close_outcomes()
     session, calls = _gateway_close_retry_session([accepted])
@@ -2856,7 +2856,7 @@ def test_session_confirmed_close_retries_passive_drain_without_new_hold(state_re
 
     assert session.close() is accepted
     assert len(calls["service"]) == 1
-    assert waits == [{"timeout_sec": 5.0}] * 2
+    assert waits == [{"timeout_sec": 65.0 if state_reader == "localization_executor" else 5.0}] * 2
     assert calls["model_close"] == calls["lower"] == ["closed"]
     assert calls["history_store"] == calls["artifact_store"] == ["closed"]
     assert session.close() is accepted

@@ -139,6 +139,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--enable-rgbd-capture-v3", action="store_true",
                         help="Publish capture_rgb v3 with optional native-grid paired RGB-D Artifacts; default off.")
+    parser.add_argument("--enable-object-localization", action="store_true",
+                        help="Publish supplied-image localize_objects v1 using the existing segmentation model; default off.")
     parser.add_argument("--enable-segmentation-batch-v2", action="store_true",
                         help="Publish same-cut ordered multi-target segmentation v2; default off.")
     parser.add_argument("--enable-segmentation-geometry-v3", action="store_true",
@@ -506,6 +508,7 @@ def main(argv: list[str] | None = None) -> int:
         or args.enable_surface_anchors
         or args.enable_surface_anchor_v2
         or args.enable_surface_anchor_v3
+        or args.enable_object_localization
         or args.enable_relation_goal_queries
         or args.history_root is not None
         or args.segmentation_asset_bundle is not None
@@ -514,6 +517,11 @@ def main(argv: list[str] | None = None) -> int:
             "--motion-side left currently supports baseline TCP/state Routes only; "
             "gripper, grasp, spatial goal, history and segmentation combinations are not enabled"
         )
+    if args.enable_object_localization and not (
+            args.segmentation_asset_bundle is not None and args.artifact_root is not None):
+        parser.error("--enable-object-localization requires --segmentation-asset-bundle and --artifact-root")
+    if args.enable_object_localization and args.enable_surface_anchor_v3 and args.max_retained_operations < 4:
+        parser.error("localized paired anchors require --max-retained-operations >= 4")
     for name in ("enable_segmentation_batch_v2", "enable_segmentation_geometry_v3"):
         if getattr(args, name) and (args.artifact_root is None or args.segmentation_asset_bundle is None):
             parser.error("--" + name.replace("_", "-") + " requires --artifact-root and --segmentation-asset-bundle")
@@ -647,6 +655,7 @@ def main(argv: list[str] | None = None) -> int:
         enable_segmentation_batch_v2=args.enable_segmentation_batch_v2,
         enable_segmentation_geometry_v3=args.enable_segmentation_geometry_v3,
         segmentation_localizer=segmentation_localizer,
+        enable_object_localization=args.enable_object_localization,
         enable_safe_tcp_pose=args.enable_safe_tcp_pose,
         enable_spatial_goals=args.enable_spatial_goals,
         enable_object_goal_queries=args.enable_object_goal_queries,
