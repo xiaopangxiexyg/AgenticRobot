@@ -57,6 +57,7 @@ from sim.mujoco.tasks.cube_lift.config import CubeLiftTaskConfig
 from .gripper_skill import MujocoGripperControlPort
 from .motion_application import MujocoAgentSkillMotionApplication
 from .motion_deployment import (
+    MUJOCO_OBSERVED_POINT_ROUTE_ID,
     MUJOCO_AGENT_GRASP_APPROACH_ROUTE_ID_V1,
     MUJOCO_AGENT_GRASP_CONTACT_ROUTE_ID_V1,
     MUJOCO_AGENT_OBJECT_MOVE_ROUTE_ID_V1,
@@ -73,6 +74,7 @@ from .motion_gateway_session import (
     MujocoAgentTcpPoseGatewaySession,
     assemble_mujoco_agent_tcp_pose_gateway_session,
 )
+from .motion_observed_scene import MujocoObservedSafeMotionConfig
 from .motion_primitive_profiles import (
     MUJOCO_AGENT_TCP_CARDINAL_STEP_ROUTE_ID_V1,
     MUJOCO_AGENT_TCP_FIXED_CARDINAL_STEP_ROUTE_ID_BY_SKILL_ID_V1,
@@ -278,6 +280,7 @@ def _build_standard_tcp_pose_envelope_runtime(
     prepared: Any,
     target_config: MujocoSimHILTargetConfig,
     enable_safe_tcp_pose: bool = False,
+    enable_observed_point_motion: bool = False,
     enable_grasp_approach: bool = False,
     grasp_contact_binding: MujocoGraspContactBinding | None = None,
     enable_object_motion: bool = False,
@@ -349,6 +352,7 @@ def _build_standard_tcp_pose_envelope_runtime(
         allowed_route_ids=(
             MUJOCO_AGENT_TCP_POSE_ROUTE_ID_V1,
             *((MUJOCO_AGENT_SAFE_TCP_POSE_ROUTE_ID_V1,) if enable_safe_tcp_pose else ()),
+            *((MUJOCO_OBSERVED_POINT_ROUTE_ID,) if enable_observed_point_motion else ()),
             MUJOCO_AGENT_TCP_CARDINAL_STEP_ROUTE_ID_V1,
             *tuple(
                 MUJOCO_AGENT_TCP_FIXED_CARDINAL_STEP_ROUTE_ID_BY_SKILL_ID_V1.values()
@@ -521,6 +525,7 @@ def build_mujoco_agent_tcp_pose_gateway_session(
     artifact_storage: MujocoAgentArtifactStorageConfig | None = None,
     segmentation_localizer: object | None = None,
     enable_safe_tcp_pose: bool = False,
+    enable_observed_point_motion: bool = False,
     enable_spatial_goals: bool = False,
     enable_tcp_pose_comparison: bool = False,
     enable_object_state: bool = False,
@@ -532,12 +537,24 @@ def build_mujoco_agent_tcp_pose_gateway_session(
     grasp_contact_target_body: str | None = None,
     fast_grasp_planner: Any | None = None,
     fast_grasp_approach_config: Mapping[str, float] | None = None,
+    safe_motion_observation: MujocoObservedSafeMotionConfig | None = None,
 ) -> MujocoAgentTcpPoseGatewaySession:
     """Build the exact default-off graph; do not start, record, or serve it."""
 
     if not isinstance(target_config, MujocoSimHILTargetConfig):
         raise TypeError("target_config must be MujocoSimHILTargetConfig.")
     side = _validated_motion_side(motion_side)
+    if safe_motion_observation is not None:
+        if not isinstance(safe_motion_observation, MujocoObservedSafeMotionConfig):
+            raise TypeError("safe_motion_observation must be MujocoObservedSafeMotionConfig.")
+        if not enable_safe_tcp_pose or artifact_storage is None:
+            raise ValueError("Observed safe motion requires the original safe Route and RGB-D resources.")
+        if target_config.realtime_worker:
+            raise ValueError("Observed safe motion requires the same deterministic physics owner.")
+    if type(enable_observed_point_motion) is not bool:
+        raise TypeError("enable_observed_point_motion must be boolean.")
+    if enable_observed_point_motion and safe_motion_observation is None:
+        raise ValueError("Observed-point motion requires explicit sensor-shaped safe motion.")
     component = f"{side}_arm"
     inactive = "left" if side == "right" else "right"
     if not isinstance(enable_grippers, bool):
@@ -701,6 +718,7 @@ def build_mujoco_agent_tcp_pose_gateway_session(
         prepared=prepared,
         target_config=target_config,
         enable_safe_tcp_pose=enable_safe_tcp_pose,
+        enable_observed_point_motion=enable_observed_point_motion,
         enable_grasp_approach=enable_grasp_approach,
         grasp_contact_binding=grasp_contact_binding,
         enable_fast_grasp=fast_grasp_planner is not None,
@@ -786,6 +804,11 @@ def build_mujoco_agent_tcp_pose_gateway_session(
                 else segmentation_localizer.semantic_content_hash
             ),
             enable_safe_tcp_pose=enable_safe_tcp_pose,
+            enable_observed_point_motion=enable_observed_point_motion,
+            safe_motion_observation_profile_hash=(None if safe_motion_observation is None
+                else safe_motion_observation.bound_profile_hash(
+                    minimum_clearance_m=application.scene.scene_spec.collision.safety_minimum_clearance_m,
+                    planning_clearance_padding_m=safe_tcp_planning_clearance_padding_m)),
             enable_spatial_goals=enable_spatial_goals,
             enable_tcp_pose_comparison=enable_tcp_pose_comparison,
             enable_object_state=enable_object_state,
@@ -838,6 +861,7 @@ def build_mujoco_agent_tcp_pose_gateway_session(
             segmentation_localizer=segmentation_localizer,
             fast_grasp_planner=fast_grasp_planner,
             gripper_ports=gripper_ports,
+            safe_motion_observation=safe_motion_observation,
         )
     except Exception:
         if history_store is not None:

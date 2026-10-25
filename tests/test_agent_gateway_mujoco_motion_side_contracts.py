@@ -1239,6 +1239,7 @@ def test_inactive_joint_reference_and_original_drift_guard_are_preserved(
         source_model_qpos=qpos.copy(),
         trajectory_hash="fixture:trajectory",
         payload_binding=None,
+        contact_binding=None,
     )
     planner._reference_index = 0
     planner._live_stage = planner._active

@@ -414,9 +414,7 @@ class MujocoAgentTcpPoseSkillLifecycle:
                 "TCP pose lifecycle component does not match the deployment "
                 "binding."
             )
-        for field_name, expected in lineage.items():
-            if parameters.get(field_name) != expected:
-                raise ValueError(f"TCP pose lifecycle {field_name} mismatch.")
+        self._validate_parameter_lineage(parameters, lineage)
 
         self.executor_id = deployment_binding.executor_id
         self.application = application
@@ -569,6 +567,12 @@ class MujocoAgentTcpPoseSkillLifecycle:
             values[self.component_id],
             field_name=f"measured.{self.component_id}",
         )
+
+    def _validate_parameter_lineage(self, parameters, lineage):
+        """Absolute primitives declare lineage; semantic adapters bind it in their Route."""
+        for field_name, expected in lineage.items():
+            if parameters.get(field_name) != expected:
+                raise ValueError(f"TCP pose lifecycle {field_name} mismatch.")
 
     def activate(
         self,
@@ -1128,8 +1132,15 @@ class MujocoAgentSafeTcpPoseSkillLifecycle(MujocoAgentTcpPoseSkillLifecycle):
     """Keep the normal lifecycle and receipts; replace only lower references."""
 
     def __init__(self, *, path_search_time_budget_sec: float = 3.0,
-                 contact_binding=None, **kwargs: Any) -> None:
+                 contact_binding=None, observed_planning_provider=None, **kwargs: Any) -> None:
         super().__init__(**kwargs)
+        self._observed_planning_provider = observed_planning_provider
+        expected = self.motion_profile.profile_id
+        actual = (None if observed_planning_provider is None else
+                  "mujoco.agent_safe_tcp_pose.rgbd." + observed_planning_provider.semantic_content_hash)
+        if ((actual is not None and actual != expected)
+                or (actual is None and expected.startswith("mujoco.agent_safe_tcp_pose.rgbd."))):
+            raise ValueError("Observed planner and admitted motion profile must match.")
         self._path_search_time_budget_sec = path_search_time_budget_sec
         self._contact_binding = contact_binding
         self._contact_check_enabled = False
@@ -1169,6 +1180,11 @@ class MujocoAgentSafeTcpPoseSkillLifecycle(MujocoAgentTcpPoseSkillLifecycle):
     def _prepare_plan(self, *, constraint, constraint_identity, cancel_requested):
         translation_tolerance, rotation_tolerance = self._planning_goal_tolerances()
         payload_binding = self._planning_payload_binding()
+        observed = (None if self._observed_planning_provider is None else
+            self._observed_planning_provider.capture(
+                operation_id=self.operation.operation_id,
+                expected_station_revision=self.request.expected_station_revision,
+                cancel_requested=cancel_requested))
         return self._planner.plan(
             self.target_pose,
             translation_tolerance_m=translation_tolerance,
@@ -1179,6 +1195,7 @@ class MujocoAgentSafeTcpPoseSkillLifecycle(MujocoAgentTcpPoseSkillLifecycle):
             path_search_time_budget_sec=self._path_search_time_budget_sec,
             contact_binding=self._contact_binding,
             **({"payload_binding": payload_binding} if payload_binding is not None else {}),
+            **({"observed_planning_input": observed} if observed is not None else {}),
         )
 
     def _activate_plan(self, plan):

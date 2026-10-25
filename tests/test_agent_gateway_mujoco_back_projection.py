@@ -28,6 +28,34 @@ _PREGRASP_TASK = (
 )
 
 
+def test_raw_and_encoded_depth_cuts_share_content_and_capture_identity():
+    from types import SimpleNamespace
+    from agent_gateway.profiles.mujoco.back_projection import (
+        live_aligned_depth_capture, live_aligned_depth_capture_from_array,
+    )
+    from sim.mujoco.depth_snapshot import MujocoRawRgbdView, _encoded_depth_frame
+
+    depth = np.asfortranarray([[1., float("nan")], [-1., 2.]], dtype=np.float64)
+    metadata = dict(width=2, height=2, fovy_deg=60.,
+        camera_pose_world_xyz_quat_xyzw=(0., 0., 1., 0., 0., 0., 1.))
+    encoded = _encoded_depth_frame(view_id="front", raw_depth=depth, metadata=metadata, captured_at=12.5)
+    view = MujocoRawRgbdView(view_id="front", rgb=np.zeros((2, 2, 3), dtype=np.uint8),
+        depth_m=depth, optical_camera_pose_world_xyz_quat_xyzw=encoded.camera_pose_world_xyz_quat_xyzw,
+        intrinsics=encoded.intrinsics)
+    args = dict(source_id="front", role="main", station_revision=3,
+        application=SimpleNamespace(transform_tcp_pose_xyzquat=lambda pose, **kw: pose),
+        source_frame_id="world", reference_frame_id="station")
+    before = live_aligned_depth_capture(encoded, **args)
+    after = live_aligned_depth_capture_from_array(view.depth_m, captured_at=encoded.captured_at,
+        camera_pose_world_xyz_quat_xyzw=view.optical_camera_pose_world_xyz_quat_xyzw,
+        intrinsics=view.intrinsics, **args)
+    assert before.depth_content_hash == after.depth_content_hash
+    assert before.capture_group_id == after.capture_group_id
+    assert before.captured_at == after.captured_at == 12.5
+    np.testing.assert_array_equal(before.depth_m, after.depth_m)
+    np.testing.assert_array_equal(before.reference_from_camera, after.reference_from_camera)
+
+
 @pytest.mark.integration
 @pytest.mark.optional
 @pytest.mark.slow_sim

@@ -32,7 +32,7 @@ def _application():
         rig_calls.append(True)
         return callback(scene)
 
-    app.runtime = SimpleNamespace(rig=SimpleNamespace(capture_scene=capture_scene))
+    app.runtime = SimpleNamespace(rig=SimpleNamespace(capture_scene=capture_scene, scene=scene))
     source = MujocoDepthSnapshotSource(capture_scene=app._capture_visual_scene, clock=lambda: 1.0)
 
     class Renderer:
@@ -126,6 +126,134 @@ def test_visual_cut_close_race_rejects_under_application_lock_before_rig():
         with pytest.raises(RuntimeError, match="application is closed"):
             app.capture_visual_depth_cut(view_id="front")
         assert not rig_calls
+    finally:
+        source.close()
+
+
+def _ready_planning_capture(app):
+    app._started, app._held = True, False
+    app._active_operation_id = "op:next"
+    app.target = SimpleNamespace(planned_tcp_motion=SimpleNamespace(active=False))
+    app.runtime.clock = lambda: 1.0
+    app.runtime.capture_execution_gate_snapshot = lambda **kwargs: SimpleNamespace(status="ready")
+
+
+@pytest.mark.parametrize("cancel_waiter", (False, True))
+def test_planning_capture_drains_prior_source_reader_without_reversing_locks(cancel_waiter):
+    app, source, rig_calls = _application()
+    _ready_planning_capture(app)
+    source_owned, waiter_entered, cancelled = (threading.Event() for _ in range(3))
+    errors, results = {}, {}
+    lock, capture = source._lock, source._capture_scene
+
+    class CheckedSourceLock:
+        def __enter__(self):
+            assert not app._lock._is_owned(), "application -> source lock inversion"
+            if threading.current_thread().name == "planning-cut":
+                if cancel_waiter:
+                    cancelled.set()
+                waiter_entered.set()
+            lock.acquire()
+            return self
+
+        def __exit__(self, *args):
+            lock.release()
+
+    def capture_scene(callback):
+        if threading.current_thread().name == "prior-depth":
+            source_owned.set()
+            assert waiter_entered.wait(2)
+        return capture(callback)
+
+    source._lock = CheckedSourceLock()
+    source._capture_scene = capture_scene
+
+    def run(name, callback):
+        try:
+            results[name] = callback()
+        except BaseException as error:
+            errors[name] = error
+
+    prior = threading.Thread(target=run, args=("prior", lambda: app.capture_depth_npy_frame(view_id="front")),
+        name="prior-depth", daemon=True)
+    planning = threading.Thread(target=run, args=("planning", lambda: app.capture_planning_rgbd_cut(
+        operation_id="op:next", source_ids=("front",), cancel_requested=cancelled.is_set)),
+        name="planning-cut", daemon=True)
+    try:
+        prior.start()
+        assert source_owned.wait(2)
+        planning.start()
+        prior.join(3)
+        planning.join(3)
+        assert not prior.is_alive() and not planning.is_alive()
+        assert "prior" in results and "prior" not in errors and len(rig_calls) == 2
+        if cancel_waiter:
+            assert set(errors) == {"planning"}
+            assert errors["planning"].reason_code == "safe_tcp_planning_cancelled"
+        else:
+            assert not errors and results["planning"].captured_at == 1.0
+    finally:
+        waiter_entered.set()
+        prior.join(3)
+        if planning.ident is not None:
+            planning.join(3)
+        source.close()
+
+
+@pytest.mark.parametrize("invalid", (None, "not_started", "held", "other_operation",
+    "no_planner", "active_plan", "not_ready", "closed", "cancelled"))
+def test_planning_capture_requires_exact_ready_operation_before_render(invalid):
+    app, source, rig_calls = _application()
+    _ready_planning_capture(app)
+    if invalid == "not_started": app._started = False
+    if invalid == "held": app._held = True
+    if invalid == "other_operation": app._active_operation_id = "op:other"
+    if invalid == "no_planner": app.target.planned_tcp_motion = None
+    if invalid == "active_plan": app.target.planned_tcp_motion.active = True
+    if invalid == "not_ready": app.runtime.capture_execution_gate_snapshot = lambda **kwargs: SimpleNamespace(status="hold")
+    if invalid == "closed": app._closed = True
+    renders, render = [], source._renderer_cache.render
+
+    def record_render(*args, **kwargs):
+        renders.append(True)
+        return render(*args, **kwargs)
+
+    source._renderer_cache.render = record_render
+    try:
+        call = lambda: app.capture_planning_rgbd_cut(operation_id="op:next", source_ids=("front",),
+            cancel_requested=lambda: invalid == "cancelled")
+        if invalid is None:
+            assert call().captured_at == 1.0 and len(renders) == 1
+        else:
+            with pytest.raises(RuntimeError): call()
+            assert not renders
+        assert len(rig_calls) == (0 if invalid == "closed" else 1)
+    finally:
+        source.close()
+
+
+def test_planning_capture_rechecks_stop_before_rendering_the_next_view():
+    app, source, _ = _application()
+    _ready_planning_capture(app)
+    scene = app.runtime.rig.scene
+    scene.camera_names = ("front", "wrist")
+    metadata = scene.camera_metadata()["front"]
+    scene.camera_metadata = lambda: {name: metadata for name in scene.camera_names}
+    cancelled, renders = threading.Event(), []
+    render = source._renderer_cache.render
+
+    def cancel_after_first(*args, **kwargs):
+        result = render(*args, **kwargs)
+        renders.append(True)
+        cancelled.set()
+        return result
+
+    source._renderer_cache.render = cancel_after_first
+    try:
+        with pytest.raises(RuntimeError, match="safe_tcp_planning_cancelled"):
+            app.capture_planning_rgbd_cut(operation_id="op:next", source_ids=scene.camera_names,
+                cancel_requested=cancelled.is_set)
+        assert len(renders) == 1
     finally:
         source.close()
 

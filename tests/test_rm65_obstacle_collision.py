@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import threading
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -16,6 +17,55 @@ from robot_motion.scene_obstacles import (
 
 pin = pytest.importorskip("pinocchio")
 hppfcl = pytest.importorskip("hppfcl")
+
+
+def test_profile_model_cache_separates_verified_resource_revisions(monkeypatch):
+    from robot_motion.rm65 import ik
+    from robot_motion.rm65.obstacle_collision import _profile_collision_solver_bundle
+
+    loaded = []
+    monkeypatch.setattr(ik, "RM65DualArmCollisionIKConfig", lambda **kw: kw)
+    def build(config):
+        result = SimpleNamespace(config=config)
+        loaded.append(result)
+        return result
+    monkeypatch.setattr(ik, "build_rm65_dual_arm_collision_ik_solver", build)
+    _profile_collision_solver_bundle.cache_clear()
+    try:
+        first = _profile_collision_solver_bundle("fixture:profile", "a"*64)
+        assert _profile_collision_solver_bundle("fixture:profile", "a"*64) is first
+        assert _profile_collision_solver_bundle("fixture:profile", "b"*64) is not first
+        assert len(loaded) == 2
+    finally:
+        _profile_collision_solver_bundle.cache_clear()
+
+
+def test_changing_resources_cannot_poison_the_verified_model_cache(monkeypatch):
+    from robot_motion.rm65 import ik
+    from robot_motion.rm65.obstacle_collision import _profile_collision_solver_bundle
+
+    resource, loaded = ["original"], []
+    monkeypatch.setattr(ik, "RM65DualArmCollisionIKConfig", lambda **kw: kw)
+    def validate():
+        if resource[0] != "original":
+            raise ValueError("resources changed")
+    def build(config):
+        loaded.append(config)
+        if len(loaded) == 1:
+            resource[0] = "changed during materialization"
+        return SimpleNamespace(config=config)
+    monkeypatch.setattr(ik, "build_rm65_dual_arm_collision_ik_solver", build)
+    _profile_collision_solver_bundle.cache_clear()
+    try:
+        with pytest.raises(ValueError, match="resources changed"):
+            _profile_collision_solver_bundle("fixture:profile", "a"*64, validate)
+        assert _profile_collision_solver_bundle.cache_info().currsize == 0
+        resource[0] = "original"
+        restored = _profile_collision_solver_bundle("fixture:profile", "a"*64, validate)
+        assert len(loaded) == 2
+        assert _profile_collision_solver_bundle("fixture:profile", "a"*64, validate) is restored
+    finally:
+        _profile_collision_solver_bundle.cache_clear()
 
 
 def _simple_prismatic_collision_model():

@@ -537,6 +537,34 @@ class MujocoAgentSkillMotionApplication:
             require_capture_state=require_state,
         )
 
+    def capture_planning_rgbd_cut(
+        self, *, operation_id: str, source_ids: tuple[str, ...],
+        cancel_requested: Callable[[], bool],
+    ) -> MujocoRawRgbdCut:
+        """Capture for this READY operation in source -> application -> rig order."""
+        from sim.mujoco.deploy.planned_tcp_motion import MujocoTcpPlanRejected
+
+        normalized_id = _required(operation_id, field_name="operation_id")
+        if not callable(cancel_requested):
+            raise TypeError("Planning capture requires the operation stop/deadline port.")
+
+        def require_state() -> None:
+            # The source invokes this under the existing application/rig cut.
+            # The worker callback reads its Event and clock, never its Store.
+            if cancel_requested():
+                raise MujocoTcpPlanRejected("safe_tcp_planning_cancelled")
+            if (not self._started or self._closed or self._held
+                    or self._active_operation_id != normalized_id
+                    or self.target.planned_tcp_motion is None
+                    or self.target.planned_tcp_motion.active):
+                raise MujocoTcpPlanRejected("observed_planning_capture_unavailable")
+            gate = self.runtime.capture_execution_gate_snapshot(now=float(self.runtime.clock()))
+            if str(gate.status) != "ready":
+                raise MujocoTcpPlanRejected("observed_planning_capture_not_ready")
+
+        return self._depth_snapshot_source.capture_rgbd_cut(
+            view_ids=source_ids, require_capture_state=require_state)
+
 
     def capture_grasp_scene_state(self):
         """Read the complete native state without rendering or advancing physics.

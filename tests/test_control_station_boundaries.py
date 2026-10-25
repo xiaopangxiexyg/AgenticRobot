@@ -263,6 +263,8 @@ def test_gateway_sim_dependencies_are_confined_to_mujoco_profile() -> None:
         "agent_gateway/profiles/mujoco/motion_factory.py": ["sim"],
         # The concrete assembly names its lower measured-object observer type.
         "agent_gateway/profiles/mujoco/motion_gateway_session.py": ["sim"],
+        # Sensor-shaped planning is a concrete simulator leaf.
+        "agent_gateway/profiles/mujoco/motion_observed_scene.py": ["sim"],
         # The concrete safe-TCP lifecycle binds its lower simulation planner.
         "agent_gateway/profiles/mujoco/motion_skill.py": ["sim"],
         "agent_gateway/profiles/mujoco/observation.py": ["sim"],
@@ -315,6 +317,9 @@ def test_gateway_numerical_dependencies_are_confined_to_concrete_profiles() -> N
         # perception profiles; Gateway core remains numerical-neutral.
         "agent_gateway/profiles/back_projection.py": ["numpy"],
         "agent_gateway/profiles/mujoco/back_projection.py": ["numpy"],
+        "agent_gateway/profiles/mujoco/motion_observed_scene.py": ["numpy"],
+        "agent_gateway/profiles/mujoco/object_motion.py": ["numpy"],
+        "agent_gateway/profiles/mujoco/object_state.py": ["numpy"],
         "agent_gateway/profiles/placement.py": ["numpy"],
         "agent_gateway/profiles/real/back_projection.py": ["numpy"],
         "agent_gateway/profiles/segmentation.py": ["numpy"],
