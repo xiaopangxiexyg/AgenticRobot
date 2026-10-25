@@ -126,6 +126,26 @@ class _Server(ThreadingHTTPServer):
                 raise ValueError("owner shutdown protocol is not available")
             self._stop_handler(action)
 
+    def record_assessment(self, payload, *, declaration_source=None):
+        if self.assessment is None:
+            raise ValueError("transparency recording is not configured")
+        handler = self.human_intervention_handler
+        sequence = None
+        if handler is not None:
+            if set(payload) != {"action", "human_intervention"} or payload.get("action") != "context" or type(payload.get("human_intervention")) is not bool:
+                raise ValueError("probe context requires human_intervention boolean")
+            with self.human_context_lock:
+                self.human_context_sequence += 1
+                sequence = self.human_context_sequence
+                if payload["human_intervention"]:
+                    handler(True)
+        self.assessment.record(payload, self.controller.status(),
+            **({"declaration_source": declaration_source} if declaration_source is not None else {}))
+        if handler is not None and not payload["human_intervention"]:
+            with self.human_context_lock:
+                if sequence == self.human_context_sequence:
+                    handler(False)
+
 
 class _Handler(BaseHTTPRequestHandler):
     server: _Server
@@ -258,26 +278,10 @@ class _Handler(BaseHTTPRequestHandler):
             if not isinstance(action, str):
                 raise TypeError("action must be a string")
             if self.path == "/api/assessment":
-                if self.server.assessment is None:
-                    raise ValueError("transparency recording is not configured")
                 # Only the explicit probe app binds control context. A true
                 # declaration withdraws before disk I/O; permission to resume
                 # requires successful annotation. Neither renews the lease.
-                handler = self.server.human_intervention_handler
-                context_sequence = None
-                if handler is not None:
-                    if set(payload) != {"action", "human_intervention"} or action != "context" or not isinstance(payload["human_intervention"], bool):
-                        raise ValueError("probe context requires human_intervention boolean")
-                    with self.server.human_context_lock:
-                        self.server.human_context_sequence += 1
-                        context_sequence = self.server.human_context_sequence
-                        if payload["human_intervention"]:
-                            handler(True)
-                self.server.assessment.record(payload, self.server.controller.status())
-                if handler is not None and not payload["human_intervention"]:
-                    with self.server.human_context_lock:
-                        if context_sequence == self.server.human_context_sequence:
-                            handler(False)
+                self.server.record_assessment(payload)
             elif self.path == "/api/stop":
                 if set(payload) != {"action"}:
                     raise ValueError("invalid stop request fields")
@@ -406,6 +410,15 @@ class B601TorqueConsoleServer:
 
     def set_stop_handler(self, handler: Callable[[str], None] | None) -> None:
         self._server.set_stop_handler(handler)
+
+    def declare_managed_context(self) -> None:
+        """Record an explicit launch declaration before any motor connection."""
+        if (self._server.assessment is None or not self._server.assessment.automatic
+            or self._server.human_intervention_handler is None
+            or self._server.controller.status().get("owner_ready")):
+            raise ValueError("managed declaration requires the unopened automatic workspace")
+        self._server.record_assessment({"action": "context", "human_intervention": False},
+            declaration_source="managed_cycle")
 
     def start(self) -> None:
         if self._thread is not None:

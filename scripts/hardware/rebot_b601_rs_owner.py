@@ -160,6 +160,8 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--torque-console-auto-calibration-profile", type=Path,
                         help="opt-in one-click J3 onset, low-speed and withdrawal acquisition profile")
+    parser.add_argument("--torque-console-managed-cycle", action="store_true",
+                        help="explicit single workspace start/permit/return; declares clear space and supported origin; no browser required")
     parser.add_argument("--torque-console-command-field-report", type=Path,
                         help="closed native-track command report for explicit experimental workspace field")
     parser.add_argument("--torque-console-command-field-mode", choices=("off", "shadow", "candidate"), default="off")
@@ -513,6 +515,8 @@ def build_probe_command(
 ) -> list[str]:
     field_report = getattr(args, "torque_console_command_field_report", None)
     field_mode = getattr(args, "torque_console_command_field_mode", "off")
+    if getattr(args, "torque_console_managed_cycle", False) and args.torque_console_auto_calibration_profile is None:
+        raise ValueError("managed cycle requires an explicit automatic workspace profile")
     if (field_report is not None or field_mode != "off") and args.torque_console_auto_calibration_profile is None:
         raise ValueError("command field requires the explicit automatic workspace profile")
     if args.torque_console_auto_calibration_profile is not None:
@@ -616,6 +620,8 @@ def build_probe_command(
         command.extend(("--torque-console-onset-probe-max-displacement-rad",
                         str(args.torque_console_onset_probe_max_displacement_rad)))
     if args.torque_console:
+        if getattr(args, "torque_console_managed_cycle", False):
+            command.append("--torque-console-managed-cycle")
         if args.torque_console_auto_calibration_profile is not None:
             command.extend(("--torque-console-auto-calibration-profile", str(args.torque_console_auto_calibration_profile.resolve())))
         if field_report is not None:
@@ -939,6 +945,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
     if args.torque_console_auto_calibration_profile is not None:
         print(
+            "[B601] managed single workspace cycle: clear-space/supported-origin declaration supplied by this launch; "
+            "the existing controller owns start admission, soft-stop return and disable; no automatic retry"
+            if args.torque_console_managed_cycle else
             "[B601] automatic calibration: select the configured GUI mode, declare no human intervention and start one batch; "
             "no manual target entry; keep the page visible and clear both directions",
             flush=True,

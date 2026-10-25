@@ -3676,6 +3676,10 @@ def resolve_active_joint_names() -> tuple[str, ...]:
 
 
 def _validate_cli(args: argparse.Namespace) -> None:
+    if getattr(args, "torque_console_managed_cycle", False) and (
+        args.mode != "hold" or getattr(args, "torque_console_auto_calibration_profile", None) is None
+    ):
+        raise LowGainProbeError("managed cycle requires hold and an explicit automatic workspace profile")
     if (getattr(args, "torque_console_command_field_mode", "off") != "off"
         or getattr(args, "torque_console_command_field_report", None) is not None
     ) and getattr(args, "torque_console_auto_calibration_profile", None) is None:
@@ -8729,6 +8733,7 @@ def run_probe(
     torque_console: _TorqueConsoleController | None = None,
     console_stop_binding: Callable[[Callable[[str], None] | None], None] | None = None,
     post_cleanup_checkpoint: Callable[[dict[str, object]], None] | None = None,
+    managed_cycle=None,
 ) -> dict[str, object]:
     """Run the guarded active probe; callers must provide explicit authority."""
 
@@ -8741,6 +8746,10 @@ def run_probe(
     )
     if (torque_console is None) != (not getattr(args, "torque_console", False)):
         raise LowGainProbeError("torque console flag and owner session must agree")
+    if (managed_cycle is None) != (not getattr(args, "torque_console_managed_cycle", False)):
+        raise LowGainProbeError("managed cycle flag and owner session must agree")
+    if managed_cycle is not None and managed_cycle.controller is not torque_console:
+        raise LowGainProbeError("managed cycle must share the existing torque console")
     if torque_console is not None and (
         shared_control_runtime is not None
         or shared_control_commissioning is not None
@@ -10003,6 +10012,9 @@ def run_probe(
                     if not torque_console_ready_notice:
                         if getattr(args, "torque_console_auto_calibration_profile", None) is not None:
                             ready_notice = (
+                                "[B601] [MANAGED CYCLE READY] waiting for the existing zero-assist/origin admission; "
+                                "one workspace batch, supported soft-stop return and disable, no automatic retry."
+                                if getattr(args, "torque_console_managed_cycle", False) else
                                 "[B601] [AUTOMATIC CALIBRATION READY] gravity only; "
                                 "choose the GUI mode when available, declare no human intervention, then press Start. "
                                 "The selected GUI mode drives J3, or J2/J3 when workspace acquisition is configured; keep E-stop ready."
@@ -10845,6 +10857,10 @@ def run_probe(
                     **({"native_receipt": _command_receipt_payload(receipt)}
                        if getattr(args, "torque_console_auto_calibration_profile", None) is not None else {}),
                 )
+                if managed_cycle is not None and managed_cycle.tick(
+                    now_sec=receipt.completed_at_sec, owner_active=handoff_fraction >= 1.0,
+                ) == "protective_hold":
+                    _console_stop_request(stop, "protective_hold")
                 if (
                     _request_supported_return_disable(stop, torque_console, cycle_disable_confirmation)
                 ):
@@ -12836,6 +12852,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--torque-console-auto-calibration-profile", type=Path,
                         help="opt-in one-click J3 onset, low-speed and withdrawal acquisition profile")
+    parser.add_argument("--torque-console-managed-cycle", action="store_true",
+                        help="explicit clear-space/supported-origin single workspace cycle without GUI start or retries")
     parser.add_argument("--torque-console-command-field-report", type=Path,
                         help="closed native-track command report for explicit experimental workspace field")
     parser.add_argument("--torque-console-command-field-mode", choices=("off", "shadow", "candidate"), default="off",
@@ -13454,6 +13472,11 @@ def _preflight_probe(args: argparse.Namespace) -> dict[str, object]:
                 driver_kd_nm_s_per_rad=(_DEFAULT_DRIVER_KD if args.driver_kd is None else base_driver_kd)), limits)
     elif args.torque_console_staged_assist:
         settings = _staged_torque_console_settings_from_args(args)
+    if getattr(args, "torque_console_managed_cycle", False):
+        from control_station.b601_torque_console.managed_cycle import B601ManagedCycle
+
+        B601ManagedCycle(automatic, now_sec=0.0)
+        settings = automatic.settings
     if args.torque_console and any(args.torque_console_max_assist_nm > cap for cap in torque_limits):
         raise LowGainProbeError("torque console assist cap exceeds a selectable joint's final torque envelope")
     return {
@@ -13474,6 +13497,7 @@ def _preflight_probe(args: argparse.Namespace) -> dict[str, object]:
             asdict(automatic.cycle) if automatic is not None and hasattr(automatic,"cycle") else None
         ),
         "automatic_mode_selection": None if automatic is None else automatic.status().get("mode_selection"),
+        "managed_cycle_enabled": getattr(args, "torque_console_managed_cycle", False),
         "command_field_source": getattr(automatic, "command_field_source_metadata", None),
         "automatic_workspace_settings": (
             None if getattr(automatic, "workspace_configuration", None) is None
@@ -13538,6 +13562,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         else None
     )
     console_server = None
+    managed_cycle = None
     with contextlib.ExitStack() as stack:
         runtime_log = stack.enter_context(runtime_log_path.open("a", encoding="utf-8"))
         stack.enter_context(contextlib.redirect_stdout(runtime_log))
@@ -13561,6 +13586,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             nonlocal cleanup_checkpoint
             checkpoint = {**checkpoint, "runtime_log_path": str(runtime_log_path),
                 "debug_dynamics_trace": {"path": str(debug_trace_path)}}
+            if managed_cycle is not None:
+                checkpoint["managed_cycle"] = managed_cycle.result_record()
             _write_result_json(checkpoint, args.output)
             cleanup_checkpoint = checkpoint
             _operator_notice(f"[B601] cleanup result saved: {args.output}; summarizing offline (no motor control). Ctrl-C retains this checkpoint.")
@@ -13569,7 +13596,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             torque_console = None
             if args.torque_console:
                 _validate_cli(args)
-                if not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
+                if not args.torque_console_managed_cycle and not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
                     raise LowGainProbeError(
                         "torque console needs an Ubuntu desktop session"
                     )
@@ -13606,11 +13633,19 @@ def main(argv: Sequence[str] | None = None) -> int:
                         ),
                         "terminal_statuses": recent_runtime_notices(runtime_log_path),
                         "runtime_log_path": str(runtime_log_path),
+                        **({"managed_cycle": managed_cycle.result_record()} if managed_cycle is not None else {}),
                     },
                 )
                 console_server.start()
                 stack.callback(console_server.close)
-                console_description = "automatic calibration; select the configured GUI mode before starting" if getattr(args, "torque_console_auto_calibration_profile", None) is not None else (
+                if args.torque_console_managed_cycle:
+                    from control_station.b601_torque_console.managed_cycle import (
+                        B601ManagedCycle,
+                    )
+
+                    console_server.declare_managed_context()
+                    managed_cycle = B601ManagedCycle(torque_console, now_sec=time.monotonic())
+                console_description = "managed single workspace batch; GUI observation/withdrawal optional" if args.torque_console_managed_cycle else "automatic calibration; select the configured GUI mode before starting" if getattr(args, "torque_console_auto_calibration_profile", None) is not None else (
                     "staged target/CUE console; one-shot breakaway requires explicit authorization"
                     if args.torque_console_staged_assist
                     else "direct bounded torque console"
@@ -13620,7 +13655,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     f"{console_server.url} "
                     "(local browser only; closing the page withdraws assist)"
                 )
-                if not webbrowser.open_new_tab(console_server.url):
+                if not args.torque_console_managed_cycle and not webbrowser.open_new_tab(console_server.url):
                     _operator_notice(
                         "[B601] Browser did not open automatically; use the URL above."
                     )
@@ -13644,6 +13679,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     console_server.set_stop_handler if torque_console is not None else None
                 ),
                 post_cleanup_checkpoint=save_cleanup_checkpoint,
+                managed_cycle=managed_cycle,
             )
         except KeyboardInterrupt:
             if cleanup_checkpoint is None:
@@ -13766,6 +13802,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             f"[B601] run finished status={payload.get('status')} exit={exit_code}",
             flush=True,
         )
+    if managed_cycle is not None:
+        from control_station.b601_torque_console.managed_cycle import (
+            assess_managed_result,
+        )
+
+        payload["managed_cycle"] = managed_cycle.result_record()
+        payload["managed_assessment"] = assess_managed_result(payload)
     if "automatic_calibration_report_status" in payload:
         _write_result_json(payload, args.output)
         _emit_result_summary(payload, args.output)

@@ -105,6 +105,13 @@ function pageVisibilityIntent(hidden, backgroundCycle) {
 }
 
 function renderAutomatic() {
+  const managed = state?.managed_cycle;
+  el("managed-cycle-status").hidden = managed?.enabled !== true;
+  if (managed?.enabled) {
+    const phases = {waiting_owner: "等待停稳与原位确认", running: "正在执行一轮采集", origin_confirmed: "原位已确认，等待失能回执",
+      operator_required: "等待人工处理", cancelled: "本轮已撤销", stopped: "本轮已停止"};
+    el("managed-cycle-status").textContent = `单轮自动运行：${phases[managed.phase] || managed.phase}。启动时已声明无人介入和原位有可靠托架；没有自动接触传感器。有人介入、撤销或关闭页面后不会自动恢复；硬件故障不自动回位。`;
+  }
   const automatic = isAutomatic();
   const selection = automatic ? state.mode_selection : null;
   el("mode-workspace").hidden = !selection?.available_modes?.includes("workspace");
