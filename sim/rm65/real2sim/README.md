@@ -92,7 +92,14 @@ core and MuJoCo adapter used for the 20260721 fit; tests compare those hashes to
 fixed historical values rather than silently reinterpreting the fit against
 the current files.
 
-当前运行时源码绑定为 `artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261023_v14.json`。
+当前运行时源码绑定为 `artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261025_v16.json`。
+V16在冻结V15之上登记显式RGB-D观测安全规划、保存点关系动作和原子采集链；
+更新application、motion skill及native planner三项既有来源，新增八项观测/采集/消费者依赖，
+共33项源码、34项输入。固定源码与169项离线消费者报告绑定
+`addd6248ac87d0402686b4481671cb875df2d15d` / `97f6d56c88e34f30fe27ca00b4bd53634e29e8c5`。
+观测选路与原生执行保护保持分工，历史目标不冒充新鲜障碍场景；原deadline、碰撞和HOLD仍生效。
+本批不重拟合arm参数，`provisional`及新held-out `not_run`保留，不构成真机或模型能力验收。
+历史V15绑定 `artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261024_v15.json` 字节保持。
 
 历史 V12 绑定为
 `artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261023_v12.json`。
