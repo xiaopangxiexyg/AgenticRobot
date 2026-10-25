@@ -92,14 +92,15 @@ core and MuJoCo adapter used for the 20260721 fit; tests compare those hashes to
 fixed historical values rather than silently reinterpreting the fit against
 the current files.
 
-当前运行时源码绑定为 `artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261025_v19.json`。
-V19在冻结V18之上登记显式冻结状态候选查询、TCP偏移IK和原算法中的可选取消检查，
-更新IK及planner两项来源，新增重定时与包络查询两项，共45项源码、46项输入。
-固定源码与320项通过、零跳过的离线消费者报告绑定
-`9bd4a748431dcda9163faa4fbc827769faf16dca` / `36644ac0d3a73135e5d8b66762219e699fea1c16`。
-冻结计划不能激活；查询使用单一绝对deadline，保留rig→planner锁序、原碰撞、质量、
-网格及执行保护。此阶段尚未发布上层object/anchor查询Skill，默认运动合同保持。
-V18及历史绑定逐字保留，已有segment v2/v3仍按显式配置启用。
+当前运行时源码绑定为 `artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261025_v20.json`。
+V20在冻结V19之上登记默认关闭的对象/关系查询、认证表面锚点v1/v2/v3及显式safe profile，
+复用原规划、留存操作、CAS和资源关闭owner；更新5项来源，新增15项，共60项源码、61项输入。
+固定源码与567项通过、1项原RPent配对轮子缺失跳过、零失败的离线消费者报告绑定
+`78b09d63ff9e1efc42b9ca7738a00d76107d8c68` / `b4c0572d4394ebbf385665875abd58379ff4dc51`。
+冻结计划不能激活；查询保留原碰撞、质量、rig→planner锁序、绝对deadline和执行保护。
+候选局部包络拒绝可继续比较后续候选；稠密查询只对逐种子诊断做内联摘要，保留实际残差、
+覆盖、容差及拒因，不改变lower完整诊断、排名或认证。普通/观测点Route保留原范围。
+V19、V18及历史绑定逐字保留，已有segment v2/v3仍按显式配置启用。
 本批不重拟合arm参数，`provisional`及新held-out `not_run`保留，不构成真机或模型能力验收。
 历史V17、V16及更早绑定字节保持。
 

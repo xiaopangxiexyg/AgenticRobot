@@ -23,7 +23,10 @@ ARM_BASELINE_PATH = Path(
 )
 ARM_RUNTIME_BINDING_PATH = Path(
     "sim/rm65/real2sim/artifacts/"
-    "rm65_arm_free_motion_20260721_v4_runtime_binding_20261025_v19.json"
+    "rm65_arm_free_motion_20260721_v4_runtime_binding_20261025_v20.json"
+)
+ARM_RUNTIME_BINDING_V19_PATH = Path(
+    'sim/rm65/real2sim/artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261025_v19.json'
 )
 ARM_RUNTIME_BINDING_V18_PATH = Path(
     'sim/rm65/real2sim/artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261025_v18.json'
@@ -306,7 +309,7 @@ def test_v4_arm_fit_baseline_remains_frozen_and_provisional() -> None:
 def test_current_arm_runtime_binding_uses_exact_current_inputs() -> None:
     binding = Real2SimArtifactManifest.load(ARM_RUNTIME_BINDING_PATH)
     fit = Real2SimArtifactManifest.load(ARM_BASELINE_PATH)
-    previous = Real2SimArtifactManifest.load(ARM_RUNTIME_BINDING_V18_PATH)
+    previous = Real2SimArtifactManifest.load(ARM_RUNTIME_BINDING_V19_PATH)
     artifacts = {
         artifact.artifact_id: artifact
         for artifact in binding.dependency_artifacts
@@ -324,28 +327,28 @@ def test_current_arm_runtime_binding_uses_exact_current_inputs() -> None:
             artifact_kind="real2sim_fit_artifact",
         ).sha256
     )
-    assert artifacts["rm65-arm-profile-runtime-20261025-v19"].sha256 == (
+    assert artifacts["rm65-arm-profile-runtime-20261025-v20"].sha256 == (
         ArtifactRef.from_file(
             ARM_PROFILE_PATH,
             artifact_id="profile-check",
             artifact_kind="actuation_profile",
         ).sha256
     )
-    assert artifacts["rm65-arm-actuator-core-runtime-20261025-v19"].sha256 == (
+    assert artifacts["rm65-arm-actuator-core-runtime-20261025-v20"].sha256 == (
         ArtifactRef.from_file(
             ARM_CORE_PATH,
             artifact_id="core-check",
             artifact_kind="sim_actuator_core_source",
         ).sha256
     )
-    assert artifacts["rm65-arm-mujoco-executor-runtime-20261025-v19"].sha256 == (
+    assert artifacts["rm65-arm-mujoco-executor-runtime-20261025-v20"].sha256 == (
         ArtifactRef.from_file(
             ARM_MUJOCO_ADAPTER_PATH,
             artifact_id="executor-check",
             artifact_kind="sim_backend_adapter_source",
         ).sha256
     )
-    assert artifacts["rm65-camera-registry-runtime-20261025-v19"].sha256 == (
+    assert artifacts["rm65-camera-registry-runtime-20261025-v20"].sha256 == (
         ArtifactRef.from_file(
             CAMERA_REGISTRY_PATH,
             artifact_id="camera-registry-check",
@@ -374,10 +377,10 @@ def test_current_arm_runtime_binding_uses_exact_current_inputs() -> None:
     assert binding.metadata["runtime_behavior_change"] is True
     assert (
         binding.metadata["runtime_behavior_change_scope"]
-        == "bounded_frozen_native_queries_and_calibrated_tcp_ik"
+        == "authenticated_surface_anchors_and_frozen_relation_queries"
     )
     assert binding.metadata["runtime_source_commit"] == (
-        "9bd4a748431dcda9163faa4fbc827769faf16dca"
+        "78b09d63ff9e1efc42b9ca7738a00d76107d8c68"
     )
     assert binding.fidelity_claims[0].status == "provisional"
     held_out = next(
@@ -400,86 +403,93 @@ def test_current_arm_runtime_binding_uses_exact_current_inputs() -> None:
         "gripper-executor", "collision-policy", "contact-timing",
         "grasped-object-observer", "payload-motion", "object-release", "object-transport",
     ):
-        artifact = artifacts[f"rm65-{label}-runtime-20261025-v19"]
+        artifact = artifacts[f"rm65-{label}-runtime-20261025-v20"]
         assert artifact.sha256 == ArtifactRef.from_file(
             artifact.locator, artifact_id="command-source-check",
             artifact_kind="sim_command_admission_source",
         ).sha256
 
-    prepared = artifacts["rm65-native-prepared-skill-runtime-20261025-v19"]
+    prepared = artifacts["rm65-native-prepared-skill-runtime-20261025-v20"]
     assert prepared.locator == "agent_gateway/profiles/mujoco/motion_skill.py"
     assert prepared.sha256 == ArtifactRef.from_file(
         prepared.locator, artifact_id="prepared-consumer-check",
         artifact_kind="sim_native_skill_consumer_source",
     ).sha256
 
-    assert binding.artifact_sha256 == "37f9ced7a3904f0cd0aeb2e60c0aae004125f9d8362d7bd3914cca65a144cd4c"
+    assert binding.artifact_sha256 == "bbb5b8f88d8c3bdc6cf375ee9e7b3c951bba3bd210f129a9de4edc9bdb6ede86"
     assert binding.code_revision == binding.environment_fingerprint["source_commit"] == binding.metadata["runtime_source_commit"]
     assert binding.metadata["previous_runtime_binding_file_sha256"] == ArtifactRef.from_file(
-        ARM_RUNTIME_BINDING_V18_PATH, artifact_id="previous-v18-file-check",
+        ARM_RUNTIME_BINDING_V19_PATH, artifact_id="previous-v19-file-check",
         artifact_kind="real2sim_runtime_binding",
     ).sha256
-    assert artifacts["rm65-arm-runtime-binding-20261025-v18"].sha256 == binding.metadata["previous_runtime_binding_file_sha256"]
+    assert artifacts["rm65-arm-runtime-binding-20261025-v19"].sha256 == binding.metadata["previous_runtime_binding_file_sha256"]
     previous_sources = {
         artifact.locator: artifact.sha256 for artifact in previous.dependency_artifacts
-        if "-runtime-20261025-v18" in artifact.artifact_id
+        if "-runtime-20261025-v19" in artifact.artifact_id
     }
     current_sources = {
         artifact.locator: artifact.sha256 for artifact in binding.dependency_artifacts
-        if "-runtime-20261025-v19" in artifact.artifact_id
+        if "-runtime-20261025-v20" in artifact.artifact_id
     }
-    new_sources = {'robot_motion/position_control/offline_waypoint_trajectory.py', 'robot_motion/target_safety/runtime.py'}
+    new_sources = {'agent_gateway/profiles/mujoco/gateway_cli.py', 'agent_gateway/profiles/mujoco/motion_deployment.py', 'agent_gateway/profiles/mujoco/motion_factory.py', 'agent_gateway/profiles/mujoco/object_goal_query.py', 'agent_gateway/profiles/query_geometry.py', 'agent_gateway/profiles/spatial_goal.py', 'agent_gateway/profiles/surface_anchor.py', 'agent_gateway/profiles/surface_anchor_selection.py', 'agent_gateway/profiles/surface_anchor_v3.py', 'agent_gateway/skills/perception/object_goal_query.py', 'agent_gateway/skills/perception/spatial_goal.py', 'agent_gateway/skills/perception/surface_anchor.py', 'agent_gateway/skills/perception/surface_anchor_v2.py', 'agent_gateway/skills/perception/surface_anchor_v3.py', 'robot_motion/spatial_goals.py'}
     assert set(current_sources) - set(previous_sources) == new_sources
     assert set(previous_sources) - set(current_sources) == set()
-    changed_sources = {'robot_motion/rm65/single_arm_ik.py', 'sim/mujoco/deploy/planned_tcp_motion.py'}
+    changed_sources = {'agent_gateway/profiles/back_projection.py', 'agent_gateway/profiles/mujoco/motion_gateway_session.py', 'agent_gateway/profiles/mujoco/motion_skill.py', 'dataset_contracts/perception_artifacts.py', 'sim/mujoco/deploy/planned_tcp_motion.py'}
     assert {path for path, digest in previous_sources.items() if current_sources[path] != digest} == changed_sources
     assert tuple(binding.metadata["changed_previous_runtime_sources"]) == tuple(sorted(changed_sources))
     assert tuple(binding.metadata["new_runtime_sources"]) == tuple(sorted(new_sources))
-    content = next(e for e in binding.validation_evidence if e.validation_id == "runtime-source-content-binding-integrity-v19")
+    content = next(e for e in binding.validation_evidence if e.validation_id == "runtime-source-content-binding-integrity-v20")
     assert content.status == "passed"
-    assert content.metrics["bound_runtime_input_file_count"] == len(current_sources) == 46
-    assert content.metrics["bound_runtime_source_file_count"] == 45
-    assert content.metrics["changed_runtime_source_file_count_from_previous_binding"] == len(changed_sources) == 2
-    assert content.metrics["new_runtime_source_file_count"] == len(new_sources) == 2
+    assert content.metrics["bound_runtime_input_file_count"] == len(current_sources) == 61
+    assert content.metrics["bound_runtime_source_file_count"] == 60
+    assert content.metrics["changed_runtime_source_file_count_from_previous_binding"] == len(changed_sources) == 5
+    assert content.metrics["new_runtime_source_file_count"] == len(new_sources) == 15
     assert content.metrics["arm_profile_refit_count"] == content.metrics["mutated_historical_artifact_count"] == 0
-    offline = next(e for e in binding.validation_evidence if e.validation_id == "offline-frozen-query-consumers-v19")
+    offline = next(e for e in binding.validation_evidence if e.validation_id == "offline-query-anchor-consumers-v20")
     assert offline.status == "passed" and offline.split == "validation"
-    assert dict(offline.metrics) == {'passed_cases': 320.0, 'skipped_cases': 0.0, 'failed_cases': 0.0, 'error_cases': 0.0}
+    assert dict(offline.metrics) == {'passed_cases': 567.0, 'skipped_cases': 1.0, 'failed_cases': 0.0, 'error_cases': 0.0}
     assert artifacts[binding.metadata["offline_validation_report_artifact_id"]].sha256 == (
-        "812ce0517296456c5d98770836fb1180e85340a60d1c32616d50129826901dc8"
+        "4999decf1ec18d262fee51ac17cb3d66f691581dcfa399d2596de869a5cab26d"
     )
-    assert binding.metadata["offline_validation_source_tree"] == "36644ac0d3a73135e5d8b66762219e699fea1c16"
+    assert binding.metadata["offline_validation_source_tree"] == "b4c0572d4394ebbf385665875abd58379ff4dc51"
     assert binding.metadata["offline_validation_execution_head"] == binding.metadata["runtime_source_commit"]
     for label, path in {'single-arm-ik': 'robot_motion/rm65/single_arm_ik.py', 'tcp-pose-envelope-core': 'robot_motion/target_safety/tcp_pose_envelope.py', 'motion-application': 'agent_gateway/profiles/mujoco/motion_application.py', 'deploy-runtime-core': 'sim/mujoco/deploy/runtime.py'}.items():
-        artifact = artifacts[f"rm65-{label}-runtime-20261025-v19"]
+        artifact = artifacts[f"rm65-{label}-runtime-20261025-v20"]
         assert artifact.locator == path
         assert artifact.sha256 == ArtifactRef.from_file(
             path, artifact_id="new-core-source-check", artifact_kind=artifact.artifact_kind,
         ).sha256
     for label, path in {'observed-joint-input': 'robot_motion/observed_planning.py', 'observed-collision-model': 'robot_motion/rm65/obstacle_collision.py', 'observed-scene': 'agent_gateway/profiles/mujoco/motion_observed_scene.py', 'retained-observed-point': 'agent_gateway/profiles/observed_target.py', 'observed-point-consumer': 'agent_gateway/profiles/mujoco/observed_point_motion.py', 'observed-point-contract': 'agent_gateway/skills/motion/observed_point.py', 'rgbd-source': 'sim/mujoco/depth_snapshot.py', 'depth-capture-conversion': 'agent_gateway/profiles/mujoco/back_projection.py'}.items():
-        artifact = artifacts[f"rm65-{label}-runtime-20261025-v19"]
+        artifact = artifacts[f"rm65-{label}-runtime-20261025-v20"]
         assert artifact.locator == path
         assert artifact.sha256 == ArtifactRef.from_file(
             path, artifact_id="observed-source-check", artifact_kind=artifact.artifact_kind,
         ).sha256
     for label, path in {'correlated-rgbd-contract': 'agent_gateway/profiles/back_projection.py', 'paired-rgbd-codec': 'agent_gateway/profiles/paired_rgbd.py', 'paired-rgbd-capture': 'agent_gateway/profiles/rgbd_capture.py', 'paired-rgbd-skill-contract': 'agent_gateway/skills/perception/rgbd_schemas.py', 'paired-rgbd-artifact-contract': 'dataset_contracts/perception_artifacts.py'}.items():
-        artifact = artifacts[f"rm65-{label}-runtime-20261025-v19"]
+        artifact = artifacts[f"rm65-{label}-runtime-20261025-v20"]
         assert artifact.locator == path
         assert artifact.sha256 == ArtifactRef.from_file(
             path, artifact_id="paired-source-check", artifact_kind=artifact.artifact_kind,
         ).sha256
     for label, path in {'segmentation-provider': 'agent_gateway/profiles/segmentation.py', 'segmentation-batch': 'agent_gateway/profiles/segmentation_batch.py', 'segmentation-definitions': 'agent_gateway/skills/perception/definition.py', 'segmentation-schemas': 'agent_gateway/skills/perception/segmentation_schemas.py', 'segmentation-session': 'agent_gateway/profiles/mujoco/motion_gateway_session.py'}.items():
-        artifact = artifacts[f"rm65-{label}-runtime-20261025-v19"]
+        artifact = artifacts[f"rm65-{label}-runtime-20261025-v20"]
         assert artifact.locator == path
         assert artifact.sha256 == ArtifactRef.from_file(
             path, artifact_id="paired-source-check", artifact_kind=artifact.artifact_kind,
         ).sha256
     for label, path in {'waypoint-cancellation': 'robot_motion/position_control/offline_waypoint_trajectory.py', 'tcp-envelope-query': 'robot_motion/target_safety/runtime.py'}.items():
-        artifact = artifacts[f"rm65-{label}-runtime-20261025-v19"]
+        artifact = artifacts[f"rm65-{label}-runtime-20261025-v20"]
         assert artifact.locator == path
         assert artifact.sha256 == ArtifactRef.from_file(
             path, artifact_id="paired-source-check", artifact_kind=artifact.artifact_kind,
         ).sha256
+    for label, path in {'object-path-query': 'agent_gateway/profiles/mujoco/object_goal_query.py', 'object-path-contract': 'agent_gateway/skills/perception/object_goal_query.py', 'query-geometry': 'agent_gateway/profiles/query_geometry.py', 'surface-anchor': 'agent_gateway/profiles/surface_anchor.py', 'surface-selection': 'agent_gateway/profiles/surface_anchor_selection.py', 'paired-surface-anchor': 'agent_gateway/profiles/surface_anchor_v3.py', 'surface-anchor-contract': 'agent_gateway/skills/perception/surface_anchor.py', 'surface-anchor-v2-contract': 'agent_gateway/skills/perception/surface_anchor_v2.py', 'surface-anchor-v3-contract': 'agent_gateway/skills/perception/surface_anchor_v3.py', 'relation-goal-core': 'robot_motion/spatial_goals.py', 'spatial-goal-provider': 'agent_gateway/profiles/spatial_goal.py', 'spatial-goal-contract': 'agent_gateway/skills/perception/spatial_goal.py', 'motion-deployment': 'agent_gateway/profiles/mujoco/motion_deployment.py', 'motion-factory': 'agent_gateway/profiles/mujoco/motion_factory.py', 'motion-launcher': 'agent_gateway/profiles/mujoco/gateway_cli.py'}.items():
+        artifact = artifacts[f"rm65-{label}-runtime-20261025-v20"]
+        assert artifact.locator == path
+        assert artifact.sha256 == ArtifactRef.from_file(
+            path, artifact_id="query-anchor-source-check", artifact_kind=artifact.artifact_kind,
+        ).sha256
+
 
 
 
@@ -814,4 +824,13 @@ def test_v18_binding_remains_frozen_after_frozen_query_extension() -> None:
     assert ArtifactRef.from_file(ARM_RUNTIME_BINDING_V18_PATH,
         artifact_id="frozen-v18-check", artifact_kind="real2sim_runtime_binding").sha256 == '486f5e8ddf1ea043919a1d260003b872b13b3f23fa5d93188aede09ea244381b'
     assert binding.metadata["runtime_source_commit"] == '31aa9fc29028644d79db0fc137dbf40cd6232017'
+    assert binding.metadata["arm_profile_refit"] is False
+
+
+def test_v19_binding_remains_frozen_after_query_anchor_extension() -> None:
+    binding = Real2SimArtifactManifest.load(ARM_RUNTIME_BINDING_V19_PATH)
+    assert binding.artifact_sha256 == '37f9ced7a3904f0cd0aeb2e60c0aae004125f9d8362d7bd3914cca65a144cd4c'
+    assert ArtifactRef.from_file(ARM_RUNTIME_BINDING_V19_PATH,
+        artifact_id="frozen-v19-check", artifact_kind="real2sim_runtime_binding").sha256 == '2006daae911cd81a64b073fa0b766c8daf92feced8088d2a4b9a0db96c4e718d'
+    assert binding.metadata["runtime_source_commit"] == '9bd4a748431dcda9163faa4fbc827769faf16dca'
     assert binding.metadata["arm_profile_refit"] is False
