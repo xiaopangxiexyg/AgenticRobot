@@ -92,7 +92,15 @@ core and MuJoCo adapter used for the 20260721 fit; tests compare those hashes to
 fixed historical values rather than silently reinterpreting the fit against
 the current files.
 
-当前运行时源码绑定为 `artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261025_v21.json`。
+当前运行时源码绑定为 `artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261025_v22.json`。
+V22冻结V21，登记共享 supplied-image localization、真机兼容入口及默认关闭的 MuJoCo 定位。
+真机 v1 的既有契约身份和有界 CAS 读取保持一致；MuJoCo 保留原始图像坐标，
+复用现有分割模型及关闭门禁。更新4项来源，新增4项，共64项源码、65项输入。
+固定631项通过、1项原RPent配对轮子缺失跳过、零失败的消费者报告绑定
+`ab5de19b3dcda8cc66bae9a85f4916d0d7f6a28a` / `a835306ec77f78d2d9b2d7f8b0864741f2cf1b81`。
+该证据只覆盖本地离线集成，不新增模型、硬件或 held-out 响应认证。
+
+历史V21为 `artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261025_v21.json`。
 V21冻结V20，仅重绑motion_deployment一项源码，仍为60项源码、61项输入，无新增输入。
 显式profile导出恢复原79b6默认字节；归一化模式仅启用时明确输出，原语义hash、IK、
 控制及执行门禁不变。固定217项通过、零跳过的消费者报告绑定
