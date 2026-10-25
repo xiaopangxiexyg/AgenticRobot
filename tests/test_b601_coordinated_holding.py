@@ -1490,7 +1490,7 @@ def test_missing_local_damping_receipt_aborts_preparation_before_active_force(tm
     assert r.controller.result_record()["state"] == "failed"
 
 
-def coupled_tick(r, *, period=.025, passive_offset=0):
+def coupled_tick(r, *, period=.025, passive_offset=0, heartbeat_active=None):
     """Declared overdamped toy, not identified B601 physics or a force sensor."""
     q = list(r.q)
     # Pose-dependent residual load, a Coulomb dead zone and off-diagonal
@@ -1502,7 +1502,7 @@ def coupled_tick(r, *, period=.025, passive_offset=0):
     for i, v in zip((1, 2), velocity):
         q[i] += v*period
     q[3] += max(-.00015, min(.00015, passive_offset-q[3]))
-    r.tick(q, dt_sec=period)
+    r.tick(q, dt_sec=period, heartbeat_active=heartbeat_active)
 
 
 def scripted_coordinated_tick(r, *, passive_target=.006519419, period=.025):
@@ -2868,13 +2868,18 @@ def test_full_coupled_batch_and_report_keep_handoffs_distinct_from_withdrawal(tm
     journal.record({"action": "context", "human_intervention": False}, snapshot())
     assert snapshot()["calibration_trial"] is None
     r.controller.submit("arm", now_sec=r.now, return_and_disable=automatic_return)
+    view = snapshot()
     handoffs = []
     for _ in range(50000):
-        state = r.controller.status()["automatic_calibration"]["state"]
+        batch = view["automatic_calibration"]
+        state = batch["state"]
         if state in {"complete", "failed", "cancelled"}:
             break
         old = len(r.controller._coordinated._acquisitions)
-        coupled_tick(r, period=period, passive_offset=passive_offset)
+        # No callback or controller mutation follows the preceding snapshot.
+        # Reuse its active flag until this tick advances the native owner.
+        coupled_tick(r, period=period, passive_offset=passive_offset,
+                     heartbeat_active=batch["active"])
         controller = r.controller._coordinated
         flags = [tracker.config.support_soft_speed_recovery for tracker in controller.pose.trackers]
         if controller._phase in {"position", "return"}:
@@ -2893,7 +2898,8 @@ def test_full_coupled_batch_and_report_keep_handoffs_distinct_from_withdrawal(tm
                 coverage and r.audit["automatic_calibration"]["workspace"]["phase"] == "sweep"
                 and r.audit["holding_calibration"]["sample_pose_rad"] is not None
                 and r.audit["holding_calibration"]["probe_command_nm"] is None)
-        journal.observe(snapshot())
+        view = snapshot()
+        journal.observe(view)
         assert sum(abs(v) for v in r.delta) <= 1+1e-9
         if old != len(r.controller._coordinated._acquisitions):
             assert tuple(r.delta) == tuple(r.audit["coordinated_holding"]["combined_command_nm"])

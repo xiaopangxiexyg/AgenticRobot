@@ -104,6 +104,14 @@ neither net line reductions nor test-count quotas are acceptance criteria.
 原有断言保持不变。这只减少测试驱动器中重复的观察开销，不改变生产状态接口，
 也不把虚拟反馈证据当作真机验证。
 
+完整双关节批次的 6 组 `test_full_coupled_batch_and_report_keep_handoffs_distinct_from_withdrawal`
+也复用上一 tick 完成后已读取的状态，供下一轮终止判断和 heartbeat 使用。两次读取
+之间只有测试中的纯机械计算、断言和被动 journal 观察，没有回调或控制器状态变更；
+`arm` 后先重新读取。每次控制 tick 仍重新获取完整状态并调用真实 journal。
+其他 `coupled_tick` 调用默认继续实时读取；6 组组合、全部控制/机械 tick、实际回执、
+逐 tick 保护断言、撤力、持久化及报告检查保留。这不减少 journal 的采样次数，
+也不替换生产状态接口、记录器或 `fsync`。
+
 ### 只读快照重试的采样历史
 
 `test_persistent_failed_state_can_retry_without_restart` 在 `_capture_history`
