@@ -602,5 +602,3 @@ def test_candidate_query_unexpected_error_clears_a_previous_pending_winner():
         planner.plan_candidates([(0,), (1,)], translation_tolerance_m=.01,
             rotation_tolerance_rad=.1, cancel_requested=lambda: False)
     assert planner._pending_plan is None
-
-
