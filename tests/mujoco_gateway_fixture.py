@@ -1,8 +1,6 @@
 """Reuse compiled inputs, never mutable models or live Gateway resources."""
 
-from functools import lru_cache
 import os
-import tempfile
 import threading
 
 import pytest
@@ -11,21 +9,19 @@ import pytest
 _construction_lock = threading.RLock()
 
 
-@lru_cache(maxsize=1)
-def _private_cache_directory():
-    # Keep direct wrapper invocations isolated too; no persistent repo cache.
-    return tempfile.TemporaryDirectory(prefix="ar-gateway-models-", dir="/tmp")
-
-
 def build_gateway_session(factory, *, use_model_cache=True, **parameters):
-    """Bind the existing artifact loader only during synchronous construction."""
+    """Use an explicitly configured Run cache during synchronous construction."""
     if not use_model_cache:
         return factory(**parameters)
 
     from sim.mujoco.artifacts.cache import MODEL_CACHE_ENV, ModelArtifactCache
+    root = os.environ.get(MODEL_CACHE_ENV, "").strip()
+    if not root:
+        # Plain focused runs keep their original construction/GC behavior.
+        return factory(**parameters)
+
     from sim.mujoco.scene import MujocoScene
 
-    root = os.environ.get(MODEL_CACHE_ENV, "").strip() or _private_cache_directory().name
     cache = ModelArtifactCache(root)
 
     with _construction_lock, pytest.MonkeyPatch.context() as patch:

@@ -102,12 +102,22 @@ def test_cached_gateway_models_match_cold_build_and_keep_mutable_state_private(t
             assert session.close().accepted
 
 
-def test_cached_gateway_construction_restores_preparation_port_after_failure():
+def test_cached_gateway_construction_restores_preparation_port_after_failure(tmp_path, monkeypatch):
     import inspect
     from mujoco_gateway_fixture import build_gateway_session
+    from sim.mujoco.artifacts.cache import MODEL_CACHE_ENV
     from sim.mujoco.scene import MujocoScene
 
     original = inspect.getattr_static(MujocoScene, "from_contract")
+    monkeypatch.delenv(MODEL_CACHE_ENV, raising=False)
+    marker = object()
+
+    def uncached(*, value):
+        assert inspect.getattr_static(MujocoScene, "from_contract") is original
+        return value
+
+    assert build_gateway_session(uncached, value=marker) is marker
+    monkeypatch.setenv(MODEL_CACHE_ENV, str(tmp_path / "gateway-model-cache"))
 
     def fail():
         assert inspect.getattr_static(MujocoScene, "from_contract") is not original

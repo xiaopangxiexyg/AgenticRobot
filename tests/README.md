@@ -117,8 +117,9 @@ freshness 和静止性边界测试继续覆盖原路径。该用例中的可控�
 ### MuJoCo 原生集成中的重复初始化与组合采样
 
 `mujoco_gateway_fixture.py` 只在两个已有 Gateway 测试构造器中，将场景编译端口
-接到已有 `ModelArtifactCache`。完整验收沿用该次 Run 的输入哈希缓存；单独运行
-wrapper 时使用进程私有的 `/tmp` 临时目录。只复用校验过的编译产物，每次构造
+接到已有 `ModelArtifactCache`，前提是显式配置 `SIM_MUJOCO_CACHE_DIR`。完整验收
+沿用该次 Run 的输入哈希缓存；未配置它的普通 focused wrapper 保持原构造路径，
+不自动启用缓存或新增缓存根。只复用校验过的编译产物，每次构造
 仍加载独立 `MjModel`、`MjData`、planner、Gateway 和生命周期资源；不共享可变模型、
 物理快照、待执行计划或运行中的会话。构造结束或抛出异常后恢复原端口。
 生产构造器和缓存实现不改。冷编译与命中结果的模型参数、网格、接触、执行器、
