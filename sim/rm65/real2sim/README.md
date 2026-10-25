@@ -92,15 +92,15 @@ core and MuJoCo adapter used for the 20260721 fit; tests compare those hashes to
 fixed historical values rather than silently reinterpreting the fit against
 the current files.
 
-当前运行时源码绑定为 `artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261025_v17.json`。
-V17在冻结V16之上登记默认关闭的RGB v3同源留存基础，更新MuJoCo原字节转交adapter，
-新增五项correlated cut、paired codec、capture executor及Skill/Artifact合同依赖，
-共38项源码、39项输入。固定源码与442通过/1原有跳过的离线消费者报告绑定
-`e82e3d6c860ca722597d8304ed849881c2501f89` / `524aedaf936c5abd98857606f726801f398fb659`。
-同次JPEG/NPY原样留存，原passive取消、完成与关闭owner继续生效；metadata不构成来源授权。
-V16的观测规划与留存点动作继续由原native执行、deadline、碰撞和HOLD保护。
+当前运行时源码绑定为 `artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261025_v18.json`。
+V18在冻结V17之上登记默认关闭的segment v2/v3、多目标共享模型与留存RGB认证消费者，
+新增provider、batch、definition/schema及session五项来源；V17原39项输入逐字保持，
+共43项源码、44项输入。固定源码与538通过/1原有跳过的离线消费者报告绑定
+`31aa9fc29028644d79db0fc137dbf40cd6232017` / `c65879b5e744253eb5d75c3cd971f334aa7a3326`。
+v3保留历史图像和采集时间，模型proposals和像素距离不构成身份、物理间隙或运动授权。
+原passive取消、原子完成、有界CAS读取和共享关闭owner保持，native运动保护不变。
 本批不重拟合arm参数，`provisional`及新held-out `not_run`保留，不构成真机或模型能力验收。
-历史V16、V15及更早绑定字节保持。
+历史V17、V16及更早绑定字节保持。
 
 历史 V12 绑定为
 `artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261023_v12.json`。

@@ -138,6 +138,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--enable-rgbd-capture-v3", action="store_true",
                         help="Publish capture_rgb v3 with optional native-grid paired RGB-D Artifacts; default off.")
+    parser.add_argument("--enable-segmentation-batch-v2", action="store_true",
+                        help="Publish same-cut ordered multi-target segmentation v2; default off.")
+    parser.add_argument("--enable-segmentation-geometry-v3", action="store_true",
+                        help="Publish authenticated retained-RGB mask geometry v3; default off.")
     parser.add_argument(
         "--history-root",
         type=Path,
@@ -487,6 +491,8 @@ def main(argv: list[str] | None = None) -> int:
         or args.enable_grasp_approach
         or args.grasp_contact_target_body is not None
         or args.enable_rgbd_capture_v3
+        or args.enable_segmentation_batch_v2
+        or args.enable_segmentation_geometry_v3
         or args.enable_spatial_goals
         or args.history_root is not None
         or args.segmentation_asset_bundle is not None
@@ -495,6 +501,11 @@ def main(argv: list[str] | None = None) -> int:
             "--motion-side left currently supports baseline TCP/state Routes only; "
             "gripper, grasp, spatial goal, history and segmentation combinations are not enabled"
         )
+    for name in ("enable_segmentation_batch_v2", "enable_segmentation_geometry_v3"):
+        if getattr(args, name) and (args.artifact_root is None or args.segmentation_asset_bundle is None):
+            parser.error("--" + name.replace("_", "-") + " requires --artifact-root and --segmentation-asset-bundle")
+    if args.enable_segmentation_geometry_v3 and args.max_retained_operations < 2:
+        parser.error("--enable-segmentation-geometry-v3 requires retained producer and consumer operations")
     task_config = _absolute_existing_file(parser, args.task_config)
     socket_path = _absolute_path(parser, args.socket_path, flag="--socket-path")
     if args.client_uid < 0:
@@ -601,6 +612,8 @@ def main(argv: list[str] | None = None) -> int:
         history_storage=history_storage,
         artifact_storage=artifact_storage,
         enable_rgbd_capture_v3=args.enable_rgbd_capture_v3,
+        enable_segmentation_batch_v2=args.enable_segmentation_batch_v2,
+        enable_segmentation_geometry_v3=args.enable_segmentation_geometry_v3,
         segmentation_localizer=segmentation_localizer,
         enable_safe_tcp_pose=args.enable_safe_tcp_pose,
         enable_spatial_goals=args.enable_spatial_goals,

@@ -342,6 +342,15 @@ MuJoCo可通过显式 `--enable-rgbd-capture-v3`（同时提供 `--artifact-root
 metadata核验只证明表示和媒体关联；后续消费者仍须完成操作、client/session与CAS来源认证。
 多Artifact提交中断时可能已有个别CAS对象留存，但不会发布成功结果，不作为多对象原子事务。
 
+同一个分割v1模型还可显式增加 `--enable-segmentation-batch-v2` 和
+`--enable-segmentation-geometry-v3`，两者默认关闭，均需Artifact root和已配置的分割模型。
+v2在一次live RGB cut上处理最多三个有序目标，明确区分no_mask与推理/编码失败。
+v3消费已认证的留存JPEG及其原RGB producer操作ID，保留原图、角色、原始ordinal和采集时间，
+至少保留producer与consumer两个操作；RGB v3开启时绑定其精确Route。它不重采集或缩放来替代输入，
+不将历史图像当当前三维场景。输出只含模型proposals及二维mask像素几何，
+`semantic_identity_verified=false`、`physical_clearance_m=null`；像素距离不构成物理间隙或运动授权。
+v1行为和默认身份保持，模型只由原session启动/关闭一次，新读取未排空时继续保留共享资源。
+
 既有原子夹爪 Skill 完成开合时必须得到 `moving=False` 的实测状态；目标位置接近但仍在
 运动或状态未知时不能完成。真机停止 ACK 之后还须在有限等待内读取新鲜、无故障的停稳反馈，
 早于停止请求、过期、未来时间或不可用反馈均不能确认 HOLD。只读反馈沿用已启动 backend，

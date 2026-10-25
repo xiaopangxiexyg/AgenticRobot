@@ -236,6 +236,55 @@ def segment_skill_definition_v1() -> SkillDefinition:
     )
 
 
+def segment_skill_definition_v2() -> SkillDefinition:
+    """Describe bounded multi-target proposals measured on one RGB cut."""
+    from dataclasses import replace
+
+    return replace(
+        segment_skill_definition_v1(),
+        skill_version="2",
+        summary=(
+            "Segment one to three ordered text- or pixel-prompted targets on one "
+            "registered RGB cut and return per-target masks or explicit no-mask "
+            "results with one jointly numbered overlay. Masks and labels are "
+            "model proposals, not verified object identity, 3D geometry or action success."
+        ),
+        parameter_semantics_id="registered_rgb_role.ordered_exclusive_prompts.same_cut.v2",
+        execution_result_semantics_id="ordered_mask_proposals_and_joint_overlay.v2",
+        task_outcome_semantics_id="passive_same_cut_targets_processed.v2",
+        task_outcome_predicate_ids=("same_cut_target_processing_completed.v2",),
+    )
+
+
+def segment_skill_definition_v3() -> SkillDefinition:
+    """Describe historical RGB Artifact proposals in their exact pixel grid."""
+    from dataclasses import replace
+
+    return replace(
+        segment_skill_definition_v2(),
+        skill_version="3",
+        summary=(
+            "Consume one authenticated capture_rgb JPEG Artifact and its producer "
+            "operation ID; segment one to three ordered targets in that exact "
+            "original pixel grid without recapture or resizing, and "
+            "measure every unordered pair's closest occupied mask pixel centers "
+            "in pixels, with closest [u, v] endpoints. Return an original-grid "
+            "overlay with target-indexed inner contours and small index labels, "
+            "without region fills or bounding boxes; target statuses remain in JSON. "
+            "Overlap has zero distance; "
+            "absent masks make a relation unavailable. These are model proposals: "
+            "semantic identity is unverified and physical clearance is unknown. "
+            "This is historical image geometry, not a fresh observation; matching "
+            "Station revisions do not imply stationary TCPs or objects."
+        ),
+        parameter_semantics_id="authenticated_rgb_artifact.ordered_exclusive_prompts.v3",
+        execution_result_semantics_id="authenticated_rgb_mask_pixel_center_relations.v3",
+        task_outcome_semantics_id="passive_authenticated_rgb_targets_processed.v3",
+        entry_predicate_ids=("authenticated_rgb_capture_available.v3", "segmentation_model_available.v1"),
+        task_outcome_predicate_ids=("authenticated_rgb_target_processing_completed.v3",),
+    )
+
+
 def plan_point_grasp_skill_definition_v1() -> SkillDefinition:
     """Describe passive point-conditioned RGB-D grasp pose planning."""
 
@@ -373,4 +422,5 @@ __all__ = [
     "plan_point_grasp_skill_definition_v3",
     "render_point_grasp_candidate_skill_definition_v1",
     "segment_skill_definition_v1",
+    "segment_skill_definition_v2",
 ]

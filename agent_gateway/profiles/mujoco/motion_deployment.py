@@ -759,6 +759,8 @@ class MujocoAgentTcpPoseContractBundle:
     fast_grasp_contract: Any | None = None
     observed_point_contract: MujocoAgentSafeTcpPoseContract | None = None
     rgbd_capture: SpatialGoalRegistration | None = None
+    segmentation_batch: SegmentationRegistration | None = None
+    segmentation_geometry: SegmentationRegistration | None = None
 
     def __post_init__(self) -> None:
         validate_skill_route_catalog_closure(
@@ -866,6 +868,33 @@ class MujocoAgentTcpPoseContractBundle:
                 segmentation.binding.semantic_content_hash
             ):
                 raise ValueError("Segmentation Route uses another deployment binding.")
+        for version, batch in (("2", self.segmentation_batch), ("3", self.segmentation_geometry)):
+            if batch is None:
+                if any(entry.route.skill_id == "perception.segment" and entry.route.skill_version == version
+                       for entry in self.route_manifest.skill_routes):
+                    raise ValueError("A segmentation batch Route requires its typed registration.")
+                continue
+            if not isinstance(batch, SegmentationRegistration):
+                raise TypeError("segmentation_batch must be a typed registration.")
+            if (segmentation is None or depth_capture is None or rgb_capture is None
+                    or segmentation.skill.definition.skill_version != "1"
+                    or batch.skill.definition.skill_version != version
+                    or batch.skill.definition.skill_id != segmentation.skill.definition.skill_id):
+                raise ValueError(f"Segmentation batch v{version} requires the v1 model and Artifact capture registrations.")
+            if replace(batch.profile, profile_id=segmentation.profile.profile_id,
+                       rgb_capture_route_hash=None) != segmentation.profile:
+                raise ValueError("Segmentation batch must share the exact v1 model, sources and byte bounds.")
+            if version == "3" and batch.profile.rgb_capture_route_hash != (
+                    self.rgbd_capture.entry.route.semantic_content_hash if self.rgbd_capture is not None else None):
+                raise ValueError("Segmentation v3 must bind its exact selected RGB producer Route.")
+            for name in ("runtime_session_id", "control_domain_id", "target_binding_id",
+                         "station_manifest_hash", "execution_manifest_hash", "target_kind"):
+                if getattr(batch.binding, name) != getattr(segmentation.binding, name):
+                    raise ValueError("Segmentation batch must share the exact v1 deployment context.")
+            entry = self.route_manifest.route(batch.skill.definition.skill_id, version)
+            if (entry.route != batch.skill.routes[0] or entry.deployment_binding != batch.binding.to_ref()
+                    or entry.availability_hash != batch.availability_hash or entry.evaluation_plan_hash is not None):
+                raise ValueError("Segmentation batch Route differs from its registration.")
         placement = self.placement
         if placement is not None:
             if not isinstance(placement, PlacementRegistration):
@@ -1885,6 +1914,8 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
     segmentation_model_profile_id: str | None = None,
     segmentation_model_profile_hash: str | None = None,
     segmentation_inference_implementation_hash: str | None = None,
+    enable_segmentation_batch_v2: bool = False,
+    enable_segmentation_geometry_v3: bool = False,
     enable_safe_tcp_pose: bool = False,
     safe_motion_observation_profile_hash: str | None = None,
     enable_observed_point_motion: bool = False,
@@ -1923,6 +1954,17 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
         raise ValueError("MuJoCo segmentation model identity is all-or-none.")
     if segmentation_model_profile_id is not None and not enable_artifact_perception:
         raise ValueError("MuJoCo segmentation requires Artifact perception.")
+    for name, enabled, version in (
+        ("enable_segmentation_batch_v2", enable_segmentation_batch_v2, "2"),
+        ("enable_segmentation_geometry_v3", enable_segmentation_geometry_v3, "3"),
+    ):
+        if type(enabled) is not bool:
+            raise TypeError(f"{name} must be boolean.")
+        if enabled and (not enable_artifact_perception or segmentation_model_profile_id is None):
+            raise ValueError(f"Segmentation batch v{version} requires Artifact perception and a segmentation model.")
+        if enabled and any(not isinstance(value, str) or not value or value != value.strip()
+                           for value in segmentation_identity):
+            raise ValueError(f"Segmentation batch v{version} requires typed model identity strings.")
     if not isinstance(enable_safe_tcp_pose, bool):
         raise TypeError("enable_safe_tcp_pose must be boolean.")
     if safe_motion_observation_profile_hash is not None:
@@ -2086,6 +2128,25 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
         if segmentation_model_profile_id is not None
         else None
     )
+    def same_cut_registration(version: str) -> SegmentationRegistration:
+        assert segmentation is not None
+        return build_segmentation_registration(
+            skill_version=version,
+            rgb_capture_route_hash=(rgbd_capture.entry.route.semantic_content_hash
+                if version == "3" and rgbd_capture is not None else None),
+            target_kind=segmentation.profile.target_kind, current_mode=segmentation.profile.current_mode,
+            source_id_by_role=segmentation.profile.source_id_by_role,
+            model_profile_id=segmentation.profile.model_profile_id,
+            model_profile_hash=segmentation.profile.model_profile_hash,
+            inference_implementation_hash=segmentation.profile.inference_implementation_hash,
+            runtime_session_id=segmentation.binding.runtime_session_id,
+            control_domain_id=segmentation.binding.control_domain_id,
+            target_binding_id=segmentation.binding.target_binding_id,
+            station_manifest_hash=segmentation.binding.station_manifest_hash,
+            execution_manifest_hash=segmentation.binding.execution_manifest_hash)
+
+    segmentation_batch = same_cut_registration("2") if enable_segmentation_batch_v2 else None
+    segmentation_geometry = same_cut_registration("3") if enable_segmentation_geometry_v3 else None
     placement = (
         build_placement_registration(
             segmentation=segmentation,
@@ -3282,6 +3343,10 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
     if segmentation is not None:
         definition_items.append(segmentation.skill.definition)
         schema_items.append(segmentation.skill.schema_entry)
+    for batch in (segmentation_batch, segmentation_geometry):
+        if batch is not None:
+            definition_items.append(batch.skill.definition)
+            schema_items.append(batch.skill.schema_entry)
     if placement is not None:
         definition_items.append(placement.skill.definition)
         schema_items.append(placement.skill.schema_entry)
@@ -3477,6 +3542,11 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
                 availability_hash=segmentation.availability_hash,
             )
         )
+    for batch in (segmentation_batch, segmentation_geometry):
+        if batch is not None:
+            route_items.append(SkillRouteManifestEntry(route=batch.skill.routes[0],
+                deployment_binding=batch.binding.to_ref(), evaluation_plan_hash=None,
+                availability_hash=batch.availability_hash))
     if placement is not None:
         route_items.append(
             SkillRouteManifestEntry(
@@ -3522,6 +3592,9 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
             placement.skill.definition.skill_version,
         ):
             explicit_contracts += (placement.skill.io_contract,)
+        for batch in (segmentation_batch, segmentation_geometry):
+            if batch is not None and key == (batch.skill.definition.skill_id, batch.skill.definition.skill_version):
+                explicit_contracts += (batch.skill.io_contract,)
         if rgbd_capture is not None and key == ("perception.capture_rgb", "3"):
             explicit_contracts += (rgbd_capture.skill.io_contract,)
         contract = (
@@ -3649,6 +3722,9 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
         validator_items.append(object_state_registration.payload_validator)
     if segmentation is not None:
         validator_items.append(segmentation.payload_validator)
+    for batch in (segmentation_batch, segmentation_geometry):
+        if batch is not None:
+            validator_items.append(batch.payload_validator)
     if placement is not None:
         validator_items.append(placement.payload_validator)
     for _, safe_schema, safe_route, planned_contract in planned_motions:
@@ -3698,6 +3774,8 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
         rgb_capture=rgb_capture,
         rgbd_capture=rgbd_capture,
         segmentation=segmentation,
+        segmentation_batch=segmentation_batch,
+        segmentation_geometry=segmentation_geometry,
         placement=placement,
         history_profile=history_profile,
         history_source_binding=history_source_binding,

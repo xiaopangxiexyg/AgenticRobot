@@ -197,7 +197,7 @@ def _assert_unsettled_passive_read_defers_owned_dependency_cleanup(state_reader)
         tcp_pose_comparison_executor=None,
         object_state_executor=None,
         depth_executor=None,
-        rgb_executor=None,
+        rgb_executor=None, segmentation_batch_executor=None, segmentation_geometry_executor=None,
         history_executor=None,
         spatial_goal_executor=None, rgbd_capture_executor=None,
         segmentation_executor=None,

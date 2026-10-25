@@ -41,6 +41,8 @@ def test_motion_side_is_explicit_fixed_and_defaults_to_right():
     ["--enable-grasp-approach"],
     ["--enable-spatial-goals"],
     ["--enable-rgbd-capture-v3"],
+    ["--enable-segmentation-batch-v2"],
+    ["--enable-segmentation-geometry-v3"],
     ["--history-root", "/unused/history"],
     ["--segmentation-asset-bundle", "/unused/segmentation"],
     ["--grasp-contact-target-body", "cube"],
