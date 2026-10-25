@@ -32,10 +32,20 @@ class CoordinatedHoldingConfig:
     cruise_velocity_ki_nm_per_rad: float = 0.0
     cruise_velocity_window_sec: float = .2
     cruise_arrival_feedback: bool = False
+    arrival_displacement_gains_nm_per_rad: tuple[float, float] | None = None
     command_field_mode: str = "off"
 
     def __post_init__(self):
         for name, value in vars(self).items():
+            if name == "arrival_displacement_gains_nm_per_rad":
+                if value is not None:
+                    if not isinstance(value, (tuple, list)) or len(value) != len(AXES):
+                        raise ValueError("arrival displacement gains require J2/J3 values")
+                    gains = tuple(finite(v, name) for v in value)
+                    if min(gains) <= 0:
+                        raise ValueError("arrival displacement gains must be positive")
+                    object.__setattr__(self, name, gains)
+                continue
             if name == "command_field_mode":
                 if not isinstance(value, str) or value not in {"off", "shadow", "candidate"}:
                     raise ValueError("command field mode must be off, shadow or candidate")
@@ -56,6 +66,8 @@ class CoordinatedHoldingConfig:
             raise ValueError("cruise velocity feedback requires the explicit motor-local recovery profile")
         if self.cruise_arrival_feedback and not self.cruise_enabled:
             raise ValueError("arrival velocity feedback requires explicit cruise feedback")
+        if self.arrival_displacement_gains_nm_per_rad is not None and not self.cruise_arrival_feedback:
+            raise ValueError("arrival displacement gain requires explicit arrival feedback")
         if self.command_field_mode != "off" and not self.cruise_enabled:
             raise ValueError("command field requires explicit cruise feedback")
 
@@ -378,7 +390,24 @@ class CoordinatedPoseHolding:
             position_rate = max(-limit, min(limit, position_rate))
             audit.update(arrival_position_error_rad=target_error,
                 arrival_position_bias_rate_nm_s=position_rate)
-        increment = (position_rate+self.config.cruise_velocity_ki_nm_per_rad*error)*dt
+        if arrival:
+            # Integrating a delayed window velocity retains its deceleration
+            # tail after the joint has stopped. Use the exact same-interval
+            # displacement instead: integral(v dt) = q_now - q_previous.
+            # This observer only advances after a matching complete dispatch;
+            # a rejected command cannot commit or replay the displacement.
+            previous_position = estimator.latest_observation[1]
+            displacement = self.q[i]-previous_position
+            gains = self.config.arrival_displacement_gains_nm_per_rad
+            gain = (self.config.cruise_velocity_ki_nm_per_rad if gains is None else gains[AXES.index(i)])
+            motion_increment = -gain*displacement
+            increment = position_rate*dt+motion_increment
+            audit.update(arrival_displacement_rad=displacement,
+                arrival_displacement_gain_nm_per_rad=gain,
+                arrival_motion_bias_increment_nm=motion_increment,
+                bias_feedback_source="last_confirmed_position_increment")
+        else:
+            increment = self.config.cruise_velocity_ki_nm_per_rad*error*dt
         bias = max(-self.config.bias_cap_nm, min(self.config.bias_cap_nm, self.bias[i]+increment))
         audit.update(active=True, reason="resolved_arrival_velocity_feedback" if arrival else "resolved_cruise_velocity_feedback", error_rad_s=error,
             proportional_request_nm=proportional, requested_bias_increment_nm=increment)

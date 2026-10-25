@@ -66,7 +66,8 @@
       "cruise_velocity_kp_nm_s_per_rad": 6,
       "cruise_velocity_ki_nm_per_rad": 20,
       "cruise_velocity_window_sec": 0.2,
-      "cruise_arrival_feedback": true
+      "cruise_arrival_feedback": true,
+      "arrival_displacement_gains_nm_per_rad": [20, 40]
     }
   }
 }

@@ -75,6 +75,11 @@ def test_four_centre_profile_changes_only_centres_and_explicit_arrival_feedback(
 @pytest.mark.parametrize("changes", [
     {"cruise_velocity_kp_nm_s_per_rad": -1}, {"cruise_velocity_ki_nm_per_rad": float("nan")},
     {"cruise_velocity_window_sec": 0}, {"cruise_velocity_kp_nm_s_per_rad": True},
+    {"arrival_displacement_gains_nm_per_rad": 0},
+    {"arrival_displacement_gains_nm_per_rad": [20, float("nan")]},
+    {"arrival_displacement_gains_nm_per_rad": [20, True]},
+    {"arrival_displacement_gains_nm_per_rad": [20, -1]},
+    {"arrival_displacement_gains_nm_per_rad": [20]},
 ])
 def test_invalid_cruise_gains_fail_before_backend_construction(changes):
     with pytest.raises(ValueError):
@@ -88,6 +93,8 @@ def test_cruise_is_bound_to_motor_local_continuous_identification():
         WorkspaceCalibrationConfig(coordinated_holding=CoordinatedHoldingConfig(
             supported_soft_recovery=True, recovery_kd_nm_s_per_rad=0, cruise_velocity_kp_nm_s_per_rad=6),
             holding_search=HoldingSearchConfig())
+    with pytest.raises(ValueError, match="requires explicit arrival"):
+        CoordinatedHoldingConfig(arrival_displacement_gains_nm_per_rad=(20, 40))
 
 
 def warm_core(core, *, q=ZERO, target=.02):
@@ -274,6 +281,7 @@ def test_soy9sdfx_arrival_keeps_one_feedback_owner_across_quantized_plateaus(
     tmp_path, monkeypatch, direction, one_count_jitter,
 ):
     core = controller_from_profile(tmp_path, profile=FOUR_CENTRES)._workspace._coordinated.pose
+    core.config = replace(core.config, arrival_displacement_gains_nm_per_rad=(20, 40))
     # Recorded sweep-12: the endpoint had already been reached, then native
     # arrival lasted 172 seconds. Low-count windows repeatedly selected the
     # stationary integrator instead of arrival velocity feedback.
@@ -357,6 +365,83 @@ def test_arrival_still_window_inside_tolerance_retains_unknown_support(tmp_path,
         assert core.bias[2] == pytest.approx(direction*.3)
 
 
+@pytest.mark.parametrize("direction", [-1, 1])
+@pytest.mark.parametrize("period", [.01, .025])
+@pytest.mark.parametrize("joint", AXES)
+def test_arrival_bias_follows_confirmed_displacement_without_a_filtered_stop_tail(
+    tmp_path, monkeypatch, direction, period, joint,
+):
+    core = controller_from_profile(tmp_path, profile=FOUR_CENTRES)._workspace._coordinated.pose
+    core.config = replace(core.config, arrival_displacement_gains_nm_per_rad=(20, 40))
+    start = .08-direction*.002
+    position = [0, .05, .05, 0, 0, 0]
+    position[joint] = start
+    warm_core(core, q=position, target=0)
+    goal = list(position)
+    goal[joint] = .08
+    core.set_goal(goal)
+    support = 3-joint
+    core.adopt_hold(support, .06)
+    core.adopt_hold(joint, direction*.3)
+    core.last_delta = core.bias
+    gain = core.config.arrival_displacement_gains_nm_per_rad[AXES.index(joint)]
+    for tracker, i in zip(core.trackers, AXES, strict=True):
+        monkeypatch.setattr(tracker, "update", lambda i=i, **kwargs: B601JointMotionFrame(
+            phase="brake", reason="target_reached_braking", q_reference_rad=core.goal[i],
+            qvel_reference_rad_s=0, control_qvel_rad_s=0, position_torque_nm=0,
+            velocity_torque_nm=0, requested_torque_nm=0))
+    saw_delayed_velocity_after_stop = False
+    for n in range(1, 81):
+        # A resolved eight-count movement stays inside the accepted band.
+        # Its filtered velocity outlives the actual position increments.
+        count = max(0, min(8, n-40))
+        q = list(position)
+        q[joint] = start+direction*count*RESOLUTION
+        raw = tuple((a-b)/period for a, b in zip(q, core.q))
+        dt = core.observe(core.last_time+period, q, raw)
+        before = core.bias
+        command, audit = core.step(sequence=100+n, dt=dt, permitted=True, point_search=False, cruise_joint=joint)
+        status = audit["cruise_velocity_control"]
+        if n > 40:
+            assert status["active"] and status["arrival_position_bias_rate_nm_s"] == 0
+            assert status["bias_feedback_source"] == "last_confirmed_position_increment"
+            assert core.bias == before
+        core.record_dispatch(100+n, command)
+        assert core.bias[support] == .06
+        assert core.bias[joint] == pytest.approx(direction*(.3-gain*count*RESOLUTION))
+        assert sum(abs(v) for v in command) <= 1+1e-12
+        if n > 48 and abs(status.get("measured_velocity_rad_s", 0)) > .001:
+            saw_delayed_velocity_after_stop = True
+            assert status["requested_bias_increment_nm"] == 0
+            assert core.bias == before
+    assert saw_delayed_velocity_after_stop
+
+
+@pytest.mark.parametrize("direction", [-1, 1])
+def test_one_count_position_chatter_does_not_ratchet_arrival_support(tmp_path, monkeypatch, direction):
+    core = controller_from_profile(tmp_path, profile=FOUR_CENTRES)._workspace._coordinated.pose
+    core.config = replace(core.config, arrival_displacement_gains_nm_per_rad=(20, 40))
+    q = (0, .05, .08, 0, 0, 0)
+    warm_core(core, q=q, target=direction*.001)
+    core.adopt_hold(2, direction*.3)
+    core.last_delta = core.bias
+    for tracker, i in zip(core.trackers, AXES, strict=True):
+        monkeypatch.setattr(tracker, "update", lambda i=i, **kwargs: B601JointMotionFrame(
+            phase="brake", reason="target_reached_braking", q_reference_rad=core.goal[i],
+            qvel_reference_rad_s=0, control_qvel_rad_s=0, position_torque_nm=0,
+            velocity_torque_nm=0, requested_torque_nm=0))
+    for n in range(1, 121):
+        current = list(q)
+        if n > 40 and n % 2:
+            current[2] += direction*RESOLUTION
+        raw = tuple((a-b)/.01 for a,b in zip(current,core.q))
+        dt = core.observe(core.last_time+.01, current, raw)
+        command, _ = core.step(sequence=200+n, dt=dt, permitted=True, point_search=False, cruise_joint=2)
+        core.record_dispatch(200+n, command)
+        if n % 2 == 0:
+            assert core.bias[2] == pytest.approx(direction*.3)
+
+
 @pytest.mark.parametrize("width", [True, .002, float("nan"), float("inf"), -.1])
 def test_invalid_position_bin_option_rejected_before_start(width):
     with pytest.raises(ValueError):
@@ -404,7 +489,8 @@ def test_complete_identification_wires_cruise_only_to_training_validation_axis(t
 
 
 def simulate_motion(tmp_path, *, candidate, speed, direction, inertia=.2, period=.01, arrival=False,
-                    static_scale=1., load_offset=0., field_mode="off", field_source=None):
+                    static_scale=1., load_offset=0., field_mode="off", field_source=None,
+                    arrival_gain=None, settle_observation_sec=0):
     """Declared stick/slip plant, not identified B601 mechanics.
 
     Known motor damping is instantaneous in this toy. Gravity residual and
@@ -420,7 +506,9 @@ def simulate_motion(tmp_path, *, candidate, speed, direction, inertia=.2, period
         core = CoordinatedPoseHolding(core.settings, replace(core.config, command_field_mode=field_mode),
             arrival_tolerance_rad=core.arrival_tolerance_rad, command_field_source=field_source)
     if arrival:
-        core.config = replace(core.config, cruise_arrival_feedback=True)
+        core.config = replace(core.config, cruise_arrival_feedback=True,
+            arrival_displacement_gains_nm_per_rad=None if arrival_gain is None else
+                (core.config.cruise_velocity_ki_nm_per_rad, arrival_gain))
     centre = math.radians(5)
     q = [0, centre, centre-direction*.035, 0, 0, 0]
     measured = tuple(round(v/RESOLUTION)*RESOLUTION for v in q)
@@ -484,7 +572,7 @@ def simulate_motion(tmp_path, *, candidate, speed, direction, inertia=.2, period
         if max(abs(q[i]-goal[i]) for i in AXES) <= .003375 and core.quiet():
             if quiet_since is None:
                 quiet_since = now
-            if now-quiet_since >= core.settings.staged_assist.settle_dwell_sec:
+            if now-quiet_since >= core.settings.staged_assist.settle_dwell_sec+settle_observation_sec:
                 outcome = "arrived"
                 break
         else:
@@ -494,6 +582,8 @@ def simulate_motion(tmp_path, *, candidate, speed, direction, inertia=.2, period
         "peak_speed_rad_s": peak_speed, "duration_sec": now-1.29,
         "final_error_rad": q[2]-goal[2], "inertia": inertia, "period_sec": period,
         "reference_speed_rad_s": speed, "direction": direction,
+        "native_phase": None if not core.frames else core.frames[1].phase,
+        "native_reason": None if not core.frames else core.frames[1].reason,
         "field_predicted_cycles": field_predictions, "field_increment_cycles": field_increments}
 
 
