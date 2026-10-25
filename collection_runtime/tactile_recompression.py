@@ -24,6 +24,7 @@ import numpy as np
 
 from dataset_interface.modality_artifacts import PAYLOAD_HASH_PREFER_SEALED
 
+from .atomic_json import atomic_write_json as _atomic_write_json
 from .modality_inventory import publish_tracked_modality_inventory
 from .process_quiescence import (
     active_formal_collection_processes as _active_collection_processes,
@@ -104,26 +105,6 @@ def _read_jsonl(path: Path) -> list[dict[str, Any]]:
             if isinstance(payload, dict):
                 rows.append(payload)
     return rows
-
-
-def _atomic_write_json(path: Path, payload: Mapping[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
-    temporary = Path(temporary_name)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump(dict(payload), handle, ensure_ascii=True, sort_keys=True, indent=2)
-            handle.write("\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary, path)
-        directory_fd = os.open(path.parent, os.O_RDONLY)
-        try:
-            os.fsync(directory_fd)
-        finally:
-            os.close(directory_fd)
-    finally:
-        temporary.unlink(missing_ok=True)
 
 
 def _atomic_write_bytes(path: Path, payload: bytes) -> None:

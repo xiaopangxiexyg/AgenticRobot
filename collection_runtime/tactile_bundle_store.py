@@ -48,6 +48,7 @@ from dataset_contracts.tactile_bundle import (
     tactile_frame_alignment_hash,
 )
 
+from .atomic_json import atomic_write_json
 from .immutable_canonical_store import (
     fsync_directory,
     publish_immutable_canonical,
@@ -574,21 +575,7 @@ class NativeTactileBundleStore:
     def _atomic_write_recovery_json(
         self, path: Path, payload: Mapping[str, Any]
     ) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        fd, temporary_name = tempfile.mkstemp(
-            prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent)
-        )
-        temporary = Path(temporary_name)
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                json.dump(dict(payload), handle, indent=2, sort_keys=True)
-                handle.write("\n")
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.replace(temporary, path)
-            fsync_directory(path.parent)
-        finally:
-            temporary.unlink(missing_ok=True)
+        atomic_write_json(path, payload, sync_directory=fsync_directory)
 
     def _apply_recovery_transaction(self, transaction: Mapping[str, Any]) -> None:
         if transaction.get("schema") != "dexteleop.tactile_bundle.recovery.v1":

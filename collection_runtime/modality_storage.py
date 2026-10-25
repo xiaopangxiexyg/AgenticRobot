@@ -53,6 +53,7 @@ from dataset_interface.modality_artifacts import (
     verify_modality_artifact_inventory,
 )
 
+from .atomic_json import atomic_write_json
 from .dataset_layout import sanitize_dataset_name_for_path
 from .modality_inventory import (
     load_modality_inventory as _load_published_modality_inventory,
@@ -203,21 +204,7 @@ def _journal_path(dataset_root: Path) -> Path:
 
 
 def _atomic_write_json(path: Path, payload: Mapping[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, temporary_name = tempfile.mkstemp(
-        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
-    )
-    temporary = Path(temporary_name)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump(dict(payload), handle, ensure_ascii=True, sort_keys=True, indent=2)
-            handle.write("\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary, path)
-        _fsync_directory(path.parent)
-    finally:
-        temporary.unlink(missing_ok=True)
+    atomic_write_json(path, payload, sync_directory=_fsync_directory)
 
 
 def _read_json(path: Path) -> Mapping[str, Any]:

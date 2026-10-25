@@ -68,6 +68,13 @@ boundary. The live store becomes poisoned and cannot append or seal again;
 the caller must close and reopen it so a complete newline-delimited record can
 be replayed, or a torn record can fail closed.
 
+采集侧的普通 JSON inventory、压缩 manifest 和恢复 journal 由 `atomic_json.py`
+共享临时文件写入、文件同步、原子替换及临时文件清理。调用方仍保留原有的编码和
+目录同步策略：bundle 使用目录类型检查，capture recovery 保留目录缺失检查，
+modality storage 保留受限的目录同步重试。替换前失败不发布新内容；替换后目录同步
+失败仍向调用方报错，但文件已经可见，不能据此回滚或报告事务成功。事务准入、
+不可变 canonical 文件发布和流式数据写入各自保留现有 owner。
+
 Capture-time progress effective time is monotonic within the bound Episode
 clock. Nested Hold/Resume operation times must also be knowable by the receipt's
 availability time. The live reducer and read-time resolver enforce the same
@@ -149,6 +156,7 @@ collection_runtime/
   progress/           # online progress + distinct sealed annotation stores
     profiles/         # managed linear/tree task profile assets and catalog
   async_writer.py
+  atomic_json.py      # atomic JSON replacement with caller-owned directory sync
   dataset_episode_maintenance.py
   dataset_layout.py
   episode_curation.py # application-neutral external curation sidecar store

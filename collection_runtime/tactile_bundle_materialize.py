@@ -7,7 +7,6 @@ import hashlib
 import json
 import os
 from pathlib import Path
-import tempfile
 from typing import Any, Mapping
 import uuid
 
@@ -20,6 +19,7 @@ from dataset_interface.tactile_bundle import (
     attach_tactile_bundle,
 )
 
+from .atomic_json import atomic_write_json
 from .immutable_canonical_store import fsync_directory
 
 
@@ -94,21 +94,7 @@ def _sha256_file(path: Path) -> str:
 
 
 def _atomic_write_json(path: Path, payload: Mapping[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, temporary_name = tempfile.mkstemp(
-        prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent)
-    )
-    temporary = Path(temporary_name)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump(dict(payload), handle, indent=2, sort_keys=True)
-            handle.write("\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary, path)
-        fsync_directory(path.parent)
-    finally:
-        temporary.unlink(missing_ok=True)
+    atomic_write_json(path, payload, sync_directory=fsync_directory)
 
 
 def plan_tactile_bundle_materialization(
