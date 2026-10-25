@@ -14,7 +14,7 @@ checking only the output sample grid would miss between-tick extrema.
 from __future__ import annotations
 
 import math
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Any
@@ -274,6 +274,7 @@ def _real_roots_in_interval(coefficients: np.ndarray, duration: float) -> tuple[
 def _continuous_extrema(
     segment_coefficients: Sequence[np.ndarray],
     segment_durations: np.ndarray,
+    check_cancelled: Callable[[], None] | None = None,
 ) -> dict[str, np.ndarray]:
     dimension = int(segment_coefficients[0].shape[1])
     minimum_position = np.full(dimension, np.inf, dtype=float)
@@ -282,6 +283,8 @@ def _continuous_extrema(
     maximum_acceleration = np.zeros(dimension, dtype=float)
     maximum_jerk = np.zeros(dimension, dtype=float)
     for coefficients, duration in zip(segment_coefficients, segment_durations):
+        if check_cancelled is not None:
+            check_cancelled()
         derivative_sets = tuple(
             _differentiate_coefficients(coefficients, order)
             for order in range(5)
@@ -418,6 +421,7 @@ def _trajectory_segments(
     initial_acceleration_rad_s2: np.ndarray,
     final_acceleration_rad_s2: np.ndarray,
     stop_at_waypoints: bool = False,
+    check_cancelled: Callable[[], None] | None = None,
 ) -> tuple[np.ndarray, np.ndarray, tuple[np.ndarray, ...], dict[str, np.ndarray]]:
     knot_velocity = _estimate_knot_velocities(
         timestamps,
@@ -431,8 +435,10 @@ def _trajectory_segments(
     knot_acceleration[0] = initial_acceleration_rad_s2
     knot_acceleration[-1] = final_acceleration_rad_s2
     durations = np.diff(timestamps)
-    coefficients = tuple(
-        _quintic_coefficients(
+    def segment_coefficients(index):
+        if check_cancelled is not None:
+            check_cancelled()
+        return _quintic_coefficients(
             q_waypoints[index],
             q_waypoints[index + 1],
             knot_velocity[index],
@@ -441,13 +447,13 @@ def _trajectory_segments(
             knot_acceleration[index + 1],
             durations[index],
         )
-        for index in range(timestamps.size - 1)
-    )
+
+    coefficients = tuple(segment_coefficients(index) for index in range(timestamps.size - 1))
     return (
         knot_velocity,
         knot_acceleration,
         coefficients,
-        _continuous_extrema(coefficients, durations),
+        _continuous_extrema(coefficients, durations, check_cancelled),
     )
 
 
@@ -466,6 +472,7 @@ def build_offline_quintic_waypoint_trajectory(
     max_time_scale: float = 4.0,
     terminal_hold_sec: float = 0.0,
     stop_at_waypoints: bool = False,
+    check_cancelled: Callable[[], None] | None = None,
 ) -> OfflineJointWaypointTrajectory:
     """Build an exact fixed-time C2 waypoint trajectory or fail closed.
 
@@ -475,8 +482,12 @@ def build_offline_quintic_waypoint_trajectory(
     polynomial extrema are certified, not just the sampled command ticks.
     ``stop_at_waypoints`` explicitly preserves each straight joint-space leg
     with zero knot derivatives; the default retains continuous through-motion.
+    Optional ``check_cancelled`` may raise at cooperative computation checkpoints;
+    it does not weaken certification or publish a partial trajectory.
     """
 
+    if check_cancelled is not None:
+        check_cancelled()
     source_times, q_waypoints = _normalize_waypoints(timestamps, q_waypoints_rad)
     times = source_times.copy()
     if not isinstance(limits, JointHorizonLimits):
@@ -548,6 +559,7 @@ def build_offline_quintic_waypoint_trajectory(
         initial_acceleration_rad_s2=initial_acceleration,
         final_acceleration_rad_s2=final_acceleration,
         stop_at_waypoints=stop_at_waypoints,
+        check_cancelled=check_cancelled,
     )
     certificate = _certify_extrema(extrema, limits)
     time_scale = 1.0
@@ -566,6 +578,8 @@ def build_offline_quintic_waypoint_trajectory(
             )
         time_scale = _dynamic_time_scale(extrema, limits) * (1.0 + 1e-6)
         for _ in range(8):
+            if check_cancelled is not None:
+                check_cancelled()
             if time_scale > maximum_time_scale + _TIME_EPSILON_SEC:
                 break
             times = source_times[0] + (
@@ -584,6 +598,7 @@ def build_offline_quintic_waypoint_trajectory(
                 initial_acceleration_rad_s2=initial_acceleration,
                 final_acceleration_rad_s2=final_acceleration,
                 stop_at_waypoints=stop_at_waypoints,
+                check_cancelled=check_cancelled,
             )
             certificate = _certify_extrema(extrema, limits)
             if bool(certificate["passed"]):
@@ -623,6 +638,8 @@ def build_offline_quintic_waypoint_trajectory(
     sample_qdd = np.empty_like(sample_q)
     sample_jerk = np.empty_like(sample_q)
     for sample_index, timestamp in enumerate(sample_times):
+        if check_cancelled is not None:
+            check_cancelled()
         if timestamp >= times[-1] - _TIME_EPSILON_SEC:
             sample_q[sample_index] = q_waypoints[-1]
             sample_qd[sample_index] = final_velocity

@@ -592,6 +592,47 @@ class TCPPoseEnvelopeSafetyRuntime:
                 execution_epoch=0, anchor_receipt=anchor,
             )
 
+    def planning_projector_for_route(
+        self,
+        *,
+        route_id: str,
+    ) -> Callable[[Mapping[str, object]], TCPPoseEnvelopeProjectionResult]:
+        """Freeze an unambiguous Route/reference for read-only planning queries.
+
+        This does not activate an envelope, issue an activation receipt, or
+        update projection state. The actual execution must bind its own fresh
+        operation-local selection through ``activate`` as before.
+        """
+        route = _required(route_id, field_name="route_id")
+        with self._lock:
+            if self._active is not None:
+                raise TCPPoseEnvelopeLifecycleError("planning preview requires closed motion")
+            entries = [entry for entry in self.catalog_entries if route in entry.allowed_route_ids]
+            if len(entries) != 1:
+                raise TCPPoseEnvelopeLifecycleError("planning preview requires one exact Route envelope")
+            entry = entries[0]
+            reference = self._reference
+            anchor = None
+            if entry.profile.anchor_required_sides:
+                if self._reference is None:
+                    raise TCPPoseEnvelopeLifecycleError("planning preview has no committed SafetyReference")
+                anchor = self._reference.bind_profile(anchor_id="planning-preview:"+route,
+                    profile=entry.profile, execution_epoch=0)
+        def project(raw_tcp_pose_by_side: Mapping[str, object]) -> TCPPoseEnvelopeProjectionResult:
+            with self._lock:
+                if self._active is not None:
+                    raise TCPPoseEnvelopeLifecycleError("planning preview requires closed motion")
+                if self._reference is not reference:
+                    raise TCPPoseEnvelopeLifecycleError("planning preview reference changed")
+                return project_tcp_pose_envelope(raw_tcp_pose_by_side,
+                    profile=entry.profile, target_frame_binding_hash=self.target_frame_binding_hash,
+                    tool_frame_binding_hash_by_side=self.tool_frame_binding_hash_by_side,
+                    controlled_frame_id=self.controlled_frame_id,
+                    reference_frame_by_side=self.reference_frame_by_side,
+                    execution_epoch=0, anchor_receipt=anchor)
+        return project
+
+
     def project(
         self,
         raw_tcp_pose_by_side: Mapping[str, object],

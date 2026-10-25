@@ -39,6 +39,23 @@ def _steady_waypoints() -> tuple[np.ndarray, np.ndarray]:
     return timestamps, q
 
 
+@pytest.mark.parametrize("abort_at", [3, 6])
+def test_expensive_trajectory_build_observes_cancellation_during_work(abort_at):
+    calls = 0
+
+    def check_cancelled():
+        nonlocal calls
+        calls += 1
+        if calls == abort_at:
+            raise InterruptedError("cancel during coefficient/extrema computation")
+
+    timestamps, q = _steady_waypoints()
+    with pytest.raises(InterruptedError, match="coefficient/extrema"):
+        build_offline_quintic_waypoint_trajectory(timestamps, q, command_hz=120.,
+            limits=_limits(6), check_cancelled=check_cancelled)
+    assert calls == abort_at
+
+
 def test_continuous_waypoints_do_not_stop_at_internal_15hz_knots() -> None:
     timestamps, q = _steady_waypoints()
     trajectory = build_offline_quintic_waypoint_trajectory(

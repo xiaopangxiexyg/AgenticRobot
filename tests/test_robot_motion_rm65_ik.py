@@ -82,6 +82,77 @@ def test_rm65_single_arm_frame_candidates_are_shared() -> None:
     assert rm65_single_arm_candidate_frames("custom_tcp") == ("custom_tcp", HAND_BASE_FRAME, ARM_LINK6_FRAME)
 
 
+def test_iterative_ik_observes_cancel_after_entering_iterations():
+    from robot_motion.rm65.single_arm_ik import SingleArmIKSolver
+
+    solver = object.__new__(SingleArmIKSolver)
+    solver.num_dofs = 6
+    solver.pin = SimpleNamespace(log3=lambda value: np.zeros(3))
+    solver.compute_pose = lambda q: np.eye(4)
+    solver._solve_step_raw = lambda **kwargs: np.zeros(6)
+    calls = 0
+
+    def check_cancelled():
+        nonlocal calls
+        calls += 1
+        if calls == 3:
+            raise InterruptedError("cancel inside IK")
+
+    target = np.eye(4)
+    target[2, 3] = 1.
+    with pytest.raises(InterruptedError, match="inside IK"):
+        solver.solve_iterative(target, check_cancelled=check_cancelled)
+    assert solver.last_solve_iterations == 2
+
+
+@pytest.mark.parametrize("offset", [np.zeros((3, 3)), np.full((4, 4), np.nan),
+    np.diag([-1., 1., 1., 1.]), np.diag([2., 1., 1., 1.])])
+def test_iterative_controlled_frame_rejects_non_rigid_offset(offset):
+    from robot_motion.rm65.single_arm_ik import SingleArmIKSolver
+
+    solver = object.__new__(SingleArmIKSolver)
+    with pytest.raises(ValueError, match="rigid 4x4"):
+        solver.solve_iterative(np.eye(4), eef_from_controlled_frame=offset)
+
+
+@pytest.mark.integration
+def test_calibrated_tcp_jacobian_matches_finite_difference():
+    from scipy.spatial.transform import Rotation
+
+    solver = build_rm65_single_arm_ik_solver(RM65SingleArmIKConfig(controlled_frame=ARM_ENDPOINT_FRAME))
+    q = np.array([-.6, .4, .5, -.3, .7, -.2])
+    offset = np.eye(4)
+    offset[:3, 3] = [.02, -.01, .14]
+    offset[:3, :3] = Rotation.from_euler("xyz", [.2, -.1, .3]).as_matrix()
+    pose, jacobian = solver._controlled_kinematics(q, offset)
+    numeric = np.empty_like(jacobian)
+    epsilon = 1e-6
+    for index in range(6):
+        plus, minus = q.copy(), q.copy()
+        plus[index] += epsilon
+        minus[index] -= epsilon
+        first, second = solver.compute_pose(plus) @ offset, solver.compute_pose(minus) @ offset
+        numeric[:3, index] = (first[:3, 3] - second[:3, 3]) / (2*epsilon)
+        numeric[3:, index] = Rotation.from_matrix(first[:3, :3] @ second[:3, :3].T).as_rotvec() / (2*epsilon)
+    np.testing.assert_allclose(jacobian, numeric, atol=1e-8)
+    np.testing.assert_allclose(pose, solver.compute_pose(q) @ offset, atol=1e-12)
+    endpoint, ordinary = solver._controlled_kinematics(q, None)
+    np.testing.assert_array_equal(endpoint, solver.compute_pose(q))
+    np.testing.assert_array_equal(ordinary, solver.compute_jacobian(q))
+
+
+@pytest.mark.integration
+def test_iterative_identity_offset_keeps_existing_solution_and_input():
+    solver = build_rm65_single_arm_ik_solver(RM65SingleArmIKConfig(controlled_frame=ARM_ENDPOINT_FRAME))
+    initial = np.array([-.6, .4, .5, -.3, .7, -.2])
+    goal = solver.compute_pose(initial + .01)
+    expected = solver.solve_iterative(goal, q_init=initial, max_iterations=30)
+    offset = np.eye(4)
+    actual = solver.solve_iterative(goal, q_init=initial, max_iterations=30, eef_from_controlled_frame=offset)
+    np.testing.assert_array_equal(expected, actual)
+    np.testing.assert_array_equal(offset, np.eye(4))
+
+
 def test_build_rm65_single_arm_ik_solver_tries_shared_fallback_frames(monkeypatch) -> None:
     import robot_motion.rm65.single_arm_ik as single_ik_module
 

@@ -12,7 +12,7 @@ import math
 import threading
 import time
 from types import MappingProxyType
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from functools import wraps
 from typing import Any
@@ -45,6 +45,7 @@ from robot_motion.rm65 import (
     endpoint_to_tool_transform,
     load_rm65_tool_profile,
 )
+from robot_motion.rm65.ik_tuning import load_ik_tuning_config, with_rm65_position_ik_objective
 from sim.mujoco.collision_safety import (
     KinematicCollisionProjector,
 )
@@ -65,6 +66,42 @@ class MujocoTcpPlanRejected(RuntimeError):
 ConfigurationConstraint = Callable[
     [np.ndarray, Mapping[str, np.ndarray]], JointConfigurationCheck
 ]
+
+
+ENDPOINT_IK_MAX_ITERATIONS = 100
+
+CANDIDATE_SCHEDULING_POLICY = {
+    "id": "bounded_current_seed_ik_hint.v1",
+    "preview_budget_fraction": 0.1,
+    "preview_budget_cap_sec": 0.5,
+    "max_seed_iterations": ENDPOINT_IK_MAX_ITERATIONS,
+    "score": "qualified_then_total_joint_excursion_then_input_index",
+    "preview_can_prune": False,
+}
+
+
+def _ik_orientation_weight(normalized, translation_tolerance_m, rotation_tolerance_rad):
+    if not isinstance(normalized, bool):
+        raise TypeError("normalize_ik_objective must be a bool.")
+    if not normalized:
+        return None
+    if any(isinstance(value, bool) or not math.isfinite(value) or value <= 0
+           for value in (translation_tolerance_m, rotation_tolerance_rad)):
+        raise ValueError("Normalized IK requires positive finite pose tolerances.")
+    return translation_tolerance_m / rotation_tolerance_rad
+
+
+def _solve_endpoint_seed(solver, goal, offset, seed, *, normalized, deadline,
+                         check_cancelled, max_iterations=ENDPOINT_IK_MAX_ITERATIONS):
+    """Keep preview and full planning on the same calibrated IK objective."""
+    return solver.solve_iterative(
+        target_pose=goal if normalized else goal @ np.linalg.inv(offset),
+        q_init=seed, max_iterations=max_iterations,
+        max_joint_step=0.2, damping=0.01,
+        tolerance=1e-5, deadline_monotonic=deadline,
+        check_cancelled=check_cancelled,
+        **({"eef_from_controlled_frame": offset} if normalized else {}),
+    )
 
 
 class _ObservedPlanningOracle:
@@ -230,6 +267,14 @@ class MujocoTcpMotionPlan:
     stages: tuple[tuple[int, MujocoTcpMotionPlan], ...] = ()
     endpoint_search_diagnostics: Mapping[str, Any] | None = None
     observed_planning_input: ObservedJointPlanningInput | None = None
+
+
+@dataclass(frozen=True)
+class MujocoTcpCandidateSelection:
+    candidate_index: int
+    plan: MujocoTcpMotionPlan
+    diagnostics: tuple[Mapping[str, Any], ...]
+    all_candidates_checked: bool
 
 
 # Bound fixed-rate materialization before allocating a native grid.
@@ -459,6 +504,7 @@ class MujocoPlannedTcpMotion:
         reference_hz: float,
         planning_clearance_padding_m: float = 0.002,
         motion_side: str = "right",
+        source_model_qpos: np.ndarray | None = None,
     ):
         if type(motion_side) is not str or motion_side not in ("left", "right"):
             raise ValueError("motion_side must be exactly 'left' or 'right'.")
@@ -479,6 +525,12 @@ class MujocoPlannedTcpMotion:
             )
         self._lock = threading.RLock()
         self._solver = None
+        self._solver_orientation_weight = None
+        self._source_model_qpos = None if source_model_qpos is None else np.asarray(source_model_qpos, dtype=float).copy()
+        if self._source_model_qpos is not None:
+            if self._source_model_qpos.shape != (self.scene.model.nq,) or not np.isfinite(self._source_model_qpos).all():
+                raise ValueError("Planning snapshot must contain one finite complete model qpos.")
+            self._source_model_qpos.setflags(write=False)
         self._active: MujocoTcpMotionPlan | None = None
         self._pending_plan: MujocoTcpMotionPlan | None = None
         self._reference_index = -1
@@ -496,6 +548,8 @@ class MujocoPlannedTcpMotion:
         return self.motion_side + "_arm"
 
     def _model_qpos(self) -> np.ndarray:
+        if self._source_model_qpos is not None:
+            return self._source_model_qpos.copy()
         return self.rig.capture_scene(lambda scene: scene.data.qpos.copy())
 
     def pose_for_configuration(
@@ -507,6 +561,94 @@ class MujocoPlannedTcpMotion:
             qpos_by_source=pair,
             component_ids=(self.component_id,),
         )[self.component_id]
+
+    def _solver_for_ik(self, orientation_weight):
+        if self._solver is None or self._solver_orientation_weight != orientation_weight:
+            tuning = None if orientation_weight is None else with_rm65_position_ik_objective(
+                load_ik_tuning_config(), position_weight=1.0,
+                orientation_weight=orientation_weight, mode_name="safe_tcp_tolerance_normalized")
+            self._solver = build_rm65_single_arm_ik_solver(
+                RM65SingleArmIKConfig(controlled_frame="arm_endpoint", ik_tuning=tuning))
+            self._solver_orientation_weight = orientation_weight
+        return self._solver
+
+
+    def _preview_candidate_order(
+        self, target_poses, *, translation_tolerance_m, rotation_tolerance_rad,
+        normalize_ik_objective, deadline, cancel_requested,
+    ):
+        """Estimate current-seed travel only; never prune or certify a path."""
+        side = self.motion_side
+        if self._source_model_qpos is None:
+            raise ValueError("Candidate scheduling preview requires a frozen query snapshot.")
+        weight = _ik_orientation_weight(
+            normalize_ik_objective, translation_tolerance_m, rotation_tolerance_rad)
+        model_qpos = self._model_qpos()
+        start = {side: np.array([model_qpos[self.scene.joint_qpos_addr(name)]
+                 for name in self.scene.arm_specs[side].joint_names])
+                 for side in ("left", "right")}
+        estimates = {}
+
+        def check_cancelled():
+            if cancel_requested() or time.perf_counter() >= deadline:
+                raise MujocoTcpPlanRejected("safe_tcp_planning_cancelled")
+
+        if cancel_requested():
+            check_cancelled()
+        if time.perf_counter() >= deadline:
+            return tuple(range(len(target_poses))), estimates
+        solver = self._solver_for_ik(weight)
+        offset = endpoint_to_tool_transform(
+            load_rm65_tool_profile(getattr(self.task_config, side + "_tool_profile_path"), side=side))
+        measured = xyzquat_to_matrix(self.pose_for_configuration(model_qpos, start))
+        if not np.allclose(solver.compute_pose(start[side]) @ offset, measured, atol=1e-5):
+            raise MujocoTcpPlanRejected("safe_tcp_ik_model_tool_mismatch")
+        for index, target in enumerate(target_poses):
+            if cancel_requested():
+                check_cancelled()
+            if time.perf_counter() >= deadline:
+                break
+            started = time.perf_counter()
+            goal = xyzquat_to_matrix(target)
+            try:
+                q = np.asarray(_solve_endpoint_seed(
+                    solver, goal, offset, start[side],
+                    normalized=normalize_ik_objective, deadline=deadline,
+                    max_iterations=CANDIDATE_SCHEDULING_POLICY["max_seed_iterations"],
+                    check_cancelled=check_cancelled))
+                check_cancelled()
+            except MujocoTcpPlanRejected as error:
+                if (error.reason_code != "safe_tcp_planning_cancelled" or cancel_requested()
+                        or time.perf_counter() < deadline):
+                    raise
+                break
+            valid = (q.shape == start[side].shape and np.isfinite(q).all()
+                     and np.all(q >= solver.q_min) and np.all(q <= solver.q_max))
+            qualified = False
+            if valid:
+                actual = xyzquat_to_matrix(self.pose_for_configuration(
+                    model_qpos, {**start, side: q}))
+                position = float(np.linalg.norm(actual[:3, 3] - goal[:3, 3]))
+                angle = float(np.arccos(np.clip(
+                    (np.trace(actual[:3, :3].T @ goal[:3, :3])-1)/2, -1, 1)))
+                qualified = position <= translation_tolerance_m and angle <= rotation_tolerance_rad
+            estimates[index] = {
+                "current_seed_ik_qualified": bool(qualified),
+                "estimated_max_joint_excursion_rad": float(np.max(np.abs(q-start[side])))
+                    if qualified else None,
+                "estimated_total_joint_excursion_rad": float(np.sum(np.abs(q-start[side])))
+                    if qualified else None,
+                "wall_sec": time.perf_counter()-started,
+                "collision_checked": False,
+            }
+        # Unknown/failed previews retain input order and remain eligible. Full
+        # multi-seed IK and collision/path checks alone establish a valid plan.
+        order = sorted(range(len(target_poses)), key=lambda index: (
+            not estimates.get(index, {}).get("current_seed_ik_qualified", False),
+            estimates.get(index, {}).get("estimated_total_joint_excursion_rad") or 0.0,
+            index))
+        return tuple(order), estimates
+
 
     def plan(
         self,
@@ -523,6 +665,9 @@ class MujocoPlannedTcpMotion:
         preview_model_qpos: np.ndarray | None = None,
         speed_scale: float = 1.0,
         observed_planning_input: ObservedJointPlanningInput | None = None,
+        deadline_monotonic: float | None = None,
+        incumbent_max_joint_excursion_rad: float | None = None,
+        normalize_ik_objective: bool = False,
     ) -> MujocoTcpMotionPlan:
         """Plan without dispatch; a payload preview retains its binding's cut.
 
@@ -532,6 +677,25 @@ class MujocoPlannedTcpMotion:
         not a bypass of source validation or a new grasp anchor.
         """
         side = self.motion_side
+        orientation_weight = _ik_orientation_weight(normalize_ik_objective,
+            translation_tolerance_m, rotation_tolerance_rad)
+        if deadline_monotonic is not None and (isinstance(deadline_monotonic, bool) or not math.isfinite(deadline_monotonic)):
+            raise ValueError("Planning deadline must be finite.")
+        if incumbent_max_joint_excursion_rad is not None and (
+            isinstance(incumbent_max_joint_excursion_rad, bool)
+            or not math.isfinite(incumbent_max_joint_excursion_rad)
+            or incumbent_max_joint_excursion_rad < 0):
+            raise ValueError("Incumbent joint excursion must be finite and non-negative.")
+        if self._source_model_qpos is not None and observed_planning_input is not None:
+            raise ValueError("A frozen native query cannot use a live observed-scene cut.")
+        incoming_cancel_requested = cancel_requested
+        if deadline_monotonic is not None:
+            cancel_requested = lambda: incoming_cancel_requested() or time.perf_counter() >= deadline_monotonic
+
+        def check_cancelled():
+            if cancel_requested():
+                raise MujocoTcpPlanRejected("safe_tcp_planning_cancelled")
+
         if observed_planning_input is not None:
             if not isinstance(observed_planning_input, ObservedJointPlanningInput):
                 raise TypeError("observed_planning_input must be a measured observed-scene cut.")
@@ -641,11 +805,7 @@ class MujocoPlannedTcpMotion:
                 initial = oracle.check(start)
                 if not initial.safe:
                     raise MujocoTcpPlanRejected("safe_tcp_start_blocked", initial.to_dict())
-                if self._solver is None:
-                    self._solver = build_rm65_single_arm_ik_solver(
-                        RM65SingleArmIKConfig(controlled_frame="arm_endpoint")
-                    )
-                solver = self._solver
+                solver = self._solver_for_ik(orientation_weight)
                 offset = endpoint_to_tool_transform(
                     load_rm65_tool_profile(
                         getattr(self.task_config, side + "_tool_profile_path"), side=side
@@ -677,6 +837,8 @@ class MujocoPlannedTcpMotion:
                 quality_limits = DEFAULT_PATH_MOTION_QUALITY_LIMITS
                 endpoint_started_at = time.perf_counter()
                 deadline = endpoint_started_at + 2.0
+                if deadline_monotonic is not None:
+                    deadline = min(deadline, deadline_monotonic)
 
                 def consider_endpoint(q, seed_index, search_method):
                     nonlocal best_pose_miss
@@ -727,11 +889,16 @@ class MujocoPlannedTcpMotion:
                         raise MujocoTcpPlanRejected("safe_tcp_planning_cancelled")
                     if time.perf_counter() >= deadline:
                         break
-                    q = solver.solve_iterative(
-                        target_pose=endpoint_goal, q_init=seed, max_iterations=100,
-                        max_joint_step=0.2, damping=0.01, tolerance=1e-5,
-                        deadline_monotonic=deadline,
-                    )
+                    if normalize_ik_objective or self._source_model_qpos is not None:
+                        q = _solve_endpoint_seed(solver, goal, offset, seed,
+                            normalized=normalize_ik_objective, deadline=deadline,
+                            check_cancelled=check_cancelled)
+                    else:
+                        q = solver.solve_iterative(
+                            target_pose=endpoint_goal, q_init=seed, max_iterations=100,
+                            max_joint_step=0.2, damping=0.01, tolerance=1e-5,
+                            deadline_monotonic=deadline,
+                        )
                     # Zero travel is the only provable minimum; a converged
                     # current-state seed is not generally the closest branch.
                     if consider_endpoint(q, seed_index, "iterative"):
@@ -785,6 +952,15 @@ class MujocoPlannedTcpMotion:
                          "endpoint_search_diagnostics": endpoint_search_diagnostics,
                          "motion_quality_limits": quality_limits.to_dict()},
                     )
+                if incumbent_max_joint_excursion_rad is not None:
+                    lower_bound = min(float(np.max(np.abs(target[side] - start[side]))) for target in targets)
+                    rank_margin = 1e-9 * max(1.0, lower_bound, incumbent_max_joint_excursion_rad)
+                    if lower_bound > incumbent_max_joint_excursion_rad + rank_margin:
+                        check_cancelled()
+                        raise MujocoTcpPlanRejected("safe_tcp_candidate_rank_pruned", {
+                            "lower_bound_max_joint_excursion_rad": lower_bound,
+                            "incumbent_max_joint_excursion_rad": incumbent_max_joint_excursion_rad,
+                            "rank_margin_rad": rank_margin, "path_search_skipped": True})
                 velocity = np.minimum(
                     np.asarray(self.rig.config.max_velocity_rad_s),
                     np.deg2rad(self.rig.config.max_command_step_deg) * self.rig.config.timing.command_hz,
@@ -800,6 +976,8 @@ class MujocoPlannedTcpMotion:
                     return world_from_base @ xyzquat_to_matrix(self.pose_for_configuration(model_qpos, pair))
 
                 search_deadline = time.perf_counter() + path_search_time_budget_sec
+                if deadline_monotonic is not None:
+                    search_deadline = min(search_deadline, deadline_monotonic)
                 rejected_paths = []
                 while targets:
                     remaining = search_deadline - time.perf_counter()
@@ -877,6 +1055,7 @@ class MujocoPlannedTcpMotion:
                     timing_mode="safe_retime_global",
                     max_time_scale=min(100.0, _trajectory_duration_limit(self.reference_hz) / source_duration),
                     stop_at_waypoints=True,
+                    **({"check_cancelled": check_cancelled} if deadline_monotonic is not None else {}),
                 )
                 # Keep RRT corners on the actual reference clock. Otherwise an
                 # executor could connect the samples on opposite sides of a knot
@@ -889,6 +1068,7 @@ class MujocoPlannedTcpMotion:
                     command_hz=self.reference_hz,
                     limits=limits,
                     stop_at_waypoints=True,
+                    **({"check_cancelled": check_cancelled} if deadline_monotonic is not None else {}),
                 )
                 poses = []
                 for index, current in enumerate(trajectory.q_rad):
@@ -966,12 +1146,145 @@ class MujocoPlannedTcpMotion:
                     }),
                     observed_planning_input=observed_planning_input,
                 )
+                check_cancelled()
                 if not preview:
                     self._pending_plan = plan
                 return plan
 
 
         return self.rig.capture_scene(capture)
+
+    def plan_candidates(
+        self,
+        target_poses: Sequence[tuple[float, ...]],
+        *,
+        translation_tolerance_m: float,
+        rotation_tolerance_rad: float,
+        cancel_requested: Callable[[], bool],
+        time_budget_sec: float = 10.0,
+        path_search_time_budget_sec: float = 3.0,
+        max_reference_count: int | None = None,
+        configuration_constraint: ConfigurationConstraint | None = None,
+        constraint_identity: str | None = None,
+        normalize_ik_objective: bool = False,
+        prioritize_current_seed: bool = False,
+    ) -> MujocoTcpCandidateSelection:
+        """Rank sampled candidates without motion, retaining the selected owned plan.
+
+        Prefer smaller worst-joint excursion, then certified execution duration,
+        then total joint travel. This bounded sampled comparison is not a global
+        optimum. A conservative endpoint bound may skip path search only after
+        a qualified incumbent exists. Such candidates count toward diagnostic
+        coverage in all_candidates_checked, without certifying a complete path.
+        Unpruned candidates use the same existing IK/path/retiming chain.
+        Frozen queries can opt into a bounded, current-seed IK scheduling hint.
+        This hint changes order only, never feasibility or the ranking criterion.
+        """
+        started_at = time.perf_counter()
+        if not target_poses or len(target_poses) > 64:
+            raise ValueError("Candidate planning requires 1..64 explicit poses.")
+        if not isinstance(prioritize_current_seed, bool):
+            raise TypeError("prioritize_current_seed must be a bool.")
+        if max_reference_count is not None and (type(max_reference_count) is not int or max_reference_count <= 0):
+            raise ValueError("Reference count bound must be a positive integer.")
+        if isinstance(time_budget_sec, bool) or not math.isfinite(time_budget_sec) or time_budget_sec <= 0:
+            raise ValueError("Candidate planning needs a positive finite time budget.")
+        if (isinstance(path_search_time_budget_sec, bool) or not math.isfinite(path_search_time_budget_sec)
+                or path_search_time_budget_sec <= 0):
+            raise ValueError("Each candidate needs a positive finite path search budget.")
+        # Both scene and planner lock waits consume the original query budget.
+        deadline = started_at + time_budget_sec
+        def capture(_scene):
+            with self._lock:
+                if self._active is not None:
+                    raise MujocoTcpPlanRejected("safe_tcp_another_plan_active")
+                selection = None
+                diagnostics = []
+                previews = {}
+                try:
+                    best = None
+                    self._pending_plan = None
+
+                    def cancelled_or_expired():
+                        return cancel_requested() or time.perf_counter() >= deadline
+                    order, previews = tuple(range(len(target_poses))), {}
+                    if prioritize_current_seed and len(target_poses) > 1:
+                        order, previews = self._preview_candidate_order(
+                            target_poses, translation_tolerance_m=translation_tolerance_m,
+                            rotation_tolerance_rad=rotation_tolerance_rad,
+                            normalize_ik_objective=normalize_ik_objective,
+                            deadline=min(deadline, time.perf_counter()+min(
+                                CANDIDATE_SCHEDULING_POLICY["preview_budget_cap_sec"],
+                                time_budget_sec*CANDIDATE_SCHEDULING_POLICY["preview_budget_fraction"])),
+                            cancel_requested=cancel_requested)
+                    for index in order:
+                        target = target_poses[index]
+                        if cancel_requested():
+                            raise MujocoTcpPlanRejected("safe_tcp_planning_cancelled")
+                        remaining = deadline - time.perf_counter()
+                        if remaining <= 0:
+                            break
+                        started = time.perf_counter()
+                        try:
+                            rank_bound = {} if best is None else {
+                                "incumbent_max_joint_excursion_rad": best[0][0]
+                            }
+                            plan = self.plan(target,
+                                translation_tolerance_m=translation_tolerance_m,
+                                rotation_tolerance_rad=rotation_tolerance_rad,
+                                normalize_ik_objective=normalize_ik_objective,
+                                cancel_requested=cancelled_or_expired,
+                                configuration_constraint=configuration_constraint,
+                                constraint_identity=constraint_identity,
+                                deadline_monotonic=deadline,
+                                path_search_time_budget_sec=min(path_search_time_budget_sec, remaining),
+                                **rank_bound)
+                        except MujocoTcpPlanRejected as error:
+                            if error.reason_code == "safe_tcp_planning_cancelled":
+                                if cancel_requested():
+                                    raise
+                                break
+                            if error.reason_code not in {
+                                "safe_tcp_endpoint_search_exhausted", "safe_tcp_target_blocked",
+                                "safe_tcp_path_search_exhausted", "safe_tcp_retimed_path_blocked",
+                                "safe_tcp_candidate_rank_pruned",
+                                "safe_tcp_motion_quality_exceeded",
+                            }:
+                                raise
+                            diagnostics.append({"candidate_index": index, "reason_code": error.reason_code,
+                                                "details": error.details, "wall_sec": time.perf_counter()-started})
+                            continue
+                        if max_reference_count is not None and len(plan.reference_poses) >= max_reference_count:
+                            diagnostics.append({"candidate_index": index, "reason_code": "safe_tcp_path_exceeds_control_budget",
+                                "wall_sec": time.perf_counter()-started})
+                            continue
+                        q = plan.trajectory.q_rad
+                        key = (float(np.max(np.abs(q-q[0]))),
+                               float(plan.trajectory.timestamps[-1]-plan.trajectory.timestamps[0]),
+                               float(np.sum(np.abs(np.diff(q, axis=0)))))
+                        diagnostics.append({"candidate_index": index, "reason_code": "path_found",
+                            "ranking_cost": key, "trajectory_hash": plan.trajectory_hash,
+                            "phase_timing_sec": getattr(plan, "phase_timing_sec", None),
+                            "wall_sec": time.perf_counter()-started})
+                        if best is None or key < best[0]:
+                            best = (key, index, plan)
+                    if best is None:
+                        raise MujocoTcpPlanRejected("safe_tcp_no_candidate_path",
+                            {"candidates": diagnostics, "all_candidates_checked": len(diagnostics) == len(target_poses)})
+                    if cancel_requested():
+                        raise MujocoTcpPlanRejected("safe_tcp_planning_cancelled")
+                    selection = MujocoTcpCandidateSelection(best[1], best[2], tuple(diagnostics),
+                                                           len(diagnostics) == len(target_poses))
+                    return selection
+                finally:
+                    for item in diagnostics:
+                        if item["candidate_index"] in previews:
+                            item["scheduling_preview"] = previews[item["candidate_index"]]
+                    self._pending_plan = None if selection is None else selection.plan
+
+
+        return self.rig.capture_scene(capture)
+
 
     @_scene_serialized(total_budget=True)
     def plan_chain(
@@ -1224,6 +1537,8 @@ class MujocoPlannedTcpMotion:
     @_scene_serialized()
     def activate(self, plan: MujocoTcpMotionPlan, *, deadline_at: float | None = None,
                  clock: Callable[[], float] = time.monotonic) -> None:
+        if self._source_model_qpos is not None:
+            raise MujocoTcpPlanRejected("safe_tcp_query_only_plan")
         with self._lock:
             if deadline_at is not None and (
                 isinstance(deadline_at, bool) or not math.isfinite(deadline_at) or not callable(clock)

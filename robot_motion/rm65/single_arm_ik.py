@@ -1,11 +1,14 @@
 from __future__ import annotations
 
-from pathlib import Path
-from collections.abc import Callable
 import time
+from collections.abc import Callable
+from pathlib import Path
 
 import numpy as np
 from scipy.spatial.transform import Rotation as R
+
+from robot_motion.rm65.assets import require_asset_path
+from robot_motion.transforms import validate_pose_matrix
 
 from .ik_tuning import (
     RM65IKTuningConfig,
@@ -13,7 +16,6 @@ from .ik_tuning import (
     load_ik_tuning_config,
     weighted_joint_distance_score,
 )
-from robot_motion.rm65.assets import require_asset_path
 
 
 class BoundedIKNumericalError(RuntimeError):
@@ -125,16 +127,24 @@ class SingleArmIKSolver:
         current_qpos: np.ndarray,
         max_joint_step: float | np.ndarray = 0.05,
         damping: float = 0.1,
+        eef_from_controlled_frame: np.ndarray | None = None,
     ) -> np.ndarray:
         target_pose = _to_pose_matrix(target_pose)
         current_qpos = np.asarray(current_qpos, dtype=float)
 
-        current_pose = self.compute_pose(current_qpos)
+        if eef_from_controlled_frame is None:
+            current_pose = self.compute_pose(current_qpos)
+            jacobian = None
+        else:
+            current_pose, jacobian = self._controlled_kinematics(
+                current_qpos, eef_from_controlled_frame
+            )
         pos_err = target_pose[:3, 3] - current_pose[:3, 3]
         rot_err = self.pin.log3(target_pose[:3, :3] @ current_pose[:3, :3].T)
         error = np.concatenate([pos_err, rot_err])
 
-        jacobian = self.compute_jacobian(current_qpos)
+        if jacobian is None:
+            jacobian = self.compute_jacobian(current_qpos)
         weighting = np.diag(
             [
                 self._position_weight,
@@ -159,6 +169,20 @@ class SingleArmIKSolver:
         target_qpos = current_qpos + np.clip(joint_update, -max_joint_step, max_joint_step)
         return np.clip(target_qpos, self.q_min, self.q_max)
 
+    def _controlled_kinematics(
+        self, qpos: np.ndarray, eef_from_controlled_frame: np.ndarray | None
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Shift the LWA linear Jacobian to the calibrated controlled origin."""
+        endpoint = self.compute_pose(qpos)
+        jacobian = self.compute_jacobian(qpos)
+        if eef_from_controlled_frame is None:
+            return endpoint, jacobian
+        displacement = endpoint[:3, :3] @ eef_from_controlled_frame[:3, 3]
+        jacobian = jacobian.copy()
+        # Pinocchio LWA stacks world-expressed linear then angular velocity.
+        jacobian[:3] += np.cross(jacobian[3:].T, displacement).T
+        return endpoint @ eef_from_controlled_frame, jacobian
+
     def solve_iterative(
         self,
         target_pose: np.ndarray,
@@ -169,8 +193,22 @@ class SingleArmIKSolver:
         tolerance: float = 1e-4,
         deadline_monotonic: float | None = None,
         max_wall_time_sec: float | None = None,
+        check_cancelled: Callable[[], None] | None = None,
+        eef_from_controlled_frame: np.ndarray | None = None,
     ) -> np.ndarray:
+        """Solve in the EEF frame, or an explicit rigid child controlled frame.
+
+        The optional transform changes both residual and Jacobian origins. It
+        does not alter the URDF, calibration, branch selection or joint limits.
+        Existing callers without a transform retain endpoint-space semantics.
+        """
         target_pose = _to_pose_matrix(target_pose)
+        if eef_from_controlled_frame is not None:
+            offset = np.asarray(eef_from_controlled_frame, dtype=float)
+            valid, reason = validate_pose_matrix(offset)
+            if offset.shape != (4, 4) or not valid:
+                raise ValueError(f"eef_from_controlled_frame must be a rigid 4x4 transform: {reason}")
+            eef_from_controlled_frame = offset.copy()
         start_time = time.perf_counter()
         deadline = _solver_deadline(
             started_at=start_time,
@@ -188,10 +226,14 @@ class SingleArmIKSolver:
         self.last_solve_deadline_exceeded = False
 
         for iteration in range(max_iterations):
+            if check_cancelled is not None:
+                check_cancelled()
             if _deadline_exceeded(deadline):
                 self.last_solve_deadline_exceeded = True
                 break
             current_pose = self.compute_pose(q)
+            if eef_from_controlled_frame is not None:
+                current_pose = current_pose @ eef_from_controlled_frame
             pos_err = target_pose[:3, 3] - current_pose[:3, 3]
             rot_err = self.pin.log3(target_pose[:3, :3] @ current_pose[:3, :3].T)
             error = np.concatenate([pos_err, rot_err])
@@ -204,6 +246,8 @@ class SingleArmIKSolver:
                 current_qpos=q,
                 max_joint_step=max_joint_step,
                 damping=damping,
+                **({"eef_from_controlled_frame": eef_from_controlled_frame}
+                   if eef_from_controlled_frame is not None else {}),
             )
             if _deadline_exceeded(deadline):
                 self.last_solve_deadline_exceeded = True
