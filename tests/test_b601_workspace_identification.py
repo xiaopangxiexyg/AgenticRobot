@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import math
@@ -21,6 +22,7 @@ from control_station.b601_torque_console.workspace_calibration import (
 from control_station.b601_torque_console.workspace_identification import (
     _dispatch_integrals,
     _local_repeat_prediction,
+    _reference_speed_coverage,
     _repeatability,
     organize_automatic_reports,
     summarize_workspace_identification,
@@ -43,6 +45,31 @@ from scripts.hardware import rebot_b601_rs_owner as owner
 pytestmark = [pytest.mark.unit, pytest.mark.contract]
 ZERO = (0.0,)*6
 PROFILE = Path(__file__).resolve().parents[1]/"docs/hardware/profiles/b601_j2_j3_continuous_identification_v1.json"
+
+
+def test_measured_speed_coverage_keeps_pose_direction_damping_and_holdout_separate():
+    base = {"model_eligible":True, "pose_index":0, "joint_name":"joint3", "role":"training",
+        "reference_speed_rad_s":.0075, "trial_id":"train-a",
+        "observation":{"velocity_rad_s":.015, "active_driver_kd_nm_s_per_rad":[0,4.5,4.5,0,0,0]}}
+    rows = [copy.deepcopy(base) for _ in range(6)]
+    rows[1].update(role="validation", trial_id="validation-a")
+    rows[1]["observation"]["velocity_rad_s"] = .03
+    rows[2]["pose_index"] = 1
+    rows[3]["observation"]["velocity_rad_s"] = -.015
+    rows[4]["observation"]["active_driver_kd_nm_s_per_rad"][2] = 3.
+    rows[5]["model_eligible"] = False
+    original = copy.deepcopy(rows)
+    summary = _reference_speed_coverage(rows)
+    assert rows == original and len(summary["groups"]) == 5
+    validation = next(g for g in summary["groups"] if g["role"] == "validation")
+    assert validation["median_measured_to_reference_ratio"] == 4
+    assert validation["window_count"] == validation["independent_trial_count"] == 1
+    training = next(g for g in summary["groups"] if g["role"] == "training" and g["pose_index"] == 0
+        and g["measured_direction"] == 1 and g["active_driver_kd_nm_s_per_rad"][2] == 4.5)
+    assert training["median_measured_to_reference_ratio"] == 2
+    assert summary["unavailable_windows"] == 0 and not summary["auto_apply"]
+    rows[0]["observation"]["velocity_rad_s"] = 0
+    assert _reference_speed_coverage(rows)["unavailable_windows"] == 1
 
 
 def test_continuous_plan_is_opt_in_multispeed_bidirectional_with_reserved_validation():

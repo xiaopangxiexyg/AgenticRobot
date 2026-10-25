@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import statistics
 from collections import Counter, defaultdict, deque
 from dataclasses import asdict
 from pathlib import Path
@@ -23,6 +24,36 @@ from robot_motion.rebot_b601_rs.gravity_identification import (
 )
 
 from .calibration_session import calibration_receipt_rejection
+
+
+def _reference_speed_coverage(windows):
+    """Describe achieved speed without changing fit admission or pooling splits."""
+    groups, unavailable = defaultdict(list), 0
+    for window in windows:
+        if not window.get("model_eligible"):
+            continue
+        observation = window.get("observation") or {}
+        reference, measured = window.get("reference_speed_rad_s"), observation.get("velocity_rad_s")
+        if (any(isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v)
+                for v in (reference, measured)) or reference <= 0 or measured == 0):
+            unavailable += 1
+            continue
+        kd = observation.get("active_driver_kd_nm_s_per_rad")
+        key = (window["pose_index"], window["joint_name"], window["role"], reference,
+            1 if measured > 0 else -1, None if kd is None else tuple(kd))
+        groups[key].append((abs(measured), window["trial_id"]))
+    return {"quantity": "measured_encoder_window_speed_not_force",
+        "scope": "admitted_command_windows_not_necessarily_quasisteady; no_fit_gate_changed",
+        "unavailable_windows": unavailable, "auto_apply": False,
+        "groups": [{"pose_index": key[0], "joint_name": key[1], "role": key[2],
+            "reference_speed_rad_s": key[3], "measured_direction": key[4],
+            "active_driver_kd_nm_s_per_rad": key[5], "window_count": len(values),
+            "independent_trial_count": len({trial for _, trial in values}),
+            "minimum_measured_speed_rad_s": min(v for v, _ in values),
+            "median_measured_speed_rad_s": statistics.median(v for v, _ in values),
+            "maximum_measured_speed_rad_s": max(v for v, _ in values),
+            "median_measured_to_reference_ratio": statistics.median(v for v, _ in values)/key[3]}
+            for key, values in sorted(groups.items(), key=lambda item: repr(item[0]))]}
 
 
 def _matched_response_distance(a, b, *, pose_tolerance_rad=.0045, maximum_speed_ratio=1.25):
@@ -95,7 +126,7 @@ def organize_automatic_reports(paths):
             raise ValueError("expected an automatic calibration report")
         condition = report.get("condition")
         if not isinstance(condition, dict):
-            raise ValueError("automatic report is missing its source/gravity condition")
+            raise ValueError("automatic report is missing its source/gravity condition")  # noqa: TRY004 - preserve source-provenance refusal contract
         records = []
         points = (report.get("holding_calibration") or {}).get("points", [])
         for point_index, point in enumerate(points):
@@ -481,6 +512,7 @@ def summarize_workspace_identification(records, *, condition, workspace,
         "quantity": "software_command_not_measured_output_torque",
         "condition": asdict(condition), "settings": settings, "windows": windows,
         "admitted_motion_windows": len(observations), "rejected": dict(rejected),
+        "reference_speed_coverage": _reference_speed_coverage(windows),
         "input_alignment": "latest_complete_dispatch_before_selected_joint_host_receive",
         "device_sampling_timestamp_verified": False,
         "reduction_semantics": ("time_integral_of_latest_complete_dispatched_input_over_duration; "
