@@ -5,7 +5,71 @@ primitive scene v2、观察和 DMTAC 对齐改进。在 native scene、accelerat
 owner 组件上新增完整 manual execution rig 的可信内部 cut；随后补齐 source admission、
 execution authority、decision owners 三个控制状态组件及原 no-model target 的时钟接缝，
 随后补齐完整 logical core 和标准 coupled IK/retargeter 的 native 数据恢复组件。
-完整 target、Gateway 会话及 RPent 联合恢复仍待装配，现有入口不自动启用恢复。
+本轮进一步将这些 owner 与 runtime 水位通过原 no-model factory 装配成独立的
+manual/immediate target；这是可信内存内分支，不是完整节点磁盘格式。Gateway 会话、
+上层 agent 上下文与 RPent 联合恢复仍待接入，现有入口不自动启用恢复。
+
+## Manual no-model target 的独立分支
+
+`sim.mujoco.deploy.runtime_checkpoint` 保存完整 core 及 runtime 自有的 source sequence、
+观察 adapter sequence、最新请求阶段、dispatch context、immediate target/admission
+历史、reference index 和 trace 消费水位。检查缓存与原 journal 的完整、有序关系，
+拒绝历史截短、遗漏已返回阶段、观察/接纳编号回退及伪造 backend receipt。
+检查复用原 typed record、trace projector 和构造器，不重放旧事件来重建状态。
+
+这里的三个“最新”不一定是同一个动作：最新请求 B 可能已拒绝，而 plant 仍执行 A；
+B 也可能已经接受但等待下一 reference tick。HOLD 可以清掉物理参考而仍保留历史
+index。恢复分别保留这些事实，不根据某一份缓存重新发动作或改写另一 owner。
+
+`sim.mujoco.deploy.target_checkpoint` 组合原 rig/native、retargeter、core/runtime 和
+resolver 诊断。恢复从原 factory 进入，使用源的原始 initial q 配置；不会把当前
+measured q 误作新启动姿态，不执行 tracking reset、重新 grant、旧请求/trace 重放。
+IK adapter 验证传入 owner 与恢复状态相同后才跳过普通初始 reset。普通新建路径
+继续执行原 reset、碰撞检查、canonical safety、墙钟 adaptive IK 和唯一 dispatch。
+
+```python
+from sim.mujoco.deploy.target_checkpoint import (
+    capture_motion_target, restore_motion_target,
+)
+
+# The parent fences ALL admissions, decisions, callbacks and physics ticks.
+cut = capture_motion_target(source, prepared=source_prepared,
+                            max_native_bytes=native_budget)
+branch = restore_motion_target(
+    cut,
+    prepared=trusted_prepared_metadata,
+    rig_config=trusted_rig_config,
+    expected_model_sha256=trusted_native_model_sha256,
+    binding_factory=build_fresh_component_binding,
+    max_native_bytes=native_budget,
+)
+# branch is already running at the saved logical clock; do not call start().
+```
+
+`binding_factory` 必须针对传入的新 prepared scene 构造回调，不能复制捕获源 scene 的
+闭包。原 shared-safety 回调现在由私有 typed callable 显式保存 rig/task/clock/profile
+绑定，算法不变；恢复核对 safety、materializer、schema、frame 与 resolver 身份。
+失败只关闭尚未发布的新 rig，源 target 和原证据保持不变。
+
+首片仅接受原 standard coupled IK、双臂 actuated manual rig、单一 direct component
+source、immediate qref、无外部 execution observer/trace sink、无额外 safe-motion plan
+或自定义 resolver/filter 的实际源配置。启用了这些组件的源明确拒绝，不在恢复时
+关闭组件来凑通过。backend 已抛异常而无法确认完整 dispatch 返回的切点也明确拒绝；
+不能把有 target 记录等同于执行已确认。
+
+验收使用真实 CAD/MuJoCo/Pinocchio/Pink，覆盖新参考未激活、活动参考、后一请求过期、
+HOLD、非零观察编号、恢复后下一次原 dispatch，以及各类回退/错绑负例。接续 physics
+的 qpos/qvel 对应一致；新一轮 adaptive IK 仍受真实墙钟时间影响，不承诺两个串行
+分支未来全部 telemetry 或 hash 相等。这不证明任务成功率或真实 agent 能力。
+
+```bash
+bash scripts/run_pytest.sh tests/test_mujoco_runtime_checkpoint.py tests/test_mujoco_target_checkpoint.py -q
+```
+
+后续应由 Gateway profile 补齐真实 enabled observer/operation owner 的封存合同、
+事务 fencing、磁盘 bundle 的实现/owner 身份和原子发布，再与 RPent 的 runtime／记录
+前缀恢复组合验收。当前内存 API 需要 caller-trusted prepared metadata；不能将其
+描述为进程重启后仅凭一个文件即可恢复完整节点。
 
 ## 完整逻辑 control core 的冷恢复
 
@@ -309,9 +373,9 @@ proposal/epoch/permit/schedule 状态及 qpos/qvel/ctrl/warmstart，另验证真
 ## 尚未完成，不能据此放开上层
 
 1. Gateway admission、物理线程和控制 owner 的联合静止边界。
-2. 将已完成的完整 logical core、rig 和标准 coupled IK 接到实际 target，补齐 target
-   保留引用、trace/observation 游标及外层 safety/plan 连续性；统一证明同一 cut。scheduled/pending
-   activation 等未纳入本片资格的绑定，不能直接放行。
+2. 将本轮已装配的 manual/immediate target 分支接到真实 Gateway profile，补齐实际
+   开启的 execution observer、外层 safety/plan 的续跑合同。immediate pending reference
+   已验证；scheduled segment 及异步 activation 仍未纳入资格，不能直接放行。
 3. 新实例中 FK、collision、payload、observer、scratch 等消费者的统一绑定。
 4. profile 身份、持久化/原子提交、历史产物与恢复分支的来源关系。
 5. sleep 混合状态、完整 no-model profile、渲染和远端组合验收。

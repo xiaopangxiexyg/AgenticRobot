@@ -3,12 +3,16 @@
 import json
 import subprocess
 import sys
+from dataclasses import dataclass, make_dataclass
 
+import numpy as np
 import pytest
 
 from robot_motion.action.authoritative_checkpoint import capture_authoritative_control
 from robot_motion.action.checkpoint_codec import (
+    decode_checkpoint_value,
     decode_control_checkpoint,
+    encode_checkpoint_value,
     encode_control_checkpoint,
 )
 from tests.test_authoritative_checkpoint import _moving, _restore
@@ -87,3 +91,28 @@ def test_decoding_does_not_replace_configuration_or_history_validation():
     with pytest.raises(ValueError, match="configuration"):
         _restore(parsed)
     source.close()
+
+
+def test_parent_record_codec_preserves_bits_and_rejects_unknown_records():
+    @dataclass(frozen=True)
+    class ParentRecord:
+        values: object
+
+    value = np.array([0.0, -0.0], dtype=">f8")
+    value.flags.writeable = False
+    blob = encode_checkpoint_value(
+        ParentRecord(value), extra_record_types=(ParentRecord,)
+    )
+    with pytest.raises(ValueError, match="Unknown"):
+        decode_checkpoint_value(blob)
+    restored = decode_checkpoint_value(blob, extra_record_types=(ParentRecord,))
+    assert restored.values.dtype == value.dtype
+    assert restored.values.tobytes() == value.tobytes()
+    assert not restored.values.flags.writeable
+    assert not np.shares_memory(value, restored.values)
+    writable = decode_checkpoint_value(encode_checkpoint_value(value.copy()))
+    assert writable.flags.writeable
+    with pytest.raises(ValueError, match="Ambiguous"):
+        encode_checkpoint_value(
+            None, extra_record_types=(ParentRecord, make_dataclass("ParentRecord", []))
+        )
