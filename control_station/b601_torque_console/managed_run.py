@@ -197,6 +197,7 @@ def inspect(run):
         else:
             batch = snapshot.get('automatic_calibration', {})
             workspace = batch.get('workspace', {})
+            holding = snapshot.get('coordinated_holding') or {}
             live = {'managed_cycle': snapshot.get('managed_cycle'), 'fault': snapshot.get('fault'),
                 'owner_ready': snapshot.get('owner_ready'),
                 'state': batch.get('state'), 'reason': batch.get('reason'),
@@ -204,7 +205,11 @@ def inspect(run):
                 'continuous_identification': workspace.get('continuous_identification'),
                 'arrival': workspace.get('arrival'),
                 'motion_control': snapshot.get('motion_control'),
-                'cruise_velocity_control': (snapshot.get('coordinated_holding') or {}).get('cruise_velocity_control'),
+                'cruise_velocity_control': holding.get('cruise_velocity_control'),
+                'command_authority': {k: holding.get(k) for k in (
+                    'bias_nm', 'proposed_bias_nm', 'combined_command_nm', 'combined_l1_cap_nm',
+                    'combined_cap_shortfall_nm', 'saturated', 'composed_speed_scales', 'quantity')}
+                    if holding else None,
                 'supported_return': workspace.get('supported_return'), 'qpos_rad': snapshot.get('qpos_rad')}
             phase = (live['managed_cycle'] or {}).get('phase')
             if phase == 'origin_confirmed':

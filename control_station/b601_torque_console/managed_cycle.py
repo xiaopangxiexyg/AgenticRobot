@@ -96,22 +96,25 @@ def assess_managed_result(payload, report=None):
     cleanup = payload.get("cleanup", {})
     batch = payload.get("automatic_calibration", {})
     returned = batch.get("workspace", {}).get("supported_return", {})
-    lifecycle = (returned.get("completed") is True
-        and payload.get("cycle_disable_confirmation", {}).get("confirmed") is True
-        and all(cleanup.get(key) is True for key in (
+    disable_cleanup = (all(cleanup.get(key) is True for key in (
             "device_cleanup_confirmed", "motor_disable_confirmed",
             "active_report_disable_confirmed", "driver_limits_restore_confirmed"))
         and cleanup.get("transport_release", {}).get("completed") is True
         and not cleanup.get("errors") and not payload.get("cleanup_errors"))
+    lifecycle = (returned.get("completed") is True
+        and payload.get("cycle_disable_confirmation", {}).get("confirmed") is True and disable_cleanup)
     complete = batch.get("state") == "complete" and batch.get("outcome", {}).get("action") == "complete"
     if report is not None:
         complete = complete and report.get("acquisition_complete") is True
     execution_error = payload.get("execution_status") in {"ERROR", "FAILED"} or payload.get("status") in {"ERROR", "FAIL"}
     report_error = payload.get("automatic_calibration_report_status") in {"ERROR", "INTERRUPTED"}
-    status = ("OPERATOR_REQUIRED" if not lifecycle else "EXECUTION_ERROR" if execution_error
+    status = ("OPERATOR_REQUIRED" if not disable_cleanup else "EXECUTION_ERROR" if execution_error
+              else "RETURN_INCOMPLETE" if not lifecycle
               else "REPORT_ERROR" if report_error else "COMPLETE" if complete else "PARTIAL_ACQUISITION")
     return {"status": status,
             "lifecycle_complete": lifecycle, "acquisition_complete": complete,
+            "return_complete": returned.get("completed") is True,
+            "disable_cleanup_confirmed": bool(disable_cleanup),
             "acquisition_reason": batch.get("reason", payload.get("stop_reason", payload.get("error"))),
             "execution_status": payload.get("execution_status"),
             "report_status": payload.get("automatic_calibration_report_status"),

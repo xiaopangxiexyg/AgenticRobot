@@ -112,6 +112,25 @@ def test_old_pid_and_exit_zero_cannot_become_success_or_a_stop_target(tmp_path, 
         managed.request_protective_hold(run)
 
 
+def test_live_status_exposes_existing_shared_command_authority_without_a_control_request(tmp_path, monkeypatch):
+    run = tmp_path/'managed-live'
+    run.mkdir()
+    (run/'process.json').write_text(json.dumps({'pid':22, 'start_ticks':'100',
+        'command':[sys.executable, str(managed.OWNER), '--torque-console-managed-cycle']}))
+    holding = {'combined_command_nm':[0,.037,.963,0,0,0], 'combined_l1_cap_nm':1,
+        'saturated':True, 'quantity':'software_command_not_measured_force'}
+    monkeypatch.setattr(managed, 'process_matches', lambda receipt: True)
+    monkeypatch.setattr(managed, 'console_state', lambda *a: ('http://127.0.0.1:1234', {
+        'managed_cycle':{'phase':'running'}, 'owner_ready':True, 'coordinated_holding':holding}))
+    monkeypatch.setattr(managed, 'urlopen', lambda *a, **k: pytest.fail('status attempted an additional HTTP request'))
+    result = managed.inspect(run)
+    assert result['status'] == 'RUNNING'
+    authority = result['live']['command_authority']
+    assert authority['saturated'] and authority['combined_l1_cap_nm'] == 1
+    assert authority['combined_command_nm'] == holding['combined_command_nm']
+    assert authority['quantity'] == 'software_command_not_measured_force'
+
+
 def test_managed_stop_cannot_escalate_to_full_disable(tmp_path, monkeypatch):
     monkeypatch.setattr(managed, 'inspect', lambda run: {'launcher_running': True, 'process': {'pid': 2}})
     monkeypatch.setattr(managed, 'process_matches', lambda receipt: True)

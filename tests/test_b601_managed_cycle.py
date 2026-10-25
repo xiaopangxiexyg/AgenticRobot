@@ -150,6 +150,15 @@ def test_managed_assessment_separates_cleanup_acquisition_and_model_readiness():
     broken = copy.deepcopy(payload)
     broken['cleanup']['motor_disable_confirmed'] = False
     assert assess_managed_result(broken, report)['status'] == 'OPERATOR_REQUIRED'
+    returned_manually = copy.deepcopy(payload)
+    returned_manually['automatic_calibration']['workspace']['supported_return']['completed'] = False
+    returned_manually['cycle_disable_confirmation']['confirmed'] = False
+    manual = assess_managed_result(returned_manually, report)
+    assert manual['status'] == 'RETURN_INCOMPLETE'
+    assert manual['disable_cleanup_confirmed'] and not manual['lifecycle_complete']
+    assert not manual['return_complete'] and not manual['automatic_retry']
+    returned_manually['execution_status'] = 'ERROR'
+    assert assess_managed_result(returned_manually, report)['status'] == 'EXECUTION_ERROR'
     payload['automatic_calibration'].update(state='complete', outcome={'action': 'complete'})
     assert not assess_managed_result(payload, report)['acquisition_complete']
     report['acquisition_complete'] = True

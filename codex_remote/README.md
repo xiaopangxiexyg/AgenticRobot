@@ -175,6 +175,9 @@ SSH 返回后子进程继续执行，连接超时不会以 SIGTERM 杀死控制�
 GUI 的 `full_disable` 协议，验证启动进程、进程组、运行目录与控制端口身份，且拒绝
 仍在运行的批次；不发送 CAN、不发信号、不修改活动 owner 源码。请求成功只代表接受，
 仍须核对最终 `motor_disable_confirmed` 与 `transport_release.completed`。
+`status` 同时发布现有两轴合成命令、共享限幅和饱和信息，均为软件命令诊断，不能当作
+实测输出力矩。人工支撑后已确认失能但自动回位未完成时报告 `RETURN_INCOMPLETE`，
+保留 `lifecycle_complete=false`；失能／清理未确认才报告 `OPERATOR_REQUIRED`，不自动重试。
 
 ### 冻结抓姿数据的限定探针
 
