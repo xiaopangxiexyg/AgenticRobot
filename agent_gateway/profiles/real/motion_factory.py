@@ -69,7 +69,7 @@ def attach_real_agent_primitive_gateway(
     clock: Callable[[], float] = time.time,
     sleep: Callable[[float], None] = time.sleep,
 ) -> RealAgentPrimitiveRealTeleopAttachment:
-    """Preflight and attach the default-off real 6+3 application.
+    """Preflight and attach retained Routes permitted by the lower envelope.
 
     The function starts no socket, thread, control loop, device, or motion.
     The caller must use the returned ``components`` in the existing RealTeleop

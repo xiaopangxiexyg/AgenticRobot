@@ -13,9 +13,7 @@ from agent_gateway.profiles.real.motion_factory import (
     attach_real_agent_primitive_gateway,
 )
 from agent_gateway.profiles.real.motion_primitive_profiles import (
-    REAL_AGENT_TCP_CARDINAL_STEP_ROUTE_ID_V1,
-    REAL_AGENT_TCP_FIXED_CARDINAL_STEP_ROUTE_ID_BY_SKILL_ID_V1,
-    REAL_AGENT_TCP_FIXED_ORIENTATION_ROUTE_ID_BY_SKILL_ID_V1,
+    REAL_AGENT_TCP_POSE_TARGET_ROUTE_ID_V1,
 )
 from agent_gateway.profiles.real.observation_gateway import (
     RealTcpPoseObserveAttachmentSpec,
@@ -26,6 +24,10 @@ from agent_gateway.profiles.real.one_shot_authorization import (
     REAL_AGENT_PRIMITIVE_CONFIRM_TOKEN,
     RealAgentPrimitiveOneShotAuthorization,
 )
+from agent_gateway.profiles.real.session_authorization import (
+    REAL_AGENT_ABSOLUTE_TCP_POSE_ACTION,
+    validate_real_agent_primitive_action,
+)
 from dataset_contracts.canonical_encoding import canonical_content_hash
 from robot_motion.coordinate_frames import CoordinateFrameGraph, CoordinateFrameSpec
 from robot_motion.coordinate_profiles import STATION_RETARGET_FRAME_CONTRACT_V1
@@ -35,11 +37,14 @@ from teleop_runtime.real_teleop.agent_motion_port import (
 )
 from teleop_runtime.real_teleop.components import RealTeleopComponents
 
-_ALL_REAL_PRIMITIVE_ROUTE_IDS = (
-    REAL_AGENT_TCP_CARDINAL_STEP_ROUTE_ID_V1,
-    *tuple(REAL_AGENT_TCP_FIXED_CARDINAL_STEP_ROUTE_ID_BY_SKILL_ID_V1.values()),
-    *tuple(REAL_AGENT_TCP_FIXED_ORIENTATION_ROUTE_ID_BY_SKILL_ID_V1.values()),
-)
+_ALL_REAL_PRIMITIVE_ROUTE_IDS = (REAL_AGENT_TCP_POSE_TARGET_ROUTE_ID_V1,)
+
+
+def _skill_only_action(action: str) -> str:
+    selected = validate_real_agent_primitive_action(action)
+    if selected != REAL_AGENT_ABSOLUTE_TCP_POSE_ACTION:
+        raise ValueError("This compatibility entrypoint supports only move_tcp_to_pose.")
+    return selected
 
 
 def add_real_agent_primitive_arguments(
@@ -73,7 +78,7 @@ def add_real_agent_primitive_arguments(
     )
     group.add_argument(
         "--agent-primitive-authorized-action",
-        choices=REAL_AGENT_PRIMITIVE_ACTIONS,
+        choices=(REAL_AGENT_ABSOLUTE_TCP_POSE_ACTION,),
     )
     group.add_argument(
         "--agent-primitive-confirm",
@@ -106,6 +111,10 @@ def validate_real_agent_primitive_arguments(
         parser.error("--agent-primitive-authorized-side is required")
     if getattr(args, "agent_primitive_authorized_action", None) is None:
         parser.error("--agent-primitive-authorized-action is required")
+    try:
+        _skill_only_action(args.agent_primitive_authorized_action)
+    except ValueError as error:
+        parser.error(str(error))
     if set(getattr(args, "active_sides", ())) != {"left", "right"}:
         parser.error(
             "Skill-only primitive requires --active-sides both: the existing "
@@ -229,7 +238,7 @@ class RealAgentPrimitiveSkillOnlyExtension:
     def __init__(self, args: argparse.Namespace) -> None:
         self.args = args
         self.side = str(args.agent_primitive_authorized_side)
-        self.action = str(args.agent_primitive_authorized_action)
+        self.action = _skill_only_action(str(args.agent_primitive_authorized_action))
         self.client_id = str(args.agent_primitive_client_id)
         self.client_uid = int(args.agent_primitive_client_uid)
         self.socket_path = str(args.agent_primitive_socket_path)
