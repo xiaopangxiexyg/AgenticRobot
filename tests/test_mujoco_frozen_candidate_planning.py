@@ -498,7 +498,8 @@ def test_candidate_rank_pruning_retains_owned_winner_and_secondary_ranking(durat
 
 
 @pytest.mark.parametrize("reason", ["safe_tcp_endpoint_search_exhausted", "safe_tcp_target_blocked",
-    "safe_tcp_path_search_exhausted", "safe_tcp_retimed_path_blocked"])
+    "safe_tcp_path_search_exhausted", "safe_tcp_retimed_path_blocked",
+    "safe_tcp_target_envelope_blocked"])
 def test_failed_first_candidate_does_not_establish_rank_incumbent(reason):
     candidate = SimpleNamespace(trajectory=SimpleNamespace(q_rad=np.array([[0.], [.1]]),
         timestamps=np.array([0., 1.])), trajectory_hash="candidate")

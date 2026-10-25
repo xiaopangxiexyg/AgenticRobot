@@ -202,6 +202,8 @@ class MujocoAgentTcpPoseGatewaySession:
     rgbd_capture_executor: PassiveReadSkillExecutor | None = None
     segmentation_batch_executor: PassiveReadSkillExecutor | None = None
     segmentation_geometry_executor: PassiveReadSkillExecutor | None = None
+    object_goal_query_executor: PassiveReadSkillExecutor | None = None
+    surface_anchor_executors: tuple[PassiveReadSkillExecutor, ...] = ()
     _close_lock: threading.Lock = field(
         default_factory=threading.Lock,
         init=False,
@@ -230,6 +232,10 @@ class MujocoAgentTcpPoseGatewaySession:
     )
 
     def __post_init__(self) -> None:
+        if (self.contract_bundle.object_goal_query_registration is not None) != (self.object_goal_query_executor is not None):
+            raise ValueError("Object goal query registration and executor must coexist.")
+        if len(self.surface_anchor_executors) != len(self.contract_bundle.surface_anchor_registrations):
+            raise ValueError("Surface anchor registrations and executors must coexist.")
         fast_parts = (self.contract_bundle.fast_grasp_contract is not None,
                       self.grasp_observation_executor is not None, self.fast_grasp_executor is not None,
                       self.execute_grasp_plan_executor is not None, self.fast_grasp_provider is not None,
@@ -580,6 +586,13 @@ class MujocoAgentTcpPoseGatewaySession:
                     ),
                     ("history", self.history_executor, 5.0),
                     ("spatial_goal", self.spatial_goal_executor, 5.0),
+                    *((("object_goal_query", self.object_goal_query_executor,
+                        self.contract_bundle.object_goal_query_registration.skill.routes[0].max_operation_duration_ms / 1000 + 5.0),)
+                        if self.object_goal_query_executor is not None else ()),
+                    *(("surface_anchor", executor, max(35.0,
+                        registration.skill.routes[0].max_operation_duration_ms / 1000 + 5.0))
+                        for registration, executor in zip(self.contract_bundle.surface_anchor_registrations,
+                            self.surface_anchor_executors, strict=True)),
                     ("rgbd_capture", self.rgbd_capture_executor, 5.0),
                     ("tcp_pose_comparison", self.tcp_pose_comparison_executor, 5.0),
                     ("object_state", self.object_state_executor, 5.0),
@@ -732,11 +745,15 @@ def _mujoco_hardware_view_provider(
         for entry in contract_bundle.route_manifest.skill_routes
         if entry.route.control_effect_class in {"read_only", "motion"}
     )
-    segment_route_hash = (
-        None
-        if contract_bundle.segmentation is None
-        else contract_bundle.segmentation.skill.routes[0].semantic_content_hash
-    )
+    segment_route_hashes = (() if contract_bundle.segmentation is None else (
+        contract_bundle.segmentation.skill.routes[0].semantic_content_hash,
+        *((contract_bundle.segmentation_batch.skill.routes[0].semantic_content_hash,)
+            if contract_bundle.segmentation_batch is not None else ()),
+        *((contract_bundle.segmentation_geometry.skill.routes[0].semantic_content_hash,)
+            if contract_bundle.segmentation_geometry is not None else ()),
+        *(item.entry.route.semantic_content_hash for item in contract_bundle.surface_anchor_registrations
+            if item.skill.definition.skill_id == "perception.capture_surface_anchor"
+            and item.skill.definition.skill_version == "2")))
     bindings = [
         HardwareResourceBinding(
             resource_id="simulation.runtime",
@@ -748,12 +765,12 @@ def _mujoco_hardware_view_provider(
             ),
         )
     ]
-    if segment_route_hash is not None:
+    if segment_route_hashes:
         bindings.append(
             HardwareResourceBinding(
                 resource_id="perception.segmentation_model",
                 resource_kind="local_model",
-                route_hashes=(segment_route_hash,),
+                route_hashes=segment_route_hashes,
                 health_provider=lambda: (
                     "ready"
                     if segmentation_provider is not None
@@ -884,6 +901,12 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
         max_retained_operations,
         field_name="max_retained_operations",
     )
+    if contract_bundle.surface_anchor_registrations and retention < 2:
+        raise ValueError("Surface anchors require retained producer and consumer operations.")
+    if any(item.skill.definition.skill_id == "perception.capture_surface_anchor"
+           and item.skill.definition.skill_version == "3"
+           for item in contract_bundle.surface_anchor_registrations) and retention < 3:
+        raise ValueError("Surface anchor v3 requires capture, segmentation and anchor retention.")
     session_admission_limit = (
         None
         if max_session_admissions_per_route is None
@@ -1777,6 +1800,44 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
             clock=runtime_clock, max_retained_operations=retention,
         )
         execution_port_by_route_hash[registration.entry.route.semantic_content_hash] = spatial_goal_executor
+    object_goal_query_executor = None
+    surface_anchor_executors = ()
+    if contract_bundle.object_goal_query_registration is not None:
+        from .object_goal_query import MujocoObjectGoalQuery, build_object_goal_query_executor
+        registration = contract_bundle.object_goal_query_registration
+        safe_contract_for_query = contract_bundle.safe_tcp_pose_contract
+        safe_route_for_query = contract_bundle.route_manifest.route('motion.move_tcp_to_pose_safe', '1').route
+        safety = application.tcp_pose_envelope_runtime
+        planning_source = application.target.planned_tcp_motion
+
+        def prepare_projection():
+            project = safety.planning_projector_for_route(route_id=safe_route_for_query.route_id)
+            return (project, canonical_content_hash({'profile': safe_contract_for_query.motion_profile.semantic_content_hash, 'reference': safety.snapshot().safety_reference_hash}, domain='agenticrobot.object_goal_query.constraint.v1'))
+        query_port = MujocoObjectGoalQuery(scene=application.scene, rig_config=application.runtime.rig.config, task_config=application.task_config, pose_projector=planning_source.pose_projector, reference_hz=planning_source.reference_hz, capture_scene=application.runtime.rig.capture_scene, transform_pose=application.transform_tcp_pose_xyzquat, prepare_projection=prepare_projection, profile=safe_contract_for_query.motion_profile, clearance_padding_m=planning_source.planning_clearance_padding_m)
+        if registration is not None:
+            object_goal_query_executor = build_object_goal_query_executor(registration=registration, query_port=query_port, current_station_revision=lambda: observation_producer.current_station_revision, clock=runtime_clock, max_retained_operations=retention)
+            execution_port_by_route_hash[registration.entry.route.semantic_content_hash] = object_goal_query_executor
+        if contract_bundle.surface_anchor_registrations:
+            from agent_gateway.profiles.surface_anchor import build_anchored_goal_executor, build_anchored_query_executor, build_surface_anchor_capture_executor
+            from agent_gateway.skills.perception.surface_anchor import CAPTURE_SKILL_ID, GOAL_SKILL_ID
+            captures = {item.skill.definition.skill_version: item for item in contract_bundle.surface_anchor_registrations if item.skill.definition.skill_id == CAPTURE_SKILL_ID}
+            shared = {'current_station_revision': lambda: observation_producer.current_station_revision, 'clock': runtime_clock, 'clock_domain_id': runtime.config.clock_domain_id, 'max_retained_operations': retention, 'store': artifact_store}
+            surface_anchor_executors = ()
+            for item in contract_bundle.surface_anchor_registrations:
+                capture_registration = captures[item.skill.definition.skill_version]
+                if item.skill.definition.skill_id == CAPTURE_SKILL_ID:
+                    if item.skill.definition.skill_version == '3':
+                        from agent_gateway.profiles.surface_anchor_v3 import build_surface_anchor_executor_v3
+                        extra = build_surface_anchor_executor_v3(registration=item, provider=back_projection_provider, segmentation_registration=contract_bundle.segmentation_geometry, rgb_registration=contract_bundle.rgbd_capture, lookup_operation=lookup_retained_operation, **shared)
+                    else:
+                        extra = build_surface_anchor_capture_executor(registration=item, provider=back_projection_provider, segmentation_provider=segmentation_provider, **shared)
+                elif item.skill.definition.skill_id == GOAL_SKILL_ID:
+                    extra = build_anchored_goal_executor(registration=item, capture_registration=capture_registration, lookup_operation=lookup_retained_operation, **{'accepted_capture_registrations': (captures['3'],)} if '3' in captures and item.skill.definition.skill_version == '2' else {}, **shared)
+                else:
+                    extra = build_anchored_query_executor(registration=item, capture_registration=capture_registration, query_port=query_port, lookup_operation=lookup_retained_operation, **{'accepted_capture_registrations': (captures['3'],)} if '3' in captures and item.skill.definition.skill_version == '2' else {}, **shared)
+                surface_anchor_executors += (extra,)
+            for item, executor in zip(contract_bundle.surface_anchor_registrations, surface_anchor_executors, strict=True):
+                execution_port_by_route_hash[item.entry.route.semantic_content_hash] = executor
     observed_planning_provider = None
     if safe_motion_observation is not None:
         if back_projection_capture_port is None or safe_contract is None:
@@ -2097,6 +2158,8 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
         tcp_pose_comparison_executor=tcp_pose_comparison_executor,
         object_state_executor=object_state_executor,
         spatial_goal_executor=spatial_goal_executor,
+        object_goal_query_executor=object_goal_query_executor,
+        surface_anchor_executors=surface_anchor_executors,
         depth_executor=depth_executor,
         rgb_executor=rgb_executor,
         rgbd_capture_executor=rgbd_capture_executor,

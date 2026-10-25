@@ -23,6 +23,42 @@ RESULT_KEYS = {
 }
 
 
+def finite_vector(value, size, *, name):
+    """Validate public numeric arrays without importing a geometry backend."""
+    if (not isinstance(value, (tuple, list)) or len(value) != size
+            or any(isinstance(x, bool) or not isinstance(x, (int, float))
+                   or not math.isfinite(x) for x in value)):
+        raise ValueError(f"{name} must contain {size} finite numbers.")
+    return tuple(float(x) for x in value)
+
+
+def validate_spatial_goal_geometry(*, offset_frame, orientation_mode, tool_axis, axis_reference_xyz):
+    """Validate relation choices; profiles own endpoint construction and FK."""
+    if offset_frame not in ("reference", "tool"):
+        raise ValueError("offset_frame must be reference or tool.")
+    if orientation_mode not in ("preserve", "align_axis"):
+        raise ValueError("orientation_mode must be preserve or align_axis.")
+    if orientation_mode == "preserve":
+        if tool_axis is not None or axis_reference_xyz is not None:
+            raise ValueError("Preserve mode cannot contain an axis constraint.")
+    else:
+        if tool_axis not in ("x", "y", "z"):
+            raise ValueError("align_axis requires tool_axis x, y, or z.")
+        direction = finite_vector(axis_reference_xyz, 3, name="axis_reference_xyz")
+        norm = math.hypot(*direction)
+        if not math.isfinite(norm) or norm < 1e-12:
+            raise ValueError("Axis constraint must have a nonzero finite length.")
+
+
+def spatial_goal_geometry_properties():
+    """Share endpoint relation parameters without introducing another Skill."""
+    vector = {"type": "array", "minItems": 3, "maxItems": 3, "items": {"type": "number"}}
+    return {"offset_xyz_m": vector, "offset_frame": {"enum": ["reference", "tool"]},
+        "orientation_mode": {"enum": ["preserve", "align_axis"]},
+        "tool_axis": {"enum": [None, "x", "y", "z"]},
+        "axis_reference_xyz": {"anyOf": [vector, {"type": "null"}]}}
+
+
 def spatial_goal_definition() -> SkillDefinition:
     return SkillDefinition(
         skill_id=SKILL_ID, skill_version="1", skill_kind="inspection",

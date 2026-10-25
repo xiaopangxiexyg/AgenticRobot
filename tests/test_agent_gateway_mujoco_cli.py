@@ -466,3 +466,96 @@ def test_cli_rejects_overlong_socket_before_simulator_assembly(
     assert "uses 109 encoded bytes" in error
     assert "will not relocate it automatically" in error
     assert "Traceback" not in error
+
+
+def test_safe_motion_profile_is_explicit_and_rejected_before_startup(capsys):
+    default = build_parser().get_default("safe_tcp_motion_profile")
+    assert default == "local_step"
+    with pytest.raises(SystemExit) as error:
+        gateway_cli.main(["--socket-path", "/not-used/gateway.sock", "--task-config", "/not-used/task.json",
+                          "--client-id", "test", "--client-uid", str(os.getuid()),
+                          "--safe-tcp-motion-profile", "object_relation"])
+    assert error.value.code == 2
+    assert "--safe-tcp-motion-profile requires --enable-safe-tcp-pose" in capsys.readouterr().err
+
+
+def test_object_query_is_default_off_and_requires_safe_geometry(capsys):
+    assert build_parser().get_default("enable_object_goal_queries") is False
+    with pytest.raises(SystemExit) as error:
+        gateway_cli.main(["--socket-path", "/not-used/gateway.sock", "--task-config", "/not-used/task.json",
+                          "--client-id", "test", "--client-uid", str(os.getuid()), "--enable-object-goal-queries"])
+    assert error.value.code == 2
+    assert "requires --enable-safe-tcp-pose" in capsys.readouterr().err
+
+
+def test_surface_anchor_v2_is_opt_in_and_rejected_before_resource_startup(capsys):
+    assert build_parser().get_default("enable_surface_anchor_v2") is False
+    with pytest.raises(SystemExit) as error:
+        gateway_cli.main(["--socket-path", "/not-used/gateway.sock", "--task-config", "/not-used/task.json",
+                          "--client-id", "test", "--client-uid", str(os.getuid()), "--enable-surface-anchor-v2"])
+    assert error.value.code == 2
+    assert "--enable-surface-anchor-v2 requires" in capsys.readouterr().err
+
+
+def test_surface_selection_profile_is_default_preserving_and_requires_v2_before_startup(capsys):
+    assert build_parser().get_default("surface_anchor_selection_policy") == "prompt_nearest"
+    with pytest.raises(SystemExit) as error:
+        gateway_cli.main(["--socket-path", "/not-used/gateway.sock", "--task-config", "/not-used/task.json",
+                          "--client-id", "test", "--client-uid", str(os.getuid()),
+                          "--surface-anchor-selection-policy", "max_clearance_medoid"])
+    assert error.value.code == 2
+    assert "requires --enable-surface-anchor-v2" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("policy", ["max_clearance_medoid", "unknown", True, None, []])
+def test_surface_selection_policy_is_checked_at_both_direct_assembly_boundaries(policy):
+    from agent_gateway.profiles.mujoco.motion_deployment import (
+        build_mujoco_agent_tcp_pose_contract_bundle,
+    )
+    from agent_gateway.profiles.mujoco.motion_factory import (
+        build_mujoco_agent_tcp_pose_gateway_session,
+    )
+
+    with pytest.raises(ValueError, match="selection policy"):
+        build_mujoco_agent_tcp_pose_contract_bundle(application=None,
+            surface_anchor_selection_policy=policy)
+    with pytest.raises(ValueError, match="selection policy"):
+        build_mujoco_agent_tcp_pose_gateway_session(target_config=None,
+            allowed_client_ids=("test",), surface_anchor_selection_policy=policy)
+
+
+def test_relation_query_is_default_off_and_requires_authenticated_surface_anchors(capsys):
+    assert build_parser().get_default("enable_relation_goal_queries") is False
+    with pytest.raises(SystemExit) as error:
+        gateway_cli.main(["--socket-path", "/not-used/gateway.sock", "--task-config", "/not-used/task.json",
+                          "--client-id", "test", "--client-uid", str(os.getuid()),
+                          "--enable-relation-goal-queries"])
+    assert error.value.code == 2
+    assert "--enable-relation-goal-queries requires --enable-surface-anchors" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("enabled", [True, "yes", 1])
+def test_relation_query_factory_rejects_invalid_dependency_before_resources(enabled):
+    from agent_gateway.profiles.mujoco.motion_factory import (
+        build_mujoco_agent_tcp_pose_gateway_session,
+    )
+
+    with pytest.raises(ValueError, match="Relation goal queries require"):
+        build_mujoco_agent_tcp_pose_gateway_session(target_config=None,
+            allowed_client_ids=("test",), enable_relation_goal_queries=enabled)
+
+
+@pytest.mark.parametrize("paired_flags,retention,message", [
+    ([], 3, "requires v2 anchors, RGB-D v3 and segmentation v3"),
+    (["--enable-rgbd-capture-v3", "--enable-segmentation-geometry-v3"], 2,
+     "requires capture, segmentation and anchor retention"),
+])
+def test_surface_anchor_v3_dependencies_fail_before_resource_startup(paired_flags, retention, message, capsys):
+    with pytest.raises(SystemExit) as error:
+        gateway_cli.main(["--socket-path", "/not-used/gateway.sock", "--task-config", "/not-used/task.json",
+            "--enable-safe-tcp-pose", "--enable-object-goal-queries", "--enable-surface-anchors",
+            "--enable-surface-anchor-v2", "--enable-surface-anchor-v3",
+            "--artifact-root", "/not-used/artifacts", "--segmentation-asset-bundle", "/not-used/model",
+            "--max-retained-operations", str(retention), *paired_flags])
+    assert error.value.code == 2
+    assert message in capsys.readouterr().err

@@ -1196,6 +1196,7 @@ class MujocoAgentSafeTcpPoseSkillLifecycle(MujocoAgentTcpPoseSkillLifecycle):
             contact_binding=self._contact_binding,
             **({"payload_binding": payload_binding} if payload_binding is not None else {}),
             **({"observed_planning_input": observed} if observed is not None else {}),
+            **({"normalize_ik_objective": True} if self.motion_profile.normalize_ik_objective else {}),
         )
 
     def _activate_plan(self, plan):

@@ -34,6 +34,7 @@ from agent_gateway.transport.unix_transport import (
 from project_paths import repo_root
 from sim.mujoco.deploy import MujocoSimHILTargetConfig
 
+from .motion_deployment import MUJOCO_SAFE_TCP_MOTION_PROFILES
 from .motion_factory import (
     MujocoAgentArtifactStorageConfig,
     MujocoAgentTcpPoseHistoryStorageConfig,
@@ -181,6 +182,13 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="run MuJoCo stepping without realtime pacing (simulation only)",
     )
+    parser.add_argument('--enable-object-goal-queries', action='store_true', help='Expose bounded read-only object-above path queries; requires --enable-safe-tcp-pose.')
+    parser.add_argument('--enable-surface-anchors', action='store_true', help='Expose measured-pixel anchor Artifacts and reuse queries; requires Artifact perception and object goal queries.')
+    parser.add_argument('--enable-surface-anchor-v2', action='store_true', help='Also publish explicit exact/mask-interior v2 anchors and matching consumers; requires surface anchors and segmentation.')
+    parser.add_argument('--enable-surface-anchor-v3', action='store_true', help='Publish source-bound anchors consuming retained capture_rgb v3 and optional segment v3; requires the explicit v2 family.')
+    parser.add_argument('--surface-anchor-selection-policy', choices=('prompt_nearest', 'max_clearance_medoid'), default='prompt_nearest', help='Explicit v2 max-clearance tie profile; default preserves prompt-nearest selection.')
+    parser.add_argument('--enable-relation-goal-queries', action='store_true', help='Expose one general anchored relation-path query; requires --enable-surface-anchors.')
+    parser.add_argument('--safe-tcp-motion-profile', choices=tuple(MUJOCO_SAFE_TCP_MOTION_PROFILES), default='local_step', help='Explicit sim-only safe Route limits; ordinary Routes stay unchanged.')
     parser.add_argument(
         "--enable-spatial-goals",
         action="store_true",
@@ -494,6 +502,11 @@ def main(argv: list[str] | None = None) -> int:
         or args.enable_segmentation_batch_v2
         or args.enable_segmentation_geometry_v3
         or args.enable_spatial_goals
+        or args.enable_object_goal_queries
+        or args.enable_surface_anchors
+        or args.enable_surface_anchor_v2
+        or args.enable_surface_anchor_v3
+        or args.enable_relation_goal_queries
         or args.history_root is not None
         or args.segmentation_asset_bundle is not None
     ):
@@ -506,6 +519,25 @@ def main(argv: list[str] | None = None) -> int:
             parser.error("--" + name.replace("_", "-") + " requires --artifact-root and --segmentation-asset-bundle")
     if args.enable_segmentation_geometry_v3 and args.max_retained_operations < 2:
         parser.error("--enable-segmentation-geometry-v3 requires retained producer and consumer operations")
+    if args.enable_object_goal_queries and not args.enable_safe_tcp_pose:
+        parser.error("--enable-object-goal-queries requires --enable-safe-tcp-pose")
+    if args.enable_surface_anchors and (args.artifact_root is None or not args.enable_object_goal_queries):
+        parser.error("--enable-surface-anchors requires --artifact-root and --enable-object-goal-queries")
+    if args.enable_surface_anchors and args.max_retained_operations < 2:
+        parser.error("surface anchors require retained producer and consumer operations")
+    if args.enable_surface_anchor_v2 and (not args.enable_surface_anchors or args.segmentation_asset_bundle is None):
+        parser.error("--enable-surface-anchor-v2 requires surface anchors and segmentation")
+    if args.surface_anchor_selection_policy != "prompt_nearest" and not args.enable_surface_anchor_v2:
+        parser.error("a non-default surface selection policy requires --enable-surface-anchor-v2")
+    if args.enable_surface_anchor_v3 and not (args.enable_surface_anchor_v2
+            and args.enable_rgbd_capture_v3 and args.enable_segmentation_geometry_v3):
+        parser.error("--enable-surface-anchor-v3 requires v2 anchors, RGB-D v3 and segmentation v3")
+    if args.enable_surface_anchor_v3 and args.max_retained_operations < 3:
+        parser.error("surface anchor v3 requires capture, segmentation and anchor retention")
+    if args.enable_relation_goal_queries and not args.enable_surface_anchors:
+        parser.error("--enable-relation-goal-queries requires --enable-surface-anchors")
+    if args.safe_tcp_motion_profile != "local_step" and not args.enable_safe_tcp_pose:
+        parser.error("--safe-tcp-motion-profile requires --enable-safe-tcp-pose")
     task_config = _absolute_existing_file(parser, args.task_config)
     socket_path = _absolute_path(parser, args.socket_path, flag="--socket-path")
     if args.client_uid < 0:
@@ -617,6 +649,13 @@ def main(argv: list[str] | None = None) -> int:
         segmentation_localizer=segmentation_localizer,
         enable_safe_tcp_pose=args.enable_safe_tcp_pose,
         enable_spatial_goals=args.enable_spatial_goals,
+        enable_object_goal_queries=args.enable_object_goal_queries,
+        enable_surface_anchors=args.enable_surface_anchors,
+        enable_surface_anchor_v2=args.enable_surface_anchor_v2,
+        enable_surface_anchor_v3=args.enable_surface_anchor_v3,
+        surface_anchor_selection_policy=args.surface_anchor_selection_policy,
+        enable_relation_goal_queries=args.enable_relation_goal_queries,
+        safe_tcp_motion_profile=args.safe_tcp_motion_profile,
         enable_tcp_pose_comparison=args.enable_tcp_pose_comparison,
         enable_object_state=args.enable_object_state,
         enable_object_follow_observation=args.enable_object_follow_observation,

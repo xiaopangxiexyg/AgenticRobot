@@ -196,6 +196,36 @@ MUJOCO_AGENT_TCP_POSE_MAX_TRANSLATION_DELTA_M_V1 = 0.10
 MUJOCO_AGENT_TCP_POSE_MAX_ROTATION_DELTA_RAD_V1 = math.radians(15.0)
 
 
+@dataclass(frozen=True)
+class MujocoSafeTcpMotionLimits:
+    max_translation_delta_m: float
+    max_rotation_delta_rad: float
+    max_control_cycles: int
+    max_operation_duration_ms: int
+    translation_tolerance_m: float = 0.01
+    rotation_tolerance_rad: float = math.radians(5.0)
+    normalize_ik_objective: bool = False
+
+
+MUJOCO_SAFE_TCP_MOTION_PROFILES = {
+    "local_step": MujocoSafeTcpMotionLimits(
+        MUJOCO_AGENT_TCP_POSE_MAX_TRANSLATION_DELTA_M_V1,
+        MUJOCO_AGENT_TCP_POSE_MAX_ROTATION_DELTA_RAD_V1, 300, 30_000),
+    "object_relation": MujocoSafeTcpMotionLimits(0.50, math.pi, 900, 90_000),
+    "object_relation_precise": MujocoSafeTcpMotionLimits(
+        0.50, math.pi, 900, 90_000, 0.003, math.radians(1.0), True),
+}
+
+
+def resolve_safe_tcp_motion_limits(name: str, *, enabled: bool) -> MujocoSafeTcpMotionLimits:
+    """Select an explicit sim-only deployment; never widen ordinary Routes."""
+    if not isinstance(name, str) or name not in MUJOCO_SAFE_TCP_MOTION_PROFILES:
+        raise ValueError("Unknown MuJoCo safe TCP motion profile.")
+    if not enabled and name != "local_step":
+        raise ValueError("A non-default safe TCP profile requires enable_safe_tcp_pose.")
+    return MUJOCO_SAFE_TCP_MOTION_PROFILES[name]
+
+
 def _required(value: object, *, field_name: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{field_name} must be a non-empty string.")
@@ -249,7 +279,11 @@ class MujocoAgentTcpPoseMotionProfile:
     physics_ticks_per_control_cycle: int = 1
     contact_policy_hash: str | None = None
 
+    normalize_ik_objective: bool = False
+
     def __post_init__(self) -> None:
+        if not isinstance(self.normalize_ik_objective, bool):
+            raise TypeError("normalize_ik_objective must be a bool.")
         if self.contact_policy_hash is not None:
             _required(self.contact_policy_hash, field_name="contact_policy_hash")
         for field_name in (
@@ -353,6 +387,8 @@ class MujocoAgentTcpPoseMotionProfile:
                     self.physics_ticks_per_control_cycle
                 ),
                 "requested_duration_semantics": "not_supported",
+                **({"ik_objective_mode": "calibrated_tcp_tolerance_normalized"}
+                   if self.normalize_ik_objective else {}),
                 **({"contact_policy_hash": self.contact_policy_hash}
                    if self.contact_policy_hash is not None else {}),
             },
@@ -762,7 +798,19 @@ class MujocoAgentTcpPoseContractBundle:
     segmentation_batch: SegmentationRegistration | None = None
     segmentation_geometry: SegmentationRegistration | None = None
 
+    object_goal_query_registration: SpatialGoalRegistration | None = None
+    surface_anchor_registrations: tuple[SpatialGoalRegistration, ...] = ()
+
     def __post_init__(self) -> None:
+        if (self.object_goal_query_registration is not None
+                and self.route_manifest.route("perception.query_object_above_paths", "1") != self.object_goal_query_registration.entry):
+            raise ValueError("Object goal query registration differs from its manifest entry.")
+
+        for registration in self.surface_anchor_registrations:
+            if self.route_manifest.route(registration.skill.definition.skill_id,
+                    registration.skill.definition.skill_version) != registration.entry:
+                raise ValueError("Surface anchor registration differs from its manifest entry.")
+
         validate_skill_route_catalog_closure(
             definition_catalog=self.definition_catalog,
             schema_catalog=self.schema_catalog,
@@ -1920,6 +1968,13 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
     safe_motion_observation_profile_hash: str | None = None,
     enable_observed_point_motion: bool = False,
     enable_spatial_goals: bool = False,
+    enable_object_goal_queries: bool = False,
+    enable_surface_anchors: bool = False,
+    enable_surface_anchor_v2: bool = False,
+    enable_surface_anchor_v3: bool = False,
+    surface_anchor_selection_policy: str = "prompt_nearest",
+    enable_relation_goal_queries: bool = False,
+    safe_tcp_motion_profile: str = "local_step",
     enable_tcp_pose_comparison: bool = False,
     enable_object_state: bool = False,
     enable_object_follow_observation: bool = False,
@@ -1991,12 +2046,41 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
     if enable_object_motion and (not enable_object_follow_observation or not enable_grasp_approach
                                  or grasp_contact_binding is None):
         raise ValueError("Object motion requires explicit follow observation, grasp approach and contact target.")
+    from agent_gateway.skills.perception.surface_anchor_v2 import INTERIOR_SELECTION_POLICIES
+    if type(enable_surface_anchor_v3) is not bool or (enable_surface_anchor_v3 and not (
+            enable_surface_anchor_v2 and enable_rgbd_capture_v3 and enable_segmentation_geometry_v3)):
+        raise ValueError("Surface anchor v3 requires explicit RGB-D, segmentation v3 and compatible v2 consumers.")
+
+    if not isinstance(enable_object_goal_queries, bool) or (enable_object_goal_queries and not enable_safe_tcp_pose):
+        raise ValueError("Object goal queries require explicitly enabled safe TCP geometry.")
+
+    if not isinstance(enable_surface_anchors, bool) or (enable_surface_anchors and not (enable_artifact_perception and enable_object_goal_queries)):
+        raise ValueError("Surface anchors require Artifact perception and object goal queries.")
+
+    if not isinstance(enable_relation_goal_queries, bool) or (enable_relation_goal_queries and not enable_surface_anchors):
+        raise ValueError("Relation goal queries require explicitly enabled surface anchors.")
+
+    if not isinstance(enable_surface_anchor_v2, bool) or (enable_surface_anchor_v2
+            and not (enable_surface_anchors and segmentation_model_profile_id is not None)):
+        raise ValueError("Surface anchor v2 requires surface anchors and a segmentation model.")
+
+    if (not isinstance(surface_anchor_selection_policy, str)
+            or surface_anchor_selection_policy not in INTERIOR_SELECTION_POLICIES
+            or surface_anchor_selection_policy != "prompt_nearest" and not enable_surface_anchor_v2):
+        raise ValueError("A non-default surface selection policy requires explicitly enabled v2 anchors.")
+
+    safe_limits = resolve_safe_tcp_motion_limits(safe_tcp_motion_profile, enabled=enable_safe_tcp_pose)
     exact = _exact_application(application)
     component = _application_component_id(application)
     side = component.removesuffix("_arm")
     if side == "left" and (
         history_profile is not None
         or enable_spatial_goals
+        or enable_object_goal_queries
+        or enable_surface_anchors
+        or enable_surface_anchor_v2
+        or enable_surface_anchor_v3
+        or enable_relation_goal_queries
         or enable_grasp_approach
         or grasp_contact_binding is not None
         or any(item is not None for item in segmentation_identity)
@@ -2663,27 +2747,36 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
     planned_motions = []
     safe_contract = grasp_contract = contact_contract = object_contract = observed_point_contract = None
     if enable_safe_tcp_pose:
+        local_safe_profile = replace(profile,
+            profile_id=("mujoco.agent_safe_tcp_pose.v1" if safe_motion_observation_profile_hash is None
+                else "mujoco.agent_safe_tcp_pose.rgbd." + safe_motion_observation_profile_hash),
+            max_control_cycles=300)
+        safe_profile = replace(local_safe_profile,
+            profile_id=(local_safe_profile.profile_id
+                if safe_tcp_motion_profile == "local_step" or safe_motion_observation_profile_hash is not None
+                else f"mujoco.agent_safe_tcp_pose.{safe_tcp_motion_profile}.v1"),
+            max_translation_delta_m=safe_limits.max_translation_delta_m,
+            max_rotation_delta_rad=safe_limits.max_rotation_delta_rad,
+            max_control_cycles=safe_limits.max_control_cycles,
+            translation_tolerance_m=safe_limits.translation_tolerance_m,
+            rotation_tolerance_rad=safe_limits.rotation_tolerance_rad,
+            normalize_ik_objective=safe_limits.normalize_ik_objective)
         item = planned_motion_contract(
             safe_tcp_pose_target_skill_definition_v1(
                 controlled_component_ids=(component,)
             ),
-            replace(
-                profile,
-                profile_id=("mujoco.agent_safe_tcp_pose.v1" if safe_motion_observation_profile_hash is None
-                    else "mujoco.agent_safe_tcp_pose.rgbd." + safe_motion_observation_profile_hash),
-                max_control_cycles=300,
-            ),
+            safe_profile,
             route_id=MUJOCO_AGENT_SAFE_TCP_POSE_ROUTE_ID_V1,
             executor_id=MUJOCO_AGENT_SAFE_TCP_POSE_EXECUTOR_ID_V1,
             binding_prefix="sim.mujoco.agent_safe_tcp_pose:",
-            duration_ms=30_000,
+            duration_ms=safe_limits.max_operation_duration_ms,
         )
         safe_contract = item[3]
         planned_motions.append(item)
     if enable_observed_point_motion:
         item = planned_motion_contract(
             observed_point_definition(controlled_component_ids=(component,)),
-            safe_contract.motion_profile,
+            local_safe_profile,
             route_id=MUJOCO_OBSERVED_POINT_ROUTE_ID,
             executor_id="mujoco-observed-point-safe-v1",
             binding_prefix="sim.mujoco.agent_observed_point:", duration_ms=30_000)
@@ -3243,6 +3336,59 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
             component_ids=state_definition.controlled_component_ids,
             reference_frame_id=profile.reference_frame_id,
         )
+
+    object_goal_query_registration = None
+    if enable_object_goal_queries:
+        from .object_goal_query import build_object_goal_query_registration
+
+        object_goal_query_registration = build_object_goal_query_registration(
+            base_route=state_route, base_binding=state_binding,
+            reference_frame_id=profile.reference_frame_id,
+            planning_profile_hash=safe_contract.motion_profile.semantic_content_hash,
+        )
+
+    surface_anchor_registrations = ()
+    if enable_surface_anchors:
+        from agent_gateway.profiles.surface_anchor import (
+            build_surface_anchor_registrations,
+        )
+
+        surface_anchor_registrations = build_surface_anchor_registrations(
+            back_projection=depth_capture.back_projection,
+            object_query=object_goal_query_registration,
+            spatial_goal=spatial_goal_registration,
+            enable_relation_queries=enable_relation_goal_queries,
+        )
+        if enable_surface_anchor_v2:
+            surface_anchor_registrations += build_surface_anchor_registrations(
+                back_projection=depth_capture.back_projection,
+                object_query=object_goal_query_registration,
+                spatial_goal=spatial_goal_registration,
+                enable_relation_queries=enable_relation_goal_queries,
+                version="2", segmentation=segmentation,
+                selection_policy=surface_anchor_selection_policy,
+            )
+        if enable_surface_anchor_v3:
+            from agent_gateway.profiles.surface_anchor import (
+                build_multi_source_anchor_consumer,
+            )
+            from agent_gateway.profiles.surface_anchor_v3 import (
+                build_surface_anchor_registration_v3,
+            )
+
+            paired_anchor = build_surface_anchor_registration_v3(
+                back_projection=depth_capture.back_projection, segmentation=segmentation_geometry,
+                capture_rgb=rgbd_capture, selection_policy=surface_anchor_selection_policy)
+            original_anchor = next(item for item in surface_anchor_registrations
+                if item.skill.definition.skill_id == "perception.capture_surface_anchor"
+                and item.skill.definition.skill_version == "2")
+            surface_anchor_registrations = tuple(
+                build_multi_source_anchor_consumer(registration=item,
+                    capture_registrations=(original_anchor, paired_anchor))
+                if item.skill.definition.skill_version == "2"
+                and item.skill.definition.skill_id != "perception.capture_surface_anchor" else item
+                for item in surface_anchor_registrations) + (paired_anchor,)
+
     # Use exactly the original passive state identity and freshness validator.
     public_state_exact = {
         **exact,
@@ -3316,6 +3462,12 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
     if spatial_goal_registration is not None:
         definition_items.append(spatial_goal_registration.skill.definition)
         schema_items.append(spatial_goal_registration.skill.schema_entry)
+    if object_goal_query_registration is not None:
+        definition_items.append(object_goal_query_registration.skill.definition)
+        schema_items.append(object_goal_query_registration.skill.schema_entry)
+    for registration in surface_anchor_registrations:
+        definition_items.append(registration.skill.definition)
+        schema_items.append(registration.skill.schema_entry)
     if tcp_pose_comparison_registration is not None:
         definition_items.append(tcp_pose_comparison_registration.skill.definition)
         schema_items.append(tcp_pose_comparison_registration.skill.schema_entry)
@@ -3558,6 +3710,9 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
         )
     if spatial_goal_registration is not None:
         route_items.append(spatial_goal_registration.entry)
+    if object_goal_query_registration is not None:
+        route_items.append(object_goal_query_registration.entry)
+    route_items.extend(registration.entry for registration in surface_anchor_registrations)
     io_contract_by_skill = {}
     for item in route_items:
         route_item = item.route
@@ -3597,6 +3752,10 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
                 explicit_contracts += (batch.skill.io_contract,)
         if rgbd_capture is not None and key == ("perception.capture_rgb", "3"):
             explicit_contracts += (rgbd_capture.skill.io_contract,)
+        explicit_contracts += tuple(registration.skill.io_contract
+            for registration in (object_goal_query_registration, *surface_anchor_registrations)
+            if registration is not None and key == (
+                registration.skill.definition.skill_id, registration.skill.definition.skill_version))
         contract = (
             explicit_contracts[0]
             if explicit_contracts
@@ -3716,6 +3875,9 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
         validator_items.append(rgbd_capture.payload_validator)
     if spatial_goal_registration is not None:
         validator_items.append(spatial_goal_registration.payload_validator)
+    if object_goal_query_registration is not None:
+        validator_items.append(object_goal_query_registration.payload_validator)
+    validator_items.extend(registration.payload_validator for registration in surface_anchor_registrations)
     if tcp_pose_comparison_registration is not None:
         validator_items.append(tcp_pose_comparison_registration.payload_validator)
     if object_state_registration is not None:
@@ -3765,6 +3927,8 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
         safe_tcp_pose_contract=safe_contract,
         observed_point_contract=observed_point_contract,
         spatial_goal_registration=spatial_goal_registration,
+        object_goal_query_registration=object_goal_query_registration,
+        surface_anchor_registrations=surface_anchor_registrations,
         tcp_pose_comparison_registration=tcp_pose_comparison_registration,
         object_state_registration=object_state_registration,
         grasp_approach_contract=grasp_contract,

@@ -1245,7 +1245,8 @@ class MujocoPlannedTcpMotion:
                                     raise
                                 break
                             if error.reason_code not in {
-                                "safe_tcp_endpoint_search_exhausted", "safe_tcp_target_blocked",
+                            "safe_tcp_endpoint_search_exhausted", "safe_tcp_target_blocked",
+                            "safe_tcp_target_envelope_blocked",
                                 "safe_tcp_path_search_exhausted", "safe_tcp_retimed_path_blocked",
                                 "safe_tcp_candidate_rank_pruned",
                                 "safe_tcp_motion_quality_exceeded",

@@ -200,6 +200,8 @@ def _assert_unsettled_passive_read_defers_owned_dependency_cleanup(state_reader)
         rgb_executor=None, segmentation_batch_executor=None, segmentation_geometry_executor=None,
         history_executor=None,
         spatial_goal_executor=None, rgbd_capture_executor=None,
+        object_goal_query_executor=None, surface_anchor_executors=(),
+        contract_bundle=SimpleNamespace(surface_anchor_registrations=()),
         segmentation_executor=None,
         placement_executor=placement_executor,
         grasp_observation_executor=None,
@@ -2762,6 +2764,8 @@ def _gateway_close_retry_session(outcomes, *, started=True):
         state_executor=None, tcp_pose_comparison_executor=None, depth_executor=None,
         rgb_executor=None, back_projection_executor=None, history_executor=None,
         spatial_goal_executor=None, segmentation_executor=None, placement_executor=None,
+        object_goal_query_executor=None, surface_anchor_executors=(),
+        contract_bundle=SimpleNamespace(surface_anchor_registrations=()),
         _segmentation_model_started=False,
         segmentation_localizer=SimpleNamespace(
             start=lambda: calls["model_start"].append("started"),
@@ -2961,3 +2965,34 @@ def test_session_unstarted_lower_can_close_without_claiming_hold_success() -> No
     assert len(calls["service"]) == 2
     assert calls["executor"] == []
     assert calls["lower"] == ["closed"]
+
+
+@pytest.mark.parametrize("kind", ["query", "anchor"])
+def test_unsettled_frozen_query_or_anchor_defers_shared_cleanup(kind):
+    _, accepted = _gateway_close_outcomes()
+    session, calls = _gateway_close_retry_session([accepted])
+    settled = [False]
+    waits = []
+
+    def wait_all(*, timeout_sec):
+        waits.append(timeout_sec)
+        return settled[0]
+
+    reader = SimpleNamespace(wait_all=wait_all)
+    registration = SimpleNamespace(skill=SimpleNamespace(
+        routes=(SimpleNamespace(max_operation_duration_ms=30_000),)))
+    session.contract_bundle = SimpleNamespace(
+        object_goal_query_registration=registration if kind == "query" else None,
+        surface_anchor_registrations=(registration,) if kind == "anchor" else ())
+    session.object_goal_query_executor = reader if kind == "query" else None
+    session.surface_anchor_executors = (reader,) if kind == "anchor" else ()
+    session._segmentation_model_started = True
+    with pytest.raises(RuntimeError, match="object_goal_query|surface_anchor"):
+        session.close()
+    assert waits and calls["lower"] == []
+    assert calls["artifact_store"] == calls["model_close"] == []
+    assert len(calls["service"]) == 1
+    settled[0] = True
+    assert session.close() is accepted
+    assert len(calls["service"]) == 1
+    assert calls["lower"] == calls["artifact_store"] == calls["model_close"] == ["closed"]

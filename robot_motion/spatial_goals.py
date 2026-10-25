@@ -7,8 +7,8 @@ Tool-relative offsets use the input TCP orientation, before axis alignment.
 from __future__ import annotations
 
 import math
+from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Sequence
 
 import numpy as np
 from scipy.spatial.transform import Rotation
@@ -30,6 +30,24 @@ class SpatialGoal:
     translation_distance_m: float
     rotation_distance_rad: float
     axis_alignment_error_rad: float | None
+
+
+@dataclass(frozen=True)
+class ObjectAboveGoalCandidate:
+    """One explicit height/yaw sample, with no feasibility or motion claim."""
+
+    height_m: float
+    tool_yaw_rad: float
+    goal: SpatialGoal
+
+
+@dataclass(frozen=True)
+class RelationGoalCandidate:
+    """One endpoint sample, not a transit-orientation or motion certificate."""
+
+    offset_xyz_m: tuple[float, ...]
+    tool_axis_rotation_rad: float
+    goal: SpatialGoal
 
 
 def compute_spatial_goal(
@@ -97,3 +115,91 @@ def compute_spatial_goal(
         float(Rotation.from_matrix(goal[:3, :3] @ current[:3, :3].T).magnitude()),
         axis_error,
     )
+
+
+def generate_object_above_goals(
+    *,
+    current_tcp_pose_xyz_quat_xyzw: Sequence[float],
+    anchor_xyz_m: Sequence[float],
+    heights_m: Sequence[float],
+    tool_yaw_offsets_rad: Sequence[float],
+) -> tuple[ObjectAboveGoalCandidate, ...]:
+    """Sample above an observed anchor with tool +Z pointing along reference -Z.
+
+    Heights are measured along reference +Z, not from an inferred object centre.
+    Yaw is about the aligned tool's own +Z axis. Periodic/duplicate samples are
+    removed in input order. At most 64 input combinations are accepted; callers
+    must explicitly choose the region and discretization. No IK is performed.
+    """
+    if (not isinstance(heights_m, (tuple, list)) or not heights_m
+            or not isinstance(tool_yaw_offsets_rad, (tuple, list)) or not tool_yaw_offsets_rad
+            or len(heights_m) * len(tool_yaw_offsets_rad) > 64):
+        raise ValueError("Above-goal sampling needs 1..64 explicit height/yaw combinations.")
+    heights = finite_vector(heights_m, len(heights_m), name="heights_m")
+    yaws = finite_vector(tool_yaw_offsets_rad, len(tool_yaw_offsets_rad), name="tool_yaw_offsets_rad")
+    if np.any(heights < 0):
+        raise ValueError("Above-goal heights must be non-negative.")
+    return tuple(ObjectAboveGoalCandidate(candidate.offset_xyz_m[2],
+        candidate.tool_axis_rotation_rad, candidate.goal)
+        for candidate in generate_relation_goals(
+            current_tcp_pose_xyz_quat_xyzw=current_tcp_pose_xyz_quat_xyzw,
+            anchor_xyz_m=anchor_xyz_m,
+            offsets_xyz_m=[[0., 0., float(height)] for height in heights],
+            offset_frame="reference", orientation_mode="align_axis", tool_axis="z",
+            axis_reference_xyz=[0., 0., -1.], tool_axis_rotation_offsets_rad=yaws.tolist()))
+
+
+def generate_relation_goals(
+    *, current_tcp_pose_xyz_quat_xyzw: Sequence[float], anchor_xyz_m: Sequence[float],
+    offsets_xyz_m: Sequence[Sequence[float]], offset_frame: str, orientation_mode: str,
+    tool_axis: str | None, axis_reference_xyz: Sequence[float] | None,
+    tool_axis_rotation_offsets_rad: Sequence[float],
+) -> tuple[RelationGoalCandidate, ...]:
+    """Sample explicit relation endpoints; offsets use the original input-tool axes.
+
+    Alignment permits rotations about the chosen aligned tool axis, not only Z.
+    Preserve mode accepts only zero/periodic-zero rotations. Input combinations
+    are bounded before deduplication; no IK, collision or transit check occurs.
+    """
+    if (not isinstance(offsets_xyz_m, (list, tuple)) or not offsets_xyz_m
+            or not isinstance(tool_axis_rotation_offsets_rad, (list, tuple))
+            or not tool_axis_rotation_offsets_rad
+            or len(offsets_xyz_m) * len(tool_axis_rotation_offsets_rad) > 64):
+        raise ValueError("Relation sampling needs 1..64 explicit offset/rotation combinations.")
+    offsets = [finite_vector(value, 3, name="offset_xyz_m") for value in offsets_xyz_m]
+    turns = finite_vector(tool_axis_rotation_offsets_rad, len(tool_axis_rotation_offsets_rad),
+                          name="tool_axis_rotation_offsets_rad")
+    wrapped_turns = [float((float(turn) + math.pi) % (2 * math.pi) - math.pi) for turn in turns]
+    if orientation_mode == "preserve" and any(abs(turn) > 1e-12 for turn in wrapped_turns):
+        raise ValueError("Preserve mode cannot contain a nonzero tool-axis rotation.")
+    current = xyzquat_to_pose_matrix(finite_vector(current_tcp_pose_xyz_quat_xyzw, 7, name="current TCP pose"))
+    candidates, seen = [], set()
+    for offset in offsets:
+        base = compute_spatial_goal(
+            current_tcp_pose_xyz_quat_xyzw=current_tcp_pose_xyz_quat_xyzw,
+            anchor_xyz_m=anchor_xyz_m, offset_xyz_m=offset.tolist(), offset_frame=offset_frame,
+            orientation_mode=orientation_mode, tool_axis=tool_axis, axis_reference_xyz=axis_reference_xyz)
+        for turn in wrapped_turns:
+            identity = (*offset, round(turn, 12))
+            if identity in seen:
+                continue
+            seen.add(identity)
+            if orientation_mode == "preserve":
+                goal = base
+            else:
+                index = ("x", "y", "z").index(tool_axis)
+                rotvec = np.zeros(3)
+                rotvec[index] = turn
+                pose = xyzquat_to_pose_matrix(base.pose_xyz_quat_xyzw)
+                pose[:3, :3] = pose[:3, :3] @ Rotation.from_rotvec(rotvec).as_matrix()
+                encoded = pose_matrix_to_xyzquat(pose).astype(float)
+                encoded[:3] = pose[:3, 3]
+                if np.dot(encoded[3:], current_tcp_pose_xyz_quat_xyzw[3:]) < 0:
+                    encoded[3:] *= -1
+                direction = np.asarray(axis_reference_xyz, dtype=float)
+                direction /= math.hypot(*direction)
+                goal = SpatialGoal(tuple(float(x) for x in encoded), base.translation_distance_m,
+                    float(Rotation.from_matrix(pose[:3, :3] @ current[:3, :3].T).magnitude()),
+                    float(math.acos(np.clip(pose[:3, index] @ direction, -1., 1.))))
+            candidates.append(RelationGoalCandidate(tuple(float(x) for x in offset), turn, goal))
+    return tuple(candidates)

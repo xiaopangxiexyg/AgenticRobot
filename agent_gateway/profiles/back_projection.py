@@ -665,17 +665,41 @@ class LiveBackProjectionProvider:
         self.registration = registration
 
     def project_request(self, request: Any) -> dict[str, Any]:
-        parameters = request.parameters
-        profile = self.registration.profile
+        result, _capture = self.project_parameters(
+            request.parameters,
+            expected_station_revision=request.expected_station_revision,
+        )
+        return result
+
+
+    def project_parameters(
+        self, parameters: Mapping[str, Any], *, expected_station_revision: int
+    ) -> tuple[dict[str, Any], LiveAlignedDepthCapture]:
+        """Return geometry and its exact capture without a second depth read."""
+
         role = str(parameters["role"])
         capture = self.capture_port.capture_aligned_depth(
             role=role,
-            expected_station_revision=request.expected_station_revision,
+            expected_station_revision=expected_station_revision,
         )
+        return self.project_capture(
+            capture, parameters, expected_station_revision=expected_station_revision
+        ), capture
+
+
+    def project_capture(
+        self, capture: LiveAlignedDepthCapture, parameters: Mapping[str, Any],
+        *, expected_station_revision: int,
+    ) -> dict[str, Any]:
+        """Project a previously captured cut without reading the source again."""
+
+        self.registration.payload_validator.validate_parameters(parameters)
+        profile = self.registration.profile
+        role = str(parameters["role"])
         if (
             capture.role != role
             or capture.source_id != profile.source_id_by_role[role]
-            or capture.station_revision != request.expected_station_revision
+            or capture.station_revision != expected_station_revision
             or capture.depth_m.shape[::-1] != profile.dimensions_by_role[role]
         ):
             raise RuntimeError("Back-projection capture changed its bound identity.")

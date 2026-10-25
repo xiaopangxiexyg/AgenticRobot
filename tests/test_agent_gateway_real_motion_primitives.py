@@ -101,7 +101,7 @@ def _bundle():
 
 @pytest.mark.parametrize("component", ["left_arm", "right_arm"])
 def test_spatial_goal_is_optional_and_binds_the_current_component(component):
-    from agent_gateway.profiles.spatial_goal import _calculate
+    from agent_gateway.profiles.spatial_goal import calculate_spatial_goal
 
     attachment, config, graph, envelope = _inputs()
     side = component.removesuffix("_arm")
@@ -128,7 +128,7 @@ def test_spatial_goal_is_optional_and_binds_the_current_component(component):
         "offset_frame": "reference", "orientation_mode": "align_axis",
         "tool_axis": "z", "axis_reference_xyz": [0., 0., -1.]}
     validator = registration.payload_validator
-    result = _calculate(parameters)
+    result = calculate_spatial_goal(parameters)
     validator.validate_parameters(parameters)
     validator.validate_execution_result(result)
     validator.validate_execution_result_for_parameters(parameters, result)
