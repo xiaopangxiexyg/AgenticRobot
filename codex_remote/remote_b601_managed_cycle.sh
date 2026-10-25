@@ -11,11 +11,11 @@ Usage:
   remote_b601_managed_cycle.sh -H HOST --project /repo --python /env/bin/python \
     --operation preflight|start --expected-revision FULL_SHA --config /config.yaml \
     --rebot-source-root /vendor/rebot --motorbridge-root /vendor/bridge --output-root /runs \
-    [--field-report /closed-source.json]
+    [--recipe near-zero|four-centres] [--field-report /closed-source.json]
   remote_b601_managed_cycle.sh -H HOST --project /repo --python /env/bin/python \
     --operation status|stop --run-directory /runs/managed-ID
 
-Purpose-built B601 near-zero single-cycle management. Start requires explicit
+Purpose-built B601 single-cycle management. Start requires explicit
 hardware authorization. Fixed existing owner/profile/limits; no arbitrary
 command, profile, torque override, reset, retry or kill. Stop requests protective
 hold only; it cannot request full disable. Status and preflight do not send motor
@@ -34,6 +34,10 @@ while [[ $# -gt 0 ]]; do
       shift 2;;
     --expected-revision|--config|--rebot-source-root|--motorbridge-root|--output-root|--field-report|--run-directory)
       [[ $# -ge 2 ]] || die "$1 requires a value"
+      ARGS+=("$1" "$2"); shift 2;;
+    --recipe)
+      [[ $# -ge 2 ]] || die "$1 requires a value"
+      case "$2" in near-zero|four-centres) ;; *) die 'invalid --recipe';; esac
       ARGS+=("$1" "$2"); shift 2;;
     --dry-run) PREVIEW=true; shift;;
     -h|--help) usage; exit 0;;

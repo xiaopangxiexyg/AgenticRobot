@@ -147,12 +147,14 @@ ssh dex-remote 'cd ~/DexTeleop && source ~/anaconda3/etc/profile.d/conda.sh && c
 module 和 pytest wrapper 只允许 L3 非控制执行；关键词检查只是误调用防线，不能证明
 任意代码没有设备副作用。设备或运动动作必须进入限制具体动作的专用 wrapper。
 
-### B601 单轮近零采集管理
+### B601 单轮采集管理
 
 `remote_b601_managed_cycle.sh` 是显式真机授权下的专用入口，复用现有
 `rebot_b601_rs_owner.py`，不接受任意脚本、运动 profile、力矩覆盖或命令尾参。
 `--operation preflight` 只运行原 owner 的无 CAN 参数／资源检查；`start` 固定执行
-近零 J2/J3 profile 一轮，并声明本次无人介入、原位有可靠托架。该声明不是传感器测量。
+所选固定 profile 一轮：`--recipe near-zero` 为默认近零 28 段，`--recipe four-centres`
+为既有 3°／6° 四中心 136 段；不接受任意 profile 路径。启动声明本次无人介入、原位有
+可靠托架。该声明不是传感器测量。
 保留原始 1 N·m 两轴组合包络、0.195 rad/s 原始速度保护、40 ms watchdog 和全部回位门。
 可选 `--field-report` 只启用原影子查询；本入口不启用前馈、不安装模型、不重置 CAN。
 

@@ -65,6 +65,40 @@ def test_continuous_plan_is_opt_in_multispeed_bidirectional_with_reserved_valida
         assert {s["max_reference_velocity_rad_s"] for s in plan["steps"]} == {.0075, .015}
 
 
+def test_four_centres_joint3_has_three_bidirectional_speeds_and_independent_holdouts(tmp_path):
+    from test_b601_cruise_velocity import FOUR_CENTRES, controller_from_profile
+
+    controller = controller_from_profile(tmp_path, profile=FOUR_CENTRES)
+    core = controller._workspace._coordinated
+    assert len(core.workspace.pose_centres()) == 4
+    assert core.workspace.coordinated_holding.arrival_displacement_gains_nm_per_rad == (20, 40)
+    for joint, expected, speeds in [('joint2', 14, {.0075, .015}), ('joint3', 20, {.0075, .01125, .015})]:
+        plan = core.workspace.sweep_plan(condition=condition(), joint_name=joint,
+            anchor_qpos_rad=(0,.06,.06,0,0,0), position_limits_rad=((-2,2),)*6, calibration=core.config)
+        assert len(plan['steps']) == expected
+        training, validation = set(), set()
+        for role, ids, repeats in [('training', training, 2), ('validation', validation, 1)]:
+            steps = [s for s in plan['steps'] if s['role'] == role]
+            for speed in speeds:
+                values = [s['target_qpos_rad'][int(joint[-1])-1] for s in steps if s['max_reference_velocity_rad_s'] == speed]
+                assert len(values) == repeats*2 and len(set(values)) == 2
+            ids.update(s['trial_id'] for s in steps)
+        assert not training & validation
+        assert max(s['max_reference_velocity_rad_s'] for s in plan['steps']) == .015
+    with pytest.raises(ValueError, match='existing sweep ceiling'):
+        workspace = replace(core.workspace, identification_joint3_speeds_rad_s=(.0075,.02))
+        type(core)(core.settings,core.config,workspace)
+
+
+@pytest.mark.parametrize('speeds', [True, [], [.0075], [.015,.0075], [.0075,.0075], [.0075,float('nan')], [.0075,True]])
+def test_bad_joint3_speed_lists_fail_before_controller_construction(speeds):
+    from test_b601_cruise_velocity import FOUR_CENTRES
+
+    workspace = WorkspaceCalibrationConfig(**load_automatic_profile(FOUR_CENTRES)['workspace'])
+    with pytest.raises(ValueError):
+        replace(workspace, identification_joint3_speeds_rad_s=speeds)
+
+
 def test_continuous_profile_resolves_through_the_real_launcher_before_backend_construction(tmp_path):
     args = owner._parser().parse_args([
         "--allow-motion", "--rate-hz", "100", "--preflight-only",

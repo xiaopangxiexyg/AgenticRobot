@@ -20,6 +20,8 @@ from .managed_cycle import assess_managed_result
 ROOT = Path(__file__).resolve().parents[2]
 OWNER = ROOT/'scripts/hardware/rebot_b601_rs_owner.py'
 PROFILE = ROOT/'docs/hardware/profiles/b601_j2_j3_near_zero_command_field_v1.json'
+PROFILES = {'near-zero': PROFILE,
+    'four-centres': ROOT/'docs/hardware/profiles/b601_j2_j3_four_centres_cruise_identification_v1.json'}
 OWNER_NAMES = {'rebot_b601_rs_owner.py', 'rebot_b601_rs_low_gain_probe.py'}
 urlopen = build_opener(ProxyHandler({})).open
 
@@ -29,7 +31,7 @@ def command_for(args, run):
         '--rebot-source-root', str(args.rebot_source_root), '--motorbridge-root', str(args.motorbridge_root),
         '--output-root', str(run/'owner'), '--mode', 'hold', '--duration-sec', '4000',
         '--rate-hz', '100', '--feedback-source', 'active-report', '--driver-kd', '0', '0', '0', '0', '0', '0',
-        '--torque-console-auto-calibration-profile', str(PROFILE), '--torque-console-managed-cycle',
+        '--torque-console-auto-calibration-profile', str(PROFILES[args.recipe]), '--torque-console-managed-cycle',
         '--torque-console-max-assist-nm', '1', '--torque-console-max-joint-velocity-rad-s', '.195',
         '--torque-console-max-excursion-rad', '.15', '--torque-console-max-support-drift-rad', '.05235987755982989',
         '--torque-console-staged-target-offset-limit-rad', '.09', '--torque-console-staged-breakaway-torque-nm', '1',
@@ -101,7 +103,8 @@ def prepare(args, run):
     check_idle()
     command = command_for(args, run)
     _write_new(run/'plan.json', {'revision': args.expected_revision, 'project': str(ROOT), 'operation': args.operation,
-        'command': command, 'profile_sha256': hashlib.sha256(PROFILE.read_bytes()).hexdigest(),
+        'command': command, 'recipe': args.recipe,
+        'profile_sha256': hashlib.sha256(PROFILES[args.recipe].read_bytes()).hexdigest(),
         'config_sha256': hashlib.sha256(args.config.read_bytes()).hexdigest(),
         'max_cycles': 1, 'automatic_retry': False})
     with (run/'preflight.log').open('x') as output:
@@ -199,6 +202,9 @@ def inspect(run):
                 'state': batch.get('state'), 'reason': batch.get('reason'),
                 'current_task': workspace.get('current_task'),
                 'continuous_identification': workspace.get('continuous_identification'),
+                'arrival': workspace.get('arrival'),
+                'motion_control': snapshot.get('motion_control'),
+                'cruise_velocity_control': (snapshot.get('coordinated_holding') or {}).get('cruise_velocity_control'),
                 'supported_return': workspace.get('supported_return'), 'qpos_rad': snapshot.get('qpos_rad')}
             phase = (live['managed_cycle'] or {}).get('phase')
             if phase == 'origin_confirmed':
@@ -259,6 +265,7 @@ def request_protective_hold(run):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--operation', choices=('preflight', 'start', 'status', 'stop'), default='preflight')
+    parser.add_argument('--recipe', choices=tuple(PROFILES), default='near-zero')
     parser.add_argument('--expected-revision')
     parser.add_argument('--config', type=Path)
     parser.add_argument('--rebot-source-root', type=Path)

@@ -19,14 +19,16 @@ def options(tmp_path, **changes):
     config = tmp_path/'config.yaml'
     config.write_text('channel: can0')
     values = {'config': config, 'rebot_source_root': tmp_path/'vendor', 'motorbridge_root': tmp_path/'bridge',
-        'field_report': None, 'expected_revision': 'a'*40, 'output_root': tmp_path/'runs', 'operation': 'preflight'}
+        'field_report': None, 'expected_revision': 'a'*40, 'output_root': tmp_path/'runs', 'operation': 'preflight',
+        'recipe': 'near-zero'}
     values.update(changes)
     return SimpleNamespace(**values)
 
 
 @pytest.mark.parametrize('operation', ['preflight', 'start'])
-def test_fixed_process_recipe_runs_preflight_before_any_detached_owner(tmp_path, monkeypatch, operation):
-    args = options(tmp_path, operation=operation)
+@pytest.mark.parametrize('recipe', ['near-zero', 'four-centres'])
+def test_fixed_process_recipe_runs_preflight_before_any_detached_owner(tmp_path, monkeypatch, operation, recipe):
+    args = options(tmp_path, operation=operation, recipe=recipe)
     calls = []
     monkeypatch.setattr(managed, 'check_revision', lambda sha: calls.append(('revision', sha)))
     monkeypatch.setattr(managed, 'check_idle', lambda: calls.append(('idle',)))
@@ -39,6 +41,7 @@ def test_fixed_process_recipe_runs_preflight_before_any_detached_owner(tmp_path,
         assert '--torque-console-managed-cycle' in command
         assert '--pause-on-exit' not in command
         assert command[command.index('--torque-console-max-assist-nm')+1] == '1'
+        assert command[command.index('--torque-console-auto-calibration-profile')+1] == str(managed.PROFILES[recipe])
         directory = Path(command[command.index('--output-root')+1])/'b601-owner-offline'
         directory.mkdir(parents=True)
         (directory/'b601_owner.json').write_text(json.dumps({'status': 'PASS', 'preflight_only': True,
@@ -59,6 +62,8 @@ def test_fixed_process_recipe_runs_preflight_before_any_detached_owner(tmp_path,
     monkeypatch.setattr(managed.subprocess, 'run', preflight)
     monkeypatch.setattr(managed.subprocess, 'Popen', popen)
     result = managed.launch(args)
+    plan = json.loads((Path(result['run_directory'])/'plan.json').read_text())
+    assert plan['recipe'] == recipe
     assert ('preflight',) in calls
     assert (('launch',) in calls) == (operation == 'start')
     if operation == 'start':
@@ -183,7 +188,7 @@ def test_purpose_built_wrapper_previews_and_rejects_arbitrary_commands(tmp_path)
         env=env, capture_output=True, text=True, timeout=10, check=False)
     assert result.returncode == 0
     assert 'control_station.b601_torque_console.managed_run' in result.stdout
-    for extra in (['--command', 'arbitrary'], ['--operation', 'kill'], ['--', '--allow-control-risk']):
+    for extra in (['--command', 'arbitrary'], ['--operation', 'kill'], ['--recipe', 'arbitrary'], ['--', '--allow-control-risk']):
         result = subprocess.run([*base, *extra, '--dry-run'], env=env, capture_output=True,
             text=True, timeout=10, check=False)
         assert result.returncode != 0

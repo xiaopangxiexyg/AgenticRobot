@@ -69,6 +69,8 @@ def test_four_centre_profile_changes_only_centres_and_explicit_arrival_feedback(
         assert new["workspace"][name] == [3, 6]
         new["workspace"][name] = old["workspace"][name]
     assert new["workspace"]["coordinated_holding"].pop("cruise_arrival_feedback") is True
+    assert new["workspace"]["coordinated_holding"].pop("arrival_displacement_gains_nm_per_rad") == [20, 40]
+    assert new["workspace"].pop("identification_joint3_speeds_rad_s") == [.0075, .01125, .015]
     assert new == old
 
 
@@ -483,7 +485,7 @@ def test_complete_identification_wires_cruise_only_to_training_validation_axis(t
             break
     result = controller.result_record()
     assert result["state"] == "complete", result["reason"]
-    assert len(result["motion"]["completed_legs"]) == 28*centres
+    assert len(result["motion"]["completed_legs"]) == (34 if profile == FOUR_CENTRES else 28)*centres
     assert active_roles == {"training", "validation"}
     assert controller.cycle_disable_confirmation_ready
 

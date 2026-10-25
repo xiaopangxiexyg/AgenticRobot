@@ -37,6 +37,7 @@ class CoordinatedWorkspaceController:
     controller_mode = "automatic_calibration"
 
     def __init__(self, settings, config, workspace, *, command_field_source=None):
+        workspace.sweep_speeds("joint3", config)
         if workspace.holding_search is None:
             raise ValueError("coordinated acquisition requires explicit holding search")
         if config.max_sweep_leg_command_exposure_nm_sec is None:
@@ -887,7 +888,8 @@ class CoordinatedWorkspaceController:
             "continuous_identification": {"enabled": self._continuous_identification,
                 "command_field_mode": self.workspace.coordinated_holding.command_field_mode,
                 "leg_index": self._leg_index, "leg_count": len(self._steps),
-                "speeds_rad_s": self.config.sweep_speeds_rad_s,
+                "speeds_rad_s": self.workspace.sweep_speeds(
+                    self._tasks[self._index].get("joint") if self._index < len(self._tasks) else None, self.config),
                 "fits_after_cleanup_only": True, "auto_apply": False},
             **({"command_field_source": self.pose.command_field_source.metadata(),
                 "command_field_mode": self.workspace.coordinated_holding.command_field_mode}

@@ -45,6 +45,7 @@
     "setup_label": "temporary_end_effector_coordinated_holding_candidate",
     "holding_sampling_plan": "identification",
     "identification_position_bin_width_rad": 0.0045,
+    "identification_joint3_speeds_rad_s": [0.0075, 0.01125, 0.015],
     "holding_excursion_rad": 0.035,
     "holding_arrival_tolerance_rad": 0.003375,
     "holding_search": {
@@ -66,7 +67,8 @@
       "cruise_velocity_kp_nm_s_per_rad": 6,
       "cruise_velocity_ki_nm_per_rad": 20,
       "cruise_velocity_window_sec": 0.2,
-      "cruise_arrival_feedback": true
+      "cruise_arrival_feedback": true,
+      "arrival_displacement_gains_nm_per_rad": [20, 40]
     }
   }
 }

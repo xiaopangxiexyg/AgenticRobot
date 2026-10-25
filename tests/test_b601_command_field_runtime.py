@@ -276,12 +276,13 @@ def test_candidate_preserves_raw_velocity_watchdog_and_combined_caps(tmp_path, m
         assert max(abs(v) for v in core.field_component) <= 1
 
 
-def test_small_acceptance_profile_changes_centres_and_arrival_gain_with_existing_owner_flags(tmp_path):
+def test_small_acceptance_profile_keeps_gains_and_uses_shorter_joint3_plan(tmp_path):
     old, new = [json.loads(path.read_text()) for path in (FOUR_CENTRES, NEAR_ZERO)]
     for name in ("joint2_centres_deg", "joint3_centres_deg"):
         assert new["workspace"][name] == [3]
         new["workspace"][name] = old["workspace"][name]
-    assert new["workspace"]["coordinated_holding"].pop("arrival_displacement_gains_nm_per_rad") == [20, 40]
+    assert new["workspace"]["coordinated_holding"]["arrival_displacement_gains_nm_per_rad"] == [20, 40]
+    assert old["workspace"].pop("identification_joint3_speeds_rad_s") == [.0075, .01125, .015]
     assert new == old
     report = source_report()
     report["command_field_context"] = {
