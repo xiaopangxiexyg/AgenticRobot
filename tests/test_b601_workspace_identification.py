@@ -25,6 +25,10 @@ from control_station.b601_torque_console.workspace_identification import (
     organize_automatic_reports,
     summarize_workspace_identification,
 )
+from robot_motion.rebot_b601_rs.command_field import (
+    LocalCommandField,
+    evaluate_local_command_field,
+)
 from robot_motion.rebot_b601_rs.gravity_identification import (
     fit_paired_gravity_command,
     fit_paired_resistance_command,
@@ -486,6 +490,113 @@ def test_local_prediction_uses_equal_training_trials_and_retains_uncovered_valid
         _local_repeat_prediction([a], [a])
 
 
+def field_observations():
+    train, _ = observations(joint="joint2")
+    base = train[0]
+    training, validation = [], []
+    for position in (.02, .04):
+        for speed in (.01, .02):
+            for direction in (-1, 1):
+                q = (0, position, .03, 0, 0, 0)
+                value = .2+2*position+direction*(.12+4*speed)
+                for repeat in range(3):
+                    sample = replace(base, trial_id=f"{speed}:{direction}:{repeat}", qpos_rad=q,
+                        velocity_rad_s=direction*speed, command_residual_nm=value)
+                    (training if repeat < 2 else validation).append(sample)
+    return training, validation
+
+
+def test_command_field_predicts_pose_speed_and_direction_and_validates_components():
+    training, validation = field_observations()
+    field = LocalCommandField(tuple(training))
+    target = validation[0]
+    query = {"condition": target.condition, "qpos_rad": target.qpos_rad,
+        "velocity_rad_s": target.velocity_rad_s,
+        "active_driver_kd_nm_s_per_rad": target.active_driver_kd_nm_s_per_rad}
+    prediction = field.predict(**query)
+    assert prediction["predicted_command_residual_nm"] == pytest.approx(target.command_residual_nm)
+    components = field.components(**query)
+    assert components["even_command_nm"] == pytest.approx(.24)
+    assert components["odd_command_nm"] == pytest.approx(.16)
+    assert not components["identifies_physical_gravity_or_friction"]
+    assert not components["usable_as_static_support"]
+    result = evaluate_local_command_field(training, validation)
+    assert result["status"] == "OFFLINE_CANDIDATE", result["validation_checks"]
+    assert result["directional_validation"]["equal_trial_rmse_on_predicted_windows_nm"] < 1e-12
+    assert result["directional_validation"]["command_prediction_error_reduction_fraction"] == pytest.approx(1)
+    paired = result["paired_component_validation"]
+    assert paired["status"] == "OFFLINE_CANDIDATE"
+    assert paired["predicted_pairs"] == paired["validation_pairs"] == 4
+    assert paired["equal_trial_even_rmse_on_predicted_pairs_nm"] < 1e-12
+    assert paired["equal_trial_odd_rmse_on_predicted_pairs_nm"] < 1e-12
+    assert not result["live_compensation_enabled"] and not result["hardware_approved"]
+    # Held-out labels change error, never training neighbours or predictions.
+    changed = evaluate_local_command_field(training, [replace(o, command_residual_nm=o.command_residual_nm+.2)
+                                                      for o in validation])
+    assert not changed["validation_checks"]["prediction_error_passed"]
+    assert changed["directional_validation"]["predictions"][0]["predicted_command_residual_nm"] == prediction["predicted_command_residual_nm"]
+    assert changed["paired_component_validation"]["equal_trial_even_rmse_on_predicted_pairs_nm"] == pytest.approx(.2)
+    assert changed["paired_component_validation"]["equal_trial_odd_rmse_on_predicted_pairs_nm"] < 1e-12
+    assert not changed["paired_component_validation"]["validation_checks"]["even_prediction_error_passed"]
+    assert not changed["coverage_gaps"]
+
+
+def test_command_field_abstains_at_rest_and_outside_actual_six_axis_speed_or_repeat_support():
+    training, validation = field_observations()
+    target = validation[0]
+    field = LocalCommandField(tuple(training))
+    query = {"condition": target.condition, "qpos_rad": target.qpos_rad,
+        "velocity_rad_s": target.velocity_rad_s,
+        "active_driver_kd_nm_s_per_rad": target.active_driver_kd_nm_s_per_rad}
+    for change in ({"velocity_rad_s": 0}, {"velocity_rad_s": .1}, {"qpos_rad": (0, .02, .04, 0, 0, 0)}):
+        result = field.predict(**{**query, **change})
+        assert not result["predicted"] and result["predicted_command_residual_nm"] is None
+    one_trial = [o for o in training if o.trial_id == target.trial_id.replace(":2", ":0")]
+    assert not LocalCommandField(tuple(one_trial)).predict(**query)["predicted"]
+    negative_only = LocalCommandField(tuple(o for o in training if o.velocity_rad_s < 0))
+    assert negative_only.predict(**query)["predicted"]
+    assert not negative_only.components(**query)["available"]
+    outside = replace(target, qpos_rad=(0, .02, .04, 0, 0, 0))
+    result = evaluate_local_command_field(training, [*validation, outside])
+    assert result["status"] == "DIAGNOSTIC_ONLY"
+    direct = result["directional_validation"]
+    assert direct["predicted_windows"] == 8 and direct["unpredicted_windows"] == 1
+    assert direct["validation_coverage_fraction"] == pytest.approx(8/9)
+    assert direct["covered_subset_error_passed"]
+    assert result["coverage_gaps"][0]["reason"] == "full_pose_outside_training_support"
+    assert result["coverage_gaps"][0]["validation_windows"] == 1
+    assert result["coverage_gaps"][0]["actual_abs_speed_range_rad_s"] == [.01, .01]
+
+
+def test_command_field_enforces_source_damping_joint_and_trial_boundaries():
+    training, validation = field_observations()
+    field = LocalCommandField(tuple(training))
+    target = validation[0]
+    query = {"condition": target.condition, "qpos_rad": target.qpos_rad,
+        "velocity_rad_s": target.velocity_rad_s,
+        "active_driver_kd_nm_s_per_rad": target.active_driver_kd_nm_s_per_rad}
+    for change in ({"condition": replace(target.condition, run_id="other-run")},
+                   {"active_driver_kd_nm_s_per_rad": (1,)*6}):
+        with pytest.raises(ValueError, match="mismatch"):
+            field.predict(**{**query, **change})
+    with pytest.raises(ValueError, match="whole trial leakage"):
+        evaluate_local_command_field(training, [training[0]])
+    with pytest.raises(ValueError, match="joint mismatch"):
+        evaluate_local_command_field(training, [replace(target, joint_name="joint3")])
+    with pytest.raises(ValueError, match="one joint"):
+        LocalCommandField((*training, replace(training[0], joint_name="joint3")))
+    with pytest.raises(TypeError, match="admitted observations"):
+        evaluate_local_command_field([{}], validation)
+    with pytest.raises(ValueError, match="finite"):
+        field.predict(**{**query, "velocity_rad_s": float("nan")})
+    # Remote poses in the bank never contribute to a local query.
+    larger = LocalCommandField((*training, replace(training[0], qpos_rad=(1,)*6)))
+    assert larger.predict(**query) == field.predict(**query)
+    # Duplicate copies and long trials cannot acquire extra prediction weight.
+    repeated = LocalCommandField((*training, *([training[0]]*100)))
+    assert repeated.predict(**query) == field.predict(**query)
+
+
 def test_validation_reports_both_coverage_and_error_failure_without_changing_admission():
     train, valid = paired_observations()
     outside = [replace(o, qpos_rad=tuple(q+.2 for q in o.qpos_rad),
@@ -547,6 +658,7 @@ def test_closed_loop_cli_preserves_sources_and_exposes_independent_reprocessing(
     assert not report["source_acquisition_complete"]
     assert report["source_trace_sha256"] == hashlib.sha256(original[0]).hexdigest()
     assert report["source_report_sha256"] == hashlib.sha256(original[1]).hexdigest()
+    assert "command_field.py" in report["processor_sources_sha256"]
     assert report["running_resistance"]["offline_candidates"] == 2
     assert (trace.read_bytes(), source.read_bytes()) == original
     assert report["settings"]["position_bin_width_rad"] == width
@@ -584,6 +696,8 @@ def test_automatic_report_wires_continuous_fits_and_keeps_later_stop_separate(tm
     else:
         assert report["command_identification"]["reduction_method"] == "closed_loop_average"
         assert report["paired_resistance_identification"] == report["command_identification"]["paired_resistance_fit"]
+    assert report["empirical_command_field"] == report["command_identification"]["empirical_command_field"]
+    assert not report["empirical_command_field"]["live_compensation_enabled"]
     assert not report["auto_apply"]
 
 

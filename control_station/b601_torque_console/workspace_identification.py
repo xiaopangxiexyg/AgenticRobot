@@ -15,6 +15,7 @@ from robot_motion.rebot_b601_rs.calibration import (
     reduce_command_window,
     six,
 )
+from robot_motion.rebot_b601_rs.command_field import evaluate_local_command_field
 from robot_motion.rebot_b601_rs.gravity_identification import (
     fit_paired_gravity_command,
     fit_paired_resistance_command,
@@ -72,46 +73,8 @@ def _repeatability(observations, *, pose_tolerance_rad=.0045, maximum_speed_rati
 
 
 def _local_repeat_prediction(training, validation):
-    """Test local repeatability using training neighbours only, never deploy.
-
-    One nearest observation per training trial prevents a long leg from
-    dominating. Retain every unpredicted validation window in the denominator.
-    """
-    if {o.trial_id for o in training} & {o.trial_id for o in validation}:
-        raise ValueError("whole trial leakage in local repeat prediction")
-    predictions, errors = [], defaultdict(list)
-    for target in validation:
-        nearest = {}
-        for source in training:
-            match = _matched_response_distance(target, source)
-            if match is not None and (source.trial_id not in nearest or match < nearest[source.trial_id][0]):
-                nearest[source.trial_id] = (match, source.command_residual_nm)
-        record = {"validation_trial_id": target.trial_id, "qpos_rad": target.qpos_rad,
-            "velocity_rad_s": target.velocity_rad_s, "training_trial_ids": sorted(nearest),
-            "predicted": len(nearest) >= 2, "observed_command_residual_nm": target.command_residual_nm}
-        if len(nearest) >= 2:
-            values = [value for _, value in nearest.values()]
-            predicted = sum(values)/len(values)
-            error = predicted-target.command_residual_nm
-            record.update(predicted_command_residual_nm=predicted, error_nm=error,
-                          training_command_residual_range_nm=[min(values), max(values)])
-            errors[target.trial_id].append(error)
-        predictions.append(record)
-    rmse = (math.sqrt(sum(sum(e*e for e in values)/len(values)
-        for values in errors.values())/len(errors)) if errors else None)
-    return {"status": "DIAGNOSTIC_ONLY", "auto_apply": False,
-        "pose_tolerance_rad": .0045, "maximum_speed_ratio": 1.25,
-        "minimum_training_trials_per_prediction": 2,
-        "validation_windows": len(validation), "predicted_windows": sum(p["predicted"] for p in predictions),
-        "unpredicted_windows": sum(not p["predicted"] for p in predictions),
-        "all_validation_windows_predicted": bool(validation) and all(p["predicted"] for p in predictions),
-        "validation_coverage_fraction": sum(p["predicted"] for p in predictions)/len(validation) if validation else None,
-        "equal_trial_rmse_on_predicted_windows_nm": rmse,
-        "max_diagnostic_rmse_nm": .05,
-        "covered_subset_error_passed": rmse is not None and rmse <= .05,
-        "physical_compensation_ready": False,
-        "predictions": predictions,
-        "semantics": "partial_local_command_predictability_not_full_model_validation_or_physical_friction"}
+    """Compatibility view of the reusable training-only command field."""
+    return evaluate_local_command_field(training, validation)["directional_validation"]
 
 
 def organize_automatic_reports(paths):
@@ -445,18 +408,24 @@ def summarize_workspace_identification(records, *, condition, workspace,
     groups = defaultdict(list)
     for pose, role, observation in observations:
         groups[(pose, observation.joint_name, observation.active_driver_kd_nm_s_per_rad)].append((role, observation))
-    fits, paired_models = [], []
+    fits, paired_models, fields = [], [], []
     for (pose, joint, kd), group in sorted(groups.items()):
         fit = fit_local_command_model([o for role, o in group if role == "training"],
             [o for role, o in group if role == "validation"])
         item = {"pose_index": pose, "joint_name": joint,
             "active_driver_kd_nm_s_per_rad": kd, "fit": fit}
         if reduction_method == "closed_loop_average":
+            assessment = evaluate_local_command_field(
+                [o for role, o in group if role == "training"],
+                [o for role, o in group if role == "validation"])
             item.update(repeatability_by_split={role: _repeatability([o for r, o in group if r == role])
                 for role in ("training", "validation")},
-                local_repeat_prediction=_local_repeat_prediction(
-                [o for role, o in group if role == "training"],
-                [o for role, o in group if role == "validation"]))
+                local_repeat_prediction=assessment["directional_validation"])
+            fields.append({"pose_index": pose, "joint_name": joint,
+                "active_driver_kd_nm_s_per_rad": kd,
+                **{k: v for k, v in assessment.items() if k != "directional_validation"},
+                "directional_validation": {k: v for k, v in assessment["directional_validation"].items()
+                    if k != "predictions"}})
             paired_models.append({"pose_index": pose, "joint_name": joint,
                 "active_driver_kd_nm_s_per_rad": kd,
                 "analysis": fit_paired_resistance_command(
@@ -507,6 +476,9 @@ def summarize_workspace_identification(records, *, condition, workspace,
                 "active_driver_kd_nm_s_per_rad": f["active_driver_kd_nm_s_per_rad"],
                 **{k: v for k, v in f["local_repeat_prediction"].items() if k != "predictions"}}
                 for f in fits if "local_repeat_prediction" in f]},
+        "empirical_command_field": {"status": "OFFLINE_ONLY", "auto_apply": False,
+            "live_compensation_enabled": False, "regions": fields,
+            "scope": "separate_local_full_pose_and_fixed_damping_regions; no_static_or_breakaway_model"},
         "cruise_execution_diagnostic": {"quantity": "software_commands_not_measured_force",
             "scope": "admitted_complete_training_validation_dispatches_not_just_fit_windows",
             "unavailable_samples": unavailable_execution_samples,

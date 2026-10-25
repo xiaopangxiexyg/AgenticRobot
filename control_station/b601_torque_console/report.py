@@ -367,7 +367,11 @@ def main(argv: list[str] | None = None) -> int:
         if args.organize_identification:
             pass
         elif args.closed_loop_identification:
-            from robot_motion.rebot_b601_rs import calibration, gravity_identification
+            from robot_motion.rebot_b601_rs import (
+                calibration,
+                command_field,
+                gravity_identification,
+            )
 
             from . import workspace_identification
 
@@ -409,7 +413,7 @@ def main(argv: list[str] | None = None) -> int:
                     "offline_candidates": (baseline.get("running_resistance") or {}).get("offline_candidates")},
                 processor_sources_sha256={Path(module.__file__).name:
                     hashlib.sha256(Path(module.__file__).read_bytes()).hexdigest()
-                    for module in (workspace_identification, calibration, gravity_identification)},
+                    for module in (workspace_identification, calibration, gravity_identification, command_field)},
                 assumptions=["latest complete six-axis dispatch approximates the held input, not device actuation time",
                     "linear encoder motion approximates cruise; inertia and transmission preload are not measured",
                     "only approximately odd repeatable resistance cancels in matched opposite-direction pairs"])
