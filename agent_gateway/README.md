@@ -334,6 +334,14 @@ requested semantic-role order. The trusted MuJoCo profile maps semantic roles
 to lower camera sources. Inline capture results contain only bounded metadata
 and content hashes. Pixel arrays never enter the control frame.
 
+MuJoCo可通过显式 `--enable-rgbd-capture-v3`（同时提供 `--artifact-root`）
+增加只读 `perception.capture_rgb@3`，默认不发布，原RGB版本与身份保持。
+`include_depth=false`沿用有序RGB捕获；为true时只允许一个已有aligned-depth角色的原生网格，
+输出同一次cut的原始JPEG、NPY和paired metadata。原始字节缺失、取消、过期或revision变化均拒绝成功，
+不重编码补造同源证据。它复用原passive执行、采集和关闭owner，不启用模型或运动。
+metadata核验只证明表示和媒体关联；后续消费者仍须完成操作、client/session与CAS来源认证。
+多Artifact提交中断时可能已有个别CAS对象留存，但不会发布成功结果，不作为多对象原子事务。
+
 既有原子夹爪 Skill 完成开合时必须得到 `moving=False` 的实测状态；目标位置接近但仍在
 运动或状态未知时不能完成。真机停止 ACK 之后还须在有限等待内读取新鲜、无故障的停稳反馈，
 早于停止请求、过期、未来时间或不可用反馈均不能确认 HOLD。只读反馈沿用已启动 backend，

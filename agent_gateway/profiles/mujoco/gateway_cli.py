@@ -136,6 +136,8 @@ def build_parser() -> argparse.ArgumentParser:
         default="cuda",
         help="Torch device used by the optional SAM2/Grounding DINO segmenter",
     )
+    parser.add_argument("--enable-rgbd-capture-v3", action="store_true",
+                        help="Publish capture_rgb v3 with optional native-grid paired RGB-D Artifacts; default off.")
     parser.add_argument(
         "--history-root",
         type=Path,
@@ -484,6 +486,7 @@ def main(argv: list[str] | None = None) -> int:
         or args.enable_grippers
         or args.enable_grasp_approach
         or args.grasp_contact_target_body is not None
+        or args.enable_rgbd_capture_v3
         or args.enable_spatial_goals
         or args.history_root is not None
         or args.segmentation_asset_bundle is not None
@@ -539,6 +542,8 @@ def main(argv: list[str] | None = None) -> int:
         )
         artifact_storage = MujocoAgentArtifactStorageConfig(root=artifact_root)
     segmentation_localizer = None
+    if args.enable_rgbd_capture_v3 and artifact_storage is None:
+        parser.error("--enable-rgbd-capture-v3 requires --artifact-root")
     if args.segmentation_asset_bundle is not None:
         from deployments.perception.sam2_grounding_dino import (
             Sam2GroundingDinoLocalizer,
@@ -595,6 +600,7 @@ def main(argv: list[str] | None = None) -> int:
         max_session_admissions_per_route=(args.max_session_admissions_per_route),
         history_storage=history_storage,
         artifact_storage=artifact_storage,
+        enable_rgbd_capture_v3=args.enable_rgbd_capture_v3,
         segmentation_localizer=segmentation_localizer,
         enable_safe_tcp_pose=args.enable_safe_tcp_pose,
         enable_spatial_goals=args.enable_spatial_goals,

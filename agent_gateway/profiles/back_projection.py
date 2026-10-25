@@ -179,6 +179,8 @@ class CorrelatedPlacementCapture:
 
     rgb: LiveRgbSegmentationCapture
     depth: LiveAlignedDepthCapture
+    rgb_jpeg: bytes | None = None
+    depth_npy: bytes | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.rgb, LiveRgbSegmentationCapture) or not isinstance(

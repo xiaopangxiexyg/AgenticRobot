@@ -758,6 +758,7 @@ class MujocoAgentTcpPoseContractBundle:
     object_motion_contract: MujocoAgentSafeTcpPoseContract | None = None
     fast_grasp_contract: Any | None = None
     observed_point_contract: MujocoAgentSafeTcpPoseContract | None = None
+    rgbd_capture: SpatialGoalRegistration | None = None
 
     def __post_init__(self) -> None:
         validate_skill_route_catalog_closure(
@@ -879,6 +880,14 @@ class MujocoAgentTcpPoseContractBundle:
                 raise ValueError("Placement Route uses another deployment binding.")
             if segmentation is None or depth_capture is None:
                 raise ValueError("Placement requires segmentation and depth capture.")
+        if self.rgbd_capture is not None:
+            if (depth_capture is None or rgb_capture is None
+                    or depth_capture.back_projection is None
+                    or self.route_manifest.route("perception.capture_rgb", "3") != self.rgbd_capture.entry):
+                raise ValueError("Paired RGB-D capture requires its exact RGB, depth and manifest registrations.")
+        elif any(item.route.skill_id == "perception.capture_rgb" and item.route.skill_version == "3"
+                 for item in self.route_manifest.skill_routes):
+            raise ValueError("RGB-D capture v3 Route has no registration.")
         if motion_entry.deployment_binding.deployment_binding_hash != (
             self.deployment_binding.semantic_content_hash
         ):
@@ -1872,6 +1881,7 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
     application: Any,
     history_profile: MujocoAgentTcpPoseHistoryProfile | None = None,
     enable_artifact_perception: bool = False,
+    enable_rgbd_capture_v3: bool = False,
     segmentation_model_profile_id: str | None = None,
     segmentation_model_profile_hash: str | None = None,
     segmentation_inference_implementation_hash: str | None = None,
@@ -1895,6 +1905,8 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
         raise TypeError("history_profile must be typed or None.")
     if not isinstance(enable_artifact_perception, bool):
         raise TypeError("enable_artifact_perception must be boolean.")
+    if type(enable_rgbd_capture_v3) is not bool or (enable_rgbd_capture_v3 and not enable_artifact_perception):
+        raise ValueError("RGB-D capture v3 requires explicit Artifact perception.")
     if type(enable_observed_point_motion) is not bool:
         raise TypeError("enable_observed_point_motion must be boolean.")
     if enable_observed_point_motion and (not enable_safe_tcp_pose or not enable_artifact_perception
@@ -2044,6 +2056,12 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
         if enable_artifact_perception
         else None
     )
+    rgbd_capture = None
+    if enable_rgbd_capture_v3:
+        from agent_gateway.profiles.rgbd_capture import build_rgbd_capture_registration
+
+        rgbd_capture = build_rgbd_capture_registration(
+            rgb_registration=rgb_capture, back_projection=depth_capture.back_projection)
     segmentation = (
         build_segmentation_registration(
             target_kind="sim",
@@ -3258,6 +3276,9 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
     if rgb_capture is not None:
         definition_items.append(rgb_capture.registration.definition)
         schema_items.append(rgb_capture.registration.schema_entry)
+    if rgbd_capture is not None:
+        definition_items.append(rgbd_capture.skill.definition)
+        schema_items.append(rgbd_capture.skill.schema_entry)
     if segmentation is not None:
         definition_items.append(segmentation.skill.definition)
         schema_items.append(segmentation.skill.schema_entry)
@@ -3445,6 +3466,8 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
                 availability_hash=rgb_capture.availability_hash,
             )
         )
+    if rgbd_capture is not None:
+        route_items.append(rgbd_capture.entry)
     if segmentation is not None:
         route_items.append(
             SkillRouteManifestEntry(
@@ -3499,6 +3522,8 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
             placement.skill.definition.skill_version,
         ):
             explicit_contracts += (placement.skill.io_contract,)
+        if rgbd_capture is not None and key == ("perception.capture_rgb", "3"):
+            explicit_contracts += (rgbd_capture.skill.io_contract,)
         contract = (
             explicit_contracts[0]
             if explicit_contracts
@@ -3614,6 +3639,8 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
             validator_items.append(depth_capture.back_projection.payload_validator)
     if rgb_capture is not None:
         validator_items.append(rgb_capture.payload_validator)
+    if rgbd_capture is not None:
+        validator_items.append(rgbd_capture.payload_validator)
     if spatial_goal_registration is not None:
         validator_items.append(spatial_goal_registration.payload_validator)
     if tcp_pose_comparison_registration is not None:
@@ -3669,6 +3696,7 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
         object_motion_contract=object_contract,
         depth_capture=depth_capture,
         rgb_capture=rgb_capture,
+        rgbd_capture=rgbd_capture,
         segmentation=segmentation,
         placement=placement,
         history_profile=history_profile,

@@ -180,6 +180,8 @@ class MujocoBackProjectionCapturePort:
                 source_frame_id=self.source_frame_id,
                 reference_frame_id=self.reference_frame_id,
             ),
+            rgb_jpeg=rgb_frame.data,
+            depth_npy=depth_frame.data,
         )
 
 

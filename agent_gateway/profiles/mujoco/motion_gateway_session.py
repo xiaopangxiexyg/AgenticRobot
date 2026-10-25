@@ -199,6 +199,7 @@ class MujocoAgentTcpPoseGatewaySession:
     _fast_grasp_segmenter_closed: bool = field(default=False, init=False, repr=False)
     _fast_grasp_start_failed: bool = field(default=False, init=False, repr=False)
     observed_point_executor: ReusableStationAgentSkillOperationExecutor | None = None
+    rgbd_capture_executor: PassiveReadSkillExecutor | None = None
     _close_lock: threading.Lock = field(
         default_factory=threading.Lock,
         init=False,
@@ -235,6 +236,8 @@ class MujocoAgentTcpPoseGatewaySession:
             raise ValueError("Fast grasp contract, model, provider and executors must coexist.")
         if (self.contract_bundle.spatial_goal_registration is not None) != (self.spatial_goal_executor is not None):
             raise ValueError("Spatial goal registration and executor must coexist.")
+        if (self.contract_bundle.rgbd_capture is not None) != (self.rgbd_capture_executor is not None):
+            raise ValueError("RGB-D capture registration and executor must coexist.")
         if (self.contract_bundle.tcp_pose_comparison_registration is not None) != (self.tcp_pose_comparison_executor is not None):
             raise ValueError("TCP comparison registration and executor must coexist.")
         if (self.contract_bundle.object_state_registration is not None) != (self.object_state_executor is not None):
@@ -568,6 +571,7 @@ class MujocoAgentTcpPoseGatewaySession:
                     ),
                     ("history", self.history_executor, 5.0),
                     ("spatial_goal", self.spatial_goal_executor, 5.0),
+                    ("rgbd_capture", self.rgbd_capture_executor, 5.0),
                     ("tcp_pose_comparison", self.tcp_pose_comparison_executor, 5.0),
                     ("object_state", self.object_state_executor, 5.0),
                     ("segmentation", self.segmentation_executor, 65.0),
@@ -1041,6 +1045,17 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
             ),
             max_retained_operations=retention,
             clock=runtime_clock,
+        )
+    rgbd_capture_executor = None
+    if contract_bundle.rgbd_capture is not None:
+        from agent_gateway.profiles.rgbd_capture import build_rgbd_capture_executor
+
+        rgbd_capture_executor = build_rgbd_capture_executor(
+            registration=contract_bundle.rgbd_capture, rgb_provider=rgb_capture_provider,
+            back_projection_provider=back_projection_provider, store=artifact_store,
+            current_station_revision=lambda: observation_producer.current_station_revision,
+            clock=runtime_clock, clock_domain_id=runtime.config.clock_domain_id,
+            max_retained_operations=retention,
         )
     placement_provider = None
     placement_executor = None
@@ -1852,6 +1867,8 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
         execution_port_by_route_hash[rgb_entry.route.semantic_content_hash] = (
             rgb_executor
         )
+    if rgbd_capture_executor is not None:
+        execution_port_by_route_hash[contract_bundle.rgbd_capture.entry.route.semantic_content_hash] = rgbd_capture_executor
     if segmentation_entry is not None and segmentation_executor is not None:
         execution_port_by_route_hash[segmentation_entry.route.semantic_content_hash] = (
             segmentation_executor
@@ -2040,6 +2057,7 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
         spatial_goal_executor=spatial_goal_executor,
         depth_executor=depth_executor,
         rgb_executor=rgb_executor,
+        rgbd_capture_executor=rgbd_capture_executor,
         back_projection_provider=back_projection_provider,
         back_projection_executor=back_projection_executor,
         segmentation_localizer=segmentation_localizer,

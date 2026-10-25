@@ -524,6 +524,7 @@ def build_mujoco_agent_tcp_pose_gateway_session(
     history_storage: MujocoAgentTcpPoseHistoryStorageConfig | None = None,
     artifact_storage: MujocoAgentArtifactStorageConfig | None = None,
     segmentation_localizer: object | None = None,
+    enable_rgbd_capture_v3: bool = False,
     enable_safe_tcp_pose: bool = False,
     enable_observed_point_motion: bool = False,
     enable_spatial_goals: bool = False,
@@ -551,6 +552,8 @@ def build_mujoco_agent_tcp_pose_gateway_session(
             raise ValueError("Observed safe motion requires the original safe Route and RGB-D resources.")
         if target_config.realtime_worker:
             raise ValueError("Observed safe motion requires the same deterministic physics owner.")
+    if type(enable_rgbd_capture_v3) is not bool or (enable_rgbd_capture_v3 and artifact_storage is None):
+        raise ValueError("RGB-D capture v3 requires explicit Artifact storage.")
     if type(enable_observed_point_motion) is not bool:
         raise TypeError("enable_observed_point_motion must be boolean.")
     if enable_observed_point_motion and safe_motion_observation is None:
@@ -588,6 +591,7 @@ def build_mujoco_agent_tcp_pose_gateway_session(
         enable_grippers
         or enable_grasp_approach
         or grasp_contact_target_body is not None
+        or enable_rgbd_capture_v3
         or enable_spatial_goals
         or history_storage is not None
         or segmentation_localizer is not None
@@ -788,6 +792,7 @@ def build_mujoco_agent_tcp_pose_gateway_session(
                 None if history_storage is None else history_storage.profile
             ),
             enable_artifact_perception=artifact_storage is not None,
+            enable_rgbd_capture_v3=enable_rgbd_capture_v3,
             segmentation_model_profile_id=(
                 None
                 if segmentation_localizer is None
