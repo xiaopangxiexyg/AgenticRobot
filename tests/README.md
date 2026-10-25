@@ -114,6 +114,41 @@ neither net line reductions nor test-count quotas are acceptance criteria.
 freshness 和静止性边界测试继续覆盖原路径。该用例中的可控历史是测试输入，
 不能作为真实设备采样时序的验证证据。
 
+### MuJoCo 原生集成中的重复初始化与组合采样
+
+`mujoco_gateway_fixture.py` 只在两个已有 Gateway 测试构造器中，将场景编译端口
+接到已有 `ModelArtifactCache`。完整验收沿用该次 Run 的输入哈希缓存；单独运行
+wrapper 时使用进程私有的 `/tmp` 临时目录。只复用校验过的编译产物，每次构造
+仍加载独立 `MjModel`、`MjData`、planner、Gateway 和生命周期资源；不共享可变模型、
+物理快照、待执行计划或运行中的会话。构造结束或抛出异常后恢复原端口。
+生产构造器和缓存实现不改。冷编译与命中结果的模型参数、网格、接触、执行器、
+初始状态逐项比较；修改一个会话的质量和 qpos 后，其他会话与后续加载必须不受影响。
+原有 `test_mujoco_fast_runtime.py` 中的冷启动、损坏恢复、跨进程发布和失效检查仍保留。
+
+所有权事务的 7 个失败/成功分支，以及锁等待预算 1 例、refinement 锁等待 4 例、
+最终场景读取后的取消/过期 2 例，使用真实 `MujocoPlannedTcpMotion` 和真实可重入锁，
+配合小型内存场景。它们原本就替换了几何查询，重复编译完整机器人没有增加该事务
+的断言。保留全部拒绝条件、待执行计划身份和执行状态断言，并要求精确拒绝原因。
+代价是这些分支不再各自验证完整原生 Rig/场景接线；真实双臂计划、执行、锁顺序、
+接触保护、Gateway 消费与资源关闭仍由其余原生集成用例验证。
+
+以下是明确的覆盖收缩，不宣称保持原笛卡尔积覆盖：
+
+| 测试族 | 原用例 | 当前用例 | 保留与放弃 |
+| --- | ---: | ---: | --- |
+| safe TCP policy × 左右臂 × task | 12 | 6 | 保留所有两两参数组合和每例全部真实执行断言；放弃其余三因素组合 |
+| DMTAC 左右手 × 方位 × 摩擦 | 8 | 4 | 保留所有两两参数组合及真实 lift、滑移、穿透和力学断言；放弃其余三因素组合 |
+| native fast selector 顺序 × 三种决策 | 6 | 3 | 每种决策一次，包含正反候选顺序；不再为每种决策重建两个原生会话。轻量 search/real-provider 策略矩阵继续保留 |
+| pose task 物理 feasibility oracle | 13 | 6 | 保留随机/固定 reach、普通/各向异性 contact、接触后 lift、完整 pick；去掉部分观察表示、固定初态和中间参数预设的独立 oracle |
+
+feasibility 的受限 z/夹爪 contact 和 positive-z lift 仍分别由真实闭环的
+`test_descend_close_task_is_feasible_without_hidden_xy_actions` 与
+`test_lift_short_v2_zero_policy_holds_and_positive_policy_lifts` 覆盖；各预设的配置、
+动作投影、观察字段、奖励和成功条件检查保留。它们不能替代被移除组合的完整
+独立物理验收，因此新增物理路径或参数交互风险时，应增加针对该风险的原生用例。
+B601 摩擦/残余力矩、真实外层截止时间、replay 释放尾段、physics tick、保护阈值、
+运行器、并发上限和内存门禁不在本次压缩范围。
+
 ### Runtime artifact 重复迁移压缩
 
 `test_runtime_artifact_migration.py` 将已发布迁移的幂等检查接在已有完整成功场景后，

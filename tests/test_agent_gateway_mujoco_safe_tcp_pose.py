@@ -30,13 +30,15 @@ CLIENT = "test:mujoco-safe-tcp"
 
 
 def _session(trace, *, after_fact=None, task=TASK, spatial=False, grasp=False,
-             contact_target=None, motion_side="right"):
+             contact_target=None, motion_side="right", use_model_cache=True):
+    from mujoco_gateway_fixture import build_gateway_session
     def consume(fact):
         trace.append(fact)
         if after_fact is not None:
             after_fact(fact)
 
-    return build_mujoco_agent_tcp_pose_gateway_session(
+    return build_gateway_session(
+        build_mujoco_agent_tcp_pose_gateway_session, use_model_cache=use_model_cache,
         target_config=MujocoSimHILTargetConfig(
             task_config_path=resolve_path(task),
             realtime_worker=False,
@@ -788,9 +790,15 @@ def test_left_safe_gateway_close_fences_an_inflight_request(record_property):
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("policy", [None, "within_arrival_tolerance", "preserve_target"])
-@pytest.mark.parametrize("motion_side", ["left", "right"])
-@pytest.mark.parametrize("task", [TASK, Path("sim/configs/tasks/rm65_right_dmtacm_blue_cube_70mm_agent_v1.json")])
+@pytest.mark.parametrize("policy,motion_side,task", [
+    # All policy/side, policy/task and side/task pairs; omit triple duplicates.
+    pytest.param(None, "left", TASK, id="reach-left-default"),
+    pytest.param(None, "right", Path("sim/configs/tasks/rm65_right_dmtacm_blue_cube_70mm_agent_v1.json"), id="dmtac-right-default"),
+    pytest.param("within_arrival_tolerance", "right", TASK, id="reach-right-arrival"),
+    pytest.param("within_arrival_tolerance", "left", Path("sim/configs/tasks/rm65_right_dmtacm_blue_cube_70mm_agent_v1.json"), id="dmtac-left-arrival"),
+    pytest.param("preserve_target", "left", TASK, id="reach-left-preserve"),
+    pytest.param("preserve_target", "right", Path("sim/configs/tasks/rm65_right_dmtacm_blue_cube_70mm_agent_v1.json"), id="dmtac-right-preserve"),
+])
 def test_safe_tcp_consumes_planned_joints_without_re_ik_pose_goal_policy(monkeypatch, record_property, policy, motion_side, task):
     import agent_gateway.profiles.mujoco.motion_skill as lifecycle_module
     terminal_hash_inputs = []

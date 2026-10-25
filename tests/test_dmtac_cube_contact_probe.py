@@ -125,9 +125,13 @@ def test_native_executor_contact_trial_persists_measurements_and_rejects_bad_dyn
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("side", ("left", "right"))
-@pytest.mark.parametrize("orientation", ("horizontal", "top_down"))
-@pytest.mark.parametrize("friction", (1., 1.2))
+@pytest.mark.parametrize("side,orientation,friction", [
+    # Preserve every two-factor interaction with four fresh physical trials.
+    pytest.param("left", "horizontal", 1., id="left-horizontal-1.0"),
+    pytest.param("left", "top_down", 1.2, id="left-top-down-1.2"),
+    pytest.param("right", "horizontal", 1.2, id="right-horizontal-1.2"),
+    pytest.param("right", "top_down", 1., id="right-top-down-1.0"),
+])
 def test_constraint_candidate_retains_seventy_mm_cube_without_force_increase(tmp_path, side, orientation, friction):
     pytest.importorskip("mujoco")
     baseline_xml, baseline = build_fixture(urdf=(REPO_ROOT / CAD_URDF).resolve(strict=True),

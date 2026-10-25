@@ -10,6 +10,7 @@ import pytest
 from test_agent_gateway_mujoco_grasp_approach import _retained_world_grasp
 from test_agent_gateway_mujoco_safe_tcp_pose import (
     CLIENT,
+    TASK,
     _place_cube_at_collision,
     _request,
     _session,
@@ -38,6 +39,74 @@ def _vertical_goals(app):
         )
         for delta in (0.01, 0.02, 0.03)
     )
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("task", (TASK, Path("sim/configs/tasks/rm65_right_dmtacm_blue_cube_70mm_agent_v1.json")))
+def test_cached_gateway_models_match_cold_build_and_keep_mutable_state_private(tmp_path, monkeypatch, task):
+    from sim.mujoco.artifacts.cache import MODEL_CACHE_ENV
+    from sim.mujoco.scene import MujocoScene
+
+    monkeypatch.setenv(MODEL_CACHE_ENV, str(tmp_path / "gateway-model-cache"))
+    compile_model = MujocoScene.from_contract
+    compiles = []
+
+    def compile_scene(*args, **kwargs):
+        compiles.append(True)
+        return compile_model(*args, **kwargs)
+
+    monkeypatch.setattr(MujocoScene, "from_contract", compile_scene)
+    sessions = []
+    try:
+        for cached in (False, True, True):
+            sessions.append(_session([], task=task, use_model_cache=cached))
+        assert len(compiles) == 2  # One uncached reference, one cold artifact.
+        reference, first, second = [s.application.scene for s in sessions]
+        fields = (
+            "qpos0", "body_pos", "body_quat", "body_mass", "body_inertia",
+            "geom_type", "geom_bodyid", "geom_pos", "geom_quat", "geom_size",
+            "geom_contype", "geom_conaffinity", "geom_friction", "geom_solref",
+            "geom_solimp", "mesh_vert", "mesh_face", "jnt_range", "dof_damping",
+            "actuator_gainprm", "actuator_biasprm", "eq_data",
+        )
+        for actual in (first, second):
+            assert actual.model is not reference.model and actual.data is not reference.data
+            assert actual.model.opt.timestep == reference.model.opt.timestep
+            for name in fields:
+                np.testing.assert_array_equal(getattr(actual.model, name), getattr(reference.model, name))
+            for name in ("qpos", "qvel", "ctrl"):
+                np.testing.assert_array_equal(getattr(actual.data, name), getattr(reference.data, name))
+        assert first.model is not second.model and first.data is not second.data
+        first.data.qpos[0] += .1
+        first.model.body_mass[-1] += 1.
+        sessions.append(_session([], task=task))
+        third = sessions[-1].application.scene
+        assert len(compiles) == 2
+        for actual in (second, third):
+            np.testing.assert_array_equal(actual.data.qpos, reference.data.qpos)
+            np.testing.assert_array_equal(actual.model.body_mass, reference.model.body_mass)
+        planners = [s.application.target.planned_tcp_motion for s in sessions]
+        assert len({id(p) for p in planners}) == len(planners)
+        assert all(p._pending_plan is None and not p.active for p in planners)
+    finally:
+        for session in reversed(sessions):
+            assert session.close().accepted
+
+
+def test_cached_gateway_construction_restores_preparation_port_after_failure():
+    import inspect
+    from mujoco_gateway_fixture import build_gateway_session
+    from sim.mujoco.scene import MujocoScene
+
+    original = inspect.getattr_static(MujocoScene, "from_contract")
+
+    def fail():
+        assert inspect.getattr_static(MujocoScene, "from_contract") is not original
+        raise LookupError("injected construction failure")
+
+    with pytest.raises(LookupError, match="injected construction failure"):
+        build_gateway_session(fail)
+    assert inspect.getattr_static(MujocoScene, "from_contract") is original
 
 
 @pytest.mark.integration
@@ -259,40 +328,37 @@ def test_contact_retiming_is_certified_before_publication_without_midcurve_waits
 
 @pytest.mark.integration
 def test_total_budget_includes_planner_lock_wait(monkeypatch):
-    session = _session([])
-    try:
-        app = session.application
-        app.start_observation_ready()
-        planner = app.target.planned_tcp_motion
-        goals = _vertical_goals(app)
-        began = threading.Event()
-        clock = [0.0]
+    from mujoco_plan_ownership_fixture import pending_chain_planner
 
-        def now():
-            began.set()
-            return clock[0]
+    planner, _original = pending_chain_planner()
+    planner._pending_plan = None
+    goals = (MujocoTcpPlanGoal((0., 0., 0., 0., 0., 0., 1.), .003, .03),)
+    began = threading.Event()
+    clock = [0.0]
 
-        monkeypatch.setattr(
-            planner,
-            "plan",
-            lambda *a, **kw: pytest.fail("Expired query must not start native search."),
-        )
-        with ThreadPoolExecutor(max_workers=1) as workers:
-            with planner._lock:
-                pending = workers.submit(
-                    planner.plan_chain,
-                    goals,
-                    cancel_requested=lambda: False,
-                    time_budget_sec=5,
-                    monotonic=now,
-                )
-                assert began.wait(timeout=2)
-                clock[0] = 6.0
-            with pytest.raises(MujocoTcpPlanRejected, match="budget_exhausted"):
-                pending.result(timeout=2)
-        assert not planner.active and planner._pending_plan is None
-    finally:
-        assert session.close().accepted
+    def now():
+        began.set()
+        return clock[0]
+
+    monkeypatch.setattr(
+        planner,
+        "plan",
+        lambda *a, **kw: pytest.fail("Expired query must not start native search."),
+    )
+    with ThreadPoolExecutor(max_workers=1) as workers:
+        with planner._lock:
+            pending = workers.submit(
+                planner.plan_chain,
+                goals,
+                cancel_requested=lambda: False,
+                time_budget_sec=5,
+                monotonic=now,
+            )
+            assert began.wait(timeout=2)
+            clock[0] = 6.0
+        with pytest.raises(MujocoTcpPlanRejected, match="budget_exhausted"):
+            pending.result(timeout=2)
+    assert not planner.active and planner._pending_plan is None
 
 
 @pytest.mark.integration
@@ -303,96 +369,85 @@ def test_total_budget_includes_planner_lock_wait(monkeypatch):
     (1.0, True, "safe_tcp_planning_cancelled"),
 ))
 def test_refinement_slice_includes_planner_lock_wait(monkeypatch, elapsed, cancel, reason):
-    session = _session([])
-    try:
-        app = session.application
-        app.start_observation_ready()
-        planner = app.target.planned_tcp_motion
-        original = planner.plan_chain(_vertical_goals(app),
-            cancel_requested=lambda: False, time_budget_sec=15)
-        refined = replace(original, trajectory_hash="test:refined-after-lock-wait")
-        clock, cancelled = [0.0], [False]
-        waiting = threading.Event()
-        owner = threading.get_ident()
-        lock = planner._lock
+    from mujoco_plan_ownership_fixture import pending_chain_planner
 
-        class ObservedLock:
-            def __enter__(self):
-                if threading.get_ident() != owner:
-                    waiting.set()
-                lock.acquire()
-                return self
+    planner, original = pending_chain_planner()
+    refined = replace(original, trajectory_hash="test:refined-after-lock-wait")
+    clock, cancelled = [0.0], [False]
+    waiting = threading.Event()
+    owner = threading.get_ident()
+    lock = planner._lock
 
-            def __exit__(self, *args):
-                lock.release()
+    class ObservedLock:
+        def __enter__(self):
+            if threading.get_ident() != owner:
+                waiting.set()
+            lock.acquire()
+            return self
 
-        monkeypatch.setattr(planner, "_lock", ObservedLock())
-        calls, validated = [], []
+        def __exit__(self, *args):
+            lock.release()
 
-        def preview(*args, **kwargs):
-            calls.append(kwargs["time_budget_sec"])
-            return refined
+    monkeypatch.setattr(planner, "_lock", ObservedLock())
+    calls, validated = [], []
 
-        monkeypatch.setattr(planner, "plan_chain", preview)
-        with ThreadPoolExecutor(max_workers=1) as workers:
-            with lock:
-                pending = workers.submit(planner.refine_pending_chain,
-                    original, (), cancel_requested=lambda: cancelled[0],
-                    time_budget_sec=1.0, deadline_at=10.0,
-                    monotonic=lambda: clock[0], validate_plan=validated.append)
-                assert waiting.wait(timeout=2), "Worker must reach the planner lock after taking the rig."
-                clock[0], cancelled[0] = elapsed, cancel
-            if reason is not None:
-                with pytest.raises(MujocoTcpPlanRejected) as error:
-                    pending.result(timeout=3)
-                assert error.value.reason_code == reason
-                assert calls == validated == []
-                assert planner._pending_plan is original
-            else:
-                assert pending.result(timeout=3) is refined
-                assert calls == [pytest.approx(1.0 - elapsed)]
-                assert validated == [refined] and planner._pending_plan is refined
-        assert not planner.active
-    finally:
-        assert session.close().accepted
+    def preview(*args, **kwargs):
+        assert planner.rig.scene_lock._is_owned()
+        calls.append(kwargs["time_budget_sec"])
+        return refined
+
+    monkeypatch.setattr(planner, "plan_chain", preview)
+    with ThreadPoolExecutor(max_workers=1) as workers:
+        with lock:
+            pending = workers.submit(planner.refine_pending_chain,
+                original, (), cancel_requested=lambda: cancelled[0],
+                time_budget_sec=1.0, deadline_at=10.0,
+                monotonic=lambda: clock[0], validate_plan=validated.append)
+            assert waiting.wait(timeout=2), "Worker must reach the planner lock after taking the rig."
+            clock[0], cancelled[0] = elapsed, cancel
+        if reason is not None:
+            with pytest.raises(MujocoTcpPlanRejected) as error:
+                pending.result(timeout=3)
+            assert error.value.reason_code == reason
+            assert calls == validated == []
+            assert planner._pending_plan is original
+        else:
+            assert pending.result(timeout=3) is refined
+            assert calls == [pytest.approx(1.0 - elapsed)]
+            assert validated == [refined] and planner._pending_plan is refined
+    assert not planner.active
 
 
 @pytest.mark.integration
 @pytest.mark.parametrize("cancel", (False, True))
 def test_refinement_final_scene_read_cannot_replace_after_cancel_or_expiry(monkeypatch, cancel):
-    session = _session([])
-    try:
-        app = session.application
-        app.start_observation_ready()
-        planner = app.target.planned_tcp_motion
-        original = planner.plan_chain(_vertical_goals(app),
-            cancel_requested=lambda: False, time_budget_sec=15)
-        refined = replace(original, trajectory_hash="test:refined-before-final-cut")
-        clock, cancelled, reads = [0.0], [False], []
-        model_qpos = planner._model_qpos
+    from mujoco_plan_ownership_fixture import pending_chain_planner
 
-        def read():
-            result = model_qpos()
-            reads.append(True)
-            if len(reads) == 2:
-                if cancel:
-                    cancelled[0] = True
-                else:
-                    clock[0] = 1.0
-            return result
+    planner, original = pending_chain_planner()
+    refined = replace(original, trajectory_hash="test:refined-before-final-cut")
+    clock, cancelled, reads = [0.0], [False], []
+    model_qpos = planner._model_qpos
 
-        monkeypatch.setattr(planner, "_model_qpos", read)
-        monkeypatch.setattr(planner, "plan_chain", lambda *args, **kwargs: refined)
-        with pytest.raises(MujocoTcpPlanRejected) as error:
-            planner.refine_pending_chain(original, (),
-                cancel_requested=lambda: cancelled[0], time_budget_sec=1.0,
-                deadline_at=10.0, monotonic=lambda: clock[0], validate_plan=lambda plan: None)
-        assert error.value.reason_code == (
-            "safe_tcp_planning_cancelled" if cancel else "safe_tcp_planning_budget_exhausted"
-        )
-        assert len(reads) == 2 and planner._pending_plan is original and not planner.active
-    finally:
-        assert session.close().accepted
+    def read():
+        result = model_qpos()
+        reads.append(True)
+        if len(reads) == 2:
+            if cancel:
+                cancelled[0] = True
+            else:
+                clock[0] = 1.0
+        return result
+
+    monkeypatch.setattr(planner, "_model_qpos", read)
+    monkeypatch.setattr(planner, "plan_chain", lambda *args, **kwargs: refined)
+    with pytest.raises(MujocoTcpPlanRejected) as error:
+        planner.refine_pending_chain(original, (),
+            cancel_requested=lambda: cancelled[0], time_budget_sec=1.0,
+            deadline_at=10.0, monotonic=lambda: clock[0], validate_plan=lambda plan: None)
+    assert error.value.reason_code == (
+        "safe_tcp_planning_cancelled" if cancel else "safe_tcp_planning_budget_exhausted"
+    )
+    assert len(reads) == 2 and planner._pending_plan is original and not planner.active
 
 
 @pytest.mark.integration

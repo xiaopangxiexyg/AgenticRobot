@@ -1659,33 +1659,17 @@ def test_reach_goal_delta_matches_pose_target_in_public_action_frame() -> None:
 @pytest.mark.parametrize(
     ("task_path", "success_reason"),
     (
-        (REACH_POSE_XYZ_TASK_CONFIG, "tcp_reach_success"),
+        # Sample distinct physical routes. Observation-only variants retain
+        # contract coverage; restricted descend/close and positive-z lift have
+        # dedicated real closed-loop tests above, rather than a second oracle.
         (REACH_GOAL_DELTA_XYZ_TASK_CONFIG, "tcp_reach_success"),
         (REACH_FIXED_POSE_XYZ_PROPRIO_TASK_CONFIG, "tcp_reach_success"),
         (CONTACT_POSE_XYZ_GRIPPER_TASK_CONFIG, "bilateral_contact_success"),
         (
-            CONTACT_GOAL_DELTA_OVERHEAD_XYZ_GRIPPER_TASK_CONFIG,
-            "bilateral_contact_success",
-        ),
-        (
             CONTACT_GOAL_DELTA_OVERHEAD_ANISOTROPIC_XYZ_GRIPPER_TASK_CONFIG,
             "bilateral_contact_success",
         ),
-        (
-            CONTACT_FIXED_POSE_XYZ_GRIPPER_PROPRIO_TASK_CONFIG,
-            "bilateral_contact_success",
-        ),
-        (
-            CONTACT_DESCEND_CLOSE_POSE_Z_GRIPPER_TASK_CONFIG,
-            "bilateral_contact_success",
-        ),
         (LIFT_HOLD_POSE_Z_TASK_CONFIG, "bilateral_contact_lift_success"),
-        (LIFT_SHORT_POSE_Z_PROPRIO_TASK_CONFIG, "bilateral_contact_lift_success"),
-        (
-            LIFT_SHORT_POSITIVE_Z_PROPRIO_TASK_CONFIG,
-            "bilateral_contact_lift_success",
-        ),
-        (PICK_POSE_XYZ_GRIPPER_TASK_CONFIG, "bilateral_contact_lift_success"),
         (
             PICK_POSE_XYZ_GRIPPER_ESTIMATOR_TASK_CONFIG,
             "bilateral_contact_lift_success",
