@@ -653,7 +653,7 @@ def recompress_tactile_zstd_in_place(
             replacements: dict[str, dict[str, Any]] = {}
             source_stats: dict[Path, os.stat_result] = {}
             original_manifest_bytes = manifest_path.read_bytes()
-            manifest_committed = False
+            manifest_publish_attempted = False
             manifest_raw_bytes = 0
             manifest_compressed_bytes = 0
             try:
@@ -761,8 +761,9 @@ def recompress_tactile_zstd_in_place(
                         "Formal collection started before tactile manifest commit: "
                         + "; ".join(active_collection[:3])
                     )
+                # Replacement can succeed before directory durability fails.
+                manifest_publish_attempted = True
                 _atomic_write_json(manifest_path, updated_manifest)
-                manifest_committed = True
                 committed_manifest = _read_json(manifest_path)
                 if committed_manifest.get(
                     "tactile_recompression"
@@ -771,7 +772,8 @@ def recompress_tactile_zstd_in_place(
                         f"Committed tactile manifest verification failed: {manifest_path}"
                     )
             except BaseException:
-                if manifest_committed:
+                if manifest_publish_attempted:
+                    # A failed restore must leave both payload sets available.
                     _atomic_write_bytes(manifest_path, original_manifest_bytes)
                 for target in created:
                     target.unlink(missing_ok=True)

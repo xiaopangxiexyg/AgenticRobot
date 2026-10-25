@@ -72,8 +72,14 @@ be replayed, or a torn record can fail closed.
 共享临时文件写入、文件同步、原子替换及临时文件清理。调用方仍保留原有的编码和
 目录同步策略：bundle 使用目录类型检查，capture recovery 保留目录缺失检查，
 modality storage 保留受限的目录同步重试。替换前失败不发布新内容；替换后目录同步
-失败仍向调用方报错，但文件已经可见，不能据此回滚或报告事务成功。事务准入、
+失败仍向调用方报错，但文件已经可见，不能假定尚未发布或已经回滚，也不能据此报告
+事务成功；恢复由原事务 owner 决定。事务准入、
 不可变 canonical 文件发布和流式数据写入各自保留现有 owner。
+
+触觉重压缩在尝试发布 manifest 前登记回收责任。发布或后续验证失败时，先恢复原始
+manifest，再移除本轮生成的压缩载荷；目录同步失败也必须走这条恢复路径，因为原子
+替换可能已经生效。恢复失败时继续报错并保留 raw 和新压缩载荷，不删除可能仍被引用
+的数据。正常成功后的校验、原始载荷移除和 receipt 顺序不变。
 
 Capture-time progress effective time is monotonic within the bound Episode
 clock. Nested Hold/Resume operation times must also be knowable by the receipt's
