@@ -22,7 +22,7 @@
     "startup_hardware_reset_reconnect_timeout_sec": 4.0,
     "metadata": {
       "mount": "single_front",
-      "startup_priority": 0,
+      "startup_priority": 10,
       "deployment": "agent_gateway_read_only_perception"
     }
   },
@@ -43,7 +43,7 @@
     "startup_hardware_reset_on_failure": false,
     "metadata": {
       "mount": "single_left_wrist",
-      "startup_priority": 20,
+      "startup_priority": 0,
       "deployment": "agent_gateway_read_only_perception"
     }
   },
@@ -64,7 +64,7 @@
     "startup_hardware_reset_on_failure": false,
     "metadata": {
       "mount": "single_right_wrist",
-      "startup_priority": 10,
+      "startup_priority": 20,
       "deployment": "agent_gateway_read_only_perception"
     }
   }

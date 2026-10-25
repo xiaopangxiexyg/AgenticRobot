@@ -221,6 +221,11 @@ stuck/failure 或缺少 completed 收尾仍算运行失败。报告完成后仍�
   `--camera-config`、`--arm-ip-assignment` 和新的 `--output` 目录，采集双臂 qpos 与可用相机 RGB-D。
   先检查既有连接/相机占用，不发送运动、HOLD、STOP、夹爪命令或相机 reset；固定 60 秒上限。
   `--dry-run` 仅显示参数，不连接设备。相机缺失和稳定性验证失败保留原因，不冒充完整采集成功。
+  `--arm-read-check` 仅通过相同 reader owner 检查双臂连接与 qpos，不构造或开启相机；
+  与相机诊断、`--check-only`、`--interactive` 互斥。`arm_read_check.json` 保存连接句柄、SDK 版本、
+  创建耗时、首次状态、短时只读样本和清理结果，不生成 RGB-D 快照。
+  `--arm-sdk-log-level 0|1|2|3` 复用原 SDK 日志等级，默认仍为 3；0 仅用于显式调试。
+  连接状态失败在首次 qpos 调用前报错，不重连、不切换 SDK 模式、不发送控制命令。
   `--camera-startup-check [streams|sensors]` 复用同一探针，仅诊断相机，不导入或连接机械臂 SDK；
   streams 保留完整 RGB-D、新鲜帧及清理门禁，并保存同帧 native depth；sensors 仅枚举目标设备的
   当前选项和流能力，不开启流或设置参数。两者均写入新证据目录，与 `--check-only`、`--interactive`

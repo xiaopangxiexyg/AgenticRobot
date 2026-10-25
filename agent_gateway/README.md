@@ -568,6 +568,11 @@ consecutive-fresh-frame admission are unchanged. The effective policy is part
 of the source binding identity; missing cameras fail admission, not RGB-only
 fallback. The default policy remains unchanged for existing consumers.
 
+仓库的 `agent_gateway_realsense.json` 使用原 `metadata.startup_priority` 配置左腕 `0`
+→ 主相机 `10` → 右腕 `20`，由原串行 owner 按约 0.5 秒错峰。角色、序列号和流配置不变；
+Gateway 与只读快照复用同一配置，自定义优先级仍由其配置决定。
+只读 SDK 连接检查可使用同一探针的 `--arm-read-check`，不会启动或重开相机。
+
 可选 `--camera-sdk-debug-log NEW_ABSOLUTE_PATH` 保存原生 DEBUG 日志和 SDK/启动上下文，
 不改变相机流、reset 或新鲜度要求。默认不启用；现有文件和符号链接均拒绝覆盖。
 启用日志会提前导入 SDK，单次成功不能据此证明初始化时序问题已根治。

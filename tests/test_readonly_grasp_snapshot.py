@@ -123,6 +123,12 @@ def camera_rig(capture_args, monkeypatch):
         monkeypatch.setattr(source, "close", close)
 
     class Arm:
+        def Arm_Socket_State(self):
+            return 0
+
+        def API_Version(self):
+            return "fixture-sdk"
+
         def Get_Current_Arm_State(self, *, retry):
             assert retry == 0
             return 0, [0]*6, [0]*6, 0, 0
@@ -172,6 +178,21 @@ def test_config_reuses_collection_policy_without_reset_or_stream_downgrade(captu
         assert not config.startup_hardware_reset_on_failure
         assert not config.startup_hardware_reset_on_warmup_failure
         assert config.auto_exposure_priority is None
+        assert source.device_info()["lifecycle_state"] == "stopped"
+
+
+def test_gateway_capture_config_uses_reviewed_left_first_startup_order():
+    config_path = Path(probe.__file__).resolve().parents[2] / (
+        "teleop_runtime/configs/devices/agent_gateway_realsense.json"
+    )
+    declared = json.loads(config_path.read_text())
+    sources = probe.readonly_camera_sources(config_path)
+    ordered = camera_runtime._camera_startup_items(sources)
+
+    assert [key for key, _ in ordered] == ["left_wrist", "front", "right_wrist"]
+    assert [source.config.metadata["startup_priority"] for _, source in ordered] == [0, 10, 20]
+    for key, source in sources.items():
+        assert source.config.serial == declared[key]["serial"]
         assert source.device_info()["lifecycle_state"] == "stopped"
 
 
@@ -429,7 +450,7 @@ def test_only_read_and_close_arm_methods_are_called():
     names = {node.func.attr for node in ast.walk(tree) if isinstance(node, ast.Call)
              and isinstance(node.func, ast.Attribute) and isinstance(node.func.value, ast.Name)
              and node.func.value.id == "arm"}
-    assert names == {"Get_Current_Arm_State", "Arm_Socket_Close"}
+    assert names == {"Get_Current_Arm_State", "Arm_Socket_Close", "Arm_Socket_State", "API_Version"}
     assert "hardware_reset" not in {n.attr for n in ast.walk(tree) if isinstance(n, ast.Attribute)}
     assert "set_option" not in {n.attr for n in ast.walk(tree) if isinstance(n, ast.Attribute)}
 
@@ -442,6 +463,120 @@ def test_read_arm_does_not_retry_or_command():
     result = read_arm(ReadOnly())
     assert result["qpos_rad"] == [0]*6
     assert result["finished_at"] >= result["started_at"]
+
+
+@pytest.mark.parametrize("failure", (None, "connection", "state", "interrupt", "close", "camera_import", "late_state"))
+def test_arm_only_check_uses_existing_owner_without_starting_cameras(capture_args, monkeypatch, failure):
+    import builtins
+
+    events = []
+    late_armed, read_entered, release_read = (threading.Event() for _ in range(3))
+
+    class Arm:
+        port = 8080
+
+        def __init__(self, side):
+            self.side = side
+            self.nSocket = -1 if failure == "connection" and side == "left" else 1
+
+        def Arm_Socket_State(self):
+            return 5 if self.nSocket == -1 else 0
+
+        def API_Version(self):
+            return "fixture-sdk"
+
+        def Get_Current_Arm_State(self, *, retry):
+            assert retry == 0
+            events.append(("read", self.side))
+            if failure == "interrupt":
+                raise KeyboardInterrupt("fixture cancellation")
+            if failure == "late_state" and self.side == "left" and late_armed.is_set():
+                read_entered.set()
+                assert release_read.wait(2)
+                return -1, [0]*6, [0]*6, 0, 0
+            return (-1 if failure == "state" else 0), [0]*6, [0]*6, 0, 0
+
+        def Arm_Socket_Close(self):
+            events.append(("close", self.side))
+            return 1 if failure == "close" and self.side == "left" else 0
+
+    def factory(ip):
+        side = {"left-test": "left", "right-test": "right"}[ip]
+        events.append(("open", side))
+        return Arm(side)
+
+    monkeypatch.setattr(probe, "assert_arm_connections_idle", lambda _: events.append(("ownership",)))
+    monkeypatch.setattr(probe, "assert_devices_idle", lambda _: pytest.fail("Arm-only check must not inspect cameras"))
+    monkeypatch.setattr(probe, "readonly_camera_sources", lambda _: pytest.fail("Arm-only check must not construct cameras"))
+    session_type = probe.ReadOnlySnapshotSession
+    sessions = []
+
+    def create_session(*args, **kwargs):
+        session = session_type(*args, **kwargs)
+        sessions.append(session)
+        if failure == "late_state":
+            start, close = session.start, session.close
+
+            def start_then_block_read(**kwargs):
+                start(**kwargs)
+                late_armed.set()
+                assert read_entered.wait(2)
+
+            def release_then_close():
+                release_read.set()
+                close()
+
+            session.start = start_then_block_read
+            session.close = release_then_close
+        return session
+
+    original_import = builtins.__import__
+
+    def reject_camera_import(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == "teleop_runtime.real_teleop" and "camera_runtime" in fromlist:
+            raise ImportError("fixture: camera runtime unavailable")
+        return original_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(probe, "ReadOnlySnapshotSession", create_session)
+    try:
+        with monkeypatch.context() as context:
+            if failure == "camera_import":
+                context.setattr(builtins, "__import__", reject_camera_import)
+            result = probe.check_arm_readonly(capture_args, arm_factory=factory)
+    finally:
+        release_read.set()
+        for session in sessions:
+            session.close()
+
+    opened = [event[1] for event in events if event[0] == "open"]
+    closed = [event[1] for event in events if event[0] == "close"]
+    assert opened == closed == (["left"] if failure in ("connection", "state", "interrupt") else ["left", "right"])
+    assert result["cameras_opened"] is False
+    assert result["motion_commands"] == [] and result["camera_reset"] is False
+    assert result["status"] == ("ready" if failure in (None, "camera_import") else "failed")
+    assert result["cleanup_complete"] is (failure != "close")
+    assert json.loads((capture_args.output / "arm_read_check.json").read_text()) == result
+    assert not (capture_args.output / "snapshot.json").exists()
+    lifecycle = json.loads((capture_args.output / "lifecycle.json").read_text())
+    assert lifecycle["views"] == {}
+    diagnostic = result["arm_connections"]["left"]
+    assert diagnostic["sdk_version"] == "fixture-sdk" and diagnostic["controller_ip"] == "left-test"
+    assert diagnostic["connect_elapsed_sec"] >= 0
+    if failure == "connection":
+        assert diagnostic["socket_state"] == 5 and diagnostic["sdk_handle_id"] == -1
+        assert not any(event[0] == "read" for event in events)
+        assert "connection failed before qpos" in result["error"]["message"]
+    elif failure in ("state", "interrupt"):
+        assert diagnostic["socket_state"] == 0
+        assert sum(event[0] == "read" for event in events) == 1
+        assert result["error"]["type"] == ("KeyboardInterrupt" if failure == "interrupt" else "RuntimeError")
+    else:
+        assert result["qpos_samples"] and set(result["initial_qpos"]) == {"left", "right"}
+        if failure == "close":
+            assert result["cleanup_errors"]
+        if failure == "late_state":
+            assert result["reader_errors"]
+            assert result["error"]["type"] == "RuntimeError"
 
 
 def samples():

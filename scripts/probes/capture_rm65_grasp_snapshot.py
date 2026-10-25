@@ -304,7 +304,13 @@ class ReadOnlySnapshotSession:
                     self._operation_condition.notify_all()
             if self.closed:
                 self._finish_watchdog_when_idle()
-    def start(self, *, cameras_only=False):
+    def start(self, *, cameras_only=False, arms_only=False):
+        if cameras_only and arms_only:
+            raise ValueError("Camera-only and arm-only checks are mutually exclusive")
+        if arms_only:
+            self.stage("check_arm_ownership", cameras_enabled=False)
+            self._start_arm_readers()
+            return
         from teleop_runtime.deploy.camera_runtime import run_camera_startup_self_check
         from teleop_runtime.real_teleop import camera_runtime
 
@@ -340,12 +346,30 @@ class ReadOnlySnapshotSession:
             self.save()
             self.stage("camera_check_ready", cameras=list(self.ready))
             return
+        self._start_arm_readers()
+
+    def _start_arm_readers(self):
         assert_arm_connections_idle(self.ips)
         for side in ("left", "right"):
-            self.stage("connect_arm_readonly", side=side)
-            self.arms[side] = self.arm_factory(self.ips[side])
+            self.stage("connect_arm_readonly", side=side, controller_ip=self.ips[side])
+            started = time.monotonic()
+            arm = self.arm_factory(self.ips[side])
+            elapsed = time.monotonic() - started
+            self.arms[side] = arm
+            state = arm.Arm_Socket_State()
+            diagnostic = {"side": side, "controller_ip": self.ips[side],
+                "port": getattr(arm, "port", 8080), "socket_state": state,
+                "sdk_handle_id": getattr(arm, "nSocket", None),
+                "sdk_version": arm.API_Version(),
+                "connect_elapsed_sec": elapsed}
+            self.info.setdefault("arm_connections", {})[side] = diagnostic
+            self.stage("arm_connection_result", **diagnostic)
+            if state != 0:
+                raise RuntimeError(f"Read-only RM65 connection failed before qpos: {diagnostic}")
             self.stage("read_initial_qpos", side=side)
-            self.stage("initial_qpos_ready", side=side, **read_arm(self.arms[side]))
+            initial = read_arm(arm)
+            self.info.setdefault("initial_qpos", {})[side] = initial
+            self.stage("initial_qpos_ready", side=side, **initial)
         self.sampler = threading.Thread(target=self._sample, name="readonly-qpos", daemon=True)
         self.sampler.start()
         time.sleep(.2)
@@ -462,8 +486,6 @@ class ReadOnlySnapshotSession:
             and min(item["started_at"] for item in row.values()) <= finished + .15]
 
     def close(self):
-        from teleop_runtime.real_teleop import camera_runtime
-
         if self.closed:
             return
         self.closed = True
@@ -506,10 +528,13 @@ class ReadOnlySnapshotSession:
             else:
                 self.info["cleanup_errors"].append("SDK read still inflight or unconfirmed; process exit releases sockets")
             try:
-                try:
-                    self.stage("close_cameras", lifecycle="real_teleop")
-                finally:
-                    camera_runtime._close_camera_sources(self.sources)
+                if self.sources:
+                    from teleop_runtime.real_teleop import camera_runtime
+
+                    try:
+                        self.stage("close_cameras", lifecycle="real_teleop")
+                    finally:
+                        camera_runtime._close_camera_sources(self.sources)
             except BaseException as exc:
                 self.info["cleanup_errors"].append(f"cameras: {type(exc).__name__}: {exc}")
                 if not isinstance(exc, Exception) and (
@@ -559,6 +584,40 @@ def capture(args, *, arm_factory) -> dict:
         if report["data_captured"] and report["cleanup_complete"] and not report["persistence_errors"] and "error" not in report:
             report["status"] = "captured"
         save_json(session.output / "snapshot.json", report)
+    print(json.dumps({"status": report["status"], "output": str(session.output),
+        "error": report.get("error"), "cleanup_errors": report["cleanup_errors"]}), flush=True)
+    return report
+
+
+def check_arm_readonly(args, *, arm_factory) -> dict:
+    """Use the existing reader owner without constructing camera sources."""
+    session = ReadOnlySnapshotSession(args, arm_factory=arm_factory)
+    report = {"check": "arm_readonly", "status": "failed", "cameras_opened": False,
+        "motion_commands": [], "camera_reset": False, "qpos_samples": []}
+    try:
+        with session.bounded_operation("arm_startup"):
+            session.start(arms_only=True)
+        with session.sample_lock:
+            report["qpos_samples"] = copy.deepcopy(list(session.samples))
+        report["status"] = "ready"
+    except (Exception, KeyboardInterrupt) as exc:
+        report["error"] = {"type": type(exc).__name__, "message": str(exc)}
+        session.stage("arm_read_check_failed", **report["error"])
+    finally:
+        with session.bounded_operation("close"):
+            session.close()
+        report.update(arm_connections=session.info.get("arm_connections", {}),
+            initial_qpos=session.info.get("initial_qpos", {}),
+            reader_errors=list(session.errors),
+            cleanup_complete=session.info["cleanup_complete"],
+            cleanup_errors=session.info["cleanup_errors"])
+        if report["reader_errors"]:
+            report["status"] = "failed"
+            report.setdefault("error", {"type": "RuntimeError",
+                "message": "Read-only arm sampler failed: " + "; ".join(report["reader_errors"])})
+        if not report["cleanup_complete"]:
+            report["status"] = "failed"
+        save_json(session.output / "arm_read_check.json", report)
     print(json.dumps({"status": report["status"], "output": str(session.output),
         "error": report.get("error"), "cleanup_errors": report["cleanup_errors"]}), flush=True)
     return report
@@ -807,6 +866,10 @@ def main() -> int:
     parser.add_argument("--output", required=True)
     parser.add_argument("--interactive", action="store_true", help="Operator-labeled repeated read-only snapshots")
     parser.add_argument("--check-only", action="store_true", help="Validate paths/imports without opening devices")
+    parser.add_argument("--arm-read-check", action="store_true",
+        help="Read arm connection/state using the existing owner, without starting cameras")
+    parser.add_argument("--arm-sdk-log-level", type=int, choices=(0, 1, 2, 3), default=3,
+        help="Existing SDK verbosity: 0 debug, 1 info, 2 warning, 3 error (default)")
     parser.add_argument("--camera-startup-check", nargs="?", const="streams", choices=("streams", "sensors"),
         help="Bounded RGB-D check, or sensors to read settings only; no arm SDK import or connection")
     for name in CONTEXT_FILES[2:]:
@@ -814,6 +877,8 @@ def main() -> int:
     parser.add_argument("--scene-object", action="append", choices=[key for key, _ in SCENE_OBJECTS.values()])
     parser.add_argument("--scene-note", default="")
     args = parser.parse_args()
+    if args.arm_read_check and (args.camera_startup_check or args.check_only or args.interactive):
+        parser.error("--arm-read-check cannot be combined with camera startup, check-only or interactive modes")
     if args.camera_startup_check and (args.check_only or args.interactive):
         parser.error("--camera-startup-check cannot be combined with --check-only or --interactive")
     if args.check_only:
@@ -835,9 +900,15 @@ def main() -> int:
         result = check_camera_startup(args)
         return 0 if result["status"] in ("ready", "observed") else 1
     from hardware.rm65.rm_api2_adapter import Arm, RM65
+    arm_factory = lambda ip: Arm(RM65, ip, log_level=args.arm_sdk_log_level)
+    if args.arm_read_check:
+        result = check_arm_readonly(args, arm_factory=arm_factory)
+        if result.get("error", {}).get("type") == "KeyboardInterrupt":
+            return 130
+        return 0 if result["status"] == "ready" else 1
     if args.interactive:
-        return interactive_capture(args, context=context, arm_factory=lambda ip: Arm(RM65, ip))
-    result = capture(args, arm_factory=lambda ip: Arm(RM65, ip))
+        return interactive_capture(args, context=context, arm_factory=arm_factory)
+    result = capture(args, arm_factory=arm_factory)
     if result.get("error", {}).get("type") == "KeyboardInterrupt":
         return 130
     return 0 if result["status"] == "captured" else 1

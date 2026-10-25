@@ -80,6 +80,22 @@ def test_readonly_snapshot_preview_never_connects(wrapper_environment):
     assert "60s" in result.stdout
 
 
+@pytest.mark.parametrize("extra", ((), ("--check-only",), ("--camera-startup-check",),
+    ("--arm-sdk-log-level", "4"), ("--arm-sdk-log-level", "-1")))
+def test_arm_read_check_wrapper_is_bounded_and_rejects_mode_conflicts(wrapper_environment, extra):
+    environment, calls = wrapper_environment
+    result = _run(environment, "remote_rm65_grasp_snapshot.sh", "-H", "trusted-target",
+        "--repo", "/repo", "--python", "/python", "--camera-config", "/cameras.json",
+        "--arm-ip-assignment", "/arms.json", "--output", "/new-evidence",
+        "--arm-read-check", "--arm-sdk-log-level", "0", "--dry-run", *extra)
+    assert (result.returncode == 0) == (not extra)
+    assert not calls.exists()
+    if not extra:
+        assert "--arm-read-check" in result.stdout and "60s" in result.stdout
+        assert "--arm-sdk-log-level '0'" in result.stdout
+        assert "--interactive" not in result.stdout
+
+
 def test_readonly_snapshot_rejects_arbitrary_command(wrapper_environment):
     environment, calls = wrapper_environment
     result = _run(environment, "remote_rm65_grasp_snapshot.sh", "-H", "trusted-target", "--command", "move")
