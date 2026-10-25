@@ -7658,7 +7658,7 @@ def _console_stop_request(stop: dict[str, bool], action: str) -> None:
 
 
 def _request_supported_return_disable(stop, torque_console, confirmation):
-    """A one-shot GUI grant, consumed only after the owner's return receipts."""
+    """A one-cycle grant, consumed only after the owner's return receipts."""
     if (not getattr(torque_console, "automatic_disable_ready", False)
         or stop.get("requested", False) or stop.get("full_disable_requested", False)):
         return False
@@ -12179,9 +12179,10 @@ def run_probe(
             ),
             **cycle_disable_confirmation,
             "semantics": (
-                "explicit_local_gui_confirmation_after_supported_origin_and_zero_assist_base_damping; "
-                "not a physical support sensor"
-            ),
+                "explicit_single_cycle_return_and_disable_selection_after_supported_origin_and_zero_assist_base_damping"
+                if cycle_disable_confirmation.get("source") == "single_cycle_supported_return" else
+                "explicit_local_gui_confirmation_after_supported_origin_and_zero_assist_base_damping"
+            ) + "; not a physical support sensor",
         },
         "cleanup_errors": tuple(cleanup_errors),
         "cleanup": cleanup_record,

@@ -50,6 +50,7 @@ def test_fixed_process_recipe_runs_preflight_before_any_detached_owner(tmp_path,
         assert calls[-1] == ('revision', 'a'*40)
         assert kwargs['start_new_session'] and kwargs['stdin'] == subprocess.DEVNULL
         assert kwargs['pass_fds']
+        assert kwargs['env']['PYTHONUNBUFFERED'] == '1'
         assert '--preflight-only' not in command
         assert managed.process_start(22) == '100'
         calls.append(('launch',))
@@ -129,6 +130,49 @@ def test_managed_stop_cannot_escalate_to_full_disable(tmp_path, monkeypatch):
         result = managed.request_protective_hold(tmp_path)
         assert requests == [{'action': 'protective_hold'}]
         assert result['full_disable_requested'] is False
+
+
+def test_live_endpoint_uses_flushed_child_log_even_when_launcher_output_is_buffered(tmp_path, monkeypatch):
+    run = tmp_path/'managed-live'
+    runtime = run/'owner/b601-owner-live/b601_owner.log'
+    runtime.parent.mkdir(parents=True)
+    runtime.write_text('TORQUE CONSOLE: http://127.0.0.1:44395\n')
+    (run/'management.log').write_text('foreground owner starts\n')
+    snapshot = {'owner_pid': 33, 'runtime_log_path': str(runtime), 'owner_ready': True}
+    urls = []
+    class Response:
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            return False
+        def read(self):
+            return json.dumps(snapshot).encode()
+    def open_url(url, **kwargs):
+        urls.append(url)
+        return Response()
+    monkeypatch.setattr(managed, 'urlopen', open_url)
+    monkeypatch.setattr(managed.os, 'getpgid', lambda pid: 22 if pid == 33 else 0)
+    url, result = managed.console_state(run, {'pid': 22})
+    assert url == 'http://127.0.0.1:44395' and result['owner_ready'] is True
+    assert urls == [url+'/api/status?view=operator']
+    snapshot['runtime_log_path'] = str(tmp_path/'other-owner.log')
+    with pytest.raises(ValueError, match='different run'):
+        managed.console_state(run, {'pid': 22})
+    snapshot['runtime_log_path'] = str(runtime)
+    monkeypatch.setattr(managed.os, 'getpgid', lambda pid: 44)
+    with pytest.raises(ValueError, match='exact managed process group'):
+        managed.console_state(run, {'pid': 22})
+
+
+def test_live_endpoint_discovery_rejects_multiple_owner_endpoints(tmp_path, monkeypatch):
+    run = tmp_path/'managed-ambiguous'
+    for name, port in [('first', 1234), ('second', 4321)]:
+        runtime = run/f'owner/b601-owner-{name}/b601_owner.log'
+        runtime.parent.mkdir(parents=True)
+        runtime.write_text(f'TORQUE CONSOLE: http://127.0.0.1:{port}\n')
+    monkeypatch.setattr(managed, 'urlopen', lambda *a, **k: pytest.fail('ambiguous endpoint reached HTTP'))
+    with pytest.raises(ValueError, match='ambiguous owner console'):
+        managed.console_state(run, {'pid': 22})
 
 
 def test_purpose_built_wrapper_previews_and_rejects_arbitrary_commands(tmp_path):

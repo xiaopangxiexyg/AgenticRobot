@@ -35,6 +35,12 @@ class B601ManagedCycle:
             raise ValueError("managed cycle requires an advancing owner clock")
         if self.phase in {"origin_confirmed", "cancelled", "operator_required", "stopped"}:
             return None
+        # Final readiness can be consumed by the owner in this very frame.
+        # Do not leave the last management record at "running" because the
+        # periodic observer has not reached its next 100 ms tick yet.
+        if self.start_count and self.controller.automatic_disable_ready:
+            self.phase, self.reason = "origin_confirmed", "existing_owner_disable_protocol_ready"
+            return None
         if now-self.last_tick_sec < .1:
             return None
         self.last_tick_sec = now
@@ -62,9 +68,7 @@ class B601ManagedCycle:
                 self.phase, self.reason = "operator_required", "managed_start_preparation_timeout"
                 return "protective_hold"
             return None
-        if self.controller.automatic_disable_ready:
-            self.phase, self.reason = "origin_confirmed", "existing_owner_disable_protocol_ready"
-        elif batch["active"]:
+        if batch["active"]:
             # A soft stop's admitted return remains active. No declaration is
             # reasserted; GUI intervention/withdrawal still wins permanently.
             self.controller.submit("heartbeat", now_sec=now)

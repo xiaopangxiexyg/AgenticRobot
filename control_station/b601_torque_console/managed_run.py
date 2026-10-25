@@ -155,7 +155,8 @@ def launch(args):
         check_revision(args.expected_revision)
         with (run/'management.log').open('x') as log:
             process = subprocess.Popen(command, cwd=ROOT, stdin=subprocess.DEVNULL,
-                stdout=log, stderr=subprocess.STDOUT, start_new_session=True, pass_fds=(lock.fileno(),))
+                stdout=log, stderr=subprocess.STDOUT, start_new_session=True, pass_fds=(lock.fileno(),),
+                env={**os.environ, 'PYTHONUNBUFFERED': '1'})
         receipt = {'pid': process.pid, 'start_ticks': process_start(process.pid), 'command': command,
                    'revision': args.expected_revision, 'run_directory': str(run)}
         _write_new(run/'process.json', receipt)
@@ -213,11 +214,18 @@ def inspect(run):
 def console_state(run, process):
     # Only the exact run's local child endpoint is eligible. Never send a
     # second SIGINT or infer permission to disable from a stale PID.
-    log = (run/'management.log').read_text()
-    urls = re.findall(r'http://127\.0\.0\.1:[0-9]+', log)
+    # The detached launcher's stdout may still be buffered in an older run.
+    # The child's own flushed runtime log is the canonical endpoint record.
+    logs = list((run/'owner').glob('b601-owner-*/b601_owner.log'))
+    if not logs:
+        logs = [run/'management.log']
+    urls = {url for path in logs for url in
+            re.findall(r'http://127\.0\.0\.1:[0-9]+', path.read_text())}
     if not urls:
         raise ValueError('owner console endpoint is not available yet')
-    url = urls[-1]
+    if len(urls) != 1:
+        raise ValueError('ambiguous owner console endpoints in this run')
+    url = urls.pop()
     with urlopen(url+'/api/status?view=operator', timeout=2) as response:
         status = json.load(response)
     owner_pid = status.get('owner_pid')

@@ -125,6 +125,17 @@ def test_managed_preparation_timeout_requests_only_existing_protective_hold():
     assert manager.tick(now_sec=1.5, owner_active=True) is None
 
 
+def test_final_readiness_is_recorded_even_between_periodic_management_ticks():
+    controller = SimpleNamespace(workspace_configuration=SimpleNamespace(coordinated_holding=True, prepare_timeout_sec=1),
+        config=SimpleNamespace(prepare_timeout_sec=1), submit=lambda *a, **k: None,
+        automatic_disable_ready=True)
+    manager = B601ManagedCycle(controller, now_sec=1)
+    manager.start_count = 1
+    manager.phase = 'running'
+    assert manager.tick(now_sec=1.001, owner_active=True) is None
+    assert manager.result_record()['phase'] == 'origin_confirmed'
+
+
 def test_managed_assessment_separates_cleanup_acquisition_and_model_readiness():
     payload = {'status': 'COMPLETED_WITH_WARNINGS', 'cycle_disable_confirmation': {'confirmed': True},
         'automatic_calibration': {'state': 'failed', 'reason': 'leg_timeout', 'outcome': {'action': 'retain_partial_data_stop_acquisition'},
