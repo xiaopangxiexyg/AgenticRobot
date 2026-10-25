@@ -42,6 +42,7 @@ def test_preflight_preserves_goal_policy_and_hold(monkeypatch, policy, goal_x, c
     lifecycle.motion_profile = SimpleNamespace(translation_tolerance_m=.01, rotation_tolerance_rad=.09)
     lifecycle._lower_operation_id = "test:operation"
     lifecycle._contact_binding = None
+    lifecycle._observed_planning_provider = None
     lifecycle._path_search_time_budget_sec = 3.
 
     def plan(target, **kwargs):

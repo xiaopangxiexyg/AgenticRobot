@@ -692,13 +692,15 @@ def test_required_control_subscriber_failure_is_not_silently_dropped() -> None:
 
 
 def test_virtual_policy_long_run_emits_each_timed_keyframe_once_without_lookahead() -> None:
-    runtime = _runtime()
+    clock = [100.0]
+    runtime = PolicyDeployRuntime(_runtime().config, monotonic_clock=lambda: clock[0])
     emission_adapter = _pipeline().action_adapter
     frontend = RtcPolicyShadowFrontend(
         config=_config(),
         deploy_runtime=runtime,
         policy=_ChunkPolicy(),
-        created_at=time.monotonic(),
+        created_at=clock[0],
+        clock=lambda: clock[0],
         emission_adapter=emission_adapter,
     )
     frontend.start()
@@ -709,6 +711,9 @@ def test_virtual_policy_long_run_emits_each_timed_keyframe_once_without_lookahea
     try:
         for step_index in range(240):
             now = base + step_index / 30.0
+            # Keep worker admission and virtual ticks in one clock domain.
+            # Control duration still uses the real perf_counter in step().
+            clock[0] = now
             step = frontend.step(
                 _observation(timestamp=100.0 + step_index / 30.0, step_index=step_index),
                 now=now,
