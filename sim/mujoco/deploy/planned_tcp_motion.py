@@ -21,6 +21,7 @@ import numpy as np
 
 from dataset_contracts.canonical_encoding import canonical_content_hash
 from robot_motion.action import RobotAction
+from robot_motion.observed_planning import ObservedJointPlanningInput
 from robot_motion.path_planning import (
     JointConfigurationCheck,
     JointPathPlannerConfig,
@@ -64,6 +65,31 @@ class MujocoTcpPlanRejected(RuntimeError):
 ConfigurationConstraint = Callable[
     [np.ndarray, Mapping[str, np.ndarray]], JointConfigurationCheck
 ]
+
+
+class _ObservedPlanningOracle:
+    """Keep the same constraint/search contract without a native scene oracle."""
+
+    def __init__(self, source, model_qpos, *, constraint, constraint_identity, cancel_requested):
+        if (constraint is None) != (constraint_identity is None):
+            raise ValueError("Configuration constraint and identity must be bound together.")
+        self.source = source
+        self.model_qpos = model_qpos
+        self.constraint = constraint
+        self.cancel_requested = cancel_requested
+        self.scene_hash = canonical_content_hash(
+            {"observed_scene": source.oracle.scene_hash, "constraint": constraint_identity},
+            domain="dexteleop.mujoco.observed_planning_query.v1")
+
+    def check(self, pair):
+        if self.cancel_requested():
+            raise MujocoTcpPlanRejected("safe_tcp_planning_cancelled")
+        check = self.source.oracle.check(pair)
+        if check.safe and self.constraint is not None:
+            constrained = self.constraint(self.model_qpos, pair)
+            if not constrained.safe:
+                return constrained
+        return check
 
 
 # Preserve the historical private import as the same canonical policy type.
@@ -203,6 +229,7 @@ class MujocoTcpMotionPlan:
     # The lower cursor owns stage changes and their original contact policy.
     stages: tuple[tuple[int, MujocoTcpMotionPlan], ...] = ()
     endpoint_search_diagnostics: Mapping[str, Any] | None = None
+    observed_planning_input: ObservedJointPlanningInput | None = None
 
 
 # Bound fixed-rate materialization before allocating a native grid.
@@ -495,6 +522,7 @@ class MujocoPlannedTcpMotion:
         payload_binding: MujocoPayloadBinding | None = None,
         preview_model_qpos: np.ndarray | None = None,
         speed_scale: float = 1.0,
+        observed_planning_input: ObservedJointPlanningInput | None = None,
     ) -> MujocoTcpMotionPlan:
         """Plan without dispatch; a payload preview retains its binding's cut.
 
@@ -504,6 +532,11 @@ class MujocoPlannedTcpMotion:
         not a bypass of source validation or a new grasp anchor.
         """
         side = self.motion_side
+        if observed_planning_input is not None:
+            if not isinstance(observed_planning_input, ObservedJointPlanningInput):
+                raise TypeError("observed_planning_input must be a measured observed-scene cut.")
+            if any(value is not None for value in (contact_binding, payload_binding, preview_model_qpos)):
+                raise ValueError("Observed ordinary TCP planning cannot use native contact/payload/preview state.")
         if payload_binding is not None:
             if not isinstance(payload_binding, MujocoPayloadBinding):
                 raise TypeError("payload_binding must be a measured MujocoPayloadBinding.")
@@ -530,7 +563,25 @@ class MujocoPlannedTcpMotion:
                     self._pending_plan = None
                 if cancel_requested():
                     raise MujocoTcpPlanRejected("safe_tcp_planning_cancelled")
-                if payload_binding is not None:
+                source_model_qpos = None
+                if observed_planning_input is not None:
+                    addresses = {
+                        arm: np.asarray([self.scene.joint_qpos_addr(name)
+                            for name in self.scene.arm_specs[arm].joint_names], dtype=int)
+                        for arm in ("left", "right")
+                    }
+                    measured_pair = _scene.arm_qpos_by_side()
+                    try:
+                        observed_planning_input.require_current(measured_pair)
+                    except ValueError as error:
+                        raise MujocoTcpPlanRejected(str(error)) from error
+                    # Retain the opaque native cut for original lifecycle
+                    # diagnostics; only nominal scratch and measured arms enter FK.
+                    source_model_qpos = self._model_qpos()
+                    model_qpos = np.asarray(self.scene.model.qpos0, dtype=float).copy()
+                    for arm, indices in addresses.items():
+                        model_qpos[indices] = measured_pair[arm]
+                elif payload_binding is not None:
                     # Search is a frozen query; activation and every dispatch
                     # separately validate the current measured relation/geometry.
                     model_qpos = np.asarray(
@@ -567,19 +618,25 @@ class MujocoPlannedTcpMotion:
                 # Keep an explicit planning reserve for the physical gripper's
                 # small joint/servo motion. Live admission keeps the original
                 # scene margin; no collision threshold is reduced or bypassed.
-                oracle = MujocoJointSceneOracle(
-                    self.scene,
-                    model_qpos,
-                    clearance_padding_m=self.planning_clearance_padding_m,
-                    configuration_constraint=configuration_constraint,
-                    constraint_identity=constraint_identity,
-                    cancel_requested=cancel_requested,
-                    contact_binding=contact_binding,
-                    payload_binding=payload_binding,
-                )
+                if observed_planning_input is None:
+                    oracle = MujocoJointSceneOracle(
+                        self.scene,
+                        model_qpos,
+                        clearance_padding_m=self.planning_clearance_padding_m,
+                        configuration_constraint=configuration_constraint,
+                        constraint_identity=constraint_identity,
+                        cancel_requested=cancel_requested,
+                        contact_binding=contact_binding,
+                        payload_binding=payload_binding,
+                    )
+                    addresses = oracle.addresses
+                else:
+                    oracle = _ObservedPlanningOracle(observed_planning_input, model_qpos,
+                        constraint=configuration_constraint, constraint_identity=constraint_identity,
+                        cancel_requested=cancel_requested)
                 start = {
                     side: model_qpos[address].copy()
-                    for side, address in oracle.addresses.items()
+                    for side, address in addresses.items()
                 }
                 initial = oracle.check(start)
                 if not initial.safe:
@@ -656,6 +713,8 @@ class MujocoPlannedTcpMotion:
                         "position_error_m": position_error, "rotation_error_rad": angle,
                         "collision_and_constraint_safe": safe,
                         "proximal_travel_within_limit": compact,
+                        **({"collision_check": endpoint_check.to_dict()}
+                           if observed_planning_input is not None else {}),
                     })
                     if safe and compact and not any(
                         np.max(np.abs(other[side] - pair[side])) < 0.001 for other in targets
@@ -869,7 +928,10 @@ class MujocoPlannedTcpMotion:
                     raise MujocoTcpPlanRejected("safe_tcp_motion_quality_exceeded", {"motion_quality": quality})
                 path = replace(path, metadata={**dict(path.metadata), "motion_quality": quality,
                     "motion_quality_limits": quality_limits.to_dict(), "endpoint_attempts": endpoint_attempts,
-                    "quality_rejected_paths": rejected_paths})
+                    "quality_rejected_paths": rejected_paths,
+                    **({"planning_scene_source": "calibrated_rgbd_and_measured_joints",
+                        "observed_scene_hash": observed_planning_input.oracle.scene_hash}
+                       if observed_planning_input is not None else {})})
                 identity = canonical_content_hash(
                     {
                         "path": path.semantic_content_hash,
@@ -879,10 +941,19 @@ class MujocoPlannedTcpMotion:
                     domain="dexteleop.mujoco.safe_tcp_joint_trajectory.v1",
                 )
                 model_qpos.setflags(write=False)
+                retained_source = model_qpos if source_model_qpos is None else source_model_qpos
+                retained_source.setflags(write=False)
+                if observed_planning_input is not None:
+                    try:
+                        observed_planning_input.require_current(_scene.arm_qpos_by_side())
+                    except ValueError as error:
+                        raise MujocoTcpPlanRejected(str(error)) from error
+                    if cancel_requested():
+                        raise MujocoTcpPlanRejected("safe_tcp_planning_cancelled")
                 plan = MujocoTcpMotionPlan(
                     path,
                     trajectory,
-                    model_qpos,
+                    retained_source,
                     tuple(poses),
                     identity,
                     configuration_constraint,
@@ -893,6 +964,7 @@ class MujocoPlannedTcpMotion:
                         **endpoint_search_diagnostics,
                         "attempts": tuple(MappingProxyType(row) for row in ik_seed_attempts),
                     }),
+                    observed_planning_input=observed_planning_input,
                 )
                 if not preview:
                     self._pending_plan = plan
@@ -1077,6 +1149,8 @@ class MujocoPlannedTcpMotion:
         with self._lock:
             if self._active is not None or self._pending_plan is not original:
                 raise MujocoTcpPlanRejected("safe_tcp_plan_not_owned_by_runtime")
+            if original.observed_planning_input is not None:
+                raise MujocoTcpPlanRejected("safe_tcp_observed_chain_refinement_unsupported")
             if not np.array_equal(original.source_model_qpos, self._model_qpos()):
                 raise MujocoTcpPlanRejected("safe_tcp_scene_changed_during_planning")
             checked_at = check_request()
@@ -1160,6 +1234,11 @@ class MujocoPlannedTcpMotion:
             if plan is not self._pending_plan:
                 raise MujocoTcpPlanRejected("safe_tcp_plan_not_owned_by_runtime")
             live = self.rig.capture_scene(lambda scene: scene.arm_qpos_by_side())
+            if plan.observed_planning_input is not None:
+                try:
+                    plan.observed_planning_input.require_current(live)
+                except ValueError as error:
+                    raise MujocoTcpPlanRejected(str(error)) from error
             if any(
                 not np.allclose(
                     live[side],
@@ -1175,6 +1254,11 @@ class MujocoPlannedTcpMotion:
             # Validate at the consumption boundary, after scene/planner lock
             # wait and oracle construction. No caller/app callback may acquire
             # another owner here; the injected clock is a read-only time port.
+            if plan.observed_planning_input is not None:
+                try:
+                    plan.observed_planning_input.require_current(self.scene.arm_qpos_by_side())
+                except ValueError as error:
+                    raise MujocoTcpPlanRejected(str(error)) from error
             if deadline_at is not None:
                 timestamp = float(clock())
                 if not math.isfinite(timestamp) or timestamp >= deadline_at:

@@ -172,7 +172,8 @@ def test_rgbd_cut_is_one_atomic_scene_copy_and_reuses_depth_renderer_cache():
     source = MujocoDepthSnapshotSource(capture_scene=capture, clock=lambda: 12.5, renderer_factory=factory)
     try:
         cut = source.capture_rgbd_cut(view_ids=("front", "wrist"), require_capture_state=lambda: guards.append(True))
-        assert len(cuts) == len(guards) == 1
+        assert len(cuts) == 1
+        assert len(guards) >= len(cut.views) and all(guards)
         assert cut.simulation_time_sec == 1.5 and cut.captured_at == 12.5
         assert [v.view_id for v in cut.views] == ["front", "wrist"]
         np.testing.assert_array_equal(cut.model_qpos, np.arange(12))

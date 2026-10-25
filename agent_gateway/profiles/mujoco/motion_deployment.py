@@ -81,6 +81,11 @@ from agent_gateway.skills.motion.schemas import (
     validate_agent_motion_parameters_v1,
     validate_agent_motion_route_schema_v1,
 )
+from agent_gateway.skills.motion.observed_point import (
+    SKILL_ID as OBSERVED_POINT_SKILL_ID, observed_point_definition, observed_point_schema,
+    validate_observed_point_parameters, validate_observed_point_report,
+)
+
 from collection_runtime.source_observation_history import (
     SOURCE_OBSERVATION_HISTORY_SAMPLING_POLICIES_V1,
     SourceObservationHistoryBinding,
@@ -136,6 +141,7 @@ from .rgb_deployment import (
 from .state_deployment import MujocoPassiveTcpPoseStateDeploymentBinding
 from .visual_observation import mujoco_rgb_role_for_source
 
+MUJOCO_OBSERVED_POINT_ROUTE_ID = "sim.mujoco.agent_observed_point_safe"
 MUJOCO_AGENT_SAFE_TCP_POSE_ROUTE_ID_V1 = "sim.mujoco.motion.move_tcp_to_pose_safe.v1"
 MUJOCO_AGENT_SAFE_TCP_POSE_EXECUTOR_ID_V1 = "mujoco-agent-safe-tcp-pose-executor-v1"
 MUJOCO_AGENT_GRASP_APPROACH_ROUTE_ID_V1 = "sim.mujoco.motion.approach_grasp_pose.v1"
@@ -751,6 +757,7 @@ class MujocoAgentTcpPoseContractBundle:
     grasp_contact_contract: MujocoAgentSafeTcpPoseContract | None = None
     object_motion_contract: MujocoAgentSafeTcpPoseContract | None = None
     fast_grasp_contract: Any | None = None
+    observed_point_contract: MujocoAgentSafeTcpPoseContract | None = None
 
     def __post_init__(self) -> None:
         validate_skill_route_catalog_closure(
@@ -793,6 +800,7 @@ class MujocoAgentTcpPoseContractBundle:
                 raise ValueError("Composed gripper Route changed.")
         for skill_id, safe in (
             ("motion.move_tcp_to_pose_safe", self.safe_tcp_pose_contract),
+            (OBSERVED_POINT_SKILL_ID, self.observed_point_contract),
             ("motion.approach_grasp_pose", self.grasp_approach_contract),
             ("motion.approach_grasp_contact", self.grasp_contact_contract),
             (GRASPED_OBJECT_MOVE_SKILL_ID, self.object_motion_contract),
@@ -1331,6 +1339,9 @@ def _motion_validators(
     }
 
     def validate_parameters(payload: Mapping[str, Any]) -> None:
+        if route.skill_id == OBSERVED_POINT_SKILL_ID:
+            validate_observed_point_parameters(payload, component_id=profile.component_id)
+            return
         if object_id is not None:
             validate_grasped_object_move(payload, profile=profile, object_id=object_id)
             return
@@ -1369,6 +1380,8 @@ def _motion_validators(
 
     def validate_execution_result(payload: Mapping[str, Any]) -> None:
         required = {"execution_receipt_refs", "final_measured_state_hash"}
+        if route.skill_id == OBSERVED_POINT_SKILL_ID:
+            required.add("observed_point_report")
         if object_id is not None:
             required.add("object_state")
         optional = {"pose_goal_report"} if route.skill_id == "motion.move_tcp_to_pose_safe" else set()
@@ -1376,6 +1389,8 @@ def _motion_validators(
             raise ValueError("TCP pose execution result schema mismatch.")
         if "pose_goal_report" in payload:
             validate_safe_tcp_pose_goal_report_v1(payload["pose_goal_report"])
+        if route.skill_id == OBSERVED_POINT_SKILL_ID:
+            validate_observed_point_report(payload["observed_point_report"], reference_frame_id=profile.reference_frame_id)
         if object_id is not None:
             validate_object_motion_state(payload["object_state"], profile=profile,
                 object_id=object_id, observation_source="mujoco_native_physics",
@@ -1413,6 +1428,11 @@ def _motion_validators(
     def validate_execution_result_for_parameters(parameters, result):
         validate_parameters(parameters)
         validate_execution_result(result)
+        if route.skill_id == OBSERVED_POINT_SKILL_ID:
+            report = result["observed_point_report"]
+            if any(report[key] != parameters[key] for key in ("observation_operation_id", "point_index")):
+                raise ValueError("Observed-point result does not match the requested reference.")
+            return
         if result["object_state"]["phase"] != parameters["phase"]:
             raise ValueError("Object terminal phase differs from the admitted request phase.")
 
@@ -1431,7 +1451,7 @@ def _motion_validators(
         validate_parameters=validate_parameters,
         validate_execution_result=validate_execution_result,
         validate_execution_result_for_parameters=(
-            validate_execution_result_for_parameters if object_id is not None else None),
+            validate_execution_result_for_parameters if object_id is not None or route.skill_id == OBSERVED_POINT_SKILL_ID else None),
         validate_task_evaluation=validate_task_evaluation,
     )
 
@@ -1856,6 +1876,8 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
     segmentation_model_profile_hash: str | None = None,
     segmentation_inference_implementation_hash: str | None = None,
     enable_safe_tcp_pose: bool = False,
+    safe_motion_observation_profile_hash: str | None = None,
+    enable_observed_point_motion: bool = False,
     enable_spatial_goals: bool = False,
     enable_tcp_pose_comparison: bool = False,
     enable_object_state: bool = False,
@@ -1873,6 +1895,11 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
         raise TypeError("history_profile must be typed or None.")
     if not isinstance(enable_artifact_perception, bool):
         raise TypeError("enable_artifact_perception must be boolean.")
+    if type(enable_observed_point_motion) is not bool:
+        raise TypeError("enable_observed_point_motion must be boolean.")
+    if enable_observed_point_motion and (not enable_safe_tcp_pose or not enable_artifact_perception
+                                         or safe_motion_observation_profile_hash is None):
+        raise ValueError("Observed-point motion requires sensor-backed safe motion and original RGB-D perception.")
     segmentation_identity = (
         segmentation_model_profile_id,
         segmentation_model_profile_hash,
@@ -1886,6 +1913,13 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
         raise ValueError("MuJoCo segmentation requires Artifact perception.")
     if not isinstance(enable_safe_tcp_pose, bool):
         raise TypeError("enable_safe_tcp_pose must be boolean.")
+    if safe_motion_observation_profile_hash is not None:
+        if (not isinstance(safe_motion_observation_profile_hash, str)
+                or len(safe_motion_observation_profile_hash) != 64
+                or any(c not in "0123456789abcdef" for c in safe_motion_observation_profile_hash)):
+            raise ValueError("Observed safe motion requires an exact observation profile SHA-256.")
+        if not enable_safe_tcp_pose or not enable_artifact_perception:
+            raise ValueError("Observed safe motion requires the safe Route and RGB-D resources.")
     if not isinstance(enable_spatial_goals, bool):
         raise TypeError("enable_spatial_goals must be boolean.")
     if not isinstance(enable_tcp_pose_comparison, bool):
@@ -2477,7 +2511,8 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
         path_search_time_budget_sec=3.0,
         contact_binding=None,
     ):
-        motion_schema = (grasped_object_move_schema(
+        motion_schema = (observed_point_schema(definition=motion_definition, profile=motion_profile)
+            if motion_definition.skill_id == OBSERVED_POINT_SKILL_ID else grasped_object_move_schema(
             definition=motion_definition, profile=motion_profile,
             object_id=grasp_contact_binding.target_body_name,
             observation_source="mujoco_native_physics",
@@ -2547,7 +2582,7 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
         return motion_definition, motion_schema, motion_route, motion_contract
 
     planned_motions = []
-    safe_contract = grasp_contract = contact_contract = object_contract = None
+    safe_contract = grasp_contract = contact_contract = object_contract = observed_point_contract = None
     if enable_safe_tcp_pose:
         item = planned_motion_contract(
             safe_tcp_pose_target_skill_definition_v1(
@@ -2555,7 +2590,8 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
             ),
             replace(
                 profile,
-                profile_id="mujoco.agent_safe_tcp_pose.v1",
+                profile_id=("mujoco.agent_safe_tcp_pose.v1" if safe_motion_observation_profile_hash is None
+                    else "mujoco.agent_safe_tcp_pose.rgbd." + safe_motion_observation_profile_hash),
                 max_control_cycles=300,
             ),
             route_id=MUJOCO_AGENT_SAFE_TCP_POSE_ROUTE_ID_V1,
@@ -2564,6 +2600,15 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
             duration_ms=30_000,
         )
         safe_contract = item[3]
+        planned_motions.append(item)
+    if enable_observed_point_motion:
+        item = planned_motion_contract(
+            observed_point_definition(controlled_component_ids=(component,)),
+            safe_contract.motion_profile,
+            route_id=MUJOCO_OBSERVED_POINT_ROUTE_ID,
+            executor_id="mujoco-observed-point-safe-v1",
+            binding_prefix="sim.mujoco.agent_observed_point:", duration_ms=30_000)
+        observed_point_contract = item[3]
         planned_motions.append(item)
     if enable_grasp_approach:
         item = planned_motion_contract(
@@ -3615,6 +3660,7 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
         station_manifest=station,
         execution_manifest=execution,
         safe_tcp_pose_contract=safe_contract,
+        observed_point_contract=observed_point_contract,
         spatial_goal_registration=spatial_goal_registration,
         tcp_pose_comparison_registration=tcp_pose_comparison_registration,
         object_state_registration=object_state_registration,

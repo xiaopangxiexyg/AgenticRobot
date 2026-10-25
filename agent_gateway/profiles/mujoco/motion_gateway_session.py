@@ -117,6 +117,7 @@ from .motion_skill import (
     MujocoAgentTcpPoseSkillLifecycle,
     mujoco_agent_skill_hold_evidence_from_transition,
 )
+from .motion_observed_scene import MujocoObservedSafeMotionConfig, MujocoObservedSafeMotionProvider
 from .observation import MujocoAgentObservationProducer
 from .observation_binding import (
     build_mujoco_agent_motion_observation_source_binding,
@@ -197,6 +198,7 @@ class MujocoAgentTcpPoseGatewaySession:
     _fast_grasp_model_closed: bool = field(default=False, init=False, repr=False)
     _fast_grasp_segmenter_closed: bool = field(default=False, init=False, repr=False)
     _fast_grasp_start_failed: bool = field(default=False, init=False, repr=False)
+    observed_point_executor: ReusableStationAgentSkillOperationExecutor | None = None
     _close_lock: threading.Lock = field(
         default_factory=threading.Lock,
         init=False,
@@ -510,6 +512,7 @@ class MujocoAgentTcpPoseGatewaySession:
             *((self.grasp_contact_executor,) if self.grasp_contact_executor is not None else ()),
             *((self.object_motion_executor,) if self.object_motion_executor is not None else ()),
             *((self.execute_grasp_plan_executor,) if self.execute_grasp_plan_executor is not None else ()),
+            *((self.observed_point_executor,) if self.observed_point_executor is not None else ()),
             self.cardinal_step_executor,
             *tuple(
                 self.fixed_cardinal_step_executors[skill_id]
@@ -763,6 +766,7 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
     segmentation_localizer: object | None = None,
     gripper_ports: Mapping[str, MujocoGripperControlPort] | None = None,
     fast_grasp_planner: Any | None = None,
+    safe_motion_observation: MujocoObservedSafeMotionConfig | None = None,
 ) -> MujocoAgentTcpPoseGatewaySession:
     """Wire exact Routes without starting the application or history recorder."""
 
@@ -770,6 +774,21 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
         raise TypeError("application must be a motion application.")
     if not isinstance(contract_bundle, MujocoAgentTcpPoseContractBundle):
         raise TypeError("contract_bundle must be typed.")
+    if safe_motion_observation is not None:
+        if not isinstance(safe_motion_observation, MujocoObservedSafeMotionConfig):
+            raise TypeError("safe_motion_observation must be MujocoObservedSafeMotionConfig.")
+        if application.runtime.rig.config.realtime_worker is not False:
+            raise ValueError("Observed safe motion requires the deterministic physics owner.")
+    observation_hash = (None if safe_motion_observation is None else
+        safe_motion_observation.bound_profile_hash(
+            minimum_clearance_m=application.scene.scene_spec.collision.safety_minimum_clearance_m,
+            planning_clearance_padding_m=application.target.planned_tcp_motion.planning_clearance_padding_m))
+    safe_contract = contract_bundle.safe_tcp_pose_contract
+    expected_profile_id = None if safe_contract is None else safe_contract.motion_profile.profile_id
+    if ((observation_hash is not None and expected_profile_id != "mujoco.agent_safe_tcp_pose.rgbd." + observation_hash)
+            or (observation_hash is None and expected_profile_id is not None
+                and expected_profile_id.startswith("mujoco.agent_safe_tcp_pose.rgbd."))):
+        raise ValueError("Observed planning configuration must match the admitted safe Route.")
     gripper_ports = dict(gripper_ports or {})
     if (
         contract_bundle.grasp_contact_contract is not None
@@ -1649,23 +1668,23 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
         state_entry.route.semantic_content_hash: state_executor,
     }
     tcp_pose_comparison_executor = None
+    def lookup_retained_operation(operation_id):
+        # The service owns retention and eviction for both state and motion references.
+        source_request = service.operation_store.request_for_operation(operation_id)
+        source_operation = service.operation_store.get(operation_id)
+        if source_request is None or source_operation is None:
+            return None
+        return source_request, source_operation
+
     if contract_bundle.tcp_pose_comparison_registration is not None:
         from agent_gateway.profiles.tcp_pose_comparison import (
             build_tcp_pose_comparison_executor,
         )
 
-        def lookup_comparison_target(operation_id):
-            # The service owns this bounded store; never scan or copy history.
-            source_request = service.operation_store.request_for_operation(operation_id)
-            source_operation = service.operation_store.get(operation_id)
-            if source_request is None or source_operation is None:
-                return None
-            return source_request, source_operation
-
         registration = contract_bundle.tcp_pose_comparison_registration
         tcp_pose_comparison_executor = build_tcp_pose_comparison_executor(
             registration=registration, capture_state=capture_tcp_pose,
-            lookup_target=lookup_comparison_target,
+            lookup_target=lookup_retained_operation,
             route_manifest=contract_bundle.route_manifest,
             payload_validators=contract_bundle.payload_validators,
             clock_domain_id=runtime.config.clock_domain_id,
@@ -1701,8 +1720,20 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
             clock=runtime_clock, max_retained_operations=retention,
         )
         execution_port_by_route_hash[registration.entry.route.semantic_content_hash] = spatial_goal_executor
+    observed_planning_provider = None
+    if safe_motion_observation is not None:
+        if back_projection_capture_port is None or safe_contract is None:
+            raise ValueError("Observed safe motion requires original RGB-D and safe-motion contracts.")
+        observed_planning_provider = MujocoObservedSafeMotionProvider(
+            config=safe_motion_observation, capture_port=back_projection_capture_port,
+            rig=application.runtime.rig, profile=safe_contract.motion_profile,
+            current_station_revision=lambda: observation_producer.current_station_revision,
+            clock=runtime_clock,
+            source_binding_hash=back_projection_registration.profile.semantic_content_hash,
+            planning_clearance_padding_m=application.target.planned_tcp_motion.planning_clearance_padding_m)
     planned_executors = {}
     for skill_id, label, safe_contract in (
+        ("motion.move_to_observed_point", "observed-point-safe", contract_bundle.observed_point_contract),
         (
             "motion.move_tcp_to_pose_safe",
             "safe-tcp-pose",
@@ -1734,6 +1765,16 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
         ):
             lifecycle = MujocoAgentSafeTcpPoseSkillLifecycle
             extra = {}
+            if _route.skill_id == "motion.move_tcp_to_pose_safe":
+                extra["observed_planning_provider"] = observed_planning_provider
+            if _route.skill_id == "motion.move_to_observed_point":
+                from .observed_point_motion import MujocoObservedPointMotionLifecycle
+
+                lifecycle = MujocoObservedPointMotionLifecycle
+                extra.update(observed_planning_provider=observed_planning_provider,
+                    lookup_observation=lookup_retained_operation,
+                    route_manifest=contract_bundle.route_manifest,
+                    payload_validators=contract_bundle.payload_validators)
             if _route.skill_id == "motion.move_grasped_object_to_pose":
                 from .object_motion import MujocoAgentObjectMotionLifecycle
 
@@ -2016,6 +2057,7 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
         hardware_view_provider=hardware_view_provider,
         service=service,
         safe_tcp_pose_executor=planned_executors.get("motion.move_tcp_to_pose_safe"),
+        observed_point_executor=planned_executors.get("motion.move_to_observed_point"),
         grasp_approach_executor=planned_executors.get("motion.approach_grasp_pose"),
         grasp_contact_executor=planned_executors.get("motion.approach_grasp_contact"),
         object_motion_executor=planned_executors.get("motion.move_grasped_object_to_pose"),

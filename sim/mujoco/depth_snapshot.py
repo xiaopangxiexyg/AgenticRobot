@@ -299,6 +299,7 @@ class MujocoDepthSnapshotSource:
                 raise ValueError("Unknown native RGB-D view.")
             views = []
             for view_id in view_ids:
+                require_capture_state()
                 meta = metadata[view_id]
                 width, height = int(meta["width"]), int(meta["height"])
                 if not 0 < width * height <= 1920 * 1080 or width <= 0 or height <= 0:
@@ -331,6 +332,7 @@ class MujocoDepthSnapshotSource:
                         },
                     )
                 )
+            require_capture_state()
             if (
                 not np.array_equal(qpos, scene.data.qpos)
                 or not np.array_equal(qvel, scene.data.qvel)

@@ -7,7 +7,7 @@ hardware authority.
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from copy import copy, deepcopy
 from dataclasses import dataclass, replace
 from functools import lru_cache
@@ -896,7 +896,10 @@ class RM65ObstacleCollisionOracle:
 
 
 @lru_cache(maxsize=2)
-def _profile_collision_solver_bundle(scene_profile: str):
+def _profile_collision_solver_bundle(
+    scene_profile: str, model_content_hash: str | None = None,
+    validate_model_resources: Callable[[], None] | None = None,
+):
     """Load one immutable source model for independent obstacle oracles."""
 
     from .ik import (
@@ -904,9 +907,16 @@ def _profile_collision_solver_bundle(scene_profile: str):
         build_rm65_dual_arm_collision_ik_solver,
     )
 
-    return build_rm65_dual_arm_collision_ik_solver(
+    if validate_model_resources is not None:
+        validate_model_resources()
+    bundle = build_rm65_dual_arm_collision_ik_solver(
         RM65DualArmCollisionIKConfig(scene_profile=scene_profile)
     )
+    # An exception here must escape the cached function, before lru_cache can
+    # publish a model built while its verified resources were changing.
+    if validate_model_resources is not None:
+        validate_model_resources()
+    return bundle
 
 
 def build_rm65_profile_obstacle_collision_oracle(
@@ -918,10 +928,28 @@ def build_rm65_profile_obstacle_collision_oracle(
     attached_box_proxies: Sequence[AttachedBoxCollisionProxy] = (),
     use_profile_proxy_geometry: bool = False,
     stop_at_first_clearance_violation: bool = False,
+    model_content_hash: str | None = None,
+    validate_model_resources: Callable[[], None] | None = None,
 ) -> RM65ObstacleCollisionOracle:
-    """Build an independent obstacle oracle from an explicit RM65 profile."""
+    """Build an independent obstacle oracle from an explicit RM65 profile.
 
-    bundle = _profile_collision_solver_bundle(str(scene_profile))
+    Verified resource identities require a validator inside the cache miss
+    boundary. Failed materialization cannot publish a model under that identity.
+    """
+
+    if model_content_hash is not None:
+        if (not isinstance(model_content_hash, str) or len(model_content_hash) != 64
+                or any(c not in "0123456789abcdef" for c in model_content_hash)):
+            raise ValueError("model_content_hash must be a verified resource SHA-256.")
+        if not callable(validate_model_resources):
+            raise ValueError("Verified model resources require a validation callback.")
+        validate_model_resources()
+        bundle = _profile_collision_solver_bundle(
+            str(scene_profile), model_content_hash, validate_model_resources)
+    else:
+        if validate_model_resources is not None:
+            raise ValueError("Resource validation requires an explicit model content hash.")
+        bundle = _profile_collision_solver_bundle(str(scene_profile))
     return RM65ObstacleCollisionOracle.from_solver(
         bundle.solver,
         scene=scene,

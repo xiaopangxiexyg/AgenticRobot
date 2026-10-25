@@ -11,6 +11,7 @@ import pytest
 
 from robot_motion.action import ExecutionObservationPlan
 from robot_motion.path_planning import JointConfigurationCheck
+from robot_motion.observed_planning import ObservedJointPlanningInput
 from robot_motion.position_control import POSITION_15_60_120_PROFILE
 from sim.mujoco.deploy import agent_skill_target as targets
 from sim.mujoco.deploy import planned_tcp_motion as planning
@@ -35,7 +36,7 @@ def _fixture(monkeypatch, *, motion_side=None):
         ])),
         model=SimpleNamespace(nq=16),
     )
-    calls = SimpleNamespace(oracles=[], checks=[], tools=[], bases=[], projections=[], seeds=[], searches=[],
+    calls = SimpleNamespace(oracles=[], checks=[], tools=[], bases=[], projections=[], seeds=[], searches=[], projection_inputs=[],
                             sweep_modified=False)
 
     def body_pose(name):
@@ -69,6 +70,7 @@ def _fixture(monkeypatch, *, motion_side=None):
         def project(self, *, model_qpos, qpos_by_source, component_ids):
             assert np.asarray(model_qpos).shape == (16,)
             calls.projections.append(component_ids)
+            calls.projection_inputs.append(np.asarray(model_qpos).copy())
             return {
                 component: (
                     *(np.asarray(qpos_by_source[component.removesuffix("_arm")])[:3]
@@ -165,6 +167,140 @@ def _plan(fixture, **kwargs):
         cancel_requested=kwargs.pop("cancel_requested", lambda: False),
         **kwargs,
     )
+
+
+def _observed_input(fixture, *, check=None, clock=lambda: 10.):
+    scene = fixture.rig.scene
+    scene.model.qpos0 = np.zeros(16)
+    scene.arm_specs = {s: SimpleNamespace(joint_names=tuple(s + str(i) for i in range(6)))
+                       for s in ("left", "right")}
+    scene.joint_qpos_addr = lambda name: next(
+        _ADDRESSES[s][i] for s in ("left", "right") for i in range(6) if name == s + str(i))
+    oracle = SimpleNamespace(scene_hash="sensor:rgbd-fixed",
+        check=check or (lambda pair: JointConfigurationCheck(safe=True)))
+    return ObservedJointPlanningInput(oracle, fixture.rig.measured_qpos_by_side(),
+        acquired_at=10., maximum_age_sec=30., maximum_start_drift_rad=.01, clock=clock)
+
+
+@pytest.mark.parametrize("side", ("left", "right"))
+def test_observed_search_does_not_consult_native_objects_but_execution_keeps_native_guard(monkeypatch, side):
+    fixture = _fixture(monkeypatch, motion_side=side)
+    source = _observed_input(fixture)
+    native_plan = fixture.planner.plan
+
+    def observe_planner(*args, **kwargs):
+        # Exclude the helper's measured-TCP target construction; observe the
+        # actual planner FK inputs without replacing its implementation.
+        fixture.calls.projection_inputs.clear()
+        return native_plan(*args, **kwargs)
+
+    monkeypatch.setattr(fixture.planner, "plan", observe_planner)
+    first = _plan(fixture, observed_planning_input=source)
+    assert not fixture.calls.oracles
+    fixture.rig.scene.data.qpos[12:] = [100., 200., 300., 400.]
+    second = _plan(fixture, observed_planning_input=source)
+    assert first.trajectory_hash == second.trajectory_hash
+    assert first.path.semantic_content_hash == second.path.semantic_content_hash
+    assert second.path.metadata["planning_scene_source"] == "calibrated_rgbd_and_measured_joints"
+    # Native lifecycle diagnostics retain the real cut; identical observed
+    # paths above prove these object coordinates were not used for selection.
+    np.testing.assert_array_equal(second.source_model_qpos[12:], [100., 200., 300., 400.])
+    assert fixture.calls.projection_inputs
+    assert all(np.array_equal(q[12:], np.zeros(4)) for q in fixture.calls.projection_inputs)
+    assert not fixture.calls.oracles
+    fixture.planner.activate(second)
+    assert len(fixture.calls.oracles) == 1
+    np.testing.assert_array_equal(fixture.calls.oracles[0].source.qpos[12:], [100., 200., 300., 400.])
+    fixture.calls.sweep_modified = True
+    action = SimpleNamespace(arm_pose_by_side={side: fixture.planner.reference(0)})
+    with pytest.raises(planning.MujocoTcpPlanRejected, match="safe_tcp_live_reference_sweep_blocked"):
+        fixture.planner.resolve(action)
+
+
+@pytest.mark.parametrize("stage", ("before", "after", "activation"))
+def test_observed_scene_age_checked_at_original_plan_and_activation_boundaries(monkeypatch, stage):
+    fixture = _fixture(monkeypatch)
+    now = [10.]
+    def check(pair):
+        if stage == "after":
+            now[0] = 41.
+        return JointConfigurationCheck(safe=True)
+    source = _observed_input(fixture, check=check, clock=lambda: now[0])
+    if stage == "before":
+        now[0] = 41.
+    if stage == "activation":
+        plan = _plan(fixture, observed_planning_input=source)
+        now[0] = 41.
+        call = lambda: fixture.planner.activate(plan)
+    else:
+        call = lambda: _plan(fixture, observed_planning_input=source)
+    with pytest.raises(planning.MujocoTcpPlanRejected, match="observed_planning_scene_stale"):
+        call()
+    assert not fixture.planner.active
+    assert not fixture.calls.oracles
+
+
+def test_observed_activation_rechecks_age_after_native_oracle_construction(monkeypatch):
+    fixture = _fixture(monkeypatch)
+    now = [10.]
+    plan = _plan(fixture, observed_planning_input=_observed_input(fixture, clock=lambda: now[0]))
+    original = fixture.planner._oracle_for_stage
+
+    def cross_age(stage):
+        oracle = original(stage)
+        now[0] = 41.
+        return oracle
+
+    monkeypatch.setattr(fixture.planner, "_oracle_for_stage", cross_age)
+    with pytest.raises(planning.MujocoTcpPlanRejected, match="observed_planning_scene_stale"):
+        fixture.planner.activate(plan)
+    assert not fixture.planner.active and fixture.planner._pending_plan is plan
+    assert len(fixture.calls.oracles) == 1
+
+
+def test_observed_freshness_work_cannot_cross_the_final_activation_deadline(monkeypatch):
+    fixture = _fixture(monkeypatch)
+    deadline_clock, in_consumption = [10.], [False]
+
+    def observation_clock():
+        if in_consumption[0]: deadline_clock[0] = 21.
+        return 10.
+
+    plan = _plan(fixture, observed_planning_input=_observed_input(fixture, clock=observation_clock))
+    original = fixture.planner._oracle_for_stage
+
+    def enter_consumption(stage):
+        oracle = original(stage)
+        in_consumption[0] = True
+        return oracle
+
+    monkeypatch.setattr(fixture.planner, "_oracle_for_stage", enter_consumption)
+    with pytest.raises(planning.MujocoTcpPlanRejected, match="grasp_path_plan_expired"):
+        fixture.planner.activate(plan, deadline_at=20., clock=lambda: deadline_clock[0])
+    assert not fixture.planner.active and fixture.planner._pending_plan is plan
+
+
+def test_observed_plan_cannot_refine_through_a_native_truth_query(monkeypatch):
+    fixture = _fixture(monkeypatch)
+    plan = _plan(fixture, observed_planning_input=_observed_input(fixture))
+    goal = planning.MujocoTcpPlanGoal(plan.reference_poses[-1], .003, .03)
+    with pytest.raises(planning.MujocoTcpPlanRejected, match="observed_chain_refinement_unsupported"):
+        fixture.planner.refine_pending_chain(plan, (goal,), cancel_requested=lambda: False,
+            time_budget_sec=1., deadline_at=20., monotonic=lambda: 10., validate_plan=lambda _: None)
+    assert fixture.planner._pending_plan is plan and not fixture.calls.oracles
+
+
+def test_observed_collision_and_envelope_reject_before_native_query(monkeypatch):
+    fixture = _fixture(monkeypatch)
+    source = _observed_input(fixture, check=lambda pair: JointConfigurationCheck(safe=False, reason="sensor_obstacle"))
+    with pytest.raises(planning.MujocoTcpPlanRejected, match="safe_tcp_start_blocked"):
+        _plan(fixture, observed_planning_input=source)
+    source = _observed_input(fixture)
+    with pytest.raises(planning.MujocoTcpPlanRejected, match="safe_tcp_start_blocked"):
+        _plan(fixture, observed_planning_input=source,
+              configuration_constraint=lambda _model, _pair: JointConfigurationCheck(safe=False),
+              constraint_identity="fixture:envelope")
+    assert not fixture.calls.oracles
 
 
 def _right_contact_binding():

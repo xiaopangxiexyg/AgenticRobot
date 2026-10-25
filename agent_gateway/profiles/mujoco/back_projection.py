@@ -35,8 +35,23 @@ def live_aligned_depth_capture(
         depth = np.load(io.BytesIO(frame.data), allow_pickle=False)
     except (OSError, ValueError) as exc:
         raise RuntimeError("MuJoCo depth frame is not valid NPY.") from exc
+    return live_aligned_depth_capture_from_array(
+        depth, captured_at=frame.captured_at,
+        camera_pose_world_xyz_quat_xyzw=frame.camera_pose_world_xyz_quat_xyzw,
+        intrinsics=frame.intrinsics, source_id=source_id, role=role,
+        station_revision=station_revision, application=application,
+        source_frame_id=source_frame_id, reference_frame_id=reference_frame_id)
+
+
+def live_aligned_depth_capture_from_array(
+    depth, *, captured_at: float, camera_pose_world_xyz_quat_xyzw,
+    intrinsics, source_id: str, role: str, station_revision: int,
+    application: MujocoAgentSkillMotionApplication,
+    source_frame_id: str, reference_frame_id: str,
+) -> LiveAlignedDepthCapture:
+    """Share exact depth/capture identity for encoded and raw native cuts."""
     pose_reference = application.transform_tcp_pose_xyzquat(
-        frame.camera_pose_world_xyz_quat_xyzw,
+        camera_pose_world_xyz_quat_xyzw,
         source_frame_id=source_frame_id,
         target_frame_id=reference_frame_id,
     )
@@ -56,7 +71,7 @@ def live_aligned_depth_capture(
         {
             "source_id": source_id,
             "role": role,
-            "captured_at": frame.captured_at,
+            "captured_at": captured_at,
             "station_revision": station_revision,
             "depth_content_hash": depth_hash,
             "camera_pose_reference_xyz_quat_xyzw": pose_reference,
@@ -66,11 +81,11 @@ def live_aligned_depth_capture(
     return LiveAlignedDepthCapture(
         source_id=source_id,
         role=role,
-        captured_at=frame.captured_at,
+        captured_at=captured_at,
         station_revision=station_revision,
         capture_group_id="mujoco-depth:" + capture_hash,
         depth_content_hash=depth_hash,
-        intrinsics=frame.intrinsics,
+        intrinsics=intrinsics,
         reference_from_camera=xyzquat_to_pose_matrix(pose_reference),
         depth_m=np.asarray(depth, dtype=np.float32),
     )
@@ -168,4 +183,4 @@ class MujocoBackProjectionCapturePort:
         )
 
 
-__all__ = ["MujocoBackProjectionCapturePort", "live_aligned_depth_capture"]
+__all__ = ["MujocoBackProjectionCapturePort", "live_aligned_depth_capture", "live_aligned_depth_capture_from_array"]

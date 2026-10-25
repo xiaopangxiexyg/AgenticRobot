@@ -1039,8 +1039,37 @@ CAD 表面以所选 URDF 引用的完整本地网格及其缩放为准，而不�
 真机 profile 保留原导入入口，并显式传入原有起点关节漂移阈值；30 s 场景时效、
 相机间时差、自体过滤、米制深度、体素覆盖与后续规划/执行检查均不改变。
 复用历史观测不会刷新其时间戳，也不等于该场景已获准用于当前动作。
-此共享几何入口本身不调用 MuJoCo 原生物体状态；MuJoCo 现有 safe planner 的完整场景
-查询仍属原生基线，不能仅凭采用此入口就声称已完成传感器输入的端到端规划验收。
+此共享几何入口本身不调用 MuJoCo 原生物体状态。MuJoCo 默认 safe planner 的完整场景
+查询仍属原生基线；另有显式启用的传感器规划装配，默认行为不切换。
+
+MuJoCo 的 `build_mujoco_agent_tcp_pose_gateway_session()` 可额外传入
+`MujocoObservedSafeMotionConfig`，复用同一 `motion.move_tcp_to_pose_safe@1`、
+规划器、执行 owner、取消、HOLD 和关闭入口。例如在原有 factory 参数之外添加：
+
+```python
+from agent_gateway.profiles.mujoco.motion_observed_scene import MujocoObservedSafeMotionConfig
+from robot_motion.observed_scene import SafeMotionObservationConfig
+
+safe_motion_observation = MujocoObservedSafeMotionConfig(
+    robot_urdf_path=robot_urdf_path,  # Same known assembly as this session.
+    collision_scene_profile="dual_arm_hand_proxy_dmtac_grasp",
+    observation=SafeMotionObservationConfig(roles=("main",)),
+)
+```
+
+此选项要求确定性的既有 physics owner、启用 safe Route、Artifact 感知装配和全部指定
+RGB-D 视角；当前为 factory API，不另增 CLI 或 debug Skill。启动时绑定 URDF、实际
+网格、碰撞对、相机附件、原碰撞余量和观测配置的内容哈希；资源建模期间变化直接拒绝，
+不把未验证模型写进缓存。消费者须重新发现目录及绑定新 safe profile hash。
+一次被动 cut 内关联相机和双臂关节，不推进 physics；投影只使用深度、内参、标定和该次
+关节测量，不读取原生物体位姿、分割标签或原生障碍列表来选择路径，也不启动 GraspGenX。
+已保存的源 profile hash、深度完整内容 hash、采集时间和变换构成观测证据；没有源帧计数
+或独立关节回执时明确为空，不用调用序号补造。
+观测云覆盖全部占用体素，沿用默认 15 mm 自体策略及原有时效/漂移限制；搜索阶段复用
+已有机器人 profile boxes 与 D405 附件几何。它不是原生全部碰撞几何的等价替代，执行前和
+执行中仍保留原独立原生物理 guard 以及严格碰撞和最终输出检查。原生 guard 可以拒绝
+路径，但不参与传感器模式的路径选择。无遮挡移动和可见障碍拒绝应分别验收；这不等于
+抓持、放置或 Agent 理解能力已获验收。物体/表面指代的简洁 Agent 动作封装另行接入。
 同一抓姿的已验证近场 IK 分支组成全局连接目标集合；每轮共享起点树、目标森林、
 碰撞查询缓存和节点/迭代/时间预算，而不是为每个终点重新搜索。搜索范围覆盖全部
 目标后逐轮扩展，最后一轮仍为原关节硬限位；确定性种子为基础种子加轮次。返回
