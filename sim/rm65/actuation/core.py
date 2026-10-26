@@ -402,6 +402,12 @@ class Rm65PositionActuator:
         if not isinstance(raw_delayed, Sequence) or isinstance(raw_delayed, (str, bytes)):
             raise TypeError("initial_state delayed_targets must be a sequence.")
         delayed: list[tuple[float, int, str, int, float, float]] = []
+        # step() processes delayed events at the beginning of the tick, then
+        # increments physics_tick. An event inside the completed interval is
+        # still pending and must survive restoration until the next step.
+        last_processed_time = (
+            None if saved_tick == 0 else (saved_tick - 1) * self.physics_timestep_sec
+        )
         for item in raw_delayed:
             if not isinstance(item, Mapping):
                 raise TypeError("initial_state delayed_targets entries must be mappings.")
@@ -416,7 +422,8 @@ class Rm65PositionActuator:
                 raise ValueError("initial_state delayed_targets entry is malformed.") from exc
             if (
                 not math.isfinite(apply_time)
-                or apply_time < initial_physics_time_sec - 1e-9
+                or apply_time < 0.0
+                or (last_processed_time is not None and apply_time <= last_processed_time + 1e-12)
                 or not isinstance(item_sequence, (int, np.integer))
                 or isinstance(item_sequence, bool)
                 or int(item_sequence) < 0
@@ -429,8 +436,8 @@ class Rm65PositionActuator:
                 or command_velocity < 0.0
             ):
                 raise ValueError(
-                    "initial_state delayed_targets entry is invalid or predates "
-                    "initial_physics_time_sec."
+                    "initial_state delayed_targets entry is invalid or was "
+                    "already due at the last processed physics tick."
                 )
             delayed.append(
                 (

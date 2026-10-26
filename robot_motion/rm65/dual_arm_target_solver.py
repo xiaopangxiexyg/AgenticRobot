@@ -1272,7 +1272,22 @@ class DualArmCollisionAwareRetargeter(Retargeter):
         ik_solver: Any | None = None,
         ik_solver_builder: Callable[..., Any] | None = None,
         scene_profile_builder: Callable[..., Any] | None = None,
+        _checkpoint: Any | None = None,
+        _checkpoint_max_native_bytes: int | None = None,
     ):
+        if _checkpoint is None and _checkpoint_max_native_bytes is not None:
+            raise ValueError("Checkpoint budget requires a checkpoint.")
+        if _checkpoint is not None:
+            if (
+                type(_checkpoint_max_native_bytes) is not int
+                or _checkpoint_max_native_bytes <= 0
+            ):
+                raise ValueError("Checkpoint restore requires a positive native byte budget.")
+            if any(value is not None for value in (
+                left_pose_retargeter, right_pose_retargeter, ik_solver,
+                ik_solver_builder, scene_profile_builder,
+            )):
+                raise ValueError("Checkpoint restore requires the original solver construction.")
         self.config = config
         self.ik_tuning = config.ik_tuning
         assert self.ik_tuning is not None
@@ -1521,6 +1536,13 @@ class DualArmCollisionAwareRetargeter(Retargeter):
         self._candidate_certificate_sequence = 0
         self._ik_shadow_trace_sink: Callable[..., object] | None = None
 
+        if _checkpoint is not None:
+            from .retargeter_checkpoint import restore_constructor_state
+
+            restore_constructor_state(
+                self, _checkpoint, max_native_bytes=_checkpoint_max_native_bytes
+            )
+            return
         self.set_current_qpos_pair(
             left_qpos=config.left_initial_qpos,
             right_qpos=config.right_initial_qpos,

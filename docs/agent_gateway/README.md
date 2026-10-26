@@ -30,6 +30,8 @@ SAM2 + VGN/GraspNet 点击引导 DMTAC M 抓姿 Skill 的 RGB-D、固定相机�
 [`POINT_GRASP.md`](./POINT_GRASP.md)。
 MuJoCo 留存观测点移动和可选观测障碍规划的调用合同、启用方式与边界见
 [`observed_point_motion.zh-CN.md`](./observed_point_motion.zh-CN.md)。
+MuJoCo 可信内存 target 的封存／独立分支、已验证范围与尚未接入的 Gateway／上层恢复，见
+[`mujoco_checkpoint.zh-CN.md`](./mujoco_checkpoint.zh-CN.md)。
 同源RGB-D留存基础可显式启用 `--enable-rgbd-capture-v3 --artifact-root ...`，
 增加默认关闭的 `perception.capture_rgb@3`；原生网格、原始媒体与失败边界见
 [`agent_gateway/README.md`](../../agent_gateway/README.md#entrypoints)。

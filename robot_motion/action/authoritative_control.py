@@ -348,6 +348,7 @@ class AuthoritativeControlRuntime:
         dispatch_owner_token: DispatchOwnerToken | None = None,
         execution_epochs: ExecutionEpochRegistry | None = None,
         clock: Callable[[], float] = time.monotonic,
+        _checkpoint=None,
     ) -> None:
         if not callable(dispatcher) or not callable(backend_hold) or not callable(clock):
             raise TypeError("dispatcher, backend_hold, and clock must be callable.")
@@ -413,6 +414,15 @@ class AuthoritativeControlRuntime:
             embodiment_instance_id=config.embodiment_instance_id,
             clock_domain_id=config.clock_domain.clock_domain_id,
         )
+        if _checkpoint is not None:
+            if any(value is not None for value in (
+                dispatch_owners, dispatch_owner_token, execution_epochs,
+            )):
+                raise ValueError("Checkpoint and initial owner injection are exclusive.")
+            from .authoritative_checkpoint import restore_control_owners
+
+            restore_control_owners(self, _checkpoint)
+            return
         self.coordinator = ControlAdmissionCoordinator(
             config.control_domain_id,
             clock_domain=config.clock_domain,
