@@ -92,7 +92,16 @@ core and MuJoCo adapter used for the 20260721 fit; tests compare those hashes to
 fixed historical values rather than silently reinterpreting the fit against
 the current files.
 
-当前运行时源码绑定为 `artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261025_v24.json`。
+当前运行时源码绑定为 `artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261026_v25.json`。
+V25 冻结 V24，登记显式模型选择、原生抓取观测的私有状态摘要及拒绝诊断的公开边界。
+继承 88 项输入并更新其中 3 项，新增 SAM3 客户端和三个抓取叶子，共 92 项输入、
+89 项 Python 源码；匹配固定提交 `83581f2ac`，直接消费者验收 766 项通过。
+默认 SAM2、进程内 GraspGenX 与 GraspMoE、v5 几何、原规划/碰撞/取消/HOLD 门禁保留。
+完整 oracle 端点检查留在私有诊断，公共查询只过滤这一新增字段，不更改原有公开字段。
+离线几何 benchmark 由固定 Git 与报告绑定，不加入运行时输入，也不授予执行权。
+本批未启动模型服务、设备或训练；不新增模型质量、真机、held-out 或六路并发资格。
+
+历史 V24 为 `artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261025_v24.json`。
 V24 冻结 V23，并补齐 ControlStation 兼容调用方的源码绑定。继承的 86 项输入
 保持 V23 字节，新增兼容入口与 Real factory 两项，共 88 项输入、85 项源码，
 匹配固定提交 `9156ae01d`；对应调用方验收为 125 项通过、零失败。
