@@ -231,7 +231,9 @@ def test_endpoint_rescue_preserves_admission_deadline_and_diagnostics(monkeypatc
         last_solve_converged=False,last_solve_deadline_exceeded=False)
     def check(pair):
         return JointConfigurationCheck(safe=not np.any(pair["right"]),
-            reason="tcp_envelope_blocked" if scenario=="rescued_envelope" else "fixture_collision")
+            reason="tcp_envelope_blocked" if scenario=="rescued_envelope" else "fixture_collision",
+            minimum_distance_m=.0017,
+            metadata={"geom1": "table", "geom2": "sensor", "collision_category": "gripper_environment"})
     monkeypatch.setattr(planning_module,"MujocoJointSceneOracle",lambda *a,**kw:SimpleNamespace(
         addresses={"left":np.arange(6),"right":np.arange(6,12)},check=check))
     monkeypatch.setattr(planning_module,"load_rm65_tool_profile",lambda *a,**kw:None)
@@ -252,3 +254,12 @@ def test_endpoint_rescue_preserves_admission_deadline_and_diagnostics(monkeypatc
         if scenario=="all_miss":
             assert failure.value.details["endpoint_attempts"]==[]
             assert len(diagnostic["attempts"])==9
+        checks = failure.value.details["endpoint_checks"]
+        assert len(checks) == len(failure.value.details["endpoint_attempts"])
+        if scenario in ("rescued_collision", "rescued_envelope", "original_collision"):
+            assert checks and all(not check["safe"] for check in checks)
+            assert all(check["metadata"]["geom2"] == "sensor" for check in checks)
+            assert all(check["minimum_distance_m"] == .0017 for check in checks)
+            # Keep successful path metadata/hash inputs unchanged. Native
+            # collision details are a separate rejection-only field.
+            assert all("collision_check" not in row for row in failure.value.details["endpoint_attempts"])

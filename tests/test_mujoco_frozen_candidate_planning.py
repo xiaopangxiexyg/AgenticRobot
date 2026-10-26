@@ -602,3 +602,27 @@ def test_candidate_query_unexpected_error_clears_a_previous_pending_winner():
         planner.plan_candidates([(0,), (1,)], translation_tolerance_m=.01,
             rotation_tolerance_rad=.1, cancel_requested=lambda: False)
     assert planner._pending_plan is None
+
+
+@pytest.mark.parametrize("with_search", [False, True])
+def test_public_candidate_diagnostics_exclude_new_private_checks_without_mutation(with_search):
+    from copy import deepcopy
+    from agent_gateway.profiles.mujoco.object_goal_query import _candidate_diagnostic
+
+    private = [{"safe": False, "metadata": {"private_native_marker": "operator-only"}}]
+    details = {"endpoint_checks": private, "legacy_note": "retained"}
+    if with_search:
+        details["endpoint_search_diagnostics"] = {
+            "attempts": [{"position_error_m": .01, "rotation_error_rad": .02}],
+            "seed_count": 9, "attempted_seed_count": 1, "deadline_exceeded": False,
+            "translation_tolerance_m": .003, "rotation_tolerance_rad": .02}
+    item = {"reason_code": "safe_tcp_endpoint_search_exhausted", "details": details}
+    before = deepcopy(item)
+    legacy = deepcopy(item)
+    del legacy["details"]["endpoint_checks"]
+    pose = [0., 0., 0., 0., 0., 0., 1.]
+    result = _candidate_diagnostic(item, pose)
+    assert result == _candidate_diagnostic(legacy, pose)
+    assert "endpoint_checks" not in result["details"]
+    assert item == before and item["details"]["endpoint_checks"] == private
+    assert "details" not in _candidate_diagnostic({"reason_code": "path_found"}, pose)

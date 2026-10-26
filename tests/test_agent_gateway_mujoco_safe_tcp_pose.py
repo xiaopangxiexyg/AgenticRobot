@@ -1650,7 +1650,8 @@ def test_continuation_query_requires_matching_safe_v2_before_resources():
 
 
 @pytest.mark.parametrize("outcome", ["success", "cancel", "budget", "fault", "rank_pruned", "prefix_failed",
-    "source_start_fault", "binding_fault", "continuation_start_blocked", "target_envelope_blocked"])
+    "source_start_fault", "binding_fault", "continuation_start_blocked", "target_envelope_blocked",
+    "endpoint_rejected"])
 @pytest.mark.parametrize("relation_input", [False, True, "region"])
 def test_continuation_query_propagates_joint_state_and_clears_only_private_plans(monkeypatch, outcome, relation_input):
     from agent_gateway.profiles.mujoco import object_goal_query as module
@@ -1658,6 +1659,8 @@ def test_continuation_query_propagates_joint_state_and_clears_only_private_plans
     now, cancelled, contexts = [0.], [False], []
     source = np.array([9., 1., 42.])
     captured, invocations = [], []
+    private_checks = [{"safe": False, "metadata": {"private_native_marker": "operator-only"}}]
+    endpoint_errors = []
     # Region sampling checks the centre before the lower endpoint, unlike the
     # historical explicit list. Both still exercise the identical planning loop.
     alternative = -4. if relation_input == "region" else 8.
@@ -1691,6 +1694,12 @@ def test_continuation_query_propagates_joint_state_and_clears_only_private_plans
                     raise MujocoTcpPlanRejected("safe_tcp_envelope_binding_changed")
                 if outcome == "target_envelope_blocked":
                     raise MujocoTcpPlanRejected("safe_tcp_target_envelope_blocked")
+                if outcome == "endpoint_rejected":
+                    error = MujocoTcpPlanRejected("safe_tcp_endpoint_search_exhausted", {
+                        "endpoint_checks": private_checks,
+                        "endpoint_check_reasons": ["collision"], "legacy_note": "retained"})
+                    endpoint_errors.append(error)
+                    raise error
             if self.source[1] == 2:
                 if outcome == "cancel":
                     cancelled[0] = True
@@ -1734,7 +1743,8 @@ def test_continuation_query_propagates_joint_state_and_clears_only_private_plans
     parameters = {"component_id": "right_arm", "reference_frame_id": "station",
         "first_pose_candidates_xyz_quat_xyzw": [[2., 0, 0, 0, 0, 0, 1]],
         "continuation_delta_xyz_m": [1., 0, 0], "path_constraint": None, "time_budget_sec": 1.}
-    if outcome in {"rank_pruned", "prefix_failed", "continuation_start_blocked", "target_envelope_blocked"}:
+    if outcome in {"rank_pruned", "prefix_failed", "continuation_start_blocked", "target_envelope_blocked",
+                   "endpoint_rejected"}:
         parameters["first_pose_candidates_xyz_quat_xyzw"].append([alternative, 0, 0, 0, 0, 0, 1])
     expected_poses = parameters["first_pose_candidates_xyz_quat_xyzw"]
     invoke = query.query_continuations
@@ -1765,13 +1775,18 @@ def test_continuation_query_propagates_joint_state_and_clears_only_private_plans
             assert result["predicted_first_tcp_pose_xyz_quat_xyzw"][0] == 2.
             assert result["continuation_pose_target_xyz_quat_xyzw"][0] == 3.
             assert [item.source[1] for item in contexts] == [1., 2.]
-        elif outcome == "target_envelope_blocked":
+        elif outcome in {"target_envelope_blocked", "endpoint_rejected"}:
             assert result["attempted_count"] == 2 and result["all_candidates_attempted"]
             assert result["selected_index"] == 1
             assert invocations == [(1., 2., None), (1., alternative, None), (alternative, alternative + 1., None)]
             rejected = result["candidate_diagnostics"][0]
-            assert rejected["reason_code"] == "safe_tcp_target_envelope_blocked"
+            assert rejected["reason_code"] == ("safe_tcp_endpoint_search_exhausted"
+                if outcome == "endpoint_rejected" else "safe_tcp_target_envelope_blocked")
             assert rejected["failed_stage"] == "first" and len(rejected["stage_diagnostics"]) == 1
+            if outcome == "endpoint_rejected":
+                assert rejected["stage_diagnostics"][0]["details"] == {
+                    "endpoint_check_reasons": ["collision"], "legacy_note": "retained"}
+                assert endpoint_errors[0].details["endpoint_checks"] == private_checks
         elif outcome in {"rank_pruned", "prefix_failed", "continuation_start_blocked"}:
             assert result["attempted_count"] == 2 and result["all_candidates_attempted"]
             assert invocations[:2] == [(1., 2., None), (2., 3., None)]

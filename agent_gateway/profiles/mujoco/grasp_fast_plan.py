@@ -6,6 +6,7 @@ import json
 import logging
 import threading
 import time
+from collections import Counter
 from collections.abc import Mapping
 from dataclasses import dataclass
 
@@ -51,6 +52,7 @@ from sim.mujoco.deploy.planned_tcp_motion import (
 from sim.mujoco.transforms import pose_to_xyz_quat_xyzw
 
 from .grasp_candidate_selection import mujoco_grasp_configuration_constraint
+from .grasp_observation import frozen_grasp_scene_hash
 from .motion_skill import MujocoAgentPreparedTcpPoseSkillLifecycle
 
 _GOAL_REJECTIONS = frozenset(
@@ -65,6 +67,37 @@ _GOAL_REJECTIONS = frozenset(
     }
 )
 _LOGGER = logging.getLogger(__name__)
+
+
+def _planning_rejection_diagnostics(error: MujocoTcpPlanRejected) -> dict:
+    """Bound private log evidence without changing the public attempt schema."""
+    details = error.details
+    result = {
+        "failed_stage": details.get("chain_stage_index"),
+        "lower_reason": details.get("reason") or error.reason_code,
+        "endpoint_attempt_count": len(details.get("endpoint_attempts", ())),
+    }
+    reasons = details.get("endpoint_check_reasons", ())
+    if reasons:
+        result["endpoint_reason_counts"] = dict(Counter(reason for reason in reasons if reason))
+    checks = details.get("endpoint_checks", ())
+    if checks:
+        # The native solver currently tries eight seeds plus one bounded rescue.
+        # Log scalars/identities only, never arbitrary oracle arrays or qpos.
+        rows = []
+        for check in checks[:9]:
+            metadata = check.get("metadata", {})
+            rows.append({
+                **{key: check[key] for key in ("safe", "reason", "minimum_distance_m") if key in check},
+                **{key: metadata[key] for key in (
+                    "geom1", "geom2", "body1", "body2", "collision_category",
+                    "penetration_depth_m", "distance_is_threshold_clipped",
+                ) if key in metadata},
+            })
+        result["endpoint_checks"] = rows
+        if len(checks) > len(rows):
+            result["endpoint_checks_omitted"] = len(checks) - len(rows)
+    return result
 
 
 @dataclass(frozen=True)
@@ -90,9 +123,7 @@ class MujocoRetainedGraspPlan:
 
 
 def _scene_hash(state):
-    return canonical_content_hash(
-        state, domain="dexteleop.mujoco.frozen_grasp_scene.v1"
-    )
+    return frozen_grasp_scene_hash(state)
 
 
 class MujocoFastGraspPlanProvider:
@@ -184,11 +215,10 @@ class MujocoFastGraspPlanProvider:
             operation.execution_result,
             domain="dexteleop.agent_gateway.passive_read_result.v1",
         )
-        state = metadata.get("native_scene_state")
+        state = self.application.capture_grasp_scene_state()
         if (
-            not isinstance(state, dict)
-            or set(state) != {"model_qpos", "model_qvel", "simulation_time_sec"}
-            or state != self.application.capture_grasp_scene_state()
+            "native_scene_state" in metadata
+            or metadata.get("native_scene_state_hash") != _scene_hash(state)
         ):
             raise PassiveReadError(
                 "Frozen native scene no longer matches the robot, hands or objects.",
@@ -359,13 +389,7 @@ class MujocoFastGraspPlanProvider:
                     pending[0] = plan
                     return plan
                 except MujocoTcpPlanRejected as error:
-                    query_detail.update({
-                        "failed_stage": error.details.get("chain_stage_index"),
-                        "lower_reason": error.details.get("reason"),
-                        "endpoint_attempt_count": len(
-                            error.details.get("endpoint_attempts", ())
-                        ),
-                    })
+                    query_detail.update(_planning_rejection_diagnostics(error))
                     candidate_start = (
                         error.reason_code == "safe_tcp_start_blocked"
                         and error.details.get("chain_stage_index", 0) > 0

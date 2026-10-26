@@ -52,10 +52,18 @@ from sim.mujoco.deploy.planned_tcp_motion import (
 )
 
 
+def _public_plan_rejection_details(details):
+    """Keep lower oracle checks private while retaining all prior public fields."""
+    return {key: value for key, value in details.items() if key != "endpoint_checks"}
+
+
 def _candidate_diagnostic(item, pose):
     """Keep exact proposals/path evidence and a bounded endpoint-search summary."""
     row = {**item, "pose_target_xyz_quat_xyzw": list(pose)}
     details = row.get("details", {})
+    if "endpoint_checks" in details:
+        details = _public_plan_rejection_details(details)
+        row["details"] = details
     search = details.get("endpoint_search_diagnostics")
     if search is not None:
         # The canonical solver retains its per-seed methods, iterations and
@@ -421,7 +429,7 @@ class MujocoObjectGoalQuery:
                         failed_stage = "first" if stage_index == 0 else "continuation"
                         stage_diagnostics.append({"stage_index": stage_index, "reason_code": reason,
                             "wall_sec": time.perf_counter()-stage_started,
-                            "details": dict(error.details)})
+                            "details": _public_plan_rejection_details(error.details)})
                         break
                     plans.append(plan)
                     stage_diagnostics.append({"stage_index": stage_index, "reason_code": "path_found",

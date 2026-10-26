@@ -149,6 +149,13 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Additionally publish a bounded-region continuation query; requires relation continuation v3.")
     parser.add_argument("--region-tcp-continuation-version", choices=("4", "5"), default="4",
                         help="Explicit region sampler: 4 preserves centre/Halton; 5 adds continuation-direction extrema.")
+    parser.add_argument(
+        "--sam3-endpoint",
+        help=(
+            "explicit loopback SAM3 service for segmentation and optional fast-grasp "
+            "point masks; reuses the external model owner and requires --artifact-root"
+        ),
+    )
     parser.add_argument("--enable-rgbd-capture-v3", action="store_true",
                         help="Publish capture_rgb v3 with optional native-grid paired RGB-D Artifacts; default off.")
     parser.add_argument("--enable-object-localization", action="store_true",
@@ -250,6 +257,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--graspgenx-point-grasp-bundle", type=Path)
     parser.add_argument("--graspgenx-source-root", type=Path)
     parser.add_argument("--point-grasp-device", default="cuda")
+    parser.add_argument("--graspgenx-planner", choices=("graspmoe", "diffusion"), default="graspmoe")
+    parser.add_argument("--graspgenx-mode", choices=("in-process", "service"), default="in-process",
+        help="in-process preserves the default; service connects to an externally owned GraspGenX model")
+    parser.add_argument("--graspgenx-host", default="127.0.0.1")
+    parser.add_argument("--graspgenx-port", type=int, default=5556)
+    parser.add_argument("--graspgenx-timeout-ms", type=int, default=120_000)
     parser.add_argument(
         "--safe-tcp-planning-clearance-padding-m",
         type=float,
@@ -469,34 +482,54 @@ def _prepare_gateway_before_ready(*, session: Any, viewer: Any | None) -> None:
 
 
 def _fast_grasp_model_from_args(parser, args):
-    paths = (args.sam2_grounding_dino_bundle, args.graspgenx_point_grasp_bundle, args.graspgenx_source_root)
+    sam3_endpoint = getattr(args, "sam3_endpoint", None)
+    mode = getattr(args, "graspgenx_mode", "in-process")
+    service_options = (getattr(args, "graspgenx_host", "127.0.0.1"),
+                       getattr(args, "graspgenx_port", 5556),
+                       getattr(args, "graspgenx_timeout_ms", 120_000))
+    if mode != "service" and service_options != ("127.0.0.1", 5556, 120_000):
+        parser.error("GraspGenX service connection flags require --graspgenx-mode service")
+    paths = (args.graspgenx_point_grasp_bundle,)
+    if mode == "in-process":
+        paths += (args.graspgenx_source_root,)
+    if sam3_endpoint is None:
+        paths += (args.sam2_grounding_dino_bundle,)
+    elif args.sam2_grounding_dino_bundle is not None:
+        parser.error("--sam3-endpoint and --sam2-grounding-dino-bundle select different point-mask backends")
     if not args.enable_fast_grasp:
-        if any(path is not None for path in paths):
+        if (any(path is not None for path in (*paths, args.graspgenx_source_root))
+                or getattr(args, "graspgenx_planner", "graspmoe") != "graspmoe"
+                or mode != "in-process"):
             parser.error("model/source bundle flags require --enable-fast-grasp")
         return None
     if (not all(path is not None for path in paths) or args.artifact_root is None
             or not args.enable_grasp_approach or not args.enable_grippers
             or args.grasp_contact_target_body is None or not args.no_realtime_worker):
-        parser.error("fast grasp requires all three model/source paths, Artifact storage, grippers, target-bound grasp approach and no realtime worker")
+        parser.error("fast grasp requires explicit model/source paths and point-mask backend, Artifact storage, grippers, target-bound grasp approach and no realtime worker")
     if any(not p.is_absolute() or not p.is_dir() for p in paths):
         parser.error("fast grasp model/source paths must be absolute existing directories")
-    from deployments.perception.dmtac_grasp_overlay import reviewed_graspgenx_dmtac_solid_geometry
-    from deployments.perception.graspgenx_client import GraspGenXInProcessBackend
+    from deployments.perception.graspgenx_client import GraspGenXClient, GraspGenXInProcessBackend
     from deployments.perception.sam2_graspgenx_point_grasp import (
         GraspGenXPointGraspModelSpec, Sam2GraspGenXPointGraspPlanner,
         GRASPGENX_DMTAC_REACHABILITY_ORIENTATION_VARIANTS_LOCAL_AXIS_DEG,
     )
-    from deployments.perception.sam2_grounding_dino import (
-        Sam2GroundingDinoLocalizer, Sam2GroundingDinoModelSpec,
-    )
-
     spec = GraspGenXPointGraspModelSpec.from_asset_bundle(args.graspgenx_point_grasp_bundle)
-    localizer = Sam2GroundingDinoLocalizer(
-        model_spec=Sam2GroundingDinoModelSpec.from_asset_bundle(args.sam2_grounding_dino_bundle),
-        device=args.point_grasp_device)
+    if sam3_endpoint is not None:
+        from deployments.perception.sam3_service import Sam3ServiceLocalizer
+        localizer = Sam3ServiceLocalizer(endpoint=sam3_endpoint)
+    else:
+        from deployments.perception.sam2_grounding_dino import (
+            Sam2GroundingDinoLocalizer, Sam2GroundingDinoModelSpec,
+        )
+        localizer = Sam2GroundingDinoLocalizer(
+            model_spec=Sam2GroundingDinoModelSpec.from_asset_bundle(args.sam2_grounding_dino_bundle),
+            device=args.point_grasp_device)
+    client = (GraspGenXClient(host=service_options[0], port=service_options[1], timeout_ms=service_options[2])
+        if mode == "service" else GraspGenXInProcessBackend(model_spec=spec,
+            source_root=args.graspgenx_source_root, device=args.point_grasp_device))
     return Sam2GraspGenXPointGraspPlanner(model_spec=spec, point_segmenter=localizer,
-        client=GraspGenXInProcessBackend(model_spec=spec, source_root=args.graspgenx_source_root,
-            device=args.point_grasp_device), alignment_profile_id=getattr(args, "graspgenx_alignment_profile", DMTAC_M_GRASPGENX_ALIGNMENT_PROFILE_ID),
+        planner=getattr(args, "graspgenx_planner", "graspmoe"),
+        client=client, alignment_profile_id=getattr(args, "graspgenx_alignment_profile", DMTAC_M_GRASPGENX_ALIGNMENT_PROFILE_ID),
         orientation_variants_local_axis_degrees=(
             GRASPGENX_DMTAC_REACHABILITY_ORIENTATION_VARIANTS_LOCAL_AXIS_DEG),
         enable_finger_exchange=True)
@@ -529,6 +562,7 @@ def main(argv: list[str] | None = None) -> int:
         or args.enable_relation_goal_queries
         or args.history_root is not None
         or args.segmentation_asset_bundle is not None
+        or args.sam3_endpoint is not None
     ):
         parser.error(
             "--motion-side left currently supports baseline TCP/state Routes only; "
@@ -540,8 +574,12 @@ def main(argv: list[str] | None = None) -> int:
     if args.enable_object_localization and args.enable_surface_anchor_v3 and args.max_retained_operations < 4:
         parser.error("localized paired anchors require --max-retained-operations >= 4")
     for name in ("enable_segmentation_batch_v2", "enable_segmentation_geometry_v3"):
-        if getattr(args, name) and (args.artifact_root is None or args.segmentation_asset_bundle is None):
-            parser.error("--" + name.replace("_", "-") + " requires --artifact-root and --segmentation-asset-bundle")
+        if getattr(args, name) and (
+            args.artifact_root is None
+            or (args.segmentation_asset_bundle is None and args.sam3_endpoint is None)
+        ):
+            parser.error("--" + name.replace("_", "-") + " requires --artifact-root and an explicit "
+                         "--segmentation-asset-bundle or --sam3-endpoint")
     if args.enable_segmentation_geometry_v3 and args.max_retained_operations < 2:
         parser.error("--enable-segmentation-geometry-v3 requires retained producer and consumer operations")
     if args.enable_object_goal_queries and not args.enable_safe_tcp_pose:
@@ -626,7 +664,17 @@ def main(argv: list[str] | None = None) -> int:
     segmentation_localizer = None
     if args.enable_rgbd_capture_v3 and artifact_storage is None:
         parser.error("--enable-rgbd-capture-v3 requires --artifact-root")
-    if args.segmentation_asset_bundle is not None:
+    if args.sam3_endpoint is not None:
+        if args.segmentation_asset_bundle is not None:
+            parser.error("--sam3-endpoint and --segmentation-asset-bundle are mutually exclusive")
+        if artifact_storage is None:
+            parser.error("--sam3-endpoint requires --artifact-root")
+        from deployments.perception.sam3_service import Sam3ServiceLocalizer
+        try:
+            segmentation_localizer = Sam3ServiceLocalizer(endpoint=args.sam3_endpoint)
+        except (TypeError, ValueError) as error:
+            parser.error(f"invalid SAM3 service binding: {error}")
+    elif args.segmentation_asset_bundle is not None:
         from deployments.perception.sam2_grounding_dino import (
             Sam2GroundingDinoLocalizer,
             Sam2GroundingDinoModelSpec,

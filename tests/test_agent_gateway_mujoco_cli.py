@@ -45,6 +45,7 @@ def test_motion_side_is_explicit_fixed_and_defaults_to_right():
     ["--enable-segmentation-geometry-v3"],
     ["--history-root", "/unused/history"],
     ["--segmentation-asset-bundle", "/unused/segmentation"],
+    ["--sam3-endpoint", "http://127.0.0.1:8114"],
     ["--grasp-contact-target-body", "cube"],
 ])
 def test_left_unsupported_combinations_fail_before_resources(monkeypatch, capsys, unsupported):
@@ -93,6 +94,134 @@ def test_fast_grasp_is_explicit_and_requires_its_complete_resource_graph(flags):
         with pytest.raises(SystemExit) as captured:
             gateway_cli._fast_grasp_model_from_args(parser, args)
         assert captured.value.code == 2
+
+
+def test_backend_options_preserve_defaults_and_require_explicit_fast_grasp():
+    parser = build_parser()
+    required = ["--socket-path", "/unused/socket", "--task-config", "/unused/task.json"]
+    defaults = parser.parse_args(required)
+    assert defaults.sam3_endpoint is None
+    assert defaults.graspgenx_planner == "graspmoe"
+    assert defaults.graspgenx_mode == "in-process"
+    with pytest.raises(SystemExit):
+        gateway_cli._fast_grasp_model_from_args(
+            parser, parser.parse_args([*required, "--graspgenx-planner", "diffusion"]),
+        )
+    for flags in (["--graspgenx-mode", "service"], ["--graspgenx-port", "5557"]):
+        with pytest.raises(SystemExit):
+            gateway_cli._fast_grasp_model_from_args(parser, parser.parse_args([*required, *flags]))
+
+
+def test_service_fast_grasp_uses_existing_inert_client_without_inprocess_source(monkeypatch, tmp_path):
+    from deployments.perception import graspgenx_client, sam2_graspgenx_point_grasp
+
+    parser = build_parser()
+    bundle, artifacts = tmp_path / "bundle", tmp_path / "artifacts"
+    bundle.mkdir()
+    artifacts.mkdir()
+    args = parser.parse_args([
+        "--socket-path", str(tmp_path / "gateway.sock"), "--task-config", "/unused/task.json",
+        "--enable-fast-grasp", "--enable-grasp-approach", "--enable-grippers",
+        "--no-realtime-worker", "--grasp-contact-target-body", "debug_cube",
+        "--artifact-root", str(artifacts), "--graspgenx-point-grasp-bundle", str(bundle),
+        "--sam3-endpoint", "http://127.0.0.1:8114", "--graspgenx-mode", "service",
+        "--graspgenx-port", "5557", "--graspgenx-timeout-ms", "50000",
+    ])
+    monkeypatch.setattr(sam2_graspgenx_point_grasp.GraspGenXPointGraspModelSpec,
+                        "from_asset_bundle", lambda path: object())
+    monkeypatch.setattr(sam2_graspgenx_point_grasp, "Sam2GraspGenXPointGraspPlanner",
+                        lambda **kwargs: SimpleNamespace(**kwargs))
+    monkeypatch.setattr(graspgenx_client, "GraspGenXInProcessBackend",
+                        lambda **kwargs: pytest.fail("Service mode must not construct in-process weights"))
+    monkeypatch.setattr(graspgenx_client.GraspGenXClient, "start",
+                        lambda self: pytest.fail("Construction cannot connect or start a model"))
+    model = gateway_cli._fast_grasp_model_from_args(parser, args)
+    assert args.graspgenx_source_root is None
+    assert isinstance(model.client, graspgenx_client.GraspGenXClient)
+    assert model.client.host == "127.0.0.1" and model.client.port == 5557
+    assert model.client.timeout_ms == 50000
+    assert model.planner == "graspmoe" and model.enable_finger_exchange
+    model.client.close()
+
+
+def test_fast_grasp_sam3_reuses_typed_ports_and_explicit_planner(monkeypatch, tmp_path):
+    from deployments.perception import graspgenx_client, sam2_graspgenx_point_grasp
+    from deployments.perception.sam3_service import Sam3ServiceLocalizer
+
+    parser = build_parser()
+    paths = [tmp_path / name for name in ("generator", "source", "artifacts")]
+    for path in paths:
+        path.mkdir()
+    args = parser.parse_args([
+        "--socket-path", str(tmp_path / "gateway.sock"), "--task-config", "/unused/task.json",
+        "--enable-fast-grasp", "--enable-grasp-approach", "--enable-grippers",
+        "--no-realtime-worker", "--grasp-contact-target-body", "debug_cube",
+        "--artifact-root", str(paths[2]), "--graspgenx-point-grasp-bundle", str(paths[0]),
+        "--graspgenx-source-root", str(paths[1]), "--sam3-endpoint", "http://127.0.0.1:8114",
+        "--graspgenx-planner", "diffusion",
+    ])
+    spec = object()
+    monkeypatch.setattr(sam2_graspgenx_point_grasp.GraspGenXPointGraspModelSpec,
+                        "from_asset_bundle", lambda path: spec)
+    monkeypatch.setattr(graspgenx_client, "GraspGenXInProcessBackend",
+                        lambda **kwargs: SimpleNamespace(**kwargs))
+    monkeypatch.setattr(sam2_graspgenx_point_grasp, "Sam2GraspGenXPointGraspPlanner",
+                        lambda **kwargs: SimpleNamespace(**kwargs))
+    model = gateway_cli._fast_grasp_model_from_args(parser, args)
+    assert isinstance(model.point_segmenter, Sam3ServiceLocalizer)
+    assert not model.point_segmenter.started  # Resource startup remains session-owned.
+    assert model.planner == "diffusion"
+    assert model.model_spec is spec and model.client.model_spec is spec
+    assert model.enable_finger_exchange
+    assert model.alignment_profile_id == args.graspgenx_alignment_profile
+    args.sam2_grounding_dino_bundle = paths[0]
+    with pytest.raises(SystemExit):
+        gateway_cli._fast_grasp_model_from_args(parser, args)
+
+
+@pytest.mark.parametrize("flags,message", [
+    (["--sam3-endpoint", "http://127.0.0.1:8114"], "requires --artifact-root"),
+    (["--sam3-endpoint", "http://127.0.0.1:8114", "--segmentation-asset-bundle", "/unused"],
+     "mutually exclusive"),
+])
+def test_sam3_incomplete_graph_fails_before_model_or_simulator_start(monkeypatch, tmp_path, capsys, flags, message):
+    def forbidden(**kwargs):
+        pytest.fail("Invalid perception selection must not construct a simulator")
+    monkeypatch.setattr(gateway_cli, "build_mujoco_agent_tcp_pose_gateway_session", forbidden)
+    task = gateway_cli.repo_root() / "sim/configs/tasks/rm65_right_cube_reach_fixed_pose_xyz_proprio_v1.json"
+    with pytest.raises(SystemExit):
+        gateway_cli.main(["--socket-path", str(tmp_path / "gateway.sock"),
+                          "--task-config", str(task), *flags])
+    assert message in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("flag", ["--enable-segmentation-batch-v2", "--enable-segmentation-geometry-v3"])
+def test_same_cut_segmentation_accepts_explicit_sam3_without_starting_resources(monkeypatch, tmp_path, flag):
+    from deployments.perception.sam3_service import Sam3ServiceLocalizer
+
+    class AssemblyReached(Exception):
+        pass
+
+    received = {}
+
+    def assemble(**kwargs):
+        received.update(kwargs)
+        raise AssemblyReached
+
+    monkeypatch.setattr(gateway_cli, "build_mujoco_agent_tcp_pose_gateway_session", assemble)
+    monkeypatch.setattr(Sam3ServiceLocalizer, "start",
+                        lambda self: pytest.fail("CLI construction cannot start the model service"))
+    task = gateway_cli.repo_root() / "sim/configs/tasks/rm65_right_cube_reach_fixed_pose_xyz_proprio_v1.json"
+    artifacts = tmp_path / "artifacts"
+    artifacts.mkdir()
+    with pytest.raises(AssemblyReached):
+        gateway_cli.main([
+            "--socket-path", str(tmp_path / "gateway.sock"), "--task-config", str(task),
+            "--artifact-root", str(artifacts), "--sam3-endpoint", "http://127.0.0.1:8114", flag,
+        ])
+    assert isinstance(received["segmentation_localizer"], Sam3ServiceLocalizer)
+    assert not received["segmentation_localizer"].started
+    assert received[flag[2:].replace("-", "_")] is True
 
 
 def test_cli_import_does_not_load_optional_perception_models() -> None:
