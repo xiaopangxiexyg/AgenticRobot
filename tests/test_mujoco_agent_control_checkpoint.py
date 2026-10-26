@@ -67,7 +67,9 @@ def test_invalid_clock_is_rejected_before_preparing_any_resource(monkeypatch, cl
         )
 
 
-def _native_target(*, observation_plan=None, observation_sink=None):
+def _native_target(
+    *, observation_plan=None, observation_sink=None, envelope_factory=None
+):
     """Build the original fixture once per test, without starting its owners."""
     config = replace(_configuration(), execution_observation_plan=observation_plan)
     prepared = prepare_mujoco_sim_hil_target(config)
@@ -101,6 +103,9 @@ def _native_target(*, observation_plan=None, observation_sink=None):
         ),
         clock=clock,
         execution_observation_sink=observation_sink,
+        tcp_pose_envelope_runtime=(
+            None if envelope_factory is None else envelope_factory(prepared, config)
+        ),
     )
     return config, prepared, profile, clock, target
 

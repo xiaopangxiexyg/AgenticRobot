@@ -17,6 +17,15 @@ from robot_motion.rm65.retargeter_checkpoint import (
     RetargeterCheckpoint,
     capture_retargeter,
 )
+from robot_motion.target_safety import (
+    RobotActionTCPPoseEnvelopeFilter,
+    TCPPoseEnvelopeSafetyRuntime,
+)
+from robot_motion.target_safety.checkpoint import (
+    TCPPoseEnvelopeCheckpoint,
+    capture_safety_envelope,
+    restore_safety_envelope,
+)
 from sim.mujoco.adapters.checkpoint import (
     ExecutionRigCheckpoint,
     ManualExecutionClock,
@@ -75,6 +84,7 @@ class MujocoTargetCheckpoint:
     resolver_diagnostics: dict
     diagnostics_hash: str
     public_metadata_hash: str
+    safety_envelope: TCPPoseEnvelopeCheckpoint | None
 
 
 @dataclass(frozen=True)
@@ -161,12 +171,9 @@ def _core_bindings(runtime):
 def _qualify(target):
     if (
         type(target) is not MujocoAgentSkillMotionTarget
-        or target.tcp_pose_envelope_runtime is not None
         or target.planned_tcp_motion is not None
     ):
-        raise ValueError(
-            "Target checkpoint does not own external safety or motion plans."
-        )
+        raise ValueError("Target checkpoint does not own external motion plans.")
     runtime = target.runtime
     if type(runtime.clock) is not ManualExecutionClock:
         raise ValueError("Target checkpoint requires a manual logical clock.")
@@ -189,7 +196,6 @@ def _qualify(target):
             for key in (
                 "pose_transformer",
                 "planned_tcp_motion",
-                "pose_target_safety_filter",
                 "target_pose_smoother",
             )
         )
@@ -198,6 +204,28 @@ def _qualify(target):
         or vars(resolver._command_resolver)
     ):
         raise ValueError("Unsupported resolver graph or unfinished resolution.")
+    envelope = target.tcp_pose_envelope_runtime
+    pose_filter = resolver.pose_target_safety_filter
+    if envelope is None:
+        if pose_filter is not None:
+            raise ValueError("Target pose filter has no owned envelope.")
+    else:
+        if type(envelope) is not TCPPoseEnvelopeSafetyRuntime:
+            raise ValueError("Target requires the original safety envelope owner.")
+        if envelope._active is not None:
+            raise ValueError("Target cut cannot restore an active envelope operation.")
+        if (
+            envelope.clock_domain_id != runtime.config.clock_domain_id
+            or type(pose_filter) is not RobotActionTCPPoseEnvelopeFilter
+            or vars(pose_filter)
+            != {
+                "runtime": envelope,
+                "filter_contract_hash": RobotActionTCPPoseEnvelopeFilter(
+                    envelope
+                ).filter_contract_hash,
+            }
+        ):
+            raise ValueError("Target filter must bind its exact own safety envelope.")
     ik = resolver.ik
     if (
         type(ik) is not RM65RetargeterIK
@@ -262,6 +290,13 @@ def capture_motion_target(target, *, prepared, max_native_bytes):
             diagnostics,
             state_hash(diagnostics),
             _public_metadata(target),
+            (
+                None
+                if target.tcp_pose_envelope_runtime is None
+                else capture_safety_envelope(
+                    target.tcp_pose_envelope_runtime, captured_at=runtime.clock()
+                )
+            ),
         )
         validate_runtime_boundary(runtime)
         validate_execution_boundary(runtime.rig)
@@ -269,7 +304,9 @@ def capture_motion_target(target, *, prepared, max_native_bytes):
         return result
 
 
-def validate_target_restore(restore, *, config, prepared, binding, clock, motion_side):
+def validate_target_restore(
+    restore, *, config, prepared, binding, clock, motion_side, safety_envelope
+):
     if (
         type(restore) is not _TargetRestore
         or type(restore.checkpoint) is not MujocoTargetCheckpoint
@@ -286,6 +323,18 @@ def validate_target_restore(restore, *, config, prepared, binding, clock, motion
         or restore.checkpoint.runtime.clock_value != restore.checkpoint.rig.clock_value
     ):
         raise ValueError("Invalid independently restored target binding.")
+    expected = restore.checkpoint.safety_envelope
+    if expected is None:
+        if safety_envelope is not None:
+            raise ValueError("Restoration cannot introduce a new safety envelope.")
+    elif (
+        type(safety_envelope) is not TCPPoseEnvelopeSafetyRuntime
+        or safety_envelope._active is not None
+        or safety_envelope.clock_domain_id != config.clock_domain_id
+        or capture_safety_envelope(safety_envelope, captured_at=clock()).content_hash
+        != expected.content_hash
+    ):
+        raise ValueError("Restored safety envelope does not match the target cut.")
 
 
 def restore_resolver_state(runtime, checkpoint):
@@ -325,6 +374,15 @@ def restore_motion_target(
         raise ValueError(
             "Target checkpoint requires trusted matching profile metadata."
         )
+    envelope = (
+        None
+        if checkpoint.safety_envelope is None
+        else restore_safety_envelope(
+            checkpoint.safety_envelope, captured_at=checkpoint.rig.clock_value
+        )
+    )
+    if envelope is not None and envelope._active is not None:
+        raise ValueError("Target cut cannot restore an active envelope operation.")
     rig = restore_execution_rig(
         checkpoint.rig,
         config=rig_config,
@@ -342,6 +400,7 @@ def restore_motion_target(
             execution_observation_sink=(
                 None if observation is None else new_observer(observation.observer)
             ),
+            tcp_pose_envelope_runtime=envelope,
             motion_side=checkpoint.motion_side,
             clock=rig._clock,
             _restore=_TargetRestore(checkpoint, rig, max_native_bytes),

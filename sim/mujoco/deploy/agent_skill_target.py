@@ -113,10 +113,10 @@ def build_mujoco_agent_skill_motion_target(
             binding=component_execution_binding,
             clock=clock,
             motion_side=motion_side,
+            safety_envelope=tcp_pose_envelope_runtime,
         )
         if (
             trace_sink is not None
-            or tcp_pose_envelope_runtime is not None
             or enable_safe_tcp_pose
         ):
             raise ValueError(

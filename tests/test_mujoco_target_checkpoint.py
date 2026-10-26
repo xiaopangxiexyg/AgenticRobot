@@ -9,6 +9,8 @@ import pytest
 from robot_motion.action import ComponentAction
 from robot_motion.deploy.schema import pose_matrix_to_xyzquat
 from robot_motion.rm65.retargeter_checkpoint import capture_retargeter
+from robot_motion.target_safety import TCPPoseEnvelopeSafetyRuntime
+from robot_motion.target_safety.checkpoint import capture_safety_envelope
 from sim.mujoco.adapters.checkpoint import capture_execution_rig
 from sim.mujoco.deploy.component_action_profile import (
     MujocoComponentActionRobotActionV1Materializer,
@@ -28,6 +30,187 @@ from tests.test_mujoco_runtime_checkpoint import target_source  # noqa: F401
 
 pytestmark = [pytest.mark.integration, pytest.mark.slow_sim]
 BUDGET = 128 * 1024 * 1024
+
+
+@pytest.fixture(params=(False, True))
+def envelope_source(request):
+    from agent_gateway.profiles.mujoco.motion_factory import (
+        _build_standard_tcp_pose_envelope_runtime,
+        mujoco_agent_tcp_pose_execution_observation_plan_v1,
+    )
+    from sim.mujoco.deploy.execution_difference import MujocoExecutionDifferenceObserver
+    from tests.test_mujoco_agent_control_checkpoint import _native_target
+
+    observation = request.param
+    values = _native_target(
+        observation_plan=(
+            mujoco_agent_tcp_pose_execution_observation_plan_v1(motion_side="right")
+            if observation
+            else None
+        ),
+        observation_sink=(
+            MujocoExecutionDifferenceObserver(
+                selection_group_id="arms", component_ids=("right_arm",)
+            )
+            if observation
+            else None
+        ),
+        envelope_factory=lambda prepared, config: (
+            _build_standard_tcp_pose_envelope_runtime(
+                prepared=prepared, target_config=config
+            )
+        ),
+    )
+    _config, prepared, _profile, clock, target = values
+    runtime = target.runtime
+    runtime.start()
+    runtime.transition_execution_gate("hold", reason="envelope-checkpoint")
+    envelope = target.tcp_pose_envelope_runtime
+    poses = capture_mujoco_sim_hil_tool_tcp_pose_by_side(
+        target.scene, prepared.task_config
+    )
+    envelope.commit_reference(
+        reference_id="original-qpos-initialization",
+        tcp_pose_by_side={"right": poses["right"]},
+        captured_at_by_side={"right": clock()},
+        source_event_ids=("completed-original-initialization",),
+        lower_state="hold",
+    )
+    clock.advance_to(clock() + 0.2)
+    try:
+        yield values
+    finally:
+        runtime.close()
+
+
+def test_inactive_envelope_restores_historical_reference_with_enabled_observation(
+    envelope_source, monkeypatch
+):
+    _config, prepared, profile, clock, target = envelope_source
+    envelope = target.tcp_pose_envelope_runtime
+    saved = capture_motion_target(target, prepared=prepared, max_native_bytes=BUDGET)
+
+    def no_lifecycle(*args, **kwargs):
+        raise AssertionError(
+            "Restoring a reference must not manufacture initialization."
+        )
+
+    with monkeypatch.context() as patch:
+        for name in (
+            "commit_reference",
+            "invalidate_reference",
+            "activate",
+            "deactivate_after_hold",
+        ):
+            patch.setattr(TCPPoseEnvelopeSafetyRuntime, name, no_lifecycle)
+        branch = _restore(saved, prepared, target, profile)
+    try:
+        fresh = branch.tcp_pose_envelope_runtime
+        assert fresh is not envelope
+        assert branch.runtime.pose_resolver.pose_target_safety_filter.runtime is fresh
+        assert capture_safety_envelope(fresh, captured_at=clock()).content_hash == (
+            saved.safety_envelope.content_hash
+        )
+        assert fresh._reference.captured_at_by_side["right"] < clock()
+        assert (
+            capture_runtime(branch.runtime).content_hash == saved.runtime.content_hash
+        )
+        entry = fresh.catalog_entries[0]
+        raw = {"right": fresh._reference.tcp_pose_by_side["right"]}
+        assert fresh.preview_for_envelope(
+            raw, deployment_envelope_hash=entry.semantic_content_hash
+        ).semantic_content_hash == (
+            envelope.preview_for_envelope(
+                raw, deployment_envelope_hash=entry.semantic_content_hash
+            ).semantic_content_hash
+        )
+        assert fresh._active is None
+        assert (
+            capture_motion_target(
+                target, prepared=prepared, max_native_bytes=BUDGET
+            ).safety_envelope.content_hash
+            == saved.safety_envelope.content_hash
+        )
+        branch.runtime.pose_resolver.pose_target_safety_filter.runtime = envelope
+        with pytest.raises(ValueError, match="envelope"):
+            capture_motion_target(
+                branch,
+                prepared=replace(prepared, scene=branch.scene),
+                max_native_bytes=BUDGET,
+            )
+    finally:
+        branch.runtime.close()
+
+
+def test_active_envelope_is_not_a_gateway_operation_restore(envelope_source):
+    from robot_motion.target_safety import TCPPoseEnvelopeSelection
+
+    _config, prepared, _profile, _clock, target = envelope_source
+    envelope = target.tcp_pose_envelope_runtime
+    entry = envelope.catalog_entries[0]
+    envelope.activate(
+        selection=TCPPoseEnvelopeSelection(
+            safety_profile_id="caller-profile",
+            safety_profile_hash="caller-profile-hash",
+            deployment_envelope_id=entry.envelope_id,
+            deployment_envelope_hash=entry.semantic_content_hash,
+            constraint_set_hash=entry.constraint_set_hash,
+        ),
+        operation_id="not-yet-restorable-application-operation",
+        route_id=entry.allowed_route_ids[0],
+        execution_epoch=7,
+        source_event_ids=("application-ready",),
+        lower_state="hold",
+    )
+    before = envelope.snapshot()
+    with pytest.raises(ValueError, match="active envelope"):
+        capture_motion_target(target, prepared=prepared, max_native_bytes=BUDGET)
+    assert envelope.snapshot() == before
+
+
+@pytest.mark.parametrize("damage", ("digest", "active"))
+def test_bad_envelope_restore_is_rejected_before_native_allocation(
+    envelope_source, monkeypatch, damage
+):
+    from robot_motion.target_safety import TCPPoseEnvelopeSelection
+    from sim.mujoco.deploy import target_checkpoint
+
+    _config, prepared, profile, clock, target = envelope_source
+    saved = capture_motion_target(target, prepared=prepared, max_native_bytes=BUDGET)
+    envelope = target.tcp_pose_envelope_runtime
+    if damage == "digest":
+        envelope_checkpoint = replace(saved.safety_envelope, content_hash="corrupt")
+    else:
+        entry = envelope.catalog_entries[0]
+        envelope.activate(
+            selection=TCPPoseEnvelopeSelection(
+                safety_profile_id="caller-profile",
+                safety_profile_hash="caller-profile-hash",
+                deployment_envelope_id=entry.envelope_id,
+                deployment_envelope_hash=entry.semantic_content_hash,
+                constraint_set_hash=entry.constraint_set_hash,
+            ),
+            operation_id="unrestored-application-operation",
+            route_id=entry.allowed_route_ids[0],
+            execution_epoch=7,
+            source_event_ids=("application-ready",),
+            lower_state="hold",
+        )
+        envelope_checkpoint = capture_safety_envelope(envelope, captured_at=clock())
+
+    def no_native_load(*args, **kwargs):
+        raise AssertionError("Bad envelope cannot acquire a native branch.")
+
+    before = target.scene.data.__getstate__()
+    monkeypatch.setattr(target_checkpoint, "restore_execution_rig", no_native_load)
+    with pytest.raises(ValueError):
+        _restore(
+            replace(saved, safety_envelope=envelope_checkpoint),
+            prepared,
+            target,
+            profile,
+        )
+    assert target.scene.data.__getstate__() == before
 
 
 def _binding(prepared, profile):

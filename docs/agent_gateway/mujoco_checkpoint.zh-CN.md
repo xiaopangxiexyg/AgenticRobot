@@ -18,7 +18,7 @@ manual/immediate target；这是可信内存内分支，不是完整节点磁盘
 该失败回执保持原样。本轮已在独立候选中准备与主线相同 gitlink 的 B601 子模块；
 不会修改主线子模块或共享源码。
 
-本轮固定源码 `db09fe458444` 的25模块组合回归为 **679通过、1跳过、零失败**。
+观察组件阶段固定源码 `db09fe458444` 的25模块组合回归为 **679通过、1跳过、零失败**。
 历史 checkpoint observer 绑定（原候选 V25，现另名保留）在保留 V24 原件的基础上登记上述三项变化、20项候选变更依赖及
 39项既有直接 owner／record／编码合同；147项输入／144项源码均逐字节匹配该提交，并绑定真实消费者日志与 JUnit 回执哈希。
 当前合流已保留主线模型图 V25，两份前驱证据均不会冒充合流资格；组合绑定待单独生成。
@@ -52,8 +52,33 @@ physics tick都记录。一次 step 的 reference→watermark→measurement→wa
 原生测试覆盖 pending/active/HOLD、数据拒收和 watermark 拒收后的分支继续、源绑定
 时间、非空 cache、重复 key/淘汰/配对、错 schema/时间/计数、live scratch/实际FK绑定
 变化，以及保存／恢复零 publish。最后评审计数反例先2失败，修复后观察及原消费者
-选集31通过。它仍不证明 Gateway 的 envelope、application、operation 或 RGB-D source
+选集31通过。它仍不证明 Gateway 的 application、operation 或 RGB-D source
 已整体恢复；这些既有 owner 的准入检查不能关闭。
+
+## TCP 安全参考与包络续跑
+
+`robot_motion.target_safety.checkpoint` 为原 `TCPPoseEnvelopeSafetyRuntime` 保存完整
+catalog/config、稳定 reference、独立 safety-reference epoch、操作内 active 记录以及
+最近 projection。原 `snapshot()` 只有 hash 摘要，不能用作恢复载荷。
+
+- 复用闭集 record codec 和原 typed 构造器，验证数据布局、缓存 hash、catalog/selection/
+  constraint/Route、anchor 和 activation receipt 的关系；projection 用原纯投影函数核对。
+- 新 owner 由原构造器建立新锁和索引；active entry 指回新 catalog。保存／恢复不调用
+  commit、invalidate、activate 或 deactivate，不增加 reference/execution epoch。
+- 稳定 reference 保留原 pose、历史采样时间和初始化事件；普通 HOLD 只清 active/projection。
+  invalidate 后 `reference=None` 且 epoch 非零、absolute envelope 没有 anchor 都沿用原语义。
+- 原 planning preview 闭包捕获原 owner/reference，不能复制到新分支；消费者在新 owner 上
+  重新取得同一个既有查询接口。本组件不保存闭包，也不新增查询或执行 owner。
+
+独立 owner 可验证 active 数据的纯投影续跑，但不据此恢复 Gateway operation/READY。
+当前 target 只接入 **inactive** envelope；保留原 reference，通过原 factory 构造 exact
+`RobotActionTCPPoseEnvelopeFilter` 并绑定新 owner，验证 clock/filter 身份。active envelope、
+其他自定义 filter、外部 planned-motion owner 仍不属于此切片；坏 envelope 在加载原生分支前拒绝。
+这不是新增 agent 动作策略或安全阈值，普通新建 target 及现有物理控制路径不变。
+
+与 `6ecb2307b` 的隐私边界一致：这里的原生 checkpoint、历史 pose 和控制记录为私有恢复数据，
+不注册为公共 Skill/Artifact，也不恢复已移除的公共 raw scene 字段。初始化来源认证和多组件
+属于同一个有权封存的应用事务，仍由后续 application/store 接缝负责。
 
 ## Manual no-model target 的独立分支
 
@@ -420,11 +445,11 @@ proposal/epoch/permit/schedule 状态及 qpos/qvel/ctrl/warmstart，另验证真
 
 1. Gateway admission、物理线程和控制 owner 的联合静止边界。
 2. 将本轮已装配的 manual/immediate target 分支接到真实 Gateway profile。标准
-   Cartesian execution observer 已随 target 验证；外层 safety/plan 及 application
-   lifecycle 仍待补齐。immediate pending reference 已验证；scheduled segment 及
+   Cartesian execution observer 与 inactive TCP envelope 已随 target 验证；活动 operation、
+   外部 plan 及 application lifecycle 仍待补齐。immediate pending reference 已验证；scheduled segment 及
    异步 activation 仍未纳入资格，不能直接放行。
 3. 新实例中 FK、collision、payload、observer、scratch 等消费者的统一绑定。
-4. V25 已独立登记当前候选的源码与消费者证据；完整仓库门禁仍须单独验收。
+4. 两份历史 V25 分别保留；合流后的当前源码须使用新的独立组合绑定与完整仓库门禁。
    profile 身份、持久化/原子提交、历史产物与恢复分支的来源关系尚待接入。
 5. sleep 混合状态、完整 no-model profile、渲染和远端组合验收。
 6. RPent SDK/runtime/记录前缀与上述下层合同的联合恢复。
