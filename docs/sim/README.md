@@ -2,6 +2,8 @@
 
 MuJoCo 是 task-physics 主链路；SAPIEN 只做 preview。详细说明见 [MUJOCO](./MUJOCO.md)。
 
+可显式生成的多物体布局与分阶段任务见 [Skill 场景与任务扩展](./SKILL_SCENE_SUITE.md)。
+
 从仓库根目录、已激活 `dexteleop310` 的桌面会话执行。带 `--viewer` 的命令需要可用显示环境；
 无显示服务器先使用第 1 节的只编译检查。
 
