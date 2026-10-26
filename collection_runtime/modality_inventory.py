@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 import json
-import os
 from pathlib import Path
-import tempfile
 from typing import Any, Mapping
 
 from dataset_contracts.modality_artifacts import ModalityArtifactInventoryV1
 from dataset_interface.modality_artifacts import build_modality_artifact_inventory
+
+from .atomic_json import atomic_write_json as _atomic_write
 
 
 MODALITY_INVENTORY_ROOT = Path("meta/modality_artifacts/tactile/inventories")
@@ -35,28 +35,6 @@ def _read_object(path: Path) -> Mapping[str, Any]:
     if not isinstance(payload, Mapping):
         raise ModalityInventoryPublishError(f"modality inventory is not an object: {path}")
     return payload
-
-
-def _atomic_write(path: Path, payload: Mapping[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, temporary_name = tempfile.mkstemp(
-        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
-    )
-    temporary = Path(temporary_name)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump(dict(payload), handle, ensure_ascii=True, sort_keys=True, indent=2)
-            handle.write("\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary, path)
-        directory_fd = os.open(path.parent, os.O_RDONLY)
-        try:
-            os.fsync(directory_fd)
-        finally:
-            os.close(directory_fd)
-    finally:
-        temporary.unlink(missing_ok=True)
 
 
 def publish_modality_inventory(

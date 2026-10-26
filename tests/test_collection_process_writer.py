@@ -4,23 +4,30 @@ import json
 import queue
 import shutil
 import time
+from dataclasses import replace
+from multiprocessing.reduction import ForkingPickler
 from pathlib import Path
-from types import SimpleNamespace
+from types import MappingProxyType, SimpleNamespace
 
 import numpy as np
 import pytest
 
+from collection_runtime import stream_sink
 from dataset_contracts.canonical_encoding import canonical_content_hash
 from dataset_contracts.episode_identity import EpisodeCaptureIdentity
 from dataset_contracts.v25p_native_storage import V25P_PARQUET_CHUNK_LAYOUT_V1
 from dataset_contracts.v25p_native import V25pComponentStreamProfileV2
 from dataset_contracts.v22 import PolicyIOLayout
-from dataset_contracts.stream_catalog import NativeStreamContract
+from dataset_contracts.stream_catalog import (
+    NATIVE_STREAM_EPISODE_RELATIVE_ROOT_V1,
+    NativeStreamContract,
+)
 from dataset_interface.v25p_native import load_v25p_native_episode
 from dataset_interface.streams import (
     NativeStreamExternalPayloadReference,
     load_native_stream_episode,
 )
+from teleop_runtime.collection import process_writer
 from teleop_runtime.collection.process_writer import (
     ProcessCollectionConfig,
     ProcessCollectionWorker,
@@ -182,6 +189,458 @@ def _selected_rgb_contract() -> NativeStreamContract:
         compression="none",
         access_role="actor_input",
     )
+
+
+def _run_native_worker_messages(tmp_path, messages, *, active, external=True):
+    """Exercise the child message loop with real temporary writers, no devices."""
+
+    contract = _selected_rgb_contract() if external else _native_q6_contract()
+    bindings = (
+        {
+            contract.stream_id: ProcessExternalNativeStreamBinding(
+                stream_id=contract.stream_id,
+                source_kind="selected_rgb",
+                source_key="front",
+            )
+        }
+        if external
+        else {}
+    )
+    incoming, replies, acknowledgements = queue.Queue(), queue.Queue(), queue.Queue()
+    if active:
+        incoming.put(
+            {
+                "kind": "start_episode",
+                "request_id": 1,
+                "episode_uuid": "native-guard-episode",
+            }
+        )
+    for request_id, message in enumerate(messages, start=2):
+        incoming.put({"request_id": request_id, **message})
+    close_request_id = len(messages) + 2
+    incoming.put({"kind": "close", "request_id": close_request_id})
+    process_writer._worker_main(
+        writer_config=LeRobotV21WriterConfig(
+            root_dir=tmp_path,
+            task_id="native-message-guards",
+            write_parquet=False,
+            write_video=False,
+        ),
+        sample_builder_config=CollectorSampleBuilderConfig(),
+        process_config=ProcessCollectionConfig(worker_nice=0),
+        v25p_shadow_config=None,
+        native_stream_contracts={contract.stream_id: contract},
+        external_stream_bindings=bindings,
+        shm_names=(),
+        input_queue=incoming,
+        reply_queue=replies,
+        ack_queue=acknowledgements,
+    )
+    # The synchronous loop has exited, so no producer can change these queues.
+    messages = [replies.get_nowait() for _ in range(replies.qsize())]
+    replies_by_id = {
+        item["request_id"]: item for item in messages if item["kind"] == "reply"
+    }
+    assert any(item["kind"] == "ready" and item["ok"] for item in messages)
+    if active:
+        assert replies_by_id[1]["ok"]
+    assert replies_by_id[close_request_id]["ok"]
+    assert not list(
+        (tmp_path / NATIVE_STREAM_EPISODE_RELATIVE_ROOT_V1).glob("*/manifest.cjson")
+    )
+    indexes = list(tmp_path.glob("streams/**/samples.cjsonl"))
+    assert bool(indexes) == active
+    assert all(path.stat().st_size == 0 for path in indexes)
+    return replies_by_id, [
+        acknowledgements.get_nowait() for _ in range(acknowledgements.qsize())
+    ]
+
+
+@pytest.mark.parametrize(
+    "kind,mismatch",
+    [
+        (
+            "native_stream_sample",
+            "Native stream sample does not match the active episode.",
+        ),
+        (
+            "native_stream_note_drops",
+            "Native stream drops do not match the active episode.",
+        ),
+        (
+            "freeze_native_stream_episode",
+            "Native stream freeze does not match the active episode.",
+        ),
+        (
+            "seal_native_stream_episode",
+            "Native stream seal does not match the active episode.",
+        ),
+        (
+            "seal_native_stream_episode_after_legacy_finalize",
+            "Post-finalize native stream seal does not match the active episode.",
+        ),
+        (
+            "close_native_stream_episode",
+            "Native stream close does not match the active episode.",
+        ),
+    ],
+)
+@pytest.mark.parametrize(
+    "active,episode_uuid,episode_index",
+    [
+        (False, "wrong-episode", "invalid-index"),
+        (True, "wrong-episode", "invalid-index"),
+        (True, "native-guard-episode", None),
+        (True, "native-guard-episode", 1),
+    ],
+)
+def test_native_worker_message_identity_guards_preserve_error_channel_and_order(
+    tmp_path, kind, mismatch, active, episode_uuid, episode_index
+) -> None:
+    replies, acknowledgements = _run_native_worker_messages(
+        tmp_path,
+        [{
+            "kind": kind,
+            "episode_uuid": episode_uuid,
+            "legacy_episode_index": episode_index,
+        }],
+        active=active,
+    )
+    if not active and kind == "close_native_stream_episode":
+        assert replies[2]["ok"] and replies[2]["result"] is True
+        assert not acknowledgements
+        return
+    if kind == "native_stream_sample":
+        assert 2 not in replies
+        assert len(acknowledgements) == 1
+        result = acknowledgements[0]
+        assert result["kind"] == "worker_error"
+        prefix = "worker.native_stream_append: "
+    else:
+        assert not acknowledgements
+        result = replies[2]
+        assert not result["ok"]
+        prefix = ""
+    if not active:
+        assert result["error"] == prefix + (
+            "RuntimeError: No native stream episode is active in the process worker."
+        )
+    elif episode_index is None:
+        assert result["error"].startswith(prefix + "TypeError: ")
+    else:
+        assert result["error"] == prefix + "ValueError: " + mismatch
+    assert "Traceback" in result["traceback"]
+
+
+@pytest.mark.parametrize(
+    "episode_uuid,episode_index", [("native-guard-episode", 0), ("wrong", None)]
+)
+def test_native_worker_inline_freeze_rejects_mode_before_identity(
+    tmp_path, episode_uuid, episode_index
+) -> None:
+    replies, acknowledgements = _run_native_worker_messages(
+        tmp_path,
+        [{
+            "kind": "freeze_native_stream_episode",
+            "episode_uuid": episode_uuid,
+            "legacy_episode_index": episode_index,
+        }],
+        active=True,
+        external=False,
+    )
+    assert not acknowledgements
+    assert replies[2]["error"] == (
+        "RuntimeError: Inline native streams do not use post-finalize freeze."
+    )
+
+
+def test_native_worker_freeze_failure_and_new_episode_keep_finalize_blocked(
+    tmp_path, monkeypatch
+) -> None:
+    fail_next_freeze = True
+
+    def fail_fsync(fd):
+        raise OSError("injected worker freeze failure")
+
+    class FailFirstFreezeWriter(stream_sink.NativeStreamEpisodeWriter):
+        def freeze_ingestion(self):
+            nonlocal fail_next_freeze
+            if fail_next_freeze:
+                fail_next_freeze = False
+                with monkeypatch.context() as patch:
+                    patch.setattr(stream_sink.os, "fsync", fail_fsync)
+                    return super().freeze_ingestion()
+            return super().freeze_ingestion()
+
+    monkeypatch.setattr(process_writer, "NativeStreamEpisodeWriter", FailFirstFreezeWriter)
+    identity = {"episode_uuid": "native-guard-episode", "legacy_episode_index": 0}
+    replies, acknowledgements = _run_native_worker_messages(
+        tmp_path,
+        [
+            {"kind": "freeze_native_stream_episode", **identity},
+            {"kind": "finalize_episode", "episode_index": 0},
+            {"kind": "freeze_native_stream_episode", **identity},
+            {"kind": "close_native_stream_episode", **identity},
+            {"kind": "discard_episode", "episode_index": 0},
+            {"kind": "start_episode", "episode_uuid": "next-native-episode"},
+            {"kind": "finalize_episode", "episode_index": 0},
+        ],
+        active=True,
+    )
+    assert not acknowledgements
+    assert replies[2]["error"] == "OSError: injected worker freeze failure"
+    expected = (
+        "RuntimeError: External native stream episode must freeze "
+        "before legacy finalize."
+    )
+    assert replies[3]["error"] == expected
+    assert replies[4]["ok"] and replies[4]["result"] is True
+    assert replies[5]["ok"] and replies[5]["result"] is True
+    assert replies[6]["ok"] and replies[6]["result"]["discarded"]
+    assert replies[7]["ok"] and replies[7]["result"] == 0
+    assert replies[8]["error"] == expected
+
+
+def test_shared_snapshot_layout_preserves_copy_views_and_excluded_fields() -> None:
+    rgb = np.arange(48, dtype=np.uint8).reshape(4, 4, 3)[:, ::2]
+    depth = np.arange(12, dtype=np.uint16).reshape(3, 4).T
+    joints = np.arange(6, dtype=np.float32)
+    metadata_array = np.eye(2)
+    frame = VideoFrame(
+        image=rgb,
+        source_timestamp=np.float64(10.0),
+        receive_timestamp=10.1,
+        available_timestamp=10.2,
+        frame_index=7,
+        metadata={"calibration": metadata_array},
+        depth_image=depth,
+        depth_metadata={"scale": 0.001},
+        unaligned_depth_image=np.ones((5, 5), dtype=np.uint16),
+        unaligned_depth_metadata={"diagnostic": True},
+    )
+    snapshot = replace(
+        _snapshot(),
+        camera_frames={
+            "missing": None,
+            "front": frame,
+            7: VideoFrame(image=[[1, 2], [3, 4]], source_timestamp=11.0),
+        },
+        arm_states=MappingProxyType({
+            "left": {"qpos": joints, "plain_list": [1, None, "unchanged"]},
+        }),
+        hand_states={"left": {"nested": [joints, (None, np.array([3, 4], dtype=">i2"))]}},
+        position_reference={"target": (np.array(3.5),)},
+        component_metadata={"not_shared": metadata_array},
+        include_debug_metadata=True,
+        include_action_debug_metadata=True,
+    )
+
+    def payloads(value):
+        return [
+            value.camera_frames["front"].image,
+            value.camera_frames["front"].depth_image,
+            value.camera_frames["7"].image,
+            value.arm_states["left"]["qpos"],
+            value.hand_states["left"]["nested"][0],
+            value.hand_states["left"]["nested"][1][1],
+            value.position_reference["target"][0],
+        ]
+
+    originals = [
+        rgb, depth, [[1, 2], [3, 4]], joints, joints,
+        np.array([3, 4], dtype=">i2"), np.array(3.5),
+    ]
+    expected = [np.ascontiguousarray(array).copy() for array in originals]
+    pool = process_writer._SharedSlotPool(slot_count=1, slot_bytes=4096)
+    try:
+        slot = pool.acquire()
+        assert slot == 0
+        packed, byte_count = pool.pack_snapshot(snapshot, slot_id=slot)
+        refs = payloads(packed)
+        end = 0
+        for ref, array in zip(refs, expected, strict=True):
+            assert isinstance(ref, process_writer.SharedArrayRef)
+            aligned = (end + 63) // 64 * 64
+            assert (ref.slot_id, ref.shm_name, ref.offset) == (slot, pool.names[0], aligned)
+            assert (ref.shape, ref.dtype, ref.nbytes) == (
+                array.shape, array.dtype.str, array.nbytes,
+            )
+            assert bytes(pool.blocks[0].buf[aligned:aligned + array.nbytes]) == array.tobytes()
+            end = aligned + array.nbytes
+        assert byte_count == end
+        assert refs[3].offset != refs[4].offset
+        assert list(packed.camera_frames) == ["missing", "front", "7"]
+        assert packed.camera_frames["missing"] is None
+        assert packed.camera_frames["front"].source_timestamp == 10.0
+        assert type(packed.camera_frames["front"].source_timestamp) is float
+        assert packed.camera_frames["front"].metadata is not frame.metadata
+        assert packed.camera_frames["front"].metadata["calibration"] is metadata_array
+        assert packed.camera_frames["front"].unaligned_depth_image is None
+        assert packed.camera_frames["front"].unaligned_depth_metadata == {}
+        assert packed.component_metadata is snapshot.component_metadata
+        assert packed.step_result is snapshot.step_result
+        assert packed.snapshot_timings_s is snapshot.snapshot_timings_s
+        assert type(packed.arm_states) is dict
+
+        decoded = ForkingPickler.loads(ForkingPickler.dumps(packed))
+        assert payloads(decoded) == refs
+        hydrated, hydrated_slot = process_writer._hydrate_snapshot(
+            decoded, {block.name: block for block in pool.blocks}
+        )
+        assert hydrated_slot == slot
+        views = payloads(hydrated)
+        raw = np.ndarray((pool.slot_bytes,), dtype=np.uint8, buffer=pool.blocks[0].buf)
+        for view, array in zip(views, expected, strict=True):
+            np.testing.assert_array_equal(view, array)
+            assert view.dtype == array.dtype
+            assert np.shares_memory(view, raw)
+        assert not np.shares_memory(views[3], views[4])
+        rgb.fill(255)
+        joints.fill(255)
+        np.testing.assert_array_equal(views[0], expected[0])
+        np.testing.assert_array_equal(views[3], expected[3])
+        raw[refs[0].offset] = 99
+        assert views[0].reshape(-1)[0] == 99
+        views[3][0] = 42
+        assert views[4][0] == expected[4][0]
+        assert isinstance(hydrated.hand_states["left"]["nested"], list)
+        assert isinstance(hydrated.hand_states["left"]["nested"][1], tuple)
+        assert hydrated.hand_states["left"]["nested"][1][0] is None
+        assert hydrated.arm_states["left"]["plain_list"] == [1, None, "unchanged"]
+        assert hydrated.component_metadata is decoded.component_metadata
+        assert hydrated.step_result is decoded.step_result
+        assert hydrated.snapshot_timings_s is decoded.snapshot_timings_s
+        assert hydrated.include_debug_metadata and hydrated.include_action_debug_metadata
+        assert hydrated.camera_frames["front"].unaligned_depth_image is None
+        assert hydrated.camera_frames["front"].unaligned_depth_metadata == {}
+    finally:
+        pool.close()
+
+
+@pytest.mark.parametrize("empty_array", [False, True])
+def test_shared_snapshot_zero_bytes_keeps_empty_array_distinct_from_no_payload(empty_array) -> None:
+    values = {"empty": np.empty((0, 6), dtype=np.float32)} if empty_array else {"plain": [1, None]}
+    snapshot = replace(
+        _snapshot(), camera_frames={"front": None}, arm_states={"left": values},
+        hand_states={}, position_reference=None,
+        component_metadata={"not_shared": np.ones(10)},
+    )
+    pool = process_writer._SharedSlotPool(slot_count=1, slot_bytes=64)
+    try:
+        slot = pool.acquire()
+        packed, byte_count = pool.pack_snapshot(snapshot, slot_id=slot)
+        assert byte_count == 0
+        hydrated, hydrated_slot = process_writer._hydrate_snapshot(
+            packed, {block.name: block for block in pool.blocks}
+        )
+        assert hydrated_slot == (slot if empty_array else None)
+        assert hydrated.camera_frames == {"front": None}
+        assert hydrated.position_reference is None
+        assert hydrated.component_metadata is snapshot.component_metadata
+        if empty_array:
+            assert hydrated.arm_states["left"]["empty"].shape == (0, 6)
+        else:
+            assert hydrated.arm_states == snapshot.arm_states
+    finally:
+        pool.close()
+
+
+def test_shared_snapshot_capacity_error_precedes_camera_timestamp_and_retains_lease() -> None:
+    snapshot = replace(
+        _snapshot(), camera_frames={"front": VideoFrame(
+            image=np.ones(128, dtype=np.uint8), source_timestamp=object(),
+        )},
+    )
+    pool = process_writer._SharedSlotPool(slot_count=1, slot_bytes=64)
+    try:
+        slot = pool.acquire()
+        with pytest.raises(BufferError, match="required=128 configured=64"):
+            pool.pack_snapshot(snapshot, slot_id=slot)
+        assert pool.available_count == 0
+        pool.release(slot)
+        assert pool.acquire() == slot
+    finally:
+        pool.close()
+
+
+@pytest.mark.parametrize("bad_field", ["source_timestamp", "metadata"])
+def test_shared_snapshot_camera_fields_fail_before_depth_or_state_payloads(bad_field) -> None:
+    frame = VideoFrame(
+        image=np.ones(1, dtype=np.uint8), source_timestamp=1.0,
+        depth_image=np.ones(128, dtype=np.uint8),
+    )
+    frame = replace(frame, **{bad_field: object() if bad_field == "source_timestamp" else None})
+    snapshot = replace(_snapshot(), camera_frames={"front": frame})
+    pool = process_writer._SharedSlotPool(slot_count=1, slot_bytes=64)
+    try:
+        slot = pool.acquire()
+        with pytest.raises(TypeError):
+            pool.pack_snapshot(snapshot, slot_id=slot)
+    finally:
+        pool.close()
+
+
+@pytest.mark.parametrize("corruption", ["slot", "bytes", "missing_block", "bounds"])
+def test_shared_snapshot_hydration_retains_descriptor_validation(corruption) -> None:
+    pool = process_writer._SharedSlotPool(slot_count=1, slot_bytes=4096)
+    try:
+        slot = pool.acquire()
+        packed, _ = pool.pack_snapshot(_snapshot(), slot_id=slot)
+        ref = packed.hand_states["left"]["tactile_dict"]["sensor_a"]
+        if corruption == "slot":
+            broken = replace(ref, slot_id=slot + 1, shm_name="unavailable")
+            error, message = RuntimeError, "multiple shared slots"
+        elif corruption == "bytes":
+            broken = replace(ref, nbytes=ref.nbytes + 1)
+            error, message = RuntimeError, "byte count mismatch"
+        elif corruption == "missing_block":
+            broken = replace(ref, shm_name="unavailable")
+            error, message = KeyError, "unavailable"
+        else:
+            broken = replace(ref, offset=pool.slot_bytes)
+            error, message = TypeError, "buffer is too small"
+        packed.hand_states["left"]["tactile_dict"]["sensor_a"] = broken
+        with pytest.raises(error, match=message):
+            process_writer._hydrate_snapshot(packed, {block.name: block for block in pool.blocks})
+    finally:
+        pool.close()
+
+
+def test_shared_snapshot_hydration_keeps_non_reference_values() -> None:
+    snapshot = _snapshot()
+    hydrated, slot = process_writer._hydrate_snapshot(snapshot, {})
+    assert slot is None
+    assert hydrated.camera_frames["front"].image is snapshot.camera_frames["front"].image
+    assert hydrated.hand_states["left"]["tactile_dict"]["sensor_a"] is (
+        snapshot.hand_states["left"]["tactile_dict"]["sensor_a"]
+    )
+
+
+def test_shared_snapshot_serialization_failure_releases_the_only_parent_slot(tmp_path) -> None:
+    worker = ProcessCollectionWorker(
+        writer_config=LeRobotV21WriterConfig(
+            root_dir=tmp_path, write_parquet=False, write_video=False,
+        ),
+        sample_builder_config=CollectorSampleBuilderConfig(),
+        config=ProcessCollectionConfig(
+            queue_size=1, shared_slot_count=1, shared_slot_bytes=4096, worker_nice=0,
+        ),
+    )
+    try:
+        worker.start()
+        episode = worker.start_episode({})
+        snapshot = _snapshot()
+        unpicklable = replace(snapshot, component_metadata={"invalid": lambda: None})
+        with pytest.raises(TypeError, match="sample is not serializable"):
+            worker.submit_snapshot(unpicklable)
+        assert worker.stats().submitted_samples == 0
+        assert worker.submit_snapshot(snapshot)
+        worker.flush()
+        assert worker.stats().completed_samples == 1
+        assert worker.stats().worker_error is None
+        worker.finalize_episode(episode, summary={"test": "shared-slot-recovery"})
+    finally:
+        worker.close()
 
 
 def test_process_collection_worker_writes_and_finalizes_without_hardware(tmp_path) -> None:

@@ -24,6 +24,7 @@ import numpy as np
 
 from dataset_interface.modality_artifacts import PAYLOAD_HASH_PREFER_SEALED
 
+from .atomic_json import atomic_write_json as _atomic_write_json
 from .modality_inventory import publish_tracked_modality_inventory
 from .process_quiescence import (
     active_formal_collection_processes as _active_collection_processes,
@@ -104,26 +105,6 @@ def _read_jsonl(path: Path) -> list[dict[str, Any]]:
             if isinstance(payload, dict):
                 rows.append(payload)
     return rows
-
-
-def _atomic_write_json(path: Path, payload: Mapping[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
-    temporary = Path(temporary_name)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump(dict(payload), handle, ensure_ascii=True, sort_keys=True, indent=2)
-            handle.write("\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary, path)
-        directory_fd = os.open(path.parent, os.O_RDONLY)
-        try:
-            os.fsync(directory_fd)
-        finally:
-            os.close(directory_fd)
-    finally:
-        temporary.unlink(missing_ok=True)
 
 
 def _atomic_write_bytes(path: Path, payload: bytes) -> None:
@@ -672,7 +653,7 @@ def recompress_tactile_zstd_in_place(
             replacements: dict[str, dict[str, Any]] = {}
             source_stats: dict[Path, os.stat_result] = {}
             original_manifest_bytes = manifest_path.read_bytes()
-            manifest_committed = False
+            manifest_publish_attempted = False
             manifest_raw_bytes = 0
             manifest_compressed_bytes = 0
             try:
@@ -780,8 +761,9 @@ def recompress_tactile_zstd_in_place(
                         "Formal collection started before tactile manifest commit: "
                         + "; ".join(active_collection[:3])
                     )
+                # Replacement can succeed before directory durability fails.
+                manifest_publish_attempted = True
                 _atomic_write_json(manifest_path, updated_manifest)
-                manifest_committed = True
                 committed_manifest = _read_json(manifest_path)
                 if committed_manifest.get(
                     "tactile_recompression"
@@ -790,7 +772,8 @@ def recompress_tactile_zstd_in_place(
                         f"Committed tactile manifest verification failed: {manifest_path}"
                     )
             except BaseException:
-                if manifest_committed:
+                if manifest_publish_attempted:
+                    # A failed restore must leave both payload sets available.
                     _atomic_write_bytes(manifest_path, original_manifest_bytes)
                 for target in created:
                     target.unlink(missing_ok=True)
