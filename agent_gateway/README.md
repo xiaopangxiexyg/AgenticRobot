@@ -69,6 +69,20 @@ event replay and generic operations to begin/upload/commit an Artifact,
 begin/read/acknowledge a download, and acknowledge an upper-owned durable
 materialization.
 
+Authenticated `healthz` also projects `domain_control_state` using
+`agent_gateway.domain_control_state.v1`: the current runtime identity, the
+Gateway owner's stop latch, confirmation backed by its lower receipt, and
+that receipt's reference. Reading it performs no device polling, Skill, HOLD,
+stop or recovery. It does not certify physical motion readiness. Clients must
+treat absent or unreadable state as unknown rather than infer readiness from
+transport `status=ok`.
+
+The real application binds its existing fault/lifecycle reader once during
+startup. `control_fault_reason` is bounded and read afresh; the transport keeps
+no second fault latch. Non-running/faulted application states remain visible
+to clients, and failed reads produce an error instead of a healthy snapshot.
+Queue orchestration remains an upper-framework responsibility.
+
 There is no RGB- or depth-image method in the protocol. A capture Skill declares
 its selection parameters, output Artifact slots with media/schema/size
 constraints, and a normal executor binding. The same machinery supports point

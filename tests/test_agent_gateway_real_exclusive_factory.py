@@ -396,11 +396,14 @@ def test_application_owns_control_loop_and_holds_before_resource_close() -> None
         config=ExclusiveRealSkillApplicationConfig(control_hz=100.0),
     )
 
+    assert application.control_fault_reason == "application_not_running:created"
     application.start()
+    assert server.control_fault_reader() is None
     time.sleep(0.03)
     application.close()
 
     assert application.state == ExclusiveRealSkillApplicationState.CLOSED
+    assert server.control_fault_reader() == "application_not_running:closed"
     assert resources.starts == 1
     assert resources.closes == 1
     assert application.startup_admission_receipt == {"startup": "admitted"}
@@ -408,6 +411,46 @@ def test_application_owns_control_loop_and_holds_before_resource_close() -> None
     assert holds
     assert deployment.control_runtime.last_hold_receipt is not None
     assert deployment.control_runtime.last_hold_receipt.succeeded is True
+
+
+@pytest.mark.parametrize("message", ["", " \n\t ", "a" * 497 + " " + "tail" * 20])
+def test_application_fault_text_satisfies_health_contract(message):
+    holds = []
+    deployment = _deployment(observation_provider=_fresh_observation_cut, hold_reasons=holds)
+    application = ExclusiveRealSkillApplication(deployment=deployment, resources=_Resources(),
+        startup_admission=lambda: {}, server_factory=_Server)
+    application._control_fault = RuntimeError(message)
+    reason = application.control_fault_reason
+    assert reason.startswith("RuntimeError") and reason == reason.strip()
+    assert 0 < len(reason) <= 512
+    if not message.strip():
+        assert reason == "RuntimeError"
+    assert holds == []
+
+
+def test_application_fault_reader_binding_failure_closes_the_same_server():
+    class BoundServer(_Server):
+        @property
+        def control_fault_reader(self):
+            return lambda: "another-owner"
+
+        @control_fault_reader.setter
+        def control_fault_reader(self, value):
+            raise RuntimeError("control fault reader is already bound")
+
+    resources = _Resources()
+    server = BoundServer()
+    holds = []
+    deployment = _deployment(observation_provider=_fresh_observation_cut, hold_reasons=holds)
+    application = ExclusiveRealSkillApplication(deployment=deployment, resources=resources,
+        startup_admission=lambda: {"startup": "admitted"}, server_factory=lambda: server)
+    with pytest.raises(RuntimeError, match="already bound"):
+        application.start()
+    assert application.state == ExclusiveRealSkillApplicationState.FAULT
+    assert server.closed == 1 and resources.starts == resources.closes == 1
+    assert holds
+    application.close()
+    assert server.closed == 1 and resources.closes == 1
 
 
 def test_application_close_failure_is_retryable_and_retains_resources(
@@ -490,6 +533,9 @@ def test_application_control_fault_reaches_hold_without_another_read() -> None:
 
     assert application.state == ExclusiveRealSkillApplicationState.FAULT
     assert isinstance(application.control_fault, RuntimeError)
+    count_before_health = calls
+    assert "dual RM65 state read failed" in application.control_fault_reason
+    assert calls == count_before_health
     assert holds
     assert deployment.control_runtime.last_hold_receipt is not None
     assert deployment.control_runtime.last_hold_receipt.succeeded is True

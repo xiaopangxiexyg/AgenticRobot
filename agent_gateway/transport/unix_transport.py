@@ -586,6 +586,7 @@ class AgentGatewayUnixJsonServer(
             DEFAULT_AGENT_GATEWAY_UNIX_PEER_IDLE_TIMEOUT_SEC
         ),
         max_disconnect_events: int = 64,
+        control_fault_reader: Callable[[], str | None] | None = None,
     ) -> None:
         path, peer_idle_timeout = validate_agent_gateway_unix_server_preflight(
             socket_path=socket_path,
@@ -597,6 +598,8 @@ class AgentGatewayUnixJsonServer(
             raise TypeError("facade_factory must be callable.")
         if not callable(close_gateway):
             raise TypeError("close_gateway must be callable.")
+        if control_fault_reader is not None and not callable(control_fault_reader):
+            raise TypeError("control_fault_reader must be callable.")
         if (
             isinstance(max_disconnect_events, bool)
             or not isinstance(max_disconnect_events, int)
@@ -613,6 +616,7 @@ class AgentGatewayUnixJsonServer(
         self.peer_client_map = peer_client_map
         self._facade_factory = facade_factory
         self._close_gateway = close_gateway
+        self._control_fault_reader = control_fault_reader
         self._connection_lock = threading.RLock()
         self._connection_available = threading.Condition(self._connection_lock)
         self._active_connections: dict[str, dict[int, socket.socket]] = {}
@@ -656,6 +660,20 @@ class AgentGatewayUnixJsonServer(
             finally:
                 self._unlink_owned_endpoint()
             raise
+
+    @property
+    def control_fault_reader(self) -> Callable[[], str | None] | None:
+        return self._control_fault_reader
+
+    @control_fault_reader.setter
+    def control_fault_reader(self, reader: Callable[[], str | None]) -> None:
+        """Bind the application's existing owner once, before serving it."""
+        if not callable(reader):
+            raise TypeError("control_fault_reader must be callable.")
+        with self._connection_lock:
+            if self._control_fault_reader is not None:
+                raise RuntimeError("control fault reader is already bound.")
+            self._control_fault_reader = reader
 
     @property
     def active_client_ids(self) -> tuple[str, ...]:
@@ -763,12 +781,18 @@ class AgentGatewayUnixJsonServer(
     ) -> tuple[Mapping[str, Any], bool]:
         try:
             if request.method == "healthz":
+                reader = self.control_fault_reader
+                fault = reader() if reader is not None else None
+                if fault is not None:
+                    fault = _required_text(fault, field_name="control_fault_reason", max_length=512)
                 result: object = {
                     "status": "ok",
                     "protocol": AGENT_GATEWAY_UNIX_JSON_PROTOCOL_V2,
                     "authenticated_client_id": client_id,
                     "max_frame_bytes": self.max_frame_bytes,
                     "peer_idle_timeout_sec": self.peer_idle_timeout_sec,
+                    "domain_control_state": facade.get_domain_control_state(),
+                    "control_fault_reason": fault,
                 }
             elif request.method == "get_skill_definition_catalog":
                 result = facade.get_skill_definition_catalog()

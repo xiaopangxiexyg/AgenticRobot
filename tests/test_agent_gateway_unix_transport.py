@@ -32,6 +32,14 @@ class _FakeBoundFacade(BoundAgentGatewayWireAdapter):
         self.authenticated_client_id = client_id
         self.requests: list[tuple[str, object]] = []
         self.disconnect_reasons: list[str] = []
+        self.domain_state = {
+            "schema": "agent_gateway.domain_control_state.v1",
+            "runtime_session_id": "runtime:test", "emergency_stop_latched": False,
+            "emergency_stop_confirmed": False, "lower_stop_receipt_ref": None,
+        }
+
+    def get_domain_control_state(self):
+        return dict(self.domain_state)
 
     def get_skill_definition_catalog(self):
         self.requests.append(("get_skill_definition_catalog", None))
@@ -200,6 +208,66 @@ def _stop_server(server, thread) -> None:
     server.server_close()
     thread.join(timeout=2.0)
     assert not thread.is_alive()
+
+
+@pytest.mark.parametrize("confirmed", [False, True])
+def test_health_projects_current_owner_state_without_control_requests(short_unix_socket_path_factory, confirmed):
+    facade = _FakeBoundFacade("rpent:test")
+    path = short_unix_socket_path_factory("health-state")
+    server, thread, _ = _start_server(path=path, facade=facade)
+    fault = [None]
+    server.control_fault_reader = lambda: fault[0]
+    try:
+        with socket.socket(socket.AF_UNIX) as peer:
+            peer.connect(str(path))
+            first = _raw_call(peer, request_id="h1", method="healthz", payload=None)
+            assert first["ok"] and first["result"]["domain_control_state"] == facade.domain_state
+            assert first["result"]["control_fault_reason"] is None
+            facade.domain_state.update(emergency_stop_latched=True,
+                emergency_stop_confirmed=confirmed, lower_stop_receipt_ref="lower:proof" if confirmed else None)
+            fault[0] = "lower_control_cycle_failed"
+            second = _raw_call(peer, request_id="h2", method="healthz", payload=None)
+            assert second["ok"] and second["result"]["domain_control_state"] == facade.domain_state
+            assert second["result"]["control_fault_reason"] == fault[0]
+            assert facade.requests == []  # Health reads submit no Skill or stop request.
+        with pytest.raises(RuntimeError, match="already bound"):
+            server.control_fault_reader = lambda: None
+    finally:
+        _stop_server(server, thread)
+
+
+@pytest.mark.parametrize("invalid", ["", "x" * 513, 1])
+def test_health_reader_failure_does_not_publish_ready(short_unix_socket_path_factory, invalid):
+    facade = _FakeBoundFacade("rpent:test")
+    path = short_unix_socket_path_factory("bad-health")
+    server, thread, _ = _start_server(path=path, facade=facade)
+    server.control_fault_reader = lambda: invalid
+    try:
+        with socket.socket(socket.AF_UNIX) as peer:
+            peer.connect(str(path))
+            result = _raw_call(peer, request_id="bad", method="healthz", payload=None)
+            assert not result["ok"] and "result" not in result
+    finally:
+        _stop_server(server, thread)
+
+
+@pytest.mark.parametrize("error", [RuntimeError("offline health failure"), OSError("offline read failure")])
+def test_health_reader_exception_never_returns_a_success_snapshot(short_unix_socket_path_factory, error):
+    facade = _FakeBoundFacade("rpent:test")
+    path = short_unix_socket_path_factory("health-error")
+    server, thread, _ = _start_server(path=path, facade=facade)
+
+    def fail():
+        raise error
+
+    server.control_fault_reader = fail
+    try:
+        with socket.socket(socket.AF_UNIX) as peer:
+            peer.connect(str(path))
+            result = _raw_call(peer, request_id="error", method="healthz", payload=None)
+            assert not result["ok"] and "result" not in result
+    finally:
+        _stop_server(server, thread)
 
 
 def test_peer_map_is_one_to_one_and_rejects_unconfigured_uid() -> None:

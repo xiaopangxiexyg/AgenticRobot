@@ -28,6 +28,12 @@ class ExclusiveRealSkillResources(Protocol):
 class ExclusiveRealSkillServer(Protocol):
     """Bounded server lifecycle needed by the application owner."""
 
+    @property
+    def control_fault_reader(self) -> Callable[[], str | None] | None: ...
+
+    @control_fault_reader.setter
+    def control_fault_reader(self, reader: Callable[[], str | None]) -> None: ...
+
     def serve_forever(self, poll_interval: float = 0.5) -> None: ...
 
     def shutdown(self) -> None: ...
@@ -119,6 +125,19 @@ class ExclusiveRealSkillApplication:
             return self._control_fault
 
     @property
+    def control_fault_reason(self) -> str | None:
+        """Read the application's existing fault/lifecycle state; no device I/O."""
+        with self._lock:
+            fault, state = self._control_fault, self._state
+        if fault is not None:
+            name = type(fault).__name__
+            detail = " ".join(str(fault).split())
+            return (f"{name}: {detail}" if detail else name)[:512].strip()
+        if state != ExclusiveRealSkillApplicationState.RUNNING:
+            return f"application_not_running:{state.value}"
+        return None
+
+    @property
     def startup_admission_receipt(self) -> object | None:
         with self._lock:
             return self._startup_admission_receipt
@@ -158,6 +177,7 @@ class ExclusiveRealSkillApplication:
                 self.deployment.control_runtime.request_startup_hold()
             self.deployment.control_runtime.step()
             server = self.server_factory()
+            server.control_fault_reader = lambda: self.control_fault_reason
             for name in ("serve_forever", "shutdown", "server_close"):
                 if not callable(getattr(server, name, None)):
                     raise TypeError(f"server must expose {name}.")
