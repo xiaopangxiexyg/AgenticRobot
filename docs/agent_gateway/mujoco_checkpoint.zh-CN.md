@@ -13,11 +13,16 @@ manual/immediate target；这是可信内存内分支，不是完整节点磁盘
 唯一失败是 `test_current_arm_runtime_binding_uses_exact_current_inputs`：V18冻结源
 绑定与候选的 actuator `core.py`、`agent_skill_target.py`、`runtime.py` 三项源码不同。
 原 V18 文件与其历史验证未改写，arm profile、simulation contract 和 MuJoCo executor
-未更改；不能用原 V18 的验证声明替代当前候选资格。后续须派生独立 source binding，
-登记这三项变化及新增 checkpoint 依赖和固定验证证据，再申请集成，不仅替换旧哈希。
+未更改；不能用原 V18 的验证声明替代当前候选资格。
 完整 non-hardware 验收另在预检因缺少固定 B601 子模块 URDF 返回2，未启动任何 shard。
 该失败回执保持原样。本轮已在独立候选中准备与主线相同 gitlink 的 B601 子模块；
-不会修改主线子模块或共享源码。当前继续完成 observer 及固定源码重新绑定，未提升 development。
+不会修改主线子模块或共享源码。
+
+本轮固定源码 `db09fe458444` 的25模块组合回归为 **679通过、1跳过、零失败**。
+新 V25 runtime binding 在保留最新 V24 原件的基础上登记上述三项变化、20项候选变更依赖及
+39项既有直接 owner／record／编码合同；147项输入／144项源码均逐字节匹配该提交，并绑定真实消费者日志与 JUnit 回执哈希。
+它不重新拟合 arm profile；唯一跳过项是未安装的 RPent 配对扩展，不代表 RPent 联合
+验收。完整仓库验收另行记录，尚未提升 development。
 
 ## 真正开启的 Cartesian 执行观察
 
@@ -413,12 +418,13 @@ proposal/epoch/permit/schedule 状态及 qpos/qvel/ctrl/warmstart，另验证真
 ## 尚未完成，不能据此放开上层
 
 1. Gateway admission、物理线程和控制 owner 的联合静止边界。
-2. 将本轮已装配的 manual/immediate target 分支接到真实 Gateway profile，补齐实际
-   开启的 execution observer、外层 safety/plan 的续跑合同。immediate pending reference
-   已验证；scheduled segment 及异步 activation 仍未纳入资格，不能直接放行。
+2. 将本轮已装配的 manual/immediate target 分支接到真实 Gateway profile。标准
+   Cartesian execution observer 已随 target 验证；外层 safety/plan 及 application
+   lifecycle 仍待补齐。immediate pending reference 已验证；scheduled segment 及
+   异步 activation 仍未纳入资格，不能直接放行。
 3. 新实例中 FK、collision、payload、observer、scratch 等消费者的统一绑定。
-4. 当前候选新的 runtime source binding、完整验收资源，以及 profile 身份、持久化/
-   原子提交、历史产物与恢复分支的来源关系。旧 V18 不能冒充新源码的资格证据。
+4. V25 已独立登记当前候选的源码与消费者证据；完整仓库门禁仍须单独验收。
+   profile 身份、持久化/原子提交、历史产物与恢复分支的来源关系尚待接入。
 5. sleep 混合状态、完整 no-model profile、渲染和远端组合验收。
 6. RPent SDK/runtime/记录前缀与上述下层合同的联合恢复。
 

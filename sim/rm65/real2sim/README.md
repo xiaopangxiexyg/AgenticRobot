@@ -92,7 +92,17 @@ core and MuJoCo adapter used for the 20260721 fit; tests compare those hashes to
 fixed historical values rather than silently reinterpreting the fit against
 the current files.
 
-当前运行时源码绑定为 `artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261025_v24.json`。
+当前候选运行时源码绑定为 `artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261026_v25.json`。
+V25 保留 V24 原件及拟合参数，登记 manual/immediate target checkpoint 与真正开启的
+Cartesian 执行观察续跑。继承 88 项输入，其中 3 项源码已改变；新增 20 项候选变更依赖及39项既有直接 owner／record／编码合同，
+共 147 项输入、144 项源码，逐文件匹配固定提交 `db09fe458444`。
+绑定的 25 模块消费者回归为 679 通过、1 跳过、零失败，涵盖原生 MuJoCo 及既有
+Gateway 消费者；跳过的是未安装的 RPent 配对扩展，不能称为 RPent 联合验收。
+这份报告不冒充完整仓库验收。观察恢复不补发历史帧、不重新发放
+控制权，也不关闭原本启用的观察。此资格仍限于可信内存 target 分支，不代表完整
+Gateway 会话、上层 agent 上下文、磁盘冷恢复或新的真机／held-out 验收。
+
+历史 V24 为 `artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261025_v24.json`。
 V24 冻结 V23，并补齐 ControlStation 兼容调用方的源码绑定。继承的 86 项输入
 保持 V23 字节，新增兼容入口与 Real factory 两项，共 88 项输入、85 项源码，
 匹配固定提交 `9156ae01d`；对应调用方验收为 125 项通过、零失败。
