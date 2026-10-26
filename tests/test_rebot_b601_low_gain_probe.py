@@ -4757,7 +4757,9 @@ def test_workspace_terminal_notice_is_immediate_and_emitted_once(monkeypatch):
     probe._flush_automatic_calibration_records(controller, probe._DynamicsTrace(stream))
     assert len(notices) == 1
     assert "leg_timeout" in notices[0]
-    assert "no automatic retry or return" in notices[0]
+    assert "no automatic retry" in notices[0]
+    assert "separate workspace return" in notices[0]
+    assert "Acquisition stop is not full disable" in notices[0]
     assert len(stream.getvalue().splitlines()) == 1
 
 

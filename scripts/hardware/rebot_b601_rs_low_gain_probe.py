@@ -7219,8 +7219,9 @@ def _flush_automatic_calibration_records(torque_console, debug_trace, cycle_timi
             and record.get("phase") in {"failed", "cancelled"}):
             _operator_notice(
                 f"[B601] ACQUISITION STOPPED: {record.get('reason')}; "
-                "no automatic retry or return. No new acquisition targets; "
-                "check owner withdrawal/hold/disable receipts. Acquisition stop is not full disable."
+                "no automatic retry. No new acquisition targets; "
+                "check separate workspace return and owner withdrawal/hold/disable receipts. "
+                "Acquisition stop is not full disable."
             )
 
 
