@@ -114,6 +114,17 @@ neither net line reductions nor test-count quotas are acceptance criteria.
 freshness 和静止性边界测试继续覆盖原路径。该用例中的可控历史是测试输入，
 不能作为真实设备采样时序的验证证据。
 
+### Worker 清理故障测试的等待压缩
+
+`test_owned_worker_cleanup.py` 的启动结果未知矩阵保留五类 owner 与两种异常，
+继续验证未确认退出时依赖保留、同一线程迟到启动后才允许最终释放。故障注入明确没有
+调用 native allocator，因此只在该线程实例的启动事件上使用真实 `Event.wait(0)`，
+不再重复等待生产级的一至两秒预算；不替换 `join_and_confirm` 或伪造完成状态。
+同时直接断言该线程的退出确认仍为 False，避免其他关闭门禁掩盖错误的线程完成判定。
+真实迟到启动与最终清理前恢复原等待。独立用例使用事件握手和真实等待验证迟到启动可
+唤醒退出确认；已运行线程、受损 liveness、join 中断等原有场景不使用该压缩。
+生产超时、线程实现、安全判断及其他测试的等待均不变，这不是生产超时性能基准。
+
 ### Runtime artifact 重复迁移压缩
 
 `test_runtime_artifact_migration.py` 将已发布迁移的幂等检查接在已有完整成功场景后，

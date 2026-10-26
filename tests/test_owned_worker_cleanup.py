@@ -116,6 +116,13 @@ def test_unknown_thread_start_retains_dependencies_until_late_bootstrap(kind, fa
     original_start = threading.Thread.start
     def unknown_start(thread):
         if thread.name == owner.name:
+            # This injected launch never reaches the native allocator. Only
+            # poll its entry event; do not fake the owner's completion result.
+            wait_for_entry = thread._runner_entered.wait
+            def poll_unstarted_entry(timeout=None):
+                assert thread.ident is None and not thread._runner_entered.is_set()
+                return wait_for_entry(timeout=0.)
+            patch.setattr(thread._runner_entered, "wait", poll_unstarted_entry)
             raise failure("unconfirmed thread launch")
         return original_start(thread)
     try:
@@ -123,12 +130,15 @@ def test_unknown_thread_start_retains_dependencies_until_late_bootstrap(kind, fa
             patch.setattr(threading.Thread, "start", unknown_start)
             with pytest.raises(failure, match="unconfirmed thread launch"):
                 owner.start()
-        thread = owner.thread()
-        assert thread is not None
-        with pytest.raises(RuntimeError):
-            owner.close()
-        assert owner.retained()
-        assert owner.thread() is thread
+            thread = owner.thread()
+            assert thread is not None
+            # Other shutdown gates must not mask an unsafe thread receipt.
+            assert thread.join_and_confirm(timeout=0.) is False
+            with pytest.raises(RuntimeError):
+                owner.close()
+            assert owner.retained()
+            assert owner.thread() is thread
+        # Restore normal event waits before real bootstrap and final cleanup.
         # Model an already acquired native thread whose bootstrap was delayed.
         original_start(thread)
         threading.Thread.join(thread, timeout=2.)
@@ -136,6 +146,43 @@ def test_unknown_thread_start_retains_dependencies_until_late_bootstrap(kind, fa
         assert owner.closed()
     finally:
         _emergency_test_cleanup(owner)
+
+
+def test_owned_worker_real_entry_wait_accepts_late_bootstrap(monkeypatch):
+    from utils.owned_thread import OwnedThread
+
+    worker = OwnedThread(target=lambda: None)
+    original_start = threading.Thread.start
+    with monkeypatch.context() as patch:
+        def unknown_start(thread):
+            if thread is worker:
+                raise RuntimeError("unconfirmed thread launch")
+            return original_start(thread)
+        patch.setattr(threading.Thread, "start", unknown_start)
+        with pytest.raises(RuntimeError, match="unconfirmed thread launch"):
+            worker.start()
+
+    waiting = threading.Event()
+    result = []
+    wait_for_entry = worker._runner_entered.wait
+    def observe_real_wait(timeout=None):
+        waiting.set()
+        return wait_for_entry(timeout=timeout)
+    monkeypatch.setattr(worker._runner_entered, "wait", observe_real_wait)
+    joiner = threading.Thread(
+        target=lambda: result.append(worker.join_and_confirm(timeout=2.)))
+    joiner.start()
+    try:
+        assert waiting.wait(1.)
+        assert result == []
+        original_start(worker)
+        joiner.join(timeout=3.)
+        assert not joiner.is_alive()
+        assert result == [True]
+    finally:
+        if worker.ident is not None:
+            worker.join(timeout=2.)
+        joiner.join(timeout=3.)
 
 
 @pytest.mark.parametrize("kind", ["application", "sampler", "watchdog", "poller", "udp"])
