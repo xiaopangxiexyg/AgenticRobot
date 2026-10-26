@@ -2880,6 +2880,170 @@ def test_estimated_execution_time_orders_ik_branches_by_joint_speed(
     assert tuple(item.seed_index for item in ordered) == (1, 0)
 
 
+def test_optional_tcp_arc_order_prefers_shorter_fk_sweep_without_changing_other_arm(
+    monkeypatch,
+) -> None:
+    current = np.zeros(6)
+    original = _planner_without_assets(
+        config=RM65GraspTrajectoryPlanningConfig(
+            endpoint_candidate_ordering=(
+                grasp_trajectory_module.RM65_GRASP_ENDPOINT_ORDER_ESTIMATED_EXECUTION_TIME
+            ),
+        )
+    )
+    planner = _planner_without_assets(
+        config=RM65GraspTrajectoryPlanningConfig(
+            endpoint_candidate_ordering=(
+                grasp_trajectory_module.RM65_GRASP_ENDPOINT_ORDER_TCP_ARC_EXECUTION_TIME
+            ),
+        )
+    )
+    planner.planner_config = JointPathPlannerConfig()
+    monkeypatch.setattr(
+        grasp_trajectory_module,
+        "load_joint_velocity_limit_profiles",
+        lambda: {"test-velocity": SimpleNamespace(
+            max_velocity_deg_s=(100., 10., 100., 100., 100., 100.),
+        )},
+    )
+    def endpoint(seed, joint, value):
+        right = current.copy()
+        right[joint] = value
+        return grasp_trajectory_module._EndpointIKCandidate(
+            qpos_by_side={"left": current.copy(), "right": right},
+            seed_index=seed, solve_cycles=1,
+            position_residual_m=0., orientation_residual_deg=0.,
+        )
+    slow_joint_short_arc = endpoint(0, 1, .30)
+    fast_joint_long_arc = endpoint(1, 0, .40)
+    calls = []
+    def fk(*, left_qpos, right_qpos):
+        np.testing.assert_array_equal(left_qpos, current)
+        calls.append(float(right_qpos[0]))
+        pose = np.eye(4)
+        pose[0, 3] = .75 * right_qpos[0] + right_qpos[1]
+        pose[1, 3] = .2 * np.sin(np.pi * right_qpos[0] / .4)
+        return {"left": np.eye(4), "right": pose}
+    planner.target_builder = SimpleNamespace(tool_tcp_world_targets_for_qpos_pair=fk)
+    original.target_builder = planner.target_builder
+    np.testing.assert_allclose(
+        fk(left_qpos=current, right_qpos=slow_joint_short_arc.qpos_by_side["right"])["right"],
+        fk(left_qpos=current, right_qpos=fast_joint_long_arc.qpos_by_side["right"])["right"],
+        atol=1e-12,
+    )
+    calls.clear()
+    assert tuple(item.seed_index for item in original._ordered_endpoint_candidates(
+        candidates=(slow_joint_short_arc, fast_joint_long_arc),
+        current_qpos=current, side="right",
+    )) == (1, 0)
+    assert not calls  # Original ranking does no FK work.
+    ordered = planner._ordered_endpoint_candidates(
+        candidates=(slow_joint_short_arc, fast_joint_long_arc),
+        current_qpos=current, side="right",
+    )
+    assert tuple(item.seed_index for item in ordered) == (0, 1)
+    assert len(calls) >= 4  # The shared edge-cost samples actual FK intermediates.
+    np.testing.assert_array_equal(current, np.zeros(6))
+
+
+def test_optional_tcp_arc_order_fails_on_corrupt_fk_metric(monkeypatch) -> None:
+    planner = _planner_without_assets(
+        config=RM65GraspTrajectoryPlanningConfig(
+            endpoint_candidate_ordering=(
+                grasp_trajectory_module.RM65_GRASP_ENDPOINT_ORDER_TCP_ARC_EXECUTION_TIME
+            ),
+        )
+    )
+    planner.planner_config = JointPathPlannerConfig()
+    monkeypatch.setattr(
+        grasp_trajectory_module,
+        "load_joint_velocity_limit_profiles",
+        lambda: {"test-velocity": SimpleNamespace(max_velocity_deg_s=(100.,) * 6)},
+    )
+    current = np.zeros(6)
+    candidate = grasp_trajectory_module._EndpointIKCandidate(
+        qpos_by_side={"left": current.copy(), "right": current.copy()},
+        seed_index=0, solve_cycles=1,
+        position_residual_m=0., orientation_residual_deg=0.,
+    )
+    planner._tcp_path_edge_cost = lambda *a, **kw: float("nan")
+    with pytest.raises(ValueError, match="Endpoint TCP arc"):
+        planner._ordered_endpoint_candidates(
+            candidates=(candidate,), current_qpos=current, side="right",
+        )
+
+
+def test_optional_tcp_arc_order_respects_shared_search_deadline(monkeypatch) -> None:
+    planner = _planner_without_assets(
+        config=RM65GraspTrajectoryPlanningConfig(
+            endpoint_candidate_ordering=(
+                grasp_trajectory_module.RM65_GRASP_ENDPOINT_ORDER_TCP_ARC_EXECUTION_TIME
+            ),
+        )
+    )
+    planner.planner_config = JointPathPlannerConfig()
+    monkeypatch.setattr(
+        grasp_trajectory_module,
+        "load_joint_velocity_limit_profiles",
+        lambda: {"test-velocity": SimpleNamespace(max_velocity_deg_s=(100.,) * 6)},
+    )
+    current = np.zeros(6)
+    candidate = grasp_trajectory_module._EndpointIKCandidate(
+        qpos_by_side={"left": current.copy(), "right": current.copy()},
+        seed_index=0, solve_cycles=1,
+        position_residual_m=0., orientation_residual_deg=0.,
+    )
+    planner._tcp_path_edge_cost = lambda *a, **kw: pytest.fail(
+        "Expired search must not start a new FK sweep"
+    )
+    with pytest.raises(RM65GraspTrajectoryPlanningError,
+                       match="path_planning_time_budget_exhausted") as caught:
+        planner._ordered_endpoint_candidates(
+            candidates=(candidate,), current_qpos=current, side="right",
+            deadline=.5, monotonic=lambda: 1.,
+        )
+    assert caught.value.details["planning_phase"] == "endpoint_candidate_ordering"
+
+
+def test_optional_tcp_arc_order_stops_between_fk_samples(monkeypatch) -> None:
+    planner = _planner_without_assets(
+        config=RM65GraspTrajectoryPlanningConfig(
+            endpoint_candidate_ordering=(
+                grasp_trajectory_module.RM65_GRASP_ENDPOINT_ORDER_TCP_ARC_EXECUTION_TIME
+            ),
+        )
+    )
+    planner.planner_config = JointPathPlannerConfig()
+    monkeypatch.setattr(
+        grasp_trajectory_module,
+        "load_joint_velocity_limit_profiles",
+        lambda: {"test-velocity": SimpleNamespace(max_velocity_deg_s=(100.,) * 6)},
+    )
+    current = np.zeros(6)
+    target = current.copy()
+    target[0] = .4  # The original 12-degree edge step requires three FK samples.
+    candidate = grasp_trajectory_module._EndpointIKCandidate(
+        qpos_by_side={"left": current.copy(), "right": target},
+        seed_index=0, solve_cycles=1,
+        position_residual_m=0., orientation_residual_deg=0.,
+    )
+    clock = [0.0]
+    fk_calls = []
+    def fk(*, left_qpos, right_qpos):
+        fk_calls.append(float(right_qpos[0]))
+        clock[0] = 1.1
+        return {"left": np.eye(4), "right": np.eye(4)}
+    planner.target_builder = SimpleNamespace(tool_tcp_world_targets_for_qpos_pair=fk)
+    with pytest.raises(RM65GraspTrajectoryPlanningError,
+                       match="path_planning_time_budget_exhausted") as caught:
+        planner._ordered_endpoint_candidates(
+            candidates=(candidate,), current_qpos=current, side="right",
+            deadline=1.0, monotonic=lambda: clock[0],
+        )
+    assert fk_calls == [0.0]
+    assert caught.value.details["planning_phase"] == "endpoint_candidate_ordering"
+
+
 def test_planner_entrypoint_records_continuous_parameterization(
     monkeypatch,
     tmp_path,

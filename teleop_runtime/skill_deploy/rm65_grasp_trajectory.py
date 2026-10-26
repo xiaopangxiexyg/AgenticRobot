@@ -102,9 +102,13 @@ RM65_GRASP_ENDPOINT_ORDER_JOINT_DISTANCE = "joint_distance"
 RM65_GRASP_ENDPOINT_ORDER_ESTIMATED_EXECUTION_TIME = (
     "estimated_execution_time"
 )
+RM65_GRASP_ENDPOINT_ORDER_TCP_ARC_EXECUTION_TIME = (
+    "tcp_arc_estimated_execution_time"
+)
 RM65_GRASP_ENDPOINT_ORDER_MODES = (
     RM65_GRASP_ENDPOINT_ORDER_JOINT_DISTANCE,
     RM65_GRASP_ENDPOINT_ORDER_ESTIMATED_EXECUTION_TIME,
+    RM65_GRASP_ENDPOINT_ORDER_TCP_ARC_EXECUTION_TIME,
 )
 # A failed fixed-orientation pregrasp is a local-route rejection, not proof
 # that the terminal grasp target is unreachable.  These failures may fall
@@ -1326,6 +1330,8 @@ class RM65GraspJointTrajectoryPlanner:
         candidates: tuple[_EndpointIKCandidate, ...],
         current_qpos: np.ndarray,
         side: str,
+        deadline: float | None = None,
+        monotonic: Callable[[], float] = time.perf_counter,
     ) -> tuple[_EndpointIKCandidate, ...]:
         """Order valid IK branches without adding another path-search pass."""
 
@@ -1359,15 +1365,47 @@ class RM65GraspJointTrajectoryPlanner:
                 "joint velocity profile must expose six positive limits."
             )
 
-        def key(item: _EndpointIKCandidate) -> tuple[float, float, int]:
+        def key(item: _EndpointIKCandidate) -> tuple[float, float, float, int]:
             target = np.asarray(item.qpos_by_side[side], dtype=float)
             delta = np.abs(target - current)
             minimum_joint_time = float(np.max(delta / velocity_limit))
-            estimated_time = minimum_joint_time * self._singularity_interval_scale(
+            joint_time = minimum_joint_time * self._singularity_interval_scale(
                 current,
                 target,
             )
-            return estimated_time, float(np.linalg.norm(delta)), item.seed_index
+            if self.config.endpoint_candidate_ordering == (
+                RM65_GRASP_ENDPOINT_ORDER_TCP_ARC_EXECUTION_TIME
+            ):
+                if deadline is not None:
+                    self._remaining_path_planning_time_sec(
+                        deadline=deadline, monotonic=monotonic,
+                        planning_phase="endpoint_candidate_ordering",
+                    )
+                # A short joint-space chord can sweep the TCP through a long
+                # nonlinear FK arc. This is a ranking estimate only: the real
+                # path and its final parameterization retain every original
+                # collision, envelope and motion-quality check.
+                start = {name: np.asarray(q, dtype=float).copy()
+                         for name, q in item.qpos_by_side.items()}
+                start[side] = current.copy()
+                tcp_arc_m = self._tcp_path_edge_cost(
+                    start, item.qpos_by_side, side=side,
+                    deadline=deadline, monotonic=monotonic,
+                )
+                if deadline is not None:
+                    self._remaining_path_planning_time_sec(
+                        deadline=deadline, monotonic=monotonic,
+                        planning_phase="endpoint_candidate_ordering",
+                    )
+                if not math.isfinite(tcp_arc_m) or tcp_arc_m < 0.0:
+                    raise ValueError("Endpoint TCP arc must be finite and nonnegative.")
+                estimated_time = max(
+                    joint_time, tcp_arc_m / self.config.linear_speed_m_s,
+                )
+                return (estimated_time, joint_time,
+                        float(np.linalg.norm(delta)), item.seed_index)
+            return (joint_time, joint_time,
+                    float(np.linalg.norm(delta)), item.seed_index)
 
         return tuple(sorted(candidates, key=key))
 
@@ -3154,6 +3192,8 @@ class RM65GraspJointTrajectoryPlanner:
                 candidates=tuple(accepted),
                 current_qpos=current,
                 side=side,
+                deadline=deadline,
+                monotonic=monotonic,
             )
             return tuple(
                 replace(candidate, search_attempt_count=len(attempts),
@@ -3916,12 +3956,22 @@ class RM65GraspJointTrajectoryPlanner:
                 left_qpos=left, right_qpos=right)[side][:3, 3])
         return sampled_path_motion_quality(np.asarray(values[side]), np.asarray(positions))
 
-    def _tcp_path_edge_cost(self, start, end, *, side: str) -> float:
-        """Sample FK travel for quality only; collision checks stay independent."""
+    def _tcp_path_edge_cost(
+        self, start, end, *, side: str, deadline: float | None = None,
+        monotonic: Callable[[], float] = time.perf_counter,
+    ) -> float:
+        """Sample FK travel for route cost and optional IK ranking, never admission."""
+        def pose_for_pair(pair):
+            if deadline is not None:
+                self._remaining_path_planning_time_sec(
+                    deadline=deadline, monotonic=monotonic,
+                    planning_phase="endpoint_candidate_ordering",
+                )
+            return self.target_builder.tool_tcp_world_targets_for_qpos_pair(
+                left_qpos=pair["left"], right_qpos=pair["right"])[side]
         return tcp_path_edge_cost(start, end, side=side,
             step_rad=self.planner_config.extension_step_rad,
-            pose_for_pair=lambda pair: self.target_builder.tool_tcp_world_targets_for_qpos_pair(
-                left_qpos=pair["left"], right_qpos=pair["right"])[side])
+            pose_for_pair=pose_for_pair)
 
     def _require_motion_quality(self, values, *, side, deadline, monotonic):
         quality = self._trajectory_motion_quality(values, side=side, deadline=deadline, monotonic=monotonic)
@@ -6664,6 +6714,7 @@ class RM65GraspJointTrajectoryPlanner:
 __all__ = [
     "RM65_GRASP_ENDPOINT_ORDER_ESTIMATED_EXECUTION_TIME",
     "RM65_GRASP_ENDPOINT_ORDER_JOINT_DISTANCE",
+    "RM65_GRASP_ENDPOINT_ORDER_TCP_ARC_EXECUTION_TIME",
     "RM65_GRASP_ENDPOINT_ORDER_MODES",
     "RM65_GRASP_PATH_PLANNING_TIME_BUDGET_SEC",
     "RM65_GRASP_SINGULARITY_HARD_THRESHOLD_DEG",
