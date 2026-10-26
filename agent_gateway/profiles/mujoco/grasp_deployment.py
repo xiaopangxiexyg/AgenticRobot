@@ -413,6 +413,7 @@ def build_mujoco_fast_grasp_contract(
         {
             "target_kind": "sim",
             "source_geometry": "native_mujoco_scene_capture",
+            "scene_guard_metadata": "private_state_digest_only.v1",
             "source_frame_id": MUJOCO_SIM_HIL_WORLD_FRAME_ID_V1,
             "camera_geometry_owner": "mujoco_scene_camera_metadata",
             "source_catalog": rgb.profile.sources,

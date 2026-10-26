@@ -832,6 +832,7 @@ class MujocoPlannedTcpMotion:
                 targets = []
                 endpoint_attempts = []
                 endpoint_check_reasons = []
+                endpoint_checks = []
                 ik_seed_attempts = []
                 best_pose_miss = None
                 quality_limits = DEFAULT_PATH_MOTION_QUALITY_LIMITS
@@ -867,6 +868,7 @@ class MujocoPlannedTcpMotion:
                     compact = float(np.max(delta[:3])) <= quality_limits.maximum_proximal_joint_travel_rad
                     endpoint_check = oracle.check(pair)
                     endpoint_check_reasons.append(endpoint_check.reason)
+                    endpoint_checks.append(endpoint_check)
                     safe = endpoint_check.safe
                     endpoint_attempts.append({
                         "seed_index": seed_index,
@@ -949,6 +951,9 @@ class MujocoPlannedTcpMotion:
                         else "safe_tcp_endpoint_search_exhausted",
                         {"endpoint_attempts": endpoint_attempts,
                          "endpoint_check_reasons": endpoint_check_reasons,
+                         # Rejection-only evidence: do not change successful
+                         # path metadata, hashes, or perform another query.
+                         "endpoint_checks": [check.to_dict() for check in endpoint_checks],
                          "endpoint_search_diagnostics": endpoint_search_diagnostics,
                          "motion_quality_limits": quality_limits.to_dict()},
                     )

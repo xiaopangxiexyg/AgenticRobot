@@ -63,6 +63,11 @@ def service():
                 if state.error is None
                 else {"ok": False, "error": state.error}
             )
+            if request["method"] not in {"healthz", "sam3.segment"}:
+                envelope = {
+                    "ok": False,
+                    "error": f"unknown RPC method: {request['method']!r}",
+                }
             self.wfile.write(
                 state.raw if state.raw is not None else json.dumps(envelope).encode()
             )
@@ -96,7 +101,9 @@ def test_text_and_point_share_original_rpc_without_model_or_server_ownership(
     assert detections[0].score == 0.9 and detections[0].label == "blue cube"
     mask = client.segment_point(image, pixel_uv=(8, 3))
     assert mask.shape == (8, 12) and mask.dtype == bool and mask[3, 8]
-    assert [r["method"] for r in service.calls] == ["healthz", "segment", "segment"]
+    assert [r["method"] for r in service.calls] == [
+        "healthz", "sam3.segment", "sam3.segment",
+    ]
     assert service.calls[1]["kwargs"]["text_prompt"] == "blue cube"
     assert "point" not in service.calls[1]["kwargs"]
     assert service.calls[2]["kwargs"]["point"] == [3, 8]

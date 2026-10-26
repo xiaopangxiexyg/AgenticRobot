@@ -814,10 +814,18 @@ def test_native_public_frozen_observation_is_atomic_and_model_lifecycle_is_sessi
                         f"Read-only called {_name}"
                     ),
                 )
-        operation, _, (_, view, metadata) = _capture(session, adapter)
-        assert (
-            app.capture_grasp_scene_state() == state == metadata["native_scene_state"]
-        )
+        operation, _, (arrays, view, metadata) = _capture(session, adapter)
+        from agent_gateway.profiles.mujoco.grasp_observation import frozen_grasp_scene_hash
+        assert app.capture_grasp_scene_state() == state
+        assert metadata["native_scene_state_hash"] == frozen_grasp_scene_hash(state)
+        assert "native_scene_state" not in metadata
+        assert "model_qpos" not in json.dumps(metadata)
+        assert "model_qvel" not in json.dumps(metadata)
+        # Real robot proprioception remains available for camera transforms.
+        assert arrays["left_qpos"].shape == arrays["right_qpos"].shape == (6,)
+        assert np.isfinite(arrays["left_qpos"]).all()
+        assert np.isfinite(arrays["right_qpos"]).all()
+        assert "model_qpos" not in arrays and "model_qvel" not in arrays
         assert (
             view["reference_frame_id"]
             == session.contract_bundle.motion_profile.reference_frame_id
@@ -947,6 +955,39 @@ def test_fast_planning_rejects_changed_frozen_scene_before_model_inference(tmp_p
 
 
 @pytest.mark.integration
+@pytest.mark.parametrize("changed_field", ("velocity", "simulation_time"))
+def test_frozen_scene_digest_preserves_velocity_and_time_invalidation(tmp_path, changed_field):
+    session = _session(tmp_path)
+    try:
+        app = session.application
+        app.start_observation_ready()
+        session.start_perception_resources()
+        adapter = session.wire_adapter(authenticated_client_id=CLIENT)
+        source, pixel, _ = _capture(session, adapter)
+        if changed_field == "velocity":
+            app.scene.data.qvel[0] += .001
+        else:
+            app.scene.data.time += .001
+        failure = _run(session, adapter, _plan_request(session, adapter, source, pixel))
+        assert failure.status == "failed"
+        assert failure.reason_code == "grasp_fast_capture_scene_changed", failure
+        assert not session.fast_grasp_planner.client.calls
+        assert not app.target.planned_tcp_motion.active
+    finally:
+        assert session.close().accepted
+
+
+@pytest.mark.parametrize("field", ("model_qpos", "model_qvel", "simulation_time_sec"))
+def test_frozen_scene_digest_rejects_nonfinite_state(field):
+    from agent_gateway.profiles.mujoco.grasp_observation import frozen_grasp_scene_hash
+
+    state = {"model_qpos": [0.], "model_qvel": [0.], "simulation_time_sec": 0.}
+    state[field] = float("nan") if field == "simulation_time_sec" else [float("nan")]
+    with pytest.raises(ValueError, match="finite and complete"):
+        frozen_grasp_scene_hash(state)
+
+
+@pytest.mark.integration
 def test_actual_proposal_filter_and_search_report_rejection_without_motion(
     tmp_path, record_property
 ):
@@ -1009,8 +1050,14 @@ def test_native_fast_publishes_all_sixty_four_rejections_with_bounded_summary(tm
         def rejected_chain(*args, **kwargs):
             queries.append(kwargs["time_budget_sec"])
             raise MujocoTcpPlanRejected("safe_tcp_endpoint_search_exhausted", details={
-                "chain_stage_index": 0, "reason": "no_valid_endpoint",
+                "chain_stage_index": 0,
                 "endpoint_attempts": [{}] * 8,
+                "endpoint_check_reasons": ["mujoco_configured_scene_collision"] * 8,
+                "endpoint_checks": [{"safe": False, "minimum_distance_m": .0017,
+                    "reason": "mujoco_configured_scene_collision", "metadata": {
+                        "geom1": "table", "geom2": "sensor", "collision_category": "gripper_environment",
+                        "private_large_array": list(range(1000)),
+                    }}] * 8,
             })
 
         def proposals(*args, **kwargs):
@@ -1034,10 +1081,35 @@ def test_native_fast_publishes_all_sixty_four_rejections_with_bounded_summary(tm
         detailed = json.loads(logs[0])["attempts"]
         assert len(logs) == 1 and len(detailed) == 64
         assert all(r["endpoint_attempt_count"] == 8 and r["failed_stage"] == 0 for r in detailed)
+        assert all(r["lower_reason"] == "safe_tcp_endpoint_search_exhausted" for r in detailed)
+        assert all(r["endpoint_reason_counts"] == {"mujoco_configured_scene_collision": 8} for r in detailed)
+        assert all(r["endpoint_checks"][0]["geom2"] == "sensor" for r in detailed)
+        assert "private_large_array" not in logs[0]
+        assert "endpoint_checks" not in encoded and "table" not in encoded
         assert app.capture_grasp_scene_state() == state
         assert session.fast_grasp_provider._retained is None
     finally:
         assert session.close().accepted
+
+
+def test_private_endpoint_diagnostic_is_bounded_and_does_not_mutate_lower_result():
+    from agent_gateway.profiles.mujoco.grasp_fast_plan import _planning_rejection_diagnostics
+    from sim.mujoco.deploy.planned_tcp_motion import MujocoTcpPlanRejected
+
+    checks = [{"safe": False, "reason": "tcp_envelope_blocked",
+               "minimum_distance_m": None, "metadata": {"unrelated_hash": "private"}}] * 12
+    error = MujocoTcpPlanRejected("safe_tcp_target_envelope_blocked", {
+        "chain_stage_index": 1, "endpoint_attempts": [{}] * 12,
+        "endpoint_checks": checks, "endpoint_check_reasons": ["tcp_envelope_blocked"] * 12,
+    })
+    original = json.dumps(error.details)
+    result = _planning_rejection_diagnostics(error)
+    assert len(result["endpoint_checks"]) == 9 and result["endpoint_checks_omitted"] == 3
+    assert result["endpoint_reason_counts"] == {"tcp_envelope_blocked": 12}
+    assert result["endpoint_checks"][0] == {
+        "safe": False, "reason": "tcp_envelope_blocked", "minimum_distance_m": None,
+    }
+    assert json.dumps(error.details) == original
 
 
 @pytest.mark.integration

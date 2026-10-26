@@ -27,108 +27,6 @@
       "locator": "sim/rm65/real2sim/artifacts/rm65_arm_free_motion_20260721_v4.json"
     },
     {
-      "artifact_id": "rm65-arm-runtime-binding-20260922-v5",
-      "artifact_kind": "real2sim_runtime_binding",
-      "sha256": "4a0d1d520864138bc1cef41347cf3fe43ec4a3f511710fdc2b77404c342768d8",
-      "locator": "sim/rm65/real2sim/artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20260922_v5.json"
-    },
-    {
-      "artifact_id": "rm65-arm-runtime-binding-20261017-v7",
-      "artifact_kind": "real2sim_runtime_binding",
-      "sha256": "1ce52c5c3cbd0a95e999efead5fa00ca2c8098b75eb76bfc896ad503b26dbbe7",
-      "locator": "sim/rm65/real2sim/artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261017_v7.json"
-    },
-    {
-      "artifact_id": "rm65-arm-runtime-binding-20261018-v8",
-      "artifact_kind": "real2sim_runtime_binding",
-      "sha256": "48ee5ff7dc5b54c7d98e3ae2cb7b7707237a40dab742e10a473d771b8b7fea68",
-      "locator": "sim/rm65/real2sim/artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261018_v8.json"
-    },
-    {
-      "artifact_id": "rm65-arm-runtime-binding-20261022-v9",
-      "artifact_kind": "real2sim_runtime_binding",
-      "sha256": "092b48c008aba04d647ff2fa8da5677f2dde18529a6db26dc4330053c8f71f43",
-      "locator": "sim/rm65/real2sim/artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261022_v9.json"
-    },
-    {
-      "artifact_id": "rm65-arm-runtime-binding-20261023-v10",
-      "artifact_kind": "real2sim_runtime_binding",
-      "sha256": "5538d158d25ee13bb7e81e515e1aff4e709c2534c38c79fe94dde81338e4841c",
-      "locator": "sim/rm65/real2sim/artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261023_v10.json"
-    },
-    {
-      "artifact_id": "rm65-arm-runtime-binding-20261023-v12",
-      "artifact_kind": "real2sim_runtime_binding",
-      "sha256": "eb186b84b763e95aa9007bec06938f743f3c9d96f299635aa8a1b9deb25749cf",
-      "locator": "sim/rm65/real2sim/artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261023_v12.json"
-    },
-    {
-      "artifact_id": "rm65-arm-runtime-binding-20261023-v13",
-      "artifact_kind": "real2sim_runtime_binding",
-      "sha256": "17823a6795c15a7ebf72ec214fcfa3bddd90fb8e16fc74d3d89e5bb80df49195",
-      "locator": "sim/rm65/real2sim/artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261023_v13.json"
-    },
-    {
-      "artifact_id": "rm65-arm-runtime-binding-20261023-v14",
-      "artifact_kind": "real2sim_runtime_binding",
-      "sha256": "edbe370d312a8a9ddb468c709e9fdab385e3dd632210e601c5bb60164ae7bc67",
-      "locator": "sim/rm65/real2sim/artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261023_v14.json"
-    },
-    {
-      "artifact_id": "rm65-arm-runtime-binding-20261024-v15",
-      "artifact_kind": "real2sim_runtime_binding",
-      "sha256": "d1bdc45d9b97cae9b751c178c43d0479614dc11c4a1ce00ef8e6bc93a19583f5",
-      "locator": "sim/rm65/real2sim/artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261024_v15.json"
-    },
-    {
-      "artifact_id": "rm65-arm-runtime-binding-20261025-v16",
-      "artifact_kind": "real2sim_runtime_binding",
-      "sha256": "bdce9be991355646e0044f8ba1044c1f5c2d26a479bfa187d2f884ae65f3b8d1",
-      "locator": "sim/rm65/real2sim/artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261025_v16.json"
-    },
-    {
-      "artifact_id": "rm65-arm-runtime-binding-20261025-v17",
-      "artifact_kind": "real2sim_runtime_binding",
-      "sha256": "28bb9dcccf33fe31240e97357202f21592da80046dcec4840bd29c183b1a8697",
-      "locator": "sim/rm65/real2sim/artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261025_v17.json"
-    },
-    {
-      "artifact_id": "rm65-arm-runtime-binding-20261025-v18",
-      "artifact_kind": "real2sim_runtime_binding",
-      "sha256": "486f5e8ddf1ea043919a1d260003b872b13b3f23fa5d93188aede09ea244381b",
-      "locator": "sim/rm65/real2sim/artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261025_v18.json"
-    },
-    {
-      "artifact_id": "rm65-arm-runtime-binding-20261025-v19",
-      "artifact_kind": "real2sim_runtime_binding",
-      "sha256": "2006daae911cd81a64b073fa0b766c8daf92feced8088d2a4b9a0db96c4e718d",
-      "locator": "sim/rm65/real2sim/artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261025_v19.json"
-    },
-    {
-      "artifact_id": "rm65-arm-runtime-binding-20261025-v20",
-      "artifact_kind": "real2sim_runtime_binding",
-      "sha256": "1eb876c2a58425e23f49cd727a4d40bcf51cfd09d21138a3133ba4d3396f9417",
-      "locator": "sim/rm65/real2sim/artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261025_v20.json"
-    },
-    {
-      "artifact_id": "rm65-arm-runtime-binding-20261025-v21",
-      "artifact_kind": "real2sim_runtime_binding",
-      "sha256": "b08732bb1948a3f5592e20fe9353a78851850c51fd987373ad3252495252785b",
-      "locator": "sim/rm65/real2sim/artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261025_v21.json"
-    },
-    {
-      "artifact_id": "rm65-arm-runtime-binding-20261025-v22",
-      "artifact_kind": "real2sim_runtime_binding",
-      "sha256": "dfb07cb6f0159796e677ea03fa2783e6d372a54490502c75612112cc5c249fd4",
-      "locator": "sim/rm65/real2sim/artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261025_v22.json"
-    },
-    {
-      "artifact_id": "rm65-arm-runtime-binding-20261025-v23",
-      "artifact_kind": "real2sim_runtime_binding",
-      "sha256": "3044ac2565ee102e5f594c91c90213847c64aa4298dc297739f32ea7d83faff1",
-      "locator": "sim/rm65/real2sim/artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261025_v23.json"
-    },
-    {
       "artifact_id": "rm65-arm-profile-runtime-20261026-v25",
       "artifact_kind": "actuation_profile",
       "sha256": "551b8a832f97d6e4fdfaef96b0cd3ff8b7dee46f4610ac948e23ff13602c48de",
@@ -137,7 +35,7 @@
     {
       "artifact_id": "rm65-arm-actuator-core-runtime-20261026-v25",
       "artifact_kind": "sim_actuator_core_source",
-      "sha256": "5a7bc50ef6a171586e3dc53f0ee9ad35b7048a2b30a0569f093186f0a343a643",
+      "sha256": "4a68394fd359b6481e28594bf933c56ffe270ddcd7806c44675cd3e964e697c6",
       "locator": "sim/rm65/actuation/core.py"
     },
     {
@@ -151,6 +49,12 @@
       "artifact_kind": "camera_registry",
       "sha256": "7a0c1e612508c15dc5e0d8445e362498d92b28606e6f7157f47b88fda965e9ba",
       "locator": "robot_motion/configs/rm65_camera_registry.json"
+    },
+    {
+      "artifact_id": "rm65-arm-runtime-binding-20260922-v5",
+      "artifact_kind": "real2sim_runtime_binding",
+      "sha256": "4a0d1d520864138bc1cef41347cf3fe43ec4a3f511710fdc2b77404c342768d8",
+      "locator": "sim/rm65/real2sim/artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20260922_v5.json"
     },
     {
       "artifact_id": "rm65-command-guard-runtime-20261026-v25",
@@ -203,14 +107,26 @@
     {
       "artifact_id": "rm65-planned-tcp-motion-runtime-20261026-v25",
       "artifact_kind": "sim_grasp_contact_source",
-      "sha256": "fda991997f4f221d290fbf3d252515d0bd5a4acac797f6742f14f97ba300e71b",
+      "sha256": "f88f51e70cf3de457c8192f05a3161e7470597ad65e06361eee1ee74a5309ab3",
       "locator": "sim/mujoco/deploy/planned_tcp_motion.py"
+    },
+    {
+      "artifact_id": "rm65-arm-runtime-binding-20261017-v7",
+      "artifact_kind": "real2sim_runtime_binding",
+      "sha256": "1ce52c5c3cbd0a95e999efead5fa00ca2c8098b75eb76bfc896ad503b26dbbe7",
+      "locator": "sim/rm65/real2sim/artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261017_v7.json"
     },
     {
       "artifact_id": "rm65-agent-skill-target-runtime-20261026-v25",
       "artifact_kind": "sim_agent_skill_target_source",
-      "sha256": "816391afbaecb772e81c6b8b0df17eeec35d82421c50456575f8cb803941727e",
+      "sha256": "5555669da095aa2c34f7580383688669f3aabdeb0d9c052c23234f4c5d734e82",
       "locator": "sim/mujoco/deploy/agent_skill_target.py"
+    },
+    {
+      "artifact_id": "rm65-arm-runtime-binding-20261018-v8",
+      "artifact_kind": "real2sim_runtime_binding",
+      "sha256": "48ee5ff7dc5b54c7d98e3ae2cb7b7707237a40dab742e10a473d771b8b7fea68",
+      "locator": "sim/rm65/real2sim/artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261018_v8.json"
     },
     {
       "artifact_id": "rm65-gripper-executor-runtime-20261026-v25",
@@ -255,10 +171,34 @@
       "locator": "robot_motion/object_transport.py"
     },
     {
+      "artifact_id": "rm65-arm-runtime-binding-20261022-v9",
+      "artifact_kind": "real2sim_runtime_binding",
+      "sha256": "092b48c008aba04d647ff2fa8da5677f2dde18529a6db26dc4330053c8f71f43",
+      "locator": "sim/rm65/real2sim/artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261022_v9.json"
+    },
+    {
       "artifact_id": "rm65-native-prepared-skill-runtime-20261026-v25",
       "artifact_kind": "sim_native_skill_consumer_source",
       "sha256": "e219d3a032afd5ae33a52f4e89b714c5fb2dbaef46ac6d01704e41632b555226",
       "locator": "agent_gateway/profiles/mujoco/motion_skill.py"
+    },
+    {
+      "artifact_id": "rm65-arm-runtime-binding-20261023-v10",
+      "artifact_kind": "real2sim_runtime_binding",
+      "sha256": "5538d158d25ee13bb7e81e515e1aff4e709c2534c38c79fe94dde81338e4841c",
+      "locator": "sim/rm65/real2sim/artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261023_v10.json"
+    },
+    {
+      "artifact_id": "rm65-arm-runtime-binding-20261023-v12",
+      "artifact_kind": "real2sim_runtime_binding",
+      "sha256": "eb186b84b763e95aa9007bec06938f743f3c9d96f299635aa8a1b9deb25749cf",
+      "locator": "sim/rm65/real2sim/artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261023_v12.json"
+    },
+    {
+      "artifact_id": "rm65-arm-runtime-binding-20261023-v13",
+      "artifact_kind": "real2sim_runtime_binding",
+      "sha256": "17823a6795c15a7ebf72ec214fcfa3bddd90fb8e16fc74d3d89e5bb80df49195",
+      "locator": "sim/rm65/real2sim/artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261023_v13.json"
     },
     {
       "artifact_id": "rm65-single-arm-ik-runtime-20261026-v25",
@@ -281,8 +221,14 @@
     {
       "artifact_id": "rm65-deploy-runtime-core-runtime-20261026-v25",
       "artifact_kind": "sim_runtime_source",
-      "sha256": "4dedfef2d379d1f3708a06e0425a31f93cfa3e9de2bf2680e24acf25ca525eea",
+      "sha256": "d244cf25cfccf818fdf0cf2822c247b09768e1b99b872ea15c85c7864b80a616",
       "locator": "sim/mujoco/deploy/runtime.py"
+    },
+    {
+      "artifact_id": "rm65-arm-runtime-binding-20261023-v14",
+      "artifact_kind": "real2sim_runtime_binding",
+      "sha256": "edbe370d312a8a9ddb468c709e9fdab385e3dd632210e601c5bb60164ae7bc67",
+      "locator": "sim/rm65/real2sim/artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261023_v14.json"
     },
     {
       "artifact_id": "rm65-observed-joint-input-runtime-20261026-v25",
@@ -333,6 +279,12 @@
       "locator": "agent_gateway/profiles/mujoco/back_projection.py"
     },
     {
+      "artifact_id": "rm65-arm-runtime-binding-20261024-v15",
+      "artifact_kind": "real2sim_runtime_binding",
+      "sha256": "d1bdc45d9b97cae9b751c178c43d0479614dc11c4a1ce00ef8e6bc93a19583f5",
+      "locator": "sim/rm65/real2sim/artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261024_v15.json"
+    },
+    {
       "artifact_id": "rm65-correlated-rgbd-contract-runtime-20261026-v25",
       "artifact_kind": "sim_planning_source",
       "sha256": "3bebdb165d14ce07e1e91b0ecdfc1c2751b62996f58164e9293e36a33d66781f",
@@ -361,6 +313,12 @@
       "artifact_kind": "sim_planning_source",
       "sha256": "75e5d503d7088deba91dd2636b6704d940bb95754100358e3e9fcb928a7686e2",
       "locator": "dataset_contracts/perception_artifacts.py"
+    },
+    {
+      "artifact_id": "rm65-arm-runtime-binding-20261025-v16",
+      "artifact_kind": "real2sim_runtime_binding",
+      "sha256": "bdce9be991355646e0044f8ba1044c1f5c2d26a479bfa187d2f884ae65f3b8d1",
+      "locator": "sim/rm65/real2sim/artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261025_v16.json"
     },
     {
       "artifact_id": "rm65-segmentation-provider-runtime-20261026-v25",
@@ -393,6 +351,12 @@
       "locator": "agent_gateway/profiles/mujoco/motion_gateway_session.py"
     },
     {
+      "artifact_id": "rm65-arm-runtime-binding-20261025-v17",
+      "artifact_kind": "real2sim_runtime_binding",
+      "sha256": "28bb9dcccf33fe31240e97357202f21592da80046dcec4840bd29c183b1a8697",
+      "locator": "sim/rm65/real2sim/artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261025_v17.json"
+    },
+    {
       "artifact_id": "rm65-waypoint-cancellation-runtime-20261026-v25",
       "artifact_kind": "sim_planning_source",
       "sha256": "e509bbfdfa3c501e5c033d72da4514007797019c145b811cb62e0fd4534349a7",
@@ -405,9 +369,15 @@
       "locator": "robot_motion/target_safety/runtime.py"
     },
     {
+      "artifact_id": "rm65-arm-runtime-binding-20261025-v18",
+      "artifact_kind": "real2sim_runtime_binding",
+      "sha256": "486f5e8ddf1ea043919a1d260003b872b13b3f23fa5d93188aede09ea244381b",
+      "locator": "sim/rm65/real2sim/artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261025_v18.json"
+    },
+    {
       "artifact_id": "rm65-object-path-query-runtime-20261026-v25",
       "artifact_kind": "sim_planning_source",
-      "sha256": "1758293b5a340c787d4dd3559f284b9b45427974dd942570e154225966f3162b",
+      "sha256": "1eb4ec6fa5e6596d5b729f5ce9f6e605ae8463d4ca093a8a7348f5981b5a1336",
       "locator": "agent_gateway/profiles/mujoco/object_goal_query.py"
     },
     {
@@ -491,8 +461,20 @@
     {
       "artifact_id": "rm65-motion-launcher-runtime-20261026-v25",
       "artifact_kind": "sim_planning_source",
-      "sha256": "df040e8b9c913e7ff2faa7de211f30173125a838a21d73294ae1a5b6cdd12459",
+      "sha256": "5590b871c2e418277e300e9b77a99567a4c2f2c4a68303f2b3a1dc9e51b8486e",
       "locator": "agent_gateway/profiles/mujoco/gateway_cli.py"
+    },
+    {
+      "artifact_id": "rm65-arm-runtime-binding-20261025-v19",
+      "artifact_kind": "real2sim_runtime_binding",
+      "sha256": "2006daae911cd81a64b073fa0b766c8daf92feced8088d2a4b9a0db96c4e718d",
+      "locator": "sim/rm65/real2sim/artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261025_v19.json"
+    },
+    {
+      "artifact_id": "rm65-arm-runtime-binding-20261025-v20",
+      "artifact_kind": "real2sim_runtime_binding",
+      "sha256": "1eb876c2a58425e23f49cd727a4d40bcf51cfd09d21138a3133ba4d3396f9417",
+      "locator": "sim/rm65/real2sim/artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261025_v20.json"
     },
     {
       "artifact_id": "rm65-shared-localization-provider-runtime-20261026-v25",
@@ -517,6 +499,12 @@
       "artifact_kind": "sim_planning_source",
       "sha256": "ec98602786c4f20a73456c2e88d121ba9dfc9280e159173f508b45b03d579163",
       "locator": "agent_gateway/profiles/real/localization_deployment.py"
+    },
+    {
+      "artifact_id": "rm65-arm-runtime-binding-20261025-v21",
+      "artifact_kind": "real2sim_runtime_binding",
+      "sha256": "b08732bb1948a3f5592e20fe9353a78851850c51fd987373ad3252495252785b",
+      "locator": "sim/rm65/real2sim/artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261025_v21.json"
     },
     {
       "artifact_id": "rm65-tcp-axis-constraint-runtime-20261026-v25",
@@ -645,6 +633,12 @@
       "locator": "sim/configs/tasks/rm65_right_dmtacm_clutter_boxes_agent_v1.json"
     },
     {
+      "artifact_id": "rm65-arm-runtime-binding-20261025-v22",
+      "artifact_kind": "real2sim_runtime_binding",
+      "sha256": "dfb07cb6f0159796e677ea03fa2783e6d372a54490502c75612112cc5c249fd4",
+      "locator": "sim/rm65/real2sim/artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261025_v22.json"
+    },
+    {
       "artifact_id": "rm65-real-compatibility-control-station-runtime-20261026-v25",
       "artifact_kind": "runtime_source",
       "sha256": "84bb4084da6263f444864f05f6421c250c3b3f1d1ca5b15c6bc832ec8333a189",
@@ -657,358 +651,34 @@
       "locator": "agent_gateway/profiles/real/motion_factory.py"
     },
     {
-      "artifact_id": "checkpoint-control_composition-observability-execution_difference-runtime-20261026-v25",
-      "artifact_kind": "sim_checkpoint_source",
-      "sha256": "091ba862349fe5cc1dbd3cd49e3be9685a4c135c8eff0670674332e64573887e",
-      "locator": "control_composition/observability/execution_difference.py"
+      "artifact_id": "rm65-arm-runtime-binding-20261025-v23",
+      "artifact_kind": "real2sim_runtime_binding",
+      "sha256": "3044ac2565ee102e5f594c91c90213847c64aa4298dc297739f32ea7d83faff1",
+      "locator": "sim/rm65/real2sim/artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261025_v23.json"
     },
     {
-      "artifact_id": "checkpoint-control_composition-observability-modules-runtime-20261026-v25",
-      "artifact_kind": "sim_checkpoint_source",
-      "sha256": "e9f986341a8d9479a83f92777748f991f741a51aa5a07c41bbb4cd37f9a28549",
-      "locator": "control_composition/observability/modules.py"
+      "artifact_id": "rm65-sam3-rpc-model-client-runtime-20261026-v25",
+      "artifact_kind": "runtime_source",
+      "sha256": "e50ae6b8a5174826f861baa6b158213f4c6b3302e2e4fb6a18496a661bf5919c",
+      "locator": "deployments/perception/sam3_service.py"
     },
     {
-      "artifact_id": "checkpoint-dataset_contracts-action_schema-runtime-20261026-v25",
-      "artifact_kind": "sim_checkpoint_source",
-      "sha256": "6bf81bb7ff362769614dae29a7bb6c748b70ac11cfa2217984ed8f5f63633b6d",
-      "locator": "dataset_contracts/action_schema.py"
+      "artifact_id": "rm65-native-grasp-deployment-runtime-20261026-v25",
+      "artifact_kind": "runtime_source",
+      "sha256": "f52beb7ed6ee45e3530a8bc47300bc475e59aa805134301e110e5f746116537f",
+      "locator": "agent_gateway/profiles/mujoco/grasp_deployment.py"
     },
     {
-      "artifact_id": "checkpoint-dataset_contracts-canonical_encoding-runtime-20261026-v25",
-      "artifact_kind": "sim_checkpoint_source",
-      "sha256": "d4e34543a70e2a30d55484faf5e0dba7ac6208e91455084b33fa0324db827591",
-      "locator": "dataset_contracts/canonical_encoding.py"
+      "artifact_id": "rm65-native-grasp-fast-plan-runtime-20261026-v25",
+      "artifact_kind": "runtime_source",
+      "sha256": "80d6a2079d58594c720e33f7bcea1b132fe772e8f3b4efa435894c82b540ad58",
+      "locator": "agent_gateway/profiles/mujoco/grasp_fast_plan.py"
     },
     {
-      "artifact_id": "checkpoint-dataset_contracts-control_trace-runtime-20261026-v25",
-      "artifact_kind": "sim_checkpoint_source",
-      "sha256": "7f60c67888c42d43a8754ff6ddc919e73ce311974f7c1b5a5dd35387ca4b9aa6",
-      "locator": "dataset_contracts/control_trace.py"
-    },
-    {
-      "artifact_id": "checkpoint-robot_motion-action-adaptation-runtime-20261026-v25",
-      "artifact_kind": "sim_checkpoint_source",
-      "sha256": "2a211d7ca46542991718c79951d3bb2decb8e42187e3667e04fc12d31bf3e893",
-      "locator": "robot_motion/action/adaptation.py"
-    },
-    {
-      "artifact_id": "checkpoint-robot_motion-action-admission_checkpoint-runtime-20261026-v25",
-      "artifact_kind": "sim_checkpoint_source",
-      "sha256": "b111470d26e022e57a733a85cca93309b86c07306366a893cbba684e6b0d8541",
-      "locator": "robot_motion/action/admission_checkpoint.py"
-    },
-    {
-      "artifact_id": "checkpoint-robot_motion-action-arbiter-runtime-20261026-v25",
-      "artifact_kind": "sim_checkpoint_source",
-      "sha256": "8ad7c33120903015790e6db6ae91590653574a79f4f7983e4165c87628929f66",
-      "locator": "robot_motion/action/arbiter.py"
-    },
-    {
-      "artifact_id": "checkpoint-robot_motion-action-arbitration_runtime-runtime-20261026-v25",
-      "artifact_kind": "sim_checkpoint_source",
-      "sha256": "64e2f9244ca6045289fc6a8e847e229a372c43fb6ca8293f4a64f432141a94eb",
-      "locator": "robot_motion/action/arbitration_runtime.py"
-    },
-    {
-      "artifact_id": "checkpoint-robot_motion-action-authoritative_checkpoint-runtime-20261026-v25",
-      "artifact_kind": "sim_checkpoint_source",
-      "sha256": "ce62ae8b09ca36c8fcf7fe49f169dd4ffe09f5a652747ed186c243084988fe1e",
-      "locator": "robot_motion/action/authoritative_checkpoint.py"
-    },
-    {
-      "artifact_id": "checkpoint-robot_motion-action-authoritative_control-runtime-20261026-v25",
-      "artifact_kind": "sim_checkpoint_source",
-      "sha256": "24cf1d482d904d8f22b304f55b5c30fb17f65849ab09d8850434b7aa9b0b0721",
-      "locator": "robot_motion/action/authoritative_control.py"
-    },
-    {
-      "artifact_id": "checkpoint-robot_motion-action-authoritative_trace-runtime-20261026-v25",
-      "artifact_kind": "sim_checkpoint_source",
-      "sha256": "ff270227dec27f1da317fa5bcb95a09536d5e58a210d8077c2db353b560bf535",
-      "locator": "robot_motion/action/authoritative_trace.py"
-    },
-    {
-      "artifact_id": "checkpoint-robot_motion-action-authority-runtime-20261026-v25",
-      "artifact_kind": "sim_checkpoint_source",
-      "sha256": "f025500710c464b67c7429f85f3ceebba1ab70288095e3d36f2538ba42442e78",
-      "locator": "robot_motion/action/authority.py"
-    },
-    {
-      "artifact_id": "checkpoint-robot_motion-action-candidate_authorization-runtime-20261026-v25",
-      "artifact_kind": "sim_checkpoint_source",
-      "sha256": "21d669fca827591c84161f476af5c78411c5ea3b4409577b0f59316528aba617",
-      "locator": "robot_motion/action/candidate_authorization.py"
-    },
-    {
-      "artifact_id": "checkpoint-robot_motion-action-checkpoint_codec-runtime-20261026-v25",
-      "artifact_kind": "sim_checkpoint_source",
-      "sha256": "296d38a13b3ff846224de4514175de5f017e1726c4ccf2c6a50e58373db4398e",
-      "locator": "robot_motion/action/checkpoint_codec.py"
-    },
-    {
-      "artifact_id": "checkpoint-robot_motion-action-component_action-runtime-20261026-v25",
-      "artifact_kind": "sim_checkpoint_source",
-      "sha256": "d2d17c5f88f6c893686aca48a4e18ea5f5df6daa828f41d5bfc704d28e4b8fe9",
-      "locator": "robot_motion/action/component_action.py"
-    },
-    {
-      "artifact_id": "checkpoint-robot_motion-action-components-runtime-20261026-v25",
-      "artifact_kind": "sim_checkpoint_source",
-      "sha256": "bc34b204fb349694f30f423de4cd4215b7213fe3f0697f76eca9e0fc684a64ed",
-      "locator": "robot_motion/action/components.py"
-    },
-    {
-      "artifact_id": "checkpoint-robot_motion-action-decision_checkpoint-runtime-20261026-v25",
-      "artifact_kind": "sim_checkpoint_source",
-      "sha256": "7c927ca9106c0fba76f8617df6d05bcb0b3aff44cc51f4518b248c429ba44ca8",
-      "locator": "robot_motion/action/decision_checkpoint.py"
-    },
-    {
-      "artifact_id": "checkpoint-robot_motion-action-dispatch_context-runtime-20261026-v25",
-      "artifact_kind": "sim_checkpoint_source",
-      "sha256": "b3cc6a0d3f731a3d1e21d3c59c60d6aa9e98ca32b2fe64857249b6d7bef6c6b5",
-      "locator": "robot_motion/action/dispatch_context.py"
-    },
-    {
-      "artifact_id": "checkpoint-robot_motion-action-execution_handoff-runtime-20261026-v25",
-      "artifact_kind": "sim_checkpoint_source",
-      "sha256": "645a259b256a41e230d658bbdbaffb9b3c358ace958c663266daf003770f48b4",
-      "locator": "robot_motion/action/execution_handoff.py"
-    },
-    {
-      "artifact_id": "checkpoint-robot_motion-action-execution_observation-runtime-20261026-v25",
-      "artifact_kind": "sim_checkpoint_source",
-      "sha256": "17aacd76da1a3505a124f5a30f4849508886ec493bb360a7bb06d67dd2927ad9",
-      "locator": "robot_motion/action/execution_observation.py"
-    },
-    {
-      "artifact_id": "checkpoint-robot_motion-action-executor-runtime-20261026-v25",
-      "artifact_kind": "sim_checkpoint_source",
-      "sha256": "044e5d8dea57d78465544ff40d4a23b462b90a60a23b90f77150b81b3a3b718e",
-      "locator": "robot_motion/action/executor.py"
-    },
-    {
-      "artifact_id": "checkpoint-robot_motion-action-persistence-runtime-20261026-v25",
-      "artifact_kind": "sim_checkpoint_source",
-      "sha256": "cb5aa2b90d2d7e597f820ef3fc1d184850e443e0f17c82f24a3b04d1c08bb5ae",
-      "locator": "robot_motion/action/persistence.py"
-    },
-    {
-      "artifact_id": "checkpoint-robot_motion-action-proposal-runtime-20261026-v25",
-      "artifact_kind": "sim_checkpoint_source",
-      "sha256": "37e2c3ec9f0d53b5c0758112c8b5ab69ee80bc3c208d7fa2874b46ed3af7fb91",
-      "locator": "robot_motion/action/proposal.py"
-    },
-    {
-      "artifact_id": "checkpoint-robot_motion-action-schema-runtime-20261026-v25",
-      "artifact_kind": "sim_checkpoint_source",
-      "sha256": "0cc6a5108d35531857ec4e9de708b4a1f7792468bd686de8801fc59dadd6e4d7",
-      "locator": "robot_motion/action/schema.py"
-    },
-    {
-      "artifact_id": "checkpoint-robot_motion-action-target_capability-runtime-20261026-v25",
-      "artifact_kind": "sim_checkpoint_source",
-      "sha256": "767274f737c7553e8f6c45bad4e0cf8fb259a4bd4971f05baddf176766142144",
-      "locator": "robot_motion/action/target_capability.py"
-    },
-    {
-      "artifact_id": "checkpoint-robot_motion-position_control-capability-runtime-20261026-v25",
-      "artifact_kind": "sim_checkpoint_source",
-      "sha256": "9f6392164dd12c9befd47baf7f3979d0676f642567b73d976b1def06f9c00ca0",
-      "locator": "robot_motion/position_control/capability.py"
-    },
-    {
-      "artifact_id": "checkpoint-robot_motion-position_control-trajectory-runtime-20261026-v25",
-      "artifact_kind": "sim_checkpoint_source",
-      "sha256": "21e63b29b10b5583628c6ff90476686d281a006b60da3ae1447228cae78787a6",
-      "locator": "robot_motion/position_control/trajectory.py"
-    },
-    {
-      "artifact_id": "checkpoint-robot_motion-position_control-trajectory_checkpoint-runtime-20261026-v25",
-      "artifact_kind": "sim_checkpoint_source",
-      "sha256": "cb8798b610eea1ca3843ef241dd4f886028d7494133d6dbd717ee60f0149a983",
-      "locator": "robot_motion/position_control/trajectory_checkpoint.py"
-    },
-    {
-      "artifact_id": "checkpoint-robot_motion-rm65-dual_arm_ik-runtime-20261026-v25",
-      "artifact_kind": "sim_checkpoint_source",
-      "sha256": "c4aa959de3b2f302bddf4f01d8e63c5f409c9a9b734e0950abc498490dbd1985",
-      "locator": "robot_motion/rm65/dual_arm_ik.py"
-    },
-    {
-      "artifact_id": "checkpoint-robot_motion-rm65-dual_arm_target_solver-runtime-20261026-v25",
-      "artifact_kind": "sim_checkpoint_source",
-      "sha256": "a274667e536aaa9b550aff800eba9abaf97397271b9c7b1e1fb182a1e0658cf8",
-      "locator": "robot_motion/rm65/dual_arm_target_solver.py"
-    },
-    {
-      "artifact_id": "checkpoint-robot_motion-rm65-ik_checkpoint-runtime-20261026-v25",
-      "artifact_kind": "sim_checkpoint_source",
-      "sha256": "0e283c5c3aa0a2e4fd7dd9e2ec5cb8a843040ef58e59bfa5d0dadb241269418f",
-      "locator": "robot_motion/rm65/ik_checkpoint.py"
-    },
-    {
-      "artifact_id": "checkpoint-robot_motion-rm65-retargeter_checkpoint-runtime-20261026-v25",
-      "artifact_kind": "sim_checkpoint_source",
-      "sha256": "c477a6f3c97e1a49fff403bc37a67372b7fbbaf718e57975787650075cd1c892",
-      "locator": "robot_motion/rm65/retargeter_checkpoint.py"
-    },
-    {
-      "artifact_id": "checkpoint-robot_motion-runtime-cancellation-runtime-20261026-v25",
-      "artifact_kind": "sim_checkpoint_source",
-      "sha256": "549811dfe82f48cf81aa65b481a5ece991a98a0ac5df6f4761e14a0f2a7eaf32",
-      "locator": "robot_motion/runtime/cancellation.py"
-    },
-    {
-      "artifact_id": "checkpoint-robot_motion-runtime-control_admission-runtime-20261026-v25",
-      "artifact_kind": "sim_checkpoint_source",
-      "sha256": "79e38bc906816b03be67ed962b36a8c0a8e699cc07d8a6d49401998e57cd6ae1",
-      "locator": "robot_motion/runtime/control_admission.py"
-    },
-    {
-      "artifact_id": "checkpoint-robot_motion-runtime-dispatch-runtime-20261026-v25",
-      "artifact_kind": "sim_checkpoint_source",
-      "sha256": "7c83f7708546728c9943e7360b5a9ca7e1afb39d8e9bcbfdefa8ccf74221ec97",
-      "locator": "robot_motion/runtime/dispatch.py"
-    },
-    {
-      "artifact_id": "checkpoint-robot_motion-runtime-dispatch_owner-runtime-20261026-v25",
-      "artifact_kind": "sim_checkpoint_source",
-      "sha256": "612f3449cccc90dbc512c5d9a30cc00621fd3a40928b82ddfd464657a0fdaf38",
-      "locator": "robot_motion/runtime/dispatch_owner.py"
-    },
-    {
-      "artifact_id": "checkpoint-robot_motion-runtime-execution_checkpoint-runtime-20261026-v25",
-      "artifact_kind": "sim_checkpoint_source",
-      "sha256": "6d04f10eaf99c99e4592e20bfe1d505e73bf507b689331070a01ad6105c9699d",
-      "locator": "robot_motion/runtime/execution_checkpoint.py"
-    },
-    {
-      "artifact_id": "checkpoint-robot_motion-runtime-execution_gate-runtime-20261026-v25",
-      "artifact_kind": "sim_checkpoint_source",
-      "sha256": "6e8504d0c52ea49addb13f63d443d2c4821eeb6e6c434799dec699c4ca293159",
-      "locator": "robot_motion/runtime/execution_gate.py"
-    },
-    {
-      "artifact_id": "checkpoint-robot_motion-runtime-identity-runtime-20261026-v25",
-      "artifact_kind": "sim_checkpoint_source",
-      "sha256": "05bf4b80035697f588ff5780272ec8dfc8b9361e28de0e7316724dff88a1eeb1",
-      "locator": "robot_motion/runtime/identity.py"
-    },
-    {
-      "artifact_id": "checkpoint-robot_motion-runtime-immutable-runtime-20261026-v25",
-      "artifact_kind": "sim_checkpoint_source",
-      "sha256": "fcbe2db947f0ce266babed6dbe642b3b09b5b248aec9a0b13f267fe311dca3fa",
-      "locator": "robot_motion/runtime/immutable.py"
-    },
-    {
-      "artifact_id": "checkpoint-robot_motion-runtime-producer_epoch-runtime-20261026-v25",
-      "artifact_kind": "sim_checkpoint_source",
-      "sha256": "29d30763389066e567f0db40d2d4d89c8a9dbf44221c62777e399e6d349b6fd1",
-      "locator": "robot_motion/runtime/producer_epoch.py"
-    },
-    {
-      "artifact_id": "checkpoint-sim-mujoco-actuation-checkpoint-runtime-20261026-v25",
-      "artifact_kind": "sim_checkpoint_source",
-      "sha256": "0fd7ce73db510fa27f3f3ccab460b29802367d32d522e5ded384c0d49a898ab6",
-      "locator": "sim/mujoco/actuation/checkpoint.py"
-    },
-    {
-      "artifact_id": "checkpoint-sim-mujoco-adapters-checkpoint-runtime-20261026-v25",
-      "artifact_kind": "sim_checkpoint_source",
-      "sha256": "387f9e907388d67465b49d8b0b40bbec7b9617f587648e5f851f25843973cda8",
-      "locator": "sim/mujoco/adapters/checkpoint.py"
-    },
-    {
-      "artifact_id": "checkpoint-sim-mujoco-deploy-component_action_profile-runtime-20261026-v25",
-      "artifact_kind": "sim_checkpoint_source",
-      "sha256": "80707f7f53cfa29ad0c13b06362d339f37f00ae445c1c35012be68f1d276c965",
-      "locator": "sim/mujoco/deploy/component_action_profile.py"
-    },
-    {
-      "artifact_id": "checkpoint-sim-mujoco-deploy-execution_difference-runtime-20261026-v25",
-      "artifact_kind": "sim_checkpoint_source",
-      "sha256": "7983de34b11a92e239e1048bbfe84cfa385a721b1b3b0be0289fe34d90da4dcb",
-      "locator": "sim/mujoco/deploy/execution_difference.py"
-    },
-    {
-      "artifact_id": "checkpoint-sim-mujoco-deploy-execution_pose_observation-runtime-20261026-v25",
-      "artifact_kind": "sim_checkpoint_source",
-      "sha256": "2b865a3e80bf582ba200de01f6b28a1e59c30dccdaf456f8c612614dd4b77812",
-      "locator": "sim/mujoco/deploy/execution_pose_observation.py"
-    },
-    {
-      "artifact_id": "checkpoint-sim-mujoco-deploy-observation-runtime-20261026-v25",
-      "artifact_kind": "sim_checkpoint_source",
-      "sha256": "67baf0571f28482b40fb918cd90406466e1f1d3d0727f92aa1655f86f6a05f33",
-      "locator": "sim/mujoco/deploy/observation.py"
-    },
-    {
-      "artifact_id": "checkpoint-sim-mujoco-deploy-observation_checkpoint-runtime-20261026-v25",
-      "artifact_kind": "sim_checkpoint_source",
-      "sha256": "8dbfa4deac19a3473d897c1d2b0067c4ada2a0c5a7b30053c8b362c73cd4f801",
-      "locator": "sim/mujoco/deploy/observation_checkpoint.py"
-    },
-    {
-      "artifact_id": "checkpoint-sim-mujoco-deploy-pose_kinematics-runtime-20261026-v25",
-      "artifact_kind": "sim_checkpoint_source",
-      "sha256": "344912f9a4a555d76227c806ea47edb65253f73ac10440fa59b6235642e2ad29",
-      "locator": "sim/mujoco/deploy/pose_kinematics.py"
-    },
-    {
-      "artifact_id": "checkpoint-sim-mujoco-deploy-pose_resolution-runtime-20261026-v25",
-      "artifact_kind": "sim_checkpoint_source",
-      "sha256": "19c9446a40eb42aa04fb75b9613bdb58398e84467d8304332fd6bf8aea55bead",
-      "locator": "sim/mujoco/deploy/pose_resolution.py"
-    },
-    {
-      "artifact_id": "checkpoint-sim-mujoco-deploy-runtime_checkpoint-runtime-20261026-v25",
-      "artifact_kind": "sim_checkpoint_source",
-      "sha256": "4848dec17d572e7f78784bcd5caf60bbf0d8a7c0569836314c7b05589705b595",
-      "locator": "sim/mujoco/deploy/runtime_checkpoint.py"
-    },
-    {
-      "artifact_id": "checkpoint-sim-mujoco-deploy-target_checkpoint-runtime-20261026-v25",
-      "artifact_kind": "sim_checkpoint_source",
-      "sha256": "647d0f163ffd87ae01a39cdb2fa78abdb353d1c965812e3c0aa1fc176d7cdfe6",
-      "locator": "sim/mujoco/deploy/target_checkpoint.py"
-    },
-    {
-      "artifact_id": "checkpoint-sim-mujoco-deploy-target_measurement-runtime-20261026-v25",
-      "artifact_kind": "sim_checkpoint_source",
-      "sha256": "9de3a614522d1ecf78229796833832b014a9c4fa8f62e29fcdd3c4ba102d95c7",
-      "locator": "sim/mujoco/deploy/target_measurement.py"
-    },
-    {
-      "artifact_id": "checkpoint-sim-mujoco-deploy-target_preparation-runtime-20261026-v25",
-      "artifact_kind": "sim_checkpoint_source",
-      "sha256": "8ffb3556f13f04146f35699aba69a54dfde9df95dc9e4c7c9f5e55f817e4e140",
-      "locator": "sim/mujoco/deploy/target_preparation.py"
-    },
-    {
-      "artifact_id": "checkpoint-sim-mujoco-ik-runtime-20261026-v25",
-      "artifact_kind": "sim_checkpoint_source",
-      "sha256": "209959b2593d7257feedc9151a06d8d8b5330c0f74b622a7ef23a28fdbf63104",
-      "locator": "sim/mujoco/ik.py"
-    },
-    {
-      "artifact_id": "checkpoint-sim-mujoco-native_checkpoint-runtime-20261026-v25",
-      "artifact_kind": "sim_checkpoint_source",
-      "sha256": "815af665301cc5b009ab0a2cdd33ceaf1d2ce0109d78967b3057868e3eb4c99f",
-      "locator": "sim/mujoco/native_checkpoint.py"
-    },
-    {
-      "artifact_id": "checkpoint-sim-mujoco-scene-runtime-20261026-v25",
-      "artifact_kind": "sim_checkpoint_source",
-      "sha256": "4617fbb4c38a93b85c591a420d47011d72f1024bb4905f8c8d12a65a89708118",
-      "locator": "sim/mujoco/scene.py"
-    },
-    {
-      "artifact_id": "checkpoint-sim-rm65-actuation-gripper-runtime-20261026-v25",
-      "artifact_kind": "sim_checkpoint_source",
-      "sha256": "4c17b5f59a5021136c63999c45a8919479c010c2866b33347caa9dcb33d92767",
-      "locator": "sim/rm65/actuation/gripper.py"
+      "artifact_id": "rm65-native-grasp-observation-runtime-20261026-v25",
+      "artifact_kind": "runtime_source",
+      "sha256": "3fea5de24032e6bf67fcf8cd1a119ed5faa777e1835f9256066ff9f29f1f8cdf",
+      "locator": "agent_gateway/profiles/mujoco/grasp_observation.py"
     },
     {
       "artifact_id": "rm65-arm-runtime-binding-20261025-v24",
@@ -1017,16 +687,16 @@
       "locator": "sim/rm65/real2sim/artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261025_v24.json"
     },
     {
-      "artifact_id": "checkpoint-observer-consumer-validation-20261026-v25",
+      "artifact_id": "model-graph-consumer-validation-20261026-v25",
       "artifact_kind": "offline_validation_report",
-      "sha256": "ee77f0aa9c5bcb1f363de6395affb92c5ac8b23471b38e64a2ba652bb6ea5de7",
-      "locator": "artifact://checkpoint-observer-consumer-validation-20261026-v25"
+      "sha256": "7109b5ad64cebde84a6a37e180dca9b2c342de6c0d20f82f8087d6bfd4b3975b",
+      "locator": "artifact://model-graph-consumer-validation-20261026-v25"
     },
     {
-      "artifact_id": "checkpoint-observer-consumer-binding-20261026-v25",
+      "artifact_id": "model-graph-consumer-binding-20261026-v25",
       "artifact_kind": "offline_validation_binding",
-      "sha256": "04259fb25952617f7decc8bcb2066577d44fe69c69b61d3616c2d15a84261196",
-      "locator": "artifact://checkpoint-observer-consumer-binding-20261026-v25"
+      "sha256": "0de4f0892e18f45498cb7ba00d469b22b097e0da8db5b8eb4de389a219af3755",
+      "locator": "artifact://model-graph-consumer-binding-20261026-v25"
     }
   ],
   "fidelity_claims": [
@@ -1034,10 +704,12 @@
       "component": "arm.position_response.free_motion.runtime_source_binding",
       "status": "provisional",
       "evidence_artifact_ids": [
+        "rm65-arm-free-motion-fit-20260721-v4",
         "rm65-arm-profile-runtime-20261026-v25",
         "rm65-arm-actuator-core-runtime-20261026-v25",
         "rm65-arm-mujoco-executor-runtime-20261026-v25",
         "rm65-camera-registry-runtime-20261026-v25",
+        "rm65-arm-runtime-binding-20260922-v5",
         "rm65-command-guard-runtime-20261026-v25",
         "rm65-envelope-adapter-runtime-20261026-v25",
         "rm65-position-rig-runtime-20261026-v25",
@@ -1047,7 +719,9 @@
         "rm65-collision-result-runtime-20261026-v25",
         "rm65-grasp-contact-runtime-20261026-v25",
         "rm65-planned-tcp-motion-runtime-20261026-v25",
+        "rm65-arm-runtime-binding-20261017-v7",
         "rm65-agent-skill-target-runtime-20261026-v25",
+        "rm65-arm-runtime-binding-20261018-v8",
         "rm65-gripper-executor-runtime-20261026-v25",
         "rm65-collision-policy-runtime-20261026-v25",
         "rm65-contact-timing-runtime-20261026-v25",
@@ -1055,11 +729,16 @@
         "rm65-payload-motion-runtime-20261026-v25",
         "rm65-object-release-runtime-20261026-v25",
         "rm65-object-transport-runtime-20261026-v25",
+        "rm65-arm-runtime-binding-20261022-v9",
         "rm65-native-prepared-skill-runtime-20261026-v25",
+        "rm65-arm-runtime-binding-20261023-v10",
+        "rm65-arm-runtime-binding-20261023-v12",
+        "rm65-arm-runtime-binding-20261023-v13",
         "rm65-single-arm-ik-runtime-20261026-v25",
         "rm65-tcp-pose-envelope-core-runtime-20261026-v25",
         "rm65-motion-application-runtime-20261026-v25",
         "rm65-deploy-runtime-core-runtime-20261026-v25",
+        "rm65-arm-runtime-binding-20261023-v14",
         "rm65-observed-joint-input-runtime-20261026-v25",
         "rm65-observed-collision-model-runtime-20261026-v25",
         "rm65-observed-scene-runtime-20261026-v25",
@@ -1068,18 +747,22 @@
         "rm65-observed-point-contract-runtime-20261026-v25",
         "rm65-rgbd-source-runtime-20261026-v25",
         "rm65-depth-capture-conversion-runtime-20261026-v25",
+        "rm65-arm-runtime-binding-20261024-v15",
         "rm65-correlated-rgbd-contract-runtime-20261026-v25",
         "rm65-paired-rgbd-codec-runtime-20261026-v25",
         "rm65-paired-rgbd-capture-runtime-20261026-v25",
         "rm65-paired-rgbd-skill-contract-runtime-20261026-v25",
         "rm65-paired-rgbd-artifact-contract-runtime-20261026-v25",
+        "rm65-arm-runtime-binding-20261025-v16",
         "rm65-segmentation-provider-runtime-20261026-v25",
         "rm65-segmentation-batch-runtime-20261026-v25",
         "rm65-segmentation-definitions-runtime-20261026-v25",
         "rm65-segmentation-schemas-runtime-20261026-v25",
         "rm65-segmentation-session-runtime-20261026-v25",
+        "rm65-arm-runtime-binding-20261025-v17",
         "rm65-waypoint-cancellation-runtime-20261026-v25",
         "rm65-tcp-envelope-query-runtime-20261026-v25",
+        "rm65-arm-runtime-binding-20261025-v18",
         "rm65-object-path-query-runtime-20261026-v25",
         "rm65-object-path-contract-runtime-20261026-v25",
         "rm65-query-geometry-runtime-20261026-v25",
@@ -1095,10 +778,13 @@
         "rm65-motion-deployment-runtime-20261026-v25",
         "rm65-motion-factory-runtime-20261026-v25",
         "rm65-motion-launcher-runtime-20261026-v25",
+        "rm65-arm-runtime-binding-20261025-v19",
+        "rm65-arm-runtime-binding-20261025-v20",
         "rm65-shared-localization-provider-runtime-20261026-v25",
         "rm65-shared-localization-deployment-runtime-20261026-v25",
         "rm65-real-localization-provider-facade-runtime-20261026-v25",
         "rm65-real-localization-deployment-facade-runtime-20261026-v25",
+        "rm65-arm-runtime-binding-20261025-v21",
         "rm65-tcp-axis-constraint-runtime-20261026-v25",
         "rm65-spatial-goal-regions-runtime-20261026-v25",
         "rm65-safe-tcp-v2-contract-runtime-20261026-v25",
@@ -1120,80 +806,27 @@
         "rm65-real-current-authorization-runtime-20261026-v25",
         "rm65-native-continuation-clutter-scene-runtime-20261026-v25",
         "rm65-native-continuation-clutter-task-runtime-20261026-v25",
+        "rm65-arm-runtime-binding-20261025-v22",
         "rm65-real-compatibility-control-station-runtime-20261026-v25",
         "rm65-real-compatibility-motion-factory-runtime-20261026-v25",
-        "checkpoint-control_composition-observability-execution_difference-runtime-20261026-v25",
-        "checkpoint-control_composition-observability-modules-runtime-20261026-v25",
-        "checkpoint-dataset_contracts-action_schema-runtime-20261026-v25",
-        "checkpoint-dataset_contracts-canonical_encoding-runtime-20261026-v25",
-        "checkpoint-dataset_contracts-control_trace-runtime-20261026-v25",
-        "checkpoint-robot_motion-action-adaptation-runtime-20261026-v25",
-        "checkpoint-robot_motion-action-admission_checkpoint-runtime-20261026-v25",
-        "checkpoint-robot_motion-action-arbiter-runtime-20261026-v25",
-        "checkpoint-robot_motion-action-arbitration_runtime-runtime-20261026-v25",
-        "checkpoint-robot_motion-action-authoritative_checkpoint-runtime-20261026-v25",
-        "checkpoint-robot_motion-action-authoritative_control-runtime-20261026-v25",
-        "checkpoint-robot_motion-action-authoritative_trace-runtime-20261026-v25",
-        "checkpoint-robot_motion-action-authority-runtime-20261026-v25",
-        "checkpoint-robot_motion-action-candidate_authorization-runtime-20261026-v25",
-        "checkpoint-robot_motion-action-checkpoint_codec-runtime-20261026-v25",
-        "checkpoint-robot_motion-action-component_action-runtime-20261026-v25",
-        "checkpoint-robot_motion-action-components-runtime-20261026-v25",
-        "checkpoint-robot_motion-action-decision_checkpoint-runtime-20261026-v25",
-        "checkpoint-robot_motion-action-dispatch_context-runtime-20261026-v25",
-        "checkpoint-robot_motion-action-execution_handoff-runtime-20261026-v25",
-        "checkpoint-robot_motion-action-execution_observation-runtime-20261026-v25",
-        "checkpoint-robot_motion-action-executor-runtime-20261026-v25",
-        "checkpoint-robot_motion-action-persistence-runtime-20261026-v25",
-        "checkpoint-robot_motion-action-proposal-runtime-20261026-v25",
-        "checkpoint-robot_motion-action-schema-runtime-20261026-v25",
-        "checkpoint-robot_motion-action-target_capability-runtime-20261026-v25",
-        "checkpoint-robot_motion-position_control-capability-runtime-20261026-v25",
-        "checkpoint-robot_motion-position_control-trajectory-runtime-20261026-v25",
-        "checkpoint-robot_motion-position_control-trajectory_checkpoint-runtime-20261026-v25",
-        "checkpoint-robot_motion-rm65-dual_arm_ik-runtime-20261026-v25",
-        "checkpoint-robot_motion-rm65-dual_arm_target_solver-runtime-20261026-v25",
-        "checkpoint-robot_motion-rm65-ik_checkpoint-runtime-20261026-v25",
-        "checkpoint-robot_motion-rm65-retargeter_checkpoint-runtime-20261026-v25",
-        "checkpoint-robot_motion-runtime-cancellation-runtime-20261026-v25",
-        "checkpoint-robot_motion-runtime-control_admission-runtime-20261026-v25",
-        "checkpoint-robot_motion-runtime-dispatch-runtime-20261026-v25",
-        "checkpoint-robot_motion-runtime-dispatch_owner-runtime-20261026-v25",
-        "checkpoint-robot_motion-runtime-execution_checkpoint-runtime-20261026-v25",
-        "checkpoint-robot_motion-runtime-execution_gate-runtime-20261026-v25",
-        "checkpoint-robot_motion-runtime-identity-runtime-20261026-v25",
-        "checkpoint-robot_motion-runtime-immutable-runtime-20261026-v25",
-        "checkpoint-robot_motion-runtime-producer_epoch-runtime-20261026-v25",
-        "checkpoint-sim-mujoco-actuation-checkpoint-runtime-20261026-v25",
-        "checkpoint-sim-mujoco-adapters-checkpoint-runtime-20261026-v25",
-        "checkpoint-sim-mujoco-deploy-component_action_profile-runtime-20261026-v25",
-        "checkpoint-sim-mujoco-deploy-execution_difference-runtime-20261026-v25",
-        "checkpoint-sim-mujoco-deploy-execution_pose_observation-runtime-20261026-v25",
-        "checkpoint-sim-mujoco-deploy-observation-runtime-20261026-v25",
-        "checkpoint-sim-mujoco-deploy-observation_checkpoint-runtime-20261026-v25",
-        "checkpoint-sim-mujoco-deploy-pose_kinematics-runtime-20261026-v25",
-        "checkpoint-sim-mujoco-deploy-pose_resolution-runtime-20261026-v25",
-        "checkpoint-sim-mujoco-deploy-runtime_checkpoint-runtime-20261026-v25",
-        "checkpoint-sim-mujoco-deploy-target_checkpoint-runtime-20261026-v25",
-        "checkpoint-sim-mujoco-deploy-target_measurement-runtime-20261026-v25",
-        "checkpoint-sim-mujoco-deploy-target_preparation-runtime-20261026-v25",
-        "checkpoint-sim-mujoco-ik-runtime-20261026-v25",
-        "checkpoint-sim-mujoco-native_checkpoint-runtime-20261026-v25",
-        "checkpoint-sim-mujoco-scene-runtime-20261026-v25",
-        "checkpoint-sim-rm65-actuation-gripper-runtime-20261026-v25",
-        "checkpoint-observer-consumer-validation-20261026-v25",
-        "checkpoint-observer-consumer-binding-20261026-v25",
+        "rm65-arm-runtime-binding-20261025-v23",
+        "rm65-sam3-rpc-model-client-runtime-20261026-v25",
+        "rm65-native-grasp-deployment-runtime-20261026-v25",
+        "rm65-native-grasp-fast-plan-runtime-20261026-v25",
+        "rm65-native-grasp-observation-runtime-20261026-v25",
         "rm65-arm-runtime-binding-20261025-v24",
-        "rm65-arm-free-motion-fit-20260721-v4"
+        "model-graph-consumer-validation-20261026-v25",
+        "model-graph-consumer-binding-20261026-v25"
       ],
       "limitations": [
-        "The original v4 fit and V24 and older source bindings remain immutable; no arm response parameter was refit.",
-        "This binds the manual immediate target checkpoint, original owner restoration and standard Cartesian full_frames observer continuation.",
-        "The observer does not publish during capture or restoration; full_frames means each original runtime observation cut, not every physics tick.",
-        "Trusted in-memory target branches do not establish portable Gateway session or upper agent context restoration.",
-        "Offline and native simulator evidence does not establish held-out arm fidelity, model quality, training benefit or hardware acceptance."
+        "The v4 arm fit, V24 and all historical runtime bindings retain their bytes; no arm response was refit.",
+        "Explicit SAM3 and external GraspGenX client options reuse existing application owners; default SAM2, in-process GraspGenX and GraspMoE selection are unchanged.",
+        "Public native grasp observations bind private qpos, qvel and simulation time by digest; producer and consumer hashes migrate together while canonical bounded CAS and retained-source checks remain.",
+        "Endpoint check evidence is retained only on rejection; numerical solving, successful metadata, collision queries, ranking, cancellation, original budgets and HOLD are unchanged.",
+        "The offline benchmark reads already-bound external evidence and retains failed/unstarted denominators; it grants no execution authority or task-success qualification.",
+        "The report is local CPU/native MuJoCo consumer evidence, not an external model RPC experiment, deployed model, hardware, held-out response or six-way scheduling qualification."
       ],
-      "notes": "Source identity is separate from task success and complete repository acceptance."
+      "notes": ""
     }
   ],
   "validation_evidence": [
@@ -1202,18 +835,20 @@
       "split": "validation",
       "status": "passed",
       "metrics": {
-        "bound_runtime_source_file_count": 144.0,
-        "bound_runtime_input_file_count": 147.0,
+        "bound_runtime_source_file_count": 89.0,
+        "bound_runtime_input_file_count": 92.0,
         "changed_runtime_source_file_count_from_previous_binding": 3.0,
-        "new_runtime_source_file_count": 59.0,
+        "new_runtime_source_file_count": 4.0,
         "arm_profile_refit_count": 0.0,
         "mutated_historical_artifact_count": 0.0
       },
       "evidence_artifact_ids": [
+        "rm65-arm-free-motion-fit-20260721-v4",
         "rm65-arm-profile-runtime-20261026-v25",
         "rm65-arm-actuator-core-runtime-20261026-v25",
         "rm65-arm-mujoco-executor-runtime-20261026-v25",
         "rm65-camera-registry-runtime-20261026-v25",
+        "rm65-arm-runtime-binding-20260922-v5",
         "rm65-command-guard-runtime-20261026-v25",
         "rm65-envelope-adapter-runtime-20261026-v25",
         "rm65-position-rig-runtime-20261026-v25",
@@ -1223,7 +858,9 @@
         "rm65-collision-result-runtime-20261026-v25",
         "rm65-grasp-contact-runtime-20261026-v25",
         "rm65-planned-tcp-motion-runtime-20261026-v25",
+        "rm65-arm-runtime-binding-20261017-v7",
         "rm65-agent-skill-target-runtime-20261026-v25",
+        "rm65-arm-runtime-binding-20261018-v8",
         "rm65-gripper-executor-runtime-20261026-v25",
         "rm65-collision-policy-runtime-20261026-v25",
         "rm65-contact-timing-runtime-20261026-v25",
@@ -1231,11 +868,16 @@
         "rm65-payload-motion-runtime-20261026-v25",
         "rm65-object-release-runtime-20261026-v25",
         "rm65-object-transport-runtime-20261026-v25",
+        "rm65-arm-runtime-binding-20261022-v9",
         "rm65-native-prepared-skill-runtime-20261026-v25",
+        "rm65-arm-runtime-binding-20261023-v10",
+        "rm65-arm-runtime-binding-20261023-v12",
+        "rm65-arm-runtime-binding-20261023-v13",
         "rm65-single-arm-ik-runtime-20261026-v25",
         "rm65-tcp-pose-envelope-core-runtime-20261026-v25",
         "rm65-motion-application-runtime-20261026-v25",
         "rm65-deploy-runtime-core-runtime-20261026-v25",
+        "rm65-arm-runtime-binding-20261023-v14",
         "rm65-observed-joint-input-runtime-20261026-v25",
         "rm65-observed-collision-model-runtime-20261026-v25",
         "rm65-observed-scene-runtime-20261026-v25",
@@ -1244,18 +886,22 @@
         "rm65-observed-point-contract-runtime-20261026-v25",
         "rm65-rgbd-source-runtime-20261026-v25",
         "rm65-depth-capture-conversion-runtime-20261026-v25",
+        "rm65-arm-runtime-binding-20261024-v15",
         "rm65-correlated-rgbd-contract-runtime-20261026-v25",
         "rm65-paired-rgbd-codec-runtime-20261026-v25",
         "rm65-paired-rgbd-capture-runtime-20261026-v25",
         "rm65-paired-rgbd-skill-contract-runtime-20261026-v25",
         "rm65-paired-rgbd-artifact-contract-runtime-20261026-v25",
+        "rm65-arm-runtime-binding-20261025-v16",
         "rm65-segmentation-provider-runtime-20261026-v25",
         "rm65-segmentation-batch-runtime-20261026-v25",
         "rm65-segmentation-definitions-runtime-20261026-v25",
         "rm65-segmentation-schemas-runtime-20261026-v25",
         "rm65-segmentation-session-runtime-20261026-v25",
+        "rm65-arm-runtime-binding-20261025-v17",
         "rm65-waypoint-cancellation-runtime-20261026-v25",
         "rm65-tcp-envelope-query-runtime-20261026-v25",
+        "rm65-arm-runtime-binding-20261025-v18",
         "rm65-object-path-query-runtime-20261026-v25",
         "rm65-object-path-contract-runtime-20261026-v25",
         "rm65-query-geometry-runtime-20261026-v25",
@@ -1271,10 +917,13 @@
         "rm65-motion-deployment-runtime-20261026-v25",
         "rm65-motion-factory-runtime-20261026-v25",
         "rm65-motion-launcher-runtime-20261026-v25",
+        "rm65-arm-runtime-binding-20261025-v19",
+        "rm65-arm-runtime-binding-20261025-v20",
         "rm65-shared-localization-provider-runtime-20261026-v25",
         "rm65-shared-localization-deployment-runtime-20261026-v25",
         "rm65-real-localization-provider-facade-runtime-20261026-v25",
         "rm65-real-localization-deployment-facade-runtime-20261026-v25",
+        "rm65-arm-runtime-binding-20261025-v21",
         "rm65-tcp-axis-constraint-runtime-20261026-v25",
         "rm65-spatial-goal-regions-runtime-20261026-v25",
         "rm65-safe-tcp-v2-contract-runtime-20261026-v25",
@@ -1296,113 +945,161 @@
         "rm65-real-current-authorization-runtime-20261026-v25",
         "rm65-native-continuation-clutter-scene-runtime-20261026-v25",
         "rm65-native-continuation-clutter-task-runtime-20261026-v25",
+        "rm65-arm-runtime-binding-20261025-v22",
         "rm65-real-compatibility-control-station-runtime-20261026-v25",
         "rm65-real-compatibility-motion-factory-runtime-20261026-v25",
-        "checkpoint-control_composition-observability-execution_difference-runtime-20261026-v25",
-        "checkpoint-control_composition-observability-modules-runtime-20261026-v25",
-        "checkpoint-dataset_contracts-action_schema-runtime-20261026-v25",
-        "checkpoint-dataset_contracts-canonical_encoding-runtime-20261026-v25",
-        "checkpoint-dataset_contracts-control_trace-runtime-20261026-v25",
-        "checkpoint-robot_motion-action-adaptation-runtime-20261026-v25",
-        "checkpoint-robot_motion-action-admission_checkpoint-runtime-20261026-v25",
-        "checkpoint-robot_motion-action-arbiter-runtime-20261026-v25",
-        "checkpoint-robot_motion-action-arbitration_runtime-runtime-20261026-v25",
-        "checkpoint-robot_motion-action-authoritative_checkpoint-runtime-20261026-v25",
-        "checkpoint-robot_motion-action-authoritative_control-runtime-20261026-v25",
-        "checkpoint-robot_motion-action-authoritative_trace-runtime-20261026-v25",
-        "checkpoint-robot_motion-action-authority-runtime-20261026-v25",
-        "checkpoint-robot_motion-action-candidate_authorization-runtime-20261026-v25",
-        "checkpoint-robot_motion-action-checkpoint_codec-runtime-20261026-v25",
-        "checkpoint-robot_motion-action-component_action-runtime-20261026-v25",
-        "checkpoint-robot_motion-action-components-runtime-20261026-v25",
-        "checkpoint-robot_motion-action-decision_checkpoint-runtime-20261026-v25",
-        "checkpoint-robot_motion-action-dispatch_context-runtime-20261026-v25",
-        "checkpoint-robot_motion-action-execution_handoff-runtime-20261026-v25",
-        "checkpoint-robot_motion-action-execution_observation-runtime-20261026-v25",
-        "checkpoint-robot_motion-action-executor-runtime-20261026-v25",
-        "checkpoint-robot_motion-action-persistence-runtime-20261026-v25",
-        "checkpoint-robot_motion-action-proposal-runtime-20261026-v25",
-        "checkpoint-robot_motion-action-schema-runtime-20261026-v25",
-        "checkpoint-robot_motion-action-target_capability-runtime-20261026-v25",
-        "checkpoint-robot_motion-position_control-capability-runtime-20261026-v25",
-        "checkpoint-robot_motion-position_control-trajectory-runtime-20261026-v25",
-        "checkpoint-robot_motion-position_control-trajectory_checkpoint-runtime-20261026-v25",
-        "checkpoint-robot_motion-rm65-dual_arm_ik-runtime-20261026-v25",
-        "checkpoint-robot_motion-rm65-dual_arm_target_solver-runtime-20261026-v25",
-        "checkpoint-robot_motion-rm65-ik_checkpoint-runtime-20261026-v25",
-        "checkpoint-robot_motion-rm65-retargeter_checkpoint-runtime-20261026-v25",
-        "checkpoint-robot_motion-runtime-cancellation-runtime-20261026-v25",
-        "checkpoint-robot_motion-runtime-control_admission-runtime-20261026-v25",
-        "checkpoint-robot_motion-runtime-dispatch-runtime-20261026-v25",
-        "checkpoint-robot_motion-runtime-dispatch_owner-runtime-20261026-v25",
-        "checkpoint-robot_motion-runtime-execution_checkpoint-runtime-20261026-v25",
-        "checkpoint-robot_motion-runtime-execution_gate-runtime-20261026-v25",
-        "checkpoint-robot_motion-runtime-identity-runtime-20261026-v25",
-        "checkpoint-robot_motion-runtime-immutable-runtime-20261026-v25",
-        "checkpoint-robot_motion-runtime-producer_epoch-runtime-20261026-v25",
-        "checkpoint-sim-mujoco-actuation-checkpoint-runtime-20261026-v25",
-        "checkpoint-sim-mujoco-adapters-checkpoint-runtime-20261026-v25",
-        "checkpoint-sim-mujoco-deploy-component_action_profile-runtime-20261026-v25",
-        "checkpoint-sim-mujoco-deploy-execution_difference-runtime-20261026-v25",
-        "checkpoint-sim-mujoco-deploy-execution_pose_observation-runtime-20261026-v25",
-        "checkpoint-sim-mujoco-deploy-observation-runtime-20261026-v25",
-        "checkpoint-sim-mujoco-deploy-observation_checkpoint-runtime-20261026-v25",
-        "checkpoint-sim-mujoco-deploy-pose_kinematics-runtime-20261026-v25",
-        "checkpoint-sim-mujoco-deploy-pose_resolution-runtime-20261026-v25",
-        "checkpoint-sim-mujoco-deploy-runtime_checkpoint-runtime-20261026-v25",
-        "checkpoint-sim-mujoco-deploy-target_checkpoint-runtime-20261026-v25",
-        "checkpoint-sim-mujoco-deploy-target_measurement-runtime-20261026-v25",
-        "checkpoint-sim-mujoco-deploy-target_preparation-runtime-20261026-v25",
-        "checkpoint-sim-mujoco-ik-runtime-20261026-v25",
-        "checkpoint-sim-mujoco-native_checkpoint-runtime-20261026-v25",
-        "checkpoint-sim-mujoco-scene-runtime-20261026-v25",
-        "checkpoint-sim-rm65-actuation-gripper-runtime-20261026-v25",
-        "checkpoint-observer-consumer-validation-20261026-v25",
-        "checkpoint-observer-consumer-binding-20261026-v25",
+        "rm65-arm-runtime-binding-20261025-v23",
+        "rm65-sam3-rpc-model-client-runtime-20261026-v25",
+        "rm65-native-grasp-deployment-runtime-20261026-v25",
+        "rm65-native-grasp-fast-plan-runtime-20261026-v25",
+        "rm65-native-grasp-observation-runtime-20261026-v25",
         "rm65-arm-runtime-binding-20261025-v24",
-        "rm65-arm-free-motion-fit-20260721-v4"
+        "model-graph-consumer-validation-20261026-v25",
+        "model-graph-consumer-binding-20261026-v25"
       ],
-      "notes": "Every current input is checked byte-for-byte against fixed source db09fe45844420d70ee2635a26f85b30d89fbf07"
+      "notes": "Every input matches fixed commit 83581f2acbdd614f2f75a32cb6996fe4fb9abddc; source deltas are enumerated."
     },
     {
-      "validation_id": "offline-checkpoint-observer-consumers-v25",
+      "validation_id": "offline-model-graph-consumers-v25",
       "split": "validation",
       "status": "passed",
       "metrics": {
-        "passed_cases": 679.0,
-        "skipped_cases": 1.0,
+        "passed_cases": 766.0,
+        "skipped_cases": 0.0,
         "failed_cases": 0.0,
         "error_cases": 0.0
       },
       "evidence_artifact_ids": [
-        "checkpoint-observer-consumer-validation-20261026-v25",
-        "checkpoint-observer-consumer-binding-20261026-v25"
+        "rm65-arm-free-motion-fit-20260721-v4",
+        "rm65-arm-profile-runtime-20261026-v25",
+        "rm65-arm-actuator-core-runtime-20261026-v25",
+        "rm65-arm-mujoco-executor-runtime-20261026-v25",
+        "rm65-camera-registry-runtime-20261026-v25",
+        "rm65-arm-runtime-binding-20260922-v5",
+        "rm65-command-guard-runtime-20261026-v25",
+        "rm65-envelope-adapter-runtime-20261026-v25",
+        "rm65-position-rig-runtime-20261026-v25",
+        "rm65-position-assembly-runtime-20261026-v25",
+        "rm65-collision-oracle-runtime-20261026-v25",
+        "rm65-collision-projection-runtime-20261026-v25",
+        "rm65-collision-result-runtime-20261026-v25",
+        "rm65-grasp-contact-runtime-20261026-v25",
+        "rm65-planned-tcp-motion-runtime-20261026-v25",
+        "rm65-arm-runtime-binding-20261017-v7",
+        "rm65-agent-skill-target-runtime-20261026-v25",
+        "rm65-arm-runtime-binding-20261018-v8",
+        "rm65-gripper-executor-runtime-20261026-v25",
+        "rm65-collision-policy-runtime-20261026-v25",
+        "rm65-contact-timing-runtime-20261026-v25",
+        "rm65-grasped-object-observer-runtime-20261026-v25",
+        "rm65-payload-motion-runtime-20261026-v25",
+        "rm65-object-release-runtime-20261026-v25",
+        "rm65-object-transport-runtime-20261026-v25",
+        "rm65-arm-runtime-binding-20261022-v9",
+        "rm65-native-prepared-skill-runtime-20261026-v25",
+        "rm65-arm-runtime-binding-20261023-v10",
+        "rm65-arm-runtime-binding-20261023-v12",
+        "rm65-arm-runtime-binding-20261023-v13",
+        "rm65-single-arm-ik-runtime-20261026-v25",
+        "rm65-tcp-pose-envelope-core-runtime-20261026-v25",
+        "rm65-motion-application-runtime-20261026-v25",
+        "rm65-deploy-runtime-core-runtime-20261026-v25",
+        "rm65-arm-runtime-binding-20261023-v14",
+        "rm65-observed-joint-input-runtime-20261026-v25",
+        "rm65-observed-collision-model-runtime-20261026-v25",
+        "rm65-observed-scene-runtime-20261026-v25",
+        "rm65-retained-observed-point-runtime-20261026-v25",
+        "rm65-observed-point-consumer-runtime-20261026-v25",
+        "rm65-observed-point-contract-runtime-20261026-v25",
+        "rm65-rgbd-source-runtime-20261026-v25",
+        "rm65-depth-capture-conversion-runtime-20261026-v25",
+        "rm65-arm-runtime-binding-20261024-v15",
+        "rm65-correlated-rgbd-contract-runtime-20261026-v25",
+        "rm65-paired-rgbd-codec-runtime-20261026-v25",
+        "rm65-paired-rgbd-capture-runtime-20261026-v25",
+        "rm65-paired-rgbd-skill-contract-runtime-20261026-v25",
+        "rm65-paired-rgbd-artifact-contract-runtime-20261026-v25",
+        "rm65-arm-runtime-binding-20261025-v16",
+        "rm65-segmentation-provider-runtime-20261026-v25",
+        "rm65-segmentation-batch-runtime-20261026-v25",
+        "rm65-segmentation-definitions-runtime-20261026-v25",
+        "rm65-segmentation-schemas-runtime-20261026-v25",
+        "rm65-segmentation-session-runtime-20261026-v25",
+        "rm65-arm-runtime-binding-20261025-v17",
+        "rm65-waypoint-cancellation-runtime-20261026-v25",
+        "rm65-tcp-envelope-query-runtime-20261026-v25",
+        "rm65-arm-runtime-binding-20261025-v18",
+        "rm65-object-path-query-runtime-20261026-v25",
+        "rm65-object-path-contract-runtime-20261026-v25",
+        "rm65-query-geometry-runtime-20261026-v25",
+        "rm65-surface-anchor-runtime-20261026-v25",
+        "rm65-surface-selection-runtime-20261026-v25",
+        "rm65-paired-surface-anchor-runtime-20261026-v25",
+        "rm65-surface-anchor-contract-runtime-20261026-v25",
+        "rm65-surface-anchor-v2-contract-runtime-20261026-v25",
+        "rm65-surface-anchor-v3-contract-runtime-20261026-v25",
+        "rm65-relation-goal-core-runtime-20261026-v25",
+        "rm65-spatial-goal-provider-runtime-20261026-v25",
+        "rm65-spatial-goal-contract-runtime-20261026-v25",
+        "rm65-motion-deployment-runtime-20261026-v25",
+        "rm65-motion-factory-runtime-20261026-v25",
+        "rm65-motion-launcher-runtime-20261026-v25",
+        "rm65-arm-runtime-binding-20261025-v19",
+        "rm65-arm-runtime-binding-20261025-v20",
+        "rm65-shared-localization-provider-runtime-20261026-v25",
+        "rm65-shared-localization-deployment-runtime-20261026-v25",
+        "rm65-real-localization-provider-facade-runtime-20261026-v25",
+        "rm65-real-localization-deployment-facade-runtime-20261026-v25",
+        "rm65-arm-runtime-binding-20261025-v21",
+        "rm65-tcp-axis-constraint-runtime-20261026-v25",
+        "rm65-spatial-goal-regions-runtime-20261026-v25",
+        "rm65-safe-tcp-v2-contract-runtime-20261026-v25",
+        "rm65-retained-motion-definitions-runtime-20261026-v25",
+        "rm65-tcp-continuation-contract-runtime-20261026-v25",
+        "rm65-pose-candidate-contract-runtime-20261026-v25",
+        "rm65-relation-continuation-contract-runtime-20261026-v25",
+        "rm65-region-continuation-contract-runtime-20261026-v25",
+        "rm65-tcp-continuation-executor-runtime-20261026-v25",
+        "rm65-pose-candidate-executor-runtime-20261026-v25",
+        "rm65-relation-continuation-executor-runtime-20261026-v25",
+        "rm65-region-continuation-executor-runtime-20261026-v25",
+        "rm65-native-continuation-executor-runtime-20261026-v25",
+        "rm65-real-current-gateway-cli-runtime-20261026-v25",
+        "rm65-real-current-gateway-session-runtime-20261026-v25",
+        "rm65-real-current-motion-profiles-runtime-20261026-v25",
+        "rm65-real-current-one-shot-client-runtime-20261026-v25",
+        "rm65-real-current-composition-runtime-20261026-v25",
+        "rm65-real-current-authorization-runtime-20261026-v25",
+        "rm65-native-continuation-clutter-scene-runtime-20261026-v25",
+        "rm65-native-continuation-clutter-task-runtime-20261026-v25",
+        "rm65-arm-runtime-binding-20261025-v22",
+        "rm65-real-compatibility-control-station-runtime-20261026-v25",
+        "rm65-real-compatibility-motion-factory-runtime-20261026-v25",
+        "rm65-arm-runtime-binding-20261025-v23",
+        "rm65-sam3-rpc-model-client-runtime-20261026-v25",
+        "rm65-native-grasp-deployment-runtime-20261026-v25",
+        "rm65-native-grasp-fast-plan-runtime-20261026-v25",
+        "rm65-native-grasp-observation-runtime-20261026-v25",
+        "rm65-arm-runtime-binding-20261025-v24",
+        "model-graph-consumer-validation-20261026-v25",
+        "model-graph-consumer-binding-20261026-v25"
       ],
-      "notes": "Focused fixed-source owners and consumers; full repository acceptance is a separate gate."
+      "notes": "The clean report and receipt bind 83581f2acbdd614f2f75a32cb6996fe4fb9abddc / dc6a1c69297bf7edfd808324e90698d878ef1e43."
     },
     {
-      "validation_id": "new-held-out-arm-response-v25",
+      "validation_id": "new-untouched-clean-held-out-v25-runtime-source-binding",
       "split": "held_out",
       "status": "not_run",
       "metrics": {},
-      "evidence_artifact_ids": [
-        "rm65-arm-free-motion-fit-20260721-v4"
-      ],
-      "notes": "No new physical calibration or held-out capture."
+      "evidence_artifact_ids": [],
+      "notes": "No new held-out response capture or profile refit."
     }
   ],
-  "code_revision": "db09fe45844420d70ee2635a26f85b30d89fbf07",
+  "code_revision": "83581f2acbdd614f2f75a32cb6996fe4fb9abddc",
   "environment_fingerprint": {
-    "source_commit": "db09fe45844420d70ee2635a26f85b30d89fbf07",
-    "python": "3.10.20",
-    "platform": "x86_64",
-    "numpy": "1.26.4",
-    "mujoco": "3.10.0",
-    "pin": "distribution-not-found",
-    "pin-pink": "4.2.0",
-    "coal": "distribution-not-found",
-    "qpsolvers": "4.11.0",
-    "osqp": "1.1.3"
+    "source_commit": "83581f2acbdd614f2f75a32cb6996fe4fb9abddc",
+    "source_tree": "dc6a1c69297bf7edfd808324e90698d878ef1e43",
+    "validation_environment": "existing Conda interpreter and approved private CAD overlay; local offline only"
   },
   "metadata": {
     "owner": "sim.rm65",
@@ -1414,121 +1111,24 @@
     "previous_runtime_binding_file_sha256": "475e7e045be44493b9ca6d35793ee1240b5b47a249a33181b77c6ff694475101",
     "arm_profile_refit": false,
     "runtime_behavior_change": true,
-    "runtime_behavior_change_scope": "manual_immediate_target_checkpoint_and_cartesian_observation_continuation",
-    "runtime_source_commit": "db09fe45844420d70ee2635a26f85b30d89fbf07",
-    "migration": "native_checkpoint_observer_source_binding",
-    "offline_validation_report_artifact_id": "checkpoint-observer-consumer-validation-20261026-v25",
-    "offline_validation_binding_artifact_id": "checkpoint-observer-consumer-binding-20261026-v25",
-    "offline_validation_source_tree": "86cd3aa93b73adc06907df98c4665fece201e86c",
-    "offline_validation_execution_head": "db09fe45844420d70ee2635a26f85b30d89fbf07",
+    "runtime_behavior_change_scope": "optional_mujoco_model_graph_and_private_grasp_observation_digest",
+    "runtime_source_commit": "83581f2acbdd614f2f75a32cb6996fe4fb9abddc",
+    "migration": "model_graph_privacy_source_binding",
+    "offline_validation_report_artifact_id": "model-graph-consumer-validation-20261026-v25",
+    "offline_validation_binding_artifact_id": "model-graph-consumer-binding-20261026-v25",
+    "offline_validation_source_tree": "dc6a1c69297bf7edfd808324e90698d878ef1e43",
+    "offline_validation_execution_head": "83581f2acbdd614f2f75a32cb6996fe4fb9abddc",
     "changed_previous_runtime_sources": [
-      "sim/mujoco/deploy/agent_skill_target.py",
-      "sim/mujoco/deploy/runtime.py",
-      "sim/rm65/actuation/core.py"
+      "agent_gateway/profiles/mujoco/gateway_cli.py",
+      "agent_gateway/profiles/mujoco/object_goal_query.py",
+      "sim/mujoco/deploy/planned_tcp_motion.py"
     ],
     "new_runtime_sources": [
-      "control_composition/observability/execution_difference.py",
-      "control_composition/observability/modules.py",
-      "dataset_contracts/action_schema.py",
-      "dataset_contracts/canonical_encoding.py",
-      "dataset_contracts/control_trace.py",
-      "robot_motion/action/adaptation.py",
-      "robot_motion/action/admission_checkpoint.py",
-      "robot_motion/action/arbiter.py",
-      "robot_motion/action/arbitration_runtime.py",
-      "robot_motion/action/authoritative_checkpoint.py",
-      "robot_motion/action/authoritative_control.py",
-      "robot_motion/action/authoritative_trace.py",
-      "robot_motion/action/authority.py",
-      "robot_motion/action/candidate_authorization.py",
-      "robot_motion/action/checkpoint_codec.py",
-      "robot_motion/action/component_action.py",
-      "robot_motion/action/components.py",
-      "robot_motion/action/decision_checkpoint.py",
-      "robot_motion/action/dispatch_context.py",
-      "robot_motion/action/execution_handoff.py",
-      "robot_motion/action/execution_observation.py",
-      "robot_motion/action/executor.py",
-      "robot_motion/action/persistence.py",
-      "robot_motion/action/proposal.py",
-      "robot_motion/action/schema.py",
-      "robot_motion/action/target_capability.py",
-      "robot_motion/position_control/capability.py",
-      "robot_motion/position_control/trajectory.py",
-      "robot_motion/position_control/trajectory_checkpoint.py",
-      "robot_motion/rm65/dual_arm_ik.py",
-      "robot_motion/rm65/dual_arm_target_solver.py",
-      "robot_motion/rm65/ik_checkpoint.py",
-      "robot_motion/rm65/retargeter_checkpoint.py",
-      "robot_motion/runtime/cancellation.py",
-      "robot_motion/runtime/control_admission.py",
-      "robot_motion/runtime/dispatch.py",
-      "robot_motion/runtime/dispatch_owner.py",
-      "robot_motion/runtime/execution_checkpoint.py",
-      "robot_motion/runtime/execution_gate.py",
-      "robot_motion/runtime/identity.py",
-      "robot_motion/runtime/immutable.py",
-      "robot_motion/runtime/producer_epoch.py",
-      "sim/mujoco/actuation/checkpoint.py",
-      "sim/mujoco/adapters/checkpoint.py",
-      "sim/mujoco/deploy/component_action_profile.py",
-      "sim/mujoco/deploy/execution_difference.py",
-      "sim/mujoco/deploy/execution_pose_observation.py",
-      "sim/mujoco/deploy/observation.py",
-      "sim/mujoco/deploy/observation_checkpoint.py",
-      "sim/mujoco/deploy/pose_kinematics.py",
-      "sim/mujoco/deploy/pose_resolution.py",
-      "sim/mujoco/deploy/runtime_checkpoint.py",
-      "sim/mujoco/deploy/target_checkpoint.py",
-      "sim/mujoco/deploy/target_measurement.py",
-      "sim/mujoco/deploy/target_preparation.py",
-      "sim/mujoco/ik.py",
-      "sim/mujoco/native_checkpoint.py",
-      "sim/mujoco/scene.py",
-      "sim/rm65/actuation/gripper.py"
-    ],
-    "unchanged_direct_companion_dependencies": [
-      "control_composition/observability/execution_difference.py",
-      "control_composition/observability/modules.py",
-      "dataset_contracts/action_schema.py",
-      "dataset_contracts/canonical_encoding.py",
-      "dataset_contracts/control_trace.py",
-      "robot_motion/action/adaptation.py",
-      "robot_motion/action/arbiter.py",
-      "robot_motion/action/arbitration_runtime.py",
-      "robot_motion/action/authoritative_trace.py",
-      "robot_motion/action/authority.py",
-      "robot_motion/action/candidate_authorization.py",
-      "robot_motion/action/component_action.py",
-      "robot_motion/action/components.py",
-      "robot_motion/action/dispatch_context.py",
-      "robot_motion/action/execution_handoff.py",
-      "robot_motion/action/execution_observation.py",
-      "robot_motion/action/executor.py",
-      "robot_motion/action/persistence.py",
-      "robot_motion/action/proposal.py",
-      "robot_motion/action/schema.py",
-      "robot_motion/action/target_capability.py",
-      "robot_motion/position_control/capability.py",
-      "robot_motion/position_control/trajectory.py",
-      "robot_motion/rm65/dual_arm_ik.py",
-      "robot_motion/runtime/cancellation.py",
-      "robot_motion/runtime/control_admission.py",
-      "robot_motion/runtime/dispatch.py",
-      "robot_motion/runtime/dispatch_owner.py",
-      "robot_motion/runtime/execution_gate.py",
-      "robot_motion/runtime/identity.py",
-      "robot_motion/runtime/immutable.py",
-      "robot_motion/runtime/producer_epoch.py",
-      "sim/mujoco/deploy/component_action_profile.py",
-      "sim/mujoco/deploy/execution_difference.py",
-      "sim/mujoco/deploy/execution_pose_observation.py",
-      "sim/mujoco/deploy/observation.py",
-      "sim/mujoco/deploy/pose_resolution.py",
-      "sim/mujoco/deploy/target_measurement.py",
-      "sim/mujoco/deploy/target_preparation.py"
-    ],
-    "source_binding_dependency_scope": "inherited inputs, changed companions, direct owners, closed records and encoding contracts; not a transitive repository closure"
+      "agent_gateway/profiles/mujoco/grasp_deployment.py",
+      "agent_gateway/profiles/mujoco/grasp_fast_plan.py",
+      "agent_gateway/profiles/mujoco/grasp_observation.py",
+      "deployments/perception/sam3_service.py"
+    ]
   },
-  "artifact_sha256": "76fe4c1986f052cd438ff1c30461ab035c937db685e7ad05706c03efefd6d302"
+  "artifact_sha256": "ee264b0fc454cbd6f3ae04a0d0cb2e5f38ed6cc05f1051f26ce21365506cd8ed"
 }

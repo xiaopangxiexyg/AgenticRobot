@@ -22,6 +22,7 @@ from dataset_contracts.grasp_multiview_snapshot import (
     GRASP_MULTIVIEW_SCHEMA_ID,
     encode_grasp_multiview_snapshot,
 )
+from dataset_contracts.canonical_encoding import canonical_content_hash
 from dataset_contracts.grasp_rgbd_snapshot import (
     GRASP_RGBD_SNAPSHOT_SCHEMA_ID,
     encode_grasp_rgbd_snapshot,
@@ -33,6 +34,16 @@ from dataset_contracts.perception_artifacts import (
 )
 from robot_motion.relative_action import xyzquat_to_pose_matrix
 from sim.mujoco.deploy.target_measurement import MUJOCO_SIM_HIL_WORLD_FRAME_ID_V1
+
+
+def frozen_grasp_scene_hash(state):
+    """Bind the private scene without publishing simulator object coordinates."""
+    if (set(state) != {"model_qpos", "model_qvel", "simulation_time_sec"}
+            or not np.isfinite(float(state["simulation_time_sec"]))
+            or not all(np.isfinite(np.asarray(state[key], dtype=float)).all()
+                       for key in ("model_qpos", "model_qvel"))):
+        raise ValueError("Frozen grasp scene state must be finite and complete.")
+    return canonical_content_hash(state, domain="dexteleop.mujoco.frozen_grasp_scene.v1")
 
 
 def build_mujoco_grasp_observation_executor(
@@ -142,7 +153,7 @@ def build_mujoco_grasp_observation_executor(
                 "frame_binding_hash": contract.frame_binding_hash,
                 "excluded_views": [],
                 "scope": "stationary_observation_not_a_validated_plan",
-                "native_scene_state": state,
+                "native_scene_state_hash": frozen_grasp_scene_hash(state),
             },
         )
         if (

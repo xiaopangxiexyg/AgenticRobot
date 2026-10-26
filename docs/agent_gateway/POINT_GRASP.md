@@ -18,6 +18,9 @@
 姿态只绑定用户提供的本地标定文件，不是 Gateway 可信 Station pose，不能绕过下游正式 motion
 owner、碰撞场景和安全门禁。
 
+后续模型、观测引用、完整抓放与执行组织的逐项计划和实际证据范围见
+[抓取 Skill 后续开发](./plans/grasp_backend_trials.zh-CN.md)。实验候选与默认装配分开维护。
+
 ## 真实 Gateway 的快速完整路径规划
 
 `perception.plan_grasp_fast@1` 只在已有冻结观测、具身 GraspGenX 和 paired-plan
@@ -54,6 +57,30 @@ MuJoCo 在显式配置完整的右臂 approach/contact、双夹爪、Artifact �
 光学相机几何、双臂及完整模型状态取自同一个 rig scene cut，不推进物理。
 采集统一按 source→application→rig 加锁，沿用现有渲染缓存及关闭检查。
 真实与仿真消费者共用有大小上限的留存 Artifact 读取器，完整性仍由原 CAS store 验证。
+
+MuJoCo 可显式用 `--sam3-endpoint http://127.0.0.1:8114` 选择已经启动的 SAM3 服务，
+用于 `perception.segment`，并在启用 fast-grasp 时提供其点提示 mask。
+也可与 `--enable-segmentation-batch-v2`、`--enable-segmentation-geometry-v3` 组合，
+复用现有同一帧批量分割、留存观测身份校验和 mask 的二维像素几何；不会新增观测 owner
+或把分割候选当作物体身份真值。上述扩展仍需显式启用，原默认后端和 v1 行为不变。
+分割 v3 的形状及间距仍是二维图像关系；三维表面点须继续由原配对 RGB-D／
+back-projection 接口生成，不能将 mask 中心直接当作物体三维中心。
+此时不传 `--segmentation-asset-bundle` 或 `--sam2-grounding-dino-bundle`；
+GraspGenX 的 bundle、Artifact 和原 grasp/gripper 装配仍必需；默认进程内模式还需 source。
+两个由会话管理的客户端分别拥有自己的传输生命周期，外部服务保持唯一模型 owner；
+客户端不会启动或关闭服务。模型资源仍在传输发布前由原会话启动，不在 Skill 内初始化。
+显式 `--graspgenx-planner diffusion` 可对照 diffusion-only；默认仍是 `graspmoe`。
+这些选择绑定到现有模型/profile hash，复用同一 v5 几何、IK 和完整路径及执行门禁，
+不增加等价 Skill、不改变默认模型，也不意味着已通过真实推理或抓取验收。
+
+MuJoCo 也可显式使用与 RealMan 相同名称的 `--graspgenx-mode service`、
+`--graspgenx-host 127.0.0.1`、`--graspgenx-port 5556`、`--graspgenx-timeout-ms 120000`。
+它复用原 `GraspGenXClient`，连接预先启动的隔离模型服务，不要求 `--graspgenx-source-root`，
+不在 Skill 中启动服务。这样模型可留在其已验证的 Torch 环境，MuJoCo 继续使用原环境；
+服务调用仍返回同一参考系的提案，并进入原 v5/IK/完整路径链。
+默认仍为原 `in-process`。连接参数只在 service 模式有效；该模式的模型设备由外部服务决定，
+`--point-grasp-device` 仍用于本地 SAM2 点分割。服务 checkpoint 的运行身份需在部署/实验中
+独立核验，客户端的预期 asset bundle 与一次健康检查不能代替该证明。
 
 快速规划只接收本会话完成的 observation operation，复用共享的候选生成、首条完整路径
 搜索和原生链 owner。主视角与辅助视角准备均检查调用方原始预算和取消状态；
@@ -701,6 +728,13 @@ IK、生产 URDF/FCL 场景和完整关节路径规划；不会接受调用方�
 原有 `perception.plan_point_grasp@1` 与上文离线 CLI 保持兼容：它允许调用方提供本地 RGB-D、内参和
 标定，因此其 `base` 输出不能被称为 deployment-trusted Station pose，也不会由生产
 `real-perception` profile 发布。
+
+MuJoCo 的公开冻结观测仅包含 RGB-D、标定/光学变换、采集身份以及真机可读取的左右臂
+各六维关节位置；不包含全模型 `qpos/qvel`，因此不会随 Artifact 泄漏物体自由关节真值。
+全模型状态仍由原 application 私有采集，公开归档仅携带其不可逆 scene 摘要，用于同一会话
+内检查机器人、物体、速度和仿真时间是否变化；它不是物体状态估计或可用目标位姿。
+该元数据策略参与 frame/profile 绑定，消费者应重新发现；旧 Artifact 不会被改写或重标记。
+保留的机器人本体 qpos 用于腕相机的采集时外参关联，不应与物体真值一并删除。
 
 ### 可选手指交换候选（显式 v5）
 

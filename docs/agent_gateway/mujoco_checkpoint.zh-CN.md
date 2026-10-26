@@ -1,6 +1,6 @@
 # MuJoCo checkpoint 组件与接入进度
 
-2026-10-26：继续原隔离分支，已合入固定 development `c5c5e3547248`，保留其
+2026-10-26：继续原隔离分支，已合入固定 development `6ecb2307b49c`，保留其
 primitive scene v2、观察和 DMTAC 对齐改进。在 native scene、acceleration planner 和 actuated
 owner 组件上新增完整 manual execution rig 的可信内部 cut；随后补齐 source admission、
 execution authority、decision owners 三个控制状态组件及原 no-model target 的时钟接缝，
@@ -19,8 +19,9 @@ manual/immediate target；这是可信内存内分支，不是完整节点磁盘
 不会修改主线子模块或共享源码。
 
 本轮固定源码 `db09fe458444` 的25模块组合回归为 **679通过、1跳过、零失败**。
-新 V25 runtime binding 在保留最新 V24 原件的基础上登记上述三项变化、20项候选变更依赖及
+历史 checkpoint observer 绑定（原候选 V25，现另名保留）在保留 V24 原件的基础上登记上述三项变化、20项候选变更依赖及
 39项既有直接 owner／record／编码合同；147项输入／144项源码均逐字节匹配该提交，并绑定真实消费者日志与 JUnit 回执哈希。
+当前合流已保留主线模型图 V25，两份前驱证据均不会冒充合流资格；组合绑定待单独生成。
 它不重新拟合 arm profile；唯一跳过项是未安装的 RPent 配对扩展，不代表 RPent 联合
 验收。完整仓库验收另行记录，尚未提升 development。
 

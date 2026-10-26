@@ -92,15 +92,20 @@ core and MuJoCo adapter used for the 20260721 fit; tests compare those hashes to
 fixed historical values rather than silently reinterpreting the fit against
 the current files.
 
-当前候选运行时源码绑定为 `artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261026_v25.json`。
-V25 保留 V24 原件及拟合参数，登记 manual/immediate target checkpoint 与真正开启的
-Cartesian 执行观察续跑。继承 88 项输入，其中 3 项源码已改变；新增 20 项候选变更依赖及39项既有直接 owner／record／编码合同，
-共 147 项输入、144 项源码，逐文件匹配固定提交 `db09fe458444`。
-绑定的 25 模块消费者回归为 679 通过、1 跳过、零失败，涵盖原生 MuJoCo 及既有
-Gateway 消费者；跳过的是未安装的 RPent 配对扩展，不能称为 RPent 联合验收。
-这份报告不冒充完整仓库验收。观察恢复不补发历史帧、不重新发放
-控制权，也不关闭原本启用的观察。此资格仍限于可信内存 target 分支，不代表完整
-Gateway 会话、上层 agent 上下文、磁盘冷恢复或新的真机／held-out 验收。
+当前运行时源码绑定为 `artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261026_v25.json`。
+V25 冻结 V24，登记显式模型选择、原生抓取观测的私有状态摘要及拒绝诊断的公开边界。
+继承 88 项输入并更新其中 3 项，新增 SAM3 客户端和三个抓取叶子，共 92 项输入、
+89 项 Python 源码；匹配固定提交 `83581f2ac`，直接消费者验收 766 项通过。
+默认 SAM2、进程内 GraspGenX 与 GraspMoE、v5 几何、原规划/碰撞/取消/HOLD 门禁保留。
+完整 oracle 端点检查留在私有诊断，公共查询只过滤这一新增字段，不更改原有公开字段。
+离线几何 benchmark 由固定 Git 与报告绑定，不加入运行时输入，也不授予执行权。
+本批未启动模型服务、设备或训练；不新增模型质量、真机、held-out 或六路并发资格。
+
+本分支另保留历史 checkpoint observer 候选：
+`artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261026_checkpoint_observer_v1.json`。
+它完整保留原候选 V25 的字节和身份，固定源码为 `db09fe458444`、147项输入，
+不改写本页主线 V25，也不将两份独立验收解释为组合验收。合流后的源码须派生
+单独的 checkpoint integration 绑定，不能直接沿用任一前驱资格。
 
 历史 V24 为 `artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261025_v24.json`。
 V24 冻结 V23，并补齐 ControlStation 兼容调用方的源码绑定。继承的 86 项输入
