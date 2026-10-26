@@ -412,7 +412,8 @@ def test_local_even_reports_are_per_pose_and_damping_and_cruise_diagnostics_are_
         assert "sum_abs_selected_command_nm" not in trial
 
 
-def test_native_arrival_frames_cannot_enter_motion_fits_through_outer_track_label():
+@pytest.mark.parametrize("endpoint_mode", ["native_brake", "completed_reference", "arrival_feedback"])
+def test_native_arrival_frames_cannot_enter_motion_fits_through_outer_track_label(endpoint_mode):
     rows, context = motion_records()
     ends = {}
     for row in rows:
@@ -429,9 +430,14 @@ def test_native_arrival_frames_cannot_enter_motion_fits_through_outer_track_labe
         cutoffs.setdefault(trial, (row["feedback_timestamp_sec"]+ends[trial])/2)
         selected = int(console["automatic_calibration"]["workspace"]["current_task"]["joint"][-1])-2
         axes = [{"phase": "brake", "reason": "target_reached_braking"} for _ in range(2)]
-        if row["feedback_timestamp_sec"] < cutoffs[trial]:
+        moving = row["feedback_timestamp_sec"] < cutoffs[trial]
+        if moving or endpoint_mode != "native_brake":
             axes[selected] = {"phase": "track", "reason": "bounded_reference_tracking"}
+        if not moving and endpoint_mode == "completed_reference":
+            axes[selected].update(target_position_rad=.1, q_reference_rad=.1, qvel_reference_rad_s=0.)
         console["coordinated_holding"] = {"axes": axes}
+        if not moving and endpoint_mode == "arrival_feedback":
+            console["coordinated_holding"]["cruise_velocity_control"] = {"arrival": True}
     result = summarize_workspace_identification(rows, condition=asdict(context), workspace={"acquisitions": []})
     assert result["admitted_motion_windows"] > 0
     assert result["rejected"]["endpoint_servo_not_cruise_identification"] > 0

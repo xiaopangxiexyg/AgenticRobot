@@ -361,9 +361,11 @@ class CoordinatedPoseHolding:
         if not self.config.cruise_enabled:
             return 0.0, self.bias[i], audit
         audit["reason"] = "native_transition_owns_command"
-        arrival = self.config.cruise_arrival_feedback and frame.reason in {
-            "target_reached_braking", "calibration_target_tracking"}
-        audit["arrival"] = arrival
+        endpoint_reference = (frame.phase == "track" and frame.reason == "bounded_reference_tracking"
+            and frame.qvel_reference_rad_s == 0.0 and frame.q_reference_rad == self.goal[i])
+        arrival = self.config.cruise_arrival_feedback and (endpoint_reference or frame.reason in {
+            "target_reached_braking", "calibration_target_tracking"})
+        audit.update(arrival=arrival, endpoint_reference_reached=endpoint_reference)
         if not arrival and (frame.phase != "track" or frame.reason != "bounded_reference_tracking"):
             return 0.0, self.bias[i], audit
         estimator = self.cruise_estimators[AXES.index(i)]
@@ -400,7 +402,14 @@ class CoordinatedPoseHolding:
         position_rate = 0.0
         if arrival:
             target_error = self.goal[i]-self.q[i]
-            outside_band = max(0.0, abs(target_error)-self.arrival_tolerance_rad)
+            # A completed planner reference can still be outside the native
+            # measured-arrival gate. Reuse that gate's existing inner reserve
+            # until native arrival takes over, rather than parking on the
+            # outer handoff boundary where a single count can cancel dwell.
+            restoration_band = (frame.arrival_brake_error_rad
+                if endpoint_reference and frame.arrival_brake_error_rad is not None
+                else self.arrival_tolerance_rad)
+            outside_band = max(0.0, abs(target_error)-restoration_band)
             position_rate = self.config.bias_gain_nm_per_rad_sec*outside_band*(1 if target_error > 0 else -1)
             # Restore a stopped-short axis with the same retained bias owner.
             # Its integral velocity objective cannot exceed this leg's chosen
@@ -410,6 +419,7 @@ class CoordinatedPoseHolding:
                      * self.trackers[AXES.index(i)].config.max_reference_velocity_rad_s)
             position_rate = max(-limit, min(limit, position_rate))
             audit.update(arrival_position_error_rad=target_error,
+                arrival_restoration_band_rad=restoration_band,
                 arrival_position_bias_rate_nm_s=position_rate)
         if arrival:
             # Integrating a delayed window velocity retains its deceleration
@@ -555,7 +565,8 @@ class CoordinatedPoseHolding:
             and cruise_joint is not None and field_pose_index is not None and field_driver_kd is not None):
             i = cruise_joint
             frame = frames[AXES.index(i)]
-            if cruise_audit["active"] and frame.phase == "track" and frame.reason == "bounded_reference_tracking":
+            if (cruise_audit["active"] and not cruise_audit.get("arrival")
+                and frame.phase == "track" and frame.reason == "bounded_reference_tracking"):
                 # Predict the command needed at the causal reference-window
                 # speed. Chasing measured overspeed with the model would add
                 # positive velocity feedback; the existing PI owns that error.
@@ -694,7 +705,8 @@ class CoordinatedPoseHolding:
                 # The fast path can only reduce toward zero, never reverse.
                 arrival_unload = (self.config.motor_local_recovery
                                   and (not point_search or point_reacquire)
-                                  and frame.reason in {"target_reached_braking", "calibration_target_tracking"})
+                                  and (frame.reason in {"target_reached_braking", "calibration_target_tracking"}
+                                       or i == cruise_joint and cruise_audit.get("arrival")))
                 command[i], transition_reasons[i], transition_rates[i] = self._slew_axis(
                     i, target, dt, moving[i], arrival_unload=arrival_unload)
                 if cap_feedback:

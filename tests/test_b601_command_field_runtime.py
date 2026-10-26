@@ -152,6 +152,24 @@ def test_shadow_is_command_equivalent_and_candidate_engagement_never_adds_absolu
     assert shadow.field_component == ZERO
 
 
+def test_completed_reference_restoration_never_queries_cruise_command_field(tmp_path, monkeypatch):
+    core = core_fixture(tmp_path, monkeypatch, "candidate")
+    monkeypatch.setattr(core, "_cruise_feedback", lambda i, frame, dt:
+        (0, core.bias[i], {"active": True, "arrival": True,
+            "reason": "resolved_arrival_velocity_feedback", "aligned_reference_velocity_rad_s": .01}))
+
+    def forbidden(**kwargs):
+        pytest.fail("endpoint restoration must not query the cruise command model")
+
+    monkeypatch.setattr(core.command_field_source, "predict", forbidden)
+    command, audit = tick(core, 200)
+    assert audit["command_field"]["reason"] == "outside_resolved_native_cruise"
+    assert not audit["command_field"]["predicted"]
+    assert audit["command_field"]["requested_increment_nm"] == 0
+    core.record_dispatch(200, command)
+    assert core.field_component == ZERO
+
+
 @pytest.mark.parametrize("matching", [False, True])
 def test_model_increments_are_slew_bounded_and_only_exact_receipts_commit(tmp_path, monkeypatch, matching):
     core = core_fixture(tmp_path, monkeypatch, "candidate")

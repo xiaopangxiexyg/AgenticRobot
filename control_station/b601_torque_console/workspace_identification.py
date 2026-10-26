@@ -315,12 +315,21 @@ def summarize_workspace_identification(records, *, condition, workspace,
             or console.get("phase") != "track" or (batch.get("workspace") or {}).get("supported_soft_stop")):
             return None, "authority_or_braking_interval"
         holding = console.get("coordinated_holding") or {}
+        if (holding.get("cruise_velocity_control") or {}).get("arrival") is True:
+            return None, "endpoint_servo_not_cruise_identification"
         axes = holding.get("axes")
         if axes is not None:
             if not isinstance(axes, list) or len(axes) != 2 or not all(isinstance(a, dict) for a in axes):
                 raise ValueError("invalid selected native tracking phase evidence")
             selected = axes[int(task["joint"][-1])-2]
             if selected.get("phase") != "track" or selected.get("reason") != "bounded_reference_tracking":
+                return None, "endpoint_servo_not_cruise_identification"
+            # Older traces may still label a completed reference as native
+            # TRACK while the physical axis is stopped short of its target.
+            # Its endpoint restoration is not a constant-speed experiment.
+            if (selected.get("target_position_rad") is not None
+                and selected.get("q_reference_rad") == selected["target_position_rad"]
+                and selected.get("qvel_reference_rad_s") == 0.0):
                 return None, "endpoint_servo_not_cruise_identification"
         if any(row.get(flag) is not False for flag in ("torque_limited", "slew_limited", "overlay_limited")):
             return None, "limited_or_unknown_command"

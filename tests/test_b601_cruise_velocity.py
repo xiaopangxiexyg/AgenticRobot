@@ -182,7 +182,7 @@ def test_cruise_integral_does_not_accumulate_unrealized_cap_or_slew_growth(tmp_p
 def test_cruise_plateau_and_reverse_keep_velocity_owner_without_position_windup(
     tmp_path, monkeypatch, direction, observed,
 ):
-    core = controller_from_profile(tmp_path)._workspace._coordinated.pose
+    core = controller_from_profile(tmp_path, profile=FOUR_CENTRES)._workspace._coordinated.pose
     warm_core(core, target=direction*.07)
     core.adopt_hold(2, direction*.2)
     core.last_delta = core.bias
@@ -205,6 +205,7 @@ def test_cruise_plateau_and_reverse_keep_velocity_owner_without_position_windup(
         command, audit = core.step(sequence=30+n, dt=dt, permitted=True,
             point_search=False, cruise_joint=2)
         status = audit["cruise_velocity_control"]
+        assert not status["arrival"] and not status["endpoint_reference_reached"]
         if status["active"]:
             active += 1
             if observed == "paused":
@@ -224,6 +225,119 @@ def test_cruise_plateau_and_reverse_keep_velocity_owner_without_position_windup(
     # The old position fallback adds about 1 N.m during this growing-lag
     # second, versus <= 0.25 N.m of bounded velocity-error adaptation.
     assert abs(core.bias[2]) < .45
+
+
+@pytest.mark.parametrize("joint", AXES)
+@pytest.mark.parametrize("direction", [-1, 1])
+@pytest.mark.parametrize("position_error", [.0037323584821928185, .0033488640603531044])
+def test_completed_reference_restores_stopped_short_axis_through_native_arrival_reserve(
+    tmp_path, monkeypatch, joint, direction, position_error,
+):
+    core = controller_from_profile(tmp_path, profile=FOUR_CENTRES)._workspace._coordinated.pose
+    start = (0, .05, .05, 0, 0, 0)
+    warm_core(core, q=start, target=0)
+    goal = list(start)
+    goal[joint] += direction*position_error
+    core.set_goal(goal, max_reference_velocity_rad_s=.0075)
+    core.adopt_hold(joint, direction*.194)
+    core.last_delta = core.bias
+    inner = core.arrival_tolerance_rad-core.motion.arrival_margin_rad
+    for tracker, i in zip(core.trackers, AXES, strict=True):
+        def frame(*, q, i=i, **kwargs):
+            effort = core.motion.tracking_kp_nm_per_rad*(core.goal[i]-q)
+            return B601JointMotionFrame(phase="track", reason="bounded_reference_tracking",
+                q_reference_rad=core.goal[i], qvel_reference_rad_s=0,
+                control_qvel_rad_s=0, position_torque_nm=effort,
+                velocity_torque_nm=0, requested_torque_nm=effort,
+                target_position_rad=core.goal[i], arrival_brake_error_rad=inner)
+        monkeypatch.setattr(tracker, "update", frame)
+    initial = core.bias[joint]
+    for n in range(1, 101):
+        before = core.bias
+        dt = core.observe(core.last_time+.01, start, ZERO)
+        command, audit = core.step(sequence=30+n, dt=dt, permitted=True,
+            point_search=False, cruise_joint=joint)
+        status = audit["cruise_velocity_control"]
+        assert status["arrival"] and status["endpoint_reference_reached"]
+        if n >= 25:
+            assert status["active"]
+            assert status["arrival_restoration_band_rad"] == inner
+            rate = min(core.config.bias_gain_nm_per_rad_sec*(position_error-inner),
+                core.config.cruise_velocity_ki_nm_per_rad*.0075)
+            assert status["arrival_position_bias_rate_nm_s"] == pytest.approx(direction*rate)
+            assert status["requested_bias_increment_nm"] == pytest.approx(direction*rate*dt)
+            assert (audit["proposed_bias_nm"][joint]-before[joint])*direction > 0
+        assert core.bias == before
+        core.record_dispatch(30+n, command)
+        assert sum(abs(v) for v in command) <= 1+1e-12
+    assert (core.bias[joint]-initial)*direction > .02
+    before = core.bias
+    dt = core.observe(core.last_time+.01, start, ZERO)
+    command, _ = core.step(sequence=131, dt=dt, permitted=True, point_search=False, cruise_joint=joint)
+    core.record_dispatch(131, tuple(v*.99 for v in command))
+    assert core.bias == before
+
+
+def simulate_completed_reference(tmp_path, joint, direction):
+    """Declared terminal stiction plant; not identified B601 mechanics."""
+    core = controller_from_profile(tmp_path, profile=FOUR_CENTRES)._workspace._coordinated.pose
+    start = (0, .05, .05, 0, 0, 0)
+    warm_core(core, q=start, target=0)
+    goal = list(start)
+    goal[joint] += direction*.0037323584821928185
+    core.set_goal(goal, max_reference_velocity_rad_s=.0075)
+    core.adopt_hold(joint, direction*.194)
+    core.last_delta = core.bias
+    actual, measured, velocity, command = list(start), start, 0., core.bias[joint]
+    saw_endpoint = saw_arrival = handoff = False
+    quiet_since = None
+    for n in range(1, 1501):
+        for _ in range(10):
+            if abs(velocity) < 1e-8 and abs(command) <= .36:
+                velocity = 0.
+                continue
+            friction = math.copysign(.30, velocity if abs(velocity) > 1e-8 else command)
+            next_velocity = velocity+(command-friction-4.5*velocity)/.2*.001
+            if next_velocity*velocity < 0 and abs(command) <= .36:
+                next_velocity = 0.
+            velocity = next_velocity
+            actual[joint] += velocity*.001
+        q = list(start)
+        q[joint] = start[joint]+round((actual[joint]-start[joint])/RESOLUTION)*RESOLUTION
+        raw = tuple((a-b)/.01 for a, b in zip(q, measured, strict=True))
+        measured = tuple(q)
+        dt = core.observe(core.last_time+.01, measured, raw)
+        commands, audit = core.step(sequence=30+n, dt=dt, permitted=True,
+            point_search=False, cruise_joint=joint)
+        status = audit['cruise_velocity_control']
+        saw_endpoint |= status.get('endpoint_reference_reached', False)
+        native = core.frames[AXES.index(joint)]
+        saw_arrival |= native.reason == 'target_reached_braking'
+        core.record_dispatch(30+n, commands)
+        command = commands[joint]
+        assert sum(abs(v) for v in commands) <= 1+1e-12
+        # Use the real workspace handoff contract: complete dispatch, outer
+        # position tolerance and its continuous native quiet dwell. A native
+        # brake phase is not required when the planner is already complete.
+        if core.arrival_quiet() and abs(measured[joint]-goal[joint]) <= core.arrival_tolerance_rad:
+            if quiet_since is None:
+                quiet_since = core.last_time
+            if core.last_time-quiet_since >= core.settings.staged_assist.settle_dwell_sec:
+                handoff = True
+                break
+        else:
+            quiet_since = None
+    return {'duration_sec': n*.01, 'saw_endpoint': saw_endpoint, 'saw_native_arrival': saw_arrival,
+        'error_rad': measured[joint]-goal[joint], 'quiet': core.arrival_quiet(), 'handoff_confirmed': handoff}
+
+
+@pytest.mark.parametrize("joint", AXES)
+@pytest.mark.parametrize("direction", [-1, 1])
+def test_native_completed_reference_breaks_terminal_stiction_and_completes_handoff(tmp_path, joint, direction):
+    result = simulate_completed_reference(tmp_path, joint, direction)
+    assert result['saw_endpoint'] and result['handoff_confirmed'], result
+    assert result['quiet'] and abs(result['error_rad']) <= .003375
+    assert result['duration_sec'] < 15
 
 
 def test_matched_accelerating_reference_never_accumulates_filtered_velocity_lag(tmp_path, monkeypatch):
