@@ -21,9 +21,12 @@ manual/immediate target；这是可信内存内分支，不是完整节点磁盘
 观察组件阶段固定源码 `db09fe458444` 的25模块组合回归为 **679通过、1跳过、零失败**。
 历史 checkpoint observer 绑定（原候选 V25，现另名保留）在保留 V24 原件的基础上登记上述三项变化、20项候选变更依赖及
 39项既有直接 owner／record／编码合同；147项输入／144项源码均逐字节匹配该提交，并绑定真实消费者日志与 JUnit 回执哈希。
-当前合流已保留主线模型图 V25，两份前驱证据均不会冒充合流资格；组合绑定待单独生成。
-它不重新拟合 arm profile；唯一跳过项是未安装的 RPent 配对扩展，不代表 RPent 联合
-验收。完整仓库验收另行记录，尚未提升 development。
+当前合流保留主线模型图 V25 与这份另名历史。新的 `checkpoint_integration_v1` 绑定
+固定源码 `a47d7e3922ef`，152项输入／149项源码；其原生恢复与公开隐私消费者218项通过，
+独立绑定实际组合证据，不沿用任一前驱报告作为组合资格。
+这些绑定均不重新拟合 arm profile。历史 `db09fe458444` 的679/1报告中，唯一跳过项是
+未安装的 RPent 配对扩展；当前 `a47d7e3922ef` 的218项报告零跳过，也未包含 RPent 联合
+恢复验收。完整仓库验收另行记录，尚未提升 development。
 
 ## 真正开启的 Cartesian 执行观察
 
@@ -449,7 +452,7 @@ proposal/epoch/permit/schedule 状态及 qpos/qvel/ctrl/warmstart，另验证真
    外部 plan 及 application lifecycle 仍待补齐。immediate pending reference 已验证；scheduled segment 及
    异步 activation 仍未纳入资格，不能直接放行。
 3. 新实例中 FK、collision、payload、observer、scratch 等消费者的统一绑定。
-4. 两份历史 V25 分别保留；合流后的当前源码须使用新的独立组合绑定与完整仓库门禁。
+4. 两份历史 V25 分别保留；合流源码已有独立组合绑定，完整仓库门禁另行记录。
    profile 身份、持久化/原子提交、历史产物与恢复分支的来源关系尚待接入。
 5. sleep 混合状态、完整 no-model profile、渲染和远端组合验收。
 6. RPent SDK/runtime/记录前缀与上述下层合同的联合恢复。

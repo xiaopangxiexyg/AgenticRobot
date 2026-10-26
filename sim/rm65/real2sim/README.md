@@ -92,7 +92,17 @@ core and MuJoCo adapter used for the 20260721 fit; tests compare those hashes to
 fixed historical values rather than silently reinterpreting the fit against
 the current files.
 
-当前运行时源码绑定为 `artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261026_v25.json`。
+当前 checkpoint 整合候选使用独立绑定
+`artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261026_checkpoint_integration_v1.json`。
+它合并主线 V25 的92项输入与历史 observer 候选的147项输入，再加入 TCP envelope
+companion，共152项输入／149项 Python 源码，固定于 `a47d7e3922ef`。两份前驱
+manifest 的原字节和资格各自保留，使用不同路径与引用身份；不继续争用数字版本名。
+原生 checkpoint owner、inactive envelope target 和公共隐私出口的固定消费者验证为
+218通过、零跳过／失败。完整非硬件门禁另行记录，不把前驱报告合计当作组合验收。
+模型选择和默认控制路径继承主线；私有恢复数据不进入公共 Artifact，未重新拟合，
+不声明 Gateway operation/READY、磁盘冷恢复或 RPent 上下文恢复已经完成。
+
+主线历史 V25 为 `artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261026_v25.json`。
 V25 冻结 V24，登记显式模型选择、原生抓取观测的私有状态摘要及拒绝诊断的公开边界。
 继承 88 项输入并更新其中 3 项，新增 SAM3 客户端和三个抓取叶子，共 92 项输入、
 89 项 Python 源码；匹配固定提交 `83581f2ac`，直接消费者验收 766 项通过。
@@ -104,8 +114,8 @@ V25 冻结 V24，登记显式模型选择、原生抓取观测的私有状态摘
 本分支另保留历史 checkpoint observer 候选：
 `artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261026_checkpoint_observer_v1.json`。
 它完整保留原候选 V25 的字节和身份，固定源码为 `db09fe458444`、147项输入，
-不改写本页主线 V25，也不将两份独立验收解释为组合验收。合流后的源码须派生
-单独的 checkpoint integration 绑定，不能直接沿用任一前驱资格。
+不改写主线 V25，也不将两份独立验收解释为组合验收。合流采用上面的独立
+checkpoint integration 绑定，并保留这份历史原件。
 
 历史 V24 为 `artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261025_v24.json`。
 V24 冻结 V23，并补齐 ControlStation 兼容调用方的源码绑定。继承的 86 项输入
