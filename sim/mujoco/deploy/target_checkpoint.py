@@ -34,6 +34,7 @@ from .agent_skill_target import (
     build_mujoco_agent_skill_motion_target,
 )
 from .component_action_profile import MujocoComponentActionRobotActionV1Materializer
+from .observation_checkpoint import new_observer
 from .pose_resolution import MujocoCoupledPoseToQposResolver
 from .runtime import _MujocoTargetExecutionSubmissionPort, _RigSerializedPoseResolver
 from .runtime_checkpoint import (
@@ -333,10 +334,14 @@ def restore_motion_target(
     )
     try:
         fresh = replace(prepared, scene=rig.scene)
+        observation = checkpoint.runtime.execution_observation
         target = build_mujoco_agent_skill_motion_target(
             config=checkpoint.config,
             prepared_target=fresh,
             component_execution_binding=binding_factory(fresh),
+            execution_observation_sink=(
+                None if observation is None else new_observer(observation.observer)
+            ),
             motion_side=checkpoint.motion_side,
             clock=rig._clock,
             _restore=_TargetRestore(checkpoint, rig, max_native_bytes),

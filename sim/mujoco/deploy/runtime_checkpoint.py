@@ -53,6 +53,14 @@ from robot_motion.runtime.dispatch import CommandDispatchReceipt
 from sim.mujoco.adapters.checkpoint import ManualExecutionClock
 
 from .observation import MujocoPolicyObservationAdapter
+from .observation_checkpoint import (
+    OBSERVATION_RECORDS,
+    RuntimeObservationCheckpoint,
+    capture_runtime_observations,
+    qualify_observation_graph,
+    restore_runtime_observations,
+    validate_plan,
+)
 from .runtime import (
     IMMEDIATE_QREF_SIM_V1,
     MujocoDeployConfig,
@@ -62,6 +70,7 @@ from .runtime import (
 )
 
 _RECORDS = (
+    *OBSERVATION_RECORDS,
     ActionAdaptationRequest,
     ActionAdaptationResult,
     ActionAdaptationReceipt,
@@ -101,10 +110,6 @@ _NONE = {
     "reference_receiver",
     "_composition_trace_emitter",
     "_last_compound_dispatch_manifest",
-    "_execution_observation_binding",
-    "_execution_observation_capability",
-    "_execution_observation_sink",
-    "_execution_pose_observation_projector",
     "_next_policy_chunk_target_at",
     "_compound_composer_authority_profile",
 }
@@ -118,6 +123,10 @@ _EMPTY = {
     "_composition_promotion_envelope_by_evaluation_id",
 }
 _BINDINGS = {
+    "_execution_observation_binding",
+    "_execution_observation_capability",
+    "_execution_observation_sink",
+    "_execution_pose_observation_projector",
     "rig",
     "config",
     "clock",
@@ -190,6 +199,7 @@ class MujocoRuntimeCheckpoint:
     core: AuthoritativeControlCheckpoint
     state: dict
     observations: tuple
+    execution_observation: RuntimeObservationCheckpoint | None
     content_hash: str
 
 
@@ -202,14 +212,14 @@ def _configuration(config):
         or config.enable_composer_authority
         or not config.enable_component_execution_handoff
         or config.direct_component_proposal_source is None
-        or config.execution_observation_plan is not None
         or config.compound_composer_authority_profile is not None
         or config.compound_hand_action_specs_by_side
         or config.prune_expired_proposals
     ):
         raise ValueError(
-            "Runtime checkpoint requires the direct manual immediate profile without observers."
+            "Runtime checkpoint requires the direct manual immediate profile."
         )
+    validate_plan(config.execution_observation_plan)
     return _hash(config)
 
 
@@ -228,6 +238,7 @@ def validate_runtime_checkpoint(checkpoint, *, config, clock):
                 checkpoint.core,
                 checkpoint.state,
                 checkpoint.observations,
+                checkpoint.execution_observation,
             )
         )
     ):
@@ -268,21 +279,7 @@ def _qualify(runtime, *, constructing=False):
         or runtime._lifecycle_terminal
     ):
         raise ValueError("Runtime must be at a live completed operation boundary.")
-    if (
-        runtime._execution_observation_representation != "off"
-        or runtime._execution_observation_last_published_at
-        != {"reference": None, "measurement": None}
-        or any(
-            getattr(runtime, name) != {"reference": 0, "measurement": 0}
-            for name in (
-                "_execution_observation_emitted_count",
-                "_execution_observation_dropped_count",
-                "_execution_observation_latest_sequence",
-            )
-        )
-        or runtime._execution_observation_watermark_by_stream
-    ):
-        raise ValueError("Execution observer state has no continuation contract.")
+    qualify_observation_graph(runtime)
 
 
 def _validate_state(runtime, state, observations):
@@ -592,13 +589,15 @@ def capture_runtime(runtime):
     _validate_state(runtime, state, observations)
     core = capture_authoritative_control(runtime.core)
     config_hash, now = _configuration(runtime.config), runtime.clock()
+    observation = capture_runtime_observations(runtime)
     return MujocoRuntimeCheckpoint(
         config_hash,
         now,
         core,
         state,
         observations,
-        _hash((config_hash, now, core, state, observations)),
+        observation,
+        _hash((config_hash, now, core, state, observations, observation)),
     )
 
 
@@ -625,6 +624,7 @@ def restore_runtime_state(runtime, checkpoint):
         adapters[node] = adapter
     runtime._observation_adapter_by_node = adapters
     runtime.observation_adapter = adapters[runtime.config.policy_node_id]
+    restore_runtime_observations(runtime, checkpoint.execution_observation)
     for name in (
         "_started",
         "_lifecycle_entered",

@@ -1,6 +1,6 @@
 # MuJoCo checkpoint 组件与接入进度
 
-2026-10-25：继续原隔离分支，已合入固定 development `4f9f242ab823`，保留其
+2026-10-26：继续原隔离分支，已合入固定 development `c5c5e3547248`，保留其
 primitive scene v2、观察和 DMTAC 对齐改进。在 native scene、acceleration planner 和 actuated
 owner 组件上新增完整 manual execution rig 的可信内部 cut；随后补齐 source admission、
 execution authority、decision owners 三个控制状态组件及原 no-model target 的时钟接缝，
@@ -9,14 +9,45 @@ execution authority、decision owners 三个控制状态组件及原 no-model ta
 manual/immediate target；这是可信内存内分支，不是完整节点磁盘格式。Gateway 会话、
 上层 agent 上下文与 RPent 联合恢复仍待接入，现有入口不自动启用恢复。
 
-当前组合源码 `25d5df1cbfda` 的21模块回归为 **708通过、1跳过、1失败**。
+上轮组合源码 `25d5df1cbfda` 的21模块回归为 **708通过、1跳过、1失败**。
 唯一失败是 `test_current_arm_runtime_binding_uses_exact_current_inputs`：V18冻结源
 绑定与候选的 actuator `core.py`、`agent_skill_target.py`、`runtime.py` 三项源码不同。
 原 V18 文件与其历史验证未改写，arm profile、simulation contract 和 MuJoCo executor
 未更改；不能用原 V18 的验证声明替代当前候选资格。后续须派生独立 source binding，
 登记这三项变化及新增 checkpoint 依赖和固定验证证据，再申请集成，不仅替换旧哈希。
 完整 non-hardware 验收另在预检因缺少固定 B601 子模块 URDF 返回2，未启动任何 shard。
-因此本分支仍是**未准入的独立候选**，不是绿色全仓基线，也未提升 development。
+该失败回执保持原样。本轮已在独立候选中准备与主线相同 gitlink 的 B601 子模块；
+不会修改主线子模块或共享源码。当前继续完成 observer 及固定源码重新绑定，未提升 development。
+
+## 真正开启的 Cartesian 执行观察
+
+`sim.mujoco.deploy.observation_checkpoint` 为原标准
+`MujocoExecutionDifferenceObserver` 增加完整 owner companion。runtime 仍是唯一
+观察生产者，sink 仍是原被动配对 owner；没有新增日志、调度器或补偿发布路径。
+
+- 保存源 `ExecutionObservationBinding`，其 `bound_at` 参与 binding ID/hash；恢复时
+  用原 plan/capability 及源时间验证，不回拨时钟，也不以 cut 时刻生成新的身份。
+- runtime 的 emitted/dropped/latest sequence、last-published 时间及本地 watermark
+  原值保留。sink 单独保存它实际收到的 watermark、完整有序 pending map、最近
+  association、容量和计数；拒收后两份 watermark 允许不同，不补发或重放旧帧。
+- 重复 key 移尾、容量淘汰与 unmatched measurement 沿用原 observer 行为。
+  `emitted <= latest` 可由原发布顺序保证，但不能用 `latest=emitted+dropped` 或
+  `pending=reference_count-measurement_count` 推导保存状态。
+- 原 FK builder 绑定新 scene/model，并新建 private scratch；验证实际 binding/hash，
+  拒绝 scratch 别名到 live `MjData`。只复用同一个 hash helper，FK 算法与 hash domain 不变。
+- capture/restore 不采样、不 publish；恢复只允许未发布的新 runtime/sink，不能原地覆盖
+  活动 owner。未知 sink、projector 或配置错配明确拒绝。
+
+首片只扩展原 manual/immediate 单臂 Cartesian plan，reference/measurement 都为
+`full_frames`。这里表示每次原 runtime 的 observation cut 都采样，不表示每个1kHz
+physics tick都记录。一次 step 的 reference→watermark→measurement→watermark
+发布必须完整结束；caller fence 还应排除直接 sink 发布。
+
+原生测试覆盖 pending/active/HOLD、数据拒收和 watermark 拒收后的分支继续、源绑定
+时间、非空 cache、重复 key/淘汰/配对、错 schema/时间/计数、live scratch/实际FK绑定
+变化，以及保存／恢复零 publish。最后评审计数反例先2失败，修复后观察及原消费者
+选集31通过。它仍不证明 Gateway 的 envelope、application、operation 或 RGB-D source
+已整体恢复；这些既有 owner 的准入检查不能关闭。
 
 ## Manual no-model target 的独立分支
 
@@ -61,7 +92,7 @@ branch = restore_motion_target(
 失败只关闭尚未发布的新 rig，源 target 和原证据保持不变。
 
 首片仅接受原 standard coupled IK、双臂 actuated manual rig、单一 direct component
-source、immediate qref、无外部 execution observer/trace sink、无额外 safe-motion plan
+source、immediate qref、上述标准 observer 或 off、无外部 trace sink、无额外 safe-motion plan
 或自定义 resolver/filter 的实际源配置。启用了这些组件的源明确拒绝，不在恢复时
 关闭组件来凑通过。backend 已抛异常而无法确认完整 dispatch 返回的切点也明确拒绝；
 不能把有 target 记录等同于执行已确认。
@@ -75,7 +106,7 @@ HOLD、非零观察编号、恢复后下一次原 dispatch，以及各类回退/
 bash scripts/run_pytest.sh tests/test_mujoco_runtime_checkpoint.py tests/test_mujoco_target_checkpoint.py -q
 ```
 
-后续应由 Gateway profile 补齐真实 enabled observer/operation owner 的封存合同、
+后续应由 Gateway profile 组合上述 enabled observer 与 operation owner 的封存合同、
 事务 fencing、磁盘 bundle 的实现/owner 身份和原子发布，再与 RPent 的 runtime／记录
 前缀恢复组合验收。当前内存 API 需要 caller-trusted prepared metadata；不能将其
 描述为进程重启后仅凭一个文件即可恢复完整节点。

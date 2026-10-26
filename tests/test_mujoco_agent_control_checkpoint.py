@@ -67,9 +67,9 @@ def test_invalid_clock_is_rejected_before_preparing_any_resource(monkeypatch, cl
         )
 
 
-def _native_target():
+def _native_target(*, observation_plan=None, observation_sink=None):
     """Build the original fixture once per test, without starting its owners."""
-    config = _configuration()
+    config = replace(_configuration(), execution_observation_plan=observation_plan)
     prepared = prepare_mujoco_sim_hil_target(config)
     scene = prepared.scene
     profile = build_mujoco_pose_component_target_profile(
@@ -100,6 +100,7 @@ def _native_target():
             profile, materializer
         ),
         clock=clock,
+        execution_observation_sink=observation_sink,
     )
     return config, prepared, profile, clock, target
 

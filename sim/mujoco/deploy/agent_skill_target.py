@@ -115,8 +115,7 @@ def build_mujoco_agent_skill_motion_target(
             motion_side=motion_side,
         )
         if (
-            execution_observation_sink is not None
-            or trace_sink is not None
+            trace_sink is not None
             or tcp_pose_envelope_runtime is not None
             or enable_safe_tcp_pose
         ):
