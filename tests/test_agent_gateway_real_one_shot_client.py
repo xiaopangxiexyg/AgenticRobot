@@ -21,6 +21,7 @@ from agent_gateway.protocol.artifact_contracts import (
     AgentArtifactBinding,
     AgentArtifactRef,
 )
+from agent_gateway.skills.motion.definition import ARCHIVED_DEBUG_MOTION_SKILL_IDS_V1
 from agent_gateway.skills.perception.definition import CAPTURE_DEPTH_SKILL_ID_V1
 from agent_gateway.skills.perception.schemas import (
     DEPTH_FRAME_COMPRESSION_V1,
@@ -52,10 +53,10 @@ class _FakeClient:
                 "skill_routes": [
                     {
                         "route": {
-                            "skill_id": "motion.step_tcp_forward",
+                            "skill_id": "motion.move_tcp_to_pose",
                             "skill_version": "1",
                             "skill_definition_hash": "skill-definition:test",
-                            "route_id": "real.rm65.agent_skill_step_tcp_forward",
+                            "route_id": "real.rm65.agent_skill_tcp_pose_target",
                             "route_version": "1",
                             "route_hash": "route:test",
                             "parameter_schema_hash": "parameter-schema-hash:test",
@@ -75,7 +76,7 @@ class _FakeClient:
                                     "content_hash": "envelope-hash:test",
                                     "constraint_set_hash": "constraint-hash:test",
                                     "allowed_route_ids": [
-                                        "real.rm65.agent_skill_step_tcp_forward"
+                                        "real.rm65.agent_skill_tcp_pose_target"
                                     ],
                                 }
                             ],
@@ -89,14 +90,13 @@ class _FakeClient:
                 "skill_schema_catalog_hash": "schema-catalog:test",
                 "schema_entries": [
                     {
-                        "skill_id": "motion.step_tcp_forward",
+                        "skill_id": "motion.move_tcp_to_pose",
                         "skill_version": "1",
                         "parameter_schema_hash": "parameter-schema-hash:test",
                         "parameter_schema": {
                             "properties": {
-                                "component_id": {"enum": ["left_arm"]},
-                                "direction": {
-                                    "enum": ["forward"]
+                                "pose_targets_by_component": {
+                                    "properties": {"left_arm": {"type": "array"}},
                                 },
                                 "reference_frame_id": {
                                     "enum": ["canonical_station"]
@@ -108,8 +108,8 @@ class _FakeClient:
                                 "frame_graph_hash": {"const": "frame-graph:test"},
                                 "tool_config_hash": {"const": "tool-config:test"},
                                 "calibration_hash": {"const": "calibration:test"},
-                                "primitive_catalog_hash": {
-                                    "const": "primitive-catalog:test"
+                                "speed_scale": {
+                                    "minimum": 0.05, "maximum": 1.0,
                                 },
                             }
                         },
@@ -134,11 +134,15 @@ class _FakeClient:
                 "calibration_hash": "calibration:test",
                 "measurement_summary": {
                     "pose_xyz_quat_xyzw_by_component": {"left_arm": [0] * 7},
+                    "reference_frame_id": "canonical_station",
+                    "reference_frame_spec_hash": "station-frame:test",
                 },
             }
         if method == "submit_skill_request":
             assert payload["skill_execution_grant_id"] is None
-            assert payload["parameters"]["direction"] == "forward"
+            assert payload["parameters"]["pose_targets_by_component"] == {
+                "left_arm": [0.04, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]
+            }
             return {
                 "accepted": True,
                 "reason_code": "request_admitted",
@@ -357,6 +361,25 @@ class _FakeRelativePoseClient(_FakeAbsolutePoseClient):
     ]
 
 
+@pytest.mark.parametrize("skill_id", sorted(ARCHIVED_DEBUG_MOTION_SKILL_IDS_V1))
+def test_one_shot_client_rejects_archived_selection_before_connect(monkeypatch, capsys, skill_id):
+    monkeypatch.setattr(
+        one_shot_client, "_Client",
+        lambda **_kwargs: pytest.fail("Archived selections must not connect"),
+    )
+    action = skill_id.removeprefix("motion.step_tcp_").removeprefix("motion.set_tcp_")
+    for selected in (action, skill_id):
+        with pytest.raises(ValueError, match="Archived debug motion"):
+            one_shot_client.execute_one_shot(Namespace(action=selected))
+        with pytest.raises(SystemExit) as rejected:
+            one_shot_client.build_parser().parse_args([
+                "--socket-path", "/nonexistent/gateway.sock", "--side", "right",
+                "--action", selected,
+            ])
+        assert rejected.value.code == 2
+        assert "Archived debug motion" in capsys.readouterr().err
+
+
 def test_one_shot_client_unwraps_owned_operation_outcome(monkeypatch, tmp_path) -> None:
     _FakeClient.instances.clear()
     monkeypatch.setattr(one_shot_client, "_Client", _FakeClient)
@@ -364,7 +387,9 @@ def test_one_shot_client_unwraps_owned_operation_outcome(monkeypatch, tmp_path) 
         confirm="EXECUTE_AUTHORIZED_REAL_TCP_PRIMITIVE",
         socket_path=str(tmp_path / "primitive.sock"),
         side="left",
-        action="forward",
+        action="move_tcp_to_pose",
+        target_xyz_m=(0.04, 0.0, 0.0),
+        target_quat_xyzw=(0.0, 0.0, 0.0, 1.0),
         client_id="dexteleop-local-primitive-operator",
         timeout_sec=1.0,
         operation_timeout_sec=None,
@@ -416,7 +441,8 @@ def test_one_shot_client_queries_before_pacing_and_waits_for_terminal_owner(
     monkeypatch.setattr(one_shot_client.time, "sleep", lambda delay: events.append(("sleep", delay)))
     args = Namespace(
         confirm="EXECUTE_AUTHORIZED_REAL_TCP_PRIMITIVE",
-        socket_path=str(tmp_path / "poll.sock"), side="left", action="forward",
+        socket_path=str(tmp_path / "poll.sock"), side="left", action="move_tcp_to_pose",
+        target_xyz_m=(0.04, 0.0, 0.0), target_quat_xyzw=(0.0, 0.0, 0.0, 1.0),
         client_id="operator", timeout_sec=1.0, operation_timeout_sec=1.0,
     )
     operation = one_shot_client.execute_one_shot(args)
@@ -459,7 +485,8 @@ def test_one_shot_client_pending_poll_does_not_sleep_or_query_past_deadline(
     monkeypatch.setattr(one_shot_client.time, "sleep", sleep)
     args = Namespace(
         confirm="EXECUTE_AUTHORIZED_REAL_TCP_PRIMITIVE",
-        socket_path=str(tmp_path / "timeout.sock"), side="left", action="forward",
+        socket_path=str(tmp_path / "timeout.sock"), side="left", action="move_tcp_to_pose",
+        target_xyz_m=(0.04, 0.0, 0.0), target_quat_xyzw=(0.0, 0.0, 0.0, 1.0),
         client_id="operator", timeout_sec=1.0, operation_timeout_sec=1.0,
     )
     with pytest.raises(RuntimeError, match="terminal operation/HOLD"):
@@ -975,9 +1002,12 @@ assert all(name not in sys.modules for name in blocked)
     assert completed.returncode == 0, completed.stdout + completed.stderr
 
 
-def test_fixed_orientation_client_uses_the_same_skill_ids_as_the_server():
+def test_archived_orientation_contracts_are_readable_but_not_client_actions():
     from agent_gateway.profiles.real.motion_primitive_profiles import (
         REAL_AGENT_TCP_FIXED_ORIENTATION_HEADING_BY_SKILL_ID_V1,
     )
-    assert set(one_shot_client.FIXED_LEVEL_TCP_ORIENTATION_SKILL_IDS_V1) == set(
-        REAL_AGENT_TCP_FIXED_ORIENTATION_HEADING_BY_SKILL_ID_V1)
+    from agent_gateway.skills.motion.definition import FIXED_LEVEL_TCP_ORIENTATION_SKILL_IDS_V1
+
+    historical_ids = set(FIXED_LEVEL_TCP_ORIENTATION_SKILL_IDS_V1)
+    assert historical_ids == set(REAL_AGENT_TCP_FIXED_ORIENTATION_HEADING_BY_SKILL_ID_V1)
+    assert historical_ids.isdisjoint(one_shot_client._ACTION_TO_SKILL_ID.values())

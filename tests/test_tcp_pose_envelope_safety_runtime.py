@@ -363,3 +363,42 @@ def test_robot_action_filter_reconstructs_float32_quaternion_in_float64() -> Non
 
     assert effective.arm_pose_by_side["right"][0] == pytest.approx(0.05)
     assert runtime.snapshot().last_projection_hash is not None
+
+
+def test_planning_preview_matches_active_projection_without_activation_or_state_update():
+    entry = _entry("envelope.preview", .10)
+    runtime = _runtime(entry)
+    before = runtime.snapshot()
+    projector = runtime.planning_projector_for_route(route_id=ROUTE_ID)
+    preview = projector({"right": _pose(.15)})
+    assert runtime.snapshot() == before
+    assert preview.modified_sides == ("right",)
+    with pytest.raises(TCPPoseEnvelopeLifecycleError, match="no operation-local"):
+        runtime.project({"right": _pose(.15)})
+    runtime.activate(selection=_selection(entry, safety_profile_id="test-preview"),
+        operation_id="operation:preview-check", route_id=ROUTE_ID, execution_epoch=3,
+        source_event_ids=("operation:preview-check",), lower_state="hold")
+    active = runtime.project({"right": _pose(.15)})
+    np.testing.assert_array_equal(active.effective_tcp_pose_by_side["right"],
+                                  preview.effective_tcp_pose_by_side["right"])
+    with pytest.raises(TCPPoseEnvelopeLifecycleError, match="closed motion"):
+        projector({"right": _pose(.15)})
+
+
+
+def test_planning_preview_rejects_missing_ambiguous_and_invalidated_bindings():
+    first, second = _entry("first", .10), _entry("second", .20)
+    runtime = _runtime(first, second)
+    with pytest.raises(TCPPoseEnvelopeLifecycleError, match="one exact"):
+        runtime.planning_projector_for_route(route_id=ROUTE_ID)
+    with pytest.raises(TCPPoseEnvelopeLifecycleError, match="one exact"):
+        runtime.planning_projector_for_route(route_id="unknown-route")
+    runtime = _runtime(first)
+    projector = runtime.planning_projector_for_route(route_id=ROUTE_ID)
+    runtime.invalidate_reference(reason="reset", source_event_ids=("reset:1",), lower_state="configured")
+    before = runtime.snapshot()
+    with pytest.raises(TCPPoseEnvelopeLifecycleError, match="no committed"):
+        runtime.planning_projector_for_route(route_id=ROUTE_ID)
+    with pytest.raises(TCPPoseEnvelopeLifecycleError, match="reference changed"):
+        projector({"right": _pose(.1)})
+    assert runtime.snapshot() == before

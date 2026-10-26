@@ -195,55 +195,7 @@ def _runtime_fixture(
 
 
 def _request_and_operation(bundle, *, clock: _Clock):
-    entry = bundle.route_manifest.route("motion.step_tcp_cardinal", "1")
-    route = entry.route
-    profile = bundle.cardinal_profile
-    request = AgentSkillRequest(
-        client_id="rpent-test-client",
-        request_id="real-request-1",
-        idempotency_key="real-idempotency-1",
-        client_sequence=1,
-        runtime_session_id=bundle.route_manifest.runtime_session_id,
-        skill_route_manifest_hash=bundle.route_manifest.semantic_content_hash,
-        expected_station_revision=0,
-        skill_id=route.skill_id,
-        skill_version=route.skill_version,
-        skill_definition_hash=route.skill_definition_hash,
-        route_id=route.route_id,
-        route_version=route.route_version,
-        route_hash=route.semantic_content_hash,
-        deployment_binding_hash=entry.deployment_binding.deployment_binding_hash,
-        parameter_profile_id=profile.parameter_profile_id,
-        parameter_profile_hash=profile.semantic_content_hash,
-        parameters={
-            "component_id": profile.component_id,
-            "direction": "forward",
-            "reference_frame_id": profile.reference_frame_id,
-            "reference_frame_spec_hash": profile.reference_frame_spec_hash,
-            "controlled_frame_id": "tool_tcp",
-            "frame_graph_hash": profile.frame_graph_hash,
-            "tool_config_hash": profile.tool_config_hash,
-            "calibration_hash": profile.calibration_hash,
-            "primitive_catalog_hash": profile.primitive_catalog_hash,
-        },
-        observation_snapshot_id="real-observation-1",
-        requested_mode="real_active",
-        requested_timeout_ms=5_000,
-        skill_execution_grant_id="agent-skill-grant:real-grant-hash-1",
-    )
-    operation = AgentSkillOperation(
-        operation_id="real-operation-1",
-        request_hash=request.semantic_content_hash,
-        runtime_session_id=request.runtime_session_id,
-        status="admitted",
-        reason_code="admitted",
-        station_revision_at_admission=0,
-        current_station_revision=0,
-        started_at=clock(),
-        updated_at=clock(),
-        deadline_at=clock() + 5.0,
-    )
-    return request, operation, route, bundle.binding_for_skill(route.skill_id)
+    return _pose_request_and_operation(bundle, clock=clock, speed_scale=0.25)
 
 
 def _pose_request_and_operation(
@@ -972,7 +924,7 @@ def test_real_lifecycle_rejects_future_measured_tcp_pose() -> None:
         contract_bundle=bundle,
         route=route,
         binding=binding,
-        profile=bundle.cardinal_profile,
+        profile=bundle.pose_target_profile,
         request=request,
         operation=operation,
         clock=clock,
@@ -1035,7 +987,7 @@ def test_real_lifecycle_resolves_dispatches_converges_and_confirms_hold() -> Non
         contract_bundle=bundle,
         route=route,
         binding=binding,
-        profile=bundle.cardinal_profile,
+        profile=bundle.pose_target_profile,
         request=request,
         operation=operation,
         clock=clock,
@@ -1107,7 +1059,7 @@ def test_real_lifecycle_waits_for_lower_owner_after_derived_cut_stalls() -> None
         contract_bundle=bundle,
         route=route,
         binding=binding,
-        profile=bundle.cardinal_profile,
+        profile=bundle.pose_target_profile,
         request=request,
         operation=operation,
         clock=clock,
@@ -1276,7 +1228,7 @@ def test_real_lifecycle_confirms_hold_after_operation_deadline() -> None:
         contract_bundle=bundle,
         route=route,
         binding=binding,
-        profile=bundle.cardinal_profile,
+        profile=bundle.pose_target_profile,
         request=request,
         operation=operation,
         clock=clock,
@@ -1384,7 +1336,7 @@ def test_real_lifecycle_reports_lower_failure_and_preserves_reason(caplog, lower
 
     lifecycle = RealAgentPrimitiveSkillLifecycle(
         port=port, contract_bundle=bundle, route=route, binding=binding,
-        profile=bundle.cardinal_profile, request=request, operation=operation,
+        profile=bundle.pose_target_profile, request=request, operation=operation,
         clock=clock, sleep=owner_sleep,
     )
     assert lifecycle.activate(request=request, operation=operation,

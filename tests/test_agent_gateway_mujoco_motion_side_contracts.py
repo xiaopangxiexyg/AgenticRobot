@@ -1,7 +1,8 @@
 """Offline fixed-side contracts; no Scene, native planner, transport or device.
 
-The right-side byte digests were obtained from Git blobs at BASE_COMMIT, not
-from the candidate worktree. Only resource imports are omitted when executing
+Historical right-side digests come from Git blobs at BASE_COMMIT. Explicit
+pose-goal and debug-publication migrations retain those historical pins below.
+Only resource imports are omitted when executing
 the actual factory/deployment code; contract bodies and validators are intact.
 This deliberately does not establish native import or physical-motion safety.
 """
@@ -115,6 +116,58 @@ RIGHT_EXPORT_SHA256 = {
         'safe_tcp_pose_contract': 'f398ac39fe893ec29edd7c9ceaef1e8fe3d82b3ef71eeaa7c69fb182a2e59832',
         'schema_catalog': 'c024295cb57ee0bfcf2afe82eb16c69afcfee9d2c733a928417358fe852ac6a7',
     },
+}
+
+# Preserve the historical 79b6 and pose-goal tables. Source 0236feec9's
+# authorized archival removes only debug publications and their envelope route
+# references. These current export pins were captured at 6b36561dc; unchanged
+# motion/state/observation/history values still use the original pins above.
+POSE_GOAL_RIGHT_EXPORT_SHA256 = RIGHT_EXPORT_SHA256
+ARCHIVED_EXPORT_FIELDS = frozenset({
+    "cardinal_step_profile", "cardinal_step_deployment_binding",
+    "fixed_cardinal_step_contracts", "fixed_orientation_contracts",
+    "cardinal_step_evaluation_plan",
+})
+ARCHIVAL_EXPORT_SHA256 = {
+    "False": {
+        "definition_catalog": "b0d675a18ca55750398a6234f8e55cbfe812f32c3901ad35abb038118ec6d3bc",
+        "deployment_binding": "700ff2fe72ead6d84cad1a6a3058b9c71fc32cd36ccb628962f7b1722c5023cd",
+        "envelopes": "6acab32bff1cdd87476f7141fb61455985b1ccdbb615796bdba593ca9669bfd5",
+        "evaluation_plan": "20faaa199ce65e1d57aeea14afb76055ab3f5da2aa69730a9ed896101b74f058",
+        "io_catalog": "df499eae76db1e3d925606dcf0d80cbb212a5f20505acd6ea819c76a88fcaa0c",
+        "route_manifest": "d26d70240a4510b9142801675fa10cd3095bae9b8d2c973806da8c43bc7ede9d",
+        "schema_catalog": "1e58d07c330dd4d384ab233f549f9b6b101b810579ee463505863ffd2167f190",
+    },
+    "True": {
+        "definition_catalog": "799a0863dc45e854fe499874ecde94b7a93dc29eb7dd270dc11e7f1309fc2034",
+        "deployment_binding": "d6f80ceba4d35419facb9757e54a78576a05c910178dc73e4fc7d918faf1ad81",
+        "envelopes": "556e0f04ed29dc16c068875ae168c537fd3fe58182b9094f41dc0b42287db275",
+        "evaluation_plan": "795d1f4e90a4a654d194f41325e74167a0d5f9fda9acc77933e9e881e76ff9c9",
+        "io_catalog": "8824b14d06466659652e5101f347eabdabeb25411232cd24e9e2e8506daf4904",
+        "route_manifest": "f9ea6d9edba44a9154731261f6e991aa7f13c5c65fc4151fdada555a8d2728a8",
+        "safe_tcp_pose_contract": "8ae6e5ff65fc588ffe09b2450991ba5172da78ef0b0e3afed9b83022a0e8086e",
+        "schema_catalog": "45e11050ac58924423cdba3d9841fc6acc52aafd670f4d95221940e2dca47a30",
+    },
+}
+RIGHT_EXPORT_SHA256 = {
+    extended: {**{key: value for key, value in exports.items() if key not in ARCHIVED_EXPORT_FIELDS},
+        **ARCHIVAL_EXPORT_SHA256[extended]}
+    for extended, exports in POSE_GOAL_RIGHT_EXPORT_SHA256.items()
+}
+
+# Derived from the actual pure definition module at BASE_COMMIT, independently
+# of current catalog publication. Historical identities remain usable by readers.
+HISTORICAL_DEBUG_DEFINITION_HASHES = {
+    "motion.step_tcp_cardinal": "28c5d8cd1315785b4287fad3fe2e926cf17cc1650ebd0f99cee6451113550249",
+    "motion.step_tcp_forward": "d23c0b7cdc09b2ea1bbf08d099e6a633c1c6b21a4ba85bf15907eb4b146d917d",
+    "motion.step_tcp_backward": "a9f56b7aa65ec0d5a96699071e59835de29b73bc97bc389357a0054900a62a31",
+    "motion.step_tcp_left": "ed81f6a8e7eb4d60f9924039e28d6ba4fa9120b8793eb69c793fd8b3c9743d09",
+    "motion.step_tcp_right": "462f3670b5d2bf0c9d5740801718d8fb5c97fe28631a224ba5e63f32a84c581c",
+    "motion.step_tcp_up": "82c39eea62541a7d78a9b6f9524e2767abd6433141c882219687e275d3361862",
+    "motion.step_tcp_down": "4d1968a58cad0d7e821622a14d2b75e384348cb96e0c1da603350f271ef9e81f",
+    "motion.set_tcp_level_forward": "f4cf378efdaa11ed45128b3ae7a1ba06b8f24fdfd8b8b5714ef34a213e00a954",
+    "motion.set_tcp_level_forward_left_30": "54fbe9dee506a8f380620a86289d170219ac8dff1b9c58d66ca58d51834d9b9b",
+    "motion.set_tcp_level_forward_right_30": "2e5b056963c9361136e4e954033bc607e4598cd69190e2d1dc07bd819417a964",
 }
 
 
@@ -407,14 +460,9 @@ def _export_bytes(bundle, application):
             "io_catalog",
             "route_manifest",
             "motion_profile",
-            "cardinal_step_profile",
             "deployment_binding",
-            "cardinal_step_deployment_binding",
             "state_deployment_binding",
-            "fixed_cardinal_step_contracts",
-            "fixed_orientation_contracts",
             "evaluation_plan",
-            "cardinal_step_evaluation_plan",
             "safe_tcp_pose_contract",
             "history_profile",
             "history_source_binding",
@@ -465,17 +513,7 @@ def _parameters(bundle, entry):
         "pose_targets_by_component": {
             profile.component_id: [0.2, -0.1, 0.3, 0, 0, 0, 1]
         },
-        "primitive_catalog_hash": bundle.cardinal_step_profile.primitive_catalog_hash,
     }
-    if "direction" in properties:
-        values["direction"] = properties["direction"]["enum"][0]
-    if "primitive_hash" in properties:
-        contract = next(
-            item
-            for item in bundle.fixed_orientation_contracts
-            if item.profile.skill_id == entry.route.skill_id
-        )
-        values["primitive_hash"] = contract.profile.primitive.semantic_content_hash
     return {key: values[key] for key in properties}
 
 
@@ -526,7 +564,7 @@ def _operation(request, name):
 @pytest.mark.parametrize(
     "extended", [False, True], ids=["default", "safe-state2-history"]
 )
-def test_default_right_exports_are_pinned_79b6_bytes(offline, monkeypatch, extended):
+def test_default_right_exports_are_pinned_with_explicit_archival(offline, monkeypatch, extended):
     application = _application(offline, extended=extended)
     bundle = _bundle(
         offline,
@@ -540,6 +578,32 @@ def test_default_right_exports_are_pinned_79b6_bytes(offline, monkeypatch, exten
         for name, data in _export_bytes(bundle, application).items()
     }
     assert actual == RIGHT_EXPORT_SHA256[str(extended)]
+    assert set(actual).isdisjoint(ARCHIVED_EXPORT_FIELDS)
+    assert all(not hasattr(bundle, field) for field in ARCHIVED_EXPORT_FIELDS)
+    for key in set(actual) - set(ARCHIVAL_EXPORT_SHA256[str(extended)]):
+        assert actual[key] == POSE_GOAL_RIGHT_EXPORT_SHA256[str(extended)][key]
+
+
+@pytest.mark.parametrize("skill_id,expected_hash", sorted(HISTORICAL_DEBUG_DEFINITION_HASHES.items()))
+def test_archived_definitions_keep_their_original_79b6_identity(offline, monkeypatch, skill_id, expected_hash):
+    from agent_gateway.skills.motion import definition as module
+
+    if skill_id == "motion.step_tcp_cardinal":
+        definition = module.cardinal_tcp_step_skill_definition_v1(controlled_component_ids=("right_arm",))
+    elif skill_id in module.FIXED_CARDINAL_TCP_STEP_SKILL_IDS_V1:
+        definition = module.fixed_cardinal_tcp_step_skill_definition_v1(
+            skill_id=skill_id, controlled_component_ids=("right_arm",))
+    else:
+        definition = module.fixed_level_tcp_orientation_skill_definition_v1(skill_id=skill_id)
+    assert definition.skill_id == skill_id and definition.skill_version == "1"
+    assert definition.semantic_content_hash == expected_hash
+    assert set(HISTORICAL_DEBUG_DEFINITION_HASHES) == module.ARCHIVED_DEBUG_MOTION_SKILL_IDS_V1
+    bundle = _bundle(offline, monkeypatch, extended=True)
+    for catalog, getter in ((bundle.route_manifest, "route"),
+            (bundle.definition_catalog, "definition"), (bundle.schema_catalog, "entry"),
+            (bundle.io_catalog, "contract")):
+        with pytest.raises(KeyError):
+            getattr(catalog, getter)(skill_id, "1")
 
 
 @pytest.mark.parametrize("side", ["right", "left"])
@@ -578,11 +642,6 @@ def test_all_advertised_motion_and_state_contracts_bind_one_side(
         assert properties["controlled_frame_id"]["const"] == "tool_tcp"
     contracts = [
         (bundle.motion_profile, bundle.deployment_binding),
-        (bundle.cardinal_step_profile, bundle.cardinal_step_deployment_binding),
-        *(
-            (item.motion_profile, item.deployment_binding)
-            for item in bundle.fixed_orientation_contracts
-        ),
         (
             bundle.safe_tcp_pose_contract.motion_profile,
             bundle.safe_tcp_pose_contract.deployment_binding,
@@ -601,12 +660,6 @@ def test_all_advertised_motion_and_state_contracts_bind_one_side(
             binding.tool_config_hash
             == profile.tool_config_hash
             == application.tool_frame_profile.semantic_content_hash
-        )
-    for item in bundle.fixed_cardinal_step_contracts:
-        assert item.deployment_binding.component_id == component
-        assert (
-            item.deployment_binding.motion_profile_hash
-            == bundle.motion_profile.semantic_content_hash
         )
     for binding in (bundle.state_deployment_binding,):
         assert binding.reference_frame_id == bundle.motion_profile.reference_frame_id
@@ -654,14 +707,7 @@ def test_definitions_match_selected_side_preserving_legacy_right_bytes(
     bundle = _bundle(offline, monkeypatch, side=side, explicit=True, extended=True)
     mismatches = {}
     for definition in bundle.definition_catalog.skill_definitions:
-        # These three right defaults deliberately retain their 79b6 definition
-        # bytes; the exact single-arm schema/binding remains authoritative.
-        legacy_orientation = (
-            side == "right"
-            and definition.skill_id
-            in offline.deployment.FIXED_LEVEL_TCP_ORIENTATION_SKILL_IDS_V1
-        )
-        expected = ("left_arm", "right_arm") if legacy_orientation else (f"{side}_arm",)
+        expected = (f"{side}_arm",)
         if definition.controlled_component_ids != expected:
             mismatches[definition.skill_id] = definition.controlled_component_ids
     assert not mismatches
@@ -714,18 +760,10 @@ def test_every_advertised_route_rejects_wrong_component_frame_and_tool(
                 validator.validate_parameters({**good, key: value})
     expected = {
         ("motion.move_tcp_to_pose", "1"),
-        ("motion.step_tcp_cardinal", "1"),
         ("motion.move_tcp_to_pose_safe", "1"),
         ("state.read_tcp_pose", "1"),
         ("state.read_tcp_pose", "2"),
     }
-    expected.update(
-        (skill, "1")
-        for skill in (
-            *offline.deployment.FIXED_CARDINAL_TCP_STEP_SKILL_IDS_V1,
-            *offline.deployment.FIXED_LEVEL_TCP_ORIENTATION_SKILL_IDS_V1,
-        )
-    )
     assert seen == expected
 
 

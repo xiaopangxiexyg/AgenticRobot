@@ -75,7 +75,6 @@ from .motion_primitive_profiles import (
 )
 from .observation_gateway import RealTcpPoseObserveAttachmentSpec
 from .one_shot_authorization import (
-    REAL_AGENT_PRIMITIVE_ACTIONS,
     RealAgentPrimitiveOneShotAuthorization,
 )
 from .perception_deployment import (
@@ -104,6 +103,7 @@ from .rm65_grasp_reachability import (
     RM65PointGraspReachabilityAdapter,
     arm_base_origin_in_candidate_frame,
 )
+from .session_authorization import validate_real_agent_primitive_action
 from .station_point_grasp_deployment import (
     StationBoundPointGraspRegistration,
     StationPointGraspArmReachabilityProfile,
@@ -347,10 +347,10 @@ def assemble_exclusive_rm65_agent_primitive_composition(
     normalized_actions = tuple(
         sorted({str(item).strip() for item in requested_actions})
     )
-    if not normalized_actions or any(
-        item not in REAL_AGENT_PRIMITIVE_ACTIONS for item in normalized_actions
-    ):
+    if not normalized_actions:
         raise ValueError("authorized_actions contains an unreviewed primitive.")
+    for item in normalized_actions:
+        validate_real_agent_primitive_action(item)
     bilateral = gripper_backends is not None
     if bilateral and right_gripper_backend is not None:
         raise ValueError("Select existing right-gripper v1 or explicit bilateral v2.")

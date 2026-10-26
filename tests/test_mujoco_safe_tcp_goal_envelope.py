@@ -39,11 +39,15 @@ def test_preflight_preserves_goal_policy_and_hold(monkeypatch, policy, goal_x, c
         lifecycle.target_pose = (goal_x, 0., 0., 1., 0., 0., 0.)
     lifecycle.route = SimpleNamespace(skill_id="motion.move_tcp_to_pose_safe")
     lifecycle.request = SimpleNamespace(parameters={"pose_goal_policy": policy})
-    lifecycle.motion_profile = SimpleNamespace(translation_tolerance_m=.01, rotation_tolerance_rad=.09)
+    lifecycle.motion_profile = SimpleNamespace(translation_tolerance_m=.01, rotation_tolerance_rad=.09,
+        normalize_ik_objective=False)
     lifecycle._lower_operation_id = "test:operation"
     lifecycle._contact_binding = None
     lifecycle._observed_planning_provider = None
     lifecycle._path_search_time_budget_sec = 3.
+    lifecycle._path_policy = None
+    lifecycle._axis_cone = None
+    lifecycle._path_constraint_evidence = None
 
     def plan(target, **kwargs):
         calls.append("plan")

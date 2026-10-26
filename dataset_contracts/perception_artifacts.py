@@ -91,3 +91,7 @@ __all__ = [
     "SEGMENTATION_OVERLAY_MEDIA_TYPE_V1",
     "SEGMENTATION_OVERLAY_SCHEMA_ID_V1",
 ]
+
+SURFACE_ANCHOR_SCHEMA_ID_V1 = "agenticrobot.measured_surface_anchor.v1"
+
+SURFACE_ANCHOR_SCHEMA_ID_V2 = "agenticrobot.measured_surface_anchor.v2"

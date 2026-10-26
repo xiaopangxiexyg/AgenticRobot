@@ -36,6 +36,9 @@ MuJoCo 留存观测点移动和可选观测障碍规划的调用合同、启用�
 多目标分割v2和认证留存RGB的二维几何v3也分别通过显式
 `--enable-segmentation-batch-v2`、`--enable-segmentation-geometry-v3` 启用；
 两者复用原分割模型，输出不提供身份验证、三维物理间隙或运动授权。
+冻结对象/关系路径查询与认证表面锚点 v1/v2/v3 的启用依赖、原始观测复用和显式 safe profile 见
+[`MuJoCo 模块说明`](../../sim/mujoco/README.md#冻结状态的候选路径查询)。这些能力默认关闭；
+新表面锚点消费者复用同一留存操作和 Artifact 存储，不另建执行或采集 owner。
 运行资产包的下载、解压和共享根登记统一见项目根 [`README.md`](../../README.md) 的“运行资产”章节；
 本目录不重复资产包说明。
 

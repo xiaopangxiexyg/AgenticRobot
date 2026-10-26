@@ -44,6 +44,38 @@ plan；细化只在最终校验、预算和场景检查通过后原子替换原 
 预算包括等待，轨迹长度在固定时钟网格分配前有界。该内部适配器不授予公共 Route 或运动权限；
 MuJoCo 快速抓取的冻结采集和公共配对入口仍需完成后续装配。
 
+## 冻结状态的候选路径查询
+
+`MujocoPlannedTcpMotion` 可显式接收一份完整、有限的 `source_model_qpos`，内部复制并冻结，
+复用现有场景捕获锁、私有碰撞查询、端点搜索和 C2 重定时。冻结查询的计划不能通过
+`activate` 激活；清理仅影响该查询实例，原执行实例的待执行计划与安全包络不变。
+
+`plan_candidates` 对最多 64 个显式候选按“最大关节偏移、认证时长、总关节行程”依次排名，
+在原总预算内返回已验证的最佳计划；rig 和 planner 锁等待均计入预算。可选的当前种子
+IK 预估只调整访问顺序，不删除候选或代替碰撞检查。严格劣于已有结果的端点下界可以
+跳过路径搜索，诊断会明确记录 `path_search_skipped`；`all_candidates_checked` 包含这类
+已作出支配判断的候选，不表示每个候选都完成路径认证。这是有限采样比较，不是全局最优。
+
+查询可显式启用按平移/旋转容差归一化的 IK 目标，使用已绑定 TCP 偏移同时调整误差和
+雅可比。默认端点 IK、原关节限位与分支策略保留；取消、绝对 deadline、路径质量、
+轨迹网格上限及原执行激活/实时检查仍由原边界执行。安全包络的 Route 预览不激活包络，
+遇到歧义、执行中状态或参考更换会拒绝。默认关闭的上层查询和锚点 Skill 复用这条边界：
+`--enable-object-goal-queries` 需同时启用安全 TCP，发布只读的对象上方候选查询；
+`--enable-surface-anchors` 需 Artifact 存储和对象查询，发布留存表面点、锚点查询及空间目标计算。
+`--enable-relation-goal-queries` 在同一锚点上增加一般关系采样。查询使用完整冻结 qpos，
+不修改实测状态、活动安全包络或执行实例的 pending plan，也不授予运动权限。
+
+表面锚点 v1 沿用实时像素反投影；显式 `--enable-surface-anchor-v2` 使用原相关 RGB-D cut，
+提供 exact 或分割 mask 内部选点，默认仍为 prompt-nearest；max-clearance-medoid 需显式
+选择 `--surface-anchor-selection-policy max_clearance_medoid`。显式 v3 再要求 paired RGB-D v3、
+segmentation v3 和至少三个留存操作，复用原 JPEG、NPY 和原生产者时间，不重新采集或调用模型。
+所有消费方核验完成生产者、client/session/manifest、revision、frame/clock 和原 Artifact 字节。
+
+`--safe-tcp-motion-profile` 默认 `local_step`，保留原 0.10 m / 15° / 30 s；显式
+`object_relation` 为安全规划 Route 选择 0.50 m / π / 90 s，`object_relation_precise` 同时
+选择 3 mm / 1° 到达容差及 TCP 容差归一化 IK。普通、方向步进和观测点 Route 保留原范围。
+这些是离线仿真配置和有限采样结果，不代表连续路径全局最优或真机到达/抓取验收。
+
 ## Real-aligned VIVE position-teleop debug
 
 The shared position path can be exercised without a real RM65 through the

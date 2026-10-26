@@ -66,7 +66,7 @@ def build_spatial_goal_registration(*, base_route, base_binding, component_ids, 
             raise ValueError("Spatial goal parameters must match the endpoint relation schema.")
         if parameters["component_id"] not in components or parameters["reference_frame_id"] != reference_frame_id:
             raise ValueError("Spatial goal component/frame differs from the public binding.")
-        _calculate(parameters)
+        calculate_spatial_goal(parameters)
 
     def validate_result(result):
         validate_spatial_goal_result(result)
@@ -76,7 +76,7 @@ def build_spatial_goal_registration(*, base_route, base_binding, component_ids, 
     def validate_result_for_parameters(parameters, result):
         validate_parameters(parameters)
         validate_result(result)
-        expected = _calculate(parameters)
+        expected = calculate_spatial_goal(parameters)
         for key, value in expected.items():
             if key == "pose_targets_by_component":
                 if any(not math.isclose(expected, actual, abs_tol=1e-7, rel_tol=0)
@@ -102,7 +102,7 @@ def build_spatial_goal_registration(*, base_route, base_binding, component_ids, 
                 domain="agenticrobot.spatial_goal.availability.v1")), validator)
 
 
-def _calculate(parameters):
+def calculate_spatial_goal(parameters):
     goal = compute_spatial_goal(**{key: parameters[key] for key in PARAMETER_KEYS
                                   if key not in {"component_id", "reference_frame_id"}})
     return {"component_id": parameters["component_id"], "reference_frame_id": parameters["reference_frame_id"],
@@ -115,7 +115,7 @@ def _calculate(parameters):
 def build_spatial_goal_executor(*, registration, current_station_revision, clock, max_retained_operations):
     def read(request, operation):
         registration.payload_validator.validate_parameters(request.parameters)
-        return PassiveReadResult(_calculate(request.parameters),
+        return PassiveReadResult(calculate_spatial_goal(request.parameters),
             ("spatial-goal-calculation:"+operation.operation_id,), reason_code="spatial_goal_computed")
     return PassiveReadSkillExecutor(port_id="agent-gateway:"+registration.entry.deployment_binding.deployment_binding_id,
         executor_id="passive.spatial-goal.v1", read=read, current_station_revision=current_station_revision,

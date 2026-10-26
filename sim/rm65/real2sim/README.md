@@ -92,13 +92,45 @@ core and MuJoCo adapter used for the 20260721 fit; tests compare those hashes to
 fixed historical values rather than silently reinterpreting the fit against
 the current files.
 
-当前运行时源码绑定为 `artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261025_v18.json`。
-V18在冻结V17之上登记默认关闭的segment v2/v3、多目标共享模型与留存RGB认证消费者，
-新增provider、batch、definition/schema及session五项来源；V17原39项输入逐字保持，
-共43项源码、44项输入。固定源码与538通过/1原有跳过的离线消费者报告绑定
-`31aa9fc29028644d79db0fc137dbf40cd6232017` / `c65879b5e744253eb5d75c3cd971f334aa7a3326`。
-v3保留历史图像和采集时间，模型proposals和像素距离不构成身份、物理间隙或运动授权。
-原passive取消、原子完成、有界CAS读取和共享关闭owner保持，native运动保护不变。
+当前运行时源码绑定为 `artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261025_v24.json`。
+V24 冻结 V23，并补齐 ControlStation 兼容调用方的源码绑定。继承的 86 项输入
+保持 V23 字节，新增兼容入口与 Real factory 两项，共 88 项输入、85 项源码，
+匹配固定提交 `9156ae01d`；对应调用方验收为 125 项通过、零失败。
+该默认关闭入口只装配既有绝对位姿 motion 与 measured-state Route，在资源创建前
+拒绝已退休或未装配的动作。双臂安全观察、所选单臂授权、原数值包络、执行 owner
+及 lower HOLD 关闭证据保留。本绑定不新增真机、模型或 held-out 认证。
+
+历史 V23 为 `artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261025_v23.json`。
+V23 冻结 V22，登记显式可选的 safe TCP v2、只读连续查询 v1–v5，以及已授权的
+十个调试运动入口归档。86 项输入匹配固定源码提交 `6b36561dc`；直接调用方验收
+为 1,744 通过、1 项原有可选依赖跳过。工具轴证据只覆盖采样参考与 float32
+发布表示；查询不能激活计划。既有运动、观测障碍检查、授权及下层 HOLD owner
+保留。新可选杂物任务显式使用其源合同的 1 kHz，既有 4 kHz 默认不变。
+未重新拟合机械臂响应，不代表新留出数据、模型服务、真机或六路并发调度验收。
+
+历史 V22 为 `artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261025_v22.json`。
+V22 冻结 V21，登记共享 supplied-image localization、真机兼容入口及默认关闭的 MuJoCo 定位。
+真机 v1 的既有契约身份和有界 CAS 读取保持一致；MuJoCo 保留原始图像坐标，
+复用现有分割模型及关闭门禁。更新4项来源，新增4项，共64项源码、65项输入。
+固定631项通过、1项原RPent配对轮子缺失跳过、零失败的消费者报告绑定
+`ab5de19b3dcda8cc66bae9a85f4916d0d7f6a28a` / `a835306ec77f78d2d9b2d7f8b0864741f2cf1b81`。
+该证据只覆盖本地离线集成，不新增模型、硬件或 held-out 响应认证。
+
+历史V21为 `artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261025_v21.json`。
+V21冻结V20，仅重绑motion_deployment一项源码，仍为60项源码、61项输入，无新增输入。
+显式profile导出恢复原79b6默认字节；归一化模式仅启用时明确输出，原语义hash、IK、
+控制及执行门禁不变。固定217项通过、零跳过的消费者报告绑定
+`d1a54844dcc27a9f24f48e7dd77788bbb11c7319` / `306fdc47e383abe480f92b0403ee7f213e4b3152`。
+
+历史V20为 `artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261025_v20.json`。
+V20在冻结V19之上登记默认关闭的对象/关系查询、认证表面锚点v1/v2/v3及显式safe profile，
+复用原规划、留存操作、CAS和资源关闭owner；更新5项来源，新增15项，共60项源码、61项输入。
+固定源码与567项通过、1项原RPent配对轮子缺失跳过、零失败的离线消费者报告绑定
+`78b09d63ff9e1efc42b9ca7738a00d76107d8c68` / `b4c0572d4394ebbf385665875abd58379ff4dc51`。
+冻结计划不能激活；查询保留原碰撞、质量、rig→planner锁序、绝对deadline和执行保护。
+候选局部包络拒绝可继续比较后续候选；稠密查询只对逐种子诊断做内联摘要，保留实际残差、
+覆盖、容差及拒因，不改变lower完整诊断、排名或认证。普通/观测点Route保留原范围。
+V20、V19、V18及历史绑定逐字保留，已有segment v2/v3仍按显式配置启用。
 本批不重拟合arm参数，`provisional`及新held-out `not_run`保留，不构成真机或模型能力验收。
 历史V17、V16及更早绑定字节保持。
 

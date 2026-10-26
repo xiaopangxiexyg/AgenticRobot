@@ -90,6 +90,20 @@ do not establish equivalent coverage. Record this reasoning in the existing
 review, with measured runtime impact when execution cost motivates the change;
 neither net line reductions nor test-count quotas are acceptance criteria.
 
+### B601 虚拟反馈驱动的重复状态读取
+
+`AcquisitionReplay.run` 与 cycle 的 `advance` 在没有 `until` 回调时，复用本次同步
+循环已经读取的 `active` 状态；前者同时复用目标偏移，避免为驱动下一 tick 反复
+深拷贝完整 GUI 历史。`tick` 的默认路径仍实时读取状态。存在回调时，heartbeat
+与目标偏移沿用原有的再次读取行为，因为回调即使返回 `False` 也可能修改控制器。
+回归用例用真实 `owner_stopped` 验证回调之后不会依据旧状态补发 heartbeat。
+
+量化摩擦机械模型在每次 dispatch 后仍读取完整状态，下一 tick 的纯机械计算期间
+复用其中的 `active`；进入返回阶段前重新读取。控制周期、1000 Hz 机械子步、
+240/180 秒循环上限、摩擦与残余负载矩阵、原生回执、驱动阻尼、全部保护校验及
+原有断言保持不变。这只减少测试驱动器中重复的观察开销，不改变生产状态接口，
+也不把虚拟反馈证据当作真机验证。
+
 ### 只读快照重试的采样历史
 
 `test_persistent_failed_state_can_retry_without_restart` 在 `_capture_history`
@@ -271,26 +285,21 @@ fresh runtimes; the four-rollout combined-control test and each parameterized
 envelope matrix remain indivisible. Grasp trajectory stays module-local to
 preserve its shared planning fixture instead of repeating that expensive plan.
 The sparse full-suite weights come from testcase durations in a complete,
-socket-capable green Run and cover only modules that contributed at least five
-seconds there. Refresh them only from another exact green full-suite artifact;
-failed, capability-limited, or focused runs are not representative inputs.
-完整验证的模块和 replay 函数权重以绿色六分片基线 `47d7be6e` 为基础；其中
-artifact migration / resolution 两个 I/O 模块按 `c3c06be6` 在 2026-09-25 的
-绿色全量结果更新为 49.666 / 15.847 秒，避免旧估值将耗时集中在同一分片。
-2026-10-18 的绿色完整基线 `298221fc`（六分片串行、Node 22）补齐了九个此前未加权、
-实际累计至少五秒的模块，包括 DMTAC 接触、Gateway 安全位姿和 worker 清理等。
-既有模块与函数权重保留，避免把单一远端的 I/O 差异当作全局变化。
-绿色完整基线 `54edca481`（Run `full-20261023-mainline12j1geom`，十二批串行）
-补齐十三个此前未加权的慢模块。2026-10-24 的绿色完整基线 `dfff99b81`
-（Run `full-20261024-visualfull2`，十二批、两并发、Node 22、Trimesh 5.1.1 /
-Embreex 4.4.0.post1）再补齐十三个累计至少五秒的新模块，包含 B601 calibration、
-coordinated holding、staged assist 与 Gateway fast grasp 等测试族，并按新源码刷新
-safe TCP pose、gripper contact、real RM65 composition 三个模块。
-该基线有 18,107 个普通用例和 24 个子测试通过、16 个跳过；单并发运行因三十分钟
-上限未完成，不作为绿色权重来源。其他历史模块与函数权重继续保留。
-这些证据绑定固定源码和环境；选择并发度后仍需验证内存余量及完整测试结果。
-这些值只用于调度，不是 timeout 或验收阈值；不改变测试内容、真实 `fsync`、
-模块隔离边界、参数矩阵或 fast Profile 的权重。
+socket-capable green Run. New entries require at least five seconds; existing
+estimates may be refreshed when their module becomes inexpensive. Refresh them
+only from another exact green full-suite artifact; failed, capability-limited,
+or focused runs are not representative inputs.
+2026-10-25 以绿色完整提交 `ec122623b`（Run `full-20261025-b601ec`，十二批、两并发、
+Node 22、Trimesh 5.1.1 / Embreex 4.4.0.post1）的数据刷新 80 个已加权模块，
+并补齐 observed-point 与 observed-safe-motion 两个累计至少五秒的新模块。
+这次同时更新两个既有函数拆分模块的 33 个函数估值，保持函数注册表和完整参数矩阵。
+有跳过、缺少实际记录或源码已在该证据之后改变的模块继续保留既有估值；历史来源
+包括 `47d7be6e`、`c3c06be6`、`298221fc`、`54edca481` 和 `dfff99b81`。
+此前优化已显著缩短部分 B601、MuJoCo 和 artifact I/O 测试，继续沿用旧数值会让某些
+批次实际偏轻，并把等待留在验收尾部。这些是所测环境中的调度估值，其他主机的
+CPU、文件系统和可选依赖会改变耗时，仍需验证完整结果与资源余量。
+这些值不是 timeout 或验收阈值；不改变测试内容、真实 `fsync`、模块隔离边界、
+参数矩阵、fast Profile、并发上限或内存门禁。运行器与分片算法保持原样。
 The default remains four shards. Each shard has separate pytest, Python, XDG,
 Matplotlib, Numba, `TMPDIR`, basetemp, log, and JUnit state. Shards in one exact
 Run share only its content-addressed MuJoCo model cache; that cache uses process

@@ -18,15 +18,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from agent_gateway.skills.motion.definition import (
-    FIXED_CARDINAL_TCP_STEP_DIRECTION_BY_SKILL_ID_V1,
-    FIXED_CARDINAL_TCP_STEP_SKILL_ID_BY_DIRECTION_V1,
-    FIXED_LEVEL_TCP_ORIENTATION_SKILL_IDS_V1,
     GRASP_APPROACH_SKILL_ID_V1,
     SAFE_TCP_POSE_TARGET_SKILL_ID_V1,
-    TCP_CARDINAL_STEP_SKILL_ID_V1,
-    TCP_LEVEL_FORWARD_LEFT_30_SKILL_ID_V1,
-    TCP_LEVEL_FORWARD_RIGHT_30_SKILL_ID_V1,
-    TCP_LEVEL_FORWARD_SKILL_ID_V1,
     TCP_POSE_TARGET_SKILL_ID_V1,
 )
 from agent_gateway.transport.unix_transport import (
@@ -37,6 +30,7 @@ from .session_authorization import (
     REAL_AGENT_ABSOLUTE_TCP_POSE_ACTION,
     REAL_AGENT_GRASP_APPROACH_ACTION,
     REAL_AGENT_SAFE_TCP_POSE_ACTION,
+    validate_real_agent_primitive_action,
 )
 
 if TYPE_CHECKING:
@@ -46,10 +40,6 @@ _PREFIX = struct.Struct(">I")
 _CONFIRM_TOKEN = "EXECUTE_AUTHORIZED_REAL_TCP_PRIMITIVE"
 _ACTION_TO_SKILL_ID = {
     "set_gripper_state": "manipulation.set_gripper_state",
-    **dict(FIXED_CARDINAL_TCP_STEP_SKILL_ID_BY_DIRECTION_V1),
-    "level_forward": TCP_LEVEL_FORWARD_SKILL_ID_V1,
-    "level_forward_left_30": TCP_LEVEL_FORWARD_LEFT_30_SKILL_ID_V1,
-    "level_forward_right_30": TCP_LEVEL_FORWARD_RIGHT_30_SKILL_ID_V1,
     REAL_AGENT_ABSOLUTE_TCP_POSE_ACTION: TCP_POSE_TARGET_SKILL_ID_V1,
     REAL_AGENT_SAFE_TCP_POSE_ACTION: SAFE_TCP_POSE_TARGET_SKILL_ID_V1,
     REAL_AGENT_GRASP_APPROACH_ACTION: GRASP_APPROACH_SKILL_ID_V1,
@@ -471,6 +461,9 @@ def _parameters(
     speed_scale: float | None = None,
     target_state: str | None = None,
 ) -> dict[str, Any]:
+    validate_real_agent_primitive_action(action)
+    if _ACTION_TO_SKILL_ID.get(action) != skill_id:
+        raise ValueError("Unsupported real one-shot action/Skill selection.")
     if skill_id == "manipulation.set_gripper_state":
         if side not in {"left", "right"} or target_state not in _schema_enum(
             _schema_properties(schema_entry), "target_state"
@@ -499,63 +492,33 @@ def _parameters(
             "Real primitive observation does not exactly match the selected side."
         )
     properties = _schema_properties(schema_entry)
-    is_absolute = skill_id in {
-        TCP_POSE_TARGET_SKILL_ID_V1,
-        SAFE_TCP_POSE_TARGET_SKILL_ID_V1,
-        GRASP_APPROACH_SKILL_ID_V1,
-    }
-    if is_absolute:
-        if not _pose_target_component_allowed(properties, expected_component):
-            raise RuntimeError("Selected side is not allowed by the Skill schema.")
-        if absolute_tcp_pose_xyz_quat_xyzw is None:
-            raise ValueError("Absolute TCP-pose action requires a target pose.")
-    elif expected_component not in _schema_enum(properties, "component_id"):
+    if not _pose_target_component_allowed(properties, expected_component):
         raise RuntimeError("Selected side is not allowed by the Skill schema.")
-    fixed_cardinal_direction = (
-        FIXED_CARDINAL_TCP_STEP_DIRECTION_BY_SKILL_ID_V1.get(skill_id)
-    )
-    if (
-        skill_id == TCP_CARDINAL_STEP_SKILL_ID_V1
-        or fixed_cardinal_direction is not None
-    ) and action not in _schema_enum(properties, "direction"):
-        raise RuntimeError("Requested cardinal action is not allowed by the Skill schema.")
+    if absolute_tcp_pose_xyz_quat_xyzw is None:
+        raise ValueError("Absolute TCP-pose action requires a target pose.")
     reference_frames = _schema_enum(properties, "reference_frame_id")
     if len(reference_frames) != 1:
         raise RuntimeError("Real primitive schema must bind one reference frame.")
-    if is_absolute:
-        if summary.get("reference_frame_id") != reference_frames[0]:
-            raise RuntimeError(
-                "Absolute TCP-pose schema frame disagrees with the observation."
-            )
-        reference_frame_spec_hash = summary.get("reference_frame_spec_hash")
-        if not isinstance(reference_frame_spec_hash, str) or not (
-            reference_frame_spec_hash
-        ):
-            raise RuntimeError(
-                "Observation has no canonical Station frame specification hash."
-            )
-        identity_values = {
-            "reference_frame_spec_hash": reference_frame_spec_hash,
-            "frame_graph_hash": snapshot.get("frame_graph_hash"),
-            "tool_config_hash": snapshot.get("tool_config_hash"),
-            "calibration_hash": snapshot.get("calibration_hash"),
-        }
-        if any(
-            not isinstance(value, str) or not value
-            for value in identity_values.values()
-        ):
-            raise RuntimeError(
-                "Observation omits an absolute TCP-pose identity hash."
-            )
-    else:
-        identity_values = {
-            "reference_frame_spec_hash": _schema_const(
-                properties, "reference_frame_spec_hash"
-            ),
-            "frame_graph_hash": _schema_const(properties, "frame_graph_hash"),
-            "tool_config_hash": _schema_const(properties, "tool_config_hash"),
-            "calibration_hash": _schema_const(properties, "calibration_hash"),
-        }
+    if summary.get("reference_frame_id") != reference_frames[0]:
+        raise RuntimeError(
+            "Absolute TCP-pose schema frame disagrees with the observation."
+        )
+    reference_frame_spec_hash = summary.get("reference_frame_spec_hash")
+    if not isinstance(reference_frame_spec_hash, str) or not reference_frame_spec_hash:
+        raise RuntimeError(
+            "Observation has no canonical Station frame specification hash."
+        )
+    identity_values = {
+        "reference_frame_spec_hash": reference_frame_spec_hash,
+        "frame_graph_hash": snapshot.get("frame_graph_hash"),
+        "tool_config_hash": snapshot.get("tool_config_hash"),
+        "calibration_hash": snapshot.get("calibration_hash"),
+    }
+    if any(
+        not isinstance(value, str) or not value
+        for value in identity_values.values()
+    ):
+        raise RuntimeError("Observation omits an absolute TCP-pose identity hash.")
     payload: dict[str, Any] = {
         "reference_frame_id": reference_frames[0],
         "reference_frame_spec_hash": identity_values[
@@ -566,39 +529,25 @@ def _parameters(
         "tool_config_hash": identity_values["tool_config_hash"],
         "calibration_hash": identity_values["calibration_hash"],
     }
-    if is_absolute:
-        payload["pose_targets_by_component"] = {
-            expected_component: list(absolute_tcp_pose_xyz_quat_xyzw)
-        }
-        payload["speed_scale"] = _validated_speed_scale(
-            properties,
-            0.25 if speed_scale is None else speed_scale,
-        )
-    else:
-        payload["component_id"] = expected_component
+    payload["pose_targets_by_component"] = {
+        expected_component: list(absolute_tcp_pose_xyz_quat_xyzw)
+    }
+    payload["speed_scale"] = _validated_speed_scale(
+        properties,
+        0.25 if speed_scale is None else speed_scale,
+    )
     for field_name in ("frame_graph_hash", "tool_config_hash", "calibration_hash"):
         if payload[field_name] != snapshot.get(field_name):
             raise RuntimeError(
                 f"Skill schema {field_name} disagrees with the observation snapshot."
             )
-    if is_absolute:
-        return payload
-    if (
-        skill_id == TCP_CARDINAL_STEP_SKILL_ID_V1
-        or fixed_cardinal_direction is not None
-    ):
-        payload["direction"] = action
-        payload["primitive_catalog_hash"] = _schema_const(
-            properties, "primitive_catalog_hash"
-        )
-    else:
-        if skill_id not in FIXED_LEVEL_TCP_ORIENTATION_SKILL_IDS_V1:
-            raise RuntimeError("Unsupported fixed-orientation real primitive Skill.")
-        payload["primitive_hash"] = _schema_const(properties, "primitive_hash")
     return payload
 
 
 def execute_one_shot(args: argparse.Namespace) -> Mapping[str, Any]:
+    validate_real_agent_primitive_action(args.action)
+    if args.action not in _ACTION_TO_SKILL_ID:
+        raise ValueError("Unsupported real one-shot action selection.")
     target_state = getattr(args, "target_state", None)
     if args.action == "set_gripper_state":
         if args.side not in {"left", "right"} or target_state not in {"open", "closed"}:
@@ -777,6 +726,13 @@ def execute_one_shot(args: argparse.Namespace) -> Mapping[str, Any]:
         client.close()
 
 
+def _retained_action(value: str) -> str:
+    try:
+        return validate_real_agent_primitive_action(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
@@ -787,7 +743,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--socket-path", required=True)
     parser.add_argument("--client-id", default="dexteleop-local-primitive-operator")
     parser.add_argument("--side", choices=("left", "right"), required=True)
-    parser.add_argument("--action", choices=tuple(_ACTION_TO_SKILL_ID), required=True)
+    parser.add_argument(
+        "--action", type=_retained_action,
+        choices=tuple(_ACTION_TO_SKILL_ID), required=True,
+    )
     parser.add_argument(
         "--target-state",
         choices=("open", "closed"),
@@ -850,7 +809,7 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "operation deadline (default: 120s for move_tcp_to_pose_safe, "
             "60s for approach_grasp_pose, 30s "
-            "for move_tcp_to_pose, 5s for fixed primitives)"
+            "for move_tcp_to_pose, 5s for set_gripper_state)"
         ),
     )
     parser.add_argument("--confirm", default="")

@@ -177,8 +177,13 @@ def test_observed_input_rejects_invalid_admission_bounds(field, value):
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("blocked", (False, True), ids=("clear", "visible-obstacle"))
-def test_native_observed_safe_move_uses_original_gateway_and_normal_cleanup(tmp_path, record_property, monkeypatch, blocked):
+@pytest.mark.parametrize("blocked,version", [
+    pytest.param(False, "1", id="clear"),
+    pytest.param(True, "1", id="visible-obstacle"),
+    pytest.param(False, "2", id="v2-clear"),
+    pytest.param(True, "2", id="v2-visible-obstacle"),
+])
+def test_native_observed_safe_move_uses_original_gateway_and_normal_cleanup(tmp_path, record_property, monkeypatch, blocked, version):
     """Native sensor/planner/executor gate, not an Agent or grasp success grade."""
     import json
     from agent_gateway.profiles.mujoco.motion_factory import (
@@ -216,6 +221,7 @@ def test_native_observed_safe_move_uses_original_gateway_and_normal_cleanup(tmp_
             execution_observation_plan=mujoco_agent_tcp_pose_execution_observation_plan_v1(),
             exposed_pose_sides=("right",), allow_scripted_task_reset=False),
         allowed_client_ids=(CLIENT,), enable_safe_tcp_pose=True,
+        enable_safe_tcp_path_constraints=version == "2",
         artifact_storage=MujocoAgentArtifactStorageConfig(root=tmp_path / "artifacts"),
         safe_motion_observation=config)
     try:
@@ -304,7 +310,7 @@ def test_native_observed_safe_move_uses_original_gateway_and_normal_cleanup(tmp_
                         "rejection": error.details}, default=str))
                 raise
         monkeypatch.setattr(planner, "plan", record_plan)
-        admitted = adapter.submit_skill_request(_request(session, adapter, target).to_wire())
+        admitted = adapter.submit_skill_request(_request(session, adapter, target, version=version).to_wire())
         assert admitted["accepted"], admitted
         assert session.wait(timeout_sec=35)
         operation = session.service.operation_store.get(admitted["operation"]["operation_id"])

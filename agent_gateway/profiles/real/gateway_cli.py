@@ -89,6 +89,7 @@ from .motion_observed_scene import SafeMotionObservationConfig
 from .session_authorization import (
     REAL_AGENT_PRIMITIVE_ACTIONS,
     REAL_AGENT_PRIMITIVE_SESSION_CONFIRM_TOKEN,
+    validate_real_agent_primitive_action,
 )
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -104,6 +105,13 @@ DEFAULT_RM65_DMTAC_CAMERA_MOUNT_URDF = (
 DEFAULT_RM65_CAMERA_REGISTRY_V4 = (
     _REPO_ROOT / "robot_motion/configs/rm65_camera_registry_v4.json"
 )
+
+
+def _retained_action(value: str) -> str:
+    try:
+        return validate_real_agent_primitive_action(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -352,11 +360,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="opt-in sides for move_tcp_to_pose[_safe], one arm per request; includes --authorized-side; grasp and fixed primitives retain the primary side")
     parser.add_argument(
         "--authorized-action",
+        type=_retained_action,
         choices=REAL_AGENT_PRIMITIVE_ACTIONS,
         help="one reviewed primitive action allowed for this process session",
     )
     parser.add_argument(
         "--authorized-actions",
+        type=_retained_action,
         choices=REAL_AGENT_PRIMITIVE_ACTIONS,
         nargs="+",
         help=(

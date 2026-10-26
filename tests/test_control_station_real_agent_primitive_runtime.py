@@ -12,6 +12,7 @@ import pytest
 from control_station.real_agent_primitive_runtime import (
     REAL_AGENT_PRIMITIVE_CONFIRM_TOKEN,
     RealAgentPrimitiveSkillOnlyExtension,
+    add_real_agent_primitive_arguments,
     validate_real_agent_primitive_arguments,
 )
 from robot_motion.runtime import EffectorCommand, TeleopCommand
@@ -111,7 +112,7 @@ def _components() -> RealTeleopComponents:
 def _args(socket_path: str) -> Namespace:
     return Namespace(
         agent_primitive_authorized_side="left",
-        agent_primitive_authorized_action="forward",
+        agent_primitive_authorized_action="move_tcp_to_pose",
         agent_primitive_client_id="dexteleop-local-primitive-operator",
         agent_primitive_client_uid=0,
         agent_primitive_socket_path=socket_path,
@@ -128,7 +129,7 @@ def _validation_args(socket_path: str) -> Namespace:
         agent_primitive_confirm=REAL_AGENT_PRIMITIVE_CONFIRM_TOKEN,
         agent_primitive_socket_path=socket_path,
         agent_primitive_authorized_side="left",
-        agent_primitive_authorized_action="up",
+        agent_primitive_authorized_action="move_tcp_to_pose",
         active_sides=("left", "right"),
         tcp_pose_envelope_active=True,
         tcp_pose_envelope_profile="left-relative-tight.json",
@@ -176,6 +177,32 @@ def test_skill_only_argument_contract_rejects_unsafe_composition(
         )
 
 
+@pytest.mark.parametrize("action", ["forward", "up", "level_forward",
+    "motion.step_tcp_cardinal", "move_tcp_to_pose_safe", "approach_grasp_pose",
+    "execute_grasp_approach_plan", "set_gripper_state", "unknown"])
+def test_skill_only_rejects_retired_or_unassembled_actions_before_resources(tmp_path, monkeypatch, action):
+    from control_station import real_agent_primitive_runtime as module
+    from agent_gateway.profiles.real.session_authorization import REAL_AGENT_PRIMITIVE_ACTIONS
+
+    assert module.REAL_AGENT_PRIMITIVE_ACTIONS is REAL_AGENT_PRIMITIVE_ACTIONS
+    calls = []
+    monkeypatch.setattr(module, "attach_real_agent_primitive_gateway", lambda *a, **kw: calls.append("attach"))
+    monkeypatch.setattr(module.threading, "Thread", lambda *a, **kw: calls.append("thread"))
+    socket = str(tmp_path / "primitive.sock")
+    args = _validation_args(socket)
+    args.agent_primitive_authorized_action = action
+    with pytest.raises(SystemExit):
+        validate_real_agent_primitive_arguments(args, argparse.ArgumentParser())
+    with pytest.raises(SystemExit):
+        add_real_agent_primitive_arguments(argparse.ArgumentParser()).parse_args(
+            ["--agent-primitive-authorized-action", action])
+    direct = _args(socket)
+    direct.agent_primitive_authorized_action = action
+    with pytest.raises(ValueError):
+        RealAgentPrimitiveSkillOnlyExtension(direct)
+    assert calls == [] and not (tmp_path / "primitive.sock").exists()
+
+
 def test_skill_only_extension_attaches_one_exclusive_lower_owner() -> None:
     original = _components()
     extension = RealAgentPrimitiveSkillOnlyExtension(_args("/tmp/agp-test.sock"))
@@ -186,6 +213,22 @@ def test_skill_only_extension_attaches_one_exclusive_lower_owner() -> None:
     assert original.agent_motion_port is None
     assert port is not None
     assert port.config.exclusive_command_claim is True
+    assert port.config.active_sides == ("left",)
+    gateway = extension._require_attachment().gateway_session
+    bundle = gateway.contract_bundle
+    assert {(entry.route.skill_id, entry.route.skill_version)
+        for entry in bundle.route_manifest.skill_routes} == {
+            ("motion.move_tcp_to_pose", "1"), ("state.read_tcp_pose", "1")}
+    pose = bundle.route_manifest.route("motion.move_tcp_to_pose", "1")
+    assert set(gateway.executors_by_skill_id) == {"motion.move_tcp_to_pose"}
+    executor = gateway.executors_by_skill_id[pose.route.skill_id]
+    assert executor.binding.route_id == pose.route.route_id
+    registered = next(item for item in gateway.service.executor_registry.bindings
+        if item.route_hash == pose.route.semantic_content_hash)
+    assert registered.execution_port is executor
+    assert bundle.pose_target_profile.component_id == "left_arm"
+    assert all(ref.allowed_route_ids == (pose.route.route_id,)
+        for ref in pose.deployment_binding.safety_envelope_refs)
     idle = attached.session.command_override_provider(None, 1.0)
     assert isinstance(idle, TeleopCommandOverride)
     assert idle.command is None

@@ -196,6 +196,8 @@ def test_endpoint_rescue_preserves_admission_deadline_and_diagnostics(monkeypatc
     from threading import RLock
 
     planner = object.__new__(planning_module.MujocoPlannedTcpMotion)
+    planner._source_model_qpos = None
+    planner._solver_orientation_weight = None
     planner._motion_side = "right"
     planner._lock = RLock()
     planner._active = planner._pending_plan = None

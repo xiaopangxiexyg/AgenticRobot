@@ -623,7 +623,8 @@ def _safe_fixture(monkeypatch, side, *, reject_at=None, basis_change=False, plan
     lifecycle.component_id = side + "_arm"
     lifecycle.application = SimpleNamespace(tcp_pose_envelope_runtime=SimpleNamespace(project=project))
     lifecycle.motion_profile = SimpleNamespace(max_translation_delta_m=0.1, max_rotation_delta_rad=0.2,
-        translation_tolerance_m=0.005, rotation_tolerance_rad=0.02, stable_measurement_count=2, max_control_cycles=20)
+        translation_tolerance_m=0.005, rotation_tolerance_rad=0.02, stable_measurement_count=2, max_control_cycles=20,
+        normalize_ik_objective=False)
     lifecycle.target_pose = target
     lifecycle._validate_call = lambda **_kwargs: None
     lifecycle._capture_pose = lambda: measured
@@ -632,6 +633,9 @@ def _safe_fixture(monkeypatch, side, *, reject_at=None, basis_change=False, plan
     lifecycle._path_search_time_budget_sec = 3.0
     lifecycle._contact_binding = None
     lifecycle._observed_planning_provider = None
+    lifecycle._path_policy = None
+    lifecycle._axis_cone = None
+    lifecycle._path_constraint_evidence = None
     lifecycle._planner = SimpleNamespace(
         pose_for_configuration=lambda _qpos, _pair: target, plan=search,
         activate=lambda _plan: events.append("planner.activate"),

@@ -15,8 +15,8 @@ from agent_gateway.profiles.real.observation_gateway import (
 )
 from agent_gateway.protocol.skill_catalog import SkillDeploymentSafetyEnvelopeRef
 from agent_gateway.skills.motion.definition import (
-    FIXED_CARDINAL_TCP_STEP_SKILL_IDS_V1,
-    FIXED_LEVEL_TCP_ORIENTATION_SKILL_IDS_V1,
+    ARCHIVED_DEBUG_MOTION_SKILL_IDS_V1,
+    cardinal_tcp_step_skill_definition_v1,
 )
 from robot_motion.coordinate_frames import (
     CoordinateFrameGraph,
@@ -101,7 +101,7 @@ def _bundle():
 
 @pytest.mark.parametrize("component", ["left_arm", "right_arm"])
 def test_spatial_goal_is_optional_and_binds_the_current_component(component):
-    from agent_gateway.profiles.spatial_goal import _calculate
+    from agent_gateway.profiles.spatial_goal import calculate_spatial_goal
 
     attachment, config, graph, envelope = _inputs()
     side = component.removesuffix("_arm")
@@ -128,7 +128,7 @@ def test_spatial_goal_is_optional_and_binds_the_current_component(component):
         "offset_frame": "reference", "orientation_mode": "align_axis",
         "tool_axis": "z", "axis_reference_xyz": [0., 0., -1.]}
     validator = registration.payload_validator
-    result = _calculate(parameters)
+    result = calculate_spatial_goal(parameters)
     validator.validate_parameters(parameters)
     validator.validate_execution_result(result)
     validator.validate_execution_result_for_parameters(parameters, result)
@@ -181,7 +181,7 @@ def test_dual_pose_routes_allow_either_one_arm_but_not_both(primary):
             bundle.payload_validators.validate_parameters(route=route, payload=payload)
 
 
-def test_real_bundle_exposes_read_diagnostic_and_fixed_motion_primitives() -> None:
+def test_real_bundle_exposes_only_retained_motion_and_read_diagnostic() -> None:
     bundle = _bundle()
 
     assert bundle.attachment.reference_frame_id == "canonical_station"
@@ -198,15 +198,18 @@ def test_real_bundle_exposes_read_diagnostic_and_fixed_motion_primitives() -> No
         == bundle.cardinal_profile.execution_reference_frame_spec_hash
     )
     assert bundle.tcp_pose_observe.attachment is bundle.attachment
-    assert len(bundle.route_manifest.skill_routes) == 12
+    assert len(bundle.route_manifest.skill_routes) == 2
     assert bundle.route_manifest.route("motion.move_tcp_to_pose", "1")
     assert bundle.pose_target_profile.component_id == COMPONENT_ID
     assert len(bundle.cardinal_profile.primitives) == 6
-    assert {
-        entry.route.skill_id for entry in bundle.route_manifest.skill_routes
-    } >= set(FIXED_CARDINAL_TCP_STEP_SKILL_IDS_V1)
-    assert {item.skill_id for item in bundle.orientation_profiles} == set(
-        FIXED_LEVEL_TCP_ORIENTATION_SKILL_IDS_V1
+    assert bundle.orientation_profiles == ()
+    retained = {"state.read_tcp_pose", "motion.move_tcp_to_pose"}
+    assert {item.skill_id for item in bundle.definition_catalog.skill_definitions} == retained
+    assert {item.skill_id for item in bundle.schema_catalog.schema_entries} == retained
+    assert {item.skill_id for item in bundle.io_catalog.io_contracts} == retained
+    assert {entry.route.skill_id for entry in bundle.route_manifest.skill_routes} == retained
+    assert set(ARCHIVED_DEBUG_MOTION_SKILL_IDS_V1) <= set(
+        bundle.route_manifest.explicit_exclusions
     )
     read = bundle.route_manifest.route("state.read_tcp_pose", "1")
     assert read.route.privilege_tier == "t0_read_only"
@@ -244,28 +247,26 @@ def test_legacy_execution_frame_attachment_gets_a_public_station_pose_schema() -
     )
 
 
-def test_real_cardinal_payload_is_exact_and_selects_all_six_primitives() -> None:
+@pytest.mark.parametrize("skill_id", sorted(ARCHIVED_DEBUG_MOTION_SKILL_IDS_V1))
+def test_real_archived_skill_has_no_route_binding_or_validator(skill_id: str) -> None:
     bundle = _bundle()
-    profile = bundle.cardinal_profile
-    route = bundle.route_manifest.route("motion.step_tcp_cardinal", "1").route
-    for primitive in profile.primitives:
-        payload = {
-            "component_id": profile.component_id,
-            "direction": primitive.direction.value,
-            "reference_frame_id": profile.reference_frame_id,
-            "reference_frame_spec_hash": profile.reference_frame_spec_hash,
-            "controlled_frame_id": "tool_tcp",
-            "frame_graph_hash": profile.frame_graph_hash,
-            "tool_config_hash": profile.tool_config_hash,
-            "calibration_hash": profile.calibration_hash,
-            "primitive_catalog_hash": profile.primitive_catalog_hash,
-        }
-        bundle.payload_validators.validate_parameters(route=route, payload=payload)
+    with pytest.raises(KeyError):
+        bundle.route_manifest.route(skill_id, "1")
+    with pytest.raises(KeyError):
+        bundle.binding_for_skill(skill_id)
+    retained_route = bundle.route_manifest.route("motion.move_tcp_to_pose", "1").route
+    with pytest.raises(KeyError, match="No payload validator"):
+        bundle.payload_validators.validator_for(replace(retained_route, skill_id=skill_id))
 
-    bad = dict(payload)
-    bad["direction"] = "diagonal"
-    with pytest.raises(ValueError):
-        bundle.payload_validators.validate_parameters(route=route, payload=bad)
+
+def test_real_bundle_rejects_republishing_an_archived_definition() -> None:
+    bundle = _bundle()
+    historic = cardinal_tcp_step_skill_definition_v1(controlled_component_ids=(COMPONENT_ID,))
+    with pytest.raises(ValueError, match="Archived debug motion"):
+        replace(bundle, definition_catalog=replace(
+            bundle.definition_catalog,
+            skill_definitions=(*bundle.definition_catalog.skill_definitions, historic),
+        ))
 
 
 def test_real_absolute_pose_payload_binds_tool_tcp_frame_and_bounded_speed() -> None:
@@ -312,7 +313,7 @@ def test_real_absolute_pose_payload_binds_tool_tcp_frame_and_bounded_speed() -> 
         )
 
 
-def test_real_contract_refuses_missing_or_unbound_lower_safety_envelope() -> None:
+def test_real_contract_requires_lower_refs_without_publishing_unbound_motion() -> None:
     attachment, port_config, graph, envelope = _inputs()
     kwargs = {
         "attachment": attachment,
@@ -333,11 +334,33 @@ def test_real_contract_refuses_missing_or_unbound_lower_safety_envelope() -> Non
         constraint_set_hash=envelope.constraint_set_hash,
         allowed_route_ids=("real.some_other_route",),
     )
-    with pytest.raises(ValueError, match="absent from all lower envelopes"):
-        build_real_agent_primitive_contract_bundle(
-            **kwargs,
-            safety_envelope_refs=(unbound,),
-        )
+    bundle = build_real_agent_primitive_contract_bundle(
+        **kwargs,
+        safety_envelope_refs=(unbound,),
+    )
+    assert {entry.route.skill_id for entry in bundle.route_manifest.skill_routes} == {
+        "state.read_tcp_pose"
+    }
+    assert bundle.deployment_bindings == ()
+    assert bundle.pose_target_profile is None
+
+
+def test_real_grasp_only_envelope_retains_its_pose_profile() -> None:
+    attachment, port_config, graph, envelope = _inputs()
+    bundle = build_real_agent_primitive_contract_bundle(
+        attachment=attachment,
+        port_config=port_config,
+        frame_graph=graph,
+        primitive_reference_frame_id="canonical_station",
+        safety_envelope_refs=(replace(
+            envelope, allowed_route_ids=("real.rm65.agent_skill_grasp_approach",),
+        ),),
+    )
+    assert {entry.route.skill_id for entry in bundle.route_manifest.skill_routes} == {
+        "state.read_tcp_pose", "motion.approach_grasp_pose"
+    }
+    assert bundle.pose_target_profile is not None
+    assert len(bundle.deployment_bindings) == 1
 
 
 def test_real_contract_refuses_an_explicit_nonstation_public_frame() -> None:

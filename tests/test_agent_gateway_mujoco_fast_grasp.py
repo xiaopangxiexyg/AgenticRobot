@@ -710,11 +710,13 @@ def test_grazing_retained_target_can_close_then_reopen_without_linkage_failure(
             "trajectory_hash": retained_native.trajectory_hash,
             "q_rad": retained_native.trajectory.q_rad.tolist(),
             "source_model_qpos": retained_native.source_model_qpos.tolist(),
+            "timestamps": retained_native.trajectory.timestamps.tolist(),
         }))
         executed = _run(session, adapter, _request(session, adapter,
             "motion.execute_grasp_approach_plan", {key: result[key] for key in
                 ("component_id", "grasp_approach_plan_id", "grasp_approach_plan_hash")}, sequence + 2))
-        assert executed.status == "completed", executed
+        record_property("grazing_execution_operation", json.dumps(executed.to_wire(), default=str))
+        assert executed.status == "completed", executed.to_wire()
         for gripper_sequence, state in enumerate(("closed", "open"), sequence + 3):
             operation = _run(session, adapter, _request(session, adapter,
                 "manipulation.set_gripper_state", {"component_id": "right_gripper", "target_state": state}, gripper_sequence))
