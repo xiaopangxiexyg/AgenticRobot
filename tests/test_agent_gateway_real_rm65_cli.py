@@ -48,6 +48,7 @@ def test_cli_back_projection_resolves_measured_geometry_without_grasp_models():
     args = parser.parse_args([*_argv(confirmation=REAL_AGENT_PRIMITIVE_SESSION_CONFIRM_TOKEN),
                               "--enable-back-projection"])
     assert not args.enable_point_grasp
+    assert args.object_localization_backend == "sam3-service"
     assert args.object_localization_asset_bundle is None
     assert args.point_grasp_asset_bundle is None
     assert gateway_cli._effective_camera_registry(args) == gateway_cli.DEFAULT_RM65_CAMERA_REGISTRY_V4
@@ -695,6 +696,8 @@ def test_cli_rejects_point_grasp_when_selected_tool_tcp_is_not_reviewed_dmtac(
             "--artifact-root",
             str(tmp_path),
             "--enable-point-grasp",
+            "--object-localization-backend",
+            "sam2-grounding-dino",
             "--object-localization-asset-bundle",
             str(REPO_ROOT),
             "--point-grasp-asset-bundle",
@@ -753,10 +756,45 @@ def test_cli_rejects_overlong_socket_before_profile_or_hardware_assembly(
     assert "Traceback" not in error
 
 
+@pytest.mark.parametrize("backend_args, bundle, message", [
+    ([], True, "invalid with sam3-service"),
+    (["--object-localization-backend", "sam2-grounding-dino"], False,
+     "requires --object-localization-asset-bundle"),
+])
+def test_cli_rejects_ambiguous_or_missing_localization_bundle_before_resources(
+    monkeypatch, tmp_path, short_unix_socket_path_factory, capsys,
+    backend_args, bundle, message,
+):
+    def forbidden(*args, **kwargs):
+        pytest.fail("invalid localization options must fail before resources")
+
+    monkeypatch.setattr(gateway_cli, "resolve_exclusive_rm65_skill_deployment_profile", forbidden)
+    argv = _argv(
+        confirmation=REAL_AGENT_PRIMITIVE_SESSION_CONFIRM_TOKEN,
+        socket_path=short_unix_socket_path_factory("localization-options"),
+    )
+    argv += [
+        "--enable-point-grasp", "--camera-config", str(REPO_ROOT / "pyproject.toml"),
+        "--artifact-root", str(tmp_path), "--point-grasp-asset-bundle", str(tmp_path),
+        *backend_args,
+    ]
+    if bundle:
+        argv += ["--object-localization-asset-bundle", str(tmp_path)]
+    with pytest.raises(SystemExit) as error:
+        gateway_cli.main(argv)
+    assert error.value.code == 2
+    assert message in capsys.readouterr().err
+
+
 @pytest.mark.parametrize("with_reachability", [False, True])
-@pytest.mark.parametrize("localization_backend", ["sam2-grounding-dino", "sam3-service"])
+@pytest.mark.parametrize("localization_backend, backend_args", [
+    ("sam3-service", []),
+    ("sam3-service", ["--object-localization-backend", "sam3-service"]),
+    ("sam2-grounding-dino", ["--object-localization-backend", "sam2-grounding-dino"]),
+])
 def test_cli_binds_the_same_localizer_to_perception_and_point_grasp(
-    monkeypatch, tmp_path, short_unix_socket_path_factory, with_reachability, localization_backend,
+    monkeypatch, tmp_path, short_unix_socket_path_factory, with_reachability,
+    localization_backend, backend_args,
 ):
     resolved = SimpleNamespace(
         semantic_content_hash="a" * 64,
@@ -773,7 +811,11 @@ def test_cli_binds_the_same_localizer_to_perception_and_point_grasp(
     monkeypatch.setattr(gateway_cli, "_validate_point_grasp_capture_urdf", lambda *_, **__: None)
     for name in ("Sam2GroundingDinoModelSpec", "GraspGenXPointGraspModelSpec"):
         monkeypatch.setattr(gateway_cli, name, SimpleNamespace(from_asset_bundle=lambda _: model_spec))
-    monkeypatch.setattr(gateway_cli, "Sam2GroundingDinoLocalizer", lambda **_: object())
+    def construct_sam2(**kwargs):
+        assert localization_backend == "sam2-grounding-dino"
+        return object()
+
+    monkeypatch.setattr(gateway_cli, "Sam2GroundingDinoLocalizer", construct_sam2)
     monkeypatch.setattr(gateway_cli, "GraspGenXInProcessBackend", lambda **_: object())
 
     def construct_planner(**kwargs):
@@ -788,6 +830,7 @@ def test_cli_binds_the_same_localizer_to_perception_and_point_grasp(
 
             assert isinstance(kwargs["object_localizer"], Sam3ServiceLocalizer)
             assert kwargs["object_localizer"]._started is False
+            assert kwargs["object_localizer"].model_spec.endpoint == "http://127.0.0.1:18114"
         raise RuntimeError("stop before any device startup")
 
     monkeypatch.setattr(gateway_cli, "Sam2GraspGenXPointGraspPlanner", construct_planner)
@@ -797,22 +840,30 @@ def test_cli_binds_the_same_localizer_to_perception_and_point_grasp(
     argv += ["--enable-point-grasp", "--point-grasp-backend", "graspgenx",
              "--camera-config", str(REPO_ROOT / "pyproject.toml"),
              "--artifact-root", str(tmp_path),
-             "--point-grasp-asset-bundle", str(tmp_path)]
+             "--point-grasp-asset-bundle", str(tmp_path),
+             "--sam3-endpoint", "http://127.0.0.1:18114", *backend_args]
     if localization_backend == "sam2-grounding-dino":
         argv += ["--object-localization-asset-bundle", str(tmp_path)]
-    else:
-        argv += ["--object-localization-backend", "sam3-service"]
     if with_reachability:
         argv.append("--enable-point-grasp-arm-reachability")
     with pytest.raises(RuntimeError, match="stop before any device startup"):
         gateway_cli.main(argv)
 
 
+@pytest.mark.parametrize("backend_args", [[], ["--object-localization-backend", "sam3-service"]])
 def test_cli_assembles_then_reports_ready_and_lower_hold(
     monkeypatch,
     capsys,
     short_unix_socket_path_factory,
+    backend_args,
 ) -> None:
+    from deployments.perception import sam3_service
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("motion-only startup must not construct localization resources")
+
+    monkeypatch.setattr(sam3_service, "Sam3ServiceLocalizer", forbidden)
+    monkeypatch.setattr(gateway_cli, "Sam2GroundingDinoLocalizer", forbidden)
     resolved = SimpleNamespace(semantic_content_hash="a" * 64)
     lower = object()
     captured = {}
@@ -978,6 +1029,7 @@ def test_cli_assembles_then_reports_ready_and_lower_hold(
         confirmation=REAL_AGENT_PRIMITIVE_SESSION_CONFIRM_TOKEN,
         socket_path=socket_path,
     )
+    argv.extend(backend_args)
     argv.extend(
         [
             "--ssh-read-only-client",
@@ -990,6 +1042,8 @@ def test_cli_assembles_then_reports_ready_and_lower_hold(
         ]
     )
     assert gateway_cli.main(argv) == 0
+    assert captured["object_localizer"] is None
+    assert captured["point_grasp_planner"] is None
 
     events = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
     assert [event["event"] for event in events] == [

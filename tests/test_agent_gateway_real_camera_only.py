@@ -27,7 +27,11 @@ from dataset_contracts.canonical_encoding import canonical_content_hash
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
-def test_camera_only_sam3_binding_never_constructs_sam2_or_starts_devices(monkeypatch, tmp_path):
+@pytest.mark.parametrize("backend_args", [[], ["--object-localization-backend", "sam3-service"]])
+@pytest.mark.parametrize("enable_localization", [False, True])
+def test_camera_only_sam3_binding_never_constructs_sam2_or_starts_devices(
+    monkeypatch, tmp_path, backend_args, enable_localization,
+):
     from deployments.perception import sam3_service
 
     captured = []
@@ -49,12 +53,45 @@ def test_camera_only_sam3_binding_never_constructs_sam2_or_starts_devices(monkey
     monkeypatch.setattr(perception_cli, "build_rm65_dual_arm_scene_profile", stop_before_sources)
     existing = str(REPO_ROOT / "pyproject.toml")
     with pytest.raises(RuntimeError, match="stop before camera construction"):
-        perception_cli.main([
+        argv = [
             "--socket-path", str(tmp_path / "unused.sock"), "--camera-config", existing,
             "--camera-registry", existing, "--artifact-root", str(tmp_path),
-            "--enable-object-localization", "--object-localization-backend", "sam3-service",
-        ])
-    assert len(captured) == 1 and not captured[0]._started
+            "--sam3-endpoint", "http://127.0.0.1:18114", *backend_args,
+        ]
+        if enable_localization:
+            argv.append("--enable-object-localization")
+        perception_cli.main(argv)
+    assert len(captured) == int(enable_localization)
+    if enable_localization:
+        assert not captured[0]._started
+        assert captured[0].model_spec.endpoint == "http://127.0.0.1:18114"
+
+
+@pytest.mark.parametrize("backend_args, bundle, message", [
+    ([], True, "invalid with sam3-service"),
+    (["--object-localization-backend", "sam2-grounding-dino"], False,
+     "requires --object-localization-asset-bundle"),
+])
+def test_camera_only_rejects_ambiguous_or_missing_localization_bundle_before_resources(
+    monkeypatch, tmp_path, capsys, backend_args, bundle, message,
+):
+    def forbidden(*args, **kwargs):
+        pytest.fail("invalid localization options must fail before resources")
+
+    monkeypatch.setattr(perception_cli.Sam2GroundingDinoModelSpec, "from_asset_bundle", forbidden)
+    monkeypatch.setattr(perception_cli, "build_rm65_dual_arm_scene_profile", forbidden)
+    existing = str(REPO_ROOT / "pyproject.toml")
+    argv = [
+        "--socket-path", str(tmp_path / "unused.sock"), "--camera-config", existing,
+        "--camera-registry", existing, "--artifact-root", str(tmp_path),
+        "--enable-object-localization", *backend_args,
+    ]
+    if bundle:
+        argv += ["--object-localization-asset-bundle", str(tmp_path)]
+    with pytest.raises(SystemExit) as error:
+        perception_cli.main(argv)
+    assert error.value.code == 2
+    assert message in capsys.readouterr().err
 
 
 def test_perception_default_does_not_import_optional_sam3_client():
@@ -65,9 +102,54 @@ def test_perception_default_does_not_import_optional_sam3_client():
         "p=perception_cli.build_parser(); "
         "a=p.parse_args(['--socket-path','/unused.sock','--camera-config','/unused.json',"
         "'--camera-registry','/unused.json','--artifact-root','/unused']); "
-        "assert a.object_localization_backend=='sam2-grounding-dino'"),
+        "assert a.object_localization_backend=='sam3-service'; "
+        "assert not a.enable_object_localization; assert not a.enable_point_grasp; "
+        "from agent_gateway.profiles.real import gateway_cli; "
+        "g=gateway_cli.build_parser(); "
+        "assert g.get_default('object_localization_backend')=='sam3-service'; "
+        "assert not g.get_default('enable_point_grasp'); "
+        "assert 'deployments.perception.sam3_service' not in sys.modules"),
     ], cwd=REPO_ROOT, capture_output=True, text=True, check=False)
     assert result.returncode == 0, result.stderr
+
+
+def test_camera_only_explicit_sam2_preserves_localization_settings(monkeypatch, tmp_path):
+    captured = {}
+    model_spec = object()
+
+    def spec(bundle):
+        assert bundle == tmp_path
+        return model_spec
+
+    def construct(**kwargs):
+        captured.update(kwargs)
+        return object()
+
+    def stop_before_sources(*args, **kwargs):
+        raise RuntimeError("stop before camera construction")
+
+    monkeypatch.setattr(perception_cli.Sam2GroundingDinoModelSpec, "from_asset_bundle", spec)
+    monkeypatch.setattr(perception_cli, "Sam2GroundingDinoLocalizer", construct)
+    monkeypatch.setattr(perception_cli, "build_rm65_dual_arm_scene_profile", stop_before_sources)
+    existing = str(REPO_ROOT / "pyproject.toml")
+    with pytest.raises(RuntimeError, match="stop before camera construction"):
+        perception_cli.main([
+            "--socket-path", str(tmp_path / "unused.sock"), "--camera-config", existing,
+            "--camera-registry", existing, "--artifact-root", str(tmp_path),
+            "--enable-object-localization",
+            "--object-localization-backend", "sam2-grounding-dino",
+            "--object-localization-asset-bundle", str(tmp_path),
+            "--object-localization-device", "cpu",
+            "--object-localization-box-threshold", "0.4",
+            "--object-localization-text-threshold", "0.3",
+            "--object-localization-automatic-score-threshold", "0.85",
+            "--object-localization-nms-iou-threshold", "0.6",
+        ])
+    assert captured == {
+        "model_spec": model_spec, "device": "cpu", "box_threshold": 0.4,
+        "text_threshold": 0.3, "automatic_score_threshold": 0.85,
+        "nms_iou_threshold": 0.6,
+    }
 
 
 class _CameraSource:

@@ -1,5 +1,10 @@
 # SAM2 + Grounding DINO 定位与分割 Skill
 
+当前在线 Gateway 默认使用 SAM3 服务，启动和能力说明见
+[默认 SAM3 服务](../../agent_gateway/README.md#默认-sam3-服务文本目标与图片点选)。
+本页保留显式 SAM2 后端的资产、离线诊断和兼容能力；使用时必须选择
+`--object-localization-backend sam2-grounding-dino`，不再由资产目录自动选择后端。
+
 `perception.localize_objects` 对一张 JPEG/PNG 执行只读物体定位：
 
 - `language_prompt=null`：SAM2 automatic mask generator 产生全图物体候选，再投影为 bounding box；
@@ -145,6 +150,7 @@ python -m agent_gateway real-perception \
   --camera-registry /absolute/path/to/rm65_camera_registry.json \
   --artifact-root /absolute/path/to/runtime-artifacts \
   --enable-object-localization \
+  --object-localization-backend sam2-grounding-dino \
   --object-localization-asset-bundle \
     "${DEXTELEOP_ASSET_ROOT}/perception/sam2_grounding_dino"
 ```
@@ -161,6 +167,7 @@ MuJoCo 主 Gateway 通过显式的可选资产参数启用同一 Skill：
 
 ```bash
 python -m agent_gateway mujoco \
+  --object-localization-backend sam2-grounding-dino \
   --artifact-root /absolute/path/to/runtime-artifacts \
   --segmentation-asset-bundle \
     "${DEXTELEOP_ASSET_ROOT}/perception/sam2_grounding_dino" \
@@ -168,8 +175,9 @@ python -m agent_gateway mujoco \
   ...
 ```
 
-不传模型 bundle 时不注册 `perception.segment`，也不加载模型；原有无模型
-Gateway 的 Route 和运行方式不变。
+未启用感知功能时不注册 `perception.segment`，也不加载模型；原有无模型 Gateway 的 Route
+和运行方式不变。默认 SAM3 可直接用 `--enable-segmentation --artifact-root ...` 启用，
+无需 SAM2 bundle；两种后端都沿用会话启动、取消与关闭的原 owner。
 
 ## 实时分割输入
 

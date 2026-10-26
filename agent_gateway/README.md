@@ -639,11 +639,12 @@ localize 的 last_call_timing_ms 仅报告当前调用的锁等待和推理阶�
 新原始数组采用无损 deflate level 3，接近原字节上限时改用原 level 6 再验证；接收已有视图字节的入口
 始终逐字节保留输入，不重新压缩。压缩包可能略大，最终字节、解压体积、形状和元数据门禁均保留。
 
-### 可选 SAM3 服务：文本目标与图片点选
+### 默认 SAM3 服务：文本目标与图片点选
 
-`real-rm65` 和 `real-perception` 的 `--object-localization-backend` 默认仍为
-`sam2-grounding-dino`。未显式选择 SAM3 时，原模型、阈值、自动分割和启动路径不变，
-不会导入 SAM3 client 或连接额外服务。GraspGenX 的 `in-process` 默认也不变。
+`real-rm65`、`real-perception` 和 `mujoco` 的 `--object-localization-backend`
+默认是 `sam3-service`。SAM2 只在显式传入 `--object-localization-backend sam2-grounding-dino`
+及对应资产时使用。后端选择不自动启用定位、分割、抓姿或运动 Route；现有启用条件仍需满足。
+GraspGenX 的 `in-process`、`graspmoe` 和 v5 几何默认保持。
 
 SAM3 复用 RPent 的通用服务，在它自己的模型环境中独立运行，不向 Gateway 环境
 安装 SAM3，也不把相机、抓姿、IK 或运动功能放入服务：
@@ -654,7 +655,7 @@ SAM3_CHECKPOINT_PATH=/absolute/checkpoints/sam3.pt \
   --transport http --host 127.0.0.1 --port 8114
 ```
 
-在现有 Gateway 命令中显式加入下面的选项，并移除
+在已启用相应感知功能的 Gateway 命令中，可设置下面的服务参数，并移除
 `--object-localization-asset-bundle`；RPent 手动脚本对应移除
 `--sam2-grounding-dino-bundle`。相机、工具标定、抓取 profile、深度处理和执行确认保持原样：
 
@@ -678,6 +679,13 @@ overlay JPEG Artifact 编码、分数阈值及发布时的观测版本检查。
 现有 SAM2 命名的下游历史类／计时字段不代表实际选择的模型；部署身份绑定所选
 localizer。SAM3 的 profile hash 表示服务协议与 endpoint 配置，**不证明外部服务的
 checkpoint 字节身份**，因此应在服务自身的部署记录中保留源码、权重与环境信息。
+定位 Skill 保持 `perception.localize_objects@1`；服务模式的 deployment binding 显式为 v2，
+分别记录应用管理的只读客户端与外部模型执行服务。SAM2 的历史 v1 绑定和哈希保持。
+更换后端后，消费者需重新发现目录并绑定新 profile/Route/deployment 哈希，不复用旧发现缓存。
+MuJoCo 使用 `--enable-segmentation` 启用默认服务分割；显式 `--sam3-endpoint` 也保留原来的启用含义。
+表面锚点 v2/v3、同帧批量分割和留存图像定位均使用所选后端，无需为了启用它们提供 SAM2 资产。
+来源绑定的 MuJoCo 部署还需按[现有运行时绑定流程](../sim/rm65/real2sim/README.md)登记这批新源码；
+历史 V25 及 fit 不因默认选择变化而被覆盖。后端切换不替代新组合的原生与真机验收。
 离线掩码或规划通过不代表深度、标定、真实接触或抓取成功已经验收。
 
 The live `perception.plan_point_grasp@2` request contains only a registered
@@ -844,7 +852,7 @@ python -m agent_gateway real-rm65 \
   --camera-mount-urdf /absolute/AgenticRobot/assets/rm65_inspire_gripper_v4/rm65_dual_arm_wrist_cameras_v4_head_camera_4b2_cad_with_legacy_housing.urdf \
   --artifact-root /absolute/private/artifact_cache \
   --enable-point-grasp \
-  --object-localization-asset-bundle /absolute/assets/perception/sam2_grounding_dino \
+  --sam3-endpoint http://127.0.0.1:8114 \
   --point-grasp-asset-bundle /absolute/assets/perception/graspgenx-point-grasp \
   --graspgenx-host 127.0.0.1 \
   --graspgenx-port 5556 \

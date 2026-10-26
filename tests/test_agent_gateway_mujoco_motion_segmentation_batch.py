@@ -95,11 +95,13 @@ def test_batch_cli_rejects_missing_dependency_before_reading_paths(
                 "--task-config",
                 "/not-used/task.json",
                 flag,
+                "--object-localization-backend", "sam2-grounding-dino",
                 *dependencies,
             ]
         )
     assert error.value.code == 2
-    assert flag + " requires" in capsys.readouterr().err
+    message = capsys.readouterr().err
+    assert "requires --segmentation-asset-bundle" in message or "requires --artifact-root" in message
 
 
 @pytest.mark.parametrize("owner", ["factory", "deployment"])
@@ -659,6 +661,23 @@ def test_localization_dependencies_fail_before_resources(owner, artifact, model)
                 segmentation_model_profile_hash=MODEL_IDENTITY[1] if model else None,
                 segmentation_inference_implementation_hash=MODEL_IDENTITY[2] if model else None,
             )
+
+
+def test_localization_service_binding_keeps_segmentation_and_motion_identities(bundle_pair):
+    _application, _baseline, _batch, kwargs = bundle_pair
+    legacy = motion_deployment.build_mujoco_agent_tcp_pose_contract_bundle(
+        **kwargs, enable_object_localization=True)
+    service = motion_deployment.build_mujoco_agent_tcp_pose_contract_bundle(
+        **kwargs, enable_object_localization=True, segmentation_inference_execution_mode="external_service")
+    assert service.localization.binding.deployment_binding_version == "2"
+    assert service.localization.binding.model_execution_owner == "external_model_service"
+    assert service.localization.binding.semantic_content_hash != legacy.localization.binding.semantic_content_hash
+    assert service.segmentation.profile == legacy.segmentation.profile
+    assert service.segmentation.binding == legacy.segmentation.binding
+    for entry in legacy.route_manifest.skill_routes:
+        route = entry.route
+        if route.skill_id != "perception.localize_objects":
+            assert service.route_manifest.route(route.skill_id, route.skill_version) == entry
 
 
 def test_localization_requires_model_method_and_full_chain_retention_before_scene():

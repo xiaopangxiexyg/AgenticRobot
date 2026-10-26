@@ -124,12 +124,23 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--object-localization-backend",
+        choices=("sam3-service", "sam2-grounding-dino"),
+        default="sam3-service",
+        help="Mask/localization backend; SAM2 requires explicit selection and assets. Does not enable a Route.",
+    )
+    parser.add_argument(
+        "--enable-segmentation",
+        action="store_true",
+        help="Publish perception.segment using the selected backend; requires --artifact-root.",
+    )
+    parser.add_argument(
         "--segmentation-asset-bundle",
         type=Path,
         help=(
-            "optional absolute assets/perception/sam2_grounding_dino directory; "
-            "enables the live MuJoCo perception.segment Route and requires "
-            "--artifact-root"
+            "absolute assets/perception/sam2_grounding_dino directory for explicit "
+            "--object-localization-backend sam2-grounding-dino; enables segmentation "
+            "and requires --artifact-root"
         ),
     )
     parser.add_argument(
@@ -152,10 +163,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--sam3-endpoint",
         help=(
-            "explicit loopback SAM3 service for segmentation and optional fast-grasp "
-            "point masks; reuses the external model owner and requires --artifact-root"
+            "loopback SAM3 service (default http://127.0.0.1:8114 when a model capability "
+            "is enabled); specifying it also enables segmentation, as before"
         ),
     )
+    parser.add_argument("--sam3-timeout-sec", type=float, default=120.0,
+                        help="SAM3 service request timeout; no automatic retry or fallback.")
+    parser.add_argument("--sam3-min-score", type=float, default=0.2,
+                        help="Minimum SAM3 proposal score in [0, 1].")
     parser.add_argument("--enable-rgbd-capture-v3", action="store_true",
                         help="Publish capture_rgb v3 with optional native-grid paired RGB-D Artifacts; default off.")
     parser.add_argument("--enable-object-localization", action="store_true",
@@ -481,8 +496,50 @@ def _prepare_gateway_before_ready(*, session: Any, viewer: Any | None) -> None:
         session.history_recorder.start()
 
 
+def _segmentation_requested(args):
+    return (
+        args.enable_segmentation
+        or args.segmentation_asset_bundle is not None
+        or args.sam3_endpoint is not None
+        or args.enable_object_localization
+        or args.enable_segmentation_batch_v2
+        or args.enable_segmentation_geometry_v3
+        or args.enable_surface_anchor_v2
+    )
+
+
+def _localizer_from_args(parser, args, *, bundle, device):
+    if args.object_localization_backend == "sam3-service":
+        if bundle is not None:
+            parser.error("SAM2 assets require --object-localization-backend sam2-grounding-dino")
+        from deployments.perception.sam3_service import DEFAULT_SAM3_ENDPOINT, Sam3ServiceLocalizer
+
+        try:
+            return Sam3ServiceLocalizer(
+                endpoint=args.sam3_endpoint or DEFAULT_SAM3_ENDPOINT,
+                timeout_sec=args.sam3_timeout_sec,
+                min_score=args.sam3_min_score,
+            )
+        except (TypeError, ValueError) as error:
+            parser.error(f"invalid SAM3 service binding: {error}")
+    if args.sam3_endpoint is not None:
+        parser.error("--sam3-endpoint requires --object-localization-backend sam3-service")
+    if bundle is None:
+        parser.error("explicit SAM2 backend requires its asset bundle")
+    from deployments.perception.sam2_grounding_dino import (
+        Sam2GroundingDinoLocalizer, Sam2GroundingDinoModelSpec,
+    )
+
+    bundle = _absolute_managed_directory(parser, bundle, flag="SAM2 asset bundle")
+    try:
+        return Sam2GroundingDinoLocalizer(
+            model_spec=Sam2GroundingDinoModelSpec.from_asset_bundle(bundle), device=device,
+        )
+    except (OSError, RuntimeError, TypeError, ValueError) as error:
+        parser.error(f"invalid segmentation model bundle: {error}")
+
+
 def _fast_grasp_model_from_args(parser, args):
-    sam3_endpoint = getattr(args, "sam3_endpoint", None)
     mode = getattr(args, "graspgenx_mode", "in-process")
     service_options = (getattr(args, "graspgenx_host", "127.0.0.1"),
                        getattr(args, "graspgenx_port", 5556),
@@ -492,10 +549,10 @@ def _fast_grasp_model_from_args(parser, args):
     paths = (args.graspgenx_point_grasp_bundle,)
     if mode == "in-process":
         paths += (args.graspgenx_source_root,)
-    if sam3_endpoint is None:
+    if args.object_localization_backend == "sam2-grounding-dino":
         paths += (args.sam2_grounding_dino_bundle,)
     elif args.sam2_grounding_dino_bundle is not None:
-        parser.error("--sam3-endpoint and --sam2-grounding-dino-bundle select different point-mask backends")
+        parser.error("--sam2-grounding-dino-bundle requires --object-localization-backend sam2-grounding-dino")
     if not args.enable_fast_grasp:
         if (any(path is not None for path in (*paths, args.graspgenx_source_root))
                 or getattr(args, "graspgenx_planner", "graspmoe") != "graspmoe"
@@ -514,16 +571,9 @@ def _fast_grasp_model_from_args(parser, args):
         GRASPGENX_DMTAC_REACHABILITY_ORIENTATION_VARIANTS_LOCAL_AXIS_DEG,
     )
     spec = GraspGenXPointGraspModelSpec.from_asset_bundle(args.graspgenx_point_grasp_bundle)
-    if sam3_endpoint is not None:
-        from deployments.perception.sam3_service import Sam3ServiceLocalizer
-        localizer = Sam3ServiceLocalizer(endpoint=sam3_endpoint)
-    else:
-        from deployments.perception.sam2_grounding_dino import (
-            Sam2GroundingDinoLocalizer, Sam2GroundingDinoModelSpec,
-        )
-        localizer = Sam2GroundingDinoLocalizer(
-            model_spec=Sam2GroundingDinoModelSpec.from_asset_bundle(args.sam2_grounding_dino_bundle),
-            device=args.point_grasp_device)
+    localizer = _localizer_from_args(
+        parser, args, bundle=args.sam2_grounding_dino_bundle, device=args.point_grasp_device,
+    )
     client = (GraspGenXClient(host=service_options[0], port=service_options[1], timeout_ms=service_options[2])
         if mode == "service" else GraspGenXInProcessBackend(model_spec=spec,
             source_root=args.graspgenx_source_root, device=args.point_grasp_device))
@@ -542,6 +592,7 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--graspgenx-alignment-profile requires --enable-fast-grasp")
     if args.motion_side == "left" and (
         args.enable_fast_grasp
+        or args.enable_segmentation
         or args.enable_grippers
         or args.enable_grasp_approach
         or args.grasp_contact_target_body is not None
@@ -568,18 +619,21 @@ def main(argv: list[str] | None = None) -> int:
             "--motion-side left currently supports baseline TCP/state Routes only; "
             "gripper, grasp, spatial goal, history and segmentation combinations are not enabled"
         )
-    if args.enable_object_localization and not (
-            args.segmentation_asset_bundle is not None and args.artifact_root is not None):
-        parser.error("--enable-object-localization requires --segmentation-asset-bundle and --artifact-root")
+    if args.enable_surface_anchor_v2 and not args.enable_surface_anchors:
+        parser.error("--enable-surface-anchor-v2 requires surface anchors and segmentation")
+    if args.object_localization_backend == "sam3-service" and (
+        args.segmentation_asset_bundle is not None or args.sam2_grounding_dino_bundle is not None
+    ):
+        parser.error("SAM2 assets require --object-localization-backend sam2-grounding-dino")
+    if args.object_localization_backend == "sam2-grounding-dino":
+        if args.sam3_endpoint is not None:
+            parser.error("--sam3-endpoint requires --object-localization-backend sam3-service")
+        if _segmentation_requested(args) and args.segmentation_asset_bundle is None:
+            parser.error("SAM2 segmentation requires --segmentation-asset-bundle")
+    if _segmentation_requested(args) and args.artifact_root is None:
+        parser.error("segmentation/localization requires --artifact-root")
     if args.enable_object_localization and args.enable_surface_anchor_v3 and args.max_retained_operations < 4:
         parser.error("localized paired anchors require --max-retained-operations >= 4")
-    for name in ("enable_segmentation_batch_v2", "enable_segmentation_geometry_v3"):
-        if getattr(args, name) and (
-            args.artifact_root is None
-            or (args.segmentation_asset_bundle is None and args.sam3_endpoint is None)
-        ):
-            parser.error("--" + name.replace("_", "-") + " requires --artifact-root and an explicit "
-                         "--segmentation-asset-bundle or --sam3-endpoint")
     if args.enable_segmentation_geometry_v3 and args.max_retained_operations < 2:
         parser.error("--enable-segmentation-geometry-v3 requires retained producer and consumer operations")
     if args.enable_object_goal_queries and not args.enable_safe_tcp_pose:
@@ -588,8 +642,6 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--enable-surface-anchors requires --artifact-root and --enable-object-goal-queries")
     if args.enable_surface_anchors and args.max_retained_operations < 2:
         parser.error("surface anchors require retained producer and consumer operations")
-    if args.enable_surface_anchor_v2 and (not args.enable_surface_anchors or args.segmentation_asset_bundle is None):
-        parser.error("--enable-surface-anchor-v2 requires surface anchors and segmentation")
     if args.surface_anchor_selection_policy != "prompt_nearest" and not args.enable_surface_anchor_v2:
         parser.error("a non-default surface selection policy requires --enable-surface-anchor-v2")
     if args.enable_surface_anchor_v3 and not (args.enable_surface_anchor_v2
@@ -664,39 +716,10 @@ def main(argv: list[str] | None = None) -> int:
     segmentation_localizer = None
     if args.enable_rgbd_capture_v3 and artifact_storage is None:
         parser.error("--enable-rgbd-capture-v3 requires --artifact-root")
-    if args.sam3_endpoint is not None:
-        if args.segmentation_asset_bundle is not None:
-            parser.error("--sam3-endpoint and --segmentation-asset-bundle are mutually exclusive")
-        if artifact_storage is None:
-            parser.error("--sam3-endpoint requires --artifact-root")
-        from deployments.perception.sam3_service import Sam3ServiceLocalizer
-        try:
-            segmentation_localizer = Sam3ServiceLocalizer(endpoint=args.sam3_endpoint)
-        except (TypeError, ValueError) as error:
-            parser.error(f"invalid SAM3 service binding: {error}")
-    elif args.segmentation_asset_bundle is not None:
-        from deployments.perception.sam2_grounding_dino import (
-            Sam2GroundingDinoLocalizer,
-            Sam2GroundingDinoModelSpec,
+    if _segmentation_requested(args):
+        segmentation_localizer = _localizer_from_args(
+            parser, args, bundle=args.segmentation_asset_bundle, device=args.segmentation_device,
         )
-
-        if artifact_storage is None:
-            parser.error("--segmentation-asset-bundle requires --artifact-root")
-        segmentation_bundle = _absolute_managed_directory(
-            parser,
-            args.segmentation_asset_bundle,
-            flag="--segmentation-asset-bundle",
-        )
-        try:
-            segmentation_spec = Sam2GroundingDinoModelSpec.from_asset_bundle(
-                segmentation_bundle
-            )
-            segmentation_localizer = Sam2GroundingDinoLocalizer(
-                model_spec=segmentation_spec,
-                device=args.segmentation_device,
-            )
-        except (OSError, RuntimeError, TypeError, ValueError) as error:
-            parser.error(f"invalid segmentation model bundle: {error}")
 
     # Task configs may contain repository-relative calibration/profile paths.
     # This dedicated process owns its working directory, so normalize it once

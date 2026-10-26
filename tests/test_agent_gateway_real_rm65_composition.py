@@ -364,9 +364,11 @@ def test_model_free_three_view_projection_uses_the_existing_owner_cut(monkeypatc
 
 
 @pytest.mark.parametrize("primary", ["left", "right"])
-def test_dual_motion_composition_has_one_owner_and_primary_bound_grasp(monkeypatch, tmp_path, primary):
+@pytest.mark.parametrize("inference_mode", ["in_process", "external_service"])
+def test_dual_motion_composition_has_one_owner_and_primary_bound_grasp(monkeypatch, tmp_path, primary, inference_mode):
     lower, guard = _lower(monkeypatch, envelope_side="dual", absolute=True)
     localizer = _Localizer()
+    localizer.inference_execution_mode = inference_mode
     composition = assemble_exclusive_rm65_agent_primitive_composition(
         lower=lower, socket_path=tmp_path / "gateway.sock", authorized_side=primary,
         authorized_action=None,
@@ -386,6 +388,10 @@ def test_dual_motion_composition_has_one_owner_and_primary_bound_grasp(monkeypat
         assert session.contract_bundle.pose_target_profile.component_ids == ("left_arm", "right_arm")
         assert all(backend.starts == 0 for backend in lower.arm_backends.values())
         assert guard.starts == 0
+        registration = composition.localization_registration
+        assert registration.binding.deployment_binding_version == (
+            "2" if inference_mode == "external_service" else "1")
+        assert registration.binding.route_hash == registration.skill.routes[0].semantic_content_hash
     finally:
         session.artifact_store.close()
 

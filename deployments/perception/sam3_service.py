@@ -81,6 +81,8 @@ class Sam3ServiceLocalizer:
     or substituted with another segmentation backend.
     """
 
+    inference_execution_mode = "external_service"
+
     def __init__(
         self,
         *,

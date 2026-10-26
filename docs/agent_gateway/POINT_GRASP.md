@@ -1,4 +1,8 @@
-# SAM2 + VGN/GraspNet/GraspGenX 点击引导 DMTAC M 抓姿
+# SAM3 与 VGN/GraspNet/GraspGenX 点击引导 DMTAC M 抓姿
+
+在线 Gateway 和 RPent 通用手动入口默认使用 SAM3 服务提供定位与点选 mask。
+SAM2 仅由 `--object-localization-backend sam2-grounding-dino` 显式选择；本页中
+固定命名的 SAM2 离线诊断脚本和历史资产说明仍用于该显式兼容路径。
 
 离线 CLI 接受一对像素对齐的 RGB-D 单帧、点击像素、显式本地标定，返回最多
 5 个已排序的 DMTAC M `tool_tcp` 抓姿。每个候选同时包含 `T_camera_from_tcp`、
@@ -34,7 +38,7 @@ owner、碰撞场景和安全门禁。
 起始状态、场景版本及原计划 TTL 保持绑定。
 
 整请求使用调用方的原绝对 deadline 和 monotonic clock。读取窗口/锁等待后、主及
-辅助 SAM2 前后、GraspGenX 前后检查同一预算和取消状态，取消优先；模型原异常仍经
+辅助分割前后、GraspGenX 前后检查同一预算和取消状态，取消优先；模型原异常仍经
 原 finally 记录耗时并传播。已经运行的模型调用保持协作式停止边界，预算耗尽后不
 启动下一受保护阶段。诊断和失败回放仅供排查，不能替代成功结果或执行授权。
 
@@ -48,8 +52,9 @@ MuJoCo 在显式配置完整的右臂 approach/contact、双夹爪、Artifact �
 `perception.plan_grasp_fast@1` 和 `motion.execute_grasp_approach_plan@1`。
 默认配置不加载这些模型或发布这三条 Route。启动器使用 `--enable-fast-grasp`，
 要求 `--no-realtime-worker`、`--enable-grippers`、`--enable-grasp-approach`、
-`--grasp-contact-target-body`、`--artifact-root` 及三个显式绝对目录：
-`--sam2-grounding-dino-bundle`、`--graspgenx-point-grasp-bundle`、`--graspgenx-source-root`。
+`--grasp-contact-target-body`、`--artifact-root` 以及 `--graspgenx-point-grasp-bundle`；
+默认进程内模式还要求 `--graspgenx-source-root`。默认 SAM3 使用已经启动的 loopback 服务；
+显式 SAM2 才另外要求 `--sam2-grounding-dino-bundle`。
 模型由会话已有的 `start_perception_resources()` 在传输发布前启动，关闭时先等待
 只读 worker 退出，再释放模型、renderer、应用和存储；不在 Skill 中创建或重启资源。
 
@@ -58,11 +63,11 @@ MuJoCo 在显式配置完整的右臂 approach/contact、双夹爪、Artifact �
 采集统一按 source→application→rig 加锁，沿用现有渲染缓存及关闭检查。
 真实与仿真消费者共用有大小上限的留存 Artifact 读取器，完整性仍由原 CAS store 验证。
 
-MuJoCo 可显式用 `--sam3-endpoint http://127.0.0.1:8114` 选择已经启动的 SAM3 服务，
-用于 `perception.segment`，并在启用 fast-grasp 时提供其点提示 mask。
+MuJoCo 默认选择 `sam3-service`，可用 `--sam3-endpoint http://127.0.0.1:8114` 覆盖服务地址。
+`--enable-segmentation` 启用 `perception.segment`，fast-grasp 使用同类服务客户端提供点提示 mask。
 也可与 `--enable-segmentation-batch-v2`、`--enable-segmentation-geometry-v3` 组合，
 复用现有同一帧批量分割、留存观测身份校验和 mask 的二维像素几何；不会新增观测 owner
-或把分割候选当作物体身份真值。上述扩展仍需显式启用，原默认后端和 v1 行为不变。
+或把分割候选当作物体身份真值。上述扩展仍需显式启用，原有 Skill I/O 和运动授权不变。
 分割 v3 的形状及间距仍是二维图像关系；三维表面点须继续由原配对 RGB-D／
 back-projection 接口生成，不能将 mask 中心直接当作物体三维中心。
 此时不传 `--segmentation-asset-bundle` 或 `--sam2-grounding-dino-bundle`；
@@ -71,7 +76,7 @@ GraspGenX 的 bundle、Artifact 和原 grasp/gripper 装配仍必需；默认进
 客户端不会启动或关闭服务。模型资源仍在传输发布前由原会话启动，不在 Skill 内初始化。
 显式 `--graspgenx-planner diffusion` 可对照 diffusion-only；默认仍是 `graspmoe`。
 这些选择绑定到现有模型/profile hash，复用同一 v5 几何、IK 和完整路径及执行门禁，
-不增加等价 Skill、不改变默认模型，也不意味着已通过真实推理或抓取验收。
+不增加等价 Skill，也不意味着已通过真实推理或抓取验收。
 
 MuJoCo 也可显式使用与 RealMan 相同名称的 `--graspgenx-mode service`、
 `--graspgenx-host 127.0.0.1`、`--graspgenx-port 5556`、`--graspgenx-timeout-ms 120000`。
@@ -79,7 +84,7 @@ MuJoCo 也可显式使用与 RealMan 相同名称的 `--graspgenx-mode service`�
 不在 Skill 中启动服务。这样模型可留在其已验证的 Torch 环境，MuJoCo 继续使用原环境；
 服务调用仍返回同一参考系的提案，并进入原 v5/IK/完整路径链。
 默认仍为原 `in-process`。连接参数只在 service 模式有效；该模式的模型设备由外部服务决定，
-`--point-grasp-device` 仍用于本地 SAM2 点分割。服务 checkpoint 的运行身份需在部署/实验中
+`--point-grasp-device` 仅在显式 SAM2 路径用于本地点分割。服务 checkpoint 的运行身份需在部署/实验中
 独立核验，客户端的预期 asset bundle 与一次健康检查不能代替该证明。
 
 快速规划只接收本会话完成的 observation operation，复用共享的候选生成、首条完整路径
@@ -93,12 +98,13 @@ MuJoCo 也可显式使用与 RealMan 相同名称的 `--graspgenx-mode service`�
 
 ## 算法与第三方源码
 
-- [SAM2](https://github.com/facebookresearch/sam2.git) 使用正点击点分割点击所在物体/部位；
+- SAM3 服务默认提供文本或点击分割；显式 [SAM2](https://github.com/facebookresearch/sam2.git)
+  后端继续支持原点击分割。两者通过同一 mask/点云端口接入；
 - [VGN](https://github.com/ethz-asl/vgn.git) 从点击区域的 30 cm、40³ TSDF 生成 6DoF 二指抓姿；
-- 可选的 [GraspNet baseline](https://github.com/graspnet/graspnet-baseline.git) 先用 SAM2 点击 mask
+- 可选的 [GraspNet baseline](https://github.com/graspnet/graspnet-baseline.git) 先用所选后端的点击 mask
   的米制三维包围盒加 12 cm margin 限定推理工作区，再生成 6DoF 二指抓姿；候选随后仍用
-  SAM2 目标表面距离、点击距离和 DMTAC M 几何过滤，完整对齐深度仍用于碰撞门禁；
-- 默认的 [GraspGenX](https://github.com/NVlabs/GraspGenX) 直接消费 SAM2 mask 内的米制局部点云，
+  目标表面距离、点击距离和 DMTAC M 几何过滤，完整对齐深度仍用于碰撞门禁；
+- 默认的 [GraspGenX](https://github.com/NVlabs/GraspGenX) 直接消费所选 mask 内的米制局部点云，
   并用 DMTAC M 的 open/mid sweep-volume 条件生成跨夹爪 6DoF 候选；默认在兼容的独立 Gateway
   Python 环境内直接加载 GPU 模型，隔离的 loopback service 保留为显式兼容选项，候选仍经过
   点击归属、实际 TCP 变换和完整可见深度碰撞过滤；

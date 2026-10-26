@@ -176,6 +176,51 @@ def test_real_localization_modules_reexport_the_shared_objects():
         assert getattr(legacy_gateway, name) is getattr(localization, name)
 
 
+@pytest.mark.parametrize("target,mode,expected_hash", [
+    ("real", "real_observe", "d72632cd28a9cba7aec23dc0d2259d3ff328af9f2b473671b9da09612efbf39e"),
+    ("real", "real_active", "10328a446764f2f85c1ce1958301115a10dc2597c69fa0e7de4cbe454a57776e"),
+    ("sim", "sim_active", "9c5ff55d78ab4f5d8403c45d9bea229e1729da7830d158ae41174653e9809823"),
+])
+def test_service_binding_separates_client_and_model_while_preserving_v1(target, mode, expected_hash):
+    # Historical values independently read from development@225854b2e.
+    kwargs = dict(target_kind=target, current_mode=mode, local_path_enabled=False,
+        model_profile_id="model:test", model_profile_hash="model-profile:test",
+        inference_implementation_hash="inference:test", runtime_session_id="session:test",
+        control_domain_id="domain:test", target_binding_id="target:test",
+        station_manifest_hash="station:test", execution_manifest_hash="execution:test")
+    original = localization_deployment.build_object_localization_registration(**kwargs)
+    explicit = localization_deployment.build_object_localization_registration(
+        **kwargs, inference_execution_mode="in_process")
+    service = localization_deployment.build_object_localization_registration(
+        **kwargs, inference_execution_mode="external_service")
+    assert original.binding.semantic_content_hash == explicit.binding.semantic_content_hash == expected_hash
+    assert original.binding.deployment_binding_version == "1"
+    assert service.binding.deployment_binding_version == "2"
+    assert service.binding.inference_client_owner == "application_owned_read_only_client"
+    assert service.binding.model_execution_owner == "external_model_service"
+    assert service.binding.semantic_content_hash != expected_hash
+    assert service.profile.model_profile_hash == original.profile.model_profile_hash
+    assert service.profile.profile_id == f"{target}-service-object-localization-v2"
+    route = service.skill.routes[0]
+    assert route.control_effect_class == "read_only" and not route.may_move_robot
+    assert route.skill_version == "1"
+    assert service.binding.route_hash == route.semantic_content_hash
+    assert service.binding.profile_hash == service.profile.semantic_content_hash
+    assert service.binding.to_ref().deployment_binding_hash == service.binding.semantic_content_hash
+
+
+@pytest.mark.parametrize("execution_mode", ["", "unknown", True])
+def test_unknown_inference_execution_role_is_rejected(execution_mode):
+    with pytest.raises(ValueError, match="inference_execution_mode"):
+        localization_deployment.build_object_localization_registration(
+            target_kind="sim", current_mode="sim_active", local_path_enabled=False,
+            model_profile_id="model:test", model_profile_hash="model-profile:test",
+            inference_implementation_hash="inference:test", runtime_session_id="session:test",
+            control_domain_id="domain:test", target_binding_id="target:test",
+            station_manifest_hash="station:test", execution_manifest_hash="execution:test",
+            inference_execution_mode=execution_mode)
+
+
 @pytest.mark.parametrize("orientation", [None, 1, 2, 6])
 @pytest.mark.parametrize("kind", ["real", "sim"])
 def test_supplied_image_grid_policy_preserves_real_and_rejects_sim_rotation(

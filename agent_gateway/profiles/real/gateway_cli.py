@@ -220,11 +220,15 @@ def build_parser() -> argparse.ArgumentParser:
             "annotations; candidate ordering remains unchanged"
         ),
     )
-    parser.add_argument("--object-localization-asset-bundle", type=Path)
+    parser.add_argument(
+        "--object-localization-asset-bundle", type=Path,
+        help="required only for the explicitly selected sam2-grounding-dino backend",
+    )
     parser.add_argument("--object-localization-device", default="cuda")
     parser.add_argument(
         "--object-localization-backend",
-        choices=("sam2-grounding-dino", "sam3-service"), default="sam2-grounding-dino",
+        choices=("sam2-grounding-dino", "sam3-service"), default="sam3-service",
+        help="localization backend (default: sam3-service); does not enable point grasp",
     )
     parser.add_argument("--sam3-endpoint", default="http://127.0.0.1:8114")
     parser.add_argument("--sam3-timeout-sec", type=float, default=120.0)
@@ -1008,8 +1012,6 @@ def main(argv: list[str] | None = None) -> int:
             or args.safe_motion_observation_roles is not None):
         parser.error("--camera-mount-urdf requires point-grasp, back projection or observed safe motion")
     if args.object_localization_backend == "sam3-service":
-        if not args.enable_point_grasp:
-            parser.error("--object-localization-backend sam3-service requires --enable-point-grasp")
         if args.object_localization_asset_bundle is not None:
             parser.error("--object-localization-asset-bundle is invalid with sam3-service")
         point_grasp_values = (args.point_grasp_asset_bundle, camera_mount_urdf_arg)

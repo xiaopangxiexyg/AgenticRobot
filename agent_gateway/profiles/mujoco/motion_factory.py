@@ -895,6 +895,8 @@ def build_mujoco_agent_tcp_pose_gateway_session(
                 if segmentation_localizer is None
                 else segmentation_localizer.semantic_content_hash
             ),
+            segmentation_inference_execution_mode=getattr(
+                segmentation_localizer, "inference_execution_mode", "in_process"),
             enable_safe_tcp_pose=enable_safe_tcp_pose,
             enable_safe_tcp_path_constraints=enable_safe_tcp_path_constraints,
             enable_tcp_continuation_queries=enable_tcp_continuation_queries,

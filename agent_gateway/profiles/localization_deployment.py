@@ -166,23 +166,26 @@ class ObjectLocalizationDeploymentBinding:
         if self.target_kind == "sim" and self.executor_id == REAL_LOCALIZE_OBJECTS_EXECUTOR_ID_V1:
             object.__setattr__(self, "executor_id", "sim-passive-object-localization.v1")
 
+    def _identity_payload(self) -> dict[str, str]:
+        return {
+            field_name: getattr(self, field_name)
+            # Keep the exact historical Real v1 payload, not new dataclass fields.
+            for field_name in (
+                "deployment_binding_id", "route_hash", "runtime_session_id",
+                "control_domain_id", "target_binding_id", "station_manifest_hash",
+                "execution_manifest_hash", "profile_hash", "executor_id",
+                "deployment_binding_version",
+            )
+        } | {
+            "target_kind": self.target_kind,
+            "control_effect_class": "read_only",
+            "downstream_control_effects": "forbidden",
+        }
+
     @property
     def semantic_content_hash(self) -> str:
         return canonical_content_hash(
-            {
-                field_name: getattr(self, field_name)
-                # Keep the exact historical Real v1 payload, not new dataclass fields.
-                for field_name in (
-                    "deployment_binding_id", "route_hash", "runtime_session_id",
-                    "control_domain_id", "target_binding_id", "station_manifest_hash",
-                    "execution_manifest_hash", "profile_hash", "executor_id",
-                    "deployment_binding_version",
-                )
-            }
-            | {
-                "target_kind": self.target_kind,
-                "control_effect_class": "read_only",
-                "downstream_control_effects": "forbidden",
+            self._identity_payload() | {
                 "inference_owner": "local_sam2_grounding_dino_resource",
             },
             domain=f"dexteleop.agent_skill.{self.target_kind}_object_localization_deployment.v1",
@@ -195,6 +198,30 @@ class ObjectLocalizationDeploymentBinding:
             target_binding_id=self.target_binding_id,
             target_kind=self.target_kind,
             execution_manifest_hash=self.execution_manifest_hash,
+        )
+
+
+@dataclass(frozen=True)
+class ServiceObjectLocalizationDeploymentBindingV2(ObjectLocalizationDeploymentBinding):
+    """Bind the application client separately from the external model executor.
+
+    This identifies execution roles, not a claim that the service checkpoint or
+    its process has been attested. The selected model profile retains that limit.
+    The SAM2 in-process v1 binding and its exact historical hash stay unchanged.
+    """
+
+    deployment_binding_version: str = field(default="2", init=False)
+    inference_client_owner: str = field(default="application_owned_read_only_client", init=False)
+    model_execution_owner: str = field(default="external_model_service", init=False)
+
+    @property
+    def semantic_content_hash(self) -> str:
+        return canonical_content_hash(
+            self._identity_payload() | {
+                "inference_client_owner": self.inference_client_owner,
+                "model_execution_owner": self.model_execution_owner,
+            },
+            domain=f"dexteleop.agent_skill.{self.target_kind}_object_localization_deployment.v2",
         )
 
 
@@ -245,17 +272,22 @@ def build_object_localization_registration(
     target_binding_id: str,
     station_manifest_hash: str,
     execution_manifest_hash: str,
+    inference_execution_mode: str = "in_process",
 ) -> ObjectLocalizationRegistration:
     """Build one closed read-only localization registration."""
 
     target_kind = _target_kind(target_kind)
     _validate_mode(target_kind, current_mode)
+    if not isinstance(inference_execution_mode, str) or inference_execution_mode not in {"in_process", "external_service"}:
+        raise ValueError("Localization inference_execution_mode is unsupported.")
+    service_execution = inference_execution_mode == "external_service"
     profile = ObjectLocalizationProfile(
         model_profile_id=model_profile_id,
         model_profile_hash=model_profile_hash,
         inference_implementation_hash=inference_implementation_hash,
         local_path_enabled=local_path_enabled,
-        profile_id=f"{target_kind}-sam2-grounding-dino-object-localization-v1",
+        profile_id=(f"{target_kind}-service-object-localization-v2" if service_execution
+                    else f"{target_kind}-sam2-grounding-dino-object-localization-v1"),
         target_kind=target_kind,
     )
     definition = localize_objects_skill_definition_v1()
@@ -337,7 +369,9 @@ def build_object_localization_registration(
         io_contract=io_contract,
         routes=(route,),
     )
-    binding = ObjectLocalizationDeploymentBinding(
+    binding_type = (ServiceObjectLocalizationDeploymentBindingV2 if service_execution
+                    else ObjectLocalizationDeploymentBinding)
+    binding = binding_type(
         deployment_binding_id=f"{target_kind}.local_model.object_localization:"
         + runtime_session_id,
         route_hash=route.semantic_content_hash,
@@ -425,6 +459,7 @@ def build_real_object_localization_registration(
 
 
 __all__ = [
+    "ServiceObjectLocalizationDeploymentBindingV2",
     "LOCALIZE_OBJECTS_INPUT_SLOT_ID_V1",
     "LOCALIZE_OBJECTS_OUTPUT_SLOT_ID_V1",
     "REAL_LOCALIZE_OBJECTS_EXECUTOR_ID_V1",
