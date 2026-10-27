@@ -155,6 +155,22 @@ RIGHT_EXPORT_SHA256 = {
     for extended, exports in POSE_GOAL_RIGHT_EXPORT_SHA256.items()
 }
 
+# Explicit TCP@2 optional-target input revision at 896de2659. Preserve all
+# prior pins. Independent exports of ab40844d and 896de2659 differ only in
+# TCP@2's summary/required fields and their hash references. V1-only exports
+# and motion, safety, evaluation, state and history facts remain byte-identical.
+REQUIRED_TARGET_RIGHT_EXPORT_SHA256 = RIGHT_EXPORT_SHA256
+RIGHT_EXPORT_SHA256 = {
+    "False": REQUIRED_TARGET_RIGHT_EXPORT_SHA256["False"],
+    "True": {
+        **REQUIRED_TARGET_RIGHT_EXPORT_SHA256["True"],
+        "definition_catalog": "f9300a0e4074cafe32d7078eba473fde16bbf7855a382df09e44488da43f96f3",
+        "schema_catalog": "34817e1487593a991ba070eda3be6cc33fe0e01b99a225595562dce67b2fbe12",
+        "io_catalog": "c3e07e297d2fb84661902ea7429c6785a991ef604832fc8aa592f4cadfc0d31e",
+        "route_manifest": "b01148aa8a4a8c2c7fe4db520176e122aff2cd79be934dc5284a20657c85303d",
+    },
+}
+
 # Derived from the actual pure definition module at BASE_COMMIT, independently
 # of current catalog publication. Historical identities remain usable by readers.
 HISTORICAL_DEBUG_DEFINITION_HASHES = {
