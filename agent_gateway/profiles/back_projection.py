@@ -246,6 +246,7 @@ class SearchedSupportSurface:
     inspected_patch_count: int
     accepted_patch_count: int
     support_mask_sha256: str
+    source_mask_clipped: bool
 
 
 def bind_known_box_support_from_depth(
@@ -298,6 +299,80 @@ def bind_known_box_support_from_depth(
         lateral_uncertainty_m=lateral_uncertainty_m,
         vertical_uncertainty_m=vertical_uncertainty_m,
     )
+
+
+def search_and_bind_known_box_support_from_depth(
+    capture: LiveAlignedDepthCapture,
+    mask: np.ndarray,
+    box: CalibratedBoxSupportObservation,
+    *,
+    mask_clipped: bool,
+    semantic_support_id: str,
+    expected_reference_frame_id: str,
+    expected_support_mask_sha256: str,
+    lateral_uncertainty_m: float,
+    vertical_uncertainty_m: float,
+    maximum_depth_m: float,
+    patch_size_px: int = 64,
+    stride_px: int = 32,
+    maximum_patches: int = 512,
+) -> tuple[SearchedSupportSurface, SupportSurfaceObservation]:
+    """Find a measured patch that actually matches the named complete box.
+
+    A broad semantic mask can include nearby same-colour surfaces or borders.
+    Candidate ranking is restricted to patches whose measured pose and plane
+    agree with the catalog-backed box. The retained semantic mask hash still
+    names the *original* mask, not a privately cropped replacement.
+    """
+    selected = np.asarray(mask)
+    if (not isinstance(capture, LiveAlignedDepthCapture)
+            or not isinstance(box, CalibratedBoxSupportObservation)
+            or selected.dtype != np.bool_ or selected.shape != capture.depth_m.shape):
+        raise TypeError("Bound support search needs typed depth, box and mask")
+    actual_mask_hash = hashlib.sha256(
+        np.ascontiguousarray(selected).tobytes()
+    ).hexdigest()
+    if (not isinstance(expected_support_mask_sha256, str)
+            or actual_mask_hash != expected_support_mask_sha256):
+        raise ValueError("Support search mask differs from its retained segment")
+    if (semantic_support_id != box.support_id
+            or box.reference_frame_id != expected_reference_frame_id
+            or box.scene_revision != capture.station_revision):
+        raise ValueError("Support search identity, frame or revision differs")
+    depth_ref = ("support-depth:" + capture.depth_content_hash + ":"
+                 + actual_mask_hash + ":" + capture.capture_group_id)
+
+    def matches_box(candidate: ProjectedSupportSurface) -> bool:
+        center_xy = (np.asarray(candidate.observed_bounds_min_xy_m)
+                     + candidate.observed_bounds_max_xy_m) / 2.
+        try:
+            box.bind_measured_top(
+                plane_measured_at=capture.captured_at,
+                measured_upper_top_z_m=candidate.upper_top_z_m,
+                measured_normal_reference_xyz=candidate.normal_reference_xyz,
+                measured_region_center_xy_m=tuple(float(value) for value in center_xy),
+                depth_evidence_ref=depth_ref,
+                lateral_uncertainty_m=lateral_uncertainty_m,
+                vertical_uncertainty_m=vertical_uncertainty_m,
+            )
+        except ValueError:
+            return False
+        return True
+
+    search = search_depth_mask_support_surface(
+        capture, selected, mask_clipped=mask_clipped,
+        maximum_depth_m=maximum_depth_m, patch_size_px=patch_size_px,
+        stride_px=stride_px, maximum_patches=maximum_patches,
+        candidate_filter=matches_box,
+    )
+    support = bind_known_box_support_from_depth(
+        capture, search, box, semantic_support_id=semantic_support_id,
+        expected_reference_frame_id=expected_reference_frame_id,
+        expected_support_mask_sha256=expected_support_mask_sha256,
+        lateral_uncertainty_m=lateral_uncertainty_m,
+        vertical_uncertainty_m=vertical_uncertainty_m,
+    )
+    return search, support
 
 
 @dataclass(frozen=True)
@@ -410,6 +485,7 @@ def search_depth_mask_support_surface(
     patch_size_px: int = 64,
     stride_px: int = 32,
     maximum_patches: int = 256,
+    candidate_filter: Callable[[ProjectedSupportSurface], bool] | None = None,
 ) -> SearchedSupportSurface:
     """Select a measured top patch inside one bound semantic support mask.
 
@@ -424,8 +500,8 @@ def search_depth_mask_support_surface(
     selected = np.asarray(mask)
     if selected.dtype != np.bool_ or selected.shape != capture.depth_m.shape:
         raise ValueError("Support mask must be a paired full-resolution boolean grid")
-    if type(mask_clipped) is not bool or mask_clipped:
-        raise ValueError("Clipped or unverified support masks are not complete regions")
+    if type(mask_clipped) is not bool:
+        raise ValueError("Support mask clipping status must be explicit")
     if (isinstance(maximum_depth_m, (bool, np.bool_))
             or not isinstance(maximum_depth_m, (int, float, np.integer, np.floating))
             or not math.isfinite(maximum_depth_m) or maximum_depth_m <= 0):
@@ -439,6 +515,8 @@ def search_depth_mask_support_surface(
             raise ValueError(f"{name} must be a positive integer")
     if patch_size_px < 16 or stride_px > patch_size_px or maximum_patches > 1024:
         raise ValueError("Support patch search bounds are invalid")
+    if candidate_filter is not None and not callable(candidate_filter):
+        raise TypeError("Support patch filter must be callable")
     height, width = selected.shape
     if patch_size_px > min(height, width):
         raise ValueError("Support patch exceeds the capture")
@@ -470,6 +548,8 @@ def search_depth_mask_support_surface(
                 )
             except ValueError:
                 continue
+            if candidate_filter is not None and not candidate_filter(candidate):
+                continue
             accepted += 1
             dx = (candidate.observed_bounds_max_xy_m[0]
                   - candidate.observed_bounds_min_xy_m[0])
@@ -490,6 +570,7 @@ def search_depth_mask_support_surface(
         support_mask_sha256=hashlib.sha256(
             np.ascontiguousarray(selected).tobytes()
         ).hexdigest(),
+        source_mask_clipped=mask_clipped,
     )
 
 

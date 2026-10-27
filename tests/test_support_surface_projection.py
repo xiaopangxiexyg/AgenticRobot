@@ -9,6 +9,7 @@ from agent_gateway.profiles.back_projection import (
     LiveAlignedDepthCapture, project_depth_mask_support_surface,
     search_depth_mask_support_surface, check_observed_support_footprint,
     bind_known_box_support_from_depth,
+    search_and_bind_known_box_support_from_depth,
 )
 from robot_motion.object_transport import CalibratedBoxSupportObservation
 
@@ -89,7 +90,7 @@ def test_search_finds_observed_local_plane_without_promoting_to_complete_region(
 
 
 @pytest.mark.parametrize("options, match", [
-    ({"mask_clipped": True}, "Clipped"),
+    ({"mask_clipped": None}, "clipping status"),
     ({"maximum_patches": 1}, "budget"),
     ({"patch_size_px": True}, "positive integer"),
     ({"maximum_depth_m": True}, "maximum_depth_m"),
@@ -100,6 +101,23 @@ def test_search_rejects_unqualified_or_unbounded_input(options, match):
     values.update(options)
     with pytest.raises(ValueError, match=match):
         search_depth_mask_support_surface(capture(), mask(), **values)
+
+
+def test_clipped_semantic_mask_remains_a_candidate_until_known_geometry_binds():
+    cut = capture()
+    search = search_depth_mask_support_surface(
+        cut, mask(), mask_clipped=True, maximum_depth_m=2.,
+        patch_size_px=16, stride_px=2)
+    assert search.source_mask_clipped is True
+    with pytest.raises(ValueError, match="Clipped"):
+        project_depth_mask_support_surface(
+            cut, mask(), mask_clipped=True, maximum_depth_m=2.)
+    support = bind_known_box_support_from_depth(
+        cut, search, known_support_for_cut(), semantic_support_id="table",
+        expected_reference_frame_id="world",
+        expected_support_mask_sha256=search.support_mask_sha256,
+        lateral_uncertainty_m=.005, vertical_uncertainty_m=.002)
+    assert support.geometry_complete is True
 
 
 def test_dense_footprint_coverage_accepts_measured_flat_interior():
@@ -206,3 +224,35 @@ def test_depth_box_fusion_rejects_identity_or_time_mismatch(change, reason):
     values.update({key: value for key, value in change.items() if key not in {"box", "search"}})
     with pytest.raises(ValueError, match=reason):
         bind_known_box_support_from_depth(cut, search, box, **values)
+
+
+def test_model_bound_search_filters_unrelated_plane_candidates():
+    import hashlib
+    cut = capture()
+    selected = mask()
+    expected_hash = hashlib.sha256(np.ascontiguousarray(selected).tobytes()).hexdigest()
+    known = known_support_for_cut()
+    search, support = search_and_bind_known_box_support_from_depth(
+        cut, selected, known, mask_clipped=True,
+        semantic_support_id="table", expected_reference_frame_id="world",
+        expected_support_mask_sha256=expected_hash,
+        lateral_uncertainty_m=.005, vertical_uncertainty_m=.002,
+        maximum_depth_m=2., patch_size_px=16, stride_px=2)
+    assert search.source_mask_clipped is True
+    assert search.accepted_patch_count > 0
+    assert support.support_id == "table"
+    with pytest.raises(ValueError, match="retained segment"):
+        search_and_bind_known_box_support_from_depth(
+            cut, selected, known, mask_clipped=True,
+            semantic_support_id="table", expected_reference_frame_id="world",
+            expected_support_mask_sha256="f" * 64,
+            lateral_uncertainty_m=.005, vertical_uncertainty_m=.002,
+            maximum_depth_m=2., patch_size_px=16, stride_px=2)
+    with pytest.raises(ValueError, match="No near-horizontal"):
+        search_and_bind_known_box_support_from_depth(
+            cut, selected, replace(known, reference_from_box=np.eye(4)),
+            mask_clipped=True, semantic_support_id="table",
+            expected_reference_frame_id="world",
+            expected_support_mask_sha256=expected_hash,
+            lateral_uncertainty_m=.005, vertical_uncertainty_m=.002,
+            maximum_depth_m=2., patch_size_px=16, stride_px=2)
