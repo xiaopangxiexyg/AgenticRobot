@@ -231,6 +231,8 @@ def build_parser() -> argparse.ArgumentParser:
         help='Also publish capture_surface_anchor@2 operation-reference safe motion.')
     parser.add_argument('--enable-anchor-region-motion-v3', action='store_true',
         help='Also publish bounded multi-offset anchor motion on one sensor-shaped safe scene.')
+    parser.add_argument('--enable-anchor-hover-motion-v4', action='store_true',
+        help='Also publish semantic hover height with bounded extra-height/lateral safe search.')
     parser.add_argument('--safe-motion-observation-urdf', type=Path,
         help='Absolute path to the session robot assembly URDF for observed self filtering.')
     parser.add_argument('--safe-motion-observation-collision-scene-profile',
@@ -569,6 +571,7 @@ def main(argv: list[str] | None = None) -> int:
         or args.enable_observed_point_motion
         or args.enable_anchor_motion_v2
         or args.enable_anchor_region_motion_v3
+        or args.enable_anchor_hover_motion_v4
         or args.safe_motion_observation_urdf is not None
         or args.safe_motion_observation_collision_scene_profile is not None
         or args.safe_motion_observation_role
@@ -626,6 +629,8 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--enable-anchor-motion-v2 requires observed-point motion and surface anchor v2")
     if args.enable_anchor_region_motion_v3 and not args.enable_anchor_motion_v2:
         parser.error("--enable-anchor-region-motion-v3 requires --enable-anchor-motion-v2")
+    if args.enable_anchor_hover_motion_v4 and not args.enable_anchor_motion_v2:
+        parser.error("--enable-anchor-hover-motion-v4 requires --enable-anchor-motion-v2")
     if args.enable_observed_point_motion:
         if (not args.enable_safe_tcp_pose or not args.no_realtime_worker
                 or args.artifact_root is None or args.safe_motion_observation_urdf is None
@@ -792,6 +797,7 @@ def main(argv: list[str] | None = None) -> int:
         enable_observed_point_motion=args.enable_observed_point_motion,
         enable_anchor_motion_v2=args.enable_anchor_motion_v2,
         enable_anchor_region_motion_v3=args.enable_anchor_region_motion_v3,
+        enable_anchor_hover_motion_v4=args.enable_anchor_hover_motion_v4,
         safe_motion_observation=safe_motion_observation,
         enable_safe_tcp_path_constraints=args.enable_safe_tcp_path_constraints,
         enable_tcp_continuation_queries=args.enable_tcp_continuation_queries,

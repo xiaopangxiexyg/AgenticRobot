@@ -21,6 +21,8 @@ REGION_PARAMETERS_V3 = (ANCHOR_PARAMETERS_V2 - {"offset_frame"}) | {
 REGION_REPORT_V3 = ANCHOR_REPORT_V2 | {
     "selected_offset_xyz_m", "selected_candidate_index", "attempted_candidate_count",
 }
+HOVER_PARAMETERS_V4 = {"component_id", "surface_anchor_operation_id", "hover_height_m",
+                       "lateral_radius_m", "extra_height_m"}
 
 
 def observed_point_definition(*, controlled_component_ids):
@@ -300,3 +302,76 @@ def validate_observed_anchor_region_report_v3(report, *, reference_frame_id):
             or type(index) is not int or type(count) is not int
             or not 0 <= index < count <= 6):
         raise ValueError("Anchor region selected candidate evidence is invalid.")
+
+
+def validate_observed_anchor_hover_parameters_v4(parameters, *, component_id=None):
+    """Keep task height distinct from the additional clearance allowance."""
+    if not isinstance(parameters, Mapping) or set(parameters) != HOVER_PARAMETERS_V4:
+        raise ValueError("Anchor hover requires its exact compact v4 relation schema.")
+    component = parameters["component_id"]
+    source = parameters["surface_anchor_operation_id"]
+    if (not isinstance(component, str) or not component
+            or component_id is not None and component != component_id
+            or not isinstance(source, str) or not source or source.strip() != source
+            or len(source) > 256):
+        raise ValueError("Anchor hover source or component is invalid.")
+    for key in ("hover_height_m", "lateral_radius_m", "extra_height_m"):
+        value = parameters[key]
+        if type(value) not in (int, float) or not math.isfinite(value) or not 0 <= value <= .30:
+            raise ValueError(f"Anchor hover {key} must be finite within 0..0.30 m.")
+
+
+def observed_anchor_hover_offsets_v4(parameters):
+    """Use exactly the v3 search with a semantic above-surface input."""
+    validate_observed_anchor_hover_parameters_v4(parameters)
+    return observed_anchor_region_offsets_v3({
+        "component_id": parameters["component_id"],
+        "surface_anchor_operation_id": parameters["surface_anchor_operation_id"],
+        "offset_xyz_m": [0., 0., float(parameters["hover_height_m"])],
+        "lateral_radius_m": parameters["lateral_radius_m"],
+        "height_extra_m": parameters["extra_height_m"],
+    })
+
+
+def observed_anchor_hover_definition_v4(*, controlled_component_ids):
+    return SkillDefinition(
+        skill_id=SKILL_ID, skill_version="4", skill_kind="motion",
+        summary=("Move TCP above one authenticated capture_surface_anchor@2 point. "
+                 "hover_height_m is the nominal distance above that measured surface in public reference +Z; "
+                 "extra_height_m is ADDITIONAL upward clearance beyond hover_height_m, not the total height. "
+                 "lateral_radius_m permits bounded sideways alternatives. The lower owner tests up to six "
+                 "deterministic candidates against one fresh RGB-D/measured-joint scene, then executes the "
+                 "first complete safe path with its original dispatch and HOLD lifecycle. Pass only the "
+                 "source operation ID; do not copy XYZ or a target pose. This is a historical visible point, "
+                 "not tracked object motion, grasp or task-success evidence."),
+        intended_target_kind="target_agnostic", cross_target_deployment_policy="not_applicable",
+        controlled_component_ids=tuple(controlled_component_ids),
+        parameter_semantics_id="authenticated_surface_anchor.hover.reference_frame.v4",
+        execution_result_semantics_id="surface_anchor.hover_safe_arrival.v4",
+        task_outcome_semantics_id="tcp_pose_arrival.v1",
+        entry_predicate_ids=("route_ready.v1", "authenticated_surface_anchor.v2",
+                             "configured_scene_collision_free_path_found.v1"),
+        task_outcome_predicate_ids=("tcp_pose_within_tolerance.v1",),
+    )
+
+
+def observed_anchor_hover_schema_v4(*, definition, profile):
+    properties = {
+        "component_id": {"const": profile.component_id},
+        "surface_anchor_operation_id": {"type": "string", "minLength": 1, "maxLength": 256},
+        "hover_height_m": {"type": "number", "minimum": 0, "maximum": .30,
+                           "description": "Nominal meters ABOVE the measured surface in reference +Z."},
+        "lateral_radius_m": {"type": "number", "minimum": 0, "maximum": .30,
+                             "description": "Maximum sideways shift from the nominal point, in meters."},
+        "extra_height_m": {"type": "number", "minimum": 0, "maximum": .30,
+                           "description": "Additional upward meters beyond hover_height_m for safe-path search."},
+    }
+    entry = _schema_entry(skill_id=SKILL_ID,
+        skill_definition_hash=definition.semantic_content_hash,
+        parameter_profile_id=profile.profile_id, parameter_profile_hash=profile.semantic_content_hash,
+        parameter_schema={"type": "object", "additionalProperties": False,
+                          "properties": properties, "required": sorted(properties)})
+    # Report fields are exactly the checked v3 search receipt. Only admitted
+    # task-language parameters change; the collision/IK/trajectory evidence does not.
+    region = observed_anchor_region_schema_v3(definition=definition, profile=profile)
+    return replace(entry, skill_version="4", execution_result_schema=region.execution_result_schema)

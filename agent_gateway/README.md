@@ -1669,6 +1669,15 @@ RGB-D 和双臂实测关节场景内，按固定顺序检查名义点、加高�
 到达误差和来源。默认 v1/v2 不变，也不把旧只读几何查询的静态场景路径
 当作 RGB-D 场景的执行证明。
 
+显式 `enable_anchor_hover_motion_v4=True`（CLI 为
+`--enable-anchor-hover-motion-v4`）发布同一 Skill ID 的语义悬停版本。
+上层只填实测表面点来源、`hover_height_m`（名义上方高度）、
+`lateral_radius_m` 和 `extra_height_m`（在名义高度之外的加高余量）。
+下层将它们映射到与 v3 完全相同的六候选安全搜索；参数名直接表达
+“上方 8 cm、必要时额外抬高 10 cm”，避免把 8 cm 错填为搜索余量。
+v1–v3 的参数、Route 和默认启用状态不变。v4 仍不追踪物体、
+不授权真机，也不把 TCP 悬停完成判作抓取或放置成功。
+
 候选排名可利用已生成 IK 终点的最大关节偏移下界，跳过严格劣于已验证完整路径的候选。
 `safe_tcp_candidate_rank_pruned` 只表示不可能改善当前排名，不表示碰撞或不可达；相同主成本
 不能剪枝。`checked_count/all_candidates_checked` 是候选处理记账，须结合逐项 reason，

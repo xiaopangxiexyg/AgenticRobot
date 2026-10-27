@@ -14,6 +14,7 @@ from agent_gateway.runtime.station_operation_worker import StationLifecycleActiv
 from agent_gateway.skills.motion.observed_point import (
     SKILL_ID, POINT_SEMANTICS, validate_observed_anchor_parameters_v2,
     validate_observed_anchor_region_parameters_v3, observed_anchor_region_offsets_v3,
+    validate_observed_anchor_hover_parameters_v4, observed_anchor_hover_offsets_v4,
     validate_observed_point_parameters,
 )
 from robot_motion.action import ComponentAction
@@ -106,11 +107,14 @@ class MujocoAnchorMotionLifecycle(MujocoObservedPointMotionLifecycle):
     def __init__(self, *, store, lookup_operation, capture_registration,
                  current_station_revision, clock_domain_id, **kwargs):
         route = kwargs["route"]
-        if (route.skill_id != SKILL_ID or route.skill_version not in {"2", "3"}
+        if (route.skill_id != SKILL_ID or route.skill_version not in {"2", "3", "4"}
                 or kwargs["observed_planning_provider"] is None):
-            raise ValueError("Anchor motion requires its explicit v2/v3 Route and sensor-shaped safe planner.")
+            raise ValueError("Anchor motion requires its explicit v2/v3/v4 Route and sensor-shaped safe planner.")
         if route.skill_version == "3":
             validate_observed_anchor_region_parameters_v3(kwargs["request"].parameters,
+                component_id=kwargs["motion_profile"].component_id)
+        elif route.skill_version == "4":
+            validate_observed_anchor_hover_parameters_v4(kwargs["request"].parameters,
                 component_id=kwargs["motion_profile"].component_id)
         else:
             validate_observed_anchor_parameters_v2(kwargs["request"].parameters,
@@ -164,12 +168,14 @@ class MujocoAnchorMotionLifecycle(MujocoObservedPointMotionLifecycle):
         self._anchor_public_xyz = tuple(anchor_pose[:3])
         self._activation_public_pose = tuple(current)
         bounds = profile.workspace_bounds
-        if self.route.skill_version == "3":
+        if self.route.skill_version in {"3", "4"}:
             # The inherited lifecycle checks its provisional target before
             # search. Bind the first admissible region member there so a
             # nominal point outside bounds cannot suppress valid alternatives.
             goal = None
-            for offset in observed_anchor_region_offsets_v3(parameters):
+            offsets = (observed_anchor_hover_offsets_v4(parameters) if self.route.skill_version == "4"
+                       else observed_anchor_region_offsets_v3(parameters))
+            for offset in offsets:
                 candidate = compute_spatial_goal(current_tcp_pose_xyz_quat_xyzw=list(current),
                     anchor_xyz_m=list(anchor_pose[:3]), offset_xyz_m=list(offset),
                     offset_frame="reference", orientation_mode="preserve")
@@ -206,7 +212,9 @@ class MujocoAnchorMotionLifecycle(MujocoObservedPointMotionLifecycle):
             operation_id=self.operation.operation_id,
             expected_station_revision=self.request.expected_station_revision,
             cancel_requested=cancel_requested)
-        offsets = observed_anchor_region_offsets_v3(self.request.parameters)
+        offsets = (observed_anchor_hover_offsets_v4(self.request.parameters)
+                   if self.route.skill_version == "4" else
+                   observed_anchor_region_offsets_v3(self.request.parameters))
         deadline = time.perf_counter() + min(20., self._path_search_time_budget_sec * len(offsets))
         translation_tolerance, rotation_tolerance = self._planning_goal_tolerances()
         bounds = self.motion_profile.workspace_bounds
@@ -291,7 +299,7 @@ class MujocoAnchorMotionLifecycle(MujocoObservedPointMotionLifecycle):
             "achieved_pose_xyz_quat_xyzw": list(final),
             "translation_error_m": translation,
             "rotation_error_rad": math.radians(degrees)}
-        if self.route.skill_version == "3":
+        if self.route.skill_version in {"3", "4"}:
             report.update(selected_offset_xyz_m=list(self._selected_offset),
                           selected_candidate_index=self._selected_index,
                           attempted_candidate_count=self._considered_count)

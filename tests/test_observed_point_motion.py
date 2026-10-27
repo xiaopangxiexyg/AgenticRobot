@@ -15,6 +15,8 @@ from agent_gateway.skills.motion.observed_point import (
     observed_anchor_definition_v2, observed_anchor_schema_v2,
     observed_anchor_region_definition_v3, observed_anchor_region_schema_v3,
     observed_anchor_region_offsets_v3, validate_observed_anchor_region_parameters_v3,
+    observed_anchor_hover_definition_v4, observed_anchor_hover_schema_v4,
+    observed_anchor_hover_offsets_v4, validate_observed_anchor_hover_parameters_v4,
     validate_observed_anchor_parameters_v2,
 )
 
@@ -97,7 +99,7 @@ def test_compact_parameters_fail_closed(change):
         validate_observed_point_parameters({**_parameters(), **change}, component_id="right_arm")
 
 
-def make_native_session(tmp_path, *, anchor_v2=False, region_v3=False):
+def make_native_session(tmp_path, *, anchor_v2=False, region_v3=False, hover_v4=False):
     from agent_gateway.profiles.mujoco.motion_factory import (
         MujocoAgentArtifactStorageConfig, build_mujoco_agent_tcp_pose_gateway_session,
         mujoco_agent_tcp_pose_execution_observation_plan_v1)
@@ -118,6 +120,7 @@ def make_native_session(tmp_path, *, anchor_v2=False, region_v3=False):
         allowed_client_ids=(CLIENT,), enable_safe_tcp_pose=True, enable_observed_point_motion=True,
         enable_anchor_motion_v2=anchor_v2,
         enable_anchor_region_motion_v3=region_v3,
+        enable_anchor_hover_motion_v4=hover_v4,
         enable_object_goal_queries=anchor_v2, enable_surface_anchors=anchor_v2,
         enable_surface_anchor_v2=anchor_v2,
         segmentation_localizer=_AnchorSegmenter() if anchor_v2 else None,
@@ -167,6 +170,28 @@ def test_anchor_region_v3_generates_bounded_reference_offsets_without_pose_input
         schema.parameter_schema["properties"])
     with pytest.raises(ValueError):
         validate_observed_anchor_region_parameters_v3({**parameters, "height_extra_m": .31})
+
+
+def test_anchor_hover_v4_uses_nominal_height_plus_extra_clearance_without_pose_input():
+    params = {"component_id": "right_arm", "surface_anchor_operation_id": "source:anchor",
+              "hover_height_m": .08, "lateral_radius_m": .05, "extra_height_m": .10}
+    old = {"component_id": "right_arm", "surface_anchor_operation_id": "source:anchor",
+           "offset_xyz_m": [0., 0., .08], "lateral_radius_m": .05, "height_extra_m": .10}
+    assert observed_anchor_hover_offsets_v4(params) == observed_anchor_region_offsets_v3(old)
+    profile = SimpleNamespace(component_id="right_arm", reference_frame_id="canonical_station",
+        profile_id="profile:test", semantic_content_hash="a" * 64,
+        workspace_bounds=(-1., 1., -1., 1., -1., 1.))
+    definition = observed_anchor_hover_definition_v4(controlled_component_ids=("right_arm",))
+    schema = observed_anchor_hover_schema_v4(definition=definition, profile=profile)
+    assert definition.skill_version == schema.skill_version == "4"
+    assert set(schema.parameter_schema["required"]) == set(params)
+    assert not {"anchor_xyz_m", "pose_targets_by_component", "offset_xyz_m"} & set(
+        schema.parameter_schema["properties"])
+    assert "Additional" in schema.parameter_schema["properties"]["extra_height_m"]["description"]
+    for bad in ({**params, "hover_height_m": -.01}, {**params, "extra_height_m": .31},
+                {**params, "lateral_radius_m": True}):
+        with pytest.raises(ValueError):
+            validate_observed_anchor_hover_parameters_v4(bad, component_id="right_arm")
 
 
 def test_anchor_region_v3_discards_overlong_pending_plan_then_checks_next_candidate():
@@ -429,17 +454,20 @@ def test_native_authenticated_anchor_v2_moves_via_original_safe_owner(tmp_path, 
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("nominal,radius,extra,completed", (
-    ([0., 0., .08], .05, .10, True),
-    ([0., 0., -.10], .05, .28, True),
-    ([0., 0., .08], 0., 0., False),
+@pytest.mark.parametrize("version,nominal,radius,extra,completed", (
+    ("3", [0., 0., .08], .05, .10, True),
+    ("3", [0., 0., -.10], .05, .28, True),
+    ("3", [0., 0., .08], 0., 0., False),
+    ("4", [0., 0., .08], .05, .10, True),
+    ("4", [0., 0., .08], 0., 0., False),
 ))
-def test_native_anchor_region_v3_uses_one_observed_scene_and_original_motion_owner(
-        tmp_path, record_property, nominal, radius, extra, completed):
+def test_native_anchor_region_uses_one_observed_scene_and_original_motion_owner(
+        tmp_path, record_property, version, nominal, radius, extra, completed):
     from agent_gateway.protocol.contracts import AgentSkillRequest
     from test_agent_gateway_mujoco_safe_tcp_pose import CLIENT, _request
 
-    session = make_native_session(tmp_path, anchor_v2=True, region_v3=True)
+    session = make_native_session(tmp_path, anchor_v2=True,
+        region_v3=version == "3", hover_v4=version == "4")
     try:
         session.application.start_observation_ready()
         session.start_perception_resources()
@@ -488,20 +516,24 @@ def test_native_anchor_region_v3_uses_one_observed_scene_and_original_motion_own
 
         session.application.capture_planning_rgbd_cut = counted_capture
 
-        entry = session.contract_bundle.route_manifest.route(SKILL_ID, "3")
+        entry = session.contract_bundle.route_manifest.route(SKILL_ID, version)
         route = entry.route
         profile = route.allowed_parameter_profiles[0]
         motion = replace(_request(session, adapter, start, sequence=1, skill_id=SKILL_ID),
-            skill_version="3", skill_definition_hash=route.skill_definition_hash,
+            skill_version=version, skill_definition_hash=route.skill_definition_hash,
             route_id=route.route_id, route_version=route.route_version,
             route_hash=route.semantic_content_hash,
             deployment_binding_hash=entry.deployment_binding.deployment_binding_hash,
             parameter_profile_id=profile.parameter_profile_id,
             parameter_profile_hash=profile.parameter_profile_hash,
-            parameters={"component_id": "right_arm",
-                        "surface_anchor_operation_id": source.operation_id,
-                        "offset_xyz_m": nominal,
-                        "lateral_radius_m": radius, "height_extra_m": extra},
+            parameters=({"component_id": "right_arm",
+                         "surface_anchor_operation_id": source.operation_id,
+                         "hover_height_m": nominal[2], "lateral_radius_m": radius,
+                         "extra_height_m": extra} if version == "4" else
+                        {"component_id": "right_arm",
+                         "surface_anchor_operation_id": source.operation_id,
+                         "offset_xyz_m": nominal,
+                         "lateral_radius_m": radius, "height_extra_m": extra}),
             requested_timeout_ms=route.max_operation_duration_ms)
         admitted = adapter.submit_skill_request(motion.to_wire())
         assert admitted["accepted"], admitted
