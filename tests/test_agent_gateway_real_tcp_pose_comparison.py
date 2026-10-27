@@ -227,7 +227,8 @@ def test_comparison_flag_rejects_non_boolean_before_assembly(enabled):
 
 
 @pytest.mark.parametrize("side", ["left", "right"])
-def test_v1_and_v2_bind_different_route_executors_and_capture_one_existing_cut(monkeypatch, side):
+@pytest.mark.parametrize("omit_target", [False, True], ids=["explicit-null", "omitted"])
+def test_v1_and_v2_bind_different_route_executors_and_capture_one_existing_cut(monkeypatch, side, omit_target):
     gateway, snapshot, clock = _session(side=side)
     cuts = []
     capture = gateway.observation_producer._capture_snapshot_with_read_evidence
@@ -235,6 +236,10 @@ def test_v1_and_v2_bind_different_route_executors_and_capture_one_existing_cut(m
                         lambda **kwargs: cuts.append(kwargs["active_operation_id"]) or capture(**kwargs))
     v1 = _read(gateway, snapshot, version="1", sequence=1)
     v2 = _read(gateway, snapshot, version="2", sequence=2)
+    if omit_target:
+        v2 = replace(v2, parameters={key: value for key, value in v2.parameters.items()
+                                    if key != "target_operation_id"})
+    original_hash = v2.semantic_content_hash
     assert gateway.service.executor_registry.execution_port_for_request(v1) is gateway.state_executor
     assert gateway.service.executor_registry.execution_port_for_request(v2) is gateway.tcp_pose_comparison_executor
     assert gateway.state_executor is not gateway.tcp_pose_comparison_executor
@@ -245,6 +250,10 @@ def test_v1_and_v2_bind_different_route_executors_and_capture_one_existing_cut(m
     assert first.task_outcome == second.task_outcome == "not_assessed"
     assert "target_comparison" not in first.execution_result
     assert second.execution_result["target_comparison"] is None
+    assert second.request_hash == original_hash == v2.semantic_content_hash
+    recorded = gateway.service.operation_store.request_for_operation(second.operation_id)
+    assert recorded.parameters == v2.parameters
+    assert ("target_operation_id" not in recorded.parameters) == omit_target
     for key in ("source_measurement_hash", "measurement_id", "pose_by_component", "reference_frame_id", "frame_graph_hash", "tool_config_hash", "calibration_hash"):
         assert first.execution_result[key] == second.execution_result[key]
     assert cuts == [first.operation_id, second.operation_id]

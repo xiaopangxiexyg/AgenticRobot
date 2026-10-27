@@ -135,12 +135,23 @@ def test_adapter_uses_one_current_cut_not_old_success_or_target_pose(context):
     assert body["measured_at"] == context.measured["measured_at"]
 
 
-def test_null_is_explicit_state_only_and_never_looks_up_history(context):
-    request = replace(context.request, parameters={**context.request.parameters, "target_operation_id": None})
-    result = context.executor._read(request, context.operation)
+@pytest.mark.parametrize("omit_target", [False, True], ids=["explicit-null", "omitted"])
+def test_state_only_never_looks_up_history_or_rewrites_the_request(context, omit_target):
+    parameters = {**context.request.parameters, "target_operation_id": None}
+    if omit_target:
+        parameters.pop("target_operation_id")
+    request = replace(context.request, parameters=parameters)
+    before_hash = request.semantic_content_hash
+    before_parameters = dict(request.parameters)
+    operation = replace(context.operation, request_hash=before_hash)
+    result = context.executor._read(request, operation)
     assert result.execution_result["target_comparison"] is None
     assert len(context.reads) == 1 and context.lookups == []
+    assert "target_operation_id" not in context.reads[0][0]
     assert result.evidence_refs == ("test:measured-cut",)
+    assert request.semantic_content_hash == before_hash
+    assert dict(request.parameters) == before_parameters
+    assert ("target_operation_id" not in request.parameters) == omit_target
 
 
 def test_historical_terminal_timestamp_does_not_retime_the_current_measurement(context):

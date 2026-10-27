@@ -125,8 +125,11 @@ def test_schema_extends_detached_v1_wire_without_mutation_or_new_source_fields()
     for name, extra in (("parameter_schema", "target_operation_id"), ("execution_result_schema", "target_comparison")):
         extended = deepcopy(wire[name])
         assert set(extended["properties"]) == set(old[name]["properties"]) | {extra}
-        assert set(extended["required"]) == set(old[name]["required"]) | {extra}
-        extended["properties"].pop(extra); extended["required"].remove(extra)
+        required_extra = {extra} if name == "execution_result_schema" else set()
+        assert set(extended["required"]) == set(old[name]["required"]) | required_extra
+        extended["properties"].pop(extra)
+        if required_extra:
+            extended["required"].remove(extra)
         assert _bytes(extended) == _bytes(old[name])
     assert entry.task_evaluation_schema_hash == base.task_evaluation_schema_hash
     assert wire["task_evaluation_schema"] == old["task_evaluation_schema"]
@@ -157,18 +160,38 @@ def test_explicit_null_and_comparison_are_valid_without_mutating_inputs(componen
     assert (parameters, result) == before
 
 
-def test_old_four_parameters_remain_v1_and_are_never_defaulted_to_v2_null():
+def test_four_parameters_are_state_only_in_both_versions_without_rewriting_inputs():
     parameters = _parameters(None); parameters.pop("target_operation_id")
+    before = _bytes(parameters)
     validate_agent_state_parameters_v1(schema_kind="tcp_pose", parameters=parameters, allowed_component_ids=COMPONENTS)
     v1_result = _result(None); v1_result.pop("target_comparison")
     validate_agent_state_result_v1(schema_kind="tcp_pose", parameters=parameters, result=v1_result, allowed_component_ids=COMPONENTS)
-    with pytest.raises(ValueError, match="explicit target_operation_id"):
-        _validate_parameters(parameters)
-    with pytest.raises(ValueError):
-        _validate_result(_result(None), parameters)
+    _validate_parameters(parameters)
+    _validate_result(_result(None), parameters)
+    assert _bytes(parameters) == before
     assert "target_operation_id" not in parameters
+    # V2 still has a distinct result envelope, even for a state-only query.
     with pytest.raises(ValueError, match="target_comparison"):
         _validate_result(v1_result)
+    with pytest.raises(ValueError, match="requires null target_comparison"):
+        _validate_result(_result(), parameters)
+
+
+@pytest.mark.parametrize("field", sorted(set(_parameters()) - {"target_operation_id"}))
+def test_state_only_keeps_all_v1_fields_required(field):
+    parameters = _parameters(None)
+    parameters.pop("target_operation_id")
+    parameters.pop(field)
+    with pytest.raises(ValueError, match="four V1 fields"):
+        _validate_parameters(parameters)
+
+
+def test_state_only_rejects_unknown_fields():
+    parameters = _parameters(None)
+    parameters.pop("target_operation_id")
+    parameters["latest_target"] = True
+    with pytest.raises(ValueError, match="four V1 fields"):
+        _validate_parameters(parameters)
 
 
 @pytest.mark.parametrize("target", ["", " ", " leading", "trailing ", "x" * 129, True, 1, [], {}])

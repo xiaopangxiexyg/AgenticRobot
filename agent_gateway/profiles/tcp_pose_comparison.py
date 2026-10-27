@@ -234,7 +234,7 @@ def build_tcp_pose_comparison_executor(
     def read(request, operation):
         registration.payload_validator.validate_parameters(request.parameters)
         source = None
-        if request.parameters["target_operation_id"] is not None:
+        if request.parameters.get("target_operation_id") is not None:
             source = _authenticate_target(
                 request=request, active_operation_id=operation.operation_id,
                 lookup_target=lookup_target, manifest=route_manifest,

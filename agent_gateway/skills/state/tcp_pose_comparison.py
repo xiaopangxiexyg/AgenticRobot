@@ -37,6 +37,7 @@ _PARAMETER_FIELDS = {
     "component_ids", "reference_frame_id", "controlled_frame_id",
     "max_measurement_age_ms", "target_operation_id",
 }
+_REQUIRED_PARAMETER_FIELDS = _PARAMETER_FIELDS - {"target_operation_id"}
 _COMPARISON_FIELDS = {
     "target_operation_id", "target_request_hash", "target_route_hash",
     "target_skill_version", "target_status", "target_execution_outcome",
@@ -86,10 +87,12 @@ def _finite_nonnegative(value: object, *, field_name: str) -> float:
 def _base_parameters(
     parameters: Mapping[str, Any], *, allowed_component_ids: tuple[str, ...],
 ) -> dict[str, Any]:
-    if not isinstance(parameters, Mapping) or set(parameters) != _PARAMETER_FIELDS:
-        raise ValueError("V2 requires exactly the four V1 fields and explicit target_operation_id.")
-    if parameters["target_operation_id"] is not None:
-        _operation_id(parameters["target_operation_id"])
+    if (not isinstance(parameters, Mapping)
+            or not _REQUIRED_PARAMETER_FIELDS <= set(parameters) <= _PARAMETER_FIELDS):
+        raise ValueError("V2 requires the four V1 fields and allows only optional target_operation_id.")
+    target = parameters.get("target_operation_id")
+    if target is not None:
+        _operation_id(target)
     base = {key: value for key, value in parameters.items() if key != "target_operation_id"}
     validate_agent_state_parameters_v1(
         schema_kind="tcp_pose", parameters=base,
@@ -109,7 +112,7 @@ def tcp_pose_comparison_definition_v2(
             "Read one fresh measured tool_tcp cut, optionally comparing it with an "
             "authenticated retained absolute motion.move_tcp_to_pose_safe v1/v2 target "
             "in the same fixed source, frame, tool and calibration context. "
-            "Explicit null requests state only. Report translation errors in metres, "
+            "Omit target_operation_id or use null for state only. Report translation errors in metres, "
             "full rotation errors in radians and original terminal status/outcomes. A current "
             "single-cut comparison proves no historical success, stability, HOLD, "
             "object effect or motion authorization. No motion or new task evaluation."
@@ -132,7 +135,6 @@ def tcp_pose_comparison_schema_entry_v2(
     parameters = wire["parameter_schema"]
     operation_id = {"type": "string", "minLength": 1, "maxLength": 128}
     parameters["properties"]["target_operation_id"] = {"anyOf": [operation_id, {"type": "null"}]}
-    parameters["required"].append("target_operation_id")
     result = wire["execution_result_schema"]
     poses = deepcopy(result["properties"]["pose_by_component"])
     errors = {}
@@ -269,10 +271,10 @@ def validate_tcp_pose_comparison_result_v2(
     )
     validate_tcp_pose_comparison_result_shape_v2(result)
     comparison = result["target_comparison"]
-    target = parameters["target_operation_id"]
+    target = parameters.get("target_operation_id")
     if target is None:
         if comparison is not None:
-            raise ValueError("Null target_operation_id requires null target_comparison.")
+            raise ValueError("Omitted or null target_operation_id requires null target_comparison.")
         return
     if comparison is None or comparison["target_operation_id"] != target:
         raise ValueError("Result target_operation_id does not match the query.")

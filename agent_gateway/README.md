@@ -1904,10 +1904,11 @@ RGB-D/SAM 得到的目标点、分割、物体尺寸/CAD、已估计手物关系
 ### 可选实测 TCP 与历史动作目标比较（显式 v2）
 
 两端 Gateway 的 `--enable-tcp-pose-comparison` 在保留 `state.read_tcp_pose@1` 的同时，
-额外发布同名 `state.read_tcp_pose@2`，默认关闭。上层通过现有精确 Route 暴露策略选择一个版本，
-不应把两个版本当成两个日常工具，也不能缺少 v2 时悄悄回退到 v1。
+额外发布同名 `state.read_tcp_pose@2`。当前 MuJoCo/real CLI 默认发布 v2，可用
+`--no-enable-tcp-pose-comparison` 显式关闭、保留 v1。上层通过现有精确版本和 Route
+暴露策略选择；不默认向模型重复暴露同一日常能力，显式选择的版本缺失时不能悄悄换版。
 
-v2 保留 v1 的四个参数，并要求显式提供 `target_operation_id`：
+v2 保留 v1 的四个必填参数，`target_operation_id` 可省略或显式为 `null`：
 
 ```json
 {
@@ -1919,10 +1920,16 @@ v2 保留 v1 的四个参数，并要求显式提供 `target_operation_id`：
 }
 ```
 
-`null` 仅读取当前状态；非空值必须引用同一客户端、会话、manifest 中尚被保留的终态
+省略或 `null` 仅读取当前状态，不查询历史、不自动选最近目标，也不向原始请求补写字段。
+非空值必须引用同一客户端、会话、manifest 中尚被保留的终态
 `motion.move_tcp_to_pose_safe@1/@2` **绝对目标请求**。当前部署没有发布对应运动版本时不能引用它。
 无法找到记录、记录未终止、参数/身份不匹配时明确失败，不猜测“最近一次动作”，也不接受调用方
 重新提供的目标位姿。具体组件、参考系与最大帧龄仍来自当前部署，示例不能跨部署直接套用。
+
+这是 v2 的兼容输入扩展：已有五字段请求的意义与返回格式保持不变，v1 不变。
+定义说明和参数 schema 修订后，registration、I/O 和 Route 按现有构造链重新计算并绑定哈希；
+客户端须消费当前 discovery。旧 v2 服务仍要求显式 `null`，不能在未知旧服务前静默省略，
+也不能沿用旧 manifest/哈希或改写已接纳请求来伪装兼容。
 
 返回原有新鲜单 cut 状态，加 `target_comparison`；其为 `null` 或包含原请求/Route hash、
 原 terminal 状态与 execution/task outcome、原目标、各目标组件的平移误差（米）与完整 SO(3)
