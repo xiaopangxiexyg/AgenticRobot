@@ -1204,6 +1204,14 @@ MuJoCo 组合显式使用 `--enable-grippers --no-realtime-worker`，或 factory
 但不发位置命令；反馈表明夹爪正在运动、状态无效或资源启动失败时，不发布 endpoint。
 机器人、相机、模型与夹爪均由 application 一次启动和关闭，不按 Skill 请求重建。
 
+在显式双夹爪 `--gripper-skill-version 2` 配置下，可添加
+`--gripper-startup-reconnect-on-fault16`：仅当启动反馈恰为
+`error_code=16 (0x0010)` 时，复用 backend 的串口重连接口，对该手尝试一次恢复；
+健康的另一手、相机和机械臂不重启。默认关闭，不用于运行中故障，不重复循环，
+不清故障寄存器、不发送开闭命令，也不等同于控制器断电或固件重启。
+重连前后记录设备身份、错误码和 readiness；只有重新读取的新鲜、无故障、静止反馈
+通过原有校验才发布 endpoint。若仍报 0x0010，启动失败并正常清理，由操作者处理设备。
+
 仅配置 backend 不授权开闭；操作者还须独立把 `set_gripper_state` 加入
 `--authorized-actions`。同一 Gateway 的 `gateway.operation` 独占资源及 operation store
 使机械臂和夹爪不能同时执行；不创建第二个 service、控制器或 admission 锁。

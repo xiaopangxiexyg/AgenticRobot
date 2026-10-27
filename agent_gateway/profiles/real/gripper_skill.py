@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import math
 import time
@@ -360,8 +361,11 @@ class ExclusiveRealGripperResources:
 
     def __init__(
         self, *, lower: Any, port: RealDmtacGripperControlPort | None = None,
-        ports: Mapping[str, RealDmtacGripperControlPort] | None = None
+        ports: Mapping[str, RealDmtacGripperControlPort] | None = None,
+        startup_reconnect_on_fault16: bool = False,
     ) -> None:
+        if not isinstance(startup_reconnect_on_fault16, bool):
+            raise TypeError("startup_reconnect_on_fault16 must be bool.")
         if port is not None:
             if ports is not None:
                 raise ValueError("Select single v1 or explicit bilateral v2 resources.")
@@ -394,10 +398,16 @@ class ExclusiveRealGripperResources:
             raise ValueError(
                 "Gripper Skill resources forbid startup opening/reset and automatic recovery."
             )
+        if startup_reconnect_on_fault16 and any(
+            not callable(getattr(port.backend, "force_reconnect_gripper", None))
+            for port in ports.values()
+        ):
+            raise TypeError("Startup reconnect requires force_reconnect_gripper().")
         self.lower = lower
         self.ports = dict(ports)
         self.port = port
         self._lower_start_attempted = False
+        self.startup_reconnect_on_fault16 = startup_reconnect_on_fault16
         self._hand_attempted: set[str] = set()
         self._hand_closed: set[str] = set()
         self._lower_closed = False
@@ -411,7 +421,33 @@ class ExclusiveRealGripperResources:
             for component, port in self.ports.items():
                 self._hand_attempted.add(component)
                 port.backend.start()
-                if not port.readiness().ready:
+                ready = port.readiness().ready
+                if not ready and self.startup_reconnect_on_fault16:
+                    report = port.backend.readiness_report()
+                    # Retry only the exact internal-communication fault, never a
+                    # bitmask containing additional faults or a serial timeout.
+                    if report.get("details", {}).get("gripper_error_code") == 0x0010:
+                        _LOG.warning(
+                            "DMTAC startup serial reconnect: component=%s attempt=1/1 report=%s",
+                            component,
+                            json.dumps(report, ensure_ascii=False, default=str),
+                        )
+                        reconnected = port.backend.force_reconnect_gripper(
+                            reason="gateway_startup_fault16_once"
+                        )
+                        ready = port.readiness().ready
+                        _LOG.warning(
+                            "DMTAC startup serial reconnect result: component=%s "
+                            "reconnected=%s ready=%s report=%s",
+                            component,
+                            reconnected,
+                            ready,
+                            json.dumps(port.backend.readiness_report(), ensure_ascii=False, default=str),
+                        )
+                        ready = bool(reconnected) and ready
+                if not ready:
+                    _LOG.error("DMTAC startup readiness failed: component=%s report=%s",
+                        component, json.dumps(port.backend.readiness_report(), ensure_ascii=False, default=str))
                     raise RuntimeError(f"{component} startup is not ready.")
                 sample = port.observe_state()
                 if sample.fault_code is not None or sample.moving is not False:

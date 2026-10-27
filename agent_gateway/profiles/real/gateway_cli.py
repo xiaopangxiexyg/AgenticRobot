@@ -155,7 +155,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--right-gripper-config",
         type=Path,
-        help="optional right DMTacGripperBackendConfig JSON for v1; v2 also requires --left-gripper-config; no startup opening/reset/recovery",
+        help="optional right DMTacGripperBackendConfig JSON for v1; v2 also requires --left-gripper-config; no startup opening/reset/fault clearing",
+    )
+    parser.add_argument(
+        "--gripper-startup-reconnect-on-fault16",
+        action="store_true",
+        help="explicit bilateral v2 only: one serial reconnect per gripper on startup error 0x0010; no reboot, fault clearing or opening",
     )
     parser.add_argument(
         "--camera-config",
@@ -898,6 +903,8 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("gripper v1 requires --authorized-side right")
     if bilateral and not all(hand_configs.values()):
         parser.error("provide both --left-gripper-config and --right-gripper-config")
+    if args.gripper_startup_reconnect_on_fault16 and (not bilateral or not all(hand_configs.values())):
+        parser.error("--gripper-startup-reconnect-on-fault16 requires --gripper-skill-version 2 and both gripper configs")
     if "set_gripper_state" in actions and (not args.right_gripper_config or (bilateral and not args.left_gripper_config)):
         parser.error(
             "set_gripper_state v2 requires both gripper configs" if bilateral
@@ -1298,6 +1305,7 @@ def main(argv: list[str] | None = None) -> int:
     composition = assemble_exclusive_rm65_agent_primitive_composition(
         right_gripper_backend=None if bilateral else gripper_backends.get("right"),
         gripper_backends=gripper_backends if bilateral else None,
+        gripper_startup_reconnect_on_fault16=args.gripper_startup_reconnect_on_fault16,
         authorized_gripper_sides=None
         if args.authorized_gripper_sides is None
         else tuple(args.authorized_gripper_sides),

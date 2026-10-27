@@ -406,7 +406,8 @@ def test_dual_motion_rejects_single_side_envelope_before_start(monkeypatch, tmp_
     assert guard.starts == 0 and all(backend.starts == 0 for backend in lower.arm_backends.values())
 
 
-def test_composition_advertises_right_gripper_without_starting_any_backend(monkeypatch):
+@pytest.mark.parametrize("startup_reconnect", [False, True])
+def test_composition_advertises_right_gripper_without_starting_any_backend(monkeypatch, startup_reconnect):
     from agent_gateway.profiles.real.gripper_skill import ExclusiveRealGripperResources
 
     lower, _ = _lower(monkeypatch)
@@ -424,6 +425,7 @@ def test_composition_advertises_right_gripper_without_starting_any_backend(monke
                 "hold_gripper_motion",
                 "is_ready",
                 "readiness_report",
+                "force_reconnect_gripper",
             }:
 
                 def forbidden(*args, **kwargs):
@@ -436,6 +438,7 @@ def test_composition_advertises_right_gripper_without_starting_any_backend(monke
     composition = assemble_exclusive_rm65_agent_primitive_composition(
         lower=lower,
         right_gripper_backend=hand,
+        gripper_startup_reconnect_on_fault16=startup_reconnect,
         socket_path=REPO_ROOT / "temp/test-gripper-composition.sock",
         authorized_side="right",
         authorized_actions=("move_tcp_to_pose", "set_gripper_state"),
@@ -450,6 +453,7 @@ def test_composition_advertises_right_gripper_without_starting_any_backend(monke
     assert isinstance(composition.resources, ExclusiveRealGripperResources)
     assert composition.resources.lower is lower.ports
     assert composition.resources.port.backend is hand
+    assert composition.resources.startup_reconnect_on_fault16 is startup_reconnect
     route = composition.deployment.gateway_session.contract_bundle.route_manifest.route(
         "manipulation.set_gripper_state", "1"
     ).route
