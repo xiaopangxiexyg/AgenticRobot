@@ -173,6 +173,37 @@ def test_dense_footprint_coverage_rejects_extrapolation_and_coarse_grid():
             region_min_xy_m=(0., 0.), region_max_xy_m=(1e12, 1e12))
 
 
+@pytest.mark.parametrize("swap_axes", [False, True])
+@pytest.mark.parametrize("large_intervals, within_budget", [
+    (49_999, True), (50_000, False), (66_000, False),
+])
+def test_exact_integer_grid_budget_before_allocation(monkeypatch, swap_axes,
+                                                   large_intervals, within_budget):
+    cut = capture()
+    selected = mask()
+    plane = project_depth_mask_support_surface(
+        cut, selected, mask_clipped=False, maximum_depth_m=2.)
+    # Binary-exact sizes distinguish the inclusive 100000-point boundary
+    # from ceil expansion without floating-point boundary ambiguity.
+    resolution = 2. ** -20
+    span = np.asarray((.5 * resolution, large_intervals * resolution))
+    if swap_axes:
+        span = span[::-1]
+    kwargs = dict(region_min_xy_m=tuple(-span / 2),
+                  region_max_xy_m=tuple(span / 2), resolution_m=resolution)
+    if within_budget:
+        result = check_observed_support_footprint(cut, selected, plane, **kwargs)
+        assert result.sample_count == 100_000
+        assert result.maximum_measured_plane_residual_m < 1e-9
+    else:
+        def unexpected_allocation(*args, **kwargs):
+            raise AssertionError("Over-budget grid must be rejected before allocation")
+
+        monkeypatch.setattr(np, "meshgrid", unexpected_allocation)
+        with pytest.raises(ValueError, match="bounded sample budget"):
+            check_observed_support_footprint(cut, selected, plane, **kwargs)
+
+
 def known_support_for_cut():
     transform = np.eye(4)
     transform[:3, 3] = (0., 0., -.02)
