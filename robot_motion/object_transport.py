@@ -364,6 +364,7 @@ def plan_release_approach(
     maximum_measurement_age_sec: float = .2,
     maximum_pair_skew_sec: float = .05,
     lateral_margin_m: float = 0.,
+    target_box_center_xy_m: tuple[float, float] | None = None,
 ) -> ReleaseApproachProposal:
     """Center a fully bounded held box above a measured support without contact.
 
@@ -403,7 +404,18 @@ def plan_release_approach(
     rotation = held.reference_from_object[:3, :3]
     offsets = corners_object @ rotation.T
     low, high = offsets.min(axis=0), offsets.max(axis=0)
-    center_xy = (np.asarray(support.region_min_xy_m) + support.region_max_xy_m) / 2.
+    support_center_xy = (np.asarray(support.region_min_xy_m)
+                         + support.region_max_xy_m) / 2.
+    if target_box_center_xy_m is None:
+        center_xy = support_center_xy
+    else:
+        if (not isinstance(target_box_center_xy_m, (tuple, list, np.ndarray))
+                or len(target_box_center_xy_m) != 2
+                or any(isinstance(value, (bool, np.bool_)) for value in target_box_center_xy_m)):
+            raise ValueError("Target box center must be finite Station XY")
+        center_xy = np.asarray(target_box_center_xy_m, dtype=float)
+        if center_xy.shape != (2,) or not np.isfinite(center_xy).all():
+            raise ValueError("Target box center must be finite Station XY")
     # Align the complete box center, not an arbitrary object-frame origin.
     object_center_offset = rotation @ box[:3, 3]
     object_goal = held.reference_from_object.copy()
@@ -412,7 +424,7 @@ def plan_release_approach(
     # The support plane crosses (center_x, center_y, top_z_m). Solve the
     # minimum signed distance of every rotated box corner, including slope.
     corner_xy = object_goal[:2, 3] + offsets[:, :2]
-    signed_without_object_z = ((corner_xy - center_xy) @ normal[:2]
+    signed_without_object_z = ((corner_xy - support_center_xy) @ normal[:2]
                                + (offsets[:, 2] - support.top_z_m) * normal[2])
     object_goal[2, 3] = (clearance_m - float(np.min(signed_without_object_z))) / normal[2]
     footprint_min = object_goal[:2, 3] + low[:2]

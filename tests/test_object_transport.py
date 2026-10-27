@@ -350,6 +350,46 @@ def test_release_approach_preserves_full_box_clearance_above_a_tilted_plane():
     assert signed.min() == pytest.approx(.004, abs=1e-12)
 
 
+def test_release_target_can_use_an_observed_offcenter_relation_goal():
+    held = observation(box_size_m=(.035, .035, .035),
+        reference_from_object=pose((-.3, 0., .08)),
+        reference_from_tool=pose((-.31, .01, .15)))
+    surface = support(region_min_xy_m=(-.4, -.1),
+                      region_max_xy_m=(-.2, .1))
+    result = plan_release_approach(
+        held, surface, now=10.02, clearance_m=.006,
+        minimum_planning_clearance_m=.004, maximum_clearance_m=.05,
+        lateral_margin_m=.005,
+        target_box_center_xy_m=(-.35, .04))
+    np.testing.assert_allclose(result.object_goal[:3, 3], (-.35, .04, .0235))
+    np.testing.assert_allclose(result.tool_goal @ held.tool_from_object,
+                               result.object_goal)
+    with pytest.raises(ValueError, match="footprint"):
+        plan_release_approach(
+            held, surface, now=10.02, clearance_m=.006,
+            minimum_planning_clearance_m=.004, maximum_clearance_m=.05,
+            lateral_margin_m=.005,
+            target_box_center_xy_m=(-.39, .04))
+
+
+def test_offcenter_release_uses_support_plane_anchor_not_target_center():
+    held = observation(box_size_m=(.035, .035, .035),
+        reference_from_object=pose((-.3, 0., .08)),
+        reference_from_tool=pose((-.31, .01, .15)))
+    normal = (-.015707317311820675, 0., .9998766324816606)
+    surface = support(normal_reference_xyz=normal)
+    result = plan_release_approach(
+        held, surface, now=10.02, clearance_m=.006,
+        minimum_planning_clearance_m=.004, maximum_clearance_m=.05,
+        target_box_center_xy_m=(-.35, .04))
+    half = np.asarray(held.box_size_m) / 2.
+    corners = np.asarray([(x, y, z) for x in (-half[0], half[0])
+                          for y in (-half[1], half[1]) for z in (-half[2], half[2])])
+    world = (result.object_goal[:3, :3] @ corners.T).T + result.object_goal[:3, 3]
+    anchor = np.array([-.3, 0., surface.top_z_m])
+    assert np.min((world - anchor) @ np.asarray(normal)) == pytest.approx(.006)
+
+
 @pytest.mark.parametrize("change", [
     dict(clearance_m=.0015), dict(clearance_m=.051),
     dict(clearance_m=float("nan")), dict(clearance_m=True),
@@ -357,6 +397,9 @@ def test_release_approach_preserves_full_box_clearance_above_a_tilted_plane():
     dict(maximum_pair_skew_sec=-.01), dict(now=10.3),
     dict(maximum_measurement_age_sec=True),
     dict(maximum_measurement_age_sec=np.bool_(True)),
+    dict(target_box_center_xy_m=(True, 0.)),
+    dict(target_box_center_xy_m=(float("nan"), 0.)),
+    dict(target_box_center_xy_m=0.),
     dict(support_override=dict(measured_at=9.9)),
     dict(support_override=dict(scene_revision=2)),
     dict(support_override=dict(reference_frame_id="camera")),
