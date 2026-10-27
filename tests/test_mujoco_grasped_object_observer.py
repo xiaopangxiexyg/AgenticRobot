@@ -52,6 +52,51 @@ def test_contact_verified_close_waits_for_settled_hand_before_freezing_relation(
     np.testing.assert_array_equal(observer.latest.tool_from_object, frozen)
 
 
+def test_selected_object_support_does_not_count_a_table_fall_as_release():
+    plant, observer = _observer(track_close_contacts=True)
+    observer.support_body_names = ("table", "box")
+    plant.touching_support = "table"
+    original_capture = observer._capture
+
+    def capture(scene, source_data=None, *, support_body_name=None):
+        stamp, obj, tcp, sides, _support, _other, measured, com = original_capture(
+            scene, source_data)
+        selected = support_body_name or observer.active_support_body_name
+        return (stamp, obj, tcp, sides,
+                bool(plant.support and plant.touching_support == selected),
+                bool(plant.support and plant.touching_support != selected),
+                measured, com)
+
+    observer._capture = capture
+    _lift(plant, observer)
+    frozen = observer.latest.tool_from_object.copy()
+    with pytest.raises(ObjectMotionPreconditionError, match="admitted object identity"):
+        observer.observe(phase="place", place_support_body_name="foreign")
+    assert observer._failure is None
+    assert observer.active_support_body_name == "table"
+    observer.observe(phase="place", establish=True, place_support_body_name="box")
+    assert observer.active_support_body_name == "table"
+    observer.observe(phase="place", source_data=plant.scene.data,
+                     place_support_body_name="box")
+    assert observer.active_support_body_name == "box"
+    plant.support, plant.touching_support = True, "box"
+    plant.time += .01
+    _physics_observation(plant, observer)
+    assert observer.latest.support_contact and not observer.latest.other_contact
+    np.testing.assert_array_equal(observer.latest.tool_from_object, frozen)
+
+    plant.command, plant.sides, plant.touching_support = (2, 0.), (False, False), "table"
+    for _ in range(62):
+        plant.time += .01
+        _physics_observation(plant, observer)
+    release = observer.diagnostic_snapshot()["release_observation"]
+    assert release is not None and not release["stable_supported_release"]
+    assert observer.active_support_body_name == "box"
+    plant.command = (3, 1.)
+    _physics_observation(plant, observer)
+    assert observer.active_support_body_name == "table"
+
+
 def _lift(plant, observer):
     first = observer.observe(phase="lift", establish=True)
     assert first.status == "contact_secured"

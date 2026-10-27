@@ -62,6 +62,8 @@ class MujocoGraspedObjectObserver:
         self.object_body_name = object_body_name
         self.sensor_geom_names = tuple(sensor_geom_names)
         self.support_body_names = tuple(support_body_names)
+        if len(set(self.support_body_names)) != len(self.support_body_names):
+            raise ValueError("Object supports must have unique native identities.")
         self.gripper_name = gripper_name
         self.command_state = command_state
         self.world_tcp_from_scene = world_tcp_from_scene
@@ -78,6 +80,7 @@ class MujocoGraspedObjectObserver:
                 or not self.support_body_names or not callable(command_state)
                 or not callable(world_tcp_from_scene)):
             raise ValueError("Object observation requires two sensors, supports and measured callbacks.")
+        self._active_support_body_name = self.support_body_names[0]
         self._generation = None
         self._anchor = None
         self._initial_z = self._initial_tcp_z = None
@@ -113,6 +116,10 @@ class MujocoGraspedObjectObserver:
             position_tolerance_m=.002, rotation_tolerance_rad=.05))
             if released_verified_grasp else None)
         self._generation = generation
+        # Preserve the selected place support across opening so the release
+        # window cannot call a fall onto the table a supported placement.
+        if target == 1.:
+            self._active_support_body_name = self.support_body_names[0]
         self._anchor = self._last = self._window_start = None
         self._verified = False
         self._window_count = 0
@@ -120,7 +127,11 @@ class MujocoGraspedObjectObserver:
         self._tracking_phase = None
         self._last_physics_cut_time = None
 
-    def _capture(self, scene, source_data=None):
+    @property
+    def active_support_body_name(self):
+        return self._active_support_body_name
+
+    def _capture(self, scene, source_data=None, *, support_body_name=None):
         model, mj = scene.model, scene.mujoco
         if self._scratch is None:
             self._scratch, self._model = mj.MjData(model), model
@@ -137,7 +148,10 @@ class MujocoGraspedObjectObserver:
             raise ValueError("Object observation has nonfinite native state.")
         body = int(model.body(self.object_body_name).id)
         sensors = tuple(int(model.geom(name).id) for name in self.sensor_geom_names)
-        supports = {int(model.body(name).id) for name in self.support_body_names}
+        selected_support = self._active_support_body_name if support_body_name is None else support_body_name
+        if selected_support not in self.support_body_names:
+            raise ValueError("Object support is not in the deployed allowlist.")
+        supports = {int(model.body(selected_support).id)}
         target_geoms = set(np.flatnonzero((model.geom_bodyid == body)
                            & ((model.geom_contype != 0) | (model.geom_conaffinity != 0))).tolist())
         touching = set()
@@ -157,14 +171,20 @@ class MujocoGraspedObjectObserver:
                 supported, other, float(view.get_gripper_close(self.gripper_name)),
                 tuple(float(value) for value in data.xipos[body]))
 
-    def observe(self, *, phase, establish=False, source_data=None):
+    def observe(self, *, phase, establish=False, source_data=None, place_support_body_name=None):
         """Consume a same-cut measurement. A new close is not a grasp proof."""
         if phase not in {"lift", "carry", "place"}:
             raise ValueError("Object observation requires a lift, carry or place phase.")
+        if place_support_body_name is not None and (
+            phase != "place" or place_support_body_name not in self.support_body_names
+        ):
+            raise ObjectMotionPreconditionError("Place support is not an admitted object identity.")
         return self.rig.capture_scene(lambda scene: self._observe(
-            scene, phase=phase, establish=establish, source_data=source_data))
+            scene, phase=phase, establish=establish, source_data=source_data,
+            place_support_body_name=place_support_body_name))
 
-    def _observe(self, scene, *, phase, establish=False, source_data=None):
+    def _observe(self, scene, *, phase, establish=False, source_data=None,
+                 place_support_body_name=None):
         # State updates and native capture share the original physics-owner lock.
         at_physics_cut = (source_data is not None and scene is not None
                           and source_data is scene.data)
@@ -174,7 +194,10 @@ class MujocoGraspedObjectObserver:
         if self._failure is not None:
             raise ObjectRelationInvalidated("Object relation invalidated: " + self._failure)
         try:
-            stamp, obj, tcp, sides, support, other, measured, com = self._capture(scene, source_data)
+            selected = ({} if place_support_body_name is None else
+                        {"support_body_name": place_support_body_name})
+            stamp, obj, tcp, sides, support, other, measured, com = self._capture(
+                scene, source_data, **selected)
             if target != 1.0 or not self.measured_closed(measured):
                 raise ObjectRelationInvalidated("Actual closed command and measured closure are required.")
             if support and phase == "carry" and not self._verified:
@@ -237,6 +260,8 @@ class MujocoGraspedObjectObserver:
                 self._tracking_phase = phase
             if at_physics_cut:
                 self._last_physics_cut_time = stamp
+                if phase == "place" and place_support_body_name is not None:
+                    self._active_support_body_name = place_support_body_name
             return self._last
         except ObjectMotionPreconditionError:
             raise
