@@ -51,9 +51,13 @@ def test_fixed_box_support_reads_native_model_with_same_depth_cut_and_closes():
             depth_role="main",
             current_station_revision=lambda: 0,
         )
-        depth, observed = port.capture_fixed_support(
+        paired, observed = port.capture_fixed_support(
             support_id=app.task_config.table_body_name,
             expected_station_revision=0)
+        depth = paired.depth
+        assert paired.rgb.source_id == depth.source_id == "front"
+        assert paired.rgb.station_revision == depth.station_revision == 0
+        assert paired.rgb_jpeg is not None and paired.depth_npy is not None
         assert observed.geometry_complete is True
         assert observed.measured_at == depth.captured_at
         assert observed.scene_revision == depth.station_revision

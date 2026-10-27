@@ -11,7 +11,7 @@ from collections.abc import Callable
 
 import numpy as np
 
-from agent_gateway.profiles.back_projection import LiveAlignedDepthCapture
+from agent_gateway.profiles.back_projection import CorrelatedPlacementCapture
 from dataset_contracts.canonical_encoding import canonical_content_hash
 from robot_motion.object_transport import CalibratedBoxSupportObservation
 from sim.mujoco.deploy.target_measurement import MUJOCO_SIM_HIL_WORLD_FRAME_ID_V1
@@ -65,14 +65,15 @@ class MujocoFixedBoxSupportPort:
         *,
         support_id: str,
         expected_station_revision: int,
-    ) -> tuple[LiveAlignedDepthCapture, CalibratedBoxSupportObservation]:
+    ) -> tuple[CorrelatedPlacementCapture, CalibratedBoxSupportObservation]:
         if support_id not in self.allowed_support_body_names:
             raise ValueError("Support identity is outside the deployed allowlist")
         revision = self.current_station_revision()
         if isinstance(expected_station_revision, bool) or expected_station_revision != revision:
             raise ValueError("Fixed support request uses another Station revision")
-        paired_depth = self.depth_capture_port.capture_aligned_depth(
+        paired_rgbd = self.depth_capture_port.capture_placement_rgbd(
             role=self.depth_role, expected_station_revision=revision)
+        paired_depth = paired_rgbd.depth
 
         def read(scene):
             model = scene.model
@@ -125,4 +126,4 @@ class MujocoFixedBoxSupportPort:
             geometry_evidence_ref=geometry_ref, pose_evidence_ref=pose_ref,
             geometry_complete=True,
         )
-        return paired_depth, box
+        return paired_rgbd, box
