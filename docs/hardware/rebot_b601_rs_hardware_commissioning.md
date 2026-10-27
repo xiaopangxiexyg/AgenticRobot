@@ -918,6 +918,12 @@ GUI 应选择「J2/J3 位姿采集」，不是「固定位置」或另一项 20�
 `motion_max_reference_lag_rad=0.02925` 不替代原 motion 默认 `0.013 rad`。
 连续辨识同样须显式传入下面的 v2 profile，默认不采集、不拟合、不应用候选。
 
+后续试验使用独立的显式配置：
+[巡航速度反馈](profiles/b601_j2_j3_cruise_identification_v1.json)、
+[四中心双向多速度](profiles/b601_j2_j3_four_centres_cruise_identification_v1.json)、
+[近零命令场对照](profiles/b601_j2_j3_near_zero_command_field_v1.json)。
+这些新配置的 v1 名称属于各自试验身份，不覆盖原 coverage/continuous v1 或主线显式 v2。
+
 运动拟合还需核对所选关节 native tracker 的阶段：外层 console 为 `track` 不代表内部
 仍在巡航。已记录 native axes 时，只接纳所选轴 `track/bounded_reference_tracking` 的
 区间；端点 `target_reached_braking`、到位调整及其他阶段记为
