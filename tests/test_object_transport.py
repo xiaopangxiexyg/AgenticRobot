@@ -6,6 +6,7 @@ import pytest
 from scipy.spatial.transform import Rotation
 
 from robot_motion.object_transport import (
+    CalibratedBoxSupportObservation,
     GraspedObjectObservation,
     SupportSurfaceObservation,
     object_translation_feedback_tool_goal,
@@ -174,6 +175,128 @@ def support(**overrides):
         geometry_complete=True)
     values.update(overrides)
     return SupportSurfaceObservation(**values)
+
+
+def known_box_support(**overrides):
+    values = dict(
+        support_id="table", reference_frame_id="world", scene_revision=1,
+        measured_at=10., reference_from_box=pose((-.3, 0., -.02)),
+        box_size_m=(.07, .07, .04),
+        geometry_evidence_ref="catalog:known-table-box",
+        pose_evidence_ref="registered-rgbd:table-pose",
+        geometry_complete=True,
+    )
+    values.update(overrides)
+    return CalibratedBoxSupportObservation(**values)
+
+
+def bind_known_box(box, **overrides):
+    values = dict(
+        plane_measured_at=10.01, measured_upper_top_z_m=.002,
+        measured_normal_reference_xyz=(0., 0., 1.),
+        measured_region_center_xy_m=(-.3, 0.),
+        depth_evidence_ref="rgbd:top-plane", lateral_uncertainty_m=.005,
+        vertical_uncertainty_m=.002,
+    )
+    values.update(overrides)
+    return box.bind_measured_top(**values)
+
+
+def test_known_box_and_measured_plane_produce_inscribed_support_not_outer_aabb():
+    box = known_box_support()
+    observed = bind_known_box(box)
+    assert observed.geometry_complete is True
+    assert observed.support_id == "table"
+    assert observed.top_z_m == pytest.approx(.004)
+    np.testing.assert_allclose(observed.region_min_xy_m, (-.33, -.03))
+    np.testing.assert_allclose(observed.region_max_xy_m, (-.27, .03))
+    held = observation(object_id="cube", box_size_m=(.035, .035, .035),
+                       reference_from_object=pose((-.3, 0., .0566)),
+                       reference_from_tool=pose((-.31, .01, .15)))
+    proposed = plan_release_approach(
+        held, observed, now=10.02, clearance_m=.006,
+        minimum_planning_clearance_m=.004, maximum_clearance_m=.05,
+        lateral_margin_m=.005)
+    assert proposed.object_goal[2, 3] == pytest.approx(.0275)
+    assert proposed.support_id == observed.support_id
+    assert observed.evidence_ref.startswith("support-box-fusion:")
+    assert not box.reference_from_box.flags.writeable
+
+
+def test_rotated_known_box_uses_inner_square_not_unsafe_outer_bounds():
+    box = known_box_support(reference_from_box=pose((-.3, 0., -.02), (0., 0., 45.)))
+    observed = bind_known_box(box)
+    radius = .035 / math.sqrt(2.) - .005
+    assert observed.region_max_xy_m[0] == pytest.approx(-.3 + radius)
+    assert observed.region_max_xy_m[1] == pytest.approx(radius)
+    assert observed.region_max_xy_m[0] < -.3 + .035 * math.sqrt(2.)
+    with pytest.raises(ValueError, match="footprint"):
+        plan_release_approach(
+            observation(object_id="cube", box_size_m=(.035, .035, .035)),
+            observed, now=10.02, clearance_m=.006,
+            minimum_planning_clearance_m=.004, maximum_clearance_m=.05,
+            lateral_margin_m=.005)
+
+
+def test_fused_tilted_plane_dominates_measured_upper_plane_at_all_region_corners():
+    box = known_box_support(
+        reference_from_box=pose((0., 0., -.49), (.9, 0., 0.)),
+        box_size_m=(1., 1., 1.),
+    )
+    surface = bind_known_box(
+        box, measured_upper_top_z_m=.0149,
+        measured_region_center_xy_m=(0., 0.),
+        lateral_uncertainty_m=0., vertical_uncertainty_m=0.,
+    )
+    for x in surface.region_min_xy_m[0], surface.region_max_xy_m[0]:
+        for y in surface.region_min_xy_m[1], surface.region_max_xy_m[1]:
+            center = (np.asarray(surface.region_min_xy_m)
+                      + surface.region_max_xy_m) / 2.
+            normal = np.asarray(surface.normal_reference_xyz)
+            fused_z = surface.top_z_m - (
+                normal[:2] @ (np.array([x, y]) - center)
+            ) / normal[2]
+            assert fused_z >= .0149 - 1e-12
+
+
+def test_fused_support_checks_each_source_time_against_held_and_now():
+    box = known_box_support(measured_at=10.)
+    fused = bind_known_box(box, plane_measured_at=10.04)
+    assert fused.measured_at == 10.04
+    assert fused.source_measurement_times_sec == (10., 10.04)
+    held = observation(measured_at=10.04, box_size_m=(.035, .035, .035),
+                       reference_from_object=pose((-.3, 0., .08)))
+    with pytest.raises(ValueError, match="fresh correlated"):
+        plan_release_approach(
+            held, fused, now=10.23, clearance_m=.006,
+            minimum_planning_clearance_m=.004, maximum_clearance_m=.05)
+    with pytest.raises(ValueError, match="fresh correlated"):
+        plan_release_approach(
+            replace(held, measured_at=10.085), fused, now=10.10,
+            clearance_m=.006, minimum_planning_clearance_m=.004,
+            maximum_clearance_m=.05)
+
+
+def test_fused_support_rejects_dropped_constituent_timestamp():
+    with pytest.raises(ValueError, match="retain both"):
+        support(measured_at=10.04, source_measurement_times_sec=(10.,))
+
+
+@pytest.mark.parametrize("box_change, plane_change, reason", [
+    (dict(geometry_complete=False), {}, "visible or unknown"),
+    (dict(box_size_m=(.07, 0., .04)), {}, "positive finite"),
+    (dict(box_size_m=(.07, True, .04)), {}, "positive finite"),
+    ({}, dict(plane_measured_at=10.2), "correlated cut"),
+    ({}, dict(measured_upper_top_z_m=.02), "top height disagree"),
+    ({}, dict(measured_normal_reference_xyz=(0., 1., 0.)), "orientation"),
+    ({}, dict(measured_region_center_xy_m=(0., 0.)), "outside the bound"),
+    ({}, dict(lateral_uncertainty_m=.04), "no conservative inner region"),
+])
+def test_known_box_fusion_rejects_unknown_geometry_or_bad_observation(
+    box_change, plane_change, reason,
+):
+    with pytest.raises(ValueError, match=reason):
+        bind_known_box(known_box_support(**box_change), **plane_change)
 
 
 def test_release_approach_uses_full_held_box_and_measured_surface_not_visible_center():

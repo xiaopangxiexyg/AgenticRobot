@@ -10,6 +10,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass
 from itertools import product
+import hashlib
 import math
 from types import MappingProxyType
 
@@ -162,6 +163,7 @@ class SupportSurfaceObservation:
     region_max_xy_m: tuple[float, float]
     evidence_ref: str
     geometry_complete: bool
+    source_measurement_times_sec: tuple[float, ...] = ()
 
     def __post_init__(self):
         for name in ("support_id", "reference_frame_id", "evidence_ref"):
@@ -188,6 +190,151 @@ class SupportSurfaceObservation:
             object.__setattr__(self, name, tuple(float(value) for value in values))
         if any(low >= high for low, high in zip(self.region_min_xy_m, self.region_max_xy_m)):
             raise ValueError("Support bounds must have positive area")
+        times = tuple(self.source_measurement_times_sec)
+        if times:
+            if (len(times) != 2 or any(isinstance(value, (bool, np.bool_))
+                    or not math.isfinite(value) or value < 0 for value in times)
+                    or self.measured_at != max(times)):
+                raise ValueError("Fused support must retain both source measurement times")
+        object.__setattr__(self, "source_measurement_times_sec", times)
+
+
+@dataclass(frozen=True)
+class CalibratedBoxSupportObservation:
+    """A complete known box and its measured pose; no native-body privilege is required.
+
+    The producer must bind the box identity to its geometry catalog and the
+    pose to an actual observation. A visible top face by itself is insufficient.
+    This type does not grant motion or infer that a box is still stationary.
+    """
+
+    support_id: str
+    reference_frame_id: str
+    scene_revision: int
+    measured_at: float
+    reference_from_box: np.ndarray
+    box_size_m: tuple[float, float, float]
+    geometry_evidence_ref: str
+    pose_evidence_ref: str
+    geometry_complete: bool
+
+    def __post_init__(self):
+        for name in ("support_id", "reference_frame_id", "geometry_evidence_ref",
+                     "pose_evidence_ref"):
+            value = getattr(self, name)
+            if not isinstance(value, str) or not value or value.strip() != value:
+                raise ValueError(f"{name} must identify an authenticated support source")
+        if (isinstance(self.scene_revision, bool) or not isinstance(self.scene_revision, int)
+                or self.scene_revision < 0 or isinstance(self.measured_at, (bool, np.bool_))
+                or not math.isfinite(self.measured_at) or self.measured_at < 0):
+            raise ValueError("Support pose revision and time are invalid")
+        if self.geometry_complete is not True:
+            raise ValueError("A visible or unknown box cannot certify complete support")
+        if any(isinstance(x, (bool, np.bool_)) for x in self.box_size_m):
+            raise ValueError("Known support box needs positive finite dimensions")
+        size = np.asarray(self.box_size_m, dtype=float)
+        if size.shape != (3,) or not np.isfinite(size).all() or np.any(size <= 0):
+            raise ValueError("Known support box needs positive finite dimensions")
+        object.__setattr__(self, "box_size_m", tuple(float(x) for x in size))
+        object.__setattr__(self, "reference_from_box",
+                           rigid_pose(self.reference_from_box, name="observed support box pose"))
+
+    def bind_measured_top(
+        self,
+        *,
+        plane_measured_at: float,
+        measured_upper_top_z_m: float,
+        measured_normal_reference_xyz: tuple[float, float, float],
+        measured_region_center_xy_m: tuple[float, float],
+        depth_evidence_ref: str,
+        lateral_uncertainty_m: float,
+        vertical_uncertainty_m: float,
+        maximum_pair_skew_sec: float = .05,
+        maximum_top_disagreement_m: float = .005,
+    ) -> SupportSurfaceObservation:
+        """Fuse a measured plane with a known complete box into an inner region.
+
+        The square is inscribed in the top face after XY projection, including
+        yaw and small tilt, then shrunk by the supplied lateral uncertainty.
+        The top height is the larger of model and measured upper bounds plus
+        vertical uncertainty. Consumer collision checking remains authoritative.
+        """
+        if not isinstance(depth_evidence_ref, str) or not depth_evidence_ref.strip():
+            raise ValueError("Measured support plane requires depth evidence")
+        for name, value in (("plane_measured_at", plane_measured_at),
+                            ("measured_upper_top_z_m", measured_upper_top_z_m),
+                            ("lateral_uncertainty_m", lateral_uncertainty_m),
+                            ("vertical_uncertainty_m", vertical_uncertainty_m),
+                            ("maximum_pair_skew_sec", maximum_pair_skew_sec),
+                            ("maximum_top_disagreement_m", maximum_top_disagreement_m)):
+            if (isinstance(value, (bool, np.bool_)) or not math.isfinite(value)
+                    or value < 0):
+                raise ValueError(f"{name} must be finite and nonnegative")
+        if (maximum_pair_skew_sec <= 0 or maximum_pair_skew_sec > .05
+                or maximum_top_disagreement_m <= 0 or maximum_top_disagreement_m > .005
+                or abs(self.measured_at - plane_measured_at) > maximum_pair_skew_sec):
+            raise ValueError("Support pose and plane are not a correlated cut")
+        measured_normal = np.asarray(measured_normal_reference_xyz, dtype=float)
+        if (measured_normal.shape != (3,) or not np.isfinite(measured_normal).all()
+                or not math.isclose(float(np.linalg.norm(measured_normal)), 1., abs_tol=1e-6)):
+            raise ValueError("Measured support normal is invalid")
+        rotation = self.reference_from_box[:3, :3]
+        model_normal = rotation[:, 2]
+        if (model_normal[2] < math.cos(math.radians(1.))
+                or measured_normal[2] < math.cos(math.radians(1.))
+                or float(np.dot(model_normal, measured_normal)) < math.cos(math.radians(2.))):
+            raise ValueError("Support model and measured top plane disagree in orientation")
+        half = np.asarray(self.box_size_m) / 2.
+        center = self.reference_from_box[:3, 3] + rotation @ np.array([0., 0., half[2]])
+        projected_axes = rotation[:2, :2]
+        inverse_axes = np.linalg.inv(projected_axes)
+        radius = min(half[0] / np.sum(np.abs(inverse_axes[0])),
+                     half[1] / np.sum(np.abs(inverse_axes[1]))) - lateral_uncertainty_m
+        if not math.isfinite(radius) or radius <= 0:
+            raise ValueError("Known support top has no conservative inner region")
+        measured_center_xy = np.asarray(measured_region_center_xy_m, dtype=float)
+        if measured_center_xy.shape != (2,) or not np.isfinite(measured_center_xy).all():
+            raise ValueError("Measured support patch center must be finite Station XY")
+        local_patch_center = inverse_axes @ (measured_center_xy - center[:2])
+        local_uncertainty = lateral_uncertainty_m * np.sum(np.abs(inverse_axes), axis=1)
+        if np.any(np.abs(local_patch_center) + local_uncertainty >= half[:2]):
+            raise ValueError("Measured top patch is outside the bound support box")
+        model_z_at_patch = center[2] - (model_normal[:2]
+            @ (measured_center_xy - center[:2])) / model_normal[2]
+        if abs(model_z_at_patch - measured_upper_top_z_m) > maximum_top_disagreement_m:
+            raise ValueError("Support model and measured top height disagree")
+        corners = np.asarray(tuple(product((-1., 1.), repeat=2)), dtype=float)
+        region_corners_xy = center[:2] + corners * radius
+        measured_z_at_corners = measured_upper_top_z_m - (
+            (region_corners_xy - measured_center_xy) @ measured_normal[:2]
+        ) / measured_normal[2]
+        model_slope_at_corners = -(
+            (region_corners_xy - center[:2]) @ model_normal[:2]
+        ) / model_normal[2]
+        # A single output plane retains the known box normal, but its center
+        # height must dominate the measured plane at *every* corner. The
+        # maximum of two affine planes occurs at one of these corners.
+        top_z = max(center[2], float(np.max(measured_z_at_corners - model_slope_at_corners)))
+        top_z += vertical_uncertainty_m
+        identity = (self.geometry_evidence_ref, self.pose_evidence_ref,
+                    depth_evidence_ref, self.support_id, self.reference_frame_id,
+                    str(self.scene_revision))
+        evidence_ref = "support-box-fusion:" + hashlib.sha256(
+            "\0".join(identity).encode("utf-8")
+        ).hexdigest()
+        return SupportSurfaceObservation(
+            support_id=self.support_id,
+            reference_frame_id=self.reference_frame_id,
+            scene_revision=self.scene_revision,
+            measured_at=max(self.measured_at, plane_measured_at),
+            top_z_m=top_z,
+            normal_reference_xyz=tuple(float(x) for x in model_normal),
+            region_min_xy_m=tuple(float(x) for x in center[:2] - radius),
+            region_max_xy_m=tuple(float(x) for x in center[:2] + radius),
+            evidence_ref=evidence_ref,
+            geometry_complete=True,
+            source_measurement_times_sec=(self.measured_at, plane_measured_at),
+        )
 
 
 @dataclass(frozen=True)
@@ -244,8 +391,10 @@ def plan_release_approach(
     held.require_current(now=now, scene_revision=support.scene_revision,
         reference_frame_id=support.reference_frame_id, object_id=held.object_id,
         side=held.side, max_age_sec=maximum_measurement_age_sec)
-    if (not 0 <= now - support.measured_at <= maximum_measurement_age_sec
-            or abs(held.measured_at - support.measured_at) > maximum_pair_skew_sec):
+    support_times = (support.measured_at, *support.source_measurement_times_sec)
+    if any(not 0 <= now - stamp <= maximum_measurement_age_sec
+           or abs(held.measured_at - stamp) > maximum_pair_skew_sec
+           for stamp in support_times):
         raise ValueError("Held object and support require fresh correlated observations")
     box = held.object_from_box
     half = np.asarray(held.box_size_m, dtype=float) / 2.
