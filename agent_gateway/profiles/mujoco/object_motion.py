@@ -19,6 +19,7 @@ from robot_motion.object_transport import rigid_pose, tool_goal_from_object_goal
 from robot_motion.path_planning import JointConfigurationCheck
 from robot_motion.pose import pose_delta_metrics
 from robot_motion.relative_action import xyzquat_to_pose_matrix
+from sim.mujoco.actuation.executor import MujocoPhysicalContactFault
 from sim.mujoco.deploy.payload_motion import MujocoPayloadBinding, MujocoPayloadSupport
 from sim.mujoco.deploy.planned_tcp_motion import MujocoTcpPlanRejected
 from sim.mujoco.transforms import pose_to_xyz_quat_xyzw
@@ -186,3 +187,19 @@ class MujocoAgentObjectMotionLifecycle(MujocoAgentSafeTcpPoseSkillLifecycle):
         completion = super()._success(**kwargs)
         return replace(completion, reason_code="grasped_object_target_reached_and_held",
                        execution_result={**completion.execution_result, "object_state": self._object_terminal})
+
+    def run(self, **kwargs):
+        try:
+            return super().run(**kwargs)
+        except MujocoPhysicalContactFault as error:
+            # The lower executor has already latched the same hard fault.
+            # Classify only its typed payload pair; all other collisions keep
+            # the original worker exception and HOLD path.
+            reason = {
+                "payload_relation": "object_follow_relation_lost_after_hold",
+                "payload_support_moved": "object_support_moved_after_hold",
+            }.get(error.check.pair_class)
+            if reason is None:
+                raise
+            hold = self._hold(reason=reason)
+            return self._failure(reason_code=reason, hold=hold)

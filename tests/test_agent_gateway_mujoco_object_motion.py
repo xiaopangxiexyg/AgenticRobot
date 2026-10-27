@@ -18,6 +18,7 @@ from agent_gateway.skills.motion.grasped_object import (
 )
 from project_paths import resolve_path
 from sim.mujoco.deploy import MujocoSimHILTargetConfig
+from sim.mujoco.actuation.executor import MujocoPhysicalContactFault
 
 CLIENT = "test:mujoco-tcp-comparison"
 TASK = Path("sim/configs/tasks/rm65_right_dmtacm_blue_cube_70mm_agent_v1.json")
@@ -158,6 +159,30 @@ def test_object_stage_commits_only_after_plan_activation_on_the_live_cut(monkeyp
     monkeypatch.setattr(MujocoAgentSafeTcpPoseSkillLifecycle, "activate", lambda *args, **kwargs: evidence)
     assert lifecycle.activate() is evidence
     assert calls == ([{"phase": "place", "source_data": scene.data}] if activated else [])
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("pair_class,expected", [
+    ("payload_relation", "object_follow_relation_lost_after_hold"),
+    ("payload_support_moved", "object_support_moved_after_hold"),
+    ("8:1", None),
+])
+def test_object_motion_only_classifies_typed_payload_fault_after_hold(monkeypatch, pair_class, expected):
+    from agent_gateway.profiles.mujoco.object_motion import MujocoAgentObjectMotionLifecycle
+    lifecycle = object.__new__(MujocoAgentObjectMotionLifecycle)
+    fault = MujocoPhysicalContactFault("native guard", SimpleNamespace(pair_class=pair_class))
+    monkeypatch.setattr(MujocoAgentSafeTcpPoseSkillLifecycle, "run",
+                        lambda *args, **kwargs: (_ for _ in ()).throw(fault))
+    holds = []
+    lifecycle._hold = lambda *, reason: holds.append(reason) or object()
+    lifecycle._failure = lambda *, reason_code, hold: reason_code
+    if expected is None:
+        with pytest.raises(MujocoPhysicalContactFault):
+            lifecycle.run()
+        assert not holds
+    else:
+        assert lifecycle.run() == expected
+        assert holds == [expected]
 
 
 @pytest.mark.unit

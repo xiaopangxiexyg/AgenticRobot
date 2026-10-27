@@ -24,6 +24,7 @@ from sim.mujoco.collision_safety import (
     CollisionCheckResult, CollisionProjectionResult, CollisionSafetyOracle,
 )
 from sim.rm65.actuation import PositionActuationProfile
+from sim.mujoco.actuation.executor import MujocoPhysicalContactFault
 
 
 CONTRACT_PATH = "sim/configs/rm65_bimanual_physics_v1.json"
@@ -430,8 +431,9 @@ def test_physical_executor_runs_full_scene_guard_and_latches_hard_contact(
             tick = sender.step_physics()
             assert tick.safety_status == "held"
         else:
-            with pytest.raises(RuntimeError, match="forbidden hard contact"):
+            with pytest.raises(MujocoPhysicalContactFault, match="forbidden hard contact") as fault:
                 sender.step_physics()
+            assert fault.value.check.body2_name == "obstacle"
             assert scene.data.physics_steps == 1
             assert sender.hard_contact_latched
             assert sender.last_active_collision_check.body2_name == "obstacle"
