@@ -6,11 +6,55 @@ import pytest
 from robot_motion.position_control import (
     AccelerationLimitedJointTrajectoryPlanner,
     JointTrajectoryLimits,
+    JointTrajectoryProposal,
     POSITION_COMMAND_PLANNER_ACCELERATION_LIMITED,
     POSITION_COMMAND_PLANNER_LINEAR,
     POSITION_COMMAND_PLANNER_SAMPLE_ALIGNED_JERK_LIMITED,
     normalize_position_command_planner,
 )
+
+
+def _vector_proposal(value: np.ndarray, **overrides: object) -> JointTrajectoryProposal:
+    kwargs = dict(
+        token=0, generation=0, target_sequence=0, sample_monotonic_time=0.0,
+        integration_dt_sec=1 / 120, q_command=value, q_target=value,
+        qd_command_rad_s=value, qd_reference_rad_s=value, qd_desired_rad_s=value,
+        qdd_command_rad_s2=value, speed_scale=1.0, mode="tracking", reason="normal",
+        quick_stop=False, acceleration_limited=True, velocity_limited=True,
+        command_step_limited=True, safety_envelope_limited=False, metadata={},
+    )
+    return JointTrajectoryProposal(**{**kwargs, **overrides})
+
+
+@pytest.mark.parametrize("dimension", [2, 6, 7, 24])
+def test_command_proposal_keeps_exact_detached_independent_readonly_vectors(dimension: int) -> None:
+    source = np.linspace(-0.3, 0.4, dimension * 2)[::2]
+    source[0] = -0.0
+    source[1] = np.nextafter(0.0, 1.0)
+    expected = source.copy()
+    proposal = _vector_proposal(source)
+    fields = ("q_command", "q_target", "qd_command_rad_s", "qd_reference_rad_s",
+              "qd_desired_rad_s", "qdd_command_rad_s2")
+    source[:] = 7.0
+    for index, name in enumerate(fields):
+        result = getattr(proposal, name)
+        np.testing.assert_array_equal(result.view(np.uint64), expected.view(np.uint64))
+        assert result.dtype == np.float64
+        assert not result.flags.writeable
+        assert not np.shares_memory(result, source)
+        assert all(not np.shares_memory(result, getattr(proposal, other)) for other in fields[index+1:])
+        with pytest.raises(ValueError, match="read-only"):
+            result[0] = 1.0
+
+
+@pytest.mark.parametrize("field", ["q_command", "q_target", "qd_command_rad_s", "qd_reference_rad_s",
+                                  "qd_desired_rad_s", "qdd_command_rad_s2"])
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), -float("inf")])
+def test_six_joint_command_proposal_rejects_nonfinite_in_every_vector(field: str, bad: float) -> None:
+    invalid = np.zeros(6)
+    invalid[-1] = bad
+    with pytest.raises(ValueError, match=f"{field} must be a non-empty finite vector"):
+        _vector_proposal(np.zeros(6), **{field: invalid})
 
 
 def _planner(

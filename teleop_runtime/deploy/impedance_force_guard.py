@@ -10,6 +10,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 import math
 import threading
+
+from robot_motion.runtime.owned_thread import OwnedThread
 import time
 from typing import Any, Callable, Mapping
 
@@ -123,7 +125,9 @@ class ImpedanceForceGuardMonitor:
         self._lock = threading.RLock()
         self._stop_event = threading.Event()
         self._ready_by_side = {side: threading.Event() for side in self._readers}
-        self._threads: list[threading.Thread] = []
+        self._threads: list[OwnedThread] = []
+        self._worker_lifecycle_lock = threading.RLock()
+        self._worker_closed = False
         self._last_reading_by_side: dict[str, ImpedanceForceGuardReading] = {}
         self._last_success_monotonic_by_side: dict[str, float] = {}
         self._last_error_by_side: dict[str, str] = {}
@@ -148,53 +152,56 @@ class ImpedanceForceGuardMonitor:
         return self.ready
 
     def start(self) -> dict[str, object]:
-        existing_fault = self.fault
-        if existing_fault is not None:
-            raise ImpedanceForceGuardTripped(existing_fault)
-        if self._threads:
+        with self._worker_lifecycle_lock:
+            if self._worker_closed:
+                raise RuntimeError("worker owner is closed")
+            existing_fault = self.fault
+            if existing_fault is not None:
+                raise ImpedanceForceGuardTripped(existing_fault)
+            if self._threads:
+                fault = self.fault
+                if fault is not None:
+                    raise ImpedanceForceGuardTripped(fault)
+                return self.snapshot()
+            self._stop_event.clear()
+            for side, reader in self._readers.items():
+                thread = OwnedThread(
+                    target=self._poll_loop,
+                    args=(side, reader),
+                    daemon=True,
+                    name=f"rm65_impedance_force_guard_{side}",
+                )
+                self._threads.append(thread)
+                thread.start()
+
+            deadline = time.monotonic() + self.config.startup_timeout_sec
+            while not self.ready and self.fault is None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0.0:
+                    missing = [
+                        side
+                        for side, event in self._ready_by_side.items()
+                        if not event.is_set()
+                    ]
+                    self._trip(
+                        ImpedanceForceGuardFault(
+                            reason="startup_timeout",
+                            side=None,
+                            message=(
+                                "RM65 impedance force guard did not receive a valid "
+                                f"startup sample for sides={missing} within "
+                                f"{self.config.startup_timeout_sec:.3f}s"
+                            ),
+                            monotonic_time_sec=time.monotonic(),
+                            wall_time_sec=time.time(),
+                        )
+                    )
+                    break
+                self._stop_event.wait(min(0.01, remaining))
             fault = self.fault
             if fault is not None:
                 raise ImpedanceForceGuardTripped(fault)
             return self.snapshot()
-        self._stop_event.clear()
-        for side, reader in self._readers.items():
-            thread = threading.Thread(
-                target=self._poll_loop,
-                args=(side, reader),
-                daemon=True,
-                name=f"rm65_impedance_force_guard_{side}",
-            )
-            thread.start()
-            self._threads.append(thread)
-
-        deadline = time.monotonic() + self.config.startup_timeout_sec
-        while not self.ready and self.fault is None:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0.0:
-                missing = [
-                    side
-                    for side, event in self._ready_by_side.items()
-                    if not event.is_set()
-                ]
-                self._trip(
-                    ImpedanceForceGuardFault(
-                        reason="startup_timeout",
-                        side=None,
-                        message=(
-                            "RM65 impedance force guard did not receive a valid "
-                            f"startup sample for sides={missing} within "
-                            f"{self.config.startup_timeout_sec:.3f}s"
-                        ),
-                        monotonic_time_sec=time.monotonic(),
-                        wall_time_sec=time.time(),
-                    )
-                )
-                break
-            self._stop_event.wait(min(0.01, remaining))
-        fault = self.fault
-        if fault is not None:
-            raise ImpedanceForceGuardTripped(fault)
-        return self.snapshot()
 
     def notify_backend_hard_stop(self, side: str, message: str) -> None:
         """Latch the guard from a controller-side hard-stop exception."""
@@ -214,51 +221,54 @@ class ImpedanceForceGuardMonitor:
         *,
         start: bool = True,
     ) -> dict[str, object]:
-        """Start a new guard generation after explicit backend re-arm."""
+        with self._worker_lifecycle_lock:
+            if self._worker_closed:
+                raise RuntimeError("worker owner is closed")
+            """Start a new guard generation after explicit backend re-arm."""
 
-        with self._lock:
-            fault = self._fault
-            stop_error = self._emergency_stop_error
-        if fault is None:
-            return self.snapshot()
-        if stop_error is not None:
-            raise RuntimeError(
-                "impedance force guard emergency stop was not acknowledged; "
-                "restart is required: "
-                + stop_error
-            )
-        self._stop_event.set()
-        old_threads = tuple(self._threads)
-        for thread in old_threads:
-            thread.join(timeout=1.0)
-        alive = [thread.name for thread in old_threads if thread.is_alive()]
-        if alive:
-            raise RuntimeError(
-                "impedance force guard worker(s) did not stop before manual re-arm: "
-                + ", ".join(alive)
-            )
-        with self._lock:
-            self._threads = []
-            self._stop_event.clear()
-            self._ready_by_side = {side: threading.Event() for side in self._readers}
-            self._last_reading_by_side.clear()
-            self._last_success_monotonic_by_side.clear()
-            self._last_error_by_side.clear()
-            self._fault = None
-            self._emergency_stop_error = None
-        return self.start() if start else self.snapshot()
+            with self._lock:
+                fault = self._fault
+                stop_error = self._emergency_stop_error
+            if fault is None:
+                return self.snapshot()
+            if stop_error is not None:
+                raise RuntimeError(
+                    "impedance force guard emergency stop was not acknowledged; "
+                    "restart is required: "
+                    + stop_error
+                )
+            self._stop_event.set()
+            old_threads = tuple(self._threads)
+            self._drain_workers()
+            with self._lock:
+                self._threads = []
+                self._stop_event.clear()
+                self._ready_by_side = {side: threading.Event() for side in self._readers}
+                self._last_reading_by_side.clear()
+                self._last_success_monotonic_by_side.clear()
+                self._last_error_by_side.clear()
+                self._fault = None
+                self._emergency_stop_error = None
+            return self.start() if start else self.snapshot()
 
     def close(self) -> None:
-        self._stop_event.set()
+        with self._worker_lifecycle_lock:
+            self._worker_closed = True
+            self._stop_event.set()
+            self._drain_workers()
+
+    def _drain_workers(self) -> None:
+        errors: list[BaseException] = []
         for thread in tuple(self._threads):
-            thread.join(timeout=1.0)
-        alive = [thread.name for thread in self._threads if thread.is_alive()]
-        self._threads = [thread for thread in self._threads if thread.is_alive()]
-        if alive:
-            raise RuntimeError(
-                "impedance force guard worker(s) did not stop within 1.000s: "
-                + ", ".join(alive)
-            )
+            try:
+                if not thread.join_and_confirm(timeout=1.0):
+                    raise RuntimeError(f"impedance force guard worker {thread.name!r} did not stop within 1.000s")
+                self._threads.remove(thread)
+            except BaseException as exc:
+                errors.append(exc)
+        if errors:
+            raise RuntimeError("impedance force guard worker shutdown unconfirmed: "
+                + "; ".join(f"{type(exc).__name__}: {exc}" for exc in errors)) from errors[0]
 
     def snapshot(self) -> dict[str, object]:
         with self._lock:

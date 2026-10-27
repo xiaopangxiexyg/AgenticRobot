@@ -1,0 +1,369 @@
+{
+  "schema_version": "dexteleop.sim.real2sim_artifact.v1",
+  "name": "rm65_arm_free_motion_20260721_v4_runtime_binding_20261023_v11",
+  "simulation_contract": {
+    "artifact_id": "rm65-bimanual-physics-runtime-20261023-v11",
+    "artifact_kind": "simulation_contract",
+    "sha256": "dbf0cd77b5e8ffbd0f7951f9a4ae10c6c25757e6f32657e16f1fe14cf100938d",
+    "locator": "sim/configs/rm65_bimanual_physics_v1.json"
+  },
+  "resolved_timing": {
+    "sample_hz": 15.0,
+    "policy_hz": 15.0,
+    "reference_hz": 60.0,
+    "ik_hz": 60.0,
+    "command_hz": 120.0,
+    "physics_hz": 1000.0,
+    "camera_hz": 30.0,
+    "interpolation": "timestamp_linear",
+    "command_hold": "zero_order_hold_between_command_ticks",
+    "parameter_source": "project_default_pending_real_system_id"
+  },
+  "dependency_artifacts": [
+    {
+      "artifact_id": "rm65-arm-free-motion-fit-20260721-v4",
+      "artifact_kind": "real2sim_fit_artifact",
+      "sha256": "89d72aed454bdc309959f7489486eb5ef3eae13d688be444efd849b637d6bd53",
+      "locator": "sim/rm65/real2sim/artifacts/rm65_arm_free_motion_20260721_v4.json"
+    },
+    {
+      "artifact_id": "rm65-arm-profile-runtime-20261023-v11",
+      "artifact_kind": "actuation_profile",
+      "sha256": "551b8a832f97d6e4fdfaef96b0cd3ff8b7dee46f4610ac948e23ff13602c48de",
+      "locator": "sim/rm65/actuation/profile.py"
+    },
+    {
+      "artifact_id": "rm65-arm-actuator-core-runtime-20261023-v11",
+      "artifact_kind": "sim_actuator_core_source",
+      "sha256": "4a68394fd359b6481e28594bf933c56ffe270ddcd7806c44675cd3e964e697c6",
+      "locator": "sim/rm65/actuation/core.py"
+    },
+    {
+      "artifact_id": "rm65-arm-mujoco-executor-runtime-20261023-v11",
+      "artifact_kind": "sim_backend_adapter_source",
+      "sha256": "ad81d86a0818c5e831ff613db11f18bfe4622e7a9c113f34ee70fe81a4f13d6c",
+      "locator": "sim/mujoco/actuation/executor.py"
+    },
+    {
+      "artifact_id": "rm65-camera-registry-runtime-20261023-v11",
+      "artifact_kind": "camera_registry",
+      "sha256": "7a0c1e612508c15dc5e0d8445e362498d92b28606e6f7157f47b88fda965e9ba",
+      "locator": "robot_motion/configs/rm65_camera_registry.json"
+    },
+    {
+      "artifact_id": "rm65-arm-runtime-binding-20260922-v5",
+      "artifact_kind": "real2sim_runtime_binding",
+      "sha256": "4a0d1d520864138bc1cef41347cf3fe43ec4a3f511710fdc2b77404c342768d8",
+      "locator": "sim/rm65/real2sim/artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20260922_v5.json"
+    },
+    {
+      "artifact_id": "rm65-command-guard-runtime-20261023-v11",
+      "artifact_kind": "sim_command_admission_source",
+      "sha256": "8e46a5361b687d53fbc6a834361ba60be9da86826f55f3107cc163d82f538666",
+      "locator": "sim/mujoco/adapters/tcp_pose_command_guard.py"
+    },
+    {
+      "artifact_id": "rm65-envelope-adapter-runtime-20261023-v11",
+      "artifact_kind": "sim_command_admission_source",
+      "sha256": "da9c97f6cf262c39122f0126e48ad46d86a3b75a7118fa6ac43edfe16656d1ce",
+      "locator": "sim/mujoco/adapters/tcp_pose_envelope.py"
+    },
+    {
+      "artifact_id": "rm65-position-rig-runtime-20261023-v11",
+      "artifact_kind": "sim_command_admission_source",
+      "sha256": "b3230f8275f137927426e4369d28fdf93e3aa28ee91672a86afa935f2c61c676",
+      "locator": "sim/mujoco/adapters/robot_motion.py"
+    },
+    {
+      "artifact_id": "rm65-position-assembly-runtime-20261023-v11",
+      "artifact_kind": "sim_command_admission_source",
+      "sha256": "81d18dc93e7fb53d4fd6545e1f3c2089660a55a9a22b951127ec94903d36db61",
+      "locator": "sim/mujoco/control/desk_tcp_position.py"
+    },
+    {
+      "artifact_id": "rm65-collision-oracle-runtime-20261023-v11",
+      "artifact_kind": "sim_grasp_contact_source",
+      "sha256": "d4c7c3455dfad9bca8e34fa38ce3df62ac09122acb08763fad32bee3c354b15d",
+      "locator": "sim/mujoco/collision_safety/oracle.py"
+    },
+    {
+      "artifact_id": "rm65-collision-projection-runtime-20261023-v11",
+      "artifact_kind": "sim_grasp_contact_source",
+      "sha256": "ddc6fbc2681d7b13d9ba313a83948c25e69c8757f1422974a484f317f3ff3609",
+      "locator": "sim/mujoco/collision_safety/projection.py"
+    },
+    {
+      "artifact_id": "rm65-collision-result-runtime-20261023-v11",
+      "artifact_kind": "sim_grasp_contact_source",
+      "sha256": "14f97c5b26971d82a011d04395a37486843cbb3049b459795e7659b33267f79b",
+      "locator": "sim/mujoco/collision_safety/result.py"
+    },
+    {
+      "artifact_id": "rm65-grasp-contact-runtime-20261023-v11",
+      "artifact_kind": "sim_grasp_contact_source",
+      "sha256": "afc585c1547918b6bbd84ba627278887638354e4c1b3564762bed732284f672b",
+      "locator": "sim/mujoco/deploy/grasp_contact.py"
+    },
+    {
+      "artifact_id": "rm65-planned-tcp-motion-runtime-20261023-v11",
+      "artifact_kind": "sim_grasp_contact_source",
+      "sha256": "25c0c1b13d74dd4e00373c95b9835b9e5a52b221a975cfb5b30c3a058970b02b",
+      "locator": "sim/mujoco/deploy/planned_tcp_motion.py"
+    },
+    {
+      "artifact_id": "rm65-arm-runtime-binding-20261017-v7",
+      "artifact_kind": "real2sim_runtime_binding",
+      "sha256": "1ce52c5c3cbd0a95e999efead5fa00ca2c8098b75eb76bfc896ad503b26dbbe7",
+      "locator": "sim/rm65/real2sim/artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261017_v7.json"
+    },
+    {
+      "artifact_id": "rm65-agent-skill-target-runtime-20261023-v11",
+      "artifact_kind": "sim_agent_skill_target_source",
+      "sha256": "5555669da095aa2c34f7580383688669f3aabdeb0d9c052c23234f4c5d734e82",
+      "locator": "sim/mujoco/deploy/agent_skill_target.py"
+    },
+    {
+      "artifact_id": "rm65-arm-runtime-binding-20261018-v8",
+      "artifact_kind": "real2sim_runtime_binding",
+      "sha256": "48ee5ff7dc5b54c7d98e3ae2cb7b7707237a40dab742e10a473d771b8b7fea68",
+      "locator": "sim/rm65/real2sim/artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261018_v8.json"
+    },
+    {
+      "artifact_id": "rm65-gripper-executor-runtime-20261023-v11",
+      "artifact_kind": "sim_object_follow_payload_source",
+      "sha256": "39a98c3c8d9996c299feb1a071597d2182c0dbb668b84fdd83c7a8dd4240eec0",
+      "locator": "sim/mujoco/actuation/gripper_executor.py"
+    },
+    {
+      "artifact_id": "rm65-collision-policy-runtime-20261023-v11",
+      "artifact_kind": "sim_object_follow_payload_source",
+      "sha256": "206fe03b9d0c4550218e58c1c14cb5e079baa29210eb29e6daa586e53e2fcde9",
+      "locator": "sim/mujoco/collision_safety/policy.py"
+    },
+    {
+      "artifact_id": "rm65-contact-timing-runtime-20261023-v11",
+      "artifact_kind": "sim_object_follow_payload_source",
+      "sha256": "8e4721e30b4fa28584b3fd53129c532cb8074951e45786fe37053cfd76dd7af7",
+      "locator": "sim/mujoco/deploy/contact_timing.py"
+    },
+    {
+      "artifact_id": "rm65-grasped-object-observer-runtime-20261023-v11",
+      "artifact_kind": "sim_object_follow_payload_source",
+      "sha256": "492e0103bb653dd09da7c34a90e034d494740f706dc1c8dbbfa6547dc83168dc",
+      "locator": "sim/mujoco/deploy/grasped_object.py"
+    },
+    {
+      "artifact_id": "rm65-payload-motion-runtime-20261023-v11",
+      "artifact_kind": "sim_object_follow_payload_source",
+      "sha256": "ce2041e1dc3467400d4493e01b57eaf957e0923509f1d561c2ae6a84d7b766dc",
+      "locator": "sim/mujoco/deploy/payload_motion.py"
+    },
+    {
+      "artifact_id": "rm65-object-release-runtime-20261023-v11",
+      "artifact_kind": "sim_object_follow_payload_source",
+      "sha256": "72099c4bab5a3e9520017c49c1fb3198281de57e559c97a300d8b399f32668b1",
+      "locator": "robot_motion/object_release.py"
+    },
+    {
+      "artifact_id": "rm65-object-transport-runtime-20261023-v11",
+      "artifact_kind": "sim_object_follow_payload_source",
+      "sha256": "31b33e935f6dcd07cadeca274f190ee89b205b468ead4e7843f284a64df85b8b",
+      "locator": "robot_motion/object_transport.py"
+    },
+    {
+      "artifact_id": "rm65-arm-runtime-binding-20261022-v9",
+      "artifact_kind": "real2sim_runtime_binding",
+      "sha256": "092b48c008aba04d647ff2fa8da5677f2dde18529a6db26dc4330053c8f71f43",
+      "locator": "sim/rm65/real2sim/artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261022_v9.json"
+    },
+    {
+      "artifact_id": "rm65-arm-runtime-binding-20261023-v10",
+      "artifact_kind": "real2sim_runtime_binding",
+      "sha256": "5538d158d25ee13bb7e81e515e1aff4e709c2534c38c79fe94dde81338e4841c",
+      "locator": "sim/rm65/real2sim/artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261023_v10.json"
+    },
+    {
+      "artifact_id": "mujoco-b601-collision-query-consumer-validation-20261023-v11",
+      "artifact_kind": "offline_validation_report",
+      "sha256": "ea977967679fb139ef8f8fd846d2b1134b01900e2d0c94ce22df8876713d8e51",
+      "locator": "artifact://mujoco-b601-collision-query-consumer-validation-20261023-v11"
+    },
+    {
+      "artifact_id": "mujoco-b601-collision-query-consumer-binding-20261023-v11",
+      "artifact_kind": "offline_validation_binding",
+      "sha256": "0d67cb311f2636b89a7deb420ca3bf6cb6ee85224c32ffc2498cf6432d2138d6",
+      "locator": "artifact://mujoco-b601-collision-query-consumer-binding-20261023-v11"
+    }
+  ],
+  "fidelity_claims": [
+    {
+      "component": "arm.position_response.free_motion.runtime_source_binding",
+      "status": "provisional",
+      "evidence_artifact_ids": [
+        "rm65-arm-free-motion-fit-20260721-v4",
+        "rm65-arm-profile-runtime-20261023-v11",
+        "rm65-arm-actuator-core-runtime-20261023-v11",
+        "rm65-arm-mujoco-executor-runtime-20261023-v11",
+        "rm65-camera-registry-runtime-20261023-v11",
+        "rm65-arm-runtime-binding-20260922-v5",
+        "rm65-command-guard-runtime-20261023-v11",
+        "rm65-envelope-adapter-runtime-20261023-v11",
+        "rm65-position-rig-runtime-20261023-v11",
+        "rm65-position-assembly-runtime-20261023-v11",
+        "rm65-collision-oracle-runtime-20261023-v11",
+        "rm65-collision-projection-runtime-20261023-v11",
+        "rm65-collision-result-runtime-20261023-v11",
+        "rm65-grasp-contact-runtime-20261023-v11",
+        "rm65-planned-tcp-motion-runtime-20261023-v11",
+        "rm65-arm-runtime-binding-20261017-v7",
+        "rm65-agent-skill-target-runtime-20261023-v11",
+        "rm65-arm-runtime-binding-20261018-v8",
+        "rm65-gripper-executor-runtime-20261023-v11",
+        "rm65-collision-policy-runtime-20261023-v11",
+        "rm65-contact-timing-runtime-20261023-v11",
+        "rm65-grasped-object-observer-runtime-20261023-v11",
+        "rm65-payload-motion-runtime-20261023-v11",
+        "rm65-object-release-runtime-20261023-v11",
+        "rm65-object-transport-runtime-20261023-v11",
+        "rm65-arm-runtime-binding-20261022-v9",
+        "rm65-arm-runtime-binding-20261023-v10",
+        "mujoco-b601-collision-query-consumer-validation-20261023-v11",
+        "mujoco-b601-collision-query-consumer-binding-20261023-v11"
+      ],
+      "limitations": [
+        "The frozen v4 fit and historical binding manifests retain their original bytes; no arm parameter was refit.",
+        "The sole changed bound source adds forbidden_geom_pairs(), a read-only query of already compiled collision pairs. No collision guard, selection or physics execution is changed by this addition.",
+        "The 43-case CPU consumer report covers B601 workspace and existing collision/model-audit consumers, not complete acceptance or native hardware.",
+        "Previous object-follow/payload evidence remains linked through the immutable v10 manifest; no new positive grasp/place or held-out arm-response claim is made."
+      ],
+      "notes": "v11 rebinds exact current source bytes after adding the read-only collision audit API."
+    }
+  ],
+  "validation_evidence": [
+    {
+      "validation_id": "runtime-source-content-binding-integrity-v11",
+      "split": "validation",
+      "status": "passed",
+      "metrics": {
+        "bound_runtime_source_file_count": 20.0,
+        "bound_runtime_input_file_count": 21.0,
+        "changed_runtime_source_file_count_from_previous_binding": 1.0,
+        "new_runtime_source_file_count": 0.0,
+        "arm_profile_refit_count": 0.0,
+        "mutated_historical_artifact_count": 0.0
+      },
+      "evidence_artifact_ids": [
+        "rm65-arm-free-motion-fit-20260721-v4",
+        "rm65-arm-profile-runtime-20261023-v11",
+        "rm65-arm-actuator-core-runtime-20261023-v11",
+        "rm65-arm-mujoco-executor-runtime-20261023-v11",
+        "rm65-camera-registry-runtime-20261023-v11",
+        "rm65-arm-runtime-binding-20260922-v5",
+        "rm65-command-guard-runtime-20261023-v11",
+        "rm65-envelope-adapter-runtime-20261023-v11",
+        "rm65-position-rig-runtime-20261023-v11",
+        "rm65-position-assembly-runtime-20261023-v11",
+        "rm65-collision-oracle-runtime-20261023-v11",
+        "rm65-collision-projection-runtime-20261023-v11",
+        "rm65-collision-result-runtime-20261023-v11",
+        "rm65-grasp-contact-runtime-20261023-v11",
+        "rm65-planned-tcp-motion-runtime-20261023-v11",
+        "rm65-arm-runtime-binding-20261017-v7",
+        "rm65-agent-skill-target-runtime-20261023-v11",
+        "rm65-arm-runtime-binding-20261018-v8",
+        "rm65-gripper-executor-runtime-20261023-v11",
+        "rm65-collision-policy-runtime-20261023-v11",
+        "rm65-contact-timing-runtime-20261023-v11",
+        "rm65-grasped-object-observer-runtime-20261023-v11",
+        "rm65-payload-motion-runtime-20261023-v11",
+        "rm65-object-release-runtime-20261023-v11",
+        "rm65-object-transport-runtime-20261023-v11",
+        "rm65-arm-runtime-binding-20261022-v9",
+        "rm65-arm-runtime-binding-20261023-v10",
+        "mujoco-b601-collision-query-consumer-validation-20261023-v11",
+        "mujoco-b601-collision-query-consumer-binding-20261023-v11"
+      ],
+      "notes": "All 21 bound source/input files equal fixed implementation commit 4c7f4e88c8541af9f284f065d9e7cf7cb8fcbe4e. Only the read-only collision query source differs from v10."
+    },
+    {
+      "validation_id": "offline-b601-collision-query-consumers-v11",
+      "split": "validation",
+      "status": "passed",
+      "metrics": {
+        "passed_cases": 43.0,
+        "skipped_cases": 0.0,
+        "failed_cases": 0.0,
+        "error_cases": 0.0
+      },
+      "evidence_artifact_ids": [
+        "rm65-arm-free-motion-fit-20260721-v4",
+        "rm65-arm-profile-runtime-20261023-v11",
+        "rm65-arm-actuator-core-runtime-20261023-v11",
+        "rm65-arm-mujoco-executor-runtime-20261023-v11",
+        "rm65-camera-registry-runtime-20261023-v11",
+        "rm65-arm-runtime-binding-20260922-v5",
+        "rm65-command-guard-runtime-20261023-v11",
+        "rm65-envelope-adapter-runtime-20261023-v11",
+        "rm65-position-rig-runtime-20261023-v11",
+        "rm65-position-assembly-runtime-20261023-v11",
+        "rm65-collision-oracle-runtime-20261023-v11",
+        "rm65-collision-projection-runtime-20261023-v11",
+        "rm65-collision-result-runtime-20261023-v11",
+        "rm65-grasp-contact-runtime-20261023-v11",
+        "rm65-planned-tcp-motion-runtime-20261023-v11",
+        "rm65-arm-runtime-binding-20261017-v7",
+        "rm65-agent-skill-target-runtime-20261023-v11",
+        "rm65-arm-runtime-binding-20261018-v8",
+        "rm65-gripper-executor-runtime-20261023-v11",
+        "rm65-collision-policy-runtime-20261023-v11",
+        "rm65-contact-timing-runtime-20261023-v11",
+        "rm65-grasped-object-observer-runtime-20261023-v11",
+        "rm65-payload-motion-runtime-20261023-v11",
+        "rm65-object-release-runtime-20261023-v11",
+        "rm65-object-transport-runtime-20261023-v11",
+        "rm65-arm-runtime-binding-20261022-v9",
+        "rm65-arm-runtime-binding-20261023-v10",
+        "mujoco-b601-collision-query-consumer-validation-20261023-v11",
+        "mujoco-b601-collision-query-consumer-binding-20261023-v11"
+      ],
+      "notes": "The XML and execution receipt identify commit 4c7f4e88c8541af9f284f065d9e7cf7cb8fcbe4e and tree aa35a6c5d0621fe1afe5e7a7e0f4615dc33aa52a. This bounded CPU report does not establish full or physical acceptance."
+    },
+    {
+      "validation_id": "new-untouched-clean-held-out-v11-runtime-source-binding",
+      "split": "held_out",
+      "status": "not_run",
+      "metrics": {},
+      "evidence_artifact_ids": [],
+      "notes": "No new held-out response capture or model refit."
+    }
+  ],
+  "code_revision": "4c7f4e88c8541af9f284f065d9e7cf7cb8fcbe4e",
+  "environment_fingerprint": {
+    "source_commit": "4c7f4e88c8541af9f284f065d9e7cf7cb8fcbe4e",
+    "source_tree": "aa35a6c5d0621fe1afe5e7a7e0f4615dc33aa52a",
+    "validation_environment": "existing bounded CPU-only offline runner"
+  },
+  "metadata": {
+    "owner": "sim.rm65",
+    "binding_kind": "runtime_source_rebind",
+    "fit_profile_name": "rm65_bimanual_udp_feedback_20260721.v4",
+    "fit_artifact_sha256": "501702e3b741096fc3038b082405073bad51f63626b7296b75d2847e85df778d",
+    "fit_simulation_contract_sha256": "baa5efcd490f27b0d2e261ac2e5c91181a0618de75596017a05714a02333a0df",
+    "previous_runtime_binding_artifact_sha256": "c341a48710ce7743941a0980b820c0627ec98dba8a27bb7df574d5418736a880",
+    "previous_runtime_binding_file_sha256": "5538d158d25ee13bb7e81e515e1aff4e709c2534c38c79fe94dde81338e4841c",
+    "arm_profile_refit": false,
+    "runtime_behavior_change": false,
+    "runtime_behavior_change_scope": "read_only_forbidden_geom_pair_query",
+    "runtime_source_commit": "4c7f4e88c8541af9f284f065d9e7cf7cb8fcbe4e",
+    "migration": "read_only_collision_audit_source_binding",
+    "offline_validation_report_artifact_id": "mujoco-b601-collision-query-consumer-validation-20261023-v11",
+    "offline_validation_binding_artifact_id": "mujoco-b601-collision-query-consumer-binding-20261023-v11",
+    "offline_validation_source_tree": "aa35a6c5d0621fe1afe5e7a7e0f4615dc33aa52a",
+    "offline_validation_execution_head": "4c7f4e88c8541af9f284f065d9e7cf7cb8fcbe4e",
+    "changed_previous_runtime_sources": [
+      "sim/mujoco/collision_safety/oracle.py"
+    ],
+    "new_runtime_sources": []
+  },
+  "artifact_sha256": "9421bb18b19226d03a9822096149aa7960e27b294db5e7953c6a9147a0f90447"
+}

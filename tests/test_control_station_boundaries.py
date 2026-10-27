@@ -254,12 +254,26 @@ def test_gateway_sim_dependencies_are_confined_to_mujoco_profile() -> None:
         "agent_gateway/profiles/mujoco/gateway_cli.py": ["sim"],
         # Native grasp preview and target-bound contact stay in concrete leaves.
         "agent_gateway/profiles/mujoco/grasp_candidate_selection.py": ["sim"],
+        # Frozen capture and exact paired execution are native profile edges.
+        "agent_gateway/profiles/mujoco/grasp_deployment.py": ["sim"],
+        "agent_gateway/profiles/mujoco/grasp_fast_plan.py": ["sim"],
+        "agent_gateway/profiles/mujoco/grasp_observation.py": ["sim"],
         "agent_gateway/profiles/mujoco/motion_application.py": ["sim"],
         "agent_gateway/profiles/mujoco/motion_deployment.py": ["sim"],
         "agent_gateway/profiles/mujoco/motion_factory.py": ["sim"],
+        # The concrete assembly names its lower measured-object observer type.
+        "agent_gateway/profiles/mujoco/motion_gateway_session.py": ["sim"],
+        # Sensor-shaped planning is a concrete simulator leaf.
+        "agent_gateway/profiles/mujoco/motion_observed_scene.py": ["sim"],
+        # The frozen query binds only this concrete simulator's private planner.
+        "agent_gateway/profiles/mujoco/object_goal_query.py": ["sim"],
         # The concrete safe-TCP lifecycle binds its lower simulation planner.
         "agent_gateway/profiles/mujoco/motion_skill.py": ["sim"],
         "agent_gateway/profiles/mujoco/observation.py": ["sim"],
+        # Carried-object composition binds the existing lower payload planner.
+        "agent_gateway/profiles/mujoco/object_motion.py": ["sim"],
+        # Native object measurements resolve simulation frames in this leaf.
+        "agent_gateway/profiles/mujoco/object_state.py": ["sim"],
         "agent_gateway/profiles/mujoco/policy_application.py": ["sim"],
         "agent_gateway/profiles/mujoco/policy_factory.py": ["sim"],
         "agent_gateway/profiles/mujoco/skills/cube_lift/deployment.py": ["sim"],
@@ -305,17 +319,33 @@ def test_gateway_numerical_dependencies_are_confined_to_concrete_profiles() -> N
         # perception profiles; Gateway core remains numerical-neutral.
         "agent_gateway/profiles/back_projection.py": ["numpy"],
         "agent_gateway/profiles/mujoco/back_projection.py": ["numpy"],
+        "agent_gateway/profiles/mujoco/motion_observed_scene.py": ["numpy"],
+        "agent_gateway/profiles/mujoco/object_motion.py": ["numpy"],
+        "agent_gateway/profiles/mujoco/object_state.py": ["numpy"],
         "agent_gateway/profiles/placement.py": ["numpy"],
+        "agent_gateway/profiles/paired_rgbd.py": ["numpy"],
         "agent_gateway/profiles/real/back_projection.py": ["numpy"],
         "agent_gateway/profiles/segmentation.py": ["numpy"],
+        "agent_gateway/profiles/segmentation_batch.py": ["numpy", "scipy"],
+        # Concrete anchor mask geometry shares the same numerical boundary.
+        "agent_gateway/profiles/surface_anchor_selection.py": ["numpy", "scipy"],
+        "agent_gateway/profiles/mujoco/object_goal_query.py": ["numpy"],
         "agent_gateway/profiles/mujoco/motion_skill.py": ["numpy"],
         "agent_gateway/profiles/mujoco/grasp_candidate_selection.py": ["numpy"],
+        "agent_gateway/profiles/mujoco/grasp_fast_plan.py": ["numpy"],
+        "agent_gateway/profiles/mujoco/grasp_observation.py": ["numpy"],
+        # Object goals project the measured relation only in the concrete leaf.
+        "agent_gateway/profiles/mujoco/object_motion.py": ["numpy"],
+        # Private-copy body Jacobians and frame projection stay in this leaf.
+        "agent_gateway/profiles/mujoco/object_state.py": ["numpy"],
         # The concrete real-RM65 CLI validates reviewed camera/tool geometry
         # while assembling its profile; Gateway core remains numerical-neutral.
         "agent_gateway/profiles/real/gateway_cli.py": ["numpy"],
         # The concrete RM65 approach profile decodes RGBD and binds its
         # retained visible scene; numerical work stays outside Gateway core.
         "agent_gateway/profiles/real/grasp_approach_plan.py": ["numpy"],
+        "agent_gateway/profiles/real/grasp_fast_plan.py": ["numpy"],
+        "agent_gateway/profiles/real/grasp_first_path.py": ["numpy"],
         # Frozen RGB-D/FK decoding and held-object/tool transforms belong to
         # these concrete real-profile leaves, not to Gateway core.
         "agent_gateway/profiles/real/grasp_observation.py": ["numpy"],

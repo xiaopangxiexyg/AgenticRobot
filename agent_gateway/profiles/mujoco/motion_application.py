@@ -31,6 +31,7 @@ from sim.mujoco.deploy.target_measurement import (
 from sim.mujoco.depth_snapshot import (
     EncodedMujocoDepthFrame,
     MujocoDepthSnapshotSource,
+    MujocoRawRgbdCut,
 )
 from sim.mujoco.rgb_snapshot import (
     EncodedMujocoRgbFrame,
@@ -82,14 +83,20 @@ class MujocoAgentSkillActivation:
 class MujocoAgentSkillMotionApplication:
     """Own one reusable no-model Agent motion session, default-off."""
 
+    _motion_side: str = "right"
+
     def __init__(
         self,
         *,
         target: MujocoAgentSkillMotionTarget,
         calibration_hash: str,
+        motion_side: str = "right",
     ) -> None:
         if not isinstance(target, MujocoAgentSkillMotionTarget):
             raise TypeError("target must be a MujocoAgentSkillMotionTarget.")
+        if type(motion_side) is not str or motion_side not in {"left", "right"}:
+            raise ValueError("motion_side must be exactly 'left' or 'right'.")
+        component_id = f"{motion_side}_arm"
         runtime = target.runtime
         direct = getattr(
             getattr(runtime, "config", None),
@@ -101,11 +108,37 @@ class MujocoAgentSkillMotionApplication:
             or getattr(runtime.config, "initial_control_mode", None)
             != "agent_skill"
             or tuple(getattr(runtime.action_schema, "component_ids", ()))
-            != ("right_arm",)
+            != (component_id,)
+            or target.motion_side != motion_side
+            or target.component_id != component_id
         ):
             raise ValueError(
-                "Motion application requires the exact right-arm Agent Skill runtime."
+                f"Motion application requires the exact {motion_side}-arm "
+                "Agent Skill runtime."
             )
+        payload = getattr(runtime.action_schema, "payload_schema_by_component", {}).get(
+            component_id
+        )
+        if (
+            getattr(payload, "representation_family", None) != "cartesian_pose"
+            or getattr(payload, "value_semantics", None) != "absolute_target"
+            or getattr(payload, "controlled_frame", None) != "tool_tcp"
+            or getattr(payload, "semantic_parameters", {}).get("target_arm_side")
+            != motion_side
+        ):
+            raise ValueError("Motion application pose schema does not match motion_side.")
+        # Direct target construction can bypass the factory. A Route's side
+        # must never stand in for the lower planner's explicit side identity.
+        planner = target.planned_tcp_motion
+        if planner is not None and (
+            getattr(planner, "motion_side", None) != motion_side
+            or getattr(planner, "component_id", None) != component_id
+        ):
+            raise ValueError(
+                "Motion application planned TCP adapter must match "
+                "motion_side and component_id."
+            )
+        self._motion_side = motion_side
         self.target = target
         self.task_config = target.task_config
         self.scene = target.scene
@@ -137,6 +170,14 @@ class MujocoAgentSkillMotionApplication:
             capture_scene=self._capture_visual_scene,
             clock=self.runtime.clock,
         )
+
+    @property
+    def motion_side(self) -> str:
+        return self._motion_side
+
+    @property
+    def component_id(self) -> str:
+        return f"{self.motion_side}_arm"
 
     @property
     def started(self) -> bool:
@@ -351,13 +392,13 @@ class MujocoAgentSkillMotionApplication:
         if not bool(scene.state_is_finite()):
             raise RuntimeError("MuJoCo scene state is non-finite.")
         poses = capture_mujoco_sim_hil_tool_tcp_pose_by_side(scene, self.task_config)
-        vector = pose_matrix_to_xyzquat(poses["right"])
+        vector = pose_matrix_to_xyzquat(poses[self.motion_side])
         if vector is None:
-            raise RuntimeError("right_arm TCP pose is not representable.")
+            raise RuntimeError(f"{self.component_id} TCP pose is not representable.")
         values = tuple(float(item) for item in vector)
         if len(values) != 7 or not all(math.isfinite(item) for item in values):
-            raise RuntimeError("right_arm TCP pose is invalid.")
-        return {"right_arm": values}
+            raise RuntimeError(f"{self.component_id} TCP pose is invalid.")
+        return {self.component_id: values}
 
     def capture_tcp_pose_by_component(self) -> Mapping[str, tuple[float, ...]]:
         """Capture measured TCP state under the application/rig lock."""
@@ -373,6 +414,9 @@ class MujocoAgentSkillMotionApplication:
         with self._lock:
             if self._closed:
                 raise RuntimeError("Agent motion application is closed.")
+
+            if self.motion_side != "right":
+                raise ValueError("Passive arm/gripper geometry is right-only.")
 
             def capture(scene: Any) -> Mapping[str, object]:
                 poses = self._capture_tcp_pose_from_scene(scene)
@@ -469,10 +513,71 @@ class MujocoAgentSkillMotionApplication:
     ) -> tuple[EncodedMujocoRgbFrame, EncodedMujocoDepthFrame]:
         """Render RGB and depth from one rig-owned scene cut."""
 
-        with self._lock:
-            if self._closed:
-                raise RuntimeError("Agent motion application is closed.")
-            return self._depth_snapshot_source.capture_jpeg_npy_cut(view_id=view_id)
+        if self._closed:
+            raise RuntimeError("Agent motion application is closed.")
+        return self._depth_snapshot_source.capture_jpeg_npy_cut(view_id=view_id)
+
+    def capture_frozen_rgbd_cut(self, *, source_ids: tuple[str, ...]) -> MujocoRawRgbdCut:
+        """Capture native multi-view RGB-D and both arms without advancing physics."""
+        def require_state() -> None:
+            # The source calls this inside _capture_visual_scene's application
+            # and rig locks. Do not invert source -> application -> rig ordering.
+            if (
+                not self._started
+                or not self._held
+                or self._active_operation_id is not None
+                or self.target.planned_tcp_motion is None
+            ):
+                raise RuntimeError(
+                    "Frozen RGB-D requires a started, stationary held motion application."
+                )
+
+        return self._depth_snapshot_source.capture_rgbd_cut(
+            view_ids=source_ids,
+            require_capture_state=require_state,
+        )
+
+    def capture_planning_rgbd_cut(
+        self, *, operation_id: str, source_ids: tuple[str, ...],
+        cancel_requested: Callable[[], bool],
+    ) -> MujocoRawRgbdCut:
+        """Capture for this READY operation in source -> application -> rig order."""
+        from sim.mujoco.deploy.planned_tcp_motion import MujocoTcpPlanRejected
+
+        normalized_id = _required(operation_id, field_name="operation_id")
+        if not callable(cancel_requested):
+            raise TypeError("Planning capture requires the operation stop/deadline port.")
+
+        def require_state() -> None:
+            # The source invokes this under the existing application/rig cut.
+            # The worker callback reads its Event and clock, never its Store.
+            if cancel_requested():
+                raise MujocoTcpPlanRejected("safe_tcp_planning_cancelled")
+            if (not self._started or self._closed or self._held
+                    or self._active_operation_id != normalized_id
+                    or self.target.planned_tcp_motion is None
+                    or self.target.planned_tcp_motion.active):
+                raise MujocoTcpPlanRejected("observed_planning_capture_unavailable")
+            gate = self.runtime.capture_execution_gate_snapshot(now=float(self.runtime.clock()))
+            if str(gate.status) != "ready":
+                raise MujocoTcpPlanRejected("observed_planning_capture_not_ready")
+
+        return self._depth_snapshot_source.capture_rgbd_cut(
+            view_ids=source_ids, require_capture_state=require_state)
+
+
+    def capture_grasp_scene_state(self):
+        """Read the complete native state without rendering or advancing physics.
+
+        Revision alone does not identify joint, gripper or task-object state.
+        The profile uses this cut before publishing/activating retained plans.
+        """
+        return self._capture_visual_scene(lambda scene: {
+            "model_qpos": scene.data.qpos.tolist(),
+            "model_qvel": scene.data.qvel.tolist(),
+            "simulation_time_sec": float(scene.data.time),
+        })
+
 
     def _capture_visual_scene(self, capture: Callable[[Any], Any]) -> Any:
         """Keep renderer access serialized with motion and lifecycle changes."""
@@ -587,8 +692,10 @@ class MujocoAgentSkillMotionApplication:
                 return
             if self._started and not self._held:
                 raise RuntimeError("Closing a started motion application requires HOLD.")
-            if self._started:
-                self.runtime.close()
+            # A failed start can leave lower-owned rollback work pending even
+            # though the application never reached _started. The lower owner
+            # makes close idempotent and retains failed releases for retry.
+            self.runtime.close()
             snapshot_sources = tuple(
                 source
                 for source in (

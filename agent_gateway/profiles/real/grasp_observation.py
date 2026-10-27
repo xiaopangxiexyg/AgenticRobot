@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from agent_gateway.profiles.grasp_observation import OBSERVATION_SLOT, read_retained_grasp_observation
+
 import hashlib
 import io
 import json
@@ -36,7 +38,6 @@ from dataset_contracts.perception_artifacts import (
     RGB_FRAME_SCHEMA_ID_V1, RGB_FRAME_ENCODING_V1, RGB_FRAME_COMPRESSION_V1,
 )
 
-OBSERVATION_SLOT = "grasp_observation"
 
 
 def upgrade_frozen_point_grasp_registration(base):
@@ -257,28 +258,3 @@ def build_grasp_observation_executor(*, registration, perception_provider, frame
     return PassiveReadSkillExecutor(port_id="agent-gateway:"+capture_name+":"+runtime_session_id,
         executor_id=registration.executor_id, read=read, current_station_revision=current_station_revision,
         clock=clock, max_retained_operations=max_retained_operations)
-
-
-def read_retained_grasp_observation(*, executor, operation_id, artifact_store, runtime_session_id,
-                                    expected_station_revision, frame_binding_hash,
-                                    observation_slot=OBSERVATION_SLOT, decode_arrays=False):
-    completion = executor.completion_for(operation_id)
-    if completion is None or not completion.accepted:
-        raise ValueError("Grasp observation is not retained by this session")
-    operation = completion.operation
-    if (operation.runtime_session_id != runtime_session_id or operation.status != "completed"
-            or operation.execution_outcome != "completed"
-            or operation.execution_result["station_revision"] != expected_station_revision):
-        raise ValueError("Grasp observation session, revision, or completion differs")
-    bindings = [b for b in operation.output_artifact_bindings if b.slot_id == observation_slot]
-    if len(bindings) != 1:
-        raise ValueError("Grasp observation lacks a unique retained Artifact")
-    artifact = bindings[0].artifact
-    data = artifact_store.read_bytes(artifact, maximum=GRASP_MULTIVIEW_MAX_BYTES)
-    decoder = decode_grasp_multiview_snapshot_arrays if decode_arrays else decode_grasp_multiview_snapshot
-    views, metadata, points, _ = decoder(data)
-    if (metadata.get("runtime_session_id") != runtime_session_id
-            or metadata.get("station_revision") != expected_station_revision
-            or metadata.get("frame_binding_hash") != frame_binding_hash or points is not None):
-        raise ValueError("Grasp observation provenance differs")
-    return views, metadata

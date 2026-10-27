@@ -92,9 +92,119 @@ core and MuJoCo adapter used for the 20260721 fit; tests compare those hashes to
 fixed historical values rather than silently reinterpreting the fit against
 the current files.
 
-当前运行时源码绑定是
+当前只读默认发布与可选 TCP arc 排序整合使用独立绑定
+`artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261027_readonly_defaults_v1.json`。
+它继承 checkpoint integration 的152项输入，更新两端CLI默认发布的源码身份，
+并加入共用抓取轨迹源码，共153项输入／150项Python源码，固定于 `b19fd84165d7`。
+旧绑定和v4标定原字节保留；固定源码的直接消费者验收为601通过、零跳过／失败，
+完整组合门禁另行记录。该绑定不重拟合，不新增物理响应或held-out资格。
+
+历史 checkpoint 整合候选使用独立绑定
+`artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261026_checkpoint_integration_v1.json`。
+它合并主线 V25 的92项输入与历史 observer 候选的147项输入，再加入 TCP envelope
+companion，共152项输入／149项 Python 源码，固定于 `a47d7e3922ef`。两份前驱
+manifest 的原字节和资格各自保留，使用不同路径与引用身份；不继续争用数字版本名。
+原生 checkpoint owner、inactive envelope target 和公共隐私出口的固定消费者验证为
+218通过、零跳过／失败。完整非硬件门禁另行记录，不把前驱报告合计当作组合验收。
+模型选择和默认控制路径继承主线；私有恢复数据不进入公共 Artifact，未重新拟合，
+不声明 Gateway operation/READY、磁盘冷恢复或 RPent 上下文恢复已经完成。
+
+主线历史 V25 为 `artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261026_v25.json`。
+V25 冻结 V24，登记显式模型选择、原生抓取观测的私有状态摘要及拒绝诊断的公开边界。
+继承 88 项输入并更新其中 3 项，新增 SAM3 客户端和三个抓取叶子，共 92 项输入、
+89 项 Python 源码；匹配固定提交 `83581f2ac`，直接消费者验收 766 项通过。
+默认 SAM2、进程内 GraspGenX 与 GraspMoE、v5 几何、原规划/碰撞/取消/HOLD 门禁保留。
+完整 oracle 端点检查留在私有诊断，公共查询只过滤这一新增字段，不更改原有公开字段。
+离线几何 benchmark 由固定 Git 与报告绑定，不加入运行时输入，也不授予执行权。
+本批未启动模型服务、设备或训练；不新增模型质量、真机、held-out 或六路并发资格。
+
+本分支另保留历史 checkpoint observer 候选：
+`artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261026_checkpoint_observer_v1.json`。
+它完整保留原候选 V25 的字节和身份，固定源码为 `db09fe458444`、147项输入，
+不改写主线 V25，也不将两份独立验收解释为组合验收。合流采用上面的独立
+checkpoint integration 绑定，并保留这份历史原件。
+
+历史 V24 为 `artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261025_v24.json`。
+V24 冻结 V23，并补齐 ControlStation 兼容调用方的源码绑定。继承的 86 项输入
+保持 V23 字节，新增兼容入口与 Real factory 两项，共 88 项输入、85 项源码，
+匹配固定提交 `9156ae01d`；对应调用方验收为 125 项通过、零失败。
+该默认关闭入口只装配既有绝对位姿 motion 与 measured-state Route，在资源创建前
+拒绝已退休或未装配的动作。双臂安全观察、所选单臂授权、原数值包络、执行 owner
+及 lower HOLD 关闭证据保留。本绑定不新增真机、模型或 held-out 认证。
+
+历史 V23 为 `artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261025_v23.json`。
+V23 冻结 V22，登记显式可选的 safe TCP v2、只读连续查询 v1–v5，以及已授权的
+十个调试运动入口归档。86 项输入匹配固定源码提交 `6b36561dc`；直接调用方验收
+为 1,744 通过、1 项原有可选依赖跳过。工具轴证据只覆盖采样参考与 float32
+发布表示；查询不能激活计划。既有运动、观测障碍检查、授权及下层 HOLD owner
+保留。新可选杂物任务显式使用其源合同的 1 kHz，既有 4 kHz 默认不变。
+未重新拟合机械臂响应，不代表新留出数据、模型服务、真机或六路并发调度验收。
+
+历史 V22 为 `artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261025_v22.json`。
+V22 冻结 V21，登记共享 supplied-image localization、真机兼容入口及默认关闭的 MuJoCo 定位。
+真机 v1 的既有契约身份和有界 CAS 读取保持一致；MuJoCo 保留原始图像坐标，
+复用现有分割模型及关闭门禁。更新4项来源，新增4项，共64项源码、65项输入。
+固定631项通过、1项原RPent配对轮子缺失跳过、零失败的消费者报告绑定
+`ab5de19b3dcda8cc66bae9a85f4916d0d7f6a28a` / `a835306ec77f78d2d9b2d7f8b0864741f2cf1b81`。
+该证据只覆盖本地离线集成，不新增模型、硬件或 held-out 响应认证。
+
+历史V21为 `artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261025_v21.json`。
+V21冻结V20，仅重绑motion_deployment一项源码，仍为60项源码、61项输入，无新增输入。
+显式profile导出恢复原79b6默认字节；归一化模式仅启用时明确输出，原语义hash、IK、
+控制及执行门禁不变。固定217项通过、零跳过的消费者报告绑定
+`d1a54844dcc27a9f24f48e7dd77788bbb11c7319` / `306fdc47e383abe480f92b0403ee7f213e4b3152`。
+
+历史V20为 `artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261025_v20.json`。
+V20在冻结V19之上登记默认关闭的对象/关系查询、认证表面锚点v1/v2/v3及显式safe profile，
+复用原规划、留存操作、CAS和资源关闭owner；更新5项来源，新增15项，共60项源码、61项输入。
+固定源码与567项通过、1项原RPent配对轮子缺失跳过、零失败的离线消费者报告绑定
+`78b09d63ff9e1efc42b9ca7738a00d76107d8c68` / `b4c0572d4394ebbf385665875abd58379ff4dc51`。
+冻结计划不能激活；查询保留原碰撞、质量、rig→planner锁序、绝对deadline和执行保护。
+候选局部包络拒绝可继续比较后续候选；稠密查询只对逐种子诊断做内联摘要，保留实际残差、
+覆盖、容差及拒因，不改变lower完整诊断、排名或认证。普通/观测点Route保留原范围。
+V20、V19、V18及历史绑定逐字保留，已有segment v2/v3仍按显式配置启用。
+本批不重拟合arm参数，`provisional`及新held-out `not_run`保留，不构成真机或模型能力验收。
+历史V17、V16及更早绑定字节保持。
+
+历史 V12 绑定为
+`artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261023_v12.json`。
+V12直接以冻结V10为前驱，登记完整native chain、分阶段接触策略和prepared Skill消费口；
+重绑planned TCP一项既有源码，新增显式motion_skill.py消费依赖，共21项源码、22项输入。
+实现及304项消费者报告绑定 `73b40a4b177ffe59026b40ff193b8e4ef93b7b7d` /
+`54b2d891fb66149da2453e727ef1d9ffe5e058d1`，不借用首次失败的完整验收或未提交工作树结果。
+本批没有新公开fast Route，不重拟合参数，不增加物理抓取或arm-response声明；
+`provisional` 与新held-out `not_run` 保持。独立B601候选V11未合入，不作为此前驱。
+
+v10历史运行时源码绑定冻结于
+`artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261023_v10.json`。
+它在冻结 v9 的基础上登记原生物体跟随、携物几何及物理步后保护：重新绑定
+executor、position rig 与 planned TCP 三项既有源码，并显式登记七项相关依赖。
+实现来源是 `7d66cb491d44c891ef41678f066b80d072f87315`；本次夹具与元数据
+迁移不改变所绑定的运行时代码。所引用的 115 项消费者回归确实运行于该提交及
+`c5b5fa16e7cdd202e30990e4b9c3c6dd086d9166` 源码树，未借用 v9 的旧报告。
+首轮完整验收的 11 项夹具／绑定失败以及旧课程正向实验的会话构造拒绝均另行保留，
+不将其记为通过；修复后的完整验收也单独记录。该绑定不提供完整抓放或真机验收，
+未重拟合参数，`provisional` 与新 held-out `not_run` 保持不变。
+v9 及全部更早清单按原字节保留。
+
+v9 历史运行时源码绑定冻结于
+`artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261022_v9.json`。
+它在冻结 v8 的基础上，登记固定左右单臂 Skill 会话的 planned-motion 更新，
+并补充 `agent_skill_target.py` 依赖；会话只选一臂，另一臂保留实测碰撞支持，
+默认仍为右臂。左臂抓取、夹爪、历史、空间推理及模型组合仍拒绝启用。
+源码修订为 `e4ab4e5d0580dd4cae3d2ce8aa783979025e5c0c`，这是添加本清单之前
+的实现提交；聚焦测试实际运行于 HEAD `11c34162e` 加 MERGE_HEAD `71faf8b1d`，
+其暂存树与 e4 的 `84cc94c8` 完全相同，并非提交 e4 后重跑。
+本清单、说明和回归迁移不改动所绑定的运行时代码。
+v9 按精确哈希引用 78 模块、1893 通过／6 跳过的聚焦离线报告及其源码树绑定，
+不把可选依赖跳过计为通过，也不把 v8 的 401 项报告解释成新实现的证据。
+首轮完整验收发现旧绑定未更新，此问题和修复后的完整重跑另行留存于阶段验收记录。
+本次没有重拟合、没有新增真机或 held-out 证据；`provisional` 与 held-out
+`not_run` 保持不变。v8、v7、v5 和 v4 拟合清单均按原字节保留。
+
+v8 历史运行时源码绑定冻结于
 `artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261018_v8.json`。
-它绑定当前 actuator、MuJoCo executor、最终命令准入、rig／assembly，以及显式
+它绑定当时 actuator、MuJoCo executor、最终命令准入、rig／assembly，以及显式
 目标接触的 oracle、projection、result、binding 和 planned-motion 源码，同时保留
 原 simulation contract、相机登记、冻结 v4 拟合及 v7／v5 运行时绑定的精确身份。
 本次相对 v7 改动两个既有源码文件，并新增五项接触路径源码依赖；没有调整执行器
@@ -257,3 +367,15 @@ surfaces. Real logs and calibration outputs are read-only evidence. Changes to
 `robot_motion/`, `teleop_runtime/`, `dataset_contracts/`, hardware behavior, or
 canonical entrypoints require a separate mainline decision and are outside this
 plan.
+
+历史 V13 以冻结 V12 为前驱，仅重绑 canonical collision projector 的安全准入查询范围；
+诊断与单调撤退保留原报告范围，原硬穿透、接触和最终输出门禁保持。22 项输入／21 项源码
+绑定固定提交 `b74fd69c52ab4bd107fd3860dd8c253f68cfc3b3`；本地消费者报告为 285 passed，
+不修改旧拟合参数或历史证据。新 held-out 仍为 not_run，fidelity 仍为 provisional。
+70 mm CAD 的 4000 Hz 配置仅用于该仿真接触任务，不代表真实系统响应重新标定。
+
+当前 V14 直接以前驱 V13 的冻结字节为基础，只重绑 oracle.py 中只读 forbidden geometry-pair
+清单接口；22 输入／21 源码仅该项改变，没有新增输入。原碰撞准入、诊断、撤退与最终输出
+门禁以及 RM65 响应配置保持；绑定固定提交 `b978c73d386bab608a0febb5ba1ba51e9cafded6`，原生离线消费者 77 passed。
+V11 为独立 B601 候选的历史绑定，不作为当前绑定；V12/V13 及旧 fit 均保留原字节。
+未重拟合响应参数，fidelity 仍 provisional，新 held-out 仍 not_run，不代表设备或抓取验收。

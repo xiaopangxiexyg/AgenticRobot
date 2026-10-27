@@ -21,6 +21,48 @@ from agent_gateway.profiles.mujoco.gateway_cli import (
 pytestmark = [pytest.mark.unit, pytest.mark.contract]
 
 
+def test_motion_side_is_explicit_fixed_and_defaults_to_right():
+    parser = build_parser()
+    required = ["--socket-path", "/unused/socket", "--task-config", "/unused/task.json"]
+    assert parser.parse_args(required).motion_side == "right"
+    assert parser.parse_args([*required, "--motion-side", "left"]).motion_side == "left"
+    assert not parser.parse_args(required).enable_object_follow_observation
+    assert not parser.parse_args(required).enable_rgbd_capture_v3
+    assert parser.parse_args([*required, "--enable-rgbd-capture-v3"]).enable_rgbd_capture_v3
+    assert parser.parse_args([*required, "--enable-object-follow-observation"]).enable_object_follow_observation
+    with pytest.raises(SystemExit) as captured:
+        parser.parse_args([*required, "--motion-side", "both"])
+    assert captured.value.code == 2
+
+
+@pytest.mark.parametrize("unsupported", [
+    ["--enable-grippers"],
+    ["--enable-fast-grasp"],
+    ["--enable-grasp-approach"],
+    ["--enable-spatial-goals"],
+    ["--enable-rgbd-capture-v3"],
+    ["--enable-segmentation-batch-v2"],
+    ["--enable-segmentation-geometry-v3"],
+    ["--history-root", "/unused/history"],
+    ["--segmentation-asset-bundle", "/unused/segmentation"],
+    ["--sam3-endpoint", "http://127.0.0.1:8114"],
+    ["--grasp-contact-target-body", "cube"],
+])
+def test_left_unsupported_combinations_fail_before_resources(monkeypatch, capsys, unsupported):
+    def forbidden(*args, **kwargs):
+        pytest.fail("Unsupported left combination must fail before path or resource work")
+
+    monkeypatch.setattr(gateway_cli, "_absolute_existing_file", forbidden)
+    monkeypatch.setattr(gateway_cli, "build_mujoco_agent_tcp_pose_gateway_session", forbidden)
+    with pytest.raises(SystemExit) as captured:
+        gateway_cli.main([
+            "--socket-path", "/unused/socket", "--task-config", "/unused/task.json",
+            "--motion-side", "left", *unsupported,
+        ])
+    assert captured.value.code == 2
+    assert "baseline TCP/state Routes only" in capsys.readouterr().err
+
+
 def test_bilateral_grippers_refuse_realtime_physics_before_session_construction(monkeypatch, tmp_path, capsys):
     from pathlib import Path
 
@@ -35,6 +77,151 @@ def test_bilateral_grippers_refuse_realtime_physics_before_session_construction(
         gateway_cli.main([*args, "--enable-grippers"])
     assert captured.value.code == 2
     assert "--enable-grippers requires --no-realtime-worker" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("flags", [
+    [], ["--enable-fast-grasp"],
+    ["--graspgenx-source-root", "/unused/graspgenx"],
+])
+def test_fast_grasp_is_explicit_and_requires_its_complete_resource_graph(flags):
+    parser = build_parser()
+    args = parser.parse_args([
+        "--socket-path", "/unused/socket", "--task-config", "/unused/task.json", *flags,
+    ])
+    if not flags:
+        assert gateway_cli._fast_grasp_model_from_args(parser, args) is None
+    else:
+        with pytest.raises(SystemExit) as captured:
+            gateway_cli._fast_grasp_model_from_args(parser, args)
+        assert captured.value.code == 2
+
+
+def test_backend_options_preserve_defaults_and_require_explicit_fast_grasp():
+    parser = build_parser()
+    required = ["--socket-path", "/unused/socket", "--task-config", "/unused/task.json"]
+    defaults = parser.parse_args(required)
+    assert defaults.sam3_endpoint is None
+    assert defaults.graspgenx_planner == "graspmoe"
+    assert defaults.graspgenx_mode == "in-process"
+    with pytest.raises(SystemExit):
+        gateway_cli._fast_grasp_model_from_args(
+            parser, parser.parse_args([*required, "--graspgenx-planner", "diffusion"]),
+        )
+    for flags in (["--graspgenx-mode", "service"], ["--graspgenx-port", "5557"]):
+        with pytest.raises(SystemExit):
+            gateway_cli._fast_grasp_model_from_args(parser, parser.parse_args([*required, *flags]))
+
+
+def test_service_fast_grasp_uses_existing_inert_client_without_inprocess_source(monkeypatch, tmp_path):
+    from deployments.perception import graspgenx_client, sam2_graspgenx_point_grasp
+
+    parser = build_parser()
+    bundle, artifacts = tmp_path / "bundle", tmp_path / "artifacts"
+    bundle.mkdir()
+    artifacts.mkdir()
+    args = parser.parse_args([
+        "--socket-path", str(tmp_path / "gateway.sock"), "--task-config", "/unused/task.json",
+        "--enable-fast-grasp", "--enable-grasp-approach", "--enable-grippers",
+        "--no-realtime-worker", "--grasp-contact-target-body", "debug_cube",
+        "--artifact-root", str(artifacts), "--graspgenx-point-grasp-bundle", str(bundle),
+        "--sam3-endpoint", "http://127.0.0.1:8114", "--graspgenx-mode", "service",
+        "--graspgenx-port", "5557", "--graspgenx-timeout-ms", "50000",
+    ])
+    monkeypatch.setattr(sam2_graspgenx_point_grasp.GraspGenXPointGraspModelSpec,
+                        "from_asset_bundle", lambda path: object())
+    monkeypatch.setattr(sam2_graspgenx_point_grasp, "Sam2GraspGenXPointGraspPlanner",
+                        lambda **kwargs: SimpleNamespace(**kwargs))
+    monkeypatch.setattr(graspgenx_client, "GraspGenXInProcessBackend",
+                        lambda **kwargs: pytest.fail("Service mode must not construct in-process weights"))
+    monkeypatch.setattr(graspgenx_client.GraspGenXClient, "start",
+                        lambda self: pytest.fail("Construction cannot connect or start a model"))
+    model = gateway_cli._fast_grasp_model_from_args(parser, args)
+    assert args.graspgenx_source_root is None
+    assert isinstance(model.client, graspgenx_client.GraspGenXClient)
+    assert model.client.host == "127.0.0.1" and model.client.port == 5557
+    assert model.client.timeout_ms == 50000
+    assert model.planner == "graspmoe" and model.enable_finger_exchange
+    model.client.close()
+
+
+def test_fast_grasp_sam3_reuses_typed_ports_and_explicit_planner(monkeypatch, tmp_path):
+    from deployments.perception import graspgenx_client, sam2_graspgenx_point_grasp
+    from deployments.perception.sam3_service import Sam3ServiceLocalizer
+
+    parser = build_parser()
+    paths = [tmp_path / name for name in ("generator", "source", "artifacts")]
+    for path in paths:
+        path.mkdir()
+    args = parser.parse_args([
+        "--socket-path", str(tmp_path / "gateway.sock"), "--task-config", "/unused/task.json",
+        "--enable-fast-grasp", "--enable-grasp-approach", "--enable-grippers",
+        "--no-realtime-worker", "--grasp-contact-target-body", "debug_cube",
+        "--artifact-root", str(paths[2]), "--graspgenx-point-grasp-bundle", str(paths[0]),
+        "--graspgenx-source-root", str(paths[1]), "--sam3-endpoint", "http://127.0.0.1:8114",
+        "--graspgenx-planner", "diffusion",
+    ])
+    spec = object()
+    monkeypatch.setattr(sam2_graspgenx_point_grasp.GraspGenXPointGraspModelSpec,
+                        "from_asset_bundle", lambda path: spec)
+    monkeypatch.setattr(graspgenx_client, "GraspGenXInProcessBackend",
+                        lambda **kwargs: SimpleNamespace(**kwargs))
+    monkeypatch.setattr(sam2_graspgenx_point_grasp, "Sam2GraspGenXPointGraspPlanner",
+                        lambda **kwargs: SimpleNamespace(**kwargs))
+    model = gateway_cli._fast_grasp_model_from_args(parser, args)
+    assert isinstance(model.point_segmenter, Sam3ServiceLocalizer)
+    assert not model.point_segmenter.started  # Resource startup remains session-owned.
+    assert model.planner == "diffusion"
+    assert model.model_spec is spec and model.client.model_spec is spec
+    assert model.enable_finger_exchange
+    assert model.alignment_profile_id == args.graspgenx_alignment_profile
+    args.sam2_grounding_dino_bundle = paths[0]
+    with pytest.raises(SystemExit):
+        gateway_cli._fast_grasp_model_from_args(parser, args)
+
+
+@pytest.mark.parametrize("flags,message", [
+    (["--sam3-endpoint", "http://127.0.0.1:8114"], "requires --artifact-root"),
+    (["--sam3-endpoint", "http://127.0.0.1:8114", "--segmentation-asset-bundle", "/unused"],
+     "mutually exclusive"),
+])
+def test_sam3_incomplete_graph_fails_before_model_or_simulator_start(monkeypatch, tmp_path, capsys, flags, message):
+    def forbidden(**kwargs):
+        pytest.fail("Invalid perception selection must not construct a simulator")
+    monkeypatch.setattr(gateway_cli, "build_mujoco_agent_tcp_pose_gateway_session", forbidden)
+    task = gateway_cli.repo_root() / "sim/configs/tasks/rm65_right_cube_reach_fixed_pose_xyz_proprio_v1.json"
+    with pytest.raises(SystemExit):
+        gateway_cli.main(["--socket-path", str(tmp_path / "gateway.sock"),
+                          "--task-config", str(task), *flags])
+    assert message in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("flag", ["--enable-segmentation-batch-v2", "--enable-segmentation-geometry-v3"])
+def test_same_cut_segmentation_accepts_explicit_sam3_without_starting_resources(monkeypatch, tmp_path, flag):
+    from deployments.perception.sam3_service import Sam3ServiceLocalizer
+
+    class AssemblyReached(Exception):
+        pass
+
+    received = {}
+
+    def assemble(**kwargs):
+        received.update(kwargs)
+        raise AssemblyReached
+
+    monkeypatch.setattr(gateway_cli, "build_mujoco_agent_tcp_pose_gateway_session", assemble)
+    monkeypatch.setattr(Sam3ServiceLocalizer, "start",
+                        lambda self: pytest.fail("CLI construction cannot start the model service"))
+    task = gateway_cli.repo_root() / "sim/configs/tasks/rm65_right_cube_reach_fixed_pose_xyz_proprio_v1.json"
+    artifacts = tmp_path / "artifacts"
+    artifacts.mkdir()
+    with pytest.raises(AssemblyReached):
+        gateway_cli.main([
+            "--socket-path", str(tmp_path / "gateway.sock"), "--task-config", str(task),
+            "--artifact-root", str(artifacts), "--sam3-endpoint", "http://127.0.0.1:8114", flag,
+        ])
+    assert isinstance(received["segmentation_localizer"], Sam3ServiceLocalizer)
+    assert not received["segmentation_localizer"].started
+    assert received[flag[2:].replace("-", "_")] is True
 
 
 def test_cli_import_does_not_load_optional_perception_models() -> None:
@@ -82,10 +269,48 @@ def _session(*, started: bool):
 
 def test_spatial_goal_cli_is_explicitly_optional():
     parser = build_parser()
-    assert parser.get_default("enable_spatial_goals") is False
+    assert parser.get_default("enable_spatial_goals") is None  # Resolve by supported motion side.
     action = next(item for item in parser._actions if item.dest == "enable_spatial_goals")
-    assert action.option_strings == ["--enable-spatial-goals"]
-    assert action.const is True
+    assert action.option_strings == ["--enable-spatial-goals", "--no-enable-spatial-goals"]
+
+
+def test_tcp_pose_comparison_cli_is_explicitly_optional():
+    parser = build_parser()
+    assert parser.get_default("enable_tcp_pose_comparison") is True
+    action = next(item for item in parser._actions if item.dest == "enable_tcp_pose_comparison")
+    assert action.option_strings == ["--enable-tcp-pose-comparison", "--no-enable-tcp-pose-comparison"]
+
+
+@pytest.mark.parametrize("side,flags,spatial,comparison", [
+    ("right", [], True, True),
+    ("left", [], False, True),
+    ("right", ["--no-enable-spatial-goals"], False, True),
+    ("right", ["--no-enable-tcp-pose-comparison"], True, False),
+    ("left", ["--no-enable-tcp-pose-comparison"], False, False),
+    ("right", ["--enable-spatial-goals", "--enable-tcp-pose-comparison"], True, True),
+])
+def test_read_only_defaults_reach_original_assembly_without_starting_resources(
+    monkeypatch, tmp_path, side, flags, spatial, comparison
+):
+    class AssemblyReached(Exception):
+        pass
+
+    received = {}
+
+    def assemble(**kwargs):
+        received.update(kwargs)
+        raise AssemblyReached
+
+    monkeypatch.setattr(gateway_cli, "build_mujoco_agent_tcp_pose_gateway_session", assemble)
+    task = gateway_cli.repo_root() / "sim/configs/tasks/rm65_right_cube_reach_fixed_pose_xyz_proprio_v1.json"
+    with pytest.raises(AssemblyReached):
+        gateway_cli.main(["--socket-path", str(tmp_path / "gateway.sock"),
+                          "--task-config", str(task), "--motion-side", side, *flags])
+    assert received["enable_spatial_goals"] is spatial
+    assert received["enable_tcp_pose_comparison"] is comparison
+    assert received["fast_grasp_planner"] is None
+    assert received["segmentation_localizer"] is None
+    assert received["enable_grippers"] is False
 
 
 def test_never_activated_gateway_closes_safely_without_hold_claim() -> None:
@@ -400,3 +625,96 @@ def test_cli_rejects_overlong_socket_before_simulator_assembly(
     assert "uses 109 encoded bytes" in error
     assert "will not relocate it automatically" in error
     assert "Traceback" not in error
+
+
+def test_safe_motion_profile_is_explicit_and_rejected_before_startup(capsys):
+    default = build_parser().get_default("safe_tcp_motion_profile")
+    assert default == "local_step"
+    with pytest.raises(SystemExit) as error:
+        gateway_cli.main(["--socket-path", "/not-used/gateway.sock", "--task-config", "/not-used/task.json",
+                          "--client-id", "test", "--client-uid", str(os.getuid()),
+                          "--safe-tcp-motion-profile", "object_relation"])
+    assert error.value.code == 2
+    assert "--safe-tcp-motion-profile requires --enable-safe-tcp-pose" in capsys.readouterr().err
+
+
+def test_object_query_is_default_off_and_requires_safe_geometry(capsys):
+    assert build_parser().get_default("enable_object_goal_queries") is False
+    with pytest.raises(SystemExit) as error:
+        gateway_cli.main(["--socket-path", "/not-used/gateway.sock", "--task-config", "/not-used/task.json",
+                          "--client-id", "test", "--client-uid", str(os.getuid()), "--enable-object-goal-queries"])
+    assert error.value.code == 2
+    assert "requires --enable-safe-tcp-pose" in capsys.readouterr().err
+
+
+def test_surface_anchor_v2_is_opt_in_and_rejected_before_resource_startup(capsys):
+    assert build_parser().get_default("enable_surface_anchor_v2") is False
+    with pytest.raises(SystemExit) as error:
+        gateway_cli.main(["--socket-path", "/not-used/gateway.sock", "--task-config", "/not-used/task.json",
+                          "--client-id", "test", "--client-uid", str(os.getuid()), "--enable-surface-anchor-v2"])
+    assert error.value.code == 2
+    assert "--enable-surface-anchor-v2 requires" in capsys.readouterr().err
+
+
+def test_surface_selection_profile_is_default_preserving_and_requires_v2_before_startup(capsys):
+    assert build_parser().get_default("surface_anchor_selection_policy") == "prompt_nearest"
+    with pytest.raises(SystemExit) as error:
+        gateway_cli.main(["--socket-path", "/not-used/gateway.sock", "--task-config", "/not-used/task.json",
+                          "--client-id", "test", "--client-uid", str(os.getuid()),
+                          "--surface-anchor-selection-policy", "max_clearance_medoid"])
+    assert error.value.code == 2
+    assert "requires --enable-surface-anchor-v2" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("policy", ["max_clearance_medoid", "unknown", True, None, []])
+def test_surface_selection_policy_is_checked_at_both_direct_assembly_boundaries(policy):
+    from agent_gateway.profiles.mujoco.motion_deployment import (
+        build_mujoco_agent_tcp_pose_contract_bundle,
+    )
+    from agent_gateway.profiles.mujoco.motion_factory import (
+        build_mujoco_agent_tcp_pose_gateway_session,
+    )
+
+    with pytest.raises(ValueError, match="selection policy"):
+        build_mujoco_agent_tcp_pose_contract_bundle(application=None,
+            surface_anchor_selection_policy=policy)
+    with pytest.raises(ValueError, match="selection policy"):
+        build_mujoco_agent_tcp_pose_gateway_session(target_config=None,
+            allowed_client_ids=("test",), surface_anchor_selection_policy=policy)
+
+
+def test_relation_query_is_default_off_and_requires_authenticated_surface_anchors(capsys):
+    assert build_parser().get_default("enable_relation_goal_queries") is False
+    with pytest.raises(SystemExit) as error:
+        gateway_cli.main(["--socket-path", "/not-used/gateway.sock", "--task-config", "/not-used/task.json",
+                          "--client-id", "test", "--client-uid", str(os.getuid()),
+                          "--enable-relation-goal-queries"])
+    assert error.value.code == 2
+    assert "--enable-relation-goal-queries requires --enable-surface-anchors" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("enabled", [True, "yes", 1])
+def test_relation_query_factory_rejects_invalid_dependency_before_resources(enabled):
+    from agent_gateway.profiles.mujoco.motion_factory import (
+        build_mujoco_agent_tcp_pose_gateway_session,
+    )
+
+    with pytest.raises(ValueError, match="Relation goal queries require"):
+        build_mujoco_agent_tcp_pose_gateway_session(target_config=None,
+            allowed_client_ids=("test",), enable_relation_goal_queries=enabled)
+
+
+@pytest.mark.parametrize("paired_flags,retention,message", [
+    ([], 3, "requires v2 anchors, RGB-D v3 and segmentation v3"),
+    (["--enable-rgbd-capture-v3", "--enable-segmentation-geometry-v3"], 2,
+     "requires capture, segmentation and anchor retention"),
+])
+def test_surface_anchor_v3_dependencies_fail_before_resource_startup(paired_flags, retention, message, capsys):
+    with pytest.raises(SystemExit) as error:
+        gateway_cli.main(["--socket-path", "/not-used/gateway.sock", "--task-config", "/not-used/task.json",
+            "--enable-safe-tcp-pose", "--enable-object-goal-queries", "--enable-surface-anchors",
+            "--enable-surface-anchor-v2", "--enable-surface-anchor-v3",
+            "--artifact-root", "/not-used/artifacts", "--segmentation-asset-bundle", "/not-used/model",
+            "--max-retained-operations", str(retention), *paired_flags])
+    assert error.value.code == 2
+    assert message in capsys.readouterr().err

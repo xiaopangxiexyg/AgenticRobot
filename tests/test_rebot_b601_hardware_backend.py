@@ -944,6 +944,54 @@ def test_active_report_cache_preference_requires_explicit_freshness(preference, 
     assert not backend.connected
 
 
+
+@pytest.mark.parametrize("source", ["type24", "type2", "stale"])
+def test_type24_preference_on_older_runtime_preserves_strict_generic_admission(source):
+    from hardware.rebot_b601_rs.active_report import B601ActiveReportControlGate
+
+    controller = _FakeController()
+    assert "active_report_observation_v1" not in controller.robstride_capabilities
+    backend = B601RSBackend(
+        _config(), controller_factory=lambda _: controller, clock=lambda: 10.0
+    )
+    backend.connect()
+    _populate_states(controller)
+    for index, motor in controller.motors.items():
+        # Older Python bindings may lack the dedicated getter entirely.
+        motor.robstride_get_active_report_observation = None
+        motor.observation = SimpleNamespace(
+            state=motor.state, status_sequence=20 + index, receive_age_ns=5_000_000
+        )
+        if index == 2 and source == "type2":
+            motor.observation.state = SimpleNamespace(
+                **{**vars(motor.state), "arbitration_id": 0x02000000 + index}
+            )
+        if index == 2 and source == "stale":
+            motor.observation.receive_age_ns = 200_000_000
+    gate = B601ActiveReportControlGate(B601_RS_ARM_JOINT_NAMES, 0.1)
+    state = backend.poll_feedback(
+        require_host_freshness=True, prefer_active_report=True
+    )
+    if source == "type24":
+        assert gate.observe(state) is False
+        with pytest.raises(ValueError, match="advance"):
+            gate.observe(backend.poll_feedback(
+                require_host_freshness=True, prefer_active_report=True
+            ))
+        for motor in controller.motors.values():
+            motor.observation.status_sequence += 10
+        assert gate.observe(backend.poll_feedback(
+            require_host_freshness=True, prefer_active_report=True
+        ))
+    else:
+        with pytest.raises(ValueError):
+            gate.observe(state)
+        assert not gate.baseline_established
+    assert all(
+        name == "robstride_get_state_observation"
+        for motor in controller.motors.values() for name, _ in motor.calls
+    )
+
 def test_host_fresh_poll_rejects_operation_status_older_than_timeout() -> None:
     controller = _FakeController()
     backend = B601RSBackend(

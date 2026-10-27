@@ -129,6 +129,8 @@ if sys.version_info[:2] != (3, 10):
 required = (
     "numpy",
     "scipy",
+    "trimesh",
+    "embreex",
     "pinocchio",
     "pink",
     "qpsolvers",
@@ -147,6 +149,9 @@ required = (
 missing = [name for name in required if importlib.util.find_spec(name) is None]
 if missing:
     raise SystemExit("missing imports: " + ", ".join(missing))
+
+# Resolve the compiled ray backend as well as the top-level packages.
+from trimesh.ray.ray_pyembree import RayMeshIntersector
 
 print("DexTeleop full environment imports ok")
 print("python", sys.version.split()[0])

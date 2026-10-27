@@ -780,6 +780,158 @@ def test_deployable_sim_runs_one_authoritative_control_and_trace_chain() -> None
     assert runtime.trace_facts[-1].event_type == "runtime_trace_terminal"
 
 
+@pytest.mark.parametrize("expired_by", (0.0, 0.01))
+@pytest.mark.parametrize("has_existing_segment", (False, True))
+def test_support_expiring_after_publication_never_starts_adaptation(
+    monkeypatch, expired_by, has_existing_segment,
+) -> None:
+    runtime, scene, clock = build_runtime()
+    runtime.start()
+    try:
+        if has_existing_segment:
+            assert runtime.submit_policy_action(action(), policy_output_id="previous").accepted
+            assert runtime.step(now=clock()).status == "dispatched"
+            clock.value += .1
+        previous_segments = dict(runtime.core._active_segment_by_group)
+        previous_epoch = runtime.core.execution_epoch
+        previous_commands = list(scene.physics_commands)
+        assert runtime.submit_policy_action(action(), policy_output_id="expiring").accepted
+        publish = runtime.core.arbitration_runtime.publish
+
+        def publish_then_expire(*args, **kwargs):
+            attempt, decision = publish(*args, **kwargs)
+            assert attempt.accepted and decision is not None
+            assert decision.published_at < decision.supported_until
+            clock.value = decision.supported_until + expired_by
+            return attempt, decision
+
+        def forbidden_adaptation(_request):
+            pytest.fail("An expired decision must not start representation adaptation")
+
+        monkeypatch.setattr(runtime.core.arbitration_runtime, "publish", publish_then_expire)
+        monkeypatch.setattr(runtime.core.action_representation_adapter, "adapt", forbidden_adaptation)
+        step = runtime.step(now=clock())
+
+        assert step.status == "target_support_expired_before_adaptation_keep_existing"
+        assert step.publication_attempt.accepted and step.decision is not None
+        assert step.decision.supported_until <= clock()
+        assert step.action_adaptation is None and step.target_execution_request is None
+        assert step.target_submission_receipt is None and step.target_dispatch_result is None
+        assert step.cancellation is None and step.safety_result is None
+        assert step.command is None and step.dispatch_receipts is None
+        assert step.directive.global_status == "normal"
+        assert all(item.directive == "publish_selected"
+                   for item in step.directive.directive_by_selection_group.values())
+        assert runtime.core._active_segment_by_group == previous_segments
+        assert runtime.core.execution_epoch == previous_epoch
+        assert scene.physics_commands == previous_commands
+        assert not any(fact.event_type == "action_adaptation_request" for fact in step.trace_facts)
+    finally:
+        runtime.close()
+
+
+def test_live_support_starts_representation_adaptation_exactly_once(monkeypatch) -> None:
+    runtime, _scene, clock = build_runtime()
+    runtime.start()
+    try:
+        assert runtime.submit_policy_action(action(), policy_output_id="live").accepted
+        original = runtime.core.action_representation_adapter.adapt
+        requests = []
+
+        def adapt_once(request):
+            requests.append(request)
+            return original(request)
+
+        monkeypatch.setattr(runtime.core.action_representation_adapter, "adapt", adapt_once)
+        step = runtime.step(now=clock())
+        assert step.status == "dispatched" and len(requests) == 1
+        assert requests[0].requested_at < requests[0].supported_until
+        assert step.action_adaptation.request is requests[0]
+    finally:
+        runtime.close()
+
+
+@pytest.mark.parametrize("supports_local_stop", (False, True))
+def test_support_expiry_before_adaptation_preserves_mixed_group_hold(
+    monkeypatch, supports_local_stop,
+) -> None:
+    from robot_motion.action import (
+        BIMANUAL_QPOS_V1, build_robot_action_v1_runtime_schema,
+        build_robot_action_v1_target_capability,
+    )
+    from robot_motion.action.authority import AuthorityPolicySpec
+    from robot_motion.action.components import ActionComponentCatalog, ActionComponentSpec
+
+    seed, _scene, clock = build_runtime()
+    try:
+        template = seed.core.config
+        groups = ("left", "right")
+        schema = build_robot_action_v1_runtime_schema(component_catalog=ActionComponentCatalog(
+            "independent-arms", BIMANUAL_QPOS_V1,
+            tuple(ActionComponentSpec(f"{side}_arm", side, f"{side}_arm") for side in groups),
+        ))
+        route = template.component_target_capability.component_routes[0]
+        capability = build_robot_action_v1_target_capability(
+            capability_id="independent-arms", action_schema=schema,
+            handler_contract_id=route.handler_contract_id,
+            handler_contract_hash=route.handler_contract_hash,
+            output_target_schema_hash=route.output_target_schema_hash,
+        )
+        config = replace(template, action_schema=schema, active_selection_groups=groups,
+            component_target_capability=capability,
+            execution_capability=replace(template.execution_capability,
+                validated_selection_groups=groups, supports_local_group_stop=supports_local_stop),
+            authority_policy=AuthorityPolicySpec(policy_id="mixed-group-policy",
+                priority_by_group={group: {"kind:policy": 10} for group in groups},
+                fallback_by_group={"left": "no_action", "right": "hold"}),
+        )
+        holds = []
+
+        def hold(cancellation):
+            holds.append(cancellation)
+            return {level: True for level in cancellation.required_ack_levels}
+
+        core = AuthoritativeControlRuntime(config,
+            dispatcher=lambda _command: pytest.fail("Expired mixed action must not dispatch"),
+            backend_hold=hold, backend_name="mixed-group-test", clock=clock)
+        core.activate_producer(producer_id="policy", producer_epoch=1)
+        core.admit_execution_gate(status="ready", reason="test ready")
+        receipt = core.admit_proposal(ActionProposalDraft(
+            runtime_session_id=config.runtime_session_id, control_domain_id=config.control_domain_id,
+            embodiment_instance_id=config.embodiment_instance_id,
+            producer_kind="policy", producer_id="policy", producer_epoch=1, sequence=0,
+            action=project_robot_action_v1_to_component_action(
+                RobotAction.bimanual_qpos(left_arm=np.zeros(6), source="policy"), action_schema=schema),
+            produced_at=clock(), produced_clock_domain_id=config.clock_domain.clock_domain_id,
+            effective_from=clock(), effective_until=clock() + .25,
+            target_effective_at=clock(), effective_clock_domain_id=config.clock_domain.clock_domain_id,
+        ), source_event_id="mixed-group-proposal")
+        assert receipt.accepted
+        publish = core.arbitration_runtime.publish
+
+        def publish_then_expire(*args, **kwargs):
+            attempt, decision = publish(*args, **kwargs)
+            assert attempt.accepted and decision is not None
+            clock.value = decision.supported_until
+            return attempt, decision
+
+        monkeypatch.setattr(core.arbitration_runtime, "publish", publish_then_expire)
+        monkeypatch.setattr(core.action_representation_adapter, "adapt",
+            lambda _request: pytest.fail("Expired action must not reach the adapter"))
+        step = core.run_decision(now=clock())
+
+        assert dict(step.computation.status_by_group) == {"left": "selected", "right": "hold"}
+        assert step.status == "execution_cancelled"
+        assert step.cancellation_receipt.complete and len(holds) == 1
+        assert step.cancellation.effective_scope == (
+            "selection_groups" if supports_local_stop else "control_domain")
+        assert step.directive.directive_by_selection_group["right"].directive == "cancel_group_and_hold"
+        assert step.action_adaptation is None and step.target_execution_request is None
+        assert step.safety_result is None and step.dispatch_receipts is None
+    finally:
+        seed.close()
+
+
 def test_adaptation_rejection_never_reaches_safety_or_dispatch() -> None:
     runtime, scene, clock = build_runtime()
     runtime.core.action_representation_adapter = (
@@ -3001,6 +3153,11 @@ def test_close_retries_only_the_resource_that_remains_pending() -> None:
 
 def test_start_rollback_failure_keeps_only_failed_resource_closeable() -> None:
     runtime, _scene, _clock = build_runtime()
+    assert runtime.capture_lifecycle_diagnostics() == {
+        "started": False, "lifecycle_entered": False,
+        "rig_close_pending": False, "trace_close_pending": False,
+        "trace_terminal": False,
+    }
     events: list[str] = []
     rig_close_attempts = 0
     runtime._sync_reference_trace = lambda: events.append("trace.sync")
@@ -3028,6 +3185,11 @@ def test_start_rollback_failure_keeps_only_failed_resource_closeable() -> None:
         failure.label for failure in caught.value.rollback_failures
     ) == ("mujoco_execution_rig.close",)
     assert events == ["rig.start", "rig.close:1"]
+    assert runtime.capture_lifecycle_diagnostics() == {
+        "started": False, "lifecycle_entered": True,
+        "rig_close_pending": True, "trace_close_pending": True,
+        "trace_terminal": False,
+    }
 
     runtime.close()
 
@@ -3038,6 +3200,11 @@ def test_start_rollback_failure_keeps_only_failed_resource_closeable() -> None:
         "trace.sync",
         "trace.close",
     ]
+    assert runtime.capture_lifecycle_diagnostics() == {
+        "started": False, "lifecycle_entered": False,
+        "rig_close_pending": False, "trace_close_pending": False,
+        "trace_terminal": True,
+    }
 
 
 def test_close_does_not_retry_trace_after_terminal_sink_failure() -> None:
@@ -3059,6 +3226,12 @@ def test_close_does_not_retry_trace_after_terminal_sink_failure() -> None:
 
     assert events == ["rig.close", "trace.sync", "trace.terminal_sink"]
     assert runtime._started is False
+    # Terminalization and release state must not swallow publication failure.
+    assert runtime.capture_lifecycle_diagnostics() == {
+        "started": False, "lifecycle_entered": False,
+        "rig_close_pending": False, "trace_close_pending": False,
+        "trace_terminal": True,
+    }
     assert sum(
         fact.event_type == "runtime_trace_terminal"
         for fact in runtime.core.trace_facts

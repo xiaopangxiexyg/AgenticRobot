@@ -149,6 +149,22 @@ class MujocoPoseKinematicsBinding:
         )
 
 
+def pose_projector_contract_hash(*, model_contract_id, model_contract_hash, bindings):
+    """Identity of actual immutable FK bindings, independent of scratch data."""
+    return canonical_content_hash(
+        {
+            "model_contract_id": model_contract_id,
+            "model_contract_hash": model_contract_hash,
+            "binding_hash_by_component": {
+                value.component_id: value.semantic_content_hash for value in bindings
+            },
+            "live_state_mutation": False,
+            "fk_engine": "mujoco.private_mjdata",
+        },
+        domain=MUJOCO_POSE_PROJECTOR_HASH_DOMAIN,
+    )
+
+
 class MujocoPoseObservationProjector:
     """Evaluate component-keyed FK poses without touching live ``MjData``."""
 
@@ -199,18 +215,10 @@ class MujocoPoseObservationProjector:
             model_contract_hash,
             name="model_contract_hash",
         )
-        self.semantic_content_hash = canonical_content_hash(
-            {
-                "model_contract_id": self.model_contract_id,
-                "model_contract_hash": self.model_contract_hash,
-                "binding_hash_by_component": {
-                    value.component_id: value.semantic_content_hash
-                    for value in values
-                },
-                "live_state_mutation": False,
-                "fk_engine": "mujoco.private_mjdata",
-            },
-            domain=MUJOCO_POSE_PROJECTOR_HASH_DOMAIN,
+        self.semantic_content_hash = pose_projector_contract_hash(
+            model_contract_id=self.model_contract_id,
+            model_contract_hash=self.model_contract_hash,
+            bindings=values,
         )
         self.contract_id = (
             f"mujoco-pose-observation-projector:{self.semantic_content_hash}"

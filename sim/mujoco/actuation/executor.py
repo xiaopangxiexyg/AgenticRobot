@@ -577,7 +577,7 @@ class MujocoActuatedPositionExecutor:
         self.scene.mujoco.mj_step(self.scene.model, self.scene.data)
         hard_contact = False
         if projector is not None:
-            post_check = projector.oracle.check_contacts(self.scene.data)
+            post_check = self._active_contact_check(projector)
             self._last_active_collision_check = post_check
             if not post_check.safe:
                 hard_contact = True
@@ -753,11 +753,16 @@ class MujocoActuatedPositionExecutor:
             gripper_close_by_name=command.gripper_close_by_name,
         )
 
-    def _check_active_contact_or_latch(self, projector, *, phase: str) -> None:
+    def _active_contact_check(self, projector):
+        """Use the same canonical and scoped guards on both sides of mj_step."""
         check = projector.oracle.check_contacts(self.scene.data)
         additional = getattr(self, "_additional_contact_oracle", None)
         if check.safe and additional is not None:
             check = additional.check_contacts(self.scene.data)
+        return check
+
+    def _check_active_contact_or_latch(self, projector, *, phase: str) -> None:
+        check = self._active_contact_check(projector)
         self._last_active_collision_check = check
         if not check.safe:
             self._hard_contact_latched = True

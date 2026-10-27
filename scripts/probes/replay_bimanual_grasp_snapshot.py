@@ -6,6 +6,11 @@ the camera used to observe an object never selects the arm that will grasp it.
 """
 from __future__ import annotations
 
+from deployments.dmtac_graspgenx_alignment_ids import (
+    DMTAC_M_GRASPGENX_ALIGNMENT_PROFILE_ID,
+    DMTAC_M_GRASPGENX_ALIGNMENT_PROFILE_IDS,
+)
+
 import argparse
 import json
 import time
@@ -22,7 +27,9 @@ from agent_gateway.profiles.real.realsense_perception import build_real_percepti
 from agent_gateway.profiles.real.rm65_camera_geometry import build_rm65_rgb_camera_geometry, load_rm65_wrist_camera_side_axis_tool
 from agent_gateway.profiles.real.rm65_grasp_reachability import RM65PointGraspReachabilityAdapter, arm_base_origin_in_candidate_frame
 from agent_gateway.profiles.real.station_point_grasp_deployment import StationPointGraspArmReachabilityProfile
-from deployments.perception.dmtac_grasp_overlay import reviewed_graspgenx_dmtac_solid_geometry
+from deployments.perception.dmtac_grasp_overlay import (
+    reviewed_graspgenx_dmtac_solid_geometry,
+)
 from deployments.perception.grasp_multiview import GraspRgbdView, fuse_grasp_views
 from deployments.perception.grasp_planning_priority import grasp_planning_candidate_ordinals
 from deployments.perception.sam2_graspgenx_point_grasp import (
@@ -169,7 +176,8 @@ def prepare(args):
 
     segment_aux = RetainedAuxiliarySegmenter(getattr(args, "aux_segmentation", ()))
 
-    solid = reviewed_graspgenx_dmtac_solid_geometry()
+    solid = reviewed_graspgenx_dmtac_solid_geometry(alignment_profile_id=getattr(
+        args, "graspgenx_alignment_profile", DMTAC_M_GRASPGENX_ALIGNMENT_PROFILE_ID))
     fused = fuse_grasp_views(anchor=anchor, anchor_mask=mask,
         anchor_pixel_uv=tuple(args.pixel) if args.refine_target_depth else None,
         auxiliary=tuple(v for k, v in views.items() if k != args.anchor),
@@ -257,7 +265,7 @@ def replay(args):
 
     point = Sam2GraspGenXPointGraspPlanner(model_spec=spec,
         point_segmenter=SimpleNamespace(segment_point=lambda *_a, **_k: mask.copy()), client=backend,
-        solid_geometry=reviewed_graspgenx_dmtac_solid_geometry(), enable_finger_exchange=True,
+        alignment_profile_id=getattr(args, "graspgenx_alignment_profile", DMTAC_M_GRASPGENX_ALIGNMENT_PROFILE_ID), enable_finger_exchange=True,
         orientation_variants_local_axis_degrees=GRASPGENX_DMTAC_REACHABILITY_ORIENTATION_VARIANTS_LOCAL_AXIS_DEG,
         preferred_approach_origins_base_m=tuple(context.origin for context in contexts.values()))
     shared, perception_error = None, None
@@ -361,6 +369,9 @@ def replay(args):
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("--graspgenx-alignment-profile",
+        choices=DMTAC_M_GRASPGENX_ALIGNMENT_PROFILE_IDS, default=DMTAC_M_GRASPGENX_ALIGNMENT_PROFILE_ID,
+        help="Default v5 nominal alignment; select v4 explicitly for legacy geometry.")
     for name in ("repo", "canonical", "capture", "mask", "urdf", "output", "bundle"):
         p.add_argument("--"+name, required=True, type=Path)
     p.add_argument("--inference", type=Path)

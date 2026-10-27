@@ -334,6 +334,23 @@ requested semantic-role order. The trusted MuJoCo profile maps semantic roles
 to lower camera sources. Inline capture results contain only bounded metadata
 and content hashes. Pixel arrays never enter the control frame.
 
+MuJoCo可通过显式 `--enable-rgbd-capture-v3`（同时提供 `--artifact-root`）
+增加只读 `perception.capture_rgb@3`，默认不发布，原RGB版本与身份保持。
+`include_depth=false`沿用有序RGB捕获；为true时只允许一个已有aligned-depth角色的原生网格，
+输出同一次cut的原始JPEG、NPY和paired metadata。原始字节缺失、取消、过期或revision变化均拒绝成功，
+不重编码补造同源证据。它复用原passive执行、采集和关闭owner，不启用模型或运动。
+metadata核验只证明表示和媒体关联；后续消费者仍须完成操作、client/session与CAS来源认证。
+多Artifact提交中断时可能已有个别CAS对象留存，但不会发布成功结果，不作为多对象原子事务。
+
+同一个分割v1模型还可显式增加 `--enable-segmentation-batch-v2` 和
+`--enable-segmentation-geometry-v3`，两者默认关闭，均需Artifact root和已配置的分割模型。
+v2在一次live RGB cut上处理最多三个有序目标，明确区分no_mask与推理/编码失败。
+v3消费已认证的留存JPEG及其原RGB producer操作ID，保留原图、角色、原始ordinal和采集时间，
+至少保留producer与consumer两个操作；RGB v3开启时绑定其精确Route。它不重采集或缩放来替代输入，
+不将历史图像当当前三维场景。输出只含模型proposals及二维mask像素几何，
+`semantic_identity_verified=false`、`physical_clearance_m=null`；像素距离不构成物理间隙或运动授权。
+v1行为和默认身份保持，模型只由原session启动/关闭一次，新读取未排空时继续保留共享资源。
+
 既有原子夹爪 Skill 完成开合时必须得到 `moving=False` 的实测状态；目标位置接近但仍在
 运动或状态未知时不能完成。真机停止 ACK 之后还须在有限等待内读取新鲜、无故障的停稳反馈，
 早于停止请求、过期、未来时间或不可用反馈均不能确认 HOLD。只读反馈沿用已启动 backend，
@@ -485,7 +502,7 @@ python -m agent_gateway real-rm65 \
   --right-tool-profile /absolute/right_tool.json \
   --envelope-profile /absolute/right_skill_envelope.json \
   --authorized-side right \
-  --authorized-action forward \
+  --authorized-action move_tcp_to_pose \
   --confirm AUTHORIZE_PERSISTENT_REAL_TCP_PRIMITIVES
 ```
 
@@ -502,7 +519,7 @@ python -m agent_gateway real-rm65 \
   --camera-registry /absolute/DexTeleop/robot_motion/configs/rm65_camera_registry.json \
   --artifact-root /absolute/private/artifact_cache \
   --authorized-side right \
-  --authorized-action forward \
+  --authorized-action move_tcp_to_pose \
   --confirm AUTHORIZE_PERSISTENT_REAL_TCP_PRIMITIVES
 ```
 
@@ -866,6 +883,16 @@ either `path_found` or a bounded rejection reason. This inspection Route cannot
 dispatch motion or request HOLD. A successful result contains an immutable,
 session-local plan ID/hash with a maximum 30-second lifetime.
 
+在已有 paired-plan、冻结观测和具身 GraspGenX 装配同时有效时，真实 profile 另行注册
+`perception.plan_grasp_fast@1`。它从留存观测直接寻找第一条完整可行路径，复用现有
+SAM2/GraspGenX、只读 FK/IK、碰撞规划与单次执行计划库，不经过公开候选序号选择。
+计划仍由独立的 `motion.execute_grasp_approach_plan@1` 在授权后消费。
+
+准备、等待锁和模型调用共享调用方原有的绝对 deadline 与取消信号；在阶段边界检查，
+不会抢占已经运行的模型调用，也不延长计划 TTL。发布和取用均核验生产 operation 的
+成功完成、来源身份及新鲜度；失败诊断或调试回放不成为执行依据。此项本地离线接入
+不表示模型部署、相机标定、真机运动或物理抓取已经验收。
+
 The reach planner first validates a fixed-orientation Cartesian approach along
 tool +Z for each pregrasp IK branch, then connects globally to the set of exact,
 validated pregrasp joint states using a shared start tree and goal forest. The
@@ -880,8 +907,36 @@ geometric resolution used by the collision/envelope checks. An already-reached
 exact target remains a HOLD trajectory; it does not back away and approach again.
 These values belong to `RM65GraspTrajectoryPlanningConfig`, not caller-controlled
 motion permits. Rejected near-field stages return typed reasons and preserve
-the complete lower diagnostics in the Gateway log; the published v1 result
-schema remains unchanged.
+the complete lower diagnostics in the Gateway log; the published diagnostics use the optional fields and contract migration described below.
+
+Start rejection diagnostics (2026-10-22 integration): `path_start_collision_blocked`
+continues to mean that the composed path admission rejected the start; it does
+not by itself prove physical FCL contact. Optional `diagnostics.start_qpos_source`
+identifies `input_qpos` or the planned `envelope_ingress_endpoint`. Private callers
+that do not know the source omit it. The lower copies the actual composed check
+already used by the sampler; no additional collision, FK or envelope query runs.
+The observed-scene admission also copies its existing check once.
+
+Optional `diagnostics.start_check_json` contains a finite JSON object, limited to
+2048 decoded characters (not total wire bytes). It includes safe/available,
+distance and reason, plus bounded geometry, observed and composed
+`collision_check` / `target_envelope` metadata when representable. A projection
+may mark `details_omitted`; full lower details remain in Gateway logs. Its
+`detail_scope=published_projection` and `detail_hash` cover exactly the final
+published object excluding `detail_hash`, including `detail_scope`, using
+`dexteleop.grasp_start_check_projection.v1`. This is not a full-detail hash.
+Trimming occurs before hashing. If projection, hashing or encoding fails, the
+optional JSON field is omitted and the original refusal remains authoritative.
+
+This intentionally changes the result-schema, IO-contract and planning Route /
+deployment-binding hashes for `perception.plan_grasp_approach@1`. Consumers must
+rediscover the current catalog and rebind to its hashes before submitting new
+requests. An old strict result validator rejects these new optional fields; the
+new validator continues to accept legacy results without them. Parameters, Skill
+semantics, top-level refusal codes and the separate execution contract retain
+their existing meaning. Planning remains read-only, with no motion or HOLD,
+no fallback enabled by this diagnostic addition, and the same lock and deadline
+owners. Offline tests do not constitute physical grasp acceptance.
 
 Grasp planning uses `dual_arm_hand_proxy_grasp_full`: the existing strict URDF
 with non-adjacent real-arm mesh self-collision pairs, complete cross-arm pairs,
@@ -980,8 +1035,58 @@ IK 临时生成未评分的旋转候选或沿用另一预测的分数。
 共享几何层可用 `for_observed_cloud()` 复用静态模型；每个冻结观测仍有独立的 FK、
 碰撞查询数据、路径缓存和场景身份，共享 target builder 的规划调用串行执行。
 观测体素覆盖全部占用格，顺序与内容哈希保持一致；未知区域不作为已验证自由空间。
+真实 Skill 会话在现有相机资源准入后、lower 控制线程启动前准备静态观测几何，
+显式观测安全移动同时准备本会话的静态规划器；准备失败不发布就绪、不进入运动。
+默认 `legacy` 与显式关闭工具表面范围的配置保持原过滤合同，不预热扩展工具查询。
+观测过滤只加载 visual 几何；显式 `link_primitives` 复用 link 局部 CAD 的 Trimesh/Embree
+查询结构，逐次使用当前关节和相机位姿变换射线，并保留工具、机械臂和相机外壳的遮挡。
+`Motion geometry ready` 记录移到启动阶段的准备成本，不能视为该成本消失。
+原 `prepare_geometry()` 仍只负责完整网格的不可变快照；`prepare()` 在相同会话几何上准备查询。
+
 捕获自体过滤只缓存不可变 CAD 网格，逐帧重算相机/FK/射线；既有 15 mm 深度门槛、
 目标掩码保护、碰撞余量与最终轨迹复核保持不变。
+CAD 表面以所选 URDF 引用的完整本地网格及其缩放为准，而不以原生 OBJ 导入器
+返回的三角面索引近似它。多材质网格可出现顶点范围相同、面片连接不同的导入结果，
+会使真实自体像素成为障碍残留。射线、工具表面采样及显式启用的手臂表面 BVH
+统一使用同一网格拓扑；只缓存局部网格和查询结构，逐帧位姿仍从该次测量计算。
+无外部网格资源的原生 primitive/BVH 仍保留其自身几何；资源加载或表面构造失败直接
+报错，不退回不一致的表面，也不靠扩大 15 mm 默认自体范围规避。
+模型无关的 RGB-D 障碍投影现在由 `robot_motion.observed_scene` 统一实现，
+接收已采集或已保存的深度、相机标定及采集时关节测量，不持有相机、分割模型或仿真场景。
+真机 profile 保留原导入入口，并显式传入原有起点关节漂移阈值；30 s 场景时效、
+相机间时差、自体过滤、米制深度、体素覆盖与后续规划/执行检查均不改变。
+复用历史观测不会刷新其时间戳，也不等于该场景已获准用于当前动作。
+此共享几何入口本身不调用 MuJoCo 原生物体状态。MuJoCo 默认 safe planner 的完整场景
+查询仍属原生基线；另有显式启用的传感器规划装配，默认行为不切换。
+
+MuJoCo 的 `build_mujoco_agent_tcp_pose_gateway_session()` 可额外传入
+`MujocoObservedSafeMotionConfig`，复用同一 `motion.move_tcp_to_pose_safe@1`、
+规划器、执行 owner、取消、HOLD 和关闭入口。例如在原有 factory 参数之外添加：
+
+```python
+from agent_gateway.profiles.mujoco.motion_observed_scene import MujocoObservedSafeMotionConfig
+from robot_motion.observed_scene import SafeMotionObservationConfig
+
+safe_motion_observation = MujocoObservedSafeMotionConfig(
+    robot_urdf_path=robot_urdf_path,  # Same known assembly as this session.
+    collision_scene_profile="dual_arm_hand_proxy_dmtac_grasp",
+    observation=SafeMotionObservationConfig(roles=("main",)),
+)
+```
+
+此选项要求确定性的既有 physics owner、启用 safe Route、Artifact 感知装配和全部指定
+RGB-D 视角；当前为 factory API，不另增 CLI 或 debug Skill。启动时绑定 URDF、实际
+网格、碰撞对、相机附件、原碰撞余量和观测配置的内容哈希；资源建模期间变化直接拒绝，
+不把未验证模型写进缓存。消费者须重新发现目录及绑定新 safe profile hash。
+一次被动 cut 内关联相机和双臂关节，不推进 physics；投影只使用深度、内参、标定和该次
+关节测量，不读取原生物体位姿、分割标签或原生障碍列表来选择路径，也不启动 GraspGenX。
+已保存的源 profile hash、深度完整内容 hash、采集时间和变换构成观测证据；没有源帧计数
+或独立关节回执时明确为空，不用调用序号补造。
+观测云覆盖全部占用体素，沿用默认 15 mm 自体策略及原有时效/漂移限制；搜索阶段复用
+已有机器人 profile boxes 与 D405 附件几何。它不是原生全部碰撞几何的等价替代，执行前和
+执行中仍保留原独立原生物理 guard 以及严格碰撞和最终输出检查。原生 guard 可以拒绝
+路径，但不参与传感器模式的路径选择。无遮挡移动和可见障碍拒绝应分别验收；这不等于
+抓持、放置或 Agent 理解能力已获验收。物体/表面指代的简洁 Agent 动作封装另行接入。
 同一抓姿的已验证近场 IK 分支组成全局连接目标集合；每轮共享起点树、目标森林、
 碰撞查询缓存和节点/迭代/时间预算，而不是为每个终点重新搜索。搜索范围覆盖全部
 目标后逐轮扩展，最后一轮仍为原关节硬限位；确定性种子为基础种子加轮次。返回
@@ -1027,6 +1132,19 @@ action is the distinct `execute_grasp_approach_plan`; authorizing the legacy
 | 到达抓姿 | `motion.execute_grasp_approach_plan@1` / `motion.approach_grasp_pose@1` | 独立运动授权；不自动闭合夹爪 |
 | 夹爪闭合 / 松开 | `manipulation.set_gripper_state@1`（显式启用、仅右夹爪） | 独立授权和请求；只证明开闭/停稳，不证明抓牢 |
 | 空手移动 | `motion.move_tcp_to_pose@1` | 不能作为携物碰撞验证的替代品 |
+
+串行双臂验收可显式设置 `--authorized-motion-sides left right`，并使用
+`agent_grasp_dual_absolute_standard_v1.json`；左右边界均为 X [-0.39, 0.75]、
+Y [-0.7, 0.7]、Z [0.03, 0.85] 米。两侧均须在下层包络中启用，缺一侧即拒绝装配。
+普通/safe 位姿 Route 允许每次选择其中一臂，不接受同一请求的双臂目标；同一个
+motion port、排他 owner 和控制循环串行执行，未请求的一臂仍硬保持。
+`--authorized-side` 继续选择固定方向 Skill 和抓姿生成/执行的主臂，不因双侧移动
+授权而隐式切换抓取手。省略新选项保持原有单臂范围；双夹爪授权仍独立设置。
+
+部署时仍须从当前实际 catalog 获取 Route 与 deployment/profile 身份。双侧授权范围会
+参与 execution、target、constraint 和 authorization 绑定；保持单臂行为不等于所有
+历史哈希均不变。新组合使用新绑定，旧会话、恢复点与实验保留原冻结实现；不能手改
+旧回执的哈希或跳过匹配来跨版本恢复。本项组合与 MuJoCo 验收不替代真机运动验收。
 
 当前 reach 准入验证真实机械臂连杆网格与部署的代理几何、固定桌面/相机杆和 TCP
 包络。成对规划另验证可见目标/背景与名义张开夹爪的非接触接近，但没有将
@@ -1286,17 +1404,34 @@ the one and only tool-TCP-to-solver-endpoint conversion described below.
 
 ## Skill and execution boundary
 
-The default-off MuJoCo profile publishes one lower motion domain with separate
-versioned Skills for absolute TCP targets, semantic cardinal steps, and fixed
-level orientations.
-`motion.move_tcp_to_pose@1` accepts an exact lower target;
-`motion.step_tcp_cardinal@1` accepts `forward`, `backward`, `left`, `right`,
-`up`, or `down`. The cardinal target is resolved from measured TCP state only
-when the lower Skill is activated. Distance, frame/tool/calibration identities,
-primitive hash, safety envelope, IK, dispatch, evaluation, and HOLD remain
-trusted deployment facts.
+当前 MuJoCo／real Gateway 的普通运动入口以绝对 TCP 位姿为准：
+`motion.move_tcp_to_pose@1` 接收明确目标，需要避障时使用显式部署的
+`motion.move_tcp_to_pose_safe@1`。相对任务应先读取已绑定坐标系中的 TCP，
+再提交目标位姿；坐标／工具／标定身份、包络、IK、dispatch、验收和 HOLD
+继续由同一条下层执行链负责。
 
-MuJoCo 的现有入口可显式增加 `--enable-safe-tcp-pose`，为右臂发布
+以下 a06–a12 旧 debug 验收项已封存，不再进入当前 sim／real 的可用 Skill、
+Route、Schema／I/O 目录、执行器注册、Agent／Dashboard 菜单或客户端动作选项；
+也不提供重新启用它们的开关。既有历史记录、契约定义及底层数学函数保留，
+不将历史回放等同于当前能力发布。
+
+| 旧验收项 | 已封存的 Skill |
+| --- | --- |
+| a06_cardinal_step | `motion.step_tcp_cardinal` |
+| a07_step_forward_backward | `motion.step_tcp_forward`、`motion.step_tcp_backward` |
+| a08_step_left_right | `motion.step_tcp_left`、`motion.step_tcp_right` |
+| a09_step_up_down | `motion.step_tcp_up`、`motion.step_tcp_down` |
+| a10_level_forward | `motion.set_tcp_level_forward` |
+| a11_level_left30 | `motion.set_tcp_level_forward_left_30` |
+| a12_level_right30 | `motion.set_tcp_level_forward_right_30` |
+
+控制结果发布后、适配请求创建前若原 support 窗口已过期，下层保留真实发布记录，
+不创建适配请求或伪造回执，继续执行原 directive 中要求的 HOLD/取消。
+只有无停止要求的正常结果才返回 `target_support_expired_before_adaptation_keep_existing`；
+MuJoCo Skill 仅在该精确状态及无适配、提交、安全或派发结果的证据组合下，
+在原调用预算内重试同一 reference。过期周期不计作执行成功，不延长 TTL 或旧 segment。
+
+MuJoCo 的现有入口可显式增加 `--enable-safe-tcp-pose`，为会话选定的一臂发布
 `motion.move_tcp_to_pose_safe@1`；默认不发布。该 Route 使用当前场景、另一臂的
 实测起点和已绑定工具配置，复用下层 RM65 IK、BiRRT-Connect、C2 时间参数化
 及原有唯一执行链。逐参考复核继续使用同一已接纳 TCP 包络，绑定改变时拒绝执行。
@@ -1307,6 +1442,20 @@ MuJoCo 的现有入口可显式增加 `--enable-safe-tcp-pose`，为右臂发布
 不替换为普通 move-to。相机未建模障碍、未建模负载、抓取接近及携物不属于该
 Route 的能力；这项接入也不发布双夹爪 v2。完成、取消和关闭仍需下层 HOLD 证据。
 模拟验证与真机验收分别记录。
+
+MuJoCo 入口可用 `--motion-side left|right` 选择这一会话唯一可驱动的机械臂，
+默认仍为 `right`。factory 对应参数为 `motion_side`；自行构造 target config 的调用方
+还须让 `exposed_pose_sides` 与 `mujoco_agent_tcp_pose_execution_observation_plan_v1`
+的 `motion_side` 一致。双臂／`both` 请求不会自动拆分，也不支持在同一会话切换控制侧。
+左右侧使用各自工具标定、arm-base 与公开 Station 转换、状态 schema 和包络身份；
+另一臂仅作为同一 rig 中的实测 support。安全规划与执行复用原 owner、碰撞 oracle、
+硬限制、完整路径复验和 HOLD；原有 support 关节漂移检查保持 0.001 rad，不代表另一臂
+在物理仿真中绝对零位移。默认右臂的公开合同不变，不改变真机入口。
+
+显式左臂组合目前支持基础 TCP/state、可选 safe TCP、可选 TCP comparison v2，
+以及独立启用的只读 RGB-D Artifact capture；尚未接通左臂的 gripper、grasp、spatial goal、
+history 或 segmentation 组合会在创建场景／资源前拒绝，不发布只改标签的伪左臂能力。
+这些组合仍可按默认右臂入口使用。该配置增加的是已有 Skill 的部署覆盖，不新增日常工具名。
 
 MuJoCo 可显式组合 `--enable-grasp-approach --enable-grippers --no-realtime-worker`，
 发布 `motion.approach_grasp_pose@1`。它复用同一 planned-motion、operation slot
@@ -1326,6 +1475,203 @@ MuJoCo 可显式组合 `--enable-grasp-approach --enable-grippers --no-realtime-
 分支选择和路径质量检查，因此普通 safe TCP 的排序／拒绝结果也可能变化，
 其默认碰撞政策不变。以上能力均不自动闭合、携物或证明物理抓取成功。
 
+该显式末端接触组合还可用 `--enable-object-state` 发布只读
+`state.read_object_state@1`，默认不发布，且必须已绑定 `--grasp-contact-target-body`。
+查询只接受目录中绑定的物体、公开 Station 坐标系及 1–50 ms 测量帧龄上限。
+当前 MuJoCo 实现从同一 private `MjData` cut 计算 body-origin pose、线/角速度
+及目标与支撑、触觉接触面、其他物体的接触；不推进物理、不发送动作或 HOLD，
+不读取命令目标冒充测量。结果携带 frame/spec、source binding 和会话物理时钟身份。
+速度通过同一 body-origin Jacobian 与 qvel 计算，再用公共 FrameGraph 转换，
+不把质心速度或世界坐标直接标成公开 Station。
+
+`measured_at`、`cutoff_at` 属于返回的 native physics clock；暂停仿真时重复读取
+同一时刻不会产生新物理证据。单独启用 `--enable-object-state` 保留原单帧反馈，
+`release_observation=null`。额外启用 `--enable-object-follow-observation` 才将既有物体关系观察器绑定到唯一 rig 的
+physics tick（包括 HOLD），不新增采样线程或 step loop。新闭爪命令后，只有实测双侧
+触觉接触、实际闭合且物体仍有支撑时才冻结 contact-secured 关系；这不授予携物权限。
+随后物体和 TCP 都实际抬升至少 3 cm、无支撑且保持 3 mm/2° 内的冻结关系，连续观察
+至少 0.5 s、缺口不超过 50 ms，才形成 held-verified 历史。失效后不重新锚定。
+
+只有此前验证抓持且随后出现新的张爪代次，才开始 `release_observation`；启动时静止、
+初始张爪、闭爪命令或动作完成都不触发它。释放稳定仍要求完整的 0.6 s/60 个实测样本、
+最大缺口 50 ms、漂移不超过 2 mm/0.05 rad，有支撑且没有夹爪或其他接触。
+读取只返回已有窗口，不延长窗口；新运动、未知接触和缺测均撤销稳定声明。
+窗口未启动时返回 null。该 producer 改变显式部署的 source/profile/schema 哈希，消费者
+必须重新发现目录，不能复用旧绑定。它既不是放置目标内判定，也不是物理任务成功评价。
+本入口不提供真机物体位姿估计源，也不表示完整抓取、搬运或放置验收已通过。
+
+### 显式携物目标（MuJoCo）
+
+在上述末端接触、双夹爪、object-state及follow观测组合上，另加
+`--enable-object-motion` 才发布 `motion.move_grasped_object_to_pose@1`；默认不发布。
+它接受目录中绑定的 `object_id`、`phase=lift|carry|place`，以及公开参考系中的
+物体body-origin绝对位姿或平移增量（二选一）。由下层记忆原始手物关系并推导TCP，
+调用者不必复制手物变换，不能提交任意接触例外。
+
+该Route与object-state共享同一个原rig逐物理步observer，不创建额外线程或步进所有者。
+lift先要求实测闭合和双侧接触；carry/place要求已观察到的无支撑抬升及完整稳定窗口。
+lift/place的支撑接触仅限命名支撑面与其法向走廊；carry不允许支撑接触。
+规划、重定时、逐参考扫掠及物理guard均复用已有链，保持1mm、3mm/2deg和50ms边界。
+阶段只在计划成功激活后提交到live cut，失败不得通过重新锚定恢复。
+
+完成回执将实际物体位姿、原生物理时钟、抓持状态及阶段接触加入最终状态hash，
+仍要求原domain HOLD。完成指到达物体目标并保持抓持，不自动张爪，也不代表稳定放置；
+释放仍需独立gripper v2与既有release观测。取消和close包含同一个携物worker及原HOLD路径。
+当前公开装配仍为右臂、确定性物理时钟；下层左右臂planner支持不等于左臂组合已发布。
+本软件接线不表示完整物理抓放或Agent验收已经通过。
+
+该 Route 默认使用 `--safe-tcp-motion-profile local_step`（单次平移 0.10 m、
+旋转 15°）。仿真物体关系目标可显式选择 `--safe-tcp-motion-profile object_relation`，
+同时传入 `--enable-safe-tcp-pose`：该配置允许单次平移 0.50 m、旋转 180°，
+最多 900 个控制周期和 90 s 操作预算。它使用只绑定 safe Route 的独立包络；
+普通 move-to、默认配置和所有真机配置均不变，碰撞与连续关节限速也不变。
+
+需要更精细的非接触悬停时，可显式选择 `object_relation_precise`，范围和预算与
+`object_relation` 相同，但查询、执行到达和规则验收统一为 0.003 m / 1°。
+该 profile 复用 RM65 IK 的现有目标权重接口，以位置和姿态各自容差归一化目标，
+避免将米与弧度按相同数值权重混合；仍分别检查校准后 TCP 的两个误差界限。
+归一化求解直接使用标定 TCP 的位姿残差和同原点的雅可比，不在法兰原点优化后再将
+误差验收到长工具 TCP。共享 IK 的可选 `eef_from_controlled_frame` 显式绑定刚性偏移，
+未提供时保留原端点语义；本轮仅精度 profile 使用它。该修正进入 profile hash，查询与
+执行共同使用，未扩大最终容差，也未修改物理伺服、重力、碰撞准入或真实设备入口。
+它有独立的 profile/hash，默认 `local_step` 和 `object_relation` 保持 0.01 m / 5°
+及原有 IK 行为。精度 profile 不能保证任意目标可达；候选查询与实际执行仍各自通过
+完整碰撞、包络、轨迹限速与实测到达检查。规划失败诊断保留逐 seed 的位置／姿态误差，
+不把求解预算耗尽解释为不可达证明。独立任务验收继续使用自己的精度标准。
+
+公共数学层 `generate_object_above_goals` 可以从调用者明确提供的表面锚点、
+高度样本和绕工具轴角度样本生成候选（工具 +Z 指向参考系 -Z），总输入最多 64 组。
+它不是新的感知或路径检查。
+MuJoCo 下层 `plan_candidates` 逐候选复用原有完整规划，按最大单关节转动、
+计划执行时长、总关节路程依次比较；必须由调用者绑定与执行一致的包络约束。
+`planning_projector_for_route` 可在闭合运动状态下准备已配置的唯一 Route 包络投影器，
+冻结当前参考，参考变更或运动激活后拒绝继续查询；不激活选择、不修改参考或投影状态。
+预算耗尽时只返回已检查候选中的最佳项并标明
+搜索未完成；取消、场景检查不可用和绑定错误不会降级成其他候选成功。
+候选查询不授权执行；选定目标仍需单独通过现有 safe Skill 的实时状态和包络检查。
+
+只读查询在原来的逐候选完整规划前，可复用相同标定 TCP / IK 求解器做当前起始
+seed 的小预算预筛（查询总预算的 10%，最多 0.5 秒，计入总预算）。合格端点按预计
+总关节行程优先尝试（同分保留原序），避免列表前端的绕远候选连续耗尽路径预算。此项仅是
+调度提示，不是碰撞证明或全局成本下界；不合格及未完成预筛的候选仍保留。正式
+多 seed IK、碰撞、包络、时间参数化、排名和取消规则不变。返回原始候选编号，并在
+已检查候选的诊断中标注预筛估计与耗时。只读 Route profile hash 绑定此策略，
+普通单目标 move 和下层直接调用的默认候选顺序不变；不增加 Agent 工具。
+
+MuJoCo 可额外启用 `--enable-object-goal-queries`（同时需要
+`--enable-safe-tcp-pose`），发布只读 `perception.query_object_above_paths@1`。
+参数包括公开参考系中的 `anchor_xyz_m`、明确的 `heights_m`、绕已朝下工具 +Z 的
+`tool_yaw_offsets_rad`（弧度）及 `time_budget_sec`（0.1–30 s）；去重前最多 64 组。
+当前只绑定右臂，默认不发布，未接入真机。查询从唯一 rig 复制一次完整 qpos，使用
+不可激活的独立规划上下文；不触碰执行端 pending plan、不推进物理时间或改变安全参考。
+统一预算和取消贯穿 IK、路径搜索、时间参数化及复核的协作检查点；原生调用不可抢占，
+因此不是硬实时截止保证。操作 deadline 仍由 Gateway 的既有超时收尾负责。
+位移/旋转限制及控制周期预算与 safe Route 的所选 profile 一致，碰撞余量不变。
+结果返回场景/起点 hash、原始仿真时间、逐候选耗时、阶段耗时、排名成本、完成数和
+`all_candidates_checked`。`no_path_found` 不等于不可达，`path_found` 也不授予执行权、
+不保证短路或最优路线；`motion_executed` 与 `execution_authorized` 始终为 false。
+上层只读 attachment 可发现它但不暴露运动。需要动作时仍单独提交目标到原 safe Route，
+重新检查现场状态、包络、碰撞、授权与预算，不消费或激活查询内部计划。
+
+MuJoCo 还可显式启用以下路径约束与两段查询；各开关默认关闭，原 safe v1
+继续发布并保留参数与行为。当前真机部署不发布这些新增版本。
+
+| 开关 | 新增合同与依赖 |
+| --- | --- |
+| `--enable-safe-tcp-path-constraints` | `motion.move_tcp_to_pose_safe@2`；要求 `--enable-safe-tcp-pose`。显式传入 `path_constraint: null` 或 `preserve_start_tool_axis` 锥约束。 |
+| `--enable-tcp-continuation-queries` | `perception.query_tcp_continuation_paths@1`；要求路径约束 v2，接收最多 8 个首段目标及后续位移。 |
+| `--enable-tcp-candidate-artifacts` | 同名只读查询 v2；要求上述连续查询、surface anchor v2 与 relation 查询，按 Artifact 原始索引选择候选。 |
+| `--enable-relation-tcp-continuation-queries` | 同名只读查询 v3；要求上述连续查询、surface anchor v2 与 relation 查询，从认证锚点直接生成并检查两段候选。 |
+| `--enable-region-tcp-continuation-queries` | 同名只读查询 v4，或显式 `--region-tcp-continuation-version 5`；要求 relation 连续查询，在给定有界区域生成候选。 |
+
+安全移动 v2 从激活时的实测姿态建立工具轴锥，沿用同一包络、碰撞、IK、
+参考生成、执行和 HOLD 所有者；验证时间参数化后的参考及实际发布的 float32
+关节参考，结果携带采样证据。这些检查不构成采样间连续轨迹的数学保证。
+两段查询在一次冻结场景中传播首段末端关节状态与 FK 到后段，共享总预算并清理
+私有规划上下文；约束只作用于后段参考。候选局部失败允许检查下一项，真实起点、
+绑定错误或取消直接终止。查询不推进物理时间、不激活计划、不授予执行权；实际
+动作仍重新规划，后续相对位移应从真实到达姿态计算。候选 Artifact 通过有界 CAS
+读取并核对原始已完成操作，跨客户端、会话或身份不匹配时拒绝。候选 Artifact、
+relation 连续查询及其 region 扩展使用 anchor v2，与 anchor v3 的组装互斥。
+
+额外启用 `--enable-surface-anchors`（要求上述查询及 `--artifact-root`）时，发布两个
+增量只读 Skill：`perception.capture_surface_anchor@1` 对 `role/target_pixel_uv` 取一次
+实测深度，保存 `surface_anchor` JSON Artifact；
+`perception.query_object_above_paths_from_anchor@1` 通过同名输入槽消费该 Artifact，
+不接受另填 XYZ。后者复用原查询，返回 `surface_anchor` 来源和 `path_query` 路径证据，
+没有第二套几何、规划或执行所有者。既有 back-project 和 inline query v1 参数不变。
+锚点保留像素、深度内容 hash、采集时间/时钟域、坐标身份、产生它的操作及请求 hash。
+消费者要求同客户端、会话、manifest 和 Station revision，并核对已完成操作的原输出；
+仅上传带有相似字段的 JSON 不能伪装成实测锚点。Artifact 字节留存不等于操作留存；
+操作被淘汰后必须重新采集，启用时操作留存至少为 2，默认仍为 16。
+它是有来源的历史表面点，不是跟踪结果、物体中心、语义真值或自动新鲜度保证。
+当前仅发布/验证 MuJoCo，未改变真机接线。上层 RPent 使用原有 `input_artifact_refs`
+按来源操作/槽解析为 Gateway 的 `input_artifact_bindings`，不再次上传或回投。
+
+同一 MuJoCo 会话再启用 `--enable-spatial-goals` 时，额外发布
+`perception.compute_spatial_goal_from_anchor@1`，用相同的 `surface_anchor` 输入槽
+计算任意显式偏移关系，而不限于物体正上方。参数沿用纯空间目标的当前 TCP、偏移坐标系
+和保持姿态／工具轴对齐选项，但不接受手抄的 `anchor_xyz_m`；结果保留锚点证据，并把
+原几何计算结果嵌入 `spatial_goal`。锚点读取复用同一来源验证；几何计算复用原数学层，
+不再次读取深度，不推断物体中心。输入 TCP 仍是调用方几何，不承诺其新鲜度。
+先读取 TCP 身份，再采集锚点并直接消费；中途 state 读取可能推进 Station revision，
+失效后必须重新采集。采集已经包括单点实测反投影，不需要先调用 `back_project`。
+此 Skill 的约束只作用于终点，不保证全路径保持姿态或满足自定义走廊约束；目标仍单独
+提交现有 safe Route。未启用空间目标时原有两个锚点 Skill 不变，旧 inline 参数也不变。
+
+MuJoCo 可再显式启用 `--enable-surface-anchor-v2`；它要求已有
+`--enable-surface-anchors` 和 `--segmentation-asset-bundle`，保留所有 v1，并额外发布
+`capture_surface_anchor@2` 与同版本的已启用 anchored goal/query。v2 的输入槽只接收
+`agenticrobot.measured_surface_anchor.v2`；不混用两个版本。上层默认选择一整套兼容版本，
+不会因同时发布两个版本而增加 Agent 可见工具数量。
+
+v2 请求显式填写 `role`、`selection_mode`、`target_pixel_uv`、`language_prompt` 和
+`min_score`。`exact` 要求像素非空、文本为空，保持指定像素，且不运行分割；
+`mask_interior` 要求像素提示与文本提示恰有一个非空，仅适用于允许在物体可见表面自由
+选点的任务。先用一次相关 RGB-D cut 分割该 RGB，再在 mask 内、有有效深度的实测像素中
+选择距 mask 边界最远的点；图像边缘也按边界处理。点提示只允许在其连通分量中选点，
+等距离时优先靠近提示；文本提示的等距离点优先靠近 mask 中位像素，最终按行、列排序。
+深度为零或超出部署深度范围的像素不能参与选点，无有效点时失败，不借用别帧或合成深度。
+
+返回的 `target_pixel_uv` 是最终实测点，`selection.requested_pixel_uv` 是原提示，二者
+有意分开；结果记录算法、RGB/mask hash、模型身份、内部距离和分数。`mask_geometry`
+仅是该分割提案中可见有效深度的稳健范围、中位数与点数，不是完整物体尺寸、中心、支持
+关系、跟踪身份或 6D 位姿。mask/overlay 作为同一 capture 操作的可选输出 Artifact 保留，
+不伪造独立 segmentation 操作。消费者仍核对同客户端、会话、manifest、revision 和原
+已完成操作的精确输出，且不重采深度。v2 复用会话模型的生命周期与 60 s 只读预算；
+未启用 v2 时原有契约不变。本批发布范围为 MuJoCo，未接入真机动作效果判断。
+
+候选排名可利用已生成 IK 终点的最大关节偏移下界，跳过严格劣于已验证完整路径的候选。
+`safe_tcp_candidate_rank_pruned` 只表示不可能改善当前排名，不表示碰撞或不可达；相同主成本
+不能剪枝。`checked_count/all_candidates_checked` 是候选处理记账，须结合逐项 reason，
+不能将剪枝、超时或端点失败记作完整路径碰撞认证。普通单目标规划没有该 incumbent 下界。
+
+为收敛 Agent 工具面，同一 MuJoCo 会话可显式启用 `--enable-relation-goal-queries`
+（要求 `--enable-surface-anchors`），发布一个通用只读 `perception.query_relation_paths@1`。
+它消费同一个已认证的 `surface_anchor`，从当前冻结实测 TCP/场景出发，接受
+`offsets_xyz_m`、`offset_frame=reference|tool`、`orientation_mode=preserve|align_axis`、
+`tool_axis`、`axis_reference_xyz` 和 `tool_axis_rotation_offsets_rad`。tool 偏移使用输入 TCP
+的原始方向；转角样本绕对齐后的所选工具轴，单位弧度。preserve 只允许零／整周转角，
+不允许轴对齐字段。去重前最多 64 组偏移×转角，整次 `time_budget_sec` 为 0.1–30 s；
+仍由原规划器实施逐候选最多 3 s 路径搜索和剩余预算协作检查。
+结果保留来源和原有 `path_query` 成本／路径证据，并明确
+`relation_constraint_scope=endpoint_only`：关系与姿态要求只保证终点，完整路径证据仅覆盖
+已有碰撞与部署包络，不承诺途中维持姿态或自定义走廊。查询不接受手抄锚点 XYZ 或当前 TCP，
+不再次取深度，不授权执行，所选目标仍须单独提交原 safe Skill 重新检查。
+旧 v1 注册、参数和路径查询保持兼容，但 RPent 默认发现该通用查询时不再把两种旧关系
+计算和两种正上方查询同时暴露给 Agent；诊断消费者仍可显式选择旧精确 Route。
+无需为上方、左右方、不同对齐轴分别增加 Skill。新 Route 默认关闭，当前仅验证 MuJoCo。
+
+MuJoCo 入口还可单独启用 `--enable-spatial-goals`，发布只读的
+`perception.compute_spatial_goal@1`；默认不发布。它复用
+`robot_motion.spatial_goals`，由调用者提供公开参考系中的锚点、当前 TCP 和偏移，
+保持姿态或以最小转角对齐一条工具轴。输入可以来自已发布的深度反投影，但数学
+计算本身不是新的观测，也不校验输入的新鲜度或物体身份。结果明确声明
+`constraint_scope=endpoint_only`、`path_checked=false`、`motion_executed=false`。
+计算不推进物理时钟、不改变关节状态，也不发送运动或 HOLD；Gateway 会话的
+启动与关闭仍由已有生命周期负责。执行目标需另行提交给安全运动 Skill，
+继续受其原有状态、包络、IK、碰撞、dispatch 和收尾约束。该只读数学 Skill 本身不执行夹爪、mask 三维测量或携物动作。
+
 MuJoCo 的 ``state.read_tcp_pose`` 与可选 TCP history 发布同一公开 Station 坐标系。
 其参数及结果校验从公开 state binding 获取坐标身份，不使用内部 IK execution frame；
 Agent 必须按当前 schema 查询和复制身份，不能以 arm-base 查询替代 Station 查询。
@@ -1334,10 +1680,10 @@ Target-independent motion semantics and payload schemas live in
 `skills/motion`. They also define fixed level-orientation Skills for forward,
 forward-left 30 degrees, and forward-right 30 degrees. Together, the cardinal
 Skill's six enum choices and the three fixed-orientation Skill identities expose
-nine bounded lower primitives. The current single-right-arm no-model launcher
+nine bounded lower primitives. The fixed-single-arm no-model launcher
 publishes all nine through exact MuJoCo Routes. Cardinal directions and absolute
 headings are resolved in the canonical Station frame, then transformed into the
-right-arm execution frame; the arm-base frame is not relabelled as canonical
+selected-arm execution frame; the arm-base frame is not relabelled as canonical
 desk axes. Fixed orientations use their own route-scoped safety envelope because
 they preserve translation but may require a larger angular correction than a
 cardinal step or generic small pose move. Publication still grants no motion by
@@ -1476,12 +1822,88 @@ external reconciliation.
 失败不回退普通 move-to。沿整个路径保持水平、绕开指定区域等持续约束尚不由该 Skill 实现，
 也不能把终点轴对齐解释为全过程满足该约束。
 
+#### 目标级抽象与观测复用边界
+
+后续 Agent 入口以“观测引用 + 目标关系 + 约束”表达意图；底层继续分开维护
+观测解析、几何目标求解、路径规划、执行和效果检查，不把这些职责复制进一个新执行器。
+普通阶段切换在内部完成，完整诊断保留在原操作证据中，Agent 接收简洁结果及必要的
+语义选择。当前 `compute_spatial_goal@1` 的只读合同不变；目标级运动入口仍待独立接通验收。
+
+RGB-D/SAM 得到的目标点、分割、物体尺寸/CAD、已估计手物关系等可以保存并复用，
+不要求每次调用都重新识别。复用分别处理三个有效范围：
+
+- 观测身份和几何来源：保留原图像/深度、坐标标定和采集时间；旧腕部图像始终使用
+  采集时相机位姿，不改套当前腕部外参，不把“读取缓存”写成“新观测”。
+- 目标知识：机器人运动不自动使固定世界点或物体尺寸失效；已知物体移动、场景变化、
+  标定变化或任务需要更高精度时，更新相应部分，不一概重做整个感知链。
+- 执行准入：当前 TCP/关节、障碍场景、碰撞/包络和取消/HOLD 仍由原执行链检查；
+  有效的目标缓存不延长执行状态 TTL，也不把未观测区域当作自由空间。
+
+真机可获得并保存的模型、标定和测量均可作为来源；MuJoCo 原生物体 pose、隐藏几何
+或全场接触可用于独立评分/既有保护，但不能伪装成视觉或触觉观测输入。物体真实跟随、
+稳定释放与 TCP 到达分开验收，不因引用或抽象层的存在改变成功定义。
+
+### 可选实测 TCP 与历史动作目标比较（显式 v2）
+
+两端 Gateway 的 `--enable-tcp-pose-comparison` 在保留 `state.read_tcp_pose@1` 的同时，
+额外发布同名 `state.read_tcp_pose@2`，默认关闭。上层通过现有精确 Route 暴露策略选择一个版本，
+不应把两个版本当成两个日常工具，也不能缺少 v2 时悄悄回退到 v1。
+
+v2 保留 v1 的四个参数，并要求显式提供 `target_operation_id`：
+
+```json
+{
+  "component_ids": ["right_arm"],
+  "reference_frame_id": "canonical_station",
+  "controlled_frame_id": "tool_tcp",
+  "max_measurement_age_ms": 200,
+  "target_operation_id": null
+}
+```
+
+`null` 仅读取当前状态；非空值必须引用同一客户端、会话、manifest 中尚被保留的终态
+`motion.move_tcp_to_pose_safe@1/@2` **绝对目标请求**。当前部署没有发布对应运动版本时不能引用它。
+无法找到记录、记录未终止、参数/身份不匹配时明确失败，不猜测“最近一次动作”，也不接受调用方
+重新提供的目标位姿。具体组件、参考系与最大帧龄仍来自当前部署，示例不能跨部署直接套用。
+
+返回原有新鲜单 cut 状态，加 `target_comparison`；其为 `null` 或包含原请求/Route hash、
+原 terminal 状态与 execution/task outcome、原目标、各目标组件的平移误差（米）与完整 SO(3)
+旋转误差（弧度）。比较覆盖原目标的全部组件，允许一次读取双臂而只比较原来有目标的那一臂。
+它复用 `robot_motion` 的位姿转换和距离计算，不引入第二个 FK、采样器、运动 owner 或容差。
+
+本比较不新增历史时间关系声明，不重写样本时间，也不替代原有新鲜度门禁。
+误差描述的是**现在的实测值与历史指令目标**，不是历史
+执行的终态测量，更不证明物体效果、稳定性、HOLD 或任务成功。即使当前误差为零，原失败、取消或
+超时 outcome 仍原样返回。Agent 根据任务给定的容差解释误差，不由本 Skill 新增成功裁决。
+
 ### 真机 TCP 预规划的统一接线
 
 `motion.move_tcp_to_pose_safe@1` 需要单独授权 `move_tcp_to_pose_safe`；普通
 `move_tcp_to_pose` 的授权不能调用它。该路由通过现有 lower planner 先完成固定场景
 碰撞、路径质量、目标包络和最终轨迹检查，再由原控制 owner 执行，不回退到在线 IK。
 safe planner 的到位容差绑定当前 convergence profile，不改抓取规划的原有配置。
+
+该 Skill 在 real / MuJoCo 上共用可选请求字段 `pose_goal_policy`：
+
+- 省略或 `within_arrival_tolerance`：保留 v1 原有到达区域规划语义；真机可在部署的
+  10 mm / 5° 到达范围内尝试 clearance 平移／旋转救援，小步仍优先局部延续。
+- `preserve_target`：固定调用方请求的 TCP 终点，禁止局部及多分支终点搜索主动改写
+  平移或姿态目标。沿用原 IK、局部延续、全局关节路径搜索和安全／HOLD owner；
+  规划终点按既有 lower 的 3 mm / 1° 检查，部署已有更严容差时保留更严值。
+  MuJoCo 用同样上限审核其既有目标 IK。无满足条件的安全路径就拒绝。
+
+此字段只在 `motion.move_tcp_to_pose_safe@1` 接受，非法枚举拒绝；普通 move-to、抓取靠近
+和各自原参数含义不变。它选择终点语义，不增加全过程姿态约束或携物碰撞能力。
+例如“仅 Z +3 cm、终点姿态保持”可用原有绝对目标加 `"pose_goal_policy": "preserve_target"`。
+
+规划精度与执行到达是两层事实：执行仍按各端既有 arrival 容差、连续实测、完整路径条件和
+下层 HOLD 判定；`preserve_target` 不承诺零误差，也不把到达容差称为精确收敛。
+成功结果增加可选 `pose_goal_report`，包含 `pose_goal_policy`、`reference_frame_id`、
+`requested_pose_xyz_quat_xyzw`、`achieved_pose_xyz_quat_xyzw`、`translation_error_m`、
+`rotation_error_rad` 及 `arrival_translation_tolerance_m` / `arrival_rotation_tolerance_rad`。
+位姿使用请求的公开参考系；achieved 是到达判定使用的实测位姿，不能当作规划目标。
+真机轨迹记录另在 `parameterization.pose_goal` 保存 requested / planned 矩阵、残差及实际规划
+容差。新增可选字段会自动更新 definition / schema / Route 等哈希，消费者须重新发现目录。
 
 在已装配抓取 planner 的部署中，普通 `motion.move_tcp_to_pose@1` 也可复用它的
 `plan_tcp_pose` 做预规划。固定朝向的平移保留笛卡尔直线，调用共用的求解、连续 C2
@@ -1505,3 +1927,20 @@ planned_trajectory_dir/observations 留存每次尝试的 snapshot.json、原始
 相机/FK 绑定、障碍与 result.json；可选调试记录使用同一批视图，不再采集。
 path_found 只证明找到规划路径，execution_verified 仍为 false。采集、场景准备、
 规划、记录和请求锁等待都计入剩余操作预算；最后一项落盘后仍检查视图有效期与预算。
+
+
+#### 目标策略的目录迁移与测量口径
+
+本次保留 `motion.move_tcp_to_pose_safe@1`：新增策略是可选项，省略时维持原规划和执行语义。
+参数、结果、definition、I/O 合同、Route 及部署绑定的身份会按内容更新；这是显式的目录迁移。
+客户端应重新发现目录并使用同一批目录中的参数 profile、Route、绑定及授权信息，不能复用旧哈希。
+旧的严格参数验证器会拒绝新增策略，旧的严格结果验证器会拒绝新增报告；新验证器仍接受旧格式请求与结果。
+普通 move-to 与抓取靠近的目录合同不接受这两个新增字段。
+
+real 报告取自触发连续到达判定的不可变测量 cut，与 `final_measured_state_hash` 相同；
+随后仍要求下层确认 HOLD，报告并不声称它是 HOLD 后的再次测量。
+MuJoCo 报告取自原有 HOLD 后复核的最终样本，与其最终状态哈希使用相同公开位姿。
+两端位姿都使用公开参考系，残差从报告发布的 requested / achieved 位姿经下层规范化位姿数学计算，
+旋转单位为弧度；不以规划目标或预测位姿代替实测，也不更改既有到达判定。
+MuJoCo 原有 already-satisfied 路径仍可在执行 arrival 容差内直接确认 HOLD；
+严格策略不会为了达到规划数值上限而强制制造运动，也不保证实测达到 3 mm / 1°。

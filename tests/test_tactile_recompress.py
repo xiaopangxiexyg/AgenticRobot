@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
 import shutil
+import stat
 import tempfile
 import unittest
 from pathlib import Path
@@ -11,6 +13,7 @@ from unittest import mock
 
 import numpy as np
 
+from collection_runtime import tactile_recompression
 from collection_runtime.modality_inventory import (
     build_and_publish_modality_inventory,
 )
@@ -27,6 +30,34 @@ from utils.dataset_postprocess.cli import build_parser
 from utils.dataset_postprocess.tactile_recompress import (
     recompress_tactile_zstd_in_place as compatibility_recompress,
 )
+
+
+def _fail_atomic_write(write, path, payload, *, stage, error):
+    """Inject one filesystem failure while retaining the real publication."""
+    real_sync, real_open, real_replace = os.fsync, os.open, os.replace
+
+    def sync(fd):
+        current = "directory_sync" if stat.S_ISDIR(os.fstat(fd).st_mode) else "file_sync"
+        if current == stage:
+            raise error
+        real_sync(fd)
+
+    def open_file(filename, flags, *args, **kwargs):
+        if Path(filename) == path.parent and stage == "directory_open":
+            raise error
+        return real_open(filename, flags, *args, **kwargs)
+
+    def replace(source, target):
+        if Path(target) == path and stage == "replace":
+            raise error
+        real_replace(source, target)
+
+    with (
+        mock.patch.object(os, "fsync", side_effect=sync),
+        mock.patch.object(os, "open", side_effect=open_file),
+        mock.patch.object(os, "replace", side_effect=replace),
+    ):
+        write(path, payload)
 
 
 class TactileRecompressTest(unittest.TestCase):
@@ -273,6 +304,111 @@ class TactileRecompressTest(unittest.TestCase):
                     / f"{inventory_hash}.json"
                 ).is_file()
             )
+
+    @unittest.skipUnless(shutil.which("zstd"), "zstd CLI is required")
+    def test_manifest_publication_failure_restores_raw_before_cleanup_and_retry(self) -> None:
+        for stage in ("file_sync", "replace", "directory_open", "directory_sync"):
+            with self.subTest(stage=stage), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                manifest_path, stream_path, expected = self._dataset(root)
+                manifest_before = manifest_path.read_bytes()
+                stream_before = stream_path.read_bytes()
+                compressed_path = stream_path.with_name(f"{stream_path.name}.tdelta2.zst")
+                injected = OSError(errno.EIO, f"manifest {stage}")
+                real_write = tactile_recompression._atomic_write_json
+
+                def publish(path, payload):
+                    if path == manifest_path:
+                        return _fail_atomic_write(
+                            real_write, path, payload, stage=stage, error=injected
+                        )
+                    return real_write(path, payload)
+
+                with mock.patch.object(tactile_recompression, "_atomic_write_json", publish):
+                    with self.assertRaises(OSError) as caught:
+                        recompress_tactile_zstd_in_place(
+                            root, chunk_frames=2, min_free_bytes=0, delete_originals=True,
+                            backend="cli", enforce_global_collection_exclusion=False,
+                        )
+                self.assertIs(caught.exception, injected)
+                self.assertEqual(manifest_path.read_bytes(), manifest_before)
+                self.assertEqual(stream_path.read_bytes(), stream_before)
+                self.assertFalse(compressed_path.exists())
+                self.assertEqual(list(manifest_path.parent.glob(".*.tmp")), [])
+                receipts = list((root / "meta/tactile_recompression").glob("*.json"))
+                self.assertEqual(len(receipts), 1)
+                failure_receipt = json.loads(receipts[0].read_text(encoding="utf-8"))
+                self.assertEqual(failure_receipt["status"], "failed_partial")
+                self.assertEqual(failure_receipt["manifest_count"], 0)
+                self.assertEqual(failure_receipt["removed_original_bytes"], 0)
+
+                result = recompress_tactile_zstd_in_place(
+                    root, chunk_frames=2, min_free_bytes=0, delete_originals=True,
+                    backend="cli", enforce_global_collection_exclusion=False,
+                )
+                self.assertEqual(result.manifest_count, 1)
+                self.assertFalse(stream_path.exists())
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                reader = ChunkedTactileStream(dataset_root=root, spec=manifest["streams"]["sensor"])
+                for index in range(len(expected)):
+                    np.testing.assert_array_equal(reader.frame(index), expected[index])
+
+    @unittest.skipUnless(shutil.which("zstd"), "zstd CLI is required")
+    def test_manifest_restore_failure_keeps_both_payloads_and_reports_failure(self) -> None:
+        for restore_stage in ("replace", "directory_sync"):
+            with self.subTest(stage=restore_stage), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                manifest_path, stream_path, expected = self._dataset(root)
+                manifest_before = manifest_path.read_bytes()
+                stream_before = stream_path.read_bytes()
+                compressed_path = stream_path.with_name(f"{stream_path.name}.tdelta2.zst")
+                publish_error = OSError(errno.EIO, "manifest directory sync")
+                restore_error = OSError(errno.EIO, "restore failed")
+                real_json = tactile_recompression._atomic_write_json
+                real_bytes = tactile_recompression._atomic_write_bytes
+
+                def publish(path, payload):
+                    if path == manifest_path:
+                        return _fail_atomic_write(
+                            real_json, path, payload, stage="directory_sync", error=publish_error
+                        )
+                    return real_json(path, payload)
+
+                def restore(path, payload):
+                    self.assertEqual(path, manifest_path)
+                    self.assertEqual(payload, manifest_before)
+                    _fail_atomic_write(
+                        real_bytes, path, payload, stage=restore_stage, error=restore_error
+                    )
+
+                with (
+                    mock.patch.object(tactile_recompression, "_atomic_write_json", publish),
+                    mock.patch.object(tactile_recompression, "_atomic_write_bytes", restore),
+                ):
+                    with self.assertRaises(OSError) as caught:
+                        recompress_tactile_zstd_in_place(
+                            root, chunk_frames=2, min_free_bytes=0, delete_originals=True,
+                            backend="cli", enforce_global_collection_exclusion=False,
+                        )
+                self.assertIs(caught.exception, restore_error)
+                self.assertIs(restore_error.__context__, publish_error)
+                self.assertEqual(stream_path.read_bytes(), stream_before)
+                self.assertTrue(compressed_path.is_file())
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                if restore_stage == "replace":
+                    self.assertEqual(root / manifest["streams"]["sensor"]["path"], compressed_path)
+                    reader = ChunkedTactileStream(dataset_root=root, spec=manifest["streams"]["sensor"])
+                    for index in range(len(expected)):
+                        np.testing.assert_array_equal(reader.frame(index), expected[index])
+                else:
+                    self.assertEqual(manifest_path.read_bytes(), manifest_before)
+                self.assertEqual(list(manifest_path.parent.glob(".*.tmp")), [])
+                receipts = list((root / "meta/tactile_recompression").glob("*.json"))
+                self.assertEqual(len(receipts), 1)
+                receipt = json.loads(receipts[0].read_text(encoding="utf-8"))
+                self.assertEqual(receipt["status"], "failed_partial")
+                self.assertEqual(receipt["error"]["message"], str(restore_error))
+                self.assertEqual(receipt["removed_original_bytes"], 0)
 
     def test_apply_requires_explicit_original_deletion_acknowledgement(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

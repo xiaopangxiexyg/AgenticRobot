@@ -70,7 +70,6 @@ from agent_gateway.skills.gripper.runtime import (
 )
 from agent_gateway.skills.motion.definition import (
     EXECUTE_GRASP_APPROACH_PLAN_SKILL_ID_V1,
-    FIXED_CARDINAL_TCP_STEP_SKILL_IDS_V1,
     GRASP_APPROACH_SKILL_ID_V1,
     SAFE_TCP_POSE_TARGET_SKILL_ID_V1,
     TCP_POSE_TARGET_SKILL_ID_V1,
@@ -99,6 +98,7 @@ from .grasp_approach_plan import (
 )
 from .back_projection import RealSenseBackProjectionCapturePort
 from .placement import RealPlacementRobotStatePort
+from .grasp_fast_plan import RealFastGraspPlanProvider, build_real_fast_grasp_plan_executor
 from .grasp_observation import (
     build_grasp_observation_executor,
     read_retained_grasp_observation,
@@ -512,6 +512,17 @@ class RealAgentPrimitiveObservationProducer:
         active_operation_id: str,
         parameters: Mapping[str, object],
     ) -> PassiveReadResult:
+        return self.capture_tcp_pose(
+            active_operation_id=active_operation_id, parameters=parameters,
+        )
+
+    def capture_tcp_pose(
+        self,
+        *,
+        active_operation_id: str,
+        parameters: Mapping[str, object],
+    ) -> PassiveReadResult:
+        """Capture the original V1 projection once for either read Route."""
         route = self.contract_bundle.route_manifest.route(
             "state.read_tcp_pose",
             "1",
@@ -666,6 +677,44 @@ def _shared_port_hold_evidence(
 
 
 @dataclass
+class _RealAgentDomainHoldPort:
+    """Retain the existing lower HOLD boundary when no motion Route is published."""
+
+    no_io = False
+    port_id: str
+    domain_hold: Callable[..., StationLifecycleControlEvidence]
+    clock: Callable[[], float]
+    _lock: threading.Lock = field(default_factory=threading.Lock, init=False)
+    _next_sequence: int = field(default=0, init=False)
+
+    def request_hold(
+        self,
+        *,
+        operation: AgentSkillOperation | None,
+        reason: str,
+    ) -> AgentGatewayAuthoritativePortReceipt:
+        evidence = self.domain_hold(
+            operation=operation,
+            reason=_required(reason, field_name="reason"),
+        )
+        with self._lock:
+            sequence = self._next_sequence
+            self._next_sequence += 1
+        return AgentGatewayAuthoritativePortReceipt(
+            port_id=self.port_id,
+            operation_kind="hold",
+            operation_id=None if operation is None else operation.operation_id,
+            succeeded=evidence.succeeded,
+            status=evidence.status,
+            completed_at=float(self.clock()),
+            call_sequence=sequence,
+            lower_operation_id=evidence.lower_operation_id,
+            evidence_refs=evidence.evidence_refs,
+            proves_motion_or_hold=(evidence.succeeded and evidence.lower_hold_confirmed),
+        )
+
+
+@dataclass
 class RealAgentPrimitiveGatewaySession:
     contract_bundle: RealAgentPrimitiveContractBundle
     port: RealAgentMotionPort
@@ -698,9 +747,11 @@ class RealAgentPrimitiveGatewaySession:
     grasp_observation_executor: PassiveReadSkillExecutor | None = None
     object_transport_executor: PassiveReadSkillExecutor | None = None
     spatial_goal_executor: PassiveReadSkillExecutor | None = None
+    tcp_pose_comparison_executor: PassiveReadSkillExecutor | None = None
     gripper_port: RealDmtacGripperControlPort | None = None
     rgbd_geometry_executors: tuple[PassiveReadSkillExecutor, ...] = ()
     gripper_ports: Mapping[str, RealDmtacGripperControlPort] = field(default_factory=dict)
+    grasp_fast_plan_executor: PassiveReadSkillExecutor | None = None
     _close_lock: threading.Lock = field(default_factory=threading.Lock, init=False)
     _close_outcome: AgentGatewayOperationOutcome | None = field(
         default=None,
@@ -711,6 +762,10 @@ class RealAgentPrimitiveGatewaySession:
     _closed_executor_ids: set[int] = field(default_factory=set, init=False)
 
     def __post_init__(self) -> None:
+        if (self.contract_bundle.tcp_pose_comparison_registration is not None) != (self.tcp_pose_comparison_executor is not None):
+            raise ValueError("TCP comparison registration and executor must coexist.")
+        if self.tcp_pose_comparison_executor is not None and not isinstance(self.tcp_pose_comparison_executor, PassiveReadSkillExecutor):
+            raise TypeError("TCP comparison executor must be passive.")
         if (self.contract_bundle.spatial_goal_registration is not None) != (self.spatial_goal_executor is not None):
             raise ValueError("Spatial goal registration and executor must coexist.")
         advertised = (
@@ -784,6 +839,11 @@ class RealAgentPrimitiveGatewaySession:
         grasp_plan_enabled = (
             self.contract_bundle.grasp_approach_plan_registration is not None
         )
+        fast_enabled = self.contract_bundle.grasp_fast_plan_registration is not None
+        if fast_enabled != (self.grasp_fast_plan_executor is not None):
+            raise ValueError("Fast grasp registration and executor must coexist.")
+        if fast_enabled and not grasp_plan_enabled:
+            raise ValueError("Fast grasp planning requires the existing paired plan store.")
         point_registration = self.contract_bundle.station_point_grasp_registration
         if (self.contract_bundle.object_transport_registration is not None) != (self.object_transport_executor is not None):
             raise ValueError("Object transport registration and executor disagree.")
@@ -818,7 +878,6 @@ class RealAgentPrimitiveGatewaySession:
             "perception.compute_spatial_goal": self.spatial_goal_executor,
             "perception.plan_object_move": self.object_transport_executor,
             "perception.capture_grasp_observation": self.grasp_observation_executor,
-            "state.read_tcp_pose": self.state_executor,
             "perception.capture_rgb": self.rgb_executor,
             "perception.capture_depth": self.depth_executor,
             "perception.back_project": self.back_projection_executor,
@@ -830,19 +889,23 @@ class RealAgentPrimitiveGatewaySession:
                 self.station_point_grasp_render_executor
             ),
             "perception.plan_grasp_approach": self.grasp_approach_plan_executor,
+            "perception.plan_grasp_fast": self.grasp_fast_plan_executor,
         }
         geometry = {
             (item.skill.definition.skill_id, item.skill.definition.skill_version): executor
             for item, executor in zip(self.contract_bundle.rgbd_geometry_registrations,
                                       self.rgbd_geometry_executors, strict=True)
         }
+        state = {("state.read_tcp_pose", "1"): self.state_executor}
+        if self.tcp_pose_comparison_executor is not None:
+            state["state.read_tcp_pose", "2"] = self.tcp_pose_comparison_executor
         return {
             (entry.route.skill_id, entry.route.skill_version): executors[entry.route.skill_id]
             for entry in self.contract_bundle.route_manifest.skill_routes
             if entry.route.skill_id in executors
             and executors[entry.route.skill_id] is not None
             and (entry.route.skill_id, entry.route.skill_version) not in geometry
-        } | geometry
+        } | geometry | state
 
     def wire_adapter(
         self,
@@ -933,6 +996,7 @@ class RealAgentPrimitiveGatewaySession:
                 executor is None or executor.wait_all(timeout_sec=timeout_sec)
                 for executor, timeout_sec in (
                     (self.state_executor, 5.0),
+                    (self.tcp_pose_comparison_executor, 5.0),
                     (self.rgb_executor, 5.0),
                     (self.depth_executor, 5.0),
                     (self.back_projection_executor, 5.0),
@@ -944,6 +1008,7 @@ class RealAgentPrimitiveGatewaySession:
                     (self.station_point_grasp_executor, 5.0),
                     (self.station_point_grasp_render_executor, 5.0),
                     (self.grasp_approach_plan_executor, 5.0),
+                    (self.grasp_fast_plan_executor, 5.0),
                     (self.grasp_observation_executor, 5.0),
                     (self.object_transport_executor, 5.0),
                     (self.spatial_goal_executor, 5.0),
@@ -1114,8 +1179,7 @@ def _real_hardware_view_provider(
 ) -> HardwareViewProvider:
     """Bind profile-owned ownership units to existing semantic Routes."""
 
-    component_id = contract_bundle.cardinal_profile.component_id
-    arm_route_hashes = []
+    arm_route_hashes = {component: [] for component in contract_bundle.attachment.component_ids}
     perception_route_hashes = []
     for entry in contract_bundle.route_manifest.skill_routes:
         route = entry.route
@@ -1123,9 +1187,10 @@ def _real_hardware_view_provider(
             route.skill_id,
             route.skill_version,
         )
-        if component_id in definition.controlled_component_ids:
-            arm_route_hashes.append(route.semantic_content_hash)
-        elif route.control_effect_class == "read_only" and route.skill_id.startswith(
+        for component, hashes in arm_route_hashes.items():
+            if component in definition.controlled_component_ids:
+                hashes.append(route.semantic_content_hash)
+        if route.control_effect_class == "read_only" and route.skill_id.startswith(
             "perception."
         ):
             perception_route_hashes.append(route.semantic_content_hash)
@@ -1133,7 +1198,7 @@ def _real_hardware_view_provider(
         HardwareResourceBinding(
             resource_id=component_id,
             resource_kind="robot_arm",
-            route_hashes=tuple(arm_route_hashes),
+            route_hashes=tuple(hashes),
             health_provider=lambda: _real_motion_resource_health(
                 port=port,
                 clock=clock,
@@ -1142,7 +1207,7 @@ def _real_hardware_view_provider(
                 ),
             ),
             control_claimed_provider=lambda: _real_motion_control_claimed(port),
-        )
+        ) for component_id, hashes in arm_route_hashes.items()
     ]
     for component, gripper_port in _configured_gripper_ports(gripper_port, gripper_ports).items():
         hand_route = contract_bundle.route_manifest.route(
@@ -1446,6 +1511,34 @@ def assemble_real_agent_primitive_gateway_session(
     execution_port_by_route_hash[state_entry.route.semantic_content_hash] = (
         state_executor
     )
+    tcp_pose_comparison_executor = None
+    if contract_bundle.tcp_pose_comparison_registration is not None:
+        from agent_gateway.profiles.tcp_pose_comparison import (
+            build_tcp_pose_comparison_executor,
+        )
+
+        # The same service/store is bound before any passive reader can run.
+        def lookup_target(operation_id):
+            operation = service.operation_store.get(operation_id)
+            request = service.operation_store.request_for_operation(operation_id)
+            if operation is None or request is None:
+                return None
+            return request, operation
+
+        registration = contract_bundle.tcp_pose_comparison_registration
+        tcp_pose_comparison_executor = build_tcp_pose_comparison_executor(
+            registration=registration,
+            capture_state=lambda parameters, active_operation_id: producer.capture_tcp_pose(
+                parameters=parameters, active_operation_id=active_operation_id,
+            ),
+            lookup_target=lookup_target,
+            route_manifest=contract_bundle.route_manifest,
+            payload_validators=contract_bundle.payload_validators,
+            clock_domain_id=contract_bundle.attachment.clock_domain_id,
+            current_station_revision=lambda: producer.current_station_revision,
+            clock=clock, max_retained_operations=max_retained_operations,
+        )
+        execution_port_by_route_hash[registration.entry.route.semantic_content_hash] = tcp_pose_comparison_executor
     spatial_goal_executor = None
     if contract_bundle.spatial_goal_registration is not None:
         from agent_gateway.profiles.spatial_goal import build_spatial_goal_executor
@@ -1459,6 +1552,8 @@ def assemble_real_agent_primitive_gateway_session(
     grasp_approach_plan_store = (
         BoundedRealGraspApproachPlanStore(
             max_retained_plans=max_retained_operations,
+            planning_operation_lookup=lambda identifier: service.operation_store.get(identifier),
+            clock=clock,
         )
         if grasp_approach_plan_enabled
         else None
@@ -1489,12 +1584,8 @@ def assemble_real_agent_primitive_gateway_session(
                 raise RuntimeError(
                     "Absolute TCP-pose Route exists without its authorized profile."
                 )
-        elif route.skill_id == "motion.step_tcp_cardinal" or (
-            route.skill_id in FIXED_CARDINAL_TCP_STEP_SKILL_IDS_V1
-        ):
-            profile = contract_bundle.cardinal_profile
         else:
-            profile = contract_bundle.orientation_profile(route.skill_id)
+            raise ValueError(f"Unsupported real motion Skill {route.skill_id!r}.")
 
         def lifecycle_factory(
             *,
@@ -1592,6 +1683,7 @@ def assemble_real_agent_primitive_gateway_session(
     station_point_grasp_render_executor = None
     grasp_approach_plan_provider = None
     grasp_approach_plan_executor = None
+    grasp_fast_plan_executor = None
     grasp_observation_executor = None
     object_transport_executor = None
     rgbd_geometry_executors = ()
@@ -1840,6 +1932,22 @@ def assemble_real_agent_primitive_gateway_session(
                     max_retained_operations=max_retained_operations,
                     clock=clock,
                 )
+                fast_registration = contract_bundle.grasp_fast_plan_registration
+                if fast_registration is not None:
+                    if grasp_observation_executor is None:
+                        raise ValueError("Fast grasp planning requires the retained observation executor.")
+                    fast_provider = RealFastGraspPlanProvider(
+                        registration=fast_registration, point_provider=station_point_grasp_provider,
+                        paired_provider=grasp_approach_plan_provider,
+                        observation_executor=grasp_observation_executor)
+                    grasp_fast_plan_executor = build_real_fast_grasp_plan_executor(
+                        registration=fast_registration, provider=fast_provider,
+                        runtime_session_id=contract_bundle.attachment.runtime_session_id,
+                        current_station_revision=lambda: producer.current_station_revision,
+                        max_retained_operations=max_retained_operations, clock=clock,
+                        artifact_store=artifact_store)
+                    execution_port_by_route_hash[
+                        fast_registration.skill.routes[0].semantic_content_hash] = grasp_fast_plan_executor
             execution_port_by_route_hash.update(
                 {
                     localization_registration.skill.routes[
@@ -1901,7 +2009,16 @@ def assemble_real_agent_primitive_gateway_session(
         max_grant_lifetime_sec=30.0,
         max_grant_invocations=1,
     )
-    domain_executor = executors["motion.step_tcp_cardinal"]
+    domain_executor = next(iter(executors.values()), None)
+    if domain_executor is None:
+        domain_executor = _RealAgentDomainHoldPort(
+            port_id=(
+                "agent-gateway:real-domain-hold:"
+                + contract_bundle.route_manifest.runtime_session_id
+            ),
+            domain_hold=domain_hold,
+            clock=clock,
+        )
     emergency_stop_port = (
         None
         if emergency_stop is None
@@ -2015,6 +2132,7 @@ def assemble_real_agent_primitive_gateway_session(
         grasp_approach_plan_store=grasp_approach_plan_store,
         grasp_approach_plan_provider=grasp_approach_plan_provider,
         grasp_approach_plan_executor=grasp_approach_plan_executor,
+        grasp_fast_plan_executor=grasp_fast_plan_executor,
         artifact_store=artifact_store,
         owns_artifact_store=owns_artifact_store,
         hardware_view_provider=hardware_view_provider,
@@ -2022,6 +2140,7 @@ def assemble_real_agent_primitive_gateway_session(
         grasp_observation_executor=grasp_observation_executor,
         object_transport_executor=object_transport_executor,
         spatial_goal_executor=spatial_goal_executor,
+        tcp_pose_comparison_executor=tcp_pose_comparison_executor,
         rgbd_geometry_executors=rgbd_geometry_executors,
     )
 

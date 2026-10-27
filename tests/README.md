@@ -90,6 +90,122 @@ do not establish equivalent coverage. Record this reasoning in the existing
 review, with measured runtime impact when execution cost motivates the change;
 neither net line reductions nor test-count quotas are acceptance criteria.
 
+### B601 虚拟反馈驱动的重复状态读取
+
+`AcquisitionReplay.run` 与 cycle 的 `advance` 在没有 `until` 回调时，复用本次同步
+循环已经读取的 `active` 状态；前者同时复用目标偏移，避免为驱动下一 tick 反复
+深拷贝完整 GUI 历史。`tick` 的默认路径仍实时读取状态。存在回调时，heartbeat
+与目标偏移沿用原有的再次读取行为，因为回调即使返回 `False` 也可能修改控制器。
+回归用例用真实 `owner_stopped` 验证回调之后不会依据旧状态补发 heartbeat。
+
+量化摩擦机械模型在每次 dispatch 后仍读取完整状态，下一 tick 的纯机械计算期间
+复用其中的 `active`；进入返回阶段前重新读取。控制周期、1000 Hz 机械子步、
+240/180 秒循环上限、摩擦与残余负载矩阵、原生回执、驱动阻尼、全部保护校验及
+原有断言保持不变。这只减少测试驱动器中重复的观察开销，不改变生产状态接口，
+也不把虚拟反馈证据当作真机验证。
+
+完整双关节批次的 6 组 `test_full_coupled_batch_and_report_keep_handoffs_distinct_from_withdrawal`
+也复用上一 tick 完成后已读取的状态，供下一轮终止判断和 heartbeat 使用。两次读取
+之间只有测试中的纯机械计算、断言和被动 journal 观察，没有回调或控制器状态变更；
+`arm` 后先重新读取。每次控制 tick 仍重新获取完整状态并调用真实 journal。
+其他 `coupled_tick` 调用默认继续实时读取；6 组组合、全部控制/机械 tick、实际回执、
+逐 tick 保护断言、撤力、持久化及报告检查保留。这不减少 journal 的采样次数，
+也不替换生产状态接口、记录器或 `fsync`。
+
+### 只读快照重试的采样历史
+
+`test_persistent_failed_state_can_retry_without_restart` 在 `_capture_history`
+测试输入端提供可控历史，分别验证过大采样间隔和关节移动被真实 `stationarity`
+校验器拒绝，再用正常历史验证同一设备会话可以重试成功。它不替换校验器，
+不依赖共享测试进程恰好获得足够密集的线程调度，也不改变生产采样周期、时钟或门限。
+原有首次失败、第二次成功、机械臂和相机不重启断言保留；其他采集、历史选择、
+freshness 和静止性边界测试继续覆盖原路径。该用例中的可控历史是测试输入，
+不能作为真实设备采样时序的验证证据。
+
+### Worker 清理故障测试的等待压缩
+
+`test_owned_worker_cleanup.py` 的启动结果未知矩阵保留五类 owner 与两种异常，
+继续验证未确认退出时依赖保留、同一线程迟到启动后才允许最终释放。故障注入明确没有
+调用 native allocator，因此只在该线程实例的启动事件上使用真实 `Event.wait(0)`，
+不再重复等待生产级的一至两秒预算；不替换 `join_and_confirm` 或伪造完成状态。
+同时直接断言该线程的退出确认仍为 False，避免其他关闭门禁掩盖错误的线程完成判定。
+真实迟到启动与最终清理前恢复原等待。独立用例使用事件握手和真实等待验证迟到启动可
+唤醒退出确认；已运行线程、受损 liveness、join 中断等原有场景不使用该压缩。
+生产超时、线程实现、安全判断及其他测试的等待均不变，这不是生产超时性能基准。
+
+### MuJoCo 原生集成中的重复初始化与组合采样
+
+`mujoco_gateway_fixture.py` 只在两个已有 Gateway 测试构造器中，将场景编译端口
+接到已有 `ModelArtifactCache`，前提是显式配置 `SIM_MUJOCO_CACHE_DIR`。完整验收
+沿用该次 Run 的输入哈希缓存；未配置它的普通 focused wrapper 保持原构造路径，
+不自动启用缓存或新增缓存根。只复用校验过的编译产物，每次构造
+仍加载独立 `MjModel`、`MjData`、planner、Gateway 和生命周期资源；不共享可变模型、
+物理快照、待执行计划或运行中的会话。构造结束或抛出异常后恢复原端口。
+生产构造器和缓存实现不改。冷编译与命中结果的模型参数、网格、接触、执行器、
+初始状态逐项比较；修改一个会话的质量和 qpos 后，其他会话与后续加载必须不受影响。
+原有 `test_mujoco_fast_runtime.py` 中的冷启动、损坏恢复、跨进程发布和失效检查仍保留。
+
+缓存会话还有函数级测试 scope。`conftest.py` 在本例 fixtures 启动前建立 scope，
+缓存构造器登记本例的会话引用，观察原 `session.close()` 的真实返回，不代替它关闭；
+全部本例 teardown 完成时，要求完整 close 已成功返回 accepted，且应用已关闭，
+再恢复测试观察包装、释放这些引用并执行一次 `gc.collect()`，归还等待
+循环回收的原生对象。它不替测试调用 `close()`；若存在未关闭应用，保留引用并
+让 teardown 失败，不进行这次回收；应用的 closed 标志不能替代完整清理成功。
+没有缓存会话的测试不调用回收。未进入本例
+scope 的高层 fixture／独立线程构造继续走原 factory，避免无人负责的缓存对象积累。
+冷、热构造都使用同一构造锁，保证临时编译端口恢复后，其他构造者才进入。
+
+加速构造后，已关闭场景的原生内存可能在 Python 自动循环回收前积累。完整验收将
+`test_agent_gateway_mujoco_fast_grasp.py` 和 `test_agent_gateway_mujoco_safe_tcp_pose.py`
+加入现有的独立函数分片许可表，把测试族分配到同一批数的不同进程；每个参数族仍
+不可拆分。两个模块只有函数局部会话，没有共享的运行中模块 fixture；跨进程只共享
+该次 Run 的校验编译产物。其函数初始估值均分已有模块估值，没有使用中断验收或
+focused 结果充当完整绿色计时证据。生产 GC 参数和行为、原生堆页归还实现、分片算法、
+批数、并发上限及内存停止门禁均不变；上述显式回收仅在已关闭的缓存测试 scope
+结束时执行。未来增加共享运行时 fixture 时，需要重新
+核对这一分片边界。
+
+所有权事务的 7 个失败/成功分支，以及锁等待预算 1 例、refinement 锁等待 4 例、
+最终场景读取后的取消/过期 2 例，使用真实 `MujocoPlannedTcpMotion` 和真实可重入锁，
+配合小型内存场景。它们原本就替换了几何查询，重复编译完整机器人没有增加该事务
+的断言。保留全部拒绝条件、待执行计划身份和执行状态断言，并要求精确拒绝原因。
+代价是这些分支不再各自验证完整原生 Rig/场景接线；真实双臂计划、执行、锁顺序、
+接触保护、Gateway 消费与资源关闭仍由其余原生集成用例验证。
+
+源分支还提出了下列覆盖压缩；本次与新增 Skill 组合时保留主线完整参数矩阵，
+仅复用编译缓存、关闭后的回收、事务测试装配及分片改进。下表是源候选的历史
+取舍，不表示当前主线缩减了这些组合。以后若单独评审矩阵压缩，再按该次组合
+风险与验证结果决定；本次验收逐项保留原 testcase 身份。
+
+| 测试族 | 主线保留用例 | 源候选采样用例 | 源候选保留与放弃 |
+| --- | ---: | ---: | --- |
+| safe TCP policy × 左右臂 × task | 12 | 6 | 保留所有两两参数组合和每例全部真实执行断言；放弃其余三因素组合 |
+| DMTAC 左右手 × 方位 × 摩擦 | 8 | 4 | 保留所有两两参数组合及真实 lift、滑移、穿透和力学断言；放弃其余三因素组合 |
+| native fast selector 顺序 × 三种决策 | 6 | 3 | 每种决策一次，包含正反候选顺序；不再为每种决策重建两个原生会话。轻量 search/real-provider 策略矩阵继续保留 |
+| pose task 物理 feasibility oracle | 13 | 6 | 保留随机/固定 reach、普通/各向异性 contact、接触后 lift、完整 pick；去掉部分观察表示、固定初态和中间参数预设的独立 oracle |
+
+feasibility 的受限 z/夹爪 contact 和 positive-z lift 仍分别由真实闭环的
+`test_descend_close_task_is_feasible_without_hidden_xy_actions` 与
+`test_lift_short_v2_zero_policy_holds_and_positive_policy_lifts` 覆盖；各预设的配置、
+动作投影、观察字段、奖励和成功条件检查保留。它们不能替代被移除组合的完整
+独立物理验收，因此新增物理路径或参数交互风险时，应增加针对该风险的原生用例。
+B601 摩擦/残余力矩、真实外层截止时间、replay 释放尾段、physics tick、保护阈值、
+运行器、并发上限和内存门禁不在本次压缩范围。
+
+2026-10-25 的完整验收对照以 `1e38c0045942cc83bb08e6aae9414b06f6ae7a33`
+为基线，候选为 `d2b3fc046c2ec8fa1d3474b299589fb26039bbea`。这批变更的目的
+是改进测试时长，不改变生产控制行为。在同一远端测试环境、12 批次、最多 2 个
+外层 pytest 的设置下，`run_full_acceptance.sh` 的墙钟时间由 1000.964 秒降至
+920.650 秒，减少 80.314 秒（约 8.0%）；这是一次完整对照，不是稳定性能保证，
+也不是整个合并工作流的总耗时。
+
+候选有 18,597 个普通测试和 24 个 subtest 通过，无失败或错误。18 个 skip 的
+身份与原因不变；声明压缩范围以外的 testcase 身份和结果逐项一致。移除 20 个
+昂贵组合样例，增加 12 个缓存一致性、恢复、生命周期和分片回归样例。
+原内存限制仍为 High 6 GiB、Max 8 GiB、Swap 0；峰值由 5.22 GiB 增至
+5.68 GiB，High、Max、OOM 事件均为零。保留这项内存代价与上述覆盖收缩，
+不能只引用 focused 测试的加速比例。证据只覆盖离线 CPU/MuJoCo，不证明真机验收。
+
 ### Runtime artifact 重复迁移压缩
 
 `test_runtime_artifact_migration.py` 将已发布迁移的幂等检查接在已有完整成功场景后，
@@ -121,6 +237,13 @@ neither net line reductions nor test-count quotas are acceptance criteria.
 中较窄的重复用例，不改变 canonical 检查、白名单或验收 selector。
 
 ### 同输入仿真与模型构建去重
+
+MJCF 的 `MeshAssetRegistry` 在一次转换内为同一路径复用 OBJ/MTL 视觉材质解析结果，
+避免左右臂重复解析同一组网格。注册器由每次 `convert_urdf_to_mjcf_xml` 新建，
+下一次转换会重新读取 OBJ、MTL 以及此前缺失的材质输入；不会复用 MuJoCo 模型或状态。
+每次视觉调用仍构建独立属性字典、检查源网格存在，碰撞网格继续独立注册原始文件。
+既有材质分区测试同时覆盖重复视觉的颜色、位置、属性隔离和原始碰撞网格，
+新增参数用例检查跨转换输入更新，包含缺失材质库恢复。原有物理闭环与安全矩阵保持完整。
 
 `test_mujoco_trajectory_composition_publication.py` 在同一真实 MuJoCo session 中
 先验证 `residual_effective_until == target_effective_at` 的到期拒绝，再以相同
@@ -247,24 +370,30 @@ planner parses the source without importing it, assigns every statically
 discovered top-level `test_*` function exactly once, and fails closed on test
 classes or dynamic collection hooks. Parameterized functions remain a single
 target, so their complete case matrix stays together. The manifest records both
-source modules and exact pytest targets. The temp pipeline and replay active
-pipeline use this exception to share shard capacity without reducing test
-coverage or physics work. Replay tests create their own temporary logs and
+source modules and exact pytest targets. The temp pipeline, replay active
+pipeline and the two independent native Gateway modules described above use
+this exception to share shard capacity and bound process-local scene
+accumulation. The split itself preserves each complete function parameter
+family. Replay tests create their own temporary logs and
 fresh runtimes; the four-rollout combined-control test and each parameterized
 envelope matrix remain indivisible. Grasp trajectory stays module-local to
 preserve its shared planning fixture instead of repeating that expensive plan.
 The sparse full-suite weights come from testcase durations in a complete,
-socket-capable green Run and cover only modules that contributed at least five
-seconds there. Refresh them only from another exact green full-suite artifact;
-failed, capability-limited, or focused runs are not representative inputs.
-完整验证的模块和 replay 函数权重以绿色六分片基线 `47d7be6e` 为基础；其中
-artifact migration / resolution 两个 I/O 模块按 `c3c06be6` 在 2026-09-25 的
-绿色全量结果更新为 49.666 / 15.847 秒，避免旧估值将耗时集中在同一分片。
-2026-10-18 的绿色完整基线 `298221fc`（六分片串行、Node 22）补齐了九个此前未加权、
-实际累计至少五秒的模块，包括 DMTAC 接触、Gateway 安全位姿和 worker 清理等。
-既有模块与函数权重保留，避免把单一远端的 I/O 差异当作全局变化。
-这些值只用于调度，不是 timeout 或验收阈值；不改变测试内容、真实 `fsync`、
-模块隔离边界、参数矩阵或 fast Profile 的权重。
+socket-capable green Run. New entries require at least five seconds; existing
+estimates may be refreshed when their module becomes inexpensive. Refresh them
+only from another exact green full-suite artifact; failed, capability-limited,
+or focused runs are not representative inputs.
+2026-10-25 以绿色完整提交 `ec122623b`（Run `full-20261025-b601ec`，十二批、两并发、
+Node 22、Trimesh 5.1.1 / Embreex 4.4.0.post1）的数据刷新 80 个已加权模块，
+并补齐 observed-point 与 observed-safe-motion 两个累计至少五秒的新模块。
+这次同时更新两个既有函数拆分模块的 33 个函数估值，保持函数注册表和完整参数矩阵。
+有跳过、缺少实际记录或源码已在该证据之后改变的模块继续保留既有估值；历史来源
+包括 `47d7be6e`、`c3c06be6`、`298221fc`、`54edca481` 和 `dfff99b81`。
+此前优化已显著缩短部分 B601、MuJoCo 和 artifact I/O 测试，继续沿用旧数值会让某些
+批次实际偏轻，并把等待留在验收尾部。这些是所测环境中的调度估值，其他主机的
+CPU、文件系统和可选依赖会改变耗时，仍需验证完整结果与资源余量。
+这些值不是 timeout 或验收阈值；不改变测试内容、真实 `fsync`、模块隔离边界、
+参数矩阵、fast Profile、并发上限或内存门禁。运行器与分片算法保持原样。
 The default remains four shards. Each shard has separate pytest, Python, XDG,
 Matplotlib, Numba, `TMPDIR`, basetemp, log, and JUnit state. Shards in one exact
 Run share only its content-addressed MuJoCo model cache; that cache uses process
@@ -282,6 +411,13 @@ may set new absolute `DEXTELEOP_FULL_ACCEPTANCE_RUN_ROOT` and
 `DEXTELEOP_FULL_ACCEPTANCE_JUNIT` paths so the aggregate evidence remains in
 the protected Run directory. Explicit test targets are rejected because this
 entrypoint represents complete-suite acceptance.
+
+完整验收会显式加载 `scripts.pytest_native_memory`：在当前模块的测试和 teardown
+完成后，使用 Linux/glibc 的 `malloc_trim` 将已经空闲的原生堆页归还操作系统，
+为主堆保留 128 KiB。它不强制 Python GC、不清空模型缓存、不关闭仍存活的资源，
+也不改变测试、断言、并发或内存保护。其他平台或缺少该符号时保持原有内存分配行为；
+实际加载或调用异常仍会使验证失败。普通 `run_pytest.sh` 不自动加载该插件。
+此优化针对长批次中已释放却仍占 RSS 的原生内存，不替代对选定并发度的完整资源验证。
 
 在内存受限的主机上，可以把分片数量与同时运行的进程数分开配置：
 

@@ -225,7 +225,8 @@ def test_clearance_recovery_only_accepts_monotonic_retreat(
     projector.controlled_qpos_indices = np.asarray((0,), dtype=np.int32)
     projector.policy = CollisionSafetyPolicy(sweep_max_joint_step_rad=0.1)
 
-    def check(_source_data, controlled_qpos):
+    def check(_source_data, controlled_qpos, *, distance_query_limit_m=None):
+        assert distance_query_limit_m == projector.policy.distance_query_limit_m
         distance = float(np.asarray(controlled_qpos)[0]) * 0.01
         return CollisionCheckResult(
             safe=distance >= projector.policy.minimum_clearance_m,
@@ -498,3 +499,71 @@ def test_fast_direct_qpos_observation_keeps_collision_approved_robot_state() -> 
         assert observation[6] > 0.0
     finally:
         env.close()
+
+
+@pytest.mark.parametrize("gap", [.006481913, .0015, -.0005, -.0015])
+def test_projector_uses_admission_radius_for_overlapping_aabbs_without_relaxing_contact(monkeypatch, gap):
+    mujoco = pytest.importorskip("mujoco")
+    from sim.mujoco.collision_safety import KinematicCollisionProjector
+    # Parallel thin boxes have overlapping world AABBs, but a positive gap
+    # along their shared local normal. Reproduce the broad-query mesh defect
+    # without platform-specific CAD or replacing actual narrow contact checks.
+    normal = np.array([-1., 1., 0.]) / np.sqrt(2.)
+    position = normal * (.002 + gap)
+    model = mujoco.MjModel.from_xml_string(
+        '<mujoco><worldbody><body quat=".923879532511287 0 0 .38268343236509">'
+        '<geom type="box" size=".05 .001 .01" contype="2"/></body>'
+        f'<body pos="{position[0]} {position[1]} 0" quat=".923879532511287 0 0 .38268343236509">'
+        '<joint type="slide" axis="1 0 0"/>'
+        '<geom type="box" size=".05 .001 .01" contype="2"/>'
+        '</body></worldbody></mujoco>')
+    data = mujoco.MjData(model)
+    mujoco.mj_forward(model, data)
+    native = mujoco.mj_geomDistance
+    calls = []
+    def distance(m, d, first, second, limit, segment):
+        calls.append(limit)
+        return -gap if gap > .005 and limit > .005 else native(m, d, first, second, limit, segment)
+    monkeypatch.setattr(mujoco, "mj_geomDistance", distance)
+    projector = KinematicCollisionProjector(mujoco, model, np.array([0]))
+    assert projector.check_current(data).safe is False
+    assert calls[-1] == .05
+    preventive = projector.check_qpos(data, np.zeros(1))
+    assert calls[-1] == .002
+    assert preventive.safe is (gap >= .002)
+    hard = projector.check_qpos(data, np.zeros(1), minimum_clearance_m=-.001)
+    assert calls[-1] == 0.
+    assert hard.safe is (gap >= -.001)
+    assert hard.minimum_distance_m == pytest.approx(min(gap, 0.), abs=1e-9)
+    if gap < -.001:
+        result = projector.project(data, start_qpos=np.zeros(1), requested_qpos=np.zeros(1),
+            minimum_clearance_m=-.001)
+        assert result.status == "invalid_safe_state"
+
+
+@pytest.mark.parametrize("distances,expected", [
+    ((.001, .0025, .003, .0025), "invalid_safe_state"),
+    ((.001, .0025, .003, .0035), "recovered"),
+    ((.001, .0025, .0015, .003), "invalid_safe_state"),
+])
+def test_recovery_compares_reporting_distances_not_saturated_admission_bounds(monkeypatch, distances, expected):
+    mujoco = pytest.importorskip("mujoco")
+    from sim.mujoco.collision_safety import (
+        CollisionSafetyPolicy,
+        KinematicCollisionProjector,
+    )
+    model = mujoco.MjModel.from_xml_string(
+        '<mujoco><worldbody><body><geom type="box" size=".02 .02 .02" contype="2"/></body>'
+        '<body><joint type="slide" axis="0 0 1"/>'
+        '<geom type="box" size=".02 .02 .02" contype="2"/></body></worldbody></mujoco>')
+    data = mujoco.MjData(model)
+    mujoco.mj_kinematics(model, data)
+    # Controlled distance series tests the actual projector/oracle clipping
+    # seam, not physical feasibility of these deliberately synthetic geoms.
+    monkeypatch.setattr(mujoco, "mj_geomDistance", lambda _m, d, _a, _b, limit, _segment:
+        min(float(np.interp(d.qpos[0], [0., .001, .002, .003], distances)), limit))
+    projector = KinematicCollisionProjector(mujoco, model, np.array([0]),
+        CollisionSafetyPolicy(sweep_max_joint_step_rad=.001))
+    result = projector.recover_from_clearance_violation(data,
+        start_qpos=np.array([0.]), requested_qpos=np.array([.003]))
+    assert result.status == expected

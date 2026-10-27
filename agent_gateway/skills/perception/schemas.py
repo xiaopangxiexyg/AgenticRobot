@@ -493,6 +493,7 @@ def localize_objects_schema_entry_v1(
             "image_width": {"type": "integer", "minimum": 1},
             "image_height": {"type": "integer", "minimum": 1},
             "coordinate_format": {"const": "xyxy_pixel_0based_half_open"},
+            "semantic_identity_status": {"const": "unverified_proposal"},
             "detections": {
                 "type": "array",
                 "minItems": 0,
@@ -635,8 +636,12 @@ def validate_localize_objects_result_v1(
         "model_profile_hash",
         "annotated_image_media_content_hash",
     }
-    if not isinstance(payload, Mapping) or set(payload) != fields:
+    if not isinstance(payload, Mapping) or not fields <= set(payload) or (
+        set(payload) - fields - {"semantic_identity_status"}
+    ):
         raise ValueError("Object localization result fields do not match the schema.")
+    if payload.get("semantic_identity_status", "unverified_proposal") != "unverified_proposal":
+        raise ValueError("Object localization does not verify semantic identity.")
     if payload["input_source"] not in {"artifact", "local_path"}:
         raise ValueError("Object localization result input_source changed.")
     for field_name in (

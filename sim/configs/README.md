@@ -13,6 +13,39 @@ Current profiles:
   collision section also owns prescribed-motion safety clearance, hard
   penetration, joint-sweep resolution and projection-iteration parameters.
 
+## Scene expansion for manipulation tasks
+
+The opt-in [Skill scene suite](../../docs/sim/SKILL_SCENE_SUITE.md) provides
+13 layouts with three fixed variants, materialized through the existing scene
+and task loaders. It separates public language tasks from evaluation-only data;
+its placement tasks remain pending physical-contact/payload acceptance.
+These fixture manifests live in `scene_suites/`; generated scene files are
+complete `SimulationContract` values consumed by the ordinary loaders.
+
+Scene contracts remain shared by MuJoCo tasks and robot-facing adapters;
+task-specific geometry must not be hidden in Agent prompts or renderer code.
+
+The existing `scene_spec.v1` remains box-only and unchanged. New scene
+experiments may explicitly select `dexteleop.sim.scene_spec.v2`, whose
+`FreeBodyObjectSpec.size_m` always means the object's full x/y/z bounding
+extents in meters. The first v2 slice supports box, upright cylinder, sphere,
+and ellipsoid free bodies. Cylinder x/y extents must match; sphere extents must
+all match. Mass and diagonal inertia are explicit in the contract, with
+shape-specific solid-body defaults. These primitive forms are stable and
+inexpensive for grasp/contact experiments; they are geometric approximations,
+not claims about the exact mass distribution, surface finish, or friction of a
+real product.
+
+The v2 primitives are a geometry foundation only. They do not yet certify
+generic grasp/contact task semantics, mesh collision quality, placement success,
+or transfer to the RealMan hand. Each later scene/task batch must retain an
+unchanged baseline and add a bounded, reproducible MuJoCo comparison before it
+is used for Agent capability claims.
+
+v2 的形状支持是场景建模能力，不等于所有形状都能进入携物 Skill。当前载荷守卫
+仅支持完整 box 与 convex mesh；sphere／cylinder／ellipsoid 仍须明确拒绝，直到
+对应的支撑几何与携物检查另行接入并验证。v1 现有 JSON、默认场景及碰撞政策保持不变。
+
 Task configurations live in `tasks/`, rather than pretending to be a second
 `SimulationContract`:
 

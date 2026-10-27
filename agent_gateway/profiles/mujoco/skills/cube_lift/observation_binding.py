@@ -10,6 +10,7 @@ from agent_gateway.runtime.station_revision import (
 
 from ...observation import MujocoAgentObservationProducer
 from ...observation_binding import MujocoAgentObservationSourceBinding
+from ...state_deployment import MujocoPassiveTcpPoseStateDeploymentBinding
 from .deployment import MujocoCubeLiftAgentSkillContractBundle
 
 
@@ -75,6 +76,18 @@ class MujocoCubeLiftAgentObservationProducer(MujocoAgentObservationProducer):
             ),
             revision_tracker=revision_tracker,
         )
+
+
+    def _resolve_observation_component(self, *, application: Any, contract_bundle: Any) -> str:
+        # CubeLift retains a task/bimanual action contract. Only its passive
+        # observation projection is right-arm TCP; it is not a TCP motion session.
+        if not isinstance(contract_bundle, MujocoCubeLiftAgentSkillContractBundle):
+            raise TypeError("contract_bundle must be a CubeLift contract bundle.")
+        state_binding = contract_bundle.state_deployment_binding
+        if (not isinstance(state_binding, MujocoPassiveTcpPoseStateDeploymentBinding)
+                or state_binding.component_id != "right_arm"):
+            raise ValueError("CubeLift observation requires its typed right_arm state binding.")
+        return "right_arm"
 
 
 __all__ = [

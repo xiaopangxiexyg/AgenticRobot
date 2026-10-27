@@ -168,12 +168,19 @@ class MujocoAgentTcpCardinalStepProfile:
         )
 
     @property
+    def parameter_profile_id(self) -> str:
+        identifier = MUJOCO_AGENT_TCP_CARDINAL_STEP_PARAMETER_PROFILE_ID_V1
+        return (
+            identifier
+            if self.component_id == "right_arm"
+            else "left-arm-" + identifier.removeprefix("right-arm-")
+        )
+
+    @property
     def semantic_content_hash(self) -> str:
         return canonical_content_hash(
             {
-                "profile_id": (
-                    MUJOCO_AGENT_TCP_CARDINAL_STEP_PARAMETER_PROFILE_ID_V1
-                ),
+                "profile_id": self.parameter_profile_id,
                 "component_id": self.component_id,
                 "reference_frame_id": self.reference_frame_id,
                 "reference_frame_spec_hash": self.reference_frame_spec_hash,
@@ -268,9 +275,16 @@ class MujocoAgentTcpFixedOrientationProfile:
 
     @property
     def parameter_profile_id(self) -> str:
-        return MUJOCO_AGENT_TCP_FIXED_ORIENTATION_PARAMETER_PROFILE_ID_BY_SKILL_ID_V1[
-            self.skill_id
-        ]
+        identifier = (
+            MUJOCO_AGENT_TCP_FIXED_ORIENTATION_PARAMETER_PROFILE_ID_BY_SKILL_ID_V1[
+                self.skill_id
+            ]
+        )
+        return (
+            identifier
+            if self.component_id == "right_arm"
+            else "left-arm-" + identifier.removeprefix("right-arm-")
+        )
 
     @property
     def semantic_content_hash(self) -> str:

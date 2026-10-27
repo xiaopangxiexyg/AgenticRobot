@@ -45,6 +45,37 @@ def test_full_environment_install_does_not_pin_one_worktree() -> None:
     assert 'UV_DEFAULT_INDEX="$LOCK_INDEX_URL"' in installer
 
 
+def test_doctor_requires_declared_cad_observation_dependencies(monkeypatch) -> None:
+    doctor = _load_doctor_module()
+    config = doctor.load_project_environment()
+    cad_dependencies = {"trimesh", "embreex"}
+    versions = {
+        doctor._dependency_name(requirement): (
+            doctor._expected_exact_version(requirement) or "installed"
+        )
+        for requirement in (*config.optional_dependencies, *config.pip_no_deps_packages)
+    }
+    monkeypatch.setattr(
+        doctor, "_conda_records",
+        lambda _prefix: dict(requirement.split("=", 1) for requirement in config.conda_packages),
+    )
+    monkeypatch.setattr(
+        doctor, "_distribution_version_outside_user_site",
+        lambda name: None if name in cad_dependencies else versions.get(name),
+    )
+    findings = []
+    doctor._append_package_findings(findings, config)
+    missing = [item for item in findings if item.key == "deps.missing"]
+    assert len(missing) == 1
+    assert set(missing[0].detail.split(", ")) == cad_dependencies
+
+    monkeypatch.setattr(doctor, "_distribution_version_outside_user_site", versions.get)
+    findings = []
+    doctor._append_package_findings(findings, config)
+    assert not any(item.level == "FAIL" for item in findings)
+    assert any(item.key == "deps.present" for item in findings)
+
+
 def test_doctor_lock_check_pins_the_committed_index() -> None:
     doctor = _load_doctor_module()
 

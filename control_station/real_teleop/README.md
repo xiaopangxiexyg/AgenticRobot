@@ -209,17 +209,21 @@ the attachment appear authoritative.
 
 ## Default-off real Agent primitive motion
 
-The top-level real profile now has a separate default-off 6+3 primitive path.
-`agent_gateway.profiles.real.motion_factory` preflights four exact
-`t2_real_motion` Routes (six cardinal directions plus three fixed level
-orientations), prepares one `RealAgentMotionPort`, assembles the Gateway
+The top-level real profile has a default-off absolute-pose compatibility path.
+`agent_gateway.profiles.real.motion_factory` preflights the retained
+`t2_real_motion` absolute-pose Route (`motion.move_tcp_to_pose@1`) and its
+measured-state Route, prepares one `RealAgentMotionPort`, assembles the Gateway
 service, and only then attaches that same port to the existing RealTeleop
 Session. It returns a replacement `RealTeleopComponents`; a composition root
 must use that returned aggregate. The canonical GUI entrypoint exposes this
-only behind `--agent-primitive-skill-only` plus an exact side, action, private
+only behind `--agent-primitive-skill-only` plus an exact side,
+`--agent-primitive-authorized-action move_tcp_to_pose`, a private
 Unix socket, Active TCP envelope, position-control mode, and explicit operator
 confirmation. Ordinary GUI invocations remain unchanged and do not attach or
-advertise any Agent motion Route.
+advertise any Agent motion Route. The ten historical cardinal/heading debug
+contracts remain readable but are no longer published. This compatibility
+assembly accepts only the retained absolute-pose action; other supported
+standalone-profile actions need their existing explicit assembly.
 
 The existing RealTeleop control thread remains the sole effect owner. It applies
 queued activation/HOLD requests, builds the selected absolute tool-TCP target

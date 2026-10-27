@@ -98,6 +98,26 @@ def _indexed_reference(
     )
 
 
+_owned_planners: list[RM65OfficialAllIKGovernorPlanner] = []
+
+
+@pytest.fixture(autouse=True)
+def _drain_owned_planners():
+    yield
+    # Retain any failed owner in the registry and let pytest report teardown
+    # separately, preserving the original startup assertion/exception.
+    errors = []
+    for planner in tuple(_owned_planners):
+        try:
+            planner.close()
+            _owned_planners.remove(planner)
+        except BaseException as exc:
+            errors.append(exc)
+    if errors:
+        raise RuntimeError("C2 test owner cleanup failed: "
+            + "; ".join(str(error) for error in errors)) from errors[0]
+
+
 def _planner(
     *,
     shadow: bool = False,
@@ -141,7 +161,7 @@ def _planner(
         if async_precompute and process_isolation
         else None
     )
-    return RM65OfficialAllIKGovernorPlanner(
+    planner = RM65OfficialAllIKGovernorPlanner(
         canonical_collision_planner,
         continuous_waypoint_precompute_collision_planner=(
             precompute_collision_planner
@@ -161,6 +181,10 @@ def _planner(
         continuous_waypoint_process_spec=process_spec,
         plan_splice_dynamics_config=plan_splice_dynamics_config,
     )
+
+    _owned_planners.append(planner)
+    planner.start_background_workers()
+    return planner
 
 
 def test_async_precompute_worker_affinity_is_verified_before_use(monkeypatch) -> None:

@@ -10,7 +10,7 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SUBMODULE_PATH = "hardware/MotorBridge"
 SUBMODULE_URL = "git@github.com:CYBER-QAQ/motorbridge.git"
-SUBMODULE_COMMIT = "93a6b4c21f3f4252e935dfbd5f0d42dd06e06424"
+SUBMODULE_COMMIT = "1e479d280f29dd88d6a7e4270aeab4342d682bde"
 
 pytestmark = [pytest.mark.unit, pytest.mark.contract]
 

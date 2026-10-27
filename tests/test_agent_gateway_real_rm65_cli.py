@@ -11,6 +11,7 @@ from agent_gateway.profiles.real import gateway_cli
 from agent_gateway.profiles.real.session_authorization import (
     REAL_AGENT_PRIMITIVE_SESSION_CONFIRM_TOKEN,
 )
+from agent_gateway.skills.motion.definition import ARCHIVED_DEBUG_MOTION_SKILL_IDS_V1
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -36,10 +37,26 @@ def test_lifecycle_json_and_newline_are_written_together(monkeypatch, event):
 
 def test_spatial_goal_cli_is_explicitly_optional():
     parser = gateway_cli.build_parser()
-    assert parser.get_default("enable_spatial_goals") is False
+    assert parser.get_default("enable_spatial_goals") is True
     action = next(item for item in parser._actions if item.dest == "enable_spatial_goals")
-    assert action.option_strings == ["--enable-spatial-goals"]
-    assert action.const is True
+    assert action.option_strings == ["--enable-spatial-goals", "--no-enable-spatial-goals"]
+
+
+@pytest.mark.parametrize("flags,spatial,comparison", [
+    ([], True, True),
+    (["--no-enable-spatial-goals"], False, True),
+    (["--no-enable-tcp-pose-comparison"], True, False),
+    (["--no-enable-spatial-goals", "--no-enable-tcp-pose-comparison"], False, False),
+])
+def test_read_only_defaults_and_explicit_opt_out_preserve_motion_and_model_choices(flags, spatial, comparison):
+    args = gateway_cli.build_parser().parse_args([
+        *_argv(confirmation=REAL_AGENT_PRIMITIVE_SESSION_CONFIRM_TOKEN), *flags])
+    assert args.enable_spatial_goals is spatial
+    assert args.enable_tcp_pose_comparison is comparison
+    assert args.enable_point_grasp is False
+    assert args.enable_grasp_observation is False
+    assert args.enable_back_projection is False
+    assert args.enable_point_grasp_finger_exchange is False
 
 
 def test_cli_back_projection_resolves_measured_geometry_without_grasp_models():
@@ -99,7 +116,7 @@ def _argv(*, confirmation: str, socket_path: Path | None = None) -> list[str]:
         "--authorized-side",
         "right",
         "--authorized-action",
-        "forward",
+        "move_tcp_to_pose",
         "--confirm",
         confirmation,
         "--runtime-session-id",
@@ -133,7 +150,7 @@ def test_cli_rejects_confirmation_before_profile_or_hardware_resolution(
 
 def test_cli_gripper_authorization_requires_explicit_config_before_hardware():
     args = _argv(confirmation=REAL_AGENT_PRIMITIVE_SESSION_CONFIRM_TOKEN)
-    args[args.index("forward")] = "set_gripper_state"
+    args[args.index("--authorized-action") + 1] = "set_gripper_state"
     with pytest.raises(SystemExit) as error:
         gateway_cli.main(args)
     assert error.value.code == 2
@@ -193,31 +210,36 @@ def test_cli_accepts_a_list_of_reviewed_actions_for_persistent_session() -> None
     argv.extend(
         [
             "--authorized-actions",
-            "forward",
-            "backward",
-            "left",
-            "right",
-            "up",
-            "down",
-            "level_forward",
-            "level_forward_left_30",
-            "level_forward_right_30",
+            "move_tcp_to_pose",
+            "approach_grasp_pose",
+            "execute_grasp_approach_plan",
         ]
     )
     parsed = gateway_cli.build_parser().parse_args(argv)
     assert parsed.authorized_action is None
     assert tuple(parsed.authorized_actions) == (
-        "forward",
-        "backward",
-        "left",
-        "right",
-        "up",
-        "down",
-        "level_forward",
-        "level_forward_left_30",
-        "level_forward_right_30",
+        "move_tcp_to_pose",
+        "approach_grasp_pose",
+        "execute_grasp_approach_plan",
     )
     assert not hasattr(parsed, "calibration_profile")
+
+
+@pytest.mark.parametrize("skill_id", sorted(ARCHIVED_DEBUG_MOTION_SKILL_IDS_V1))
+@pytest.mark.parametrize("option", ("--authorized-action", "--authorized-actions"))
+def test_cli_rejects_archived_motion_before_profile_resolution(monkeypatch, capsys, skill_id, option):
+    monkeypatch.setattr(
+        gateway_cli, "resolve_exclusive_rm65_skill_deployment_profile",
+        lambda *_args, **_kwargs: pytest.fail("Archived actions must fail before profile resolution"),
+    )
+    argv = _argv(confirmation=REAL_AGENT_PRIMITIVE_SESSION_CONFIRM_TOKEN)
+    action_index = argv.index("--authorized-action")
+    action = skill_id.removeprefix("motion.step_tcp_").removeprefix("motion.set_tcp_")
+    argv[action_index:action_index + 2] = [option, action]
+    with pytest.raises(SystemExit) as rejected:
+        gateway_cli.main(argv)
+    assert rejected.value.code == 2
+    assert "Archived debug motion" in capsys.readouterr().err
 
 
 def test_cli_defaults_to_the_detailed_v4_camera_mount_urdf() -> None:
@@ -826,9 +848,9 @@ def test_cli_assembles_then_reports_ready_and_lower_hold(
             return False
 
     route = SimpleNamespace(
-        skill_id="motion.step_tcp_cardinal",
+        skill_id="motion.move_tcp_to_pose",
         skill_version="1",
-        route_id="real.rm65.agent_skill_tcp_cardinal_step",
+        route_id="real.rm65.agent_skill_tcp_pose_target",
         route_version="1",
     )
     entry = SimpleNamespace(route=route, semantic_content_hash="route-entry:test")
@@ -893,7 +915,8 @@ def test_cli_assembles_then_reports_ready_and_lower_hold(
         socket_path=socket_path,
         client_id="rpent.dexteleop",
         authorized_side="right",
-        authorized_action="forward",
+        authorized_motion_sides=("right",),
+        authorized_action="move_tcp_to_pose",
         lower=SimpleNamespace(
             profile=resolved,
             ports=SimpleNamespace(
@@ -935,7 +958,7 @@ def test_cli_assembles_then_reports_ready_and_lower_hold(
                     emergency_stop_latched=False,
                     emergency_stop_receipt=None,
                 ),
-                executors_by_skill_id={"motion.step_tcp_cardinal": SimpleNamespace()},
+                executors_by_skill_id={"motion.move_tcp_to_pose": SimpleNamespace()},
                 passive_read_executors_by_skill_ref={
                     ("perception.capture_rgb", "1"): camera_executor,
                     ("perception.plan_point_grasp", "1"): point_grasp_executor,
@@ -1031,7 +1054,7 @@ def test_cli_assembles_then_reports_ready_and_lower_hold(
     ]
     assert captured["lower"] is lower
     assert captured["authorized_side"] == "right"
-    assert captured["authorized_action"] == "forward"
+    assert captured["authorized_action"] == "move_tcp_to_pose"
     assert captured["ssh_read_only_client_id_by_uid"] == {1101: "rpent.remote.alice"}
     grasp_config = captured["grasp_trajectory_config"]
     assert grasp_config.trajectory_parameterization == "continuous_c2"

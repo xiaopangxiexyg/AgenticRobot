@@ -66,7 +66,7 @@ class Sam3ServiceModelSpec:
             {
                 "model_profile_id": self.model_profile_id,
                 "endpoint": self.endpoint,
-                "rpc": "segment:text_or_row_col:single_best_png_mask",
+                "rpc": "sam3.segment:text_or_row_col:single_best_png_mask",
                 "checkpoint_identity": "external_service_not_attested",
             },
             domain="dexteleop.perception.sam3_service_binding.v1",
@@ -172,7 +172,7 @@ class Sam3ServiceLocalizer:
             stream = io.BytesIO()
             image.convert("RGB").save(stream, format="PNG")
             result = self._call(
-                "segment",
+                "sam3.segment",
                 {
                     "image_base64": base64.b64encode(stream.getvalue()).decode("ascii"),
                     "min_score": self.min_score,

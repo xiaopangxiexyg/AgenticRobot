@@ -2,6 +2,11 @@
 
 from __future__ import annotations
 
+from deployments.dmtac_graspgenx_alignment_ids import (
+    DMTAC_M_GRASPGENX_ALIGNMENT_PROFILE_ID,
+    DMTAC_M_GRASPGENX_ALIGNMENT_PROFILE_IDS,
+)
+
 import argparse
 import json
 import os
@@ -84,6 +89,7 @@ from .motion_observed_scene import SafeMotionObservationConfig
 from .session_authorization import (
     REAL_AGENT_PRIMITIVE_ACTIONS,
     REAL_AGENT_PRIMITIVE_SESSION_CONFIRM_TOKEN,
+    validate_real_agent_primitive_action,
 )
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -101,6 +107,13 @@ DEFAULT_RM65_CAMERA_REGISTRY_V4 = (
 )
 
 
+def _retained_action(value: str) -> str:
+    try:
+        return validate_real_agent_primitive_action(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m agent_gateway real-rm65",
@@ -110,6 +123,9 @@ def build_parser() -> argparse.ArgumentParser:
             "trusted profile resolves and the exact confirmation is present."
         ),
     )
+    parser.add_argument("--graspgenx-alignment-profile",
+        choices=DMTAC_M_GRASPGENX_ALIGNMENT_PROFILE_IDS, default=DMTAC_M_GRASPGENX_ALIGNMENT_PROFILE_ID,
+        help="Default v5 nominal alignment; select v4 explicitly for legacy geometry.")
     parser.add_argument(
         "--socket-path",
         type=Path,
@@ -178,8 +194,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="maximum frozen scene age at activation (default: 30s); no automatic degraded fallback")
     parser.add_argument("--safe-motion-debug-dir", type=Path,
         help="existing private directory for exact RGB-D, filtered points and safe-move rejection evidence; opt-in, no extra captures")
-    parser.add_argument("--enable-spatial-goals", action="store_true",
-        help="expose read-only endpoint relation goals; no observation or motion authority")
+    parser.add_argument("--enable-spatial-goals", action=argparse.BooleanOptionalAction,
+        default=True, help="publish read-only endpoint relation goals by default; explicit opt-out available; no motion authority")
+    parser.add_argument("--enable-tcp-pose-comparison", action=argparse.BooleanOptionalAction,
+        default=True, help="publish read_tcp_pose v2 against retained safe targets by default; explicit opt-out available; no motion or success verdict")
     parser.add_argument("--enable-grasp-observation", action="store_true",
         help="Use frozen stationary RGB-D target selection and optional associated-view fusion (GraspGenX only).")
     parser.add_argument("--enable-back-projection", action="store_true",
@@ -338,13 +356,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--rm65-udp-port", type=int, default=8090,
         help="exclusive UDP feedback receive port when feedback-source=udp")
     parser.add_argument("--authorized-side", choices=("left", "right"), required=True)
+    parser.add_argument("--authorized-motion-sides", nargs="+", choices=("left", "right"),
+        help="opt-in sides for move_tcp_to_pose[_safe], one arm per request; includes --authorized-side; grasp and fixed primitives retain the primary side")
     parser.add_argument(
         "--authorized-action",
+        type=_retained_action,
         choices=REAL_AGENT_PRIMITIVE_ACTIONS,
         help="one reviewed primitive action allowed for this process session",
     )
     parser.add_argument(
         "--authorized-actions",
+        type=_retained_action,
         choices=REAL_AGENT_PRIMITIVE_ACTIONS,
         nargs="+",
         help=(
@@ -579,6 +601,7 @@ def _ready_payload(
         "execution_manifest_hash": manifest.execution_manifest_hash,
         "deployment_profile_hash": composition.lower.profile.semantic_content_hash,
         "authorized_side": composition.authorized_side,
+        "authorized_motion_sides": list(composition.authorized_motion_sides),
         "authorized_action": composition.authorized_action,
         "authorized_actions": list(authorized_actions),
         "authorization_scope": (
@@ -842,6 +865,11 @@ def _emit_lifecycle_event(payload: dict[str, Any]) -> None:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.graspgenx_alignment_profile != DMTAC_M_GRASPGENX_ALIGNMENT_PROFILE_ID:
+        if args.point_grasp_backend != "graspgenx":
+            parser.error("--graspgenx-alignment-profile requires the GraspGenX backend")
+        if not args.enable_point_grasp:
+            parser.error("--graspgenx-alignment-profile requires --enable-point-grasp")
     if args.confirm != REAL_AGENT_PRIMITIVE_SESSION_CONFIRM_TOKEN:
         parser.error(
             "--confirm must exactly equal " + REAL_AGENT_PRIMITIVE_SESSION_CONFIRM_TOKEN
@@ -1248,7 +1276,7 @@ def main(argv: list[str] | None = None) -> int:
                     model_spec=point_grasp_spec,
                     point_segmenter=object_localizer,
                     client=graspgenx_backend,
-                    solid_geometry=reviewed_graspgenx_dmtac_solid_geometry(),
+                    alignment_profile_id=getattr(args, "graspgenx_alignment_profile", DMTAC_M_GRASPGENX_ALIGNMENT_PROFILE_ID),
                     orientation_variants_local_axis_degrees=(
                         GRASPGENX_DMTAC_REACHABILITY_ORIENTATION_VARIANTS_LOCAL_AXIS_DEG
                     ),
@@ -1274,6 +1302,8 @@ def main(argv: list[str] | None = None) -> int:
         lower=lower,
         socket_path=socket_path,
         authorized_side=args.authorized_side,
+        authorized_motion_sides=(None if args.authorized_motion_sides is None
+                                 else tuple(args.authorized_motion_sides)),
         authorized_action=args.authorized_action,
         authorized_actions=(
             None if args.authorized_actions is None else tuple(args.authorized_actions)
@@ -1305,6 +1335,7 @@ def main(argv: list[str] | None = None) -> int:
         point_grasp_planner=point_grasp_planner,
         enable_grasp_observation=args.enable_grasp_observation,
         enable_spatial_goals=args.enable_spatial_goals,
+        enable_tcp_pose_comparison=args.enable_tcp_pose_comparison,
         enable_back_projection=args.enable_back_projection,
         enable_point_grasp_finger_exchange=args.enable_point_grasp_finger_exchange,
         debug_render_object_coordinates=args.debug_render_object_coordinates,

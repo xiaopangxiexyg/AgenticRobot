@@ -37,16 +37,32 @@ from agent_gateway.runtime.passive_read_executor import (
     PassiveReadSkillExecutor,
 )
 from agent_gateway.runtime.payload_validation import AgentSkillPayloadValidatorSet
-from agent_gateway.skills.perception.definition import segment_skill_definition_v1
+from agent_gateway.skills.perception.definition import (
+    segment_skill_definition_v1,
+    segment_skill_definition_v2,
+    segment_skill_definition_v3,
+)
 from agent_gateway.skills.perception.schemas import validate_no_task_evaluation_v1
 from agent_gateway.skills.perception.segmentation_schemas import (
     segment_schema_entry_v1,
+    segment_schema_entry_v2,
+    segment_schema_entry_v3,
     validate_segment_parameters_v1,
+    validate_segment_parameters_v2,
+    validate_segment_parameters_v3,
     validate_segment_result_for_parameters_v1,
+    validate_segment_result_for_parameters_v2,
+    validate_segment_result_for_parameters_v3,
     validate_segment_result_v1,
+    validate_segment_result_v2,
+    validate_segment_result_v3,
 )
 from dataset_contracts.canonical_encoding import canonical_content_hash
 from dataset_contracts.perception_artifacts import (
+    RGB_FRAME_COMPRESSION_V1,
+    RGB_FRAME_ENCODING_V1,
+    RGB_FRAME_MEDIA_TYPE_V1,
+    RGB_FRAME_SCHEMA_ID_V1,
     SEGMENTATION_MASK_COMPRESSION_V1,
     SEGMENTATION_MASK_ENCODING_V1,
     SEGMENTATION_MASK_MEDIA_TYPE_V1,
@@ -61,6 +77,24 @@ SEGMENT_MASK_OUTPUT_SLOT_ID_V1 = "segmentation_mask"
 SEGMENT_OVERLAY_OUTPUT_SLOT_ID_V1 = "segmentation_overlay"
 SEGMENT_MAX_MASK_BYTES_V1 = 16 * 1024 * 1024
 SEGMENT_MAX_OVERLAY_BYTES_V1 = 16 * 1024 * 1024
+SEGMENT_RGB_INPUT_SLOT_ID_V3 = "input_image"
+SEGMENT_MAX_RGB_BYTES_V3 = 16 * 1024 * 1024
+
+_SEGMENT_DEFINITIONS = {
+    "1": segment_skill_definition_v1,
+    "2": segment_skill_definition_v2,
+    "3": segment_skill_definition_v3,
+}
+_SEGMENT_SCHEMAS = {
+    "1": segment_schema_entry_v1,
+    "2": segment_schema_entry_v2,
+    "3": segment_schema_entry_v3,
+}
+_SEGMENT_RESULT_VALIDATORS = {
+    "1": validate_segment_result_v1,
+    "2": validate_segment_result_v2,
+    "3": validate_segment_result_v3,
+}
 
 
 def _required(value: object, *, field_name: str) -> str:
@@ -127,8 +161,11 @@ class SegmentationProfile:
     max_mask_bytes: int = SEGMENT_MAX_MASK_BYTES_V1
     max_overlay_bytes: int = SEGMENT_MAX_OVERLAY_BYTES_V1
     profile_id: str = "sam2-grounding-dino-live-segmentation-v1"
+    rgb_capture_route_hash: str | None = None
 
     def __post_init__(self) -> None:
+        if self.rgb_capture_route_hash is not None:
+            _hash(self.rgb_capture_route_hash, field_name="rgb_capture_route_hash")
         for field_name in (
             "target_kind",
             "current_mode",
@@ -187,6 +224,8 @@ class SegmentationProfile:
                 "max_overlay_bytes": self.max_overlay_bytes,
                 "prompt_policy": "exactly_one_of_text_or_pixel",
                 "downstream_control_effects": "forbidden",
+                **({"rgb_capture_route_hash": self.rgb_capture_route_hash}
+                   if self.rgb_capture_route_hash is not None else {}),
             },
             domain="dexteleop.agent_skill.live_segmentation_profile.v1",
         )
@@ -260,7 +299,12 @@ class SegmentationRegistration:
                 "Segmentation registration must contain exactly one Route."
             )
         route = self.skill.routes[0]
-        definition = segment_skill_definition_v1()
+        version = self.skill.definition.skill_version
+        if version not in _SEGMENT_DEFINITIONS:
+            raise ValueError("Segmentation registration uses another Skill contract.")
+        if self.profile.rgb_capture_route_hash is not None and version != "3":
+            raise ValueError("An exact RGB producer binding requires segmentation v3.")
+        definition = _SEGMENT_DEFINITIONS[version]()
         if self.skill.definition != definition or (
             route.skill_id,
             route.skill_version,
@@ -305,7 +349,8 @@ class SegmentationRegistration:
         self.payload_validator.validate_route(route)
         expected_availability_hash = canonical_content_hash(
             {
-                "status": "configured_requires_live_rgb_model_and_artifact_store",
+                "status": ("configured_requires_authenticated_rgb_model_and_artifact_store" if version == "3"
+                    else "configured_requires_live_rgb_model_and_artifact_store"),
                 "route_hash": route.semantic_content_hash,
                 "deployment_binding_hash": self.binding.semantic_content_hash,
                 "profile_hash": self.profile.semantic_content_hash,
@@ -329,7 +374,13 @@ def build_segmentation_registration(
     target_binding_id: str,
     station_manifest_hash: str,
     execution_manifest_hash: str,
+    skill_version: str = "1",
+    rgb_capture_route_hash: str | None = None,
 ) -> SegmentationRegistration:
+    if skill_version not in _SEGMENT_DEFINITIONS:
+        raise ValueError("Segmentation skill_version must be 1, 2 or 3.")
+    if rgb_capture_route_hash is not None and skill_version != "3":
+        raise ValueError("An exact RGB producer binding requires segmentation v3.")
     profile = SegmentationProfile(
         target_kind=target_kind,
         current_mode=current_mode,
@@ -337,9 +388,15 @@ def build_segmentation_registration(
         model_profile_id=model_profile_id,
         model_profile_hash=model_profile_hash,
         inference_implementation_hash=inference_implementation_hash,
+        rgb_capture_route_hash=rgb_capture_route_hash,
+        **({"profile_id": (("sam2-grounding-dino-rgb-artifact-indexed-contour-segmentation-v3"
+            + (".paired-rgbd" if rgb_capture_route_hash is not None else "")) if skill_version == "3"
+            else f"sam2-grounding-dino-same-cut-segmentation-v{skill_version}")}
+            if skill_version != "1" else {}),
     )
-    definition = segment_skill_definition_v1()
-    schema = segment_schema_entry_v1(
+    definition = _SEGMENT_DEFINITIONS[skill_version]()
+    schema_builder = _SEGMENT_SCHEMAS[skill_version]
+    schema = schema_builder(
         skill_definition_hash=definition.semantic_content_hash,
         parameter_profile_id=profile.profile_id,
         parameter_profile_hash=profile.semantic_content_hash,
@@ -352,13 +409,18 @@ def build_segmentation_registration(
         parameter_schema_hash=schema.parameter_schema_hash,
         execution_result_schema_hash=schema.execution_result_schema_hash,
         task_evaluation_schema_hash=schema.task_evaluation_schema_hash,
-        input_artifact_slots=(),
+        input_artifact_slots=(SkillArtifactSlotSpec(
+            slot_id=SEGMENT_RGB_INPUT_SLOT_ID_V3, direction="input", min_count=1, max_count=1,
+            allowed_media_types=(RGB_FRAME_MEDIA_TYPE_V1,), allowed_schema_ids=(RGB_FRAME_SCHEMA_ID_V1,),
+            allowed_encodings=(RGB_FRAME_ENCODING_V1,), allowed_compressions=(RGB_FRAME_COMPRESSION_V1,),
+            max_artifact_bytes=SEGMENT_MAX_RGB_BYTES_V3, max_total_bytes=SEGMENT_MAX_RGB_BYTES_V3,
+        ),) if skill_version == "3" else (),
         output_artifact_slots=(
             SkillArtifactSlotSpec(
                 slot_id=SEGMENT_MASK_OUTPUT_SLOT_ID_V1,
                 direction="output",
-                min_count=1,
-                max_count=1,
+                min_count=1 if skill_version == "1" else 0,
+                max_count=1 if skill_version == "1" else 3,
                 allowed_media_types=(SEGMENTATION_MASK_MEDIA_TYPE_V1,),
                 allowed_schema_ids=(SEGMENTATION_MASK_SCHEMA_ID_V1,),
                 allowed_encodings=(SEGMENTATION_MASK_ENCODING_V1,),
@@ -385,7 +447,7 @@ def build_segmentation_registration(
         skill_version=definition.skill_version,
         skill_definition_hash=definition.semantic_content_hash,
         route_id=f"{target_kind}.local_model.perception.segment",
-        route_version="1",
+        route_version=skill_version,
         parameter_schema_hash=schema.parameter_schema_hash,
         execution_result_schema_hash=schema.execution_result_schema_hash,
         task_evaluation_schema_hash=schema.task_evaluation_schema_hash,
@@ -410,7 +472,8 @@ def build_segmentation_registration(
         routes=(route,),
     )
     binding = SegmentationDeploymentBinding(
-        deployment_binding_id=f"{target_kind}.local_model.segmentation:{runtime_session_id}",
+        deployment_binding_id=(f"{target_kind}.local_model.segmentation:{runtime_session_id}"
+            if skill_version == "1" else f"{target_kind}.local_model.segmentation.v{skill_version}:{runtime_session_id}"),
         route_hash=route.semantic_content_hash,
         runtime_session_id=runtime_session_id,
         control_domain_id=control_domain_id,
@@ -419,8 +482,11 @@ def build_segmentation_registration(
         execution_manifest_hash=execution_manifest_hash,
         profile_hash=profile.semantic_content_hash,
         target_kind=target_kind,
-        executor_id=f"{target_kind}-passive-live-segmentation.v1",
+        executor_id=f"{target_kind}-passive-live-segmentation.v{skill_version}",
     )
+    parameter_validator = {"1": validate_segment_parameters_v1, "2": validate_segment_parameters_v2,
+        "3": validate_segment_parameters_v3}[skill_version]
+    result_validator = _SEGMENT_RESULT_VALIDATORS[skill_version]
     validator = AgentSkillPayloadValidatorSet(
         validator_id=f"dexteleop.agent_skill.validator.{target_kind}_segmentation:{runtime_session_id}",
         skill_id=definition.skill_id,
@@ -430,21 +496,23 @@ def build_segmentation_registration(
         parameter_schema_hash=route.parameter_schema_hash,
         execution_result_schema_hash=route.execution_result_schema_hash,
         task_evaluation_schema_hash=route.task_evaluation_schema_hash,
-        validate_parameters=lambda payload: validate_segment_parameters_v1(
+        validate_parameters=lambda payload: parameter_validator(
             payload, allowed_roles=profile.roles
         ),
-        validate_execution_result=lambda payload: validate_segment_result_v1(
+        validate_execution_result=lambda payload: result_validator(
             payload,
             source_id_by_role=profile.source_id_by_role,
             model_profile_id=profile.model_profile_id,
             model_profile_hash=profile.model_profile_hash,
         ),
-        validate_execution_result_for_parameters=validate_segment_result_for_parameters_v1,
+        validate_execution_result_for_parameters={"1": validate_segment_result_for_parameters_v1,
+            "2": validate_segment_result_for_parameters_v2, "3": validate_segment_result_for_parameters_v3}[skill_version],
         validate_task_evaluation=validate_no_task_evaluation_v1,
     )
     availability_hash = canonical_content_hash(
         {
-            "status": "configured_requires_live_rgb_model_and_artifact_store",
+            "status": ("configured_requires_authenticated_rgb_model_and_artifact_store" if skill_version == "3"
+                else "configured_requires_live_rgb_model_and_artifact_store"),
             "route_hash": route.semantic_content_hash,
             "deployment_binding_hash": binding.semantic_content_hash,
             "profile_hash": profile.semantic_content_hash,
@@ -587,6 +655,8 @@ class LiveSegmentationProvider:
     ) -> None:
         if not isinstance(registration, SegmentationRegistration):
             raise TypeError("registration must be typed.")
+        if registration.skill.definition.skill_version != "1":
+            raise ValueError("The shared single-target provider requires its v1 registration.")
         for method_name in ("segment", "encode_segment_artifacts"):
             if not callable(getattr(localizer, method_name, None)):
                 raise TypeError(f"localizer must expose {method_name}().")
@@ -637,6 +707,16 @@ class LiveSegmentationProvider:
     ) -> PreparedSegmentation:
         """Run the registered localizer on one caller-owned immutable RGB cut."""
 
+        result = self.try_segment_capture(capture=capture, parameters=parameters)
+        if result is None:
+            raise RuntimeError("segmentation_no_mask_above_threshold")
+        return result
+
+    def try_segment_capture(
+        self, *, capture: LiveRgbSegmentationCapture, parameters: Mapping[str, Any],
+    ) -> PreparedSegmentation | None:
+        """Run the same validation/encoder while explicitly retaining a no-mask outcome."""
+
         if not isinstance(capture, LiveRgbSegmentationCapture):
             raise TypeError("capture must be a LiveRgbSegmentationCapture.")
         self.registration.payload_validator.validate_parameters(parameters)
@@ -659,7 +739,7 @@ class LiveSegmentationProvider:
             min_score=float(parameters["min_score"]),
         )
         if segment is None:
-            raise RuntimeError("segmentation_no_mask_above_threshold")
+            return None
         encoded = self.localizer.encode_segment_artifacts(capture.image, segment)
         raw_bounds = getattr(encoded, "box_xyxy", None)
         if (

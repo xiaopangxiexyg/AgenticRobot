@@ -41,7 +41,6 @@ from agent_gateway.profiles.mujoco.motion_gateway_session import (
     assemble_mujoco_agent_tcp_pose_gateway_session,
 )
 from agent_gateway.profiles.mujoco.motion_primitive_profiles import (
-    MUJOCO_AGENT_TCP_FIXED_CARDINAL_STEP_ROUTE_ID_BY_SKILL_ID_V1,
     MUJOCO_AGENT_TCP_FIXED_ORIENTATION_ROUTE_ID_BY_SKILL_ID_V1,
     MujocoAgentTcpCardinalStepProfile,
     MujocoAgentTcpFixedOrientationProfile,
@@ -72,9 +71,7 @@ from agent_gateway.protocol.skill_catalog import (
 )
 from agent_gateway.runtime.artifact_store import RecoverableAgentArtifactStore
 from agent_gateway.skills.motion.definition import (
-    FIXED_CARDINAL_TCP_STEP_DIRECTION_BY_SKILL_ID_V1,
-    FIXED_CARDINAL_TCP_STEP_SKILL_IDS_V1,
-    FIXED_LEVEL_TCP_ORIENTATION_SKILL_IDS_V1,
+    ARCHIVED_DEBUG_MOTION_SKILL_IDS_V1,
 )
 from agent_gateway.skills.perception.definition import (
     CAPTURE_DEPTH_SKILL_ID_V1,
@@ -138,9 +135,13 @@ def test_segmentation_model_startup_failure_closes_partial_resources() -> None:
     localizer = _FaultyLocalizer()
     session = SimpleNamespace(
         _close_lock=threading.Lock(),
+        _close_started=False,
         _close_outcome=None,
+        service=SimpleNamespace(is_closed=False),
         segmentation_localizer=localizer,
         _segmentation_model_started=False,
+        fast_grasp_planner=None,
+        _fast_grasp_start_failed=False,
     )
 
     with pytest.raises(RuntimeError, match="model allocation failed"):
@@ -150,7 +151,7 @@ def test_segmentation_model_startup_failure_closes_partial_resources() -> None:
     assert session._segmentation_model_started is False
 
 
-def test_unsettled_passive_read_defers_owned_dependency_cleanup() -> None:
+def _assert_unsettled_passive_read_defers_owned_dependency_cleanup(state_reader) -> None:
     wait_timeouts = []
 
     class _Executor:
@@ -175,23 +176,36 @@ def test_unsettled_passive_read_defers_owned_dependency_cleanup() -> None:
             self.close_calls += 1
 
     executor = _Executor()
+    placement_executor = _Executor()
+    placement_executor.settled = True
     localizer = _Localizer()
     artifact_store = _Store()
     lower_close_calls = []
-    outcome = object()
+    from agent_gateway.runtime.service import AgentGatewayOperationOutcome
+
+    outcome = AgentGatewayOperationOutcome(True, "fixture_close_accepted")
     session = SimpleNamespace(
         _close_lock=threading.Lock(),
         history_recorder=None,
         _close_outcome=None,
         service=SimpleNamespace(close=lambda **_kwargs: outcome),
         observation_producer=SimpleNamespace(current_station_revision=0),
-        state_executor=executor,
+        state_executor=None,
+        tcp_pose_comparison_executor=None,
+        object_state_executor=None,
         depth_executor=None,
-        rgb_executor=None,
+        rgb_executor=None, segmentation_batch_executor=None, segmentation_geometry_executor=None,
         history_executor=None,
-        spatial_goal_executor=None,
+        spatial_goal_executor=None, rgbd_capture_executor=None,
+        object_goal_query_executor=None, surface_anchor_executors=(), localization_executor=None,
+        tcp_continuation_query_executor=None, candidate_query_executors=(), safe_tcp_pose_v2_executor=None,
+        contract_bundle=SimpleNamespace(surface_anchor_registrations=(), candidate_query_registrations=()),
         segmentation_executor=None,
-        placement_executor=executor,
+        placement_executor=placement_executor,
+        grasp_observation_executor=None,
+        fast_grasp_executor=None,
+        fast_grasp_provider=None,
+        fast_grasp_planner=None,
         _segmentation_model_started=True,
         segmentation_localizer=localizer,
         _finish_lower_close=lambda value: lower_close_calls.append(value),
@@ -202,8 +216,9 @@ def test_unsettled_passive_read_defers_owned_dependency_cleanup() -> None:
         artifact_store=artifact_store,
         _artifact_store_closed=False,
     )
+    setattr(session, state_reader, executor)
 
-    with pytest.raises(RuntimeError, match="state_executor"):
+    with pytest.raises(RuntimeError, match=state_reader):
         MujocoAgentTcpPoseGatewaySession.close(session)
     assert 130.0 in wait_timeouts
     assert localizer.close_calls == 0
@@ -215,6 +230,18 @@ def test_unsettled_passive_read_defers_owned_dependency_cleanup() -> None:
     assert localizer.close_calls == 1
     assert lower_close_calls == [outcome]
     assert artifact_store.close_calls == 1
+
+
+def test_unsettled_passive_read_defers_owned_dependency_cleanup() -> None:
+    _assert_unsettled_passive_read_defers_owned_dependency_cleanup("state_executor")
+
+
+def test_unsettled_tcp_pose_comparison_defers_owned_dependency_cleanup() -> None:
+    _assert_unsettled_passive_read_defers_owned_dependency_cleanup("tcp_pose_comparison_executor")
+
+
+def test_unsettled_object_state_defers_owned_dependency_cleanup() -> None:
+    _assert_unsettled_passive_read_defers_owned_dependency_cleanup("object_state_executor")
 
 
 def _profile_and_schema(component_id: str = "right_arm"):
@@ -558,9 +585,7 @@ def test_tcp_observation_transforms_raw_arm_base_pose_before_publication(
     )
 
 
-def test_mujoco_fixed_orientation_routes_use_a_separate_full_rotation_envelope() -> (
-    None
-):
+def test_mujoco_envelopes_no_longer_publish_archived_debug_routes() -> None:
     runtime = _build_standard_tcp_pose_envelope_runtime(
         prepared=SimpleNamespace(
             target_frame_profile=SimpleNamespace(
@@ -579,23 +604,15 @@ def test_mujoco_fixed_orientation_routes_use_a_separate_full_rotation_envelope()
     )
     entry_by_id = {entry.envelope_id: entry for entry in runtime.catalog_entries}
     standard = entry_by_id[MUJOCO_AGENT_TCP_POSE_STANDARD_ENVELOPE_ID_V1]
-    orientation = entry_by_id[MUJOCO_AGENT_TCP_FIXED_ORIENTATION_ENVELOPE_ID_V1]
-
+    assert set(entry_by_id) == {MUJOCO_AGENT_TCP_POSE_STANDARD_ENVELOPE_ID_V1}
     assert standard.profile.side_config_by_side["right"].max_rotation_rad == (
         pytest.approx(0.2617993877991494)
     )
-    assert orientation.profile.side_config_by_side["right"].max_rotation_rad == (
-        pytest.approx(3.141592653589793)
-    )
-    assert orientation.profile.side_config_by_side["right"].relative_min_xyz_m == (
-        0.0,
-        0.0,
-        0.0,
-    )
-    assert set(orientation.allowed_route_ids) == set(
+    assert standard.allowed_route_ids == ("sim.mujoco.rm65.agent_skill_tcp_pose",)
+    assert MUJOCO_AGENT_TCP_FIXED_ORIENTATION_ENVELOPE_ID_V1 not in entry_by_id
+    assert set(standard.allowed_route_ids).isdisjoint(
         MUJOCO_AGENT_TCP_FIXED_ORIENTATION_ROUTE_ID_BY_SKILL_ID_V1.values()
     )
-    assert set(standard.allowed_route_ids).isdisjoint(orientation.allowed_route_ids)
 
 
 def _contracts(motion_profile):
@@ -949,7 +966,7 @@ def test_tcp_pose_lifecycle_dispatches_through_lower_and_finishes_under_hold() -
 
 @pytest.mark.parametrize(
     "transient_kind",
-    ("publication_miss", "target_support_expired"),
+    ("publication_miss", "target_support_expired", "adaptation_support_expired"),
 )
 def test_tcp_pose_lifecycle_retries_same_reference_after_bounded_no_action(
     transient_kind: str,
@@ -977,7 +994,7 @@ def test_tcp_pose_lifecycle_retries_same_reference_after_bounded_no_action(
         attempts += 1
         if attempts == 1:
             calls["submit"].append(kwargs)
-            if transient_kind == "target_support_expired":
+            if transient_kind in {"target_support_expired", "adaptation_support_expired"}:
                 return MujocoAgentSkillMotionStep(
                     proposal_admission=SimpleNamespace(
                         accepted=True,
@@ -989,6 +1006,8 @@ def test_tcp_pose_lifecycle_retries_same_reference_after_bounded_no_action(
                     ),
                     authoritative_step=SimpleNamespace(
                         status=(
+                            "target_support_expired_before_adaptation_keep_existing"
+                            if transient_kind == "adaptation_support_expired" else
                             "target_support_expired_before_submission_keep_existing"
                         ),
                         decision=SimpleNamespace(decision_id="decision:fixture"),
@@ -999,7 +1018,7 @@ def test_tcp_pose_lifecycle_retries_same_reference_after_bounded_no_action(
                                 "arms": SimpleNamespace(directive="publish_selected")
                             },
                         ),
-                        action_adaptation=SimpleNamespace(
+                        action_adaptation=None if transient_kind == "adaptation_support_expired" else SimpleNamespace(
                             receipt=SimpleNamespace(accepted=True)
                         ),
                         target_execution_request=None,
@@ -1080,6 +1099,24 @@ def test_tcp_pose_lifecycle_retries_same_reference_after_bounded_no_action(
     assert second == pytest.approx(first)
     assert ":target-attempt:0:reference:0" in calls["submit"][0]["source_event_id"]
     assert ":target-attempt:1:reference:0" in calls["submit"][1]["source_event_id"]
+
+
+@pytest.mark.parametrize("field", (
+    "action_adaptation", "target_execution_request", "cancellation",
+    "cancellation_receipt", "safety_result", "command", "dispatch_context",
+    "dispatch_validation", "dispatch_receipts",
+))
+def test_adaptation_expiry_retry_rejects_execution_or_hold_evidence(field) -> None:
+    step = SimpleNamespace(
+        status="target_support_expired_before_adaptation_keep_existing",
+        decision=SimpleNamespace(decision_id="decision:expired"),
+        publication_attempt=SimpleNamespace(accepted=True),
+        directive=SimpleNamespace(global_status="normal", directive_by_selection_group={
+            "arms": SimpleNamespace(directive="publish_selected")}),
+    )
+    assert motion_skill._authoritative_step_keeps_existing_for_retry(step)
+    setattr(step, field, SimpleNamespace())
+    assert not motion_skill._authoritative_step_keeps_existing_for_retry(step)
 
 
 def test_tcp_pose_lifecycle_fails_closed_on_unclassified_keep_existing() -> None:
@@ -1468,6 +1505,7 @@ def _build_no_model_contract_bundle_fixture(
     *,
     enable_artifact_perception: bool = False,
     segmentation_identity: tuple[str, str, str] | None = None,
+    enable_tcp_pose_comparison: bool = False,
 ):
     _profile, action_schema = _profile_and_schema()
     observation_plan = SimpleNamespace(
@@ -1482,6 +1520,7 @@ def _build_no_model_contract_bundle_fixture(
         producer_id="control-station-agent-skill-fixture",
         producer_epoch=1,
     )
+    resource_close_calls = []
     runtime = SimpleNamespace(
         config=SimpleNamespace(
             runtime_session_id="runtime:agent-motion-bundle-fixture",
@@ -1531,6 +1570,8 @@ def _build_no_model_contract_bundle_fixture(
             ),
         ),
         clock=lambda: 10.0,
+        close=lambda: resource_close_calls.append("runtime.close"),
+        resource_close_calls=resource_close_calls,
     )
     frame_graph = CoordinateFrameGraph(
         graph_id="frame-graph:fixture",
@@ -1634,6 +1675,7 @@ def _build_no_model_contract_bundle_fixture(
     bundle = build_mujoco_agent_tcp_pose_contract_bundle(
         application=application,
         enable_artifact_perception=enable_artifact_perception,
+        enable_tcp_pose_comparison=enable_tcp_pose_comparison,
         segmentation_model_profile_id=(
             None if segmentation_identity is None else segmentation_identity[0]
         ),
@@ -1647,6 +1689,31 @@ def _build_no_model_contract_bundle_fixture(
     return application, runtime, direct, bundle, captured_manifest_args
 
 
+def test_tcp_pose_comparison_is_opt_in_and_retains_the_original_state_contract(monkeypatch):
+    baseline = _build_no_model_contract_bundle_fixture(monkeypatch)[3]
+    candidate = _build_no_model_contract_bundle_fixture(monkeypatch, enable_tcp_pose_comparison=True)[3]
+    assert baseline.tcp_pose_comparison_registration is None
+    with pytest.raises(KeyError):
+        baseline.route_manifest.route("state.read_tcp_pose", "2")
+    assert candidate.schema_catalog.entry("state.read_tcp_pose", "1") == baseline.schema_catalog.entry("state.read_tcp_pose", "1")
+    assert candidate.route_manifest.route("state.read_tcp_pose", "1") == baseline.route_manifest.route("state.read_tcp_pose", "1")
+    assert candidate.definition_catalog.definition("state.read_tcp_pose", "1") == baseline.definition_catalog.definition("state.read_tcp_pose", "1")
+    registration = candidate.tcp_pose_comparison_registration
+    assert candidate.route_manifest.route("state.read_tcp_pose", "2") == registration.entry
+    assert registration.entry.route.control_effect_class == "read_only"
+    assert not registration.entry.route.may_move_robot
+    assert not registration.entry.route.requires_task_evaluation
+    assert candidate.payload_validators.validator_for(registration.entry.route) == registration.payload_validator
+    candidate.io_catalog.contract("state.read_tcp_pose", "2")
+    assert len(candidate.route_manifest.skill_routes) == len(baseline.route_manifest.skill_routes) + 1
+
+
+@pytest.mark.parametrize("enabled", [None, 0, 1, "true"])
+def test_tcp_pose_comparison_enablement_requires_a_boolean(monkeypatch, enabled):
+    with pytest.raises(TypeError, match="enable_tcp_pose_comparison"):
+        _build_no_model_contract_bundle_fixture(monkeypatch, enable_tcp_pose_comparison=enabled)
+
+
 def test_no_model_contract_bundle_exposes_exact_motion_and_state_routes(
     monkeypatch,
 ) -> None:
@@ -1655,10 +1722,6 @@ def test_no_model_contract_bundle_exposes_exact_motion_and_state_routes(
     )
     motion_entry = bundle.route_manifest.route(
         "motion.move_tcp_to_pose",
-        "1",
-    )
-    cardinal_step_entry = bundle.route_manifest.route(
-        "motion.step_tcp_cardinal",
         "1",
     )
     state_entry = bundle.route_manifest.route("state.read_tcp_pose", "1")
@@ -1677,29 +1740,11 @@ def test_no_model_contract_bundle_exposes_exact_motion_and_state_routes(
         "tool_config_hash": "tool-config:fixture",
         "calibration_hash": "calibration:agent-motion-bundle-fixture",
     }
-    cardinal_parameters = {
-        "component_id": "right_arm",
-        "direction": "up",
-        "reference_frame_id": bundle.cardinal_step_profile.reference_frame_id,
-        "reference_frame_spec_hash": (
-            bundle.cardinal_step_profile.reference_frame_spec_hash
-        ),
-        "controlled_frame_id": "tool_tcp",
-        "frame_graph_hash": bundle.cardinal_step_profile.frame_graph_hash,
-        "tool_config_hash": bundle.cardinal_step_profile.tool_config_hash,
-        "calibration_hash": bundle.cardinal_step_profile.calibration_hash,
-        "primitive_catalog_hash": (bundle.cardinal_step_profile.primitive_catalog_hash),
-    }
-
     assert bundle.route_manifest.current_mode == "sim_active"
     assert motion_entry.route.control_effect_class == "motion"
     assert motion_entry.route.privilege_tier == "t1_sim_or_no_motion"
     assert motion_entry.route.route_id == ("sim.mujoco.rm65.agent_skill_tcp_pose")
-    assert cardinal_step_entry.route.control_effect_class == "motion"
-    assert cardinal_step_entry.route.route_id == (
-        "sim.mujoco.rm65.agent_skill_tcp_cardinal_step"
-    )
-    assert bundle.cardinal_step_profile.reference_frame_id == ("mujoco_sim_hil/station")
+
     assert bundle.motion_profile.reference_frame_id == "mujoco_sim_hil/station"
     assert bundle.motion_profile.execution_reference_frame_id == "right_arm_base"
     assert bundle.state_deployment_binding.reference_frame_id == (
@@ -1719,25 +1764,24 @@ def test_no_model_contract_bundle_exposes_exact_motion_and_state_routes(
             route=state_entry.route,
             payload={**state_parameters, "reference_frame_id": "right_arm_base"},
         )
-    assert bundle.cardinal_step_profile.execution_reference_frame_id == (
-        "right_arm_base"
-    )
     assert tuple(
-        item.object_id
-        for item in bundle.cardinal_step_deployment_binding.safety_envelope_refs
+        item.object_id for item in bundle.deployment_binding.safety_envelope_refs
     ) == (MUJOCO_AGENT_TCP_POSE_STANDARD_ENVELOPE_ID_V1,)
     published_skill_ids = {
         entry.route.skill_id for entry in bundle.route_manifest.skill_routes
     }
-    assert set(FIXED_LEVEL_TCP_ORIENTATION_SKILL_IDS_V1) <= published_skill_ids
-    assert set(FIXED_CARDINAL_TCP_STEP_SKILL_IDS_V1) <= published_skill_ids
-    assert (
-        "distance_m"
-        not in bundle.schema_catalog.entry(
-            "motion.step_tcp_cardinal",
-            "1",
-        ).parameter_schema["properties"]
-    )
+    assert published_skill_ids == {"motion.move_tcp_to_pose", "state.read_tcp_pose"}
+    assert set(ARCHIVED_DEBUG_MOTION_SKILL_IDS_V1).isdisjoint(published_skill_ids)
+    for skill_id in ARCHIVED_DEBUG_MOTION_SKILL_IDS_V1:
+        with pytest.raises(KeyError):
+            bundle.route_manifest.route(skill_id, "1")
+        with pytest.raises(KeyError):
+            bundle.definition_catalog.definition(skill_id, "1")
+        with pytest.raises(KeyError):
+            bundle.schema_catalog.entry(skill_id, "1")
+        with pytest.raises(KeyError):
+            bundle.io_catalog.contract(skill_id, "1")
+
     assert state_entry.route.control_effect_class == "read_only"
     assert "requested_duration_ms" not in schema_entry.parameter_schema["properties"]
     assert captured_manifest_args["motion_authority_sources"] == (
@@ -1748,96 +1792,6 @@ def test_no_model_contract_bundle_exposes_exact_motion_and_state_routes(
         route=motion_entry.route,
         payload=parameters,
     )
-    bundle.payload_validators.validate_parameters(
-        route=cardinal_step_entry.route,
-        payload=cardinal_parameters,
-    )
-    for fixed_contract in bundle.fixed_cardinal_step_contracts:
-        fixed_route = bundle.route_manifest.route(
-            fixed_contract.skill_id,
-            "1",
-        ).route
-        assert (
-            fixed_route.route_id
-            == (
-                MUJOCO_AGENT_TCP_FIXED_CARDINAL_STEP_ROUTE_ID_BY_SKILL_ID_V1[
-                    fixed_contract.skill_id
-                ]
-            )
-        )
-        assert (
-            fixed_contract.direction
-            == (
-                FIXED_CARDINAL_TCP_STEP_DIRECTION_BY_SKILL_ID_V1[
-                    fixed_contract.skill_id
-                ]
-            )
-        )
-        fixed_parameters = {
-            **cardinal_parameters,
-            "direction": fixed_contract.direction,
-        }
-        bundle.payload_validators.validate_parameters(
-            route=fixed_route,
-            payload=fixed_parameters,
-        )
-        with pytest.raises(ValueError, match="unsupported direction"):
-            bundle.payload_validators.validate_parameters(
-                route=fixed_route,
-                payload={**fixed_parameters, "direction": "diagonal"},
-            )
-    for orientation_contract in bundle.fixed_orientation_contracts:
-        orientation_profile = orientation_contract.profile
-        orientation_route = bundle.route_manifest.route(
-            orientation_profile.skill_id,
-            "1",
-        ).route
-        assert (
-            orientation_route.route_id
-            == (
-                MUJOCO_AGENT_TCP_FIXED_ORIENTATION_ROUTE_ID_BY_SKILL_ID_V1[
-                    orientation_profile.skill_id
-                ]
-            )
-        )
-        assert orientation_profile.reference_frame_id == "mujoco_sim_hil/station"
-        assert orientation_profile.execution_reference_frame_id == "right_arm_base"
-        assert tuple(
-            item.object_id
-            for item in orientation_contract.deployment_binding.safety_envelope_refs
-        ) == (MUJOCO_AGENT_TCP_FIXED_ORIENTATION_ENVELOPE_ID_V1,)
-        assert orientation_contract.motion_profile.max_translation_delta_m == (
-            pytest.approx(1e-6)
-        )
-        assert orientation_contract.motion_profile.max_rotation_delta_rad == (
-            pytest.approx(math.pi)
-        )
-        orientation_parameters = {
-            "component_id": orientation_profile.component_id,
-            "reference_frame_id": orientation_profile.reference_frame_id,
-            "reference_frame_spec_hash": (
-                orientation_profile.reference_frame_spec_hash
-            ),
-            "controlled_frame_id": "tool_tcp",
-            "frame_graph_hash": orientation_profile.frame_graph_hash,
-            "tool_config_hash": orientation_profile.tool_config_hash,
-            "calibration_hash": orientation_profile.calibration_hash,
-            "primitive_hash": (orientation_profile.primitive.semantic_content_hash),
-        }
-        bundle.payload_validators.validate_parameters(
-            route=orientation_route,
-            payload=orientation_parameters,
-        )
-        with pytest.raises(ValueError, match="exactly match"):
-            bundle.payload_validators.validate_parameters(
-                route=orientation_route,
-                payload={**orientation_parameters, "yaw_deg": 30.0},
-            )
-    with pytest.raises(ValueError, match="unsupported direction"):
-        bundle.payload_validators.validate_parameters(
-            route=cardinal_step_entry.route,
-            payload={**cardinal_parameters, "direction": "diagonal"},
-        )
     with pytest.raises(ValueError, match="exactly match"):
         bundle.payload_validators.validate_parameters(
             route=motion_entry.route,
@@ -1865,17 +1819,8 @@ def test_no_model_contract_bundle_exposes_exact_motion_and_state_routes(
         for item in session.service.executor_registry.bindings
     }
     assert route_to_port["motion.move_tcp_to_pose"] is session.motion_executor
-    assert route_to_port["motion.step_tcp_cardinal"] is (session.cardinal_step_executor)
-    assert set(FIXED_CARDINAL_TCP_STEP_SKILL_IDS_V1) <= set(route_to_port)
-    for skill_id in FIXED_CARDINAL_TCP_STEP_SKILL_IDS_V1:
-        assert (
-            route_to_port[skill_id] is session.fixed_cardinal_step_executors[skill_id]
-        )
-    assert set(FIXED_LEVEL_TCP_ORIENTATION_SKILL_IDS_V1) <= set(route_to_port)
-    for skill_id in FIXED_LEVEL_TCP_ORIENTATION_SKILL_IDS_V1:
-        assert route_to_port[skill_id] is session.fixed_orientation_executors[
-            skill_id
-        ]
+    assert set(ARCHIVED_DEBUG_MOTION_SKILL_IDS_V1).isdisjoint(route_to_port)
+    assert session._motion_executors() == (session.motion_executor,)
     assert route_to_port["state.read_tcp_pose"] is session.state_executor
     assert session.service.operation_store.max_retained_operations == 3
     assert session.service.operation_store.max_admissions_by_route_hash == {}
@@ -1893,9 +1838,9 @@ def test_no_model_contract_bundle_exposes_exact_motion_and_state_routes(
     assert {item["skill_id"] for item in simulation["read_skill_refs"]} == {
         "state.read_tcp_pose"
     }
-    assert "motion.step_tcp_forward" in {
+    assert {
         item["skill_id"] for item in simulation["drive_skill_refs"]
-    }
+    } == {"motion.move_tcp_to_pose"}
     configured = adapter.get_hardware_status_views()["resources"][0]
     assert configured["occupancy"] == "free"
     assert configured["health"] == "unavailable"
@@ -1921,6 +1866,8 @@ def test_no_model_contract_bundle_exposes_exact_motion_and_state_routes(
         "station_hold_not_confirmed_no_active_operation"
     )
     assert motion_application.closed
+
+    assert motion_application.runtime.resource_close_calls == ["runtime.close"]
 
 
 def test_depth_artifact_route_uses_passive_executor_and_artifact_runtime(
@@ -2523,10 +2470,6 @@ def test_installed_rpent_toolkit_consumes_exact_motion_and_state_routes(
         "motion.move_tcp_to_pose",
         "1",
     )
-    cardinal_entry = bundle.route_manifest.route(
-        "motion.step_tcp_cardinal",
-        "1",
-    )
     parameters = {
         "pose_targets_by_component": {
             "right_arm": [0.4, -0.1, 0.5, 0.0, 0.0, 0.0, 1.0]
@@ -2538,20 +2481,6 @@ def test_installed_rpent_toolkit_consumes_exact_motion_and_state_routes(
         "tool_config_hash": "tool-config:fixture",
         "calibration_hash": "calibration:agent-motion-bundle-fixture",
     }
-    cardinal_parameters = {
-        "component_id": bundle.cardinal_step_profile.component_id,
-        "direction": "forward",
-        "reference_frame_id": bundle.cardinal_step_profile.reference_frame_id,
-        "reference_frame_spec_hash": (
-            bundle.cardinal_step_profile.reference_frame_spec_hash
-        ),
-        "controlled_frame_id": "tool_tcp",
-        "frame_graph_hash": bundle.cardinal_step_profile.frame_graph_hash,
-        "tool_config_hash": bundle.cardinal_step_profile.tool_config_hash,
-        "calibration_hash": bundle.cardinal_step_profile.calibration_hash,
-        "primitive_catalog_hash": (bundle.cardinal_step_profile.primitive_catalog_hash),
-    }
-
     source_slot = bundle.station_manifest.source_slots[0]
     snapshot = AgentObservationSnapshot(
         snapshot_id="agent-observation:agent-motion-bundle-fixture",
@@ -2584,21 +2513,18 @@ def test_installed_rpent_toolkit_consumes_exact_motion_and_state_routes(
         route_manifest=bundle.route_manifest.to_wire(),
         observation_snapshot=snapshot.to_wire(),
     )
+    from itertools import count
+    request_sequence = count(1)
     consumer_session = DexTeleopConsumerSession(
         client=client,
         client_id="rpent:fixture",
-        request_id_factory=lambda: "request:rpent-agent-motion-fixture",
+        request_id_factory=lambda: f"request:rpent-agent-motion-fixture:{next(request_sequence)}",
     )
     toolkit = DexTeleopToolkit(session=consumer_session)
     motion_spec = next(
         spec
         for spec in toolkit.get_tools_spec()
         if spec["name"].startswith("dex__motion_move_tcp_to_pose")
-    )
-    cardinal_spec = next(
-        spec
-        for spec in toolkit.get_tools_spec()
-        if spec["name"].startswith("dex__motion_step_tcp_cardinal")
     )
 
     assert set(motion_spec["input_schema"]["properties"]) == set(parameters)
@@ -2611,14 +2537,302 @@ def test_installed_rpent_toolkit_consumes_exact_motion_and_state_routes(
     assert client.submitted_requests[0]["route_hash"] == (
         motion_entry.route.semantic_content_hash
     )
-    assert set(cardinal_spec["input_schema"]["properties"]) == set(cardinal_parameters)
-    assert "distance_m" not in cardinal_spec["input_schema"]["properties"]
-    cardinal_response = toolkit.execute_tool(
-        cardinal_spec["name"],
-        cardinal_parameters,
-    ).result
-    assert cardinal_response["accepted"]
-    assert client.submitted_requests[1]["route_hash"] == (
-        cardinal_entry.route.semantic_content_hash
+    assert not any(
+        any(skill_id.replace(".", "_") in spec["name"]
+            for skill_id in ARCHIVED_DEBUG_MOTION_SKILL_IDS_V1)
+        for spec in toolkit.get_tools_spec()
     )
     consumer_session.close()
+
+
+def _gateway_close_outcomes():
+    from agent_gateway.runtime.operation_port import AgentGatewayAuthoritativePortReceipt
+    from agent_gateway.runtime.service import AgentGatewayOperationOutcome
+
+    rejected = AgentGatewayOperationOutcome(
+        False, "station_hold_not_confirmed_no_active_operation",
+        port_receipt=AgentGatewayAuthoritativePortReceipt(
+            port_id="fixture:domain", operation_kind="hold", operation_id=None,
+            succeeded=False, status="hold_pending", completed_at=1.0,
+            call_sequence=1, proves_motion_or_hold=False,
+        ),
+    )
+    accepted = AgentGatewayOperationOutcome(
+        True, "station_hold_confirmed_no_active_operation",
+        port_receipt=AgentGatewayAuthoritativePortReceipt(
+            port_id="fixture:domain", operation_kind="hold", operation_id=None,
+            succeeded=True, status="held", completed_at=2.0,
+            call_sequence=2, proves_motion_or_hold=True,
+            evidence_refs=("fixture:lower-confirmed-hold:2",),
+        ),
+    )
+    return rejected, accepted
+
+
+def _gateway_close_retry_session(outcomes, *, started=True):
+    pending = list(outcomes)
+    calls = {"service": [], "lower": [], "executor": [], "model_start": [],
+             "model_close": [], "history_store": [], "artifact_store": []}
+
+    def service_close(**kwargs):
+        calls["service"].append(kwargs)
+        result = pending.pop(0)
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    application = SimpleNamespace(started=started, closed=False)
+
+    def lower_close():
+        calls["lower"].append("closed")
+        application.closed = True
+
+    application.close_after_hold = lower_close
+    motion_executor = SimpleNamespace(
+        close_after_hold=lambda **kwargs: calls["executor"].append(kwargs),
+        workers=(), active_operation_id=None,
+    )
+    session = object.__new__(MujocoAgentTcpPoseGatewaySession)
+    for name, value in dict(
+        _close_lock=threading.Lock(), _close_started=False, _close_outcome=None,
+        service=SimpleNamespace(close=service_close, is_closed=False),
+        observation_producer=SimpleNamespace(current_station_revision=0),
+        application=application, motion_executor=motion_executor,
+        _motion_executors=lambda: (motion_executor,), history_recorder=None,
+        state_executor=None, tcp_pose_comparison_executor=None, depth_executor=None,
+        rgb_executor=None, back_projection_executor=None, history_executor=None,
+        spatial_goal_executor=None, segmentation_executor=None, placement_executor=None,
+        object_goal_query_executor=None, surface_anchor_executors=(), localization_executor=None,
+        tcp_continuation_query_executor=None, candidate_query_executors=(), safe_tcp_pose_v2_executor=None,
+        contract_bundle=SimpleNamespace(surface_anchor_registrations=(), candidate_query_registrations=()),
+        _segmentation_model_started=False,
+        segmentation_localizer=SimpleNamespace(
+            start=lambda: calls["model_start"].append("started"),
+            close=lambda: calls["model_close"].append("closed"),
+        ),
+        owns_source_observation_history_store=True,
+        source_observation_history_store=SimpleNamespace(
+            close=lambda: calls["history_store"].append("closed")),
+        _source_observation_history_store_closed=False,
+        owns_artifact_store=True,
+        artifact_store=SimpleNamespace(close=lambda: calls["artifact_store"].append("closed")),
+        _artifact_store_closed=False,
+    ).items():
+        setattr(session, name, value)
+    return session, calls
+
+
+def test_session_close_retries_rejected_hold_then_caches_confirmed_hold() -> None:
+    rejected, accepted = _gateway_close_outcomes()
+    session, calls = _gateway_close_retry_session([rejected, accepted])
+
+    assert session.close() is rejected
+    assert not session.application.closed
+    assert calls["executor"] == []
+    second = session.close()
+
+    assert len(calls["service"]) == 2
+    assert second is accepted
+    assert session._close_outcome is accepted
+    assert session.application.closed
+    assert calls["executor"] == [{"hold_receipt": accepted.port_receipt}]
+    assert calls["lower"] == ["closed"]
+    assert session.close() is accepted
+    assert len(calls["service"]) == 2
+    assert calls["lower"] == ["closed"]
+    assert calls["history_store"] == calls["artifact_store"] == ["closed"]
+
+
+@pytest.mark.parametrize("first_failure", ["rejected", "exception"])
+def test_session_close_attempt_permanently_fences_model_start(first_failure) -> None:
+    rejected, accepted = _gateway_close_outcomes()
+    first = rejected if first_failure == "rejected" else RuntimeError("fixture HOLD error")
+    session, calls = _gateway_close_retry_session([first, accepted])
+
+    if first_failure == "rejected":
+        assert session.close() is rejected
+    else:
+        with pytest.raises(RuntimeError, match="gateway_service.*fixture HOLD error"):
+            session.close()
+    with pytest.raises(RuntimeError, match="Closed Gateway session"):
+        session.start_perception_resources()
+    assert session._close_started
+    assert calls["model_start"] == []
+    assert session._close_outcome is None
+    assert session.close() is accepted
+    assert len(calls["service"]) == 2
+
+
+def test_session_model_start_rejects_directly_closed_service() -> None:
+    _, accepted = _gateway_close_outcomes()
+    session, calls = _gateway_close_retry_session([accepted])
+    session.service.is_closed = True
+
+    with pytest.raises(RuntimeError, match="Closed Gateway session"):
+        session.start_perception_resources()
+    assert calls["model_start"] == []
+    assert calls["service"] == []
+
+
+@pytest.mark.parametrize("state_reader", ["state_executor", "tcp_pose_comparison_executor", "rgbd_capture_executor", "localization_executor"])
+def test_session_confirmed_close_retries_passive_drain_without_new_hold(state_reader) -> None:
+    _, accepted = _gateway_close_outcomes()
+    session, calls = _gateway_close_retry_session([accepted])
+    settled = threading.Event()
+    waits = []
+    setattr(session, state_reader, SimpleNamespace(
+        wait_all=lambda **kwargs: waits.append(kwargs) or settled.is_set()))
+    session._segmentation_model_started = True
+
+    with pytest.raises(RuntimeError, match=state_reader):
+        session.close()
+    assert len(calls["service"]) == 1
+    assert session._close_outcome is accepted
+    assert not session.application.closed
+    assert calls["model_close"] == calls["lower"] == []
+    assert calls["history_store"] == calls["artifact_store"] == []
+    settled.set()
+
+    assert session.close() is accepted
+    assert len(calls["service"]) == 1
+    assert waits == [{"timeout_sec": 65.0 if state_reader == "localization_executor" else 5.0}] * 2
+    assert calls["model_close"] == calls["lower"] == ["closed"]
+    assert calls["history_store"] == calls["artifact_store"] == ["closed"]
+    assert session.close() is accepted
+    assert calls["model_close"] == calls["lower"] == ["closed"]
+    assert len(calls["service"]) == 1
+
+
+def test_session_concurrent_close_attempts_serialize_and_retry_hold() -> None:
+    rejected, accepted = _gateway_close_outcomes()
+    session, calls = _gateway_close_retry_session([rejected, accepted])
+    entered = threading.Event()
+    release = threading.Event()
+    second_ready = threading.Event()
+    original = session.service.close
+
+    def blocked_first_close(**kwargs):
+        if not entered.is_set():
+            entered.set()
+            assert release.wait(3.0)
+        return original(**kwargs)
+
+    session.service.close = blocked_first_close
+    results, errors = {}, []
+
+    def close_session(*, second=False):
+        if second:
+            second_ready.set()
+        try:
+            results["second" if second else "first"] = session.close()
+        except Exception as error:
+            errors.append(error)
+
+    first = threading.Thread(target=close_session)
+    second = threading.Thread(target=close_session, kwargs={"second": True})
+    first.start()
+    try:
+        assert entered.wait(3.0)
+        second.start()
+        assert second_ready.wait(3.0)
+    finally:
+        release.set()
+        first.join(5.0)
+        if second.ident is not None:
+            second.join(5.0)
+    assert not first.is_alive() and not second.is_alive()
+    assert errors == []
+    assert results == {"first": rejected, "second": accepted}
+    assert len(calls["service"]) == 2
+    assert calls["executor"] == [{"hold_receipt": accepted.port_receipt}]
+    assert calls["lower"] == ["closed"]
+
+
+def test_session_model_start_waiting_on_failed_close_remains_fenced() -> None:
+    rejected, _ = _gateway_close_outcomes()
+    session, calls = _gateway_close_retry_session([rejected])
+    entered, release, start_ready = threading.Event(), threading.Event(), threading.Event()
+    original = session.service.close
+
+    def blocked_close(**kwargs):
+        entered.set()
+        assert release.wait(3.0)
+        return original(**kwargs)
+
+    session.service.close = blocked_close
+    results, errors = [], []
+
+    def close_session():
+        try:
+            results.append(session.close())
+        except Exception as error:
+            errors.append(error)
+
+    def start_model():
+        start_ready.set()
+        try:
+            session.start_perception_resources()
+        except RuntimeError as error:
+            errors.append(error)
+
+    closer, starter = threading.Thread(target=close_session), threading.Thread(target=start_model)
+    closer.start()
+    try:
+        assert entered.wait(3.0)
+        starter.start()
+        assert start_ready.wait(3.0)
+    finally:
+        release.set()
+        closer.join(5.0)
+        if starter.ident is not None:
+            starter.join(5.0)
+    assert not closer.is_alive() and not starter.is_alive()
+    assert results == [rejected]
+    assert len(errors) == 1 and "Closed Gateway session" in str(errors[0])
+    assert calls["model_start"] == []
+    assert session._close_started
+
+
+def test_session_unstarted_lower_can_close_without_claiming_hold_success() -> None:
+    rejected, accepted = _gateway_close_outcomes()
+    session, calls = _gateway_close_retry_session([rejected, accepted], started=False)
+
+    assert session.close() is rejected
+    assert session.application.closed
+    assert calls["executor"] == []
+    assert session.close() is accepted
+    assert len(calls["service"]) == 2
+    assert calls["executor"] == []
+    assert calls["lower"] == ["closed"]
+
+
+@pytest.mark.parametrize("kind", ["query", "anchor"])
+def test_unsettled_frozen_query_or_anchor_defers_shared_cleanup(kind):
+    _, accepted = _gateway_close_outcomes()
+    session, calls = _gateway_close_retry_session([accepted])
+    settled = [False]
+    waits = []
+
+    def wait_all(*, timeout_sec):
+        waits.append(timeout_sec)
+        return settled[0]
+
+    reader = SimpleNamespace(wait_all=wait_all)
+    registration = SimpleNamespace(skill=SimpleNamespace(
+        routes=(SimpleNamespace(max_operation_duration_ms=30_000),)))
+    session.contract_bundle = SimpleNamespace(
+        candidate_query_registrations=(),
+        object_goal_query_registration=registration if kind == "query" else None,
+        surface_anchor_registrations=(registration,) if kind == "anchor" else ())
+    session.object_goal_query_executor = reader if kind == "query" else None
+    session.surface_anchor_executors = (reader,) if kind == "anchor" else ()
+    session._segmentation_model_started = True
+    with pytest.raises(RuntimeError, match="object_goal_query|surface_anchor"):
+        session.close()
+    assert waits and calls["lower"] == []
+    assert calls["artifact_store"] == calls["model_close"] == []
+    assert len(calls["service"]) == 1
+    settled[0] = True
+    assert session.close() is accepted
+    assert len(calls["service"]) == 1
+    assert calls["lower"] == calls["artifact_store"] == calls["model_close"] == ["closed"]

@@ -134,6 +134,12 @@ bash scripts/install_point_grasp_models.sh \
 Isaac Gym、OpenPI server 和真实设备的系统驱动不属于 `uv.lock` 的可移植范围；它们的边界和安装方式
 在本文后面或对应模块文档中单独说明。
 
+RM65 的完整 CAD 自观测、附着体网格生成和深度射线查询需要 `core` 中显式锁定的
+`trimesh` 与 `embreex`。这些是真实几何路径的运行依赖，不是仅供测试使用的可选占位。
+不使用 `trimesh[easy]` 扩张依赖集合；所需 NumPy 复用现有固定版本。安装后的 smoke
+检查会解析 `trimesh.ray.ray_pyembree.RayMeshIntersector`，环境诊断也会检查这两项的存在与版本。
+验证继续使用 `PYTHONNOUSERSITE=1`，用户级安装不能替代主环境中的锁定依赖。
+
 ## 2. 只安装后期标注环境
 
 标注机器不需要安装完整 conda 环境，也不需要 Pinocchio、Pink、机器人厂商 SDK、

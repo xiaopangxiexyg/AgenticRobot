@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import math
 from collections.abc import Mapping
 from typing import Any
@@ -149,6 +150,16 @@ def grasp_approach_plan_schema_entry_v1(
                 "items": {"type": "string", "enum": ["left", "right"]},
             },
             "path_status": {"type": "string", "minLength": 1},
+            "planning_phase": {"type": "string", "minLength": 1, "maxLength": 128},
+            "start_qpos_source": {"type": "string", "enum": ["input_qpos", "envelope_ingress_endpoint"]},
+            "start_check_json": {"type": "string", "minLength": 1, "maxLength": 2048},
+            "target_collision_points": {"type": "integer", "minimum": 0},
+            "background_collision_points": {"type": "integer", "minimum": 0},
+            "terminal_target_contact_points": {"type": "integer", "minimum": 0},
+            "terminal_contact_allowed": {"type": "boolean"},
+            "path_gripper_proxy_padding_m": {"type": "number", "minimum": 0},
+            "terminal_position_error_m": {"type": "number", "minimum": 0},
+            "terminal_orientation_error_deg": {"type": "number", "minimum": 0, "maximum": 180},
             "segment_index": {"type": "integer", "minimum": 0},
             "edge_sample_index": {"type": "integer", "minimum": 0},
             "exception_type": {"type": "string", "minLength": 1},
@@ -524,6 +535,8 @@ def validate_grasp_approach_plan_result_v1(
         "best_orientation_residual_deg",
         "modified_sides",
         "path_status",
+        "start_qpos_source",
+        "start_check_json",
         "segment_index",
         "edge_sample_index",
         "exception_type",
@@ -532,9 +545,26 @@ def validate_grasp_approach_plan_result_v1(
         "envelope_projection_subject",
         "maximum_path_envelope_ingress_distance_m",
         "path_envelope_ingress_distance_excess_m",
+        "planning_phase", "target_collision_points", "background_collision_points",
+        "terminal_target_contact_points", "terminal_contact_allowed",
+        "path_gripper_proxy_padding_m", "terminal_position_error_m", "terminal_orientation_error_deg",
     }
     if not isinstance(diagnostics, Mapping) or set(diagnostics) - allowed_diagnostics:
         raise ValueError("diagnostics contains unsupported fields.")
+    for field in ("target_collision_points", "background_collision_points", "terminal_target_contact_points"):
+        if field in diagnostics and (isinstance(diagnostics[field], bool)
+                or not isinstance(diagnostics[field], int) or diagnostics[field] < 0):
+            raise ValueError(f"diagnostics.{field} must be a nonnegative integer")
+    for field in ("path_gripper_proxy_padding_m", "terminal_position_error_m", "terminal_orientation_error_deg"):
+        if field in diagnostics and _finite(diagnostics[field], field=field) < 0:
+            raise ValueError(f"diagnostics.{field} must be nonnegative")
+    if diagnostics.get("terminal_orientation_error_deg", 0) > 180:
+        raise ValueError("diagnostics.terminal_orientation_error_deg exceeds 180")
+    if "terminal_contact_allowed" in diagnostics and not isinstance(diagnostics["terminal_contact_allowed"], bool):
+        raise ValueError("diagnostics.terminal_contact_allowed must be boolean")
+    if "planning_phase" in diagnostics and (not isinstance(diagnostics["planning_phase"], str)
+            or not 1 <= len(diagnostics["planning_phase"]) <= 128):
+        raise ValueError("diagnostics.planning_phase must be bounded nonempty text")
     for field in ("maximum_path_envelope_ingress_distance_m", "path_envelope_ingress_distance_excess_m"):
         if field in diagnostics and _finite(diagnostics[field], field=field) < 0:
             raise ValueError(f"diagnostics.{field} must be nonnegative")
@@ -543,6 +573,28 @@ def validate_grasp_approach_plan_result_v1(
         or not diagnostics["envelope_projection_subject"]
     ):
         raise ValueError("envelope_projection_subject must be a nonempty string")
+    if "start_qpos_source" in diagnostics and (
+        not isinstance(diagnostics["start_qpos_source"], str)
+        or diagnostics["start_qpos_source"] not in {"input_qpos", "envelope_ingress_endpoint"}
+    ):
+        raise ValueError("start_qpos_source must identify the actual start state")
+    if "start_check_json" in diagnostics:
+        encoded = diagnostics["start_check_json"]
+        if not isinstance(encoded, str) or not 1 <= len(encoded) <= 2048:
+            raise ValueError("start_check_json must contain at most 2048 decoded characters")
+        def finite_float(text: str) -> float:
+            number = float(text)
+            if not math.isfinite(number):
+                raise ValueError("start_check_json numbers must be finite")
+            return number
+        def reject_constant(_text: str) -> None:
+            raise ValueError("start_check_json numbers must be finite")
+        try:
+            decoded = json.loads(encoded, parse_float=finite_float, parse_constant=reject_constant)
+        except (ValueError, RecursionError) as exc:
+            raise ValueError("start_check_json must be a bounded finite JSON object") from exc
+        if not isinstance(decoded, dict):
+            raise ValueError("start_check_json must encode an object")
     status = payload["planning_status"]
     plan_fields = (
         "grasp_approach_plan_id",

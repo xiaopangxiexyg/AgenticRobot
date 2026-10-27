@@ -1,0 +1,18 @@
+{
+  "schema_version": "teleop_runtime.tcp_pose_envelope.v1",
+  "profile_id": "agent-grasp-dual-absolute-standard-v1",
+  "sides": {
+    "left": {
+      "absolute_bounds": {
+        "min_xyz_m": [-0.39, -0.7, 0.03],
+        "max_xyz_m": [0.75, 0.7, 0.85]
+      }
+    },
+    "right": {
+      "absolute_bounds": {
+        "min_xyz_m": [-0.39, -0.7, 0.03],
+        "max_xyz_m": [0.75, 0.7, 0.85]
+      }
+    }
+  }
+}

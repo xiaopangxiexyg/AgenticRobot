@@ -23,7 +23,9 @@ from agent_gateway.protocol.skill_catalog import (
     SkillDeploymentSafetyEnvelopeRef,
 )
 from agent_gateway.runtime.artifact_store import RecoverableAgentArtifactStore
-from .motion_observed_scene import ObservedSafeMovePlanner, SafeMotionObservationConfig
+from .motion_observed_scene import (
+    MotionPlanningGeometryResources, ObservedSafeMovePlanner, SafeMotionObservationConfig,
+)
 from .motion_observed_scene_debug import validate_debug_directory
 from agent_gateway.transport.client_bindings import (
     compile_agent_gateway_unix_client_bindings,
@@ -73,7 +75,6 @@ from .motion_primitive_profiles import (
 )
 from .observation_gateway import RealTcpPoseObserveAttachmentSpec
 from .one_shot_authorization import (
-    REAL_AGENT_PRIMITIVE_ACTIONS,
     RealAgentPrimitiveOneShotAuthorization,
 )
 from .perception_deployment import (
@@ -102,6 +103,7 @@ from .rm65_grasp_reachability import (
     RM65PointGraspReachabilityAdapter,
     arm_base_origin_in_candidate_frame,
 )
+from .session_authorization import validate_real_agent_primitive_action
 from .station_point_grasp_deployment import (
     StationBoundPointGraspRegistration,
     StationPointGraspArmReachabilityProfile,
@@ -176,6 +178,7 @@ class ExclusiveRM65AgentPrimitiveComposition:
     point_grasp_planner: object | None
     socket_path: Path
     authorized_side: str
+    authorized_motion_sides: tuple[str, ...]
     authorized_action: str | None
     authorized_actions: tuple[str, ...]
     client_id: str
@@ -260,6 +263,7 @@ def assemble_exclusive_rm65_agent_primitive_composition(
     authorized_gripper_sides: tuple[str, ...] | None = None,
     socket_path: str | Path,
     authorized_side: str,
+    authorized_motion_sides: tuple[str, ...] | None = None,
     authorized_action: str | None,
     confirmation_token: str,
     client_id: str,
@@ -285,6 +289,7 @@ def assemble_exclusive_rm65_agent_primitive_composition(
     point_grasp_planner: object | None = None,
     enable_grasp_observation: bool = False,
     enable_spatial_goals: bool = False,
+    enable_tcp_pose_comparison: bool = False,
     enable_back_projection: bool = False,
     enable_point_grasp_finger_exchange: bool = False,
     debug_render_object_coordinates: bool = False,
@@ -307,6 +312,8 @@ def assemble_exclusive_rm65_agent_primitive_composition(
         raise TypeError("enable_grasp_observation must be bool.")
     if not isinstance(enable_spatial_goals, bool):
         raise TypeError("enable_spatial_goals must be bool.")
+    if not isinstance(enable_tcp_pose_comparison, bool):
+        raise TypeError("enable_tcp_pose_comparison must be bool.")
     if not isinstance(enable_back_projection, bool):
         raise TypeError("enable_back_projection must be bool.")
     if not isinstance(enable_point_grasp_finger_exchange, bool):
@@ -322,6 +329,11 @@ def assemble_exclusive_rm65_agent_primitive_composition(
     side = str(authorized_side).strip().lower()
     if side not in {"left", "right"}:
         raise ValueError("authorized_side must be left or right.")
+    motion_sides = tuple(sorted(set((side,) if authorized_motion_sides is None
+                                   else authorized_motion_sides)))
+    if not motion_sides or side not in motion_sides or not set(motion_sides) <= {"left", "right"}:
+        raise ValueError("authorized_motion_sides must include the primary side and select left/right.")
+    motion_components = tuple(arm + "_arm" for arm in motion_sides)
     if authorized_actions is None:
         if authorized_action is None:
             raise ValueError("authorized_action or authorized_actions is required.")
@@ -335,10 +347,10 @@ def assemble_exclusive_rm65_agent_primitive_composition(
     normalized_actions = tuple(
         sorted({str(item).strip() for item in requested_actions})
     )
-    if not normalized_actions or any(
-        item not in REAL_AGENT_PRIMITIVE_ACTIONS for item in normalized_actions
-    ):
+    if not normalized_actions:
         raise ValueError("authorized_actions contains an unreviewed primitive.")
+    for item in normalized_actions:
+        validate_real_agent_primitive_action(item)
     bilateral = gripper_backends is not None
     if bilateral and right_gripper_backend is not None:
         raise ValueError("Select existing right-gripper v1 or explicit bilateral v2.")
@@ -444,11 +456,10 @@ def assemble_exclusive_rm65_agent_primitive_composition(
         raise ValueError("Point-grasp must share the exact object-localizer instance.")
 
     envelope_profile = lower.target_safety.envelope_profile
-    side_envelope = envelope_profile.side_config_by_side.get(side)
-    if side_envelope is None or not side_envelope.enabled:
-        raise ValueError(
-            f"selected lower envelope does not actively constrain {side!r}."
-        )
+    for arm in motion_sides:
+        constraint = envelope_profile.side_config_by_side.get(arm)
+        if constraint is None or not constraint.enabled:
+            raise ValueError(f"selected lower envelope does not actively constrain {arm!r}.")
 
     profile = lower.profile
     if camera_mount_urdf_path is None and any(value is not None for value in (
@@ -540,6 +551,7 @@ def assemble_exclusive_rm65_agent_primitive_composition(
             "target_safety_profile_hash": envelope_profile.semantic_content_hash,
             "active_side": side,
             "inactive_side_semantics": "coupled_solver_hard_hold",
+            "authorized_motion_sides": motion_sides,
             "command_owner_count": 1,
             **({"captured_robot_filter": {
                 "config_hash": captured_robot_observation_filter.config.semantic_content_hash,
@@ -556,6 +568,7 @@ def assemble_exclusive_rm65_agent_primitive_composition(
             "embodiment_instance_id": embodiment_id,
             "profile_hash": profile.semantic_content_hash,
             "active_side": side,
+            "authorized_motion_sides": motion_sides,
         },
         domain="dexteleop.real_skill.rm65_target_binding.v1",
     )
@@ -579,7 +592,7 @@ def assemble_exclusive_rm65_agent_primitive_composition(
         {
             "source_binding_hash": source_binding_hash,
             "projection": "coupled_fk_to_tool_tcp_world",
-            "component_ids": (f"{side}_arm",),
+            "component_ids": motion_components,
             "pull_semantics": (
                 "continuous_lower_sampling_plus_skill_cycle_consumption"
                 if lower.ports.profile.background_measurement_sampling
@@ -594,7 +607,7 @@ def assemble_exclusive_rm65_agent_primitive_composition(
             "representation": "xyz_quat_xyzw",
             "controlled_frame": "tool_tcp",
             "reference_frame": execution_frame.frame_id,
-            "bounded_components": (f"{side}_arm",),
+            "bounded_components": motion_components,
         },
         domain="dexteleop.real_skill.rm65_observation_capability.v1",
     )
@@ -628,7 +641,7 @@ def assemble_exclusive_rm65_agent_primitive_composition(
         control_domain_id=domain_id,
         embodiment_instance_id=embodiment_id,
         target_binding_id=target_binding_id,
-        component_ids=(f"{side}_arm",),
+        component_ids=motion_components,
         station_manifest_hash=station_manifest_hash,
         execution_manifest_hash=execution_manifest_hash,
         backend_inventory_hash=backend_inventory_hash,
@@ -652,8 +665,8 @@ def assemble_exclusive_rm65_agent_primitive_composition(
         max_measurement_age_ms=maximum_age_ms,
     )
     port_config = RealAgentMotionPortConfig(
-        active_sides=(side,),
-        component_id_by_side={side: f"{side}_arm"},
+        active_sides=motion_sides,
+        component_id_by_side={arm: f"{arm}_arm" for arm in motion_sides},
         execution_frame_id=execution_frame.frame_id,
         execution_frame_spec_hash=execution_frame.semantic_content_hash,
         exclusive_command_claim=True,
@@ -663,13 +676,14 @@ def assemble_exclusive_rm65_agent_primitive_composition(
             "profile_id": envelope_profile.profile_id,
             "profile_hash": envelope_profile.semantic_content_hash,
             "active_side": side,
-            "side_constraints": side_envelope.semantic_payload(),
+            "side_constraints": {arm: envelope_profile.side_config_by_side[arm].semantic_payload()
+                                 for arm in motion_sides},
             "application": "active_final_pre_ik",
         },
         domain="dexteleop.real_skill.rm65_safety_constraint_set.v1",
     )
     envelope_ref = SkillDeploymentSafetyEnvelopeRef(
-        object_id=f"real-rm65-envelope:{envelope_profile.profile_id}:{side}",
+        object_id=f"real-rm65-envelope:{envelope_profile.profile_id}:{'+'.join(motion_sides)}",
         schema="dexteleop.deployment_safety_envelope.v1",
         content_hash=envelope_profile.semantic_content_hash,
         constraint_set_hash=constraint_set_hash,
@@ -959,6 +973,10 @@ def assemble_exclusive_rm65_agent_primitive_composition(
         )
         safe_pose_trajectory_planner = None
         safe_pose_trajectory_planner_factory = None
+        planning_geometry_resources = None
+        if captured_robot_observation_filter is not None:
+            planning_geometry_resources = MotionPlanningGeometryResources(
+                self_filter=captured_robot_observation_filter)
         if "move_tcp_to_pose_safe" in normalized_actions:
             safe_config = (grasp_trajectory_config or RM65GraspTrajectoryPlanningConfig()).for_tcp_pose_move(
                 translation_tolerance_m=convergence_profile.translation_tolerance_m,
@@ -981,6 +999,7 @@ def assemble_exclusive_rm65_agent_primitive_composition(
 
             if observed_safe_enabled:
                 assert captured_robot_observation_filter is not None
+                planning_geometry_resources.planner_factory = safe_planner_factory
                 assert perception_source_binding is not None
                 aligned_roles = {item["role"] for item in catalog_provider.aligned_rgbd_source_catalog()}
                 if not set(safe_motion_observation_config.roles) <= aligned_roles:
@@ -1038,8 +1057,10 @@ def assemble_exclusive_rm65_agent_primitive_composition(
 
         deployment = assemble_exclusive_rm65_agent_primitive_deployment(
             enable_spatial_goals=enable_spatial_goals,
+            enable_tcp_pose_comparison=enable_tcp_pose_comparison,
             gripper_port=gripper_port,
             gripper_ports=gripper_ports if bilateral else None,
+            primary_component_id=f"{side}_arm",
             target_builder=lower.target_builder,
             rm65_ports=lower.ports,
             port_config=port_config,
@@ -1093,6 +1114,7 @@ def assemble_exclusive_rm65_agent_primitive_composition(
         additional_resources = tuple(
             resource
             for resource in (
+                planning_geometry_resources,
                 localization_provider,
                 deployment.gateway_session.station_point_grasp_provider,
             )
@@ -1108,6 +1130,7 @@ def assemble_exclusive_rm65_agent_primitive_composition(
         resources = ExclusiveRealGripperResources(lower=resources,
             **({"ports": gripper_ports} if bilateral else {"port": gripper_port}))
     authorization = RealAgentPrimitiveOneShotAuthorization(
+        authorized_motion_sides=motion_sides,
         authorized_gripper_sides=authorized_gripper_sides,
         gateway_session=deployment.gateway_session,
         side=side,
@@ -1161,6 +1184,7 @@ def assemble_exclusive_rm65_agent_primitive_composition(
         point_grasp_planner=point_grasp_planner,
         socket_path=endpoint,
         authorized_side=side,
+        authorized_motion_sides=motion_sides,
         authorized_action=authorization.action,
         authorized_actions=authorization.authorized_actions,
         client_id=client,

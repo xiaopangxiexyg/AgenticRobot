@@ -25,7 +25,7 @@ from scripts.hardware import rebot_b601_rs_owner as owner
 
 pytestmark = [pytest.mark.unit, pytest.mark.contract]
 PROFILES = Path(__file__).resolve().parents[1]/"docs/hardware/profiles"
-BASE = PROFILES/"b601_j2_j3_continuous_identification_v1.json"
+BASE = PROFILES/"b601_j2_j3_continuous_identification_v2.json"
 CANDIDATE = PROFILES/"b601_j2_j3_cruise_identification_v1.json"
 FOUR_CENTRES = PROFILES/"b601_j2_j3_four_centres_cruise_identification_v1.json"
 RESOLUTION = .0003834962844848633

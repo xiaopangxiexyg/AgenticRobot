@@ -21,4 +21,4 @@
 	url = https://github.com/graspnet/graspnet-baseline.git
 [submodule "model/perception/graspgenx"]
 	path = model/perception/graspgenx
-	url = https://github.com/NVlabs/GraspGenX.git
+	url = https://github.com/CYBER-QAQ/GraspGenX.git

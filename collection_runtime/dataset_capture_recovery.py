@@ -17,7 +17,6 @@ import json
 import os
 from pathlib import Path
 import re
-import tempfile
 from typing import Any, Iterator, Mapping
 import uuid
 import warnings
@@ -27,6 +26,7 @@ from dataset_interface.modality_artifacts import (
     assert_dataset_capture_writable,
 )
 
+from .atomic_json import atomic_write_json
 from .process_quiescence import (
     active_formal_collection_processes as _active_collection_processes,
 )
@@ -75,21 +75,7 @@ def _sha256_file(path: Path) -> str:
 
 
 def _atomic_write_json(path: Path, payload: Mapping[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, temporary_name = tempfile.mkstemp(
-        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
-    )
-    temporary = Path(temporary_name)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump(dict(payload), handle, ensure_ascii=False, indent=2, sort_keys=True)
-            handle.write("\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary, path)
-        _fsync_directory(path.parent)
-    finally:
-        temporary.unlink(missing_ok=True)
+    atomic_write_json(path, payload, ensure_ascii=False, sync_directory=_fsync_directory)
 
 
 def _fsync_directory(path: Path) -> None:

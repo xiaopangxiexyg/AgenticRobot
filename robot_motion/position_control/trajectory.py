@@ -48,9 +48,20 @@ def normalize_position_command_planner(value: object) -> str:
 
 
 def _readonly_vector(value: Sequence[float] | np.ndarray, *, name: str) -> np.ndarray:
-    vector = np.asarray(value, dtype=float).reshape(-1).copy()
-    if vector.size == 0 or not np.all(np.isfinite(vector)):
-        raise ValueError(f"{name} must be a non-empty finite vector.")
+    vector = np.asarray(value, dtype=float).reshape(-1)
+    if vector.size == 6:
+        # Six-joint command proposals run at the native command rate. Tiny
+        # NumPy reductions/copies can relinquish the GIL and wait behind a
+        # Python producer. Keep finite validation and detached storage, but
+        # construct this short vector without those redundant handoffs.
+        values = vector.tolist()
+        if not all(math.isfinite(item) for item in values):
+            raise ValueError(f"{name} must be a non-empty finite vector.")
+        vector = np.array(values, dtype=float)
+    else:
+        vector = vector.copy()
+        if vector.size == 0 or not np.all(np.isfinite(vector)):
+            raise ValueError(f"{name} must be a non-empty finite vector.")
     vector.setflags(write=False)
     return vector
 

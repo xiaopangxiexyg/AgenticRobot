@@ -10,6 +10,7 @@ from robot_motion.runtime import CommandDispatchReceipt
 from robot_motion.runtime import TeleopCommand
 
 from ..interfaces import EffectorBackend
+from .backend_state import read_backend_state
 
 
 POSITION_REFERENCE_DISPATCH_AUDIT_POST = "post"
@@ -224,7 +225,7 @@ def inspect_arm_backends_for_position_dispatch(
         if not backend_ready:
             reasons.append("backend_not_ready")
         state_started = time.perf_counter()
-        state, state_error = _safe_backend_state(backend)
+        state, state_error = _safe_backend_state(backend, health_only=True)
         state_completed = time.perf_counter()
         if state_error:
             reasons.append("state_error")
@@ -464,8 +465,20 @@ def _safe_backend_ready(backend: EffectorBackend) -> bool:
 
 def _safe_backend_state(
     backend: EffectorBackend,
+    *,
+    health_only: bool = False,
 ) -> tuple[dict[str, Any], str | None]:
     try:
+        if health_only:
+            # Health is checked at reference cadence. FK poses and percentile
+            # sorting are not inputs to any guard below; all backend-owned
+            # health, timing, epoch, error and singularity fields remain live.
+            return dict(read_backend_state(backend.get_state, optional_arguments={
+                "include_derived_pose": False,
+                "include_timing_percentiles": False,
+                "include_pose_source_attestation": False,
+                "include_background_streaming": True,
+            })), None
         return dict(backend.get_state()), None
     except Exception as exc:  # noqa: BLE001 - health checks must report, not hide.
         return {}, f"{type(exc).__name__}: {exc}"

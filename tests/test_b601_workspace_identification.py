@@ -44,7 +44,7 @@ from scripts.hardware import rebot_b601_rs_owner as owner
 
 pytestmark = [pytest.mark.unit, pytest.mark.contract]
 ZERO = (0.0,)*6
-PROFILE = Path(__file__).resolve().parents[1]/"docs/hardware/profiles/b601_j2_j3_continuous_identification_v1.json"
+PROFILE = Path(__file__).resolve().parents[1]/"docs/hardware/profiles/b601_j2_j3_continuous_identification_v2.json"
 
 
 def test_measured_speed_coverage_keeps_pose_direction_damping_and_holdout_separate():

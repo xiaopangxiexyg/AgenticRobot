@@ -823,98 +823,6 @@ def test_anti_windup_keeps_reductions_but_blocks_growth_and_reverse_integration(
     assert core._unwind_only(2, -sign*.1) == 0.
 
 
-@pytest.mark.parametrize("sign", [-1, 1])
-@pytest.mark.parametrize("period", [.01, .025])
-@pytest.mark.parametrize("matched_receipt", [False, True])
-def test_jhetc48r_joint_cap_feedback_releases_stale_support_without_raising_cap(
-    settings, monkeypatch, sign, period, matched_receipt,
-):
-    """Recorded composition boundary, not a counterfactual hardware trajectory."""
-    from robot_motion.rebot_b601_rs.joint_motion import B601JointMotionFrame
-
-    core = runtime(settings)
-    core.settings = replace(core.settings, limits=replace(core.settings.limits, max_abs_assist_nm=1.))
-    core.config = CoordinatedHoldingConfig(total_assist_cap_nm=1., bias_cap_nm=1.,
-        bias_gain_nm_per_rad_sec=40., rise_slew_nm_s=2.25, fall_slew_nm_s=1.,
-        supported_soft_recovery=True, recovery_kd_nm_s_per_rad=0.)
-    warm(core)
-    q = (0., sign*.00882038939744234, sign*.046787913888692856, 0., 0., 0.)
-    goal = (0., sign*.006902913562953472, sign*.029357376098632815, 0., 0., 0.)
-    for estimator, value in zip(core.estimators, q):
-        estimator.reset()
-        for n in range(20):
-            estimator.update(timestamp_sec=2+n*period, qpos_rad=value, fallback_rad_s=0.)
-    core.q, core.raw, core.velocity, core.last_time = q, ZERO, ZERO, 2+19*period
-    core.bias = (0., -sign*.4855909712800446, -sign*.3931582362948062, 0., 0., 0.)
-    core.last_delta = (0., -sign*.45494223239950543, -sign*.5450577676004945, 0., 0., 0.)
-    core.set_goal(goal)
-    native = (-sign*.023009710013866425, -sign*.20916974071857353)
-    for index, (i, tracker) in enumerate(zip(AXES, core.trackers)):
-        frame = B601JointMotionFrame(phase="brake" if i == 1 else "track",
-            reason="target_reached_braking" if i == 1 else "bounded_reference_tracking",
-            q_reference_rad=goal[i], qvel_reference_rad_s=0., control_qvel_rad_s=0.,
-            position_torque_nm=native[index], velocity_torque_nm=0.,
-            requested_torque_nm=native[index], target_position_rad=goal[i],
-            target_error_rad=goal[i]-q[i])
-        monkeypatch.setattr(tracker, "update", lambda frame=frame, **kwargs: frame)
-    before = core.bias
-    for n in range(120):
-        dt = core.observe(core.last_time+period, q, ZERO)
-        command, audit = core.step(sequence=n+100, dt=dt, permitted=True, point_search=False)
-        assert sum(abs(v) for v in command) <= 1.+1e-9
-        assert command[1]*sign < 0 and command[2]*sign < 0
-        if audit["saturated"]:
-            for i, effort in zip(AXES, native):
-                proposed = audit["proposed_bias_nm"][i]
-                if abs(proposed) > abs(core.bias[i]):
-                    realized = command[i]-effort
-                    assert proposed*realized >= 0 and abs(proposed) <= abs(realized)+1e-9
-        if n == 0:
-            assert audit["saturated"]
-            requested = (native[0]+before[1],
-                native[1]+before[2]+core.config.bias_gain_nm_per_rad_sec*(goal[2]-q[2])*period)
-            scale = 1/sum(abs(v) for v in requested)
-            assert command[1:3] == pytest.approx(tuple(v*scale for v in requested))
-            assert abs(audit["proposed_bias_nm"][1]) < abs(before[1])-.01
-            assert core.bias == before  # Proposal is not committed before dispatch.
-        core.record_dispatch(n+100, command if matched_receipt else ZERO)
-        if not matched_receipt:
-            assert core.bias == before
-            return
-        if abs(command[2]) >= .72:
-            assert abs(command[1]) >= .20  # Support is retained, never reset to zero.
-            break
-    else:
-        pytest.fail("frozen old bias still starves the selected axis under the unchanged cap")
-
-
-@pytest.mark.parametrize("native_opposes_bias", [False, True])
-def test_joint_cap_feedback_never_charges_normal_slew_or_invents_opposing_bias(
-    settings, monkeypatch, native_opposes_bias,
-):
-    from robot_motion.rebot_b601_rs.joint_motion import B601JointMotionFrame
-
-    core = runtime(settings)
-    core.config = CoordinatedHoldingConfig(supported_soft_recovery=True, recovery_kd_nm_s_per_rad=0.)
-    warm(core)
-    core.q = core.goal = ZERO
-    core.bias = (0., .3 if native_opposes_bias else -.3, -.7, 0., 0., 0.)
-    core.last_delta = (0., -.4, -.6, 0., 0., 0.) if native_opposes_bias else ZERO
-    for i, tracker in zip(AXES, core.trackers):
-        native = -.8 if i == 1 else 0.
-        frame = B601JointMotionFrame(phase="brake", reason="target_reached_braking",
-            q_reference_rad=0., qvel_reference_rad_s=0., control_qvel_rad_s=0.,
-            position_torque_nm=native, velocity_torque_nm=0., requested_torque_nm=native)
-        monkeypatch.setattr(tracker, "update", lambda frame=frame, **kwargs: frame)
-    command, audit = core.step(sequence=12, dt=.01, permitted=True, point_search=False)
-    assert audit["saturated"] and sum(abs(v) for v in command) <= 1.+1e-9
-    assert audit["combined_cap_shortfall_nm"][1] == 0.
-    assert audit["proposed_bias_nm"][1] == core.bias[1]
-    if not native_opposes_bias:
-        assert audit["combined_cap_shortfall_nm"] == ZERO
-    core.record_dispatch(12, command)
-
-
 @pytest.mark.parametrize("limit", ["speed", "combined_envelope"])
 def test_limited_arrival_cannot_restore_the_unloaded_increment(settings, monkeypatch, limit):
     from robot_motion.rebot_b601_rs.joint_motion import B601JointMotionFrame
@@ -1544,8 +1452,9 @@ def test_passive_joint_hard_velocity_reports_actual_fault_axis_not_task_axis(tmp
     assert r.controller.result_record()["state"] == "failed"
 
 
-def test_coverage_local_damping_ramps_through_complete_receipts_and_restores_on_withdrawal(tmp_path):
-    profile = Path(__file__).resolve().parents[1]/"docs/hardware/profiles/b601_j2_j3_coverage_support_v1.json"
+@pytest.mark.parametrize("profile_version,expected_kd", [(1, 3.0), (2, 4.5)])
+def test_coverage_local_damping_ramps_through_complete_receipts_and_restores_on_withdrawal(tmp_path, profile_version, expected_kd):
+    profile = Path(__file__).resolve().parents[1]/f"docs/hardware/profiles/b601_j2_j3_coverage_support_v{profile_version}.json"
     r = replay(tmp_path, **json.loads(profile.read_text())["workspace"])
     r.controller.submit("arm", now_sec=r.now)
     workspace = r.controller._coordinated
@@ -1560,7 +1469,7 @@ def test_coverage_local_damping_ramps_through_complete_receipts_and_restores_on_
         else:
             assert previous == target
         previous = r.last_kd
-    assert r.last_kd == target == (.4, 4.5, 4.5, 1.2, .2, .1)
+    assert r.last_kd == target == (.4, expected_kd, expected_kd, 1.2, .2, .1)
     r.controller.submit("withdraw", now_sec=r.now)
     for _ in range(ramp_ticks):
         r.tick()
@@ -1581,7 +1490,7 @@ def test_missing_local_damping_receipt_aborts_preparation_before_active_force(tm
     assert r.controller.result_record()["state"] == "failed"
 
 
-def coupled_tick(r, *, period=.025, passive_offset=0):
+def coupled_tick(r, *, period=.025, passive_offset=0, heartbeat_active=None):
     """Declared overdamped toy, not identified B601 physics or a force sensor."""
     q = list(r.q)
     # Pose-dependent residual load, a Coulomb dead zone and off-diagonal
@@ -1593,7 +1502,7 @@ def coupled_tick(r, *, period=.025, passive_offset=0):
     for i, v in zip((1, 2), velocity):
         q[i] += v*period
     q[3] += max(-.00015, min(.00015, passive_offset-q[3]))
-    r.tick(q, dt_sec=period)
+    r.tick(q, dt_sec=period, heartbeat_active=heartbeat_active)
 
 
 def scripted_coordinated_tick(r, *, passive_target=.006519419, period=.025):
@@ -2182,8 +2091,7 @@ def test_coverage_profile_reuses_paths_with_four_legs_and_keeps_hold_verificatio
     baseline = json.loads((profiles/"b601_j2_j3_four_centres_holding_v1.json").read_text())
     candidate = json.loads((profiles/"b601_j2_j3_coverage_support_v1.json").read_text())
     assert candidate["cycle"] == baseline["cycle"]
-    assert candidate["workspace"]["holding_search"] == {
-        **baseline["workspace"]["holding_search"], "observation_timeout_sec": 3.0}
+    assert candidate["workspace"]["holding_search"] == baseline["workspace"]["holding_search"]
     r = replay(tmp_path, **candidate["workspace"])
     controller = r.controller._coordinated
     workspace = controller.workspace
@@ -2202,7 +2110,7 @@ def test_coverage_profile_reuses_paths_with_four_legs_and_keeps_hold_verificatio
     assert workspace.coordinated_holding.total_assist_cap_nm == 1
     assert workspace.coordinated_holding.bias_gain_nm_per_rad_sec == 40
     assert workspace.coordinated_holding.supported_soft_recovery
-    assert workspace.joint2_drive_kd == workspace.joint3_drive_kd == (.4, 4.5, 4.5, 1.2, .2, .1)
+    assert workspace.joint2_drive_kd == workspace.joint3_drive_kd == (.4, 3., 3., 1.2, .2, .1)
     assert workspace.coordinated_holding.recovery_kd_nm_s_per_rad == 0
     assert workspace.coordinated_holding.motor_local_recovery
     assert controller.config.max_sweep_leg_sec == 180
@@ -2216,7 +2124,7 @@ def test_coverage_lag_margin_reaches_native_trackers_and_still_has_terminal_boun
 
     from robot_motion.rebot_b601_rs.joint_motion import B601JointMotionTracker
 
-    profile = Path(__file__).resolve().parents[1]/"docs/hardware/profiles/b601_j2_j3_coverage_support_v1.json"
+    profile = Path(__file__).resolve().parents[1]/"docs/hardware/profiles/b601_j2_j3_coverage_support_v2.json"
     whole = production_controller.__wrapped__(tmp_path)
     old = whole._workspace
     candidate = B601WorkspaceCalibrationController(old.settings, old.config,
@@ -2970,13 +2878,18 @@ def test_full_coupled_batch_and_report_keep_handoffs_distinct_from_withdrawal(tm
     journal.record({"action": "context", "human_intervention": False}, snapshot())
     assert snapshot()["calibration_trial"] is None
     r.controller.submit("arm", now_sec=r.now, return_and_disable=automatic_return)
+    view = snapshot()
     handoffs = []
     for _ in range(50000):
-        state = r.controller.status()["automatic_calibration"]["state"]
+        batch = view["automatic_calibration"]
+        state = batch["state"]
         if state in {"complete", "failed", "cancelled"}:
             break
         old = len(r.controller._coordinated._acquisitions)
-        coupled_tick(r, period=period, passive_offset=passive_offset)
+        # No callback or controller mutation follows the preceding snapshot.
+        # Reuse its active flag until this tick advances the native owner.
+        coupled_tick(r, period=period, passive_offset=passive_offset,
+                     heartbeat_active=batch["active"])
         controller = r.controller._coordinated
         flags = [tracker.config.support_soft_speed_recovery for tracker in controller.pose.trackers]
         if controller._phase in {"position", "return"}:
@@ -2995,7 +2908,8 @@ def test_full_coupled_batch_and_report_keep_handoffs_distinct_from_withdrawal(tm
                 coverage and r.audit["automatic_calibration"]["workspace"]["phase"] == "sweep"
                 and r.audit["holding_calibration"]["sample_pose_rad"] is not None
                 and r.audit["holding_calibration"]["probe_command_nm"] is None)
-        journal.observe(snapshot())
+        view = snapshot()
+        journal.observe(view)
         assert sum(abs(v) for v in r.delta) <= 1+1e-9
         if old != len(r.controller._coordinated._acquisitions):
             assert tuple(r.delta) == tuple(r.audit["coordinated_holding"]["combined_command_nm"])
@@ -3085,3 +2999,95 @@ def test_authority_revoked_between_computation_and_dispatch_vetoes_old_nonzero_f
 def test_coordinated_parameters_are_finite_and_explicit(values):
     with pytest.raises(ValueError):
         CoordinatedHoldingConfig(**values)
+
+
+@pytest.mark.parametrize("sign", [-1, 1])
+@pytest.mark.parametrize("period", [.01, .025])
+@pytest.mark.parametrize("matched_receipt", [False, True])
+def test_jhetc48r_joint_cap_feedback_releases_stale_support_without_raising_cap(
+    settings, monkeypatch, sign, period, matched_receipt,
+):
+    """Recorded composition boundary, not a counterfactual hardware trajectory."""
+    from robot_motion.rebot_b601_rs.joint_motion import B601JointMotionFrame
+
+    core = runtime(settings)
+    core.settings = replace(core.settings, limits=replace(core.settings.limits, max_abs_assist_nm=1.))
+    core.config = CoordinatedHoldingConfig(total_assist_cap_nm=1., bias_cap_nm=1.,
+        bias_gain_nm_per_rad_sec=40., rise_slew_nm_s=2.25, fall_slew_nm_s=1.,
+        supported_soft_recovery=True, recovery_kd_nm_s_per_rad=0.)
+    warm(core)
+    q = (0., sign*.00882038939744234, sign*.046787913888692856, 0., 0., 0.)
+    goal = (0., sign*.006902913562953472, sign*.029357376098632815, 0., 0., 0.)
+    for estimator, value in zip(core.estimators, q):
+        estimator.reset()
+        for n in range(20):
+            estimator.update(timestamp_sec=2+n*period, qpos_rad=value, fallback_rad_s=0.)
+    core.q, core.raw, core.velocity, core.last_time = q, ZERO, ZERO, 2+19*period
+    core.bias = (0., -sign*.4855909712800446, -sign*.3931582362948062, 0., 0., 0.)
+    core.last_delta = (0., -sign*.45494223239950543, -sign*.5450577676004945, 0., 0., 0.)
+    core.set_goal(goal)
+    native = (-sign*.023009710013866425, -sign*.20916974071857353)
+    for index, (i, tracker) in enumerate(zip(AXES, core.trackers)):
+        frame = B601JointMotionFrame(phase="brake" if i == 1 else "track",
+            reason="target_reached_braking" if i == 1 else "bounded_reference_tracking",
+            q_reference_rad=goal[i], qvel_reference_rad_s=0., control_qvel_rad_s=0.,
+            position_torque_nm=native[index], velocity_torque_nm=0.,
+            requested_torque_nm=native[index], target_position_rad=goal[i],
+            target_error_rad=goal[i]-q[i])
+        monkeypatch.setattr(tracker, "update", lambda frame=frame, **kwargs: frame)
+    before = core.bias
+    for n in range(120):
+        dt = core.observe(core.last_time+period, q, ZERO)
+        command, audit = core.step(sequence=n+100, dt=dt, permitted=True, point_search=False)
+        assert sum(abs(v) for v in command) <= 1.+1e-9
+        assert command[1]*sign < 0 and command[2]*sign < 0
+        if audit["saturated"]:
+            for i, effort in zip(AXES, native):
+                proposed = audit["proposed_bias_nm"][i]
+                if abs(proposed) > abs(core.bias[i]):
+                    realized = command[i]-effort
+                    assert proposed*realized >= 0 and abs(proposed) <= abs(realized)+1e-9
+        if n == 0:
+            assert audit["saturated"]
+            requested = (native[0]+before[1],
+                native[1]+before[2]+core.config.bias_gain_nm_per_rad_sec*(goal[2]-q[2])*period)
+            scale = 1/sum(abs(v) for v in requested)
+            assert command[1:3] == pytest.approx(tuple(v*scale for v in requested))
+            assert abs(audit["proposed_bias_nm"][1]) < abs(before[1])-.01
+            assert core.bias == before  # Proposal is not committed before dispatch.
+        core.record_dispatch(n+100, command if matched_receipt else ZERO)
+        if not matched_receipt:
+            assert core.bias == before
+            return
+        if abs(command[2]) >= .72:
+            assert abs(command[1]) >= .20  # Support is retained, never reset to zero.
+            break
+    else:
+        pytest.fail("frozen old bias still starves the selected axis under the unchanged cap")
+
+
+@pytest.mark.parametrize("native_opposes_bias", [False, True])
+def test_joint_cap_feedback_never_charges_normal_slew_or_invents_opposing_bias(
+    settings, monkeypatch, native_opposes_bias,
+):
+    from robot_motion.rebot_b601_rs.joint_motion import B601JointMotionFrame
+
+    core = runtime(settings)
+    core.config = CoordinatedHoldingConfig(supported_soft_recovery=True, recovery_kd_nm_s_per_rad=0.)
+    warm(core)
+    core.q = core.goal = ZERO
+    core.bias = (0., .3 if native_opposes_bias else -.3, -.7, 0., 0., 0.)
+    core.last_delta = (0., -.4, -.6, 0., 0., 0.) if native_opposes_bias else ZERO
+    for i, tracker in zip(AXES, core.trackers):
+        native = -.8 if i == 1 else 0.
+        frame = B601JointMotionFrame(phase="brake", reason="target_reached_braking",
+            q_reference_rad=0., qvel_reference_rad_s=0., control_qvel_rad_s=0.,
+            position_torque_nm=native, velocity_torque_nm=0., requested_torque_nm=native)
+        monkeypatch.setattr(tracker, "update", lambda frame=frame, **kwargs: frame)
+    command, audit = core.step(sequence=12, dt=.01, permitted=True, point_search=False)
+    assert audit["saturated"] and sum(abs(v) for v in command) <= 1.+1e-9
+    assert audit["combined_cap_shortfall_nm"][1] == 0.
+    assert audit["proposed_bias_nm"][1] == core.bias[1]
+    if not native_opposes_bias:
+        assert audit["combined_cap_shortfall_nm"] == ZERO
+    core.record_dispatch(12, command)

@@ -11,18 +11,23 @@ from __future__ import annotations
 from contextlib import nullcontext
 import numpy as np
 
+import json
 import logging
+import hashlib
 import math
 import threading
 import time
 from collections import OrderedDict
 from collections.abc import Callable, Mapping
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Any
 
-from agent_gateway.protocol.contracts import AgentSkillOperation
+import numpy as np
+
 from agent_gateway.protocol._contract_validation import thaw_json
+from agent_gateway.protocol.contracts import AgentSkillOperation
 from agent_gateway.protocol.skill_catalog import (
     SkillDeploymentBindingRef,
     SkillDeploymentSafetyEnvelopeRef,
@@ -30,12 +35,12 @@ from agent_gateway.protocol.skill_catalog import (
 )
 from agent_gateway.protocol.skill_io_contracts import inline_only_skill_io_contract
 from agent_gateway.protocol.skill_registration import SkillRegistrationTemplate
+from agent_gateway.runtime.artifact_store import RecoverableAgentArtifactStore
 from agent_gateway.runtime.passive_read_executor import (
     PassiveReadResult,
     PassiveReadSkillExecutor,
 )
 from agent_gateway.runtime.payload_validation import AgentSkillPayloadValidatorSet
-from agent_gateway.runtime.artifact_store import RecoverableAgentArtifactStore
 from agent_gateway.runtime.service import AgentGatewayOperationOutcome
 from agent_gateway.skills.motion.definition import (
     execute_grasp_approach_plan_skill_definition_v1,
@@ -57,12 +62,12 @@ from dataset_contracts.grasp_rgbd_snapshot import GRASP_RGBD_SNAPSHOT_MAX_BYTES,
 from dataset_contracts.grasp_multiview_snapshot import (
     GRASP_MULTIVIEW_MAX_BYTES, GRASP_MULTIVIEW_SCHEMA_ID, decode_grasp_multiview_snapshot_arrays,
 )
+from robot_motion.coordinate_frames import CoordinateFrameGraph
 from robot_motion.grasp_visible_scene import (
     PRODUCTION_VISIBLE_GRASP_DEPTH_FILTER,
     ParallelJawSolidGeometry,
     VisibleGraspScene,
 )
-from robot_motion.coordinate_frames import CoordinateFrameGraph
 from robot_motion.rm65.captured_robot_observations import (
     RM65CapturedRobotObservationFilterResult,
 )
@@ -78,8 +83,93 @@ from teleop_runtime.skill_deploy.rm65_grasp_trajectory import (
 )
 
 from .station_point_grasp_deployment import (
-    StationBoundPointGraspRegistration, REAL_STATION_POINT_GRASP_SNAPSHOT_SLOT_ID,
+    REAL_STATION_POINT_GRASP_SNAPSHOT_SLOT_ID,
+    StationBoundPointGraspRegistration,
 )
+
+
+def _bounded_start_check_value(value: object, *, depth: int = 0,
+                               budget: list[int]) -> Any:
+    """Copy bounded finite evidence before serialization or hashing."""
+    budget[0] -= 1
+    if budget[0] < 0 or depth > 6:
+        raise ValueError("start-check evidence exceeds projection bounds")
+    if isinstance(value, np.generic):
+        value = value.item()
+    if value is None or isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        if len(value) > 512:
+            raise ValueError("start-check evidence string is too long")
+        return value
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        if not math.isfinite(value):
+            raise ValueError("start-check evidence must be finite")
+        return value
+    if isinstance(value, np.ndarray):
+        if value.size > 16 or value.ndim > 2:
+            raise ValueError("start-check evidence array is too large")
+        value = value.tolist()
+    if isinstance(value, Mapping):
+        if len(value) > 16:
+            raise ValueError("start-check evidence object is too large")
+        result = {}
+        for key, item in value.items():
+            if not isinstance(key, str) or len(key) > 128:
+                raise ValueError("start-check evidence key is invalid")
+            result[key] = _bounded_start_check_value(item, depth=depth+1, budget=budget)
+        return result
+    if isinstance(value, (list, tuple)) and len(value) <= 16:
+        return [_bounded_start_check_value(item, depth=depth+1, budget=budget) for item in value]
+    raise ValueError("start-check evidence cannot be projected")
+
+
+def _start_check_json(value: object) -> str | None:
+    """Publish a projection, never let optional diagnostics replace a refusal.
+
+    The digest covers the final projection including detail_scope, excluding
+    detail_hash itself. It is not an identity for omitted lower metadata.
+    """
+    try:
+        if not isinstance(value, Mapping):
+            return None
+        if any(not isinstance(value.get(key), bool) for key in ("safe", "collision_check_available")):
+            return None
+        projected = {key: _bounded_start_check_value(value.get(key), budget=[128]) for key in
+                     ("safe", "collision_check_available", "reason", "minimum_distance_m")}
+        if projected["reason"] is not None and not isinstance(projected["reason"], str):
+            return None
+        distance = projected["minimum_distance_m"]
+        if distance is not None and (isinstance(distance, bool) or not isinstance(distance, (int, float))):
+            return None
+        metadata = value.get("metadata")
+        if metadata is not None:
+            try:
+                if not isinstance(metadata, Mapping):
+                    raise ValueError("start-check metadata must be an object")
+                selected = {key: metadata[key] for key in (
+                    "closest_geometry_names", "closest_geometry_ids", "nearest_observed",
+                    "collision_check", "target_envelope") if key in metadata}
+                projected["metadata"] = _bounded_start_check_value(selected, budget=[128])
+                if len(selected) != len(metadata):
+                    projected["details_omitted"] = True
+            except Exception:
+                projected["details_omitted"] = True
+        projected["detail_scope"] = "published_projection"
+        for _ in range(2):
+            # Recompute after any trimming: only the final published preimage is hashed.
+            digest = canonical_content_hash(projected,
+                domain="dexteleop.grasp_start_check_projection.v1")
+            encoded = json.dumps({**projected, "detail_hash": digest}, ensure_ascii=False,
+                                 allow_nan=False, sort_keys=True, separators=(",", ":"))
+            if len(encoded) <= 2048:
+                return encoded
+            projected.pop("metadata", None)
+            projected["details_omitted"] = True
+    except Exception:
+        # Lower already decided the rejection. Encoding is optional evidence.
+        return None
+    return None
 
 
 def build_grasp_visible_scene_reader(*, artifact_store: RecoverableAgentArtifactStore,
@@ -661,10 +751,10 @@ class RealGraspApproachPlan:
     profile_hash: str
     planning_operation_id: str
     planning_request_hash: str
-    point_grasp_operation_id: str
-    point_grasp_request_hash: str
-    point_grasp_result_hash: str
-    point_grasp_candidate_hash: str
+    source_operation_id: str
+    source_request_hash: str
+    source_result_hash: str
+    source_grasp_hash: str
     source_station_revision: int
     component_id: str
     side: str
@@ -678,6 +768,7 @@ class RealGraspApproachPlan:
     created_at: float
     expires_at: float
     evidence_refs: tuple[str, ...]
+    source_kind: str = "point_grasp_candidate"
     semantic_content_hash: str = field(init=False)
 
     def __post_init__(self) -> None:
@@ -686,10 +777,10 @@ class RealGraspApproachPlan:
             "profile_hash",
             "planning_operation_id",
             "planning_request_hash",
-            "point_grasp_operation_id",
-            "point_grasp_request_hash",
-            "point_grasp_result_hash",
-            "point_grasp_candidate_hash",
+            "source_operation_id",
+            "source_request_hash",
+            "source_result_hash",
+            "source_grasp_hash",
             "component_id",
             "measured_qpos_hash",
         ):
@@ -698,6 +789,8 @@ class RealGraspApproachPlan:
                 field_name,
                 _required(getattr(self, field_name), field_name=field_name),
             )
+        if self.source_kind not in {"point_grasp_candidate", "frozen_observation_fast"}:
+            raise ValueError("Unknown grasp plan source kind.")
         side = str(self.side).strip().lower()
         if side not in {"left", "right"}:
             raise ValueError("side must be left or right.")
@@ -750,10 +843,18 @@ class RealGraspApproachPlan:
                     "profile_hash": self.profile_hash,
                     "planning_operation_id": self.planning_operation_id,
                     "planning_request_hash": self.planning_request_hash,
-                    "point_grasp_operation_id": self.point_grasp_operation_id,
-                    "point_grasp_request_hash": self.point_grasp_request_hash,
-                    "point_grasp_result_hash": self.point_grasp_result_hash,
-                    "point_grasp_candidate_hash": self.point_grasp_candidate_hash,
+                    **({
+                        "point_grasp_operation_id": self.source_operation_id,
+                        "point_grasp_request_hash": self.source_request_hash,
+                        "point_grasp_result_hash": self.source_result_hash,
+                        "point_grasp_candidate_hash": self.source_grasp_hash,
+                    } if self.source_kind == "point_grasp_candidate" else {
+                        "source_kind": self.source_kind,
+                        "source_operation_id": self.source_operation_id,
+                        "source_request_hash": self.source_request_hash,
+                        "source_result_hash": self.source_result_hash,
+                        "source_grasp_hash": self.source_grasp_hash,
+                    }),
                     "source_station_revision": self.source_station_revision,
                     "component_id": self.component_id,
                     "side": self.side,
@@ -768,7 +869,9 @@ class RealGraspApproachPlan:
                     "expires_at": expires,
                     "evidence_refs": refs,
                 },
-                domain="dexteleop.real_agent_motion.grasp_approach_plan.v1",
+                domain=("dexteleop.real_agent_motion.grasp_approach_plan.v1"
+                        if self.source_kind == "point_grasp_candidate"
+                        else "dexteleop.real_agent_motion.direct_grasp_approach_plan.v1"),
             ),
         )
 
@@ -805,7 +908,9 @@ class _StoredPlan:
 class BoundedRealGraspApproachPlanStore:
     """Bounded one-session plan store with one-operation replay fencing."""
 
-    def __init__(self, *, max_retained_plans: int) -> None:
+    def __init__(self, *, max_retained_plans: int,
+                 planning_operation_lookup: Callable[[str], AgentSkillOperation | None] | None = None,
+                 clock: Callable[[], float] | None = None) -> None:
         if (
             isinstance(max_retained_plans, bool)
             or not isinstance(max_retained_plans, int)
@@ -816,8 +921,36 @@ class BoundedRealGraspApproachPlanStore:
         self._lock = threading.RLock()
         self._plans: OrderedDict[str, _StoredPlan] = OrderedDict()
         self._closed = False
+        if planning_operation_lookup is not None and not callable(planning_operation_lookup):
+            raise TypeError("planning_operation_lookup must be callable or None.")
+        if clock is not None and not callable(clock):
+            raise TypeError("clock must be callable or None.")
+        self._planning_operation_lookup = planning_operation_lookup
+        self._clock = clock
+
+    def _fast_source_operation(self, plan: RealGraspApproachPlan) -> AgentSkillOperation | None:
+        if self._planning_operation_lookup is None:
+            return None
+        return self._planning_operation_lookup(plan.planning_operation_id)
+
+    def _fast_plan_committed(self, plan: RealGraspApproachPlan) -> bool:
+        operation = self._fast_source_operation(plan)
+        return bool(isinstance(operation, AgentSkillOperation)
+            and operation.runtime_session_id == plan.runtime_session_id
+            and operation.request_hash == plan.planning_request_hash
+            and operation.status == "completed" and operation.execution_outcome == "completed"
+            and isinstance(operation.execution_result, Mapping)
+            and operation.execution_result.get("eligible_for_execution") is True
+            and operation.execution_result.get("grasp_approach_plan_id") == plan.plan_id
+            and operation.execution_result.get("grasp_approach_plan_hash") == plan.semantic_content_hash)
 
     def _prune(self, *, now: float) -> None:
+        for plan_id, stored in tuple(self._plans.items()):
+            if stored.plan.source_kind != "frozen_observation_fast" or stored.reserved_by_operation_id is not None:
+                continue
+            operation = self._fast_source_operation(stored.plan)
+            if operation is not None and operation.terminal and not self._fast_plan_committed(stored.plan):
+                self._plans.pop(plan_id)
         expired = [
             plan_id
             for plan_id, stored in self._plans.items()
@@ -832,9 +965,19 @@ class BoundedRealGraspApproachPlanStore:
             raise TypeError("plan must be a RealGraspApproachPlan.")
         timestamp = _finite(now, field_name="now")
         with self._lock:
+            if self._clock is not None:
+                timestamp = _finite(self._clock(), field_name="clock")
             if self._closed:
                 raise RuntimeError("Grasp-approach plan store is closed.")
             self._prune(now=timestamp)
+            if plan.source_kind == "frozen_observation_fast":
+                if self._clock is None or self._planning_operation_lookup is None:
+                    raise RuntimeError("Fast plans require the authoritative operation lookup and clock.")
+                source = self._fast_source_operation(plan)
+                if source is None or (source.terminal and not self._fast_plan_committed(plan)):
+                    raise RealGraspApproachPlanLookupError("grasp_path_plan_not_committed")
+                if timestamp >= plan.expires_at or timestamp >= source.deadline_at:
+                    raise RealGraspApproachPlanLookupError("grasp_path_plan_expired")
             current = self._plans.get(plan.plan_id)
             if current is not None:
                 if current.plan.semantic_content_hash != plan.semantic_content_hash:
@@ -873,6 +1016,8 @@ class BoundedRealGraspApproachPlanStore:
         requested_operation = _required(operation_id, field_name="operation_id")
         timestamp = _finite(now, field_name="now")
         with self._lock:
+            if self._clock is not None:
+                timestamp = _finite(self._clock(), field_name="clock")
             if self._closed:
                 raise RealGraspApproachPlanLookupError("grasp_path_plan_store_closed")
             self._prune(now=timestamp)
@@ -880,6 +1025,8 @@ class BoundedRealGraspApproachPlanStore:
             if stored is None:
                 raise RealGraspApproachPlanLookupError("grasp_path_plan_not_found")
             plan = stored.plan
+            if plan.source_kind == "frozen_observation_fast" and not self._fast_plan_committed(plan):
+                raise RealGraspApproachPlanLookupError("grasp_path_plan_not_committed")
             if (
                 requested_hash != plan.semantic_content_hash
                 or requested_id != plan.plan_id
@@ -1130,15 +1277,31 @@ class RealGraspApproachPlanProvider:
             "envelope_projection_subject",
             "maximum_path_envelope_ingress_distance_m",
             "path_envelope_ingress_distance_excess_m",
+            "planning_phase",
+            "target_collision_points",
+            "background_collision_points",
+            "terminal_target_contact_points",
+            "terminal_contact_allowed",
+            "path_gripper_proxy_padding_m",
+            "terminal_position_error_m",
+            "terminal_orientation_error_deg",
         ):
             if field_name in details:
                 value = details[field_name]
+                if value is None:
+                    continue
                 diagnostics[field_name] = (
                     list(value) if field_name == "modified_sides" else value
                 )
         path = details.get("path")
         if isinstance(path, Mapping) and isinstance(path.get("status"), str):
             diagnostics["path_status"] = path["status"]
+        source = details.get("start_qpos_source")
+        if isinstance(source, str) and source in {"input_qpos", "envelope_ingress_endpoint"}:
+            diagnostics["start_qpos_source"] = source
+        encoded_start_check = _start_check_json(details.get("start_check"))
+        if encoded_start_check is not None:
+            diagnostics["start_check_json"] = encoded_start_check
         return diagnostics
 
     def _base_result(
@@ -1207,6 +1370,51 @@ class RealGraspApproachPlanProvider:
             "execution_requires_explicit_motion_skill": True,
             "motion_or_hold_performed": False,
         }
+
+    def prepare_plan(self, *, request, operation, source_operation, source_result,
+                     grasp, trajectory, qpos_cut, target_reference, target_execution,
+                     speed_scale, frame_resolution_hash,
+                     source_kind="point_grasp_candidate"):
+        """Share post-plan admission and immutable identity, never execution.
+
+        Direct planning names its actual frozen observation operation. Callers
+        validate their public result before putting the plan in the one store
+        consumed by the existing execution Skill.
+        """
+        if not isinstance(trajectory, RealAgentJointTrajectory):
+            raise TypeError("RM65 planner returned an invalid trajectory type.")
+        latest, now, problem = self._postplan_measured_qpos()
+        reason = None if problem is None else "grasp_path_postplan_measured_qpos_" + problem
+        if reason is None and any(
+            np.max(np.abs(np.asarray(latest.qpos_by_side[side])
+                          - trajectory.qpos_by_side[side][0]))
+            > REAL_AGENT_TRAJECTORY_START_MAX_DRIFT_RAD for side in ("left", "right")
+        ):
+            reason = "grasp_path_start_state_drift"
+        if reason is None and self._current_station_revision() != request.expected_station_revision:
+            reason = "grasp_path_station_revision_changed"
+        if reason is not None:
+            return None, latest, now, reason
+        profile = self.registration.profile
+        plan = RealGraspApproachPlan(
+            runtime_session_id=self.runtime_session_id, profile_hash=profile.semantic_content_hash,
+            planning_operation_id=operation.operation_id, planning_request_hash=request.semantic_content_hash,
+            source_operation_id=source_operation.operation_id, source_request_hash=source_operation.request_hash,
+            source_result_hash=canonical_content_hash(
+                source_result, domain="dexteleop.agent_gateway.passive_read_result.v1"),
+            source_grasp_hash=canonical_content_hash(
+                grasp, domain="dexteleop.agent_skill.station_point_grasp_candidate.v2"),
+            source_kind=source_kind, source_station_revision=request.expected_station_revision,
+            component_id=profile.component_id, side=profile.side,
+            target_pose_reference=_immutable_pose(target_reference, field_name="target_reference"),
+            target_pose_execution=_immutable_pose(target_execution, field_name="target_execution"),
+            speed_scale=speed_scale, measured_qpos_revision=qpos_cut.revision,
+            measured_qpos_hash=qpos_cut.semantic_content_hash, measured_qpos_at=qpos_cut.measured_at,
+            trajectory=trajectory, created_at=now, expires_at=now + profile.plan_ttl_sec,
+            evidence_refs=tuple(sorted({*source_operation.execution_receipt_refs,
+                *qpos_cut.evidence_refs, *latest.evidence_refs, *trajectory.evidence_refs,
+                "grasp-approach-frame-resolution:" + frame_resolution_hash})))
+        return plan, latest, now, None
 
     def _rejected_result(
         self,
@@ -1376,7 +1584,12 @@ class RealGraspApproachPlanProvider:
             )
         if not isinstance(trajectory, RealAgentJointTrajectory):
             raise TypeError("RM65 planner returned an invalid trajectory type.")
-        latest_qpos, now, post_problem = self._postplan_measured_qpos()
+        plan, latest_qpos, now, post_problem = self.prepare_plan(
+            request=request, operation=operation, source_operation=source_operation,
+            source_result=source_result, grasp=candidate, trajectory=trajectory,
+            qpos_cut=qpos_cut, target_reference=target_reference,
+            target_execution=target_execution, speed_scale=speed_scale,
+            frame_resolution_hash=resolution.semantic_content_hash)
         if post_problem is not None:
             failed_base = self._base_result(
                 source_operation=source_operation,
@@ -1393,98 +1606,12 @@ class RealGraspApproachPlanProvider:
             return (
                 self._rejected_result(
                     base=failed_base,
-                    reason_code="grasp_path_postplan_measured_qpos_" + post_problem,
+                    reason_code=post_problem,
                 ),
                 None,
             )
-        assert latest_qpos is not None
-        if any(
-            max(
-                abs(float(current) - float(planned))
-                for current, planned in zip(
-                    latest_qpos.qpos_by_side[arm_side],
-                    trajectory.qpos_by_side[arm_side][0],
-                    strict=True,
-                )
-            )
-            > REAL_AGENT_TRAJECTORY_START_MAX_DRIFT_RAD
-            for arm_side in ("left", "right")
-        ):
-            failed_base = self._base_result(
-                source_operation=source_operation,
-                source_result=source_result,
-                candidate=candidate,
-                ordinal=ordinal,
-                speed_scale=speed_scale,
-                target_reference=target_reference,
-                target_execution=target_execution,
-                qpos_cut=latest_qpos,
-                now=now,
-                planner_evidence_refs=trajectory.evidence_refs,
-            )
-            return (
-                self._rejected_result(
-                    base=failed_base,
-                    reason_code="grasp_path_start_state_drift",
-                ),
-                None,
-            )
-        if self._current_station_revision() != expected_revision:
-            failed_base = self._base_result(
-                source_operation=source_operation,
-                source_result=source_result,
-                candidate=candidate,
-                ordinal=ordinal,
-                speed_scale=speed_scale,
-                target_reference=target_reference,
-                target_execution=target_execution,
-                qpos_cut=latest_qpos,
-                now=now,
-                planner_evidence_refs=trajectory.evidence_refs,
-            )
-            return (
-                self._rejected_result(
-                    base=failed_base,
-                    reason_code="grasp_path_station_revision_changed",
-                ),
-                None,
-            )
-        created_at = now
-        expires_at = created_at + profile.plan_ttl_sec
-        plan = RealGraspApproachPlan(
-            runtime_session_id=self.runtime_session_id,
-            profile_hash=profile.semantic_content_hash,
-            planning_operation_id=operation.operation_id,
-            planning_request_hash=request.semantic_content_hash,
-            point_grasp_operation_id=source_operation.operation_id,
-            point_grasp_request_hash=source_operation.request_hash,
-            point_grasp_result_hash=base["point_grasp_result_hash"],
-            point_grasp_candidate_hash=base["point_grasp_candidate_hash"],
-            source_station_revision=expected_revision,
-            component_id=profile.component_id,
-            side=profile.side,
-            target_pose_reference=target_reference,
-            target_pose_execution=target_execution,
-            speed_scale=speed_scale,
-            measured_qpos_revision=qpos_cut.revision,
-            measured_qpos_hash=qpos_cut.semantic_content_hash,
-            measured_qpos_at=qpos_cut.measured_at,
-            trajectory=trajectory,
-            created_at=created_at,
-            expires_at=expires_at,
-            evidence_refs=tuple(
-                sorted(
-                    {
-                        *source_evidence,
-                        *qpos_cut.evidence_refs,
-                        *latest_qpos.evidence_refs,
-                        *trajectory.evidence_refs,
-                        "grasp-approach-frame-resolution:"
-                        + resolution.semantic_content_hash,
-                    }
-                )
-            ),
-        )
+        assert plan is not None
+        created_at, expires_at = plan.created_at, plan.expires_at
         # Keep the reported age tied to admission of the exact qpos cut used
         # to construct the path.  Recomputing it at completion made this field
         # grow by the entire planning duration even though the post-plan fresh

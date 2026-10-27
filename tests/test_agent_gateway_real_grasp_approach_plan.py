@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from dataclasses import replace
 from types import SimpleNamespace
 
@@ -113,7 +114,8 @@ def _no_op_point_grasp_validator(
 
 def _planning_fixture(
     *, planner, execution_operation_timeout_sec=DEFAULT_REAL_GRASP_EXECUTION_OPERATION_TIMEOUT_SEC,
-    finger_exchange=False,
+    finger_exchange=False, frozen_observation=False,
+    plan_store_clock=None, planning_operation_lookup=None,
 ):
     from robot_motion.grasp_visible_scene import VisibleGraspScene, ParallelJawSolidGeometry
     # Explicit geometry fixture: route tests exercise control/plan lifecycles,
@@ -166,6 +168,7 @@ def _planning_fixture(
         execution_manifest_hash="execution-manifest:grasp-plan-test",
         current_mode="real_active",
         finger_exchange=finger_exchange,
+        frozen_observation=frozen_observation,
         arm_reachability_profile=(StationPointGraspArmReachabilityProfile(arm_side="right",
             evaluator_profile_id="fixture:reachability", evaluator_profile_hash="fixture:reachability-hash",
             solver_reference_frame_id=execution_frame.frame_id,
@@ -260,7 +263,8 @@ def _planning_fixture(
         available_at=10.0,
         source_evidence_refs=("measured-qpos:grasp-plan-test",),
     )
-    store = BoundedRealGraspApproachPlanStore(max_retained_plans=4)
+    store = BoundedRealGraspApproachPlanStore(max_retained_plans=4,
+        clock=plan_store_clock, planning_operation_lookup=planning_operation_lookup)
     provider = RealGraspApproachPlanProvider(
         registration=registration,
         point_grasp_registration=point_grasp,
@@ -770,3 +774,289 @@ def test_plan_store_close_revokes_retained_plan(stored_plan) -> None:
         store.consume(plan_id=plan.plan_id, operation_id=reservation["operation_id"])
     with pytest.raises(RuntimeError, match="Grasp-approach plan store is closed"):
         store.put(plan, now=reservation["now"])
+
+
+@pytest.mark.parametrize("source", ("input_qpos", "envelope_ingress_endpoint"))
+def test_start_rejection_preserves_composed_cause_without_claiming_physical_fcl_contact(source):
+    details = {"planning_phase": "pregrasp_target", "start_qpos_source": source,
+        "start_check": {"safe": False, "collision_check_available": True,
+            "minimum_distance_m": .01, "reason": "path_target_safety_envelope_blocked",
+            "metadata": {"closest_geometry_names": ["right_hand_proxy_0", "observed_voxels"],
+                "nearest_observed": {"geometry_name": "right_hand_proxy_0",
+                    "occupied_center_world_m": [.1, .2, .3]}}}}
+    def planner(**_):
+        raise RM65GraspTrajectoryPlanningError("path_start_collision_blocked", details=details)
+    registration, provider, _, port, request, operation = _planning_fixture(planner=planner)
+    result, plan = provider.plan_request(request, operation)
+    assert plan is None and port.snapshot().dispatch_count == 0
+    diagnostics = result["diagnostics"]
+    assert diagnostics["start_qpos_source"] == source
+    check = json.loads(diagnostics["start_check_json"])
+    assert check["reason"] == "path_target_safety_envelope_blocked"
+    assert len(check["detail_hash"]) == 64
+    registration.payload_validator.validate_execution_result(result)
+    for invalid in ("", "[]", "x"*2049):
+        changed = {**result, "diagnostics": {**diagnostics, "start_check_json": invalid}}
+        with pytest.raises(ValueError):
+            registration.payload_validator.validate_execution_result(changed)
+
+
+
+def _start_rejection_result(*, start_check=None, source="input_qpos"):
+    def planner(**_):
+        raise RM65GraspTrajectoryPlanningError("path_start_collision_blocked", details={
+            "start_qpos_source": source, "path": {"status": "start_blocked"},
+            "start_check": start_check if start_check is not None else {
+                "safe": False, "collision_check_available": True,
+                "minimum_distance_m": .01, "reason": "path_target_safety_envelope_blocked",
+                "metadata": {"collision_check": {"safe": True, "collision_check_available": True,
+                    "minimum_distance_m": .01, "reason": None, "metadata": {}},
+                    "target_envelope": {"constraint": "fixture_envelope"}}}})
+    registration, provider, store, port, request, operation = _planning_fixture(planner=planner)
+    result, plan = provider.plan_request(request, operation)
+    assert plan is None
+    assert result["planning_status"] == "rejected"
+    assert result["reason_code"] == "path_start_collision_blocked"
+    assert result["eligible_for_execution"] is False
+    assert result["grasp_approach_plan_id"] is None
+    assert result["motion_or_hold_performed"] is False
+    assert result["diagnostics"]["path_status"] == "start_blocked"
+    assert port.snapshot().phase == RealAgentMotionPhase.INACTIVE
+    assert port.snapshot().dispatch_count == 0
+    registration.payload_validator.validate_execution_result(result)
+    return registration, result
+
+
+def test_start_projection_retains_composed_cause_and_hashes_exact_published_preimage():
+    from dataset_contracts.canonical_encoding import canonical_content_hash
+    _, result = _start_rejection_result()
+    projected = json.loads(result["diagnostics"]["start_check_json"])
+    digest = projected.pop("detail_hash")
+    assert projected["detail_scope"] == "published_projection"
+    assert projected["metadata"]["collision_check"]["safe"] is True
+    assert projected["metadata"]["target_envelope"]["constraint"] == "fixture_envelope"
+    assert digest == canonical_content_hash(projected, domain="dexteleop.grasp_start_check_projection.v1")
+
+
+def test_start_projection_copies_bounded_numpy_metadata_scalars_and_array():
+    _, result = _start_rejection_result(start_check={"safe": False,
+        "collision_check_available": True, "minimum_distance_m": -.001,
+        "reason": "fixture_collision", "metadata": {"nearest_observed": {
+            "present": np.bool_(True), "distance_m": np.float64(.01),
+            "occupied_center_world_m": np.array([.1, .2, .3])}}})
+    projected = json.loads(result["diagnostics"]["start_check_json"])
+    assert projected["metadata"]["nearest_observed"] == {
+        "present": True, "distance_m": .01, "occupied_center_world_m": [.1, .2, .3]}
+    assert "details_omitted" not in projected
+
+
+@pytest.mark.parametrize("metadata", (
+    {"nearest_observed": {"note": "x" * 513}},
+    {"target_envelope": {"values": list(range(17))}},
+    {"target_envelope": {"bad": float("nan")}},
+    {"target_envelope": {"bad": object()}},
+    {"target_envelope": {"a": {"b": {"c": {"d": {"e": {"f": {"g": 0}}}}}}}},
+    {"nearest_observed": {str(i): "x" * 500 for i in range(6)}},
+))
+def test_defensive_start_projection_trims_unrepresentable_metadata_without_losing_refusal(metadata):
+    # Direct malformed-error injection is defensive; typed production path checks
+    # already require finite distance and canonical path metadata.
+    from dataset_contracts.canonical_encoding import canonical_content_hash
+    _, result = _start_rejection_result(start_check={"safe": False,
+        "collision_check_available": True, "minimum_distance_m": -.001,
+        "reason": "fixture_collision", "metadata": metadata})
+    encoded = result["diagnostics"]["start_check_json"]
+    assert len(encoded) <= 2048
+    projected = json.loads(encoded)
+    digest = projected.pop("detail_hash")
+    assert projected["details_omitted"] is True
+    assert "metadata" not in projected
+    assert projected["reason"] == "fixture_collision"
+    assert digest == canonical_content_hash(projected, domain="dexteleop.grasp_start_check_projection.v1")
+
+
+@pytest.mark.parametrize("field,value", (("minimum_distance_m", float("inf")),
+    ("minimum_distance_m", True), ("reason", object()), ("safe", "false")))
+def test_defensive_invalid_start_core_omits_optional_json_and_preserves_refusal(field, value):
+    check = {"safe": False, "collision_check_available": True,
+             "minimum_distance_m": .01, "reason": "fixture_collision"}
+    check[field] = value
+    _, result = _start_rejection_result(start_check=check)
+    assert "start_check_json" not in result["diagnostics"]
+    assert result["diagnostics"]["start_qpos_source"] == "input_qpos"
+
+
+@pytest.mark.parametrize("failure", ("hash", "encode"))
+def test_start_diagnostic_encoder_failure_cannot_mask_lower_refusal(monkeypatch, failure):
+    import agent_gateway.profiles.real.grasp_approach_plan as module
+    original_hash = module.canonical_content_hash
+    hash_calls, encode_calls = [], []
+    def hashed(value, *, domain):
+        if domain == "dexteleop.grasp_start_check_projection.v1":
+            hash_calls.append(domain)
+            if failure == "hash":
+                raise ValueError("fixture diagnostic hash failure")
+        return original_hash(value, domain=domain)
+    def encode(*_, **__):
+        encode_calls.append("encode")
+        raise ValueError("fixture diagnostic encoding failure")
+    monkeypatch.setattr(module, "canonical_content_hash", hashed)
+    if failure == "encode":
+        # Replace only the provider reference, keeping canonical encoding's
+        # stdlib json.dumps intact so this reaches the post-hash failure.
+        monkeypatch.setattr(module, "json", SimpleNamespace(dumps=encode))
+    _, result = _start_rejection_result()
+    assert result["diagnostics"] == {"path_status": "start_blocked", "start_qpos_source": "input_qpos"}
+    assert len(hash_calls) == 1
+    assert encode_calls == (["encode"] if failure == "encode" else [])
+
+
+@pytest.mark.parametrize("encoded", ("", "[]", "null", "0", "{", "x" * 2049,
+    '{"x":NaN}', '{"x":Infinity}', '{"x":-Infinity}', '{"x":1e400}',
+    '{"x":-1e400}', '{"x":' + '[' * 1000 + '0' + ']' * 1000 + '}'))
+def test_start_check_json_validator_rejects_invalid_nonfinite_or_deep_payload(encoded):
+    registration, result = _start_rejection_result()
+    changed = {**result, "diagnostics": {**result["diagnostics"], "start_check_json": encoded}}
+    with pytest.raises(ValueError):
+        registration.payload_validator.validate_execution_result(changed)
+
+
+@pytest.mark.parametrize("character", ("x", "\u4e2d"))
+def test_start_check_json_limit_counts_decoded_unicode_characters(character):
+    registration, result = _start_rejection_result()
+    for length in (2048, 2049):
+        encoded = json.dumps({"x": character * (length-8)}, ensure_ascii=False, separators=(",", ":"))
+        assert len(encoded) == length
+        changed = {**result, "diagnostics": {**result["diagnostics"], "start_check_json": encoded}}
+        if length == 2048:
+            registration.payload_validator.validate_execution_result(changed)
+        else:
+            with pytest.raises(ValueError):
+                registration.payload_validator.validate_execution_result(changed)
+
+
+@pytest.mark.parametrize("source", ("measured", "", None, [], 1))
+def test_start_source_validator_rejects_unknown_or_untyped_provenance(source):
+    registration, result = _start_rejection_result()
+    changed = {**result, "diagnostics": {**result["diagnostics"], "start_qpos_source": source}}
+    with pytest.raises(ValueError):
+        registration.payload_validator.validate_execution_result(changed)
+
+
+def test_grasp_start_diagnostic_contract_migration_requires_fresh_result_and_route_binding():
+    from copy import deepcopy
+    from agent_gateway.protocol._contract_validation import thaw_json
+    from agent_gateway.protocol.skill_catalog import agent_skill_schema_document_hash
+    registration, result = _start_rejection_result()
+    schema = registration.skill.schema_entry
+    current = thaw_json(schema.execution_result_schema)
+    old = deepcopy(current)
+    added_failure_fields = {
+        "planning_phase", "target_collision_points", "background_collision_points",
+        "terminal_target_contact_points", "terminal_contact_allowed",
+        "path_gripper_proxy_padding_m", "terminal_position_error_m", "terminal_orientation_error_deg",
+    }
+    for field in added_failure_fields:
+        del old["properties"]["diagnostics"]["properties"][field]
+    for field in ("start_qpos_source", "start_check_json"):
+        del old["properties"]["diagnostics"]["properties"][field]
+    old_hash = agent_skill_schema_document_hash(old, schema_kind="execution_result")
+    assert old_hash == "0096762d790e2a0c4ea53c1a661f0f7a413ea1c7f07936a6f707c87219216c7a"
+    route = registration.skill.routes[0]
+    assert route.execution_result_schema_hash == schema.execution_result_schema_hash != old_hash
+    assert route.parameter_schema_hash == "9a3bc2e0194bb578ea1b5e15b3b551de69e21d438028e49ddad01b8bf7963a93"
+    assert route.skill_definition_hash == "ecea8e7b2bd9b436131c050c4e740ddcfe479782020e243594a49985a2c1bded"
+    assert route.skill_io_contract_hash != "c023e278a7fdb8910ad6e78b11ed02a2d5ebe533e0af61f70302a3fd380aeaf9"
+    assert registration.binding.route_hash != "a595af276440972ef11b5a9c057091a78a88891e81f1fd11154e430ff9e2d5b7"
+    assert route.control_effect_class == "read_only" and route.privilege_tier == "t0_read_only"
+    assert not route.may_move_robot and not route.may_open_publication
+    assert registration.binding.route_hash == route.semantic_content_hash
+    registration.payload_validator.validate_execution_result(result)
+    # Freeze the old strict diagnostic gate without introducing a second
+    # schema engine dependency. Its closed property set forbids the new keys.
+    old_diagnostics = old["properties"]["diagnostics"]
+    assert old_diagnostics["additionalProperties"] is False
+    original_start_diagnostics = {
+        key: value for key, value in result["diagnostics"].items()
+        if key not in added_failure_fields
+    }
+    assert set(original_start_diagnostics) - set(old_diagnostics["properties"]) == {
+        "start_qpos_source", "start_check_json"}
+    legacy_result = {**result, "diagnostics": {"path_status": "start_blocked"}}
+    assert not set(legacy_result["diagnostics"]) - set(old_diagnostics["properties"])
+    registration.payload_validator.validate_execution_result(legacy_result)
+    # The separately authorized execution contract retains its old hashes.
+    execute = registration.execute_skill.routes[0]
+    assert execute.execution_result_schema_hash == "528c66fcead63efdf3ec16d4eda7545cef32104e68ec6720d712d11f6f2440b1"
+    assert execute.skill_io_contract_hash == "9f5af1fa1e28933cd5dbcd47e92035ef95566098550c7e3a949c23669bb215f7"
+
+
+
+
+def test_approach_rejection_retains_unpublished_details_in_logs(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    def planner(**_kwargs):
+        raise RM65GraspTrajectoryPlanningError(
+            "approach_lateral_deviation",
+            details={
+                "segment_index": 2,
+                "edge_sample_index": 4,
+                "lateral_error_m": 0.0034,
+                "maximum_lateral_error_m": 0.002,
+            },
+        )
+
+    registration, provider, _store, port, request, operation = _planning_fixture(
+        planner=planner
+    )
+
+    result, plan = provider.plan_request(request, operation)
+
+    assert plan is None
+    assert result["reason_code"] == "approach_lateral_deviation"
+    assert result["diagnostics"] == {"segment_index": 2, "edge_sample_index": 4}
+    assert "lateral_error_m" in caplog.text
+    assert "0.0034" in caplog.text
+    registration.payload_validator.validate_execution_result(result)
+    assert port.snapshot().phase == RealAgentMotionPhase.INACTIVE
+    assert port.snapshot().dispatch_count == 0
+
+
+def test_missing_collision_pose_metrics_do_not_invalidate_the_rejection():
+    error = RM65GraspTrajectoryPlanningError("visible_gripper_path_collision", details={
+        "planning_phase": "visible_scene_dense_revalidation", "target_collision_points": 1,
+        "background_collision_points": 0, "terminal_position_error_m": None,
+        "terminal_orientation_error_deg": None,
+    })
+    assert RealGraspApproachPlanProvider._diagnostics(error) == {
+        "planning_phase": "visible_scene_dense_revalidation", "target_collision_points": 1,
+        "background_collision_points": 0,
+    }
+
+
+@pytest.mark.parametrize("field,invalid", [
+    (None, None), ("target_collision_points", True), ("background_collision_points", -1),
+    ("terminal_contact_allowed", 1), ("path_gripper_proxy_padding_m", float("nan")),
+    ("terminal_position_error_m", -1), ("terminal_orientation_error_deg", 181),
+    ("planning_phase", ""),
+])
+def test_visible_collision_rejection_publishes_bounded_evidence_without_motion(field, invalid):
+    details = {
+        "planning_phase": "visible_scene_dense_revalidation", "target_collision_points": 1,
+        "background_collision_points": 0, "terminal_target_contact_points": 0,
+        "terminal_contact_allowed": False, "path_gripper_proxy_padding_m": .003,
+        "terminal_position_error_m": .0184, "terminal_orientation_error_deg": .001,
+    }
+    def planner(**_kwargs):
+        raise RM65GraspTrajectoryPlanningError("visible_gripper_path_collision", details=details)
+    registration, provider, _, port, request, operation = _planning_fixture(planner=planner)
+    result, plan = provider.plan_request(request, operation)
+    assert plan is None and not result["motion_or_hold_performed"]
+    assert result["diagnostics"] == details
+    assert port.snapshot().dispatch_count == 0
+    registration.payload_validator.validate_execution_result(result)
+    if field is not None:
+        result["diagnostics"][field] = invalid
+        with pytest.raises((TypeError, ValueError)):
+            registration.payload_validator.validate_execution_result(result)

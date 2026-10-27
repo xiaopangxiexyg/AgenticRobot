@@ -179,6 +179,33 @@ python -m control_station.b601_torque_console.report --run-dir /path/to/b601-own
 translation/rotation 收敛，并记录 force/torque clip、joint torque/slew、qvel/qacc 和
 driver fault。该 ideal-effort 结果只验证控制数学与稳定趋势，不映射为真机力值或手感。
 
+## Type-24 control-feedback cache compatibility
+
+The low-gain probe's existing active-report control path requests
+`poll_feedback(require_host_freshness=True, prefer_active_report=True)`.
+When MotorBridge advertises `active_report_observation_v1`, this selects
+`robstride_get_active_report_observation()` so Type-2 command replies cannot
+overwrite the selected Type-24 observation. An advertised dedicated getter
+that is missing, raises, returns no observation or returns stale data is
+rejected; generic replies cannot rescue it. The existing admission owner still
+requires complete, fresh Type-24 observations for all six joints and advancing
+receive sequences. Host receive age is not a device-source timestamp.
+
+The pinned MotorBridge gitlink remains
+`93a6b4c21f3f4252e935dfbd5f0d42dd06e06424`. Without the advertised capability,
+the same preference uses the older generic observation API and retains the
+original strict Type-24 gate. This compatibility path does not isolate Type-24
+from intervening Type-2 replies on an older SDK. Ordinary host-fresh callers
+that omit the preference retain the generic newest-status contract.
+
+This batch imports no controller tuning, profile defaults or new hardware
+entrypoints. The dedicated SDK implementation, its distributable Git object
+and reproducible ABI build remain a separate integration step. Offline fake
+SDK checks establish selection and rejection behavior only; they establish
+neither hardware acceptance nor a control-loop frequency claim. The source
+feedback-retry diagnostics depend on an additional probe refactor and remain
+outside this compatibility batch until that dependency is reviewed.
+
 ## 频率指标契约
 
 频率不能从一条混合 CAN 计数推断。`hardware.rebot_b601_rs.frequency.FrequencyLedger`
@@ -886,6 +913,11 @@ GUI 应选择「J2/J3 位姿采集」，不是「固定位置」或另一项 20�
 
 ### 近零 J2/J3 双向多速度连续辨识（显式候选）
 
+现有 `b601_j2_j3_coverage_support_v1.json` 及程序默认参数保持不变。新参数另存为
+[b601_j2_j3_coverage_support_v2.json](profiles/b601_j2_j3_coverage_support_v2.json)，只有显式传入该 profile 才启用；
+`motion_max_reference_lag_rad=0.02925` 不替代原 motion 默认 `0.013 rad`。
+连续辨识同样须显式传入下面的 v2 profile，默认不采集、不拟合、不应用候选。
+
 运动拟合还需核对所选关节 native tracker 的阶段：外层 console 为 `track` 不代表内部
 仍在巡航。已记录 native axes 时，只接纳所选轴 `track/bounded_reference_tracking` 的
 区间；端点 `target_reached_braking`、到位调整及其他阶段记为
@@ -1130,7 +1162,7 @@ J3 完成 9/14；第 10 段超时后复用原软停止回位，六轴原位、�
 另有显式声明的量化编码器、位置相关摩擦、重力残差和 motor-local 阻尼的合成动力学
 对照；它用来检查反馈方向与限幅，不代表已经辨识或验证真机惯量、摩擦和力矩精度。
 
-`b601_j2_j3_continuous_identification_v1.json` 复用相同的 workspace controller、
+[b601_j2_j3_continuous_identification_v2.json](profiles/b601_j2_j3_continuous_identification_v2.json) 复用相同的 workspace controller、
 六轴 owner、协调支撑、派发回执和逐轴回位，不替代原 `detailed`／`coverage` 保持搜索。
 其 `workspace.holding_sampling_plan=identification` 只改变采样目的：
 
@@ -1988,3 +2020,39 @@ MotorBridge 线程安全契约时并发调用同一个 controller。
 bitrate、操作者/观察者、唯一 owner、每 event 的统计、每关节状态/命令/错误、限幅、
 watchdog/fault transition、物理急停和 cleanup 结果。每个阶段标记为 `NOT_RUN`、`FAIL`
 或 `HARDWARE_PASS`；`OFFLINE_PASS` 只能描述 P0，不得升级为真机结论。
+
+## Type-24 反馈读取诊断与离线集成边界（2026-10-19）
+
+当前 low-gain probe 在 `active-report` 路径的每次逻辑读取中，记录
+`feedback_read_diagnostics`：`backend_poll`、`host_freshness_admission`、
+`baseline_not_advanced` 三类拒绝计数、首次及末次拒绝原因（各最多 400 字符）、
+未推进次数及可重试异常次数。每次读取只保存首末两个原因；连续重试不保留异常或 traceback。
+此有界性指单个快照；既有 `samples` 总量仍随采样数量增长。
+
+主路径固定 `measure_intervals=false`，`interval_semantics=not_collected`，
+耗时值为 `null`；不构造 interval timer，不增加诊断时钟读取。计数仍有少量分配和 CPU 开销，
+不能据此声称频率改善。计数只观察现有请求、准入和重试，不是新的 freshness 或调度依据。
+warmup 仍为原外层预算下的单次 poll，随后读取仍使用原反馈超时及 1 ms retry wait；
+Type-24 preference、六关节 host freshness 与序号推进门不变。
+
+成功样本携带该样本读取的快照；成功结果顶层携带最近一次读取（可能发生在 cleanup）的快照。
+失败时在 cleanup 前冻结最近一次逻辑读取的诊断，通过原错误包装送到 CLI `ERROR` JSON，
+避免保护保持的后续读取覆盖主故障证据。连接失败或首次读取之前失败时允许无该字段；
+parameter 路径维持原输出，不增加此字段。错误文本、cause、退出码和清理顺序保持原语义。
+
+本次仅吸收固定来源 `4f9e3390fe129f58d5d810b9421d11f48c7b8ee2` 的小范围反馈辅助逻辑，
+适配当前主线的输出与 Type-24 preference；未接入完整 dynamics trace、GC observer、反馈
+cadence floor、调参默认值或 vendor gitlink 更新。离线通过不等于实机验收，仍需由硬件阶段
+验证总线、六关节帧连续推进、停止与保护保持以及目标频率。
+
+### 联合限幅与保留偏置记账
+
+一轴已经到位时，保留的较大起步／支撑偏置仍可在静摩擦区间内维持不动；若只冻结积分
+增长，内部偏置会继续请求已被 L1 限幅削去的量，另一轴可能长时间得不到驱动额度。
+显式电机本地阻尼、非固定力探针的联合到位／重新到位路径，将联合限幅本身造成的
+发送差额反馈到偏置：对同一原始需求使用同一变化率规则计算未联合限幅命令，与最终
+联合命令相减。普通减速、到位撤力和变化率限制不会再次记账；差额只撤销已有偏置
+方向上的未实现量，不生成反向偏置。积分增长仅能保留本次命令中已经实现的部分。
+新偏置仍要等完整且精确匹配的 owner 回执才提交；固定力观察、真正制动、许可撤销
+和已有非电机本地阻尼路径保持原行为。`combined_cap_shortfall_nm` 是软件命令诊断，
+不是实测力矩。联合上限、各轴限幅、变化率、速度／位移保护和有限预算均未改变。

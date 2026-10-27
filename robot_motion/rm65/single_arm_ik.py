@@ -1,10 +1,14 @@
 from __future__ import annotations
 
-from pathlib import Path
 import time
+from collections.abc import Callable
+from pathlib import Path
 
 import numpy as np
 from scipy.spatial.transform import Rotation as R
+
+from robot_motion.rm65.assets import require_asset_path
+from robot_motion.transforms import validate_pose_matrix
 
 from .ik_tuning import (
     RM65IKTuningConfig,
@@ -12,7 +16,10 @@ from .ik_tuning import (
     load_ik_tuning_config,
     weighted_joint_distance_score,
 )
-from robot_motion.rm65.assets import require_asset_path
+
+
+class BoundedIKNumericalError(RuntimeError):
+    """A query's FK/residual was non-finite; no candidate may be admitted."""
 
 
 def _to_pose_matrix(pose: np.ndarray) -> np.ndarray:
@@ -120,16 +127,24 @@ class SingleArmIKSolver:
         current_qpos: np.ndarray,
         max_joint_step: float | np.ndarray = 0.05,
         damping: float = 0.1,
+        eef_from_controlled_frame: np.ndarray | None = None,
     ) -> np.ndarray:
         target_pose = _to_pose_matrix(target_pose)
         current_qpos = np.asarray(current_qpos, dtype=float)
 
-        current_pose = self.compute_pose(current_qpos)
+        if eef_from_controlled_frame is None:
+            current_pose = self.compute_pose(current_qpos)
+            jacobian = None
+        else:
+            current_pose, jacobian = self._controlled_kinematics(
+                current_qpos, eef_from_controlled_frame
+            )
         pos_err = target_pose[:3, 3] - current_pose[:3, 3]
         rot_err = self.pin.log3(target_pose[:3, :3] @ current_pose[:3, :3].T)
         error = np.concatenate([pos_err, rot_err])
 
-        jacobian = self.compute_jacobian(current_qpos)
+        if jacobian is None:
+            jacobian = self.compute_jacobian(current_qpos)
         weighting = np.diag(
             [
                 self._position_weight,
@@ -154,6 +169,20 @@ class SingleArmIKSolver:
         target_qpos = current_qpos + np.clip(joint_update, -max_joint_step, max_joint_step)
         return np.clip(target_qpos, self.q_min, self.q_max)
 
+    def _controlled_kinematics(
+        self, qpos: np.ndarray, eef_from_controlled_frame: np.ndarray | None
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Shift the LWA linear Jacobian to the calibrated controlled origin."""
+        endpoint = self.compute_pose(qpos)
+        jacobian = self.compute_jacobian(qpos)
+        if eef_from_controlled_frame is None:
+            return endpoint, jacobian
+        displacement = endpoint[:3, :3] @ eef_from_controlled_frame[:3, 3]
+        jacobian = jacobian.copy()
+        # Pinocchio LWA stacks world-expressed linear then angular velocity.
+        jacobian[:3] += np.cross(jacobian[3:].T, displacement).T
+        return endpoint @ eef_from_controlled_frame, jacobian
+
     def solve_iterative(
         self,
         target_pose: np.ndarray,
@@ -164,8 +193,22 @@ class SingleArmIKSolver:
         tolerance: float = 1e-4,
         deadline_monotonic: float | None = None,
         max_wall_time_sec: float | None = None,
+        check_cancelled: Callable[[], None] | None = None,
+        eef_from_controlled_frame: np.ndarray | None = None,
     ) -> np.ndarray:
+        """Solve in the EEF frame, or an explicit rigid child controlled frame.
+
+        The optional transform changes both residual and Jacobian origins. It
+        does not alter the URDF, calibration, branch selection or joint limits.
+        Existing callers without a transform retain endpoint-space semantics.
+        """
         target_pose = _to_pose_matrix(target_pose)
+        if eef_from_controlled_frame is not None:
+            offset = np.asarray(eef_from_controlled_frame, dtype=float)
+            valid, reason = validate_pose_matrix(offset)
+            if offset.shape != (4, 4) or not valid:
+                raise ValueError(f"eef_from_controlled_frame must be a rigid 4x4 transform: {reason}")
+            eef_from_controlled_frame = offset.copy()
         start_time = time.perf_counter()
         deadline = _solver_deadline(
             started_at=start_time,
@@ -183,10 +226,14 @@ class SingleArmIKSolver:
         self.last_solve_deadline_exceeded = False
 
         for iteration in range(max_iterations):
+            if check_cancelled is not None:
+                check_cancelled()
             if _deadline_exceeded(deadline):
                 self.last_solve_deadline_exceeded = True
                 break
             current_pose = self.compute_pose(q)
+            if eef_from_controlled_frame is not None:
+                current_pose = current_pose @ eef_from_controlled_frame
             pos_err = target_pose[:3, 3] - current_pose[:3, 3]
             rot_err = self.pin.log3(target_pose[:3, :3] @ current_pose[:3, :3].T)
             error = np.concatenate([pos_err, rot_err])
@@ -199,11 +246,94 @@ class SingleArmIKSolver:
                 current_qpos=q,
                 max_joint_step=max_joint_step,
                 damping=damping,
+                **({"eef_from_controlled_frame": eef_from_controlled_frame}
+                   if eef_from_controlled_frame is not None else {}),
             )
             if _deadline_exceeded(deadline):
                 self.last_solve_deadline_exceeded = True
                 break
         return self._normalize_branch(candidate_qpos=q, reference_qpos=reference_q)
+
+    def solve_bounded_pose(
+        self,
+        target_pose: np.ndarray,
+        q_init: np.ndarray,
+        *,
+        controlled_frame_offset: np.ndarray,
+        translation_tolerance_m: float,
+        rotation_tolerance_rad: float,
+        deadline_monotonic: float,
+        cancel_requested: Callable[[], bool],
+        maximum_evaluations: int = 100,
+    ) -> np.ndarray:
+        """Query one bounded endpoint candidate; never authorize its execution.
+
+        Trust-region least squares handles active joint limits without clipping
+        an unconstrained update. Residuals use the caller's actual TCP, not its
+        flange. Callers still own FK, collision, path and dispatch admission.
+        This explicit offline-query path does not change solve_step/iterative.
+        """
+        from scipy.optimize import least_squares
+
+        goal = _to_pose_matrix(target_pose)
+        offset = _to_pose_matrix(controlled_frame_offset)
+        for pose in (goal, offset):
+            if (not np.isfinite(pose).all()
+                    or not np.allclose(pose[3], (0., 0., 0., 1.), atol=1e-9)
+                    or not np.allclose(pose[:3, :3].T @ pose[:3, :3], np.eye(3), atol=1e-6)
+                    or not np.isclose(np.linalg.det(pose[:3, :3]), 1., atol=1e-6)):
+                raise ValueError("Bounded pose query requires rigid finite transforms.")
+        seed = np.asarray(q_init, dtype=float).copy()
+        if (seed.shape != self.q_min.shape or not np.isfinite(seed).all()
+                or np.any(seed < self.q_min) or np.any(seed > self.q_max)):
+            raise ValueError("Bounded pose seed must satisfy the original joint bounds.")
+        tolerances = np.asarray((translation_tolerance_m, rotation_tolerance_rad), dtype=float)
+        if not np.isfinite(tolerances).all() or np.any(tolerances <= 0):
+            raise ValueError("Bounded pose tolerances must be finite and positive.")
+        if (isinstance(maximum_evaluations, bool) or not isinstance(maximum_evaluations, int)
+                or maximum_evaluations <= 0 or isinstance(deadline_monotonic, bool)
+                or not np.isfinite(deadline_monotonic)):
+            raise ValueError("Bounded pose query requires a finite deadline and evaluation budget.")
+        if not callable(cancel_requested):
+            raise TypeError("cancel_requested must be callable.")
+        self.last_solve_iterations = 0
+        self.last_solve_converged = False
+        self.last_solve_deadline_exceeded = False
+        self.last_solve_residual_evaluations = 0
+        best_q = seed.copy()
+        best_score = float("inf")
+
+        class DeadlineExceeded(Exception):
+            pass
+
+        def residual(q):
+            nonlocal best_q, best_score
+            if cancel_requested():
+                raise InterruptedError("Bounded endpoint query cancelled.")
+            if time.perf_counter() >= deadline_monotonic:
+                raise DeadlineExceeded
+            tcp = self.compute_pose(q) @ offset
+            if not np.isfinite(tcp).all():
+                raise BoundedIKNumericalError("Bounded endpoint FK is non-finite.")
+            value = np.concatenate(((goal[:3, 3] - tcp[:3, 3]) / tolerances[0],
+                self.pin.log3(goal[:3, :3] @ tcp[:3, :3].T) / tolerances[1]))
+            if not np.isfinite(value).all():
+                raise BoundedIKNumericalError("Bounded endpoint residual is non-finite.")
+            self.last_solve_residual_evaluations += 1
+            score = float(max(np.linalg.norm(value[:3]), np.linalg.norm(value[3:])))
+            if score < best_score:
+                best_q, best_score = np.asarray(q).copy(), score
+            return value
+
+        try:
+            solved = least_squares(residual, seed, bounds=(self.q_min, self.q_max),
+                max_nfev=maximum_evaluations, xtol=1e-9, ftol=1e-9, gtol=1e-9)
+            self.last_solve_iterations = int(solved.nfev)
+        except DeadlineExceeded:
+            self.last_solve_deadline_exceeded = True
+        self.last_solve_converged = best_score <= 1.0
+        # Do not normalize to another branch after evaluating this candidate.
+        return best_q
 
     def _normalize_branch(
         self,

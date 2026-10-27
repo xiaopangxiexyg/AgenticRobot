@@ -27,6 +27,8 @@ from .definition import (
     plan_point_grasp_skill_definition_v3,
     render_point_grasp_candidate_skill_definition_v1,
     segment_skill_definition_v1,
+    segment_skill_definition_v2,
+    segment_skill_definition_v3,
 )
 from .placement_schemas import (
     plan_placement_schema_entry_v1,
@@ -44,9 +46,17 @@ from .schemas import (
 )
 from .segmentation_schemas import (
     segment_schema_entry_v1,
+    segment_schema_entry_v2,
+    segment_schema_entry_v3,
     validate_segment_parameters_v1,
+    validate_segment_parameters_v2,
+    validate_segment_parameters_v3,
     validate_segment_result_for_parameters_v1,
+    validate_segment_result_for_parameters_v2,
+    validate_segment_result_for_parameters_v3,
     validate_segment_result_v1,
+    validate_segment_result_v2,
+    validate_segment_result_v3,
 )
 
 __all__ = [
@@ -74,7 +84,11 @@ __all__ = [
     "plan_point_grasp_skill_definition_v3",
     "render_point_grasp_candidate_skill_definition_v1",
     "segment_schema_entry_v1",
+    "segment_schema_entry_v2",
+    "segment_schema_entry_v3",
     "segment_skill_definition_v1",
+    "segment_skill_definition_v2",
+    "segment_skill_definition_v3",
     "validate_back_project_parameters_v1",
     "validate_back_project_result_for_parameters_v1",
     "validate_back_project_result_v1",
@@ -86,6 +100,12 @@ __all__ = [
     "validate_plan_placement_result_for_parameters_v1",
     "validate_plan_placement_result_v1",
     "validate_segment_parameters_v1",
+    "validate_segment_parameters_v2",
+    "validate_segment_parameters_v3",
     "validate_segment_result_for_parameters_v1",
+    "validate_segment_result_for_parameters_v2",
+    "validate_segment_result_for_parameters_v3",
     "validate_segment_result_v1",
+    "validate_segment_result_v2",
+    "validate_segment_result_v3",
 ]

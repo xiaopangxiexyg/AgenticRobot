@@ -67,6 +67,13 @@ FIXED_LEVEL_TCP_ORIENTATION_SKILL_IDS_V1 = (
     TCP_LEVEL_FORWARD_LEFT_30_SKILL_ID_V1,
     TCP_LEVEL_FORWARD_RIGHT_30_SKILL_ID_V1,
 )
+# Historical debug contracts remain readable, but current deployments must not
+# publish them. Relative moves use the shared absolute-pose Skills instead.
+ARCHIVED_DEBUG_MOTION_SKILL_IDS_V1 = frozenset((
+    TCP_CARDINAL_STEP_SKILL_ID_V1,
+    *FIXED_CARDINAL_TCP_STEP_SKILL_IDS_V1,
+    *FIXED_LEVEL_TCP_ORIENTATION_SKILL_IDS_V1,
+))
 FIXED_LEVEL_TCP_ORIENTATION_SKILL_SUMMARY_BY_ID_V1: Mapping[str, str] = (
     MappingProxyType(
         {
@@ -154,6 +161,10 @@ def safe_tcp_pose_target_skill_definition_v1(
         summary=(
             "Move one selected arm tool_tcp to an absolute pose after finding "
             "and validating a collision-free joint path in the deployed scene. "
+            "Optional pose_goal_policy=preserve_target keeps the requested goal "
+            "without translation/rotation rescue; omitted or "
+            "within_arrival_tolerance retains deployment arrival-region planning. "
+            "Execution reports requested versus achieved pose under arrival bounds. "
             "Unknown obstacles and unmodeled carried objects are not covered. "
             "No path means no motion; never fall back to an unchecked pose move."
         ),
@@ -339,6 +350,7 @@ def fixed_level_tcp_orientation_skill_definition_v1(
 
 
 __all__ = [
+    "ARCHIVED_DEBUG_MOTION_SKILL_IDS_V1",
     "CARDINAL_TCP_STEP_DIRECTIONS_V1",
     "EXECUTE_GRASP_APPROACH_PLAN_SKILL_ID_V1",
     "FIXED_CARDINAL_TCP_STEP_DIRECTION_BY_SKILL_ID_V1",

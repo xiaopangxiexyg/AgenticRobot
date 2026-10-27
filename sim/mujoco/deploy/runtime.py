@@ -60,6 +60,7 @@ from robot_motion.action import (
     ROBOT_ACTION_V1_TARGET_ADAPTER_CONTRACT_HASH,
     ROBOT_ACTION_V1_TARGET_ADAPTER_CONTRACT_ID,
     TargetExecutionDispatchResult,
+    TargetExecutionCompletionReceipt,
     TargetExecutionRequest,
     TargetExecutionStatusSnapshot,
     TargetExecutionSubmissionReceipt,
@@ -947,6 +948,16 @@ def build_mujoco_pose_action_schema(
     )
 
 
+@dataclass(frozen=True)
+class _LatestTargetExecution:
+    """The original stage facts consumed by the public latest-request view."""
+
+    target_execution_request: TargetExecutionRequest
+    target_submission_receipt: TargetExecutionSubmissionReceipt | None
+    target_completion_receipt: TargetExecutionCompletionReceipt | None
+    target_dispatch_result: TargetExecutionDispatchResult | None
+
+
 class MujocoDeployRuntime:
     """One deterministic producer→Arbiter→MuJoCo authority chain."""
 
@@ -980,7 +991,12 @@ class MujocoDeployRuntime:
             MujocoPoseObservationProjector | None
         ) = None,
         clock: Callable[[], float] = time.monotonic,
+        _checkpoint=None,
     ) -> None:
+        if _checkpoint is not None:
+            from .runtime_checkpoint import validate_runtime_checkpoint
+
+            validate_runtime_checkpoint(_checkpoint, config=config, clock=clock)
         self.rig = rig
         self.config = config
         if composition_runtime_config is not None:
@@ -1660,6 +1676,7 @@ class MujocoDeployRuntime:
             action_representation_adapter=action_representation_adapter,
             trace_sink=trace_sink,
             clock=clock,
+            _checkpoint=None if _checkpoint is None else _checkpoint.core,
         )
         self.authoritative_port = MujocoAuthoritativeTargetPort(self.core)
         self.reference_receiver: MujocoScheduledQposReferenceReceiver | None = None
@@ -1749,7 +1766,7 @@ class MujocoDeployRuntime:
         self._trace_close_pending = False
         self._rig_close_pending = False
         self._lifecycle_terminal = False
-        self._latest_target_execution_step: AuthoritativeControlStep | None = None
+        self._latest_target_execution_step: _LatestTargetExecution | None = None
         self._last_dispatch_context: (
             AuthoritativeCommandDispatchContext
             | AuthoritativeTargetDispatchContext
@@ -1784,6 +1801,10 @@ class MujocoDeployRuntime:
         self._observation_adapter_by_node = {
             config.policy_node_id: self.observation_adapter
         }
+        if _checkpoint is not None:
+            from .runtime_checkpoint import restore_runtime_state
+
+            restore_runtime_state(self, _checkpoint)
 
     def reset_pose_resolution_temporal_state(self) -> bool:
         """Reset lower-owned stateful pose shaping after authoritative HOLD."""
@@ -3535,7 +3556,12 @@ class MujocoDeployRuntime:
                 # for the lifetime of a foreground session.
                 release(result.command)
         if result.target_execution_request is not None:
-            self._latest_target_execution_step = result
+            self._latest_target_execution_step = _LatestTargetExecution(
+                result.target_execution_request,
+                result.target_submission_receipt,
+                result.target_completion_receipt,
+                result.target_dispatch_result,
+            )
         if result.status == "dispatched":
             for _ in range(normalized_physics_ticks):
                 self.rig.step_physics()
@@ -3800,6 +3826,22 @@ class MujocoDeployRuntime:
             raise
         self._trace_close_pending = False
         self._lifecycle_terminal = True
+
+    def capture_lifecycle_diagnostics(self) -> dict[str, bool]:
+        """Report owner state at a serialized lifecycle boundary, without I/O.
+
+        This is diagnostic evidence about pending resource releases, not a
+        successful HOLD receipt or proof that terminal trace publication
+        succeeded. Callers must retain any start/close exception separately.
+        """
+
+        return {
+            "started": self._started,
+            "lifecycle_entered": self._lifecycle_entered,
+            "rig_close_pending": self._rig_close_pending,
+            "trace_close_pending": self._trace_close_pending,
+            "trace_terminal": self._lifecycle_terminal,
+        }
 
     def _close_rig_once(self) -> None:
         if not self._rig_close_pending:

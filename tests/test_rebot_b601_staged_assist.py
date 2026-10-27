@@ -2876,7 +2876,13 @@ def test_motion_target_arrival_does_not_count_another_captured_stop_point_as_suc
         pytest.skip("declare B601_REBOT_SOURCE_ROOT for offline plant validation")
     from sim.mujoco.rebot_b601_rs.joint_motion_demo import run_b601_joint_motion_demo
 
-    code, payload = run_b601_joint_motion_demo(source_root=source, scenario="target-arrival")
+    # Preserve the historical negative fixture independently of commissioning tuning.
+    code, payload = run_b601_joint_motion_demo(
+        source_root=source, scenario="target-arrival",
+        motion_config=replace(
+            B601JointMotionConfig(), max_reference_lag_rad=.01, braking_timeout_sec=3.0,
+        ),
+    )
     acceptance = payload["simulation_acceptance"]
     assert code == 3
     assert acceptance["kind"] == "target_arrival"
@@ -3352,7 +3358,10 @@ def test_slower_reference_alone_does_not_fix_existing_low_gain_arrival_failure()
 
     code, payload = run_b601_joint_motion_demo(
         source_root=source, scenario="target-arrival",
-        motion_config=replace(B601JointMotionConfig(), max_reference_velocity_rad_s=.005),
+        motion_config=replace(
+            B601JointMotionConfig(), max_reference_velocity_rad_s=.005,
+            max_reference_lag_rad=.01, braking_timeout_sec=3.0,
+        ),
     )
     assert code == 3
     assert payload["target_evaluation"]["first_brake"]["reason"] == "reference_lag_braking"
@@ -3488,7 +3497,10 @@ def test_offline_reference_pacing_improves_high_resistance_motion_but_does_not_c
     from sim.mujoco.rebot_b601_rs.joint_motion_demo import run_b601_joint_motion_demo
 
     profile = Path(__file__).resolve().parents[1]/"docs/hardware/profiles/b601_j3_interaction_v2.json"
-    motion = B601JointMotionConfig(**json.loads(profile.read_text()))
+    motion = replace(
+        B601JointMotionConfig(**json.loads(profile.read_text())),
+        max_reference_lag_rad=.01, braking_timeout_sec=3.0,
+    )
     results = []
     for pacing in (False, True):
         _, payload = run_b601_joint_motion_demo(
@@ -3528,7 +3540,10 @@ def test_long_quantized_candidate_latches_failed_exit_and_keeps_actual_damping_a
     from sim.mujoco.rebot_b601_rs.joint_motion_demo import run_b601_joint_motion_demo
 
     profile = Path(__file__).resolve().parents[1]/"docs/hardware/profiles/b601_j3_interaction_v2.json"
-    motion = replace(B601JointMotionConfig(**json.loads(profile.read_text())), reference_pacing=True)
+    motion = replace(
+        B601JointMotionConfig(**json.loads(profile.read_text())), reference_pacing=True,
+        max_reference_lag_rad=.01, braking_timeout_sec=3.0,
+    )
     code, payload = run_b601_joint_motion_demo(
         source_root=source, host_hz=100, scenario="target-arrival", duration_sec=14., scripted_withdrawal_sec=10.,
         motion_config=motion, driver_kd_nm_s_per_rad=ZERO, feedback_position_quantum_rad=.000384,

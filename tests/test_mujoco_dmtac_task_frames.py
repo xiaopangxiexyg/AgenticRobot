@@ -51,6 +51,11 @@ def test_current_task_is_explicit_physical_contact_not_scripted_or_latched():
     assert config.object_size_m == (.07, .07, .07)
     assert not config.scripted_pregrasp_reset and not config.scripted_contact_reset
     assert config.success_requires_bilateral_contact
+    # Preserve physical durations when refining the stiff contact integration.
+    assert config.physics_hz == config.base_contract().timing.physics_hz == 4000.
+    assert config.command_hz == 120.
+    assert config.success_hold_physics_ticks / config.physics_hz == .03
+    assert config.settle_physics_ticks / config.physics_hz == 1.
     with pytest.raises(ValueError, match="grasp_frame_source"):
         replace(config, grasp_frame_source="invented")
     with pytest.raises(ValueError, match="physical actuated"):

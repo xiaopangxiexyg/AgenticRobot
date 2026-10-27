@@ -27,6 +27,11 @@ python -m teleop_runtime.debug.run_vive_rm65_real_teleop --gui
 ndarray也使用同一共享内存槽；`--collection-process-extra-array-mb`控制每槽为这些
 非相机数组预留的容量，默认8 MiB。队列/共享槽过载会显式暂停episode，不能阻塞位控。
 
+共享内存打包与还原使用同一份固定 payload 字段遍历，保持相机 image/标量/metadata/depth、
+再 arm/hand/position-reference 的既有顺序。相机载荷继续支持 array-like，嵌套容器只转换
+对应的 ndarray 或共享数组描述符；metadata 内数组、其他 snapshot 字段及诊断深度的处理不变。
+它不管理槽位：64 字节对齐、容量与描述符校验仍由原转换操作负责，写盘 job 完成后才确认释放。
+
 v2.4 native stream仍为default-off。process worker现提供小型pose/qpos的bounded inline
 接缝：提交不等待写盘，queue full或消息超限返回typed rejection，并在episode seal时记入
 drop/gap。RGBD和tactile大数组禁止使用该pickle通道。首个opt-in `selected_rgb` bridge会从
@@ -35,6 +40,12 @@ capture-time intent在release时freeze，legacy specialized writer完成后提�
 artifact receipt，native manifest才seal；reader会复核artifact hash并返回typed locator。
 它只保存decision/sample已选中的RGB，同一源帧复用时native index只记一次，不等于相机
 native-rate stream。高频RGBD/tactile artifact bundle及GUI/真机profile仍未启用。
+
+子进程内的冻结事实只由 `NativeStreamEpisodeWriter.ingestion_frozen` 提供；它在所有
+index 的 `fsync` 成功后才变为真，seal/close 后仍可读取，但不表示 writer 仍可操作。
+worker 不再保存另一份冻结标志。六类 native stream 消息共用 episode 身份校验，保留各自的
+模式检查顺序和错误通道；父进程的 RPC 确认状态与 legacy episode 防重复提交保护仍独立保留。
+冻结失败不能放行 legacy finalize；新 episode 使用新的 writer，不继承旧 writer 的冻结事实。
 
 `--collection-worker-mode thread` 保留原实现作为回退。force/impedance的 `auto` 始终
 解析为 `thread`，因此该变更不改变力控数采链路。这里的headless兼容入口也仍使用原有

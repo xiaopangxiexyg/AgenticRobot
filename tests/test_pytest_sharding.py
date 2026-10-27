@@ -85,20 +85,20 @@ def test_full_profile_tracks_recent_dominant_modules() -> None:
     module = _load_sharding_module()
 
     assert module.FULL_WEIGHTS["tests/test_mujoco_temp_pipeline.py"] == pytest.approx(
-        134.914
+        93.578
     )
     assert module.FULL_WEIGHTS[
         "tests/test_replay_position_admittance_active_pipeline.py"
-    ] == pytest.approx(108.657)
+    ] == pytest.approx(77.676)
     assert module.FULL_WEIGHTS["tests/test_mujoco_fast_runtime.py"] == pytest.approx(
-        48.101
+        23.032
     )
     assert module.FULL_WEIGHTS["tests/test_rm65_grasp_trajectory.py"] == pytest.approx(
-        91.046
+        67.308
     )
     assert module.FULL_WEIGHTS[
         "tests/test_mujoco_formal_compound_authority.py"
-    ] == pytest.approx(6.681)
+    ] == pytest.approx(3.565)
     assert (
         module.FULL_WEIGHTS["tests/test_mujoco_temp_pipeline.py"]
         > module.FULL_WEIGHTS[
@@ -107,20 +107,20 @@ def test_full_profile_tracks_recent_dominant_modules() -> None:
     )
     assert module.FULL_WEIGHTS[
         "tests/test_sim_point_grasp_experiment.py"
-    ] == pytest.approx(16.729)
+    ] == pytest.approx(12.628)
     assert module.FULL_WEIGHTS["tests/test_mujoco_cube_lift.py"] == pytest.approx(
-        11.965
+        7.075
     )
     assert module.FULL_WEIGHTS["tests/test_rebot_b601_real2sim.py"] == pytest.approx(
-        23.742
+        14.808
     )
     assert module.FULL_WEIGHTS["tests/test_runtime_artifact_migration.py"] == pytest.approx(
-        49.666
+        1.316
     )
     assert module.FULL_WEIGHTS["tests/test_runtime_artifact_resolution.py"] == pytest.approx(
-        15.847
+        0.221
     )
-    assert module.FULL_WEIGHTS["tests/test_modality_storage.py"] > 7.0
+    assert module.FULL_WEIGHTS["tests/test_modality_storage.py"] == pytest.approx(2.512)
 
 
 def test_fast_integration_profile_tracks_its_unsharded_critical_path() -> None:
@@ -143,6 +143,8 @@ def test_fast_integration_profile_tracks_its_unsharded_critical_path() -> None:
     (
         "tests/test_mujoco_temp_pipeline.py",
         "tests/test_replay_position_admittance_active_pipeline.py",
+        "tests/test_agent_gateway_mujoco_fast_grasp.py",
+        "tests/test_agent_gateway_mujoco_safe_tcp_pose.py",
     ),
 )
 def test_full_plan_splits_registered_large_module_without_losing_tests(
@@ -155,7 +157,9 @@ def test_full_plan_splits_registered_large_module_without_losing_tests(
     tests_root.mkdir(parents=True)
     split_path = repository / relative_path
     registered = module.FULL_SPLIT_NODE_WEIGHTS[relative_path]
-    test_names = sorted(registered) + ["test_new_profile_is_still_collected"]
+    test_names = sorted(set(registered) | {
+        "test_new_profile_is_still_collected", "test_unmeasured_peer_is_collected",
+    })
     split_path.write_text(
         "\n\n".join(f"def {name}():\n    pass" for name in test_names) + "\n",
         encoding="utf-8",

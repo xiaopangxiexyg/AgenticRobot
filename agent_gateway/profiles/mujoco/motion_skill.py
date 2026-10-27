@@ -8,6 +8,7 @@ import threading
 import time
 from collections.abc import Callable, Mapping
 from typing import Any
+from dataclasses import replace
 
 import numpy as np
 
@@ -28,6 +29,8 @@ from agent_gateway.protocol.evaluation_contracts import (
     SkillEvaluationReceipt,
 )
 from agent_gateway.protocol.skill_catalog import SkillExecutionRoute
+from agent_gateway.skills.motion.schemas import safe_tcp_pose_goal_policy_v1
+from agent_gateway.skills.motion.path_constraint import validate_path_constraint
 from agent_gateway.runtime.station_operation_worker import (
     StationLifecycleActivationEvidence,
     StationLifecycleControlEvidence,
@@ -36,11 +39,13 @@ from agent_gateway.runtime.station_operation_worker import (
 )
 from dataset_contracts.canonical_encoding import canonical_content_hash
 from robot_motion.action import ComponentAction
+from robot_motion.path_constraints import ToolAxisCone
 from robot_motion.path_planning import JointConfigurationCheck
-from robot_motion.relative_action import xyzquat_to_pose_matrix
+from robot_motion.pose import pose_delta_metrics
 from robot_motion.relative_action import xyzquat_to_pose_matrix
 from robot_motion.target_safety import (
     TCPPoseEnvelopeLifecycleError,
+    TCPPoseEnvelopeRotationCutLocusError,
     TCPPoseEnvelopeSafetyRuntime,
     TCPPoseEnvelopeSelection,
 )
@@ -135,7 +140,10 @@ def _authoritative_step_keeps_existing_for_retry(authoritative: Any) -> bool:
     """
 
     status = getattr(authoritative, "status", None)
-    if status == "target_support_expired_before_submission_keep_existing":
+    if status in {
+        "target_support_expired_before_adaptation_keep_existing",
+        "target_support_expired_before_submission_keep_existing",
+    }:
         publication = getattr(authoritative, "publication_attempt", None)
         directive = getattr(authoritative, "directive", None)
         directives = getattr(directive, "directive_by_selection_group", None)
@@ -144,6 +152,7 @@ def _authoritative_step_keeps_existing_for_retry(authoritative: Any) -> bool:
             getattr(authoritative, "decision", None) is not None
             and publication is not None
             and bool(getattr(publication, "accepted", False))
+            and getattr(publication, "required_fallback", None) is None
             and getattr(directive, "global_status", None) == "normal"
             and isinstance(directives, Mapping)
             and directives
@@ -151,12 +160,11 @@ def _authoritative_step_keeps_existing_for_retry(authoritative: Any) -> bool:
                 getattr(item, "directive", None) == "publish_selected"
                 for item in directives.values()
             )
-            and adaptation is not None
-            and bool(
-                getattr(
-                    getattr(adaptation, "receipt", None),
-                    "accepted",
-                    False,
+            and (
+                adaptation is None
+                if status == "target_support_expired_before_adaptation_keep_existing"
+                else adaptation is not None and bool(
+                    getattr(getattr(adaptation, "receipt", None), "accepted", False)
                 )
             )
             and getattr(authoritative, "target_execution_request", None) is None
@@ -164,8 +172,12 @@ def _authoritative_step_keeps_existing_for_retry(authoritative: Any) -> bool:
             and getattr(authoritative, "target_dispatch_result", None) is None
             and getattr(authoritative, "target_completion_receipt", None) is None
             and getattr(authoritative, "cancellation", None) is None
+            and getattr(authoritative, "cancellation_receipt", None) is None
+            and getattr(authoritative, "cancellation_dispatch_validation", None) is None
             and getattr(authoritative, "safety_result", None) is None
             and getattr(authoritative, "resolution_failure", None) is None
+            and getattr(authoritative, "command", None) is None
+            and getattr(authoritative, "dispatch_context", None) is None
             and getattr(authoritative, "dispatch_validation", None) is None
             and getattr(authoritative, "dispatch_receipts", None) is None
         )
@@ -326,7 +338,7 @@ class MujocoAgentTcpPoseSkillLifecycle:
                 raise ValueError(f"TCP pose lifecycle {label} mismatch.")
         if request.runtime_session_id != application.runtime.config.runtime_session_id:
             raise ValueError("TCP pose lifecycle runtime session mismatch.")
-        parameters = request.parameters
+        parameters = self._motion_parameters(request.parameters)
         if not isinstance(parameters, Mapping):
             raise TypeError("request.parameters must be a mapping.")
         if target_resolver is not None and not callable(target_resolver):
@@ -405,9 +417,7 @@ class MujocoAgentTcpPoseSkillLifecycle:
                 "TCP pose lifecycle component does not match the deployment "
                 "binding."
             )
-        for field_name, expected in lineage.items():
-            if parameters.get(field_name) != expected:
-                raise ValueError(f"TCP pose lifecycle {field_name} mismatch.")
+        self._validate_parameter_lineage(parameters, lineage)
 
         self.executor_id = deployment_binding.executor_id
         self.application = application
@@ -483,6 +493,10 @@ class MujocoAgentTcpPoseSkillLifecycle:
         self._latest_step_refs: tuple[str, ...] = ()
         self._activation_measured_pose: tuple[float, ...] | None = None
 
+    def _motion_parameters(self, parameters):
+        """Ordinary pose Routes consume their admitted wire parameters unchanged."""
+        return parameters
+
     def _reference_action_for_cycle(self, cycle: int) -> ComponentAction:
         if self.action is None or self.target_pose is None:
             raise RuntimeError("TCP pose lifecycle has no resolved action.")
@@ -556,6 +570,12 @@ class MujocoAgentTcpPoseSkillLifecycle:
             values[self.component_id],
             field_name=f"measured.{self.component_id}",
         )
+
+    def _validate_parameter_lineage(self, parameters, lineage):
+        """Absolute primitives declare lineage; semantic adapters bind it in their Route."""
+        for field_name, expected in lineage.items():
+            if parameters.get(field_name) != expected:
+                raise ValueError(f"TCP pose lifecycle {field_name} mismatch.")
 
     def activate(
         self,
@@ -961,6 +981,18 @@ class MujocoAgentTcpPoseSkillLifecycle:
             hold=hold,
         )
 
+    def _terminal_state_evidence(self, public_final_pose, measured_at):
+        return {
+            "runtime_session_id": self.request.runtime_session_id,
+            "control_domain_id": self.deployment_binding.control_domain_id,
+            "operation_id": self.operation.operation_id,
+            "component_id": self.component_id,
+            "pose_xyz_quat_xyzw": public_final_pose,
+            "measured_at": measured_at,
+            "reference_frame_id": self.motion_profile.reference_frame_id,
+            "controlled_frame_id": "tool_tcp",
+        }
+
     def _success(
         self,
         *,
@@ -975,16 +1007,7 @@ class MujocoAgentTcpPoseSkillLifecycle:
             target_frame_id=self.motion_profile.reference_frame_id,
         )
         final_state_hash = canonical_content_hash(
-            {
-                "runtime_session_id": request.runtime_session_id,
-                "control_domain_id": self.deployment_binding.control_domain_id,
-                "operation_id": operation.operation_id,
-                "component_id": self.component_id,
-                "pose_xyz_quat_xyzw": public_final_pose,
-                "measured_at": measured_at,
-                "reference_frame_id": self.motion_profile.reference_frame_id,
-                "controlled_frame_id": "tool_tcp",
-            },
+            self._terminal_state_evidence(public_final_pose, measured_at),
             domain="dexteleop.agent_skill.mujoco_tcp_terminal_state.v1",
         )
         if len(self.evaluation_plan.evaluator_specs) != 1:
@@ -1044,6 +1067,21 @@ class MujocoAgentTcpPoseSkillLifecycle:
             "execution_receipt_refs": list(refs),
             "final_measured_state_hash": final_state_hash,
         }
+        if self.route.skill_id == "motion.move_tcp_to_pose_safe":
+            requested_public_pose = request.parameters["pose_targets_by_component"][self.component_id]
+            translation_error, rotation_error_deg = pose_delta_metrics(
+                xyzquat_to_pose_matrix(public_final_pose, name="safe_tcp_report_achieved"),
+                xyzquat_to_pose_matrix(requested_public_pose, name="safe_tcp_report_requested"))
+            result["pose_goal_report"] = {
+                "pose_goal_policy": safe_tcp_pose_goal_policy_v1(request.parameters),
+                "reference_frame_id": self.motion_profile.reference_frame_id,
+                "requested_pose_xyz_quat_xyzw": list(requested_public_pose),
+                "achieved_pose_xyz_quat_xyzw": list(public_final_pose),
+                "translation_error_m": translation_error,
+                "rotation_error_rad": math.radians(rotation_error_deg),
+                "arrival_translation_tolerance_m": self.motion_profile.translation_tolerance_m,
+                "arrival_rotation_tolerance_rad": self.motion_profile.rotation_tolerance_rad,
+            }
         return StationLifecycleExecutionCompletion(
             succeeded=True,
             reason_code="tcp_pose_target_reached_and_held",
@@ -1097,8 +1135,29 @@ class MujocoAgentSafeTcpPoseSkillLifecycle(MujocoAgentTcpPoseSkillLifecycle):
     """Keep the normal lifecycle and receipts; replace only lower references."""
 
     def __init__(self, *, path_search_time_budget_sec: float = 3.0,
-                 contact_binding=None, **kwargs: Any) -> None:
+                 contact_binding=None, observed_planning_provider=None, **kwargs: Any) -> None:
         super().__init__(**kwargs)
+        self._axis_cone = None
+        self._path_constraint_evidence = None
+        self._path_policy = None
+        is_safe_v2 = (self.route.skill_id == "motion.move_tcp_to_pose_safe"
+                      and self.route.skill_version == "2")
+        if is_safe_v2:
+            if "path_constraint" not in self.request.parameters:
+                raise ValueError("Safe TCP v2 requires an explicit path_constraint.")
+            self._path_policy = self.request.parameters["path_constraint"]
+            validate_path_constraint(self._path_policy)
+        elif "path_constraint" in self.request.parameters:
+            raise ValueError("Path constraints require the explicit safe TCP v2 Route.")
+        self._observed_planning_provider = observed_planning_provider
+        expected = self.motion_profile.profile_id
+        actual = (None if observed_planning_provider is None else
+                  "mujoco.agent_safe_tcp_pose.rgbd." + observed_planning_provider.semantic_content_hash)
+        if actual is not None and is_safe_v2:
+            actual += ".path_axis.v2"
+        if ((actual is not None and actual != expected)
+                or (actual is None and expected.startswith("mujoco.agent_safe_tcp_pose.rgbd."))):
+            raise ValueError("Observed planner and admitted motion profile must match.")
         self._path_search_time_budget_sec = path_search_time_budget_sec
         self._contact_binding = contact_binding
         self._contact_check_enabled = False
@@ -1125,33 +1184,70 @@ class MujocoAgentSafeTcpPoseSkillLifecycle(MujocoAgentTcpPoseSkillLifecycle):
             reason_code = self._lower_failure_code
         return super()._failure(reason_code=reason_code, hold=hold)
 
+    def _axis_deviation_including_published_qref(self, model_qpos, pair, pose):
+        # The existing qref publisher normalizes joints to float32. Check that
+        # exact representation too; tight cones must not be widened by the
+        # later deterministic numeric conversion.
+        published_pair = {side: np.asarray(q, dtype=np.float32) for side, q in pair.items()}
+        published_pose = self._planner.pose_for_configuration(model_qpos, published_pair)
+        return max(self._axis_cone.deviation_rad(pose),
+                   self._axis_cone.deviation_rad(published_pose))
+
+    def _planning_goal_tolerances(self):
+        preserve_target = (self.route.skill_id == "motion.move_tcp_to_pose_safe"
+            and safe_tcp_pose_goal_policy_v1(self.request.parameters) == "preserve_target")
+        return (
+            min(self.motion_profile.translation_tolerance_m, 0.003)
+                if preserve_target else self.motion_profile.translation_tolerance_m,
+            min(self.motion_profile.rotation_tolerance_rad, math.radians(1.0))
+                if preserve_target else self.motion_profile.rotation_tolerance_rad,
+        )
+
+    def _prepare_plan(self, *, constraint, constraint_identity, cancel_requested):
+        translation_tolerance, rotation_tolerance = self._planning_goal_tolerances()
+        payload_binding = self._planning_payload_binding()
+        observed = (None if self._observed_planning_provider is None else
+            self._observed_planning_provider.capture(
+                operation_id=self.operation.operation_id,
+                expected_station_revision=self.request.expected_station_revision,
+                cancel_requested=cancel_requested))
+        return self._planner.plan(
+            self.target_pose,
+            translation_tolerance_m=translation_tolerance,
+            rotation_tolerance_rad=rotation_tolerance,
+            cancel_requested=cancel_requested,
+            configuration_constraint=constraint,
+            constraint_identity=constraint_identity,
+            path_search_time_budget_sec=self._path_search_time_budget_sec,
+            contact_binding=self._contact_binding,
+            **({"payload_binding": payload_binding} if payload_binding is not None else {}),
+            **({"observed_planning_input": observed} if observed is not None else {}),
+            **({"normalize_ik_objective": True} if self.motion_profile.normalize_ik_objective else {}),
+        )
+
+    def _activate_plan(self, plan):
+        self._planner.activate(plan)
+
     def activate(self, *, request, operation, cancel_requested):
-        self._validate_call(request=request, operation=operation)
-        if self.target_pose is None:
-            raise ValueError("Safe TCP motion requires an absolute target.")
-        measured = self._capture_pose()
-        translation, rotation = _pose_error(measured, self.target_pose)
-        if (
-            cancel_requested()
-            or translation > self.motion_profile.max_translation_delta_m
-            or rotation > self.motion_profile.max_rotation_delta_rad
-        ):
-            # Preserve the ordinary cancellation/delta gate before planning.
-            return super().activate(
-                request=request, operation=operation, cancel_requested=cancel_requested
-            )
         # Bind the exact admitted envelope before search, without submitting
-        # a reference. Search and execution then consult the same lower owner.
+        # a reference. The base also owns cancellation, measured target
+        # resolution and delta admission for absolute and composed targets.
         evidence = super().activate(
             request=request, operation=operation, cancel_requested=cancel_requested
         )
         if not evidence.succeeded:
             return evidence
+        measured = self._activation_measured_pose
         safety = self.application.tcp_pose_envelope_runtime
+        motion_side = self.component_id.removesuffix("_arm")
         constraint = None
         constraint_identity = None
+        if self._path_policy is not None:
+            self._axis_cone = ToolAxisCone.from_pose(
+                measured, tool_axis=self._path_policy["tool_axis"],
+                max_deviation_rad=self._path_policy["max_deviation_rad"])
         if safety is not None:
-            initial = safety.project({"right": xyzquat_to_pose_matrix(measured)})
+            initial = safety.project({motion_side: xyzquat_to_pose_matrix(measured)})
             basis = (initial.envelope_profile_hash, initial.anchor_hash)
             constraint_identity = canonical_content_hash(
                 {"profile": basis[0], "anchor": basis[1]},
@@ -1160,7 +1256,7 @@ class MujocoAgentSafeTcpPoseSkillLifecycle(MujocoAgentTcpPoseSkillLifecycle):
 
             def constraint(model_qpos, pair):
                 pose = self._planner.pose_for_configuration(model_qpos, pair)
-                projection = safety.project({"right": xyzquat_to_pose_matrix(pose)})
+                projection = safety.project({motion_side: xyzquat_to_pose_matrix(pose)})
                 same_basis = (
                     projection.envelope_profile_hash,
                     projection.anchor_hash,
@@ -1178,22 +1274,89 @@ class MujocoAgentSafeTcpPoseSkillLifecycle(MujocoAgentTcpPoseSkillLifecycle):
                     metadata=projection.to_payload(),
                 )
 
+        if self._axis_cone is not None:
+            envelope_constraint = constraint
+            constraint_identity = canonical_content_hash({
+                "envelope_identity": constraint_identity,
+                "tool_axis_cone": self._axis_cone.to_payload(),
+                "execution_reference_frame": self.motion_profile.execution_reference_frame_spec_hash,
+                "public_reference_frame": self.motion_profile.reference_frame_spec_hash,
+            }, domain="dexteleop.mujoco.planned_tcp_axis_constraint.v2")
+
+            def constraint(model_qpos, pair):
+                if envelope_constraint is not None:
+                    answer = envelope_constraint(model_qpos, pair)
+                    if not answer.safe:
+                        return answer
+                else:
+                    answer = JointConfigurationCheck(safe=True)
+                pose = self._planner.pose_for_configuration(model_qpos, pair)
+                deviation = self._axis_deviation_including_published_qref(model_qpos, pair, pose)
+                if deviation > self._axis_cone.max_deviation_rad + 1e-9:
+                    return JointConfigurationCheck(safe=False, reason="tcp_tool_axis_cone_blocked",
+                        metadata={"deviation_rad": deviation,
+                                  "max_deviation_rad": self._axis_cone.max_deviation_rad})
+                return answer
+
         try:
-            plan = self._planner.plan(
-                self.target_pose,
-                translation_tolerance_m=self.motion_profile.translation_tolerance_m,
-                rotation_tolerance_rad=self.motion_profile.rotation_tolerance_rad,
-                cancel_requested=cancel_requested,
-                configuration_constraint=constraint,
+            if cancel_requested():
+                raise MujocoTcpPlanRejected("safe_tcp_planning_cancelled")
+            # This query owns the public single-goal route. Retained chains
+            # keep their original per-stage constraints and prepared resolver.
+            if self.route.skill_id == "motion.move_tcp_to_pose_safe" and safety is not None:
+                translation_tolerance, rotation_tolerance = self._planning_goal_tolerances()
+                try:
+                    goal_projection = safety.project(
+                        {motion_side: xyzquat_to_pose_matrix(self.target_pose)}
+                    )
+                except TCPPoseEnvelopeRotationCutLocusError:
+                    # A non-unique nominal projection does not prove the
+                    # tolerance region infeasible; candidate/path gates remain.
+                    goal_projection = None
+                if goal_projection is not None and (
+                    goal_projection.envelope_profile_hash, goal_projection.anchor_hash
+                ) != basis:
+                    raise MujocoTcpPlanRejected("safe_tcp_envelope_binding_changed")
+                if goal_projection is not None and not goal_projection.intersects_goal_tolerance(
+                    translation_tolerance_m=translation_tolerance,
+                    rotation_tolerance_rad=rotation_tolerance,
+                ):
+                    raise MujocoTcpPlanRejected("safe_tcp_goal_outside_safety_envelope", {
+                        "goal_policy": safe_tcp_pose_goal_policy_v1(self.request.parameters),
+                        "translation_tolerance_m": translation_tolerance,
+                        "rotation_tolerance_rad": rotation_tolerance,
+                        "projection": goal_projection.to_payload(),
+                    })
+            plan = self._prepare_plan(
+                constraint=constraint,
                 constraint_identity=constraint_identity,
-                path_search_time_budget_sec=self._path_search_time_budget_sec,
-                contact_binding=self._contact_binding,
+                cancel_requested=cancel_requested,
             )
             if (
                 len(plan.reference_poses) + self.motion_profile.stable_measurement_count
                 >= self.motion_profile.max_control_cycles
             ):
                 raise MujocoTcpPlanRejected("safe_tcp_path_exceeds_control_budget")
+            if self._axis_cone is not None:
+                maximum = max(self._axis_deviation_including_published_qref(
+                    plan.source_model_qpos, {**plan.path.start_qpos_by_component, motion_side: q}, pose)
+                    for pose, q in zip(plan.reference_poses, plan.trajectory.q_rad))
+                if maximum > self._axis_cone.max_deviation_rad + 1e-9:
+                    raise MujocoTcpPlanRejected("safe_tcp_planned_tool_axis_constraint_blocked")
+                public_activation = self.application.transform_tcp_pose_xyzquat(
+                    self._activation_measured_pose,
+                    source_frame_id=self.motion_profile.execution_reference_frame_id,
+                    target_frame_id=self.motion_profile.reference_frame_id)
+                public_cone = ToolAxisCone.from_pose(public_activation,
+                    tool_axis=self._axis_cone.tool_axis, max_deviation_rad=self._axis_cone.max_deviation_rad)
+                self._path_constraint_evidence = {
+                    **dict(self._path_policy),
+                    "activation_axis_in_reference_frame": list(public_cone.reference_axis),
+                    "constraint_identity": constraint_identity,
+                    "planned_max_deviation_rad": maximum,
+                    "validated_reference_count": len(plan.reference_poses),
+                    "scope": "sampled_planned_and_live_references",
+                }
         except MujocoTcpPlanRejected as error:
             logging.getLogger(__name__).warning("Safe TCP planning rejected: %s", error)
             hold = self._hold(reason=error.reason_code)
@@ -1207,7 +1370,7 @@ class MujocoAgentSafeTcpPoseSkillLifecycle(MujocoAgentTcpPoseSkillLifecycle):
         try:
             if safety is not None:
                 for index, pose in enumerate(plan.reference_poses):
-                    projection = safety.project({"right": xyzquat_to_pose_matrix(pose)})
+                    projection = safety.project({motion_side: xyzquat_to_pose_matrix(pose)})
                     if projection.modified_sides:
                         raise MujocoTcpPlanRejected(
                             "safe_tcp_path_safety_envelope_blocked",
@@ -1216,7 +1379,7 @@ class MujocoAgentSafeTcpPoseSkillLifecycle(MujocoAgentTcpPoseSkillLifecycle):
                                 "projection": projection.to_payload(),
                             },
                         )
-            self._planner.activate(plan)
+            self._activate_plan(plan)
             self._contact_check_enabled = self._contact_binding is not None
         except MujocoTcpPlanRejected as error:
             logging.getLogger(__name__).warning(
@@ -1232,6 +1395,22 @@ class MujocoAgentSafeTcpPoseSkillLifecycle(MujocoAgentTcpPoseSkillLifecycle):
             )
         self._execution_refs.add("mujoco-safe-joint-trajectory:" + plan.trajectory_hash)
         return evidence
+
+    def _success(self, **kwargs):
+        completion = super()._success(**kwargs)
+        if (self.route.skill_id == "motion.move_tcp_to_pose_safe"
+                and self.route.skill_version == "2"):
+            if self._path_policy is not None and self._path_constraint_evidence is None:
+                raise RuntimeError("A constrained move cannot complete without validated path evidence.")
+            return replace(completion, execution_result={
+                **completion.execution_result,
+                "path_constraint_evidence": self._path_constraint_evidence,
+            })
+        return completion
+
+    def _planning_payload_binding(self):
+        """Only an explicitly composed lifecycle may supply carried geometry."""
+        return None
 
     def _capture_pose(self):
         pose = super()._capture_pose()
@@ -1263,7 +1442,98 @@ class MujocoAgentSafeTcpPoseSkillLifecycle(MujocoAgentTcpPoseSkillLifecycle):
         ) and super()._within_terminal_tolerance(pose)
 
 
+class MujocoAgentPreparedTcpPoseSkillLifecycle(MujocoAgentSafeTcpPoseSkillLifecycle):
+    """Consume an exact lower-retained chain through the normal Skill lifecycle.
+
+    This is an internal profile adapter, not a new Route or a plan grant. The
+    Route's future paired-plan owner must validate provenance/TTL/one-use before
+    constructing it. Lower activation independently rejects foreign, preview,
+    superseded, consumed and start-drifted plans; it never replans them.
+    """
+
+    def __init__(self, *, prepared_plan, **kwargs):
+        from sim.mujoco.deploy.planned_tcp_motion import MujocoTcpMotionPlan
+
+        if not isinstance(prepared_plan, MujocoTcpMotionPlan):
+            raise TypeError("prepared_plan must be a native MuJoCo TCP plan.")
+        if "contact_binding" in kwargs:
+            raise ValueError("A retained chain owns its per-stage contact bindings.")
+        self._prepared_plan = prepared_plan
+        self._prepared_parameters = None
+        if kwargs["request"].skill_id == "motion.execute_grasp_approach_plan":
+            # The public request remains an immutable plan reference. Only this
+            # trusted adapter resolves its lower-owned target for the existing
+            # pose lifecycle; it never rewrites request/operation identity.
+            profile = kwargs["motion_profile"]
+            app = kwargs["application"]
+            pose = app.transform_tcp_pose_xyzquat(
+                prepared_plan.reference_poses[-1],
+                source_frame_id=profile.execution_reference_frame_id,
+                target_frame_id=profile.reference_frame_id,
+            )
+            self._prepared_parameters = {
+                "pose_targets_by_component": {profile.component_id: pose},
+                "reference_frame_id": profile.reference_frame_id,
+                "reference_frame_spec_hash": profile.reference_frame_spec_hash,
+                "controlled_frame_id": "tool_tcp",
+                "frame_graph_hash": profile.frame_graph_hash,
+                "tool_config_hash": profile.tool_config_hash,
+                "calibration_hash": profile.calibration_hash,
+            }
+        super().__init__(**kwargs)
+
+    def _motion_parameters(self, parameters):
+        return self._prepared_parameters if self._prepared_parameters is not None else parameters
+
+    def _prepare_plan(self, *, constraint, constraint_identity, cancel_requested):
+        del constraint, constraint_identity  # Original stage bindings are kept.
+        if cancel_requested():
+            raise MujocoTcpPlanRejected("safe_tcp_planning_cancelled")
+        plan = self._prepared_plan
+        # Match the canonical exact-reference resolver's float32 conversion
+        # tolerance. Raw quaternion-dot acos is ill-conditioned at identity.
+        expected = xyzquat_to_pose_matrix(plan.reference_poses[-1])
+        requested = xyzquat_to_pose_matrix(self.target_pose)
+        if not np.allclose(expected, requested, atol=2e-6, rtol=0):
+            raise MujocoTcpPlanRejected(
+                "safe_tcp_retained_plan_target_mismatch",
+                {
+                    "maximum_matrix_difference": float(
+                        np.max(np.abs(expected - requested))
+                    ),
+                },
+            )
+        return plan
+
+    def _within_terminal_tolerance(self, pose):
+        # An immutable chain may return to its source pose. Endpoint equality
+        # must not skip that chain or manufacture successful consumption.
+        return (
+            self._path_completed
+            and MujocoAgentTcpPoseSkillLifecycle._within_terminal_tolerance(self, pose)
+        )
+
+    def _capture_pose(self):
+        pose = super()._capture_pose()
+        if self._path_completed:
+            stage = (
+                self._prepared_plan.stages[-1][1]
+                if self._prepared_plan.stages
+                else self._prepared_plan
+            )
+            if stage.contact_binding is not None:
+                check = self._planner.check_measured_contact(
+                    stage.contact_binding, self.target_pose
+                )
+                if not check.safe:
+                    raise MujocoTcpPlanRejected(
+                        "grasp_contact_measured_state_blocked", check.to_dict()
+                    )
+        return pose
+
+
 __all__ = [
+    "MujocoAgentPreparedTcpPoseSkillLifecycle",
     "MujocoAgentSafeTcpPoseSkillLifecycle",
     "MujocoAgentTcpPoseSkillLifecycle",
     "MujocoAgentTcpTargetResolution",

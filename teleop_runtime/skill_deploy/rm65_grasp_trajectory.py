@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from robot_motion.rm65.dual_arm_target_solver import DualArmToolTCPReachCheck
+
 import math
 import threading
 import time
@@ -100,9 +102,13 @@ RM65_GRASP_ENDPOINT_ORDER_JOINT_DISTANCE = "joint_distance"
 RM65_GRASP_ENDPOINT_ORDER_ESTIMATED_EXECUTION_TIME = (
     "estimated_execution_time"
 )
+RM65_GRASP_ENDPOINT_ORDER_TCP_ARC_EXECUTION_TIME = (
+    "tcp_arc_estimated_execution_time"
+)
 RM65_GRASP_ENDPOINT_ORDER_MODES = (
     RM65_GRASP_ENDPOINT_ORDER_JOINT_DISTANCE,
     RM65_GRASP_ENDPOINT_ORDER_ESTIMATED_EXECUTION_TIME,
+    RM65_GRASP_ENDPOINT_ORDER_TCP_ARC_EXECUTION_TIME,
 )
 # A failed fixed-orientation pregrasp is a local-route rejection, not proof
 # that the terminal grasp target is unreachable.  These failures may fall
@@ -131,6 +137,19 @@ _RM65_GLOBAL_GRASP_TARGET_FALLBACK_REASONS = frozenset(
 def _joint_proposals_match(first: np.ndarray, second: np.ndarray, *, atol: float) -> bool:
     """Compare normalized finite joint proposals at zero relative tolerance."""
     return bool(np.all(np.abs(first - second) <= atol))
+
+
+RM65_GRASP_CANDIDATE_REJECTION_REASONS = _RM65_GLOBAL_GRASP_TARGET_FALLBACK_REASONS | {
+    "grasp_path_motion_quality_exceeded",
+    "visible_gripper_terminal_collision",
+    "visible_gripper_approach_collision",
+    "visible_gripper_path_collision",
+    "approach_progress_out_of_bounds",
+    "approach_progress_reversed",
+    "approach_lateral_deviation",
+    "approach_orientation_deviation",
+    "path_planning_time_budget_exhausted",
+}
 
 
 class RM65GraspTrajectoryPlanningError(RuntimeError):
@@ -194,6 +213,8 @@ class RM65GraspTrajectoryPlanningConfig:
         0.35,
     )
 
+    pose_goal_policy: str = "within_arrival_tolerance"
+
     def for_tcp_pose_move(
         self, *, translation_tolerance_m: float, rotation_tolerance_rad: float,
     ) -> RM65GraspTrajectoryPlanningConfig:
@@ -213,6 +234,10 @@ class RM65GraspTrajectoryPlanningConfig:
         )
 
     def __post_init__(self) -> None:
+        if not isinstance(self.pose_goal_policy, str) or self.pose_goal_policy not in (
+            "preserve_target", "within_arrival_tolerance",
+        ):
+            raise ValueError("Invalid pose_goal_policy.")
         if not isinstance(self.allow_unconstrained_terminal_fallback, bool):
             raise ValueError("allow_unconstrained_terminal_fallback must be bool.")
         for name in (
@@ -823,13 +848,76 @@ class RM65GraspJointTrajectoryPlanner:
         request._local_chain_cache_lock = threading.Lock()
         return request
 
-    def plan_with_observed_cloud(self, cloud: ObservedObstacleCloud, **kwargs):
+    def _for_pose_goal_policy(
+        self, *, pose_goal_policy: str, require_grasp_approach: bool,
+    ) -> RM65GraspJointTrajectoryPlanner:
+        if not isinstance(pose_goal_policy, str) or pose_goal_policy not in (
+            "preserve_target", "within_arrival_tolerance",
+        ):
+            raise ValueError("Invalid pose_goal_policy.")
+        if require_grasp_approach and pose_goal_policy != "within_arrival_tolerance":
+            raise ValueError("pose_goal_policy is only supported for ordinary safe TCP moves.")
+        config = self.config
+        position = config.endpoint_position_tolerance_m
+        orientation = config.endpoint_orientation_tolerance_deg
+        if pose_goal_policy == "preserve_target":
+            position = min(position, 0.003)
+            orientation = min(orientation, 1.0)
+        if (pose_goal_policy == config.pose_goal_policy
+                and position == config.endpoint_position_tolerance_m
+                and orientation == config.endpoint_orientation_tolerance_deg):
+            return self
+        request = copy(self)
+        request.config = replace(config, pose_goal_policy=pose_goal_policy,
+            endpoint_position_tolerance_m=position,
+            endpoint_orientation_tolerance_deg=orientation)
+        return request
+
+    def plan_with_observed_cloud(
+        self, cloud: ObservedObstacleCloud, *,
+        pose_goal_policy: str = "within_arrival_tolerance", **kwargs,
+    ):
         """Serialize shared target-builder use across observed requests."""
         monotonic = kwargs.get("monotonic", time.perf_counter)
         started = float(monotonic())
         with self._observed_planning_lock:
-            return self.for_observed_cloud(cloud)._plan(
-                _planning_started_at=started, **kwargs)
+            request = self.for_observed_cloud(cloud)._for_pose_goal_policy(
+                pose_goal_policy=pose_goal_policy,
+                require_grasp_approach=kwargs.get("require_grasp_approach", True),
+            )
+            return request._plan(_planning_started_at=started, **kwargs)
+
+    def tool_tcp_poses_for_qpos_pair(self, *, qpos_by_side):
+        """Return explicit-pair FK without exposing mutable native scratch."""
+        with self._observed_planning_lock, self._solver_lock:
+            return self.target_builder.tool_tcp_world_targets_for_qpos_pair(
+            left_qpos=qpos_by_side["left"], right_qpos=qpos_by_side["right"])
+
+    def _check_grasp_geometric_reach(
+        self, *, qpos_by_side: Mapping[str, np.ndarray], side: str,
+        target_tool_tcp_world: np.ndarray, orientation_tolerance_deg: float | None = None,
+    ) -> DualArmToolTCPReachCheck | None:
+        query = getattr(self.target_builder, "tool_tcp_geometric_reach_check", None)
+        if not callable(query):
+            return None
+        return query(
+            qpos_by_side=qpos_by_side, side=side,
+            target_tool_tcp_world=target_tool_tcp_world,
+            position_tolerance_m=self.config.endpoint_position_tolerance_m,
+            orientation_tolerance_deg=(self.config.endpoint_orientation_tolerance_deg
+                if orientation_tolerance_deg is None else orientation_tolerance_deg),
+        )
+
+    def check_grasp_geometric_reach(
+        self, *, qpos_by_side: Mapping[str, np.ndarray], side: str,
+        target_tool_tcp_world: np.ndarray,
+    ) -> DualArmToolTCPReachCheck | None:
+        """Cheap necessary terminal test, sharing the lower native geometry owner."""
+        with self._observed_planning_lock, self._solver_lock:
+            return self._check_grasp_geometric_reach(
+                qpos_by_side=qpos_by_side, side=side,
+                target_tool_tcp_world=target_tool_tcp_world,
+            )
 
     def require_static_grasp_scene(
         self, *, qpos_by_side: Mapping[str, np.ndarray], side: str,
@@ -1242,6 +1330,8 @@ class RM65GraspJointTrajectoryPlanner:
         candidates: tuple[_EndpointIKCandidate, ...],
         current_qpos: np.ndarray,
         side: str,
+        deadline: float | None = None,
+        monotonic: Callable[[], float] = time.perf_counter,
     ) -> tuple[_EndpointIKCandidate, ...]:
         """Order valid IK branches without adding another path-search pass."""
 
@@ -1275,15 +1365,47 @@ class RM65GraspJointTrajectoryPlanner:
                 "joint velocity profile must expose six positive limits."
             )
 
-        def key(item: _EndpointIKCandidate) -> tuple[float, float, int]:
+        def key(item: _EndpointIKCandidate) -> tuple[float, float, float, int]:
             target = np.asarray(item.qpos_by_side[side], dtype=float)
             delta = np.abs(target - current)
             minimum_joint_time = float(np.max(delta / velocity_limit))
-            estimated_time = minimum_joint_time * self._singularity_interval_scale(
+            joint_time = minimum_joint_time * self._singularity_interval_scale(
                 current,
                 target,
             )
-            return estimated_time, float(np.linalg.norm(delta)), item.seed_index
+            if self.config.endpoint_candidate_ordering == (
+                RM65_GRASP_ENDPOINT_ORDER_TCP_ARC_EXECUTION_TIME
+            ):
+                if deadline is not None:
+                    self._remaining_path_planning_time_sec(
+                        deadline=deadline, monotonic=monotonic,
+                        planning_phase="endpoint_candidate_ordering",
+                    )
+                # A short joint-space chord can sweep the TCP through a long
+                # nonlinear FK arc. This is a ranking estimate only: the real
+                # path and its final parameterization retain every original
+                # collision, envelope and motion-quality check.
+                start = {name: np.asarray(q, dtype=float).copy()
+                         for name, q in item.qpos_by_side.items()}
+                start[side] = current.copy()
+                tcp_arc_m = self._tcp_path_edge_cost(
+                    start, item.qpos_by_side, side=side,
+                    deadline=deadline, monotonic=monotonic,
+                )
+                if deadline is not None:
+                    self._remaining_path_planning_time_sec(
+                        deadline=deadline, monotonic=monotonic,
+                        planning_phase="endpoint_candidate_ordering",
+                    )
+                if not math.isfinite(tcp_arc_m) or tcp_arc_m < 0.0:
+                    raise ValueError("Endpoint TCP arc must be finite and nonnegative.")
+                estimated_time = max(
+                    joint_time, tcp_arc_m / self.config.linear_speed_m_s,
+                )
+                return (estimated_time, joint_time,
+                        float(np.linalg.norm(delta)), item.seed_index)
+            return (joint_time, joint_time,
+                    float(np.linalg.norm(delta)), item.seed_index)
 
         return tuple(sorted(candidates, key=key))
 
@@ -2458,6 +2580,8 @@ class RM65GraspJointTrajectoryPlanner:
         def residual(values: np.ndarray) -> np.ndarray:
             nonlocal cached_values, cached_residual, cached_jacobian
             nonlocal cached_tcp_jacobian, cached_rotation_error
+            if deadline is not None and float(monotonic()) >= deadline:
+                raise RM65GraspTrajectoryPlanningError("path_planning_time_budget_exhausted")
             # SciPy supplies fixed-shape six-joint iterates. Compare exactly,
             # not by identity or tolerance, including after an in-place update.
             if cached_values is not None and not (values != cached_values).any():
@@ -2623,6 +2747,8 @@ class RM65GraspJointTrajectoryPlanner:
                 target_tool_tcp_world=target_pose,
                 seed_qpos=np.asarray(seed_qpos, dtype=float),
                 solved_qpos=np.asarray(candidate[side], dtype=float),
+                deadline=deadline,
+                monotonic=monotonic,
             )
         return candidate, evaluations, position, orientation
 
@@ -2634,6 +2760,8 @@ class RM65GraspJointTrajectoryPlanner:
         target_tool_tcp_world: np.ndarray,
         seed_qpos: np.ndarray,
         solved_qpos: np.ndarray,
+        deadline: float | None = None,
+        monotonic: Callable[[], float] = time.perf_counter,
     ) -> tuple[dict[str, np.ndarray], float, float]:
         """Keep the earliest seed-to-solution point inside a strict margin.
 
@@ -2656,6 +2784,8 @@ class RM65GraspJointTrajectoryPlanner:
         solved = np.asarray(solved_qpos, dtype=float)
 
         def evaluate(alpha: float) -> tuple[dict[str, np.ndarray], float, float]:
+            if deadline is not None and float(monotonic()) >= deadline:
+                raise RM65GraspTrajectoryPlanningError("path_planning_time_budget_exhausted")
             pair = {
                 name: np.asarray(qpos_by_side[name], dtype=float).copy()
                 for name in _SIDES
@@ -2910,7 +3040,7 @@ class RM65GraspJointTrajectoryPlanner:
         # accepted result is still measured against the original requested
         # pose, the same envelope, and the unchanged production collision
         # clearance.  True penetrations do not activate this rescue.
-        if accepted == [] and clearance_rescue_seeds and (
+        if self.config.pose_goal_policy != "preserve_target" and accepted == [] and clearance_rescue_seeds and (
             deadline is None or float(monotonic()) < deadline
         ):
             _distance, source_seed_index, rescue_seed = max(
@@ -3062,6 +3192,8 @@ class RM65GraspJointTrajectoryPlanner:
                 candidates=tuple(accepted),
                 current_qpos=current,
                 side=side,
+                deadline=deadline,
+                monotonic=monotonic,
             )
             return tuple(
                 replace(candidate, search_attempt_count=len(attempts),
@@ -3279,6 +3411,26 @@ class RM65GraspJointTrajectoryPlanner:
                             monotonic=monotonic,
                         )
                     )
+                except RM65GraspTrajectoryPlanningError as error:
+                    if error.reason_code != "path_planning_time_budget_exhausted":
+                        raise
+                    termination = "time_budget_exhausted"
+                    if best is None and initial_seed_qpos is None:
+                        # Keep the legacy no-hint diagnostic: one factual
+                        # FK sample, no new seed or optimization budget.
+                        # This cannot produce a late standard label.
+                        pair = {name: np.asarray(qpos_by_side[name], dtype=float).copy()
+                                for name in _SIDES}
+                        realized = self.target_builder.tool_tcp_world_targets_for_qpos_pair(
+                            left_qpos=pair["left"], right_qpos=pair["right"])[side]
+                        position, orientation = pose_delta_metrics(realized, target_pose)
+                        if not math.isfinite(position) or not math.isfinite(orientation):
+                            raise RuntimeError("RM65 reachability diagnostic residual must be finite.")
+                        best = (max(position / config.basic_position_tolerance_m,
+                                    orientation / config.basic_orientation_tolerance_deg),
+                                position, orientation)
+                        cycles += 1
+                    break
                 except (RuntimeError, ValueError, np.linalg.LinAlgError):
                     continue
                 cycles += evaluations
@@ -3804,12 +3956,22 @@ class RM65GraspJointTrajectoryPlanner:
                 left_qpos=left, right_qpos=right)[side][:3, 3])
         return sampled_path_motion_quality(np.asarray(values[side]), np.asarray(positions))
 
-    def _tcp_path_edge_cost(self, start, end, *, side: str) -> float:
-        """Sample FK travel for quality only; collision checks stay independent."""
+    def _tcp_path_edge_cost(
+        self, start, end, *, side: str, deadline: float | None = None,
+        monotonic: Callable[[], float] = time.perf_counter,
+    ) -> float:
+        """Sample FK travel for route cost and optional IK ranking, never admission."""
+        def pose_for_pair(pair):
+            if deadline is not None:
+                self._remaining_path_planning_time_sec(
+                    deadline=deadline, monotonic=monotonic,
+                    planning_phase="endpoint_candidate_ordering",
+                )
+            return self.target_builder.tool_tcp_world_targets_for_qpos_pair(
+                left_qpos=pair["left"], right_qpos=pair["right"])[side]
         return tcp_path_edge_cost(start, end, side=side,
             step_rad=self.planner_config.extension_step_rad,
-            pose_for_pair=lambda pair: self.target_builder.tool_tcp_world_targets_for_qpos_pair(
-                left_qpos=pair["left"], right_qpos=pair["right"])[side])
+            pose_for_pair=pose_for_pair)
 
     def _require_motion_quality(self, values, *, side, deadline, monotonic):
         quality = self._trajectory_motion_quality(values, side=side, deadline=deadline, monotonic=monotonic)
@@ -3836,6 +3998,7 @@ class RM65GraspJointTrajectoryPlanner:
         endpoint_candidates: tuple[_EndpointIKCandidate, ...] | None = None,
         deadline: float | None = None,
         monotonic: Callable[[], float] = time.perf_counter,
+        start_qpos_source: str | None = None,
     ) -> _PlannedPathLeg:
         if deadline is not None:
             self._remaining_path_planning_time_sec(
@@ -3934,9 +4097,15 @@ class RM65GraspJointTrajectoryPlanner:
                 } for item in endpoint_candidates)
             if path.status is not JointPathStatus.PATH_FOUND:
                 if path.status is JointPathStatus.START_BLOCKED:
+                    start_details: dict[str, object] = {"path_status": path.status.value}
+                    if start_qpos_source is not None:
+                        start_details["start_qpos_source"] = start_qpos_source
+                    if "start_check" in path.metadata:
+                        start_details["start_check"] = _plain_search_evidence(path.metadata["start_check"])
+                    attempt_record.update(start_details)
                     raise RM65GraspTrajectoryPlanningError(
                         "path_start_collision_blocked",
-                        details={"planning_phase": planning_phase,
+                        details={**start_details, "planning_phase": planning_phase,
                                  "path": path.to_dict(), "search_attempts": search_attempts},
                     )
                 if path.status is JointPathStatus.INVALID_REQUEST:
@@ -4573,6 +4742,7 @@ class RM65GraspJointTrajectoryPlanner:
                     raise RM65GraspTrajectoryPlanningError(error.reason_code,
                         details={**error.details, "local_continuation_attempts": local_attempts}) from error
                 if (candidate_kind == "requested_pose"
+                        and self.config.pose_goal_policy != "preserve_target"
                         and error.reason_code == "approach_endpoint_clearance_blocked"):
                     # Use the existing bounded endpoint tolerance probes even
                     # when a distant exact IK branch could pass collision.
@@ -4595,6 +4765,7 @@ class RM65GraspJointTrajectoryPlanner:
                 qpos_by_side=qpos_by_side, side=side, target_tool_tcp_world=target_tool_tcp_world,
                 planning_phase="safe_pose_target", visible_scene=visible_scene,
                 prefer_closest_tolerance=False, deadline=deadline, monotonic=monotonic,
+                start_qpos_source="input_qpos",
             )
         except RM65GraspTrajectoryPlanningError as error:
             raise RM65GraspTrajectoryPlanningError(error.reason_code,
@@ -5045,6 +5216,7 @@ class RM65GraspJointTrajectoryPlanner:
         monotonic: Callable[[], float],
         visible_scene: VisibleGraspScene | None = None,
         prepared_approaches: _PreparedGraspApproaches | None = None,
+        start_qpos_source: str | None = None,
     ) -> tuple[_PlannedPathLeg, _PlannedPathLeg]:
         """Connect to an exact prevalidated local branch, without re-solving IK."""
 
@@ -5063,6 +5235,7 @@ class RM65GraspJointTrajectoryPlanner:
                 prefer_closest_tolerance=False,
                 endpoint_candidates=tuple(endpoint for endpoint, _ in prepared.candidates),
                 deadline=deadline, monotonic=monotonic,
+                start_qpos_source=start_qpos_source,
             )
         except RM65GraspTrajectoryPlanningError as error:
             if error.reason_code in {"path_search_exhausted", "path_target_collision_blocked",
@@ -5084,7 +5257,9 @@ class RM65GraspJointTrajectoryPlanner:
                 return self._plan_pregrasp_and_approach(qpos_by_side=qpos_by_side, side=side,
                     pregrasp_tool_tcp_world=pregrasp_tool_tcp_world,
                     grasp_tool_tcp_world=grasp_tool_tcp_world, visible_scene=visible_scene,
-                    deadline=deadline, monotonic=monotonic, prepared_approaches=fresh)
+                    deadline=deadline, monotonic=monotonic, prepared_approaches=fresh,
+                    start_qpos_source=start_qpos_source,
+                )
             raise RM65GraspTrajectoryPlanningError(
                 error.reason_code,
                 details={**error.details,
@@ -5142,6 +5317,7 @@ class RM65GraspJointTrajectoryPlanner:
                 monotonic=monotonic,
                 visible_scene=visible_scene,
                 prepared_approaches=prepared,
+                start_qpos_source="input_qpos",
             )
             return (pregrasp_leg, approach_leg), None, []
 
@@ -5170,6 +5346,7 @@ class RM65GraspJointTrajectoryPlanner:
                     visible_scene=visible_scene,
                     deadline=route_deadline,
                     monotonic=monotonic,
+                    start_qpos_source="input_qpos",
                 )
                 pregrasp_leg, approach_leg = self._plan_pregrasp_and_approach(
                     qpos_by_side=ingress_leg.endpoint.qpos_by_side,
@@ -5180,6 +5357,7 @@ class RM65GraspJointTrajectoryPlanner:
                     monotonic=monotonic,
                     visible_scene=visible_scene,
                     prepared_approaches=prepared,
+                    start_qpos_source="envelope_ingress_endpoint",
                 )
                 combined_waypoints = (
                     *ingress_leg.path.waypoints,
@@ -5343,7 +5521,9 @@ class RM65GraspJointTrajectoryPlanner:
             leg = self._plan_path_leg(
                 qpos_by_side=current, side=side, target_tool_tcp_world=target,
                 planning_phase="tcp_pose_target", prefer_closest_tolerance=False,
-                deadline=deadline, monotonic=monotonic)
+                deadline=deadline, monotonic=monotonic,
+                start_qpos_source="input_qpos",
+            )
         waypoints = tuple(leg.path.waypoints)
         if len(waypoints) == 1:
             waypoints = (waypoints[0], waypoints[0])
@@ -5410,12 +5590,17 @@ class RM65GraspJointTrajectoryPlanner:
         monotonic: Callable[[], float] = time.perf_counter,
         require_grasp_approach: bool = True,
         time_budget_sec: float | None = None,
+        pose_goal_policy: str = "within_arrival_tolerance",
     ) -> RealAgentJointTrajectory:
         # Request planners share a mutable target builder with their template.
         # Keep diagnostics inspectable without allowing concurrent plan state.
         started = float(monotonic())
         with self._observed_planning_lock:
-            return self._plan(
+            request = self._for_pose_goal_policy(
+                pose_goal_policy=pose_goal_policy,
+                require_grasp_approach=require_grasp_approach,
+            )
+            return request._plan(
                 qpos_by_side=qpos_by_side, side=side,
                 target_tool_tcp_world=target_tool_tcp_world, speed_scale=speed_scale,
                 visible_scene=visible_scene, monotonic=monotonic,
@@ -5468,7 +5653,9 @@ class RM65GraspJointTrajectoryPlanner:
                     else "path_start_collision_blocked", details={
                         **initial_check.metadata, "minimum_distance_m": initial_check.minimum_distance_m,
                         "collision_query_reason": initial_check.reason,
-                        "planning_phase": "observed_scene_start_admission"})
+                        "planning_phase": "observed_scene_start_admission",
+                        "start_qpos_source": "input_qpos",
+                        "start_check": _plain_search_evidence(initial_check.to_dict())})
         planning_started_at = time.perf_counter()
         capture_self_observation_evidence = (
             None
@@ -5566,6 +5753,7 @@ class RM65GraspJointTrajectoryPlanner:
                     visible_scene=visible_scene,
                     deadline=deadline,
                     monotonic=monotonic,
+                    start_qpos_source="input_qpos",
                 ),
             )
         else:
@@ -5642,6 +5830,7 @@ class RM65GraspJointTrajectoryPlanner:
                                         prefer_closest_tolerance=False,
                                         deadline=deadline,
                                         monotonic=monotonic,
+                                        start_qpos_source="input_qpos",
                                     )
                                 except RM65GraspTrajectoryPlanningError as error:
                                     direct_fallback_attempt.update(
@@ -5742,6 +5931,7 @@ class RM65GraspJointTrajectoryPlanner:
                             prefer_closest_tolerance=False,
                             deadline=deadline,
                             monotonic=monotonic,
+                            start_qpos_source="input_qpos",
                         )
                     except RM65GraspTrajectoryPlanningError as error:
                         direct_fallback_attempt.update(
@@ -6377,6 +6567,29 @@ class RM65GraspJointTrajectoryPlanner:
             samples, side=selected_side, deadline=deadline, monotonic=monotonic)
         if not require_grasp_approach:
             parameterization_metadata["path_search_attempts"] = _plain_search_evidence(search_attempts)
+            self._remaining_path_planning_time_sec(deadline=deadline, monotonic=monotonic,
+                planning_phase="safe_tcp_final_endpoint")
+            with self._solver_lock:
+                achieved = self.target_builder.tool_tcp_world_targets_for_qpos_pair(
+                    left_qpos=samples["left"][-1], right_qpos=samples["right"][-1])[selected_side]
+            self._remaining_path_planning_time_sec(deadline=deadline, monotonic=monotonic,
+                planning_phase="safe_tcp_final_endpoint")
+            position_error, orientation_error = pose_delta_metrics(achieved, target_pose)
+            if (not math.isfinite(position_error) or not math.isfinite(orientation_error)
+                    or position_error > self.config.endpoint_position_tolerance_m
+                    or orientation_error > self.config.endpoint_orientation_tolerance_deg):
+                raise RM65GraspTrajectoryPlanningError("safe_tcp_endpoint_pose_tolerance_exceeded",
+                    details={"position_residual_m": position_error,
+                             "orientation_residual_deg": orientation_error})
+            parameterization_metadata["pose_goal"] = {
+                "pose_goal_policy": self.config.pose_goal_policy,
+                "requested_tool_tcp_world": target_pose.tolist(),
+                "planned_tool_tcp_world": achieved.tolist(),
+                "position_residual_m": position_error,
+                "orientation_residual_deg": orientation_error,
+                "planning_position_tolerance_m": self.config.endpoint_position_tolerance_m,
+                "planning_orientation_tolerance_deg": self.config.endpoint_orientation_tolerance_deg,
+            }
         planning_timing = {
             "clock": "host_perf_counter",
             "pre_path_search_wall_duration_sec": float(
@@ -6501,6 +6714,7 @@ class RM65GraspJointTrajectoryPlanner:
 __all__ = [
     "RM65_GRASP_ENDPOINT_ORDER_ESTIMATED_EXECUTION_TIME",
     "RM65_GRASP_ENDPOINT_ORDER_JOINT_DISTANCE",
+    "RM65_GRASP_ENDPOINT_ORDER_TCP_ARC_EXECUTION_TIME",
     "RM65_GRASP_ENDPOINT_ORDER_MODES",
     "RM65_GRASP_PATH_PLANNING_TIME_BUDGET_SEC",
     "RM65_GRASP_SINGULARITY_HARD_THRESHOLD_DEG",

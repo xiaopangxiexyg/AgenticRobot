@@ -14,14 +14,10 @@ from agent_gateway.runtime.access_policy import (
 )
 from agent_gateway.skills.gripper.definition import SET_GRIPPER_STATE_SKILL_ID_V1
 from agent_gateway.skills.motion.definition import (
+    ARCHIVED_DEBUG_MOTION_SKILL_IDS_V1,
     EXECUTE_GRASP_APPROACH_PLAN_SKILL_ID_V1,
-    FIXED_CARDINAL_TCP_STEP_DIRECTION_BY_SKILL_ID_V1,
-    FIXED_CARDINAL_TCP_STEP_SKILL_ID_BY_DIRECTION_V1,
     GRASP_APPROACH_SKILL_ID_V1,
     SAFE_TCP_POSE_TARGET_SKILL_ID_V1,
-    TCP_LEVEL_FORWARD_LEFT_30_SKILL_ID_V1,
-    TCP_LEVEL_FORWARD_RIGHT_30_SKILL_ID_V1,
-    TCP_LEVEL_FORWARD_SKILL_ID_V1,
     TCP_POSE_TARGET_SKILL_ID_V1,
 )
 from dataset_contracts.canonical_encoding import canonical_content_hash
@@ -38,15 +34,6 @@ REAL_AGENT_SAFE_TCP_POSE_ACTION = "move_tcp_to_pose_safe"
 REAL_AGENT_GRASP_APPROACH_ACTION = "approach_grasp_pose"
 REAL_AGENT_EXECUTE_GRASP_APPROACH_PLAN_ACTION = "execute_grasp_approach_plan"
 REAL_AGENT_PRIMITIVE_ACTIONS = (
-    "forward",
-    "backward",
-    "left",
-    "right",
-    "up",
-    "down",
-    "level_forward",
-    "level_forward_left_30",
-    "level_forward_right_30",
     REAL_AGENT_ABSOLUTE_TCP_POSE_ACTION,
     REAL_AGENT_SAFE_TCP_POSE_ACTION,
     REAL_AGENT_GRASP_APPROACH_ACTION,
@@ -55,10 +42,6 @@ REAL_AGENT_PRIMITIVE_ACTIONS = (
 )
 _FIXED_SKILL_ID_BY_ACTION = {
     "set_gripper_state": SET_GRIPPER_STATE_SKILL_ID_V1,
-    **dict(FIXED_CARDINAL_TCP_STEP_SKILL_ID_BY_DIRECTION_V1),
-    "level_forward": TCP_LEVEL_FORWARD_SKILL_ID_V1,
-    "level_forward_left_30": TCP_LEVEL_FORWARD_LEFT_30_SKILL_ID_V1,
-    "level_forward_right_30": TCP_LEVEL_FORWARD_RIGHT_30_SKILL_ID_V1,
     REAL_AGENT_ABSOLUTE_TCP_POSE_ACTION: TCP_POSE_TARGET_SKILL_ID_V1,
     REAL_AGENT_SAFE_TCP_POSE_ACTION: SAFE_TCP_POSE_TARGET_SKILL_ID_V1,
     REAL_AGENT_GRASP_APPROACH_ACTION: GRASP_APPROACH_SKILL_ID_V1,
@@ -69,6 +52,23 @@ _FIXED_SKILL_ID_BY_ACTION = {
 _ACTION_BY_FIXED_SKILL_ID = {
     skill_id: action for action, skill_id in _FIXED_SKILL_ID_BY_ACTION.items()
 }
+_ARCHIVED_PRIMITIVE_ACTIONS = frozenset(
+    skill_id.removeprefix("motion.step_tcp_").removeprefix("motion.set_tcp_")
+    for skill_id in ARCHIVED_DEBUG_MOTION_SKILL_IDS_V1
+)
+
+
+def validate_real_agent_primitive_action(action: str) -> str:
+    """Reject retired aliases and IDs before authorization or resource assembly."""
+
+    if (
+        action in _ARCHIVED_PRIMITIVE_ACTIONS
+        or action in ARCHIVED_DEBUG_MOTION_SKILL_IDS_V1
+    ):
+        raise ValueError(f"Archived debug motion action {action!r} is unavailable.")
+    if action not in REAL_AGENT_PRIMITIVE_ACTIONS:
+        raise ValueError(f"Unreviewed real motion action {action!r}.")
+    return action
 
 
 def _requested_action_and_component_ids(
@@ -76,26 +76,18 @@ def _requested_action_and_component_ids(
 ) -> tuple[str | None, tuple[str, ...]]:
     """Resolve only the operator authorization class and selected components.
 
-    Absolute TCP targets intentionally use ``pose_targets_by_component`` while
-    the fixed primitives use ``component_id``.  Keeping this distinction here
-    prevents a published absolute-pose Route from becoming permanently
-    ungrantable merely because its payload shape is not a cardinal primitive.
+    Absolute TCP targets use ``pose_targets_by_component`` while retained plan
+    execution uses ``component_id``. Archived debug Skills cannot obtain grants.
     Target values, frame identities, profile hashes, safety envelopes, and all
     lower admission remain validated by their existing owners.
     """
 
     parameters = request.parameters
+    if request.skill_id in ARCHIVED_DEBUG_MOTION_SKILL_IDS_V1:
+        return None, ()
     if request.skill_id == SET_GRIPPER_STATE_SKILL_ID_V1:
         return "set_gripper_state", (("right_gripper",) if request.skill_version == "1"
                                       else (str(parameters.get("component_id")),))
-    fixed_cardinal_action = FIXED_CARDINAL_TCP_STEP_DIRECTION_BY_SKILL_ID_V1.get(
-        request.skill_id
-    )
-    if (
-        fixed_cardinal_action is not None
-        and parameters.get("direction") != fixed_cardinal_action
-    ):
-        return None, ()
     if request.skill_id in {
         TCP_POSE_TARGET_SKILL_ID_V1,
         SAFE_TCP_POSE_TARGET_SKILL_ID_V1,
@@ -114,11 +106,7 @@ def _requested_action_and_component_ids(
         if len(component_ids) != len(targets):
             return _ACTION_BY_FIXED_SKILL_ID[request.skill_id], ()
         return _ACTION_BY_FIXED_SKILL_ID[request.skill_id], component_ids
-    requested_action = (
-        parameters.get("direction")
-        if request.skill_id == "motion.step_tcp_cardinal"
-        else (fixed_cardinal_action or _ACTION_BY_FIXED_SKILL_ID.get(request.skill_id))
-    )
+    requested_action = _ACTION_BY_FIXED_SKILL_ID.get(request.skill_id)
     component_id = parameters.get("component_id")
     return (
         requested_action if isinstance(requested_action, str) else None,
@@ -137,6 +125,7 @@ class RealAgentPrimitiveSessionAuthorization:
         action: str | None = None,
         authorized_actions: tuple[str, ...] | None = None,
         authorized_gripper_sides: tuple[str, ...] | None = None,
+        authorized_motion_sides: tuple[str, ...] | None = None,
         client_id: str,
         confirmation_token: str,
         grant_lifetime_sec: float = 5.0,
@@ -164,10 +153,10 @@ class RealAgentPrimitiveSessionAuthorization:
         normalized_client_id = str(client_id).strip()
         if normalized_side not in {"left", "right"}:
             raise ValueError("side must be left or right.")
-        if not normalized_actions or any(
-            item not in REAL_AGENT_PRIMITIVE_ACTIONS for item in normalized_actions
-        ):
+        if not normalized_actions:
             raise ValueError("authorized_actions contains an unreviewed primitive.")
+        for item in normalized_actions:
+            validate_real_agent_primitive_action(item)
         if not normalized_client_id:
             raise ValueError("client_id must be non-empty.")
         if str(confirmation_token) != REAL_AGENT_PRIMITIVE_SESSION_CONFIRM_TOKEN:
@@ -183,6 +172,14 @@ class RealAgentPrimitiveSessionAuthorization:
 
         self.gateway_session = gateway_session
         self.side = normalized_side
+        self.authorized_motion_sides = tuple(sorted(set(
+            (normalized_side,) if authorized_motion_sides is None else authorized_motion_sides)))
+        if (not self.authorized_motion_sides or normalized_side not in self.authorized_motion_sides
+                or not set(self.authorized_motion_sides) <= {"left", "right"}):
+            raise ValueError("authorized_motion_sides must contain the primary side and select left/right.")
+        if not {arm + "_arm" for arm in self.authorized_motion_sides} <= set(
+                gateway_session.contract_bundle.attachment.component_ids):
+            raise ValueError("Motion authorization exceeds the bound arm components.")
         self.authorized_actions = normalized_actions
         self.authorized_gripper_sides = tuple(
             sorted(
@@ -231,6 +228,7 @@ class RealAgentPrimitiveSessionAuthorization:
                     "side": self.side,
                     **({"authorized_gripper_sides": self.authorized_gripper_sides}
                        if gripper_contract is not None and gripper_contract.deployment_binding.skill_version == "2" else {}),
+                    "authorized_motion_sides": self.authorized_motion_sides,
                     "authorized_actions": self.authorized_actions,
                     "client_id": self.client_id,
                     "confirmation": REAL_AGENT_PRIMITIVE_SESSION_CONFIRM_TOKEN,
@@ -274,6 +272,10 @@ class RealAgentPrimitiveSessionAuthorization:
                 side + "_gripper" for side in self.authorized_gripper_sides
             }:
                 return None
+        elif requested_action in {REAL_AGENT_ABSOLUTE_TCP_POSE_ACTION, REAL_AGENT_SAFE_TCP_POSE_ACTION}:
+            if len(component_ids) != 1 or component_ids[0] not in {
+                    arm + "_arm" for arm in self.authorized_motion_sides}:
+                return None
         elif component_ids != (f"{self.side}_arm",):
             return None
         if requested_action not in REAL_AGENT_PRIMITIVE_ACTIONS:
@@ -315,4 +317,5 @@ __all__ = [
     "REAL_AGENT_PRIMITIVE_SESSION_CONFIRM_TOKEN",
     "REAL_AGENT_SAFE_TCP_POSE_ACTION",
     "RealAgentPrimitiveSessionAuthorization",
+    "validate_real_agent_primitive_action",
 ]

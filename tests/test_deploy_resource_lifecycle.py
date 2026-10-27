@@ -78,9 +78,13 @@ class _PositionExecutor(_Closeable):
 
     def snapshot(self) -> dict[str, bool]:
         return {
+            "dispatch_workers_stopped": not self.worker_alive,
             "reference_worker_alive": self.worker_alive,
             "discrete_worker_alive": False,
         }
+
+    def shutdown_snapshot(self) -> dict[str, bool]:
+        return self.snapshot()
 
 
 class _Guard(_Closeable):
@@ -135,6 +139,7 @@ class _StartingPositionExecutor(_PositionExecutor):
 
     def snapshot(self) -> dict[str, object]:
         return {
+            "dispatch_workers_stopped": True,
             "reference_worker_affinity_receipt": self.affinity,
             "reference_worker_alive": False,
             "discrete_worker_alive": False,
@@ -397,7 +402,7 @@ def test_live_position_worker_blocks_backend_close_but_not_other_cleanup() -> No
     assert errors == (
         "keyboard_interrupt_emergency_stop: arm stop incomplete",
         "position_executor: RuntimeError: worker did not stop",
-        "position_backends: close skipped because a dispatch worker is still alive",
+        "position_backends: close skipped because worker shutdown is unconfirmed",
     )
     assert any(
         event == "position_executor_close_error"

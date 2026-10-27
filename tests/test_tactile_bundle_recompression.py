@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
+import os
+import stat
 import tempfile
 import uuid
 from pathlib import Path
+from unittest import mock
 
 import pytest
 
@@ -19,6 +23,7 @@ from collection_runtime.tactile_bundle_store import NativeTactileBundleStore
 from collection_runtime.tactile_recompression import TactileRecompressionCancelled
 from collection_runtime.tactile_recompression import run_idle_tactile_recompression_worker
 from dataset_contracts.episode_identity import EpisodeCaptureIdentity
+from dataset_contracts.tactile import ChunkedTactileStream
 from dataset_interface.tactile_bundle import attach_tactile_bundle
 
 
@@ -216,6 +221,294 @@ def _append_native_episode(
         encoding="utf-8",
     )
     return payload_path
+
+
+def _episode_metadata_paths(core: Path, storage: Path, episode_index: int = 0) -> dict[str, Path]:
+    attached = attach_tactile_bundle(core, storage)
+    commit = attached.episodes[episode_index].commit
+    bundle = storage / "datasets" / str(DATASET_UUID)
+    component = bundle / commit.tactile_component_ref
+    return {
+        "component": component,
+        "tactile_commit": component.with_name("bundle_commit.cjson"),
+        "core_commit": (core / commit.core_component_ref).with_name("bundle_commit.cjson"),
+        "catalog": core / "meta/episodes.jsonl",
+    }
+
+
+def _write_with_fault(write, path, payload, *, stage, error):
+    real_sync, real_replace = os.fsync, os.replace
+
+    def sync(fd):
+        if stage == "directory_sync" and stat.S_ISDIR(os.fstat(fd).st_mode):
+            raise error
+        real_sync(fd)
+
+    def replace(source, target):
+        if stage == "replace" and Path(target) == path:
+            raise error
+        real_replace(source, target)
+
+    with (
+        mock.patch.object(os, "fsync", side_effect=sync),
+        mock.patch.object(os, "replace", side_effect=replace),
+    ):
+        write(path, payload)
+
+
+def _assert_compressed_payload(bundle: Path, manifest: bytes, expected: bytes) -> None:
+    spec = json.loads(manifest)["streams"]["M_RAW"]
+    assert spec["compression"] == "zstd"
+    reader = ChunkedTactileStream(dataset_root=bundle, spec=spec)
+    assert b"".join(reader.frame(index).tobytes() for index in range(2)) == expected
+
+
+@pytest.mark.parametrize("failed_file", ["manifest", "component", "tactile_commit", "core_commit", "catalog"])
+def test_native_publication_failure_restores_attachment_before_deleting_payload(
+    tmp_path, monkeypatch, failed_file
+):
+    core, storage, raw = _native_dataset(tmp_path)
+    manifest = raw.with_name("manifest.json")
+    paths = _episode_metadata_paths(core, storage)
+    paths["manifest"] = manifest
+    before = {path: path.read_bytes() for path in paths.values()}
+    raw_before = raw.read_bytes()
+    injected = OSError(errno.EIO, "publication directory sync")
+    entrypoint = "_atomic_write_json" if failed_file == "manifest" else "_atomic_write_bytes"
+    original_write = getattr(native_recompression_module, entrypoint)
+    faulted = False
+
+    def publish(path, payload):
+        nonlocal faulted
+        if path == paths[failed_file] and not faulted:
+            faulted = True
+            return _write_with_fault(
+                original_write, path, payload, stage="directory_sync", error=injected
+            )
+        return original_write(path, payload)
+
+    monkeypatch.setattr(native_recompression_module, entrypoint, publish)
+    with pytest.raises(OSError) as caught:
+        recompress_native_tactile_bundle_zstd_in_place(
+            core, storage, min_free_bytes=0, backend="python"
+        )
+    assert caught.value is injected
+    assert faulted
+    assert {path: path.read_bytes() for path in before} == before
+    assert raw.read_bytes() == raw_before
+    assert not raw.with_name(f"{raw.name}.tdelta8.zst").exists()
+    assert list(tmp_path.rglob("*.tmp")) == []
+    attach_tactile_bundle(core, storage)
+    result = recompress_native_tactile_bundle_zstd_in_place(
+        core, storage, min_free_bytes=0, backend="python"
+    )
+    assert result["episode_count"] == 1
+    assert not raw.exists()
+    attach_tactile_bundle(core, storage)
+    _assert_compressed_payload(
+        storage / "datasets" / str(DATASET_UUID), manifest.read_bytes(), raw_before
+    )
+
+
+@pytest.mark.parametrize("restore_file", ["component", "tactile_commit", "core_commit", "catalog"])
+@pytest.mark.parametrize("stage", ["replace", "directory_sync"])
+def test_native_metadata_restore_failure_stops_payload_cleanup(
+    tmp_path, monkeypatch, restore_file, stage
+):
+    core, storage, raw = _native_dataset(tmp_path)
+    paths = _episode_metadata_paths(core, storage)
+    before = {path: path.read_bytes() for path in paths.values()}
+    manifest = raw.with_name("manifest.json")
+    raw_before = raw.read_bytes()
+    published = {}
+    restored = []
+    validation_error = OSError(errno.EIO, "post-publication validation")
+    restore_error = OSError(errno.EIO, "metadata restore failed")
+    original_write = native_recompression_module._atomic_write_bytes
+    original_attach = native_recompression_module.attach_tactile_bundle
+    attachments = 0
+
+    def attach(*args, **kwargs):
+        nonlocal attachments
+        result = original_attach(*args, **kwargs)
+        attachments += 1
+        if attachments == 2:
+            published.update({path: path.read_bytes() for path in before})
+            published[manifest] = manifest.read_bytes()
+            raise validation_error
+        return result
+
+    def write(path, payload):
+        if published:
+            restored.append(path)
+            if path == paths[restore_file]:
+                assert payload == before[path]
+                return _write_with_fault(
+                    original_write, path, payload, stage=stage, error=restore_error
+                )
+        return original_write(path, payload)
+
+    monkeypatch.setattr(native_recompression_module, "attach_tactile_bundle", attach)
+    monkeypatch.setattr(native_recompression_module, "_atomic_write_bytes", write)
+    with pytest.raises(OSError) as caught:
+        recompress_native_tactile_bundle_zstd_in_place(
+            core, storage, min_free_bytes=0, backend="python"
+        )
+    assert caught.value is restore_error
+    assert restore_error.__context__ is validation_error
+    assert attachments == 2
+    assert raw.read_bytes() == raw_before
+    assert raw.with_name(f"{raw.name}.tdelta8.zst").is_file()
+    assert manifest.read_bytes() == published[manifest]
+    ordered = list(paths.values())
+    failed_index = ordered.index(paths[restore_file])
+    assert restored == ordered[:failed_index + 1]
+    for index, path in enumerate(ordered):
+        was_restored = index < failed_index or (index == failed_index and stage == "directory_sync")
+        assert path.read_bytes() == (before[path] if was_restored else published[path])
+    _assert_compressed_payload(
+        storage / "datasets" / str(DATASET_UUID), published[manifest], raw_before
+    )
+    assert list(tmp_path.rglob("*.tmp")) == []
+
+
+@pytest.mark.parametrize("verify_history", [True, False])
+def test_native_multiple_episodes_keep_cumulative_catalog_updates(tmp_path, verify_history):
+    core, storage, first_raw = _native_dataset(tmp_path)
+    second_raw = _append_native_episode(core, storage, episode_index=1)
+    raw_bytes = {path: path.read_bytes() for path in (first_raw, second_raw)}
+    catalog = core / "meta/episodes.jsonl"
+    rows = [json.loads(line) for line in catalog.read_text(encoding="utf-8").splitlines()]
+    for row in rows:
+        row["metadata"] = {"tactile_bundle_episode": dict(row["tactile_bundle"])}
+    catalog.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+    before = attach_tactile_bundle(core, storage)
+    result = recompress_native_tactile_bundle_zstd_in_place(
+        core, storage, min_free_bytes=0, backend="python",
+        verify_historical_payload_hashes=verify_history,
+    )
+    assert result["episode_count"] == result["manifest_count"] == result["stream_count"] == 2
+    assert result["removed_original_bytes"] == 16
+    attached = attach_tactile_bundle(core, storage)
+    rows = [json.loads(line) for line in catalog.read_text(encoding="utf-8").splitlines()]
+    for index, raw in enumerate((first_raw, second_raw)):
+        assert not raw.exists()
+        assert attached.episodes[index].commit != before.episodes[index].commit
+        expected_hash = attached.episodes[index].commit.semantic_content_hash
+        assert rows[index]["tactile_bundle"]["commit_hash"] == expected_hash
+        assert rows[index]["metadata"]["tactile_bundle_episode"]["commit_hash"] == expected_hash
+        _assert_compressed_payload(
+            storage / "datasets" / str(DATASET_UUID),
+            raw.with_name("manifest.json").read_bytes(), raw_bytes[raw],
+        )
+
+
+def test_second_episode_rollback_keeps_the_first_episode_committed(tmp_path, monkeypatch):
+    core, storage, first_raw = _native_dataset(tmp_path)
+    second_raw = _append_native_episode(core, storage, episode_index=1)
+    first_bytes, second_bytes = first_raw.read_bytes(), second_raw.read_bytes()
+    before = attach_tactile_bundle(core, storage)
+    paths = _episode_metadata_paths(core, storage, 1)
+    original_write = native_recompression_module._atomic_write_bytes
+    injected = OSError(errno.EIO, "second episode commit sync")
+    catalog_before_second = None
+
+    def publish(path, payload):
+        nonlocal catalog_before_second
+        if path == paths["component"] and catalog_before_second is None:
+            catalog_before_second = paths["catalog"].read_bytes()
+            return _write_with_fault(
+                original_write, path, payload, stage="directory_sync", error=injected
+            )
+        return original_write(path, payload)
+
+    monkeypatch.setattr(native_recompression_module, "_atomic_write_bytes", publish)
+    with pytest.raises(OSError) as caught:
+        recompress_native_tactile_bundle_zstd_in_place(
+            core, storage, min_free_bytes=0, backend="python"
+        )
+    assert caught.value is injected
+    assert paths["catalog"].read_bytes() == catalog_before_second
+    attached = attach_tactile_bundle(core, storage)
+    assert attached.episodes[0].commit != before.episodes[0].commit
+    assert attached.episodes[1].commit == before.episodes[1].commit
+    assert not first_raw.exists()
+    assert second_raw.read_bytes() == second_bytes
+    assert not second_raw.with_name(f"{second_raw.name}.tdelta8.zst").exists()
+    _assert_compressed_payload(
+        storage / "datasets" / str(DATASET_UUID),
+        first_raw.with_name("manifest.json").read_bytes(), first_bytes,
+    )
+
+
+@pytest.mark.parametrize("failed_read", ["catalog", "core_commit"])
+def test_early_second_episode_failure_does_not_reuse_previous_recovery_state(
+    tmp_path, monkeypatch, failed_read
+):
+    core, storage, first_raw = _native_dataset(tmp_path)
+    second_raw = _append_native_episode(core, storage, episode_index=1)
+    before = attach_tactile_bundle(core, storage)
+    paths = _episode_metadata_paths(core, storage, 1)
+    original_read = Path.read_bytes
+    original_write = native_recompression_module._atomic_write_bytes
+    injected = OSError(errno.EIO, "second episode backup read")
+    faulted = False
+    restored = []
+
+    def read(path):
+        nonlocal faulted
+        if path == paths[failed_read] and not first_raw.exists() and not faulted:
+            faulted = True
+            raise injected
+        return original_read(path)
+
+    def write(path, payload):
+        if faulted:
+            restored.append(path)
+        return original_write(path, payload)
+
+    monkeypatch.setattr(Path, "read_bytes", read)
+    monkeypatch.setattr(native_recompression_module, "_atomic_write_bytes", write)
+    with pytest.raises(OSError) as caught:
+        recompress_native_tactile_bundle_zstd_in_place(
+            core, storage, min_free_bytes=0, backend="python"
+        )
+    assert caught.value is injected
+    assert faulted
+    assert restored == ([] if failed_read == "catalog" else [second_raw.with_name("manifest.json")])
+    attached = attach_tactile_bundle(core, storage)
+    assert attached.episodes[0].commit != before.episodes[0].commit
+    assert attached.episodes[1].commit == before.episodes[1].commit
+    assert not first_raw.exists()
+    assert second_raw.read_bytes() == bytes(range(9, 17))
+    assert not second_raw.with_name(f"{second_raw.name}.tdelta8.zst").exists()
+
+
+def test_raw_removal_failure_keeps_the_verified_new_metadata(tmp_path, monkeypatch):
+    core, storage, raw = _native_dataset(tmp_path)
+    raw_before = raw.read_bytes()
+    before = attach_tactile_bundle(core, storage)
+    original_unlink = Path.unlink
+    injected = PermissionError(errno.EACCES, "raw removal blocked")
+
+    def unlink(path, *args, **kwargs):
+        if path == raw:
+            raise injected
+        return original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", unlink)
+    with pytest.raises(PermissionError) as caught:
+        recompress_native_tactile_bundle_zstd_in_place(
+            core, storage, min_free_bytes=0, backend="python"
+        )
+    assert caught.value is injected
+    assert raw.read_bytes() == raw_before
+    attached = attach_tactile_bundle(core, storage)
+    assert attached.episodes[0].commit != before.episodes[0].commit
+    _assert_compressed_payload(
+        storage / "datasets" / str(DATASET_UUID),
+        raw.with_name("manifest.json").read_bytes(), raw_before,
+    )
 
 
 def test_native_idle_recompression_updates_bundle_commit_and_attachment() -> None:

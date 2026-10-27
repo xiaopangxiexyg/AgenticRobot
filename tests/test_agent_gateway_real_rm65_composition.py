@@ -220,7 +220,7 @@ class _ForceGuard:
         return None
 
 
-def _lower(monkeypatch, *, envelope_side: str = "right"):
+def _lower(monkeypatch, *, envelope_side: str = "right", absolute: bool = False):
     monkeypatch.setattr(
         profile_module,
         "load_assignment",
@@ -246,7 +246,8 @@ def _lower(monkeypatch, *, envelope_side: str = "right"):
             },
             envelope_profile_path=(
                 REPO_ROOT / "teleop_runtime/configs/skill_deploy/"
-                f"agent_primitive_{envelope_side}_relative_tight_v1.json"
+                / (f"agent_grasp_{envelope_side}_absolute_standard_v1.json" if absolute
+                   else f"agent_primitive_{envelope_side}_relative_tight_v1.json")
             ),
         )
     )
@@ -278,7 +279,7 @@ def test_model_free_three_view_projection_uses_the_existing_owner_cut(monkeypatc
     monkeypatch.setattr(lower.target_builder, "solver_world_targets_for_qpos_pair", fk)
     composition = assemble_exclusive_rm65_agent_primitive_composition(
         lower=lower, socket_path=tmp_path / "geometry.sock", authorized_side=side,
-        authorized_action="forward", confirmation_token=REAL_AGENT_PRIMITIVE_CONFIRM_TOKEN,
+        authorized_action="move_tcp_to_pose", confirmation_token=REAL_AGENT_PRIMITIVE_CONFIRM_TOKEN,
         client_id="rpent:test", client_uid=1000, runtime_session_id="geometry:test",
         control_domain_id="geometry:domain", embodiment_instance_id="geometry:arms",
         camera_config_path=REPO_ROOT / "teleop_runtime/configs/devices/agent_gateway_realsense.json",
@@ -362,6 +363,43 @@ def test_model_free_three_view_projection_uses_the_existing_owner_cut(monkeypatc
         session.close()
 
 
+@pytest.mark.parametrize("primary", ["left", "right"])
+def test_dual_motion_composition_has_one_owner_and_primary_bound_grasp(monkeypatch, tmp_path, primary):
+    lower, guard = _lower(monkeypatch, envelope_side="dual", absolute=True)
+    localizer = _Localizer()
+    composition = assemble_exclusive_rm65_agent_primitive_composition(
+        lower=lower, socket_path=tmp_path / "gateway.sock", authorized_side=primary,
+        authorized_action=None,
+        authorized_motion_sides=("left", "right"),
+        authorized_actions=("move_tcp_to_pose_safe", "execute_grasp_approach_plan"),
+        confirmation_token=REAL_AGENT_PRIMITIVE_CONFIRM_TOKEN, client_id="rpent:test", client_uid=1000,
+        runtime_session_id="dual:test", control_domain_id="dual:domain", embodiment_instance_id="dual:arms",
+        camera_config_path=REPO_ROOT / "teleop_runtime/configs/devices/agent_gateway_realsense.json",
+        camera_registry_path=DEFAULT_RM65_CAMERA_REGISTRY_V4,
+        artifact_root=tmp_path, camera_mount_urdf_path=DEFAULT_RM65_CAMERA_MOUNT_URDF,
+        object_localizer=localizer, point_grasp_planner=_PointGraspPlanner(localizer))
+    session = composition.deployment.gateway_session
+    try:
+        assert session.port is composition.deployment.control_runtime.motion_port
+        assert composition.attachment.component_ids == ("left_arm", "right_arm")
+        assert session.contract_bundle.grasp_approach_plan_registration.profile.side == primary
+        assert session.contract_bundle.pose_target_profile.component_ids == ("left_arm", "right_arm")
+        assert all(backend.starts == 0 for backend in lower.arm_backends.values())
+        assert guard.starts == 0
+    finally:
+        session.artifact_store.close()
+
+
+def test_dual_motion_rejects_single_side_envelope_before_start(monkeypatch, tmp_path):
+    lower, guard = _lower(monkeypatch)
+    with pytest.raises(ValueError, match="does not actively constrain 'left'"):
+        assemble_exclusive_rm65_agent_primitive_composition(lower=lower, socket_path=tmp_path / "gateway.sock",
+            authorized_side="right", authorized_motion_sides=("left", "right"), authorized_action="move_tcp_to_pose_safe",
+            confirmation_token=REAL_AGENT_PRIMITIVE_CONFIRM_TOKEN, client_id="rpent:test", client_uid=1000,
+            runtime_session_id="dual:test", control_domain_id="dual:domain", embodiment_instance_id="dual:arms")
+    assert guard.starts == 0 and all(backend.starts == 0 for backend in lower.arm_backends.values())
+
+
 def test_composition_advertises_right_gripper_without_starting_any_backend(monkeypatch):
     from agent_gateway.profiles.real.gripper_skill import ExclusiveRealGripperResources
 
@@ -394,7 +432,7 @@ def test_composition_advertises_right_gripper_without_starting_any_backend(monke
         right_gripper_backend=hand,
         socket_path=REPO_ROOT / "temp/test-gripper-composition.sock",
         authorized_side="right",
-        authorized_actions=("forward", "set_gripper_state"),
+        authorized_actions=("move_tcp_to_pose", "set_gripper_state"),
         authorized_action=None,
         confirmation_token=REAL_AGENT_PRIMITIVE_CONFIRM_TOKEN,
         client_id="rpent:test",
@@ -415,7 +453,7 @@ def test_composition_advertises_right_gripper_without_starting_any_backend(monke
 
 
 @pytest.mark.parametrize("authorized_side", ("left", "right"))
-@pytest.mark.parametrize("action", ["forward", "move_tcp_to_pose_safe"])
+@pytest.mark.parametrize("action", ["move_tcp_to_pose", "move_tcp_to_pose_safe"])
 def test_composition_binds_selected_side_to_one_lower_graph_without_start(
     monkeypatch, authorized_side: str, action: str
 ) -> None:
@@ -452,7 +490,7 @@ def test_composition_binds_selected_side_to_one_lower_graph_without_start(
         RM65_SKILL_EXECUTION_FRAME_ID_V1
     )
     assert RM65_SKILL_STATION_FRAME_ID_V1 in composition.frame_graph.frame_by_id
-    assert len(composition.safety_envelope_ref.allowed_route_ids) == 12 + int(action == "move_tcp_to_pose_safe")
+    assert len(composition.safety_envelope_ref.allowed_route_ids) == 2 + int(action == "move_tcp_to_pose_safe")
     manifest = composition.deployment.gateway_session.contract_bundle.route_manifest
     if action == "move_tcp_to_pose_safe":
         assert manifest.route("motion.move_tcp_to_pose_safe", "1").route.control_effect_class == "motion"
@@ -531,6 +569,14 @@ def test_safe_planner_binding_uses_arrival_tolerances_and_can_observe_without_mo
         safe_motion_debug_dir=tmp_path if debug_enabled else None)
     session = observed.deployment.gateway_session
     assert len(planners) == 1  # Safe static template is lazy, not a fixed-only fallback.
+    geometry_resources = [r for r in observed.resources.additional_resources
+        if isinstance(r, composition_module.MotionPlanningGeometryResources)]
+    assert len(geometry_resources) == 1
+    prepared = []
+    monkeypatch.setattr(geometry_resources[0].self_filter, 'prepare',
+                        lambda: prepared.append(True) or {})
+    geometry_resources[0].start()
+    assert prepared == [True] and len(planners) == 2
     for cloud in (object(), object()):
         request = adapter_bindings[0]['planner_factory'](cloud)
         assert request() is cloud
@@ -557,7 +603,7 @@ def test_composition_matches_mujoco_canonical_station_axes_and_pose(
         lower=lower,
         socket_path=REPO_ROOT / "temp/test-real-rm65-frame-parity.sock",
         authorized_side="right",
-        authorized_action="forward",
+        authorized_action="move_tcp_to_pose",
         confirmation_token=REAL_AGENT_PRIMITIVE_CONFIRM_TOKEN,
         client_id="rpent:test",
         client_uid=1000,
@@ -643,7 +689,7 @@ def test_composition_opt_in_binds_real_rgb_depth_and_artifact_plane_without_star
         lower=lower,
         socket_path=REPO_ROOT / "temp/test-real-rm65-perception.sock",
         authorized_side="right",
-        authorized_action="forward",
+        authorized_action="move_tcp_to_pose",
         confirmation_token=REAL_AGENT_PRIMITIVE_CONFIRM_TOKEN,
         client_id="rpent:test",
         client_uid=1000,
@@ -681,7 +727,7 @@ def test_composition_opt_in_binds_real_rgb_depth_and_artifact_plane_without_star
         assert session.service.protocol_runtime.session_capabilities.artifact_transfer_enabled
         assert session.rgb_executor is not None
         assert session.depth_executor is not None
-        assert len(session.contract_bundle.route_manifest.skill_routes) == 16
+        assert len(session.contract_bundle.route_manifest.skill_routes) == 6
         effects = {
             entry.route.skill_id: entry.route.control_effect_class
             for entry in session.contract_bundle.route_manifest.skill_routes
@@ -745,7 +791,7 @@ def test_composition_requires_complete_perception_attachment(
             lower=lower,
             socket_path=REPO_ROOT / "temp/test-real-rm65-perception.sock",
             authorized_side="right",
-            authorized_action="forward",
+        authorized_action="move_tcp_to_pose",
             confirmation_token=REAL_AGENT_PRIMITIVE_CONFIRM_TOKEN,
             client_id="rpent:test",
             client_uid=1000,
@@ -937,10 +983,10 @@ def test_preplanned_grasp_execution_consumes_exact_path_without_replanning(
             profile_hash=registration.profile.semantic_content_hash,
             planning_operation_id="grasp-plan-operation:execution-test",
             planning_request_hash="1" * 64,
-            point_grasp_operation_id="point-grasp-operation:execution-test",
-            point_grasp_request_hash="2" * 64,
-            point_grasp_result_hash="3" * 64,
-            point_grasp_candidate_hash="4" * 64,
+            source_operation_id="point-grasp-operation:execution-test",
+            source_request_hash="2" * 64,
+            source_result_hash="3" * 64,
+            source_grasp_hash="4" * 64,
             source_station_revision=0,
             component_id=registration.profile.component_id,
             side=registration.profile.side,
@@ -1078,11 +1124,12 @@ def test_preplanned_grasp_execution_consumes_exact_path_without_replanning(
         session.artifact_store.close()
 
 
-@pytest.mark.parametrize("backend", ("vgn", "graspgenx"))
+@pytest.mark.parametrize("backend,frozen", (("vgn", False), ("graspgenx", False), ("graspgenx", True)))
 def test_composition_opt_in_binds_point_grasp_v3_to_lower_ik_without_starting(
     monkeypatch,
     tmp_path,
     backend,
+    frozen,
 ) -> None:
     lower, guard = _lower(monkeypatch)
     localizer = _Localizer()
@@ -1109,13 +1156,24 @@ def test_composition_opt_in_binds_point_grasp_v3_to_lower_ik_without_starting(
         object_localizer=localizer,
         point_grasp_planner=planner,
         enable_point_grasp_arm_reachability=True,
+        enable_grasp_observation=frozen,
         clock=lambda: 10.0,
     )
     session = composition.deployment.gateway_session
     try:
         registration = composition.station_point_grasp_registration
         assert registration is not None
-        assert registration.skill.definition.skill_version == "3"
+        assert registration.skill.definition.skill_version == ("4" if frozen else "3")
+        fast = session.contract_bundle.grasp_fast_plan_registration
+        assert (fast is not None) is frozen
+        assert (session.grasp_fast_plan_executor is not None) is frozen
+        if frozen:
+            assert fast.skill.definition.skill_id == "perception.plan_grasp_fast"
+            assert fast.skill.routes[0].control_effect_class == "read_only"
+            assert fast.skill.routes[0].may_move_robot is False
+            assert session.passive_read_executors_by_skill_ref[("perception.plan_grasp_fast", "1")] is session.grasp_fast_plan_executor
+            assert session.grasp_approach_plan_store is session.grasp_approach_plan_provider.plan_store
+            assert session.grasp_fast_plan_executor.wait_all(timeout_sec=1.)
         reachability = registration.profile.arm_reachability_profile
         assert reachability is not None
         assert reachability.arm_side == "right"
@@ -1200,7 +1258,7 @@ def test_composition_rejects_envelope_for_another_side(monkeypatch) -> None:
             lower=lower,
             socket_path=REPO_ROOT / "temp/test-real-rm65-composition.sock",
             authorized_side="right",
-            authorized_action="forward",
+        authorized_action="move_tcp_to_pose",
             confirmation_token=REAL_AGENT_PRIMITIVE_CONFIRM_TOKEN,
             client_id="rpent:test",
             client_uid=1000,
@@ -1220,7 +1278,7 @@ def test_programmatic_composition_still_requires_exact_confirmation(
             lower=lower,
             socket_path=REPO_ROOT / "temp/test-real-rm65-composition.sock",
             authorized_side="right",
-            authorized_action="forward",
+        authorized_action="move_tcp_to_pose",
             confirmation_token="wrong",
             client_id="rpent:test",
             client_uid=1000,
@@ -1249,7 +1307,7 @@ def test_composition_rejects_socket_config_before_application_start(
             lower=lower,
             socket_path=(REPO_ROOT / "temp/absent-real-rm65-parent/gateway.sock"),
             authorized_side="right",
-            authorized_action="forward",
+        authorized_action="move_tcp_to_pose",
             confirmation_token=REAL_AGENT_PRIMITIVE_CONFIRM_TOKEN,
             client_id="rpent:test",
             client_uid=1000,

@@ -82,10 +82,16 @@ class KinematicCollisionProjector:
         # Distance queries only require body/geom poses. Running the full
         # dynamics/constraint pipeline here would dominate batched RL cost.
         self.mujoco.mj_kinematics(self.model, self.scratch)
+        clearance = self.policy.minimum_clearance_m if minimum_clearance_m is None else float(minimum_clearance_m)
+        # Admission needs only the applicable threshold. Broad CCD queries on
+        # thin CAD can flip a positive gap into a spurious penetration even
+        # when world AABBs overlap. Keep the oracle's wide reporting mode, and
+        # preserve actual negative distances and the unchanged hard bound.
+        query_limit = max(0.0, clearance) if distance_query_limit_m is None else distance_query_limit_m
         return self.oracle.check(
             self.scratch,
             minimum_clearance_m=minimum_clearance_m,
-            distance_query_limit_m=distance_query_limit_m,
+            distance_query_limit_m=query_limit,
         )
 
     def check_current(self, data) -> CollisionCheckResult:
@@ -222,7 +228,12 @@ class KinematicCollisionProjector:
         expected = self.controlled_qpos_indices.size
         if start.shape != (expected,) or requested.shape != (expected,):
             raise ValueError(f"Collision recovery expects {expected} controlled qpos values.")
-        start_check = self._check_candidate(source_data, start)
+        # Recovery compares the whole sampled distance sequence, not just
+        # admission. Retain its original reporting radius so saturation at
+        # the preventive threshold cannot hide a subsequent decrease.
+        reporting_limit = self.policy.distance_query_limit_m
+        start_check = self._check_candidate(source_data, start,
+            distance_query_limit_m=reporting_limit)
         if start_check.safe:
             return self.project(
                 source_data,
@@ -239,7 +250,8 @@ class KinematicCollisionProjector:
         tolerance = 1e-9
         for sample_index in range(1, sample_count + 1):
             alpha = sample_index / sample_count
-            check = self._check_candidate(source_data, start + alpha * delta)
+            check = self._check_candidate(source_data, start + alpha * delta,
+                distance_query_limit_m=reporting_limit)
             distance = float(check.minimum_distance_m)
             if (
                 check.penetration_depth_m > self.policy.hard_penetration_m

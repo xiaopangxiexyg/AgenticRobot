@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import pytest
 
 from agent_gateway.profiles.real import motion_gateway_session, session_authorization
+from agent_gateway.skills.motion.definition import ARCHIVED_DEBUG_MOTION_SKILL_IDS_V1
 
 
 class _Manifest:
@@ -20,7 +21,8 @@ class _Manifest:
 
 class _Gateway:
     def __init__(self) -> None:
-        self.contract_bundle = SimpleNamespace(route_manifest=_Manifest())
+        self.contract_bundle = SimpleNamespace(route_manifest=_Manifest(),
+            attachment=SimpleNamespace(component_ids=("left_arm", "right_arm")))
         self.service = SimpleNamespace(access_policy=SimpleNamespace())
 
 
@@ -40,6 +42,33 @@ def _request(*, component_id: str = "right_arm", action: str = "move_tcp_to_pose
             }
         },
     )
+
+
+def test_dual_pose_authority_mints_only_separate_single_arm_grants(monkeypatch):
+    monkeypatch.setattr(motion_gateway_session, "RealAgentPrimitiveGatewaySession", _Gateway)
+    issued = []
+    monkeypatch.setattr(session_authorization, "issue_skill_execution_grant",
+        lambda **kwargs: issued.append(kwargs) or SimpleNamespace(grant_id=str(len(issued))))
+    authority = session_authorization.RealAgentPrimitiveSessionAuthorization(
+        gateway_session=_Gateway(), side="right", authorized_motion_sides=("left", "right"),
+        action="move_tcp_to_pose_safe", client_id="rpent.dexteleop",
+        confirmation_token=session_authorization.REAL_AGENT_PRIMITIVE_SESSION_CONFIRM_TOKEN)
+    for arm in ("left", "right"):
+        assert authority.grant_resolver(_request(component_id=arm+"_arm", action="move_tcp_to_pose_safe"))
+    both = _request(action="move_tcp_to_pose_safe")
+    both.parameters["pose_targets_by_component"]["left_arm"] = [0, 0, .3, 0, 0, 0, 1]
+    assert authority.grant_resolver(both) is None
+    assert len(issued) == 2
+
+
+@pytest.mark.parametrize("sides", [(), ("left",), ("right", "other")])
+def test_dual_authority_rejects_invalid_scope(monkeypatch, sides):
+    monkeypatch.setattr(motion_gateway_session, "RealAgentPrimitiveGatewaySession", _Gateway)
+    with pytest.raises(ValueError, match="authorized_motion_sides"):
+        session_authorization.RealAgentPrimitiveSessionAuthorization(
+            gateway_session=_Gateway(), side="right", authorized_motion_sides=sides,
+            action="move_tcp_to_pose_safe", client_id="rpent.dexteleop",
+            confirmation_token=session_authorization.REAL_AGENT_PRIMITIVE_SESSION_CONFIRM_TOKEN)
 
 
 @pytest.mark.parametrize("action", ["move_tcp_to_pose", "move_tcp_to_pose_safe"])
@@ -109,7 +138,7 @@ def test_absolute_tcp_pose_grant_rejects_wrong_side_and_unlisted_action(
         session_authorization.RealAgentPrimitiveSessionAuthorization(
             gateway_session=gateway,
             side="right",
-            action="forward",
+            action="approach_grasp_pose",
             client_id="rpent.dexteleop",
             confirmation_token=(
                 session_authorization.REAL_AGENT_PRIMITIVE_SESSION_CONFIRM_TOKEN
@@ -136,7 +165,31 @@ def test_legacy_pose_grant_cannot_authorize_safe_move(monkeypatch):
 def test_authorization_still_requires_the_concrete_gateway_owner():
     with pytest.raises(TypeError, match="gateway_session must be typed"):
         session_authorization.RealAgentPrimitiveSessionAuthorization(
-            gateway_session=SimpleNamespace(), side="right", action="up",
+            gateway_session=SimpleNamespace(), side="right", action="move_tcp_to_pose",
             client_id="operator:test",
             confirmation_token=session_authorization.REAL_AGENT_PRIMITIVE_SESSION_CONFIRM_TOKEN,
         )
+
+
+@pytest.mark.parametrize("skill_id", sorted(ARCHIVED_DEBUG_MOTION_SKILL_IDS_V1))
+def test_archived_real_motion_selection_cannot_authorize_or_mint_a_grant(monkeypatch, skill_id):
+    monkeypatch.setattr(motion_gateway_session, "RealAgentPrimitiveGatewaySession", _Gateway)
+    gateway = _Gateway()
+    kwargs = {
+        "gateway_session": gateway,
+        "side": "right",
+        "client_id": "rpent.dexteleop",
+        "confirmation_token": session_authorization.REAL_AGENT_PRIMITIVE_SESSION_CONFIRM_TOKEN,
+    }
+    action = skill_id.removeprefix("motion.step_tcp_").removeprefix("motion.set_tcp_")
+    for selected in (action, skill_id):
+        with pytest.raises(ValueError, match="Archived debug motion"):
+            session_authorization.RealAgentPrimitiveSessionAuthorization(action=selected, **kwargs)
+    authorization = session_authorization.RealAgentPrimitiveSessionAuthorization(
+        action="move_tcp_to_pose", **kwargs,
+    )
+    request = _request()
+    request.skill_id = skill_id
+    request.parameters = {"component_id": "right_arm", "direction": "forward"}
+    assert authorization.grant_resolver(request) is None
+    assert authorization.grants_issued == 0

@@ -107,6 +107,49 @@ def _project(
     )
 
 
+@pytest.mark.parametrize("local_axes", (False, True))
+@pytest.mark.parametrize("offset,angle,translation,rotation,expected", (
+    ((0., 0., 0.), 0., 0., 0., True),
+    ((.105, 0., 0.), 0., .01, .02, True),
+    ((.105, 0., 0.), 0., .003, .02, False),
+    ((.108, .108, 0.), 0., .01, .02, False),
+    ((.11, 0., 0.), 0., .01, 0., True),
+    ((0., 0., 0.), .32, .01, .03, True),
+    ((0., 0., 0.), .32, .01, .01, False),
+))
+def test_goal_tolerance_intersection_uses_projection_distance(
+    local_axes, offset, angle, translation, rotation, expected,
+):
+    anchor_pose = _pose((.2, -.1, .3), rotation=Rotation.from_euler("z", .7))
+    profile = _profile({"right": TCPPoseEnvelopeSideConfig(
+        relative_min_xyz_m=(-.1, -.1, -.1), relative_max_xyz_m=(.1, .1, .1),
+        relative_axes="anchor_local_axes" if local_axes else "canonical_axes",
+        max_rotation_rad=.3,
+    )})
+    pose = anchor_pose.copy()
+    pose[:3, 3] += (anchor_pose[:3, :3] @ offset if local_axes else np.asarray(offset))
+    pose[:3, :3] = anchor_pose[:3, :3] @ Rotation.from_euler("x", angle).as_matrix()
+    result = _project({"right": pose}, profile, anchor=_anchor(profile, {"right": anchor_pose}))
+    before_hash = result.semantic_content_hash
+    assert result.intersects_goal_tolerance(
+        translation_tolerance_m=translation, rotation_tolerance_rad=rotation,
+    ) is expected
+    np.testing.assert_array_equal(result.raw_tcp_pose_by_side["right"], pose)
+    assert result.semantic_content_hash == before_hash
+
+
+@pytest.mark.parametrize("field", ("translation_tolerance_m", "rotation_tolerance_rad"))
+@pytest.mark.parametrize("bad", (-.1, float("nan"), float("inf"), True, np.bool_(False)))
+def test_goal_tolerance_query_rejects_invalid_tolerances(field, bad):
+    profile = _profile({"right": TCPPoseEnvelopeSideConfig(
+        absolute_min_xyz_m=(-1., -1., -1.), absolute_max_xyz_m=(1., 1., 1.))})
+    projection = _project({"right": _pose()}, profile)
+    with pytest.raises(TCPPoseEnvelopeError, match="finite and non-negative"):
+        projection.intersects_goal_tolerance(**{
+            "translation_tolerance_m": .01, "rotation_tolerance_rad": .03, field: bad,
+        })
+
+
 @pytest.mark.parametrize("relative,rotation,disabled", (
     (False, False, False), (True, False, False),
     (True, True, False), (True, True, True),

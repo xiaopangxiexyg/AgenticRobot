@@ -7,7 +7,8 @@ tables whose schemas are derived from the bound component-stream profile.
 
 from __future__ import annotations
 
-from typing import Any, Sequence
+from collections.abc import Sequence
+from typing import Any
 
 from dataset_contracts.canonical_encoding import canonical_content_hash
 from dataset_contracts.episode_identity import EpisodeCaptureIdentity
@@ -19,7 +20,6 @@ from dataset_contracts.v25p_native import (
     V25pExternalPayloadReference,
     normalize_component_stream_stored_values,
 )
-
 
 V25P_PARQUET_PHYSICAL_SCHEMA_HASH_DOMAIN_V1 = (
     "dexteleop.v25p.parquet_physical_schema.semantic.v1"
@@ -192,7 +192,13 @@ def component_records_to_arrow(
             "record_hash": bytes.fromhex(record.semantic_content_hash),
         }
         if stream.storage_kind == "inline_tensor":
-            row["values"] = None if record.values is None else list(record.values)
+            # A null parent fixed-size list cannot round-trip through some
+            # Arrow/Parquet versions. Null children retain the fixed width;
+            # the logical payload remains absent, never a zero measurement.
+            row["values"] = (
+                [None] * stream.flattened_size
+                if record.values is None else list(record.values)
+            )
         else:
             reference = record.payload_reference
             row.update(
@@ -233,7 +239,7 @@ def component_records_from_arrow(
             raw_values = row["values"]
             values = (
                 None
-                if raw_values is None
+                if raw_values is None or all(item is None for item in raw_values)
                 else normalize_component_stream_stored_values(stream, raw_values)
             )
         elif row["artifact_locator"] is not None:

@@ -2762,35 +2762,16 @@ def test_dispatch_fault_is_latched_and_requests_hold() -> None:
 
 
 def test_stale_reference_fault_has_narrow_rtc_recovery_seam() -> None:
-    holds: list[str] = []
-    executor = PositionDeployExecutor(
-        config=PositionDeployExecutorConfig(stale_after_sec=0.5),
-        canonical_pipeline=_pipeline(("left",)),
-        dispatch_callback=lambda _command: None,
-        hold_callback=lambda: holds.append("hold"),
-    )
+    executor, _clock, _commands, holds = _real_stale_recovery_case()
     try:
-        executor._latch_fault(
-            TimeoutError(
-                "15 Hz position keyframe stream is stale: "
-                "age=0.251713s limit=0.250000s"
-            ),
-            stage="reference_worker",
-            metadata={"source": "test"},
-        )
-        receipt = executor.recover_stale_reference_fault(
-            reason="rtc_result_timeout",
-        )
+        receipt = executor.recover_stale_reference_fault(reason="rtc_result_timeout")
         assert receipt["fault_type"] == "TimeoutError"
         assert receipt["fault_stage"] == "reference_worker"
         assert executor.snapshot()["fault_latched"] is False
         assert executor.snapshot()["active"] is False
         assert holds == ["hold", "hold"]
-
-        executor._latch_fault(
-            TimeoutError("reference deadline burst exceeded"),
-            stage="reference_worker",
-        )
+        executor._latch_fault(TimeoutError("reference deadline burst exceeded"),
+            stage="reference_worker")
         with pytest.raises(PositionDeployExecutorFault, match="only the explicit stale"):
             executor.recover_stale_reference_fault(reason="rtc_result_timeout")
         assert executor.snapshot()["fault_latched"] is True
@@ -4377,4 +4358,702 @@ def test_failed_close_is_rethrown_to_concurrent_and_later_callers(
 
     with pytest.raises(RuntimeError) as later:
         executor.close()
-    assert later.value is close_error
+    assert later.value is not close_error
+    assert "unit close hold failure" in str(later.value)
+    assert errors["waiter"] is close_error
+
+
+@pytest.mark.parametrize("healthy", [True, False])
+def test_position_dispatch_health_omits_unused_work_but_keeps_live_stream(healthy) -> None:
+    class SelectiveBackend:
+        def __init__(self):
+            self.calls = []
+
+        def is_ready(self):
+            return True
+
+        def get_state(self, *, include_derived_pose=True, include_timing_percentiles=True,
+                      include_pose_source_attestation=True, include_background_streaming=False):
+            self.calls.append((include_derived_pose, include_timing_percentiles,
+                               include_pose_source_attestation, include_background_streaming))
+            assert not include_derived_pose and not include_timing_percentiles
+            assert not include_pose_source_attestation
+            assert include_background_streaming
+            return {"hardware_ready": True, "background_streaming": {
+                "enabled": True, "healthy": healthy, "thread_alive": True,
+                "health_reasons": [] if healthy else ["low_send_rate"],
+                "target_active": True, "target_stale": False, "fault": None}}
+
+    backend = SelectiveBackend()
+    health = inspect_arm_backends_for_position_dispatch(
+        {"right": backend}, require_background_target=True)
+    assert backend.calls == [(False, False, False, True)]
+    assert health["ready"] is healthy
+    assert health["sides"]["right"]["warnings"] == ([] if healthy else ["low_send_rate"])
+
+
+def test_position_dispatch_health_uses_real_backend_without_fk_or_percentiles(monkeypatch) -> None:
+    from teleop_runtime.backends.arms.rm65 import RM65ArmBackend, RM65ArmBackendConfig
+
+    backend = RM65ArmBackend(RM65ArmBackendConfig(
+        side="right", arm_ip="0.0.0.0", connect_hardware=False,
+        initial_qpos=np.zeros(6), background_streaming_enabled=True))
+    backend._hardware_ready = True
+    backend._stream_thread = SimpleNamespace(is_alive=lambda: True)
+    backend._stream_warning = {"active": True}
+    expensive_calls = []
+
+    def expensive(*args, **kwargs):
+        expensive_calls.append(True)
+        raise AssertionError("unused derived work must not run in a health read")
+
+    monkeypatch.setattr(backend, "compute_tcp_pose", expensive)
+    monkeypatch.setattr(backend, "_background_stream_timing_percentiles_snapshot", expensive)
+    try:
+        health = inspect_arm_backends_for_position_dispatch(
+            {"right": backend}, require_background_target=False)
+        assert not expensive_calls
+        assert health["ready"] is False
+        assert health["sides"]["right"]["background_streaming"]["health_reasons"] == ["low_send_rate"]
+        assert health["sides"]["right"]["warnings"] == ["low_send_rate"]
+    finally:
+        backend._stream_thread = None
+        backend.close()
+
+
+def test_position_dispatch_health_does_not_retry_a_backend_type_error() -> None:
+    class BrokenBackend:
+        calls = 0
+
+        def is_ready(self):
+            return True
+
+        def get_state(self, *, include_derived_pose=True):
+            self.calls += 1
+            assert include_derived_pose is False
+            raise TypeError("internal snapshot failure")
+
+    backend = BrokenBackend()
+    health = inspect_arm_backends_for_position_dispatch(
+        {"right": backend}, require_background_target=True)
+    assert backend.calls == 1
+    assert health["ready"] is False
+    assert health["sides"]["right"]["state_error"] == "TypeError: internal snapshot failure"
+    assert "state_error" in health["sides"]["right"]["reasons"]
+
+
+@pytest.mark.parametrize("kind", ["legacy", "explicit", "partial", "arbitrary", "positional_only", "unavailable_type", "unavailable_value"])
+def test_shared_backend_snapshot_options_follow_declared_signature_once(monkeypatch, kind):
+    from teleop_runtime.deploy import backend_state
+
+    calls = []
+    marker = object()
+    options = {"include_derived_pose": False, "include_timing_percentiles": False,
+               "include_pose_source_attestation": False, "include_background_streaming": True}
+    if kind in {"legacy", "unavailable_type", "unavailable_value"}:
+        def read():
+            calls.append({})
+            return marker
+        expected = {}
+    elif kind == "explicit":
+        def read(*, include_derived_pose=True, include_timing_percentiles=True,
+                 include_pose_source_attestation=True, include_background_streaming=False):
+            calls.append(dict(include_derived_pose=include_derived_pose, include_timing_percentiles=include_timing_percentiles,
+                              include_pose_source_attestation=include_pose_source_attestation, include_background_streaming=include_background_streaming))
+            return marker
+        expected = options
+    elif kind == "partial":
+        def read(*, include_derived_pose=True):
+            calls.append({"include_derived_pose": include_derived_pose})
+            return marker
+        expected = {"include_derived_pose": False}
+    elif kind == "positional_only":
+        def read(include_derived_pose=True, /):
+            calls.append({"positional_default": include_derived_pose})
+            return marker
+        expected = {"positional_default": True}
+    else:
+        def read(**kwargs):
+            calls.append(kwargs)
+            return marker
+        expected = options
+    if kind.startswith("unavailable_"):
+        original = backend_state.inspect.signature
+        def signature(method):
+            if method is read:
+                raise (TypeError if kind == "unavailable_type" else ValueError)("signature unavailable")
+            return original(method)
+        monkeypatch.setattr(backend_state.inspect, "signature", signature)
+    assert backend_state.read_backend_state(read, optional_arguments=options) is marker
+    assert calls == [expected]
+
+
+def test_shared_backend_snapshot_does_not_retry_internal_type_error():
+    from teleop_runtime.deploy.backend_state import read_backend_state
+
+    calls = []
+    def read(*, include_derived_pose=True):
+        calls.append(include_derived_pose)
+        raise TypeError("internal snapshot failure")
+    with pytest.raises(TypeError, match="internal snapshot failure"):
+        read_backend_state(read, optional_arguments={"include_derived_pose": False})
+    assert calls == [False]
+
+
+def test_health_and_qpos_consumers_keep_distinct_snapshot_options_and_full_audit():
+    from teleop_runtime.deploy import arm_state_reader, dispatch
+
+    class Backend:
+        calls = []
+        def is_ready(self):
+            return True
+        def get_state(self, *, include_derived_pose=True, include_timing_percentiles=True,
+                      include_pose_source_attestation=True, include_background_streaming=True):
+            self.calls.append((include_derived_pose, include_timing_percentiles,
+                               include_pose_source_attestation, include_background_streaming))
+            return {"hardware_ready": True, "hardware_qpos": [0.]*6,
+                    "background_streaming": {"enabled": True, "healthy": True, "thread_alive": True,
+                        "health_reasons": [], "target_active": True, "target_stale": False, "fault": None},
+                    "full_audit_marker": "full" if include_derived_pose else "lean"}
+    backend = Backend()
+    qpos = arm_state_reader._read_backend_state(backend.get_state, raw_hardware_qpos_only=True)
+    assert qpos["hardware_qpos"] == [0.]*6
+    health = dispatch.inspect_arm_backends_for_position_dispatch({"right": backend}, require_background_target=True)
+    assert health["ready"] is True
+    assert arm_state_reader._read_backend_state(backend.get_state, raw_hardware_qpos_only=False)["full_audit_marker"] == "full"
+    full, error = dispatch._safe_backend_state(backend)
+    assert error is None and full["full_audit_marker"] == "full"
+    assert backend.calls == [(False, False, False, False), (False, False, False, True),
+                             (True, True, True, True), (True, True, True, True)]
+
+
+@pytest.mark.parametrize("case", ["ready", "not_ready", "hardware_not_ready", "emergency", "send_error", "low_rate", "stale", "fault", "unknown_unhealthy"])
+def test_lean_health_retains_identical_canonical_rejections(monkeypatch, case):
+    from teleop_runtime.deploy import dispatch
+
+    state = {"hardware_ready": case != "hardware_not_ready", "emergency_stopped": case == "emergency",
+        "send_result_code": 1 if case == "send_error" else 0,
+        "singularity_metadata": {"source": "native-owner", "sequence": 9},
+        "background_streaming": {"enabled": True, "healthy": True, "thread_alive": True,
+            "health_reasons": [], "target_active": True, "target_stale": False, "fault": None}}
+    stream = state["background_streaming"]
+    if case == "low_rate":
+        stream.update(healthy=False, health_reasons=["low_send_rate"], warning={"active": True})
+    elif case == "stale":
+        stream.update(healthy=False, target_stale=True, health_reasons=["target_stale"])
+    elif case == "fault":
+        stream.update(healthy=False, fault="native fault", health_reasons=["fault_latched"])
+    elif case == "unknown_unhealthy":
+        stream.update(healthy=False)
+    calls = []
+    class Backend:
+        def is_ready(self):
+            return case != "not_ready"
+        def get_state(self, **kwargs):
+            calls.append(kwargs)
+            return state
+    backend = Backend()
+    lean = dispatch.inspect_arm_backends_for_position_dispatch({"right": backend}, require_background_target=True)
+    assert calls == [{"include_derived_pose": False, "include_timing_percentiles": False,
+                      "include_pose_source_attestation": False, "include_background_streaming": True}]
+    # Counterfactual only changes which optional snapshot work is requested.
+    monkeypatch.setattr(dispatch, "read_backend_state", lambda method, **_kw: method())
+    full = dispatch.inspect_arm_backends_for_position_dispatch({"right": backend}, require_background_target=True)
+    assert calls[-1] == {} and len(calls) == 2
+    for result in [lean, full]:
+        result.pop("timing")
+        for side in result["sides"].values():
+            side.pop("timing")
+    assert lean == full
+    assert lean["ready"] is (case == "ready")
+    assert lean["sides"]["right"]["singularity_metadata"] == state["singularity_metadata"]
+
+
+def test_shared_backend_health_error_preserves_typed_readiness_receipt():
+    from teleop_runtime.deploy import dispatch
+
+    class Backend:
+        calls = 0
+        def is_ready(self):
+            return True
+        def get_state(self, *, include_derived_pose=True):
+            self.calls += 1
+            raise TypeError("single-read typed failure")
+    backend = Backend()
+    with pytest.raises(dispatch.PositionDispatchNotReady) as caught:
+        dispatch.require_arm_backends_ready_for_position_dispatch({"right": backend}, stage="fixture", require_background_target=True)
+    assert backend.calls == 1
+    health = caught.value.health
+    assert health["ready"] is False
+    assert health["sides"]["right"]["state_error"] == "TypeError: single-read typed failure"
+
+
+class _StaleRecoveryWake:
+    """Expose the real reference owner's post-dispatch wait without retiming it."""
+
+    def __init__(self, executor, dispatched):
+        self.executor = executor
+        self.dispatched = dispatched
+        self.event = threading.Event()
+        self.ready = threading.Event()
+
+    def wait(self, timeout=None):
+        if (threading.current_thread() is self.executor._thread
+                and self.dispatched.is_set() and self.executor._fault is None):
+            self.ready.set()
+        return self.event.wait(timeout)
+
+    def set(self):
+        self.event.set()
+
+    def clear(self):
+        self.event.clear()
+
+
+def _real_stale_recovery_case(*, hold_callback=None, discrete_callback=None):
+    clock = {"value": 10.0}
+    commands = []
+    dispatched = threading.Event()
+    holds = []
+
+    def dispatch(command):
+        commands.append(command)
+        dispatched.set()
+
+    def hold():
+        holds.append("hold")
+        if hold_callback is not None:
+            hold_callback()
+
+    executor = PositionDeployExecutor(
+        config=PositionDeployExecutorConfig(stale_after_sec=0.5),
+        canonical_pipeline=_pipeline(("left",)),
+        dispatch_callback=dispatch,
+        discrete_dispatch_callback=discrete_callback,
+        hold_callback=hold,
+        clock=lambda: clock["value"],
+        wall_clock=lambda: 1_700_000_000.0 + clock["value"],
+    )
+    wake = _StaleRecoveryWake(executor, dispatched)
+    executor._wake = wake
+    executor.start()
+    try:
+        executor.submit(_filtered_pose("left", _pose(0.16)), _observation(), "before-stale")
+        assert wake.ready.wait(1.0), "reference owner did not reach its next-tick wait"
+        clock["value"] = 11.0
+        wake.set()
+        _wait_until(lambda: executor.snapshot()["fault_latched"])
+        _wait_until(lambda: executor._thread._runner_completed.is_set()
+                    or getattr(executor, "_stale_reference_pause", None) is not None)
+        assert "position keyframe stream is stale" in executor.snapshot()["fault"]
+        return executor, clock, commands, holds
+    except BaseException:
+        executor.close()
+        raise
+
+
+def test_real_stale_recovery_resumes_same_reference_owner():
+    executor, clock, commands, holds = _real_stale_recovery_case()
+    owner = executor._thread
+    try:
+        before = len(commands)
+        receipt = executor.recover_stale_reference_fault(reason="rtc_result_timeout")
+        assert receipt["fault_type"] == "TimeoutError"
+        assert executor.snapshot()["active"] is False
+        executor.submit(_filtered_pose("left", _pose(0.17)), _observation(), "after-stale")
+        _wait_until(lambda: len(commands) > before)
+        assert executor._thread is owner
+        assert not owner._runner_completed.is_set()
+        assert executor.snapshot()["fault_latched"] is False
+        assert holds == ["hold", "hold"]
+    finally:
+        executor.close()
+    assert executor.shutdown_snapshot()["dispatch_workers_stopped"] is True
+
+
+def test_stale_recovery_rejects_closed_executor():
+    executor, _clock, _commands, _holds = _real_stale_recovery_case()
+    fault = executor._fault
+    executor.close()
+    with pytest.raises(RuntimeError, match="closed"):
+        executor.recover_stale_reference_fault(reason="rtc_result_timeout")
+    assert executor._fault is fault
+    assert executor.shutdown_snapshot()["dispatch_workers_stopped"] is True
+
+
+def test_stale_recovery_rejects_replaced_fault_identity(monkeypatch):
+    executor, _clock, _commands, _holds = _real_stale_recovery_case()
+    old = executor._fault
+    replacement = TimeoutError(str(old))
+    original_clear = executor.clear
+
+    def replace_during_clear():
+        original_clear()
+        with executor._lock:
+            executor._fault = replacement
+
+    monkeypatch.setattr(executor, "clear", replace_during_clear)
+    try:
+        with pytest.raises(PositionDeployExecutorFault, match="changed"):
+            executor.recover_stale_reference_fault(reason="rtc_result_timeout")
+        assert executor._fault is replacement
+        assert executor.snapshot()["fault_latched"] is True
+    finally:
+        executor.close()
+
+
+def _fresh_rearm_observation():
+    return _observation(arm_state_overrides={
+        "left": {"hardware_measurement_timestamp": time.time()}})
+
+
+def test_stale_park_does_not_read_clock_or_dispatch_before_explicit_recovery():
+    executor, clock, commands, _holds = _real_stale_recovery_case()
+    fault = executor._fault
+    generation = executor._generation
+    before = len(commands)
+    clock_read = threading.Event()
+    original_clock = executor._clock
+
+    def forbidden_clock():
+        clock_read.set()
+        raise RuntimeError("parked owner must not read clock")
+
+    try:
+        executor._clock = forbidden_clock
+        executor._wake.set()
+        assert not clock_read.wait(0.08)
+        assert len(commands) == before
+        assert executor._fault is fault
+        assert executor.snapshot()["queue_depth"] == 0
+        with pytest.raises(PositionDeployExecutorFault):
+            executor.submit(_filtered_pose("left", _pose(0.18)), _observation(),
+                            "rejected-old-generation", timestamp_monotonic=clock["value"])
+        executor._clock = original_clock
+        executor.recover_stale_reference_fault(reason="explicit-new-session")
+        assert executor._generation > generation
+        assert executor.snapshot()["active"] is False
+        assert executor.snapshot()["queue_depth"] == 0
+        assert len(commands) == before
+    finally:
+        executor._clock = original_clock
+        executor.close()
+    assert executor.shutdown_snapshot()["dispatch_workers_stopped"] is True
+
+
+def test_stale_recovery_repeated_cycles_retain_both_owners_and_affinity(monkeypatch):
+    affinity_calls = []
+    original_bind = deploy_executor_module.bind_current_thread_to_cpu
+
+    def counted_bind(cpu, *, role):
+        affinity_calls.append(threading.current_thread())
+        return original_bind(cpu, role=role)
+
+    monkeypatch.setattr(deploy_executor_module, "bind_current_thread_to_cpu", counted_bind)
+    executor, clock, commands, holds = _real_stale_recovery_case(
+        discrete_callback=lambda _command: True)
+    owners = executor._thread, executor._discrete_thread
+    receipt = executor.snapshot()["reference_worker_affinity_receipt"]
+    try:
+        for cycle in range(3):
+            before = len(commands)
+            executor.recover_stale_reference_fault(reason=f"cycle-{cycle}")
+            executor._wake.ready.clear()
+            executor.submit(_filtered_pose("left", _pose(0.17)), _observation(),
+                            f"fresh-{cycle}", discrete_command=_hand_command("left", 0.4))
+            _wait_until(lambda: len(commands) > before)
+            _wait_until(lambda: executor._next_tick_timestamp > clock["value"])
+            assert (executor._thread, executor._discrete_thread) == owners
+            assert executor.snapshot()["reference_worker_affinity_receipt"] == receipt
+            if cycle < 2:
+                clock["value"] += 1.0
+                executor._wake.set()
+                _wait_until(lambda: executor._stale_reference_pause is not None)
+        assert affinity_calls == [owners[0]]
+        assert len(holds) == 6
+    finally:
+        executor.close()
+    assert executor.shutdown_snapshot()["dispatch_workers_stopped"] is True
+    assert all(owner._runner_completed.is_set() for owner in owners)
+
+
+def test_stale_recovery_failed_hold_preserves_pause_then_allows_successful_retry():
+    fail = {"enabled": True}
+
+    def hold():
+        if fail["enabled"]:
+            raise RuntimeError("unit hold failure")
+
+    executor, _clock, _commands, _holds = _real_stale_recovery_case(hold_callback=hold)
+    fault = executor._fault
+    pause = executor._stale_reference_pause
+    try:
+        assert executor.snapshot()["hold_retry_required"] is True
+        with pytest.raises(RuntimeError, match="unit hold failure"):
+            executor.recover_stale_reference_fault(reason="failed-hold")
+        assert executor._fault is fault
+        assert executor._stale_reference_pause is pause
+        assert executor.snapshot()["hold_retry_required"] is True
+        fail["enabled"] = False
+        executor.recover_stale_reference_fault(reason="successful-hold")
+        assert executor.snapshot()["hold_retry_required"] is False
+        assert executor._fault is None
+    finally:
+        fail["enabled"] = False
+        executor.close()
+
+
+@pytest.mark.parametrize("interrupt_type", [KeyboardInterrupt, SystemExit])
+def test_stale_hold_interrupt_exits_owner_and_permanently_blocks_recovery(interrupt_type):
+    calls = {"count": 0}
+
+    def hold():
+        calls["count"] += 1
+        if calls["count"] == 1:
+            raise interrupt_type("unit hold interrupt")
+
+    executor, _clock, _commands, _holds = _real_stale_recovery_case(hold_callback=hold)
+    fault = executor._fault
+    try:
+        assert executor._thread._runner_completed.wait(1.0)
+        assert executor._stale_reference_pause is None
+        assert executor.snapshot()["fault_metadata"]["stale_recovery_blocker"]["stage"] == "reference_worker"
+        with pytest.raises(PositionDeployExecutorFault, match="parked recovery receipt"):
+            executor.recover_stale_reference_fault(reason="interrupted-owner")
+        assert executor._fault is fault
+    finally:
+        executor.close()
+    assert executor.shutdown_snapshot()["dispatch_workers_stopped"] is True
+
+
+def test_stale_recovery_close_fence_wins_while_hold_is_inflight():
+    entered = threading.Event()
+    release = threading.Event()
+    calls = {"count": 0}
+
+    def hold():
+        calls["count"] += 1
+        if calls["count"] == 2:
+            entered.set()
+            assert release.wait(1.0)
+
+    executor, _clock, _commands, _holds = _real_stale_recovery_case(hold_callback=hold)
+    fault = executor._fault
+    errors = []
+
+    def recover():
+        try:
+            executor.recover_stale_reference_fault(reason="concurrent-close")
+        except BaseException as exc:
+            errors.append(exc)
+
+    recovery = threading.Thread(target=recover)
+    closer = threading.Thread(target=executor.close)
+    try:
+        recovery.start()
+        assert entered.wait(1.0)
+        closer.start()
+        _wait_until(lambda: executor._closed)
+    finally:
+        release.set()
+        recovery.join(1.0)
+        if closer.ident is not None:
+            closer.join(1.0)
+        executor.close()
+    assert not recovery.is_alive() and not closer.is_alive()
+    assert len(errors) == 1 and isinstance(errors[0], RuntimeError)
+    assert "closed" in str(errors[0])
+    assert executor._fault is fault
+    assert executor.shutdown_snapshot()["dispatch_workers_stopped"] is True
+
+
+def test_concurrent_stale_recovery_has_one_success_and_no_recreated_owner():
+    executor, _clock, _commands, _holds = _real_stale_recovery_case()
+    owner = executor._thread
+    barrier = threading.Barrier(3)
+    results, errors = [], []
+
+    def recover():
+        barrier.wait(1.0)
+        try:
+            results.append(executor.recover_stale_reference_fault(reason="concurrent"))
+        except BaseException as exc:
+            errors.append(exc)
+
+    workers = [threading.Thread(target=recover) for _ in range(2)]
+    try:
+        for worker in workers:
+            worker.start()
+        barrier.wait(1.0)
+        for worker in workers:
+            worker.join(1.0)
+        assert not any(worker.is_alive() for worker in workers)
+        assert len(results) == len(errors) == 1
+        assert isinstance(errors[0], PositionDeployExecutorFault)
+        assert executor._thread is owner and not owner._runner_completed.is_set()
+    finally:
+        executor.close()
+
+
+@pytest.mark.parametrize("primary", ["stale", "safety", "pending-first"])
+@pytest.mark.parametrize("error_type", [RuntimeError, KeyboardInterrupt, SystemExit])
+def test_recovery_never_masks_real_inflight_discrete_failure(primary, error_type):
+    clock = {"value": 10.0}
+    hand_entered = threading.Event()
+    release_hand = threading.Event()
+    arm_dispatched = threading.Event()
+    latch_errors = []
+
+    def hand(_command):
+        hand_entered.set()
+        assert release_hand.wait(1.5)
+        raise error_type("unit secondary discrete failure")
+
+    executor = PositionDeployExecutor(
+        config=PositionDeployExecutorConfig(stale_after_sec=0.5),
+        canonical_pipeline=_pipeline(("left",)),
+        dispatch_callback=lambda _command: arm_dispatched.set(),
+        discrete_dispatch_callback=hand, hold_callback=lambda: None,
+        clock=lambda: clock["value"])
+    executor._wake = _StaleRecoveryWake(executor, arm_dispatched)
+    executor.start()
+    latcher = None
+    try:
+        executor.submit(_filtered_pose("left", _pose(0.16)), _observation(), "inflight",
+                        discrete_command=_hand_command("left", 0.4))
+        assert executor._wake.ready.wait(1.0)
+        # The causal hand command becomes due only after the reference query
+        # reaches the source stamp. Advance complete logical ticks, never
+        # retime a callback or skip straight beyond the deadline budget.
+        for _ in range(6):
+            if hand_entered.is_set():
+                break
+            clock["value"] = executor._next_tick_timestamp
+            executor._wake.set()
+            _wait_until(lambda: executor._next_tick_timestamp > clock["value"])
+        assert hand_entered.wait(1.0)
+        if primary == "pending-first":
+            with executor._dispatch_lock:
+                release_hand.set()
+                _wait_until(lambda: executor._fault_pending)
+                executor._latch_fault(TimeoutError("position keyframe stream is stale"),
+                                      stage="reference_worker")
+        elif primary == "stale":
+            clock["value"] = 11.0
+            executor._wake.set()
+            _wait_until(lambda: executor._fault is not None)
+            release_hand.set()
+        else:
+            def latch():
+                try:
+                    executor.latch_safety_fault(["unit safety gate"])
+                except BaseException as exc:
+                    latch_errors.append(exc)
+
+            latcher = threading.Thread(target=latch)
+            latcher.start()
+            _wait_until(lambda: executor._fault is not None)
+            release_hand.set()
+        assert executor._discrete_thread._runner_completed.wait(1.0)
+        if latcher is not None:
+            latcher.join(1.0)
+            assert not latcher.is_alive() and not latch_errors
+        if primary == "stale":
+            _wait_until(lambda: executor._stale_reference_pause is not None)
+        fault = executor._fault
+        blocker = executor.snapshot()["fault_metadata"]["stale_recovery_blocker"]
+        assert "unit secondary discrete failure" in blocker["error"]
+        executor.clear()
+        assert executor.snapshot()["fault_metadata"]["stale_recovery_blocker"] == blocker
+        if primary == "safety":
+            with pytest.raises(PositionDeployExecutorFault, match="another worker failure"):
+                executor.manual_rearm(_fresh_rearm_observation())
+        else:
+            with pytest.raises(PositionDeployExecutorFault):
+                executor.recover_stale_reference_fault(reason="must-not-mask-secondary")
+        assert executor._fault is fault
+        assert executor._stale_recovery_blocker == blocker
+    finally:
+        release_hand.set()
+        if latcher is not None:
+            latcher.join(1.0)
+        executor.close()
+    assert executor.shutdown_snapshot()["dispatch_workers_stopped"] is True
+
+
+@pytest.mark.parametrize("during_validation", [False, True])
+def test_manual_rearm_preserves_fault_after_close(monkeypatch, during_validation):
+    executor = PositionDeployExecutor(
+        config=PositionDeployExecutorConfig(stale_after_sec=0.5),
+        canonical_pipeline=_pipeline(("left",)))
+    executor.start()
+    executor.latch_safety_fault(["unit safety gate"])
+    fault = executor._fault
+    original_validate = executor._validate_observation_reference_domain
+    if during_validation:
+        def validate(*args, **kwargs):
+            details = original_validate(*args, **kwargs)
+            executor.close()
+            return details
+
+        monkeypatch.setattr(executor, "_validate_observation_reference_domain", validate)
+    else:
+        executor.close()
+    try:
+        with pytest.raises(RuntimeError, match="closed"):
+            executor.manual_rearm(_fresh_rearm_observation())
+        assert executor._fault is fault
+    finally:
+        executor.close()
+    assert executor.shutdown_snapshot()["dispatch_workers_stopped"] is True
+
+
+@pytest.mark.parametrize("faulted", [False, True])
+def test_manual_rearm_preserves_new_fault_during_validation(monkeypatch, faulted):
+    executor = PositionDeployExecutor(
+        config=PositionDeployExecutorConfig(stale_after_sec=0.5),
+        canonical_pipeline=_pipeline(("left",)))
+    executor.start()
+    if faulted:
+        executor.latch_safety_fault(["unit safety gate"])
+    original_validate = executor._validate_observation_reference_domain
+    replacement = RuntimeError("safety gate rejected keyframe: unit safety gate")
+
+    def validate(*args, **kwargs):
+        details = original_validate(*args, **kwargs)
+        with executor._lock:
+            executor._fault = replacement
+            executor._fault_stage = "safety_gate"
+        return details
+
+    monkeypatch.setattr(executor, "_validate_observation_reference_domain", validate)
+    try:
+        with pytest.raises(PositionDeployExecutorFault, match="changed"):
+            executor.manual_rearm(_fresh_rearm_observation())
+        assert executor._fault is replacement
+    finally:
+        executor.close()
+
+
+@pytest.mark.parametrize("error_type", [RuntimeError, TimeoutError, KeyboardInterrupt, SystemExit])
+def test_nonstale_reference_worker_failure_stays_terminal(monkeypatch, error_type):
+    executor = PositionDeployExecutor(
+        config=PositionDeployExecutorConfig(stale_after_sec=0.5),
+        canonical_pipeline=_pipeline(("left",)), hold_callback=lambda: None)
+    error = error_type("unit nonstale clock failure")
+
+    def failing_clock():
+        if threading.current_thread() is executor._thread:
+            raise error
+        return time.monotonic()
+
+    monkeypatch.setattr(executor, "_clock", failing_clock)
+    executor.start()
+    try:
+        assert executor._thread._runner_completed.wait(1.0)
+        assert executor._fault is error
+        assert executor._stale_reference_pause is None
+        with pytest.raises(PositionDeployExecutorFault, match="only the explicit stale"):
+            executor.recover_stale_reference_fault(reason="nonstale")
+    finally:
+        executor.close()

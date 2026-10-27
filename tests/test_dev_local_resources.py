@@ -221,7 +221,7 @@ def test_perception_sources_are_registered_gitlink_boundaries() -> None:
         "model/perception/graspnet-baseline": (
             "https://github.com/graspnet/graspnet-baseline.git"
         ),
-        "model/perception/graspgenx": "https://github.com/NVlabs/GraspGenX.git",
+        "model/perception/graspgenx": "https://github.com/CYBER-QAQ/GraspGenX.git",
     }
     for path, url in expected.items():
         assert f'[submodule "{path}"]' in gitmodules

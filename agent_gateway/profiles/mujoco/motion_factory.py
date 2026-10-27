@@ -30,6 +30,7 @@ from collection_runtime.source_observation_history import (
 )
 from dataset_contracts.canonical_encoding import canonical_content_hash
 from robot_motion.action import ExecutionObservationPlan
+from robot_motion.rm65 import load_rm65_tool_profile
 from robot_motion.target_safety import (
     TCPPoseEnvelopeCatalogEntry,
     TCPPoseEnvelopeProfile,
@@ -51,13 +52,17 @@ from sim.mujoco.deploy.grasp_contact import (
     bind_task_grasp_contact,
 )
 from sim.mujoco.deploy.target_config import DEFAULT_STATION_POSE_CONTRACT_PATH
+from sim.mujoco.tasks.cube_lift.config import CubeLiftTaskConfig
 
 from .gripper_skill import MujocoGripperControlPort
 from .motion_application import MujocoAgentSkillMotionApplication
 from .motion_deployment import (
+    MUJOCO_OBSERVED_POINT_ROUTE_ID,
     MUJOCO_AGENT_GRASP_APPROACH_ROUTE_ID_V1,
     MUJOCO_AGENT_GRASP_CONTACT_ROUTE_ID_V1,
+    MUJOCO_AGENT_OBJECT_MOVE_ROUTE_ID_V1,
     MUJOCO_AGENT_SAFE_TCP_POSE_ROUTE_ID_V1,
+    MUJOCO_AGENT_SAFE_TCP_POSE_ROUTE_ID_V2,
     MUJOCO_AGENT_TCP_POSE_MAX_ROTATION_DELTA_RAD_V1,
     MUJOCO_AGENT_TCP_POSE_MAX_TRANSLATION_DELTA_M_V1,
     MUJOCO_AGENT_TCP_POSE_ROUTE_ID_V1,
@@ -65,17 +70,13 @@ from .motion_deployment import (
     MujocoAgentTcpPoseContractBundle,
     MujocoAgentTcpPoseHistoryProfile,
     build_mujoco_agent_tcp_pose_contract_bundle,
+    resolve_safe_tcp_motion_limits,
 )
 from .motion_gateway_session import (
     MujocoAgentTcpPoseGatewaySession,
     assemble_mujoco_agent_tcp_pose_gateway_session,
 )
-from .motion_primitive_profiles import (
-    MUJOCO_AGENT_TCP_CARDINAL_STEP_ROUTE_ID_V1,
-    MUJOCO_AGENT_TCP_FIXED_CARDINAL_STEP_ROUTE_ID_BY_SKILL_ID_V1,
-    MUJOCO_AGENT_TCP_FIXED_ORIENTATION_MAX_ROTATION_DELTA_RAD_V1,
-    MUJOCO_AGENT_TCP_FIXED_ORIENTATION_ROUTE_ID_BY_SKILL_ID_V1,
-)
+from .motion_observed_scene import MujocoObservedSafeMotionConfig
 
 MUJOCO_AGENT_TCP_POSE_CALIBRATION_HASH_DOMAIN_V1 = (
     "dexteleop.agent_skill.mujoco_tcp_pose_scene_calibration.v1"
@@ -174,43 +175,76 @@ class MujocoAgentTcpPoseHistoryStorageConfig:
 
 
 def mujoco_agent_tcp_pose_execution_observation_plan_v1(
+    *,
+    motion_side: str = "right",
 ) -> ExecutionObservationPlan:
+    side = _validated_motion_side(motion_side)
+    component = f"{side}_arm"
     return ExecutionObservationPlan(
-        plan_id=MUJOCO_AGENT_TCP_POSE_OBSERVATION_PLAN_ID_V1,
+        plan_id=(
+            MUJOCO_AGENT_TCP_POSE_OBSERVATION_PLAN_ID_V1
+            if side == "right"
+            else "control-station-agent-tcp-pose-left-arm-observation-v1"
+        ),
         reference_mode="full_frames",
         measurement_mode="full_frames",
-        component_ids=("right_arm",),
+        component_ids=(component,),
         required_representation_by_component={
-            "right_arm": "cartesian_pose",
+            component: "cartesian_pose",
         },
     )
 
 
 def validate_mujoco_agent_tcp_pose_target_config(
     config: MujocoSimHILTargetConfig,
+    *,
+    motion_side: str = "right",
 ) -> None:
     """Fail before scene construction when another Sim-HIL profile is used."""
 
     if not isinstance(config, MujocoSimHILTargetConfig):
         raise TypeError("config must be a MujocoSimHILTargetConfig.")
+    side = _validated_motion_side(motion_side)
     plan = config.execution_observation_plan
-    expected = mujoco_agent_tcp_pose_execution_observation_plan_v1()
+    expected = mujoco_agent_tcp_pose_execution_observation_plan_v1(motion_side=side)
     if config.allow_scripted_task_reset:
         raise ValueError(
             "Agent TCP pose config requires allow_scripted_task_reset=False."
         )
-    if config.exposed_pose_sides != ("right",):
+    if config.exposed_pose_sides != (side,):
         raise ValueError(
-            "Agent TCP pose config must expose exactly the right pose side."
+            f"Agent TCP pose config must expose exactly the {side} pose side."
         )
     if (
         not isinstance(plan, ExecutionObservationPlan)
         or plan.semantic_content_hash != expected.semantic_content_hash
     ):
         raise ValueError(
-            "Agent TCP pose config requires the exact right-arm Cartesian "
+            f"Agent TCP pose config requires the exact {side}-arm Cartesian "
             "execution observation plan."
         )
+
+
+def _validated_motion_side(value: str) -> str:
+    if type(value) is not str or value not in {"left", "right"}:
+        raise ValueError("motion_side must be exactly left or right.")
+    return value
+
+
+def _validate_left_tool_sources(config: MujocoSimHILTargetConfig) -> None:
+    """Check actual side metadata before constructing the new left graph.
+
+    Both tool sources matter: the other arm remains a measured support target.
+    Existing right-only loading semantics are deliberately not changed here.
+    """
+    task = CubeLiftTaskConfig.load(config.task_config_path)
+    for side in ("left", "right"):
+        path = getattr(task, f"{side}_tool_profile_path")
+        profile = load_rm65_tool_profile(path, side=side)
+        if profile.get("arm") != side:
+            raise ValueError(
+                f"Left motion graph requires an explicit {side} tool profile: {path}."
+            )
 
 
 def _calibration_hash(target: Any) -> str:
@@ -242,8 +276,14 @@ def _build_standard_tcp_pose_envelope_runtime(
     prepared: Any,
     target_config: MujocoSimHILTargetConfig,
     enable_safe_tcp_pose: bool = False,
+    enable_safe_tcp_path_constraints: bool = False,
+    safe_tcp_motion_profile: str = "local_step",
+    enable_observed_point_motion: bool = False,
     enable_grasp_approach: bool = False,
     grasp_contact_binding: MujocoGraspContactBinding | None = None,
+    enable_object_motion: bool = False,
+    motion_side: str = "right",
+    enable_fast_grasp: bool = False,
 ) -> TCPPoseEnvelopeSafetyRuntime:
     """Bind separate lower envelopes for bounded pose and fixed heading Routes.
 
@@ -252,17 +292,21 @@ def _build_standard_tcp_pose_envelope_runtime(
     envelope used by the generic pose and cardinal-step Routes.
     """
 
+    side = _validated_motion_side(motion_side)
+    component = f"{side}_arm"
+    if side == "left" and enable_grasp_approach:
+        raise ValueError("Left motion mode does not expose grasp approach envelopes.")
     target_profile = prepared.target_frame_profile
     tool_profile = prepared.tool_frame_profile
-    reference_frame = target_profile.reference_frame_by_component["right_arm"]
+    reference_frame = target_profile.reference_frame_by_component[component]
     tool_binding_hash = tool_profile.binding_by_component[
-        "right_arm"
+        component
     ].semantic_content_hash
     target_binding_hash = canonical_content_hash(
         {
             "target_frame_profile_hash": target_profile.semantic_content_hash,
-            "component_id": "right_arm",
-            "side": "right",
+            "component_id": component,
+            "side": side,
             "reference_frame_id": reference_frame,
             "controlled_frame_id": "tool_tcp",
         },
@@ -271,20 +315,22 @@ def _build_standard_tcp_pose_envelope_runtime(
     bounds = MUJOCO_AGENT_TCP_POSE_WORKSPACE_BOUNDS_V1
     delta = MUJOCO_AGENT_TCP_POSE_MAX_TRANSLATION_DELTA_M_V1
     profile = TCPPoseEnvelopeProfile(
-        profile_id="mujoco-agent-tcp-pose-standard-envelope-v1",
+        profile_id=(
+            "mujoco-agent-tcp-pose-standard-envelope-v1"
+            if side == "right"
+            else "mujoco-agent-left-tcp-pose-standard-envelope-v1"
+        ),
         target_frame_binding_hash=target_binding_hash,
-        tool_frame_binding_hash_by_side={"right": tool_binding_hash},
-        reference_frame_by_side={"right": reference_frame},
+        tool_frame_binding_hash_by_side={side: tool_binding_hash},
+        reference_frame_by_side={side: reference_frame},
         side_config_by_side={
-            "right": TCPPoseEnvelopeSideConfig(
+            side: TCPPoseEnvelopeSideConfig(
                 absolute_min_xyz_m=(bounds[0], bounds[2], bounds[4]),
                 absolute_max_xyz_m=(bounds[1], bounds[3], bounds[5]),
                 relative_min_xyz_m=(-delta, -delta, -delta),
                 relative_max_xyz_m=(delta, delta, delta),
                 relative_axes="canonical_axes",
-                max_rotation_rad=(
-                    MUJOCO_AGENT_TCP_POSE_MAX_ROTATION_DELTA_RAD_V1
-                ),
+                max_rotation_rad=(MUJOCO_AGENT_TCP_POSE_MAX_ROTATION_DELTA_RAD_V1),
             )
         },
     )
@@ -303,54 +349,31 @@ def _build_standard_tcp_pose_envelope_runtime(
         constraint_set_hash=constraint_set_hash,
         allowed_route_ids=(
             MUJOCO_AGENT_TCP_POSE_ROUTE_ID_V1,
-            *((MUJOCO_AGENT_SAFE_TCP_POSE_ROUTE_ID_V1,) if enable_safe_tcp_pose else ()),
-            MUJOCO_AGENT_TCP_CARDINAL_STEP_ROUTE_ID_V1,
-            *tuple(
-                MUJOCO_AGENT_TCP_FIXED_CARDINAL_STEP_ROUTE_ID_BY_SKILL_ID_V1.values()
-            ),
+            *((MUJOCO_AGENT_SAFE_TCP_POSE_ROUTE_ID_V1,) if enable_safe_tcp_pose and safe_tcp_motion_profile == "local_step" else ()),
+            *((MUJOCO_AGENT_SAFE_TCP_POSE_ROUTE_ID_V2,) if enable_safe_tcp_path_constraints and safe_tcp_motion_profile == "local_step" else ()),
+            *((MUJOCO_OBSERVED_POINT_ROUTE_ID,) if enable_observed_point_motion else ()),
         ),
     )
-    orientation_profile = TCPPoseEnvelopeProfile(
-        profile_id="mujoco-agent-tcp-fixed-orientation-envelope-v1",
-        target_frame_binding_hash=target_binding_hash,
-        tool_frame_binding_hash_by_side={"right": tool_binding_hash},
-        reference_frame_by_side={"right": reference_frame},
-        side_config_by_side={
-            "right": TCPPoseEnvelopeSideConfig(
-                absolute_min_xyz_m=(bounds[0], bounds[2], bounds[4]),
-                absolute_max_xyz_m=(bounds[1], bounds[3], bounds[5]),
-                relative_min_xyz_m=(0.0, 0.0, 0.0),
-                relative_max_xyz_m=(0.0, 0.0, 0.0),
-                relative_axes="canonical_axes",
-                max_rotation_rad=(
-                    MUJOCO_AGENT_TCP_FIXED_ORIENTATION_MAX_ROTATION_DELTA_RAD_V1
-                ),
-            )
-        },
-    )
-    orientation_constraint_set_hash = canonical_content_hash(
-        {
-            "tcp_pose_envelope_profile_hash": (
-                orientation_profile.semantic_content_hash
-            ),
-            "absolute_heading_primitives_only": True,
-            "translation_must_equal_activation_anchor": True,
-            "canonical_keyframe_safety_retained": True,
-            "coupled_ik_safety_retained": True,
-        },
-        domain=(
-            "dexteleop.mujoco.agent_tcp_fixed_orientation_constraint_set.v1"
-        ),
-    )
-    orientation_entry = TCPPoseEnvelopeCatalogEntry(
-        envelope_id=MUJOCO_AGENT_TCP_FIXED_ORIENTATION_ENVELOPE_ID_V1,
-        profile=orientation_profile,
-        constraint_set_hash=orientation_constraint_set_hash,
-        allowed_route_ids=tuple(
-            MUJOCO_AGENT_TCP_FIXED_ORIENTATION_ROUTE_ID_BY_SKILL_ID_V1.values()
-        ),
-    )
-    entries = [standard_entry, orientation_entry]
+    entries = [standard_entry]
+    if enable_safe_tcp_pose and safe_tcp_motion_profile != "local_step":
+        limits = resolve_safe_tcp_motion_limits(safe_tcp_motion_profile, enabled=True)
+        relation_profile = replace(profile,
+            profile_id="mujoco-agent-safe-tcp-object-relation-envelope-v1",
+            side_config_by_side={side: replace(profile.side_config_by_side[side],
+                relative_min_xyz_m=(-limits.max_translation_delta_m,) * 3,
+                relative_max_xyz_m=(limits.max_translation_delta_m,) * 3,
+                max_rotation_rad=limits.max_rotation_delta_rad)})
+        entries.append(TCPPoseEnvelopeCatalogEntry(
+            envelope_id="mujoco.agent_safe_tcp_pose.safety.object_relation.v1",
+            profile=relation_profile,
+            constraint_set_hash=canonical_content_hash({
+                "tcp_pose_envelope_profile_hash": relation_profile.semantic_content_hash,
+                "safe_tcp_route_only": True,
+                "canonical_keyframe_safety_retained": True,
+                "coupled_ik_safety_retained": True,
+            }, domain="dexteleop.mujoco.agent_safe_tcp_relation_constraint_set.v1"),
+            allowed_route_ids=(MUJOCO_AGENT_SAFE_TCP_POSE_ROUTE_ID_V1,
+                *((MUJOCO_AGENT_SAFE_TCP_POSE_ROUTE_ID_V2,) if enable_safe_tcp_path_constraints else ()))))
     if enable_grasp_approach:
         grasp_profile = replace(
             profile,
@@ -370,11 +393,15 @@ def _build_standard_tcp_pose_envelope_runtime(
                 constraint_set_hash=canonical_content_hash(
                     {
                         "profile": grasp_profile.semantic_content_hash,
-                        "contact_permission": "none_noncontact_joint_path_only",
+                        "contact_permission": ("ordinary_approach_noncontact;paired_execution_uses_retained_terminal_policy"
+                            if enable_fast_grasp else "none_noncontact_joint_path_only"),
+                        **({"retained_terminal_policy_hash": grasp_contact_binding.semantic_content_hash}
+                           if enable_fast_grasp and grasp_contact_binding is not None else {}),
                     },
                     domain="mujoco.grasp_approach.absolute_envelope.v1",
                 ),
-                allowed_route_ids=(MUJOCO_AGENT_GRASP_APPROACH_ROUTE_ID_V1,),
+                allowed_route_ids=(MUJOCO_AGENT_GRASP_APPROACH_ROUTE_ID_V1,
+                    *(("sim.mujoco.motion.execute_grasp_approach_plan.v1",) if enable_fast_grasp else ())),
             )
         )
         if grasp_contact_binding is not None:
@@ -388,11 +415,23 @@ def _build_standard_tcp_pose_envelope_runtime(
                     domain="mujoco.grasp_contact.absolute_envelope.v1"),
                 allowed_route_ids=(MUJOCO_AGENT_GRASP_CONTACT_ROUTE_ID_V1,),
             ))
+            if enable_object_motion:
+                object_profile = replace(grasp_profile, profile_id="mujoco-agent-object-motion-envelope-v1")
+                entries.append(TCPPoseEnvelopeCatalogEntry(
+                    envelope_id="mujoco.agent_object_motion.safety.absolute.v1",
+                    profile=object_profile,
+                    constraint_set_hash=canonical_content_hash({
+                        "profile": object_profile.semantic_content_hash,
+                        "target_contact_binding": grasp_contact_binding.to_payload(),
+                        "payload_policy": "frozen_measured_relation_full_native_geometry_v1",
+                    }, domain="mujoco.object_motion.absolute_envelope.v1"),
+                    allowed_route_ids=(MUJOCO_AGENT_OBJECT_MOVE_ROUTE_ID_V1,),
+                ))
     return TCPPoseEnvelopeSafetyRuntime(
         catalog_entries=tuple(entries),
         target_frame_binding_hash=target_binding_hash,
-        tool_frame_binding_hash_by_side={"right": tool_binding_hash},
-        reference_frame_by_side={"right": reference_frame},
+        tool_frame_binding_hash_by_side={side: tool_binding_hash},
+        reference_frame_by_side={side: reference_frame},
         clock_domain_id=target_config.clock_domain_id,
     )
 
@@ -448,39 +487,218 @@ def build_mujoco_agent_tcp_pose_gateway_session(
     *,
     target_config: MujocoSimHILTargetConfig,
     allowed_client_ids: tuple[str, ...],
+    motion_side: str = "right",
     max_retained_operations: int = 16,
     max_session_admissions_per_route: int | None = None,
     trace_sink: Callable[[Any], None] | None = None,
     history_storage: MujocoAgentTcpPoseHistoryStorageConfig | None = None,
     artifact_storage: MujocoAgentArtifactStorageConfig | None = None,
     segmentation_localizer: object | None = None,
+    enable_object_localization: bool = False,
+    enable_rgbd_capture_v3: bool = False,
+    enable_segmentation_batch_v2: bool = False,
+    enable_segmentation_geometry_v3: bool = False,
     enable_safe_tcp_pose: bool = False,
+    enable_safe_tcp_path_constraints: bool = False,
+    enable_tcp_continuation_queries: bool = False,
+    enable_tcp_candidate_artifacts: bool = False,
+    enable_relation_tcp_continuation_queries: bool = False,
+    enable_region_tcp_continuation_queries: bool = False,
+    region_tcp_continuation_version: str = "4",
+    enable_observed_point_motion: bool = False,
     enable_spatial_goals: bool = False,
+    enable_object_goal_queries: bool = False,
+    enable_surface_anchors: bool = False,
+    enable_surface_anchor_v2: bool = False,
+    enable_surface_anchor_v3: bool = False,
+    surface_anchor_selection_policy: str = "prompt_nearest",
+    enable_relation_goal_queries: bool = False,
+    safe_tcp_motion_profile: str = "local_step",
+    enable_tcp_pose_comparison: bool = False,
+    enable_object_state: bool = False,
+    enable_object_follow_observation: bool = False,
+    enable_object_motion: bool = False,
     safe_tcp_planning_clearance_padding_m: float = 0.002,
     enable_grippers: bool = False,
     enable_grasp_approach: bool = False,
     grasp_contact_target_body: str | None = None,
+    fast_grasp_planner: Any | None = None,
+    fast_grasp_approach_config: Mapping[str, float] | None = None,
+    safe_motion_observation: MujocoObservedSafeMotionConfig | None = None,
 ) -> MujocoAgentTcpPoseGatewaySession:
     """Build the exact default-off graph; do not start, record, or serve it."""
 
+    if type(enable_object_localization) is not bool:
+        raise TypeError("enable_object_localization must be boolean.")
+    if enable_object_localization and (
+        artifact_storage is None or segmentation_localizer is None
+        or not callable(getattr(segmentation_localizer, "localize", None))
+    ):
+        raise ValueError("Object localization requires Artifact storage and the shared segmentation localizer.")
+    if enable_object_localization and enable_surface_anchor_v3 and max_retained_operations < 4:
+        raise ValueError("Localized paired anchors require capture, localization, segmentation and anchor retention.")
+    if not isinstance(enable_safe_tcp_path_constraints, bool) or (
+            enable_safe_tcp_path_constraints and not enable_safe_tcp_pose):
+        raise ValueError("Safe TCP path constraints require explicitly enabled safe TCP motion.")
+    if not isinstance(enable_tcp_continuation_queries, bool) or (enable_tcp_continuation_queries
+            and not enable_safe_tcp_path_constraints):
+        raise ValueError("Continuation queries require explicitly enabled safe TCP path constraints.")
+    if not isinstance(enable_tcp_candidate_artifacts, bool) or (enable_tcp_candidate_artifacts
+            and not (enable_tcp_continuation_queries and enable_surface_anchor_v2 and enable_relation_goal_queries)):
+        raise ValueError("Candidate Artifacts require continuation queries and the v2 anchor/relation family.")
+    if not isinstance(enable_relation_tcp_continuation_queries, bool) or (enable_relation_tcp_continuation_queries
+            and not (enable_tcp_continuation_queries and enable_surface_anchor_v2 and enable_relation_goal_queries)):
+        raise ValueError("Relation continuation v3 requires continuation queries and the v2 anchor/relation family.")
+    if not isinstance(enable_region_tcp_continuation_queries, bool) or (enable_region_tcp_continuation_queries
+            and not enable_relation_tcp_continuation_queries):
+        raise ValueError("Region continuation v4 requires the explicitly enabled relation continuation v3 family.")
+    if (type(region_tcp_continuation_version) is not str or region_tcp_continuation_version not in {"4", "5"}
+            or region_tcp_continuation_version != "4" and not enable_region_tcp_continuation_queries):
+        raise ValueError("Region continuation version 5 requires explicitly enabled region queries; choose '4' or '5'.")
+    if enable_surface_anchor_v3 and (enable_tcp_candidate_artifacts or enable_relation_tcp_continuation_queries):
+        raise ValueError("Surface anchor v3 cannot be combined with candidate Artifacts or relation continuations.")
+
+    from agent_gateway.skills.perception.surface_anchor_v2 import INTERIOR_SELECTION_POLICIES
+    if not isinstance(enable_object_goal_queries, bool) or (enable_object_goal_queries and not enable_safe_tcp_pose):
+        raise ValueError("Object goal queries require explicitly enabled safe TCP geometry.")
+
+    if not isinstance(enable_surface_anchors, bool) or (enable_surface_anchors and not (artifact_storage is not None and enable_object_goal_queries)):
+        raise ValueError("Surface anchors require Artifact storage and object goal queries.")
+
+    if enable_surface_anchors and max_retained_operations < 2:
+        raise ValueError("Surface anchors require retention for at least producer and consumer operations.")
+
+    if type(enable_surface_anchor_v3) is not bool or (enable_surface_anchor_v3 and not (
+            enable_surface_anchor_v2 and enable_rgbd_capture_v3 and enable_segmentation_geometry_v3)):
+        raise ValueError("Surface anchor v3 requires explicit RGB-D, segmentation v3 and compatible v2 consumers.")
+
+    if enable_surface_anchor_v3 and max_retained_operations < 3:
+        raise ValueError("Surface anchor v3 requires simultaneous capture, segmentation and anchor retention.")
+
+    if not isinstance(enable_surface_anchor_v2, bool) or (enable_surface_anchor_v2
+            and not (enable_surface_anchors and segmentation_localizer is not None)):
+        raise ValueError("Surface anchor v2 requires surface anchors and a segmentation model.")
+
+    if (not isinstance(surface_anchor_selection_policy, str)
+            or surface_anchor_selection_policy not in INTERIOR_SELECTION_POLICIES
+            or surface_anchor_selection_policy != "prompt_nearest" and not enable_surface_anchor_v2):
+        raise ValueError("A non-default surface selection policy requires explicitly enabled v2 anchors.")
+
+    if not isinstance(enable_relation_goal_queries, bool) or (enable_relation_goal_queries and not enable_surface_anchors):
+        raise ValueError("Relation goal queries require explicitly enabled surface anchors.")
+
+    resolve_safe_tcp_motion_limits(safe_tcp_motion_profile, enabled=enable_safe_tcp_pose)
+
+    for name, enabled, version in (
+        ("enable_segmentation_batch_v2", enable_segmentation_batch_v2, "2"),
+        ("enable_segmentation_geometry_v3", enable_segmentation_geometry_v3, "3"),
+    ):
+        if type(enabled) is not bool:
+            raise TypeError(f"{name} must be boolean.")
+        if enabled and (segmentation_localizer is None or artifact_storage is None):
+            raise ValueError(f"Segmentation batch v{version} requires Artifact storage and a segmentation model.")
+    if enable_segmentation_geometry_v3 and max_retained_operations < 2:
+        raise ValueError("RGB-input geometry requires retention for at least producer and consumer operations.")
+    if enable_segmentation_batch_v2 or enable_segmentation_geometry_v3:
+        if not isinstance(artifact_storage, MujocoAgentArtifactStorageConfig):
+            raise TypeError("artifact_storage must be typed or None.")
+        for name in ("start", "close", "segment", "encode_segment_artifacts"):
+            if not callable(getattr(segmentation_localizer, name, None)):
+                raise TypeError(f"segmentation_localizer must expose {name}().")
+        model_spec = getattr(segmentation_localizer, "model_spec", None)
+        if any(not isinstance(value, str) or not value or value != value.strip() for value in (
+                getattr(model_spec, "model_profile_id", None),
+                getattr(model_spec, "semantic_content_hash", None),
+                getattr(segmentation_localizer, "semantic_content_hash", None))):
+            raise ValueError("Segmentation batch v2/v3 requires typed model identity strings.")
     if not isinstance(target_config, MujocoSimHILTargetConfig):
         raise TypeError("target_config must be MujocoSimHILTargetConfig.")
+    side = _validated_motion_side(motion_side)
+    if safe_motion_observation is not None:
+        if not isinstance(safe_motion_observation, MujocoObservedSafeMotionConfig):
+            raise TypeError("safe_motion_observation must be MujocoObservedSafeMotionConfig.")
+        if not enable_safe_tcp_pose or artifact_storage is None:
+            raise ValueError("Observed safe motion requires the original safe Route and RGB-D resources.")
+        if target_config.realtime_worker:
+            raise ValueError("Observed safe motion requires the same deterministic physics owner.")
+    if type(enable_rgbd_capture_v3) is not bool or (enable_rgbd_capture_v3 and artifact_storage is None):
+        raise ValueError("RGB-D capture v3 requires explicit Artifact storage.")
+    if type(enable_observed_point_motion) is not bool:
+        raise TypeError("enable_observed_point_motion must be boolean.")
+    if enable_observed_point_motion and safe_motion_observation is None:
+        raise ValueError("Observed-point motion requires explicit sensor-shaped safe motion.")
+    component = f"{side}_arm"
+    inactive = "left" if side == "right" else "right"
     if not isinstance(enable_grippers, bool):
         raise TypeError("enable_grippers must be boolean.")
     if enable_grippers and target_config.realtime_worker:
-        raise ValueError("Composed gripper Skills require deterministic physics ownership.")
+        raise ValueError(
+            "Composed gripper Skills require deterministic physics ownership."
+        )
     if not isinstance(enable_safe_tcp_pose, bool):
         raise TypeError("enable_safe_tcp_pose must be boolean.")
     if not isinstance(enable_spatial_goals, bool):
         raise TypeError("enable_spatial_goals must be boolean.")
+    if not isinstance(enable_tcp_pose_comparison, bool):
+        raise TypeError("enable_tcp_pose_comparison must be boolean.")
+    if type(enable_object_state) is not bool:
+        raise TypeError("enable_object_state must be boolean.")
+    if type(enable_object_follow_observation) is not bool:
+        raise TypeError("enable_object_follow_observation must be boolean.")
+    if enable_object_follow_observation and not enable_object_state:
+        raise ValueError("Object follow observation requires explicit object-state feedback.")
+    if type(enable_object_motion) is not bool:
+        raise TypeError("enable_object_motion must be boolean.")
+    if enable_object_motion and (not enable_object_follow_observation or not enable_grippers
+                                 or not enable_grasp_approach or grasp_contact_target_body is None):
+        raise ValueError("Object motion requires explicit follow observation, grippers, grasp approach and contact target.")
+    if enable_object_state and grasp_contact_target_body is None:
+        raise ValueError("Object-state feedback requires an explicit grasp contact target.")
     if not isinstance(enable_grasp_approach, bool):
         raise TypeError("enable_grasp_approach must be boolean.")
+    if side == "left" and (
+        enable_grippers
+        or enable_grasp_approach
+        or grasp_contact_target_body is not None
+        or enable_rgbd_capture_v3
+        or enable_segmentation_batch_v2
+        or enable_segmentation_geometry_v3
+        or enable_spatial_goals
+        or enable_object_goal_queries
+        or enable_surface_anchors
+        or enable_surface_anchor_v2
+        or enable_surface_anchor_v3
+        or enable_object_localization
+        or enable_safe_tcp_path_constraints
+        or enable_tcp_continuation_queries
+        or enable_tcp_candidate_artifacts
+        or enable_relation_tcp_continuation_queries
+        or enable_region_tcp_continuation_queries
+        or enable_relation_goal_queries
+        or history_storage is not None
+        or segmentation_localizer is not None
+    ):
+        raise ValueError(
+            "Left motion mode currently supports baseline TCP/state Routes only; "
+            "gripper, grasp, spatial goal, history and segmentation combinations are not enabled."
+        )
     if enable_grasp_approach and (not enable_grippers or target_config.realtime_worker):
         raise ValueError(
             "Grasp approach requires composed grippers and deterministic physics ownership."
         )
     if grasp_contact_target_body is not None and not enable_grasp_approach:
         raise ValueError("Terminal contact requires explicit grasp approach enablement.")
+    if fast_grasp_planner is not None:
+        if side != "right":
+            raise ValueError("Fast grasp currently requires the native right arm.")
+        from deployments.perception.sam2_graspgenx_point_grasp import Sam2GraspGenXPointGraspPlanner
+
+        if not isinstance(fast_grasp_planner, Sam2GraspGenXPointGraspPlanner):
+            raise TypeError("fast_grasp_planner must be the existing typed GraspGenX planner.")
+        if (not enable_grasp_approach or grasp_contact_target_body is None or artifact_storage is None):
+            raise ValueError("Fast grasp requires Artifact storage and the complete target-bound native approach graph.")
+    elif fast_grasp_approach_config is not None:
+        raise ValueError("A fast grasp configuration requires its model binding.")
     if history_storage is not None and not isinstance(
         history_storage,
         MujocoAgentTcpPoseHistoryStorageConfig,
@@ -511,19 +729,41 @@ def build_mujoco_agent_tcp_pose_gateway_session(
             target_config,
             station_pose_contract_path=DEFAULT_STATION_POSE_CONTRACT_PATH,
         )
-    validate_mujoco_agent_tcp_pose_target_config(target_config)
+    validate_mujoco_agent_tcp_pose_target_config(target_config, motion_side=side)
+    if side == "left":
+        _validate_left_tool_sources(target_config)
     prepared = prepare_mujoco_sim_hil_target(target_config)
+    if fast_grasp_planner is not None:
+        from deployments.perception.dmtac_grasp_overlay import (
+            DMTAC_M_REVIEWED_TOOL_TCP_POSE_FLANGE_M_RAD, reviewed_graspgenx_dmtac_solid_geometry,
+        )
+        from robot_motion.rm65 import load_rm65_tool_profile, tool_tcp_pose_flange_m_rad
+
+        actual_tcp = tool_tcp_pose_flange_m_rad(load_rm65_tool_profile(
+            prepared.task_config.right_tool_profile_path, side="right"))
+        if (any(not math.isclose(float(a), float(b), abs_tol=1e-9, rel_tol=0)
+                for a, b in zip(actual_tcp, DMTAC_M_REVIEWED_TOOL_TCP_POSE_FLANGE_M_RAD))
+                or fast_grasp_planner.solid_geometry != reviewed_graspgenx_dmtac_solid_geometry(
+                    maximum_opening_m=fast_grasp_planner.max_gripper_width_m,
+                    alignment_profile_id=fast_grasp_planner.alignment_profile_id)
+                or not all(prepared.scene.has_body(name) for name in (
+                    "right_gripper_l_dm_tac_w2m_sensor", "right_gripper_r_dm_tac_w2m_sensor"))):
+            raise ValueError("Fast GraspGenX requires the reviewed DMTAC M tool TCP and native sensor assembly.")
     grasp_contact_binding = (
         None if grasp_contact_target_body is None else bind_task_grasp_contact(
             prepared.scene, prepared.gripper_profile, grasp_contact_target_body)
     )
     component_profile = build_mujoco_pose_component_target_profile(
         prepared.scene,
-        profile_id=MUJOCO_AGENT_TCP_POSE_COMPONENT_PROFILE_ID_V1,
-        arm_side_by_component={"right_arm": "right"},
-        arm_reference_frame_by_component={"right_arm": "right_arm_base"},
-        arm_controlled_frame_by_component={"right_arm": "tool_tcp"},
-        selection_group_by_component={"right_arm": "arms"},
+        profile_id=(
+            MUJOCO_AGENT_TCP_POSE_COMPONENT_PROFILE_ID_V1
+            if side == "right"
+            else "mujoco.rm65.left_agent_tcp_pose.v1"
+        ),
+        arm_side_by_component={component: side},
+        arm_reference_frame_by_component={component: f"{side}_arm_base"},
+        arm_controlled_frame_by_component={component: "tool_tcp"},
+        selection_group_by_component={component: "arms"},
     )
     runtime_rig_holder: dict[str, Any] = {}
 
@@ -535,10 +775,10 @@ def build_mujoco_agent_tcp_pose_gateway_session(
             )
         return rig.capture_scene(
             lambda scene: {
-                "left": capture_mujoco_sim_hil_tool_tcp_pose_by_side(
+                inactive: capture_mujoco_sim_hil_tool_tcp_pose_by_side(
                     scene,
                     prepared.task_config,
-                )["left"]
+                )[inactive]
             }
         )
 
@@ -547,9 +787,9 @@ def build_mujoco_agent_tcp_pose_gateway_session(
         component_profile,
         hand_action_spec_by_component={},
         support_arm_pose_provider=capture_support_arm_pose,
-        support_arm_sides=("left",),
+        support_arm_sides=(inactive,),
         support_pose_contract_id=(
-            "mujoco.measured_left_tool_tcp_support_for_agent_coupled_ik.v1"
+            f"mujoco.measured_{inactive}_tool_tcp_support_for_agent_coupled_ik.v1"
         ),
     )
     component_execution_binding = build_mujoco_component_execution_binding(
@@ -558,14 +798,20 @@ def build_mujoco_agent_tcp_pose_gateway_session(
     )
     observation_sink = MujocoExecutionDifferenceObserver(
         selection_group_id="arms",
-        component_ids=("right_arm",),
+        component_ids=(component,),
     )
     tcp_pose_envelope_runtime = _build_standard_tcp_pose_envelope_runtime(
         prepared=prepared,
         target_config=target_config,
         enable_safe_tcp_pose=enable_safe_tcp_pose,
+        enable_safe_tcp_path_constraints=enable_safe_tcp_path_constraints,
+        enable_observed_point_motion=enable_observed_point_motion,
+        safe_tcp_motion_profile=safe_tcp_motion_profile,
         enable_grasp_approach=enable_grasp_approach,
         grasp_contact_binding=grasp_contact_binding,
+        enable_fast_grasp=fast_grasp_planner is not None,
+        enable_object_motion=enable_object_motion,
+        motion_side=side,
     )
     target = build_mujoco_agent_skill_motion_target(
         config=target_config,
@@ -576,6 +822,7 @@ def build_mujoco_agent_tcp_pose_gateway_session(
         tcp_pose_envelope_runtime=tcp_pose_envelope_runtime,
         enable_safe_tcp_pose=enable_safe_tcp_pose or enable_grasp_approach,
         safe_tcp_planning_clearance_padding_m=safe_tcp_planning_clearance_padding_m,
+        motion_side=side,
     )
     runtime_rig_holder["rig"] = target.runtime.rig
     captured_at = float(target.runtime.clock())
@@ -583,23 +830,21 @@ def build_mujoco_agent_tcp_pose_gateway_session(
         lambda scene: capture_mujoco_sim_hil_tool_tcp_pose_by_side(
             scene,
             prepared.task_config,
-        )["right"]
+        )[side]
     )
     initialization_event_hash = canonical_content_hash(
         {
             "task_initialization_info": dict(prepared.task_initialization_info),
-            "measured_right_tool_tcp": initial_pose,
+            f"measured_{side}_tool_tcp": initial_pose,
             "captured_at": captured_at,
             "clock_domain_id": target_config.clock_domain_id,
         },
         domain="dexteleop.mujoco.agent_tcp_pose_qpos_initialization.v1",
     )
     tcp_pose_envelope_runtime.commit_reference(
-        reference_id=(
-            "mujoco-agent-qpos-init-reference:" + initialization_event_hash
-        ),
-        tcp_pose_by_side={"right": initial_pose},
-        captured_at_by_side={"right": captured_at},
+        reference_id=("mujoco-agent-qpos-init-reference:" + initialization_event_hash),
+        tcp_pose_by_side={side: initial_pose},
+        captured_at_by_side={side: captured_at},
         source_event_ids=(
             "mujoco-qpos-initialization-completed:" + initialization_event_hash,
         ),
@@ -612,6 +857,7 @@ def build_mujoco_agent_tcp_pose_gateway_session(
     application = MujocoAgentSkillMotionApplication(
         target=target,
         calibration_hash=_calibration_hash(target),
+        motion_side=side,
     )
     history_store = None
     artifact_store = None
@@ -630,6 +876,10 @@ def build_mujoco_agent_tcp_pose_gateway_session(
                 None if history_storage is None else history_storage.profile
             ),
             enable_artifact_perception=artifact_storage is not None,
+            enable_object_localization=enable_object_localization,
+            enable_rgbd_capture_v3=enable_rgbd_capture_v3,
+            enable_segmentation_batch_v2=enable_segmentation_batch_v2,
+            enable_segmentation_geometry_v3=enable_segmentation_geometry_v3,
             segmentation_model_profile_id=(
                 None
                 if segmentation_localizer is None
@@ -646,12 +896,42 @@ def build_mujoco_agent_tcp_pose_gateway_session(
                 else segmentation_localizer.semantic_content_hash
             ),
             enable_safe_tcp_pose=enable_safe_tcp_pose,
+            enable_safe_tcp_path_constraints=enable_safe_tcp_path_constraints,
+            enable_tcp_continuation_queries=enable_tcp_continuation_queries,
+            enable_tcp_candidate_artifacts=enable_tcp_candidate_artifacts,
+            enable_relation_tcp_continuation_queries=enable_relation_tcp_continuation_queries,
+            enable_region_tcp_continuation_queries=enable_region_tcp_continuation_queries,
+            region_tcp_continuation_version=region_tcp_continuation_version,
+            enable_observed_point_motion=enable_observed_point_motion,
+            safe_motion_observation_profile_hash=(None if safe_motion_observation is None
+                else safe_motion_observation.bound_profile_hash(
+                    minimum_clearance_m=application.scene.scene_spec.collision.safety_minimum_clearance_m,
+                    planning_clearance_padding_m=safe_tcp_planning_clearance_padding_m)),
             enable_spatial_goals=enable_spatial_goals,
+            enable_object_goal_queries=enable_object_goal_queries,
+            enable_surface_anchors=enable_surface_anchors,
+            enable_surface_anchor_v2=enable_surface_anchor_v2,
+            enable_surface_anchor_v3=enable_surface_anchor_v3,
+            surface_anchor_selection_policy=surface_anchor_selection_policy,
+            enable_relation_goal_queries=enable_relation_goal_queries,
+            safe_tcp_motion_profile=safe_tcp_motion_profile,
+            enable_tcp_pose_comparison=enable_tcp_pose_comparison,
+            enable_object_state=enable_object_state,
+            enable_object_follow_observation=enable_object_follow_observation,
+            enable_object_motion=enable_object_motion,
             enable_grasp_approach=enable_grasp_approach,
             grasp_contact_binding=grasp_contact_binding,
         )
         if enable_grippers:
             contract_bundle = _bind_grippers(contract_bundle, gripper_ports)
+        if fast_grasp_planner is not None:
+            from .grasp_deployment import build_mujoco_fast_grasp_contract
+
+            config = ({"pregrasp_distance_m": .07, "near_distance_m": .025,
+                       "terminal_offset_m": 0., "terminal_speed_scale": .25}
+                      if fast_grasp_approach_config is None else dict(fast_grasp_approach_config))
+            contract_bundle = build_mujoco_fast_grasp_contract(contract_bundle,
+                model_profile_hash=fast_grasp_planner.semantic_content_hash, approach_config=config)
         if history_storage is not None:
             source_binding = contract_bundle.history_source_binding
             if source_binding is None:
@@ -684,7 +964,9 @@ def build_mujoco_agent_tcp_pose_gateway_session(
             artifact_store=artifact_store,
             owns_artifact_store=artifact_store is not None,
             segmentation_localizer=segmentation_localizer,
+            fast_grasp_planner=fast_grasp_planner,
             gripper_ports=gripper_ports,
+            safe_motion_observation=safe_motion_observation,
         )
     except Exception:
         if history_store is not None:

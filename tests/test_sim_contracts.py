@@ -7,7 +7,12 @@ import pytest
 from robot_motion.deploy.schema import ACTION_DIM, OBSERVATION_STATE_DIM
 from robot_motion.position_control import PositionControlRates
 from sim.contracts import SceneSpec, SimulationContract
-from sim.contracts.scene import DEFAULT_RM65_PHYSICS_URDF
+from sim.contracts.scene import (
+    DEFAULT_RM65_PHYSICS_URDF,
+    SCENE_SPEC_VERSION,
+    SCENE_SPEC_VERSION_V2,
+)
+from sim.contracts.scene.object import FreeBodyObjectSpec
 
 
 CONTRACT = Path("sim/configs/rm65_bimanual_physics_v1.json")
@@ -92,3 +97,89 @@ def test_scene_profiles_separate_physics_mainline_from_kinematic_replay() -> Non
     assert kinematic.gravity_mps2 == (0.0, 0.0, 0.0)
     assert kinematic.collision.enabled is False
     assert kinematic.objects == ()
+
+
+def test_scene_v1_box_profile_remains_unchanged_and_v1_rejects_new_shapes() -> None:
+    baseline = SimulationContract.load(CONTRACT).scene
+    assert baseline.schema_version == SCENE_SPEC_VERSION
+    assert baseline.objects[0].shape == "box"
+
+    with pytest.raises(ValueError, match="SceneSpec v1 supports box"):
+        SceneSpec(
+            objects=(
+                FreeBodyObjectSpec(
+                    name="can", shape="cylinder", size_m=(0.05, 0.05, 0.10)
+                ),
+            )
+        )
+
+
+def test_scene_v2_round_trips_graspable_primitive_geometry() -> None:
+    scene = SceneSpec(
+        schema_version=SCENE_SPEC_VERSION_V2,
+        profile_name="rm65_graspable_primitives_v2",
+        objects=(
+            FreeBodyObjectSpec(name="box", shape="box", size_m=(0.07, 0.05, 0.04)),
+            FreeBodyObjectSpec(name="can", shape="cylinder", size_m=(0.05, 0.05, 0.10)),
+            FreeBodyObjectSpec(name="ball", shape="sphere", size_m=(0.048, 0.048, 0.048)),
+            FreeBodyObjectSpec(name="fruit", shape="ellipsoid", size_m=(0.06, 0.045, 0.035)),
+        ),
+    )
+
+    restored = SimulationContract.from_dict(SimulationContract(scene=scene).to_dict())
+
+    assert restored.scene.schema_version == SCENE_SPEC_VERSION_V2
+    assert [obj.shape for obj in restored.scene.objects] == [
+        "box", "cylinder", "sphere", "ellipsoid"
+    ]
+    assert restored.to_dict() == SimulationContract(scene=scene).to_dict()
+
+
+@pytest.mark.parametrize(
+    ("shape", "size"),
+    [
+        ("sphere", (0.05, 0.05, 0.06)),
+        ("cylinder", (0.05, 0.06, 0.10)),
+        ("mesh", (0.05, 0.05, 0.10)),
+    ],
+)
+def test_free_body_primitives_reject_invalid_dimensions_and_unsupported_shapes(
+    shape, size
+) -> None:
+    with pytest.raises(ValueError):
+        FreeBodyObjectSpec(name="invalid", shape=shape, size_m=size)
+
+
+@pytest.mark.parametrize("shape", ["box", "sphere", "cylinder", "ellipsoid"])
+def test_free_body_primitives_reject_nonfinite_derived_inertia(shape) -> None:
+    with pytest.raises(ValueError, match="object inertia.*finite"):
+        FreeBodyObjectSpec(
+            name="overflow", shape=shape, size_m=(1e100,) * 3, mass_kg=1e200
+        )
+
+
+@pytest.mark.parametrize(
+    ("shape", "size", "mass", "expected"),
+    [
+        ("box", (0.06, 0.04, 0.02), 0.12, (2e-5, 4e-5, 5.2e-5)),
+        ("sphere", (0.048, 0.048, 0.048), 0.05, (1.152e-5,) * 3),
+        (
+            "cylinder",
+            (0.05, 0.05, 0.10),
+            0.10,
+            (9.895833333333334e-5, 9.895833333333334e-5, 3.125e-5),
+        ),
+        (
+            "ellipsoid",
+            (0.06, 0.045, 0.035),
+            0.08,
+            (1.3e-5, 1.93e-5, 2.25e-5),
+        ),
+    ],
+)
+def test_free_body_primitive_defaults_use_shape_specific_solid_inertia(
+    shape, size, mass, expected
+) -> None:
+    spec = FreeBodyObjectSpec(name="shape", shape=shape, size_m=size, mass_kg=mass)
+
+    assert spec.inertia_diagonal_kg_m2 == pytest.approx(expected)

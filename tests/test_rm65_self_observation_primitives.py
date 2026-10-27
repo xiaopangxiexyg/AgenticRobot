@@ -2,6 +2,8 @@ import json
 
 import numpy as np
 import pytest
+from types import SimpleNamespace
+from scipy.spatial.transform import Rotation
 from scipy.spatial import cKDTree
 
 from robot_motion.rm65.captured_robot_observations import (
@@ -146,7 +148,7 @@ def test_base_roi_rays_include_zero_depth_pixel_and_keep_depth_mismatch(tmp_path
         assert kwargs['depth_m'][1, 1] == 0
         rendered = np.full((3, 3), np.nan); rendered[1, 1] = 1.
         return (rendered,), {}
-    monkeypatch.setattr(filt, '_render_depth_maps', render)
+    monkeypatch.setattr(filt, '_render_primitive_base', render)
     monkeypatch.setattr(filt, '_capture_primitive_geometry', lambda *args:
         ([('left_arm_base_link_0', np.eye(4), np.array([-.01, -.01, .99]),
            np.array([.01, .01, 1.01]), 'base', None)], set()))
@@ -157,3 +159,110 @@ def test_base_roi_rays_include_zero_depth_pixel_and_keep_depth_mismatch(tmp_path
         capture_qpos_by_side={s: np.zeros(6) for s in ('left', 'right')})
     np.testing.assert_array_equal(result.removed_mask,
         [[False, True, False], [True, False, True], [True, True, True]])
+
+
+def test_local_ray_mesh_reuses_bvh_but_updates_link_pose_and_occlusion(tmp_path, monkeypatch):
+    trimesh = pytest.importorskip('trimesh')
+    ray = pytest.importorskip('trimesh.ray.ray_pyembree').RayMeshIntersector
+    urdf = tmp_path / 'fixture.urdf'; urdf.write_text('<robot name="fixture"/>')
+    filt = RM65CapturedRobotObservationFilter(urdf_path=urdf)
+    vertices = np.array([[-.15, -.15, 0], [.15, -.15, 0], [.15, .15, 0], [-.15, .15, 0]])
+    faces = np.array([[0, 1, 2], [0, 2, 3]])
+    shape = SimpleNamespace(vertices=lambda: vertices, num_tris=2, tri_indices=lambda i: faces[i])
+    visual = SimpleNamespace(geometryObjects=[
+        SimpleNamespace(name='left_arm_base_link_0', geometry=shape),
+        SimpleNamespace(name='right_arm_link6_0', geometry=shape)])
+    poses = [np.eye(4), np.eye(4)]
+    poses[0][2, 3], poses[1][2, 3] = 1., .8
+    def update(_model, _data, geom, geom_data, q):
+        poses[1][0, 3] = q[12]
+    pin = SimpleNamespace(GeometryData=lambda _: SimpleNamespace(oMg=[
+        SimpleNamespace(homogeneous=p) for p in poses]), forwardKinematics=lambda *_: None,
+        updateGeometryPlacements=update)
+    model = SimpleNamespace(createData=lambda: None)
+    monkeypatch.setattr(filt, '_runtime_components', lambda: (pin, trimesh, ray, model, visual, (0, 1)))
+    qpos = {s: np.zeros(6) for s in ('left', 'right')}
+    kw = dict(depth_m=np.zeros((3, 3)), intrinsics={'fx': 10., 'fy': 10., 'cx': 1., 'cy': 1.},
+        source_from_camera=np.eye(4), capture_qpos_by_side=qpos)
+    blocked = filt._render_primitive_base(**kw)[0][0]
+    assert np.isnan(blocked).all()  # Tool occludes the body; it is not a body hit.
+    cached = dict(filt._ray_meshes)
+    qpos['right'][0] = 2.
+    visible = filt._render_primitive_base(**kw)[0][0]
+    np.testing.assert_allclose(visible, 1.)
+    assert all(filt._ray_meshes[i][0] is cached[i][0] for i in cached)
+    qpos['right'][0] = 0.
+    assert np.isnan(filt._render_primitive_base(**kw)[0][0]).all()
+    # Compare independent combined-mesh queries under changing camera and
+    # link rotations. Every zero-depth pixel must still cast a ray.
+    rng = np.random.default_rng(128)
+    for _ in range(12):
+        poses[0][:3, :3] = Rotation.from_rotvec(rng.uniform(-.7, .7, 3)).as_matrix()
+        poses[1][:3, :3] = Rotation.from_rotvec(rng.uniform(-.7, .7, 3)).as_matrix()
+        qpos['right'][0] = rng.uniform(-.2, .2)
+        camera = np.eye(4)
+        camera[:3, :3] = Rotation.from_rotvec(rng.uniform(-.15, .15, 3)).as_matrix()
+        camera[:3, 3] = rng.uniform(-.08, .08, 3)
+        kw.update(depth_m=np.zeros((11, 13)), source_from_camera=camera,
+                  intrinsics={'fx': 20., 'fy': 20., 'cx': 6., 'cy': 5.})
+        actual = filt._render_primitive_base(**kw)[0][0]
+        local = [np.linalg.inv(camera) @ p for p in poses]
+        meshes = [vertices @ p[:3, :3].T + p[:3, 3] for p in local]
+        combined = trimesh.Trimesh(vertices=np.concatenate(meshes),
+            faces=np.r_[faces, faces+len(vertices)], process=False)
+        r, c = np.indices(actual.shape).reshape(2, -1)
+        directions = np.column_stack(((c-6)/20, (r-5)/20, np.ones(len(r))))
+        hits, rays, triangles = ray(combined).intersects_location(
+            np.zeros_like(directions), directions, multiple_hits=False)
+        expected = np.full(actual.shape, np.nan)
+        body = triangles < len(faces)
+        expected[r[rays[body]], c[rays[body]]] = hits[body, 2]
+        np.testing.assert_array_equal(np.isnan(actual), np.isnan(expected))
+        np.testing.assert_allclose(actual, expected, rtol=0, atol=1e-6)
+    poses[0][:] = np.eye(4); poses[0][2, 3] = 1.
+    poses[1][:] = poses[0]
+    qpos['right'][0] = 0.
+    kw.update(source_from_camera=np.eye(4))
+    for gap in (0., -1e-7, 1e-7, -1e-5, 1e-5):
+        poses[1][2, 3] = 1. + gap
+        actual = filt._render_primitive_base(**kw)[0][0]
+        combined = trimesh.Trimesh(vertices=np.r_[vertices+[0, 0, 1.],
+            vertices+[0, 0, 1.+gap]], faces=np.r_[faces, faces+len(vertices)], process=False)
+        r, c = np.indices(actual.shape).reshape(2, -1)
+        directions = np.column_stack(((c-6)/20, (r-5)/20, np.ones(len(r))))
+        hits, rays, triangles = ray(combined).intersects_location(
+            np.zeros_like(directions), directions, multiple_hits=False)
+        expected = np.full(actual.shape, np.nan)
+        body = triangles < len(faces)
+        expected[r[rays[body]], c[rays[body]]] = hits[body, 2]
+        np.testing.assert_array_equal(np.isnan(actual), np.isnan(expected), err_msg=f'gap={gap}')
+
+
+def test_warmed_ray_caches_exclude_only_current_camera_across_a_b_a(tmp_path, monkeypatch):
+    trimesh = pytest.importorskip('trimesh')
+    ray = pytest.importorskip('trimesh.ray.ray_pyembree').RayMeshIntersector
+    urdf = tmp_path / 'fixture.urdf'; urdf.write_text('<robot name="fixture"/>')
+    filt = RM65CapturedRobotObservationFilter(urdf_path=urdf)
+    plane = trimesh.Trimesh(vertices=[[-.2, -.2, 1.], [.2, -.2, 1.], [.2, .2, 1.], [-.2, .2, 1.]],
+                            faces=[[0, 1, 2], [0, 2, 3]], process=False)
+    housing = trimesh.creation.box(extents=[.4, .4, .4])
+    shapes = [SimpleNamespace(vertices=lambda m=m: np.asarray(m.vertices), num_tris=len(m.faces),
+        tri_indices=lambda i, m=m: m.faces[i]) for m in (plane, housing, housing)]
+    visual = SimpleNamespace(geometryObjects=[SimpleNamespace(name=n, geometry=s) for n, s in zip(
+        ('left_arm_base_link_0', 'left_realsense_d405_0', 'right_realsense_d405_0'), shapes)])
+    poses = [np.eye(4) for _ in shapes]; poses[2][2, 3] = .6
+    pin = SimpleNamespace(GeometryData=lambda _: SimpleNamespace(oMg=[
+        SimpleNamespace(homogeneous=p) for p in poses]), forwardKinematics=lambda *_: None,
+        updateGeometryPlacements=lambda *_: None)
+    model = SimpleNamespace(createData=lambda: None)
+    monkeypatch.setattr(filt, '_runtime_components', lambda: (pin, trimesh, ray, model, visual, (0, 1, 2)))
+    for i, shape in enumerate(shapes):
+        filt._ray_mesh(i, shape)
+    cached = dict(filt._ray_meshes)
+    for z, expected in ((0., np.nan), (.6, .4), (0., np.nan)):
+        camera = np.eye(4); camera[2, 3] = z
+        actual = filt._render_primitive_base(depth_m=np.zeros((1, 1)),
+            intrinsics={'fx': 100., 'fy': 100., 'cx': 0., 'cy': 0.}, source_from_camera=camera,
+            capture_qpos_by_side={s: np.zeros(6) for s in ('left', 'right')})[0][0]
+        np.testing.assert_allclose(actual, expected, atol=1e-6)
+    assert all(filt._ray_meshes[i][0] is cached[i][0] for i in cached)

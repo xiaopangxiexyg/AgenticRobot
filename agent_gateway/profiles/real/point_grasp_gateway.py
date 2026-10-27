@@ -25,6 +25,7 @@ from agent_gateway.runtime.artifact_producer import (
 )
 from agent_gateway.runtime.artifact_store import RecoverableAgentArtifactStore
 from agent_gateway.runtime.passive_read_executor import (
+    PassiveReadError,
     PassiveReadResult,
     PassiveReadSkillExecutor,
 )
@@ -40,6 +41,10 @@ from dataset_contracts.grasp_multiview_snapshot import (
     GRASP_MULTIVIEW_SCHEMA_ID, GRASP_MULTIVIEW_ENCODING, encode_grasp_multiview_arrays,
 )
 from deployments.perception.grasp_multiview import GraspRgbdView, fuse_grasp_views
+from deployments.perception.point_grasp_failure import (
+    PointGraspPlanningError,
+    bounded_point_grasp_failure_diagnostic,
+)
 from dataset_contracts.perception_artifacts import (
     LOCALIZATION_ANNOTATED_IMAGE_COMPRESSION_V1,
     LOCALIZATION_ANNOTATED_IMAGE_ENCODING_V1,
@@ -155,6 +160,7 @@ def _annotate(
         target_pixel_uv=pixel_uv,
         target_bbox_xyxy=tuple(prepared.target_mask_bbox_xyxy),
         solid_geometry=solid_geometry,
+        opening_m=(None if solid_geometry is None else solid_geometry.maximum_opening_m),
     )
     stream = io.BytesIO()
     output.save(stream, format="JPEG", quality=90, optimize=True)
@@ -501,6 +507,14 @@ class StationBoundPointGraspProvider:
         return self.registration.profile.inference_implementation_hash
 
     def start(self) -> None:
+        # Static CAD belongs to the session resource lifecycle, not the first
+        # user's finite planning budget. No measured state is prepared here.
+        prepare = getattr(self.captured_robot_observation_filter, "prepare", None)
+        if callable(prepare):
+            started = time.perf_counter()
+            prepare()
+            _LOGGER.info("Captured robot static geometry prepared: elapsed_sec=%.6f",
+                         time.perf_counter()-started)
         self.planner.start()
         self._started = True
 
@@ -510,11 +524,29 @@ class StationBoundPointGraspProvider:
         finally:
             self._started = False
 
-    def plan_request(self, request: Any, *, input_snapshot_sink: Callable[[bytes], None] | None = None) -> PreparedPointGrasp:
+    def plan_request(self, request: Any, *, input_snapshot_sink: Callable[[bytes], None] | None = None,
+                     failure_snapshot_sink: Callable[[bytes], Mapping] | None = None,
+                     selection_factory: Callable | None = None,
+                     annotate_result: bool = True,
+                     refine_grasp_centers: bool = False,
+                     refine_grasp_axial_depth: bool = False,
+                     preparation_guard: Callable[[], None] | None = None) -> PreparedPointGrasp:
+        if preparation_guard is not None and not callable(preparation_guard):
+            raise TypeError("preparation_guard must be callable or None")
+        if type(refine_grasp_centers) is not bool:
+            raise TypeError("refine_grasp_centers must be boolean")
+        if type(refine_grasp_axial_depth) is not bool:
+            raise TypeError("refine_grasp_axial_depth must be boolean")
+        if (refine_grasp_centers or refine_grasp_axial_depth) and self.registration.profile.backend_id != "graspgenx":
+            raise ValueError("Grasp-center refinement requires the GraspGenX backend")
+        if (refine_grasp_centers or refine_grasp_axial_depth) and (selection_factory is None or annotate_result):
+            raise ValueError("Grasp-center refinement is internal to complete-path selection, not public candidate review")
         started = time.perf_counter()
         timings: dict[str, Any] = {}
         completed = False
         try:
+            if preparation_guard is not None:
+                preparation_guard()
             window_factory = self.non_motion_read_window
             window = (
                 window_factory()
@@ -522,8 +554,18 @@ class StationBoundPointGraspProvider:
                 else nullcontext()
             )
             with window:
+                if preparation_guard is not None:
+                    preparation_guard()
                 prepared = self._plan_request_unwindowed(
-                    request, input_snapshot_sink=input_snapshot_sink, timings=timings)
+                    request, input_snapshot_sink=input_snapshot_sink,
+                    failure_snapshot_sink=failure_snapshot_sink, timings=timings,
+                    selection_factory=selection_factory, annotate_result=annotate_result,
+                    refine_grasp_centers=refine_grasp_centers,
+                    refine_grasp_axial_depth=refine_grasp_axial_depth,
+                    **({"preparation_guard": preparation_guard}
+                       if preparation_guard is not None else {}))
+            if preparation_guard is not None:
+                preparation_guard()
             completed = True
             return prepared
         finally:
@@ -538,7 +580,13 @@ class StationBoundPointGraspProvider:
         request: Any,
         *,
         input_snapshot_sink: Callable[[bytes], None] | None = None,
+        failure_snapshot_sink: Callable[[bytes], Mapping] | None = None,
         timings: dict[str, Any],
+        selection_factory: Callable | None = None,
+        annotate_result: bool = True,
+        refine_grasp_centers: bool = False,
+        refine_grasp_axial_depth: bool = False,
+        preparation_guard: Callable[[], None] | None = None,
     ) -> PreparedPointGrasp:
         if request.input_artifact_bindings:
             raise ValueError("Live Station point-grasp accepts no input Artifacts.")
@@ -546,6 +594,8 @@ class StationBoundPointGraspProvider:
         preparation_started = time.perf_counter()
         with self._lock:
             timings["provider_lock_wait"] = (time.perf_counter() - preparation_started) * 1_000.
+            if preparation_guard is not None:
+                preparation_guard()
             with _record_elapsed_ms(timings, "capture_and_preparation"):
                 frozen_views = None
                 fused_observation = None
@@ -710,16 +760,48 @@ class StationBoundPointGraspProvider:
 
                     def build_fused_scene(*, depth_m, target_mask, intrinsics, geometry):
                         nonlocal fused_observation
+                        segment_point = self.planner.point_segmenter.segment_point
+                        if preparation_guard is not None:
+                            original_segment_point = segment_point
+
+                            def segment_point(*args, **kwargs):
+                                preparation_guard()
+                                mask = original_segment_point(*args, **kwargs)
+                                preparation_guard()
+                                return mask
+
                         fused_observation = fuse_grasp_views(
                             anchor=views[capture.role], anchor_mask=target_mask,
                             anchor_pixel_uv=pixel_uv,
                             auxiliary=tuple(v for role, v in views.items() if role != capture.role)
                                 if request.parameters["view_policy"] == "auto" else (),
-                            geometry=geometry, segment_point=self.planner.point_segmenter.segment_point,
+                            geometry=geometry, segment_point=segment_point,
                             clean_depth=clean_depth)
                         return fused_observation.scene
 
                     visible_scene_factory = build_fused_scene
+
+                selection_scene = None
+                if visible_scene_factory is not None and (selection_factory is not None
+                        or request.parameters.get("include_arm_reachability", False)):
+                    scene_factory = visible_scene_factory
+                    def retain_selection_scene(**kwargs):
+                        nonlocal selection_scene
+                        scene = scene_factory(**kwargs)
+                        # Same immutable labels and capture, but use the
+                        # actual controlled-TCP geometry for local IK,
+                        # not the model's zero-offset grasp geometry.
+                        selection_scene = VisibleGraspScene(
+                            points=(scene.points @ reference_from_camera[:3, :3].T
+                                + reference_from_camera[:3, 3]),
+                            target_mask=scene.target_mask,
+                            geometry=self.planner.solid_geometry,
+                            capture_qpos_by_side=qpos_cut.qpos_by_side,
+                            capture_self_observation_evidence=scene.capture_self_observation_evidence,
+                            depth_preprocessing_evidence=scene.depth_preprocessing_evidence,
+                        )
+                        return scene
+                    visible_scene_factory = retain_selection_scene
 
                 candidate_selector = None
                 # Proposal seeds belong only to this frozen request. No cached
@@ -735,9 +817,12 @@ class StationBoundPointGraspProvider:
                     )
                     if callable(selector):
                         try:
-                            accepts_endpoint_seeds = "endpoint_seeds" in inspect.signature(selector).parameters
+                            selector_parameters = inspect.signature(selector).parameters
+                            accepts_endpoint_seeds = "endpoint_seeds" in selector_parameters
+                            accepts_visible_scene = "visible_scene" in selector_parameters
                         except (TypeError, ValueError):
                             accepts_endpoint_seeds = False
+                            accepts_visible_scene = False
                         def select_candidates(
                             candidates,
                             target_point_reference_m,
@@ -750,10 +835,20 @@ class StationBoundPointGraspProvider:
                                 measured_qpos_cut=qpos_cut,
                                 measurement_reference_time=float(capture.acquired_at),
                                 **({"endpoint_seeds": endpoint_seeds} if accepts_endpoint_seeds else {}),
+                                **({"visible_scene": selection_scene}
+                                   if accepts_visible_scene and selection_scene is not None else {}),
                             )
 
                         candidate_selector = select_candidates
 
+            proposal_priority = None
+            if selection_factory is not None:
+                if selection_scene is not None:
+                    raise RuntimeError("Selection scene must be constructed during model preparation.")
+                candidate_selector = selection_factory(qpos_cut, lambda: selection_scene)
+                proposal_priority = candidate_selector.priority
+
+            timings["capture_and_preparation"] = (time.perf_counter() - preparation_started) * 1_000.
             proposal_started = time.perf_counter()
             try:
                 planned = self.planner.plan(
@@ -762,9 +857,80 @@ class StationBoundPointGraspProvider:
                     max_candidates=request.parameters["max_candidates"],
                     **({"use_visible_target_points": True} if frozen_views is not None else {}),
                     **({"visible_scene_factory": visible_scene_factory} if visible_scene_factory is not None else {}),
-                    **({"candidate_selector": candidate_selector} if candidate_selector is not None else {}))
+                    **({"candidate_selector": candidate_selector} if candidate_selector is not None else {}),
+                    **({"refine_grasp_centers": True} if refine_grasp_centers else {}),
+                    **({"refine_grasp_axial_depth": True} if refine_grasp_axial_depth else {}),
+                    **({"preparation_guard": preparation_guard} if preparation_guard is not None else {}),
+                    **({"proposal_priority": proposal_priority} if proposal_priority is not None else {}))
+            except PointGraspPlanningError as error:
+                # Retaining failed evidence is not part of model/path compute.
+                failed_at = time.perf_counter()
+                timings["proposal_planning"] = (failed_at - proposal_started) * 1_000.
+                diagnostic = dict(error.diagnostic)
+                if failure_snapshot_sink is not None:
+                    # Debug evidence is not a success Artifact binding, does
+                    # not make a rejected proposal renderable/executable, and
+                    # carries the exact request's mask rather than cached state.
+                    metadata = {
+                        "schema": "dexteleop.point_grasp.failure_replay.v1",
+                        "scope": "rejected_proposals_not_an_executable_plan",
+                        "request_id": request.request_id,
+                        "parameters": dict(request.parameters),
+                        "capture_group_id": capture.capture_group_id,
+                        "acquired_at": capture.acquired_at,
+                        "station_revision": capture.station_revision,
+                        "camera_intrinsics": dict(capture.intrinsics),
+                        "T_reference_from_camera": reference_from_camera.tolist(),
+                        "reference_frame_id": self.frame_binding.reference_frame_id,
+                        "filter_summary": error.filter_summary,
+                        "reference_frame_spec_hash": self.registration.profile.reference_frame_spec_hash,
+                        "frame_graph_hash": self.registration.profile.frame_graph_hash,
+                        "frame_binding_hash": self.registration.profile.frame_binding_hash,
+                        "model_profile_hash": self.registration.profile.model_profile_hash,
+                        "inference_implementation_hash": self.registration.profile.inference_implementation_hash,
+                        "failure_diagnostic": diagnostic,
+                        "solid_geometry": asdict(self.planner.solid_geometry),
+                        "measured_qpos": None if qpos_cut is None else {
+                            "measured_at": qpos_cut.measured_at,
+                            "available_at": qpos_cut.available_at,
+                            "hash": qpos_cut.semantic_content_hash,
+                        },
+                    }
+                    try:
+                        arrays = {**error.replay_arrays, "rgb": capture.rgb,
+                                  "depth_m": capture.depth_m,
+                                  "metadata": np.frombuffer(json.dumps(metadata, allow_nan=False,
+                                      sort_keys=True).encode("utf-8"), dtype=np.uint8)}
+                        if qpos_cut is not None:
+                            arrays.update({side+"_qpos": np.asarray(qpos_cut.qpos_by_side[side])
+                                           for side in ("left", "right")})
+                        if any(value.dtype.hasobject for value in arrays.values()):
+                            raise ValueError("Failure replay cannot contain object arrays.")
+                        # Enforce inflated and compressed bounds even if the
+                        # store would accept a larger payload.
+                        if sum(value.nbytes for value in arrays.values()) > 16 * 1024 * 1024:
+                            raise ValueError("Point-grasp failure replay exceeds 16 MiB.")
+                        stream = io.BytesIO()
+                        np.savez_compressed(stream, **arrays)
+                        if stream.tell() > 16 * 1024 * 1024:
+                            raise ValueError("Point-grasp failure replay exceeds 16 MiB.")
+                        diagnostic["debug_evidence"] = dict(failure_snapshot_sink(stream.getvalue()))
+                    except (OSError, ValueError, TypeError, RuntimeError) as retention_error:
+                        # The request has already failed closed. Preserve its
+                        # primary cause while explicitly reporting missing
+                        # optional debug evidence; never report success.
+                        diagnostic["debug_evidence_failure"] = {
+                            "exception_type": type(retention_error).__name__,
+                            "message": " ".join(str(retention_error).split())[:256],
+                        }
+                        _LOGGER.exception("Point-grasp replay retention failed; primary reason=%s",
+                                          error.reason_code)
+                timings["failure_evidence_retention"] = (time.perf_counter()-failed_at)*1_000.
+                raise PassiveReadError(str(error), reason_code=error.reason_code,
+                                       diagnostic=bounded_point_grasp_failure_diagnostic(diagnostic)) from error
             finally:
-                timings["proposal_planning"] = (time.perf_counter() - proposal_started) * 1_000.
+                if "proposal_planning" not in timings:
+                    timings["proposal_planning"] = (time.perf_counter() - proposal_started) * 1_000.
                 stages = getattr(self.planner, "last_plan_timing_ms", None)
                 if isinstance(stages, Mapping):
                     timings["proposal_stages"] = dict(stages)
@@ -784,7 +950,7 @@ class StationBoundPointGraspProvider:
                 planned,
                 dict(capture.intrinsics),
                 solid_geometry=getattr(self.planner, "solid_geometry", None),
-            )
+            ) if annotate_result else b""
             if len(annotated) > self.registration.profile.max_annotated_bytes:
                 raise RuntimeError(
                     "Annotated Station point-grasp image exceeds its bound."
@@ -834,7 +1000,7 @@ class StationBoundPointGraspProvider:
                         )
                 candidates.append(payload)
             reachability_context = None
-            if request.parameters.get("include_arm_reachability", False):
+            if annotate_result and request.parameters.get("include_arm_reachability", False):
                 if self.arm_reachability_evaluator is None:
                     raise RuntimeError("Arm reachability evaluator is unavailable.")
                 candidate_poses = tuple(
@@ -1029,6 +1195,25 @@ def build_real_point_grasp_executor(
     )
 
 
+def retain_point_grasp_failure(
+    *, data: bytes, artifact_store: RecoverableAgentArtifactStore,
+    runtime_session_id: str, operation_id: str, now: float,
+) -> Mapping[str, str]:
+    """Keep bounded operator evidence, never a successful output or motion permit."""
+    ref = artifact_ref_for_bytes(
+        data, media_type="application/x-npz", schema_id="dexteleop.point_grasp.failure_replay.v1",
+        encoding="npz.point_grasp_failure_arrays.metadata_json.v1", compression="zip")
+    committed = commit_artifact_bytes(
+        store=artifact_store, data=data, artifact=ref,
+        producer_id="agent_gateway.provider.station_point_grasp_failure",
+        runtime_session_id=runtime_session_id,
+        idempotency_key="station-point-grasp-failure:" + operation_id, now=now)
+    _LOGGER.warning("Point-grasp failure replay retained: operation_id=%s sha256=%s path=%s",
+        operation_id, committed.sha256, artifact_store.managed_read_path(committed.artifact_id))
+    return {"artifact_id": committed.artifact_id, "sha256": committed.sha256,
+            "scope": "operator_debug_only_not_success_output_or_motion_authority"}
+
+
 def build_station_bound_point_grasp_executor(
     *,
     registration: StationBoundPointGraspRegistration,
@@ -1042,6 +1227,12 @@ def build_station_bound_point_grasp_executor(
     """Bind the live proposal Route without granting downstream execution."""
 
     def read_and_publish(request: Any, operation: Any, timings: dict[str, float]) -> PassiveReadResult:
+        def retain_failure(data: bytes) -> Mapping:
+            return retain_point_grasp_failure(data=data, artifact_store=artifact_store,
+                runtime_session_id=runtime_session_id,
+                operation_id=operation.operation_id,
+                now=float(clock()))
+
         def retain_input(data: bytes) -> None:
             ref = artifact_ref_for_bytes(
                 data, media_type=GRASP_RGBD_SNAPSHOT_MEDIA_TYPE,
@@ -1060,7 +1251,8 @@ def build_station_bound_point_grasp_executor(
                 operation.operation_id, committed_input.sha256,
                 artifact_store.managed_read_path(committed_input.artifact_id),
             )
-        prepared = provider.plan_request(request, input_snapshot_sink=retain_input)
+        prepared = provider.plan_request(request, input_snapshot_sink=retain_input,
+                                         failure_snapshot_sink=retain_failure)
         with _record_elapsed_ms(timings, "artifact_publication"):
             expected_revision = request.expected_station_revision
             if current_station_revision() != expected_revision:

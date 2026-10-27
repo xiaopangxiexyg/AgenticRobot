@@ -15,6 +15,8 @@ import multiprocessing as mp
 import os
 import queue
 import threading
+
+from robot_motion.runtime.owned_thread import OwnedThread
 import time
 from collections import OrderedDict
 from dataclasses import dataclass
@@ -773,8 +775,10 @@ class RM65OfficialAllIKGovernorPlanner:
             str, _ContinuousWaypointBuildResult
         ] = OrderedDict()
         self._continuous_precompute_stop = False
-        self._continuous_precompute_thread: threading.Thread | None = None
+        self._continuous_precompute_thread: OwnedThread | None = None
         self._continuous_precompute_process: Any | None = None
+        self._continuous_precompute_process_launch_attempted = False
+        self._continuous_precompute_process_exit_confirmed = False
         self._continuous_precompute_process_request_queue: Any | None = None
         self._continuous_precompute_process_result_queue: Any | None = None
         self._continuous_precompute_process_pending_key: str | None = None
@@ -791,47 +795,53 @@ class RM65OfficialAllIKGovernorPlanner:
         self._continuous_precompute_superseded_count = 0
         self._continuous_precompute_miss_count = 0
         if self.continuous_waypoint_async_precompute_enabled:
-            if (
-                self.continuous_waypoint_worker_isolation
-                == CONTINUOUS_WAYPOINT_WORKER_PROCESS
-            ):
+            if self.continuous_waypoint_worker_isolation == CONTINUOUS_WAYPOINT_WORKER_PROCESS:
                 if self._continuous_waypoint_process_spec is None:
-                    raise ValueError(
-                        "process-isolated continuous waypoint precompute "
-                        "requires continuous_waypoint_process_spec"
-                    )
+                    raise ValueError("process-isolated continuous waypoint precompute requires continuous_waypoint_process_spec")
                 if self._continuous_waypoint_precompute_collision_planner is not None:
-                    raise ValueError(
-                        "process-isolated continuous waypoint precompute must "
-                        "construct its proposal planner inside the child process"
-                    )
-                self._start_continuous_waypoint_process()
-            else:
-                if self._continuous_waypoint_precompute_collision_planner is None:
-                    raise ValueError(
-                        "continuous waypoint async precompute requires an isolated "
-                        "proposal collision planner."
-                    )
-                self._continuous_precompute_thread = threading.Thread(
-                    target=self._continuous_waypoint_precompute_loop,
-                    name="rm65-continuous-waypoint-precompute",
-                    daemon=True,
-                )
-                self._continuous_precompute_thread.start()
-                if not self._continuous_precompute_affinity_ready.wait(timeout=1.0):
-                    self.shutdown_background_workers(timeout_sec=1.0)
-                    raise RuntimeError(
-                        "continuous waypoint precompute worker did not publish its "
-                        "CPU-affinity receipt within 1.000s"
-                    )
-                if self._continuous_precompute_affinity_error is not None:
-                    error = self._continuous_precompute_affinity_error
-                    self.shutdown_background_workers(timeout_sec=1.0)
-                    raise RuntimeError(
-                        "continuous waypoint precompute CPU-affinity setup failed: "
-                        f"{error}"
-                    )
+                    raise ValueError("process-isolated continuous waypoint precompute must construct its proposal planner inside the child process")
+            elif self._continuous_waypoint_precompute_collision_planner is None:
+                raise ValueError("continuous waypoint async precompute requires an isolated proposal collision planner.")
+        self._background_lifecycle_lock = threading.RLock()
+        self._background_start_attempted = False
+        self._background_start_error: BaseException | None = None
+        self._background_closed = False
         self._sequence = 0
+
+    def start_background_workers(self) -> None:
+        """Acquire optional workers only after the caller retains this owner.
+
+        A failed start is sticky. The owner must close/drain this same instance;
+        retrying construction must never lose an uncertain acquisition.
+        """
+        with self._background_lifecycle_lock:
+            if self._background_closed:
+                raise RuntimeError("continuous waypoint planner is closed")
+            if self._background_start_error is not None:
+                raise self._background_start_error
+            if self._background_start_attempted:
+                return
+            self._background_start_attempted = True
+            try:
+                if not self.continuous_waypoint_async_precompute_enabled:
+                    return
+                if self.continuous_waypoint_worker_isolation == CONTINUOUS_WAYPOINT_WORKER_PROCESS:
+                    self._start_continuous_waypoint_process()
+                else:
+                    self._continuous_precompute_thread = OwnedThread(
+                        target=self._continuous_waypoint_precompute_loop,
+                        name="rm65-continuous-waypoint-precompute", daemon=True,
+                    )
+                    self._continuous_precompute_thread.start()
+                    if not self._continuous_precompute_affinity_ready.wait(timeout=1.0):
+                        raise RuntimeError("continuous waypoint precompute worker did not publish its CPU-affinity receipt within 1.000s")
+                    if self._continuous_precompute_affinity_error is not None:
+                        raise RuntimeError("continuous waypoint precompute CPU-affinity setup failed: " + self._continuous_precompute_affinity_error)
+                if self._background_closed:
+                    raise RuntimeError("continuous waypoint planner closed during worker acquisition")
+            except BaseException as exc:
+                self._background_start_error = exc
+                raise
 
     @property
     def collision_pair_count(self) -> int:
@@ -842,7 +852,9 @@ class RM65OfficialAllIKGovernorPlanner:
         assert process_spec is not None
         context = mp.get_context("spawn")
         request_queue = context.Queue(maxsize=1)
+        self._continuous_precompute_process_request_queue = request_queue
         result_queue = context.Queue(maxsize=4)
+        self._continuous_precompute_process_result_queue = result_queue
         process = context.Process(
             target=_continuous_waypoint_process_main,
             kwargs={
@@ -860,11 +872,11 @@ class RM65OfficialAllIKGovernorPlanner:
         self._continuous_precompute_process_request_queue = request_queue
         self._continuous_precompute_process_result_queue = result_queue
         self._continuous_precompute_process = process
+        self._continuous_precompute_process_launch_attempted = True
         process.start()
         try:
             startup = result_queue.get(timeout=15.0)
         except queue.Empty as exc:
-            self.shutdown_background_workers(timeout_sec=1.0)
             raise RuntimeError(
                 "continuous waypoint proposal process did not publish startup "
                 "within 15.000s"
@@ -874,7 +886,6 @@ class RM65OfficialAllIKGovernorPlanner:
                 f"{startup.get('error_type', 'RuntimeError')}: "
                 f"{startup.get('error', 'unknown process startup failure')}"
             )
-            self.shutdown_background_workers(timeout_sec=1.0)
             raise RuntimeError(
                 "continuous waypoint proposal process startup failed: "
                 f"{self._continuous_precompute_process_error}"
@@ -899,7 +910,6 @@ class RM65OfficialAllIKGovernorPlanner:
         try:
             warmup = result_queue.get(timeout=2.0)
         except queue.Empty as exc:
-            self.shutdown_background_workers(timeout_sec=1.0)
             raise RuntimeError(
                 "continuous waypoint proposal process did not acknowledge "
                 "the parent request-queue feeder warmup within 2.000s"
@@ -908,7 +918,6 @@ class RM65OfficialAllIKGovernorPlanner:
             str(warmup.get("kind", "")) != "parent_queue_warmup"
             or str(warmup.get("token", "")) != warmup_token
         ):
-            self.shutdown_background_workers(timeout_sec=1.0)
             raise RuntimeError(
                 "continuous waypoint proposal process returned an invalid "
                 "parent request-queue feeder warmup receipt"
@@ -1105,61 +1114,52 @@ class RM65OfficialAllIKGovernorPlanner:
         }
 
     def shutdown_background_workers(self, *, timeout_sec: float = 1.0) -> None:
-        """Stop the optional proposal worker without touching robot state."""
-
-        process = self._continuous_precompute_process
-        if process is not None:
-            self._continuous_precompute_stop = True
-            request_queue = self._continuous_precompute_process_request_queue
-            if request_queue is not None:
-                try:
-                    request_queue.put_nowait({"kind": "shutdown"})
-                except queue.Full:
-                    try:
-                        request_queue.get_nowait()
-                    except queue.Empty:
-                        pass
+        """Drain the retained owner; failure keeps handles for a later retry."""
+        # Fence admission before a bounded wait for in-flight acquisition.
+        self._background_closed = True
+        if not self._background_lifecycle_lock.acquire(timeout=max(0.0, float(timeout_sec))):
+            raise RuntimeError("continuous waypoint worker acquisition is still in progress")
+        try:
+            self._background_closed = True
+            with self._continuous_precompute_condition:
+                self._continuous_precompute_stop = True
+                self._continuous_precompute_pending = None
+                self._continuous_precompute_condition.notify_all()
+            process = self._continuous_precompute_process
+            if (process is not None and self._continuous_precompute_process_launch_attempted
+                    and not self._continuous_precompute_process_exit_confirmed):
+                # A start() interrupted before _popen publication is unknown,
+                # even when is_alive() reports False. Never discard that owner.
+                if getattr(process, "_popen", None) is None:
+                    raise RuntimeError("continuous waypoint process acquisition is unconfirmed")
+                request_queue = self._continuous_precompute_process_request_queue
+                if request_queue is not None:
                     try:
                         request_queue.put_nowait({"kind": "shutdown"})
                     except queue.Full:
                         pass
-            process.join(timeout=float(timeout_sec))
-            if process.is_alive():
-                process.terminate()
                 process.join(timeout=float(timeout_sec))
-            if process.is_alive():
-                raise RuntimeError(
-                    "continuous waypoint proposal process did not stop within "
-                    f"{float(timeout_sec):.3f}s"
-                )
-            for process_queue in (
-                self._continuous_precompute_process_request_queue,
-                self._continuous_precompute_process_result_queue,
-            ):
+                if process.is_alive():
+                    process.terminate()
+                    process.join(timeout=float(timeout_sec))
+                if process.is_alive() or process.exitcode is None:
+                    raise RuntimeError("continuous waypoint proposal process did not stop within " + f"{float(timeout_sec):.3f}s")
+                self._continuous_precompute_process_exit_confirmed = True
+            thread = self._continuous_precompute_thread
+            if thread is not None:
+                if not thread.join_and_confirm(timeout=float(timeout_sec)):
+                    raise RuntimeError("continuous waypoint precompute worker did not stop within " + f"{float(timeout_sec):.3f}s")
+            for name in ("_continuous_precompute_process_request_queue", "_continuous_precompute_process_result_queue"):
+                process_queue = getattr(self, name)
                 if process_queue is not None:
                     process_queue.cancel_join_thread()
                     process_queue.close()
+                    setattr(self, name, None)
             self._continuous_precompute_process = None
-            self._continuous_precompute_process_request_queue = None
-            self._continuous_precompute_process_result_queue = None
             self._continuous_precompute_process_pending_key = None
-            return
-
-        thread = self._continuous_precompute_thread
-        if thread is None:
-            return
-        with self._continuous_precompute_condition:
-            self._continuous_precompute_stop = True
-            self._continuous_precompute_pending = None
-            self._continuous_precompute_condition.notify_all()
-        if thread is not threading.current_thread():
-            thread.join(timeout=float(timeout_sec))
-            if thread.is_alive():
-                raise RuntimeError(
-                    "continuous waypoint precompute worker did not stop within "
-                    f"{float(timeout_sec):.3f}s"
-                )
-        self._continuous_precompute_thread = None
+            self._continuous_precompute_thread = None
+        finally:
+            self._background_lifecycle_lock.release()
 
     def close(self, *, timeout_sec: float = 1.0) -> None:
         self.shutdown_background_workers(timeout_sec=timeout_sec)

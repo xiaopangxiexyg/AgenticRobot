@@ -22,7 +22,7 @@ from multiprocessing.reduction import ForkingPickler
 from collections import deque
 from dataclasses import dataclass, replace
 from multiprocessing import shared_memory
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Callable, Iterable, Mapping, Sequence
 
 import numpy as np
 
@@ -423,6 +423,49 @@ def _metric_summary(values: Sequence[float]) -> dict[str, float | int | None]:
     }
 
 
+def _map_snapshot_payloads(
+    snapshot: CollectorSampleSnapshot,
+    *,
+    array_type: type,
+    map_array: Callable[[Any], Any],
+) -> CollectorSampleSnapshot:
+    """Map transport payloads in camera, arm, hand, then reference order."""
+
+    def map_nested(value: Any) -> Any:
+        if isinstance(value, array_type):
+            return map_array(value)
+        if isinstance(value, Mapping):
+            return {key: map_nested(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [map_nested(item) for item in value]
+        if isinstance(value, tuple):
+            return tuple(map_nested(item) for item in value)
+        return value
+
+    frames: dict[str, VideoFrame | None] = {}
+    for camera_key, frame in snapshot.camera_frames.items():
+        if frame is None:
+            frames[str(camera_key)] = None
+            continue
+        frames[str(camera_key)] = VideoFrame(
+            image=map_array(frame.image),
+            source_timestamp=float(frame.source_timestamp),
+            receive_timestamp=frame.receive_timestamp,
+            available_timestamp=frame.available_timestamp,
+            frame_index=frame.frame_index,
+            metadata=dict(frame.metadata),
+            depth_image=map_array(frame.depth_image),
+            depth_metadata=dict(frame.depth_metadata),
+        )
+    return replace(
+        snapshot,
+        camera_frames=frames,
+        arm_states=map_nested(snapshot.arm_states),
+        hand_states=map_nested(snapshot.hand_states),
+        position_reference=map_nested(snapshot.position_reference),
+    )
+
+
 class _SharedSlotPool:
     def __init__(self, *, slot_count: int, slot_bytes: int):
         self.slot_bytes = int(slot_bytes)
@@ -516,41 +559,8 @@ class _SharedSlotPool:
                 nbytes=int(contiguous.nbytes),
             )
 
-        def pack_nested(value: Any) -> Any:
-            if isinstance(value, np.ndarray):
-                return pack(value)
-            if isinstance(value, Mapping):
-                return {
-                    key: pack_nested(item)
-                    for key, item in value.items()
-                }
-            if isinstance(value, list):
-                return [pack_nested(item) for item in value]
-            if isinstance(value, tuple):
-                return tuple(pack_nested(item) for item in value)
-            return value
-
-        frames: dict[str, VideoFrame | None] = {}
-        for camera_key, frame in snapshot.camera_frames.items():
-            if frame is None:
-                frames[str(camera_key)] = None
-                continue
-            frames[str(camera_key)] = VideoFrame(
-                image=pack(frame.image),
-                source_timestamp=float(frame.source_timestamp),
-                receive_timestamp=frame.receive_timestamp,
-                available_timestamp=frame.available_timestamp,
-                frame_index=frame.frame_index,
-                metadata=dict(frame.metadata),
-                depth_image=pack(frame.depth_image),
-                depth_metadata=dict(frame.depth_metadata),
-            )
-        packed_snapshot = replace(
-            snapshot,
-            camera_frames=frames,
-            arm_states=pack_nested(snapshot.arm_states),
-            hand_states=pack_nested(snapshot.hand_states),
-            position_reference=pack_nested(snapshot.position_reference),
+        packed_snapshot = _map_snapshot_payloads(
+            snapshot, array_type=np.ndarray, map_array=pack,
         )
         return packed_snapshot, int(offset)
 
@@ -597,42 +607,9 @@ def _hydrate_snapshot(
         # after that copy, so the parent cannot overwrite this view early.
         return view
 
-    def hydrate_nested(value: Any) -> Any:
-        if isinstance(value, SharedArrayRef):
-            return hydrate(value)
-        if isinstance(value, Mapping):
-            return {
-                key: hydrate_nested(item)
-                for key, item in value.items()
-            }
-        if isinstance(value, list):
-            return [hydrate_nested(item) for item in value]
-        if isinstance(value, tuple):
-            return tuple(hydrate_nested(item) for item in value)
-        return value
-
-    frames: dict[str, VideoFrame | None] = {}
-    for camera_key, frame in snapshot.camera_frames.items():
-        if frame is None:
-            frames[str(camera_key)] = None
-            continue
-        frames[str(camera_key)] = VideoFrame(
-            image=hydrate(frame.image),
-            source_timestamp=float(frame.source_timestamp),
-            receive_timestamp=frame.receive_timestamp,
-            available_timestamp=frame.available_timestamp,
-            frame_index=frame.frame_index,
-            metadata=dict(frame.metadata),
-            depth_image=hydrate(frame.depth_image),
-            depth_metadata=dict(frame.depth_metadata),
-        )
     return (
-        replace(
-            snapshot,
-            camera_frames=frames,
-            arm_states=hydrate_nested(snapshot.arm_states),
-            hand_states=hydrate_nested(snapshot.hand_states),
-            position_reference=hydrate_nested(snapshot.position_reference),
+        _map_snapshot_payloads(
+            snapshot, array_type=SharedArrayRef, map_array=hydrate,
         ),
         slot_id,
     )
@@ -833,6 +810,25 @@ def _selected_rgb_artifact_receipts(
     return tuple(receipts)
 
 
+def _require_native_stream_episode(
+    writer: NativeStreamEpisodeWriter | None,
+    message: Mapping[str, Any],
+    mismatch_message: str,
+) -> NativeStreamEpisodeWriter:
+    """Validate child-message identity without changing its writer or phase."""
+
+    if writer is None:
+        raise RuntimeError(
+            "No native stream episode is active in the process worker."
+        )
+    if (
+        str(message.get("episode_uuid", "")) != writer.episode_uuid
+        or int(message.get("legacy_episode_index", -1)) != writer.legacy_episode_index
+    ):
+        raise ValueError(mismatch_message)
+    return writer
+
+
 def _worker_main(
     writer_config: LeRobotV21WriterConfig,
     sample_builder_config: CollectorSampleBuilderConfig,
@@ -853,7 +849,6 @@ def _worker_main(
     v25p_native_shadow: Any | None = None
     v25p_native_shadow_identity: EpisodeCaptureIdentity | None = None
     v25p_native_shadow_error = ""
-    native_ingestion_frozen = False
     # Keep legacy episode ownership explicit in the process owner.  The
     # writer's lazy ``_ensure_episode_state`` fallback must never turn a stale
     # duplicate finalize into a newly committed empty episode.
@@ -957,7 +952,7 @@ def _worker_main(
             """
 
             nonlocal active_legacy_episode_index
-            nonlocal native_writer, native_ingestion_frozen
+            nonlocal native_writer
             nonlocal v25p_native_shadow_identity, v25p_native_shadow_error
             if (
                 active_legacy_episode_index is not None
@@ -975,7 +970,6 @@ def _worker_main(
                     )
                 native_writer.close_unsealed()
                 native_writer = None
-                native_ingestion_frozen = False
                 next_external_sequence_by_stream.clear()
                 external_intent_and_sample_frame_by_identity.clear()
             if (
@@ -1164,19 +1158,10 @@ def _worker_main(
             if kind == "native_stream_sample":
                 active_stage = "worker.native_stream_append"
                 try:
-                    if native_writer is None:
-                        raise RuntimeError(
-                            "No native stream episode is active in the process worker."
-                        )
-                    if (
-                        str(message.get("episode_uuid", ""))
-                        != native_writer.episode_uuid
-                        or int(message.get("legacy_episode_index", -1))
-                        != native_writer.legacy_episode_index
-                    ):
-                        raise ValueError(
-                            "Native stream sample does not match the active episode."
-                        )
+                    native_writer = _require_native_stream_episode(
+                        native_writer, message,
+                        "Native stream sample does not match the active episode.",
+                    )
                     native_writer.append(**dict(message["sample"]))
                     put_ack(
                         {
@@ -1332,7 +1317,6 @@ def _worker_main(
                             )
                             v25p_native_shadow_identity = None
                             raise
-                    native_ingestion_frozen = False
                     next_external_sequence_by_stream.clear()
                     external_intent_and_sample_frame_by_identity.clear()
                     builder.set_episode(int(episode_index))
@@ -1358,17 +1342,11 @@ def _worker_main(
                         raise RuntimeError(
                             "Inline native streams do not use post-finalize freeze."
                         )
-                    if (
-                        str(message.get("episode_uuid", ""))
-                        != native_writer.episode_uuid
-                        or int(message.get("legacy_episode_index", -1))
-                        != native_writer.legacy_episode_index
-                    ):
-                        raise ValueError(
-                            "Native stream freeze does not match the active episode."
-                        )
+                    native_writer = _require_native_stream_episode(
+                        native_writer, message,
+                        "Native stream freeze does not match the active episode.",
+                    )
                     native_writer.freeze_ingestion()
-                    native_ingestion_frozen = True
                     result = True
                 elif kind == "finalize_episode":
                     requested_episode_index = int(message["episode_index"])
@@ -1396,7 +1374,7 @@ def _worker_main(
                                 "Inline native stream episode must seal before "
                                 "legacy finalize."
                             )
-                        if not native_ingestion_frozen:
+                        if not native_writer.ingestion_frozen:
                             raise RuntimeError(
                                 "External native stream episode must freeze "
                                 "before legacy finalize."
@@ -1465,19 +1443,10 @@ def _worker_main(
                 elif kind == "discard_episode":
                     result = discard_legacy_episode(int(message["episode_index"]))
                 elif kind == "native_stream_note_drops":
-                    if native_writer is None:
-                        raise RuntimeError(
-                            "No native stream episode is active in the process worker."
-                        )
-                    if (
-                        str(message.get("episode_uuid", ""))
-                        != native_writer.episode_uuid
-                        or int(message.get("legacy_episode_index", -1))
-                        != native_writer.legacy_episode_index
-                    ):
-                        raise ValueError(
-                            "Native stream drops do not match the active episode."
-                        )
+                    native_writer = _require_native_stream_episode(
+                        native_writer, message,
+                        "Native stream drops do not match the active episode.",
+                    )
                     for item in tuple(message.get("drop_counts") or ()):
                         stream_id = str(item["stream_id"])
                         reason = str(item["reason"])
@@ -1490,19 +1459,10 @@ def _worker_main(
                             native_writer.note_drop(stream_id, reason=reason)
                     result = True
                 elif kind == "seal_native_stream_episode":
-                    if native_writer is None:
-                        raise RuntimeError(
-                            "No native stream episode is active in the process worker."
-                        )
-                    if (
-                        str(message.get("episode_uuid", ""))
-                        != native_writer.episode_uuid
-                        or int(message.get("legacy_episode_index", -1))
-                        != native_writer.legacy_episode_index
-                    ):
-                        raise ValueError(
-                            "Native stream seal does not match the active episode."
-                        )
+                    native_writer = _require_native_stream_episode(
+                        native_writer, message,
+                        "Native stream seal does not match the active episode.",
+                    )
                     if native_writer.requires_post_finalize_seal:
                         raise RuntimeError(
                             "External native streams must seal after legacy finalize."
@@ -1514,27 +1474,17 @@ def _worker_main(
                         ),
                     )
                     native_writer = None
-                    native_ingestion_frozen = False
                     next_external_sequence_by_stream.clear()
                     external_intent_and_sample_frame_by_identity.clear()
                 elif kind == "seal_native_stream_episode_after_legacy_finalize":
-                    if native_writer is None:
-                        raise RuntimeError(
-                            "No native stream episode is active in the process worker."
-                        )
-                    if (
-                        str(message.get("episode_uuid", ""))
-                        != native_writer.episode_uuid
-                        or int(message.get("legacy_episode_index", -1))
-                        != native_writer.legacy_episode_index
-                    ):
-                        raise ValueError(
-                            "Post-finalize native stream seal does not match "
-                            "the active episode."
-                        )
+                    native_writer = _require_native_stream_episode(
+                        native_writer, message,
+                        "Post-finalize native stream seal does not match "
+                        "the active episode.",
+                    )
                     if (
                         not native_writer.requires_post_finalize_seal
-                        or not native_ingestion_frozen
+                        or not native_writer.ingestion_frozen
                     ):
                         raise RuntimeError(
                             "Post-finalize native stream seal requires a frozen "
@@ -1548,23 +1498,16 @@ def _worker_main(
                         ),
                     )
                     native_writer = None
-                    native_ingestion_frozen = False
                     next_external_sequence_by_stream.clear()
                     external_intent_and_sample_frame_by_identity.clear()
                 elif kind == "close_native_stream_episode":
                     if native_writer is not None:
-                        if (
-                            str(message.get("episode_uuid", ""))
-                            != native_writer.episode_uuid
-                            or int(message.get("legacy_episode_index", -1))
-                            != native_writer.legacy_episode_index
-                        ):
-                            raise ValueError(
-                                "Native stream close does not match the active episode."
-                            )
+                        native_writer = _require_native_stream_episode(
+                            native_writer, message,
+                            "Native stream close does not match the active episode.",
+                        )
                         native_writer.close_unsealed()
                         native_writer = None
-                        native_ingestion_frozen = False
                         next_external_sequence_by_stream.clear()
                         external_intent_and_sample_frame_by_identity.clear()
                     result = True
@@ -1599,7 +1542,6 @@ def _worker_main(
                     if native_writer is not None:
                         native_writer.close_unsealed()
                         native_writer = None
-                    native_ingestion_frozen = False
                     next_external_sequence_by_stream.clear()
                     external_intent_and_sample_frame_by_identity.clear()
                     if (

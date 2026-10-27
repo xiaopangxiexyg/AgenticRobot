@@ -348,6 +348,7 @@ class AuthoritativeControlRuntime:
         dispatch_owner_token: DispatchOwnerToken | None = None,
         execution_epochs: ExecutionEpochRegistry | None = None,
         clock: Callable[[], float] = time.monotonic,
+        _checkpoint=None,
     ) -> None:
         if not callable(dispatcher) or not callable(backend_hold) or not callable(clock):
             raise TypeError("dispatcher, backend_hold, and clock must be callable.")
@@ -413,6 +414,15 @@ class AuthoritativeControlRuntime:
             embodiment_instance_id=config.embodiment_instance_id,
             clock_domain_id=config.clock_domain.clock_domain_id,
         )
+        if _checkpoint is not None:
+            if any(value is not None for value in (
+                dispatch_owners, dispatch_owner_token, execution_epochs,
+            )):
+                raise ValueError("Checkpoint and initial owner injection are exclusive.")
+            from .authoritative_checkpoint import restore_control_owners
+
+            restore_control_owners(self, _checkpoint)
+            return
         self.coordinator = ControlAdmissionCoordinator(
             config.control_domain_id,
             clock_domain=config.clock_domain,
@@ -1337,8 +1347,13 @@ class AuthoritativeControlRuntime:
             else self._compound_profile_for_decision(decision)
         )
         action_adaptation: ActionAdaptationResult | None = None
+        adaptation_support_expired = False
         if decision is not None:
             adaptation_requested_at = float(self.clock())
+            adaptation_support_expired = (
+                adaptation_requested_at >= decision.supported_until
+            )
+        if decision is not None and not adaptation_support_expired:
             adaptation_request = build_action_adaptation_request(
                 authoritative_decision_id=decision.decision_id,
                 authoritative_decision_hash=decision.semantic_content_hash,
@@ -1486,6 +1501,7 @@ class AuthoritativeControlRuntime:
         if (
             decision is None
             or adaptation_rejected
+            or adaptation_support_expired
             or directive.global_status != "normal"
         ):
             cancellation = None
@@ -1537,6 +1553,11 @@ class AuthoritativeControlRuntime:
                 status = "execution_hold_active"
             elif adaptation_rejected:
                 status = "action_adaptation_rejected_keep_existing"
+            elif adaptation_support_expired:
+                # No request or target was created. Retain the actual published
+                # support deadline, while still honoring the directive's HOLDs
+                # and cancellations above; expiry alone is not an adapter fault.
+                status = "target_support_expired_before_adaptation_keep_existing"
             else:
                 status = "execution_kept_existing"
             self._emit(step_facts)

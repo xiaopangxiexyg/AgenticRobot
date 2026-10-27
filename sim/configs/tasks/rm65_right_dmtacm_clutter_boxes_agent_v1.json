@@ -1,0 +1,7 @@
+{
+  "extends": "sim/configs/tasks/rm65_right_dmtacm_blue_cube_70mm_agent_v1.json",
+  "name": "rm65_right_dmtacm_clutter_boxes_agent_v1",
+  "physics_hz": 1000.0,
+  "base_contract_path": "sim/configs/rm65_bimanual_dmtacm_clutter_boxes_v1.json",
+  "base_contract_sha256": "34e1e2de22f5a22b09a2a15d91faf25e385ec31569cd2d51c5e0784c2cd9ee70"
+}

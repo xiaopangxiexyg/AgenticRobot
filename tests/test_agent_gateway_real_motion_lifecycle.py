@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+from dataclasses import replace
 from types import SimpleNamespace
 
 import numpy as np
@@ -115,6 +116,7 @@ def _runtime_fixture(
     include_grasp_approach: bool = False,
     include_safe_pose: bool = False,
     convergence_profile: RealAgentPrimitiveConvergenceProfile | None = None,
+    dual: bool = False,
 ):
     execution_frame = CoordinateFrameSpec(frame_id="dual_arm_solver_world")
     station_frame = CoordinateFrameSpec(
@@ -143,7 +145,7 @@ def _runtime_fixture(
         control_domain_id="real-domain:lifecycle-test",
         embodiment_instance_id="dual-rm65:lifecycle-test",
         target_binding_id="real-target:lifecycle-test",
-        component_ids=("right_arm",),
+        component_ids=("left_arm", "right_arm") if dual else ("right_arm",),
         station_manifest_hash="station-manifest:lifecycle-test",
         execution_manifest_hash="execution-manifest:lifecycle-test",
         backend_inventory_hash="backend-inventory:lifecycle-test",
@@ -163,8 +165,8 @@ def _runtime_fixture(
         producer_epoch=1,
     )
     port_config = RealAgentMotionPortConfig(
-        active_sides=("right",),
-        component_id_by_side={"right": "right_arm"},
+        active_sides=("left", "right") if dual else ("right",),
+        component_id_by_side={side: side+"_arm" for side in (("left", "right") if dual else ("right",))},
         execution_frame_id=execution_frame.frame_id,
         execution_frame_spec_hash=execution_frame.semantic_content_hash,
     )
@@ -179,6 +181,7 @@ def _runtime_fixture(
         ),
     )
     bundle = build_real_agent_primitive_contract_bundle(
+        primary_component_id="right_arm",
         attachment=attachment,
         port_config=port_config,
         frame_graph=graph,
@@ -192,55 +195,7 @@ def _runtime_fixture(
 
 
 def _request_and_operation(bundle, *, clock: _Clock):
-    entry = bundle.route_manifest.route("motion.step_tcp_cardinal", "1")
-    route = entry.route
-    profile = bundle.cardinal_profile
-    request = AgentSkillRequest(
-        client_id="rpent-test-client",
-        request_id="real-request-1",
-        idempotency_key="real-idempotency-1",
-        client_sequence=1,
-        runtime_session_id=bundle.route_manifest.runtime_session_id,
-        skill_route_manifest_hash=bundle.route_manifest.semantic_content_hash,
-        expected_station_revision=0,
-        skill_id=route.skill_id,
-        skill_version=route.skill_version,
-        skill_definition_hash=route.skill_definition_hash,
-        route_id=route.route_id,
-        route_version=route.route_version,
-        route_hash=route.semantic_content_hash,
-        deployment_binding_hash=entry.deployment_binding.deployment_binding_hash,
-        parameter_profile_id=profile.parameter_profile_id,
-        parameter_profile_hash=profile.semantic_content_hash,
-        parameters={
-            "component_id": profile.component_id,
-            "direction": "forward",
-            "reference_frame_id": profile.reference_frame_id,
-            "reference_frame_spec_hash": profile.reference_frame_spec_hash,
-            "controlled_frame_id": "tool_tcp",
-            "frame_graph_hash": profile.frame_graph_hash,
-            "tool_config_hash": profile.tool_config_hash,
-            "calibration_hash": profile.calibration_hash,
-            "primitive_catalog_hash": profile.primitive_catalog_hash,
-        },
-        observation_snapshot_id="real-observation-1",
-        requested_mode="real_active",
-        requested_timeout_ms=5_000,
-        skill_execution_grant_id="agent-skill-grant:real-grant-hash-1",
-    )
-    operation = AgentSkillOperation(
-        operation_id="real-operation-1",
-        request_hash=request.semantic_content_hash,
-        runtime_session_id=request.runtime_session_id,
-        status="admitted",
-        reason_code="admitted",
-        station_revision_at_admission=0,
-        current_station_revision=0,
-        started_at=clock(),
-        updated_at=clock(),
-        deadline_at=clock() + 5.0,
-    )
-    return request, operation, route, bundle.binding_for_skill(route.skill_id)
+    return _pose_request_and_operation(bundle, clock=clock, speed_scale=0.25)
 
 
 def _pose_request_and_operation(
@@ -398,6 +353,41 @@ def test_grasp_approach_activates_only_the_preplanned_joint_trajectory(skill_id,
     assert isinstance(command, TeleopCommand)
     metadata = command.metadata[REAL_AGENT_MOTION_COMMAND_METADATA_KEY]
     assert metadata["joint_trajectory_hash"] == trajectory.semantic_content_hash
+    assert builder.last_target is None
+
+
+@pytest.mark.parametrize("side", ["left", "right"])
+@pytest.mark.parametrize("skill_id,planner_key", [
+    ("motion.move_tcp_to_pose_safe", "grasp_trajectory_planner"),
+    ("motion.move_tcp_to_pose", "tcp_trajectory_planner"),
+])
+def test_dual_profile_routes_exact_requested_side_to_planner_and_activation(side, skill_id, planner_key):
+    bundle, port, builder = _runtime_fixture(dual=True, include_safe_pose=True)
+    clock, owner = _Clock(), _OwnerSession()
+    request, operation, route, binding = _pose_request_and_operation(
+        bundle, clock=clock, speed_scale=.2, skill_id=skill_id)
+    request = replace(request, parameters={**request.parameters,
+        "pose_targets_by_component": {side+"_arm": [0, 0, .03, 0, 0, 0, 1]}})
+    operation = replace(operation, request_hash=request.semantic_content_hash)
+    qpos = {arm: np.zeros(6) for arm in ("left", "right")}
+    _publish_qpos(port, qpos_by_side=qpos, measured_at=clock(), available_at=clock())
+    calls = []
+    trajectory = _stationary_grasp_trajectory(qpos)
+    def planner(**kwargs):
+        calls.append(kwargs)
+        return trajectory
+    def advance(duration):
+        clock.value += duration
+        _publish_qpos(port, qpos_by_side=qpos, measured_at=clock(), available_at=clock())
+        port.apply_owner_requests(session=owner, now=clock())
+    lifecycle = RealAgentPrimitiveSkillLifecycle(port=port, contract_bundle=bundle,
+        route=route, binding=binding, profile=bundle.pose_target_profile,
+        request=request, operation=operation, clock=clock, sleep=advance, **{planner_key: planner})
+    assert lifecycle.activate(request=request, operation=operation, cancel_requested=lambda: False).succeeded
+    assert len(calls) == 1 and calls[0]["side"] == side
+    command = port.command_for_observation(TeleopObservation(timestamp=clock()), clock())
+    metadata = command.metadata[REAL_AGENT_MOTION_COMMAND_METADATA_KEY]
+    assert metadata["side"] == side and metadata["component_id"] == side+"_arm"
     assert builder.last_target is None
 
 
@@ -934,7 +924,7 @@ def test_real_lifecycle_rejects_future_measured_tcp_pose() -> None:
         contract_bundle=bundle,
         route=route,
         binding=binding,
-        profile=bundle.cardinal_profile,
+        profile=bundle.pose_target_profile,
         request=request,
         operation=operation,
         clock=clock,
@@ -997,7 +987,7 @@ def test_real_lifecycle_resolves_dispatches_converges_and_confirms_hold() -> Non
         contract_bundle=bundle,
         route=route,
         binding=binding,
-        profile=bundle.cardinal_profile,
+        profile=bundle.pose_target_profile,
         request=request,
         operation=operation,
         clock=clock,
@@ -1069,7 +1059,7 @@ def test_real_lifecycle_waits_for_lower_owner_after_derived_cut_stalls() -> None
         contract_bundle=bundle,
         route=route,
         binding=binding,
-        profile=bundle.cardinal_profile,
+        profile=bundle.pose_target_profile,
         request=request,
         operation=operation,
         clock=clock,
@@ -1238,7 +1228,7 @@ def test_real_lifecycle_confirms_hold_after_operation_deadline() -> None:
         contract_bundle=bundle,
         route=route,
         binding=binding,
-        profile=bundle.cardinal_profile,
+        profile=bundle.pose_target_profile,
         request=request,
         operation=operation,
         clock=clock,
@@ -1346,7 +1336,7 @@ def test_real_lifecycle_reports_lower_failure_and_preserves_reason(caplog, lower
 
     lifecycle = RealAgentPrimitiveSkillLifecycle(
         port=port, contract_bundle=bundle, route=route, binding=binding,
-        profile=bundle.cardinal_profile, request=request, operation=operation,
+        profile=bundle.pose_target_profile, request=request, operation=operation,
         clock=clock, sleep=owner_sleep,
     )
     assert lifecycle.activate(request=request, operation=operation,
@@ -1416,3 +1406,389 @@ def test_preplanned_tcp_requires_new_cut_even_when_previous_cut_is_still_fresh(s
     assert port.snapshot().dispatch_count == 0
     assert port.snapshot().phase != RealAgentMotionPhase.ACTIVE
     assert builder.last_target is None
+
+
+def _pose_goal_runtime_fixture(
+    *,
+    station_from_execution_x: float = 0.0,
+    motion_side: str = "right",
+    include_inactive_command: bool = False,
+    include_grasp_approach: bool = False,
+    include_safe_pose: bool = False,
+    convergence_profile: RealAgentPrimitiveConvergenceProfile | None = None,
+    dual: bool = False,
+):
+    execution_frame = CoordinateFrameSpec(frame_id="dual_arm_solver_world")
+    station_frame = CoordinateFrameSpec(
+        frame_id="canonical_station",
+        semantic_parameters={"axis_contract": STATION_RETARGET_FRAME_CONTRACT_V1},
+    )
+    station_from_execution = np.eye(4, dtype=float)
+    station_from_execution[:3, :3] = [[0., -1., 0.], [1., 0., 0.], [0., 0., 1.]]
+    station_from_execution[0, 3] = station_from_execution_x
+    graph = CoordinateFrameGraph(
+        graph_id="real-agent-lifecycle-test-graph",
+        frames=(execution_frame, station_frame),
+        transforms=(
+            RigidFrameTransformSpec(
+                transform_id="solver-world-to-station",
+                source_frame_id=execution_frame.frame_id,
+                target_frame_id=station_frame.frame_id,
+                matrix_target_source=tuple(
+                    tuple(row) for row in station_from_execution
+                ),
+            ),
+        ),
+        graph_version="1",
+    )
+    attachment = RealTcpPoseObserveAttachmentSpec(
+        runtime_session_id="real-session:lifecycle-test",
+        control_domain_id="real-domain:lifecycle-test",
+        embodiment_instance_id="dual-rm65:lifecycle-test",
+        target_binding_id="real-target:lifecycle-test",
+        component_ids=("left_arm", "right_arm") if dual else (motion_side + "_arm",),
+        station_manifest_hash="station-manifest:lifecycle-test",
+        execution_manifest_hash="execution-manifest:lifecycle-test",
+        backend_inventory_hash="backend-inventory:lifecycle-test",
+        source_binding_id="source-binding:lifecycle-test",
+        source_binding_hash="source-binding-hash:lifecycle-test",
+        observation_binding_id="observation-binding:lifecycle-test",
+        observation_binding_hash="observation-binding-hash:lifecycle-test",
+        observation_plan_hash="observation-plan-hash:lifecycle-test",
+        observation_capability_hash="observation-capability-hash:lifecycle-test",
+        pose_schema_hash="pose-schema-hash:lifecycle-test",
+        reference_frame_id=execution_frame.frame_id,
+        reference_frame_spec_hash=execution_frame.semantic_content_hash,
+        frame_graph_hash=graph.semantic_content_hash,
+        tool_config_hash="tool-config-hash:lifecycle-test",
+        calibration_hash="calibration-hash:lifecycle-test",
+        clock_domain_id="real-owner-wall-clock",
+        producer_epoch=1,
+    )
+    port_config = RealAgentMotionPortConfig(
+        active_sides=("left", "right") if dual else (motion_side,),
+        component_id_by_side=({side: side + "_arm" for side in ("left", "right")}
+                              if dual else {motion_side: motion_side + "_arm"}),
+        execution_frame_id=execution_frame.frame_id,
+        execution_frame_spec_hash=execution_frame.semantic_content_hash,
+    )
+    envelope = SkillDeploymentSafetyEnvelopeRef(
+        object_id="real-envelope:lifecycle-test",
+        schema="dexteleop.deployment_safety_envelope.v1",
+        content_hash="real-envelope-hash:lifecycle-test",
+        constraint_set_hash="real-constraint-hash:lifecycle-test",
+        allowed_route_ids=real_agent_motion_route_ids_v1(
+            include_safe_pose=include_safe_pose,
+            include_grasp_approach=include_grasp_approach,
+        ),
+    )
+    bundle = build_real_agent_primitive_contract_bundle(
+        primary_component_id="right_arm" if dual else None,
+        attachment=attachment,
+        port_config=port_config,
+        frame_graph=graph,
+        primitive_reference_frame_id=station_frame.frame_id,
+        safety_envelope_refs=(envelope,),
+        convergence_profile=convergence_profile,
+    )
+    builder = _TargetBuilder(include_inactive_command=include_inactive_command)
+    port = RealAgentMotionPort(config=port_config, target_builder=builder)
+    return bundle, port, builder
+
+
+@pytest.mark.parametrize("skill_id, planner_key", [
+    ("motion.approach_grasp_pose", "grasp_trajectory_planner"),
+    ("motion.move_tcp_to_pose_safe", "grasp_trajectory_planner"),
+    ("motion.move_tcp_to_pose", "tcp_trajectory_planner"),
+])
+@pytest.mark.parametrize("policy", [None, "within_arrival_tolerance", "preserve_target"])
+def test_grasp_approach_activates_only_the_preplanned_joint_trajectory_pose_goal_policy(skill_id, planner_key, policy) -> None:
+    bundle, port, builder = _runtime_fixture(include_grasp_approach=True, include_safe_pose=True)
+    clock = _Clock()
+    owner = _OwnerSession()
+    request, operation, route, binding = _pose_request_and_operation(
+        bundle,
+        clock=clock,
+        speed_scale=0.2,
+        skill_id=skill_id,
+    )
+    if skill_id == "motion.move_tcp_to_pose_safe" and policy is not None:
+        request = replace(request, parameters={**request.parameters, "pose_goal_policy": policy})
+        operation = replace(operation, request_hash=request.semantic_content_hash)
+    qpos_by_side = {
+        "left": np.zeros(6, dtype=float),
+        "right": np.zeros(6, dtype=float),
+    }
+    _publish_qpos(
+        port,
+        qpos_by_side=qpos_by_side,
+        measured_at=clock(),
+        available_at=clock(),
+    )
+    trajectory = _stationary_grasp_trajectory(qpos_by_side)
+    planner_calls = 0
+
+    def planner(**_kwargs) -> RealAgentJointTrajectory:
+        nonlocal planner_calls
+        planner_calls += 1
+        assert _kwargs.get("require_grasp_approach", True) == (skill_id != "motion.move_tcp_to_pose_safe")
+        if skill_id == "motion.move_tcp_to_pose_safe":
+            assert _kwargs["pose_goal_policy"] == (policy or "within_arrival_tolerance")
+        else:
+            assert "pose_goal_policy" not in _kwargs
+        return trajectory
+
+    def lower_owner_sleep(duration: float) -> None:
+        clock.value += duration
+        _publish_qpos(port, qpos_by_side=qpos_by_side, measured_at=clock(), available_at=clock())
+        port.apply_owner_requests(session=owner, now=clock())
+
+    lifecycle = RealAgentPrimitiveSkillLifecycle(
+        port=port,
+        contract_bundle=bundle,
+        route=route,
+        binding=binding,
+        profile=bundle.pose_target_profile,
+        request=request,
+        operation=operation,
+        **{planner_key: planner},
+        clock=clock,
+        sleep=lower_owner_sleep,
+    )
+
+    activation = lifecycle.activate(
+        request=request,
+        operation=operation,
+        cancel_requested=lambda: False,
+    )
+
+    assert activation.succeeded is True
+    assert planner_calls == 1
+    assert port.snapshot().phase == RealAgentMotionPhase.ACTIVE
+    command = port.command_for_observation(
+        TeleopObservation(timestamp=clock()),
+        clock(),
+    )
+    assert isinstance(command, TeleopCommand)
+    metadata = command.metadata[REAL_AGENT_MOTION_COMMAND_METADATA_KEY]
+    assert metadata["joint_trajectory_hash"] == trajectory.semantic_content_hash
+    assert builder.last_target is None
+
+
+@pytest.mark.parametrize("policy", [None, "preserve_target"])
+@pytest.mark.parametrize("failure", ["no_path", "start_blocked", "stale_start", "cancel", "deadline", "start_drift"])
+def test_safe_pose_move_never_falls_back_to_online_ik_pose_goal_policy(failure, policy, monkeypatch, caplog):
+    from dataclasses import replace
+
+    from teleop_runtime.skill_deploy.rm65_grasp_trajectory import (
+        RM65GraspTrajectoryPlanningError,
+    )
+
+    bundle, port, builder = _runtime_fixture(include_safe_pose=True)
+    clock, owner = _Clock(), _OwnerSession()
+    request, operation, route, binding = _pose_request_and_operation(
+        bundle, clock=clock, speed_scale=0.2, skill_id="motion.move_tcp_to_pose_safe",
+    )
+    if policy is not None:
+        request = replace(request, parameters={**request.parameters, "pose_goal_policy": policy})
+        operation = replace(operation, request_hash=request.semantic_content_hash)
+    qpos = {side: np.zeros(6) for side in ("left", "right")}
+    _publish_qpos(port, qpos_by_side=qpos, measured_at=clock(), available_at=clock())
+    if failure == "stale_start":
+        stale_qpos = replace(port.latest_measured_qpos(), measured_at=clock() - 0.3)
+        monkeypatch.setattr(port, "latest_measured_qpos", lambda: stale_qpos)
+    planned = []
+    rejection_details = {"planning_phase": "safe_pose_target", "path": {
+        "metadata": {"start_check": {
+            "minimum_distance_m": 0.006,
+            "metadata": {"nearest_observed": {
+                "geometry_name": "right_hand_proxy", "occupied_center_world_m": [0.1, 0.2, 0.3],
+            }},
+        }},
+    }}
+
+    def planner(**kwargs):
+        planned.append(kwargs)
+        assert kwargs["require_grasp_approach"] is False
+        if failure in {"no_path", "start_blocked"}:
+            raise RM65GraspTrajectoryPlanningError(
+                "path_start_collision_blocked" if failure == "start_blocked" else "path_search_exhausted",
+                details=rejection_details,
+            )
+        if failure == "deadline":
+            clock.value += 9.8
+        changed = {side: values.copy() for side, values in qpos.items()}
+        if failure == "start_drift":
+            changed["left"][0] += 0.2
+        _publish_qpos(port, qpos_by_side=changed, measured_at=clock(), available_at=clock())
+        return _stationary_grasp_trajectory(qpos)
+
+    def lower_sleep(duration):
+        clock.value += duration
+        port.apply_owner_requests(session=owner, now=clock())
+
+    lifecycle = RealAgentPrimitiveSkillLifecycle(
+        port=port, contract_bundle=bundle, route=route, binding=binding,
+        profile=bundle.pose_target_profile, request=request, operation=operation,
+        grasp_trajectory_planner=planner, clock=clock, sleep=lower_sleep,
+    )
+    result = lifecycle.activate(request=request, operation=operation,
+        cancel_requested=lambda: failure == "cancel" and bool(planned))
+    assert not result.succeeded
+    assert result.lower_hold_confirmed
+    assert port.snapshot().dispatch_count == 0
+    assert builder.last_target is None
+    assert len(planned) == (0 if failure == "stale_start" else 1)
+    if failure in {"no_path", "start_blocked"}:
+        records = [record for record in caplog.records if record.name ==
+                   "agent_gateway.profiles.real.motion_primitive_skill"]
+        assert len(records) == 1
+        message = records[0].getMessage()
+        assert result.status in message
+        assert operation.operation_id in message
+        assert route.skill_id in message
+        assert repr(rejection_details) in message
+
+
+@pytest.mark.parametrize("policy", [None, "within_arrival_tolerance", "preserve_target"])
+@pytest.mark.parametrize("motion_side", ["left", "right"])
+@pytest.mark.parametrize("dual", [False, True])
+def test_grasp_approach_cannot_complete_before_planned_trajectory_elapsed_pose_goal_policy(policy, motion_side, dual) -> None:
+    bundle, port, _builder = _pose_goal_runtime_fixture(include_grasp_approach=True, include_safe_pose=True,
+        station_from_execution_x=.1, motion_side=motion_side, dual=dual)
+    clock = _Clock()
+    owner = _OwnerSession()
+    request, operation, route, binding = _pose_request_and_operation(
+        bundle,
+        clock=clock,
+        speed_scale=0.2,
+        skill_id="motion.move_tcp_to_pose_safe",
+    )
+    if policy is not None:
+        request = replace(request, parameters={**request.parameters, "pose_goal_policy": policy})
+        operation = replace(operation, request_hash=request.semantic_content_hash)
+    if dual:
+        request = replace(request, parameters={**request.parameters,
+            "pose_targets_by_component": {motion_side + "_arm": [.4, .2, .3, 0, 0, 0, 1]}})
+        operation = replace(operation, request_hash=request.semantic_content_hash)
+    qpos_by_side = {
+        "left": np.zeros(6, dtype=float),
+        "right": np.zeros(6, dtype=float),
+    }
+    _publish_qpos(
+        port,
+        qpos_by_side=qpos_by_side,
+        measured_at=clock(),
+        available_at=clock(),
+    )
+    trajectory = _stationary_grasp_trajectory(qpos_by_side)
+    target_pose = np.eye(4, dtype=float)
+    target_pose[:3, 3] = (.4, .2, .3)
+    target_pose, _ = bundle.frame_graph.transform_pose_matrix(
+        target_pose, source_reference_frame_id=bundle.pose_target_profile.reference_frame_id,
+        target_reference_frame_id=bundle.pose_target_profile.execution_reference_frame_id)
+    # Measured convergence uses the existing 10 mm arrival bound, not the
+    # stricter planning bound. Report that residual explicitly in public frame.
+    target_pose = target_pose.copy()
+    target_pose[2, 3] += .006
+    dispatch_times: list[float] = []
+
+    def lower_owner_sleep(duration: float) -> None:
+        clock.value += duration
+        _publish_qpos(port, qpos_by_side=qpos_by_side, measured_at=clock(), available_at=clock())
+        snapshot = port.apply_owner_requests(session=owner, now=clock())
+        if snapshot.phase != RealAgentMotionPhase.ACTIVE:
+            return
+        command = port.command_for_observation(
+            TeleopObservation(timestamp=clock()),
+            clock(),
+        )
+        assert isinstance(command, TeleopCommand)
+        port.observe_session_step(command=command, command_dispatched=True)
+        dispatch_times.append(clock())
+        port.publish_measured_pose(
+            pose_world_by_component=({side + "_arm": target_pose if side == motion_side else np.eye(4)
+                                     for side in ("left", "right")} if dual else {motion_side + "_arm": target_pose}),
+            measured_at=clock(),
+            available_at=clock(),
+            source_evidence_refs=(
+                f"real-hardware-cut:grasp-target:{len(dispatch_times)}",
+            ),
+        )
+
+    lifecycle = RealAgentPrimitiveSkillLifecycle(
+        port=port,
+        contract_bundle=bundle,
+        route=route,
+        binding=binding,
+        profile=bundle.pose_target_profile,
+        request=request,
+        operation=operation,
+        grasp_trajectory_planner=lambda **_kwargs: trajectory,
+        clock=clock,
+        sleep=lower_owner_sleep,
+    )
+    activation = lifecycle.activate(
+        request=request,
+        operation=operation,
+        cancel_requested=lambda: False,
+    )
+    assert activation.succeeded is True
+    activated_at = port.snapshot().activated_at
+    assert activated_at is not None
+
+    arrival_cuts = []
+    original_hold = lifecycle.request_hold
+    def capture_arrival_then_hold(**kwargs):
+        arrival_cuts.append(port.latest_measured_pose())
+        held = original_hold(**kwargs)
+        later_pose = target_pose.copy()
+        later_pose[2, 3] += .001
+        port.publish_measured_pose(pose_world_by_component=(
+            {side + "_arm": later_pose if side == motion_side else np.eye(4) for side in ("left", "right")}
+            if dual else {motion_side + "_arm": later_pose}),
+            measured_at=clock(), available_at=clock(), source_evidence_refs=("later-hold-cut",))
+        return held
+    lifecycle.request_hold = capture_arrival_then_hold
+    completion = lifecycle.run(
+        request=request,
+        operation=operation,
+        cancel_requested=lambda: False,
+    )
+
+    assert completion.succeeded is True
+    bundle.payload_validators.validate_execution_result(route=route, payload=completion.execution_result)
+    report = completion.execution_result["pose_goal_report"]
+    assert report["pose_goal_policy"] == (policy or "within_arrival_tolerance")
+    assert report["reference_frame_id"] == bundle.pose_target_profile.reference_frame_id
+    np.testing.assert_allclose(report["requested_pose_xyz_quat_xyzw"], [.4, .2, .3, 0, 0, 0, 1])
+    np.testing.assert_allclose(report["achieved_pose_xyz_quat_xyzw"], [.4, .2, .306, 0, 0, 0, 1])
+    assert report["translation_error_m"] == pytest.approx(.006, abs=1e-7)
+    assert report["rotation_error_rad"] == pytest.approx(0.)
+    assert report["arrival_translation_tolerance_m"] == .01
+    for field, bad_value in (("pose_goal_policy", "invalid"),
+            ("achieved_pose_xyz_quat_xyzw", [0, 0, 0, 0, 0, 0, 0]),
+            ("translation_error_m", float("nan")),
+            ("arrival_translation_tolerance_m", 0.)):
+        with pytest.raises((ValueError, TypeError)):
+            bundle.payload_validators.validate_execution_result(route=route,
+                payload={**completion.execution_result,
+                    "pose_goal_report": {**report, field: bad_value}})
+    assert len(arrival_cuts) == 1
+    arrival_cut = arrival_cuts[0]
+    assert completion.execution_result["final_measured_state_hash"] == arrival_cut.semantic_content_hash
+    assert completion.execution_result["final_measured_state_hash"] != port.latest_measured_pose().semantic_content_hash
+    public_pose, _ = bundle.frame_graph.transform_pose_matrix(
+        arrival_cut.pose_world_by_component[motion_side + "_arm"],
+        source_reference_frame_id=bundle.pose_target_profile.execution_reference_frame_id,
+        target_reference_frame_id=bundle.pose_target_profile.reference_frame_id)
+    from robot_motion.relative_action import pose_matrix_to_xyzquat
+    np.testing.assert_allclose(report["achieved_pose_xyz_quat_xyzw"],
+        pose_matrix_to_xyzquat(public_pose, name="arrival_report_test"))
+    assert dispatch_times[-1] >= activated_at + 0.5
+    assert len(dispatch_times) > 3
+    assert len(completion.execution_receipt_refs) < 16
+    assert (
+        "real-agent-joint-trajectory:" + trajectory.semantic_content_hash
+        in completion.execution_receipt_refs
+    )

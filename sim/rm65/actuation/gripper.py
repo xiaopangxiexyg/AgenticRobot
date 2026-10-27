@@ -232,6 +232,7 @@ class DmtacPositionActuator:
         self._delayed: list[tuple[float, int, str, float]] = []
         self._sequence = 0
         self._applied_sequence_by_side: dict[str, int] = {}
+        self._last_step: tuple[float, float] | None = None
         self._reset = False
 
     def reset(
@@ -277,6 +278,7 @@ class DmtacPositionActuator:
         self._delayed.clear()
         self._sequence = 0
         self._applied_sequence_by_side = {side: 0 for side in values}
+        self._last_step = None
         self._reset = True
         if initial_state is not None:
             self._restore_state(initial_state, initial_physics_time_sec=initial_time)
@@ -374,6 +376,7 @@ class DmtacPositionActuator:
             self._position[side] = float(np.clip(candidate, 0.0, 1.0))
             self._rate[side] = float(rate)
 
+        self._last_step = (now, dt)
         return DmtacPositionActuatorTick(
             physics_time_sec=now,
             accepted_by_side=accepted,
@@ -389,6 +392,12 @@ class DmtacPositionActuator:
             "state_schema": "dmtac_position_actuator_state.v1",
             "execution_mode": self.execution_mode,
             "profile": self.profile.to_metadata(),
+            "last_step": (
+                None if self._last_step is None else {
+                    "physics_time_sec": self._last_step[0],
+                    "timestep_sec": self._last_step[1],
+                }
+            ),
             "next_command_time_by_side": {
                 side: float(value) for side, value in self._next_command_time.items()
             },
@@ -527,6 +536,25 @@ class DmtacPositionActuator:
         if not isinstance(raw_delayed, Sequence) or isinstance(raw_delayed, (str, bytes)):
             raise TypeError("initial_state delayed_targets must be a sequence.")
         delayed: list[tuple[float, int, str, float]] = []
+        # The core accepts an explicit (possibly variable) timestep. Retain
+        # the actual processed interval; command_hz cannot reconstruct it.
+        last_step = None
+        interval = state.get("last_step")
+        if interval is not None:
+            if (
+                not isinstance(interval, Mapping)
+                or set(interval) != {"physics_time_sec", "timestep_sec"}
+                or any(type(value) not in (int, float) for value in interval.values())
+            ):
+                raise ValueError("initial_state last_step is malformed.")
+            now, dt = float(interval["physics_time_sec"]), float(interval["timestep_sec"])
+            if (
+                not math.isfinite(now) or now < 0
+                or not math.isfinite(dt) or dt <= 0
+                or not math.isclose(now + dt, initial_physics_time_sec, rel_tol=0.0, abs_tol=1e-9)
+            ):
+                raise ValueError("initial_state last_step does not match the resume time.")
+            last_step = (now, dt)
         for item in raw_delayed:
             if not isinstance(item, Mapping):
                 raise TypeError("initial_state delayed target entries must be mappings.")
@@ -536,7 +564,11 @@ class DmtacPositionActuator:
             target = float(item.get("target", float("nan")))
             if (
                 not math.isfinite(apply_time)
-                or apply_time < initial_physics_time_sec
+                or apply_time < 0.0
+                or (last_step is not None and apply_time <= last_step[0] + 1e-12)
+                # Old snapshots lack step evidence. Keep their established
+                # conservative bound rather than guessing a prior interval.
+                or (last_step is None and apply_time < initial_physics_time_sec)
                 or isinstance(item_sequence, bool)
                 or not isinstance(item_sequence, (int, np.integer))
                 or int(item_sequence) < 0
@@ -558,6 +590,7 @@ class DmtacPositionActuator:
         self._servo_goal = servo_goal
         self._position = position
         self._rate = rate
+        self._last_step = last_step
 
     @staticmethod
     def _validate_position(value: float, *, side: str) -> float:

@@ -1,10 +1,47 @@
 from dataclasses import replace
+import math
 
 import numpy as np
 import pytest
 from scipy.spatial.transform import Rotation
 
-from robot_motion.object_transport import GraspedObjectObservation, verify_rigid_follow
+from robot_motion.object_transport import (
+    GraspedObjectObservation,
+    object_translation_feedback_tool_goal,
+    tool_goal_from_object_goal,
+    verify_rigid_follow,
+)
+
+
+def test_translation_feedback_corrects_object_error_without_changing_nominal_rotation():
+    tool = pose((0, 0, .1), (170, 0, 90))
+    obj, goal = pose((0, 0, .02)), pose((.002, -.001, .02))
+    before = [matrix.copy() for matrix in (tool, obj, goal)]
+    corrected = object_translation_feedback_tool_goal(tool, obj, goal, tool)
+    np.testing.assert_allclose(corrected[:3, 3], [.002, -.001, .1])
+    np.testing.assert_array_equal(corrected[:3, :3], tool[:3, :3])
+    for actual, original in zip((tool, obj, goal), before, strict=True):
+        np.testing.assert_array_equal(actual, original)
+    assert not corrected.flags.writeable
+
+
+def test_translation_feedback_bounds_each_step_and_total_nominal_offset():
+    nominal = pose((0, 0, .1))
+    measured = pose((-.002, 0, .1))
+    for _ in range(12):
+        goal = object_translation_feedback_tool_goal(measured, pose(), pose((1, 0, 0)), nominal)
+        assert np.linalg.norm(goal[:3, 3]-nominal[:3, 3]) <= .003+1e-12
+        assert np.linalg.norm(goal[:3, 3]-measured[:3, 3]) <= .003+1e-12
+        measured = goal
+    assert measured[0, 3] == pytest.approx(.003)
+    with pytest.raises(ValueError, match="nominal correction region"):
+        object_translation_feedback_tool_goal(pose((.004, 0, .1)), pose(), pose(), nominal)
+
+
+@pytest.mark.parametrize("bound", [True, 0, -.001, .004, float('nan'), float('inf')])
+def test_translation_feedback_rejects_invalid_bounds(bound):
+    with pytest.raises(ValueError):
+        object_translation_feedback_tool_goal(pose(), pose(), pose(), pose(), maximum_correction_m=bound)
 
 
 def pose(xyz=(0, 0, 0), angles=(0, 0, 0)):
@@ -88,3 +125,40 @@ def test_fcl_carried_box_orientation_and_explicit_other_arm_pairs():
     assert len(geometries.geometryObjects) == 1 and len(geometries.collisionPairs) == 0
     with pytest.raises(ValueError, match="Invalid attached"):
         build(np.eye(3), ("missing",))
+
+
+@pytest.mark.parametrize("bound", [1e-200, 1e-300])
+def test_translation_feedback_preserves_extremely_small_positive_bounds(bound):
+    result = object_translation_feedback_tool_goal(
+        pose(), pose(), pose((1e-170, 0, 0)), pose(), maximum_correction_m=bound,
+    )
+    assert 0 < math.hypot(*result[:3, 3]) <= bound
+
+
+@pytest.mark.parametrize("bound", [1e-200, 1e-300])
+def test_translation_feedback_rejects_measured_tool_outside_a_tiny_bound(bound):
+    with pytest.raises(ValueError, match="nominal correction region"):
+        object_translation_feedback_tool_goal(
+            pose((1e-170, 0, 0)), pose(), pose(), pose(), maximum_correction_m=bound,
+        )
+
+
+@pytest.mark.parametrize("use_observation", [False, True])
+def test_tool_goal_rejects_nonfinite_composition_of_finite_input_poses(use_observation):
+    goal, relation = pose((1e308, 0, 0)), pose((-1e308, 0, 0))
+    with np.errstate(over="ignore", invalid="ignore"):
+        with pytest.raises(ValueError, match="finite rigid"):
+            if use_observation:
+                observation(reference_from_tool=pose(), reference_from_object=relation).tool_goal(goal)
+            else:
+                tool_goal_from_object_goal(goal, relation)
+
+
+def test_tool_goal_helper_preserves_relation_and_returns_an_immutable_pose():
+    goal, relation = pose((.4, -.2, .1), (15, -20, 45)), pose((.01, .02, .03), (0, 15, 0))
+    before = [p.copy() for p in (goal, relation)]
+    result = tool_goal_from_object_goal(goal, relation)
+    np.testing.assert_allclose(result @ relation, goal, atol=1e-12)
+    assert not result.flags.writeable
+    for actual, original in zip((goal, relation), before, strict=True):
+        np.testing.assert_array_equal(actual, original)

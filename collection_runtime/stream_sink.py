@@ -250,6 +250,13 @@ class NativeStreamEpisodeWriter:
     def requires_post_finalize_seal(self) -> bool:
         return bool(self.external_payload_stream_ids)
 
+    @property
+    def ingestion_frozen(self) -> bool:
+        """Whether ingestion froze successfully, even after seal or close."""
+
+        with self._lock:
+            return self._frozen
+
     def append(
         self,
         *,

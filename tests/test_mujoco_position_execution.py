@@ -136,6 +136,49 @@ def test_execution_metadata_records_gripper_self_contact_policy() -> None:
     assert rig.config.allow_gripper_self_contact is True
 
 
+def test_physics_observer_runs_after_ticks_and_is_released_only_after_close():
+    scene = _FakeScene()
+    rig = MujocoPositionExecutionRig(scene, MujocoPositionExecutionConfig(
+        timing=_timing(), actuation_profile=None, gripper_actuation_profile=None,
+        realtime_worker=False))
+    observed = []
+    rig.set_physics_step_observer(lambda current: observed.append(len(current.physics_commands)))
+    with pytest.raises(RuntimeError, match="already bound"):
+        rig.set_physics_step_observer(lambda _: None)
+    rig.start()
+    rig.step_physics()
+    rig.step_physics()
+    assert observed == [1, 2]
+    rig.close()
+    assert rig._physics_step_observer is None
+    rig.start()
+    rig.step_physics()
+    assert observed == [1, 2]
+    rig.close()
+
+
+def test_physics_observer_failure_uses_the_existing_fault_boundary():
+    scene = _FakeScene()
+    rig = MujocoPositionExecutionRig(scene, MujocoPositionExecutionConfig(
+        timing=_timing(), actuation_profile=None, gripper_actuation_profile=None,
+        realtime_worker=False))
+
+    def failed_observation(_):
+        raise ValueError("native observation failed")
+
+    rig.set_physics_step_observer(failed_observation)
+    rig.start()
+    try:
+        with pytest.raises(ValueError, match="native observation failed"):
+            rig.step_physics()
+        assert not rig.is_ready()
+        with pytest.raises(RuntimeError, match="faulted"):
+            rig.step_physics()
+        assert len(scene.physics_commands) == 1
+    finally:
+        rig.close()
+
+
 def test_mujoco_position_rig_mailbox_keeps_only_latest_qref() -> None:
     scene = _FakeScene()
     rig = MujocoPositionExecutionRig(

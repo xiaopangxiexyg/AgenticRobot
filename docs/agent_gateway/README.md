@@ -5,6 +5,22 @@
 profile 负责装配 MuJoCo 或真机下层 owner。它不启动上层 Planner，也不把安全、IK、HOLD
 证明或 actuator dispatch 交给远端调用方。
 
+## 有界抓取搜索与观测诊断
+
+- fast 抓取同时参考中央和有观测支持的较弱侧插入，沿用有限的局部轴向偏移、来源上限和
+  完整路径检查。原中央浅源与新增弱侧源交错，避免新来源挤掉原有覆盖。父路径失败不证明
+  轴向子路径失败；子候选仍须独立检查，不能继承父路径证明。
+- 首次安全路径之后，接触更好的近邻检查最多两次，共享原 3 秒子预算及全请求截止时间。
+  它不是无界优化；未知端点只跳过可选改善，不否定已验证路径。返回的 `contact_evidence`
+  是局部观测评分，不是触觉反馈、力闭合或抓取成功判定。
+- 文本定位返回 `semantic_identity_status=unverified_proposal`；标签和分数不能当身份真值。
+  同图不同查询的重叠框不能作为独立参照。腕部相机随手运动，二维框变化不能单独证明世界
+  坐标下的物体抬升；应使用对应 RGB-D、采集时 qpos 与既有标定转换，或如实报告未知。
+
+可选改善沿用原绝对截止时间、发布保留量与pending-plan owner；最终场景读取后
+仍须复查时间，过期候选不能替换原有效计划。该增量不改变当前夹爪几何默认，
+也不代表已完成真机抓取验收。
+
 本页是 Agent Gateway 的正式运行入口。协议与 package 所有权细节见
 [`agent_gateway/README.md`](../../agent_gateway/README.md)；局域网开发者的 SSH 只读接入见
 [`SSH_READ_ONLY.md`](./SSH_READ_ONLY.md)。
@@ -12,8 +28,32 @@ SAM2 + Grounding DINO 图片定位 Skill 的源码、权重和测试路径说明
 [`SAM2_GROUNDING_DINO.md`](./SAM2_GROUNDING_DINO.md)。
 SAM2 + VGN/GraspNet 点击引导 DMTAC M 抓姿 Skill 的 RGB-D、固定相机标定、权重和只读边界见
 [`POINT_GRASP.md`](./POINT_GRASP.md)。
+MuJoCo 留存观测点移动和可选观测障碍规划的调用合同、启用方式与边界见
+[`observed_point_motion.zh-CN.md`](./observed_point_motion.zh-CN.md)。
+MuJoCo 可信内存 target 的封存／独立分支、已验证范围与尚未接入的 Gateway／上层恢复，见
+[`mujoco_checkpoint.zh-CN.md`](./mujoco_checkpoint.zh-CN.md)。
+同源RGB-D留存基础可显式启用 `--enable-rgbd-capture-v3 --artifact-root ...`，
+增加默认关闭的 `perception.capture_rgb@3`；原生网格、原始媒体与失败边界见
+[`agent_gateway/README.md`](../../agent_gateway/README.md#entrypoints)。
+多目标分割v2和认证留存RGB的二维几何v3也分别通过显式
+`--enable-segmentation-batch-v2`、`--enable-segmentation-geometry-v3` 启用；
+两者复用原分割模型，输出不提供身份验证、三维物理间隙或运动授权。
+冻结对象/关系路径查询与认证表面锚点 v1/v2/v3 的启用依赖、原始观测复用和显式 safe profile 见
+[`MuJoCo 模块说明`](../../sim/mujoco/README.md#冻结状态的候选路径查询)。这些能力默认关闭；
+新表面锚点消费者复用同一留存操作和 Artifact 存储，不另建执行或采集 owner。
 运行资产包的下载、解压和共享根登记统一见项目根 [`README.md`](../../README.md) 的“运行资产”章节；
 本目录不重复资产包说明。
+
+标准 Gateway CLI 默认发布只读空间关系目标计算与 TCP 位姿比较 v2；原读取 v1
+继续保留。MuJoCo 的空间关系默认只在已支持的 right profile 发布，left 仍保持
+原拒绝边界；显式在 left 启用该能力会失败。两端均可使用
+`--no-enable-spatial-goals` 和 `--no-enable-tcp-pose-comparison` 选择较小的目录。
+直接工厂 API 继续保留原显式装配默认。以上默认不启动模型，也不授予运动权限；
+相机、模型、抓取、锚点/续接组合及控制参数仍按各自配置选择。
+
+保存真机观测上的 Contact-GraspNet 模型与完整路径筛选记录见
+[`contact_graspnet_saved_real_20261027.md`](./contact_graspnet_saved_real_20261027.md)。
+该记录保留失败分母与阶段证据，不改变默认生成器。
 
 ## 边界和运行等级
 
@@ -237,3 +277,17 @@ PYTHONNOUSERSITE=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
 
 这些检查只证明 CLI、合同、transport 和装配的离线行为；不能替代 MuJoCo、SSH 主机或
 真机运行证据。
+
+
+### MuJoCo 安全目标与初始几何复核
+
+安全 TCP 的公开单目标路线先检查目标容差区域是否可能与原稳定包络相交；不将投影值
+替换用户目标。候选、路径、实测输出和 HOLD 门禁仍分别执行。关节限位附近的普通迭代
+全部未命中时，只用原 2 秒端点预算的剩余时间查询有界 IK；碰撞或路径质量拒绝不会
+触发该查询。已有抓取链仍沿原分段绑定及 prepared resolver 执行。
+
+[qualify_mujoco_scene.py](../../scripts/probes/qualify_mujoco_scene.py) 提供独立的零运动
+初始几何资格检查。用 `python -m scripts.probes.qualify_mujoco_scene --help` 查看参数；
+输出写入新文件，不覆盖已有报告。资格成立只说明该初始几何通过检查，不代表规划、
+执行或抓取成功，也不启动 RGB-D、模型服务或真机。失败启动后的关闭会继续交给原
+runtime 清理，并保留其未完成释放供同一 owner 重试。

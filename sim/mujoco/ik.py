@@ -286,6 +286,8 @@ class RM65RetargeterIK:
         *,
         world_from_arm_base_by_side: Mapping[str, Any],
         admitted_qpos_source: Callable[[], Mapping[str, Any]],
+        _checkpoint=None,
+        _checkpoint_max_native_bytes: int | None = None,
     ) -> None:
         if not isinstance(retargeter, DualArmCollisionAwareRetargeter):
             raise TypeError("retargeter must be DualArmCollisionAwareRetargeter.")
@@ -309,7 +311,22 @@ class RM65RetargeterIK:
         # publishes collision ownership.  It is an adapter identity, not a
         # second planner or dispatch owner.
         self.planner = self
-        self.reset_from_scene()
+        if _checkpoint is None:
+            self.reset_from_scene()
+        else:
+            from robot_motion.rm65.retargeter_checkpoint import (
+                RetargeterCheckpoint,
+                capture_retargeter,
+            )
+
+            if (
+                type(_checkpoint) is not RetargeterCheckpoint
+                or capture_retargeter(
+                    retargeter, max_native_bytes=_checkpoint_max_native_bytes
+                ).content_hash
+                != _checkpoint.content_hash
+            ):
+                raise ValueError("IK adapter requires the exact restored retargeter.")
 
     @property
     def collision_pair_count(self) -> int:

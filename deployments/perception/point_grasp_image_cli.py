@@ -2,6 +2,11 @@
 
 from __future__ import annotations
 
+from deployments.dmtac_graspgenx_alignment_ids import (
+    DMTAC_M_GRASPGENX_ALIGNMENT_PROFILE_ID,
+    DMTAC_M_GRASPGENX_ALIGNMENT_PROFILE_IDS,
+)
+
 import argparse
 import io
 import json
@@ -40,6 +45,9 @@ def build_parser() -> argparse.ArgumentParser:
         prog="python -m deployments.perception.point_grasp_image_cli",
         description="Plan ranked DMTAC M tool_tcp poses from one aligned local RGB-D frame and clicked pixel.",
     )
+    parser.add_argument("--graspgenx-alignment-profile",
+        choices=DMTAC_M_GRASPGENX_ALIGNMENT_PROFILE_IDS, default=DMTAC_M_GRASPGENX_ALIGNMENT_PROFILE_ID,
+        help="Default v5 nominal alignment; select v4 explicitly for legacy geometry.")
     parser.add_argument("--sam2-asset-bundle", type=Path, required=True)
     parser.add_argument("--point-grasp-asset-bundle", type=Path, required=True)
     parser.add_argument(
@@ -209,7 +217,7 @@ def _build_point_grasp_planner(
             model_spec=grasp_spec,
             point_segmenter=localizer,
             client=backend,
-            solid_geometry=reviewed_graspgenx_dmtac_solid_geometry(),
+            alignment_profile_id=getattr(args, "graspgenx_alignment_profile", DMTAC_M_GRASPGENX_ALIGNMENT_PROFILE_ID),
         )
     if args.point_grasp_backend == "graspnet":
         grasp_spec = GraspNetPointGraspModelSpec.from_asset_bundle(grasp_bundle)
@@ -345,7 +353,11 @@ def run(args: argparse.Namespace) -> dict:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     try:
-        payload = run(parser.parse_args(argv))
+        args = parser.parse_args(argv)
+        if args.graspgenx_alignment_profile != DMTAC_M_GRASPGENX_ALIGNMENT_PROFILE_ID:
+            if args.point_grasp_backend != "graspgenx":
+                parser.error("--graspgenx-alignment-profile requires the GraspGenX backend")
+        payload = run(args)
     except (OSError, RuntimeError, TypeError, ValueError, json.JSONDecodeError) as exc:
         parser.exit(2, f"point-grasp inference failed: {exc}\n")
     print(

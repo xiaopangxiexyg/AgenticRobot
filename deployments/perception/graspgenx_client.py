@@ -9,12 +9,16 @@ environment.  Neither backend owns robot or motion resources.
 from __future__ import annotations
 
 import importlib
+import json
+import logging
 import math
 import os
 import sys
 import threading
+from collections import Counter
 from collections.abc import Mapping
 from pathlib import Path
+from time import perf_counter
 from typing import Any, Protocol, runtime_checkable
 
 import msgpack
@@ -48,6 +52,121 @@ GRASPGENX_POINT_GRASP_MOE_SIDE_HEIGHT_OFFSETS_CM = (0.0, 1.0, 2.0)
 GRASPGENX_POINT_GRASP_MOE_OBB_DENSITY = "dense-topandside"
 GRASPGENX_POINT_GRASP_MOE_OBB_POSITION_SPACING_CM = 3.0
 _GRASPGENX_IMPORT_LOCK = threading.RLock()
+_LOGGER = logging.getLogger(__name__)
+_INFERENCE_PHASES = (
+    "validation",
+    "lock_wait",
+    "sampler_preparation",
+    "planner_call",
+    "output_conversion",
+    "top_k_postprocess",
+    "diagnostic_summary",
+)
+
+
+class _InferenceDiagnostics:
+    """One bounded log record, without retaining results or changing the API.
+
+    These are host wall-clock intervals, not CUDA kernel timings. Existing
+    tensor-to-host conversion may wait for queued GPU work; no synchronization
+    or extra tensor conversion is introduced for observation. The total includes
+    bounded source summarization, but excludes JSON formatting and log-handler
+    I/O. Unentered phases remain null when the original operation fails.
+    """
+
+    def __init__(self, backend_id: str) -> None:
+        self.details: dict[str, object] = {
+            "event": "graspgenx_inference_diagnostic",
+            "backend": backend_id,
+            "timing_basis": "host_wall_without_added_cuda_synchronization",
+            "branch_tags": {
+                "status": "unavailable", "reason": "output_not_converted"
+            },
+        }
+        self._timings: dict[str, float | None] = {
+            name: None for name in _INFERENCE_PHASES
+        }
+
+    def __enter__(self):
+        self._started = self._phase_started = perf_counter()
+        self._phase = "validation"
+        return self
+
+    def phase(self, name: str) -> None:
+        now = perf_counter()
+        self._timings[self._phase] = now - self._phase_started
+        self._phase, self._phase_started = name, now
+
+    def __exit__(self, exc_type, _exc, _traceback) -> bool:
+        now = perf_counter()
+        self._timings[self._phase] = now - self._phase_started
+        self.details.update(
+            status="ok" if exc_type is None else "failed",
+            failed_phase=None if exc_type is None else self._phase,
+            exception_type=None if exc_type is None else exc_type.__name__,
+            started_monotonic_sec=self._started,
+            phase_wall_sec=self._timings,
+            total_wall_sec=now - self._started,
+        )
+        try:
+            _LOGGER.log(
+                logging.INFO if exc_type is None else logging.WARNING,
+                "GraspGenX inference diagnostics: %s",
+                json.dumps(self.details, separators=(",", ":"), allow_nan=False),
+            )
+        except Exception as error:  # noqa: BLE001 - only optional diagnostic output.
+            # A logging handler or serializer must never replace the inference
+            # result, its original fault, or a pending operator interruption.
+            # Do not recurse through the failed logger or expose model data.
+            self.details["output_error_type"] = type(error).__name__[:128]
+            stream = getattr(sys, "stderr", None)
+            if stream is None:
+                self.details["fallback_output_failed"] = True
+            else:
+                try:
+                    stream.write("GraspGenX inference diagnostics unavailable ("
+                        + self.details["output_error_type"] + ").\n")
+                except Exception:  # noqa: BLE001 - both optional sinks unavailable.
+                    self.details["fallback_output_failed"] = True
+        return False
+
+
+def _branch_tag_summary(
+    tags: object, keep: np.ndarray, order: np.ndarray,
+) -> dict[str, object]:
+    """Count actual host-side labels only; never transfer a diagnostic tensor."""
+
+    def unavailable(reason: str) -> dict[str, object]:
+        return {"status": "unavailable", "reason": reason}
+
+    if tags is None:
+        return unavailable("not_returned")
+    if not isinstance(tags, (list, tuple, np.ndarray)):
+        return unavailable("unsupported_host_labels")
+    if isinstance(tags, np.ndarray) and tags.ndim != 1:
+        return unavailable("non_vector_labels")
+    if len(tags) != len(keep):
+        return unavailable("candidate_count_mismatch")
+    # Bound observation work and log size independently of the candidate union.
+    if len(tags) > 32_768:
+        return unavailable("label_count_limit")
+    labels: list[str] = []
+    unique: set[str] = set()
+    for tag in tags:
+        if not isinstance(tag, str) or not tag or len(tag) > 64:
+            return unavailable("unsupported_host_labels")
+        label = str(tag)
+        unique.add(label)
+        if len(unique) > 32:
+            return unavailable("distinct_label_limit")
+        labels.append(label)
+    filtered = [label for label, retained in zip(labels, keep) if retained]
+    return {
+        "status": "available",
+        "raw_counts": dict(Counter(labels)),
+        "after_threshold_counts": dict(Counter(filtered)),
+        "returned_counts": dict(Counter(filtered[index] for index in order)),
+    }
 
 
 def _point_grasp_moe_sampling_config() -> dict[str, object]:
@@ -653,73 +772,97 @@ class GraspGenXInProcessBackend:
         score_threshold: float = -1.0,
         top_k: int = 100,
     ) -> tuple[np.ndarray, np.ndarray]:
-        points = np.ascontiguousarray(point_cloud, dtype=np.float32)
-        if (
-            points.ndim != 2
-            or points.shape[1:] != (3,)
-            or len(points) < 16
-            or not np.all(np.isfinite(points))
-        ):
-            raise ValueError(
-                "point_cloud must contain at least 16 finite XYZ meter points."
-            )
-        if planner not in {"graspmoe", "diffusion"}:
-            raise ValueError("planner must be 'graspmoe' or 'diffusion'.")
-        if isinstance(num_grasps, bool) or not 1 <= int(num_grasps) <= 1_000:
-            raise ValueError("num_grasps must be in [1, 1000].")
-        if isinstance(top_k, bool) or not (int(top_k) == -1 or 1 <= int(top_k) <= 1_000):
-            raise ValueError("top_k must be -1 or in [1, 1000].")
-        threshold = float(score_threshold)
-        if not math.isfinite(threshold) or not -1.0 <= threshold <= 1.0:
-            raise ValueError("score_threshold must be finite and in [-1, 1].")
-        params_dict = GraspGenXClient._validated_sweep_volume(sweep_volume_params)
-        with self._lock:
-            if not self._started or self._closed:
-                raise RuntimeError("GraspGenX in-process backend is not running.")
-            params = self._sweep_volume_params_cls.coerce(params_dict)
-            sampler = self._get_sampler(params)
-            backend_top_k = -1 if planner == "graspmoe" else int(num_grasps)
-            with self._torch.cuda.device(self._device_obj):
-                raw_grasps, raw_scores, _branch_tags, _obb = (
-                    self._run_planner_on_object(
-                        points,
-                        sampler,
-                        planner=planner,
-                        grasp_threshold=-1.0,
-                        num_grasps=int(num_grasps),
-                        topk_num_grasps=backend_top_k,
-                        moe_num_yaws=GRASPGENX_POINT_GRASP_MOE_NUM_YAWS,
-                        moe_z_offsets_cm=GRASPGENX_POINT_GRASP_MOE_Z_OFFSETS_CM,
-                        moe_side_height_offsets_cm=(
-                            GRASPGENX_POINT_GRASP_MOE_SIDE_HEIGHT_OFFSETS_CM
-                        ),
-                        moe_obb_density=GRASPGENX_POINT_GRASP_MOE_OBB_DENSITY,
-                        moe_obb_position_spacing_cm=(
-                            GRASPGENX_POINT_GRASP_MOE_OBB_POSITION_SPACING_CM
-                        ),
-                    )
+        with _InferenceDiagnostics(self.backend_id) as diagnostic:
+            points = np.ascontiguousarray(point_cloud, dtype=np.float32)
+            if (
+                points.ndim != 2
+                or points.shape[1:] != (3,)
+                or len(points) < 16
+                or not np.all(np.isfinite(points))
+            ):
+                raise ValueError(
+                    "point_cloud must contain at least 16 finite XYZ meter points."
                 )
-        grasps = _finite_rigid_matrices(self._to_numpy(raw_grasps))
-        try:
-            scores = self._to_numpy(raw_scores).astype(np.float64).reshape(-1)
-        except (TypeError, ValueError) as exc:
-            raise RuntimeError(
-                "GraspGenX returned malformed confidence scores."
-            ) from exc
-        if len(scores) != len(grasps) or not np.all(np.isfinite(scores)):
-            raise RuntimeError("GraspGenX grasp and confidence counts differ.")
-        keep = np.ones(len(scores), dtype=bool)
-        if threshold > 0.0:
-            keep &= scores >= threshold
-        grasps = grasps[keep]
-        scores = scores[keep]
-        order = np.argsort(-scores, kind="stable")
-        if int(top_k) != -1:
-            order = order[: int(top_k)]
-        return (
-            np.ascontiguousarray(grasps[order], dtype=np.float64),
-            np.ascontiguousarray(scores[order], dtype=np.float64),
-        )
+            if planner not in {"graspmoe", "diffusion"}:
+                raise ValueError("planner must be 'graspmoe' or 'diffusion'.")
+            if isinstance(num_grasps, bool) or not 1 <= int(num_grasps) <= 1_000:
+                raise ValueError("num_grasps must be in [1, 1000].")
+            if isinstance(top_k, bool) or not (
+                int(top_k) == -1 or 1 <= int(top_k) <= 1_000
+            ):
+                raise ValueError("top_k must be -1 or in [1, 1000].")
+            threshold = float(score_threshold)
+            if not math.isfinite(threshold) or not -1.0 <= threshold <= 1.0:
+                raise ValueError("score_threshold must be finite and in [-1, 1].")
+            params_dict = GraspGenXClient._validated_sweep_volume(sweep_volume_params)
+            diagnostic.details.update(
+                planner=planner, input_point_count=len(points),
+                requested_num_grasps=int(num_grasps), top_k=int(top_k),
+            )
+            diagnostic.phase("lock_wait")
+            with self._lock:
+                diagnostic.phase("sampler_preparation")
+                if not self._started or self._closed:
+                    raise RuntimeError("GraspGenX in-process backend is not running.")
+                params = self._sweep_volume_params_cls.coerce(params_dict)
+                sampler_count = len(self._samplers)
+                sampler = self._get_sampler(params)
+                diagnostic.details["sampler_created"] = (
+                    len(self._samplers) > sampler_count
+                )
+                backend_top_k = -1 if planner == "graspmoe" else int(num_grasps)
+                diagnostic.phase("planner_call")
+                with self._torch.cuda.device(self._device_obj):
+                    raw_grasps, raw_scores, _branch_tags, _obb = (
+                        self._run_planner_on_object(
+                            points,
+                            sampler,
+                            planner=planner,
+                            grasp_threshold=-1.0,
+                            num_grasps=int(num_grasps),
+                            topk_num_grasps=backend_top_k,
+                            moe_num_yaws=GRASPGENX_POINT_GRASP_MOE_NUM_YAWS,
+                            moe_z_offsets_cm=GRASPGENX_POINT_GRASP_MOE_Z_OFFSETS_CM,
+                            moe_side_height_offsets_cm=(
+                                GRASPGENX_POINT_GRASP_MOE_SIDE_HEIGHT_OFFSETS_CM
+                            ),
+                            moe_obb_density=GRASPGENX_POINT_GRASP_MOE_OBB_DENSITY,
+                            moe_obb_position_spacing_cm=(
+                                GRASPGENX_POINT_GRASP_MOE_OBB_POSITION_SPACING_CM
+                            ),
+                        )
+                    )
+            diagnostic.phase("output_conversion")
+            grasps = _finite_rigid_matrices(self._to_numpy(raw_grasps))
+            diagnostic.details["raw_candidate_count"] = len(grasps)
+            try:
+                scores = self._to_numpy(raw_scores).astype(np.float64).reshape(-1)
+            except (TypeError, ValueError) as exc:
+                raise RuntimeError(
+                    "GraspGenX returned malformed confidence scores."
+                ) from exc
+            diagnostic.details["converted_score_count"] = len(scores)
+            if len(scores) != len(grasps) or not np.all(np.isfinite(scores)):
+                raise RuntimeError("GraspGenX grasp and confidence counts differ.")
+            diagnostic.phase("top_k_postprocess")
+            keep = np.ones(len(scores), dtype=bool)
+            if threshold > 0.0:
+                keep &= scores >= threshold
+            grasps = grasps[keep]
+            scores = scores[keep]
+            order = np.argsort(-scores, kind="stable")
+            if int(top_k) != -1:
+                order = order[: int(top_k)]
+            result = (
+                np.ascontiguousarray(grasps[order], dtype=np.float64),
+                np.ascontiguousarray(scores[order], dtype=np.float64),
+            )
+            diagnostic.phase("diagnostic_summary")
+            diagnostic.details.update(
+                after_threshold_count=len(scores), returned_candidate_count=len(order),
+                branch_tags=_branch_tag_summary(_branch_tags, keep, order),
+            )
+            return result
 
 
 __all__ = [

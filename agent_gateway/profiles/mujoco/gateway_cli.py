@@ -8,6 +8,11 @@ deployments; only this lower-owned launcher and its published manifest change.
 
 from __future__ import annotations
 
+from deployments.dmtac_graspgenx_alignment_ids import (
+    DMTAC_M_GRASPGENX_ALIGNMENT_PROFILE_ID,
+    DMTAC_M_GRASPGENX_ALIGNMENT_PROFILE_IDS,
+)
+
 import argparse
 import json
 import os
@@ -29,6 +34,7 @@ from agent_gateway.transport.unix_transport import (
 from project_paths import repo_root
 from sim.mujoco.deploy import MujocoSimHILTargetConfig
 
+from .motion_deployment import MUJOCO_SAFE_TCP_MOTION_PROFILES
 from .motion_factory import (
     MujocoAgentArtifactStorageConfig,
     MujocoAgentTcpPoseHistoryStorageConfig,
@@ -44,10 +50,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m agent_gateway mujoco",
         description=(
-            "Serve the generic right-arm TCP-pose Agent Gateway on MuJoCo. "
+            "Serve a fixed-single-arm TCP-pose Agent Gateway on MuJoCo (default: right). "
             "This starts no Agent planner and connects no real device."
         ),
     )
+    parser.add_argument("--graspgenx-alignment-profile",
+        choices=DMTAC_M_GRASPGENX_ALIGNMENT_PROFILE_IDS, default=DMTAC_M_GRASPGENX_ALIGNMENT_PROFILE_ID,
+        help="Default v5 nominal alignment; select v4 explicitly for legacy geometry.")
     parser.add_argument(
         "--socket-path",
         type=Path,
@@ -63,6 +72,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         required=True,
         help="absolute MuJoCo task-config JSON path",
+    )
+    parser.add_argument(
+        "--motion-side",
+        choices=("left", "right"),
+        default="right",
+        help="fixed movable arm for this session; not per-request switching or simultaneous arms",
     )
     parser.add_argument(
         "--client-id",
@@ -122,6 +137,33 @@ def build_parser() -> argparse.ArgumentParser:
         default="cuda",
         help="Torch device used by the optional SAM2/Grounding DINO segmenter",
     )
+    parser.add_argument("--enable-safe-tcp-path-constraints", action="store_true",
+                        help="Additionally publish safe TCP v2 with explicit sampled tool-axis path constraints.")
+    parser.add_argument("--enable-tcp-continuation-queries", action="store_true",
+                        help="Expose read-only two-stage path lookahead; requires safe TCP path constraints.")
+    parser.add_argument("--enable-tcp-candidate-artifacts", action="store_true",
+                        help="Publish relation v3 candidate Artifacts and index-based continuation v2; requires the complete v2 anchor/relation and continuation family.")
+    parser.add_argument("--enable-relation-tcp-continuation-queries", action="store_true",
+                        help="Publish continuation v3: generate relation endpoints and check both paths once from a v2 anchor.")
+    parser.add_argument("--enable-region-tcp-continuation-queries", action="store_true",
+                        help="Additionally publish a bounded-region continuation query; requires relation continuation v3.")
+    parser.add_argument("--region-tcp-continuation-version", choices=("4", "5"), default="4",
+                        help="Explicit region sampler: 4 preserves centre/Halton; 5 adds continuation-direction extrema.")
+    parser.add_argument(
+        "--sam3-endpoint",
+        help=(
+            "explicit loopback SAM3 service for segmentation and optional fast-grasp "
+            "point masks; reuses the external model owner and requires --artifact-root"
+        ),
+    )
+    parser.add_argument("--enable-rgbd-capture-v3", action="store_true",
+                        help="Publish capture_rgb v3 with optional native-grid paired RGB-D Artifacts; default off.")
+    parser.add_argument("--enable-object-localization", action="store_true",
+                        help="Publish supplied-image localize_objects v1 using the existing segmentation model; default off.")
+    parser.add_argument("--enable-segmentation-batch-v2", action="store_true",
+                        help="Publish same-cut ordered multi-target segmentation v2; default off.")
+    parser.add_argument("--enable-segmentation-geometry-v3", action="store_true",
+                        help="Publish authenticated retained-RGB mask geometry v3; default off.")
     parser.add_argument(
         "--history-root",
         type=Path,
@@ -161,19 +203,68 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="run MuJoCo stepping without realtime pacing (simulation only)",
     )
-    parser.add_argument("--enable-spatial-goals", action="store_true",
-                        help="Expose read-only endpoint relation calculation; does not authorize motion.")
+    parser.add_argument('--enable-object-goal-queries', action='store_true', help='Expose bounded read-only object-above path queries; requires --enable-safe-tcp-pose.')
+    parser.add_argument('--enable-surface-anchors', action='store_true', help='Expose measured-pixel anchor Artifacts and reuse queries; requires Artifact perception and object goal queries.')
+    parser.add_argument('--enable-surface-anchor-v2', action='store_true', help='Also publish explicit exact/mask-interior v2 anchors and matching consumers; requires surface anchors and segmentation.')
+    parser.add_argument('--enable-surface-anchor-v3', action='store_true', help='Publish source-bound anchors consuming retained capture_rgb v3 and optional segment v3; requires the explicit v2 family.')
+    parser.add_argument('--surface-anchor-selection-policy', choices=('prompt_nearest', 'max_clearance_medoid'), default='prompt_nearest', help='Explicit v2 max-clearance tie profile; default preserves prompt-nearest selection.')
+    parser.add_argument('--enable-relation-goal-queries', action='store_true', help='Expose one general anchored relation-path query; requires --enable-surface-anchors.')
+    parser.add_argument('--safe-tcp-motion-profile', choices=tuple(MUJOCO_SAFE_TCP_MOTION_PROFILES), default='local_step', help='Explicit sim-only safe Route limits; ordinary Routes stay unchanged.')
+    parser.add_argument(
+        "--enable-spatial-goals",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Publish read-only endpoint relations by default on the supported right profile; explicit opt-out preserves the smaller catalog. No motion authority.",
+    )
+    parser.add_argument(
+        "--enable-tcp-pose-comparison",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Publish read_tcp_pose v2 comparison by default; explicit opt-out preserves v1 only. No motion authority.",
+    )
     parser.add_argument(
         "--enable-safe-tcp-pose",
         action="store_true",
         help="also publish collision-aware move_tcp_to_pose_safe using lower-owned joint paths",
     )
-    parser.add_argument("--enable-grippers", action="store_true",
-        help="publish bilateral atomic gripper Skills on the same deterministic MuJoCo owner")
-    parser.add_argument("--enable-grasp-approach", action="store_true",
-        help="publish right-arm approach_grasp_pose with an absolute envelope and noncontact joint planning; requires grippers and no realtime worker")
-    parser.add_argument("--grasp-contact-target-body",
-        help="also publish bounded terminal contact for this task object and its profile-bound right sensors")
+    parser.add_argument(
+        "--enable-grippers",
+        action="store_true",
+        help="publish bilateral atomic gripper Skills on the same deterministic MuJoCo owner",
+    )
+    parser.add_argument(
+        "--enable-grasp-approach",
+        action="store_true",
+        help="publish right-arm approach_grasp_pose with an absolute envelope and noncontact joint planning; requires grippers and no realtime worker",
+    )
+    parser.add_argument(
+        "--grasp-contact-target-body",
+        help="also publish bounded terminal contact for this task object and its profile-bound right sensors",
+    )
+    parser.add_argument(
+        "--enable-object-state", action="store_true",
+        help="publish passive native object pose/velocity/contact for the explicit target; no task-success inference",
+    )
+    parser.add_argument(
+        "--enable-object-follow-observation", action="store_true",
+        help="also observe frozen follow/release on existing physics ticks; requires object-state feedback; no motion authorization",
+    )
+    parser.add_argument(
+        "--enable-object-motion", action="store_true",
+        help="publish carried-object lift/carry/place on the existing planner; requires grippers, grasp approach, contact target and explicit follow observation",
+    )
+    parser.add_argument("--enable-fast-grasp", action="store_true",
+        help="publish frozen observation, first-acceptable GraspGenX planning and paired one-use native execution")
+    parser.add_argument("--sam2-grounding-dino-bundle", type=Path)
+    parser.add_argument("--graspgenx-point-grasp-bundle", type=Path)
+    parser.add_argument("--graspgenx-source-root", type=Path)
+    parser.add_argument("--point-grasp-device", default="cuda")
+    parser.add_argument("--graspgenx-planner", choices=("graspmoe", "diffusion"), default="graspmoe")
+    parser.add_argument("--graspgenx-mode", choices=("in-process", "service"), default="in-process",
+        help="in-process preserves the default; service connects to an externally owned GraspGenX model")
+    parser.add_argument("--graspgenx-host", default="127.0.0.1")
+    parser.add_argument("--graspgenx-port", type=int, default=5556)
+    parser.add_argument("--graspgenx-timeout-ms", type=int, default=120_000)
     parser.add_argument(
         "--safe-tcp-planning-clearance-padding-m",
         type=float,
@@ -392,9 +483,145 @@ def _prepare_gateway_before_ready(*, session: Any, viewer: Any | None) -> None:
         session.history_recorder.start()
 
 
+def _fast_grasp_model_from_args(parser, args):
+    sam3_endpoint = getattr(args, "sam3_endpoint", None)
+    mode = getattr(args, "graspgenx_mode", "in-process")
+    service_options = (getattr(args, "graspgenx_host", "127.0.0.1"),
+                       getattr(args, "graspgenx_port", 5556),
+                       getattr(args, "graspgenx_timeout_ms", 120_000))
+    if mode != "service" and service_options != ("127.0.0.1", 5556, 120_000):
+        parser.error("GraspGenX service connection flags require --graspgenx-mode service")
+    paths = (args.graspgenx_point_grasp_bundle,)
+    if mode == "in-process":
+        paths += (args.graspgenx_source_root,)
+    if sam3_endpoint is None:
+        paths += (args.sam2_grounding_dino_bundle,)
+    elif args.sam2_grounding_dino_bundle is not None:
+        parser.error("--sam3-endpoint and --sam2-grounding-dino-bundle select different point-mask backends")
+    if not args.enable_fast_grasp:
+        if (any(path is not None for path in (*paths, args.graspgenx_source_root))
+                or getattr(args, "graspgenx_planner", "graspmoe") != "graspmoe"
+                or mode != "in-process"):
+            parser.error("model/source bundle flags require --enable-fast-grasp")
+        return None
+    if (not all(path is not None for path in paths) or args.artifact_root is None
+            or not args.enable_grasp_approach or not args.enable_grippers
+            or args.grasp_contact_target_body is None or not args.no_realtime_worker):
+        parser.error("fast grasp requires explicit model/source paths and point-mask backend, Artifact storage, grippers, target-bound grasp approach and no realtime worker")
+    if any(not p.is_absolute() or not p.is_dir() for p in paths):
+        parser.error("fast grasp model/source paths must be absolute existing directories")
+    from deployments.perception.graspgenx_client import GraspGenXClient, GraspGenXInProcessBackend
+    from deployments.perception.sam2_graspgenx_point_grasp import (
+        GraspGenXPointGraspModelSpec, Sam2GraspGenXPointGraspPlanner,
+        GRASPGENX_DMTAC_REACHABILITY_ORIENTATION_VARIANTS_LOCAL_AXIS_DEG,
+    )
+    spec = GraspGenXPointGraspModelSpec.from_asset_bundle(args.graspgenx_point_grasp_bundle)
+    if sam3_endpoint is not None:
+        from deployments.perception.sam3_service import Sam3ServiceLocalizer
+        localizer = Sam3ServiceLocalizer(endpoint=sam3_endpoint)
+    else:
+        from deployments.perception.sam2_grounding_dino import (
+            Sam2GroundingDinoLocalizer, Sam2GroundingDinoModelSpec,
+        )
+        localizer = Sam2GroundingDinoLocalizer(
+            model_spec=Sam2GroundingDinoModelSpec.from_asset_bundle(args.sam2_grounding_dino_bundle),
+            device=args.point_grasp_device)
+    client = (GraspGenXClient(host=service_options[0], port=service_options[1], timeout_ms=service_options[2])
+        if mode == "service" else GraspGenXInProcessBackend(model_spec=spec,
+            source_root=args.graspgenx_source_root, device=args.point_grasp_device))
+    return Sam2GraspGenXPointGraspPlanner(model_spec=spec, point_segmenter=localizer,
+        planner=getattr(args, "graspgenx_planner", "graspmoe"),
+        client=client, alignment_profile_id=getattr(args, "graspgenx_alignment_profile", DMTAC_M_GRASPGENX_ALIGNMENT_PROFILE_ID),
+        orientation_variants_local_axis_degrees=(
+            GRASPGENX_DMTAC_REACHABILITY_ORIENTATION_VARIANTS_LOCAL_AXIS_DEG),
+        enable_finger_exchange=True)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.enable_spatial_goals is None:
+        # The left profile deliberately rejects spatial-goal publication.
+        # Preserve that boundary and its ordinary startup; explicit True
+        # still reaches the existing unsupported-combination rejection.
+        args.enable_spatial_goals = args.motion_side == "right"
+    if args.graspgenx_alignment_profile != DMTAC_M_GRASPGENX_ALIGNMENT_PROFILE_ID and not args.enable_fast_grasp:
+        parser.error("--graspgenx-alignment-profile requires --enable-fast-grasp")
+    if args.motion_side == "left" and (
+        args.enable_fast_grasp
+        or args.enable_grippers
+        or args.enable_grasp_approach
+        or args.grasp_contact_target_body is not None
+        or args.enable_rgbd_capture_v3
+        or args.enable_segmentation_batch_v2
+        or args.enable_segmentation_geometry_v3
+        or args.enable_spatial_goals
+        or args.enable_object_goal_queries
+        or args.enable_surface_anchors
+        or args.enable_surface_anchor_v2
+        or args.enable_surface_anchor_v3
+        or args.enable_object_localization
+        or args.enable_safe_tcp_path_constraints
+        or args.enable_tcp_continuation_queries
+        or args.enable_tcp_candidate_artifacts
+        or args.enable_relation_tcp_continuation_queries
+        or args.enable_region_tcp_continuation_queries
+        or args.enable_relation_goal_queries
+        or args.history_root is not None
+        or args.segmentation_asset_bundle is not None
+        or args.sam3_endpoint is not None
+    ):
+        parser.error(
+            "--motion-side left currently supports baseline TCP/state Routes only; "
+            "gripper, grasp, spatial goal, history and segmentation combinations are not enabled"
+        )
+    if args.enable_object_localization and not (
+            args.segmentation_asset_bundle is not None and args.artifact_root is not None):
+        parser.error("--enable-object-localization requires --segmentation-asset-bundle and --artifact-root")
+    if args.enable_object_localization and args.enable_surface_anchor_v3 and args.max_retained_operations < 4:
+        parser.error("localized paired anchors require --max-retained-operations >= 4")
+    for name in ("enable_segmentation_batch_v2", "enable_segmentation_geometry_v3"):
+        if getattr(args, name) and (
+            args.artifact_root is None
+            or (args.segmentation_asset_bundle is None and args.sam3_endpoint is None)
+        ):
+            parser.error("--" + name.replace("_", "-") + " requires --artifact-root and an explicit "
+                         "--segmentation-asset-bundle or --sam3-endpoint")
+    if args.enable_segmentation_geometry_v3 and args.max_retained_operations < 2:
+        parser.error("--enable-segmentation-geometry-v3 requires retained producer and consumer operations")
+    if args.enable_object_goal_queries and not args.enable_safe_tcp_pose:
+        parser.error("--enable-object-goal-queries requires --enable-safe-tcp-pose")
+    if args.enable_surface_anchors and (args.artifact_root is None or not args.enable_object_goal_queries):
+        parser.error("--enable-surface-anchors requires --artifact-root and --enable-object-goal-queries")
+    if args.enable_surface_anchors and args.max_retained_operations < 2:
+        parser.error("surface anchors require retained producer and consumer operations")
+    if args.enable_surface_anchor_v2 and (not args.enable_surface_anchors or args.segmentation_asset_bundle is None):
+        parser.error("--enable-surface-anchor-v2 requires surface anchors and segmentation")
+    if args.surface_anchor_selection_policy != "prompt_nearest" and not args.enable_surface_anchor_v2:
+        parser.error("a non-default surface selection policy requires --enable-surface-anchor-v2")
+    if args.enable_surface_anchor_v3 and not (args.enable_surface_anchor_v2
+            and args.enable_rgbd_capture_v3 and args.enable_segmentation_geometry_v3):
+        parser.error("--enable-surface-anchor-v3 requires v2 anchors, RGB-D v3 and segmentation v3")
+    if args.enable_surface_anchor_v3 and args.max_retained_operations < 3:
+        parser.error("surface anchor v3 requires capture, segmentation and anchor retention")
+    if args.enable_relation_goal_queries and not args.enable_surface_anchors:
+        parser.error("--enable-relation-goal-queries requires --enable-surface-anchors")
+    if args.safe_tcp_motion_profile != "local_step" and not args.enable_safe_tcp_pose:
+        parser.error("--safe-tcp-motion-profile requires --enable-safe-tcp-pose")
+    if args.enable_safe_tcp_path_constraints and not args.enable_safe_tcp_pose:
+        parser.error("--enable-safe-tcp-path-constraints requires --enable-safe-tcp-pose")
+    if args.enable_tcp_continuation_queries and not args.enable_safe_tcp_path_constraints:
+        parser.error("--enable-tcp-continuation-queries requires --enable-safe-tcp-path-constraints")
+    if args.enable_tcp_candidate_artifacts and not (args.enable_tcp_continuation_queries
+            and args.enable_surface_anchor_v2 and args.enable_relation_goal_queries):
+        parser.error("--enable-tcp-candidate-artifacts requires continuation queries and the v2 anchor/relation family")
+    if args.enable_relation_tcp_continuation_queries and not (args.enable_tcp_continuation_queries
+            and args.enable_surface_anchor_v2 and args.enable_relation_goal_queries):
+        parser.error("--enable-relation-tcp-continuation-queries requires continuation queries and the v2 anchor/relation family")
+    if args.enable_region_tcp_continuation_queries and not args.enable_relation_tcp_continuation_queries:
+        parser.error("--enable-region-tcp-continuation-queries requires --enable-relation-tcp-continuation-queries")
+    if args.region_tcp_continuation_version != "4" and not args.enable_region_tcp_continuation_queries:
+        parser.error("--region-tcp-continuation-version 5 requires --enable-region-tcp-continuation-queries")
     task_config = _absolute_existing_file(parser, args.task_config)
     socket_path = _absolute_path(parser, args.socket_path, flag="--socket-path")
     if args.client_uid < 0:
@@ -442,7 +669,19 @@ def main(argv: list[str] | None = None) -> int:
         )
         artifact_storage = MujocoAgentArtifactStorageConfig(root=artifact_root)
     segmentation_localizer = None
-    if args.segmentation_asset_bundle is not None:
+    if args.enable_rgbd_capture_v3 and artifact_storage is None:
+        parser.error("--enable-rgbd-capture-v3 requires --artifact-root")
+    if args.sam3_endpoint is not None:
+        if args.segmentation_asset_bundle is not None:
+            parser.error("--sam3-endpoint and --segmentation-asset-bundle are mutually exclusive")
+        if artifact_storage is None:
+            parser.error("--sam3-endpoint requires --artifact-root")
+        from deployments.perception.sam3_service import Sam3ServiceLocalizer
+        try:
+            segmentation_localizer = Sam3ServiceLocalizer(endpoint=args.sam3_endpoint)
+        except (TypeError, ValueError) as error:
+            parser.error(f"invalid SAM3 service binding: {error}")
+    elif args.segmentation_asset_bundle is not None:
         from deployments.perception.sam2_grounding_dino import (
             Sam2GroundingDinoLocalizer,
             Sam2GroundingDinoModelSpec,
@@ -481,12 +720,16 @@ def main(argv: list[str] | None = None) -> int:
         runtime_session_id=runtime_session_id,
         control_domain_id=args.control_domain_id,
         execution_observation_plan=(
-            mujoco_agent_tcp_pose_execution_observation_plan_v1()
+            mujoco_agent_tcp_pose_execution_observation_plan_v1(
+                motion_side=args.motion_side
+            )
         ),
-        exposed_pose_sides=("right",),
+        exposed_pose_sides=(args.motion_side,),
         allow_scripted_task_reset=False,
     )
+    fast_grasp_planner = _fast_grasp_model_from_args(parser, args)
     session = build_mujoco_agent_tcp_pose_gateway_session(
+        motion_side=args.motion_side,
         enable_grippers=args.enable_grippers,
         target_config=target_config,
         allowed_client_ids=client_bindings.allowed_client_ids,
@@ -494,11 +737,33 @@ def main(argv: list[str] | None = None) -> int:
         max_session_admissions_per_route=(args.max_session_admissions_per_route),
         history_storage=history_storage,
         artifact_storage=artifact_storage,
+        enable_rgbd_capture_v3=args.enable_rgbd_capture_v3,
+        enable_segmentation_batch_v2=args.enable_segmentation_batch_v2,
+        enable_segmentation_geometry_v3=args.enable_segmentation_geometry_v3,
         segmentation_localizer=segmentation_localizer,
+        enable_object_localization=args.enable_object_localization,
         enable_safe_tcp_pose=args.enable_safe_tcp_pose,
+        enable_safe_tcp_path_constraints=args.enable_safe_tcp_path_constraints,
+        enable_tcp_continuation_queries=args.enable_tcp_continuation_queries,
+        enable_tcp_candidate_artifacts=args.enable_tcp_candidate_artifacts,
+        enable_relation_tcp_continuation_queries=args.enable_relation_tcp_continuation_queries,
+        enable_region_tcp_continuation_queries=args.enable_region_tcp_continuation_queries,
+        region_tcp_continuation_version=args.region_tcp_continuation_version,
         enable_spatial_goals=args.enable_spatial_goals,
+        enable_object_goal_queries=args.enable_object_goal_queries,
+        enable_surface_anchors=args.enable_surface_anchors,
+        enable_surface_anchor_v2=args.enable_surface_anchor_v2,
+        enable_surface_anchor_v3=args.enable_surface_anchor_v3,
+        surface_anchor_selection_policy=args.surface_anchor_selection_policy,
+        enable_relation_goal_queries=args.enable_relation_goal_queries,
+        safe_tcp_motion_profile=args.safe_tcp_motion_profile,
+        enable_tcp_pose_comparison=args.enable_tcp_pose_comparison,
+        enable_object_state=args.enable_object_state,
+        enable_object_follow_observation=args.enable_object_follow_observation,
+        enable_object_motion=args.enable_object_motion,
         enable_grasp_approach=args.enable_grasp_approach,
         grasp_contact_target_body=args.grasp_contact_target_body,
+        fast_grasp_planner=fast_grasp_planner,
         safe_tcp_planning_clearance_padding_m=args.safe_tcp_planning_clearance_padding_m,
     )
     viewer = None

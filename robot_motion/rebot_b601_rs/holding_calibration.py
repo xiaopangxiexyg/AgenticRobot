@@ -112,15 +112,21 @@ class HoldingForceSearch:
         lower, upper = max(negative, default=-math.inf), min(positive, default=math.inf)
         # Keep every conflicting observation. The coordinated acquisition may
         # verify another observed interior hold, never fit the rejected edge.
-        if lower >= upper or any(not lower < v < upper for v in stable):
-            eligible = self._eligible_stationary_commands()
+        eligible = self._eligible_stationary_commands()
+        excluded_plateau = (
+            changed_plateau
+            and outcome == "stationary"
+            and command_nm not in eligible
+        )
+        if lower >= upper or any(not lower < v < upper for v in stable) or excluded_plateau:
             if not self._recheck_interior_on_conflict or lower >= upper or not eligible:
                 self.state, self.reason = (
                     "incomplete",
                     "holding_response_not_repeatable_or_monotone",
                 )
                 return
-            if self._interior_recheck_start is None or self._verification not in eligible:
+            if (self._interior_recheck_start is None
+                or self._verification not in eligible or excluded_plateau):
                 self._verification = self.candidate_nm = min(eligible, key=abs)
                 self._interior_recheck_start = len(self.observations)
                 self.reason = "verify_interior_hold_after_inconsistent_boundary"
@@ -159,7 +165,7 @@ class HoldingForceSearch:
             if self.state == "complete":
                 return
         elif math.isfinite(lower) and math.isfinite(upper):
-            self.candidate_nm = (lower + upper) / 2
+            self.candidate_nm = lower / 2 + upper / 2
             if upper - lower <= self.config.torque_resolution_nm:
                 self.state, self.reason = (
                     "incomplete",
@@ -188,7 +194,7 @@ class HoldingForceSearch:
         if len(self.observations) + len(self.transitions) >= self.config.max_trials:
             self.state, self.reason = "incomplete", "holding_trial_budget_exhausted"
 
-    def _propose_after_transition(self, command_nm, proposal, reason):
+    def _propose_after_transition(self, command_nm, proposal, reason, *, interval=None):
         proposal = max(-self.cap_nm, min(self.cap_nm, proposal))
         # A censored command supplies exploration history, never a signed
         # force bound. Subdivide a repeated proposal rather than cycle through
@@ -197,11 +203,16 @@ class HoldingForceSearch:
             if abs(proposal-command_nm) <= 1e-9:
                 self.state, self.reason = "incomplete", "holding_authority_insufficient"
                 return
-            proposal = (command_nm+proposal)/2
+            proposal = command_nm / 2 + proposal / 2
+        # Repeated-proposal subdivision must retain the caller's search interval.
+        if not math.isfinite(proposal) or (interval is not None and not interval[0] <= proposal <= interval[1]):
+            self.state, self.reason = "incomplete", "holding_no_finite_trial_in_search_interval"
+            return
         self.candidate_nm, self.reason = proposal, reason
         self._verification = None
         self._interior_recheck_start = len(self.observations)
         self._check_trial_budget()
+
 
     def _probe_from_stable(self, stable, lower, upper):
         best = min(stable, key=abs)
@@ -234,7 +245,7 @@ class HoldingForceSearch:
                     "verified_usable_hold_not_unique_gravity",
                 )
         else:
-            self.candidate_nm = 0.0 if endpoint is None else (best + endpoint) / 2
+            self.candidate_nm = 0.0 if endpoint is None else best / 2 + endpoint / 2
 
     def record_transition(
         self, *, command_nm: float, requested_command_nm: float, evidence: dict
@@ -293,7 +304,7 @@ class HoldingForceSearch:
                                abs(command_nm-bound))
                     proposal = command_nm-math.copysign(step, progress)
                     self._propose_after_transition(command_nm, proposal,
-                        "explore_unverified_hold_beyond_censored_endpoint")
+                        "explore_unverified_hold_beyond_censored_endpoint", interval=(lower, upper))
                     return
                 # Opposing or unresolved transient progress can propose an
                 # interior test, but never certify a bracket's resolution.
@@ -305,8 +316,8 @@ class HoldingForceSearch:
                 elif math.isfinite(upper) and command_nm < upper:
                     left, right = command_nm, upper
                 if math.isfinite(left) and math.isfinite(right) and right > left:
-                    self._propose_after_transition(command_nm, (left+right)/2,
-                        "refine_unverified_hold_between_motion_and_transition")
+                    self._propose_after_transition(command_nm, left / 2 + right / 2,
+                        "refine_unverified_hold_between_motion_and_transition", interval=(left, right))
                     return
             if (self._recheck_interior_on_conflict and not self.observations
                 and self._verification is None and progress is not None
@@ -370,13 +381,15 @@ class HoldingForceSearch:
                      if r["outcome"] == "positive_motion"), default=math.inf)
         return [r["command_nm"] for r in self.observations
                 if r["outcome"] == "stationary"
-                and (not self._recheck_interior_on_conflict or lower < r["command_nm"] < upper)
+                and lower < r["command_nm"] < upper
                 and not any(abs(r["command_nm"] - v) <= 1e-9 for v in rejected)]
 
     @property
     def return_command_nm(self):
         """Use the selected recheck hold during reacquisition, not a rejected one."""
         if self._verification is not None:
+            if self._verification not in self._eligible_stationary_commands():
+                return None
             return self._verification
         return min(self._eligible_stationary_commands(), key=abs,
                    default=None)

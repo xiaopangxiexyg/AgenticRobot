@@ -1449,3 +1449,364 @@ def test_report_keeps_verified_hold_even_if_later_withdrawal_failed(
     assert report["holding_calibration"]["auto_apply"] is False
     assert report["holding_calibration"]["identifies_unique_gravity"] is False
     assert report["acquisition_complete"] == withdrawal_ok
+
+
+@pytest.mark.parametrize("sign", [-1, 1])
+@pytest.mark.parametrize("excluded_by", ["resolved_boundary", "failed_return"])
+def test_excluded_frozen_plateau_never_becomes_a_return_or_usable_hold(sign, excluded_by):
+    search = HoldingForceSearch(HoldingSearchConfig(), seed_nm=sign * .4,
+                               cap_nm=1, recheck_interior_on_conflict=True)
+    for value in ([.4, .3, .2] if excluded_by == "resolved_boundary" else [.4, .3]):
+        search.record(command_nm=sign * value, outcome="stationary", evidence={})
+    if excluded_by == "resolved_boundary":
+        search.record(command_nm=sign * .2,
+                      outcome="negative_motion" if sign > 0 else "positive_motion", evidence={})
+        actual, fallback = sign * .2, sign * .3
+    else:
+        search.record_transition(command_nm=sign * .29, requested_command_nm=0, evidence={})
+        search.record_transition(command_nm=sign * .3, requested_command_nm=sign * .3, evidence={})
+        actual, fallback = sign * .3, sign * .4
+    assert search.candidate_nm == fallback
+    before = list(search.observations)
+    search.record(command_nm=actual, requested_command_nm=fallback,
+                  outcome="stationary", evidence={"ramp_frozen": True})
+    result = search.status(detailed=True)
+    assert result["state"] == "searching"
+    assert result["usable_hold_nm"] is None
+    assert result["candidate_nm"] == result["return_command_nm"] == fallback
+    assert actual in result["rejected_stationary_commands_nm"]
+    assert result["observations"][:len(before)] == before
+    assert result["observations"][-1]["command_nm"] == actual
+    assert result["observations"][-1]["requested_command_nm"] == fallback
+    assert result["interior_recheck_start_observation"] == len(search.observations)
+    assert result["trial_count"] + result["transition_count"] < result["max_trials"]
+    for repeat in range(2):
+        search.record(command_nm=fallback, requested_command_nm=fallback,
+                      outcome="stationary", evidence={"fresh_return": repeat})
+        assert search.state == ("searching" if repeat == 0 else "complete")
+    assert search.status()["usable_hold_nm"] == fallback
+    assert search.status()["auto_apply"] is search.status()["identifies_unique_gravity"] is False
+
+
+@pytest.mark.parametrize("sign", [-1, 1])
+def test_exhausted_interior_holds_publish_no_rejected_return_command(sign):
+    search = HoldingForceSearch(HoldingSearchConfig(), seed_nm=sign * .4,
+                               cap_nm=1, recheck_interior_on_conflict=True)
+    for value in [.4, .3, .2]:
+        search.record(command_nm=sign * value, outcome="stationary", evidence={})
+    for value in [.2, .3, .4]:
+        search.record(command_nm=sign * value,
+                      outcome="negative_motion" if sign > 0 else "positive_motion", evidence={})
+    result = search.status(detailed=True)
+    assert result["state"] == "incomplete"
+    assert result["usable_hold_nm"] is None
+    assert result["return_command_nm"] is None
+    assert search.return_command_nm is None
+    assert len(result["observations"]) == 6
+    assert set(result["rejected_stationary_commands_nm"]) == {sign * value for value in [.2, .3, .4]}
+
+
+@pytest.mark.parametrize("sign", [-1, 1])
+def test_default_rejected_frozen_plateau_never_completes(sign):
+    search = HoldingForceSearch(HoldingSearchConfig(), seed_nm=sign * .4, cap_nm=1)
+    for value in [.4, .3]:
+        search.record(command_nm=sign * value, outcome="stationary", evidence={})
+    search.record_transition(command_nm=sign * .29, requested_command_nm=0, evidence={})
+    search.record_transition(command_nm=sign * .3, requested_command_nm=sign * .3, evidence={})
+    assert search.candidate_nm == sign * .4
+    before = list(search.observations)
+    search.record(command_nm=sign * .3, requested_command_nm=sign * .4,
+                  outcome="stationary", evidence={"ramp_frozen": True})
+    result = search.status(detailed=True)
+    assert result["state"] == "incomplete"
+    assert result["reason"] == "holding_response_not_repeatable_or_monotone"
+    assert result["usable_hold_nm"] is None
+    assert result["candidate_nm"] == result["return_command_nm"] == sign * .4
+    assert result["observations"][:len(before)] == before
+    assert result["observations"][-1]["command_nm"] == sign * .3
+    assert result["trial_count"] + result["transition_count"] < result["max_trials"]
+
+
+@pytest.mark.parametrize("sign", [-1, 1])
+@pytest.mark.parametrize("excluded_by", ["censored_check", "resolved_boundary"])
+def test_default_terminal_recheck_publishes_no_rejected_return(sign, excluded_by):
+    search = HoldingForceSearch(HoldingSearchConfig(), seed_nm=sign * .3, cap_nm=1)
+    search.record(command_nm=sign * .3, outcome="stationary", evidence={})
+    search.record_transition(command_nm=sign * .28, requested_command_nm=0, evidence={})
+    assert search.return_command_nm == sign * .3
+    if excluded_by == "censored_check":
+        search.record_transition(command_nm=sign * .3, requested_command_nm=sign * .3, evidence={})
+    else:
+        search.record(command_nm=sign * .3,
+                      outcome="negative_motion" if sign > 0 else "positive_motion", evidence={})
+    result = search.status(detailed=True)
+    assert result["state"] == "incomplete"
+    assert result["usable_hold_nm"] is None
+    assert result["return_command_nm"] is None
+    assert search.return_command_nm is None
+
+
+@pytest.mark.parametrize("sign", [-1, 1])
+def test_unanchored_transition_keeps_both_resolved_bounds_and_original_evidence(sign):
+    search = HoldingForceSearch(HoldingSearchConfig(), seed_nm=sign*.8, cap_nm=1,
+                               recheck_interior_on_conflict=True)
+    search.record(command_nm=sign*.8,
+                  outcome="positive_motion" if sign > 0 else "negative_motion", evidence={})
+    search.record(command_nm=0, requested_command_nm=0,
+                  outcome="negative_motion" if sign > 0 else "positive_motion", evidence={})
+    old_rows = [dict(row) for row in search.observations]
+    requested = search.candidate_nm
+    search.record_transition(command_nm=sign*.2, requested_command_nm=requested,
+                             evidence={"outcome": "censored_settled_outside_point"})
+    result = search.status(detailed=True)
+    assert result["state"] == "searching"
+    assert result["candidate_nm"] == pytest.approx(sign*.4)
+    assert result["observations"] == old_rows
+    assert result["trial_count"] == 2 and result["transition_count"] == 1
+    assert result["negative_motion_below_nm"] == (0 if sign > 0 else -.8)
+    assert result["positive_motion_above_nm"] == (.8 if sign > 0 else 0)
+    assert result["return_command_nm"] is result["usable_hold_nm"] is None
+    assert result["observed_stationary_range_nm"] is None
+    assert result["transitions"][0]["command_nm"] == sign*.2
+    assert result["transitions"][0]["requested_command_nm"] == requested
+
+
+@pytest.mark.parametrize("sign", [-1, 1])
+def test_unanchored_transition_on_the_wrong_side_cannot_invent_an_interval(sign):
+    search = HoldingForceSearch(HoldingSearchConfig(), seed_nm=sign*.8, cap_nm=1,
+                               recheck_interior_on_conflict=True)
+    search.record(command_nm=sign*.8,
+                  outcome="positive_motion" if sign > 0 else "negative_motion", evidence={})
+    search.record_transition(command_nm=sign*.9, requested_command_nm=0, evidence={})
+    result = search.status(detailed=True)
+    assert result["state"] == "incomplete"
+    assert result["reason"] == "holding_transition_without_stable_anchor"
+    assert result["candidate_nm"] == 0
+    assert result["trial_count"] == result["transition_count"] == 1
+    assert result["observed_stationary_range_nm"] is None
+    assert result["return_command_nm"] is result["usable_hold_nm"] is None
+
+
+@pytest.mark.parametrize("sign", [-1, 1])
+def test_unanchored_censored_narrow_interval_never_certifies_a_hold(sign):
+    search = HoldingForceSearch(HoldingSearchConfig(torque_resolution_nm=.025),
+                               seed_nm=sign*.01, cap_nm=1,
+                               recheck_interior_on_conflict=True)
+    search.record(command_nm=sign*.01,
+                  outcome="positive_motion" if sign > 0 else "negative_motion", evidence={})
+    search.record_transition(command_nm=0, requested_command_nm=search.candidate_nm,
+                             evidence={"outcome": "censored_settled_outside_point"})
+    result = search.status(detailed=True)
+    assert result["state"] == "searching"
+    assert result["reason"] == "refine_unverified_hold_between_motion_and_transition"
+    assert result["candidate_nm"] == pytest.approx(sign*.005)
+    assert result["trial_count"] == result["transition_count"] == 1
+    assert result["observed_stationary_range_nm"] is None
+    assert result["return_command_nm"] is result["usable_hold_nm"] is None
+    assert result["auto_apply"] is result["identifies_unique_gravity"] is False
+    while search.state == "searching":
+        command = search.candidate_nm
+        search.record_transition(command_nm=command, requested_command_nm=command, evidence={})
+    exhausted = search.status(detailed=True)
+    assert exhausted["reason"] == "holding_trial_budget_exhausted"
+    assert exhausted["trial_count"]+exhausted["transition_count"] == search.config.max_trials
+    assert exhausted["return_command_nm"] is exhausted["usable_hold_nm"] is None
+
+
+def test_unanchored_exhausted_budget_cannot_be_revived_by_a_later_transition():
+    search = HoldingForceSearch(HoldingSearchConfig(max_trials=2), seed_nm=-.8, cap_nm=1,
+                               recheck_interior_on_conflict=True)
+    search.record(command_nm=-.8, outcome="negative_motion", evidence={})
+    search.record_transition(command_nm=0, requested_command_nm=0, evidence={})
+    before = search.status(detailed=True)
+    assert before["state"] == "incomplete"
+    assert before["reason"] == "holding_trial_budget_exhausted"
+    with pytest.raises(ValueError, match="terminal"):
+        search.record_transition(command_nm=search.candidate_nm,
+                                 requested_command_nm=search.candidate_nm, evidence={})
+    assert search.status(detailed=True) == before
+
+
+@pytest.mark.parametrize("sign", [-1, 1])
+def test_unanchored_large_finite_interval_keeps_a_finite_proposal(sign):
+    import math
+
+    cap = 1.5e308
+    search = HoldingForceSearch(HoldingSearchConfig(), seed_nm=sign*cap, cap_nm=cap,
+                               recheck_interior_on_conflict=True)
+    search.record(command_nm=sign*cap,
+                  outcome="positive_motion" if sign > 0 else "negative_motion", evidence={})
+    search.record_transition(command_nm=sign*1e308, requested_command_nm=0, evidence={})
+    result = search.status(detailed=True)
+    assert math.isfinite(result["candidate_nm"])
+    assert result["state"] == "searching"
+    assert result["candidate_nm"] == pytest.approx(sign*1.25e308)
+    assert -cap <= result["candidate_nm"] <= cap
+    assert result["trial_count"] == result["transition_count"] == 1
+    assert result["return_command_nm"] is result["usable_hold_nm"] is None
+
+
+@pytest.mark.parametrize("sign", [-1, 1])
+@pytest.mark.parametrize("explicit", [False, True])
+def test_resolved_large_finite_motion_bounds_keep_a_finite_proposal(sign, explicit):
+    import math
+
+    cap = 1.5e308
+    search = HoldingForceSearch(HoldingSearchConfig(), seed_nm=sign*cap, cap_nm=cap,
+                               recheck_interior_on_conflict=explicit)
+    search.record(command_nm=sign*cap,
+                  outcome="positive_motion" if sign > 0 else "negative_motion", evidence={})
+    search.record(command_nm=sign*1e308,
+                  outcome="negative_motion" if sign > 0 else "positive_motion", evidence={})
+    result = search.status(detailed=True)
+    assert math.isfinite(result["candidate_nm"])
+    assert result["state"] == "searching"
+    assert result["candidate_nm"] == pytest.approx(sign*1.25e308)
+    assert result["trial_count"] == 2 and result["transition_count"] == 0
+    assert result["return_command_nm"] is result["usable_hold_nm"] is None
+
+
+@pytest.mark.parametrize("sign", [-1, 1])
+@pytest.mark.parametrize("explicit", [False, True])
+def test_large_finite_stationary_and_censored_endpoint_keep_a_finite_proposal(sign, explicit):
+    import math
+
+    cap = 1.5e308
+    search = HoldingForceSearch(HoldingSearchConfig(), seed_nm=sign*cap, cap_nm=cap,
+                               recheck_interior_on_conflict=explicit)
+    search.record(command_nm=sign*cap, outcome="stationary", evidence={})
+    search.record_transition(command_nm=sign*1e308, requested_command_nm=0, evidence={})
+    result = search.status(detailed=True)
+    assert math.isfinite(result["candidate_nm"])
+    assert result["state"] == "searching"
+    assert result["candidate_nm"] == pytest.approx(sign*1.25e308)
+    assert result["return_command_nm"] == sign*cap
+    assert result["usable_hold_nm"] is None
+
+
+@pytest.mark.parametrize("sign", [-1, 1])
+@pytest.mark.parametrize("explicit", [False, True])
+def test_directed_unanchored_exploration_requires_explicit_opt_in(sign, explicit):
+    search = HoldingForceSearch(HoldingSearchConfig(movement_rad=.0045), seed_nm=sign*.2,
+                               cap_nm=1, recheck_interior_on_conflict=explicit)
+    search.record(command_nm=sign*.2,
+                  outcome="positive_motion" if sign > 0 else "negative_motion", evidence={})
+    search.record_transition(command_nm=0, requested_command_nm=0,
+                             evidence={"net_displacement_rad":sign*.003})
+    result = search.status(detailed=True)
+    assert result["state"] == ("searching" if explicit else "incomplete")
+    assert result["candidate_nm"] == pytest.approx(-sign*.2 if explicit else 0)
+    assert result["trial_count"] == result["transition_count"] == 1
+    assert result["return_command_nm"] is result["usable_hold_nm"] is None
+    assert result["observed_stationary_range_nm"] is None
+
+
+@pytest.mark.parametrize("sign", [-1, 1])
+@pytest.mark.parametrize("progress_kind", ["below_threshold", "at_threshold", "opposing"])
+def test_directed_unanchored_exploration_respects_progress_threshold_and_direction(sign, progress_kind):
+    config = HoldingSearchConfig(movement_rad=.0045)
+    search = HoldingForceSearch(config, seed_nm=sign*.2, cap_nm=1,
+                               recheck_interior_on_conflict=True)
+    search.record(command_nm=sign*.2,
+                  outcome="positive_motion" if sign > 0 else "negative_motion", evidence={})
+    progress = sign*config.movement_rad*({"below_threshold":.49, "at_threshold":.5, "opposing":-1}[progress_kind])
+    search.record_transition(command_nm=0, requested_command_nm=0,
+                             evidence={"net_displacement_rad":progress})
+    result = search.status(detailed=True)
+    expected = -sign*.2 if progress_kind == "at_threshold" else sign*.1
+    assert result["state"] == "searching"
+    assert result["candidate_nm"] == pytest.approx(expected)
+    assert len(result["observations"]) == len(result["transitions"]) == 1
+    assert result["negative_motion_below_nm" if sign > 0 else "positive_motion_above_nm"] is None
+    assert result["return_command_nm"] is result["usable_hold_nm"] is None
+
+
+@pytest.mark.parametrize("sign", [-1, 1])
+@pytest.mark.parametrize("progress_sign", [-1, 1])
+def test_directed_unanchored_progress_cannot_escape_two_resolved_motion_bounds(sign, progress_sign):
+    search = HoldingForceSearch(HoldingSearchConfig(movement_rad=.0045), seed_nm=sign*.8,
+                               cap_nm=1, recheck_interior_on_conflict=True)
+    search.record(command_nm=sign*.8,
+                  outcome="positive_motion" if sign > 0 else "negative_motion", evidence={})
+    search.record(command_nm=0, requested_command_nm=0,
+                  outcome="negative_motion" if sign > 0 else "positive_motion", evidence={})
+    old = [dict(row) for row in search.observations]
+    search.record_transition(command_nm=sign*.2, requested_command_nm=search.candidate_nm,
+                             evidence={"net_displacement_rad":progress_sign*.003})
+    result = search.status(detailed=True)
+    assert result["state"] == "searching"
+    assert result["candidate_nm"] == pytest.approx(sign*.4)
+    assert result["observations"] == old
+    assert result["trial_count"] == 2 and result["transition_count"] == 1
+    assert result["return_command_nm"] is result["usable_hold_nm"] is None
+
+
+@pytest.mark.parametrize("sign", [-1, 1])
+@pytest.mark.parametrize("max_trials", [2, 3])
+def test_directed_unanchored_expansion_cannot_renew_the_original_trial_budget(sign, max_trials):
+    search = HoldingForceSearch(HoldingSearchConfig(max_trials=max_trials, movement_rad=.0045),
+                               seed_nm=sign*.1, cap_nm=1, recheck_interior_on_conflict=True)
+    search.record(command_nm=sign*.1,
+                  outcome="positive_motion" if sign > 0 else "negative_motion", evidence={})
+    while search.state == "searching":
+        command = search.candidate_nm
+        search.record_transition(command_nm=command, requested_command_nm=command,
+                                 evidence={"net_displacement_rad":sign*.003})
+    result = search.status(detailed=True)
+    assert result["state"] == "incomplete" and result["reason"] == "holding_trial_budget_exhausted"
+    assert result["trial_count"]+result["transition_count"] == max_trials
+    assert result["trial_count"] == 1
+    assert result["return_command_nm"] is result["usable_hold_nm"] is None
+    with pytest.raises(ValueError, match="terminal"):
+        search.record_transition(command_nm=search.candidate_nm,
+                                 requested_command_nm=search.candidate_nm, evidence={"net_displacement_rad":sign*.003})
+    assert search.status(detailed=True) == result
+
+
+@pytest.mark.parametrize("sign", [-1, 1])
+def test_repeated_proposal_keeps_resolved_motion_interval(sign):
+    search = HoldingForceSearch(
+        HoldingSearchConfig(movement_rad=.0045, max_trials=12),
+        seed_nm=sign * .4, cap_nm=1, recheck_interior_on_conflict=True,
+    )
+    search.record_transition(command_nm=sign * .4, requested_command_nm=sign * .4,
+                             evidence={"net_displacement_rad":-sign * .003})
+    search.record(command_nm=sign * .8,
+                  outcome="positive_motion" if sign > 0 else "negative_motion", evidence={})
+    search.record(command_nm=0,
+                  outcome="negative_motion" if sign > 0 else "positive_motion", evidence={})
+    before = list(search.observations)
+    search.record_transition(command_nm=-sign * .8, requested_command_nm=sign * .4, evidence={})
+    result = search.status(detailed=True)
+    lower, upper = sorted((0, sign * .8))
+    assert result["negative_motion_below_nm"] == lower
+    assert result["positive_motion_above_nm"] == upper
+    assert lower <= result["candidate_nm"] <= upper
+    assert result["return_command_nm"] is result["usable_hold_nm"] is None
+    assert result["observations"] == before
+    assert result["trial_count"] == 2 and result["transition_count"] == 2
+    if result["state"] == "incomplete":
+        assert result["reason"] == "holding_no_finite_trial_in_search_interval"
+
+
+@pytest.mark.parametrize("sign", [-1, 1])
+def test_directed_unanchored_large_finite_commands_are_clamped_before_publication(sign):
+    import math
+
+    cap = 1.5e308
+    search = HoldingForceSearch(HoldingSearchConfig(max_trials=6, movement_rad=.0045),
+                               seed_nm=sign*cap, cap_nm=cap, recheck_interior_on_conflict=True)
+    search.record(command_nm=sign*cap,
+                  outcome="positive_motion" if sign > 0 else "negative_motion", evidence={})
+    search.record_transition(command_nm=-sign*1e308, requested_command_nm=0,
+                             evidence={"net_displacement_rad":sign*.003})
+    assert search.state == "searching"
+    assert math.isfinite(search.candidate_nm) and search.candidate_nm == -sign*cap
+    search.record_transition(command_nm=search.candidate_nm, requested_command_nm=search.candidate_nm,
+                             evidence={"net_displacement_rad":sign*.003})
+    result = search.status(detailed=True)
+    assert result["state"] == "incomplete" and result["reason"] == "holding_authority_insufficient"
+    assert math.isfinite(result["candidate_nm"]) and result["candidate_nm"] == -sign*cap
+    assert result["trial_count"] == 1 and result["transition_count"] == 2
+    assert result["observed_stationary_range_nm"] is None
+    assert result["return_command_nm"] is result["usable_hold_nm"] is None

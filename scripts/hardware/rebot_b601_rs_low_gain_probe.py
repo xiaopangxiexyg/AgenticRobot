@@ -6144,6 +6144,7 @@ def _shared_control_config_payload(
         "max_target_error_rad": config.max_target_error_rad,
         "max_abs_assist_torque_nm": config.max_abs_assist_torque_nm,
         "max_assist_torque_rate_nm_s": config.max_assist_torque_rate_nm_s,
+        "damping_velocity_window_sec": config.damping_velocity_window_sec,
         "authority_rise_per_sec": config.authority_rise_per_sec,
         "policy_stale_timeout_sec": config.policy_stale_timeout_sec,
         "maximum_future_skew_sec": config.maximum_future_skew_sec,
@@ -6202,6 +6203,7 @@ def _step_shared_control_runtime(
     measured_qpos_rad: Sequence[float],
     measured_qvel_rad_s: Sequence[float],
     dt_sec: float,
+    joint_observation_timestamps_sec: Sequence[float] | None = None,
 ) -> tuple[B601MitReference, dict[str, object]]:
     """Produce one auditable assist reference for the sole hardware owner."""
 
@@ -6211,8 +6213,13 @@ def _step_shared_control_runtime(
         measured_qpos_rad=measured_qpos_rad,
         measured_qvel_rad_s=measured_qvel_rad_s,
         dt_sec=dt_sec,
+        **({"joint_observation_timestamps_sec": joint_observation_timestamps_sec}
+           if joint_observation_timestamps_sec is not None else {}),
     )
-    return frame.reference, _shared_control_frame_payload(frame)
+    payload = _shared_control_frame_payload(frame)
+    if runtime.config.damping_velocity_window_sec:
+        payload["control_qvel_rad_s"] = frame.control_qvel_rad_s
+    return frame.reference, payload
 
 
 def compute_software_torque_breakdown(
@@ -7309,8 +7316,8 @@ class _ProbeGCObserver:
 class _ProbeFeedbackTiming:
     """Observe the existing read/admission/retry path, without a second gate."""
 
-    def __init__(self) -> None:
-        self.timer = _ProbeStageTiming()
+    def __init__(self, *, measure_intervals: bool = True) -> None:
+        self.timer = _ProbeStageTiming() if measure_intervals else None
         self.not_advanced_count = 0
         self.retryable_error_count = 0
         self.rejection_counts: dict[str, int] = {}
@@ -7328,12 +7335,22 @@ class _ProbeFeedbackTiming:
         self.last_rejection = entry
 
     def mark(self, stage: str) -> None:
-        self.timer.mark(stage, accumulate=True)
+        if self.timer is not None:
+            self.timer.mark(stage, accumulate=True)
 
     def snapshot(self) -> dict[str, object]:
         return {
-            **self.timer.snapshot(),
-            "interval_semantics": "summed_disjoint_intervals; span_bounds_are_not_contiguous",
+            **(self.timer.snapshot() if self.timer is not None else {
+                "semantics": "diagnostic_only; timing_not_collected",
+                "stages": {},
+                "total_wall_sec": None,
+                "total_thread_cpu_sec": None,
+            }),
+            "measure_intervals": self.timer is not None,
+            "interval_semantics": (
+                "summed_disjoint_intervals; span_bounds_are_not_contiguous"
+                if self.timer is not None else "not_collected"
+            ),
             "not_advanced_count": self.not_advanced_count,
             "retryable_error_count": self.retryable_error_count,
             "rejection_counts": dict(self.rejection_counts),
@@ -7353,7 +7370,9 @@ def _poll_control_feedback(
         state = (
             backend.poll_feedback(request_feedback=True)
             if active_report_gate is None
-            else backend.poll_feedback(require_host_freshness=True, prefer_active_report=True)
+            else backend.poll_feedback(
+                require_host_freshness=True, prefer_active_report=True
+            )
         )
     except LowGainProbeError as exc:
         if diagnostics is not None:
@@ -8709,6 +8728,13 @@ def _run_latched_fault_hold(
     )
 
 
+
+
+
+
+
+
+
 def _release_owner_transport(
     backend: B601RSBackend, *, device_cleanup_confirmed: bool, cleanup_errors: list[str],
 ) -> dict[str, object]:
@@ -9062,6 +9088,8 @@ def run_probe(
     assist_guard_rejection: dict[str, object] | None = None
     cartesian_assist_guard_rejection: dict[str, object] | None = None
     primary_error: Exception | None = None
+    last_feedback_read_diagnostics: _ProbeFeedbackTiming | None = None
+    primary_feedback_read_diagnostics: dict[str, object] | None = None
     cycle_timing = None
     preflight_disable: B601ModeReceipt | None = None
     mode_receipt: B601ModeReceipt | None = None
@@ -9184,6 +9212,43 @@ def run_probe(
         startup_state_history.append(state)
         _operator_notice(f"[B601] STARTUP {state}")
 
+    def poll_control_feedback() -> tuple[B601HardwareState, bool]:
+        # Warmup remains one poll per attempt under its original outer budget.
+        nonlocal last_feedback_read_diagnostics
+        diagnostics = (
+            _ProbeFeedbackTiming(measure_intervals=False)
+            if active_report_gate is not None else None
+        )
+        last_feedback_read_diagnostics = diagnostics
+        try:
+            state, advanced = _poll_control_feedback(backend, active_report_gate, diagnostics)
+        except LowGainProbeError:
+            if diagnostics is not None:
+                diagnostics.retryable_error_count += 1
+            raise
+        if diagnostics is not None and not advanced:
+            diagnostics.not_advanced_count += 1
+            diagnostics.reject(
+                "baseline_not_advanced",
+                "active-report feedback established a baseline but did not yet advance",
+            )
+        return state, advanced
+
+    def read_admitted_control_feedback(timeout_sec: float) -> B601HardwareState:
+        if active_report_gate is None:
+            state, _advanced = poll_control_feedback()
+            return state
+        nonlocal last_feedback_read_diagnostics
+        diagnostics = (
+            _ProbeFeedbackTiming(measure_intervals=False)
+            if active_report_gate is not None else None
+        )
+        # Register before a fallible poll, and share one observer across retries.
+        last_feedback_read_diagnostics = diagnostics
+        return _read_admitted_control_feedback(
+            backend, active_report_gate, timeout_sec, diagnostics
+        )
+
     signal.signal(
         signal.SIGINT,
         lambda signum, frame: _signal_handler(stop, signum, frame),
@@ -9254,7 +9319,7 @@ def run_probe(
             if stop["requested"]:
                 raise LowGainProbeError("operator interrupt before motor enable")
             try:
-                warmup_state, warmup_feedback_advanced = _poll_control_feedback(backend, active_report_gate)
+                warmup_state, warmup_feedback_advanced = poll_control_feedback()
             except LowGainProbeError:
                 time.sleep(0.01)
                 continue
@@ -9362,7 +9427,7 @@ def run_probe(
             raise LowGainProbeError(
                 "operator interrupt immediately after motor enable"
             )
-        arming_state = _read_admitted_control_feedback(backend, active_report_gate, advance_timeout_sec)
+        arming_state = read_admitted_control_feedback(advance_timeout_sec)
         arming_observed_at_sec = time.monotonic()
         if (
             not arming_state.valid
@@ -9527,7 +9592,7 @@ def run_probe(
             if stop["requested"]:
                 stop_reason = "operator_interrupt during arming settle"
                 break
-            settle_state = _read_admitted_control_feedback(backend, active_report_gate, advance_timeout_sec)
+            settle_state = read_admitted_control_feedback(advance_timeout_sec)
             settle_observed_at_sec = time.monotonic()
             if (
                 not settle_state.valid
@@ -9743,7 +9808,11 @@ def run_probe(
                 time.sleep(next_deadline - now)
             if cycle_timing is not None:
                 cycle_timing.mark("schedule_wait")
-            feedback_diagnostics = _ProbeFeedbackTiming() if debug_trace is not None else None
+            feedback_diagnostics = (
+                _ProbeFeedbackTiming(measure_intervals=debug_trace is not None)
+                if debug_trace is not None or active_report_gate is not None else None
+            )
+            last_feedback_read_diagnostics = feedback_diagnostics
             try:
                 state = _read_admitted_control_feedback(
                     backend, active_report_gate, advance_timeout_sec, feedback_diagnostics,
@@ -10531,6 +10600,10 @@ def run_probe(
                         measured_qpos_rad=q,
                         measured_qvel_rad_s=qvel,
                         dt_sec=dt,
+                        joint_observation_timestamps_sec=(
+                            tuple(joint.observed_at_sec for joint in state.joints)
+                            if shared_control_runtime.config.damping_velocity_window_sec else None
+                        ),
                     )
                 )
                 qref = shared_reference.qpos_rad
@@ -10905,6 +10978,8 @@ def run_probe(
             )
             samples.append(
                 {
+                    **({"feedback_read_diagnostics": last_feedback_read_diagnostics.snapshot()}
+                       if last_feedback_read_diagnostics is not None else {}),
                     "sequence": state.sequence,
                     "elapsed_sec": elapsed,
                     "feedback_timestamp_sec": state.receive_timestamp_sec,
@@ -11233,10 +11308,25 @@ def run_probe(
                 )
     except LowGainProbeError as exc:
         primary_error = exc
+        # Cleanup may perform another feedback read; preserve the primary read.
+        primary_feedback_read_diagnostics = (
+            last_feedback_read_diagnostics.snapshot()
+            if last_feedback_read_diagnostics is not None else None
+        )
     except (B601HardwareError, OSError, TypeError, ValueError) as exc:
         primary_error = exc
+        # Cleanup may perform another feedback read; preserve the primary read.
+        primary_feedback_read_diagnostics = (
+            last_feedback_read_diagnostics.snapshot()
+            if last_feedback_read_diagnostics is not None else None
+        )
     except Exception as exc:  # noqa: BLE001 - report unexpected probe failure
         primary_error = exc
+        # Cleanup may perform another feedback read; preserve the primary read.
+        primary_feedback_read_diagnostics = (
+            last_feedback_read_diagnostics.snapshot()
+            if last_feedback_read_diagnostics is not None else None
+        )
     finally:
         if torque_console is not None:
             # Observer finalization must not bypass the enabled-arm shutdown
@@ -11696,7 +11786,10 @@ def run_probe(
         detail = str(primary_error)
         if cleanup_errors:
             detail += "; cleanup: " + "; ".join(cleanup_errors)
-        raise LowGainProbeError(detail, cleanup=cleanup_record) from primary_error
+        error = LowGainProbeError(detail, cleanup=cleanup_record)
+        if primary_feedback_read_diagnostics is not None:
+            error.feedback_read_diagnostics = primary_feedback_read_diagnostics
+        raise error from primary_error
 
     # Decode summary fields once, only after the existing owner cleanup.
     # Keep the rich archive for lossless export; repeated summary traversal
@@ -11948,6 +12041,8 @@ def run_probe(
         },
         "transport": "motorbridge_wired_local",
         "feedback_source": feedback_source,
+        **({"feedback_read_diagnostics": last_feedback_read_diagnostics.snapshot()}
+           if last_feedback_read_diagnostics is not None else {}),
         "gravity_debug": {
             "enabled": gravity_debug_profile is not None,
             "parameter_source": (
@@ -13702,6 +13797,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 payload["cleanup"] = exc.cleanup
             if getattr(args, "torque_console_auto_calibration_profile", None) is not None:
                 payload["execution_status"] = "ERROR"
+            feedback_diagnostics = getattr(exc, "feedback_read_diagnostics", None)
+            if feedback_diagnostics is not None:
+                payload["feedback_read_diagnostics"] = feedback_diagnostics
             exit_code = 2
         else:
             exit_code = 0 if payload.get("status") == "OK" else 1

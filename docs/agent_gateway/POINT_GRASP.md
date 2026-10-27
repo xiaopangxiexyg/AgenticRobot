@@ -18,6 +18,79 @@
 姿态只绑定用户提供的本地标定文件，不是 Gateway 可信 Station pose，不能绕过下游正式 motion
 owner、碰撞场景和安全门禁。
 
+后续模型、观测引用、完整抓放与执行组织的逐项计划和实际证据范围见
+[抓取 Skill 后续开发](./plans/grasp_backend_trials.zh-CN.md)。实验候选与默认装配分开维护。
+
+## 真实 Gateway 的快速完整路径规划
+
+`perception.plan_grasp_fast@1` 只在已有冻结观测、具身 GraspGenX 和 paired-plan
+装配条件闭合时注册。调用方提供留存 observation operation ID、点击像素、角色和
+有界搜索参数；profile 复用原模型、几何、IK 与路径规划器，返回第一条完整可行路径的
+会话内计划 ID/hash。旧候选审阅及 `perception.plan_grasp_approach@1` 入口继续可用。
+
+该 Skill 为只读规划，不发动作或 HOLD，不闭合夹爪。实际执行仍走已授权的
+`motion.execute_grasp_approach_plan@1`，复用同一个单次消费计划库；未完成、失败、
+取消或过期的生产 operation 不得使计划成为可执行结果。来源观测、选中抓姿、双臂
+起始状态、场景版本及原计划 TTL 保持绑定。
+
+整请求使用调用方的原绝对 deadline 和 monotonic clock。读取窗口/锁等待后、主及
+辅助 SAM2 前后、GraspGenX 前后检查同一预算和取消状态，取消优先；模型原异常仍经
+原 finally 记录耗时并传播。已经运行的模型调用保持协作式停止边界，预算耗尽后不
+启动下一受保护阶段。诊断和失败回放仅供排查，不能替代成功结果或执行授权。
+
+验证范围为本地合同、假模型端口、CPU 原生几何及非硬件组合验收；不声明真机、
+模型服务或真实抓取成功验收。
+
+## MuJoCo 冻结观测与快速完整路径
+
+MuJoCo 在显式配置完整的右臂 approach/contact、双夹爪、Artifact 存储与 GraspGenX
+模型绑定后，追加 `perception.capture_grasp_observation@1`、
+`perception.plan_grasp_fast@1` 和 `motion.execute_grasp_approach_plan@1`。
+默认配置不加载这些模型或发布这三条 Route。启动器使用 `--enable-fast-grasp`，
+要求 `--no-realtime-worker`、`--enable-grippers`、`--enable-grasp-approach`、
+`--grasp-contact-target-body`、`--artifact-root` 及三个显式绝对目录：
+`--sam2-grounding-dino-bundle`、`--graspgenx-point-grasp-bundle`、`--graspgenx-source-root`。
+模型由会话已有的 `start_perception_resources()` 在传输发布前启动，关闭时先等待
+只读 worker 退出，再释放模型、renderer、应用和存储；不在 Skill 中创建或重启资源。
+
+冻结观测要求应用已启动、处于 HOLD、没有活动运动且已绑定原生规划器。RGB-D、
+光学相机几何、双臂及完整模型状态取自同一个 rig scene cut，不推进物理。
+采集统一按 source→application→rig 加锁，沿用现有渲染缓存及关闭检查。
+真实与仿真消费者共用有大小上限的留存 Artifact 读取器，完整性仍由原 CAS store 验证。
+
+MuJoCo 可显式用 `--sam3-endpoint http://127.0.0.1:8114` 选择已经启动的 SAM3 服务，
+用于 `perception.segment`，并在启用 fast-grasp 时提供其点提示 mask。
+也可与 `--enable-segmentation-batch-v2`、`--enable-segmentation-geometry-v3` 组合，
+复用现有同一帧批量分割、留存观测身份校验和 mask 的二维像素几何；不会新增观测 owner
+或把分割候选当作物体身份真值。上述扩展仍需显式启用，原默认后端和 v1 行为不变。
+分割 v3 的形状及间距仍是二维图像关系；三维表面点须继续由原配对 RGB-D／
+back-projection 接口生成，不能将 mask 中心直接当作物体三维中心。
+此时不传 `--segmentation-asset-bundle` 或 `--sam2-grounding-dino-bundle`；
+GraspGenX 的 bundle、Artifact 和原 grasp/gripper 装配仍必需；默认进程内模式还需 source。
+两个由会话管理的客户端分别拥有自己的传输生命周期，外部服务保持唯一模型 owner；
+客户端不会启动或关闭服务。模型资源仍在传输发布前由原会话启动，不在 Skill 内初始化。
+显式 `--graspgenx-planner diffusion` 可对照 diffusion-only；默认仍是 `graspmoe`。
+这些选择绑定到现有模型/profile hash，复用同一 v5 几何、IK 和完整路径及执行门禁，
+不增加等价 Skill、不改变默认模型，也不意味着已通过真实推理或抓取验收。
+
+MuJoCo 也可显式使用与 RealMan 相同名称的 `--graspgenx-mode service`、
+`--graspgenx-host 127.0.0.1`、`--graspgenx-port 5556`、`--graspgenx-timeout-ms 120000`。
+它复用原 `GraspGenXClient`，连接预先启动的隔离模型服务，不要求 `--graspgenx-source-root`，
+不在 Skill 中启动服务。这样模型可留在其已验证的 Torch 环境，MuJoCo 继续使用原环境；
+服务调用仍返回同一参考系的提案，并进入原 v5/IK/完整路径链。
+默认仍为原 `in-process`。连接参数只在 service 模式有效；该模式的模型设备由外部服务决定，
+`--point-grasp-device` 仍用于本地 SAM2 点分割。服务 checkpoint 的运行身份需在部署/实验中
+独立核验，客户端的预期 asset bundle 与一次健康检查不能代替该证明。
+
+快速规划只接收本会话完成的 observation operation，复用共享的候选生成、首条完整路径
+搜索和原生链 owner。主视角与辅助视角准备均检查调用方原始预算和取消状态；
+模型调用中止仍是协作式边界。规划不执行运动或 HOLD；执行必须另行提交本会话
+`mujoco-grasp-approach-plan:<sha256>` 的精确 ID/hash，校验来源、场景、TTL 和 pending
+所有权后单次消费已有完整链，不重新规划或接受真实机器人计划 ID。
+
+本地原生 MuJoCo 测试使用固定候选及假推理端口，覆盖状态冻结、路径留存、取消、
+失效拒绝和执行接线；这类证据不代表新模型推理质量或真机接触成功。
+
 ## 算法与第三方源码
 
 - [SAM2](https://github.com/facebookresearch/sam2.git) 使用正点击点分割点击所在物体/部位；
@@ -541,6 +614,45 @@ INFO 日志分别记录 provider 的锁等待、采集准备、提案、标注�
 发布和总耗时。提案旧总字段仍包含机械臂筛选，新增排除该筛选的耗时不能与总值重复相加。
 失败保留原错误及已运行阶段的耗时，新请求清空旧阶段；这些本地阶段时钟不改变观测时间和 TTL。
 
+in-process GraspGenX 的 `GraspGenX inference diagnostics` 细分输入验证、锁等待、sampler
+准备、模型调用、已有输出转 CPU、阈值/top-k 和来源标签汇总。这是一条有界主机时钟日志，
+不增加 CUDA 同步，也不是 kernel 耗时；只统计实际返回且可识别的主机来源标签，未知则明确
+标为 unavailable。日志或序列化的普通故障以有界 stderr 提示；两个诊断通道都不可用时允许
+丢失诊断，保留原推理结果与原异常／中断。诊断期间新发生的操作员中断继续传播。
+
+### 离线闭爪首触诊断
+
+`python -m scripts.probes.diagnose_grasp_closure --help` 提供独立、离线的末端闭爪实验。
+该工具不启动相机、网络、模型或真机，不是另一个运动生产入口；复用现有任务装配、
+工具标定、canonical IK 和 guarded MuJoCo rig。夹爪/机械臂在开始后的控制仍由原执行器负责。
+仅 reset fixture 可以直接设置初始 qpos。默认不试抬，显式 `--lift` 也只是原执行器内的局部
+3 cm 试抬，不代表完整接近路径、Gateway 接线、携物避障或物理抓稳验收。
+
+外部 JSON fixture 指定已有 `task_config`、`object_edge_m`、`object_center_world_m`、
+单位四元数 `object_quaternion_wxyz`、`support_width_m`、`object_pose_evidence`，以及命名
+`grasps`。每个 grasp 包含 `model_pose_world` 和 `qpos_by_side`（双臂各 6 个弧度值）。
+工具按明确尺寸构建方块和静态支撑体，不从图片推断真实质量；沿用任务的质量、摩擦和 servo。
+这是方块实验 fixture，不是任意形状的通用物理成功标签生成器。方块尺寸不写入生产抓姿规则。
+`--center A --orientation B` 固定的是已标定 GraspGenX model-origin，而非旧 TCP 或实测压力中心；
+交叉组合的端点局部 IK 默认共享 8 秒预算，失败如实保存，不修改目标或放宽容差。
+四组合的被动臂必须一致；输出保存实际选中 qpos、实测初始 TCP/model pose 和 FK 残差。
+
+新输出目录中 `events.jsonl` 逐次 flush 首次接触事件，`trace.jsonl` 每 40 个物理步保存一次轨迹
+（4000 Hz 时约 10 ms，1000 Hz 时约 40 ms）。每个成功返回的物理步均用于瞬时极值统计；
+若原执行器在故障步抛错，该步保留原拒绝原因，不保证生成完整接触行。
+记录包含左右首触时间、闭合进度、接触位置/力、物体与 TCP
+的运动，以及穿透量。闭合进度无量纲，不冒充毫米行程。MuJoCo 的接触位置是两表面的中点，
+诊断按 signed distance 和 geom 顺序恢复传感器碰撞体表面点，并保留完整接触坐标系与力方向。
+当前 implicit/Euler 步进的接触/力/派生位姿属于积分前求值，记录与同阶段的 qpos/时间配对，
+另留积分后时间；不为记日志在 live scene 额外调用 `mj_forward`，RK4 的多 stage 时序不受此工具支持。
+中断和早期失败尽可能保存 `result.json`；原始错误与各资源关闭失败分别记录，不用后者覆盖前者。
+
+传感器 body、内侧半空间、碰撞 box 内侧面、box 边缘和真实有效触觉垫片不是同一概念。
+工具将当前可见事实标为 collision face/edge，`physical_tactile_pad_membership` 始终为 unknown，
+直到存在经过审核的有限有效垫片定义。原 URDF 的传感器 collision box 不是自动获得的真实垫片合同。
+`--lift` 前连续双侧 body 受力只是复用实验的试抬条件，不是抓牢证明；大穿透、未知接触面或
+不准确物体假设必须单独评估，不能因脚本完成或方块上升就给生产候选增加成功标签。
+
 #### 线缆掩码诊断（离线，不改变碰撞场景）
 
 `deployments.perception.cable_diagnostics` 提供纯数组诊断，不启动模型或设备，也不接入生产删点：
@@ -617,6 +729,13 @@ IK、生产 URDF/FCL 场景和完整关节路径规划；不会接受调用方�
 标定，因此其 `base` 输出不能被称为 deployment-trusted Station pose，也不会由生产
 `real-perception` profile 发布。
 
+MuJoCo 的公开冻结观测仅包含 RGB-D、标定/光学变换、采集身份以及真机可读取的左右臂
+各六维关节位置；不包含全模型 `qpos/qvel`，因此不会随 Artifact 泄漏物体自由关节真值。
+全模型状态仍由原 application 私有采集，公开归档仅携带其不可逆 scene 摘要，用于同一会话
+内检查机器人、物体、速度和仿真时间是否变化；它不是物体状态估计或可用目标位姿。
+该元数据策略参与 frame/profile 绑定，消费者应重新发现；旧 Artifact 不会被改写或重标记。
+保留的机器人本体 qpos 用于腕相机的采集时外参关联，不应与物体真值一并删除。
+
 ### 可选手指交换候选（显式 v5）
 
 真实 Gateway 的现有入口可显式增加 `--enable-point-grasp-finger-exchange`，
@@ -658,9 +777,10 @@ GraspGenX 的 arm reachability 在绑定同侧腕相机标定后，会从 tool T
 
 ## DMTAC M 和坐标语义
 
-DMTAC/GraspGenX 的名义模型指长仍为 100 mm；碰撞及渲染 proxy 在最前端单独加长 1 mm，
-覆盖开口 q=0 CAD 指尖约 0.596 mm 的轴向漏包。TCP、模型输入尺寸、抓取中心和原版 4B2
-profile 保持原值；这不补偿相机外参偏差，也不表示外壳横向已完全包络。
+DMTAC/GraspGenX 默认使用 v5 名义模型：指长 86.7 mm、palm Z −24 mm，以及对应的完整
+TCP→model 变换。碰撞及渲染 proxy 在指尖单独扩展 3 mm；推理与 capture 仍使用名义尺寸。
+控制器 TCP、物理抓取中心和原版 4B2 profile 保持原值；这不补偿相机外参偏差，也不表示
+外壳横向已完全包络。旧 v4 几何通过显式 profile 保留，详见本文“DMTAC 名义对齐 profile”。
 
 当前 simulation 默认 URDF 由 `sim/contracts/scene/spec.py` 选定为：
 
@@ -880,3 +1000,30 @@ registry。生产 Skill 只广告当前部署已经具备可信 RGB 和相机 po
 `--captured-robot-self-envelope-urdf` 只用于捕获时删点，不会替换运动碰撞模型。
 扩展配置与几何参数哈希进入执行 manifest 及过滤证据，默认 manifest 和旧过滤证据不变。
 本地几何、离线或仿真验证不代表附件已获现场复核或真实动作已获验收。
+
+## DMTAC 名义对齐 profile
+
+默认 `DMTAC_M_graspgenx_alignment_v5_q0` 采用 finger length 86.7 mm、palm Z −24 mm、
+碰撞指尖扩展 3 mm，并绑定对应的完整 TCP→model 变换。原 v4 的 100 mm、−29 mm 和
+1 mm 扩展保留为 `DMTAC_M_graspgenx_alignment_v4_q0`；选择显式 v4 时，旧几何、推理
+sweep 和 semantic hash 保持不变。现有入口使用 `--graspgenx-alignment-profile` 选择，
+Python planner 使用 `alignment_profile_id`；未指定时使用新 v5。已有不可变候选及计划仍
+按照其原身份解释，不能借默认值变化重新标记。不得只替换某个全局尺寸常量。
+
+同一个不可变 profile 供给推理 sweep、capture 名义尺寸、候选转换、碰撞几何及身份。
+3 mm 扩展只用于碰撞/渲染，不加入推理抓取深度。新 profile 拒绝旧尺寸或另一变换的
+`solid_geometry` override。原生运动、碰撞、截止时间、取消与最终输出保护继续由原 owner 负责。
+
+原始对齐 JSON 来自右臂 gripper q=0；用当前固定 URDF 和左右各自的工具 TCP 重新核验，
+两侧的名义 TCP→model 变换与新记录的最大元素差均约 3.31e−14，因此默认名义几何由左右
+共用，沿用原双臂共享候选池及各组件独立的可达性/执行检查。q=0 描述名义开爪模型，
+不是当前夹爪状态的实测证明；实时状态与完整碰撞检查仍由原链负责。
+冻结输入为 `1013deb1546c97599caa928bb24ddb4098d5169f` 的 alignment blob，
+父提交 `10f06a710` 本身不含该未跟踪 JSON。版本化记录
+`deployments/perception/profiles/dmtac_graspgenx_alignment_v5_q0.json`
+保存原 blob、URDF、左右工具配置摘要、两侧 FK 核验范围和名义参数；原绝对路径没有带入生产绑定。
+其证据等级为 `offline_nominal_alignment`，不是物理抓稳或整 CAD/闭爪扫掠包络认证。
+
+离线对齐工具见 `utils/gripper_urdf_editor/README.md` 的“GraspGenX/DMTAC 对齐预览”。
+Tk、Qt 和 headless 共用 profile 初值和完整 6D TCP 解析；完整 pose 存在时优先于旧 z scalar。
+导出的 GUI JSON 是可审查提案，不会自动修改工具标定或应用到运行中的 planner。

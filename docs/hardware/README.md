@@ -117,6 +117,21 @@ bash scripts/run_pytest.sh -q hardware/quest_dev/tests
 [`B601-RS hardware commissioning`](./rebot_b601_rs_hardware_commissioning.md)。该文档中的
 position probe 仍属于 M 级操作，只能由现场操作者在完成安全检查后显式运行。
 
+本批版本化配置入口如下；配置可读取不代表已经取得真机验收或运动授权：
+
+- J3 交互：[v1](./profiles/b601_j3_interaction_v1.json)、
+  [v2](./profiles/b601_j3_interaction_v2.json)、
+  [连续运动](./profiles/b601_j3_continuous_motion_v1.json)。
+- J3 标定：[自动采集](./profiles/b601_j3_auto_calibration_v1.json)、
+  [恢复配置](./profiles/b601_j3_auto_calibration_recovery_v1.json)、
+  [局部辨识](./profiles/b601_j3_local_identification_v1.json)、
+  [支撑标定循环](./profiles/b601_j3_supported_calibration_cycle_v1.json)。
+- J2/J3 位姿与保持：[工作区标定](./profiles/b601_j2_j3_workspace_calibration_v1.json)、
+  [保持搜索](./profiles/b601_j2_j3_holding_search_v1.json)、
+  [四中心保持](./profiles/b601_j2_j3_four_centres_holding_v1.json)、
+  [协调保持](./profiles/b601_j2_j3_coordinated_holding_v1.json)、
+  [覆盖支撑](./profiles/b601_j2_j3_coverage_support_v1.json)。
+
 [`rebot_b601_rs_haptic_acceptance.md`](./rebot_b601_rs_haptic_acceptance.md) 给出无设备的
 数学/闭环效果验收命令，以及机械臂到货后从只读反馈、急停/watchdog、单关节 MIT、重力阻尼
 到低幅弹簧/虚拟墙的分阶段验收。当前只能执行 H0；H1–H8 均为 `NOT_RUN`，不构成真机运动

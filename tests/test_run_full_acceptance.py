@@ -193,6 +193,8 @@ def _assert_complete_run(
     assert (run_root / "mujoco-cache").is_dir()
     for index in range(shard_count):
         arguments = (sync_root / f"shard-{index}.args").read_text().splitlines()
+        assert arguments.count("scripts.pytest_native_memory") == 1
+        assert arguments[arguments.index("scripts.pytest_native_memory") - 1] == "-p"
         assert "not hardware" in arguments
         assert "--durations=3" in arguments
         assert f"cache_dir={run_root / f'shard-{index}-pytest-cache'}" in arguments

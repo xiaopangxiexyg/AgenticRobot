@@ -53,6 +53,7 @@ from agent_gateway.runtime.operation_store import (
     BoundedInMemoryAgentSkillOperationStore,
 )
 from agent_gateway.runtime.passive_read_executor import (
+    PassiveReadError,
     PassiveReadResult,
     PassiveReadSkillExecutor,
 )
@@ -2248,9 +2249,11 @@ def test_passive_read_result_rejection_retains_validator_diagnostic() -> None:
     "first line\nsecond line",
     "x" * 900,
 ])
+@pytest.mark.parametrize("structured_failure", (False, True))
 def test_required_output_passive_read_can_commit_failure_without_artifact(
     tmp_path,
     error_message,
+    structured_failure,
 ) -> None:
     clock = _ManualClock()
     base = _capability()
@@ -2329,6 +2332,10 @@ def test_required_output_passive_read_can_commit_failure_without_artifact(
     )
 
     def failed_read(_request, _operation) -> PassiveReadResult:
+        if structured_failure:
+            raise PassiveReadError(error_message, reason_code="fixture_bounded_search_failed",
+                diagnostic={"stage": "fixture_search", "counts": {"checked": 31},
+                            "budget_exhausted": False})
         raise RuntimeError(error_message)
 
     executor = PassiveReadSkillExecutor(
@@ -2370,22 +2377,29 @@ def test_required_output_passive_read_can_commit_failure_without_artifact(
         assert executor.wait(operation_id, timeout_sec=1.0)
         failed = service.operation_store.get(operation_id)
         assert failed is not None and failed.status == "failed"
-        assert failed.reason_code == "passive_read_executor_exception:RuntimeError"
-        assert failed.progress_summary["failure_diagnostic"] == {
-            "exception_type": "RuntimeError",
+        expected = {
+            "exception_type": "PassiveReadError" if structured_failure else "RuntimeError",
             "message": " ".join(error_message.split())[:512],
         }
+        if structured_failure:
+            expected.update(stage="fixture_search", counts={"checked": 31}, budget_exhausted=False)
+        assert failed.reason_code == ("fixture_bounded_search_failed" if structured_failure
+                                      else "passive_read_executor_exception:RuntimeError")
+        assert failed.progress_summary["failure_diagnostic"] == expected
         assert executor.failure_diagnostics == (
             {
                 "executor_id": "passive-reader-executor:required-output-failure",
                 "operation_id": operation_id,
-                "exception_type": "RuntimeError",
-                "message": " ".join(error_message.split())[:512],
+                **expected,
                 "failed_at": 10.0,
             },
         )
         assert failed.output_artifact_bindings == ()
         assert domain_port.calls == []
+        if structured_failure:
+            diagnostic_copy = executor.failure_diagnostics[0]
+            diagnostic_copy["counts"]["checked"] = 0
+            assert executor.failure_diagnostics[0]["counts"]["checked"] == 31
     finally:
         store.close()
 
@@ -2461,3 +2475,19 @@ def test_domain_hold_during_passive_read_never_binds_read_to_motion_port() -> No
     assert executor.wait_all(timeout_sec=0.0)
     terminal = service.operation_store.get(operation_id)
     assert terminal is not None and terminal.status == "cancelled"
+
+
+@pytest.mark.parametrize("diagnostic", ({"message": "override"}, {"exception_type": "override"},
+    {"nan": float("nan")}, {"object": object()}, {"too_large": "x" * 4096}, {1: "non-string-key"}))
+def test_passive_read_error_rejects_unbounded_or_invalid_facts(diagnostic):
+    with pytest.raises((TypeError, ValueError)):
+        PassiveReadError("failure", reason_code="fixture_failed", diagnostic=diagnostic)
+
+
+def test_passive_read_error_does_not_alias_mutable_provider_diagnostics():
+    details = {"counts": {"checked": 31}}
+    error = PassiveReadError("failure", reason_code="fixture_failed", diagnostic=details)
+    details["counts"]["checked"] = 0
+    projected = error.diagnostic
+    projected["counts"]["checked"] = 99
+    assert error.diagnostic == {"counts": {"checked": 31}}

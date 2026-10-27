@@ -496,6 +496,7 @@ def recompress_native_tactile_bundle_zstd_in_place(
             )
         created: list[Path] = []
         metadata_committed = False
+        original_metadata: tuple[tuple[Path, bytes], ...] = ()
         original_manifests: dict[Path, bytes] = {}
         source_stats: dict[Path, os.stat_result] = {}
         replacements_by_manifest: dict[Path, dict[str, dict[str, Any]]] = {}
@@ -626,47 +627,43 @@ def recompress_native_tactile_bundle_zstd_in_place(
                 Path(old_commit.tactile_component_ref).parent / "bundle_commit.cjson"
             )
             tactile_component_path = bundle_root / old_commit.tactile_component_ref
-            original_component = tactile_component_path.read_bytes()
-            original_tactile_commit = tactile_commit_path.read_bytes()
-            original_core_commit = core_commit_path.read_bytes()
-            try:
-                _atomic_write_canonical(
-                    tactile_component_path,
-                    updated_component.to_payload(),
-                    domain=TACTILE_BUNDLE_TACTILE_COMPONENT_FILE_DOMAIN_V1,
+            original_metadata = (
+                (tactile_component_path, tactile_component_path.read_bytes()),
+                (tactile_commit_path, tactile_commit_path.read_bytes()),
+                (core_commit_path, core_commit_path.read_bytes()),
+                (catalog_path, catalog_before_episode),
+            )
+            _atomic_write_canonical(
+                tactile_component_path,
+                updated_component.to_payload(),
+                domain=TACTILE_BUNDLE_TACTILE_COMPONENT_FILE_DOMAIN_V1,
+            )
+            _atomic_write_canonical(
+                tactile_commit_path,
+                updated_commit.to_payload(),
+                domain=TACTILE_BUNDLE_EPISODE_COMMIT_FILE_DOMAIN_V1,
+            )
+            _atomic_write_canonical(
+                core_commit_path,
+                updated_commit.to_payload(),
+                domain=TACTILE_BUNDLE_EPISODE_COMMIT_FILE_DOMAIN_V1,
+            )
+            _atomic_write_bytes(catalog_path, updated_catalog)
+            # Re-attach before deleting raw bytes.  This proves both commit
+            # halves and the updated episode's new payload hashes are
+            # coherent.  The idle path deliberately avoids re-reading
+            # historical payload bytes here; direct/offline callers retain
+            # the full validation default.
+            committed_attachment = attach_tactile_bundle(
+                core_root,
+                storage_root,
+                verify_payload_hashes=bool(verify_historical_payload_hashes),
+            )
+            if not verify_historical_payload_hashes:
+                committed_attachment.verify_payload_hashes_for_episodes(
+                    (attached_episode.legacy_episode_index,)
                 )
-                _atomic_write_canonical(
-                    tactile_commit_path,
-                    updated_commit.to_payload(),
-                    domain=TACTILE_BUNDLE_EPISODE_COMMIT_FILE_DOMAIN_V1,
-                )
-                _atomic_write_canonical(
-                    core_commit_path,
-                    updated_commit.to_payload(),
-                    domain=TACTILE_BUNDLE_EPISODE_COMMIT_FILE_DOMAIN_V1,
-                )
-                _atomic_write_bytes(catalog_path, updated_catalog)
-                # Re-attach before deleting raw bytes.  This proves both commit
-                # halves and the updated episode's new payload hashes are
-                # coherent.  The idle path deliberately avoids re-reading
-                # historical payload bytes here; direct/offline callers retain
-                # the full validation default.
-                committed_attachment = attach_tactile_bundle(
-                    core_root,
-                    storage_root,
-                    verify_payload_hashes=bool(verify_historical_payload_hashes),
-                )
-                if not verify_historical_payload_hashes:
-                    committed_attachment.verify_payload_hashes_for_episodes(
-                        (attached_episode.legacy_episode_index,)
-                    )
-                metadata_committed = True
-            except BaseException:
-                _atomic_write_bytes(tactile_component_path, original_component)
-                _atomic_write_bytes(tactile_commit_path, original_tactile_commit)
-                _atomic_write_bytes(core_commit_path, original_core_commit)
-                _atomic_write_bytes(catalog_path, catalog_before_episode)
-                raise
+            metadata_committed = True
 
             for source in source_stats:
                 source.unlink()
@@ -680,6 +677,10 @@ def recompress_native_tactile_bundle_zstd_in_place(
             )
         except BaseException:
             if not metadata_committed:
+                # Stop on any restore failure; remaining metadata may still
+                # reference the new manifests and compressed payloads.
+                for path, data in original_metadata:
+                    _atomic_write_bytes(path, data)
                 for path, data in original_manifests.items():
                     _atomic_write_bytes(path, data)
                 for target in created:

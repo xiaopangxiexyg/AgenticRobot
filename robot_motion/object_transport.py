@@ -7,9 +7,10 @@ cannot certify the swept volume of a held object.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from types import MappingProxyType
 from collections.abc import Mapping
+from dataclasses import dataclass
+import math
+from types import MappingProxyType
 
 import numpy as np
 
@@ -26,6 +27,49 @@ def rigid_pose(value, *, name: str) -> np.ndarray:
     result = pose.copy()
     result.setflags(write=False)
     return result
+
+
+def tool_goal_from_object_goal(reference_from_object_goal, tool_from_object) -> np.ndarray:
+    """Convert an observed object relation; no grasp or execution is inferred."""
+    goal = rigid_pose(reference_from_object_goal, name="object goal")
+    relation = rigid_pose(tool_from_object, name="observed tool_from_object")
+    with np.errstate(over="ignore", invalid="ignore"):
+        result = goal @ np.linalg.inv(relation)
+    return rigid_pose(result, name="derived tool goal")
+
+
+def object_translation_feedback_tool_goal(reference_from_tool, reference_from_object,
+                                          reference_from_object_goal, nominal_tool_goal,
+                                          *, maximum_correction_m: float = .003) -> np.ndarray:
+    """Bound a translation-only correction; never replace a grasp relation.
+
+    All four poses must share one reference frame and the measured pair must be
+    correlated. Rotation remains the nominal tool rotation. Both the step and
+    total offset from the original tool goal are bounded, not integrated.
+    Collision checking and the original frozen-relation guard remain callers'
+    responsibilities; this geometric proposal grants no execution authority.
+    """
+    if (isinstance(maximum_correction_m, (bool, np.bool_))
+            or not np.isfinite(maximum_correction_m) or not 0 < maximum_correction_m <= .003):
+        raise ValueError("Object feedback requires a positive correction bound at most 3mm")
+    tool = rigid_pose(reference_from_tool, name="measured tool")
+    obj = rigid_pose(reference_from_object, name="measured object")
+    goal = rigid_pose(reference_from_object_goal, name="immutable object goal")
+    nominal = rigid_pose(nominal_tool_goal, name="nominal tool goal")
+    if math.hypot(*(tool[:3, 3]-nominal[:3, 3])) > maximum_correction_m:
+        raise ValueError("Object feedback requires the tool inside the nominal correction region")
+    desired = tool[:3, 3] + goal[:3, 3] - obj[:3, 3]
+    offset = desired - nominal[:3, 3]
+    length = math.hypot(*offset)
+    if length > maximum_correction_m:
+        desired = nominal[:3, 3] + offset * (maximum_correction_m/length)
+    step = desired-tool[:3, 3]
+    length = math.hypot(*step)
+    if length > maximum_correction_m:
+        desired = tool[:3, 3] + step * (maximum_correction_m/length)
+    result = nominal.copy()
+    result[:3, 3] = desired
+    return rigid_pose(result, name="bounded object translation feedback tool goal")
 
 
 @dataclass(frozen=True)
@@ -85,8 +129,7 @@ class GraspedObjectObservation:
         return np.linalg.inv(self.reference_from_tool) @ self.reference_from_object
 
     def tool_goal(self, reference_from_object_goal: np.ndarray) -> np.ndarray:
-        goal = rigid_pose(reference_from_object_goal, name="object goal")
-        return goal @ np.linalg.inv(self.tool_from_object)
+        return tool_goal_from_object_goal(reference_from_object_goal, self.tool_from_object)
 
     def require_current(self, *, now: float, scene_revision: int, reference_frame_id: str,
                         object_id: str, side: str, max_age_sec: float = .2) -> None:

@@ -68,6 +68,25 @@ boundary. The live store becomes poisoned and cannot append or seal again;
 the caller must close and reopen it so a complete newline-delimited record can
 be replayed, or a torn record can fail closed.
 
+采集侧的普通 JSON inventory、压缩 manifest 和恢复 journal 由 `atomic_json.py`
+共享临时文件写入、文件同步、原子替换及临时文件清理。调用方仍保留原有的编码和
+目录同步策略：bundle 使用目录类型检查，capture recovery 保留目录缺失检查，
+modality storage 保留受限的目录同步重试。替换前失败不发布新内容；替换后目录同步
+失败仍向调用方报错，但文件已经可见，不能假定尚未发布或已经回滚，也不能据此报告
+事务成功；恢复由原事务 owner 决定。事务准入、
+不可变 canonical 文件发布和流式数据写入各自保留现有 owner。
+
+触觉重压缩在尝试发布 manifest 前登记回收责任。发布或后续验证失败时，先恢复原始
+manifest，再移除本轮生成的压缩载荷；目录同步失败也必须走这条恢复路径，因为原子
+替换可能已经生效。恢复失败时继续报错并保留 raw 和新压缩载荷，不删除可能仍被引用
+的数据。正常成功后的校验、原始载荷移除和 receipt 顺序不变。
+
+Native tactile bundle 重压缩也使用一个恢复出口，按原 metadata、原 manifests、
+本轮压缩载荷的顺序处理；任一恢复失败即中断后续清理，避免内层恢复失败后外层仍删掉
+被引用的数据。恢复快照逐 Episode 建立，不回退此前已成功提交的 Episode。恢复失败时
+metadata 图可能仍不一致，两套载荷保留不代表完整回滚；成功验证后的 raw 回收失败则
+保留已提交的新图，不回退到可能引用已删除 raw 的旧版本。
+
 Capture-time progress effective time is monotonic within the bound Episode
 clock. Nested Hold/Resume operation times must also be knowable by the receipt's
 availability time. The live reducer and read-time resolver enforce the same
@@ -149,6 +168,7 @@ collection_runtime/
   progress/           # online progress + distinct sealed annotation stores
     profiles/         # managed linear/tree task profile assets and catalog
   async_writer.py
+  atomic_json.py      # atomic JSON replacement with caller-owned directory sync
   dataset_episode_maintenance.py
   dataset_layout.py
   episode_curation.py # application-neutral external curation sidecar store

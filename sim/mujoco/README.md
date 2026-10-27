@@ -30,6 +30,52 @@ python -m sim.mujoco.run_control \
   --mjcf-out /tmp/rm65_bimanual_physics_v1.xml
 ```
 
+## 完整 TCP 规划链
+
+`sim.mujoco.deploy.planned_tcp_motion` 的 `MujocoTcpPlanGoal`、`plan_chain` 和
+`refine_pending_chain` 复用原 IK、碰撞查询和 C2 重定时，先规划所有阶段，再保留一个完整
+pending handle。阶段在已认证的零速、零加速度节点拼接，原阶段约束和接触权限由同一个
+lower reference cursor 选择；失败不留下可执行前缀。预览不能激活，也不能覆盖现有 pending
+plan；细化只在最终校验、预算和场景检查通过后原子替换原 handle。
+
+`MujocoAgentPreparedTcpPoseSkillLifecycle` 通过原 Skill 生命周期消费该计划，不重新解 IK，
+不跳过 measured arrival、碰撞、另一臂 HOLD、取消及最终输出门禁。普通 TCP 与携物路径
+保留原臂侧和实时 payload 校验。native 查询和执行统一使用 rig→planner 的锁序；完整链
+预算包括等待，轨迹长度在固定时钟网格分配前有界。该内部适配器不授予公共 Route 或运动权限；
+MuJoCo 快速抓取的冻结采集和公共配对入口仍需完成后续装配。
+
+## 冻结状态的候选路径查询
+
+`MujocoPlannedTcpMotion` 可显式接收一份完整、有限的 `source_model_qpos`，内部复制并冻结，
+复用现有场景捕获锁、私有碰撞查询、端点搜索和 C2 重定时。冻结查询的计划不能通过
+`activate` 激活；清理仅影响该查询实例，原执行实例的待执行计划与安全包络不变。
+
+`plan_candidates` 对最多 64 个显式候选按“最大关节偏移、认证时长、总关节行程”依次排名，
+在原总预算内返回已验证的最佳计划；rig 和 planner 锁等待均计入预算。可选的当前种子
+IK 预估只调整访问顺序，不删除候选或代替碰撞检查。严格劣于已有结果的端点下界可以
+跳过路径搜索，诊断会明确记录 `path_search_skipped`；`all_candidates_checked` 包含这类
+已作出支配判断的候选，不表示每个候选都完成路径认证。这是有限采样比较，不是全局最优。
+
+查询可显式启用按平移/旋转容差归一化的 IK 目标，使用已绑定 TCP 偏移同时调整误差和
+雅可比。默认端点 IK、原关节限位与分支策略保留；取消、绝对 deadline、路径质量、
+轨迹网格上限及原执行激活/实时检查仍由原边界执行。安全包络的 Route 预览不激活包络，
+遇到歧义、执行中状态或参考更换会拒绝。默认关闭的上层查询和锚点 Skill 复用这条边界：
+`--enable-object-goal-queries` 需同时启用安全 TCP，发布只读的对象上方候选查询；
+`--enable-surface-anchors` 需 Artifact 存储和对象查询，发布留存表面点、锚点查询及空间目标计算。
+`--enable-relation-goal-queries` 在同一锚点上增加一般关系采样。查询使用完整冻结 qpos，
+不修改实测状态、活动安全包络或执行实例的 pending plan，也不授予运动权限。
+
+表面锚点 v1 沿用实时像素反投影；显式 `--enable-surface-anchor-v2` 使用原相关 RGB-D cut，
+提供 exact 或分割 mask 内部选点，默认仍为 prompt-nearest；max-clearance-medoid 需显式
+选择 `--surface-anchor-selection-policy max_clearance_medoid`。显式 v3 再要求 paired RGB-D v3、
+segmentation v3 和至少三个留存操作，复用原 JPEG、NPY 和原生产者时间，不重新采集或调用模型。
+所有消费方核验完成生产者、client/session/manifest、revision、frame/clock 和原 Artifact 字节。
+
+`--safe-tcp-motion-profile` 默认 `local_step`，保留原 0.10 m / 15° / 30 s；显式
+`object_relation` 为安全规划 Route 选择 0.50 m / π / 90 s，`object_relation_precise` 同时
+选择 3 mm / 1° 到达容差及 TCP 容差归一化 IK。普通、方向步进和观测点 Route 保留原范围。
+这些是离线仿真配置和有限采样结果，不代表连续路径全局最优或真机到达/抓取验收。
+
 ## Real-aligned VIVE position-teleop debug
 
 The shared position path can be exercised without a real RM65 through the
@@ -318,6 +364,56 @@ This is an interactive GLFW viewer, so Linux requires `DISPLAY` or
 `WAYLAND_DISPLAY`. `MUJOCO_GL=egl` and `MUJOCO_GL=osmesa` are offscreen render
 options and do not provide an interactive desktop window.
 
+## 显式携物几何与规划绑定
+
+`sim.mujoco.deploy.payload_motion` 提供可选的 `MujocoPayloadBinding` 与
+`MujocoPayloadProjector`。`MujocoJointSceneOracle(..., payload_binding=binding)`
+复用原有碰撞查询／扫掠；候选只在私有 `MjData` 中移动完整物体碰撞几何，不修改真实场景。
+本批支持顶层自由刚体的 box／convex mesh，以及明确命名的固定 plane／box 支撑面。
+未支持的物体形状会拒绝，不自动改成较小碰撞体。
+
+绑定必须由调用方在原有 rig 场景锁内，从同一 cut 的标定 TCP、实测闭合和双侧传感器接触
+构造。冻结关系使用物体原生 body frame，不是质心或包围盒；后续捕获必须继续传入原始关系，
+不能通过重新锚定掩盖滑动。查询 source 必须与绑定的完整 qpos cut 一致；终端接触 binding
+和携物 binding 不能混用。
+
+物理 timestep 纳入绑定身份；改变 timestep 或更换 live `MjData` owner 后，原绑定不可继续使用。
+实测入口只接受当前 live cut 或其 time／qpos／qvel／mocap／equality 状态一致的私有副本，
+不能用历史或构造数据推进实测接触历史。候选源也绑定冻结的 mocap／equality 几何状态，
+避免只复制 qpos 而漏掉可移动环境几何。
+
+`check_measured` 及 `contact_oracle` 检查实际物体、冻结的 3mm／2deg 关系和全部原生几何。
+拉取测量与物理 guard 复用同一个实测接触历史；预测查询使用独立历史，不能延长真实证据。
+仅对指定传感器／物体及支撑面按阶段配置接触许可，保持场景 1mm 硬穿透边界。
+单物理步接触缺口不能延长成多步，也不能豁免物体滑移或其他碰撞。
+直接 projector 点查询也检查冻结 cut；扫掠起点必须是当前实测 cut。扫掠的源几何／关系检查
+不发布新的实测历史或调用外部观测器，不是完整抓持验证或执行授权。
+
+`MujocoPlannedTcpMotion.plan(..., payload_binding=binding)` 将绑定纳入原有 IK、
+BiRRT-Connect、C2 重定时和逐参考检查，仍返回本实例独占的不可变计划。
+携物查询使用绑定的冻结 cut；显式 preview 不替换待执行计划，也不能被激活。
+携物 preview 同样拒绝不同源 cut；如需当前新状态，须在原 rig 锁内重新捕获绑定，
+继续传入原始手物关系，不能用任意 preview qpos 绕过冻结来源。
+标定 world-TCP 必须与本实例所选左右臂的执行 TCP 一致，不能用另一只手的绑定规划。
+
+激活时复核模型、两臂起点和当前实测关系，只有检查通过后才把绑定的同一个实测 oracle
+挂到既有 position rig 的附加物理 guard；canonical guard 仍先执行。
+同一个附加 guard 在每次 `mj_step` 前后都运行；步后违规立即保留具体碰撞对并锁存，
+不能等到下一步才拒绝，也不能先向连续观测器发布该步为正常测量。没有附加绑定时，
+仍只执行原 canonical 检查；硬穿透限制、控制频率和物理参数均不改变。
+逐参考 resolve 在原 rig 锁内复核实测并复制完整当前 `MjData`，包括 time、qvel、
+mocap 和 equality 输入，再检查被动臂、原有 configuration constraint 及完整携物扫掠。
+冻结查询与当前扫掠各自保留来源要求；当前扫掠不重新锚定，也不发布候选的接触历史。
+新障碍、滑移、错误参考或失效绑定均拒绝，不投影成另一条未经规划的指令。
+
+`clear()` 撤销本次计划、参考和附加 guard，重复调用无副作用；绑定本身的实测接口及
+原 observer 不被清除，调用方继续负责释放前后的持续观测。
+这一层不拥有 physics、调度或 dispatch，不证明抓持成功，也不授予携物执行权限。
+本层不装配 Gateway Route；显式应用接线见
+[Gateway 携物运动说明](../../agent_gateway/README.md#显式携物目标mujoco)。原有运动与单帧默认行为不变。
+该 Route 必须成套绑定同一 observer、HOLD／取消／释放／close，并完成原生验收；
+不能把 `approach_grasp_contact` 当作携物抬升接口。
+
 ## DMTAC CAD 方块接触诊断（仅离线）
 
 ```bash
@@ -354,6 +450,14 @@ weld、抓取 latch、qpos 强制回放或摩擦覆盖。80 g 是可改的**仿�
 这不是完整机械臂路径、Gateway Skill 或 Agent 验收。旧版平行夹爪的接触测试通过，
 也不能替代当前六关节 CAD／DMTAC 的动力学验收。完整诊断完成但任一试抬不通过时
 退出码为 2，不能仅凭程序执行完毕宣称抓取成功。
+
+当前 70 mm 安装后 CAD 任务采用 **0.25 ms（4000 Hz）** 物理步长，以解析 2 ms
+刚性 mimic／接触约束。保留的倾斜擦边抓姿在原 1 ms 步长下可复现闭爪穿透故障。
+本改动只细化此任务的积分分辨率；策略、参考和命令时钟、摩擦、驱动力、行程、
+几何及原 1 mm 硬穿透门禁均不改变。稳定成功窗口仍为 0.03 s，settle 仍为 1 s；
+按秒换算物理 tick，不能继续将 1000 tick 当作一秒。其他历史任务保留自身时钟。
+夹爪判停同时读取原插值器与实测关节速度，默认实测速度不超过 0.02 rad/s；
+插值器目标已停止本身不能证明 CAD 关节已停止。这仍是仿真接触配置，不是真机标定。
 
 ### 可选的传感器外观覆盖
 

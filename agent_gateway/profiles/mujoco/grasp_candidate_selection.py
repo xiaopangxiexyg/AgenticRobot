@@ -49,6 +49,27 @@ class MujocoGraspSelectionConfig:
             raise ValueError("Selection candidate budget must be a positive integer.")
 
 
+def mujoco_grasp_configuration_constraint(application, bundle, contract):
+    """Preview the exact existing envelope without acquiring motion authority."""
+    safety = application.tcp_pose_envelope_runtime
+    entry = next(item for item in bundle.route_manifest.skill_routes
+        if item.route.semantic_content_hash == contract.evaluation_plan.route_hash)
+    refs = entry.deployment_binding.safety_envelope_refs
+    if len(refs) != 1:
+        raise ValueError("Grasp preview requires one exact deployment envelope.")
+    planner = application.target.planned_tcp_motion
+
+    def check(model_qpos, pair):
+        pose = xyzquat_to_pose_matrix(planner.pose_for_configuration(model_qpos, pair))
+        result = safety.preview_for_envelope({"right": pose},
+            deployment_envelope_hash=refs[0].content_hash)
+        return JointConfigurationCheck(safe=not result.modified_sides, minimum_distance_m=None,
+            reason=None if not result.modified_sides else "tcp_envelope_blocked",
+            metadata=result.to_payload())
+
+    return check, refs[0].content_hash
+
+
 class MujocoGraspCandidateSelector:
     """Preview a bounded full approach chain, without activating any plan.
 
@@ -74,23 +95,7 @@ class MujocoGraspCandidateSelector:
             raise ValueError("Near pose is outside the bound terminal contact corridor.")
 
     def _constraint(self, contract):
-        safety = self.application.tcp_pose_envelope_runtime
-        entry = next(item for item in self.bundle.route_manifest.skill_routes
-            if item.route.semantic_content_hash == contract.evaluation_plan.route_hash)
-        refs = entry.deployment_binding.safety_envelope_refs
-        if len(refs) != 1:
-            raise ValueError("Grasp preview requires one exact deployment envelope.")
-        planner = self.application.target.planned_tcp_motion
-
-        def check(model_qpos, pair):
-            pose = xyzquat_to_pose_matrix(planner.pose_for_configuration(model_qpos, pair))
-            result = safety.preview_for_envelope({"right": pose},
-                deployment_envelope_hash=refs[0].content_hash)
-            return JointConfigurationCheck(safe=not result.modified_sides, minimum_distance_m=None,
-                reason=None if not result.modified_sides else "tcp_envelope_blocked",
-                metadata=result.to_payload())
-
-        return check, refs[0].content_hash
+        return mujoco_grasp_configuration_constraint(self.application, self.bundle, contract)
 
     def __call__(self, candidates, target_point, maximum):
         del target_point  # Geometry/target membership was already admitted upstream.

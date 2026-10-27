@@ -16,6 +16,7 @@ from dataset_interface.streams import (
     load_native_stream_episode,
 )
 from robot_motion.runtime.observation_cut import ObservationSampleRef
+from collection_runtime import stream_sink
 from collection_runtime.stream_sink import NativeStreamEpisodeWriter
 
 
@@ -135,6 +136,7 @@ def test_native_stream_episode_round_trip_and_idempotent_sample(tmp_path) -> Non
         legacy_episode_index=3,
         contracts={contract.stream_id: contract},
     )
+    assert not writer.ingestion_frozen
     payload = np.linspace(0.0, 0.5, 6, dtype=np.float32)
     first = writer.append_observation_sample(
         _sample(0),
@@ -162,6 +164,7 @@ def test_native_stream_episode_round_trip_and_idempotent_sample(tmp_path) -> Non
         sealed_at=10.2,
         sealed_clock_domain_id="control.monotonic",
     )
+    assert writer.ingestion_frozen
 
     stream_range = manifest.stream_ranges[0]
     assert stream_range.sample_count == 2
@@ -187,6 +190,93 @@ def test_native_stream_episode_round_trip_and_idempotent_sample(tmp_path) -> Non
             written_at=10.3,
             written_clock_domain_id="control.monotonic",
         )
+
+
+@pytest.mark.parametrize("freeze_before_close", [False, True])
+def test_native_stream_freeze_fact_remains_readable_after_close(
+    tmp_path, freeze_before_close
+) -> None:
+    contract = _contract("human.left_hand_q6")
+    writer = NativeStreamEpisodeWriter(
+        tmp_path,
+        episode_uuid="freeze-close",
+        legacy_episode_index=0,
+        contracts={contract.stream_id: contract},
+    )
+    try:
+        assert not writer.ingestion_frozen
+        if freeze_before_close:
+            writer.freeze_ingestion()
+        writer.close_unsealed()
+        writer.close_unsealed()
+        assert writer.ingestion_frozen is freeze_before_close
+        with pytest.raises(AttributeError):
+            writer.ingestion_frozen = not freeze_before_close
+    finally:
+        writer.close_unsealed()
+
+
+def test_native_stream_freeze_fact_requires_every_index_fsync(tmp_path, monkeypatch) -> None:
+    contracts = [_contract("human.left_hand_q6"), _contract("human.right_hand_q6")]
+    writer = NativeStreamEpisodeWriter(
+        tmp_path,
+        episode_uuid="freeze-retry",
+        legacy_episode_index=0,
+        contracts={contract.stream_id: contract for contract in contracts},
+    )
+    real_fsync = stream_sink.os.fsync
+    observed_freeze_state = []
+
+    def fail_second_fsync(fd):
+        observed_freeze_state.append(writer.ingestion_frozen)
+        if len(observed_freeze_state) == 2:
+            raise OSError("injected index sync failure")
+        real_fsync(fd)
+
+    try:
+        monkeypatch.setattr(stream_sink.os, "fsync", fail_second_fsync)
+        with pytest.raises(OSError, match="injected index sync failure"):
+            writer.freeze_ingestion()
+        assert not writer.ingestion_frozen
+        assert observed_freeze_state == [False, False]
+        writer.freeze_ingestion()
+        assert writer.ingestion_frozen
+        assert observed_freeze_state == [False, False, False, False]
+        writer.freeze_ingestion()
+        assert len(observed_freeze_state) == 4
+    finally:
+        writer.close_unsealed()
+
+
+def test_native_stream_failed_manifest_publish_retains_freeze_fact(
+    tmp_path, monkeypatch
+) -> None:
+    contract = _contract("human.left_hand_q6")
+    writer = NativeStreamEpisodeWriter(
+        tmp_path,
+        episode_uuid="seal-retry",
+        legacy_episode_index=0,
+        contracts={contract.stream_id: contract},
+    )
+
+    def fail_publish(path, payload):
+        raise OSError("injected manifest publish failure")
+
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(stream_sink, "_publish_immutable", fail_publish)
+            with pytest.raises(OSError, match="injected manifest publish failure"):
+                writer.seal(sealed_at=1.0, sealed_clock_domain_id="local_monotonic")
+        assert writer.ingestion_frozen
+        with pytest.raises(RuntimeError, match="frozen"):
+            writer.append_observation_sample(
+                _sample(0), np.zeros(6, dtype=np.float32),
+                written_at=1.1, written_clock_domain_id="local_monotonic",
+            )
+        writer.seal(sealed_at=2.0, sealed_clock_domain_id="local_monotonic")
+        assert writer.ingestion_frozen
+    finally:
+        writer.close_unsealed()
 
 
 def test_native_stream_reader_rejects_tampered_index(tmp_path) -> None:
