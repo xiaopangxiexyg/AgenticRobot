@@ -1173,6 +1173,7 @@ class MujocoPlannedTcpMotion:
         constraint_identity: str | None = None,
         normalize_ik_objective: bool = False,
         prioritize_current_seed: bool = False,
+        payload_binding: MujocoPayloadBinding | None = None,
     ) -> MujocoTcpCandidateSelection:
         """Rank sampled candidates without motion, retaining the selected owned plan.
 
@@ -1190,6 +1191,12 @@ class MujocoPlannedTcpMotion:
             raise ValueError("Candidate planning requires 1..64 explicit poses.")
         if not isinstance(prioritize_current_seed, bool):
             raise TypeError("prioritize_current_seed must be a bool.")
+        if payload_binding is not None and not isinstance(payload_binding, MujocoPayloadBinding):
+            raise TypeError("payload_binding must be a measured MujocoPayloadBinding.")
+        if payload_binding is not None and self._source_model_qpos is not None:
+            raise ValueError("Payload candidate planning requires the live owned planner.")
+        if payload_binding is not None and prioritize_current_seed:
+            raise ValueError("Payload candidate scheduling requires full guarded plans.")
         if max_reference_count is not None and (type(max_reference_count) is not int or max_reference_count <= 0):
             raise ValueError("Reference count bound must be a positive integer.")
         if isinstance(time_budget_sec, bool) or not math.isfinite(time_budget_sec) or time_budget_sec <= 0:
@@ -1241,6 +1248,7 @@ class MujocoPlannedTcpMotion:
                                 cancel_requested=cancelled_or_expired,
                                 configuration_constraint=configuration_constraint,
                                 constraint_identity=constraint_identity,
+                                payload_binding=payload_binding,
                                 deadline_monotonic=deadline,
                                 path_search_time_budget_sec=min(path_search_time_budget_sec, remaining),
                                 **rank_bound)

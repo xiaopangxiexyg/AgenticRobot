@@ -1073,3 +1073,43 @@ def test_payload_timestep_change_invalidates_active_guard_without_dispatch(monke
     np.testing.assert_array_equal(scene.data.qpos, before)
     assert installed["oracle"] is binding._measured_oracle
     planner.clear()
+
+
+@pytest.mark.integration
+def test_payload_candidate_selection_keeps_one_guarded_plan_without_motion(monkeypatch):
+    scene = _scene(table=True)
+    binding = _binding(scene, support=_support())
+    planner, installed = _planner(scene, monkeypatch)
+    before = (scene.data.qpos.copy(), scene.data.qvel.copy(), float(scene.data.time))
+    goals = [(0., 0., .43, 0., 0., 0., 1.)] * 2
+    selection = planner.plan_candidates(
+        goals, translation_tolerance_m=.001, rotation_tolerance_rad=.01,
+        cancel_requested=lambda: False, payload_binding=binding,
+        time_budget_sec=8., path_search_time_budget_sec=3.)
+    assert selection.candidate_index == 0 and selection.all_candidates_checked
+    assert selection.plan.payload_binding is binding
+    assert planner.owns_pending_plan(selection.plan)
+    assert installed["oracle"] is None and not planner.active
+    np.testing.assert_array_equal(scene.data.qpos, before[0])
+    np.testing.assert_array_equal(scene.data.qvel, before[1])
+    assert float(scene.data.time) == before[2]
+    planner.activate(selection.plan)
+    assert installed["oracle"] is binding.contact_oracle(scene)
+    planner.clear()
+    assert installed["oracle"] is None
+    with pytest.raises(TypeError, match="MujocoPayloadBinding"):
+        planner.plan_candidates(goals, translation_tolerance_m=.001,
+            rotation_tolerance_rad=.01, cancel_requested=lambda: False,
+            payload_binding=True)
+    with pytest.raises(ValueError, match="full guarded plans"):
+        planner.plan_candidates(goals, translation_tolerance_m=.001,
+            rotation_tolerance_rad=.01, cancel_requested=lambda: False,
+            payload_binding=binding, prioritize_current_seed=True)
+    frozen = motion.MujocoPlannedTcpMotion(
+        rig=planner.rig, task_config=planner.task_config,
+        pose_projector=planner.pose_projector, reference_hz=planner.reference_hz,
+        motion_side="right", source_model_qpos=scene.data.qpos.copy())
+    with pytest.raises(ValueError, match="live owned planner"):
+        frozen.plan_candidates(goals, translation_tolerance_m=.001,
+            rotation_tolerance_rad=.01, cancel_requested=lambda: False,
+            payload_binding=binding)
