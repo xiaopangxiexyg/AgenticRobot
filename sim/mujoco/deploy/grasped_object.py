@@ -209,6 +209,13 @@ class MujocoGraspedObjectObserver:
                         {"support_body_name": place_support_body_name})
             stamp, obj, tcp, sides, support, other, measured, com = self._capture(
                 scene, source_data, **selected)
+            if (self._anchor is None and self.contact_verified_close and establish
+                    and phase == "lift" and target == 1.0 and np.isfinite(measured)
+                    and 0. <= measured <= 1. and not self.gripper_settled()):
+                # An early explicit lift must not poison a close that has not
+                # finished. Once anchored, missing contacts still latch below.
+                raise ObjectMotionPreconditionError(
+                    "Target-bound close must settle before the lift relation is frozen.")
             if target != 1.0 or not self.measured_closed(measured):
                 raise ObjectRelationInvalidated("Actual closed command and measured closure are required.")
             if support and phase == "carry" and not self._verified:

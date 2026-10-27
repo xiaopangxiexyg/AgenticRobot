@@ -57,14 +57,29 @@ def test_contact_verified_close_waits_for_settled_hand_before_freezing_relation(
     np.testing.assert_array_equal(observer.latest.tool_from_object, frozen)
 
 
-def test_target_bound_explicit_lift_cannot_freeze_a_moving_close():
+@pytest.mark.parametrize("measured,sides", [
+    (.045, (True, True)), (.05, (True, True)), (.2, (True, False)), (.2, (True, True)),
+])
+def test_target_bound_explicit_lift_cannot_freeze_a_moving_close(measured, sides):
     plant, observer = _observer(track_close_contacts=True, contact_verified_close=True)
-    plant.measured, plant.settled = .2, False
+    plant.measured, plant.settled, plant.sides = measured, False, sides
     with pytest.raises(ObjectMotionPreconditionError, match="must settle"):
         observer.observe(phase="lift", establish=True)
     assert observer.latest is None and observer._anchor is None and observer._failure is None
-    plant.settled = True
+    plant.settled, plant.sides = True, (True, True)
     assert observer.observe(phase="lift", establish=True).status == "contact_secured"
+
+
+def test_established_target_bound_relation_still_latches_contact_loss_when_hand_unsettles():
+    plant, observer = _observer(track_close_contacts=True, contact_verified_close=True)
+    observer.observe(phase="lift", establish=True)
+    plant.time, plant.settled, plant.sides = .01, False, (True, False)
+    with pytest.raises(ObjectRelationInvalidated, match="Both target sensor contacts"):
+        observer.observe(phase="lift")
+    assert observer._failure is not None
+    plant.settled, plant.sides = True, (True, True)
+    with pytest.raises(ObjectRelationInvalidated, match="invalidated"):
+        observer.observe(phase="lift")
 
 
 def test_unbound_close_retains_legacy_aperture_establishment():
