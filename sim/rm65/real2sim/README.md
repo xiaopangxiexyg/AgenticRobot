@@ -92,7 +92,14 @@ core and MuJoCo adapter used for the 20260721 fit; tests compare those hashes to
 fixed historical values rather than silently reinterpreting the fit against
 the current files.
 
-当前 SAM3 默认与外部定位 owner v2 整合使用独立绑定
+当前锚点运动 v2–v4、预抓取连接比较与夹爪资源生命周期整合使用独立绑定
+`artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261027_motion_gripper_v1.json`。
+它继承153项输入，更新其中9项源码身份，另纳入已改动的 Real gripper resource owner，
+共154项输入／151项Python源码，固定于 `6c8f9289d4ad`。该源码的CLI、夹爪、手动维护及
+领域边界消费者验收572通过、零跳过／失败；完整组合门禁另行记录。
+历史39份绑定和标定原字节保留，v4 fit与timing不变，不新增物理响应或held-out资格。
+
+历史 SAM3 默认与外部定位 owner v2 整合使用独立绑定
 `artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261027_sam3_default_v1.json`。
 它继承下面只读默认绑定的全部153项输入／150项Python源码，更新其中7项源码身份，
 固定于 `8bdf790dde02`。固定源码的离线 owner／消费者验收590通过、零跳过／失败；
