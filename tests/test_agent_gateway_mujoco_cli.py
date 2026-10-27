@@ -46,6 +46,8 @@ def test_motion_side_is_explicit_fixed_and_defaults_to_right():
     ["--enable-segmentation-geometry-v3"],
     ["--enable-observed-point-motion"],
     ["--enable-anchor-motion-v2"],
+    ["--enable-anchor-region-motion-v3"],
+    ["--enable-anchor-hover-motion-v4"],
     ["--history-root", "/unused/history"],
     ["--segmentation-asset-bundle", "/unused/segmentation"],
     ["--sam3-endpoint", "http://127.0.0.1:8114"],
@@ -663,12 +665,22 @@ def test_surface_anchor_v2_is_opt_in_and_rejected_before_resource_startup(capsys
 def test_anchor_motion_cli_requires_explicit_sensor_safe_dependencies(capsys):
     parser = build_parser()
     assert parser.get_default("enable_anchor_motion_v2") is False
+    assert parser.get_default("enable_anchor_region_motion_v3") is False
+    assert parser.get_default("enable_anchor_hover_motion_v4") is False
     assert parser.get_default("enable_observed_point_motion") is False
     common = ["--socket-path", "/not-used/gateway.sock", "--task-config", "/not-used/task.json"]
     with pytest.raises(SystemExit) as missing_anchor:
         gateway_cli.main([*common, "--enable-anchor-motion-v2"])
     assert missing_anchor.value.code == 2
     assert "requires observed-point motion and surface anchor v2" in capsys.readouterr().err
+    with pytest.raises(SystemExit) as missing_region:
+        gateway_cli.main([*common, "--enable-anchor-region-motion-v3"])
+    assert missing_region.value.code == 2
+    assert "requires --enable-anchor-motion-v2" in capsys.readouterr().err
+    with pytest.raises(SystemExit) as missing_hover:
+        gateway_cli.main([*common, "--enable-anchor-hover-motion-v4"])
+    assert missing_hover.value.code == 2
+    assert "requires --enable-anchor-motion-v2" in capsys.readouterr().err
     with pytest.raises(SystemExit) as missing_observation:
         gateway_cli.main([*common, "--enable-observed-point-motion"])
     assert missing_observation.value.code == 2
@@ -676,7 +688,8 @@ def test_anchor_motion_cli_requires_explicit_sensor_safe_dependencies(capsys):
 
 
 @pytest.mark.parametrize("service_flags", [[], ["--sam3-endpoint", "http://127.0.0.1:8114"]])
-def test_anchor_motion_cli_accepts_explicit_sam3_and_sensor_safe_assembly(monkeypatch, tmp_path, service_flags):
+@pytest.mark.parametrize("version_flags", [[], ["--enable-anchor-region-motion-v3"], ["--enable-anchor-hover-motion-v4"]])
+def test_anchor_motion_cli_accepts_explicit_sam3_and_sensor_safe_assembly(monkeypatch, tmp_path, service_flags, version_flags):
     from deployments.perception.sam3_service import Sam3ServiceLocalizer
     from agent_gateway.profiles.mujoco.motion_observed_scene import MujocoObservedSafeMotionConfig
 
@@ -704,11 +717,17 @@ def test_anchor_motion_cli_accepts_explicit_sam3_and_sensor_safe_assembly(monkey
             "--enable-safe-tcp-pose", "--safe-tcp-motion-profile", "object_relation",
             "--enable-object-goal-queries", "--enable-surface-anchors",
             "--enable-surface-anchor-v2", "--enable-observed-point-motion",
-            "--enable-anchor-motion-v2", "--safe-motion-observation-urdf", str(urdf),
+            "--enable-anchor-motion-v2", "--enable-anchor-region-motion-v3",
+            "--enable-anchor-hover-motion-v4",
+            "--safe-motion-observation-urdf", str(urdf),
             "--safe-motion-observation-collision-scene-profile", "dual_arm_hand_proxy_dmtac_grasp",
-            "--safe-motion-observation-role", "main"])
+            "--safe-motion-observation-role", "main", *version_flags])
     assert received["enable_observed_point_motion"] is True
     assert received["enable_anchor_motion_v2"] is True
+    assert received["enable_anchor_region_motion_v3"] is ("--enable-anchor-region-motion-v3" in version_flags)
+    assert received["enable_anchor_hover_motion_v4"] is ("--enable-anchor-hover-motion-v4" in version_flags)
+    assert received["enable_anchor_region_motion_v3"] is True
+    assert received["enable_anchor_hover_motion_v4"] is True
     assert received["enable_surface_anchor_v2"] is True
     assert isinstance(received["segmentation_localizer"], Sam3ServiceLocalizer)
     assert not received["segmentation_localizer"].started

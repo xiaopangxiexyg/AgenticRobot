@@ -1670,6 +1670,25 @@ revision 和帧图，读取当前 TCP 并保持其朝向，再经
 程序化构造的 MuJoCo 原生运动已验收；CLI 的参数装配已做离线回归。
 RPent 组合与实际 Agent 任务、RealMan 动作 Route 须分别验收。
 
+显式 `enable_anchor_region_motion_v3=True`（CLI 为
+`--enable-anchor-region-motion-v3`）在 v2 家族之上发布同一 Skill ID 的 v3。
+请求只含锚点操作 ID、名义参考系偏移、横向半径与额外高度。下层在一次新采集的
+RGB-D 和双臂实测关节场景内，按固定顺序检查名义点、加高点、加高后的 X/Y
+正负偏移，共最多六个去重候选；第一个通过原安全包络、IK、碰撞、完整路径和
+运动质量门禁的候选才由原执行 owner 发送。整个搜索限时，任一候选的拒绝
+不改变关节或授权，所有候选失败时确认 HOLD。成功结果给出选中的偏移、
+到达误差和来源。默认 v1/v2 不变，也不把旧只读几何查询的静态场景路径
+当作 RGB-D 场景的执行证明。
+
+显式 `enable_anchor_hover_motion_v4=True`（CLI 为
+`--enable-anchor-hover-motion-v4`）发布同一 Skill ID 的语义悬停版本。
+上层只填实测表面点来源、`hover_height_m`（名义上方高度）、
+`lateral_radius_m` 和 `extra_height_m`（在名义高度之外的加高余量）。
+下层将它们映射到与 v3 完全相同的六候选安全搜索；参数名直接表达
+“上方 8 cm、必要时额外抬高 10 cm”，避免把 8 cm 错填为搜索余量。
+v1–v3 的参数、Route 和默认启用状态不变。v4 仍不追踪物体、
+不授权真机，也不把 TCP 悬停完成判作抓取或放置成功。
+
 候选排名可利用已生成 IK 终点的最大关节偏移下界，跳过严格劣于已验证完整路径的候选。
 `safe_tcp_candidate_rank_pruned` 只表示不可能改善当前排名，不表示碰撞或不可达；相同主成本
 不能剪枝。`checked_count/all_candidates_checked` 是候选处理记账，须结合逐项 reason，
