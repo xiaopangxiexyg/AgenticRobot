@@ -185,7 +185,7 @@ def _place_cube_at_collision(application, plan, *, terminal):
 
 @pytest.mark.parametrize("safe_profile", ["local_step", "object_relation_precise"])
 def test_native_safe_session_does_not_republish_archived_debug_skills(safe_profile):
-    session = _session([], safe_profile=safe_profile, queries=True)
+    session = _session([], safe_profile=safe_profile, queries=True, use_model_cache=False)
     try:
         bundle = session.contract_bundle
         published = {entry.route.skill_id for entry in bundle.route_manifest.skill_routes}
