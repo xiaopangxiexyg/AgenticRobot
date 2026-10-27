@@ -293,9 +293,12 @@ def check_observed_support_footprint(
             or not np.isfinite(high).all() or np.any(low >= high)
             or np.any(low < observed_low) or np.any(high > observed_high)):
         raise ValueError("Requested footprint is outside the observed support bounds")
-    counts = np.ceil((high - low) / resolution_m).astype(int) + 1
-    if np.prod(counts) > 100_000:
+    steps = (high - low) / resolution_m
+    if (not np.isfinite(steps).all() or np.any(steps > 100_000)
+            or (steps[0] + 1) * (steps[1] + 1) > 100_000):
         raise ValueError("Requested footprint exceeds the bounded sample budget")
+    counts = (math.ceil(float(steps[0])) + 1,
+              math.ceil(float(steps[1])) + 1)
     grid_x, grid_y = np.meshgrid(np.linspace(low[0], high[0], counts[0]),
                                  np.linspace(low[1], high[1], counts[1]))
     anchor = np.asarray(candidate.plane_anchor_reference_xyz_m)

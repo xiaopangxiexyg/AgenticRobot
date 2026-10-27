@@ -146,3 +146,7 @@ def test_dense_footprint_coverage_rejects_extrapolation_and_coarse_grid():
         check_observed_support_footprint(
             cut, mask(), replace(plane, capture_group_id="other-cut"),
             region_min_xy_m=(-.04, -.04), region_max_xy_m=(.04, .04))
+    with pytest.raises(ValueError, match="bounded sample budget"):
+        check_observed_support_footprint(
+            cut, mask(), replace(plane, observed_bounds_max_xy_m=(1e12, 1e12)),
+            region_min_xy_m=(0., 0.), region_max_xy_m=(1e12, 1e12))
