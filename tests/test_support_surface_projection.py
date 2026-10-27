@@ -10,6 +10,7 @@ from agent_gateway.profiles.back_projection import (
     search_depth_mask_support_surface, check_observed_support_footprint,
     bind_known_box_support_from_depth,
     search_and_bind_known_box_support_from_depth,
+    refresh_known_box_support_patch_from_depth,
 )
 from robot_motion.object_transport import CalibratedBoxSupportObservation
 
@@ -256,3 +257,48 @@ def test_model_bound_search_filters_unrelated_plane_candidates():
             expected_support_mask_sha256=expected_hash,
             lateral_uncertainty_m=.005, vertical_uncertainty_m=.002,
             maximum_depth_m=2., patch_size_px=16, stride_px=2)
+
+
+def test_reselected_support_patch_uses_fresh_depth_and_keeps_camera_identity():
+    import hashlib
+    old = capture()
+    selected = mask()
+    mask_hash = hashlib.sha256(np.ascontiguousarray(selected).tobytes()).hexdigest()
+    selection, _ = search_and_bind_known_box_support_from_depth(
+        old, selected, known_support_for_cut(), mask_clipped=True,
+        semantic_support_id="table", expected_reference_frame_id="world",
+        expected_support_mask_sha256=mask_hash,
+        lateral_uncertainty_m=.005, vertical_uncertainty_m=.002,
+        maximum_depth_m=2., patch_size_px=16, stride_px=2)
+    fresh = replace(old, captured_at=10.03, capture_group_id="fresh:2",
+                    depth_content_hash="1" * 64)
+    refreshed, support = refresh_known_box_support_patch_from_depth(
+        old, fresh, selected, selection,
+        replace(known_support_for_cut(), measured_at=10.03),
+        semantic_support_id="table", expected_reference_frame_id="world",
+        expected_support_mask_sha256=mask_hash,
+        lateral_uncertainty_m=.005, vertical_uncertainty_m=.002,
+        maximum_depth_m=2.)
+    assert refreshed.candidate.capture_group_id == "fresh:2"
+    assert support.measured_at == 10.03
+    assert support.source_measurement_times_sec == (10.03, 10.03)
+    moved = old.reference_from_camera.copy()
+    moved[:3, 3] += (.01, 0., 0.)
+    with pytest.raises(ValueError, match="camera binding changed"):
+        refresh_known_box_support_patch_from_depth(
+            old, replace(fresh, reference_from_camera=moved), selected,
+            selection, replace(known_support_for_cut(), measured_at=10.03),
+            semantic_support_id="table", expected_reference_frame_id="world",
+            expected_support_mask_sha256=mask_hash,
+            lateral_uncertainty_m=.005, vertical_uncertainty_m=.002,
+            maximum_depth_m=2.)
+    changed_mask = selected.copy()
+    changed_mask[4, 4] = False
+    with pytest.raises(ValueError, match="mask identity changed"):
+        refresh_known_box_support_patch_from_depth(
+            old, fresh, changed_mask, selection,
+            replace(known_support_for_cut(), measured_at=10.03),
+            semantic_support_id="table", expected_reference_frame_id="world",
+            expected_support_mask_sha256=mask_hash,
+            lateral_uncertainty_m=.005, vertical_uncertainty_m=.002,
+            maximum_depth_m=2.)

@@ -375,6 +375,84 @@ def search_and_bind_known_box_support_from_depth(
     return search, support
 
 
+def refresh_known_box_support_patch_from_depth(
+    source_capture: LiveAlignedDepthCapture,
+    fresh_capture: LiveAlignedDepthCapture,
+    semantic_mask: np.ndarray,
+    selection: SearchedSupportSurface,
+    fresh_box: CalibratedBoxSupportObservation,
+    *,
+    semantic_support_id: str,
+    expected_reference_frame_id: str,
+    expected_support_mask_sha256: str,
+    lateral_uncertainty_m: float,
+    vertical_uncertainty_m: float,
+    maximum_depth_m: float,
+) -> tuple[SearchedSupportSurface, SupportSurfaceObservation]:
+    """Revalidate only a selected patch on a fresh cut before motion planning.
+
+    The expensive semantic search may run on an earlier cut. This method
+    preserves its exact mask and static camera identity but never refreshes a
+    stale plane by copying a timestamp. It fits the selected patch again on
+    actual fresh depth, then binds a freshly read fixed support box.
+    """
+    if (not isinstance(source_capture, LiveAlignedDepthCapture)
+            or not isinstance(fresh_capture, LiveAlignedDepthCapture)
+            or not isinstance(selection, SearchedSupportSurface)):
+        raise TypeError("Support refresh needs typed source, fresh cut and selection")
+    source = selection.candidate
+    if (source.source_id != source_capture.source_id
+            or source.capture_group_id != source_capture.capture_group_id
+            or source.depth_content_hash != source_capture.depth_content_hash
+            or source.captured_at != source_capture.captured_at
+            or source.station_revision != source_capture.station_revision):
+        raise ValueError("Selected patch does not belong to its source cut")
+    if (source_capture.source_id != fresh_capture.source_id
+            or source_capture.role != fresh_capture.role
+            or source_capture.station_revision != fresh_capture.station_revision
+            or dict(source_capture.intrinsics) != dict(fresh_capture.intrinsics)
+            or not np.allclose(source_capture.reference_from_camera,
+                               fresh_capture.reference_from_camera,
+                               atol=1e-6, rtol=0)):
+        raise ValueError("Saved semantic mask cannot be reused after camera binding changed")
+    selected = np.asarray(semantic_mask)
+    if selected.dtype != np.bool_ or selected.shape != source_capture.depth_m.shape:
+        raise ValueError("Retained semantic mask has the wrong dimensions")
+    mask_hash = hashlib.sha256(np.ascontiguousarray(selected).tobytes()).hexdigest()
+    if (not isinstance(expected_support_mask_sha256, str)
+            or mask_hash != expected_support_mask_sha256
+            or mask_hash != selection.support_mask_sha256):
+        raise ValueError("Retained support mask identity changed")
+    patch = selection.patch_xyxy_px
+    width, height = selected.shape[1], selected.shape[0]
+    if (len(patch) != 4 or any(isinstance(value, bool) or not isinstance(value, int)
+                               for value in patch)):
+        raise ValueError("Selected support patch coordinates are invalid")
+    x0, y0, x1, y1 = patch
+    if not (0 <= x0 < x1 <= width and 0 <= y0 < y1 <= height):
+        raise ValueError("Selected support patch exceeds the camera grid")
+    local_mask = np.zeros_like(selected)
+    local_mask[y0:y1, x0:x1] = selected[y0:y1, x0:x1]
+    fresh_candidate = project_depth_mask_support_surface(
+        fresh_capture, local_mask, mask_clipped=False,
+        maximum_depth_m=maximum_depth_m)
+    refreshed = SearchedSupportSurface(
+        candidate=fresh_candidate, patch_xyxy_px=patch,
+        inspected_patch_count=1, accepted_patch_count=1,
+        support_mask_sha256=mask_hash,
+        source_mask_clipped=selection.source_mask_clipped,
+    )
+    support = bind_known_box_support_from_depth(
+        fresh_capture, refreshed, fresh_box,
+        semantic_support_id=semantic_support_id,
+        expected_reference_frame_id=expected_reference_frame_id,
+        expected_support_mask_sha256=mask_hash,
+        lateral_uncertainty_m=lateral_uncertainty_m,
+        vertical_uncertainty_m=vertical_uncertainty_m,
+    )
+    return refreshed, support
+
+
 @dataclass(frozen=True)
 class ObservedSupportFootprintCoverage:
     """Dense RGB-D evidence for one proposed rectangle, not complete CAD geometry."""
