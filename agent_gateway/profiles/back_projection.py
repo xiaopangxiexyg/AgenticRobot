@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import hashlib
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
@@ -10,6 +11,11 @@ from types import MappingProxyType
 from typing import Any, Protocol
 
 import numpy as np
+
+from robot_motion.object_transport import (
+    CalibratedBoxSupportObservation,
+    SupportSurfaceObservation,
+)
 
 from agent_gateway.profiles.segmentation import LiveRgbSegmentationCapture
 from agent_gateway.protocol.skill_catalog import (
@@ -239,6 +245,59 @@ class SearchedSupportSurface:
     patch_xyxy_px: tuple[int, int, int, int]
     inspected_patch_count: int
     accepted_patch_count: int
+    support_mask_sha256: str
+
+
+def bind_known_box_support_from_depth(
+    capture: LiveAlignedDepthCapture,
+    search: SearchedSupportSurface,
+    box: CalibratedBoxSupportObservation,
+    *,
+    semantic_support_id: str,
+    expected_reference_frame_id: str,
+    expected_support_mask_sha256: str,
+    lateral_uncertainty_m: float,
+    vertical_uncertainty_m: float,
+) -> SupportSurfaceObservation:
+    """Bind a retained semantic mask and same-cut plane to known box geometry.
+
+    The caller must obtain the semantic ID and expected mask hash from the
+    authenticated segmentation operation. This edge never grants motion;
+    the lower safe planner and live observer still validate the result.
+    """
+    if (not isinstance(capture, LiveAlignedDepthCapture)
+            or not isinstance(search, SearchedSupportSurface)
+            or not isinstance(box, CalibratedBoxSupportObservation)):
+        raise TypeError("Support fusion needs typed depth, search and box observations")
+    candidate = search.candidate
+    if (candidate.source_id != capture.source_id
+            or candidate.capture_group_id != capture.capture_group_id
+            or candidate.captured_at != capture.captured_at
+            or candidate.station_revision != capture.station_revision
+            or candidate.depth_content_hash != capture.depth_content_hash):
+        raise ValueError("Support plane does not belong to the bound depth cut")
+    if (semantic_support_id != box.support_id
+            or box.reference_frame_id != expected_reference_frame_id
+            or box.scene_revision != capture.station_revision):
+        raise ValueError("Semantic support, frame or revision differs from its box binding")
+    if (not isinstance(expected_support_mask_sha256, str)
+            or len(expected_support_mask_sha256) != 64
+            or any(char not in "0123456789abcdef" for char in expected_support_mask_sha256)
+            or search.support_mask_sha256 != expected_support_mask_sha256):
+        raise ValueError("Support mask differs from the retained semantic segment")
+    center_xy = (np.asarray(candidate.observed_bounds_min_xy_m)
+                 + candidate.observed_bounds_max_xy_m) / 2.
+    depth_ref = ("support-depth:" + capture.depth_content_hash + ":"
+                 + search.support_mask_sha256 + ":" + capture.capture_group_id)
+    return box.bind_measured_top(
+        plane_measured_at=capture.captured_at,
+        measured_upper_top_z_m=candidate.upper_top_z_m,
+        measured_normal_reference_xyz=candidate.normal_reference_xyz,
+        measured_region_center_xy_m=tuple(float(value) for value in center_xy),
+        depth_evidence_ref=depth_ref,
+        lateral_uncertainty_m=lateral_uncertainty_m,
+        vertical_uncertainty_m=vertical_uncertainty_m,
+    )
 
 
 @dataclass(frozen=True)
@@ -428,6 +487,9 @@ def search_depth_mask_support_surface(
         patch_xyxy_px=(x0, y0, x0 + patch_size_px, y0 + patch_size_px),
         inspected_patch_count=len(xs) * len(ys),
         accepted_patch_count=accepted,
+        support_mask_sha256=hashlib.sha256(
+            np.ascontiguousarray(selected).tobytes()
+        ).hexdigest(),
     )
 
 

@@ -8,7 +8,9 @@ from scipy.spatial.transform import Rotation
 from agent_gateway.profiles.back_projection import (
     LiveAlignedDepthCapture, project_depth_mask_support_surface,
     search_depth_mask_support_surface, check_observed_support_footprint,
+    bind_known_box_support_from_depth,
 )
+from robot_motion.object_transport import CalibratedBoxSupportObservation
 
 
 def capture(*, depth=None, tilt_deg=0.):
@@ -150,3 +152,57 @@ def test_dense_footprint_coverage_rejects_extrapolation_and_coarse_grid():
         check_observed_support_footprint(
             cut, mask(), replace(plane, observed_bounds_max_xy_m=(1e12, 1e12)),
             region_min_xy_m=(0., 0.), region_max_xy_m=(1e12, 1e12))
+
+
+def known_support_for_cut():
+    transform = np.eye(4)
+    transform[:3, 3] = (0., 0., -.02)
+    return CalibratedBoxSupportObservation(
+        support_id="table", reference_frame_id="world", scene_revision=3,
+        measured_at=10., reference_from_box=transform,
+        box_size_m=(.12, .12, .04),
+        geometry_evidence_ref="catalog:table", pose_evidence_ref="pose:table",
+        geometry_complete=True,
+    )
+
+
+def test_depth_candidate_binds_known_support_only_with_matching_semantic_cut():
+    cut = capture()
+    search = search_depth_mask_support_surface(
+        cut, mask(), mask_clipped=False, maximum_depth_m=2.,
+        patch_size_px=16, stride_px=2)
+    result = bind_known_box_support_from_depth(
+        cut, search, known_support_for_cut(), semantic_support_id="table",
+        expected_reference_frame_id="world",
+        expected_support_mask_sha256=search.support_mask_sha256,
+        lateral_uncertainty_m=.005, vertical_uncertainty_m=.002)
+    assert result.support_id == "table"
+    assert result.geometry_complete is True
+    assert result.top_z_m == pytest.approx(.004)
+    assert result.region_max_xy_m == pytest.approx((.055, .055))
+
+
+@pytest.mark.parametrize("change, reason", [
+    ({"semantic_support_id": "other"}, "Semantic support"),
+    ({"expected_reference_frame_id": "camera"}, "Semantic support"),
+    ({"expected_support_mask_sha256": "f" * 64}, "mask differs"),
+    ({"expected_support_mask_sha256": True}, "mask differs"),
+    ({"box": "stale"}, "correlated cut"),
+    ({"search": "wrong-cut"}, "bound depth cut"),
+])
+def test_depth_box_fusion_rejects_identity_or_time_mismatch(change, reason):
+    cut = capture()
+    search = search_depth_mask_support_surface(
+        cut, mask(), mask_clipped=False, maximum_depth_m=2.,
+        patch_size_px=16, stride_px=2)
+    box = known_support_for_cut()
+    if change.get("box") == "stale":
+        box = replace(box, measured_at=9.)
+    if change.get("search") == "wrong-cut":
+        search = replace(search, candidate=replace(search.candidate, capture_group_id="other"))
+    values = dict(semantic_support_id="table", expected_reference_frame_id="world",
+                  expected_support_mask_sha256=search.support_mask_sha256,
+                  lateral_uncertainty_m=.005, vertical_uncertainty_m=.002)
+    values.update({key: value for key, value in change.items() if key not in {"box", "search"}})
+    with pytest.raises(ValueError, match=reason):
+        bind_known_box_support_from_depth(cut, search, box, **values)
