@@ -217,7 +217,13 @@ class ProjectedDepthGeometry:
 class ProjectedSupportSurface:
     """Top-plane candidate, not proof that the entire XY AABB is supported."""
 
+    source_id: str
+    capture_group_id: str
+    captured_at: float
+    station_revision: int
+    depth_content_hash: str
     upper_top_z_m: float
+    plane_anchor_reference_xyz_m: tuple[float, float, float]
     normal_reference_xyz: tuple[float, float, float]
     observed_bounds_min_xy_m: tuple[float, float]
     observed_bounds_max_xy_m: tuple[float, float]
@@ -233,6 +239,104 @@ class SearchedSupportSurface:
     patch_xyxy_px: tuple[int, int, int, int]
     inspected_patch_count: int
     accepted_patch_count: int
+
+
+@dataclass(frozen=True)
+class ObservedSupportFootprintCoverage:
+    """Dense RGB-D evidence for one proposed rectangle, not complete CAD geometry."""
+
+    region_min_xy_m: tuple[float, float]
+    region_max_xy_m: tuple[float, float]
+    sample_count: int
+    maximum_measured_plane_residual_m: float
+    resolution_m: float
+
+
+def check_observed_support_footprint(
+    capture: LiveAlignedDepthCapture,
+    mask: np.ndarray,
+    candidate: ProjectedSupportSurface,
+    *,
+    region_min_xy_m: tuple[float, float],
+    region_max_xy_m: tuple[float, float],
+    resolution_m: float = .002,
+    maximum_plane_residual_m: float = .002,
+) -> ObservedSupportFootprintCoverage:
+    """Require measured planar depth at every sampled point of a proposed footprint.
+
+    This closes gaps in an AABB of observed pixels at 2 mm resolution or finer.
+    It cannot prove subpixel material continuity or hidden support geometry;
+    callers must still bind a known support extent and fresh identity before
+    constructing a complete SupportSurfaceObservation.
+    """
+    if not isinstance(capture, LiveAlignedDepthCapture) or not isinstance(candidate, ProjectedSupportSurface):
+        raise TypeError("Support footprint needs a bound capture and fitted plane")
+    if (candidate.source_id != capture.source_id
+            or candidate.capture_group_id != capture.capture_group_id
+            or candidate.captured_at != capture.captured_at
+            or candidate.station_revision != capture.station_revision
+            or candidate.depth_content_hash != capture.depth_content_hash):
+        raise ValueError("Support plane and footprint depth have different source cuts")
+    selected = np.asarray(mask)
+    if selected.dtype != np.bool_ or selected.shape != capture.depth_m.shape:
+        raise ValueError("Support mask must match the bound depth cut")
+    for name, value in (("resolution_m", resolution_m),
+                        ("maximum_plane_residual_m", maximum_plane_residual_m)):
+        if (isinstance(value, (bool, np.bool_)) or not math.isfinite(value)
+                or value <= 0 or value > .002):
+            raise ValueError(f"{name} exceeds the measured support qualification profile")
+    low = np.asarray(region_min_xy_m, dtype=float)
+    high = np.asarray(region_max_xy_m, dtype=float)
+    observed_low = np.asarray(candidate.observed_bounds_min_xy_m)
+    observed_high = np.asarray(candidate.observed_bounds_max_xy_m)
+    if (low.shape != (2,) or high.shape != (2,) or not np.isfinite(low).all()
+            or not np.isfinite(high).all() or np.any(low >= high)
+            or np.any(low < observed_low) or np.any(high > observed_high)):
+        raise ValueError("Requested footprint is outside the observed support bounds")
+    counts = np.ceil((high - low) / resolution_m).astype(int) + 1
+    if np.prod(counts) > 100_000:
+        raise ValueError("Requested footprint exceeds the bounded sample budget")
+    grid_x, grid_y = np.meshgrid(np.linspace(low[0], high[0], counts[0]),
+                                 np.linspace(low[1], high[1], counts[1]))
+    anchor = np.asarray(candidate.plane_anchor_reference_xyz_m)
+    normal = np.asarray(candidate.normal_reference_xyz)
+    x = grid_x.ravel()
+    y = grid_y.ravel()
+    z = anchor[2] - (normal[0] * (x - anchor[0])
+                     + normal[1] * (y - anchor[1])) / normal[2]
+    reference_points = np.stack((x, y, z), axis=1)
+    rotation = capture.reference_from_camera[:3, :3]
+    camera_points = (reference_points - capture.reference_from_camera[:3, 3]) @ rotation
+    if np.any(camera_points[:, 2] <= 0):
+        raise ValueError("Support footprint projects behind the camera")
+    intrinsics = capture.intrinsics
+    u = np.rint(intrinsics["fx"] * camera_points[:, 0] / camera_points[:, 2]
+                + intrinsics["cx"]).astype(int)
+    v = np.rint(intrinsics["fy"] * camera_points[:, 1] / camera_points[:, 2]
+                + intrinsics["cy"]).astype(int)
+    height, width = selected.shape
+    if np.any(u < 0) or np.any(v < 0) or np.any(u >= width) or np.any(v >= height):
+        raise ValueError("Support footprint is outside the captured image")
+    if not np.all(selected[v, u]):
+        raise ValueError("Support footprint contains an unobserved mask gap")
+    measured_depth = capture.depth_m[v, u].astype(float)
+    if np.any(measured_depth <= 0):
+        raise ValueError("Support footprint contains missing metric depth")
+    measured = _project_pixels(
+        u=u.astype(float), v=v.astype(float), depth=measured_depth,
+        intrinsics=intrinsics,
+        reference_from_camera=capture.reference_from_camera,
+    )
+    residual = np.abs((measured - anchor) @ normal)
+    if np.any(residual > maximum_plane_residual_m):
+        raise ValueError("Support footprint contains nonplanar depth or an occlusion")
+    return ObservedSupportFootprintCoverage(
+        region_min_xy_m=tuple(float(value) for value in low),
+        region_max_xy_m=tuple(float(value) for value in high),
+        sample_count=int(residual.size),
+        maximum_measured_plane_residual_m=float(np.max(residual)),
+        resolution_m=float(resolution_m),
+    )
 
 
 def search_depth_mask_support_surface(
@@ -392,7 +496,13 @@ def project_depth_mask_support_surface(
     if np.any(xy_bounds[1] <= xy_bounds[0]):
         raise ValueError("Observed support top has no finite placement region")
     return ProjectedSupportSurface(
+        source_id=capture.source_id,
+        capture_group_id=capture.capture_group_id,
+        captured_at=capture.captured_at,
+        station_revision=capture.station_revision,
+        depth_content_hash=capture.depth_content_hash,
         upper_top_z_m=float(np.max(top[:, 2]) + top_height_margin_m),
+        plane_anchor_reference_xyz_m=tuple(float(value) for value in np.mean(top, axis=0)),
         normal_reference_xyz=tuple(float(value) for value in normal),
         observed_bounds_min_xy_m=tuple(float(value) for value in xy_bounds[0]),
         observed_bounds_max_xy_m=tuple(float(value) for value in xy_bounds[1]),

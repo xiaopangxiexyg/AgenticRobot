@@ -2,11 +2,12 @@
 
 import numpy as np
 import pytest
+from dataclasses import replace
 from scipy.spatial.transform import Rotation
 
 from agent_gateway.profiles.back_projection import (
     LiveAlignedDepthCapture, project_depth_mask_support_surface,
-    search_depth_mask_support_surface,
+    search_depth_mask_support_surface, check_observed_support_footprint,
 )
 
 
@@ -97,3 +98,51 @@ def test_search_rejects_unqualified_or_unbounded_input(options, match):
     values.update(options)
     with pytest.raises(ValueError, match=match):
         search_depth_mask_support_surface(capture(), mask(), **values)
+
+
+def test_dense_footprint_coverage_accepts_measured_flat_interior():
+    cut = capture()
+    selected = mask()
+    plane = project_depth_mask_support_surface(
+        cut, selected, mask_clipped=False, maximum_depth_m=2.)
+    result = check_observed_support_footprint(
+        cut, selected, plane,
+        region_min_xy_m=(-.04, -.04), region_max_xy_m=(.04, .04))
+    assert result.sample_count > 1000
+    assert result.maximum_measured_plane_residual_m < 1e-9
+
+
+def test_dense_footprint_coverage_rejects_hole_and_raised_occluder():
+    cut = capture()
+    plane = project_depth_mask_support_surface(
+        cut, mask(), mask_clipped=False, maximum_depth_m=2.)
+    gap = mask()
+    gap[10, 10] = False
+    with pytest.raises(ValueError, match="mask gap"):
+        check_observed_support_footprint(
+            cut, gap, plane, region_min_xy_m=(-.04, -.04),
+            region_max_xy_m=(.04, .04))
+    depth = np.ones((20, 20), dtype=np.float32)
+    depth[10, 10] = .99
+    with pytest.raises(ValueError, match="nonplanar"):
+        check_observed_support_footprint(
+            capture(depth=depth), mask(), plane,
+            region_min_xy_m=(-.04, -.04), region_max_xy_m=(.04, .04))
+
+
+def test_dense_footprint_coverage_rejects_extrapolation_and_coarse_grid():
+    cut = capture()
+    plane = project_depth_mask_support_surface(
+        cut, mask(), mask_clipped=False, maximum_depth_m=2.)
+    with pytest.raises(ValueError, match="outside the observed"):
+        check_observed_support_footprint(
+            cut, mask(), plane, region_min_xy_m=(-.09, -.04),
+            region_max_xy_m=(.04, .04))
+    with pytest.raises(ValueError, match="qualification profile"):
+        check_observed_support_footprint(
+            cut, mask(), plane, region_min_xy_m=(-.04, -.04),
+            region_max_xy_m=(.04, .04), resolution_m=.01)
+    with pytest.raises(ValueError, match="different source cuts"):
+        check_observed_support_footprint(
+            cut, mask(), replace(plane, capture_group_id="other-cut"),
+            region_min_xy_m=(-.04, -.04), region_max_xy_m=(.04, .04))
