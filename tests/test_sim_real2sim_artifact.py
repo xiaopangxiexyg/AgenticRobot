@@ -25,6 +25,10 @@ ARM_BASELINE_PATH = Path(
 )
 ARM_RUNTIME_BINDING_PATH = Path(
     "sim/rm65/real2sim/artifacts/"
+    "rm65_arm_free_motion_20260721_v4_runtime_binding_20261028_sam3_candidates_v1.json"
+)
+MOTION_GRIPPER_BINDING_PATH = Path(
+    "sim/rm65/real2sim/artifacts/"
     "rm65_arm_free_motion_20260721_v4_runtime_binding_20261027_motion_gripper_v1.json"
 )
 SAM3_DEFAULT_BINDING_PATH = Path(
@@ -345,6 +349,56 @@ def test_v4_arm_fit_baseline_remains_frozen_and_provisional() -> None:
 
 def test_current_arm_runtime_binding_uses_exact_current_inputs() -> None:
     binding = Real2SimArtifactManifest.load(ARM_RUNTIME_BINDING_PATH)
+    previous = Real2SimArtifactManifest.load(MOTION_GRIPPER_BINDING_PATH)
+    fit = Real2SimArtifactManifest.load(ARM_BASELINE_PATH)
+    tag = "20261028-sam3-candidates-v1"
+    old_tag = "20261027-motion-gripper-v1"
+    current = {ref.locator: ref for ref in binding.dependency_artifacts
+               if "-runtime-" + tag in ref.artifact_id}
+    inherited = {ref.locator: ref for ref in previous.dependency_artifacts
+                 if "-runtime-" + old_tag in ref.artifact_id}
+    assert len(current) == len(inherited) == 154 and set(current) == set(inherited)
+    assert sum(path.endswith(".py") for path in current) == 151
+    for path, ref in current.items():
+        assert ref.sha256 == ArtifactRef.from_file(path,
+            artifact_id="current-input-check", artifact_kind=ref.artifact_kind).sha256
+        assert ref.artifact_id == inherited[path].artifact_id.replace(old_tag, tag)
+        assert ref.artifact_kind == inherited[path].artifact_kind
+    changed = {path for path in inherited if current[path].sha256 != inherited[path].sha256}
+    assert changed == {"agent_gateway/profiles/mujoco/gateway_cli.py",
+        "agent_gateway/profiles/real/gateway_cli.py", "deployments/perception/sam3_service.py"}
+    assert tuple(binding.metadata["changed_previous_runtime_sources"]) == tuple(sorted(changed))
+    assert tuple(binding.metadata["new_runtime_sources"]) == ()
+    assert binding.resolved_timing == previous.resolved_timing == Real2SimArtifactManifest.resolved_timing_from_contract_file(CONTRACT_PATH)
+    assert binding.simulation_contract.sha256 == previous.simulation_contract.sha256
+    assert binding.metadata["fit_artifact_sha256"] == fit.artifact_sha256
+    assert binding.metadata["fit_simulation_contract_sha256"] == fit.simulation_contract.sha256
+    assert binding.metadata["previous_runtime_binding_artifact_sha256"] == previous.artifact_sha256
+    assert binding.metadata["previous_runtime_binding_file_sha256"] == ArtifactRef.from_file(
+        MOTION_GRIPPER_BINDING_PATH, artifact_id="parent-check", artifact_kind="real2sim_runtime_binding").sha256
+    assert binding.metadata["arm_profile_refit"] is False and binding.metadata["runtime_behavior_change"] is True
+    assert binding.metadata["runtime_behavior_change_scope"] == "explicit_sam3_multi_instance_localization_default_binding_unchanged"
+    assert binding.code_revision == binding.environment_fingerprint["source_commit"] == binding.metadata["runtime_source_commit"] == "66765c65e736fc6dcdf80d0f0e96878c513ed3cb"
+    assert binding.metadata["offline_validation_execution_head"] == binding.code_revision
+    assert binding.environment_fingerprint["source_tree"] == binding.metadata["offline_validation_source_tree"] == "ecdbc7053b04cdc7c9e61bb07856ca6bcaaa88c3"
+    assert binding.artifact_sha256 == "085a6b6e92fd0a606953ccfeca3dc577142fe621f577e413ef0ca208fe5a0e82"
+    assert ArtifactRef.from_file(ARM_RUNTIME_BINDING_PATH,
+        artifact_id="binding-file-check", artifact_kind="real2sim_runtime_binding").sha256 == "63b0ea27ad8614fd3dde48964c1b574150e52b73fdf7fe416db87e896704366d"
+    assert binding.fidelity_claims[0].status == "provisional"
+    content = next(e for e in binding.validation_evidence if e.validation_id == "runtime-source-content-binding-integrity-" + tag)
+    assert content.status == "passed" and content.split == "validation"
+    assert dict(content.metrics) == {"bound_runtime_input_file_count": 154., "bound_runtime_source_file_count": 151., "changed_runtime_source_file_count_from_previous_binding": 3., "new_runtime_source_file_count": 0., "arm_profile_refit_count": 0., "mutated_historical_artifact_count": 0.}
+    offline = next(e for e in binding.validation_evidence if e.validation_id == "sam3-candidates-source-consumers-" + tag)
+    assert offline.status == "passed" and offline.split == "validation"
+    assert dict(offline.metrics) == {"passed_cases": 674., "skipped_cases": 0., "failed_cases": 0., "error_cases": 0.}
+    refs = {ref.artifact_id: ref for ref in binding.dependency_artifacts}
+    assert refs[binding.metadata["offline_validation_report_artifact_id"]].sha256 == "422b228d067f107d6b0d77d69b9bcf30af3e409616e10a9451a5143daa1db4b8"
+    assert binding.metadata["external_candidate_rpc_dependency_commit"] == "24eb2ff00cc70ac782dbfa82c59020a228164a47"
+    assert next(e for e in binding.validation_evidence if e.split == "held_out").status == "not_run"
+
+
+def test_motion_gripper_binding_remains_frozen_after_sam3_candidates() -> None:
+    binding = Real2SimArtifactManifest.load(MOTION_GRIPPER_BINDING_PATH)
     previous = Real2SimArtifactManifest.load(SAM3_DEFAULT_BINDING_PATH)
     fit = Real2SimArtifactManifest.load(ARM_BASELINE_PATH)
     tag = "20261027-motion-gripper-v1"
@@ -357,8 +411,8 @@ def test_current_arm_runtime_binding_uses_exact_current_inputs() -> None:
     assert set(current) == set(inherited) | {"agent_gateway/profiles/real/gripper_skill.py"}
     assert sum(path.endswith(".py") for path in current) == 151
     for path, ref in current.items():
-        assert ref.sha256 == ArtifactRef.from_file(path,
-            artifact_id="current-input-check", artifact_kind=ref.artifact_kind).sha256
+        assert ref.sha256 == hashlib.sha256(subprocess.check_output(
+            ["git", "show", "6c8f9289d4ad672ac6fda7e1d266d58dfa297f3f:" + path])).hexdigest()
         if path in inherited:
             assert ref.artifact_id == inherited[path].artifact_id.replace(old_tag, tag)
             assert ref.artifact_kind == inherited[path].artifact_kind
@@ -392,7 +446,7 @@ def test_current_arm_runtime_binding_uses_exact_current_inputs() -> None:
     assert binding.metadata["offline_validation_execution_head"] == binding.code_revision
     assert binding.environment_fingerprint["source_tree"] == binding.metadata["offline_validation_source_tree"] == "f2c3445c0cd96e536dc4c731a4cad61dcf0b5ed3"
     assert binding.artifact_sha256 == "91eacc6abaf737a9c0d7a76f759d19c281733161a8df695ef339d2d0ebd4db85"
-    assert ArtifactRef.from_file(ARM_RUNTIME_BINDING_PATH,
+    assert ArtifactRef.from_file(MOTION_GRIPPER_BINDING_PATH,
         artifact_id="binding-file-check", artifact_kind="real2sim_runtime_binding").sha256 == "780e43c74196bb8e44a6a23fd98a0f0d6400e9057a414d0e02ca518841be7966"
     assert binding.fidelity_claims[0].status == "provisional"
     content = next(e for e in binding.validation_evidence if e.validation_id == "runtime-source-content-binding-integrity-" + tag)
