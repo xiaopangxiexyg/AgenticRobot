@@ -366,6 +366,43 @@ def test_other_free_box_support_is_frozen_and_movement_revokes_placement():
 
 
 @pytest.mark.integration
+def test_free_support_place_plan_stops_if_support_moves_before_dispatch(monkeypatch):
+    scene = _scene(extra='''<body name="support" pos=".08 0 .355"><freejoint/>
+      <geom name="support_geom" type="box" size=".1 .08 .03" mass=".4"
+        contype="8" conaffinity="15"/></body>''')
+    model = scene.model
+    scene.data.qpos[scene.joint_qpos_addr("right_z")] += .06
+    payload_address = int(model.jnt_qposadr[model.body_jntadr[model.body("payload").id]])
+    scene.data.qpos[payload_address + 2] += .06
+    scene.mujoco.mj_kinematics(model, scene.data)
+    scene.mujoco.mj_collision(model, scene.data)
+    support = _support(
+        geom_names=("support_geom",), phase="place",
+        region_min_world=(-.02, -.08, .385),
+        region_max_world=(.18, .08, .385),
+        dynamic_body_name="support",
+        frozen_pose_xyz_quat_xyzw=tuple(pose_matrix_to_xyzquat(
+            _pose(scene.data, model, "support"))),
+    )
+    binding = _binding(scene, support=support)
+    planner, installed = _planner(scene, monkeypatch)
+    plan = _plan(planner, binding, z=0.)
+    assert plan.reference_poses and installed["oracle"] is None
+    planner.activate(plan)
+    assert installed["oracle"] is binding.contact_oracle(scene)
+    planner._reference_index = len(plan.reference_poses) - 1
+    assert planner.resolve(_action(planner, plan.reference_poses[-1])) is not None
+    support_address = int(model.jnt_qposadr[model.body_jntadr[model.body("support").id]])
+    scene.data.qpos[support_address] += .004
+    scene.mujoco.mj_kinematics(model, scene.data)
+    scene.mujoco.mj_collision(model, scene.data)
+    with pytest.raises(motion.MujocoTcpPlanRejected, match="payload_measured_blocked"):
+        planner.resolve(_action(planner, plan.reference_poses[-1]))
+    planner.clear()
+    assert installed["oracle"] is None
+
+
+@pytest.mark.integration
 def test_free_support_cannot_be_used_as_a_fixed_table_exception():
     scene = _scene(extra='''<body name="support" pos=".08 0 .355"><freejoint/>
       <geom name="support_geom" type="box" size=".1 .08 .03" mass=".4"
