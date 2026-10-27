@@ -130,7 +130,8 @@ def main(argv=None):
         "--socket-path", str(args.output / "gateway.sock"), "--artifact-root", str(args.output / "artifacts"),
         "--camera-config", str(args.camera_config), "--camera-registry", str(args.camera_registry),
         "--camera-single-start", "--client-id", "rpent.readonly.acceptance", "--client-uid", str(os.getuid()),
-        "--enable-object-localization", "--object-localization-asset-bundle", str(args.localization_bundle)]
+        "--enable-object-localization", "--object-localization-backend", "sam2-grounding-dino",
+        "--object-localization-asset-bundle", str(args.localization_bundle)]
     if args.camera_sdk_debug_log:
         gateway_command.extend(("--camera-sdk-debug-log", str(args.output / "librealsense.debug.log")))
     if tcp:

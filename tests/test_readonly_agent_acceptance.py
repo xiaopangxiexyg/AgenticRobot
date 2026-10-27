@@ -31,7 +31,9 @@ def test_fixed_acceptance_keeps_secrets_out_of_argv_and_closes_children(tmp_path
     class Child:
         def __init__(self, command, **options):
             if "real-perception" in command:
-                perception_cli.build_parser().parse_args(command[command.index("real-perception") + 1:])
+                selected = perception_cli.build_parser().parse_args(command[command.index("real-perception") + 1:])
+                assert selected.object_localization_backend == "sam2-grounding-dino"
+                assert selected.object_localization_asset_bundle == tmp_path
             elif "real-tcp-observe" in command:
                 readonly_tcp_cli.build_parser().parse_args(command[command.index("real-tcp-observe") + 1:])
             if "real-perception" in command:

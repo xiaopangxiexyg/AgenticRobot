@@ -600,8 +600,8 @@ lower 测量发布与 `RM65RgbCameraGeometry`。这条入口按已对齐 RGB-D �
 投影。只读 Skill 不发送运动/HOLD/STOP，但该既有双臂应用的启动与收尾仍保持原来的
 设备/初始 HOLD 行为，不能当成相机-only 启动命令。上层是否暴露动作由独立策略决定。
 
-`--enable-object-localization` adds the supplied-image localization Route after
-loading its reviewed model bundle. `--enable-point-grasp` is a separate,
+`--enable-object-localization` adds the supplied-image localization Route using
+the default SAM3 service client. `--enable-point-grasp` is a separate,
 default-off module and requires that same localizer plus a reviewed point-grasp
 bundle. GraspGenX in-process inference is the default and does not require a
 loopback service; VGN, GraspNet, and service-mode GraspGenX are explicit
@@ -614,7 +614,7 @@ python -m agent_gateway real-perception \
   --camera-registry /absolute/DexTeleop/robot_motion/configs/rm65_camera_registry.json \
   --artifact-root /absolute/private/artifact_cache \
   --enable-object-localization \
-  --object-localization-asset-bundle /absolute/assets/perception/sam2_grounding_dino \
+  --sam3-endpoint http://127.0.0.1:8114 \
   --enable-point-grasp \
   --point-grasp-asset-bundle /absolute/assets/perception/graspgenx-point-grasp \
   --graspgenx-mode in-process \
@@ -683,6 +683,8 @@ checkpoint 字节身份**，因此应在服务自身的部署记录中保留源�
 分别记录应用管理的只读客户端与外部模型执行服务。SAM2 的历史 v1 绑定和哈希保持。
 更换后端后，消费者需重新发现目录并绑定新 profile/Route/deployment 哈希，不复用旧发现缓存。
 MuJoCo 使用 `--enable-segmentation` 启用默认服务分割；显式 `--sam3-endpoint` 也保留原来的启用含义。
+历史只读 Agent 验收 probe 的 `--localization-bundle` 仍绑定 SAM2；该调用方现在显式选择
+SAM2 兼容后端，不会把已有资产参数误传给默认 SAM3。
 表面锚点 v2/v3、同帧批量分割和留存图像定位均使用所选后端，无需为了启用它们提供 SAM2 资产。
 来源绑定的 MuJoCo 部署还需按[现有运行时绑定流程](../sim/rm65/real2sim/README.md)登记这批新源码；
 历史 V25 及 fit 不因默认选择变化而被覆盖。后端切换不替代新组合的原生与真机验收。
@@ -1628,7 +1630,8 @@ relation 连续查询及其 region 扩展使用 anchor v2，与 anchor v3 的组
 提交现有 safe Route。未启用空间目标时原有两个锚点 Skill 不变，旧 inline 参数也不变。
 
 MuJoCo 可再显式启用 `--enable-surface-anchor-v2`；它要求已有
-`--enable-surface-anchors` 和 `--segmentation-asset-bundle`，保留所有 v1，并额外发布
+`--enable-surface-anchors` 和选定的分割后端；默认使用 SAM3，显式选择 SAM2 时需提供
+`--segmentation-asset-bundle`。保留所有 v1，并额外发布
 `capture_surface_anchor@2` 与同版本的已启用 anchored goal/query。v2 的输入槽只接收
 `agenticrobot.measured_surface_anchor.v2`；不混用两个版本。上层默认选择一整套兼容版本，
 不会因同时发布两个版本而增加 Agent 可见工具数量。

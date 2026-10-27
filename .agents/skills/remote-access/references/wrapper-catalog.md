@@ -67,6 +67,12 @@ this does not extend its authority or replace fresh checks.
   behavior.
 - Control-risk preflight evidence: `remote_safety_check.sh`. It is read-only
   and does not authorize a later action.
+- B601 single-cycle management: `remote_b601_managed_cycle.sh`; `preflight`
+  and `status` are passive. `start` requires explicit real-motion authority;
+  `stop` requests the existing protective HOLD only. `supported-disable`
+  additionally requires the operator's physical-support confirmation and
+  explicit disable request. Reuse the sole existing owner and the matching
+  README limits; no arbitrary profile, torque override, retry, or kill.
 
 Use dataset-specific wrappers only for the exact documented dataset audit,
 quarantine, promotion, or storage task. Do not reinterpret them as arbitrary
