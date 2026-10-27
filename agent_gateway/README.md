@@ -1583,6 +1583,18 @@ MuJoCo 支撑盒的完整碰撞几何和冻结姿态规划，执行中支撑偏�
 RealMan v2 Route。请求仍需提供公开参考系中的物体目标位姿或增量；因此它是
 受限的仿真放置接口，不能作为任意物体上放置或真机任务成功证据。
 
+在上述显式 MuJoCo 支撑组合上，可再选 `--enable-named-release-v3`，以
+`manipulation.set_gripper_state@3` 替换同一会话中的夹爪 v2 Route，不增加新的
+Agent 可见 Skill。双手普通开合参数仍为 `component_id`、`target_state`；只有右手
+`target_state=open` 可附 `release_support_object_id`，且必须来自部署时的
+`--object-support-body` 列表。它在当前物理 cut 上重新检查已验证抓持、双侧目标
+接触、无支撑/其他接触、50 ms 观测新鲜度及原 3 mm／2° 冻结关系；在同一
+rig 锁内入队开爪并绑定原观察器的释放支撑身份。入队后的绑定异常会由原夹爪
+owner 撤销尚未消费的命令，保留序号和失败证据。夹爪完成回执仍只证明开爪
+动作，稳定放置须另读完整 0.6 s 的 `state.read_object_state` 释放窗口。
+此开关默认关闭，原夹爪 v1/v2 合同及真机部署不变；当前 v3 只在 MuJoCo
+有原生验收，支撑位置的 Agent 输入仍需来自可获取的 RGB-D/已保存观测。
+
 该 Route 默认使用 `--safe-tcp-motion-profile local_step`（单次平移 0.10 m、
 旋转 15°）。仿真物体关系目标可显式选择 `--safe-tcp-motion-profile object_relation`，
 同时传入 `--enable-safe-tcp-pose`：该配置允许单次平移 0.50 m、旋转 180°，

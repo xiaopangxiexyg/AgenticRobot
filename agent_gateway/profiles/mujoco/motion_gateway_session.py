@@ -1559,6 +1559,9 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
             object_observer = source.follow_observer
             if object_observer is None:
                 raise ValueError("Object motion lacks its existing rig-tick follow observer.")
+            hand = contract_bundle.gripper_contract
+            if hand is not None and hand.deployment_binding.skill_version == "3":
+                gripper_ports["right_gripper"].bind_release_observer(object_observer)
         object_state_executor = build_object_state_executor(registration=registration, capture=source.capture,
             current_station_revision=lambda: observation_producer.current_station_revision,
             clock=runtime_clock, max_retained_operations=retention)

@@ -194,6 +194,36 @@ class MujocoGraspedObjectObserver:
             scene, phase=phase, establish=establish, source_data=source_data,
             place_support_body_name=place_support_body_name))
 
+    def check_named_release_precondition(self, scene, support_body_name):
+        """Read the current bilateral held cut without changing follow evidence.
+
+        The caller holds the rig scene lock. The returned cut may be committed
+        only after the same lower gripper owner accepts an open command under
+        that lock; no one-step sensor dropout or historical cut qualifies.
+        """
+        if support_body_name not in self.support_body_names[1:]:
+            raise ObjectMotionPreconditionError("Named release support is not admitted.")
+        generation, target = self.command_state()
+        if (target != 1. or generation != self._generation or not self._verified
+                or self._failure is not None or self._anchor is None
+                or self._last is None or self._last.status != "held_verified"):
+            raise ObjectMotionPreconditionError("Named release requires current verified holding.")
+        stamp, obj, tcp, sides, support, other, measured, _ = self._capture(
+            scene, source_data=scene.data, support_body_name=support_body_name)
+        slip, angle = pose_delta_metrics(
+            self._anchor, rigid_pose(np.linalg.inv(tcp) @ obj,
+                                     name="named release measured tool_from_object"))
+        if (stamp != float(scene.data.time) or not 0 <= stamp - self._last.sim_time_s <= .05 + 1e-9
+                or not all(sides) or support or other or not self.measured_closed(measured)
+                or slip > .003 or angle > 2.):
+            raise ObjectMotionPreconditionError(
+                "Named release requires fresh bilateral, unsupported frozen relation.")
+        return (float(stamp), int(generation))
+
+    def commit_named_release_support(self, support_body_name):
+        """Commit only after same-lock gripper queue acceptance; do not re-anchor."""
+        self._active_support_body_name = support_body_name
+
     def _observe(self, scene, *, phase, establish=False, source_data=None,
                  place_support_body_name=None):
         # State updates and native capture share the original physics-owner lock.

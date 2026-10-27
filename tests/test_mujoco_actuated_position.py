@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import threading
+from types import SimpleNamespace
+
 import numpy as np
 import pytest
-from types import SimpleNamespace
 
 from robot_motion.runtime import EffectorCommand, TeleopCommand
 from sim.contracts import SimulationContract, TimingSpec
@@ -55,6 +57,81 @@ def test_rm65_execution_config_defaults_to_fitted_arm_and_grippers() -> None:
         config.gripper_actuation_profile.name
         == "dmtac_bimanual_position_20260722.v1"
     )
+
+
+def test_atomic_gripper_precondition_never_queues_after_a_rejected_scene_cut() -> None:
+    rig = object.__new__(MujocoPositionExecutionRig)
+    rig._lock = threading.RLock()
+    rig._started = True
+    rig._stop_event = threading.Event()
+    rig._last_worker_error = None
+    rig.scene = SimpleNamespace(data=object())
+    queued = []
+    latest = {"right": (4, 1.)}
+
+    def queue(values):
+        queued.append(dict(values))
+        latest["right"] = (8, values["right"])
+        return 8
+
+    def rollback(sequence, previous):
+        assert sequence == 8
+        queued.clear()
+        latest.update(previous)
+
+    rig._gripper_execution = SimpleNamespace(queue_close_targets=lambda values:
+        queued.append(dict(values)) or 7,
+        latest_command=lambda name: latest[name],
+        rollback_unconsumed_command=rollback)
+
+    def reject(_scene):
+        raise ValueError("measured relation unavailable")
+
+    with pytest.raises(ValueError, match="measured relation unavailable"):
+        rig.queue_gripper_close_targets_after_scene_check({"right": 0.}, scene_check=reject)
+    assert queued == []
+    sequence, cut = rig.queue_gripper_close_targets_after_scene_check(
+        {"right": 0.}, scene_check=lambda scene: scene.data)
+    assert sequence == 7 and cut is rig.scene.data
+    assert queued == [{"right": 0.}]
+    committed = []
+    cancelled = {"value": False}
+
+    def cancel_during_observation(scene):
+        cancelled["value"] = True
+        return scene.data
+
+    sequence, _cut = rig.queue_gripper_close_targets_after_scene_check(
+        {"right": 0.}, scene_check=cancel_during_observation,
+        cancelled=lambda: cancelled["value"],
+        on_queued=lambda _scene, _cut: committed.append(True))
+    assert sequence is None and queued == [{"right": 0.}] and committed == []
+
+    rig._gripper_execution.queue_close_targets = lambda _values: (
+        _ for _ in ()).throw(RuntimeError("lower queue rejected"))
+    with pytest.raises(RuntimeError, match="lower queue rejected"):
+        rig.queue_gripper_close_targets_after_scene_check(
+            {"right": 0.}, scene_check=lambda scene: scene.data,
+            on_queued=lambda _scene, _cut: committed.append(True))
+    assert committed == []
+    rig._gripper_execution.queue_close_targets = queue
+    restored = []
+
+    def fail_after_queue(_scene, _cut):
+        committed.append(True)
+        raise RuntimeError("observer commit failed")
+
+    with pytest.raises(RuntimeError, match="observer commit failed"):
+        rig.queue_gripper_close_targets_after_scene_check(
+            {"right": 0.}, scene_check=lambda scene: scene.data,
+            on_queued=fail_after_queue,
+            on_queue_failed=lambda _scene, _cut: restored.append(True))
+    assert queued == [] and restored == [True] and latest["right"] == (4, 1.)
+    rig._stop_event.set()
+    with pytest.raises(RuntimeError, match="not ready"):
+        rig.queue_gripper_close_targets_after_scene_check(
+            {"right": 0.}, scene_check=lambda _scene: pytest.fail("must not observe"))
+    assert queued == []
 
 
 def _scene_and_profile():

@@ -26,13 +26,17 @@ from .definition import (
     SET_GRIPPER_STATE_SKILL_ID_V1,
     set_gripper_state_schema_entry_v1,
     set_gripper_state_schema_entry_v2,
+    set_gripper_state_schema_entry_v3,
     set_gripper_state_skill_definition_v1,
     set_gripper_state_skill_definition_v2,
+    set_gripper_state_skill_definition_v3,
     validate_no_gripper_task_evaluation_v1,
     validate_set_gripper_state_parameters_v1,
     validate_set_gripper_state_parameters_v2,
+    validate_set_gripper_state_parameters_v3,
     validate_set_gripper_state_result_for_parameters_v1,
     validate_set_gripper_state_result_for_parameters_v2,
+    validate_set_gripper_state_result_for_parameters_v3,
     validate_set_gripper_state_result_v1,
     validate_set_gripper_state_result_v2,
 )
@@ -61,6 +65,7 @@ class GripperSkillDeploymentBinding:
     execution_manifest_hash: str
     skill_version: str = "1"
     port_binding_hash_by_component: Mapping[str, str] | None = None
+    release_support_object_ids: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         for field_name in (
@@ -89,12 +94,14 @@ class GripperSkillDeploymentBinding:
                 or self.port_binding_hash_by_component is not None
             ):
                 raise ValueError("v1 binds exactly the right_gripper component.")
-        elif self.skill_version == "2":
+            if self.release_support_object_ids:
+                raise ValueError("v1 has no named release supports.")
+        elif self.skill_version in {"2", "3"}:
             bindings = dict(self.port_binding_hash_by_component or {})
             if self.component_id != "grippers" or set(bindings) != set(
                 GRIPPER_COMPONENT_IDS
             ):
-                raise ValueError("v2 binds both left_gripper and right_gripper.")
+                raise ValueError("v2/v3 bind both left_gripper and right_gripper.")
             bindings = {
                 key: _required(value, field_name="gripper port binding")
                 for key, value in bindings.items()
@@ -102,6 +109,18 @@ class GripperSkillDeploymentBinding:
             object.__setattr__(
                 self, "port_binding_hash_by_component", MappingProxyType(bindings)
             )
+            if isinstance(self.release_support_object_ids, str):
+                raise ValueError("Release supports require explicit object identities.")
+            supports = tuple(self.release_support_object_ids)
+            if self.skill_version == "2" and supports:
+                raise ValueError("v2 has no named release supports.")
+            if self.skill_version == "3" and (
+                    self.target_kind != "sim" or not supports
+                    or any(not isinstance(name, str) or not name or name != name.strip()
+                           for name in supports)
+                    or len(set(supports)) != len(supports)):
+                raise ValueError("v3 requires distinct sim support identities.")
+            object.__setattr__(self, "release_support_object_ids", supports)
         else:
             raise ValueError("Unsupported gripper Skill version.")
 
@@ -137,12 +156,14 @@ class GripperSkillDeploymentBinding:
                 "route_id": self.route_id,
                 **(
                     {
-                        "skill_version": "2",
+                        "skill_version": self.skill_version,
                         "port_binding_hash_by_component": dict(
                             self.port_binding_hash_by_component
                         ),
+                        **({"release_support_object_ids": self.release_support_object_ids}
+                           if self.skill_version == "3" else {}),
                     }
-                    if self.skill_version == "2"
+                    if self.skill_version in {"2", "3"}
                     else {}
                 ),
             },
@@ -192,17 +213,19 @@ def build_gripper_skill_contract_bundle(
     if not isinstance(binding, GripperSkillDeploymentBinding):
         raise TypeError("binding must be a GripperSkillDeploymentBinding.")
     version = binding.skill_version
-    definition = (
-        set_gripper_state_skill_definition_v1
-        if version == "1"
-        else set_gripper_state_skill_definition_v2
-    )()
-    schema = (
-        set_gripper_state_schema_entry_v1
-        if version == "1"
-        else set_gripper_state_schema_entry_v2
-    )(
+    definition = {
+        "1": set_gripper_state_skill_definition_v1,
+        "2": set_gripper_state_skill_definition_v2,
+        "3": set_gripper_state_skill_definition_v3,
+    }[version]()
+    schema = ({
+        "1": set_gripper_state_schema_entry_v1,
+        "2": set_gripper_state_schema_entry_v2,
+        "3": set_gripper_state_schema_entry_v3,
+    }[version])(
         skill_definition_hash=definition.semantic_content_hash,
+        **({"support_object_ids": binding.release_support_object_ids}
+           if version == "3" else {}),
     )
     definition_catalog = SkillDefinitionCatalog(
         catalog_id="dexteleop.agent_skill_definitions.gripper_control",
@@ -282,17 +305,21 @@ def build_gripper_skill_contract_bundle(
         parameter_schema_hash=route.parameter_schema_hash,
         execution_result_schema_hash=route.execution_result_schema_hash,
         task_evaluation_schema_hash=route.task_evaluation_schema_hash,
-        validate_parameters=validate_set_gripper_state_parameters_v1
-        if version == "1"
-        else validate_set_gripper_state_parameters_v2,
+        validate_parameters=(validate_set_gripper_state_parameters_v1
+            if version == "1" else validate_set_gripper_state_parameters_v2
+            if version == "2" else lambda parameters:
+                validate_set_gripper_state_parameters_v3(
+                    parameters, support_object_ids=binding.release_support_object_ids)),
         validate_execution_result=validate_set_gripper_state_result_v1
         if version == "1"
         else validate_set_gripper_state_result_v2,
         validate_task_evaluation=validate_no_gripper_task_evaluation_v1,
         validate_execution_result_for_parameters=(
             validate_set_gripper_state_result_for_parameters_v1
-            if version == "1"
-            else validate_set_gripper_state_result_for_parameters_v2
+            if version == "1" else validate_set_gripper_state_result_for_parameters_v2
+            if version == "2" else lambda parameters, result:
+                validate_set_gripper_state_result_for_parameters_v3(
+                    parameters, result, support_object_ids=binding.release_support_object_ids)
         ),
     )
     return GripperSkillContractBundle(

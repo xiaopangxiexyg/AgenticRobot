@@ -27,6 +27,78 @@ GRIPPER_COMPONENT_IDS = ("left_gripper", "right_gripper")
 SET_GRIPPER_STATE_RESULT_SCHEMA_V2 = "dexteleop.agent_skill.set_gripper_state_result.v2"
 
 
+def set_gripper_state_skill_definition_v3() -> SkillDefinition:
+    return replace(
+        set_gripper_state_skill_definition_v2(),
+        skill_version="3",
+        summary=("Open or close one selected deployment-bound gripper. An optional "
+                 "named support may be bound only when opening the right hand "
+                 "after a verified grasp; it selects the release observation target "
+                 "without moving the arm. Command completion is not stable release; "
+                 "read the object state after its full observation window."),
+        parameter_semantics_id="gripper_state.selected_optional_named_release.v3",
+    )
+
+
+def set_gripper_state_schema_entry_v3(
+    *, skill_definition_hash: str, support_object_ids: tuple[str, ...]
+) -> AgentSkillSchemaEntry:
+    if isinstance(support_object_ids, str):
+        raise ValueError("v3 support identities must be explicit objects.")
+    names = tuple(support_object_ids)
+    if (not names or any(not isinstance(name, str) or not name or name != name.strip()
+                         for name in names) or len(set(names)) != len(names)):
+        raise ValueError("v3 requires distinct deployment-bound support identities.")
+    base = set_gripper_state_schema_entry_v2(
+        skill_definition_hash=skill_definition_hash)
+    parameters = {
+        **base.parameter_schema,
+        "properties": {**base.parameter_schema["properties"],
+                       "release_support_object_id": {"type": "string", "enum": list(names)}},
+        "allOf": [{"if": {"required": ["release_support_object_id"]},
+                   "then": {"properties": {
+                       "component_id": {"const": "right_gripper"},
+                       "target_state": {"const": "open"}}}}],
+    }
+    schema_hash = agent_skill_schema_document_hash(parameters, schema_kind="parameter")
+    profile_id = "gripper_state.selected_optional_named_release.v3"
+    profile_hash = canonical_content_hash({
+        "parameter_profile_id": profile_id,
+        "parameter_schema_hash": schema_hash,
+        "agent_selectable_parameters": ("component_id", "target_state", "release_support_object_id"),
+    }, domain="dexteleop.agent_skill.gripper_state_parameter_profile.v3")
+    return replace(base, skill_version="3", parameter_schema=parameters,
+        parameter_profiles=(SkillParameterProfileRef(
+            parameter_profile_id=profile_id, parameter_profile_hash=profile_hash,
+            parameter_schema_hash=schema_hash),))
+
+
+def validate_set_gripper_state_parameters_v3(
+    parameters: Mapping[str, Any], *, support_object_ids: tuple[str, ...]
+) -> None:
+    if not isinstance(parameters, Mapping) or set(parameters) not in (
+            {"component_id", "target_state"},
+            {"component_id", "target_state", "release_support_object_id"}):
+        raise ValueError("v3 requires a selected gripper/state and optional named release support.")
+    validate_set_gripper_state_parameters_v2({
+        key: parameters[key] for key in ("component_id", "target_state")})
+    if "release_support_object_id" in parameters and (
+            parameters["component_id"] != "right_gripper"
+            or parameters["target_state"] != "open"
+            or parameters["release_support_object_id"] not in support_object_ids):
+        raise ValueError("Named release requires the admitted right-hand support and open state.")
+
+
+def validate_set_gripper_state_result_for_parameters_v3(
+    parameters: Mapping[str, Any], result: Mapping[str, Any],
+    *, support_object_ids: tuple[str, ...]
+) -> None:
+    validate_set_gripper_state_parameters_v3(
+        parameters, support_object_ids=support_object_ids)
+    validate_set_gripper_state_result_for_parameters_v2(
+        {key: parameters[key] for key in ("component_id", "target_state")}, result)
+
+
 def set_gripper_state_skill_definition_v2() -> SkillDefinition:
     return replace(
         set_gripper_state_skill_definition_v1(),
@@ -301,13 +373,17 @@ __all__ = [
     "SET_GRIPPER_STATE_TARGETS_V1",
     "set_gripper_state_schema_entry_v1",
     "set_gripper_state_schema_entry_v2",
+    "set_gripper_state_schema_entry_v3",
     "set_gripper_state_skill_definition_v1",
     "set_gripper_state_skill_definition_v2",
+    "set_gripper_state_skill_definition_v3",
     "validate_no_gripper_task_evaluation_v1",
     "validate_set_gripper_state_parameters_v1",
     "validate_set_gripper_state_parameters_v2",
+    "validate_set_gripper_state_parameters_v3",
     "validate_set_gripper_state_result_for_parameters_v1",
     "validate_set_gripper_state_result_for_parameters_v2",
+    "validate_set_gripper_state_result_for_parameters_v3",
     "validate_set_gripper_state_result_v1",
     "validate_set_gripper_state_result_v2",
 ]
