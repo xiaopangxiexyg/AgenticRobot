@@ -524,7 +524,7 @@ def test_policy_emission_fanout_is_bounded_bound_and_emission_only() -> None:
         for index in range(120):
             candidate = frontend.step(
                 _observation(timestamp=50.0 + index / 30.0, step_index=index),
-                now=base + index / 30.0,
+                now=max(base + index / 30.0, time.monotonic()),
             )
             if candidate.emission_result.emission is not None:
                 step = candidate
@@ -546,7 +546,7 @@ def test_policy_emission_fanout_is_bounded_bound_and_emission_only() -> None:
         with pytest.raises(TypeError, match="PolicyActionEmission"):
             fanout.put_nowait(step)
     finally:
-        frontend.close(now=base + 5.0)
+        frontend.close(now=max(base + 5.0, time.monotonic()))
 
 
 def test_committed_emission_publisher_validates_commit_ttl_and_idempotency() -> None:
