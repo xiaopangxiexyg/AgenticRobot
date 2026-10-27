@@ -233,6 +233,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--sam3-endpoint", default="http://127.0.0.1:8114")
     parser.add_argument("--sam3-timeout-sec", type=float, default=120.0)
     parser.add_argument("--sam3-min-score", type=float, default=0.2)
+    parser.add_argument("--sam3-multi-instance-text", action="store_true",
+                        help="Opt into bounded SAM3 text instances for localization; default single best.")
     parser.add_argument(
         "--point-grasp-backend",
         choices=tuple(sorted(SUPPORTED_POINT_GRASP_BACKEND_IDS)),
@@ -997,6 +999,10 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--safe-motion-debug-dir requires --safe-motion-observation-roles")
     if args.enable_grasp_observation and (not args.enable_point_grasp or args.point_grasp_backend != "graspgenx"):
         parser.error("--enable-grasp-observation requires --enable-point-grasp and GraspGenX")
+    if args.sam3_multi_instance_text and (
+        not args.enable_point_grasp or args.object_localization_backend != "sam3-service"
+    ):
+        parser.error("--sam3-multi-instance-text requires SAM3 --enable-point-grasp")
     if args.debug_render_object_coordinates and not args.enable_point_grasp:
         parser.error("--debug-render-object-coordinates requires --enable-point-grasp")
     if args.enable_point_grasp_arm_reachability and not args.enable_point_grasp:
@@ -1223,6 +1229,7 @@ def main(argv: list[str] | None = None) -> int:
                 object_localizer = Sam3ServiceLocalizer(
                     endpoint=args.sam3_endpoint, timeout_sec=args.sam3_timeout_sec,
                     min_score=args.sam3_min_score,
+                    multi_instance_text=args.sam3_multi_instance_text,
                 )
             if args.point_grasp_backend == "vgn":
                 point_grasp_spec = VgnPointGraspModelSpec.from_asset_bundle(

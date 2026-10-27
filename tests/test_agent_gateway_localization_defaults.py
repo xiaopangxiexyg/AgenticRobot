@@ -13,6 +13,7 @@ pytestmark = [pytest.mark.unit, pytest.mark.contract]
 def test_default_is_sam3_but_existing_capabilities_are_still_off(module):
     parser = module.build_parser()
     assert parser.get_default("object_localization_backend") == "sam3-service"
+    assert not parser.get_default("sam3_multi_instance_text")
     if module is sim:
         # None distinguishes an explicitly requested endpoint (which also enables
         # segmentation) from the effective default, resolved only when enabled.
@@ -46,7 +47,24 @@ def test_sim_enabled_default_constructs_sam3_without_starting_or_loading_sam2(mo
     assert isinstance(localizer, sam3_service.Sam3ServiceLocalizer)
     assert localizer.model_spec.endpoint == sam3_service.DEFAULT_SAM3_ENDPOINT
     assert not localizer.started
+    assert not localizer.multi_instance_text
     localizer.close()
+
+
+def test_sim_multi_instance_requires_and_reuses_existing_localization_route():
+    parser, args = sim_args("--enable-object-localization", "--sam3-multi-instance-text")
+    localizer = sim._localizer_from_args(parser, args, bundle=None, device="cuda")
+    assert localizer.multi_instance_text
+    assert not localizer.started
+    localizer.close()
+
+    parser, args = sim_args("--sam3-multi-instance-text")
+    with pytest.raises(SystemExit):
+        sim._localizer_from_args(parser, args, bundle=None, device="cuda")
+    parser, args = sim_args("--enable-object-localization", "--sam3-multi-instance-text",
+                            "--object-localization-backend", "sam2-grounding-dino")
+    with pytest.raises(SystemExit):
+        sim._localizer_from_args(parser, args, bundle=None, device="cuda")
 
 
 def test_sim_explicit_sam2_keeps_original_bundle_and_device(monkeypatch, tmp_path):

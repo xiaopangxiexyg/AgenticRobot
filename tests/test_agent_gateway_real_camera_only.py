@@ -28,9 +28,11 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 @pytest.mark.parametrize("backend_args", [[], ["--object-localization-backend", "sam3-service"]])
-@pytest.mark.parametrize("enable_localization", [False, True])
+@pytest.mark.parametrize("enable_localization, multi_instance", [
+    (False, False), (True, False), (True, True),
+])
 def test_camera_only_sam3_binding_never_constructs_sam2_or_starts_devices(
-    monkeypatch, tmp_path, backend_args, enable_localization,
+    monkeypatch, tmp_path, backend_args, enable_localization, multi_instance,
 ):
     from deployments.perception import sam3_service
 
@@ -60,11 +62,14 @@ def test_camera_only_sam3_binding_never_constructs_sam2_or_starts_devices(
         ]
         if enable_localization:
             argv.append("--enable-object-localization")
+        if multi_instance:
+            argv.append("--sam3-multi-instance-text")
         perception_cli.main(argv)
     assert len(captured) == int(enable_localization)
     if enable_localization:
         assert not captured[0]._started
         assert captured[0].model_spec.endpoint == "http://127.0.0.1:18114"
+        assert captured[0].multi_instance_text is multi_instance
 
 
 @pytest.mark.parametrize("backend_args, bundle, message", [
