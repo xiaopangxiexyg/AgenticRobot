@@ -1004,6 +1004,9 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("Point-grasp, back projection or observed safe motion requires the composed camera options")
     if args.safe_motion_debug_dir is not None and args.safe_motion_observation_roles is None:
         parser.error("--safe-motion-debug-dir requires --safe-motion-observation-roles")
+    if "move_to_observed_point" in actions and (
+            not args.enable_back_projection or args.safe_motion_observation_roles is None):
+        parser.error("move_to_observed_point requires --enable-back-projection and --safe-motion-observation-roles")
     if args.enable_grasp_observation and (not args.enable_point_grasp or args.point_grasp_backend != "graspgenx"):
         parser.error("--enable-grasp-observation requires --enable-point-grasp and GraspGenX")
     if args.sam3_multi_instance_text and (

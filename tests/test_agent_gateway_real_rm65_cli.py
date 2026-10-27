@@ -88,6 +88,23 @@ def test_cli_observed_safe_move_does_not_require_grasp_models(tmp_path):
     assert args.safe_motion_debug_dir == tmp_path
 
 
+@pytest.mark.parametrize("extra", [[], ["--enable-back-projection"],
+                                    ["--safe-motion-observation-roles", "main"]])
+def test_observed_point_requires_projection_and_safe_scene_before_devices(monkeypatch, tmp_path, extra):
+    def forbidden(*args, **kwargs):
+        raise AssertionError("Invalid observed-point configuration must fail before device/profile resolution")
+
+    monkeypatch.setattr(gateway_cli, "resolve_exclusive_rm65_skill_deployment_profile", forbidden)
+    argv = _argv(confirmation=REAL_AGENT_PRIMITIVE_SESSION_CONFIRM_TOKEN,
+                 socket_path=tmp_path / "gateway.sock")
+    argv[argv.index("move_tcp_to_pose")] = "move_to_observed_point"
+    camera = str(REPO_ROOT / "pyproject.toml")
+    argv.extend(["--camera-config", camera, "--camera-registry", camera,
+                 "--artifact-root", str(tmp_path), *extra])
+    with pytest.raises(SystemExit, match="2"):
+        gateway_cli.main(argv)
+
+
 def test_cli_debug_scene_requires_observed_safe_move_before_devices(monkeypatch, tmp_path):
     def forbidden(*args, **kwargs):
         raise AssertionError("No profile/device resolution is allowed for invalid debug configuration")

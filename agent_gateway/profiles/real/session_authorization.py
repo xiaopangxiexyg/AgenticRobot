@@ -13,6 +13,7 @@ from agent_gateway.runtime.access_policy import (
     issue_skill_execution_grant,
 )
 from agent_gateway.skills.gripper.definition import SET_GRIPPER_STATE_SKILL_ID_V1
+from agent_gateway.skills.motion.observed_point import SKILL_ID as OBSERVED_POINT_SKILL_ID
 from agent_gateway.skills.motion.definition import (
     ARCHIVED_DEBUG_MOTION_SKILL_IDS_V1,
     EXECUTE_GRASP_APPROACH_PLAN_SKILL_ID_V1,
@@ -31,11 +32,13 @@ REAL_AGENT_PRIMITIVE_SESSION_CONFIRM_TOKEN = "AUTHORIZE_PERSISTENT_REAL_TCP_PRIM
 REAL_AGENT_PRIMITIVE_CONFIRM_TOKEN = REAL_AGENT_PRIMITIVE_SESSION_CONFIRM_TOKEN
 REAL_AGENT_ABSOLUTE_TCP_POSE_ACTION = "move_tcp_to_pose"
 REAL_AGENT_SAFE_TCP_POSE_ACTION = "move_tcp_to_pose_safe"
+REAL_AGENT_OBSERVED_POINT_ACTION = "move_to_observed_point"
 REAL_AGENT_GRASP_APPROACH_ACTION = "approach_grasp_pose"
 REAL_AGENT_EXECUTE_GRASP_APPROACH_PLAN_ACTION = "execute_grasp_approach_plan"
 REAL_AGENT_PRIMITIVE_ACTIONS = (
     REAL_AGENT_ABSOLUTE_TCP_POSE_ACTION,
     REAL_AGENT_SAFE_TCP_POSE_ACTION,
+    REAL_AGENT_OBSERVED_POINT_ACTION,
     REAL_AGENT_GRASP_APPROACH_ACTION,
     REAL_AGENT_EXECUTE_GRASP_APPROACH_PLAN_ACTION,
     "set_gripper_state",
@@ -44,6 +47,7 @@ _FIXED_SKILL_ID_BY_ACTION = {
     "set_gripper_state": SET_GRIPPER_STATE_SKILL_ID_V1,
     REAL_AGENT_ABSOLUTE_TCP_POSE_ACTION: TCP_POSE_TARGET_SKILL_ID_V1,
     REAL_AGENT_SAFE_TCP_POSE_ACTION: SAFE_TCP_POSE_TARGET_SKILL_ID_V1,
+    REAL_AGENT_OBSERVED_POINT_ACTION: OBSERVED_POINT_SKILL_ID,
     REAL_AGENT_GRASP_APPROACH_ACTION: GRASP_APPROACH_SKILL_ID_V1,
     REAL_AGENT_EXECUTE_GRASP_APPROACH_PLAN_ACTION: (
         EXECUTE_GRASP_APPROACH_PLAN_SKILL_ID_V1
@@ -272,7 +276,11 @@ class RealAgentPrimitiveSessionAuthorization:
                 side + "_gripper" for side in self.authorized_gripper_sides
             }:
                 return None
-        elif requested_action in {REAL_AGENT_ABSOLUTE_TCP_POSE_ACTION, REAL_AGENT_SAFE_TCP_POSE_ACTION}:
+        elif requested_action in {
+            REAL_AGENT_ABSOLUTE_TCP_POSE_ACTION,
+            REAL_AGENT_SAFE_TCP_POSE_ACTION,
+            REAL_AGENT_OBSERVED_POINT_ACTION,
+        }:
             if len(component_ids) != 1 or component_ids[0] not in {
                     arm + "_arm" for arm in self.authorized_motion_sides}:
                 return None
@@ -309,6 +317,7 @@ class RealAgentPrimitiveSessionAuthorization:
 
 
 __all__ = [
+    "REAL_AGENT_OBSERVED_POINT_ACTION",
     "REAL_AGENT_ABSOLUTE_TCP_POSE_ACTION",
     "REAL_AGENT_EXECUTE_GRASP_APPROACH_PLAN_ACTION",
     "REAL_AGENT_GRASP_APPROACH_ACTION",

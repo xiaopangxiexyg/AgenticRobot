@@ -27,10 +27,32 @@
 
 RPent 通过原 `build_motion_attachment(..., motion_skill_ids=("motion.move_to_observed_point",), include_execution=True, ...)` 显式选择；仍须发现并选择该 Route 的确切安全配置。新入口没有自己的 Agent 调度器或执行环。RPC、GUI 批准、取消、HOLD 和关闭沿用通用扩展。
 
+RealMan 在原 `real-rm65` 入口显式选择 `--authorized-action move_to_observed_point`，同时要求
+`--enable-back-projection`、`--safe-motion-observation-roles` 和完整相机装配。
+Route 为 `real.rm65.agent_skill_observed_point@1`；未选择该 action 时不发布。
+仍须原会话 operator confirmation、确切 Route/profile/envelope 和每次请求的新鲜、单次使用 grant；
+原 `move_tcp_to_pose_safe` 的授权不能授权这个 action。`component_id` 只选择已授权的一侧，
+双侧部署也每次仅操作一个 arm。调用者只提交上面的五个字段，不能覆盖速度、目标位姿、参考系标识或安全策略。
+
+Real profile 保留激活时实测 TCP 朝向，固定 profile 速度为 `0.2`，使用 `preserve_target`，
+复用已有 `ObservedSafeMovePlanner`、lower dispatch 与 HOLD；缺少 RGB-D safe planner 时装配失败。
+保存点的年龄上限直接沿用该 planner 的 `SafeMotionObservationConfig.maximum_scene_age_sec`，
+默认仍为 30 秒，不增加 TTL 开关。`back_project@2` 使用原 `acquired_at`；`back_project@1`
+没有传感器时间戳，以当前时间减去其 live operation 的 `started_at`，再加上部署相机的
+`max_frame_age_ms`，作为保守年龄上界，不伪造采集时间或忽略相机缓存年龄。
+缺失、失败、异客户端、异会话、异 manifest/Route/binding/profile、错误 frame graph、越界索引、
+过期或未来引用均拒绝。规划结束、lower activation 前再次检查保留身份与年龄，失败进入原 HOLD。
+每次移动的碰撞观测仍由 safe planner 重新采集、校验 TTL、静止性和几何，不复用保存点作为障碍场景。
+
 ## 结果与边界
 
 `observed_point_report` 包含源 operation/request hash、点索引、公开参考系、派生目标、实测终点和位姿误差；原执行/评估/HOLD 回执仍完整保留。到达不是抓取或物理任务成功。
 
-当前实现为 MuJoCo 显式 Route。目标解析器、关系数学和语义 Schema 不依赖仿真物体真值；RealMan 可接入同一输入合同和现有 safe owner，但**尚未发布/验收该真机 Route**。不以 native body pose 或物体标签作为目标输入，不授权真机运动。
+MuJoCo 与 RealMan 共享目标解析器、关系数学和语义 Schema；不以 native body pose 或物体标签作为目标输入。
+RealMan 的协议和路由接线以离线 mock 验证；不代表实际 CAD/FCL 碰撞规划、部署或真机运动验收，也不授权真机运动。
+
+Real focused 验证：`bash scripts/run_pytest.sh -q tests/test_agent_gateway_real_observed_point.py tests/test_agent_gateway_real_motion_primitives.py tests/test_agent_gateway_real_motion_lifecycle.py tests/test_agent_gateway_real_session_authorization.py tests/test_agent_gateway_real_rm65_cli.py`。
+新增 Real 测试替换 native planner 构造并禁止几何 prepare，不启动设备；覆盖源引用、v1/v2、TTL、grant 隔离、
+坐标关系、mock lower arrival/HOLD，以及无路径、取消、deadline、规划后状态未刷新、引用过期/淘汰等失败路径。
 
 验证入口：`bash scripts/run_pytest.sh -q tests/test_observed_point_motion.py`。其中离线部分覆盖身份隔离、淘汰、v1/v2 revision 和非法参数；原生部分覆盖实际 RGB-D 引用、两次移动复用、观测后新增障碍拒绝、无效引用零运动和正常 HOLD/close。模型能力及性能提升以另行冻结的多场景 Agent 对照为准。

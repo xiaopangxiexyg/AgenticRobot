@@ -145,9 +145,11 @@ def _public_tool_profiles(lower: ExclusiveRM65SkillLowerAssembly) -> dict[str, o
     }
 
 
-def _route_ids(*, include_grasp_approach_plan: bool = False, include_safe_pose: bool = False) -> tuple[str, ...]:
+def _route_ids(*, include_grasp_approach_plan: bool = False, include_safe_pose: bool = False,
+               include_observed_point: bool = False) -> tuple[str, ...]:
     return real_agent_motion_route_ids_v1(
         include_safe_pose=include_safe_pose,
+        include_observed_point=include_observed_point,
         include_grasp_approach=True,
         include_grasp_approach_plan=include_grasp_approach_plan,
     )
@@ -418,9 +420,12 @@ def assemble_exclusive_rm65_agent_primitive_composition(
             "provided together."
         )
     grasp_enabled = point_grasp_planner is not None
+    observed_point_enabled = "move_to_observed_point" in normalized_actions
     observed_safe_enabled = safe_motion_observation_config is not None
+    if observed_point_enabled and (not enable_back_projection or not observed_safe_enabled):
+        raise ValueError("Observed-point motion requires back projection and the RGB-D safe scene.")
     if observed_safe_enabled and (not isinstance(safe_motion_observation_config, SafeMotionObservationConfig)
-            or not perception_enabled or "move_tcp_to_pose_safe" not in normalized_actions):
+            or not perception_enabled or not {"move_tcp_to_pose_safe", "move_to_observed_point"}.intersection(normalized_actions)):
         raise ValueError("Observed safe motion requires its typed policy, composed cameras and explicit safe move authorization.")
     if safe_motion_debug_dir is not None:
         if not observed_safe_enabled:
@@ -694,6 +699,7 @@ def assemble_exclusive_rm65_agent_primitive_composition(
         constraint_set_hash=constraint_set_hash,
         allowed_route_ids=_route_ids(
             include_safe_pose="move_tcp_to_pose_safe" in normalized_actions,
+            include_observed_point=observed_point_enabled,
             include_grasp_approach_plan=grasp_enabled,
         ),
     )
@@ -984,7 +990,7 @@ def assemble_exclusive_rm65_agent_primitive_composition(
         if captured_robot_observation_filter is not None:
             planning_geometry_resources = MotionPlanningGeometryResources(
                 self_filter=captured_robot_observation_filter)
-        if "move_tcp_to_pose_safe" in normalized_actions:
+        if {"move_tcp_to_pose_safe", "move_to_observed_point"}.intersection(normalized_actions):
             safe_config = (grasp_trajectory_config or RM65GraspTrajectoryPlanningConfig()).for_tcp_pose_move(
                 translation_tolerance_m=convergence_profile.translation_tolerance_m,
                 rotation_tolerance_rad=convergence_profile.rotation_tolerance_rad)

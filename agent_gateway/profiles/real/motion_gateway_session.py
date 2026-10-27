@@ -74,6 +74,7 @@ from agent_gateway.skills.motion.definition import (
     SAFE_TCP_POSE_TARGET_SKILL_ID_V1,
     TCP_POSE_TARGET_SKILL_ID_V1,
 )
+from agent_gateway.skills.motion.observed_point import SKILL_ID as OBSERVED_POINT_SKILL_ID
 from agent_gateway.transport.unix_transport import (
     AgentGatewayUnixJsonServer,
     AgentGatewayUnixPeerClientMap,
@@ -112,6 +113,8 @@ from .motion_primitive_profiles import (
     RealAgentPrimitiveContractBundle,
 )
 from .motion_primitive_skill import RealAgentPrimitiveSkillLifecycle
+from .motion_observed_scene import ObservedSafeMovePlanner, SafeMotionObservationConfig
+from .observed_point_motion import RealObservedPointMotionLifecycle
 from .object_transport import build_object_transport_executor
 from .observation_gateway import RealControlOwnerState
 from .perception_gateway import build_real_perception_passive_executors
@@ -1380,11 +1383,15 @@ def assemble_real_agent_primitive_gateway_session(
             "Grasp approach Route requires exactly one URDF/FCL trajectory planner."
         )
     safe_pose_enabled = any(
-        entry.route.skill_id == SAFE_TCP_POSE_TARGET_SKILL_ID_V1
+        entry.route.skill_id in {SAFE_TCP_POSE_TARGET_SKILL_ID_V1, OBSERVED_POINT_SKILL_ID}
         for entry in contract_bundle.route_manifest.skill_routes
     )
     if safe_pose_enabled != callable(safe_pose_trajectory_planner):
         raise ValueError("Safe pose Route requires its independently bound trajectory planner.")
+    if contract_bundle.observed_point_profile is not None and (
+            not isinstance(safe_pose_trajectory_planner, ObservedSafeMovePlanner)
+            or not isinstance(safe_pose_trajectory_planner.config, SafeMotionObservationConfig)):
+        raise ValueError("Observed-point Route requires the existing RGB-D safe planner and policy.")
     grasp_approach_plan_enabled = (
         contract_bundle.grasp_approach_plan_registration is not None
     )
@@ -1574,6 +1581,10 @@ def assemble_real_agent_primitive_gateway_session(
                     "Plan execution Route exists without its paired registration."
                 )
             profile = registration.profile
+        elif route.skill_id == OBSERVED_POINT_SKILL_ID:
+            profile = contract_bundle.observed_point_profile
+            if profile is None:
+                raise RuntimeError("Observed-point Route has no bound profile.")
         elif route.skill_id in {
             TCP_POSE_TARGET_SKILL_ID_V1,
             SAFE_TCP_POSE_TARGET_SKILL_ID_V1,
@@ -1595,7 +1606,20 @@ def assemble_real_agent_primitive_gateway_session(
             _binding=binding,
             _profile=profile,
         ):
-            return RealAgentPrimitiveSkillLifecycle(
+            lifecycle_type = RealAgentPrimitiveSkillLifecycle
+            extra = {}
+            if _route.skill_id == OBSERVED_POINT_SKILL_ID:
+                lifecycle_type = RealObservedPointMotionLifecycle
+
+                def lookup_observation(identifier):
+                    source_request = service.operation_store.request_for_operation(identifier)
+                    source_operation = service.operation_store.get(identifier)
+                    return (None if source_request is None or source_operation is None
+                            else (source_request, source_operation))
+
+                extra = {"lookup_observation": lookup_observation,
+                         "observation_config": safe_pose_trajectory_planner.config}
+            return lifecycle_type(
                 port=port,
                 contract_bundle=contract_bundle,
                 route=_route,
@@ -1605,7 +1629,7 @@ def assemble_real_agent_primitive_gateway_session(
                 operation=operation,
                 grasp_trajectory_planner=(
                     safe_pose_trajectory_planner
-                    if _route.skill_id == SAFE_TCP_POSE_TARGET_SKILL_ID_V1
+                    if _route.skill_id in {SAFE_TCP_POSE_TARGET_SKILL_ID_V1, OBSERVED_POINT_SKILL_ID}
                     else grasp_trajectory_planner
                     if _route.skill_id == GRASP_APPROACH_SKILL_ID_V1
                     else None
@@ -1622,6 +1646,7 @@ def assemble_real_agent_primitive_gateway_session(
                 ),
                 clock=clock,
                 sleep=sleep,
+                **extra,
             )
 
         executor = ReusableStationAgentSkillOperationExecutor(
