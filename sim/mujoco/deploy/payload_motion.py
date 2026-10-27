@@ -331,7 +331,12 @@ class MujocoPayloadBinding:
         This survives HOLD/clear. Caller must hold the existing rig scene lock.
         Invalid input raises; measured safety failures return an unsafe check.
         """
-        data = self._copy_actual(scene, scene.data if source_data is None else source_data)
+        # The measured oracle authenticates the current cut and copies it to
+        # its private scratch before kinematics/contact recomputation. An
+        # earlier _copy_actual() here repeated the same full native copy and
+        # collision pass on every control step.
+        self.validate_scene(scene, geometry=False)
+        data = scene.data if source_data is None else source_data
         oracle = self._measured_oracle if _oracle is None else _oracle
         if oracle is not self._measured_oracle or oracle.model is not scene.model:
             raise ValueError("Measured payload oracle must belong to this exact binding/model")

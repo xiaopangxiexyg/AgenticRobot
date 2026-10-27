@@ -122,6 +122,7 @@ def test_native_no_model_target_components_share_an_exact_clock_and_history(
     core = runtime.core
     restored_rig = None
     try:
+        assert runtime.config.prune_expired_proposals is False
         runtime.start()
         assert runtime.clock is rig._clock is core.clock is clock
         assert core.coordinator._clock is core.scheduler._clock is clock

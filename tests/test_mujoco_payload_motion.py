@@ -203,6 +203,25 @@ def test_payload_query_requires_exact_binding_cut_and_rejects_contact_policy_mix
 
 
 @pytest.mark.integration
+def test_measured_guard_reuses_the_oracles_single_private_current_cut(monkeypatch):
+    scene = _scene()
+    binding = _binding(scene)
+    original = scene.mujoco.mj_copyData
+    copies = []
+
+    def copy_data(destination, model, source):
+        copies.append((destination is scene.data, source is scene.data))
+        return original(destination, model, source)
+
+    monkeypatch.setattr(scene.mujoco, "mj_copyData", copy_data)
+    before = (scene.data.qpos.copy(), float(scene.data.time))
+    assert binding.check_measured(scene).safe
+    assert copies == [(False, True)]
+    np.testing.assert_array_equal(scene.data.qpos, before[0])
+    assert float(scene.data.time) == before[1]
+
+
+@pytest.mark.integration
 @pytest.mark.parametrize("changes", [
     {"translation_tolerance_m": .003001},
     {"rotation_tolerance_rad": math.radians(2.001)},

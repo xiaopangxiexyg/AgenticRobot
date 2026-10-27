@@ -290,6 +290,7 @@ def test_dynamic_support_binding_uses_measured_tilted_top_without_stepping(tmp_p
         enable_object_motion=True, enable_object_support_motion_v2=True,
         object_support_body_names=("large_blue_cube",))
     try:
+        assert session.application.runtime.config.prune_expired_proposals is True
         session.application.start_observation_ready()
         scene = session.application.scene
         model, data = scene.model, scene.data
