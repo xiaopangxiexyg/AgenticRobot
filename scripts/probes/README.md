@@ -113,6 +113,9 @@ Skill 或执行链选中。这是离线候选加载能力，不能代替具体�
 
 `link_primitives` 需完整左右 TCP 标定、显式工具范围和 stepped 自观测盒；未识别的附件必须
 选择 `cad_surface`。`Config.for_urdf(...)` 是显式候选选择器，不会被默认构造调用。
+可复用的 DMTAC 显式配置在
+`teleop_runtime/configs/skill_deploy/rm65_dmtac_capture_self_filter_cad_v1.json`；
+它只改变自观测删点，不改变运动碰撞模型或默认 15 mm 策略。
 两种扩展模式只删除冻结捕获中的背景点，始终保护目标标签；缓存仅保存模型局部几何和查询树，
 每帧重新计算双臂与相机变换。输入哈希绑定 URDF 描述、TCP 和自观测盒参数，不是外部 mesh
 内容的完整覆盖证明。运动碰撞仍使用原严格模型与检查对，未将 rigid 候选换为默认。

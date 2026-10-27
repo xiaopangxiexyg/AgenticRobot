@@ -36,6 +36,10 @@ Route 为 `real.rm65.agent_skill_observed_point@1`；未选择该 action 时不�
 
 Real profile 保留激活时实测 TCP 朝向，固定 profile 速度为 `0.2`，使用 `preserve_target`，
 复用已有 `ObservedSafeMovePlanner`、lower dispatch 与 HOLD；缺少 RGB-D safe planner 时装配失败。
+对于 DMTAC 装配，可显式传入
+`--captured-robot-filter-config teleop_runtime/configs/skill_deploy/rm65_dmtac_capture_self_filter_cad_v1.json`
+选择已版本化的 CAD 自观测过滤候选。默认 15 mm 过滤保持不变；该选项只处理捕获点云，
+不替换原严格碰撞模型、起点净空或运动门禁。实际部署须用现场装配和标定复核过滤身份。
 保存点的年龄上限直接沿用该 planner 的 `SafeMotionObservationConfig.maximum_scene_age_sec`，
 默认仍为 30 秒，不增加 TTL 开关。`back_project@2` 使用原 `acquired_at`；`back_project@1`
 没有传感器时间戳，以当前时间减去其 live operation 的 `started_at`，再加上部署相机的
