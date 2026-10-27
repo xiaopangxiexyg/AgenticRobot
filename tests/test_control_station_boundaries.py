@@ -265,6 +265,8 @@ def test_gateway_sim_dependencies_are_confined_to_mujoco_profile() -> None:
         "agent_gateway/profiles/mujoco/motion_gateway_session.py": ["sim"],
         # Sensor-shaped planning is a concrete simulator leaf.
         "agent_gateway/profiles/mujoco/motion_observed_scene.py": ["sim"],
+        # Anchored motion reuses the lower planner's typed rejection in this leaf.
+        "agent_gateway/profiles/mujoco/observed_point_motion.py": ["sim"],
         # The frozen query binds only this concrete simulator's private planner.
         "agent_gateway/profiles/mujoco/object_goal_query.py": ["sim"],
         # The concrete safe-TCP lifecycle binds its lower simulation planner.
@@ -320,6 +322,8 @@ def test_gateway_numerical_dependencies_are_confined_to_concrete_profiles() -> N
         "agent_gateway/profiles/back_projection.py": ["numpy"],
         "agent_gateway/profiles/mujoco/back_projection.py": ["numpy"],
         "agent_gateway/profiles/mujoco/motion_observed_scene.py": ["numpy"],
+        # Candidate actions are constructed only in this concrete motion leaf.
+        "agent_gateway/profiles/mujoco/observed_point_motion.py": ["numpy"],
         "agent_gateway/profiles/mujoco/object_motion.py": ["numpy"],
         "agent_gateway/profiles/mujoco/object_state.py": ["numpy"],
         "agent_gateway/profiles/placement.py": ["numpy"],

@@ -1211,6 +1211,8 @@ MuJoCo 组合显式使用 `--enable-grippers --no-realtime-worker`，或 factory
 不清故障寄存器、不发送开闭命令，也不等同于控制器断电或固件重启。
 重连前后记录设备身份、错误码和 readiness；只有重新读取的新鲜、无故障、静止反馈
 通过原有校验才发布 endpoint。若仍报 0x0010，启动失败并正常清理，由操作者处理设备。
+上述双手限制属于 CLI；Python resource／composition 的显式参数也支持单手，默认仍为关闭，
+并保留相同的精确故障码、单次尝试和新鲜静止反馈检查。
 
 仅配置 backend 不授权开闭；操作者还须独立把 `set_gripper_state` 加入
 `--authorized-actions`。同一 Gateway 的 `gateway.operation` 独占资源及 operation store
