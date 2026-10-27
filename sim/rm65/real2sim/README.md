@@ -92,7 +92,15 @@ core and MuJoCo adapter used for the 20260721 fit; tests compare those hashes to
 fixed historical values rather than silently reinterpreting the fit against
 the current files.
 
-当前显式 SAM3 多实例定位整合使用独立绑定
+当前 SAM3／MuJoCo 携物支撑组合使用独立绑定
+`artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261028_sam3_placement_v1.json`。
+它继承154项输入并更新其中10项，补入九个已改动的夹爪、物体观测、支撑和合同owner，
+共163项输入／160项Python源码，固定于 `b584813411cc`；组合消费者验收652通过。
+真机／仿真夹爪公开操作上限均为15秒，原较短请求与下层保护仍有效；支撑网格严格不超过100000点。
+本批公开新增为显式支撑体v2 Route；释放候选及深度支撑几何仍是下层API，无端到端放置成功声明。
+完整非硬件组合资格另行记录，fit、timing、旧绑定及held-out资格不变。
+
+前驱显式 SAM3 多实例定位整合使用独立绑定
 `artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261028_sam3_candidates_v1.json`。
 它继承前驱全部154项输入／151项Python源码，仅更新三个SAM3客户端／CLI源码身份，
 固定于 `66765c65e736`；定位、分割及三类CLI消费者验收674通过、零跳过／失败。
