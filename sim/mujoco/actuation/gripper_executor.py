@@ -248,6 +248,26 @@ class MujocoDmtacGripperExecutor:
             self._last_status_by_gripper[name] = "held"
         self._write_ctrl()
 
+    def rollback_unconsumed_command(
+        self, sequence: int,
+        previous_commands: Mapping[str, tuple[int, float | None]],
+    ) -> None:
+        """Cancel an accepted command before the next physics tick consumes it.
+
+        The parent rig holds its physics lock throughout queue, callback and
+        rollback. The sequence remains spent, while the effective command seen
+        by the grasp observer returns to the last accepted intent.
+        """
+        if not previous_commands or any(
+            name not in self._latest_command_by_gripper
+            or self._latest_command_by_gripper[name][0] != sequence
+            for name in previous_commands
+        ):
+            self.hold_targets()
+            raise RuntimeError("Queued gripper command changed before rollback.")
+        self.hold_targets()
+        self._latest_command_by_gripper.update(previous_commands)
+
     def before_physics_step(
         self,
         *,

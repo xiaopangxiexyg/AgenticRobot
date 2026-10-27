@@ -391,6 +391,29 @@ def test_gripper_hold_cancels_commands_still_in_transport_delay() -> None:
 
 
 @pytest.mark.slow_sim
+def test_rollback_before_physics_keeps_prior_effective_grasp_command() -> None:
+    pytest.importorskip("mujoco")
+    scene, _arm_profile, profile = _scene()
+    executor = MujocoDmtacGripperExecutor(scene, profile)
+    executor.reset({"left_gripper": 0.0, "right_gripper": 0.0})
+    close_sequence = executor.queue_close_targets({"right_gripper": 1.0})
+    for step in range(1200):
+        executor.before_physics_step(
+            physics_time_sec=step * .001, timestep_sec=.001)
+        scene.mujoco.mj_step(scene.model, scene.data)
+    prior = executor.latest_command("right_gripper")
+    assert prior == (close_sequence, 1.0)
+    before = executor.snapshot()["servo_goal_close_by_gripper"]["right_gripper"]
+    assert before > .9
+    open_sequence = executor.queue_close_targets({"right_gripper": 0.0})
+    executor.rollback_unconsumed_command(open_sequence, {"right_gripper": prior})
+    assert executor.latest_command("right_gripper") == prior
+    assert executor.snapshot()["pending_delayed_targets"] == 0
+    tick = executor.before_physics_step(physics_time_sec=1.2, timestep_sec=.001)
+    assert tick.servo_goal_close_by_gripper["right_gripper"] == pytest.approx(before)
+
+
+@pytest.mark.slow_sim
 def test_gripper_snapshot_is_bound_to_completed_physics_time() -> None:
     pytest.importorskip("mujoco")
     scene, _arm_profile, profile = _scene()

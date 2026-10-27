@@ -1079,6 +1079,56 @@ class MujocoPositionExecutionRig(Rig):
                 raise RuntimeError("No MuJoCo gripper executor is configured.")
             return self._gripper_execution.queue_close_targets(close_by_gripper)
 
+    def queue_gripper_close_targets_after_scene_check(
+        self, close_by_gripper: Mapping[str, float], *,
+        scene_check: Callable[[MujocoScene], object],
+        cancelled: Callable[[], bool] | None = None,
+        on_queued: Callable[[MujocoScene, object], None] | None = None,
+        on_queue_failed: Callable[[MujocoScene, object], None] | None = None,
+    ) -> tuple[int | None, object]:
+        """Atomically bind a measured precondition and the existing gripper queue.
+
+        The trusted caller may update its own observation evidence while
+        inspecting this cut. It cannot advance physics or arm references here.
+        A failed precondition never queues the hand command.
+        """
+        if (not callable(scene_check)
+                or cancelled is not None and not callable(cancelled)
+                or on_queued is not None and not callable(on_queued)
+                or on_queue_failed is not None and not callable(on_queue_failed)):
+            raise TypeError("scene_check and queue callbacks must be callable.")
+        with self._lock:
+            if not self._started or self._stop_event.is_set():
+                raise RuntimeError("MuJoCo position execution is not ready.")
+            if self._last_worker_error is not None:
+                raise RuntimeError(
+                    "MuJoCo position execution is faulted: "
+                    f"{self._last_worker_error}")
+            if self._gripper_execution is None:
+                raise RuntimeError("No MuJoCo gripper executor is configured.")
+            evidence = scene_check(self.scene)
+            if cancelled is not None and cancelled():
+                return None, evidence
+            previous_commands = {
+                name: self._gripper_execution.latest_command(name)
+                for name in close_by_gripper
+            }
+            sequence = self._gripper_execution.queue_close_targets(close_by_gripper)
+            if on_queued is not None:
+                try:
+                    on_queued(self.scene, evidence)
+                except BaseException:
+                    # The lower owner must discard an accepted open before
+                    # releasing the rig lock, even if evidence commit fails.
+                    try:
+                        self._gripper_execution.rollback_unconsumed_command(
+                            sequence, previous_commands)
+                    finally:
+                        if on_queue_failed is not None:
+                            on_queue_failed(self.scene, evidence)
+                    raise
+            return sequence, evidence
+
     def gripper_execution_snapshot(self) -> dict[str, object]:
         """Return the current gripper transport/servo state under the rig lock."""
 
