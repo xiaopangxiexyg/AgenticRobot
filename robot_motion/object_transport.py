@@ -441,6 +441,68 @@ def plan_release_approach(
     )
 
 
+def plan_release_approach_for_relation(
+    held: GraspedObjectObservation,
+    support: SupportSurfaceObservation,
+    *,
+    relation: str,
+    now: float,
+    clearance_m: float,
+    minimum_planning_clearance_m: float,
+    maximum_clearance_m: float,
+    lateral_margin_m: float = 0.,
+    maximum_measurement_age_sec: float = .05,
+    maximum_pair_skew_sec: float = .05,
+) -> ReleaseApproachProposal:
+    """Resolve an explicit support-frame relation without exposing pose floats.
+
+    X-side names refer to the declared reference frame, never an image's
+    visually ambiguous left/right. The original release planner still owns
+    freshness, complete-footprint, clearance and frozen-relation validation.
+    """
+    if relation not in {"center", "reference_x_negative", "reference_x_positive"}:
+        raise ValueError("Unsupported support relation")
+    if not isinstance(held, GraspedObjectObservation) or not isinstance(support, SupportSurfaceObservation):
+        raise TypeError("Relation placement needs typed held and support observations")
+    if (isinstance(lateral_margin_m, (bool, np.bool_))
+            or not math.isfinite(lateral_margin_m) or lateral_margin_m < 0):
+        raise ValueError("Lateral margin must be finite and nonnegative")
+    support_min = np.asarray(support.region_min_xy_m, dtype=float)
+    support_max = np.asarray(support.region_max_xy_m, dtype=float)
+    support_center = (support_min + support_max) / 2.
+    half_box = np.asarray(held.box_size_m, dtype=float) / 2.
+    corners = np.asarray(tuple(product((-1., 1.), repeat=3)), dtype=float) * half_box
+    reference_box_rotation = (held.reference_from_object[:3, :3]
+                              @ held.object_from_box[:3, :3])
+    rotated = corners @ reference_box_rotation.T
+    extent_xy = np.max(np.abs(rotated[:, :2]), axis=0)
+    feasible_min = support_min + lateral_margin_m + extent_xy
+    feasible_max = support_max - lateral_margin_m - extent_xy
+    if not (np.isfinite(extent_xy).all() and np.isfinite(feasible_min).all()
+            and np.isfinite(feasible_max).all()):
+        raise ValueError("Support relation geometry must be finite")
+    if np.any(feasible_min > feasible_max):
+        raise ValueError("Complete held footprint has no feasible support center")
+    target_center = support_center.copy()
+    if relation == "reference_x_negative":
+        if feasible_min[0] >= support_center[0] - 1e-9:
+            raise ValueError("Selected support has no reference-negative-X placement region")
+        target_center[0] = (feasible_min[0] + support_center[0]) / 2.
+    elif relation == "reference_x_positive":
+        if feasible_max[0] <= support_center[0] + 1e-9:
+            raise ValueError("Selected support has no reference-positive-X placement region")
+        target_center[0] = (feasible_max[0] + support_center[0]) / 2.
+    return plan_release_approach(
+        held, support, now=now, clearance_m=clearance_m,
+        minimum_planning_clearance_m=minimum_planning_clearance_m,
+        maximum_clearance_m=maximum_clearance_m,
+        lateral_margin_m=lateral_margin_m,
+        maximum_measurement_age_sec=maximum_measurement_age_sec,
+        maximum_pair_skew_sec=maximum_pair_skew_sec,
+        target_box_center_xy_m=tuple(float(value) for value in target_center),
+    )
+
+
 def verify_rigid_follow(previous: GraspedObjectObservation, current: GraspedObjectObservation,
                         *, translation_tolerance_m: float = .003,
                         rotation_tolerance_deg: float = 2.) -> dict[str, float]:

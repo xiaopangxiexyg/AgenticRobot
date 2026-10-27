@@ -11,6 +11,7 @@ from robot_motion.object_transport import (
     SupportSurfaceObservation,
     object_translation_feedback_tool_goal,
     plan_release_approach,
+    plan_release_approach_for_relation,
     tool_goal_from_object_goal,
     verify_rigid_follow,
 )
@@ -370,6 +371,64 @@ def test_release_target_can_use_an_observed_offcenter_relation_goal():
             minimum_planning_clearance_m=.004, maximum_clearance_m=.05,
             lateral_margin_m=.005,
             target_box_center_xy_m=(-.39, .04))
+
+
+def test_named_support_relation_uses_complete_rotated_footprint():
+    held = observation(box_size_m=(.04, .02, .06),
+        reference_from_object=pose((-.3, 0., .2), (0., 30., 25.)),
+        reference_from_tool=pose((-.31, .01, .3)),
+        object_from_box=pose((.01, 0., .005), (0., 0., 10.)))
+    surface = support(region_min_xy_m=(-.45, -.12),
+        region_max_xy_m=(-.15, .12))
+    options = dict(now=10.02, clearance_m=.006,
+        minimum_planning_clearance_m=.004, maximum_clearance_m=.05,
+        lateral_margin_m=.005)
+    middle = plan_release_approach_for_relation(
+        held, surface, relation="center", **options)
+    direct = plan_release_approach(held, surface, **options)
+    np.testing.assert_allclose(middle.object_goal, direct.object_goal, atol=1e-12)
+    left = plan_release_approach_for_relation(
+        held, surface, relation="reference_x_negative", **options)
+    right = plan_release_approach_for_relation(
+        held, surface, relation="reference_x_positive", **options)
+    # The box center, rather than object-frame origin, follows the named
+    # support relation. The unchanged lower function checks all eight corners.
+    center_offset = (held.reference_from_object[:3, :3]
+                     @ held.object_from_box[:3, 3])[0]
+    assert left.object_goal[0, 3] + center_offset < middle.object_goal[0, 3] + center_offset
+    assert middle.object_goal[0, 3] + center_offset < right.object_goal[0, 3] + center_offset
+    for result in (left, right):
+        assert result.release_clearance_m == .006
+        assert result.evidence_refs == middle.evidence_refs
+        np.testing.assert_allclose(result.tool_goal @ held.tool_from_object,
+                                   result.object_goal, atol=1e-12)
+
+
+def test_named_support_relation_rejects_ambiguous_or_unavailable_region():
+    held = observation(box_size_m=(.035, .035, .035),
+        reference_from_object=pose((0., 0., .1)),
+        reference_from_tool=pose((0., 0., .2)))
+    options = dict(now=10.02, clearance_m=.006,
+        minimum_planning_clearance_m=.004, maximum_clearance_m=.05,
+        lateral_margin_m=.005)
+    with pytest.raises(ValueError, match="Unsupported support relation"):
+        plan_release_approach_for_relation(
+            held, support(), relation="right", **options)
+    with pytest.raises(ValueError, match="no feasible support center"):
+        plan_release_approach_for_relation(
+            held, support(region_min_xy_m=(-.01, -.01),
+                          region_max_xy_m=(.01, .01)), relation="center", **options)
+    just_fits_x = support(region_min_xy_m=(-.0225 - 5e-11, -.1),
+                          region_max_xy_m=(.0225 + 5e-11, .1))
+    plan_release_approach_for_relation(
+        held, just_fits_x, relation="center", **options)
+    for relation in ("reference_x_negative", "reference_x_positive"):
+        with pytest.raises(ValueError, match="no reference-.*-X placement region"):
+            plan_release_approach_for_relation(
+                held, just_fits_x, relation=relation, **options)
+    with pytest.raises(ValueError, match="fresh correlated observations"):
+        plan_release_approach_for_relation(
+            held, support(measured_at=9.0), relation="center", **options)
 
 
 def test_offcenter_release_uses_support_plane_anchor_not_target_center():
