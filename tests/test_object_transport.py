@@ -500,6 +500,34 @@ def test_release_candidates_can_rotate_a_rectangular_object_onto_narrow_support(
     assert all(item.proposal.release_clearance_m == .006 for item in candidates)
 
 
+def test_release_candidates_accept_explicit_bounded_yaw_samples_without_changing_default():
+    held = observation(box_size_m=(.035, .035, .035),
+        reference_from_object=pose((-.285, -.02, .0566)))
+    surface = support(region_min_xy_m=(-.41, -.02),
+                      region_max_xy_m=(-.33, .06))
+    options = dict(now=10.02, clearance_m=.006,
+        minimum_planning_clearance_m=.004, maximum_clearance_m=.05,
+        lateral_margin_m=.005)
+    original = plan_release_approach_candidates(held, surface, **options)
+    angles = (0., -math.radians(80.), -math.pi / 2.)
+    candidates = plan_release_approach_candidates(
+        held, surface, yaw_offsets_rad=angles, **options)
+    assert len(original) == 5 and len(candidates) == 15
+    assert tuple(dict.fromkeys(item.yaw_offset_rad for item in candidates)) == angles
+    np.testing.assert_array_equal(candidates[0].proposal.object_goal,
+                                  original[0].proposal.object_goal)
+    assert all(candidate.proposal.evidence_refs == original[0].proposal.evidence_refs
+               for candidate in candidates)
+    for invalid in ((0., 0.), (True,), (float("nan"),), (math.pi + .01,), ()):
+        with pytest.raises(ValueError, match="Yaw samples|1..8 angles"):
+            plan_release_approach_candidates(
+                held, surface, yaw_offsets_rad=invalid, **options)
+    with pytest.raises(ValueError, match="replace quarter-turn"):
+        plan_release_approach_candidates(
+            held, surface, yaw_offsets_rad=angles,
+            allow_quarter_turns=True, **options)
+
+
 def test_release_candidates_recompute_clearance_after_yaw_for_offset_box():
     held = observation(box_size_m=(.04, .02, .03),
         reference_from_object=pose((-.3, 0., .16), (0., 15., 10.)),

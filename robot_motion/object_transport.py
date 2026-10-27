@@ -566,17 +566,28 @@ def plan_release_approach_candidates(
     maximum_measurement_age_sec: float = .05,
     maximum_pair_skew_sec: float = .05,
     allow_quarter_turns: bool = False,
+    yaw_offsets_rad: tuple[float, ...] | None = None,
 ) -> tuple[ReleaseApproachCandidate, ...]:
     """Bounded on-support proposals for the existing payload-safe planner.
 
     When it fits, the current-orientation center remains first. Four interior
     corners expose room for IK without asking an Agent to copy coordinates.
-    Quarter turns are opt-in because a task may require the observed orientation. No
-    candidate is an authority to move, and the selected support must be
+    Quarter turns or an explicit bounded yaw sample are opt-in because a task
+    may require the observed orientation. No candidate is an authority to move,
+    and the selected support must be
     observed again when execution starts.
     """
     if type(allow_quarter_turns) is not bool:
         raise TypeError("Quarter-turn sampling must be explicitly boolean")
+    if yaw_offsets_rad is not None:
+        if allow_quarter_turns or not isinstance(yaw_offsets_rad, (tuple, list)) or not 1 <= len(yaw_offsets_rad) <= 8:
+            raise ValueError("Explicit yaw samples replace quarter-turn sampling and require 1..8 angles")
+        if any(isinstance(angle, (bool, np.bool_)) or not isinstance(angle, (int, float))
+               or not math.isfinite(angle) or not -math.pi <= angle <= math.pi
+               for angle in yaw_offsets_rad):
+            raise ValueError("Yaw samples must be finite radians in [-pi, pi]")
+        if len({round(float(angle), 12) for angle in yaw_offsets_rad}) != len(yaw_offsets_rad):
+            raise ValueError("Yaw samples must be unique")
     _require_release_observations(
         held, support, now=now, clearance_m=clearance_m,
         minimum_planning_clearance_m=minimum_planning_clearance_m,
@@ -588,7 +599,12 @@ def plan_release_approach_candidates(
     center = (np.asarray(support.region_min_xy_m)
               + support.region_max_xy_m) / 2.
     candidates = []
-    angles = (0., -math.pi / 2., math.pi / 2., math.pi) if allow_quarter_turns else (0.,)
+    if yaw_offsets_rad is not None:
+        angles = tuple(float(angle) for angle in yaw_offsets_rad)
+    elif allow_quarter_turns:
+        angles = (0., -math.pi / 2., math.pi / 2., math.pi)
+    else:
+        angles = (0.,)
     fractions = ((0., 0.), (.85, .85), (.85, -.85), (-.85, .85), (-.85, -.85))
     for angle in angles:
         z_rotation = np.array([
