@@ -160,6 +160,20 @@ def test_bundle_load_is_offline_and_digest_checked(tmp_path):
         load_operator_scene_sample(root)
 
 
+@pytest.mark.parametrize("status", ["partial", "failed"])
+def test_partial_or_failed_sample_can_be_inspected_but_not_exported_for_planning(tmp_path, status):
+    root = sample(tmp_path)
+    record = json.loads((root / "record.json").read_text())
+    record["status"] = status
+    (root / "record.json").write_text(json.dumps(record))
+    scene = load_operator_scene_sample(root)
+    assert scene.record["status"] == status
+    output = tmp_path / "not-created"
+    with pytest.raises(ValueError, match="requires_complete_capture"):
+        export_replay_capture(scene, output)
+    assert not output.exists()
+
+
 def test_zip_traversal_and_pickle_are_rejected(tmp_path):
     path = tmp_path / "bad.zip"
     with zipfile.ZipFile(path, "w") as z:

@@ -138,6 +138,8 @@ def export_replay_capture(scene: RecordedOperatorScene, output: Path):
     only with a nearby stationary wrist cut and preserve that distinction.
     No interpolation, invented state or present-day camera transform is used.
     """
+    if scene.record.get("status") != "complete":
+        raise ValueError("recorded_scene_requires_complete_capture_for_replay")
     from teleop_runtime.skill_deploy.motion_port import (
         REAL_AGENT_TRAJECTORY_START_MAX_DRIFT_RAD,
     )
