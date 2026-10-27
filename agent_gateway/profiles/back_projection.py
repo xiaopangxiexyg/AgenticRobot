@@ -213,6 +213,93 @@ class ProjectedDepthGeometry:
     valid_point_count: int
 
 
+@dataclass(frozen=True)
+class ProjectedSupportSurface:
+    """Top-plane candidate, not proof that the entire XY AABB is supported."""
+
+    upper_top_z_m: float
+    normal_reference_xyz: tuple[float, float, float]
+    observed_bounds_min_xy_m: tuple[float, float]
+    observed_bounds_max_xy_m: tuple[float, float]
+    maximum_plane_residual_m: float
+    top_point_count: int
+
+
+def project_depth_mask_support_surface(
+    capture: LiveAlignedDepthCapture,
+    mask: np.ndarray,
+    *,
+    mask_clipped: bool,
+    maximum_depth_m: float,
+    minimum_top_points: int = 32,
+    maximum_tilt_deg: float = 1.,
+    maximum_plane_residual_m: float = .002,
+    top_height_margin_m: float = .002,
+) -> ProjectedSupportSurface:
+    """Fit only a measured top patch; reject sides, clipping and poor geometry.
+
+    The returned XY bounds are only quantiles of observed top points. They are
+    not automatically an inscribed supported rectangle: rotated surfaces,
+    holes and occlusion need separate conservative qualification before use as
+    SupportSurfaceObservation. upper_top_z_m includes a positive error margin.
+    This operation is read-only and does not assert identity or motion safety.
+    """
+    if not isinstance(capture, LiveAlignedDepthCapture):
+        raise TypeError("A bound metric-depth capture is required")
+    selected = np.asarray(mask)
+    if selected.dtype != np.bool_ or selected.shape != capture.depth_m.shape:
+        raise ValueError("Support mask must be a paired full-resolution boolean grid")
+    if type(mask_clipped) is not bool or mask_clipped:
+        raise ValueError("Clipped or unverified support masks are not complete regions")
+    if (isinstance(minimum_top_points, bool) or not isinstance(minimum_top_points, int)
+            or minimum_top_points < 16):
+        raise ValueError("Support plane needs at least sixteen measured top points")
+    for name, value in (("maximum_depth_m", maximum_depth_m),
+                        ("maximum_tilt_deg", maximum_tilt_deg),
+                        ("maximum_plane_residual_m", maximum_plane_residual_m),
+                        ("top_height_margin_m", top_height_margin_m)):
+        if isinstance(value, bool) or not math.isfinite(value) or value <= 0:
+            raise ValueError(f"{name} must be finite and positive")
+    if maximum_tilt_deg > 1. or maximum_plane_residual_m > .002 or top_height_margin_m > .005:
+        raise ValueError("Support plane and uncertainty limits exceed the release geometry profile")
+    valid = (selected & np.isfinite(capture.depth_m)
+             & (capture.depth_m > 0.) & (capture.depth_m <= maximum_depth_m))
+    rows, cols = np.nonzero(valid)
+    if len(rows) < minimum_top_points:
+        raise ValueError("Support mask has insufficient valid metric depth")
+    points = _project_pixels(
+        u=cols.astype(np.float64), v=rows.astype(np.float64),
+        depth=capture.depth_m[valid].astype(np.float64),
+        intrinsics=capture.intrinsics,
+        reference_from_camera=capture.reference_from_camera)
+    threshold = float(np.quantile(points[:, 2], .8))
+    top = points[points[:, 2] >= threshold - 1e-9]
+    if len(top) < minimum_top_points:
+        raise ValueError("Support top has insufficient measured coverage")
+    centered = top - np.mean(top, axis=0)
+    _, singular, vectors = np.linalg.svd(centered, full_matrices=False)
+    if singular[1] <= 1e-5:
+        raise ValueError("Support top is geometrically degenerate")
+    normal = vectors[-1]
+    if normal[2] < 0:
+        normal = -normal
+    if normal[2] < math.cos(math.radians(maximum_tilt_deg)):
+        raise ValueError("Observed support top is not near-horizontal")
+    residual = np.abs(centered @ normal)
+    max_residual = float(np.quantile(residual, .95))
+    if max_residual > maximum_plane_residual_m:
+        raise ValueError("Observed support top does not fit a stable plane")
+    xy_bounds = np.quantile(top[:, :2], [.05, .95], axis=0)
+    if np.any(xy_bounds[1] <= xy_bounds[0]):
+        raise ValueError("Observed support top has no finite placement region")
+    return ProjectedSupportSurface(
+        upper_top_z_m=float(np.max(top[:, 2]) + top_height_margin_m),
+        normal_reference_xyz=tuple(float(value) for value in normal),
+        observed_bounds_min_xy_m=tuple(float(value) for value in xy_bounds[0]),
+        observed_bounds_max_xy_m=tuple(float(value) for value in xy_bounds[1]),
+        maximum_plane_residual_m=max_residual, top_point_count=len(top))
+
+
 def project_depth_mask_geometry(
     capture: LiveAlignedDepthCapture,
     mask: np.ndarray,
