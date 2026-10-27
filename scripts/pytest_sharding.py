@@ -114,11 +114,17 @@ FULL_WEIGHTS = {
     "tests/test_agent_gateway_mujoco_back_projection.py": 8.847,
 }
 
-# Modules normally remain the isolation unit. These two long-running modules
-# have independent top-level tests: replay uses function-local tmp_path logs
-# and fresh runtimes, not shared rollout fixtures. Parameter matrices remain
-# intact. Unlisted functions share the measured residual and stay collected.
+# Modules normally remain the isolation unit. Reviewed exceptions have
+# independent top-level tests and no shared live runtime fixture. Native
+# Gateway families split to bound closed scene cycles within each process;
+# replay uses function-local logs and fresh runtimes. Parameter matrices stay
+# intact. Unlisted functions share the module residual and stay collected.
 FULL_SPLIT_NODE_WEIGHTS = {
+    # Retain existing module estimates as uniform seeds, not timings from the
+    # interrupted compressed Run. Every current/new top-level function stays
+    # selected; fresh full-green evidence may refine these estimates later.
+    "tests/test_agent_gateway_mujoco_fast_grasp.py": {},
+    "tests/test_agent_gateway_mujoco_safe_tcp_pose.py": {},
     # Same ec122623b green Run as FULL_WEIGHTS; registered functions and
     # complete parameter matrices stay intact. Only timing data changes.
     "tests/test_mujoco_temp_pipeline.py": {

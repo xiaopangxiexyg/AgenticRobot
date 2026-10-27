@@ -167,52 +167,55 @@ def test_native_proposal_preparation_stops_at_the_shared_deadline(tmp_path):
 
 @pytest.mark.integration
 @pytest.mark.parametrize("failure", [None, "query", "validation", "cancel", "scene", "deadline", "foreign"])
-def test_native_refinement_replaces_only_owned_unchanged_fully_validated_plan(tmp_path, monkeypatch, failure):
+def test_native_refinement_replaces_only_owned_unchanged_fully_validated_plan(monkeypatch, failure):
+    from mujoco_plan_ownership_fixture import pending_chain_planner
     from deployments.perception.grasp_first_path import GraspPathQueryRejected
-    from sim.mujoco.deploy.planned_tcp_motion import (
-        MujocoTcpMotionPlan,
-        MujocoTcpPlanRejected,
-    )
-    session = _session(tmp_path)
-    try:
-        session.application.start_observation_ready()
-        native = session.application.target.planned_tcp_motion
-        # Fake only the expensive path-return port; this checks the actual
-        # native ownership transaction, not geometry or path feasibility.
-        original = MujocoTcpMotionPlan(path=None, trajectory=None,
-            source_model_qpos=native._model_qpos().copy(), reference_poses=(), trajectory_hash="a" * 64)
-        refined = replace(original, trajectory_hash="b" * 64)
-        native._pending_plan = original if failure != "foreign" else refined
-        clock, cancelled = [0.], [False]
-        def preview(_goals, **kwargs):
-            assert native.owns_pending_plan(original)
-            np.testing.assert_array_equal(kwargs["preview_model_qpos"], original.source_model_qpos)
-            if failure == "query":
-                raise MujocoTcpPlanRejected("safe_tcp_target_blocked")
-            if failure == "cancel":
-                cancelled[0] = True
-            if failure == "scene":
-                session.application.scene.data.qpos[0] += .001
-            if failure == "deadline":
-                clock[0] = 4.
-            return refined
-        monkeypatch.setattr(native, "plan_chain", preview)
-        def validate(plan):
-            assert plan is refined and native.owns_pending_plan(original)
-            if failure == "validation":
-                raise GraspPathQueryRejected("grasp_fast_path_exceeds_execution_budget")
-        def query():
-            return native.refine_pending_chain(original, (), cancel_requested=lambda: cancelled[0],
-                time_budget_sec=3., deadline_at=20., monotonic=lambda: clock[0], validate_plan=validate)
-        if failure is None:
-            assert query() is refined and native.owns_pending_plan(refined)
-        else:
-            with pytest.raises((MujocoTcpPlanRejected, GraspPathQueryRejected)):
-                query()
-            assert native.owns_pending_plan(refined if failure == "foreign" else original)
-        assert not native.active
-    finally:
-        assert session.close().accepted
+    from sim.mujoco.deploy.planned_tcp_motion import MujocoTcpPlanRejected
+
+    # The transaction never queries geometry: keep the real planner and locks,
+    # with a small scene cut instead of rebuilding a complete Gateway per failure case.
+    native, original = pending_chain_planner()
+    refined = replace(original, trajectory_hash="b" * 64)
+    native._pending_plan = original if failure != "foreign" else refined
+    clock, cancelled = [0.], [False]
+    def preview(_goals, **kwargs):
+        assert native.rig.scene_lock._is_owned()
+        assert native.owns_pending_plan(original)
+        np.testing.assert_array_equal(kwargs["preview_model_qpos"], original.source_model_qpos)
+        if failure == "query":
+            raise MujocoTcpPlanRejected("safe_tcp_target_blocked")
+        if failure == "cancel":
+            cancelled[0] = True
+        if failure == "scene":
+            native.scene.data.qpos[0] += .001
+        if failure == "deadline":
+            clock[0] = 4.
+        return refined
+    monkeypatch.setattr(native, "plan_chain", preview)
+    def validate(plan):
+        assert native.rig.scene_lock._is_owned()
+        assert plan is refined and native.owns_pending_plan(original)
+        if failure == "validation":
+            raise GraspPathQueryRejected("grasp_fast_path_exceeds_execution_budget")
+    def query():
+        return native.refine_pending_chain(original, (), cancel_requested=lambda: cancelled[0],
+            time_budget_sec=3., deadline_at=20., monotonic=lambda: clock[0], validate_plan=validate)
+    if failure is None:
+        assert query() is refined and native.owns_pending_plan(refined)
+    else:
+        reasons = {
+            "query": "safe_tcp_target_blocked",
+            "validation": "grasp_fast_path_exceeds_execution_budget",
+            "cancel": "safe_tcp_planning_cancelled",
+            "scene": "safe_tcp_scene_changed_during_planning",
+            "deadline": "safe_tcp_planning_budget_exhausted",
+            "foreign": "safe_tcp_plan_not_owned_by_runtime",
+        }
+        with pytest.raises((MujocoTcpPlanRejected, GraspPathQueryRejected)) as error:
+            query()
+        assert error.value.reason_code == reasons[failure]
+        assert native.owns_pending_plan(refined if failure == "foreign" else original)
+    assert not native.active
 
 
 @pytest.mark.integration
@@ -480,6 +483,7 @@ class _BlueMask:
 
 def _session(tmp_path, *, trace=None, retained_selector=False, terminal_offset_m=0.01,
              pregrasp_distance_m=0.07, alignment_profile_id=DMTAC_M_GRASPGENX_ALIGNMENT_PROFILE_ID):
+    from mujoco_gateway_fixture import build_gateway_session
     (tmp_path / "artifacts").mkdir()
     client = _PlannerClient(np.empty((0, 4, 4)), np.empty(0))
     model = Sam2GraspGenXPointGraspPlanner(
@@ -489,7 +493,8 @@ def _session(tmp_path, *, trace=None, retained_selector=False, terminal_offset_m
         alignment_profile_id=alignment_profile_id,
         enable_finger_exchange=True,
     )
-    session = build_mujoco_agent_tcp_pose_gateway_session(
+    session = build_gateway_session(
+        build_mujoco_agent_tcp_pose_gateway_session,
         target_config=MujocoSimHILTargetConfig(
             task_config_path=resolve_path(TASK),
             realtime_worker=False,

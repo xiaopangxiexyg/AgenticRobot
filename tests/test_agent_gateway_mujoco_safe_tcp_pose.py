@@ -32,13 +32,15 @@ CLIENT = "test:mujoco-safe-tcp"
 
 
 def _session(trace, *, after_fact=None, task=TASK, spatial=False, grasp=False,
-             contact_target=None, motion_side="right", safe_profile="local_step", queries=False, path_constraints=False, continuations=False):
+             contact_target=None, motion_side="right", safe_profile="local_step", queries=False, path_constraints=False, continuations=False, use_model_cache=True):
+    from mujoco_gateway_fixture import build_gateway_session
     def consume(fact):
         trace.append(fact)
         if after_fact is not None:
             after_fact(fact)
 
-    return build_mujoco_agent_tcp_pose_gateway_session(
+    return build_gateway_session(
+        build_mujoco_agent_tcp_pose_gateway_session, use_model_cache=use_model_cache,
         target_config=MujocoSimHILTargetConfig(
             task_config_path=resolve_path(task),
             realtime_worker=False,
