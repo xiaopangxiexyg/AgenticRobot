@@ -21,6 +21,7 @@ from agent_gateway.skills.gripper.runtime import (
     assemble_gripper_agent_gateway_session,
 )
 from dataset_contracts.canonical_encoding import canonical_content_hash
+from sim.mujoco.deploy.grasp_contact import MujocoGraspContactBinding
 
 
 class MujocoGripperControlPort:
@@ -37,6 +38,7 @@ class MujocoGripperControlPort:
         clock=time.monotonic,
         arm_held: Callable[[], bool] | None = None,
         stationary_joint_speed_rad_sec: float = 0.02,
+        target_contact_binding: MujocoGraspContactBinding | None = None,
     ) -> None:
         if not callable(clock):
             raise TypeError("clock must be callable.")
@@ -70,6 +72,15 @@ class MujocoGripperControlPort:
         self.gripper_name = str(gripper_name).strip()
         if not self.gripper_name:
             raise ValueError("gripper_name must be non-empty.")
+        if target_contact_binding is not None:
+            if (not isinstance(target_contact_binding, MujocoGraspContactBinding)
+                    or component_id != "right_gripper"
+                    or len(target_contact_binding.sensor_geom_names) != 2):
+                raise ValueError("Target contact must bind the right gripper and two native sensors.")
+            rig.capture_scene(lambda scene: target_contact_binding.pair_clearances(scene))
+        self.target_contact_binding = target_contact_binding
+        self._contact_scratch = None
+        self._contact_model = None
         profile = getattr(rig.config, "gripper_actuation_profile", None)
         side_binding = getattr(profile, "gripper_for_side", None)
         if explicit_component or profile is not None:
@@ -88,6 +99,9 @@ class MujocoGripperControlPort:
                 "actuation_profile": None if actuator_profile is None else actuator_profile.to_metadata(),
                 "requires_arm_hold": arm_held is not None,
                 "stationary_joint_speed_rad_sec": stationary_joint_speed_rad_sec,
+                **({} if target_contact_binding is None else {
+                    "target_contact_binding_hash": target_contact_binding.semantic_content_hash,
+                }),
             },
             domain="dexteleop.agent_skill.gripper_port_binding.v1",
         )
@@ -159,10 +173,17 @@ class MujocoGripperControlPort:
         # A settled interpolator is not proof that the physical hand stopped.
         moving = bool(pending or abs(rate) > 1e-5
                       or joint_speed > self._stationary_joint_speed_rad_sec)
+        contact = None
+        if self.target_contact_binding is not None:
+            contact = bool(
+                not moving and self.target_command_settled(snapshot)
+                and self.rig.capture_scene(self._target_bilateral_contact)
+            )
         observed_at = float(self.clock())
         return GripperStateSample(
             measured_close=measured,
             moving=moving,
+            target_contact_confirmed=contact,
             fault_code=None,
             observed_at=observed_at,
             evidence_ref=self._ref(
@@ -170,11 +191,54 @@ class MujocoGripperControlPort:
                 {
                     "measured_close": measured,
                     "moving": moving,
+                    "target_contact_confirmed": contact,
                     "max_joint_speed_rad_sec": joint_speed,
                     "observed_at": observed_at,
                 },
             ),
         )
+
+    def target_command_settled(self, snapshot=None) -> bool:
+        """Read the existing actuator and joint cut; no new motion or owner."""
+        if snapshot is None:
+            snapshot = self.rig.gripper_execution_snapshot()
+        name = self.gripper_name
+        return bool(
+            name not in snapshot["pending_close_by_gripper"]
+            and float(snapshot["accepted_close_by_gripper"][name]) == 1.0
+            and float(snapshot["actuator_target_close_by_gripper"][name]) >= 1.0 - 1e-8
+            and abs(float(snapshot["actuator_target_rate_by_gripper"][name])) <= 1e-5
+            and float(snapshot["measured_max_joint_speed_rad_sec_by_gripper"][name])
+            <= self._stationary_joint_speed_rad_sec
+        )
+
+    def _target_bilateral_contact(self, scene) -> bool:
+        binding = self.target_contact_binding
+        if binding is None:
+            return False
+        model, mj = scene.model, scene.mujoco
+        if self._contact_scratch is None:
+            self._contact_scratch, self._contact_model = mj.MjData(model), model
+        if self._contact_model is not model:
+            raise ValueError("Target contact model changed.")
+        data = self._contact_scratch
+        mj.mj_copyData(data, model, scene.data)
+        mj.mj_kinematics(model, data)
+        mj.mj_collision(model, data)
+        target = int(model.body(binding.target_body_name).id)
+        target_geoms = {int(g) for g in range(model.ngeom)
+                        if int(model.geom_bodyid[g]) == target and model.geom_contype[g] == 8}
+        sensors = {int(model.geom(name).id) for name in binding.sensor_geom_names}
+        touching = set()
+        for item in data.contact[:int(data.ncon)]:
+            if item.dist > 0:
+                continue
+            a, b = int(item.geom1), int(item.geom2)
+            if a in target_geoms and b in sensors:
+                touching.add(b)
+            elif b in target_geoms and a in sensors:
+                touching.add(a)
+        return touching == sensors
 
     def poll_state(self) -> GripperStateSample:
         self.rig.step_physics()

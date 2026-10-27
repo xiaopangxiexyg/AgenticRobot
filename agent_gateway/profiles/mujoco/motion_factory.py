@@ -898,7 +898,11 @@ def build_mujoco_agent_tcp_pose_gateway_session(
                 raise ValueError("Composed grippers require both configured hands.")
             gripper_ports = {side + "_gripper": MujocoGripperControlPort(
                 rig=target.runtime.rig, gripper_name=name, component_id=side + "_gripper",
-                clock=target.runtime.clock, arm_held=lambda: application.held)
+                clock=target.runtime.clock, arm_held=lambda: application.held,
+                target_contact_binding=(
+                    grasp_contact_binding
+                    if enable_object_follow_observation and side == "right" else None
+                ))
                 for name, side in prepared.gripper_profile.side_by_gripper.items()}
         contract_bundle = build_mujoco_agent_tcp_pose_contract_bundle(
             application=application,

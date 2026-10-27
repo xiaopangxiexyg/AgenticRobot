@@ -113,7 +113,8 @@ class MujocoAgentObjectMotionLifecycle(MujocoAgentSafeTcpPoseSkillLifecycle):
                 tcp_pose_from_data=lambda data: observer.world_tcp_from_scene(view(data)),
                 gripper_closed_from_data=lambda data: (
                     observer.command_state() == (cut.command_generation, 1.)
-                    and view(data).get_gripper_close(observer.gripper_name) >= .05),
+                    and observer.measured_closed(
+                        view(data).get_gripper_close(observer.gripper_name))),
                 tool_from_object=cut.tool_from_object, support=support,
                 measured_guard=measured_guard, guard_identity=self.motion_profile.semantic_content_hash)
 

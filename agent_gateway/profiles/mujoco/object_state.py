@@ -56,7 +56,9 @@ class MujocoObjectStateSource:
                 support_body_names=(application.task_config.table_body_name,),
                 gripper_name=gripper_port.gripper_name,
                 command_state=lambda: rig.latest_gripper_command(gripper_port.gripper_name),
-                world_tcp_from_scene=world_tcp, track_close_contacts=True)
+                world_tcp_from_scene=world_tcp, track_close_contacts=True,
+                contact_verified_close=gripper_port.target_contact_binding is not None,
+                gripper_settled=gripper_port.target_command_settled)
             rig.set_physics_step_observer(self._follow.observe_physics_step)
 
     @property

@@ -12,25 +12,44 @@ from sim.mujoco.deploy.grasped_object import (
 pytestmark = pytest.mark.unit
 
 
-def _observer(*, track_close_contacts=False):
+def _observer(*, track_close_contacts=False, contact_verified_close=False):
     plant = SimpleNamespace(time=0., z=0., support=True, other=False, slip=0.,
-                            sides=(True, True), command=(1, 1.0))
+                            sides=(True, True), command=(1, 1.0),
+                            measured=.2, settled=True)
     plant.data = object()
     plant.scene = SimpleNamespace(data=plant.data)
     observer = MujocoGraspedObjectObserver(
         rig=SimpleNamespace(capture_scene=lambda callback: callback(plant.scene)), object_body_name="cube",
         sensor_geom_names=("left_sensor", "right_sensor"), support_body_names=("table",),
         gripper_name="right", command_state=lambda: plant.command,
-        world_tcp_from_scene=lambda _: np.eye(4), track_close_contacts=track_close_contacts)
+        world_tcp_from_scene=lambda _: np.eye(4), track_close_contacts=track_close_contacts,
+        contact_verified_close=contact_verified_close,
+        gripper_settled=(lambda: plant.settled) if contact_verified_close else None)
 
     def capture(_, source_data=None):
         obj, tcp = np.eye(4), np.eye(4)
         obj[:3, 3] = (plant.slip, 0, .05 + plant.z)
         tcp[2, 3] = .1 + plant.z
-        return plant.time, obj, tcp, plant.sides, plant.support, plant.other, .2, tuple(obj[:3, 3])
+        return plant.time, obj, tcp, plant.sides, plant.support, plant.other, plant.measured, tuple(obj[:3, 3])
 
     observer._capture = capture
     return plant, observer
+
+
+def test_contact_verified_close_waits_for_settled_hand_before_freezing_relation():
+    plant, observer = _observer(track_close_contacts=True, contact_verified_close=True)
+    plant.measured, plant.settled = .045, False
+    _physics_observation(plant, observer)
+    assert observer.latest is None
+    plant.time, plant.settled = .01, True
+    _physics_observation(plant, observer)
+    assert observer.latest is not None
+    assert observer.latest.status == "contact_secured"
+    frozen = observer.latest.tool_from_object.copy()
+    plant.time, plant.slip = .02, .004
+    _physics_observation(plant, observer)
+    assert observer._failure is not None
+    np.testing.assert_array_equal(observer.latest.tool_from_object, frozen)
 
 
 def _lift(plant, observer):

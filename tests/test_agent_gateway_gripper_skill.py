@@ -214,6 +214,7 @@ def test_gateway_executes_closed_contact_settle_and_reuses_executor() -> None:
     assert port.commanded == [1.0]
     assert len(port.holds) == 1
 
+
     port.samples.extend(
         [
             (0.4, False),  # next passive observation
@@ -248,6 +249,38 @@ def test_gateway_executes_closed_contact_settle_and_reuses_executor() -> None:
     assert open_operation.execution_result["completion_kind"] == "target_reached"
     assert port.commanded == [1.0, 0.0]
     assert len(port.holds) == 2
+
+
+def test_target_bilateral_contact_can_settle_before_the_fixed_close_fraction() -> None:
+    class ContactPort(FakeGripperPort):
+        def observe_state(self):
+            sample = super().observe_state()
+            return replace(sample, target_contact_confirmed=(
+                sample.measured_close == .045 and sample.moving is False
+            ))
+
+    port = ContactPort([(0., False), (.045, True), (.045, False),
+                        (.045, False), (.045, False)])
+    bundle = _sim_bundle(port)
+    session = assemble_gripper_agent_gateway_session(
+        contract_bundle=bundle, port=port, allowed_client_ids=("client:test",),
+        current_station_revision=lambda: 3, clock_domain_id="clock:test",
+        convergence=GripperConvergenceProfile(
+            minimum_contact_settle_sec=0., poll_interval_sec=0.))
+    try:
+        snapshot = session.publish_observation()
+        request = _request(bundle, snapshot, target_state="closed")
+        admitted = session.service.submit_request(request=request, current_station_revision=3)
+        assert admitted.accepted and admitted.operation is not None
+        assert session.service.launch_operation(admitted.operation.operation_id).accepted
+        assert session.executor.wait(timeout_sec=1.)
+        operation = session.service.get_operation(admitted.operation.operation_id)
+        assert operation.execution_outcome == "completed"
+        assert operation.execution_result["measured_close"] == pytest.approx(.045)
+        assert operation.execution_result["completion_kind"] == "settled_before_full_close"
+        assert port.holds
+    finally:
+        session.close()
 
 
 def test_wire_adapter_observation_uses_receiver_admission_outcome() -> None:

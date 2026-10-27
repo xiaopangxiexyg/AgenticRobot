@@ -56,7 +56,8 @@ class MujocoGraspedObjectObserver:
     """
 
     def __init__(self, *, rig, object_body_name, sensor_geom_names, support_body_names,
-                 gripper_name, command_state, world_tcp_from_scene, track_close_contacts=False):
+                 gripper_name, command_state, world_tcp_from_scene, track_close_contacts=False,
+                 contact_verified_close=False, gripper_settled=None):
         self.rig = rig
         self.object_body_name = object_body_name
         self.sensor_geom_names = tuple(sensor_geom_names)
@@ -67,6 +68,12 @@ class MujocoGraspedObjectObserver:
         if type(track_close_contacts) is not bool:
             raise TypeError("Contact tracking must be explicitly boolean.")
         self.track_close_contacts = track_close_contacts
+        if type(contact_verified_close) is not bool or (
+            contact_verified_close and not callable(gripper_settled)
+        ):
+            raise ValueError("Contact-verified close requires an explicit settled gripper producer.")
+        self.contact_verified_close = contact_verified_close
+        self.gripper_settled = gripper_settled
         if (len(self.sensor_geom_names) != 2 or len(set(self.sensor_geom_names)) != 2
                 or not self.support_body_names or not callable(command_state)
                 or not callable(world_tcp_from_scene)):
@@ -84,6 +91,17 @@ class MujocoGraspedObjectObserver:
         self._tracking_phase = None
         self._last_physics_cut_time = None
         self._release_window = None
+
+    def measured_closed(self, measured):
+        """Keep the legacy floor unless the deployed hand has settled target contact."""
+        return bool(
+            np.isfinite(measured) and (
+                measured >= .05 or (
+                    self.contact_verified_close and measured > 0.
+                    and (self._anchor is not None or self.gripper_settled())
+                )
+            )
+        )
 
     def _reset_generation(self, generation, target):
         # Opening revokes the grasp as before. Only a previously verified grasp
@@ -157,7 +175,7 @@ class MujocoGraspedObjectObserver:
             raise ObjectRelationInvalidated("Object relation invalidated: " + self._failure)
         try:
             stamp, obj, tcp, sides, support, other, measured, com = self._capture(scene, source_data)
-            if target != 1.0 or not np.isfinite(measured) or measured < .05:
+            if target != 1.0 or not self.measured_closed(measured):
                 raise ObjectRelationInvalidated("Actual closed command and measured closure are required.")
             if support and phase == "carry" and not self._verified:
                 raise ObjectMotionPreconditionError("Carry requires an unsupported verified lift first.")
@@ -253,7 +271,7 @@ class MujocoGraspedObjectObserver:
             if not self.track_close_contacts or target != 1.:
                 return
             _, _, _, sides, support, other, measured, _ = self._capture(scene)
-            if all(sides) and support and not other and np.isfinite(measured) and measured >= .05:
+            if all(sides) and support and not other and self.measured_closed(measured):
                 try:
                     self._observe(scene, phase="lift", establish=True, source_data=scene.data)
                 except ObjectRelationInvalidated:
@@ -307,7 +325,7 @@ class MujocoGraspedObjectObserver:
                            else pose_delta_metrics(self._anchor, relative))
             command_matches = generation == self._generation and target == 1.0
             relation_valid = bool(
-                command_matches and np.isfinite(measured) and measured >= .05
+                command_matches and self.measured_closed(measured)
                 and self._anchor is not None and slip <= .003 and angle <= 2.0
                 and all(sides) and not other and self._failure is None)
             fresh = age is not None and age <= .05 + 1e-9

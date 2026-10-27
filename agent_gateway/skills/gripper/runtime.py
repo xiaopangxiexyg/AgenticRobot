@@ -122,6 +122,7 @@ class GripperStateSample:
     fault_code: str | None
     observed_at: float
     evidence_ref: str
+    target_contact_confirmed: bool | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -131,6 +132,10 @@ class GripperStateSample:
         )
         if self.moving is not None and not isinstance(self.moving, bool):
             raise TypeError("moving must be boolean or None.")
+        if self.target_contact_confirmed is not None and not isinstance(
+            self.target_contact_confirmed, bool
+        ):
+            raise TypeError("target_contact_confirmed must be boolean or None.")
         if self.fault_code is not None:
             object.__setattr__(
                 self,
@@ -444,7 +449,13 @@ class GripperSkillLifecycle:
                 and sample.moving is False
                 and float(self.clock()) - started_at
                 >= self.convergence.minimum_contact_settle_sec
-                and sample.measured_close >= self.convergence.minimum_closed_position
+                and (
+                    sample.measured_close >= self.convergence.minimum_closed_position
+                    or (
+                        sample.target_contact_confirmed is True
+                        and sample.measured_close > 0.0
+                    )
+                )
             )
             current_kind = (
                 "target_reached"
