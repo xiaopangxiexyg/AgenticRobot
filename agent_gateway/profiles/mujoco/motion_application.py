@@ -587,6 +587,15 @@ class MujocoAgentSkillMotionApplication:
                 raise RuntimeError("Agent motion application is closed.")
             return self.runtime.rig.capture_scene(capture)
 
+    def run_held_gripper_transition(self, transition: Callable[[], Any]) -> Any:
+        """Keep the application-before-rig lock order for an owned hand command."""
+        if not callable(transition):
+            raise TypeError("gripper transition must be callable.")
+        with self._lock:
+            if not self._started or self._closed or not self._held:
+                raise RuntimeError("Named release requires the current composed HOLD.")
+            return transition()
+
     def request_hold(
         self,
         *,

@@ -469,17 +469,23 @@ def _build_standard_tcp_pose_envelope_runtime(
 def _bind_grippers(
     bundle: MujocoAgentTcpPoseContractBundle,
     ports: Mapping[str, MujocoGripperControlPort],
+    *, release_support_body_names: tuple[str, ...] = (),
 ) -> MujocoAgentTcpPoseContractBundle:
     hashes = {component: port.port_binding_hash for component, port in ports.items()}
     manifest = bundle.route_manifest
+    version = "3" if release_support_body_names else "2"
+    binding_payload = {"ports": hashes, "release_support_body_names": release_support_body_names}
     hand = build_gripper_skill_contract_bundle(GripperSkillDeploymentBinding(
         runtime_session_id=manifest.runtime_session_id, control_domain_id=manifest.control_domain_id,
         component_id="grippers", target_binding_id=manifest.target_binding_id,
-        target_kind="sim", current_mode="sim_active", executor_id="mujoco-composed-grippers-v2",
-        port_binding_hash=canonical_content_hash(hashes, domain="mujoco-composed-grippers-v2"),
+        target_kind="sim", current_mode="sim_active", executor_id="mujoco-composed-grippers-v" + version,
+        port_binding_hash=(canonical_content_hash(hashes, domain="mujoco-composed-grippers-v2")
+            if version == "2" else canonical_content_hash(
+                binding_payload, domain="mujoco-composed-grippers-v3")),
         station_manifest_hash=manifest.station_manifest_hash,
         execution_manifest_hash=manifest.execution_manifest_hash,
-        skill_version="2", port_binding_hash_by_component=hashes))
+        skill_version=version, port_binding_hash_by_component=hashes,
+        release_support_object_ids=release_support_body_names))
     definitions = replace(bundle.definition_catalog, skill_definitions=tuple(sorted(
         (*bundle.definition_catalog.skill_definitions, *hand.definition_catalog.skill_definitions),
         key=lambda d: (d.skill_id, d.skill_version))))
@@ -552,6 +558,7 @@ def build_mujoco_agent_tcp_pose_gateway_session(
     enable_object_follow_observation: bool = False,
     enable_object_motion: bool = False,
     enable_object_support_motion_v2: bool = False,
+    enable_named_release_v3: bool = False,
     object_support_body_names: tuple[str, ...] = (),
     safe_tcp_planning_clearance_padding_m: float = 0.002,
     enable_grippers: bool = False,
@@ -563,6 +570,11 @@ def build_mujoco_agent_tcp_pose_gateway_session(
 ) -> MujocoAgentTcpPoseGatewaySession:
     """Build the exact default-off graph; do not start, record, or serve it."""
 
+    if type(enable_named_release_v3) is not bool or (enable_named_release_v3 and not (
+            enable_object_support_motion_v2 and enable_grippers
+            and enable_object_follow_observation and enable_object_motion
+            and motion_side == "right")):
+        raise ValueError("Named release v3 requires the explicit right-hand object-support graph.")
     if type(enable_object_localization) is not bool:
         raise TypeError("enable_object_localization must be boolean.")
     if enable_object_localization and (
@@ -937,7 +949,11 @@ def build_mujoco_agent_tcp_pose_gateway_session(
                 target_contact_binding=(
                     grasp_contact_binding
                     if enable_object_follow_observation and side == "right" else None
-                ))
+                ),
+                release_support_body_names=(object_support_body_names
+                    if enable_named_release_v3 and side == "right" else ()),
+                held_transaction=(application.run_held_gripper_transition
+                    if enable_named_release_v3 and side == "right" else None))
                 for name, side in prepared.gripper_profile.side_by_gripper.items()}
         contract_bundle = build_mujoco_agent_tcp_pose_contract_bundle(
             application=application,
@@ -999,7 +1015,9 @@ def build_mujoco_agent_tcp_pose_gateway_session(
             grasp_contact_binding=grasp_contact_binding,
         )
         if enable_grippers:
-            contract_bundle = _bind_grippers(contract_bundle, gripper_ports)
+            contract_bundle = _bind_grippers(contract_bundle, gripper_ports,
+                release_support_body_names=(object_support_body_names
+                    if enable_named_release_v3 else ()))
         if fast_grasp_planner is not None:
             from .grasp_deployment import build_mujoco_fast_grasp_contract
 

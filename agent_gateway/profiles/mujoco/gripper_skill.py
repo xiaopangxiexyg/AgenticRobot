@@ -39,6 +39,8 @@ class MujocoGripperControlPort:
         arm_held: Callable[[], bool] | None = None,
         stationary_joint_speed_rad_sec: float = 0.02,
         target_contact_binding: MujocoGraspContactBinding | None = None,
+        release_support_body_names: tuple[str, ...] = (),
+        held_transaction: Callable[[Callable[[], Any]], Any] | None = None,
     ) -> None:
         if not callable(clock):
             raise TypeError("clock must be callable.")
@@ -79,6 +81,23 @@ class MujocoGripperControlPort:
                 raise ValueError("Target contact must bind the right gripper and two native sensors.")
             rig.capture_scene(lambda scene: target_contact_binding.pair_clearances(scene))
         self.target_contact_binding = target_contact_binding
+        if isinstance(release_support_body_names, str):
+            raise ValueError("Named release supports require explicit object identities.")
+        release_support_body_names = tuple(release_support_body_names)
+        if release_support_body_names and (
+                component_id != "right_gripper" or target_contact_binding is None
+                or any(not isinstance(name, str) or not name or name != name.strip()
+                       for name in release_support_body_names)
+                or len(set(release_support_body_names)) != len(release_support_body_names)):
+            raise ValueError("Named release requires the target-bound right gripper and support IDs.")
+        self.release_support_body_names = release_support_body_names
+        self._release_observer = None
+        if release_support_body_names and not callable(held_transaction):
+            raise TypeError("Named release requires the application's ordered HOLD transaction.")
+        self._held_transaction = held_transaction
+        if release_support_body_names and not callable(getattr(
+                rig, "queue_gripper_close_targets_after_scene_check", None)):
+            raise TypeError("Named release requires the rig's atomic gripper precondition port.")
         self._contact_scratch = None
         self._contact_model = None
         profile = getattr(rig.config, "gripper_actuation_profile", None)
@@ -102,6 +121,10 @@ class MujocoGripperControlPort:
                 **({} if target_contact_binding is None else {
                     "target_contact_binding_hash": target_contact_binding.semantic_content_hash,
                 }),
+                **({} if not release_support_body_names else {
+                    "release_support_body_names": release_support_body_names,
+                    "held_transaction": "application_lock_before_rig_lock.v1",
+                }),
             },
             domain="dexteleop.agent_skill.gripper_port_binding.v1",
         )
@@ -116,6 +139,73 @@ class MujocoGripperControlPort:
         if not self.requires_arm_hold:
             raise ValueError("Composed grippers require an arm-HOLD-bound port.")
         self._arm_held = guard
+
+    def bind_release_observer(self, observer) -> None:
+        """Attach the existing rig-tick observer; never create a second owner."""
+        from sim.mujoco.deploy.grasped_object import MujocoGraspedObjectObserver
+
+        binding = self.target_contact_binding
+        if (not self.release_support_body_names or self._release_observer is not None
+                or not isinstance(observer, MujocoGraspedObjectObserver)
+                or observer.rig is not self.rig or binding is None
+                or observer.object_body_name != binding.target_body_name
+                or observer.sensor_geom_names != binding.sensor_geom_names
+                or observer.gripper_name != self.gripper_name
+                or tuple(observer.support_body_names[1:]) != self.release_support_body_names):
+            raise ValueError("Named release observer differs from the bound rig/object/supports.")
+        self._release_observer = observer
+
+    def command_open_to_support(
+        self, support_body_name: str, *,
+        cancel_requested: Callable[[], bool] | None = None,
+    ) -> GripperCommandReceipt:
+        if support_body_name not in self.release_support_body_names:
+            raise ValueError("Named release support differs from the deployment allowlist.")
+        if self._release_observer is None:
+            raise RuntimeError("Named release requires the bound measured object observer.")
+        if (cancel_requested is not None and cancel_requested()) or (
+                self._arm_held is not None and not self._arm_held()):
+            return GripperCommandReceipt(
+                accepted=False,
+                lower_operation_id=f"mujoco-gripper:{self.gripper_name}:preempted",
+                evidence_refs=(self._ref("command_preempted", {
+                    "target_close": 0., "support_body_name": support_body_name}),),
+            )
+
+        def ordered_transition():
+            previous_support = []
+
+            def check_scene(scene):
+                previous_support.append(self._release_observer.active_support_body_name)
+                return self._release_observer.check_named_release_precondition(
+                    scene, support_body_name)
+
+            return self.rig.queue_gripper_close_targets_after_scene_check(
+                {self.gripper_name: 0.},
+                scene_check=check_scene,
+                cancelled=cancel_requested,
+                on_queued=lambda _scene, _cut:
+                    self._release_observer.commit_named_release_support(support_body_name),
+                on_queue_failed=lambda _scene, _cut:
+                    self._release_observer.commit_named_release_support(previous_support[0]))
+
+        sequence, cut = self._held_transaction(ordered_transition)
+        if sequence is None:
+            return GripperCommandReceipt(
+                accepted=False,
+                lower_operation_id=f"mujoco-gripper:{self.gripper_name}:preempted",
+                evidence_refs=(self._ref("command_preempted", {
+                    "target_close": 0., "support_body_name": support_body_name}),),
+            )
+        return GripperCommandReceipt(
+            accepted=True,
+            lower_operation_id=f"mujoco-gripper-command:{sequence}",
+            evidence_refs=(self._ref("command", {
+                "target_close": 0., "sequence": sequence,
+                "support_body_name": support_body_name,
+                "measured_held": True,
+                "measured_at": cut[0]}),),
+        )
 
     def _ref(self, kind: str, payload: dict[str, object]) -> str:
         self._sequence += 1

@@ -134,6 +134,39 @@ def test_selected_object_support_does_not_count_a_table_fall_as_release():
     assert observer.active_support_body_name == "table"
 
 
+def test_named_release_precondition_uses_fresh_bilateral_cut_without_committing():
+    plant, observer = _observer(track_close_contacts=True)
+    observer.support_body_names = ("table", "box")
+    _lift(plant, observer)
+    original_capture = observer._capture
+    observer._capture = lambda scene, source_data=None, *, support_body_name=None: (
+        original_capture(scene, source_data))
+
+    def current_cut():
+        plant.scene.data = SimpleNamespace(time=plant.time)
+        return observer.check_named_release_precondition(plant.scene, "box")
+
+    last = observer.latest
+    token = current_cut()
+    assert token == (plant.time, 1)
+    assert observer.latest is last and observer.active_support_body_name == "table"
+    plant.sides = (False, True)
+    plant.time += .01
+    with pytest.raises(ObjectMotionPreconditionError, match="fresh bilateral"):
+        current_cut()
+    assert observer.latest is last and observer.active_support_body_name == "table"
+    plant.sides, plant.support = (True, True), True
+    with pytest.raises(ObjectMotionPreconditionError, match="fresh bilateral"):
+        current_cut()
+    assert observer.active_support_body_name == "table"
+    plant.support = False
+    token = current_cut()
+    assert token == (plant.time, 1)
+    observer.commit_named_release_support("box")
+    assert observer.active_support_body_name == "box"
+    assert observer.latest is last
+
+
 def _lift(plant, observer):
     first = observer.observe(phase="lift", establish=True)
     assert first.status == "contact_secured"

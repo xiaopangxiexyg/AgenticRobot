@@ -902,7 +902,8 @@ class MujocoAgentTcpPoseContractBundle:
                          "station_manifest_hash", "execution_manifest_hash"):
                 if getattr(hand.route_manifest, name) != getattr(self.route_manifest, name):
                     raise ValueError("Composed gripper and motion session identity mismatch.")
-            entry = self.route_manifest.route("manipulation.set_gripper_state", "2")
+            entry = self.route_manifest.route(
+                "manipulation.set_gripper_state", hand.deployment_binding.skill_version)
             if (entry.route != hand.route_manifest.skill_routes[0].route
                     or entry.deployment_binding.deployment_binding_hash != hand.deployment_binding.semantic_content_hash):
                 raise ValueError("Composed gripper Route changed.")

@@ -445,6 +445,92 @@ def test_object_support_v2_is_opt_in_and_reuses_the_same_physics_owner(tmp_path,
 
 
 @pytest.mark.integration
+def test_named_release_v3_reuses_one_gripper_skill_and_the_existing_observer(tmp_path, monkeypatch):
+    from sim.mujoco.scene_suite import materialize_case
+
+    task_path = materialize_case("same_color_sizes", tmp_path / "case")
+    session = build_mujoco_agent_tcp_pose_gateway_session(
+        target_config=MujocoSimHILTargetConfig(
+            task_config_path=task_path, realtime_worker=False,
+            runtime_session_id=CLIENT, control_domain_id=CLIENT,
+            execution_observation_plan=mujoco_agent_tcp_pose_execution_observation_plan_v1(),
+            exposed_pose_sides=("right",), allow_scripted_task_reset=False),
+        allowed_client_ids=(CLIENT,), enable_grippers=True,
+        enable_grasp_approach=True, grasp_contact_target_body="debug_cube",
+        enable_object_state=True, enable_object_follow_observation=True,
+        enable_object_motion=True, enable_object_support_motion_v2=True,
+        enable_named_release_v3=True,
+        object_support_body_names=("large_blue_cube", "medium_blue_cube"))
+    try:
+        session.application.start_observation_ready()
+        hand = session.contract_bundle.gripper_contract
+        assert hand.deployment_binding.skill_version == "3"
+        assert hand.deployment_binding.release_support_object_ids == (
+            "large_blue_cube", "medium_blue_cube")
+        route = session.contract_bundle.route_manifest.route("manipulation.set_gripper_state", "3")
+        with pytest.raises(KeyError):
+            session.contract_bundle.route_manifest.route("manipulation.set_gripper_state", "2")
+        validator = session.contract_bundle.payload_validators.validator_for(route.route)
+        validator.validate_parameters({"component_id": "right_gripper", "target_state": "closed"})
+        validator.validate_parameters({"component_id": "left_gripper", "target_state": "open"})
+        named = {"component_id": "right_gripper", "target_state": "open",
+                 "release_support_object_id": "large_blue_cube"}
+        validator.validate_parameters(named)
+        for invalid in (
+            {**named, "component_id": "left_gripper"},
+            {**named, "target_state": "closed"},
+            {**named, "release_support_object_id": "unbound"},
+        ):
+            with pytest.raises(ValueError):
+                validator.validate_parameters(invalid)
+        port = session.gripper_ports["right_gripper"]
+        assert port._release_observer is session.object_observer
+        before = session.application.runtime.rig.gripper_execution_snapshot()
+        assert not port.command_open_to_support(
+            "large_blue_cube", cancel_requested=lambda: True).accepted
+        assert session.application.runtime.rig.gripper_execution_snapshot() == before
+        with pytest.raises(ValueError):
+            port.command_open_to_support("large_blue_cube")
+        assert session.application.runtime.rig.gripper_execution_snapshot() == before
+
+        def require_order(_scene, _support):
+            assert session.application._lock._is_owned()
+            assert session.application.runtime.rig._lock._is_owned()
+            raise ValueError("read-only precondition rejected")
+
+        monkeypatch.setattr(session.object_observer,
+                            "check_named_release_precondition", require_order)
+        with pytest.raises(ValueError, match="read-only precondition rejected"):
+            port.command_open_to_support("large_blue_cube")
+        assert session.application.runtime.rig.gripper_execution_snapshot() == before
+
+        observer = session.object_observer
+        original_commit = observer.commit_named_release_support
+        attempts = []
+
+        def fail_first_commit(support):
+            attempts.append(support)
+            original_commit(support)
+            if len(attempts) == 1:
+                raise RuntimeError("observer commit failed")
+
+        monkeypatch.setattr(observer, "check_named_release_precondition",
+                            lambda scene, _support: (float(scene.data.time), 1))
+        monkeypatch.setattr(observer, "commit_named_release_support", fail_first_commit)
+        prior_support = observer.active_support_body_name
+        prior_command = observer.command_state()
+        with pytest.raises(RuntimeError, match="observer commit failed"):
+            port.command_open_to_support("large_blue_cube")
+        after = session.application.runtime.rig.gripper_execution_snapshot()
+        assert after["pending_close_by_gripper"] == {}
+        assert observer.active_support_body_name == prior_support
+        assert observer.command_state() == prior_command
+        assert attempts == ["large_blue_cube", prior_support]
+    finally:
+        assert session.close().accepted
+
+
+@pytest.mark.integration
 def test_ungrasped_object_request_is_rejected_with_original_domain_hold_and_cleanup():
     from test_agent_gateway_mujoco_tcp_pose_comparison import _request
     session = _session()

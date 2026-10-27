@@ -267,6 +267,9 @@ class GripperSkillLifecycle:
             or port.port_binding_hash != binding.port_hash_for(port.component_id)
         ):
             raise ValueError("port identity does not match deployment binding.")
+        if (binding.skill_version == "3" and port.component_id == "right_gripper"
+                and not callable(getattr(port, "command_open_to_support", None))):
+            raise TypeError("v3 right gripper lacks named release support binding.")
         if not callable(clock) or not callable(sleep):
             raise TypeError("clock and sleep must be callable.")
         self.port = port
@@ -308,7 +311,7 @@ class GripperSkillLifecycle:
         if not all(checks):
             raise ValueError("request does not bind this exact gripper lifecycle.")
         if (
-            self.deployment_binding.skill_version == "2"
+            self.deployment_binding.skill_version in {"2", "3"}
             and request.parameters["component_id"] != self.port.component_id
         ):
             raise ValueError("request selected a different gripper.")
@@ -390,11 +393,16 @@ class GripperSkillLifecycle:
             raise ValueError("run does not match activation.")
         target_state = str(request.parameters["target_state"])
         target_close = 0.0 if target_state == "open" else 1.0
-        command = self.port.command_close(
-            target_close,
-            cancel_requested=lambda: bool(cancel_requested())
-            or float(self.clock()) >= operation.deadline_at,
-        )
+        preempted = lambda: bool(cancel_requested()) or float(self.clock()) >= operation.deadline_at
+        release_support = request.parameters.get("release_support_object_id")
+        if release_support is not None:
+            if (self.deployment_binding.skill_version != "3" or target_state != "open"
+                    or self.port.component_id != "right_gripper"):
+                raise ValueError("Named release differs from the admitted gripper Route.")
+            command = self.port.command_open_to_support(
+                release_support, cancel_requested=preempted)
+        else:
+            command = self.port.command_close(target_close, cancel_requested=preempted)
         # Cancellation and HOLD stay bound to the activation's lower owner.
         cancelled = bool(cancel_requested())
         expired = float(self.clock()) >= operation.deadline_at
@@ -746,7 +754,7 @@ def build_gripper_skill_executor(
         if port is not None or set(ports or {}) != set(
             binding.port_binding_hash_by_component
         ):
-            raise ValueError("v2 requires the exact configured left and right ports.")
+            raise ValueError("v2/v3 require the exact configured left and right ports.")
         selected_ports = dict(ports)
     for component, item in selected_ports.items():
         if (
@@ -764,7 +772,7 @@ def build_gripper_skill_executor(
     ) -> GripperSkillLifecycle:
         return GripperSkillLifecycle(
             port=selected_ports[request.parameters["component_id"]]
-            if binding.skill_version == "2"
+            if binding.skill_version in {"2", "3"}
             else port,
             contract_bundle=contract_bundle,
             convergence=convergence,
