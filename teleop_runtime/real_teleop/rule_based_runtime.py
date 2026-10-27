@@ -511,6 +511,31 @@ class _ReplayReferenceCarrier:
     source_kind: str
 
 
+@dataclass
+class _ManualGripperProgress:
+    """One side's causal command and measured-progress history for this action."""
+
+    last_progress_at: float
+    # Only an accepted receipt establishes this action's command fact.
+    last_command: float | None = None
+    command_baseline: float | None = None
+    initial_baseline: float | None = None
+    # Attempts pace resends; this clock alone cannot authorize completion.
+    last_dispatch_at: float | None = None
+    settle_samples: int = 0
+    last_settle_feedback_token: tuple[str, float] | None = None
+
+
+@dataclass(frozen=True)
+class _ManualGripperDispatch:
+    """Targets and their pre-dispatch feedback; not a dispatch authorization."""
+
+    hand_qpos: dict[str, np.ndarray]
+    measured_scalar_by_side: dict[str, float]
+    feedback_state_by_side: dict[str, Mapping[str, Any]]
+    resend_sides: set[str]
+
+
 class RuleBasedRealTeleopExtension:
     """Exclusive rule-plan source attached to one existing RealTeleop runtime."""
 
@@ -693,16 +718,7 @@ class RuleBasedRealTeleopExtension:
         self._gripper_action_intent = ""
         self._gripper_action_result = "idle"
         self._pending_gripper_action: str | None = None
-        self._manual_gripper_started_at: float | None = None
-        self._manual_gripper_last_command_by_side: dict[str, float] = {}
-        self._manual_gripper_command_baseline_by_side: dict[str, float] = {}
-        self._manual_gripper_initial_baseline_by_side: dict[str, float] = {}
-        self._manual_gripper_last_dispatch_at_by_side: dict[str, float] = {}
-        self._manual_gripper_last_progress_at_by_side: dict[str, float] = {}
-        self._manual_gripper_settle_samples_by_side: dict[str, int] = {}
-        self._manual_gripper_last_settle_feedback_token_by_side: dict[
-            str, tuple[str, float]
-        ] = {}
+        self._manual_gripper_progress_by_side: dict[str, _ManualGripperProgress] = {}
         self._admitted_capture_sequences: set[int] = set()
         self._accepted_samples_by_detail_stage: dict[str, int] = {}
         # Resampled pose stages execute on the 60 Hz reference clock while
@@ -1726,8 +1742,6 @@ class RuleBasedRealTeleopExtension:
                         message="当前拓扑没有已启用的右夹爪。",
                     )
                 else:
-                    self._manual_gripper_started_at = None
-                    self._manual_gripper_last_command_by_side.clear()
                     self._gripper_action_status = (
                         "已排队：松开夹爪"
                         if intent == "release_grippers"
@@ -2558,14 +2572,7 @@ class RuleBasedRealTeleopExtension:
 
     def _clear_manual_gripper_action(self) -> None:
         self._pending_gripper_action = None
-        self._manual_gripper_started_at = None
-        self._manual_gripper_last_command_by_side.clear()
-        self._manual_gripper_command_baseline_by_side.clear()
-        self._manual_gripper_initial_baseline_by_side.clear()
-        self._manual_gripper_last_dispatch_at_by_side.clear()
-        self._manual_gripper_last_progress_at_by_side.clear()
-        self._manual_gripper_settle_samples_by_side.clear()
-        self._manual_gripper_last_settle_feedback_token_by_side.clear()
+        self._manual_gripper_progress_by_side.clear()
 
     def _manual_gripper_state(
         self,
@@ -2734,7 +2741,6 @@ class RuleBasedRealTeleopExtension:
         *,
         side: str,
         now: float,
-        final_target: float,
     ) -> tuple[bool, str]:
         """Require post-command, distinct stable endpoint/contact feedback.
 
@@ -2746,8 +2752,10 @@ class RuleBasedRealTeleopExtension:
         second device loop.
         """
 
+        progress = self._manual_gripper_progress_by_side[side]
+
         def interrupted(reason: str) -> tuple[bool, str]:
-            self._manual_gripper_settle_samples_by_side[side] = 0
+            progress.settle_samples = 0
             return False, reason
 
         recovery_phase = str(state.get("gripper_recovery_phase") or "").strip()
@@ -2776,8 +2784,8 @@ class RuleBasedRealTeleopExtension:
             return interrupted("夹爪反馈仍显示运动中")
 
         feedback_timestamp = self._manual_gripper_feedback_timestamp(state)
-        last_dispatch = self._manual_gripper_last_dispatch_at_by_side.get(side)
-        if last_dispatch is None:
+        last_dispatch = progress.last_dispatch_at
+        if progress.last_command is None or last_dispatch is None:
             return interrupted("等待本次夹爪命令后的反馈")
         if (
             feedback_timestamp is not None
@@ -2786,9 +2794,7 @@ class RuleBasedRealTeleopExtension:
             return interrupted("等待夹爪命令后的新鲜反馈")
 
         token = self._manual_gripper_feedback_token(state, now=float(now))
-        previous_token = self._manual_gripper_last_settle_feedback_token_by_side.get(
-            side
-        )
+        previous_token = progress.last_settle_feedback_token
         if (
             previous_token is not None
             and previous_token[0] == token[0]
@@ -2796,14 +2802,14 @@ class RuleBasedRealTeleopExtension:
         ):
             return interrupted("夹爪反馈时间倒退，等待新鲜反馈")
         if previous_token == token:
-            count = self._manual_gripper_settle_samples_by_side.get(side, 0)
+            count = progress.settle_samples
             return False, (
                 "等待下一帧不同的实测反馈"
                 f"({count}/{self.config.manual_gripper_settle_samples})"
             )
-        self._manual_gripper_last_settle_feedback_token_by_side[side] = token
-        count = self._manual_gripper_settle_samples_by_side.get(side, 0) + 1
-        self._manual_gripper_settle_samples_by_side[side] = count
+        progress.last_settle_feedback_token = token
+        count = progress.settle_samples + 1
+        progress.settle_samples = count
         required = int(self.config.manual_gripper_settle_samples)
         if count < required:
             return False, f"等待端点稳定反馈({count}/{required})"
@@ -2830,11 +2836,12 @@ class RuleBasedRealTeleopExtension:
         stable-frame requirements after this evidence is present.
         """
 
+        progress = self._manual_gripper_progress_by_side[side]
         if (
             intent not in {"close_grippers", "close_right_gripper"}
             or status_code != 2
             or last_target is None
-            or side not in self._manual_gripper_last_dispatch_at_by_side
+            or progress.last_dispatch_at is None
             or abs(float(last_target) - float(final_target))
             > float(self.config.manual_gripper_endpoint_tolerance)
         ):
@@ -2842,7 +2849,7 @@ class RuleBasedRealTeleopExtension:
         # The progress watchdog advances its rolling baseline while firmware
         # is closing. Contact confirmation must compare against the actual
         # start of this endpoint command, not the last moving sample.
-        baseline = self._manual_gripper_initial_baseline_by_side.get(side)
+        baseline = progress.initial_baseline
         if baseline is None:
             return False
         backend = getattr(self._components, f"{side}_hand_backend", None)
@@ -2855,30 +2862,6 @@ class RuleBasedRealTeleopExtension:
             1e-4,
         )
         return float(measured_scalar) - float(baseline) >= minimum_progress
-
-    def _manual_gripper_feedback(
-        self,
-        backend: object,
-        *,
-        side: str,
-        now: float,
-    ) -> tuple[np.ndarray | None, str]:
-        command_dim = int(self._hand_command_dim_by_side.get(side, 0))
-        max_action = float(self._hand_max_action_by_side.get(side, 1.0))
-        state, state_error = self._manual_gripper_state(
-            backend,
-            side=side,
-            now=float(now),
-        )
-        return self._manual_gripper_feedback_from_state(
-            state,
-            state_error,
-            side=side,
-            now=float(now),
-            command_dim=command_dim,
-            max_action=max_action,
-            max_age_sec=float(self.config.hand_state_max_age_sec),
-        )
 
     @staticmethod
     def _manual_gripper_dispatch_outcome(
@@ -2992,59 +2975,26 @@ class RuleBasedRealTeleopExtension:
             return ("right",) if "right" in self.config.gripper_sides else ()
         return tuple(self.config.gripper_sides)
 
-    def _dispatch_pending_gripper_action(self, observation: object, now: float) -> None:
-        """Advance one feedback-gated maintenance action through the Session Rig.
+    @staticmethod
+    def _manual_gripper_action_label(intent: str) -> str:
+        if intent == "release_right_gripper":
+            return "松开右夹爪"
+        if intent == "release_grippers":
+            return "松开"
+        if intent == "close_right_gripper":
+            return "闭紧右夹爪"
+        return "闭紧"
 
-        The rule UI is intentionally not a second device loop. A reset click
-        is converted to the same canonical ``RobotAction``/``TeleopCommand``
-        carrier used by collection and sent through ``TeleopSession``'s
-        existing dispatch seam. Writing right-hand actions issue one endpoint
-        command and then only observe fresh feedback; other generic
-        maintenance actions retain bounded incremental motion. No formal
-        writer call is made and no arm effector is included.
-        """
-
-        intent = self._pending_gripper_action
-        if intent is None:
-            return
-        action_sides = self._manual_gripper_action_sides(intent)
-        if not action_sides:
-            self._finish_manual_gripper_action(
-                succeeded=False,
-                message="当前拓扑没有可用的目标夹爪。",
-            )
-            return
-        session = getattr(self._components, "session", None)
-        if session is None:
-            self._finish_manual_gripper_action(
-                succeeded=False,
-                message="夹爪控制失败：Session 不可用。",
-            )
-            return
-        state = getattr(getattr(session, "state_machine", None), "state", None)
-        state_value = str(getattr(state, "value", state) or "").upper()
-        # A successful Episode deliberately leaves the shared Session in
-        # RUNNING while this rule-only source is command-inert.  Admit manual
-        # gripper maintenance in that inter-Episode state through the same
-        # lifecycle predicate used by the GUI; active/finalizing Episodes,
-        # configuration changes, alignment and Hold remain fail-closed.
-        if not self._manual_gripper_lifecycle_available(
-            session_state_value=state_value,
-        ):
-            self._finish_manual_gripper_action(
-                succeeded=False,
-                message=(
-                    "夹爪控制已拒绝：当前不处于无活动 Episode 的安全维护窗口"
-                    f"（Session={state_value or 'UNKNOWN'}）。"
-                ),
-            )
-            return
-
-        if self._manual_gripper_started_at is None:
-            self._manual_gripper_started_at = float(now)
-            self._manual_gripper_last_progress_at_by_side = {
-                side: float(now) for side in action_sides
-            }
+    def _prepare_manual_gripper_dispatch(
+        self,
+        *,
+        intent: str,
+        action_sides: tuple[str, ...],
+        one_shot_right_hand: bool,
+        is_release: bool,
+        now: float,
+    ) -> _ManualGripperDispatch | None:
+        """Consume one measured snapshot per side, without authorizing dispatch."""
 
         hand_qpos: dict[str, np.ndarray] = {}
         measured_scalar_by_side: dict[str, float] = {}
@@ -3054,22 +3004,10 @@ class RuleBasedRealTeleopExtension:
         arrived: list[str] = []
         wrong_direction: list[str] = []
         resend_sides: set[str] = set()
-        task_chain_right_only = intent in {
-            "release_right_gripper",
-            "close_right_gripper",
-        }
-        # Standalone writing buttons emit generic intents. With only the
-        # right DMTAC hand configured, they need the same one-shot contract
-        # as the task chain: contact can stop short of a numeric segment.
-        one_shot_right_hand = task_chain_right_only or (
-            action_sides == ("right",)
-            and str(self.source_selection.get("collection_mode") or "")
-            == "rule_based_writing"
-        )
-        is_release = intent in {"release_grippers", "release_right_gripper"}
         target_scalar = 0.0 if is_release else 1.0
         direction = -1.0 if is_release else 1.0
         for side in action_sides:
+            progress = self._manual_gripper_progress_by_side[side]
             backend = getattr(self._components, f"{side}_hand_backend", None)
             if backend is None:
                 unavailable.append(side)
@@ -3100,7 +3038,7 @@ class RuleBasedRealTeleopExtension:
             if feedback_state is not None:
                 feedback_state_by_side[side] = feedback_state
             if measured_qpos is None:
-                self._manual_gripper_settle_samples_by_side[side] = 0
+                progress.settle_samples = 0
                 waiting.append(f"{side}:{feedback_error}")
                 continue
             config = getattr(backend, "config", None)
@@ -3118,7 +3056,7 @@ class RuleBasedRealTeleopExtension:
             measured_scalar = float(measured_qpos[command_dim])
             measured_scalar_by_side[side] = measured_scalar
             final_target = float(np.clip(target_scalar, 0.0, max_action))
-            last_target = self._manual_gripper_last_command_by_side.get(side)
+            last_target = progress.last_command
             at_endpoint = abs(measured_scalar - final_target) <= float(
                 self.config.manual_gripper_endpoint_tolerance
             )
@@ -3137,7 +3075,8 @@ class RuleBasedRealTeleopExtension:
                 and one_shot_right_hand
                 and side == "right"
                 and status_code == 6
-                and side in self._manual_gripper_last_dispatch_at_by_side
+                and last_target is not None
+                and progress.last_dispatch_at is not None
             )
             closed_idle_progress = self._manual_gripper_closed_idle_progress(
                 intent=intent,
@@ -3152,11 +3091,10 @@ class RuleBasedRealTeleopExtension:
                     feedback_state or {},
                     side=side,
                     now=float(now),
-                    final_target=final_target,
                 )
                 if settled:
                     arrived.append(side)
-                    self._manual_gripper_last_progress_at_by_side[side] = float(now)
+                    progress.last_progress_at = float(now)
                 else:
                     waiting.append(f"{side}:{settle_reason}")
                     # An explicit maintenance action must have a causal device
@@ -3165,34 +3103,33 @@ class RuleBasedRealTeleopExtension:
                     # mode and task-chain close establishes a one-shot closed
                     # state before the writing replay preserves that physical
                     # grip without another serial write.
+                    # A transient rejection is only an attempt. Retry at the
+                    # bounded cadence until this action has an accepted write.
+                    last_attempt = progress.last_dispatch_at
                     if (
                         at_endpoint
-                        and side
-                        not in self._manual_gripper_last_dispatch_at_by_side
-                    ):
-                        last_dispatch_at = (
-                            self._manual_gripper_last_dispatch_at_by_side.get(side)
-                        )
-                        if (
-                            last_dispatch_at is None
-                            or float(now) - float(last_dispatch_at)
+                        and last_target is None
+                        and (
+                            last_attempt is None
+                            or float(now) - last_attempt
                             >= float(self.config.manual_gripper_resend_interval_sec)
-                        ):
-                            qpos = np.zeros(6, dtype=np.float32)
-                            qpos[command_dim] = final_target
-                            hand_qpos[side] = qpos
-                            resend_sides.add(side)
+                        )
+                    ):
+                        qpos = np.zeros(6, dtype=np.float32)
+                        qpos[command_dim] = final_target
+                        hand_qpos[side] = qpos
+                        resend_sides.add(side)
                 continue
             # A fresh sample outside the endpoint/contact predicate also
             # interrupts settling; it must not bridge two stable streaks.
-            self._manual_gripper_settle_samples_by_side[side] = 0
+            progress.settle_samples = 0
             if last_target is not None:
-                command_baseline = self._manual_gripper_command_baseline_by_side.get(side)
+                command_baseline = progress.command_baseline
                 if command_baseline is None:
                     unavailable.append(side)
                     continue
-                progress = direction * (measured_scalar - float(command_baseline))
-                if progress < -float(self.config.manual_gripper_tolerance):
+                measured_progress = direction * (measured_scalar - float(command_baseline))
+                if measured_progress < -float(self.config.manual_gripper_tolerance):
                     wrong_direction.append(
                         f"{side}={measured_scalar:.3f}（上一实测 {command_baseline:.3f}）"
                     )
@@ -3206,25 +3143,22 @@ class RuleBasedRealTeleopExtension:
                     1e-4,
                 )
                 if one_shot_right_hand:
-                    if progress >= minimum_progress:
+                    if measured_progress >= minimum_progress:
                         # The endpoint command is already owned by firmware.
                         # Fresh forward progress only refreshes the bounded
                         # no-progress watchdog; it must not trigger another
                         # register write.
-                        self._manual_gripper_command_baseline_by_side[side] = (
-                            measured_scalar
-                        )
-                        self._manual_gripper_last_progress_at_by_side[side] = (
-                            float(now)
-                        )
+                        progress.command_baseline = measured_scalar
+                        progress.last_progress_at = float(now)
                     waiting.append(
                         f"{side}={measured_scalar:.3f}/{last_target:.3f}"
                     )
                     continue
-                if progress < minimum_progress:
-                    last_dispatch_at = self._manual_gripper_last_dispatch_at_by_side.get(
-                        side,
-                        float(now),
+                if measured_progress < minimum_progress:
+                    last_dispatch_at = (
+                        float(now)
+                        if progress.last_dispatch_at is None
+                        else progress.last_dispatch_at
                     )
                     if (
                         float(now) - float(last_dispatch_at)
@@ -3279,7 +3213,7 @@ class RuleBasedRealTeleopExtension:
             if side not in arrived
             and (
                 float(now)
-                - float(self._manual_gripper_last_progress_at_by_side.get(side, now))
+                - float(self._manual_gripper_progress_by_side[side].last_progress_at)
                 > float(self.config.manual_gripper_timeout_sec)
             )
         ]
@@ -3318,14 +3252,7 @@ class RuleBasedRealTeleopExtension:
                     message=message,
                 )
             elif waiting:
-                if intent == "release_right_gripper":
-                    action_label = "松开右夹爪"
-                elif is_release:
-                    action_label = "松开"
-                elif intent == "close_right_gripper":
-                    action_label = "闭紧右夹爪"
-                else:
-                    action_label = "闭紧"
+                action_label = self._manual_gripper_action_label(intent)
                 feedback_label = (
                     "等待一次性命令的实测到位"
                     if one_shot_right_hand
@@ -3343,88 +3270,300 @@ class RuleBasedRealTeleopExtension:
                 )
             return
 
-        try:
-            action = RobotAction.bimanual_qpos(
-                left_hand=hand_qpos.get("left"),
-                right_hand=hand_qpos.get("right"),
-                timestamp=float(now),
-                source="rule_based_manual_gripper",
-                metadata={
-                    "rule_based_manual_gripper_action": intent,
-                    "rule_based_manual_gripper_sides": list(action_sides),
-                    "rule_based_manual_gripper_max_step": float(
-                        self.config.gripper_max_step
-                    ),
-                    "rule_based_manual_gripper_dispatch_mode": (
-                        "single_endpoint_feedback_gated"
-                        if one_shot_right_hand
-                        else "bounded_incremental_feedback_gated"
-                    ),
-                    "rule_based_capture_enabled": False,
-                    "external_gripper_motion": True,
-                    "external_non_motion": True,
-                    "hand_action_specs_by_side": {
-                        side: HandActionSpec.dmtac_gripper(
-                            side,
-                            gripper_slot=int(self._hand_command_dim_by_side[side]),
-                        ).to_metadata()
-                        for side in hand_qpos
-                    },
+        return _ManualGripperDispatch(
+            hand_qpos=hand_qpos,
+            measured_scalar_by_side=measured_scalar_by_side,
+            feedback_state_by_side=feedback_state_by_side,
+            resend_sides=resend_sides,
+        )
+
+    def _build_manual_gripper_command(
+        self,
+        *,
+        intent: str,
+        action_sides: tuple[str, ...],
+        hand_qpos: Mapping[str, np.ndarray],
+        one_shot_right_hand: bool,
+        is_release: bool,
+        now: float,
+    ) -> TeleopCommand:
+        """Resolve the canonical action and preserve its non-recorded hand mode."""
+
+        dispatch_mode = (
+            "single_endpoint_feedback_gated"
+            if one_shot_right_hand
+            else "bounded_incremental_feedback_gated"
+        )
+        action = RobotAction.bimanual_qpos(
+            left_hand=hand_qpos.get("left"),
+            right_hand=hand_qpos.get("right"),
+            timestamp=float(now),
+            source="rule_based_manual_gripper",
+            metadata={
+                "rule_based_manual_gripper_action": intent,
+                "rule_based_manual_gripper_sides": list(action_sides),
+                "rule_based_manual_gripper_max_step": float(
+                    self.config.gripper_max_step
+                ),
+                "rule_based_manual_gripper_dispatch_mode": dispatch_mode,
+                "rule_based_capture_enabled": False,
+                "external_gripper_motion": True,
+                "external_non_motion": True,
+                "hand_action_specs_by_side": {
+                    side: HandActionSpec.dmtac_gripper(
+                        side,
+                        gripper_slot=int(self._hand_command_dim_by_side[side]),
+                    ).to_metadata()
+                    for side in hand_qpos
                 },
+            },
+        )
+        command = self.adapter.resolver.resolve(action)
+        # The writing right-hand actions are one-shot firmware operations.
+        # The replay keeps that same mode and target rather than restoring
+        # continuous catch or re-driving the hand.
+        manual_continuous_grasp = (
+            intent == "close_grippers" and not one_shot_right_hand
+        )
+        manual_motion_mode = (
+            "one_shot_open"
+            if is_release
+            else (
+                "one_shot_close"
+                if one_shot_right_hand
+                else "continuous_close"
             )
-            command = self.adapter.resolver.resolve(action)
-            # The writing right-hand actions are one-shot firmware operations.
-            # The replay keeps that same mode and target rather than restoring
-            # continuous catch or re-driving the hand.
-            manual_continuous_grasp = (
-                intent == "close_grippers" and not one_shot_right_hand
-            )
-            manual_motion_mode = (
-                "one_shot_open"
-                if is_release
-                else (
-                    "one_shot_close"
-                    if one_shot_right_hand
-                    else "continuous_close"
+        )
+        for side in hand_qpos:
+            effector = command.commands.get(f"{side}_hand")
+            if effector is None:
+                raise RuntimeError(
+                    f"resolved manual gripper command is missing {side}_hand."
                 )
+            if not isinstance(effector.metadata, dict):
+                effector.metadata = dict(effector.metadata or {})
+            # Generic multi-hand maintenance retains its existing mode;
+            # the writing right hand stays in one-shot mode.
+            effector.metadata["dmtac_continuous_grasp_override"] = bool(
+                manual_continuous_grasp
             )
-            for side in hand_qpos:
-                effector = command.commands.get(f"{side}_hand")
-                if effector is None:
-                    raise RuntimeError(
-                        f"resolved manual gripper command is missing {side}_hand."
+            # Never inherit the writing replay's command-inert hold for a
+            # manual release.  The open command must reach DMTAC so the
+            # backend can switch back to its explicit one-shot mode even
+            # when the target value is already cached at the endpoint.
+            effector.metadata["dmtac_preserve_existing_grip"] = False
+            effector.metadata["rule_based_manual_gripper_dispatch_mode"] = dispatch_mode
+            effector.metadata["rule_based_manual_gripper_motion_mode"] = (
+                manual_motion_mode
+            )
+        command.metadata.update(
+            {
+                "rule_based_manual_gripper_action": intent,
+                "rule_based_manual_gripper_sides": list(action_sides),
+                "rule_based_manual_gripper_motion_mode": manual_motion_mode,
+                "rule_based_capture_enabled": False,
+                "rule_based_arm_motion": False,
+                "external_gripper_motion": True,
+                "external_non_motion": True,
+                "dataset_recording_eligible": False,
+            }
+        )
+        return command
+
+    def _consume_manual_gripper_receipts(
+        self,
+        result: object,
+        prepared: _ManualGripperDispatch,
+        *,
+        intent: str,
+        one_shot_right_hand: bool,
+        now: float,
+    ) -> None:
+        """Commit accepted targets, keeping dispatch and measured clocks separate."""
+
+        hand_qpos = prepared.hand_qpos
+        measured_scalar_by_side = prepared.measured_scalar_by_side
+        feedback_state_by_side = prepared.feedback_state_by_side
+        resend_sides = prepared.resend_sides
+        receipts = dict(getattr(result, "dispatch_receipts", {}) or {})
+        accepted: list[str] = []
+        retrying: list[str] = []
+        failed: list[str] = []
+        for side, qpos in hand_qpos.items():
+            progress = self._manual_gripper_progress_by_side[side]
+            receipt = receipts.get(f"{side}_hand")
+            command_dim = int(self._hand_command_dim_by_side[side])
+            outcome, detail = self._manual_gripper_dispatch_outcome(
+                getattr(self._components, f"{side}_hand_backend"),
+                side=side,
+                target=float(qpos[command_dim]),
+                receipt=receipt,
+                command_dim=command_dim,
+                measured_scalar=measured_scalar_by_side[side],
+                state=feedback_state_by_side.get(side),
+            )
+            if side in resend_sides:
+                # Rate-limit every repeated dispatch attempt, including a
+                # backend ``rate_limited``/``io_busy`` receipt.  This timestamp
+                # is deliberately separate from measured progress and cannot
+                # extend the fail-closed no-progress timeout.
+                progress.last_dispatch_at = float(now)
+            if outcome == "accepted":
+                progress.last_command = float(
+                    qpos[command_dim]
+                )
+                progress.last_dispatch_at = float(now)
+                # A newly accepted asynchronous command invalidates all
+                # endpoint samples collected before it.  The next completion
+                # decision must be based on distinct feedback after this
+                # command, including when the backend accepts a threshold
+                # no-op as already at target.
+                progress.settle_samples = 0
+                progress.last_settle_feedback_token = None
+                if side not in resend_sides:
+                    progress.command_baseline = float(
+                        measured_scalar_by_side[side]
                     )
-                if not isinstance(effector.metadata, dict):
-                    effector.metadata = dict(effector.metadata or {})
-                # Generic multi-hand maintenance retains its existing mode;
-                # the writing right hand stays in one-shot mode.
-                effector.metadata["dmtac_continuous_grasp_override"] = bool(
-                    manual_continuous_grasp
-                )
-                # Never inherit the writing replay's command-inert hold for a
-                # manual release.  The open command must reach DMTAC so the
-                # backend can switch back to its explicit one-shot mode even
-                # when the target value is already cached at the endpoint.
-                effector.metadata["dmtac_preserve_existing_grip"] = False
-                effector.metadata["rule_based_manual_gripper_dispatch_mode"] = (
-                    "single_endpoint_feedback_gated"
-                    if one_shot_right_hand
-                    else "bounded_incremental_feedback_gated"
-                )
-                effector.metadata["rule_based_manual_gripper_motion_mode"] = (
-                    manual_motion_mode
-                )
-            command.metadata.update(
-                {
-                    "rule_based_manual_gripper_action": intent,
-                    "rule_based_manual_gripper_sides": list(action_sides),
-                    "rule_based_manual_gripper_motion_mode": manual_motion_mode,
-                    "rule_based_capture_enabled": False,
-                    "rule_based_arm_motion": False,
-                    "external_gripper_motion": True,
-                    "external_non_motion": True,
-                    "dataset_recording_eligible": False,
-                }
+                    progress.initial_baseline = float(
+                        measured_scalar_by_side[side]
+                    )
+                    progress.last_progress_at = float(now)
+                accepted.append(side)
+            elif outcome == "retry":
+                retrying.append(detail)
+            else:
+                failed.append(detail)
+        action_label = self._manual_gripper_action_label(intent)
+        if failed:
+            partial = (
+                "；部分侧已发送 " + ",".join(sorted(accepted))
+                if accepted
+                else ""
+            )
+            message = (
+                f"夹爪控制停止：{'，'.join(failed)}{partial}。"
+            )
+            append_message = getattr(self._control_ui, "append_message", None)
+            if callable(append_message):
+                append_message("DMTAC", message)
+            self._finish_manual_gripper_action(
+                succeeded=False,
+                message=message,
+            )
+        elif accepted:
+            positions = ", ".join(
+                f"{side}={self._manual_gripper_progress_by_side[side].last_command:.2f}"
+                for side in sorted(accepted)
+            )
+            resend_note = (
+                "（无实测进展，重发同一安全分段）"
+                if resend_sides.intersection(accepted)
+                else ""
+            )
+            retry_suffix = (
+                "；" + "，".join(retrying) + "，等待重试"
+                if retrying
+                else ""
+            )
+            dispatch_label = (
+                "已发送一次性终点命令"
+                if one_shot_right_hand
+                else "已发送受限分段"
+            )
+            self._gripper_action_status = (
+                f"正在{action_label}夹爪：{dispatch_label} {positions}{resend_note}"
+                f"{retry_suffix}，等待实测到位。"
+            )
+        elif retrying:
+            self._gripper_action_status = (
+                f"正在{action_label}夹爪：{'，'.join(retrying)}，等待重试。"
+            )
+
+    def _dispatch_pending_gripper_action(self, observation: object, now: float) -> None:
+        """Advance one feedback-gated maintenance action through the Session Rig.
+
+        The rule UI is intentionally not a second device loop. A reset click
+        is converted to the same canonical ``RobotAction``/``TeleopCommand``
+        carrier used by collection and sent through ``TeleopSession``'s
+        existing dispatch seam. Writing right-hand actions issue one endpoint
+        command and then only observe fresh feedback; other generic
+        maintenance actions retain bounded incremental motion. No formal
+        writer call is made and no arm effector is included.
+        """
+
+        intent = self._pending_gripper_action
+        if intent is None:
+            return
+        action_sides = self._manual_gripper_action_sides(intent)
+        if not action_sides:
+            self._finish_manual_gripper_action(
+                succeeded=False,
+                message="当前拓扑没有可用的目标夹爪。",
+            )
+            return
+        session = getattr(self._components, "session", None)
+        if session is None:
+            self._finish_manual_gripper_action(
+                succeeded=False,
+                message="夹爪控制失败：Session 不可用。",
+            )
+            return
+        state = getattr(getattr(session, "state_machine", None), "state", None)
+        state_value = str(getattr(state, "value", state) or "").upper()
+        # A successful Episode deliberately leaves the shared Session in
+        # RUNNING while this rule-only source is command-inert.  Admit manual
+        # gripper maintenance in that inter-Episode state through the same
+        # lifecycle predicate used by the GUI; active/finalizing Episodes,
+        # configuration changes, alignment and Hold remain fail-closed.
+        if not self._manual_gripper_lifecycle_available(
+            session_state_value=state_value,
+        ):
+            self._finish_manual_gripper_action(
+                succeeded=False,
+                message=(
+                    "夹爪控制已拒绝：当前不处于无活动 Episode 的安全维护窗口"
+                    f"（Session={state_value or 'UNKNOWN'}）。"
+                ),
+            )
+            return
+
+        if not self._manual_gripper_progress_by_side:
+            self._manual_gripper_progress_by_side = {
+                side: _ManualGripperProgress(last_progress_at=float(now))
+                for side in action_sides
+            }
+
+        task_chain_right_only = intent in {
+            "release_right_gripper",
+            "close_right_gripper",
+        }
+        # Standalone writing buttons emit generic intents. With only the
+        # right DMTAC hand configured, they need the same one-shot contract
+        # as the task chain: contact can stop short of a numeric segment.
+        one_shot_right_hand = task_chain_right_only or (
+            action_sides == ("right",)
+            and str(self.source_selection.get("collection_mode") or "")
+            == "rule_based_writing"
+        )
+        is_release = intent in {"release_grippers", "release_right_gripper"}
+        prepared = self._prepare_manual_gripper_dispatch(
+            intent=intent,
+            action_sides=action_sides,
+            one_shot_right_hand=one_shot_right_hand,
+            is_release=is_release,
+            now=now,
+        )
+        if prepared is None:
+            return
+        hand_qpos = prepared.hand_qpos
+        try:
+            command = self._build_manual_gripper_command(
+                intent=intent,
+                action_sides=action_sides,
+                hand_qpos=hand_qpos,
+                one_shot_right_hand=one_shot_right_hand,
+                is_release=is_release,
+                now=now,
             )
             dispatch_external = getattr(session, "dispatch_external_command", None)
             if not callable(dispatch_external):
@@ -3483,108 +3622,13 @@ class RuleBasedRealTeleopExtension:
                 message=message,
             )
             return
-        receipts = dict(getattr(result, "dispatch_receipts", {}) or {})
-        accepted: list[str] = []
-        retrying: list[str] = []
-        failed: list[str] = []
-        for side, qpos in hand_qpos.items():
-            receipt = receipts.get(f"{side}_hand")
-            command_dim = int(self._hand_command_dim_by_side[side])
-            outcome, detail = self._manual_gripper_dispatch_outcome(
-                getattr(self._components, f"{side}_hand_backend"),
-                side=side,
-                target=float(qpos[command_dim]),
-                receipt=receipt,
-                command_dim=command_dim,
-                measured_scalar=measured_scalar_by_side[side],
-                state=feedback_state_by_side.get(side),
-            )
-            if side in resend_sides:
-                # Rate-limit every repeated dispatch attempt, including a
-                # backend ``rate_limited``/``io_busy`` receipt.  This timestamp
-                # is deliberately separate from measured progress and cannot
-                # extend the fail-closed no-progress timeout.
-                self._manual_gripper_last_dispatch_at_by_side[side] = float(now)
-            if outcome == "accepted":
-                self._manual_gripper_last_command_by_side[side] = float(
-                    qpos[command_dim]
-                )
-                self._manual_gripper_last_dispatch_at_by_side[side] = float(now)
-                # A newly accepted asynchronous command invalidates all
-                # endpoint samples collected before it.  The next completion
-                # decision must be based on distinct feedback after this
-                # command, including when the backend accepts a threshold
-                # no-op as already at target.
-                self._manual_gripper_settle_samples_by_side[side] = 0
-                self._manual_gripper_last_settle_feedback_token_by_side.pop(
-                    side,
-                    None,
-                )
-                if side not in resend_sides:
-                    self._manual_gripper_command_baseline_by_side[side] = float(
-                        measured_scalar_by_side[side]
-                    )
-                    self._manual_gripper_initial_baseline_by_side[side] = float(
-                        measured_scalar_by_side[side]
-                    )
-                    self._manual_gripper_last_progress_at_by_side[side] = float(now)
-                accepted.append(side)
-            elif outcome == "retry":
-                retrying.append(detail)
-            else:
-                failed.append(detail)
-        if intent == "release_right_gripper":
-            action_label = "松开右夹爪"
-        elif is_release:
-            action_label = "松开"
-        elif intent == "close_right_gripper":
-            action_label = "闭紧右夹爪"
-        else:
-            action_label = "闭紧"
-        if failed:
-            partial = (
-                "；部分侧已发送 " + ",".join(sorted(accepted))
-                if accepted
-                else ""
-            )
-            message = (
-                f"夹爪控制停止：{'，'.join(failed)}{partial}。"
-            )
-            append_message = getattr(self._control_ui, "append_message", None)
-            if callable(append_message):
-                append_message("DMTAC", message)
-            self._finish_manual_gripper_action(
-                succeeded=False,
-                message=message,
-            )
-        elif accepted:
-            positions = ", ".join(
-                f"{side}={self._manual_gripper_last_command_by_side[side]:.2f}"
-                for side in sorted(accepted)
-            )
-            resend_note = (
-                "（无实测进展，重发同一安全分段）"
-                if resend_sides.intersection(accepted)
-                else ""
-            )
-            retry_suffix = (
-                "；" + "，".join(retrying) + "，等待重试"
-                if retrying
-                else ""
-            )
-            dispatch_label = (
-                "已发送一次性终点命令"
-                if one_shot_right_hand
-                else "已发送受限分段"
-            )
-            self._gripper_action_status = (
-                f"正在{action_label}夹爪：{dispatch_label} {positions}{resend_note}"
-                f"{retry_suffix}，等待实测到位。"
-            )
-        elif retrying:
-            self._gripper_action_status = (
-                f"正在{action_label}夹爪：{'，'.join(retrying)}，等待重试。"
-            )
+        self._consume_manual_gripper_receipts(
+            result,
+            prepared,
+            intent=intent,
+            one_shot_right_hand=one_shot_right_hand,
+            now=now,
+        )
 
     def _runtime_ready(
         self,
