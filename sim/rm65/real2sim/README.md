@@ -92,7 +92,14 @@ core and MuJoCo adapter used for the 20260721 fit; tests compare those hashes to
 fixed historical values rather than silently reinterpreting the fit against
 the current files.
 
-当前 SAM3／MuJoCo 携物支撑组合使用独立绑定
+当前 Agent/MuJoCo 提案过期清理与 measured 私有 cut 复用使用独立绑定
+`artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261028_agent_proposal_cut_v1.json`。
+它继承163项输入／160项Python源码，仅更新factory、target和payload三个既有owner，
+固定于 `4de2591b3c48`；当前cut、过期/HOLD及checkpoint消费者验收373通过。
+Gateway清理开关启用，下层target factory仍默认关闭以保留手动checkpoint子集；
+原TTL、sequence高水位及HOLD不变。完整集成及包内离线门禁另行记录，fit与timing不变。
+
+前驱 SAM3／MuJoCo 携物支撑组合使用独立绑定
 `artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261028_sam3_placement_v1.json`。
 它继承154项输入并更新其中10项，补入九个已改动的夹爪、物体观测、支撑和合同owner，
 共163项输入／160项Python源码，固定于 `b584813411cc`；组合消费者验收652通过。

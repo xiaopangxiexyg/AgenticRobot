@@ -25,6 +25,10 @@ ARM_BASELINE_PATH = Path(
 )
 ARM_RUNTIME_BINDING_PATH = Path(
     "sim/rm65/real2sim/artifacts/"
+    "rm65_arm_free_motion_20260721_v4_runtime_binding_20261028_agent_proposal_cut_v1.json"
+)
+SAM3_PLACEMENT_BINDING_PATH = Path(
+    "sim/rm65/real2sim/artifacts/"
     "rm65_arm_free_motion_20260721_v4_runtime_binding_20261028_sam3_placement_v1.json"
 )
 SAM3_CANDIDATES_BINDING_PATH = Path(
@@ -353,6 +357,63 @@ def test_v4_arm_fit_baseline_remains_frozen_and_provisional() -> None:
 
 def test_current_arm_runtime_binding_uses_exact_current_inputs() -> None:
     binding = Real2SimArtifactManifest.load(ARM_RUNTIME_BINDING_PATH)
+    previous = Real2SimArtifactManifest.load(SAM3_PLACEMENT_BINDING_PATH)
+    fit = Real2SimArtifactManifest.load(ARM_BASELINE_PATH)
+    tag, old_tag = "20261028-agent-proposal-cut-v1", "20261028-sam3-placement-v1"
+    current = {ref.locator: ref for ref in binding.dependency_artifacts
+               if "-runtime-" + tag in ref.artifact_id}
+    inherited = {ref.locator: ref for ref in previous.dependency_artifacts
+                 if "-runtime-" + old_tag in ref.artifact_id}
+    extras = tuple(binding.metadata["new_runtime_sources"])
+    assert len(current) == 163 and len(inherited) == 163 and len(extras) == 0
+    assert set(current) == set(inherited) | set(extras)
+    assert sum(path.endswith(".py") for path in current) == 160
+    for path, ref in current.items():
+        assert ref.sha256 == ArtifactRef.from_file(path,
+            artifact_id="current-input-check", artifact_kind=ref.artifact_kind).sha256
+        if path in inherited:
+            assert ref.artifact_id == inherited[path].artifact_id.replace(old_tag, tag)
+            assert ref.artifact_kind == inherited[path].artifact_kind
+        else:
+            assert ref.artifact_id == f"placement-owner-{extras.index(path)}-runtime-" + tag
+            assert ref.artifact_kind == "runtime_source"
+    changed = {path for path in inherited if current[path].sha256 != inherited[path].sha256}
+    assert changed == set(['agent_gateway/profiles/mujoco/motion_factory.py', 'sim/mujoco/deploy/agent_skill_target.py', 'sim/mujoco/deploy/payload_motion.py'])
+    assert tuple(binding.metadata["changed_previous_runtime_sources"]) == tuple(sorted(changed))
+    assert binding.resolved_timing == previous.resolved_timing == Real2SimArtifactManifest.resolved_timing_from_contract_file(CONTRACT_PATH)
+    assert binding.simulation_contract.sha256 == previous.simulation_contract.sha256
+    assert binding.metadata["fit_artifact_sha256"] == fit.artifact_sha256
+    assert binding.metadata["fit_simulation_contract_sha256"] == fit.simulation_contract.sha256
+    assert binding.metadata["previous_runtime_binding_artifact_sha256"] == previous.artifact_sha256
+    assert binding.metadata["previous_runtime_binding_file_sha256"] == ArtifactRef.from_file(
+        SAM3_PLACEMENT_BINDING_PATH, artifact_id="parent-check", artifact_kind="real2sim_runtime_binding").sha256
+    assert binding.metadata["arm_profile_refit"] is False and binding.metadata["runtime_behavior_change"] is True
+    assert binding.metadata["runtime_behavior_change_scope"] == "agent_mujoco_expired_proposal_pruning_and_single_measured_private_cut"
+    assert binding.code_revision == binding.environment_fingerprint["source_commit"] == binding.metadata["runtime_source_commit"] == "4de2591b3c48ac9e8787acd7c28f8c14cb551b45"
+    assert binding.metadata["offline_validation_execution_head"] == binding.code_revision
+    assert binding.environment_fingerprint["source_tree"] == binding.metadata["offline_validation_source_tree"] == "f9807beb1462e3ddbdd02f9ac4b71777fe5a1832"
+    assert binding.artifact_sha256 == "c3f7f618bc2d23e12e2412a600475dace617ede5d3ad5a0bca8d07e0ecc3b370"
+    assert ArtifactRef.from_file(ARM_RUNTIME_BINDING_PATH,
+        artifact_id="binding-file-check", artifact_kind="real2sim_runtime_binding").sha256 == "ef4e1473204ed99a2b17208b3e53279aa10ca7d8f9cfd8be2e21cfd05044b394"
+    assert binding.fidelity_claims[0].status == "provisional"
+    content = next(e for e in binding.validation_evidence if e.validation_id == "runtime-source-content-binding-integrity-" + tag)
+    assert content.status == "passed" and content.split == "validation"
+    assert dict(content.metrics) == {"bound_runtime_input_file_count": 163., "bound_runtime_source_file_count": 160., "changed_runtime_source_file_count_from_previous_binding": 3., "new_runtime_source_file_count": 0., "arm_profile_refit_count": 0., "mutated_historical_artifact_count": 0.}
+    offline = next(e for e in binding.validation_evidence if e.validation_id == "agent-proposal-cut-source-consumers-" + tag)
+    assert offline.status == "passed" and offline.split == "validation"
+    assert dict(offline.metrics) == {"passed_cases": 373., "skipped_cases": 0., "failed_cases": 0., "error_cases": 0.}
+    refs = {ref.artifact_id: ref for ref in binding.dependency_artifacts}
+    assert refs[binding.metadata["offline_validation_report_artifact_id"]].sha256 == "da77476444daa176b5411d7d1ce636a45d8d37a502e9edec1e3fc304ad3daf5f"
+    assert binding.metadata["gateway_prunes_expired_proposals"] is True
+    assert binding.metadata["lower_factory_prune_default"] is False
+    assert binding.metadata["ttl_and_hold_changed"] is False
+    assert binding.metadata["gripper_max_operation_duration_ms"] == 15000
+    assert binding.metadata["support_footprint_maximum_samples"] == 100000
+    assert next(e for e in binding.validation_evidence if e.split == "held_out").status == "not_run"
+
+
+def test_sam3_placement_binding_remains_frozen_after_proposal_cut() -> None:
+    binding = Real2SimArtifactManifest.load(SAM3_PLACEMENT_BINDING_PATH)
     previous = Real2SimArtifactManifest.load(SAM3_CANDIDATES_BINDING_PATH)
     fit = Real2SimArtifactManifest.load(ARM_BASELINE_PATH)
     tag, old_tag = "20261028-sam3-placement-v1", "20261028-sam3-candidates-v1"
@@ -365,8 +426,8 @@ def test_current_arm_runtime_binding_uses_exact_current_inputs() -> None:
     assert set(current) == set(inherited) | set(extras)
     assert sum(path.endswith(".py") for path in current) == 160
     for path, ref in current.items():
-        assert ref.sha256 == ArtifactRef.from_file(path,
-            artifact_id="current-input-check", artifact_kind=ref.artifact_kind).sha256
+        assert ref.sha256 == hashlib.sha256(subprocess.check_output(
+            ["git", "show", "b584813411ccfffa0853f12b052e4f1d2c821050:" + path])).hexdigest()
         if path in inherited:
             assert ref.artifact_id == inherited[path].artifact_id.replace(old_tag, tag)
             assert ref.artifact_kind == inherited[path].artifact_kind
@@ -389,7 +450,7 @@ def test_current_arm_runtime_binding_uses_exact_current_inputs() -> None:
     assert binding.metadata["offline_validation_execution_head"] == binding.code_revision
     assert binding.environment_fingerprint["source_tree"] == binding.metadata["offline_validation_source_tree"] == "8d6662180e8e010dd978babb67fae8ad4448a8f4"
     assert binding.artifact_sha256 == "ff9ee9a590b0df3b219041465362956bc165cdb7dfe64d5c2fae1422b9ec4067"
-    assert ArtifactRef.from_file(ARM_RUNTIME_BINDING_PATH,
+    assert ArtifactRef.from_file(SAM3_PLACEMENT_BINDING_PATH,
         artifact_id="binding-file-check", artifact_kind="real2sim_runtime_binding").sha256 == "fa5b47717090f98cd963d23dafe220625b4a94e70d79d0e99cc94bc891335049"
     assert binding.fidelity_claims[0].status == "provisional"
     content = next(e for e in binding.validation_evidence if e.validation_id == "runtime-source-content-binding-integrity-" + tag)
