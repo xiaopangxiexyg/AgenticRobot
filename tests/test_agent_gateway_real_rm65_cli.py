@@ -37,10 +37,26 @@ def test_lifecycle_json_and_newline_are_written_together(monkeypatch, event):
 
 def test_spatial_goal_cli_is_explicitly_optional():
     parser = gateway_cli.build_parser()
-    assert parser.get_default("enable_spatial_goals") is False
+    assert parser.get_default("enable_spatial_goals") is True
     action = next(item for item in parser._actions if item.dest == "enable_spatial_goals")
-    assert action.option_strings == ["--enable-spatial-goals"]
-    assert action.const is True
+    assert action.option_strings == ["--enable-spatial-goals", "--no-enable-spatial-goals"]
+
+
+@pytest.mark.parametrize("flags,spatial,comparison", [
+    ([], True, True),
+    (["--no-enable-spatial-goals"], False, True),
+    (["--no-enable-tcp-pose-comparison"], True, False),
+    (["--no-enable-spatial-goals", "--no-enable-tcp-pose-comparison"], False, False),
+])
+def test_read_only_defaults_and_explicit_opt_out_preserve_motion_and_model_choices(flags, spatial, comparison):
+    args = gateway_cli.build_parser().parse_args([
+        *_argv(confirmation=REAL_AGENT_PRIMITIVE_SESSION_CONFIRM_TOKEN), *flags])
+    assert args.enable_spatial_goals is spatial
+    assert args.enable_tcp_pose_comparison is comparison
+    assert args.enable_point_grasp is False
+    assert args.enable_grasp_observation is False
+    assert args.enable_back_projection is False
+    assert args.enable_point_grasp_finger_exchange is False
 
 
 def test_cli_back_projection_resolves_measured_geometry_without_grasp_models():

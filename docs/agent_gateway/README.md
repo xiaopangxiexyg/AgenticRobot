@@ -44,6 +44,17 @@ MuJoCo 可信内存 target 的封存／独立分支、已验证范围与尚未�
 运行资产包的下载、解压和共享根登记统一见项目根 [`README.md`](../../README.md) 的“运行资产”章节；
 本目录不重复资产包说明。
 
+标准 Gateway CLI 默认发布只读空间关系目标计算与 TCP 位姿比较 v2；原读取 v1
+继续保留。MuJoCo 的空间关系默认只在已支持的 right profile 发布，left 仍保持
+原拒绝边界；显式在 left 启用该能力会失败。两端均可使用
+`--no-enable-spatial-goals` 和 `--no-enable-tcp-pose-comparison` 选择较小的目录。
+直接工厂 API 继续保留原显式装配默认。以上默认不启动模型，也不授予运动权限；
+相机、模型、抓取、锚点/续接组合及控制参数仍按各自配置选择。
+
+保存真机观测上的 Contact-GraspNet 模型与完整路径筛选记录见
+[`contact_graspnet_saved_real_20261027.md`](./contact_graspnet_saved_real_20261027.md)。
+该记录保留失败分母与阶段证据，不改变默认生成器。
+
 ## 边界和运行等级
 
 | 用途 | 接入方式 | 能力上限 | 等级 |

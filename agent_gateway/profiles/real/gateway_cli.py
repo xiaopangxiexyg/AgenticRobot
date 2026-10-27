@@ -194,10 +194,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="maximum frozen scene age at activation (default: 30s); no automatic degraded fallback")
     parser.add_argument("--safe-motion-debug-dir", type=Path,
         help="existing private directory for exact RGB-D, filtered points and safe-move rejection evidence; opt-in, no extra captures")
-    parser.add_argument("--enable-spatial-goals", action="store_true",
-        help="expose read-only endpoint relation goals; no observation or motion authority")
-    parser.add_argument("--enable-tcp-pose-comparison", action="store_true",
-        help="expose explicit read_tcp_pose v2 against retained authenticated safe targets; no motion or success verdict")
+    parser.add_argument("--enable-spatial-goals", action=argparse.BooleanOptionalAction,
+        default=True, help="publish read-only endpoint relation goals by default; explicit opt-out available; no motion authority")
+    parser.add_argument("--enable-tcp-pose-comparison", action=argparse.BooleanOptionalAction,
+        default=True, help="publish read_tcp_pose v2 against retained safe targets by default; explicit opt-out available; no motion or success verdict")
     parser.add_argument("--enable-grasp-observation", action="store_true",
         help="Use frozen stationary RGB-D target selection and optional associated-view fusion (GraspGenX only).")
     parser.add_argument("--enable-back-projection", action="store_true",

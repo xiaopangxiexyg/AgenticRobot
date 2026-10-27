@@ -269,18 +269,48 @@ def _session(*, started: bool):
 
 def test_spatial_goal_cli_is_explicitly_optional():
     parser = build_parser()
-    assert parser.get_default("enable_spatial_goals") is False
+    assert parser.get_default("enable_spatial_goals") is None  # Resolve by supported motion side.
     action = next(item for item in parser._actions if item.dest == "enable_spatial_goals")
-    assert action.option_strings == ["--enable-spatial-goals"]
-    assert action.const is True
+    assert action.option_strings == ["--enable-spatial-goals", "--no-enable-spatial-goals"]
 
 
 def test_tcp_pose_comparison_cli_is_explicitly_optional():
     parser = build_parser()
-    assert parser.get_default("enable_tcp_pose_comparison") is False
+    assert parser.get_default("enable_tcp_pose_comparison") is True
     action = next(item for item in parser._actions if item.dest == "enable_tcp_pose_comparison")
-    assert action.option_strings == ["--enable-tcp-pose-comparison"]
-    assert action.const is True
+    assert action.option_strings == ["--enable-tcp-pose-comparison", "--no-enable-tcp-pose-comparison"]
+
+
+@pytest.mark.parametrize("side,flags,spatial,comparison", [
+    ("right", [], True, True),
+    ("left", [], False, True),
+    ("right", ["--no-enable-spatial-goals"], False, True),
+    ("right", ["--no-enable-tcp-pose-comparison"], True, False),
+    ("left", ["--no-enable-tcp-pose-comparison"], False, False),
+    ("right", ["--enable-spatial-goals", "--enable-tcp-pose-comparison"], True, True),
+])
+def test_read_only_defaults_reach_original_assembly_without_starting_resources(
+    monkeypatch, tmp_path, side, flags, spatial, comparison
+):
+    class AssemblyReached(Exception):
+        pass
+
+    received = {}
+
+    def assemble(**kwargs):
+        received.update(kwargs)
+        raise AssemblyReached
+
+    monkeypatch.setattr(gateway_cli, "build_mujoco_agent_tcp_pose_gateway_session", assemble)
+    task = gateway_cli.repo_root() / "sim/configs/tasks/rm65_right_cube_reach_fixed_pose_xyz_proprio_v1.json"
+    with pytest.raises(AssemblyReached):
+        gateway_cli.main(["--socket-path", str(tmp_path / "gateway.sock"),
+                          "--task-config", str(task), "--motion-side", side, *flags])
+    assert received["enable_spatial_goals"] is spatial
+    assert received["enable_tcp_pose_comparison"] is comparison
+    assert received["fast_grasp_planner"] is None
+    assert received["segmentation_localizer"] is None
+    assert received["enable_grippers"] is False
 
 
 def test_never_activated_gateway_closes_safely_without_hold_claim() -> None:

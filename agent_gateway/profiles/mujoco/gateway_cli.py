@@ -212,13 +212,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--safe-tcp-motion-profile', choices=tuple(MUJOCO_SAFE_TCP_MOTION_PROFILES), default='local_step', help='Explicit sim-only safe Route limits; ordinary Routes stay unchanged.')
     parser.add_argument(
         "--enable-spatial-goals",
-        action="store_true",
-        help="Expose read-only endpoint relation calculation; does not authorize motion.",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Publish read-only endpoint relations by default on the supported right profile; explicit opt-out preserves the smaller catalog. No motion authority.",
     )
     parser.add_argument(
         "--enable-tcp-pose-comparison",
-        action="store_true",
-        help="Expose explicit read_tcp_pose v2 comparison with a retained absolute safe target; no motion authority.",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Publish read_tcp_pose v2 comparison by default; explicit opt-out preserves v1 only. No motion authority.",
     )
     parser.add_argument(
         "--enable-safe-tcp-pose",
@@ -538,6 +540,11 @@ def _fast_grasp_model_from_args(parser, args):
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.enable_spatial_goals is None:
+        # The left profile deliberately rejects spatial-goal publication.
+        # Preserve that boundary and its ordinary startup; explicit True
+        # still reaches the existing unsupported-combination rejection.
+        args.enable_spatial_goals = args.motion_side == "right"
     if args.graspgenx_alignment_profile != DMTAC_M_GRASPGENX_ALIGNMENT_PROFILE_ID and not args.enable_fast_grasp:
         parser.error("--graspgenx-alignment-profile requires --enable-fast-grasp")
     if args.motion_side == "left" and (
