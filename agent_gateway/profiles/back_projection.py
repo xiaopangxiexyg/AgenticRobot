@@ -225,6 +225,105 @@ class ProjectedSupportSurface:
     top_point_count: int
 
 
+@dataclass(frozen=True)
+class SearchedSupportSurface:
+    """Best measured planar patch; its bounds are still only observations."""
+
+    candidate: ProjectedSupportSurface
+    patch_xyxy_px: tuple[int, int, int, int]
+    inspected_patch_count: int
+    accepted_patch_count: int
+
+
+def search_depth_mask_support_surface(
+    capture: LiveAlignedDepthCapture,
+    mask: np.ndarray,
+    *,
+    mask_clipped: bool,
+    maximum_depth_m: float,
+    patch_size_px: int = 64,
+    stride_px: int = 32,
+    maximum_patches: int = 256,
+) -> SearchedSupportSurface:
+    """Select a measured top patch inside one bound semantic support mask.
+
+    A large support mask can include edges and occlusions, so fitting it all at
+    once may reject a valid local plane. This bounded search only finds a
+    candidate. It does not certify a complete footprint or motion eligibility.
+    The semantic mask identity, clipping status and depth cut remain the
+    caller's responsibility.
+    """
+    if not isinstance(capture, LiveAlignedDepthCapture):
+        raise TypeError("A bound metric-depth capture is required")
+    selected = np.asarray(mask)
+    if selected.dtype != np.bool_ or selected.shape != capture.depth_m.shape:
+        raise ValueError("Support mask must be a paired full-resolution boolean grid")
+    if type(mask_clipped) is not bool or mask_clipped:
+        raise ValueError("Clipped or unverified support masks are not complete regions")
+    if (isinstance(maximum_depth_m, (bool, np.bool_))
+            or not isinstance(maximum_depth_m, (int, float, np.integer, np.floating))
+            or not math.isfinite(maximum_depth_m) or maximum_depth_m <= 0):
+        raise ValueError("maximum_depth_m must be finite and positive")
+    for name, value in (
+        ("patch_size_px", patch_size_px),
+        ("stride_px", stride_px),
+        ("maximum_patches", maximum_patches),
+    ):
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise ValueError(f"{name} must be a positive integer")
+    if patch_size_px < 16 or stride_px > patch_size_px or maximum_patches > 1024:
+        raise ValueError("Support patch search bounds are invalid")
+    height, width = selected.shape
+    if patch_size_px > min(height, width):
+        raise ValueError("Support patch exceeds the capture")
+    rows, columns = np.nonzero(selected)
+    if not len(rows):
+        raise ValueError("Support mask is empty")
+
+    def starts(low: int, high: int, limit: int) -> tuple[int, ...]:
+        first = max(0, low - patch_size_px + 1)
+        last = min(high, limit - patch_size_px)
+        return tuple(range(first, last + 1, stride_px)) + ((last,) if last >= first else ())
+
+    xs = tuple(dict.fromkeys(starts(int(columns.min()), int(columns.max()), width)))
+    ys = tuple(dict.fromkeys(starts(int(rows.min()), int(rows.max()), height)))
+    if len(xs) * len(ys) > maximum_patches:
+        raise ValueError("Support mask exceeds the bounded patch search budget")
+    best: tuple[float, float, int, int, ProjectedSupportSurface] | None = None
+    accepted = 0
+    for y0 in ys:
+        for x0 in xs:
+            patch = np.zeros_like(selected)
+            patch[y0:y0 + patch_size_px, x0:x0 + patch_size_px] = selected[
+                y0:y0 + patch_size_px, x0:x0 + patch_size_px
+            ]
+            try:
+                candidate = project_depth_mask_support_surface(
+                    capture, patch, mask_clipped=False,
+                    maximum_depth_m=maximum_depth_m,
+                )
+            except ValueError:
+                continue
+            accepted += 1
+            dx = (candidate.observed_bounds_max_xy_m[0]
+                  - candidate.observed_bounds_min_xy_m[0])
+            dy = (candidate.observed_bounds_max_xy_m[1]
+                  - candidate.observed_bounds_min_xy_m[1])
+            score = (dx * dy, -candidate.maximum_plane_residual_m,
+                     -y0, -x0, candidate)
+            if best is None or score[:4] > best[:4]:
+                best = score
+    if best is None:
+        raise ValueError("No near-horizontal measured support patch was found")
+    x0, y0 = -best[3], -best[2]
+    return SearchedSupportSurface(
+        candidate=best[4],
+        patch_xyxy_px=(x0, y0, x0 + patch_size_px, y0 + patch_size_px),
+        inspected_patch_count=len(xs) * len(ys),
+        accepted_patch_count=accepted,
+    )
+
+
 def project_depth_mask_support_surface(
     capture: LiveAlignedDepthCapture,
     mask: np.ndarray,

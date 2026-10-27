@@ -6,6 +6,7 @@ from scipy.spatial.transform import Rotation
 
 from agent_gateway.profiles.back_projection import (
     LiveAlignedDepthCapture, project_depth_mask_support_surface,
+    search_depth_mask_support_surface,
 )
 
 
@@ -69,3 +70,30 @@ def test_tilted_support_is_not_labeled_as_horizontal():
     with pytest.raises(ValueError, match="near-horizontal"):
         project_depth_mask_support_surface(
             capture(tilt_deg=2.), mask(), mask_clipped=False, maximum_depth_m=2.)
+
+
+def test_search_finds_observed_local_plane_without_promoting_to_complete_region():
+    depth = np.ones((20, 20), dtype=np.float32)
+    depth[1:4, 1:4] = .90  # A raised object contaminates the wide mask.
+    result = search_depth_mask_support_surface(
+        capture(depth=depth), mask(), mask_clipped=False,
+        maximum_depth_m=2., patch_size_px=16, stride_px=2)
+    assert result.accepted_patch_count > 0
+    assert result.inspected_patch_count >= result.accepted_patch_count
+    assert result.candidate.top_point_count >= 32
+    assert result.candidate.observed_bounds_max_xy_m[0] > result.candidate.observed_bounds_min_xy_m[0]
+    assert not hasattr(result.candidate, "geometry_complete")
+
+
+@pytest.mark.parametrize("options, match", [
+    ({"mask_clipped": True}, "Clipped"),
+    ({"maximum_patches": 1}, "budget"),
+    ({"patch_size_px": True}, "positive integer"),
+    ({"maximum_depth_m": True}, "maximum_depth_m"),
+])
+def test_search_rejects_unqualified_or_unbounded_input(options, match):
+    values = dict(mask_clipped=False, maximum_depth_m=2., patch_size_px=16,
+                  stride_px=2)
+    values.update(options)
+    with pytest.raises(ValueError, match=match):
+        search_depth_mask_support_surface(capture(), mask(), **values)
