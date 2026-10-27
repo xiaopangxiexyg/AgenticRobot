@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import argparse
 import os
+import select
+import stat
 import sys
 import tempfile
 from collections.abc import Sequence
@@ -160,6 +162,12 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--torque-console-auto-calibration-profile", type=Path,
                         help="opt-in one-click J3 onset, low-speed and withdrawal acquisition profile")
+    parser.add_argument("--torque-console-managed-cycle", action="store_true",
+                        help="explicit single workspace start/permit/return; declares clear space and supported origin; no browser required")
+    parser.add_argument("--managed-startup-fd", type=int, help=argparse.SUPPRESS)
+    parser.add_argument("--torque-console-command-field-report", type=Path,
+                        help="closed native-track command report for explicit experimental workspace field")
+    parser.add_argument("--torque-console-command-field-mode", choices=("off", "shadow", "candidate"), default="off")
     parser.add_argument("--torque-console-staged-target-offset-limit-rad", type=float, default=0.065)
     parser.add_argument(
         "--torque-console-staged-authority-rise-per-sec",
@@ -508,6 +516,12 @@ def build_probe_command(
     *,
     run_dir: Path,
 ) -> list[str]:
+    field_report = getattr(args, "torque_console_command_field_report", None)
+    field_mode = getattr(args, "torque_console_command_field_mode", "off")
+    if getattr(args, "torque_console_managed_cycle", False) and args.torque_console_auto_calibration_profile is None:
+        raise ValueError("managed cycle requires an explicit automatic workspace profile")
+    if (field_report is not None or field_mode != "off") and args.torque_console_auto_calibration_profile is None:
+        raise ValueError("command field requires the explicit automatic workspace profile")
     if args.torque_console_auto_calibration_profile is not None:
         args.torque_console = args.torque_console_staged_assist = True
         if args.torque_console_staged_motion_confirm_rad is None:
@@ -609,8 +623,14 @@ def build_probe_command(
         command.extend(("--torque-console-onset-probe-max-displacement-rad",
                         str(args.torque_console_onset_probe_max_displacement_rad)))
     if args.torque_console:
+        if getattr(args, "torque_console_managed_cycle", False):
+            command.append("--torque-console-managed-cycle")
         if args.torque_console_auto_calibration_profile is not None:
             command.extend(("--torque-console-auto-calibration-profile", str(args.torque_console_auto_calibration_profile.resolve())))
+        if field_report is not None:
+            command.extend(("--torque-console-command-field-report", str(field_report.resolve())))
+        if field_report is not None or field_mode != "off":
+            command.extend(("--torque-console-command-field-mode", field_mode))
         command.extend(
             (
                 "--torque-console",
@@ -807,6 +827,20 @@ def _motorbridge_environment(root: Path | None = None) -> dict[str, str]:
     return overrides
 
 
+def _wait_for_managed_startup_release(fd: int, *, timeout_sec: float = 30.0) -> None:
+    """Wait before any device-capable work; parent death/failed receipt denies entry."""
+    if type(fd) is not int or fd < 3:
+        raise ValueError("managed startup requires a private inherited pipe")
+    try:
+        if not stat.S_ISFIFO(os.fstat(fd).st_mode):
+            raise ValueError("managed startup requires a pipe, not a file")
+        ready, _, _ = select.select([fd], [], [], timeout_sec)
+        if not ready or os.read(fd, 1) != b"G":
+            raise ValueError("managed startup was not released after a durable receipt")
+    finally:
+        os.close(fd)
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     if args.gzip_dynamics_trace:
@@ -882,6 +916,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         _parser().error(
             "--cartesian-assist-confirmation requires --cartesian-assist"
         )
+    if args.managed_startup_fd is not None:
+        if not args.torque_console_managed_cycle or args.preflight_only:
+            _parser().error("managed startup pipe requires an actual managed cycle")
+        try:
+            _wait_for_managed_startup_release(args.managed_startup_fd)
+        except (OSError, ValueError) as exc:
+            _parser().error(str(exc))
     config = Path(args.config).expanduser()
     source_root = Path(args.rebot_source_root).expanduser()
     missing = [
@@ -928,6 +969,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
     if args.torque_console_auto_calibration_profile is not None:
         print(
+            "[B601] managed single workspace cycle: clear-space/supported-origin declaration supplied by this launch; "
+            "the existing controller owns start admission, soft-stop return and disable; no automatic retry"
+            if args.torque_console_managed_cycle else
             "[B601] automatic calibration: select the configured GUI mode, declare no human intervention and start one batch; "
             "no manual target entry; keep the page visible and clear both directions",
             flush=True,

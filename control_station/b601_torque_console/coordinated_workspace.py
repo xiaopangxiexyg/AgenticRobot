@@ -36,7 +36,8 @@ class CoordinatedWorkspaceController:
 
     controller_mode = "automatic_calibration"
 
-    def __init__(self, settings, config, workspace):
+    def __init__(self, settings, config, workspace, *, command_field_source=None):
+        workspace.sweep_speeds("joint3", config)
         if workspace.holding_search is None:
             raise ValueError("coordinated acquisition requires explicit holding search")
         if config.max_sweep_leg_command_exposure_nm_sec is None:
@@ -45,7 +46,9 @@ class CoordinatedWorkspaceController:
         self.config, self.workspace = config, workspace
         self.pose = CoordinatedPoseHolding(settings, workspace.coordinated_holding,
             arrival_tolerance_rad=(workspace.holding_search.movement_rad / 2
-                if workspace.holding_arrival_tolerance_rad is None else workspace.holding_arrival_tolerance_rad))
+                if workspace.holding_arrival_tolerance_rad is None else workspace.holding_arrival_tolerance_rad),
+            command_field_source=command_field_source)
+        self._field_pose_indices = None
         self._condition = self._position_limits = None
         self._ready = self._closed = self._start = False
         self._human = self._permit = self._origin = self._started = None
@@ -77,6 +80,7 @@ class CoordinatedWorkspaceController:
         self._return_context = None
         self._return_completed = False
         self._return_route_complete = False
+        self._return_completion_observation = None
         self._return_revoked = None
         self._manual_return_requested = None
         self._dispatch_withdrawal = None
@@ -100,7 +104,12 @@ class CoordinatedWorkspaceController:
                 if not limits[i][0] <= lo < hi <= limits[i][1]:
                     raise ValueError("coordinated range exceeds owner limits")
                 limits[i] = (lo, hi)
+            field_pose_indices = None
+            if self.pose.command_field_source is not None:
+                field_pose_indices = self.pose.command_field_source.validate_context(condition,
+                    setup_label=self.workspace.setup_label, pose_centres_rad=self.workspace.pose_centres())
             self._condition, self._position_limits = condition, tuple(limits)
+            self._field_pose_indices = field_pose_indices
 
     def owner_ready(self):
         self._ready = True
@@ -249,6 +258,7 @@ class CoordinatedWorkspaceController:
         # not a new straight-line six-axis move or an arbitrary-pose planner.
         self._tasks = self.workspace.tasks(self._supported_origin)[-3:]
         self._return_route_complete = self._return_completed = False
+        self._return_completion_observation = None
         self._index = self._segments = 0
         self._nominal_target = self.pose.q
         self._search = self._probe = self._observation = self._sample_pose = None
@@ -297,16 +307,34 @@ class CoordinatedWorkspaceController:
     def _at_goal(self, radius, *, require_quiet=True):
         # Only J2/J3 have position authority. Passive axes remain inside their
         # safety envelope; static acquisition checks their full position window.
-        return (self.pose.goal is not None and (not require_quiet or self.pose.quiet())
+        return (self.pose.goal is not None and (not require_quiet or self.pose.arrival_quiet())
                 and max(abs(self.pose.q[i]-self.pose.goal[i]) for i in AXES) <= radius)
+
+    def _return_waypoint_passed(self):
+        # A segmented return waypoint is a path-progress marker, not a new
+        # measurement pose. Do not reverse away from home to recover a small
+        # overshoot. Final origin, peer pose and all owner guards stay strict.
+        if (not self.pose.config.cruise_arrival_feedback or self._phase != "return"
+            or self.pose.goal is None or not self.pose.arrival_quiet()):
+            return False
+        task = self._tasks[self._index]
+        i = int(task["joint"][-1])-1
+        target, waypoint, q = task["target"], self.pose.goal[i], self.pose.q[i]
+        direction = target-waypoint
+        return (direction != 0 and (q-waypoint)*direction >= 0 and (target-q)*direction >= 0
+            and all(abs(self.pose.q[j]-self.pose.goal[j]) <= self.pose.arrival_tolerance_rad
+                    for j in AXES if j != i))
 
     def _arrival_status(self):
         radius = self.pose.arrival_tolerance_rad
         goal = self.pose.goal
-        quiet = self.pose.quiet()
+        quiet = self.pose.arrival_quiet()
         error = None if goal is None else tuple(q-g for q, g in zip(self.pose.q, goal))
         return {"controlled_joint_names": ["joint2", "joint3"],
             "tolerance_rad": radius, "six_axis_stationary": quiet,
+            "preparation_stationary": self.pose.quiet(),
+            "stationarity_basis": ("native_resolution_aware_arrival" if self.pose.config.cruise_arrival_feedback
+                                   else "strict_preparation"),
             "controlled_error_rad": None if error is None else [error[i] for i in AXES],
             "passive_offset_from_nominal_rad": None if error is None else {f"joint{i+1}": error[i] for i in (0, 3, 4, 5)},
             "reason": ("no_goal" if goal is None else "six_axis_not_stationary" if not quiet
@@ -417,7 +445,14 @@ class CoordinatedWorkspaceController:
                     # Reacquiring the frozen point is continuous transport.
                     # Only actual plateau observations own force bisection.
                     point_reacquire=(self.workspace.coordinated_holding.motor_local_recovery
-                        and self._phase == "sweep" and self._sample_pose is not None and self._probe is None))
+                        and self._phase == "sweep" and self._sample_pose is not None and self._probe is None),
+                    cruise_joint=(int(joint[-1])-1 if self._continuous_identification and self._phase == "sweep"
+                        and self._leg_index < len(self._steps)
+                        and self._steps[self._leg_index]["role"] in {"training", "validation"} else None),
+                    field_pose_index=(self._field_pose_indices[self._tasks[self._index]["pose"]]
+                        if self._field_pose_indices is not None and self._index < len(self._tasks)
+                        and self._phase == "sweep" else None),
+                    field_driver_kd=self._last_kd)
             except ValueError as exc:
                 self.recording_failed(str(exc))
                 return ZERO, self._make_audit(ZERO, {}, fault=self._reason)
@@ -536,9 +571,17 @@ class CoordinatedWorkspaceController:
                         and self._reason in RETURNABLE_STOPS):
                         self._begin_return()
                     else:
-                        self._return_completed = self._return_route_complete and self._supported_origin is not None and all(
-                            abs(q-o) <= self.workspace.holding_search.movement_rad
-                            for q, o in zip(self.pose.q, self._supported_origin))
+                        window = self._supported_origin_window()
+                        self._return_completed = self._return_route_complete and window is not None and window["within_window"]
+                        if self._return_route_complete:
+                            self._return_completion_observation = {
+                                "qpos_rad": self.pose.q, "origin_window": window,
+                                "zero_assist_base_damping_confirmed": self._zero_base,
+                                "six_axis_stationary": self.pose.quiet(),
+                                "automatic_origin_confirmed": self._return_completed,
+                                "completed_at_sec": completed}
+                            self._records.append({"kind": "workspace_return_evaluation",
+                                "recorded_monotonic_sec": completed, **copy.deepcopy(self._return_completion_observation)})
                         self._transition(self._destination, self._reason)
             else:
                 self._quiet_since = None
@@ -574,10 +617,11 @@ class CoordinatedWorkspaceController:
             # Static acquisition measures the entire six-axis position window.
             # Do not restart it for a short-window velocity/count fluctuation
             # inside that band. Native braking, fresh complete receipts and all
-            # owner guards still precede this branch. Transit handoffs and fixed
-            # command bisection keep their original quiet gates.
-            if not self._at_goal(self.pose.arrival_tolerance_rad,
-                                 require_quiet=not pose_observation):
+            # owner guards still precede this branch. Explicit cruise handoffs
+            # reuse native stop evidence; fixed-command bisection stays strict.
+            waypoint_passed = self._return_waypoint_passed()
+            if not (self._at_goal(self.pose.arrival_tolerance_rad,
+                                 require_quiet=not pose_observation) or waypoint_passed):
                 self._quiet_since = self._pose_window = None
                 return
             if self._quiet_since is None:
@@ -599,11 +643,16 @@ class CoordinatedWorkspaceController:
             if stamp-self._quiet_since < dwell:
                 return
             # Reference speed/damping changes at the next task still require
-            # the original fresh stillness check. Wait without discarding the
+            # the same fresh arrival check. Wait without discarding the
             # valid long window when its last frame has count jitter.
-            if pose_observation and not self.pose.quiet():
+            if pose_observation and not self.pose.arrival_quiet():
                 return
             if self._phase in {"position", "return"} and abs(task["target"]-self.pose.q[int(task["joint"][-1])-1]) > self.pose.arrival_tolerance_rad:
+                if waypoint_passed:
+                    self._records.append({"kind": "workspace_return_waypoint_passed",
+                        "recorded_monotonic_sec": completed, "waypoint_qpos_rad": self.pose.goal,
+                        "measured_qpos_rad": self.pose.q, "task": copy.deepcopy(task),
+                        "semantics": "consumed_stationary_progress_on_existing_return_segment_not_origin_confirmation"})
                 self._begin_task()
                 return
             if pose_observation:
@@ -844,6 +893,10 @@ class CoordinatedWorkspaceController:
             "origin_qpos_rad": self._origin, "current_qpos_rad": self.pose.q,
             "supported_return": {"enabled": self._return_and_disable,
                 "supported_origin_qpos_rad": self._supported_origin,
+                "route_completed": self._return_route_complete,
+                "origin_window": self._supported_origin_window(),
+                "completion_observation": copy.deepcopy(self._return_completion_observation) if detailed else None,
+                "manual_disable_confirmation_available": self.cycle_disable_confirmation_ready,
                 "active": self._return_context is not None and self._active,
                 "completed": self._return_completed,
                 "revoked_reason": self._return_revoked,
@@ -857,9 +910,14 @@ class CoordinatedWorkspaceController:
             "dispatch_withdrawal": copy.deepcopy(self._dispatch_withdrawal),
             "holding_search_enabled": not self._continuous_identification, "holding_calibration": self._holding_status(detailed),
             "continuous_identification": {"enabled": self._continuous_identification,
+                "command_field_mode": self.workspace.coordinated_holding.command_field_mode,
                 "leg_index": self._leg_index, "leg_count": len(self._steps),
-                "speeds_rad_s": self.config.sweep_speeds_rad_s,
+                "speeds_rad_s": self.workspace.sweep_speeds(
+                    self._tasks[self._index].get("joint") if self._index < len(self._tasks) else None, self.config),
                 "fits_after_cleanup_only": True, "auto_apply": False},
+            **({"command_field_source": self.pose.command_field_source.metadata(),
+                "command_field_mode": self.workspace.coordinated_holding.command_field_mode}
+               if self.pose.command_field_source is not None and detailed else {}),
             "arrival": self._arrival_status(),
             "static_observation": self._static_observation_status(),
             "maximum_start_angle_deg": self.workspace.maximum_start_angle_deg,
@@ -995,3 +1053,13 @@ class CoordinatedWorkspaceController:
                 for q, o in zip(self.pose.q, self._supported_origin))
             and (self._phase == "complete" or self._return_context is not None
                  and self._reason == self._return_context["reason"] and self._reason in RETURNABLE_STOPS))
+
+    def _supported_origin_window(self):
+        """Describe the existing six-axis gate without widening or bypassing it."""
+        if self._supported_origin is None:
+            return None
+        limit = self.workspace.holding_search.movement_rad
+        blocking = [{"joint_name": f"joint{i+1}", "offset_rad": q-o, "limit_rad": limit}
+            for i, (q, o) in enumerate(zip(self.pose.q, self._supported_origin)) if abs(q-o) > limit]
+        return {"tolerance_rad": limit, "within_window": not blocking, "blocking_joints": blocking,
+            "semantics": "encoder_window_not_physical_support_detection"}

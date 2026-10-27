@@ -261,6 +261,8 @@ control_risk_detected() {
       *confirm-motion*|*confirm_motion*|*confirm-reset*|*confirm_reset*|\
       *no-dry-run*|*no_dry_run*|*disable-dry-run*|*disable_dry_run*|\
       *robot_motion*|*real_robot*|*realrobot*|*rm65*|*gripper*|\
+      *b601_torque_console.managed_run*|*b601_torque_console/managed_run.py*|*remote_b601_managed_cycle.sh*|\
+      *rebot_b601_rs_owner.py*|*rebot_b601_rs_low_gain_probe.py*|*--torque-console-managed-cycle*|\
       *arm_home*|*arm-home*|*arm_enable*|*arm-enable*|*arm_disable*|*arm-disable*|\
       *estop*|*e-stop*|*emergency-stop*|*zero_velocity*|*zero-velocity*|\
       *trajectory*|*traj*|*replay*|*servo*|*impedance*|*force_control*|*force-control*|\
@@ -283,6 +285,8 @@ print_control_risk_matches() {
       *confirm-motion*|*confirm_motion*|*confirm-reset*|*confirm_reset*|\
       *no-dry-run*|*no_dry_run*|*disable-dry-run*|*disable_dry_run*|\
       *robot_motion*|*real_robot*|*realrobot*|*rm65*|*gripper*|\
+      *b601_torque_console.managed_run*|*b601_torque_console/managed_run.py*|*remote_b601_managed_cycle.sh*|\
+      *rebot_b601_rs_owner.py*|*rebot_b601_rs_low_gain_probe.py*|*--torque-console-managed-cycle*|\
       *arm_home*|*arm-home*|*arm_enable*|*arm-enable*|*arm_disable*|*arm-disable*|\
       *estop*|*e-stop*|*emergency-stop*|*zero_velocity*|*zero-velocity*|\
       *trajectory*|*traj*|*replay*|*servo*|*impedance*|*force_control*|*force-control*|\

@@ -179,9 +179,21 @@ def build_automatic_report(run_dir: Path) -> dict:
     if result.get("workspace") is not None:
         report["workspace"] = result["workspace"]
         if result["workspace"].get("holding_sampling_plan") == "identification":
+            # Read the recorded acquisition configuration, not a profile that
+            # may have changed after this physical run.
+            width = (result["workspace"].get("settings") or {}).get("identification_position_bin_width_rad")
             identification = summarize_workspace_identification(_jsonl(trace),
-                condition=report["condition"], workspace=result["workspace"])
+                condition=report["condition"], workspace=result["workspace"],
+                reduction_method="closed_loop_average" if width is not None else "quasisteady",
+                position_bin_width_rad=width)
             report["command_identification"] = identification
+            report["reference_speed_coverage"] = identification.get("reference_speed_coverage")
+            report["local_even_command_identification"] = identification["local_even_command_fit"]
+            report["local_command_predictability"] = identification["local_command_predictability"]
+            report["empirical_command_field"] = identification["empirical_command_field"]
+            report["command_field_runtime"] = identification["command_field_runtime"]
+            if "paired_resistance_fit" in identification:
+                report["paired_resistance_identification"] = identification["paired_resistance_fit"]
             report["workspace_motion"] = {"status": "CONTINUOUS_IDENTIFICATION_WINDOWS",
                 "window_count": len(identification["windows"]), "auto_apply": False}
         else:

@@ -147,6 +147,38 @@ ssh dex-remote 'cd ~/DexTeleop && source ~/anaconda3/etc/profile.d/conda.sh && c
 module 和 pytest wrapper 只允许 L3 非控制执行；关键词检查只是误调用防线，不能证明
 任意代码没有设备副作用。设备或运动动作必须进入限制具体动作的专用 wrapper。
 
+### B601 单轮采集管理
+
+`remote_b601_managed_cycle.sh` 是显式真机授权下的专用入口，复用现有
+`rebot_b601_rs_owner.py`，不接受任意脚本、运动 profile、力矩覆盖或命令尾参。
+`--operation preflight` 只运行原 owner 的无 CAN 参数／资源检查；`start` 固定执行
+所选固定 profile 一轮：`--recipe near-zero` 为默认近零 28 段，`--recipe four-centres`
+为既有 3°／6° 四中心 136 段；不接受任意 profile 路径。启动声明本次无人介入、原位有
+可靠托架。该声明不是传感器测量。
+保留原始 1 N·m 两轴组合包络、0.195 rad/s 原始速度保护、40 ms watchdog 和全部回位门。
+可选 `--field-report` 只启用原影子查询；本入口不启用前馈、不安装模型、不重置 CAN。
+
+每次创建新的运行目录，记录完整 Git SHA、实际命令、配置摘要及进程启动标识。
+先检查源码一致且干净、没有已有 owner，再执行原参数预检和 CAN 链路状态检查；管理
+启动持有进程继承锁。仍须串行使用这台机械臂，不同时手动启动另一条开发线的 owner。
+SSH 返回后子进程继续执行，连接超时不会以 SIGTERM 杀死控制进程。
+
+`status --run-directory <returned-directory>` 是只读观察，分别报告进程状态、原 owner 的
+实时阶段、采集完成度、回位失能回执和模型准备情况。`stop` 只通过同一 owner 的本地
+控制端口请求保护保持，不发送重复 Ctrl-C，不自动升级为全失能。人工介入、页面关闭、
+硬件故障后不自动重试或重新加力；需要人工处理时，保持进程和原有重力／阻尼协议。
+通用 Python/module/pytest wrapper 继续拒绝这些控制入口；不使用新的授权口令或令牌。
+
+若单轮已停止，但未成功回到托架，禁止把采集停止或 RPC 接受当作已经失能。
+操作者在现场确认已经可靠支撑并明确要求失能后，才可显式使用
+`--operation supported-disable --run-directory <returned-directory>`。该操作复用原本地
+GUI 的 `full_disable` 协议，验证启动进程、进程组、运行目录与控制端口身份，且拒绝
+仍在运行的批次；不发送 CAN、不发信号、不修改活动 owner 源码。请求成功只代表接受，
+仍须核对最终 `motor_disable_confirmed` 与 `transport_release.completed`。
+`status` 同时发布现有两轴合成命令、共享限幅和饱和信息，均为软件命令诊断，不能当作
+实测输出力矩。人工支撑后已确认失能但自动回位未完成时报告 `RETURN_INCOMPLETE`，
+保留 `lifecycle_complete=false`；失能／清理未确认才报告 `OPERATOR_REQUIRED`，不自动重试。
+
 ### 冻结抓姿数据的限定探针
 
 `remote_readonly_agent_acceptance.sh` 是另一个显式授权的只读验收入口：仅运行已有

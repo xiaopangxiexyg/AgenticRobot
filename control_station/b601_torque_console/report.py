@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import gzip
+import hashlib
 import json
 import math
 import sys
@@ -342,6 +343,10 @@ def main(argv: list[str] | None = None) -> int:
     mode.add_argument("--calibration", action="store_true", help="offline, gravity-conditioned command identification; never applies compensation")
     mode.add_argument("--automatic-calibration", action="store_true", help="automatic onset, return and running-resistance acquisition summary")
     mode.add_argument("--organize-identification", action="store_true", help="organize retained automatic reports without reading or rewriting raw traces")
+    mode.add_argument("--closed-loop-identification", action="store_true",
+        help="reprocess a closed continuous run with time-integrated dispatched inputs; no device I/O or automatic application")
+    parser.add_argument("--position-bin-width-rad", type=float,
+        help="with --closed-loop-identification, reduce complete measured-position cells instead of time windows")
     parser.add_argument("--include-run-dir", type=Path, action="append", default=[],
         help="additional closed run for --organize-identification; conditions remain separate")
     parser.add_argument("--pair-pose-tolerance-rad", type=float, default=0.03)
@@ -349,6 +354,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.include_run_dir and not args.organize_identification:
             raise ValueError("--include-run-dir requires --organize-identification")
+        if args.position_bin_width_rad is not None and not args.closed_loop_identification:
+            raise ValueError("--position-bin-width-rad requires --closed-loop-identification")
         if args.organize_identification:
             from .workspace_identification import organize_automatic_reports
 
@@ -359,6 +366,58 @@ def main(argv: list[str] | None = None) -> int:
             trace = _resolve_jsonl_path(args.run_dir.resolve() / "b601_owner.debug.jsonl")
         if args.organize_identification:
             pass
+        elif args.closed_loop_identification:
+            from robot_motion.rebot_b601_rs import (
+                calibration,
+                command_field,
+                gravity_identification,
+            )
+
+            from . import workspace_identification
+
+            source = trace.parent / "automatic_calibration_report.json"
+            raw_report = source.read_bytes()
+            original = json.loads(raw_report)
+            if not isinstance(original, dict):
+                raise TypeError("automatic report must be an object")
+            workspace = original.get("workspace")
+            condition = original.get("condition")
+            if (original.get("schema") != "b601.automatic-calibration-report.v1"
+                or not isinstance(workspace, dict) or workspace.get("holding_sampling_plan") != "identification"
+                or original.get("batch_state") not in {"complete", "failed", "cancelled"}):
+                raise ValueError("closed-loop identification requires a continuous automatic report")
+            if not isinstance(condition, dict) or not isinstance(condition.get("run_id"), str):
+                raise ValueError("closed-loop identification requires source/gravity condition")
+            before = trace.stat()
+            digest = hashlib.sha256()
+            with trace.open("rb") as stream:
+                for block in iter(lambda: stream.read(1024*1024), b""):
+                    digest.update(block)
+            report = workspace_identification.summarize_workspace_identification(_jsonl(trace),
+                condition=condition, workspace=workspace,
+                reduction_method="closed_loop_average", position_bin_width_rad=args.position_bin_width_rad)
+            after = trace.stat()
+            if ((before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+                != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+                or source.read_bytes() != raw_report):
+                raise ValueError("source changed during closed-loop reprocessing")
+            baseline = original.get("command_identification") or {}
+            report.update(trials=[], source_trace_sha256=digest.hexdigest(),
+                source_report=str(source), source_report_sha256=hashlib.sha256(raw_report).hexdigest(),
+                source_batch_state=original.get("batch_state"),
+                source_acquisition_complete=original.get("acquisition_complete"),
+                baseline={"reduction_method": baseline.get("reduction_method", "quasisteady"),
+                    "admitted_motion_windows": baseline.get("admitted_motion_windows"),
+                    "recorded_command_windows": len(baseline.get("windows", [])),
+                    "gravity_status": (baseline.get("gravity_fit") or {}).get("status"),
+                    "offline_candidates": (baseline.get("running_resistance") or {}).get("offline_candidates")},
+                processor_sources_sha256={Path(module.__file__).name:
+                    hashlib.sha256(Path(module.__file__).read_bytes()).hexdigest()
+                    for module in (workspace_identification, calibration, gravity_identification, command_field)},
+                assumptions=["latest complete six-axis dispatch approximates the held input, not device actuation time",
+                    "linear encoder motion approximates cruise; inertia and transmission preload are not measured",
+                    "only approximately odd repeatable resistance cancels in matched opposite-direction pairs"])
+            report["processor_sources_sha256"][Path(__file__).name] = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
         elif args.automatic_calibration:
             from .automatic_report import build_automatic_report
 
@@ -398,6 +457,13 @@ def main(argv: list[str] | None = None) -> int:
         print(f"[B601-REPORT] ERROR: {error}", file=sys.stderr)
         return 2
     print(f"[B601-REPORT] trials={len(report['trials'])} report={output}")
+    if args.closed_loop_identification:
+        print(f"[B601-REPORT] windows={len(report['windows'])} admitted={report['admitted_motion_windows']} "
+              f"candidates={report['running_resistance']['offline_candidates']} "
+              f"gravity={report['gravity_fit']['status']} "
+              f"paired_resistance={report['paired_resistance_fit']['status']}; "
+              "offline command evidence only; no compensation applied")
+        return 0
     if args.organize_identification:
         print(f"[B601-REPORT] runs={report['run_count']} observations={report['record_count']}; no source changed or compensation applied")
         return 0

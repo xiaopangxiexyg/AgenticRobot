@@ -53,6 +53,8 @@ class WorkspaceCalibrationConfig:
     setup_label: str = "temporary_end_effector"
     holding_search: HoldingSearchConfig | None = None
     holding_sampling_plan: str = "detailed"
+    identification_position_bin_width_rad: float | None = None
+    identification_joint3_speeds_rad_s: tuple[float, ...] | None = None
     holding_excursion_rad: float | None = None
     holding_arrival_tolerance_rad: float | None = None
     coordinated_holding: CoordinatedHoldingConfig | None = None
@@ -81,6 +83,22 @@ class WorkspaceCalibrationConfig:
             self.holding_sampling_plan in {"coverage", "identification"} and self.coordinated_holding is None
         ):
             raise ValueError("coverage/identification sampling requires explicit coordinated holding")
+        if (self.coordinated_holding is not None and self.coordinated_holding.cruise_enabled
+            and self.holding_sampling_plan != "identification"):
+            raise ValueError("cruise velocity feedback requires explicit continuous identification")
+        if self.identification_position_bin_width_rad is not None and (
+            self.holding_sampling_plan != "identification"
+            or finite(self.identification_position_bin_width_rad, "identification position bin") <= .002
+        ):
+            raise ValueError("position-bin analysis requires continuous identification and width above 0.002 rad")
+        if self.identification_joint3_speeds_rad_s is not None:
+            values = self.identification_joint3_speeds_rad_s
+            if self.holding_sampling_plan != "identification" or not isinstance(values, (tuple, list)):
+                raise ValueError("joint3 speed selection requires explicit continuous identification")
+            speeds = tuple(finite(v, "joint3 identification speed") for v in values)
+            if not 2 <= len(speeds) <= 4 or list(speeds) != sorted(set(speeds)) or min(speeds) <= 0:
+                raise ValueError("joint3 identification requires two to four distinct positive sorted speeds")
+            object.__setattr__(self, "identification_joint3_speeds_rad_s", speeds)
         if self.holding_arrival_tolerance_rad is not None and (
             self.coordinated_holding is None
             or not 0 < finite(self.holding_arrival_tolerance_rad, "holding arrival tolerance") <= self.holding_search.movement_rad
@@ -169,13 +187,20 @@ class WorkspaceCalibrationConfig:
         tasks.append({"kind": "return_observe"})
         return tasks
 
+    def sweep_speeds(self, joint_name, calibration):
+        if joint_name == "joint3" and self.identification_joint3_speeds_rad_s is not None:
+            if max(self.identification_joint3_speeds_rad_s) > max(calibration.sweep_speeds_rad_s):
+                raise ValueError("joint3 identification speed exceeds the existing sweep ceiling")
+            return self.identification_joint3_speeds_rad_s
+        return calibration.sweep_speeds_rad_s
+
     def sweep_plan(self, *, condition, joint_name, anchor_qpos_rad, position_limits_rad, calibration):
         """One canonical path for runtime and offline geometry consumers."""
         coverage = self.holding_sampling_plan == "coverage"
         plan = plan_local_sweeps(condition=condition, joint_name=joint_name,
             anchor_qpos_rad=anchor_qpos_rad, position_limits_rad=position_limits_rad,
             excursion_rad=self.local_excursion_rad(calibration),
-            speeds_rad_s=calibration.sweep_speeds_rad_s,
+            speeds_rad_s=self.sweep_speeds(joint_name, calibration),
             max_reference_velocity_rad_s=max(calibration.sweep_speeds_rad_s),
             training_repeats=1 if coverage else 2, validation_repeats=1,
             purpose="model_sweeps" if self.holding_sampling_plan == "identification" else "local_identification")
@@ -197,7 +222,7 @@ class B601WorkspaceCalibrationController:
 
     controller_mode = "automatic_calibration"
 
-    def __init__(self, settings, config, workspace: WorkspaceCalibrationConfig):
+    def __init__(self, settings, config, workspace: WorkspaceCalibrationConfig, *, command_field_source=None):
         overrides = {name: getattr(workspace, name) for name in COORDINATED_CALIBRATION_OVERRIDES
                      if getattr(workspace, name) is not None}
         if overrides:
@@ -265,11 +290,19 @@ class B601WorkspaceCalibrationController:
         self._coordinated = None
         if workspace.coordinated_holding is not None:
             from .coordinated_workspace import CoordinatedWorkspaceController
-            self._coordinated = CoordinatedWorkspaceController(self.settings, config, workspace)
+            self._coordinated = CoordinatedWorkspaceController(self.settings, config, workspace,
+                command_field_source=command_field_source)
+        elif command_field_source is not None:
+            raise ValueError("command field requires coordinated workspace acquisition")
 
     @property
     def _active(self):
         return self._phase not in {"idle", "complete", "failed", "cancelled"}
+
+    @property
+    def command_field_source_metadata(self):
+        source = None if self._coordinated is None else self._coordinated.pose.command_field_source
+        return None if source is None else source.metadata()
 
     def _make_controller(self, joint, *, positioning):
         gains = getattr(self.workspace, f"{joint}_drive_kd")

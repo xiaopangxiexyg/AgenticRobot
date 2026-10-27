@@ -73,6 +73,10 @@ class B601CalibrationModeController:
         return None if self._workspace is None else self._workspace.workspace
 
     @property
+    def command_field_source_metadata(self):
+        return None if self._workspace is None else self._workspace.command_field_source_metadata
+
+    @property
     def cycle_disable_confirmation_ready(self) -> bool:
         with self._lock:
             if self._selected == "workspace":

@@ -105,6 +105,13 @@ function pageVisibilityIntent(hidden, backgroundCycle) {
 }
 
 function renderAutomatic() {
+  const managed = state?.managed_cycle;
+  el("managed-cycle-status").hidden = managed?.enabled !== true;
+  if (managed?.enabled) {
+    const phases = {waiting_owner: "等待停稳与原位确认", running: "正在执行一轮采集", origin_confirmed: "原位已确认，等待失能回执",
+      operator_required: "等待人工处理", cancelled: "本轮已撤销", stopped: "本轮已停止"};
+    el("managed-cycle-status").textContent = `单轮自动运行：${phases[managed.phase] || managed.phase}。启动时已声明无人介入和原位有可靠托架；没有自动接触传感器。有人介入、撤销或关闭页面后不会自动恢复；硬件故障不自动回位。`;
+  }
   const automatic = isAutomatic();
   const selection = automatic ? state.mode_selection : null;
   el("mode-workspace").hidden = !selection?.available_modes?.includes("workspace");
@@ -309,7 +316,8 @@ function renderWorkspace(batch) {
   if (workspace.recovery_damping_owner === "motor_local_profile") {
     names.preparing = "建立电机本地阻尼并确认静止（零附加驱动力）";
   }
-  const returnReady = workspace.supported_return?.acquisition_stop != null
+  const returnReady = (workspace.supported_return?.route_completed === true
+    || workspace.supported_return?.acquisition_stop != null)
     && batch.cycle?.disable_confirmation_available === true
     && batch.cycle?.zero_assist_base_damping_confirmed === true;
   const label = returnReady ? "回位完成 · 等待人工确认失能" : workspace.supported_soft_stop ? "有界支撑恢复 · 停稳后继续原段" : workspace.phase === "sweep" && workspace.holding_search_enabled
@@ -331,6 +339,11 @@ function renderWorkspace(batch) {
     const motion = workspace.continuous_identification;
     el("automatic-mode-title").textContent = "J2/J3 双向多速度连续辨识";
     el("automatic-mode-note").textContent += ` 连续往返不在端点搜索最小维持力；参考速度 ${motion.speeds_rad_s.map(v => number(v, 4)).join(" / ")} rad/s。训练与验证整段预先分开，拟合在失能清理后离线运行，不自动安装补偿。`;
+    if (motion.command_field_mode === "shadow") {
+      el("automatic-mode-note").textContent += " 局部命令模型为影子模式：只记录预测，不参与驱动力输出。";
+    } else if (motion.command_field_mode === "candidate") {
+      el("automatic-mode-note").textContent += " 实验前馈已显式启用：在原总助力包络内参与运动控制，不用于静止保持和起动。";
+    }
   }
   el("arm").textContent = "开始 J2/J3 多位姿自动采集";
   el("withdraw").textContent = "停止采集并撤力（不自动返回）";
@@ -351,7 +364,8 @@ function renderWorkspace(batch) {
     }
   }
   if (returnReady) {
-    el("drive-instructions").textContent = "J2/J3 已按回位路线返回，零助力、基础阻尼及停稳已确认；其他关节未主动换位。请人工确认整臂已由可靠托架承托，再点击全失能。原采集结果单独保留，回位完成不等于采集完成。";
+    el("drive-instructions").textContent = supportedReturnMessage(workspace.supported_return)
+      || "J2/J3 已按回位路线返回，零助力、基础阻尼及停稳已确认；其他关节未主动换位。请人工确认整臂已由可靠托架承托，再点击全失能。原采集结果单独保留，回位完成不等于采集完成。";
   }
   el("phase").textContent = label;
   const target = Number.isFinite(task?.target) ? `，换位目标 ${number(task.target * 180 / Math.PI, 2)}°` : "";
@@ -417,9 +431,19 @@ function renderWorkspace(batch) {
   const ready = batch.cycle?.disable_confirmation_available === true && state.stop_controls_available === true;
   el("cycle-disable-hint").hidden = !ready;
   if (ready) {
-    el("cycle-disable-hint").textContent = "J2/J3 已返回起始位置，零助力和基础阻尼已确认；请确认机械臂确实由可靠支撑承托，再点击确认失能。角度到位不是物理支撑传感器。";
+    el("cycle-disable-hint").textContent = supportedReturnMessage(workspace.supported_return)
+      || "J2/J3 已返回起始位置，零助力和基础阻尼已确认；请确认机械臂确实由可靠支撑承托，再点击确认失能。角度到位不是物理支撑传感器。";
     el("full-disable").textContent = "确认已支撑并全失能 J1–J6";
   }
+}
+
+function supportedReturnMessage(status) {
+  if (!status?.route_completed) return "";
+  const blocked = status.origin_window?.blocking_joints || [];
+  const detail = blocked.map(j => `${j.joint_name} 偏差 ${number(j.offset_rad*180/Math.PI, 3)}°（限 ±${number(j.limit_rad*180/Math.PI, 3)}°）`).join("；");
+  const origin = detail ? `自动失能的六轴原位窗口尚未满足：${detail}。` : "";
+  if (!status.manual_disable_confirmation_available) return `回位路线已执行。${origin}仍等待 owner 的零助力、基础阻尼、停稳或人工确认条件；当前不是已失能。`;
+  return `J2/J3 回位路线、零助力及停稳已确认；其他关节未主动换位。${origin}当前保持重力补偿／阻尼。请确认整臂已由可靠托架承托，再点击“确认已支撑并全失能 J1–J6”。`;
 }
 
 function preparationReasonLabel(reason) {

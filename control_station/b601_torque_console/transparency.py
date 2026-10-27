@@ -137,7 +137,7 @@ class TransparencyAssessment:
         self._sequence += 1
         return row
 
-    def record(self, payload: dict[str, Any], snapshot: dict[str, Any]) -> None:
+    def record(self, payload: dict[str, Any], snapshot: dict[str, Any], *, declaration_source=None) -> None:
         """Record a user-labelled window against cached owner state only."""
         with self._lock:
             action = payload.get("action")
@@ -147,8 +147,11 @@ class TransparencyAssessment:
                 human = payload.get("human_intervention")
                 if action != "context" or not isinstance(human, bool):
                     raise ValueError("context requires human_intervention=true or false")
+                if declaration_source not in {None, "managed_cycle"}:
+                    raise ValueError("unknown declaration source")
                 self._append({"schema": "b601.joint-diagnostic-context.v1", "event": "declaration",
-                              "human_intervention": human, "owner_snapshot": sampled})
+                              "human_intervention": human, "owner_snapshot": sampled,
+                              **({"declaration_source": declaration_source} if declaration_source else {})})
                 self._human_intervention = human
                 self._observe_locked(snapshot)
                 return
