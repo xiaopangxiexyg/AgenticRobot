@@ -368,6 +368,7 @@ class _PayloadSceneOracle(CollisionSafetyOracle):
         self._supports = () if binding.support is None else tuple(int(model.geom(n).id) for n in binding.support.geom_names)
         self._dynamic_support_body = None
         self._frozen_support_pose = None
+        self._inverse_source_support_pose = None
         if binding.support is not None:
             if binding.support.max_penetration_m > policy.hard_penetration_m:
                 raise ValueError("Payload support cannot exceed the scene hard penetration bound")
@@ -382,6 +383,16 @@ class _PayloadSceneOracle(CollisionSafetyOracle):
                 self._dynamic_support_body = body
                 self._frozen_support_pose = xyzquat_to_pose_matrix(
                     binding.support.frozen_pose_xyz_quat_xyzw)
+                source = mujoco.MjData(model)
+                source.qpos[:] = binding.source_model_qpos
+                source.mocap_pos[:] = np.asarray(binding.source_mocap_pos).reshape(source.mocap_pos.shape)
+                source.mocap_quat[:] = np.asarray(binding.source_mocap_quat).reshape(source.mocap_quat.shape)
+                mujoco.mj_kinematics(model, source)
+                source_pose = _body_pose(source, body)
+                displacement, angle = pose_delta_metrics(self._frozen_support_pose, source_pose)
+                if displacement > 1e-5 or angle > .001:
+                    raise ValueError("Frozen dynamic support pose differs from its captured source cut")
+                self._inverse_source_support_pose = np.linalg.inv(source_pose)
                 collision_geoms = {int(g) for g in np.flatnonzero(
                     (model.geom_bodyid == body)
                     & ((model.geom_contype != 0) | (model.geom_conaffinity != 0)))}
@@ -433,6 +444,11 @@ class _PayloadSceneOracle(CollisionSafetyOracle):
     def _support_allowed(self, data, geom, support_geom, *, measured=False):
         support, model = self.binding.support, self.model
         normal = np.asarray(support.normal_world)
+        delta = None
+        if self._dynamic_support_body is not None:
+            current = _body_pose(data, self._dynamic_support_body)
+            delta = current @ self._inverse_source_support_pose
+            normal = delta[:3, :3] @ normal
         rotation = data.geom_xmat[support_geom].reshape(3, 3)
         local = rotation.T @ normal
         axis = int(np.argmax(np.abs(local)))
@@ -456,9 +472,12 @@ class _PayloadSceneOracle(CollisionSafetyOracle):
         points = vertices @ data.geom_xmat[geom].reshape(3, 3).T + data.geom_xpos[geom]
         height = (points - face) @ normal
         footprint = points - height[:, None] * normal
+        # The declared region is a potentially narrow source-frame rectangle.
+        # Rotating its AABB outward would grant contact outside that rectangle.
+        region_footprint = (footprint - delta[:3, 3]) @ delta[:3, :3] if delta is not None else footprint
         if (not np.isfinite(points).all() or np.min(height) < -support.max_penetration_m
-                or np.any(footprint < np.asarray(support.region_min_world) - 1e-9)
-                or np.any(footprint > np.asarray(support.region_max_world) + 1e-9)):
+                or np.any(region_footprint < np.asarray(support.region_min_world) - 1e-9)
+                or np.any(region_footprint > np.asarray(support.region_max_world) + 1e-9)):
             return False
         if model.geom_type[support_geom] == self.mujoco.mjtGeom.mjGEOM_BOX:
             local_points = (footprint - data.geom_xpos[support_geom]) @ rotation

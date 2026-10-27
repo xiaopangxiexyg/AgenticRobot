@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
+from scipy.spatial.transform import Rotation
 
 from robot_motion.action import BIMANUAL_EE_POSE_V1, RobotAction
 from robot_motion.path_planning import JointConfigurationCheck
@@ -363,6 +364,111 @@ def test_other_free_box_support_is_frozen_and_movement_revokes_placement():
     assert oracle.check(_pair(oracle, z=.02)).safe
     rejected = binding.check_measured(scene)
     assert not rejected.safe and rejected.metadata["pair_class"] == "payload_support_moved"
+
+
+@pytest.mark.integration
+def test_tilted_free_support_tracks_its_face_inside_the_existing_motion_limit():
+    scene = _scene(extra='''<body name="support" pos=".08 0 .355"><freejoint/>
+      <geom name="support_geom" type="box" size=".1 .08 .03" mass=".4"
+        contype="8" conaffinity="15"/></body>''')
+    model, data = scene.model, scene.data
+    body = int(model.body("support").id)
+    address = int(model.jnt_qposadr[model.body_jntadr[body]])
+    data.qpos[scene.joint_qpos_addr("right_z")] += .06
+    payload_body = int(model.body("payload").id)
+    payload_address = int(model.jnt_qposadr[model.body_jntadr[payload_body]])
+    data.qpos[payload_address + 2] += .06
+
+    def orient(degrees):
+        quaternion = Rotation.from_euler("y", degrees, degrees=True).as_quat()
+        data.qpos[address + 3:address + 7] = [quaternion[3], *quaternion[:3]]
+        scene.mujoco.mj_kinematics(model, data)
+        scene.mujoco.mj_collision(model, data)
+
+    orient(.2)
+    geom = int(model.geom("support_geom").id)
+    rotation = data.geom_xmat[geom].reshape(3, 3)
+    normal = tuple(rotation[:, 2])
+    top = np.asarray([(x, y, model.geom_size[geom, 2])
+                      for x in (-model.geom_size[geom, 0], model.geom_size[geom, 0])
+                      for y in (-model.geom_size[geom, 1], model.geom_size[geom, 1])])
+    top = top @ rotation.T + data.geom_xpos[geom]
+    support = _support(
+        geom_names=("support_geom",), phase="place", normal_world=normal,
+        region_min_world=tuple(top.min(axis=0)),
+        region_max_world=tuple(top.max(axis=0)),
+        dynamic_body_name="support",
+        frozen_pose_xyz_quat_xyzw=tuple(pose_matrix_to_xyzquat(
+            _pose(data, model, "support"))),
+    )
+    binding = _binding(scene, support=support)
+    assert binding.check_measured(scene).safe
+    orient(.3)
+    # A 0.1-degree motion moves the same allowed face without changing the
+    # 3mm/2deg support-motion guard or the 1mm contact penetration limit.
+    assert binding.check_measured(scene).safe
+    orient(3.)
+    rejected = binding.check_measured(scene)
+    assert not rejected.safe and rejected.metadata["pair_class"] == "payload_support_moved"
+
+
+@pytest.mark.integration
+def test_rotated_free_support_does_not_expand_a_narrow_contact_region():
+    scene = _scene(extra='''<body name="support" pos=".08 0 .355"><freejoint/>
+      <geom name="support_geom" type="box" size=".1 .08 .03" mass=".4"
+        contype="8" conaffinity="15"/></body>''')
+    model, data = scene.model, scene.data
+    support = _support(
+        geom_names=("support_geom",), phase="place",
+        region_min_world=(.0299, -.016, .385),
+        region_max_world=(.1301, .016, .385),
+        dynamic_body_name="support",
+        frozen_pose_xyz_quat_xyzw=tuple(pose_matrix_to_xyzquat(
+            _pose(data, model, "support"))),
+    )
+    binding = _binding(scene, support=support)
+    oracle = binding.contact_oracle(scene)
+    payload_geom = int(model.geom("payload_geom").id)
+    support_geom = int(model.geom("support_geom").id)
+    assert oracle._support_allowed(data, payload_geom, support_geom, measured=True)
+
+    body = int(model.body("support").id)
+    address = int(model.jnt_qposadr[model.body_jntadr[body]])
+    quaternion = Rotation.from_euler("z", 1., degrees=True).as_quat()
+    data.qpos[address + 3:address + 7] = [quaternion[3], *quaternion[:3]]
+    scene.mujoco.mj_kinematics(model, data)
+    scene.mujoco.mj_collision(model, data)
+    # The source rectangle turns with the support. An axis-aligned enclosure
+    # of its rotated corners would admit this still-unrotated payload edge.
+    old_world_aabb_max_x = .08 + .0501 * math.cos(math.radians(1.)) + .016 * math.sin(math.radians(1.))
+    assert old_world_aabb_max_x > .13
+    assert not oracle._support_allowed(data, payload_geom, support_geom, measured=True)
+
+
+@pytest.mark.integration
+def test_free_support_near_contact_retains_one_millimetre_hard_penetration():
+    scene = _scene(extra='''<body name="support" pos=".08 0 .355"><freejoint/>
+      <geom name="support_geom" type="box" size=".1 .08 .03" mass=".4"
+        contype="8" conaffinity="15"/></body>''')
+    model, data = scene.model, scene.data
+    support = _support(
+        geom_names=("support_geom",), phase="place",
+        region_min_world=(-.02, -.08, .385),
+        region_max_world=(.18, .08, .385),
+        dynamic_body_name="support",
+        frozen_pose_xyz_quat_xyzw=tuple(pose_matrix_to_xyzquat(
+            _pose(data, model, "support"))),
+    )
+    binding = _binding(scene, support=support)
+    oracle = binding.contact_oracle(scene)
+    payload_geom = int(model.geom("payload_geom").id)
+    support_geom = int(model.geom("support_geom").id)
+    address = int(model.jnt_qposadr[model.body_jntadr[int(model.body("payload").id)]])
+    initial_z = float(data.qpos[address + 2])
+    for penetration, accepted in ((.0009, True), (.0011, False)):
+        data.qpos[address + 2] = initial_z - penetration
+        scene.mujoco.mj_kinematics(model, data)
+        assert oracle._support_allowed(data, payload_geom, support_geom, measured=True) is accepted
 
 
 @pytest.mark.integration

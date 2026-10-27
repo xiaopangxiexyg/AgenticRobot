@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
+from scipy.spatial.transform import Rotation
 
 from agent_gateway.profiles.mujoco.motion_deployment import MujocoAgentTcpPoseMotionProfile
 from agent_gateway.profiles.mujoco.motion_factory import (
@@ -269,6 +270,62 @@ def test_native_object_route_is_explicit_and_reuses_exact_tick_observer(enabled)
     finally:
         assert session.close().accepted
     assert app.runtime.rig._physics_step_observer is None
+
+
+@pytest.mark.integration
+def test_dynamic_support_binding_uses_measured_tilted_top_without_stepping(tmp_path):
+    from agent_gateway.profiles.mujoco.object_motion import _native_support_for_object_motion
+    from sim.mujoco.scene_suite import materialize_case
+
+    task_path = materialize_case("same_color_sizes", tmp_path / "case")
+    session = build_mujoco_agent_tcp_pose_gateway_session(
+        target_config=MujocoSimHILTargetConfig(
+            task_config_path=task_path, realtime_worker=False,
+            runtime_session_id=CLIENT, control_domain_id=CLIENT,
+            execution_observation_plan=mujoco_agent_tcp_pose_execution_observation_plan_v1(),
+            exposed_pose_sides=("right",), allow_scripted_task_reset=False),
+        allowed_client_ids=(CLIENT,), enable_grippers=True,
+        enable_grasp_approach=True, grasp_contact_target_body="debug_cube",
+        enable_object_state=True, enable_object_follow_observation=True,
+        enable_object_motion=True, enable_object_support_motion_v2=True,
+        object_support_body_names=("large_blue_cube",))
+    try:
+        session.application.start_observation_ready()
+        scene = session.application.scene
+        model, data = scene.model, scene.data
+        body = int(model.body("large_blue_cube").id)
+        address = int(model.jnt_qposadr[model.body_jntadr[body]])
+        quaternion = Rotation.from_euler("y", .2, degrees=True).as_quat()
+        data.qpos[address + 3:address + 7] = [quaternion[3], *quaternion[:3]]
+        before = (data.qpos.copy(), float(data.time))
+        support = session.application.runtime.rig.capture_scene(
+            lambda current: _native_support_for_object_motion(
+                current, body_name="large_blue_cube", phase="place",
+                max_penetration_m=.001, dynamic=True))
+        assert support.dynamic_body_name == "large_blue_cube"
+        assert support.region_min_world[2] < support.region_max_world[2]
+        expected = Rotation.from_euler("y", .2, degrees=True).apply((0., 0., 1.))
+        np.testing.assert_allclose(support.normal_world, expected, atol=1e-8)
+        np.testing.assert_array_equal(data.qpos, before[0])
+        assert float(data.time) == before[1]
+        tilted = Rotation.from_euler("y", 2., degrees=True).as_quat()
+        data.qpos[address + 3:address + 7] = [tilted[3], *tilted[:3]]
+        with pytest.raises(ValueError, match="near-horizontal"):
+            session.application.runtime.rig.capture_scene(
+                lambda current: _native_support_for_object_motion(
+                    current, body_name="large_blue_cube", phase="place",
+                    max_penetration_m=.001, dynamic=True))
+        for angle in (90., 180.):
+            sideways = Rotation.from_euler("x", angle, degrees=True).as_quat()
+            data.qpos[address + 3:address + 7] = [sideways[3], *sideways[:3]]
+            support = session.application.runtime.rig.capture_scene(
+                lambda current: _native_support_for_object_motion(
+                    current, body_name="large_blue_cube", phase="place",
+                    max_penetration_m=.001, dynamic=True))
+            np.testing.assert_allclose(support.normal_world, (0., 0., 1.), atol=1e-8)
+            assert support.region_max_world[2] - support.region_min_world[2] < 1e-8
+    finally:
+        assert session.close().accepted
 
 
 @pytest.mark.integration

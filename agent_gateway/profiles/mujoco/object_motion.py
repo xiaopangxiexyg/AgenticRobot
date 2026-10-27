@@ -27,6 +27,69 @@ from sim.mujoco.transforms import pose_to_xyz_quat_xyzw
 from .motion_skill import MujocoAgentSafeTcpPoseSkillLifecycle
 
 
+def _native_support_for_object_motion(scene, *, body_name, phase,
+                                      max_penetration_m, dynamic):
+    """Bind the current top face; a free support need not be exactly level."""
+    model = scene.model
+    body = int(model.body(body_name).id)
+    geoms = [int(g) for g in np.flatnonzero((model.geom_bodyid == body)
+             & ((model.geom_contype != 0) | (model.geom_conaffinity != 0)))]
+    if not geoms:
+        raise ValueError("Object support stage requires native support geometry.")
+    data = scene.data
+    if dynamic:
+        data = scene.mujoco.MjData(model)
+        scene.mujoco.mj_copyData(data, model, scene.data)
+        scene.mujoco.mj_kinematics(model, data)
+    points, normals, top_heights = [], [], []
+    for geom in geoms:
+        if model.geom_type[geom] != scene.mujoco.mjtGeom.mjGEOM_BOX:
+            raise ValueError("Current object support binding requires finite native boxes.")
+        rotation = data.geom_xmat[geom].reshape(3, 3)
+        center = data.geom_xpos[geom]
+        size = model.geom_size[geom]
+        if dynamic:
+            # A free box may rest on any native face. Select its upward face
+            # from the measured orientation, without inferring it from a
+            # privileged object pose or changing the native collision model.
+            axis = int(np.argmax(np.abs(rotation[2, :])))
+            sign = float(np.sign(rotation[2, axis]))
+            normal = rotation[:, axis] * sign
+            if normal[2] < math.cos(math.radians(1.)):
+                raise ValueError("Dynamic support top face is not near-horizontal and upward.")
+            normals.append(normal)
+            tangents = [i for i in range(3) if i != axis]
+            face_local = np.empty((4, 3), dtype=float)
+            face_local[:, axis] = sign * size[axis]
+            face_local[:, tangents] = (np.asarray(tuple(itertools.product(
+                (-1., 1.), repeat=2)), dtype=float) * size[tangents])
+            face = face_local @ rotation.T + center
+            points.extend(face)
+            top_heights.append(float(np.dot(normal, center + normal * size[axis])))
+        else:
+            vertices = np.asarray(tuple(itertools.product((-1., 1.), repeat=3))) * size
+            points.extend(vertices @ rotation.T + center)
+    if dynamic and (any(not np.allclose(value, normals[0], atol=1e-7, rtol=0.)
+                        for value in normals[1:])
+                    or max(top_heights) - min(top_heights) > max_penetration_m):
+        raise ValueError("Dynamic support boxes must have one measured top face.")
+    region = np.asarray(points)
+    lower, upper = region.min(axis=0), region.max(axis=0)
+    if not dynamic:
+        lower[2] = upper[2]
+    frozen = {}
+    if dynamic:
+        pose = np.eye(4)
+        pose[:3, :3] = data.xmat[body].reshape(3, 3)
+        pose[:3, 3] = data.xpos[body]
+        frozen = {"dynamic_body_name": body_name,
+                  "frozen_pose_xyz_quat_xyzw": tuple(pose_to_xyz_quat_xyzw(pose))}
+    return MujocoPayloadSupport(
+        tuple(model.geom(g).name for g in geoms),
+        tuple(normals[0]) if dynamic else (0., 0., 1.),
+        tuple(lower), tuple(upper), phase, max_penetration_m, **frozen)
+
+
 class MujocoAgentObjectMotionLifecycle(MujocoAgentSafeTcpPoseSkillLifecycle):
     """Resolve once from a correlated cut; no second planner or physics owner."""
 
@@ -82,31 +145,11 @@ class MujocoAgentObjectMotionLifecycle(MujocoAgentSafeTcpPoseSkillLifecycle):
         def bind(scene):
             support = None
             if self._phase in {"lift", "place"}:
-                model = scene.model
                 support_name = (self._support_object_id or self.application.task_config.table_body_name)
-                support_body = int(model.body(support_name).id)
-                geoms = [int(g) for g in np.flatnonzero((model.geom_bodyid == support_body)
-                         & ((model.geom_contype != 0) | (model.geom_conaffinity != 0)))]
-                if not geoms:
-                    raise ValueError("Object support stage requires native support geometry.")
-                points = []
-                for geom in geoms:
-                    if model.geom_type[geom] != scene.mujoco.mjtGeom.mjGEOM_BOX:
-                        raise ValueError("Current object support binding requires finite native boxes.")
-                    vertices = np.asarray(tuple(itertools.product((-1., 1.), repeat=3))) * model.geom_size[geom]
-                    points.extend(vertices @ scene.data.geom_xmat[geom].reshape(3, 3).T
-                                  + scene.data.geom_xpos[geom])
-                points = np.asarray(points)
-                lower, upper = points.min(axis=0), points.max(axis=0)
-                lower[2] = upper[2]
-                support = MujocoPayloadSupport(
-                    tuple(model.geom(g).name for g in geoms), (0., 0., 1.), tuple(lower), tuple(upper),
-                    self._phase, scene.collision_projector().policy.hard_penetration_m,
-                    **({} if self._support_object_id is None else {
-                        "dynamic_body_name": support_name,
-                        "frozen_pose_xyz_quat_xyzw": tuple(pose_to_xyz_quat_xyzw(
-                            scene.body_pose(support_name))),
-                    }))
+                support = _native_support_for_object_motion(
+                    scene, body_name=support_name, phase=self._phase,
+                    max_penetration_m=scene.collision_projector().policy.hard_penetration_m,
+                    dynamic=self._support_object_id is not None)
 
             def view(data):
                 result = copy.copy(scene)
