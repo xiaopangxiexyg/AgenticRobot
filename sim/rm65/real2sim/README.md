@@ -92,7 +92,14 @@ core and MuJoCo adapter used for the 20260721 fit; tests compare those hashes to
 fixed historical values rather than silently reinterpreting the fit against
 the current files.
 
-当前只读默认发布与可选 TCP arc 排序整合使用独立绑定
+当前 SAM3 默认与外部定位 owner v2 整合使用独立绑定
+`artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261027_sam3_default_v1.json`。
+它继承下面只读默认绑定的全部153项输入／150项Python源码，更新其中7项源码身份，
+固定于 `8bdf790dde02`。固定源码的离线 owner／消费者验收590通过、零跳过／失败；
+完整组合门禁另行记录。SAM3服务和真实设备未启动；v4 fit、timing及历史绑定原字节保留，
+不新增外部checkpoint身份认证、物理响应或held-out资格。
+
+历史只读默认发布与可选 TCP arc 排序整合使用独立绑定
 `artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261027_readonly_defaults_v1.json`。
 它继承 checkpoint integration 的152项输入，更新两端CLI默认发布的源码身份，
 并加入共用抓取轨迹源码，共153项输入／150项Python源码，固定于 `b19fd84165d7`。
