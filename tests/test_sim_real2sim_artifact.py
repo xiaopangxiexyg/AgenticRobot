@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import hashlib
 import json
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -22,6 +24,10 @@ ARM_BASELINE_PATH = Path(
     "sim/rm65/real2sim/artifacts/rm65_arm_free_motion_20260721_v4.json"
 )
 ARM_RUNTIME_BINDING_PATH = Path(
+    "sim/rm65/real2sim/artifacts/"
+    "rm65_arm_free_motion_20260721_v4_runtime_binding_20261027_readonly_defaults_v1.json"
+)
+CHECKPOINT_INTEGRATION_BINDING_PATH = Path(
     "sim/rm65/real2sim/artifacts/"
     "rm65_arm_free_motion_20260721_v4_runtime_binding_20261026_checkpoint_integration_v1.json"
 )
@@ -331,6 +337,56 @@ def test_v4_arm_fit_baseline_remains_frozen_and_provisional() -> None:
 
 def test_current_arm_runtime_binding_uses_exact_current_inputs() -> None:
     binding = Real2SimArtifactManifest.load(ARM_RUNTIME_BINDING_PATH)
+    previous = Real2SimArtifactManifest.load(CHECKPOINT_INTEGRATION_BINDING_PATH)
+    fit = Real2SimArtifactManifest.load(ARM_BASELINE_PATH)
+    tag = "20261027-readonly-defaults-v1"
+    current = {ref.locator: ref for ref in binding.dependency_artifacts
+               if "-runtime-" + tag in ref.artifact_id}
+    inherited = {ref.locator: ref for ref in previous.dependency_artifacts
+                 if "-runtime-20261026-checkpoint-integration-v1" in ref.artifact_id}
+    assert len(current) == 153 and len(inherited) == 152
+    assert sum(path.endswith(".py") for path in current) == 150
+    assert set(current) == set(inherited) | {"teleop_runtime/skill_deploy/rm65_grasp_trajectory.py"}
+    for path, ref in current.items():
+        assert ref.sha256 == ArtifactRef.from_file(path,
+            artifact_id="current-input-check", artifact_kind=ref.artifact_kind).sha256
+        if path in inherited:
+            assert ref.artifact_id == inherited[path].artifact_id.replace("20261026-checkpoint-integration-v1", tag)
+            assert ref.artifact_kind == inherited[path].artifact_kind
+    changed = {path for path in inherited if current[path].sha256 != inherited[path].sha256}
+    assert changed == {"agent_gateway/profiles/mujoco/gateway_cli.py", "agent_gateway/profiles/real/gateway_cli.py"}
+    assert tuple(binding.metadata["changed_previous_runtime_sources"]) == tuple(sorted(changed))
+    assert tuple(binding.metadata["new_runtime_sources"]) == ("teleop_runtime/skill_deploy/rm65_grasp_trajectory.py",)
+    assert binding.resolved_timing == previous.resolved_timing == Real2SimArtifactManifest.resolved_timing_from_contract_file(CONTRACT_PATH)
+    assert binding.simulation_contract.sha256 == previous.simulation_contract.sha256
+    assert binding.metadata["fit_artifact_sha256"] == fit.artifact_sha256
+    assert binding.metadata["fit_simulation_contract_sha256"] == fit.simulation_contract.sha256
+    assert binding.metadata["previous_runtime_binding_artifact_sha256"] == previous.artifact_sha256
+    assert binding.metadata["previous_runtime_binding_file_sha256"] == ArtifactRef.from_file(
+        CHECKPOINT_INTEGRATION_BINDING_PATH, artifact_id="parent-check", artifact_kind="real2sim_runtime_binding").sha256
+    assert binding.metadata["arm_profile_refit"] is False
+    assert binding.metadata["runtime_behavior_change"] is True
+    assert binding.metadata["runtime_behavior_change_scope"] == "readonly_cli_catalog_defaults_and_optional_bounded_tcp_arc_ordering"
+    assert binding.code_revision == binding.environment_fingerprint["source_commit"] == binding.metadata["runtime_source_commit"] == 'b19fd84165d710bc01aa18a94c50fc50c1b12d8a'
+    assert binding.metadata["offline_validation_execution_head"] == 'b19fd84165d710bc01aa18a94c50fc50c1b12d8a'
+    assert binding.environment_fingerprint["source_tree"] == binding.metadata["offline_validation_source_tree"] == 'bb3a8b9339c7d03f4aafc0a26179de959d0b732b'
+    assert binding.artifact_sha256 == 'e7fdb5d558bf413535436851b9aab66ffa7b90048c3bc1345bd85ac99ddac240'
+    assert ArtifactRef.from_file(ARM_RUNTIME_BINDING_PATH,
+        artifact_id="binding-file-check", artifact_kind="real2sim_runtime_binding").sha256 == '2e050d85c5f2f34fa72e655dbfa2cf4ec39b4710d2ab14004a205680e32cd523'
+    assert binding.fidelity_claims[0].status == "provisional"
+    content = next(e for e in binding.validation_evidence if e.validation_id == "runtime-source-content-binding-integrity-" + tag)
+    assert content.status == "passed" and content.split == "validation"
+    assert dict(content.metrics) == {'bound_runtime_input_file_count': 153.0, 'bound_runtime_source_file_count': 150.0, 'changed_runtime_source_file_count_from_previous_binding': 2.0, 'new_runtime_source_file_count': 1.0, 'arm_profile_refit_count': 0.0, 'mutated_historical_artifact_count': 0.0}
+    offline = next(e for e in binding.validation_evidence if e.validation_id == "readonly-defaults-consumers-" + tag)
+    assert offline.status == "passed" and offline.split == "validation"
+    assert dict(offline.metrics) == {"passed_cases": 601., "skipped_cases": 0., "failed_cases": 0., "error_cases": 0.}
+    refs = {ref.artifact_id: ref for ref in binding.dependency_artifacts}
+    assert refs[binding.metadata["offline_validation_report_artifact_id"]].sha256 == "2466618ed98732d4be629477617835a4b18375ffe9a178e8ef59a7512e564848"
+    assert next(e for e in binding.validation_evidence if e.split == "held_out").status == "not_run"
+
+
+def test_checkpoint_integration_binding_remains_frozen_after_readonly_defaults() -> None:
+    binding = Real2SimArtifactManifest.load(CHECKPOINT_INTEGRATION_BINDING_PATH)
     fit = Real2SimArtifactManifest.load(ARM_BASELINE_PATH)
     parents = [
         Real2SimArtifactManifest.load(path)
@@ -367,11 +423,10 @@ def test_current_arm_runtime_binding_uses_exact_current_inputs() -> None:
     for ref in current.values():
         assert (
             ref.sha256
-            == ArtifactRef.from_file(
-                ref.locator,
-                artifact_id="current-input-check",
-                artifact_kind=ref.artifact_kind,
-            ).sha256
+            == hashlib.sha256(subprocess.check_output(
+                ["git", "show", f"{binding.code_revision}:{ref.locator}"],
+                cwd=Path(__file__).resolve().parents[1],
+            )).hexdigest()
         )
     expected_changes = [
         {
@@ -458,7 +513,7 @@ def test_current_arm_runtime_binding_uses_exact_current_inputs() -> None:
     )
     assert (
         ArtifactRef.from_file(
-            ARM_RUNTIME_BINDING_PATH,
+            CHECKPOINT_INTEGRATION_BINDING_PATH,
             artifact_id="integration-file-check",
             artifact_kind="real2sim_runtime_binding",
         ).sha256

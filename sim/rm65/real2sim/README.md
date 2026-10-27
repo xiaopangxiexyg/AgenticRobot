@@ -92,7 +92,14 @@ core and MuJoCo adapter used for the 20260721 fit; tests compare those hashes to
 fixed historical values rather than silently reinterpreting the fit against
 the current files.
 
-当前 checkpoint 整合候选使用独立绑定
+当前只读默认发布与可选 TCP arc 排序整合使用独立绑定
+`artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261027_readonly_defaults_v1.json`。
+它继承 checkpoint integration 的152项输入，更新两端CLI默认发布的源码身份，
+并加入共用抓取轨迹源码，共153项输入／150项Python源码，固定于 `b19fd84165d7`。
+旧绑定和v4标定原字节保留；固定源码的直接消费者验收为601通过、零跳过／失败，
+完整组合门禁另行记录。该绑定不重拟合，不新增物理响应或held-out资格。
+
+历史 checkpoint 整合候选使用独立绑定
 `artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261026_checkpoint_integration_v1.json`。
 它合并主线 V25 的92项输入与历史 observer 候选的147项输入，再加入 TCP envelope
 companion，共152项输入／149项 Python 源码，固定于 `a47d7e3922ef`。两份前驱
