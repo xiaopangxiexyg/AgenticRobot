@@ -35,6 +35,7 @@ def service():
             "mask_shape": [8, 12],
             "mask_png_base64": encoded_mask(mask),
         },
+        candidate_result={},
         error=None,
         raw=None,
         redirect=False,
@@ -56,14 +57,16 @@ def service():
             self.send_response(200)
             self.end_headers()
             result = (
-                {"status": "ok"} if request["method"] == "healthz" else state.result
+                {"status": "ok"} if request["method"] == "healthz"
+                else state.candidate_result if request["method"] == "sam3.segment_candidates"
+                else state.result
             )
             envelope = (
                 {"ok": True, "result": result}
                 if state.error is None
                 else {"ok": False, "error": state.error}
             )
-            if request["method"] not in {"healthz", "sam3.segment"}:
+            if request["method"] not in {"healthz", "sam3.segment", "sam3.segment_candidates"}:
                 envelope = {
                     "ok": False,
                     "error": f"unknown RPC method: {request['method']!r}",
@@ -117,6 +120,55 @@ def test_text_and_point_share_original_rpc_without_model_or_server_ownership(
     assert len(service.calls) == 3  # In particular, never send shutdown.
     with pytest.raises(RuntimeError, match="cannot restart"):
         client.start()
+
+
+def test_opt_in_multi_instance_localization_preserves_default_binding(service):
+    first = np.zeros((8, 12), dtype=np.uint8)
+    second = np.zeros_like(first)
+    first[2:6, 7:10] = 255
+    second[1:4, 1:4] = 255
+    service.candidate_result = {
+        "raw_candidate_count": 200,
+        "candidates": [
+            {"score": 0.93, "mask_shape": [8, 12], "mask_png_base64": encoded_mask(first)},
+            {"score": 0.89, "mask_shape": [8, 12], "mask_png_base64": encoded_mask(second)},
+        ],
+    }
+    default = Sam3ServiceLocalizer(endpoint=service.endpoint)
+    candidate_client = Sam3ServiceLocalizer(
+        endpoint=service.endpoint, multi_instance_text=True
+    )
+    assert default.semantic_content_hash != candidate_client.semantic_content_hash
+    assert default.model_spec.semantic_content_hash != candidate_client.model_spec.semantic_content_hash
+    image = Image.new("RGB", (12, 8))
+    default.start()
+    candidate_client.start()
+    try:
+        assert len(default.localize(image, language_prompt="blue cube", max_detections=8)) == 1
+        detections = candidate_client.localize(
+            image, language_prompt="blue cube", max_detections=2
+        )
+        assert [item.box_xyxy for item in detections] == [(7, 2, 10, 6), (1, 1, 4, 4)]
+        assert [item.score for item in detections] == [0.93, 0.89]
+        assert [item.label for item in detections] == ["blue cube", "blue cube"]
+        assert candidate_client.segment_candidates(
+            image, language_prompt="blue cube", max_candidates=2
+        )[1].mask[2, 2]
+        assert [call["method"] for call in service.calls] == [
+            "healthz", "healthz", "sam3.segment", "sam3.segment_candidates",
+            "sam3.segment_candidates",
+        ]
+    finally:
+        default.close()
+        candidate_client.close()
+
+
+def test_multi_instance_protocol_fault_is_not_a_single_best_fallback(service):
+    client = Sam3ServiceLocalizer(endpoint=service.endpoint, multi_instance_text=True)
+    client.start()
+    with pytest.raises(RuntimeError, match="invalid candidate collection"):
+        client.localize(Image.new("RGB", (12, 8)), language_prompt="cube", max_detections=2)
+    assert [call["method"] for call in service.calls] == ["healthz", "sam3.segment_candidates"]
 
 
 @pytest.mark.parametrize("mode", ["text", "point"])
