@@ -175,6 +175,15 @@ def test_support_requires_explicit_bounded_identity_direction_region(changes):
         _support(**changes)
 
 
+def test_fixed_support_keeps_its_original_serialized_identity():
+    assert set(_support().to_payload()) == {
+        "geom_names", "normal_world", "region_min_world", "region_max_world",
+        "phase", "max_penetration_m", "lateral_tolerance_m",
+    }
+    with pytest.raises(ValueError, match="both body identity and frozen pose"):
+        _support(dynamic_body_name="support")
+
+
 @pytest.mark.integration
 def test_payload_query_requires_exact_binding_cut_and_rejects_contact_policy_mix():
     scene = _scene()
@@ -326,6 +335,43 @@ def test_mocap_driven_body_cannot_be_declared_a_fixed_support():
     scene = _scene(table=True, table_shape="box", table_mocap=True)
     with pytest.raises(ValueError, match="fixed, not mocap-driven"):
         _binding(scene, support=_support())
+
+
+@pytest.mark.integration
+def test_other_free_box_support_is_frozen_and_movement_revokes_placement():
+    scene = _scene(extra='''<body name="support" pos=".08 0 .355"><freejoint/>
+      <geom name="support_geom" type="box" size=".1 .08 .03" mass=".4"
+        contype="8" conaffinity="15"/></body>''')
+    support = _support(
+        geom_names=("support_geom",), phase="place",
+        region_min_world=(-.02, -.08, .385),
+        region_max_world=(.18, .08, .385),
+        dynamic_body_name="support",
+        frozen_pose_xyz_quat_xyzw=tuple(pose_matrix_to_xyzquat(
+            _pose(scene.data, scene.model, "support"))),
+    )
+    binding = _binding(scene, support=support)
+    oracle = _oracle(scene, binding)
+    assert oracle.check(_pair(oracle, z=.02)).safe
+    assert binding.check_measured(scene).safe
+    address = int(scene.model.jnt_qposadr[scene.model.body_jntadr[scene.model.body("support").id]])
+    scene.data.qpos[address] += .004
+    scene.mujoco.mj_kinematics(scene.model, scene.data)
+    scene.mujoco.mj_collision(scene.model, scene.data)
+    # The historical planning cut remains immutable; the live measured guard
+    # must reject the support's actual movement before another dispatch.
+    assert oracle.check(_pair(oracle, z=.02)).safe
+    rejected = binding.check_measured(scene)
+    assert not rejected.safe and rejected.metadata["pair_class"] == "payload_support_moved"
+
+
+@pytest.mark.integration
+def test_free_support_cannot_be_used_as_a_fixed_table_exception():
+    scene = _scene(extra='''<body name="support" pos=".08 0 .355"><freejoint/>
+      <geom name="support_geom" type="box" size=".1 .08 .03" mass=".4"
+        contype="8" conaffinity="15"/></body>''')
+    with pytest.raises(ValueError, match="fixed native environment"):
+        _binding(scene, support=_support(geom_names=("support_geom",)))
 
 
 @pytest.mark.integration
