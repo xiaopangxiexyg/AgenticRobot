@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
+from itertools import product
 import math
 from types import MappingProxyType
 
@@ -139,6 +140,144 @@ class GraspedObjectObservation:
         if (self.object_id, self.side, self.reference_frame_id, self.scene_revision) != (
                 object_id, side, reference_frame_id, scene_revision):
             raise ValueError("Object/hand observation identity does not match the request")
+
+
+@dataclass(frozen=True)
+class SupportSurfaceObservation:
+    """Measured support plane and a fully supported inner XY rectangle.
+
+    top_z_m is the conservative plane height at the rectangle's XY center.
+    The observation producer must prove that every point in that rectangle is
+    supported; a rotated object's outer AABB or raw mask quantile bounds do
+    not satisfy geometry_complete.
+    """
+
+    support_id: str
+    reference_frame_id: str
+    scene_revision: int
+    measured_at: float
+    top_z_m: float
+    normal_reference_xyz: tuple[float, float, float]
+    region_min_xy_m: tuple[float, float]
+    region_max_xy_m: tuple[float, float]
+    evidence_ref: str
+    geometry_complete: bool
+
+    def __post_init__(self):
+        for name in ("support_id", "reference_frame_id", "evidence_ref"):
+            value = getattr(self, name)
+            if not isinstance(value, str) or not value or value.strip() != value:
+                raise ValueError(f"{name} must identify measured support evidence")
+        if (isinstance(self.scene_revision, bool) or not isinstance(self.scene_revision, int)
+                or self.scene_revision < 0 or isinstance(self.measured_at, bool)
+                or isinstance(self.top_z_m, bool) or not math.isfinite(self.measured_at)
+                or self.measured_at < 0 or not math.isfinite(self.top_z_m)):
+            raise ValueError("Support time, revision and height must be finite")
+        if self.geometry_complete is not True:
+            raise ValueError("Release approach requires complete conservative support geometry")
+        normal = np.asarray(self.normal_reference_xyz, dtype=float)
+        if (normal.shape != (3,) or not np.isfinite(normal).all()
+                or not np.isclose(np.linalg.norm(normal), 1., atol=1e-6, rtol=0)
+                or normal[2] < math.cos(math.radians(1.))):
+            raise ValueError("Release approach requires a measured near-horizontal upward support")
+        object.__setattr__(self, "normal_reference_xyz", tuple(float(value) for value in normal))
+        for name in ("region_min_xy_m", "region_max_xy_m"):
+            values = np.asarray(getattr(self, name), dtype=float)
+            if values.shape != (2,) or not np.isfinite(values).all():
+                raise ValueError(f"{name} must contain finite Station XY bounds")
+            object.__setattr__(self, name, tuple(float(value) for value in values))
+        if any(low >= high for low, high in zip(self.region_min_xy_m, self.region_max_xy_m)):
+            raise ValueError("Support bounds must have positive area")
+
+
+@dataclass(frozen=True)
+class ReleaseApproachProposal:
+    """A support-relative goal proposal; existing motion admission remains authoritative."""
+
+    support_id: str
+    reference_frame_id: str
+    object_goal: np.ndarray
+    tool_goal: np.ndarray
+    release_clearance_m: float
+    evidence_refs: tuple[str, str, str]
+
+    def __post_init__(self):
+        object.__setattr__(self, "object_goal", rigid_pose(self.object_goal, name="release object goal"))
+        object.__setattr__(self, "tool_goal", rigid_pose(self.tool_goal, name="release tool goal"))
+
+
+def plan_release_approach(
+    held: GraspedObjectObservation,
+    support: SupportSurfaceObservation,
+    *,
+    now: float,
+    clearance_m: float,
+    minimum_planning_clearance_m: float,
+    maximum_clearance_m: float,
+    maximum_measurement_age_sec: float = .2,
+    maximum_pair_skew_sec: float = .05,
+    lateral_margin_m: float = 0.,
+) -> ReleaseApproachProposal:
+    """Center a fully bounded held box above a measured support without contact.
+
+    The release pose preserves the observed object orientation and hand-object
+    relation. The support surface and object box must be complete observations;
+    no segmentation-visible top face is promoted into an unseen object bottom.
+    """
+    if not isinstance(held, GraspedObjectObservation) or not isinstance(support, SupportSurfaceObservation):
+        raise TypeError("Release planning needs typed held-object and support observations")
+    if held.object_id == support.support_id:
+        raise ValueError("A held object cannot support its own release")
+    for name, value in (("now", now),
+                        ("maximum_measurement_age_sec", maximum_measurement_age_sec),
+                        ("clearance_m", clearance_m),
+                        ("minimum_planning_clearance_m", minimum_planning_clearance_m),
+                        ("maximum_clearance_m", maximum_clearance_m),
+                        ("lateral_margin_m", lateral_margin_m),
+                        ("maximum_pair_skew_sec", maximum_pair_skew_sec)):
+        if isinstance(value, (bool, np.bool_)) or not math.isfinite(value) or value < 0:
+            raise ValueError(f"{name} must be finite and nonnegative")
+    if (maximum_measurement_age_sec <= 0 or maximum_pair_skew_sec <= 0
+            or minimum_planning_clearance_m <= 0 or maximum_clearance_m <= 0
+            or not minimum_planning_clearance_m <= clearance_m <= maximum_clearance_m):
+        raise ValueError("Release clearance is outside the original planning profile")
+    held.require_current(now=now, scene_revision=support.scene_revision,
+        reference_frame_id=support.reference_frame_id, object_id=held.object_id,
+        side=held.side, max_age_sec=maximum_measurement_age_sec)
+    if (not 0 <= now - support.measured_at <= maximum_measurement_age_sec
+            or abs(held.measured_at - support.measured_at) > maximum_pair_skew_sec):
+        raise ValueError("Held object and support require fresh correlated observations")
+    box = held.object_from_box
+    half = np.asarray(held.box_size_m, dtype=float) / 2.
+    corners_box = np.asarray(tuple(product((-1., 1.), repeat=3)), dtype=float) * half
+    corners_object = corners_box @ box[:3, :3].T + box[:3, 3]
+    rotation = held.reference_from_object[:3, :3]
+    offsets = corners_object @ rotation.T
+    low, high = offsets.min(axis=0), offsets.max(axis=0)
+    center_xy = (np.asarray(support.region_min_xy_m) + support.region_max_xy_m) / 2.
+    # Align the complete box center, not an arbitrary object-frame origin.
+    object_center_offset = rotation @ box[:3, 3]
+    object_goal = held.reference_from_object.copy()
+    object_goal[:2, 3] = center_xy - object_center_offset[:2]
+    normal = np.asarray(support.normal_reference_xyz)
+    # The support plane crosses (center_x, center_y, top_z_m). Solve the
+    # minimum signed distance of every rotated box corner, including slope.
+    corner_xy = object_goal[:2, 3] + offsets[:, :2]
+    signed_without_object_z = ((corner_xy - center_xy) @ normal[:2]
+                               + (offsets[:, 2] - support.top_z_m) * normal[2])
+    object_goal[2, 3] = (clearance_m - float(np.min(signed_without_object_z))) / normal[2]
+    footprint_min = object_goal[:2, 3] + low[:2]
+    footprint_max = object_goal[:2, 3] + high[:2]
+    if (np.any(footprint_min < np.asarray(support.region_min_xy_m) + lateral_margin_m)
+            or np.any(footprint_max > np.asarray(support.region_max_xy_m) - lateral_margin_m)):
+        raise ValueError("Complete held footprint does not fit on the selected support")
+    object_goal = rigid_pose(object_goal, name="support-relative release object goal")
+    return ReleaseApproachProposal(
+        support_id=support.support_id, reference_frame_id=held.reference_frame_id,
+        object_goal=object_goal, tool_goal=held.tool_goal(object_goal),
+        release_clearance_m=float(clearance_m),
+        evidence_refs=(held.pose_evidence_ref, held.grasp_evidence_ref, support.evidence_ref),
+    )
 
 
 def verify_rigid_follow(previous: GraspedObjectObservation, current: GraspedObjectObservation,

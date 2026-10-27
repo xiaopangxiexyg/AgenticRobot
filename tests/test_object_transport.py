@@ -7,7 +7,9 @@ from scipy.spatial.transform import Rotation
 
 from robot_motion.object_transport import (
     GraspedObjectObservation,
+    SupportSurfaceObservation,
     object_translation_feedback_tool_goal,
+    plan_release_approach,
     tool_goal_from_object_goal,
     verify_rigid_follow,
 )
@@ -162,3 +164,99 @@ def test_tool_goal_helper_preserves_relation_and_returns_an_immutable_pose():
     assert not result.flags.writeable
     for actual, original in zip((goal, relation), before, strict=True):
         np.testing.assert_array_equal(actual, original)
+
+
+def support(**overrides):
+    values = dict(support_id="table-region", reference_frame_id="world", scene_revision=1,
+        measured_at=10.01, top_z_m=0., normal_reference_xyz=(0., 0., 1.),
+        region_min_xy_m=(-.4, -.1),
+        region_max_xy_m=(-.2, .1), evidence_ref="rgbd:measured-support-region",
+        geometry_complete=True)
+    values.update(overrides)
+    return SupportSurfaceObservation(**values)
+
+
+def test_release_approach_uses_full_held_box_and_measured_surface_not_visible_center():
+    held = observation(box_size_m=(.035, .035, .035),
+        reference_from_object=pose((-.3, 0., .0566)),
+        reference_from_tool=pose((-.31, .01, .15)))
+    result = plan_release_approach(held, support(), now=10.02,
+        clearance_m=.006, minimum_planning_clearance_m=.004,
+        maximum_clearance_m=.05)
+    np.testing.assert_allclose(result.object_goal[:3, 3], [-.3, 0., .0235])
+    np.testing.assert_allclose(result.tool_goal @ held.tool_from_object, result.object_goal)
+    assert result.evidence_refs == (
+        held.pose_evidence_ref, held.grasp_evidence_ref, support().evidence_ref)
+    assert not result.object_goal.flags.writeable and not result.tool_goal.flags.writeable
+    assert held.reference_from_object[2, 3] == pytest.approx(.0566)
+
+
+def test_release_approach_respects_rotated_offset_box_and_support_footprint():
+    held = observation(box_size_m=(.04, .02, .06),
+        reference_from_object=pose((0., 0., .2), (0., 30., 25.)),
+        object_from_box=pose((.01, 0., .005), (0., 0., 10.)))
+    result = plan_release_approach(held, support(region_min_xy_m=(-.1, -.1),
+        region_max_xy_m=(.1, .1)), now=10.02, clearance_m=.006,
+        minimum_planning_clearance_m=.004, maximum_clearance_m=.05,
+        lateral_margin_m=.002)
+    half = np.asarray(held.box_size_m) / 2.
+    corners = np.asarray([(x, y, z) for x in (-half[0], half[0])
+                          for y in (-half[1], half[1]) for z in (-half[2], half[2])])
+    points = (result.object_goal @ held.object_from_box)[:3, :3] @ corners.T
+    points += (result.object_goal @ held.object_from_box)[:3, 3:4]
+    assert points[2].min() == pytest.approx(.006)
+    assert np.all(points[:2].min(axis=1) >= -.1 + .002)
+    assert np.all(points[:2].max(axis=1) <= .1 - .002)
+
+
+def test_release_approach_preserves_full_box_clearance_above_a_tilted_plane():
+    held = observation(reference_from_object=pose((0., 0., .2)),
+        reference_from_tool=pose((0., 0., .3)), box_size_m=(.2, .05, .04))
+    normal = (-.015707317311820675, 0., .9998766324816606)
+    surface = support(normal_reference_xyz=normal,
+        region_min_xy_m=(-.4, -.1), region_max_xy_m=(.4, .1))
+    result = plan_release_approach(held, surface, now=10.02,
+        clearance_m=.004, minimum_planning_clearance_m=.004,
+        maximum_clearance_m=.05)
+    half = np.asarray(held.box_size_m) / 2.
+    corners = np.asarray([(x, y, z) for x in (-half[0], half[0])
+                          for y in (-half[1], half[1]) for z in (-half[2], half[2])])
+    world = (result.object_goal[:3, :3] @ corners.T).T + result.object_goal[:3, 3]
+    anchor = np.array([0., 0., surface.top_z_m])
+    signed = (world - anchor) @ np.asarray(normal)
+    assert signed.min() == pytest.approx(.004, abs=1e-12)
+
+
+@pytest.mark.parametrize("change", [
+    dict(clearance_m=.0015), dict(clearance_m=.051),
+    dict(clearance_m=float("nan")), dict(clearance_m=True),
+    dict(lateral_margin_m=.09), dict(lateral_margin_m=-.001),
+    dict(maximum_pair_skew_sec=-.01), dict(now=10.3),
+    dict(maximum_measurement_age_sec=True),
+    dict(maximum_measurement_age_sec=np.bool_(True)),
+    dict(support_override=dict(measured_at=9.9)),
+    dict(support_override=dict(scene_revision=2)),
+    dict(support_override=dict(reference_frame_id="camera")),
+    dict(support_override=dict(support_id="cube")),
+    dict(support_override=dict(region_min_xy_m=(-.01, -.01), region_max_xy_m=(.01, .01))),
+])
+def test_release_approach_rejects_missing_clearance_stale_or_unsupported_geometry(change):
+    change = dict(change)
+    surface = support(**change.pop("support_override", {}))
+    options = dict(now=10.02, clearance_m=.006,
+        minimum_planning_clearance_m=.004, maximum_clearance_m=.05)
+    options.update(change)
+    with pytest.raises(ValueError):
+        plan_release_approach(observation(), surface, **options)
+
+
+@pytest.mark.parametrize("change", [
+    dict(geometry_complete=False), dict(top_z_m=float("nan")),
+    dict(top_z_m=True), dict(scene_revision=True),
+    dict(normal_reference_xyz=(0., 1., 0.)),
+    dict(region_min_xy_m=(-.1, float("inf"))),
+    dict(region_min_xy_m=(.2, 0.), region_max_xy_m=(.1, .1)),
+])
+def test_release_support_requires_complete_finite_measured_geometry(change):
+    with pytest.raises(ValueError):
+        support(**change)
