@@ -171,6 +171,8 @@ def build_parser() -> argparse.ArgumentParser:
                         help="SAM3 service request timeout; no automatic retry or fallback.")
     parser.add_argument("--sam3-min-score", type=float, default=0.2,
                         help="Minimum SAM3 proposal score in [0, 1].")
+    parser.add_argument("--sam3-multi-instance-text", action="store_true",
+                        help="Opt into bounded SAM3 text instances for localize_objects; default single best.")
     parser.add_argument("--enable-rgbd-capture-v3", action="store_true",
                         help="Publish capture_rgb v3 with optional native-grid paired RGB-D Artifacts; default off.")
     parser.add_argument("--enable-object-localization", action="store_true",
@@ -526,6 +528,8 @@ def _segmentation_requested(args):
 
 
 def _localizer_from_args(parser, args, *, bundle, device):
+    if args.sam3_multi_instance_text and not args.enable_object_localization:
+        parser.error("--sam3-multi-instance-text requires --enable-object-localization")
     if args.object_localization_backend == "sam3-service":
         if bundle is not None:
             parser.error("SAM2 assets require --object-localization-backend sam2-grounding-dino")
@@ -536,11 +540,14 @@ def _localizer_from_args(parser, args, *, bundle, device):
                 endpoint=args.sam3_endpoint or DEFAULT_SAM3_ENDPOINT,
                 timeout_sec=args.sam3_timeout_sec,
                 min_score=args.sam3_min_score,
+                multi_instance_text=args.sam3_multi_instance_text,
             )
         except (TypeError, ValueError) as error:
             parser.error(f"invalid SAM3 service binding: {error}")
     if args.sam3_endpoint is not None:
         parser.error("--sam3-endpoint requires --object-localization-backend sam3-service")
+    if args.sam3_multi_instance_text:
+        parser.error("--sam3-multi-instance-text requires --object-localization-backend sam3-service")
     if bundle is None:
         parser.error("explicit SAM2 backend requires its asset bundle")
     from deployments.perception.sam2_grounding_dino import (
@@ -650,11 +657,15 @@ def main(argv: list[str] | None = None) -> int:
         )
     if args.enable_surface_anchor_v2 and not args.enable_surface_anchors:
         parser.error("--enable-surface-anchor-v2 requires surface anchors and segmentation")
+    if args.sam3_multi_instance_text and not args.enable_object_localization:
+        parser.error("--sam3-multi-instance-text requires --enable-object-localization")
     if args.object_localization_backend == "sam3-service" and (
         args.segmentation_asset_bundle is not None or args.sam2_grounding_dino_bundle is not None
     ):
         parser.error("SAM2 assets require --object-localization-backend sam2-grounding-dino")
     if args.object_localization_backend == "sam2-grounding-dino":
+        if args.sam3_multi_instance_text:
+            parser.error("--sam3-multi-instance-text requires --object-localization-backend sam3-service")
         if args.sam3_endpoint is not None:
             parser.error("--sam3-endpoint requires --object-localization-backend sam3-service")
         if _segmentation_requested(args) and args.segmentation_asset_bundle is None:

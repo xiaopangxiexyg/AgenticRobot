@@ -666,8 +666,16 @@ SAM3_CHECKPOINT_PATH=/absolute/checkpoints/sam3.pt \
 --sam3-min-score 0.2
 ```
 
-此版本支持文本提示的**单个最佳实例**和原图像素点选；`max_detections` 仍是上界，
-不是承诺返回多个物体。无文本自动分割暂不支持，会明确拒绝，不能以空结果假装成功。
+默认仍是文本提示的**单个最佳实例**和原图像素点选；默认模式下 `max_detections`
+仍是上界，不承诺返回多个物体。可显式传入 `--sam3-multi-instance-text`，让现有
+`perception.localize_objects@1` 从服务的新 `sam3.segment_candidates` 只读 RPC
+接收至多八个按分数排序、去除高度重叠的文本实例。MuJoCo 与 real-perception
+须同时启用 `--enable-object-localization`；real-rm65 须启用
+`--enable-point-grasp`。开关不自动启用相机、模型、定位或运动，也不改变
+`perception.segment` 的单掩码行为。此模式需要包含该 RPC 的 RPent SAM3 服务；
+旧服务会明确报错，不回退到单实例或 SAM2。候选只有共同的文本标签和实测掩码，
+关系目标的最终实例选择仍需调用方判断，不能把分数当作关系判定。
+无文本自动分割暂不支持，会明确拒绝，不能以空结果假装成功。
 同一实例支持现有 `perception.segment` 的文本和点选请求，复用标准 mask NPY 与
 overlay JPEG Artifact 编码、分数阈值及发布时的观测版本检查。
 文本没有检出时可按现有交互流程由操作者改为图片点选；不会自动换回 SAM2 或偷偷
@@ -681,7 +689,8 @@ localizer。SAM3 的 profile hash 表示服务协议与 endpoint 配置，**不�
 checkpoint 字节身份**，因此应在服务自身的部署记录中保留源码、权重与环境信息。
 定位 Skill 保持 `perception.localize_objects@1`；服务模式的 deployment binding 显式为 v2，
 分别记录应用管理的只读客户端与外部模型执行服务。SAM2 的历史 v1 绑定和哈希保持。
-更换后端后，消费者需重新发现目录并绑定新 profile/Route/deployment 哈希，不复用旧发现缓存。
+启用多实例时，model/localizer profile hash 另行区分；消费者需重新发现目录并绑定
+新 profile/Route/deployment 哈希，不复用旧发现缓存。默认单实例哈希保持不变。
 MuJoCo 使用 `--enable-segmentation` 启用默认服务分割；显式 `--sam3-endpoint` 也保留原来的启用含义。
 历史只读 Agent 验收 probe 的 `--localization-bundle` 仍绑定 SAM2；该调用方现在显式选择
 SAM2 兼容后端，不会把已有资产参数误传给默认 SAM3。

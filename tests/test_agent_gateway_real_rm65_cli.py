@@ -823,14 +823,16 @@ def test_cli_rejects_ambiguous_or_missing_localization_bundle_before_resources(
 
 
 @pytest.mark.parametrize("with_reachability", [False, True])
-@pytest.mark.parametrize("localization_backend, backend_args", [
-    ("sam3-service", []),
-    ("sam3-service", ["--object-localization-backend", "sam3-service"]),
-    ("sam2-grounding-dino", ["--object-localization-backend", "sam2-grounding-dino"]),
+@pytest.mark.parametrize("localization_backend, backend_args, multi_instance", [
+    ("sam3-service", [], False),
+    ("sam3-service", [], True),
+    ("sam3-service", ["--object-localization-backend", "sam3-service"], False),
+    ("sam3-service", ["--object-localization-backend", "sam3-service"], True),
+    ("sam2-grounding-dino", ["--object-localization-backend", "sam2-grounding-dino"], False),
 ])
 def test_cli_binds_the_same_localizer_to_perception_and_point_grasp(
     monkeypatch, tmp_path, short_unix_socket_path_factory, with_reachability,
-    localization_backend, backend_args,
+    localization_backend, backend_args, multi_instance,
 ):
     resolved = SimpleNamespace(
         semantic_content_hash="a" * 64,
@@ -867,6 +869,7 @@ def test_cli_binds_the_same_localizer_to_perception_and_point_grasp(
             assert isinstance(kwargs["object_localizer"], Sam3ServiceLocalizer)
             assert kwargs["object_localizer"]._started is False
             assert kwargs["object_localizer"].model_spec.endpoint == "http://127.0.0.1:18114"
+            assert kwargs["object_localizer"].multi_instance_text is multi_instance
         raise RuntimeError("stop before any device startup")
 
     monkeypatch.setattr(gateway_cli, "Sam2GraspGenXPointGraspPlanner", construct_planner)
@@ -882,6 +885,8 @@ def test_cli_binds_the_same_localizer_to_perception_and_point_grasp(
         argv += ["--object-localization-asset-bundle", str(tmp_path)]
     if with_reachability:
         argv.append("--enable-point-grasp-arm-reachability")
+    if multi_instance:
+        argv.append("--sam3-multi-instance-text")
     with pytest.raises(RuntimeError, match="stop before any device startup"):
         gateway_cli.main(argv)
 

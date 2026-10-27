@@ -42,6 +42,7 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 class Sam3ServiceModelSpec:
     endpoint: str
     model_profile_id: str = "sam3-service-text-point-v1"
+    rpc_contract: str = "sam3.segment:text_or_row_col:single_best_png_mask"
 
     def __post_init__(self) -> None:
         url = urllib.parse.urlsplit(self.endpoint)
@@ -66,7 +67,7 @@ class Sam3ServiceModelSpec:
             {
                 "model_profile_id": self.model_profile_id,
                 "endpoint": self.endpoint,
-                "rpc": "sam3.segment:text_or_row_col:single_best_png_mask",
+                "rpc": self.rpc_contract,
                 "checkpoint_identity": "external_service_not_attested",
             },
             domain="dexteleop.perception.sam3_service_binding.v1",
@@ -76,8 +77,9 @@ class Sam3ServiceModelSpec:
 class Sam3ServiceLocalizer:
     """Use the same read-only localizer/point-segmenter ports as SAM2.
 
-    Text requests return at most one instance. Unprompted automatic proposals
-    are deliberately unsupported. Model/transport failures are never retried
+    The default text request returns one instance. Opt-in multi-instance
+    localization uses the service's bounded candidate RPC; unprompted automatic
+    proposals remain unsupported. Model/transport failures are never retried
     or substituted with another segmentation backend.
     """
 
@@ -89,8 +91,22 @@ class Sam3ServiceLocalizer:
         endpoint: str = DEFAULT_SAM3_ENDPOINT,
         timeout_sec: float = 120.0,
         min_score: float = 0.2,
+        multi_instance_text: bool = False,
     ) -> None:
-        self.model_spec = Sam3ServiceModelSpec(endpoint)
+        if not isinstance(multi_instance_text, bool):
+            raise TypeError("multi_instance_text must be boolean")
+        self.multi_instance_text = multi_instance_text
+        self.model_spec = Sam3ServiceModelSpec(
+            endpoint,
+            model_profile_id=(
+                "sam3-service-text-candidates-v1" if multi_instance_text
+                else "sam3-service-text-point-v1"
+            ),
+            rpc_contract=(
+                "sam3.segment_candidates:text:bounded_distinct_png_masks_v1"
+                if multi_instance_text else "sam3.segment:text_or_row_col:single_best_png_mask"
+            ),
+        )
         for name, value in (("timeout_sec", timeout_sec), ("min_score", min_score)):
             if isinstance(value, bool) or not math.isfinite(value):
                 raise ValueError(f"SAM3 {name} must be finite")
@@ -118,9 +134,15 @@ class Sam3ServiceLocalizer:
                 "model_spec_hash": self.model_spec.semantic_content_hash,
                 "timeout_sec": self.timeout_sec,
                 "min_score": self.min_score,
-                "mask_result_contract": "grounded_object_segment_with_shared_artifacts_v1",
+                "mask_result_contract": (
+                    "grounded_object_segment_candidates_with_shared_artifacts_v1"
+                    if self.multi_instance_text else "grounded_object_segment_with_shared_artifacts_v1"
+                ),
             },
-            domain="dexteleop.perception.sam3_service_localizer.v1",
+            domain=(
+                "dexteleop.perception.sam3_service_localizer.v2"
+                if self.multi_instance_text else "dexteleop.perception.sam3_service_localizer.v1"
+            ),
         )
 
     def _call(self, method: str, kwargs: dict) -> dict:
@@ -183,17 +205,33 @@ class Sam3ServiceLocalizer:
             )
         if not isinstance(result.get("found"), bool):
             raise RuntimeError("SAM3 response lacks a boolean found field")  # noqa: TRY004 - remote protocol fault
-        score = result.get("score")
-        if score is not None and (
+        if not result["found"]:
+            score = result.get("score")
+            if score is None:
+                return None, 0.0
+            self._validated_score(score)
+            return None, float(score)
+        return self._decode_mask_result(result, image)
+
+    @staticmethod
+    def _validated_score(score: object) -> float:
+        if (
             isinstance(score, bool)
             or not isinstance(score, (int, float))
             or not math.isfinite(score)
             or not 0 <= score <= 1
         ):
             raise RuntimeError("SAM3 returned an invalid score")
-        if not result["found"]:
-            return None, float(score or 0.0)
-        if score is None or score < self.min_score:
+        return float(score)
+
+    def _decode_mask_result(
+        self, result: dict, image: Image.Image
+    ) -> tuple[np.ndarray, float]:
+        score = result.get("score")
+        if score is None:
+            raise RuntimeError("SAM3 returned found=True without a score")
+        score = self._validated_score(score)
+        if score < self.min_score:
             raise RuntimeError(
                 "SAM3 returned found=True below its requested score threshold"
             )
@@ -213,7 +251,7 @@ class Sam3ServiceLocalizer:
             raise RuntimeError(f"SAM3 returned an invalid PNG mask: {exc}") from exc
         if not np.isin(mask_values, (0, 255)).all() or not mask_values.any():
             raise RuntimeError("SAM3 returned a non-binary or empty mask")
-        return mask_values > 0, float(score)
+        return mask_values > 0, score
 
     def localize(
         self, image: Image.Image, *, language_prompt: str | None, max_detections: int
@@ -228,6 +266,18 @@ class Sam3ServiceLocalizer:
             or max_detections <= 0
         ):
             raise ValueError("max_detections must be positive")
+        if self.multi_instance_text:
+            segments = self.segment_candidates(
+                image, language_prompt=language_prompt,
+                max_candidates=min(max_detections, 8),
+            )
+            return tuple(
+                GroundedObjectDetection(
+                    box_xyxy=segment.box_xyxy,
+                    score=segment.score,
+                    label=segment.label,
+                ) for segment in segments
+            )
         segment = self.segment(
             image, language_prompt=language_prompt, pixel_uv=None,
             min_score=self.min_score,
@@ -241,6 +291,54 @@ class Sam3ServiceLocalizer:
                 label=segment.label,
             ),
         )
+
+    def segment_candidates(
+        self, image: Image.Image, *, language_prompt: str,
+        max_candidates: int = 4,
+    ) -> tuple[GroundedObjectSegment, ...]:
+        """Read bounded text instances without changing the single-mask port."""
+        if not self.multi_instance_text:
+            raise RuntimeError("SAM3 multi-instance text mode is not enabled")
+        if not isinstance(image, Image.Image):
+            raise TypeError("image must be a PIL Image")
+        if not isinstance(language_prompt, str) or not language_prompt.strip():
+            raise ValueError("language_prompt must contain text")
+        if (
+            isinstance(max_candidates, bool) or not isinstance(max_candidates, int)
+            or not 1 <= max_candidates <= 8
+        ):
+            raise ValueError("max_candidates must be an integer between 1 and 8")
+        with self._lock:
+            if not self._started or self._closed:
+                raise RuntimeError("SAM3 localizer is not running")
+            stream = io.BytesIO()
+            image.convert("RGB").save(stream, format="PNG")
+            response = self._call("sam3.segment_candidates", {
+                "image_base64": base64.b64encode(stream.getvalue()).decode("ascii"),
+                "text_prompt": language_prompt.strip(),
+                "min_score": self.min_score,
+                "max_candidates": max_candidates,
+            })
+        candidates = response.get("candidates")
+        raw_count = response.get("raw_candidate_count")
+        if (
+            not isinstance(candidates, list) or len(candidates) > max_candidates
+            or isinstance(raw_count, bool) or not isinstance(raw_count, int)
+            or raw_count < len(candidates)
+        ):
+            raise RuntimeError("SAM3 returned invalid candidate collection")
+        segments = []
+        for candidate in candidates:
+            if not isinstance(candidate, dict):
+                raise RuntimeError("SAM3 returned invalid candidate entry")
+            mask, score = self._decode_mask_result(candidate, image)
+            rows, cols = np.nonzero(mask)
+            segments.append(GroundedObjectSegment(
+                mask=mask, score=score, label=language_prompt.strip(),
+                box_xyxy=(int(cols.min()), int(rows.min()),
+                          int(cols.max()) + 1, int(rows.max()) + 1),
+            ))
+        return tuple(segments)
 
     def segment_point(
         self, image: Image.Image, *, pixel_uv: tuple[int, int]

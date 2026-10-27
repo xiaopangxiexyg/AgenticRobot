@@ -132,6 +132,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--sam3-endpoint", default="http://127.0.0.1:8114")
     parser.add_argument("--sam3-timeout-sec", type=float, default=120.0)
     parser.add_argument("--sam3-min-score", type=float, default=0.2)
+    parser.add_argument("--sam3-multi-instance-text", action="store_true",
+                        help="Opt into bounded SAM3 text instances; default single best.")
     parser.add_argument("--object-localization-box-threshold", type=float, default=0.35)
     parser.add_argument(
         "--object-localization-text-threshold", type=float, default=0.25
@@ -272,6 +274,10 @@ def _enable_camera_sdk_debug_log(path: Path | None) -> None:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.sam3_multi_instance_text and (
+        not args.enable_object_localization or args.object_localization_backend != "sam3-service"
+    ):
+        parser.error("--sam3-multi-instance-text requires SAM3 --enable-object-localization")
     if args.graspgenx_alignment_profile != DMTAC_M_GRASPGENX_ALIGNMENT_PROFILE_ID:
         if args.point_grasp_backend != "graspgenx":
             parser.error("--graspgenx-alignment-profile requires the GraspGenX backend")
@@ -350,6 +356,7 @@ def main(argv: list[str] | None = None) -> int:
                 object_localizer = Sam3ServiceLocalizer(
                     endpoint=args.sam3_endpoint, timeout_sec=args.sam3_timeout_sec,
                     min_score=args.sam3_min_score,
+                    multi_instance_text=args.sam3_multi_instance_text,
                 )
         except (OSError, TypeError, ValueError) as error:
             parser.error(f"invalid object-localization model bundle: {error}")
