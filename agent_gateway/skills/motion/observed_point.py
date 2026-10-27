@@ -16,6 +16,11 @@ ANCHOR_REPORT_V2 = {
     "reference_frame_id", "requested_pose_xyz_quat_xyzw", "achieved_pose_xyz_quat_xyzw",
     "translation_error_m", "rotation_error_rad",
 }
+REGION_PARAMETERS_V3 = (ANCHOR_PARAMETERS_V2 - {"offset_frame"}) | {
+    "lateral_radius_m", "height_extra_m"}
+REGION_REPORT_V3 = ANCHOR_REPORT_V2 | {
+    "selected_offset_xyz_m", "selected_candidate_index", "attempted_candidate_count",
+}
 
 
 def observed_point_definition(*, controlled_component_ids):
@@ -193,3 +198,105 @@ def validate_observed_anchor_report_v2(report, *, reference_frame_id):
         value = report[key]
         if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
             raise ValueError("Anchor motion report error must be finite and nonnegative.")
+
+
+def observed_anchor_region_offsets_v3(parameters):
+    """Bounded Station-frame relation alternatives; identical inputs give identical order."""
+    validate_observed_anchor_region_parameters_v3(parameters)
+    x, y, z = (float(value) for value in parameters["offset_xyz_m"])
+    radius = float(parameters["lateral_radius_m"])
+    lift = float(parameters["height_extra_m"])
+    variants = ((x, y, z), (x, y, z + lift),
+                (x - radius, y, z + lift), (x + radius, y, z + lift),
+                (x, y - radius, z + lift), (x, y + radius, z + lift))
+    return tuple(dict.fromkeys(variants))
+
+
+def validate_observed_anchor_region_parameters_v3(parameters, *, component_id=None):
+    if not isinstance(parameters, Mapping) or set(parameters) != REGION_PARAMETERS_V3:
+        raise ValueError("Anchor region motion requires its exact compact v3 relation schema.")
+    component = parameters["component_id"]
+    source = parameters["surface_anchor_operation_id"]
+    offset = parameters["offset_xyz_m"]
+    if (not isinstance(component, str) or not component
+            or component_id is not None and component != component_id
+            or not isinstance(source, str) or not source or source.strip() != source
+            or len(source) > 256 or not isinstance(offset, (list, tuple)) or len(offset) != 3
+            or any(type(value) not in (int, float) or not math.isfinite(value) for value in offset)):
+        raise ValueError("Anchor region source, component or offset is invalid.")
+    for key, maximum in (("lateral_radius_m", .30), ("height_extra_m", .30)):
+        value = parameters[key]
+        if type(value) not in (int, float) or not math.isfinite(value) or not 0 <= value <= maximum:
+            raise ValueError(f"Anchor region {key} must be finite within 0..{maximum} m.")
+
+
+def observed_anchor_region_definition_v3(*, controlled_component_ids):
+    return SkillDefinition(
+        skill_id=SKILL_ID, skill_version="3", skill_kind="motion",
+        summary=("Move TCP near one authenticated capture_surface_anchor@2 point. Pass its completed "
+                 "operation ID, a nominal Station-frame offset, maximum lateral radius and extra height. "
+                 "The lower owner deterministically tests up to six offsets on one fresh RGB-D and measured-joint "
+                 "scene, executes the first collision-free safe path, and reports the selected offset. "
+                 "No model-authored XYZ, target pose, Artifact descriptor, gripper or grasp action. "
+                 "The saved point is a historical surface location, not a tracked object pose."),
+        intended_target_kind="target_agnostic", cross_target_deployment_policy="not_applicable",
+        controlled_component_ids=tuple(controlled_component_ids),
+        parameter_semantics_id="authenticated_surface_anchor.region.reference_frame.v3",
+        execution_result_semantics_id="surface_anchor.region_safe_arrival.v3",
+        task_outcome_semantics_id="tcp_pose_arrival.v1",
+        entry_predicate_ids=("route_ready.v1", "authenticated_surface_anchor.v2",
+                             "configured_scene_collision_free_path_found.v1"),
+        task_outcome_predicate_ids=("tcp_pose_within_tolerance.v1",),
+    )
+
+
+def observed_anchor_region_schema_v3(*, definition, profile):
+    properties = {
+        "component_id": {"const": profile.component_id},
+        "surface_anchor_operation_id": {"type": "string", "minLength": 1, "maxLength": 256},
+        "offset_xyz_m": {"type": "array", "minItems": 3, "maxItems": 3,
+                         "items": {"type": "number"}},
+        "lateral_radius_m": {"type": "number", "minimum": 0, "maximum": .30},
+        "height_extra_m": {"type": "number", "minimum": 0, "maximum": .30},
+    }
+    entry = replace(_schema_entry(skill_id=SKILL_ID,
+        skill_definition_hash=definition.semantic_content_hash,
+        parameter_profile_id=profile.profile_id, parameter_profile_hash=profile.semantic_content_hash,
+        parameter_schema={"type": "object", "additionalProperties": False,
+                          "properties": properties, "required": sorted(properties)}), skill_version="3")
+    report_properties = {
+        "source_operation_id": {"type": "string", "minLength": 1},
+        "source_request_hash": {"type": "string", "minLength": 1},
+        "anchor_artifact_id": {"type": "string", "pattern": "^artifact:[0-9a-f]{64}$"},
+        "point_semantics": {"const": POINT_SEMANTICS},
+        "reference_frame_id": {"const": profile.reference_frame_id},
+        "requested_pose_xyz_quat_xyzw": _pose_schema(workspace_bounds=profile.workspace_bounds),
+        "achieved_pose_xyz_quat_xyzw": _pose_schema(workspace_bounds=None),
+        "translation_error_m": {"type": "number", "minimum": 0},
+        "rotation_error_rad": {"type": "number", "minimum": 0},
+        "selected_offset_xyz_m": {"type": "array", "minItems": 3, "maxItems": 3,
+                                  "items": {"type": "number"}},
+        "selected_candidate_index": {"type": "integer", "minimum": 0, "maximum": 5},
+        "attempted_candidate_count": {"type": "integer", "minimum": 1, "maximum": 6},
+    }
+    result = dict(entry.execution_result_schema)
+    result["properties"] = {**result["properties"], "surface_anchor_region_report": {
+        "type": "object", "additionalProperties": False,
+        "properties": report_properties, "required": sorted(report_properties)}}
+    result["required"] = [*result["required"], "surface_anchor_region_report"]
+    return replace(entry, execution_result_schema=result)
+
+
+def validate_observed_anchor_region_report_v3(report, *, reference_frame_id):
+    if not isinstance(report, Mapping) or set(report) != REGION_REPORT_V3:
+        raise ValueError("Anchor region report must retain exact provenance and selected arrival.")
+    validate_observed_anchor_report_v2({key: report[key] for key in ANCHOR_REPORT_V2},
+                                       reference_frame_id=reference_frame_id)
+    offset = report["selected_offset_xyz_m"]
+    index = report["selected_candidate_index"]
+    count = report["attempted_candidate_count"]
+    if (not isinstance(offset, (list, tuple)) or len(offset) != 3
+            or any(type(value) not in (int, float) or not math.isfinite(value) for value in offset)
+            or type(index) is not int or type(count) is not int
+            or not 0 <= index < count <= 6):
+        raise ValueError("Anchor region selected candidate evidence is invalid.")

@@ -186,6 +186,7 @@ class MujocoAgentTcpPoseGatewaySession:
     _fast_grasp_start_failed: bool = field(default=False, init=False, repr=False)
     observed_point_executor: ReusableStationAgentSkillOperationExecutor | None = None
     observed_anchor_executor_v2: ReusableStationAgentSkillOperationExecutor | None = None
+    observed_anchor_region_executor_v3: ReusableStationAgentSkillOperationExecutor | None = None
     rgbd_capture_executor: PassiveReadSkillExecutor | None = None
     segmentation_batch_executor: PassiveReadSkillExecutor | None = None
     segmentation_geometry_executor: PassiveReadSkillExecutor | None = None
@@ -225,6 +226,8 @@ class MujocoAgentTcpPoseGatewaySession:
     def __post_init__(self) -> None:
         if (self.contract_bundle.observed_anchor_contract_v2 is not None) != (self.observed_anchor_executor_v2 is not None):
             raise ValueError("Anchor motion v2 registration and safe executor must coexist.")
+        if (self.contract_bundle.observed_anchor_region_contract_v3 is not None) != (self.observed_anchor_region_executor_v3 is not None):
+            raise ValueError("Anchor region v3 registration and safe executor must coexist.")
         if (self.contract_bundle.safe_tcp_pose_v2_contract is not None) != (self.safe_tcp_pose_v2_executor is not None):
             raise ValueError("Safe TCP v2 registration and executor must coexist.")
         if len(self.candidate_query_executors) != len(self.contract_bundle.candidate_query_registrations):
@@ -529,6 +532,7 @@ class MujocoAgentTcpPoseGatewaySession:
             *((self.execute_grasp_plan_executor,) if self.execute_grasp_plan_executor is not None else ()),
             *((self.observed_point_executor,) if self.observed_point_executor is not None else ()),
             *((self.observed_anchor_executor_v2,) if self.observed_anchor_executor_v2 is not None else ()),
+            *((self.observed_anchor_region_executor_v3,) if self.observed_anchor_region_executor_v3 is not None else ()),
         )
 
     def close(self) -> AgentGatewayOperationOutcome:
@@ -1660,6 +1664,7 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
     for skill_id, version, label, safe_contract in (
         ('motion.move_to_observed_point', "1", 'observed-point-safe', contract_bundle.observed_point_contract),
         ('motion.move_to_observed_point', "2", 'observed-anchor-safe-v2', contract_bundle.observed_anchor_contract_v2),
+        ('motion.move_to_observed_point', "3", 'observed-anchor-region-safe-v3', contract_bundle.observed_anchor_region_contract_v3),
         ('motion.move_tcp_to_pose_safe', "1", 'safe-tcp-pose', contract_bundle.safe_tcp_pose_contract),
         ("motion.move_tcp_to_pose_safe", "2", "safe-tcp-pose-v2", contract_bundle.safe_tcp_pose_v2_contract),
         ('motion.approach_grasp_pose', "1", 'grasp-approach', contract_bundle.grasp_approach_contract),
@@ -1683,7 +1688,7 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
                     MujocoAnchorMotionLifecycle, MujocoObservedPointMotionLifecycle)
 
                 extra["observed_planning_provider"] = observed_planning_provider
-                if _route.skill_version == "2":
+                if _route.skill_version in {"2", "3"}:
                     capture = next(item for item in contract_bundle.surface_anchor_registrations
                         if item.skill.definition.skill_id == "perception.capture_surface_anchor"
                         and item.skill.definition.skill_version == "2")
@@ -1975,6 +1980,7 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
         safe_tcp_pose_v2_executor=planned_executors.get(("motion.move_tcp_to_pose_safe", "2")),
         observed_point_executor=planned_executors.get(("motion.move_to_observed_point", "1")),
         observed_anchor_executor_v2=planned_executors.get(("motion.move_to_observed_point", "2")),
+        observed_anchor_region_executor_v3=planned_executors.get(("motion.move_to_observed_point", "3")),
         grasp_approach_executor=planned_executors.get(("motion.approach_grasp_pose", "1")),
         grasp_contact_executor=planned_executors.get(("motion.approach_grasp_contact", "1")),
         object_motion_executor=planned_executors.get(("motion.move_grasped_object_to_pose", "1")),

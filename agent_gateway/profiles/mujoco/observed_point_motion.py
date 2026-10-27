@@ -3,6 +3,9 @@
 from dataclasses import replace
 import logging
 import math
+import time
+
+import numpy as np
 
 from agent_gateway.profiles.motion_primitive_resolution import MotionPrimitiveTargetResolution
 from agent_gateway.profiles.observed_target import resolve_retained_observed_point
@@ -10,11 +13,14 @@ from agent_gateway.profiles.surface_anchor import resolve_surface_anchor
 from agent_gateway.runtime.station_operation_worker import StationLifecycleActivationEvidence
 from agent_gateway.skills.motion.observed_point import (
     SKILL_ID, POINT_SEMANTICS, validate_observed_anchor_parameters_v2,
+    validate_observed_anchor_region_parameters_v3, observed_anchor_region_offsets_v3,
     validate_observed_point_parameters,
 )
+from robot_motion.action import ComponentAction
 from robot_motion.spatial_goals import compute_spatial_goal
 from robot_motion.pose import pose_delta_metrics
 from robot_motion.relative_action import xyzquat_to_pose_matrix
+from sim.mujoco.deploy.planned_tcp_motion import MujocoTcpPlanRejected
 
 from .motion_skill import MujocoAgentSafeTcpPoseSkillLifecycle
 
@@ -100,11 +106,15 @@ class MujocoAnchorMotionLifecycle(MujocoObservedPointMotionLifecycle):
     def __init__(self, *, store, lookup_operation, capture_registration,
                  current_station_revision, clock_domain_id, **kwargs):
         route = kwargs["route"]
-        if (route.skill_id != SKILL_ID or route.skill_version != "2"
+        if (route.skill_id != SKILL_ID or route.skill_version not in {"2", "3"}
                 or kwargs["observed_planning_provider"] is None):
-            raise ValueError("Anchor motion requires its explicit v2 Route and sensor-shaped safe planner.")
-        validate_observed_anchor_parameters_v2(kwargs["request"].parameters,
-                                               component_id=kwargs["motion_profile"].component_id)
+            raise ValueError("Anchor motion requires its explicit v2/v3 Route and sensor-shaped safe planner.")
+        if route.skill_version == "3":
+            validate_observed_anchor_region_parameters_v3(kwargs["request"].parameters,
+                component_id=kwargs["motion_profile"].component_id)
+        else:
+            validate_observed_anchor_parameters_v2(kwargs["request"].parameters,
+                component_id=kwargs["motion_profile"].component_id)
         self._store = store
         self._lookup_operation = lookup_operation
         self._capture_registration = capture_registration
@@ -151,12 +161,32 @@ class MujocoAnchorMotionLifecycle(MujocoObservedPointMotionLifecycle):
         current = self.application.transform_tcp_pose_xyzquat(measured,
             source_frame_id=profile.execution_reference_frame_id,
             target_frame_id=profile.reference_frame_id)
-        goal = compute_spatial_goal(current_tcp_pose_xyz_quat_xyzw=list(current),
-            anchor_xyz_m=list(anchor_pose[:3]), offset_xyz_m=parameters["offset_xyz_m"],
-            offset_frame=parameters["offset_frame"], orientation_mode="preserve")
+        self._anchor_public_xyz = tuple(anchor_pose[:3])
+        self._activation_public_pose = tuple(current)
         bounds = profile.workspace_bounds
-        if any(not bounds[2*i] <= goal.pose_xyz_quat_xyzw[i] <= bounds[2*i+1] for i in range(3)):
-            raise ValueError("Surface anchor relation goal is outside the deployed workspace.")
+        if self.route.skill_version == "3":
+            # The inherited lifecycle checks its provisional target before
+            # search. Bind the first admissible region member there so a
+            # nominal point outside bounds cannot suppress valid alternatives.
+            goal = None
+            for offset in observed_anchor_region_offsets_v3(parameters):
+                candidate = compute_spatial_goal(current_tcp_pose_xyz_quat_xyzw=list(current),
+                    anchor_xyz_m=list(anchor_pose[:3]), offset_xyz_m=list(offset),
+                    offset_frame="reference", orientation_mode="preserve")
+                if (all(bounds[2*i] <= candidate.pose_xyz_quat_xyzw[i] <= bounds[2*i+1]
+                        for i in range(3))
+                        and candidate.translation_distance_m <= profile.max_translation_delta_m
+                        and candidate.rotation_distance_rad <= profile.max_rotation_delta_rad):
+                    goal = candidate
+                    break
+            if goal is None:
+                raise ValueError("Surface anchor region has no target within the deployed profile.")
+        else:
+            goal = compute_spatial_goal(current_tcp_pose_xyz_quat_xyzw=list(current),
+                anchor_xyz_m=list(anchor_pose[:3]), offset_xyz_m=parameters["offset_xyz_m"],
+                offset_frame=parameters["offset_frame"], orientation_mode="preserve")
+            if any(not bounds[2*i] <= goal.pose_xyz_quat_xyzw[i] <= bounds[2*i+1] for i in range(3)):
+                raise ValueError("Surface anchor relation goal is outside the deployed workspace.")
         self._source, self._artifact_id = anchor, artifact_id
         target = self.application.transform_tcp_pose_xyzquat(goal.pose_xyz_quat_xyzw,
             source_frame_id=profile.reference_frame_id,
@@ -165,6 +195,84 @@ class MujocoAnchorMotionLifecycle(MujocoObservedPointMotionLifecycle):
             "surface-anchor-operation:" + anchor["source_operation_id"],
             "surface-anchor-request:" + anchor["source_request_hash"],
             "surface-anchor-artifact:" + artifact_id))
+
+    def _prepare_plan(self, *, constraint, constraint_identity, cancel_requested):
+        if self.route.skill_version == "2":
+            return super()._prepare_plan(constraint=constraint,
+                constraint_identity=constraint_identity, cancel_requested=cancel_requested)
+        if cancel_requested():
+            raise MujocoTcpPlanRejected("safe_tcp_planning_cancelled")
+        observed = self._observed_planning_provider.capture(
+            operation_id=self.operation.operation_id,
+            expected_station_revision=self.request.expected_station_revision,
+            cancel_requested=cancel_requested)
+        offsets = observed_anchor_region_offsets_v3(self.request.parameters)
+        deadline = time.perf_counter() + min(20., self._path_search_time_budget_sec * len(offsets))
+        translation_tolerance, rotation_tolerance = self._planning_goal_tolerances()
+        bounds = self.motion_profile.workspace_bounds
+        failures = []
+        for index, offset in enumerate(offsets):
+            if cancel_requested():
+                raise MujocoTcpPlanRejected("safe_tcp_planning_cancelled")
+            remaining = deadline - time.perf_counter()
+            if remaining <= 0:
+                raise MujocoTcpPlanRejected("safe_tcp_region_budget_exhausted",
+                    {"candidate_count": len(offsets), "considered_count": len(failures)})
+            goal = compute_spatial_goal(current_tcp_pose_xyz_quat_xyzw=list(self._activation_public_pose),
+                anchor_xyz_m=list(self._anchor_public_xyz), offset_xyz_m=list(offset),
+                offset_frame="reference", orientation_mode="preserve")
+            public = goal.pose_xyz_quat_xyzw
+            if (any(not bounds[2 * axis] <= public[axis] <= bounds[2 * axis + 1]
+                    for axis in range(3))
+                    or goal.translation_distance_m > self.motion_profile.max_translation_delta_m
+                    or goal.rotation_distance_rad > self.motion_profile.max_rotation_delta_rad):
+                failures.append((index, "safe_tcp_target_exceeds_profile"))
+                continue
+            target = self.application.transform_tcp_pose_xyzquat(public,
+                source_frame_id=self.motion_profile.reference_frame_id,
+                target_frame_id=self.motion_profile.execution_reference_frame_id)
+            try:
+                plan = self._planner.plan(target,
+                    translation_tolerance_m=translation_tolerance,
+                    rotation_tolerance_rad=rotation_tolerance,
+                    normalize_ik_objective=self.motion_profile.normalize_ik_objective,
+                    cancel_requested=cancel_requested,
+                    configuration_constraint=constraint,
+                    constraint_identity=constraint_identity,
+                    observed_planning_input=observed,
+                    deadline_monotonic=deadline,
+                    path_search_time_budget_sec=min(self._path_search_time_budget_sec, remaining))
+            except MujocoTcpPlanRejected as error:
+                if (error.reason_code == "safe_tcp_planning_cancelled"
+                        and not cancel_requested() and time.perf_counter() >= deadline):
+                    raise MujocoTcpPlanRejected("safe_tcp_region_budget_exhausted",
+                        {"candidate_count": len(offsets), "considered_count": index + 1}) from error
+                if error.reason_code not in {
+                    "safe_tcp_target_blocked", "safe_tcp_endpoint_search_exhausted",
+                    "safe_tcp_path_search_exhausted", "safe_tcp_retimed_path_blocked",
+                    "safe_tcp_motion_quality_exceeded", "safe_tcp_target_envelope_blocked",
+                }:
+                    raise
+                failures.append((index, error.reason_code))
+                continue
+            if (len(plan.reference_poses) + self.motion_profile.stable_measurement_count
+                    >= self.motion_profile.max_control_cycles):
+                # The planner has a pending, not yet activated handle. Discard
+                # it before another candidate; never promote an overlong path.
+                self._planner.clear()
+                failures.append((index, "safe_tcp_path_exceeds_control_budget"))
+                continue
+            self.target_pose = tuple(target)
+            self.public_target_pose = tuple(public)
+            self.action = ComponentAction(action_schema=self.application.runtime.action_schema,
+                values_by_component={self.component_id: np.asarray(target, dtype=np.float32)})
+            self._selected_offset = tuple(offset)
+            self._selected_index = index
+            self._considered_count = index + 1
+            return plan
+        raise MujocoTcpPlanRejected("safe_tcp_no_candidate_path",
+            {"candidate_count": len(offsets), "considered_count": len(failures),
+             "candidate_reasons": tuple(failures)})
 
     def _success(self, *, operation, request, final_pose):
         completion = MujocoAgentSafeTcpPoseSkillLifecycle._success(
@@ -183,5 +291,11 @@ class MujocoAnchorMotionLifecycle(MujocoObservedPointMotionLifecycle):
             "achieved_pose_xyz_quat_xyzw": list(final),
             "translation_error_m": translation,
             "rotation_error_rad": math.radians(degrees)}
+        if self.route.skill_version == "3":
+            report.update(selected_offset_xyz_m=list(self._selected_offset),
+                          selected_candidate_index=self._selected_index,
+                          attempted_candidate_count=self._considered_count)
+            return replace(completion, execution_result={**completion.execution_result,
+                "surface_anchor_region_report": report})
         return replace(completion, execution_result={**completion.execution_result,
                                                      "surface_anchor_report": report})

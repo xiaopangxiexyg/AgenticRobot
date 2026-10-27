@@ -58,6 +58,7 @@ from .gripper_skill import MujocoGripperControlPort
 from .motion_application import MujocoAgentSkillMotionApplication
 from .motion_deployment import (
     MUJOCO_OBSERVED_ANCHOR_ROUTE_ID_V2,
+    MUJOCO_OBSERVED_ANCHOR_ROUTE_ID_V3,
     MUJOCO_OBSERVED_POINT_ROUTE_ID,
     MUJOCO_AGENT_GRASP_APPROACH_ROUTE_ID_V1,
     MUJOCO_AGENT_GRASP_CONTACT_ROUTE_ID_V1,
@@ -281,6 +282,7 @@ def _build_standard_tcp_pose_envelope_runtime(
     safe_tcp_motion_profile: str = "local_step",
     enable_observed_point_motion: bool = False,
     enable_anchor_motion_v2: bool = False,
+    enable_anchor_region_motion_v3: bool = False,
     enable_grasp_approach: bool = False,
     grasp_contact_binding: MujocoGraspContactBinding | None = None,
     enable_object_motion: bool = False,
@@ -356,6 +358,8 @@ def _build_standard_tcp_pose_envelope_runtime(
             *((MUJOCO_OBSERVED_POINT_ROUTE_ID,) if enable_observed_point_motion else ()),
             *((MUJOCO_OBSERVED_ANCHOR_ROUTE_ID_V2,)
               if enable_anchor_motion_v2 and safe_tcp_motion_profile == "local_step" else ()),
+            *((MUJOCO_OBSERVED_ANCHOR_ROUTE_ID_V3,)
+              if enable_anchor_region_motion_v3 and safe_tcp_motion_profile == "local_step" else ()),
         ),
     )
     entries = [standard_entry]
@@ -378,7 +382,8 @@ def _build_standard_tcp_pose_envelope_runtime(
             }, domain="dexteleop.mujoco.agent_safe_tcp_relation_constraint_set.v1"),
             allowed_route_ids=(MUJOCO_AGENT_SAFE_TCP_POSE_ROUTE_ID_V1,
                 *((MUJOCO_AGENT_SAFE_TCP_POSE_ROUTE_ID_V2,) if enable_safe_tcp_path_constraints else ()),
-                *((MUJOCO_OBSERVED_ANCHOR_ROUTE_ID_V2,) if enable_anchor_motion_v2 else ()))))
+                *((MUJOCO_OBSERVED_ANCHOR_ROUTE_ID_V2,) if enable_anchor_motion_v2 else ()),
+                *((MUJOCO_OBSERVED_ANCHOR_ROUTE_ID_V3,) if enable_anchor_region_motion_v3 else ()))))
     if enable_grasp_approach:
         grasp_profile = replace(
             profile,
@@ -512,6 +517,7 @@ def build_mujoco_agent_tcp_pose_gateway_session(
     region_tcp_continuation_version: str = "4",
     enable_observed_point_motion: bool = False,
     enable_anchor_motion_v2: bool = False,
+    enable_anchor_region_motion_v3: bool = False,
     enable_spatial_goals: bool = False,
     enable_object_goal_queries: bool = False,
     enable_surface_anchors: bool = False,
@@ -636,6 +642,9 @@ def build_mujoco_agent_tcp_pose_gateway_session(
     if type(enable_anchor_motion_v2) is not bool or (enable_anchor_motion_v2
             and not (enable_observed_point_motion and enable_surface_anchor_v2)):
         raise ValueError("Anchor motion v2 requires observed safe motion and surface anchor v2.")
+    if type(enable_anchor_region_motion_v3) is not bool or (enable_anchor_region_motion_v3
+            and not enable_anchor_motion_v2):
+        raise ValueError("Anchor region v3 requires the opt-in anchor v2 family.")
     component = f"{side}_arm"
     inactive = "left" if side == "right" else "right"
     if not isinstance(enable_grippers, bool):
@@ -816,6 +825,7 @@ def build_mujoco_agent_tcp_pose_gateway_session(
         enable_safe_tcp_path_constraints=enable_safe_tcp_path_constraints,
         enable_observed_point_motion=enable_observed_point_motion,
         enable_anchor_motion_v2=enable_anchor_motion_v2,
+        enable_anchor_region_motion_v3=enable_anchor_region_motion_v3,
         safe_tcp_motion_profile=safe_tcp_motion_profile,
         enable_grasp_approach=enable_grasp_approach,
         grasp_contact_binding=grasp_contact_binding,
@@ -914,6 +924,7 @@ def build_mujoco_agent_tcp_pose_gateway_session(
             region_tcp_continuation_version=region_tcp_continuation_version,
             enable_observed_point_motion=enable_observed_point_motion,
             enable_anchor_motion_v2=enable_anchor_motion_v2,
+            enable_anchor_region_motion_v3=enable_anchor_region_motion_v3,
             safe_motion_observation_profile_hash=(None if safe_motion_observation is None
                 else safe_motion_observation.bound_profile_hash(
                     minimum_clearance_m=application.scene.scene_spec.collision.safety_minimum_clearance_m,
