@@ -68,7 +68,8 @@ def test_invalid_clock_is_rejected_before_preparing_any_resource(monkeypatch, cl
 
 
 def _native_target(
-    *, observation_plan=None, observation_sink=None, envelope_factory=None
+    *, observation_plan=None, observation_sink=None, envelope_factory=None,
+    prune_expired_proposals=False,
 ):
     """Build the original fixture once per test, without starting its owners."""
     config = replace(_configuration(), execution_observation_plan=observation_plan)
@@ -103,11 +104,28 @@ def _native_target(
         ),
         clock=clock,
         execution_observation_sink=observation_sink,
+        prune_expired_proposals=prune_expired_proposals,
         tcp_pose_envelope_runtime=(
             None if envelope_factory is None else envelope_factory(prepared, config)
         ),
     )
     return config, prepared, profile, clock, target
+
+
+@pytest.mark.integration
+def test_explicit_pruning_target_keeps_manual_checkpoint_rejection():
+    from sim.mujoco.deploy.runtime_checkpoint import capture_runtime
+
+    _config, _prepared, _profile, _clock, target = _native_target(
+        prune_expired_proposals=True)
+    runtime = target.runtime
+    try:
+        runtime.start()
+        assert runtime.config.prune_expired_proposals is True
+        with pytest.raises(ValueError, match="direct manual immediate profile"):
+            capture_runtime(runtime)
+    finally:
+        runtime.close()
 
 
 @pytest.mark.integration

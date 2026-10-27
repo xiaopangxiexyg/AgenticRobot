@@ -2002,8 +2002,9 @@ def test_replay_publication_fails_closed_without_admitted_target_evidence() -> N
     }.issubset({fact.event_type for fact in runtime.trace_facts})
 
 
-def test_no_action_expires_segment_once_then_keeps_backend_hold() -> None:
-    runtime, _scene, clock = build_runtime()
+@pytest.mark.parametrize("prune_expired_proposals", [False, True])
+def test_no_action_expires_segment_once_then_keeps_backend_hold(prune_expired_proposals) -> None:
+    runtime, _scene, clock = build_runtime(prune_expired_proposals=prune_expired_proposals)
     runtime.start()
     runtime.submit_policy_action(action(), policy_output_id="policy-output-0")
     first = runtime.step(now=clock.value)
