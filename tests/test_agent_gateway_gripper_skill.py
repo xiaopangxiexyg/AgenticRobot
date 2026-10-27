@@ -145,7 +145,7 @@ def test_sim_route_is_target_neutral_semantics_with_sim_privilege() -> None:
     )
 
 
-def test_real_gripper_keeps_existing_operation_deadline() -> None:
+def test_real_gripper_uses_authorized_fifteen_second_operation_limit() -> None:
     port = FakeGripperPort([(0.0, False)])
     binding = replace(
         _sim_bundle(port).deployment_binding,
@@ -153,7 +153,9 @@ def test_real_gripper_keeps_existing_operation_deadline() -> None:
         current_mode="real_active",
     )
     route = build_gripper_skill_contract_bundle(binding).route_manifest.skill_routes[0].route
-    assert route.max_operation_duration_ms == 5_000
+    assert route.max_operation_duration_ms == 15_000
+    assert route.requires_operator_confirmation is True
+    assert route.cancellation_policy == "hold_on_cancel_disconnect_or_timeout"
 
 
 def test_gripper_executor_rejects_wrong_port_before_activation():

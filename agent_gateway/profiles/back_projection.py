@@ -511,6 +511,8 @@ def check_observed_support_footprint(
         raise ValueError("Requested footprint exceeds the bounded sample budget")
     counts = (math.ceil(float(steps[0])) + 1,
               math.ceil(float(steps[1])) + 1)
+    if counts[0] * counts[1] > 100_000:
+        raise ValueError("Requested footprint exceeds the bounded sample budget")
     grid_x, grid_y = np.meshgrid(np.linspace(low[0], high[0], counts[0]),
                                  np.linspace(low[1], high[1], counts[1]))
     anchor = np.asarray(candidate.plane_anchor_reference_xyz_m)
