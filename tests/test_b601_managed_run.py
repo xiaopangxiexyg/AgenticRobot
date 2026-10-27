@@ -216,6 +216,33 @@ def test_uncertain_release_retains_durable_management_and_does_not_kill_child(tm
     assert children[0].wait(timeout=5) == 0 and marker.exists()
 
 
+@pytest.mark.parametrize('after_release', [False, True])
+def test_startup_interrupt_preserves_original_and_exact_release_boundary(tmp_path, monkeypatch, after_release):
+    run, marker, children, _ = _start_inert_pipe_owner(tmp_path, monkeypatch)
+    interrupted = KeyboardInterrupt('operator interrupt')
+    original_write = os.write
+
+    if after_release:
+        def release_then_interrupt(fd, data):
+            original_write(fd, data)
+            raise interrupted
+        monkeypatch.setattr(managed.os, 'write', release_then_interrupt)
+    else:
+        def interrupt_receipt(*args):
+            raise interrupted
+        monkeypatch.setattr(managed, '_write_new', interrupt_receipt)
+
+    with (run/'lease').open('w') as lock:
+        with pytest.raises(KeyboardInterrupt) as caught:
+            managed._launch_after_durable_receipt([], run, lock, revision='a'*40)
+    assert caught.value is interrupted
+    assert children[0].wait(timeout=5) == (0 if after_release else 17)
+    assert marker.exists() is after_release
+    assert (run/'process.json').exists() is after_release
+    if after_release:
+        assert json.loads((run/'process.json').read_text())['pid'] == children[0].pid
+
+
 @pytest.mark.parametrize('value', [None, '', 'not-an-identity'])
 def test_unconfirmed_child_identity_denies_startup(tmp_path, monkeypatch, value):
     run, marker, children, _ = _start_inert_pipe_owner(tmp_path, monkeypatch)
