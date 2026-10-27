@@ -171,6 +171,7 @@ class MujocoAgentTcpPoseGatewaySession:
     grasp_approach_executor: ReusableStationAgentSkillOperationExecutor | None = None
     grasp_contact_executor: ReusableStationAgentSkillOperationExecutor | None = None
     object_motion_executor: ReusableStationAgentSkillOperationExecutor | None = None
+    object_support_motion_executor_v2: ReusableStationAgentSkillOperationExecutor | None = None
     object_observer: MujocoGraspedObjectObserver | None = None
     gripper_executor: ReusableStationAgentSkillOperationExecutor | None = None
     gripper_ports: Mapping[str, MujocoGripperControlPort] = field(default_factory=dict)
@@ -275,6 +276,9 @@ class MujocoAgentTcpPoseGatewaySession:
                         self.object_motion_executor is not None, self.object_observer is not None)
         if any(object_parts) and not all(object_parts):
             raise ValueError("Object motion registration, observer and executor must coexist.")
+        if (self.contract_bundle.object_support_motion_contract_v2 is not None
+                ) != (self.object_support_motion_executor_v2 is not None):
+            raise ValueError("Object support v2 registration and executor must coexist.")
         hand_parts = (self.contract_bundle.gripper_contract is not None,
                       self.gripper_executor is not None, bool(self.gripper_ports))
         if any(hand_parts) and not all(hand_parts):
@@ -532,6 +536,7 @@ class MujocoAgentTcpPoseGatewaySession:
             *((self.safe_tcp_pose_v2_executor,) if self.safe_tcp_pose_v2_executor is not None else ()),
             *((self.grasp_contact_executor,) if self.grasp_contact_executor is not None else ()),
             *((self.object_motion_executor,) if self.object_motion_executor is not None else ()),
+            *((self.object_support_motion_executor_v2,) if self.object_support_motion_executor_v2 is not None else ()),
             *((self.execute_grasp_plan_executor,) if self.execute_grasp_plan_executor is not None else ()),
             *((self.observed_point_executor,) if self.observed_point_executor is not None else ()),
             *((self.observed_anchor_executor_v2,) if self.observed_anchor_executor_v2 is not None else ()),
@@ -1548,7 +1553,8 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
         registration = contract_bundle.object_state_registration
         source = MujocoObjectStateSource(application=application, profile=registration.profile,
             contact_binding=contract_bundle.grasp_contact_contract.contact_binding,
-            gripper_port=(gripper_ports.get("right_gripper") if registration.profile.release_supported else None))
+            gripper_port=(gripper_ports.get("right_gripper") if registration.profile.release_supported else None),
+            additional_support_body_names=contract_bundle.object_support_body_names)
         if contract_bundle.object_motion_contract is not None:
             object_observer = source.follow_observer
             if object_observer is None:
@@ -1675,6 +1681,7 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
         ('motion.approach_grasp_pose', "1", 'grasp-approach', contract_bundle.grasp_approach_contract),
         ('motion.approach_grasp_contact', "1", 'grasp-contact', contract_bundle.grasp_contact_contract),
         ('motion.move_grasped_object_to_pose', "1", 'grasped-object-motion', contract_bundle.object_motion_contract),
+        ('motion.move_grasped_object_to_pose', "2", 'grasped-object-support-motion-v2', contract_bundle.object_support_motion_contract_v2),
     ):
         if safe_contract is None:
             continue
@@ -1990,6 +1997,7 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
         grasp_approach_executor=planned_executors.get(("motion.approach_grasp_pose", "1")),
         grasp_contact_executor=planned_executors.get(("motion.approach_grasp_contact", "1")),
         object_motion_executor=planned_executors.get(("motion.move_grasped_object_to_pose", "1")),
+        object_support_motion_executor_v2=planned_executors.get(("motion.move_grasped_object_to_pose", "2")),
         object_observer=object_observer,
         gripper_executor=gripper_executor,
         gripper_ports=gripper_ports,

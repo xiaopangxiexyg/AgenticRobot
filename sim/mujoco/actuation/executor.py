@@ -30,6 +30,14 @@ _COLLISION_PROJECTION_MODES = frozenset(
 )
 
 
+class MujocoPhysicalContactFault(RuntimeError):
+    """Latched native hard-contact failure with the exact checked pair."""
+
+    def __init__(self, message, check):
+        super().__init__(message)
+        self.check = check
+
+
 def normalize_collision_projection_mode(value: str) -> str:
     """Validate the owner of continuous arm-command collision projection.
 
@@ -583,9 +591,9 @@ class MujocoActuatedPositionExecutor:
                 hard_contact = True
                 self._hard_contact_latched = True
                 self._last_safety_status = "hard_contact"
-                raise RuntimeError(
+                raise MujocoPhysicalContactFault(
                     "MuJoCo physical execution entered forbidden hard contact "
-                    f"after physics step: {post_check.to_dict()}"
+                    f"after physics step: {post_check.to_dict()}", post_check
                 )
             if not due:
                 self._last_safety_status = "held"
@@ -767,9 +775,9 @@ class MujocoActuatedPositionExecutor:
         if not check.safe:
             self._hard_contact_latched = True
             self._last_safety_status = "hard_contact"
-            raise RuntimeError(
+            raise MujocoPhysicalContactFault(
                 "MuJoCo physical execution found forbidden hard contact "
-                f"{phase}: {check.to_dict()}"
+                f"{phase}: {check.to_dict()}", check
             )
 
     def set_additional_contact_oracle(self, oracle) -> None:
@@ -902,6 +910,7 @@ __all__ = [
     "COLLISION_PROJECTION_MODE_EXECUTOR",
     "COLLISION_PROJECTION_MODE_UPSTREAM_ADMITTED",
     "ActuatedPositionTick",
+    "MujocoPhysicalContactFault",
     "MujocoActuatedPositionExecutor",
     "normalize_collision_projection_mode",
 ]

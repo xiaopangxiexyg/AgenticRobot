@@ -70,8 +70,12 @@ from agent_gateway.skills.motion.grasped_object import (
     GRASPED_OBJECT_MOVE_SKILL_ID,
     grasped_object_move_definition,
     grasped_object_move_schema,
+    grasped_object_place_definition_v2,
+    grasped_object_place_schema_v2,
     validate_grasped_object_move,
+    validate_grasped_object_place_v2,
     validate_object_motion_state,
+    validate_object_motion_state_v2,
 )
 from agent_gateway.skills.motion.path_constraint import (
     safe_tcp_pose_target_skill_definition_v2,
@@ -161,6 +165,7 @@ MUJOCO_AGENT_SAFE_TCP_POSE_EXECUTOR_ID_V2 = "mujoco-agent-safe-tcp-pose-executor
 MUJOCO_AGENT_GRASP_APPROACH_ROUTE_ID_V1 = "sim.mujoco.motion.approach_grasp_pose.v1"
 MUJOCO_AGENT_GRASP_CONTACT_ROUTE_ID_V1 = "sim.mujoco.motion.approach_grasp_contact.v1"
 MUJOCO_AGENT_OBJECT_MOVE_ROUTE_ID_V1 = "sim.mujoco.motion.move_grasped_object_to_pose.v1"
+MUJOCO_AGENT_OBJECT_MOVE_ROUTE_ID_V2 = "sim.mujoco.motion.move_grasped_object_to_pose.v2"
 MUJOCO_AGENT_GRASP_APPROACH_EXECUTOR_ID_V1 = "mujoco-agent-grasp-approach-executor-v1"
 
 MUJOCO_AGENT_TCP_POSE_ROUTE_ID_V1 = "sim.mujoco.rm65.agent_skill_tcp_pose"
@@ -806,6 +811,8 @@ class MujocoAgentTcpPoseContractBundle:
     grasp_approach_contract: MujocoAgentSafeTcpPoseContract | None = None
     grasp_contact_contract: MujocoAgentSafeTcpPoseContract | None = None
     object_motion_contract: MujocoAgentSafeTcpPoseContract | None = None
+    object_support_motion_contract_v2: MujocoAgentSafeTcpPoseContract | None = None
+    object_support_body_names: tuple[str, ...] = ()
     fast_grasp_contract: Any | None = None
     observed_point_contract: MujocoAgentSafeTcpPoseContract | None = None
     observed_anchor_contract_v2: MujocoAgentSafeTcpPoseContract | None = None
@@ -830,6 +837,8 @@ class MujocoAgentTcpPoseContractBundle:
         }
         if published_skill_ids.intersection(ARCHIVED_DEBUG_MOTION_SKILL_IDS_V1):
             raise ValueError("Archived debug motion Skills cannot be published.")
+        if bool(self.object_support_motion_contract_v2) != bool(self.object_support_body_names):
+            raise ValueError("Object support v2 contract requires its exact support allowlist.")
         if (self.object_goal_query_registration is not None
                 and self.route_manifest.route("perception.query_object_above_paths", "1") != self.object_goal_query_registration.entry):
             raise ValueError("Object goal query registration differs from its manifest entry.")
@@ -936,6 +945,7 @@ class MujocoAgentTcpPoseContractBundle:
             ("motion.approach_grasp_pose", "1", self.grasp_approach_contract),
             ("motion.approach_grasp_contact", "1", self.grasp_contact_contract),
             (GRASPED_OBJECT_MOVE_SKILL_ID, "1", self.object_motion_contract),
+            (GRASPED_OBJECT_MOVE_SKILL_ID, "2", self.object_support_motion_contract_v2),
         ):
             if safe is None:
                 continue
@@ -1409,6 +1419,7 @@ def _motion_validators(
     profile: MujocoAgentTcpPoseMotionProfile,
     object_id: str | None = None,
     object_clock_domain_id: str | None = None,
+    object_support_body_names: tuple[str, ...] = (),
 ) -> AgentSkillPayloadValidatorSet:
     parameter_fields = {
         "pose_targets_by_component",
@@ -1427,6 +1438,8 @@ def _motion_validators(
     is_anchor_v3 = (route.skill_id == OBSERVED_POINT_SKILL_ID and route.skill_version == "3")
     is_anchor_v4 = (route.skill_id == OBSERVED_POINT_SKILL_ID and route.skill_version == "4")
     is_anchor_region = is_anchor_v3 or is_anchor_v4
+    is_object_support_v2 = (route.skill_id == GRASPED_OBJECT_MOVE_SKILL_ID
+                            and route.skill_version == "2")
 
     def validate_parameters(payload: Mapping[str, Any]) -> None:
         if route.skill_id == OBSERVED_POINT_SKILL_ID:
@@ -1440,7 +1453,11 @@ def _motion_validators(
                 validate_observed_point_parameters(payload, component_id=profile.component_id)
             return
         if object_id is not None:
-            validate_grasped_object_move(payload, profile=profile, object_id=object_id)
+            if is_object_support_v2:
+                validate_grasped_object_place_v2(payload, profile=profile,
+                    object_id=object_id, support_object_ids=object_support_body_names)
+            else:
+                validate_grasped_object_move(payload, profile=profile, object_id=object_id)
             return
         optional = {"pose_goal_policy"} if route.skill_id == "motion.move_tcp_to_pose_safe" else set()
         if not isinstance(payload, Mapping) or not parameter_fields <= set(payload) <= parameter_fields | optional:
@@ -1504,7 +1521,13 @@ def _motion_validators(
                 validate_observed_point_report(payload["observed_point_report"],
                                                reference_frame_id=profile.reference_frame_id)
         if object_id is not None:
-            validate_object_motion_state(payload["object_state"], profile=profile,
+            state = payload["object_state"]
+            if is_object_support_v2:
+                if state.get("support_object_id") not in object_support_body_names:
+                    raise ValueError("Object terminal support is outside the deployed allowlist.")
+                state = {key: value for key, value in state.items()
+                         if key != "support_object_id"}
+            validate_object_motion_state(state, profile=profile,
                 object_id=object_id, observation_source="mujoco_native_physics",
                 clock_domain_id=object_clock_domain_id)
         refs = payload["execution_receipt_refs"]
@@ -1562,6 +1585,11 @@ def _motion_validators(
                 if any(report[key] != parameters[key] for key in ("observation_operation_id", "point_index")):
                     raise ValueError("Observed-point result does not match the requested reference.")
             return
+        if is_object_support_v2:
+            validate_object_motion_state_v2(result["object_state"],
+                parameters=parameters, profile=profile, object_id=object_id,
+                observation_source="mujoco_native_physics",
+                clock_domain_id=object_clock_domain_id)
         if result["object_state"]["phase"] != parameters["phase"]:
             raise ValueError("Object terminal phase differs from the admitted request phase.")
 
@@ -2033,6 +2061,8 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
     enable_object_state: bool = False,
     enable_object_follow_observation: bool = False,
     enable_object_motion: bool = False,
+    enable_object_support_motion_v2: bool = False,
+    object_support_body_names: tuple[str, ...] = (),
     enable_grasp_approach: bool = False,
     grasp_contact_binding: MujocoGraspContactBinding | None = None,
 ) -> MujocoAgentTcpPoseContractBundle:
@@ -2115,6 +2145,16 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
     if enable_object_motion and (not enable_object_follow_observation or not enable_grasp_approach
                                  or grasp_contact_binding is None):
         raise ValueError("Object motion requires explicit follow observation, grasp approach and contact target.")
+    if type(enable_object_support_motion_v2) is not bool or (
+            enable_object_support_motion_v2 != bool(object_support_body_names)):
+        raise ValueError("Object support v2 requires its explicit nonempty allowlist.")
+    if enable_object_support_motion_v2 and not enable_object_motion:
+        raise ValueError("Object support v2 requires the original object motion chain.")
+    object_support_body_names = tuple(object_support_body_names)
+    if (len(set(object_support_body_names)) != len(object_support_body_names)
+            or any(not isinstance(name, str) or not name or name.strip() != name
+                   for name in object_support_body_names)):
+        raise ValueError("Object supports require distinct native identifiers.")
     if not isinstance(enable_safe_tcp_path_constraints, bool) or (
             enable_safe_tcp_path_constraints and not enable_safe_tcp_pose):
         raise ValueError("Safe TCP path constraints require explicitly enabled safe TCP motion.")
@@ -2497,16 +2537,24 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
                        and motion_definition.skill_version == "4")
         schema_builder = (safe_tcp_pose_target_schema_entry_v2 if is_safe_v2
                           else tcp_pose_target_schema_entry_v1)
+        def object_motion_schema():
+            kwargs = dict(
+                definition=motion_definition, profile=motion_profile,
+                object_id=grasp_contact_binding.target_body_name,
+                observation_source="mujoco_native_physics",
+                clock_domain_id="mujoco-native-physics:" + exact["runtime_session_id"],
+            )
+            if motion_definition.skill_version == "2":
+                return grasped_object_place_schema_v2(
+                    **kwargs, support_object_ids=object_support_body_names)
+            return grasped_object_move_schema(**kwargs)
+
         motion_schema = (observed_anchor_hover_schema_v4(definition=motion_definition, profile=motion_profile)
             if is_anchor_v4 else observed_anchor_region_schema_v3(definition=motion_definition, profile=motion_profile)
             if is_anchor_v3 else observed_anchor_schema_v2(definition=motion_definition, profile=motion_profile)
             if is_anchor_v2 else observed_point_schema(definition=motion_definition, profile=motion_profile)
-            if motion_definition.skill_id == OBSERVED_POINT_SKILL_ID else grasped_object_move_schema(
-            definition=motion_definition, profile=motion_profile,
-            object_id=grasp_contact_binding.target_body_name,
-            observation_source="mujoco_native_physics",
-            clock_domain_id="mujoco-native-physics:" + exact["runtime_session_id"],
-        ) if motion_definition.skill_id == GRASPED_OBJECT_MOVE_SKILL_ID else schema_builder(
+            if motion_definition.skill_id == OBSERVED_POINT_SKILL_ID else object_motion_schema()
+            if motion_definition.skill_id == GRASPED_OBJECT_MOVE_SKILL_ID else schema_builder(
             **({} if is_safe_v2 else {"skill_id": motion_definition.skill_id}),
             skill_definition_hash=motion_definition.semantic_content_hash,
             parameter_profile_id=motion_profile.profile_id,
@@ -2573,7 +2621,7 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
         return motion_definition, motion_schema, motion_route, motion_contract
 
     planned_motions = []
-    safe_contract = safe_contract_v2 = grasp_contract = contact_contract = object_contract = observed_point_contract = observed_anchor_contract_v2 = observed_anchor_region_contract_v3 = observed_anchor_hover_contract_v4 = None
+    safe_contract = safe_contract_v2 = grasp_contract = contact_contract = object_contract = object_support_contract_v2 = observed_point_contract = observed_anchor_contract_v2 = observed_anchor_region_contract_v3 = observed_anchor_hover_contract_v4 = None
     if enable_safe_tcp_pose:
         local_safe_profile = replace(profile,
             profile_id=("mujoco.agent_safe_tcp_pose.v1" if safe_motion_observation_profile_hash is None
@@ -2678,6 +2726,19 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
             duration_ms=120_000, path_search_time_budget_sec=15.0,
         )
         object_contract = item[3]
+        planned_motions.append(item)
+    if enable_object_support_motion_v2:
+        item = planned_motion_contract(
+            grasped_object_place_definition_v2(controlled_component_ids=(component,)),
+            replace(object_contract.motion_profile,
+                profile_id="mujoco.agent_object_support_motion.v2." +
+                           grasp_contact_binding.semantic_content_hash),
+            route_id=MUJOCO_AGENT_OBJECT_MOVE_ROUTE_ID_V2,
+            executor_id="mujoco-grasped-object-support-motion-v2",
+            binding_prefix="sim.mujoco.agent_object_support_motion_v2:",
+            duration_ms=120_000, path_search_time_budget_sec=15.0,
+        )
+        object_support_contract_v2 = item[3]
         planned_motions.append(item)
     state_definition = tcp_pose_state_definition_v1(
         controlled_component_ids=(component,)
@@ -3433,6 +3494,8 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
                 profile=planned_contract.motion_profile,
                 **({"object_id": grasp_contact_binding.target_body_name,
                     "object_clock_domain_id": "mujoco-native-physics:" + exact["runtime_session_id"]}
+                   | ({"object_support_body_names": object_support_body_names}
+                      if safe_route.skill_version == "2" else {})
                    if safe_route.skill_id == GRASPED_OBJECT_MOVE_SKILL_ID else {}),
             )
         )
@@ -3471,6 +3534,8 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
         grasp_approach_contract=grasp_contract,
         grasp_contact_contract=contact_contract,
         object_motion_contract=object_contract,
+        object_support_motion_contract_v2=object_support_contract_v2,
+        object_support_body_names=object_support_body_names,
         depth_capture=depth_capture,
         rgb_capture=rgb_capture,
         rgbd_capture=rgbd_capture,

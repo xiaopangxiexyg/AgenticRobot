@@ -64,6 +64,7 @@ from .motion_deployment import (
     MUJOCO_AGENT_GRASP_APPROACH_ROUTE_ID_V1,
     MUJOCO_AGENT_GRASP_CONTACT_ROUTE_ID_V1,
     MUJOCO_AGENT_OBJECT_MOVE_ROUTE_ID_V1,
+    MUJOCO_AGENT_OBJECT_MOVE_ROUTE_ID_V2,
     MUJOCO_AGENT_SAFE_TCP_POSE_ROUTE_ID_V1,
     MUJOCO_AGENT_SAFE_TCP_POSE_ROUTE_ID_V2,
     MUJOCO_AGENT_TCP_POSE_MAX_ROTATION_DELTA_RAD_V1,
@@ -288,6 +289,8 @@ def _build_standard_tcp_pose_envelope_runtime(
     enable_grasp_approach: bool = False,
     grasp_contact_binding: MujocoGraspContactBinding | None = None,
     enable_object_motion: bool = False,
+    enable_object_support_motion_v2: bool = False,
+    object_support_body_names: tuple[str, ...] = (),
     motion_side: str = "right",
     enable_fast_grasp: bool = False,
 ) -> TCPPoseEnvelopeSafetyRuntime:
@@ -442,6 +445,18 @@ def _build_standard_tcp_pose_envelope_runtime(
                     }, domain="mujoco.object_motion.absolute_envelope.v1"),
                     allowed_route_ids=(MUJOCO_AGENT_OBJECT_MOVE_ROUTE_ID_V1,),
                 ))
+                if enable_object_support_motion_v2:
+                    entries.append(TCPPoseEnvelopeCatalogEntry(
+                        envelope_id="mujoco.agent_object_support_motion.safety.absolute.v2",
+                        profile=replace(grasp_profile,
+                            profile_id="mujoco-agent-object-support-motion-envelope-v2"),
+                        constraint_set_hash=canonical_content_hash({
+                            "target_contact_binding": grasp_contact_binding.to_payload(),
+                            "support_body_names": list(object_support_body_names),
+                            "payload_policy": "frozen_measured_relation_complete_dynamic_support_v2",
+                        }, domain="mujoco.object_support_motion.absolute_envelope.v2"),
+                        allowed_route_ids=(MUJOCO_AGENT_OBJECT_MOVE_ROUTE_ID_V2,),
+                    ))
     return TCPPoseEnvelopeSafetyRuntime(
         catalog_entries=tuple(entries),
         target_frame_binding_hash=target_binding_hash,
@@ -536,6 +551,8 @@ def build_mujoco_agent_tcp_pose_gateway_session(
     enable_object_state: bool = False,
     enable_object_follow_observation: bool = False,
     enable_object_motion: bool = False,
+    enable_object_support_motion_v2: bool = False,
+    object_support_body_names: tuple[str, ...] = (),
     safe_tcp_planning_clearance_padding_m: float = 0.002,
     enable_grippers: bool = False,
     enable_grasp_approach: bool = False,
@@ -679,6 +696,15 @@ def build_mujoco_agent_tcp_pose_gateway_session(
     if enable_object_motion and (not enable_object_follow_observation or not enable_grippers
                                  or not enable_grasp_approach or grasp_contact_target_body is None):
         raise ValueError("Object motion requires explicit follow observation, grippers, grasp approach and contact target.")
+    if (type(enable_object_support_motion_v2) is not bool
+            or enable_object_support_motion_v2 != bool(object_support_body_names)
+            or (enable_object_support_motion_v2 and not enable_object_motion)):
+        raise ValueError("Object support v2 requires original object motion and an explicit support allowlist.")
+    object_support_body_names = tuple(object_support_body_names)
+    if (len(set(object_support_body_names)) != len(object_support_body_names)
+            or any(not isinstance(name, str) or not name or name.strip() != name
+                   for name in object_support_body_names)):
+        raise ValueError("Object support IDs must be unique native names.")
     if enable_object_state and grasp_contact_target_body is None:
         raise ValueError("Object-state feedback requires an explicit grasp contact target.")
     if not isinstance(enable_grasp_approach, bool):
@@ -760,6 +786,12 @@ def build_mujoco_agent_tcp_pose_gateway_session(
     if side == "left":
         _validate_left_tool_sources(target_config)
     prepared = prepare_mujoco_sim_hil_target(target_config)
+    if enable_object_support_motion_v2:
+        scene_objects = {item.name: item for item in prepared.task_config.base_contract().scene.objects}
+        for name in object_support_body_names:
+            item = scene_objects.get(name)
+            if (name == grasp_contact_target_body or item is None or item.shape != "box"):
+                raise ValueError("Object support v2 requires another declared free box object.")
     if fast_grasp_planner is not None:
         from deployments.perception.dmtac_grasp_overlay import (
             DMTAC_M_REVIEWED_TOOL_TCP_POSE_FLANGE_M_RAD, reviewed_graspgenx_dmtac_solid_geometry,
@@ -841,6 +873,8 @@ def build_mujoco_agent_tcp_pose_gateway_session(
         grasp_contact_binding=grasp_contact_binding,
         enable_fast_grasp=fast_grasp_planner is not None,
         enable_object_motion=enable_object_motion,
+        enable_object_support_motion_v2=enable_object_support_motion_v2,
+        object_support_body_names=object_support_body_names,
         motion_side=side,
     )
     target = build_mujoco_agent_skill_motion_target(
@@ -898,7 +932,11 @@ def build_mujoco_agent_tcp_pose_gateway_session(
                 raise ValueError("Composed grippers require both configured hands.")
             gripper_ports = {side + "_gripper": MujocoGripperControlPort(
                 rig=target.runtime.rig, gripper_name=name, component_id=side + "_gripper",
-                clock=target.runtime.clock, arm_held=lambda: application.held)
+                clock=target.runtime.clock, arm_held=lambda: application.held,
+                target_contact_binding=(
+                    grasp_contact_binding
+                    if enable_object_follow_observation and side == "right" else None
+                ))
                 for name, side in prepared.gripper_profile.side_by_gripper.items()}
         contract_bundle = build_mujoco_agent_tcp_pose_contract_bundle(
             application=application,
@@ -954,6 +992,8 @@ def build_mujoco_agent_tcp_pose_gateway_session(
             enable_object_state=enable_object_state,
             enable_object_follow_observation=enable_object_follow_observation,
             enable_object_motion=enable_object_motion,
+            enable_object_support_motion_v2=enable_object_support_motion_v2,
+            object_support_body_names=object_support_body_names,
             enable_grasp_approach=enable_grasp_approach,
             grasp_contact_binding=grasp_contact_binding,
         )

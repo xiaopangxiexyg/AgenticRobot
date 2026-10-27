@@ -285,6 +285,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--enable-object-motion", action="store_true",
         help="publish carried-object lift/carry/place on the existing planner; requires grippers, grasp approach, contact target and explicit follow observation",
     )
+    parser.add_argument(
+        "--enable-object-support-motion-v2", action="store_true",
+        help="opt in to place-on-selected-object v2; requires --enable-object-motion and --object-support-body",
+    )
+    parser.add_argument(
+        "--object-support-body", action="append", default=[],
+        help="one declared free box support identity admitted by object-motion v2; repeat for each allowed support",
+    )
     parser.add_argument("--enable-fast-grasp", action="store_true",
         help="publish frozen observation, first-acceptable GraspGenX planning and paired one-use native execution")
     parser.add_argument("--sam2-grounding-dino-bundle", type=Path)
@@ -624,6 +632,8 @@ def main(argv: list[str] | None = None) -> int:
         or args.enable_segmentation
         or args.enable_grippers
         or args.enable_grasp_approach
+        or args.enable_object_support_motion_v2
+        or args.object_support_body
         or args.grasp_contact_target_body is not None
         or args.enable_rgbd_capture_v3
         or args.enable_segmentation_batch_v2
@@ -659,6 +669,10 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--enable-surface-anchor-v2 requires surface anchors and segmentation")
     if args.sam3_multi_instance_text and not args.enable_object_localization:
         parser.error("--sam3-multi-instance-text requires --enable-object-localization")
+    if args.enable_object_support_motion_v2 != bool(args.object_support_body):
+        parser.error("--enable-object-support-motion-v2 requires --object-support-body, and vice versa")
+    if args.enable_object_support_motion_v2 and not args.enable_object_motion:
+        parser.error("--enable-object-support-motion-v2 requires --enable-object-motion")
     if args.object_localization_backend == "sam3-service" and (
         args.segmentation_asset_bundle is not None or args.sam2_grounding_dino_bundle is not None
     ):
@@ -857,6 +871,8 @@ def main(argv: list[str] | None = None) -> int:
         enable_object_state=args.enable_object_state,
         enable_object_follow_observation=args.enable_object_follow_observation,
         enable_object_motion=args.enable_object_motion,
+        enable_object_support_motion_v2=args.enable_object_support_motion_v2,
+        object_support_body_names=tuple(args.object_support_body),
         enable_grasp_approach=args.enable_grasp_approach,
         grasp_contact_target_body=args.grasp_contact_target_body,
         fast_grasp_planner=fast_grasp_planner,

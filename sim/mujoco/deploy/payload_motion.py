@@ -31,6 +31,7 @@ import numpy as np
 
 from dataset_contracts.canonical_encoding import canonical_content_hash
 from robot_motion.object_transport import rigid_pose
+from robot_motion.relative_action import xyzquat_to_pose_matrix
 from robot_motion.path_planning import JointConfigurationCheck
 from robot_motion.pose import pose_delta_metrics
 from sim.mujoco.collision_safety import KinematicCollisionProjector
@@ -112,6 +113,8 @@ class MujocoPayloadSupport:
     phase: str
     max_penetration_m: float
     lateral_tolerance_m: float = .003
+    dynamic_body_name: str | None = None
+    frozen_pose_xyz_quat_xyzw: tuple[float, ...] | None = None
 
     def __post_init__(self):
         object.__setattr__(self, "geom_names", _names(self.geom_names, "Support geoms"))
@@ -127,9 +130,20 @@ class MujocoPayloadSupport:
                 raise ValueError(f"{name} must be finite and nonnegative")
         if not 0 < self.lateral_tolerance_m <= .003:
             raise ValueError("Lift lateral tolerance must retain the 3mm bound")
+        if (self.dynamic_body_name is None) != (self.frozen_pose_xyz_quat_xyzw is None):
+            raise ValueError("Dynamic support requires both body identity and frozen pose")
+        if self.dynamic_body_name is not None:
+            _names((self.dynamic_body_name,), "Dynamic support body")
+            pose = _vector(self.frozen_pose_xyz_quat_xyzw, 7, "Frozen support pose")
+            rigid_pose(xyzquat_to_pose_matrix(pose), name="frozen support pose")
+            object.__setattr__(self, "frozen_pose_xyz_quat_xyzw", pose)
 
     def to_payload(self):
-        return dict(vars(self))
+        payload = dict(vars(self))
+        if self.dynamic_body_name is None:
+            payload.pop("dynamic_body_name")
+            payload.pop("frozen_pose_xyz_quat_xyzw")
+        return payload
 
 
 @dataclass(frozen=True, init=False, eq=False)
@@ -352,11 +366,46 @@ class _PayloadSceneOracle(CollisionSafetyOracle):
                 or len({int(model.geom_bodyid[g]) for g in self._sensors}) != 2):
             raise ValueError("Payload requires two distinct native hand sensor bodies")
         self._supports = () if binding.support is None else tuple(int(model.geom(n).id) for n in binding.support.geom_names)
+        self._dynamic_support_body = None
+        self._frozen_support_pose = None
+        self._inverse_source_support_pose = None
         if binding.support is not None:
             if binding.support.max_penetration_m > policy.hard_penetration_m:
                 raise ValueError("Payload support cannot exceed the scene hard penetration bound")
+            if binding.support.dynamic_body_name is not None:
+                body = int(model.body(binding.support.dynamic_body_name).id)
+                joint = int(model.body_jntadr[body])
+                if (body == self._body or model.body_parentid[body] != 0
+                        or model.body_jntnum[body] != 1
+                        or model.jnt_type[joint] != mujoco.mjtJoint.mjJNT_FREE
+                        or np.any(model.body_parentid[1:] == body)):
+                    raise ValueError("Dynamic support requires another top-level free rigid body")
+                self._dynamic_support_body = body
+                self._frozen_support_pose = xyzquat_to_pose_matrix(
+                    binding.support.frozen_pose_xyz_quat_xyzw)
+                source = mujoco.MjData(model)
+                source.qpos[:] = binding.source_model_qpos
+                source.mocap_pos[:] = np.asarray(binding.source_mocap_pos).reshape(source.mocap_pos.shape)
+                source.mocap_quat[:] = np.asarray(binding.source_mocap_quat).reshape(source.mocap_quat.shape)
+                mujoco.mj_kinematics(model, source)
+                source_pose = _body_pose(source, body)
+                displacement, angle = pose_delta_metrics(self._frozen_support_pose, source_pose)
+                if displacement > 1e-5 or angle > .001:
+                    raise ValueError("Frozen dynamic support pose differs from its captured source cut")
+                self._inverse_source_support_pose = np.linalg.inv(source_pose)
+                collision_geoms = {int(g) for g in np.flatnonzero(
+                    (model.geom_bodyid == body)
+                    & ((model.geom_contype != 0) | (model.geom_conaffinity != 0)))}
+                if set(self._supports) != collision_geoms:
+                    raise ValueError("Dynamic support must bind its complete collision geometry")
             for geom in self._supports:
                 body = int(model.geom_bodyid[geom])
+                if self._dynamic_support_body is not None:
+                    if (body != self._dynamic_support_body
+                            or model.geom_contype[geom] != 8
+                            or model.geom_type[geom] != mujoco.mjtGeom.mjGEOM_BOX):
+                        raise ValueError("Dynamic support must use its complete native box identity")
+                    continue
                 while body and model.body_dofnum[body] == 0:
                     if model.body_mocapid[body] >= 0:
                         raise ValueError("Payload support must be fixed, not mocap-driven")
@@ -395,6 +444,11 @@ class _PayloadSceneOracle(CollisionSafetyOracle):
     def _support_allowed(self, data, geom, support_geom, *, measured=False):
         support, model = self.binding.support, self.model
         normal = np.asarray(support.normal_world)
+        delta = None
+        if self._dynamic_support_body is not None:
+            current = _body_pose(data, self._dynamic_support_body)
+            delta = current @ self._inverse_source_support_pose
+            normal = delta[:3, :3] @ normal
         rotation = data.geom_xmat[support_geom].reshape(3, 3)
         local = rotation.T @ normal
         axis = int(np.argmax(np.abs(local)))
@@ -418,9 +472,12 @@ class _PayloadSceneOracle(CollisionSafetyOracle):
         points = vertices @ data.geom_xmat[geom].reshape(3, 3).T + data.geom_xpos[geom]
         height = (points - face) @ normal
         footprint = points - height[:, None] * normal
+        # The declared region is a potentially narrow source-frame rectangle.
+        # Rotating its AABB outward would grant contact outside that rectangle.
+        region_footprint = (footprint - delta[:3, 3]) @ delta[:3, :3] if delta is not None else footprint
         if (not np.isfinite(points).all() or np.min(height) < -support.max_penetration_m
-                or np.any(footprint < np.asarray(support.region_min_world) - 1e-9)
-                or np.any(footprint > np.asarray(support.region_max_world) + 1e-9)):
+                or np.any(region_footprint < np.asarray(support.region_min_world) - 1e-9)
+                or np.any(region_footprint > np.asarray(support.region_max_world) + 1e-9)):
             return False
         if model.geom_type[support_geom] == self.mujoco.mjtGeom.mjGEOM_BOX:
             local_points = (footprint - data.geom_xpos[support_geom]) @ rotation
@@ -440,6 +497,14 @@ class _PayloadSceneOracle(CollisionSafetyOracle):
                 or (support.phase == "place" and rise > .003))
 
     def check(self, data, *, _measured_support=False, **kwargs):
+        if self._dynamic_support_body is not None:
+            translation, angle = pose_delta_metrics(
+                self._frozen_support_pose, _body_pose(data, self._dynamic_support_body))
+            if translation > .003 or angle > 2.:
+                return CollisionCheckResult(
+                    safe=False, minimum_distance_m=0.,
+                    body1_name=self.binding.support.dynamic_body_name,
+                    pair_class="payload_support_moved")
         with np.errstate(over="raise", invalid="raise"):
             rotation = np.asarray(data.geom_xmat).reshape((-1, 3, 3))
             position = np.asarray(data.geom_xpos)

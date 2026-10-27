@@ -139,9 +139,21 @@ def test_sim_route_is_target_neutral_semantics_with_sim_privilege() -> None:
     assert route.target_kind == "sim"
     assert route.privilege_tier == "t1_sim_or_no_motion"
     assert route.requires_operator_confirmation is False
+    assert route.max_operation_duration_ms == 15_000
     assert (
         "approach_then_close_composition" in bundle.route_manifest.explicit_exclusions
     )
+
+
+def test_real_gripper_keeps_existing_operation_deadline() -> None:
+    port = FakeGripperPort([(0.0, False)])
+    binding = replace(
+        _sim_bundle(port).deployment_binding,
+        target_kind="real",
+        current_mode="real_active",
+    )
+    route = build_gripper_skill_contract_bundle(binding).route_manifest.skill_routes[0].route
+    assert route.max_operation_duration_ms == 5_000
 
 
 def test_gripper_executor_rejects_wrong_port_before_activation():
@@ -202,6 +214,7 @@ def test_gateway_executes_closed_contact_settle_and_reuses_executor() -> None:
     assert port.commanded == [1.0]
     assert len(port.holds) == 1
 
+
     port.samples.extend(
         [
             (0.4, False),  # next passive observation
@@ -236,6 +249,38 @@ def test_gateway_executes_closed_contact_settle_and_reuses_executor() -> None:
     assert open_operation.execution_result["completion_kind"] == "target_reached"
     assert port.commanded == [1.0, 0.0]
     assert len(port.holds) == 2
+
+
+def test_target_bilateral_contact_can_settle_before_the_fixed_close_fraction() -> None:
+    class ContactPort(FakeGripperPort):
+        def observe_state(self):
+            sample = super().observe_state()
+            return replace(sample, target_contact_confirmed=(
+                sample.measured_close == .045 and sample.moving is False
+            ))
+
+    port = ContactPort([(0., False), (.045, True), (.045, False),
+                        (.045, False), (.045, False)])
+    bundle = _sim_bundle(port)
+    session = assemble_gripper_agent_gateway_session(
+        contract_bundle=bundle, port=port, allowed_client_ids=("client:test",),
+        current_station_revision=lambda: 3, clock_domain_id="clock:test",
+        convergence=GripperConvergenceProfile(
+            minimum_contact_settle_sec=0., poll_interval_sec=0.))
+    try:
+        snapshot = session.publish_observation()
+        request = _request(bundle, snapshot, target_state="closed")
+        admitted = session.service.submit_request(request=request, current_station_revision=3)
+        assert admitted.accepted and admitted.operation is not None
+        assert session.service.launch_operation(admitted.operation.operation_id).accepted
+        assert session.executor.wait(timeout_sec=1.)
+        operation = session.service.get_operation(admitted.operation.operation_id)
+        assert operation.execution_outcome == "completed"
+        assert operation.execution_result["measured_close"] == pytest.approx(.045)
+        assert operation.execution_result["completion_kind"] == "settled_before_full_close"
+        assert port.holds
+    finally:
+        session.close()
 
 
 def test_wire_adapter_observation_uses_receiver_admission_outcome() -> None:

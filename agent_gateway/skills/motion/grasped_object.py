@@ -4,7 +4,9 @@ import math
 from collections.abc import Mapping
 from dataclasses import replace
 
-from agent_gateway.protocol.skill_catalog import SkillDefinition
+from agent_gateway.protocol.skill_catalog import (
+    SkillDefinition, agent_skill_schema_document_hash,
+)
 from agent_gateway.skills.motion.schemas import (
     _pose,
     _pose_schema,
@@ -41,6 +43,76 @@ def grasped_object_move_definition(*, controlled_component_ids):
                              "configured_scene_collision_free_path_found.v1"),
         task_outcome_predicate_ids=("grasped_object_pose_within_tolerance.v1",),
     )
+
+
+def grasped_object_place_definition_v2(*, controlled_component_ids):
+    """A selected support identity is required; gripper release stays separate."""
+    return replace(
+        grasped_object_move_definition(controlled_component_ids=controlled_component_ids),
+        skill_version="2",
+        summary=("Place the already verified held object onto one explicitly bound "
+                 "object support. Retain the frozen hand-object relation, complete "
+                 "collision path and measured support identity; do not open the hand "
+                 "or infer stable release."),
+        parameter_semantics_id="grasped_object.place_on_bound_support.v2",
+        task_outcome_semantics_id="grasped_object_selected_support_arrival.v2",
+    )
+
+
+def grasped_object_place_schema_v2(*, definition, profile, object_id,
+                                    support_object_ids, observation_source, clock_domain_id):
+    support_object_ids = tuple(support_object_ids)
+    if (definition.skill_version != "2" or not support_object_ids
+            or len(set(support_object_ids)) != len(support_object_ids)
+            or object_id in support_object_ids):
+        raise ValueError("Place v2 requires distinct deployed support object IDs.")
+    base = grasped_object_move_schema(
+        definition=definition, profile=profile, object_id=object_id,
+        observation_source=observation_source, clock_domain_id=clock_domain_id)
+    parameters = dict(base.parameter_schema)
+    properties = dict(parameters["properties"])
+    properties["phase"] = {"const": "place"}
+    properties["support_object_id"] = {"type": "string", "enum": list(support_object_ids)}
+    parameters["properties"] = properties
+    parameters["required"] = [*parameters["required"], "support_object_id"]
+    result = dict(base.execution_result_schema)
+    result_properties = dict(result["properties"])
+    state = dict(result_properties["object_state"])
+    state_properties = dict(state["properties"])
+    state_properties["support_object_id"] = {"type": "string", "enum": list(support_object_ids)}
+    state["properties"] = state_properties
+    state["required"] = [*state["required"], "support_object_id"]
+    result_properties["object_state"] = state
+    result["properties"] = result_properties
+    schema_hash = agent_skill_schema_document_hash(parameters, schema_kind="parameter")
+    return replace(
+        base, skill_version="2", parameter_schema=parameters,
+        execution_result_schema=result,
+        parameter_profiles=tuple(replace(item, parameter_schema_hash=schema_hash)
+                                 for item in base.parameter_profiles),
+    )
+
+
+def validate_grasped_object_place_v2(parameters, *, profile, object_id, support_object_ids):
+    if not isinstance(parameters, Mapping) or "support_object_id" not in parameters:
+        raise ValueError("Place v2 requires a selected support object ID.")
+    support_id = parameters["support_object_id"]
+    if support_id not in tuple(support_object_ids) or parameters.get("phase") != "place":
+        raise ValueError("Place v2 support and phase must match the deployed allowlist.")
+    validate_grasped_object_move(
+        {key: value for key, value in parameters.items() if key != "support_object_id"},
+        profile=profile, object_id=object_id)
+
+
+def validate_object_motion_state_v2(state, *, parameters, profile, object_id,
+                                    observation_source, clock_domain_id):
+    if (not isinstance(state, Mapping)
+            or state.get("support_object_id") != parameters["support_object_id"]):
+        raise ValueError("Object terminal support differs from the admitted request.")
+    validate_object_motion_state(
+        {key: value for key, value in state.items() if key != "support_object_id"},
+        profile=profile, object_id=object_id,
+        observation_source=observation_source, clock_domain_id=clock_domain_id)
 
 
 def grasped_object_move_schema(*, definition, profile, object_id, observation_source, clock_domain_id):

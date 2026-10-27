@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import hashlib
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
@@ -10,6 +11,11 @@ from types import MappingProxyType
 from typing import Any, Protocol
 
 import numpy as np
+
+from robot_motion.object_transport import (
+    CalibratedBoxSupportObservation,
+    SupportSurfaceObservation,
+)
 
 from agent_gateway.profiles.segmentation import LiveRgbSegmentationCapture
 from agent_gateway.protocol.skill_catalog import (
@@ -211,6 +217,520 @@ class ProjectedDepthGeometry:
     world_extent_xyz_m: tuple[float, float, float]
     median_depth_m: float
     valid_point_count: int
+
+
+@dataclass(frozen=True)
+class ProjectedSupportSurface:
+    """Top-plane candidate, not proof that the entire XY AABB is supported."""
+
+    source_id: str
+    capture_group_id: str
+    captured_at: float
+    station_revision: int
+    depth_content_hash: str
+    upper_top_z_m: float
+    plane_anchor_reference_xyz_m: tuple[float, float, float]
+    normal_reference_xyz: tuple[float, float, float]
+    observed_bounds_min_xy_m: tuple[float, float]
+    observed_bounds_max_xy_m: tuple[float, float]
+    maximum_plane_residual_m: float
+    top_point_count: int
+
+
+@dataclass(frozen=True)
+class SearchedSupportSurface:
+    """Best measured planar patch; its bounds are still only observations."""
+
+    candidate: ProjectedSupportSurface
+    patch_xyxy_px: tuple[int, int, int, int]
+    inspected_patch_count: int
+    accepted_patch_count: int
+    support_mask_sha256: str
+    source_mask_clipped: bool
+
+
+def bind_known_box_support_from_depth(
+    capture: LiveAlignedDepthCapture,
+    search: SearchedSupportSurface,
+    box: CalibratedBoxSupportObservation,
+    *,
+    semantic_support_id: str,
+    expected_reference_frame_id: str,
+    expected_support_mask_sha256: str,
+    lateral_uncertainty_m: float,
+    vertical_uncertainty_m: float,
+) -> SupportSurfaceObservation:
+    """Bind a retained semantic mask and same-cut plane to known box geometry.
+
+    The caller must obtain the semantic ID and expected mask hash from the
+    authenticated segmentation operation. This edge never grants motion;
+    the lower safe planner and live observer still validate the result.
+    """
+    if (not isinstance(capture, LiveAlignedDepthCapture)
+            or not isinstance(search, SearchedSupportSurface)
+            or not isinstance(box, CalibratedBoxSupportObservation)):
+        raise TypeError("Support fusion needs typed depth, search and box observations")
+    candidate = search.candidate
+    if (candidate.source_id != capture.source_id
+            or candidate.capture_group_id != capture.capture_group_id
+            or candidate.captured_at != capture.captured_at
+            or candidate.station_revision != capture.station_revision
+            or candidate.depth_content_hash != capture.depth_content_hash):
+        raise ValueError("Support plane does not belong to the bound depth cut")
+    if (semantic_support_id != box.support_id
+            or box.reference_frame_id != expected_reference_frame_id
+            or box.scene_revision != capture.station_revision):
+        raise ValueError("Semantic support, frame or revision differs from its box binding")
+    if (not isinstance(expected_support_mask_sha256, str)
+            or len(expected_support_mask_sha256) != 64
+            or any(char not in "0123456789abcdef" for char in expected_support_mask_sha256)
+            or search.support_mask_sha256 != expected_support_mask_sha256):
+        raise ValueError("Support mask differs from the retained semantic segment")
+    center_xy = (np.asarray(candidate.observed_bounds_min_xy_m)
+                 + candidate.observed_bounds_max_xy_m) / 2.
+    depth_ref = ("support-depth:" + capture.depth_content_hash + ":"
+                 + search.support_mask_sha256 + ":" + capture.capture_group_id)
+    return box.bind_measured_top(
+        plane_measured_at=capture.captured_at,
+        measured_upper_top_z_m=candidate.upper_top_z_m,
+        measured_normal_reference_xyz=candidate.normal_reference_xyz,
+        measured_region_center_xy_m=tuple(float(value) for value in center_xy),
+        depth_evidence_ref=depth_ref,
+        lateral_uncertainty_m=lateral_uncertainty_m,
+        vertical_uncertainty_m=vertical_uncertainty_m,
+    )
+
+
+def search_and_bind_known_box_support_from_depth(
+    capture: LiveAlignedDepthCapture,
+    mask: np.ndarray,
+    box: CalibratedBoxSupportObservation,
+    *,
+    mask_clipped: bool,
+    semantic_support_id: str,
+    expected_reference_frame_id: str,
+    expected_support_mask_sha256: str,
+    lateral_uncertainty_m: float,
+    vertical_uncertainty_m: float,
+    maximum_depth_m: float,
+    patch_size_px: int = 64,
+    stride_px: int = 32,
+    maximum_patches: int = 512,
+) -> tuple[SearchedSupportSurface, SupportSurfaceObservation]:
+    """Find a measured patch that actually matches the named complete box.
+
+    A broad semantic mask can include nearby same-colour surfaces or borders.
+    Candidate ranking is restricted to patches whose measured pose and plane
+    agree with the catalog-backed box. The retained semantic mask hash still
+    names the *original* mask, not a privately cropped replacement.
+    """
+    selected = np.asarray(mask)
+    if (not isinstance(capture, LiveAlignedDepthCapture)
+            or not isinstance(box, CalibratedBoxSupportObservation)
+            or selected.dtype != np.bool_ or selected.shape != capture.depth_m.shape):
+        raise TypeError("Bound support search needs typed depth, box and mask")
+    actual_mask_hash = hashlib.sha256(
+        np.ascontiguousarray(selected).tobytes()
+    ).hexdigest()
+    if (not isinstance(expected_support_mask_sha256, str)
+            or actual_mask_hash != expected_support_mask_sha256):
+        raise ValueError("Support search mask differs from its retained segment")
+    if (semantic_support_id != box.support_id
+            or box.reference_frame_id != expected_reference_frame_id
+            or box.scene_revision != capture.station_revision):
+        raise ValueError("Support search identity, frame or revision differs")
+    depth_ref = ("support-depth:" + capture.depth_content_hash + ":"
+                 + actual_mask_hash + ":" + capture.capture_group_id)
+
+    def matches_box(candidate: ProjectedSupportSurface) -> bool:
+        center_xy = (np.asarray(candidate.observed_bounds_min_xy_m)
+                     + candidate.observed_bounds_max_xy_m) / 2.
+        try:
+            box.bind_measured_top(
+                plane_measured_at=capture.captured_at,
+                measured_upper_top_z_m=candidate.upper_top_z_m,
+                measured_normal_reference_xyz=candidate.normal_reference_xyz,
+                measured_region_center_xy_m=tuple(float(value) for value in center_xy),
+                depth_evidence_ref=depth_ref,
+                lateral_uncertainty_m=lateral_uncertainty_m,
+                vertical_uncertainty_m=vertical_uncertainty_m,
+            )
+        except ValueError:
+            return False
+        return True
+
+    search = search_depth_mask_support_surface(
+        capture, selected, mask_clipped=mask_clipped,
+        maximum_depth_m=maximum_depth_m, patch_size_px=patch_size_px,
+        stride_px=stride_px, maximum_patches=maximum_patches,
+        candidate_filter=matches_box,
+    )
+    support = bind_known_box_support_from_depth(
+        capture, search, box, semantic_support_id=semantic_support_id,
+        expected_reference_frame_id=expected_reference_frame_id,
+        expected_support_mask_sha256=expected_support_mask_sha256,
+        lateral_uncertainty_m=lateral_uncertainty_m,
+        vertical_uncertainty_m=vertical_uncertainty_m,
+    )
+    return search, support
+
+
+def refresh_known_box_support_patch_from_depth(
+    source_capture: LiveAlignedDepthCapture,
+    fresh_capture: LiveAlignedDepthCapture,
+    semantic_mask: np.ndarray,
+    selection: SearchedSupportSurface,
+    fresh_box: CalibratedBoxSupportObservation,
+    *,
+    semantic_support_id: str,
+    expected_reference_frame_id: str,
+    expected_support_mask_sha256: str,
+    lateral_uncertainty_m: float,
+    vertical_uncertainty_m: float,
+    maximum_depth_m: float,
+) -> tuple[SearchedSupportSurface, SupportSurfaceObservation]:
+    """Revalidate only a selected patch on a fresh cut before motion planning.
+
+    The expensive semantic search may run on an earlier cut. This method
+    preserves its exact mask and static camera identity but never refreshes a
+    stale plane by copying a timestamp. It fits the selected patch again on
+    actual fresh depth, then binds a freshly read fixed support box.
+    """
+    if (not isinstance(source_capture, LiveAlignedDepthCapture)
+            or not isinstance(fresh_capture, LiveAlignedDepthCapture)
+            or not isinstance(selection, SearchedSupportSurface)):
+        raise TypeError("Support refresh needs typed source, fresh cut and selection")
+    source = selection.candidate
+    if (source.source_id != source_capture.source_id
+            or source.capture_group_id != source_capture.capture_group_id
+            or source.depth_content_hash != source_capture.depth_content_hash
+            or source.captured_at != source_capture.captured_at
+            or source.station_revision != source_capture.station_revision):
+        raise ValueError("Selected patch does not belong to its source cut")
+    if (source_capture.source_id != fresh_capture.source_id
+            or source_capture.role != fresh_capture.role
+            or source_capture.station_revision != fresh_capture.station_revision
+            or dict(source_capture.intrinsics) != dict(fresh_capture.intrinsics)
+            or not np.allclose(source_capture.reference_from_camera,
+                               fresh_capture.reference_from_camera,
+                               atol=1e-6, rtol=0)):
+        raise ValueError("Saved semantic mask cannot be reused after camera binding changed")
+    selected = np.asarray(semantic_mask)
+    if selected.dtype != np.bool_ or selected.shape != source_capture.depth_m.shape:
+        raise ValueError("Retained semantic mask has the wrong dimensions")
+    mask_hash = hashlib.sha256(np.ascontiguousarray(selected).tobytes()).hexdigest()
+    if (not isinstance(expected_support_mask_sha256, str)
+            or mask_hash != expected_support_mask_sha256
+            or mask_hash != selection.support_mask_sha256):
+        raise ValueError("Retained support mask identity changed")
+    patch = selection.patch_xyxy_px
+    width, height = selected.shape[1], selected.shape[0]
+    if (len(patch) != 4 or any(isinstance(value, bool) or not isinstance(value, int)
+                               for value in patch)):
+        raise ValueError("Selected support patch coordinates are invalid")
+    x0, y0, x1, y1 = patch
+    if not (0 <= x0 < x1 <= width and 0 <= y0 < y1 <= height):
+        raise ValueError("Selected support patch exceeds the camera grid")
+    local_mask = np.zeros_like(selected)
+    local_mask[y0:y1, x0:x1] = selected[y0:y1, x0:x1]
+    fresh_candidate = project_depth_mask_support_surface(
+        fresh_capture, local_mask, mask_clipped=False,
+        maximum_depth_m=maximum_depth_m)
+    refreshed = SearchedSupportSurface(
+        candidate=fresh_candidate, patch_xyxy_px=patch,
+        inspected_patch_count=1, accepted_patch_count=1,
+        support_mask_sha256=mask_hash,
+        source_mask_clipped=selection.source_mask_clipped,
+    )
+    support = bind_known_box_support_from_depth(
+        fresh_capture, refreshed, fresh_box,
+        semantic_support_id=semantic_support_id,
+        expected_reference_frame_id=expected_reference_frame_id,
+        expected_support_mask_sha256=mask_hash,
+        lateral_uncertainty_m=lateral_uncertainty_m,
+        vertical_uncertainty_m=vertical_uncertainty_m,
+    )
+    return refreshed, support
+
+
+@dataclass(frozen=True)
+class ObservedSupportFootprintCoverage:
+    """Dense RGB-D evidence for one proposed rectangle, not complete CAD geometry."""
+
+    region_min_xy_m: tuple[float, float]
+    region_max_xy_m: tuple[float, float]
+    sample_count: int
+    maximum_measured_plane_residual_m: float
+    resolution_m: float
+
+
+def check_observed_support_footprint(
+    capture: LiveAlignedDepthCapture,
+    mask: np.ndarray,
+    candidate: ProjectedSupportSurface,
+    *,
+    region_min_xy_m: tuple[float, float],
+    region_max_xy_m: tuple[float, float],
+    resolution_m: float = .002,
+    maximum_plane_residual_m: float = .002,
+) -> ObservedSupportFootprintCoverage:
+    """Require measured planar depth at every sampled point of a proposed footprint.
+
+    This closes gaps in an AABB of observed pixels at 2 mm resolution or finer.
+    It cannot prove subpixel material continuity or hidden support geometry;
+    callers must still bind a known support extent and fresh identity before
+    constructing a complete SupportSurfaceObservation.
+    """
+    if not isinstance(capture, LiveAlignedDepthCapture) or not isinstance(candidate, ProjectedSupportSurface):
+        raise TypeError("Support footprint needs a bound capture and fitted plane")
+    if (candidate.source_id != capture.source_id
+            or candidate.capture_group_id != capture.capture_group_id
+            or candidate.captured_at != capture.captured_at
+            or candidate.station_revision != capture.station_revision
+            or candidate.depth_content_hash != capture.depth_content_hash):
+        raise ValueError("Support plane and footprint depth have different source cuts")
+    selected = np.asarray(mask)
+    if selected.dtype != np.bool_ or selected.shape != capture.depth_m.shape:
+        raise ValueError("Support mask must match the bound depth cut")
+    for name, value in (("resolution_m", resolution_m),
+                        ("maximum_plane_residual_m", maximum_plane_residual_m)):
+        if (isinstance(value, (bool, np.bool_)) or not math.isfinite(value)
+                or value <= 0 or value > .002):
+            raise ValueError(f"{name} exceeds the measured support qualification profile")
+    low = np.asarray(region_min_xy_m, dtype=float)
+    high = np.asarray(region_max_xy_m, dtype=float)
+    observed_low = np.asarray(candidate.observed_bounds_min_xy_m)
+    observed_high = np.asarray(candidate.observed_bounds_max_xy_m)
+    if (low.shape != (2,) or high.shape != (2,) or not np.isfinite(low).all()
+            or not np.isfinite(high).all() or np.any(low >= high)
+            or np.any(low < observed_low) or np.any(high > observed_high)):
+        raise ValueError("Requested footprint is outside the observed support bounds")
+    steps = (high - low) / resolution_m
+    if (not np.isfinite(steps).all() or np.any(steps > 100_000)
+            or (steps[0] + 1) * (steps[1] + 1) > 100_000):
+        raise ValueError("Requested footprint exceeds the bounded sample budget")
+    counts = (math.ceil(float(steps[0])) + 1,
+              math.ceil(float(steps[1])) + 1)
+    grid_x, grid_y = np.meshgrid(np.linspace(low[0], high[0], counts[0]),
+                                 np.linspace(low[1], high[1], counts[1]))
+    anchor = np.asarray(candidate.plane_anchor_reference_xyz_m)
+    normal = np.asarray(candidate.normal_reference_xyz)
+    x = grid_x.ravel()
+    y = grid_y.ravel()
+    z = anchor[2] - (normal[0] * (x - anchor[0])
+                     + normal[1] * (y - anchor[1])) / normal[2]
+    reference_points = np.stack((x, y, z), axis=1)
+    rotation = capture.reference_from_camera[:3, :3]
+    camera_points = (reference_points - capture.reference_from_camera[:3, 3]) @ rotation
+    if np.any(camera_points[:, 2] <= 0):
+        raise ValueError("Support footprint projects behind the camera")
+    intrinsics = capture.intrinsics
+    u = np.rint(intrinsics["fx"] * camera_points[:, 0] / camera_points[:, 2]
+                + intrinsics["cx"]).astype(int)
+    v = np.rint(intrinsics["fy"] * camera_points[:, 1] / camera_points[:, 2]
+                + intrinsics["cy"]).astype(int)
+    height, width = selected.shape
+    if np.any(u < 0) or np.any(v < 0) or np.any(u >= width) or np.any(v >= height):
+        raise ValueError("Support footprint is outside the captured image")
+    if not np.all(selected[v, u]):
+        raise ValueError("Support footprint contains an unobserved mask gap")
+    measured_depth = capture.depth_m[v, u].astype(float)
+    if np.any(measured_depth <= 0):
+        raise ValueError("Support footprint contains missing metric depth")
+    measured = _project_pixels(
+        u=u.astype(float), v=v.astype(float), depth=measured_depth,
+        intrinsics=intrinsics,
+        reference_from_camera=capture.reference_from_camera,
+    )
+    residual = np.abs((measured - anchor) @ normal)
+    if np.any(residual > maximum_plane_residual_m):
+        raise ValueError("Support footprint contains nonplanar depth or an occlusion")
+    return ObservedSupportFootprintCoverage(
+        region_min_xy_m=tuple(float(value) for value in low),
+        region_max_xy_m=tuple(float(value) for value in high),
+        sample_count=int(residual.size),
+        maximum_measured_plane_residual_m=float(np.max(residual)),
+        resolution_m=float(resolution_m),
+    )
+
+
+def search_depth_mask_support_surface(
+    capture: LiveAlignedDepthCapture,
+    mask: np.ndarray,
+    *,
+    mask_clipped: bool,
+    maximum_depth_m: float,
+    patch_size_px: int = 64,
+    stride_px: int = 32,
+    maximum_patches: int = 256,
+    candidate_filter: Callable[[ProjectedSupportSurface], bool] | None = None,
+) -> SearchedSupportSurface:
+    """Select a measured top patch inside one bound semantic support mask.
+
+    A large support mask can include edges and occlusions, so fitting it all at
+    once may reject a valid local plane. This bounded search only finds a
+    candidate. It does not certify a complete footprint or motion eligibility.
+    The semantic mask identity, clipping status and depth cut remain the
+    caller's responsibility.
+    """
+    if not isinstance(capture, LiveAlignedDepthCapture):
+        raise TypeError("A bound metric-depth capture is required")
+    selected = np.asarray(mask)
+    if selected.dtype != np.bool_ or selected.shape != capture.depth_m.shape:
+        raise ValueError("Support mask must be a paired full-resolution boolean grid")
+    if type(mask_clipped) is not bool:
+        raise ValueError("Support mask clipping status must be explicit")
+    if (isinstance(maximum_depth_m, (bool, np.bool_))
+            or not isinstance(maximum_depth_m, (int, float, np.integer, np.floating))
+            or not math.isfinite(maximum_depth_m) or maximum_depth_m <= 0):
+        raise ValueError("maximum_depth_m must be finite and positive")
+    for name, value in (
+        ("patch_size_px", patch_size_px),
+        ("stride_px", stride_px),
+        ("maximum_patches", maximum_patches),
+    ):
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise ValueError(f"{name} must be a positive integer")
+    if patch_size_px < 16 or stride_px > patch_size_px or maximum_patches > 1024:
+        raise ValueError("Support patch search bounds are invalid")
+    if candidate_filter is not None and not callable(candidate_filter):
+        raise TypeError("Support patch filter must be callable")
+    height, width = selected.shape
+    if patch_size_px > min(height, width):
+        raise ValueError("Support patch exceeds the capture")
+    rows, columns = np.nonzero(selected)
+    if not len(rows):
+        raise ValueError("Support mask is empty")
+
+    def starts(low: int, high: int, limit: int) -> tuple[int, ...]:
+        first = max(0, low - patch_size_px + 1)
+        last = min(high, limit - patch_size_px)
+        return tuple(range(first, last + 1, stride_px)) + ((last,) if last >= first else ())
+
+    xs = tuple(dict.fromkeys(starts(int(columns.min()), int(columns.max()), width)))
+    ys = tuple(dict.fromkeys(starts(int(rows.min()), int(rows.max()), height)))
+    if len(xs) * len(ys) > maximum_patches:
+        raise ValueError("Support mask exceeds the bounded patch search budget")
+    best: tuple[float, float, int, int, ProjectedSupportSurface] | None = None
+    accepted = 0
+    for y0 in ys:
+        for x0 in xs:
+            patch = np.zeros_like(selected)
+            patch[y0:y0 + patch_size_px, x0:x0 + patch_size_px] = selected[
+                y0:y0 + patch_size_px, x0:x0 + patch_size_px
+            ]
+            try:
+                candidate = project_depth_mask_support_surface(
+                    capture, patch, mask_clipped=False,
+                    maximum_depth_m=maximum_depth_m,
+                )
+            except ValueError:
+                continue
+            if candidate_filter is not None and not candidate_filter(candidate):
+                continue
+            accepted += 1
+            dx = (candidate.observed_bounds_max_xy_m[0]
+                  - candidate.observed_bounds_min_xy_m[0])
+            dy = (candidate.observed_bounds_max_xy_m[1]
+                  - candidate.observed_bounds_min_xy_m[1])
+            score = (dx * dy, -candidate.maximum_plane_residual_m,
+                     -y0, -x0, candidate)
+            if best is None or score[:4] > best[:4]:
+                best = score
+    if best is None:
+        raise ValueError("No near-horizontal measured support patch was found")
+    x0, y0 = -best[3], -best[2]
+    return SearchedSupportSurface(
+        candidate=best[4],
+        patch_xyxy_px=(x0, y0, x0 + patch_size_px, y0 + patch_size_px),
+        inspected_patch_count=len(xs) * len(ys),
+        accepted_patch_count=accepted,
+        support_mask_sha256=hashlib.sha256(
+            np.ascontiguousarray(selected).tobytes()
+        ).hexdigest(),
+        source_mask_clipped=mask_clipped,
+    )
+
+
+def project_depth_mask_support_surface(
+    capture: LiveAlignedDepthCapture,
+    mask: np.ndarray,
+    *,
+    mask_clipped: bool,
+    maximum_depth_m: float,
+    minimum_top_points: int = 32,
+    maximum_tilt_deg: float = 1.,
+    maximum_plane_residual_m: float = .002,
+    top_height_margin_m: float = .002,
+) -> ProjectedSupportSurface:
+    """Fit only a measured top patch; reject sides, clipping and poor geometry.
+
+    The returned XY bounds are only quantiles of observed top points. They are
+    not automatically an inscribed supported rectangle: rotated surfaces,
+    holes and occlusion need separate conservative qualification before use as
+    SupportSurfaceObservation. upper_top_z_m includes a positive error margin.
+    This operation is read-only and does not assert identity or motion safety.
+    """
+    if not isinstance(capture, LiveAlignedDepthCapture):
+        raise TypeError("A bound metric-depth capture is required")
+    selected = np.asarray(mask)
+    if selected.dtype != np.bool_ or selected.shape != capture.depth_m.shape:
+        raise ValueError("Support mask must be a paired full-resolution boolean grid")
+    if type(mask_clipped) is not bool or mask_clipped:
+        raise ValueError("Clipped or unverified support masks are not complete regions")
+    if (isinstance(minimum_top_points, bool) or not isinstance(minimum_top_points, int)
+            or minimum_top_points < 16):
+        raise ValueError("Support plane needs at least sixteen measured top points")
+    for name, value in (("maximum_depth_m", maximum_depth_m),
+                        ("maximum_tilt_deg", maximum_tilt_deg),
+                        ("maximum_plane_residual_m", maximum_plane_residual_m),
+                        ("top_height_margin_m", top_height_margin_m)):
+        if isinstance(value, bool) or not math.isfinite(value) or value <= 0:
+            raise ValueError(f"{name} must be finite and positive")
+    if maximum_tilt_deg > 1. or maximum_plane_residual_m > .002 or top_height_margin_m > .005:
+        raise ValueError("Support plane and uncertainty limits exceed the release geometry profile")
+    valid = (selected & np.isfinite(capture.depth_m)
+             & (capture.depth_m > 0.) & (capture.depth_m <= maximum_depth_m))
+    rows, cols = np.nonzero(valid)
+    if len(rows) < minimum_top_points:
+        raise ValueError("Support mask has insufficient valid metric depth")
+    points = _project_pixels(
+        u=cols.astype(np.float64), v=rows.astype(np.float64),
+        depth=capture.depth_m[valid].astype(np.float64),
+        intrinsics=capture.intrinsics,
+        reference_from_camera=capture.reference_from_camera)
+    threshold = float(np.quantile(points[:, 2], .8))
+    top = points[points[:, 2] >= threshold - 1e-9]
+    if len(top) < minimum_top_points:
+        raise ValueError("Support top has insufficient measured coverage")
+    centered = top - np.mean(top, axis=0)
+    _, singular, vectors = np.linalg.svd(centered, full_matrices=False)
+    if singular[1] <= 1e-5:
+        raise ValueError("Support top is geometrically degenerate")
+    normal = vectors[-1]
+    if normal[2] < 0:
+        normal = -normal
+    if normal[2] < math.cos(math.radians(maximum_tilt_deg)):
+        raise ValueError("Observed support top is not near-horizontal")
+    residual = np.abs(centered @ normal)
+    max_residual = float(np.quantile(residual, .95))
+    if max_residual > maximum_plane_residual_m:
+        raise ValueError("Observed support top does not fit a stable plane")
+    xy_bounds = np.quantile(top[:, :2], [.05, .95], axis=0)
+    if np.any(xy_bounds[1] <= xy_bounds[0]):
+        raise ValueError("Observed support top has no finite placement region")
+    return ProjectedSupportSurface(
+        source_id=capture.source_id,
+        capture_group_id=capture.capture_group_id,
+        captured_at=capture.captured_at,
+        station_revision=capture.station_revision,
+        depth_content_hash=capture.depth_content_hash,
+        upper_top_z_m=float(np.max(top[:, 2]) + top_height_margin_m),
+        plane_anchor_reference_xyz_m=tuple(float(value) for value in np.mean(top, axis=0)),
+        normal_reference_xyz=tuple(float(value) for value in normal),
+        observed_bounds_min_xy_m=tuple(float(value) for value in xy_bounds[0]),
+        observed_bounds_max_xy_m=tuple(float(value) for value in xy_bounds[1]),
+        maximum_plane_residual_m=max_residual, top_point_count=len(top))
 
 
 def project_depth_mask_geometry(

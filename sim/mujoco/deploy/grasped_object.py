@@ -56,21 +56,31 @@ class MujocoGraspedObjectObserver:
     """
 
     def __init__(self, *, rig, object_body_name, sensor_geom_names, support_body_names,
-                 gripper_name, command_state, world_tcp_from_scene, track_close_contacts=False):
+                 gripper_name, command_state, world_tcp_from_scene, track_close_contacts=False,
+                 contact_verified_close=False, gripper_settled=None):
         self.rig = rig
         self.object_body_name = object_body_name
         self.sensor_geom_names = tuple(sensor_geom_names)
         self.support_body_names = tuple(support_body_names)
+        if len(set(self.support_body_names)) != len(self.support_body_names):
+            raise ValueError("Object supports must have unique native identities.")
         self.gripper_name = gripper_name
         self.command_state = command_state
         self.world_tcp_from_scene = world_tcp_from_scene
         if type(track_close_contacts) is not bool:
             raise TypeError("Contact tracking must be explicitly boolean.")
         self.track_close_contacts = track_close_contacts
+        if type(contact_verified_close) is not bool or (
+            contact_verified_close and not callable(gripper_settled)
+        ):
+            raise ValueError("Contact-verified close requires an explicit settled gripper producer.")
+        self.contact_verified_close = contact_verified_close
+        self.gripper_settled = gripper_settled
         if (len(self.sensor_geom_names) != 2 or len(set(self.sensor_geom_names)) != 2
                 or not self.support_body_names or not callable(command_state)
                 or not callable(world_tcp_from_scene)):
             raise ValueError("Object observation requires two sensors, supports and measured callbacks.")
+        self._active_support_body_name = self.support_body_names[0]
         self._generation = None
         self._anchor = None
         self._initial_z = self._initial_tcp_z = None
@@ -85,6 +95,28 @@ class MujocoGraspedObjectObserver:
         self._last_physics_cut_time = None
         self._release_window = None
 
+    def measured_closed(self, measured):
+        """Keep the legacy floor unless the deployed hand has settled target contact."""
+        return bool(
+            np.isfinite(measured) and (
+                measured >= .05 or (
+                    self.contact_verified_close and measured > 0.
+                    and (self._anchor is not None or self.gripper_settled())
+                )
+            )
+        )
+
+    def _can_establish_relation(self, measured):
+        """Freeze a target-bound grasp only after its close actuator has settled.
+
+        A small object can pass the legacy 0.05 aperture threshold while the
+        fingers are still moving. That reading alone is not the target-bound
+        close receipt and must not start the immutable following window.
+        """
+        if self.contact_verified_close:
+            return bool(np.isfinite(measured) and measured > 0. and self.gripper_settled())
+        return self.measured_closed(measured)
+
     def _reset_generation(self, generation, target):
         # Opening revokes the grasp as before. Only a previously verified grasp
         # arms release diagnostics; initial open/closed commands are not proof.
@@ -95,6 +127,10 @@ class MujocoGraspedObjectObserver:
             position_tolerance_m=.002, rotation_tolerance_rad=.05))
             if released_verified_grasp else None)
         self._generation = generation
+        # Preserve the selected place support across opening so the release
+        # window cannot call a fall onto the table a supported placement.
+        if target == 1.:
+            self._active_support_body_name = self.support_body_names[0]
         self._anchor = self._last = self._window_start = None
         self._verified = False
         self._window_count = 0
@@ -102,7 +138,11 @@ class MujocoGraspedObjectObserver:
         self._tracking_phase = None
         self._last_physics_cut_time = None
 
-    def _capture(self, scene, source_data=None):
+    @property
+    def active_support_body_name(self):
+        return self._active_support_body_name
+
+    def _capture(self, scene, source_data=None, *, support_body_name=None):
         model, mj = scene.model, scene.mujoco
         if self._scratch is None:
             self._scratch, self._model = mj.MjData(model), model
@@ -119,7 +159,10 @@ class MujocoGraspedObjectObserver:
             raise ValueError("Object observation has nonfinite native state.")
         body = int(model.body(self.object_body_name).id)
         sensors = tuple(int(model.geom(name).id) for name in self.sensor_geom_names)
-        supports = {int(model.body(name).id) for name in self.support_body_names}
+        selected_support = self._active_support_body_name if support_body_name is None else support_body_name
+        if selected_support not in self.support_body_names:
+            raise ValueError("Object support is not in the deployed allowlist.")
+        supports = {int(model.body(selected_support).id)}
         target_geoms = set(np.flatnonzero((model.geom_bodyid == body)
                            & ((model.geom_contype != 0) | (model.geom_conaffinity != 0))).tolist())
         touching = set()
@@ -139,14 +182,20 @@ class MujocoGraspedObjectObserver:
                 supported, other, float(view.get_gripper_close(self.gripper_name)),
                 tuple(float(value) for value in data.xipos[body]))
 
-    def observe(self, *, phase, establish=False, source_data=None):
+    def observe(self, *, phase, establish=False, source_data=None, place_support_body_name=None):
         """Consume a same-cut measurement. A new close is not a grasp proof."""
         if phase not in {"lift", "carry", "place"}:
             raise ValueError("Object observation requires a lift, carry or place phase.")
+        if place_support_body_name is not None and (
+            phase != "place" or place_support_body_name not in self.support_body_names
+        ):
+            raise ObjectMotionPreconditionError("Place support is not an admitted object identity.")
         return self.rig.capture_scene(lambda scene: self._observe(
-            scene, phase=phase, establish=establish, source_data=source_data))
+            scene, phase=phase, establish=establish, source_data=source_data,
+            place_support_body_name=place_support_body_name))
 
-    def _observe(self, scene, *, phase, establish=False, source_data=None):
+    def _observe(self, scene, *, phase, establish=False, source_data=None,
+                 place_support_body_name=None):
         # State updates and native capture share the original physics-owner lock.
         at_physics_cut = (source_data is not None and scene is not None
                           and source_data is scene.data)
@@ -156,8 +205,18 @@ class MujocoGraspedObjectObserver:
         if self._failure is not None:
             raise ObjectRelationInvalidated("Object relation invalidated: " + self._failure)
         try:
-            stamp, obj, tcp, sides, support, other, measured, com = self._capture(scene, source_data)
-            if target != 1.0 or not np.isfinite(measured) or measured < .05:
+            selected = ({} if place_support_body_name is None else
+                        {"support_body_name": place_support_body_name})
+            stamp, obj, tcp, sides, support, other, measured, com = self._capture(
+                scene, source_data, **selected)
+            if (self._anchor is None and self.contact_verified_close and establish
+                    and phase == "lift" and target == 1.0 and np.isfinite(measured)
+                    and 0. <= measured <= 1. and not self.gripper_settled()):
+                # An early explicit lift must not poison a close that has not
+                # finished. Once anchored, missing contacts still latch below.
+                raise ObjectMotionPreconditionError(
+                    "Target-bound close must settle before the lift relation is frozen.")
+            if target != 1.0 or not self.measured_closed(measured):
                 raise ObjectRelationInvalidated("Actual closed command and measured closure are required.")
             if support and phase == "carry" and not self._verified:
                 raise ObjectMotionPreconditionError("Carry requires an unsupported verified lift first.")
@@ -184,6 +243,8 @@ class MujocoGraspedObjectObserver:
             if self._anchor is None:
                 if not establish or phase != "lift":
                     raise ObjectMotionPreconditionError("A new grasp must first establish the measured lift relation.")
+                if not self._can_establish_relation(measured):
+                    raise ObjectMotionPreconditionError("Target-bound close must settle before the lift relation is frozen.")
                 self._anchor = relative
                 self._initial_z, self._initial_tcp_z = com[2], float(tcp[2, 3])
             slip, angle = pose_delta_metrics(self._anchor, relative)
@@ -219,6 +280,8 @@ class MujocoGraspedObjectObserver:
                 self._tracking_phase = phase
             if at_physics_cut:
                 self._last_physics_cut_time = stamp
+                if phase == "place" and place_support_body_name is not None:
+                    self._active_support_body_name = place_support_body_name
             return self._last
         except ObjectMotionPreconditionError:
             raise
@@ -253,7 +316,7 @@ class MujocoGraspedObjectObserver:
             if not self.track_close_contacts or target != 1.:
                 return
             _, _, _, sides, support, other, measured, _ = self._capture(scene)
-            if all(sides) and support and not other and np.isfinite(measured) and measured >= .05:
+            if all(sides) and support and not other and self._can_establish_relation(measured):
                 try:
                     self._observe(scene, phase="lift", establish=True, source_data=scene.data)
                 except ObjectRelationInvalidated:
@@ -307,7 +370,7 @@ class MujocoGraspedObjectObserver:
                            else pose_delta_metrics(self._anchor, relative))
             command_matches = generation == self._generation and target == 1.0
             relation_valid = bool(
-                command_matches and np.isfinite(measured) and measured >= .05
+                command_matches and self.measured_closed(measured)
                 and self._anchor is not None and slip <= .003 and angle <= 2.0
                 and all(sides) and not other and self._failure is None)
             fresh = age is not None and age <= .05 + 1e-9

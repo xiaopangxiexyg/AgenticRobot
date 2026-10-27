@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
+from scipy.spatial.transform import Rotation
 
 from robot_motion.action import BIMANUAL_EE_POSE_V1, RobotAction
 from robot_motion.path_planning import JointConfigurationCheck
@@ -175,6 +176,15 @@ def test_support_requires_explicit_bounded_identity_direction_region(changes):
         _support(**changes)
 
 
+def test_fixed_support_keeps_its_original_serialized_identity():
+    assert set(_support().to_payload()) == {
+        "geom_names", "normal_world", "region_min_world", "region_max_world",
+        "phase", "max_penetration_m", "lateral_tolerance_m",
+    }
+    with pytest.raises(ValueError, match="both body identity and frozen pose"):
+        _support(dynamic_body_name="support")
+
+
 @pytest.mark.integration
 def test_payload_query_requires_exact_binding_cut_and_rejects_contact_policy_mix():
     scene = _scene()
@@ -326,6 +336,185 @@ def test_mocap_driven_body_cannot_be_declared_a_fixed_support():
     scene = _scene(table=True, table_shape="box", table_mocap=True)
     with pytest.raises(ValueError, match="fixed, not mocap-driven"):
         _binding(scene, support=_support())
+
+
+@pytest.mark.integration
+def test_other_free_box_support_is_frozen_and_movement_revokes_placement():
+    scene = _scene(extra='''<body name="support" pos=".08 0 .355"><freejoint/>
+      <geom name="support_geom" type="box" size=".1 .08 .03" mass=".4"
+        contype="8" conaffinity="15"/></body>''')
+    support = _support(
+        geom_names=("support_geom",), phase="place",
+        region_min_world=(-.02, -.08, .385),
+        region_max_world=(.18, .08, .385),
+        dynamic_body_name="support",
+        frozen_pose_xyz_quat_xyzw=tuple(pose_matrix_to_xyzquat(
+            _pose(scene.data, scene.model, "support"))),
+    )
+    binding = _binding(scene, support=support)
+    oracle = _oracle(scene, binding)
+    assert oracle.check(_pair(oracle, z=.02)).safe
+    assert binding.check_measured(scene).safe
+    address = int(scene.model.jnt_qposadr[scene.model.body_jntadr[scene.model.body("support").id]])
+    scene.data.qpos[address] += .004
+    scene.mujoco.mj_kinematics(scene.model, scene.data)
+    scene.mujoco.mj_collision(scene.model, scene.data)
+    # The historical planning cut remains immutable; the live measured guard
+    # must reject the support's actual movement before another dispatch.
+    assert oracle.check(_pair(oracle, z=.02)).safe
+    rejected = binding.check_measured(scene)
+    assert not rejected.safe and rejected.metadata["pair_class"] == "payload_support_moved"
+
+
+@pytest.mark.integration
+def test_tilted_free_support_tracks_its_face_inside_the_existing_motion_limit():
+    scene = _scene(extra='''<body name="support" pos=".08 0 .355"><freejoint/>
+      <geom name="support_geom" type="box" size=".1 .08 .03" mass=".4"
+        contype="8" conaffinity="15"/></body>''')
+    model, data = scene.model, scene.data
+    body = int(model.body("support").id)
+    address = int(model.jnt_qposadr[model.body_jntadr[body]])
+    data.qpos[scene.joint_qpos_addr("right_z")] += .06
+    payload_body = int(model.body("payload").id)
+    payload_address = int(model.jnt_qposadr[model.body_jntadr[payload_body]])
+    data.qpos[payload_address + 2] += .06
+
+    def orient(degrees):
+        quaternion = Rotation.from_euler("y", degrees, degrees=True).as_quat()
+        data.qpos[address + 3:address + 7] = [quaternion[3], *quaternion[:3]]
+        scene.mujoco.mj_kinematics(model, data)
+        scene.mujoco.mj_collision(model, data)
+
+    orient(.2)
+    geom = int(model.geom("support_geom").id)
+    rotation = data.geom_xmat[geom].reshape(3, 3)
+    normal = tuple(rotation[:, 2])
+    top = np.asarray([(x, y, model.geom_size[geom, 2])
+                      for x in (-model.geom_size[geom, 0], model.geom_size[geom, 0])
+                      for y in (-model.geom_size[geom, 1], model.geom_size[geom, 1])])
+    top = top @ rotation.T + data.geom_xpos[geom]
+    support = _support(
+        geom_names=("support_geom",), phase="place", normal_world=normal,
+        region_min_world=tuple(top.min(axis=0)),
+        region_max_world=tuple(top.max(axis=0)),
+        dynamic_body_name="support",
+        frozen_pose_xyz_quat_xyzw=tuple(pose_matrix_to_xyzquat(
+            _pose(data, model, "support"))),
+    )
+    binding = _binding(scene, support=support)
+    assert binding.check_measured(scene).safe
+    orient(.3)
+    # A 0.1-degree motion moves the same allowed face without changing the
+    # 3mm/2deg support-motion guard or the 1mm contact penetration limit.
+    assert binding.check_measured(scene).safe
+    orient(3.)
+    rejected = binding.check_measured(scene)
+    assert not rejected.safe and rejected.metadata["pair_class"] == "payload_support_moved"
+
+
+@pytest.mark.integration
+def test_rotated_free_support_does_not_expand_a_narrow_contact_region():
+    scene = _scene(extra='''<body name="support" pos=".08 0 .355"><freejoint/>
+      <geom name="support_geom" type="box" size=".1 .08 .03" mass=".4"
+        contype="8" conaffinity="15"/></body>''')
+    model, data = scene.model, scene.data
+    support = _support(
+        geom_names=("support_geom",), phase="place",
+        region_min_world=(.0299, -.016, .385),
+        region_max_world=(.1301, .016, .385),
+        dynamic_body_name="support",
+        frozen_pose_xyz_quat_xyzw=tuple(pose_matrix_to_xyzquat(
+            _pose(data, model, "support"))),
+    )
+    binding = _binding(scene, support=support)
+    oracle = binding.contact_oracle(scene)
+    payload_geom = int(model.geom("payload_geom").id)
+    support_geom = int(model.geom("support_geom").id)
+    assert oracle._support_allowed(data, payload_geom, support_geom, measured=True)
+
+    body = int(model.body("support").id)
+    address = int(model.jnt_qposadr[model.body_jntadr[body]])
+    quaternion = Rotation.from_euler("z", 1., degrees=True).as_quat()
+    data.qpos[address + 3:address + 7] = [quaternion[3], *quaternion[:3]]
+    scene.mujoco.mj_kinematics(model, data)
+    scene.mujoco.mj_collision(model, data)
+    # The source rectangle turns with the support. An axis-aligned enclosure
+    # of its rotated corners would admit this still-unrotated payload edge.
+    old_world_aabb_max_x = .08 + .0501 * math.cos(math.radians(1.)) + .016 * math.sin(math.radians(1.))
+    assert old_world_aabb_max_x > .13
+    assert not oracle._support_allowed(data, payload_geom, support_geom, measured=True)
+
+
+@pytest.mark.integration
+def test_free_support_near_contact_retains_one_millimetre_hard_penetration():
+    scene = _scene(extra='''<body name="support" pos=".08 0 .355"><freejoint/>
+      <geom name="support_geom" type="box" size=".1 .08 .03" mass=".4"
+        contype="8" conaffinity="15"/></body>''')
+    model, data = scene.model, scene.data
+    support = _support(
+        geom_names=("support_geom",), phase="place",
+        region_min_world=(-.02, -.08, .385),
+        region_max_world=(.18, .08, .385),
+        dynamic_body_name="support",
+        frozen_pose_xyz_quat_xyzw=tuple(pose_matrix_to_xyzquat(
+            _pose(data, model, "support"))),
+    )
+    binding = _binding(scene, support=support)
+    oracle = binding.contact_oracle(scene)
+    payload_geom = int(model.geom("payload_geom").id)
+    support_geom = int(model.geom("support_geom").id)
+    address = int(model.jnt_qposadr[model.body_jntadr[int(model.body("payload").id)]])
+    initial_z = float(data.qpos[address + 2])
+    for penetration, accepted in ((.0009, True), (.0011, False)):
+        data.qpos[address + 2] = initial_z - penetration
+        scene.mujoco.mj_kinematics(model, data)
+        assert oracle._support_allowed(data, payload_geom, support_geom, measured=True) is accepted
+
+
+@pytest.mark.integration
+def test_free_support_place_plan_stops_if_support_moves_before_dispatch(monkeypatch):
+    scene = _scene(extra='''<body name="support" pos=".08 0 .355"><freejoint/>
+      <geom name="support_geom" type="box" size=".1 .08 .03" mass=".4"
+        contype="8" conaffinity="15"/></body>''')
+    model = scene.model
+    scene.data.qpos[scene.joint_qpos_addr("right_z")] += .06
+    payload_address = int(model.jnt_qposadr[model.body_jntadr[model.body("payload").id]])
+    scene.data.qpos[payload_address + 2] += .06
+    scene.mujoco.mj_kinematics(model, scene.data)
+    scene.mujoco.mj_collision(model, scene.data)
+    support = _support(
+        geom_names=("support_geom",), phase="place",
+        region_min_world=(-.02, -.08, .385),
+        region_max_world=(.18, .08, .385),
+        dynamic_body_name="support",
+        frozen_pose_xyz_quat_xyzw=tuple(pose_matrix_to_xyzquat(
+            _pose(scene.data, model, "support"))),
+    )
+    binding = _binding(scene, support=support)
+    planner, installed = _planner(scene, monkeypatch)
+    plan = _plan(planner, binding, z=0.)
+    assert plan.reference_poses and installed["oracle"] is None
+    planner.activate(plan)
+    assert installed["oracle"] is binding.contact_oracle(scene)
+    planner._reference_index = len(plan.reference_poses) - 1
+    assert planner.resolve(_action(planner, plan.reference_poses[-1])) is not None
+    support_address = int(model.jnt_qposadr[model.body_jntadr[model.body("support").id]])
+    scene.data.qpos[support_address] += .004
+    scene.mujoco.mj_kinematics(model, scene.data)
+    scene.mujoco.mj_collision(model, scene.data)
+    with pytest.raises(motion.MujocoTcpPlanRejected, match="payload_measured_blocked"):
+        planner.resolve(_action(planner, plan.reference_poses[-1]))
+    planner.clear()
+    assert installed["oracle"] is None
+
+
+@pytest.mark.integration
+def test_free_support_cannot_be_used_as_a_fixed_table_exception():
+    scene = _scene(extra='''<body name="support" pos=".08 0 .355"><freejoint/>
+      <geom name="support_geom" type="box" size=".1 .08 .03" mass=".4"
+        contype="8" conaffinity="15"/></body>''')
+    with pytest.raises(ValueError, match="fixed native environment"):
+        _binding(scene, support=_support(geom_names=("support_geom",)))
 
 
 @pytest.mark.integration
@@ -990,3 +1179,43 @@ def test_payload_timestep_change_invalidates_active_guard_without_dispatch(monke
     np.testing.assert_array_equal(scene.data.qpos, before)
     assert installed["oracle"] is binding._measured_oracle
     planner.clear()
+
+
+@pytest.mark.integration
+def test_payload_candidate_selection_keeps_one_guarded_plan_without_motion(monkeypatch):
+    scene = _scene(table=True)
+    binding = _binding(scene, support=_support())
+    planner, installed = _planner(scene, monkeypatch)
+    before = (scene.data.qpos.copy(), scene.data.qvel.copy(), float(scene.data.time))
+    goals = [(0., 0., .43, 0., 0., 0., 1.)] * 2
+    selection = planner.plan_candidates(
+        goals, translation_tolerance_m=.001, rotation_tolerance_rad=.01,
+        cancel_requested=lambda: False, payload_binding=binding,
+        time_budget_sec=8., path_search_time_budget_sec=3.)
+    assert selection.candidate_index == 0 and selection.all_candidates_checked
+    assert selection.plan.payload_binding is binding
+    assert planner.owns_pending_plan(selection.plan)
+    assert installed["oracle"] is None and not planner.active
+    np.testing.assert_array_equal(scene.data.qpos, before[0])
+    np.testing.assert_array_equal(scene.data.qvel, before[1])
+    assert float(scene.data.time) == before[2]
+    planner.activate(selection.plan)
+    assert installed["oracle"] is binding.contact_oracle(scene)
+    planner.clear()
+    assert installed["oracle"] is None
+    with pytest.raises(TypeError, match="MujocoPayloadBinding"):
+        planner.plan_candidates(goals, translation_tolerance_m=.001,
+            rotation_tolerance_rad=.01, cancel_requested=lambda: False,
+            payload_binding=True)
+    with pytest.raises(ValueError, match="full guarded plans"):
+        planner.plan_candidates(goals, translation_tolerance_m=.001,
+            rotation_tolerance_rad=.01, cancel_requested=lambda: False,
+            payload_binding=binding, prioritize_current_seed=True)
+    frozen = motion.MujocoPlannedTcpMotion(
+        rig=planner.rig, task_config=planner.task_config,
+        pose_projector=planner.pose_projector, reference_hz=planner.reference_hz,
+        motion_side="right", source_model_qpos=scene.data.qpos.copy())
+    with pytest.raises(ValueError, match="live owned planner"):
+        frozen.plan_candidates(goals, translation_tolerance_m=.001,
+            rotation_tolerance_rad=.01, cancel_requested=lambda: False,
+            payload_binding=binding)

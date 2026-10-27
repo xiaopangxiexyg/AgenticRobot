@@ -12,7 +12,8 @@ from sim.mujoco.transforms import pose_to_xyz_quat_xyzw
 
 
 class MujocoObjectStateSource:
-    def __init__(self, *, application, profile, contact_binding, gripper_port=None):
+    def __init__(self, *, application, profile, contact_binding, gripper_port=None,
+                 additional_support_body_names=()):
         if profile.observation_source != "mujoco_native_physics":
             raise ValueError("Native object source requires its explicit observation identity")
         if profile.release_supported != (gripper_port is not None):
@@ -29,6 +30,10 @@ class MujocoObjectStateSource:
         self._model = application.scene.model
         self._body = int(self._model.body(profile.object_id).id)
         self._support = int(self._model.body(application.task_config.table_body_name).id)
+        additional_support_body_names = tuple(additional_support_body_names)
+        if (len(set(additional_support_body_names)) != len(additional_support_body_names)
+                or application.task_config.table_body_name in additional_support_body_names):
+            raise ValueError("Additional object supports must have distinct native identities.")
         self._sensors = {int(self._model.geom(name).id) for name in contact_binding.sensor_geom_names}
         self._target_geoms = set(np.flatnonzero((self._model.geom_bodyid == self._body)
             & ((self._model.geom_contype != 0) | (self._model.geom_conaffinity != 0))).tolist())
@@ -53,10 +58,13 @@ class MujocoObjectStateSource:
             self._follow = MujocoGraspedObjectObserver(
                 rig=rig, object_body_name=profile.object_id,
                 sensor_geom_names=contact_binding.sensor_geom_names,
-                support_body_names=(application.task_config.table_body_name,),
+                support_body_names=(application.task_config.table_body_name,
+                                    *additional_support_body_names),
                 gripper_name=gripper_port.gripper_name,
                 command_state=lambda: rig.latest_gripper_command(gripper_port.gripper_name),
-                world_tcp_from_scene=world_tcp, track_close_contacts=True)
+                world_tcp_from_scene=world_tcp, track_close_contacts=True,
+                contact_verified_close=gripper_port.target_contact_binding is not None,
+                gripper_settled=gripper_port.target_command_settled)
             rig.set_physics_step_observer(self._follow.observe_physics_step)
 
     @property
@@ -94,14 +102,19 @@ class MujocoObjectStateSource:
                     touching.add(second)
                 elif second in self._target_geoms and first not in self._target_geoms:
                     touching.add(first)
+            selected_support = (
+                self._support if self._follow is None else
+                int(model.body(self._follow.active_support_body_name).id)
+            )
             return {
                 "measured_at": float(data.time), "cutoff_at": float(data.time),
                 "pose_xyz_quat_xyzw": list(pose_to_xyz_quat_xyzw(public_from_world @ world_pose)),
                 "linear_velocity_xyz_m_s": (public_from_world[:3, :3] @ jacp @ data.qvel).tolist(),
                 "angular_velocity_xyz_rad_s": (public_from_world[:3, :3] @ jacr @ data.qvel).tolist(),
-                "support_contact": any(int(model.geom_bodyid[g]) == self._support for g in touching),
+                "support_contact": any(int(model.geom_bodyid[g]) == selected_support for g in touching),
                 "gripper_contact": any(g in self._sensors for g in touching),
-                "other_contact": any(g not in self._sensors and int(model.geom_bodyid[g]) != self._support for g in touching),
+                "other_contact": any(g not in self._sensors and int(model.geom_bodyid[g]) != selected_support
+                                     for g in touching),
                 "release_observation": (None if self._follow is None else
                     self._follow.release_snapshot()),
             }
