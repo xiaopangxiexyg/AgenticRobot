@@ -55,7 +55,7 @@ fresh checks.
   `runner preflight` and `transfer exchange-run`; its availability grants no
   request, device, motion, or arbitrary-command authority.
 - Protected Harness deployment: `remote_harness_deploy.sh`; requires an exact
-  commit authorized by the deployment owner and a fresh Harness plan; grants
+  commit explicitly authorized by the deployment owner and a fresh Harness plan; grants
   no project command, device or motion authority.
 - Before either protected Harness wrapper, read `codex_remote/README.md` section
   `3.1 远端受保护 Harness`. Resolve site identity, exchange roots, and key paths
