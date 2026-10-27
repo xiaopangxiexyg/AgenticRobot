@@ -106,6 +106,17 @@ class MujocoGraspedObjectObserver:
             )
         )
 
+    def _can_establish_relation(self, measured):
+        """Freeze a target-bound grasp only after its close actuator has settled.
+
+        A small object can pass the legacy 0.05 aperture threshold while the
+        fingers are still moving. That reading alone is not the target-bound
+        close receipt and must not start the immutable following window.
+        """
+        if self.contact_verified_close:
+            return bool(np.isfinite(measured) and measured > 0. and self.gripper_settled())
+        return self.measured_closed(measured)
+
     def _reset_generation(self, generation, target):
         # Opening revokes the grasp as before. Only a previously verified grasp
         # arms release diagnostics; initial open/closed commands are not proof.
@@ -225,6 +236,8 @@ class MujocoGraspedObjectObserver:
             if self._anchor is None:
                 if not establish or phase != "lift":
                     raise ObjectMotionPreconditionError("A new grasp must first establish the measured lift relation.")
+                if not self._can_establish_relation(measured):
+                    raise ObjectMotionPreconditionError("Target-bound close must settle before the lift relation is frozen.")
                 self._anchor = relative
                 self._initial_z, self._initial_tcp_z = com[2], float(tcp[2, 3])
             slip, angle = pose_delta_metrics(self._anchor, relative)
@@ -296,7 +309,7 @@ class MujocoGraspedObjectObserver:
             if not self.track_close_contacts or target != 1.:
                 return
             _, _, _, sides, support, other, measured, _ = self._capture(scene)
-            if all(sides) and support and not other and self.measured_closed(measured):
+            if all(sides) and support and not other and self._can_establish_relation(measured):
                 try:
                     self._observe(scene, phase="lift", establish=True, source_data=scene.data)
                 except ObjectRelationInvalidated:

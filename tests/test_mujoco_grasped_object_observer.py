@@ -36,11 +36,16 @@ def _observer(*, track_close_contacts=False, contact_verified_close=False):
     return plant, observer
 
 
-def test_contact_verified_close_waits_for_settled_hand_before_freezing_relation():
+@pytest.mark.parametrize("measured", [.045, .2])
+def test_contact_verified_close_waits_for_settled_hand_before_freezing_relation(measured):
     plant, observer = _observer(track_close_contacts=True, contact_verified_close=True)
-    plant.measured, plant.settled = .045, False
+    plant.measured, plant.settled = measured, False
     _physics_observation(plant, observer)
     assert observer.latest is None
+    plant.time, plant.sides = .005, (False, True)
+    _physics_observation(plant, observer)
+    assert observer._anchor is None and observer._failure is None
+    plant.sides = (True, True)
     plant.time, plant.settled = .01, True
     _physics_observation(plant, observer)
     assert observer.latest is not None
@@ -50,6 +55,23 @@ def test_contact_verified_close_waits_for_settled_hand_before_freezing_relation(
     _physics_observation(plant, observer)
     assert observer._failure is not None
     np.testing.assert_array_equal(observer.latest.tool_from_object, frozen)
+
+
+def test_target_bound_explicit_lift_cannot_freeze_a_moving_close():
+    plant, observer = _observer(track_close_contacts=True, contact_verified_close=True)
+    plant.measured, plant.settled = .2, False
+    with pytest.raises(ObjectMotionPreconditionError, match="must settle"):
+        observer.observe(phase="lift", establish=True)
+    assert observer.latest is None and observer._anchor is None and observer._failure is None
+    plant.settled = True
+    assert observer.observe(phase="lift", establish=True).status == "contact_secured"
+
+
+def test_unbound_close_retains_legacy_aperture_establishment():
+    plant, observer = _observer(track_close_contacts=True, contact_verified_close=False)
+    plant.measured, plant.settled = .2, False
+    _physics_observation(plant, observer)
+    assert observer.latest is not None and observer.latest.status == "contact_secured"
 
 
 def test_selected_object_support_does_not_count_a_table_fall_as_release():
