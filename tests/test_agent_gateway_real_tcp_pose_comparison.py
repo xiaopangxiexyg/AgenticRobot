@@ -430,7 +430,7 @@ def test_rm65_composition_to_factory_chain_keeps_safe_owner_and_starts_no_device
 @pytest.mark.parametrize("enabled", [False, True])
 def test_cli_flag_reaches_composition_before_any_real_resource_start(monkeypatch, short_unix_socket_path_factory, enabled):
     parser = gateway_cli.build_parser()
-    assert parser.get_default("enable_tcp_pose_comparison") is False
+    assert parser.get_default("enable_tcp_pose_comparison") is True
     lower = object(); captured = {}
     monkeypatch.setattr(gateway_cli, "resolve_exclusive_rm65_skill_deployment_profile",
                         lambda profile: SimpleNamespace(semantic_content_hash="a" * 64))
@@ -441,7 +441,7 @@ def test_cli_flag_reaches_composition_before_any_real_resource_start(monkeypatch
     monkeypatch.setattr(gateway_cli, "assemble_exclusive_rm65_agent_primitive_composition", stop_before_start)
     args = _argv(confirmation=REAL_AGENT_PRIMITIVE_SESSION_CONFIRM_TOKEN,
                  socket_path=short_unix_socket_path_factory("offline-comparison"))
-    if enabled: args.append("--enable-tcp-pose-comparison")
+    args.append("--enable-tcp-pose-comparison" if enabled else "--no-enable-tcp-pose-comparison")
     with pytest.raises(RuntimeError, match="offline composition boundary"):
         gateway_cli.main(args)
     assert captured["lower"] is lower
