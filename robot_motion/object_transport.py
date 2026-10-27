@@ -353,7 +353,51 @@ class ReleaseApproachProposal:
         object.__setattr__(self, "tool_goal", rigid_pose(self.tool_goal, name="release tool goal"))
 
 
-def plan_release_approach(
+def _oriented_box_offsets(held: GraspedObjectObservation,
+                          object_rotation: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    box = held.object_from_box
+    half = np.asarray(held.box_size_m, dtype=float) / 2.
+    corners_box = np.asarray(tuple(product((-1., 1.), repeat=3)), dtype=float) * half
+    corners_object = corners_box @ box[:3, :3].T + box[:3, 3]
+    offsets = corners_object @ object_rotation.T
+    return offsets, offsets.min(axis=0), offsets.max(axis=0), object_rotation @ box[:3, 3]
+
+
+def _release_approach_at_box_center(
+    held: GraspedObjectObservation,
+    support: SupportSurfaceObservation,
+    *,
+    object_rotation: np.ndarray,
+    box_center_xy_m: np.ndarray,
+    clearance_m: float,
+    lateral_margin_m: float,
+) -> ReleaseApproachProposal:
+    offsets, low, high, object_center_offset = _oriented_box_offsets(held, object_rotation)
+    object_goal = held.reference_from_object.copy()
+    object_goal[:3, :3] = object_rotation
+    object_goal[:2, 3] = box_center_xy_m - object_center_offset[:2]
+    normal = np.asarray(support.normal_reference_xyz)
+    support_center_xy = (np.asarray(support.region_min_xy_m)
+                         + support.region_max_xy_m) / 2.
+    corner_xy = object_goal[:2, 3] + offsets[:, :2]
+    signed_without_object_z = ((corner_xy - support_center_xy) @ normal[:2]
+                               + (offsets[:, 2] - support.top_z_m) * normal[2])
+    object_goal[2, 3] = (clearance_m - float(np.min(signed_without_object_z))) / normal[2]
+    footprint_min = object_goal[:2, 3] + low[:2]
+    footprint_max = object_goal[:2, 3] + high[:2]
+    if (np.any(footprint_min < np.asarray(support.region_min_xy_m) + lateral_margin_m)
+            or np.any(footprint_max > np.asarray(support.region_max_xy_m) - lateral_margin_m)):
+        raise ValueError("Complete held footprint does not fit on the selected support")
+    object_goal = rigid_pose(object_goal, name="support-relative release object goal")
+    return ReleaseApproachProposal(
+        support_id=support.support_id, reference_frame_id=held.reference_frame_id,
+        object_goal=object_goal, tool_goal=held.tool_goal(object_goal),
+        release_clearance_m=float(clearance_m),
+        evidence_refs=(held.pose_evidence_ref, held.grasp_evidence_ref, support.evidence_ref),
+    )
+
+
+def _require_release_observations(
     held: GraspedObjectObservation,
     support: SupportSurfaceObservation,
     *,
@@ -364,14 +408,7 @@ def plan_release_approach(
     maximum_measurement_age_sec: float = .2,
     maximum_pair_skew_sec: float = .05,
     lateral_margin_m: float = 0.,
-    target_box_center_xy_m: tuple[float, float] | None = None,
-) -> ReleaseApproachProposal:
-    """Center a fully bounded held box above a measured support without contact.
-
-    The release pose preserves the observed object orientation and hand-object
-    relation. The support surface and object box must be complete observations;
-    no segmentation-visible top face is promoted into an unseen object bottom.
-    """
+) -> None:
     if not isinstance(held, GraspedObjectObservation) or not isinstance(support, SupportSurfaceObservation):
         raise TypeError("Release planning needs typed held-object and support observations")
     if held.object_id == support.support_id:
@@ -397,13 +434,36 @@ def plan_release_approach(
            or abs(held.measured_at - stamp) > maximum_pair_skew_sec
            for stamp in support_times):
         raise ValueError("Held object and support require fresh correlated observations")
-    box = held.object_from_box
-    half = np.asarray(held.box_size_m, dtype=float) / 2.
-    corners_box = np.asarray(tuple(product((-1., 1.), repeat=3)), dtype=float) * half
-    corners_object = corners_box @ box[:3, :3].T + box[:3, 3]
+
+
+def plan_release_approach(
+    held: GraspedObjectObservation,
+    support: SupportSurfaceObservation,
+    *,
+    now: float,
+    clearance_m: float,
+    minimum_planning_clearance_m: float,
+    maximum_clearance_m: float,
+    maximum_measurement_age_sec: float = .2,
+    maximum_pair_skew_sec: float = .05,
+    lateral_margin_m: float = 0.,
+    target_box_center_xy_m: tuple[float, float] | None = None,
+) -> ReleaseApproachProposal:
+    """Center a fully bounded held box above a measured support without contact.
+
+    The release pose preserves the observed object orientation and hand-object
+    relation. The support surface and object box must be complete observations;
+    no segmentation-visible top face is promoted into an unseen object bottom.
+    """
+    _require_release_observations(
+        held, support, now=now, clearance_m=clearance_m,
+        minimum_planning_clearance_m=minimum_planning_clearance_m,
+        maximum_clearance_m=maximum_clearance_m,
+        maximum_measurement_age_sec=maximum_measurement_age_sec,
+        maximum_pair_skew_sec=maximum_pair_skew_sec,
+        lateral_margin_m=lateral_margin_m,
+    )
     rotation = held.reference_from_object[:3, :3]
-    offsets = corners_object @ rotation.T
-    low, high = offsets.min(axis=0), offsets.max(axis=0)
     support_center_xy = (np.asarray(support.region_min_xy_m)
                          + support.region_max_xy_m) / 2.
     if target_box_center_xy_m is None:
@@ -416,28 +476,10 @@ def plan_release_approach(
         center_xy = np.asarray(target_box_center_xy_m, dtype=float)
         if center_xy.shape != (2,) or not np.isfinite(center_xy).all():
             raise ValueError("Target box center must be finite Station XY")
-    # Align the complete box center, not an arbitrary object-frame origin.
-    object_center_offset = rotation @ box[:3, 3]
-    object_goal = held.reference_from_object.copy()
-    object_goal[:2, 3] = center_xy - object_center_offset[:2]
-    normal = np.asarray(support.normal_reference_xyz)
-    # The support plane crosses (center_x, center_y, top_z_m). Solve the
-    # minimum signed distance of every rotated box corner, including slope.
-    corner_xy = object_goal[:2, 3] + offsets[:, :2]
-    signed_without_object_z = ((corner_xy - support_center_xy) @ normal[:2]
-                               + (offsets[:, 2] - support.top_z_m) * normal[2])
-    object_goal[2, 3] = (clearance_m - float(np.min(signed_without_object_z))) / normal[2]
-    footprint_min = object_goal[:2, 3] + low[:2]
-    footprint_max = object_goal[:2, 3] + high[:2]
-    if (np.any(footprint_min < np.asarray(support.region_min_xy_m) + lateral_margin_m)
-            or np.any(footprint_max > np.asarray(support.region_max_xy_m) - lateral_margin_m)):
-        raise ValueError("Complete held footprint does not fit on the selected support")
-    object_goal = rigid_pose(object_goal, name="support-relative release object goal")
-    return ReleaseApproachProposal(
-        support_id=support.support_id, reference_frame_id=held.reference_frame_id,
-        object_goal=object_goal, tool_goal=held.tool_goal(object_goal),
-        release_clearance_m=float(clearance_m),
-        evidence_refs=(held.pose_evidence_ref, held.grasp_evidence_ref, support.evidence_ref),
+    return _release_approach_at_box_center(
+        held, support, object_rotation=rotation,
+        box_center_xy_m=center_xy, clearance_m=clearance_m,
+        lateral_margin_m=lateral_margin_m,
     )
 
 
@@ -501,6 +543,88 @@ def plan_release_approach_for_relation(
         maximum_pair_skew_sec=maximum_pair_skew_sec,
         target_box_center_xy_m=tuple(float(value) for value in target_center),
     )
+
+
+@dataclass(frozen=True)
+class ReleaseApproachCandidate:
+    """One measured-geometry proposal, not an IK, path or execution certificate."""
+
+    box_center_xy_m: tuple[float, float]
+    yaw_offset_rad: float
+    proposal: ReleaseApproachProposal
+
+
+def plan_release_approach_candidates(
+    held: GraspedObjectObservation,
+    support: SupportSurfaceObservation,
+    *,
+    now: float,
+    clearance_m: float,
+    minimum_planning_clearance_m: float,
+    maximum_clearance_m: float,
+    lateral_margin_m: float = 0.,
+    maximum_measurement_age_sec: float = .05,
+    maximum_pair_skew_sec: float = .05,
+    allow_quarter_turns: bool = False,
+) -> tuple[ReleaseApproachCandidate, ...]:
+    """Bounded on-support proposals for the existing payload-safe planner.
+
+    When it fits, the current-orientation center remains first. Four interior
+    corners expose room for IK without asking an Agent to copy coordinates.
+    Quarter turns are opt-in because a task may require the observed orientation. No
+    candidate is an authority to move, and the selected support must be
+    observed again when execution starts.
+    """
+    if type(allow_quarter_turns) is not bool:
+        raise TypeError("Quarter-turn sampling must be explicitly boolean")
+    _require_release_observations(
+        held, support, now=now, clearance_m=clearance_m,
+        minimum_planning_clearance_m=minimum_planning_clearance_m,
+        maximum_clearance_m=maximum_clearance_m,
+        maximum_measurement_age_sec=maximum_measurement_age_sec,
+        maximum_pair_skew_sec=maximum_pair_skew_sec,
+        lateral_margin_m=lateral_margin_m,
+    )
+    center = (np.asarray(support.region_min_xy_m)
+              + support.region_max_xy_m) / 2.
+    candidates = []
+    angles = (0., -math.pi / 2., math.pi / 2., math.pi) if allow_quarter_turns else (0.,)
+    fractions = ((0., 0.), (.85, .85), (.85, -.85), (-.85, .85), (-.85, -.85))
+    for angle in angles:
+        z_rotation = np.array([
+            [math.cos(angle), -math.sin(angle), 0.],
+            [math.sin(angle), math.cos(angle), 0.],
+            [0., 0., 1.],
+        ])
+        rotation = z_rotation @ held.reference_from_object[:3, :3]
+        _, low, high, center_offset = _oriented_box_offsets(held, rotation)
+        feasible_min = np.asarray(support.region_min_xy_m) + lateral_margin_m - low[:2] + center_offset[:2]
+        feasible_max = np.asarray(support.region_max_xy_m) - lateral_margin_m - high[:2] + center_offset[:2]
+        if np.any(feasible_min > feasible_max):
+            continue
+        for x_fraction, y_fraction in fractions:
+            fraction = np.array([x_fraction, y_fraction])
+            span = np.where(fraction >= 0., feasible_max-center, center-feasible_min)
+            box_center = center + fraction * span
+            if np.any(box_center < feasible_min) or np.any(box_center > feasible_max):
+                continue
+            proposal = _release_approach_at_box_center(
+                held, support, object_rotation=rotation,
+                box_center_xy_m=box_center,
+                clearance_m=clearance_m,
+                lateral_margin_m=lateral_margin_m,
+            )
+            if any(item.yaw_offset_rad == angle and
+                   np.allclose(item.box_center_xy_m, box_center, atol=1e-12, rtol=0.)
+                   for item in candidates):
+                continue
+            candidates.append(ReleaseApproachCandidate(
+                box_center_xy_m=tuple(float(value) for value in box_center),
+                yaw_offset_rad=angle, proposal=proposal,
+            ))
+    if not candidates:
+        raise ValueError("No complete held footprint fits the selected support")
+    return tuple(candidates)
 
 
 def verify_rigid_follow(previous: GraspedObjectObservation, current: GraspedObjectObservation,

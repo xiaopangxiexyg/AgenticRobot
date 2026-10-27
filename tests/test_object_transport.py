@@ -11,6 +11,7 @@ from robot_motion.object_transport import (
     SupportSurfaceObservation,
     object_translation_feedback_tool_goal,
     plan_release_approach,
+    plan_release_approach_candidates,
     plan_release_approach_for_relation,
     tool_goal_from_object_goal,
     verify_rigid_follow,
@@ -429,6 +430,102 @@ def test_named_support_relation_rejects_ambiguous_or_unavailable_region():
     with pytest.raises(ValueError, match="fresh correlated observations"):
         plan_release_approach_for_relation(
             held, support(measured_at=9.0), relation="center", **options)
+
+
+def test_release_candidates_keep_one_skill_goal_and_complete_measured_footprints():
+    held = observation(box_size_m=(.035, .035, .035),
+        reference_from_object=pose((-.285, -.02, .0566)),
+        reference_from_tool=pose((-.27, .03, .15)))
+    surface = support(support_id="large_blue_cube", top_z_m=.051,
+        region_min_xy_m=(-.41, -.02), region_max_xy_m=(-.33, .06))
+    options = dict(now=10.02, clearance_m=.006,
+        minimum_planning_clearance_m=.004, maximum_clearance_m=.05,
+        lateral_margin_m=.005)
+    original = plan_release_approach(held, surface, **options)
+    simple = plan_release_approach_candidates(held, surface, **options)
+    assert len(simple) == 5 and all(item.yaw_offset_rad == 0 for item in simple)
+    np.testing.assert_array_equal(simple[0].proposal.object_goal, original.object_goal)
+    expanded = plan_release_approach_candidates(
+        held, surface, allow_quarter_turns=True, **options)
+    assert len(expanded) == 20
+    assert {item.yaw_offset_rad for item in expanded} == {0., -math.pi / 2., math.pi / 2., math.pi}
+    assert any(item.yaw_offset_rad == -math.pi / 2. and
+               np.linalg.norm(np.asarray(item.box_center_xy_m) - [-.355, .035]) < .002
+               for item in expanded)
+    corners = np.asarray([(x, y, z) for x in (-.0175, .0175)
+                          for y in (-.0175, .0175) for z in (-.0175, .0175)])
+    for item in expanded:
+        proposal = item.proposal
+        world = corners @ proposal.object_goal[:3, :3].T + proposal.object_goal[:3, 3]
+        assert np.all(world[:, :2].min(axis=0) >= np.asarray(surface.region_min_xy_m) + .005 - 1e-12)
+        assert np.all(world[:, :2].max(axis=0) <= np.asarray(surface.region_max_xy_m) - .005 + 1e-12)
+        assert world[:, 2].min() - surface.top_z_m == pytest.approx(.006, abs=1e-12)
+        np.testing.assert_allclose(proposal.tool_goal @ held.tool_from_object,
+                                   proposal.object_goal, atol=1e-12)
+        assert proposal.evidence_refs == original.evidence_refs
+
+
+def test_release_candidates_reject_stale_support_and_nonboolean_orientation_policy():
+    held = observation(box_size_m=(.035, .035, .035))
+    options = dict(now=10.02, clearance_m=.006,
+        minimum_planning_clearance_m=.004, maximum_clearance_m=.05)
+    with pytest.raises(ValueError, match="fresh correlated observations"):
+        plan_release_approach_candidates(
+            held, support(measured_at=9.), **options)
+    with pytest.raises(TypeError, match="explicitly boolean"):
+        plan_release_approach_candidates(
+            held, support(), allow_quarter_turns=1, **options)
+    with pytest.raises(TypeError, match="typed held-object and support"):
+        plan_release_approach_candidates(
+            held, object(), **options)
+
+
+def test_release_candidates_can_rotate_a_rectangular_object_onto_narrow_support():
+    held = observation(box_size_m=(.06, .02, .02),
+        reference_from_object=pose((0., 0., .1)),
+        reference_from_tool=pose((0., 0., .2)))
+    surface = support(region_min_xy_m=(-.0175, -.045),
+                      region_max_xy_m=(.0175, .045))
+    options = dict(now=10.02, clearance_m=.006,
+        minimum_planning_clearance_m=.004, maximum_clearance_m=.05,
+        lateral_margin_m=.005)
+    with pytest.raises(ValueError, match="footprint"):
+        plan_release_approach(held, surface, **options)
+    with pytest.raises(ValueError, match="No complete held footprint"):
+        plan_release_approach_candidates(held, surface, **options)
+    candidates = plan_release_approach_candidates(
+        held, surface, allow_quarter_turns=True, **options)
+    assert candidates and {item.yaw_offset_rad for item in candidates} == {
+        -math.pi / 2., math.pi / 2.}
+    assert all(item.proposal.release_clearance_m == .006 for item in candidates)
+
+
+def test_release_candidates_recompute_clearance_after_yaw_for_offset_box():
+    held = observation(box_size_m=(.04, .02, .03),
+        reference_from_object=pose((-.3, 0., .16), (0., 15., 10.)),
+        object_from_box=pose((.008, -.004, .003), (0., 0., 8.)))
+    normal = np.asarray((-.008, .004, math.sqrt(1. - .008**2 - .004**2)))
+    surface = support(top_z_m=.08,
+        normal_reference_xyz=tuple(normal),
+        region_min_xy_m=(-.4, -.1), region_max_xy_m=(-.2, .1))
+    candidates = plan_release_approach_candidates(
+        held, surface, now=10.02, clearance_m=.006,
+        minimum_planning_clearance_m=.004, maximum_clearance_m=.05,
+        lateral_margin_m=.005, allow_quarter_turns=True)
+    assert len(candidates) == 20
+    half = np.asarray(held.box_size_m) / 2.
+    corners = np.asarray([(x, y, z) for x in (-half[0], half[0])
+                          for y in (-half[1], half[1]) for z in (-half[2], half[2])])
+    support_center = (np.asarray(surface.region_min_xy_m)
+                      + surface.region_max_xy_m) / 2.
+    plane_anchor = np.array([*support_center, surface.top_z_m])
+    for candidate in candidates:
+        world_box = candidate.proposal.object_goal @ held.object_from_box
+        np.testing.assert_allclose(world_box[:2, 3], candidate.box_center_xy_m, atol=1e-12)
+        world_corners = corners @ world_box[:3, :3].T + world_box[:3, 3]
+        assert np.min((world_corners - plane_anchor) @ normal) == pytest.approx(.006, abs=1e-12)
+        assert np.all(world_corners[:, :2].min(axis=0) >= np.asarray(surface.region_min_xy_m) + .005 - 1e-12)
+        assert np.all(world_corners[:, :2].max(axis=0) <= np.asarray(surface.region_max_xy_m) - .005 + 1e-12)
 
 
 def test_offcenter_release_uses_support_plane_anchor_not_target_center():
