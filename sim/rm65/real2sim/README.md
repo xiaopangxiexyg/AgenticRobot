@@ -92,7 +92,16 @@ core and MuJoCo adapter used for the 20260721 fit; tests compare those hashes to
 fixed historical values rather than silently reinterpreting the fit against
 the current files.
 
-当前 Agent/MuJoCo 提案过期清理与 measured 私有 cut 复用使用独立绑定
+当前 MuJoCo 显式指定支撑体释放使用独立绑定
+`artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261028_named_release_v1.json`。
+继承163项输入并更新11项，新增公开夹爪定义，合计164项输入／161项Python源码，
+固定于 `88db4d1db3c3`；夹爪、事务回滚、观察器、CLI及合同消费者479通过。
+`--enable-named-release-v3` 显式启用，v1/v2默认及真机／仿真15秒上限保留；
+同一rig锁内排队、提交支撑身份及失败回滚复用原owner。完成开爪后仍需独立观察
+原0.6秒释放窗口，源native场景真值诊断不等于Agent任务资格。完整组合门禁另行记录，
+旧绑定、fit、timing和held-out资格不变。
+
+前驱 Agent/MuJoCo 提案过期清理与 measured 私有 cut 复用使用独立绑定
 `artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261028_agent_proposal_cut_v1.json`。
 它继承163项输入／160项Python源码，仅更新factory、target和payload三个既有owner，
 固定于 `4de2591b3c48`；当前cut、过期/HOLD及checkpoint消费者验收373通过。
