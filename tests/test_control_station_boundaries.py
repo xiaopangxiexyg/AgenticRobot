@@ -258,6 +258,9 @@ def test_gateway_sim_dependencies_are_confined_to_mujoco_profile() -> None:
         "agent_gateway/profiles/mujoco/grasp_deployment.py": ["sim"],
         "agent_gateway/profiles/mujoco/grasp_fast_plan.py": ["sim"],
         "agent_gateway/profiles/mujoco/grasp_observation.py": ["sim"],
+        "agent_gateway/profiles/mujoco/gripper_skill.py": ["sim"],
+        "agent_gateway/profiles/mujoco/held_box.py": ["sim"],
+        "agent_gateway/profiles/mujoco/support_box.py": ["sim"],
         "agent_gateway/profiles/mujoco/motion_application.py": ["sim"],
         "agent_gateway/profiles/mujoco/motion_deployment.py": ["sim"],
         "agent_gateway/profiles/mujoco/motion_factory.py": ["sim"],
@@ -321,6 +324,8 @@ def test_gateway_numerical_dependencies_are_confined_to_concrete_profiles() -> N
         # perception profiles; Gateway core remains numerical-neutral.
         "agent_gateway/profiles/back_projection.py": ["numpy"],
         "agent_gateway/profiles/mujoco/back_projection.py": ["numpy"],
+        "agent_gateway/profiles/mujoco/held_box.py": ["numpy"],
+        "agent_gateway/profiles/mujoco/support_box.py": ["numpy"],
         "agent_gateway/profiles/mujoco/motion_observed_scene.py": ["numpy"],
         # Candidate actions are constructed only in this concrete motion leaf.
         "agent_gateway/profiles/mujoco/observed_point_motion.py": ["numpy"],
