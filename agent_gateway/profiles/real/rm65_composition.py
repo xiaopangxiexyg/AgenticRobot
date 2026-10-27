@@ -66,7 +66,9 @@ from .grasp_approach_plan import (
 from .gripper_skill import ExclusiveRealGripperResources, RealDmtacGripperControlPort
 from .localization_deployment import (
     RealObjectLocalizationRegistration,
-    build_real_object_localization_registration,
+)
+from agent_gateway.profiles.localization_deployment import (
+    build_object_localization_registration,
 )
 from .localization_gateway import ObjectLocalizationProvider
 from .motion_primitive_profiles import (
@@ -800,7 +802,9 @@ def assemble_exclusive_rm65_agent_primitive_composition(
                 )
             ):
                 raise ValueError("Point-grasp models lack verified profile identity.")
-            localization_registration = build_real_object_localization_registration(
+            localization_registration = build_object_localization_registration(
+                target_kind="real",
+                inference_execution_mode=getattr(object_localizer, "inference_execution_mode", "in_process"),
                 model_profile_id=localization_model_id,
                 model_profile_hash=localization_model_hash,
                 inference_implementation_hash=localizer_hash,

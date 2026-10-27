@@ -112,7 +112,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--enable-object-localization",
         action="store_true",
-        help="enable localization using default SAM2 + Grounding DINO or explicit SAM3 service",
+        help="enable localization using the default SAM3 service or explicitly selected SAM2 + Grounding DINO",
     )
     parser.add_argument(
         "--object-localization-asset-bundle",
@@ -120,13 +120,14 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help=(
             "absolute path to assets/perception/sam2_grounding_dino; required "
-            "when the default SAM2 localization backend is enabled"
+            "when the explicitly selected SAM2 localization backend is enabled"
         ),
     )
     parser.add_argument("--object-localization-device", default="cuda")
     parser.add_argument(
         "--object-localization-backend",
-        choices=("sam2-grounding-dino", "sam3-service"), default="sam2-grounding-dino",
+        choices=("sam2-grounding-dino", "sam3-service"), default="sam3-service",
+        help="localization backend (default: sam3-service); does not enable localization",
     )
     parser.add_argument("--sam3-endpoint", default="http://127.0.0.1:8114")
     parser.add_argument("--sam3-timeout-sec", type=float, default=120.0)
@@ -316,8 +317,6 @@ def main(argv: list[str] | None = None) -> int:
         )
     object_localizer = None
     if args.object_localization_backend == "sam3-service":
-        if not args.enable_object_localization:
-            parser.error("sam3-service requires --enable-object-localization")
         if args.object_localization_asset_bundle is not None:
             parser.error("--object-localization-asset-bundle is invalid with sam3-service")
     if args.enable_object_localization:

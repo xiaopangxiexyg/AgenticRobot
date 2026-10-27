@@ -38,6 +38,7 @@ def test_motion_side_is_explicit_fixed_and_defaults_to_right():
 @pytest.mark.parametrize("unsupported", [
     ["--enable-grippers"],
     ["--enable-fast-grasp"],
+    ["--enable-segmentation"],
     ["--enable-grasp-approach"],
     ["--enable-spatial-goals"],
     ["--enable-rgbd-capture-v3"],
@@ -101,6 +102,7 @@ def test_backend_options_preserve_defaults_and_require_explicit_fast_grasp():
     required = ["--socket-path", "/unused/socket", "--task-config", "/unused/task.json"]
     defaults = parser.parse_args(required)
     assert defaults.sam3_endpoint is None
+    assert defaults.object_localization_backend == "sam3-service"
     assert defaults.graspgenx_planner == "graspmoe"
     assert defaults.graspgenx_mode == "in-process"
     with pytest.raises(SystemExit):
@@ -182,7 +184,7 @@ def test_fast_grasp_sam3_reuses_typed_ports_and_explicit_planner(monkeypatch, tm
 @pytest.mark.parametrize("flags,message", [
     (["--sam3-endpoint", "http://127.0.0.1:8114"], "requires --artifact-root"),
     (["--sam3-endpoint", "http://127.0.0.1:8114", "--segmentation-asset-bundle", "/unused"],
-     "mutually exclusive"),
+     "SAM2 assets require --object-localization-backend sam2-grounding-dino"),
 ])
 def test_sam3_incomplete_graph_fails_before_model_or_simulator_start(monkeypatch, tmp_path, capsys, flags, message):
     def forbidden(**kwargs):
@@ -715,6 +717,7 @@ def test_surface_anchor_v3_dependencies_fail_before_resource_startup(paired_flag
             "--enable-safe-tcp-pose", "--enable-object-goal-queries", "--enable-surface-anchors",
             "--enable-surface-anchor-v2", "--enable-surface-anchor-v3",
             "--artifact-root", "/not-used/artifacts", "--segmentation-asset-bundle", "/not-used/model",
+            "--object-localization-backend", "sam2-grounding-dino",
             "--max-retained-operations", str(retention), *paired_flags])
     assert error.value.code == 2
     assert message in capsys.readouterr().err

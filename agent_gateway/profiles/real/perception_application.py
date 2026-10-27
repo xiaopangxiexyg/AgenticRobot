@@ -15,12 +15,14 @@ from agent_gateway.profiles.segmentation import (
     build_segmentation_registration,
 )
 from agent_gateway.runtime.artifact_store import RecoverableAgentArtifactStore
+from agent_gateway.profiles.localization_deployment import (
+    build_object_localization_registration,
+)
 from agent_gateway.transport.client_bindings import AgentGatewayUnixClientBindings
 from dataset_contracts.canonical_encoding import canonical_content_hash
 
 from .localization_deployment import (
     RealObjectLocalizationRegistration,
-    build_real_object_localization_registration,
 )
 from .localization_gateway import ObjectLocalizationProvider
 from .perception_deployment import (
@@ -341,7 +343,9 @@ def assemble_camera_only_real_perception_composition(
         ).strip()
         if not model_profile_id or not model_profile_hash:
             raise ValueError("object_localizer must expose one verified model_spec.")
-        localization_registration = build_real_object_localization_registration(
+        localization_registration = build_object_localization_registration(
+            target_kind="real", current_mode="real_observe",
+            inference_execution_mode=getattr(object_localizer, "inference_execution_mode", "in_process"),
             model_profile_id=model_profile_id,
             model_profile_hash=model_profile_hash,
             inference_implementation_hash=localizer_hash,

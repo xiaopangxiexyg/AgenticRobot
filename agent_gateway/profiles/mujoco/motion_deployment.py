@@ -1950,6 +1950,7 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
     segmentation_model_profile_id: str | None = None,
     segmentation_model_profile_hash: str | None = None,
     segmentation_inference_implementation_hash: str | None = None,
+    segmentation_inference_execution_mode: str = "in_process",
     enable_segmentation_batch_v2: bool = False,
     enable_segmentation_geometry_v3: bool = False,
     enable_safe_tcp_pose: bool = False,
@@ -2237,6 +2238,7 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
     localization = (
         build_object_localization_registration(
             target_kind="sim", current_mode="sim_active", local_path_enabled=False,
+            inference_execution_mode=segmentation_inference_execution_mode,
             model_profile_id=segmentation_model_profile_id,
             model_profile_hash=segmentation_model_profile_hash,
             inference_implementation_hash=segmentation_inference_implementation_hash,
