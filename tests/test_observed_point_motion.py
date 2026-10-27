@@ -10,6 +10,10 @@ import pytest
 from agent_gateway.profiles.observed_target import resolve_retained_observed_point
 from agent_gateway.protocol.contracts import AgentSkillOperation
 from agent_gateway.skills.motion.observed_point import SKILL_ID, validate_observed_point_parameters
+from agent_gateway.skills.motion.observed_point import (
+    observed_anchor_definition_v2, observed_anchor_schema_v2,
+    validate_observed_anchor_parameters_v2,
+)
 
 pytestmark = pytest.mark.contract
 
@@ -90,7 +94,7 @@ def test_compact_parameters_fail_closed(change):
         validate_observed_point_parameters({**_parameters(), **change}, component_id="right_arm")
 
 
-def make_native_session(tmp_path):
+def make_native_session(tmp_path, *, anchor_v2=False):
     from agent_gateway.profiles.mujoco.motion_factory import (
         MujocoAgentArtifactStorageConfig, build_mujoco_agent_tcp_pose_gateway_session,
         mujoco_agent_tcp_pose_execution_observation_plan_v1)
@@ -99,6 +103,7 @@ def make_native_session(tmp_path):
     from project_paths import resolve_path
     from sim.mujoco.deploy import MujocoSimHILTargetConfig
     from test_agent_gateway_mujoco_safe_tcp_pose import CLIENT
+    from test_agent_gateway_surface_anchor import _AnchorSegmenter
     (tmp_path / "artifacts").mkdir()
     return build_mujoco_agent_tcp_pose_gateway_session(
         target_config=MujocoSimHILTargetConfig(
@@ -108,11 +113,34 @@ def make_native_session(tmp_path):
             execution_observation_plan=mujoco_agent_tcp_pose_execution_observation_plan_v1(),
             exposed_pose_sides=("right",), allow_scripted_task_reset=False),
         allowed_client_ids=(CLIENT,), enable_safe_tcp_pose=True, enable_observed_point_motion=True,
+        enable_anchor_motion_v2=anchor_v2,
+        enable_object_goal_queries=anchor_v2, enable_surface_anchors=anchor_v2,
+        enable_surface_anchor_v2=anchor_v2,
+        segmentation_localizer=_AnchorSegmenter() if anchor_v2 else None,
+        safe_tcp_motion_profile="object_relation" if anchor_v2 else "local_step",
         enable_spatial_goals=True, artifact_storage=MujocoAgentArtifactStorageConfig(root=tmp_path / "artifacts"),
         safe_motion_observation=MujocoObservedSafeMotionConfig(
             robot_urdf_path=resolve_path("assets/realman_dual_arm_inspire_gripper_dmtacm/realman_dual_arm_inspire_gripper_dmtacm.urdf"),
             collision_scene_profile="dual_arm_hand_proxy_dmtac_grasp",
             observation=SafeMotionObservationConfig(roles=("main",))))
+
+
+def test_anchor_motion_v2_contract_has_no_caller_pose_or_source_xyz():
+    profile = SimpleNamespace(component_id="right_arm", reference_frame_id="canonical_station",
+        profile_id="profile:test", semantic_content_hash="a" * 64,
+        workspace_bounds=(-1., 1., -1., 1., -1., 1.))
+    definition = observed_anchor_definition_v2(controlled_component_ids=("right_arm",))
+    schema = observed_anchor_schema_v2(definition=definition, profile=profile)
+    assert (definition.skill_id, definition.skill_version) == (SKILL_ID, "2")
+    assert tuple(schema.parameter_schema["required"]) == (
+        "component_id", "offset_frame", "offset_xyz_m", "surface_anchor_operation_id")
+    for extra in ({"anchor_xyz_m": [0., 0., 0.]},
+                  {"pose_targets_by_component": {}}, {"observation_operation_id": "old"}):
+        with pytest.raises(ValueError):
+            validate_observed_anchor_parameters_v2({"component_id": "right_arm",
+                "surface_anchor_operation_id": "source:anchor", "offset_xyz_m": [0., 0., .08],
+                "offset_frame": "reference", **extra},
+                component_id="right_arm")
 
 
 def call_native(session, adapter, skill, parameters, sequence):
@@ -135,6 +163,8 @@ def test_native_retained_point_relation_moves_then_reuses_the_same_sensor_eviden
     from test_agent_gateway_mujoco_safe_tcp_pose import CLIENT
     session = make_native_session(tmp_path)
     try:
+        assert session.contract_bundle.observed_anchor_contract_v2 is None
+        assert session.observed_anchor_executor_v2 is None
         session.application.start_observation_ready()
         session.start_perception_resources()
         adapter = session.wire_adapter(authenticated_client_id=CLIENT)
@@ -188,3 +218,109 @@ def test_native_retained_point_relation_moves_then_reuses_the_same_sensor_eviden
             "closed": session.application._closed}))
         assert closed.accepted and session.application._closed
         assert receipt is not None and receipt.succeeded and receipt.proves_motion_or_hold and receipt.evidence_refs
+
+
+@pytest.mark.integration
+def test_native_authenticated_anchor_v2_moves_via_original_safe_owner(tmp_path, record_property):
+    from agent_gateway.protocol.contracts import AgentSkillRequest
+    from test_agent_gateway_mujoco_safe_tcp_pose import CLIENT, _request
+
+    session = make_native_session(tmp_path, anchor_v2=True)
+    try:
+        session.application.start_observation_ready()
+        session.start_perception_resources()
+        adapter = session.wire_adapter(authenticated_client_id=CLIENT)
+        snapshot = adapter.get_observation_snapshot()
+        start = snapshot["measurement_summary"]["pose_xyz_quat_xyzw_by_component"]["right_arm"]
+        capture_registration = next(item for item in session.contract_bundle.surface_anchor_registrations
+            if (item.skill.definition.skill_id, item.skill.definition.skill_version) ==
+            ("perception.capture_surface_anchor", "2"))
+        capture_route = capture_registration.entry.route
+        capture_profile = capture_route.allowed_parameter_profiles[0]
+        capture_request = AgentSkillRequest(
+            client_id=CLIENT, request_id="request:anchor:v2", idempotency_key="anchor:v2",
+            client_sequence=0, runtime_session_id=session.contract_bundle.route_manifest.runtime_session_id,
+            skill_route_manifest_hash=session.contract_bundle.route_manifest.semantic_content_hash,
+            expected_station_revision=snapshot["station_revision"],
+            observation_snapshot_id=snapshot["snapshot_id"],
+            skill_id=capture_route.skill_id, skill_version="2",
+            skill_definition_hash=capture_route.skill_definition_hash,
+            route_id=capture_route.route_id, route_version=capture_route.route_version,
+            route_hash=capture_route.semantic_content_hash,
+            deployment_binding_hash=capture_registration.entry.deployment_binding.deployment_binding_hash,
+            parameter_profile_id=capture_profile.parameter_profile_id,
+            parameter_profile_hash=capture_profile.parameter_profile_hash,
+            parameters={"role": "main", "selection_mode": "exact", "target_pixel_uv": [320, 240],
+                        "language_prompt": None, "min_score": .25},
+            requested_mode="sim_active", requested_timeout_ms=capture_route.max_operation_duration_ms,
+        )
+        admitted = session.service.submit_request(
+            request=capture_request, current_station_revision=snapshot["station_revision"])
+        assert admitted.accepted, admitted
+        assert session.service.launch_operation(admitted.operation.operation_id).accepted
+        capture_executor = next(executor for item, executor in zip(
+            session.contract_bundle.surface_anchor_registrations, session.surface_anchor_executors, strict=True)
+            if item is capture_registration)
+        assert capture_executor.wait(admitted.operation.operation_id, timeout_sec=20.)
+        captured = session.service.get_operation(admitted.operation.operation_id)
+        assert captured.execution_outcome == "completed", captured.to_wire()
+        assert session.segmentation_localizer.calls == 0
+        outputs = tuple(binding
+            for binding in captured.output_artifact_bindings if binding.slot_id == "surface_anchor")
+        assert len(outputs) == 1
+        measure = captured.execution_result["measurement"]
+        public_anchor = session.application.transform_tcp_pose_xyzquat(
+            (*measure["world_xyz_m"], 0., 0., 0., 1.),
+            source_frame_id=measure["reference_frame_id"],
+            target_frame_id=session.contract_bundle.motion_profile.reference_frame_id)
+        target = np.asarray(start[:3]) + [0., 0., .03]
+        offset = (target - np.asarray(public_anchor[:3])).tolist()
+
+        route_entry = session.contract_bundle.route_manifest.route(SKILL_ID, "2")
+        route = route_entry.route
+        parameter_profile = route.allowed_parameter_profiles[0]
+        motion = replace(_request(session, adapter, start, sequence=1, skill_id=SKILL_ID),
+            skill_version="2", skill_definition_hash=route.skill_definition_hash,
+            route_id=route.route_id, route_version=route.route_version,
+            route_hash=route.semantic_content_hash,
+            deployment_binding_hash=route_entry.deployment_binding.deployment_binding_hash,
+            parameter_profile_id=parameter_profile.parameter_profile_id,
+            parameter_profile_hash=parameter_profile.parameter_profile_hash,
+            parameters={"component_id": "right_arm",
+                        "surface_anchor_operation_id": captured.operation_id, "offset_xyz_m": offset,
+                        "offset_frame": "reference"},
+            requested_timeout_ms=route.max_operation_duration_ms)
+        result = adapter.submit_skill_request(motion.to_wire())
+        assert result["accepted"], result
+        assert session.wait(timeout_sec=40.)
+        operation = session.service.get_operation(result["operation"]["operation_id"])
+        record_property("anchor_motion", json.dumps(operation.to_wire()))
+        assert operation.execution_outcome == "completed", operation.to_wire()
+        report = operation.execution_result["surface_anchor_report"]
+        assert report["source_operation_id"] == captured.operation_id
+        assert report["anchor_artifact_id"] == outputs[0].artifact.artifact_id
+        assert report["translation_error_m"] < .003
+        np.testing.assert_allclose(report["requested_pose_xyz_quat_xyzw"][:3], target, atol=1e-7)
+        assert not session.application.target.planned_tcp_motion.active
+        fresh = adapter.get_observation_snapshot()
+        without_anchor = replace(motion, request_id="request:anchor:missing",
+            idempotency_key="anchor:missing", client_sequence=2,
+            expected_station_revision=fresh["station_revision"],
+            observation_snapshot_id=fresh["snapshot_id"],
+            parameters={**motion.parameters, "surface_anchor_operation_id": "missing:anchor"})
+        before = float(session.application.scene.data.time)
+        denied = adapter.submit_skill_request(without_anchor.to_wire())
+        assert denied["accepted"], denied
+        assert session.wait(timeout_sec=20.)
+        failed = session.service.get_operation(denied["operation"]["operation_id"])
+        assert failed.execution_outcome == "failed", failed.to_wire()
+        assert failed.progress_summary["lower_hold_confirmed"]
+        assert float(session.application.scene.data.time) == before
+        assert not session.application.target.planned_tcp_motion.active
+    finally:
+        closed = session.close()
+        record_property("anchor_motion_cleanup", json.dumps({
+            "accepted": closed.accepted, "application_closed": session.application._closed,
+            "hold": closed.port_receipt is not None and closed.port_receipt.proves_motion_or_hold}))
+        assert closed.accepted and session.application._closed
+        assert closed.port_receipt is not None and closed.port_receipt.proves_motion_or_hold

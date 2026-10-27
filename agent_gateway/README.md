@@ -1641,6 +1641,20 @@ v2 请求显式填写 `role`、`selection_mode`、`target_pixel_uv`、`language_
 已完成操作的精确输出，且不重采深度。v2 复用会话模型的生命周期与 60 s 只读预算；
 未启用 v2 时原有契约不变。本批发布范围为 MuJoCo，未接入真机动作效果判断。
 
+MuJoCo 会话构造器还可显式启用 `enable_anchor_motion_v2=True`，发布
+`motion.move_to_observed_point@2`。它要求原有 `enable_observed_point_motion` 的
+传感器场景 safe planner，以及 `capture_surface_anchor@2`；默认关闭，当前不由
+`gateway_cli` 命令行发布。上层请求只传同会话已完成 capture 的
+`surface_anchor_operation_id`、`component_id`、`offset_xyz_m` 和
+`offset_frame=reference|tool`，不传点坐标、Artifact 细节或目标 TCP 姿态。
+下层从保留的原 capture 操作取出原始 Artifact，验证内容与来源、当前 Station
+revision 和帧图，读取当前 TCP 并保持其朝向，再经
+原 safe 规划、碰撞、执行和 HOLD/关闭链。保存点是一次实测表面位置，不是物体
+跟踪状态；运动改变 Station revision 后应重新采集锚点。结果分别记录来源、
+请求与实际到达位姿及误差；路径规划或执行完成不能代替抓取成功判定。
+目前仅完成程序化构造的 MuJoCo 原生运动验收；RPent Agent 可见入口和 RealMan
+动作 Route 仍须分别接入与验收。
+
 候选排名可利用已生成 IK 终点的最大关节偏移下界，跳过严格劣于已验证完整路径的候选。
 `safe_tcp_candidate_rank_pruned` 只表示不可能改善当前排名，不表示碰撞或不可达；相同主成本
 不能剪枝。`checked_count/all_candidates_checked` 是候选处理记账，须结合逐项 reason，

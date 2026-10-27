@@ -6,8 +6,12 @@ import math
 
 from agent_gateway.profiles.motion_primitive_resolution import MotionPrimitiveTargetResolution
 from agent_gateway.profiles.observed_target import resolve_retained_observed_point
+from agent_gateway.profiles.surface_anchor import resolve_surface_anchor
 from agent_gateway.runtime.station_operation_worker import StationLifecycleActivationEvidence
-from agent_gateway.skills.motion.observed_point import SKILL_ID, POINT_SEMANTICS, validate_observed_point_parameters
+from agent_gateway.skills.motion.observed_point import (
+    SKILL_ID, POINT_SEMANTICS, validate_observed_anchor_parameters_v2,
+    validate_observed_point_parameters,
+)
 from robot_motion.spatial_goals import compute_spatial_goal
 from robot_motion.pose import pose_delta_metrics
 from robot_motion.relative_action import xyzquat_to_pose_matrix
@@ -88,3 +92,96 @@ class MujocoObservedPointMotionLifecycle(MujocoAgentSafeTcpPoseSkillLifecycle):
             "achieved_pose_xyz_quat_xyzw": list(final), "translation_error_m": translation,
             "rotation_error_rad": math.radians(degrees)}
         return replace(completion, execution_result={**completion.execution_result, "observed_point_report": report})
+
+
+class MujocoAnchorMotionLifecycle(MujocoObservedPointMotionLifecycle):
+    """Reuse the safe motion owner with an authenticated v2 anchor input."""
+
+    def __init__(self, *, store, lookup_operation, capture_registration,
+                 current_station_revision, clock_domain_id, **kwargs):
+        route = kwargs["route"]
+        if (route.skill_id != SKILL_ID or route.skill_version != "2"
+                or kwargs["observed_planning_provider"] is None):
+            raise ValueError("Anchor motion requires its explicit v2 Route and sensor-shaped safe planner.")
+        validate_observed_anchor_parameters_v2(kwargs["request"].parameters,
+                                               component_id=kwargs["motion_profile"].component_id)
+        self._store = store
+        self._lookup_operation = lookup_operation
+        self._capture_registration = capture_registration
+        self._current_station_revision = current_station_revision
+        self._clock_domain_id = clock_domain_id
+        self._source = None
+        self._artifact_id = None
+        MujocoAgentSafeTcpPoseSkillLifecycle.__init__(
+            self, target_resolver=self._resolve_goal, **kwargs)
+
+    def _resolve_goal(self, measured):
+        parameters, profile = self.request.parameters, self.motion_profile
+        operation_id = parameters["surface_anchor_operation_id"]
+        retained = self._lookup_operation(operation_id)
+        if retained is None or retained[0] is None or retained[1] is None:
+            raise ValueError("Surface anchor producer is unavailable; recapture the pixel.")
+        bindings = [binding for binding in retained[1].output_artifact_bindings
+                    if binding.slot_id == "surface_anchor" and binding.ordinal == 0]
+        if len(bindings) != 1:
+            raise ValueError("Surface anchor producer lacks one exact output Artifact.")
+        # The model names only the source operation. Reconstruct the transient
+        # input binding from its retained output, then reuse the common CAS and
+        # producer-authentication boundary without creating another source owner.
+        bound_request = replace(self.request, input_artifact_bindings=(
+            replace(bindings[0], production_receipt_ref=None),))
+        anchor, artifact_id = resolve_surface_anchor(
+            request=bound_request, store=self._store,
+            lookup_operation=self._lookup_operation,
+            capture_registration=self._capture_registration,
+            current_station_revision=self._current_station_revision,
+            clock_domain_id=self._clock_domain_id)
+        if anchor["source_operation_id"] != operation_id:
+            raise ValueError("Surface anchor differs from the requested source operation.")
+        source = anchor["measurement"]
+        graph = self.application.target_frame_profile.frame_graph
+        frame = graph.frame_by_id.get(source["reference_frame_id"])
+        if (frame is None or frame.semantic_content_hash != source["reference_frame_spec_hash"]
+                or source["frame_graph_hash"] != profile.frame_graph_hash):
+            raise ValueError("Surface anchor frame differs from the active calibrated frame graph.")
+        anchor_pose = self.application.transform_tcp_pose_xyzquat(
+            (*source["world_xyz_m"], 0., 0., 0., 1.),
+            source_frame_id=source["reference_frame_id"],
+            target_frame_id=profile.reference_frame_id)
+        current = self.application.transform_tcp_pose_xyzquat(measured,
+            source_frame_id=profile.execution_reference_frame_id,
+            target_frame_id=profile.reference_frame_id)
+        goal = compute_spatial_goal(current_tcp_pose_xyz_quat_xyzw=list(current),
+            anchor_xyz_m=list(anchor_pose[:3]), offset_xyz_m=parameters["offset_xyz_m"],
+            offset_frame=parameters["offset_frame"], orientation_mode="preserve")
+        bounds = profile.workspace_bounds
+        if any(not bounds[2*i] <= goal.pose_xyz_quat_xyzw[i] <= bounds[2*i+1] for i in range(3)):
+            raise ValueError("Surface anchor relation goal is outside the deployed workspace.")
+        self._source, self._artifact_id = anchor, artifact_id
+        target = self.application.transform_tcp_pose_xyzquat(goal.pose_xyz_quat_xyzw,
+            source_frame_id=profile.reference_frame_id,
+            target_frame_id=profile.execution_reference_frame_id)
+        return MotionPrimitiveTargetResolution(target_pose=target, evidence_refs=(
+            "surface-anchor-operation:" + anchor["source_operation_id"],
+            "surface-anchor-request:" + anchor["source_request_hash"],
+            "surface-anchor-artifact:" + artifact_id))
+
+    def _success(self, *, operation, request, final_pose):
+        completion = MujocoAgentSafeTcpPoseSkillLifecycle._success(
+            self, operation=operation, request=request, final_pose=final_pose)
+        final = self.application.transform_tcp_pose_xyzquat(final_pose,
+            source_frame_id=self.motion_profile.execution_reference_frame_id,
+            target_frame_id=self.motion_profile.reference_frame_id)
+        translation, degrees = pose_delta_metrics(xyzquat_to_pose_matrix(final),
+                                                  xyzquat_to_pose_matrix(self.public_target_pose))
+        report = {"source_operation_id": self._source["source_operation_id"],
+            "source_request_hash": self._source["source_request_hash"],
+            "anchor_artifact_id": self._artifact_id,
+            "point_semantics": POINT_SEMANTICS,
+            "reference_frame_id": self.motion_profile.reference_frame_id,
+            "requested_pose_xyz_quat_xyzw": list(self.public_target_pose),
+            "achieved_pose_xyz_quat_xyzw": list(final),
+            "translation_error_m": translation,
+            "rotation_error_rad": math.radians(degrees)}
+        return replace(completion, execution_result={**completion.execution_result,
+                                                     "surface_anchor_report": report})
