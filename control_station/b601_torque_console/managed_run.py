@@ -98,6 +98,65 @@ def _write_new(path, data):
         os.fsync(stream.fileno())
 
 
+class ManagedStartupCleanupPending(RuntimeError):
+    """Keep the denied child identity when its exit could not be confirmed."""
+
+    def __init__(self, process, receipt, cleanup_error):
+        super().__init__(f'managed startup was not released; exit of child {process.pid} is unconfirmed')
+        self.process = process
+        self.receipt = receipt
+        self.cleanup_error = cleanup_error
+
+
+def _launch_after_durable_receipt(command, run, lock, *, revision):
+    """Gate the original owner, without taking over its device or cleanup state."""
+    read_fd, release_fd = os.pipe()
+    process, receipt = None, None
+    release_attempted = False
+    try:
+        command = [*command, '--managed-startup-fd', str(read_fd)]
+        with (run/'management.log').open('x') as log:
+            process = subprocess.Popen(command, cwd=ROOT, stdin=subprocess.DEVNULL,
+                stdout=log, stderr=subprocess.STDOUT, start_new_session=True,
+                pass_fds=(lock.fileno(), read_fd),
+                env={**os.environ, 'PYTHONUNBUFFERED': '1'})
+        os.close(read_fd)
+        read_fd = None
+        start = process_start(process.pid)
+        if not isinstance(start, str) or not start.isdigit():
+            raise ValueError('managed child has no confirmed process identity; startup denied')
+        receipt = {'pid': process.pid, 'start_ticks': start, 'command': command,
+                   'revision': revision, 'run_directory': str(run)}
+        _write_new(run/'process.json', receipt)
+        directory = os.open(run, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+        # From this point management has its durable exact identity. If a
+        # release write has an uncertain outcome, retain that receipt and the
+        # original exception; never kill or claim a device-safe rollback.
+        release_attempted = True
+        if os.write(release_fd, b'G') != 1:
+            raise OSError('managed startup release was not confirmed; inspect the retained process receipt')
+        return receipt
+    except BaseException as error:
+        if release_fd is not None:
+            os.close(release_fd)
+            release_fd = None
+        if process is not None and not release_attempted:
+            try:
+                process.wait(timeout=5)
+            except BaseException as cleanup_error:
+                raise ManagedStartupCleanupPending(process, receipt, cleanup_error) from error
+        raise
+    finally:
+        if read_fd is not None:
+            os.close(read_fd)
+        if release_fd is not None:
+            os.close(release_fd)
+
+
 def prepare(args, run):
     check_revision(args.expected_revision)
     check_idle()
@@ -156,13 +215,7 @@ def launch(args):
         check_channel(preflight['channel'])
         check_idle()
         check_revision(args.expected_revision)
-        with (run/'management.log').open('x') as log:
-            process = subprocess.Popen(command, cwd=ROOT, stdin=subprocess.DEVNULL,
-                stdout=log, stderr=subprocess.STDOUT, start_new_session=True, pass_fds=(lock.fileno(),),
-                env={**os.environ, 'PYTHONUNBUFFERED': '1'})
-        receipt = {'pid': process.pid, 'start_ticks': process_start(process.pid), 'command': command,
-                   'revision': args.expected_revision, 'run_directory': str(run)}
-        _write_new(run/'process.json', receipt)
+        receipt = _launch_after_durable_receipt(command, run, lock, revision=args.expected_revision)
     return {'status': 'STARTED_NOT_YET_ACCEPTED', **receipt}
 
 

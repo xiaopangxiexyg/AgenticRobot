@@ -1,7 +1,10 @@
 """Fake process/transport boundaries; these tests cannot launch the B601 owner."""
 
 import json
+import inspect
 import os
+import select
+import stat
 import subprocess
 import sys
 from pathlib import Path
@@ -30,6 +33,7 @@ def options(tmp_path, **changes):
 def test_fixed_process_recipe_runs_preflight_before_any_detached_owner(tmp_path, monkeypatch, operation, recipe):
     args = options(tmp_path, operation=operation, recipe=recipe)
     calls = []
+    child_reads = []
     monkeypatch.setattr(managed, 'check_revision', lambda sha: calls.append(('revision', sha)))
     monkeypatch.setattr(managed, 'check_idle', lambda: calls.append(('idle',)))
     monkeypatch.setattr(managed, 'check_channel', lambda channel: calls.append(('channel', channel)))
@@ -56,6 +60,9 @@ def test_fixed_process_recipe_runs_preflight_before_any_detached_owner(tmp_path,
         assert kwargs['env']['PYTHONUNBUFFERED'] == '1'
         assert '--preflight-only' not in command
         assert managed.process_start(22) == '100'
+        fd = int(command[command.index('--managed-startup-fd')+1])
+        assert fd in kwargs['pass_fds']
+        child_reads.append(os.dup(fd))  # The fake child owns the inherited pipe.
         calls.append(('launch',))
         return SimpleNamespace(pid=22)
 
@@ -67,12 +74,210 @@ def test_fixed_process_recipe_runs_preflight_before_any_detached_owner(tmp_path,
     assert ('preflight',) in calls
     assert (('launch',) in calls) == (operation == 'start')
     if operation == 'start':
+        assert os.read(child_reads[0], 1) == b'G'
+        os.close(child_reads.pop())
         receipt = json.loads((Path(result['run_directory'])/'process.json').read_text())
         assert receipt['start_ticks'] == '100' and receipt['pid'] == 22
         assert result['status'] == 'STARTED_NOT_YET_ACCEPTED'
     else:
         assert ('channel', 'can0') not in calls
         assert result['can_opened'] is False
+
+
+def _start_inert_pipe_owner(tmp_path, monkeypatch):
+    """Run only the exact gate function, then a marker; no B601 launcher body."""
+    from scripts.hardware import rebot_b601_rs_owner as owner
+    run = tmp_path/'inert-run'
+    run.mkdir()
+    marker = run/'device-path-reached'
+    process = []
+    actual_popen = subprocess.Popen
+    source = inspect.getsource(owner._wait_for_managed_startup_release)
+    code = ('import os, select, stat, sys\nfrom pathlib import Path\n' + source +
+            '\ntry:\n _wait_for_managed_startup_release(int(sys.argv[1]))\n'
+            'except ValueError:\n sys.exit(17)\n'
+            'Path(sys.argv[2]).write_text("released")\n')
+
+    def popen(command, **kwargs):
+        fd = command[command.index('--managed-startup-fd')+1]
+        child = actual_popen([sys.executable, '-c', code, fd, str(marker)], **kwargs)
+        process.append(child)
+        return child
+
+    monkeypatch.setattr(managed.subprocess, 'Popen', popen)
+    return run, marker, process, popen
+
+
+@pytest.mark.parametrize('stage', ['open', 'write', 'flush', 'file-fsync', 'directory-open', 'directory-fsync'])
+def test_receipt_persistence_fault_never_releases_existing_owner(tmp_path, monkeypatch, stage):
+    run, marker, children, _ = _start_inert_pipe_owner(tmp_path, monkeypatch)
+    original_open, original_fsync, original_os_open = Path.open, os.fsync, os.open
+
+    class ReceiptStream:
+        def __init__(self, stream): self.stream = stream
+        def __enter__(self): self.stream.__enter__(); return self
+        def __exit__(self, *args): return self.stream.__exit__(*args)
+        def write(self, data):
+            if stage == 'write': raise OSError('injected receipt write')
+            return self.stream.write(data)
+        def flush(self):
+            if stage == 'flush': raise OSError('injected receipt flush')
+            return self.stream.flush()
+        def fileno(self): return self.stream.fileno()
+
+    def open_receipt(path, *args, **kwargs):
+        if path == run/'process.json' and args and args[0] == 'x':
+            if stage == 'open': raise OSError('injected receipt open')
+            return ReceiptStream(original_open(path, *args, **kwargs))
+        return original_open(path, *args, **kwargs)
+
+    def fsync(fd):
+        directory = stat.S_ISDIR(os.fstat(fd).st_mode)
+        if (stage == 'directory-fsync' and directory) or (stage == 'file-fsync' and not directory):
+            raise OSError('injected receipt fsync')
+        return original_fsync(fd)
+
+    def open_directory(path, *args, **kwargs):
+        if stage == 'directory-open' and Path(path) == run:
+            raise OSError('injected receipt directory open')
+        return original_os_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, 'open', open_receipt)
+    monkeypatch.setattr(managed.os, 'fsync', fsync)
+    monkeypatch.setattr(managed.os, 'open', open_directory)
+    with (run/'lease').open('w') as lock:
+        with pytest.raises(OSError, match='injected receipt'):
+            managed._launch_after_durable_receipt(
+                [sys.executable, str(managed.OWNER), '--torque-console-managed-cycle'],
+                run, lock, revision='a'*40)
+    assert len(children) == 1 and children[0].returncode == 17
+    assert not marker.exists()
+    if stage in {'file-fsync', 'directory-open', 'directory-fsync'}:
+        receipt = json.loads((run/'process.json').read_text())
+        assert receipt['pid'] == children[0].pid and receipt['start_ticks'].isdigit()
+    elif stage == 'open':
+        assert not (run/'process.json').exists()
+
+
+def test_durable_file_and_directory_precede_startup_release(tmp_path, monkeypatch):
+    run, marker, children, _ = _start_inert_pipe_owner(tmp_path, monkeypatch)
+    original_fsync, original_write = os.fsync, os.write
+    synced = []
+
+    def fsync(fd):
+        original_fsync(fd)
+        synced.append('directory' if stat.S_ISDIR(os.fstat(fd).st_mode) else 'file')
+
+    def release(fd, data):
+        assert synced == ['file', 'directory'] and not marker.exists()
+        receipt = json.loads((run/'process.json').read_text())
+        assert receipt['pid'] == children[0].pid
+        return original_write(fd, data)
+
+    monkeypatch.setattr(managed.os, 'fsync', fsync)
+    monkeypatch.setattr(managed.os, 'write', release)
+    with (run/'lease').open('w') as lock:
+        receipt = managed._launch_after_durable_receipt(
+            [sys.executable, str(managed.OWNER), '--torque-console-managed-cycle'],
+            run, lock, revision='a'*40)
+    assert children[0].wait(timeout=5) == 0 and marker.read_text() == 'released'
+    assert receipt['command'][-2] == '--managed-startup-fd'
+
+
+def test_uncertain_popen_result_closes_release_pipe_without_starting_device_path(tmp_path, monkeypatch):
+    run, marker, children, popen = _start_inert_pipe_owner(tmp_path, monkeypatch)
+
+    def uncertain(*args, **kwargs):
+        popen(*args, **kwargs)
+        raise OSError('unknown Popen result')
+
+    monkeypatch.setattr(managed.subprocess, 'Popen', uncertain)
+    with (run/'lease').open('w') as lock:
+        with pytest.raises(OSError, match='unknown Popen result'):
+            managed._launch_after_durable_receipt([], run, lock, revision='a'*40)
+    assert children[0].wait(timeout=5) == 17
+    assert not marker.exists() and not (run/'process.json').exists()
+
+
+def test_uncertain_release_retains_durable_management_and_does_not_kill_child(tmp_path, monkeypatch):
+    run, marker, children, _ = _start_inert_pipe_owner(tmp_path, monkeypatch)
+    original_write = os.write
+
+    def uncertain(fd, data):
+        original_write(fd, data)
+        raise OSError('unknown release result')
+
+    monkeypatch.setattr(managed.os, 'write', uncertain)
+    with (run/'lease').open('w') as lock:
+        with pytest.raises(OSError, match='unknown release result'):
+            managed._launch_after_durable_receipt([], run, lock, revision='a'*40)
+    receipt = json.loads((run/'process.json').read_text())
+    assert receipt['pid'] == children[0].pid
+    assert children[0].wait(timeout=5) == 0 and marker.exists()
+
+
+@pytest.mark.parametrize('value', [None, '', 'not-an-identity'])
+def test_unconfirmed_child_identity_denies_startup(tmp_path, monkeypatch, value):
+    run, marker, children, _ = _start_inert_pipe_owner(tmp_path, monkeypatch)
+    monkeypatch.setattr(managed, 'process_start', lambda pid: value)
+    with (run/'lease').open('w') as lock:
+        with pytest.raises(ValueError, match='no confirmed process identity'):
+            managed._launch_after_durable_receipt([], run, lock, revision='a'*40)
+    assert children[0].returncode == 17 and not marker.exists()
+
+
+def test_denied_child_exit_must_be_confirmed_without_a_kill_fallback(tmp_path, monkeypatch):
+    run = tmp_path/'pending-run'
+    run.mkdir()
+    child = SimpleNamespace(pid=22, wait=lambda timeout: (_ for _ in ()).throw(subprocess.TimeoutExpired('inert', timeout)))
+    monkeypatch.setattr(managed.subprocess, 'Popen', lambda *a, **k: child)
+    monkeypatch.setattr(managed, 'process_start', lambda pid: None)
+    with (run/'lease').open('w') as lock:
+        with pytest.raises(managed.ManagedStartupCleanupPending) as pending:
+            managed._launch_after_durable_receipt([], run, lock, revision='a'*40)
+    assert pending.value.process is child
+    assert isinstance(pending.value.__cause__, ValueError)
+    assert isinstance(pending.value.cleanup_error, subprocess.TimeoutExpired)
+
+
+@pytest.mark.parametrize('token', [b'', b'X', b'G'])
+def test_original_owner_gate_uses_exact_release_and_closes_fd(token):
+    from scripts.hardware import rebot_b601_rs_owner as owner
+    read_fd, write_fd = os.pipe()
+    if token: os.write(write_fd, token)
+    os.close(write_fd)
+    if token == b'G':
+        owner._wait_for_managed_startup_release(read_fd, timeout_sec=0)
+    else:
+        with pytest.raises(ValueError, match='not released'):
+            owner._wait_for_managed_startup_release(read_fd, timeout_sec=0)
+    with pytest.raises(OSError): os.fstat(read_fd)
+
+
+def test_original_owner_gate_timeout_and_file_input_fail_closed(tmp_path):
+    from scripts.hardware import rebot_b601_rs_owner as owner
+    read_fd, write_fd = os.pipe()
+    try:
+        with pytest.raises(ValueError, match='not released'):
+            owner._wait_for_managed_startup_release(read_fd, timeout_sec=0)
+    finally:
+        os.close(write_fd)
+    fd = os.open(tmp_path/'ordinary-file', os.O_CREAT | os.O_RDWR, 0o600)
+    with pytest.raises(ValueError, match='not a file'):
+        owner._wait_for_managed_startup_release(fd, timeout_sec=0)
+
+
+def test_owner_rejects_denied_startup_before_resource_or_probe_work(monkeypatch, capsys):
+    from scripts.hardware import rebot_b601_rs_owner as owner
+    monkeypatch.setattr(owner, '_motorbridge_environment', lambda *a: pytest.fail('denied startup reached resource work'))
+    monkeypatch.setattr(owner, '_run_foreground', lambda *a, **k: pytest.fail('denied startup reached probe'))
+    read_fd, write_fd = os.pipe()
+    os.close(write_fd)
+    with pytest.raises(SystemExit) as error:
+        owner.main(['--allow-motion', '--torque-console-managed-cycle', '--managed-startup-fd', str(read_fd)])
+    assert error.value.code == 2
+    assert 'not released' in capsys.readouterr().err
+    assert owner._parser().parse_args([]).managed_startup_fd is None
 
 
 def test_bad_preflight_cannot_launch_and_runtime_cannot_enter_checkout(tmp_path, monkeypatch):

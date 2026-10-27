@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import argparse
 import os
+import select
+import stat
 import sys
 import tempfile
 from collections.abc import Sequence
@@ -162,6 +164,7 @@ def _parser() -> argparse.ArgumentParser:
                         help="opt-in one-click J3 onset, low-speed and withdrawal acquisition profile")
     parser.add_argument("--torque-console-managed-cycle", action="store_true",
                         help="explicit single workspace start/permit/return; declares clear space and supported origin; no browser required")
+    parser.add_argument("--managed-startup-fd", type=int, help=argparse.SUPPRESS)
     parser.add_argument("--torque-console-command-field-report", type=Path,
                         help="closed native-track command report for explicit experimental workspace field")
     parser.add_argument("--torque-console-command-field-mode", choices=("off", "shadow", "candidate"), default="off")
@@ -824,6 +827,20 @@ def _motorbridge_environment(root: Path | None = None) -> dict[str, str]:
     return overrides
 
 
+def _wait_for_managed_startup_release(fd: int, *, timeout_sec: float = 30.0) -> None:
+    """Wait before any device-capable work; parent death/failed receipt denies entry."""
+    if type(fd) is not int or fd < 3:
+        raise ValueError("managed startup requires a private inherited pipe")
+    try:
+        if not stat.S_ISFIFO(os.fstat(fd).st_mode):
+            raise ValueError("managed startup requires a pipe, not a file")
+        ready, _, _ = select.select([fd], [], [], timeout_sec)
+        if not ready or os.read(fd, 1) != b"G":
+            raise ValueError("managed startup was not released after a durable receipt")
+    finally:
+        os.close(fd)
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     if args.gzip_dynamics_trace:
@@ -899,6 +916,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         _parser().error(
             "--cartesian-assist-confirmation requires --cartesian-assist"
         )
+    if args.managed_startup_fd is not None:
+        if not args.torque_console_managed_cycle or args.preflight_only:
+            _parser().error("managed startup pipe requires an actual managed cycle")
+        try:
+            _wait_for_managed_startup_release(args.managed_startup_fd)
+        except (OSError, ValueError) as exc:
+            _parser().error(str(exc))
     config = Path(args.config).expanduser()
     source_root = Path(args.rebot_source_root).expanduser()
     missing = [
