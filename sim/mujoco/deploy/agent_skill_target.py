@@ -80,6 +80,7 @@ def build_mujoco_agent_skill_motion_target(
     enable_safe_tcp_pose: bool = False,
     safe_tcp_planning_clearance_padding_m: float = 0.002,
     motion_side: str = "right",
+    prune_expired_proposals: bool = False,
     clock: Callable[[], float] = time.monotonic,
     _restore=None,
 ) -> MujocoAgentSkillMotionTarget:
@@ -99,6 +100,8 @@ def build_mujoco_agent_skill_motion_target(
     component_id = motion_side + "_arm"
     if not isinstance(enable_safe_tcp_pose, bool):
         raise TypeError("enable_safe_tcp_pose must be boolean.")
+    if not isinstance(prune_expired_proposals, bool):
+        raise TypeError("prune_expired_proposals must be boolean.")
     if config.allow_scripted_task_reset:
         raise ValueError(
             "Agent Skill motion target requires allow_scripted_task_reset=False."
@@ -392,6 +395,7 @@ def build_mujoco_agent_skill_motion_target(
             producer_epoch=1,
             policy_node_id=config.policy_node_id,
             decision_hz=prepared.compose_target_hz,
+            prune_expired_proposals=prune_expired_proposals,
             reference_activation_profile_id=IMMEDIATE_QREF_SIM_V1,
             selected_segment_max_lifetime_sec=support_horizon_sec,
             proposal_horizon_sec=support_horizon_sec,

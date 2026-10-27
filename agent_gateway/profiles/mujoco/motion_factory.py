@@ -887,6 +887,7 @@ def build_mujoco_agent_tcp_pose_gateway_session(
         enable_safe_tcp_pose=enable_safe_tcp_pose or enable_grasp_approach,
         safe_tcp_planning_clearance_padding_m=safe_tcp_planning_clearance_padding_m,
         motion_side=side,
+        prune_expired_proposals=True,
     )
     runtime_rig_holder["rig"] = target.runtime.rig
     captured_at = float(target.runtime.clock())
