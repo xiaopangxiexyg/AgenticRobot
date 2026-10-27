@@ -87,6 +87,8 @@ from agent_gateway.skills.motion.schemas import (
 )
 from agent_gateway.skills.motion.observed_point import (
     SKILL_ID as OBSERVED_POINT_SKILL_ID, observed_point_definition, observed_point_schema,
+    observed_anchor_definition_v2, observed_anchor_schema_v2,
+    validate_observed_anchor_parameters_v2, validate_observed_anchor_report_v2,
     validate_observed_point_parameters, validate_observed_point_report,
 )
 
@@ -144,6 +146,7 @@ from .state_deployment import MujocoPassiveTcpPoseStateDeploymentBinding
 from .visual_observation import mujoco_rgb_role_for_source
 
 MUJOCO_OBSERVED_POINT_ROUTE_ID = "sim.mujoco.agent_observed_point_safe"
+MUJOCO_OBSERVED_ANCHOR_ROUTE_ID_V2 = "sim.mujoco.agent_observed_anchor_safe.v2"
 MUJOCO_AGENT_SAFE_TCP_POSE_ROUTE_ID_V1 = "sim.mujoco.motion.move_tcp_to_pose_safe.v1"
 MUJOCO_AGENT_SAFE_TCP_POSE_EXECUTOR_ID_V1 = "mujoco-agent-safe-tcp-pose-executor-v1"
 MUJOCO_AGENT_SAFE_TCP_POSE_ROUTE_ID_V2 = "sim.mujoco.motion.move_tcp_to_pose_safe.v2"
@@ -798,6 +801,7 @@ class MujocoAgentTcpPoseContractBundle:
     object_motion_contract: MujocoAgentSafeTcpPoseContract | None = None
     fast_grasp_contract: Any | None = None
     observed_point_contract: MujocoAgentSafeTcpPoseContract | None = None
+    observed_anchor_contract_v2: MujocoAgentSafeTcpPoseContract | None = None
     rgbd_capture: SpatialGoalRegistration | None = None
     segmentation_batch: SegmentationRegistration | None = None
     segmentation_geometry: SegmentationRegistration | None = None
@@ -906,10 +910,16 @@ class MujocoAgentTcpPoseContractBundle:
             if replace(self.safe_tcp_pose_v2_contract.motion_profile,
                     profile_id=baseline.profile_id) != baseline:
                 raise ValueError("Safe TCP v2 must share the exact baseline numeric and geometry profile.")
+        if self.observed_anchor_contract_v2 is not None and not any(
+                item.skill.definition.skill_id == "perception.capture_surface_anchor"
+                and item.skill.definition.skill_version == "2"
+                for item in self.surface_anchor_registrations):
+            raise ValueError("Anchor motion v2 requires its authenticated v2 producer.")
         for skill_id, version, safe in (
             ("motion.move_tcp_to_pose_safe", "1", self.safe_tcp_pose_contract),
             ("motion.move_tcp_to_pose_safe", "2", self.safe_tcp_pose_v2_contract),
             (OBSERVED_POINT_SKILL_ID, "1", self.observed_point_contract),
+            (OBSERVED_POINT_SKILL_ID, "2", self.observed_anchor_contract_v2),
             ("motion.approach_grasp_pose", "1", self.grasp_approach_contract),
             ("motion.approach_grasp_contact", "1", self.grasp_contact_contract),
             (GRASPED_OBJECT_MOVE_SKILL_ID, "1", self.object_motion_contract),
@@ -1400,10 +1410,14 @@ def _motion_validators(
     is_safe_v2 = (route.skill_id == "motion.move_tcp_to_pose_safe" and route.skill_version == "2")
     if is_safe_v2:
         parameter_fields.add("path_constraint")
+    is_anchor_v2 = (route.skill_id == OBSERVED_POINT_SKILL_ID and route.skill_version == "2")
 
     def validate_parameters(payload: Mapping[str, Any]) -> None:
         if route.skill_id == OBSERVED_POINT_SKILL_ID:
-            validate_observed_point_parameters(payload, component_id=profile.component_id)
+            if is_anchor_v2:
+                validate_observed_anchor_parameters_v2(payload, component_id=profile.component_id)
+            else:
+                validate_observed_point_parameters(payload, component_id=profile.component_id)
             return
         if object_id is not None:
             validate_grasped_object_move(payload, profile=profile, object_id=object_id)
@@ -1448,7 +1462,7 @@ def _motion_validators(
         if is_safe_v2:
             required.add("path_constraint_evidence")
         if route.skill_id == OBSERVED_POINT_SKILL_ID:
-            required.add("observed_point_report")
+            required.add("surface_anchor_report" if is_anchor_v2 else "observed_point_report")
         if object_id is not None:
             required.add("object_state")
         optional = {"pose_goal_report"} if route.skill_id == "motion.move_tcp_to_pose_safe" else set()
@@ -1459,7 +1473,12 @@ def _motion_validators(
         if "pose_goal_report" in payload:
             validate_safe_tcp_pose_goal_report_v1(payload["pose_goal_report"])
         if route.skill_id == OBSERVED_POINT_SKILL_ID:
-            validate_observed_point_report(payload["observed_point_report"], reference_frame_id=profile.reference_frame_id)
+            if is_anchor_v2:
+                validate_observed_anchor_report_v2(payload["surface_anchor_report"],
+                                                   reference_frame_id=profile.reference_frame_id)
+            else:
+                validate_observed_point_report(payload["observed_point_report"],
+                                               reference_frame_id=profile.reference_frame_id)
         if object_id is not None:
             validate_object_motion_state(payload["object_state"], profile=profile,
                 object_id=object_id, observation_source="mujoco_native_physics",
@@ -1502,9 +1521,13 @@ def _motion_validators(
                 constraint=parameters["path_constraint"])
             return
         if route.skill_id == OBSERVED_POINT_SKILL_ID:
-            report = result["observed_point_report"]
-            if any(report[key] != parameters[key] for key in ("observation_operation_id", "point_index")):
-                raise ValueError("Observed-point result does not match the requested reference.")
+            report = result["surface_anchor_report" if is_anchor_v2 else "observed_point_report"]
+            if is_anchor_v2:
+                if report["source_operation_id"] != parameters["surface_anchor_operation_id"]:
+                    raise ValueError("Anchor motion result differs from the requested capture operation.")
+            else:
+                if any(report[key] != parameters[key] for key in ("observation_operation_id", "point_index")):
+                    raise ValueError("Observed-point result does not match the requested reference.")
             return
         if result["object_state"]["phase"] != parameters["phase"]:
             raise ValueError("Object terminal phase differs from the admitted request phase.")
@@ -1962,6 +1985,7 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
     region_tcp_continuation_version: str = "4",
     safe_motion_observation_profile_hash: str | None = None,
     enable_observed_point_motion: bool = False,
+    enable_anchor_motion_v2: bool = False,
     enable_spatial_goals: bool = False,
     enable_object_goal_queries: bool = False,
     enable_surface_anchors: bool = False,
@@ -1999,6 +2023,9 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
     if enable_observed_point_motion and (not enable_safe_tcp_pose or not enable_artifact_perception
                                          or safe_motion_observation_profile_hash is None):
         raise ValueError("Observed-point motion requires sensor-backed safe motion and original RGB-D perception.")
+    if type(enable_anchor_motion_v2) is not bool or (enable_anchor_motion_v2
+            and not (enable_observed_point_motion and enable_surface_anchor_v2)):
+        raise ValueError("Anchor motion v2 requires observed safe motion and surface anchor v2.")
     segmentation_identity = (
         segmentation_model_profile_id,
         segmentation_model_profile_hash,
@@ -2421,9 +2448,12 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
     ):
         is_safe_v2 = (motion_definition.skill_id == "motion.move_tcp_to_pose_safe"
                       and motion_definition.skill_version == "2")
+        is_anchor_v2 = (motion_definition.skill_id == OBSERVED_POINT_SKILL_ID
+                        and motion_definition.skill_version == "2")
         schema_builder = (safe_tcp_pose_target_schema_entry_v2 if is_safe_v2
                           else tcp_pose_target_schema_entry_v1)
-        motion_schema = (observed_point_schema(definition=motion_definition, profile=motion_profile)
+        motion_schema = (observed_anchor_schema_v2(definition=motion_definition, profile=motion_profile)
+            if is_anchor_v2 else observed_point_schema(definition=motion_definition, profile=motion_profile)
             if motion_definition.skill_id == OBSERVED_POINT_SKILL_ID else grasped_object_move_schema(
             definition=motion_definition, profile=motion_profile,
             object_id=grasp_contact_binding.target_body_name,
@@ -2496,7 +2526,7 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
         return motion_definition, motion_schema, motion_route, motion_contract
 
     planned_motions = []
-    safe_contract = safe_contract_v2 = grasp_contract = contact_contract = object_contract = observed_point_contract = None
+    safe_contract = safe_contract_v2 = grasp_contract = contact_contract = object_contract = observed_point_contract = observed_anchor_contract_v2 = None
     if enable_safe_tcp_pose:
         local_safe_profile = replace(profile,
             profile_id=("mujoco.agent_safe_tcp_pose.v1" if safe_motion_observation_profile_hash is None
@@ -2876,6 +2906,22 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
                 if item.skill.definition.skill_version == "2"
                 and item.skill.definition.skill_id != "perception.capture_surface_anchor" else item
                 for item in surface_anchor_registrations) + (paired_anchor,)
+
+    if enable_anchor_motion_v2:
+        capture = [item for item in surface_anchor_registrations
+                   if item.skill.definition.skill_id == "perception.capture_surface_anchor"
+                   and item.skill.definition.skill_version == "2"]
+        if len(capture) != 1:
+            raise ValueError("Anchor motion v2 requires one exact surface anchor v2 producer.")
+        item = planned_motion_contract(
+            observed_anchor_definition_v2(controlled_component_ids=(component,)),
+            safe_profile,
+            route_id=MUJOCO_OBSERVED_ANCHOR_ROUTE_ID_V2,
+            executor_id="mujoco-observed-anchor-safe-v2",
+            binding_prefix="sim.mujoco.agent_observed_anchor:", binding_suffix=".v2",
+            duration_ms=safe_limits.max_operation_duration_ms)
+        observed_anchor_contract_v2 = item[3]
+        planned_motions.append(item)
 
     # Use exactly the original passive state identity and freshness validator.
     public_state_exact = {
@@ -3343,6 +3389,7 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
         safe_tcp_pose_contract=safe_contract,
         safe_tcp_pose_v2_contract=safe_contract_v2,
         observed_point_contract=observed_point_contract,
+        observed_anchor_contract_v2=observed_anchor_contract_v2,
         spatial_goal_registration=spatial_goal_registration,
         object_goal_query_registration=object_goal_query_registration,
         tcp_continuation_query_registration=tcp_continuation_query_registration,

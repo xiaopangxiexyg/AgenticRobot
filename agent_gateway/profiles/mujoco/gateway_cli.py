@@ -220,7 +220,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument('--enable-object-goal-queries', action='store_true', help='Expose bounded read-only object-above path queries; requires --enable-safe-tcp-pose.')
     parser.add_argument('--enable-surface-anchors', action='store_true', help='Expose measured-pixel anchor Artifacts and reuse queries; requires Artifact perception and object goal queries.')
-    parser.add_argument('--enable-surface-anchor-v2', action='store_true', help='Also publish explicit exact/mask-interior v2 anchors and matching consumers; requires surface anchors and segmentation.')
+    parser.add_argument('--enable-surface-anchor-v2', action='store_true', help='Also publish explicit exact/mask-interior v2 anchors and matching consumers; requires surface anchors and a SAM3 endpoint or explicit SAM2 bundle.')
     parser.add_argument('--enable-surface-anchor-v3', action='store_true', help='Publish source-bound anchors consuming retained capture_rgb v3 and optional segment v3; requires the explicit v2 family.')
     parser.add_argument('--surface-anchor-selection-policy', choices=('prompt_nearest', 'max_clearance_medoid'), default='prompt_nearest', help='Explicit v2 max-clearance tie profile; default preserves prompt-nearest selection.')
     parser.add_argument('--enable-relation-goal-queries', action='store_true', help='Expose one general anchored relation-path query; requires --enable-surface-anchors.')
@@ -242,6 +242,17 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="also publish collision-aware move_tcp_to_pose_safe using lower-owned joint paths",
     )
+    parser.add_argument('--enable-observed-point-motion', action='store_true',
+        help='Publish the sensor-shaped safe point relation action (sim, explicit observation config).')
+    parser.add_argument('--enable-anchor-motion-v2', action='store_true',
+        help='Also publish capture_surface_anchor@2 operation-reference safe motion.')
+    parser.add_argument('--safe-motion-observation-urdf', type=Path,
+        help='Absolute path to the session robot assembly URDF for observed self filtering.')
+    parser.add_argument('--safe-motion-observation-collision-scene-profile',
+        help='Existing RM65 collision scene profile for observed safe planning.')
+    parser.add_argument('--safe-motion-observation-role', action='append',
+        choices=('main', 'wrist_left', 'wrist_right'),
+        help='Required RGB-D view for observed safe planning; repeat for multiple views.')
     parser.add_argument(
         "--enable-grippers",
         action="store_true",
@@ -611,6 +622,11 @@ def main(argv: list[str] | None = None) -> int:
         or args.enable_surface_anchors
         or args.enable_surface_anchor_v2
         or args.enable_surface_anchor_v3
+        or args.enable_observed_point_motion
+        or args.enable_anchor_motion_v2
+        or args.safe_motion_observation_urdf is not None
+        or args.safe_motion_observation_collision_scene_profile is not None
+        or args.safe_motion_observation_role
         or args.enable_object_localization
         or args.enable_safe_tcp_path_constraints
         or args.enable_tcp_continuation_queries
@@ -660,6 +676,20 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--enable-relation-goal-queries requires --enable-surface-anchors")
     if args.safe_tcp_motion_profile != "local_step" and not args.enable_safe_tcp_pose:
         parser.error("--safe-tcp-motion-profile requires --enable-safe-tcp-pose")
+    if args.enable_anchor_motion_v2 and not (args.enable_observed_point_motion
+            and args.enable_surface_anchor_v2):
+        parser.error("--enable-anchor-motion-v2 requires observed-point motion and surface anchor v2")
+    if args.enable_observed_point_motion:
+        if (not args.enable_safe_tcp_pose or not args.no_realtime_worker
+                or args.artifact_root is None or args.safe_motion_observation_urdf is None
+                or args.safe_motion_observation_collision_scene_profile is None
+                or not args.safe_motion_observation_role):
+            parser.error("--enable-observed-point-motion requires safe TCP, artifact storage, "
+                         "--no-realtime-worker, robot URDF, collision profile and RGB-D role")
+    elif (args.safe_motion_observation_urdf is not None
+            or args.safe_motion_observation_collision_scene_profile is not None
+            or args.safe_motion_observation_role):
+        parser.error("safe motion observation options require --enable-observed-point-motion")
     if args.enable_safe_tcp_path_constraints and not args.enable_safe_tcp_pose:
         parser.error("--enable-safe-tcp-path-constraints requires --enable-safe-tcp-pose")
     if args.enable_tcp_continuation_queries and not args.enable_safe_tcp_path_constraints:
@@ -733,6 +763,23 @@ def main(argv: list[str] | None = None) -> int:
     # instead of making an RPent caller know DexTeleop's repository layout.
     os.chdir(repo_root())
 
+    safe_motion_observation = None
+    if args.enable_observed_point_motion:
+        urdf = _absolute_path(parser, args.safe_motion_observation_urdf,
+                              flag="--safe-motion-observation-urdf")
+        if not urdf.is_file():
+            parser.error("--safe-motion-observation-urdf must be an existing file")
+        from robot_motion.observed_scene import SafeMotionObservationConfig
+        from .motion_observed_scene import MujocoObservedSafeMotionConfig
+        try:
+            safe_motion_observation = MujocoObservedSafeMotionConfig(
+                robot_urdf_path=urdf,
+                collision_scene_profile=args.safe_motion_observation_collision_scene_profile,
+                observation=SafeMotionObservationConfig(
+                    roles=tuple(args.safe_motion_observation_role)))
+        except (OSError, TypeError, ValueError) as error:
+            parser.error(f"invalid safe motion observation configuration: {error}")
+
     if not 0 <= args.safe_tcp_planning_clearance_padding_m < float("inf"):
         parser.error("--safe-tcp-planning-clearance-padding-m must be finite and non-negative")
     if args.enable_grippers and not args.no_realtime_worker:
@@ -766,6 +813,9 @@ def main(argv: list[str] | None = None) -> int:
         segmentation_localizer=segmentation_localizer,
         enable_object_localization=args.enable_object_localization,
         enable_safe_tcp_pose=args.enable_safe_tcp_pose,
+        enable_observed_point_motion=args.enable_observed_point_motion,
+        enable_anchor_motion_v2=args.enable_anchor_motion_v2,
+        safe_motion_observation=safe_motion_observation,
         enable_safe_tcp_path_constraints=args.enable_safe_tcp_path_constraints,
         enable_tcp_continuation_queries=args.enable_tcp_continuation_queries,
         enable_tcp_candidate_artifacts=args.enable_tcp_candidate_artifacts,

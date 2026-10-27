@@ -44,6 +44,8 @@ def test_motion_side_is_explicit_fixed_and_defaults_to_right():
     ["--enable-rgbd-capture-v3"],
     ["--enable-segmentation-batch-v2"],
     ["--enable-segmentation-geometry-v3"],
+    ["--enable-observed-point-motion"],
+    ["--enable-anchor-motion-v2"],
     ["--history-root", "/unused/history"],
     ["--segmentation-asset-bundle", "/unused/segmentation"],
     ["--sam3-endpoint", "http://127.0.0.1:8114"],
@@ -656,6 +658,63 @@ def test_surface_anchor_v2_is_opt_in_and_rejected_before_resource_startup(capsys
                           "--client-id", "test", "--client-uid", str(os.getuid()), "--enable-surface-anchor-v2"])
     assert error.value.code == 2
     assert "--enable-surface-anchor-v2 requires" in capsys.readouterr().err
+
+
+def test_anchor_motion_cli_requires_explicit_sensor_safe_dependencies(capsys):
+    parser = build_parser()
+    assert parser.get_default("enable_anchor_motion_v2") is False
+    assert parser.get_default("enable_observed_point_motion") is False
+    common = ["--socket-path", "/not-used/gateway.sock", "--task-config", "/not-used/task.json"]
+    with pytest.raises(SystemExit) as missing_anchor:
+        gateway_cli.main([*common, "--enable-anchor-motion-v2"])
+    assert missing_anchor.value.code == 2
+    assert "requires observed-point motion and surface anchor v2" in capsys.readouterr().err
+    with pytest.raises(SystemExit) as missing_observation:
+        gateway_cli.main([*common, "--enable-observed-point-motion"])
+    assert missing_observation.value.code == 2
+    assert "requires safe TCP, artifact storage" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("service_flags", [[], ["--sam3-endpoint", "http://127.0.0.1:8114"]])
+def test_anchor_motion_cli_accepts_explicit_sam3_and_sensor_safe_assembly(monkeypatch, tmp_path, service_flags):
+    from deployments.perception.sam3_service import Sam3ServiceLocalizer
+    from agent_gateway.profiles.mujoco.motion_observed_scene import MujocoObservedSafeMotionConfig
+
+    class AssemblyReached(Exception):
+        pass
+
+    received = {}
+
+    def assemble(**kwargs):
+        received.update(kwargs)
+        raise AssemblyReached
+
+    monkeypatch.setattr(gateway_cli, "build_mujoco_agent_tcp_pose_gateway_session", assemble)
+    monkeypatch.setattr(Sam3ServiceLocalizer, "start",
+                        lambda self: pytest.fail("CLI construction cannot start SAM3"))
+    root = gateway_cli.repo_root()
+    task = root / "sim/configs/tasks/rm65_right_dmtacm_blue_cube_70mm_agent_v1.json"
+    urdf = root / "assets/realman_dual_arm_inspire_gripper_dmtacm/realman_dual_arm_inspire_gripper_dmtacm.urdf"
+    artifacts = tmp_path / "artifacts"
+    artifacts.mkdir()
+    with pytest.raises(AssemblyReached):
+        gateway_cli.main(["--socket-path", str(tmp_path / "gateway.sock"),
+            "--task-config", str(task), "--artifact-root", str(artifacts),
+            *service_flags, "--no-realtime-worker",
+            "--enable-safe-tcp-pose", "--safe-tcp-motion-profile", "object_relation",
+            "--enable-object-goal-queries", "--enable-surface-anchors",
+            "--enable-surface-anchor-v2", "--enable-observed-point-motion",
+            "--enable-anchor-motion-v2", "--safe-motion-observation-urdf", str(urdf),
+            "--safe-motion-observation-collision-scene-profile", "dual_arm_hand_proxy_dmtac_grasp",
+            "--safe-motion-observation-role", "main"])
+    assert received["enable_observed_point_motion"] is True
+    assert received["enable_anchor_motion_v2"] is True
+    assert received["enable_surface_anchor_v2"] is True
+    assert isinstance(received["segmentation_localizer"], Sam3ServiceLocalizer)
+    assert not received["segmentation_localizer"].started
+    config = received["safe_motion_observation"]
+    assert isinstance(config, MujocoObservedSafeMotionConfig)
+    assert config.observation.roles == ("main",)
 
 
 def test_surface_selection_profile_is_default_preserving_and_requires_v2_before_startup(capsys):
