@@ -14,7 +14,9 @@ from agent_gateway.profiles.mujoco.motion_factory import (
 from agent_gateway.profiles.mujoco.motion_skill import MujocoAgentSafeTcpPoseSkillLifecycle
 from agent_gateway.skills.motion.grasped_object import (
     GRASPED_OBJECT_MOVE_SKILL_ID, grasped_object_move_definition, grasped_object_move_schema,
-    validate_grasped_object_move, validate_object_motion_state,
+    grasped_object_place_definition_v2, grasped_object_place_schema_v2,
+    validate_grasped_object_move, validate_grasped_object_place_v2,
+    validate_object_motion_state, validate_object_motion_state_v2,
 )
 from project_paths import resolve_path
 from sim.mujoco.deploy import MujocoSimHILTargetConfig
@@ -63,6 +65,38 @@ def test_object_goal_schema_and_validation_keep_exact_object_body_identity():
     parameters["translation_delta_xyz_m"] = [0., 0., .04]
     with pytest.raises(ValueError, match="exact"):
         validate_grasped_object_move(parameters, profile=profile, object_id="debug_cube")
+
+
+@pytest.mark.unit
+def test_object_support_v2_requires_named_place_and_exact_terminal_support():
+    profile = _profile()
+    definition = grasped_object_place_definition_v2(controlled_component_ids=("right_arm",))
+    schema = grasped_object_place_schema_v2(
+        definition=definition, profile=profile, object_id="debug_cube",
+        support_object_ids=("large_blue_cube", "red_box"),
+        observation_source="mujoco_native_physics", clock_domain_id="mujoco-native-physics:test")
+    assert definition.skill_id == GRASPED_OBJECT_MOVE_SKILL_ID and schema.skill_version == "2"
+    assert schema.parameter_schema["properties"]["phase"] == {"const": "place"}
+    parameters = _parameters(profile, phase="place", support_object_id="large_blue_cube")
+    validate_grasped_object_place_v2(parameters, profile=profile, object_id="debug_cube",
+                                      support_object_ids=("large_blue_cube", "red_box"))
+    for change in ({"support_object_id": "foreign"}, {"phase": "lift"}):
+        with pytest.raises(ValueError):
+            validate_grasped_object_place_v2({**parameters, **change}, profile=profile,
+                                              object_id="debug_cube",
+                                              support_object_ids=("large_blue_cube", "red_box"))
+    state = dict(object_id="debug_cube", phase="place", reference_frame_id="station",
+                 pose_xyz_quat_xyzw=[0., 0., .3, 0., 0., 0., 1.], measured_at=0.,
+                 clock_domain_id="mujoco-native-physics:test", holding_verified=True,
+                 support_contact=True, source="mujoco_native_physics",
+                 support_object_id="large_blue_cube")
+    validate_object_motion_state_v2(state, parameters=parameters, profile=profile,
+        object_id="debug_cube", observation_source="mujoco_native_physics",
+        clock_domain_id="mujoco-native-physics:test")
+    with pytest.raises(ValueError, match="terminal support differs"):
+        validate_object_motion_state_v2({**state, "support_object_id": "red_box"},
+            parameters=parameters, profile=profile, object_id="debug_cube",
+            observation_source="mujoco_native_physics", clock_domain_id="mujoco-native-physics:test")
 
 
 @pytest.mark.unit
@@ -130,6 +164,7 @@ def test_object_terminal_hash_input_contains_measured_body_goal_and_native_clock
     lifecycle.deployment_binding = SimpleNamespace(control_domain_id="domain")
     lifecycle.motion_profile = _profile()
     lifecycle._object_id, lifecycle._phase = "debug_cube", "carry"
+    lifecycle._support_object_id = None
     obj = np.eye(4)
     obj[:3, 3] = (.1, .2, .3)
     cut = SimpleNamespace(world_from_object=obj, sim_time_s=2., status="held_verified", support_contact=False)
@@ -152,6 +187,7 @@ def test_object_stage_commits_only_after_plan_activation_on_the_live_cut(monkeyp
     scene = SimpleNamespace(data=object())
     lifecycle = object.__new__(MujocoAgentObjectMotionLifecycle)
     lifecycle._phase = "place"
+    lifecycle._support_object_id = None
     lifecycle.application = SimpleNamespace(runtime=SimpleNamespace(
         rig=SimpleNamespace(capture_scene=lambda callback: callback(scene))))
     lifecycle._object_observer = SimpleNamespace(observe=lambda **kwargs: calls.append(kwargs))
@@ -233,6 +269,121 @@ def test_native_object_route_is_explicit_and_reuses_exact_tick_observer(enabled)
     finally:
         assert session.close().accepted
     assert app.runtime.rig._physics_step_observer is None
+
+
+@pytest.mark.integration
+def test_object_support_v2_is_opt_in_and_reuses_the_same_physics_owner(tmp_path, monkeypatch):
+    from sim.mujoco.scene_suite import materialize_case
+
+    task_path = materialize_case("same_color_sizes", tmp_path / "case")
+    options = dict(
+        target_config=MujocoSimHILTargetConfig(
+            task_config_path=task_path, realtime_worker=False,
+            runtime_session_id=CLIENT, control_domain_id=CLIENT,
+            execution_observation_plan=mujoco_agent_tcp_pose_execution_observation_plan_v1(),
+            exposed_pose_sides=("right",), allow_scripted_task_reset=False),
+        allowed_client_ids=(CLIENT,), enable_grippers=True,
+        enable_grasp_approach=True, grasp_contact_target_body="debug_cube",
+        enable_object_state=True, enable_object_follow_observation=True,
+        enable_object_motion=True)
+    session = build_mujoco_agent_tcp_pose_gateway_session(
+        **options, enable_object_support_motion_v2=True,
+        object_support_body_names=("large_blue_cube", "medium_blue_cube"))
+    try:
+        session.application.start_observation_ready()
+        bundle = session.contract_bundle
+        assert bundle.object_motion_contract is not None
+        assert bundle.object_support_motion_contract_v2 is not None
+        v1_route_hash = bundle.route_manifest.route(GRASPED_OBJECT_MOVE_SKILL_ID, "1").route.semantic_content_hash
+        assert bundle.object_support_body_names == ("large_blue_cube", "medium_blue_cube")
+        assert session.object_observer.support_body_names == (
+            "table", "large_blue_cube", "medium_blue_cube")
+        assert session.application.runtime.rig._physics_step_observer.__self__ is session.object_observer
+        route = bundle.route_manifest.route(GRASPED_OBJECT_MOVE_SKILL_ID, "2")
+        assert route.route.route_version == "2"
+        validator = bundle.payload_validators.validator_for(route.route)
+        profile = bundle.object_support_motion_contract_v2.motion_profile
+        parameters = {**_parameters(profile, phase="place",
+                                   translation_delta_xyz_m=[0., 0., 0.]),
+                      "support_object_id": "large_blue_cube"}
+        validator.validate_parameters(parameters)
+        with pytest.raises(ValueError):
+            validator.validate_parameters({**parameters, "support_object_id": "unbound"})
+        state = dict(object_id="debug_cube", phase="place",
+            reference_frame_id=profile.reference_frame_id,
+            pose_xyz_quat_xyzw=[0., 0., .3, 0., 0., 0., 1.], measured_at=0.,
+            clock_domain_id="mujoco-native-physics:" + CLIENT, holding_verified=True,
+            support_contact=True, source="mujoco_native_physics",
+            support_object_id="large_blue_cube")
+        validator.validate_execution_result_for_parameters(parameters,
+            dict(execution_receipt_refs=["test:hold"], final_measured_state_hash="test:state",
+                 object_state=state))
+        with pytest.raises(ValueError, match="terminal support differs"):
+            validator.validate_execution_result_for_parameters(parameters,
+                dict(execution_receipt_refs=["test:hold"], final_measured_state_hash="test:state",
+                     object_state={**state, "support_object_id": "medium_blue_cube"}))
+        from agent_gateway.profiles.mujoco.object_motion import MujocoAgentObjectMotionLifecycle
+        from sim.mujoco.deploy.payload_motion import MujocoPayloadBinding
+        native = session.application.scene
+        before_qpos = native.data.qpos.copy()
+        before_time = float(native.data.time)
+        captured = {}
+        with monkeypatch.context() as patcher:
+            def capture(_cls, _scene, _data, **kwargs):
+                captured.update(kwargs)
+                return SimpleNamespace(semantic_content_hash="test:frozen-payload")
+            patcher.setattr(MujocoPayloadBinding, "capture", classmethod(capture))
+            lifecycle = object.__new__(MujocoAgentObjectMotionLifecycle)
+            lifecycle.application = session.application
+            lifecycle.motion_profile = profile
+            lifecycle.request = SimpleNamespace(parameters=parameters)
+            lifecycle._phase = "place"
+            lifecycle._object_id = "debug_cube"
+            lifecycle._support_object_id = "large_blue_cube"
+            lifecycle._object_observer = SimpleNamespace(
+                observe=lambda **kwargs: SimpleNamespace(
+                    world_from_object=native.body_pose("debug_cube"),
+                    tool_from_object=np.eye(4), command_generation=1),
+                sensor_geom_names=session.object_observer.sensor_geom_names,
+                gripper_name=session.object_observer.gripper_name,
+                command_state=lambda: (1, 1.),
+                world_tcp_from_scene=lambda view: np.eye(4),
+                measured_closed=lambda value: value > 0.)
+            lifecycle._resolve_object_goal(None)
+        assert captured["support"].dynamic_body_name == "large_blue_cube"
+        assert captured["support"].phase == "place"
+        assert set(captured["support"].geom_names) == {
+            native.model.geom(i).name for i in range(native.model.ngeom)
+            if native.model.geom_bodyid[i] == native.model.body("large_blue_cube").id
+            and (native.model.geom_contype[i] or native.model.geom_conaffinity[i])}
+        np.testing.assert_array_equal(native.data.qpos, before_qpos)
+        assert float(native.data.time) == before_time
+        assert session.application.scene.data.time == 0.
+        from test_agent_gateway_mujoco_tcp_pose_comparison import _request
+        adapter = session.wire_adapter(authenticated_client_id=CLIENT)
+        before = session.application.scene.data.qpos.copy()
+        request = _request(session, adapter, skill_id=GRASPED_OBJECT_MOVE_SKILL_ID,
+                           version="2", parameters=parameters, sequence=0)
+        admitted = adapter.submit_skill_request(request.to_wire())
+        assert admitted["accepted"]
+        assert session.wait(timeout_sec=30.)
+        operation = session.service.get_operation(admitted["operation"]["operation_id"])
+        assert operation.execution_outcome == "failed"
+        assert operation.reason_code == "object_motion_measured_relation_unavailable"
+        assert operation.progress_summary["lower_hold_confirmed"] is True
+        np.testing.assert_array_equal(session.application.scene.data.qpos, before)
+    finally:
+        assert session.close().accepted
+    baseline = build_mujoco_agent_tcp_pose_gateway_session(**options)
+    try:
+        assert baseline.contract_bundle.object_support_motion_contract_v2 is None
+        assert baseline.contract_bundle.route_manifest.route(
+            GRASPED_OBJECT_MOVE_SKILL_ID, "1").route.semantic_content_hash == v1_route_hash
+        with pytest.raises(KeyError):
+            baseline.contract_bundle.route_manifest.route(GRASPED_OBJECT_MOVE_SKILL_ID, "2")
+        baseline.application.start_observation_ready()
+    finally:
+        assert baseline.close().accepted
 
 
 @pytest.mark.integration

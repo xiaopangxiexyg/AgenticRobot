@@ -1548,6 +1548,18 @@ lift/place的支撑接触仅限命名支撑面与其法向走廊；carry不允�
 当前公开装配仍为右臂、确定性物理时钟；下层左右臂planner支持不等于左臂组合已发布。
 本软件接线不表示完整物理抓放或Agent验收已经通过。
 
+若场景明确声明另一个可移动盒体为支撑，可再显式传
+`--enable-object-support-motion-v2 --object-support-body <body>`（可重复），发布
+`motion.move_grasped_object_to_pose@2`。它沿用上面的 v1 前置条件和执行 owner，
+但请求只允许 `phase=place`，必须选择目录中的 `support_object_id`；该身份不能是
+被抓物体，也不能由请求临时发明。v1 同时保留，仍以固定桌面为支撑。v2 用实测
+MuJoCo 支撑盒的完整碰撞几何和冻结姿态规划，执行中支撑偏移超过原 3 mm／2°
+界限即走原 HOLD；最终回执须报告与请求一致的支撑身份和实测接触。张爪之后的
+连续释放观察继续检查*所选支撑*，掉到桌面不能算在该盒上稳定放置。
+此处的支撑 ID 来自已声明场景；尚未绑定 RGB-D/SAM 的物体跟踪引用，亦未发布
+RealMan v2 Route。请求仍需提供公开参考系中的物体目标位姿或增量；因此它是
+受限的仿真放置接口，不能作为任意物体上放置或真机任务成功证据。
+
 该 Route 默认使用 `--safe-tcp-motion-profile local_step`（单次平移 0.10 m、
 旋转 15°）。仿真物体关系目标可显式选择 `--safe-tcp-motion-profile object_relation`，
 同时传入 `--enable-safe-tcp-pose`：该配置允许单次平移 0.50 m、旋转 180°，

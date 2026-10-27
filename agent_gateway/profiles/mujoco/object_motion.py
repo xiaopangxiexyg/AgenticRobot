@@ -37,8 +37,13 @@ class MujocoAgentObjectMotionLifecycle(MujocoAgentSafeTcpPoseSkillLifecycle):
         self._object_terminal = None
         self._phase = kwargs["request"].parameters["phase"]
         self._object_id = kwargs["request"].parameters["object_id"]
+        self._support_object_id = kwargs["request"].parameters.get("support_object_id")
         if self._object_id != object_observer.object_body_name:
             raise ValueError("Object motion differs from the deployed observed object.")
+        if (kwargs["route"].skill_version == "2" and (
+                self._phase != "place" or self._support_object_id not in object_observer.support_body_names[1:]
+        )) or (kwargs["route"].skill_version == "1" and self._support_object_id is not None):
+            raise ValueError("Object support identity differs from the admitted Route.")
         lineage = {name: kwargs["request"].parameters[name] for name in OBJECT_MOVE_LINEAGE_FIELDS}
         super().__init__(target_resolver=self._resolve_object_goal, parameter_lineage=lineage, **kwargs)
 
@@ -51,7 +56,9 @@ class MujocoAgentObjectMotionLifecycle(MujocoAgentSafeTcpPoseSkillLifecycle):
 
     def _resolve_object_goal(self, _measured):
         observer, parameters = self._object_observer, self.request.parameters
-        cut = observer.observe(phase=self._phase, establish=True)
+        support_selection = ({} if self._support_object_id is None else
+                             {"place_support_body_name": self._support_object_id})
+        cut = observer.observe(phase=self._phase, establish=True, **support_selection)
         public_from_world = self._public_from_world()
         current = public_from_world @ cut.world_from_object
         if "translation_delta_xyz_m" in parameters:
@@ -76,8 +83,9 @@ class MujocoAgentObjectMotionLifecycle(MujocoAgentSafeTcpPoseSkillLifecycle):
             support = None
             if self._phase in {"lift", "place"}:
                 model = scene.model
-                table = int(model.body(self.application.task_config.table_body_name).id)
-                geoms = [int(g) for g in np.flatnonzero((model.geom_bodyid == table)
+                support_name = (self._support_object_id or self.application.task_config.table_body_name)
+                support_body = int(model.body(support_name).id)
+                geoms = [int(g) for g in np.flatnonzero((model.geom_bodyid == support_body)
                          & ((model.geom_contype != 0) | (model.geom_conaffinity != 0)))]
                 if not geoms:
                     raise ValueError("Object support stage requires native support geometry.")
@@ -93,7 +101,12 @@ class MujocoAgentObjectMotionLifecycle(MujocoAgentSafeTcpPoseSkillLifecycle):
                 lower[2] = upper[2]
                 support = MujocoPayloadSupport(
                     tuple(model.geom(g).name for g in geoms), (0., 0., 1.), tuple(lower), tuple(upper),
-                    self._phase, scene.collision_projector().policy.hard_penetration_m)
+                    self._phase, scene.collision_projector().policy.hard_penetration_m,
+                    **({} if self._support_object_id is None else {
+                        "dynamic_body_name": support_name,
+                        "frozen_pose_xyz_quat_xyzw": tuple(pose_to_xyz_quat_xyzw(
+                            scene.body_pose(support_name))),
+                    }))
 
             def view(data):
                 result = copy.copy(scene)
@@ -137,7 +150,10 @@ class MujocoAgentObjectMotionLifecycle(MujocoAgentSafeTcpPoseSkillLifecycle):
                 # Commit the stage only after the owned plan and guard were
                 # activated. Scratch preflights do not change tick policy.
                 self.application.runtime.rig.capture_scene(lambda scene:
-                    self._object_observer.observe(phase=self._phase, source_data=scene.data))
+                    self._object_observer.observe(
+                        phase=self._phase, source_data=scene.data,
+                        **({} if self._support_object_id is None else
+                           {"place_support_body_name": self._support_object_id})))
             return evidence
         except (ValueError, MujocoTcpPlanRejected) as error:
             logging.getLogger(__name__).warning("Object motion activation rejected: %s", error)
@@ -180,6 +196,8 @@ class MujocoAgentObjectMotionLifecycle(MujocoAgentSafeTcpPoseSkillLifecycle):
             "holding_verified": cut.status == "held_verified",
             "support_contact": cut.support_contact, "source": "mujoco_native_physics",
         }
+        if self._support_object_id is not None:
+            self._object_terminal["support_object_id"] = self._support_object_id
         return {**super()._terminal_state_evidence(public_final_pose, measured_at),
                 "object_state": self._object_terminal}
 

@@ -27,6 +27,8 @@ def test_motion_side_is_explicit_fixed_and_defaults_to_right():
     assert parser.parse_args(required).motion_side == "right"
     assert parser.parse_args([*required, "--motion-side", "left"]).motion_side == "left"
     assert not parser.parse_args(required).enable_object_follow_observation
+    assert not parser.parse_args(required).enable_object_support_motion_v2
+    assert parser.parse_args(required).object_support_body == []
     assert not parser.parse_args(required).enable_rgbd_capture_v3
     assert parser.parse_args([*required, "--enable-rgbd-capture-v3"]).enable_rgbd_capture_v3
     assert parser.parse_args([*required, "--enable-object-follow-observation"]).enable_object_follow_observation
@@ -52,6 +54,8 @@ def test_motion_side_is_explicit_fixed_and_defaults_to_right():
     ["--segmentation-asset-bundle", "/unused/segmentation"],
     ["--sam3-endpoint", "http://127.0.0.1:8114"],
     ["--grasp-contact-target-body", "cube"],
+    ["--enable-object-support-motion-v2"],
+    ["--object-support-body", "cube"],
 ])
 def test_left_unsupported_combinations_fail_before_resources(monkeypatch, capsys, unsupported):
     def forbidden(*args, **kwargs):
@@ -66,6 +70,22 @@ def test_left_unsupported_combinations_fail_before_resources(monkeypatch, capsys
         ])
     assert captured.value.code == 2
     assert "baseline TCP/state Routes only" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("flags", [
+    ["--enable-object-support-motion-v2"],
+    ["--object-support-body", "large_blue_cube"],
+    ["--enable-object-support-motion-v2", "--object-support-body", "large_blue_cube"],
+])
+def test_object_support_cli_requires_complete_opt_in_before_resources(monkeypatch, capsys, flags):
+    monkeypatch.setattr(gateway_cli, "_absolute_existing_file",
+                        lambda *args, **kwargs: pytest.fail("Invalid support flags reached resources"))
+    with pytest.raises(SystemExit) as captured:
+        gateway_cli.main([
+            "--socket-path", "/unused/socket", "--task-config", "/unused/task.json", *flags,
+        ])
+    assert captured.value.code == 2
+    assert "requires" in capsys.readouterr().err
 
 
 def test_bilateral_grippers_refuse_realtime_physics_before_session_construction(monkeypatch, tmp_path, capsys):
