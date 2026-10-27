@@ -234,7 +234,10 @@ def build_gripper_skill_contract_bundle(
         may_open_publication=False,
         requires_operator_confirmation=binding.target_kind == "real",
         requires_deadman=False,
-        max_operation_duration_ms=5_000,
+        # Deterministic MuJoCo advances one native physics tick per gripper
+        # poll.  A detailed contact scene may need several seconds of wall
+        # time to complete a short physical close.  Keep the real-device bound.
+        max_operation_duration_ms=(15_000 if binding.target_kind == "sim" else 5_000),
         cancellation_policy="hold_on_cancel_disconnect_or_timeout",
         requires_task_evaluation=False,
     )

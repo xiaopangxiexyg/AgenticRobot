@@ -1522,6 +1522,10 @@ physics tick（包括 HOLD），不新增采样线程或 step loop。新闭爪�
 
 ### 显式携物目标（MuJoCo）
 
+确定性 MuJoCo 夹爪逐物理步轮询的公开操作期限为 15 秒墙钟；真机仍为 5 秒。
+超时仍走原 HOLD，夹爪停稳、双侧目标接触与携物关系的原判据均不改变。
+旧 Route 哈希须重新发现并绑定。
+
 在上述末端接触、双夹爪、object-state及follow观测组合上，另加
 `--enable-object-motion` 才发布 `motion.move_grasped_object_to_pose@1`；默认不发布。
 它接受目录中绑定的 `object_id`、`phase=lift|carry|place`，以及公开参考系中的

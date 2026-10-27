@@ -139,9 +139,21 @@ def test_sim_route_is_target_neutral_semantics_with_sim_privilege() -> None:
     assert route.target_kind == "sim"
     assert route.privilege_tier == "t1_sim_or_no_motion"
     assert route.requires_operator_confirmation is False
+    assert route.max_operation_duration_ms == 15_000
     assert (
         "approach_then_close_composition" in bundle.route_manifest.explicit_exclusions
     )
+
+
+def test_real_gripper_keeps_existing_operation_deadline() -> None:
+    port = FakeGripperPort([(0.0, False)])
+    binding = replace(
+        _sim_bundle(port).deployment_binding,
+        target_kind="real",
+        current_mode="real_active",
+    )
+    route = build_gripper_skill_contract_bundle(binding).route_manifest.skill_routes[0].route
+    assert route.max_operation_duration_ms == 5_000
 
 
 def test_gripper_executor_rejects_wrong_port_before_activation():
