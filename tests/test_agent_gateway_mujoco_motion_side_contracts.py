@@ -203,6 +203,10 @@ def _load_offline(
             node
             for node in tree.body
             if getattr(node, "name", None) in names
+            or (
+                isinstance(node, ast.Assign)
+                and any(isinstance(target, ast.Name) and target.id in names for target in node.targets)
+            )
             or (isinstance(node, ast.ImportFrom) and node.module == "__future__")
         ]
     name = "_motion_side_contract_" + path.stem
@@ -232,7 +236,39 @@ def _modules(monkeypatch, source_for=None):
 
     config = load("sim/mujoco/deploy/target_config.py")
     component = load("sim/mujoco/deploy/component_action_profile.py")
-    contact = load("sim/mujoco/deploy/grasp_contact.py")
+    contact_path = "sim/mujoco/deploy/grasp_contact.py"
+    contact_source = None if source_for is None else source_for(contact_path)
+    if contact_source is None:
+        contact_source = (REPO / contact_path).read_bytes()
+    contact_tree = ast.parse(contact_source)
+    profile_imports = [
+        node for node in contact_tree.body
+        if isinstance(node, ast.ImportFrom)
+        and node.module == "sim.mujoco.actuation.gripper_profile"
+    ]
+    pair_contract = None
+    contact_options = {}
+    if profile_imports:
+        assert len(profile_imports) == 1
+        assert {(item.name, item.asname) for item in profile_imports[0].names} == {
+            ("_OBJECT_CONTACT_PAIR_PREFIX", None),
+            ("_object_contact_pair_name", None),
+        }
+        pair_contract = load(
+            "sim/mujoco/actuation/gripper_profile.py",
+            names={"_OBJECT_CONTACT_PAIR_PREFIX", "_object_contact_pair_name"},
+            namespace={"hashlib": hashlib, "json": json},
+        )
+        contact_options = {
+            "omit": ("sim.mujoco.actuation.gripper_profile",),
+            "namespace": {
+                "_OBJECT_CONTACT_PAIR_PREFIX": pair_contract._OBJECT_CONTACT_PAIR_PREFIX,
+                "_object_contact_pair_name": pair_contract._object_contact_pair_name,
+            },
+        }
+    contact = _load_offline(
+        monkeypatch, contact_path, source=contact_source, **contact_options
+    )
     state = load(PROFILE_DIR + "state_deployment.py")
     primitives = load(PROFILE_DIR + "motion_primitive_profiles.py")
     pure_contracts = {
@@ -271,12 +307,64 @@ def _modules(monkeypatch, source_for=None):
             "DEFAULT_STATION_POSE_CONTRACT_PATH": config.DEFAULT_STATION_POSE_CONTRACT_PATH,
         },
     )
-    return SimpleNamespace(factory=factory, deployment=deployment, component=component)
+    return SimpleNamespace(
+        factory=factory, deployment=deployment, component=component,
+        contact=contact, pair_contract=pair_contract,
+    )
 
 
 @pytest.fixture
 def offline(monkeypatch):
     return _modules(monkeypatch)
+
+
+@pytest.mark.parametrize("module", ["mujoco", "sim.mujoco.actuation.gripper_profile"])
+def test_offline_loader_still_rejects_native_resource_imports(monkeypatch, module):
+    def source_for(relative):
+        source = (REPO / relative).read_bytes()
+        if relative == "sim/mujoco/deploy/grasp_contact.py":
+            source = f"import {module}\n".encode() + source
+        return source
+
+    monkeypatch.setitem(sys.modules, module, ModuleType(module))
+    with pytest.raises(AssertionError) as error:
+        _modules(monkeypatch, source_for=source_for)
+    assert str(error.value) == f"Native/resource import in offline test: {module}"
+
+
+def test_offline_loader_accepts_contact_source_without_profile_import(monkeypatch):
+    def source_for(relative):
+        assert relative != "sim/mujoco/actuation/gripper_profile.py"
+        source = (REPO / relative).read_bytes()
+        if relative == "sim/mujoco/deploy/grasp_contact.py":
+            tree = ast.parse(source)
+            tree.body = [node for node in tree.body if not (
+                isinstance(node, ast.ImportFrom)
+                and node.module == "sim.mujoco.actuation.gripper_profile"
+            )]
+            source = ast.unparse(tree).encode()
+        return source
+
+    assert _modules(monkeypatch, source_for=source_for).pair_contract is None
+
+
+def test_offline_loader_source_callback_can_fall_back_to_workspace(monkeypatch):
+    assert _modules(monkeypatch, source_for=lambda _: None).pair_contract is not None
+
+
+def test_offline_contact_pair_contract_reuses_source_and_binds_tuning(offline):
+    pair_name = offline.contact._object_contact_pair_name
+    assert pair_name is offline.pair_contract._object_contact_pair_name
+    assert Path(pair_name.__code__.co_filename) == REPO / "sim/mujoco/actuation/gripper_profile.py"
+    tuning = SimpleNamespace(friction=(0.5, 0.2, 0.1), solref=(0.01, 1), solimp=(0.9, 0.95, 0.001))
+    payload = {"geoms": ["object", "sensor"], "friction": tuning.friction,
+               "solref": tuning.solref, "solimp": tuning.solimp}
+    digest = hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":"),
+                                       allow_nan=False).encode()).hexdigest()
+    assert pair_name("sensor", "object", tuning) == offline.pair_contract._OBJECT_CONTACT_PAIR_PREFIX + digest
+    assert pair_name("object", "sensor", tuning) == pair_name("sensor", "object", tuning)
+    changed = SimpleNamespace(friction=(0.6, 0.2, 0.1), solref=tuning.solref, solimp=tuning.solimp)
+    assert pair_name("object", "sensor", changed) != pair_name("object", "sensor", tuning)
 
 
 def _side_ready(offline):
