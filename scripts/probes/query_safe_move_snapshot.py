@@ -38,6 +38,7 @@ from scripts.probes.inspect_safe_move_snapshot import (
     RM65CapturedRobotObservationFilterConfig, backproject, load_captures, resolve_inputs,
 )
 from teleop_runtime.skill_deploy.rm65_grasp_trajectory import (
+    RM65_GRASP_ENDPOINT_ORDER_JOINT_DISTANCE, RM65_GRASP_ENDPOINT_ORDER_MODES,
     RM65GraspJointTrajectoryPlanner, RM65GraspTrajectoryPlanningConfig,
     RM65GraspTrajectoryPlanningError,
 )
@@ -279,10 +280,15 @@ class SavedSceneSkillQuery:
         self._query_budget = None if query_budget is None else dict(query_budget)
 
     @classmethod
-    def from_manifest(cls, manifest, *, enable_inherited_start_clearance=True):
+    def from_manifest(cls, manifest, *, enable_inherited_start_clearance=True,
+                      endpoint_candidate_ordering=RM65_GRASP_ENDPOINT_ORDER_JOINT_DISTANCE):
         # The reviewed positive-start egress mode is this offline consumer's
         # default (user decision 2026-10-29). Strict 20 mm start admission
         # remains available with an explicit False; a manifest cannot choose.
+        # Endpoint ordering selects among the planner's existing reviewed
+        # modes (the RealMan Gateway CLI deploys estimated_execution_time).
+        if endpoint_candidate_ordering not in RM65_GRASP_ENDPOINT_ORDER_MODES:
+            raise ValueError("endpoint_candidate_ordering must be a reviewed planner mode.")
         if type(enable_inherited_start_clearance) is not bool:
             raise ValueError("enable_inherited_start_clearance must be bool.")
         verify_inputs(manifest)
@@ -315,7 +321,9 @@ class SavedSceneSkillQuery:
             "anchors": manifest.get("anchors", []), "source_single_start": manifest["source_single_start"],
             "planning_qpos": qpos,
             **({"start_clearance_mode": "inherited-positive-v1"}
-               if enable_inherited_start_clearance else {})},
+               if enable_inherited_start_clearance else {}),
+            **({"endpoint_candidate_ordering": endpoint_candidate_ordering}
+               if endpoint_candidate_ordering != RM65_GRASP_ENDPOINT_ORDER_JOINT_DISTANCE else {})},
             domain="agenticrobot.saved_scene_query.identity.v1")
         prefix = "saved:" + scene_id[:16]
         anchors = [{"reference": prefix + ":tcp_" + side, "label": side + " TCP",
@@ -346,7 +354,8 @@ class SavedSceneSkillQuery:
                 "depth_content_hash": capture.depth_content_hash})
         convergence = RealAgentPrimitiveConvergenceProfile()
         plan_config = RM65GraspTrajectoryPlanningConfig(
-            enable_inherited_start_clearance=enable_inherited_start_clearance).for_tcp_pose_move(
+            enable_inherited_start_clearance=enable_inherited_start_clearance,
+            endpoint_candidate_ordering=endpoint_candidate_ordering).for_tcp_pose_move(
             translation_tolerance_m=convergence.translation_tolerance_m,
             rotation_tolerance_rad=convergence.rotation_tolerance_rad)
         planner = RM65GraspJointTrajectoryPlanner(profile=profile,
@@ -360,7 +369,8 @@ class SavedSceneSkillQuery:
                 "qpos_source": qpos_source, "observation_configuration": snapshot["configuration"],
                 "planning_policy": {
                     "inherited_start_clearance": enable_inherited_start_clearance,
-                    "ordinary_clearance_m": plan_config.minimum_clearance_m},
+                    "ordinary_clearance_m": plan_config.minimum_clearance_m,
+                    "endpoint_candidate_ordering": plan_config.endpoint_candidate_ordering},
                 "observed_voxel_count": len(cloud.points_m),
                 "enable_inherited_start_clearance": enable_inherited_start_clearance,
                 "tool_entities": {side: entity.identity() for side, entity in tool_entities.items()}},
@@ -867,13 +877,17 @@ def main():
         action="store_const", const=False,
         help="Reject starts below the ordinary 20 mm clearance, as before 2026-10-29")
     parser.set_defaults(inherited_start_clearance=True)
+    parser.add_argument("--endpoint-candidate-ordering", choices=RM65_GRASP_ENDPOINT_ORDER_MODES,
+        default=RM65_GRASP_ENDPOINT_ORDER_JOINT_DISTANCE,
+        help="Planner IK endpoint ordering (the RealMan Gateway deploys estimated_execution_time)")
     args = parser.parse_args()
     if args.request is not None and args.audit_output is None:
         parser.error("--request requires --audit-output to preserve full planning evidence")
     if args.audit_output is not None and args.audit_output.exists():
         parser.error("--audit-output must not already exist")
     query = SavedSceneSkillQuery.from_manifest(json.loads(args.manifest.read_text()),
-        enable_inherited_start_clearance=args.inherited_start_clearance)
+        enable_inherited_start_clearance=args.inherited_start_clearance,
+        endpoint_candidate_ordering=args.endpoint_candidate_ordering)
     try:
         result = (query.read_scene() if args.request is None else
                   query.plan_relation(**json.loads(args.request.read_text())))

@@ -222,7 +222,8 @@ def test_cli_defaults_to_inherited_clearance_with_explicit_strict_opt_out(tmp_pa
     monkeypatch.setattr(sys, "argv", ["query", "--manifest", str(manifest), *flags])
     with pytest.raises(Stop):
         module.main()
-    assert seen == [({}, {"enable_inherited_start_clearance": expected})]
+    assert seen == [({}, {"enable_inherited_start_clearance": expected,
+                          "endpoint_candidate_ordering": "joint_distance"})]
 
 
 def test_cli_rejects_conflicting_start_clearance_flags(tmp_path, monkeypatch):
@@ -270,7 +271,8 @@ def test_factory_defaults_to_inherited_clearance_and_binds_strict_opt_out(input_
         audit = query.audit()
         identities.append(audit["scene_id"])
         assert audit["source"]["planning_policy"] == {
-            "inherited_start_clearance": enabled, "ordinary_clearance_m": .02}
+            "inherited_start_clearance": enabled, "ordinary_clearance_m": .02,
+            "endpoint_candidate_ordering": "joint_distance"}
         assert configs[-1].enable_inherited_start_clearance is enabled
         assert audit["dispatches"] == 0 and audit["queries"] == []
         region = query.plan_relation_region(
@@ -299,6 +301,16 @@ def test_factory_defaults_to_inherited_clearance_and_binds_strict_opt_out(input_
     assert configs[-1].enable_inherited_start_clearance is True
     query.close()
     del input_manifest["enable_inherited_start_clearance"]
+
+    # Endpoint ordering is an explicit reviewed planner mode, bound into identity.
+    query = SavedSceneSkillQuery.from_manifest(input_manifest,
+                                               endpoint_candidate_ordering="estimated_execution_time")
+    assert configs[-1].endpoint_candidate_ordering == "estimated_execution_time"
+    assert query.audit()["source"]["planning_policy"]["endpoint_candidate_ordering"] == "estimated_execution_time"
+    assert query.audit()["scene_id"] != identities[0]
+    query.close()
+    with pytest.raises(ValueError, match="endpoint_candidate_ordering"):
+        SavedSceneSkillQuery.from_manifest(input_manifest, endpoint_candidate_ordering="fastest")
 
     input_manifest["region_candidate_policy"] = "halton"
     query = SavedSceneSkillQuery.from_manifest(input_manifest)
