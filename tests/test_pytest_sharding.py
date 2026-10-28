@@ -85,20 +85,20 @@ def test_full_profile_tracks_recent_dominant_modules() -> None:
     module = _load_sharding_module()
 
     assert module.FULL_WEIGHTS["tests/test_mujoco_temp_pipeline.py"] == pytest.approx(
-        93.578
+        118.275
     )
     assert module.FULL_WEIGHTS[
         "tests/test_replay_position_admittance_active_pipeline.py"
-    ] == pytest.approx(77.676)
+    ] == pytest.approx(101.928)
     assert module.FULL_WEIGHTS["tests/test_mujoco_fast_runtime.py"] == pytest.approx(
-        23.032
+        27.069
     )
     assert module.FULL_WEIGHTS["tests/test_rm65_grasp_trajectory.py"] == pytest.approx(
-        67.308
+        85.626
     )
     assert module.FULL_WEIGHTS[
         "tests/test_mujoco_formal_compound_authority.py"
-    ] == pytest.approx(3.565)
+    ] == pytest.approx(4.29)
     assert (
         module.FULL_WEIGHTS["tests/test_mujoco_temp_pipeline.py"]
         > module.FULL_WEIGHTS[
@@ -107,20 +107,20 @@ def test_full_profile_tracks_recent_dominant_modules() -> None:
     )
     assert module.FULL_WEIGHTS[
         "tests/test_sim_point_grasp_experiment.py"
-    ] == pytest.approx(12.628)
+    ] == pytest.approx(14.281)
     assert module.FULL_WEIGHTS["tests/test_mujoco_cube_lift.py"] == pytest.approx(
-        7.075
+        8.851
     )
     assert module.FULL_WEIGHTS["tests/test_rebot_b601_real2sim.py"] == pytest.approx(
-        14.808
+        21.849
     )
     assert module.FULL_WEIGHTS["tests/test_runtime_artifact_migration.py"] == pytest.approx(
-        1.316
+        7.655
     )
     assert module.FULL_WEIGHTS["tests/test_runtime_artifact_resolution.py"] == pytest.approx(
-        0.221
+        1.579
     )
-    assert module.FULL_WEIGHTS["tests/test_modality_storage.py"] == pytest.approx(2.512)
+    assert module.FULL_WEIGHTS["tests/test_modality_storage.py"] == pytest.approx(5.531)
 
 
 def test_fast_integration_profile_tracks_its_unsharded_critical_path() -> None:
