@@ -72,6 +72,68 @@ duplicate tests to raise it. A minimal environment's optional skips are useful
 feedback but do not satisfy acceptance for changed optional behavior. Record
 missing dependencies and known unrelated failures explicitly.
 
+### 显式按变更验收：先隔离 B601 长控制测试
+
+分片解决并行负载分配；`--changed-since` 才选择本次需要运行的测试。
+默认 `bash scripts/run_full_acceptance.sh` 仍运行完整非硬件集合。第一版只对
+Gateway/感知独立更改省去七个 B601 长控制模块，其他模块全部运行，包括短
+B601 安全检查、混合测试、MuJoCo、架构边界及本次新增测试。它不是通用的
+“文件名没有 B601 就跳过”规则，也不整体省略 MuJoCo。
+
+在干净的已提交工作树中，选择**同依赖、资产和 vendor 环境已完整绿色的固定祖先**：
+
+```bash
+# BASE_COMMIT 由本次开发/集成者固定，不能是移动中的分支名。
+python3 scripts/pytest_impact.py inspect --repository "$PWD" --base "$BASE_COMMIT"
+DEXTELEOP_FULL_ACCEPTANCE_SHARDS=12 DEXTELEOP_FULL_ACCEPTANCE_MAX_JOBS=2 \
+  bash scripts/run_full_acceptance.sh --changed-since "$BASE_COMMIT" --durations=50
+```
+
+先检查 `inspect` 的 `changed_paths`、`mode`、`excluded_modules`、
+`fallback_reasons`。`inspect` 可分析历史提交和脏工作树，但只提供建议，不能作为
+执行证据。实际 runner 要求 HEAD、已跟踪文件、未跟踪文件和子模块均干净；
+拒绝无法解析或非祖先的 base，在启动前及结束时核对源与分片清单，漂移则拒绝
+成功证据。工具不认证基线的绿色记录、不认证外部环境等价，也不复用基线测试
+结果；调用者需要保留基线完整验收及当前环境记录。并发上限不是内存容量保证，
+仍使用所在主机既有内存门禁和资源上限。
+
+按变更运行先规划**完整集合**，再从各批次过滤省略项；保留每个 retained target
+的批次和相对顺序，不把较小集合重新按 CPU 时间打包。原生堆峰值与时间负载并不
+等价，重新打包可能使两个大堆同时运行。若过滤使配置中的某批变空，保守回退
+全量，避免暗中改变批次数、并发或制造空批通过记录。实际内存门禁仍是必需条件。
+
+| 变更/依赖情况 | 当前策略 |
+| --- | --- |
+| 全部更改在 `agent_gateway/`、`deployments/perception/`、`docs/agent_gateway/`、`tests/test_agent_gateway_*.py` 或 `tests/test_sam3_service.py` 内，且依赖核查通过 | 仅省去下列七个长模块，其余测试全部重新运行 |
+| 共享运动、硬件、Control Station、sim、共享 fixture、runner、依赖或锁文件、其他未知路径 | 全量回退，并列出原因 |
+| 删除/重命名、文件类型/权限变化、`__init__.py`、未知格式、显式 B601 引用 | 全量回退 |
+| B601 在 base 或 HEAD 中的导入/资源依赖命中更改，或存在无法解释的动态加载、全局 `pytest_plugins` 声明 | 全量回退 |
+| 无差异 | 全量；不把“没有改动”当作已有通过证据 |
+
+固定可省略集合：`test_b601_automatic_calibration.py`、
+`test_b601_calibration_cycle.py`、`test_b601_coordinated_holding.py`、
+`test_b601_cruise_velocity.py`、`test_b601_workspace_calibration.py`、
+`test_b601_workspace_identification.py`、`test_rebot_b601_staged_assist.py`。
+不会删除、减参或 mock 这些测试；全量入口仍完整运行它们。
+
+选择器沿两端 Git 树分析这些模块和公共 `conftest.py` 的静态导入、测试根 helper、
+字面量资源及全部延迟导出。少量既有动态加载实现经源码摘要固定；它们漂移后
+先回退全量，重新审查才能更新摘要。gitlink 是独立的版本边界，改动 gitlink
+必定全量。该检查只为上述已审查所有权边界增加保守保护，不宣称能推导任意
+Python 元编程的全部依赖；新增所有者或新的可省略测试族需要独立评审。
+
+执行产生 `selection.json`、原有 `shard-plan.json`、各分片日志和
+`changed-acceptance.xml`。JUnit 标明 change-aware、实际 full/affected 模式、
+固定 base/HEAD 及省略列表；省略项没有伪造的 pass/skip receipt。
+按变更模式仅接受 verbosity/durations 参数，拒绝额外筛选、插件和环境
+`PYTEST_ADDOPTS`/`PYTEST_PLUGINS`，避免静默缩小已声明集合。默认完整入口的参数行为不变。
+
+**affected 成功只证明清单列出的集合，不能声称完整验收成功。** 现有明确要求
+完整验收的 Harness Profile/集成门禁继续调用无此选项的完整入口。本轮只接通
+仓库 runner 的显式调用，没有激活或改写外部 Harness 配置。跨包公共契约、
+共享控制/安全、依赖、环境或资产变化，以及最终组合提交的完整验证，继续使用
+完整验收；不得把本入口冒充必需的 full evidence。
+
 ## Maintaining the test set
 
 When behavior changes, first find and update its existing tests. Add cases for

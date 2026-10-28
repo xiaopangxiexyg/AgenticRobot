@@ -81,6 +81,49 @@ def test_plan_is_deterministic_complete_and_weighted(tmp_path: Path) -> None:
     assert max(loads) - min(loads) <= 0.3
 
 
+def test_selected_module_plan_preserves_all_requested_targets(tmp_path: Path) -> None:
+    module = _load_sharding_module()
+    tests_root = tmp_path / "tests"
+    tests_root.mkdir()
+    for name in ("first", "second", "omitted"):
+        (tests_root / f"test_{name}.py").write_text("def test_case(): pass\n")
+    selected = ["tests/test_first.py", "tests/test_second.py"]
+    shards = module.plan_shards(tmp_path, tests_root, 2, "full", test_modules=selected)
+    assert {target for shard in shards for target, _, _ in shard} == set(selected)
+    complete = module.plan_shards(tmp_path, tests_root, 2, "full")
+    assert shards == [
+        [item for item in shard if item[0] in selected] for shard in complete
+    ]
+    for invalid in ([selected[0], selected[0]], ["tests/missing.py"], []):
+        with pytest.raises(ValueError):
+            module.plan_shards(tmp_path, tests_root, 1, "full", test_modules=invalid)
+
+
+def test_selected_split_families_keep_their_complete_plan_batches(tmp_path):
+    module = _load_sharding_module()
+    tests_root = tmp_path / "tests"
+    tests_root.mkdir()
+    relative = "tests/test_mujoco_temp_pipeline.py"
+    functions = sorted(
+        set(module.FULL_SPLIT_NODE_WEIGHTS[relative]) | {"test_new_family"}
+    )
+    (tmp_path / relative).write_text(
+        "\n\n".join(f"def {name}():\n    pass" for name in functions) + "\n"
+    )
+    (tests_root / "test_omitted.py").write_text("def test_other(): pass\n")
+    full = module.plan_shards(tmp_path, tests_root, 2, "full")
+    selected = module.plan_shards(
+        tmp_path, tests_root, 2, "full", test_modules=[relative]
+    )
+    assert selected == [
+        [item for item in shard if item[0].startswith(relative + "::")]
+        for shard in full
+    ]
+    assert {item[0].split("::")[1] for shard in selected for item in shard} == set(
+        functions
+    )
+
+
 def test_full_profile_tracks_recent_dominant_modules() -> None:
     module = _load_sharding_module()
 
