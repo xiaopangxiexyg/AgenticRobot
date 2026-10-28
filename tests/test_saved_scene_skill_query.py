@@ -222,7 +222,8 @@ def test_cli_defaults_to_inherited_clearance_with_explicit_strict_opt_out(tmp_pa
     monkeypatch.setattr(sys, "argv", ["query", "--manifest", str(manifest), *flags])
     with pytest.raises(Stop):
         module.main()
-    assert seen == [({}, {"enable_inherited_start_clearance": expected})]
+    assert seen == [({}, {"enable_inherited_start_clearance": expected,
+                          "endpoint_candidate_ordering": "joint_distance"})]
 
 
 def test_cli_rejects_conflicting_start_clearance_flags(tmp_path, monkeypatch):
@@ -237,6 +238,31 @@ def test_cli_rejects_conflicting_start_clearance_flags(tmp_path, monkeypatch):
     with pytest.raises(SystemExit) as raised:
         module.main()
     assert raised.value.code == 2
+
+
+@pytest.mark.parametrize("ordering", ["joint_distance", "estimated_execution_time", "tcp_arc_estimated_execution_time"])
+@pytest.mark.parametrize("strict", [False, True])
+def test_cli_forwards_endpoint_ordering_and_clearance_mode(tmp_path, monkeypatch, ordering, strict):
+    import sys
+    from scripts.probes import query_safe_move_snapshot as module
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text("{}")
+    seen = []
+
+    class Stop(Exception):
+        pass
+
+    def factory(cls, value, **kwargs):
+        seen.append((value, kwargs))
+        raise Stop
+    monkeypatch.setattr(module.SavedSceneSkillQuery, "from_manifest", classmethod(factory))
+    flags = ["--strict-start-clearance"] if strict else []
+    monkeypatch.setattr(sys, "argv", ["query", "--manifest", str(manifest),
+                                     "--endpoint-candidate-ordering", ordering, *flags])
+    with pytest.raises(Stop):
+        module.main()
+    assert seen == [({}, {"enable_inherited_start_clearance": not strict,
+                          "endpoint_candidate_ordering": ordering})]
 
 
 def test_factory_defaults_to_inherited_clearance_and_binds_strict_opt_out(input_manifest, capture_fixture, monkeypatch):
@@ -271,7 +297,8 @@ def test_factory_defaults_to_inherited_clearance_and_binds_strict_opt_out(input_
         audit = query.audit()
         identities.append(audit["scene_id"])
         assert audit["source"]["planning_policy"] == {
-            "inherited_start_clearance": enabled, "ordinary_clearance_m": .02}
+            "inherited_start_clearance": enabled, "ordinary_clearance_m": .02,
+            "endpoint_candidate_ordering": "joint_distance"}
         assert configs[-1].enable_inherited_start_clearance is enabled
         assert audit["dispatches"] == 0 and audit["queries"] == []
         region = query.plan_relation_region(
@@ -306,6 +333,31 @@ def test_factory_defaults_to_inherited_clearance_and_binds_strict_opt_out(input_
     assert configs[-1].enable_inherited_start_clearance is False
     query.close()
     del input_manifest["enable_inherited_start_clearance"]
+
+    # Endpoint ordering is an explicit reviewed planner mode, bound into identity.
+    query = SavedSceneSkillQuery.from_manifest(input_manifest,
+                                               endpoint_candidate_ordering="estimated_execution_time")
+    assert configs[-1].endpoint_candidate_ordering == "estimated_execution_time"
+    assert query.audit()["source"]["planning_policy"]["endpoint_candidate_ordering"] == "estimated_execution_time"
+    assert query.audit()["scene_id"] != identities[0]
+    query.close()
+    with pytest.raises(ValueError, match="endpoint_candidate_ordering"):
+        SavedSceneSkillQuery.from_manifest(input_manifest, endpoint_candidate_ordering="fastest")
+
+    scoped_identities = set()
+    for clearance in (False, True):
+        for ordering in ("joint_distance", "estimated_execution_time", "tcp_arc_estimated_execution_time"):
+            query = SavedSceneSkillQuery.from_manifest(input_manifest,
+                enable_inherited_start_clearance=clearance, endpoint_candidate_ordering=ordering)
+            policy = query.audit()["source"]["planning_policy"]
+            assert policy["inherited_start_clearance"] is clearance
+            assert policy["endpoint_candidate_ordering"] == configs[-1].endpoint_candidate_ordering == ordering
+            identity = query.audit()["scene_id"]
+            if ordering == "joint_distance":
+                assert identity == identities[0 if clearance else 2]
+            scoped_identities.add(identity)
+            query.close()
+    assert len(scoped_identities) == 6
 
     input_manifest["region_candidate_policy"] = "halton"
     query = SavedSceneSkillQuery.from_manifest(input_manifest)

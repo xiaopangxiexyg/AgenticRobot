@@ -35,6 +35,11 @@ does not come from an untrusted manifest or an individual model query. Neither
 mode executes a trajectory or changes the live Gateway's safety policy; the
 RealMan Gateway applies the same default to observed safe moves through its
 own CLI (`--strict-start-clearance` opts out there as well).
+`endpoint_candidate_ordering` (keyword, or `--endpoint-candidate-ordering`)
+selects one of the planner's reviewed IK endpoint orderings. The default
+`joint_distance` keeps earlier offline results comparable; the RealMan Gateway
+deploys `estimated_execution_time`. A non-default ordering enters the query
+identity and the audit planning policy.
 Operator exports additionally require `source_record`: freeze the original
 record, observation ZIP and all its context files. The probe verifies the
 exported arrays/geometry against that original archive and binds calibration to

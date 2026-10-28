@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import math
+import threading
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Mapping
@@ -74,11 +77,49 @@ class ObservedObstacleCloud:
 
 
 class ObservedBoxDistance:
-    """Exact signed distance from occupied centers to sparse oriented boxes."""
+    """Exact signed distance from occupied centers to sparse oriented boxes.
+
+    Per-box results are memoized on the box's exact pose bytes, extents and
+    query radius. Equal inputs give bit-identical results, so a component that
+    does not move during a request (for example the inactive arm) is not
+    re-measured at every configuration check. The cloud is immutable and the
+    instance is request-owned.
+    """
+
+    _CACHE_LIMIT = 256
 
     def __init__(self, cloud: ObservedObstacleCloud):
         self.cloud = cloud
         self.tree = cKDTree(cloud.points_m)
+        self._box_cache: OrderedDict[tuple, tuple[float, int | None]] = OrderedDict()
+        self._box_cache_lock = threading.Lock()
+        self.box_cache_hits = 0
+        self.box_cache_misses = 0
+
+    def _box_minimum(self, transform: np.ndarray, half: np.ndarray, required: float) -> tuple[float, int | None]:
+        key = (transform.shape, transform.tobytes(), half.shape, half.tobytes(), required)
+        with self._box_cache_lock:
+            cached = self._box_cache.get(key)
+            if cached is not None:
+                self._box_cache.move_to_end(key)
+                self.box_cache_hits += 1
+                return cached
+        candidates = self.tree.query_ball_point(
+            transform[:3, 3], float(np.linalg.norm(half)) + required)
+        if not candidates:
+            result = (math.inf, None)
+        else:
+            local = (self.cloud.points_m[candidates] - transform[:3, 3]) @ transform[:3, :3]
+            delta = np.abs(local) - half
+            signed = np.linalg.norm(np.maximum(delta, 0), axis=1) + np.minimum(np.max(delta, axis=1), 0)
+            index = int(np.argmin(signed))
+            result = (float(signed[index]) - self.cloud.quantization_margin_m, int(candidates[index]))
+        with self._box_cache_lock:
+            self.box_cache_misses += 1
+            self._box_cache[key] = result
+            while len(self._box_cache) > self._CACHE_LIMIT:
+                self._box_cache.popitem(last=False)
+        return result
 
     def check_boxes(self, boxes, *, clearance_m: float):
         # Only points within this conservative circumsphere can violate the
@@ -86,19 +127,15 @@ class ObservedBoxDistance:
         required = float(clearance_m) + self.cloud.quantization_margin_m
         minimum, nearest = float(np.nextafter(clearance_m, np.inf)), None
         for name, world_from_box, half_size in boxes:
-            transform = np.asarray(world_from_box, dtype=float)
-            half = np.asarray(half_size, dtype=float)
-            candidates = self.tree.query_ball_point(
-                transform[:3, 3], float(np.linalg.norm(half)) + required)
-            if not candidates:
+            # Key and measurement must use the same owned snapshot even if the
+            # caller reuses or mutates its original arrays concurrently.
+            transform = np.array(world_from_box, dtype=float, order="C", copy=True)
+            half = np.array(half_size, dtype=float, order="C", copy=True)
+            distance, point_index = self._box_minimum(transform, half, required)
+            if point_index is None:
                 continue
-            local = (self.cloud.points_m[candidates] - transform[:3, 3]) @ transform[:3, :3]
-            delta = np.abs(local) - half
-            signed = np.linalg.norm(np.maximum(delta, 0), axis=1) + np.minimum(np.max(delta, axis=1), 0)
-            index = int(np.argmin(signed))
-            distance = float(signed[index]) - self.cloud.quantization_margin_m
             if distance < minimum:
                 minimum = distance
                 nearest = {"geometry_name": name,
-                           "occupied_center_world_m": self.cloud.points_m[candidates[index]].tolist()}
+                           "occupied_center_world_m": self.cloud.points_m[point_index].tolist()}
         return minimum, nearest
