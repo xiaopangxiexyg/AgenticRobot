@@ -92,7 +92,18 @@ core and MuJoCo adapter used for the 20260721 fit; tests compare those hashes to
 fixed historical values rather than silently reinterpreting the fit against
 the current files.
 
-球体载荷、仿真对象接触及 Skill 悬停查询的组合来源使用独立绑定
+观察点云距离缓存及离线端点排序的组合来源使用独立绑定
+`artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261029_observed_cache_order_v1.json`。
+它固定于源码提交 `b2b77e61e09b`，保留前一绑定并记录 177 项运行时输入，其中观察点云
+距离代码用于真实观测规划；6 项离线查询输入及同一源码树的 978 项关联测试单独记录。
+该列表不是全部传递依赖或工作区漂移的实时检查，固定 commit/tree 与干净工作区门禁另行
+核验。绑定仍为 `provisional`，没有新增真机动作、标定或 held-out 资格。
+
+观察点云缓存对相同输入复用原距离结果，缓存键及计算使用稳定快照；调用方仍负责配对
+输入的跨线程一致性。离线端点排序默认 `joint_distance`，其他已有模式需显式选择并进入
+查询身份和审计；此配置不会改变实时设备执行权限。
+
+上一阶段球体载荷、仿真对象接触及 Skill 悬停查询的组合来源使用独立历史绑定
 `artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261029_skill_hover_visual_v1.json`。
 它固定于源码提交 `1e2ab619c2f3`，保留前一绑定并记录 176 项运行时输入、6 项离线查询
 输入，以及同一组合源码树上的 1297 项专项通过；完整组合门禁另行记录。该列表不是对
