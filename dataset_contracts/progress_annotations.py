@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-import math
+from functools import partial as _partial
 from typing import Any, Mapping, Sequence
 
+from . import _progress_validation as _validation
 from .canonical_encoding import canonical_content_hash
 from .progress_facts import ProgressEpisodeManifestV1
 from .progress_refinement import TaskRefinementProfileV1
@@ -53,49 +54,13 @@ class ProgressAnnotationContractError(ValueError):
     """Raised when a refinement annotation artifact is ambiguous or invalid."""
 
 
-def _required(value: object, *, name: str) -> str:
-    if not isinstance(value, str) or not value.strip():
-        raise ProgressAnnotationContractError(
-            f"{name} must be a non-empty string."
-        )
-    return value.strip()
-
-
-def _sha256(value: object, *, name: str) -> str:
-    result = _required(value, name=name).lower()
-    if len(result) != 64 or any(
-        char not in "0123456789abcdef" for char in result
-    ):
-        raise ProgressAnnotationContractError(
-            f"{name} must be a lowercase SHA-256 digest."
-        )
-    return result
-
-
-def _finite(value: object, *, name: str) -> float:
-    if not isinstance(value, (int, float)) or isinstance(value, bool):
-        raise ProgressAnnotationContractError(f"{name} must be numeric.")
-    result = float(value)
-    if not math.isfinite(result):
-        raise ProgressAnnotationContractError(f"{name} must be finite.")
-    return result
-
-
-def _confidence(value: object) -> float:
-    result = _finite(value, name="confidence")
-    if result < 0.0 or result > 1.0:
-        raise ProgressAnnotationContractError(
-            "confidence must lie in [0, 1]."
-        )
-    return result
-
-
-def _nonnegative_int(value: object, *, name: str) -> int:
-    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
-        raise ProgressAnnotationContractError(
-            f"{name} must be a non-negative integer."
-        )
-    return value
+_required = _partial(_validation.required_text, ProgressAnnotationContractError)
+_sha256 = _partial(_validation.sha256_digest, ProgressAnnotationContractError)
+_finite = _partial(_validation.finite_number, ProgressAnnotationContractError)
+_confidence = _partial(_validation.confidence, ProgressAnnotationContractError)
+_nonnegative_int = _partial(
+    _validation.nonnegative_int, ProgressAnnotationContractError
+)
 
 
 def _verify_declared_hash(

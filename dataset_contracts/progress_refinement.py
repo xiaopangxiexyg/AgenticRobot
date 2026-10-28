@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
+from functools import partial as _partial
 from typing import Any, Mapping, Sequence
 
+from . import _progress_validation as _validation
 from .canonical_encoding import canonical_content_hash
 from .progress_profile import TaskProgressProfileV1
 
@@ -24,33 +26,15 @@ class ProgressRefinementContractError(ValueError):
     """Raised when a refinement profile cannot be interpreted uniquely."""
 
 
-def _required(value: object, *, name: str) -> str:
-    if not isinstance(value, str) or not value.strip():
-        raise ProgressRefinementContractError(f"{name} must be a non-empty string.")
-    return value.strip()
+_required = _partial(_validation.required_text, ProgressRefinementContractError)
 
 
 def _optional_required(value: object | None, *, name: str) -> str | None:
     return None if value is None else _required(value, name=name)
 
 
-def _sha256(value: object, *, name: str) -> str:
-    result = _required(value, name=name).lower()
-    if len(result) != 64 or any(
-        char not in "0123456789abcdef" for char in result
-    ):
-        raise ProgressRefinementContractError(
-            f"{name} must be a lowercase SHA-256 digest."
-        )
-    return result
-
-
-def _positive_int(value: object, *, name: str) -> int:
-    if not isinstance(value, int) or isinstance(value, bool) or value < 1:
-        raise ProgressRefinementContractError(
-            f"{name} must be a positive integer."
-        )
-    return value
+_sha256 = _partial(_validation.sha256_digest, ProgressRefinementContractError)
+_positive_int = _partial(_validation.positive_int, ProgressRefinementContractError)
 
 
 def _boolean(value: object, *, name: str) -> bool:

@@ -42,6 +42,12 @@ contract. Missing row columns are never guessed into negative targets.
 
 ## Collection progress contracts
 
+Progress 与 retrospective 契约的相同基础校验由私有 `_progress_validation.py`
+统一实现；各领域通过标准库 `partial` 绑定原有异常类。这里只共享必填文本、SHA-256、
+有限数值、正整数、非负整数和置信度规则，领域错误类型、公开数据类型及序列化/hash
+仍由原模块持有。可选字段语义、声明 hash 的错误措辞，以及 retrospective 正整数
+先检查非负再拒绝零的顺序继续留在原模块，不能因名称相近而合并。
+
 `dataset_contracts.progress_profile` and `dataset_contracts.progress_facts`
 define the first p2 capture-truth slice without importing a runtime or GUI:
 
