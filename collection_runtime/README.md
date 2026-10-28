@@ -99,6 +99,13 @@ Native 压缩清理以已挂接的全部 Episode component 的 artifact 集合�
 删除仍作用于原路径，保留“删除 symlink 本身”的语义。设备、inode、链接数和哈希
 门禁继续执行；该流程仍要求两个存储根静止，不提供并发写入期间的删除保证。
 
+旧的自包含布局同样先读完 finalized Episode 的全部 tactile manifests，并验证所有
+raw 流，再清理未提交的压缩目标。保护集包含 manifest 本身、raw 来源及全部流的当前
+载荷引用，避免删除被其他 Episode 使用的文件；任一 manifest 或 raw 验证失败时尚未
+执行删除。路径身份沿用读者的相对、绝对和外部载荷兼容性；已引用目标直接保留，
+未引用目标继续执行设备、inode、链接数门禁，并只 unlink 原候选路径。调用方仍负责
+确认数据集静止，不提供并发写入期间的删除保证。
+
 Capture-time progress effective time is monotonic within the bound Episode
 clock. Nested Hold/Resume operation times must also be knowable by the receipt's
 availability time. The live reducer and read-time resolver enforce the same
