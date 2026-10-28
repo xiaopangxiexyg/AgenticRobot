@@ -6461,8 +6461,15 @@ def test_preserve_target_cannot_change_grasp_approach_policy(monkeypatch):
 
 def test_safe_pose_policy_keeps_existing_config_positional_constructor():
     from dataclasses import fields
+    legacy = RM65GraspTrajectoryPlanningConfig(.02, 1.2)
+    assert legacy.minimum_clearance_m == .02
+    assert legacy.maximum_proximal_joint_travel_rad == 1.2
+    assert legacy.enable_inherited_start_clearance is False
     original = RM65GraspTrajectoryPlanningConfig()
-    names = [field.name for field in fields(original) if field.name != "pose_goal_policy"]
+    assert next(field for field in fields(original)
+                if field.name == "enable_inherited_start_clearance").kw_only
+    names = [field.name for field in fields(original)
+             if field.name not in {"pose_goal_policy", "enable_inherited_start_clearance"}]
     values = [getattr(original, name) for name in names]
     values[names.index("final_edge_resolution_rad")] = .0017
     values[names.index("path_envelope_ingress_waypoint_fractions")] = (.1, .2)

@@ -10,7 +10,7 @@ import time
 from collections import OrderedDict
 from copy import copy
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from itertools import pairwise
 from pathlib import Path
 from typing import NoReturn
@@ -170,7 +170,7 @@ class RM65GraspTrajectoryPlanningError(RuntimeError):
 @dataclass(frozen=True)
 class RM65GraspTrajectoryPlanningConfig:
     minimum_clearance_m: float = 0.02
-    enable_inherited_start_clearance: bool = False
+    enable_inherited_start_clearance: bool = field(default=False, kw_only=True)
     maximum_proximal_joint_travel_rad: float = DEFAULT_PATH_MOTION_QUALITY_LIMITS.maximum_proximal_joint_travel_rad
     maximum_tcp_detour_ratio: float = DEFAULT_PATH_MOTION_QUALITY_LIMITS.maximum_tcp_detour_ratio
     maximum_tcp_detour_excess_m: float = DEFAULT_PATH_MOTION_QUALITY_LIMITS.maximum_tcp_detour_excess_m
