@@ -329,27 +329,40 @@ def clean_uncommitted_tactile_recompression_artifacts(
     """
 
     root = Path(dataset_root).expanduser().resolve()
+    manifests = _finalized_manifest_paths(root)
+    referenced = set(manifests)
+    raw_sources: list[Path] = []
+    for manifest_path in manifests:
+        manifest, raw_streams = _raw_manifest_streams(root, manifest_path)
+        for _sensor_key, _spec, source in raw_streams:
+            raw_sources.append(source)
+            referenced.add(source)
+        for spec in manifest["streams"].values():
+            value = spec.get("path")
+            if value is not None and str(value):
+                # Match reader path identity, including legacy external payloads.
+                referenced.add((root / Path(str(value)).expanduser()).resolve())
+
+    # Complete reference discovery and raw validation before the first deletion.
     removed = 0
     touched_directories: set[Path] = set()
-    for manifest_path in _finalized_manifest_paths(root):
-        _manifest, raw_streams = _raw_manifest_streams(root, manifest_path)
-        for _sensor_key, _spec, source in raw_streams:
-            target = _compressed_path(source, chunk_frames=int(chunk_frames))
-            if not target.exists():
-                continue
-            source_stat = source.stat()
-            target_stat = target.stat()
-            if target_stat.st_dev != source_stat.st_dev:
-                raise RuntimeError(
-                    f"Refusing cross-device uncommitted tactile target: {target}"
-                )
-            if target_stat.st_ino == source_stat.st_ino or target_stat.st_nlink != 1:
-                raise RuntimeError(
-                    f"Refusing unsafe uncommitted tactile target inode: {target}"
-                )
-            target.unlink()
-            touched_directories.add(target.parent)
-            removed += 1
+    for source in raw_sources:
+        target = _compressed_path(source, chunk_frames=int(chunk_frames))
+        if target.resolve() in referenced or not target.exists():
+            continue
+        source_stat = source.stat()
+        target_stat = target.stat()
+        if target_stat.st_dev != source_stat.st_dev:
+            raise RuntimeError(
+                f"Refusing cross-device uncommitted tactile target: {target}"
+            )
+        if target_stat.st_ino == source_stat.st_ino or target_stat.st_nlink != 1:
+            raise RuntimeError(
+                f"Refusing unsafe uncommitted tactile target inode: {target}"
+            )
+        target.unlink()
+        touched_directories.add(target.parent)
+        removed += 1
     for directory in sorted(touched_directories):
         directory_fd = os.open(directory, os.O_RDONLY)
         try:

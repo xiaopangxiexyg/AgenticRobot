@@ -244,6 +244,181 @@ class TactileRecompressTest(unittest.TestCase):
             self.assertFalse(orphan.exists())
             self.assertEqual(stream_path.read_bytes(), raw_before)
             self.assertEqual(manifest_path.read_bytes(), manifest_before)
+            self.assertEqual(clean_uncommitted_tactile_recompression_artifacts(root), 0)
+
+    def test_cleanup_preserves_payload_referenced_by_a_later_manifest(self) -> None:
+        for reference in ("relative", "absolute", "parent_alias", "symlink", "raw"):
+            with self.subTest(reference=reference), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                manifest_path, source, _ = self._dataset(root)
+                owner_manifest, _, expected = self._dataset(root, episode_index=1)
+                target = source.with_name(f"{source.name}.tdelta8.zst")
+                manifest = json.loads(owner_manifest.read_text(encoding="utf-8"))
+                spec = manifest["streams"]["sensor"]
+                spec["path"] = target.relative_to(root).as_posix()
+                if reference == "raw":
+                    target.write_bytes(expected.tobytes())
+                else:
+                    payload = tactile_recompression._ZstdCodec(
+                        level=1, backend="python"
+                    ).compress(expected.tobytes())
+                    target.write_bytes(payload)
+                    spec.update(
+                        encoding="chunked_zstd",
+                        compression="zstd",
+                        chunks=[{
+                            "frame_start": 0,
+                            "frame_count": len(expected),
+                            "offset": 0,
+                            "compressed_bytes": len(payload),
+                            "raw_bytes": expected.nbytes,
+                        }],
+                    )
+                    if reference == "absolute":
+                        spec["path"] = str(target)
+                    elif reference == "parent_alias":
+                        spec["path"] = (
+                            f"{target.parent.relative_to(root)}/../"
+                            f"{target.parent.name}/{target.name}"
+                        )
+                    elif reference == "symlink":
+                        alias = root / "payload-alias.zst"
+                        alias.symlink_to(target)
+                        spec["path"] = alias.name
+                owner_manifest.write_text(json.dumps(manifest), encoding="utf-8")
+                paths = (manifest_path, owner_manifest, source, target)
+                before = {path: path.read_bytes() for path in paths}
+                if reference != "raw":
+                    reader = ChunkedTactileStream(dataset_root=root, spec=spec)
+                    for index, frame in enumerate(expected):
+                        np.testing.assert_array_equal(reader.frame(index), frame)
+
+                self.assertEqual(clean_uncommitted_tactile_recompression_artifacts(root), 0)
+
+                self.assertEqual({path: path.read_bytes() for path in paths}, before)
+                if reference != "raw":
+                    # A new reader must reopen the payload, not reuse its cached chunk.
+                    reader = ChunkedTactileStream(dataset_root=root, spec=spec)
+                    for index, frame in enumerate(expected):
+                        np.testing.assert_array_equal(reader.frame(index), frame)
+
+    def test_cleanup_preserves_a_manifest_at_the_compressed_target_path(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            manifest_path, source, _ = self._dataset(root)
+            target = source.with_name(f"{source.name}.tdelta8.zst")
+            target.write_text(json.dumps({"format": "binary_stream_v1", "streams": {}}))
+            with (root / "meta/episodes.jsonl").open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps({
+                    "episode_index": 1,
+                    "tactile_paths": {"left": target.relative_to(root).as_posix()},
+                }) + "\n")
+            before = {path: path.read_bytes() for path in (manifest_path, source, target)}
+
+            self.assertEqual(clean_uncommitted_tactile_recompression_artifacts(root), 0)
+
+            self.assertEqual({path: path.read_bytes() for path in before}, before)
+
+    def test_cleanup_validates_all_manifests_before_removing_any_target(self) -> None:
+        for invalid in ("json", "stream", "raw_size"):
+            with self.subTest(invalid=invalid), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                manifest_path, source, _ = self._dataset(root)
+                later_manifest, later_source, _ = self._dataset(root, episode_index=1)
+                target = source.with_name(f"{source.name}.tdelta8.zst")
+                target.write_bytes(b"uncommitted-derivative")
+                if invalid == "json":
+                    later_manifest.write_text("{", encoding="utf-8")
+                    expected_error = "Expecting property name"
+                elif invalid == "stream":
+                    manifest = json.loads(later_manifest.read_text(encoding="utf-8"))
+                    manifest["streams"]["sensor"] = None
+                    later_manifest.write_text(json.dumps(manifest), encoding="utf-8")
+                    expected_error = "Invalid stream spec"
+                else:
+                    later_source.write_bytes(b"short-raw")
+                    expected_error = "Raw tactile stream size mismatch"
+                before = {
+                    path: path.read_bytes()
+                    for path in (manifest_path, source, target, later_manifest, later_source)
+                }
+
+                with self.assertRaisesRegex(ValueError, expected_error):
+                    clean_uncommitted_tactile_recompression_artifacts(root)
+
+                self.assertEqual({path: path.read_bytes() for path in before}, before)
+
+    def test_cleanup_keeps_external_compressed_references_compatible(self) -> None:
+        for reference in ("relative", "absolute"):
+            with self.subTest(reference=reference), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary) / "dataset"
+                manifest_path, source, _ = self._dataset(root)
+                owner_manifest, _, expected = self._dataset(root, episode_index=1)
+                external = root.parent / " external-payload.zst "
+                payload = tactile_recompression._ZstdCodec(
+                    level=1, backend="python"
+                ).compress(expected.tobytes())
+                external.write_bytes(payload)
+                manifest = json.loads(owner_manifest.read_text(encoding="utf-8"))
+                spec = manifest["streams"]["sensor"]
+                spec.update(
+                    path=str(external) if reference == "absolute" else f"../{external.name}",
+                    encoding="chunked_zstd",
+                    compression="zstd",
+                    chunks=[{
+                        "frame_start": 0,
+                        "frame_count": len(expected),
+                        "offset": 0,
+                        "compressed_bytes": len(payload),
+                        "raw_bytes": expected.nbytes,
+                    }],
+                )
+                owner_manifest.write_text(json.dumps(manifest), encoding="utf-8")
+                target = source.with_name(f"{source.name}.tdelta8.zst")
+                target.write_bytes(b"uncommitted-derivative")
+                before = {
+                    path: path.read_bytes()
+                    for path in (manifest_path, owner_manifest, source, external)
+                }
+
+                self.assertEqual(clean_uncommitted_tactile_recompression_artifacts(root), 1)
+
+                self.assertFalse(target.exists())
+                self.assertEqual({path: path.read_bytes() for path in before}, before)
+                reader = ChunkedTactileStream(dataset_root=root, spec=spec)
+                for index, frame in enumerate(expected):
+                    np.testing.assert_array_equal(reader.frame(index), frame)
+
+    def test_cleanup_retains_inode_guards_and_unlinks_only_the_candidate(self) -> None:
+        for target_kind in ("raw_symlink", "hardlink", "orphan_symlink"):
+            with self.subTest(target_kind=target_kind), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                manifest_path, source, _ = self._dataset(root)
+                target = source.with_name(f"{source.name}.tdelta8.zst")
+                external = root / "unreferenced-payload.zst"
+                external.write_bytes(b"derivative")
+                if target_kind == "raw_symlink":
+                    target.symlink_to(source)
+                elif target_kind == "hardlink":
+                    os.link(external, target)
+                else:
+                    target.symlink_to(external)
+                before = {
+                    path: path.read_bytes() for path in (manifest_path, source, external)
+                }
+
+                if target_kind == "orphan_symlink":
+                    self.assertEqual(clean_uncommitted_tactile_recompression_artifacts(root), 1)
+                    self.assertFalse(target.is_symlink())
+                elif target_kind == "raw_symlink":
+                    self.assertEqual(clean_uncommitted_tactile_recompression_artifacts(root), 0)
+                    self.assertTrue(target.is_symlink())
+                else:
+                    with self.assertRaisesRegex(RuntimeError, "unsafe uncommitted tactile target inode"):
+                        clean_uncommitted_tactile_recompression_artifacts(root)
+                    self.assertTrue(target.exists())
+
+                self.assertEqual({path: path.read_bytes() for path in before}, before)
 
     @unittest.skipUnless(shutil.which("zstd"), "zstd CLI is required")
     def test_in_place_zstd_commit_round_trips_and_removes_raw(self) -> None:
