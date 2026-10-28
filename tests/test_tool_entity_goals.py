@@ -313,3 +313,53 @@ def test_fused_relation_is_the_union_of_partial_views():
     assert fuse_tool_object_relations([make("far", .2)])["views_agree"] is True
     with pytest.raises(ValueError):
         fuse_tool_object_relations([])
+
+
+# --- bounded tool-axis-down cone ----------------------------------------------------
+
+from robot_motion.tool_entity_goals import MAX_TOOL_AXIS_TILT_RAD, tool_axis_tilt_rad  # noqa: E402
+
+# Measured RealMan-like diagonal tool: approach axis about 61.5 deg from down.
+DIAGONAL = Rotation.align_vectors([[-.527, -.704, -.477]], [[0., 0., 1.]])[0]
+
+
+def test_tool_axis_cone_uses_the_least_rotation_and_stops_at_its_boundary():
+    pose = [.1, .2, .3, *DIAGONAL.as_quat()]
+    start = tool_axis_tilt_rad(DIAGONAL.as_matrix())
+    assert start == pytest.approx(math.acos(.477 / np.linalg.norm([.527, .704, .477])))
+    exact = hover_orientation(pose, "tool_axis_down")
+    assert tool_axis_tilt_rad(exact) == pytest.approx(0., abs=1e-9)
+    for tilt in (math.radians(30.), math.radians(45.)):
+        cone = hover_orientation(pose, "tool_axis_down", tool_axis_max_tilt_rad=tilt)
+        assert tool_axis_tilt_rad(cone) == pytest.approx(tilt, abs=1e-9)
+        # Least rotation: turning by exactly (start - tilt), along the exact alignment's path.
+        turn = Rotation.from_matrix(cone) * DIAGONAL.inv()
+        assert turn.magnitude() == pytest.approx(start - tilt, abs=1e-9)
+        rest = Rotation.from_matrix(exact) * Rotation.from_matrix(cone).inv()
+        assert rest.magnitude() == pytest.approx(tilt, abs=1e-9)
+    inside = Rotation.from_euler("x", 170, degrees=True)  # axis 10 deg from down
+    kept = hover_orientation([0., 0., 0., *inside.as_quat()], "tool_axis_down",
+                             tool_axis_max_tilt_rad=math.radians(30.))
+    np.testing.assert_allclose(kept, inside.as_matrix(), atol=1e-12)
+
+
+@pytest.mark.parametrize("policy,tilt", [
+    ("preserve", .1), ("tool_axis_down", -.1), ("tool_axis_down", MAX_TOOL_AXIS_TILT_RAD + .01),
+    ("tool_axis_down", float("nan")), ("tool_axis_down", True),
+])
+def test_tool_axis_cone_rejects_invalid_requests(policy, tilt):
+    with pytest.raises(ValueError):
+        hover_orientation([0., 0., 0., *DIAGONAL.as_quat()], policy, tool_axis_max_tilt_rad=tilt)
+
+
+def test_hover_goals_carry_the_cone_orientation():
+    pose = [.1, .2, .5, *DIAGONAL.as_quat()]
+    goals = generate_entity_hover_goals(current_tcp_pose_xyz_quat_xyzw=pose, anchor_xyz_m=[.1, .2, .05],
+        tip_offset_bounds_xy_m=[[-.02, .02], [-.02, .02]], clearance_bounds_m=[.03, .06],
+        entity=simple_entity(), points_m=scene_points(), orientation_policy="tool_axis_down",
+        tool_axis_max_tilt_rad=math.radians(30.), max_candidates=3)
+    assert len(goals) == 3
+    for goal in goals:
+        tilt = tool_axis_tilt_rad(Rotation.from_quat(goal.pose_xyz_quat_xyzw[3:]).as_matrix())
+        assert tilt == pytest.approx(math.radians(30.), abs=1e-9)
+        assert .03 - 1e-9 <= goal.clearance_m <= .06 + 1e-9

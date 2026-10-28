@@ -35,6 +35,8 @@ TOOL_ENTITY_HOVER_SEMANTICS_V1 = "agenticrobot.relation.tool_entity_hover.v1"
 HOVER_ORIENTATION_POLICIES = ("preserve", "tool_axis_down")
 MAX_HOVER_TIP_OFFSET_M = 0.25
 MAX_HOVER_CLEARANCE_M = 0.30
+# A tilt cone wider than this is no longer a "tool down" request.
+MAX_TOOL_AXIS_TILT_RAD = math.radians(60.)
 _ROUND = 12
 
 
@@ -384,24 +386,52 @@ def entity_hover_metrics(*, entity: ToolEntityBox, world_from_tcp: np.ndarray, a
                               overhead_point_count=overhead)
 
 
-def hover_orientation(current_tcp_pose_xyz_quat_xyzw: Sequence[float], policy: str) -> np.ndarray:
+def tool_axis_tilt_rad(rotation) -> float:
+    """Angle between the TCP approach axis (+Z) and public reference -Z."""
+    axis = np.asarray(rotation, dtype=float).reshape(3, 3)[:, 2]
+    return float(math.acos(max(-1., min(1., -axis[2] / np.linalg.norm(axis)))))
+
+
+def _tilt(value) -> float:
+    if (isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value)
+            or not 0. <= value <= MAX_TOOL_AXIS_TILT_RAD):
+        raise ValueError("tool_axis_max_tilt_rad must be finite within [0, 60 deg].")
+    return float(value)
+
+
+def hover_orientation(current_tcp_pose_xyz_quat_xyzw: Sequence[float], policy: str, *,
+                      tool_axis_max_tilt_rad: float = 0.) -> np.ndarray:
     """Return the hover TCP rotation for an explicit policy.
 
     ``preserve`` keeps the measured TCP orientation. ``tool_axis_down`` turns
-    the TCP approach axis (+Z) onto public reference -Z with the least
-    rotation, using the shared ``compute_spatial_goal`` alignment convention.
+    the TCP approach axis (+Z) toward public reference -Z with the least
+    rotation, using the shared ``compute_spatial_goal`` alignment convention,
+    and stops at the cone ``tool_axis_max_tilt_rad`` around -Z (0 = exactly
+    down). A tool already inside the cone keeps its measured orientation.
     """
     pose = finite_vector(list(current_tcp_pose_xyz_quat_xyzw), 7, name="current TCP pose")
     if policy not in HOVER_ORIENTATION_POLICIES:
         raise ValueError("Unknown hover orientation policy.")
+    tilt = _tilt(tool_axis_max_tilt_rad)
     if policy == "preserve":
+        if tilt:
+            raise ValueError("A tool-axis tilt cone applies only to tool_axis_down.")
         goal = compute_spatial_goal(current_tcp_pose_xyz_quat_xyzw=list(pose), anchor_xyz_m=list(pose[:3]),
             offset_xyz_m=[0., 0., 0.], offset_frame="reference", orientation_mode="preserve")
-    else:
-        goal = compute_spatial_goal(current_tcp_pose_xyz_quat_xyzw=list(pose), anchor_xyz_m=list(pose[:3]),
-            offset_xyz_m=[0., 0., 0.], offset_frame="reference", orientation_mode="align_axis",
-            tool_axis="z", axis_reference_xyz=[0., 0., -1.])
-    return Rotation.from_quat(goal.pose_xyz_quat_xyzw[3:]).as_matrix()
+        return Rotation.from_quat(goal.pose_xyz_quat_xyzw[3:]).as_matrix()
+    goal = compute_spatial_goal(current_tcp_pose_xyz_quat_xyzw=list(pose), anchor_xyz_m=list(pose[:3]),
+        offset_xyz_m=[0., 0., 0.], offset_frame="reference", orientation_mode="align_axis",
+        tool_axis="z", axis_reference_xyz=[0., 0., -1.])
+    exact = Rotation.from_quat(goal.pose_xyz_quat_xyzw[3:])
+    if not tilt:
+        return exact.as_matrix()
+    current = Rotation.from_quat(pose[3:] / np.linalg.norm(pose[3:]))
+    angle = tool_axis_tilt_rad(current.as_matrix())
+    if angle <= tilt:
+        return current.as_matrix()
+    # Same least rotation as the exact alignment, stopped at the cone boundary.
+    turn = (exact * current.inv()).as_rotvec()
+    return (Rotation.from_rotvec(turn * ((angle - tilt) / np.linalg.norm(turn))) * current).as_matrix()
 
 
 def _interval(value, *, name: str, lower: float, upper: float) -> tuple[float, float]:
@@ -416,6 +446,7 @@ def generate_entity_hover_goals(
     tip_offset_bounds_xy_m: Sequence[Sequence[float]], clearance_bounds_m: Sequence[float],
     entity: ToolEntityBox, points_m, orientation_policy: str = "preserve", max_candidates: int = 8,
     boundary_inset_m: float = 0., support_window_m: float = 0.30, support_margin_m: float = 0.,
+    tool_axis_max_tilt_rad: float = 0.,
 ) -> tuple[EntityHoverCandidate, ...]:
     """Propose tool-box hover poses inside explicit tip-offset and clearance bounds.
 
@@ -442,7 +473,7 @@ def generate_entity_hover_goals(
         _interval(clearance_bounds_m, name="clearance", lower=0., upper=MAX_HOVER_CLEARANCE_M)])
     current = finite_vector(list(current_tcp_pose_xyz_quat_xyzw), 7, name="current TCP pose")
     anchor = _vector3(anchor_xyz_m, name="anchor_xyz_m")
-    rotation = hover_orientation(current, orientation_policy)
+    rotation = hover_orientation(current, orientation_policy, tool_axis_max_tilt_rad=tool_axis_max_tilt_rad)
     points = np.asarray(points_m, dtype=float).reshape(-1, 3)
     inset = np.minimum(boundary_inset_m, (bounds[:, 1] - bounds[:, 0]) / 2.)
     low, high = bounds[:, 0] + inset, bounds[:, 1] - inset
@@ -499,6 +530,7 @@ __all__ = [
     "HOVER_ORIENTATION_POLICIES",
     "MAX_HOVER_CLEARANCE_M",
     "MAX_HOVER_TIP_OFFSET_M",
+    "MAX_TOOL_AXIS_TILT_RAD",
     "TOOL_ENTITY_HOVER_SEMANTICS_V1",
     "TOOL_OBJECT_RELATIONS",
     "TOOL_OBJECT_RELATION_SEMANTICS_V1",
@@ -510,5 +542,6 @@ __all__ = [
     "generate_entity_hover_goals",
     "hover_orientation",
     "object_surface_cluster",
+    "tool_axis_tilt_rad",
     "tool_object_relation",
 ]

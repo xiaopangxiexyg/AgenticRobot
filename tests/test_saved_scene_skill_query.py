@@ -1163,3 +1163,44 @@ def test_tool_object_relations_only_bind_saved_surface_references():
     result = query.describe_tool_object_relations()
     assert result["objects"] == [] and result["unmeasured_references"] == ["top-a"]
     query.close()
+
+
+def test_entity_hover_tool_axis_cone_targets_and_checks_the_achieved_tilt():
+    import math
+    from scipy.spatial.transform import Rotation
+    from robot_motion.tool_entity_goals import tool_axis_tilt_rad
+    planner = Planner()
+    query = _entity_query(planner)
+    diagonal = Rotation.align_vectors([[-.527, -.704, -.477]], [[0., 0., 1.]])[0]
+    query._tcp["right"] = (.1, .2, .5, *diagonal.as_quat().tolist())
+    with pytest.raises(ValueError, match="tilt"):
+        query.plan_entity_hover_region(**HOVER, tool_axis_max_tilt_rad=.3)  # preserve + cone
+    assert not planner.calls
+    result = query.plan_entity_hover_region(**HOVER, orientation_policy="tool_axis_down",
+                                            tool_axis_max_tilt_rad=math.radians(30.))
+    assert result["status"] == "path_found" and result["tool_axis_max_tilt_rad"] == pytest.approx(math.radians(30.))
+    assert tool_axis_tilt_rad(planner.target[:3, :3]) == pytest.approx(math.radians(30.), abs=1e-9)
+    validation = query.audit()["region_queries"][0]["candidate_validations"][0]
+    assert validation["achieved_tool_axis_tilt_rad"] == pytest.approx(math.radians(30.), abs=1e-9)
+    query.close()
+
+
+class TiltingPlanner(Planner):
+    """Arrives at the requested point but with the tool turned 20 deg further from down."""
+
+    def tool_tcp_poses_for_qpos_pair(self, **kwargs):
+        from scipy.spatial.transform import Rotation
+        actual = self.target.copy()
+        actual[:3, :3] = Rotation.from_euler("x", 20, degrees=True).as_matrix() @ actual[:3, :3]
+        return {s: actual for s in ("left", "right")}
+
+
+def test_entity_hover_tool_axis_down_rejects_an_achieved_axis_outside_the_cone():
+    planner = TiltingPlanner()
+    query = _entity_query(planner)
+    result = query.plan_entity_hover_region(**HOVER, orientation_policy="tool_axis_down", max_candidates=2)
+    assert result["status"] == "path_rejected" and result["reason"] == "region_no_candidate_path"
+    validations = query.audit()["region_queries"][0]["candidate_validations"]
+    assert len(validations) == 2 and not any(v["inside_requested_region"] for v in validations)
+    assert all(v["achieved_tool_axis_tilt_rad"] == pytest.approx(np.radians(20.)) for v in validations)
+    query.close()

@@ -33,7 +33,7 @@ from robot_motion.spatial_goal_regions import generate_relation_region_goals, ge
 from robot_motion.tool_entity_goals import (
     HOVER_ORIENTATION_POLICIES, TOOL_ENTITY_HOVER_SEMANTICS_V1, TOOL_OBJECT_RELATION_SEMANTICS_V1,
     ToolEntityBox, entity_hover_metrics, fuse_tool_object_relations, generate_entity_hover_goals,
-    object_surface_cluster, tool_object_relation,
+    hover_orientation, object_surface_cluster, tool_axis_tilt_rad, tool_object_relation,
 )
 from scripts.probes.inspect_safe_move_snapshot import (
     RM65CapturedRobotObservationFilterConfig, backproject, load_captures, resolve_inputs,
@@ -596,7 +596,8 @@ class SavedSceneSkillQuery:
             self._lock.release()
 
     def plan_entity_hover_region(self, *, side, target_reference, tip_offset_bounds_xy_m,
-                                 clearance_bounds_m, orientation_policy="preserve", max_candidates=8):
+                                 clearance_bounds_m, orientation_policy="preserve", max_candidates=8,
+                                 tool_axis_max_tilt_rad=0.):
         """Hover the reviewed gripper box above a saved surface reference.
 
         Semantics ``agenticrobot.relation.tool_entity_hover.v1``: the centre of
@@ -604,7 +605,10 @@ class SavedSceneSkillQuery:
         horizontal offsets from the anchor, and the box's lowest point keeps a
         vertical clearance inside ``clearance_bounds_m`` above the highest
         observed point under its footprint (never below the anchor itself).
-        Orientation is the explicit ``orientation_policy``. Proposals reuse
+        Orientation is the explicit ``orientation_policy``; ``tool_axis_down``
+        may allow a cone ``tool_axis_max_tilt_rad`` around reference -Z (least
+        rotation into the cone; the achieved axis is re-checked against it,
+        within the arrival rotation tolerance). Proposals reuse
         the same budgeted region loop and the same lower planner; the achieved
         FK pose is re-measured against the ORIGINAL bounds. Planning only.
         """
@@ -615,17 +619,21 @@ class SavedSceneSkillQuery:
             raise ValueError("No reviewed tool entity is bound for this arm.")
         if orientation_policy not in HOVER_ORIENTATION_POLICIES:
             raise ValueError("Unknown hover orientation policy.")
+        # Validates the cone before any lock or native work.
+        hover_orientation(self._tcp[side], orientation_policy, tool_axis_max_tilt_rad=tool_axis_max_tilt_rad)
         if not self._lock.acquire(blocking=False):
             raise RuntimeError("A query is already running for this saved scene.")
         try:
             return self._plan_entity_hover_locked(side=side, target_reference=target_reference,
                 tip_offset_bounds_xy_m=tip_offset_bounds_xy_m, clearance_bounds_m=clearance_bounds_m,
-                orientation_policy=orientation_policy, max_candidates=max_candidates)
+                orientation_policy=orientation_policy, max_candidates=max_candidates,
+                tool_axis_max_tilt_rad=float(tool_axis_max_tilt_rad))
         finally:
             self._lock.release()
 
     def _plan_entity_hover_locked(self, *, side, target_reference, tip_offset_bounds_xy_m,
-                                  clearance_bounds_m, orientation_policy, max_candidates):
+                                  clearance_bounds_m, orientation_policy, max_candidates,
+                                  tool_axis_max_tilt_rad=0.):
         anchor = np.asarray(self._refs[target_reference]["world_xyz_m"], dtype=float)
         entity = self._tool_entities[side]
         points = self._cloud.points_m
@@ -639,14 +647,16 @@ class SavedSceneSkillQuery:
                 entity=entity, points_m=points, orientation_policy=orientation_policy,
                 max_candidates=max_candidates,
                 boundary_inset_m=RealAgentPrimitiveConvergenceProfile().translation_tolerance_m,
-                support_window_m=window, support_margin_m=margin)
+                support_window_m=window, support_margin_m=margin,
+                tool_axis_max_tilt_rad=tool_axis_max_tilt_rad)
             return [_RegionProposal(pose=candidate.pose_xyz_quat_xyzw,
                         relation={"entity_hover": {"tip_offset_xy_m": list(candidate.tip_offset_xy_m),
                             "clearance_m": candidate.clearance_m,
                             "support_height_m": candidate.metrics.support_height_m,
                             "footprint_point_count": candidate.metrics.footprint_point_count,
                             "overhead_point_count": candidate.metrics.overhead_point_count,
-                            "orientation_policy": orientation_policy}},
+                            "orientation_policy": orientation_policy,
+                            "tool_axis_max_tilt_rad": tool_axis_max_tilt_rad}},
                         selection={"selected_tip_offset_xy_m": list(candidate.tip_offset_xy_m),
                                    "selected_clearance_m": candidate.clearance_m})
                     for candidate in candidates]
@@ -660,16 +670,23 @@ class SavedSceneSkillQuery:
             dx, dy = metrics.tip_offset_xy_m
             within = (x_low - 1e-9 <= dx <= x_high + 1e-9 and y_low - 1e-9 <= dy <= y_high + 1e-9
                       and c_low - 1e-9 <= metrics.clearance_m <= c_high + 1e-9)
-            return {"achieved_tip_offset_xy_m": [dx, dy], "achieved_clearance_m": metrics.clearance_m,
-                    "achieved_support_height_m": metrics.support_height_m,
-                    "achieved_footprint_point_count": metrics.footprint_point_count,
-                    "inside_requested_region": within}, within
+            record = {"achieved_tip_offset_xy_m": [dx, dy], "achieved_clearance_m": metrics.clearance_m,
+                      "achieved_support_height_m": metrics.support_height_m,
+                      "achieved_footprint_point_count": metrics.footprint_point_count}
+            if orientation_policy == "tool_axis_down":
+                tilt = tool_axis_tilt_rad(_pose_matrix(row["planned_endpoint_pose_xyz_quat_xyzw"])[:3, :3])
+                record["achieved_tool_axis_tilt_rad"] = tilt
+                within = within and tilt <= (tool_axis_max_tilt_rad + 1e-9
+                    + RealAgentPrimitiveConvergenceProfile().rotation_tolerance_rad)
+            record["inside_requested_region"] = within
+            return record, within
 
         return self._search_region_locked(side=side, target_reference=target_reference,
             summary_fields={"semantics": TOOL_ENTITY_HOVER_SEMANTICS_V1,
                 "tip_offset_bounds_xy_m": copy.deepcopy(tip_offset_bounds_xy_m),
                 "clearance_bounds_m": copy.deepcopy(clearance_bounds_m),
                 "orientation_policy": orientation_policy, "candidate_policy": "entity_proximity",
+                "tool_axis_max_tilt_rad": tool_axis_max_tilt_rad,
                 "support_window_m": window, "support_margin_m": margin,
                 "tool_entity": entity.identity()},
             hidden_fields=("tip_offset_bounds_xy_m", "clearance_bounds_m", "tool_entity"),
