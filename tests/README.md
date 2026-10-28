@@ -97,6 +97,11 @@ DEXTELEOP_FULL_ACCEPTANCE_SHARDS=12 DEXTELEOP_FULL_ACCEPTANCE_MAX_JOBS=2 \
 结果；调用者需要保留基线完整验收及当前环境记录。并发上限不是内存容量保证，
 仍使用所在主机既有内存门禁和资源上限。
 
+按变更运行先规划**完整集合**，再从各批次过滤省略项；保留每个 retained target
+的批次和相对顺序，不把较小集合重新按 CPU 时间打包。原生堆峰值与时间负载并不
+等价，重新打包可能使两个大堆同时运行。若过滤使配置中的某批变空，保守回退
+全量，避免暗中改变批次数、并发或制造空批通过记录。实际内存门禁仍是必需条件。
+
 | 变更/依赖情况 | 当前策略 |
 | --- | --- |
 | 全部更改在 `agent_gateway/`、`deployments/perception/`、`docs/agent_gateway/`、`tests/test_agent_gateway_*.py` 或 `tests/test_sam3_service.py` 内，且依赖核查通过 | 仅省去下列七个长模块，其余测试全部重新运行 |

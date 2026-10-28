@@ -45,11 +45,16 @@ def _wrapper_checkout(tmp_path: Path) -> tuple[Path, Path, Path]:
     (scripts / "pytest_sharding.py").write_text(
         """#!/usr/bin/env python3
 import os
-from pathlib import Path
-import subprocess
 import sys
 
+import pytest_sharding_real as real
 from pytest_sharding_real import plan_shards, write_plan
+
+if os.environ.get("FAKE_ZERO_CONTROL_WEIGHTS") == "1":
+    # These fixture control modules contain only 'pass', not real rollouts.
+    for path in real.FULL_WEIGHTS:
+        if path.startswith(("tests/test_b601_", "tests/test_rebot_b601_")):
+            real.FULL_WEIGHTS[path] = 0.0
 
 if __name__ == "__main__":
     if sys.argv[1:2] == ["check-sockets"]:
@@ -57,8 +62,7 @@ if __name__ == "__main__":
         if status:
             print("fake socket preflight rejected", file=sys.stderr)
         raise SystemExit(status)
-    real = Path(__file__).with_name("pytest_sharding_real.py")
-    raise SystemExit(subprocess.run([sys.executable, str(real), *sys.argv[1:]]).returncode)
+    raise SystemExit(real.main(sys.argv[1:]))
 """,
         encoding="utf-8",
     )
@@ -144,6 +148,7 @@ def _run_wrapper(
             "FAKE_SOCKET_PREFLIGHT_STATUS": str(socket_preflight_status),
             "FAKE_NODE_PREFLIGHT_STATUS": str(node_preflight_status),
             "FAKE_MUTATE_SOURCE": str(mutate_source) if mutate_source else "",
+            "FAKE_ZERO_CONTROL_WEIGHTS": "1" if extra_arguments else "0",
             "FAKE_SYNC_ROOT": str(sync_root),
             "PATH": str(wrapper.parent) + os.pathsep + environment.get("PATH", ""),
         }

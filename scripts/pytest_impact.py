@@ -495,12 +495,36 @@ def verify_checkout(repository: Path, report: dict) -> None:
         raise ValueError("change-aware acceptance requires regular test modules")
 
 
+def selection_for_shards(repository: Path, base: str, shard_count: int) -> dict:
+    from pytest_sharding import plan_shards
+
+    report = selection(repository, base)
+    report["shard_count"] = shard_count
+    report["shard_layout"] = "filtered-complete-plan.v1"
+    shards = plan_shards(
+        repository,
+        repository / "tests",
+        shard_count,
+        "full",
+        test_modules=report["selected_modules"],
+    )
+    if report["mode"] == "affected" and any(not shard for shard in shards):
+        report["mode"] = "full"
+        report["selected_modules"] = sorted(
+            set(report["selected_modules"]) | set(report["excluded_modules"])
+        )
+        report["excluded_modules"] = []
+        report["fallback_reasons"].append(
+            "filtering the complete plan would empty a configured shard; retain full acceptance"
+        )
+    return report
+
+
 def verify(repository: Path, path: Path, shard_count: int) -> None:
     repository = repository.resolve()
     report = json.loads(path.read_text())
     verify_checkout(repository, report)
-    expected = selection(repository, report["base_commit"])
-    expected["shard_count"] = shard_count
+    expected = selection_for_shards(repository, report["base_commit"], shard_count)
     if {key: report.get(key) for key in expected} != expected:
         raise ValueError("selection does not match the pinned Git inputs and policy")
     if hashlib.sha256(
@@ -617,12 +641,14 @@ def main(argv: list[str] | None = None) -> int:
                         ET.SubElement(properties, "property", name=key, value=value)
                 document.write(args.junit, encoding="utf-8", xml_declaration=True)
             return 0
-        report = selection(args.repository, args.base, getattr(args, "head", "HEAD"))
         if args.command == "inspect":
+            report = selection(args.repository, args.base, args.head)
             report["advisory_only"] = True
+            report["shard_configuration_checked"] = False
             report["checkout_clean"] = clean(args.repository)
             print(json.dumps(report, indent=2))
             return 0
+        report = selection_for_shards(args.repository.resolve(), args.base, args.shards)
         verify_checkout(args.repository.resolve(), report)
         from pytest_sharding import write_plan
 
@@ -638,7 +664,6 @@ def main(argv: list[str] | None = None) -> int:
         report["shard_plan_sha256"] = hashlib.sha256(
             (args.output_dir / "shard-plan.json").read_bytes()
         ).hexdigest()
-        report["shard_count"] = args.shards
         report["paths_sha256"] = {
             p.name: hashlib.sha256(p.read_bytes()).hexdigest()
             for p in sorted(args.output_dir.glob("shard-*-paths.txt"))

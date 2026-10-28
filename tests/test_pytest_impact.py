@@ -355,9 +355,9 @@ def test_invalid_or_nonancestor_base_is_rejected(repository, impact):
         impact.selection(repo, future, base)
 
 
-def _cli(repo, *arguments):
+def _cli(repo, *arguments, shards=2):
     if arguments[0] == "verify":
-        arguments = (*arguments, "--shards", "2")
+        arguments = (*arguments, "--shards", str(shards))
     return subprocess.run(
         [sys.executable, str(SELECTOR), *arguments, "--repository", str(repo)],
         capture_output=True,
@@ -457,3 +457,25 @@ def test_plan_refuses_dirty_source_before_generating_evidence(repository, tmp_pa
     assert result.returncode != 0
     assert not (output / "selection.json").exists()
     assert not (output / "shard-plan.json").exists()
+
+
+def test_empty_filtered_batch_restores_full_without_repacking(repository, tmp_path):
+    repo, base = repository
+    _write(repo, "agent_gateway/feature.py", "VALUE = 2\n")
+    _checkpoint(repo)
+    output = tmp_path / "empty-batch"
+    output.mkdir()
+    result = _cli(
+        repo, "plan", "--base", base, "--output-dir", str(output), "--shards", "3"
+    )
+    assert result.returncode == 0, result.stderr
+    report = json.loads((output / "selection.json").read_text())
+    assert report["mode"] == "full"
+    assert not report["excluded_modules"]
+    assert any("empty" in reason for reason in report["fallback_reasons"])
+    assert (
+        _cli(
+            repo, "verify", "--selection", str(output / "selection.json"), shards=3
+        ).returncode
+        == 0
+    )
