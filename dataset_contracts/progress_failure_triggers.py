@@ -8,9 +8,10 @@ record a discrete, post-capture refinement of the onset of a captured Failure.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-import math
+from functools import partial as _partial
 from typing import Any, Mapping
 
+from . import _progress_validation as _validation
 from .canonical_encoding import canonical_content_hash
 
 
@@ -50,49 +51,11 @@ class FailureTriggerContractError(ValueError):
     """Raised when a failure-trigger artifact is ambiguous or malformed."""
 
 
-def _required(value: object, *, name: str) -> str:
-    if not isinstance(value, str) or not value.strip():
-        raise FailureTriggerContractError(
-            f"{name} must be a non-empty string."
-        )
-    return value.strip()
-
-
-def _sha256(value: object, *, name: str) -> str:
-    result = _required(value, name=name).lower()
-    if len(result) != 64 or any(
-        character not in "0123456789abcdef" for character in result
-    ):
-        raise FailureTriggerContractError(
-            f"{name} must be a lowercase SHA-256 digest."
-        )
-    return result
-
-
-def _finite(value: object, *, name: str) -> float:
-    if not isinstance(value, (int, float)) or isinstance(value, bool):
-        raise FailureTriggerContractError(f"{name} must be numeric.")
-    result = float(value)
-    if not math.isfinite(result):
-        raise FailureTriggerContractError(f"{name} must be finite.")
-    return result
-
-
-def _nonnegative_int(value: object, *, name: str) -> int:
-    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
-        raise FailureTriggerContractError(
-            f"{name} must be a non-negative integer."
-        )
-    return value
-
-
-def _confidence(value: object) -> float:
-    result = _finite(value, name="confidence")
-    if result < 0.0 or result > 1.0:
-        raise FailureTriggerContractError(
-            "confidence must lie in [0, 1]."
-        )
-    return result
+_required = _partial(_validation.required_text, FailureTriggerContractError)
+_sha256 = _partial(_validation.sha256_digest, FailureTriggerContractError)
+_finite = _partial(_validation.finite_number, FailureTriggerContractError)
+_nonnegative_int = _partial(_validation.nonnegative_int, FailureTriggerContractError)
+_confidence = _partial(_validation.confidence, FailureTriggerContractError)
 
 
 def _verify_declared_hash(

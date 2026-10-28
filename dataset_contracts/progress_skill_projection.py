@@ -11,8 +11,10 @@ validation and sample-interval projection belong to :mod:`dataset_interface`.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from functools import partial as _partial
 from typing import Any, Mapping
 
+from . import _progress_validation as _validation
 from .canonical_encoding import canonical_content_hash
 
 
@@ -47,23 +49,8 @@ class ProgressSkillProjectionContractError(ValueError):
     """Raised when a Skill or projection contract is ambiguous."""
 
 
-def _required(value: object, *, name: str) -> str:
-    if not isinstance(value, str) or not value.strip():
-        raise ProgressSkillProjectionContractError(
-            f"{name} must be a non-empty string."
-        )
-    return value.strip()
-
-
-def _sha256(value: object, *, name: str) -> str:
-    result = _required(value, name=name).lower()
-    if len(result) != 64 or any(
-        character not in "0123456789abcdef" for character in result
-    ):
-        raise ProgressSkillProjectionContractError(
-            f"{name} must be a lowercase SHA-256 digest."
-        )
-    return result
+_required = _partial(_validation.required_text, ProgressSkillProjectionContractError)
+_sha256 = _partial(_validation.sha256_digest, ProgressSkillProjectionContractError)
 
 
 def _unique_strings(

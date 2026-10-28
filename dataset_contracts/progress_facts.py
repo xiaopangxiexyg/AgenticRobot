@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-import math
+from functools import partial as _partial
 from typing import Any, ClassVar, Mapping, Protocol, TypeAlias
 
+from . import _progress_validation as _validation
 from .canonical_encoding import canonical_content_hash
 
 
@@ -86,36 +87,10 @@ class ProgressFactContractError(ValueError):
     """Raised when a persisted progress fact is incomplete or contradictory."""
 
 
-def _required(value: object, *, name: str) -> str:
-    if not isinstance(value, str) or not value.strip():
-        raise ProgressFactContractError(
-            f"{name} must be a non-empty string."
-        )
-    return value.strip()
-
-
-def _sha256(value: object, *, name: str) -> str:
-    result = _required(value, name=name).lower()
-    if len(result) != 64 or any(char not in "0123456789abcdef" for char in result):
-        raise ProgressFactContractError(
-            f"{name} must be a lowercase SHA-256 digest."
-        )
-    return result
-
-
-def _finite(value: Any, *, name: str) -> float:
-    if not isinstance(value, (int, float)) or isinstance(value, bool):
-        raise ProgressFactContractError(f"{name} must be numeric.")
-    result = float(value)
-    if not math.isfinite(result):
-        raise ProgressFactContractError(f"{name} must be finite.")
-    return result
-
-
-def _positive_int(value: Any, *, name: str) -> int:
-    if not isinstance(value, int) or isinstance(value, bool) or value < 1:
-        raise ProgressFactContractError(f"{name} must be a positive integer.")
-    return value
+_required = _partial(_validation.required_text, ProgressFactContractError)
+_sha256 = _partial(_validation.sha256_digest, ProgressFactContractError)
+_finite = _partial(_validation.finite_number, ProgressFactContractError)
+_positive_int = _partial(_validation.positive_int, ProgressFactContractError)
 
 
 def _optional_finite(value: object | None, *, name: str) -> float | None:

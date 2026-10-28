@@ -9,9 +9,10 @@ overrides.  They never rewrite raw samples, video, or the source progress log.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-import math
+from functools import partial as _partial
 from typing import Any, Mapping
 
+from . import _progress_validation as _validation
 from .canonical_encoding import canonical_content_hash
 
 
@@ -93,12 +94,7 @@ class ProgressStageAnnotationContractError(ValueError):
     """Raised when a stage annotation artifact is ambiguous or malformed."""
 
 
-def _required(value: object, *, name: str) -> str:
-    if not isinstance(value, str) or not value.strip():
-        raise ProgressStageAnnotationContractError(
-            f"{name} must be a non-empty string."
-        )
-    return value.strip()
+_required = _partial(_validation.required_text, ProgressStageAnnotationContractError)
 
 
 def _optional_text(value: object | None, *, name: str) -> str | None:
@@ -112,45 +108,10 @@ def _optional_text(value: object | None, *, name: str) -> str | None:
     return text or None
 
 
-def _sha256(value: object, *, name: str) -> str:
-    result = _required(value, name=name).lower()
-    if len(result) != 64 or any(
-        char not in "0123456789abcdef" for char in result
-    ):
-        raise ProgressStageAnnotationContractError(
-            f"{name} must be a lowercase SHA-256 digest."
-        )
-    return result
-
-
-def _finite(value: object, *, name: str) -> float:
-    if not isinstance(value, (int, float)) or isinstance(value, bool):
-        raise ProgressStageAnnotationContractError(
-            f"{name} must be numeric."
-        )
-    result = float(value)
-    if not math.isfinite(result):
-        raise ProgressStageAnnotationContractError(
-            f"{name} must be finite."
-        )
-    return result
-
-
-def _positive_int(value: object, *, name: str) -> int:
-    if not isinstance(value, int) or isinstance(value, bool) or value < 1:
-        raise ProgressStageAnnotationContractError(
-            f"{name} must be a positive integer."
-        )
-    return value
-
-
-def _confidence(value: object) -> float:
-    result = _finite(value, name="confidence")
-    if result < 0.0 or result > 1.0:
-        raise ProgressStageAnnotationContractError(
-            "confidence must lie in [0, 1]."
-        )
-    return result
+_sha256 = _partial(_validation.sha256_digest, ProgressStageAnnotationContractError)
+_finite = _partial(_validation.finite_number, ProgressStageAnnotationContractError)
+_positive_int = _partial(_validation.positive_int, ProgressStageAnnotationContractError)
+_confidence = _partial(_validation.confidence, ProgressStageAnnotationContractError)
 
 
 def _verify_declared_hash(

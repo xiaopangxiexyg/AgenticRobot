@@ -25,6 +25,12 @@ Existing imports through `teleop_runtime.collection.schema_v21`,
 `utils.dataset_postprocess.wrist_cam_adjust.depth` remain compatibility exports;
 new format-level code should import this package directly.
 
+`dataset_contracts`、`dataset_interface` 和 `collection_runtime.progress` 的包根
+以有序懒加载映射声明公共导出，随后生成独立的 `__all__` 列表快照；仅供具名访问的
+兼容项在快照之后追加。因此名称、owner 和星号导入范围只需在对应位置维护一次，
+已有星号导入顺序、按需加载、对象身份与缓存行为保持不变。新增具名兼容项时，应继续
+放在快照之后，避免无意扩大 `import *` 的接口。
+
 ## Arm hold-intent training contract
 
 `dataset_contracts.arm_mode` freezes the existing
@@ -41,6 +47,12 @@ label spec remain valid action-training datasets and expose no arm-hold
 contract. Missing row columns are never guessed into negative targets.
 
 ## Collection progress contracts
+
+Progress 与 retrospective 契约的相同基础校验由私有 `_progress_validation.py`
+统一实现；各领域通过标准库 `partial` 绑定原有异常类。这里只共享必填文本、SHA-256、
+有限数值、正整数、非负整数和置信度规则，领域错误类型、公开数据类型及序列化/hash
+仍由原模块持有。可选字段语义、声明 hash 的错误措辞，以及 retrospective 正整数
+先检查非负再拒绝零的顺序继续留在原模块，不能因名称相近而合并。
 
 `dataset_contracts.progress_profile` and `dataset_contracts.progress_facts`
 define the first p2 capture-truth slice without importing a runtime or GUI:
