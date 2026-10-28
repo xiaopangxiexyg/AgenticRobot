@@ -265,6 +265,8 @@ def test_factory_defaults_to_inherited_clearance_and_binds_strict_opt_out(input_
         configs.append(kwargs["config"])
         return Planner()
     monkeypatch.setattr(module, "RM65GraspJointTrajectoryPlanner", create_planner)
+    # The URDF contact solids are native geometry, covered by their own test.
+    monkeypatch.setattr(module, "dmtac_open_sensor_contact_solids", lambda *_a, **_k: {})
     for kwargs, enabled in (({}, True), ({"enable_inherited_start_clearance": True}, True),
                             ({"enable_inherited_start_clearance": False}, False)):
         query = SavedSceneSkillQuery.from_manifest(input_manifest, **kwargs)
@@ -1204,3 +1206,32 @@ def test_entity_hover_tool_axis_down_rejects_an_achieved_axis_outside_the_cone()
     assert len(validations) == 2 and not any(v["inside_requested_region"] for v in validations)
     assert all(v["achieved_tool_axis_tilt_rad"] == pytest.approx(np.radians(20.)) for v in validations)
     query.close()
+
+
+def test_station_urdf_open_dmtac_sensor_boxes_extend_beyond_the_screening_fingers():
+    pytest.importorskip("pinocchio")
+    from pathlib import Path
+    from scripts.probes.query_safe_move_snapshot import (
+        default_tool_entity_by_side, dmtac_open_sensor_contact_solids)
+    urdf = (Path(__file__).resolve().parents[1]
+            / "assets/realman_dual_arm_inspire_gripper_dmtacm/realman_dual_arm_inspire_gripper_dmtacm.urdf")
+    reviewed = (0., 0., .14, 0., 0., 0.)
+    solids = dmtac_open_sensor_contact_solids(urdf, {"left": reviewed, "right": reviewed, "other": (0., 0., .1, 0., 0., 0.)})
+    assert set(solids) == {"left", "right"}
+    entities = default_tool_entity_by_side({"right": reviewed}, urdf_path=urdf)
+    entity = entities["right"]
+    rotation = np.asarray(entity.tcp_from_box_rotation).reshape(3, 3)
+    outer = max(abs(np.asarray(c) @ rotation)[0] + h[0] for c, h in entity.parts[1:])
+    reach = []
+    for pose, half in entity.contact_solids:
+        np.testing.assert_allclose(sorted(half), sorted((.0182, .0376, .024)), atol=1e-4)
+        transform = np.asarray(pose).reshape(4, 4)
+        corners = np.array([[x, y, z] for x in (-1, 1) for y in (-1, 1) for z in (-1, 1)]) * half
+        reach.append(np.abs(((corners @ transform[:3, :3].T) + transform[:3, 3]) @ rotation)[:, 0].max())
+    # Same numbers as the MuJoCo twin: outer sensor faces ~85 mm vs screening 55 mm.
+    assert outer == pytest.approx(.0552, abs=5e-4)
+    assert min(reach) == pytest.approx(.0846, abs=1e-3) and max(reach) == pytest.approx(.0852, abs=1e-3)
+    assert entity.source["contact_solids"] == "urdf_dmtac_sensor_collision_boxes_open_v1"
+    # Hover geometry stays the screening box.
+    plain = default_tool_entity_by_side({"right": reviewed})["right"]
+    np.testing.assert_allclose(entity.corners_tcp(), plain.corners_tcp())

@@ -363,3 +363,36 @@ def test_hover_goals_carry_the_cone_orientation():
         tilt = tool_axis_tilt_rad(Rotation.from_quat(goal.pose_xyz_quat_xyzw[3:]).as_matrix())
         assert tilt == pytest.approx(math.radians(30.), abs=1e-9)
         assert .03 - 1e-9 <= goal.clearance_m <= .06 + 1e-9
+
+
+# --- contact-only oriented solids ---------------------------------------------------
+
+def _with_sensor(entity):
+    from dataclasses import replace
+    pose = np.eye(4)
+    pose[:3, :3] = Rotation.from_euler("z", 30, degrees=True).as_matrix()
+    pose[:3, 3] = (.06, 0., .02)
+    return replace(entity, contact_solids=((tuple(pose.reshape(-1)), (.01, .01, .02)),))
+
+
+def test_contact_solids_join_only_the_relation_contact_band():
+    plain = simple_entity()
+    sensor = _with_sensor(plain)
+    probe = box_surface((.07, 0., .02), (.004, .004, .004))  # inside the extra solid, 3 cm off the finger
+    assert relation_of(probe).relation == "near"
+    extended = tool_object_relation(entity=sensor, world_from_tcp=WORLD_FROM_TCP, object_points_m=to_world(probe))
+    assert extended.relation == "in_contact_band" and extended.surface_distance_m < 0.
+    # Hover geometry, closing region and identity of the screening box are unchanged.
+    np.testing.assert_allclose(sensor.corners_tcp(), plain.corners_tcp())
+    assert sensor.grasp_region == plain.grasp_region and sensor.parts == plain.parts
+    assert len(sensor.identity()["contact_solids"]) == 1 and plain.identity()["contact_solids"] == []
+
+
+@pytest.mark.parametrize("pose,half", [
+    (np.eye(4).reshape(-1)[:12], (.01, .01, .01)), (np.eye(4).reshape(-1), (.01, 0., .01)),
+    (np.diag([1., 1., -1., 1.]).reshape(-1), (.01, .01, .01)),
+])
+def test_contact_solids_must_be_rigid_boxes(pose, half):
+    from dataclasses import replace
+    with pytest.raises(ValueError):
+        replace(simple_entity(), contact_solids=((tuple(pose), half),))

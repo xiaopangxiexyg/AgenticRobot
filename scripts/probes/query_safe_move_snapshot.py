@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import dataclasses
 import hashlib
 import json
 import math
@@ -73,12 +74,57 @@ def object_surface_from_mask(mask, capture, *, maximum_depth_m):
     return surface, {**evidence, **cluster}
 
 
-def default_tool_entity_by_side(tool_tcp_pose_flange_m_rad_by_side):
+def dmtac_open_sensor_contact_solids(urdf_path, tool_tcp_pose_flange_m_rad_by_side):
+    """URDF DMTAC sensor collision boxes at the neutral (open) gripper, per TCP frame.
+
+    The grasp-screening finger solids are 19.9 mm thick; the station URDF's
+    sensor collision boxes are 48 mm along the closing axis and reach about
+    30 mm beyond them when open (identical in the MuJoCo twin). They are
+    returned as contact-only solids for arms with the reviewed TCP; an arm
+    without exactly two such boxes gets none.
+    """
+    import pinocchio as pin
+    from deployments.perception.dmtac_grasp_overlay import DMTAC_M_REVIEWED_TOOL_TCP_POSE_FLANGE_M_RAD
+
+    path = Path(urdf_path).resolve(strict=True)
+    model = pin.buildModelFromUrdf(str(path))
+    geometry = pin.buildGeomFromUrdf(model, str(path), pin.GeometryType.COLLISION,
+                                     package_dirs=[str(path.parent), str(path.parent.parent)])
+    data, geometry_data = model.createData(), pin.GeometryData(geometry)
+    q = pin.neutral(model)
+    pin.forwardKinematics(model, data, q)
+    pin.updateFramePlacements(model, data)
+    pin.updateGeometryPlacements(model, data, geometry, geometry_data, q)
+    result = {}
+    for side, tcp in tool_tcp_pose_flange_m_rad_by_side.items():
+        if not np.allclose(np.asarray(tcp, dtype=float), DMTAC_M_REVIEWED_TOOL_TCP_POSE_FLANGE_M_RAD,
+                           atol=1e-9, rtol=0.):
+            continue
+        frame = side + "_arm_link6"
+        if not model.existFrame(frame):
+            continue
+        world_from_tcp = data.oMf[model.getFrameId(frame)].homogeneous.copy()
+        world_from_tcp[:3, 3] += world_from_tcp[:3, 2] * float(tcp[2])  # reviewed TCP: pure +Z offset
+        solids = []
+        for index, item in enumerate(geometry.geometryObjects):
+            half = getattr(item.geometry, "halfSide", None)
+            if half is None or not item.name.startswith(side + "_gripper_") or "dm_tac_w2m_sensor" not in item.name:
+                continue
+            pose = np.linalg.inv(world_from_tcp) @ geometry_data.oMg[index].homogeneous
+            solids.append((tuple(pose.reshape(-1)), tuple(float(x) for x in np.asarray(half))))
+        if len(solids) == 2:
+            result[side] = tuple(solids)
+    return result
+
+
+def default_tool_entity_by_side(tool_tcp_pose_flange_m_rad_by_side, *, urdf_path=None):
     """Bind the reviewed grasp-screening gripper box where the TCP matches it.
 
     The DMTAC GraspGenX alignment v5 solid frame is defined relative to the
     reviewed 140 mm tool TCP. Any other TCP leaves that arm without an entity;
-    entity queries then fail instead of reinterpreting the box.
+    entity queries then fail instead of reinterpreting the box. With
+    ``urdf_path`` the URDF's open DMTAC sensor boxes join as contact-only
+    solids for tool-object relations; hover geometry is unchanged.
     """
     from deployments.perception.dmtac_grasp_overlay import (
         DMTAC_M_REVIEWED_TOOL_TCP_POSE_FLANGE_M_RAD, dmtac_graspgenx_alignment_profile,
@@ -92,10 +138,17 @@ def default_tool_entity_by_side(tool_tcp_pose_flange_m_rad_by_side):
               "tool_tcp_pose_flange_m_rad": list(DMTAC_M_REVIEWED_TOOL_TCP_POSE_FLANGE_M_RAD),
               "opening_policy": "maximum_opening_envelope_v1"}
     result = {}
+    contact = ({} if urdf_path is None
+               else dmtac_open_sensor_contact_solids(urdf_path, tool_tcp_pose_flange_m_rad_by_side))
     for side, tcp in tool_tcp_pose_flange_m_rad_by_side.items():
         if np.allclose(np.asarray(tcp, dtype=float), DMTAC_M_REVIEWED_TOOL_TCP_POSE_FLANGE_M_RAD,
                        atol=1e-9, rtol=0.):
-            result[side] = ToolEntityBox.from_parallel_jaw_geometry(geometry, source={**source, "side": side})
+            entity = ToolEntityBox.from_parallel_jaw_geometry(geometry, source={**source, "side": side})
+            if side in contact:
+                entity = dataclasses.replace(entity, contact_solids=contact[side], source={
+                    **entity.source, "contact_solids": "urdf_dmtac_sensor_collision_boxes_open_v1",
+                    "contact_solids_urdf": Path(urdf_path).name})
+            result[side] = entity
     return result
 
 
@@ -400,7 +453,7 @@ class SavedSceneSkillQuery:
         planner = RM65GraspJointTrajectoryPlanner(profile=profile,
             planning_target_builder=builder, target_envelope_filter=builder.pre_ik_target_safety_filter,
             config=plan_config)
-        tool_entities = default_tool_entity_by_side(profile.tool_tcp_pose_flange_m_rad_by_side)
+        tool_entities = default_tool_entity_by_side(profile.tool_tcp_pose_flange_m_rad_by_side, urdf_path=urdf)
         return cls(scene_id=scene_id, reference_frame_id=profile.station_world_frame_id,
             qpos_by_side=qpos, tcp_pose_by_side=poses, anchors=anchors, planner=planner, cloud=cloud,
             source_evidence={"fixed_files": dict(manifest["fixed_files"]),

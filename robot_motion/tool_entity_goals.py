@@ -62,6 +62,10 @@ class ToolEntityBox:
     # (palm and fingers) and the closing region between the fingers.
     parts: tuple[tuple[tuple[float, float, float], tuple[float, float, float]], ...] = ()
     grasp_region: tuple[tuple[float, float, float], tuple[float, float, float]] | None = None
+    # Optional extra contact-only solids with their own axes: (TCP-from-solid
+    # 4x4 row-major, half extents). They join the relation contact band only;
+    # the hover box, its footprint and the closing region are unchanged.
+    contact_solids: tuple[tuple[tuple[float, ...], tuple[float, float, float]], ...] = ()
 
     def __post_init__(self) -> None:
         centre = _vector3(self.tcp_from_box_xyz_m, name="tcp_from_box_xyz_m")
@@ -85,6 +89,21 @@ class ToolEntityBox:
                 raise ValueError(f"{name} half extents must be positive.")
             return tuple(float(x) for x in c), tuple(float(x) for x in h)
         object.__setattr__(self, "parts", tuple(box(part, "tool part") for part in self.parts))
+
+        def oriented(value):
+            if len(value) != 2:
+                raise ValueError("contact solid must be (TCP-from-solid pose, half extents).")
+            pose = np.asarray(value[0], dtype=float)
+            h = _vector3(value[1], name="contact solid half")
+            if (pose.size != 16 or not np.isfinite(pose).all() or np.any(h <= 0)
+                    or not np.allclose(pose.reshape(4, 4)[3], (0., 0., 0., 1.), atol=1e-9, rtol=0.)):
+                raise ValueError("contact solid needs a finite rigid 4x4 pose and positive half extents.")
+            r = pose.reshape(4, 4)[:3, :3]
+            if (not np.allclose(r.T @ r, np.eye(3), atol=1e-7, rtol=0.)
+                    or not np.isclose(np.linalg.det(r), 1., atol=1e-7, rtol=0.)):
+                raise ValueError("contact solid rotation must be right-handed orthonormal.")
+            return tuple(float(x) for x in pose.reshape(-1)), tuple(float(x) for x in h)
+        object.__setattr__(self, "contact_solids", tuple(oriented(item) for item in self.contact_solids))
         if self.grasp_region is not None:
             object.__setattr__(self, "grasp_region", box(self.grasp_region, "grasp region"))
         object.__setattr__(self, "tcp_from_box_xyz_m", tuple(float(x) for x in centre))
@@ -146,7 +165,8 @@ class ToolEntityBox:
                 "half_extents_m": list(self.half_extents_m),
                 "tip_center_tcp_m": list(self.tip_center_tcp_m), "source": dict(self.source),
                 "parts": [[list(c), list(h)] for c, h in self.parts],
-                "grasp_region": None if self.grasp_region is None else [list(v) for v in self.grasp_region]}
+                "grasp_region": None if self.grasp_region is None else [list(v) for v in self.grasp_region],
+                "contact_solids": [[list(pose), list(h)] for pose, h in self.contact_solids]}
 
 
 def _signed_box_distance(points_local: np.ndarray, centre, half) -> np.ndarray:
@@ -252,7 +272,13 @@ def tool_object_relation(*, entity: ToolEntityBox, world_from_tcp: np.ndarray, o
     rotation = np.asarray(entity.tcp_from_box_rotation).reshape(3, 3)
     # World -> TCP coordinates, then into the shared solid axes (no translation).
     local = ((points - transform[:3, 3]) @ transform[:3, :3]) @ rotation
-    distance = np.min([_signed_box_distance(local, np.asarray(c) @ rotation, h) for c, h in entity.parts], axis=0)
+    distances = [_signed_box_distance(local, np.asarray(c) @ rotation, h) for c, h in entity.parts]
+    if entity.contact_solids:
+        in_tcp = (points - transform[:3, 3]) @ transform[:3, :3]
+        for pose, h in entity.contact_solids:
+            solid = np.asarray(pose).reshape(4, 4)
+            distances.append(_signed_box_distance((in_tcp - solid[:3, 3]) @ solid[:3, :3], np.zeros(3), h))
+    distance = np.min(distances, axis=0)
     centre, half = entity.grasp_region
     inside = np.all(np.abs(local - np.asarray(centre) @ rotation) < np.asarray(half), axis=1)
     region = int(np.count_nonzero(inside))
