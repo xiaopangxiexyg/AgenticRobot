@@ -92,7 +92,15 @@ core and MuJoCo adapter used for the 20260721 fit; tests compare those hashes to
 fixed historical values rather than silently reinterpreting the fit against
 the current files.
 
-当前实测点与表面锚点的真机安全运动接入使用独立绑定
+当前显式起点净空能力使用独立绑定
+`artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261028_explicit_clearance_v1.json`。
+保留168项输入／164项Python源码，仅更新四个既有owner，固定于 `04b86362643b`；
+净空、目录保护及相关消费者977通过，9项subtest另列。严格默认不变，
+`--enable-inherited-start-clearance` 显式启用并进入Real执行manifest；仅已有正距离近邻可继承
+请求局部下界，运动侧必须通过最终密集采样的离开证明。查询故障保持原原因并拒绝。
+完整组合门禁另行记录，不以规划结果替代真机动作资格；旧绑定、fit和timing不改。
+
+前驱实测点与表面锚点的真机安全运动接入使用独立绑定
 `artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261028_real_observed_motion_v1.json`。
 继承164项输入并更新6项，补入三个执行／装配源码和显式CAD过滤配置，
 合计168项输入／164项Python源码，固定于 `c0334f16467f`；相关离线消费者632通过。
