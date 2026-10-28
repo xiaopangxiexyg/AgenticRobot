@@ -21,6 +21,7 @@ from dataset_contracts.canonical_encoding import canonical_bytes, canonical_load
 from dataset_contracts.tactile_bundle import (
     TACTILE_BUNDLE_DATASET_IDENTITY_FILE_DOMAIN_V1,
     TACTILE_BUNDLE_EPISODE_COMMIT_FILE_DOMAIN_V1,
+    TACTILE_BUNDLE_LOGICAL_PREFIX_V1,
     TACTILE_BUNDLE_TACTILE_COMPONENT_FILE_DOMAIN_V1,
     TactileBundleDatasetIdentityV1,
     TactileBundleArtifactV1,
@@ -304,8 +305,15 @@ def _clean_native_orphans(
 ) -> int:
     """Remove only deterministic targets or raw predecessors left by a stop."""
 
+    bundle_root = bundle_root.resolve()
+    tactile_root = bundle_root / TACTILE_BUNDLE_LOGICAL_PREFIX_V1
+    # Protect all committed artifacts before examining any candidate.
+    referenced = {
+        (bundle_root / artifact.logical_path).resolve()
+        for component in components
+        for artifact in component.artifacts
+    }
     removed = 0
-    referenced: set[str] = set()
     for component in components:
         for binding in component.manifests:
             manifest_path = bundle_root / binding.manifest_logical_path
@@ -316,15 +324,17 @@ def _clean_native_orphans(
             for value in streams.values():
                 if not isinstance(value, Mapping):
                     continue
-                target = str(value.get("path") or "")
-                if target:
-                    referenced.add(target)
                 source_info = value.get("recompressed_from")
                 if isinstance(source_info, Mapping):
                     source = str(source_info.get("path") or "")
                     if source:
                         source_path = bundle_root / source
-                        if source_path.is_file() and source not in referenced:
+                        source_identity = source_path.resolve()
+                        if not source_identity.is_relative_to(tactile_root):
+                            raise NativeTactileBundleRecompressionError(
+                                f"native tactile orphan source is outside tactile namespace: {source}"
+                            )
+                        if source_path.is_file() and source_identity not in referenced:
                             stat = source_path.stat()
                             if int(source_info.get("device", stat.st_dev)) != int(stat.st_dev):
                                 raise NativeTactileBundleRecompressionError(
@@ -359,6 +369,13 @@ def _clean_native_orphans(
             _manifest, raw_streams = _raw_manifest_streams(bundle_root, manifest_path)
             for _sensor, _spec, source in raw_streams:
                 target = source.with_name(f"{source.name}.tdelta{int(chunk_frames)}.zst")
+                target_identity = target.resolve()
+                if not target_identity.is_relative_to(tactile_root):
+                    raise NativeTactileBundleRecompressionError(
+                        f"native tactile orphan target is outside tactile namespace: {target}"
+                    )
+                if target_identity in referenced:
+                    continue
                 if not target.is_file():
                     continue
                 target_stat = target.stat()

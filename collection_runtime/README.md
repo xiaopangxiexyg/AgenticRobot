@@ -92,6 +92,13 @@ metadata 图可能仍不一致，两套载荷保留不代表完整回滚；成�
 不依赖外层浅复制保留的嵌套共享引用。内存更新不代表提交成功；任何失败仍中止本次
 调用，磁盘状态由该 Episode 的既有备份和恢复顺序负责。
 
+Native 压缩清理以已挂接的全部 Episode component 的 artifact 集合为引用依据，
+在删除前一次建立保护集；历史 predecessor 和推导出的压缩目标使用同一保护集，
+不随 manifest 遍历顺序逐步重建。候选的实际路径身份必须位于 bundle 的 `tactile/`
+范围内，避免历史字段触及 bundle metadata 或外部文件。身份比较解析路径别名，实际
+删除仍作用于原路径，保留“删除 symlink 本身”的语义。设备、inode、链接数和哈希
+门禁继续执行；该流程仍要求两个存储根静止，不提供并发写入期间的删除保证。
+
 Capture-time progress effective time is monotonic within the bound Episode
 clock. Nested Hold/Resume operation times must also be knowable by the receipt's
 availability time. The live reducer and read-time resolver enforce the same
