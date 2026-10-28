@@ -198,8 +198,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="observed obstacle depth range in meters; farther/unknown space is not certified")
     parser.add_argument("--safe-motion-scene-max-age-sec", type=float, default=30.,
         help="maximum frozen scene age at activation (default: 30s); no automatic degraded fallback")
-    parser.add_argument("--enable-inherited-start-clearance", action="store_true",
-        help="Explicitly allow certified egress from positive-distance start proximity for observed safe moves; strict clearance remains the default.")
+    clearance = parser.add_mutually_exclusive_group()
+    clearance.add_argument("--enable-inherited-start-clearance", dest="enable_inherited_start_clearance",
+        action="store_const", const=True,
+        help="Certified egress from positive-distance start proximity for observed safe moves; "
+             "the default whenever --safe-motion-observation-roles is set.")
+    clearance.add_argument("--strict-start-clearance", dest="enable_inherited_start_clearance",
+        action="store_const", const=False,
+        help="Reject observed safe-move starts below the ordinary 20 mm clearance (the pre-2026-10-29 default).")
+    parser.set_defaults(enable_inherited_start_clearance=None)
     parser.add_argument("--safe-motion-debug-dir", type=Path,
         help="existing private directory for exact RGB-D, filtered points and safe-move rejection evidence; opt-in, no extra captures")
     parser.add_argument("--enable-spatial-goals", action=argparse.BooleanOptionalAction,
@@ -436,6 +443,19 @@ def _absolute_existing_file(
     if not resolved.is_file():
         parser.error(f"{flag} is not a file: {resolved}")
     return resolved
+
+
+def _effective_inherited_start_clearance(args: argparse.Namespace) -> bool:
+    """Positive-start egress is the observed safe-move default (user decision 2026-10-29).
+
+    Residual self-observation near the hand otherwise blocks ordinary starts.
+    The mode exists only with an observed obstacle scene: without one, start
+    admission stays strict and the execution manifest identity is unchanged.
+    Hard contact and penetration remain rejected by the planner either way.
+    """
+    if args.enable_inherited_start_clearance is None:
+        return args.safe_motion_observation_roles is not None
+    return bool(args.enable_inherited_start_clearance)
 
 
 def _effective_camera_registry(args: argparse.Namespace) -> Path | None:
@@ -1408,7 +1428,7 @@ def main(argv: list[str] | None = None) -> int:
                 maximum_scene_age_sec=args.safe_motion_scene_max_age_sec)),
         safe_motion_debug_dir=safe_motion_debug_dir,
         grasp_trajectory_config=RM65GraspTrajectoryPlanningConfig(
-            enable_inherited_start_clearance=args.enable_inherited_start_clearance,
+            enable_inherited_start_clearance=_effective_inherited_start_clearance(args),
             trajectory_parameterization=(args.grasp_trajectory_parameterization),
             trajectory_speed_profile=(args.grasp_trajectory_speed_profile),
             endpoint_candidate_ordering=(args.grasp_endpoint_candidate_ordering),

@@ -22,15 +22,19 @@ Each optional `anchors` entry contains `label`, `role`, `mask_path`,
 The saved mask must belong to that exact RGB-D frame. Labels describe model
 evidence; they are not operator-provided object truth. Existing default self
 filtering remains unchanged; expanded filtering requires an explicit config.
-The planner also keeps the original strict 20 mm start-clearance default.
-To inspect the separately reviewed positive-distance egress mode, explicitly
-pass `enable_inherited_start_clearance=True` to `from_manifest`, or add
-`--enable-inherited-start-clearance` to the CLI. The mode is included in the
-query identity and audit policy; omitting it and passing False are equivalent.
-The keyword does not come from an untrusted manifest or individual model query.
-The original source branch's implicit egress results remain historical evidence;
-they are not results for this integrated strict default. Neither mode executes
-a trajectory or changes the live Gateway's safety policy.
+The planner's ordinary obstacle clearance stays 20 mm. Since 2026-10-29 this
+offline query defaults to the separately reviewed positive-distance start
+egress mode: a measured start that is already closer than 20 mm but still at a
+strictly positive distance may only move away, without new near pairs or hard
+contact. Pass `enable_inherited_start_clearance=False` to `from_manifest`, or
+`--strict-start-clearance` to the CLI, to reproduce strict start admission.
+`--enable-inherited-start-clearance` remains accepted and selects the default.
+The selected mode is included in the query identity and audit policy; strict
+queries keep the identity they had under the former strict default. The keyword
+does not come from an untrusted manifest or an individual model query. Neither
+mode executes a trajectory or changes the live Gateway's safety policy; the
+RealMan Gateway applies the same default to observed safe moves through its
+own CLI (`--strict-start-clearance` opts out there as well).
 Operator exports additionally require `source_record`: freeze the original
 record, observation ZIP and all its context files. The probe verifies the
 exported arrays/geometry against that original archive and binds calibration to
@@ -88,9 +92,10 @@ separate, freshly observed and authorized Gateway request.
 
 ## Explicit region queries
 
-Inherited positive-start clearance remains default-off. Select it explicitly
-with the `from_manifest` keyword or CLI flag described above; a manifest field
-cannot enable it. This consumer does not change production planner defaults.
+Inherited positive-start clearance is the default of this offline consumer;
+select strict start admission explicitly with the `from_manifest` keyword or
+CLI flag described above. A manifest field cannot change it. This consumer does
+not change production planner or Gateway defaults.
 
 `plan_relation_region(side, target_reference, offset_bounds_xyz_m,
 offset_frame="reference", max_candidates=8)` uses the shared deterministic
@@ -136,3 +141,46 @@ for IK error without changing the requested region: final FK is still checked
 against the original intervals. Candidate count and planning budgets do not
 increase. This is an offline selection policy, not a new Agent tool or a change
 to production MuJoCo/RealMan defaults.
+
+## Tool-entity hover queries
+
+A TCP offset above a surface point does not say where the gripper is. In the
+saved RealMan poses the reviewed gripper box hangs 41–90 mm below the TCP and
+its fingertip face centre lies 7–10 cm away from the TCP, so part of a TCP
+region such as Z [0.08, 0.16] m can put the gripper into the target itself.
+
+`plan_entity_hover_region(side, target_reference, tip_offset_bounds_xy_m,
+clearance_bounds_m, orientation_policy="preserve", max_candidates=8)` uses
+semantics `agenticrobot.relation.tool_entity_hover.v1` and places the gripper
+box instead of the TCP:
+
+- The entity is the simple gripper box used by grasp screening: the DMTAC
+  GraspGenX alignment v5 palm and finger solids, including the fingertip
+  collision extension, enveloped at the maximum opening (opening is ignored).
+  It is bound only when the frozen tool profile names DMTAC M for that side and
+  its tool TCP equals the reviewed 140 mm TCP; otherwise the query is rejected
+  for that arm. This nominal profile match does not establish the installed
+  hardware geometry or a physical calibration.
+- `tip_offset_bounds_xy_m` bounds the horizontal offset, in reference axes, of
+  the centre of the box's approach-side (fingertip) face from the anchor.
+- `clearance_bounds_m` bounds the vertical gap between the box's lowest point
+  and the support height: the highest observed voxel inside the box's
+  horizontal footprint and at most 0.30 m above the anchor (never below the
+  anchor itself), plus the cloud's voxel quantization margin. The same margin
+  expands the footprint and height-window selection so a voxel overlapping an
+  edge is not lost because its center lies outside. Higher points in the
+  footprint are reported as overhead, not as support. Unobserved space is
+  not assumed free; the planner still applies its own collision model.
+- `orientation_policy` is explicit: `preserve` keeps the measured TCP
+  orientation; `tool_axis_down` turns the TCP approach axis onto reference -Z
+  with the least rotation.
+
+Proposals are ordered nearest to the current gripper state, centre, face
+centres, then Halton fill, inset by the arrival tolerance. They run through
+the same budgeted region loop as `plan_relation_region` (20 s, 3 s per
+candidate, optional session budget) and the same planner. A found plan is
+accepted only if the achieved FK pose, re-measured with the same geometry,
+satisfies the ORIGINAL bounds. The audit keeps per-candidate support height,
+footprint and overhead counts, and the entity identity. This is an offline
+query semantic, not a published Gateway Skill or a change to the existing TCP
+relation and region semantics.

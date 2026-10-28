@@ -48,14 +48,17 @@ Real profile 保留激活时实测 TCP 朝向，固定 profile 速度为 `0.2`�
 过期或未来引用均拒绝。规划结束、lower activation 前再次检查保留身份与年龄，失败进入原 HOLD。
 每次移动的碰撞观测仍由 safe planner 重新采集、校验 TTL、静止性和几何，不复用保存点作为障碍场景。
 
-## 可选的正距离起点退出
+## 正距离起点退出（观测场景默认）
 
-RealMan 继续默认拒绝不足原 20 mm 净空的起点。部署者可显式选择
-`--enable-inherited-start-clearance`，同时配置 `--safe-motion-observation-roles`；
-直接调用原 RM65 规划器时使用
+自 2026-10-29 起（用户决定：起点尽量不受自体观测残留干扰），RealMan 只要配置了
+`--safe-motion-observation-roles`，普通 observed safe 移动默认启用正距离起点退出；
+需要原 20 mm 严格起点准入时显式传 `--strict-start-clearance`。`--enable-inherited-start-clearance`
+仍可显式使用，但没有观测场景时照旧在设备前拒绝。没有观测云时该模式本就不存在，起点准入与
+manifest 身份不变。直接调用原 RM65 规划器时数据类默认仍为严格，需要
 `RM65GraspTrajectoryPlanningConfig(enable_inherited_start_clearance=True)`。
 该选项只适用于含实测障碍云的普通 safe TCP 移动，不作用于抓姿接触链或无观测云的规划。
-它进入执行 manifest 身份，旧 manifest/grant 不能直接复用；默认关闭时身份保持原值。
+它进入执行 manifest 身份：含观测场景的默认部署身份因此改变，旧 manifest/grant 不能直接复用；
+`--strict-start-clearance` 部署保持原严格身份。
 
 仅本次实测起点已有且严格正距离的近邻对继承原距离下界；硬接触、穿透和新出现的近邻仍拒绝。
 非运动臂必须保持固定，运动侧近邻须沿最终稠密执行采样不退化、最终进入原净空，并禁止重新进入。
@@ -78,3 +81,54 @@ Real focused 验证：`bash scripts/run_pytest.sh -q tests/test_agent_gateway_re
 坐标关系、mock lower arrival/HOLD，以及无路径、取消、deadline、规划后状态未刷新、引用过期/淘汰等失败路径。
 
 验证入口：`bash scripts/run_pytest.sh -q tests/test_observed_point_motion.py`。其中离线部分覆盖身份隔离、淘汰、v1/v2 revision 和非法参数；原生部分覆盖实际 RGB-D 引用、两次移动复用、观测后新增障碍拒绝、无效引用零运动和正常 HOLD/close。模型能力及性能提升以另行冻结的多场景 Agent 对照为准。
+
+## 关节限位附近的端点查询
+
+MuJoCo 原 safe planner 仍先尝试原有8个迭代种子。只有全部种子都不满足调用方的位姿容差、
+且原2秒端点预算仍有剩余时，才由共享单臂数值层补做一次有界最小二乘查询（最多100次函数评估）。
+残差以实际TCP及其装配偏移计算，关节上下限不变；取消和期限在数值回调中检查。
+这一增量不改变实时`solve_step`/`solve_iterative`的默认实现，也不构造第二个规划或执行所有者。
+
+新候选必须重新通过原FK容差、碰撞、路径质量、轨迹复验及执行准入；已经得到合格位姿、
+但被碰撞或路径质量条件拒绝的请求，不启动这次补搜。新入口和原绝对safe入口共用该修复。
+`endpoint_search_diagnostics`保留未收敛种子的残差、求解状态及预算；历史`endpoint_attempts`
+仍表示达到位姿容差后进行碰撞／路径质量筛选的候选，不能把空列表解释为没有尝试。
+
+修复依据是保存的准备动作目标和实测qpos：原迭代在第三关节上限停滞，而有界查询能找到
+满足该动作原容差的数值候选。数值可达不等于路径可执行或完整场景成功，后两者另做原生验收。
+
+## 包络预检与失败归因
+
+标准 MuJoCo safe 配置同时约束单次激活位移和相对会话初始化 SafetyReference 的每轴±10cm区域。
+分成多个短步只满足前一种限制；正常HOLD不重置后者。实验准备和Agent动作都必须服从同一参考。
+
+safe lifecycle在采集障碍场景、IK和路径搜索前复用下层投影，判断目标允许的位姿容差区域
+是否与包络相交。完全无交集返回`safe_tcp_goal_outside_safety_envelope`并沿原HOLD链收尾；
+名义目标越界但容差仍相交时继续原规划，绝不把投影后的坐标替换成新目标。
+`preserve_target`使用原3mm/1度搜索容差，默认使用原profile到达容差，均未放宽。
+SO(3)相对旋转接近π、名义投影不唯一时，预检不作无解判断，仍由原候选及全路径安全检查决定。
+
+IK达到容差后，如果所有候选均被包络拒绝，返回`safe_tcp_target_envelope_blocked`；
+`safe_tcp_target_blocked`仍用于实体/观测障碍或混合拒绝，`safe_tcp_endpoint_search_exhausted`
+仍表示未找到位姿合格候选。详细诊断保留在下层错误中，不改变轨迹hash、Skill参数或注册目录。
+新增测试覆盖容差相交、非有限参数、局部旋转轴、π附近投影不唯一，以及左右臂实际分段运动后累计越界
+的零新增dispatch拒绝与正常HOLD/close；不等于复杂场景或真机验收。
+
+## 场景资格与启动失败收尾
+
+实验布局必须明确使用的坐标系，通过已装配的`TargetFrameProfile.frame_graph`转换至
+场景world；不能把公开station坐标直接写入场景。首次运动前应复用原碰撞oracle检查完整机器人
+与场景，不能只检查物体之间的AABB。零运动几何资格不代表IK、路径或任务成功。
+
+Gateway启动失败时，即使application尚未标为started，关闭仍会调用原runtime的幂等close，
+让启动回滚遗留的资源能够再次释放。已经启动的application仍必须先取得HOLD。
+`runtime.capture_lifecycle_diagnostics()`只在串行生命周期边界读取原所有者的pending/terminal状态，
+不执行I/O、不授予运动权限，也不替代HOLD或正常关闭回执。测试记录应分别保留启动错误、
+关闭错误、资源释放状态与HOLD证明；例如启动几何拒绝后正常释放，不应记作运动验收通过。
+
+零运动检查入口为`python -m scripts.probes.qualify_mujoco_scene TASK_CONFIG --output NEW_REPORT.json`。
+它使用原prepared target与整机collision oracle，保留原预防余量和1mm硬穿透界限，另外报告
+物体/支撑接触的初始深穿透。结果中的距离可能是裁剪后的下界，不冒称精确余量。
+此工具不创建执行所有者或渲染器，不前进physics，检查前后time/qpos/qvel必须一致；
+报告不覆盖，构造异常保留为失败并重新抛出。对应原生检查：
+`bash scripts/run_pytest.sh -q tests/test_mujoco_scene_qualification.py`。
