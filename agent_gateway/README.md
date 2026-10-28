@@ -600,6 +600,16 @@ lower 测量发布与 `RM65RgbCameraGeometry`。这条入口按已对齐 RGB-D �
 投影。只读 Skill 不发送运动/HOLD/STOP，但该既有双臂应用的启动与收尾仍保持原来的
 设备/初始 HOLD 行为，不能当成相机-only 启动命令。上层是否暴露动作由独立策略决定。
 
+`real-rm65` 可再显式传入 `--enable-surface-anchor-v2`（同时要求
+`--enable-back-projection` 和 `sam3-service`），在同一会话发布只读
+`perception.capture_surface_anchor@2`。它复用一次对齐 RGB-D 采集、SAM3 分割和
+共享 mask 内深度选择，返回带来源身份的表面点及 Artifact；无需抓姿生成器及其资产。
+当前仅对注册了对齐深度的视角有效，默认配置是主相机。此开关不发布新的运动 Route，
+不替代 `motion.move_to_observed_point@1` 的 back-project 来源，也不改变启动真机
+应用时原有设备所有权与 HOLD 生命周期。启用时 SAM3 RPC 默认及上限为 45 秒，
+只读分割与锚点 Route 的时限为 60 秒，关闭等待覆盖该时限及 5 秒收尾余量；
+普通分割／抓姿部署原时限不变。
+
 `--enable-object-localization` adds the supplied-image localization Route using
 the default SAM3 service client. `--enable-point-grasp` is a separate,
 default-off module and requires that same localizer plus a reviewed point-grasp
@@ -671,7 +681,7 @@ SAM3_CHECKPOINT_PATH=/absolute/checkpoints/sam3.pt \
 `perception.localize_objects@1` 从服务的新 `sam3.segment_candidates` 只读 RPC
 接收至多八个按分数排序、去除高度重叠的文本实例。MuJoCo 与 real-perception
 须同时启用 `--enable-object-localization`；real-rm65 须启用
-`--enable-point-grasp`。开关不自动启用相机、模型、定位或运动，也不改变
+`--enable-point-grasp` 或 `--enable-surface-anchor-v2`。开关不自动启用相机、模型、定位或运动，也不改变
 `perception.segment` 的单掩码行为。此模式需要包含该 RPC 的 RPent SAM3 服务；
 旧服务会明确报错，不回退到单实例或 SAM2。候选只有共同的文本标签和实测掩码，
 关系目标的最终实例选择仍需调用方判断，不能把分数当作关系判定。
@@ -1663,7 +1673,7 @@ relation 连续查询及其 region 扩展使用 anchor v2，与 anchor v3 的组
 仅上传带有相似字段的 JSON 不能伪装成实测锚点。Artifact 字节留存不等于操作留存；
 操作被淘汰后必须重新采集，启用时操作留存至少为 2，默认仍为 16。
 它是有来源的历史表面点，不是跟踪结果、物体中心、语义真值或自动新鲜度保证。
-当前仅发布/验证 MuJoCo，未改变真机接线。上层 RPent 使用原有 `input_artifact_refs`
+目前 MuJoCo 已发布捕获及消费链；RealMan 的只读 v2 捕获独立发布，上层 RPent 使用原有 `input_artifact_refs`
 按来源操作/槽解析为 Gateway 的 `input_artifact_bindings`，不再次上传或回投。
 
 同一 MuJoCo 会话再启用 `--enable-spatial-goals` 时，额外发布
@@ -1698,7 +1708,7 @@ v2 请求显式填写 `role`、`selection_mode`、`target_pixel_uv`、`language_
 关系、跟踪身份或 6D 位姿。mask/overlay 作为同一 capture 操作的可选输出 Artifact 保留，
 不伪造独立 segmentation 操作。消费者仍核对同客户端、会话、manifest、revision 和原
 已完成操作的精确输出，且不重采深度。v2 复用会话模型的生命周期与 60 s 只读预算；
-未启用 v2 时原有契约不变。本批发布范围为 MuJoCo，未接入真机动作效果判断。
+未启用 v2 时原有契约不变。RealMan 的锚点运动消费者及真机动作效果仍待独立验收。
 
 MuJoCo 会话构造器还可显式启用 `enable_anchor_motion_v2=True`，发布
 `motion.move_to_observed_point@2`。它要求原有 `enable_observed_point_motion` 的

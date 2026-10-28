@@ -83,6 +83,7 @@ from .point_grasp_deployment import (
 )
 from .rm65_composition import (
     ExclusiveRM65AgentPrimitiveComposition,
+    REAL_SURFACE_ANCHOR_MAX_SEGMENT_TIMEOUT_SEC,
     assemble_exclusive_rm65_agent_primitive_composition,
 )
 from .motion_observed_scene import SafeMotionObservationConfig
@@ -207,6 +208,8 @@ def build_parser() -> argparse.ArgumentParser:
         help="Use frozen stationary RGB-D target selection and optional associated-view fusion (GraspGenX only).")
     parser.add_argument("--enable-back-projection", action="store_true",
         help="Expose model-free RGB-D capture and back projection using the existing measured camera geometry.")
+    parser.add_argument("--enable-surface-anchor-v2", action="store_true",
+        help="Expose read-only SAM3 surface anchors from paired RGB-D without a grasp generator; requires back projection.")
     parser.add_argument("--enable-point-grasp-finger-exchange", action="store_true",
         help="Register point-grasp v5 with separately readmitted 180-degree finger exchanges; requires GraspGenX and arm reachability.")
     parser.add_argument(
@@ -236,7 +239,8 @@ def build_parser() -> argparse.ArgumentParser:
         help="localization backend (default: sam3-service); does not enable point grasp",
     )
     parser.add_argument("--sam3-endpoint", default="http://127.0.0.1:8114")
-    parser.add_argument("--sam3-timeout-sec", type=float, default=120.0)
+    parser.add_argument("--sam3-timeout-sec", type=float, default=120.0,
+        help="SAM3 RPC timeout; surface-anchor v2 uses 45s by default and accepts at most 45s")
     parser.add_argument("--sam3-min-score", type=float, default=0.2)
     parser.add_argument("--sam3-multi-instance-text", action="store_true",
                         help="Opt into bounded SAM3 text instances for localization; default single best.")
@@ -635,6 +639,9 @@ def _ready_payload(
                 "segmentation_enabled": (
                     composition.segmentation_registration is not None
                 ),
+                "surface_anchor_v2_enabled": (
+                    session.contract_bundle.surface_anchor_capture_registration is not None
+                ),
                 "point_grasp_render_view_roles": (
                     []
                     if composition.station_point_grasp_render_registration is None
@@ -876,6 +883,15 @@ def _emit_lifecycle_event(payload: dict[str, Any]) -> None:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.enable_surface_anchor_v2:
+        tokens = sys.argv[1:] if argv is None else argv
+        timeout_explicit = any(token == "--sam3-timeout-sec"
+                               or token.startswith("--sam3-timeout-sec=")
+                               for token in tokens)
+        if timeout_explicit and not 0 < args.sam3_timeout_sec <= REAL_SURFACE_ANCHOR_MAX_SEGMENT_TIMEOUT_SEC:
+            parser.error("--enable-surface-anchor-v2 requires --sam3-timeout-sec in (0, 45]")
+        if not timeout_explicit:
+            args.sam3_timeout_sec = REAL_SURFACE_ANCHOR_MAX_SEGMENT_TIMEOUT_SEC
     if args.graspgenx_alignment_profile != DMTAC_M_GRASPGENX_ALIGNMENT_PROFILE_ID:
         if args.point_grasp_backend != "graspgenx":
             parser.error("--graspgenx-alignment-profile requires the GraspGenX backend")
@@ -1007,12 +1023,17 @@ def main(argv: list[str] | None = None) -> int:
     if "move_to_observed_point" in actions and (
             not args.enable_back_projection or args.safe_motion_observation_roles is None):
         parser.error("move_to_observed_point requires --enable-back-projection and --safe-motion-observation-roles")
+    if args.enable_surface_anchor_v2 and (
+        not args.enable_back_projection or args.object_localization_backend != "sam3-service"
+    ):
+        parser.error("--enable-surface-anchor-v2 requires back projection and sam3-service")
     if args.enable_grasp_observation and (not args.enable_point_grasp or args.point_grasp_backend != "graspgenx"):
         parser.error("--enable-grasp-observation requires --enable-point-grasp and GraspGenX")
     if args.sam3_multi_instance_text and (
-        not args.enable_point_grasp or args.object_localization_backend != "sam3-service"
+        not (args.enable_point_grasp or args.enable_surface_anchor_v2)
+        or args.object_localization_backend != "sam3-service"
     ):
-        parser.error("--sam3-multi-instance-text requires SAM3 --enable-point-grasp")
+        parser.error("--sam3-multi-instance-text requires SAM3 point grasp or surface anchor v2")
     if args.debug_render_object_coordinates and not args.enable_point_grasp:
         parser.error("--debug-render-object-coordinates requires --enable-point-grasp")
     if args.enable_point_grasp_arm_reachability and not args.enable_point_grasp:
@@ -1214,6 +1235,14 @@ def main(argv: list[str] | None = None) -> int:
         )
     object_localizer = None
     point_grasp_planner = None
+    if args.enable_surface_anchor_v2 and not args.enable_point_grasp:
+        from deployments.perception.sam3_service import Sam3ServiceLocalizer
+
+        object_localizer = Sam3ServiceLocalizer(
+            endpoint=args.sam3_endpoint, timeout_sec=args.sam3_timeout_sec,
+            min_score=args.sam3_min_score,
+            multi_instance_text=args.sam3_multi_instance_text,
+        )
     if args.enable_point_grasp:
         object_bundle = (
             _absolute_managed_directory(
@@ -1357,6 +1386,7 @@ def main(argv: list[str] | None = None) -> int:
         enable_spatial_goals=args.enable_spatial_goals,
         enable_tcp_pose_comparison=args.enable_tcp_pose_comparison,
         enable_back_projection=args.enable_back_projection,
+        enable_surface_anchor_v2=args.enable_surface_anchor_v2,
         enable_point_grasp_finger_exchange=args.enable_point_grasp_finger_exchange,
         debug_render_object_coordinates=args.debug_render_object_coordinates,
         enable_point_grasp_arm_reachability=(args.enable_point_grasp_arm_reachability),

@@ -669,6 +669,7 @@ class RealAgentPrimitiveContractBundle:
     perception_capture: RealPerceptionCaptureRegistration | None = None
     localization_registration: RealObjectLocalizationRegistration | None = None
     segmentation_registration: SegmentationRegistration | None = None
+    surface_anchor_capture_registration: SpatialGoalRegistration | None = None
     placement_registration: PlacementRegistration | None = None
     station_point_grasp_registration: StationBoundPointGraspRegistration | None = None
     station_point_grasp_render_registration: (
@@ -864,14 +865,12 @@ class RealAgentPrimitiveContractBundle:
             raise ValueError("Real primitive profile frame bindings disagree.")
         if self.attachment.frame_graph_hash != self.frame_graph.semantic_content_hash:
             raise ValueError("Real primitive attachment frame graph mismatch.")
-        optional_grasp = (
-            self.localization_registration,
-            self.station_point_grasp_registration,
-            self.station_point_grasp_render_registration,
-        )
-        if any(item is not None for item in optional_grasp) and not all(
+        optional_grasp = (self.station_point_grasp_registration,
+                          self.station_point_grasp_render_registration)
+        if any(item is not None for item in optional_grasp) != all(
             item is not None for item in optional_grasp
-        ):
+        ) or (any(item is not None for item in optional_grasp)
+              and self.localization_registration is None):
             raise ValueError(
                 "Real localization, point-grasp, and render registrations must coexist."
             )
@@ -885,6 +884,17 @@ class RealAgentPrimitiveContractBundle:
             and self.perception_capture is None
         ):
             raise ValueError("Real segmentation Route requires perception capture.")
+        if self.surface_anchor_capture_registration is not None and (
+            self.segmentation_registration is None
+            or self.perception_capture is None
+            or self.perception_capture.back_projection is None
+        ):
+            raise ValueError("Real surface anchor v2 requires segmentation and back projection.")
+        if self.surface_anchor_capture_registration is not None and (
+            self.route_manifest.route("perception.capture_surface_anchor", "2")
+            != self.surface_anchor_capture_registration.entry
+        ):
+            raise ValueError("Real surface anchor differs from its manifest entry.")
         if self.placement_registration is not None and (
             self.segmentation_registration is None
             or self.perception_capture is None
@@ -916,8 +926,10 @@ class RealAgentPrimitiveContractBundle:
                 and self.perception_capture.back_projection is not None
             )
             + len(self.rgbd_geometry_registrations)
-            + (3 if self.localization_registration is not None else 0)
+            + int(self.localization_registration is not None)
+            + 2 * int(self.station_point_grasp_registration is not None)
             + int(self.segmentation_registration is not None)
+            + int(self.surface_anchor_capture_registration is not None)
             + int(self.placement_registration is not None)
             + (2 if grasp_approach_plan_enabled else 0)
             + int(transport_enabled)
@@ -1176,6 +1188,8 @@ def build_real_agent_primitive_contract_bundle(
     gripper_contract: GripperSkillContractBundle | None = None,
     localization_registration: RealObjectLocalizationRegistration | None = None,
     segmentation_registration: SegmentationRegistration | None = None,
+    enable_surface_anchor_v2: bool = False,
+    enable_placement: bool = True,
     station_point_grasp_registration: StationBoundPointGraspRegistration | None = None,
     station_point_grasp_render_registration: (
         StationBoundPointGraspRenderRegistration | None
@@ -1199,6 +1213,8 @@ def build_real_agent_primitive_contract_bundle(
         raise TypeError("enable_spatial_goals must be boolean.")
     if not isinstance(enable_tcp_pose_comparison, bool):
         raise TypeError("enable_tcp_pose_comparison must be boolean.")
+    if not isinstance(enable_surface_anchor_v2, bool) or not isinstance(enable_placement, bool):
+        raise TypeError("Optional real perception switches must be boolean.")
     refs = tuple(safety_envelope_refs)
     if not refs:
         raise ValueError("Real primitive Routes require lower safety-envelope refs.")
@@ -1627,14 +1643,12 @@ def build_real_agent_primitive_contract_bundle(
         for route in all_routes
     )
     binding_by_route_hash = {item.route_hash: item for item in bindings}
-    optional_grasp = (
-        localization_registration,
-        station_point_grasp_registration,
-        station_point_grasp_render_registration,
-    )
-    if any(item is not None for item in optional_grasp) and not all(
+    optional_grasp = (station_point_grasp_registration,
+                      station_point_grasp_render_registration)
+    if any(item is not None for item in optional_grasp) != all(
         item is not None for item in optional_grasp
-    ):
+    ) or (any(item is not None for item in optional_grasp)
+          and localization_registration is None):
         raise ValueError(
             "Real localization, point-grasp, and render registrations must coexist."
         )
@@ -1654,11 +1668,22 @@ def build_real_agent_primitive_contract_bundle(
             station_manifest_hash=attachment.station_manifest_hash,
             execution_manifest_hash=attachment.execution_manifest_hash,
         )
-        if segmentation_registration is not None
+        if enable_placement and segmentation_registration is not None
         and perception_capture is not None
         and perception_capture.back_projection is not None
         else None
     )
+    surface_anchor_capture_registration = None
+    if enable_surface_anchor_v2:
+        if (segmentation_registration is None or perception_capture is None
+                or perception_capture.back_projection is None):
+            raise ValueError("Real surface anchor v2 requires segmentation and back projection.")
+        from agent_gateway.profiles.surface_anchor import build_surface_anchor_registrations
+
+        (surface_anchor_capture_registration,) = build_surface_anchor_registrations(
+            back_projection=perception_capture.back_projection,
+            segmentation=segmentation_registration, version="2",
+        )
     perception_registrations = list(
         ()
         if perception_capture is None
@@ -1684,6 +1709,8 @@ def build_real_agent_primitive_contract_bundle(
         )
     if segmentation_registration is not None:
         perception_registrations.append(segmentation_registration.skill)
+    if surface_anchor_capture_registration is not None:
+        perception_registrations.append(surface_anchor_capture_registration.skill)
     if placement_registration is not None:
         perception_registrations.append(placement_registration.skill)
     if grasp_approach_plan_registration is not None:
@@ -1890,6 +1917,8 @@ def build_real_agent_primitive_contract_bundle(
                 availability_hash=placement_registration.availability_hash,
             )
         )
+    if surface_anchor_capture_registration is not None:
+        route_items.append(surface_anchor_capture_registration.entry)
     if grasp_approach_plan_registration is not None:
         route_items.append(
             SkillRouteManifestEntry(
@@ -2061,6 +2090,8 @@ def build_real_agent_primitive_contract_bundle(
                 if segmentation_registration is None
                 else (segmentation_registration.payload_validator,)
             ),
+            *((surface_anchor_capture_registration.payload_validator,)
+              if surface_anchor_capture_registration is not None else ()),
             *(
                 ()
                 if placement_registration is None
@@ -2119,6 +2150,7 @@ def build_real_agent_primitive_contract_bundle(
         observed_point_profile=observed_point_profile,
         localization_registration=localization_registration,
         segmentation_registration=segmentation_registration,
+        surface_anchor_capture_registration=surface_anchor_capture_registration,
         placement_registration=placement_registration,
         station_point_grasp_registration=station_point_grasp_registration,
         station_point_grasp_render_registration=(

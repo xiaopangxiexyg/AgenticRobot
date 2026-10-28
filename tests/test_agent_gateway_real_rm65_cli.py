@@ -295,6 +295,31 @@ def test_cli_defaults_to_the_detailed_v4_camera_mount_urdf() -> None:
     )
 
 
+def test_surface_anchor_v2_is_explicit_and_requires_back_projection(monkeypatch, capsys):
+    parser = gateway_cli.build_parser()
+    parsed = parser.parse_args(_argv(confirmation=REAL_AGENT_PRIMITIVE_SESSION_CONFIRM_TOKEN))
+    assert parsed.enable_surface_anchor_v2 is False
+    monkeypatch.setattr(
+        gateway_cli, "resolve_exclusive_rm65_skill_deployment_profile",
+        lambda *_args, **_kwargs: pytest.fail("Invalid anchor flags must fail before lower assembly"),
+    )
+    with pytest.raises(SystemExit) as rejected:
+        gateway_cli.main([
+            *_argv(confirmation=REAL_AGENT_PRIMITIVE_SESSION_CONFIRM_TOKEN),
+            "--enable-surface-anchor-v2",
+        ])
+    assert rejected.value.code == 2
+    assert "requires back projection" in capsys.readouterr().err
+    with pytest.raises(SystemExit) as rejected:
+        gateway_cli.main([
+            *_argv(confirmation=REAL_AGENT_PRIMITIVE_SESSION_CONFIRM_TOKEN),
+            "--enable-surface-anchor-v2", "--enable-back-projection",
+            "--sam3-timeout-sec", "121",
+        ])
+    assert rejected.value.code == 2
+    assert "in (0, 45]" in capsys.readouterr().err
+
+
 @pytest.mark.parametrize("scene", (
     "dual_arm_hand_proxy_dmtac_strict", "dual_arm_hand_proxy_dmtac_grasp"))
 def test_dmtac_grasp_scene_keeps_reviewed_capture_geometry_validation(scene, tmp_path):

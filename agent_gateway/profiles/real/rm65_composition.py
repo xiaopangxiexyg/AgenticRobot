@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import time
 import threading
+import math
 from functools import partial
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, asdict
@@ -119,6 +120,7 @@ from .station_point_grasp_render_deployment import (
 RM65_SKILL_EXECUTION_FRAME_ID_V1 = RM65_SKILL_SCENE_WORLD_FRAME_ID_V1
 RM65_SKILL_STATION_FRAME_ID_V1 = "canonical_station"
 RM65_SKILL_CLOCK_DOMAIN_ID_V1 = "python-time-time-wall-clock"
+REAL_SURFACE_ANCHOR_MAX_SEGMENT_TIMEOUT_SEC = 45.0
 
 
 def _required(value: object, *, field_name: str) -> str:
@@ -221,7 +223,7 @@ class ExclusiveRM65AgentPrimitiveComposition:
             if any(
                 item is not None
                 for item in (
-                            self.localization_registration,
+                    self.localization_registration,
                     self.localization_provider,
                     self.segmentation_registration,
                     self.station_point_grasp_registration,
@@ -244,7 +246,6 @@ class ExclusiveRM65AgentPrimitiveComposition:
         grasp_items = (
             self.localization_registration,
             self.localization_provider,
-            self.segmentation_registration,
             self.station_point_grasp_registration,
             self.station_point_grasp_render_registration,
             self.point_grasp_planner,
@@ -255,6 +256,8 @@ class ExclusiveRM65AgentPrimitiveComposition:
             raise ValueError("RM65 point-grasp resources must be assembled together.")
         if any(item is not None for item in grasp_items) and self.rgb_camera_geometry is None:
             raise ValueError("RM65 point-grasp requires camera geometry.")
+        if self.segmentation_registration is not None and self.rgb_camera_geometry is None:
+            raise ValueError("RM65 segmentation requires camera geometry.")
         if self.application.startup_admission is not self.lower.startup_admission:
             raise ValueError("application must use the exact lower startup gate.")
 
@@ -296,6 +299,7 @@ def assemble_exclusive_rm65_agent_primitive_composition(
     enable_spatial_goals: bool = False,
     enable_tcp_pose_comparison: bool = False,
     enable_back_projection: bool = False,
+    enable_surface_anchor_v2: bool = False,
     enable_point_grasp_finger_exchange: bool = False,
     debug_render_object_coordinates: bool = False,
     enable_point_grasp_arm_reachability: bool = False,
@@ -321,6 +325,8 @@ def assemble_exclusive_rm65_agent_primitive_composition(
         raise TypeError("enable_tcp_pose_comparison must be bool.")
     if not isinstance(enable_back_projection, bool):
         raise TypeError("enable_back_projection must be bool.")
+    if not isinstance(enable_surface_anchor_v2, bool):
+        raise TypeError("enable_surface_anchor_v2 must be bool.")
     if not isinstance(enable_point_grasp_finger_exchange, bool):
         raise TypeError("enable_point_grasp_finger_exchange must be bool.")
     if grasp_trajectory_config is not None and not isinstance(
@@ -420,6 +426,14 @@ def assemble_exclusive_rm65_agent_primitive_composition(
             "provided together."
         )
     grasp_enabled = point_grasp_planner is not None
+    if enable_surface_anchor_v2 and (not enable_back_projection or object_localizer is None):
+        raise ValueError("Surface anchor v2 requires back projection and a bound segmenter.")
+    if enable_surface_anchor_v2:
+        timeout_sec = getattr(object_localizer, "timeout_sec", None)
+        if (not isinstance(timeout_sec, (int, float)) or isinstance(timeout_sec, bool)
+                or not math.isfinite(float(timeout_sec))
+                or not 0 < timeout_sec <= REAL_SURFACE_ANCHOR_MAX_SEGMENT_TIMEOUT_SEC):
+            raise ValueError("Surface anchor v2 requires a bounded segmenter timeout of at most 45s.")
     observed_point_enabled = "move_to_observed_point" in normalized_actions
     observed_safe_enabled = safe_motion_observation_config is not None
     if observed_point_enabled and (not enable_back_projection or not observed_safe_enabled):
@@ -440,10 +454,12 @@ def assemble_exclusive_rm65_agent_primitive_composition(
         not grasp_enabled or getattr(point_grasp_planner, "backend_id", None) != "graspgenx"
     ):
         raise ValueError("Frozen grasp observations require a GraspGenX planner.")
-    if (object_localizer is None) != (point_grasp_planner is None):
+    if grasp_enabled and object_localizer is None:
         raise ValueError(
-            "object_localizer and point_grasp_planner must be supplied together."
+            "Point-grasp requires its bound object localizer."
         )
+    if object_localizer is not None and not (grasp_enabled or enable_surface_anchor_v2):
+        raise ValueError("Object localizer requires point grasp or surface anchor v2.")
     if grasp_enabled and not perception_enabled:
         raise ValueError("Point-grasp requires the composed camera resources.")
     if enable_back_projection and not perception_enabled:
@@ -774,9 +790,8 @@ def assemble_exclusive_rm65_agent_primitive_composition(
             rgbd_geometry_registrations = build_rgbd_geometry_registrations(
                 perception_capture, roles=tuple(row["role"]
                     for row in catalog_provider.aligned_rgbd_source_catalog()))
-        if grasp_enabled:
+        if object_localizer is not None:
             assert object_localizer is not None
-            assert point_grasp_planner is not None
             assert rgb_camera_geometry is not None
             localization_spec = getattr(object_localizer, "model_spec", None)
             localization_model_id = str(
@@ -788,6 +803,26 @@ def assemble_exclusive_rm65_agent_primitive_composition(
             localizer_hash = str(
                 getattr(object_localizer, "semantic_content_hash", "")
             ).strip()
+            if not all((localization_model_id, localization_model_hash, localizer_hash)):
+                raise ValueError("Object localizer lacks verified profile identity.")
+            segmentation_registration = build_segmentation_registration(
+                target_kind="real",
+                current_mode="real_active",
+                source_id_by_role={
+                    str(item["role"]): str(item["source_id"])
+                    for item in catalog_provider.rgb_source_catalog()
+                },
+                model_profile_id=localization_model_id,
+                model_profile_hash=localization_model_hash,
+                inference_implementation_hash=localizer_hash,
+                runtime_session_id=runtime_id,
+                control_domain_id=domain_id,
+                target_binding_id=target_binding_id,
+                station_manifest_hash=station_manifest_hash,
+                execution_manifest_hash=execution_manifest_hash,
+            )
+        if grasp_enabled:
+            assert point_grasp_planner is not None
             planner_spec = getattr(point_grasp_planner, "model_spec", None)
             planner_model_id = str(
                 getattr(planner_spec, "model_profile_id", "")
@@ -829,22 +864,6 @@ def assemble_exclusive_rm65_agent_primitive_composition(
                 localizer=object_localizer,
                 registration=localization_registration,
                 allowed_local_image_roots=(),
-            )
-            segmentation_registration = build_segmentation_registration(
-                target_kind="real",
-                current_mode="real_active",
-                source_id_by_role={
-                    str(item["role"]): str(item["source_id"])
-                    for item in catalog_provider.rgb_source_catalog()
-                },
-                model_profile_id=localization_model_id,
-                model_profile_hash=localization_model_hash,
-                inference_implementation_hash=localizer_hash,
-                runtime_session_id=runtime_id,
-                control_domain_id=domain_id,
-                target_binding_id=target_binding_id,
-                station_manifest_hash=station_manifest_hash,
-                execution_manifest_hash=execution_manifest_hash,
             )
             station_point_grasp_registration = (
                 build_station_bound_point_grasp_registration(
@@ -1087,6 +1106,8 @@ def assemble_exclusive_rm65_agent_primitive_composition(
             rgbd_geometry_registrations=rgbd_geometry_registrations,
             localization_registration=localization_registration,
             segmentation_registration=segmentation_registration,
+            enable_surface_anchor_v2=enable_surface_anchor_v2,
+            enable_placement=grasp_enabled,
             localization_provider=localization_provider,
             segmentation_localizer=(
                 object_localizer if segmentation_registration is not None else None
@@ -1128,7 +1149,7 @@ def assemble_exclusive_rm65_agent_primitive_composition(
             resource
             for resource in (
                 planning_geometry_resources,
-                localization_provider,
+                localization_provider if localization_provider is not None else object_localizer,
                 deployment.gateway_session.station_point_grasp_provider,
             )
             if resource is not None

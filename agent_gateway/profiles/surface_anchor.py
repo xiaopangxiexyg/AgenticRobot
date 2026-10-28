@@ -174,7 +174,7 @@ def _registration(
 
 
 def build_surface_anchor_registrations(
-    *, back_projection, object_query, spatial_goal=None, enable_relation_queries=False,
+    *, back_projection, object_query=None, spatial_goal=None, enable_relation_queries=False,
     version="1", segmentation=None, selection_policy="prompt_nearest",
 ):
     if (not isinstance(selection_policy, str) or selection_policy not in INTERIOR_SELECTION_POLICIES
@@ -185,6 +185,8 @@ def build_surface_anchor_registrations(
         raise ValueError("Unsupported surface anchor version.")
     if version == "2" and segmentation is None:
         raise ValueError("Surface anchor v2 requires a bound segmentation provider.")
+    if object_query is None and (version != "2" or enable_relation_queries):
+        raise ValueError("Surface anchor path queries require a bound object query.")
     if version == "2" and (
             any(getattr(segmentation.binding, key) != getattr(back_projection.binding, key)
                 for key in ("runtime_session_id", "control_domain_id", "target_binding_id",
@@ -192,7 +194,7 @@ def build_surface_anchor_registrations(
             or any(segmentation.profile.source_id_by_role.get(role) != source
                 for role, source in back_projection.profile.source_id_by_role.items())):
         raise ValueError("Surface anchor v2 requires matching RGB/depth deployment and source identities.")
-    if (
+    if object_query is not None and (
         object_query.skill.schema_entry.parameter_schema["properties"][
             "reference_frame_id"
         ]["const"]
@@ -201,16 +203,17 @@ def build_surface_anchor_registrations(
         raise ValueError(
             "Surface anchor and path query must share the public reference frame."
         )
-    profile_hash = canonical_content_hash(
-        {
-            "projection": back_projection.profile.semantic_content_hash,
-            "query": object_query.entry.route.semantic_content_hash,
-        },
-        domain="agenticrobot.surface_anchor.profile.v1",
-    )
     if version == "2":
         profile_hash = _v2_profile_identity(back_projection=back_projection, segmentation=segmentation,
             interior_algorithm=interior_algorithm)
+    else:
+        profile_hash = canonical_content_hash(
+            {
+                "projection": back_projection.profile.semantic_content_hash,
+                "query": object_query.entry.route.semantic_content_hash,
+            },
+            domain="agenticrobot.surface_anchor.profile.v1",
+        )
     capture_def = capture_definition(version=version)
     schema_args = {
         "definition": capture_def,
@@ -313,6 +316,13 @@ def build_surface_anchor_registrations(
         max_operation_duration_ms=(None if version == "1"
             else segmentation.skill.routes[0].max_operation_duration_ms),
     )
+    if object_query is None:
+        registrations = (capture,)
+        if spatial_goal is not None:
+            registrations += (_build_anchored_goal_registration(
+                capture=capture, spatial_goal=spatial_goal,
+                reference_frame_id=back_projection.profile.reference_frame_id),)
+        return registrations
     query_def = query_definition(version=version)
     anchored_schema = query_schema(
         definition=query_def,

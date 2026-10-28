@@ -755,6 +755,7 @@ class RealAgentPrimitiveGatewaySession:
     rgbd_geometry_executors: tuple[PassiveReadSkillExecutor, ...] = ()
     gripper_ports: Mapping[str, RealDmtacGripperControlPort] = field(default_factory=dict)
     grasp_fast_plan_executor: PassiveReadSkillExecutor | None = None
+    surface_anchor_executor: PassiveReadSkillExecutor | None = None
     _close_lock: threading.Lock = field(default_factory=threading.Lock, init=False)
     _close_outcome: AgentGatewayOperationOutcome | None = field(
         default=None,
@@ -831,6 +832,10 @@ class RealAgentPrimitiveGatewaySession:
             raise ValueError(
                 "Real segmentation registration and runtime resources disagree."
             )
+        if (self.contract_bundle.surface_anchor_capture_registration is not None) != (
+            self.surface_anchor_executor is not None
+        ):
+            raise ValueError("Real surface anchor registration and executor disagree.")
         placement_enabled = self.contract_bundle.placement_registration is not None
         if placement_enabled != all(
             item is not None
@@ -886,6 +891,7 @@ class RealAgentPrimitiveGatewaySession:
             "perception.back_project": self.back_projection_executor,
             "perception.localize_objects": self.localization_executor,
             "perception.segment": self.segmentation_executor,
+            "perception.capture_surface_anchor": self.surface_anchor_executor,
             "perception.plan_placement": self.placement_executor,
             "perception.plan_point_grasp": self.station_point_grasp_executor,
             "perception.render_point_grasp_candidate": (
@@ -1003,6 +1009,9 @@ class RealAgentPrimitiveGatewaySession:
                     (self.rgb_executor, 5.0),
                     (self.depth_executor, 5.0),
                     (self.back_projection_executor, 5.0),
+                    (self.surface_anchor_executor,
+                     5.0 if self.contract_bundle.surface_anchor_capture_registration is None
+                     else 5.0 + self.contract_bundle.surface_anchor_capture_registration.entry.route.max_operation_duration_ms / 1000.0),
                     (
                         self.placement_executor,
                         PLACEMENT_MAX_OPERATION_DURATION_MS_V1 / 1_000.0 + 5.0,
@@ -1020,7 +1029,9 @@ class RealAgentPrimitiveGatewaySession:
             )
             segmentation_settled = (
                 self.segmentation_executor is None
-                or self.segmentation_executor.wait_all(timeout_sec=65.0)
+                or self.segmentation_executor.wait_all(timeout_sec=(
+                    5.0 + self.contract_bundle.segmentation_registration.skill.routes[0].max_operation_duration_ms / 1000.0
+                ))
             )
             if not passive_reads_settled or not segmentation_settled:
                 raise RuntimeError(
@@ -1255,6 +1266,7 @@ def _real_hardware_view_provider(
                 "perception.localize_objects",
                 "perception.plan_point_grasp",
                 "perception.segment",
+                "perception.capture_surface_anchor",
             }
         )
         if not model_route_hashes:
@@ -1700,6 +1712,7 @@ def assemble_real_agent_primitive_gateway_session(
     localization_executor = None
     segmentation_provider = None
     segmentation_executor = None
+    surface_anchor_executor = None
     placement_provider = None
     placement_executor = None
     station_point_grasp_provider = None
@@ -1775,6 +1788,25 @@ def assemble_real_agent_primitive_gateway_session(
             execution_port_by_route_hash[
                 segmentation_registration.skill.routes[0].semantic_content_hash
             ] = segmentation_executor
+        anchor_registration = contract_bundle.surface_anchor_capture_registration
+        if anchor_registration is not None:
+            if back_projection_provider is None or segmentation_provider is None:
+                raise ValueError("Real surface anchor requires the exact depth and segmentation providers.")
+            from agent_gateway.profiles.surface_anchor import build_surface_anchor_capture_executor
+
+            surface_anchor_executor = build_surface_anchor_capture_executor(
+                registration=anchor_registration,
+                provider=back_projection_provider,
+                segmentation_provider=segmentation_provider,
+                store=artifact_store,
+                current_station_revision=lambda: producer.current_station_revision,
+                clock=clock,
+                clock_domain_id=contract_bundle.attachment.clock_domain_id,
+                max_retained_operations=max_retained_operations,
+            )
+            execution_port_by_route_hash[
+                anchor_registration.entry.route.semantic_content_hash
+            ] = surface_anchor_executor
         placement_registration = contract_bundle.placement_registration
         if placement_registration is not None:
             assert segmentation_registration is not None
@@ -2148,6 +2180,7 @@ def assemble_real_agent_primitive_gateway_session(
         localization_executor=localization_executor,
         segmentation_provider=segmentation_provider,
         segmentation_executor=segmentation_executor,
+        surface_anchor_executor=surface_anchor_executor,
         placement_provider=placement_provider,
         placement_executor=placement_executor,
         station_point_grasp_provider=station_point_grasp_provider,
