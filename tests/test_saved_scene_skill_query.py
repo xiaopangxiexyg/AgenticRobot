@@ -432,6 +432,18 @@ def test_region_invalid_bounds_are_rejected_before_planning(session):
     assert not planner.calls
 
 
+def test_proximity_policy_keeps_q0_and_checks_achieved_region(session):
+    query, planner = session
+    query._region_candidate_policy = "proximity"
+    result = query.plan_relation_region(**region_parameters())
+    assert result["status"] == "path_found"
+    record = query.audit()["region_queries"][0]
+    assert record["candidate_policy"] == "proximity"
+    assert record["candidate_validations"][0]["inside_requested_region"] is True
+    assert query.audit()["qpos_by_side"] == {s: [0.] * 6 for s in ("left", "right")}
+    assert planner.calls[0]["time_budget_sec"] <= 3.
+
+
 def test_one_candidate_timeout_does_not_starve_the_whole_region(session):
     query, planner = session
     now = [0.]

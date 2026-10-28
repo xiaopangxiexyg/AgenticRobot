@@ -227,3 +227,68 @@ def generate_continuation_region_goals(
             if len(candidates) == max_candidates:
                 break
     return tuple(candidates)
+
+
+def generate_proximity_region_goals(
+    *, current_tcp_pose_xyz_quat_xyzw: Sequence[float],
+    anchor_xyz_m: Sequence[float], offset_bounds_xyz_m: Sequence[Sequence[float]],
+    offset_frame: str, max_candidates: int, boundary_inset_m: float = 0.0,
+) -> tuple[RelationGoalCandidate, ...]:
+    """Preserve orientation; propose nearest, centre and face-centre goals.
+
+    This is an optional translation-region policy, not an IK or clearance
+    decision. Project the measured TCP into the offset frame, then onto the
+    proposal box. Try its nearest point, centre, then face centres ordered by
+    TCP distance (axis/sign order breaks ties). Fill duplicate slots from the
+    original Halton proposals without exceeding the original candidate budget.
+
+    The inset reserves room for arrival tolerance when proposing targets; it
+    does not change the requested region or certify achieved FK. Narrow axes
+    collapse to their midpoint. Callers must still validate the actual endpoint
+    against the ORIGINAL region, including for zero-width regions.
+    """
+    geometry = dict(current_tcp_pose_xyz_quat_xyzw=current_tcp_pose_xyz_quat_xyzw,
+        anchor_xyz_m=anchor_xyz_m, offset_frame=offset_frame,
+        orientation_mode="preserve", tool_axis=None, axis_reference_xyz=None,
+        tool_axis_rotation_bounds_rad=[0., 0.], max_candidates=max_candidates)
+    # Reuse the original public validation, quaternion and frame conventions.
+    generate_relation_region_goals(**geometry, offset_bounds_xyz_m=offset_bounds_xyz_m)
+    if (isinstance(boundary_inset_m, bool) or not isinstance(boundary_inset_m, (float, int))
+            or not math.isfinite(boundary_inset_m) or boundary_inset_m < 0.):
+        raise ValueError("boundary_inset_m must be finite and nonnegative.")
+    bounds = np.asarray(offset_bounds_xyz_m, dtype=float)
+    inset = np.minimum(boundary_inset_m, (bounds[:, 1] - bounds[:, 0]) / 2.)
+    low, high = bounds[:, 0] + inset, bounds[:, 1] - inset
+    centre = low + (high - low) / 2.
+    try:
+        with np.errstate(over="raise", invalid="raise"):
+            current = np.asarray(current_tcp_pose_xyz_quat_xyzw[:3], dtype=float) - anchor_xyz_m
+            if offset_frame == "tool":
+                current = xyzquat_to_pose_matrix(current_tcp_pose_xyz_quat_xyzw)[:3, :3].T @ current
+    except FloatingPointError as exc:
+        raise ValueError("Current TCP offset must remain finite.") from exc
+    nearest = np.clip(current, low, high)
+    faces = []
+    for axis in range(3):
+        for edge in (low[axis], high[axis]):
+            face = centre.copy()
+            face[axis] = edge
+            faces.append(face)
+    faces.sort(key=lambda value: math.dist(current, value))
+    fallback = generate_relation_region_goals(**geometry,
+        offset_bounds_xyz_m=np.stack((low, high), axis=1).tolist())
+    proposals = [nearest, centre, *faces, *(c.offset_xyz_m for c in fallback)]
+    candidates, seen = [], set()
+    for offset in proposals:
+        candidate, = generate_relation_goals(
+            current_tcp_pose_xyz_quat_xyzw=current_tcp_pose_xyz_quat_xyzw,
+            anchor_xyz_m=anchor_xyz_m, offsets_xyz_m=[list(offset)],
+            offset_frame=offset_frame, orientation_mode="preserve",
+            tool_axis=None, axis_reference_xyz=None, tool_axis_rotation_offsets_rad=[0.])
+        identity = tuple(candidate.offset_xyz_m)
+        if identity not in seen:
+            seen.add(identity)
+            candidates.append(candidate)
+            if len(candidates) == max_candidates:
+                break
+    return tuple(candidates)

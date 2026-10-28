@@ -110,3 +110,13 @@ This same budget covers atomic and region calls over the session, including
 final FK and validation. Model wait time is not charged as native planning.
 Omitting it preserves the previous independent atomic-query behavior. Close
 cannot race a region search. No region result is an executable motion grant.
+
+For an explicit sampling experiment, manifest `region_candidate_policy` may
+select `proximity`; omission keeps the original `halton` policy. The shared
+proximity sampler preserves orientation, proposes the point nearest the saved
+TCP, then the region centre and face centres. Proposal bounds are inset by the
+existing arrival tolerance (narrow axes use their midpoint). This reserves room
+for IK error without changing the requested region: final FK is still checked
+against the original intervals. Candidate count and planning budgets do not
+increase. This is an offline selection policy, not a new Agent tool or a change
+to production MuJoCo/RealMan defaults.

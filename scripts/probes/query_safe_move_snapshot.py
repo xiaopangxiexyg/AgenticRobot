@@ -29,7 +29,7 @@ from robot_motion.observed_scene import SafeMotionObservationConfig
 from robot_motion.pose import pose_delta_metrics
 from robot_motion.relative_action import pose_matrix_to_xyzquat, xyzquat_to_pose_matrix
 from robot_motion.spatial_goals import compute_spatial_goal, finite_vector
-from robot_motion.spatial_goal_regions import generate_relation_region_goals
+from robot_motion.spatial_goal_regions import generate_relation_region_goals, generate_proximity_region_goals
 from scripts.probes.inspect_safe_move_snapshot import (
     RM65CapturedRobotObservationFilterConfig, backproject, load_captures, resolve_inputs,
 )
@@ -177,7 +177,7 @@ class SavedSceneSkillQuery:
 
     def __init__(self, *, scene_id, reference_frame_id, qpos_by_side,
                  tcp_pose_by_side, anchors, planner, cloud, source_evidence,
-                 query_budget=None, clock=time.monotonic):
+                 query_budget=None, region_candidate_policy="halton", clock=time.monotonic):
         self._scene_id = str(scene_id)
         self._frame = reference_frame_id
         self._qpos = {side: finite_vector(list(qpos_by_side[side]), 6, name=side).copy()
@@ -199,6 +199,9 @@ class SavedSceneSkillQuery:
         self._trajectories = {}
         self._closed = False
         self._clock = clock
+        if region_candidate_policy not in {"halton", "proximity"}:
+            raise ValueError("Unknown region candidate policy.")
+        self._region_candidate_policy = region_candidate_policy
         self._planning_calls = 0
         self._planning_seconds = 0.
         if query_budget is not None:
@@ -293,7 +296,8 @@ class SavedSceneSkillQuery:
                 "qpos_source": qpos_source, "observation_configuration": snapshot["configuration"],
                 "observed_voxel_count": len(cloud.points_m),
                 "enable_inherited_start_clearance": enabled},
-            query_budget=manifest.get("query_budget"))
+            query_budget=manifest.get("query_budget"),
+            region_candidate_policy=manifest.get("region_candidate_policy", "halton"))
 
     def _require_open(self):
         if self._closed:
@@ -420,6 +424,13 @@ class SavedSceneSkillQuery:
             offset_bounds_xyz_m=offset_bounds_xyz_m, offset_frame=offset_frame,
             orientation_mode="preserve", tool_axis=None, axis_reference_xyz=None,
             tool_axis_rotation_bounds_rad=[0., 0.], max_candidates=max_candidates)
+        if self._region_candidate_policy == "proximity":
+            candidates = generate_proximity_region_goals(
+                current_tcp_pose_xyz_quat_xyzw=list(self._tcp[side]),
+                anchor_xyz_m=self._refs[target_reference]["world_xyz_m"],
+                offset_bounds_xyz_m=offset_bounds_xyz_m, offset_frame=offset_frame,
+                max_candidates=max_candidates,
+                boundary_inset_m=RealAgentPrimitiveConvergenceProfile().translation_tolerance_m)
         if not self._lock.acquire(blocking=False):
             raise RuntimeError("A query is already running for this saved scene.")
         summary = None
@@ -428,6 +439,7 @@ class SavedSceneSkillQuery:
             query_id = "region:" + self._scene_id[:16] + ":" + str(len(self._regions))
             summary = {"query_id": query_id, "side": side, "target_reference": target_reference,
                 "offset_bounds_xyz_m": copy.deepcopy(offset_bounds_xyz_m), "offset_frame": offset_frame,
+                "candidate_policy": self._region_candidate_policy,
                 "candidate_count": len(candidates), "attempted_candidate_count": 0,
                 "unresolved_candidate_count": 0,
                 "attempt_query_ids": [], "candidate_validations": [], "selected_plan_query_id": None,
