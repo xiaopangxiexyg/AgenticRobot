@@ -63,8 +63,9 @@ class ToolEntityBox:
     parts: tuple[tuple[tuple[float, float, float], tuple[float, float, float]], ...] = ()
     grasp_region: tuple[tuple[float, float, float], tuple[float, float, float]] | None = None
     # Optional extra contact-only solids with their own axes: (TCP-from-solid
-    # 4x4 row-major, half extents). They join the relation contact band only;
-    # the hover box, its footprint and the closing region are unchanged.
+    # 4x4 row-major, half extents). Tool-object relations measure them
+    # separately (sensor distance, contact band, near/far); the hover box, its
+    # footprint and the closing region are unchanged.
     contact_solids: tuple[tuple[tuple[float, ...], tuple[float, float, float]], ...] = ()
 
     def __post_init__(self) -> None:
@@ -176,7 +177,8 @@ def _signed_box_distance(points_local: np.ndarray, centre, half) -> np.ndarray:
 
 
 TOOL_OBJECT_RELATION_SEMANTICS_V1 = "agenticrobot.relation.tool_object.v1"
-TOOL_OBJECT_RELATIONS = ("between_fingers_in_contact_band", "between_fingers", "in_contact_band", "near", "far")
+TOOL_OBJECT_RELATIONS = ("between_fingers_in_contact_band", "between_fingers", "in_contact_band", "near", "far",
+                         "insufficient_surface")
 
 
 def object_surface_cluster(points_m, *, voxel_size_m: float = 0.003,
@@ -186,9 +188,12 @@ def object_surface_cluster(points_m, *, voxel_size_m: float = 0.003,
     Points are first thinned to one point per ``voxel_size_m`` cell, so counts
     are metric and do not depend on camera range. Voxels closer than
     ``link_distance_m`` are connected; only the largest component is kept.
-    A mask that also covers a nearer occluder (for example a finger in front
-    of the object) yields a separate depth cluster and is not object evidence.
-    Deterministic for identical input order.
+    A mask that also covers an occluder separated by more than the link
+    distance (for example a finger well in front of the object) usually yields
+    a separate, smaller cluster that is dropped; an occluder within the link
+    distance merges, and a larger one wins. The evidence reports component and
+    kept counts so ambiguous surfaces stay visible. Deterministic for identical
+    input order.
     """
     from scipy.sparse import coo_matrix
     from scipy.sparse.csgraph import connected_components
@@ -218,19 +223,24 @@ class ToolObjectRelation:
     """Measured relation between one arm's gripper solids and one object surface.
 
     Inputs are the object's measured surface points (see
-    ``object_surface_cluster``) and the gripper box parts at the measured TCP.
-    The palm/finger solids are the maximum-opening screening envelope, so real
-    finger surfaces lie a few millimetres inside them; ``in_contact_band``
-    means "surface within the band of that envelope", not a contact, force,
-    grasp or stability claim. ``surface_distance_m`` is the k-th smallest
-    signed point distance (k = the contact count threshold), negative inside.
+    ``object_surface_cluster``) and the gripper at the measured TCP: the
+    maximum-opening grasp-screening solids, their open closing region and,
+    when bound, contact-only solids (for example the URDF sensor boxes).
+    ``surface_distance_m`` is the k-th smallest signed point distance to the
+    screening solids (k = the contact count threshold, negative inside);
+    ``sensor_surface_distance_m`` is the same against the contact-only solids
+    (``None`` without them). The contact band uses either set. It is
+    proximity evidence, not a contact, force, grasp or stability claim.
+    ``insufficient_surface`` means fewer surface points than that threshold.
     """
 
     relation: str
-    surface_distance_m: float
+    surface_distance_m: float | None
     contact_band_point_count: int
     grasp_region_point_count: int
     object_point_count: int
+    sensor_surface_distance_m: float | None = None
+    sensor_band_point_count: int = 0
 
     @property
     def between_fingers(self) -> bool:
@@ -240,11 +250,35 @@ class ToolObjectRelation:
     def in_contact_band(self) -> bool:
         return self.relation in ("between_fingers_in_contact_band", "in_contact_band")
 
+    @property
+    def nearest_distance_m(self) -> float | None:
+        values = [v for v in (self.surface_distance_m, self.sensor_surface_distance_m) if v is not None]
+        return min(values) if values else None
+
     def as_dict(self) -> dict:
         return {"relation": self.relation, "surface_distance_m": self.surface_distance_m,
+                "sensor_surface_distance_m": self.sensor_surface_distance_m,
                 "contact_band_point_count": self.contact_band_point_count,
+                "sensor_band_point_count": self.sensor_band_point_count,
                 "grasp_region_point_count": self.grasp_region_point_count,
                 "object_point_count": self.object_point_count}
+
+
+def _rigid_transform(value, *, name: str) -> np.ndarray:
+    transform = np.asarray(value, dtype=float)
+    if transform.size != 16 or not np.isfinite(transform).all():
+        raise ValueError(f"{name} must be a finite 4x4 transform.")
+    transform = transform.reshape(4, 4)
+    rotation = transform[:3, :3]
+    if (not np.allclose(transform[3], (0., 0., 0., 1.), atol=1e-9, rtol=0.)
+            or not np.allclose(rotation.T @ rotation, np.eye(3), atol=1e-6, rtol=0.)
+            or not np.isclose(np.linalg.det(rotation), 1., atol=1e-6, rtol=0.)):
+        raise ValueError(f"{name} must be a rigid transform.")
+    return transform
+
+
+def _kth(values: np.ndarray, k: int) -> float:
+    return float(np.partition(values, k - 1)[k - 1])
 
 
 def tool_object_relation(*, entity: ToolEntityBox, world_from_tcp: np.ndarray, object_points_m,
@@ -256,8 +290,9 @@ def tool_object_relation(*, entity: ToolEntityBox, world_from_tcp: np.ndarray, o
     ``between_fingers`` needs ``region_minimum_points`` surface points inside
     the open closing region between the finger solids; the contact band needs
     ``contact_minimum_points`` points within ``contact_distance_m`` of (or
-    inside) the palm/finger solids. Pass voxel-thinned points so the counts
-    are metric. Thresholds were calibrated on the saved operator samples.
+    inside) the screening or contact-only solids. ``near``/``far`` use the
+    smaller robust distance. Pass voxel-thinned points so the counts are
+    metric. Thresholds were calibrated on the saved operator samples.
     """
     if not entity.parts or entity.grasp_region is None:
         raise ValueError("Tool-object relations need the gripper solids and closing region.")
@@ -268,58 +303,71 @@ def tool_object_relation(*, entity: ToolEntityBox, world_from_tcp: np.ndarray, o
             or type(contact_minimum_points) is not int or contact_minimum_points < 1
             or type(region_minimum_points) is not int or region_minimum_points < 1):
         raise ValueError("Need 0 < contact < near <= 0.5 m and positive integer point thresholds.")
-    transform = np.asarray(world_from_tcp, dtype=float).reshape(4, 4)
+    transform = _rigid_transform(world_from_tcp, name="world_from_tcp")
     rotation = np.asarray(entity.tcp_from_box_rotation).reshape(3, 3)
-    # World -> TCP coordinates, then into the shared solid axes (no translation).
-    local = ((points - transform[:3, 3]) @ transform[:3, :3]) @ rotation
-    distances = [_signed_box_distance(local, np.asarray(c) @ rotation, h) for c, h in entity.parts]
+    in_tcp = (points - transform[:3, 3]) @ transform[:3, :3]
+    # TCP coordinates into the shared screening-solid axes (no translation).
+    local = in_tcp @ rotation
+    screening = np.min([_signed_box_distance(local, np.asarray(c) @ rotation, h) for c, h in entity.parts], axis=0)
+    sensor = None
     if entity.contact_solids:
-        in_tcp = (points - transform[:3, 3]) @ transform[:3, :3]
-        for pose, h in entity.contact_solids:
-            solid = np.asarray(pose).reshape(4, 4)
-            distances.append(_signed_box_distance((in_tcp - solid[:3, 3]) @ solid[:3, :3], np.zeros(3), h))
-    distance = np.min(distances, axis=0)
+        sensor = np.min([_signed_box_distance((in_tcp - np.asarray(pose).reshape(4, 4)[:3, 3])
+                                              @ np.asarray(pose).reshape(4, 4)[:3, :3], np.zeros(3), h)
+                         for pose, h in entity.contact_solids], axis=0)
     centre, half = entity.grasp_region
     inside = np.all(np.abs(local - np.asarray(centre) @ rotation) < np.asarray(half), axis=1)
     region = int(np.count_nonzero(inside))
-    band = int(np.count_nonzero(distance <= contact_distance_m))
-    robust = float(np.partition(distance, min(contact_minimum_points, len(distance)) - 1)[
-        min(contact_minimum_points, len(distance)) - 1])
+    nearest = screening if sensor is None else np.minimum(screening, sensor)
+    band = int(np.count_nonzero(nearest <= contact_distance_m))
+    sensor_band = 0 if sensor is None else int(np.count_nonzero(sensor <= contact_distance_m))
+    if len(points) < contact_minimum_points:
+        return ToolObjectRelation(relation="insufficient_surface", surface_distance_m=None,
+            contact_band_point_count=band, grasp_region_point_count=region, object_point_count=int(len(points)),
+            sensor_surface_distance_m=None, sensor_band_point_count=sensor_band)
+    robust = _kth(screening, contact_minimum_points)
+    robust_sensor = None if sensor is None else _kth(sensor, contact_minimum_points)
     between, touching = region >= region_minimum_points, band >= contact_minimum_points
     if between:
         relation = "between_fingers_in_contact_band" if touching else "between_fingers"
     elif touching:
         relation = "in_contact_band"
-    elif robust <= near_distance_m:
+    elif min(robust, robust if robust_sensor is None else robust_sensor) <= near_distance_m:
         relation = "near"
     else:
         relation = "far"
     return ToolObjectRelation(relation=relation, surface_distance_m=robust, contact_band_point_count=band,
-                              grasp_region_point_count=region, object_point_count=int(len(points)))
+                              grasp_region_point_count=region, object_point_count=int(len(points)),
+                              sensor_surface_distance_m=robust_sensor, sensor_band_point_count=sensor_band)
 
 
 def fuse_tool_object_relations(relations: Sequence[ToolObjectRelation]) -> dict:
     """Combine one object's per-view relations for one arm.
 
-    Every view is partial surface evidence, so the union is used: the object is
-    between the fingers or in the contact band if any view shows it, and the
-    distance is the smallest robust distance. ``views_agree`` reports whether
-    all views gave the same class, so disagreement stays visible.
+    Every view is partial surface evidence of the same physical object, so the
+    union is used: between the fingers or in the contact band if any view
+    shows it; distances are the smallest robust ones. Views with too little
+    surface are ignored unless no view has enough. ``views_agree`` reports
+    whether all sufficient views gave the same class.
     """
     if not relations:
         raise ValueError("At least one view relation is required.")
-    between = any(item.between_fingers for item in relations)
-    band = any(item.in_contact_band for item in relations)
-    distance = min(item.surface_distance_m for item in relations)
+    usable = [item for item in relations if item.relation != "insufficient_surface"]
+    if not usable:
+        return {"relation": "insufficient_surface", "surface_distance_m": None, "sensor_surface_distance_m": None,
+                "view_count": len(relations), "usable_view_count": 0, "views_agree": True}
+    between = any(item.between_fingers for item in usable)
+    band = any(item.in_contact_band for item in usable)
     if between:
         relation = "between_fingers_in_contact_band" if band else "between_fingers"
     elif band:
         relation = "in_contact_band"
     else:
-        # All views are near/far here; nearest view decides.
-        relation = min(relations, key=lambda item: item.surface_distance_m).relation
-    return {"relation": relation, "surface_distance_m": distance, "view_count": len(relations),
-            "views_agree": len({item.relation for item in relations}) == 1}
+        # All usable views are near/far here; the nearest view decides.
+        relation = min(usable, key=lambda item: item.nearest_distance_m).relation
+    sensors = [item.sensor_surface_distance_m for item in usable if item.sensor_surface_distance_m is not None]
+    return {"relation": relation, "surface_distance_m": min(item.surface_distance_m for item in usable),
+            "sensor_surface_distance_m": min(sensors) if sensors else None, "view_count": len(relations),
+            "usable_view_count": len(usable), "views_agree": len({item.relation for item in usable}) == 1}
 
 
 @dataclass(frozen=True)

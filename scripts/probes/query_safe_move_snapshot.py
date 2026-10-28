@@ -92,6 +92,14 @@ def dmtac_open_sensor_contact_solids(urdf_path, tool_tcp_pose_flange_m_rad_by_si
                                      package_dirs=[str(path.parent), str(path.parent.parent)])
     data, geometry_data = model.createData(), pin.GeometryData(geometry)
     q = pin.neutral(model)
+    # The v5 screening alignment is defined at gripper_master_q_rad == 0 (its
+    # loader enforces it); require q=0 to be the open end of every gripper joint.
+    for joint_id in range(1, model.njoints):
+        name = model.names[joint_id]
+        if "_eg2_4b2_cad_" in name and model.joints[joint_id].nq == 1:
+            index = model.joints[joint_id].idx_q
+            if not np.isclose(model.lowerPositionLimit[index], 0.) or not np.isclose(q[index], 0.):
+                raise ValueError("Open DMTAC sensor boxes require q=0 at the open joint limit.")
     pin.forwardKinematics(model, data, q)
     pin.updateFramePlacements(model, data)
     pin.updateGeometryPlacements(model, data, geometry, geometry_data, q)
@@ -103,8 +111,10 @@ def dmtac_open_sensor_contact_solids(urdf_path, tool_tcp_pose_flange_m_rad_by_si
         frame = side + "_arm_link6"
         if not model.existFrame(frame):
             continue
-        world_from_tcp = data.oMf[model.getFrameId(frame)].homogeneous.copy()
-        world_from_tcp[:3, 3] += world_from_tcp[:3, 2] * float(tcp[2])  # reviewed TCP: pure +Z offset
+        flange_from_tcp = np.eye(4)
+        flange_from_tcp[:3, :3] = Rotation.from_euler("xyz", np.asarray(tcp[3:], dtype=float)).as_matrix()
+        flange_from_tcp[:3, 3] = np.asarray(tcp[:3], dtype=float)
+        world_from_tcp = data.oMf[model.getFrameId(frame)].homogeneous @ flange_from_tcp
         solids = []
         for index, item in enumerate(geometry.geometryObjects):
             half = getattr(item.geometry, "halfSide", None)
@@ -335,7 +345,11 @@ class SavedSceneSkillQuery:
                 raise ValueError("Object surfaces must be nonempty finite N x 3 arrays.")
             points.setflags(write=False)
             self._object_surfaces[reference] = points
-        self._relation_reads = 0
+        views = [(self._refs[r]["label"], self._refs[r]["role"]) for r in self._object_surfaces]
+        if len(set(views)) != len(views):
+            # Fusion treats one label as one physical object seen from several views.
+            raise ValueError("Each measured object label may have at most one surface per camera role.")
+        self._relation_reads = []
         self._planner, self._cloud = planner, cloud
         self._source_evidence = copy.deepcopy(source_evidence)
         self._lock = threading.Lock()
@@ -492,11 +506,14 @@ class SavedSceneSkillQuery:
         """Measured gripper-object relations at this saved time node; no planning.
 
         Semantics ``agenticrobot.relation.tool_object.v1``: each saved object
-        surface (eroded mask, largest measured cluster) against each arm's
-        reviewed gripper solids at the measured TCP. ``objects`` fuses views
-        that share a label; ``views`` keeps every per-view result. Distances
-        are to the maximum-opening screening envelope, so the contact band is
-        evidence of proximity, never a contact, grasp or force claim.
+        surface (eroded mask, largest measured cluster) against each bound
+        arm's gripper at the measured TCP: the maximum-opening screening solids
+        with their closing region, plus any bound contact-only solids (the
+        URDF's open DMTAC sensor boxes), reported as separate distances.
+        ``objects`` fuses the camera views of one label (one physical object);
+        ``views`` keeps each view with its surface-cluster counts. Unbound arms
+        are listed, never silently omitted. The contact band is proximity
+        evidence, never a contact, grasp or force claim.
         """
         self._require_open()
         if not self._lock.acquire(blocking=False):
@@ -508,22 +525,35 @@ class SavedSceneSkillQuery:
                 points = self._object_surfaces.get(anchor["reference"])
                 if points is None:
                     continue
+                cluster = anchor.get("object_surface") or {}
+                surface = {key: cluster[key] for key in ("voxel_count", "component_count", "kept_voxel_count")
+                           if key in cluster}
                 for side in sorted(self._tool_entities):
                     relation = tool_object_relation(entity=self._tool_entities[side],
                         world_from_tcp=_pose_matrix(self._tcp[side]), object_points_m=points)
                     views.append({"side": side, "target_reference": anchor["reference"],
-                                  "label": anchor["label"], "role": anchor["role"], **relation.as_dict()})
+                                  "label": anchor["label"], "role": anchor["role"], **relation.as_dict(),
+                                  **({"surface_cluster": surface} if surface else {})})
                     grouped.setdefault((side, anchor["label"]), []).append(relation)
             objects = [{"side": side, "label": label, **fuse_tool_object_relations(items)}
                        for (side, label), items in sorted(grouped.items())]
-            self._relation_reads += 1
-            return {"scope": "one_saved_time_node_no_execution",
+            gripper = {side: {"screening_solids": "graspgenx_screening_solids_maximum_opening_envelope",
+                              "contact_solids": entity.source.get("contact_solids"),
+                              "contact_solid_count": len(entity.contact_solids)}
+                       for side, entity in sorted(self._tool_entities.items())}
+            result = {"scope": "one_saved_time_node_no_execution",
                     "semantics": TOOL_OBJECT_RELATION_SEMANTICS_V1,
                     "reference_frame_id": self._frame, "objects": objects, "views": views,
+                    "evaluated_sides": sorted(self._tool_entities),
+                    "unbound_sides": sorted({"left", "right"} - set(self._tool_entities)),
+                    "gripper_geometry_by_side": gripper,
                     "unmeasured_references": [a["reference"] for a in self._anchors
                         if a["kind"] == "saved_visible_surface_point"
                         and a["reference"] not in self._object_surfaces],
-                    "evidence_scope": "measured_visible_surfaces_vs_gripper_screening_envelope"}
+                    "evidence_scope": ("measured_visible_surfaces_vs_gripper_screening_solids"
+                                       "_and_bound_contact_solids")}
+            self._relation_reads.append(copy.deepcopy(result))
+            return result
         finally:
             self._lock.release()
 
@@ -1017,8 +1047,9 @@ class SavedSceneSkillQuery:
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--manifest", type=Path, required=True)
-    parser.add_argument("--request", type=Path, help="JSON relation query; omit to inspect references")
-    parser.add_argument("--tool-object-relations", action="store_true",
+    action = parser.add_mutually_exclusive_group()
+    action.add_argument("--request", type=Path, help="JSON relation query; omit to inspect references")
+    action.add_argument("--tool-object-relations", action="store_true",
         help="Print measured gripper-object relations instead of references")
     parser.add_argument("--audit-output", type=Path, help="New JSON file for full query evidence")
     clearance = parser.add_mutually_exclusive_group()

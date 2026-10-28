@@ -200,24 +200,39 @@ against each bound gripper at the measured TCP, without planning:
 
 - Object surface: the saved mask eroded by 2 px, valid depth within the
   observation range, back-projected, thinned to 3 mm voxels, and only the
-  largest 10 mm-linked cluster kept. A mask that also covers a nearer occluder
-  (for example a finger in front of the object) is therefore not object
-  evidence.
-- Gripper: the same screening palm/finger solids as above, plus the open
-  closing region between the fingers.
-- Classes per arm and reference: `between_fingers` (at least 10 surface voxels
-  in the closing region), `between_fingers_in_contact_band`, `in_contact_band`
-  (at least 3 voxels within 5 mm of, or inside, the solids), `near` (robust
-  distance at most 5 cm) or `far`. `surface_distance_m` is the third-smallest
-  signed voxel distance. `objects` fuses all views of a label (union of
-  evidence, smallest distance, `views_agree`); `views` keeps each view.
+  largest 10 mm-linked cluster kept. An occluder separated by more than 10 mm
+  (for example a finger in front of the object) usually forms a smaller,
+  dropped cluster; a closer or larger one does not. Each view reports its
+  `surface_cluster` counts so an ambiguous surface stays visible.
+- Gripper: the same screening palm/finger solids as above with the open
+  closing region between the fingers, plus contact-only solids: the station
+  URDF's two DMTAC sensor collision boxes per arm at the open gripper (q=0,
+  pinocchio FK; identical in the MuJoCo twin). These are 48 mm along the
+  closing axis and reach about 30 mm beyond the 19.9 mm screening finger;
+  their inner faces agree with the closing region within about 1 mm.
+- Per arm and reference: `between_fingers` (at least 10 surface voxels in the
+  closing region), `between_fingers_in_contact_band`, `in_contact_band` (at
+  least 3 voxels within 5 mm of, or inside, either solid set), `near` (robust
+  distance at most 5 cm), `far`, or `insufficient_surface` (fewer than 3
+  voxels). `surface_distance_m` is the third-smallest signed voxel distance to
+  the screening solids and `sensor_surface_distance_m` the same to the sensor
+  boxes (`null` without them), so neither hides the other.
+- `objects` fuses the camera views of one label as one physical object (union
+  of evidence, smallest distances, `views_agree`); a label may have at most
+  one measured surface per camera role. `views` keeps each view.
+  `evaluated_sides`, `unbound_sides` and `gripper_geometry_by_side` state which
+  arms and solids were evaluated; an arm without the reviewed TCP is listed as
+  unbound rather than silently omitted.
 
-The solids are the maximum-opening screening envelope, so this is proximity
-evidence, not contact, grasp, force or stability. Real own-wrist finger
-surfaces sit 3-5 mm inside it. In the MuJoCo twin (same URDF), the DMTAC sensor
-collision boxes extend about 30 mm beyond the envelope's outer finger faces
-when open, so contact on the outside of a finger can be under-reported; the
-closing-region faces agree within about 1 mm. Measured on the 21 saved samples
-with all SAM3 objects and views: no relation on the 11 clean-start samples, all
-5 pregrasp samples between the fingers, 3 of 4 contact samples in the band. In
-MuJoCo with exact masks, 20 of 20 designed placements matched.
+This is proximity evidence, not contact, grasp, force or stability. Real
+own-wrist finger surfaces sit 3-5 mm inside the screening solids. Head-camera
+surfaces next to the gripper can read up to about 17 mm inside the sensor
+boxes, more likely a 1-2 cm head-camera/arm calibration offset near the
+gripper or loose boxes than real penetration. On the 21 saved samples with all
+SAM3 objects and views (sensor boxes bound): no between or band relation on the
+11 clean-start samples, all 5 pregrasp samples between the fingers, and 3 of 4
+contact samples in the band; the miss (`1e0395c0`) has no mask for the black
+thermos in the contacting arm's wrist view. In the MuJoCo twin with exact
+segmentation, 20 of 20 designed placements matched the exact geometry,
+including a box 25 mm outside the screening finger that physically penetrates
+the sensor box.

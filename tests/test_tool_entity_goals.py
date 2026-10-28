@@ -308,11 +308,30 @@ def test_fused_relation_is_the_union_of_partial_views():
                                   grasp_region_point_count=0, object_point_count=10)
     fused = fuse_tool_object_relations([make("near", .02), make("between_fingers", .008), make("in_contact_band", .001)])
     assert fused == {"relation": "between_fingers_in_contact_band", "surface_distance_m": .001,
-                     "view_count": 3, "views_agree": False}
+                     "sensor_surface_distance_m": None, "view_count": 3, "usable_view_count": 3,
+                     "views_agree": False}
     assert fuse_tool_object_relations([make("far", .2), make("near", .03)])["relation"] == "near"
     assert fuse_tool_object_relations([make("far", .2)])["views_agree"] is True
+    thin = ToolObjectRelation(relation="insufficient_surface", surface_distance_m=None, contact_band_point_count=2,
+                              grasp_region_point_count=0, object_point_count=2)
+    mixed = fuse_tool_object_relations([thin, make("far", .2)])
+    assert mixed["relation"] == "far" and mixed["usable_view_count"] == 1 and mixed["views_agree"] is True
+    assert fuse_tool_object_relations([thin])["relation"] == "insufficient_surface"
     with pytest.raises(ValueError):
         fuse_tool_object_relations([])
+
+
+def test_too_small_surfaces_are_reported_not_classified():
+    relation = relation_of([[.035, 0., .02], [.035, 0., .03]])  # two points inside a finger
+    assert relation.relation == "insufficient_surface"
+    assert relation.surface_distance_m is None and relation.contact_band_point_count == 2
+
+
+@pytest.mark.parametrize("transform", [np.full((4, 4), np.nan), np.diag([2., 1., 1., 1.]),
+                                       np.diag([1., 1., -1., 1.]), np.eye(3)])
+def test_relation_rejects_a_non_rigid_or_nonfinite_tcp(transform):
+    with pytest.raises(ValueError):
+        tool_object_relation(entity=simple_entity(), world_from_tcp=transform, object_points_m=[[1., 0., 0.]] * 3)
 
 
 # --- bounded tool-axis-down cone ----------------------------------------------------
@@ -381,7 +400,10 @@ def test_contact_solids_join_only_the_relation_contact_band():
     probe = box_surface((.07, 0., .02), (.004, .004, .004))  # inside the extra solid, 3 cm off the finger
     assert relation_of(probe).relation == "near"
     extended = tool_object_relation(entity=sensor, world_from_tcp=WORLD_FROM_TCP, object_points_m=to_world(probe))
-    assert extended.relation == "in_contact_band" and extended.surface_distance_m < 0.
+    assert extended.relation == "in_contact_band" and extended.sensor_surface_distance_m < 0.
+    # The screening distance keeps its own meaning; the sensor evidence is separate.
+    assert extended.surface_distance_m == pytest.approx(relation_of(probe).surface_distance_m)
+    assert extended.sensor_band_point_count > 0 and relation_of(probe).sensor_surface_distance_m is None
     # Hover geometry, closing region and identity of the screening box are unchanged.
     np.testing.assert_allclose(sensor.corners_tcp(), plain.corners_tcp())
     assert sensor.grasp_region == plain.grasp_region and sensor.parts == plain.parts
@@ -396,3 +418,10 @@ def test_contact_solids_must_be_rigid_boxes(pose, half):
     from dataclasses import replace
     with pytest.raises(ValueError):
         replace(simple_entity(), contact_solids=((tuple(pose), half),))
+
+
+def test_tool_axis_cone_from_a_tool_pointing_straight_up():
+    up = Rotation.from_euler("x", 0, degrees=True)  # approach axis +Z: 180 deg from down
+    cone = hover_orientation([0., 0., 0., *up.as_quat()], "tool_axis_down", tool_axis_max_tilt_rad=math.radians(30.))
+    assert tool_axis_tilt_rad(cone) == pytest.approx(math.radians(30.), abs=1e-9)
+    assert (Rotation.from_matrix(cone) * up.inv()).magnitude() == pytest.approx(math.radians(150.), abs=1e-9)

@@ -1140,15 +1140,22 @@ def test_tool_object_relations_fuse_views_without_planning():
     # closing region spans z .44-.52 around the TCP's x axis.
     between = _cube_surface((.1, .2, .47), (.01, .008, .01))
     query = _entity_query(planner, object_surface_by_reference={"top-a": between})
+    query._anchors[0]["object_surface"] = {"voxel_count": 9, "component_count": 2, "kept_voxel_count": 7}
     result = query.describe_tool_object_relations()
     assert result["semantics"] == "agenticrobot.relation.tool_object.v1"
     assert result["scope"] == "one_saved_time_node_no_execution"
     assert result["objects"] == [{"side": "right", "label": "cube top", "relation": "between_fingers",
-        "surface_distance_m": pytest.approx(.02), "view_count": 1, "views_agree": True}]
+        "surface_distance_m": pytest.approx(.02), "sensor_surface_distance_m": None, "view_count": 1,
+        "usable_view_count": 1, "views_agree": True}]
+    # Unbound arms are disclosed, never silently omitted; geometry provenance is explicit.
+    assert result["evaluated_sides"] == ["right"] and result["unbound_sides"] == ["left"]
+    assert result["gripper_geometry_by_side"]["right"]["contact_solid_count"] == 0
     view = result["views"][0]
     assert view["target_reference"] == "top-a" and view["role"] == "main"
     assert view["grasp_region_point_count"] == view["object_point_count"] > 10
-    assert not planner.calls and query.audit()["relation_reads"] == 1
+    assert view["surface_cluster"] == {"voxel_count": 9, "component_count": 2, "kept_voxel_count": 7}
+    assert not planner.calls and query.audit()["relation_reads"] == [result]
+    # The model view still exposes neither surfaces nor their cluster evidence.
     assert "object_surface" not in json.dumps(query.read_scene())
     query.close()
     with pytest.raises(RuntimeError):
@@ -1161,6 +1168,14 @@ def test_tool_object_relations_only_bind_saved_surface_references():
         _entity_query(planner, object_surface_by_reference={"elsewhere": [[0., 0., 0.]]})
     with pytest.raises(ValueError, match="finite"):
         _entity_query(planner, object_surface_by_reference={"top-a": [[0., 0., float("nan")]]})
+    # Two measured surfaces with one label in one camera role would be fused as one object.
+    twin = _entity_query(planner)
+    anchors = twin._anchors + [{**twin._anchors[0], "reference": "top-b"}]
+    with pytest.raises(ValueError, match="one surface per camera role"):
+        SavedSceneSkillQuery(scene_id="b" * 64, reference_frame_id="station", qpos_by_side=twin._qpos,
+            tcp_pose_by_side=twin._tcp, anchors=anchors, planner=planner, cloud=None, source_evidence={},
+            object_surface_by_reference={"top-a": [[0., 0., 0.]], "top-b": [[1., 0., 0.]]})
+    twin.close()
     query = _entity_query(planner)
     result = query.describe_tool_object_relations()
     assert result["objects"] == [] and result["unmeasured_references"] == ["top-a"]
@@ -1235,3 +1250,55 @@ def test_station_urdf_open_dmtac_sensor_boxes_extend_beyond_the_screening_finger
     # Hover geometry stays the screening box.
     plain = default_tool_entity_by_side({"right": reviewed})["right"]
     np.testing.assert_allclose(entity.corners_tcp(), plain.corners_tcp())
+
+
+def test_object_surface_from_mask_erodes_and_keeps_valid_measured_depth():
+    from scripts.probes.query_safe_move_snapshot import object_surface_from_mask
+    depth = np.full((40, 40), .5, dtype=np.float32)
+    depth[20:, :] = 0.  # invalid half
+    depth[:, 30:] = 2.  # beyond the observation range
+    mask = np.zeros((40, 40), dtype=bool)
+    mask[5:35, 5:35] = True
+    capture = SimpleNamespace(depth_m=depth, intrinsics={"fx": 100., "fy": 100., "cx": 20., "cy": 20.},
+                              source_from_camera=np.eye(4))
+    points, evidence = object_surface_from_mask(mask, capture, maximum_depth_m=1.5)
+    assert evidence["mask_erosion_px"] == 2
+    # Rows 7..19 and columns 7..29 survive erosion, validity and range.
+    assert evidence["valid_pixel_count"] == 13 * 23
+    np.testing.assert_allclose(points[:, 2], .5)
+    assert evidence["component_count"] == 1 and evidence["kept_voxel_count"] == len(points)
+    empty, info = object_surface_from_mask(np.zeros((40, 40), bool), capture, maximum_depth_m=1.5)
+    assert empty is None and info["valid_pixel_count"] == 0
+
+
+def test_cli_relation_and_planning_requests_are_exclusive(tmp_path, monkeypatch):
+    import sys
+    from scripts.probes import query_safe_move_snapshot as module
+    request = tmp_path / "request.json"
+    request.write_text("{}")
+    monkeypatch.setattr(sys, "argv", ["probe", "--manifest", str(tmp_path / "m.json"), "--request", str(request),
+                                      "--audit-output", str(tmp_path / "a.json"), "--tool-object-relations"])
+    with pytest.raises(SystemExit):
+        module.main()
+
+
+@pytest.mark.parametrize("extra_deg,inside", [(-.5, True), (.5, False)])
+def test_entity_hover_cone_accepts_only_within_the_arrival_rotation_tolerance(extra_deg, inside):
+    import math
+    from scipy.spatial.transform import Rotation
+    from agent_gateway.profiles.real.motion_primitive_profiles import RealAgentPrimitiveConvergenceProfile
+    tolerance = math.degrees(RealAgentPrimitiveConvergenceProfile().rotation_tolerance_rad)
+
+    class Tilting(Planner):
+        def tool_tcp_poses_for_qpos_pair(self, **kwargs):
+            actual = self.target.copy()
+            actual[:3, :3] = Rotation.from_euler("x", tolerance + extra_deg, degrees=True).as_matrix() @ actual[:3, :3]
+            return {s: actual for s in ("left", "right")}
+
+    query = _entity_query(Tilting())
+    result = query.plan_entity_hover_region(**HOVER, orientation_policy="tool_axis_down", max_candidates=1)
+    validation = query.audit()["region_queries"][0]["candidate_validations"][0]
+    assert validation["achieved_tool_axis_tilt_rad"] == pytest.approx(math.radians(tolerance + extra_deg))
+    assert validation["inside_requested_region"] is inside
+    assert (result["status"] == "path_found") is inside
+    query.close()
