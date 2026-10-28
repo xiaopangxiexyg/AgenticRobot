@@ -87,6 +87,11 @@ Native tactile bundle 重压缩也使用一个恢复出口，按原 metadata、�
 metadata 图可能仍不一致，两套载荷保留不代表完整回滚；成功验证后的 raw 回收失败则
 保留已提交的新图，不回退到可能引用已删除 raw 的旧版本。
 
+同一次 native 重压缩调用保留一份 catalog 行集合，逐 Episode 显式原地更新主 binding
+及其 metadata 镜像，再编码供发布使用。后续 Episode 直接继承前面已更新的记录，
+不依赖外层浅复制保留的嵌套共享引用。内存更新不代表提交成功；任何失败仍中止本次
+调用，磁盘状态由该 Episode 的既有备份和恢复顺序负责。
+
 Capture-time progress effective time is monotonic within the bound Episode
 clock. Nested Hold/Resume operation times must also be knowable by the receipt's
 availability time. The live reducer and read-time resolver enforce the same

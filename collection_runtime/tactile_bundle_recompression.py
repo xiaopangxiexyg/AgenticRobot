@@ -167,13 +167,14 @@ def _read_catalog_rows(core_root: Path) -> list[dict[str, Any]]:
     return rows
 
 
-def _episode_catalog_update(
+def _update_episode_catalog_in_place(
     rows: list[dict[str, Any]],
     *,
     episode_index: int,
     episode_uuid: str,
     commit_hash: str,
 ) -> bytes:
+    """Update the caller's cumulative rows in place and encode the next catalog."""
     matched = 0
     for row in rows:
         if int(row.get("episode_index", -1)) != int(episode_index):
@@ -432,7 +433,7 @@ def recompress_native_tactile_bundle_zstd_in_place(
         raise TactileRecompressionCancelled("native tactile recompression cancelled before work")
 
     codec: _ZstdCodec | None = None
-    rows = _read_catalog_rows(core_root)
+    catalog_rows = _read_catalog_rows(core_root)
     catalog_path = core_root / "meta" / "episodes.jsonl"
     manifest_count = 0
     stream_count = 0
@@ -614,8 +615,8 @@ def recompress_native_tactile_bundle_zstd_in_place(
                 core_component_ref=old_commit.core_component_ref,
                 tactile_component_ref=old_commit.tactile_component_ref,
             )
-            updated_catalog = _episode_catalog_update(
-                [dict(row) for row in rows],
+            updated_catalog = _update_episode_catalog_in_place(
+                catalog_rows,
                 episode_index=updated_commit.legacy_episode_index,
                 episode_uuid=updated_commit.episode_uuid,
                 commit_hash=updated_commit.semantic_content_hash,
