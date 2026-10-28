@@ -364,8 +364,9 @@ class _PayloadSceneOracle(CollisionSafetyOracle):
         self._geoms = frozenset(int(g) for g in np.flatnonzero((model.geom_bodyid == self._body)
             & ((model.geom_contype != 0) | (model.geom_conaffinity != 0))))
         if not self._geoms or any(model.geom_contype[g] != 8 or model.geom_type[g] not in (
-                mujoco.mjtGeom.mjGEOM_BOX, mujoco.mjtGeom.mjGEOM_MESH) for g in self._geoms):
-            raise ValueError("Complete payload requires all native target collision geoms as object boxes/meshes")
+                mujoco.mjtGeom.mjGEOM_BOX, mujoco.mjtGeom.mjGEOM_MESH,
+                mujoco.mjtGeom.mjGEOM_SPHERE) for g in self._geoms):
+            raise ValueError("Complete payload requires all native target collision geoms as object boxes/meshes/spheres")
         self._sensors = tuple(int(model.geom(n).id) for n in binding.sensor_geom_names)
         if (any(model.geom_contype[g] != 4 for g in self._sensors)
                 or len({int(model.geom_bodyid[g]) for g in self._sensors}) != 2):
@@ -448,12 +449,19 @@ class _PayloadSceneOracle(CollisionSafetyOracle):
 
     def _support_allowed(self, data, geom, support_geom, *, measured=False):
         support, model = self.binding.support, self.model
+        sphere = model.geom_type[geom] == self.mujoco.mjtGeom.mjGEOM_SPHERE
         normal = np.asarray(support.normal_world)
+        if sphere:
+            # The public contract permits a tiny unit-length tolerance. Sphere
+            # projection requires a unit direction to retain exact bounds.
+            normal = normal / np.linalg.norm(normal)
         delta = None
         if self._dynamic_support_body is not None:
             current = _body_pose(data, self._dynamic_support_body)
             delta = current @ self._inverse_source_support_pose
             normal = delta[:3, :3] @ normal
+            if sphere:
+                normal = normal / np.linalg.norm(normal)
         rotation = data.geom_xmat[support_geom].reshape(3, 3)
         local = rotation.T @ normal
         axis = int(np.argmax(np.abs(local)))
@@ -467,27 +475,53 @@ class _PayloadSceneOracle(CollisionSafetyOracle):
             face = data.geom_xpos[support_geom] + normal * model.geom_size[support_geom, axis]
         if not aligned:
             raise ValueError("Explicit support normal must match an outward native support face")
-        # Native geometry, including rotated/offset boxes and convex mesh vertices.
-        if model.geom_type[geom] == self.mujoco.mjtGeom.mjGEOM_BOX:
-            vertices = np.asarray(tuple(itertools.product((-1., 1.), repeat=3))) * model.geom_size[geom]
+        if sphere:
+            # The exact circle, rather than a finite surface sample, bounds the
+            # native sphere's projected footprint and lowest support point.
+            radius = float(model.geom_size[geom, 0])
+            center = data.geom_xpos[geom]
+            center_height = float((center - face) @ normal)
+            minimum_height = center_height - radius
+            footprint = center - center_height * normal
+            if delta is not None:
+                region_center = (footprint - delta[:3, 3]) @ delta[:3, :3]
+                region_normal = normal @ delta[:3, :3]
+                region_normal = region_normal / np.linalg.norm(region_normal)
+            else:
+                region_center, region_normal = footprint, normal
+            extent = radius * np.sqrt(np.maximum(0., 1. - region_normal * region_normal))
+            region_low, region_high = region_center - extent, region_center + extent
+            geometry_finite = (math.isfinite(radius) and radius > 0.
+                               and np.isfinite(center).all() and np.isfinite(footprint).all())
         else:
-            mesh = int(model.geom_dataid[geom])
-            start, count = int(model.mesh_vertadr[mesh]), int(model.mesh_vertnum[mesh])
-            vertices = model.mesh_vert[start:start+count]
-        points = vertices @ data.geom_xmat[geom].reshape(3, 3).T + data.geom_xpos[geom]
-        height = (points - face) @ normal
-        footprint = points - height[:, None] * normal
-        # The declared region is a potentially narrow source-frame rectangle.
-        # Rotating its AABB outward would grant contact outside that rectangle.
-        region_footprint = (footprint - delta[:3, 3]) @ delta[:3, :3] if delta is not None else footprint
-        if (not np.isfinite(points).all() or np.min(height) < -support.max_penetration_m
-                or np.any(region_footprint < np.asarray(support.region_min_world) - 1e-9)
-                or np.any(region_footprint > np.asarray(support.region_max_world) + 1e-9)):
+            # Preserve the complete native box/convex-mesh vertex path.
+            if model.geom_type[geom] == self.mujoco.mjtGeom.mjGEOM_BOX:
+                vertices = np.asarray(tuple(itertools.product((-1., 1.), repeat=3))) * model.geom_size[geom]
+            else:
+                mesh = int(model.geom_dataid[geom])
+                start, count = int(model.mesh_vertadr[mesh]), int(model.mesh_vertnum[mesh])
+                vertices = model.mesh_vert[start:start+count]
+            points = vertices @ data.geom_xmat[geom].reshape(3, 3).T + data.geom_xpos[geom]
+            height = (points - face) @ normal
+            minimum_height = np.min(height)
+            footprint = points - height[:, None] * normal
+            # The declared region is a potentially narrow source-frame rectangle.
+            # Rotating its AABB outward would grant contact outside that rectangle.
+            region_footprint = (footprint - delta[:3, 3]) @ delta[:3, :3] if delta is not None else footprint
+            region_low, region_high = region_footprint.min(axis=0), region_footprint.max(axis=0)
+            geometry_finite = np.isfinite(points).all()
+        if (not geometry_finite or not np.isfinite(minimum_height)
+                or not np.isfinite(region_low).all() or not np.isfinite(region_high).all()
+                or minimum_height < -support.max_penetration_m
+                or np.any(region_low < np.asarray(support.region_min_world) - 1e-9)
+                or np.any(region_high > np.asarray(support.region_max_world) + 1e-9)):
             return False
         if model.geom_type[support_geom] == self.mujoco.mjtGeom.mjGEOM_BOX:
             local_points = (footprint - data.geom_xpos[support_geom]) @ rotation
             tangents = [i for i in range(3) if i != axis]
-            if np.any(np.abs(local_points[:, tangents]) > model.geom_size[support_geom, tangents] + 1e-9):
+            projected_extent = (np.abs(local_points[tangents]) + radius if sphere
+                                else np.max(np.abs(local_points[:, tangents]), axis=0))
+            if np.any(projected_extent > model.geom_size[support_geom, tangents] + 1e-9):
                 return False
         tcp = rigid_pose(self.binding._tcp(data), name="canonical world_from_tcp")
         delta = tcp[:3, 3] - np.asarray(self.binding._anchor_tool)[:3, 3]

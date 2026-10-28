@@ -27,7 +27,8 @@ def _pose(data, model, name):
 
 
 def _scene(*, shape="box", extra="", table=False, table_shape="plane", second_geom=False,
-           sensor_y=.0245, table_mocap=False, payload_side="right"):
+           sensor_y=.0245, table_mocap=False, payload_side="right",
+           payload_geom_offset=(0., 0., 0.), second_shape="box"):
     import mujoco
 
     def joints_for(side):
@@ -38,7 +39,14 @@ def _scene(*, shape="box", extra="", table=False, table_shape="plane", second_ge
 
     vertices = " ".join(f"{x} {y} {z}" for x in (-.05, .05) for y in (-.015, .015) for z in (-.015, .015))
     asset = f'<asset><mesh name="native_mesh" vertex="{vertices}"/></asset>' if shape == "mesh" else ""
-    geom = 'type="mesh" mesh="native_mesh"' if shape == "mesh" else 'type="box" size=".05 .015 .015"'
+    geom = {
+        "mesh": 'type="mesh" mesh="native_mesh"',
+        "box": 'type="box" size=".05 .015 .015"',
+        "sphere": 'type="sphere" size=".015"',
+        "capsule": 'type="capsule" size=".015 .02"',
+        "cylinder": 'type="cylinder" size=".015 .02"',
+        "ellipsoid": 'type="ellipsoid" size=".02 .015 .015"',
+    }[shape]
     table_xml = '''<body name="table" pos="0 0 .385"><geom name="table_geom" type="plane"
       size="1 1 .01" contype="1" conaffinity="15"/></body>''' if table else ""
     if table and table_shape == "box":
@@ -46,7 +54,9 @@ def _scene(*, shape="box", extra="", table=False, table_shape="plane", second_ge
           size=".6 .6 .03" contype="1" conaffinity="15"/></body>'''
     if table_mocap:
         table_xml = table_xml.replace('<body name="table"', '<body name="table" mocap="true"')
-    tail = '''<geom name="payload_tail" pos=".07 0 0" type="box" size=".01 .01 .01"
+    tail_shape = {"box": 'type="box" size=".01 .01 .01"',
+                  "sphere": 'type="sphere" size=".015"'}[second_shape]
+    tail = f'''<geom name="payload_tail" pos=".07 0 0" {tail_shape}
       contype="8" conaffinity="15"/>''' if second_geom else ""
     passive_side = "left" if payload_side == "right" else "right"
     model = mujoco.MjModel.from_xml_string(f'''<mujoco>{asset}<option gravity="0 0 0"/>
@@ -62,7 +72,8 @@ def _scene(*, shape="box", extra="", table=False, table_shape="plane", second_ge
             type="box" size=".01 .01 .01" contype="4" conaffinity="15"/></body>
         </body>
         <body name="payload" pos=".08 0 .4"><freejoint/>
-          <geom name="payload_geom" {geom} contype="8" conaffinity="15"/>{tail}
+          <geom name="payload_geom" {geom} pos="{' '.join(map(str, payload_geom_offset))}"
+            contype="8" conaffinity="15"/>{tail}
         </body>{table_xml}{extra}
       </worldbody>
     </mujoco>''')
@@ -465,6 +476,100 @@ def test_rotated_free_support_does_not_expand_a_narrow_contact_region():
 
 
 @pytest.mark.integration
+@pytest.mark.parametrize("shift", [-.002, .002])
+def test_sphere_free_support_region_is_checked_in_its_source_frame(shift):
+    scene = _scene(shape="sphere", extra='''<body name="support" pos=".08 0 .355"><freejoint/>
+      <geom name="support_geom" type="box" size=".1 .08 .03" mass=".4"
+        contype="8" conaffinity="15"/></body>''')
+    model, data = scene.model, scene.data
+    support = _support(geom_names=("support_geom",), phase="place",
+        region_min_world=(.065, -.015, .385), region_max_world=(.095, .015, .385),
+        dynamic_body_name="support", frozen_pose_xyz_quat_xyzw=tuple(pose_matrix_to_xyzquat(
+            _pose(data, model, "support"))))
+    binding = _binding(scene, support=support)
+    oracle = binding.contact_oracle(scene)
+    payload_geom, support_geom = int(model.geom("payload_geom").id), int(model.geom("support_geom").id)
+    assert oracle._support_allowed(data, payload_geom, support_geom, measured=True)
+    body = int(model.body("support").id)
+    address = int(model.jnt_qposadr[model.body_jntadr[body]])
+    data.qpos[address] += shift
+    scene.mujoco.mj_kinematics(model, data)
+    # Support movement is within 3 mm, but the sphere extends beyond its
+    # original bounded region when that region moves with the support.
+    assert not oracle._support_allowed(data, payload_geom, support_geom, measured=True)
+
+
+@pytest.mark.integration
+def test_sphere_free_support_projection_uses_source_frame_normal():
+    scene = _scene(shape="sphere", extra='''<body name="support" pos=".08 0 .355"><freejoint/>
+      <geom name="support_geom" type="box" size=".1 .08 .03" mass=".4"
+        contype="8" conaffinity="15"/></body>''')
+    model, data = scene.model, scene.data
+    support = _support(geom_names=("support_geom",), phase="place",
+        region_min_world=(.065, -.015, .385), region_max_world=(.095, .015, .385),
+        dynamic_body_name="support", frozen_pose_xyz_quat_xyzw=tuple(pose_matrix_to_xyzquat(
+            _pose(data, model, "support"))))
+    binding = _binding(scene, support=support)
+    oracle = binding.contact_oracle(scene)
+    payload_geom, support_geom = int(model.geom("payload_geom").id), int(model.geom("support_geom").id)
+    assert oracle._support_allowed(data, payload_geom, support_geom, measured=True)
+    support_body, payload_body = int(model.body("support").id), int(model.body("payload").id)
+    support_address = int(model.jnt_qposadr[model.body_jntadr[support_body]])
+    payload_address = int(model.jnt_qposadr[model.body_jntadr[payload_body]])
+    rotation = Rotation.from_euler("y", 1., degrees=True)
+    quaternion = rotation.as_quat()
+    origin = np.array([.08, 0., .355])
+    data.qpos[support_address + 3:support_address + 7] = [quaternion[3], *quaternion[:3]]
+    data.qpos[payload_address:payload_address + 3] = origin + rotation.apply(np.array([0., 0., .045]))
+    scene.mujoco.mj_kinematics(model, data)
+    # Within the existing 2-degree limit, the same circle still fits the
+    # original plane; a world-normal bound in the source frame rejects it.
+    assert oracle._support_allowed(data, payload_geom, support_geom, measured=True)
+
+
+@pytest.mark.integration
+def test_sphere_free_support_retains_hard_penetration_and_motion_bounds():
+    scene = _scene(shape="sphere", extra='''<body name="support" pos=".08 0 .355"><freejoint/>
+      <geom name="support_geom" type="box" size=".1 .08 .03" mass=".4"
+        contype="8" conaffinity="15"/></body>''')
+    model, data = scene.model, scene.data
+    support = _support(geom_names=("support_geom",), phase="place",
+        region_min_world=(-.02, -.08, .385), region_max_world=(.18, .08, .385),
+        dynamic_body_name="support", frozen_pose_xyz_quat_xyzw=tuple(pose_matrix_to_xyzquat(
+            _pose(data, model, "support"))))
+    binding = _binding(scene, support=support)
+    oracle = binding.contact_oracle(scene)
+    payload_geom, support_geom = int(model.geom("payload_geom").id), int(model.geom("support_geom").id)
+    payload_body, support_body = int(model.body("payload").id), int(model.body("support").id)
+    payload_address = int(model.jnt_qposadr[model.body_jntadr[payload_body]])
+    support_address = int(model.jnt_qposadr[model.body_jntadr[support_body]])
+    initial_z = float(data.qpos[payload_address + 2])
+    for penetration, accepted in ((.0009, True), (.0011, False)):
+        data.qpos[payload_address + 2] = initial_z - penetration
+        scene.mujoco.mj_kinematics(model, data)
+        assert oracle._support_allowed(data, payload_geom, support_geom, measured=True) is accepted
+    data.qpos[payload_address + 2] = initial_z
+    data.qpos[support_address] += .004
+    scene.mujoco.mj_kinematics(model, data)
+    scene.mujoco.mj_collision(model, data)
+    rejected = binding.check_measured(scene)
+    assert not rejected.safe and rejected.metadata["pair_class"] == "payload_support_moved"
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("table_shape", ["plane", "box"])
+@pytest.mark.parametrize("scale", [1. - 5e-9, 1. + 5e-9])
+def test_sphere_support_normal_within_unit_tolerance_retains_exact_projection(table_shape, scale):
+    scene = _scene(shape="sphere", table=True, table_shape=table_shape)
+    support = _support(normal_world=(0., 0., scale), phase="place",
+        region_min_world=(.065, -.015, .385), region_max_world=(.095, .015, .385))
+    binding = _binding(scene, support=support)
+    assert binding.check_measured(scene).safe
+    oracle = _oracle(scene, binding)
+    assert oracle.check(_pair(oracle)).safe
+
+
+@pytest.mark.integration
 def test_free_support_near_contact_retains_one_millimetre_hard_penetration():
     scene = _scene(extra='''<body name="support" pos=".08 0 .355"><freejoint/>
       <geom name="support_geom" type="box" size=".1 .08 .03" mass=".4"
@@ -537,7 +642,7 @@ def test_free_support_cannot_be_used_as_a_fixed_table_exception():
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("shape", ["box", "mesh"])
+@pytest.mark.parametrize("shape", ["box", "mesh", "sphere"])
 def test_native_binding_freezes_complete_relation_and_only_scratch_follows(shape, monkeypatch):
     scene = _scene(shape=shape, second_geom=True)
     before = {n: getattr(scene.data, n).copy() for n in ("qpos", "qvel", "ctrl", "xpos", "xmat", "geom_xpos", "eq_active")}
@@ -594,6 +699,21 @@ def test_native_payload_hits_foreign_geometry_while_robot_and_sensors_clear(grou
 
 
 @pytest.mark.integration
+@pytest.mark.parametrize("group", [1, 2, 4, 8])
+def test_native_sphere_payload_hits_foreign_geometry_while_robot_and_sensors_clear(group):
+    scene = _scene(shape="sphere", extra=f'''<body name="foreign" pos=".395 0 .4"><freejoint/>
+      <geom name="foreign_geom" type="box" size=".004 .004 .004" contype="{group}" conaffinity="15"/></body>''')
+    binding = _binding(scene)
+    oracle = _oracle(scene, binding)
+    check = oracle.check(_pair(oracle, x=.3))
+    assert not check.safe
+    assert {check.metadata["geom1"], check.metadata["geom2"]} == {"payload_geom", "foreign_geom"}
+    assert scene.collision_projector().oracle.check(oracle.projector.scratch).safe is (group != 2)
+    canonical_pairs = {(p.geom1, p.geom2) for p in scene.collision_projector().oracle._pairs}
+    assert canonical_pairs <= {(p.geom1, p.geom2) for p in oracle.projector.oracle._pairs}
+
+
+@pytest.mark.integration
 def test_complete_native_target_includes_secondary_offset_collision_geom():
     scene = _scene(second_geom=True, extra='''<body pos=".465 0 .4"><geom name="tail_obstacle"
       type="box" size=".009 .009 .009" contype="1" conaffinity="15"/></body>''')
@@ -633,7 +753,7 @@ def test_frozen_original_anchor_is_validated_instead_of_reanchored_on_later_capt
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("shape", ["box", "mesh"])
+@pytest.mark.parametrize("shape", ["box", "mesh", "sphere"])
 def test_lift_starts_on_only_named_table_pair_and_cannot_descend_or_slide(shape):
     scene = _scene(shape=shape, table=True)
     with pytest.raises(ValueError, match="capture rejected"):
@@ -661,6 +781,123 @@ def test_place_allows_only_outward_face_inside_region_at_hard_bound():
     assert not oracle.check(_pair(oracle, x=.6)).safe
     with pytest.raises(ValueError, match="outward native support face"):
         _binding(scene, support=_support(normal_world=(0., 0., -1.)))
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("shape", ["capsule", "cylinder", "ellipsoid"])
+def test_unimplemented_payload_shapes_remain_explicitly_rejected(shape):
+    with pytest.raises(ValueError, match="Complete payload requires all native target collision geoms"):
+        _binding(_scene(shape=shape))
+
+
+@pytest.mark.integration
+def test_sphere_geom_offset_and_body_origin_follow_the_original_frozen_relation():
+    scene = _scene(shape="sphere", payload_geom_offset=(.04, 0., 0.))
+    address = int(scene.model.jnt_qposadr[scene.model.body_jntadr[scene.model.body("payload").id]])
+    scene.data.qpos[address] -= .04
+    binding = _binding(scene)
+    assert binding.tool_from_object[0][3] == pytest.approx(.04)
+    oracle = _oracle(scene, binding)
+    assert oracle.check(_pair(oracle, x=.2, y=.1, z=.03, yaw=.7)).safe
+    scratch = oracle.projector.scratch
+    expected_body = _pose(scratch, scene.model, "tool") @ np.asarray(binding.tool_from_object)
+    expected_center = expected_body @ np.array([.04, 0., 0., 1.])
+    np.testing.assert_allclose(scratch.geom_xpos[scene.model.geom("payload_geom").id], expected_center[:3])
+    np.testing.assert_allclose(_pose(scratch, scene.model, "payload"), expected_body)
+    scene.data.qpos[address] += .004
+    assert not binding.check_measured(scene).safe
+
+
+def _inclined_sphere_scene(*, penetration=0., normal=(.28, 0., .96)):
+    normal = np.asarray(normal)
+    center = np.array([.08, 0., .4])
+    face = center - normal * (.015 - penetration)
+    support_center = face - .03 * normal
+    qw = math.sqrt((1.+normal[2])/2)
+    quat = (qw, -normal[1]/(2*qw), normal[0]/(2*qw), 0.)
+    scene = _scene(shape="sphere", extra=f'''
+      <body name="table" pos="{' '.join(map(str, support_center))}" quat="{' '.join(map(str, quat))}">
+        <geom name="table_geom" type="box" size=".15 .15 .03" contype="1" conaffinity="15"/>
+      </body>''')
+    support = _support(normal_world=tuple(normal), region_min_world=(-.5, -.5, 0.),
+                       region_max_world=(.5, .5, 1.), phase="place")
+    return scene, support, face
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("normal", [(.28, 0., .96), (.12, .01, math.sqrt(1-.12**2-.01**2))])
+@pytest.mark.parametrize("penetration,allowed", [(.0004, True), (.0011, False)])
+def test_sphere_on_oblique_support_keeps_the_original_hard_penetration_bound(penetration, allowed, normal):
+    scene, support, _ = _inclined_sphere_scene(penetration=penetration, normal=normal)
+    if allowed:
+        binding = _binding(scene, support=support)
+        assert binding.check_measured(scene).safe
+        oracle = _oracle(scene, binding)
+        assert oracle.check(_pair(oracle)).safe
+    else:
+        with pytest.raises(ValueError, match="capture rejected.*payload_geom.*table_geom"):
+            _binding(scene, support=support)
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("half_z,allowed", [(.0043, True), (.0041, False)])
+def test_sphere_oblique_projected_region_uses_full_circle_not_sampled_axes(half_z, allowed):
+    scene, support, face = _inclined_sphere_scene()
+    # Exact projected Z radius is 4.2 mm. The six world-axis surface points
+    # span only 4.032 mm and would incorrectly admit the 4.1 mm region.
+    support = MujocoPayloadSupport(**{**support.to_payload(),
+        "region_min_world": (-.5, -.5, float(face[2]-half_z)),
+        "region_max_world": (.5, .5, float(face[2]+half_z))})
+    if allowed:
+        assert _binding(scene, support=support).check_measured(scene).safe
+    else:
+        with pytest.raises(ValueError, match="capture rejected.*payload_geom.*table_geom"):
+            _binding(scene, support=support)
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("local_axis", [0, 1, 2])
+@pytest.mark.parametrize("half_width,allowed", [(.016, True), (.012, False)])
+def test_sphere_footprint_must_fit_rotated_finite_support_face(half_width, allowed, local_axis):
+    if local_axis == 2:
+        quat = (math.cos(math.pi/8), 0., 0., math.sin(math.pi/8))
+    else:
+        quat = (math.sqrt(.5), math.sqrt(.5) if local_axis == 1 else 0.,
+                math.sqrt(.5) if local_axis == 0 else 0., 0.)
+    half_size = [half_width]*3
+    half_size[local_axis] = .03
+    scene = _scene(shape="sphere", extra=f'''
+      <body name="table" pos=".08 0 .355" quat="{' '.join(map(str, quat))}">
+        <geom name="table_geom" type="box" size="{' '.join(map(str, half_size))}"
+          contype="1" conaffinity="15"/>
+      </body>''')
+    if allowed:
+        binding = _binding(scene, support=_support())
+        assert binding.check_measured(scene).safe
+    else:
+        with pytest.raises(ValueError, match="capture rejected.*payload_geom.*table_geom"):
+            _binding(scene, support=_support())
+
+
+@pytest.mark.integration
+def test_secondary_offset_sphere_alone_blocks_foreign_obstacle():
+    scene = _scene(shape="sphere", second_geom=True, second_shape="sphere", extra='''
+      <body pos=".465 0 .4"><geom name="secondary_obstacle" type="box"
+        size=".004 .004 .004" contype="1" conaffinity="15"/></body>''')
+    oracle = _oracle(scene, _binding(scene))
+    assert oracle.check(_pair(oracle)).safe
+    check = oracle.check(_pair(oracle, x=.3))
+    assert not check.safe
+    assert {check.metadata["geom1"], check.metadata["geom2"]} == {"payload_tail", "secondary_obstacle"}
+
+
+@pytest.mark.integration
+def test_secondary_offset_sphere_footprint_cannot_leave_support_region():
+    scene = _scene(shape="sphere", table=True, second_geom=True, second_shape="sphere")
+    assert _binding(scene, support=_support()).check_measured(scene).safe
+    # The main sphere spans X [0.065, 0.095]; the secondary extends to 0.165.
+    with pytest.raises(ValueError, match="capture rejected.*payload_tail.*table_geom"):
+        _binding(scene, support=_support(region_max_world=(.155, .5, .386)))
 
 
 @pytest.mark.integration
@@ -721,6 +958,28 @@ def test_realized_tracking_tolerance_never_permits_support_hard_penetration_or_f
 
 
 @pytest.mark.integration
+@pytest.mark.parametrize("tracking_drop_m", [2e-6, 5e-5])
+def test_sphere_lift_tracking_tolerance_does_not_allow_downward_intent(tracking_drop_m):
+    scene = _scene(shape="sphere", table=True, table_shape="box")
+    address = int(scene.model.jnt_qposadr[scene.model.body_jntadr[scene.model.body("payload").id]])
+    scene.data.qpos[address + 2] -= .00094
+    binding = _binding(scene, support=_support())
+    oracle = _oracle(scene, binding)
+    assert not oracle.check(_pair(oracle, z=-tracking_drop_m)).safe
+    scene.data.qpos[scene.joint_qpos_addr("right_z")] -= tracking_drop_m
+    scene.data.qpos[address + 2] -= tracking_drop_m
+    assert binding.check_measured(scene).safe
+    oracle.source.qpos[:] = scene.data.qpos
+    actual = np.concatenate([scene.data.qpos[i] for i in oracle.addresses.values()])
+    commanded = np.concatenate([np.asarray(binding.source_model_qpos)[i] for i in oracle.addresses.values()])
+    sweep = oracle.projector.project(oracle.source, start_qpos=actual, requested_qpos=commanded)
+    assert not sweep.modified and sweep.check.safe
+    down = commanded.copy()
+    down[-4] = -.0002
+    assert oracle.projector.project(oracle.source, start_qpos=actual, requested_qpos=down).modified
+
+
+@pytest.mark.integration
 def test_support_permission_never_exempts_other_objects_or_robot_table_contacts():
     scene = _scene(table=True, extra='''<body name="distractor" pos=".35 0 .4"><freejoint/>
       <geom name="distractor_geom" type="box" size=".01 .01 .015" contype="8" conaffinity="15"/></body>''')
@@ -738,6 +997,17 @@ def test_native_geometry_changes_including_mesh_vertices_invalidate_binding():
     scene = _scene(shape="mesh")
     binding = _binding(scene)
     scene.model.mesh_vert[0, 0] += .01
+    with pytest.raises(ValueError, match="geometry/model/policy changed"):
+        _oracle(scene, binding)
+    with pytest.raises(ValueError, match="geometry/model/policy changed"):
+        binding.validate_scene(scene)
+
+
+@pytest.mark.integration
+def test_native_sphere_radius_change_invalidates_binding():
+    scene = _scene(shape="sphere")
+    binding = _binding(scene)
+    scene.model.geom_size[scene.model.geom("payload_geom").id, 0] += .001
     with pytest.raises(ValueError, match="geometry/model/policy changed"):
         _oracle(scene, binding)
     with pytest.raises(ValueError, match="geometry/model/policy changed"):
@@ -991,6 +1261,36 @@ def test_payload_owned_plan_resolves_exact_references_and_clear_releases_only_gu
         planner.resolve(_action(planner, reference))
     with pytest.raises(motion.MujocoTcpPlanRejected, match="not_owned"):
         planner.activate(plan)
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("side", ["left", "right"])
+def test_sphere_owned_plan_uses_existing_guard_and_retains_slip_detection(monkeypatch, side):
+    scene = _scene(shape="sphere", table=True, payload_side=side)
+    binding = _binding(scene, support=_support())
+    planner, installed = _planner(scene, monkeypatch, side=side)
+    before = scene.data.qpos.copy()
+    plan = _plan(planner, binding)
+    assert plan.payload_binding is binding
+    assert len(plan.reference_poses) == len(plan.trajectory.q_rad) > 2
+    planner.activate(plan)
+    assert installed["oracle"] is binding.contact_oracle(scene)
+    reference = planner.reference(0)
+    from sim.mujoco.deploy import payload_motion
+
+    def forbidden_hash(*args):
+        raise AssertionError("A live sphere reference must not rehash immutable CAD")
+
+    with monkeypatch.context() as context:
+        context.setattr(payload_motion, "_model_signature", forbidden_hash)
+        answer = planner.resolve(_action(planner, reference))
+    assert answer.success and answer.qpos_by_side[side] == plan.trajectory.q_rad[0].tolist()
+    np.testing.assert_array_equal(scene.data.qpos, before)
+    planner.clear()
+    assert installed["oracle"] is None and binding.check_measured(scene).safe
+    address = int(scene.model.jnt_qposadr[scene.model.body_jntadr[scene.model.body("payload").id]])
+    scene.data.qpos[address] += .004
+    assert not binding.check_measured(scene).safe
 
 
 @pytest.mark.integration
