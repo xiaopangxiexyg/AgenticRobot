@@ -92,14 +92,27 @@ core and MuJoCo adapter used for the 20260721 fit; tests compare those hashes to
 fixed historical values rather than silently reinterpreting the fit against
 the current files.
 
-当前区域查询与端点路径质量下界使用独立绑定
+球体载荷、仿真对象接触及 Skill 悬停查询的组合来源使用独立绑定
+`artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261029_skill_hover_visual_v1.json`。
+它固定于源码提交 `1e2ab619c2f3`，保留前一绑定并记录 176 项运行时输入、6 项离线查询
+输入，以及同一组合源码树上的 1297 项专项通过；完整组合门禁另行记录。该列表不是对
+全部传递依赖或后续工作区漂移的实时检查，完整源码身份由固定 commit/tree 与干净工作区
+门禁共同约束。该绑定仍为 `provisional`，没有新增真机动作、标定或 held-out 资格。
+
+离线保存场景查询及 RealMan 配置观测场景后的安全移动默认启用正距离起点退出，硬接触、
+穿透、新增近邻及距离恶化仍按原门禁拒绝，运动侧必须证明最终退出到普通 20 mm 净空。
+`--strict-start-clearance` 可显式选择原严格起点准入；未配置观测场景时 RealMan 不启用
+正距离退出，直接调用的下层规划器默认亦不变。先前 12 场景对照是旧的显式启用实验，
+不能当作新默认的真机验收。
+
+上一阶段区域查询与端点路径质量下界使用独立历史绑定
 `artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261028_skill_region_checked_v2.json`。
 继承168项输入，更新两个已有规划源码，并绑定路径质量模块和起点检查采样器，合计170项
 输入／166项Python源码；离线查询入口另作源码证据，固定于 `b3b03e8a6212`。
 源码及消费者离线检查805项、相同源树的查询检查252项分别记录，完整组合验收另行执行。
 早期 `skill_region_v1` 候选仍作为未完成完整验收的历史证据保留，不作为当前绑定。
-离线区域查询默认 proximity、可显式选择 halton；严格20mm起点净空保持默认。
-来源12场景对照显式启用了正距离起点退出，不能推断严格默认下的通过率；没有新增真机
+该阶段离线区域查询默认 proximity、可显式选择 halton；当时严格20mm起点净空保持默认。
+来源12场景对照显式启用了正距离起点退出，不能推断当时严格默认下的通过率；没有新增真机
 标定、运动或held-out资格，既有fit、timing及所有历史绑定保持。
 
 此前显式起点净空能力使用独立绑定
