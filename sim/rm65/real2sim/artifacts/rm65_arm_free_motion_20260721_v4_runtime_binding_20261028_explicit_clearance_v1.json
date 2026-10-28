@@ -1073,7 +1073,7 @@
     {
       "artifact_id": "rm65-grasp-trajectory-runtime-20261028-explicit-clearance-v1",
       "artifact_kind": "runtime_source",
-      "sha256": "aafd8999dd3855c1a09ddce826734eeec19e6869e8ec5d1ffee34bd2bb67c1f9",
+      "sha256": "afc5eb9f0a05e3e8825a03f9bbf80b3cc00d68f808aa852a1dfe98bc97c62f4f",
       "locator": "teleop_runtime/skill_deploy/rm65_grasp_trajectory.py"
     },
     {
@@ -1319,13 +1319,13 @@
     {
       "artifact_id": "explicit-clearance-source-consumer-report-20261028-explicit-clearance-v1",
       "artifact_kind": "offline_validation_report",
-      "sha256": "e6ac791503be9d196a10a7ce4002b77b91eb8880aac85b2f2610eaea2d327548",
+      "sha256": "ef7282a6019d176030ccbd7f425383f595c54d81047714a89a411a0afce8a3c1",
       "locator": "artifact://explicit-clearance-source-consumer-report-20261028-explicit-clearance-v1"
     },
     {
       "artifact_id": "explicit-clearance-source-consumer-binding-20261028-explicit-clearance-v1",
       "artifact_kind": "offline_validation_report",
-      "sha256": "40b148a7ca1229318888fb64daacdeed2993e3152cc48fa41208c0630c500ef8",
+      "sha256": "386829d2229913d14eac7d2f2416bdab3e2257d26d610db5ec57673ab4169b67",
       "locator": "artifact://explicit-clearance-source-consumer-binding-20261028-explicit-clearance-v1"
     }
   ],
@@ -1728,10 +1728,10 @@
       "notes": "No new physical calibration or held-out capture."
     }
   ],
-  "code_revision": "04b86362643b035053ee909c587b8c836c42fead",
+  "code_revision": "e9245d2fdd878dba7f4434a8aa0096a37bc4c4d0",
   "environment_fingerprint": {
-    "source_commit": "04b86362643b035053ee909c587b8c836c42fead",
-    "source_tree": "272577001e5fea0dca3c001eed4cac2b15cc889b",
+    "source_commit": "e9245d2fdd878dba7f4434a8aa0096a37bc4c4d0",
+    "source_tree": "4c126ac23dd781bc746f5629c3bd59ecd74f8506",
     "python": "3.10.20",
     "platform": "x86_64",
     "numpy": "1.26.4",
@@ -1751,13 +1751,13 @@
     "arm_profile_refit": false,
     "runtime_behavior_change": true,
     "runtime_behavior_change_scope": "explicit_inherited_start_clearance_on_existing_safe_motion_owners",
-    "runtime_source_commit": "04b86362643b035053ee909c587b8c836c42fead",
+    "runtime_source_commit": "e9245d2fdd878dba7f4434a8aa0096a37bc4c4d0",
     "mainline_input_commit": "c22e394ce7f8c56db5175fb2b8035164e28afa00",
     "migration": "namespaced_explicit_clearance_binding",
     "offline_validation_report_artifact_id": "explicit-clearance-source-consumer-report-20261028-explicit-clearance-v1",
     "offline_validation_binding_artifact_id": "explicit-clearance-source-consumer-binding-20261028-explicit-clearance-v1",
-    "offline_validation_source_tree": "272577001e5fea0dca3c001eed4cac2b15cc889b",
-    "offline_validation_execution_head": "04b86362643b035053ee909c587b8c836c42fead",
+    "offline_validation_source_tree": "4c126ac23dd781bc746f5629c3bd59ecd74f8506",
+    "offline_validation_execution_head": "e9245d2fdd878dba7f4434a8aa0096a37bc4c4d0",
     "changed_previous_runtime_sources": [
       "agent_gateway/profiles/real/gateway_cli.py",
       "agent_gateway/profiles/real/rm65_composition.py",
@@ -1785,5 +1785,5 @@
     "inherited_start_query_failure_preserved": true,
     "ordinary_clearance_m": 0.02
   },
-  "artifact_sha256": "cb1d19d750b28fbfbe506aa6af506ee3e57e247d14067b1bdc6cd6147137e100"
+  "artifact_sha256": "d848da50f936e8f997c73975d540df36b66dcf66d9480e24bb8e6451f3a49569"
 }

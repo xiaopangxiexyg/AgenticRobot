@@ -402,12 +402,12 @@ def test_current_arm_runtime_binding_uses_exact_current_inputs() -> None:
         REAL_OBSERVED_MOTION_BINDING_PATH, artifact_id="parent-check", artifact_kind="real2sim_runtime_binding").sha256
     assert binding.metadata["arm_profile_refit"] is False and binding.metadata["runtime_behavior_change"] is True
     assert binding.metadata["runtime_behavior_change_scope"] == "explicit_inherited_start_clearance_on_existing_safe_motion_owners"
-    assert binding.code_revision == binding.environment_fingerprint["source_commit"] == binding.metadata["runtime_source_commit"] == "04b86362643b035053ee909c587b8c836c42fead"
+    assert binding.code_revision == binding.environment_fingerprint["source_commit"] == binding.metadata["runtime_source_commit"] == "e9245d2fdd878dba7f4434a8aa0096a37bc4c4d0"
     assert binding.metadata["offline_validation_execution_head"] == binding.code_revision
-    assert binding.environment_fingerprint["source_tree"] == binding.metadata["offline_validation_source_tree"] == "272577001e5fea0dca3c001eed4cac2b15cc889b"
-    assert binding.artifact_sha256 == "cb1d19d750b28fbfbe506aa6af506ee3e57e247d14067b1bdc6cd6147137e100"
+    assert binding.environment_fingerprint["source_tree"] == binding.metadata["offline_validation_source_tree"] == "4c126ac23dd781bc746f5629c3bd59ecd74f8506"
+    assert binding.artifact_sha256 == "d848da50f936e8f997c73975d540df36b66dcf66d9480e24bb8e6451f3a49569"
     assert ArtifactRef.from_file(ARM_RUNTIME_BINDING_PATH,
-        artifact_id="binding-file-check", artifact_kind="real2sim_runtime_binding").sha256 == "19922fc6a10b20146b5e89ebd79c70b065a3fb9e9726964ec38c7b0368ffca70"
+        artifact_id="binding-file-check", artifact_kind="real2sim_runtime_binding").sha256 == "7b55fba29f586b194529fa3c86ced30a44f6fff4f62243f1c2595baf28e698a7"
     assert binding.fidelity_claims[0].status == "provisional"
     content = next(e for e in binding.validation_evidence if e.validation_id == "runtime-source-content-binding-integrity-" + tag)
     assert content.status == "passed" and content.split == "validation"
@@ -416,7 +416,7 @@ def test_current_arm_runtime_binding_uses_exact_current_inputs() -> None:
     assert offline.status == "passed" and offline.split == "validation"
     assert dict(offline.metrics) == {"passed_cases": 977.0, "skipped_cases": 0., "failed_cases": 0., "error_cases": 0.}
     refs = {ref.artifact_id: ref for ref in binding.dependency_artifacts}
-    assert refs[binding.metadata["offline_validation_report_artifact_id"]].sha256 == "e6ac791503be9d196a10a7ce4002b77b91eb8880aac85b2f2610eaea2d327548"
+    assert refs[binding.metadata["offline_validation_report_artifact_id"]].sha256 == "ef7282a6019d176030ccbd7f425383f595c54d81047714a89a411a0afce8a3c1"
     assert binding.metadata["gateway_prunes_expired_proposals"] is True
     assert binding.metadata["lower_factory_prune_default"] is False
     assert binding.metadata["ttl_and_hold_changed"] is False

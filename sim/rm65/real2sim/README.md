@@ -94,7 +94,7 @@ the current files.
 
 当前显式起点净空能力使用独立绑定
 `artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261028_explicit_clearance_v1.json`。
-保留168项输入／164项Python源码，仅更新四个既有owner，固定于 `04b86362643b`；
+保留168项输入／164项Python源码，仅更新四个既有owner，固定于 `e9245d2fdd87`；
 净空、目录保护及相关消费者977通过，9项subtest另列。严格默认不变，
 `--enable-inherited-start-clearance` 显式启用并进入Real执行manifest；仅已有正距离近邻可继承
 请求局部下界，运动侧必须通过最终密集采样的离开证明。查询故障保持原原因并拒绝。
