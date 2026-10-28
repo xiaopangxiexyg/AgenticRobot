@@ -63,6 +63,9 @@ RealMan 继续默认拒绝不足原 20 mm 净空的起点。部署者可显式�
 该模式提供规划接纳能力，仍受原执行、deadline、取消和HOLD约束；离线保存场景结果不证明真机跟踪误差或实际运动资格。
 MuJoCo Gateway 的独立 sensor-shaped planner 不通过此 RealMan 选项改变默认接纳。
 
+保存场景的只读查询与显式模式用法见
+[保存场景 Skill 查询](../development/saved_scene_skill_query.md)。
+
 ## 结果与边界
 
 `observed_point_report` 包含源 operation/request hash、点索引、公开参考系、派生目标、实测终点和位姿误差；原执行/评估/HOLD 回执仍完整保留。到达不是抓取或物理任务成功。
