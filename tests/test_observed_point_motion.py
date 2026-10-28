@@ -100,6 +100,7 @@ def test_compact_parameters_fail_closed(change):
 
 
 def make_native_session(tmp_path, *, anchor_v2=False, region_v3=False, hover_v4=False):
+    from mujoco_gateway_fixture import build_gateway_session
     from agent_gateway.profiles.mujoco.motion_factory import (
         MujocoAgentArtifactStorageConfig, build_mujoco_agent_tcp_pose_gateway_session,
         mujoco_agent_tcp_pose_execution_observation_plan_v1)
@@ -110,7 +111,7 @@ def make_native_session(tmp_path, *, anchor_v2=False, region_v3=False, hover_v4=
     from test_agent_gateway_mujoco_safe_tcp_pose import CLIENT
     from test_agent_gateway_surface_anchor import _AnchorSegmenter
     (tmp_path / "artifacts").mkdir()
-    return build_mujoco_agent_tcp_pose_gateway_session(
+    return build_gateway_session(build_mujoco_agent_tcp_pose_gateway_session,
         target_config=MujocoSimHILTargetConfig(
             task_config_path=resolve_path("sim/configs/tasks/rm65_right_dmtacm_blue_cube_70mm_agent_v1.json"),
             realtime_worker=False, runtime_session_id="test:observed-point",

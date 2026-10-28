@@ -766,6 +766,9 @@ def test_complete_identification_wires_cruise_only_to_training_validation_axis(t
             for i in AXES:
                 q[i] += max(-.008*period, min(.008*period, goal[i]-q[i]))
         r.tick(q, dt_sec=period)
+        # This wiring test inspects the current audit and final record only.
+        # Retain all driver checks and records without keeping every GUI copy.
+        r.audits.clear()
         audit = r.audit.get("coordinated_holding") or {}
         cruise = audit.get("cruise_velocity_control") or {}
         marker = r.audit.get("calibration_trial") or {}
