@@ -29,6 +29,7 @@ from robot_motion.observed_scene import SafeMotionObservationConfig
 from robot_motion.pose import pose_delta_metrics
 from robot_motion.relative_action import pose_matrix_to_xyzquat, xyzquat_to_pose_matrix
 from robot_motion.spatial_goals import compute_spatial_goal, finite_vector
+from robot_motion.spatial_goal_regions import generate_relation_region_goals
 from scripts.probes.inspect_safe_move_snapshot import (
     RM65CapturedRobotObservationFilterConfig, backproject, load_captures, resolve_inputs,
 )
@@ -175,7 +176,8 @@ class SavedSceneSkillQuery:
     """
 
     def __init__(self, *, scene_id, reference_frame_id, qpos_by_side,
-                 tcp_pose_by_side, anchors, planner, cloud, source_evidence):
+                 tcp_pose_by_side, anchors, planner, cloud, source_evidence,
+                 query_budget=None, clock=time.monotonic):
         self._scene_id = str(scene_id)
         self._frame = reference_frame_id
         self._qpos = {side: finite_vector(list(qpos_by_side[side]), 6, name=side).copy()
@@ -193,8 +195,21 @@ class SavedSceneSkillQuery:
         self._source_evidence = copy.deepcopy(source_evidence)
         self._lock = threading.Lock()
         self._queries = []
+        self._regions = []
         self._trajectories = {}
         self._closed = False
+        self._clock = clock
+        self._planning_calls = 0
+        self._planning_seconds = 0.
+        if query_budget is not None:
+            if (set(query_budget) != {"maximum_calls", "maximum_planning_sec"}
+                    or type(query_budget["maximum_calls"]) is not int
+                    or not 1 <= query_budget["maximum_calls"] <= 64
+                    or type(query_budget["maximum_planning_sec"]) not in (int, float)
+                    or not math.isfinite(query_budget["maximum_planning_sec"])
+                    or not 0 < query_budget["maximum_planning_sec"] <= 120.):
+                raise ValueError("Query budget must have 1..64 calls and 0..120 finite seconds.")
+        self._query_budget = None if query_budget is None else dict(query_budget)
 
     @classmethod
     def from_manifest(cls, manifest):
@@ -255,7 +270,11 @@ class SavedSceneSkillQuery:
                 "mask_sha256": saved["mask_sha256"], "rgb_content_hash": capture.rgb_content_hash,
                 "depth_content_hash": capture.depth_content_hash})
         convergence = RealAgentPrimitiveConvergenceProfile()
-        plan_config = RM65GraspTrajectoryPlanningConfig().for_tcp_pose_move(
+        enabled = manifest.get("enable_inherited_start_clearance", False)
+        if type(enabled) is not bool:
+            raise ValueError("enable_inherited_start_clearance must be explicit bool.")
+        plan_config = RM65GraspTrajectoryPlanningConfig(
+            enable_inherited_start_clearance=enabled).for_tcp_pose_move(
             translation_tolerance_m=convergence.translation_tolerance_m,
             rotation_tolerance_rad=convergence.rotation_tolerance_rad)
         planner = RM65GraspJointTrajectoryPlanner(profile=profile,
@@ -266,7 +285,9 @@ class SavedSceneSkillQuery:
             source_evidence={"fixed_files": dict(manifest["fixed_files"]),
                 "source": "saved_rgbd_and_measured_qpos", "device_connections": 0,
                 "qpos_source": qpos_source, "observation_configuration": snapshot["configuration"],
-                "observed_voxel_count": len(cloud.points_m)})
+                "observed_voxel_count": len(cloud.points_m),
+                "enable_inherited_start_clearance": enabled},
+            query_budget=manifest.get("query_budget"))
 
     def _require_open(self):
         if self._closed:
@@ -309,47 +330,159 @@ class SavedSceneSkillQuery:
             raise RuntimeError("A query is already running for this saved scene.")
         try:
             self._require_open()
-            query_id = "plan:" + self._scene_id[:16] + ":" + str(len(self._queries))
-            row = {"query_id": query_id, "side": side, "target_pose_xyz_quat_xyzw": pose.tolist(),
-                "relation": copy.deepcopy(_relation), "scope": "planned_not_executed",
-                "physical_action_occurred": False}
-            started = time.monotonic()
-            try:
-                trajectory = self._planner.plan_with_observed_cloud(self._cloud,
-                    qpos_by_side={s: q.copy() for s, q in self._qpos.items()}, side=side,
-                    target_tool_tcp_world=xyzquat_to_pose_matrix(pose), speed_scale=.2,
-                    require_grasp_approach=False, time_budget_sec=120.,
-                    pose_goal_policy="within_arrival_tolerance")
-                last = {s: trajectory.qpos_by_side[s][-1] for s in ("left", "right")}
-                actual = self._planner.tool_tcp_poses_for_qpos_pair(qpos_by_side=last)[side]
-                translation, rotation = pose_delta_metrics(actual, xyzquat_to_pose_matrix(pose))
-                row.update(status="path_found", reason="planned_not_executed",
-                    trajectory_hash=trajectory.semantic_content_hash,
-                    planner_evidence_refs=list(trajectory.planner_evidence_refs),
-                    trajectory_samples=len(trajectory.time_from_start_sec),
-                    trajectory_duration_sec=float(trajectory.time_from_start_sec[-1]),
-                    final_translation_error_m=float(translation), final_rotation_error_deg=float(rotation))
-                self._trajectories[query_id] = trajectory
-            except RM65GraspTrajectoryPlanningError as error:
-                row.update(status="path_rejected", reason=error.reason_code,
-                           failure_details=str(error.details))
-            except BaseException as error:
-                row.update(status="query_failed", reason=type(error).__name__,
-                           failure_details=str(error), path_planning_wall_sec=time.monotonic() - started)
-                self._queries.append(row)
-                raise
-            row["path_planning_wall_sec"] = time.monotonic() - started
-            self._queries.append(row)
-            # Full poses, lineage and native diagnostics stay in the audit record.
-            return {k: v for k, v in row.items()
-                    if k not in {"target_pose_xyz_quat_xyzw", "relation", "failure_details",
-                                 "trajectory_hash", "planner_evidence_refs"}}
+            return self._plan_pose_locked(side=side, pose=pose, relation=_relation)
         finally:
+            self._lock.release()
+
+    def _plan_pose_locked(self, *, side, pose, relation=None, time_budget_sec=120.):
+        query_id = "plan:" + self._scene_id[:16] + ":" + str(len(self._queries))
+        row = {"query_id": query_id, "side": side, "target_pose_xyz_quat_xyzw": pose.tolist(),
+            "relation": copy.deepcopy(relation), "scope": "planned_not_executed",
+            "physical_action_occurred": False}
+        remaining = time_budget_sec
+        if self._query_budget is not None:
+            remaining = min(remaining, self._query_budget["maximum_planning_sec"] - self._planning_seconds)
+            if self._planning_calls >= self._query_budget["maximum_calls"]:
+                remaining = 0.
+        if remaining <= 0:
+            row.update(status="query_incomplete", reason="query_budget_exhausted", path_planning_wall_sec=0.)
+            self._queries.append(row)
+            return self._public_result(row)
+        started = self._clock()
+        self._planning_calls += 1
+        try:
+            trajectory = self._planner.plan_with_observed_cloud(self._cloud,
+                qpos_by_side={s: q.copy() for s, q in self._qpos.items()}, side=side,
+                target_tool_tcp_world=xyzquat_to_pose_matrix(pose), speed_scale=.2,
+                require_grasp_approach=False, time_budget_sec=remaining,
+                pose_goal_policy="within_arrival_tolerance")
+            if self._clock() - started > remaining:
+                raise RM65GraspTrajectoryPlanningError("path_planning_time_budget_exhausted",
+                    details={"planning_phase": "query_return_budget"})
+            last = {s: trajectory.qpos_by_side[s][-1] for s in ("left", "right")}
+            actual = self._planner.tool_tcp_poses_for_qpos_pair(qpos_by_side=last)[side]
+            translation, rotation = pose_delta_metrics(actual, xyzquat_to_pose_matrix(pose))
+            row.update(status="path_found", reason="planned_not_executed",
+                trajectory_hash=trajectory.semantic_content_hash,
+                planner_evidence_refs=list(trajectory.planner_evidence_refs),
+                trajectory_samples=len(trajectory.time_from_start_sec),
+                trajectory_duration_sec=float(trajectory.time_from_start_sec[-1]),
+                planned_endpoint_xyz_m=actual[:3, 3].tolist(),
+                final_translation_error_m=float(translation), final_rotation_error_deg=float(rotation))
+            self._trajectories[query_id] = trajectory
+        except RM65GraspTrajectoryPlanningError as error:
+            row.update(status=("query_incomplete" if error.reason_code == "path_planning_time_budget_exhausted"
+                               else "path_rejected"), reason=error.reason_code,
+                       failure_details=str(error.details))
+        except BaseException as error:
+            row.update(status="query_failed", reason=type(error).__name__,
+                       failure_details=str(error))
+            raise
+        finally:
+            row["path_planning_wall_sec"] = self._clock() - started
+            self._planning_seconds += row["path_planning_wall_sec"]
+            self._queries.append(row)
+        if row["status"] in {"path_found", "path_rejected"} and row["path_planning_wall_sec"] > remaining:
+            row["outcome_before_budget_check"] = {"status": row["status"], "reason": row["reason"]}
+            self._trajectories.pop(query_id, None)
+            row.update(status="query_incomplete", reason="query_budget_exhausted")
+        return self._public_result(row)
+
+    @staticmethod
+    def _public_result(row):
+        return {k: copy.deepcopy(v) for k, v in row.items()
+                if k not in {"target_pose_xyz_quat_xyzw", "relation", "failure_details",
+                             "trajectory_hash", "planner_evidence_refs", "planned_endpoint_xyz_m"}}
+
+    def plan_relation_region(self, *, side, target_reference, offset_bounds_xyz_m,
+                             offset_frame="reference", max_candidates=8):
+        """Find the first certified path inside explicitly allowed endpoint bounds.
+
+        Use the existing shared deterministic region sampler. The search owns
+        no IK, collision exception or execution state. Each candidate starts at
+        the same measured q0, and all attempts share one 20-second upper budget.
+        An optional application query budget also covers atomic calls, so an
+        Agent/Skill comparison cannot silently give one side extra native work.
+        """
+        self._require_open()
+        if side not in self._tcp or target_reference not in self._refs:
+            raise ValueError("Unknown arm or reference from another saved scene.")
+        candidates = generate_relation_region_goals(
+            current_tcp_pose_xyz_quat_xyzw=list(self._tcp[side]),
+            anchor_xyz_m=self._refs[target_reference]["world_xyz_m"],
+            offset_bounds_xyz_m=offset_bounds_xyz_m, offset_frame=offset_frame,
+            orientation_mode="preserve", tool_axis=None, axis_reference_xyz=None,
+            tool_axis_rotation_bounds_rad=[0., 0.], max_candidates=max_candidates)
+        if not self._lock.acquire(blocking=False):
+            raise RuntimeError("A query is already running for this saved scene.")
+        summary = None
+        try:
+            self._require_open()
+            query_id = "region:" + self._scene_id[:16] + ":" + str(len(self._regions))
+            summary = {"query_id": query_id, "side": side, "target_reference": target_reference,
+                "offset_bounds_xyz_m": copy.deepcopy(offset_bounds_xyz_m), "offset_frame": offset_frame,
+                "candidate_count": len(candidates), "attempted_candidate_count": 0,
+                "attempt_query_ids": [], "candidate_validations": [], "selected_plan_query_id": None,
+                "status": "path_rejected", "reason": "region_no_candidate_path",
+                "scope": "planned_not_executed", "physical_action_occurred": False}
+            began = self._clock()
+            deadline = began + 20.
+            retryable = {"endpoint_collision_blocked", "endpoint_clearance_blocked", "ik_search_exhausted",
+                "path_collision_blocked", "path_target_safety_envelope_blocked",
+                "grasp_path_motion_quality_exceeded", "safe_tcp_endpoint_pose_tolerance_exceeded"}
+            for index, candidate in enumerate(candidates):
+                remaining = deadline - self._clock()
+                if remaining <= 0:
+                    summary.update(status="query_incomplete", reason="query_budget_exhausted")
+                    break
+                prior_calls = self._planning_calls
+                result = self._plan_pose_locked(side=side,
+                    pose=np.asarray(candidate.goal.pose_xyz_quat_xyzw), time_budget_sec=remaining,
+                    relation={"region_query_id": query_id, "target_reference": target_reference,
+                              "offset_xyz_m": list(candidate.offset_xyz_m), "offset_frame": offset_frame})
+                summary["attempt_query_ids"].append(result["query_id"])
+                summary["attempted_candidate_count"] += self._planning_calls - prior_calls
+                if result["status"] == "path_found":
+                    actual_offset = (np.asarray(self._queries[-1]["planned_endpoint_xyz_m"])
+                                     - self._refs[target_reference]["world_xyz_m"])
+                    if offset_frame == "tool":
+                        actual_offset = xyzquat_to_pose_matrix(self._tcp[side])[:3, :3].T @ actual_offset
+                    within = all(lo - 1e-9 <= x <= hi + 1e-9
+                                 for x, (lo, hi) in zip(actual_offset, offset_bounds_xyz_m))
+                    summary["candidate_validations"].append({"query_id": result["query_id"],
+                        "actual_offset_xyz_m": actual_offset.tolist(), "inside_requested_region": within})
+                    if not within:
+                        continue
+                    if self._clock() > deadline:
+                        summary.update(status="query_incomplete", reason="query_budget_exhausted")
+                        break
+                    summary.update(status="path_found", reason="planned_not_executed",
+                        selected_plan_query_id=result["query_id"], selected_candidate_index=index,
+                        selected_offset_xyz_m=list(candidate.offset_xyz_m),
+                        trajectory_duration_sec=result["trajectory_duration_sec"])
+                    self._trajectories[query_id] = self._trajectories[result["query_id"]]
+                    break
+                if result["reason"] not in retryable:
+                    summary.update(status=result["status"], reason=result["reason"])
+                    break
+            summary["path_planning_wall_sec"] = self._clock() - began
+            return {key: copy.deepcopy(value) for key, value in summary.items()
+                    if key not in {"attempt_query_ids", "offset_bounds_xyz_m", "selected_plan_query_id", "candidate_validations"}}
+        except BaseException as error:
+            if summary is not None:
+                summary.update(status="query_failed", reason=type(error).__name__)
+            raise
+        finally:
+            if summary is not None:
+                self._regions.append(summary)
             self._lock.release()
 
     def audit(self):
         return copy.deepcopy({"scene_id": self._scene_id, "source": self._source_evidence,
             "references": self._anchors, "queries": self._queries,
+            "region_queries": self._regions,
+            "planning_budget": self._query_budget, "planning_calls": self._planning_calls,
+            "planning_seconds": self._planning_seconds,
             "qpos_by_side": {s: q.tolist() for s, q in self._qpos.items()},
             "dispatches": 0, "closed": self._closed})
 

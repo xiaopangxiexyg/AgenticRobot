@@ -76,3 +76,33 @@ The caller owns the existing native-resource lock and fixed experiment
 denominator. This probe has no transport, camera/backend startup, dispatch,
 domain-HOLD, or executable-plan retention. Actual RealMan motion remains a
 separate, freshly observed and authorized Gateway request.
+
+## Explicit region queries
+
+On current development, inherited positive-start clearance is default-off.
+Set manifest `enable_inherited_start_clearance: true` only for a batch that
+explicitly selects this reviewed mode; omission preserves the strict default.
+This query consumer does not change the production planner's defaults.
+
+`plan_relation_region(side, target_reference, offset_bounds_xyz_m,
+offset_frame="reference", max_candidates=8)` uses the shared deterministic
+region sampler already used by MuJoCo relation queries. The caller supplies
+three closed offset intervals, not an implicit relaxation of a precise target.
+Orientation is preserved. The method searches for one certified path within a
+single 20-second budget, retaining q0 and the observed scene across candidates.
+It checks the planned FK endpoint against the region; an ordinary pose solution
+within arrival tolerance can still be rejected if it lies outside the region.
+Use the original point query for point-arrival tolerance semantics.
+
+Only ordinary endpoint/IK/path rejections permit another candidate. A start
+state violation or unavailable native check stops the search. Timeout is
+`query_incomplete`, distinct from `region_no_candidate_path`; eight sampled
+failures do not prove that a continuous region is infeasible. Full attempt
+records and FK region validation remain in `audit().region_queries`.
+
+For fair atomic-versus-composed experiments, the application may set manifest
+`query_budget` to `{"maximum_calls": 8, "maximum_planning_sec": 20.0}`.
+This same budget covers atomic and region calls over the session, including
+final FK and validation. Model wait time is not charged as native planning.
+Omitting it preserves the previous independent atomic-query behavior. Close
+cannot race a region search. No region result is an executable motion grant.
