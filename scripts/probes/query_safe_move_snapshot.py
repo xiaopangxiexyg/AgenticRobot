@@ -202,13 +202,19 @@ class SavedSceneSkillQuery:
         self._planning_calls = 0
         self._planning_seconds = 0.
         if query_budget is not None:
-            if (set(query_budget) != {"maximum_calls", "maximum_planning_sec"}
+            if (set(query_budget) not in ({"maximum_calls", "maximum_planning_sec"},
+                    {"maximum_calls", "maximum_planning_sec", "maximum_call_planning_sec"})
                     or type(query_budget["maximum_calls"]) is not int
                     or not 1 <= query_budget["maximum_calls"] <= 64
                     or type(query_budget["maximum_planning_sec"]) not in (int, float)
                     or not math.isfinite(query_budget["maximum_planning_sec"])
                     or not 0 < query_budget["maximum_planning_sec"] <= 120.):
                 raise ValueError("Query budget must have 1..64 calls and 0..120 finite seconds.")
+            if "maximum_call_planning_sec" in query_budget:
+                value = query_budget["maximum_call_planning_sec"]
+                if (type(value) not in (int, float) or not math.isfinite(value)
+                        or not 0 < value <= query_budget["maximum_planning_sec"]):
+                    raise ValueError("Per-call budget must be positive and within the session budget.")
         self._query_budget = None if query_budget is None else dict(query_budget)
 
     @classmethod
@@ -342,6 +348,7 @@ class SavedSceneSkillQuery:
         remaining = time_budget_sec
         if self._query_budget is not None:
             remaining = min(remaining, self._query_budget["maximum_planning_sec"] - self._planning_seconds)
+            remaining = min(remaining, self._query_budget.get("maximum_call_planning_sec", remaining))
             if self._planning_calls >= self._query_budget["maximum_calls"]:
                 remaining = 0.
         if remaining <= 0:
@@ -422,6 +429,7 @@ class SavedSceneSkillQuery:
             summary = {"query_id": query_id, "side": side, "target_reference": target_reference,
                 "offset_bounds_xyz_m": copy.deepcopy(offset_bounds_xyz_m), "offset_frame": offset_frame,
                 "candidate_count": len(candidates), "attempted_candidate_count": 0,
+                "unresolved_candidate_count": 0,
                 "attempt_query_ids": [], "candidate_validations": [], "selected_plan_query_id": None,
                 "status": "path_rejected", "reason": "region_no_candidate_path",
                 "scope": "planned_not_executed", "physical_action_occurred": False}
@@ -437,7 +445,7 @@ class SavedSceneSkillQuery:
                     break
                 prior_calls = self._planning_calls
                 result = self._plan_pose_locked(side=side,
-                    pose=np.asarray(candidate.goal.pose_xyz_quat_xyzw), time_budget_sec=remaining,
+                    pose=np.asarray(candidate.goal.pose_xyz_quat_xyzw), time_budget_sec=min(3., remaining),
                     relation={"region_query_id": query_id, "target_reference": target_reference,
                               "offset_xyz_m": list(candidate.offset_xyz_m), "offset_frame": offset_frame})
                 summary["attempt_query_ids"].append(result["query_id"])
@@ -451,21 +459,31 @@ class SavedSceneSkillQuery:
                                  for x, (lo, hi) in zip(actual_offset, offset_bounds_xyz_m))
                     summary["candidate_validations"].append({"query_id": result["query_id"],
                         "actual_offset_xyz_m": actual_offset.tolist(), "inside_requested_region": within})
-                    if not within:
-                        continue
                     if self._clock() > deadline:
                         summary.update(status="query_incomplete", reason="query_budget_exhausted")
                         break
+                    if not within:
+                        continue
                     summary.update(status="path_found", reason="planned_not_executed",
                         selected_plan_query_id=result["query_id"], selected_candidate_index=index,
                         selected_offset_xyz_m=list(candidate.offset_xyz_m),
                         trajectory_duration_sec=result["trajectory_duration_sec"])
                     self._trajectories[query_id] = self._trajectories[result["query_id"]]
                     break
+                if result["status"] == "query_incomplete":
+                    summary["unresolved_candidate_count"] += 1
+                    if (self._planning_calls > prior_calls and self._clock() < deadline
+                            and (self._query_budget is None or (
+                                self._planning_calls < self._query_budget["maximum_calls"]
+                                and self._planning_seconds < self._query_budget["maximum_planning_sec"]))):
+                        continue
                 if result["reason"] not in retryable:
                     summary.update(status=result["status"], reason=result["reason"])
                     break
             summary["path_planning_wall_sec"] = self._clock() - began
+            if summary["status"] == "path_rejected" and (
+                    summary["unresolved_candidate_count"] or self._clock() > deadline):
+                summary.update(status="query_incomplete", reason="region_candidate_search_incomplete")
             return {key: copy.deepcopy(value) for key, value in summary.items()
                     if key not in {"attempt_query_ids", "offset_bounds_xyz_m", "selected_plan_query_id", "candidate_validations"}}
         except BaseException as error:

@@ -430,3 +430,42 @@ def test_region_invalid_bounds_are_rejected_before_planning(session):
     with pytest.raises(ValueError):
         query.plan_relation_region(**{**region_parameters(), "offset_bounds_xyz_m": [[1., -1.], [0., 0.], [.1, .2]]})
     assert not planner.calls
+
+
+def test_one_candidate_timeout_does_not_starve_the_whole_region(session):
+    query, planner = session
+    now = [0.]
+    query._clock = lambda: now[0]
+    query._query_budget = {"maximum_calls": 8, "maximum_planning_sec": 20., "maximum_call_planning_sec": 3.}
+    original = planner.plan_with_observed_cloud
+    calls = []
+    def plan(*args, **kwargs):
+        calls.append(kwargs["time_budget_sec"])
+        if len(calls) == 1:
+            now[0] += 3.
+            raise RM65GraspTrajectoryPlanningError("path_planning_time_budget_exhausted")
+        now[0] += .1
+        return original(*args, **kwargs)
+    planner.plan_with_observed_cloud = plan
+    result = query.plan_relation_region(**region_parameters())
+    assert result["status"] == "path_found" and result["selected_candidate_index"] == 1
+    assert result["unresolved_candidate_count"] == 1 and result["attempted_candidate_count"] == 2
+    assert calls == [3., 3.]
+
+
+def test_region_deadline_also_covers_last_out_of_region_validation(session):
+    query, planner = session
+    clock = iter([0., 0., 0., 0., 0., 21., 21., 21.])
+    query._clock = lambda: next(clock)
+    original = planner.tool_tcp_poses_for_qpos_pair
+    def outside(**kwargs):
+        poses = {s: p.copy() for s, p in original(**kwargs).items()}
+        poses["right"][2, 3] += .001
+        return poses
+    planner.tool_tcp_poses_for_qpos_pair = outside
+    result = query.plan_relation_region(side="right", target_reference="point-a",
+        offset_bounds_xyz_m=[[0., 0.], [0., 0.], [.08, .08]])
+    assert result["status"] == "query_incomplete"
+    assert query.audit()["region_queries"][0]["selected_plan_query_id"] is None
+    # The lower point query remains inspectable evidence, never a region grant.
+    assert query.audit()["queries"][0]["status"] == "path_found"

@@ -90,6 +90,9 @@ region sampler already used by MuJoCo relation queries. The caller supplies
 three closed offset intervals, not an implicit relaxation of a precise target.
 Orientation is preserved. The method searches for one certified path within a
 single 20-second budget, retaining q0 and the observed scene across candidates.
+Each candidate gets at most 3 seconds, matching the existing MuJoCo search
+policy. A per-candidate timeout leaves that candidate unresolved and permits
+another candidate while shared resources remain. It does not prove infeasibility.
 It checks the planned FK endpoint against the region; an ordinary pose solution
 within arrival tolerance can still be rejected if it lies outside the region.
 Use the original point query for point-arrival tolerance semantics.
@@ -101,7 +104,8 @@ failures do not prove that a continuous region is infeasible. Full attempt
 records and FK region validation remain in `audit().region_queries`.
 
 For fair atomic-versus-composed experiments, the application may set manifest
-`query_budget` to `{"maximum_calls": 8, "maximum_planning_sec": 20.0}`.
+`query_budget` to `{"maximum_calls": 8, "maximum_planning_sec": 20.0,
+"maximum_call_planning_sec": 3.0}`.
 This same budget covers atomic and region calls over the session, including
 final FK and validation. Model wait time is not charged as native planning.
 Omitting it preserves the previous independent atomic-query behavior. Close
