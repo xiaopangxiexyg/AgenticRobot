@@ -127,17 +127,112 @@ def test_safe_endpoint_quality_prunes_only_proven_impossible_branches(monkeypatc
 
 def test_all_quality_impossible_endpoints_stop_before_native_path_search(monkeypatch):
     planner = _planner_without_assets(config=RM65GraspTrajectoryPlanningConfig())
+    planner.planner_config = JointPathPlannerConfig()
     current = {s: np.zeros(6) for s in ("left", "right")}
-    target = {s: q.copy() for s, q in current.items()};target["right"][2]=4.3
+    current["right"][0] = -2.
+    target = {s: q.copy() for s, q in current.items()};target["right"][0]=2.
     endpoint = grasp_trajectory_module._EndpointIKCandidate(qpos_by_side=target,
         seed_index=12, solve_cycles=1, position_residual_m=0., orientation_residual_deg=0.)
-    planner._path_search_oracle = lambda **kwargs: pytest.fail("late oracle construction")
-    monkeypatch.setattr(grasp_trajectory_module, "plan_collision_aware_joint_path",
-                        lambda **kwargs:pytest.fail("impossible endpoint reached RRT"))
+    checks = []
+    oracle = SimpleNamespace(scene_hash="scene:test", check=lambda q: (
+        checks.append(q), JointConfigurationCheck(safe=True))[1])
+    planner._path_search_oracle = lambda **kwargs: oracle
+    from robot_motion.path_planning import sampling
+    monkeypatch.setattr(sampling._Tree, "rooted_at", lambda *args: pytest.fail("impossible endpoint reached RRT"))
     with pytest.raises(RM65GraspTrajectoryPlanningError, match="grasp_path_motion_quality_exceeded") as caught:
         planner._plan_path_leg(qpos_by_side=current,side="right",target_tool_tcp_world=np.eye(4),
             planning_phase="safe_pose_target",endpoint_candidates=(endpoint,))
     assert caught.value.details["planning_phase"] == "endpoint_joint_travel_lower_bound"
+    assert len(checks) == 1
+    np.testing.assert_array_equal(checks[0]["right"], current["right"])
+
+
+@pytest.mark.parametrize("outcome, expected", [
+    ("blocked", "path_start_collision_blocked"),
+    ("unavailable", "path_collision_check_unavailable"),
+    ("exception", "path_collision_check_unavailable"),
+    ("invalid", "path_collision_check_unavailable"),
+    ("invalid_scene", "path_planner_error"),
+    ("late_blocked", "path_planning_time_budget_exhausted"),
+    ("late_unavailable", "path_planning_time_budget_exhausted"),
+])
+def test_all_pruned_endpoints_preserve_start_faults_and_deadlines(monkeypatch, outcome, expected):
+    planner = _planner_without_assets(config=RM65GraspTrajectoryPlanningConfig())
+    planner.planner_config = JointPathPlannerConfig()
+    current = {s: np.zeros(6) for s in ("left", "right")}
+    current["right"][0] = -2.
+    target = {s: q.copy() for s, q in current.items()}; target["right"][0] = 2.
+    endpoint = grasp_trajectory_module._EndpointIKCandidate(qpos_by_side=target,
+        seed_index=12, solve_cycles=1, position_residual_m=0., orientation_residual_deg=0.)
+    now, calls, composition = [0.], [], []
+    def check(q):
+        calls.append(q)
+        if outcome.startswith("late_"):
+            now[0] = 10.
+        if outcome == "exception":
+            raise OSError("synthetic collision failure")
+        if outcome == "invalid":
+            return None
+        return JointConfigurationCheck(safe=False,
+            collision_check_available=outcome not in {"unavailable", "late_unavailable"},
+            reason="synthetic_start")
+    oracle = SimpleNamespace(scene_hash=("" if outcome == "invalid_scene" else "scene:test"), check=check)
+    def compose(**kwargs):
+        composition.append(kwargs)
+        return oracle
+    planner._path_search_oracle = compose
+    from robot_motion.path_planning import sampling
+    monkeypatch.setattr(sampling._Tree, "rooted_at", lambda *args: pytest.fail("unexpected RRT"))
+    with pytest.raises(RM65GraspTrajectoryPlanningError, match=expected) as caught:
+        planner._plan_path_leg(qpos_by_side=current, side="right", target_tool_tcp_world=np.eye(4),
+            planning_phase="safe_pose_target", endpoint_candidates=(endpoint,),
+            start_qpos_source="synthetic-feedback", deadline=10., monotonic=lambda: now[0])
+    assert caught.value.reason_code == expected
+    assert len(composition) == 1 and composition[0]["start_qpos_by_side"] is current
+    assert composition[0]["side"] == "right" and composition[0]["terminal_tool_tcp_world"] is None
+    assert len(calls) == (0 if outcome == "invalid_scene" else 1)
+    if outcome in {"blocked", "unavailable", "exception", "invalid"}:
+        assert caught.value.details["start_qpos_source"] == "synthetic-feedback"
+        assert caught.value.details["start_check"] == caught.value.details["search_attempts"][0]["start_check"]
+        attempt = caught.value.details["search_attempts"][0]
+        assert attempt["endpoint_seed_indices"] == (12,) and attempt["path_attempt"] == 0
+        assert attempt["search_seed"] == planner.planner_config.seed
+        assert attempt["endpoint_candidates"][0]["seed_index"] == 12
+        assert attempt["endpoint_candidate_ordering"] == planner.config.endpoint_candidate_ordering
+        assert attempt["start_check"] == grasp_trajectory_module._plain_search_evidence(
+            caught.value.details["path"]["metadata"]["start_check"])
+
+
+@pytest.mark.parametrize("failure", ["envelope", "visible"])
+def test_all_pruned_endpoints_use_the_composed_start_oracle(failure):
+    planner = _planner_without_assets(config=RM65GraspTrajectoryPlanningConfig())
+    planner.planner_config = JointPathPlannerConfig()
+    current = {s: np.zeros(6) for s in ("left", "right")}
+    current["right"][0] = -2.
+    target = {s: q.copy() for s, q in current.items()}; target["right"][0] = 2.
+    endpoint = grasp_trajectory_module._EndpointIKCandidate(qpos_by_side=target,
+        seed_index=12, solve_cycles=1, position_residual_m=0., orientation_residual_deg=0.)
+    calls = []
+    planner.oracle = SimpleNamespace(scene_hash="scene:test", check=lambda q: (
+        calls.append("collision"), JointConfigurationCheck(safe=True))[1])
+    planner.target_envelope_filter = object()
+    def envelope(_):
+        calls.append("envelope")
+        if failure == "envelope":
+            raise RM65GraspTrajectoryPlanningError("path_target_safety_envelope_blocked")
+    planner._ingress_search_envelope_check = lambda **_: envelope
+    planner.target_builder = SimpleNamespace(tool_tcp_world_targets_for_qpos_pair=lambda **_: {
+        side: np.eye(4) for side in ("left", "right")})
+    visible = SimpleNamespace(semantic_content_hash="scene:visible",
+        geometry=SimpleNamespace(maximum_opening_m=.08), collision_counts=lambda *a, **k: (
+            calls.append("visible"), (1, 0))[1])
+    with pytest.raises(RM65GraspTrajectoryPlanningError, match="path_start_collision_blocked") as caught:
+        planner._plan_path_leg(qpos_by_side=current, side="right", target_tool_tcp_world=np.eye(4),
+            planning_phase="safe_pose_target", visible_scene=visible, endpoint_candidates=(endpoint,))
+    assert calls == (["collision", "envelope"] if failure == "envelope" else
+                     ["collision", "envelope", "visible"])
+    assert caught.value.details["start_check"]["reason"] == (
+        "path_target_safety_envelope_blocked" if failure == "envelope" else "visible_gripper_path_collision")
 
 
 def test_partial_endpoint_pool_at_deadline_stays_budget_exhausted():

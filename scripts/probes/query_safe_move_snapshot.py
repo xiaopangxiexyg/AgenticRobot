@@ -349,7 +349,8 @@ class SavedSceneSkillQuery:
         finally:
             self._lock.release()
 
-    def _plan_pose_locked(self, *, side, pose, relation=None, time_budget_sec=120.):
+    def _plan_pose_locked(self, *, side, pose, relation=None, time_budget_sec=120.,
+                          absolute_deadline=None):
         query_id = "plan:" + self._scene_id[:16] + ":" + str(len(self._queries))
         row = {"query_id": query_id, "side": side, "target_pose_xyz_quat_xyzw": pose.tolist(),
             "relation": copy.deepcopy(relation), "scope": "planned_not_executed",
@@ -365,6 +366,12 @@ class SavedSceneSkillQuery:
             self._queries.append(row)
             return self._public_result(row)
         started = self._clock()
+        if absolute_deadline is not None:
+            remaining = min(remaining, absolute_deadline - started)
+            if remaining <= 0:
+                row.update(status="query_incomplete", reason="query_budget_exhausted", path_planning_wall_sec=0.)
+                self._queries.append(row)
+                return self._public_result(row)
         self._planning_calls += 1
         try:
             trajectory = self._planner.plan_with_observed_cloud(self._cloud,
@@ -423,62 +430,170 @@ class SavedSceneSkillQuery:
         self._require_open()
         if side not in self._tcp or target_reference not in self._refs:
             raise ValueError("Unknown arm or reference from another saved scene.")
-        candidates = generate_relation_region_goals(
-            current_tcp_pose_xyz_quat_xyzw=list(self._tcp[side]),
-            anchor_xyz_m=self._refs[target_reference]["world_xyz_m"],
-            offset_bounds_xyz_m=offset_bounds_xyz_m, offset_frame=offset_frame,
-            orientation_mode="preserve", tool_axis=None, axis_reference_xyz=None,
-            tool_axis_rotation_bounds_rad=[0., 0.], max_candidates=max_candidates)
-        if self._region_candidate_policy == "proximity":
-            candidates = generate_proximity_region_goals(
-                current_tcp_pose_xyz_quat_xyzw=list(self._tcp[side]),
-                anchor_xyz_m=self._refs[target_reference]["world_xyz_m"],
-                offset_bounds_xyz_m=offset_bounds_xyz_m, offset_frame=offset_frame,
-                max_candidates=max_candidates,
-                boundary_inset_m=RealAgentPrimitiveConvergenceProfile().translation_tolerance_m)
         if not self._lock.acquire(blocking=False):
             raise RuntimeError("A query is already running for this saved scene.")
+        try:
+            return self._plan_relation_region_locked(side=side, target_reference=target_reference,
+                offset_bounds_xyz_m=offset_bounds_xyz_m, offset_frame=offset_frame,
+                max_candidates=max_candidates)
+        finally:
+            self._lock.release()
+
+    def _plan_relation_region_locked(self, *, side, target_reference, offset_bounds_xyz_m,
+                                     offset_frame, max_candidates):
         summary = None
+        public_result = None
+        began = None
+        query_id = None
+        region_query_start = len(self._queries)
+        region_calls_start = self._planning_calls
+        existing_trajectory_ids = set(self._trajectories)
+        region_budget_start = self._planning_seconds
+        def fail_region(error):
+            for trajectory_id in self._trajectories.keys() - existing_trajectory_ids:
+                self._trajectories.pop(trajectory_id, None)
+            if summary is not None:
+                summary.update(status="query_failed", reason=type(error).__name__,
+                    selected_plan_query_id=None,
+                    attempted_candidate_count=self._planning_calls - region_calls_start,
+                    attempt_query_ids=[row["query_id"] for row in self._queries[region_query_start:]])
+                for key in ("selected_candidate_index", "selected_offset_xyz_m", "trajectory_duration_sec"):
+                    summary.pop(key, None)
         try:
             self._require_open()
             query_id = "region:" + self._scene_id[:16] + ":" + str(len(self._regions))
+            began = self._clock()
             summary = {"query_id": query_id, "side": side, "target_reference": target_reference,
                 "offset_bounds_xyz_m": copy.deepcopy(offset_bounds_xyz_m), "offset_frame": offset_frame,
                 "candidate_policy": self._region_candidate_policy,
-                "candidate_count": len(candidates), "attempted_candidate_count": 0,
+                "candidate_count": 0, "attempted_candidate_count": 0,
                 "unresolved_candidate_count": 0,
                 "attempt_query_ids": [], "candidate_validations": [], "selected_plan_query_id": None,
                 "status": "path_rejected", "reason": "region_no_candidate_path",
                 "scope": "planned_not_executed", "physical_action_occurred": False}
-            began = self._clock()
             deadline = began + 20.
+            def reject_expired_selection(now):
+                if summary["status"] != "path_found":
+                    return
+                if (now <= deadline and now - candidate_started <= remaining
+                        and (self._query_budget is None
+                             or self._planning_seconds <= self._query_budget["maximum_planning_sec"])):
+                    return
+                self._trajectories.pop(summary["selected_plan_query_id"], None)
+                self._trajectories.pop(query_id, None)
+                self._queries[-1]["region_validation_budget_exceeded"] = True
+                summary["unresolved_candidate_count"] += 1
+                summary.update(status="query_incomplete", reason="query_budget_exhausted",
+                               selected_plan_query_id=None)
+                for key in ("selected_candidate_index", "selected_offset_xyz_m", "trajectory_duration_sec"):
+                    summary.pop(key, None)
+            def finalize_budget_result(now):
+                reject_expired_selection(now)
+                if (summary["status"] == "path_rejected" and summary["reason"] == "region_no_candidate_path"
+                        and (summary["unresolved_candidate_count"] or now > deadline
+                             or (self._query_budget is not None
+                                 and self._planning_seconds > self._query_budget["maximum_planning_sec"]))):
+                    summary.update(status="query_incomplete", reason="region_candidate_search_incomplete")
+            try:
+                candidates = generate_relation_region_goals(
+                    current_tcp_pose_xyz_quat_xyzw=list(self._tcp[side]),
+                    anchor_xyz_m=self._refs[target_reference]["world_xyz_m"],
+                    offset_bounds_xyz_m=offset_bounds_xyz_m, offset_frame=offset_frame,
+                    orientation_mode="preserve", tool_axis=None, axis_reference_xyz=None,
+                    tool_axis_rotation_bounds_rad=[0., 0.], max_candidates=max_candidates)
+                if self._region_candidate_policy == "proximity":
+                    candidates = generate_proximity_region_goals(
+                        current_tcp_pose_xyz_quat_xyzw=list(self._tcp[side]),
+                        anchor_xyz_m=self._refs[target_reference]["world_xyz_m"],
+                        offset_bounds_xyz_m=offset_bounds_xyz_m, offset_frame=offset_frame,
+                        max_candidates=max_candidates,
+                        boundary_inset_m=RealAgentPrimitiveConvergenceProfile().translation_tolerance_m)
+            finally:
+                generation_wall = self._clock() - began
+                self._planning_seconds = region_budget_start + generation_wall
+                summary["candidate_generation_wall_sec"] = generation_wall
+            summary["candidate_count"] = len(candidates)
             retryable = {"endpoint_collision_blocked", "endpoint_clearance_blocked", "ik_search_exhausted",
                 "path_collision_blocked", "path_target_safety_envelope_blocked",
                 "grasp_path_motion_quality_exceeded", "safe_tcp_endpoint_pose_tolerance_exceeded"}
             for index, candidate in enumerate(candidates):
-                remaining = deadline - self._clock()
+                candidate_started = self._clock()
+                self._planning_seconds = region_budget_start + (candidate_started - began)
+                remaining = min(3., deadline - candidate_started)
+                if self._query_budget is not None:
+                    remaining = min(remaining,
+                        self._query_budget["maximum_planning_sec"] - self._planning_seconds,
+                        self._query_budget.get("maximum_call_planning_sec", remaining))
                 if remaining <= 0:
                     summary.update(status="query_incomplete", reason="query_budget_exhausted")
                     break
                 prior_calls = self._planning_calls
-                result = self._plan_pose_locked(side=side,
-                    pose=np.asarray(candidate.goal.pose_xyz_quat_xyzw), time_budget_sec=min(3., remaining),
-                    relation={"region_query_id": query_id, "target_reference": target_reference,
-                              "offset_xyz_m": list(candidate.offset_xyz_m), "offset_frame": offset_frame})
-                summary["attempt_query_ids"].append(result["query_id"])
-                summary["attempted_candidate_count"] += self._planning_calls - prior_calls
+                prior_planning_seconds = self._planning_seconds
+                prior_query_count = len(self._queries)
+                result = None
+                within = False
+                try:
+                    call_remaining = max(0., remaining - (self._clock() - candidate_started))
+                    result = self._plan_pose_locked(side=side,
+                        pose=np.asarray(candidate.goal.pose_xyz_quat_xyzw), time_budget_sec=call_remaining,
+                        absolute_deadline=candidate_started + remaining,
+                        relation={"region_query_id": query_id, "target_reference": target_reference,
+                                  "offset_xyz_m": list(candidate.offset_xyz_m), "offset_frame": offset_frame})
+                    if result["status"] == "path_found":
+                        actual_offset = (np.asarray(self._queries[-1]["planned_endpoint_xyz_m"])
+                                         - self._refs[target_reference]["world_xyz_m"])
+                        if offset_frame == "tool":
+                            actual_offset = xyzquat_to_pose_matrix(self._tcp[side])[:3, :3].T @ actual_offset
+                        within = all(lo - 1e-9 <= x <= hi + 1e-9
+                                     for x, (lo, hi) in zip(actual_offset, offset_bounds_xyz_m))
+                        summary["candidate_validations"].append({"query_id": result["query_id"],
+                            "actual_offset_xyz_m": actual_offset.tolist(), "inside_requested_region": within})
+                except BaseException:
+                    for new_query in self._queries[prior_query_count:]:
+                        self._trajectories.pop(new_query["query_id"], None)
+                    raise
+                finally:
+                    candidate_finished = self._clock()
+                    candidate_wall = candidate_finished - candidate_started
+                    summary["attempt_query_ids"].extend(
+                        row["query_id"] for row in self._queries[prior_query_count:])
+                    summary["attempted_candidate_count"] += self._planning_calls - prior_calls
+                    # _plan_pose_locked already charges its own work. Add only
+                    # the remaining outer work, including scheduling and final
+                    # region validation, including on exceptional exits.
+                    already_charged = self._planning_seconds - prior_planning_seconds
+                    extra = max(0., candidate_wall - already_charged)
+                    self._planning_seconds = region_budget_start + (candidate_finished - began)
+                    if len(self._queries) > prior_query_count:
+                        self._queries[-1]["region_candidate_wall_sec"] = candidate_wall
+                        self._queries[-1]["region_validation_extra_wall_sec"] = extra
+                # A known fatal start or native fault must not be relabeled as
+                # a retryable scheduling overrun after the lower call returned.
+                prior_outcome = (self._queries[-1].get("outcome_before_budget_check")
+                                 if len(self._queries) > prior_query_count else None)
+                if (result["status"] == "query_incomplete" and prior_outcome is not None
+                        and prior_outcome["status"] == "path_rejected" and prior_outcome["reason"] not in retryable):
+                    summary["unresolved_candidate_count"] += 1
+                    summary.update(status=result["status"], reason=result["reason"],
+                                   terminal_fault_reason=prior_outcome["reason"])
+                    break
+                if result["status"] == "path_rejected" and result["reason"] not in retryable:
+                    summary.update(status=result["status"], reason=result["reason"])
+                    break
+                if candidate_wall > remaining or candidate_finished > deadline:
+                    if result["status"] == "path_found":
+                        self._trajectories.pop(result["query_id"], None)
+                        self._queries[-1]["region_validation_budget_exceeded"] = True
+                    summary["unresolved_candidate_count"] += 1
+                    if (candidate_finished < deadline and self._query_budget is not None
+                            and self._planning_calls < self._query_budget["maximum_calls"]
+                            and self._planning_seconds < self._query_budget["maximum_planning_sec"]):
+                        continue
+                    if candidate_finished < deadline and self._query_budget is None:
+                        continue
+                    summary.update(status="query_incomplete", reason="query_budget_exhausted")
+                    break
                 if result["status"] == "path_found":
-                    actual_offset = (np.asarray(self._queries[-1]["planned_endpoint_xyz_m"])
-                                     - self._refs[target_reference]["world_xyz_m"])
-                    if offset_frame == "tool":
-                        actual_offset = xyzquat_to_pose_matrix(self._tcp[side])[:3, :3].T @ actual_offset
-                    within = all(lo - 1e-9 <= x <= hi + 1e-9
-                                 for x, (lo, hi) in zip(actual_offset, offset_bounds_xyz_m))
-                    summary["candidate_validations"].append({"query_id": result["query_id"],
-                        "actual_offset_xyz_m": actual_offset.tolist(), "inside_requested_region": within})
-                    if self._clock() > deadline:
-                        summary.update(status="query_incomplete", reason="query_budget_exhausted")
-                        break
                     if not within:
                         continue
                     summary.update(status="path_found", reason="planned_not_executed",
@@ -497,20 +612,34 @@ class SavedSceneSkillQuery:
                 if result["reason"] not in retryable:
                     summary.update(status=result["status"], reason=result["reason"])
                     break
-            summary["path_planning_wall_sec"] = self._clock() - began
-            if summary["status"] == "path_rejected" and (
-                    summary["unresolved_candidate_count"] or self._clock() > deadline):
-                summary.update(status="query_incomplete", reason="region_candidate_search_incomplete")
-            return {key: copy.deepcopy(value) for key, value in summary.items()
+            finished = self._clock()
+            summary["path_planning_wall_sec"] = finished - began
+            self._planning_seconds = region_budget_start + summary["path_planning_wall_sec"]
+            finalize_budget_result(finished)
+            public_result = {key: copy.deepcopy(value) for key, value in summary.items()
                     if key not in {"attempt_query_ids", "offset_bounds_xyz_m", "selected_plan_query_id", "candidate_validations"}}
+            return public_result
         except BaseException as error:
-            if summary is not None:
-                summary.update(status="query_failed", reason=type(error).__name__)
+            fail_region(error)
             raise
         finally:
-            if summary is not None:
-                self._regions.append(summary)
-            self._lock.release()
+            try:
+                if summary is not None:
+                    if began is not None:
+                        final_time = self._clock()
+                        summary["path_planning_wall_sec"] = final_time - began
+                        self._planning_seconds = region_budget_start + summary["path_planning_wall_sec"]
+                        finalize_budget_result(final_time)
+                        if public_result is not None:
+                            public_result.clear()
+                            public_result.update({key: copy.deepcopy(value) for key, value in summary.items()
+                                if key not in {"attempt_query_ids", "offset_bounds_xyz_m", "selected_plan_query_id", "candidate_validations"}})
+                    self._regions.append(summary)
+            except BaseException as error:
+                fail_region(error)
+                if summary is not None:
+                    self._regions.append(summary)
+                raise
 
     def audit(self):
         return copy.deepcopy({"scene_id": self._scene_id, "source": self._source_evidence,

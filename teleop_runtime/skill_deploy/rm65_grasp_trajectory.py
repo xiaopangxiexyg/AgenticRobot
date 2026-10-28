@@ -4108,6 +4108,7 @@ class RM65GraspJointTrajectoryPlanner:
             rejected = tuple(endpoint for endpoint in endpoint_candidates
                 if limits.endpoint_joint_travel_exceeded(qpos_by_side[side], endpoint.qpos_by_side[side]))
             if rejected:
+                retained_endpoints = endpoint_candidates
                 endpoint_quality_rejections = tuple({"seed_index": endpoint.seed_index,
                     "minimum_joint_travel_deg": np.rad2deg(np.abs(
                         endpoint.qpos_by_side[side] - qpos_by_side[side])).tolist()}
@@ -4122,6 +4123,73 @@ class RM65GraspJointTrajectoryPlanner:
                         self._remaining_path_planning_time_sec(deadline=deadline,
                             monotonic=monotonic, planning_phase="endpoint_joint_travel_lower_bound",
                             details={"endpoint_quality_rejections": endpoint_quality_rejections})
+                    # Preserve the original scene/request and complete start
+                    # checks before reporting the endpoint-quality conclusion.
+                    # The sampler stops after that check and never enters RRT.
+                    search_oracle = self._path_search_oracle(
+                        planning_phase=planning_phase, visible_scene=visible_scene, side=side,
+                        start_qpos_by_side=qpos_by_side, terminal_tool_tcp_world=None,
+                    )
+                    cfg = self.planner_config
+                    lower = np.asarray(RM65_ABSOLUTE_Q_MIN_RAD, dtype=float)
+                    upper = np.asarray(RM65_ABSOLUTE_Q_MAX_RAD, dtype=float)
+                    target_values = np.stack([item.qpos_by_side[side] for item in retained_endpoints])
+                    full_joint_range = self.config.path_search_attempts_per_endpoint == 1
+                    if not full_joint_range:
+                        lower = np.maximum(lower, np.minimum(qpos_by_side[side], target_values.min(axis=0)) - cfg.sample_padding_rad)
+                        upper = np.minimum(upper, np.maximum(qpos_by_side[side], target_values.max(axis=0)) + cfg.sample_padding_rad)
+                    budget = cfg.time_budget_sec
+                    if deadline is not None:
+                        remaining = self._remaining_path_planning_time_sec(
+                            deadline=deadline, monotonic=monotonic, planning_phase=planning_phase)
+                        budget = remaining if budget is None else min(budget, remaining)
+                    path = plan_collision_aware_joint_path(
+                        start_qpos_by_component=qpos_by_side,
+                        target_qpos_by_component=retained_endpoints[0].qpos_by_side,
+                        alternative_target_qpos_by_component=tuple(
+                            item.qpos_by_side for item in retained_endpoints[1:]),
+                        movable_components=(side,), oracle=search_oracle,
+                        config=replace(cfg, time_budget_sec=budget),
+                        joint_lower_by_component={side: lower},
+                        joint_upper_by_component={side: upper}, monotonic=monotonic,
+                        _stop_after_start_check=True,
+                    )
+                    if deadline is not None:
+                        self._remaining_path_planning_time_sec(
+                            deadline=deadline, monotonic=monotonic, planning_phase=planning_phase)
+                    attempt = {"planning_phase": planning_phase,
+                        "search_collision_model": "ik_sparse_proxy_pairs",
+                        "endpoint_candidate_ordering": self.config.endpoint_candidate_ordering,
+                        "endpoint_seed_indices": tuple(item.seed_index for item in retained_endpoints),
+                        "path_attempt": 0, "search_seed": cfg.seed,
+                        "full_joint_range": full_joint_range,
+                        "sample_padding_rad": None if full_joint_range else cfg.sample_padding_rad,
+                        "endpoint_generation_attempts": retained_endpoints[0].generation_attempts,
+                        "endpoint_candidates": tuple({"seed_index": item.seed_index,
+                            "joint_delta_deg": np.rad2deg(item.qpos_by_side[side] - qpos_by_side[side]).tolist(),
+                            "position_residual_m": item.position_residual_m,
+                            "orientation_residual_deg": item.orientation_residual_deg,
+                        } for item in retained_endpoints),
+                        "status": path.status.value, "reason": path.reason,
+                        "endpoint_quality_rejections": endpoint_quality_rejections}
+                    if "start_check" in path.metadata:
+                        attempt["start_check"] = _plain_search_evidence(path.metadata["start_check"])
+                    if start_qpos_source is not None:
+                        attempt["start_qpos_source"] = start_qpos_source
+                    if path.status is JointPathStatus.START_BLOCKED:
+                        raise RM65GraspTrajectoryPlanningError("path_start_collision_blocked", details={
+                            **attempt, "path_status": path.status.value, "path": path.to_dict(),
+                            "search_attempts": [attempt]})
+                    if path.status is JointPathStatus.COLLISION_CHECK_UNAVAILABLE:
+                        raise RM65GraspTrajectoryPlanningError("path_collision_check_unavailable", details={
+                            **attempt, "path_status": path.status.value, "path": path.to_dict(),
+                            "search_attempts": [attempt]})
+                    if path.reason == "time_budget_exhausted":
+                        raise RM65GraspTrajectoryPlanningError("path_planning_time_budget_exhausted", details={
+                            **attempt, "path": path.to_dict(), "search_attempts": [attempt]})
+                    if path.status is not JointPathStatus.PATH_SEARCH_EXHAUSTED or path.reason != "start_check_only":
+                        raise RM65GraspTrajectoryPlanningError("path_planner_error", details={
+                            **attempt, "path": path.to_dict(), "search_attempts": [attempt]})
                     raise RM65GraspTrajectoryPlanningError("grasp_path_motion_quality_exceeded", details={
                         "planning_phase": "endpoint_joint_travel_lower_bound",
                         "scope": "retained_endpoints_only",

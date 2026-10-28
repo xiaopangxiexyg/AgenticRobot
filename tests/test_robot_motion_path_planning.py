@@ -80,6 +80,21 @@ def test_cost_optimization_keeps_existing_total_deadline():
     assert result.reason == "time_budget_exhausted"
 
 
+def test_internal_start_only_check_cannot_return_an_executable_path():
+    oracle = _PlanarBoxOracle()
+    result = plan_collision_aware_joint_path(
+        start_qpos_by_component={"left": [-1., .7], "right": [4., 5.]},
+        target_qpos_by_component={"left": [1., .7], "right": [4., 5.]},
+        movable_components=("left",), oracle=oracle, config=_planner_config(),
+        scene_hash="scene", _stop_after_start_check=True)
+    assert result.status is JointPathStatus.PATH_SEARCH_EXHAUSTED
+    assert result.reason == "start_check_only" and not result.waypoints
+    assert result.execution_certified is False and result.real_motion_authorized is False
+    assert result.metadata["start_check"]["safe"] is True
+    assert len(oracle.queries) == 1
+    np.testing.assert_array_equal(oracle.queries[0]["left"], [-1., .7])
+
+
 def test_aabb_scene_is_immutable_canonical_and_order_independent() -> None:
     first = AxisAlignedBoxObstacle("first", (0.0, 0.0, 0.2), (0.4, 0.2, 0.6))
     second = AxisAlignedBoxObstacle("second", (1.0, 2.0, 3.0), (0.1, 0.2, 0.3))

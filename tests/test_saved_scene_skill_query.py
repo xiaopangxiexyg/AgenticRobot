@@ -534,8 +534,14 @@ def test_one_candidate_timeout_does_not_starve_the_whole_region(session):
 
 def test_region_deadline_also_covers_last_out_of_region_validation(session):
     query, planner = session
-    clock = iter([0., 0., 0., 0., 0., 21., 21., 21.])
-    query._clock = lambda: next(clock)
+    now = [0.]
+    query._clock = lambda: now[0]
+    original_plan = query._plan_pose_locked
+    def delayed_validation(**kwargs):
+        result = original_plan(**kwargs)
+        now[0] = 21.
+        return result
+    query._plan_pose_locked = delayed_validation
     original = planner.tool_tcp_poses_for_qpos_pair
     def outside(**kwargs):
         poses = {s: p.copy() for s, p in original(**kwargs).items()}
@@ -548,3 +554,387 @@ def test_region_deadline_also_covers_last_out_of_region_validation(session):
     assert query.audit()["region_queries"][0]["selected_plan_query_id"] is None
     # The lower point query remains inspectable evidence, never a region grant.
     assert query.audit()["queries"][0]["status"] == "path_found"
+
+
+def test_region_validation_charges_remaining_session_budget_and_revokes_export(session, tmp_path):
+    query, planner = session
+    now = [0.]
+    query._clock = lambda: now[0]
+    query._query_budget = {"maximum_calls": 8, "maximum_planning_sec": 20., "maximum_call_planning_sec": 3.}
+    query._planning_seconds = 19.95
+    original_planner, original_query = planner.plan_with_observed_cloud, query._plan_pose_locked
+    def plan(*args, **kwargs):
+        now[0] += .04
+        return original_planner(*args, **kwargs)
+    def delayed(**kwargs):
+        result = original_query(**kwargs)
+        now[0] += .10
+        return result
+    planner.plan_with_observed_cloud, query._plan_pose_locked = plan, delayed
+    result = query.plan_relation_region(**region_parameters())
+    audit = query.audit()
+    assert result["status"] == "query_incomplete" and result["reason"] == "query_budget_exhausted"
+    assert audit["planning_seconds"] == pytest.approx(20.09)
+    assert audit["queries"][0]["path_planning_wall_sec"] == pytest.approx(.04)
+    assert audit["queries"][0]["region_candidate_wall_sec"] == pytest.approx(.14)
+    assert audit["queries"][0]["region_validation_budget_exceeded"] is True
+    assert audit["queries"][0]["status"] == "path_found"
+    assert audit["region_queries"][0]["selected_plan_query_id"] is None
+    for query_id in (result["query_id"], audit["queries"][0]["query_id"]):
+        with pytest.raises(KeyError):
+            query.save_trajectory(query_id, tmp_path / "late.npz")
+
+
+def test_region_call_budget_overrun_retries_without_double_charge(session, tmp_path):
+    query, planner = session
+    now = [0.]
+    query._clock = lambda: now[0]
+    query._query_budget = {"maximum_calls": 8, "maximum_planning_sec": 2., "maximum_call_planning_sec": .1}
+    original_planner, original_query = planner.plan_with_observed_cloud, query._plan_pose_locked
+    def plan(*args, **kwargs):
+        now[0] += .04
+        return original_planner(*args, **kwargs)
+    def delayed(**kwargs):
+        result = original_query(**kwargs)
+        if len(planner.calls) == 1:
+            now[0] += .1
+        return result
+    planner.plan_with_observed_cloud, query._plan_pose_locked = plan, delayed
+    result = query.plan_relation_region(**region_parameters())
+    audit = query.audit()
+    assert result["status"] == "path_found" and result["selected_candidate_index"] == 1
+    assert result["attempted_candidate_count"] == 2 and result["unresolved_candidate_count"] == 1
+    assert audit["planning_seconds"] == pytest.approx(.18)
+    assert audit["queries"][0]["region_validation_budget_exceeded"] is True
+    with pytest.raises(KeyError):
+        query.save_trajectory(audit["queries"][0]["query_id"], tmp_path / "late.npz")
+    query.save_trajectory(result["query_id"], tmp_path / "accepted.npz")
+
+
+def test_region_generation_is_charged_once_before_native_planning(session, monkeypatch):
+    from scripts.probes import query_safe_move_snapshot as module
+    query, planner = session
+    now = [0.]
+    query._clock = lambda: now[0]
+    query._query_budget = {"maximum_calls": 8, "maximum_planning_sec": .25}
+    original = module.generate_relation_region_goals
+    def slow_generation(**kwargs):
+        now[0] += .3
+        return original(**kwargs)
+    monkeypatch.setattr(module, "generate_relation_region_goals", slow_generation)
+    result = query.plan_relation_region(**region_parameters())
+    assert result["status"] == "query_incomplete" and not planner.calls
+    assert query.audit()["planning_seconds"] == pytest.approx(.3)
+    assert query.audit()["region_queries"][0]["candidate_generation_wall_sec"] == pytest.approx(.3)
+
+
+def test_region_deadline_expiring_before_lower_entry_never_starts_planner(session):
+    query, planner = session
+    now = [0.]
+    query._clock = lambda: now[0]
+    query._query_budget = {"maximum_calls": 8, "maximum_planning_sec": 30., "maximum_call_planning_sec": 3.}
+    original = query._plan_pose_locked
+    def interrupted_before_entry(**kwargs):
+        now[0] = 21.
+        return original(**kwargs)
+    query._plan_pose_locked = interrupted_before_entry
+    result = query.plan_relation_region(**region_parameters())
+    audit = query.audit()
+    assert result["status"] == "query_incomplete" and not planner.calls
+    assert audit["planning_calls"] == 0 and audit["planning_seconds"] == pytest.approx(21.)
+    assert audit["queries"][0]["reason"] == "query_budget_exhausted"
+    assert audit["region_queries"][0]["attempted_candidate_count"] == 0
+
+
+def test_region_lower_entry_receives_only_remaining_absolute_time(session):
+    query, planner = session
+    now = [0.]
+    query._clock = lambda: now[0]
+    query._query_budget = {"maximum_calls": 8, "maximum_planning_sec": 30., "maximum_call_planning_sec": 3.}
+    original = query._plan_pose_locked
+    def delayed_before_entry(**kwargs):
+        now[0] = 2.
+        return original(**kwargs)
+    query._plan_pose_locked = delayed_before_entry
+    result = query.plan_relation_region(**region_parameters())
+    assert result["status"] == "path_found" and len(planner.calls) == 1
+    assert planner.calls[0]["time_budget_sec"] == pytest.approx(1.)
+    assert query.audit()["planning_seconds"] == pytest.approx(2.)
+
+
+def test_atomic_region_atomic_budget_is_charged_once(session, monkeypatch):
+    from scripts.probes import query_safe_move_snapshot as module
+    query, planner = session
+    now = [0.]
+    query._clock = lambda: now[0]
+    query._query_budget = {"maximum_calls": 8, "maximum_planning_sec": 2.}
+    original_planner, original_query = planner.plan_with_observed_cloud, query._plan_pose_locked
+    original_generate = module.generate_relation_region_goals
+    def plan(*args, **kwargs):
+        now[0] += .1
+        return original_planner(*args, **kwargs)
+    def delayed(**kwargs):
+        result = original_query(**kwargs)
+        if kwargs.get("relation", {}).get("region_query_id"):
+            now[0] += .03
+        return result
+    def generate(**kwargs):
+        now[0] += .02
+        return original_generate(**kwargs)
+    planner.plan_with_observed_cloud, query._plan_pose_locked = plan, delayed
+    monkeypatch.setattr(module, "generate_relation_region_goals", generate)
+    args = dict(side="right", target_reference="point-a", offset_xyz_m=[0., 0., .08])
+    assert query.plan_relation(**args)["status"] == "path_found"
+    assert query.plan_relation_region(**region_parameters())["status"] == "path_found"
+    assert query.plan_relation(**args)["status"] == "path_found"
+    assert query.audit()["planning_seconds"] == pytest.approx(.35)
+    assert query.audit()["planning_calls"] == 3
+
+
+def test_region_validation_exception_charges_and_removes_candidate(session, tmp_path):
+    query, planner = session
+    now = [0.]
+    query._clock = lambda: now[0]
+    original_planner, original_query = planner.plan_with_observed_cloud, query._plan_pose_locked
+    def plan(*args, **kwargs):
+        now[0] += .04
+        return original_planner(*args, **kwargs)
+    def broken(**kwargs):
+        result = original_query(**kwargs)
+        now[0] += .06
+        query._queries[-1]["planned_endpoint_xyz_m"] = "invalid endpoint"
+        return result
+    planner.plan_with_observed_cloud, query._plan_pose_locked = plan, broken
+    with pytest.raises((TypeError, ValueError)):
+        query.plan_relation_region(**region_parameters())
+    audit = query.audit()
+    assert audit["planning_seconds"] == pytest.approx(.1)
+    assert audit["region_queries"][0]["status"] == "query_failed"
+    assert audit["region_queries"][0]["selected_plan_query_id"] is None
+    with pytest.raises(KeyError):
+        query.save_trajectory(audit["queries"][0]["query_id"], tmp_path / "broken.npz")
+    query.close()
+
+
+def test_region_interrupted_before_result_assignment_drops_only_new_candidate(session, tmp_path):
+    query, planner = session
+    now = [0.]
+    query._clock = lambda: now[0]
+    original_planner = planner.plan_with_observed_cloud
+    def plan(*args, **kwargs):
+        now[0] += .04
+        return original_planner(*args, **kwargs)
+    planner.plan_with_observed_cloud = plan
+    previous = query.plan_relation(side="right", target_reference="point-a", offset_xyz_m=[0., 0., .08])
+    original_query = query._plan_pose_locked
+    def interrupted(**kwargs):
+        original_query(**kwargs)
+        now[0] += .06
+        raise RuntimeError("interrupted after lower result")
+    query._plan_pose_locked = interrupted
+    with pytest.raises(RuntimeError, match="interrupted after lower result"):
+        query.plan_relation_region(**region_parameters())
+    audit = query.audit()
+    assert audit["planning_seconds"] == pytest.approx(.14)
+    assert audit["region_queries"][0]["status"] == "query_failed"
+    assert audit["region_queries"][0]["attempted_candidate_count"] == 1
+    assert audit["region_queries"][0]["attempt_query_ids"] == [audit["queries"][-1]["query_id"]]
+    query.save_trajectory(previous["query_id"], tmp_path / "previous.npz")
+    with pytest.raises(KeyError):
+        query.save_trajectory(audit["queries"][-1]["query_id"], tmp_path / "interrupted.npz")
+
+
+def test_region_lower_finally_failure_removes_unrecorded_trajectory(session, tmp_path):
+    query, _ = session
+    previous = query.plan_relation(side="right", target_reference="point-a", offset_xyz_m=[0., 0., .08])
+    original_ids, original_rows = set(query._trajectories), len(query._queries)
+    failed, orphan_id = [False], [None]
+    def clock():
+        newly_stored = set(query._trajectories) - original_ids
+        if newly_stored and len(query._queries) == original_rows and not failed[0]:
+            failed[0] = True
+            orphan_id[0] = next(iter(newly_stored))
+            raise RuntimeError("synthetic lower finally clock failure")
+        return 0.
+    query._clock = clock
+    with pytest.raises(RuntimeError, match="lower finally clock failure"):
+        query.plan_relation_region(**region_parameters())
+    audit = query.audit()
+    assert orphan_id[0] is not None and len(audit["queries"]) == original_rows
+    assert audit["region_queries"][0]["status"] == "query_failed"
+    assert audit["region_queries"][0]["attempted_candidate_count"] == 1
+    assert audit["region_queries"][0]["attempt_query_ids"] == []
+    with pytest.raises(KeyError):
+        query.save_trajectory(orphan_id[0], tmp_path / "orphan.npz")
+    query.save_trajectory(previous["query_id"], tmp_path / "previous.npz")
+    query.close()
+
+
+def test_region_trajectory_snapshot_failure_releases_lock(session):
+    query, planner = session
+    class SnapshotFailure(dict):
+        def __iter__(self):
+            raise MemoryError("synthetic trajectory snapshot failure")
+    query._trajectories = SnapshotFailure(query._trajectories)
+    with pytest.raises(MemoryError, match="snapshot failure"):
+        query.plan_relation_region(**region_parameters())
+    assert not planner.calls
+    assert query._lock.acquire(blocking=False)
+    query._lock.release()
+    query.close()
+
+
+@pytest.mark.parametrize("reason", ["path_start_collision_blocked", "path_collision_check_unavailable"])
+def test_region_does_not_retry_fatal_fault_after_post_return_delay(session, reason):
+    query, planner = session
+    now = [0.]
+    query._clock = lambda: now[0]
+    query._query_budget = {"maximum_calls": 8, "maximum_planning_sec": 2., "maximum_call_planning_sec": .1}
+    original_planner, original_query = planner.plan_with_observed_cloud, query._plan_pose_locked
+    planner.error = RM65GraspTrajectoryPlanningError(reason)
+    def plan(*args, **kwargs):
+        now[0] += .04
+        return original_planner(*args, **kwargs)
+    def delayed(**kwargs):
+        result = original_query(**kwargs)
+        now[0] += .1
+        return result
+    planner.plan_with_observed_cloud, query._plan_pose_locked = plan, delayed
+    result = query.plan_relation_region(**region_parameters())
+    assert result["status"] == "path_rejected" and result["reason"] == reason
+    assert result["attempted_candidate_count"] == 1 and len(planner.calls) == 1
+    assert query.audit()["planning_seconds"] == pytest.approx(.14)
+
+
+@pytest.mark.parametrize("sequence", ["timeout_then_fatal", "fatal_then_region_deadline"])
+def test_region_preserves_fatal_fault_after_unresolved_or_late_delivery(session, sequence):
+    query, planner = session
+    now = [0.]
+    query._clock = lambda: now[0]
+    query._query_budget = {"maximum_calls": 8, "maximum_planning_sec": 30., "maximum_call_planning_sec": .2}
+    original_planner, original_query = planner.plan_with_observed_cloud, query._plan_pose_locked
+    def plan(*args, **kwargs):
+        now[0] += .1
+        planner.error = RM65GraspTrajectoryPlanningError(
+            "path_planning_time_budget_exhausted" if sequence == "timeout_then_fatal" and not planner.calls
+            else "path_start_collision_blocked")
+        return original_planner(*args, **kwargs)
+    def delayed(**kwargs):
+        result = original_query(**kwargs)
+        if sequence == "fatal_then_region_deadline":
+            now[0] = 21.
+        return result
+    planner.plan_with_observed_cloud, query._plan_pose_locked = plan, delayed
+    result = query.plan_relation_region(**region_parameters())
+    assert result["status"] == "path_rejected" and result["reason"] == "path_start_collision_blocked"
+    assert len(planner.calls) == (2 if sequence == "timeout_then_fatal" else 1)
+    assert result["unresolved_candidate_count"] == (1 if sequence == "timeout_then_fatal" else 0)
+
+
+@pytest.mark.parametrize("reason", ["path_start_collision_blocked", "path_collision_check_unavailable"])
+def test_region_never_retries_fatal_fault_returned_after_lower_budget(session, reason):
+    query, planner = session
+    now = [0.]
+    query._clock = lambda: now[0]
+    query._query_budget = {"maximum_calls": 8, "maximum_planning_sec": 2., "maximum_call_planning_sec": .1}
+    original = planner.plan_with_observed_cloud
+    planner.error = RM65GraspTrajectoryPlanningError(reason)
+    def slow(*args, **kwargs):
+        now[0] += .15
+        return original(*args, **kwargs)
+    planner.plan_with_observed_cloud = slow
+    result = query.plan_relation_region(**region_parameters())
+    assert result["status"] == "query_incomplete" and result["reason"] == "query_budget_exhausted"
+    assert result["terminal_fault_reason"] == reason and len(planner.calls) == 1
+    assert query.audit()["queries"][0]["outcome_before_budget_check"] == {
+        "status": "path_rejected", "reason": reason}
+
+
+def test_region_late_final_rejection_respects_session_budget(session):
+    query, planner = session
+    now = [0.]
+    query._clock = lambda: now[0]
+    query._query_budget = {"maximum_calls": 8, "maximum_planning_sec": .5, "maximum_call_planning_sec": 1.}
+    planner.error = RM65GraspTrajectoryPlanningError("endpoint_collision_blocked")
+    original_planner, original_query = planner.plan_with_observed_cloud, query._plan_pose_locked
+    def plan(*args, **kwargs):
+        now[0] += .4
+        return original_planner(*args, **kwargs)
+    class DelayedResult(dict):
+        reads = 0
+        def __getitem__(self, key):
+            if key == "status":
+                self.reads += 1
+                if self.reads == 2:
+                    now[0] += .2
+            return super().__getitem__(key)
+    def delayed(**kwargs):
+        return DelayedResult(original_query(**kwargs))
+    planner.plan_with_observed_cloud, query._plan_pose_locked = plan, delayed
+    result = query.plan_relation_region(**{**region_parameters(), "max_candidates": 1})
+    assert result["status"] == "query_incomplete"
+    assert result["reason"] == "region_candidate_search_incomplete"
+    assert len(planner.calls) == 1 and query.audit()["planning_seconds"] == pytest.approx(.6)
+
+
+@pytest.mark.parametrize("phase", ["after_selection", "final_delivery"])
+def test_region_exception_after_selection_revokes_all_new_exports(session, tmp_path, phase):
+    query, _ = session
+    previous = query.plan_relation(side="right", target_reference="point-a", offset_xyz_m=[0., 0., .08])
+    now, selected_reads, failed = [0.], [0], [False]
+    def clock():
+        if any(key.startswith("region:") for key in query._trajectories):
+            selected_reads[0] += 1
+            trigger = 1 if phase == "after_selection" else 2
+            if selected_reads[0] == trigger and not failed[0]:
+                failed[0] = True
+                raise RuntimeError("synthetic delivery clock failure")
+        return now[0]
+    query._clock = clock
+    with pytest.raises(RuntimeError, match="delivery clock failure"):
+        query.plan_relation_region(**region_parameters())
+    audit = query.audit()
+    region = audit["region_queries"][0]
+    assert region["status"] == "query_failed" and region["selected_plan_query_id"] is None
+    assert region["attempted_candidate_count"] == 1
+    assert region["attempt_query_ids"] == [audit["queries"][-1]["query_id"]]
+    for query_id in (region["query_id"], audit["queries"][-1]["query_id"]):
+        with pytest.raises(KeyError):
+            query.save_trajectory(query_id, tmp_path / "revoked.npz")
+    query.save_trajectory(previous["query_id"], tmp_path / "previous.npz")
+    query.close()
+
+
+@pytest.mark.parametrize("first_outcome", ["retryable", "success"])
+def test_region_accounts_for_scheduling_between_candidate_and_decision(session, tmp_path, first_outcome):
+    query, planner = session
+    now = [0.]
+    query._clock = lambda: now[0]
+    query._query_budget = {"maximum_calls": 8, "maximum_planning_sec": 2., "maximum_call_planning_sec": 1.}
+    if first_outcome == "retryable":
+        planner.error = RM65GraspTrajectoryPlanningError("endpoint_collision_blocked")
+    original_planner, original_query = planner.plan_with_observed_cloud, query._plan_pose_locked
+    def plan(*args, **kwargs):
+        now[0] += .1
+        return original_planner(*args, **kwargs)
+    class DelayedResult(dict):
+        reads = 0
+        def __getitem__(self, key):
+            if key == "status":
+                self.reads += 1
+                if self.reads == 2:
+                    now[0] += 3.
+            return super().__getitem__(key)
+    def delayed(**kwargs):
+        return DelayedResult(original_query(**kwargs))
+    planner.plan_with_observed_cloud, query._plan_pose_locked = plan, delayed
+    result = query.plan_relation_region(**region_parameters())
+    audit = query.audit()
+    assert result["status"] == "query_incomplete"
+    assert len(planner.calls) == 1 and audit["planning_seconds"] == pytest.approx(3.1)
+    assert audit["region_queries"][0]["selected_plan_query_id"] is None
+    if first_outcome == "success":
+        with pytest.raises(KeyError):
+            query.save_trajectory(audit["queries"][0]["query_id"], tmp_path / "late.npz")
+        with pytest.raises(KeyError):
+            query.save_trajectory(result["query_id"], tmp_path / "late-region.npz")

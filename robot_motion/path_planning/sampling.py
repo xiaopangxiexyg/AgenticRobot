@@ -95,6 +95,7 @@ def plan_collision_aware_joint_path(
     scene_hash: str | None = None,
     edge_cost: Callable[[Mapping[str, np.ndarray], Mapping[str, np.ndarray]], float] | None = None,
     monotonic: Callable[[], float] = time.perf_counter,
+    _stop_after_start_check: bool = False,
 ) -> JointPathPlanResult:
     """Plan a collision-checked path without authorizing its execution.
 
@@ -289,6 +290,13 @@ def plan_collision_aware_joint_path(
         return _result(JointPathStatus.COLLISION_CHECK_UNAVAILABLE, start, target, movable, resolved_scene_hash, "start_collision_check_unavailable", {**base_metadata, "start_check": start_check.to_dict()})
     if not start_check.safe:
         return _result(JointPathStatus.START_BLOCKED, start, target, movable, resolved_scene_hash, "start_configuration_blocked", {**base_metadata, "start_check": start_check.to_dict()})
+    if _stop_after_start_check:
+        # Internal diagnostic use: retain the usual scene/request checks and
+        # canonical fail-closed start oracle without planning a target path.
+        return _result(JointPathStatus.PATH_SEARCH_EXHAUSTED, start, target, movable,
+            resolved_scene_hash, "start_check_only",
+            {**base_metadata, "start_check": start_check.to_dict(),
+             "search_termination": "start_check_only"})
     target_checks: list[dict[str, Any]] = []
     safe_target_indices: list[int] = []
     for target_index, candidate_flat in enumerate(target_flats):
