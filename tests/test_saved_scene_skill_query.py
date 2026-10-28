@@ -1116,3 +1116,50 @@ def test_entity_hover_tool_axis_down_turns_a_horizontal_tool():
     assert result["status"] == "path_found" and result["orientation_policy"] == "tool_axis_down"
     np.testing.assert_allclose(planner.target[:3, 2], [0., 0., -1.], atol=1e-9)
     query.close()
+
+
+def _cube_surface(centre, half, spacing=.003):
+    centre, half = np.asarray(centre, float), np.asarray(half, float)
+    faces = []
+    for axis in range(3):
+        others = [a for a in range(3) if a != axis]
+        uu, vv = np.meshgrid(*[np.arange(-half[a], half[a] + 1e-9, spacing) for a in others])
+        for sign in (-1., 1.):
+            face = np.zeros((uu.size, 3))
+            face[:, others[0]], face[:, others[1]] = uu.ravel(), vv.ravel()
+            face[:, axis] = sign * half[axis]
+            faces.append(face + centre)
+    return np.vstack(faces)
+
+
+def test_tool_object_relations_fuse_views_without_planning():
+    planner = Planner()
+    # TCP at (.1, .2, .5) pointing down; the fingers hang to z = .44 and the
+    # closing region spans z .44-.52 around the TCP's x axis.
+    between = _cube_surface((.1, .2, .47), (.01, .008, .01))
+    query = _entity_query(planner, object_surface_by_reference={"top-a": between})
+    result = query.describe_tool_object_relations()
+    assert result["semantics"] == "agenticrobot.relation.tool_object.v1"
+    assert result["scope"] == "one_saved_time_node_no_execution"
+    assert result["objects"] == [{"side": "right", "label": "cube top", "relation": "between_fingers",
+        "surface_distance_m": pytest.approx(.02), "view_count": 1, "views_agree": True}]
+    view = result["views"][0]
+    assert view["target_reference"] == "top-a" and view["role"] == "main"
+    assert view["grasp_region_point_count"] == view["object_point_count"] > 10
+    assert not planner.calls and query.audit()["relation_reads"] == 1
+    assert "object_surface" not in json.dumps(query.read_scene())
+    query.close()
+    with pytest.raises(RuntimeError):
+        query.describe_tool_object_relations()
+
+
+def test_tool_object_relations_only_bind_saved_surface_references():
+    planner = Planner()
+    with pytest.raises(ValueError, match="saved surface"):
+        _entity_query(planner, object_surface_by_reference={"elsewhere": [[0., 0., 0.]]})
+    with pytest.raises(ValueError, match="finite"):
+        _entity_query(planner, object_surface_by_reference={"top-a": [[0., 0., float("nan")]]})
+    query = _entity_query(planner)
+    result = query.describe_tool_object_relations()
+    assert result["objects"] == [] and result["unmeasured_references"] == ["top-a"]
+    query.close()

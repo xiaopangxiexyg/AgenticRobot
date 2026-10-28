@@ -31,8 +31,9 @@ from robot_motion.relative_action import pose_matrix_to_xyzquat, xyzquat_to_pose
 from robot_motion.spatial_goals import compute_spatial_goal, finite_vector
 from robot_motion.spatial_goal_regions import generate_relation_region_goals, generate_proximity_region_goals
 from robot_motion.tool_entity_goals import (
-    HOVER_ORIENTATION_POLICIES, TOOL_ENTITY_HOVER_SEMANTICS_V1, ToolEntityBox,
-    entity_hover_metrics, generate_entity_hover_goals,
+    HOVER_ORIENTATION_POLICIES, TOOL_ENTITY_HOVER_SEMANTICS_V1, TOOL_OBJECT_RELATION_SEMANTICS_V1,
+    ToolEntityBox, entity_hover_metrics, fuse_tool_object_relations, generate_entity_hover_goals,
+    object_surface_cluster, tool_object_relation,
 )
 from scripts.probes.inspect_safe_move_snapshot import (
     RM65CapturedRobotObservationFilterConfig, backproject, load_captures, resolve_inputs,
@@ -48,6 +49,28 @@ from scipy.spatial.transform import Rotation
 # Height above the anchor below which observed points count as support under a
 # hovering tool footprint; higher points are reported as overhead obstacles.
 ENTITY_HOVER_SUPPORT_WINDOW_M = 0.30
+# Saved object masks are eroded before back-projection so boundary pixels
+# (mask bleed, mixed depth) do not become object surface evidence.
+OBJECT_MASK_EROSION_PX = 2
+
+
+def object_surface_from_mask(mask, capture, *, maximum_depth_m):
+    """Measured surface of one saved object mask: eroded, valid depth, largest cluster.
+
+    Returns ``(points, evidence)``; ``points`` is ``None`` when no valid
+    measured pixel remains. Observation only: never a pose or full shape.
+    """
+    from scipy import ndimage
+
+    eroded = ndimage.binary_erosion(np.asarray(mask, dtype=bool), iterations=OBJECT_MASK_EROSION_PX)
+    depth = capture.depth_m
+    eroded &= np.isfinite(depth) & (depth > 0) & (depth <= maximum_depth_m)
+    evidence = {"mask_erosion_px": OBJECT_MASK_EROSION_PX, "valid_pixel_count": int(np.count_nonzero(eroded))}
+    if not evidence["valid_pixel_count"]:
+        return None, evidence
+    points, _, _ = backproject(depth, capture.intrinsics, capture.source_from_camera, eroded)
+    surface, cluster = object_surface_cluster(points)
+    return surface, {**evidence, **cluster}
 
 
 def default_tool_entity_by_side(tool_tcp_pose_flange_m_rad_by_side):
@@ -232,7 +255,7 @@ class SavedSceneSkillQuery:
     def __init__(self, *, scene_id, reference_frame_id, qpos_by_side,
                  tcp_pose_by_side, anchors, planner, cloud, source_evidence,
                  query_budget=None, region_candidate_policy="proximity", clock=time.monotonic,
-                 tool_entity_by_side=None):
+                 tool_entity_by_side=None, object_surface_by_reference=None):
         self._scene_id = str(scene_id)
         self._frame = reference_frame_id
         self._tool_entities = dict(tool_entity_by_side or {})
@@ -250,6 +273,16 @@ class SavedSceneSkillQuery:
         if len({item["reference"] for item in self._anchors}) != len(self._anchors):
             raise ValueError("Saved observation references must be unique.")
         self._refs = {item["reference"]: item for item in self._anchors}
+        self._object_surfaces = {}
+        for reference, points in dict(object_surface_by_reference or {}).items():
+            if reference not in self._refs or self._refs[reference]["kind"] != "saved_visible_surface_point":
+                raise ValueError("Object surfaces must belong to saved surface references.")
+            points = np.array(points, dtype=float).reshape(-1, 3)
+            if not len(points) or not np.isfinite(points).all():
+                raise ValueError("Object surfaces must be nonempty finite N x 3 arrays.")
+            points.setflags(write=False)
+            self._object_surfaces[reference] = points
+        self._relation_reads = 0
         self._planner, self._cloud = planner, cloud
         self._source_evidence = copy.deepcopy(source_evidence)
         self._lock = threading.Lock()
@@ -330,6 +363,7 @@ class SavedSceneSkillQuery:
                     "kind": "measured_tcp", "world_xyz_m": poses[side][:3],
                     "acquired_at": captures[0].pose_measured_at, "role": None}
                    for side in ("left", "right")]
+        surfaces = {}
         for index, saved in enumerate(manifest.get("anchors", [])):
             capture = next((c for c in captures if c.role == saved["role"]), None)
             if (capture is None or capture.acquired_at != saved["acquired_at"]
@@ -346,12 +380,17 @@ class SavedSceneSkillQuery:
                 capture.source_from_camera, selected)
             if points.shape != (1, 3) or not np.isfinite(points).all():
                 raise ValueError("Surface anchor must be one measured finite RGB-D point.")
-            anchors.append({"reference": prefix + ":surface_" + str(index),
+            reference = prefix + ":surface_" + str(index)
+            surface, surface_evidence = object_surface_from_mask(mask, capture,
+                maximum_depth_m=observation_config.maximum_depth_m)
+            if surface is not None:
+                surfaces[reference] = surface
+            anchors.append({"reference": reference,
                 "label": saved["label"], "kind": "saved_visible_surface_point",
                 "world_xyz_m": points[0].tolist(), "acquired_at": capture.acquired_at,
                 "role": capture.role, "pixel_uv": uv, "pixel_clearance_px": clearance,
                 "mask_sha256": saved["mask_sha256"], "rgb_content_hash": capture.rgb_content_hash,
-                "depth_content_hash": capture.depth_content_hash})
+                "depth_content_hash": capture.depth_content_hash, "object_surface": surface_evidence})
         convergence = RealAgentPrimitiveConvergenceProfile()
         plan_config = RM65GraspTrajectoryPlanningConfig(
             enable_inherited_start_clearance=enable_inherited_start_clearance,
@@ -376,7 +415,7 @@ class SavedSceneSkillQuery:
                 "tool_entities": {side: entity.identity() for side, entity in tool_entities.items()}},
             query_budget=manifest.get("query_budget"),
             region_candidate_policy=manifest.get("region_candidate_policy", "proximity"),
-            tool_entity_by_side=tool_entities)
+            tool_entity_by_side=tool_entities, object_surface_by_reference=surfaces)
 
     def _require_open(self):
         if self._closed:
@@ -395,6 +434,45 @@ class SavedSceneSkillQuery:
         if include_geometry:
             result["measured_tcp_pose_by_side"] = {s: list(p) for s, p in self._tcp.items()}
         return result
+
+    def describe_tool_object_relations(self):
+        """Measured gripper-object relations at this saved time node; no planning.
+
+        Semantics ``agenticrobot.relation.tool_object.v1``: each saved object
+        surface (eroded mask, largest measured cluster) against each arm's
+        reviewed gripper solids at the measured TCP. ``objects`` fuses views
+        that share a label; ``views`` keeps every per-view result. Distances
+        are to the maximum-opening screening envelope, so the contact band is
+        evidence of proximity, never a contact, grasp or force claim.
+        """
+        self._require_open()
+        if not self._lock.acquire(blocking=False):
+            raise RuntimeError("A query is already running for this saved scene.")
+        try:
+            self._require_open()
+            views, grouped = [], {}
+            for anchor in self._anchors:
+                points = self._object_surfaces.get(anchor["reference"])
+                if points is None:
+                    continue
+                for side in sorted(self._tool_entities):
+                    relation = tool_object_relation(entity=self._tool_entities[side],
+                        world_from_tcp=_pose_matrix(self._tcp[side]), object_points_m=points)
+                    views.append({"side": side, "target_reference": anchor["reference"],
+                                  "label": anchor["label"], "role": anchor["role"], **relation.as_dict()})
+                    grouped.setdefault((side, anchor["label"]), []).append(relation)
+            objects = [{"side": side, "label": label, **fuse_tool_object_relations(items)}
+                       for (side, label), items in sorted(grouped.items())]
+            self._relation_reads += 1
+            return {"scope": "one_saved_time_node_no_execution",
+                    "semantics": TOOL_OBJECT_RELATION_SEMANTICS_V1,
+                    "reference_frame_id": self._frame, "objects": objects, "views": views,
+                    "unmeasured_references": [a["reference"] for a in self._anchors
+                        if a["kind"] == "saved_visible_surface_point"
+                        and a["reference"] not in self._object_surfaces],
+                    "evidence_scope": "measured_visible_surfaces_vs_gripper_screening_envelope"}
+        finally:
+            self._lock.release()
 
     def plan_relation(self, *, side, target_reference, offset_xyz_m, offset_frame="reference"):
         self._require_open()
@@ -837,6 +915,7 @@ class SavedSceneSkillQuery:
             "planning_budget": self._query_budget, "planning_calls": self._planning_calls,
             "planning_seconds": self._planning_seconds,
             "qpos_by_side": {s: q.tolist() for s, q in self._qpos.items()},
+            "relation_reads": self._relation_reads,
             "dispatches": 0, "closed": self._closed})
 
     def save_trajectory(self, query_id, path):
@@ -860,6 +939,7 @@ class SavedSceneSkillQuery:
             self._closed = True
             self._planner = self._cloud = None
             self._trajectories.clear()
+            self._object_surfaces = {}
         finally:
             self._lock.release()
 
@@ -868,6 +948,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--manifest", type=Path, required=True)
     parser.add_argument("--request", type=Path, help="JSON relation query; omit to inspect references")
+    parser.add_argument("--tool-object-relations", action="store_true",
+        help="Print measured gripper-object relations instead of references")
     parser.add_argument("--audit-output", type=Path, help="New JSON file for full query evidence")
     clearance = parser.add_mutually_exclusive_group()
     clearance.add_argument("--enable-inherited-start-clearance", dest="inherited_start_clearance",
@@ -889,8 +971,9 @@ def main():
         enable_inherited_start_clearance=args.inherited_start_clearance,
         endpoint_candidate_ordering=args.endpoint_candidate_ordering)
     try:
-        result = (query.read_scene() if args.request is None else
-                  query.plan_relation(**json.loads(args.request.read_text())))
+        result = (query.plan_relation(**json.loads(args.request.read_text())) if args.request is not None
+                  else query.describe_tool_object_relations() if args.tool_object_relations
+                  else query.read_scene())
         print(json.dumps(result, ensure_ascii=False, allow_nan=False, indent=2))
     finally:
         query.close()

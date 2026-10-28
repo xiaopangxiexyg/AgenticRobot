@@ -178,3 +178,138 @@ def test_entity_rejects_invalid_box():
         ToolEntityBox(tcp_from_box_xyz_m=(0., 0., 0.), tcp_from_box_rotation=tuple((2 * np.eye(3)).ravel()),
                       half_extents_m=(.01, .01, .01), tip_center_tcp_m=(0., 0., .01))
     assert math.isclose(simple_entity().half_extents_m[2], .045)
+
+
+# --- measured tool-object relations -------------------------------------------------
+
+from robot_motion.tool_entity_goals import (  # noqa: E402
+    TOOL_OBJECT_RELATIONS,
+    ToolObjectRelation,
+    fuse_tool_object_relations,
+    object_surface_cluster,
+    tool_object_relation,
+)
+
+
+def box_surface(centre, half, spacing=.003):
+    """Points on the six faces of an axis-aligned box (TCP frame of simple_entity)."""
+    centre, half = np.asarray(centre, float), np.asarray(half, float)
+    faces = []
+    for axis in range(3):
+        others = [a for a in range(3) if a != axis]
+        grids = [np.arange(-half[a], half[a] + 1e-9, spacing) for a in others]
+        uu, vv = np.meshgrid(*grids)
+        for sign in (-1., 1.):
+            face = np.zeros((uu.size, 3))
+            face[:, others[0]], face[:, others[1]] = uu.ravel(), vv.ravel()
+            face[:, axis] = sign * half[axis]
+            faces.append(face + centre)
+    return np.unique(np.round(np.vstack(faces), 9), axis=0)
+
+
+WORLD_FROM_TCP = pose_matrix([.4, -.1, .3, *Rotation.from_euler("xyz", [20, -35, 70], degrees=True).as_quat()])
+
+
+def to_world(points_tcp):
+    return np.asarray(points_tcp) @ WORLD_FROM_TCP[:3, :3].T + WORLD_FROM_TCP[:3, 3]
+
+
+def relation_of(points_tcp, **kwargs):
+    return tool_object_relation(entity=simple_entity(), world_from_tcp=WORLD_FROM_TCP,
+                                object_points_m=to_world(points_tcp), **kwargs)
+
+
+def test_parts_and_closing_region_partition_the_envelope():
+    entity = simple_entity()
+    palm, left, right = entity.parts
+    np.testing.assert_allclose(palm[0], [0., 0., -.025], atol=1e-12)
+    np.testing.assert_allclose(palm[1], [.04, .01, .005], atol=1e-12)
+    np.testing.assert_allclose(left[0], [-.035, 0., .02], atol=1e-12)
+    np.testing.assert_allclose(right[0], [.035, 0., .02], atol=1e-12)
+    np.testing.assert_allclose(left[1], [.005, .01, .04], atol=1e-12)
+    centre, half = entity.grasp_region
+    np.testing.assert_allclose(centre, [0., 0., .02], atol=1e-12)
+    np.testing.assert_allclose(half, [.03, .01, .04], atol=1e-12)
+    identity = entity.identity()
+    assert len(identity["parts"]) == 3
+    np.testing.assert_allclose(identity["grasp_region"], [centre, half])
+
+
+@pytest.mark.parametrize("centre,half,expected,distance", [
+    # 2 cm cube centred between the fingers: 2 cm from either finger.
+    ((0., 0., .03), (.01, .008, .01), "between_fingers", .02),
+    # Nearly finger-wide object between the fingers: inside the 5 mm band.
+    ((0., 0., .03), (.028, .008, .01), "between_fingers_in_contact_band", .002),
+    # Flat object 1 mm outside the right finger's outer face.
+    ((.051, 0., .02), (.01, .01, .02), "in_contact_band", .001),
+    # Same object 3 cm away: near, not in the band.
+    ((.08, 0., .02), (.01, .01, .02), "near", .03),
+    ((.4, 0., .02), (.01, .01, .02), "far", .35),
+])
+def test_relation_classes_follow_measured_surface_geometry(centre, half, expected, distance):
+    relation = relation_of(box_surface(centre, half))
+    assert relation.relation == expected
+    assert relation.surface_distance_m == pytest.approx(distance, abs=1e-6)
+    assert relation.between_fingers is expected.startswith("between")
+    assert relation.in_contact_band is ("contact_band" in expected)
+    assert expected in TOOL_OBJECT_RELATIONS
+
+
+def test_relation_counts_are_robust_to_a_few_stray_points():
+    far = box_surface((.4, 0., .02), (.01, .01, .02))
+    in_finger = np.array([[.035, 0., .02], [.035, 0., .03]])
+    relation = relation_of(np.vstack([far, in_finger]))
+    assert relation.contact_band_point_count == 2 and relation.relation == "far"
+    assert relation.surface_distance_m == pytest.approx(.35)  # third-smallest, not the stray minimum
+    in_region = np.column_stack([np.zeros(9), np.zeros(9), np.linspace(0., .04, 9)])
+    sparse = relation_of(np.vstack([far, in_region]))
+    assert sparse.grasp_region_point_count == 9 and sparse.relation == "near"
+    strict = relation_of(np.vstack([far, in_finger, in_region]), contact_minimum_points=2, region_minimum_points=9)
+    assert strict.relation == "between_fingers_in_contact_band"
+    assert strict.surface_distance_m == pytest.approx(-.005)
+
+
+def test_relation_requires_parts_points_and_valid_thresholds():
+    entity = simple_entity()
+    bare = ToolEntityBox(tcp_from_box_xyz_m=entity.tcp_from_box_xyz_m,
+                         tcp_from_box_rotation=entity.tcp_from_box_rotation,
+                         half_extents_m=entity.half_extents_m, tip_center_tcp_m=entity.tip_center_tcp_m)
+    with pytest.raises(ValueError, match="solids"):
+        tool_object_relation(entity=bare, world_from_tcp=np.eye(4), object_points_m=[[0., 0., 0.]])
+    for points in ([], [[0., 0., float("nan")]]):
+        with pytest.raises(ValueError):
+            tool_object_relation(entity=entity, world_from_tcp=np.eye(4), object_points_m=points)
+    for change in ({"contact_distance_m": .06}, {"contact_minimum_points": 0}, {"region_minimum_points": 1.5}):
+        with pytest.raises(ValueError):
+            tool_object_relation(entity=entity, world_from_tcp=np.eye(4), object_points_m=[[1., 0., 0.]], **change)
+
+
+def test_surface_cluster_thins_to_voxels_and_drops_a_nearer_occluder():
+    plane = np.stack(np.meshgrid(np.arange(0., .06, .001), np.arange(0., .06, .001)), -1).reshape(-1, 2)
+    obj = np.column_stack([plane, np.full(len(plane), .30)])
+    occluder = np.column_stack([plane[:200] * .2, np.full(200, .20)])  # 10 cm in front
+    kept, evidence = object_surface_cluster(np.vstack([obj, obj, occluder]))
+    assert evidence["input_point_count"] == 2 * len(obj) + 200
+    assert evidence["component_count"] == 2
+    assert evidence["kept_voxel_count"] == len(kept) == 400  # 20 x 20 voxels of 3 mm
+    np.testing.assert_allclose(kept[:, 2], .30)
+    again, _ = object_surface_cluster(np.vstack([obj, obj, occluder]))
+    np.testing.assert_array_equal(kept, again)
+    single, info = object_surface_cluster([[0., 0., 0.]])
+    assert len(single) == 1 and info["component_count"] == 1
+    for bad in ({"voxel_size_m": 0.}, {"link_distance_m": .001}, {"voxel_size_m": .03}):
+        with pytest.raises(ValueError):
+            object_surface_cluster(obj, **bad)
+
+
+def test_fused_relation_is_the_union_of_partial_views():
+    def make(relation, distance):
+        return ToolObjectRelation(relation=relation, surface_distance_m=distance, contact_band_point_count=0,
+                                  grasp_region_point_count=0, object_point_count=10)
+    fused = fuse_tool_object_relations([make("near", .02), make("between_fingers", .008), make("in_contact_band", .001)])
+    assert fused == {"relation": "between_fingers_in_contact_band", "surface_distance_m": .001,
+                     "view_count": 3, "views_agree": False}
+    assert fuse_tool_object_relations([make("far", .2), make("near", .03)])["relation"] == "near"
+    assert fuse_tool_object_relations([make("far", .2)])["views_agree"] is True
+    with pytest.raises(ValueError):
+        fuse_tool_object_relations([])
