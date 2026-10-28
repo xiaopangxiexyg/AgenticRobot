@@ -249,7 +249,9 @@ def test_factory_defaults_to_inherited_clearance_and_binds_strict_opt_out(input_
     snapshot_path.write_text(json.dumps(snapshot))
     input_manifest["fixed_files"][str(snapshot_path)] = file_sha256(snapshot_path)
     input_manifest.update(anchors=[], source_single_start=False)
-    profile = SimpleNamespace(station_world_frame_id="station")
+    profile = SimpleNamespace(station_world_frame_id="station",
+        tool_tcp_pose_flange_m_rad_by_side={"left": np.array([0., 0., .14, 0., 0., 0.]),
+                                            "right": np.array([0., 0., .15, 0., 0., 0.])})
     builder = SimpleNamespace(pre_ik_target_safety_filter=lambda value: value,
         tool_tcp_world_targets_for_qpos_pair=lambda **_: {s: np.eye(4) for s in ("left", "right")})
     monkeypatch.setattr(module, "resolve_inputs", lambda *_a, **_k:
@@ -279,6 +281,15 @@ def test_factory_defaults_to_inherited_clearance_and_binds_strict_opt_out(input_
         query.close()
     # The strict opt-out keeps the identity of earlier strict-default queries.
     assert identities[0] == identities[1] and identities[2] != identities[0]
+
+    # Only an arm whose TCP matches the reviewed gripper alignment gets the entity.
+    query = SavedSceneSkillQuery.from_manifest(input_manifest)
+    assert set(query.audit()["source"]["tool_entities"]) == {"left"}
+    with pytest.raises(ValueError, match="tool entity"):
+        query.plan_entity_hover_region(side="right",
+            target_reference=query.read_scene()["references"][0]["reference"],
+            tip_offset_bounds_xy_m=[[-.01, .01], [-.01, .01]], clearance_bounds_m=[.03, .05])
+    query.close()
 
     # An input manifest still cannot select the planning policy either way.
     input_manifest["enable_inherited_start_clearance"] = False
@@ -976,3 +987,120 @@ def test_region_accounts_for_scheduling_between_candidate_and_decision(session, 
             query.save_trajectory(audit["queries"][0]["query_id"], tmp_path / "late.npz")
         with pytest.raises(KeyError):
             query.save_trajectory(result["query_id"], tmp_path / "late-region.npz")
+
+
+def _entity_query(planner, **kwargs):
+    from robot_motion.grasp_visible_scene import ParallelJawSolidGeometry
+    from robot_motion.tool_entity_goals import ToolEntityBox
+    entity = ToolEntityBox.from_parallel_jaw_geometry(ParallelJawSolidGeometry(palm_z_m=-.02,
+        finger_length_m=.08, finger_thickness_m=.01, pad_height_m=.02, maximum_opening_m=.06),
+        source={"test": "box"})
+    grid = np.stack(np.meshgrid(np.arange(-.2, .4, .01), np.arange(-.1, .5, .01)), -1).reshape(-1, 2)
+    top = np.stack(np.meshgrid(np.arange(.08, .121, .005), np.arange(.18, .221, .005)), -1).reshape(-1, 2)
+    points = np.vstack([np.column_stack([grid, np.zeros(len(grid))]),
+                        np.column_stack([top, np.full(len(top), .05)])])
+    down = [.1, .2, .5, 1., 0., 0., 0.]  # TCP +Z points to reference -Z
+    return SavedSceneSkillQuery(scene_id="b" * 64, reference_frame_id="station",
+        qpos_by_side={s: [0.] * 6 for s in ("left", "right")},
+        tcp_pose_by_side={s: down for s in ("left", "right")},
+        anchors=[{"reference": "top-a", "label": "cube top", "kind": "saved_visible_surface_point",
+                  "world_xyz_m": [.1, .2, .05], "acquired_at": 3., "role": "main"}],
+        planner=planner, cloud=SimpleNamespace(points_m=points, quantization_margin_m=.002),
+        source_evidence={}, tool_entity_by_side={"right": entity}, **kwargs)
+
+
+@pytest.fixture
+def entity_session():
+    planner = Planner()
+    query = _entity_query(planner)
+    yield query, planner
+    query.close()
+
+
+HOVER = dict(side="right", target_reference="top-a",
+             tip_offset_bounds_xy_m=[[-.02, .02], [-.02, .02]], clearance_bounds_m=[.03, .06])
+
+
+def test_entity_hover_targets_the_gripper_box_and_checks_achieved_fk(entity_session):
+    query, planner = entity_session
+    result = query.plan_entity_hover_region(**HOVER)
+    assert result["status"] == "path_found" and result["selected_candidate_index"] == 0
+    assert result["semantics"] == "agenticrobot.relation.tool_entity_hover.v1"
+    assert result["selected_clearance_m"] == pytest.approx(.05)
+    np.testing.assert_allclose(result["selected_tip_offset_xy_m"], [0., 0.], atol=1e-12)
+    assert not {"tool_entity", "clearance_bounds_m", "tip_offset_bounds_xy_m"} & set(result)
+    # Support is the object top plus the voxel margin; the fingertip face hangs 6 cm below TCP.
+    np.testing.assert_allclose(planner.target[:3, 3], [.1, .2, .052 + .05 + .06], atol=1e-9)
+    np.testing.assert_allclose(planner.target[:3, 2], [0., 0., -1.], atol=1e-9)
+    region = query.audit()["region_queries"][0]
+    assert region["tool_entity"]["source"] == {"test": "box"}
+    assert region["clearance_bounds_m"] == [.03, .06]
+    validation = region["candidate_validations"][0]
+    assert validation["inside_requested_region"] is True
+    assert validation["achieved_clearance_m"] == pytest.approx(.05)
+    row = query.audit()["queries"][0]
+    assert row["relation"]["entity_hover"]["support_height_m"] == pytest.approx(.052)
+    assert len(row["planned_endpoint_pose_xyz_quat_xyzw"]) == 7
+    assert all(not call["require_grasp_approach"] for call in planner.calls)
+    assert query.audit()["qpos_by_side"] == {s: [0.] * 6 for s in ("left", "right")}
+
+
+class SinkingPlanner(Planner):
+    """Arrives 3 cm lower than requested: inside TCP tolerance, outside the hover."""
+
+    def tool_tcp_poses_for_qpos_pair(self, **kwargs):
+        actual = self.target.copy()
+        actual[2, 3] -= .03
+        return {s: actual for s in ("left", "right")}
+
+
+def test_entity_hover_rejects_achieved_pose_outside_requested_clearance():
+    planner = SinkingPlanner()
+    query = _entity_query(planner)
+    result = query.plan_entity_hover_region(**HOVER)
+    assert result["status"] == "path_rejected" and result["reason"] == "region_no_candidate_path"
+    assert len(planner.calls) == result["attempted_candidate_count"] == 8
+    validations = query.audit()["region_queries"][0]["candidate_validations"]
+    assert len(validations) == 8 and not any(v["inside_requested_region"] for v in validations)
+    assert all(v["achieved_clearance_m"] < .03 for v in validations)
+    query.close()
+
+
+def test_entity_hover_requires_entity_policy_reference_and_bounds(entity_session, session):
+    query, planner = entity_session
+    with pytest.raises(ValueError, match="tool entity"):
+        query.plan_entity_hover_region(**{**HOVER, "side": "left"})
+    with pytest.raises(ValueError, match="orientation"):
+        query.plan_entity_hover_region(**HOVER, orientation_policy="free")
+    with pytest.raises(ValueError):
+        query.plan_entity_hover_region(**{**HOVER, "target_reference": "point-a"})
+    with pytest.raises(ValueError):
+        query.plan_entity_hover_region(**{**HOVER, "clearance_bounds_m": [.06, .03]})
+    assert not planner.calls
+    plain, plain_planner = session
+    with pytest.raises(ValueError, match="tool entity"):
+        plain.plan_entity_hover_region(**{**HOVER, "target_reference": "point-a"})
+    assert not plain_planner.calls
+
+
+def test_entity_hover_shares_the_session_query_budget():
+    planner = Planner()
+    query = _entity_query(planner, query_budget={"maximum_calls": 2, "maximum_planning_sec": 20.})
+    planner.error = RM65GraspTrajectoryPlanningError("ik_search_exhausted", details={})
+    query.plan_pose(side="right", pose_xyz_quat_xyzw=[.1, .2, .3, 1., 0., 0., 0.])
+    result = query.plan_entity_hover_region(**HOVER)
+    assert len(planner.calls) == 2
+    assert result["status"] == "query_incomplete" and result["reason"] == "query_budget_exhausted"
+    query.close()
+
+
+def test_entity_hover_tool_axis_down_turns_a_horizontal_tool():
+    from scipy.spatial.transform import Rotation
+    planner = Planner()
+    query = _entity_query(planner)
+    horizontal = Rotation.from_euler("y", 90, degrees=True).as_quat().tolist()
+    query._tcp["right"] = (.1, .2, .5, *horizontal)
+    result = query.plan_entity_hover_region(**HOVER, orientation_policy="tool_axis_down")
+    assert result["status"] == "path_found" and result["orientation_policy"] == "tool_axis_down"
+    np.testing.assert_allclose(planner.target[:3, 2], [0., 0., -1.], atol=1e-9)
+    query.close()

@@ -140,3 +140,42 @@ for IK error without changing the requested region: final FK is still checked
 against the original intervals. Candidate count and planning budgets do not
 increase. This is an offline selection policy, not a new Agent tool or a change
 to production MuJoCo/RealMan defaults.
+
+## Tool-entity hover queries
+
+A TCP offset above a surface point does not say where the gripper is. In the
+saved RealMan poses the reviewed gripper box hangs 41–90 mm below the TCP and
+its fingertip face centre lies 7–10 cm away from the TCP, so part of a TCP
+region such as Z [0.08, 0.16] m can put the gripper into the target itself.
+
+`plan_entity_hover_region(side, target_reference, tip_offset_bounds_xy_m,
+clearance_bounds_m, orientation_policy="preserve", max_candidates=8)` uses
+semantics `agenticrobot.relation.tool_entity_hover.v1` and places the gripper
+box instead of the TCP:
+
+- The entity is the simple gripper box used by grasp screening: the DMTAC
+  GraspGenX alignment v5 palm and finger solids, including the fingertip
+  collision extension, enveloped at the maximum opening (opening is ignored).
+  It is bound only for an arm whose tool TCP equals the reviewed 140 mm TCP;
+  otherwise the query is rejected for that arm.
+- `tip_offset_bounds_xy_m` bounds the horizontal offset, in reference axes, of
+  the centre of the box's approach-side (fingertip) face from the anchor.
+- `clearance_bounds_m` bounds the vertical gap between the box's lowest point
+  and the support height: the highest observed voxel inside the box's
+  horizontal footprint and at most 0.30 m above the anchor (never below the
+  anchor itself), plus the cloud's voxel quantization margin. Higher points in
+  the footprint are reported as overhead, not as support. Unobserved space is
+  not assumed free; the planner still applies its own collision model.
+- `orientation_policy` is explicit: `preserve` keeps the measured TCP
+  orientation; `tool_axis_down` turns the TCP approach axis onto reference -Z
+  with the least rotation.
+
+Proposals are ordered nearest to the current gripper state, centre, face
+centres, then Halton fill, inset by the arrival tolerance. They run through
+the same budgeted region loop as `plan_relation_region` (20 s, 3 s per
+candidate, optional session budget) and the same planner. A found plan is
+accepted only if the achieved FK pose, re-measured with the same geometry,
+satisfies the ORIGINAL bounds. The audit keeps per-candidate support height,
+footprint and overhead counts, and the entity identity. This is an offline
+query semantic, not a published Gateway Skill or a change to the existing TCP
+relation and region semantics.

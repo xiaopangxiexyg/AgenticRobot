@@ -30,6 +30,10 @@ from robot_motion.pose import pose_delta_metrics
 from robot_motion.relative_action import pose_matrix_to_xyzquat, xyzquat_to_pose_matrix
 from robot_motion.spatial_goals import compute_spatial_goal, finite_vector
 from robot_motion.spatial_goal_regions import generate_relation_region_goals, generate_proximity_region_goals
+from robot_motion.tool_entity_goals import (
+    HOVER_ORIENTATION_POLICIES, TOOL_ENTITY_HOVER_SEMANTICS_V1, ToolEntityBox,
+    entity_hover_metrics, generate_entity_hover_goals,
+)
 from scripts.probes.inspect_safe_move_snapshot import (
     RM65CapturedRobotObservationFilterConfig, backproject, load_captures, resolve_inputs,
 )
@@ -38,6 +42,55 @@ from teleop_runtime.skill_deploy.rm65_grasp_trajectory import (
     RM65GraspTrajectoryPlanningError,
 )
 from teleop_runtime.skill_deploy.rm65_lower_assembly import bind_exclusive_rm65_skill_target_safety
+from scipy.spatial.transform import Rotation
+
+# Height above the anchor below which observed points count as support under a
+# hovering tool footprint; higher points are reported as overhead obstacles.
+ENTITY_HOVER_SUPPORT_WINDOW_M = 0.30
+
+
+def default_tool_entity_by_side(tool_tcp_pose_flange_m_rad_by_side):
+    """Bind the reviewed grasp-screening gripper box where the TCP matches it.
+
+    The DMTAC GraspGenX alignment v5 solid frame is defined relative to the
+    reviewed 140 mm tool TCP. Any other TCP leaves that arm without an entity;
+    entity queries then fail instead of reinterpreting the box.
+    """
+    from deployments.perception.dmtac_grasp_overlay import (
+        DMTAC_M_REVIEWED_TOOL_TCP_POSE_FLANGE_M_RAD, dmtac_graspgenx_alignment_profile,
+    )
+    alignment = dmtac_graspgenx_alignment_profile()
+    geometry = alignment.collision_geometry(maximum_opening_m=alignment.nominal_geometry.maximum_opening_m)
+    source = {"geometry": "graspgenx_screening_solids_maximum_opening_envelope",
+              "alignment_profile_id": alignment.profile_id,
+              "alignment_source_sha256": alignment.source_content_hash,
+              "collision_tip_extension_m": alignment.collision_tip_extension_m,
+              "tool_tcp_pose_flange_m_rad": list(DMTAC_M_REVIEWED_TOOL_TCP_POSE_FLANGE_M_RAD),
+              "opening_policy": "maximum_opening_envelope_v1"}
+    result = {}
+    for side, tcp in tool_tcp_pose_flange_m_rad_by_side.items():
+        if np.allclose(np.asarray(tcp, dtype=float), DMTAC_M_REVIEWED_TOOL_TCP_POSE_FLANGE_M_RAD,
+                       atol=1e-9, rtol=0.):
+            result[side] = ToolEntityBox.from_parallel_jaw_geometry(geometry, source={**source, "side": side})
+    return result
+
+
+class _RegionProposal:
+    """One candidate pose with its audit relation and selection fields."""
+
+    __slots__ = ("pose", "relation", "selection")
+
+    def __init__(self, *, pose, relation, selection):
+        self.pose, self.relation, self.selection = np.asarray(pose, dtype=float), relation, selection
+
+
+def _pose_matrix(pose_xyz_quat_xyzw):
+    """Full-precision pose matrix (the shared encoder rounds to float32)."""
+    pose = np.asarray(pose_xyz_quat_xyzw, dtype=float)
+    transform = np.eye(4)
+    transform[:3, :3] = Rotation.from_quat(pose[3:]).as_matrix()
+    transform[:3, 3] = pose[:3]
+    return transform
 
 
 def file_sha256(path: Path) -> str:
@@ -177,9 +230,14 @@ class SavedSceneSkillQuery:
 
     def __init__(self, *, scene_id, reference_frame_id, qpos_by_side,
                  tcp_pose_by_side, anchors, planner, cloud, source_evidence,
-                 query_budget=None, region_candidate_policy="proximity", clock=time.monotonic):
+                 query_budget=None, region_candidate_policy="proximity", clock=time.monotonic,
+                 tool_entity_by_side=None):
         self._scene_id = str(scene_id)
         self._frame = reference_frame_id
+        self._tool_entities = dict(tool_entity_by_side or {})
+        if (not set(self._tool_entities) <= {"left", "right"}
+                or not all(isinstance(e, ToolEntityBox) for e in self._tool_entities.values())):
+            raise ValueError("Tool entities must be ToolEntityBox values keyed by arm.")
         self._qpos = {side: finite_vector(list(qpos_by_side[side]), 6, name=side).copy()
                       for side in ("left", "right")}
         self._tcp = {side: tuple(finite_vector(list(tcp_pose_by_side[side]), 7, name=side))
@@ -294,6 +352,7 @@ class SavedSceneSkillQuery:
         planner = RM65GraspJointTrajectoryPlanner(profile=profile,
             planning_target_builder=builder, target_envelope_filter=builder.pre_ik_target_safety_filter,
             config=plan_config)
+        tool_entities = default_tool_entity_by_side(profile.tool_tcp_pose_flange_m_rad_by_side)
         return cls(scene_id=scene_id, reference_frame_id=profile.station_world_frame_id,
             qpos_by_side=qpos, tcp_pose_by_side=poses, anchors=anchors, planner=planner, cloud=cloud,
             source_evidence={"fixed_files": dict(manifest["fixed_files"]),
@@ -303,9 +362,11 @@ class SavedSceneSkillQuery:
                     "inherited_start_clearance": enable_inherited_start_clearance,
                     "ordinary_clearance_m": plan_config.minimum_clearance_m},
                 "observed_voxel_count": len(cloud.points_m),
-                "enable_inherited_start_clearance": enable_inherited_start_clearance},
+                "enable_inherited_start_clearance": enable_inherited_start_clearance,
+                "tool_entities": {side: entity.identity() for side, entity in tool_entities.items()}},
             query_budget=manifest.get("query_budget"),
-            region_candidate_policy=manifest.get("region_candidate_policy", "proximity"))
+            region_candidate_policy=manifest.get("region_candidate_policy", "proximity"),
+            tool_entity_by_side=tool_entities)
 
     def _require_open(self):
         if self._closed:
@@ -394,6 +455,9 @@ class SavedSceneSkillQuery:
                 trajectory_samples=len(trajectory.time_from_start_sec),
                 trajectory_duration_sec=float(trajectory.time_from_start_sec[-1]),
                 planned_endpoint_xyz_m=actual[:3, 3].tolist(),
+                planned_endpoint_pose_xyz_quat_xyzw=[
+                    *np.asarray(actual[:3, 3], dtype=float).tolist(),
+                    *Rotation.from_matrix(np.asarray(actual[:3, :3], dtype=float)).as_quat().tolist()],
                 final_translation_error_m=float(translation), final_rotation_error_deg=float(rotation))
             self._trajectories[query_id] = trajectory
         except RM65GraspTrajectoryPlanningError as error:
@@ -418,7 +482,8 @@ class SavedSceneSkillQuery:
     def _public_result(row):
         return {k: copy.deepcopy(v) for k, v in row.items()
                 if k not in {"target_pose_xyz_quat_xyzw", "relation", "failure_details",
-                             "trajectory_hash", "planner_evidence_refs", "planned_endpoint_xyz_m"}}
+                             "trajectory_hash", "planner_evidence_refs", "planned_endpoint_xyz_m",
+                             "planned_endpoint_pose_xyz_quat_xyzw"}}
 
     def plan_relation_region(self, *, side, target_reference, offset_bounds_xyz_m,
                              offset_frame="reference", max_candidates=8):
@@ -442,8 +507,131 @@ class SavedSceneSkillQuery:
         finally:
             self._lock.release()
 
+    def plan_entity_hover_region(self, *, side, target_reference, tip_offset_bounds_xy_m,
+                                 clearance_bounds_m, orientation_policy="preserve", max_candidates=8):
+        """Hover the reviewed gripper box above a saved surface reference.
+
+        Semantics ``agenticrobot.relation.tool_entity_hover.v1``: the centre of
+        the gripper box's approach-side face lies inside the explicit
+        horizontal offsets from the anchor, and the box's lowest point keeps a
+        vertical clearance inside ``clearance_bounds_m`` above the highest
+        observed point under its footprint (never below the anchor itself).
+        Orientation is the explicit ``orientation_policy``. Proposals reuse
+        the same budgeted region loop and the same lower planner; the achieved
+        FK pose is re-measured against the ORIGINAL bounds. Planning only.
+        """
+        self._require_open()
+        if side not in self._tcp or target_reference not in self._refs:
+            raise ValueError("Unknown arm or reference from another saved scene.")
+        if side not in self._tool_entities:
+            raise ValueError("No reviewed tool entity is bound for this arm.")
+        if orientation_policy not in HOVER_ORIENTATION_POLICIES:
+            raise ValueError("Unknown hover orientation policy.")
+        if not self._lock.acquire(blocking=False):
+            raise RuntimeError("A query is already running for this saved scene.")
+        try:
+            return self._plan_entity_hover_locked(side=side, target_reference=target_reference,
+                tip_offset_bounds_xy_m=tip_offset_bounds_xy_m, clearance_bounds_m=clearance_bounds_m,
+                orientation_policy=orientation_policy, max_candidates=max_candidates)
+        finally:
+            self._lock.release()
+
+    def _plan_entity_hover_locked(self, *, side, target_reference, tip_offset_bounds_xy_m,
+                                  clearance_bounds_m, orientation_policy, max_candidates):
+        anchor = np.asarray(self._refs[target_reference]["world_xyz_m"], dtype=float)
+        entity = self._tool_entities[side]
+        points = self._cloud.points_m
+        margin = float(self._cloud.quantization_margin_m)
+        window = ENTITY_HOVER_SUPPORT_WINDOW_M
+
+        def generate():
+            candidates = generate_entity_hover_goals(
+                current_tcp_pose_xyz_quat_xyzw=list(self._tcp[side]), anchor_xyz_m=anchor.tolist(),
+                tip_offset_bounds_xy_m=tip_offset_bounds_xy_m, clearance_bounds_m=clearance_bounds_m,
+                entity=entity, points_m=points, orientation_policy=orientation_policy,
+                max_candidates=max_candidates,
+                boundary_inset_m=RealAgentPrimitiveConvergenceProfile().translation_tolerance_m,
+                support_window_m=window, support_margin_m=margin)
+            return [_RegionProposal(pose=candidate.pose_xyz_quat_xyzw,
+                        relation={"entity_hover": {"tip_offset_xy_m": list(candidate.tip_offset_xy_m),
+                            "clearance_m": candidate.clearance_m,
+                            "support_height_m": candidate.metrics.support_height_m,
+                            "footprint_point_count": candidate.metrics.footprint_point_count,
+                            "overhead_point_count": candidate.metrics.overhead_point_count,
+                            "orientation_policy": orientation_policy}},
+                        selection={"selected_tip_offset_xy_m": list(candidate.tip_offset_xy_m),
+                                   "selected_clearance_m": candidate.clearance_m})
+                    for candidate in candidates]
+
+        def validate(row):
+            metrics = entity_hover_metrics(entity=entity,
+                world_from_tcp=_pose_matrix(row["planned_endpoint_pose_xyz_quat_xyzw"]),
+                anchor_xyz_m=anchor, points_m=points, support_window_m=window, support_margin_m=margin)
+            (x_low, x_high), (y_low, y_high) = tip_offset_bounds_xy_m
+            c_low, c_high = clearance_bounds_m
+            dx, dy = metrics.tip_offset_xy_m
+            within = (x_low - 1e-9 <= dx <= x_high + 1e-9 and y_low - 1e-9 <= dy <= y_high + 1e-9
+                      and c_low - 1e-9 <= metrics.clearance_m <= c_high + 1e-9)
+            return {"achieved_tip_offset_xy_m": [dx, dy], "achieved_clearance_m": metrics.clearance_m,
+                    "achieved_support_height_m": metrics.support_height_m,
+                    "achieved_footprint_point_count": metrics.footprint_point_count,
+                    "inside_requested_region": within}, within
+
+        return self._search_region_locked(side=side, target_reference=target_reference,
+            summary_fields={"semantics": TOOL_ENTITY_HOVER_SEMANTICS_V1,
+                "tip_offset_bounds_xy_m": copy.deepcopy(tip_offset_bounds_xy_m),
+                "clearance_bounds_m": copy.deepcopy(clearance_bounds_m),
+                "orientation_policy": orientation_policy, "candidate_policy": "entity_proximity",
+                "support_window_m": window, "support_margin_m": margin,
+                "tool_entity": entity.identity()},
+            hidden_fields=("tip_offset_bounds_xy_m", "clearance_bounds_m", "tool_entity"),
+            generate=generate, validate=validate)
+
     def _plan_relation_region_locked(self, *, side, target_reference, offset_bounds_xyz_m,
                                      offset_frame, max_candidates):
+        anchor = self._refs[target_reference]["world_xyz_m"]
+
+        def generate():
+            candidates = generate_relation_region_goals(
+                current_tcp_pose_xyz_quat_xyzw=list(self._tcp[side]),
+                anchor_xyz_m=anchor,
+                offset_bounds_xyz_m=offset_bounds_xyz_m, offset_frame=offset_frame,
+                orientation_mode="preserve", tool_axis=None, axis_reference_xyz=None,
+                tool_axis_rotation_bounds_rad=[0., 0.], max_candidates=max_candidates)
+            if self._region_candidate_policy == "proximity":
+                candidates = generate_proximity_region_goals(
+                    current_tcp_pose_xyz_quat_xyzw=list(self._tcp[side]),
+                    anchor_xyz_m=anchor,
+                    offset_bounds_xyz_m=offset_bounds_xyz_m, offset_frame=offset_frame,
+                    max_candidates=max_candidates,
+                    boundary_inset_m=RealAgentPrimitiveConvergenceProfile().translation_tolerance_m)
+            return [_RegionProposal(pose=candidate.goal.pose_xyz_quat_xyzw,
+                        relation={"offset_xyz_m": list(candidate.offset_xyz_m), "offset_frame": offset_frame},
+                        selection={"selected_offset_xyz_m": list(candidate.offset_xyz_m)})
+                    for candidate in candidates]
+
+        def validate(row):
+            actual_offset = np.asarray(row["planned_endpoint_xyz_m"]) - anchor
+            if offset_frame == "tool":
+                actual_offset = xyzquat_to_pose_matrix(self._tcp[side])[:3, :3].T @ actual_offset
+            within = all(lo - 1e-9 <= x <= hi + 1e-9
+                         for x, (lo, hi) in zip(actual_offset, offset_bounds_xyz_m))
+            return {"actual_offset_xyz_m": actual_offset.tolist(), "inside_requested_region": within}, within
+
+        return self._search_region_locked(side=side, target_reference=target_reference,
+            summary_fields={"offset_bounds_xyz_m": copy.deepcopy(offset_bounds_xyz_m),
+                            "offset_frame": offset_frame, "candidate_policy": self._region_candidate_policy},
+            hidden_fields=("offset_bounds_xyz_m",), generate=generate, validate=validate)
+
+    def _search_region_locked(self, *, side, target_reference, summary_fields, hidden_fields,
+                              generate, validate):
+        """Budgeted first-certified-path search shared by explicit region queries.
+
+        ``generate`` returns ordered proposals; it runs inside the charged
+        region budget. ``validate(row)`` checks a found plan's achieved FK
+        against the ORIGINAL request and returns ``(record, inside)``. Budget,
+        retry and revocation rules are identical for every query kind.
+        """
         summary = None
         public_result = None
         began = None
@@ -452,6 +640,13 @@ class SavedSceneSkillQuery:
         region_calls_start = self._planning_calls
         existing_trajectory_ids = set(self._trajectories)
         region_budget_start = self._planning_seconds
+        selection_keys = {"selected_candidate_index", "trajectory_duration_sec"}
+        hidden = {"attempt_query_ids", "selected_plan_query_id", "candidate_validations", *hidden_fields}
+
+        def drop_selection():
+            for key in selection_keys:
+                summary.pop(key, None)
+
         def fail_region(error):
             for trajectory_id in self._trajectories.keys() - existing_trajectory_ids:
                 self._trajectories.pop(trajectory_id, None)
@@ -460,15 +655,13 @@ class SavedSceneSkillQuery:
                     selected_plan_query_id=None,
                     attempted_candidate_count=self._planning_calls - region_calls_start,
                     attempt_query_ids=[row["query_id"] for row in self._queries[region_query_start:]])
-                for key in ("selected_candidate_index", "selected_offset_xyz_m", "trajectory_duration_sec"):
-                    summary.pop(key, None)
+                drop_selection()
         try:
             self._require_open()
             query_id = "region:" + self._scene_id[:16] + ":" + str(len(self._regions))
             began = self._clock()
             summary = {"query_id": query_id, "side": side, "target_reference": target_reference,
-                "offset_bounds_xyz_m": copy.deepcopy(offset_bounds_xyz_m), "offset_frame": offset_frame,
-                "candidate_policy": self._region_candidate_policy,
+                **summary_fields,
                 "candidate_count": 0, "attempted_candidate_count": 0,
                 "unresolved_candidate_count": 0,
                 "attempt_query_ids": [], "candidate_validations": [], "selected_plan_query_id": None,
@@ -488,8 +681,7 @@ class SavedSceneSkillQuery:
                 summary["unresolved_candidate_count"] += 1
                 summary.update(status="query_incomplete", reason="query_budget_exhausted",
                                selected_plan_query_id=None)
-                for key in ("selected_candidate_index", "selected_offset_xyz_m", "trajectory_duration_sec"):
-                    summary.pop(key, None)
+                drop_selection()
             def finalize_budget_result(now):
                 reject_expired_selection(now)
                 if (summary["status"] == "path_rejected" and summary["reason"] == "region_no_candidate_path"
@@ -498,19 +690,9 @@ class SavedSceneSkillQuery:
                                  and self._planning_seconds > self._query_budget["maximum_planning_sec"]))):
                     summary.update(status="query_incomplete", reason="region_candidate_search_incomplete")
             try:
-                candidates = generate_relation_region_goals(
-                    current_tcp_pose_xyz_quat_xyzw=list(self._tcp[side]),
-                    anchor_xyz_m=self._refs[target_reference]["world_xyz_m"],
-                    offset_bounds_xyz_m=offset_bounds_xyz_m, offset_frame=offset_frame,
-                    orientation_mode="preserve", tool_axis=None, axis_reference_xyz=None,
-                    tool_axis_rotation_bounds_rad=[0., 0.], max_candidates=max_candidates)
-                if self._region_candidate_policy == "proximity":
-                    candidates = generate_proximity_region_goals(
-                        current_tcp_pose_xyz_quat_xyzw=list(self._tcp[side]),
-                        anchor_xyz_m=self._refs[target_reference]["world_xyz_m"],
-                        offset_bounds_xyz_m=offset_bounds_xyz_m, offset_frame=offset_frame,
-                        max_candidates=max_candidates,
-                        boundary_inset_m=RealAgentPrimitiveConvergenceProfile().translation_tolerance_m)
+                candidates = generate()
+                for candidate in candidates:
+                    selection_keys.update(candidate.selection)
             finally:
                 generation_wall = self._clock() - began
                 self._planning_seconds = region_budget_start + generation_wall
@@ -538,19 +720,13 @@ class SavedSceneSkillQuery:
                 try:
                     call_remaining = max(0., remaining - (self._clock() - candidate_started))
                     result = self._plan_pose_locked(side=side,
-                        pose=np.asarray(candidate.goal.pose_xyz_quat_xyzw), time_budget_sec=call_remaining,
+                        pose=candidate.pose, time_budget_sec=call_remaining,
                         absolute_deadline=candidate_started + remaining,
                         relation={"region_query_id": query_id, "target_reference": target_reference,
-                                  "offset_xyz_m": list(candidate.offset_xyz_m), "offset_frame": offset_frame})
+                                  **candidate.relation})
                     if result["status"] == "path_found":
-                        actual_offset = (np.asarray(self._queries[-1]["planned_endpoint_xyz_m"])
-                                         - self._refs[target_reference]["world_xyz_m"])
-                        if offset_frame == "tool":
-                            actual_offset = xyzquat_to_pose_matrix(self._tcp[side])[:3, :3].T @ actual_offset
-                        within = all(lo - 1e-9 <= x <= hi + 1e-9
-                                     for x, (lo, hi) in zip(actual_offset, offset_bounds_xyz_m))
-                        summary["candidate_validations"].append({"query_id": result["query_id"],
-                            "actual_offset_xyz_m": actual_offset.tolist(), "inside_requested_region": within})
+                        record, within = validate(self._queries[-1])
+                        summary["candidate_validations"].append({"query_id": result["query_id"], **record})
                 except BaseException:
                     for new_query in self._queries[prior_query_count:]:
                         self._trajectories.pop(new_query["query_id"], None)
@@ -601,7 +777,7 @@ class SavedSceneSkillQuery:
                         continue
                     summary.update(status="path_found", reason="planned_not_executed",
                         selected_plan_query_id=result["query_id"], selected_candidate_index=index,
-                        selected_offset_xyz_m=list(candidate.offset_xyz_m),
+                        **candidate.selection,
                         trajectory_duration_sec=result["trajectory_duration_sec"])
                     self._trajectories[query_id] = self._trajectories[result["query_id"]]
                     break
@@ -620,7 +796,7 @@ class SavedSceneSkillQuery:
             self._planning_seconds = region_budget_start + summary["path_planning_wall_sec"]
             finalize_budget_result(finished)
             public_result = {key: copy.deepcopy(value) for key, value in summary.items()
-                    if key not in {"attempt_query_ids", "offset_bounds_xyz_m", "selected_plan_query_id", "candidate_validations"}}
+                    if key not in hidden}
             return public_result
         except BaseException as error:
             fail_region(error)
@@ -636,7 +812,7 @@ class SavedSceneSkillQuery:
                         if public_result is not None:
                             public_result.clear()
                             public_result.update({key: copy.deepcopy(value) for key, value in summary.items()
-                                if key not in {"attempt_query_ids", "offset_bounds_xyz_m", "selected_plan_query_id", "candidate_validations"}})
+                                if key not in hidden})
                     self._regions.append(summary)
             except BaseException as error:
                 fail_region(error)
