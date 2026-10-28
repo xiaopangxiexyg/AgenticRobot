@@ -203,7 +203,43 @@ def test_clearance_mode_rejects_nonboolean_before_loading_inputs(monkeypatch, va
         SavedSceneSkillQuery.from_manifest({}, enable_inherited_start_clearance=value)
 
 
-def test_factory_preserves_strict_default_and_binds_explicit_mode(input_manifest, capture_fixture, monkeypatch):
+@pytest.mark.parametrize("flags, expected", (
+    ((), True), (("--enable-inherited-start-clearance",), True), (("--strict-start-clearance",), False)))
+def test_cli_defaults_to_inherited_clearance_with_explicit_strict_opt_out(tmp_path, monkeypatch, flags, expected):
+    import sys
+    from scripts.probes import query_safe_move_snapshot as module
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text("{}")
+    seen = []
+
+    class Stop(Exception):
+        pass
+
+    def factory(cls, value, **kwargs):
+        seen.append((value, kwargs))
+        raise Stop
+    monkeypatch.setattr(module.SavedSceneSkillQuery, "from_manifest", classmethod(factory))
+    monkeypatch.setattr(sys, "argv", ["query", "--manifest", str(manifest), *flags])
+    with pytest.raises(Stop):
+        module.main()
+    assert seen == [({}, {"enable_inherited_start_clearance": expected})]
+
+
+def test_cli_rejects_conflicting_start_clearance_flags(tmp_path, monkeypatch):
+    import sys
+    from scripts.probes import query_safe_move_snapshot as module
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text("{}")
+    monkeypatch.setattr(module.SavedSceneSkillQuery, "from_manifest",
+                        classmethod(lambda *_a, **_k: pytest.fail("Conflicting flags reached the factory")))
+    monkeypatch.setattr(sys, "argv", ["query", "--manifest", str(manifest),
+                                      "--enable-inherited-start-clearance", "--strict-start-clearance"])
+    with pytest.raises(SystemExit) as raised:
+        module.main()
+    assert raised.value.code == 2
+
+
+def test_factory_defaults_to_inherited_clearance_and_binds_strict_opt_out(input_manifest, capture_fixture, monkeypatch):
     from pathlib import Path
     from scripts.probes import query_safe_move_snapshot as module
     capture, snapshot = capture_fixture
@@ -226,8 +262,8 @@ def test_factory_preserves_strict_default_and_binds_explicit_mode(input_manifest
         configs.append(kwargs["config"])
         return Planner()
     monkeypatch.setattr(module, "RM65GraspJointTrajectoryPlanner", create_planner)
-    for kwargs, enabled in (({}, False), ({"enable_inherited_start_clearance": False}, False),
-                            ({"enable_inherited_start_clearance": True}, True)):
+    for kwargs, enabled in (({}, True), ({"enable_inherited_start_clearance": True}, True),
+                            ({"enable_inherited_start_clearance": False}, False)):
         query = SavedSceneSkillQuery.from_manifest(input_manifest, **kwargs)
         audit = query.audit()
         identities.append(audit["scene_id"])
@@ -241,13 +277,15 @@ def test_factory_preserves_strict_default_and_binds_explicit_mode(input_manifest
         assert region["status"] == "path_found" and region["candidate_policy"] == "proximity"
         np.testing.assert_allclose(region["selected_offset_xyz_m"], [0., 0., .09])
         query.close()
+    # The strict opt-out keeps the identity of earlier strict-default queries.
     assert identities[0] == identities[1] and identities[2] != identities[0]
 
-    input_manifest["enable_inherited_start_clearance"] = True
+    # An input manifest still cannot select the planning policy either way.
+    input_manifest["enable_inherited_start_clearance"] = False
     query = SavedSceneSkillQuery.from_manifest(input_manifest)
-    assert query.audit()["source"]["planning_policy"]["inherited_start_clearance"] is False
+    assert query.audit()["source"]["planning_policy"]["inherited_start_clearance"] is True
     assert query.audit()["scene_id"] == identities[0]
-    assert configs[-1].enable_inherited_start_clearance is False
+    assert configs[-1].enable_inherited_start_clearance is True
     query.close()
     del input_manifest["enable_inherited_start_clearance"]
 

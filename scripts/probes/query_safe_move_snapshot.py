@@ -221,7 +221,10 @@ class SavedSceneSkillQuery:
         self._query_budget = None if query_budget is None else dict(query_budget)
 
     @classmethod
-    def from_manifest(cls, manifest, *, enable_inherited_start_clearance=False):
+    def from_manifest(cls, manifest, *, enable_inherited_start_clearance=True):
+        # The reviewed positive-start egress mode is this offline consumer's
+        # default (user decision 2026-10-29). Strict 20 mm start admission
+        # remains available with an explicit False; a manifest cannot choose.
         if type(enable_inherited_start_clearance) is not bool:
             raise ValueError("enable_inherited_start_clearance must be bool.")
         verify_inputs(manifest)
@@ -680,15 +683,21 @@ def main():
     parser.add_argument("--manifest", type=Path, required=True)
     parser.add_argument("--request", type=Path, help="JSON relation query; omit to inspect references")
     parser.add_argument("--audit-output", type=Path, help="New JSON file for full query evidence")
-    parser.add_argument("--enable-inherited-start-clearance", action="store_true",
-        help="Explicitly enable certified positive-start egress in offline plans; strict clearance is the default")
+    clearance = parser.add_mutually_exclusive_group()
+    clearance.add_argument("--enable-inherited-start-clearance", dest="inherited_start_clearance",
+        action="store_const", const=True,
+        help="Certified positive-start egress in offline plans (the default)")
+    clearance.add_argument("--strict-start-clearance", dest="inherited_start_clearance",
+        action="store_const", const=False,
+        help="Reject starts below the ordinary 20 mm clearance, as before 2026-10-29")
+    parser.set_defaults(inherited_start_clearance=True)
     args = parser.parse_args()
     if args.request is not None and args.audit_output is None:
         parser.error("--request requires --audit-output to preserve full planning evidence")
     if args.audit_output is not None and args.audit_output.exists():
         parser.error("--audit-output must not already exist")
     query = SavedSceneSkillQuery.from_manifest(json.loads(args.manifest.read_text()),
-        enable_inherited_start_clearance=args.enable_inherited_start_clearance)
+        enable_inherited_start_clearance=args.inherited_start_clearance)
     try:
         result = (query.read_scene() if args.request is None else
                   query.plan_relation(**json.loads(args.request.read_text())))

@@ -22,15 +22,18 @@ Each optional `anchors` entry contains `label`, `role`, `mask_path`,
 The saved mask must belong to that exact RGB-D frame. Labels describe model
 evidence; they are not operator-provided object truth. Existing default self
 filtering remains unchanged; expanded filtering requires an explicit config.
-The planner also keeps the original strict 20 mm start-clearance default.
-To inspect the separately reviewed positive-distance egress mode, explicitly
-pass `enable_inherited_start_clearance=True` to `from_manifest`, or add
-`--enable-inherited-start-clearance` to the CLI. The mode is included in the
-query identity and audit policy; omitting it and passing False are equivalent.
-The keyword does not come from an untrusted manifest or individual model query.
-The original source branch's implicit egress results remain historical evidence;
-they are not results for this integrated strict default. Neither mode executes
-a trajectory or changes the live Gateway's safety policy.
+The planner's ordinary obstacle clearance stays 20 mm. Since 2026-10-29 this
+offline query defaults to the separately reviewed positive-distance start
+egress mode: a measured start that is already closer than 20 mm but still at a
+strictly positive distance may only move away, without new near pairs or hard
+contact. Pass `enable_inherited_start_clearance=False` to `from_manifest`, or
+`--strict-start-clearance` to the CLI, to reproduce strict start admission.
+`--enable-inherited-start-clearance` remains accepted and selects the default.
+The selected mode is included in the query identity and audit policy; strict
+queries keep the identity they had under the former strict default. The keyword
+does not come from an untrusted manifest or an individual model query. Neither
+mode executes a trajectory or changes the live Gateway's safety policy; the
+RealMan Gateway still requires its own explicit option.
 Operator exports additionally require `source_record`: freeze the original
 record, observation ZIP and all its context files. The probe verifies the
 exported arrays/geometry against that original archive and binds calibration to
@@ -88,9 +91,10 @@ separate, freshly observed and authorized Gateway request.
 
 ## Explicit region queries
 
-Inherited positive-start clearance remains default-off. Select it explicitly
-with the `from_manifest` keyword or CLI flag described above; a manifest field
-cannot enable it. This consumer does not change production planner defaults.
+Inherited positive-start clearance is the default of this offline consumer;
+select strict start admission explicitly with the `from_manifest` keyword or
+CLI flag described above. A manifest field cannot change it. This consumer does
+not change production planner or Gateway defaults.
 
 `plan_relation_region(side, target_reference, offset_bounds_xyz_m,
 offset_frame="reference", max_candidates=8)` uses the shared deterministic
