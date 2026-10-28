@@ -177,12 +177,32 @@ def test_cli_gripper_authorization_requires_explicit_config_before_hardware():
 def test_inherited_start_clearance_requires_explicit_observed_scene_before_devices(monkeypatch):
     argv = _argv(confirmation=REAL_AGENT_PRIMITIVE_SESSION_CONFIRM_TOKEN)
     parser = gateway_cli.build_parser()
-    assert parser.parse_args(argv).enable_inherited_start_clearance is False
+    assert parser.parse_args(argv).enable_inherited_start_clearance is None
     assert parser.parse_args([*argv, "--enable-inherited-start-clearance"]).enable_inherited_start_clearance is True
     monkeypatch.setattr(gateway_cli, "resolve_exclusive_rm65_skill_deployment_profile",
         lambda *_: pytest.fail("Incomplete explicit clearance mode reached device profile resolution"))
     with pytest.raises(SystemExit) as caught:
         gateway_cli.main([*argv, "--enable-inherited-start-clearance"])
+    assert caught.value.code == 2
+
+
+@pytest.mark.parametrize("extra, expected", (
+    ((), False),  # no observed scene: strict static start admission, manifest unchanged
+    (("--safe-motion-observation-roles", "main"), True),
+    (("--safe-motion-observation-roles", "main", "--enable-inherited-start-clearance"), True),
+    (("--safe-motion-observation-roles", "main", "--strict-start-clearance"), False),
+    (("--strict-start-clearance",), False),
+))
+def test_inherited_start_clearance_is_the_observed_scene_default_with_strict_opt_out(extra, expected):
+    parser = gateway_cli.build_parser()
+    args = parser.parse_args([*_argv(confirmation=REAL_AGENT_PRIMITIVE_SESSION_CONFIRM_TOKEN), *extra])
+    assert gateway_cli._effective_inherited_start_clearance(args) is expected
+
+
+def test_start_clearance_flags_are_mutually_exclusive():
+    with pytest.raises(SystemExit) as caught:
+        gateway_cli.build_parser().parse_args([*_argv(confirmation=REAL_AGENT_PRIMITIVE_SESSION_CONFIRM_TOKEN),
+            "--enable-inherited-start-clearance", "--strict-start-clearance"])
     assert caught.value.code == 2
 
 

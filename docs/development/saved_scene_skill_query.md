@@ -33,7 +33,8 @@ The selected mode is included in the query identity and audit policy; strict
 queries keep the identity they had under the former strict default. The keyword
 does not come from an untrusted manifest or an individual model query. Neither
 mode executes a trajectory or changes the live Gateway's safety policy; the
-RealMan Gateway still requires its own explicit option.
+RealMan Gateway applies the same default to observed safe moves through its
+own CLI (`--strict-start-clearance` opts out there as well).
 Operator exports additionally require `source_record`: freeze the original
 record, observation ZIP and all its context files. The probe verifies the
 exported arrays/geometry against that original archive and binds calibration to

@@ -48,14 +48,17 @@ Real profile 保留激活时实测 TCP 朝向，固定 profile 速度为 `0.2`�
 过期或未来引用均拒绝。规划结束、lower activation 前再次检查保留身份与年龄，失败进入原 HOLD。
 每次移动的碰撞观测仍由 safe planner 重新采集、校验 TTL、静止性和几何，不复用保存点作为障碍场景。
 
-## 可选的正距离起点退出
+## 正距离起点退出（观测场景默认）
 
-RealMan 继续默认拒绝不足原 20 mm 净空的起点。部署者可显式选择
-`--enable-inherited-start-clearance`，同时配置 `--safe-motion-observation-roles`；
-直接调用原 RM65 规划器时使用
+自 2026-10-29 起（用户决定：起点尽量不受自体观测残留干扰），RealMan 只要配置了
+`--safe-motion-observation-roles`，普通 observed safe 移动默认启用正距离起点退出；
+需要原 20 mm 严格起点准入时显式传 `--strict-start-clearance`。`--enable-inherited-start-clearance`
+仍可显式使用，但没有观测场景时照旧在设备前拒绝。没有观测云时该模式本就不存在，起点准入与
+manifest 身份不变。直接调用原 RM65 规划器时数据类默认仍为严格，需要
 `RM65GraspTrajectoryPlanningConfig(enable_inherited_start_clearance=True)`。
 该选项只适用于含实测障碍云的普通 safe TCP 移动，不作用于抓姿接触链或无观测云的规划。
-它进入执行 manifest 身份，旧 manifest/grant 不能直接复用；默认关闭时身份保持原值。
+它进入执行 manifest 身份：含观测场景的默认部署身份因此改变，旧 manifest/grant 不能直接复用；
+`--strict-start-clearance` 部署保持原严格身份。
 
 仅本次实测起点已有且严格正距离的近邻对继承原距离下界；硬接触、穿透和新出现的近邻仍拒绝。
 非运动臂必须保持固定，运动侧近邻须沿最终稠密执行采样不退化、最终进入原净空，并禁止重新进入。
