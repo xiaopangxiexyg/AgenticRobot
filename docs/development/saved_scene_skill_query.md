@@ -115,7 +115,14 @@ For fair atomic-versus-composed experiments, the application may set manifest
 `query_budget` to `{"maximum_calls": 8, "maximum_planning_sec": 20.0,
 "maximum_call_planning_sec": 3.0}`.
 This same budget covers atomic and region calls over the session, including
-final FK and validation. Model wait time is not charged as native planning.
+candidate generation, final FK, validation and time spent between candidates.
+The candidate deadline is rechecked before starting the lower planner; a
+native call already in progress cannot be preempted. If a fatal native fault
+arrives after its budget, the result remains incomplete and reports its
+`terminal_fault_reason` without trying another candidate. Over-budget or
+exceptional candidates cannot be exported. A completed point plan whose FK is
+outside the requested region remains available only as a point-query diagnostic.
+Model wait time is not charged.
 Omitting it preserves the previous independent atomic-query behavior. Close
 cannot race a region search. No region result is an executable motion grant.
 

@@ -93,10 +93,11 @@ fixed historical values rather than silently reinterpreting the fit against
 the current files.
 
 当前区域查询与端点路径质量下界使用独立绑定
-`artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261028_skill_region_v1.json`。
-继承168项输入，更新两个已有规划源码，并将已有路径质量模块纳入绑定，合计169项输入／
-165项Python源码；离线查询入口另作源码证据，固定于 `6b3a21148f90`。
-源码及消费者离线检查795项、相同源树的查询检查231项分别记录，完整组合验收另行执行。
+`artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261028_skill_region_checked_v2.json`。
+继承168项输入，更新两个已有规划源码，并绑定路径质量模块和起点检查采样器，合计170项
+输入／166项Python源码；离线查询入口另作源码证据，固定于 `b3b03e8a6212`。
+源码及消费者离线检查805项、相同源树的查询检查252项分别记录，完整组合验收另行执行。
+早期 `skill_region_v1` 候选仍作为未完成完整验收的历史证据保留，不作为当前绑定。
 离线区域查询默认 proximity、可显式选择 halton；严格20mm起点净空保持默认。
 来源12场景对照显式启用了正距离起点退出，不能推断严格默认下的通过率；没有新增真机
 标定、运动或held-out资格，既有fit、timing及所有历史绑定保持。
