@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
@@ -43,6 +45,7 @@ class GripperContactTuning:
     mimic_solimp: tuple[float, float, float, float, float] | None = None
     solver_cone: str | None = None
     solver_impratio: float | None = None
+    object_contact_geom_names: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if any(isinstance(pair, (str, bytes)) for pair in self.geom_pairs):
@@ -53,6 +56,15 @@ class GripperContactTuning:
         if len({tuple(sorted(pair)) for pair in pairs}) != len(pairs):
             raise ValueError("Contact geom pairs must be unique.")
         object.__setattr__(self, "geom_pairs", pairs)
+        if isinstance(self.object_contact_geom_names, (str, bytes)):
+            raise ValueError("Object contact geom names must be explicit non-empty names.")
+        object_geoms = tuple(self.object_contact_geom_names)
+        if any(not isinstance(name, str) or not name.strip() or name != name.strip()
+               for name in object_geoms):
+            raise ValueError("Object contact geom names must be explicit non-empty names.")
+        if len(set(object_geoms)) != len(object_geoms):
+            raise ValueError("Object contact geom names must be unique.")
+        object.__setattr__(self, "object_contact_geom_names", tuple(sorted(object_geoms)))
         for name, length in (("mimic_solref", 2), ("mimic_solimp", 5)):
             value = getattr(self, name)
             if value is not None:
@@ -119,11 +131,24 @@ class GripperContactTuning:
                 name: list(values)
                 for name, values in self.post_settle_geom_friction_by_name.items()
             }
+        if self.object_contact_geom_names:
+            metadata["object_contact_geom_names"] = list(self.object_contact_geom_names)
         for name in ("geom_pairs", "mimic_solref", "mimic_solimp", "solver_cone", "solver_impratio"):
             value = getattr(self, name)
             if value is not None and value != ():
                 metadata[name] = value
         return metadata
+
+
+_OBJECT_CONTACT_PAIR_PREFIX = "agenticrobot_object_contact_v1_"
+
+
+def _object_contact_pair_name(first: str, second: str, tuning: GripperContactTuning) -> str:
+    """Bind the compiled pair to the adapter's explicit/default semantics."""
+    payload = {"geoms": sorted((first, second)), "friction": tuning.friction,
+               "solref": tuning.solref, "solimp": tuning.solimp}
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
+    return _OBJECT_CONTACT_PAIR_PREFIX + hashlib.sha256(encoded).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -590,6 +615,72 @@ def cad_dmtac_cube_contact_gripper_profile(*, sliding_friction: float = 1.2) -> 
             "actuator force limits unchanged. Not a real material calibration."))
 
 
+def dmtac_gripper_profile_with_object_contacts(
+    profile: GripperActuationProfile,
+    object_collision_geom_names: Sequence[str],
+    *,
+    replaced_object_collision_geom_names: Sequence[str] = ("debug_cube_collision",),
+) -> GripperActuationProfile:
+    """Return a simulation profile with explicit named object-to-pad contacts.
+
+    Preserve all unrelated contact pairs and existing physical parameters.
+    Actual object and sensor identities remain owned by the scene/guard.
+    """
+    def names(values: Sequence[str], label: str, *, allow_empty: bool) -> tuple[str, ...]:
+        if isinstance(values, (str, bytes)):
+            raise ValueError(f"{label} must be a sequence of geometry names.")
+        raw = tuple(values)
+        if any(not isinstance(value, str) for value in raw):
+            raise ValueError(f"{label} must be a sequence of geometry names.")
+        result = tuple(value.strip() for value in raw)
+        if (not allow_empty and not result) or any(not value for value in result):
+            raise ValueError(f"{label} must contain non-empty geometry names.")
+        if len(result) != len(set(result)):
+            raise ValueError(f"{label} must contain unique geometry names.")
+        return result
+
+    object_names = names(object_collision_geom_names, "Object geoms", allow_empty=False)
+    replaced_names = set(names(replaced_object_collision_geom_names, "Replaced object geoms", allow_empty=True))
+    if set(profile.side_by_gripper.values()) != {"left", "right"}:
+        raise ValueError("DMTAC object contacts require one configured gripper per side.")
+    stale_friction = replaced_names.intersection(profile.contact_tuning.post_settle_geom_friction_by_name)
+    stale_friction.difference_update(object_names)
+    if stale_friction:
+        raise ValueError(f"Cannot rebind object contacts with stale post-settle friction: {sorted(stale_friction)}")
+    sensors = tuple(f"{side}_gripper_{finger}_dm_tac_w2m_sensor_collision_0"
+                    for side in ("left", "right") for finger in ("l", "r"))
+    sensor_names = set(sensors)
+    preserved_pairs = tuple(
+        pair for pair in profile.contact_tuning.geom_pairs
+        if not ((pair[0] in replaced_names and pair[1] in sensor_names)
+                or (pair[1] in replaced_names and pair[0] in sensor_names))
+    )
+    existing = {tuple(sorted(pair)) for pair in preserved_pairs}
+    pairs = tuple((object_name, sensor) for object_name in sorted(object_names) for sensor in sensors
+                  if tuple(sorted((object_name, sensor))) not in existing)
+    retained_bound = {name for name in profile.contact_tuning.object_contact_geom_names
+                      if any(name in pair and bool(sensor_names.intersection(pair)) for pair in preserved_pairs)}
+    bound_names = tuple(sorted(set(object_names) | retained_bound))
+    contact_tuning = replace(profile.contact_tuning, geom_pairs=preserved_pairs + pairs,
+                             object_contact_geom_names=bound_names)
+    identity = profile.to_metadata()
+    identity.update(
+        open_qpos_by_gripper={name: list(values) for name, values in profile.open_qpos_by_gripper.items()},
+        closed_qpos_by_gripper={name: list(values) for name, values in profile.closed_qpos_by_gripper.items()},
+        master_joint_by_gripper=dict(profile.master_joint_by_gripper),
+        actuator_prefix=profile.actuator_prefix,
+    )
+    tuning_identity = contact_tuning.to_metadata()
+    tuning_identity["geom_pairs"] = sorted(tuple(sorted(pair)) for pair in contact_tuning.geom_pairs)
+    identity["contact_tuning"] = tuning_identity
+    digest = hashlib.sha256(json.dumps(identity, sort_keys=True, separators=(",", ":"),
+                                       ensure_ascii=False, allow_nan=False).encode("utf-8")).hexdigest()[:12]
+    return replace(profile, name=f"{profile.name}.objects_{digest}", contact_tuning=contact_tuning,
+        evidence=(f"{profile.evidence} Explicit target-object contact pairs were rebound "
+                  f"for {len(object_names)} collision geometry/geometries; force, friction, "
+                  "stroke and solver settings are unchanged."))
+
+
 def temporary_bimanual_dmtac_gripper_profile() -> GripperActuationProfile:
     """Compatibility alias for the current identified bimanual V1 profile."""
 
@@ -650,6 +741,7 @@ __all__ = [
     "cad_bimanual_dmtac_gripper_profile",
     "cad_dmtac_cube_contact_gripper_profile",
     "cube_lift_contact_dmtac_gripper_profile",
+    "dmtac_gripper_profile_with_object_contacts",
     "identified_bimanual_dmtac_gripper_profile",
     "point_grasp_cad_bimanual_dmtac_gripper_profile",
     "strong_cad_bimanual_dmtac_gripper_profile",

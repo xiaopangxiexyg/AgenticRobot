@@ -5,12 +5,64 @@ from __future__ import annotations
 import math
 import xml.etree.ElementTree as ET
 
-from ..actuation.gripper_profile import GripperActuationProfile
+from ..actuation.gripper_profile import GripperActuationProfile, _object_contact_pair_name
+from .collision import CollisionFilter, GRIPPER_GROUP, OBJECT_GROUP
 
 
 def _find_or_add(root: ET.Element, tag: str) -> ET.Element:
     element = root.find(tag)
     return element if element is not None else ET.SubElement(root, tag)
+
+
+def _validate_object_contact_bindings(mujoco_root, profile, joints, geoms) -> None:
+    """Bind adapter-generated pairs to native free objects and their own pads."""
+    names = profile.contact_tuning.object_contact_geom_names
+    if not names:
+        return
+    worldbody = mujoco_root.find("worldbody")
+    if worldbody is None:
+        raise ValueError("Object contact binding requires a worldbody.")
+    parents = {child: parent for parent in mujoco_root.iter() for child in parent}
+    filters = CollisionFilter()
+    object_bit = str(filters.masks_for_group(OBJECT_GROUP)[0])
+    gripper_bit = str(filters.masks_for_group(GRIPPER_GROUP)[0])
+    for name in names:
+        geom = geoms.get(name)
+        if geom is None:
+            raise KeyError(f"Contact profile references unknown geom pair containing {name!r}.")
+        if geom.get("contype") == "0" and geom.get("conaffinity") == "0":
+            raise ValueError("Explicit contact pairs cannot select visual-only geoms.")
+        body = parents.get(geom)
+        if (geom.get("contype") != object_bit or body is None or body.tag != "body"
+                or parents.get(body) is not worldbody
+                or (body.find("freejoint") is None
+                    and not any(joint.get("type") == "free" for joint in body.findall("joint")))):
+            raise ValueError(f"Object contact target {name!r} must be a free-body object collision geom.")
+    pairs = {tuple(sorted(pair)) for pair in profile.contact_tuning.geom_pairs}
+    for gripper, side in profile.side_by_gripper.items():
+        master_name = profile.master_joint_by_gripper[gripper]
+        master = joints.get(master_name)
+        if master is None:
+            raise KeyError(f"Gripper profile references unknown master joint {master_name!r}.")
+        master_body = parents.get(master)
+        palm = parents.get(master_body) if master_body is not None else None
+        if palm is None or palm.tag != "body":
+            raise ValueError(f"Gripper {gripper!r} has no owning palm body.")
+        for finger in ("l", "r"):
+            sensor_name = f"{side}_gripper_{finger}_dm_tac_w2m_sensor_collision_0"
+            sensor = geoms.get(sensor_name)
+            if sensor is None:
+                raise KeyError(f"Contact profile references unknown geom pair containing {sensor_name!r}.")
+            sensor_body = parents.get(sensor)
+            expected_body = f"{side}_gripper_{finger}_dm_tac_w2m_sensor"
+            if sensor_body is None or sensor_body.tag != "body" or sensor_body.get("name") != expected_body:
+                raise ValueError(f"Contact sensor {sensor_name!r} must belong to the configured gripper sensor body.")
+            while sensor_body is not None and sensor_body is not palm:
+                sensor_body = parents.get(sensor_body)
+            if sensor.get("contype") != gripper_bit or sensor_body is not palm:
+                raise ValueError(f"Contact sensor {sensor_name!r} must belong to the configured gripper.")
+            if any(tuple(sorted((name, sensor_name))) not in pairs for name in names):
+                raise ValueError("Object contact binding requires every configured pad pair.")
 
 
 def add_gripper_position_actuators(
@@ -34,6 +86,7 @@ def add_gripper_position_actuators(
         for element in mujoco_root.iter("geom")
         if element.attrib.get("name")
     }
+    _validate_object_contact_bindings(mujoco_root, profile, joints, geoms)
     equality = _find_or_add(mujoco_root, "equality")
     actuator = _find_or_add(mujoco_root, "actuator")
     for gripper_name, joint_names in profile.joint_names_by_gripper.items():
@@ -126,6 +179,11 @@ def add_gripper_position_actuators(
                for name in (first, second)):
             raise ValueError("Explicit contact pairs cannot select visual-only geoms.")
         attributes = {"geom1": first, "geom2": second}
+        sensors = {f"{side}_gripper_{finger}_dm_tac_w2m_sensor_collision_0"
+                   for side in ("left", "right") for finger in ("l", "r")}
+        if (first in tuning.object_contact_geom_names and second in sensors
+                or second in tuning.object_contact_geom_names and first in sensors):
+            attributes["name"] = _object_contact_pair_name(first, second, tuning)
         for name in ("solref", "solimp"):
             if getattr(tuning, name) is not None:
                 attributes[name] = " ".join(map(str, getattr(tuning, name)))

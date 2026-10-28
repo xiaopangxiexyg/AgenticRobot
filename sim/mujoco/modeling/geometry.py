@@ -60,6 +60,17 @@ class MeshAssetRegistry:
         ET.SubElement(self.asset, "mesh", attributes)
         return name
 
+    def visual_mesh_name(self, path: str | Path) -> str:
+        """Register a visual-only object mesh without making it a collider."""
+        mesh_path = Path(path).expanduser().resolve()
+        if not mesh_path.is_file():
+            raise FileNotFoundError(f"Object visual mesh not found: {mesh_path}")
+        if mesh_path.suffix.lower() not in {".obj", ".stl"}:
+            raise ValueError("Object visual meshes must use a MuJoCo-supported .obj or .stl file.")
+        # Scanned meshes may be open surfaces. The object keeps a separately
+        # specified primitive collider and inertial model.
+        return self._mesh_name(mesh_path, inertia="shell")
+
     def geom_attributes(self, geometry: URDFGeometry) -> dict[str, str]:
         if geometry.kind == "mesh":
             if geometry.filename is None:

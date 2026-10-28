@@ -4,7 +4,7 @@ import tempfile
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Iterable
+from typing import TYPE_CHECKING, Iterable, Mapping
 
 from sim.contracts.scene import ContactMaterialSpec, SceneSpec
 
@@ -208,9 +208,27 @@ def convert_urdf_to_mjcf_xml(
     gravity: tuple[float, float, float] = (0.0, 0.0, 0.0),
     debug_proxy_visuals: bool = False,
     scene_spec: SceneSpec | None = None,
+    object_visual_mesh_paths: Mapping[str, str | Path] | None = None,
     position_actuation_profile: "PositionActuationProfile | None" = None,
     gripper_actuation_profile: "GripperActuationProfile | None" = None,
 ) -> str:
+    visual_mesh_paths: dict[str, Path] = {}
+    if object_visual_mesh_paths:
+        if scene_spec is None:
+            raise ValueError("Object visual meshes require a SceneSpec.")
+        if not scene_spec.collision.enabled:
+            raise ValueError("Object visual meshes require an enabled scene collision model.")
+        known_objects = {obj.name for obj in scene_spec.objects}
+        unknown_objects = set(object_visual_mesh_paths).difference(known_objects)
+        if unknown_objects:
+            raise ValueError(f"Object visual mesh bindings reference unknown scene objects: {sorted(unknown_objects)}")
+        for object_name, raw_path in object_visual_mesh_paths.items():
+            mesh_path = Path(raw_path).expanduser().resolve()
+            if not mesh_path.is_file():
+                raise FileNotFoundError(f"Object visual mesh not found: {mesh_path}")
+            if mesh_path.suffix.lower() not in {".obj", ".stl"}:
+                raise ValueError("Object visual meshes must use a MuJoCo-supported .obj or .stl file.")
+            visual_mesh_paths[str(object_name)] = mesh_path
     mounts_by_link: dict[str, list[CameraMount]] = {}
     for mount in camera_mounts:
         mounts_by_link.setdefault(mount.link_name, []).append(mount)
@@ -255,7 +273,8 @@ def convert_urdf_to_mjcf_xml(
 
     if collision_enabled:
         add_ground(worldbody, scene_spec.ground, collision_filter)
-        add_free_body_objects(worldbody, scene_spec.objects, collision_filter)
+        add_free_body_objects(worldbody, scene_spec.objects, collision_filter,
+            visual_mesh_path_by_name=visual_mesh_paths, geometry_registry=geometry_registry)
 
     def populate_body(body: ET.Element, link_name: str, parent_joint: URDFJoint | None) -> None:
         link = model.links[link_name]
@@ -334,6 +353,7 @@ def write_mjcf(
     gravity: tuple[float, float, float] = (0.0, 0.0, 0.0),
     debug_proxy_visuals: bool = False,
     scene_spec: SceneSpec | None = None,
+    object_visual_mesh_paths: Mapping[str, str | Path] | None = None,
     position_actuation_profile: "PositionActuationProfile | None" = None,
     gripper_actuation_profile: "GripperActuationProfile | None" = None,
 ) -> MJCFConversion:
@@ -346,6 +366,7 @@ def write_mjcf(
         gravity=gravity,
         debug_proxy_visuals=debug_proxy_visuals,
         scene_spec=scene_spec,
+        object_visual_mesh_paths=object_visual_mesh_paths,
         position_actuation_profile=position_actuation_profile,
         gripper_actuation_profile=gripper_actuation_profile,
     )
