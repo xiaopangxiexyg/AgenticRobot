@@ -25,6 +25,12 @@ Existing imports through `teleop_runtime.collection.schema_v21`,
 `utils.dataset_postprocess.wrist_cam_adjust.depth` remain compatibility exports;
 new format-level code should import this package directly.
 
+`dataset_contracts`、`dataset_interface` 和 `collection_runtime.progress` 的包根
+以有序懒加载映射声明公共导出，随后生成独立的 `__all__` 列表快照；仅供具名访问的
+兼容项在快照之后追加。因此名称、owner 和星号导入范围只需在对应位置维护一次，
+已有星号导入顺序、按需加载、对象身份与缓存行为保持不变。新增具名兼容项时，应继续
+放在快照之后，避免无意扩大 `import *` 的接口。
+
 ## Arm hold-intent training contract
 
 `dataset_contracts.arm_mode` freezes the existing

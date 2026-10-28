@@ -6,6 +6,8 @@ from pathlib import Path
 import subprocess
 import sys
 
+import pytest
+
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 _LAZY_COMPATIBILITY_PACKAGES = (
@@ -44,6 +46,99 @@ for package_name in {package_names}:
 """
     result = _run_isolated_python(source)
 
+    assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.parametrize(
+    "package_name,named_only",
+    [
+        ("dataset_contracts", [
+            "EPISODE_REVIEW_REQUEST_ANNOTATION_SCHEMA_V1",
+            "EpisodeReviewRequestAnnotationV1",
+            "PROGRESS_ARM_CONTROL_MODES_V1",
+            "PROGRESS_FIXED_SCOPES_V2",
+            "PROGRESS_FIXED_SCOPE_ARM_AND_END_EFFECTOR_V1",
+            "PROGRESS_FIXED_SCOPE_ARM_ONLY_V2",
+            "PROGRESS_STEP_ARM_CONTROL_SCHEMA_V1",
+            "PROGRESS_STEP_ARM_CONTROL_SCHEMA_V2",
+            "STAGE_ANNOTATION_MODES_V1",
+        ]),
+        ("dataset_interface", [
+            "assert_dataset_capture_integrity_compatible",
+            "load_latest_detail_stage_annotation_set",
+            "resolve_latest_detail_stage_annotation_view",
+        ]),
+        ("collection_runtime.progress", []),
+    ],
+)
+def test_package_root_keeps_lazy_cache_and_wildcard_boundary(package_name, named_only):
+    source = f"""
+from importlib import import_module
+from importlib.util import resolve_name
+from types import SimpleNamespace
+import sys
+
+package_name = {package_name!r}
+named_only = {named_only!r}
+package = import_module(package_name)
+exports = package._LAZY_EXPORTS
+public = list(package.__all__)
+assert isinstance(package.__all__, list)
+assert len(public) == len(set(public))
+assert set(exports) - set(public) == set(named_only)
+owner_modules = {{resolve_name(module, package_name) for module, _ in exports.values()}}
+assert owner_modules.isdisjoint(sys.modules)
+before_dir = dir(package)
+assert set(exports).issubset(before_dir)
+assert owner_modules.isdisjoint(sys.modules)
+
+# Exercise the facade without loading every optional owner a second time.
+# The original-owner test above checks real imports and all object identities.
+owners = {{}}
+for module_name, attribute_name in exports.values():
+    owner = owners.setdefault(module_name, SimpleNamespace())
+    setattr(owner, attribute_name, object())
+calls = []
+def import_owner(module_name, package_arg):
+    assert package_arg == package_name
+    calls.append(module_name)
+    return owners[module_name]
+package.import_module = import_owner
+
+first = public[0]
+value = getattr(package, first)
+module_name, attribute_name = exports[first]
+assert value is getattr(owners[module_name], attribute_name)
+assert package.__dict__[first] is value
+assert calls == [module_name]
+assert getattr(package, first) is value
+assert calls == [module_name]
+try:
+    getattr(package, "_missing_export_for_test")
+except AttributeError as exc:
+    assert str(exc) == f"module {{package_name!r}} has no attribute '_missing_export_for_test'"
+    assert exc.__cause__ is None
+else:
+    raise AssertionError("unknown export was accepted")
+assert calls == [module_name]
+
+wildcard = {{}}
+exec(f"from {{package_name}} import *", wildcard)
+assert [name for name in wildcard if name != "__builtins__"] == public
+assert set(named_only).isdisjoint(wildcard)
+for name in named_only:
+    module_name, attribute_name = exports[name]
+    assert getattr(package, name) is getattr(owners[module_name], attribute_name)
+    assert name in package.__dict__
+cached_calls = list(calls)
+after_cache = {{}}
+exec(f"from {{package_name}} import *", after_cache)
+assert [name for name in after_cache if name != "__builtins__"] == public
+assert set(named_only).isdisjoint(after_cache)
+assert calls == cached_calls
+assert dir(package) == before_dir
+"""
+    result = _run_isolated_python(source)
     assert result.returncode == 0, result.stderr
 
 
