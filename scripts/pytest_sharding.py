@@ -62,7 +62,6 @@ FULL_WEIGHTS = {
     "tests/test_replay_position_admittance_ik_trace.py": 17.575,
     "tests/test_agent_gateway_mujoco_tcp_pose_comparison.py": 17.253,
     "tests/test_control_station_sim_hil_allocation_profile.py": 16.954,
-    "tests/test_control_station_mujoco_sim_hil.py": 16.492,
     "tests/test_openpi_cpu_resources.py": 16.268,
     "tests/test_b601_command_field_runtime.py": 14.469,
     "tests/test_sim_point_grasp_experiment.py": 14.281,
@@ -132,7 +131,10 @@ FULL_WEIGHTS = {
     "tests/test_runtime_artifact_resolution.py": 1.579,
     "tests/test_runtime_artifact_migration_boundaries.py": 1.352,
     "tests/test_rebot_b601_submodule_boundary.py": 0.688,
-    "tests/test_control_station_contracts.py": 0.112
+    "tests/test_control_station_contracts.py": 0.112,
+    # Keep the prior complete estimate: this Run skipped two optional
+    # checkpoint cases, so its partial-module time cannot replace it.
+    "tests/test_control_station_mujoco_sim_hil.py": 36.534,
 }
 
 # Modules normally remain the isolation unit. Reviewed exceptions have
