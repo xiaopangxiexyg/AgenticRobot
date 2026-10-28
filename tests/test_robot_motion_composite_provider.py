@@ -56,10 +56,20 @@ def test_composite_provider_merges_dedupes_and_marks_time_budget():
     assert provider.last_metadata["provider_count"] == 2
 
 
-def test_composite_provider_stops_serial_collection_after_budget_is_spent():
+def test_composite_provider_stops_serial_collection_after_budget_is_spent(monkeypatch):
+    from types import SimpleNamespace
+
+    import robot_motion.composite_provider as composite_provider
+
+    # Model provider work without consuming the tiny budget in host scheduling.
+    clock = SimpleNamespace(now=0.0)
+    monkeypatch.setattr(
+        composite_provider, "time", SimpleNamespace(perf_counter=lambda: clock.now)
+    )
+
     class SlowProvider(ConstantProvider):
         def iter_ik_candidates(self, *, target_pose, seeds, seed_labels, options):
-            time.sleep(0.002)
+            clock.now += 0.002
             return super().iter_ik_candidates(
                 target_pose=target_pose,
                 seeds=seeds,

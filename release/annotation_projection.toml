@@ -50,6 +50,7 @@ include = [
     "collection_runtime/progress/retrospective_store.py",
     "collection_runtime/progress/stage_annotation_store.py",
     "dataset_contracts/__init__.py",
+    "dataset_contracts/_progress_validation.py",
     "dataset_contracts/canonical_encoding.py",
     "dataset_contracts/capture_modalities.py",
     "dataset_contracts/causal_snapshot.py",
