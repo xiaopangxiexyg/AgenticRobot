@@ -17,6 +17,8 @@ from robot_motion.path_planning import (
     JointPathStatus,
 )
 from robot_motion.pose import pose_delta_metrics
+from robot_motion.observed_obstacles import ObservedObstacleCloud
+from robot_motion.rm65.obstacle_collision import RM65InheritedStartClearanceOracle
 from robot_motion.relative_action import xyzquat_to_pose_matrix
 from robot_motion.rm65 import (
     DEFAULT_COLLISION_SCENE,
@@ -5062,6 +5064,89 @@ def test_frozen_dmtac_static_scene_blocks_before_ik_but_not_the_active_arm(monke
             speed_scale=.2)
     assert full_error.value.reason_code == raised.value.reason_code
     assert not planner.oracle.check(measured).safe  # Ordinary safety is unchanged.
+
+
+@pytest.mark.parametrize("parameterization", (
+    RM65_GRASP_TRAJECTORY_PARAMETERIZATION_SEGMENTED_STOP,
+    RM65_GRASP_TRAJECTORY_PARAMETERIZATION_CONTINUOUS_C2,
+))
+def test_observed_safe_move_can_leave_positive_static_start_proximity(monkeypatch, parameterization):
+    profile = _real_profile(
+        envelope_profile_name="agent_grasp_right_absolute_standard_v1.json",
+        collision_scene_profile="dual_arm_hand_proxy_dmtac_strict",
+    )
+    builder = build_exclusive_rm65_skill_target_builder(profile)
+    cloud = ObservedObstacleCloud(reference_frame_id=profile.station_world_frame_id,
+        points_m=np.array([[10., 10., 10.]]), evidence={"source": "synthetic_far_obstacle"})
+    planner = RM65GraspJointTrajectoryPlanner(
+        profile=profile, planning_target_builder=builder,
+        target_envelope_filter=builder.pre_ik_target_safety_filter,
+        observed_obstacles=cloud,
+        config=RM65GraspTrajectoryPlanningConfig(
+            trajectory_parameterization=parameterization),
+    )
+    revalidated = []
+    original = RM65GraspJointTrajectoryPlanner._revalidate
+
+    def record(self, waypoints, **kwargs):
+        result = original(self, waypoints, **kwargs)
+        if isinstance(self.oracle, RM65InheritedStartClearanceOracle):
+            revalidated.append(tuple(waypoints))
+        return result
+
+    monkeypatch.setattr(RM65GraspJointTrajectoryPlanner, "_revalidate", record)
+    start = {"left": np.array((2.327623565385757, .8887216231575795,
+              1.874605749209501, 1.8164688094550168,
+              -1.3424897849709652, -.3151540891841784)),
+             "right": SAFE_QPOS["right"].copy()}
+    static = planner.oracle.check_static_scene(start, active_component="right")
+    assert static.collision_check_available and not static.safe
+    assert 0 < static.minimum_distance_m < .02
+    target_q = {side: values.copy() for side, values in start.items()}
+    target_q["right"][0] += .03
+    target = builder.tool_tcp_world_targets_for_qpos_pair(
+        left_qpos=target_q["left"], right_qpos=target_q["right"])["right"]
+    trajectory = planner(qpos_by_side=start, side="right",
+        target_tool_tcp_world=target, speed_scale=.2,
+        require_grasp_approach=False, time_budget_sec=30.)
+    np.testing.assert_array_equal(trajectory.qpos_by_side["left"][0], start["left"])
+    np.testing.assert_array_equal(trajectory.qpos_by_side["left"][-1], start["left"])
+    assert np.linalg.norm(trajectory.qpos_by_side["right"][-1] - start["right"]) > .01
+    assert any(len(path) == len(trajectory.time_from_start_sec)
+        and np.array_equal(path[-1]["right"], trajectory.qpos_by_side["right"][-1])
+        for path in revalidated)
+    assert not planner.oracle.check(start).safe  # The template remains strict.
+
+
+def test_observed_hard_overlap_masked_by_fixed_margin_reports_blocked_start():
+    profile = _real_profile(
+        envelope_profile_name="agent_grasp_right_absolute_standard_v1.json",
+        collision_scene_profile="dual_arm_hand_proxy_dmtac_strict",
+    )
+    builder = build_exclusive_rm65_skill_target_builder(profile)
+    start = {"left": np.array((2.327623565385757, .8887216231575795,
+              1.874605749209501, 1.8164688094550168,
+              -1.3424897849709652, -.3151540891841784)),
+             "right": SAFE_QPOS["right"].copy()}
+    template = RM65GraspJointTrajectoryPlanner(profile=profile,
+        planning_target_builder=builder,
+        target_envelope_filter=builder.pre_ik_target_safety_filter)
+    proxy = template.oracle.world_obstacle_proxy_boxes(start)[0]
+    cloud = ObservedObstacleCloud(reference_frame_id=profile.station_world_frame_id,
+        points_m=np.asarray(proxy[1][:3, 3]).reshape(1, 3),
+        evidence={"source": "synthetic_overlap"})
+    planner = RM65GraspJointTrajectoryPlanner(profile=profile,
+        planning_target_builder=builder,
+        target_envelope_filter=builder.pre_ik_target_safety_filter,
+        observed_obstacles=cloud)
+    target = builder.tool_tcp_world_targets_for_qpos_pair(
+        left_qpos=start["left"], right_qpos=start["right"])["right"]
+    with pytest.raises(RM65GraspTrajectoryPlanningError) as caught:
+        planner(qpos_by_side=start, side="right", target_tool_tcp_world=target,
+            speed_scale=.2, require_grasp_approach=False, time_budget_sec=2.)
+    assert caught.value.reason_code == "path_start_collision_blocked"
+    assert caught.value.details["source"] == "observed_rgbd"
+    assert caught.value.details["distance_m"] <= 0.0
 
 
 
