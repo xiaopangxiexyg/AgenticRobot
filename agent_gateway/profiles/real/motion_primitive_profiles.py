@@ -30,6 +30,7 @@ from agent_gateway.protocol.skill_catalog import (
     SkillExecutionRoute,
     SkillRouteManifest,
     SkillRouteManifestEntry,
+    agent_skill_schema_document_hash,
     validate_skill_route_catalog_closure,
 )
 from agent_gateway.protocol.skill_io_contracts import (
@@ -63,6 +64,17 @@ from agent_gateway.skills.motion.schemas import (
     validate_safe_tcp_pose_goal_report_v1,
     validate_agent_motion_parameters_v1,
     validate_agent_motion_route_schema_v1,
+)
+from agent_gateway.skills.motion.observed_point import (
+    SKILL_ID as OBSERVED_POINT_SKILL_ID,
+    observed_anchor_definition_v2,
+    observed_anchor_schema_v2,
+    observed_point_definition,
+    observed_point_schema,
+    validate_observed_anchor_parameters_v2,
+    validate_observed_anchor_report_v2,
+    validate_observed_point_parameters,
+    validate_observed_point_report,
 )
 from dataset_contracts.canonical_encoding import canonical_content_hash
 from robot_motion.coordinate_frames import CoordinateFrameGraph
@@ -107,6 +119,10 @@ REAL_AGENT_SAFE_TCP_POSE_TARGET_ROUTE_ID_V1 = (
 REAL_AGENT_SAFE_TCP_POSE_TARGET_EXECUTOR_ID_V1 = (
     "control-station.real-agent-tcp-pose-target-safe.v1"
 )
+REAL_AGENT_OBSERVED_POINT_ROUTE_ID_V1 = "real.rm65.agent_skill_observed_point"
+REAL_AGENT_OBSERVED_POINT_EXECUTOR_ID_V1 = "real-agent-observed-point.v1"
+REAL_AGENT_OBSERVED_ANCHOR_ROUTE_ID_V2 = "real.rm65.agent_skill_observed_anchor_v2"
+REAL_AGENT_OBSERVED_ANCHOR_EXECUTOR_ID_V2 = "real-agent-observed-anchor.v2"
 REAL_AGENT_GRASP_APPROACH_ROUTE_ID_V1 = "real.rm65.agent_skill_grasp_approach"
 REAL_AGENT_GRASP_APPROACH_EXECUTOR_ID_V1 = (
     "control-station.real-agent-grasp-approach.v1"
@@ -183,10 +199,14 @@ def real_agent_motion_route_ids_v1(
     include_safe_pose: bool = False,
     include_grasp_approach: bool = False,
     include_grasp_approach_plan: bool = False,
+    include_observed_point: bool = False,
+    include_observed_anchor_v2: bool = False,
 ) -> tuple[str, ...]:
     """Return the single authoritative real-motion Route allowlist."""
 
     optional_routes = (
+        *((REAL_AGENT_OBSERVED_POINT_ROUTE_ID_V1,) if include_observed_point else ()),
+        *((REAL_AGENT_OBSERVED_ANCHOR_ROUTE_ID_V2,) if include_observed_anchor_v2 else ()),
         *((REAL_AGENT_SAFE_TCP_POSE_TARGET_ROUTE_ID_V1,) if include_safe_pose else ()),
         *((REAL_AGENT_GRASP_APPROACH_ROUTE_ID_V1,) if include_grasp_approach else ()),
         *(
@@ -426,6 +446,71 @@ class RealAgentTcpPoseTargetProfile:
 
 
 @dataclass(frozen=True)
+class RealAgentObservedPointProfile(RealAgentTcpPoseTargetProfile):
+    """Bind relation resolution to the existing safe TCP limits."""
+
+    speed_scale: float = 0.2
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        if (isinstance(self.speed_scale, bool)
+                or not isinstance(self.speed_scale, (int, float))
+                or not math.isfinite(self.speed_scale)
+                or not self.min_speed_scale <= self.speed_scale <= self.max_speed_scale):
+            raise ValueError("Observed-point speed must be within the bound TCP limits.")
+
+    @property
+    def skill_id(self) -> str:
+        return OBSERVED_POINT_SKILL_ID
+
+    @property
+    def parameter_profile_id(self) -> str:
+        return "real-observed-point-v1"
+
+    @property
+    def profile_id(self) -> str:
+        return self.parameter_profile_id
+
+    @property
+    def workspace_bounds(self) -> None:
+        # Real motion uses the lower deployment envelope, not a second AABB.
+        return None
+
+    @property
+    def pose_goal_policy(self) -> str:
+        return "preserve_target"
+
+    @property
+    def semantic_content_hash(self) -> str:
+        return canonical_content_hash({
+            **self.__dict__, "profile_id": self.parameter_profile_id,
+            "controlled_frame_id": "tool_tcp",
+            "target_semantics": "authenticated_surface_point_plus_offset_preserve_activation_orientation",
+            "source_contracts": ("back_project@1", "back_project@2"),
+            "pose_goal_policy": self.pose_goal_policy,
+        }, domain="agenticrobot.real_observed_point.profile.v1")
+
+
+@dataclass(frozen=True)
+class RealAgentObservedAnchorProfile(RealAgentObservedPointProfile):
+    """The same lower safe limits with a v2 authenticated anchor source."""
+
+    @property
+    def parameter_profile_id(self) -> str:
+        return "real-observed-anchor-v2"
+
+    @property
+    def semantic_content_hash(self) -> str:
+        return canonical_content_hash({
+            **self.__dict__, "profile_id": self.parameter_profile_id,
+            "controlled_frame_id": "tool_tcp",
+            "target_semantics": "authenticated_surface_anchor_plus_offset_preserve_activation_orientation",
+            "source_contracts": ("capture_surface_anchor@2",),
+            "pose_goal_policy": self.pose_goal_policy,
+        }, domain="agenticrobot.real_observed_anchor.profile.v2")
+
+
+@dataclass(frozen=True)
 class RealAgentTcpFixedOrientationProfile:
     skill_id: str
     component_id: str
@@ -611,6 +696,7 @@ class RealAgentPrimitiveContractBundle:
     perception_capture: RealPerceptionCaptureRegistration | None = None
     localization_registration: RealObjectLocalizationRegistration | None = None
     segmentation_registration: SegmentationRegistration | None = None
+    surface_anchor_capture_registration: SpatialGoalRegistration | None = None
     placement_registration: PlacementRegistration | None = None
     station_point_grasp_registration: StationBoundPointGraspRegistration | None = None
     station_point_grasp_render_registration: (
@@ -623,6 +709,8 @@ class RealAgentPrimitiveContractBundle:
     tcp_pose_comparison_registration: TcpPoseComparisonRegistration | None = None
     rgbd_geometry_registrations: tuple[RgbdGeometryRegistration, ...] = ()
     grasp_fast_plan_registration: RealFastGraspPlanRegistration | None = None
+    observed_point_profile: RealAgentObservedPointProfile | None = None
+    observed_anchor_profile_v2: RealAgentObservedAnchorProfile | None = None
 
     def __post_init__(self) -> None:
         published_skill_ids = {
@@ -671,11 +759,29 @@ class RealAgentPrimitiveContractBundle:
             entry.route.skill_id == SAFE_TCP_POSE_TARGET_SKILL_ID_V1
             for entry in self.route_manifest.skill_routes
         )
+        observed_point_enabled = self.observed_point_profile is not None
+        if observed_point_enabled != any(
+                entry.route.skill_id == OBSERVED_POINT_SKILL_ID
+                and entry.route.skill_version == "1"
+                for entry in self.route_manifest.skill_routes):
+            raise ValueError("Observed-point profile and Route must coexist.")
+        observed_anchor_enabled = self.observed_anchor_profile_v2 is not None
+        if observed_anchor_enabled != any(
+                entry.route.skill_id == OBSERVED_POINT_SKILL_ID
+                and entry.route.skill_version == "2"
+                for entry in self.route_manifest.skill_routes):
+            raise ValueError("Observed-anchor v2 profile and Route must coexist.")
+        if observed_anchor_enabled and self.surface_anchor_capture_registration is None:
+            raise ValueError("Observed-anchor motion requires its v2 capture producer.")
+        if observed_point_enabled and (self.perception_capture is None
+                or self.perception_capture.back_projection is None):
+            raise ValueError("Observed-point motion requires bound back-projection.")
         grasp_approach_enabled = any(
             entry.route.skill_id == GRASP_APPROACH_SKILL_ID_V1
             for entry in self.route_manifest.skill_routes
         )
-        if (pose_target_enabled or safe_pose_enabled or grasp_approach_enabled) != (
+        if (pose_target_enabled or safe_pose_enabled or grasp_approach_enabled
+                or observed_point_enabled or observed_anchor_enabled) != (
             self.pose_target_profile is not None
         ):
             raise ValueError("Absolute-pose Routes require their bound target profile.")
@@ -719,6 +825,8 @@ class RealAgentPrimitiveContractBundle:
             0
             + int(pose_target_enabled)
             + int(safe_pose_enabled)
+            + int(observed_point_enabled)
+            + int(observed_anchor_enabled)
             + int(grasp_approach_enabled)
             + int(grasp_approach_plan_enabled)
         )
@@ -796,14 +904,12 @@ class RealAgentPrimitiveContractBundle:
             raise ValueError("Real primitive profile frame bindings disagree.")
         if self.attachment.frame_graph_hash != self.frame_graph.semantic_content_hash:
             raise ValueError("Real primitive attachment frame graph mismatch.")
-        optional_grasp = (
-            self.localization_registration,
-            self.station_point_grasp_registration,
-            self.station_point_grasp_render_registration,
-        )
-        if any(item is not None for item in optional_grasp) and not all(
+        optional_grasp = (self.station_point_grasp_registration,
+                          self.station_point_grasp_render_registration)
+        if any(item is not None for item in optional_grasp) != all(
             item is not None for item in optional_grasp
-        ):
+        ) or (any(item is not None for item in optional_grasp)
+              and self.localization_registration is None):
             raise ValueError(
                 "Real localization, point-grasp, and render registrations must coexist."
             )
@@ -817,6 +923,17 @@ class RealAgentPrimitiveContractBundle:
             and self.perception_capture is None
         ):
             raise ValueError("Real segmentation Route requires perception capture.")
+        if self.surface_anchor_capture_registration is not None and (
+            self.segmentation_registration is None
+            or self.perception_capture is None
+            or self.perception_capture.back_projection is None
+        ):
+            raise ValueError("Real surface anchor v2 requires segmentation and back projection.")
+        if self.surface_anchor_capture_registration is not None and (
+            self.route_manifest.route("perception.capture_surface_anchor", "2")
+            != self.surface_anchor_capture_registration.entry
+        ):
+            raise ValueError("Real surface anchor differs from its manifest entry.")
         if self.placement_registration is not None and (
             self.segmentation_registration is None
             or self.perception_capture is None
@@ -841,15 +958,18 @@ class RealAgentPrimitiveContractBundle:
             raise ValueError("Grasp-approach planning requires retained point grasps.")
         expected_route_count = (
             (1 + int(pose_target_enabled) + int(grasp_approach_enabled)
-             + int(safe_pose_enabled))
+             + int(safe_pose_enabled) + int(observed_point_enabled)
+             + int(observed_anchor_enabled))
             + (2 if self.perception_capture is not None else 0)
             + int(
                 self.perception_capture is not None
                 and self.perception_capture.back_projection is not None
             )
             + len(self.rgbd_geometry_registrations)
-            + (3 if self.localization_registration is not None else 0)
+            + int(self.localization_registration is not None)
+            + 2 * int(self.station_point_grasp_registration is not None)
             + int(self.segmentation_registration is not None)
+            + int(self.surface_anchor_capture_registration is not None)
             + int(self.placement_registration is not None)
             + (2 if grasp_approach_plan_enabled else 0)
             + int(transport_enabled)
@@ -866,8 +986,8 @@ class RealAgentPrimitiveContractBundle:
         if len(self.route_manifest.skill_routes) != expected_route_count:
             raise ValueError("Real perception registration and manifest disagree.")
 
-    def binding_for_skill(self, skill_id: str) -> RealAgentPrimitiveDeploymentBinding:
-        route = self.route_manifest.route(skill_id, "1").route
+    def binding_for_skill(self, skill_id: str, skill_version: str = "1") -> RealAgentPrimitiveDeploymentBinding:
+        route = self.route_manifest.route(skill_id, skill_version).route
         for binding in self.deployment_bindings:
             if binding.route_hash == route.semantic_content_hash:
                 return binding
@@ -895,6 +1015,8 @@ def _payload_validator(
     cardinal = isinstance(profile, RealAgentTcpCardinalStepProfile)
     pose_target = isinstance(profile, RealAgentTcpPoseTargetProfile)
     plan_execution = isinstance(profile, RealGraspApproachPlanProfile)
+    observed_anchor = isinstance(profile, RealAgentObservedAnchorProfile)
+    observed_point = isinstance(profile, RealAgentObservedPointProfile) and not observed_anchor
     pose_components = (profile.component_ids if pose_target and route.skill_id in {
         TCP_POSE_TARGET_SKILL_ID_V1, SAFE_TCP_POSE_TARGET_SKILL_ID_V1,
     } else (profile.component_id,))
@@ -944,6 +1066,15 @@ def _payload_validator(
     )
 
     def validate_parameters(payload: Mapping[str, Any]) -> None:
+        if observed_point or observed_anchor:
+            component = payload.get("component_id") if isinstance(payload, Mapping) else None
+            if component not in profile.component_ids:
+                raise ValueError("Observed-point component differs from its bound profile.")
+            if observed_anchor:
+                validate_observed_anchor_parameters_v2(payload, component_id=component)
+            else:
+                validate_observed_point_parameters(payload, component_id=component)
+            return
         payload_fields = set(payload) if isinstance(payload, Mapping) else set()
         allowed_parameter_fields = (
             parameter_fields | {"speed_scale"} if pose_target else parameter_fields
@@ -1025,10 +1156,19 @@ def _payload_validator(
         required = {"execution_receipt_refs", "final_measured_state_hash"}
         allowed = required | ({"pose_goal_report"}
             if route.skill_id == SAFE_TCP_POSE_TARGET_SKILL_ID_V1 else set())
+        if observed_point or observed_anchor:
+            required = required | {"surface_anchor_report" if observed_anchor else "observed_point_report"}
+            allowed = required
         if not isinstance(payload, Mapping) or not required <= set(payload) <= allowed:
             raise ValueError("Real primitive result schema mismatch.")
         if "pose_goal_report" in payload:
             validate_safe_tcp_pose_goal_report_v1(payload["pose_goal_report"])
+        if observed_point:
+            validate_observed_point_report(payload["observed_point_report"],
+                                          reference_frame_id=profile.reference_frame_id)
+        if observed_anchor:
+            validate_observed_anchor_report_v2(payload["surface_anchor_report"],
+                                               reference_frame_id=profile.reference_frame_id)
         refs = payload["execution_receipt_refs"]
         if (
             not isinstance(refs, (tuple, list))
@@ -1055,6 +1195,15 @@ def _payload_validator(
         if payload["task_outcome"] not in {"failed", "inconclusive", "succeeded"}:
             raise ValueError("Unsupported real primitive task_outcome.")
 
+    def validate_result_for_parameters(parameters, result):
+        if observed_anchor:
+            if result["surface_anchor_report"]["source_operation_id"] != parameters["surface_anchor_operation_id"]:
+                raise ValueError("Observed-anchor result differs from its request.")
+            return
+        report = result["observed_point_report"]
+        if any(report[name] != parameters[name] for name in ("observation_operation_id", "point_index")):
+            raise ValueError("Observed-point result differs from its request.")
+
     return AgentSkillPayloadValidatorSet(
         validator_id=(
             "payload-validator:real-agent-primitive:"
@@ -1071,6 +1220,8 @@ def _payload_validator(
         validate_parameters=validate_parameters,
         validate_execution_result=validate_execution_result,
         validate_task_evaluation=validate_task_evaluation,
+        validate_execution_result_for_parameters=(validate_result_for_parameters
+            if observed_point or observed_anchor else None),
     )
 
 
@@ -1089,6 +1240,8 @@ def build_real_agent_primitive_contract_bundle(
     gripper_contract: GripperSkillContractBundle | None = None,
     localization_registration: RealObjectLocalizationRegistration | None = None,
     segmentation_registration: SegmentationRegistration | None = None,
+    enable_surface_anchor_v2: bool = False,
+    enable_placement: bool = True,
     station_point_grasp_registration: StationBoundPointGraspRegistration | None = None,
     station_point_grasp_render_registration: (
         StationBoundPointGraspRenderRegistration | None
@@ -1112,6 +1265,8 @@ def build_real_agent_primitive_contract_bundle(
         raise TypeError("enable_spatial_goals must be boolean.")
     if not isinstance(enable_tcp_pose_comparison, bool):
         raise TypeError("enable_tcp_pose_comparison must be boolean.")
+    if not isinstance(enable_surface_anchor_v2, bool) or not isinstance(enable_placement, bool):
+        raise TypeError("Optional real perception switches must be boolean.")
     refs = tuple(safety_envelope_refs)
     if not refs:
         raise ValueError("Real primitive Routes require lower safety-envelope refs.")
@@ -1294,6 +1449,47 @@ def build_real_agent_primitive_contract_bundle(
     safe_pose_definition = safe_tcp_pose_target_skill_definition_v1(
         controlled_component_ids=pose_target_profile.component_ids,
     )
+    observed_point_enabled = any(REAL_AGENT_OBSERVED_POINT_ROUTE_ID_V1 in ref.allowed_route_ids
+                                 for ref in refs)
+    observed_point_profile = None
+    observed_definition = observed_schema = None
+    if observed_point_enabled:
+        if perception_capture is None or perception_capture.back_projection is None:
+            raise ValueError("Observed-point motion requires bound back-projection.")
+        observed_point_profile = RealAgentObservedPointProfile(**pose_target_profile.__dict__)
+        observed_definition = observed_point_definition(
+            controlled_component_ids=observed_point_profile.component_ids)
+        observed_schema = observed_point_schema(definition=observed_definition,
+                                                profile=observed_point_profile)
+        if len(observed_point_profile.component_ids) > 1:
+            parameters = dict(observed_schema.parameter_schema)
+            parameters["properties"] = {**parameters["properties"], "component_id": {
+                "type": "string", "enum": list(observed_point_profile.component_ids)}}
+            observed_schema = replace(observed_schema, parameter_schema=parameters,
+                parameter_profiles=(replace(observed_schema.parameter_profiles[0],
+                    parameter_schema_hash=agent_skill_schema_document_hash(
+                        parameters, schema_kind="parameter")),))
+    observed_anchor_enabled = any(
+        REAL_AGENT_OBSERVED_ANCHOR_ROUTE_ID_V2 in ref.allowed_route_ids for ref in refs
+    )
+    observed_anchor_profile_v2 = None
+    observed_anchor_definition = observed_anchor_schema = None
+    if observed_anchor_enabled:
+        if not observed_point_enabled or not enable_surface_anchor_v2:
+            raise ValueError("Observed-anchor v2 requires v1 safe motion and v2 capture.")
+        observed_anchor_profile_v2 = RealAgentObservedAnchorProfile(**pose_target_profile.__dict__)
+        observed_anchor_definition = observed_anchor_definition_v2(
+            controlled_component_ids=observed_anchor_profile_v2.component_ids)
+        observed_anchor_schema = observed_anchor_schema_v2(
+            definition=observed_anchor_definition, profile=observed_anchor_profile_v2)
+        if len(observed_anchor_profile_v2.component_ids) > 1:
+            parameters = dict(observed_anchor_schema.parameter_schema)
+            parameters["properties"] = {**parameters["properties"], "component_id": {
+                "type": "string", "enum": list(observed_anchor_profile_v2.component_ids)}}
+            observed_anchor_schema = replace(observed_anchor_schema, parameter_schema=parameters,
+                parameter_profiles=(replace(observed_anchor_schema.parameter_profiles[0],
+                    parameter_schema_hash=agent_skill_schema_document_hash(
+                        parameters, schema_kind="parameter")),))
     safe_pose_schema = tcp_pose_target_schema_entry_v1(
         max_target_components=1 if pose_target_profile.additional_components else None,
         skill_id=SAFE_TCP_POSE_TARGET_SKILL_ID_V1,
@@ -1329,7 +1525,7 @@ def build_real_agent_primitive_contract_bundle(
             skill_version=definition.skill_version,
             skill_definition_hash=definition.semantic_content_hash,
             route_id=route_id,
-            route_version="1",
+            route_version=definition.skill_version,
             parameter_schema_hash=schema.parameter_schema_hash,
             execution_result_schema_hash=schema.execution_result_schema_hash,
             task_evaluation_schema_hash=schema.task_evaluation_schema_hash,
@@ -1366,6 +1562,13 @@ def build_real_agent_primitive_contract_bundle(
         route_id=REAL_AGENT_SAFE_TCP_POSE_TARGET_ROUTE_ID_V1,
         max_operation_duration_ms=120_000,
     )
+    observed_route = (None if not observed_point_enabled else route_for(
+        definition=observed_definition, schema=observed_schema,
+        route_id=REAL_AGENT_OBSERVED_POINT_ROUTE_ID_V1, max_operation_duration_ms=120_000))
+    observed_anchor_route = (None if not observed_anchor_enabled else route_for(
+        definition=observed_anchor_definition, schema=observed_anchor_schema,
+        route_id=REAL_AGENT_OBSERVED_ANCHOR_ROUTE_ID_V2,
+        max_operation_duration_ms=120_000))
     safe_pose_enabled = any(
         REAL_AGENT_SAFE_TCP_POSE_TARGET_ROUTE_ID_V1 in ref.allowed_route_ids for ref in refs
     )
@@ -1381,6 +1584,8 @@ def build_real_agent_primitive_contract_bundle(
         else grasp_approach_plan_registration.execute_skill.routes[0]
     )
     all_routes = (
+        *((observed_route,) if observed_route is not None else ()),
+        *((observed_anchor_route,) if observed_anchor_route is not None else ()),
         *((safe_pose_route,) if safe_pose_enabled else ()),
         *((pose_target_route,) if pose_target_enabled else ()),
         *((grasp_approach_route,) if grasp_approach_enabled else ()),
@@ -1393,6 +1598,8 @@ def build_real_agent_primitive_contract_bundle(
     expected_route_ids = set(
         real_agent_motion_route_ids_v1(
             include_safe_pose=safe_pose_enabled,
+            include_observed_point=observed_point_enabled,
+            include_observed_anchor_v2=observed_anchor_enabled,
             include_grasp_approach=grasp_approach_enabled,
             include_grasp_approach_plan=grasp_approach_plan_enabled,
         )
@@ -1422,6 +1629,10 @@ def build_real_agent_primitive_contract_bundle(
         domain="dexteleop.real_agent_motion.port_binding.v1",
     )
     profile_by_route_hash = {
+        **({observed_route.semantic_content_hash: observed_point_profile}
+           if observed_route is not None else {}),
+        **({observed_anchor_route.semantic_content_hash: observed_anchor_profile_v2}
+           if observed_anchor_route is not None else {}),
         **({safe_pose_route.semantic_content_hash: pose_target_profile}
            if safe_pose_enabled else {}),
         **(
@@ -1446,6 +1657,10 @@ def build_real_agent_primitive_contract_bundle(
         ),
     }
     executor_by_route_hash = {
+        **({observed_route.semantic_content_hash: REAL_AGENT_OBSERVED_POINT_EXECUTOR_ID_V1}
+           if observed_route is not None else {}),
+        **({observed_anchor_route.semantic_content_hash: REAL_AGENT_OBSERVED_ANCHOR_EXECUTOR_ID_V2}
+           if observed_anchor_route is not None else {}),
         **({safe_pose_route.semantic_content_hash: REAL_AGENT_SAFE_TCP_POSE_TARGET_EXECUTOR_ID_V1}
            if safe_pose_enabled else {}),
         **(
@@ -1511,14 +1726,12 @@ def build_real_agent_primitive_contract_bundle(
         for route in all_routes
     )
     binding_by_route_hash = {item.route_hash: item for item in bindings}
-    optional_grasp = (
-        localization_registration,
-        station_point_grasp_registration,
-        station_point_grasp_render_registration,
-    )
-    if any(item is not None for item in optional_grasp) and not all(
+    optional_grasp = (station_point_grasp_registration,
+                      station_point_grasp_render_registration)
+    if any(item is not None for item in optional_grasp) != all(
         item is not None for item in optional_grasp
-    ):
+    ) or (any(item is not None for item in optional_grasp)
+          and localization_registration is None):
         raise ValueError(
             "Real localization, point-grasp, and render registrations must coexist."
         )
@@ -1538,11 +1751,22 @@ def build_real_agent_primitive_contract_bundle(
             station_manifest_hash=attachment.station_manifest_hash,
             execution_manifest_hash=attachment.execution_manifest_hash,
         )
-        if segmentation_registration is not None
+        if enable_placement and segmentation_registration is not None
         and perception_capture is not None
         and perception_capture.back_projection is not None
         else None
     )
+    surface_anchor_capture_registration = None
+    if enable_surface_anchor_v2:
+        if (segmentation_registration is None or perception_capture is None
+                or perception_capture.back_projection is None):
+            raise ValueError("Real surface anchor v2 requires segmentation and back projection.")
+        from agent_gateway.profiles.surface_anchor import build_surface_anchor_registrations
+
+        (surface_anchor_capture_registration,) = build_surface_anchor_registrations(
+            back_projection=perception_capture.back_projection,
+            segmentation=segmentation_registration, version="2",
+        )
     perception_registrations = list(
         ()
         if perception_capture is None
@@ -1568,6 +1792,8 @@ def build_real_agent_primitive_contract_bundle(
         )
     if segmentation_registration is not None:
         perception_registrations.append(segmentation_registration.skill)
+    if surface_anchor_capture_registration is not None:
+        perception_registrations.append(surface_anchor_capture_registration.skill)
     if placement_registration is not None:
         perception_registrations.append(placement_registration.skill)
     if grasp_approach_plan_registration is not None:
@@ -1612,6 +1838,8 @@ def build_real_agent_primitive_contract_bundle(
         catalog_version="1",
         skill_definitions=(
             tcp_pose_definition,
+            *((observed_definition,) if observed_point_enabled else ()),
+            *((observed_anchor_definition,) if observed_anchor_enabled else ()),
             *((safe_pose_definition,) if safe_pose_enabled else ()),
             *((pose_target_definition,) if pose_target_enabled else ()),
             *((grasp_approach_definition,) if grasp_approach_enabled else ()),
@@ -1633,6 +1861,8 @@ def build_real_agent_primitive_contract_bundle(
         catalog_version="1",
         schema_entries=(
             tcp_pose_schema,
+            *((observed_schema,) if observed_point_enabled else ()),
+            *((observed_anchor_schema,) if observed_anchor_enabled else ()),
             *((safe_pose_schema,) if safe_pose_enabled else ()),
             *((pose_target_schema,) if pose_target_enabled else ()),
             *((grasp_approach_schema,) if grasp_approach_enabled else ()),
@@ -1772,6 +2002,8 @@ def build_real_agent_primitive_contract_bundle(
                 availability_hash=placement_registration.availability_hash,
             )
         )
+    if surface_anchor_capture_registration is not None:
+        route_items.append(surface_anchor_capture_registration.entry)
     if grasp_approach_plan_registration is not None:
         route_items.append(
             SkillRouteManifestEntry(
@@ -1914,6 +2146,10 @@ def build_real_agent_primitive_contract_bundle(
             ),
             *((_payload_validator(route=safe_pose_route, profile=pose_target_profile),)
               if safe_pose_enabled else ()),
+            *((_payload_validator(route=observed_route, profile=observed_point_profile),)
+              if observed_point_enabled else ()),
+            *((_payload_validator(route=observed_anchor_route, profile=observed_anchor_profile_v2),)
+              if observed_anchor_enabled else ()),
             *(
                 ()
                 if perception_capture is None
@@ -1941,6 +2177,8 @@ def build_real_agent_primitive_contract_bundle(
                 if segmentation_registration is None
                 else (segmentation_registration.payload_validator,)
             ),
+            *((surface_anchor_capture_registration.payload_validator,)
+              if surface_anchor_capture_registration is not None else ()),
             *(
                 ()
                 if placement_registration is None
@@ -1985,6 +2223,7 @@ def build_real_agent_primitive_contract_bundle(
         pose_target_profile=(
             pose_target_profile
             if pose_target_enabled or safe_pose_enabled or grasp_approach_enabled
+            or observed_point_enabled or observed_anchor_enabled
             else None
         ),
         orientation_profiles=(),
@@ -1996,8 +2235,11 @@ def build_real_agent_primitive_contract_bundle(
         tcp_pose_observe=tcp_pose_observe,
         perception_capture=perception_capture,
         rgbd_geometry_registrations=rgbd_geometry_registrations,
+        observed_point_profile=observed_point_profile,
+        observed_anchor_profile_v2=observed_anchor_profile_v2,
         localization_registration=localization_registration,
         segmentation_registration=segmentation_registration,
+        surface_anchor_capture_registration=surface_anchor_capture_registration,
         placement_registration=placement_registration,
         station_point_grasp_registration=station_point_grasp_registration,
         station_point_grasp_render_registration=(
@@ -2013,6 +2255,9 @@ def build_real_agent_primitive_contract_bundle(
 
 
 __all__ = [
+    "REAL_AGENT_OBSERVED_POINT_EXECUTOR_ID_V1",
+    "REAL_AGENT_OBSERVED_POINT_ROUTE_ID_V1",
+    "RealAgentObservedPointProfile",
     "REAL_AGENT_GRASP_APPROACH_EXECUTOR_ID_V1",
     "REAL_AGENT_GRASP_APPROACH_ROUTE_ID_V1",
     "REAL_AGENT_SAFE_TCP_POSE_TARGET_EXECUTOR_ID_V1",

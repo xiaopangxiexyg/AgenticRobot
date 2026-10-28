@@ -166,6 +166,34 @@ def _v2_parameters(mode="mask_interior"):
             "language_prompt": None, "min_score": 0.25}
 
 
+def test_v2_capture_can_publish_without_sim_path_query():
+    from agent_gateway.profiles.segmentation import build_segmentation_registration
+
+    projection = _projection()
+    model = _AnchorSegmenter()
+    segmentation = build_segmentation_registration(
+        target_kind="sim", current_mode="sim_active",
+        source_id_by_role={"main": "front"},
+        model_profile_id=model.model_spec.model_profile_id,
+        model_profile_hash=model.model_spec.semantic_content_hash,
+        inference_implementation_hash=model.semantic_content_hash,
+        runtime_session_id="session:test", control_domain_id="domain:test",
+        target_binding_id="target:test", station_manifest_hash="station:test",
+        execution_manifest_hash="execution:test",
+    )
+    (capture,) = build_surface_anchor_registrations(
+        back_projection=projection, segmentation=segmentation, version="2",
+    )
+    assert capture.skill.definition.skill_id == CAPTURE_SKILL_ID
+    assert capture.skill.definition.skill_version == "2"
+    assert capture.entry.route.control_effect_class == "read_only"
+    with pytest.raises(ValueError, match="path queries require"):
+        build_surface_anchor_registrations(
+            back_projection=projection, segmentation=segmentation,
+            version="2", enable_relation_queries=True,
+        )
+
+
 @pytest.mark.parametrize("kind", ["relation", "goal"])
 def test_anchor_executor_freezes_caller_owned_producer_list(monkeypatch, kind):
     from agent_gateway.profiles import surface_anchor

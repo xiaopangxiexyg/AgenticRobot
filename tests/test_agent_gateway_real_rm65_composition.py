@@ -167,6 +167,7 @@ class _Localizer:
         semantic_content_hash="localization-model:test",
     )
     semantic_content_hash = "localization-implementation:test"
+    timeout_sec = 45.0
 
     def start(self) -> None:
         raise AssertionError("default-off composition must not start models")
@@ -260,6 +261,132 @@ def _lower(monkeypatch, *, envelope_side: str = "right", absolute: bool = False)
         force_guard_factory=lambda backends: guard,
     )
     return lower, guard
+
+
+def test_real_surface_anchor_v2_advertises_read_only_without_grasp_model(
+    monkeypatch, tmp_path,
+):
+    lower, guard = _lower(monkeypatch)
+    localizer = _Localizer()
+    composition = assemble_exclusive_rm65_agent_primitive_composition(
+        lower=lower, socket_path=tmp_path / "anchor.sock",
+        authorized_side="right", authorized_action="move_tcp_to_pose",
+        confirmation_token=REAL_AGENT_PRIMITIVE_CONFIRM_TOKEN,
+        client_id="rpent:test", client_uid=1000,
+        runtime_session_id="anchor:test", control_domain_id="anchor:domain",
+        embodiment_instance_id="anchor:arms",
+        camera_config_path=REPO_ROOT / "teleop_runtime/configs/devices/agent_gateway_realsense.json",
+        camera_registry_path=DEFAULT_RM65_CAMERA_REGISTRY_V4,
+        camera_mount_urdf_path=DEFAULT_RM65_CAMERA_MOUNT_URDF,
+        artifact_root=tmp_path, enable_back_projection=True,
+        enable_surface_anchor_v2=True, object_localizer=localizer,
+    )
+    session = composition.deployment.gateway_session
+    try:
+        from PIL import Image
+        from agent_gateway.profiles.back_projection import (
+            CorrelatedPlacementCapture, LiveAlignedDepthCapture,
+        )
+        from agent_gateway.profiles.segmentation import LiveRgbSegmentationCapture
+        from deployments.perception.sam2_grounding_dino import (
+            GroundedObjectSegment, encode_grounded_object_segment_artifacts,
+        )
+        import time
+
+        manifest = session.contract_bundle.route_manifest
+        capture = manifest.route("perception.capture_surface_anchor", "2")
+        assert capture.route.control_effect_class == "read_only"
+        assert capture.route.max_operation_duration_ms == 60_000
+        assert manifest.route("perception.segment", "1").route.max_operation_duration_ms == 60_000
+        assert session.surface_anchor_executor is not None
+        assert ("perception.capture_surface_anchor", "2") in session.passive_read_executors_by_skill_ref
+        assert session.localization_provider is None
+        assert session.station_point_grasp_provider is None
+        assert session.contract_bundle.placement_registration is None
+        assert localizer in composition.resources.additional_resources
+        assert all(backend.starts == 0 for backend in lower.arm_backends.values())
+        assert guard.starts == 0
+        profile = session.back_projection_provider.registration.profile
+        width, height = profile.dimensions_by_role["main"]
+        source_id = profile.source_id_by_role["main"]
+        mask = np.zeros((height, width), dtype=bool)
+        mask[height // 2 - 10:height // 2 + 10, width // 2 - 10:width // 2 + 10] = True
+        selected = np.argwhere(mask)
+        calls = []
+
+        def segment(image, *, language_prompt, pixel_uv, min_score):
+            calls.append((language_prompt, pixel_uv, min_score))
+            assert image.size == (width, height)
+            return GroundedObjectSegment(
+                mask=mask, score=0.9, label=language_prompt,
+                box_xyxy=(int(selected[:, 1].min()), int(selected[:, 0].min()),
+                          int(selected[:, 1].max() + 1), int(selected[:, 0].max() + 1)),
+            )
+
+        monkeypatch.setattr(localizer, "segment", segment)
+        monkeypatch.setattr(localizer, "encode_segment_artifacts",
+                            encode_grounded_object_segment_artifacts)
+        cut_reads = []
+
+        def capture_cut(*, role, expected_station_revision):
+            cut_reads.append((role, expected_station_revision))
+            acquired_at = time.time()
+            depth = LiveAlignedDepthCapture(
+                source_id=source_id, role=role, captured_at=acquired_at,
+                station_revision=expected_station_revision,
+                capture_group_id="real:test-cut", depth_content_hash="a" * 64,
+                intrinsics={"width": width, "height": height, "fx": 500.0,
+                            "fy": 500.0, "cx": width / 2, "cy": height / 2},
+                reference_from_camera=np.eye(4),
+                depth_m=np.ones((height, width), dtype=np.float32),
+            )
+            rgb = LiveRgbSegmentationCapture(
+                source_id=source_id, role=role, captured_at=acquired_at,
+                station_revision=expected_station_revision,
+                image=Image.new("RGB", (width, height)),
+                rgb_content_hash="b" * 64,
+            )
+            return CorrelatedPlacementCapture(rgb=rgb, depth=depth)
+
+        monkeypatch.setattr(session.back_projection_provider.capture_port,
+                            "capture_placement_rgbd", capture_cut)
+        parameters = {"role": "main", "selection_mode": "mask_interior",
+                      "target_pixel_uv": None, "language_prompt": "blue cube",
+                      "min_score": 0.25}
+        result = session.surface_anchor_executor._read(
+            SimpleNamespace(parameters=parameters, expected_station_revision=0,
+                            runtime_session_id=manifest.runtime_session_id,
+                            semantic_content_hash="c" * 64),
+            SimpleNamespace(operation_id="real-anchor:test"),
+        )
+        assert cut_reads == [("main", 0)]
+        assert calls == [("blue cube", None, 0.25)]
+        assert result.execution_result["selection"]["input_rgb_content_hash"] == "b" * 64
+        assert result.execution_result["measurement"]["reference_frame_id"] == profile.reference_frame_id
+        assert len(result.output_artifact_bindings) == 3
+    finally:
+        session.close()
+
+
+def test_real_surface_anchor_rejects_unbounded_model_before_resource_start(
+    monkeypatch, tmp_path,
+):
+    lower, guard = _lower(monkeypatch)
+    localizer = _Localizer()
+    localizer.timeout_sec = 46.0
+    with pytest.raises(ValueError, match="at most 45s"):
+        assemble_exclusive_rm65_agent_primitive_composition(
+            lower=lower, socket_path=tmp_path / "anchor.sock",
+            authorized_side="right", authorized_action="move_tcp_to_pose",
+            confirmation_token=REAL_AGENT_PRIMITIVE_CONFIRM_TOKEN,
+            client_id="rpent:test", client_uid=1000,
+            runtime_session_id="anchor:timeout", control_domain_id="anchor:domain",
+            embodiment_instance_id="anchor:arms",
+            enable_back_projection=True, enable_surface_anchor_v2=True,
+            object_localizer=localizer,
+        )
+    assert all(backend.starts == 0 for backend in lower.arm_backends.values())
+    assert guard.starts == 0
 
 
 @pytest.mark.parametrize("side", ["left", "right"])

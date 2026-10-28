@@ -1,0 +1,6 @@
+{
+  "geometry_mode": "cad_surface",
+  "depth_tolerance_m": 0.025,
+  "tool_surface_bounds_m": [[-0.045, 0.045], [-0.05, 0.05], [-0.05, 0.05]],
+  "body_surface_tolerance_m": 0.05
+}

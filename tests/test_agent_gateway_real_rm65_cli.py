@@ -88,6 +88,23 @@ def test_cli_observed_safe_move_does_not_require_grasp_models(tmp_path):
     assert args.safe_motion_debug_dir == tmp_path
 
 
+@pytest.mark.parametrize("extra", [[], ["--enable-back-projection"],
+                                    ["--safe-motion-observation-roles", "main"]])
+def test_observed_point_requires_projection_and_safe_scene_before_devices(monkeypatch, tmp_path, extra):
+    def forbidden(*args, **kwargs):
+        raise AssertionError("Invalid observed-point configuration must fail before device/profile resolution")
+
+    monkeypatch.setattr(gateway_cli, "resolve_exclusive_rm65_skill_deployment_profile", forbidden)
+    argv = _argv(confirmation=REAL_AGENT_PRIMITIVE_SESSION_CONFIRM_TOKEN,
+                 socket_path=tmp_path / "gateway.sock")
+    argv[argv.index("move_tcp_to_pose")] = "move_to_observed_point"
+    camera = str(REPO_ROOT / "pyproject.toml")
+    argv.extend(["--camera-config", camera, "--camera-registry", camera,
+                 "--artifact-root", str(tmp_path), *extra])
+    with pytest.raises(SystemExit, match="2"):
+        gateway_cli.main(argv)
+
+
 def test_cli_debug_scene_requires_observed_safe_move_before_devices(monkeypatch, tmp_path):
     def forbidden(*args, **kwargs):
         raise AssertionError("No profile/device resolution is allowed for invalid debug configuration")
@@ -276,6 +293,46 @@ def test_cli_defaults_to_the_detailed_v4_camera_mount_urdf() -> None:
     assert effective.name == (
         "rm65_dual_arm_wrist_cameras_v4_head_camera_4b2_cad_with_legacy_housing.urdf"
     )
+
+
+def test_surface_anchor_v2_is_explicit_and_requires_back_projection(monkeypatch, capsys):
+    parser = gateway_cli.build_parser()
+    parsed = parser.parse_args(_argv(confirmation=REAL_AGENT_PRIMITIVE_SESSION_CONFIRM_TOKEN))
+    assert parsed.enable_surface_anchor_v2 is False
+    monkeypatch.setattr(
+        gateway_cli, "resolve_exclusive_rm65_skill_deployment_profile",
+        lambda *_args, **_kwargs: pytest.fail("Invalid anchor flags must fail before lower assembly"),
+    )
+    with pytest.raises(SystemExit) as rejected:
+        gateway_cli.main([
+            *_argv(confirmation=REAL_AGENT_PRIMITIVE_SESSION_CONFIRM_TOKEN),
+            "--enable-surface-anchor-v2",
+        ])
+    assert rejected.value.code == 2
+    assert "requires back projection" in capsys.readouterr().err
+    with pytest.raises(SystemExit) as rejected:
+        gateway_cli.main([
+            *_argv(confirmation=REAL_AGENT_PRIMITIVE_SESSION_CONFIRM_TOKEN),
+            "--enable-surface-anchor-v2", "--enable-back-projection",
+            "--sam3-timeout-sec", "121",
+        ])
+    assert rejected.value.code == 2
+    assert "in (0, 45]" in capsys.readouterr().err
+
+
+def test_anchor_motion_v2_requires_explicit_producer_action_and_safe_scene(monkeypatch, capsys):
+    parsed = gateway_cli.build_parser().parse_args(
+        _argv(confirmation=REAL_AGENT_PRIMITIVE_SESSION_CONFIRM_TOKEN))
+    assert parsed.enable_anchor_motion_v2 is False
+    monkeypatch.setattr(gateway_cli, "resolve_exclusive_rm65_skill_deployment_profile",
+                        lambda *_args, **_kwargs: pytest.fail("Invalid v2 motion flags reached lower assembly"))
+    with pytest.raises(SystemExit) as rejected:
+        gateway_cli.main([
+            *_argv(confirmation=REAL_AGENT_PRIMITIVE_SESSION_CONFIRM_TOKEN),
+            "--enable-anchor-motion-v2",
+        ])
+    assert rejected.value.code == 2
+    assert "requires the observed-point action" in capsys.readouterr().err
 
 
 @pytest.mark.parametrize("scene", (

@@ -74,6 +74,7 @@ from agent_gateway.skills.motion.definition import (
     SAFE_TCP_POSE_TARGET_SKILL_ID_V1,
     TCP_POSE_TARGET_SKILL_ID_V1,
 )
+from agent_gateway.skills.motion.observed_point import SKILL_ID as OBSERVED_POINT_SKILL_ID
 from agent_gateway.transport.unix_transport import (
     AgentGatewayUnixJsonServer,
     AgentGatewayUnixPeerClientMap,
@@ -112,6 +113,11 @@ from .motion_primitive_profiles import (
     RealAgentPrimitiveContractBundle,
 )
 from .motion_primitive_skill import RealAgentPrimitiveSkillLifecycle
+from .motion_observed_scene import ObservedSafeMovePlanner, SafeMotionObservationConfig
+from .observed_point_motion import (
+    RealObservedAnchorMotionLifecycle,
+    RealObservedPointMotionLifecycle,
+)
 from .object_transport import build_object_transport_executor
 from .observation_gateway import RealControlOwnerState
 from .perception_gateway import build_real_perception_passive_executors
@@ -752,6 +758,7 @@ class RealAgentPrimitiveGatewaySession:
     rgbd_geometry_executors: tuple[PassiveReadSkillExecutor, ...] = ()
     gripper_ports: Mapping[str, RealDmtacGripperControlPort] = field(default_factory=dict)
     grasp_fast_plan_executor: PassiveReadSkillExecutor | None = None
+    surface_anchor_executor: PassiveReadSkillExecutor | None = None
     _close_lock: threading.Lock = field(default_factory=threading.Lock, init=False)
     _close_outcome: AgentGatewayOperationOutcome | None = field(
         default=None,
@@ -828,6 +835,10 @@ class RealAgentPrimitiveGatewaySession:
             raise ValueError(
                 "Real segmentation registration and runtime resources disagree."
             )
+        if (self.contract_bundle.surface_anchor_capture_registration is not None) != (
+            self.surface_anchor_executor is not None
+        ):
+            raise ValueError("Real surface anchor registration and executor disagree.")
         placement_enabled = self.contract_bundle.placement_registration is not None
         if placement_enabled != all(
             item is not None
@@ -883,6 +894,7 @@ class RealAgentPrimitiveGatewaySession:
             "perception.back_project": self.back_projection_executor,
             "perception.localize_objects": self.localization_executor,
             "perception.segment": self.segmentation_executor,
+            "perception.capture_surface_anchor": self.surface_anchor_executor,
             "perception.plan_placement": self.placement_executor,
             "perception.plan_point_grasp": self.station_point_grasp_executor,
             "perception.render_point_grasp_candidate": (
@@ -1000,6 +1012,9 @@ class RealAgentPrimitiveGatewaySession:
                     (self.rgb_executor, 5.0),
                     (self.depth_executor, 5.0),
                     (self.back_projection_executor, 5.0),
+                    (self.surface_anchor_executor,
+                     5.0 if self.contract_bundle.surface_anchor_capture_registration is None
+                     else 5.0 + self.contract_bundle.surface_anchor_capture_registration.entry.route.max_operation_duration_ms / 1000.0),
                     (
                         self.placement_executor,
                         PLACEMENT_MAX_OPERATION_DURATION_MS_V1 / 1_000.0 + 5.0,
@@ -1017,7 +1032,9 @@ class RealAgentPrimitiveGatewaySession:
             )
             segmentation_settled = (
                 self.segmentation_executor is None
-                or self.segmentation_executor.wait_all(timeout_sec=65.0)
+                or self.segmentation_executor.wait_all(timeout_sec=(
+                    5.0 + self.contract_bundle.segmentation_registration.skill.routes[0].max_operation_duration_ms / 1000.0
+                ))
             )
             if not passive_reads_settled or not segmentation_settled:
                 raise RuntimeError(
@@ -1252,6 +1269,7 @@ def _real_hardware_view_provider(
                 "perception.localize_objects",
                 "perception.plan_point_grasp",
                 "perception.segment",
+                "perception.capture_surface_anchor",
             }
         )
         if not model_route_hashes:
@@ -1380,11 +1398,15 @@ def assemble_real_agent_primitive_gateway_session(
             "Grasp approach Route requires exactly one URDF/FCL trajectory planner."
         )
     safe_pose_enabled = any(
-        entry.route.skill_id == SAFE_TCP_POSE_TARGET_SKILL_ID_V1
+        entry.route.skill_id in {SAFE_TCP_POSE_TARGET_SKILL_ID_V1, OBSERVED_POINT_SKILL_ID}
         for entry in contract_bundle.route_manifest.skill_routes
     )
     if safe_pose_enabled != callable(safe_pose_trajectory_planner):
         raise ValueError("Safe pose Route requires its independently bound trajectory planner.")
+    if contract_bundle.observed_point_profile is not None and (
+            not isinstance(safe_pose_trajectory_planner, ObservedSafeMovePlanner)
+            or not isinstance(safe_pose_trajectory_planner.config, SafeMotionObservationConfig)):
+        raise ValueError("Observed-point Route requires the existing RGB-D safe planner and policy.")
     grasp_approach_plan_enabled = (
         contract_bundle.grasp_approach_plan_registration is not None
     )
@@ -1566,7 +1588,12 @@ def assemble_real_agent_primitive_gateway_session(
     )
     for entry in motion_entries:
         route = entry.route
-        binding = contract_bundle.binding_for_skill(route.skill_id)
+        # Keep the v1 worker identity stable while giving a second version its
+        # own lifecycle entry. The route registry and close fence must retain
+        # both executors even though they share a public Skill id.
+        executor_key = (route.skill_id if route.skill_version == "1"
+                        else f"{route.skill_id}@{route.skill_version}")
+        binding = contract_bundle.binding_for_skill(route.skill_id, route.skill_version)
         if route.skill_id == EXECUTE_GRASP_APPROACH_PLAN_SKILL_ID_V1:
             registration = contract_bundle.grasp_approach_plan_registration
             if registration is None:
@@ -1574,6 +1601,12 @@ def assemble_real_agent_primitive_gateway_session(
                     "Plan execution Route exists without its paired registration."
                 )
             profile = registration.profile
+        elif route.skill_id == OBSERVED_POINT_SKILL_ID:
+            profile = (contract_bundle.observed_anchor_profile_v2
+                       if route.skill_version == "2"
+                       else contract_bundle.observed_point_profile)
+            if profile is None:
+                raise RuntimeError("Observed-point Route has no bound profile.")
         elif route.skill_id in {
             TCP_POSE_TARGET_SKILL_ID_V1,
             SAFE_TCP_POSE_TARGET_SKILL_ID_V1,
@@ -1595,7 +1628,28 @@ def assemble_real_agent_primitive_gateway_session(
             _binding=binding,
             _profile=profile,
         ):
-            return RealAgentPrimitiveSkillLifecycle(
+            lifecycle_type = RealAgentPrimitiveSkillLifecycle
+            extra = {}
+            if _route.skill_id == OBSERVED_POINT_SKILL_ID:
+                lifecycle_type = (RealObservedAnchorMotionLifecycle
+                                  if _route.skill_version == "2"
+                                  else RealObservedPointMotionLifecycle)
+
+                def lookup_observation(identifier):
+                    source_request = service.operation_store.request_for_operation(identifier)
+                    source_operation = service.operation_store.get(identifier)
+                    return (None if source_request is None or source_operation is None
+                            else (source_request, source_operation))
+
+                extra = {"lookup_observation": lookup_observation,
+                         "observation_config": safe_pose_trajectory_planner.config}
+                if _route.skill_version == "2":
+                    extra.update(
+                        artifact_store=artifact_store,
+                        capture_registration=contract_bundle.surface_anchor_capture_registration,
+                        current_station_revision=lambda: producer.current_station_revision,
+                    )
+            return lifecycle_type(
                 port=port,
                 contract_bundle=contract_bundle,
                 route=_route,
@@ -1605,7 +1659,7 @@ def assemble_real_agent_primitive_gateway_session(
                 operation=operation,
                 grasp_trajectory_planner=(
                     safe_pose_trajectory_planner
-                    if _route.skill_id == SAFE_TCP_POSE_TARGET_SKILL_ID_V1
+                    if _route.skill_id in {SAFE_TCP_POSE_TARGET_SKILL_ID_V1, OBSERVED_POINT_SKILL_ID}
                     else grasp_trajectory_planner
                     if _route.skill_id == GRASP_APPROACH_SKILL_ID_V1
                     else None
@@ -1622,19 +1676,20 @@ def assemble_real_agent_primitive_gateway_session(
                 ),
                 clock=clock,
                 sleep=sleep,
+                **extra,
             )
 
         executor = ReusableStationAgentSkillOperationExecutor(
             port_id=(
                 "agent-gateway:real-primitive:"
-                + route.skill_id
+                + executor_key
                 + ":"
                 + contract_bundle.route_manifest.runtime_session_id
             ),
             binding=StationOperationWorkerBinding(
                 worker_id=(
                     "real-agent-primitive-worker:"
-                    + route.skill_id
+                    + executor_key
                     + ":"
                     + contract_bundle.route_manifest.runtime_session_id
                 ),
@@ -1651,7 +1706,7 @@ def assemble_real_agent_primitive_gateway_session(
             current_station_revision=lambda: producer.current_station_revision,
             clock=clock,
         )
-        executors[route.skill_id] = executor
+        executors[executor_key] = executor
         execution_port_by_route_hash[route.semantic_content_hash] = executor
     if contract_bundle.gripper_contract is not None:
         gripper_executor = build_gripper_skill_executor(
@@ -1675,6 +1730,7 @@ def assemble_real_agent_primitive_gateway_session(
     localization_executor = None
     segmentation_provider = None
     segmentation_executor = None
+    surface_anchor_executor = None
     placement_provider = None
     placement_executor = None
     station_point_grasp_provider = None
@@ -1750,6 +1806,25 @@ def assemble_real_agent_primitive_gateway_session(
             execution_port_by_route_hash[
                 segmentation_registration.skill.routes[0].semantic_content_hash
             ] = segmentation_executor
+        anchor_registration = contract_bundle.surface_anchor_capture_registration
+        if anchor_registration is not None:
+            if back_projection_provider is None or segmentation_provider is None:
+                raise ValueError("Real surface anchor requires the exact depth and segmentation providers.")
+            from agent_gateway.profiles.surface_anchor import build_surface_anchor_capture_executor
+
+            surface_anchor_executor = build_surface_anchor_capture_executor(
+                registration=anchor_registration,
+                provider=back_projection_provider,
+                segmentation_provider=segmentation_provider,
+                store=artifact_store,
+                current_station_revision=lambda: producer.current_station_revision,
+                clock=clock,
+                clock_domain_id=contract_bundle.attachment.clock_domain_id,
+                max_retained_operations=max_retained_operations,
+            )
+            execution_port_by_route_hash[
+                anchor_registration.entry.route.semantic_content_hash
+            ] = surface_anchor_executor
         placement_registration = contract_bundle.placement_registration
         if placement_registration is not None:
             assert segmentation_registration is not None
@@ -2123,6 +2198,7 @@ def assemble_real_agent_primitive_gateway_session(
         localization_executor=localization_executor,
         segmentation_provider=segmentation_provider,
         segmentation_executor=segmentation_executor,
+        surface_anchor_executor=surface_anchor_executor,
         placement_provider=placement_provider,
         placement_executor=placement_executor,
         station_point_grasp_provider=station_point_grasp_provider,
