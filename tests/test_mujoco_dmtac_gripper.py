@@ -43,6 +43,7 @@ from sim.mujoco.actuation import (
     bounded_cad_dmtac_cube_contact_gripper_profile,
     cad_bimanual_dmtac_gripper_profile,
     cad_dmtac_cube_contact_gripper_profile,
+    dmtac_gripper_profile_with_object_contacts,
     identified_bimanual_dmtac_gripper_profile,
     point_grasp_cad_bimanual_dmtac_gripper_profile,
     rm65_bimanual_udp_feedback_profile,
@@ -176,6 +177,107 @@ def test_installed_cad_operating_profile_preserves_force_and_contact_tuning():
     for name in baseline.joint_names_by_gripper:
         assert baseline.closed_qpos_by_gripper[name] == (.864,)*6
         assert bounded.qpos_from_close(name, 1.) == (.8,)*6
+
+
+def test_dmtac_object_contact_adapter_rebinds_cube_pairs_without_mutating_baseline():
+    baseline = bounded_cad_dmtac_cube_contact_gripper_profile()
+    unrelated_pair = ("static_fixture_collision", "another_collision")
+    with_unrelated = replace(
+        baseline,
+        contact_tuning=replace(
+            baseline.contact_tuning,
+            geom_pairs=baseline.contact_tuning.geom_pairs + (unrelated_pair,),
+        ),
+    )
+
+    adapted = dmtac_gripper_profile_with_object_contacts(
+        with_unrelated,
+        ("blue_cube_collision", "red_can_collision_0", "red_can_collision_1"),
+    )
+
+    expected = {
+        (object_geom, f"{side}_gripper_{finger}_dm_tac_w2m_sensor_collision_0")
+        for object_geom in (
+            "blue_cube_collision",
+            "red_can_collision_0",
+            "red_can_collision_1",
+        )
+        for side in ("left", "right")
+        for finger in ("l", "r")
+    }
+    assert set(adapted.contact_tuning.geom_pairs) == expected | {unrelated_pair}
+    assert baseline.contact_tuning.geom_pairs != adapted.contact_tuning.geom_pairs
+    assert baseline.name == "dmtac_bimanual_cad_cube_contact_20261017.v2_bounded_stroke"
+    assert adapted.name.startswith(baseline.name + ".objects_")
+    assert len(adapted.name.rsplit("objects_", 1)[1]) == 12
+    assert adapted.name == dmtac_gripper_profile_with_object_contacts(
+        with_unrelated,
+        ("red_can_collision_1", "blue_cube_collision", "red_can_collision_0"),
+    ).name
+    assert adapted.force_limit_n == baseline.force_limit_n
+    assert adapted.closed_qpos_by_gripper == baseline.closed_qpos_by_gripper
+    assert adapted.contact_tuning.friction == baseline.contact_tuning.friction
+
+
+@pytest.mark.parametrize(
+    "object_names",
+    [(), ("",), ("object_collision", "object_collision")],
+)
+def test_dmtac_object_contact_adapter_rejects_invalid_object_geom_names(object_names):
+    with pytest.raises(ValueError):
+        dmtac_gripper_profile_with_object_contacts(
+            bounded_cad_dmtac_cube_contact_gripper_profile(), object_names
+        )
+
+
+def test_dmtac_object_contact_adapter_keeps_unrelated_old_object_pair_and_existing_target():
+    baseline = bounded_cad_dmtac_cube_contact_gripper_profile()
+    old_fixture = ("debug_cube_collision", "static_fixture_collision")
+    existing_pad = ("blue_cube_collision", "left_gripper_l_dm_tac_w2m_sensor_collision_0")
+    profile = replace(baseline, contact_tuning=replace(
+        baseline.contact_tuning, geom_pairs=baseline.contact_tuning.geom_pairs + (old_fixture, existing_pad)))
+    adapted = dmtac_gripper_profile_with_object_contacts(profile, ("blue_cube_collision",))
+    assert old_fixture in adapted.contact_tuning.geom_pairs
+    assert sum(set(pair) == set(existing_pad) for pair in adapted.contact_tuning.geom_pairs) == 1
+    assert not any("debug_cube_collision" in pair and "dm_tac_w2m_sensor" in " ".join(pair)
+                   for pair in adapted.contact_tuning.geom_pairs)
+
+
+def test_dmtac_object_contact_adapter_rejects_stale_replaced_object_friction():
+    baseline = bounded_cad_dmtac_cube_contact_gripper_profile()
+    profile = replace(baseline, contact_tuning=replace(baseline.contact_tuning,
+        post_settle_geom_friction_by_name={"debug_cube_collision": (1., .05, .005)}))
+    with pytest.raises(ValueError, match="stale post-settle friction"):
+        dmtac_gripper_profile_with_object_contacts(profile, ("blue_cube_collision",))
+    retained = dmtac_gripper_profile_with_object_contacts(
+        profile, ("blue_cube_collision",), replaced_object_collision_geom_names=())
+    assert "debug_cube_collision" in retained.contact_tuning.post_settle_geom_friction_by_name
+
+
+def test_dmtac_object_contact_adapter_identity_reflects_retained_pairs():
+    baseline = bounded_cad_dmtac_cube_contact_gripper_profile()
+    replaced = dmtac_gripper_profile_with_object_contacts(baseline, ("blue_cube_collision",))
+    retained = dmtac_gripper_profile_with_object_contacts(
+        baseline, ("blue_cube_collision",), replaced_object_collision_geom_names=())
+    assert replaced.contact_tuning.geom_pairs != retained.contact_tuning.geom_pairs
+    assert replaced.name != retained.name
+
+
+def test_dmtac_object_contact_adapter_retains_bound_targets_when_extended():
+    baseline = bounded_cad_dmtac_cube_contact_gripper_profile()
+    first = dmtac_gripper_profile_with_object_contacts(baseline, ("blue_cube_collision",))
+    extended = dmtac_gripper_profile_with_object_contacts(
+        first, ("red_cube_collision",), replaced_object_collision_geom_names=())
+    assert extended.contact_tuning.object_contact_geom_names == ("blue_cube_collision", "red_cube_collision")
+    assert extended.contact_tuning.to_metadata()["object_contact_geom_names"] == [
+        "blue_cube_collision", "red_cube_collision"]
+
+
+@pytest.mark.parametrize("object_names", ["blue_cube_collision", (None,), (1,)])
+def test_dmtac_object_contact_adapter_rejects_non_name_sequences(object_names):
+    with pytest.raises(ValueError):
+        dmtac_gripper_profile_with_object_contacts(
+            bounded_cad_dmtac_cube_contact_gripper_profile(), object_names)
 
 
 @pytest.mark.parametrize("hard_range", ("-0.035 0", "-0.04 0.01"))

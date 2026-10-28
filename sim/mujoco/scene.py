@@ -303,6 +303,7 @@ class MujocoScene:
         mjcf_path: str | Path | None = None,
         debug_proxy_visuals: bool = False,
         gripper_specs: Mapping[str, GripperSpec] | Sequence[GripperSpec] | None = None,
+        object_visual_mesh_paths: Mapping[str, str | Path] | None = None,
         position_actuation_profile: PositionActuationProfile | None = None,
         gripper_actuation_profile: GripperActuationProfile | None = None,
     ) -> "MujocoScene":
@@ -318,6 +319,7 @@ class MujocoScene:
             debug_proxy_visuals=debug_proxy_visuals,
             gripper_specs=gripper_specs,
             scene_spec=contract.scene,
+            object_visual_mesh_paths=object_visual_mesh_paths,
             position_actuation_profile=position_actuation_profile,
             gripper_actuation_profile=gripper_actuation_profile,
         )
@@ -376,6 +378,7 @@ class MujocoScene:
         debug_proxy_visuals: bool = False,
         gripper_specs: Mapping[str, GripperSpec] | Sequence[GripperSpec] | None = None,
         scene_spec: SceneSpec | None = None,
+        object_visual_mesh_paths: Mapping[str, str | Path] | None = None,
         position_actuation_profile: PositionActuationProfile | None = None,
         gripper_actuation_profile: GripperActuationProfile | None = None,
     ) -> "MujocoScene":
@@ -398,6 +401,7 @@ class MujocoScene:
             gravity=gravity,
             debug_proxy_visuals=debug_proxy_visuals,
             scene_spec=scene_spec,
+            object_visual_mesh_paths=object_visual_mesh_paths,
             position_actuation_profile=position_actuation_profile,
             gripper_actuation_profile=gripper_actuation_profile,
         )

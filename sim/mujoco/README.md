@@ -14,6 +14,31 @@ This package provides a reusable MuJoCo layer for DexTeleop real2sim checks.
 The first implementation is intentionally position-controlled only: no force
 sensor, gravity compensation, impedance control, or hardware streaming.
 
+`scene_spec.v2` supports primitive free-body targets (`box`, `cylinder`,
+`sphere`, and `ellipsoid`) with full extents in meters; legacy v1 remains
+unchanged. A rendered mesh alone is not a contact collider.
+
+MuJoCo experiments can bind an external `.obj` or `.stl` visual mesh to a named
+`FreeBodyObjectSpec` using `MujocoScene.from_contract(...,
+object_visual_mesh_paths={...})` or `MujocoScene.from_urdf(...)`. Paths are
+runtime inputs, not tracked scene contracts. The mesh is visual-only
+(`contype=0`, `conaffinity=0`, `density=0`); the declared primitive remains the
+collider and inertial approximation. Verify the mesh's frame and scale against
+the proxy before use. This direct construction path does not use
+`ModelArtifactCache`; its current cache interface does not accept object mesh
+bindings, so do not reuse a cached model as if it contained them.
+
+The simulation-only Cube-Lift CAD contact profile binds explicit pairs to
+`debug_cube_collision`. For other objects, the explicit
+`dmtac_gripper_profile_with_object_contacts` adapter rebinds target-to-pad pairs
+while preserving unrelated pairs and physical settings. It rejects stale
+post-settle friction for a replaced object; resolve that configuration
+explicitly. The adapter records its object geometries in profile metadata;
+MJCF assembly checks free-object collision group, configured gripper sensor
+group and ownership before emitting the pairs. The existing grasp-contact guard
+continues to bind the selected target at runtime. Neither
+visual binding nor contact rebinding proves physical grasp success.
+
 The existing dataset replay remains an explicit kinematic diagnostic path. The
 physical profile additionally compiles URDF collision geoms, contact
 group/masks, gravity, ground, a freejoint debug object, and opt-in RM65
