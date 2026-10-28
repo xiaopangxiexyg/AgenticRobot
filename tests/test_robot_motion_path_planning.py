@@ -600,3 +600,37 @@ def test_shared_motion_quality_rejects_corrupt_samples(q, xyz):
 
     with pytest.raises(ValueError):
         sampled_path_motion_quality(q, xyz)
+
+
+def test_endpoint_joint_travel_bound_uses_same_unwrapped_proximal_limit():
+    from robot_motion.path_planning.motion_quality import PathMotionQualityLimits
+    limits = PathMotionQualityLimits()
+    start, end = np.zeros(6), np.zeros(6)
+    end[0] = np.pi
+    assert not limits.endpoint_joint_travel_exceeded(start, end)
+    end[0] += 1e-6
+    assert limits.endpoint_joint_travel_exceeded(start, end)
+    start[0], end[0] = np.deg2rad([-170., 170.])
+    assert limits.endpoint_joint_travel_exceeded(start, end)
+    start[:] = 0.; end[:] = 0.; end[4] = 2 * np.pi
+    assert not limits.endpoint_joint_travel_exceeded(start, end)
+    end[:] = 0.; end[1] = np.deg2rad(120.)
+    assert not limits.endpoint_joint_travel_exceeded(start, end)
+    assert PathMotionQualityLimits(maximum_proximal_joint_travel_rad=np.deg2rad(100.)).endpoint_joint_travel_exceeded(start, end)
+
+
+def test_endpoint_rejection_implies_existing_final_quality_rejection():
+    from robot_motion.path_planning.motion_quality import PathMotionQualityLimits, sampled_path_motion_quality
+    limits = PathMotionQualityLimits()
+    rng = np.random.default_rng(19)
+    for _ in range(64):
+        path = rng.uniform(-3., 3., size=(10, 6))
+        if limits.endpoint_joint_travel_exceeded(path[0], path[-1]):
+            assert limits.exceeded(sampled_path_motion_quality(path, np.zeros((10, 3))))
+
+
+@pytest.mark.parametrize("start,end", [(np.zeros(2),np.zeros(2)),(np.zeros(6),np.zeros(5)),
+                                        (np.zeros(6),np.full(6,np.nan))])
+def test_endpoint_quality_corruption_is_not_a_valid_rejection(start,end):
+    from robot_motion.path_planning.motion_quality import PathMotionQualityLimits
+    with pytest.raises(ValueError):PathMotionQualityLimits().endpoint_joint_travel_exceeded(start,end)

@@ -87,6 +87,74 @@ from teleop_runtime.skill_deploy.rm65_target_safety import (
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 pytestmark = [pytest.mark.integration, pytest.mark.contract]
+
+
+@pytest.mark.parametrize("side", ("left", "right"))
+@pytest.mark.parametrize("phase", ("safe_pose_target", "pregrasp_target"))
+def test_safe_endpoint_quality_prunes_only_proven_impossible_branches(monkeypatch, side, phase):
+    planner = _planner_without_assets(config=RM65GraspTrajectoryPlanningConfig())
+    planner.planner_config = JointPathPlannerConfig()
+    planner.oracle = SimpleNamespace(scene_hash="scene:test")
+    planner.target_builder = _CartesianQposBuilder()
+    current = {s: np.zeros(6) for s in ("left", "right")}
+    endpoints = []
+    for seed, delta in ((12, 4.3), (0, .2)):
+        target = {s: q.copy() for s, q in current.items()}; target[side][0] = delta
+        endpoints.append(grasp_trajectory_module._EndpointIKCandidate(qpos_by_side=target,
+            seed_index=seed, solve_cycles=1, position_residual_m=0., orientation_residual_deg=0.))
+    calls = []
+    def search(**kwargs):
+        calls.append(kwargs)
+        targets = (kwargs["target_qpos_by_component"], *kwargs["alternative_target_qpos_by_component"])
+        assert len(targets) == (1 if phase == "safe_pose_target" else 2)
+        index = 0 if phase == "safe_pose_target" else 1
+        np.testing.assert_array_equal(targets[index][side], endpoints[1].qpos_by_side[side])
+        return JointPathPlanResult(status=JointPathStatus.PATH_FOUND,
+            start_qpos_by_component=current, target_qpos_by_component=targets[index],
+            movable_components=(side,), waypoints=(current, targets[index]),
+            metadata={"direct_path": True, "selected_target_index": index})
+    monkeypatch.setattr(grasp_trajectory_module, "plan_collision_aware_joint_path", search)
+    planner._revalidate = lambda *args, **kwargs: {"checked": True}
+    result = planner._plan_path_leg(qpos_by_side=current, side=side,
+        target_tool_tcp_world=np.eye(4), planning_phase=phase,
+        endpoint_candidates=tuple(endpoints), deadline=10., monotonic=lambda:0.)
+    assert result.endpoint is endpoints[1] and len(calls) == 1
+    if phase == "safe_pose_target":
+        assert result.search_attempts[0]["endpoint_quality_rejections"][0]["seed_index"] == 12
+    else:
+        assert "endpoint_quality_rejections" not in result.search_attempts[0]
+
+
+def test_all_quality_impossible_endpoints_stop_before_native_path_search(monkeypatch):
+    planner = _planner_without_assets(config=RM65GraspTrajectoryPlanningConfig())
+    current = {s: np.zeros(6) for s in ("left", "right")}
+    target = {s: q.copy() for s, q in current.items()};target["right"][2]=4.3
+    endpoint = grasp_trajectory_module._EndpointIKCandidate(qpos_by_side=target,
+        seed_index=12, solve_cycles=1, position_residual_m=0., orientation_residual_deg=0.)
+    planner._path_search_oracle = lambda **kwargs: pytest.fail("late oracle construction")
+    monkeypatch.setattr(grasp_trajectory_module, "plan_collision_aware_joint_path",
+                        lambda **kwargs:pytest.fail("impossible endpoint reached RRT"))
+    with pytest.raises(RM65GraspTrajectoryPlanningError, match="grasp_path_motion_quality_exceeded") as caught:
+        planner._plan_path_leg(qpos_by_side=current,side="right",target_tool_tcp_world=np.eye(4),
+            planning_phase="safe_pose_target",endpoint_candidates=(endpoint,))
+    assert caught.value.details["planning_phase"] == "endpoint_joint_travel_lower_bound"
+
+
+def test_partial_endpoint_pool_at_deadline_stays_budget_exhausted():
+    planner = _planner_without_assets(config=RM65GraspTrajectoryPlanningConfig())
+    current = {s: np.zeros(6) for s in ("left", "right")}
+    target = {s: q.copy() for s,q in current.items()};target["right"][0]=4.3
+    endpoint = grasp_trajectory_module._EndpointIKCandidate(qpos_by_side=target,
+        seed_index=12, solve_cycles=1, position_residual_m=0., orientation_residual_deg=0.)
+    now=[0.]
+    def partial(**kwargs):
+        now[0]=10.
+        return (endpoint,)
+    planner._endpoint_qpos_candidates=partial
+    with pytest.raises(RM65GraspTrajectoryPlanningError, match="path_planning_time_budget_exhausted") as caught:
+        planner._plan_path_leg(qpos_by_side=current,side="right",target_tool_tcp_world=np.eye(4),
+            planning_phase="safe_pose_target",deadline=10.,monotonic=lambda:now[0])
+    assert caught.value.details["endpoint_quality_rejections"][0]["seed_index"] == 12
 SAFE_QPOS = {
     "left": np.array(
         [

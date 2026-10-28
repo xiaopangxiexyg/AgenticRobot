@@ -43,6 +43,21 @@ class PathMotionQualityLimits:
             "maximum_tcp_detour_excess_m": self.maximum_tcp_detour_excess_m,
         }
 
+    def endpoint_joint_travel_exceeded(self, start: np.ndarray, end: np.ndarray) -> bool:
+        """Necessary rejection under the existing final proximal-travel limit.
+
+        Total variation of each numeric joint path is at least its net change.
+        Do not wrap angles: the executed/quality-checked joint trajectory uses
+        these bounded joint coordinates, not equivalent quaternion poses.
+        This says nothing about collision, IK, wrist travel or TCP detours.
+        """
+        a, b = np.asarray(start, dtype=float), np.asarray(end, dtype=float)
+        if (a.ndim != 1 or a.shape != b.shape or len(a) < 3
+                or not np.isfinite(a).all() or not np.isfinite(b).all()):
+            raise ValueError("Endpoint quality requires aligned finite joint vectors.")
+        lower_bound_deg = np.rad2deg(np.abs(b[:3] - a[:3]))
+        return bool(np.max(lower_bound_deg) > math.degrees(self.maximum_proximal_joint_travel_rad))
+
 
 DEFAULT_PATH_MOTION_QUALITY_LIMITS = PathMotionQualityLimits()
 
