@@ -92,7 +92,15 @@ core and MuJoCo adapter used for the 20260721 fit; tests compare those hashes to
 fixed historical values rather than silently reinterpreting the fit against
 the current files.
 
-当前 MuJoCo 显式指定支撑体释放使用独立绑定
+当前实测点与表面锚点的真机安全运动接入使用独立绑定
+`artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261028_real_observed_motion_v1.json`。
+继承164项输入并更新6项，补入三个执行／装配源码和显式CAD过滤配置，
+合计168项输入／164项Python源码，固定于 `c0334f16467f`；相关离线消费者632通过。
+实测点动作、表面锚点v2采集及锚点v2运动均显式选择，复用原授权、安全规划和HOLD；
+默认15mm自观测范围不变，CAD配置需显式指定。此绑定记录源码及合同资格，
+不代表真机运动或上层Agent任务成功；原fit、timing、历史绑定和held-out资格保持。
+
+前驱 MuJoCo 显式指定支撑体释放使用独立绑定
 `artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261028_named_release_v1.json`。
 继承163项输入并更新11项，新增公开夹爪定义，合计164项输入／161项Python源码，
 固定于 `88db4d1db3c3`；夹爪、事务回滚、观察器、CLI及合同消费者479通过。
