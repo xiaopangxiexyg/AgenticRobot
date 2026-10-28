@@ -173,15 +173,51 @@ box instead of the TCP:
   the footprint are reported as overhead, not as support. Unobserved space is
   not assumed free; the planner still applies its own collision model.
 - `orientation_policy` is explicit: `preserve` keeps the measured TCP
-  orientation; `tool_axis_down` turns the TCP approach axis onto reference -Z
-  with the least rotation.
+  orientation; `tool_axis_down` turns the TCP approach axis toward reference
+  -Z with the least rotation. `tool_axis_max_tilt_rad` (0 to 60 degrees,
+  default 0 = exactly down, `tool_axis_down` only) stops that rotation at the
+  cone boundary; a tool already inside the cone keeps its measured
+  orientation. On the 12 saved RealMan scenes exactly-down hovers were never
+  reachable (IK residuals up to 39 degrees), while a 45-degree cone gave 69 of
+  96 valid candidates.
 
 Proposals are ordered nearest to the current gripper state, centre, face
 centres, then Halton fill, inset by the arrival tolerance. They run through
 the same budgeted region loop as `plan_relation_region` (20 s, 3 s per
 candidate, optional session budget) and the same planner. A found plan is
 accepted only if the achieved FK pose, re-measured with the same geometry,
-satisfies the ORIGINAL bounds. The audit keeps per-candidate support height,
-footprint and overhead counts, and the entity identity. This is an offline
-query semantic, not a published Gateway Skill or a change to the existing TCP
-relation and region semantics.
+satisfies the ORIGINAL bounds; for `tool_axis_down` the achieved approach axis
+must also lie inside the cone within the arrival rotation tolerance. The audit
+keeps per-candidate support height, footprint and overhead counts, and the
+entity identity. This is an offline query semantic, not a published Gateway
+Skill or a change to the existing TCP relation and region semantics.
+
+## Gripper-object relations
+
+`describe_tool_object_relations()` (semantics
+`agenticrobot.relation.tool_object.v1`) measures every saved object surface
+against each bound gripper at the measured TCP, without planning:
+
+- Object surface: the saved mask eroded by 2 px, valid depth within the
+  observation range, back-projected, thinned to 3 mm voxels, and only the
+  largest 10 mm-linked cluster kept. A mask that also covers a nearer occluder
+  (for example a finger in front of the object) is therefore not object
+  evidence.
+- Gripper: the same screening palm/finger solids as above, plus the open
+  closing region between the fingers.
+- Classes per arm and reference: `between_fingers` (at least 10 surface voxels
+  in the closing region), `between_fingers_in_contact_band`, `in_contact_band`
+  (at least 3 voxels within 5 mm of, or inside, the solids), `near` (robust
+  distance at most 5 cm) or `far`. `surface_distance_m` is the third-smallest
+  signed voxel distance. `objects` fuses all views of a label (union of
+  evidence, smallest distance, `views_agree`); `views` keeps each view.
+
+The solids are the maximum-opening screening envelope, so this is proximity
+evidence, not contact, grasp, force or stability. Real own-wrist finger
+surfaces sit 3-5 mm inside it. In the MuJoCo twin (same URDF), the DMTAC sensor
+collision boxes extend about 30 mm beyond the envelope's outer finger faces
+when open, so contact on the outside of a finger can be under-reported; the
+closing-region faces agree within about 1 mm. Measured on the 21 saved samples
+with all SAM3 objects and views: no relation on the 11 clean-start samples, all
+5 pregrasp samples between the fingers, 3 of 4 contact samples in the band. In
+MuJoCo with exact masks, 20 of 20 designed placements matched.
