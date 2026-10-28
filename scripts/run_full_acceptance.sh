@@ -21,6 +21,49 @@ die() {
   exit 2
 }
 
+CHANGE_BASE=""
+PYTEST_ARGUMENTS=()
+while (($#)); do
+  case "$1" in
+    --changed-since|--changed-since=*)
+      [[ -z "$CHANGE_BASE" ]] || die "--changed-since may be supplied only once"
+      if [[ "$1" == --changed-since ]]; then
+        (($# >= 2)) || die "--changed-since requires an ancestor commit"
+        shift
+        CHANGE_BASE="$1"
+      else
+        CHANGE_BASE="${1#--changed-since=}"
+      fi
+      [[ -n "$CHANGE_BASE" ]] || die "--changed-since requires an ancestor commit"
+      ;;
+    *) PYTEST_ARGUMENTS+=("$1") ;;
+  esac
+  shift
+done
+set -- "${PYTEST_ARGUMENTS[@]}"
+
+if [[ -n "$CHANGE_BASE" ]]; then
+  [[ -z "${PYTEST_ADDOPTS:-}" ]] || die "change-aware acceptance does not allow ambient PYTEST_ADDOPTS"
+  [[ -z "${PYTEST_PLUGINS:-}" ]] || die "change-aware acceptance does not allow ambient PYTEST_PLUGINS"
+  option_value=""
+  for argument in "$@"; do
+    if [[ -n "$option_value" ]]; then
+      [[ "$argument" =~ ^[0-9]+([.][0-9]+)?$ ]] || die "invalid $option_value value: $argument"
+      [[ "$option_value" != --durations || "$argument" =~ ^[0-9]+$ ]] || die "invalid --durations value"
+      option_value=""
+      continue
+    fi
+    case "$argument" in
+      --durations|--durations-min) option_value="$argument" ;;
+      --durations=*) [[ "${argument#*=}" =~ ^[0-9]+$ ]] || die "invalid --durations value" ;;
+      --durations-min=*) [[ "${argument#*=}" =~ ^[0-9]+([.][0-9]+)?$ ]] || die "invalid --durations-min value" ;;
+      -q|-v|-vv) ;;
+      *) die "change-aware acceptance permits only verbosity and duration reporting options: $argument" ;;
+    esac
+  done
+  [[ -z "$option_value" ]] || die "missing $option_value value"
+fi
+
 for argument in "$@"; do
   case "$argument" in
     --basetemp|--basetemp=*|-m|--junitxml|--junitxml=*|-o|--override-ini|--override-ini=*)
@@ -64,7 +107,12 @@ prepare_run_root() {
     RUN_ROOT="$requested_root"
   fi
 
-  JUNIT_DESTINATION="${DEXTELEOP_FULL_ACCEPTANCE_JUNIT:-$RUN_ROOT/full-acceptance.xml}"
+  local report_name="full-acceptance.xml"
+  [[ -z "$CHANGE_BASE" ]] || report_name="changed-acceptance.xml"
+  JUNIT_DESTINATION="${DEXTELEOP_FULL_ACCEPTANCE_JUNIT:-$RUN_ROOT/$report_name}"
+  if [[ -n "$CHANGE_BASE" && "${JUNIT_DESTINATION##*/}" == full-acceptance.xml ]]; then
+    die "change-aware evidence must not be named full-acceptance.xml"
+  fi
   case "$JUNIT_DESTINATION" in
     /*) ;;
     *) die "DEXTELEOP_FULL_ACCEPTANCE_JUNIT must be absolute: $JUNIT_DESTINATION" ;;
@@ -145,12 +193,21 @@ prepare_shards() {
   # multiprocessing's forkserver uses TMPDIR, not pytest's short basetemp.
   SHORT_TMP_ROOT="$(mktemp -d "/tmp/dt-full-tmp-${UID:-user}-XXXXXX")"
   mkdir -- "$RUN_ROOT/mujoco-cache"
-  python3 "$REPO_ROOT/scripts/pytest_sharding.py" plan \
-    --repository "$REPO_ROOT" \
-    --tests-root "$REPO_ROOT/tests" \
-    --output-dir "$RUN_ROOT" \
-    --shards "$SHARD_COUNT" \
-    --profile full || die "could not build a complete shard plan"
+  if [[ -n "$CHANGE_BASE" ]]; then
+    python3 "$REPO_ROOT/scripts/pytest_impact.py" plan \
+      --repository "$REPO_ROOT" --base "$CHANGE_BASE" \
+      --output-dir "$RUN_ROOT" --shards "$SHARD_COUNT" || die "could not establish change-aware acceptance"
+    python3 "$REPO_ROOT/scripts/pytest_impact.py" verify \
+      --repository "$REPO_ROOT" --selection "$RUN_ROOT/selection.json" --shards "$SHARD_COUNT" || die "change-aware source or plan changed"
+    echo "[dexteleop-full-acceptance] change-aware run; see selection.json for omissions or full fallback"
+  else
+    python3 "$REPO_ROOT/scripts/pytest_sharding.py" plan \
+      --repository "$REPO_ROOT" \
+      --tests-root "$REPO_ROOT/tests" \
+      --output-dir "$RUN_ROOT" \
+      --shards "$SHARD_COUNT" \
+      --profile full || die "could not build a complete shard plan"
+  fi
   for ((index = 0; index < SHARD_COUNT; index++)); do
     SHARD_LOGS[index]="$RUN_ROOT/shard-${index}.log"
     SHARD_XMLS[index]="$RUN_ROOT/shard-${index}.xml"
@@ -285,6 +342,11 @@ for ((index = SHARD_COUNT - MAX_JOBS; index < SHARD_COUNT; index++)); do
 done
 SHARD_PIDS=()
 
+if [[ -n "$CHANGE_BASE" ]]; then
+  python3 "$REPO_ROOT/scripts/pytest_impact.py" verify \
+    --repository "$REPO_ROOT" --selection "$RUN_ROOT/selection.json" --shards "$SHARD_COUNT" || die "source or plan changed during change-aware acceptance; no aggregate evidence published"
+fi
+
 for ((index = 0; index < SHARD_COUNT; index++)); do
   echo "===== full acceptance shard $index (status=${SHARD_STATUSES[index]}) ====="
   if [[ -f "${SHARD_LOGS[index]}" ]]; then
@@ -300,6 +362,12 @@ if ! python3 "$REPO_ROOT/scripts/pytest_sharding.py" merge-junit \
   OVERALL_STATUS=1
 fi
 echo "[dexteleop-full-acceptance] aggregate JUnit: $JUNIT_DESTINATION"
+
+if [[ -n "$CHANGE_BASE" ]]; then
+  python3 "$REPO_ROOT/scripts/pytest_impact.py" verify \
+    --repository "$REPO_ROOT" --selection "$RUN_ROOT/selection.json" --shards "$SHARD_COUNT" \
+    --junit "$JUNIT_DESTINATION" || die "change-aware evidence is invalid; source or plan changed"
+fi
 
 if ((OVERALL_STATUS != 0)); then
   exit 1

@@ -81,6 +81,20 @@ def test_plan_is_deterministic_complete_and_weighted(tmp_path: Path) -> None:
     assert max(loads) - min(loads) <= 0.3
 
 
+def test_selected_module_plan_preserves_all_requested_targets(tmp_path: Path) -> None:
+    module = _load_sharding_module()
+    tests_root = tmp_path / "tests"
+    tests_root.mkdir()
+    for name in ("first", "second", "omitted"):
+        (tests_root / f"test_{name}.py").write_text("def test_case(): pass\n")
+    selected = ["tests/test_first.py", "tests/test_second.py"]
+    shards = module.plan_shards(tmp_path, tests_root, 2, "full", test_modules=selected)
+    assert {target for shard in shards for target, _, _ in shard} == set(selected)
+    for invalid in ([selected[0], selected[0]], ["tests/missing.py"], []):
+        with pytest.raises(ValueError):
+            module.plan_shards(tmp_path, tests_root, 1, "full", test_modules=invalid)
+
+
 def test_full_profile_tracks_recent_dominant_modules() -> None:
     module = _load_sharding_module()
 

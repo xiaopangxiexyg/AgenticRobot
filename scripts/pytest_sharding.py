@@ -427,10 +427,18 @@ def plan_shards(
     tests_root: Path,
     shard_count: int,
     profile: str,
+    *,
+    test_modules: Iterable[str] | None = None,
 ) -> list[list[tuple[str, Path, float]]]:
     repository = repository.resolve()
     tests_root = tests_root.resolve()
     files = sorted(path for path in tests_root.rglob("test_*.py") if path.is_file())
+    if test_modules is not None:
+        requested = list(test_modules)
+        available = {path.relative_to(repository).as_posix(): path for path in files}
+        if len(requested) != len(set(requested)) or not set(requested) <= available.keys():
+            raise ValueError("selected test modules contain duplicates or unknown paths")
+        files = sorted(available[name] for name in requested)
     if not files:
         raise ValueError(f"no pytest modules found under {tests_root}")
     if not 1 <= shard_count <= len(files):
@@ -485,12 +493,14 @@ def write_plan(
     profile: str,
     prefix: str,
     manifest_name: str = "shard-plan.json",
+    *,
+    test_modules: Iterable[str] | None = None,
 ) -> None:
     if not output_dir.is_dir():
         raise ValueError(f"output directory does not exist: {output_dir}")
     if Path(manifest_name).name != manifest_name or not manifest_name.endswith(".json"):
         raise ValueError(f"invalid shard manifest name: {manifest_name}")
-    shards = plan_shards(repository, tests_root, shard_count, profile)
+    shards = plan_shards(repository, tests_root, shard_count, profile, test_modules=test_modules)
     manifest_shards = []
     for index, shard in enumerate(shards):
         paths_file = output_dir / f"{prefix}-{index}-paths.txt"
