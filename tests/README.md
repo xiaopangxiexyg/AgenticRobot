@@ -125,8 +125,18 @@ Python 元编程的全部依赖；新增所有者或新的可省略测试族需�
 执行产生 `selection.json`、原有 `shard-plan.json`、各分片日志和
 `changed-acceptance.xml`。JUnit 标明 change-aware、实际 full/affected 模式、
 固定 base/HEAD 及省略列表；省略项没有伪造的 pass/skip receipt。
-按变更模式仅接受 verbosity/durations 参数，拒绝额外筛选、插件和环境
-`PYTEST_ADDOPTS`/`PYTEST_PLUGINS`，避免静默缩小已声明集合。默认完整入口的参数行为不变。
+完整入口和按变更模式都只接受 verbosity/durations 参数，拒绝额外筛选、插件、
+环境 `PYTEST_ADDOPTS`/`PYTEST_PLUGINS` 和非零 `PYTHONOPTIMIZE`，避免静默
+缩小已声明集合或关闭断言。完整入口仍是默认行为。
+
+分片结束后先保留 `diagnostic-acceptance.xml`，清理临时资源并完成最终校验后，
+才以不覆盖现有文件的方式发布正式汇总 JUnit。原子发布需要 Linux `renameat2`
+及文件系统对 `RENAME_NOREPLACE` 的支持；入口会在启动分片前检查目标目录，
+不支持时立即失败。运行期间后续若发布失败，入口仍失败并保留诊断报告。
+分片异常退出、空报告或清理失败
+会令入口失败并在可发布的汇总中标记错误；校验失败或分片结果与诊断汇总
+不一致时不会发布正式汇总。
+消费验收结果时应同时检查入口进程退出码与正式 JUnit，不能单凭 XML 认定执行完成。
 
 **affected 成功只证明清单列出的集合，不能声称完整验收成功。** 现有明确要求
 完整验收的 Harness Profile/集成门禁继续调用无此选项的完整入口。本轮只接通

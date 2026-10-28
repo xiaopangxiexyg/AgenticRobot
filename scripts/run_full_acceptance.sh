@@ -42,27 +42,26 @@ while (($#)); do
 done
 set -- "${PYTEST_ARGUMENTS[@]}"
 
-if [[ -n "$CHANGE_BASE" ]]; then
-  [[ -z "${PYTEST_ADDOPTS:-}" ]] || die "change-aware acceptance does not allow ambient PYTEST_ADDOPTS"
-  [[ -z "${PYTEST_PLUGINS:-}" ]] || die "change-aware acceptance does not allow ambient PYTEST_PLUGINS"
-  option_value=""
-  for argument in "$@"; do
-    if [[ -n "$option_value" ]]; then
-      [[ "$argument" =~ ^[0-9]+([.][0-9]+)?$ ]] || die "invalid $option_value value: $argument"
-      [[ "$option_value" != --durations || "$argument" =~ ^[0-9]+$ ]] || die "invalid --durations value"
-      option_value=""
-      continue
-    fi
-    case "$argument" in
-      --durations|--durations-min) option_value="$argument" ;;
-      --durations=*) [[ "${argument#*=}" =~ ^[0-9]+$ ]] || die "invalid --durations value" ;;
-      --durations-min=*) [[ "${argument#*=}" =~ ^[0-9]+([.][0-9]+)?$ ]] || die "invalid --durations-min value" ;;
-      -q|-v|-vv) ;;
-      *) die "change-aware acceptance permits only verbosity and duration reporting options: $argument" ;;
-    esac
-  done
-  [[ -z "$option_value" ]] || die "missing $option_value value"
-fi
+[[ -z "${PYTEST_ADDOPTS:-}" ]] || die "acceptance does not allow ambient PYTEST_ADDOPTS"
+[[ -z "${PYTEST_PLUGINS:-}" ]] || die "acceptance does not allow ambient PYTEST_PLUGINS"
+[[ -z "${PYTHONOPTIMIZE:-}" || "${PYTHONOPTIMIZE}" == 0 ]] || die "acceptance does not allow PYTHONOPTIMIZE"
+option_value=""
+for argument in "$@"; do
+  if [[ -n "$option_value" ]]; then
+    [[ "$argument" =~ ^[0-9]+([.][0-9]+)?$ ]] || die "invalid $option_value value: $argument"
+    [[ "$option_value" != --durations || "$argument" =~ ^[0-9]+$ ]] || die "invalid --durations value"
+    option_value=""
+    continue
+  fi
+  case "$argument" in
+    --durations|--durations-min) option_value="$argument" ;;
+    --durations=*) [[ "${argument#*=}" =~ ^[0-9]+$ ]] || die "invalid --durations value" ;;
+    --durations-min=*) [[ "${argument#*=}" =~ ^[0-9]+([.][0-9]+)?$ ]] || die "invalid --durations-min value" ;;
+    -q|-v|-vv) ;;
+    *) die "acceptance permits only verbosity and duration reporting options: $argument" ;;
+  esac
+done
+[[ -z "$option_value" ]] || die "missing $option_value value"
 
 for argument in "$@"; do
   case "$argument" in
@@ -87,6 +86,7 @@ SHARD_PIDS=()
 SHARD_STATUSES=()
 SHARD_LOGS=()
 SHARD_XMLS=()
+CLEANUP_COMPLETED=0
 
 prepare_run_root() {
   local requested_root="${DEXTELEOP_FULL_ACCEPTANCE_RUN_ROOT:-}"
@@ -117,6 +117,8 @@ prepare_run_root() {
     /*) ;;
     *) die "DEXTELEOP_FULL_ACCEPTANCE_JUNIT must be absolute: $JUNIT_DESTINATION" ;;
   esac
+  [[ "$(realpath -m -- "$JUNIT_DESTINATION")" != "$(realpath -m -- "$RUN_ROOT/diagnostic-acceptance.xml")" ]] || die \
+    "aggregate JUnit destination must differ from the retained diagnostic report"
   [[ ! -e "$JUNIT_DESTINATION" && ! -L "$JUNIT_DESTINATION" ]] || die \
     "aggregate JUnit destination already exists: $JUNIT_DESTINATION"
   [[ -d "$(dirname -- "$JUNIT_DESTINATION")" ]] || die \
@@ -221,17 +223,19 @@ stop_children() {
   done
 }
 
-cleanup() {
-  local status=$?
+cleanup_resources() {
+  local original_status="$1"
+  local status=0
   local current_root
   local retain_tmp=0
-  trap - EXIT INT TERM
+  ((CLEANUP_COMPLETED == 0)) || return 0
+  CLEANUP_COMPLETED=1
   if ((${#SHARD_PIDS[@]} > 0)); then
     retain_tmp=1
     stop_children
   fi
   if [[ -n "$SHORT_TMP_ROOT" ]]; then
-    if ((retain_tmp || status == 130 || status == 143)); then
+    if ((retain_tmp || original_status == 130 || original_status == 143)); then
       echo "[dexteleop-full-acceptance] interrupted temporary state retained: $SHORT_TMP_ROOT"
     else
       case "$SHORT_TMP_ROOT" in
@@ -254,6 +258,13 @@ cleanup() {
       status=1
     fi
   fi
+  return "$status"
+}
+
+cleanup() {
+  local status=$?
+  trap - EXIT INT TERM
+  cleanup_resources "$status" || status=1
   [[ -z "$RUN_ROOT" ]] || echo "[dexteleop-full-acceptance] artifacts: $RUN_ROOT"
   exit "$status"
 }
@@ -318,6 +329,9 @@ verify_required_model_input
 verify_local_socket_capabilities
 verify_browser_contract_runtime
 prepare_run_root
+python3 "$REPO_ROOT/scripts/pytest_sharding.py" check-junit-publication \
+  --directory "$(dirname -- "$JUNIT_DESTINATION")" || die \
+  "atomic no-replace JUnit publication is unavailable; no shards started"
 prepare_asset_compat_link
 # Wrapper configuration is private to this invocation.  Do not leak it into
 # pytest shards, whose tests may launch a nested acceptance wrapper.
@@ -329,6 +343,7 @@ prepare_shards
 trap on_signal INT TERM
 
 OVERALL_STATUS=0
+WRAPPER_ERRORS=()
 for ((index = 0; index < SHARD_COUNT; index++)); do
   if ((index >= MAX_JOBS)); then
     wait_shard "$((index - MAX_JOBS))"
@@ -354,20 +369,40 @@ for ((index = 0; index < SHARD_COUNT; index++)); do
   else
     echo "missing shard log: ${SHARD_LOGS[index]}" >&2
     OVERALL_STATUS=1
+    WRAPPER_ERRORS+=("shard $index log is missing")
   fi
 done
 
-if ! python3 "$REPO_ROOT/scripts/pytest_sharding.py" merge-junit \
-  --output "$JUNIT_DESTINATION" "${SHARD_XMLS[@]}"; then
+if ! cleanup_resources 0; then
   OVERALL_STATUS=1
+  WRAPPER_ERRORS+=("temporary resource cleanup failed")
 fi
-echo "[dexteleop-full-acceptance] aggregate JUnit: $JUNIT_DESTINATION"
+DIAGNOSTIC_JUNIT="$RUN_ROOT/diagnostic-acceptance.xml"
+if ! python3 "$REPO_ROOT/scripts/pytest_sharding.py" merge-junit \
+  --output "$DIAGNOSTIC_JUNIT" "${SHARD_XMLS[@]}"; then
+  die "cannot merge shard JUnit; individual shard evidence is retained"
+fi
 
 if [[ -n "$CHANGE_BASE" ]]; then
   python3 "$REPO_ROOT/scripts/pytest_impact.py" verify \
     --repository "$REPO_ROOT" --selection "$RUN_ROOT/selection.json" --shards "$SHARD_COUNT" \
-    --junit "$JUNIT_DESTINATION" || die "change-aware evidence is invalid; source or plan changed"
+    --junit "$DIAGNOSTIC_JUNIT" || die "change-aware evidence is invalid; diagnostic JUnit retained"
 fi
+
+PUBLISH_ARGUMENTS=()
+for ((index = 0; index < SHARD_COUNT; index++)); do
+  PUBLISH_ARGUMENTS+=(--shard-status "${SHARD_STATUSES[index]}")
+done
+for error in "${WRAPPER_ERRORS[@]}"; do
+  PUBLISH_ARGUMENTS+=(--wrapper-error "$error")
+done
+if ! python3 "$REPO_ROOT/scripts/pytest_sharding.py" publish-junit \
+  --input "$DIAGNOSTIC_JUNIT" --output "$JUNIT_DESTINATION" \
+  "${PUBLISH_ARGUMENTS[@]}" "${SHARD_XMLS[@]}"; then
+  OVERALL_STATUS=1
+fi
+echo "[dexteleop-full-acceptance] diagnostic JUnit: $DIAGNOSTIC_JUNIT"
+[[ ! -f "$JUNIT_DESTINATION" ]] || echo "[dexteleop-full-acceptance] aggregate JUnit: $JUNIT_DESTINATION"
 
 if ((OVERALL_STATUS != 0)); then
   exit 1

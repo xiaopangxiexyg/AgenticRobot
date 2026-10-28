@@ -38,8 +38,8 @@ INDEPENDENT_ROOTS = ("agent_gateway/", "deployments/perception/", "docs/agent_ga
 DYNAMIC_IMPORT_AUDITS = {
     "control_station/__init__.py": "7a3f64738e85f6572e861aef5d8cf82b6062addd7cb025581d989a4013c792ed",
     "robot_motion/__init__.py": "a048f446659faea95e4b4bda9d4485d9b3870852c1ec6f61056b2472759c3c71",
-    "dataset_contracts/__init__.py": "f052ef8dc0b973d83ca08c5e02881eef1175f469430e56052c2da33a52d99f50",
-    "dataset_interface/__init__.py": "d294081b15f356df26a1c3777038c40e598080d8fbf38842c616290ea6b15601",
+    "dataset_contracts/__init__.py": "4dd404a9080ecac36239c438eb46565b42bd8c74382b9bdc7172ea37675c7b29",
+    "dataset_interface/__init__.py": "9f3f4ed04d694c1b7560a739dfc22ccc1c6df98bd08ef2ebc8c3888935c74ec3",
     "robot_motion/rm65/arm_init/__init__.py": "5736d807dbaaebae99642837cb26b6dd6488f2ccf00ead31f709e254608d4290",
     "robot_motion/rm65/ik_checkpoint.py": "0e283c5c3aa0a2e4fd7dd9e2ec5cb8a843040ef58e59bfa5d0dadb241269418f",
 }
@@ -271,6 +271,7 @@ def protected_dependencies(snapshot: Snapshot, roots: set[str]) -> set[str]:
                         dependencies.update(snapshot.resolve(name + "." + alias.name))
         # Package roots expose literal, lazy public APIs. Traverse all targets,
         # including unused exports; this intentionally overestimates impact.
+        lazy_mappings = []
         for node in tree.body:
             names = (
                 node.targets
@@ -283,22 +284,29 @@ def protected_dependencies(snapshot: Snapshot, roots: set[str]) -> set[str]:
                 isinstance(n, ast.Name) and n.id in {"_LAZY_EXPORTS", "_EXPORTS"}
                 for n in names
             ):
-                mapping = ast.literal_eval(node.value)
-                if not isinstance(mapping, dict):
-                    raise ValueError(f"unsupported lazy export table: {path}")
-                for value in mapping.values():
-                    module = (
-                        value
-                        if isinstance(value, str)
-                        else value[0]
-                        if isinstance(value, (tuple, list)) and value
-                        else None
-                    )
-                    if not isinstance(module, str):
-                        raise TypeError(f"unsupported lazy export target: {path}")
-                    dependencies.update(
-                        snapshot.resolve(snapshot.absolute(path, module))
-                    )
+                lazy_mappings.append(ast.literal_eval(node.value))
+            if (isinstance(node, ast.Expr) and isinstance(node.value, ast.Call)
+                and isinstance(node.value.func, ast.Attribute)
+                and isinstance(node.value.func.value, ast.Name)
+                and node.value.func.value.id in {"_LAZY_EXPORTS", "_EXPORTS"}
+                and node.value.func.attr == "update"):
+                if len(node.value.args) != 1 or node.value.keywords:
+                    raise ValueError(f"unsupported lazy export update: {path}")
+                lazy_mappings.append(ast.literal_eval(node.value.args[0]))
+        for mapping in lazy_mappings:
+            if not isinstance(mapping, dict):
+                raise ValueError(f"unsupported lazy export table: {path}")
+            for value in mapping.values():
+                module = (
+                    value
+                    if isinstance(value, str)
+                    else value[0]
+                    if isinstance(value, (tuple, list)) and value
+                    else None
+                )
+                if not isinstance(module, str):
+                    raise TypeError(f"unsupported lazy export target: {path}")
+                dependencies.update(snapshot.resolve(snapshot.absolute(path, module)))
         for node in nodes:
             if not isinstance(node, ast.Call):
                 continue

@@ -338,6 +338,27 @@ def test_audited_lazy_exports_are_traversed_and_content_drift_fails_closed(
     )
 
 
+def test_audited_lazy_export_updates_are_traversed(repository, impact):
+    repo, _ = repository
+    source = (
+        "from importlib import import_module\n"
+        "_LAZY_EXPORTS = {}\n"
+        "_LAZY_EXPORTS.update({'VALUE': ('.lazy_internal', 'VALUE')})\n"
+        "def __getattr__(name): return getattr(import_module(_LAZY_EXPORTS[name][0]), name)\n"
+    )
+    path = "robot_motion/__init__.py"
+    _write(repo, path, source)
+    _write(repo, "robot_motion/lazy_internal.py", "from agent_gateway.feature import VALUE\n")
+    impact.DYNAMIC_IMPORT_AUDITS[path] = hashlib.sha256(source.encode()).hexdigest()
+    base = _checkpoint(repo)
+    _write(repo, "agent_gateway/feature.py", "VALUE = 2\n")
+    _checkpoint(repo)
+
+    report = impact.selection(repo, base)
+    assert report["mode"] == "full"
+    assert "agent_gateway/feature.py" in report["protected_dependencies"]
+
+
 def test_no_change_never_reuses_an_unproven_result(repository, impact):
     repo, base = repository
     report = impact.selection(repo, base)

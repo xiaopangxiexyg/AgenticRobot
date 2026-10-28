@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import socket
 import subprocess
 import sys
@@ -357,3 +358,98 @@ def test_merge_junit_sums_counts_and_rejects_duplicate_cases(tmp_path: Path) -> 
     )
     assert duplicate.returncode == 2
     assert "duplicate testcase" in duplicate.stderr
+
+
+def test_publish_junit_preserves_existing_destination_and_diagnostic(tmp_path: Path) -> None:
+    module = _load_sharding_module()
+    shard = tmp_path / "shard.xml"
+    shard.write_text('<testsuite tests="1" errors="0" failures="0" skipped="0"><testcase classname="x" name="ok"/></testsuite>')
+    diagnostic = tmp_path / "diagnostic.xml"
+    module.merge_junit(diagnostic, [shard])
+    before = diagnostic.read_bytes()
+    destination = tmp_path / "final.xml"
+    destination.write_text("do not overwrite")
+    with pytest.raises(FileExistsError):
+        module.publish_junit(diagnostic, destination, [shard], [0], [])
+    assert destination.read_text() == "do not overwrite" and diagnostic.read_bytes() == before
+    assert not list(tmp_path.glob('.acceptance-*.xml'))
+
+
+def test_publish_junit_detects_inconsistent_failure_counts(tmp_path: Path) -> None:
+    module = _load_sharding_module()
+    shard = tmp_path / "shard.xml"
+    shard.write_text('<testsuite tests="1" errors="0" failures="0" skipped="0"><testcase classname="x" name="bad"><failure message="forced"/></testcase></testsuite>')
+    diagnostic, destination = tmp_path / "diagnostic.xml", tmp_path / "final.xml"
+    module.merge_junit(diagnostic, [shard])
+    assert module.publish_junit(diagnostic, destination, [shard], [0], []) is True
+    result = ET.parse(destination).getroot()
+    assert int(result.attrib["failures"]) == 1 and int(result.attrib["errors"]) > 0
+    assert result.find('.//testcase/failure') is not None and result.find('.//testcase/error') is not None
+
+
+@pytest.mark.parametrize("declared", ["failures", "errors", "skipped"])
+def test_publish_junit_marks_counts_without_outcome_records(tmp_path: Path, declared: str) -> None:
+    module = _load_sharding_module()
+    counts = {"tests": 1, "errors": 0, "failures": 0, "skipped": 0}
+    counts[declared] = 1
+    root = ET.Element("testsuite", {name: str(value) for name, value in counts.items()})
+    ET.SubElement(root, "testcase", classname="x", name="missing-outcome")
+    shard = tmp_path / "shard.xml"
+    ET.ElementTree(root).write(shard)
+    diagnostic, destination = tmp_path / "diagnostic.xml", tmp_path / "final.xml"
+    module.merge_junit(diagnostic, [shard])
+
+    assert module.publish_junit(diagnostic, destination, [shard], [0], []) is True
+    assert ET.parse(destination).find('.//testcase/error') is not None
+
+
+def test_publish_junit_needs_no_post_publication_unlink(tmp_path: Path, monkeypatch) -> None:
+    module = _load_sharding_module()
+    shard = tmp_path / "shard.xml"
+    shard.write_text('<testsuite tests="1" errors="0" failures="0" skipped="0"><testcase classname="x" name="ok"/></testsuite>')
+    diagnostic, destination = tmp_path / "diagnostic.xml", tmp_path / "final.xml"
+    module.merge_junit(diagnostic, [shard])
+    def reject_unlink(_path):
+        raise OSError("forced post-publication cleanup failure")
+    monkeypatch.setattr(module.os, "unlink", reject_unlink)
+
+    assert module.publish_junit(diagnostic, destination, [shard], [0], []) is False
+    assert destination.is_file() and not list(tmp_path.glob('.acceptance-*.xml'))
+
+
+def test_publish_junit_rejects_shard_drift_after_aggregation(tmp_path: Path) -> None:
+    module = _load_sharding_module()
+    shard = tmp_path / "shard.xml"
+    shard.write_text('<testsuite tests="1" errors="0" failures="0" skipped="0"><testcase classname="x" name="ok"/></testsuite>')
+    diagnostic, destination = tmp_path / "diagnostic.xml", tmp_path / "final.xml"
+    module.merge_junit(diagnostic, [shard])
+    original_diagnostic = diagnostic.read_bytes()
+    shard.write_text('<testsuite tests="1" errors="0" failures="1" skipped="0"><testcase classname="x" name="ok"><failure message="later failure"/></testcase></testsuite>')
+
+    with pytest.raises(ValueError, match="shard.*diagnostic|diagnostic.*shard"):
+        module.publish_junit(diagnostic, destination, [shard], [0], [])
+    assert diagnostic.read_bytes() == original_diagnostic and not destination.exists()
+
+
+def test_publication_preflight_detects_overwrite_behavior(tmp_path: Path, monkeypatch) -> None:
+    module = _load_sharding_module()
+    module.check_junit_publication(tmp_path)
+    assert not list(tmp_path.iterdir())
+    monkeypatch.setattr(module, "_atomic_publish_noreplace", os.replace)
+
+    with pytest.raises(ValueError, match="overwrote an existing file"):
+        module.check_junit_publication(tmp_path)
+    assert not list(tmp_path.iterdir())
+
+
+def test_publish_junit_marks_even_one_empty_shard(tmp_path: Path) -> None:
+    module = _load_sharding_module()
+    good, empty = tmp_path / "good.xml", tmp_path / "empty.xml"
+    good.write_text('<testsuite tests="1" errors="0" failures="0" skipped="0"><testcase classname="x" name="ok"/></testsuite>')
+    empty.write_text('<testsuite tests="0" errors="0" failures="0" skipped="0"/>')
+    diagnostic, destination = tmp_path / "diagnostic.xml", tmp_path / "final.xml"
+    module.merge_junit(diagnostic, [good, empty])
+    assert module.publish_junit(diagnostic, destination, [good, empty], [0, 0], []) is True
+    root = ET.parse(destination).getroot()
+    assert root.find('.//testcase[@name="ok"]') is not None
+    assert 'no testcase records' in root.find('.//testcase/error').get('message')

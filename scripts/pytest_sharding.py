@@ -6,7 +6,10 @@ from __future__ import annotations
 import argparse
 import ast
 import copy
+import ctypes
+import errno
 import json
+import os
 import socket
 import sys
 import tempfile
@@ -608,6 +611,161 @@ def merge_junit(destination: Path, sources: list[Path]) -> None:
     ET.ElementTree(merged).write(destination, encoding="utf-8", xml_declaration=True)
 
 
+def _atomic_publish_noreplace(temporary: str, destination: Path) -> None:
+    """Atomically move a same-directory file without replacing an existing report."""
+    if sys.platform != "linux":
+        raise OSError(errno.ENOTSUP, "atomic no-replace publication requires Linux")
+    libc = ctypes.CDLL(None, use_errno=True)
+    try:
+        renameat2 = libc.renameat2
+    except AttributeError as error:
+        raise OSError(errno.ENOTSUP, "renameat2 is unavailable") from error
+    renameat2.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+    renameat2.restype = ctypes.c_int
+    # AT_FDCWD and RENAME_NOREPLACE: the kernel checks existence atomically.
+    if renameat2(-100, os.fsencode(temporary), -100, os.fsencode(destination), 1) != 0:
+        error_number = ctypes.get_errno()
+        raise OSError(error_number, os.strerror(error_number), str(destination))
+
+
+def check_junit_publication(directory: Path) -> None:
+    """Prove no-replace publication works on the report's filesystem."""
+    if not directory.is_dir():
+        raise ValueError("published JUnit parent does not exist")
+    with tempfile.TemporaryDirectory(prefix=".acceptance-probe-", dir=directory) as temp_dir:
+        source, target = Path(temp_dir) / "source", Path(temp_dir) / "target"
+        source.write_bytes(b"source")
+        target.write_bytes(b"existing")
+        try:
+            _atomic_publish_noreplace(str(source), target)
+        except FileExistsError:
+            pass
+        else:
+            raise ValueError("no-replace publication overwrote an existing file")
+        if source.read_bytes() != b"source" or target.read_bytes() != b"existing":
+            raise ValueError("no-replace publication altered an existing file")
+        target.unlink()
+        _atomic_publish_noreplace(str(source), target)
+        if source.exists() or target.read_bytes() != b"source":
+            raise ValueError("no-replace publication did not move the test file")
+
+
+def _case_signatures(cases: Iterable[ET.Element]) -> dict[tuple[str, str], tuple]:
+    def signature(node: ET.Element) -> tuple:
+        text = node.text if node.text and node.text.strip() else ""
+        return (node.tag, tuple(sorted(node.attrib.items())), text,
+                tuple(signature(child) for child in node))
+
+    result = {}
+    for case in cases:
+        identity = (case.get("classname", ""), case.get("name", ""))
+        if identity in result:
+            raise ValueError("duplicate testcase while checking diagnostic against shards")
+        result[identity] = signature(case)
+    return result
+
+
+def publish_junit(
+    source: Path, destination: Path, shard_sources: list[Path],
+    shard_statuses: list[int], wrapper_errors: list[str],
+) -> bool:
+    """Publish only a finalized report; retain the input as diagnostic evidence.
+
+    A JUnit file is not proof that the wrapper naturally exited: consumers
+    must also check its process status. Known shard/cleanup failures are made
+    visible in the published XML before it can be observed.
+    """
+    if not shard_sources or len(shard_sources) != len(shard_statuses):
+        raise ValueError("each shard must have exactly one exit status")
+    if any(status < 0 or status > 255 for status in shard_statuses):
+        raise ValueError("shard exit status must be within [0, 255]")
+    if source.resolve() == destination.resolve():
+        raise ValueError("diagnostic and published JUnit must be different paths")
+    if not destination.parent.is_dir():
+        raise ValueError("published JUnit parent does not exist")
+    document = ET.parse(source)
+    root = document.getroot()
+    if root.tag != "testsuite":
+        raise ValueError("aggregate JUnit must be a testsuite")
+    for name in ("tests", "errors", "failures", "skipped"):
+        if int(root.attrib.get(name, "0")) < 0:
+            raise ValueError("JUnit counts must be non-negative")
+    issues = list(wrapper_errors)
+    shard_cases = []
+    shard_totals = {name: 0 for name in ("tests", "errors", "failures", "skipped")}
+    for index, (path, status) in enumerate(zip(shard_sources, shard_statuses)):
+        if status:
+            issues.append(f"shard {index} exited with status {status}")
+        suites = tuple(_test_suites(ET.parse(path).getroot(), path))
+        if not any(tuple(suite.iter("testcase")) for suite in suites):
+            issues.append(f"shard {index} produced no testcase records")
+        for suite in suites:
+            cases = tuple(suite.iter("testcase"))
+            shard_cases.extend(cases)
+            counts = {name: int(suite.attrib.get(name, "0"))
+                      for name in ("tests", "errors", "failures", "skipped")}
+            if any(value < 0 for value in counts.values()):
+                raise ValueError("JUnit counts must be non-negative")
+            for name, value in counts.items():
+                shard_totals[name] += value
+            actual = {
+                "tests": len(cases),
+                "errors": sum(case.find("error") is not None for case in cases),
+                "failures": sum(case.find("failure") is not None for case in cases),
+                "skipped": sum(case.find("skipped") is not None for case in cases),
+            }
+            if counts["tests"] < actual["tests"] or any(
+                counts[name] != actual[name] for name in ("errors", "failures", "skipped")
+            ):
+                issues.append(f"shard {index} JUnit counts contradict testcase records")
+    aggregate_cases = tuple(root.iter("testcase"))
+    if (_case_signatures(shard_cases) != _case_signatures(aggregate_cases) or
+        any(shard_totals[name] != int(root.attrib.get(name, "0")) for name in shard_totals)):
+        raise ValueError("diagnostic JUnit does not match the current shard results")
+    aggregate_actual = {
+        "tests": len(aggregate_cases),
+        "errors": sum(case.find("error") is not None for case in aggregate_cases),
+        "failures": sum(case.find("failure") is not None for case in aggregate_cases),
+        "skipped": sum(case.find("skipped") is not None for case in aggregate_cases),
+    }
+    if int(root.attrib.get("tests", "0")) < aggregate_actual["tests"] or any(
+        int(root.attrib.get(name, "0")) != aggregate_actual[name]
+        for name in ("errors", "failures", "skipped")
+    ):
+        issues.append("aggregate JUnit counts contradict testcase records")
+        root.set("tests", str(max(int(root.attrib.get("tests", "0")), aggregate_actual["tests"])))
+        for name in ("errors", "failures", "skipped"):
+            root.set(name, str(aggregate_actual[name]))
+    existing = {(case.get("classname", ""), case.get("name", "")) for case in aggregate_cases}
+    for index, detail in enumerate(issues):
+        identity = ("agenticrobot.acceptance", f"wrapper-error-{index}")
+        if identity in existing:
+            raise ValueError("diagnostic testcase identity collides with a shard testcase")
+        testcase = ET.SubElement(root, "testcase", classname=identity[0], name=identity[1])
+        ET.SubElement(testcase, "error", message=detail).text = detail
+    root.set("tests", str(int(root.attrib.get("tests", "0")) + len(issues)))
+    root.set("errors", str(int(root.attrib.get("errors", "0")) + len(issues)))
+    failed = bool(issues or int(root.attrib.get("errors", "0")) or int(root.attrib.get("failures", "0")))
+    ET.indent(root, space="  ")
+    fd, temporary = tempfile.mkstemp(prefix=".acceptance-", suffix=".xml", dir=destination.parent)
+    published = False
+    try:
+        with os.fdopen(fd, "wb") as stream:
+            document.write(stream, encoding="utf-8", xml_declaration=True)
+            stream.flush()
+            os.fsync(stream.fileno())
+        # No temporary pathname remains after a successful atomic move.
+        _atomic_publish_noreplace(temporary, destination)
+        published = True
+    finally:
+        if not published:
+            try:
+                os.unlink(temporary)
+            except OSError as error:
+                print(f"pytest_sharding: temporary evidence retained: {error}", file=sys.stderr)
+    return failed
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
@@ -622,6 +780,14 @@ def _parser() -> argparse.ArgumentParser:
     merge = commands.add_parser("merge-junit", help="merge and validate shard JUnit")
     merge.add_argument("--output", type=Path, required=True)
     merge.add_argument("sources", type=Path, nargs="+")
+    publish = commands.add_parser("publish-junit", help="publish a finalized, non-overwriting JUnit report")
+    publish.add_argument("--input", type=Path, required=True)
+    publish.add_argument("--output", type=Path, required=True)
+    publish.add_argument("--shard-status", type=int, action="append", required=True)
+    publish.add_argument("--wrapper-error", action="append", default=[])
+    publish.add_argument("sources", type=Path, nargs="+")
+    publish_probe = commands.add_parser("check-junit-publication", help="preflight atomic report publication")
+    publish_probe.add_argument("--directory", type=Path, required=True)
     commands.add_parser(
         "check-sockets",
         help="verify loopback TCP and Unix sockets before complete acceptance",
@@ -644,6 +810,11 @@ def main(argv: list[str] | None = None) -> int:
             )
         elif arguments.command == "merge-junit":
             merge_junit(arguments.output, arguments.sources)
+        elif arguments.command == "publish-junit":
+            return int(publish_junit(arguments.input, arguments.output, arguments.sources,
+                                     arguments.shard_status, arguments.wrapper_error))
+        elif arguments.command == "check-junit-publication":
+            check_junit_publication(arguments.directory)
         else:
             check_required_local_sockets()
     except (OSError, ValueError, ET.ParseError) as error:

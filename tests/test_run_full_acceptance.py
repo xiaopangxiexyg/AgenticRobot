@@ -62,6 +62,11 @@ if __name__ == "__main__":
         if status:
             print("fake socket preflight rejected", file=sys.stderr)
         raise SystemExit(status)
+    if sys.argv[1:2] == ["check-junit-publication"]:
+        status = int(os.environ.get("FAKE_PUBLISH_PREFLIGHT_STATUS", "0"))
+        if status:
+            print("fake publication preflight rejected", file=sys.stderr)
+            raise SystemExit(status)
     raise SystemExit(real.main(sys.argv[1:]))
 """,
         encoding="utf-8",
@@ -167,7 +172,7 @@ def _run_wrapper(
 
 
 def _assert_complete_run(
-    sync_root: Path, run_root: Path, *, shard_count: int
+    sync_root: Path, run_root: Path, *, shard_count: int, expected_wrapper_errors: int = 0
 ) -> None:
     manifest = json.loads((run_root / "shard-plan.json").read_text())
     assert manifest["shard_count"] == shard_count
@@ -219,11 +224,17 @@ def _assert_complete_run(
         assert (sync_root / f"shard-{index}.max-jobs").read_text().strip() == "unset"
     aggregate = ET.parse(run_root / "full-acceptance.xml").getroot()
     cases = aggregate.findall(".//testcase")
-    assert aggregate.attrib["tests"] == str(shard_count)
+    assert aggregate.attrib["tests"] == str(shard_count + expected_wrapper_errors)
     assert aggregate.attrib["failures"] == "0"
-    assert {case.attrib["name"] for case in cases} == {
-        f"shard-{index}" for index in range(shard_count)
-    }
+    assert aggregate.attrib["errors"] == str(expected_wrapper_errors)
+    expected_cases = {("tests.fake", f"shard-{index}") for index in range(shard_count)}
+    expected_cases.update(
+        ("agenticrobot.acceptance", f"wrapper-error-{index}")
+        for index in range(expected_wrapper_errors)
+    )
+    assert {(case.attrib["classname"], case.attrib["name"]) for case in cases} == expected_cases
+    assert len(cases) == len(expected_cases)
+    assert len(aggregate.findall(".//testcase/error")) == expected_wrapper_errors
 
 
 def test_wrapper_defaults_to_four_complete_shards(
@@ -453,7 +464,7 @@ def test_wrapper_propagates_failure_after_preserving_other_shards(
     assert "full acceptance shard 1 (status=7)" in completed.stdout
     assert all((run_root / f"shard-{index}.xml").is_file() for index in range(shard_count))
     assert (run_root / "full-acceptance.xml").is_file()
-    _assert_complete_run(sync_root, run_root, shard_count=shard_count)
+    _assert_complete_run(sync_root, run_root, shard_count=shard_count, expected_wrapper_errors=1)
     assert not os.path.lexists(checkout / "assets")
 
 
@@ -631,6 +642,167 @@ def test_change_aware_wrapper_rejects_ambient_pytest_selection(
     assert name in result.stderr
     assert not output.exists()
     assert not list(sync_root.glob("*.started"))
+
+
+@pytest.mark.parametrize("arguments", [
+    ("--collect-only",), ("-k", "happy"), ("--deselect=tests/test_case_0.py",),
+    ("--lf",), ("--maxfail=1",), ("-p", "custom_plugin"), ("--help",),
+])
+def test_full_wrapper_rejects_options_that_cannot_prove_complete_execution(tmp_path, arguments):
+    _checkout, wrapper, sync_root = _wrapper_checkout(tmp_path)
+    assets = tmp_path / "assets"
+    assets.mkdir()
+    output = tmp_path / "full"
+    result = _run_wrapper(wrapper, sync_root, assets, output, extra_arguments=arguments)
+    assert result.returncode == 2
+    assert not output.exists() and not list(sync_root.glob("*.started"))
+
+
+@pytest.mark.parametrize("name,value", [
+    ("PYTEST_ADDOPTS", "--collect-only"), ("PYTEST_PLUGINS", "custom_plugin"),
+    ("PYTHONOPTIMIZE", "1"),
+])
+def test_full_wrapper_rejects_ambient_gate_bypass(tmp_path, monkeypatch, name, value):
+    _checkout, wrapper, sync_root = _wrapper_checkout(tmp_path)
+    assets = tmp_path / "assets"
+    assets.mkdir()
+    output = tmp_path / "full"
+    monkeypatch.setenv(name, value)
+    result = _run_wrapper(wrapper, sync_root, assets, output)
+    assert result.returncode == 2 and name in result.stderr
+    assert not output.exists() and not list(sync_root.glob("*.started"))
+
+
+def test_nonzero_shard_exit_is_never_published_as_green_junit(tmp_path):
+    _checkout, wrapper, sync_root = _wrapper_checkout(tmp_path)
+    assets = tmp_path / "assets"
+    assets.mkdir()
+    output = tmp_path / "full"
+    result = _run_wrapper(wrapper, sync_root, assets, output, fail_shard="shard-1")
+    assert result.returncode != 0
+    report = ET.parse(output / "full-acceptance.xml").getroot()
+    assert int(report.attrib["errors"]) > 0
+    assert report.findall(".//testcase/error")
+    assert all((output / f"shard-{index}.xml").is_file() for index in range(4))
+
+
+def test_failed_junit_never_produces_successful_wrapper_exit(tmp_path):
+    checkout, wrapper, sync_root = _wrapper_checkout(tmp_path)
+    runner = checkout / "scripts/run_pytest.sh"
+    source = runner.read_text()
+    source = source.replace('failures="0"', 'failures="1"').replace(
+        'time="0.1"/></testsuite>',
+        'time="0.1"><failure message="forced"/></testcase></testsuite>')
+    runner.write_text(source)
+    assets = tmp_path / "assets"
+    assets.mkdir()
+    output = tmp_path / "full"
+    result = _run_wrapper(wrapper, sync_root, assets, output)
+    report = ET.parse(output / "full-acceptance.xml").getroot()
+    assert report.findall(".//testcase/failure")
+    assert result.returncode != 0
+
+
+def test_empty_junit_never_produces_successful_wrapper_exit(tmp_path):
+    checkout, wrapper, sync_root = _wrapper_checkout(tmp_path)
+    runner = checkout / "scripts/run_pytest.sh"
+    source = runner.read_text().replace('tests="1"', 'tests="0"')
+    source = source.replace('<testcase classname="tests.fake" name="%s" time="0.1"/>', '<system-out>%s</system-out>')
+    runner.write_text(source)
+    assets = tmp_path / "assets"
+    assets.mkdir()
+    output = tmp_path / "full"
+    result = _run_wrapper(wrapper, sync_root, assets, output)
+    report = ET.parse(output / "full-acceptance.xml").getroot()
+    assert result.returncode != 0
+    assert report.findall(".//testcase/error")
+
+
+def test_cleanup_failure_is_not_published_as_green(tmp_path, monkeypatch):
+    checkout, wrapper, sync_root = _wrapper_checkout(tmp_path)
+    runner = checkout / "scripts/run_pytest.sh"
+    source = runner.read_text()
+    marker = 'echo "fake shard: $name"'
+    assert marker in source
+    source = source.replace(marker, '''if [[ "$name" == shard-0 ]]; then
+  repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+  unlink -- "$repo_root/assets"
+  ln -s -- "$FAKE_ALTERNATE_ASSETS" "$repo_root/assets"
+fi
+''' + marker)
+    runner.write_text(source)
+    assets, alternate = tmp_path / "assets", tmp_path / "alternate"
+    assets.mkdir(); alternate.mkdir()
+    monkeypatch.setenv("FAKE_ALTERNATE_ASSETS", str(alternate))
+    output = tmp_path / "full"
+    result = _run_wrapper(wrapper, sync_root, assets, output)
+    report = ET.parse(output / "full-acceptance.xml").getroot()
+    assert result.returncode != 0 and report.findall(".//testcase/error")
+    assert (checkout / "assets").resolve() == alternate.resolve()
+
+
+def test_change_aware_final_verify_failure_never_publishes_report(tmp_path, monkeypatch):
+    checkout, wrapper, sync_root, base, _excluded = _changed_wrapper_checkout(tmp_path)
+    selector = checkout / "scripts/pytest_impact.py"
+    source = selector.read_text()
+    marker = 'if __name__ == "__main__":\n    raise SystemExit(main())'
+    assert marker in source
+    selector.write_text(source.replace(marker,
+        'if __name__ == "__main__":\n'
+        '    if "--junit" in sys.argv:\n'
+        '        import os\n'
+        '        Path(os.environ["FAKE_VERIFY_MARKER"]).write_text("reached final verify")\n'
+        '        if Path(os.environ["FAKE_FINAL_DESTINATION"]).exists():\n'
+        '            Path(os.environ["FAKE_EXPOSED_MARKER"]).write_text("visible during verify")\n'
+        '        raise SystemExit(17)\n'
+        '    raise SystemExit(main())'))
+    subprocess.run(["git", "add", str(selector)], cwd=checkout, check=True, capture_output=True)
+    subprocess.run(["git", "-c", "commit.gpgsign=false", "commit", "-qm", "inject final verify failure"],
+        cwd=checkout, check=True, capture_output=True)
+    assets = tmp_path / "assets"
+    assets.mkdir()
+    output = tmp_path / "changed"
+    marker_path = tmp_path / "exposed-during-verify"
+    verify_path = tmp_path / "reached-final-verify"
+    monkeypatch.setenv("FAKE_FINAL_DESTINATION", str(output / "changed-acceptance.xml"))
+    monkeypatch.setenv("FAKE_EXPOSED_MARKER", str(marker_path))
+    monkeypatch.setenv("FAKE_VERIFY_MARKER", str(verify_path))
+    result = _run_wrapper(wrapper, sync_root, assets, output,
+        shard_count=2, extra_arguments=("--changed-since", base))
+    assert result.returncode != 0
+    assert not (output / "changed-acceptance.xml").exists()
+    assert (output / "diagnostic-acceptance.xml").is_file()
+    assert verify_path.exists() and not marker_path.exists()
+
+
+def test_full_wrapper_rejects_diagnostic_report_destination(tmp_path, monkeypatch):
+    _checkout, wrapper, sync_root = _wrapper_checkout(tmp_path)
+    assets = tmp_path / "assets"
+    assets.mkdir()
+    output = tmp_path / "full"
+    monkeypatch.setenv("DEXTELEOP_FULL_ACCEPTANCE_JUNIT", str(output / "diagnostic-acceptance.xml"))
+
+    result = _run_wrapper(wrapper, sync_root, assets, output)
+
+    assert result.returncode == 2
+    assert "must differ from the retained diagnostic report" in result.stderr
+    assert not (output / "diagnostic-acceptance.xml").exists()
+    assert not list(sync_root.glob("*.started"))
+
+
+def test_full_wrapper_rejects_unsupported_publication_before_shards(tmp_path, monkeypatch):
+    checkout, wrapper, sync_root = _wrapper_checkout(tmp_path)
+    assets = tmp_path / "assets"
+    assets.mkdir()
+    output = tmp_path / "full"
+    monkeypatch.setenv("FAKE_PUBLISH_PREFLIGHT_STATUS", "17")
+
+    result = _run_wrapper(wrapper, sync_root, assets, output)
+
+    assert result.returncode == 2
+    assert "publication is unavailable; no shards started" in result.stderr
+    assert not list(sync_root.glob("*.started")) and not os.path.lexists(checkout / "assets")
+    assert not (output / "full-acceptance.xml").exists()
 
 
 @pytest.mark.parametrize(
