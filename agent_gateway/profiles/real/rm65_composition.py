@@ -148,10 +148,12 @@ def _public_tool_profiles(lower: ExclusiveRM65SkillLowerAssembly) -> dict[str, o
 
 
 def _route_ids(*, include_grasp_approach_plan: bool = False, include_safe_pose: bool = False,
-               include_observed_point: bool = False) -> tuple[str, ...]:
+               include_observed_point: bool = False,
+               include_observed_anchor_v2: bool = False) -> tuple[str, ...]:
     return real_agent_motion_route_ids_v1(
         include_safe_pose=include_safe_pose,
         include_observed_point=include_observed_point,
+        include_observed_anchor_v2=include_observed_anchor_v2,
         include_grasp_approach=True,
         include_grasp_approach_plan=include_grasp_approach_plan,
     )
@@ -300,6 +302,7 @@ def assemble_exclusive_rm65_agent_primitive_composition(
     enable_tcp_pose_comparison: bool = False,
     enable_back_projection: bool = False,
     enable_surface_anchor_v2: bool = False,
+    enable_anchor_motion_v2: bool = False,
     enable_point_grasp_finger_exchange: bool = False,
     debug_render_object_coordinates: bool = False,
     enable_point_grasp_arm_reachability: bool = False,
@@ -327,6 +330,8 @@ def assemble_exclusive_rm65_agent_primitive_composition(
         raise TypeError("enable_back_projection must be bool.")
     if not isinstance(enable_surface_anchor_v2, bool):
         raise TypeError("enable_surface_anchor_v2 must be bool.")
+    if not isinstance(enable_anchor_motion_v2, bool):
+        raise TypeError("enable_anchor_motion_v2 must be bool.")
     if not isinstance(enable_point_grasp_finger_exchange, bool):
         raise TypeError("enable_point_grasp_finger_exchange must be bool.")
     if grasp_trajectory_config is not None and not isinstance(
@@ -436,6 +441,10 @@ def assemble_exclusive_rm65_agent_primitive_composition(
             raise ValueError("Surface anchor v2 requires a bounded segmenter timeout of at most 45s.")
     observed_point_enabled = "move_to_observed_point" in normalized_actions
     observed_safe_enabled = safe_motion_observation_config is not None
+    if enable_anchor_motion_v2 and (
+        not enable_surface_anchor_v2 or not observed_point_enabled or not observed_safe_enabled
+    ):
+        raise ValueError("Observed-anchor motion v2 requires its capture, action, and safe scene.")
     if observed_point_enabled and (not enable_back_projection or not observed_safe_enabled):
         raise ValueError("Observed-point motion requires back projection and the RGB-D safe scene.")
     if observed_safe_enabled and (not isinstance(safe_motion_observation_config, SafeMotionObservationConfig)
@@ -716,6 +725,7 @@ def assemble_exclusive_rm65_agent_primitive_composition(
         allowed_route_ids=_route_ids(
             include_safe_pose="move_tcp_to_pose_safe" in normalized_actions,
             include_observed_point=observed_point_enabled,
+            include_observed_anchor_v2=enable_anchor_motion_v2,
             include_grasp_approach_plan=grasp_enabled,
         ),
     )

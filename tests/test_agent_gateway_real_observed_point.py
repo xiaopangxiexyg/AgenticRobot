@@ -7,7 +7,9 @@ import pytest
 
 from agent_gateway.profiles.back_projection import LiveAlignedDepthCapture
 from agent_gateway.profiles.real.motion_observed_scene import SafeMotionObservationConfig
-from agent_gateway.profiles.real.observed_point_motion import RealObservedPointMotionLifecycle
+from agent_gateway.profiles.real.observed_point_motion import (
+    RealObservedAnchorMotionLifecycle, RealObservedPointMotionLifecycle,
+)
 from agent_gateway.profiles.real.rm65_composition import assemble_exclusive_rm65_agent_primitive_composition
 from agent_gateway.profiles.real.session_authorization import (
     REAL_AGENT_PRIMITIVE_CONFIRM_TOKEN, _requested_action_and_component_ids,
@@ -23,14 +25,15 @@ from teleop_runtime.skill_deploy.motion_port import RealAgentJointTrajectory
 from teleop_runtime.skill_deploy.rm65_grasp_trajectory import RM65GraspTrajectoryPlanningError
 from test_agent_gateway_real_motion_lifecycle import _OwnerSession, _publish_qpos
 from test_agent_gateway_real_rm65_composition import (
-    _lower, REPO_ROOT, DEFAULT_RM65_CAMERA_REGISTRY_V4, DEFAULT_RM65_CAMERA_MOUNT_URDF,
+    _Localizer, _lower, REPO_ROOT, DEFAULT_RM65_CAMERA_REGISTRY_V4,
+    DEFAULT_RM65_CAMERA_MOUNT_URDF,
 )
 
 pytestmark = pytest.mark.contract
 
 
 def _composition(monkeypatch, tmp_path, *, primary="right", dual=False, action="move_to_observed_point",
-                 projection=True, observed=True, max_age=30.):
+                 projection=True, observed=True, max_age=30., anchor_v2=False):
     lower, guard = _lower(monkeypatch, envelope_side="dual" if dual else primary, absolute=True)
     # Pure wiring only while the shared native-resource lock belongs to the operator.
     def forbidden_native(**_):
@@ -54,11 +57,208 @@ def _composition(monkeypatch, tmp_path, *, primary="right", dual=False, action="
         camera_registry_path=DEFAULT_RM65_CAMERA_REGISTRY_V4,
         camera_mount_urdf_path=DEFAULT_RM65_CAMERA_MOUNT_URDF, artifact_root=tmp_path / "artifacts",
         enable_back_projection=projection,
+        enable_surface_anchor_v2=anchor_v2,
+        enable_anchor_motion_v2=anchor_v2,
+        object_localizer=_Localizer() if anchor_v2 else None,
         safe_motion_observation_config=SafeMotionObservationConfig(roles=("main",), maximum_scene_age_sec=max_age) if observed else None,
         clock=lambda: now[0], sleep=lambda dt: now.__setitem__(0, now[0]+dt))
     assert guard.starts == 0 and all(backend.starts == 0 for backend in lower.arm_backends.values())
     assert composition.deployment.gateway_session.localization_provider is None
     return composition, lower, now
+
+
+def test_observed_anchor_v2_is_opt_in_and_uses_existing_real_safe_owner(monkeypatch, tmp_path):
+    composition, lower, _ = _composition(monkeypatch, tmp_path, anchor_v2=True)
+    session = composition.deployment.gateway_session
+    try:
+        manifest = session.contract_bundle.route_manifest
+        v1 = manifest.route(SKILL_ID, "1")
+        v2 = manifest.route(SKILL_ID, "2")
+        assert v1.route.route_id != v2.route.route_id
+        assert v2.route.control_effect_class == "motion"
+        assert v2.route.requires_operator_confirmation is True
+        assert session.contract_bundle.observed_anchor_profile_v2 is not None
+        v1_executor = session.executors_by_skill_id[SKILL_ID]
+        v2_executor = session.executors_by_skill_id[SKILL_ID + "@2"]
+        assert v1_executor is not v2_executor
+        assert v1_executor.binding.skill_version == "1"
+        assert v2_executor.binding.skill_version == "2"
+        assert v1_executor.binding.worker_id != v2_executor.binding.worker_id
+        assert session.surface_anchor_executor is not None
+        assert session.port is composition.deployment.control_runtime.motion_port
+        assert session.station_point_grasp_provider is None
+        assert all(backend.starts == 0 for backend in lower.arm_backends.values())
+        assert session.port.snapshot().dispatch_count == 0
+    finally:
+        session.close_unused()
+        assert id(v1_executor) in session._closed_executor_ids
+        assert id(v2_executor) in session._closed_executor_ids
+
+
+def _anchor_v2_source(session, monkeypatch, *, captured_at=9.5):
+    from PIL import Image
+    from agent_gateway.profiles.back_projection import CorrelatedPlacementCapture
+    from agent_gateway.profiles.segmentation import LiveRgbSegmentationCapture
+    from deployments.perception.sam2_grounding_dino import (
+        GroundedObjectSegment, encode_grounded_object_segment_artifacts,
+    )
+
+    profile = session.back_projection_provider.registration.profile
+    width, height = profile.dimensions_by_role["main"]
+    source_id = profile.source_id_by_role["main"]
+    mask = np.zeros((height, width), dtype=bool)
+    mask[height // 2 - 8:height // 2 + 8, width // 2 - 8:width // 2 + 8] = True
+    model = session.segmentation_provider.localizer
+    calls = []
+
+    def segment(image, *, language_prompt, pixel_uv, min_score):
+        calls.append(language_prompt)
+        assert image.size == (width, height)
+        return GroundedObjectSegment(mask=mask, score=.9, label=language_prompt,
+            box_xyxy=(width // 2 - 8, height // 2 - 8,
+                       width // 2 + 8, height // 2 + 8))
+
+    monkeypatch.setattr(model, "segment", segment)
+    monkeypatch.setattr(model, "encode_segment_artifacts",
+                        encode_grounded_object_segment_artifacts)
+    reads = []
+
+    def cut(*, role, expected_station_revision):
+        reads.append((role, expected_station_revision))
+        depth = LiveAlignedDepthCapture(
+            source_id=source_id, role=role, captured_at=captured_at,
+            station_revision=expected_station_revision,
+            capture_group_id="real-anchor:cut", depth_content_hash="a" * 64,
+            intrinsics={"width": width, "height": height, "fx": 500., "fy": 500.,
+                        "cx": width / 2, "cy": height / 2},
+            reference_from_camera=np.eye(4),
+            depth_m=np.full((height, width), .2, dtype=np.float32),
+        )
+        rgb = LiveRgbSegmentationCapture(
+            source_id=source_id, role=role, captured_at=captured_at,
+            station_revision=expected_station_revision,
+            image=Image.new("RGB", (width, height)), rgb_content_hash="b" * 64,
+        )
+        return CorrelatedPlacementCapture(rgb=rgb, depth=depth)
+
+    monkeypatch.setattr(session.back_projection_provider.capture_port,
+                        "capture_placement_rgbd", cut)
+    parameters = {"role": "main", "selection_mode": "mask_interior",
+                  "target_pixel_uv": None, "language_prompt": "blue cube",
+                  "min_score": .25}
+    request = _request(session.contract_bundle, "perception.capture_surface_anchor",
+                       parameters, sequence=0, version="2")
+    operation = _operation(request)
+    result = session.surface_anchor_executor._read(request, operation)
+    source = replace(_operation(request, completed=True, result=result.execution_result),
+                     output_artifact_bindings=result.output_artifact_bindings)
+    assert calls == ["blue cube"] and reads == [("main", 0)]
+    return request, source
+
+
+def test_observed_anchor_v2_authenticates_producer_and_reuses_safe_target_resolution(
+    monkeypatch, tmp_path,
+):
+    from agent_gateway.profiles.real.observed_point_motion import (
+        RealObservedAnchorMotionLifecycle,
+    )
+
+    composition, lower, now = _composition(monkeypatch, tmp_path, anchor_v2=True)
+    session = composition.deployment.gateway_session
+    try:
+        producer_request, producer = _anchor_v2_source(session, monkeypatch)
+        bundle = session.contract_bundle
+        entry = bundle.route_manifest.route(SKILL_ID, "2")
+        parameters = {"component_id": "right_arm",
+                      "surface_anchor_operation_id": producer.operation_id,
+                      "offset_xyz_m": [0., 0., .03], "offset_frame": "reference"}
+        request = _request(bundle, SKILL_ID, parameters, version="2")
+        validator = bundle.payload_validators.validator_for(entry.route)
+        validator.validate_parameters(parameters)
+        lifecycle = RealObservedAnchorMotionLifecycle(
+            port=session.port, contract_bundle=bundle, route=entry.route,
+            binding=bundle.binding_for_skill(SKILL_ID, "2"),
+            profile=bundle.observed_anchor_profile_v2,
+            request=request, operation=_operation(request),
+            grasp_trajectory_planner=lambda **_: None,
+            observation_config=SafeMotionObservationConfig(),
+            artifact_store=session.artifact_store,
+            capture_registration=bundle.surface_anchor_capture_registration,
+            current_station_revision=lambda: 0,
+            lookup_observation=lambda _: (producer_request, producer),
+            clock=lambda: now[0],
+        )
+        resolution, source_kind, _ = lifecycle._resolve_target((0., 0., 0., 0., 0., 0., 1.))
+        assert source_kind == SKILL_ID + "@2"
+        assert lifecycle._source[0]["source_operation_id"] == producer.operation_id
+        assert any(ref.startswith("surface-anchor-artifact:") for ref in resolution.evidence_refs)
+        assert _requested_action_and_component_ids(request) == ("move_to_observed_point", ("right_arm",))
+        result = lifecycle._extend_arrival_result({
+            "execution_receipt_refs": ["lower:confirmed"],
+            "final_measured_state_hash": "final:measured",
+        }, resolution.target_pose)
+        validator.validate_execution_result_for_parameters(parameters, result)
+        assert result["surface_anchor_report"]["translation_error_m"] < 1e-7
+        assert session.port.snapshot().dispatch_count == 0
+
+        lifecycle._lookup = lambda _: (replace(producer_request, client_id="other"), producer)
+        with pytest.raises(ValueError, match="authenticated"):
+            lifecycle._validate_target_before_activation()
+        lifecycle._lookup = lambda _: None
+        with pytest.raises(ValueError, match="unavailable"):
+            lifecycle._validate_target_before_activation()
+        lifecycle._lookup = lambda _: (producer_request, producer)
+        now[0] = 40.001
+        with pytest.raises(ValueError, match="expired"):
+            lifecycle._validate_target_before_activation()
+        now[0] = 10.
+        lifecycle._current_station_revision = lambda: 1
+        with pytest.raises(ValueError, match="revision changed"):
+            lifecycle._validate_target_before_activation()
+        from agent_gateway.runtime.artifact_store import ArtifactStoreConflictError
+
+        lifecycle._current_station_revision = lambda: 0
+
+        def missing_artifact(*_args, **_kwargs):
+            raise ArtifactStoreConflictError("Artifact unavailable")
+
+        monkeypatch.setattr(session.artifact_store, "read_bytes", missing_artifact)
+        with pytest.raises(ValueError, match="Artifact unavailable"):
+            lifecycle._validate_target_before_activation()
+    finally:
+        session.close_unused()
+
+
+def test_observed_anchor_v2_uses_request_bound_real_motion_grant(monkeypatch, tmp_path):
+    composition, lower, now = _composition(monkeypatch, tmp_path, anchor_v2=True)
+    session = composition.deployment.gateway_session
+    try:
+        bundle = session.contract_bundle
+        params = {"component_id": "right_arm",
+                  "surface_anchor_operation_id": "operation:source",
+                  "offset_xyz_m": [0., 0., .03], "offset_frame": "reference"}
+        request = replace(_request(bundle, SKILL_ID, params, version="2"),
+                          skill_execution_grant_id=None)
+        assert composition.authorization.grant_resolver(
+            replace(request, parameters={**params, "component_id": "left_arm"})
+        ) is None
+        grant = composition.authorization.grant_resolver(request)
+        assert grant is not None
+        authorized = replace(request, skill_execution_grant_id=grant.grant_id)
+        result = assess_skill_request_access(
+            policy=session.service.access_policy, manifest=bundle.route_manifest,
+            request=authorized, current_station_revision=0, now=now[0], grant=grant,
+        )
+        assert result.accepted
+        changed = replace(authorized, parameters={**params, "offset_xyz_m": [0., 0., .04]})
+        assert not assess_skill_request_access(
+            policy=session.service.access_policy, manifest=bundle.route_manifest,
+            request=changed, current_station_revision=0, now=now[0], grant=grant,
+        ).accepted
+        assert session.port.snapshot().dispatch_count == 0
+        assert all(backend.starts == 0 for backend in lower.arm_backends.values())
+    finally:
+        session.close_unused()
 
 
 def _request(bundle, skill_id, parameters, *, sequence=1, version="1"):
@@ -441,11 +641,13 @@ def test_composed_factory_resolves_from_the_service_operation_store(monkeypatch,
 
 
 @pytest.mark.parametrize("side", ["left", "right"])
+@pytest.mark.parametrize("version", ["1", "2"])
 @pytest.mark.parametrize("outcome", ["completed", "no_path", "cancel", "deadline", "stale", "missing_source",
                                      "expired_during_planning", "evicted_during_planning", "unrefreshed"])
-def test_original_motion_owner_plans_executes_and_holds(monkeypatch, tmp_path, side, outcome):
+def test_original_motion_owner_plans_executes_and_holds(monkeypatch, tmp_path, side, version, outcome):
     composition, lower, now = _composition(monkeypatch, tmp_path, primary=side,
-        max_age=.22 if outcome == "expired_during_planning" else 30.)
+        max_age=.22 if outcome == "expired_during_planning" else 30.,
+        anchor_v2=version == "2")
     session = composition.deployment.gateway_session
     owner = _OwnerSession()
     qpos = {arm: np.zeros(6) for arm in ("left", "right")}
@@ -498,17 +700,31 @@ def test_original_motion_owner_plans_executes_and_holds(monkeypatch, tmp_path, s
         current_public, _ = bundle.frame_graph.transform_pose_matrix(np.eye(4),
             source_reference_frame_id=profile.execution_reference_frame_id,
             target_reference_frame_id=profile.reference_frame_id)
-        source, source_op = _source(session, monkeypatch, current_public[:3, 3])
-        request = _request(bundle, SKILL_ID, _parameters(source_op, component=side + "_arm"))
+        if version == "2":
+            source, source_op = _anchor_v2_source(session, monkeypatch,
+                captured_at=9.79 if outcome == "expired_during_planning" else 9.95)
+            parameters = {"component_id": side + "_arm",
+                "surface_anchor_operation_id": source_op.operation_id,
+                "offset_xyz_m": [0., 0., .03], "offset_frame": "reference"}
+            profile = bundle.observed_anchor_profile_v2
+        else:
+            source, source_op = _source(session, monkeypatch, current_public[:3, 3])
+            parameters = _parameters(source_op, component=side + "_arm")
+        request = _request(bundle, SKILL_ID, parameters, version=version)
         operation = _operation(request)
-        entry = bundle.route_manifest.route(SKILL_ID, "1")
-        lifecycle = RealObservedPointMotionLifecycle(port=session.port, contract_bundle=bundle,
-            route=entry.route, binding=bundle.binding_for_skill(SKILL_ID), profile=profile,
+        entry = bundle.route_manifest.route(SKILL_ID, version)
+        lifecycle_class = (RealObservedAnchorMotionLifecycle if version == "2"
+                           else RealObservedPointMotionLifecycle)
+        lifecycle = lifecycle_class(port=session.port, contract_bundle=bundle,
+            route=entry.route, binding=bundle.binding_for_skill(SKILL_ID, version), profile=profile,
             request=request, operation=operation, grasp_trajectory_planner=planner,
             observation_config=SafeMotionObservationConfig(maximum_scene_age_sec=.22
                 if outcome == "expired_during_planning" else 30.),
             lookup_observation=lambda _: None if outcome == "missing_source" or (
                 outcome == "evicted_during_planning" and calls) else (source, source_op),
+            **({"artifact_store": session.artifact_store,
+                "capture_registration": bundle.surface_anchor_capture_registration,
+                "current_station_revision": lambda: 0} if version == "2" else {}),
             clock=lambda: now[0], sleep=advance)
         cancel = lambda: outcome == "cancel" and bool(calls)
         activation = lifecycle.activate(request=request, operation=operation, cancel_requested=cancel)
@@ -519,17 +735,20 @@ def test_original_motion_owner_plans_executes_and_holds(monkeypatch, tmp_path, s
             result = completion.execution_result
             bundle.payload_validators.validate_execution_result(route=entry.route, payload=result,
                                                                request_parameters=request.parameters)
-            report = result["observed_point_report"]
+            report_key = "surface_anchor_report" if version == "2" else "observed_point_report"
+            report = result[report_key]
             assert report["translation_error_m"] < 1e-7
             assert report["rotation_error_rad"] < 1e-7
             assert report["source_request_hash"] == source.semantic_content_hash
             assert result["final_measured_state_hash"]
             assert commands
-            for changes in ({"observation_operation_id": "different-source"}, {"point_index": 1},
-                            {"translation_error_m": float("nan")}, {"reference_frame_id": "other-frame"}):
+            source_change = ({"source_operation_id": "different-source"} if version == "2"
+                             else {"observation_operation_id": "different-source"})
+            for changes in (source_change, {"translation_error_m": float("nan")},
+                            {"reference_frame_id": "other-frame"}):
                 with pytest.raises(ValueError):
                     bundle.payload_validators.validate_execution_result(route=entry.route,
-                        payload={**result, "observed_point_report": {**report, **changes}},
+                        payload={**result, report_key: {**report, **changes}},
                         request_parameters=request.parameters)
         else:
             assert not activation.succeeded and activation.lower_hold_confirmed

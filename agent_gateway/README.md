@@ -610,6 +610,15 @@ lower 测量发布与 `RM65RgbCameraGeometry`。这条入口按已对齐 RGB-D �
 只读分割与锚点 Route 的时限为 60 秒，关闭等待覆盖该时限及 5 秒收尾余量；
 普通分割／抓姿部署原时限不变。
 
+需以已保存锚点为目标移动时，另显式传入 `--enable-anchor-motion-v2`，并保持
+`--enable-surface-anchor-v2`、`--enable-back-projection`、
+`--safe-motion-observation-roles` 与授权动作 `move_to_observed_point`。此时发布
+`motion.move_to_observed_point@2`；上层只需给同一客户端和会话中已完成的
+`capture_surface_anchor@2` 操作 ID、左右臂及偏移，不复制世界坐标或 Artifact 哈希。
+下层核对生产者、原始 Artifact、采集时间、标定、station revision 和授权，保留 v1
+入口与原安全规划、观测场景、唯一执行 owner、取消及 HOLD。该协议接线已做无设备回归，
+仍需在受控真机验收中单独确认动作效果。
+
 `--enable-object-localization` adds the supplied-image localization Route using
 the default SAM3 service client. `--enable-point-grasp` is a separate,
 default-off module and requires that same localizer plus a reviewed point-grasp
@@ -1708,7 +1717,7 @@ v2 请求显式填写 `role`、`selection_mode`、`target_pixel_uv`、`language_
 关系、跟踪身份或 6D 位姿。mask/overlay 作为同一 capture 操作的可选输出 Artifact 保留，
 不伪造独立 segmentation 操作。消费者仍核对同客户端、会话、manifest、revision 和原
 已完成操作的精确输出，且不重采深度。v2 复用会话模型的生命周期与 60 s 只读预算；
-未启用 v2 时原有契约不变。RealMan 的锚点运动消费者及真机动作效果仍待独立验收。
+未启用 v2 时原有契约不变。RealMan 的锚点运动协议已显式接线；真机动作效果仍待独立验收。
 
 MuJoCo 会话构造器还可显式启用 `enable_anchor_motion_v2=True`，发布
 `motion.move_to_observed_point@2`。它要求原有 `enable_observed_point_motion` 的

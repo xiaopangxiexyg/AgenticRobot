@@ -114,7 +114,10 @@ from .motion_primitive_profiles import (
 )
 from .motion_primitive_skill import RealAgentPrimitiveSkillLifecycle
 from .motion_observed_scene import ObservedSafeMovePlanner, SafeMotionObservationConfig
-from .observed_point_motion import RealObservedPointMotionLifecycle
+from .observed_point_motion import (
+    RealObservedAnchorMotionLifecycle,
+    RealObservedPointMotionLifecycle,
+)
 from .object_transport import build_object_transport_executor
 from .observation_gateway import RealControlOwnerState
 from .perception_gateway import build_real_perception_passive_executors
@@ -1585,7 +1588,12 @@ def assemble_real_agent_primitive_gateway_session(
     )
     for entry in motion_entries:
         route = entry.route
-        binding = contract_bundle.binding_for_skill(route.skill_id)
+        # Keep the v1 worker identity stable while giving a second version its
+        # own lifecycle entry. The route registry and close fence must retain
+        # both executors even though they share a public Skill id.
+        executor_key = (route.skill_id if route.skill_version == "1"
+                        else f"{route.skill_id}@{route.skill_version}")
+        binding = contract_bundle.binding_for_skill(route.skill_id, route.skill_version)
         if route.skill_id == EXECUTE_GRASP_APPROACH_PLAN_SKILL_ID_V1:
             registration = contract_bundle.grasp_approach_plan_registration
             if registration is None:
@@ -1594,7 +1602,9 @@ def assemble_real_agent_primitive_gateway_session(
                 )
             profile = registration.profile
         elif route.skill_id == OBSERVED_POINT_SKILL_ID:
-            profile = contract_bundle.observed_point_profile
+            profile = (contract_bundle.observed_anchor_profile_v2
+                       if route.skill_version == "2"
+                       else contract_bundle.observed_point_profile)
             if profile is None:
                 raise RuntimeError("Observed-point Route has no bound profile.")
         elif route.skill_id in {
@@ -1621,7 +1631,9 @@ def assemble_real_agent_primitive_gateway_session(
             lifecycle_type = RealAgentPrimitiveSkillLifecycle
             extra = {}
             if _route.skill_id == OBSERVED_POINT_SKILL_ID:
-                lifecycle_type = RealObservedPointMotionLifecycle
+                lifecycle_type = (RealObservedAnchorMotionLifecycle
+                                  if _route.skill_version == "2"
+                                  else RealObservedPointMotionLifecycle)
 
                 def lookup_observation(identifier):
                     source_request = service.operation_store.request_for_operation(identifier)
@@ -1631,6 +1643,12 @@ def assemble_real_agent_primitive_gateway_session(
 
                 extra = {"lookup_observation": lookup_observation,
                          "observation_config": safe_pose_trajectory_planner.config}
+                if _route.skill_version == "2":
+                    extra.update(
+                        artifact_store=artifact_store,
+                        capture_registration=contract_bundle.surface_anchor_capture_registration,
+                        current_station_revision=lambda: producer.current_station_revision,
+                    )
             return lifecycle_type(
                 port=port,
                 contract_bundle=contract_bundle,
@@ -1664,14 +1682,14 @@ def assemble_real_agent_primitive_gateway_session(
         executor = ReusableStationAgentSkillOperationExecutor(
             port_id=(
                 "agent-gateway:real-primitive:"
-                + route.skill_id
+                + executor_key
                 + ":"
                 + contract_bundle.route_manifest.runtime_session_id
             ),
             binding=StationOperationWorkerBinding(
                 worker_id=(
                     "real-agent-primitive-worker:"
-                    + route.skill_id
+                    + executor_key
                     + ":"
                     + contract_bundle.route_manifest.runtime_session_id
                 ),
@@ -1688,7 +1706,7 @@ def assemble_real_agent_primitive_gateway_session(
             current_station_revision=lambda: producer.current_station_revision,
             clock=clock,
         )
-        executors[route.skill_id] = executor
+        executors[executor_key] = executor
         execution_port_by_route_hash[route.semantic_content_hash] = executor
     if contract_bundle.gripper_contract is not None:
         gripper_executor = build_gripper_skill_executor(

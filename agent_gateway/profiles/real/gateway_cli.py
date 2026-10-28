@@ -210,6 +210,8 @@ def build_parser() -> argparse.ArgumentParser:
         help="Expose model-free RGB-D capture and back projection using the existing measured camera geometry.")
     parser.add_argument("--enable-surface-anchor-v2", action="store_true",
         help="Expose read-only SAM3 surface anchors from paired RGB-D without a grasp generator; requires back projection.")
+    parser.add_argument("--enable-anchor-motion-v2", action="store_true",
+        help="Publish the authenticated surface-anchor v2 motion Route on the existing observed safe owner; default off.")
     parser.add_argument("--enable-point-grasp-finger-exchange", action="store_true",
         help="Register point-grasp v5 with separately readmitted 180-degree finger exchanges; requires GraspGenX and arm reachability.")
     parser.add_argument(
@@ -1023,6 +1025,11 @@ def main(argv: list[str] | None = None) -> int:
     if "move_to_observed_point" in actions and (
             not args.enable_back_projection or args.safe_motion_observation_roles is None):
         parser.error("move_to_observed_point requires --enable-back-projection and --safe-motion-observation-roles")
+    if args.enable_anchor_motion_v2 and (
+        "move_to_observed_point" not in actions or not args.enable_surface_anchor_v2
+        or args.safe_motion_observation_roles is None
+    ):
+        parser.error("--enable-anchor-motion-v2 requires the observed-point action, v2 anchor, and safe RGB-D scene")
     if args.enable_surface_anchor_v2 and (
         not args.enable_back_projection or args.object_localization_backend != "sam3-service"
     ):
@@ -1387,6 +1394,7 @@ def main(argv: list[str] | None = None) -> int:
         enable_tcp_pose_comparison=args.enable_tcp_pose_comparison,
         enable_back_projection=args.enable_back_projection,
         enable_surface_anchor_v2=args.enable_surface_anchor_v2,
+        enable_anchor_motion_v2=args.enable_anchor_motion_v2,
         enable_point_grasp_finger_exchange=args.enable_point_grasp_finger_exchange,
         debug_render_object_coordinates=args.debug_render_object_coordinates,
         enable_point_grasp_arm_reachability=(args.enable_point_grasp_arm_reachability),
