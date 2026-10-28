@@ -4098,6 +4098,35 @@ class RM65GraspJointTrajectoryPlanner:
                 deadline=deadline,
                 monotonic=monotonic,
             )
+        endpoint_quality_rejections = ()
+        if planning_phase == "safe_pose_target":
+            # A path's total joint travel cannot be less than its endpoint net
+            # change. Discard only branches already unable to pass the existing
+            # final quality gate, before RRT and dense FK consume the budget.
+            limits = PathMotionQualityLimits(self.config.maximum_proximal_joint_travel_rad,
+                self.config.maximum_tcp_detour_ratio, self.config.maximum_tcp_detour_excess_m)
+            rejected = tuple(endpoint for endpoint in endpoint_candidates
+                if limits.endpoint_joint_travel_exceeded(qpos_by_side[side], endpoint.qpos_by_side[side]))
+            if rejected:
+                endpoint_quality_rejections = tuple({"seed_index": endpoint.seed_index,
+                    "minimum_joint_travel_deg": np.rad2deg(np.abs(
+                        endpoint.qpos_by_side[side] - qpos_by_side[side])).tolist()}
+                    for endpoint in rejected)
+                endpoint_candidates = tuple(endpoint for endpoint in endpoint_candidates
+                    if not any(endpoint is item for item in rejected))
+                if not endpoint_candidates:
+                    if deadline is not None:
+                        # IK may return a partial accepted set at its deadline.
+                        # Preserve that incomplete search instead of reporting
+                        # its retained, pruned subset as a quality conclusion.
+                        self._remaining_path_planning_time_sec(deadline=deadline,
+                            monotonic=monotonic, planning_phase="endpoint_joint_travel_lower_bound",
+                            details={"endpoint_quality_rejections": endpoint_quality_rejections})
+                    raise RM65GraspTrajectoryPlanningError("grasp_path_motion_quality_exceeded", details={
+                        "planning_phase": "endpoint_joint_travel_lower_bound",
+                        "scope": "retained_endpoints_only",
+                        "maximum_proximal_joint_travel_deg": math.degrees(limits.maximum_proximal_joint_travel_rad),
+                        "endpoint_quality_rejections": endpoint_quality_rejections})
         lower = np.asarray(RM65_ABSOLUTE_Q_MIN_RAD, dtype=float)
         upper = np.asarray(RM65_ABSOLUTE_Q_MAX_RAD, dtype=float)
         cfg = self.planner_config
@@ -4198,6 +4227,8 @@ class RM65GraspJointTrajectoryPlanner:
                 "reason": path.reason,
             }
             search_attempts.append(attempt_record)
+            if endpoint_quality_rejections:
+                attempt_record["endpoint_quality_rejections"] = endpoint_quality_rejections
             if best_connection is not None:
                 attempt_record["connection_comparison_time_budget_sec"] = attempt_config.time_budget_sec
             if path_attempt == 0:

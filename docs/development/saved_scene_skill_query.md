@@ -85,3 +85,47 @@ The caller owns the existing native-resource lock and fixed experiment
 denominator. This probe has no transport, camera/backend startup, dispatch,
 domain-HOLD, or executable-plan retention. Actual RealMan motion remains a
 separate, freshly observed and authorized Gateway request.
+
+## Explicit region queries
+
+Inherited positive-start clearance remains default-off. Select it explicitly
+with the `from_manifest` keyword or CLI flag described above; a manifest field
+cannot enable it. This consumer does not change production planner defaults.
+
+`plan_relation_region(side, target_reference, offset_bounds_xyz_m,
+offset_frame="reference", max_candidates=8)` uses the shared deterministic
+region sampler already used by MuJoCo relation queries. The caller supplies
+three closed offset intervals, not an implicit relaxation of a precise target.
+Orientation is preserved. The method searches for one certified path within a
+single 20-second budget, retaining q0 and the observed scene across candidates.
+Each candidate gets at most 3 seconds, matching the existing MuJoCo search
+policy. A per-candidate timeout leaves that candidate unresolved and permits
+another candidate while shared resources remain. It does not prove infeasibility.
+It checks the planned FK endpoint against the region; an ordinary pose solution
+within arrival tolerance can still be rejected if it lies outside the region.
+Use the original point query for point-arrival tolerance semantics.
+
+Only ordinary endpoint/IK/path rejections permit another candidate. A start
+state violation or unavailable native check stops the search. Timeout is
+`query_incomplete`, distinct from `region_no_candidate_path`; eight sampled
+failures do not prove that a continuous region is infeasible. Full attempt
+records and FK region validation remain in `audit().region_queries`.
+
+For fair atomic-versus-composed experiments, the application may set manifest
+`query_budget` to `{"maximum_calls": 8, "maximum_planning_sec": 20.0,
+"maximum_call_planning_sec": 3.0}`.
+This same budget covers atomic and region calls over the session, including
+final FK and validation. Model wait time is not charged as native planning.
+Omitting it preserves the previous independent atomic-query behavior. Close
+cannot race a region search. No region result is an executable motion grant.
+
+The offline region query defaults to the `proximity` candidate policy. Set
+manifest `region_candidate_policy` to `halton` to explicitly select the
+original sampling order. The shared proximity sampler preserves orientation,
+proposes the point nearest the saved TCP, then the region centre and face
+centres. Proposal bounds are inset by the
+existing arrival tolerance (narrow axes use their midpoint). This reserves room
+for IK error without changing the requested region: final FK is still checked
+against the original intervals. Candidate count and planning budgets do not
+increase. This is an offline selection policy, not a new Agent tool or a change
+to production MuJoCo/RealMan defaults.

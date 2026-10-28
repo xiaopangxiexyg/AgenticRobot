@@ -235,8 +235,30 @@ def test_factory_preserves_strict_default_and_binds_explicit_mode(input_manifest
             "inherited_start_clearance": enabled, "ordinary_clearance_m": .02}
         assert configs[-1].enable_inherited_start_clearance is enabled
         assert audit["dispatches"] == 0 and audit["queries"] == []
+        region = query.plan_relation_region(
+            side="right", target_reference=query.read_scene()["references"][0]["reference"],
+            offset_bounds_xyz_m=[[-.02, .02], [-.03, .03], [.08, .12]])
+        assert region["status"] == "path_found" and region["candidate_policy"] == "proximity"
+        np.testing.assert_allclose(region["selected_offset_xyz_m"], [0., 0., .09])
         query.close()
     assert identities[0] == identities[1] and identities[2] != identities[0]
+
+    input_manifest["enable_inherited_start_clearance"] = True
+    query = SavedSceneSkillQuery.from_manifest(input_manifest)
+    assert query.audit()["source"]["planning_policy"]["inherited_start_clearance"] is False
+    assert query.audit()["scene_id"] == identities[0]
+    assert configs[-1].enable_inherited_start_clearance is False
+    query.close()
+    del input_manifest["enable_inherited_start_clearance"]
+
+    input_manifest["region_candidate_policy"] = "halton"
+    query = SavedSceneSkillQuery.from_manifest(input_manifest)
+    region = query.plan_relation_region(
+        side="right", target_reference=query.read_scene()["references"][0]["reference"],
+        offset_bounds_xyz_m=[[-.02, .02], [-.03, .03], [.08, .12]])
+    assert region["status"] == "path_found" and region["candidate_policy"] == "halton"
+    np.testing.assert_allclose(region["selected_offset_xyz_m"], [0., 0., .1])
+    query.close()
 
 
 @pytest.fixture
@@ -355,3 +377,174 @@ def test_operator_export_roundtrip_uses_original_codec_and_measurements(input_ma
         verify_inputs(input_manifest)
     else:
         with pytest.raises(ValueError):verify_inputs(input_manifest)
+
+
+def region_parameters():
+    return dict(side="right", target_reference="point-a",
+                offset_bounds_xyz_m=[[-.02, .02], [-.03, .03], [.08, .12]])
+
+
+def test_region_search_reuses_shared_samples_and_original_q0(session):
+    from robot_motion.spatial_goal_regions import generate_relation_region_goals
+    query, planner = session
+    # Keep the original Halton-order assertions when opting into that policy.
+    query._region_candidate_policy = "halton"
+    original = planner.plan_with_observed_cloud
+    errors = iter([RM65GraspTrajectoryPlanningError("endpoint_collision_blocked"),
+                   RM65GraspTrajectoryPlanningError("ik_search_exhausted"), None])
+    def plan(*args, **kwargs):
+        planner.error = next(errors)
+        return original(*args, **kwargs)
+    planner.plan_with_observed_cloud = plan
+    result = query.plan_relation_region(**region_parameters())
+    assert result["status"] == "path_found"
+    assert result["selected_candidate_index"] == 2
+    assert result["attempted_candidate_count"] == 3
+    assert len(planner.calls) == 3
+    candidates = generate_relation_region_goals(
+        current_tcp_pose_xyz_quat_xyzw=query.read_scene(include_geometry=True)["measured_tcp_pose_by_side"]["right"],
+        anchor_xyz_m=[.1, .2, .3], offset_bounds_xyz_m=region_parameters()["offset_bounds_xyz_m"],
+        offset_frame="reference", orientation_mode="preserve", tool_axis=None,
+        axis_reference_xyz=None,
+        tool_axis_rotation_bounds_rad=[0., 0.], max_candidates=8)
+    np.testing.assert_allclose(planner.target[:3, 3], candidates[2].goal.pose_xyz_quat_xyzw[:3])
+    assert query.audit()["qpos_by_side"] == {s: [0.] * 6 for s in ("left", "right")}
+    assert all(c["time_budget_sec"] <= 20. for c in planner.calls)
+
+
+@pytest.mark.parametrize("reason", ["path_start_collision_blocked", "ik_solver_error",
+                                    "path_collision_check_unavailable", "stationary_arm_changed"])
+def test_region_does_not_retry_start_or_native_faults(session, reason):
+    query, planner = session
+    planner.error = RM65GraspTrajectoryPlanningError(reason)
+    result = query.plan_relation_region(**region_parameters())
+    assert result["reason"] == reason and result["attempted_candidate_count"] == 1
+    assert len(planner.calls) == 1
+
+
+def test_region_native_error_remains_an_error_and_unlocks(session):
+    query, planner = session
+    planner.error = OSError("native oracle failed")
+    with pytest.raises(OSError):query.plan_relation_region(**region_parameters())
+    assert query.audit()["region_queries"][0]["status"] == "query_failed"
+    query.close()
+
+
+def test_atomic_and_region_share_application_call_budget(session):
+    query, planner = session
+    query._query_budget = {"maximum_calls": 2, "maximum_planning_sec": 20.}
+    query.plan_relation(side="right", target_reference="point-a", offset_xyz_m=[0., 0., .08])
+    planner.error = RM65GraspTrajectoryPlanningError("endpoint_collision_blocked")
+    result = query.plan_relation_region(**region_parameters())
+    assert result["status"] == "query_incomplete" and result["reason"] == "query_budget_exhausted"
+    assert result["attempted_candidate_count"] == 1 and len(planner.calls) == 2
+    assert query.audit()["planning_calls"] == 2
+
+
+def test_late_path_is_not_accepted_and_budget_is_charged(session):
+    query, planner = session
+    now = [0.]
+    query._clock = lambda: now[0]
+    query._query_budget = {"maximum_calls": 8, "maximum_planning_sec": 2.}
+    original = planner.plan_with_observed_cloud
+    def slow(*args, **kwargs):
+        now[0] += 3.
+        return original(*args, **kwargs)
+    planner.plan_with_observed_cloud = slow
+    result = query.plan_relation_region(**region_parameters())
+    assert result["status"] == "query_incomplete"
+    assert len(planner.calls) == 1
+    assert query.audit()["planning_seconds"] == 3.
+    assert query.audit()["queries"][0]["path_planning_wall_sec"] == 3.
+
+
+def test_endpoint_fk_is_inside_the_same_query_budget(session, tmp_path):
+    query, planner = session
+    now = [0.]
+    query._clock = lambda: now[0]
+    query._query_budget = {"maximum_calls": 8, "maximum_planning_sec": 2.}
+    original = planner.tool_tcp_poses_for_qpos_pair
+    def slow_fk(**kwargs):
+        now[0] += 3.
+        return original(**kwargs)
+    planner.tool_tcp_poses_for_qpos_pair = slow_fk
+    result = query.plan_relation_region(**region_parameters())
+    assert result["status"] == "query_incomplete" and result["reason"] == "query_budget_exhausted"
+    audit = query.audit()
+    assert audit["planning_calls"] == 1 and audit["planning_seconds"] == 3.
+    assert audit["queries"][0]["outcome_before_budget_check"]["status"] == "path_found"
+    with pytest.raises(KeyError):query.save_trajectory(audit["queries"][0]["query_id"], tmp_path / "late.npz")
+
+
+def test_region_checks_achieved_endpoint_not_just_requested_pose(session):
+    query, planner = session
+    original = planner.tool_tcp_poses_for_qpos_pair
+    def displaced(**kwargs):
+        poses = original(**kwargs)
+        moved = {s: p.copy() for s, p in poses.items()}
+        moved["right"][2, 3] += .001
+        return moved
+    planner.tool_tcp_poses_for_qpos_pair = displaced
+    result = query.plan_relation_region(side="right", target_reference="point-a",
+        offset_bounds_xyz_m=[[0., 0.], [0., 0.], [.08, .08]])
+    assert result["status"] == "path_rejected" and result["reason"] == "region_no_candidate_path"
+    audit = query.audit()
+    assert audit["queries"][0]["status"] == "path_found"
+    assert audit["region_queries"][0]["candidate_validations"][0]["inside_requested_region"] is False
+
+
+def test_region_invalid_bounds_are_rejected_before_planning(session):
+    query, planner = session
+    with pytest.raises(ValueError):
+        query.plan_relation_region(**{**region_parameters(), "offset_bounds_xyz_m": [[1., -1.], [0., 0.], [.1, .2]]})
+    assert not planner.calls
+
+
+def test_proximity_policy_keeps_q0_and_checks_achieved_region(session):
+    query, planner = session
+    result = query.plan_relation_region(**region_parameters())
+    assert result["status"] == "path_found"
+    record = query.audit()["region_queries"][0]
+    assert record["candidate_policy"] == "proximity"
+    assert record["candidate_validations"][0]["inside_requested_region"] is True
+    assert query.audit()["qpos_by_side"] == {s: [0.] * 6 for s in ("left", "right")}
+    assert planner.calls[0]["time_budget_sec"] <= 3.
+
+
+def test_one_candidate_timeout_does_not_starve_the_whole_region(session):
+    query, planner = session
+    now = [0.]
+    query._clock = lambda: now[0]
+    query._query_budget = {"maximum_calls": 8, "maximum_planning_sec": 20., "maximum_call_planning_sec": 3.}
+    original = planner.plan_with_observed_cloud
+    calls = []
+    def plan(*args, **kwargs):
+        calls.append(kwargs["time_budget_sec"])
+        if len(calls) == 1:
+            now[0] += 3.
+            raise RM65GraspTrajectoryPlanningError("path_planning_time_budget_exhausted")
+        now[0] += .1
+        return original(*args, **kwargs)
+    planner.plan_with_observed_cloud = plan
+    result = query.plan_relation_region(**region_parameters())
+    assert result["status"] == "path_found" and result["selected_candidate_index"] == 1
+    assert result["unresolved_candidate_count"] == 1 and result["attempted_candidate_count"] == 2
+    assert calls == [3., 3.]
+
+
+def test_region_deadline_also_covers_last_out_of_region_validation(session):
+    query, planner = session
+    clock = iter([0., 0., 0., 0., 0., 21., 21., 21.])
+    query._clock = lambda: next(clock)
+    original = planner.tool_tcp_poses_for_qpos_pair
+    def outside(**kwargs):
+        poses = {s: p.copy() for s, p in original(**kwargs).items()}
+        poses["right"][2, 3] += .001
+        return poses
+    planner.tool_tcp_poses_for_qpos_pair = outside
+    result = query.plan_relation_region(side="right", target_reference="point-a",
+        offset_bounds_xyz_m=[[0., 0.], [0., 0.], [.08, .08]])
+    assert result["status"] == "query_incomplete"
+    assert query.audit()["region_queries"][0]["selected_plan_query_id"] is None
+    # The lower point query remains inspectable evidence, never a region grant.
+    assert query.audit()["queries"][0]["status"] == "path_found"

@@ -11,11 +11,55 @@ from scipy.spatial.transform import Rotation
 from robot_motion import spatial_goal_regions as regions
 from robot_motion.spatial_goal_regions import (
     generate_continuation_region_goals,
+    generate_proximity_region_goals,
     generate_relation_region_goals,
 )
 from robot_motion.spatial_goals import RelationGoalCandidate, generate_relation_goals
 
 pytestmark = pytest.mark.unit
+
+
+def test_proximity_region_reserves_tolerance_and_covers_faces_without_expanding_region():
+    candidates = generate_proximity_region_goals(
+        current_tcp_pose_xyz_quat_xyzw=[-.1, .3, .1, 0., 0., 0., 1.],
+        anchor_xyz_m=[0., 0., 0.], offset_bounds_xyz_m=[[0., .1], [0., .1], [.2, .4]],
+        offset_frame="reference", max_candidates=8, boundary_inset_m=.01)
+    offsets = np.asarray([c.offset_xyz_m for c in candidates])
+    np.testing.assert_allclose(offsets[0], [.01, .09, .21])
+    np.testing.assert_allclose(offsets[1], [.05, .05, .3])
+    assert len(candidates) == 8
+    for axis, value in ((0, .01), (0, .09), (1, .01), (1, .09), (2, .21), (2, .39)):
+        assert np.any(np.isclose(offsets[2:, axis], value))
+    assert np.all(offsets >= [0., 0., .2]) and np.all(offsets <= [.1, .1, .4])
+
+
+def test_proximity_tool_frame_uses_original_orientation_and_keeps_fixed_axes():
+    candidates = generate_proximity_region_goals(
+        current_tcp_pose_xyz_quat_xyzw=[1., 2., .1, 0., 0., np.sqrt(.5), np.sqrt(.5)],
+        anchor_xyz_m=[1., 2.2, .1], offset_bounds_xyz_m=[[-.3, -.1], [.2, .2], [0., .005]],
+        offset_frame="tool", max_candidates=8, boundary_inset_m=.01)
+    # Current displacement (0,-.2,0) in world is (-.2,0,0) in original tool axes.
+    np.testing.assert_allclose(candidates[0].offset_xyz_m, [-.2, .2, .0025])
+    for c in candidates:
+        assert c.offset_xyz_m[1:] == pytest.approx([.2, .0025])
+        np.testing.assert_allclose(c.goal.pose_xyz_quat_xyzw[3:], [0, 0, np.sqrt(.5), np.sqrt(.5)])
+
+
+@pytest.mark.parametrize("inset", [-1., float("nan"), float("inf"), True])
+def test_proximity_rejects_invalid_inset(inset):
+    with pytest.raises(ValueError):
+        generate_proximity_region_goals(current_tcp_pose_xyz_quat_xyzw=[0, 0, 0, 0, 0, 0, 1],
+            anchor_xyz_m=[0, 0, 0], offset_bounds_xyz_m=[[0, 0]] * 3,
+            offset_frame="reference", max_candidates=8, boundary_inset_m=inset)
+
+
+def test_proximity_fixed_goal_remains_one_goal():
+    candidates = generate_proximity_region_goals(
+        current_tcp_pose_xyz_quat_xyzw=[0, 0, 0, 0, 0, 0, 1], anchor_xyz_m=[0, 0, 0],
+        offset_bounds_xyz_m=[[.1, .1], [.2, .2], [.3, .3]],
+        offset_frame="reference", max_candidates=8, boundary_inset_m=.01)
+    assert len(candidates) == 1
+    assert candidates[0].offset_xyz_m == pytest.approx([.1, .2, .3])
 
 
 def _parameters(**changes):
