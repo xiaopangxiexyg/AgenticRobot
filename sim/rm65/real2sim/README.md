@@ -92,7 +92,16 @@ core and MuJoCo adapter used for the 20260721 fit; tests compare those hashes to
 fixed historical values rather than silently reinterpreting the fit against
 the current files.
 
-当前显式起点净空能力使用独立绑定
+当前区域查询与端点路径质量下界使用独立绑定
+`artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261028_skill_region_v1.json`。
+继承168项输入，更新两个已有规划源码，并将已有路径质量模块纳入绑定，合计169项输入／
+165项Python源码；离线查询入口另作源码证据，固定于 `6b3a21148f90`。
+源码及消费者离线检查795项、相同源树的查询检查231项分别记录，完整组合验收另行执行。
+离线区域查询默认 proximity、可显式选择 halton；严格20mm起点净空保持默认。
+来源12场景对照显式启用了正距离起点退出，不能推断严格默认下的通过率；没有新增真机
+标定、运动或held-out资格，既有fit、timing及所有历史绑定保持。
+
+此前显式起点净空能力使用独立绑定
 `artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261028_explicit_clearance_v1.json`。
 保留168项输入／164项Python源码，仅更新四个既有owner，固定于 `e9245d2fdd87`；
 净空、目录保护及相关消费者977通过，9项subtest另列。严格默认不变，
