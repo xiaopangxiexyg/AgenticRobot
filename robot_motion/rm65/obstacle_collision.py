@@ -24,6 +24,15 @@ from dataset_contracts.canonical_encoding import canonical_content_hash
 _OBSTACLE_GEOMETRY_PREFIX = "aabb_obstacle::"
 
 
+class RM65InheritedStartBlocked(ValueError):
+    """A measured start has actual overlap, not an unavailable query."""
+
+    def __init__(self, *, source: str, distance_m: float, geometry_name: str):
+        self.details = {"source": source, "distance_m": float(distance_m),
+                        "geometry_name": geometry_name}
+        super().__init__("inherited start is in contact or penetration")
+
+
 @dataclass(frozen=True)
 class AttachedBoxCollisionProxy:
     """One conservative box rigidly attached to an existing model frame."""
@@ -576,6 +585,18 @@ class RM65ObstacleCollisionOracle:
             "query_mode": "inactive_component_minimum_distance",
             "active_component": active_component, "static_pair_count": len(pairs)})
 
+    def inherited_start_clearance(self, qpos_by_component, *, active_component: str):
+        """Bind a request-local, positive-distance start allowance for safe egress.
+
+        This does not alter this oracle, the scene margin, or its collision
+        pairs. The returned oracle still checks every pair and the observed
+        cloud. Its moving-pair progress is separately certified on the dense
+        final trajectory by the caller.
+        """
+        return RM65InheritedStartClearanceOracle(
+            self, qpos_by_component=qpos_by_component,
+            active_component=active_component)
+
 
     def check_clearance_only(
         self, qpos_by_component: Mapping[str, np.ndarray]
@@ -893,6 +914,244 @@ class RM65ObstacleCollisionOracle:
             "collision_pair_count": int(pair_count),
             "minimum_clearance_m": self._scene.minimum_clearance_m,
         }
+
+
+class RM65StartClearanceProgress:
+    """Ordered dense-path proof for inherited active collision pairs."""
+
+    def __init__(self, *, pair_indices: tuple[int | str, ...], initial_distances: tuple[float, ...],
+                 ordinary_clearance_m: float, tolerance_m: float):
+        self.pair_indices = pair_indices
+        self.previous = list(initial_distances)
+        self.exited = [False] * len(pair_indices)
+        self.ordinary_clearance_m = ordinary_clearance_m
+        self.tolerance_m = tolerance_m
+
+    def advance(self, distances: tuple[float, ...]) -> dict[str, object] | None:
+        if len(distances) != len(self.previous):
+            return {"reason": "inherited_start_clearance_distance_count_changed"}
+        for index, distance in enumerate(distances):
+            previous = self.previous[index]
+            if (not np.isfinite(distance) or distance <= 0.0
+                    or (self.exited[index] and distance <= self.ordinary_clearance_m)
+                    or (not self.exited[index] and distance < previous - self.tolerance_m)):
+                return {"reason": "inherited_start_clearance_regressed",
+                    "inherited_pair_index": self.pair_indices[index],
+                    "previous_distance_m": previous, "distance_m": distance}
+            # Compare to the high-water mark. A per-step tolerance must not
+            # accumulate into a centimetre-scale retreat over many samples.
+            self.previous[index] = max(previous, distance)
+            if distance > self.ordinary_clearance_m:
+                self.exited[index] = True
+        return None
+
+    @property
+    def all_exited(self) -> bool:
+        return all(self.exited)
+
+
+class RM65InheritedStartClearanceOracle:
+    """Request-owned clearance oracle for an already non-contact start state.
+
+    Only fixed collision pairs below the ordinary margin at the exact start
+    receive their measured positive-distance floor. All other pairs keep the
+    original margin. The inactive component must remain at the measured qpos.
+    A dense, ordered path check must additionally prove that active near pairs
+    move monotonically out of the margin and never re-enter it.
+    """
+
+    _DISTANCE_TOLERANCE_M = 1e-6
+
+    def __init__(self, source: RM65ObstacleCollisionOracle, *,
+                 qpos_by_component: Mapping[str, np.ndarray], active_component: str):
+        if not isinstance(source, RM65ObstacleCollisionOracle):
+            raise TypeError("Inherited start clearance requires the native RM65 oracle.")
+        if active_component not in source._indices:
+            raise ValueError("Active component is absent from the collision model.")
+        self._source = source
+        self._active_component = active_component
+        self._start = {name: np.asarray(values, dtype=float).copy()
+                       for name, values in qpos_by_component.items()}
+        source._embed(self._start)
+        self._model_data = source._model.createData()
+        self._collision_data = source._pin.GeometryData(source._collision_model)
+        self._margin = float(source._scene.minimum_clearance_m)
+        self._baseline = self._distances(self._start)
+        if np.any(self._baseline <= 0.0):
+            index = int(np.argmin(self._baseline))
+            pair = source._collision_model.collisionPairs[index]
+            names = tuple(str(source._collision_model.geometryObjects[part].name)
+                          for part in (int(pair.first), int(pair.second)))
+            raise RM65InheritedStartBlocked(source="fixed_scene",
+                distance_m=float(self._baseline[index]), geometry_name=" / ".join(names))
+        self._inherited = tuple(int(index) for index in np.flatnonzero(self._baseline <= self._margin))
+        active_indices = set(source._indices[active_component])
+
+        def affected(geometry_id: int) -> bool:
+            joint_id = int(source._collision_model.geometryObjects[geometry_id].parentJoint)
+            while joint_id:
+                joint = source._model.joints[joint_id]
+                if active_indices.intersection(range(joint.idx_q, joint.idx_q + joint.nq)):
+                    return True
+                joint_id = int(source._model.parents[joint_id])
+            return False
+
+        self.active_inherited_pairs = tuple(index for index in self._inherited
+            if affected(int(source._collision_model.collisionPairs[index].first))
+            or affected(int(source._collision_model.collisionPairs[index].second)))
+        self.static_inherited_pairs = tuple(index for index in self._inherited
+            if index not in self.active_inherited_pairs)
+        self._observed_baseline = self._observed_distances(self._start)
+        for name, (distance, _) in self._observed_baseline.items():
+            if not np.isfinite(distance):
+                raise RuntimeError("Inherited observed distance is nonfinite.")
+            if distance <= 0.0:
+                raise RM65InheritedStartBlocked(source="observed_rgbd",
+                    distance_m=distance, geometry_name=name)
+        self._observed_inherited = tuple(name for name, (distance, _) in self._observed_baseline.items()
+            if distance <= self._margin)
+        if not self._inherited and not self._observed_inherited:
+            raise ValueError("The start already satisfies the ordinary clearance margin.")
+        geometry_by_name = {str(geometry.name): index
+            for index, geometry in enumerate(source._collision_model.geometryObjects)}
+        self.observed_active_names = tuple(name for name in self._observed_inherited
+            if affected(geometry_by_name[name]))
+        self.observed_static_names = tuple(name for name in self._observed_inherited
+            if name not in self.observed_active_names)
+        self.scene_hash = canonical_content_hash({
+            "scene_hash": source.scene_hash,
+            "active_component": active_component,
+            "start_qpos": self._start,
+            "inherited_pairs": [(index, float(self._baseline[index])) for index in self._inherited],
+            "inherited_observed_boxes": [(name, float(self._observed_baseline[name][0]))
+                for name in self._observed_inherited],
+            "ordinary_margin_m": self._margin,
+        }, domain="dexteleop.rm65.inherited_start_clearance.v1")
+
+    @property
+    def ordinary_clearance_m(self) -> float:
+        return self._margin
+
+    def _distances(self, qpos_by_component: Mapping[str, np.ndarray]) -> np.ndarray:
+        source = self._source
+        full_q = source._embed(qpos_by_component)
+        source._pin.computeDistances(source._model, self._model_data,
+            source._collision_model, self._collision_data, full_q)
+        results = tuple(self._collision_data.distanceResults)
+        if len(results) != len(source._collision_model.collisionPairs):
+            raise RuntimeError("Inherited clearance distance result count mismatch.")
+        values = np.asarray([float(item.min_distance) for item in results], dtype=float)
+        if not values.size or not np.isfinite(values).all():
+            raise RuntimeError("Inherited clearance distance query is unavailable.")
+        return values
+
+    def inherited_active_distances(self, qpos_by_component) -> tuple[float, ...]:
+        """Exact ordered-pair distances for dense egress progress validation."""
+        values = self._distances(qpos_by_component)
+        return tuple(float(values[index]) for index in self.active_inherited_pairs)
+
+    def observed_active_distances(self, qpos_by_component) -> tuple[float, ...]:
+        values = self._observed_distances(qpos_by_component)
+        return tuple(values[name][0] for name in self.observed_active_names)
+
+    def _observed_distances(self, qpos_by_component):
+        distance_query = self._source._observed_distance
+        if distance_query is None:
+            return {}
+        boxes = self._source.world_obstacle_proxy_boxes(qpos_by_component)
+        values = {}
+        for box in boxes:
+            name = box[0]
+            if name in values:
+                raise RuntimeError("Observed proxy names must be unique.")
+            values[name] = distance_query.check_boxes((box,), clearance_m=self._margin)
+        return values
+
+    def new_dense_progress(self) -> RM65StartClearanceProgress:
+        return RM65StartClearanceProgress(
+            pair_indices=self.active_inherited_pairs,
+            initial_distances=tuple(float(self._baseline[index])
+                for index in self.active_inherited_pairs),
+            ordinary_clearance_m=self._margin,
+            tolerance_m=self._DISTANCE_TOLERANCE_M)
+
+    def new_observed_dense_progress(self) -> RM65StartClearanceProgress:
+        return RM65StartClearanceProgress(
+            pair_indices=self.observed_active_names,
+            initial_distances=tuple(self._observed_baseline[name][0]
+                for name in self.observed_active_names),
+            ordinary_clearance_m=self._margin,
+            tolerance_m=self._DISTANCE_TOLERANCE_M)
+
+    def check(self, qpos_by_component: Mapping[str, np.ndarray]) -> JointConfigurationCheck:
+        if any(not np.array_equal(np.asarray(qpos_by_component.get(name)), start)
+               for name, start in self._start.items() if name != self._active_component):
+            return JointConfigurationCheck(safe=False, collision_check_available=False,
+                reason="inherited_clearance_inactive_component_changed")
+        try:
+            distances = self._distances(qpos_by_component)
+        except Exception as error:  # noqa: BLE001 - native distance faults fail closed
+            return JointConfigurationCheck(safe=False, collision_check_available=False,
+                reason="inherited_clearance_collision_check_unavailable",
+                metadata={"exception_type": type(error).__name__})
+        thresholds = np.full(len(distances), self._margin, dtype=float)
+        thresholds[list(self._inherited)] = np.maximum(
+            0.0, self._baseline[list(self._inherited)] - self._DISTANCE_TOLERANCE_M)
+        violated = np.flatnonzero((distances <= 0.0) | (distances <= thresholds))
+        index = (int(violated[0]) if violated.size else int(np.argmin(distances)))
+        pair = self._source._collision_model.collisionPairs[index]
+        names = tuple(str(self._source._collision_model.geometryObjects[part].name)
+                      for part in (int(pair.first), int(pair.second)))
+        observed = {}
+        if not violated.size:
+            try:
+                observed = self._observed_distances(qpos_by_component)
+            except Exception as error:  # noqa: BLE001 - observed geometry faults fail closed
+                return JointConfigurationCheck(safe=False, collision_check_available=False,
+                    reason="inherited_observed_collision_check_unavailable",
+                    metadata={"exception_type": type(error).__name__})
+            if set(observed) != set(self._observed_baseline):
+                return JointConfigurationCheck(safe=False, collision_check_available=False,
+                    reason="inherited_observed_proxy_set_changed")
+        observed_blocked = None
+        for name, (distance, nearest) in observed.items():
+            baseline = self._observed_baseline.get(name)
+            if baseline is None:
+                return JointConfigurationCheck(safe=False, collision_check_available=False,
+                    reason="inherited_observed_proxy_set_changed")
+            threshold = (max(0.0, baseline[0] - self._DISTANCE_TOLERANCE_M)
+                         if name in self._observed_inherited else self._margin)
+            if distance <= 0.0 or distance <= threshold:
+                observed_blocked = (name, distance, nearest)
+                break
+        result = JointConfigurationCheck(
+            safe=not bool(violated.size) and observed_blocked is None,
+            collision_check_available=True,
+            reason="inherited_start_clearance_satisfied" if not violated.size
+                   and observed_blocked is None else
+                   "observed_obstacle_clearance_blocked" if observed_blocked is not None
+                   else "inherited_start_clearance_blocked",
+            minimum_distance_m=min([float(np.min(distances))]
+                + [distance for distance, _ in observed.values()]),
+            metadata={"scene_hash": self.scene_hash,
+                      "closest_geometry_names": (
+                          (observed_blocked[0], "observed_voxels")
+                          if observed_blocked is not None else names),
+                      "blocking_pair_index": index if violated.size else None,
+                      "inherited_pair_count": len(self._inherited),
+                      "active_inherited_pair_count": len(self.active_inherited_pairs),
+                      "static_inherited_pair_count": len(self.static_inherited_pairs),
+                      "observed_inherited_box_count": len(self._observed_inherited),
+                      "observed_active_box_count": len(self.observed_active_names),
+                      "nearest_observed": None if observed_blocked is None else observed_blocked[2],
+                      "ordinary_clearance_m": self._margin})
+        return result
+
+    def check_clearance_only(self, qpos_by_component):
+        return self.check(qpos_by_component)
+
+    def check_rigid_endpoint_pose(self, *args, **kwargs):
+        return self._source.check_rigid_endpoint_pose(*args, **kwargs)
 
 
 @lru_cache(maxsize=2)

@@ -54,6 +54,8 @@ from robot_motion.rm65 import (
 )
 from robot_motion.rm65.obstacle_collision import (
     RM65_D405_ATTACHED_COLLISION_PROXIES,
+    RM65InheritedStartBlocked,
+    RM65InheritedStartClearanceOracle,
     RM65ObstacleCollisionOracle,
     build_rm65_profile_obstacle_collision_oracle,
 )
@@ -168,6 +170,7 @@ class RM65GraspTrajectoryPlanningError(RuntimeError):
 @dataclass(frozen=True)
 class RM65GraspTrajectoryPlanningConfig:
     minimum_clearance_m: float = 0.02
+    enable_inherited_start_clearance: bool = False
     maximum_proximal_joint_travel_rad: float = DEFAULT_PATH_MOTION_QUALITY_LIMITS.maximum_proximal_joint_travel_rad
     maximum_tcp_detour_ratio: float = DEFAULT_PATH_MOTION_QUALITY_LIMITS.maximum_tcp_detour_ratio
     maximum_tcp_detour_excess_m: float = DEFAULT_PATH_MOTION_QUALITY_LIMITS.maximum_tcp_detour_excess_m
@@ -234,6 +237,8 @@ class RM65GraspTrajectoryPlanningConfig:
         )
 
     def __post_init__(self) -> None:
+        if not isinstance(self.enable_inherited_start_clearance, bool):
+            raise ValueError("enable_inherited_start_clearance must be bool.")
         if not isinstance(self.pose_goal_policy, str) or self.pose_goal_policy not in (
             "preserve_target", "within_arrival_tolerance",
         ):
@@ -3606,6 +3611,13 @@ class RM65GraspJointTrajectoryPlanner:
         ingress_best_adjustment_m: float | None = None
         ingress_observed_constraints: set[str] = set()
         ingress_entered_at: dict[str, int] | None = None
+        start_clearance = (self.oracle if isinstance(
+            self.oracle, RM65InheritedStartClearanceOracle) else None)
+        clearance_progress = (
+            start_clearance.new_dense_progress() if start_clearance is not None else None)
+        observed_progress = (
+            start_clearance.new_observed_dense_progress()
+            if start_clearance is not None else None)
 
         def reject_ingress(
             error: RM65GraspTrajectoryPlanningError,
@@ -3736,6 +3748,53 @@ class RM65GraspJointTrajectoryPlanner:
                             "collision_check": check.to_dict(),
                         },
                     )
+                if start_clearance is not None and start_clearance.active_inherited_pairs:
+                    try:
+                        distances = start_clearance.inherited_active_distances(qpos)
+                    except Exception as error:  # noqa: BLE001 - native query fails closed
+                        raise RM65GraspTrajectoryPlanningError(
+                            "path_collision_check_unavailable", details={
+                                "segment_index": segment_index,
+                                "edge_sample_index": index,
+                                "exception_type": type(error).__name__,
+                            }) from error
+                    regression = clearance_progress.advance(distances)
+                    if regression is not None:
+                        raise RM65GraspTrajectoryPlanningError(
+                            "path_collision_blocked", details={
+                                "segment_index": segment_index,
+                                "edge_sample_index": index,
+                                **regression,
+                            })
+                if start_clearance is not None and start_clearance.observed_active_names:
+                    try:
+                        distances = start_clearance.observed_active_distances(qpos)
+                    except Exception as error:  # noqa: BLE001 - observed query fails closed
+                        raise RM65GraspTrajectoryPlanningError(
+                            "path_collision_check_unavailable", details={
+                                "segment_index": segment_index,
+                                "edge_sample_index": index,
+                                "exception_type": type(error).__name__,
+                            }) from error
+                    regression = observed_progress.advance(distances)
+                    if regression is not None:
+                        raise RM65GraspTrajectoryPlanningError(
+                            "path_collision_blocked", details={
+                                "segment_index": segment_index,
+                                "edge_sample_index": index,
+                                "source": "observed_rgbd",
+                                **regression,
+                            })
+        if clearance_progress is not None and not clearance_progress.all_exited:
+            raise RM65GraspTrajectoryPlanningError("path_collision_blocked", details={
+                "reason": "inherited_start_clearance_not_exited",
+                "active_inherited_pair_indices": start_clearance.active_inherited_pairs,
+            })
+        if observed_progress is not None and not observed_progress.all_exited:
+            raise RM65GraspTrajectoryPlanningError("path_collision_blocked", details={
+                "reason": "inherited_observed_clearance_not_exited",
+                "active_inherited_observed_boxes": start_clearance.observed_active_names,
+            })
         waypoint_minimum_distance = math.inf
         if clearance_only:
             # Preserve exact endpoint diagnostics and fail closed if the two
@@ -3770,7 +3829,7 @@ class RM65GraspJointTrajectoryPlanner:
                     "modified_sides": (moving_side,),
                 },
             )
-        return {
+        result = {
             "sample_count": checks,
             "minimum_distance_m": (
                 None if not math.isfinite(minimum_distance) else minimum_distance
@@ -3804,6 +3863,16 @@ class RM65GraspJointTrajectoryPlanner:
                 }
             ),
         }
+        if start_clearance is not None:
+            result["inherited_start_clearance"] = {
+                "static_pair_count": len(start_clearance.static_inherited_pairs),
+                "active_pair_count": len(start_clearance.active_inherited_pairs),
+                "active_pairs_exited": clearance_progress.all_exited,
+                "observed_static_box_count": len(start_clearance.observed_static_names),
+                "observed_active_box_count": len(start_clearance.observed_active_names),
+                "observed_active_boxes_exited": observed_progress.all_exited,
+            }
+        return result
 
     def _revalidate_visible_gripper_path(
         self,
@@ -5694,6 +5763,10 @@ class RM65GraspJointTrajectoryPlanner:
                 pose_goal_policy=pose_goal_policy,
                 require_grasp_approach=require_grasp_approach,
             )
+            if request is self and self.config.enable_inherited_start_clearance:
+                # A near-start allowance is bound to one measured request, not
+                # the reusable planner template or a later operation.
+                request = copy(self)
             return request._plan(
                 qpos_by_side=qpos_by_side, side=side,
                 target_tool_tcp_world=target_tool_tcp_world, speed_scale=speed_scale,
@@ -5738,6 +5811,49 @@ class RM65GraspJointTrajectoryPlanner:
             for name in _SIDES
         }
         target_pose = np.asarray(target_tool_tcp_world, dtype=float).reshape(4, 4).copy()
+        if (self.config.enable_inherited_start_clearance
+                and self.observed_obstacles is not None and not require_grasp_approach
+                and type(self.oracle) is RM65ObstacleCollisionOracle):
+            baseline_check = self.oracle.check(current)
+            if (baseline_check.collision_check_available and not baseline_check.safe
+                    and baseline_check.reason in {
+                        "collision_clearance_violated",
+                        "observed_obstacle_clearance_blocked",
+                    }
+                    and baseline_check.minimum_distance_m is not None
+                    and baseline_check.minimum_distance_m > 0.0):
+                try:
+                    inherited = self.oracle.inherited_start_clearance(
+                        current, active_component=selected_side)
+                    inherited_check = inherited.check(current)
+                except RM65InheritedStartBlocked as error:
+                    raise RM65GraspTrajectoryPlanningError(
+                        "path_start_collision_blocked", details={
+                            "planning_phase": "inherited_start_clearance_admission",
+                            **error.details,
+                        }) from error
+                except Exception as error:  # noqa: BLE001 - no fallback from native admission faults
+                    raise RM65GraspTrajectoryPlanningError(
+                        "path_start_collision_check_unavailable", details={
+                            "planning_phase": "inherited_start_clearance_admission",
+                            "exception_type": type(error).__name__,
+                        }) from error
+                if not inherited_check.collision_check_available:
+                    raise RM65GraspTrajectoryPlanningError(
+                        "path_start_collision_check_unavailable", details={
+                            "planning_phase": "inherited_start_clearance_admission",
+                            "collision_check": inherited_check.to_dict(),
+                        })
+                if not inherited_check.safe:
+                    raise RM65GraspTrajectoryPlanningError(
+                        "path_start_collision_blocked", details={
+                            "planning_phase": "inherited_start_clearance_admission",
+                            "collision_check": inherited_check.to_dict(),
+                        })
+                # The request-owned planner already holds the planning lock.
+                # Ordinary strict oracles, model geometry and scene margins
+                # are untouched; dense final paths must prove egress.
+                self.oracle = inherited
         self.require_static_grasp_scene(qpos_by_side=current, side=selected_side)
         if self.observed_obstacles is not None:
             initial_check = self.oracle.check(current)
@@ -6500,11 +6616,10 @@ class RM65GraspJointTrajectoryPlanner:
             boundary["end_time_sec"] = float(
                 times[int(boundary["end_sample_index"])]
             )
-        if (
-            self.config.trajectory_parameterization
-            == RM65_GRASP_TRAJECTORY_PARAMETERIZATION_CONTINUOUS_C2
-            and not continuous_per_leg_coverage_complete
-        ):
+        if (isinstance(self.oracle, RM65InheritedStartClearanceOracle)
+                or (self.config.trajectory_parameterization
+                    == RM65_GRASP_TRAJECTORY_PARAMETERIZATION_CONTINUOUS_C2
+                    and not continuous_per_leg_coverage_complete)):
             dense["parameterized_trajectory_revalidation"] = self._revalidate(
                 tuple(
                     {

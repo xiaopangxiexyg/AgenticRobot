@@ -48,6 +48,21 @@ Real profile 保留激活时实测 TCP 朝向，固定 profile 速度为 `0.2`�
 过期或未来引用均拒绝。规划结束、lower activation 前再次检查保留身份与年龄，失败进入原 HOLD。
 每次移动的碰撞观测仍由 safe planner 重新采集、校验 TTL、静止性和几何，不复用保存点作为障碍场景。
 
+## 可选的正距离起点退出
+
+RealMan 继续默认拒绝不足原 20 mm 净空的起点。部署者可显式选择
+`--enable-inherited-start-clearance`，同时配置 `--safe-motion-observation-roles`；
+直接调用原 RM65 规划器时使用
+`RM65GraspTrajectoryPlanningConfig(enable_inherited_start_clearance=True)`。
+该选项只适用于含实测障碍云的普通 safe TCP 移动，不作用于抓姿接触链或无观测云的规划。
+它进入执行 manifest 身份，旧 manifest/grant 不能直接复用；默认关闭时身份保持原值。
+
+仅本次实测起点已有且严格正距离的近邻对继承原距离下界；硬接触、穿透和新出现的近邻仍拒绝。
+非运动臂必须保持固定，运动侧近邻须沿最终稠密执行采样不退化、最终进入原净空，并禁止重新进入。
+许可只绑定一次请求，不修改场景余量或污染下一次规划。查询故障单独报告不可用，不落回另一条规划路径。
+该模式提供规划接纳能力，仍受原执行、deadline、取消和HOLD约束；离线保存场景结果不证明真机跟踪误差或实际运动资格。
+MuJoCo Gateway 的独立 sensor-shaped planner 不通过此 RealMan 选项改变默认接纳。
+
 ## 结果与边界
 
 `observed_point_report` 包含源 operation/request hash、点索引、公开参考系、派生目标、实测终点和位姿误差；原执行/评估/HOLD 回执仍完整保留。到达不是抓取或物理任务成功。

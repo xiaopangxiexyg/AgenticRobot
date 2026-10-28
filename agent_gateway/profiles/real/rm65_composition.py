@@ -441,6 +441,12 @@ def assemble_exclusive_rm65_agent_primitive_composition(
             raise ValueError("Surface anchor v2 requires a bounded segmenter timeout of at most 45s.")
     observed_point_enabled = "move_to_observed_point" in normalized_actions
     observed_safe_enabled = safe_motion_observation_config is not None
+    inherited_start_clearance_enabled = (
+        grasp_trajectory_config is not None
+        and grasp_trajectory_config.enable_inherited_start_clearance
+    )
+    if inherited_start_clearance_enabled and not observed_safe_enabled:
+        raise ValueError("Inherited start clearance requires an explicit observed safe scene.")
     if enable_anchor_motion_v2 and (
         not enable_surface_anchor_v2 or not observed_point_enabled or not observed_safe_enabled
     ):
@@ -595,6 +601,8 @@ def assemble_exclusive_rm65_agent_primitive_composition(
                 and captured_robot_observation_filter.config.geometry_mode != "legacy" else {}),
             **({"safe_motion_observation": asdict(safe_motion_observation_config)}
                if safe_motion_observation_config is not None else {}),
+            **({"safe_motion_start_clearance": "inherited-positive-v1"}
+               if inherited_start_clearance_enabled else {}),
         },
         domain="dexteleop.real_skill.rm65_execution_manifest.v1",
     )

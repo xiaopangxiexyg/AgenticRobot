@@ -198,6 +198,8 @@ def build_parser() -> argparse.ArgumentParser:
         help="observed obstacle depth range in meters; farther/unknown space is not certified")
     parser.add_argument("--safe-motion-scene-max-age-sec", type=float, default=30.,
         help="maximum frozen scene age at activation (default: 30s); no automatic degraded fallback")
+    parser.add_argument("--enable-inherited-start-clearance", action="store_true",
+        help="Explicitly allow certified egress from positive-distance start proximity for observed safe moves; strict clearance remains the default.")
     parser.add_argument("--safe-motion-debug-dir", type=Path,
         help="existing private directory for exact RGB-D, filtered points and safe-move rejection evidence; opt-in, no extra captures")
     parser.add_argument("--enable-spatial-goals", action=argparse.BooleanOptionalAction,
@@ -1022,6 +1024,8 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("Point-grasp, back projection or observed safe motion requires the composed camera options")
     if args.safe_motion_debug_dir is not None and args.safe_motion_observation_roles is None:
         parser.error("--safe-motion-debug-dir requires --safe-motion-observation-roles")
+    if args.enable_inherited_start_clearance and args.safe_motion_observation_roles is None:
+        parser.error("--enable-inherited-start-clearance requires --safe-motion-observation-roles")
     if "move_to_observed_point" in actions and (
             not args.enable_back_projection or args.safe_motion_observation_roles is None):
         parser.error("move_to_observed_point requires --enable-back-projection and --safe-motion-observation-roles")
@@ -1404,6 +1408,7 @@ def main(argv: list[str] | None = None) -> int:
                 maximum_scene_age_sec=args.safe_motion_scene_max_age_sec)),
         safe_motion_debug_dir=safe_motion_debug_dir,
         grasp_trajectory_config=RM65GraspTrajectoryPlanningConfig(
+            enable_inherited_start_clearance=args.enable_inherited_start_clearance,
             trajectory_parameterization=(args.grasp_trajectory_parameterization),
             trajectory_speed_profile=(args.grasp_trajectory_speed_profile),
             endpoint_candidate_ordering=(args.grasp_endpoint_candidate_ordering),

@@ -732,6 +732,53 @@ def test_safe_planner_binding_uses_arrival_tolerances_and_can_observe_without_mo
     assert not kwargs["socket_path"].exists()
 
 
+def test_explicit_start_clearance_binds_manifest_and_keeps_strict_default(monkeypatch, tmp_path):
+    from robot_motion.observed_scene import SafeMotionObservationConfig
+    from teleop_runtime.skill_deploy.rm65_grasp_trajectory import RM65GraspTrajectoryPlanningConfig
+
+    class Planner:
+        def __call__(self, **kwargs):
+            return None
+        def plan_with_observed_cloud(self, cloud, **kwargs):
+            return cloud
+
+    configs = []
+    def planner(**kwargs):
+        configs.append(kwargs["config"])
+        return Planner()
+
+    monkeypatch.setattr(composition_module, "RM65GraspJointTrajectoryPlanner", planner)
+    lower, guard = _lower(monkeypatch)
+    kwargs = dict(lower=lower, socket_path=tmp_path / "gateway.sock", authorized_side="right",
+        authorized_action="move_tcp_to_pose_safe", confirmation_token=REAL_AGENT_PRIMITIVE_CONFIRM_TOKEN,
+        client_id="rpent:test", client_uid=1000, runtime_session_id="clearance:test",
+        control_domain_id="clearance:domain", embodiment_instance_id="clearance:embodiment")
+    enabled = RM65GraspTrajectoryPlanningConfig(enable_inherited_start_clearance=True)
+    with pytest.raises(ValueError, match="explicit observed safe scene"):
+        assemble_exclusive_rm65_agent_primitive_composition(**kwargs, grasp_trajectory_config=enabled)
+    (tmp_path / "artifacts").mkdir()
+    hashes = []
+    for config in (None, RM65GraspTrajectoryPlanningConfig(), enabled):
+        configs.clear()
+        composition = assemble_exclusive_rm65_agent_primitive_composition(**kwargs,
+            camera_config_path=REPO_ROOT / "teleop_runtime/configs/devices/agent_gateway_realsense.json",
+            camera_registry_path=DEFAULT_RM65_CAMERA_REGISTRY_V4,
+            artifact_root=tmp_path / "artifacts", camera_mount_urdf_path=DEFAULT_RM65_CAMERA_MOUNT_URDF,
+            safe_motion_observation_config=SafeMotionObservationConfig(), grasp_trajectory_config=config)
+        session = composition.deployment.gateway_session
+        hashes.append(session.contract_bundle.attachment.execution_manifest_hash)
+        resource, = [r for r in composition.resources.additional_resources
+            if isinstance(r, composition_module.MotionPlanningGeometryResources)]
+        monkeypatch.setattr(resource.self_filter, "prepare", lambda: {})
+        resource.start()
+        assert configs[-1].enable_inherited_start_clearance is (config is enabled)
+        session.close()
+    assert hashes[0] == hashes[1] and hashes[2] != hashes[0]
+    assert all(backend.starts == 0 for backend in lower.arm_backends.values())
+    assert guard.starts == 0
+    assert not kwargs["socket_path"].exists()
+
+
 def test_composition_matches_mujoco_canonical_station_axes_and_pose(
     monkeypatch,
 ) -> None:

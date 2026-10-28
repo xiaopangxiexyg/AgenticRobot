@@ -8,8 +8,10 @@ import pytest
 
 from robot_motion.rm65.obstacle_collision import (
     AttachedBoxCollisionProxy,
+    RM65InheritedStartBlocked,
     RM65ObstacleCollisionOracle,
 )
+from robot_motion.observed_obstacles import ObservedObstacleCloud
 from robot_motion.scene_obstacles import (
     AxisAlignedBoxObstacle,
     ObstacleSceneSnapshot,
@@ -143,6 +145,127 @@ def test_clearance_margin_can_block_a_geometrically_separated_link() -> None:
     assert check.collision_check_available is True
     assert check.minimum_distance_m == pytest.approx(0.05, abs=1e-6)
     assert check.safe is False
+
+
+def test_inherited_start_clearance_keeps_ordinary_margin_and_blocks_worsening():
+    model, collision = _simple_prismatic_collision_model()
+    oracle = RM65ObstacleCollisionOracle(model=model, base_collision_model=collision,
+        reference_full_q=np.zeros(model.nq), qpos_indices_by_component={"arm": (0,)},
+        scene=_scene(center_x=.2, clearance=.06))
+    start = {"arm": np.array([0.])}
+    assert oracle.check(start).minimum_distance_m == pytest.approx(.05)
+    assert not oracle.check(start).safe
+    inherited = oracle.inherited_start_clearance(start, active_component="arm")
+    assert inherited.active_inherited_pairs == (0,)
+    assert inherited.check(start).safe
+    assert inherited.check({"arm": np.array([-.005])}).safe
+    assert not inherited.check({"arm": np.array([.005])}).safe
+    assert inherited.check({"arm": np.array([-.02])}).safe
+    assert not inherited.check({"arm": np.array([.15])}).safe
+    progress = inherited.new_dense_progress()
+    assert not progress.all_exited
+    assert progress.advance(inherited.inherited_active_distances(start)) is None
+    assert progress.advance(inherited.inherited_active_distances(
+        {"arm": np.array([-.005])})) is None
+    regression = progress.advance(inherited.inherited_active_distances(
+        {"arm": np.array([-.002])}))
+    assert regression["reason"] == "inherited_start_clearance_regressed"
+    progress = inherited.new_dense_progress()
+    assert progress.advance((.05,)) is None
+    assert progress.advance((.059,)) is None
+    assert progress.advance((.059 - .5e-6,)) is None
+    assert progress.advance((.059 - 1.5e-6,))["reason"] == "inherited_start_clearance_regressed"
+    progress = inherited.new_dense_progress()
+    for value in (0., -.005, -.02):
+        assert progress.advance(inherited.inherited_active_distances(
+            {"arm": np.array([value])})) is None
+    assert progress.all_exited
+    assert progress.advance(inherited.inherited_active_distances(
+        {"arm": np.array([-.005])}))["reason"] == "inherited_start_clearance_regressed"
+    assert not oracle.check(start).safe  # No source oracle or scene mutation.
+    with pytest.raises(RM65InheritedStartBlocked) as blocked:
+        oracle.inherited_start_clearance({"arm": np.array([.15])}, active_component="arm")
+    assert blocked.value.details["source"] == "fixed_scene"
+
+
+def test_inherited_clearance_of_inactive_arm_never_exempts_new_active_pair():
+    model = pin.Model()
+    collision = pin.GeometryModel()
+    indices = {}
+    for side, offset in (("left", 0.), ("right", 1.)):
+        joint_id = model.addJoint(0, pin.JointModelPX(),
+            pin.SE3(np.eye(3), np.array((0., offset, 0.))), side + "_joint")
+        model.appendBodyToJoint(joint_id, pin.Inertia.Random(), pin.SE3.Identity())
+        collision.addGeometryObject(pin.GeometryObject(side + "_sensor", joint_id,
+            0, pin.SE3.Identity(), hppfcl.Sphere(.05)))
+        indices[side] = (model.joints[joint_id].idx_q,)
+    scene = ObstacleSceneSnapshot(reference_frame_id="world",
+        reference_frame_spec_hash="world-v1", revision=1, minimum_clearance_m=.02,
+        obstacles=(AxisAlignedBoxObstacle(obstacle_id="slab",
+            center_xyz_m=(.2, .5, 0.), size_xyz_m=(.2, 2., .2)),))
+    oracle = RM65ObstacleCollisionOracle(model=model, base_collision_model=collision,
+        reference_full_q=pin.neutral(model), qpos_indices_by_component=indices, scene=scene)
+    start = {"left": np.array((-.5,)), "right": np.array((.04,))}
+    assert not oracle.check(start).safe
+    inherited = oracle.inherited_start_clearance(start, active_component="left")
+    assert inherited.static_inherited_pairs and not inherited.active_inherited_pairs
+    assert inherited.check(start).safe
+    assert inherited.check({"left": np.array((-.4,)), "right": start["right"]}).safe
+    assert not inherited.check({"left": np.array((.04,)), "right": start["right"]}).safe
+    assert not inherited.check({"left": start["left"], "right": np.array((.05,))}).collision_check_available
+
+
+def test_inherited_start_clearance_keeps_observed_proxy_distance_from_worsening():
+    model = pin.Model()
+    joint = model.addJoint(0, pin.JointModelPX(), pin.SE3.Identity(), "moving_x")
+    model.appendBodyToJoint(joint, pin.Inertia.Random(), pin.SE3.Identity())
+    collision = pin.GeometryModel()
+    collision.addGeometryObject(pin.GeometryObject("hand_box", joint, 0,
+        pin.SE3.Identity(), hppfcl.Box(.1, .1, .1)))
+    oracle = RM65ObstacleCollisionOracle(model=model, base_collision_model=collision,
+        reference_full_q=pin.neutral(model), qpos_indices_by_component={"arm": (0,)},
+        scene=_scene(center_x=.5, clearance=.02))
+    cloud = ObservedObstacleCloud(reference_frame_id="world",
+        points_m=np.array([[-.07, 0., 0.]]), evidence={"source": "measured_rgbd"})
+    oracle.bind_observed_cloud(cloud)
+    start = {"arm": np.array([0.])}
+    ordinary = oracle.check(start)
+    assert ordinary.reason == "observed_obstacle_clearance_blocked"
+    assert ordinary.minimum_distance_m > 0.0
+    inherited = oracle.inherited_start_clearance(start, active_component="arm")
+    assert not inherited.active_inherited_pairs
+    assert inherited.observed_active_names == ("hand_box",)
+    assert inherited.check(start).safe
+    assert inherited.check({"arm": np.array([.005])}).safe
+    assert not inherited.check({"arm": np.array([-.005])}).safe
+    progress = inherited.new_observed_dense_progress()
+    assert progress.advance(inherited.observed_active_distances(start)) is None
+    assert progress.advance(inherited.observed_active_distances(
+        {"arm": np.array([.005])})) is None
+    assert progress.all_exited
+    assert progress.advance(inherited.observed_active_distances(
+        {"arm": np.array([0.])}))["reason"] == "inherited_start_clearance_regressed"
+    assert not oracle.check(start).safe
+
+
+def test_inherited_start_reports_masked_observed_overlap_as_blocked():
+    model = pin.Model()
+    joint = model.addJoint(0, pin.JointModelPX(), pin.SE3.Identity(), "moving_x")
+    model.appendBodyToJoint(joint, pin.Inertia.Random(), pin.SE3.Identity())
+    collision = pin.GeometryModel()
+    collision.addGeometryObject(pin.GeometryObject("hand_box", joint, 0,
+        pin.SE3.Identity(), hppfcl.Box(.1, .1, .1)))
+    oracle = RM65ObstacleCollisionOracle(model=model, base_collision_model=collision,
+        reference_full_q=pin.neutral(model), qpos_indices_by_component={"arm": (0,)},
+        scene=_scene(center_x=.2, clearance=.06))
+    oracle.bind_observed_cloud(ObservedObstacleCloud(reference_frame_id="world",
+        points_m=np.array([[0., 0., 0.]]), evidence={"source": "measured_rgbd"}))
+    start = {"arm": np.array([0.])}
+    assert oracle.check(start).reason == "collision_clearance_violated"
+    with pytest.raises(RM65InheritedStartBlocked) as caught:
+        oracle.inherited_start_clearance(start, active_component="arm")
+    assert caught.value.details["source"] == "observed_rgbd"
+    assert caught.value.details["distance_m"] <= 0.0
 
 
 @pytest.mark.parametrize("active_component", ("left", "right"))
