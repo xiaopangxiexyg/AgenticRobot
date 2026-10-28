@@ -8,6 +8,7 @@ import stat
 import tempfile
 import uuid
 from pathlib import Path
+from typing import Callable
 from unittest import mock
 
 import pytest
@@ -30,7 +31,11 @@ from dataset_interface.tactile_bundle import attach_tactile_bundle
 DATASET_UUID = uuid.UUID("3ef8a7b7-22f5-44e7-812c-79d2f66f69d1")
 
 
-def _native_dataset(tmp_path: Path) -> tuple[Path, Path, Path]:
+def _native_dataset(
+    tmp_path: Path,
+    *,
+    before_seal: Callable[[Path, Path], None] | None = None,
+) -> tuple[Path, Path, Path]:
     core = tmp_path / "core"
     storage = tmp_path / "storage"
     core.mkdir()
@@ -99,6 +104,8 @@ def _native_dataset(tmp_path: Path) -> tuple[Path, Path, Path]:
         }
         for index in range(2)
     ]
+    if before_seal is not None:
+        before_seal(manifest_path, payload_path)
     report = store.seal_episode(
         identity=identity,
         rows=rows,
@@ -509,6 +516,204 @@ def test_raw_removal_failure_keeps_the_verified_new_metadata(tmp_path, monkeypat
         storage / "datasets" / str(DATASET_UUID),
         raw.with_name("manifest.json").read_bytes(), raw_before,
     )
+
+
+def _compress_fixture_stream(path: Path, spec: dict) -> dict:
+    raw = path.read_bytes()
+    compressed = native_recompression_module._ZstdCodec(level=1, backend="python").compress(raw)
+    path.write_bytes(compressed)
+    return {
+        **spec,
+        "encoding": "chunked_zstd",
+        "compression": "zstd",
+        "chunks": [{
+            "frame_start": 0, "frame_count": spec["frame_count"], "offset": 0,
+            "compressed_bytes": len(compressed), "raw_bytes": len(raw),
+        }],
+        "stored_size_bytes": len(compressed),
+        "stored_sha256": hashlib.sha256(compressed).hexdigest(),
+    }
+
+
+@pytest.mark.parametrize(
+    "layout",
+    ["predecessor", "predecessor_dot", "predecessor_parent", "predecessor_current_first", "committed_target"],
+)
+def test_native_cleanup_preserves_all_committed_streams(tmp_path, layout):
+    def add_stream(manifest_path, payload_path):
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        first = manifest["streams"]["M_RAW"]
+        sibling = payload_path.with_name(
+            f"{payload_path.name}.tdelta8.zst" if layout == "committed_target" else "current.bin"
+        )
+        raw = payload_path.read_bytes()
+        sibling.write_bytes(raw)
+        sibling_logical = str(Path(first["path"]).with_name(sibling.name))
+        second = {**first, "path": sibling_logical}
+        if layout == "committed_target":
+            second = _compress_fixture_stream(sibling, second)
+        else:
+            first = _compress_fixture_stream(payload_path, first)
+            source_stat = sibling.stat()
+            source_path = sibling_logical
+            if layout == "predecessor_dot":
+                source_path = f"./{sibling_logical}"
+            elif layout == "predecessor_parent":
+                source_path = str(Path(sibling_logical).parent / ".." / "left" / sibling.name)
+            first["recompressed_from"] = {
+                "path": source_path,
+                "device": source_stat.st_dev,
+                "inode": source_stat.st_ino,
+                "raw_sha256": hashlib.sha256(raw).hexdigest(),
+            }
+            manifest["streams"]["M_RAW"] = first
+        sensor = "AA_CURRENT" if layout == "predecessor_current_first" else "ZZ_CURRENT"
+        manifest["sensor_keys"].append(sensor)
+        manifest["streams"][sensor] = second
+        manifest_path.write_text(json.dumps(manifest, sort_keys=True), encoding="utf-8")
+
+    core, storage, _payload = _native_dataset(tmp_path, before_seal=add_stream)
+    attached = attach_tactile_bundle(core, storage)
+    before = {
+        attached.resolve(artifact.logical_path): attached.resolve(artifact.logical_path).read_bytes()
+        for artifact in attached.episodes[0].tactile_component.artifacts
+    }
+    with pytest.raises((TactileRecompressionCancelled, FileNotFoundError)) as caught:
+        recompress_native_tactile_bundle_zstd_in_place(
+            core, storage, min_free_bytes=0, backend="python", cancel_requested=lambda: True
+        )
+    for path, data in before.items():
+        assert path.is_file(), f"committed artifact was removed: {path}"
+        assert path.read_bytes() == data
+    assert isinstance(caught.value, TactileRecompressionCancelled)
+    attach_tactile_bundle(core, storage)
+    if layout == "committed_target":
+        with pytest.raises(FileExistsError, match="Refusing to overwrite existing compressed stream"):
+            recompress_native_tactile_bundle_zstd_in_place(
+                core, storage, min_free_bytes=0, backend="python"
+            )
+        assert {path: path.read_bytes() for path in before} == before
+        attach_tactile_bundle(core, storage)
+
+
+@pytest.mark.parametrize("location", ["absolute_external", "relative_external", "bundle_metadata"])
+def test_native_cleanup_rejects_predecessors_outside_tactile_namespace(tmp_path, location):
+    bundle = tmp_path / "storage/datasets" / str(DATASET_UUID)
+    if location == "bundle_metadata":
+        protected = bundle / native_recompression_module.storage_dataset_identity_relative_path()
+    else:
+        protected = tmp_path / "foreign.raw"
+        protected.write_bytes(b"retained evidence")
+
+    def add_predecessor(manifest_path, payload_path):
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        spec = _compress_fixture_stream(payload_path, manifest["streams"]["M_RAW"])
+        source_stat = protected.stat()
+        spec["recompressed_from"] = {
+            "path": str(protected) if location == "absolute_external" else os.path.relpath(protected, bundle),
+            "device": source_stat.st_dev,
+            "inode": source_stat.st_ino,
+            "raw_sha256": hashlib.sha256(protected.read_bytes()).hexdigest(),
+        }
+        manifest["streams"]["M_RAW"] = spec
+        manifest_path.write_text(json.dumps(manifest, sort_keys=True), encoding="utf-8")
+
+    core, storage, _payload = _native_dataset(tmp_path, before_seal=add_predecessor)
+    attach_tactile_bundle(core, storage)
+    before = protected.read_bytes()
+    with pytest.raises((RuntimeError, ValueError)) as caught:
+        recompress_native_tactile_bundle_zstd_in_place(
+            core, storage, min_free_bytes=0, backend="python", cancel_requested=lambda: True
+        )
+    assert protected.is_file(), f"out-of-scope predecessor was removed: {protected}"
+    assert protected.read_bytes() == before
+    assert "outside tactile namespace" in str(caught.value)
+    attach_tactile_bundle(core, storage)
+
+
+def test_native_cleanup_protects_artifacts_from_a_later_episode(tmp_path):
+    later_relative = "tactile/chunk-001/episode_000001/left/M_RAW.uint8.bin"
+
+    def add_history(manifest_path, payload_path):
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        spec = _compress_fixture_stream(payload_path, manifest["streams"]["M_RAW"])
+        spec["recompressed_from"] = {"path": later_relative}
+        manifest["streams"]["M_RAW"] = spec
+        manifest_path.write_text(json.dumps(manifest, sort_keys=True), encoding="utf-8")
+
+    core, storage, _payload = _native_dataset(tmp_path, before_seal=add_history)
+    later = _append_native_episode(core, storage, episode_index=1)
+    attached = attach_tactile_bundle(core, storage)
+    before = {
+        attached.resolve(artifact.logical_path): attached.resolve(artifact.logical_path).read_bytes()
+        for episode in attached.episodes.values()
+        for artifact in episode.tactile_component.artifacts
+    }
+    with pytest.raises((TactileRecompressionCancelled, FileNotFoundError)) as caught:
+        recompress_native_tactile_bundle_zstd_in_place(
+            core, storage, min_free_bytes=0, backend="python", max_episodes=1,
+            cancel_requested=lambda: True,
+        )
+    assert later.is_file()
+    assert {path: path.read_bytes() for path in before} == before
+    assert isinstance(caught.value, TactileRecompressionCancelled)
+    attach_tactile_bundle(core, storage)
+
+
+def test_native_cleanup_rejects_external_target_symlink(tmp_path):
+    core, storage, raw = _native_dataset(tmp_path)
+    foreign = tmp_path / "foreign.zst"
+    foreign.write_bytes(b"retained evidence")
+    target = raw.with_name(f"{raw.name}.tdelta8.zst")
+    target.symlink_to(foreign)
+    attach_tactile_bundle(core, storage)
+    with pytest.raises(RuntimeError) as caught:
+        recompress_native_tactile_bundle_zstd_in_place(
+            core, storage, min_free_bytes=0, backend="python", cancel_requested=lambda: True
+        )
+    assert target.is_symlink()
+    assert foreign.read_bytes() == b"retained evidence"
+    assert "outside tactile namespace" in str(caught.value)
+    attach_tactile_bundle(core, storage)
+
+
+@pytest.mark.parametrize("use_symlink", [False, True])
+def test_native_cleanup_removes_only_the_unreferenced_predecessor_path(tmp_path, use_symlink):
+    predecessor = None
+    backing = None
+
+    def add_predecessor(manifest_path, payload_path):
+        nonlocal predecessor, backing
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        spec = manifest["streams"]["M_RAW"]
+        raw = payload_path.read_bytes()
+        backing = payload_path.with_name("previous.bin")
+        backing.write_bytes(raw)
+        predecessor = backing
+        if use_symlink:
+            predecessor = payload_path.with_name("previous-link.bin")
+            predecessor.symlink_to(backing.name)
+        source_stat = predecessor.stat()
+        updated = _compress_fixture_stream(payload_path, spec)
+        updated["recompressed_from"] = {
+            "path": str(Path(spec["path"]).with_name(predecessor.name)),
+            "device": source_stat.st_dev,
+            "inode": source_stat.st_ino,
+            "raw_sha256": hashlib.sha256(raw).hexdigest(),
+        }
+        manifest["streams"]["M_RAW"] = updated
+        manifest_path.write_text(json.dumps(manifest, sort_keys=True), encoding="utf-8")
+
+    core, storage, _payload = _native_dataset(tmp_path, before_seal=add_predecessor)
+    with pytest.raises(TactileRecompressionCancelled):
+        recompress_native_tactile_bundle_zstd_in_place(
+            core, storage, min_free_bytes=0, backend="python", cancel_requested=lambda: True
+        )
+    assert not predecessor.exists()
+    assert not predecessor.is_symlink()
+    if use_symlink:
+        assert backing.read_bytes() == bytes(range(8))
+    attach_tactile_bundle(core, storage)
 
 
 def test_native_idle_recompression_updates_bundle_commit_and_attachment() -> None:

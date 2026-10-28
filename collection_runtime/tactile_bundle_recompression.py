@@ -21,6 +21,7 @@ from dataset_contracts.canonical_encoding import canonical_bytes, canonical_load
 from dataset_contracts.tactile_bundle import (
     TACTILE_BUNDLE_DATASET_IDENTITY_FILE_DOMAIN_V1,
     TACTILE_BUNDLE_EPISODE_COMMIT_FILE_DOMAIN_V1,
+    TACTILE_BUNDLE_LOGICAL_PREFIX_V1,
     TACTILE_BUNDLE_TACTILE_COMPONENT_FILE_DOMAIN_V1,
     TactileBundleDatasetIdentityV1,
     TactileBundleArtifactV1,
@@ -167,13 +168,14 @@ def _read_catalog_rows(core_root: Path) -> list[dict[str, Any]]:
     return rows
 
 
-def _episode_catalog_update(
+def _update_episode_catalog_in_place(
     rows: list[dict[str, Any]],
     *,
     episode_index: int,
     episode_uuid: str,
     commit_hash: str,
 ) -> bytes:
+    """Update the caller's cumulative rows in place and encode the next catalog."""
     matched = 0
     for row in rows:
         if int(row.get("episode_index", -1)) != int(episode_index):
@@ -303,8 +305,15 @@ def _clean_native_orphans(
 ) -> int:
     """Remove only deterministic targets or raw predecessors left by a stop."""
 
+    bundle_root = bundle_root.resolve()
+    tactile_root = bundle_root / TACTILE_BUNDLE_LOGICAL_PREFIX_V1
+    # Protect all committed artifacts before examining any candidate.
+    referenced = {
+        (bundle_root / artifact.logical_path).resolve()
+        for component in components
+        for artifact in component.artifacts
+    }
     removed = 0
-    referenced: set[str] = set()
     for component in components:
         for binding in component.manifests:
             manifest_path = bundle_root / binding.manifest_logical_path
@@ -315,15 +324,17 @@ def _clean_native_orphans(
             for value in streams.values():
                 if not isinstance(value, Mapping):
                     continue
-                target = str(value.get("path") or "")
-                if target:
-                    referenced.add(target)
                 source_info = value.get("recompressed_from")
                 if isinstance(source_info, Mapping):
                     source = str(source_info.get("path") or "")
                     if source:
                         source_path = bundle_root / source
-                        if source_path.is_file() and source not in referenced:
+                        source_identity = source_path.resolve()
+                        if not source_identity.is_relative_to(tactile_root):
+                            raise NativeTactileBundleRecompressionError(
+                                f"native tactile orphan source is outside tactile namespace: {source}"
+                            )
+                        if source_path.is_file() and source_identity not in referenced:
                             stat = source_path.stat()
                             if int(source_info.get("device", stat.st_dev)) != int(stat.st_dev):
                                 raise NativeTactileBundleRecompressionError(
@@ -358,6 +369,13 @@ def _clean_native_orphans(
             _manifest, raw_streams = _raw_manifest_streams(bundle_root, manifest_path)
             for _sensor, _spec, source in raw_streams:
                 target = source.with_name(f"{source.name}.tdelta{int(chunk_frames)}.zst")
+                target_identity = target.resolve()
+                if not target_identity.is_relative_to(tactile_root):
+                    raise NativeTactileBundleRecompressionError(
+                        f"native tactile orphan target is outside tactile namespace: {target}"
+                    )
+                if target_identity in referenced:
+                    continue
                 if not target.is_file():
                     continue
                 target_stat = target.stat()
@@ -432,7 +450,7 @@ def recompress_native_tactile_bundle_zstd_in_place(
         raise TactileRecompressionCancelled("native tactile recompression cancelled before work")
 
     codec: _ZstdCodec | None = None
-    rows = _read_catalog_rows(core_root)
+    catalog_rows = _read_catalog_rows(core_root)
     catalog_path = core_root / "meta" / "episodes.jsonl"
     manifest_count = 0
     stream_count = 0
@@ -614,8 +632,8 @@ def recompress_native_tactile_bundle_zstd_in_place(
                 core_component_ref=old_commit.core_component_ref,
                 tactile_component_ref=old_commit.tactile_component_ref,
             )
-            updated_catalog = _episode_catalog_update(
-                [dict(row) for row in rows],
+            updated_catalog = _update_episode_catalog_in_place(
+                catalog_rows,
                 episode_index=updated_commit.legacy_episode_index,
                 episode_uuid=updated_commit.episode_uuid,
                 commit_hash=updated_commit.semantic_content_hash,
