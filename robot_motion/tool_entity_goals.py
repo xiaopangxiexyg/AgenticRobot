@@ -11,6 +11,11 @@ execution decision, never turns a proposal into an observation, and does not
 change the existing TCP relation semantics in ``robot_motion.spatial_goals``.
 Unobserved space under the footprint is not known to be free; the caller's
 planner still checks its own collision model against the observed scene.
+
+The same gripper solids also classify measured gripper-object relations
+(``agenticrobot.relation.tool_object.v1``): one object's largest measured
+surface cluster against the palm/finger solids and the open closing region.
+That is observation evidence for the upper layer, not a grasp or contact claim.
 """
 
 from __future__ import annotations
@@ -30,6 +35,8 @@ TOOL_ENTITY_HOVER_SEMANTICS_V1 = "agenticrobot.relation.tool_entity_hover.v1"
 HOVER_ORIENTATION_POLICIES = ("preserve", "tool_axis_down")
 MAX_HOVER_TIP_OFFSET_M = 0.25
 MAX_HOVER_CLEARANCE_M = 0.30
+# A tilt cone wider than this is no longer a "tool down" request.
+MAX_TOOL_AXIS_TILT_RAD = math.radians(60.)
 _ROUND = 12
 
 
@@ -51,6 +58,15 @@ class ToolEntityBox:
     half_extents_m: tuple[float, float, float]
     tip_center_tcp_m: tuple[float, float, float]
     source: Mapping[str, object] = field(default_factory=dict)
+    # Optional finer geometry sharing the box axes: (centre_tcp, half) solids
+    # (palm and fingers) and the closing region between the fingers.
+    parts: tuple[tuple[tuple[float, float, float], tuple[float, float, float]], ...] = ()
+    grasp_region: tuple[tuple[float, float, float], tuple[float, float, float]] | None = None
+    # Optional extra contact-only solids with their own axes: (TCP-from-solid
+    # 4x4 row-major, half extents). Tool-object relations measure them
+    # separately (sensor distance, contact band, near/far); the hover box, its
+    # footprint and the closing region are unchanged.
+    contact_solids: tuple[tuple[tuple[float, ...], tuple[float, float, float]], ...] = ()
 
     def __post_init__(self) -> None:
         centre = _vector3(self.tcp_from_box_xyz_m, name="tcp_from_box_xyz_m")
@@ -67,6 +83,32 @@ class ToolEntityBox:
             raise ValueError("Tool entity rotation must be a right-handed orthonormal matrix.")
         if not np.allclose(rotation.T @ (tip - centre), (0., 0., half[2]), atol=1e-9, rtol=0.):
             raise ValueError("Tool entity tip must be the approach face center.")
+
+        def box(value, name):
+            if len(value) != 2:
+                raise ValueError(f"{name} must be (centre, half extents).")
+            c, h = _vector3(value[0], name=name + " centre"), _vector3(value[1], name=name + " half")
+            if np.any(h <= 0):
+                raise ValueError(f"{name} half extents must be positive.")
+            return tuple(float(x) for x in c), tuple(float(x) for x in h)
+        object.__setattr__(self, "parts", tuple(box(part, "tool part") for part in self.parts))
+
+        def oriented(value):
+            if len(value) != 2:
+                raise ValueError("contact solid must be (TCP-from-solid pose, half extents).")
+            pose = np.asarray(value[0], dtype=float)
+            h = _vector3(value[1], name="contact solid half")
+            if (pose.size != 16 or not np.isfinite(pose).all() or np.any(h <= 0)
+                    or not np.allclose(pose.reshape(4, 4)[3], (0., 0., 0., 1.), atol=1e-9, rtol=0.)):
+                raise ValueError("contact solid needs a finite rigid 4x4 pose and positive half extents.")
+            r = pose.reshape(4, 4)[:3, :3]
+            if (not np.allclose(r.T @ r, np.eye(3), atol=1e-7, rtol=0.)
+                    or not np.isclose(np.linalg.det(r), 1., atol=1e-7, rtol=0.)):
+                raise ValueError("contact solid rotation must be right-handed orthonormal.")
+            return tuple(float(x) for x in pose.reshape(-1)), tuple(float(x) for x in h)
+        object.__setattr__(self, "contact_solids", tuple(oriented(item) for item in self.contact_solids))
+        if self.grasp_region is not None:
+            object.__setattr__(self, "grasp_region", box(self.grasp_region, "grasp region"))
         object.__setattr__(self, "tcp_from_box_xyz_m", tuple(float(x) for x in centre))
         object.__setattr__(self, "tip_center_tcp_m", tuple(float(x) for x in tip))
         object.__setattr__(self, "half_extents_m", tuple(float(x) for x in half))
@@ -82,17 +124,30 @@ class ToolEntityBox:
         axis, the palm ``palm_z - finger_thickness .. palm_z``; the width is
         ``opening / 2 + finger_thickness`` per side and the depth is the pad
         height. Opening-dependent finger positions are deliberately enveloped.
+        The separate palm/finger solids and the open closing region are kept
+        for measured tool-object relations.
         """
-        half_width = geometry.maximum_opening_m / 2. + geometry.finger_thickness_m
-        lower = np.array((-half_width, -geometry.pad_height_m / 2., geometry.palm_z_m - geometry.finger_thickness_m))
+        opening, thickness = geometry.maximum_opening_m, geometry.finger_thickness_m
+        half_width = opening / 2. + thickness
+        lower = np.array((-half_width, -geometry.pad_height_m / 2., geometry.palm_z_m - thickness))
         upper = np.array((half_width, geometry.pad_height_m / 2., geometry.palm_z_m + geometry.finger_length_m))
         tcp_from_solid = np.asarray(geometry.solid_pose(np.eye(4)), dtype=float)
         rotation, origin = tcp_from_solid[:3, :3], tcp_from_solid[:3, 3]
+
+        def solid(low, high):
+            low, high = np.asarray(low, float), np.asarray(high, float)
+            return tuple(rotation @ ((low + high) / 2.) + origin), tuple((high - low) / 2.)
+        pad = geometry.pad_height_m / 2.
+        finger_z = (geometry.palm_z_m, geometry.palm_z_m + geometry.finger_length_m)
+        parts = (solid((-half_width, -pad, lower[2]), (half_width, pad, geometry.palm_z_m)),
+                 solid((-half_width, -pad, finger_z[0]), (-opening / 2., pad, finger_z[1])),
+                 solid((opening / 2., -pad, finger_z[0]), (half_width, pad, finger_z[1])))
+        grasp = solid((-opening / 2., -pad, finger_z[0]), (opening / 2., pad, finger_z[1]))
         return cls(tcp_from_box_xyz_m=tuple(rotation @ ((lower + upper) / 2.) + origin),
                    tcp_from_box_rotation=tuple(rotation.reshape(-1)),
                    half_extents_m=tuple((upper - lower) / 2.),
                    tip_center_tcp_m=tuple(rotation @ np.array((0., 0., upper[2])) + origin),
-                   source=source)
+                   source=source, parts=parts, grasp_region=grasp)
 
     def corners_tcp(self) -> np.ndarray:
         rotation = np.asarray(self.tcp_from_box_rotation).reshape(3, 3)
@@ -111,7 +166,213 @@ class ToolEntityBox:
         return {"tcp_from_box_xyz_m": list(self.tcp_from_box_xyz_m),
                 "tcp_from_box_rotation": list(self.tcp_from_box_rotation),
                 "half_extents_m": list(self.half_extents_m),
-                "tip_center_tcp_m": list(self.tip_center_tcp_m), "source": dict(self.source)}
+                "tip_center_tcp_m": list(self.tip_center_tcp_m), "source": dict(self.source),
+                "parts": [[list(c), list(h)] for c, h in self.parts],
+                "grasp_region": None if self.grasp_region is None else [list(v) for v in self.grasp_region],
+                "contact_solids": [[list(pose), list(h)] for pose, h in self.contact_solids]}
+
+
+def _signed_box_distance(points_local: np.ndarray, centre, half) -> np.ndarray:
+    """Signed distance to an axis-aligned box; negative inside."""
+    delta = np.abs(points_local - np.asarray(centre)) - np.asarray(half)
+    return np.linalg.norm(np.maximum(delta, 0.), axis=1) + np.minimum(np.max(delta, axis=1), 0.)
+
+
+TOOL_OBJECT_RELATION_SEMANTICS_V1 = "agenticrobot.relation.tool_object.v1"
+TOOL_OBJECT_RELATIONS = ("between_fingers_in_contact_band", "between_fingers", "in_contact_band", "near", "far",
+                         "insufficient_surface")
+
+
+def object_surface_cluster(points_m, *, voxel_size_m: float = 0.003,
+                           link_distance_m: float = 0.010) -> tuple[np.ndarray, dict]:
+    """Return the largest connected measured surface of one object's mask points.
+
+    Points are first thinned to one point per ``voxel_size_m`` cell, so counts
+    are metric and do not depend on camera range. Voxels closer than
+    ``link_distance_m`` are connected; only the largest component is kept.
+    A mask that also covers an occluder separated by more than the link
+    distance (for example a finger well in front of the object) usually yields
+    a separate, smaller cluster that is dropped; an occluder within the link
+    distance merges, and a larger one wins. The evidence reports component and
+    kept counts so ambiguous surfaces stay visible. Deterministic for identical
+    input order.
+    """
+    from scipy.sparse import coo_matrix
+    from scipy.sparse.csgraph import connected_components
+    from scipy.spatial import cKDTree
+
+    points = np.asarray(points_m, dtype=float).reshape(-1, 3)
+    if not len(points) or not np.isfinite(points).all():
+        raise ValueError("Object points must be a nonempty finite N x 3 array.")
+    if not (math.isfinite(voxel_size_m) and 0. < voxel_size_m <= 0.02
+            and math.isfinite(link_distance_m) and voxel_size_m <= link_distance_m <= 0.05):
+        raise ValueError("Voxel size must be in (0, 0.02] m and the link distance in [voxel, 0.05] m.")
+    _, first = np.unique(np.floor(points / voxel_size_m).astype(np.int64), axis=0, return_index=True)
+    voxels = points[np.sort(first)]
+    pairs = cKDTree(voxels).query_pairs(r=link_distance_m, output_type="ndarray")
+    graph = coo_matrix((np.ones(len(pairs)), (pairs[:, 0], pairs[:, 1])) if len(pairs) else
+                       (np.zeros(0), (np.zeros(0, int), np.zeros(0, int))), shape=(len(voxels), len(voxels)))
+    count, labels = connected_components(graph, directed=False)
+    sizes = np.bincount(labels)
+    order = np.argsort(-sizes, kind="stable")
+    kept = voxels[labels == int(order[0])]
+    second = int(sizes[order[1]]) if count > 1 else 0
+    return kept, {"input_point_count": int(len(points)), "voxel_count": int(len(voxels)),
+                  "component_count": int(count), "kept_voxel_count": int(len(kept)),
+                  "second_component_voxel_count": second,
+                  "voxel_size_m": float(voxel_size_m), "link_distance_m": float(link_distance_m)}
+
+
+@dataclass(frozen=True)
+class ToolObjectRelation:
+    """Measured relation between one arm's gripper solids and one object surface.
+
+    Inputs are the object's measured surface points (see
+    ``object_surface_cluster``) and the gripper at the measured TCP: the
+    maximum-opening grasp-screening solids, their open closing region and,
+    when bound, contact-only solids (for example the URDF sensor boxes).
+    ``surface_distance_m`` is the k-th smallest signed point distance to the
+    screening solids (k = the contact count threshold, negative inside);
+    ``sensor_surface_distance_m`` is the same against the contact-only solids
+    (``None`` without them). The contact band uses either set. It is
+    proximity evidence, not a contact, force, grasp or stability claim.
+    ``insufficient_surface`` means fewer surface points than that threshold.
+    """
+
+    relation: str
+    surface_distance_m: float | None
+    contact_band_point_count: int
+    grasp_region_point_count: int
+    object_point_count: int
+    sensor_surface_distance_m: float | None = None
+    sensor_band_point_count: int = 0
+
+    @property
+    def between_fingers(self) -> bool:
+        return self.relation.startswith("between_fingers")
+
+    @property
+    def in_contact_band(self) -> bool:
+        return self.relation in ("between_fingers_in_contact_band", "in_contact_band")
+
+    @property
+    def nearest_distance_m(self) -> float | None:
+        values = [v for v in (self.surface_distance_m, self.sensor_surface_distance_m) if v is not None]
+        return min(values) if values else None
+
+    def as_dict(self) -> dict:
+        return {"relation": self.relation, "surface_distance_m": self.surface_distance_m,
+                "sensor_surface_distance_m": self.sensor_surface_distance_m,
+                "contact_band_point_count": self.contact_band_point_count,
+                "sensor_band_point_count": self.sensor_band_point_count,
+                "grasp_region_point_count": self.grasp_region_point_count,
+                "object_point_count": self.object_point_count}
+
+
+def _rigid_transform(value, *, name: str) -> np.ndarray:
+    transform = np.asarray(value, dtype=float)
+    if transform.size != 16 or not np.isfinite(transform).all():
+        raise ValueError(f"{name} must be a finite 4x4 transform.")
+    transform = transform.reshape(4, 4)
+    rotation = transform[:3, :3]
+    if (not np.allclose(transform[3], (0., 0., 0., 1.), atol=1e-9, rtol=0.)
+            or not np.allclose(rotation.T @ rotation, np.eye(3), atol=1e-6, rtol=0.)
+            or not np.isclose(np.linalg.det(rotation), 1., atol=1e-6, rtol=0.)):
+        raise ValueError(f"{name} must be a rigid transform.")
+    return transform
+
+
+def _kth(values: np.ndarray, k: int) -> float:
+    return float(np.partition(values, k - 1)[k - 1])
+
+
+def tool_object_relation(*, entity: ToolEntityBox, world_from_tcp: np.ndarray, object_points_m,
+                         contact_distance_m: float = 0.005, near_distance_m: float = 0.05,
+                         contact_minimum_points: int = 3,
+                         region_minimum_points: int = 10) -> ToolObjectRelation:
+    """Classify one measured object surface against one arm's gripper.
+
+    ``between_fingers`` needs ``region_minimum_points`` surface points inside
+    the open closing region between the finger solids; the contact band needs
+    ``contact_minimum_points`` points within ``contact_distance_m`` of (or
+    inside) the screening or contact-only solids. ``near``/``far`` use the
+    smaller robust distance. Pass voxel-thinned points so the counts are
+    metric. Thresholds were calibrated on the saved operator samples.
+    """
+    if not entity.parts or entity.grasp_region is None:
+        raise ValueError("Tool-object relations need the gripper solids and closing region.")
+    points = np.asarray(object_points_m, dtype=float).reshape(-1, 3)
+    if not len(points) or not np.isfinite(points).all():
+        raise ValueError("Object points must be a nonempty finite N x 3 array.")
+    if (not 0. < contact_distance_m < near_distance_m <= 0.5
+            or type(contact_minimum_points) is not int or contact_minimum_points < 1
+            or type(region_minimum_points) is not int or region_minimum_points < 1):
+        raise ValueError("Need 0 < contact < near <= 0.5 m and positive integer point thresholds.")
+    transform = _rigid_transform(world_from_tcp, name="world_from_tcp")
+    rotation = np.asarray(entity.tcp_from_box_rotation).reshape(3, 3)
+    in_tcp = (points - transform[:3, 3]) @ transform[:3, :3]
+    # TCP coordinates into the shared screening-solid axes (no translation).
+    local = in_tcp @ rotation
+    screening = np.min([_signed_box_distance(local, np.asarray(c) @ rotation, h) for c, h in entity.parts], axis=0)
+    sensor = None
+    if entity.contact_solids:
+        sensor = np.min([_signed_box_distance((in_tcp - np.asarray(pose).reshape(4, 4)[:3, 3])
+                                              @ np.asarray(pose).reshape(4, 4)[:3, :3], np.zeros(3), h)
+                         for pose, h in entity.contact_solids], axis=0)
+    centre, half = entity.grasp_region
+    inside = np.all(np.abs(local - np.asarray(centre) @ rotation) < np.asarray(half), axis=1)
+    region = int(np.count_nonzero(inside))
+    nearest = screening if sensor is None else np.minimum(screening, sensor)
+    band = int(np.count_nonzero(nearest <= contact_distance_m))
+    sensor_band = 0 if sensor is None else int(np.count_nonzero(sensor <= contact_distance_m))
+    if len(points) < contact_minimum_points:
+        return ToolObjectRelation(relation="insufficient_surface", surface_distance_m=None,
+            contact_band_point_count=band, grasp_region_point_count=region, object_point_count=int(len(points)),
+            sensor_surface_distance_m=None, sensor_band_point_count=sensor_band)
+    robust = _kth(screening, contact_minimum_points)
+    robust_sensor = None if sensor is None else _kth(sensor, contact_minimum_points)
+    between, touching = region >= region_minimum_points, band >= contact_minimum_points
+    if between:
+        relation = "between_fingers_in_contact_band" if touching else "between_fingers"
+    elif touching:
+        relation = "in_contact_band"
+    elif min(robust, robust if robust_sensor is None else robust_sensor) <= near_distance_m:
+        relation = "near"
+    else:
+        relation = "far"
+    return ToolObjectRelation(relation=relation, surface_distance_m=robust, contact_band_point_count=band,
+                              grasp_region_point_count=region, object_point_count=int(len(points)),
+                              sensor_surface_distance_m=robust_sensor, sensor_band_point_count=sensor_band)
+
+
+def fuse_tool_object_relations(relations: Sequence[ToolObjectRelation]) -> dict:
+    """Combine one object's per-view relations for one arm.
+
+    Every view is partial surface evidence of the same physical object, so the
+    union is used: between the fingers or in the contact band if any view
+    shows it; distances are the smallest robust ones. Views with too little
+    surface are ignored unless no view has enough. ``views_agree`` reports
+    whether all sufficient views gave the same class.
+    """
+    if not relations:
+        raise ValueError("At least one view relation is required.")
+    usable = [item for item in relations if item.relation != "insufficient_surface"]
+    if not usable:
+        return {"relation": "insufficient_surface", "surface_distance_m": None, "sensor_surface_distance_m": None,
+                "view_count": len(relations), "usable_view_count": 0, "views_agree": True}
+    between = any(item.between_fingers for item in usable)
+    band = any(item.in_contact_band for item in usable)
+    if between:
+        relation = "between_fingers_in_contact_band" if band else "between_fingers"
+    elif band:
+        relation = "in_contact_band"
+    else:
+        # All usable views are near/far here; the nearest view decides.
+        relation = min(usable, key=lambda item: item.nearest_distance_m).relation
+    sensors = [item.sensor_surface_distance_m for item in usable if item.sensor_surface_distance_m is not None]
+    return {"relation": relation, "surface_distance_m": min(item.surface_distance_m for item in usable),
+            "sensor_surface_distance_m": min(sensors) if sensors else None, "view_count": len(relations),
+            "usable_view_count": len(usable), "views_agree": len({item.relation for item in usable}) == 1}
 
 
 @dataclass(frozen=True)
@@ -210,24 +471,52 @@ def entity_hover_metrics(*, entity: ToolEntityBox, world_from_tcp: np.ndarray, a
                               overhead_point_count=overhead)
 
 
-def hover_orientation(current_tcp_pose_xyz_quat_xyzw: Sequence[float], policy: str) -> np.ndarray:
+def tool_axis_tilt_rad(rotation) -> float:
+    """Angle between the TCP approach axis (+Z) and public reference -Z."""
+    axis = np.asarray(rotation, dtype=float).reshape(3, 3)[:, 2]
+    return float(math.acos(max(-1., min(1., -axis[2] / np.linalg.norm(axis)))))
+
+
+def _tilt(value) -> float:
+    if (isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value)
+            or not 0. <= value <= MAX_TOOL_AXIS_TILT_RAD):
+        raise ValueError("tool_axis_max_tilt_rad must be finite within [0, 60 deg].")
+    return float(value)
+
+
+def hover_orientation(current_tcp_pose_xyz_quat_xyzw: Sequence[float], policy: str, *,
+                      tool_axis_max_tilt_rad: float = 0.) -> np.ndarray:
     """Return the hover TCP rotation for an explicit policy.
 
     ``preserve`` keeps the measured TCP orientation. ``tool_axis_down`` turns
-    the TCP approach axis (+Z) onto public reference -Z with the least
-    rotation, using the shared ``compute_spatial_goal`` alignment convention.
+    the TCP approach axis (+Z) toward public reference -Z with the least
+    rotation, using the shared ``compute_spatial_goal`` alignment convention,
+    and stops at the cone ``tool_axis_max_tilt_rad`` around -Z (0 = exactly
+    down). A tool already inside the cone keeps its measured orientation.
     """
     pose = finite_vector(list(current_tcp_pose_xyz_quat_xyzw), 7, name="current TCP pose")
     if policy not in HOVER_ORIENTATION_POLICIES:
         raise ValueError("Unknown hover orientation policy.")
+    tilt = _tilt(tool_axis_max_tilt_rad)
     if policy == "preserve":
+        if tilt:
+            raise ValueError("A tool-axis tilt cone applies only to tool_axis_down.")
         goal = compute_spatial_goal(current_tcp_pose_xyz_quat_xyzw=list(pose), anchor_xyz_m=list(pose[:3]),
             offset_xyz_m=[0., 0., 0.], offset_frame="reference", orientation_mode="preserve")
-    else:
-        goal = compute_spatial_goal(current_tcp_pose_xyz_quat_xyzw=list(pose), anchor_xyz_m=list(pose[:3]),
-            offset_xyz_m=[0., 0., 0.], offset_frame="reference", orientation_mode="align_axis",
-            tool_axis="z", axis_reference_xyz=[0., 0., -1.])
-    return Rotation.from_quat(goal.pose_xyz_quat_xyzw[3:]).as_matrix()
+        return Rotation.from_quat(goal.pose_xyz_quat_xyzw[3:]).as_matrix()
+    goal = compute_spatial_goal(current_tcp_pose_xyz_quat_xyzw=list(pose), anchor_xyz_m=list(pose[:3]),
+        offset_xyz_m=[0., 0., 0.], offset_frame="reference", orientation_mode="align_axis",
+        tool_axis="z", axis_reference_xyz=[0., 0., -1.])
+    exact = Rotation.from_quat(goal.pose_xyz_quat_xyzw[3:])
+    if not tilt:
+        return exact.as_matrix()
+    current = Rotation.from_quat(pose[3:] / np.linalg.norm(pose[3:]))
+    angle = tool_axis_tilt_rad(current.as_matrix())
+    if angle <= tilt:
+        return current.as_matrix()
+    # Same least rotation as the exact alignment, stopped at the cone boundary.
+    turn = (exact * current.inv()).as_rotvec()
+    return (Rotation.from_rotvec(turn * ((angle - tilt) / np.linalg.norm(turn))) * current).as_matrix()
 
 
 def _interval(value, *, name: str, lower: float, upper: float) -> tuple[float, float]:
@@ -242,6 +531,7 @@ def generate_entity_hover_goals(
     tip_offset_bounds_xy_m: Sequence[Sequence[float]], clearance_bounds_m: Sequence[float],
     entity: ToolEntityBox, points_m, orientation_policy: str = "preserve", max_candidates: int = 8,
     boundary_inset_m: float = 0., support_window_m: float = 0.30, support_margin_m: float = 0.,
+    tool_axis_max_tilt_rad: float = 0.,
 ) -> tuple[EntityHoverCandidate, ...]:
     """Propose tool-box hover poses inside explicit tip-offset and clearance bounds.
 
@@ -268,7 +558,7 @@ def generate_entity_hover_goals(
         _interval(clearance_bounds_m, name="clearance", lower=0., upper=MAX_HOVER_CLEARANCE_M)])
     current = finite_vector(list(current_tcp_pose_xyz_quat_xyzw), 7, name="current TCP pose")
     anchor = _vector3(anchor_xyz_m, name="anchor_xyz_m")
-    rotation = hover_orientation(current, orientation_policy)
+    rotation = hover_orientation(current, orientation_policy, tool_axis_max_tilt_rad=tool_axis_max_tilt_rad)
     points = np.asarray(points_m, dtype=float).reshape(-1, 3)
     inset = np.minimum(boundary_inset_m, (bounds[:, 1] - bounds[:, 0]) / 2.)
     low, high = bounds[:, 0] + inset, bounds[:, 1] - inset
@@ -325,10 +615,18 @@ __all__ = [
     "HOVER_ORIENTATION_POLICIES",
     "MAX_HOVER_CLEARANCE_M",
     "MAX_HOVER_TIP_OFFSET_M",
+    "MAX_TOOL_AXIS_TILT_RAD",
     "TOOL_ENTITY_HOVER_SEMANTICS_V1",
+    "TOOL_OBJECT_RELATIONS",
+    "TOOL_OBJECT_RELATION_SEMANTICS_V1",
     "ToolEntityBox",
+    "ToolObjectRelation",
     "entity_hover_metrics",
     "footprint_support",
+    "fuse_tool_object_relations",
     "generate_entity_hover_goals",
     "hover_orientation",
+    "object_surface_cluster",
+    "tool_axis_tilt_rad",
+    "tool_object_relation",
 ]

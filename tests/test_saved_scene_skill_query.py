@@ -291,6 +291,8 @@ def test_factory_defaults_to_inherited_clearance_and_binds_strict_opt_out(input_
         configs.append(kwargs["config"])
         return Planner()
     monkeypatch.setattr(module, "RM65GraspJointTrajectoryPlanner", create_planner)
+    # The URDF contact solids are native geometry, covered by their own test.
+    monkeypatch.setattr(module, "dmtac_open_sensor_contact_solids", lambda *_a, **_k: {})
     for kwargs, enabled in (({}, True), ({"enable_inherited_start_clearance": True}, True),
                             ({"enable_inherited_start_clearance": False}, False)):
         query = SavedSceneSkillQuery.from_manifest(input_manifest, **kwargs)
@@ -1331,3 +1333,212 @@ def test_default_entity_requires_the_frozen_tool_identity_as_well_as_tcp():
     assert entities["right"].identity()["source"]["tool_name"] == "DMTAC_M"
     profiles["left"] = json.loads(Path("hardware/rm65/utils/configs/calibrations/rm65_left_DMTAC_M.json").read_text())
     assert set(default_tool_entity_by_side(tcps, profiles)) == {"left", "right"}
+
+
+def _cube_surface(centre, half, spacing=.003):
+    centre, half = np.asarray(centre, float), np.asarray(half, float)
+    faces = []
+    for axis in range(3):
+        others = [a for a in range(3) if a != axis]
+        uu, vv = np.meshgrid(*[np.arange(-half[a], half[a] + 1e-9, spacing) for a in others])
+        for sign in (-1., 1.):
+            face = np.zeros((uu.size, 3))
+            face[:, others[0]], face[:, others[1]] = uu.ravel(), vv.ravel()
+            face[:, axis] = sign * half[axis]
+            faces.append(face + centre)
+    return np.vstack(faces)
+
+
+def test_tool_object_relations_fuse_views_without_planning():
+    planner = Planner()
+    # TCP at (.1, .2, .5) pointing down; the fingers hang to z = .44 and the
+    # closing region spans z .44-.52 around the TCP's x axis.
+    between = _cube_surface((.1, .2, .47), (.01, .008, .01))
+    query = _entity_query(planner, object_surface_by_reference={"top-a": between})
+    query._anchors[0]["object_surface"] = {"voxel_count": 9, "component_count": 2, "kept_voxel_count": 7,
+                                           "second_component_voxel_count": 2}
+    result = query.describe_tool_object_relations()
+    assert result["semantics"] == "agenticrobot.relation.tool_object.v1"
+    assert result["scope"] == "one_saved_time_node_no_execution"
+    assert result["objects"] == [{"side": "right", "label": "cube top", "relation": "between_fingers",
+        "surface_distance_m": pytest.approx(.02), "sensor_surface_distance_m": None, "view_count": 1,
+        "usable_view_count": 1, "views_agree": True, "ambiguous_view_count": 0}]
+    # Unbound arms are disclosed, never silently omitted; geometry provenance is explicit.
+    assert result["evaluated_sides"] == ["right"] and result["unbound_sides"] == ["left"]
+    assert result["gripper_geometry_by_side"]["right"]["contact_solid_count"] == 0
+    view = result["views"][0]
+    assert view["target_reference"] == "top-a" and view["role"] == "main"
+    assert view["grasp_region_point_count"] == view["object_point_count"] > 10
+    assert view["surface_cluster"] == {"voxel_count": 9, "component_count": 2, "kept_voxel_count": 7,
+                                       "second_component_voxel_count": 2}
+    assert view["surface_ambiguous"] is False and view["gripper_pose_source"] == "planning_start_qpos"
+    assert not planner.calls and query.audit()["relation_reads"] == [result]
+    # The model view still exposes neither surfaces nor their cluster evidence.
+    assert "object_surface" not in json.dumps(query.read_scene())
+    query.close()
+    with pytest.raises(RuntimeError):
+        query.describe_tool_object_relations()
+
+
+def test_tool_object_relations_only_bind_saved_surface_references():
+    planner = Planner()
+    with pytest.raises(ValueError, match="saved surface"):
+        _entity_query(planner, object_surface_by_reference={"elsewhere": [[0., 0., 0.]]})
+    with pytest.raises(ValueError, match="finite"):
+        _entity_query(planner, object_surface_by_reference={"top-a": [[0., 0., float("nan")]]})
+    # Two measured surfaces with one label in one camera role would be fused as one object.
+    twin = _entity_query(planner)
+    anchors = twin._anchors + [{**twin._anchors[0], "reference": "top-b"}]
+    with pytest.raises(ValueError, match="one surface per camera role"):
+        SavedSceneSkillQuery(scene_id="b" * 64, reference_frame_id="station", qpos_by_side=twin._qpos,
+            tcp_pose_by_side=twin._tcp, anchors=anchors, planner=planner, cloud=None, source_evidence={},
+            object_surface_by_reference={"top-a": [[0., 0., 0.]], "top-b": [[1., 0., 0.]]})
+    twin.close()
+    query = _entity_query(planner)
+    result = query.describe_tool_object_relations()
+    assert result["objects"] == [] and result["unmeasured_references"] == ["top-a"]
+    query.close()
+
+
+def test_entity_hover_tool_axis_cone_targets_and_checks_the_achieved_tilt():
+    import math
+    from scipy.spatial.transform import Rotation
+    from robot_motion.tool_entity_goals import tool_axis_tilt_rad
+    planner = Planner()
+    query = _entity_query(planner)
+    diagonal = Rotation.align_vectors([[-.527, -.704, -.477]], [[0., 0., 1.]])[0]
+    query._tcp["right"] = (.1, .2, .5, *diagonal.as_quat().tolist())
+    with pytest.raises(ValueError, match="tilt"):
+        query.plan_entity_hover_region(**HOVER, tool_axis_max_tilt_rad=.3)  # preserve + cone
+    assert not planner.calls
+    result = query.plan_entity_hover_region(**HOVER, orientation_policy="tool_axis_down",
+                                            tool_axis_max_tilt_rad=math.radians(30.))
+    assert result["status"] == "path_found" and result["tool_axis_max_tilt_rad"] == pytest.approx(math.radians(30.))
+    assert tool_axis_tilt_rad(planner.target[:3, :3]) == pytest.approx(math.radians(30.), abs=1e-9)
+    validation = query.audit()["region_queries"][0]["candidate_validations"][0]
+    assert validation["achieved_tool_axis_tilt_rad"] == pytest.approx(math.radians(30.), abs=1e-9)
+    query.close()
+
+
+class TiltingPlanner(Planner):
+    """Arrives at the requested point but with the tool turned 20 deg further from down."""
+
+    def tool_tcp_poses_for_qpos_pair(self, **kwargs):
+        from scipy.spatial.transform import Rotation
+        actual = self.target.copy()
+        actual[:3, :3] = Rotation.from_euler("x", 20, degrees=True).as_matrix() @ actual[:3, :3]
+        return {s: actual for s in ("left", "right")}
+
+
+def test_entity_hover_tool_axis_down_rejects_an_achieved_axis_outside_the_cone():
+    planner = TiltingPlanner()
+    query = _entity_query(planner)
+    result = query.plan_entity_hover_region(**HOVER, orientation_policy="tool_axis_down", max_candidates=2)
+    assert result["status"] == "path_rejected" and result["reason"] == "region_no_candidate_path"
+    validations = query.audit()["region_queries"][0]["candidate_validations"]
+    assert len(validations) == 2 and not any(v["inside_requested_region"] for v in validations)
+    assert all(v["achieved_tool_axis_tilt_rad"] == pytest.approx(np.radians(20.)) for v in validations)
+    query.close()
+
+
+def test_station_urdf_open_dmtac_sensor_boxes_extend_beyond_the_screening_fingers():
+    pytest.importorskip("pinocchio")
+    from pathlib import Path
+    from scripts.probes.query_safe_move_snapshot import (
+        default_tool_entity_by_side, dmtac_open_sensor_contact_solids)
+    urdf = (Path(__file__).resolve().parents[1]
+            / "assets/realman_dual_arm_inspire_gripper_dmtacm/realman_dual_arm_inspire_gripper_dmtacm.urdf")
+    reviewed = (0., 0., .14, 0., 0., 0.)
+    solids = dmtac_open_sensor_contact_solids(urdf, {"left": reviewed, "right": reviewed, "other": (0., 0., .1, 0., 0., 0.)})
+    assert set(solids) == {"left", "right"}
+    profiles = {"right": json.loads(Path("hardware/rm65/utils/configs/calibrations/rm65_right_DMTAC_M.json").read_text())}
+    entities = default_tool_entity_by_side({"right": reviewed}, profiles, urdf_path=urdf)
+    entity = entities["right"]
+    rotation = np.asarray(entity.tcp_from_box_rotation).reshape(3, 3)
+    outer = max(abs(np.asarray(c) @ rotation)[0] + h[0] for c, h in entity.parts[1:])
+    reach = []
+    for pose, half in entity.contact_solids:
+        np.testing.assert_allclose(sorted(half), sorted((.0182, .0376, .024)), atol=1e-4)
+        transform = np.asarray(pose).reshape(4, 4)
+        corners = np.array([[x, y, z] for x in (-1, 1) for y in (-1, 1) for z in (-1, 1)]) * half
+        reach.append(np.abs(((corners @ transform[:3, :3].T) + transform[:3, 3]) @ rotation)[:, 0].max())
+    # Same numbers as the MuJoCo twin: outer sensor faces ~85 mm vs screening 55 mm.
+    assert outer == pytest.approx(.0552, abs=5e-4)
+    assert min(reach) == pytest.approx(.0846, abs=1e-3) and max(reach) == pytest.approx(.0852, abs=1e-3)
+    assert entity.source["contact_solids"] == "urdf_dmtac_sensor_collision_boxes_open_v1"
+    # Hover geometry stays the screening box.
+    plain = default_tool_entity_by_side({"right": reviewed}, profiles)["right"]
+    np.testing.assert_allclose(entity.corners_tcp(), plain.corners_tcp())
+
+
+def test_object_surface_from_mask_erodes_and_keeps_valid_measured_depth():
+    from scripts.probes.query_safe_move_snapshot import object_surface_from_mask
+    depth = np.full((40, 40), .5, dtype=np.float32)
+    depth[20:, :] = 0.  # invalid half
+    depth[:, 30:] = 2.  # beyond the observation range
+    mask = np.zeros((40, 40), dtype=bool)
+    mask[5:35, 5:35] = True
+    capture = SimpleNamespace(depth_m=depth, intrinsics={"fx": 100., "fy": 100., "cx": 20., "cy": 20.},
+                              source_from_camera=np.eye(4))
+    points, evidence = object_surface_from_mask(mask, capture, maximum_depth_m=1.5)
+    assert evidence["mask_erosion_px"] == 2
+    # Rows 7..19 and columns 7..29 survive erosion, validity and range.
+    assert evidence["valid_pixel_count"] == 13 * 23
+    np.testing.assert_allclose(points[:, 2], .5)
+    assert evidence["component_count"] == 1 and evidence["kept_voxel_count"] == len(points)
+    empty, info = object_surface_from_mask(np.zeros((40, 40), bool), capture, maximum_depth_m=1.5)
+    assert empty is None and info["valid_pixel_count"] == 0
+
+
+def test_cli_relation_and_planning_requests_are_exclusive(tmp_path, monkeypatch):
+    import sys
+    from scripts.probes import query_safe_move_snapshot as module
+    request = tmp_path / "request.json"
+    request.write_text("{}")
+    monkeypatch.setattr(sys, "argv", ["probe", "--manifest", str(tmp_path / "m.json"), "--request", str(request),
+                                      "--audit-output", str(tmp_path / "a.json"), "--tool-object-relations"])
+    with pytest.raises(SystemExit):
+        module.main()
+
+
+@pytest.mark.parametrize("extra_deg,inside", [(-.5, True), (.5, False)])
+def test_entity_hover_cone_accepts_only_within_the_arrival_rotation_tolerance(extra_deg, inside):
+    import math
+    from scipy.spatial.transform import Rotation
+    from agent_gateway.profiles.real.motion_primitive_profiles import RealAgentPrimitiveConvergenceProfile
+    tolerance = math.degrees(RealAgentPrimitiveConvergenceProfile().rotation_tolerance_rad)
+
+    class Tilting(Planner):
+        def tool_tcp_poses_for_qpos_pair(self, **kwargs):
+            actual = self.target.copy()
+            actual[:3, :3] = Rotation.from_euler("x", tolerance + extra_deg, degrees=True).as_matrix() @ actual[:3, :3]
+            return {s: actual for s in ("left", "right")}
+
+    query = _entity_query(Tilting())
+    result = query.plan_entity_hover_region(**HOVER, orientation_policy="tool_axis_down", max_candidates=1)
+    validation = query.audit()["region_queries"][0]["candidate_validations"][0]
+    assert validation["achieved_tool_axis_tilt_rad"] == pytest.approx(math.radians(tolerance + extra_deg))
+    assert validation["inside_requested_region"] is inside
+    assert (result["status"] == "path_found") is inside
+    query.close()
+
+
+def test_tool_object_relations_use_each_frames_capture_pose_and_flag_ambiguity():
+    planner = Planner()
+    between = _cube_surface((.1, .2, .47), (.01, .008, .01))
+    planning_start = [.1, .2, .5, 1., 0., 0., 0.]
+    moved = [.4, .2, .5, 1., 0., 0., 0.]  # the arm was 30 cm away when this frame was captured
+    query = _entity_query(planner, object_surface_by_reference={"top-a": between},
+                          object_surface_tcp_pose_by_reference={"top-a": {"left": planning_start, "right": moved}})
+    query._anchors[0]["object_surface"] = {"voxel_count": 60, "component_count": 2, "kept_voxel_count": 40,
+                                           "second_component_voxel_count": 12}
+    result = query.describe_tool_object_relations()
+    view = result["views"][0]
+    assert view["gripper_pose_source"] == "frame_capture_qpos" and view["relation"] == "far"
+    assert view["surface_ambiguous"] is True and result["objects"][0]["ambiguous_view_count"] == 1
+    query.close()
+    for bad in ({"top-a": {"right": moved}}, {"other": {"left": moved, "right": moved}},
+                {"top-a": {"left": moved, "right": [.4, .2, .5, 2., 0., 0., 0.]}}):
+        with pytest.raises(ValueError):
+            _entity_query(planner, object_surface_by_reference={"top-a": between},
+                          object_surface_tcp_pose_by_reference=bad)
