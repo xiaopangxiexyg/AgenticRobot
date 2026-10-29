@@ -274,6 +274,15 @@ class ExclusiveRealSkillApplication:
                     self._state = ExclusiveRealSkillApplicationState.FAULT
                     server = self._server
                 self._control_stop.set()
+                if diagnostics_retained:
+                    # The transport keeps serving, so make the latch visible to
+                    # the operator instead of looking like a silent stall.
+                    _LOGGER.error(
+                        "Real Skill control loop fault latched: %s: %s. Lower HOLD was "
+                        "requested; new Skill submissions are rejected and the Gateway "
+                        "stays up only for queries. Press Ctrl+C to close it.",
+                        type(exc).__name__, " ".join(str(exc).split())[:512],
+                    )
                 if self._serving.is_set() and server is not None and not diagnostics_retained:
                     server.shutdown()
                 return
