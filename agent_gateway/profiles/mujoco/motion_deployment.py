@@ -829,6 +829,8 @@ class MujocoAgentTcpPoseContractBundle:
     candidate_query_registrations: tuple[SpatialGoalRegistration, ...] = ()
     # Shared tool-entity relations/hover Skills (agent_gateway.profiles.tool_entity).
     tool_entity_registrations: tuple[Any, ...] = ()
+    # perception.query_support_release_pose@1 (mujoco/support_release_query.py).
+    support_release_query_registration: Any | None = None
 
     def __post_init__(self) -> None:
         published_skill_ids = {
@@ -856,6 +858,13 @@ class MujocoAgentTcpPoseContractBundle:
             if registration.skill.definition.skill_id not in {
                     "perception.describe_tool_object_relations", "perception.query_tool_hover_paths"}:
                 raise ValueError("Unknown tool-entity registration.")
+        release_query = self.support_release_query_registration
+        if release_query is not None:
+            if self.route_manifest.route("perception.query_support_release_pose", "1") != release_query.entry:
+                raise ValueError("Support release query registration differs from its manifest entry.")
+            if (self.object_motion_contract is None
+                    or not set(release_query.support_object_ids) <= set(self.object_support_body_names)):
+                raise ValueError("Support release queries need object motion and admitted supports.")
 
         validate_skill_route_catalog_closure(
             definition_catalog=self.definition_catalog,
@@ -2079,6 +2088,9 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
     enable_tool_hover_queries: bool = False,
     tool_entity_by_side: Mapping[str, Any] | None = None,
     tool_hover_roles: tuple[str, ...] = (),
+    enable_support_release_queries: bool = False,
+    support_release_prompt_by_id: Mapping[str, str] | None = None,
+    support_release_roles: tuple[str, ...] | None = None,
 ) -> MujocoAgentTcpPoseContractBundle:
     """Project one already-constructed no-model application without starting it."""
 
@@ -3167,6 +3179,36 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
             if tool_entity_registrations[-1].reference_frame_id != safe_entry[3].motion_profile.reference_frame_id:
                 # The selected pose is submitted unchanged to the safe TCP Route.
                 raise ValueError("MuJoCo tool hover results must use the safe TCP Route's public frame.")
+    support_release_query_registration = None
+    if type(enable_support_release_queries) is not bool:
+        raise TypeError("enable_support_release_queries must be boolean.")
+    if enable_support_release_queries:
+        from .support_release_query import build_support_release_query_registration
+
+        prompts = dict(support_release_prompt_by_id or {})
+        object_entry = next((item for item in planned_motions
+                             if item[2].skill_id == "motion.move_grasped_object_to_pose"
+                             and item[2].skill_version == "1"), None)
+        if (segmentation is None or depth_capture is None or depth_capture.back_projection is None
+                or object_entry is None or not object_support_body_names):
+            raise ValueError("Support release queries need segmentation, aligned RGB-D, object motion "
+                             "and named supports.")
+        if not prompts or not set(prompts) <= set(object_support_body_names):
+            raise ValueError("Support release prompts must name admitted support bodies.")
+        roles = tuple(depth_capture.back_projection.profile.roles)
+        if support_release_roles is None:
+            # The held hand's wrist camera sees the support past the arm; keep
+            # every other bound view as a measured alternative.
+            wrist = "wrist_" + component.removesuffix("_arm")
+            roles = tuple(sorted(roles, key=lambda role: role != wrist))
+        else:
+            roles = tuple(support_release_roles)
+        support_release_query_registration = build_support_release_query_registration(
+            segmentation=segmentation, back_projection=depth_capture.back_projection, roles=roles,
+            prompt_by_support_id=prompts, object_motion_contract=object_entry[3],
+            object_motion_route=object_entry[2])
+    elif support_release_prompt_by_id or support_release_roles is not None:
+        raise ValueError("Support release prompts and role require enable_support_release_queries.")
     tcp_pose_comparison_registration = None
     if enable_tcp_pose_comparison:
         from agent_gateway.profiles.tcp_pose_comparison import (
@@ -3212,7 +3254,9 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
     if object_goal_query_registration is not None:
         definition_items.append(object_goal_query_registration.skill.definition)
         schema_items.append(object_goal_query_registration.skill.schema_entry)
-    for registration in (*surface_anchor_registrations, *candidate_query_registrations, *tool_entity_registrations):
+    for registration in (*surface_anchor_registrations, *candidate_query_registrations, *tool_entity_registrations,
+                         *((support_release_query_registration,)
+                           if support_release_query_registration is not None else ())):
         definition_items.append(registration.skill.definition)
         schema_items.append(registration.skill.schema_entry)
     if tcp_continuation_query_registration is not None:
@@ -3380,6 +3424,8 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
         route_items.append(object_goal_query_registration.entry)
     route_items.extend(registration.entry for registration in (*surface_anchor_registrations, *candidate_query_registrations,
                                                                *tool_entity_registrations))
+    if support_release_query_registration is not None:
+        route_items.append(support_release_query_registration.entry)
     if tcp_continuation_query_registration is not None:
         route_items.append(tcp_continuation_query_registration.entry)
     if localization is not None:
@@ -3429,7 +3475,7 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
         explicit_contracts += tuple(registration.skill.io_contract
             for registration in (object_goal_query_registration, localization, tcp_continuation_query_registration,
                                  *surface_anchor_registrations, *candidate_query_registrations,
-                                 *tool_entity_registrations)
+                                 *tool_entity_registrations, support_release_query_registration)
             if registration is not None and key == (
                 registration.skill.definition.skill_id, registration.skill.definition.skill_version))
         contract = (
@@ -3528,6 +3574,8 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
         validator_items.append(object_goal_query_registration.payload_validator)
     validator_items.extend(registration.payload_validator for registration in (*surface_anchor_registrations, *candidate_query_registrations,
                                                                                *tool_entity_registrations))
+    if support_release_query_registration is not None:
+        validator_items.append(support_release_query_registration.payload_validator)
     if tcp_continuation_query_registration is not None:
         validator_items.append(tcp_continuation_query_registration.payload_validator)
     if localization is not None:
@@ -3587,6 +3635,7 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
         candidate_query_registrations=candidate_query_registrations,
         surface_anchor_registrations=surface_anchor_registrations,
         tool_entity_registrations=tool_entity_registrations,
+        support_release_query_registration=support_release_query_registration,
         tcp_pose_comparison_registration=tcp_pose_comparison_registration,
         object_state_registration=object_state_registration,
         grasp_approach_contract=grasp_contract,

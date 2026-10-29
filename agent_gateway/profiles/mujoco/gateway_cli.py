@@ -314,6 +314,21 @@ def build_parser() -> argparse.ArgumentParser:
         "--object-support-body", action="append", default=[],
         help="one declared free box support identity admitted by object-motion v2; repeat for each allowed support",
     )
+    parser.add_argument(
+        "--enable-support-release-queries", action="store_true",
+        help="publish read-only perception.query_support_release_pose@1 (measured support top, held box, "
+             "payload-safe carry check); requires --enable-named-release-v3, segmentation and "
+             "--support-release-prompt",
+    )
+    parser.add_argument(
+        "--support-release-prompt", action="append", default=[], metavar="SUPPORT=PROMPT",
+        help="text prompt that segments one --object-support-body for release queries; repeat per support",
+    )
+    parser.add_argument(
+        "--support-release-role", action="append", default=[],
+        help="aligned RGB-D role measured by release queries, in preference order; repeat per role "
+             "(default: the motion-side wrist camera, then every other bound role)",
+    )
     parser.add_argument("--enable-fast-grasp", action="store_true",
         help="publish frozen observation, first-acceptable GraspGenX planning and paired one-use native execution")
     parser.add_argument("--sam2-grounding-dino-bundle", type=Path)
@@ -566,6 +581,7 @@ def _segmentation_requested(args):
         or args.enable_segmentation_geometry_v3
         or args.enable_surface_anchor_v2
         or args.enable_tool_object_relations
+        or args.enable_support_release_queries
     )
 
 
@@ -694,6 +710,7 @@ def main(argv: list[str] | None = None) -> int:
         or args.enable_relation_goal_queries
         or args.enable_tool_object_relations
         or args.enable_tool_hover_queries
+        or args.enable_support_release_queries
         or args.history_root is not None
         or args.segmentation_asset_bundle is not None
         or args.sam3_endpoint is not None
@@ -719,6 +736,21 @@ def main(argv: list[str] | None = None) -> int:
         and args.enable_object_follow_observation and args.enable_object_motion
     ):
         parser.error("--enable-named-release-v3 requires grippers, follow observation and object-support motion v2")
+    if args.enable_support_release_queries and (
+        not args.enable_named_release_v3 or not args.support_release_prompt or args.artifact_root is None
+    ):
+        parser.error("--enable-support-release-queries requires --enable-named-release-v3, "
+                     "--support-release-prompt and --artifact-root with segmentation")
+    if (args.support_release_prompt or args.support_release_role) and not args.enable_support_release_queries:
+        parser.error("--support-release-prompt/--support-release-role require --enable-support-release-queries")
+    support_release_prompts = {}
+    for item in args.support_release_prompt:
+        support, separator, prompt = item.partition("=")
+        if (not separator or not support.strip() or not prompt.strip()
+                or support.strip() not in args.object_support_body
+                or support.strip() in support_release_prompts):
+            parser.error("--support-release-prompt must be SUPPORT=PROMPT for one distinct --object-support-body")
+        support_release_prompts[support.strip()] = prompt.strip()
     if args.object_localization_backend == "sam3-service" and (
         args.segmentation_asset_bundle is not None or args.sam2_grounding_dino_bundle is not None
     ):
@@ -932,6 +964,9 @@ def main(argv: list[str] | None = None) -> int:
         enable_object_support_motion_v2=args.enable_object_support_motion_v2,
         enable_named_release_v3=args.enable_named_release_v3,
         object_support_body_names=tuple(args.object_support_body),
+        enable_support_release_queries=args.enable_support_release_queries,
+        support_release_prompt_by_id=support_release_prompts or None,
+        support_release_roles=tuple(args.support_release_role) or None,
         enable_grasp_approach=args.enable_grasp_approach,
         grasp_contact_target_body=args.grasp_contact_target_body,
         fast_grasp_planner=fast_grasp_planner,

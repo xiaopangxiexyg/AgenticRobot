@@ -199,6 +199,7 @@ class MujocoAgentTcpPoseGatewaySession:
     localization_executor: PassiveReadSkillExecutor | None = None
     surface_anchor_executors: tuple[PassiveReadSkillExecutor, ...] = ()
     tool_entity_executors: tuple[PassiveReadSkillExecutor, ...] = ()
+    support_release_query_executor: PassiveReadSkillExecutor | None = None
     _close_lock: threading.Lock = field(
         default_factory=threading.Lock,
         init=False,
@@ -282,6 +283,9 @@ class MujocoAgentTcpPoseGatewaySession:
         if (self.contract_bundle.object_support_motion_contract_v2 is not None
                 ) != (self.object_support_motion_executor_v2 is not None):
             raise ValueError("Object support v2 registration and executor must coexist.")
+        if (getattr(self.contract_bundle, "support_release_query_registration", None) is not None
+                ) != (self.support_release_query_executor is not None):
+            raise ValueError("Support release query registration and executor must coexist.")
         hand_parts = (self.contract_bundle.gripper_contract is not None,
                       self.gripper_executor is not None, bool(self.gripper_ports))
         if any(hand_parts) and not all(hand_parts):
@@ -601,6 +605,10 @@ class MujocoAgentTcpPoseGatewaySession:
                     *(("tool_entity", executor, registration.entry.route.max_operation_duration_ms / 1000 + 5.0)
                         for registration, executor in zip(self.contract_bundle.tool_entity_registrations,
                             self.tool_entity_executors, strict=True)),
+                    *((("support_release_query", self.support_release_query_executor,
+                        self.contract_bundle.support_release_query_registration.entry.route.max_operation_duration_ms
+                        / 1000 + 5.0),)
+                        if getattr(self, "support_release_query_executor", None) is not None else ()),
                     ("rgbd_capture", self.rgbd_capture_executor, 5.0),
                     ("tcp_pose_comparison", self.tcp_pose_comparison_executor, 5.0),
                     ("object_state", self.object_state_executor, 5.0),
@@ -1735,6 +1743,42 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
                     max_retained_operations=retention)
             execution_port_by_route_hash[tool_registration.entry.route.semantic_content_hash] = tool_executor
             tool_entity_executors += (tool_executor,)
+    support_release_query_executor = None
+    support_release_registration = getattr(contract_bundle, "support_release_query_registration", None)
+    if support_release_registration is not None:
+        from .support_release_query import (
+            MujocoSupportReleaseQuery,
+            build_support_release_query_executor,
+        )
+
+        if (object_observer is None or segmentation_provider is None
+                or back_projection_capture_port is None or back_projection_registration is None):
+            raise ValueError("Support release queries require the held-object observer, the bound "
+                             "segmenter and original RGB-D.")
+        release_safety = application.tcp_pose_envelope_runtime
+        release_route = contract_bundle.route_manifest.route("motion.move_grasped_object_to_pose", "1").route
+        release_profile = contract_bundle.object_motion_contract.motion_profile
+
+        def prepare_release_projection():
+            project = release_safety.planning_projector_for_route(route_id=release_route.route_id)
+            return (project, canonical_content_hash({"profile": release_profile.semantic_content_hash,
+                "reference": release_safety.snapshot().safety_reference_hash},
+                domain="agenticrobot.support_release_query.constraint.v1"))
+
+        support_release_query_executor = build_support_release_query_executor(
+            registration=support_release_registration,
+            query_port=MujocoSupportReleaseQuery(
+                registration=support_release_registration, application=application,
+                observer=object_observer, segmentation_provider=segmentation_provider,
+                capture_port=back_projection_capture_port, motion_profile=release_profile,
+                prepare_projection=prepare_release_projection,
+                maximum_depth_m=back_projection_registration.profile.maximum_depth_m,
+                current_station_revision=lambda: observation_producer.current_station_revision,
+                clock=runtime_clock),
+            current_station_revision=lambda: observation_producer.current_station_revision,
+            clock=runtime_clock, max_retained_operations=retention)
+        execution_port_by_route_hash[support_release_registration.entry.route.semantic_content_hash] = (
+            support_release_query_executor)
     planned_executors = {}
     for skill_id, version, label, safe_contract in (
         ('motion.move_to_observed_point', "1", 'observed-point-safe', contract_bundle.observed_point_contract),
@@ -2033,6 +2077,7 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
         localization_executor=localization_executor,
         surface_anchor_executors=surface_anchor_executors,
         tool_entity_executors=tool_entity_executors,
+        support_release_query_executor=support_release_query_executor,
         depth_executor=depth_executor,
         rgb_executor=rgb_executor,
         rgbd_capture_executor=rgbd_capture_executor,
