@@ -86,6 +86,12 @@ RM65_GRASP_PATH_PLANNING_TIME_BUDGET_SEC = 120.0
 RM65_GRASP_CAPTURE_SELF_OBSERVATION_SURFACE_MARGIN_M = 0.006
 RM65_GRASP_TERMINAL_TARGET_CONTACT_DEPTH_M = 0.006
 RM65_GRASP_SINGULARITY_HARD_THRESHOLD_DEG = 3.0
+# A measured start may exceed a software joint bound only by the backend's
+# local-observation quantization tolerance (SDK degrees -> radians). Such a
+# start is clipped onto the bound for planning; a larger excess is rejected
+# with an explicit reason instead of an opaque solver or path-search error.
+RM65_GRASP_START_JOINT_LIMIT_TOLERANCE_RAD = math.radians(0.01)
+RM65_GRASP_MAX_ENDPOINT_JOINT_LIMIT_MARGIN_RAD = math.radians(10.0)
 RM65_GRASP_TRAJECTORY_PARAMETERIZATION_SEGMENTED_STOP = "segmented_stop"
 RM65_GRASP_TRAJECTORY_PARAMETERIZATION_CONTINUOUS_C2 = "continuous_c2"
 RM65_GRASP_TRAJECTORY_PARAMETERIZATION_MODES = (
@@ -167,6 +173,52 @@ class RM65GraspTrajectoryPlanningError(RuntimeError):
         super().__init__(self.reason_code)
 
 
+def _wrist_flip_equivalent(qpos: np.ndarray) -> np.ndarray:
+    """Same flange pose with joints 4 and 6 turned half a revolution and 5 negated."""
+    flipped = np.asarray(qpos, dtype=float).copy()
+    flipped[3] += -math.pi if flipped[3] > 0.0 else math.pi
+    flipped[4] = -flipped[4]
+    flipped[5] += -math.pi if flipped[5] > 0.0 else math.pi
+    return flipped
+
+
+def bounded_planning_start_qpos(qpos: np.ndarray, *, side: str) -> np.ndarray:
+    """Return a measured start inside the RM65 software limits, or fail explicitly.
+
+    A start beyond a bound by at most the SDK quantization tolerance (an
+    endpoint planned onto the bound and measured just past it) is clipped onto
+    the bound. A larger excess raises ``start_outside_joint_limits``: no IK seed
+    or path search can start there, and the lower SDK guard rejects HOLD there.
+    """
+    lower = np.asarray(RM65_ABSOLUTE_Q_MIN_RAD, dtype=float)
+    upper = np.asarray(RM65_ABSOLUTE_Q_MAX_RAD, dtype=float)
+    values = np.asarray(qpos, dtype=float).reshape(6)
+    excess = np.maximum(lower - values, values - upper)
+    outside = np.flatnonzero(excess > RM65_GRASP_START_JOINT_LIMIT_TOLERANCE_RAD)
+    if outside.size:
+        joints = [{"joint": int(index) + 1, "qpos_deg": round(math.degrees(values[index]), 3),
+                   "lower_deg": round(math.degrees(lower[index]), 3),
+                   "upper_deg": round(math.degrees(upper[index]), 3),
+                   "excess_deg": round(math.degrees(excess[index]), 3)} for index in outside]
+        twin = _wrist_flip_equivalent(values)
+        twin_in_range = bool(np.all(twin >= lower) and np.all(twin <= upper))
+        described = ", ".join(
+            f"J{item['joint']}={item['qpos_deg']:.1f} deg outside "
+            f"[{item['lower_deg']:.1f}, {item['upper_deg']:.1f}]" for item in joints)
+        hint = (" The same TCP pose is reachable in range at joints "
+                + "[" + ", ".join(f"{math.degrees(value):.1f}" for value in twin) + "] deg"
+                if twin_in_range else "")
+        raise RM65GraspTrajectoryPlanningError("start_outside_joint_limits", details={
+            "planning_phase": "start_joint_limit_admission", "side": side,
+            "tolerance_deg": math.degrees(RM65_GRASP_START_JOINT_LIMIT_TOLERANCE_RAD),
+            "joints": joints, "measured_qpos_deg": [round(math.degrees(v), 3) for v in values],
+            "wrist_flip_equivalent_deg": ([round(math.degrees(v), 3) for v in twin]
+                                          if twin_in_range else None),
+            "message": (f"{side} arm start {described}; move it into the RM65 software joint "
+                        f"range with a joint-space move before planning.{hint}")})
+    return np.clip(values, lower, upper)
+
+
 @dataclass(frozen=True)
 class RM65GraspTrajectoryPlanningConfig:
     minimum_clearance_m: float = 0.02
@@ -223,6 +275,12 @@ class RM65GraspTrajectoryPlanningConfig:
 
     pose_goal_policy: str = "within_arrival_tolerance"
     minimum_observed_clearance_m: float | None = None
+    # Optional inward margin (rad) from the RM65 software joint limits for IK
+    # endpoints and their seeds. 0 keeps the historical full-range endpoints.
+    # A small margin keeps a planned rest pose off the hard bound, so measured
+    # quantization at the next request cannot place its start outside the
+    # limits. Path samples between endpoints keep the full range.
+    endpoint_joint_limit_margin_rad: float = field(default=0.0, kw_only=True)
 
     def for_tcp_pose_move(
         self, *, translation_tolerance_m: float, rotation_tolerance_rad: float,
@@ -253,6 +311,12 @@ class RM65GraspTrajectoryPlanningConfig:
                     or observed_clearance <= 0):
                 raise ValueError("minimum_observed_clearance_m must be finite and positive.")
             object.__setattr__(self, "minimum_observed_clearance_m", float(observed_clearance))
+        joint_margin = self.endpoint_joint_limit_margin_rad
+        if (isinstance(joint_margin, bool) or not isinstance(joint_margin, (int, float))
+                or not math.isfinite(joint_margin)
+                or not 0.0 <= joint_margin <= RM65_GRASP_MAX_ENDPOINT_JOINT_LIMIT_MARGIN_RAD):
+            raise ValueError("endpoint_joint_limit_margin_rad must be finite within [0, 10 deg].")
+        object.__setattr__(self, "endpoint_joint_limit_margin_rad", float(joint_margin))
         if not isinstance(self.pose_goal_policy, str) or self.pose_goal_policy not in (
             "preserve_target", "within_arrival_tolerance",
         ):
@@ -2467,6 +2531,12 @@ class RM65GraspJointTrajectoryPlanner:
                 monotonic=monotonic,
             )
 
+    def _endpoint_joint_bounds(self) -> tuple[np.ndarray, np.ndarray]:
+        """IK endpoint bounds: the software limits, optionally inset by the config margin."""
+        margin = self.config.endpoint_joint_limit_margin_rad
+        return (np.asarray(RM65_ABSOLUTE_Q_MIN_RAD, dtype=float) + margin,
+                np.asarray(RM65_ABSOLUTE_Q_MAX_RAD, dtype=float) - margin)
+
     def _endpoint_seed_qpos(
         self,
         qpos_by_side: Mapping[str, np.ndarray],
@@ -2491,8 +2561,7 @@ class RM65GraspJointTrajectoryPlanner:
             ),
             dtype=float,
         )
-        lower = np.asarray(RM65_ABSOLUTE_Q_MIN_RAD, dtype=float)
-        upper = np.asarray(RM65_ABSOLUTE_Q_MAX_RAD, dtype=float)
+        lower, upper = self._endpoint_joint_bounds()
         baseline = {
             name: np.asarray(qpos_by_side[name], dtype=float).copy() for name in _SIDES
         }
@@ -2573,8 +2642,10 @@ class RM65GraspJointTrajectoryPlanner:
         monotonic: Callable[[], float] = time.perf_counter,
     ) -> tuple[dict[str, np.ndarray], int, float, float]:
         target_pose = np.asarray(target_tool_tcp_world, dtype=float)
-        lower = np.asarray(RM65_ABSOLUTE_Q_MIN_RAD, dtype=float)
-        upper = np.asarray(RM65_ABSOLUTE_Q_MAX_RAD, dtype=float)
+        lower, upper = self._endpoint_joint_bounds()
+        # SciPy rejects an initial iterate outside its bounds; a measured seed
+        # on (or inside a configured margin of) a joint limit starts on them.
+        seed_qpos = np.clip(np.asarray(seed_qpos, dtype=float), lower, upper)
         position_scale = self.config.endpoint_position_residual_scale_m
         orientation_scale = math.radians(
             self.config.endpoint_orientation_residual_scale_deg
@@ -5940,6 +6011,9 @@ class RM65GraspJointTrajectoryPlanner:
             .copy()
             for name in _SIDES
         }
+        # Every IK seed and the joint path start at this state; a bound-limited
+        # solver or search cannot start beyond the software joint limits.
+        current[selected_side] = bounded_planning_start_qpos(current[selected_side], side=selected_side)
         target_pose = np.asarray(target_tool_tcp_world, dtype=float).reshape(4, 4).copy()
         ignore_start = (self.config.ignore_start_collisions
                         and self.observed_obstacles is not None and not require_grasp_approach)

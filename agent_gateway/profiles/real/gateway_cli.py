@@ -9,6 +9,7 @@ from deployments.dmtac_graspgenx_alignment_ids import (
 
 import argparse
 import json
+import math
 import os
 import signal
 import stat
@@ -387,6 +388,16 @@ def build_parser() -> argparse.ArgumentParser:
             "valid IK branch preference; estimated_execution_time uses the "
             "configured per-joint velocity limits without adding path searches "
             "(default: estimated_execution_time)"
+        ),
+    )
+    parser.add_argument(
+        "--grasp-endpoint-joint-limit-margin-deg",
+        type=float,
+        default=0.0,
+        help=(
+            "keep IK endpoints this many degrees inside the RM65 software joint "
+            "limits (0..10, default 0 = full range); a planned rest pose then "
+            "never sits on a bound that the next measured start could exceed"
         ),
     )
     parser.add_argument(
@@ -1066,6 +1077,9 @@ def main(argv: list[str] | None = None) -> int:
         )
     if args.debug_motion_skill and args.motion_trace_root is None:
         parser.error("--debug-motion-skill requires --motion-trace-root")
+    if (not math.isfinite(args.grasp_endpoint_joint_limit_margin_deg)
+            or not 0.0 <= args.grasp_endpoint_joint_limit_margin_deg <= 10.0):
+        parser.error("--grasp-endpoint-joint-limit-margin-deg must be within [0, 10]")
 
     socket_path = _absolute_socket_path(parser, args.socket_path)
     camera_registry_arg = _effective_camera_registry(args)
@@ -1512,6 +1526,7 @@ def main(argv: list[str] | None = None) -> int:
             trajectory_parameterization=(args.grasp_trajectory_parameterization),
             trajectory_speed_profile=(args.grasp_trajectory_speed_profile),
             endpoint_candidate_ordering=(args.grasp_endpoint_candidate_ordering),
+            endpoint_joint_limit_margin_rad=math.radians(args.grasp_endpoint_joint_limit_margin_deg),
         ),
     )
 
