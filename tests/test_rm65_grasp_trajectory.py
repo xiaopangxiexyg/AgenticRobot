@@ -6635,7 +6635,7 @@ def test_safe_pose_policy_keeps_existing_config_positional_constructor():
     original = RM65GraspTrajectoryPlanningConfig()
     assert next(field for field in fields(original)
                 if field.name == "enable_inherited_start_clearance").kw_only
-    all_names = [field.name for field in fields(original) if field.name != "enable_inherited_start_clearance"]
+    all_names = [field.name for field in fields(original) if not field.kw_only]
     names = all_names[:all_names.index("pose_goal_policy")]
     values = [getattr(original, name) for name in names]
     values[names.index("final_edge_resolution_rad")] = .0017

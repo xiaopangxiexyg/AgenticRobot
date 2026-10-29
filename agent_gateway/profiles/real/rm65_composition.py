@@ -627,7 +627,7 @@ def assemble_exclusive_rm65_agent_primitive_composition(
                 "input_binding_hash": captured_robot_observation_filter.input_binding_hash,
             }} if captured_robot_observation_filter is not None
                 and captured_robot_observation_filter.config.geometry_mode != "legacy" else {}),
-            **({"safe_motion_observation": asdict(safe_motion_observation_config)}
+            **({"safe_motion_observation": safe_motion_observation_config.identity_payload()}
                if safe_motion_observation_config is not None else {}),
             **({"safe_motion_start_clearance": "ignore-start-contacts-v1"}
                if ignore_start_collisions_enabled else
@@ -1167,7 +1167,7 @@ def assemble_exclusive_rm65_agent_primitive_composition(
                                      else "strict"),
                     profile_identity={"execution_manifest_hash": execution_manifest_hash,
                         "planning_config": json.loads(json.dumps(asdict(hover_config))),
-                        "observation": json.loads(json.dumps(asdict(safe_motion_observation_config)))})
+                        "observation": json.loads(json.dumps(safe_motion_observation_config.identity_payload()))})
             tool_entity_options = RealToolEntityOptions(enable_relations=enable_tool_object_relations,
                 enable_hover=enable_tool_hover_queries, tool_entity_by_side=tool_entities,
                 tool_tcp_poses=tool_tcp_poses, public_from_geometry=public_from_geometry,

@@ -48,6 +48,17 @@ class SafeMotionObservationConfig:
                 raise ValueError("Observed minimum clearance must be finite and positive.")
             object.__setattr__(self, "minimum_clearance_m", float(value))
 
+    def identity_payload(self) -> dict:
+        """Identity fields; the explicit observed clearance appears only when selected.
+
+        Keeps every existing profile, manifest and cloud identity unchanged when
+        the option is not used.
+        """
+        payload = asdict(self)
+        if payload.get("minimum_clearance_m") is None:
+            payload.pop("minimum_clearance_m", None)
+        return payload
+
 
 @contextmanager
 def timed_observation_phase(record_timing, phase, *, role=None):
@@ -155,5 +166,5 @@ def obstacle_cloud_from_captures(*, captures, config, reference_frame_id, self_f
     with timed_observation_phase(record_timing, "voxelize_and_bind_evidence"):
         return ObservedObstacleCloud(reference_frame_id=reference_frame_id,
             points_m=np.concatenate(points), voxel_size_m=config.voxel_size_m,
-            evidence={"views": evidence, "policy": asdict(config),
+            evidence={"views": evidence, "policy": config.identity_payload(),
                       "scope": "observed_surfaces_only_no_target_contact_exemptions"})
