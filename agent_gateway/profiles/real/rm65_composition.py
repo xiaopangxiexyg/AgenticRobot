@@ -9,12 +9,15 @@ socket, thread, or motion authority.  RealTeleop, VIVE, collection, GUI, and
 from __future__ import annotations
 
 import time
+import json
 import threading
 import math
 from functools import partial
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, asdict
 from pathlib import Path
+
+import numpy as np
 
 from agent_gateway.profiles.segmentation import (
     SegmentationRegistration,
@@ -303,6 +306,8 @@ def assemble_exclusive_rm65_agent_primitive_composition(
     enable_back_projection: bool = False,
     enable_surface_anchor_v2: bool = False,
     enable_anchor_motion_v2: bool = False,
+    enable_tool_object_relations: bool = False,
+    enable_tool_hover_queries: bool = False,
     enable_point_grasp_finger_exchange: bool = False,
     debug_render_object_coordinates: bool = False,
     enable_point_grasp_arm_reachability: bool = False,
@@ -332,6 +337,8 @@ def assemble_exclusive_rm65_agent_primitive_composition(
         raise TypeError("enable_surface_anchor_v2 must be bool.")
     if not isinstance(enable_anchor_motion_v2, bool):
         raise TypeError("enable_anchor_motion_v2 must be bool.")
+    if not isinstance(enable_tool_object_relations, bool) or not isinstance(enable_tool_hover_queries, bool):
+        raise TypeError("Tool-entity Skill switches must be bool.")
     if not isinstance(enable_point_grasp_finger_exchange, bool):
         raise TypeError("enable_point_grasp_finger_exchange must be bool.")
     if grasp_trajectory_config is not None and not isinstance(
@@ -433,7 +440,9 @@ def assemble_exclusive_rm65_agent_primitive_composition(
     grasp_enabled = point_grasp_planner is not None
     if enable_surface_anchor_v2 and (not enable_back_projection or object_localizer is None):
         raise ValueError("Surface anchor v2 requires back projection and a bound segmenter.")
-    if enable_surface_anchor_v2:
+    if enable_tool_object_relations and (not enable_back_projection or object_localizer is None):
+        raise ValueError("Tool-object relations require back projection and a bound segmenter.")
+    if enable_surface_anchor_v2 or enable_tool_object_relations:
         timeout_sec = getattr(object_localizer, "timeout_sec", None)
         if (not isinstance(timeout_sec, (int, float)) or isinstance(timeout_sec, bool)
                 or not math.isfinite(float(timeout_sec))
@@ -441,6 +450,10 @@ def assemble_exclusive_rm65_agent_primitive_composition(
             raise ValueError("Surface anchor v2 requires a bounded segmenter timeout of at most 45s.")
     observed_point_enabled = "move_to_observed_point" in normalized_actions
     observed_safe_enabled = safe_motion_observation_config is not None
+    if enable_tool_hover_queries and (not enable_surface_anchor_v2 or not observed_safe_enabled
+                                      or "move_tcp_to_pose_safe" not in normalized_actions):
+        raise ValueError("Tool hover queries require surface anchor v2, the observed safe scene "
+                         "and authorized move_tcp_to_pose_safe.")
     inherited_start_clearance_enabled = (
         grasp_trajectory_config is not None
         and grasp_trajectory_config.enable_inherited_start_clearance
@@ -473,8 +486,9 @@ def assemble_exclusive_rm65_agent_primitive_composition(
         raise ValueError(
             "Point-grasp requires its bound object localizer."
         )
-    if object_localizer is not None and not (grasp_enabled or enable_surface_anchor_v2):
-        raise ValueError("Object localizer requires point grasp or surface anchor v2.")
+    if object_localizer is not None and not (grasp_enabled or enable_surface_anchor_v2
+                                             or enable_tool_object_relations):
+        raise ValueError("Object localizer requires point grasp, surface anchor v2 or tool-object relations.")
     if grasp_enabled and not perception_enabled:
         raise ValueError("Point-grasp requires the composed camera resources.")
     if enable_back_projection and not perception_enabled:
@@ -1083,6 +1097,64 @@ def assemble_exclusive_rm65_agent_primitive_composition(
             else:
                 safe_pose_trajectory_planner = safe_planner_factory()
 
+        tool_entity_options = None
+        if enable_tool_object_relations or enable_tool_hover_queries:
+            from deployments.perception.dmtac_tool_entity import default_tool_entity_by_side
+
+            from .tool_entity import RealToolEntityOptions, RealToolHoverPlanner
+
+            assert camera_mount_urdf_path is not None
+            tool_entities = default_tool_entity_by_side(profile.tool_tcp_pose_flange_m_rad_by_side,
+                profile.tool_profile_by_side, urdf_path=camera_mount_urdf_path)
+            if not tool_entities:
+                raise ValueError("Tool-entity Skills need the reviewed DMTAC_M tool on at least one arm.")
+            public_from_geometry, _ = frame_graph.transform_pose_matrix(np.eye(4),
+                source_reference_frame_id=execution_frame.frame_id,
+                target_reference_frame_id=station_frame.frame_id)
+            # A request-owned FK builder, created on first use; the control
+            # loop's builder keeps its own scratch.
+            tool_fk_lock = threading.Lock()
+            tool_fk_builders = []
+
+            def tool_tcp_poses(qpos_by_side):
+                with tool_fk_lock:
+                    if not tool_fk_builders:
+                        tool_fk_builders.append(build_exclusive_rm65_skill_target_builder(lower.profile))
+                    return tool_fk_builders[0].tool_tcp_world_targets_for_qpos_pair(
+                        left_qpos=np.asarray(qpos_by_side["left"], dtype=float),
+                        right_qpos=np.asarray(qpos_by_side["right"], dtype=float))
+
+            tool_hover_planner = None
+            if enable_tool_hover_queries:
+                hover_config = safe_config
+
+                def tool_hover_planner_factory():
+                    # Same reviewed safe-move configuration, separate instance:
+                    # a query never holds the motion planner's lock.
+                    return RM65GraspJointTrajectoryPlanner(profile=lower.profile,
+                        planning_target_builder=build_exclusive_rm65_skill_target_builder(lower.profile),
+                        target_envelope_filter=lower.target_builder.pre_ik_target_safety_filter,
+                        config=hover_config, reachability_config=reachability_config)
+
+                tool_hover_planner = RealToolHoverPlanner(planner_factory=tool_hover_planner_factory,
+                    self_filter=captured_robot_observation_filter,
+                    observation_config=safe_motion_observation_config,
+                    geometry_frame_id=lower.profile.station_world_frame_id,
+                    translation_tolerance_m=convergence_profile.translation_tolerance_m,
+                    rotation_tolerance_rad=convergence_profile.rotation_tolerance_rad,
+                    start_clearance=("inherited-positive-v1" if hover_config.enable_inherited_start_clearance
+                                     else "strict"),
+                    max_inter_camera_skew_sec=perception_capture.profile.max_inter_camera_skew_ms / 1000.0,
+                    profile_identity={"execution_manifest_hash": execution_manifest_hash,
+                        "planning_config": json.loads(json.dumps(asdict(hover_config))),
+                        "observation": json.loads(json.dumps(asdict(safe_motion_observation_config)))})
+            tool_entity_options = RealToolEntityOptions(enable_relations=enable_tool_object_relations,
+                enable_hover=enable_tool_hover_queries, tool_entity_by_side=tool_entities,
+                tool_tcp_poses=tool_tcp_poses, public_from_geometry=public_from_geometry,
+                hover_planner=tool_hover_planner,
+                hover_roles=(() if not enable_tool_hover_queries
+                             else tuple(safe_motion_observation_config.roles)))
+
         def reachability_evaluator_factory(port):
             if arm_reachability_profile is None:
                 raise RuntimeError("Arm reachability profile is unavailable.")
@@ -1108,6 +1180,7 @@ def assemble_exclusive_rm65_agent_primitive_composition(
         deployment = assemble_exclusive_rm65_agent_primitive_deployment(
             enable_spatial_goals=enable_spatial_goals,
             enable_tcp_pose_comparison=enable_tcp_pose_comparison,
+            tool_entity_options=tool_entity_options,
             gripper_port=gripper_port,
             gripper_ports=gripper_ports if bilateral else None,
             primary_component_id=f"{side}_arm",

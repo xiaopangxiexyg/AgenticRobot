@@ -567,8 +567,21 @@ def build_mujoco_agent_tcp_pose_gateway_session(
     fast_grasp_planner: Any | None = None,
     fast_grasp_approach_config: Mapping[str, float] | None = None,
     safe_motion_observation: MujocoObservedSafeMotionConfig | None = None,
+    enable_tool_object_relations: bool = False,
+    enable_tool_hover_queries: bool = False,
 ) -> MujocoAgentTcpPoseGatewaySession:
     """Build the exact default-off graph; do not start, record, or serve it."""
+
+    if type(enable_tool_object_relations) is not bool or type(enable_tool_hover_queries) is not bool:
+        raise TypeError("Tool-entity Skill switches must be bool.")
+    if enable_tool_object_relations and (artifact_storage is None or segmentation_localizer is None
+                                         or not enable_safe_tcp_pose):
+        # The frozen multi-view RGB-D capture belongs to the planned safe TCP owner.
+        raise ValueError("Tool-object relations require Artifact storage, a segmentation localizer "
+                         "and the safe TCP pose Route.")
+    if enable_tool_hover_queries and (not enable_surface_anchor_v2 or safe_motion_observation is None
+                                      or not enable_safe_tcp_pose):
+        raise ValueError("Tool hover queries require surface anchor v2 and the observed safe TCP scene.")
 
     if type(enable_named_release_v3) is not bool or (enable_named_release_v3 and not (
             enable_object_support_motion_v2 and enable_grippers
@@ -955,8 +968,28 @@ def build_mujoco_agent_tcp_pose_gateway_session(
                 held_transaction=(application.run_held_gripper_transition
                     if enable_named_release_v3 and side == "right" else None))
                 for name, side in prepared.gripper_profile.side_by_gripper.items()}
+        tool_entity_by_side = None
+        if enable_tool_object_relations or enable_tool_hover_queries:
+            from deployments.perception.dmtac_tool_entity import default_tool_entity_by_side
+            from robot_motion.rm65.tool_profiles import load_rm65_tool_profile
+
+            # Same reviewed entity binding as the RealMan Gateway: tool
+            # calibrations and the session's station URDF (twin geometry).
+            tool_profiles = {side: load_rm65_tool_profile(getattr(application.task_config, side + "_tool_profile_path"),
+                                                          side=side) for side in ("left", "right")}
+            tool_entity_by_side = default_tool_entity_by_side(
+                {side: tuple(float(x) for x in profile["tcp"]["pose_flange_m_rad"])
+                 for side, profile in tool_profiles.items()}, tool_profiles,
+                urdf_path=application.runtime.rig.scene.load_result.conversion.urdf_path)
+            if not tool_entity_by_side:
+                raise ValueError("Tool-entity Skills need the reviewed DMTAC_M tool on at least one arm.")
         contract_bundle = build_mujoco_agent_tcp_pose_contract_bundle(
             application=application,
+            enable_tool_object_relations=enable_tool_object_relations,
+            enable_tool_hover_queries=enable_tool_hover_queries,
+            tool_entity_by_side=tool_entity_by_side,
+            tool_hover_roles=(() if safe_motion_observation is None
+                              else tuple(safe_motion_observation.observation.roles)),
             history_profile=(
                 None if history_storage is None else history_storage.profile
             ),
@@ -1061,6 +1094,7 @@ def build_mujoco_agent_tcp_pose_gateway_session(
             fast_grasp_planner=fast_grasp_planner,
             gripper_ports=gripper_ports,
             safe_motion_observation=safe_motion_observation,
+            tool_entity_by_side=tool_entity_by_side,
         )
     except Exception:
         if history_store is not None:

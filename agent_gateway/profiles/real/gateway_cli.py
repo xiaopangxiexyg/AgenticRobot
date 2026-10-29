@@ -221,6 +221,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="Expose read-only SAM3 surface anchors from paired RGB-D without a grasp generator; requires back projection.")
     parser.add_argument("--enable-anchor-motion-v2", action="store_true",
         help="Publish the authenticated surface-anchor v2 motion Route on the existing observed safe owner; default off.")
+    parser.add_argument("--enable-tool-object-relations", action="store_true",
+        help=("Publish read-only perception.describe_tool_object_relations@1 (SAM3 masks on stationary "
+              "multi-view RGB-D vs the reviewed DMTAC gripper); requires back projection; default off."))
+    parser.add_argument("--enable-tool-hover-queries", action="store_true",
+        help=("Publish read-only perception.query_tool_hover_paths@1 (gripper-box hover paths checked by the "
+              "observed safe-move planner, never dispatched); requires surface anchor v2, "
+              "--safe-motion-observation-roles and move_tcp_to_pose_safe; default off."))
     parser.add_argument("--enable-point-grasp-finger-exchange", action="store_true",
         help="Register point-grasp v5 with separately readmitted 180-degree finger exchanges; requires GraspGenX and arm reachability.")
     parser.add_argument(
@@ -907,13 +914,14 @@ def _emit_lifecycle_event(payload: dict[str, Any]) -> None:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-    if args.enable_surface_anchor_v2:
+    if args.enable_surface_anchor_v2 or args.enable_tool_object_relations:
         tokens = sys.argv[1:] if argv is None else argv
         timeout_explicit = any(token == "--sam3-timeout-sec"
                                or token.startswith("--sam3-timeout-sec=")
                                for token in tokens)
         if timeout_explicit and not 0 < args.sam3_timeout_sec <= REAL_SURFACE_ANCHOR_MAX_SEGMENT_TIMEOUT_SEC:
-            parser.error("--enable-surface-anchor-v2 requires --sam3-timeout-sec in (0, 45]")
+            parser.error("--enable-surface-anchor-v2/--enable-tool-object-relations require "
+                         "--sam3-timeout-sec in (0, 45]")
         if not timeout_explicit:
             args.sam3_timeout_sec = REAL_SURFACE_ANCHOR_MAX_SEGMENT_TIMEOUT_SEC
     if args.graspgenx_alignment_profile != DMTAC_M_GRASPGENX_ALIGNMENT_PROFILE_ID:
@@ -1058,6 +1066,16 @@ def main(argv: list[str] | None = None) -> int:
         not args.enable_back_projection or args.object_localization_backend != "sam3-service"
     ):
         parser.error("--enable-surface-anchor-v2 requires back projection and sam3-service")
+    if args.enable_tool_object_relations and (
+        not args.enable_back_projection or args.object_localization_backend != "sam3-service"
+    ):
+        parser.error("--enable-tool-object-relations requires back projection and sam3-service")
+    if args.enable_tool_hover_queries and (
+        not args.enable_surface_anchor_v2 or args.safe_motion_observation_roles is None
+        or "move_tcp_to_pose_safe" not in actions
+    ):
+        parser.error("--enable-tool-hover-queries requires --enable-surface-anchor-v2, "
+                     "--safe-motion-observation-roles and the move_tcp_to_pose_safe action")
     if args.enable_grasp_observation and (not args.enable_point_grasp or args.point_grasp_backend != "graspgenx"):
         parser.error("--enable-grasp-observation requires --enable-point-grasp and GraspGenX")
     if args.sam3_multi_instance_text and (
@@ -1266,7 +1284,7 @@ def main(argv: list[str] | None = None) -> int:
         )
     object_localizer = None
     point_grasp_planner = None
-    if args.enable_surface_anchor_v2 and not args.enable_point_grasp:
+    if (args.enable_surface_anchor_v2 or args.enable_tool_object_relations) and not args.enable_point_grasp:
         from deployments.perception.sam3_service import Sam3ServiceLocalizer
 
         object_localizer = Sam3ServiceLocalizer(
@@ -1419,6 +1437,8 @@ def main(argv: list[str] | None = None) -> int:
         enable_back_projection=args.enable_back_projection,
         enable_surface_anchor_v2=args.enable_surface_anchor_v2,
         enable_anchor_motion_v2=args.enable_anchor_motion_v2,
+        enable_tool_object_relations=args.enable_tool_object_relations,
+        enable_tool_hover_queries=args.enable_tool_hover_queries,
         enable_point_grasp_finger_exchange=args.enable_point_grasp_finger_exchange,
         debug_render_object_coordinates=args.debug_render_object_coordinates,
         enable_point_grasp_arm_reachability=(args.enable_point_grasp_arm_reachability),

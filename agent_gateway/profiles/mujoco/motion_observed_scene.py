@@ -16,7 +16,6 @@ from xml.etree import ElementTree
 import numpy as np
 
 from dataset_contracts.canonical_encoding import canonical_content_hash
-from robot_motion.observed_planning import ObservedJointPlanningInput
 from robot_motion.observed_scene import SafeMotionObservationConfig, obstacle_cloud_from_captures
 from robot_motion.relative_action import xyzquat_to_pose_matrix
 from robot_motion.rm65.captured_robot_observations import (
@@ -29,6 +28,11 @@ from robot_motion.rm65.obstacle_collision import (
     build_rm65_profile_obstacle_collision_oracle,
 )
 from robot_motion.scene_obstacles import ObstacleSceneSnapshot
+from sim.mujoco.deploy.planned_tcp_motion import (
+    OBSERVED_START_CLEARANCE_MODES,
+    OBSERVED_START_CLEARANCE_STRICT,
+    MujocoObservedJointPlanningInput,
+)
 
 
 def _urdf_geometry_identity(path):
@@ -52,6 +56,9 @@ class MujocoObservedSafeMotionConfig:
     observation: SafeMotionObservationConfig
     maximum_start_drift_rad: float = 0.01
     maximum_inter_camera_skew_sec: float = 0.1
+    # Strict keeps every prior identity. The reviewed RealMan egress mode
+    # enters the safe profile identity only when selected.
+    start_clearance: str = OBSERVED_START_CLEARANCE_STRICT
     _semantic_content_hash: str = field(init=False, repr=False)
     _collision_model_hash: str = field(init=False, repr=False)
 
@@ -68,6 +75,8 @@ class MujocoObservedSafeMotionConfig:
             value = getattr(self, name)
             if isinstance(value, (bool, np.bool_)) or not np.isfinite(value) or value <= 0:
                 raise ValueError(f"{name} must be finite and positive.")
+        if type(self.start_clearance) is not str or self.start_clearance not in OBSERVED_START_CLEARANCE_MODES:
+            raise ValueError("start_clearance must be 'strict' or 'inherited-positive-v1'.")
         identity, collision = self._content_identities()
         object.__setattr__(self, "_semantic_content_hash", identity)
         object.__setattr__(self, "_collision_model_hash", collision)
@@ -90,6 +99,8 @@ class MujocoObservedSafeMotionConfig:
             "self_filter": asdict(RM65CapturedRobotObservationFilterConfig()),
             "planning_inputs": "rgbd_and_measured_joints_only",
             "observed_collision_geometry": "existing_profile_boxes_and_D405",
+            **({"start_clearance": self.start_clearance}
+               if self.start_clearance != OBSERVED_START_CLEARANCE_STRICT else {}),
         }, domain="agenticrobot.mujoco.observed_safe_motion.v1")
         return identity, collision
 
@@ -161,7 +172,6 @@ class MujocoObservedSafeMotionProvider:
 
     def capture(self, *, operation_id, expected_station_revision, cancel_requested):
         from sim.mujoco.deploy.planned_tcp_motion import MujocoTcpPlanRejected
-        from .back_projection import live_aligned_depth_capture_from_array
 
         def require_request():
             if cancel_requested():
@@ -178,32 +188,23 @@ class MujocoObservedSafeMotionProvider:
                 for role in self.config.observation.roles),
             cancel_requested=cancel_requested)
         require_request()
-        pair = cut.arm_qpos_by_side
-        captures = []
-        for role, view in zip(self.config.observation.roles, cut.views, strict=True):
-            require_request()
-            source_id = self.capture_port.source_id_by_role[role]
-            if view.view_id != source_id:
-                raise MujocoTcpPlanRejected("observed_planning_rgbd_cut_mismatch")
-            depth = live_aligned_depth_capture_from_array(
-                view.depth_m, captured_at=cut.captured_at,
-                camera_pose_world_xyz_quat_xyzw=view.optical_camera_pose_world_xyz_quat_xyzw,
-                intrinsics=view.intrinsics, source_id=source_id, role=role,
-                station_revision=expected_station_revision,
-                application=self.capture_port.application,
-                source_frame_id=self.capture_port.source_frame_id,
-                reference_frame_id=self.capture_port.reference_frame_id)
-            captures.append(SimpleNamespace(
-                role=role, source_id=depth.source_id, acquired_at=depth.captured_at,
-                station_revision=depth.station_revision, source_generation=None,
-                frame_index=None,
-                source_binding_hash=self.source_binding_hash,
-                width=depth.depth_m.shape[1], height=depth.depth_m.shape[0],
-                depth_m=depth.depth_m, depth_content_hash=depth.depth_content_hash,
-                intrinsics=depth.intrinsics, source_from_camera=(
-                    self.geometry_from_depth_reference @ np.asarray(depth.reference_from_camera).reshape(4, 4)),
-                capture_qpos_by_side=pair, pose_measured_at=cut.captured_at,
-                pose_evidence_refs=()))
+        captures = self.captures_from_cut(cut, roles=self.config.observation.roles,
+            expected_station_revision=expected_station_revision, require_request=require_request)
+        _, source = self.planning_input_from_captures(captures)
+        require_request()
+        return source
+
+    def captures_from_cut(self, cut, *, roles, expected_station_revision, require_request=lambda: None):
+        """Typed RGB-D views of one native cut in the URDF/FCL geometry frame."""
+        return mujoco_rgbd_captures_from_cut(cut, roles=roles, capture_port=self.capture_port,
+            geometry_from_depth_reference=self.geometry_from_depth_reference,
+            source_binding_hash=self.source_binding_hash, expected_station_revision=expected_station_revision,
+            require_request=require_request)
+
+    def planning_input_from_captures(self, captures):
+        """Observed cloud plus the request-owned planning input for the current measured arms."""
+        from sim.mujoco.deploy.planned_tcp_motion import MujocoTcpPlanRejected
+
         current = self.rig.capture_scene(lambda scene: scene.arm_qpos_by_side())
         try:
             cloud = obstacle_cloud_from_captures(captures=captures, config=self.config.observation,
@@ -211,12 +212,54 @@ class MujocoObservedSafeMotionProvider:
                 planning_qpos_by_side=current,
                 max_inter_camera_skew_sec=self.config.maximum_inter_camera_skew_sec,
                 max_qpos_drift_rad=self.config.maximum_start_drift_rad)
-            source = ObservedJointPlanningInput(oracle=self.oracle.for_observed_cloud(cloud),
+            source = MujocoObservedJointPlanningInput(oracle=self.oracle.for_observed_cloud(cloud),
                 qpos_by_component=current, acquired_at=min(c.acquired_at for c in captures),
                 maximum_age_sec=self.config.observation.maximum_scene_age_sec,
-                maximum_start_drift_rad=self.config.maximum_start_drift_rad, clock=self.clock)
+                maximum_start_drift_rad=self.config.maximum_start_drift_rad, clock=self.clock,
+                start_clearance=self.config.start_clearance)
             source.require_current(current)
         except ValueError as error:
             raise MujocoTcpPlanRejected("observed_planning_input_rejected", {"error": str(error)}) from error
+        return cloud, source
+
+
+def mujoco_rgbd_captures_from_cut(cut, *, roles, capture_port, geometry_from_depth_reference, source_binding_hash,
+                                  expected_station_revision, require_request=lambda: None):
+    """Convert one native multi-view cut into RGB-D captures with capture-time dual-arm qpos.
+
+    ``source_from_camera`` is in the URDF/FCL geometry frame (the capture
+    port's source frame); RGB is kept for segmentation consumers.
+    """
+    from sim.mujoco.deploy.planned_tcp_motion import MujocoTcpPlanRejected
+    from .back_projection import live_aligned_depth_capture_from_array
+
+    pair = cut.arm_qpos_by_side
+    captures = []
+    for role, view in zip(roles, cut.views, strict=True):
         require_request()
-        return source
+        source_id = capture_port.source_id_by_role[role]
+        if view.view_id != source_id:
+            raise MujocoTcpPlanRejected("observed_planning_rgbd_cut_mismatch")
+        depth = live_aligned_depth_capture_from_array(
+            view.depth_m, captured_at=cut.captured_at,
+            camera_pose_world_xyz_quat_xyzw=view.optical_camera_pose_world_xyz_quat_xyzw,
+            intrinsics=view.intrinsics, source_id=source_id, role=role,
+            station_revision=expected_station_revision,
+            application=capture_port.application,
+            source_frame_id=capture_port.source_frame_id,
+            reference_frame_id=capture_port.reference_frame_id)
+        rgb = getattr(view, "rgb", None)
+        rgb = None if rgb is None else np.ascontiguousarray(rgb)
+        captures.append(SimpleNamespace(
+            role=role, source_id=depth.source_id, acquired_at=depth.captured_at,
+            station_revision=depth.station_revision, source_generation=None,
+            frame_index=None,
+            source_binding_hash=source_binding_hash,
+            width=depth.depth_m.shape[1], height=depth.depth_m.shape[0],
+            depth_m=depth.depth_m, depth_content_hash=depth.depth_content_hash,
+            intrinsics=depth.intrinsics, source_from_camera=(
+                geometry_from_depth_reference @ np.asarray(depth.reference_from_camera).reshape(4, 4)),
+            capture_qpos_by_side=pair, pose_measured_at=cut.captured_at,
+            pose_evidence_refs=(), rgb=rgb,
+            rgb_content_hash=None if rgb is None else hashlib.sha256(rgb.tobytes(order="C")).hexdigest()))
+    return captures

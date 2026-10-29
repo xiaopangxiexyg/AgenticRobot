@@ -46,6 +46,10 @@ from robot_motion.rm65 import (
     load_rm65_tool_profile,
 )
 from robot_motion.rm65.ik_tuning import load_ik_tuning_config, with_rm65_position_ik_objective
+from robot_motion.rm65.obstacle_collision import (
+    RM65InheritedStartBlocked,
+    RM65ObstacleCollisionOracle,
+)
 from sim.mujoco.collision_safety import (
     KinematicCollisionProjector,
 )
@@ -104,29 +108,147 @@ def _solve_endpoint_seed(solver, goal, offset, seed, *, normalized, deadline,
     )
 
 
+OBSERVED_START_CLEARANCE_STRICT = "strict"
+OBSERVED_START_CLEARANCE_INHERITED = "inherited-positive-v1"
+OBSERVED_START_CLEARANCE_MODES = (OBSERVED_START_CLEARANCE_STRICT, OBSERVED_START_CLEARANCE_INHERITED)
+_INHERITED_START_REASONS = frozenset({"collision_clearance_violated", "observed_obstacle_clearance_blocked"})
+
+
+@dataclass(frozen=True)
+class MujocoObservedJointPlanningInput(ObservedJointPlanningInput):
+    """An observed cut plus its reviewed start-clearance admission mode.
+
+    ``inherited-positive-v1`` mirrors the RealMan planner: a measured start
+    below the ordinary margin, at a strictly positive distance, may only plan
+    a path whose dense references prove egress. Contact and penetration stay
+    blocked. A plain ObservedJointPlanningInput remains strict.
+    """
+
+    start_clearance: str = OBSERVED_START_CLEARANCE_STRICT
+
+    def __post_init__(self):
+        super().__post_init__()
+        if type(self.start_clearance) is not str or self.start_clearance not in OBSERVED_START_CLEARANCE_MODES:
+            raise ValueError("start_clearance must be 'strict' or 'inherited-positive-v1'.")
+
+
 class _ObservedPlanningOracle:
     """Keep the same constraint/search contract without a native scene oracle."""
 
-    def __init__(self, source, model_qpos, *, constraint, constraint_identity, cancel_requested):
+    def __init__(self, source, model_qpos, *, constraint, constraint_identity, cancel_requested,
+                 query=None):
         if (constraint is None) != (constraint_identity is None):
             raise ValueError("Configuration constraint and identity must be bound together.")
         self.source = source
+        # A request-owned inherited start oracle replaces only the collision
+        # answer; the envelope constraint below still applies on top of it.
+        self.query = source.oracle if query is None else query
         self.model_qpos = model_qpos
         self.constraint = constraint
+        self.constraint_identity = constraint_identity
         self.cancel_requested = cancel_requested
         self.scene_hash = canonical_content_hash(
-            {"observed_scene": source.oracle.scene_hash, "constraint": constraint_identity},
+            {"observed_scene": self.query.scene_hash, "constraint": constraint_identity},
             domain="dexteleop.mujoco.observed_planning_query.v1")
 
     def check(self, pair):
         if self.cancel_requested():
             raise MujocoTcpPlanRejected("safe_tcp_planning_cancelled")
-        check = self.source.oracle.check(pair)
+        check = self.query.check(pair)
         if check.safe and self.constraint is not None:
             constrained = self.constraint(self.model_qpos, pair)
             if not constrained.safe:
                 return constrained
         return check
+
+    def with_inherited_start(self, start, side, details):
+        """Return this query on a request-owned inherited start oracle, or None.
+
+        Same admission as the reviewed RealMan planner: only a positive-distance
+        clearance shortfall of the native RM65 observed oracle is eligible.
+        Contact, penetration, unavailable queries and envelope refusals keep
+        strict start admission. Admission faults reject without a fallback.
+        """
+        source = self.source.oracle
+        if type(source) is not RM65ObstacleCollisionOracle:
+            return None
+        baseline = source.check(start)
+        if (baseline.safe or not baseline.collision_check_available
+                or baseline.reason not in _INHERITED_START_REASONS
+                or baseline.minimum_distance_m is None or not baseline.minimum_distance_m > 0.0):
+            return None
+        rejected = {**baseline.to_dict(), **details}
+        try:
+            query = source.inherited_start_clearance(start, active_component=side)
+        except RM65InheritedStartBlocked as error:
+            raise MujocoTcpPlanRejected("safe_tcp_start_blocked", {**rejected, **error.details}) from error
+        except Exception as error:  # noqa: BLE001 - no fallback from native admission faults
+            raise MujocoTcpPlanRejected("safe_tcp_start_blocked",
+                {**rejected, "exception_type": type(error).__name__}) from error
+        return _ObservedPlanningOracle(self.source, self.model_qpos, constraint=self.constraint,
+            constraint_identity=self.constraint_identity, cancel_requested=self.cancel_requested,
+            query=query)
+
+
+def _observed_start_clearance(source) -> str:
+    if isinstance(source, MujocoObservedJointPlanningInput):
+        return source.start_clearance
+    return OBSERVED_START_CLEARANCE_STRICT
+
+
+class _InheritedStartEgress:
+    """Ordered dense proof that inherited near pairs/boxes leave the margin."""
+
+    def __init__(self, start_clearance):
+        self.start_clearance = start_clearance
+        self.progress = start_clearance.new_dense_progress()
+        self.observed_progress = start_clearance.new_observed_dense_progress()
+
+    def advance(self, qpos, location):
+        clearance = self.start_clearance
+        for names, distances, progress, source in (
+            (clearance.active_inherited_pairs, clearance.inherited_active_distances,
+             self.progress, None),
+            (clearance.observed_active_names, clearance.observed_active_distances,
+             self.observed_progress, "observed_rgbd"),
+        ):
+            if not names:
+                continue
+            try:
+                values = distances(qpos)
+            except Exception as error:  # noqa: BLE001 - native/observed queries fail closed
+                check = JointConfigurationCheck(safe=False, collision_check_available=False,
+                    reason="inherited_start_clearance_distance_unavailable",
+                    metadata={"exception_type": type(error).__name__,
+                              "source": source or "fixed_scene"})
+                raise MujocoTcpPlanRejected("safe_tcp_retimed_path_blocked",
+                    {**location, "check": check.to_dict()}) from error
+            regression = progress.advance(values)
+            if regression is not None:
+                raise MujocoTcpPlanRejected("safe_tcp_inherited_start_clearance_regressed",
+                    {**location, **({"source": source} if source else {}), **regression})
+
+    def require_exited(self):
+        clearance = self.start_clearance
+        if not self.progress.all_exited:
+            raise MujocoTcpPlanRejected("safe_tcp_inherited_start_clearance_not_exited", {
+                "reason": "inherited_start_clearance_not_exited",
+                "active_inherited_pair_indices": clearance.active_inherited_pairs})
+        if not self.observed_progress.all_exited:
+            raise MujocoTcpPlanRejected("safe_tcp_inherited_start_clearance_not_exited", {
+                "reason": "inherited_observed_clearance_not_exited",
+                "active_inherited_observed_boxes": clearance.observed_active_names})
+
+    def summary(self):
+        clearance = self.start_clearance
+        return {
+            "static_pair_count": len(clearance.static_inherited_pairs),
+            "active_pair_count": len(clearance.active_inherited_pairs),
+            "active_pairs_exited": self.progress.all_exited,
+            "observed_static_box_count": len(clearance.observed_static_names),
+            "observed_active_box_count": len(clearance.observed_active_names),
+            "observed_active_boxes_exited": self.observed_progress.all_exited,
+        }
 
 
 # Preserve the historical private import as the same canonical policy type.
@@ -803,6 +925,24 @@ class MujocoPlannedTcpMotion:
                     for side, address in addresses.items()
                 }
                 initial = oracle.check(start)
+                egress = None
+                if (not initial.safe and observed_planning_input is not None
+                        and _observed_start_clearance(observed_planning_input)
+                        == OBSERVED_START_CLEARANCE_INHERITED):
+                    # Strict starts and ineligible inherited starts share the
+                    # original reason; details record the admission decision.
+                    admission = {"planning_phase": "inherited_start_clearance_admission",
+                                 "start_clearance": OBSERVED_START_CLEARANCE_INHERITED,
+                                 "inherited_start_clearance_admitted": False}
+                    inherited = oracle.with_inherited_start(start, side, admission)
+                    if inherited is not None:
+                        admission.update(inherited_start_clearance_admitted=True,
+                                         baseline_check=initial.to_dict())
+                        oracle, egress = inherited, _InheritedStartEgress(inherited.query)
+                        initial = oracle.check(start)
+                    if not initial.safe:
+                        raise MujocoTcpPlanRejected("safe_tcp_start_blocked",
+                                                    {**initial.to_dict(), **admission})
                 if not initial.safe:
                     raise MujocoTcpPlanRejected("safe_tcp_start_blocked", initial.to_dict())
                 solver = self._solver_for_ik(orientation_weight)
@@ -1087,9 +1227,8 @@ class MujocoPlannedTcpMotion:
                         1, math.ceil(float(np.max(np.abs(current - previous))) / 0.01)
                     )
                     for alpha in np.linspace(0, 1, count + 1):
-                        check = oracle.check(
-                            {**pair, side: previous + alpha * (current - previous)}
-                        )
+                        sample = {**pair, side: previous + alpha * (current - previous)}
+                        check = oracle.check(sample)
                         if not check.safe:
                             raise MujocoTcpPlanRejected(
                                 "safe_tcp_retimed_path_blocked",
@@ -1100,12 +1239,19 @@ class MujocoPlannedTcpMotion:
                                     "path_metadata": dict(path.metadata),
                                 },
                             )
+                        if egress is not None:
+                            # Inherited near pairs must move out monotonically
+                            # along these exact ordered executed samples.
+                            egress.advance(sample, {"reference_index": index,
+                                                    "edge_alpha": float(alpha)})
                     poses.append(
                         tuple(
                             float(item)
                             for item in self.pose_for_configuration(model_qpos, pair)
                         )
                     )
+                if egress is not None:
+                    egress.require_exited()
                 quality = sampled_path_motion_quality(trajectory.q_rad, np.asarray([
                     (world_from_base @ xyzquat_to_matrix(pose))[:3, 3] for pose in poses
                 ]))
@@ -1116,7 +1262,8 @@ class MujocoPlannedTcpMotion:
                     "quality_rejected_paths": rejected_paths,
                     **({"planning_scene_source": "calibrated_rgbd_and_measured_joints",
                         "observed_scene_hash": observed_planning_input.oracle.scene_hash}
-                       if observed_planning_input is not None else {})})
+                       if observed_planning_input is not None else {}),
+                    **({"inherited_start_clearance": egress.summary()} if egress is not None else {})})
                 identity = canonical_content_hash(
                     {
                         "path": path.semantic_content_hash,

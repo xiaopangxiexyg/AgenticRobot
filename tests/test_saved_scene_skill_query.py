@@ -292,7 +292,8 @@ def test_factory_defaults_to_inherited_clearance_and_binds_strict_opt_out(input_
         return Planner()
     monkeypatch.setattr(module, "RM65GraspJointTrajectoryPlanner", create_planner)
     # The URDF contact solids are native geometry, covered by their own test.
-    monkeypatch.setattr(module, "dmtac_open_sensor_contact_solids", lambda *_a, **_k: {})
+    from deployments.perception import dmtac_tool_entity
+    monkeypatch.setattr(dmtac_tool_entity, "dmtac_open_sensor_contact_solids", lambda *_a, **_k: {})
     for kwargs, enabled in (({}, True), ({"enable_inherited_start_clearance": True}, True),
                             ({"enable_inherited_start_clearance": False}, False)):
         query = SavedSceneSkillQuery.from_manifest(input_manifest, **kwargs)
@@ -1104,6 +1105,54 @@ def test_entity_hover_targets_the_gripper_box_and_checks_achieved_fk(entity_sess
     assert len(row["planned_endpoint_pose_xyz_quat_xyzw"]) == 7
     assert all(not call["require_grasp_approach"] for call in planner.calls)
     assert query.audit()["qpos_by_side"] == {s: [0.] * 6 for s in ("left", "right")}
+
+
+def test_entity_hover_gives_each_candidate_five_seconds_and_tcp_regions_three(entity_session):
+    query, planner = entity_session
+    now = [0.]
+    query._clock = lambda: now[0]
+    query.plan_entity_hover_region(**HOVER)
+    assert planner.calls[-1]["time_budget_sec"] == pytest.approx(5.)
+    assert query.audit()["region_queries"][-1]["candidate_budget_sec"] == 5.
+    query.plan_relation_region(side="right", target_reference="top-a",
+        offset_bounds_xyz_m=[[0., 0.], [0., 0.], [.08, .12]])
+    assert planner.calls[-1]["time_budget_sec"] == pytest.approx(3.)
+    assert "candidate_budget_sec" not in query.audit()["region_queries"][-1]
+
+
+def test_entity_hover_records_the_session_capped_candidate_budget():
+    query = _entity_query(Planner())
+    try:
+        query._query_budget = {"maximum_calls": 8, "maximum_planning_sec": 20., "maximum_call_planning_sec": 3.}
+        query.plan_entity_hover_region(**HOVER)
+        assert query.audit()["region_queries"][-1]["candidate_budget_sec"] == 3.
+    finally:
+        query.close()
+
+
+class EnvelopeThenFoundPlanner(Planner):
+    """First proposal outside the TCP envelope: a per-target rejection."""
+
+    def plan_with_observed_cloud(self, cloud, **kwargs):
+        if not self.calls:
+            self.calls.append(kwargs)
+            raise RM65GraspTrajectoryPlanningError("target_safety_envelope_blocked")
+        return super().plan_with_observed_cloud(cloud, **kwargs)
+
+
+def test_entity_hover_retries_per_target_planner_rejections_like_the_gateway():
+    planner = EnvelopeThenFoundPlanner()
+    query = _entity_query(planner)
+    try:
+        result = query.plan_entity_hover_region(**HOVER)
+        assert result["status"] == "path_found" and result["selected_candidate_index"] == 1
+        # TCP region queries keep their original, narrower retry set.
+        planner.calls.clear()
+        result = query.plan_relation_region(side="right", target_reference="top-a",
+            offset_bounds_xyz_m=[[0., 0.], [0., 0.], [.08, .12]])
+        assert (result["status"], result["reason"]) == ("path_rejected", "target_safety_envelope_blocked")
+    finally:
+        query.close()
 
 
 class SinkingPlanner(Planner):

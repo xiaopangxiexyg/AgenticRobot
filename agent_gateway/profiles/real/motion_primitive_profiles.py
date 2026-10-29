@@ -22,6 +22,11 @@ from agent_gateway.profiles.placement import (
     PlacementRegistration,
     build_placement_registration,
 )
+from agent_gateway.profiles.tool_entity import (
+    ToolEntityRegistration,
+    build_tool_hover_registration,
+    build_tool_object_relation_registration,
+)
 from agent_gateway.protocol.skill_catalog import (
     AgentSkillSchemaCatalog,
     SkillDefinitionCatalog,
@@ -711,6 +716,8 @@ class RealAgentPrimitiveContractBundle:
     grasp_fast_plan_registration: RealFastGraspPlanRegistration | None = None
     observed_point_profile: RealAgentObservedPointProfile | None = None
     observed_anchor_profile_v2: RealAgentObservedAnchorProfile | None = None
+    tool_object_relation_registration: ToolEntityRegistration | None = None
+    tool_hover_registration: ToolEntityRegistration | None = None
 
     def __post_init__(self) -> None:
         published_skill_ids = {
@@ -956,6 +963,19 @@ class RealAgentPrimitiveContractBundle:
             item is not None for item in optional_grasp
         ):
             raise ValueError("Grasp-approach planning requires retained point grasps.")
+        if self.tool_object_relation_registration is not None and (
+            self.segmentation_registration is None or self.perception_capture is None
+            or self.perception_capture.back_projection is None
+            or self.route_manifest.route("perception.describe_tool_object_relations", "1")
+            != self.tool_object_relation_registration.entry
+        ):
+            raise ValueError("Real tool-object relations need segmentation, aligned RGB-D and their manifest entry.")
+        if self.tool_hover_registration is not None and (
+            self.surface_anchor_capture_registration is None or not safe_pose_enabled
+            or self.route_manifest.route("perception.query_tool_hover_paths", "1")
+            != self.tool_hover_registration.entry
+        ):
+            raise ValueError("Real tool hover queries need surface anchor v2, the safe TCP Route and their entry.")
         expected_route_count = (
             (1 + int(pose_target_enabled) + int(grasp_approach_enabled)
              + int(safe_pose_enabled) + int(observed_point_enabled)
@@ -970,6 +990,8 @@ class RealAgentPrimitiveContractBundle:
             + 2 * int(self.station_point_grasp_registration is not None)
             + int(self.segmentation_registration is not None)
             + int(self.surface_anchor_capture_registration is not None)
+            + int(self.tool_object_relation_registration is not None)
+            + int(self.tool_hover_registration is not None)
             + int(self.placement_registration is not None)
             + (2 if grasp_approach_plan_enabled else 0)
             + int(transport_enabled)
@@ -1250,6 +1272,11 @@ def build_real_agent_primitive_contract_bundle(
     domain_emergency_stop_available: bool = False,
     enable_spatial_goals: bool = False,
     enable_tcp_pose_comparison: bool = False,
+    enable_tool_object_relations: bool = False,
+    enable_tool_hover_queries: bool = False,
+    tool_entity_by_side: Mapping[str, object] | None = None,
+    tool_hover_planner_profile_hash: str | None = None,
+    tool_hover_roles: tuple[str, ...] | None = None,
 ) -> RealAgentPrimitiveContractBundle:
     """Build exact motion and optional passive Routes without runtime effects."""
 
@@ -1767,6 +1794,35 @@ def build_real_agent_primitive_contract_bundle(
             back_projection=perception_capture.back_projection,
             segmentation=segmentation_registration, version="2",
         )
+    tool_object_relation_registration = None
+    tool_hover_registration = None
+    if enable_tool_object_relations or enable_tool_hover_queries:
+        if (segmentation_registration is None or perception_capture is None
+                or perception_capture.back_projection is None or not tool_entity_by_side):
+            raise ValueError("Real tool-entity Skills need segmentation, aligned RGB-D and a reviewed tool entity.")
+    if enable_tool_object_relations:
+        tool_object_relation_registration = build_tool_object_relation_registration(
+            segmentation=segmentation_registration, back_projection=perception_capture.back_projection,
+            roles=perception_capture.back_projection.profile.roles, tool_entity_by_side=tool_entity_by_side)
+    if enable_tool_hover_queries:
+        if (surface_anchor_capture_registration is None or tool_hover_planner_profile_hash is None
+                or not tool_hover_roles or not safe_pose_enabled):
+            raise ValueError("Real tool hover queries need surface anchor v2 and the observed safe-move planner.")
+        hover_sides = {component: side for side, component in port_config.component_id_by_side.items()
+                       if side in tool_entity_by_side}
+        tool_hover_registration = build_tool_hover_registration(
+            capture_registration=surface_anchor_capture_registration,
+            back_projection=perception_capture.back_projection, component_side_by_id=hover_sides,
+            roles=tuple(tool_hover_roles), tool_entity_by_side=tool_entity_by_side,
+            # The checked path belongs to the same safe-move Route the Agent
+            # later submits the selected pose to.
+            planner_profile_hash=canonical_content_hash(
+                {"planner": tool_hover_planner_profile_hash,
+                 "safe_motion_route": safe_pose_route.semantic_content_hash},
+                domain="agenticrobot.real.tool_hover_planner_binding.v1"))
+        if tool_hover_registration.reference_frame_id != pose_target_profile.reference_frame_id:
+            # The selected pose is submitted unchanged to the safe TCP Route.
+            raise ValueError("Real tool hover results must use the safe TCP Route's public frame.")
     perception_registrations = list(
         ()
         if perception_capture is None
@@ -1794,6 +1850,10 @@ def build_real_agent_primitive_contract_bundle(
         perception_registrations.append(segmentation_registration.skill)
     if surface_anchor_capture_registration is not None:
         perception_registrations.append(surface_anchor_capture_registration.skill)
+    if tool_object_relation_registration is not None:
+        perception_registrations.append(tool_object_relation_registration.skill)
+    if tool_hover_registration is not None:
+        perception_registrations.append(tool_hover_registration.skill)
     if placement_registration is not None:
         perception_registrations.append(placement_registration.skill)
     if grasp_approach_plan_registration is not None:
@@ -2004,6 +2064,10 @@ def build_real_agent_primitive_contract_bundle(
         )
     if surface_anchor_capture_registration is not None:
         route_items.append(surface_anchor_capture_registration.entry)
+    if tool_object_relation_registration is not None:
+        route_items.append(tool_object_relation_registration.entry)
+    if tool_hover_registration is not None:
+        route_items.append(tool_hover_registration.entry)
     if grasp_approach_plan_registration is not None:
         route_items.append(
             SkillRouteManifestEntry(
@@ -2179,6 +2243,10 @@ def build_real_agent_primitive_contract_bundle(
             ),
             *((surface_anchor_capture_registration.payload_validator,)
               if surface_anchor_capture_registration is not None else ()),
+            *((tool_object_relation_registration.payload_validator,)
+              if tool_object_relation_registration is not None else ()),
+            *((tool_hover_registration.payload_validator,)
+              if tool_hover_registration is not None else ()),
             *(
                 ()
                 if placement_registration is None
@@ -2240,6 +2308,8 @@ def build_real_agent_primitive_contract_bundle(
         localization_registration=localization_registration,
         segmentation_registration=segmentation_registration,
         surface_anchor_capture_registration=surface_anchor_capture_registration,
+        tool_object_relation_registration=tool_object_relation_registration,
+        tool_hover_registration=tool_hover_registration,
         placement_registration=placement_registration,
         station_point_grasp_registration=station_point_grasp_registration,
         station_point_grasp_render_registration=(

@@ -198,6 +198,7 @@ class MujocoAgentTcpPoseGatewaySession:
     localization_provider: ObjectLocalizationProvider | None = None
     localization_executor: PassiveReadSkillExecutor | None = None
     surface_anchor_executors: tuple[PassiveReadSkillExecutor, ...] = ()
+    tool_entity_executors: tuple[PassiveReadSkillExecutor, ...] = ()
     _close_lock: threading.Lock = field(
         default_factory=threading.Lock,
         init=False,
@@ -249,6 +250,8 @@ class MujocoAgentTcpPoseGatewaySession:
             raise ValueError("Object localization must borrow the session segmentation model.")
         if (self.contract_bundle.object_goal_query_registration is not None) != (self.object_goal_query_executor is not None):
             raise ValueError("Object goal query registration and executor must coexist.")
+        if len(self.tool_entity_executors) != len(self.contract_bundle.tool_entity_registrations):
+            raise ValueError("Tool-entity registrations and executors disagree.")
         if len(self.surface_anchor_executors) != len(self.contract_bundle.surface_anchor_registrations):
             raise ValueError("Surface anchor registrations and executors must coexist.")
         fast_parts = (self.contract_bundle.fast_grasp_contract is not None,
@@ -595,6 +598,9 @@ class MujocoAgentTcpPoseGatewaySession:
                         registration.skill.routes[0].max_operation_duration_ms / 1000 + 5.0))
                         for registration, executor in zip(self.contract_bundle.surface_anchor_registrations,
                             self.surface_anchor_executors, strict=True)),
+                    *(("tool_entity", executor, registration.entry.route.max_operation_duration_ms / 1000 + 5.0)
+                        for registration, executor in zip(self.contract_bundle.tool_entity_registrations,
+                            self.tool_entity_executors, strict=True)),
                     ("rgbd_capture", self.rgbd_capture_executor, 5.0),
                     ("tcp_pose_comparison", self.tcp_pose_comparison_executor, 5.0),
                     ("object_state", self.object_state_executor, 5.0),
@@ -815,6 +821,7 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
     gripper_ports: Mapping[str, MujocoGripperControlPort] | None = None,
     fast_grasp_planner: Any | None = None,
     safe_motion_observation: MujocoObservedSafeMotionConfig | None = None,
+    tool_entity_by_side: Mapping[str, Any] | None = None,
 ) -> MujocoAgentTcpPoseGatewaySession:
     """Wire exact Routes without starting the application or history recorder."""
 
@@ -1673,6 +1680,61 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
             clock=runtime_clock,
             source_binding_hash=back_projection_registration.profile.semantic_content_hash,
             planning_clearance_padding_m=application.target.planned_tcp_motion.planning_clearance_padding_m)
+    tool_entity_executors = ()
+    if contract_bundle.tool_entity_registrations:
+        from agent_gateway.profiles.tool_entity import (
+            build_tool_hover_executor,
+            build_tool_object_relation_executor,
+        )
+        from robot_motion.tool_entity_scene import RELATION_MAXIMUM_DEPTH_M
+
+        from .tool_entity import MujocoToolHoverPlanner, MujocoToolScenePort
+
+        if back_projection_capture_port is None or back_projection_registration is None or not tool_entity_by_side:
+            raise ValueError("MuJoCo tool-entity Routes require original RGB-D and reviewed tool entities.")
+        tool_scene_port = MujocoToolScenePort(application=application, capture_port=back_projection_capture_port,
+            source_binding_hash=back_projection_registration.profile.semantic_content_hash,
+            tool_profile_path_by_side={side: getattr(application.task_config, side + "_tool_profile_path")
+                                       for side in ("left", "right")})
+        for tool_registration in contract_bundle.tool_entity_registrations:
+            if tool_registration.skill.definition.skill_id == "perception.describe_tool_object_relations":
+                if segmentation_provider is None:
+                    raise ValueError("MuJoCo tool-object relations require the bound segmenter.")
+                tool_executor = build_tool_object_relation_executor(registration=tool_registration,
+                    scene_port=tool_scene_port, segmentation_provider=segmentation_provider,
+                    tool_entity_by_side=tool_entity_by_side,
+                    maximum_depth_m=min(RELATION_MAXIMUM_DEPTH_M,
+                                        back_projection_registration.profile.maximum_depth_m),
+                    current_station_revision=lambda: observation_producer.current_station_revision,
+                    clock=runtime_clock, max_retained_operations=retention)
+            else:
+                if observed_planning_provider is None or contract_bundle.safe_tcp_pose_contract is None:
+                    raise ValueError("MuJoCo tool hover queries require the observed safe TCP scene.")
+                tool_anchor = next(item for item in contract_bundle.surface_anchor_registrations
+                    if item.skill.definition.skill_id == "perception.capture_surface_anchor"
+                    and item.skill.definition.skill_version == "2")
+                tool_safety = application.tcp_pose_envelope_runtime
+                tool_safe_route = contract_bundle.route_manifest.route("motion.move_tcp_to_pose_safe", "1").route
+                tool_motion_profile = contract_bundle.safe_tcp_pose_contract.motion_profile
+
+                def prepare_tool_projection():
+                    project = tool_safety.planning_projector_for_route(route_id=tool_safe_route.route_id)
+                    return (project, canonical_content_hash({"profile": tool_motion_profile.semantic_content_hash,
+                        "reference": tool_safety.snapshot().safety_reference_hash},
+                        domain="agenticrobot.object_goal_query.constraint.v1"))
+
+                tool_executor = build_tool_hover_executor(registration=tool_registration,
+                    capture_registration=tool_anchor, scene_port=tool_scene_port,
+                    planner_port=MujocoToolHoverPlanner(provider=observed_planning_provider, application=application,
+                        scene_port=tool_scene_port, motion_profile=tool_motion_profile,
+                        prepare_projection=prepare_tool_projection),
+                    tool_entity_by_side=tool_entity_by_side, store=artifact_store,
+                    lookup_operation=lookup_retained_operation,
+                    current_station_revision=lambda: observation_producer.current_station_revision,
+                    clock=runtime_clock, clock_domain_id=runtime.config.clock_domain_id,
+                    max_retained_operations=retention)
+            execution_port_by_route_hash[tool_registration.entry.route.semantic_content_hash] = tool_executor
+            tool_entity_executors += (tool_executor,)
     planned_executors = {}
     for skill_id, version, label, safe_contract in (
         ('motion.move_to_observed_point', "1", 'observed-point-safe', contract_bundle.observed_point_contract),
@@ -1970,6 +2032,7 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
         localization_provider=localization_provider,
         localization_executor=localization_executor,
         surface_anchor_executors=surface_anchor_executors,
+        tool_entity_executors=tool_entity_executors,
         depth_executor=depth_executor,
         rgb_executor=rgb_executor,
         rgbd_capture_executor=rgbd_capture_executor,

@@ -4,7 +4,11 @@
 consumer of the production surface selection, spatial-goal solver and observed
 safe TCP planner. It supports direct lower queries and Agent experiments on the
 same saved time node. It does not advertise a new production Skill or replace
-the admitted RealMan/MuJoCo Gateway execution lifecycle.
+the admitted RealMan/MuJoCo Gateway execution lifecycle. Its gripper-object
+relation and gripper-entity hover evaluations come from
+`robot_motion.tool_entity_scene`, the code the RealMan and MuJoCo Gateways
+publish as `perception.describe_tool_object_relations@1` and
+`perception.query_tool_hover_paths@1`.
 
 First export an accepted operator sample through the existing
 `load_operator_scene_sample` entry when that separate codec leaf is installed.
@@ -187,14 +191,23 @@ box instead of the TCP:
 
 Proposals are ordered nearest to the current gripper state, centre, face
 centres, then Halton fill, inset by the arrival tolerance. They run through
-the same budgeted region loop as `plan_relation_region` (20 s, 3 s per
-candidate, optional session budget) and the same planner. A found plan is
+the same budgeted region loop as `plan_relation_region` (20 s, optional
+session budget) and the same planner, with 5 s per candidate instead of 3 s
+(2026-10-29: on the saved samples a 45-degree cone found 3/12 paths at
+3 s/20 s and 8/12 at 5 s/20 s). A found plan is
 accepted only if the achieved FK pose, re-measured with the same geometry,
 satisfies the ORIGINAL bounds; for `tool_axis_down` the achieved approach axis
 must also lie inside the cone within the arrival rotation tolerance. The audit
 keeps per-candidate support height, footprint and overhead counts, and the
-entity identity. This is an offline query semantic, not a published Gateway
-Skill or a change to the existing TCP relation and region semantics.
+entity identity. The same geometry and search are published on the RealMan
+and MuJoCo Gateways as `perception.query_tool_hover_paths@1` (see
+[`tool_entity_skills.zh-CN.md`](../agent_gateway/tool_entity_skills.zh-CN.md));
+this probe does not change the existing TCP relation and region semantics.
+Two differences matter when comparing the probe with the Gateway Skill: the
+probe evaluates `tip_offset_bounds_xy_m` in `dual_arm_solver_world`, while the
+Gateway uses the public Station frame (rotated 180 degrees about Z), so convert
+one-sided X/Y bounds; and hover proposals retry the planner's per-target
+rejections (the Gateway hover set), while TCP regions keep their original set.
 
 ## Gripper-object relations
 

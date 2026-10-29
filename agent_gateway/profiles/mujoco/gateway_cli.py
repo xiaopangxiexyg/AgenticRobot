@@ -226,6 +226,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--enable-surface-anchor-v3', action='store_true', help='Publish source-bound anchors consuming retained capture_rgb v3 and optional segment v3; requires the explicit v2 family.')
     parser.add_argument('--surface-anchor-selection-policy', choices=('prompt_nearest', 'max_clearance_medoid'), default='prompt_nearest', help='Explicit v2 max-clearance tie profile; default preserves prompt-nearest selection.')
     parser.add_argument('--enable-relation-goal-queries', action='store_true', help='Expose one general anchored relation-path query; requires --enable-surface-anchors.')
+    parser.add_argument('--enable-tool-object-relations', action='store_true',
+        help=('Publish read-only perception.describe_tool_object_relations@1 (segmented frozen multi-view RGB-D vs the '
+              'reviewed DMTAC gripper, same implementation as the RealMan Gateway); requires --artifact-root, '
+              'segmentation and --enable-safe-tcp-pose (owner of the frozen capture).'))
+    parser.add_argument('--enable-tool-hover-queries', action='store_true',
+        help=('Publish read-only perception.query_tool_hover_paths@1 (gripper-box hover paths checked on the observed '
+              'RGB-D scene by a private safe TCP planner, never activated); requires --enable-surface-anchor-v2 and '
+              '--enable-observed-point-motion.'))
     parser.add_argument('--safe-tcp-motion-profile', choices=tuple(MUJOCO_SAFE_TCP_MOTION_PROFILES), default='local_step', help='Explicit sim-only safe Route limits; ordinary Routes stay unchanged.')
     parser.add_argument(
         "--enable-spatial-goals",
@@ -259,6 +267,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--safe-motion-observation-role', action='append',
         choices=('main', 'wrist_left', 'wrist_right'),
         help='Required RGB-D view for observed safe planning; repeat for multiple views.')
+    clearance = parser.add_mutually_exclusive_group()
+    clearance.add_argument('--enable-inherited-start-clearance', dest='enable_inherited_start_clearance',
+        action='store_const', const=True,
+        help='Certified egress from a positive-distance observed start inside the clearance margin; '
+             'the default whenever an observed safe-motion scene is configured.')
+    clearance.add_argument('--strict-start-clearance', dest='enable_inherited_start_clearance',
+        action='store_const', const=False,
+        help='Reject observed safe-motion starts inside the ordinary clearance margin (the previous default).')
+    parser.set_defaults(enable_inherited_start_clearance=None)
     parser.add_argument(
         "--enable-grippers",
         action="store_true",
@@ -368,6 +385,18 @@ def _resolved_runtime_session_id(explicit: str | None) -> str:
     if explicit is not None:
         return explicit
     return "dexteleop-agent-mujoco-tcp-pose:" + uuid.uuid4().hex
+
+
+def _effective_inherited_start_clearance(args: argparse.Namespace) -> bool:
+    """Positive-start egress is the observed safe-move default, as on RealMan.
+
+    The mode exists only with an observed scene: without one, start admission
+    stays strict and every profile identity is unchanged. Contact and
+    penetration remain rejected by the planner either way.
+    """
+    if args.enable_inherited_start_clearance is None:
+        return bool(args.enable_observed_point_motion)
+    return bool(args.enable_inherited_start_clearance)
 
 
 def _ready_payload(
@@ -536,6 +565,7 @@ def _segmentation_requested(args):
         or args.enable_segmentation_batch_v2
         or args.enable_segmentation_geometry_v3
         or args.enable_surface_anchor_v2
+        or args.enable_tool_object_relations
     )
 
 
@@ -662,6 +692,8 @@ def main(argv: list[str] | None = None) -> int:
         or args.enable_relation_tcp_continuation_queries
         or args.enable_region_tcp_continuation_queries
         or args.enable_relation_goal_queries
+        or args.enable_tool_object_relations
+        or args.enable_tool_hover_queries
         or args.history_root is not None
         or args.segmentation_asset_bundle is not None
         or args.sam3_endpoint is not None
@@ -672,6 +704,10 @@ def main(argv: list[str] | None = None) -> int:
         )
     if args.enable_surface_anchor_v2 and not args.enable_surface_anchors:
         parser.error("--enable-surface-anchor-v2 requires surface anchors and segmentation")
+    if args.enable_tool_object_relations and (args.artifact_root is None or not args.enable_safe_tcp_pose):
+        parser.error("--enable-tool-object-relations requires --artifact-root, segmentation and --enable-safe-tcp-pose")
+    if args.enable_tool_hover_queries and not (args.enable_surface_anchor_v2 and args.enable_observed_point_motion):
+        parser.error("--enable-tool-hover-queries requires --enable-surface-anchor-v2 and --enable-observed-point-motion")
     if args.sam3_multi_instance_text and not args.enable_object_localization:
         parser.error("--sam3-multi-instance-text requires --enable-object-localization")
     if args.enable_object_support_motion_v2 != bool(args.object_support_body):
@@ -735,6 +771,9 @@ def main(argv: list[str] | None = None) -> int:
             or args.safe_motion_observation_collision_scene_profile is not None
             or args.safe_motion_observation_role):
         parser.error("safe motion observation options require --enable-observed-point-motion")
+    if args.enable_inherited_start_clearance and not args.enable_observed_point_motion:
+        parser.error("--enable-inherited-start-clearance requires --enable-observed-point-motion "
+                     "and its safe motion observation options")
     if args.enable_safe_tcp_path_constraints and not args.enable_safe_tcp_pose:
         parser.error("--enable-safe-tcp-path-constraints requires --enable-safe-tcp-pose")
     if args.enable_tcp_continuation_queries and not args.enable_safe_tcp_path_constraints:
@@ -815,13 +854,20 @@ def main(argv: list[str] | None = None) -> int:
         if not urdf.is_file():
             parser.error("--safe-motion-observation-urdf must be an existing file")
         from robot_motion.observed_scene import SafeMotionObservationConfig
+        from sim.mujoco.deploy.planned_tcp_motion import (
+            OBSERVED_START_CLEARANCE_INHERITED,
+            OBSERVED_START_CLEARANCE_STRICT,
+        )
         from .motion_observed_scene import MujocoObservedSafeMotionConfig
         try:
             safe_motion_observation = MujocoObservedSafeMotionConfig(
                 robot_urdf_path=urdf,
                 collision_scene_profile=args.safe_motion_observation_collision_scene_profile,
                 observation=SafeMotionObservationConfig(
-                    roles=tuple(args.safe_motion_observation_role)))
+                    roles=tuple(args.safe_motion_observation_role)),
+                start_clearance=(OBSERVED_START_CLEARANCE_INHERITED
+                    if _effective_inherited_start_clearance(args)
+                    else OBSERVED_START_CLEARANCE_STRICT))
         except (OSError, TypeError, ValueError) as error:
             parser.error(f"invalid safe motion observation configuration: {error}")
 
@@ -863,6 +909,8 @@ def main(argv: list[str] | None = None) -> int:
         enable_anchor_region_motion_v3=args.enable_anchor_region_motion_v3,
         enable_anchor_hover_motion_v4=args.enable_anchor_hover_motion_v4,
         safe_motion_observation=safe_motion_observation,
+        enable_tool_object_relations=args.enable_tool_object_relations,
+        enable_tool_hover_queries=args.enable_tool_hover_queries,
         enable_safe_tcp_path_constraints=args.enable_safe_tcp_path_constraints,
         enable_tcp_continuation_queries=args.enable_tcp_continuation_queries,
         enable_tcp_candidate_artifacts=args.enable_tcp_candidate_artifacts,
