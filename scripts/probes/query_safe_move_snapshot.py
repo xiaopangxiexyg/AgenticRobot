@@ -10,11 +10,9 @@ from __future__ import annotations
 
 import argparse
 import copy
-import dataclasses
 import hashlib
 import json
 import math
-from collections.abc import Mapping
 from pathlib import Path
 import threading
 import time
@@ -33,9 +31,17 @@ from robot_motion.relative_action import pose_matrix_to_xyzquat, xyzquat_to_pose
 from robot_motion.spatial_goals import compute_spatial_goal, finite_vector
 from robot_motion.spatial_goal_regions import generate_relation_region_goals, generate_proximity_region_goals
 from robot_motion.tool_entity_goals import (
-    HOVER_ORIENTATION_POLICIES, TOOL_ENTITY_HOVER_SEMANTICS_V1, TOOL_OBJECT_RELATION_SEMANTICS_V1,
-    ToolEntityBox, entity_hover_metrics, fuse_tool_object_relations, generate_entity_hover_goals,
-    hover_orientation, object_surface_cluster, tool_axis_tilt_rad, tool_object_relation,
+    HOVER_ORIENTATION_POLICIES, TOOL_ENTITY_HOVER_SEMANTICS_V1, ToolEntityBox, hover_orientation,
+)
+# Shared with the RealMan and MuJoCo Gateways; re-exported for existing callers.
+from robot_motion.tool_entity_scene import (  # noqa: F401
+    ENTITY_HOVER_SUPPORT_WINDOW_M, OBJECT_MASK_EROSION_PX, SURFACE_AMBIGUITY_MINIMUM_VOXELS,
+    SURFACE_AMBIGUITY_SHARE, MeasuredObjectSurface, describe_tool_object_relations as _describe_relations,
+    entity_hover_proposals, hover_candidate_relation, object_surface_from_mask, pose_matrix as _pose_matrix,
+    validate_entity_hover_endpoint,
+)
+from deployments.perception.dmtac_tool_entity import (  # noqa: F401
+    default_tool_entity_by_side, dmtac_open_sensor_contact_solids,
 )
 from scripts.probes.inspect_safe_move_snapshot import (
     RM65CapturedRobotObservationFilterConfig, backproject, load_captures, resolve_inputs,
@@ -47,148 +53,6 @@ from teleop_runtime.skill_deploy.rm65_grasp_trajectory import (
 )
 from teleop_runtime.skill_deploy.rm65_lower_assembly import bind_exclusive_rm65_skill_target_safety
 from scipy.spatial.transform import Rotation
-
-# Height above the anchor below which observed points count as support under a
-# hovering tool footprint; higher points are reported as overhead obstacles.
-ENTITY_HOVER_SUPPORT_WINDOW_M = 0.30
-# Saved object masks are eroded before back-projection so boundary pixels
-# (mask bleed, mixed depth) do not become object surface evidence.
-OBJECT_MASK_EROSION_PX = 2
-# A view whose second-largest surface component reaches this share of the kept
-# one (and at least 10 voxels) is reported as ambiguous; the class still uses
-# the largest component. On the 21 saved samples every disagreeing secondary
-# component was mask bleed onto another object or a gripper part.
-SURFACE_AMBIGUITY_SHARE = 0.25
-SURFACE_AMBIGUITY_MINIMUM_VOXELS = 10
-
-
-def object_surface_from_mask(mask, capture, *, maximum_depth_m, robot_mask=None):
-    """Measured surface of one saved object mask: eroded, valid depth, largest cluster.
-
-    ``robot_mask`` optionally marks pixels known to show the robot; they are
-    never object evidence. (The planning self-filter is deliberately generous
-    and also erases object points next to the gripper, so it is not used for
-    relations.) Returns ``(points, evidence)``; ``points`` is ``None`` when no
-    valid measured pixel remains. Observation only: never a pose or full shape.
-    """
-    from scipy import ndimage
-
-    eroded = ndimage.binary_erosion(np.asarray(mask, dtype=bool), iterations=OBJECT_MASK_EROSION_PX)
-    depth = capture.depth_m
-    eroded &= np.isfinite(depth) & (depth > 0) & (depth <= maximum_depth_m)
-    robot_removed = 0
-    if robot_mask is not None:
-        robot = np.asarray(robot_mask, dtype=bool)
-        if robot.shape != eroded.shape:
-            raise ValueError("Robot mask must match the object mask frame.")
-        robot_removed = int(np.count_nonzero(eroded & robot))
-        eroded &= ~robot
-    evidence = {"mask_erosion_px": OBJECT_MASK_EROSION_PX, "robot_pixels_removed": robot_removed,
-                "robot_mask_applied": robot_mask is not None,
-                "valid_pixel_count": int(np.count_nonzero(eroded))}
-    if not evidence["valid_pixel_count"]:
-        return None, evidence
-    points, _, _ = backproject(depth, capture.intrinsics, capture.source_from_camera, eroded)
-    surface, cluster = object_surface_cluster(points)
-    return surface, {**evidence, **cluster}
-
-
-def dmtac_open_sensor_contact_solids(urdf_path, tool_tcp_pose_flange_m_rad_by_side):
-    """URDF DMTAC sensor collision boxes at the neutral (open) gripper, per TCP frame.
-
-    The grasp-screening finger solids are 19.9 mm thick; the station URDF's
-    sensor collision boxes are 48 mm along the closing axis and reach about
-    30 mm beyond them when open (identical in the MuJoCo twin). They are
-    returned as contact-only solids for arms with the reviewed TCP; an arm
-    without exactly two such boxes gets none.
-    """
-    import pinocchio as pin
-    from deployments.perception.dmtac_grasp_overlay import DMTAC_M_REVIEWED_TOOL_TCP_POSE_FLANGE_M_RAD
-
-    path = Path(urdf_path).resolve(strict=True)
-    model = pin.buildModelFromUrdf(str(path))
-    geometry = pin.buildGeomFromUrdf(model, str(path), pin.GeometryType.COLLISION,
-                                     package_dirs=[str(path.parent), str(path.parent.parent)])
-    data, geometry_data = model.createData(), pin.GeometryData(geometry)
-    q = pin.neutral(model)
-    # The v5 screening alignment is defined at gripper_master_q_rad == 0 (its
-    # loader enforces it); require q=0 to be the open end of every gripper joint.
-    for joint_id in range(1, model.njoints):
-        name = model.names[joint_id]
-        if "_eg2_4b2_cad_" in name and model.joints[joint_id].nq == 1:
-            index = model.joints[joint_id].idx_q
-            if not np.isclose(model.lowerPositionLimit[index], 0.) or not np.isclose(q[index], 0.):
-                raise ValueError("Open DMTAC sensor boxes require q=0 at the open joint limit.")
-    pin.forwardKinematics(model, data, q)
-    pin.updateFramePlacements(model, data)
-    pin.updateGeometryPlacements(model, data, geometry, geometry_data, q)
-    result = {}
-    for side, tcp in tool_tcp_pose_flange_m_rad_by_side.items():
-        if not np.allclose(np.asarray(tcp, dtype=float), DMTAC_M_REVIEWED_TOOL_TCP_POSE_FLANGE_M_RAD,
-                           atol=1e-9, rtol=0.):
-            continue
-        frame = side + "_arm_link6"
-        if not model.existFrame(frame):
-            continue
-        flange_from_tcp = np.eye(4)
-        flange_from_tcp[:3, :3] = Rotation.from_euler("xyz", np.asarray(tcp[3:], dtype=float)).as_matrix()
-        flange_from_tcp[:3, 3] = np.asarray(tcp[:3], dtype=float)
-        world_from_tcp = data.oMf[model.getFrameId(frame)].homogeneous @ flange_from_tcp
-        solids = []
-        for index, item in enumerate(geometry.geometryObjects):
-            half = getattr(item.geometry, "halfSide", None)
-            if half is None or not item.name.startswith(side + "_gripper_") or "dm_tac_w2m_sensor" not in item.name:
-                continue
-            pose = np.linalg.inv(world_from_tcp) @ geometry_data.oMg[index].homogeneous
-            solids.append((tuple(pose.reshape(-1)), tuple(float(x) for x in np.asarray(half))))
-        if len(solids) == 2:
-            result[side] = tuple(solids)
-    return result
-
-
-def default_tool_entity_by_side(tool_tcp_pose_flange_m_rad_by_side, tool_profile_by_side, *, urdf_path=None):
-    """Bind the nominal grasp-screening box only for a matching tool profile.
-
-    The DMTAC GraspGenX alignment v5 solid frame is defined relative to the
-    reviewed 140 mm tool TCP. The frozen profile must identify DMTAC M on the
-    same side as well; this nominal match does not prove physical installation.
-    Any other arm gets no entity, so entity queries fail instead of
-    reinterpreting the box. With ``urdf_path`` the URDF's open DMTAC sensor
-    boxes join as contact-only solids for tool-object relations; hover
-    geometry is unchanged.
-    """
-    from deployments.perception.dmtac_grasp_overlay import (
-        DMTAC_M_REVIEWED_TOOL_TCP_POSE_FLANGE_M_RAD, dmtac_graspgenx_alignment_profile,
-    )
-    alignment = dmtac_graspgenx_alignment_profile()
-    geometry = alignment.collision_geometry(maximum_opening_m=alignment.nominal_geometry.maximum_opening_m)
-    source = {"geometry": "graspgenx_screening_solids_maximum_opening_envelope",
-              "alignment_profile_id": alignment.profile_id,
-              "alignment_source_sha256": alignment.source_content_hash,
-              "collision_tip_extension_m": alignment.collision_tip_extension_m,
-              "tool_tcp_pose_flange_m_rad": list(DMTAC_M_REVIEWED_TOOL_TCP_POSE_FLANGE_M_RAD),
-              "opening_policy": "maximum_opening_envelope_v1"}
-    result = {}
-    contact = ({} if urdf_path is None
-               else dmtac_open_sensor_contact_solids(urdf_path, tool_tcp_pose_flange_m_rad_by_side))
-    for side, tcp in tool_tcp_pose_flange_m_rad_by_side.items():
-        profile = tool_profile_by_side.get(side)
-        if (isinstance(profile, Mapping) and profile.get("arm") == side
-                and profile.get("tool_name") == "DMTAC_M"
-                and np.allclose(np.asarray(tcp, dtype=float), DMTAC_M_REVIEWED_TOOL_TCP_POSE_FLANGE_M_RAD,
-                                atol=1e-9, rtol=0.)):
-            profile_identity = canonical_content_hash(
-                {key: value for key, value in profile.items() if not str(key).startswith("_")},
-                domain="agenticrobot.saved_tool_profile.v1")
-            entity = ToolEntityBox.from_parallel_jaw_geometry(geometry, source={
-                **source, "side": side, "tool_name": "DMTAC_M", "tool_profile_hash": profile_identity})
-            if side in contact:
-                entity = dataclasses.replace(entity, contact_solids=contact[side], source={
-                    **entity.source, "contact_solids": "urdf_dmtac_sensor_collision_boxes_open_v1",
-                    "contact_solids_urdf": Path(urdf_path).name})
-            result[side] = entity
-    return result
-
 
 class _RegionProposal:
     """One candidate pose with its audit relation and selection fields."""
@@ -212,15 +76,6 @@ def _snapshot_bounds(value):
             return frozen, tuple(audit) if isinstance(item, tuple) else audit
         return item, item
     return capture(copy.deepcopy(value))
-
-
-def _pose_matrix(pose_xyz_quat_xyzw):
-    """Full-precision pose matrix (the shared encoder rounds to float32)."""
-    pose = np.asarray(pose_xyz_quat_xyzw, dtype=float)
-    transform = np.eye(4)
-    transform[:3, :3] = Rotation.from_quat(pose[3:]).as_matrix()
-    transform[:3, 3] = pose[:3]
-    return transform
 
 
 def file_sha256(path: Path) -> str:
@@ -584,48 +439,23 @@ class SavedSceneSkillQuery:
             raise RuntimeError("A query is already running for this saved scene.")
         try:
             self._require_open()
-            views, grouped = [], {}
-            for anchor in self._anchors:
-                points = self._object_surfaces.get(anchor["reference"])
-                if points is None:
-                    continue
-                cluster = anchor.get("object_surface") or {}
-                surface = {key: cluster[key] for key in ("voxel_count", "component_count", "kept_voxel_count",
-                                                          "second_component_voxel_count") if key in cluster}
-                ambiguous = (None if "second_component_voxel_count" not in surface else bool(
-                    surface["second_component_voxel_count"] >= max(SURFACE_AMBIGUITY_MINIMUM_VOXELS,
-                        SURFACE_AMBIGUITY_SHARE * surface["kept_voxel_count"])))
-                capture_tcp = self._surface_tcp.get(anchor["reference"])
-                for side in sorted(self._tool_entities):
-                    pose = self._tcp[side] if capture_tcp is None else capture_tcp[side]
-                    relation = tool_object_relation(entity=self._tool_entities[side],
-                        world_from_tcp=_pose_matrix(pose), object_points_m=points)
-                    views.append({"side": side, "target_reference": anchor["reference"],
-                                  "label": anchor["label"], "role": anchor["role"], **relation.as_dict(),
-                                  "gripper_pose_source": ("planning_start_qpos" if capture_tcp is None
-                                                          else "frame_capture_qpos"),
-                                  "surface_ambiguous": ambiguous,
-                                  **({"surface_cluster": surface} if surface else {})})
-                    grouped.setdefault((side, anchor["label"]), []).append((relation, ambiguous))
-            objects = [{"side": side, "label": label,
-                        **fuse_tool_object_relations([relation for relation, _ in items]),
-                        "ambiguous_view_count": sum(flag is True for _, flag in items)}
-                       for (side, label), items in sorted(grouped.items())]
-            gripper = {side: {"screening_solids": "graspgenx_screening_solids_maximum_opening_envelope",
-                              "contact_solids": entity.source.get("contact_solids"),
-                              "contact_solid_count": len(entity.contact_solids)}
-                       for side, entity in sorted(self._tool_entities.items())}
+            surfaces = [MeasuredObjectSurface(reference=anchor["reference"], label=anchor["label"],
+                            role=anchor["role"], points_m=self._object_surfaces[anchor["reference"]],
+                            surface_cluster=anchor.get("object_surface") or {},
+                            tcp_pose_by_side=self._surface_tcp.get(anchor["reference"]))
+                        for anchor in self._anchors if anchor["reference"] in self._object_surfaces]
+            shared = _describe_relations(surfaces=surfaces, tool_entity_by_side=self._tool_entities,
+                                         fallback_tcp_pose_by_side=self._tcp)
             result = {"scope": "one_saved_time_node_no_execution",
-                    "semantics": TOOL_OBJECT_RELATION_SEMANTICS_V1,
-                    "reference_frame_id": self._frame, "objects": objects, "views": views,
-                    "evaluated_sides": sorted(self._tool_entities),
-                    "unbound_sides": sorted({"left", "right"} - set(self._tool_entities)),
-                    "gripper_geometry_by_side": gripper,
+                    "semantics": shared["semantics"],
+                    "reference_frame_id": self._frame, "objects": shared["objects"], "views": shared["views"],
+                    "evaluated_sides": shared["evaluated_sides"],
+                    "unbound_sides": shared["unbound_sides"],
+                    "gripper_geometry_by_side": shared["gripper_geometry_by_side"],
                     "unmeasured_references": [a["reference"] for a in self._anchors
                         if a["kind"] == "saved_visible_surface_point"
                         and a["reference"] not in self._object_surfaces],
-                    "evidence_scope": ("measured_visible_surfaces_vs_gripper_screening_solids"
-                                       "_and_bound_contact_solids")}
+                    "evidence_scope": shared["evidence_scope"]}
             self._relation_reads.append(copy.deepcopy(result))
             return result
         finally:
@@ -827,45 +657,28 @@ class SavedSceneSkillQuery:
                 "tool_entity": entity.identity()}
 
         def generate():
-            candidates = generate_entity_hover_goals(
-                current_tcp_pose_xyz_quat_xyzw=list(self._tcp[side]), anchor_xyz_m=anchor.tolist(),
+            candidates = entity_hover_proposals(entity=entity, anchor_xyz_m=anchor.tolist(),
+                current_tcp_pose_xyz_quat_xyzw=list(self._tcp[side]),
                 tip_offset_bounds_xy_m=bounds["tip"], clearance_bounds_m=bounds["clearance"],
-                entity=entity, points_m=points, orientation_policy=orientation_policy,
+                points_m=points, support_margin_m=margin, orientation_policy=orientation_policy,
                 max_candidates=max_candidates,
                 boundary_inset_m=RealAgentPrimitiveConvergenceProfile().translation_tolerance_m,
-                support_window_m=window, support_margin_m=margin,
                 tool_axis_max_tilt_rad=tool_axis_max_tilt_rad)
             return [_RegionProposal(pose=candidate.pose_xyz_quat_xyzw,
-                        relation={"entity_hover": {"tip_offset_xy_m": list(candidate.tip_offset_xy_m),
-                            "clearance_m": candidate.clearance_m,
-                            "support_height_m": candidate.metrics.support_height_m,
-                            "footprint_point_count": candidate.metrics.footprint_point_count,
-                            "overhead_point_count": candidate.metrics.overhead_point_count,
-                            "orientation_policy": orientation_policy,
-                            "tool_axis_max_tilt_rad": tool_axis_max_tilt_rad}},
+                        relation={"entity_hover": hover_candidate_relation(candidate,
+                            orientation_policy=orientation_policy,
+                            tool_axis_max_tilt_rad=tool_axis_max_tilt_rad)},
                         selection={"selected_tip_offset_xy_m": list(candidate.tip_offset_xy_m),
                                    "selected_clearance_m": candidate.clearance_m})
                     for candidate in candidates]
 
         def validate(row):
-            metrics = entity_hover_metrics(entity=entity,
-                world_from_tcp=_pose_matrix(row["planned_endpoint_pose_xyz_quat_xyzw"]),
-                anchor_xyz_m=anchor, points_m=points, support_window_m=window, support_margin_m=margin)
-            (x_low, x_high), (y_low, y_high) = bounds["tip"]
-            c_low, c_high = bounds["clearance"]
-            dx, dy = metrics.tip_offset_xy_m
-            within = (x_low - 1e-9 <= dx <= x_high + 1e-9 and y_low - 1e-9 <= dy <= y_high + 1e-9
-                      and c_low - 1e-9 <= metrics.clearance_m <= c_high + 1e-9)
-            record = {"achieved_tip_offset_xy_m": [dx, dy], "achieved_clearance_m": metrics.clearance_m,
-                      "achieved_support_height_m": metrics.support_height_m,
-                      "achieved_footprint_point_count": metrics.footprint_point_count}
-            if orientation_policy == "tool_axis_down":
-                tilt = tool_axis_tilt_rad(_pose_matrix(row["planned_endpoint_pose_xyz_quat_xyzw"])[:3, :3])
-                record["achieved_tool_axis_tilt_rad"] = tilt
-                within = within and tilt <= (tool_axis_max_tilt_rad + 1e-9
-                    + RealAgentPrimitiveConvergenceProfile().rotation_tolerance_rad)
-            record["inside_requested_region"] = within
-            return record, within
+            return validate_entity_hover_endpoint(entity=entity,
+                endpoint_pose_xyz_quat_xyzw=row["planned_endpoint_pose_xyz_quat_xyzw"], anchor_xyz_m=anchor,
+                points_m=points, support_margin_m=margin, tip_offset_bounds_xy_m=bounds["tip"],
+                clearance_bounds_m=bounds["clearance"], orientation_policy=orientation_policy,
+                tool_axis_max_tilt_rad=tool_axis_max_tilt_rad,
+                rotation_tolerance_rad=RealAgentPrimitiveConvergenceProfile().rotation_tolerance_rad)
 
         return self._search_region_locked(side=side, target_reference=target_reference,
             summary_fields=summary_fields, began=began,

@@ -292,7 +292,8 @@ def test_factory_defaults_to_inherited_clearance_and_binds_strict_opt_out(input_
         return Planner()
     monkeypatch.setattr(module, "RM65GraspJointTrajectoryPlanner", create_planner)
     # The URDF contact solids are native geometry, covered by their own test.
-    monkeypatch.setattr(module, "dmtac_open_sensor_contact_solids", lambda *_a, **_k: {})
+    from deployments.perception import dmtac_tool_entity
+    monkeypatch.setattr(dmtac_tool_entity, "dmtac_open_sensor_contact_solids", lambda *_a, **_k: {})
     for kwargs, enabled in (({}, True), ({"enable_inherited_start_clearance": True}, True),
                             ({"enable_inherited_start_clearance": False}, False)):
         query = SavedSceneSkillQuery.from_manifest(input_manifest, **kwargs)
