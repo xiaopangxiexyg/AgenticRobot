@@ -115,6 +115,52 @@ def _tcp_points(view: HeldObjectView) -> np.ndarray:
     return (view.points_world_m - pose[:3, 3]) @ pose[:3, :3]
 
 
+HELD_OBJECT_SEED_REGION_SHRINK_M = 0.003
+HELD_OBJECT_SEED_MINIMUM_PIXELS = 15
+
+
+def grip_seed_pixel(*, depth_m, intrinsics, world_from_camera, world_from_tcp, entity: ToolEntityBox,
+                    maximum_depth_m: float, stride_px: int = 2) -> tuple[tuple[int, int] | None, int]:
+    """Pixel showing the held object between the pads, for a point-prompt segmentation.
+
+    Back-projects the view's valid depth (every ``stride_px`` pixel), keeps
+    pixels whose 3D point lies inside the gripper's closing region shrunk by
+    3 mm (never a finger or palm surface) and returns the one nearest the
+    region centre with the number of such pixels. ``None`` when fewer than
+    ``HELD_OBJECT_SEED_MINIMUM_PIXELS`` pixels see anything between the pads
+    (empty gripper, dropped object or occluded view).
+    """
+    if entity.grasp_region is None:
+        raise ValueError("Seed selection needs the gripper closing region.")
+    depth = np.asarray(depth_m, dtype=float)
+    rows, cols = np.mgrid[0:depth.shape[0]:stride_px, 0:depth.shape[1]:stride_px]
+    z = depth[rows, cols]
+    valid = np.isfinite(z) & (z > 0) & (z <= maximum_depth_m)
+    if not np.any(valid):
+        return None, 0
+    rows, cols, z = rows[valid], cols[valid], z[valid]
+    fx, fy = float(intrinsics["fx"]), float(intrinsics["fy"])
+    cx, cy = float(intrinsics["cx"]), float(intrinsics["cy"])
+    camera = np.column_stack(((cols - cx) * z / fx, (rows - cy) * z / fy, z))
+    pose = np.asarray(world_from_camera, dtype=float).reshape(4, 4)
+    world = camera @ pose[:3, :3].T + pose[:3, 3]
+    tcp = np.asarray(world_from_tcp, dtype=float).reshape(4, 4)
+    local = (world - tcp[:3, 3]) @ tcp[:3, :3]
+    rotation = np.asarray(entity.tcp_from_box_rotation, dtype=float).reshape(3, 3)
+    centre, half = (np.asarray(value, dtype=float) for value in entity.grasp_region)
+    shrunk = np.maximum(half - HELD_OBJECT_SEED_REGION_SHRINK_M, 1e-4)
+    in_region = np.all(np.abs((local - centre) @ rotation) < shrunk, axis=1)
+    count = int(np.count_nonzero(in_region))
+    if count < HELD_OBJECT_SEED_MINIMUM_PIXELS:
+        return None, count
+    candidates = np.flatnonzero(in_region)
+    # The pixel nearest the image centroid of all closing-region pixels lies
+    # inside the visible object part, away from its depth-bleeding boundary.
+    pixels = np.column_stack((cols[candidates], rows[candidates])).astype(float)
+    best = candidates[int(np.argmin(np.linalg.norm(pixels - pixels.mean(axis=0), axis=1)))]
+    return (int(cols[best]), int(rows[best])), count
+
+
 def measure_held_object_box(*, views: Sequence[HeldObjectView], entity: ToolEntityBox,
                             support_plane: SupportPlane | None = None,
                             margin_m: float = HELD_OBJECT_BOX_MARGIN_M) -> HeldObjectBox:
@@ -214,4 +260,4 @@ def measure_held_object_box(*, views: Sequence[HeldObjectView], entity: ToolEnti
 
 
 __all__ = ["HELD_OBJECT_BOX_SEMANTICS_V1", "HeldObjectBox", "HeldObjectView", "SupportPlane",
-           "measure_held_object_box"]
+           "grip_seed_pixel", "measure_held_object_box"]

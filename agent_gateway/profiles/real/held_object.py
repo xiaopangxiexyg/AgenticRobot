@@ -2,7 +2,9 @@
 
 One observation captures stationary aligned RGB-D views (each with its
 capture-time dual-arm qpos), segments the named object with the deployment's
-text segmentation in every view, measures each view's object surface and
+text segmentation in every view (or, without a text prompt, from a point
+prompt at the pixel showing something between the pads), measures each view's
+object surface and
 fuses them in the holding tool frame (``robot_motion.held_object_measurement``).
 The optional gripper sample adds the measured closure. Nothing here moves the
 robot, commands a gripper or grants motion authority; a planner only accepts
@@ -13,7 +15,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 import numpy as np
 
@@ -23,6 +25,7 @@ from robot_motion.held_object_measurement import (
     HeldObjectBox,
     HeldObjectView,
     SupportPlane,
+    grip_seed_pixel,
     measure_held_object_box,
 )
 from robot_motion.relative_action import xyzquat_to_pose_matrix
@@ -44,7 +47,7 @@ class RealHeldObjectObservation:
 
     side: str
     label: str
-    language_prompt: str
+    language_prompt: str | None
     station_revision: int
     capture_qpos_by_side: Mapping[str, tuple[float, ...]]
     world_from_tcp: np.ndarray
@@ -121,14 +124,21 @@ class RealHeldObjectObserver:
         self.gripper_state_by_side = dict(gripper_state_by_side or {})
         self.maximum_depth_m = float(maximum_depth_m)
 
-    def observe(self, *, side: str, label: str, language_prompt: str, min_score: float,
+    def observe(self, *, side: str, label: str, language_prompt: str | None, min_score: float,
                 expected_station_revision: int, cancel_requested: Callable[[], bool],
                 support_plane: SupportPlane | None = None, roles: Sequence[str] | None = None,
                 captures=None) -> RealHeldObjectObservation:
+        """Measure ``side``'s held object.
+
+        With ``language_prompt`` every view is segmented by that text. Without
+        it each view is segmented from a point prompt at the pixel that shows
+        something inside the closing region between the pads; a view with no
+        such pixel reports ``no_object_between_fingers_in_view``.
+        """
         if side not in self.tool_entity_by_side:
             raise ValueError("Held-object observation needs this arm's reviewed gripper entity.")
-        if not isinstance(language_prompt, str) or not language_prompt.strip():
-            raise ValueError("Held-object observation needs the object's text prompt.")
+        if language_prompt is not None and (not isinstance(language_prompt, str) or not language_prompt.strip()):
+            raise ValueError("A held-object text prompt must be nonempty.")
         selected = self.roles if roles is None else tuple(roles)
         if captures is None:
             captures = tuple(self.scene_port.capture_views(
@@ -147,10 +157,22 @@ class RealHeldObjectObserver:
                         for s, q in capture.capture_qpos_by_side.items()}
             if cancel_requested():
                 raise InterruptedError("Held-object observation cancelled.")
+            tcp = xyzquat_to_pose_matrix(self.scene_port.tcp_pose_by_side(capture.capture_qpos_by_side)[side])
+            seed, region_pixels = None, None
+            if language_prompt is None:
+                seed, region_pixels = grip_seed_pixel(
+                    depth_m=capture.depth_m, intrinsics=capture.intrinsics,
+                    world_from_camera=np.asarray(capture.source_from_camera, dtype=float).reshape(4, 4),
+                    world_from_tcp=tcp, entity=entity, maximum_depth_m=self.maximum_depth_m)
+                if seed is None:
+                    unmeasured.append({"role": capture.role, "reason": "no_object_between_fingers_in_view",
+                                       "closing_region_pixel_count": region_pixels})
+                    continue
             prepared = self.segmentation_provider.try_segment_capture(
                 capture=self.scene_port.segmentation_input(capture),
                 parameters={"role": capture.role, "language_prompt": language_prompt,
-                            "target_pixel_uv": None, "min_score": float(min_score)})
+                            "target_pixel_uv": None if seed is None else list(seed),
+                            "min_score": float(min_score)})
             if prepared is None:
                 unmeasured.append({"role": capture.role, "reason": "no_mask_above_threshold"})
                 continue
@@ -161,19 +183,25 @@ class RealHeldObjectObserver:
                 expected_bounds=tuple(int(v) for v in evidence["mask_bounds_xyxy"]))
             points, surface = object_surface_from_mask(mask, capture, maximum_depth_m=self.maximum_depth_m)
             segments.append({"role": capture.role, "score": float(evidence["score"]),
+                             "prompt": "text" if seed is None else "closing_region_point",
+                             **({} if seed is None else {"seed_pixel_uv": list(seed),
+                                                         "closing_region_pixel_count": region_pixels}),
                              "mask_pixel_count": int(evidence["mask_pixel_count"]),
                              "mask_bounds_xyxy": [int(v) for v in evidence["mask_bounds_xyxy"]],
                              "valid_pixel_count": int(surface["valid_pixel_count"])})
             if points is None:
                 unmeasured.append({"role": capture.role, "reason": "no_valid_depth"})
                 continue
-            tcp = self.scene_port.tcp_pose_by_side(capture.capture_qpos_by_side)[side]
-            views.append(HeldObjectView(role=capture.role, points_world_m=points,
-                                        world_from_tcp=xyzquat_to_pose_matrix(tcp)))
+            views.append(HeldObjectView(role=capture.role, points_world_m=points, world_from_tcp=tcp))
         if qpos is None:
             raise RuntimeError("Held-object observation captured no view.")
         world_from_tcp = xyzquat_to_pose_matrix(self.scene_port.tcp_pose_by_side(qpos)[side])
         measurement = measure_held_object_box(views=views, entity=entity, support_plane=support_plane)
+        if (not views and unmeasured
+                and all(item["reason"] == "no_object_between_fingers_in_view" for item in unmeasured)):
+            # Every view sees the closing region empty: nothing is held there.
+            measurement = replace(measurement, status="not_between_fingers",
+                                  reason="no_object_between_fingers_in_any_view")
         gripper = None
         reader = self.gripper_state_by_side.get(side)
         if reader is not None:
