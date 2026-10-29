@@ -11,18 +11,18 @@ from agent_gateway.profiles.mujoco.motion_deployment import MujocoAgentTcpPoseMo
 from robot_motion.observed_planning import ObservedJointPlanningInput
 from robot_motion.observed_scene import SafeMotionObservationConfig
 from robot_motion.path_planning import JointConfigurationCheck
-from sim.mujoco.deploy.planned_tcp_motion import MujocoTcpPlanRejected
+from sim.mujoco.deploy.planned_tcp_motion import MujocoObservedJointPlanningInput, MujocoTcpPlanRejected
 
 pytestmark = [pytest.mark.unit, pytest.mark.contract]
 
 
-def _fixture(tmp_path, monkeypatch):
+def _fixture(tmp_path, monkeypatch, *, start_clearance="strict"):
     path = tmp_path / "robot.urdf"
     path.write_text('<robot name="fixture"/>')
     monkeypatch.setattr(module, "build_dual_arm_scene_profile", lambda name: SimpleNamespace(
         urdf_path=path, collision_pairs=(), fixed_scene_box_overrides=()))
     config = module.MujocoObservedSafeMotionConfig(path, "fixture:known-robot",
-        SafeMotionObservationConfig(roles=("main",)))
+        SafeMotionObservationConfig(roles=("main",)), start_clearance=start_clearance)
     profile = MujocoAgentTcpPoseMotionProfile(reference_frame_id="canonical_station",
         reference_frame_spec_hash="f"*64, frame_graph_hash="g"*64,
         tool_config_hash="t"*64, calibration_hash="c"*64,
@@ -131,6 +131,38 @@ def test_observation_policy_changes_exact_safe_profile_hash_only_when_enabled(tm
     assert replace(f.profile, profile_id="mujoco.agent_safe_tcp_pose.rgbd." + other.bound_profile_hash(
         minimum_clearance_m=.002, planning_clearance_padding_m=.002)).semantic_content_hash != f.profile.semantic_content_hash
     assert other.bound_profile_hash(minimum_clearance_m=.002, planning_clearance_padding_m=0.) != other.bound_profile_hash(
+        minimum_clearance_m=.002, planning_clearance_padding_m=.002)
+
+
+def test_start_clearance_changes_the_safe_profile_identity_only_when_inherited(tmp_path, monkeypatch):
+    f = _fixture(tmp_path, monkeypatch)
+    bound = {"minimum_clearance_m": .002, "planning_clearance_padding_m": .002}
+    # Captured at ed18f3952 with this fixture, before start_clearance existed.
+    assert f.config.start_clearance == "strict"
+    assert f.config.semantic_content_hash == "b1de324ce6ec4408937740397a4429033d8c5910d4540a2e6cd027292493fd25"
+    assert f.config.bound_profile_hash(**bound) == "58ced87bed5c820c3a2c1d6e44ef5dbee3d271078f53eaccf2190024b6813794"
+    inherited = replace(f.config, start_clearance="inherited-positive-v1")
+    assert inherited.semantic_content_hash != f.config.semantic_content_hash
+    assert inherited.bound_profile_hash(**bound) != f.config.bound_profile_hash(**bound)
+    inherited.require_resources_unchanged()
+    assert replace(f.profile, profile_id="mujoco.agent_safe_tcp_pose.rgbd." + inherited.bound_profile_hash(
+        **bound)).semantic_content_hash != f.profile.semantic_content_hash
+
+
+@pytest.mark.parametrize("value", ("STRICT", "", "inherited-positive-v2", None, True))
+def test_start_clearance_must_be_an_exact_reviewed_mode(tmp_path, monkeypatch, value):
+    f = _fixture(tmp_path, monkeypatch)
+    with pytest.raises(ValueError, match="start_clearance"):
+        replace(f.config, start_clearance=value)
+
+
+@pytest.mark.parametrize("mode", ("strict", "inherited-positive-v1"))
+def test_provider_carries_the_configured_start_clearance_to_the_planner(tmp_path, monkeypatch, mode):
+    f = _fixture(tmp_path, monkeypatch, start_clearance=mode)
+    source = f.provider.capture(operation_id="op:observed", expected_station_revision=3, cancel_requested=lambda: False)
+    assert isinstance(source, MujocoObservedJointPlanningInput) and isinstance(source, ObservedJointPlanningInput)
+    assert source.start_clearance == mode
+    assert f.provider.semantic_content_hash == f.config.bound_profile_hash(
         minimum_clearance_m=.002, planning_clearance_padding_m=.002)
 
 

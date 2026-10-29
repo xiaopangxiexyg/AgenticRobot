@@ -259,6 +259,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--safe-motion-observation-role', action='append',
         choices=('main', 'wrist_left', 'wrist_right'),
         help='Required RGB-D view for observed safe planning; repeat for multiple views.')
+    clearance = parser.add_mutually_exclusive_group()
+    clearance.add_argument('--enable-inherited-start-clearance', dest='enable_inherited_start_clearance',
+        action='store_const', const=True,
+        help='Certified egress from a positive-distance observed start inside the clearance margin; '
+             'the default whenever an observed safe-motion scene is configured.')
+    clearance.add_argument('--strict-start-clearance', dest='enable_inherited_start_clearance',
+        action='store_const', const=False,
+        help='Reject observed safe-motion starts inside the ordinary clearance margin (the previous default).')
+    parser.set_defaults(enable_inherited_start_clearance=None)
     parser.add_argument(
         "--enable-grippers",
         action="store_true",
@@ -368,6 +377,18 @@ def _resolved_runtime_session_id(explicit: str | None) -> str:
     if explicit is not None:
         return explicit
     return "dexteleop-agent-mujoco-tcp-pose:" + uuid.uuid4().hex
+
+
+def _effective_inherited_start_clearance(args: argparse.Namespace) -> bool:
+    """Positive-start egress is the observed safe-move default, as on RealMan.
+
+    The mode exists only with an observed scene: without one, start admission
+    stays strict and every profile identity is unchanged. Contact and
+    penetration remain rejected by the planner either way.
+    """
+    if args.enable_inherited_start_clearance is None:
+        return bool(args.enable_observed_point_motion)
+    return bool(args.enable_inherited_start_clearance)
 
 
 def _ready_payload(
@@ -735,6 +756,9 @@ def main(argv: list[str] | None = None) -> int:
             or args.safe_motion_observation_collision_scene_profile is not None
             or args.safe_motion_observation_role):
         parser.error("safe motion observation options require --enable-observed-point-motion")
+    if args.enable_inherited_start_clearance and not args.enable_observed_point_motion:
+        parser.error("--enable-inherited-start-clearance requires --enable-observed-point-motion "
+                     "and its safe motion observation options")
     if args.enable_safe_tcp_path_constraints and not args.enable_safe_tcp_pose:
         parser.error("--enable-safe-tcp-path-constraints requires --enable-safe-tcp-pose")
     if args.enable_tcp_continuation_queries and not args.enable_safe_tcp_path_constraints:
@@ -815,13 +839,20 @@ def main(argv: list[str] | None = None) -> int:
         if not urdf.is_file():
             parser.error("--safe-motion-observation-urdf must be an existing file")
         from robot_motion.observed_scene import SafeMotionObservationConfig
+        from sim.mujoco.deploy.planned_tcp_motion import (
+            OBSERVED_START_CLEARANCE_INHERITED,
+            OBSERVED_START_CLEARANCE_STRICT,
+        )
         from .motion_observed_scene import MujocoObservedSafeMotionConfig
         try:
             safe_motion_observation = MujocoObservedSafeMotionConfig(
                 robot_urdf_path=urdf,
                 collision_scene_profile=args.safe_motion_observation_collision_scene_profile,
                 observation=SafeMotionObservationConfig(
-                    roles=tuple(args.safe_motion_observation_role)))
+                    roles=tuple(args.safe_motion_observation_role)),
+                start_clearance=(OBSERVED_START_CLEARANCE_INHERITED
+                    if _effective_inherited_start_clearance(args)
+                    else OBSERVED_START_CLEARANCE_STRICT))
         except (OSError, TypeError, ValueError) as error:
             parser.error(f"invalid safe motion observation configuration: {error}")
 

@@ -759,6 +759,77 @@ def test_anchor_motion_cli_accepts_explicit_sam3_and_sensor_safe_assembly(monkey
     assert config.observation.roles == ("main",)
 
 
+def test_start_clearance_flags_are_exclusive_and_default_to_the_observed_scene():
+    parser = build_parser()
+    required = ["--socket-path", "/unused/socket", "--task-config", "/unused/task.json"]
+    assert parser.parse_args(required).enable_inherited_start_clearance is None
+    assert parser.parse_args([*required, "--strict-start-clearance"]).enable_inherited_start_clearance is False
+    assert parser.parse_args(
+        [*required, "--enable-inherited-start-clearance"]).enable_inherited_start_clearance is True
+    with pytest.raises(SystemExit) as both:
+        parser.parse_args([*required, "--strict-start-clearance", "--enable-inherited-start-clearance"])
+    assert both.value.code == 2
+    for observed, explicit, expected in ((False, None, False), (True, None, True),
+                                         (True, False, False), (True, True, True), (False, False, False)):
+        args = argparse.Namespace(enable_observed_point_motion=observed,
+                                  enable_inherited_start_clearance=explicit)
+        assert gateway_cli._effective_inherited_start_clearance(args) is expected
+
+
+@pytest.mark.parametrize("side", ("right", "left"))
+def test_inherited_start_clearance_without_observed_scene_fails_before_resources(monkeypatch, capsys, side):
+    def forbidden(*args, **kwargs):
+        pytest.fail("A missing observed scene must fail before path or resource work")
+
+    monkeypatch.setattr(gateway_cli, "_absolute_existing_file", forbidden)
+    monkeypatch.setattr(gateway_cli, "build_mujoco_agent_tcp_pose_gateway_session", forbidden)
+    with pytest.raises(SystemExit) as captured:
+        gateway_cli.main(["--socket-path", "/unused/socket", "--task-config", "/unused/task.json",
+                          "--motion-side", side, "--enable-inherited-start-clearance"])
+    assert captured.value.code == 2
+    assert "--enable-inherited-start-clearance requires --enable-observed-point-motion" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("flags,expected", [
+    ([], "inherited-positive-v1"),
+    (["--enable-inherited-start-clearance"], "inherited-positive-v1"),
+    (["--strict-start-clearance"], "strict"),
+])
+def test_observed_scene_start_clearance_reaches_the_safe_motion_config(monkeypatch, tmp_path, flags, expected):
+    from agent_gateway.profiles.mujoco.motion_observed_scene import MujocoObservedSafeMotionConfig
+    from robot_motion.observed_scene import SafeMotionObservationConfig
+
+    class AssemblyReached(Exception):
+        pass
+
+    received = {}
+
+    def assemble(**kwargs):
+        received.update(kwargs)
+        raise AssemblyReached
+
+    monkeypatch.setattr(gateway_cli, "build_mujoco_agent_tcp_pose_gateway_session", assemble)
+    root = gateway_cli.repo_root()
+    urdf = root / "assets/realman_dual_arm_inspire_gripper_dmtacm/realman_dual_arm_inspire_gripper_dmtacm.urdf"
+    artifacts = tmp_path / "artifacts"
+    artifacts.mkdir()
+    with pytest.raises(AssemblyReached):
+        gateway_cli.main(["--socket-path", str(tmp_path / "gateway.sock"),
+            "--task-config", str(root / "sim/configs/tasks/rm65_right_dmtacm_blue_cube_70mm_agent_v1.json"),
+            "--artifact-root", str(artifacts), "--no-realtime-worker",
+            "--enable-safe-tcp-pose", "--enable-observed-point-motion",
+            "--safe-motion-observation-urdf", str(urdf),
+            "--safe-motion-observation-collision-scene-profile", "dual_arm_hand_proxy_dmtac_grasp",
+            "--safe-motion-observation-role", "main", *flags])
+    config = received["safe_motion_observation"]
+    assert config.start_clearance == expected
+    # Opting out reproduces the identity of the previous strict-only config.
+    strict = MujocoObservedSafeMotionConfig(robot_urdf_path=urdf,
+        collision_scene_profile="dual_arm_hand_proxy_dmtac_grasp",
+        observation=SafeMotionObservationConfig(roles=("main",)))
+    assert (config.semantic_content_hash == strict.semantic_content_hash) is (expected == "strict")
+
+
 def test_surface_selection_profile_is_default_preserving_and_requires_v2_before_startup(capsys):
     assert build_parser().get_default("surface_anchor_selection_policy") == "prompt_nearest"
     with pytest.raises(SystemExit) as error:
