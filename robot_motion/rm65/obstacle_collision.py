@@ -592,17 +592,20 @@ class RM65ObstacleCollisionOracle:
             "query_mode": "inactive_component_minimum_distance",
             "active_component": active_component, "static_pair_count": len(pairs)})
 
-    def inherited_start_clearance(self, qpos_by_component, *, active_component: str):
+    def inherited_start_clearance(self, qpos_by_component, *, active_component: str,
+                                  allow_start_contact: bool = False):
         """Bind a request-local, positive-distance start allowance for safe egress.
 
         This does not alter this oracle, the scene margin, or its collision
         pairs. The returned oracle still checks every pair and the observed
         cloud. Its moving-pair progress is separately certified on the dense
-        final trajectory by the caller.
+        final trajectory by the caller. ``allow_start_contact`` (explicit
+        ignore-start-collisions mode only) also inherits contact/penetration
+        at the start; such pairs may not get worse and must still exit.
         """
         return RM65InheritedStartClearanceOracle(
             self, qpos_by_component=qpos_by_component,
-            active_component=active_component)
+            active_component=active_component, allow_start_contact=allow_start_contact)
 
 
     def check_clearance_only(
@@ -927,19 +930,23 @@ class RM65StartClearanceProgress:
     """Ordered dense-path proof for inherited active collision pairs."""
 
     def __init__(self, *, pair_indices: tuple[int | str, ...], initial_distances: tuple[float, ...],
-                 ordinary_clearance_m: float, tolerance_m: float):
+                 ordinary_clearance_m: float, tolerance_m: float, allow_start_contact: bool = False):
         self.pair_indices = pair_indices
         self.previous = list(initial_distances)
         self.exited = [False] * len(pair_indices)
         self.ordinary_clearance_m = ordinary_clearance_m
         self.tolerance_m = tolerance_m
+        # Explicit ignore-start mode: a pair that starts in contact may stay in
+        # contact while it does not get worse; once exited it may not return.
+        self.allow_start_contact = bool(allow_start_contact)
 
     def advance(self, distances: tuple[float, ...]) -> dict[str, object] | None:
         if len(distances) != len(self.previous):
             return {"reason": "inherited_start_clearance_distance_count_changed"}
         for index, distance in enumerate(distances):
             previous = self.previous[index]
-            if (not np.isfinite(distance) or distance <= 0.0
+            contact = distance <= 0.0 and not (self.allow_start_contact and not self.exited[index])
+            if (not np.isfinite(distance) or contact
                     or (self.exited[index] and distance <= self.ordinary_clearance_m)
                     or (not self.exited[index] and distance < previous - self.tolerance_m)):
                 return {"reason": "inherited_start_clearance_regressed",
@@ -970,7 +977,11 @@ class RM65InheritedStartClearanceOracle:
     _DISTANCE_TOLERANCE_M = 1e-6
 
     def __init__(self, source: RM65ObstacleCollisionOracle, *,
-                 qpos_by_component: Mapping[str, np.ndarray], active_component: str):
+                 qpos_by_component: Mapping[str, np.ndarray], active_component: str,
+                 allow_start_contact: bool = False):
+        if not isinstance(allow_start_contact, bool):
+            raise TypeError("allow_start_contact must be bool.")
+        self.allow_start_contact = allow_start_contact
         if not isinstance(source, RM65ObstacleCollisionOracle):
             raise TypeError("Inherited start clearance requires the native RM65 oracle.")
         if active_component not in source._indices:
@@ -988,7 +999,7 @@ class RM65InheritedStartClearanceOracle:
         self._observed_margin = (float(source._observed_minimum_clearance_m)
                                  if source._observed_distance is not None else self._margin)
         self._baseline = self._distances(self._start)
-        if np.any(self._baseline <= 0.0):
+        if np.any(self._baseline <= 0.0) and not allow_start_contact:
             index = int(np.argmin(self._baseline))
             pair = source._collision_model.collisionPairs[index]
             names = tuple(str(source._collision_model.geometryObjects[part].name)
@@ -1016,7 +1027,7 @@ class RM65InheritedStartClearanceOracle:
         for name, (distance, _) in self._observed_baseline.items():
             if not np.isfinite(distance):
                 raise RuntimeError("Inherited observed distance is nonfinite.")
-            if distance <= 0.0:
+            if distance <= 0.0 and not allow_start_contact:
                 raise RM65InheritedStartBlocked(source="observed_rgbd",
                     distance_m=distance, geometry_name=name)
         self._observed_inherited = tuple(name for name, (distance, _) in self._observed_baseline.items()
@@ -1039,6 +1050,7 @@ class RM65InheritedStartClearanceOracle:
             "ordinary_margin_m": self._margin,
             **({} if self._observed_margin == self._margin
                else {"observed_margin_m": self._observed_margin}),
+            **({"allow_start_contact": True} if allow_start_contact else {}),
         }, domain="dexteleop.rm65.inherited_start_clearance.v1")
 
     @property
@@ -1086,7 +1098,8 @@ class RM65InheritedStartClearanceOracle:
             initial_distances=tuple(float(self._baseline[index])
                 for index in self.active_inherited_pairs),
             ordinary_clearance_m=self._margin,
-            tolerance_m=self._DISTANCE_TOLERANCE_M)
+            tolerance_m=self._DISTANCE_TOLERANCE_M,
+            allow_start_contact=self.allow_start_contact)
 
     def new_observed_dense_progress(self) -> RM65StartClearanceProgress:
         return RM65StartClearanceProgress(
@@ -1094,7 +1107,8 @@ class RM65InheritedStartClearanceOracle:
             initial_distances=tuple(self._observed_baseline[name][0]
                 for name in self.observed_active_names),
             ordinary_clearance_m=self._observed_margin,
-            tolerance_m=self._DISTANCE_TOLERANCE_M)
+            tolerance_m=self._DISTANCE_TOLERANCE_M,
+            allow_start_contact=self.allow_start_contact)
 
     def check(self, qpos_by_component: Mapping[str, np.ndarray]) -> JointConfigurationCheck:
         if any(not np.array_equal(np.asarray(qpos_by_component.get(name)), start)
@@ -1108,9 +1122,14 @@ class RM65InheritedStartClearanceOracle:
                 reason="inherited_clearance_collision_check_unavailable",
                 metadata={"exception_type": type(error).__name__})
         thresholds = np.full(len(distances), self._margin, dtype=float)
-        thresholds[list(self._inherited)] = np.maximum(
-            0.0, self._baseline[list(self._inherited)] - self._DISTANCE_TOLERANCE_M)
-        violated = np.flatnonzero((distances <= 0.0) | (distances <= thresholds))
+        inherited_floor = self._baseline[list(self._inherited)] - self._DISTANCE_TOLERANCE_M
+        thresholds[list(self._inherited)] = (inherited_floor if self.allow_start_contact
+                                             else np.maximum(0.0, inherited_floor))
+        contact = distances <= 0.0
+        if self.allow_start_contact:
+            # Contact inherited from the start may persist while it does not deepen.
+            contact[list(self._inherited)] = False
+        violated = np.flatnonzero(contact | (distances <= thresholds))
         index = (int(violated[0]) if violated.size else int(np.argmin(distances)))
         pair = self._source._collision_model.collisionPairs[index]
         names = tuple(str(self._source._collision_model.geometryObjects[part].name)
@@ -1132,9 +1151,12 @@ class RM65InheritedStartClearanceOracle:
             if baseline is None:
                 return JointConfigurationCheck(safe=False, collision_check_available=False,
                     reason="inherited_observed_proxy_set_changed")
-            threshold = (max(0.0, baseline[0] - self._DISTANCE_TOLERANCE_M)
-                         if name in self._observed_inherited else self._observed_margin)
-            if distance <= 0.0 or distance <= threshold:
+            inherited = name in self._observed_inherited
+            floor = baseline[0] - self._DISTANCE_TOLERANCE_M
+            threshold = ((floor if self.allow_start_contact else max(0.0, floor))
+                         if inherited else self._observed_margin)
+            contact = distance <= 0.0 and not (self.allow_start_contact and inherited)
+            if contact or distance <= threshold:
                 observed_blocked = (name, distance, nearest)
                 break
         result = JointConfigurationCheck(
@@ -1158,7 +1180,8 @@ class RM65InheritedStartClearanceOracle:
                       "observed_active_box_count": len(self.observed_active_names),
                       "nearest_observed": None if observed_blocked is None else observed_blocked[2],
                       "ordinary_clearance_m": self._margin,
-                      "observed_clearance_m": self._observed_margin})
+                      "observed_clearance_m": self._observed_margin,
+                      "allow_start_contact": self.allow_start_contact})
         return result
 
     def check_clearance_only(self, qpos_by_component):

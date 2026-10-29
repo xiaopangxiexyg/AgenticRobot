@@ -470,6 +470,10 @@ def assemble_exclusive_rm65_agent_primitive_composition(
     )
     if inherited_start_clearance_enabled and not observed_safe_enabled:
         raise ValueError("Inherited start clearance requires an explicit observed safe scene.")
+    ignore_start_collisions_enabled = (
+        grasp_trajectory_config is not None and grasp_trajectory_config.ignore_start_collisions)
+    if ignore_start_collisions_enabled and not observed_safe_enabled:
+        raise ValueError("Ignoring start collisions requires an explicit observed safe scene.")
     if enable_anchor_motion_v2 and (
         not enable_surface_anchor_v2 or not observed_point_enabled or not observed_safe_enabled
     ):
@@ -625,7 +629,9 @@ def assemble_exclusive_rm65_agent_primitive_composition(
                 and captured_robot_observation_filter.config.geometry_mode != "legacy" else {}),
             **({"safe_motion_observation": asdict(safe_motion_observation_config)}
                if safe_motion_observation_config is not None else {}),
-            **({"safe_motion_start_clearance": "inherited-positive-v1"}
+            **({"safe_motion_start_clearance": "ignore-start-contacts-v1"}
+               if ignore_start_collisions_enabled else
+               {"safe_motion_start_clearance": "inherited-positive-v1"}
                if inherited_start_clearance_enabled else {}),
         },
         domain="dexteleop.real_skill.rm65_execution_manifest.v1",
@@ -1156,7 +1162,8 @@ def assemble_exclusive_rm65_agent_primitive_composition(
                     geometry_frame_id=lower.profile.station_world_frame_id,
                     translation_tolerance_m=convergence_profile.translation_tolerance_m,
                     rotation_tolerance_rad=convergence_profile.rotation_tolerance_rad,
-                    start_clearance=("inherited-positive-v1" if hover_config.enable_inherited_start_clearance
+                    start_clearance=("ignore-start-contacts-v1" if hover_config.ignore_start_collisions
+                                     else "inherited-positive-v1" if hover_config.enable_inherited_start_clearance
                                      else "strict"),
                     profile_identity={"execution_manifest_hash": execution_manifest_hash,
                         "planning_config": json.loads(json.dumps(asdict(hover_config))),

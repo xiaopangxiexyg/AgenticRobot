@@ -76,6 +76,61 @@ class ObservedObstacleCloud:
         return _plain(self.evidence)
 
 
+# Explicit ignore-start-collisions mode only (real safe TCP and hover planning).
+START_CONTACT_EXEMPTION_POLICY = "observed_voxels_within_clearance_of_start_robot_proxies_v1"
+
+
+def without_start_contacts(cloud: ObservedObstacleCloud, boxes, *, clearance_m: float,
+                           start_qpos_by_side: Mapping[str, object]):
+    """Drop occupied voxels that already violate ``clearance_m`` at the measured start.
+
+    Anything this close to the robot's own obstacle proxies at the start
+    (flexible cables, attached parts, residual self observation, an object the
+    tool already touches) is treated as moving with the robot for this one
+    request and is not an obstacle anywhere on its path. Every other voxel
+    stays. The rule is the same signed-centre distance minus the voxel
+    half-diagonal that :class:`ObservedBoxDistance` uses, so after exemption
+    the start satisfies ``clearance_m`` against the remaining cloud.
+    Returns the (possibly unchanged) cloud and a JSON-safe summary.
+    """
+    clearance = float(clearance_m)
+    if isinstance(clearance_m, bool) or not math.isfinite(clearance) or clearance < 0:
+        raise ValueError("Start-contact exemption clearance must be finite and nonnegative.")
+    points = cloud.points_m
+    margin = cloud.quantization_margin_m
+    tree = cKDTree(points)
+    keep = np.ones(len(points), dtype=bool)
+    by_proxy = {}
+    for name, world_from_box, half_size in boxes:
+        transform = np.asarray(world_from_box, dtype=float).reshape(4, 4)
+        half = np.asarray(half_size, dtype=float).reshape(3)
+        candidates = np.asarray(tree.query_ball_point(
+            transform[:3, 3], float(np.linalg.norm(half)) + clearance + margin), dtype=int)
+        if not len(candidates):
+            by_proxy[str(name)] = 0
+            continue
+        local = (points[candidates] - transform[:3, 3]) @ transform[:3, :3]
+        delta = np.abs(local) - half
+        signed = np.linalg.norm(np.maximum(delta, 0), axis=1) + np.minimum(np.max(delta, axis=1), 0)
+        hit = candidates[signed - margin <= clearance]
+        by_proxy[str(name)] = int(len(hit))
+        keep[hit] = False
+    summary = {
+        "policy": START_CONTACT_EXEMPTION_POLICY, "clearance_m": clearance, "quantization_margin_m": margin,
+        "exempt_voxel_count": int(np.count_nonzero(~keep)), "kept_voxel_count": int(np.count_nonzero(keep)),
+        "exempt_voxel_count_by_proxy": by_proxy, "source_cloud_hash": cloud.semantic_content_hash,
+        "start_qpos_by_side": {str(side): [float(x) for x in np.asarray(q, dtype=float).reshape(-1)]
+                               for side, q in sorted(start_qpos_by_side.items())},
+    }
+    if not summary["exempt_voxel_count"]:
+        return cloud, summary
+    if not keep.any():
+        raise ValueError("Every observed voxel touches the robot at the start; no observed scene remains.")
+    return ObservedObstacleCloud(reference_frame_id=cloud.reference_frame_id, points_m=points[keep],
+        evidence={**cloud.evidence_payload(), "start_contact_exemption": summary},
+        voxel_size_m=cloud.voxel_size_m), summary
+
+
 class ObservedBoxDistance:
     """Exact signed distance from occupied centers to sparse oriented boxes.
 

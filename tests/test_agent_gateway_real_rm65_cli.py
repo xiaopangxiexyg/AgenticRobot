@@ -1342,3 +1342,52 @@ def test_finger_exchange_is_explicit_and_old_cli_default_stays_disabled():
     parsed = parser.parse_args([*argv, "--enable-point-grasp", "--enable-point-grasp-arm-reachability",
         "--enable-point-grasp-finger-exchange", "--point-grasp-backend", "graspgenx"])
     assert parsed.enable_point_grasp_finger_exchange and parsed.enable_point_grasp_arm_reachability
+
+
+@pytest.mark.parametrize("extra, message", (
+    (("--ignore-start-collisions",), "--ignore-start-collisions requires --safe-motion-observation-roles"),
+    (("--safe-motion-observation-roles", "main", "--strict-start-clearance", "--ignore-start-collisions"),
+     "--ignore-start-collisions cannot be combined with --strict-start-clearance"),
+))
+def test_ignore_start_collisions_requires_observed_scene_and_rejects_strict(monkeypatch, capsys, extra, message):
+    monkeypatch.setattr(gateway_cli, "resolve_exclusive_rm65_skill_deployment_profile",
+        lambda *_: pytest.fail("Invalid start-collision mode reached device profile resolution"))
+    argv = _argv(confirmation=REAL_AGENT_PRIMITIVE_SESSION_CONFIRM_TOKEN)
+    assert gateway_cli.build_parser().parse_args(argv).ignore_start_collisions is False
+    with pytest.raises(SystemExit) as caught:
+        gateway_cli.main([*argv, *extra])
+    assert caught.value.code == 2
+    assert message in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("policy", ("trip", "warn"))
+def test_force_guard_stale_policy_reaches_only_the_lower_force_guard(
+    monkeypatch, short_unix_socket_path_factory, policy,
+) -> None:
+    resolved = SimpleNamespace(semantic_content_hash="a" * 64)
+    captured = {}
+    monkeypatch.setattr(gateway_cli, "resolve_exclusive_rm65_skill_deployment_profile", lambda profile: resolved)
+
+    def assemble(**kwargs):
+        captured.update(kwargs)
+        raise RuntimeError("stop after lower binding")
+
+    monkeypatch.setattr(gateway_cli, "assemble_exclusive_rm65_skill_lower", assemble)
+    socket_path = short_unix_socket_path_factory("stale-policy")
+    socket_path.parent.chmod(0o2750)
+    argv = _argv(confirmation=REAL_AGENT_PRIMITIVE_SESSION_CONFIRM_TOKEN, socket_path=socket_path)
+    assert gateway_cli.build_parser().parse_args(argv).force_guard_stale_policy == "trip"
+    with pytest.raises(RuntimeError, match="stop after lower binding"):
+        gateway_cli.main([*argv, "--force-guard-stale-policy", policy])
+    if policy == "trip":
+        assert "force_guard_factory" not in captured
+        return
+    from teleop_runtime.position_force_guard import PositionForceGuardMonitor
+
+    class Backend:
+        def read_force_data(self):
+            return {}
+
+    guard = captured["force_guard_factory"]({"left": Backend(), "right": Backend()})
+    assert isinstance(guard, PositionForceGuardMonitor)
+    assert guard.config.stale_policy == "warn"

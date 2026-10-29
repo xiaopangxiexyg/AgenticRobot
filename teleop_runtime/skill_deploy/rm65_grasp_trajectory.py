@@ -64,7 +64,7 @@ from robot_motion.scene_obstacles import ObstacleSceneSnapshot
 from teleop_runtime.target_safety.tcp_pose_envelope_runtime import (
     TCPPoseEnvelopeTargetFilter,
 )
-from robot_motion.observed_obstacles import ObservedObstacleCloud
+from robot_motion.observed_obstacles import ObservedObstacleCloud, without_start_contacts
 
 from .grasp_trajectory_record import write_grasp_trajectory_record
 from .motion_port import RealAgentJointTrajectory
@@ -171,6 +171,11 @@ class RM65GraspTrajectoryPlanningError(RuntimeError):
 class RM65GraspTrajectoryPlanningConfig:
     minimum_clearance_m: float = 0.02
     enable_inherited_start_clearance: bool = field(default=False, kw_only=True)
+    # Explicit experiment mode for observed safe TCP moves: no start-state
+    # collision rejection. Observed voxels touching the robot at the measured
+    # start (cables, attachments, residual self observation) are exempt for the
+    # request; fixed pairs in contact at the start may not get worse and must exit.
+    ignore_start_collisions: bool = field(default=False, kw_only=True)
     maximum_proximal_joint_travel_rad: float = DEFAULT_PATH_MOTION_QUALITY_LIMITS.maximum_proximal_joint_travel_rad
     maximum_tcp_detour_ratio: float = DEFAULT_PATH_MOTION_QUALITY_LIMITS.maximum_tcp_detour_ratio
     maximum_tcp_detour_excess_m: float = DEFAULT_PATH_MOTION_QUALITY_LIMITS.maximum_tcp_detour_excess_m
@@ -240,6 +245,8 @@ class RM65GraspTrajectoryPlanningConfig:
     def __post_init__(self) -> None:
         if not isinstance(self.enable_inherited_start_clearance, bool):
             raise ValueError("enable_inherited_start_clearance must be bool.")
+        if not isinstance(self.ignore_start_collisions, bool):
+            raise ValueError("ignore_start_collisions must be bool.")
         observed_clearance = self.minimum_observed_clearance_m
         if observed_clearance is not None:
             if (isinstance(observed_clearance, bool) or not np.isfinite(observed_clearance)
@@ -896,6 +903,17 @@ class RM65GraspJointTrajectoryPlanner:
         monotonic = kwargs.get("monotonic", time.perf_counter)
         started = float(monotonic())
         with self._observed_planning_lock:
+            qpos_by_side = kwargs.get("qpos_by_side")
+            if (self.config.ignore_start_collisions and not kwargs.get("require_grasp_approach", True)
+                    and qpos_by_side is not None and isinstance(self.oracle, RM65ObstacleCollisionOracle)):
+                # Voxels already touching the robot at the measured start move
+                # with it (cables, attachments, self residue); exempt them here.
+                start = {side: np.asarray(dict(qpos_by_side)[side], dtype=float).reshape(6).copy()
+                         for side in _SIDES}
+                clearance = (self.scene.minimum_clearance_m if self.config.minimum_observed_clearance_m is None
+                             else self.config.minimum_observed_clearance_m)
+                cloud, _ = without_start_contacts(cloud, self.oracle.world_obstacle_proxy_boxes(start),
+                                                  clearance_m=clearance, start_qpos_by_side=start)
             request = self.for_observed_cloud(cloud)._for_pose_goal_policy(
                 pose_goal_policy=pose_goal_policy,
                 require_grasp_approach=kwargs.get("require_grasp_approach", True),
@@ -5923,7 +5941,9 @@ class RM65GraspJointTrajectoryPlanner:
             for name in _SIDES
         }
         target_pose = np.asarray(target_tool_tcp_world, dtype=float).reshape(4, 4).copy()
-        if (self.config.enable_inherited_start_clearance
+        ignore_start = (self.config.ignore_start_collisions
+                        and self.observed_obstacles is not None and not require_grasp_approach)
+        if ((self.config.enable_inherited_start_clearance or ignore_start)
                 and self.observed_obstacles is not None and not require_grasp_approach
                 and type(self.oracle) is RM65ObstacleCollisionOracle):
             baseline_check = self.oracle.check(current)
@@ -5933,10 +5953,10 @@ class RM65GraspJointTrajectoryPlanner:
                         "observed_obstacle_clearance_blocked",
                     }
                     and baseline_check.minimum_distance_m is not None
-                    and baseline_check.minimum_distance_m > 0.0):
+                    and (ignore_start or baseline_check.minimum_distance_m > 0.0)):
                 try:
                     inherited = self.oracle.inherited_start_clearance(
-                        current, active_component=selected_side)
+                        current, active_component=selected_side, allow_start_contact=ignore_start)
                     inherited_check = inherited.check(current)
                 except RM65InheritedStartBlocked as error:
                     raise RM65GraspTrajectoryPlanningError(

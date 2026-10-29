@@ -852,3 +852,92 @@ def test_rigid_endpoint_query_matches_native_shape_distance_without_mutating_qpo
             current_tool_tcp_world=np.eye(4), target_tool_tcp_world=invalid)
     assert not oracle.check_rigid_endpoint_pose(current, active_component="absent",
         current_tool_tcp_world=np.eye(4), target_tool_tcp_world=np.eye(4)).collision_check_available
+
+
+def test_contact_start_is_inherited_only_in_explicit_ignore_mode():
+    # Sphere r=.05 at x=q against the cube x in [.1, .3]: distance = .05 - q.
+    model, collision = _simple_prismatic_collision_model()
+    oracle = RM65ObstacleCollisionOracle(model=model, base_collision_model=collision,
+        reference_full_q=np.zeros(model.nq), qpos_indices_by_component={"arm": (0,)},
+        scene=_scene(center_x=.2, clearance=.06))
+    start = {"arm": np.array([.07])}
+    assert oracle.check(start).minimum_distance_m == pytest.approx(-.02, abs=1e-6)
+    with pytest.raises(RM65InheritedStartBlocked):
+        oracle.inherited_start_clearance(start, active_component="arm")
+    inherited = oracle.inherited_start_clearance(start, active_component="arm", allow_start_contact=True)
+    assert inherited.allow_start_contact is True
+    assert inherited.check(start).safe
+    assert inherited.check({"arm": np.array([.06])}).safe            # contact easing
+    assert not inherited.check({"arm": np.array([.08])}).safe        # contact deepening
+    assert inherited.check({"arm": np.array([-.05])}).safe           # out of the margin
+    assert oracle.inherited_start_clearance(start, active_component="arm",
+        allow_start_contact=True).scene_hash != oracle.inherited_start_clearance(
+        {"arm": np.array([0.])}, active_component="arm").scene_hash
+    progress = inherited.new_dense_progress()
+    for value in (.07, .06, .03, -.02):
+        assert progress.advance(inherited.inherited_active_distances({"arm": np.array([value])})) is None
+    assert progress.all_exited
+    assert progress.advance(inherited.inherited_active_distances(
+        {"arm": np.array([.0])}))["reason"] == "inherited_start_clearance_regressed"
+    progress = inherited.new_dense_progress()
+    assert progress.advance(inherited.inherited_active_distances({"arm": np.array([.06])})) is None
+    assert progress.advance(inherited.inherited_active_distances(
+        {"arm": np.array([.065])}))["reason"] == "inherited_start_clearance_regressed"
+    assert not oracle.check(start).safe  # The source oracle stays strict.
+
+
+def test_observed_contact_start_is_inherited_only_in_explicit_ignore_mode():
+    model = pin.Model()
+    joint = model.addJoint(0, pin.JointModelPX(), pin.SE3.Identity(), "moving_x")
+    model.appendBodyToJoint(joint, pin.Inertia.Random(), pin.SE3.Identity())
+    collision = pin.GeometryModel()
+    collision.addGeometryObject(pin.GeometryObject("hand_box", joint, 0,
+        pin.SE3.Identity(), hppfcl.Box(.1, .1, .1)))
+    oracle = RM65ObstacleCollisionOracle(model=model, base_collision_model=collision,
+        reference_full_q=pin.neutral(model), qpos_indices_by_component={"arm": (0,)},
+        scene=_scene(center_x=.5, clearance=.02))
+    oracle.bind_observed_cloud(ObservedObstacleCloud(reference_frame_id="world",
+        points_m=np.array([[-.03, 0., 0.]]), evidence={"source": "cable_inside_hand_box"}))
+    start = {"arm": np.array([0.])}
+    assert oracle.check(start).minimum_distance_m < 0.0
+    with pytest.raises(RM65InheritedStartBlocked) as blocked:
+        oracle.inherited_start_clearance(start, active_component="arm")
+    assert blocked.value.details["source"] == "observed_rgbd"
+    inherited = oracle.inherited_start_clearance(start, active_component="arm", allow_start_contact=True)
+    assert inherited.observed_active_names == ("hand_box",)
+    assert inherited.check(start).safe
+    assert inherited.check({"arm": np.array([.01])}).safe            # moving away from the voxel
+    assert not inherited.check({"arm": np.array([-.01])}).safe       # deeper into it
+
+
+def test_start_contact_exemption_drops_only_voxels_touching_start_proxies():
+    from robot_motion.observed_obstacles import START_CONTACT_EXEMPTION_POLICY, without_start_contacts
+
+    points = np.array([[0., 0., 0.],        # inside the box
+                       [.054, 0., 0.],      # ~4 mm outside: within 10 mm
+                       [.09, 0., 0.],       # ~40 mm outside: an obstacle
+                       [0., .4, 0.]])       # far away
+    cloud = ObservedObstacleCloud(reference_frame_id="world", points_m=points, evidence={"source": "rgbd"})
+    box = ("right_hand_proxy_0", np.eye(4), np.array([.05, .05, .05]))
+    start = {"left": np.zeros(6), "right": np.ones(6)}
+    exempted, summary = without_start_contacts(cloud, (box,), clearance_m=.01, start_qpos_by_side=start)
+    assert summary["policy"] == START_CONTACT_EXEMPTION_POLICY
+    assert summary["exempt_voxel_count"] == 2 and summary["kept_voxel_count"] == 2
+    assert summary["exempt_voxel_count_by_proxy"] == {"right_hand_proxy_0": 2}
+    assert summary["source_cloud_hash"] == cloud.semantic_content_hash
+    np.testing.assert_allclose(sorted(exempted.points_m[:, 0]), [.002, .09], atol=1e-9)
+    assert exempted.evidence_payload()["start_contact_exemption"]["exempt_voxel_count"] == 2
+    assert exempted.semantic_content_hash != cloud.semantic_content_hash
+    from robot_motion.observed_obstacles import ObservedBoxDistance
+    distance, _ = ObservedBoxDistance(exempted).check_boxes((box,), clearance_m=.01)
+    assert distance >= .01
+    far = np.eye(4)
+    far[:3, 3] = (1., 1., 1.)
+    unchanged, nothing = without_start_contacts(cloud, (("far", far, np.array([.01, .01, .01])),),
+                                                clearance_m=.01, start_qpos_by_side=start)
+    assert unchanged is cloud and nothing["exempt_voxel_count"] == 0
+    with pytest.raises(ValueError, match="no observed scene remains"):
+        without_start_contacts(cloud, (("all", np.eye(4), np.array([1., 1., 1.])),),
+                               clearance_m=.01, start_qpos_by_side=start)
+    with pytest.raises(ValueError, match="finite and nonnegative"):
+        without_start_contacts(cloud, (box,), clearance_m=float("nan"), start_qpos_by_side=start)
