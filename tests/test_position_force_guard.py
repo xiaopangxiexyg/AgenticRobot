@@ -1181,3 +1181,93 @@ def test_impedance_issue_provider_force_error_enters_collision_callback():
                 now=1.0,
                 collision_handler=collisions.append,
             )
+
+
+def _blocked_after_first_reader(block: threading.Event):
+    first = True
+
+    def reader():
+        nonlocal first
+        if first:
+            first = False
+            return _payload()
+        block.wait(1.0)
+        return _payload()
+
+    return reader
+
+
+def test_stale_policy_is_validated_and_reported():
+    assert PositionForceGuardConfig().stale_policy == "trip"
+    assert PositionForceGuardConfig(stale_policy="warn").to_dict()["stale_policy"] == "warn"
+    with pytest.raises(ValueError, match="stale_policy"):
+        PositionForceGuardConfig(stale_policy="ignore")
+
+
+def test_warn_stale_policy_never_faults_stops_or_blocks_motion():
+    stops = []
+    block = threading.Event()
+    monitor = PositionForceGuardMonitor(
+        readers_by_side={"left": _blocked_after_first_reader(block), "right": lambda: _payload()},
+        emergency_stop=stops.append,
+        config=PositionForceGuardConfig(poll_hz=20.0, stale_timeout_sec=0.08,
+                                        startup_timeout_sec=0.5, stale_policy="warn"),
+    )
+    try:
+        monitor.start()
+        deadline = time.monotonic() + 0.6
+        while not monitor.snapshot()["stale_warning_count_by_side"].get("left") and time.monotonic() < deadline:
+            time.sleep(0.01)
+        time.sleep(0.2)
+        snapshot = monitor.snapshot()
+        assert monitor.fault is None and stops == []
+        assert monitor.motion_ready is True
+        assert snapshot["stale_warning_count_by_side"]["left"] >= 1
+        assert snapshot["stale_warning_count_by_side"]["right"] == 0
+        assert "stale_policy=warn" in snapshot["last_stale_warning_by_side"]["left"]
+        assert snapshot["config"]["stale_policy"] == "warn"
+        # A non-motion read window resumes at once instead of waiting for fresh samples.
+        token = monitor.suspend_stale_watchdog_for_non_motion()
+        assert monitor.motion_ready is False
+        resumed = monitor.resume_stale_watchdog_after_non_motion(token, timeout_sec=0.05)
+        assert resumed["motion_ready"] is True and monitor.fault is None
+    finally:
+        block.set()
+        monitor.close()
+
+
+def test_warn_stale_policy_still_trips_on_force_limit():
+    stops = []
+    monitor = PositionForceGuardMonitor(
+        readers_by_side={"left": lambda: _payload(force_x=40.0)},
+        emergency_stop=stops.append,
+        config=PositionForceGuardConfig(poll_hz=20.0, max_force_n=15.0, startup_timeout_sec=0.5,
+                                        stale_policy="warn"),
+    )
+    try:
+        with pytest.raises(PositionForceGuardTripped) as captured:
+            monitor.start()
+        assert captured.value.fault.reason == "force_limit_exceeded"
+        assert len(stops) == 1
+    finally:
+        monitor.close()
+
+
+def test_trip_stale_policy_is_unchanged():
+    stops = []
+    block = threading.Event()
+    monitor = PositionForceGuardMonitor(
+        readers_by_side={"left": _blocked_after_first_reader(block)},
+        emergency_stop=stops.append,
+        config=PositionForceGuardConfig(poll_hz=20.0, stale_timeout_sec=0.08, startup_timeout_sec=0.5),
+    )
+    try:
+        monitor.start()
+        deadline = time.monotonic() + 0.5
+        while monitor.fault is None and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert monitor.fault is not None and monitor.fault.reason == "force_read_stale"
+        assert len(stops) == 1
+    finally:
+        block.set()
+        monitor.close()

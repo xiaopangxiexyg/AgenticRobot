@@ -13,6 +13,7 @@ re-arms the monitor; no automatic recovery is permitted.
 from __future__ import annotations
 
 import argparse
+import logging
 import math
 import sys
 import threading
@@ -26,6 +27,13 @@ import numpy as np
 
 
 POSITION_FORCE_SOURCES = ("raw", "zero", "work", "tool")
+# trip: a reading older than stale_timeout_sec latches a fault and stops both
+# arms (historical default). warn: staleness is logged and counted only; it never
+# latches a fault, blocks motion admission or stops an executing motion. Force or
+# torque over the limits and consecutive reader errors still trip in both modes.
+POSITION_FORCE_STALE_POLICIES = ("trip", "warn")
+_STALE_WARNING_LOG_INTERVAL_SEC = 5.0
+_LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -38,8 +46,14 @@ class PositionForceGuardConfig:
     max_consecutive_read_errors: int = 3
     stale_timeout_sec: float = 0.4
     startup_timeout_sec: float = 2.0
+    stale_policy: str = "trip"
 
     def __post_init__(self) -> None:
+        if self.stale_policy not in POSITION_FORCE_STALE_POLICIES:
+            raise ValueError(
+                f"position force stale_policy must be one of {POSITION_FORCE_STALE_POLICIES}, "
+                f"got {self.stale_policy!r}"
+            )
         source = str(self.source or "tool").strip()
         if source not in POSITION_FORCE_SOURCES:
             raise ValueError(
@@ -83,6 +97,7 @@ class PositionForceGuardConfig:
             "max_consecutive_read_errors": self.max_consecutive_read_errors,
             "stale_timeout_sec": self.stale_timeout_sec,
             "startup_timeout_sec": self.startup_timeout_sec,
+            "stale_policy": self.stale_policy,
         }
 
 
@@ -110,6 +125,7 @@ def position_force_guard_config(
         startup_timeout_sec=float(
             getattr(args, "position_force_guard_startup_timeout_sec", 2.0)
         ),
+        stale_policy=str(getattr(args, "position_force_guard_stale_policy", "trip")),
     )
 
 
@@ -212,6 +228,10 @@ class PositionForceGuardMonitor:
         self._last_error_by_side: dict[str, str] = {}
         self._fault: PositionForceGuardFault | None = None
         self._emergency_stop_error: str | None = None
+        self._stale_warning_count_by_side = {side: 0 for side in self._readers}
+        self._last_stale_warning_by_side: dict[str, str] = {}
+        self._last_stale_sample_by_side: dict[str, float | None] = {}
+        self._last_stale_log_by_side: dict[str, float] = {}
 
     def _diagnostics_active(self) -> bool:
         if self._diagnostic_enabled is None or self._diagnostic_sink is None:
@@ -447,6 +467,13 @@ class PositionForceGuardMonitor:
             raise PositionForceGuardTripped(fault)
         if self.stale_watchdog_armed:
             return self.snapshot()
+        if self.config.stale_policy == "warn":
+            # Staleness never gates motion in warn mode: no fresh-sample wait,
+            # no arm timeout. Limits and reader errors stay active.
+            with self._lock:
+                self._stale_watchdog_generation += 1
+                self._stale_watchdog_armed.set()
+            return self.snapshot()
         requested_at = time.monotonic()
         resolved_timeout = (
             float(self.config.startup_timeout_sec)
@@ -607,6 +634,8 @@ class PositionForceGuardMonitor:
                     side: max(0.0, time.monotonic() - started)
                     for side, started in self._reader_inflight_since_by_side.items()
                 },
+                "stale_warning_count_by_side": dict(self._stale_warning_count_by_side),
+                "last_stale_warning_by_side": dict(self._last_stale_warning_by_side),
                 "fault": None if self._fault is None else self._fault.to_dict(),
                 "emergency_stop_error": self._emergency_stop_error,
             }
@@ -732,6 +761,9 @@ class PositionForceGuardMonitor:
                     if self._ready_by_side[side].is_set()
                     and now - timestamp > float(self.config.stale_timeout_sec)
                 ]
+            if stale and self.config.stale_policy == "warn":
+                self._warn_stale(stale, now)
+                continue
             if stale:
                 side, age_sec = max(stale, key=lambda item: item[1])
                 with self._lock:
@@ -776,6 +808,33 @@ class PositionForceGuardMonitor:
                     if diagnostic is not None:
                         self._emit_diagnostic("force_read_stale", diagnostic)
                     return
+
+    def _warn_stale(self, stale: list[tuple[str, float]], now: float) -> None:
+        """Record stale force samples without any fault, stop or admission effect."""
+        for side, age_sec in stale:
+            with self._lock:
+                inflight_since = self._reader_inflight_since_by_side.get(side)
+                last_success = self._last_success_monotonic_by_side.get(side)
+                # Count one event per stale sample, not per watchdog tick.
+                if side in self._last_stale_sample_by_side and self._last_stale_sample_by_side[side] == last_success:
+                    continue
+                self._last_stale_sample_by_side[side] = last_success
+                self._stale_warning_count_by_side[side] = self._stale_warning_count_by_side.get(side, 0) + 1
+                count = self._stale_warning_count_by_side[side]
+                message = (f"{side} RM65 force reading is stale: {age_sec:.3f}s > "
+                           f"{self.config.stale_timeout_sec:.3f}s"
+                           + ("" if inflight_since is None else
+                              f"; reader in flight {max(0.0, now - inflight_since):.3f}s")
+                           + "; stale_policy=warn (no fault, no stop, motion unaffected)")
+                self._last_stale_warning_by_side[side] = message
+                last_log = self._last_stale_log_by_side.get(side)
+                log_now = last_log is None or now - last_log >= _STALE_WARNING_LOG_INTERVAL_SEC
+                if log_now:
+                    self._last_stale_log_by_side[side] = now
+            if log_now:
+                _LOGGER.warning("%s; stale events on %s so far: %d", message, side, count)
+            self._emit_diagnostic("force_read_stale_warning",
+                                  {"side": side, "age_sec": age_sec, "count": count})
 
     def _trip(
         self,
@@ -852,6 +911,7 @@ class PositionForceGuardMonitor:
 
 __all__ = [
     "POSITION_FORCE_SOURCES",
+    "POSITION_FORCE_STALE_POLICIES",
     "PositionForceGuardConfig",
     "PositionForceGuardFault",
     "PositionForceGuardMonitor",
