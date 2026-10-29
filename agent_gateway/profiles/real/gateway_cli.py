@@ -1122,6 +1122,12 @@ def main(argv: list[str] | None = None) -> int:
     ):
         parser.error("--enable-tool-hover-queries requires --enable-surface-anchor-v2, "
                      "--safe-motion-observation-roles and the move_tcp_to_pose_safe action")
+    if "move_grasped_object_to_pose" in actions and (
+        not args.enable_tool_object_relations or args.safe_motion_observation_roles is None
+        or "move_tcp_to_pose_safe" not in actions
+    ):
+        parser.error("move_grasped_object_to_pose requires --enable-tool-object-relations, "
+                     "--safe-motion-observation-roles and the move_tcp_to_pose_safe action")
     if not args.enable_tool_hover_queries and (args.tool_hover_candidate_budget_sec is not None
                                                or args.tool_hover_region_budget_sec is not None):
         parser.error("--tool-hover-*-budget-sec requires --enable-tool-hover-queries")

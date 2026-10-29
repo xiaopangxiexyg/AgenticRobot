@@ -21,6 +21,7 @@ from agent_gateway.skills.motion.definition import (
     SAFE_TCP_POSE_TARGET_SKILL_ID_V1,
     TCP_POSE_TARGET_SKILL_ID_V1,
 )
+from agent_gateway.skills.motion.grasped_object import GRASPED_OBJECT_MOVE_SKILL_ID
 from dataset_contracts.canonical_encoding import canonical_content_hash
 
 if TYPE_CHECKING:
@@ -35,12 +36,14 @@ REAL_AGENT_SAFE_TCP_POSE_ACTION = "move_tcp_to_pose_safe"
 REAL_AGENT_OBSERVED_POINT_ACTION = "move_to_observed_point"
 REAL_AGENT_GRASP_APPROACH_ACTION = "approach_grasp_pose"
 REAL_AGENT_EXECUTE_GRASP_APPROACH_PLAN_ACTION = "execute_grasp_approach_plan"
+REAL_AGENT_OBJECT_MOTION_ACTION = "move_grasped_object_to_pose"
 REAL_AGENT_PRIMITIVE_ACTIONS = (
     REAL_AGENT_ABSOLUTE_TCP_POSE_ACTION,
     REAL_AGENT_SAFE_TCP_POSE_ACTION,
     REAL_AGENT_OBSERVED_POINT_ACTION,
     REAL_AGENT_GRASP_APPROACH_ACTION,
     REAL_AGENT_EXECUTE_GRASP_APPROACH_PLAN_ACTION,
+    REAL_AGENT_OBJECT_MOTION_ACTION,
     "set_gripper_state",
 )
 _FIXED_SKILL_ID_BY_ACTION = {
@@ -52,6 +55,7 @@ _FIXED_SKILL_ID_BY_ACTION = {
     REAL_AGENT_EXECUTE_GRASP_APPROACH_PLAN_ACTION: (
         EXECUTE_GRASP_APPROACH_PLAN_SKILL_ID_V1
     ),
+    REAL_AGENT_OBJECT_MOTION_ACTION: GRASPED_OBJECT_MOVE_SKILL_ID,
 }
 _ACTION_BY_FIXED_SKILL_ID = {
     skill_id: action for action, skill_id in _FIXED_SKILL_ID_BY_ACTION.items()

@@ -152,14 +152,33 @@ def _public_tool_profiles(lower: ExclusiveRM65SkillLowerAssembly) -> dict[str, o
 
 def _route_ids(*, include_grasp_approach_plan: bool = False, include_safe_pose: bool = False,
                include_observed_point: bool = False,
-               include_observed_anchor_v2: bool = False) -> tuple[str, ...]:
+               include_observed_anchor_v2: bool = False,
+               include_object_motion: bool = False) -> tuple[str, ...]:
     return real_agent_motion_route_ids_v1(
         include_safe_pose=include_safe_pose,
         include_observed_point=include_observed_point,
         include_observed_anchor_v2=include_observed_anchor_v2,
+        include_object_motion=include_object_motion,
         include_grasp_approach=True,
         include_grasp_approach_plan=include_grasp_approach_plan,
     )
+
+
+def _public_object_workspace_bounds(*, public_from_geometry, collision_scene_profile):
+    """Held-object pose bounds: the fixed table's footprint, up to 0.8 m above its top."""
+    from robot_motion.rm65 import build_dual_arm_scene_profile
+    from robot_motion.rm65.scene_profiles import fixed_scene_aabb_obstacles
+
+    table = next(item for item in fixed_scene_aabb_obstacles(build_dual_arm_scene_profile(
+        collision_scene_profile or "dual_arm_hand_proxy_dmtac_grasp")) if item.obstacle_id == "fixed-scene:table")
+    centre, size = np.asarray(table.center_xyz_m, dtype=float), np.asarray(table.size_xyz_m, dtype=float)
+    corners = np.array([[x, y, centre[2] + size[2] / 2.0] for x in (-0.5, 0.5) for y in (-0.5, 0.5)])
+    corners[:, :2] = corners[:, :2] * size[:2] + centre[:2]
+    transform = np.asarray(public_from_geometry, dtype=float).reshape(4, 4)
+    public = corners @ transform[:3, :3].T + transform[:3, 3]
+    low, high = public.min(axis=0), public.max(axis=0)
+    return (float(low[0]), float(high[0]), float(low[1]), float(high[1]),
+            float(low[2]) - 0.02, float(high[2]) + 0.80)
 
 
 @dataclass(frozen=True)
@@ -460,6 +479,11 @@ def assemble_exclusive_rm65_agent_primitive_composition(
             raise ValueError("Surface anchor v2 requires a bounded segmenter timeout of at most 45s.")
     observed_point_enabled = "move_to_observed_point" in normalized_actions
     observed_safe_enabled = safe_motion_observation_config is not None
+    object_motion_enabled = "move_grasped_object_to_pose" in normalized_actions
+    if object_motion_enabled and (not enable_tool_object_relations or not observed_safe_enabled
+                                  or "move_tcp_to_pose_safe" not in normalized_actions):
+        raise ValueError("Held-object motion requires tool-object relations, the observed safe scene "
+                         "and authorized move_tcp_to_pose_safe.")
     if enable_tool_hover_queries and (not enable_surface_anchor_v2 or not observed_safe_enabled
                                       or "move_tcp_to_pose_safe" not in normalized_actions):
         raise ValueError("Tool hover queries require surface anchor v2, the observed safe scene "
@@ -765,6 +789,7 @@ def assemble_exclusive_rm65_agent_primitive_composition(
             include_observed_point=observed_point_enabled,
             include_observed_anchor_v2=enable_anchor_motion_v2,
             include_grasp_approach_plan=grasp_enabled,
+            include_object_motion=object_motion_enabled,
         ),
     )
     perception_source_binding = None
@@ -1175,7 +1200,13 @@ def assemble_exclusive_rm65_agent_primitive_composition(
                 hover_roles=(() if not enable_tool_hover_queries
                              else tuple(safe_motion_observation_config.roles)),
                 hover_region_budget_sec=tool_hover_region_budget_sec,
-                hover_candidate_budget_sec=tool_hover_candidate_budget_sec)
+                hover_candidate_budget_sec=tool_hover_candidate_budget_sec,
+                object_motion=(None if not object_motion_enabled else {
+                    "object_id": f"{side}_held_object",
+                    "object_workspace_bounds": _public_object_workspace_bounds(
+                        public_from_geometry=public_from_geometry,
+                        collision_scene_profile=lower.profile.collision_scene_profile),
+                    "clock_domain_id": attachment.clock_domain_id}))
 
         def reachability_evaluator_factory(port):
             if arm_reachability_profile is None:
