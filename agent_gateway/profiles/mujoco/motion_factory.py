@@ -572,6 +572,9 @@ def build_mujoco_agent_tcp_pose_gateway_session(
     enable_support_release_queries: bool = False,
     support_release_prompt_by_id: Mapping[str, str] | None = None,
     support_release_roles: tuple[str, ...] | None = None,
+    enable_grasp_approach_queries: bool = False,
+    grasp_query_prompt_by_id: Mapping[str, str] | None = None,
+    grasp_query_roles: tuple[str, ...] | None = None,
 ) -> MujocoAgentTcpPoseGatewaySession:
     """Build the exact default-off graph; do not start, record, or serve it."""
 
@@ -599,6 +602,13 @@ def build_mujoco_agent_tcp_pose_gateway_session(
         # The query's pose is consumed by carry and its support by named release.
         raise ValueError("Support release queries require Artifact storage, a segmentation localizer, "
                          "named release v3 and one prompt per queried support.")
+    if type(enable_grasp_approach_queries) is not bool:
+        raise TypeError("enable_grasp_approach_queries must be boolean.")
+    if enable_grasp_approach_queries and (
+            artifact_storage is None or segmentation_localizer is None
+            or not enable_grasp_approach or not grasp_query_prompt_by_id):
+        raise ValueError("Grasp approach queries require Artifact storage, a segmentation localizer, "
+                         "the grasp approach Route and one prompt per object.")
     if type(enable_object_localization) is not bool:
         raise TypeError("enable_object_localization must be boolean.")
     if enable_object_localization and (
@@ -999,6 +1009,9 @@ def build_mujoco_agent_tcp_pose_gateway_session(
             enable_support_release_queries=enable_support_release_queries,
             support_release_prompt_by_id=support_release_prompt_by_id,
             support_release_roles=support_release_roles,
+            enable_grasp_approach_queries=enable_grasp_approach_queries,
+            grasp_query_prompt_by_id=grasp_query_prompt_by_id,
+            grasp_query_roles=grasp_query_roles,
             enable_tool_object_relations=enable_tool_object_relations,
             enable_tool_hover_queries=enable_tool_hover_queries,
             tool_entity_by_side=tool_entity_by_side,

@@ -213,5 +213,104 @@ def measure_support_top(capture: LiveAlignedDepthCapture, mask: np.ndarray, *,
         top_z_m=top_z, tilt_deg=tilt)
 
 
-__all__ = ["MeasuredSupportTop", "fit_support_top_plane", "largest_true_rectangle",
-           "measure_support_top", "plane_coverage_grid"]
+__all__ = ["MeasuredObjectTop", "MeasuredSupportTop", "fit_support_top_plane",
+           "largest_true_rectangle", "measure_object_top", "measure_support_top",
+           "minimum_area_rectangle", "plane_coverage_grid"]
+
+
+@dataclass(frozen=True)
+class MeasuredObjectTop:
+    """Measured top face of a box-like object: center, upward height, yaw, extent."""
+
+    center_xy_m: tuple[float, float]
+    top_z_m: float
+    yaw_rad: float
+    extent_xy_m: tuple[float, float]
+    top_point_count: int
+    plane_residual_m: float
+    tilt_deg: float
+
+
+def _convex_hull(points: np.ndarray) -> np.ndarray:
+    """Monotone-chain hull of 2-D points, counter-clockwise, without duplicates."""
+    unique = np.unique(np.round(points, 6), axis=0)
+    if len(unique) < 3:
+        return unique
+    order = unique[np.lexsort((unique[:, 1], unique[:, 0]))]
+
+    def cross(o, a, b):
+        return (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
+
+    lower, upper = [], []
+    for point in order:
+        while len(lower) >= 2 and cross(lower[-2], lower[-1], point) <= 0:
+            lower.pop()
+        lower.append(point)
+    for point in order[::-1]:
+        while len(upper) >= 2 and cross(upper[-2], upper[-1], point) <= 0:
+            upper.pop()
+        upper.append(point)
+    return np.asarray(lower[:-1] + upper[:-1])
+
+
+def minimum_area_rectangle(points: np.ndarray) -> tuple[np.ndarray, float, np.ndarray]:
+    """(center_xy, yaw in (-pi/4, pi/4], extent along yaw axes) of the minimum box."""
+    hull = _convex_hull(np.asarray(points, dtype=float))
+    if len(hull) < 3:
+        raise ValueError("Object top has too few distinct measured points")
+    best = None
+    for index in range(len(hull)):
+        edge = hull[(index + 1) % len(hull)] - hull[index]
+        if not np.any(edge):
+            continue
+        angle = math.atan2(edge[1], edge[0])
+        rotation = np.array([[math.cos(angle), math.sin(angle)],
+                             [-math.sin(angle), math.cos(angle)]])
+        local = hull @ rotation.T
+        low, high = local.min(axis=0), local.max(axis=0)
+        area = float(np.prod(high - low))
+        if best is None or area < best[0]:
+            best = (area, angle, low, high, rotation)
+    _, angle, low, high, rotation = best
+    center = ((low + high) / 2.) @ rotation
+    extent = high - low
+    # A box is symmetric under quarter turns: report the yaw in (-pi/4, pi/4].
+    turns = round(angle / (math.pi / 2.))
+    yaw = angle - turns * math.pi / 2.
+    if yaw <= -math.pi / 4.:
+        yaw += math.pi / 2.
+        turns -= 1
+    if turns % 2:
+        extent = extent[::-1]
+    return center, float(yaw), np.asarray(extent, dtype=float)
+
+
+def measure_object_top(capture: LiveAlignedDepthCapture, mask: np.ndarray, *,
+                       maximum_depth_m: float,
+                       maximum_plane_residual_m: float = MAXIMUM_PLANE_RESIDUAL_M,
+                       minimum_top_points: int = 24) -> MeasuredObjectTop:
+    """Fit a box-like object's top plane from depth and its footprint orientation."""
+    if not isinstance(capture, LiveAlignedDepthCapture):
+        raise TypeError("A bound metric-depth capture is required")
+    selected = np.asarray(mask)
+    if selected.dtype != np.bool_ or selected.shape != capture.depth_m.shape or not selected.any():
+        raise ValueError("Object mask must be a non-empty paired boolean grid")
+    if (selected[0].any() or selected[-1].any() or selected[:, 0].any() or selected[:, -1].any()):
+        raise ValueError("Object mask touches the image border; its top may be clipped")
+    plane = fit_support_top_plane(capture, selected, maximum_depth_m=maximum_depth_m)
+    points = _mask_points(capture, selected, maximum_depth_m)
+    anchor = np.asarray(plane.plane_anchor_reference_xyz_m)
+    normal = np.asarray(plane.normal_reference_xyz)
+    residual = np.abs((points - anchor) @ normal)
+    top = points[residual <= maximum_plane_residual_m]
+    if len(top) < minimum_top_points:
+        raise ValueError("Object top has insufficient measured coverage")
+    center, yaw, extent = minimum_area_rectangle(top[:, :2])
+    top_z = float(anchor[2] - (normal[0] * (center[0] - anchor[0])
+                               + normal[1] * (center[1] - anchor[1])) / normal[2])
+    tilt = math.degrees(math.acos(max(-1., min(1., float(normal[2])))))
+    return MeasuredObjectTop(
+        center_xy_m=(float(center[0]), float(center[1])), top_z_m=top_z, yaw_rad=yaw,
+        extent_xy_m=(float(extent[0]), float(extent[1])), top_point_count=int(len(top)),
+        plane_residual_m=float(np.quantile(residual[residual <= maximum_plane_residual_m], .95)),
+        tilt_deg=tilt)

@@ -200,6 +200,7 @@ class MujocoAgentTcpPoseGatewaySession:
     surface_anchor_executors: tuple[PassiveReadSkillExecutor, ...] = ()
     tool_entity_executors: tuple[PassiveReadSkillExecutor, ...] = ()
     support_release_query_executor: PassiveReadSkillExecutor | None = None
+    grasp_approach_query_executor: PassiveReadSkillExecutor | None = None
     _close_lock: threading.Lock = field(
         default_factory=threading.Lock,
         init=False,
@@ -286,6 +287,9 @@ class MujocoAgentTcpPoseGatewaySession:
         if (getattr(self.contract_bundle, "support_release_query_registration", None) is not None
                 ) != (self.support_release_query_executor is not None):
             raise ValueError("Support release query registration and executor must coexist.")
+        if (getattr(self.contract_bundle, "grasp_approach_query_registration", None) is not None
+                ) != (self.grasp_approach_query_executor is not None):
+            raise ValueError("Grasp approach query registration and executor must coexist.")
         hand_parts = (self.contract_bundle.gripper_contract is not None,
                       self.gripper_executor is not None, bool(self.gripper_ports))
         if any(hand_parts) and not all(hand_parts):
@@ -609,6 +613,10 @@ class MujocoAgentTcpPoseGatewaySession:
                         self.contract_bundle.support_release_query_registration.entry.route.max_operation_duration_ms
                         / 1000 + 5.0),)
                         if getattr(self, "support_release_query_executor", None) is not None else ()),
+                    *((("grasp_approach_query", self.grasp_approach_query_executor,
+                        self.contract_bundle.grasp_approach_query_registration.entry.route.max_operation_duration_ms
+                        / 1000 + 5.0),)
+                        if getattr(self, "grasp_approach_query_executor", None) is not None else ()),
                     ("rgbd_capture", self.rgbd_capture_executor, 5.0),
                     ("tcp_pose_comparison", self.tcp_pose_comparison_executor, 5.0),
                     ("object_state", self.object_state_executor, 5.0),
@@ -1779,6 +1787,43 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
             clock=runtime_clock, max_retained_operations=retention)
         execution_port_by_route_hash[support_release_registration.entry.route.semantic_content_hash] = (
             support_release_query_executor)
+    grasp_approach_query_executor = None
+    grasp_query_registration = getattr(contract_bundle, "grasp_approach_query_registration", None)
+    if grasp_query_registration is not None:
+        from .grasp_approach_query import (
+            MujocoGraspApproachQuery,
+            build_grasp_approach_query_executor,
+        )
+
+        if (segmentation_provider is None or back_projection_capture_port is None
+                or back_projection_registration is None or "right_gripper" not in gripper_ports):
+            raise ValueError("Grasp approach queries require the bound segmenter, original RGB-D "
+                             "and the right gripper.")
+        grasp_safety = application.tcp_pose_envelope_runtime
+        grasp_route = contract_bundle.route_manifest.route("motion.approach_grasp_pose", "1").route
+        grasp_profile = contract_bundle.grasp_approach_contract.motion_profile
+
+        def prepare_grasp_projection():
+            project = grasp_safety.planning_projector_for_route(route_id=grasp_route.route_id)
+            return (project, canonical_content_hash({"profile": grasp_profile.semantic_content_hash,
+                "reference": grasp_safety.snapshot().safety_reference_hash},
+                domain="agenticrobot.grasp_approach_query.constraint.v1"))
+
+        grasp_approach_query_executor = build_grasp_approach_query_executor(
+            registration=grasp_query_registration,
+            query_port=MujocoGraspApproachQuery(
+                registration=grasp_query_registration, application=application,
+                observer=object_observer, gripper_name=gripper_ports["right_gripper"].gripper_name,
+                segmentation_provider=segmentation_provider,
+                capture_port=back_projection_capture_port, motion_profile=grasp_profile,
+                prepare_projection=prepare_grasp_projection,
+                maximum_depth_m=back_projection_registration.profile.maximum_depth_m,
+                current_station_revision=lambda: observation_producer.current_station_revision,
+                clock=runtime_clock),
+            current_station_revision=lambda: observation_producer.current_station_revision,
+            clock=runtime_clock, max_retained_operations=retention)
+        execution_port_by_route_hash[grasp_query_registration.entry.route.semantic_content_hash] = (
+            grasp_approach_query_executor)
     planned_executors = {}
     for skill_id, version, label, safe_contract in (
         ('motion.move_to_observed_point', "1", 'observed-point-safe', contract_bundle.observed_point_contract),
@@ -2078,6 +2123,7 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
         surface_anchor_executors=surface_anchor_executors,
         tool_entity_executors=tool_entity_executors,
         support_release_query_executor=support_release_query_executor,
+        grasp_approach_query_executor=grasp_approach_query_executor,
         depth_executor=depth_executor,
         rgb_executor=rgb_executor,
         rgbd_capture_executor=rgbd_capture_executor,
