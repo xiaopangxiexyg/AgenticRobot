@@ -99,8 +99,8 @@ def _blue_segment(image, *, language_prompt, pixel_uv, min_score):
 @pytest.mark.integration
 @pytest.mark.optional
 @pytest.mark.slow_sim
-def test_native_mujoco_relation_anchor_and_hover_run_through_the_gateway(tmp_path, monkeypatch):
-    """Relation, surface anchor and hover requests through the admitted MuJoCo service."""
+def test_native_mujoco_relations_hover_and_safe_move_through_the_gateway(tmp_path, monkeypatch):
+    """Relation, anchor and hover queries, then the selected target through motion.move_tcp_to_pose_safe@1."""
     pytest.importorskip("mujoco")
     from agent_gateway.profiles.mujoco.motion_factory import (
         MujocoAgentArtifactStorageConfig,
@@ -115,11 +115,15 @@ def test_native_mujoco_relation_anchor_and_hover_run_through_the_gateway(tmp_pat
         AGENT_SKILL_TERMINAL_OPERATION_STATUSES_V1,
         AgentSkillRequest,
     )
+    from deployments.perception.dmtac_tool_entity import default_tool_entity_by_side
     from deployments.perception.sam2_grounding_dino import (
         encode_grounded_object_segment_artifacts,
     )
     from deployments.perception.sam3_service import Sam3ServiceLocalizer
     from robot_motion.observed_scene import SafeMotionObservationConfig
+    from robot_motion.relative_action import xyzquat_to_pose_matrix
+    from robot_motion.rm65.tool_profiles import load_rm65_tool_profile
+    from robot_motion.tool_entity_scene import pose_matrix
     from sim.mujoco.deploy import MujocoSimHILTargetConfig
 
     localizer = Sam3ServiceLocalizer(endpoint="http://127.0.0.1:8114", timeout_sec=45., min_score=0.3,
@@ -144,11 +148,12 @@ def test_native_mujoco_relation_anchor_and_hover_run_through_the_gateway(tmp_pat
             observation=SafeMotionObservationConfig(roles=("main",)), start_clearance="inherited-positive-v1"),
         enable_tool_object_relations=True, enable_tool_hover_queries=True)
     try:
+        app = session.application
         manifest = session.contract_bundle.route_manifest
         for key in (RELATION, HOVER):
             route = manifest.route(*key).route
             assert route.control_effect_class == "read_only" and route.may_move_robot is False
-        session.application.start_observation_ready()
+        app.start_observation_ready()
         session.start_perception_resources()
         published = session.observation_producer.capture_and_publish(session.service)
         assert published.accepted
@@ -182,7 +187,9 @@ def test_native_mujoco_relation_anchor_and_hover_run_through_the_gateway(tmp_pat
             assert completed.status == "completed", completed
             return completed
 
-        before = session.application.scene.data.qpos.copy()
+        arms = {side: [app.scene.joint_qpos_addr(name) for name in app.scene.arm_specs[side].joint_names]
+                for side in ("left", "right")}
+        before = app.scene.data.qpos.copy()
         relations = run(RELATION, {"objects": [{"label": "cube", "language_prompt": "blue cube"}],
                                    "roles": None, "min_score": 0.3}, timeout_ms=60_000).execution_result
         assert relations["motion_executed"] is False and list(relations["evaluated_sides"]) == ["left", "right"]
@@ -190,25 +197,89 @@ def test_native_mujoco_relation_anchor_and_hover_run_through_the_gateway(tmp_pat
         assert {item["relation"] for item in relations["objects"]} <= {"far", "near"}
         anchor = run(("perception.capture_surface_anchor", "2"), {"role": "main", "selection_mode": "mask_interior",
             "target_pixel_uv": None, "language_prompt": "blue cube", "min_score": 0.3}, timeout_ms=60_000)
-        artifact = next(item.artifact for item in anchor.output_artifact_bindings if item.slot_id == "surface_anchor")
-        reference = session.contract_bundle.tool_entity_registrations[-1].reference_frame_id
-        hover = run(HOVER, {"component_id": "right_arm", "reference_frame_id": reference,
-                            "tip_offset_bounds_xy_m": [[-0.02, 0.02], [-0.02, 0.02]], "clearance_bounds_m": [0.03, 0.10],
-                            "orientation_policy": "preserve", "tool_axis_max_tilt_rad": 0.0, "max_candidates": 8},
-                    bindings=(AgentArtifactBinding(slot_id="surface_anchor", ordinal=0, artifact=artifact),))
-        query = hover.execution_result["hover_query"]
+        binding = AgentArtifactBinding(slot_id="surface_anchor", ordinal=0, artifact=next(
+            item.artifact for item in anchor.output_artifact_bindings if item.slot_id == "surface_anchor"))
+        registration = session.contract_bundle.tool_entity_registrations[-1]
+        common = {"component_id": "right_arm", "reference_frame_id": registration.reference_frame_id,
+                  "tip_offset_bounds_xy_m": [[-0.02, 0.02], [-0.02, 0.02]], "clearance_bounds_m": [0.03, 0.10],
+                  "tool_axis_max_tilt_rad": 0.0, "max_candidates": 8}
+        # A preserved horizontal tool above this cube puts the wrist into the
+        # twin's central camera pole (the same fixed geometry as the station
+        # URDF); every proposal must be refused, never silently accepted.
+        preserved = run(HOVER, {**common, "orientation_policy": "preserve"},
+                        bindings=(binding,)).execution_result["hover_query"]
+        assert preserved["status"] == "path_rejected", preserved["reason"]
+        assert {item["reason"] for item in preserved["candidate_attempts"]} == {"safe_tcp_target_blocked"}
+        down = run(HOVER, {**common, "orientation_policy": "tool_axis_down"}, bindings=(binding,))
+        registration.payload_validator.validate_execution_result_for_parameters(
+            {**common, "orientation_policy": "tool_axis_down"}, down.execution_result)
+        query = down.execution_result["hover_query"]
         assert query["motion_executed"] is False and query["execution_authorized"] is False
-        assert query["status"] in {"path_found", "query_incomplete", "path_rejected"}
-        assert query["start_clearance"] == "inherited-positive-v1"
-        if query["status"] == "path_found":
-            assert query["achieved"]["inside_requested_region"] is True
-            assert len(query["target_tcp_pose_xyz_quat_xyzw"]) == 7
+        assert query["start_clearance"] == "inherited-positive-v1" and query["candidate_budget_sec"] == 5.
+        assert query["status"] == "path_found", [(a["status"], a["reason"]) for a in query["candidate_attempts"]]
+        assert query["achieved"]["inside_requested_region"] is True
         # Read-only Skills never moved the simulated arms.
-        np.testing.assert_allclose(session.application.scene.data.qpos[:12], before[:12], atol=1e-9)
-        print("native tool-entity", [(item["side"], item["label"], item["relation"], item["surface_distance_m"])
-              for item in relations["objects"]], {k: query[k] for k in (
-            "status", "reason", "selected_candidate_index", "achieved", "attempted_candidate_count",
-            "path_planning_wall_sec", "observed_voxel_count", "target_tcp_pose_xyz_quat_xyzw")},
-              [(a["candidate_index"], a["status"], a["reason"]) for a in query["candidate_attempts"]])
+        for indices in arms.values():
+            np.testing.assert_allclose(app.scene.data.qpos[indices], before[indices], atol=1e-12)
+
+        # Two-step use: the selected target goes unchanged to the reviewed safe motion Skill.
+        safe_profile = session.contract_bundle.safe_tcp_pose_contract.motion_profile
+        assert safe_profile.reference_frame_id == query["reference_frame_id"]
+        adapter = session.wire_adapter(authenticated_client_id=client)
+        observation = adapter.get_observation_snapshot()
+        entry = manifest.route("motion.move_tcp_to_pose_safe", "1")
+        route = entry.route
+        parameter = route.allowed_parameter_profiles[0]
+        base = session.contract_bundle.motion_profile
+        target = [float(x) for x in query["target_tcp_pose_xyz_quat_xyzw"]]
+        sequence[0] += 1
+        move = AgentSkillRequest(client_id=client, request_id=f"request:{sequence[0]}",
+            idempotency_key=f"tool:{sequence[0]}", client_sequence=sequence[0],
+            runtime_session_id=manifest.runtime_session_id, skill_route_manifest_hash=manifest.semantic_content_hash,
+            expected_station_revision=int(observation["station_revision"]), skill_id=route.skill_id,
+            skill_version=route.skill_version, skill_definition_hash=route.skill_definition_hash,
+            route_id=route.route_id, route_version=route.route_version, route_hash=route.semantic_content_hash,
+            deployment_binding_hash=entry.deployment_binding.deployment_binding_hash,
+            parameter_profile_id=parameter.parameter_profile_id, parameter_profile_hash=parameter.parameter_profile_hash,
+            parameters={"pose_targets_by_component": {base.component_id: target},
+                "reference_frame_id": base.reference_frame_id, "reference_frame_spec_hash": base.reference_frame_spec_hash,
+                "controlled_frame_id": "tool_tcp", "frame_graph_hash": base.frame_graph_hash,
+                "tool_config_hash": base.tool_config_hash, "calibration_hash": base.calibration_hash},
+            observation_snapshot_id=observation["snapshot_id"], requested_mode="sim_active",
+            requested_timeout_ms=min(120_000, route.max_operation_duration_ms))
+        admitted = adapter.submit_skill_request(move.to_wire())
+        assert admitted["accepted"], admitted
+        assert session.wait(timeout_sec=90)
+        moved = session.service.operation_store.get(admitted["operation"]["operation_id"])
+        assert moved.execution_outcome == "completed", moved
+        final = adapter.get_observation_snapshot()["measurement_summary"]["pose_xyz_quat_xyzw_by_component"][
+            base.component_id]
+        assert np.linalg.norm(np.asarray(final[:3]) - np.asarray(target[:3])) <= safe_profile.translation_tolerance_m
+        # The executed hover against the native cube: the gripper box clears it
+        # inside the requested band (plus arrival tolerance), tip above it, no contact.
+        profiles = {side: load_rm65_tool_profile(getattr(app.task_config, side + "_tool_profile_path"), side=side)
+                    for side in ("left", "right")}
+        entity = default_tool_entity_by_side({side: tuple(item["tcp"]["pose_flange_m_rad"])
+                                              for side, item in profiles.items()}, profiles)["right"]
+        capture_port = session.back_projection_provider.capture_port
+        world_from_public = xyzquat_to_pose_matrix(app.transform_tcp_pose_xyzquat((0., 0., 0., 0., 0., 0., 1.),
+            source_frame_id=query["reference_frame_id"], target_frame_id=capture_port.source_frame_id))
+        tcp_world = world_from_public @ pose_matrix(final)
+        model, mujoco = app.scene.model, app.scene.mujoco
+        cube = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, "debug_cube_collision")
+        cube_top = float(app.scene.data.geom_xpos[cube][2] + model.geom_size[cube][2])
+        clearance = float(entity.corners_world(tcp_world)[:, 2].min()) - cube_top
+        assert 0.03 - 0.02 <= clearance <= 0.10 + 0.02, clearance
+        tip = entity.tip_world(tcp_world)
+        assert np.linalg.norm(tip[:2] - app.scene.data.geom_xpos[cube][:2]) <= model.geom_size[cube][0] + 0.02
+        touching = [(int(c.geom1), int(c.geom2)) for c in app.scene.data.contact[:app.scene.data.ncon]
+                    if cube in (int(c.geom1), int(c.geom2))
+                    and "table" not in (mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_GEOM,
+                        int(c.geom2 if int(c.geom1) == cube else c.geom1)) or "")]
+        assert touching == []
+        print("native tool-entity hover", {"clearance_m": clearance, "tip_xy_world": tip[:2].tolist(),
+              "selected_candidate_index": query["selected_candidate_index"],
+              "hover_wall_sec": query["path_planning_wall_sec"], "relations": [
+                  (item["side"], item["relation"]) for item in relations["objects"]]})
     finally:
         session.close()

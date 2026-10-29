@@ -3164,6 +3164,9 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
                     "observed_scene": safe_motion_observation_profile_hash,
                     "safe_motion_route": safe_entry[2].semantic_content_hash},
                     domain="agenticrobot.mujoco.tool_hover_planner_binding.v1")),)
+            if tool_entity_registrations[-1].reference_frame_id != safe_entry[3].motion_profile.reference_frame_id:
+                # The selected pose is submitted unchanged to the safe TCP Route.
+                raise ValueError("MuJoCo tool hover results must use the safe TCP Route's public frame.")
     tcp_pose_comparison_registration = None
     if enable_tcp_pose_comparison:
         from agent_gateway.profiles.tcp_pose_comparison import (

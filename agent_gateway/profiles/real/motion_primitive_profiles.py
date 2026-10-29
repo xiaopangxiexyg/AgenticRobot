@@ -1820,6 +1820,9 @@ def build_real_agent_primitive_contract_bundle(
                 {"planner": tool_hover_planner_profile_hash,
                  "safe_motion_route": safe_pose_route.semantic_content_hash},
                 domain="agenticrobot.real.tool_hover_planner_binding.v1"))
+        if tool_hover_registration.reference_frame_id != pose_target_profile.reference_frame_id:
+            # The selected pose is submitted unchanged to the safe TCP Route.
+            raise ValueError("Real tool hover results must use the safe TCP Route's public frame.")
     perception_registrations = list(
         ()
         if perception_capture is None

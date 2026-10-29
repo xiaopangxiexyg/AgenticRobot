@@ -370,17 +370,21 @@ def validate_hover_query(value, *, component_ids, reference_frame_id):
 
 
 def validate_hover_result_for_parameters(parameters, result):
+    """Bind the result to its request; stored results may hold tuples instead of lists."""
+    def nested(value):
+        return [[float(x) for x in item] for item in value]
+
     query = result["hover_query"]
     for key in ("component_id", "reference_frame_id", "orientation_policy"):
         if query[key] != parameters[key]:
             raise ValueError("Hover query changed its requested component, frame or orientation.")
-    if (query["tip_offset_bounds_xy_m"] != [[float(x) for x in item] for item in parameters["tip_offset_bounds_xy_m"]]
-            or query["clearance_bounds_m"] != [float(x) for x in parameters["clearance_bounds_m"]]
+    if (nested(query["tip_offset_bounds_xy_m"]) != nested(parameters["tip_offset_bounds_xy_m"])
+            or [float(x) for x in query["clearance_bounds_m"]] != [float(x) for x in parameters["clearance_bounds_m"]]
             or not math.isclose(query["tool_axis_max_tilt_rad"], parameters["tool_axis_max_tilt_rad"],
                                 abs_tol=1e-12, rel_tol=0.)
             or query["candidate_count"] > parameters["max_candidates"]):
         raise ValueError("Hover query changed its requested bounds.")
-    if list(query["anchor_xyz_m"]) != list(result["surface_anchor"]["measurement"]["world_xyz_m"]):
+    if [float(x) for x in query["anchor_xyz_m"]] != [float(x) for x in result["surface_anchor"]["measurement"]["world_xyz_m"]]:
         raise ValueError("Hover query changed its measured anchor.")
 
 

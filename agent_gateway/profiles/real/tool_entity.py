@@ -133,6 +133,9 @@ class RealToolHoverPlanner:
     def prepare_scene(self, *, captures, planning_qpos_by_side, cancel_requested):
         if cancel_requested():
             raise InterruptedError("Hover query cancelled.")
+        # Build the planner before the search so its one-time preparation is
+        # never charged to a single proposal's budget.
+        self._instance()
         cloud = obstacle_cloud_from_captures(captures=captures, config=self.observation_config,
             reference_frame_id=self.geometry_frame_id, self_filter=self.self_filter,
             planning_qpos_by_side=planning_qpos_by_side,

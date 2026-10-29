@@ -1107,6 +1107,19 @@ def test_entity_hover_targets_the_gripper_box_and_checks_achieved_fk(entity_sess
     assert query.audit()["qpos_by_side"] == {s: [0.] * 6 for s in ("left", "right")}
 
 
+def test_entity_hover_gives_each_candidate_five_seconds_and_tcp_regions_three(entity_session):
+    query, planner = entity_session
+    now = [0.]
+    query._clock = lambda: now[0]
+    query.plan_entity_hover_region(**HOVER)
+    assert planner.calls[-1]["time_budget_sec"] == pytest.approx(5.)
+    assert query.audit()["region_queries"][-1]["candidate_budget_sec"] == 5.
+    query.plan_relation_region(side="right", target_reference="top-a",
+        offset_bounds_xyz_m=[[0., 0.], [0., 0.], [.08, .12]])
+    assert planner.calls[-1]["time_budget_sec"] == pytest.approx(3.)
+    assert "candidate_budget_sec" not in query.audit()["region_queries"][-1]
+
+
 class SinkingPlanner(Planner):
     """Arrives 3 cm lower than requested: inside TCP tolerance, outside the hover."""
 

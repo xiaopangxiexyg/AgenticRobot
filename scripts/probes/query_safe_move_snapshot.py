@@ -35,7 +35,8 @@ from robot_motion.tool_entity_goals import (
 )
 # Shared with the RealMan and MuJoCo Gateways; re-exported for existing callers.
 from robot_motion.tool_entity_scene import (  # noqa: F401
-    ENTITY_HOVER_SUPPORT_WINDOW_M, OBJECT_MASK_EROSION_PX, SURFACE_AMBIGUITY_MINIMUM_VOXELS,
+    ENTITY_HOVER_CANDIDATE_BUDGET_SEC, ENTITY_HOVER_SUPPORT_WINDOW_M, OBJECT_MASK_EROSION_PX,
+    SURFACE_AMBIGUITY_MINIMUM_VOXELS,
     SURFACE_AMBIGUITY_SHARE, MeasuredObjectSurface, describe_tool_object_relations as _describe_relations,
     entity_hover_proposals, hover_candidate_relation, object_surface_from_mask, pose_matrix as _pose_matrix,
     validate_entity_hover_endpoint,
@@ -654,6 +655,7 @@ class SavedSceneSkillQuery:
                 "orientation_policy": orientation_policy, "candidate_policy": "entity_proximity",
                 "tool_axis_max_tilt_rad": tool_axis_max_tilt_rad,
                 "support_window_m": window, "support_margin_m": margin,
+                "candidate_budget_sec": ENTITY_HOVER_CANDIDATE_BUDGET_SEC,
                 "tool_entity": entity.identity()}
 
         def generate():
@@ -683,7 +685,7 @@ class SavedSceneSkillQuery:
         return self._search_region_locked(side=side, target_reference=target_reference,
             summary_fields=summary_fields, began=began,
             hidden_fields=("tip_offset_bounds_xy_m", "clearance_bounds_m", "tool_entity"),
-            generate=generate, validate=validate)
+            generate=generate, validate=validate, candidate_budget_sec=ENTITY_HOVER_CANDIDATE_BUDGET_SEC)
 
     def _plan_relation_region_locked(self, *, side, target_reference, offset_bounds_xyz_m,
                                      offset_frame, max_candidates, began):
@@ -727,13 +729,14 @@ class SavedSceneSkillQuery:
             hidden_fields=("offset_bounds_xyz_m",), generate=generate, validate=validate)
 
     def _search_region_locked(self, *, side, target_reference, summary_fields, hidden_fields, began,
-                              generate, validate):
+                              generate, validate, candidate_budget_sec=3.):
         """Budgeted first-certified-path search shared by explicit region queries.
 
         ``generate`` returns ordered proposals; it runs inside the charged
         region budget. ``validate(row)`` checks a found plan's achieved FK
         against the ORIGINAL request and returns ``(record, inside)``. Budget,
-        retry and revocation rules are identical for every query kind.
+        retry and revocation rules are identical for every query kind; only the
+        per-candidate cap differs (3 s TCP regions, 5 s gripper-entity hover).
         """
         summary = None
         public_result = None
@@ -811,7 +814,7 @@ class SavedSceneSkillQuery:
             for index, candidate in enumerate(candidates):
                 candidate_started = self._clock()
                 self._planning_seconds = region_budget_start + (candidate_started - began)
-                remaining = min(3., deadline - candidate_started)
+                remaining = min(float(candidate_budget_sec), deadline - candidate_started)
                 if self._query_budget is not None:
                     remaining = min(remaining,
                         self._query_budget["maximum_planning_sec"] - self._planning_seconds,

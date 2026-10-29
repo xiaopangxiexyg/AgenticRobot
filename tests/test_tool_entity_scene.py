@@ -95,6 +95,14 @@ def test_first_certified_proposal_is_selected_and_never_executed():
     assert result["semantics"] == goals.TOOL_ENTITY_HOVER_SEMANTICS_V1
 
 
+def test_each_proposal_gets_the_five_second_hover_budget():
+    assert scene.ENTITY_HOVER_CANDIDATE_BUDGET_SEC == 5. and scene.ENTITY_HOVER_REGION_BUDGET_SEC == 20.
+    retry = scene.HoverPlanOutcome(status="path_rejected", reason="ik_search_exhausted", retryable=True)
+    result, calls = _search([retry, _found], clock=lambda: 0.)
+    assert [budget for _, budget in calls] == [5., 5.]
+    assert result["candidate_budget_sec"] == 5. and result["region_budget_sec"] == 20.
+
+
 def test_an_endpoint_outside_the_original_bounds_is_not_certified():
     def drifted(pose):
         moved = list(pose)

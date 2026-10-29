@@ -55,9 +55,11 @@ RELATION_MAXIMUM_DEPTH_M = 1.5
 # hovering tool footprint; higher points are reported as overhead obstacles.
 ENTITY_HOVER_SUPPORT_WINDOW_M = 0.30
 # One hover search: every candidate starts at the same measured state, at most
-# this long per candidate and in total (the saved-scene region loop budgets).
+# this long per candidate and in total. Reoriented hovers need more than the
+# 3 s TCP-region cap: on the saved samples a 45-degree cone found 3/12 paths at
+# 3 s/20 s and 8/12 at 5 s/20 s (user decision 2026-10-29: 5 s per candidate).
 ENTITY_HOVER_REGION_BUDGET_SEC = 20.
-ENTITY_HOVER_CANDIDATE_BUDGET_SEC = 3.
+ENTITY_HOVER_CANDIDATE_BUDGET_SEC = 5.
 SURFACE_CLUSTER_FIELDS = ("voxel_count", "component_count", "kept_voxel_count",
                           "second_component_voxel_count")
 RELATION_EVIDENCE_SCOPE = "measured_visible_surfaces_vs_gripper_screening_solids_and_bound_contact_solids"
