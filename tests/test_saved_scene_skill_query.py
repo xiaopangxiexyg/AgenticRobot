@@ -1120,6 +1120,41 @@ def test_entity_hover_gives_each_candidate_five_seconds_and_tcp_regions_three(en
     assert "candidate_budget_sec" not in query.audit()["region_queries"][-1]
 
 
+def test_entity_hover_records_the_session_capped_candidate_budget():
+    query = _entity_query(Planner())
+    try:
+        query._query_budget = {"maximum_calls": 8, "maximum_planning_sec": 20., "maximum_call_planning_sec": 3.}
+        query.plan_entity_hover_region(**HOVER)
+        assert query.audit()["region_queries"][-1]["candidate_budget_sec"] == 3.
+    finally:
+        query.close()
+
+
+class EnvelopeThenFoundPlanner(Planner):
+    """First proposal outside the TCP envelope: a per-target rejection."""
+
+    def plan_with_observed_cloud(self, cloud, **kwargs):
+        if not self.calls:
+            self.calls.append(kwargs)
+            raise RM65GraspTrajectoryPlanningError("target_safety_envelope_blocked")
+        return super().plan_with_observed_cloud(cloud, **kwargs)
+
+
+def test_entity_hover_retries_per_target_planner_rejections_like_the_gateway():
+    planner = EnvelopeThenFoundPlanner()
+    query = _entity_query(planner)
+    try:
+        result = query.plan_entity_hover_region(**HOVER)
+        assert result["status"] == "path_found" and result["selected_candidate_index"] == 1
+        # TCP region queries keep their original, narrower retry set.
+        planner.calls.clear()
+        result = query.plan_relation_region(side="right", target_reference="top-a",
+            offset_bounds_xyz_m=[[0., 0.], [0., 0.], [.08, .12]])
+        assert (result["status"], result["reason"]) == ("path_rejected", "target_safety_envelope_blocked")
+    finally:
+        query.close()
+
+
 class SinkingPlanner(Planner):
     """Arrives 3 cm lower than requested: inside TCP tolerance, outside the hover."""
 

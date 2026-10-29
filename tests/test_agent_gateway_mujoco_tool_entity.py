@@ -42,6 +42,8 @@ def test_tool_entity_cli_flags_are_default_off():
 @pytest.mark.parametrize(("flags", "message"), [
     (["--enable-tool-hover-queries"], "--enable-tool-hover-queries requires"),
     (["--enable-tool-object-relations"], "--enable-tool-object-relations requires --artifact-root"),
+    # The frozen multi-view capture belongs to the planned safe TCP owner.
+    (["--enable-tool-object-relations", "--artifact-root", "/unused/artifacts"], "--enable-safe-tcp-pose"),
 ])
 def test_tool_entity_prerequisites_fail_before_resources(monkeypatch, capsys, flags, message):
     monkeypatch.setattr(gateway_cli, "build_mujoco_agent_tcp_pose_gateway_session",
@@ -231,7 +233,8 @@ def test_native_mujoco_relations_hover_and_safe_move_through_the_gateway(tmp_pat
         route = entry.route
         parameter = route.allowed_parameter_profiles[0]
         base = session.contract_bundle.motion_profile
-        target = [float(x) for x in query["target_tcp_pose_xyz_quat_xyzw"]]
+        # The pose the hover planner reached and re-measured; preserve_target keeps it.
+        target = [float(x) for x in query["planned_endpoint_pose_xyz_quat_xyzw"]]
         sequence[0] += 1
         move = AgentSkillRequest(client_id=client, request_id=f"request:{sequence[0]}",
             idempotency_key=f"tool:{sequence[0]}", client_sequence=sequence[0],
@@ -244,7 +247,9 @@ def test_native_mujoco_relations_hover_and_safe_move_through_the_gateway(tmp_pat
             parameters={"pose_targets_by_component": {base.component_id: target},
                 "reference_frame_id": base.reference_frame_id, "reference_frame_spec_hash": base.reference_frame_spec_hash,
                 "controlled_frame_id": "tool_tcp", "frame_graph_hash": base.frame_graph_hash,
-                "tool_config_hash": base.tool_config_hash, "calibration_hash": base.calibration_hash},
+                "tool_config_hash": base.tool_config_hash, "calibration_hash": base.calibration_hash,
+                # Keep the executed hover inside the certified bounds (see the Skill summary).
+                "pose_goal_policy": "preserve_target"},
             observation_snapshot_id=observation["snapshot_id"], requested_mode="sim_active",
             requested_timeout_ms=min(120_000, route.max_operation_duration_ms))
         admitted = adapter.submit_skill_request(move.to_wire())
@@ -269,7 +274,7 @@ def test_native_mujoco_relations_hover_and_safe_move_through_the_gateway(tmp_pat
         cube = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, "debug_cube_collision")
         cube_top = float(app.scene.data.geom_xpos[cube][2] + model.geom_size[cube][2])
         clearance = float(entity.corners_world(tcp_world)[:, 2].min()) - cube_top
-        assert 0.03 - 0.02 <= clearance <= 0.10 + 0.02, clearance
+        assert 0.03 - 0.005 <= clearance <= 0.10 + 0.005, clearance
         tip = entity.tip_world(tcp_world)
         assert np.linalg.norm(tip[:2] - app.scene.data.geom_xpos[cube][:2]) <= model.geom_size[cube][0] + 0.02
         touching = [(int(c.geom1), int(c.geom2)) for c in app.scene.data.contact[:app.scene.data.ncon]

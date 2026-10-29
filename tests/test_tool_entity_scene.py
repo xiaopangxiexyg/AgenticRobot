@@ -151,6 +151,19 @@ def test_a_late_answer_is_not_a_certified_result():
     assert result["target_tcp_pose_xyz_quat_xyzw"] is None
 
 
+def test_a_late_rejection_is_unresolved_not_final():
+    now = [0.]
+
+    def slow_reject(pose):
+        now[0] += 4.
+        return scene.HoverPlanOutcome(status="path_rejected", reason="path_start_collision_blocked")
+
+    result, calls = _search([slow_reject], clock=lambda: now[0], region_budget_sec=6., candidate_budget_sec=3.)
+    assert (result["status"], result["reason"]) == ("query_incomplete", "query_budget_exhausted")
+    assert all(item["region_validation_budget_exceeded"] for item in result["candidate_attempts"])
+    assert result["unresolved_candidate_count"] == len(calls) == 2
+
+
 def test_deadline_before_generation_reports_budget_exhaustion():
     result, calls = _search([_found], clock=lambda: 10., deadline=5.)
     assert (result["status"], result["reason"], result["candidate_count"], calls) == (

@@ -1923,6 +1923,9 @@ def assemble_real_agent_primitive_gateway_session(
         if hover_registration is not None:
             if anchor_registration is None or tool_entity_options.hover_planner is None:
                 raise ValueError("Real tool hover queries require surface anchor v2 and their planner.")
+            if (tool_entity_options.hover_planner.max_inter_camera_skew_sec
+                    != perception_provider.max_inter_camera_skew_ms / 1000.0):
+                raise ValueError("Real tool hover queries must admit scenes like the safe move.")
 
             def lookup_tool_anchor(identifier):
                 source_request = service.operation_store.request_for_operation(identifier)

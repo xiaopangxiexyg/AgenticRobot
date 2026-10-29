@@ -28,13 +28,23 @@ from teleop_runtime.skill_deploy.rm65_grasp_trajectory import (
 from .motion_observed_scene import obstacle_cloud_from_captures
 
 # Planner rejections that are specific to one proposed endpoint or path; any
-# other reason (for example a blocked start) applies to every proposal.
+# other reason (for example a blocked start or an unavailable check) applies to
+# every proposal. Same per-target set as the planner's own target fallback,
+# restricted to ordinary TCP moves, plus the saved-scene region retry reasons.
 REAL_HOVER_RETRYABLE_REASONS = frozenset({
-    "endpoint_collision_blocked", "endpoint_clearance_blocked", "ik_search_exhausted",
-    "path_collision_blocked", "path_target_safety_envelope_blocked", "grasp_path_motion_quality_exceeded",
-    "safe_tcp_endpoint_pose_tolerance_exceeded"})
+    "endpoint_collision_blocked", "endpoint_clearance_blocked", "endpoint_safety_envelope_blocked",
+    "ik_search_exhausted", "path_collision_blocked", "path_search_exhausted", "path_target_collision_blocked",
+    "path_target_safety_envelope_blocked", "target_safety_envelope_blocked",
+    "grasp_path_motion_quality_exceeded", "safe_tcp_endpoint_pose_tolerance_exceeded"})
 REAL_HOVER_SPEED_SCALE = 0.2
-REAL_HOVER_MAX_INTER_CAMERA_SKEW_SEC = 0.1
+
+
+def real_hover_rejection_outcome(reason_code: str) -> HoverPlanOutcome:
+    """Map one RealMan planner rejection to the shared hover search outcome."""
+    if reason_code == "path_planning_time_budget_exhausted":
+        return HoverPlanOutcome(status="query_incomplete", reason=reason_code)
+    return HoverPlanOutcome(status="path_rejected", reason=reason_code,
+                            retryable=reason_code in REAL_HOVER_RETRYABLE_REASONS)
 
 
 @dataclass(frozen=True)
@@ -106,7 +116,8 @@ class RealToolHoverPlanner:
 
     def __init__(self, *, planner_factory: Callable[[], object], self_filter, observation_config,
                  geometry_frame_id: str, translation_tolerance_m: float, rotation_tolerance_rad: float,
-                 start_clearance: str, profile_identity: Mapping[str, object]):
+                 start_clearance: str, profile_identity: Mapping[str, object],
+                 max_inter_camera_skew_sec: float = 0.1):
         if not callable(planner_factory) or self_filter is None:
             raise TypeError("Hover planning needs a planner factory and the captured-robot filter.")
         self._planner_factory = planner_factory
@@ -118,8 +129,14 @@ class RealToolHoverPlanner:
         self.translation_tolerance_m = float(translation_tolerance_m)
         self.rotation_tolerance_rad = float(rotation_tolerance_rad)
         self.start_clearance = start_clearance
+        skew = float(max_inter_camera_skew_sec)
+        if not 0. < skew < float("inf"):
+            raise ValueError("max_inter_camera_skew_sec must be positive and finite.")
+        # Same admission as the safe move: the perception provider's skew bound.
+        self.max_inter_camera_skew_sec = skew
         self.profile_hash = canonical_content_hash({**dict(profile_identity),
             "speed_scale": REAL_HOVER_SPEED_SCALE, "start_clearance": start_clearance,
+            "max_inter_camera_skew_sec": skew,
             "translation_tolerance_m": self.translation_tolerance_m,
             "rotation_tolerance_rad": self.rotation_tolerance_rad},
             domain="agenticrobot.real.tool_hover_planner.v1")
@@ -139,7 +156,7 @@ class RealToolHoverPlanner:
         cloud = obstacle_cloud_from_captures(captures=captures, config=self.observation_config,
             reference_frame_id=self.geometry_frame_id, self_filter=self.self_filter,
             planning_qpos_by_side=planning_qpos_by_side,
-            max_inter_camera_skew_sec=REAL_HOVER_MAX_INTER_CAMERA_SKEW_SEC)
+            max_inter_camera_skew_sec=self.max_inter_camera_skew_sec)
         return ToolHoverScene(frame_id=self.geometry_frame_id, points_m=np.asarray(cloud.points_m, dtype=float),
             quantization_margin_m=float(cloud.quantization_margin_m), planning_input=cloud)
 
@@ -154,10 +171,7 @@ class RealToolHoverPlanner:
                 speed_scale=REAL_HOVER_SPEED_SCALE, require_grasp_approach=False,
                 time_budget_sec=time_budget_sec, pose_goal_policy="within_arrival_tolerance")
         except RM65GraspTrajectoryPlanningError as error:
-            if error.reason_code == "path_planning_time_budget_exhausted":
-                return HoverPlanOutcome(status="query_incomplete", reason=error.reason_code)
-            return HoverPlanOutcome(status="path_rejected", reason=error.reason_code,
-                                    retryable=error.reason_code in REAL_HOVER_RETRYABLE_REASONS)
+            return real_hover_rejection_outcome(error.reason_code)
         last = {s: np.asarray(trajectory.qpos_by_side[s][-1], dtype=float) for s in ("left", "right")}
         actual = planner.tool_tcp_poses_for_qpos_pair(qpos_by_side=last)[side]
         return HoverPlanOutcome(status="path_found", reason="planned_not_executed",
@@ -166,4 +180,5 @@ class RealToolHoverPlanner:
             trajectory_duration_sec=float(trajectory.time_from_start_sec[-1]))
 
 
-__all__ = ["REAL_HOVER_RETRYABLE_REASONS", "RealToolEntityOptions", "RealToolHoverPlanner", "RealToolScenePort"]
+__all__ = ["REAL_HOVER_RETRYABLE_REASONS", "RealToolEntityOptions", "RealToolHoverPlanner", "RealToolScenePort",
+           "real_hover_rejection_outcome"]

@@ -233,6 +233,23 @@ def _bounded_interval(value, *, name: str, lower: float, upper: float) -> tuple[
     return low, high
 
 
+def require_vertical_frame(public_from_geometry) -> np.ndarray:
+    """Hover clearance, footprint and ``tool_axis_down`` use public +Z as up.
+
+    Accept only a rigid public-from-geometry transform that keeps that axis
+    vertical (a yaw plus translation), so the geometry frame's up is public up.
+    """
+    transform = np.asarray(public_from_geometry, dtype=float).reshape(4, 4)
+    rotation = transform[:3, :3]
+    if (not np.isfinite(transform).all() or not np.allclose(transform[3], (0., 0., 0., 1.), atol=1e-9)
+            or not np.allclose(rotation.T @ rotation, np.eye(3), atol=1e-8)
+            or not math.isclose(float(np.linalg.det(rotation)), 1., abs_tol=1e-8)):
+        raise ValueError("public_from_geometry must be a rigid transform.")
+    if not np.allclose(rotation[:, 2], (0., 0., 1.), atol=1e-6) or not np.allclose(rotation[2], (0., 0., 1.), atol=1e-6):
+        raise ValueError("Hover geometry needs a public frame whose +Z is the geometry frame's vertical.")
+    return transform
+
+
 def validate_hover_request(*, tip_offset_bounds_xy_m, clearance_bounds_m, orientation_policy,
                            tool_axis_max_tilt_rad, max_candidates) -> None:
     """Reject a malformed hover request before any capture or planning.
@@ -405,7 +422,6 @@ def search_entity_hover_paths(*, entity: ToolEntityBox, anchor_xyz_m, current_tc
                    "proposal": hover_candidate_relation(candidate, orientation_policy=orientation_policy,
                        tool_axis_max_tilt_rad=float(tool_axis_max_tilt_rad))}
         summary["candidate_attempts"].append(attempt)
-        overran = finished - started > remaining or finished > stop
         if outcome.status == "path_found":
             record, within = validate_entity_hover_endpoint(entity=entity,
                 endpoint_pose_xyz_quat_xyzw=outcome.endpoint_pose_xyz_quat_xyzw, anchor_xyz_m=anchor_xyz_m,
@@ -413,14 +429,15 @@ def search_entity_hover_paths(*, entity: ToolEntityBox, anchor_xyz_m, current_tc
                 clearance_bounds_m=clearance_bounds, orientation_policy=orientation_policy,
                 tool_axis_max_tilt_rad=float(tool_axis_max_tilt_rad), rotation_tolerance_rad=rotation_tolerance_rad)
             attempt.update(record)
-            if overran:
-                # A late answer is not a certified result of this budget.
-                attempt["region_validation_budget_exceeded"] = True
-                summary["unresolved_candidate_count"] += 1
-                if finished < stop:
-                    continue
-                summary.update(status="query_incomplete", reason="query_budget_exhausted")
-                break
+        if finished - started > remaining or finished > stop:
+            # A late answer, found or rejected, is not a result of this budget.
+            attempt["region_validation_budget_exceeded"] = True
+            summary["unresolved_candidate_count"] += 1
+            if finished < stop:
+                continue
+            summary.update(status="query_incomplete", reason="query_budget_exhausted")
+            break
+        if outcome.status == "path_found":
             if not within:
                 continue
             summary.update(status="path_found", reason="planned_not_executed", selected_candidate_index=index,
@@ -467,6 +484,7 @@ __all__ = [
     "object_surface_from_mask",
     "pose_matrix",
     "pose_xyz_quat_xyzw",
+    "require_vertical_frame",
     "search_entity_hover_paths",
     "surface_ambiguous",
     "validate_entity_hover_endpoint",

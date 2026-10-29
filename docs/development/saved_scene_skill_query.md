@@ -203,6 +203,11 @@ entity identity. The same geometry and search are published on the RealMan
 and MuJoCo Gateways as `perception.query_tool_hover_paths@1` (see
 [`tool_entity_skills.zh-CN.md`](../agent_gateway/tool_entity_skills.zh-CN.md));
 this probe does not change the existing TCP relation and region semantics.
+Two differences matter when comparing the probe with the Gateway Skill: the
+probe evaluates `tip_offset_bounds_xy_m` in `dual_arm_solver_world`, while the
+Gateway uses the public Station frame (rotated 180 degrees about Z), so convert
+one-sided X/Y bounds; and hover proposals retry the planner's per-target
+rejections (the Gateway hover set), while TCP regions keep their original set.
 
 ## Gripper-object relations
 

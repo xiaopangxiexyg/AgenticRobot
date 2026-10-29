@@ -228,7 +228,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--enable-relation-goal-queries', action='store_true', help='Expose one general anchored relation-path query; requires --enable-surface-anchors.')
     parser.add_argument('--enable-tool-object-relations', action='store_true',
         help=('Publish read-only perception.describe_tool_object_relations@1 (segmented frozen multi-view RGB-D vs the '
-              'reviewed DMTAC gripper, same implementation as the RealMan Gateway); requires --artifact-root and segmentation.'))
+              'reviewed DMTAC gripper, same implementation as the RealMan Gateway); requires --artifact-root, '
+              'segmentation and --enable-safe-tcp-pose (owner of the frozen capture).'))
     parser.add_argument('--enable-tool-hover-queries', action='store_true',
         help=('Publish read-only perception.query_tool_hover_paths@1 (gripper-box hover paths checked on the observed '
               'RGB-D scene by a private safe TCP planner, never activated); requires --enable-surface-anchor-v2 and '
@@ -703,8 +704,8 @@ def main(argv: list[str] | None = None) -> int:
         )
     if args.enable_surface_anchor_v2 and not args.enable_surface_anchors:
         parser.error("--enable-surface-anchor-v2 requires surface anchors and segmentation")
-    if args.enable_tool_object_relations and args.artifact_root is None:
-        parser.error("--enable-tool-object-relations requires --artifact-root and segmentation")
+    if args.enable_tool_object_relations and (args.artifact_root is None or not args.enable_safe_tcp_pose):
+        parser.error("--enable-tool-object-relations requires --artifact-root, segmentation and --enable-safe-tcp-pose")
     if args.enable_tool_hover_queries and not (args.enable_surface_anchor_v2 and args.enable_observed_point_motion):
         parser.error("--enable-tool-hover-queries requires --enable-surface-anchor-v2 and --enable-observed-point-motion")
     if args.sam3_multi_instance_text and not args.enable_object_localization:

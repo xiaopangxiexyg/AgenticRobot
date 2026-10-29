@@ -17,7 +17,6 @@ in the public reference frame. Nothing here moves a robot or retains a plan.
 
 from __future__ import annotations
 
-import math
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
 
@@ -70,6 +69,7 @@ from robot_motion.tool_entity_scene import (
     object_surface_from_mask,
     pose_matrix,
     pose_xyz_quat_xyzw,
+    require_vertical_frame,
     search_entity_hover_paths,
 )
 
@@ -166,7 +166,7 @@ def build_tool_object_relation_registration(*, segmentation, back_projection, ro
     def validate_result_for_parameters(parameters, result):
         validate_parameters(parameters)
         validate_result(result)
-        validate_relation_result_for_parameters(parameters, result)
+        validate_relation_result_for_parameters(parameters, result, roles=roles)
 
     validator = AgentSkillPayloadValidatorSet(validator_id="tool-object-relations:" + profile_hash,
         skill_id=RELATION_SKILL_ID, skill_version="1", route_id=route.route_id, route_version="1",
@@ -281,19 +281,15 @@ def _capture_payload(capture):
             "capture_qpos_by_side": _qpos_payload(capture.capture_qpos_by_side)}
 
 
-def _rigid(transform):
-    transform = np.asarray(transform, dtype=float).reshape(4, 4)
-    rotation = transform[:3, :3]
-    if (not np.isfinite(transform).all() or not np.allclose(transform[3], (0., 0., 0., 1.), atol=1e-9)
-            or not np.allclose(rotation.T @ rotation, np.eye(3), atol=1e-8)
-            or not math.isclose(float(np.linalg.det(rotation)), 1., abs_tol=1e-8)):
-        raise ValueError("public_from_geometry must be a rigid transform.")
-    return transform
-
-
 def run_tool_object_relations(*, parameters, roles, reference_frame_id, scene_port, segmentation_provider,
-                              tool_entity_by_side, maximum_depth_m, expected_station_revision, cancel_requested):
-    """One relation request over typed ports; the Gateway executor and offline replays share it."""
+                              tool_entity_by_side, maximum_depth_m, expected_station_revision, cancel_requested,
+                              clock=None, deadline=None):
+    """One relation request over typed ports; the Gateway executor and offline replays share it.
+
+    With ``clock`` and ``deadline``, no segmentation call starts after the
+    deadline; the remaining object views are reported as unmeasured
+    (``relation_budget_exhausted``) instead of discarding the finished ones.
+    """
     entities = dict(tool_entity_by_side)
     revision = expected_station_revision
     selected = tuple(roles) if parameters["roles"] is None else tuple(r for r in roles if r in parameters["roles"])
@@ -310,6 +306,10 @@ def run_tool_object_relations(*, parameters, roles, reference_frame_id, scene_po
         for item in parameters["objects"]:
             if cancel_requested():
                 raise InterruptedError("Relation query cancelled.")
+            if deadline is not None and clock() >= deadline:
+                unmeasured.append({"label": item["label"], "role": capture.role,
+                                   "reason": "relation_budget_exhausted"})
+                continue
             prepared = segmentation_provider.try_segment_capture(capture=rgb, parameters={
                 "role": capture.role, "language_prompt": item["language_prompt"],
                 "target_pixel_uv": None, "min_score": parameters["min_score"]})
@@ -345,7 +345,7 @@ def run_tool_object_relations(*, parameters, roles, reference_frame_id, scene_po
 def run_tool_hover_query(*, parameters, anchor_xyz_m, side, roles, reference_frame_id, scene_port, planner_port,
                          entity, expected_station_revision, cancel_requested, clock, deadline):
     """One hover request over typed ports, evaluated in the public reference frame."""
-    public_from_geometry = _rigid(scene_port.public_from_geometry)
+    public_from_geometry = require_vertical_frame(scene_port.public_from_geometry)
     geometry_from_public = np.linalg.inv(public_from_geometry)
     revision = expected_station_revision
     captures = tuple(scene_port.capture_views(roles=tuple(roles), expected_station_revision=revision,
@@ -401,8 +401,8 @@ def build_tool_object_relation_executor(*, registration, scene_port, segmentatio
             reference_frame_id=registration.reference_frame_id, scene_port=scene_port,
             segmentation_provider=segmentation_provider, tool_entity_by_side=entities,
             maximum_depth_m=maximum_depth_m, expected_station_revision=revision,
-            cancel_requested=lambda: (executor.cancel_requested(operation.operation_id)
-                                      or clock() >= operation.deadline_at))
+            cancel_requested=lambda: executor.cancel_requested(operation.operation_id),
+            clock=clock, deadline=operation.deadline_at - _RESULT_RESERVE_SEC)
         if current_station_revision() != revision:
             raise RuntimeError("Station revision changed during the relation capture; retry.")
         return PassiveReadResult(result, ("tool-object-relations:" + operation.operation_id,
@@ -420,7 +420,7 @@ def build_tool_hover_executor(*, registration, capture_registration, scene_port,
                               max_retained_operations):
     """Resolve the anchor, capture the observed scene once, search hover paths without dispatch."""
     entities = dict(tool_entity_by_side)
-    _rigid(scene_port.public_from_geometry)
+    require_vertical_frame(scene_port.public_from_geometry)
 
     def read(request, operation):
         registration.payload_validator.validate_parameters(request.parameters)

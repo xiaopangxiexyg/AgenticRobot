@@ -1144,6 +1144,7 @@ def assemble_exclusive_rm65_agent_primitive_composition(
                     rotation_tolerance_rad=convergence_profile.rotation_tolerance_rad,
                     start_clearance=("inherited-positive-v1" if hover_config.enable_inherited_start_clearance
                                      else "strict"),
+                    max_inter_camera_skew_sec=perception_capture.profile.max_inter_camera_skew_ms / 1000.0,
                     profile_identity={"execution_manifest_hash": execution_manifest_hash,
                         "planning_config": json.loads(json.dumps(asdict(hover_config))),
                         "observation": json.loads(json.dumps(asdict(safe_motion_observation_config)))})

@@ -574,8 +574,11 @@ def build_mujoco_agent_tcp_pose_gateway_session(
 
     if type(enable_tool_object_relations) is not bool or type(enable_tool_hover_queries) is not bool:
         raise TypeError("Tool-entity Skill switches must be bool.")
-    if enable_tool_object_relations and (artifact_storage is None or segmentation_localizer is None):
-        raise ValueError("Tool-object relations require Artifact storage and a segmentation localizer.")
+    if enable_tool_object_relations and (artifact_storage is None or segmentation_localizer is None
+                                         or not enable_safe_tcp_pose):
+        # The frozen multi-view RGB-D capture belongs to the planned safe TCP owner.
+        raise ValueError("Tool-object relations require Artifact storage, a segmentation localizer "
+                         "and the safe TCP pose Route.")
     if enable_tool_hover_queries and (not enable_surface_anchor_v2 or safe_motion_observation is None
                                       or not enable_safe_tcp_pose):
         raise ValueError("Tool hover queries require surface anchor v2 and the observed safe TCP scene.")

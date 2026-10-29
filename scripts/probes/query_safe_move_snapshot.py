@@ -22,6 +22,7 @@ import numpy as np
 from agent_gateway.profiles.real.motion_observed_scene import obstacle_cloud_from_captures
 from agent_gateway.profiles.real.motion_primitive_profiles import RealAgentPrimitiveConvergenceProfile
 from agent_gateway.profiles.real.realsense_perception import build_real_perception_source_binding
+from agent_gateway.profiles.real.tool_entity import REAL_HOVER_RETRYABLE_REASONS
 from agent_gateway.profiles.surface_anchor_selection import select_mask_interior_pixel
 from dataset_contracts.canonical_encoding import canonical_content_hash
 from dataset_contracts.grasp_multiview_snapshot import decode_grasp_multiview_snapshot_arrays
@@ -655,7 +656,10 @@ class SavedSceneSkillQuery:
                 "orientation_policy": orientation_policy, "candidate_policy": "entity_proximity",
                 "tool_axis_max_tilt_rad": tool_axis_max_tilt_rad,
                 "support_window_m": window, "support_margin_m": margin,
-                "candidate_budget_sec": ENTITY_HOVER_CANDIDATE_BUDGET_SEC,
+                # The effective per-proposal cap (a session budget may lower it).
+                "candidate_budget_sec": (ENTITY_HOVER_CANDIDATE_BUDGET_SEC if self._query_budget is None
+                    else min(ENTITY_HOVER_CANDIDATE_BUDGET_SEC, self._query_budget.get(
+                        "maximum_call_planning_sec", ENTITY_HOVER_CANDIDATE_BUDGET_SEC))),
                 "tool_entity": entity.identity()}
 
         def generate():
@@ -685,7 +689,8 @@ class SavedSceneSkillQuery:
         return self._search_region_locked(side=side, target_reference=target_reference,
             summary_fields=summary_fields, began=began,
             hidden_fields=("tip_offset_bounds_xy_m", "clearance_bounds_m", "tool_entity"),
-            generate=generate, validate=validate, candidate_budget_sec=ENTITY_HOVER_CANDIDATE_BUDGET_SEC)
+            generate=generate, validate=validate, candidate_budget_sec=ENTITY_HOVER_CANDIDATE_BUDGET_SEC,
+            retryable_reasons=REAL_HOVER_RETRYABLE_REASONS)
 
     def _plan_relation_region_locked(self, *, side, target_reference, offset_bounds_xyz_m,
                                      offset_frame, max_candidates, began):
@@ -729,14 +734,16 @@ class SavedSceneSkillQuery:
             hidden_fields=("offset_bounds_xyz_m",), generate=generate, validate=validate)
 
     def _search_region_locked(self, *, side, target_reference, summary_fields, hidden_fields, began,
-                              generate, validate, candidate_budget_sec=3.):
+                              generate, validate, candidate_budget_sec=3., retryable_reasons=None):
         """Budgeted first-certified-path search shared by explicit region queries.
 
         ``generate`` returns ordered proposals; it runs inside the charged
         region budget. ``validate(row)`` checks a found plan's achieved FK
         against the ORIGINAL request and returns ``(record, inside)``. Budget,
         retry and revocation rules are identical for every query kind; only the
-        per-candidate cap differs (3 s TCP regions, 5 s gripper-entity hover).
+        per-candidate cap and the per-target retry set differ: TCP regions keep
+        3 s and their original set; gripper-entity hover uses 5 s and the
+        Gateway hover set (the planner's per-target fallback reasons).
         """
         summary = None
         public_result = None
@@ -808,9 +815,10 @@ class SavedSceneSkillQuery:
                 self._planning_seconds = region_budget_start + generation_wall
                 summary["candidate_generation_wall_sec"] = generation_wall
             summary["candidate_count"] = len(candidates)
-            retryable = {"endpoint_collision_blocked", "endpoint_clearance_blocked", "ik_search_exhausted",
+            retryable = ({"endpoint_collision_blocked", "endpoint_clearance_blocked", "ik_search_exhausted",
                 "path_collision_blocked", "path_target_safety_envelope_blocked",
                 "grasp_path_motion_quality_exceeded", "safe_tcp_endpoint_pose_tolerance_exceeded"}
+                if retryable_reasons is None else set(retryable_reasons))
             for index, candidate in enumerate(candidates):
                 candidate_started = self._clock()
                 self._planning_seconds = region_budget_start + (candidate_started - began)

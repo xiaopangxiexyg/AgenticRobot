@@ -33,7 +33,7 @@ MAX_HOVER_CLEARANCE_M = 0.30
 MAX_TOOL_AXIS_TILT_RAD = math.radians(60.)
 RELATION_CLASSES = ("between_fingers_in_contact_band", "between_fingers", "in_contact_band", "near", "far",
                     "insufficient_surface")
-UNMEASURED_REASONS = ("no_mask_above_threshold", "no_valid_depth")
+UNMEASURED_REASONS = ("no_mask_above_threshold", "no_valid_depth", "relation_budget_exhausted")
 HOVER_STATUSES = ("path_found", "path_rejected", "query_incomplete")
 RELATION_PARAMETER_KEYS = frozenset({"objects", "roles", "min_score"})
 RELATION_RESULT_KEYS = frozenset({
@@ -234,11 +234,12 @@ def validate_relation_result(value, *, roles, sides, reference_frame_id):
             raise ValueError("Capture provenance must use bound roles.")
 
 
-def validate_relation_result_for_parameters(parameters, result):
+def validate_relation_result_for_parameters(parameters, result, *, roles):
+    """``roles`` are the registered roles; ``roles: null`` in a request selects all of them."""
     labels = {item["label"] for item in parameters["objects"]}
-    roles = None if parameters["roles"] is None else set(parameters["roles"])
+    requested = set(roles) if parameters["roles"] is None else set(parameters["roles"])
     captured = [item["role"] for item in result["captures"]]
-    if len(set(captured)) != len(captured) or (roles is not None and set(captured) != roles):
+    if len(set(captured)) != len(captured) or set(captured) != requested:
         raise ValueError("Relation result captured other camera roles than requested.")
     for name in ("views", "unmeasured", "segments"):
         for item in result[name]:
@@ -267,8 +268,13 @@ def hover_definition() -> SkillDefinition:
             "tool axis down (optionally within a tilt cone). The Gateway captures the observed scene, "
             "plans each proposal with the deployment's safe-motion planner from the measured state, "
             "re-measures the achieved pose against the original bounds and returns the first certified "
-            "target_tcp_pose_xyz_quat_xyzw. Read-only: submit that pose separately to the safe TCP "
-            "motion Skill, which replans and checks it again before any motion."),
+            "proposal (target_tcp_pose_xyz_quat_xyzw) with the pose it actually reached "
+            "(planned_endpoint_pose_xyz_quat_xyzw); the bounds are certified for that reached pose. "
+            "Read-only: submit a pose separately to the safe TCP motion Skill, which replans and checks it "
+            "again before any motion. To keep the executed hover inside the bounds, submit "
+            "planned_endpoint_pose_xyz_quat_xyzw with pose_goal_policy=preserve_target; the default policy "
+            "may arrive anywhere inside its arrival tolerance, which can move the gripper tip or lowest "
+            "point by about 2 cm."),
         intended_target_kind="target_agnostic", cross_target_deployment_policy="not_applicable",
         controlled_component_ids=(),
         parameter_semantics_id="artifact_surface_anchor.tool_entity_hover_bounds.v1",
@@ -351,6 +357,9 @@ def validate_hover_query(value, *, component_ids, reference_frame_id):
         raise ValueError("A hover query never executes or authorizes motion.")
     if value["status"] not in HOVER_STATUSES or not isinstance(value["reason"], str) or not value["reason"]:
         raise ValueError("Hover query needs a known status and a reason.")
+    revision = value["station_revision"]
+    if isinstance(revision, bool) or not isinstance(revision, int) or revision < 0:
+        raise ValueError("Hover query must name its Station revision.")
     _vector(value["anchor_xyz_m"], 3, name="anchor_xyz_m")
     _pose(value["source_tcp_pose_xyz_quat_xyzw"], name="source_tcp_pose_xyz_quat_xyzw")
     found = value["status"] == "path_found"
@@ -384,8 +393,11 @@ def validate_hover_result_for_parameters(parameters, result):
                                 abs_tol=1e-12, rel_tol=0.)
             or query["candidate_count"] > parameters["max_candidates"]):
         raise ValueError("Hover query changed its requested bounds.")
-    if [float(x) for x in query["anchor_xyz_m"]] != [float(x) for x in result["surface_anchor"]["measurement"]["world_xyz_m"]]:
+    measurement = result["surface_anchor"]["measurement"]
+    if [float(x) for x in query["anchor_xyz_m"]] != [float(x) for x in measurement["world_xyz_m"]]:
         raise ValueError("Hover query changed its measured anchor.")
+    if query["station_revision"] != measurement["station_revision"]:
+        raise ValueError("Hover query and its anchor belong to different Station revisions.")
 
 
 __all__ = [

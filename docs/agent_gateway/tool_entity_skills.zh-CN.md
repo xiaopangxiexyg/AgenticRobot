@@ -24,6 +24,14 @@
 - 结果中的位姿使用与 `motion.move_tcp_to_pose_safe@1` 相同的公共参考系（注册时强制检查）。
   上层把 `target_tcp_pose_xyz_quat_xyzw` 原样提交给该运动 Skill；运动 Skill 会在新的场景上
   重新规划和检查，悬停查询本身不保留计划。
+- 区间只对悬停规划器实际到达的位姿 `planned_endpoint_pose_xyz_quat_xyzw` 成立。运动 Skill
+  默认的到达容差（审查过的配置为 10 mm、5°）可能让夹爪尖端或最低点偏出约 2 cm。需要执行后
+  仍在区间内时，提交 `planned_endpoint_pose_xyz_quat_xyzw` 并加
+  `pose_goal_policy=preserve_target`（按 3 mm、1° 的精确规划界限瞄准这个已到达过的位姿）。
+  不要对 `target_tcp_pose_xyz_quat_xyzw` 使用 `preserve_target`：精确朝下等提议位姿可能超出
+  1° 内的 IK 范围（MuJoCo 孪生场景实测 `safe_tcp_endpoint_search_exhausted`）。实测到达容差
+  仍由部署决定。
+- 公共参考系的 +Z 必须是竖直方向（注册时检查）；间隙、足迹和 `tool_axis_down` 都按它计算。
 
 ## 启用
 
@@ -39,7 +47,8 @@
 
 MuJoCo（`agent_gateway/profiles/mujoco/gateway_cli.py`）：
 
-- `--enable-tool-object-relations`：需要 `--artifact-root` 和分割后端。
+- `--enable-tool-object-relations`：需要 `--artifact-root`、分割后端和 `--enable-safe-tcp-pose`
+  （冻结多视角采集属于 safe TCP 规划 owner）。
 - `--enable-tool-hover-queries`：需要 `--enable-surface-anchor-v2` 和
   `--enable-observed-point-motion`（观测 RGB-D 安全场景）。
 - 在 HOLD、无活动 operation 时冻结多视角采集。悬停使用私有、从不激活的 safe TCP 规划器，
@@ -60,6 +69,6 @@ MuJoCo（`agent_gateway/profiles/mujoco/gateway_cli.py`）：
    45° 倾斜锥会向立柱一侧倾斜，仍然全部被拒。因此不需要修改碰撞配置。
 
 原生 MuJoCo 端到端测试（`tests/test_agent_gateway_mujoco_tool_entity.py`）覆盖：关系查询 →
-表面锚点 → `preserve` 被拒 → `tool_axis_down` 找到路径 → 把目标交给
-`motion.move_tcp_to_pose_safe@1` 执行，并在原生几何上检查夹爪盒最低点高于立方体顶面的间隙、
-尖端在立方体上方、无接触。
+表面锚点 → `preserve` 被拒 → `tool_axis_down` 找到路径 → 把 `planned_endpoint_pose_xyz_quat_xyzw`
+以 `preserve_target` 交给 `motion.move_tcp_to_pose_safe@1` 执行，并在原生几何上检查夹爪盒最低点
+高于立方体顶面的间隙（实测 6.2 cm，请求 3–10 cm）、尖端在立方体上方、无接触。

@@ -40,12 +40,20 @@ from .motion_observed_scene import mujoco_rgbd_captures_from_cut
 # Rejections specific to one proposed endpoint/path (MujocoObjectGoalQuery's
 # ordinary rejections plus the per-path inherited egress proofs).
 MUJOCO_HOVER_RETRYABLE_REASONS = frozenset({
-    "safe_tcp_endpoint_search_exhausted", "safe_tcp_target_blocked", "safe_tcp_retimed_path_blocked",
-    "safe_tcp_path_exceeds_control_budget", "safe_tcp_target_envelope_blocked", "safe_tcp_target_exceeds_profile",
-    "safe_tcp_motion_quality_exceeded", "safe_tcp_inherited_start_clearance_regressed",
-    "safe_tcp_inherited_start_clearance_not_exited", "safe_tcp_ik_failed"})
+    "safe_tcp_endpoint_search_exhausted", "safe_tcp_endpoint_numerical_failure", "safe_tcp_target_blocked",
+    "safe_tcp_retimed_path_blocked", "safe_tcp_path_exceeds_control_budget", "safe_tcp_target_envelope_blocked",
+    "safe_tcp_target_exceeds_profile", "safe_tcp_motion_quality_exceeded",
+    "safe_tcp_inherited_start_clearance_regressed", "safe_tcp_inherited_start_clearance_not_exited"})
 # Budget ends inside the planner, not a property of the proposal.
 MUJOCO_HOVER_INCOMPLETE_REASONS = frozenset({"safe_tcp_path_search_exhausted", "safe_tcp_planning_cancelled"})
+
+
+def mujoco_hover_rejection_outcome(reason_code: str, *, deadline_passed: bool) -> HoverPlanOutcome:
+    """Map one MuJoCo planner rejection to the shared hover search outcome."""
+    if reason_code in MUJOCO_HOVER_INCOMPLETE_REASONS or deadline_passed:
+        return HoverPlanOutcome(status="query_incomplete", reason=reason_code)
+    return HoverPlanOutcome(status="path_rejected", reason=reason_code,
+                            retryable=reason_code in MUJOCO_HOVER_RETRYABLE_REASONS)
 
 
 def _identity_pose():
@@ -64,7 +72,9 @@ class MujocoToolScenePort:
         self._mujoco = scene.mujoco
         self._addresses = {side: np.asarray([scene.joint_qpos_addr(name) for name in scene.arm_specs[side].joint_names],
                                             dtype=int) for side in ("left", "right")}
-        self._link6 = {side: self._mujoco.mj_name2id(self._model, self._mujoco.mjtObj.mjOBJ_BODY, side + "_arm_link6")
+        # The same controlled body as the motion pose projector.
+        self._link6 = {side: self._mujoco.mj_name2id(self._model, self._mujoco.mjtObj.mjOBJ_BODY,
+                                                     scene.arm_specs[side].controlled_body)
                        for side in ("left", "right")}
         if any(index < 0 for index in self._link6.values()):
             raise ValueError("Tool FK requires both arm flange bodies.")
@@ -186,10 +196,7 @@ class MujocoToolHoverPlanner:
         except MujocoTcpPlanRejected as error:
             if cancel_requested():
                 raise InterruptedError("Hover query cancelled.") from error
-            if error.reason_code in MUJOCO_HOVER_INCOMPLETE_REASONS or time.perf_counter() >= deadline:
-                return HoverPlanOutcome(status="query_incomplete", reason=error.reason_code)
-            return HoverPlanOutcome(status="path_rejected", reason=error.reason_code,
-                                    retryable=error.reason_code in MUJOCO_HOVER_RETRYABLE_REASONS)
+            return mujoco_hover_rejection_outcome(error.reason_code, deadline_passed=time.perf_counter() >= deadline)
         finally:
             planner.clear()
         if len(plan.reference_poses) + self.profile.stable_measurement_count >= self.profile.max_control_cycles:
@@ -205,4 +212,5 @@ class MujocoToolHoverPlanner:
             endpoint_pose_xyz_quat_xyzw=tuple(pose_xyz_quat_xyzw(endpoint)), trajectory_duration_sec=duration)
 
 
-__all__ = ["MUJOCO_HOVER_RETRYABLE_REASONS", "MujocoToolHoverPlanner", "MujocoToolScenePort"]
+__all__ = ["MUJOCO_HOVER_RETRYABLE_REASONS", "MujocoToolHoverPlanner", "MujocoToolScenePort",
+           "mujoco_hover_rejection_outcome"]
