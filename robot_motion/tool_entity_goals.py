@@ -32,10 +32,14 @@ from scipy.stats import qmc
 from robot_motion.spatial_goals import compute_spatial_goal, finite_vector
 
 TOOL_ENTITY_HOVER_SEMANTICS_V1 = "agenticrobot.relation.tool_entity_hover.v1"
-HOVER_ORIENTATION_POLICIES = ("preserve", "tool_axis_down")
+HOVER_ORIENTATION_POLICIES = ("preserve", "tool_axis_down", "tool_axis_forward")
+# Public reference direction for the TCP approach axis (+Z) of each tool-axis
+# policy: straight down, or horizontal forward into the workspace (canonical
+# Station +X, the level-forward gripper posture of tcp_orientation.py).
+TOOL_AXIS_POLICY_REFERENCE_XYZ = {"tool_axis_down": (0., 0., -1.), "tool_axis_forward": (1., 0., 0.)}
 MAX_HOVER_TIP_OFFSET_M = 0.25
 MAX_HOVER_CLEARANCE_M = 0.30
-# A tilt cone wider than this is no longer a "tool down" request.
+# A cone wider than this no longer names its policy axis ("down" or "forward").
 MAX_TOOL_AXIS_TILT_RAD = math.radians(60.)
 _ROUND = 12
 
@@ -477,6 +481,13 @@ def tool_axis_tilt_rad(rotation) -> float:
     return float(math.acos(max(-1., min(1., -axis[2] / np.linalg.norm(axis)))))
 
 
+def tool_axis_deviation_rad(rotation, policy: str) -> float:
+    """Angle between the TCP approach axis (+Z) and a tool-axis policy's reference."""
+    reference = np.asarray(TOOL_AXIS_POLICY_REFERENCE_XYZ[policy], dtype=float)
+    axis = np.asarray(rotation, dtype=float).reshape(3, 3)[:, 2]
+    return float(math.acos(max(-1., min(1., float(axis @ reference) / np.linalg.norm(axis)))))
+
+
 def _tilt(value) -> float:
     if (isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value)
             or not 0. <= value <= MAX_TOOL_AXIS_TILT_RAD):
@@ -488,11 +499,15 @@ def hover_orientation(current_tcp_pose_xyz_quat_xyzw: Sequence[float], policy: s
                       tool_axis_max_tilt_rad: float = 0.) -> np.ndarray:
     """Return the hover TCP rotation for an explicit policy.
 
-    ``preserve`` keeps the measured TCP orientation. ``tool_axis_down`` turns
-    the TCP approach axis (+Z) toward public reference -Z with the least
-    rotation, using the shared ``compute_spatial_goal`` alignment convention,
-    and stops at the cone ``tool_axis_max_tilt_rad`` around -Z (0 = exactly
-    down). A tool already inside the cone keeps its measured orientation.
+    ``preserve`` keeps the measured TCP orientation. ``tool_axis_down`` and
+    ``tool_axis_forward`` turn the TCP approach axis (+Z) toward public -Z or
+    +X (horizontal forward) with the least rotation, using the shared
+    ``compute_spatial_goal`` alignment convention, and stop at the cone
+    ``tool_axis_max_tilt_rad`` around that axis (0 = exactly on it). A tool
+    already inside the cone keeps its measured orientation. The least rotation
+    keeps the roll nearest the measured tool: from a level gripper the
+    forward policy stays level, from a tool-down gripper it ends level with
+    tool +X down.
     """
     pose = finite_vector(list(current_tcp_pose_xyz_quat_xyzw), 7, name="current TCP pose")
     if policy not in HOVER_ORIENTATION_POLICIES:
@@ -500,18 +515,18 @@ def hover_orientation(current_tcp_pose_xyz_quat_xyzw: Sequence[float], policy: s
     tilt = _tilt(tool_axis_max_tilt_rad)
     if policy == "preserve":
         if tilt:
-            raise ValueError("A tool-axis tilt cone applies only to tool_axis_down.")
+            raise ValueError("A tool-axis tilt cone applies only to tool_axis_down or tool_axis_forward.")
         goal = compute_spatial_goal(current_tcp_pose_xyz_quat_xyzw=list(pose), anchor_xyz_m=list(pose[:3]),
             offset_xyz_m=[0., 0., 0.], offset_frame="reference", orientation_mode="preserve")
         return Rotation.from_quat(goal.pose_xyz_quat_xyzw[3:]).as_matrix()
     goal = compute_spatial_goal(current_tcp_pose_xyz_quat_xyzw=list(pose), anchor_xyz_m=list(pose[:3]),
         offset_xyz_m=[0., 0., 0.], offset_frame="reference", orientation_mode="align_axis",
-        tool_axis="z", axis_reference_xyz=[0., 0., -1.])
+        tool_axis="z", axis_reference_xyz=list(TOOL_AXIS_POLICY_REFERENCE_XYZ[policy]))
     exact = Rotation.from_quat(goal.pose_xyz_quat_xyzw[3:])
     if not tilt:
         return exact.as_matrix()
     current = Rotation.from_quat(pose[3:] / np.linalg.norm(pose[3:]))
-    angle = tool_axis_tilt_rad(current.as_matrix())
+    angle = tool_axis_deviation_rad(current.as_matrix(), policy)
     if angle <= tilt:
         return current.as_matrix()
     # Same least rotation as the exact alignment, stopped at the cone boundary.
@@ -616,6 +631,7 @@ __all__ = [
     "MAX_HOVER_CLEARANCE_M",
     "MAX_HOVER_TIP_OFFSET_M",
     "MAX_TOOL_AXIS_TILT_RAD",
+    "TOOL_AXIS_POLICY_REFERENCE_XYZ",
     "TOOL_ENTITY_HOVER_SEMANTICS_V1",
     "TOOL_OBJECT_RELATIONS",
     "TOOL_OBJECT_RELATION_SEMANTICS_V1",
@@ -627,6 +643,7 @@ __all__ = [
     "generate_entity_hover_goals",
     "hover_orientation",
     "object_surface_cluster",
+    "tool_axis_deviation_rad",
     "tool_axis_tilt_rad",
     "tool_object_relation",
 ]

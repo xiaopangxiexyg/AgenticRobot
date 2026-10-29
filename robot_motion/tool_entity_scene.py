@@ -26,6 +26,7 @@ from robot_motion.tool_entity_goals import (
     HOVER_ORIENTATION_POLICIES,
     MAX_HOVER_CLEARANCE_M,
     MAX_HOVER_TIP_OFFSET_M,
+    TOOL_AXIS_POLICY_REFERENCE_XYZ,
     TOOL_ENTITY_HOVER_SEMANTICS_V1,
     TOOL_OBJECT_RELATION_SEMANTICS_V1,
     EntityHoverCandidate,
@@ -35,7 +36,7 @@ from robot_motion.tool_entity_goals import (
     generate_entity_hover_goals,
     hover_orientation,
     object_surface_cluster,
-    tool_axis_tilt_rad,
+    tool_axis_deviation_rad,
     tool_object_relation,
 )
 
@@ -255,7 +256,7 @@ def validate_hover_request(*, tip_offset_bounds_xy_m, clearance_bounds_m, orient
     """Reject a malformed hover request before any capture or planning.
 
     The checks equal ``generate_entity_hover_goals`` and ``hover_orientation``
-    (interval order and limits, policy, tilt cone only for ``tool_axis_down``).
+    (interval order and limits, policy, tilt cone only for the tool-axis policies).
     """
     if orientation_policy not in HOVER_ORIENTATION_POLICIES:
         raise ValueError("Unknown hover orientation policy.")
@@ -267,7 +268,7 @@ def validate_hover_request(*, tip_offset_bounds_xy_m, clearance_bounds_m, orient
         _bounded_interval(interval, name=name, lower=-MAX_HOVER_TIP_OFFSET_M, upper=MAX_HOVER_TIP_OFFSET_M)
     _bounded_interval(clearance_bounds_m, name="clearance", lower=0., upper=MAX_HOVER_CLEARANCE_M)
     # The orientation owner validates the cone (finite, within its limit, and
-    # only with tool_axis_down) without needing a measured scene.
+    # only with a tool-axis policy) without needing a measured scene.
     hover_orientation([0., 0., 0., 0., 0., 0., 1.], orientation_policy,
                       tool_axis_max_tilt_rad=tool_axis_max_tilt_rad)
 
@@ -314,8 +315,9 @@ def validate_entity_hover_endpoint(*, entity: ToolEntityBox, endpoint_pose_xyz_q
     record = {"achieved_tip_offset_xy_m": [dx, dy], "achieved_clearance_m": metrics.clearance_m,
               "achieved_support_height_m": metrics.support_height_m,
               "achieved_footprint_point_count": metrics.footprint_point_count}
-    if orientation_policy == "tool_axis_down":
-        tilt = tool_axis_tilt_rad(transform[:3, :3])
+    if orientation_policy in TOOL_AXIS_POLICY_REFERENCE_XYZ:
+        # Angle of the achieved approach axis from the policy axis (down or forward).
+        tilt = tool_axis_deviation_rad(transform[:3, :3], orientation_policy)
         record["achieved_tool_axis_tilt_rad"] = tilt
         within = within and tilt <= tool_axis_max_tilt_rad + 1e-9 + rotation_tolerance_rad
     record["inside_requested_region"] = within
