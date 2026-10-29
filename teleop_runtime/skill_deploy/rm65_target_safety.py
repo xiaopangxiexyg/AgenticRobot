@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import math
 import time
 from collections.abc import Callable, Mapping
@@ -27,6 +28,31 @@ from .control_runtime import (
     RealSkillMotionHoldReceipt,
     RealSkillMotionObservationCut,
 )
+
+_LOGGER = logging.getLogger(__name__)
+
+
+def _warn_startup_joint_range(qpos_by_side: Mapping[str, Any]) -> None:
+    """Operator hint only: an arm outside the software joint range cannot plan or hold.
+
+    Never blocks or changes startup admission; planning later rejects such a
+    start with ``start_outside_joint_limits`` and the same message.
+    """
+    try:
+        from .rm65_grasp_trajectory import (
+            RM65GraspTrajectoryPlanningError,
+            bounded_planning_start_qpos,
+        )
+
+        for side in ("left", "right"):
+            try:
+                bounded_planning_start_qpos(np.asarray(qpos_by_side[side], dtype=float), side=side)
+            except RM65GraspTrajectoryPlanningError as error:
+                _LOGGER.warning(
+                    "Startup joint range: %s Until then this arm's planning fails and its "
+                    "position stream may reject HOLD.", error.details.get("message"))
+    except Exception:  # noqa: BLE001 - a diagnostic hint never blocks startup
+        _LOGGER.debug("Startup joint-range hint unavailable.", exc_info=True)
 
 
 class RM65SkillTargetSafetyBuilder(Protocol):
@@ -255,6 +281,7 @@ class ExclusiveRM65SkillStartupSafetyBinder:
         if not hold_receipt.succeeded:
             raise RuntimeError("RM65 Skill startup HOLD was not confirmed.")
         cut = self.ports.observe()
+        _warn_startup_joint_range(cut.qpos_by_side)
         self.ports.synchronize_target_builder(cut.qpos_by_side)
         return self.target_safety.bind_startup_anchor(
             observation_cut=cut,

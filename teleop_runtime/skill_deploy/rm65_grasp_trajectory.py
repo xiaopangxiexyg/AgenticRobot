@@ -206,7 +206,7 @@ def bounded_planning_start_qpos(qpos: np.ndarray, *, side: str) -> np.ndarray:
             f"J{item['joint']}={item['qpos_deg']:.1f} deg outside "
             f"[{item['lower_deg']:.1f}, {item['upper_deg']:.1f}]" for item in joints)
         hint = (" The same TCP pose is reachable in range at joints "
-                + "[" + ", ".join(f"{math.degrees(value):.1f}" for value in twin) + "] deg"
+                + "[" + ", ".join(f"{math.degrees(value):.1f}" for value in twin) + "] deg."
                 if twin_in_range else "")
         raise RM65GraspTrajectoryPlanningError("start_outside_joint_limits", details={
             "planning_phase": "start_joint_limit_admission", "side": side,
