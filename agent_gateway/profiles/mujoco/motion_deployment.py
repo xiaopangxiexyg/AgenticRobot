@@ -167,6 +167,7 @@ MUJOCO_AGENT_GRASP_CONTACT_ROUTE_ID_V1 = "sim.mujoco.motion.approach_grasp_conta
 MUJOCO_AGENT_OBJECT_MOVE_ROUTE_ID_V1 = "sim.mujoco.motion.move_grasped_object_to_pose.v1"
 MUJOCO_AGENT_OBJECT_MOVE_ROUTE_ID_V2 = "sim.mujoco.motion.move_grasped_object_to_pose.v2"
 MUJOCO_AGENT_GRASP_APPROACH_EXECUTOR_ID_V1 = "mujoco-agent-grasp-approach-executor-v1"
+MUJOCO_AGENT_OBJECT_MOVE_MAX_OPERATION_MS = 240_000
 
 MUJOCO_AGENT_TCP_POSE_ROUTE_ID_V1 = "sim.mujoco.rm65.agent_skill_tcp_pose"
 MUJOCO_AGENT_TCP_POSE_EXECUTOR_ID_V1 = (
@@ -2749,7 +2750,10 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
             route_id=MUJOCO_AGENT_OBJECT_MOVE_ROUTE_ID_V1,
             executor_id="mujoco-grasped-object-motion-v1",
             binding_prefix="sim.mujoco.agent_object_motion:",
-            duration_ms=120_000, path_search_time_budget_sec=15.0,
+            # Debug-phase bound: per-step held-object guards make one carry
+            # take ~60-110 s of wall time; tighten once the guard cost drops.
+            duration_ms=MUJOCO_AGENT_OBJECT_MOVE_MAX_OPERATION_MS,
+            path_search_time_budget_sec=15.0,
         )
         object_contract = item[3]
         planned_motions.append(item)
@@ -2762,7 +2766,8 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
             route_id=MUJOCO_AGENT_OBJECT_MOVE_ROUTE_ID_V2,
             executor_id="mujoco-grasped-object-support-motion-v2",
             binding_prefix="sim.mujoco.agent_object_support_motion_v2:",
-            duration_ms=120_000, path_search_time_budget_sec=15.0,
+            duration_ms=MUJOCO_AGENT_OBJECT_MOVE_MAX_OPERATION_MS,
+            path_search_time_budget_sec=15.0,
         )
         object_support_contract_v2 = item[3]
         planned_motions.append(item)

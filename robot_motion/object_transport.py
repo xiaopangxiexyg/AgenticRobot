@@ -19,12 +19,20 @@ import numpy as np
 from robot_motion.pose import pose_delta_metrics
 
 
+_IDENTITY_3 = np.eye(3)
+_HOMOGENEOUS_ROW = np.array((0., 0., 0., 1.))
+
+
 def rigid_pose(value, *, name: str) -> np.ndarray:
     pose = np.asarray(value, dtype=float)
-    if (pose.shape != (4, 4) or not np.isfinite(pose).all()
-            or not np.allclose(pose[3], (0, 0, 0, 1), atol=1e-8, rtol=0)
-            or not np.allclose(pose[:3, :3].T @ pose[:3, :3], np.eye(3), atol=1e-6, rtol=0)
-            or not np.isclose(np.linalg.det(pose[:3, :3]), 1., atol=1e-6, rtol=0)):
+    # Same tolerances as allclose(..., rtol=0); the explicit max-abs form avoids
+    # allclose overhead on the per-physics-step held-object guards.
+    if pose.shape != (4, 4) or not np.isfinite(pose).all():
+        raise ValueError(f"{name} must be a finite rigid 4x4 transform")
+    rotation = pose[:3, :3]
+    if (np.max(np.abs(pose[3] - _HOMOGENEOUS_ROW)) > 1e-8
+            or np.max(np.abs(rotation.T @ rotation - _IDENTITY_3)) > 1e-6
+            or abs(np.linalg.det(rotation) - 1.) > 1e-6):
         raise ValueError(f"{name} must be a finite rigid 4x4 transform")
     result = pose.copy()
     result.setflags(write=False)

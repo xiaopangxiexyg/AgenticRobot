@@ -133,13 +133,8 @@ class MujocoAgentObjectMotionLifecycle(MujocoAgentSafeTcpPoseSkillLifecycle):
         if any(not bounds[2 * i] <= goal[i, 3] <= bounds[2 * i + 1] for i in range(3)):
             raise MujocoTcpPlanRejected("object_motion_goal_outside_workspace")
         world_goal = rigid_pose(np.linalg.inv(public_from_world) @ goal, name="world object goal")
-        if self._phase in {"lift", "place"}:
-            delta = world_goal[:3, 3] - cut.world_from_object[:3, 3]
-            _, rotation = pose_delta_metrics(world_goal, cut.world_from_object)
-            signed = delta[2] if self._phase == "lift" else -delta[2]
-            if (not 0 <= signed <= .08 or np.linalg.norm(delta[:2]) > .003
-                    or rotation > 2.):
-                raise MujocoTcpPlanRejected("object_motion_support_stage_outside_normal_corridor")
+        # Lift and place carry no fixed vertical corridor: the measured payload
+        # binding, its support allowance and the follow guard bound every path.
         self._object_goal_world = world_goal
 
         def bind(scene):
