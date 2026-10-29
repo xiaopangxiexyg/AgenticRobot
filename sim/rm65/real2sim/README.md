@@ -92,7 +92,16 @@ core and MuJoCo adapter used for the 20260721 fit; tests compare those hashes to
 fixed historical values rather than silently reinterpreting the fit against
 the current files.
 
-观察点云距离缓存及离线端点排序的组合来源使用独立绑定
+离线夹爪—物体关系及悬停倾角锥使用独立绑定
+`artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261029_skill_relations_v1.json`。
+它固定于合并提交 `d20dd86bb0e1`，保留前一绑定的全部非运行时引用，177 项运行时输入未变；
+6 项离线查询输入中保存场景查询与工具实体几何两项改变。离线证据按内容哈希记录：同一源码树
+1630 项关联测试、21 个保存操作员样本的关系结果（干净起点无两指间/接触带判定，预抓 5/5 两指
+之间，接触 4 例中 3 例在接触带）和 MuJoCo 孪生 20/20 设计摆放。关系只读、不发布 Gateway
+Route；URDF 传感器盒随各保存场景 manifest 的冻结文件绑定，因为资产库不入 Git。绑定仍为
+`provisional`，没有新增真机动作、标定或 held-out 资格。
+
+上一阶段观察点云距离缓存及离线端点排序的组合来源使用独立历史绑定
 `artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261029_observed_cache_order_v1.json`。
 它固定于源码提交 `b2b77e61e09b`，保留前一绑定并记录 177 项运行时输入，其中观察点云
 距离代码用于真实观测规划；6 项离线查询输入及同一源码树的 978 项关联测试单独记录。

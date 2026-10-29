@@ -25,6 +25,10 @@ ARM_BASELINE_PATH = Path(
 )
 ARM_RUNTIME_BINDING_PATH = Path(
     "sim/rm65/real2sim/artifacts/"
+    "rm65_arm_free_motion_20260721_v4_runtime_binding_20261029_skill_relations_v1.json"
+)
+OBSERVED_CACHE_ORDER_BINDING_PATH = Path(
+    "sim/rm65/real2sim/artifacts/"
     "rm65_arm_free_motion_20260721_v4_runtime_binding_20261029_observed_cache_order_v1.json"
 )
 HOVER_VISUAL_BINDING_PATH = Path(
@@ -385,6 +389,100 @@ def test_v4_arm_fit_baseline_remains_frozen_and_provisional() -> None:
 
 def test_current_arm_runtime_binding_uses_exact_current_inputs() -> None:
     binding = Real2SimArtifactManifest.load(ARM_RUNTIME_BINDING_PATH)
+    previous = Real2SimArtifactManifest.load(OBSERVED_CACHE_ORDER_BINDING_PATH)
+    fit = Real2SimArtifactManifest.load(ARM_BASELINE_PATH)
+    tag, old_tag = "20261029-skill-relations-v1", "20261029-observed-cache-order-v1"
+    source = "d20dd86bb0e1493c19357b1053e639b0750dcf0e"
+    source_tree = "ddedae194c106d43c0d7c62c6ec109f0fc61e457"
+    current = {ref.locator: ref for ref in binding.dependency_artifacts if "-runtime-" + tag in ref.artifact_id}
+    inherited = {ref.locator: ref for ref in previous.dependency_artifacts if "-runtime-" + old_tag in ref.artifact_id}
+    assert tuple(binding.metadata["new_runtime_sources"]) == ()
+    assert len(current) == len(inherited) == 177 and set(current) == set(inherited)
+    assert sum(path.endswith(".py") for path in current) == 173
+    for path, ref in current.items():
+        assert ref.sha256 == ArtifactRef.from_file(path, artifact_id="current-check", artifact_kind=ref.artifact_kind).sha256
+        assert ref.sha256 == hashlib.sha256(subprocess.check_output(["git", "show", source + ":" + path])).hexdigest()
+        assert ref.artifact_id == inherited[path].artifact_id.replace(old_tag, tag)
+        assert ref.artifact_kind == inherited[path].artifact_kind
+        assert ref.sha256 == inherited[path].sha256
+    assert tuple(binding.metadata["changed_previous_runtime_sources"]) == ()
+    assert tuple(binding.metadata["changed_previous_offline_inputs"]) == (
+        "robot_motion/tool_entity_goals.py", "scripts/probes/query_safe_move_snapshot.py")
+    assert binding.code_revision == binding.environment_fingerprint["source_commit"] == binding.metadata["runtime_source_commit"] == source
+    assert binding.environment_fingerprint["source_tree"] == binding.metadata["offline_validation_source_tree"] == source_tree
+    assert subprocess.check_output(["git", "rev-parse", source + "^{tree}"], text=True).strip() == source_tree
+    assert binding.metadata["mainline_input_commit"] == "3efadf50b68583dd0ae4e476db716b9a573f3e43"
+    assert binding.metadata["previous_runtime_binding_artifact_sha256"] == previous.artifact_sha256
+    assert binding.metadata["previous_runtime_binding_file_sha256"] == ArtifactRef.from_file(
+        OBSERVED_CACHE_ORDER_BINDING_PATH, artifact_id="parent-check", artifact_kind="real2sim_runtime_binding").sha256
+    refs = {ref.artifact_id: ref for ref in binding.dependency_artifacts}
+    parent = refs["rm65-arm-runtime-binding-observed-cache-order-20261029-v1"]
+    assert parent.locator == str(OBSERVED_CACHE_ORDER_BINDING_PATH)
+    assert parent.sha256 == binding.metadata["previous_runtime_binding_file_sha256"]
+    # Every non-runtime predecessor reference is inherited unchanged.
+    for ref in previous.dependency_artifacts:
+        if "-runtime-" + old_tag not in ref.artifact_id:
+            assert refs[ref.artifact_id] == ref
+    assert binding.resolved_timing == previous.resolved_timing == Real2SimArtifactManifest.resolved_timing_from_contract_file(CONTRACT_PATH)
+    assert binding.simulation_contract.sha256 == previous.simulation_contract.sha256
+    assert binding.metadata["fit_artifact_sha256"] == fit.artifact_sha256
+    assert binding.metadata["arm_profile_refit"] is False
+    assert binding.metadata["runtime_behavior_change"] is False
+    assert binding.metadata["inherited_start_clearance_default"] is True
+    assert binding.metadata["inherited_start_clearance_default_scope"] == "saved_scene_query_and_real_gateway_observed_scene"
+    assert binding.metadata["direct_planner_start_clearance_default_changed"] is False
+    assert binding.metadata["ordinary_clearance_m"] == .02
+    assert binding.metadata["observed_distance_cache_default"] is True
+    assert binding.metadata["saved_scene_endpoint_ordering_default"] == "joint_distance"
+    assert binding.metadata["tool_object_relation_semantics"] == "agenticrobot.relation.tool_object.v1"
+    assert binding.metadata["tool_object_relation_gateway_route"] is False
+    assert binding.metadata["tool_object_relation_contact_solids"] == "urdf_dmtac_sensor_collision_boxes_open_v1"
+    assert binding.metadata["tool_object_relation_gripper_pose_source"] == "frame_capture_qpos"
+    assert binding.metadata["tool_object_relation_planning_self_filter_used"] is False
+    assert binding.metadata["hover_tool_axis_max_tilt_default_rad"] == 0.
+    assert binding.metadata["hover_achieved_tilt_checked"] is True
+    assert binding.metadata["new_physical_hardware_validation"] is False
+    expected_offline = (
+        "scripts/probes/query_safe_move_snapshot.py", "robot_motion/tool_entity_goals.py",
+        "robot_motion/observed_obstacles.py", "robot_motion/grasp_visible_scene.py",
+        "deployments/perception/dmtac_grasp_overlay.py",
+        "deployments/perception/profiles/dmtac_graspgenx_alignment_v5_q0.json")
+    previous_refs = {ref.artifact_id: ref for ref in previous.dependency_artifacts}
+    changed_offline = []
+    for index, path in enumerate(expected_offline):
+        ref = refs[f"relation-query-input-{index}-{tag}"]
+        assert ref.locator == path
+        assert ref.sha256 == ArtifactRef.from_file(path, artifact_id="offline-check", artifact_kind=ref.artifact_kind).sha256
+        assert ref.sha256 == hashlib.sha256(subprocess.check_output(["git", "show", source + ":" + path])).hexdigest()
+        old_ref = previous_refs[previous.metadata["offline_query_input_artifact_ids"][index]]
+        assert old_ref.locator == path and old_ref.artifact_kind == ref.artifact_kind
+        if old_ref.sha256 != ref.sha256:
+            changed_offline.append(path)
+    assert tuple(sorted(changed_offline)) == tuple(binding.metadata["changed_previous_offline_inputs"])
+    assert tuple(binding.metadata["offline_query_input_artifact_ids"]) == tuple(
+        f"relation-query-input-{index}-{tag}" for index in range(len(expected_offline)))
+    reports = {
+        "relation-focused-report-" + tag: "4e57d7e46c32569429d438d9f8841813f41fadbbd32611075e3ba4915070c02c",
+        "relation-focused-binding-" + tag: "83121638167cec24fa82533ce8106184110ebe4eac9671e60eb4431b45c31e79",
+        "relation-real-samples-report-" + tag: "54de033312d9a3ccc51a93f2c1ce86c9acfd4a73d7837f3f00a96a6b25ee5b85",
+        "relation-mujoco-report-" + tag: "f175ae499a8ebf76d011a79e1c80186b4c3a5be54df5d7441bbc576c32be90f3",
+    }
+    assert tuple(binding.metadata["offline_validation_report_artifact_ids"]) == tuple(reports)
+    for artifact_id, digest in reports.items():
+        assert refs[artifact_id].sha256 == digest and refs[artifact_id].artifact_kind == "offline_validation_report"
+    assert binding.metadata["offline_validation_report_artifact_id"] == "relation-focused-report-" + tag
+    offline = next(e for e in binding.validation_evidence if e.validation_id == "relation-offline-consumers-" + tag)
+    assert offline.status == "passed" and dict(offline.metrics) == {
+        "passed_cases": 1630., "skipped_cases": 0., "failed_cases": 0., "error_cases": 0.}
+    assert binding.artifact_sha256 == "0569e69f7e77d69a83b5ad93dc76fe3c76b4fd1260d3bc784977c563c7461ff0"
+    assert ArtifactRef.from_file(ARM_RUNTIME_BINDING_PATH, artifact_id="binding-file-check",
+        artifact_kind="real2sim_runtime_binding").sha256 == "ea11d919ae694c5568014953117e6ec317db6ef4ffcadc81ab8b7ea15a1211f4"
+    assert binding.fidelity_claims[0].status == "provisional"
+    assert next(e for e in binding.validation_evidence if e.split == "held_out").status == "not_run"
+
+
+def test_observed_cache_order_binding_remains_frozen_after_skill_relations() -> None:
+    binding = Real2SimArtifactManifest.load(OBSERVED_CACHE_ORDER_BINDING_PATH)
     previous = Real2SimArtifactManifest.load(HOVER_VISUAL_BINDING_PATH)
     fit = Real2SimArtifactManifest.load(ARM_BASELINE_PATH)
     tag, old_tag = "20261029-observed-cache-order-v1", "20261029-skill-hover-visual-v1"
@@ -397,7 +495,6 @@ def test_current_arm_runtime_binding_uses_exact_current_inputs() -> None:
     assert len(current) == 177 and len(inherited) == 176 and set(current) == set(inherited) | set(extras)
     assert sum(path.endswith(".py") for path in current) == 173
     for path, ref in current.items():
-        assert ref.sha256 == ArtifactRef.from_file(path, artifact_id="current-check", artifact_kind=ref.artifact_kind).sha256
         assert ref.sha256 == hashlib.sha256(subprocess.check_output(["git", "show", source + ":" + path])).hexdigest()
         if path in inherited:
             assert ref.artifact_id == inherited[path].artifact_id.replace(old_tag, tag)
@@ -441,7 +538,6 @@ def test_current_arm_runtime_binding_uses_exact_current_inputs() -> None:
     for index, path in enumerate(expected_offline):
         ref = refs[f"observed-query-input-{index}-{tag}"]
         assert ref.locator == path
-        assert ref.sha256 == ArtifactRef.from_file(path, artifact_id="offline-check", artifact_kind=ref.artifact_kind).sha256
         assert ref.sha256 == hashlib.sha256(subprocess.check_output(["git", "show", source + ":" + path])).hexdigest()
         old_ref = previous_refs[previous.metadata["offline_query_input_artifact_ids"][index]]
         assert old_ref.locator == path
@@ -455,7 +551,7 @@ def test_current_arm_runtime_binding_uses_exact_current_inputs() -> None:
     assert offline.status == "passed" and dict(offline.metrics) == {
         "passed_cases": 978., "skipped_cases": 0., "failed_cases": 0., "error_cases": 0.}
     assert binding.artifact_sha256 == "ef5bc3ae629ec628d03b001201acfb7b99039b51e2e3a66d5e5372a84de39baa"
-    assert ArtifactRef.from_file(ARM_RUNTIME_BINDING_PATH, artifact_id="binding-file-check",
+    assert ArtifactRef.from_file(OBSERVED_CACHE_ORDER_BINDING_PATH, artifact_id="binding-file-check",
         artifact_kind="real2sim_runtime_binding").sha256 == "ff265d915da9226371af42185d351587ad146683822255a54304a45d975abca5"
     assert binding.fidelity_claims[0].status == "provisional"
     assert next(e for e in binding.validation_evidence if e.split == "held_out").status == "not_run"
