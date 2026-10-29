@@ -3,8 +3,9 @@
 ``perception.query_support_release_pose@1`` is read-only. One request measures
 the selected support's top face from a fresh RGB-D view (text segmentation of
 the support, plane fit and a dense footprint check), reads the verified held
-object, proposes on-support release poses and keeps the first one whose
-complete payload path from the current arm state is collision-free. The
+object, proposes on-support release poses and keeps the planner's ranked
+choice among those whose complete payload path from the current arm state
+is collision-free. The
 result is an object-body pose for ``motion.move_grasped_object_to_pose``
 (``phase=carry``); the query never moves the robot, opens the gripper or
 grants execution authority. Semantics:
@@ -65,8 +66,8 @@ def definition() -> SkillDefinition:
             "first (motion.move_grasped_object_to_pose phase=lift). The Gateway segments the "
             "support in fresh RGB-D from each bound camera (the wrist camera sees past the arm), "
             "keeps the largest fully observed top rectangle, proposes on-support positions "
-            "and yaw turns for the held object, and returns the first one whose whole payload "
-            "path from the current arm state is collision-free. Pass "
+            "and yaw turns for the held object, and returns the planner's preferred one among "
+            "those whose whole payload path from the current arm state is collision-free. Pass "
             "release_object_pose_xyz_quat_xyzw unchanged to motion.move_grasped_object_to_pose "
             "with phase=carry, then open the gripper with release_support_object_id set to the "
             "same support. Read-only; it never moves the arm or opens the gripper, and "
