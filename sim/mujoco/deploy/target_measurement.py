@@ -8,8 +8,6 @@ construct authority, apply safety, resolve IK, or dispatch commands.
 from __future__ import annotations
 
 import hashlib
-import os
-import threading
 from collections.abc import Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -373,42 +371,6 @@ def build_mujoco_sim_hil_coordinate_profiles(
     return target_profile, tool_profile
 
 
-# (profile name, side) -> (resolved path, (mtime_ns, size), endpoint_T_tool).
-# Held-object guards call the TCP capture on every 4 kHz physics step; the
-# calibration file is re-read only when its identity on disk changes.
-_ENDPOINT_TO_TOOL_CACHE: dict[tuple[str, str], tuple[str, tuple[int, int], np.ndarray]] = {}
-_ENDPOINT_TO_TOOL_LOCK = threading.Lock()
-
-
-def _file_identity(path: str) -> tuple[int, int] | None:
-    try:
-        stat = os.stat(path)
-    except OSError:
-        return None
-    return (stat.st_mtime_ns, stat.st_size)
-
-
-def _endpoint_to_tool_by_side(task_config: Any) -> dict[str, np.ndarray]:
-    result: dict[str, np.ndarray] = {}
-    for side in ("left", "right"):
-        name = getattr(task_config, side + "_tool_profile_path")
-        key = (str(name), side)
-        cached = _ENDPOINT_TO_TOOL_CACHE.get(key)
-        if cached is not None and _file_identity(cached[0]) == cached[1]:
-            result[side] = cached[2]
-            continue
-        with _ENDPOINT_TO_TOOL_LOCK:
-            profile = load_rm65_tool_profile(name, side=side)
-            path = str(profile["_profile_path"])
-            identity = _file_identity(path)
-            transform = np.array(endpoint_to_tool_transform(profile), dtype=float)
-            transform.setflags(write=False)
-            if identity is not None:
-                _ENDPOINT_TO_TOOL_CACHE[key] = (path, identity, transform)
-        result[side] = transform
-    return result
-
-
 def capture_mujoco_sim_hil_tool_tcp_pose_by_side(
     scene: Any,
     task_config: Any,
@@ -416,12 +378,21 @@ def capture_mujoco_sim_hil_tool_tcp_pose_by_side(
     """Capture current ``T_arm_base_tool_tcp`` for each active arm."""
 
     result: dict[str, np.ndarray] = {}
-    endpoint_to_tool = _endpoint_to_tool_by_side(task_config)
+    tool_profiles = {
+        "left": load_rm65_tool_profile(
+            task_config.left_tool_profile_path,
+            side="left",
+        ),
+        "right": load_rm65_tool_profile(
+            task_config.right_tool_profile_path,
+            side="right",
+        ),
+    }
     for side in ("left", "right"):
         base_name = _arm_base_body_name(scene, side)
         endpoint = scene.body_pose(scene.arm_specs[side].controlled_body)
         pose = np.linalg.inv(scene.body_pose(base_name)) @ endpoint
-        result[side] = pose @ endpoint_to_tool[side]
+        result[side] = pose @ endpoint_to_tool_transform(tool_profiles[side])
     return result
 
 
