@@ -61,6 +61,7 @@ from .observation_gateway import (
 )
 from .perception_deployment import RealPerceptionCaptureRegistration
 from .realsense_perception import RealSenseAgentPerceptionProvider
+from .tool_entity import RealToolEntityOptions
 from .station_point_grasp_deployment import StationBoundPointGraspRegistration
 from .station_point_grasp_render_deployment import (
     StationBoundPointGraspRenderRegistration,
@@ -156,6 +157,7 @@ def assemble_exclusive_real_agent_primitive_deployment(
     convergence_profile: RealAgentPrimitiveConvergenceProfile | None = None,
     enable_spatial_goals: bool = False,
     enable_tcp_pose_comparison: bool = False,
+    tool_entity_options: RealToolEntityOptions | None = None,
     perception_capture: RealPerceptionCaptureRegistration | None = None,
     rgbd_geometry_registrations: tuple[RgbdGeometryRegistration, ...] = (),
     localization_registration: RealObjectLocalizationRegistration | None = None,
@@ -211,6 +213,14 @@ def assemble_exclusive_real_agent_primitive_deployment(
     bundle = build_real_agent_primitive_contract_bundle(
         enable_spatial_goals=enable_spatial_goals,
         enable_tcp_pose_comparison=enable_tcp_pose_comparison,
+        **({} if tool_entity_options is None else {
+            "enable_tool_object_relations": tool_entity_options.enable_relations,
+            "enable_tool_hover_queries": tool_entity_options.enable_hover,
+            "tool_entity_by_side": tool_entity_options.tool_entity_by_side,
+            "tool_hover_planner_profile_hash": (None if tool_entity_options.hover_planner is None
+                                                else tool_entity_options.hover_planner.profile_hash),
+            "tool_hover_roles": tool_entity_options.hover_roles,
+        }),
         primary_component_id=primary_component_id,
         gripper_contract=gripper_contract,
         attachment=observation_attachment,
@@ -288,6 +298,7 @@ def assemble_exclusive_real_agent_primitive_deployment(
         safe_pose_trajectory_planner=safe_pose_trajectory_planner,
         captured_robot_observation_filter=captured_robot_observation_filter,
         non_motion_read_window=non_motion_read_window,
+        tool_entity_options=tool_entity_options,
         artifact_store=artifact_store,
         owns_artifact_store=owns_artifact_store,
         revision_tracker=revision_tracker,
@@ -317,6 +328,7 @@ def assemble_exclusive_rm65_agent_primitive_deployment(
     convergence_profile: RealAgentPrimitiveConvergenceProfile | None = None,
     enable_spatial_goals: bool = False,
     enable_tcp_pose_comparison: bool = False,
+    tool_entity_options: RealToolEntityOptions | None = None,
     perception_capture: RealPerceptionCaptureRegistration | None = None,
     rgbd_geometry_registrations: tuple[RgbdGeometryRegistration, ...] = (),
     localization_registration: RealObjectLocalizationRegistration | None = None,
@@ -364,6 +376,7 @@ def assemble_exclusive_rm65_agent_primitive_deployment(
     return assemble_exclusive_real_agent_primitive_deployment(
         enable_spatial_goals=enable_spatial_goals,
         enable_tcp_pose_comparison=enable_tcp_pose_comparison,
+        tool_entity_options=tool_entity_options,
         gripper_port=gripper_port,
         primary_component_id=primary_component_id,
         gripper_ports=gripper_ports,

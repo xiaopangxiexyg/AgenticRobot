@@ -131,6 +131,7 @@ from .point_grasp_render_gateway import (
 )
 from .realsense_perception import RealSenseAgentPerceptionProvider
 from .segmentation import RealSenseSegmentationCapturePort
+from .tool_entity import RealToolEntityOptions
 
 
 def _required(value: object, *, field_name: str) -> str:
@@ -759,6 +760,8 @@ class RealAgentPrimitiveGatewaySession:
     gripper_ports: Mapping[str, RealDmtacGripperControlPort] = field(default_factory=dict)
     grasp_fast_plan_executor: PassiveReadSkillExecutor | None = None
     surface_anchor_executor: PassiveReadSkillExecutor | None = None
+    tool_object_relation_executor: PassiveReadSkillExecutor | None = None
+    tool_hover_executor: PassiveReadSkillExecutor | None = None
     _close_lock: threading.Lock = field(default_factory=threading.Lock, init=False)
     _close_outcome: AgentGatewayOperationOutcome | None = field(
         default=None,
@@ -775,6 +778,11 @@ class RealAgentPrimitiveGatewaySession:
             raise TypeError("TCP comparison executor must be passive.")
         if (self.contract_bundle.spatial_goal_registration is not None) != (self.spatial_goal_executor is not None):
             raise ValueError("Spatial goal registration and executor must coexist.")
+        if (self.contract_bundle.tool_object_relation_registration is not None) != (
+                self.tool_object_relation_executor is not None):
+            raise ValueError("Tool-object relation registration and executor must coexist.")
+        if (self.contract_bundle.tool_hover_registration is not None) != (self.tool_hover_executor is not None):
+            raise ValueError("Tool hover registration and executor must coexist.")
         advertised = (
             "own_domain_emergency_stop_v1"
             in self.contract_bundle.route_manifest.supported_transport_features
@@ -895,6 +903,8 @@ class RealAgentPrimitiveGatewaySession:
             "perception.localize_objects": self.localization_executor,
             "perception.segment": self.segmentation_executor,
             "perception.capture_surface_anchor": self.surface_anchor_executor,
+            "perception.describe_tool_object_relations": self.tool_object_relation_executor,
+            "perception.query_tool_hover_paths": self.tool_hover_executor,
             "perception.plan_placement": self.placement_executor,
             "perception.plan_point_grasp": self.station_point_grasp_executor,
             "perception.render_point_grasp_candidate": (
@@ -1027,6 +1037,12 @@ class RealAgentPrimitiveGatewaySession:
                     (self.grasp_observation_executor, 5.0),
                     (self.object_transport_executor, 5.0),
                     (self.spatial_goal_executor, 5.0),
+                    *((executor, 5.0 + registration.entry.route.max_operation_duration_ms / 1000.0)
+                      for executor, registration in (
+                          (self.tool_object_relation_executor,
+                           self.contract_bundle.tool_object_relation_registration),
+                          (self.tool_hover_executor, self.contract_bundle.tool_hover_registration))
+                      if registration is not None),
                     *((executor, 5.0) for executor in self.rgbd_geometry_executors),
                 )
             )
@@ -1312,6 +1328,7 @@ def assemble_real_agent_primitive_gateway_session(
     object_transport_planner_factory: Callable[..., object] | None = None,
     captured_robot_observation_filter: Callable[..., object] | None = None,
     non_motion_read_window: Callable[[], object] | None = None,
+    tool_entity_options: RealToolEntityOptions | None = None,
     artifact_store: RecoverableAgentArtifactStore | None = None,
     owns_artifact_store: bool = False,
     revision_tracker: AgentStationRevisionTracker | None = None,
@@ -1731,6 +1748,8 @@ def assemble_real_agent_primitive_gateway_session(
     segmentation_provider = None
     segmentation_executor = None
     surface_anchor_executor = None
+    tool_object_relation_executor = None
+    tool_hover_executor = None
     placement_provider = None
     placement_executor = None
     station_point_grasp_provider = None
@@ -1871,6 +1890,56 @@ def assemble_real_agent_primitive_gateway_session(
             execution_port_by_route_hash[
                 placement_registration.skill.routes[0].semantic_content_hash
             ] = placement_executor
+        relation_registration = contract_bundle.tool_object_relation_registration
+        hover_registration = contract_bundle.tool_hover_registration
+        if relation_registration is not None or hover_registration is not None:
+            if tool_entity_options is None:
+                raise ValueError("Real tool-entity Routes require their composition options.")
+            from agent_gateway.profiles.tool_entity import (
+                build_tool_hover_executor,
+                build_tool_object_relation_executor,
+            )
+
+            from robot_motion.tool_entity_scene import RELATION_MAXIMUM_DEPTH_M
+
+            from .tool_entity import RealToolScenePort
+
+            tool_scene_port = RealToolScenePort(perception_provider=perception_provider,
+                tool_tcp_poses=tool_entity_options.tool_tcp_poses,
+                public_from_geometry=tool_entity_options.public_from_geometry)
+        if relation_registration is not None:
+            if segmentation_provider is None or back_projection_registration is None:
+                raise ValueError("Real tool-object relations require segmentation and aligned RGB-D.")
+            tool_object_relation_executor = build_tool_object_relation_executor(
+                registration=relation_registration, scene_port=tool_scene_port,
+                segmentation_provider=segmentation_provider,
+                tool_entity_by_side=tool_entity_options.tool_entity_by_side,
+                maximum_depth_m=min(RELATION_MAXIMUM_DEPTH_M,
+                                    back_projection_registration.profile.maximum_depth_m),
+                current_station_revision=lambda: producer.current_station_revision,
+                clock=clock, max_retained_operations=max_retained_operations)
+            execution_port_by_route_hash[relation_registration.entry.route.semantic_content_hash] = (
+                tool_object_relation_executor)
+        if hover_registration is not None:
+            if anchor_registration is None or tool_entity_options.hover_planner is None:
+                raise ValueError("Real tool hover queries require surface anchor v2 and their planner.")
+
+            def lookup_tool_anchor(identifier):
+                source_request = service.operation_store.request_for_operation(identifier)
+                source_operation = service.operation_store.get(identifier)
+                return (None if source_request is None or source_operation is None
+                        else (source_request, source_operation))
+
+            tool_hover_executor = build_tool_hover_executor(
+                registration=hover_registration, capture_registration=anchor_registration,
+                scene_port=tool_scene_port, planner_port=tool_entity_options.hover_planner,
+                tool_entity_by_side=tool_entity_options.tool_entity_by_side, store=artifact_store,
+                lookup_operation=lookup_tool_anchor,
+                current_station_revision=lambda: producer.current_station_revision, clock=clock,
+                clock_domain_id=contract_bundle.attachment.clock_domain_id,
+                max_retained_operations=max_retained_operations)
+            execution_port_by_route_hash[hover_registration.entry.route.semantic_content_hash] = (
+                tool_hover_executor)
 
         if contract_bundle.rgbd_geometry_registrations:
             rgbd_geometry_executors = build_rgbd_geometry_executors(
@@ -2199,6 +2268,8 @@ def assemble_real_agent_primitive_gateway_session(
         segmentation_provider=segmentation_provider,
         segmentation_executor=segmentation_executor,
         surface_anchor_executor=surface_anchor_executor,
+        tool_object_relation_executor=tool_object_relation_executor,
+        tool_hover_executor=tool_hover_executor,
         placement_provider=placement_provider,
         placement_executor=placement_executor,
         station_point_grasp_provider=station_point_grasp_provider,

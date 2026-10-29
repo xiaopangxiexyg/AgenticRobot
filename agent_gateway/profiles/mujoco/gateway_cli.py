@@ -226,6 +226,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--enable-surface-anchor-v3', action='store_true', help='Publish source-bound anchors consuming retained capture_rgb v3 and optional segment v3; requires the explicit v2 family.')
     parser.add_argument('--surface-anchor-selection-policy', choices=('prompt_nearest', 'max_clearance_medoid'), default='prompt_nearest', help='Explicit v2 max-clearance tie profile; default preserves prompt-nearest selection.')
     parser.add_argument('--enable-relation-goal-queries', action='store_true', help='Expose one general anchored relation-path query; requires --enable-surface-anchors.')
+    parser.add_argument('--enable-tool-object-relations', action='store_true',
+        help=('Publish read-only perception.describe_tool_object_relations@1 (segmented frozen multi-view RGB-D vs the '
+              'reviewed DMTAC gripper, same implementation as the RealMan Gateway); requires --artifact-root and segmentation.'))
+    parser.add_argument('--enable-tool-hover-queries', action='store_true',
+        help=('Publish read-only perception.query_tool_hover_paths@1 (gripper-box hover paths checked on the observed '
+              'RGB-D scene by a private safe TCP planner, never activated); requires --enable-surface-anchor-v2 and '
+              '--enable-observed-point-motion.'))
     parser.add_argument('--safe-tcp-motion-profile', choices=tuple(MUJOCO_SAFE_TCP_MOTION_PROFILES), default='local_step', help='Explicit sim-only safe Route limits; ordinary Routes stay unchanged.')
     parser.add_argument(
         "--enable-spatial-goals",
@@ -557,6 +564,7 @@ def _segmentation_requested(args):
         or args.enable_segmentation_batch_v2
         or args.enable_segmentation_geometry_v3
         or args.enable_surface_anchor_v2
+        or args.enable_tool_object_relations
     )
 
 
@@ -683,6 +691,8 @@ def main(argv: list[str] | None = None) -> int:
         or args.enable_relation_tcp_continuation_queries
         or args.enable_region_tcp_continuation_queries
         or args.enable_relation_goal_queries
+        or args.enable_tool_object_relations
+        or args.enable_tool_hover_queries
         or args.history_root is not None
         or args.segmentation_asset_bundle is not None
         or args.sam3_endpoint is not None
@@ -693,6 +703,10 @@ def main(argv: list[str] | None = None) -> int:
         )
     if args.enable_surface_anchor_v2 and not args.enable_surface_anchors:
         parser.error("--enable-surface-anchor-v2 requires surface anchors and segmentation")
+    if args.enable_tool_object_relations and args.artifact_root is None:
+        parser.error("--enable-tool-object-relations requires --artifact-root and segmentation")
+    if args.enable_tool_hover_queries and not (args.enable_surface_anchor_v2 and args.enable_observed_point_motion):
+        parser.error("--enable-tool-hover-queries requires --enable-surface-anchor-v2 and --enable-observed-point-motion")
     if args.sam3_multi_instance_text and not args.enable_object_localization:
         parser.error("--sam3-multi-instance-text requires --enable-object-localization")
     if args.enable_object_support_motion_v2 != bool(args.object_support_body):
@@ -894,6 +908,8 @@ def main(argv: list[str] | None = None) -> int:
         enable_anchor_region_motion_v3=args.enable_anchor_region_motion_v3,
         enable_anchor_hover_motion_v4=args.enable_anchor_hover_motion_v4,
         safe_motion_observation=safe_motion_observation,
+        enable_tool_object_relations=args.enable_tool_object_relations,
+        enable_tool_hover_queries=args.enable_tool_hover_queries,
         enable_safe_tcp_path_constraints=args.enable_safe_tcp_path_constraints,
         enable_tcp_continuation_queries=args.enable_tcp_continuation_queries,
         enable_tcp_candidate_artifacts=args.enable_tcp_candidate_artifacts,

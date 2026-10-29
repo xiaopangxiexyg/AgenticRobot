@@ -48,6 +48,9 @@ OBJECT_MASK_EROSION_PX = 2
 # component was mask bleed onto another object or a gripper part.
 SURFACE_AMBIGUITY_SHARE = 0.25
 SURFACE_AMBIGUITY_MINIMUM_VOXELS = 10
+# Object-mask surfaces use only depth up to the safe-motion scene's range
+# (the calibration of the 21 saved samples); farther pixels are not evidence.
+RELATION_MAXIMUM_DEPTH_M = 1.5
 # Height above the anchor below which observed points count as support under a
 # hovering tool footprint; higher points are reported as overhead obstacles.
 ENTITY_HOVER_SUPPORT_WINDOW_M = 0.30
@@ -343,8 +346,8 @@ def search_entity_hover_paths(*, entity: ToolEntityBox, anchor_xyz_m, current_tc
 
     Proposals are inset by the arrival translation tolerance; every planned
     endpoint is re-measured against the ORIGINAL bounds. ``plan_candidate(pose,
-    time_budget_sec=..., deadline=...)`` must plan only (no dispatch) from the
-    same measured start for every proposal. The selected proposal pose is the
+    time_budget_sec=...)`` must plan only (no dispatch) from the same measured
+    start for every proposal and stop within that budget in its own clock. The
     target a separate safe motion Skill may later be asked to reach; this
     search grants no execution authority.
     """
@@ -391,8 +394,7 @@ def search_entity_hover_paths(*, entity: ToolEntityBox, anchor_xyz_m, current_tc
             summary.update(status="query_incomplete", reason="query_budget_exhausted")
             break
         summary["attempted_candidate_count"] += 1
-        outcome = plan_candidate(tuple(float(x) for x in candidate.pose_xyz_quat_xyzw),
-                                 time_budget_sec=remaining, deadline=started + remaining)
+        outcome = plan_candidate(tuple(float(x) for x in candidate.pose_xyz_quat_xyzw), time_budget_sec=remaining)
         if not isinstance(outcome, HoverPlanOutcome):
             raise TypeError("Hover planner must return a HoverPlanOutcome.")
         finished = clock()
@@ -450,6 +452,7 @@ __all__ = [
     "ENTITY_HOVER_SUPPORT_WINDOW_M",
     "OBJECT_MASK_EROSION_PX",
     "RELATION_EVIDENCE_SCOPE",
+    "RELATION_MAXIMUM_DEPTH_M",
     "SURFACE_AMBIGUITY_MINIMUM_VOXELS",
     "SURFACE_AMBIGUITY_SHARE",
     "SURFACE_CLUSTER_FIELDS",

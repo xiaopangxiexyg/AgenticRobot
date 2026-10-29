@@ -259,6 +259,9 @@ class MujocoAnchorMotionLifecycle(MujocoObservedPointMotionLifecycle):
                     "safe_tcp_target_blocked", "safe_tcp_endpoint_search_exhausted",
                     "safe_tcp_path_search_exhausted", "safe_tcp_retimed_path_blocked",
                     "safe_tcp_motion_quality_exceeded", "safe_tcp_target_envelope_blocked",
+                    # Egress proofs are per path: another offset may still exit.
+                    "safe_tcp_inherited_start_clearance_regressed",
+                    "safe_tcp_inherited_start_clearance_not_exited",
                 }:
                     raise
                 failures.append((index, error.reason_code))

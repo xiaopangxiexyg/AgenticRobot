@@ -172,7 +172,6 @@ class MujocoObservedSafeMotionProvider:
 
     def capture(self, *, operation_id, expected_station_revision, cancel_requested):
         from sim.mujoco.deploy.planned_tcp_motion import MujocoTcpPlanRejected
-        from .back_projection import live_aligned_depth_capture_from_array
 
         def require_request():
             if cancel_requested():
@@ -189,32 +188,23 @@ class MujocoObservedSafeMotionProvider:
                 for role in self.config.observation.roles),
             cancel_requested=cancel_requested)
         require_request()
-        pair = cut.arm_qpos_by_side
-        captures = []
-        for role, view in zip(self.config.observation.roles, cut.views, strict=True):
-            require_request()
-            source_id = self.capture_port.source_id_by_role[role]
-            if view.view_id != source_id:
-                raise MujocoTcpPlanRejected("observed_planning_rgbd_cut_mismatch")
-            depth = live_aligned_depth_capture_from_array(
-                view.depth_m, captured_at=cut.captured_at,
-                camera_pose_world_xyz_quat_xyzw=view.optical_camera_pose_world_xyz_quat_xyzw,
-                intrinsics=view.intrinsics, source_id=source_id, role=role,
-                station_revision=expected_station_revision,
-                application=self.capture_port.application,
-                source_frame_id=self.capture_port.source_frame_id,
-                reference_frame_id=self.capture_port.reference_frame_id)
-            captures.append(SimpleNamespace(
-                role=role, source_id=depth.source_id, acquired_at=depth.captured_at,
-                station_revision=depth.station_revision, source_generation=None,
-                frame_index=None,
-                source_binding_hash=self.source_binding_hash,
-                width=depth.depth_m.shape[1], height=depth.depth_m.shape[0],
-                depth_m=depth.depth_m, depth_content_hash=depth.depth_content_hash,
-                intrinsics=depth.intrinsics, source_from_camera=(
-                    self.geometry_from_depth_reference @ np.asarray(depth.reference_from_camera).reshape(4, 4)),
-                capture_qpos_by_side=pair, pose_measured_at=cut.captured_at,
-                pose_evidence_refs=()))
+        captures = self.captures_from_cut(cut, roles=self.config.observation.roles,
+            expected_station_revision=expected_station_revision, require_request=require_request)
+        _, source = self.planning_input_from_captures(captures)
+        require_request()
+        return source
+
+    def captures_from_cut(self, cut, *, roles, expected_station_revision, require_request=lambda: None):
+        """Typed RGB-D views of one native cut in the URDF/FCL geometry frame."""
+        return mujoco_rgbd_captures_from_cut(cut, roles=roles, capture_port=self.capture_port,
+            geometry_from_depth_reference=self.geometry_from_depth_reference,
+            source_binding_hash=self.source_binding_hash, expected_station_revision=expected_station_revision,
+            require_request=require_request)
+
+    def planning_input_from_captures(self, captures):
+        """Observed cloud plus the request-owned planning input for the current measured arms."""
+        from sim.mujoco.deploy.planned_tcp_motion import MujocoTcpPlanRejected
+
         current = self.rig.capture_scene(lambda scene: scene.arm_qpos_by_side())
         try:
             cloud = obstacle_cloud_from_captures(captures=captures, config=self.config.observation,
@@ -230,5 +220,46 @@ class MujocoObservedSafeMotionProvider:
             source.require_current(current)
         except ValueError as error:
             raise MujocoTcpPlanRejected("observed_planning_input_rejected", {"error": str(error)}) from error
+        return cloud, source
+
+
+def mujoco_rgbd_captures_from_cut(cut, *, roles, capture_port, geometry_from_depth_reference, source_binding_hash,
+                                  expected_station_revision, require_request=lambda: None):
+    """Convert one native multi-view cut into RGB-D captures with capture-time dual-arm qpos.
+
+    ``source_from_camera`` is in the URDF/FCL geometry frame (the capture
+    port's source frame); RGB is kept for segmentation consumers.
+    """
+    from sim.mujoco.deploy.planned_tcp_motion import MujocoTcpPlanRejected
+    from .back_projection import live_aligned_depth_capture_from_array
+
+    pair = cut.arm_qpos_by_side
+    captures = []
+    for role, view in zip(roles, cut.views, strict=True):
         require_request()
-        return source
+        source_id = capture_port.source_id_by_role[role]
+        if view.view_id != source_id:
+            raise MujocoTcpPlanRejected("observed_planning_rgbd_cut_mismatch")
+        depth = live_aligned_depth_capture_from_array(
+            view.depth_m, captured_at=cut.captured_at,
+            camera_pose_world_xyz_quat_xyzw=view.optical_camera_pose_world_xyz_quat_xyzw,
+            intrinsics=view.intrinsics, source_id=source_id, role=role,
+            station_revision=expected_station_revision,
+            application=capture_port.application,
+            source_frame_id=capture_port.source_frame_id,
+            reference_frame_id=capture_port.reference_frame_id)
+        rgb = getattr(view, "rgb", None)
+        rgb = None if rgb is None else np.ascontiguousarray(rgb)
+        captures.append(SimpleNamespace(
+            role=role, source_id=depth.source_id, acquired_at=depth.captured_at,
+            station_revision=depth.station_revision, source_generation=None,
+            frame_index=None,
+            source_binding_hash=source_binding_hash,
+            width=depth.depth_m.shape[1], height=depth.depth_m.shape[0],
+            depth_m=depth.depth_m, depth_content_hash=depth.depth_content_hash,
+            intrinsics=depth.intrinsics, source_from_camera=(
+                geometry_from_depth_reference @ np.asarray(depth.reference_from_camera).reshape(4, 4)),
+            capture_qpos_by_side=pair, pose_measured_at=cut.captured_at,
+            pose_evidence_refs=(), rgb=rgb,
+            rgb_content_hash=None if rgb is None else hashlib.sha256(rgb.tobytes(order="C")).hexdigest()))
+    return captures

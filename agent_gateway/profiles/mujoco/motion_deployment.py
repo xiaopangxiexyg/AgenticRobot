@@ -827,6 +827,8 @@ class MujocoAgentTcpPoseContractBundle:
     surface_anchor_registrations: tuple[SpatialGoalRegistration, ...] = ()
     tcp_continuation_query_registration: SpatialGoalRegistration | None = None
     candidate_query_registrations: tuple[SpatialGoalRegistration, ...] = ()
+    # Shared tool-entity relations/hover Skills (agent_gateway.profiles.tool_entity).
+    tool_entity_registrations: tuple[Any, ...] = ()
 
     def __post_init__(self) -> None:
         published_skill_ids = {
@@ -847,6 +849,13 @@ class MujocoAgentTcpPoseContractBundle:
             if self.route_manifest.route(registration.skill.definition.skill_id,
                     registration.skill.definition.skill_version) != registration.entry:
                 raise ValueError("Surface anchor registration differs from its manifest entry.")
+        for registration in self.tool_entity_registrations:
+            if self.route_manifest.route(registration.skill.definition.skill_id,
+                    registration.skill.definition.skill_version) != registration.entry:
+                raise ValueError("Tool-entity registration differs from its manifest entry.")
+            if registration.skill.definition.skill_id not in {
+                    "perception.describe_tool_object_relations", "perception.query_tool_hover_paths"}:
+                raise ValueError("Unknown tool-entity registration.")
 
         validate_skill_route_catalog_closure(
             definition_catalog=self.definition_catalog,
@@ -2066,6 +2075,10 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
     object_support_body_names: tuple[str, ...] = (),
     enable_grasp_approach: bool = False,
     grasp_contact_binding: MujocoGraspContactBinding | None = None,
+    enable_tool_object_relations: bool = False,
+    enable_tool_hover_queries: bool = False,
+    tool_entity_by_side: Mapping[str, Any] | None = None,
+    tool_hover_roles: tuple[str, ...] = (),
 ) -> MujocoAgentTcpPoseContractBundle:
     """Project one already-constructed no-model application without starting it."""
 
@@ -3114,6 +3127,43 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
             surface_anchor_registrations += (build_region_continuation_registration(
                 capture=capture, relation=relation, continuation=tcp_continuation_query_registration,
                 version=region_tcp_continuation_version),)
+    tool_entity_registrations = ()
+    if enable_tool_object_relations or enable_tool_hover_queries:
+        from agent_gateway.profiles.tool_entity import (
+            build_tool_hover_registration,
+            build_tool_object_relation_registration,
+        )
+
+        if (segmentation is None or depth_capture is None or depth_capture.back_projection is None
+                or not tool_entity_by_side):
+            raise ValueError("MuJoCo tool-entity Skills need segmentation, aligned RGB-D and a tool entity.")
+        if enable_tool_object_relations:
+            tool_entity_registrations += (build_tool_object_relation_registration(
+                segmentation=segmentation, back_projection=depth_capture.back_projection,
+                roles=depth_capture.back_projection.profile.roles, tool_entity_by_side=tool_entity_by_side),)
+        if enable_tool_hover_queries:
+            anchors = [item for item in surface_anchor_registrations
+                       if item.skill.definition.skill_id == "perception.capture_surface_anchor"
+                       and item.skill.definition.skill_version == "2"]
+            safe_entry = next((item for item in planned_motions
+                               if item[2].skill_id == "motion.move_tcp_to_pose_safe"
+                               and item[2].skill_version == "1"), None)
+            if (len(anchors) != 1 or safe_entry is None or safe_motion_observation_profile_hash is None
+                    or not tool_hover_roles):
+                raise ValueError("MuJoCo tool hover queries need surface anchor v2, the safe TCP Route "
+                                 "and the observed-scene planner.")
+            hover_side = component.removesuffix("_arm")
+            tool_entity_registrations += (build_tool_hover_registration(
+                capture_registration=anchors[0], back_projection=depth_capture.back_projection,
+                component_side_by_id={component: hover_side}, roles=tuple(tool_hover_roles),
+                tool_entity_by_side=tool_entity_by_side,
+                # The private plan-only planner shares the safe Route's observed
+                # scene, motion profile and envelope; both identities bind here.
+                planner_profile_hash=canonical_content_hash({
+                    "planner": "mujoco_private_collision_checked_joint_path_v1",
+                    "observed_scene": safe_motion_observation_profile_hash,
+                    "safe_motion_route": safe_entry[2].semantic_content_hash},
+                    domain="agenticrobot.mujoco.tool_hover_planner_binding.v1")),)
     tcp_pose_comparison_registration = None
     if enable_tcp_pose_comparison:
         from agent_gateway.profiles.tcp_pose_comparison import (
@@ -3159,7 +3209,7 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
     if object_goal_query_registration is not None:
         definition_items.append(object_goal_query_registration.skill.definition)
         schema_items.append(object_goal_query_registration.skill.schema_entry)
-    for registration in (*surface_anchor_registrations, *candidate_query_registrations):
+    for registration in (*surface_anchor_registrations, *candidate_query_registrations, *tool_entity_registrations):
         definition_items.append(registration.skill.definition)
         schema_items.append(registration.skill.schema_entry)
     if tcp_continuation_query_registration is not None:
@@ -3325,7 +3375,8 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
         route_items.append(spatial_goal_registration.entry)
     if object_goal_query_registration is not None:
         route_items.append(object_goal_query_registration.entry)
-    route_items.extend(registration.entry for registration in (*surface_anchor_registrations, *candidate_query_registrations))
+    route_items.extend(registration.entry for registration in (*surface_anchor_registrations, *candidate_query_registrations,
+                                                               *tool_entity_registrations))
     if tcp_continuation_query_registration is not None:
         route_items.append(tcp_continuation_query_registration.entry)
     if localization is not None:
@@ -3374,7 +3425,8 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
             explicit_contracts += (rgbd_capture.skill.io_contract,)
         explicit_contracts += tuple(registration.skill.io_contract
             for registration in (object_goal_query_registration, localization, tcp_continuation_query_registration,
-                                 *surface_anchor_registrations, *candidate_query_registrations)
+                                 *surface_anchor_registrations, *candidate_query_registrations,
+                                 *tool_entity_registrations)
             if registration is not None and key == (
                 registration.skill.definition.skill_id, registration.skill.definition.skill_version))
         contract = (
@@ -3471,7 +3523,8 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
         validator_items.append(spatial_goal_registration.payload_validator)
     if object_goal_query_registration is not None:
         validator_items.append(object_goal_query_registration.payload_validator)
-    validator_items.extend(registration.payload_validator for registration in (*surface_anchor_registrations, *candidate_query_registrations))
+    validator_items.extend(registration.payload_validator for registration in (*surface_anchor_registrations, *candidate_query_registrations,
+                                                                               *tool_entity_registrations))
     if tcp_continuation_query_registration is not None:
         validator_items.append(tcp_continuation_query_registration.payload_validator)
     if localization is not None:
@@ -3530,6 +3583,7 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
         tcp_continuation_query_registration=tcp_continuation_query_registration,
         candidate_query_registrations=candidate_query_registrations,
         surface_anchor_registrations=surface_anchor_registrations,
+        tool_entity_registrations=tool_entity_registrations,
         tcp_pose_comparison_registration=tcp_pose_comparison_registration,
         object_state_registration=object_state_registration,
         grasp_approach_contract=grasp_contract,
