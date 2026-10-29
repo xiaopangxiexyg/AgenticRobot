@@ -1,14 +1,17 @@
-"""Measured top-down grasp approach for a named resting object.
+"""Measured grasp approach for a named resting box-like object.
 
 ``perception.query_grasp_approach@1`` is read-only. One request measures the
-object's top face from fresh RGB-D (text segmentation, plane fit, footprint
-orientation), proposes top-down grasps turned by quarter turns about the
-object, and keeps the planner's preferred one whose approach path from the
-current arm state and whose straight final approach are collision-free. It
-returns the three tool_tcp poses consumed by ``motion.approach_grasp_pose``
-(approach, pregrasp) and ``motion.approach_grasp_contact`` (contact). It
-never moves the arm, closes the gripper or grants execution authority.
-Semantics: ``agenticrobot.object.top_down_grasp_approach.v1``.
+object's top face and the surface under it from fresh RGB-D (text
+segmentation, plane fit, footprint orientation), proposes face-aligned grasps
+in a fixed preference order (the reviewed top-down grasp, the same grasp
+turned a quarter turn either way, a horizontal grasp from the arm's own side,
+a horizontal front grasp, the half-turned top-down grasp) and keeps the first
+whose approach path from the current arm state and whose straight final
+approach are collision-free. It returns the three tool_tcp poses consumed by
+``motion.approach_grasp_pose`` (approach, pregrasp) and
+``motion.approach_grasp_contact`` (contact). It never moves the arm, closes
+the gripper or grants execution authority.
+Semantics: ``agenticrobot.object.face_aligned_grasp_approach.v1``.
 """
 
 from __future__ import annotations
@@ -24,7 +27,8 @@ from agent_gateway.protocol.skill_catalog import (
 )
 
 SKILL_ID = "perception.query_grasp_approach"
-SEMANTICS = "agenticrobot.object.top_down_grasp_approach.v1"
+SEMANTICS = "agenticrobot.object.face_aligned_grasp_approach.v1"
+APPROACH_FAMILIES = ("top_down", "side", "front")
 STATUSES = ("grasp_approach_found", "no_grasp_approach")
 REASONS = (
     "collision_free_approach_found",
@@ -41,11 +45,12 @@ POSE_KEYS = ("approach_tcp_pose_xyz_quat_xyzw", "pregrasp_tcp_pose_xyz_quat_xyzw
 PARAMETER_KEYS = frozenset({"object_id", "reference_frame_id"})
 RESULT_KEYS = frozenset({
     "semantics", "status", "reason", "object_id", "reference_frame_id", "station_revision",
-    *POSE_KEYS, "measured_object", "yaw_offset_rad", "candidate_count",
-    "attempted_candidate_count", "selected_candidate_index", "path_planning_wall_sec", "views",
-    "motion_executed", "execution_authorized"})
+    *POSE_KEYS, "approach_family", "measured_object", "yaw_offset_rad", "candidate_count",
+    "attempted_candidate_count", "selected_candidate_index", "candidate_rejections",
+    "path_planning_wall_sec", "views", "motion_executed", "execution_authorized"})
 MEASURED_KEYS = frozenset({"role", "language_prompt", "score", "top_center_xyz_m", "yaw_rad",
-                           "extent_xy_m", "top_point_count"})
+                           "extent_xy_m", "top_point_count", "support_z_m"})
+REJECTION_KEYS = frozenset({"candidate", "reason_code"})
 VIEW_KEYS = frozenset({"role", "outcome", "score"})
 
 
@@ -53,12 +58,16 @@ def definition() -> SkillDefinition:
     return SkillDefinition(
         skill_id=SKILL_ID, skill_version="1", skill_kind="inspection",
         summary=(
-            "Find a collision-checked top-down grasp approach for a named object resting on a "
+            "Find a collision-checked grasp approach for a named box-like object resting on a "
             "surface. Requires the gripper open and the object not held. The Gateway segments "
             "the object in fresh RGB-D from each bound camera, measures its top face (center, "
-            "height, yaw), proposes top-down grasps turned by quarter turns about the object and "
-            "returns the planner's preferred one whose path from the current arm state and whose "
-            "straight final approach are collision-free. Execute in order: "
+            "height, yaw) and the surface under it, and tries face-aligned grasps in a fixed "
+            "order: top-down, top-down turned a quarter turn either way, horizontal from the "
+            "arm's own side (useful when a post or box blocks the open fingers from above), "
+            "horizontal from the front, top-down turned a half turn. It returns "
+            "the first whose path from the current arm state and whose straight final approach "
+            "are collision-free (approach_family says which) and lists why earlier candidates "
+            "were refused. Execute in order: "
             "motion.approach_grasp_pose to approach_tcp_pose_xyz_quat_xyzw, "
             "motion.approach_grasp_pose to pregrasp_tcp_pose_xyz_quat_xyzw, "
             "motion.approach_grasp_contact to contact_tcp_pose_xyz_quat_xyzw, then close the "
@@ -102,7 +111,8 @@ def schema(*, definition_hash, profile_hash, prompt_by_object_id, reference_fram
     measured = {"type": "object", "additionalProperties": False, "properties": {
         "role": {"type": "string"}, "language_prompt": {"type": "string"},
         "score": {"type": "number"}, "top_center_xyz_m": xyz, "yaw_rad": {"type": "number"},
-        "extent_xy_m": xy, "top_point_count": {"type": "integer", "minimum": 0}},
+        "extent_xy_m": xy, "top_point_count": {"type": "integer", "minimum": 0},
+        "support_z_m": {"type": "number"}},
         "required": sorted(MEASURED_KEYS)}
     result = {"type": "object", "additionalProperties": False, "properties": {
         "semantics": {"const": SEMANTICS},
@@ -112,11 +122,16 @@ def schema(*, definition_hash, profile_hash, prompt_by_object_id, reference_fram
         "reference_frame_id": {"const": reference_frame_id},
         "station_revision": {"type": "integer", "minimum": 0},
         **{key: _nullable(_pose_schema()) for key in POSE_KEYS},
+        "approach_family": {"enum": [*APPROACH_FAMILIES, None]},
         "measured_object": _nullable(measured),
         "yaw_offset_rad": {"type": ["number", "null"]},
         "candidate_count": {"type": "integer", "minimum": 0},
         "attempted_candidate_count": {"type": "integer", "minimum": 0},
         "selected_candidate_index": {"type": ["integer", "null"], "minimum": 0},
+        "candidate_rejections": {"type": "array", "items": {"type": "object",
+            "additionalProperties": False,
+            "properties": {"candidate": {"type": "string"}, "reason_code": {"type": "string"}},
+            "required": ["candidate", "reason_code"]}},
         "path_planning_wall_sec": {"type": "number", "minimum": 0},
         "views": {"type": "array", "items": {"type": "object", "additionalProperties": False,
             "properties": {"role": {"type": "string"}, "outcome": {"enum": list(VIEW_OUTCOMES)},
@@ -186,17 +201,29 @@ def validate_result(value, *, object_ids, reference_frame_id):
     found = value["status"] == "grasp_approach_found"
     if found != (value["reason"] == "collision_free_approach_found"):
         raise ValueError("Grasp query status and reason disagree.")
+    rejections = value["candidate_rejections"]
+    if not isinstance(rejections, (list, tuple)) or len(rejections) > value["attempted_candidate_count"]:
+        raise ValueError("Grasp query rejections must list at most the attempted candidates.")
+    for item in rejections:
+        if (not isinstance(item, Mapping) or set(item) != REJECTION_KEYS
+                or not all(isinstance(item[key], str) and item[key] for key in REJECTION_KEYS)):
+            raise ValueError("Grasp query rejection entries need a candidate and a reason code.")
     if found:
+        if value["approach_family"] not in APPROACH_FAMILIES:
+            raise ValueError("A found grasp approach must name its approach family.")
         for key in POSE_KEYS:
             _pose(value[key], name=key)
-        _finite(value["yaw_offset_rad"], name="yaw_offset_rad", low=-math.pi, high=math.pi)
+        if value["approach_family"] == "top_down":
+            _finite(value["yaw_offset_rad"], name="yaw_offset_rad", low=-math.pi, high=math.pi)
+        elif value["yaw_offset_rad"] is not None:
+            raise ValueError("Only a top-down grasp reports a yaw offset.")
         index = value["selected_candidate_index"]
         _count(index, name="selected_candidate_index")
         if index >= value["attempted_candidate_count"]:
             raise ValueError("Selected grasp candidate was not attempted.")
         if value["measured_object"] is None:
             raise ValueError("A found grasp approach needs its object measurement.")
-    elif (any(value[key] is not None for key in POSE_KEYS)
+    elif (any(value[key] is not None for key in POSE_KEYS) or value["approach_family"] is not None
           or value["selected_candidate_index"] is not None or value["yaw_offset_rad"] is not None):
         raise ValueError("A rejected grasp query cannot publish approach poses.")
     measured = value["measured_object"]
@@ -208,6 +235,9 @@ def validate_result(value, *, object_ids, reference_frame_id):
         _vector(measured["extent_xy_m"], 2, name="extent_xy_m")
         _finite(measured["yaw_rad"], name="yaw_rad", low=-math.pi, high=math.pi)
         _count(measured["top_point_count"], name="top_point_count")
+        _finite(measured["support_z_m"], name="support_z_m")
+        if measured["support_z_m"] >= measured["top_center_xyz_m"][2]:
+            raise ValueError("The surface under the object must be below its top face.")
     views = value["views"]
     if not isinstance(views, (list, tuple)):
         raise ValueError("Grasp query views must be a list.")

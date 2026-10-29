@@ -61,7 +61,7 @@ RELEASE_YAW_OFFSETS_RAD = (0., -math.pi / 4., math.pi / 4., -math.pi / 2., math.
 RELEASE_LATERAL_MARGIN_M = 0.003
 MAXIMUM_RELEASE_CLEARANCE_M = 0.05
 PLANNING_TIME_BUDGET_SEC = 45.
-PATH_SEARCH_BUDGET_SEC = 3.
+PATH_SEARCH_BUDGET_SEC = 8.
 SEGMENTATION_MIN_SCORE = 0.3
 DEPTH_UNCHANGED_TOLERANCE_M = 0.001
 # Leave the executor time to validate and retain its result before the deadline.
@@ -184,8 +184,20 @@ def build_support_release_query_registration(*, segmentation, back_projection, r
         profile_hash, roles, prompts, supports, frame)
 
 
+def summarize_rejections(diagnostics):
+    """Count planner refusals by reason; feasible candidates are not refusals."""
+    counts = {}
+    for item in diagnostics or ():
+        reason = str(item.get("reason_code") or "unknown")
+        if reason != "path_found":
+            counts[reason] = counts.get(reason, 0) + 1
+    return [{"reason_code": reason, "count": count}
+            for reason, count in sorted(counts.items(), key=lambda pair: (-pair[1], pair[0]))]
+
+
 def _rejected(*, parameters, revision, frame, reason, held_pose=None, segmentation=None,
-              measured=None, candidate_count=0, attempted=0, planning_wall_sec=0., views=()):
+              measured=None, candidate_count=0, attempted=0, planning_wall_sec=0., views=(),
+              rejections=()):
     return {
         "semantics": skill.SEMANTICS, "status": "no_release_pose", "reason": reason,
         "support_object_id": parameters["support_object_id"], "reference_frame_id": frame,
@@ -199,6 +211,7 @@ def _rejected(*, parameters, revision, frame, reason, held_pose=None, segmentati
         "measured_support": None if measured is None else measured["evidence"],
         "candidate_count": candidate_count, "attempted_candidate_count": attempted,
         "selected_candidate_index": None, "path_planning_wall_sec": float(planning_wall_sec),
+        "candidate_rejections": list(rejections),
         "views": list(views), "motion_executed": False, "execution_authorized": False}
 
 
@@ -347,25 +360,32 @@ class MujocoSupportReleaseQuery:
                 raise
             return _rejected(reason="held_footprint_does_not_fit_support", held_pose=held_pose,
                              segmentation=segmentation, measured=measured, **common), tuple(evidence)
-        admissible = self._admissible(candidates, held)
+        indices = self._admissible(candidates, held)
+        admissible = [candidates[index] for index in indices]
+        filtered = len(candidates) - len(indices)
+        limit_rejections = ([{"reason_code": "carry_target_outside_route_limits", "count": filtered}]
+                            if filtered else [])
         began = time.monotonic()
         try:
             selection = self._plan(admissible, cancel_requested=cancel_requested, deadline=deadline)
         except MujocoTcpPlanRejected as error:
-            reason = ("query_budget_exhausted" if error.reason_code in {
-                "safe_tcp_path_search_exhausted", "safe_tcp_planning_cancelled"}
-                and not cancel_requested() else "no_collision_free_release_path")
             if cancel_requested():
                 raise InterruptedError("Support release query cancelled.") from error
+            reason = ("query_budget_exhausted" if error.reason_code in {
+                "safe_tcp_path_search_exhausted", "safe_tcp_planning_cancelled"}
+                else "no_collision_free_release_path")
             return _rejected(reason=reason, held_pose=held_pose, segmentation=segmentation,
                              measured=measured, candidate_count=len(candidates),
-                             attempted=len(admissible), planning_wall_sec=time.monotonic() - began,
+                             attempted=len(candidates), planning_wall_sec=time.monotonic() - began,
+                             rejections=[*limit_rejections,
+                                         *summarize_rejections(error.details.get("candidates"))],
                              **common), tuple(evidence)
         wall = time.monotonic() - began
         if selection is None:
             return _rejected(reason="no_collision_free_release_path", held_pose=held_pose,
                              segmentation=segmentation, measured=measured,
-                             candidate_count=len(candidates), attempted=0, **common), tuple(evidence)
+                             candidate_count=len(candidates), attempted=len(candidates),
+                             rejections=limit_rejections, **common), tuple(evidence)
         chosen = admissible[selection.candidate_index]
         release = [float(v) for v in pose_to_xyz_quat_xyzw(chosen.proposal.object_goal)]
         evidence.append("support-release-plan:" + canonical_content_hash({
@@ -383,9 +403,11 @@ class MujocoSupportReleaseQuery:
             "support_region_min_xy_m": list(top.region_min_xy_m),
             "support_region_max_xy_m": list(top.region_max_xy_m),
             "segmentation": segmentation, "measured_support": measured["evidence"],
-            "candidate_count": len(candidates), "attempted_candidate_count": len(admissible),
-            "selected_candidate_index": int(selection.candidate_index),
-            "path_planning_wall_sec": float(wall), "views": views,
+            "candidate_count": len(candidates), "attempted_candidate_count": len(candidates),
+            "selected_candidate_index": int(indices[selection.candidate_index]),
+            "path_planning_wall_sec": float(wall),
+            "candidate_rejections": [*limit_rejections, *summarize_rejections(selection.diagnostics)],
+            "views": views,
             "motion_executed": False, "execution_authorized": False}, tuple(evidence)
 
     @staticmethod
@@ -401,12 +423,12 @@ class MujocoSupportReleaseQuery:
             raise RuntimeError("Support moved during segmentation; retry the release query.")
 
     def _admissible(self, candidates, held):
-        """Drop proposals the carry Route would reject before planning."""
+        """Indices of proposals the carry Route would admit (workspace and delta limits)."""
         profile = self.motion_profile
         bounds = profile.workspace_bounds
         tool = held.reference_from_tool
         kept = []
-        for candidate in candidates:
+        for index, candidate in enumerate(candidates):
             goal = candidate.proposal.object_goal
             tool_goal = candidate.proposal.tool_goal
             relative = tool[:3, :3].T @ tool_goal[:3, :3]
@@ -415,7 +437,7 @@ class MujocoSupportReleaseQuery:
                     and float(np.linalg.norm(tool_goal[:3, 3] - tool[:3, 3]))
                     <= profile.max_translation_delta_m
                     and angle <= profile.max_rotation_delta_rad):
-                kept.append(candidate)
+                kept.append(index)
         return tuple(kept[:64])
 
     def _plan(self, candidates, *, cancel_requested, deadline):

@@ -28,11 +28,16 @@ def _found(**changes):
         "reason": "collision_free_approach_found", "object_id": "debug_cube",
         "reference_frame_id": FRAME, "station_revision": 0,
         **{key: list(POSE) for key in skill.POSE_KEYS},
+        "approach_family": "top_down",
         "measured_object": {"role": "main", "language_prompt": "blue cube", "score": 0.8,
                             "top_center_xyz_m": [-0.19, 0.02, 0.036], "yaw_rad": 0.01,
-                            "extent_xy_m": [0.035, 0.035], "top_point_count": 300},
-        "yaw_offset_rad": 0., "candidate_count": 4, "attempted_candidate_count": 4,
-        "selected_candidate_index": 0, "path_planning_wall_sec": 1.2,
+                            "extent_xy_m": [0.035, 0.035], "top_point_count": 300,
+                            "support_z_m": 0.001},
+        "yaw_offset_rad": 0., "candidate_count": 6, "attempted_candidate_count": 2,
+        "selected_candidate_index": 1,
+        "candidate_rejections": [{"candidate": "top_down",
+                                  "reason_code": "approach_safe_tcp_target_blocked"}],
+        "path_planning_wall_sec": 1.2,
         "views": [{"role": "main", "outcome": "measured", "score": 0.8}],
         "motion_executed": False, "execution_authorized": False}
     value.update(changes)
@@ -59,11 +64,17 @@ def test_grasp_query_contract_names_the_object_and_the_execution_order():
 def test_grasp_query_results_are_consistent_with_their_status():
     objects = ("debug_cube",)
     skill.validate_result(_found(), object_ids=objects, reference_frame_id=FRAME)
+    skill.validate_result(_found(approach_family="side", yaw_offset_rad=None), object_ids=objects,
+                          reference_frame_id=FRAME)
     rejected = _found(status="no_grasp_approach", reason="gripper_not_open",
                       **{key: None for key in skill.POSE_KEYS}, yaw_offset_rad=None,
-                      selected_candidate_index=None, measured_object=None, views=[])
+                      approach_family=None, selected_candidate_index=None, measured_object=None,
+                      candidate_rejections=[], views=[])
     skill.validate_result(rejected, object_ids=objects, reference_frame_id=FRAME)
     for bad in (_found(reason="gripper_not_open"), _found(selected_candidate_index=4),
+                _found(approach_family=None), _found(approach_family="diagonal"),
+                _found(approach_family="side"),
+                _found(candidate_rejections=[{"candidate": "x"}] * 3),
                 _found(motion_executed=True), _found(measured_object=None),
                 _found(views=[{"role": "main", "outcome": "not_segmented", "score": None}]),
                 {**rejected, "approach_tcp_pose_xyz_quat_xyzw": list(POSE)}):
@@ -202,7 +213,7 @@ def test_native_queried_grasp_then_queried_release_places_the_cube(tmp_path, mon
                   "controlled_frame_id": "object_body",
                   **{name: getattr(object_profile, name) for name in lineage}}
         call("motion.move_grasped_object_to_pose",
-             {**common, "phase": "lift", "translation_delta_xyz_m": [0., 0., .06]})
+             {**common, "phase": "lift", "translation_delta_xyz_m": [0., 0., .04]})
         release = call(RELEASE[0], {"support_object_id": "green_box", "reference_frame_id": frame})
         assert release["status"] == "release_pose_found", release
         call("motion.move_grasped_object_to_pose",

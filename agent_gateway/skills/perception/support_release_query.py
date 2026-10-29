@@ -46,14 +46,35 @@ RESULT_KEYS = frozenset({
     "held_object_pose_xyz_quat_xyzw", "yaw_change_rad", "support_top_z_m",
     "support_region_min_xy_m", "support_region_max_xy_m", "segmentation",
     "measured_support", "candidate_count", "attempted_candidate_count",
-    "selected_candidate_index", "path_planning_wall_sec", "views", "motion_executed",
-    "execution_authorized"})
+    "selected_candidate_index", "path_planning_wall_sec", "candidate_rejections", "views",
+    "motion_executed", "execution_authorized"})
 SEGMENTATION_KEYS = frozenset({"role", "language_prompt", "score", "mask_pixel_count",
                                "mask_bounds_xyxy"})
 MEASURED_SUPPORT_KEYS = frozenset({"top_point_count", "plane_residual_m", "plane_tilt_deg",
                                    "footprint_sample_count", "observed_region_min_xy_m",
                                    "observed_region_max_xy_m"})
 VIEW_KEYS = frozenset({"role", "outcome", "score", "certified_area_m2"})
+# Why planned candidates were refused, e.g. safe_tcp_target_blocked (the
+# endpoint collides), safe_tcp_path_search_exhausted (no collision-free path
+# within budget), safe_tcp_endpoint_search_exhausted (out of reach).
+REJECTIONS_SCHEMA = {"type": "array", "items": {"type": "object", "additionalProperties": False,
+    "properties": {"reason_code": {"type": "string"}, "count": {"type": "integer", "minimum": 1}},
+    "required": ["count", "reason_code"]}}
+
+
+def validate_candidate_rejections(value, *, attempted):
+    if not isinstance(value, (list, tuple)):
+        raise ValueError("Candidate rejections must be a list.")
+    total = 0
+    for item in value:
+        if (not isinstance(item, Mapping) or set(item) != {"reason_code", "count"}
+                or not isinstance(item["reason_code"], str) or not item["reason_code"]
+                or isinstance(item["count"], bool) or not isinstance(item["count"], int)
+                or item["count"] < 1):
+            raise ValueError("Candidate rejection entries need a reason code and a positive count.")
+        total += item["count"]
+    if total > attempted:
+        raise ValueError("Candidate rejections exceed the attempted candidates.")
 VIEW_OUTCOMES = ("measured", "not_segmented", "top_not_measured")
 
 
@@ -70,8 +91,14 @@ def definition() -> SkillDefinition:
             "those whose whole payload path from the current arm state is collision-free. Pass "
             "release_object_pose_xyz_quat_xyzw unchanged to motion.move_grasped_object_to_pose "
             "with phase=carry, then open the gripper with release_support_object_id set to the "
-            "same support. Read-only; it never moves the arm or opens the gripper, and "
-            "status=no_release_pose explains why no pose qualified."),
+            "same support. Read-only; it never moves the arm or opens the gripper. "
+            "status=no_release_pose gives the reason and candidate_rejections counts why "
+            "planned poses were refused: safe_tcp_endpoint_search_exhausted means the arm "
+            "found no joint solution for those poses from its current configuration (for "
+            "example after a high lift near the edge of its reach); safe_tcp_target_blocked "
+            "means the release pose itself collides; safe_tcp_path_search_exhausted means no "
+            "collision-free path was found in time. Moving the held object lower or nearer the "
+            "support with phase=carry and querying again changes all three."),
         intended_target_kind="target_agnostic", cross_target_deployment_policy="not_applicable",
         controlled_component_ids=(),
         parameter_semantics_id="held_object.named_support_release.v1",
@@ -140,6 +167,7 @@ def schema(*, definition_hash, profile_hash, support_object_ids, reference_frame
         "attempted_candidate_count": {"type": "integer", "minimum": 0},
         "selected_candidate_index": {"type": ["integer", "null"], "minimum": 0},
         "path_planning_wall_sec": {"type": "number", "minimum": 0},
+        "candidate_rejections": REJECTIONS_SCHEMA,
         "views": {"type": "array", "items": {"type": "object", "additionalProperties": False,
             "properties": {"role": {"type": "string"}, "outcome": {"enum": list(VIEW_OUTCOMES)},
                            "score": {"type": ["number", "null"]},
@@ -259,6 +287,8 @@ def validate_result(value, *, support_object_ids, reference_frame_id):
         if (not isinstance(bounds, (list, tuple)) or len(bounds) != 4
                 or any(isinstance(x, bool) or not isinstance(x, int) for x in bounds)):
             raise ValueError("Segmentation bounds must be four integers.")
+    validate_candidate_rejections(value["candidate_rejections"],
+                                  attempted=value["attempted_candidate_count"])
     views = value["views"]
     if not isinstance(views, (list, tuple)):
         raise ValueError("Release query views must be a list.")

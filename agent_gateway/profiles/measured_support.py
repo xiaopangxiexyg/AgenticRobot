@@ -213,10 +213,38 @@ def measure_support_top(capture: LiveAlignedDepthCapture, mask: np.ndarray, *,
         top_z_m=top_z, tilt_deg=tilt)
 
 
-__all__ = ["MeasuredObjectTop", "MeasuredSupportTop", "fit_support_top_plane",
-           "largest_true_rectangle", "measure_object_top", "measure_support_top",
-           "minimum_area_rectangle", "plane_coverage_grid"]
+def _window_any(mask: np.ndarray, radius: int) -> np.ndarray:
+    """Square-window dilation by an integral image (numpy only)."""
+    padded = np.pad(mask.astype(np.int32), radius + 1)
+    integral = padded.cumsum(axis=0).cumsum(axis=1)
+    size = 2 * radius + 1
+    height, width = mask.shape
+    total = (integral[size:size + height, size:size + width]
+             - integral[:height, size:size + width]
+             - integral[size:size + height, :width]
+             + integral[:height, :width])
+    return total > 0
 
+
+def measure_surface_below(capture: LiveAlignedDepthCapture, mask: np.ndarray, *, top_z_m: float,
+                          maximum_depth_m: float, ring_px: int = 12, minimum_points: int = 60,
+                          below_top_margin_m: float = .005) -> float | None:
+    """Height of the surface around an object's footprint, from a measured depth ring.
+
+    Points of a ring around the mask that lie below the object's top face are
+    the surface it rests on; taller neighbours, the arm and the camera
+    background are excluded by height and depth. Returns None when the ring
+    has too few such points (fully occluded surroundings).
+    """
+    selected = np.asarray(mask, dtype=bool)
+    ring = _window_any(selected, ring_px) & ~_window_any(selected, 3)
+    points = _mask_points(capture, ring, maximum_depth_m)
+    if not len(points):
+        return None
+    below = points[points[:, 2] < top_z_m - below_top_margin_m]
+    if len(below) < minimum_points:
+        return None
+    return float(np.median(below[:, 2]))
 
 @dataclass(frozen=True)
 class MeasuredObjectTop:
@@ -314,3 +342,8 @@ def measure_object_top(capture: LiveAlignedDepthCapture, mask: np.ndarray, *,
         extent_xy_m=(float(extent[0]), float(extent[1])), top_point_count=int(len(top)),
         plane_residual_m=float(np.quantile(residual[residual <= maximum_plane_residual_m], .95)),
         tilt_deg=tilt)
+
+
+__all__ = ["MeasuredObjectTop", "MeasuredSupportTop", "fit_support_top_plane",
+           "largest_true_rectangle", "measure_object_top", "measure_support_top",
+           "measure_surface_below", "minimum_area_rectangle", "plane_coverage_grid"]

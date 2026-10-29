@@ -38,6 +38,7 @@ def _found(**changes):
                              "observed_region_max_xy_m": [-0.06, 0.03]},
         "candidate_count": 40, "attempted_candidate_count": 40, "selected_candidate_index": 6,
         "path_planning_wall_sec": 2.5,
+        "candidate_rejections": [{"reason_code": "safe_tcp_target_blocked", "count": 3}],
         "views": [{"role": "wrist_right", "outcome": "measured", "score": 0.8,
                    "certified_area_m2": 0.0064},
                   {"role": "main", "outcome": "top_not_measured", "score": 0.4,
