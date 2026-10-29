@@ -91,9 +91,11 @@ def spatial_goal_schema(*, definition_hash: str, profile_hash: str,
             "Tool axis to align; z is the gripper approach axis. null with preserve.")},
         "axis_reference_xyz": {**nullable_axis, "description": (
             "Reference direction for tool_axis in the reference frame. The general gripper posture "
-            "is horizontal forward: tool_axis z onto [1, 0, 0]. Use [0, 0, -1] (straight down) only "
-            "when a top-down approach is explicitly required; exactly-down poses are often out of "
-            "reach. null with preserve.")},
+            "is horizontal: tool_axis z onto [1, 0, 0] (approach from the robot side), or onto "
+            "[0, 1, 0] / [0, -1, 0] to approach from the object's right / left side (the right / "
+            "left arm's own side; often better near the central pole or close to the arm). Use "
+            "[0, 0, -1] (straight down) only when a top-down approach is explicitly required; "
+            "exactly-down poses are often out of reach. null with preserve.")},
     }, "required": sorted(PARAMETER_KEYS)}
     result = {"type": "object", "additionalProperties": False, "properties": {
         **identity,
