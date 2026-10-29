@@ -29,9 +29,12 @@ def grasped_object_move_definition(*, controlled_component_ids):
             "Move a deployment-bound grasped object to an absolute object-body pose. "
             "The lower owner remembers the measured hand-object transform and checks "
             "the complete carried geometry, robot and world. Lift first establishes "
-            "physical following; carry requires verified holding; place permits only "
-            "the named support contact. Does not close/open the gripper or certify "
-            "release. No unchecked TCP fallback."
+            "physical following: until holding is verified, a lift must raise the "
+            "object at least 3.5 cm above where the grasp was frozen. Carry requires "
+            "verified holding; place permits only the named support contact. If the "
+            "hand arrives but the measured object state does not, the operation stops "
+            "with a reason instead of waiting. Does not close/open the gripper or "
+            "certify release. No unchecked TCP fallback."
         ),
         intended_target_kind="target_agnostic",
         cross_target_deployment_policy="not_applicable",

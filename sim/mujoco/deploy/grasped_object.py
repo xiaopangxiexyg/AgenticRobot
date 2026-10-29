@@ -21,6 +21,10 @@ from robot_motion.pose import pose_delta_metrics
 from sim.mujoco.deploy.contact_timing import is_single_physics_step_elapsed
 from sim.mujoco.transforms import pose_to_xyz_quat_xyzw
 
+# Both the object COM and the TCP must rise this far above their positions at
+# the frozen lift start, unsupported, before holding can be verified.
+HOLDING_VERIFICATION_RISE_M = .03
+
 
 @dataclass(frozen=True)
 class NativeGraspedObjectCut:
@@ -287,8 +291,9 @@ class MujocoGraspedObjectObserver:
                     raise ObjectRelationInvalidated("Object follow observation gap exceeds 50ms of simulation time.")
                 self._verified = False
                 self._window_start, self._window_count = None, 0
-            lifted = (com[2] - self._initial_z >= .03
-                      and tcp[2, 3] - self._initial_tcp_z >= .03 and not support)
+            lifted = (com[2] - self._initial_z >= HOLDING_VERIFICATION_RISE_M
+                      and tcp[2, 3] - self._initial_tcp_z >= HOLDING_VERIFICATION_RISE_M
+                      and not support)
             fresh = self._last is None or stamp > self._last.sim_time_s
             if lifted and fresh:
                 if self._window_start is None:
@@ -361,6 +366,20 @@ class MujocoGraspedObjectObserver:
         except ObjectRelationInvalidated:
             # _observe retained the first measured failure; no retry/re-anchoring.
             return
+
+    def holding_verification_rise_remaining_m(self, cut):
+        """Further rise this cut still needs before holding can be verified.
+
+        Reads the frozen lift start only; it neither observes nor renews
+        evidence. Zero once verified; the full rise before any relation exists.
+        """
+        if self._verified:
+            return 0.
+        if self._anchor is None or self._initial_z is None:
+            return HOLDING_VERIFICATION_RISE_M
+        risen = min(float(cut.object_com_world_m[2]) - float(self._initial_z),
+                    float(cut.world_from_tcp[2, 3]) - float(self._initial_tcp_z))
+        return max(0., HOLDING_VERIFICATION_RISE_M - risen)
 
     @property
     def latest(self):

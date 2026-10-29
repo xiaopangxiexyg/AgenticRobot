@@ -401,6 +401,7 @@ def test_object_support_v2_is_opt_in_and_reuses_the_same_physics_owner(tmp_path,
             lifecycle._object_observer = SimpleNamespace(
                 observe=lambda **kwargs: SimpleNamespace(
                     world_from_object=native.body_pose("debug_cube"),
+                    world_from_tcp=native.body_pose("debug_cube"),
                     tool_from_object=np.eye(4), command_generation=1),
                 sensor_geom_names=session.object_observer.sensor_geom_names,
                 gripper_name=session.object_observer.gripper_name,
