@@ -1140,20 +1140,23 @@ def test_tool_object_relations_fuse_views_without_planning():
     # closing region spans z .44-.52 around the TCP's x axis.
     between = _cube_surface((.1, .2, .47), (.01, .008, .01))
     query = _entity_query(planner, object_surface_by_reference={"top-a": between})
-    query._anchors[0]["object_surface"] = {"voxel_count": 9, "component_count": 2, "kept_voxel_count": 7}
+    query._anchors[0]["object_surface"] = {"voxel_count": 9, "component_count": 2, "kept_voxel_count": 7,
+                                           "second_component_voxel_count": 2}
     result = query.describe_tool_object_relations()
     assert result["semantics"] == "agenticrobot.relation.tool_object.v1"
     assert result["scope"] == "one_saved_time_node_no_execution"
     assert result["objects"] == [{"side": "right", "label": "cube top", "relation": "between_fingers",
         "surface_distance_m": pytest.approx(.02), "sensor_surface_distance_m": None, "view_count": 1,
-        "usable_view_count": 1, "views_agree": True}]
+        "usable_view_count": 1, "views_agree": True, "ambiguous_view_count": 0}]
     # Unbound arms are disclosed, never silently omitted; geometry provenance is explicit.
     assert result["evaluated_sides"] == ["right"] and result["unbound_sides"] == ["left"]
     assert result["gripper_geometry_by_side"]["right"]["contact_solid_count"] == 0
     view = result["views"][0]
     assert view["target_reference"] == "top-a" and view["role"] == "main"
     assert view["grasp_region_point_count"] == view["object_point_count"] > 10
-    assert view["surface_cluster"] == {"voxel_count": 9, "component_count": 2, "kept_voxel_count": 7}
+    assert view["surface_cluster"] == {"voxel_count": 9, "component_count": 2, "kept_voxel_count": 7,
+                                       "second_component_voxel_count": 2}
+    assert view["surface_ambiguous"] is False and view["gripper_pose_source"] == "planning_start_qpos"
     assert not planner.calls and query.audit()["relation_reads"] == [result]
     # The model view still exposes neither surfaces nor their cluster evidence.
     assert "object_surface" not in json.dumps(query.read_scene())
@@ -1302,3 +1305,24 @@ def test_entity_hover_cone_accepts_only_within_the_arrival_rotation_tolerance(ex
     assert validation["inside_requested_region"] is inside
     assert (result["status"] == "path_found") is inside
     query.close()
+
+
+def test_tool_object_relations_use_each_frames_capture_pose_and_flag_ambiguity():
+    planner = Planner()
+    between = _cube_surface((.1, .2, .47), (.01, .008, .01))
+    planning_start = [.1, .2, .5, 1., 0., 0., 0.]
+    moved = [.4, .2, .5, 1., 0., 0., 0.]  # the arm was 30 cm away when this frame was captured
+    query = _entity_query(planner, object_surface_by_reference={"top-a": between},
+                          object_surface_tcp_pose_by_reference={"top-a": {"left": planning_start, "right": moved}})
+    query._anchors[0]["object_surface"] = {"voxel_count": 60, "component_count": 2, "kept_voxel_count": 40,
+                                           "second_component_voxel_count": 12}
+    result = query.describe_tool_object_relations()
+    view = result["views"][0]
+    assert view["gripper_pose_source"] == "frame_capture_qpos" and view["relation"] == "far"
+    assert view["surface_ambiguous"] is True and result["objects"][0]["ambiguous_view_count"] == 1
+    query.close()
+    for bad in ({"top-a": {"right": moved}}, {"other": {"left": moved, "right": moved}},
+                {"top-a": {"left": moved, "right": [.4, .2, .5, 2., 0., 0., 0.]}}):
+        with pytest.raises(ValueError):
+            _entity_query(planner, object_surface_by_reference={"top-a": between},
+                          object_surface_tcp_pose_by_reference=bad)

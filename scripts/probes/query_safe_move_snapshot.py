@@ -53,20 +53,38 @@ ENTITY_HOVER_SUPPORT_WINDOW_M = 0.30
 # Saved object masks are eroded before back-projection so boundary pixels
 # (mask bleed, mixed depth) do not become object surface evidence.
 OBJECT_MASK_EROSION_PX = 2
+# A view whose second-largest surface component reaches this share of the kept
+# one (and at least 10 voxels) is reported as ambiguous; the class still uses
+# the largest component. On the 21 saved samples every disagreeing secondary
+# component was mask bleed onto another object or a gripper part.
+SURFACE_AMBIGUITY_SHARE = 0.25
+SURFACE_AMBIGUITY_MINIMUM_VOXELS = 10
 
 
-def object_surface_from_mask(mask, capture, *, maximum_depth_m):
+def object_surface_from_mask(mask, capture, *, maximum_depth_m, robot_mask=None):
     """Measured surface of one saved object mask: eroded, valid depth, largest cluster.
 
-    Returns ``(points, evidence)``; ``points`` is ``None`` when no valid
-    measured pixel remains. Observation only: never a pose or full shape.
+    ``robot_mask`` optionally marks pixels known to show the robot; they are
+    never object evidence. (The planning self-filter is deliberately generous
+    and also erases object points next to the gripper, so it is not used for
+    relations.) Returns ``(points, evidence)``; ``points`` is ``None`` when no
+    valid measured pixel remains. Observation only: never a pose or full shape.
     """
     from scipy import ndimage
 
     eroded = ndimage.binary_erosion(np.asarray(mask, dtype=bool), iterations=OBJECT_MASK_EROSION_PX)
     depth = capture.depth_m
     eroded &= np.isfinite(depth) & (depth > 0) & (depth <= maximum_depth_m)
-    evidence = {"mask_erosion_px": OBJECT_MASK_EROSION_PX, "valid_pixel_count": int(np.count_nonzero(eroded))}
+    robot_removed = 0
+    if robot_mask is not None:
+        robot = np.asarray(robot_mask, dtype=bool)
+        if robot.shape != eroded.shape:
+            raise ValueError("Robot mask must match the object mask frame.")
+        robot_removed = int(np.count_nonzero(eroded & robot))
+        eroded &= ~robot
+    evidence = {"mask_erosion_px": OBJECT_MASK_EROSION_PX, "robot_pixels_removed": robot_removed,
+                "robot_mask_applied": robot_mask is not None,
+                "valid_pixel_count": int(np.count_nonzero(eroded))}
     if not evidence["valid_pixel_count"]:
         return None, evidence
     points, _, _ = backproject(depth, capture.intrinsics, capture.source_from_camera, eroded)
@@ -318,7 +336,8 @@ class SavedSceneSkillQuery:
     def __init__(self, *, scene_id, reference_frame_id, qpos_by_side,
                  tcp_pose_by_side, anchors, planner, cloud, source_evidence,
                  query_budget=None, region_candidate_policy="proximity", clock=time.monotonic,
-                 tool_entity_by_side=None, object_surface_by_reference=None):
+                 tool_entity_by_side=None, object_surface_by_reference=None,
+                 object_surface_tcp_pose_by_reference=None):
         self._scene_id = str(scene_id)
         self._frame = reference_frame_id
         self._tool_entities = dict(tool_entity_by_side or {})
@@ -345,6 +364,19 @@ class SavedSceneSkillQuery:
                 raise ValueError("Object surfaces must be nonempty finite N x 3 arrays.")
             points.setflags(write=False)
             self._object_surfaces[reference] = points
+        # Each view's gripper pose at that frame's recorded capture qpos (the
+        # relation is a property of that frame, not of the planning start).
+        self._surface_tcp = {}
+        for reference, poses in dict(object_surface_tcp_pose_by_reference or {}).items():
+            if reference not in self._object_surfaces or set(poses) != {"left", "right"}:
+                raise ValueError("Capture TCP poses must name a measured surface and both arms.")
+            checked = {}
+            for side, pose in poses.items():
+                pose = tuple(finite_vector(list(pose), 7, name="capture TCP pose"))
+                if abs(math.hypot(*pose[3:]) - 1.) > 1e-5:
+                    raise ValueError("Capture TCP orientation must be a unit quaternion.")
+                checked[side] = pose
+            self._surface_tcp[reference] = checked
         views = [(self._refs[r]["label"], self._refs[r]["role"]) for r in self._object_surfaces]
         if len(set(views)) != len(views):
             # Fusion treats one label as one physical object seen from several views.
@@ -430,7 +462,7 @@ class SavedSceneSkillQuery:
                     "kind": "measured_tcp", "world_xyz_m": poses[side][:3],
                     "acquired_at": captures[0].pose_measured_at, "role": None}
                    for side in ("left", "right")]
-        surfaces = {}
+        surfaces, surface_tcp = {}, {}
         for index, saved in enumerate(manifest.get("anchors", [])):
             capture = next((c for c in captures if c.role == saved["role"]), None)
             if (capture is None or capture.acquired_at != saved["acquired_at"]
@@ -452,6 +484,11 @@ class SavedSceneSkillQuery:
                 maximum_depth_m=observation_config.maximum_depth_m)
             if surface is not None:
                 surfaces[reference] = surface
+                capture_tcp = builder.tool_tcp_world_targets_for_qpos_pair(
+                    left_qpos=np.asarray(capture.capture_qpos_by_side["left"], dtype=float),
+                    right_qpos=np.asarray(capture.capture_qpos_by_side["right"], dtype=float))
+                surface_tcp[reference] = {side: pose_matrix_to_xyzquat(pose).tolist()
+                                          for side, pose in capture_tcp.items()}
             anchors.append({"reference": reference,
                 "label": saved["label"], "kind": "saved_visible_surface_point",
                 "world_xyz_m": points[0].tolist(), "acquired_at": capture.acquired_at,
@@ -482,7 +519,8 @@ class SavedSceneSkillQuery:
                 "tool_entities": {side: entity.identity() for side, entity in tool_entities.items()}},
             query_budget=manifest.get("query_budget"),
             region_candidate_policy=manifest.get("region_candidate_policy", "proximity"),
-            tool_entity_by_side=tool_entities, object_surface_by_reference=surfaces)
+            tool_entity_by_side=tool_entities, object_surface_by_reference=surfaces,
+            object_surface_tcp_pose_by_reference=surface_tcp)
 
     def _require_open(self):
         if self._closed:
@@ -526,16 +564,26 @@ class SavedSceneSkillQuery:
                 if points is None:
                     continue
                 cluster = anchor.get("object_surface") or {}
-                surface = {key: cluster[key] for key in ("voxel_count", "component_count", "kept_voxel_count")
-                           if key in cluster}
+                surface = {key: cluster[key] for key in ("voxel_count", "component_count", "kept_voxel_count",
+                                                          "second_component_voxel_count") if key in cluster}
+                ambiguous = (None if "second_component_voxel_count" not in surface else bool(
+                    surface["second_component_voxel_count"] >= max(SURFACE_AMBIGUITY_MINIMUM_VOXELS,
+                        SURFACE_AMBIGUITY_SHARE * surface["kept_voxel_count"])))
+                capture_tcp = self._surface_tcp.get(anchor["reference"])
                 for side in sorted(self._tool_entities):
+                    pose = self._tcp[side] if capture_tcp is None else capture_tcp[side]
                     relation = tool_object_relation(entity=self._tool_entities[side],
-                        world_from_tcp=_pose_matrix(self._tcp[side]), object_points_m=points)
+                        world_from_tcp=_pose_matrix(pose), object_points_m=points)
                     views.append({"side": side, "target_reference": anchor["reference"],
                                   "label": anchor["label"], "role": anchor["role"], **relation.as_dict(),
+                                  "gripper_pose_source": ("planning_start_qpos" if capture_tcp is None
+                                                          else "frame_capture_qpos"),
+                                  "surface_ambiguous": ambiguous,
                                   **({"surface_cluster": surface} if surface else {})})
-                    grouped.setdefault((side, anchor["label"]), []).append(relation)
-            objects = [{"side": side, "label": label, **fuse_tool_object_relations(items)}
+                    grouped.setdefault((side, anchor["label"]), []).append((relation, ambiguous))
+            objects = [{"side": side, "label": label,
+                        **fuse_tool_object_relations([relation for relation, _ in items]),
+                        "ambiguous_view_count": sum(flag is True for _, flag in items)}
                        for (side, label), items in sorted(grouped.items())]
             gripper = {side: {"screening_solids": "graspgenx_screening_solids_maximum_opening_envelope",
                               "contact_solids": entity.source.get("contact_solids"),

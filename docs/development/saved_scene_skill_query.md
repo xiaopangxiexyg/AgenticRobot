@@ -203,7 +203,16 @@ against each bound gripper at the measured TCP, without planning:
   largest 10 mm-linked cluster kept. An occluder separated by more than 10 mm
   (for example a finger in front of the object) usually forms a smaller,
   dropped cluster; a closer or larger one does not. Each view reports its
-  `surface_cluster` counts so an ambiguous surface stays visible.
+  `surface_cluster` counts and `surface_ambiguous` (second component at least
+  25% of the kept one and 10 voxels); `objects` counts ambiguous views. On the
+  21 saved samples 6 of 412 view/arm pairs had a secondary component of a
+  different class; all were mask bleed onto another object or a gripper part.
+  The planning self-filter is not used to clean masks: it is deliberately
+  generous and on the saved samples erased the object points next to the
+  gripper, turning every pregrasp into `near`.
+- Gripper pose: each view uses the arm TCP at that frame's recorded capture
+  qpos (`gripper_pose_source`), not the planning start; the two may differ by
+  up to the 0.01 rad start-drift bound, several millimetres at the TCP.
 - Gripper: the same screening palm/finger solids as above with the open
   closing region between the fingers, plus contact-only solids: the station
   URDF's two DMTAC sensor collision boxes per arm at the open gripper (q=0,

@@ -212,9 +212,12 @@ def object_surface_cluster(points_m, *, voxel_size_m: float = 0.003,
                        (np.zeros(0), (np.zeros(0, int), np.zeros(0, int))), shape=(len(voxels), len(voxels)))
     count, labels = connected_components(graph, directed=False)
     sizes = np.bincount(labels)
-    kept = voxels[labels == int(np.argmax(sizes))]
+    order = np.argsort(-sizes, kind="stable")
+    kept = voxels[labels == int(order[0])]
+    second = int(sizes[order[1]]) if count > 1 else 0
     return kept, {"input_point_count": int(len(points)), "voxel_count": int(len(voxels)),
                   "component_count": int(count), "kept_voxel_count": int(len(kept)),
+                  "second_component_voxel_count": second,
                   "voxel_size_m": float(voxel_size_m), "link_distance_m": float(link_distance_m)}
 
 

@@ -291,6 +291,7 @@ def test_surface_cluster_thins_to_voxels_and_drops_a_nearer_occluder():
     kept, evidence = object_surface_cluster(np.vstack([obj, obj, occluder]))
     assert evidence["input_point_count"] == 2 * len(obj) + 200
     assert evidence["component_count"] == 2
+    assert evidence["second_component_voxel_count"] == 4  # the 10 cm-nearer occluder
     assert evidence["kept_voxel_count"] == len(kept) == 400  # 20 x 20 voxels of 3 mm
     np.testing.assert_allclose(kept[:, 2], .30)
     again, _ = object_surface_cluster(np.vstack([obj, obj, occluder]))
