@@ -63,6 +63,19 @@ _TOP_FROM_GRASP_WORLD_AXES = np.array([
 ])
 # Offsets along the tool axis from the template grasp pose.
 APPROACH_OFFSET_M, PREGRASP_OFFSET_M, CONTACT_OFFSET_M = -0.07, -0.025, 0.01
+# When the nominal approach pose has no endpoint (near the arm's reach, IK
+# convergence there is sensitive to sub-millimetre goal changes), is blocked,
+# or plans only near an arm singularity, retry it closer along the same tool
+# axis, at most down to the pregrasp pose; the pregrasp and contact poses are
+# unchanged.
+APPROACH_SHORTENINGS_M = (0., 0.01, 0.02, 0.03, 0.045)
+APPROACH_RETRY_REASONS = frozenset({"safe_tcp_endpoint_search_exhausted", "safe_tcp_target_blocked",
+                                    "near_arm_singularity"})
+# Smallest singular value of the 6x6 flange Jacobian (m/rad and rad/rad rows)
+# a planned approach or pregrasp configuration must keep. Near the stretched
+# elbow it falls to ~0 and the TCP cannot settle within tolerance (an approach
+# planned there timed out); a normal reach keeps about 0.06.
+MINIMUM_STAGE_JACOBIAN_SIGMA = 0.02
 # Side and front grasps. The DMTAC_M pads close along tool y; tool x points
 # down. Collision boxes of the open hand in tool_tcp (x, y, z ranges, from the
 # deployed URDF): the wrist flange reaches 61 mm along tool x, so a level
@@ -256,6 +269,9 @@ def build_grasp_approach_query_registration(*, segmentation, back_projection, ro
         "grasp_approach_profile": motion_profile.semantic_content_hash,
         "top_from_grasp": TOP_FROM_GRASP.round(9).tolist(),
         "tool_axis_offsets_m": [APPROACH_OFFSET_M, PREGRASP_OFFSET_M, CONTACT_OFFSET_M],
+        "approach_shortenings_m": list(APPROACH_SHORTENINGS_M),
+        "approach_retry_reasons": sorted(APPROACH_RETRY_REASONS),
+        "minimum_stage_jacobian_sigma": MINIMUM_STAGE_JACOBIAN_SIGMA,
         "candidates": [list(item) for item in CANDIDATES],
         "horizontal": {"hand_boxes_in_tcp": [list(map(list, box)) for box in HAND_BOXES_IN_TCP],
                        "pad_box_in_tcp": [list(item) for item in PAD_BOX_IN_TCP],
@@ -449,11 +465,25 @@ class MujocoGraspApproachQuery:
                 return _rejected(reason="query_budget_exhausted", candidate_count=len(candidates),
                                  attempted=index, planning_wall_sec=time.monotonic() - began,
                                  rejections=rejections, **common), tuple(evidence)
-            reason, approach_q = self._plan_stage(approach, start_q=None, cancel_requested=cancel_requested,
-                                                  deadline=deadline)
-            if reason is None:
-                reason, _ = self._plan_stage(pregrasp, start_q=approach_q, cancel_requested=cancel_requested,
-                                             deadline=deadline)
+            reason, approach_q = None, None
+            for shortening in APPROACH_SHORTENINGS_M:
+                trial = _along_tool(approach, shortening)
+                stage_reason, approach_q = self._plan_stage(
+                    trial, start_q=None, cancel_requested=cancel_requested, deadline=deadline)
+                if stage_reason is None and self._jacobian_sigma_min(approach_q) < MINIMUM_STAGE_JACOBIAN_SIGMA:
+                    stage_reason, approach_q = "near_arm_singularity", None
+                if stage_reason is None:
+                    approach = trial
+                    break
+                # Report the nominal approach's refusal if no shorter one plans.
+                reason = reason or stage_reason
+                if stage_reason not in APPROACH_RETRY_REASONS:
+                    break
+            if approach_q is not None:
+                reason, pregrasp_q = self._plan_stage(pregrasp, start_q=approach_q,
+                                                      cancel_requested=cancel_requested, deadline=deadline)
+                if reason is None and self._jacobian_sigma_min(pregrasp_q) < MINIMUM_STAGE_JACOBIAN_SIGMA:
+                    reason = "near_arm_singularity"
                 if reason is not None:
                     reason = "pregrasp_" + reason
             else:
@@ -524,6 +554,29 @@ class MujocoGraspApproachQuery:
             max_reference_count=profile.max_control_cycles - profile.stable_measurement_count,
             configuration_constraint=constraint, constraint_identity=identity,
             normalize_ik_objective=profile.normalize_ik_objective)
+
+    def _jacobian_sigma_min(self, q):
+        """Smallest singular value of the motion arm's flange Jacobian at q (private copy)."""
+        app = self.application
+        names = app.scene.arm_specs[app.motion_side].joint_names
+        if len(names) != len(q):
+            raise ValueError("Stage configuration differs from the motion-side arm.")
+
+        def compute(live):
+            model, mujoco = live.model, live.mujoco
+            data = mujoco.MjData(model)
+            mujoco.mj_copyData(data, model, live.data)
+            for name, value in zip(names, q):
+                data.qpos[live.joint_qpos_addr(name)] = float(value)
+            mujoco.mj_kinematics(model, data)
+            mujoco.mj_comPos(model, data)
+            dofs = [int(model.joint(name).dofadr[0]) for name in names]
+            linear, angular = np.zeros((3, model.nv)), np.zeros((3, model.nv))
+            mujoco.mj_jacBody(model, data, linear, angular, int(model.joint(names[-1]).bodyid[0]))
+            jacobian = np.vstack([linear[:, dofs], angular[:, dofs]])
+            return float(np.linalg.svd(jacobian, compute_uv=False)[-1])
+
+        return app.runtime.rig.capture_scene(compute)
 
     def _plan_stage(self, pose, *, start_q, cancel_requested, deadline):
         """(None, final arm q) when a path to pose exists from start_q (None: the live state)."""
