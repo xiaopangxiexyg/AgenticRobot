@@ -26,7 +26,10 @@ from robot_motion.held_object_measurement import (
     measure_held_object_box,
 )
 from robot_motion.relative_action import xyzquat_to_pose_matrix
-from robot_motion.tool_entity_scene import RELATION_MAXIMUM_DEPTH_M, object_surface_from_mask
+from robot_motion.tool_entity_scene import (
+    RELATION_MAXIMUM_DEPTH_M,
+    object_surface_from_mask,
+)
 from teleop_runtime.skill_deploy.rm65_grasp_trajectory import RM65CarriedObjectBox
 
 REAL_HELD_OBJECT_SEMANTICS_V1 = "agenticrobot.real.held_object_observation.v1"
