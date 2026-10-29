@@ -92,7 +92,22 @@ core and MuJoCo adapter used for the 20260721 fit; tests compare those hashes to
 fixed historical values rather than silently reinterpreting the fit against
 the current files.
 
-离线夹爪—物体关系及悬停倾角锥使用独立绑定
+夹爪—物体关系与夹爪悬停路径查询发布为 RealMan 与 MuJoCo Gateway 的默认关闭只读 Skill
+（`perception.describe_tool_object_relations@1`、`perception.query_tool_hover_paths@1`），使用独立绑定
+`artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261029_skill_gateway_unify_v1.json`。
+它固定于合并提交 `9b5c06ce9523`，保留前一绑定的全部非运行时引用；177 项已有运行时输入中 12 项
+改变（两侧 Gateway 装配、会话、CLI 及 MuJoCo 观测规划），另绑定 6 项新运行时源码（共享工具实体
+场景、DMTAC 实体绑定、Skill 定义及通用/RealMan/MuJoCo 执行器），合计 183 项；6 项离线查询输入中
+仅保存场景查询入口改变。悬停每个候选 5 s、整体 20 s，TCP 区域查询仍为 3 s；悬停注册绑定安全 TCP
+Route 的公共坐标系并要求其 +Z 竖直。MuJoCo 观测场景安全移动在 CLI 配置观测场景时默认启用正距离
+起点退出，配置数据类默认仍为 strict。离线证据按内容哈希记录：同一源码树 2492 项关联测试；21 个
+保存真机样本经生产关系核心的结果与探针逐视角一致（354/354 视角、162/162 融合物体）；6 个样本
+24 组悬停查询中探针与生产核心 24/24 一致，公共坐标系与世界坐标系 23/24 一致，唯一差异是首个候选
+恰在 5 s 预算边界（5.001 s 对 4.949 s）。MuJoCo 孪生悬停诊断中保持姿态的提议被腕部与中央相机立柱
+的真实碰撞拒绝，更换碰撞配置结果不变，工具轴向下找到路径并按规划终点无接触执行。绑定仍为
+`provisional`，没有新增真机动作、标定或 held-out 资格。
+
+上一阶段离线夹爪—物体关系及悬停倾角锥使用独立历史绑定
 `artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261029_skill_relations_v1.json`。
 它固定于合并提交 `d20dd86bb0e1`，保留前一绑定的全部非运行时引用，177 项运行时输入未变；
 6 项离线查询输入中保存场景查询与工具实体几何两项改变。离线证据按内容哈希记录：同一源码树
