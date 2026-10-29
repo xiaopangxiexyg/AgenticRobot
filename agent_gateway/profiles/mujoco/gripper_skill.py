@@ -23,6 +23,11 @@ from agent_gateway.skills.gripper.runtime import (
 from dataset_contracts.canonical_encoding import canonical_content_hash
 from sim.mujoco.deploy.grasp_contact import MujocoGraspContactBinding
 
+# Named-support release: the 0.6 s release window plus margin for the fingers
+# to clear and the object to settle; checked every 10 ms of simulated time.
+NAMED_RELEASE_MAXIMUM_OBSERVATION_SEC = 1.5
+NAMED_RELEASE_CHECK_INTERVAL_SEC = 0.01
+
 
 class MujocoGripperControlPort:
     """Drive one gripper through the rig's gripper-only lower boundary."""
@@ -206,6 +211,38 @@ class MujocoGripperControlPort:
                 "measured_held": True,
                 "measured_at": cut[0]}),),
         )
+
+    def observe_named_release(
+        self, *, cancel_requested: Callable[[], bool],
+        maximum_observation_sec: float = NAMED_RELEASE_MAXIMUM_OBSERVATION_SEC,
+        check_interval_sec: float = NAMED_RELEASE_CHECK_INTERVAL_SEC,
+    ) -> dict[str, Any] | None:
+        """Keep the open command and let simulated time pass for the release window.
+
+        Without a realtime worker, physics advances only inside an operation.
+        After a named-support open reaches its target, the same gripper owner
+        keeps stepping its rig (arm HOLD, gripper open) until the bound
+        observer reports a stable supported release or the bound elapses.
+        This adds measured samples only; it does not judge or latch success.
+        """
+        observer = self._release_observer
+        if observer is None:
+            raise RuntimeError("Named release observation requires the bound measured object observer.")
+        timestep = float(self.rig.config.timing.physics_timestep_sec)
+        if not (math.isfinite(timestep) and timestep > 0.):
+            raise RuntimeError("Named release observation needs a positive physics timestep.")
+        steps = max(1, int(math.ceil(float(maximum_observation_sec) / timestep)))
+        stride = max(1, int(round(float(check_interval_sec) / timestep)))
+        snapshot = observer.release_snapshot()
+        for index in range(steps):
+            if snapshot is not None and snapshot.get("stable_supported_release") is True:
+                break
+            if cancel_requested():
+                break
+            self.rig.step_physics()
+            if (index + 1) % stride == 0 or index + 1 == steps:
+                snapshot = observer.release_snapshot()
+        return snapshot
 
     def _ref(self, kind: str, payload: dict[str, object]) -> str:
         self._sequence += 1

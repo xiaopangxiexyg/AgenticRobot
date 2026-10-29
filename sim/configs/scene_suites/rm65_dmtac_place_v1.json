@@ -1,0 +1,79 @@
+{
+  "name": "rm65_dmtac_place_suite_v1",
+  "base_task": "sim/configs/tasks/rm65_right_dmtacm_blue_cube_70mm_agent_v1.json",
+  "variants_xy_m": [[0.0, 0.0], [0.01, -0.015], [-0.01, 0.01]],
+  "parameter_provenance": "Synthetic primitive fixtures for right-arm Agent placement tasks; contact tuple inherited from the unchanged source scene, not measured material parameters. Variant 0 keeps the 35 mm cube pick and the 90x90x40 mm free support at the layout that passed native named-support release 3/3 (temp/skill-object-placement-20261028).",
+  "prototypes": {
+    "blue_small_cube": {"shape": "box", "size_m": [0.035, 0.035, 0.035], "mass_kg": 0.025, "rgba": [0.08, 0.24, 0.9, 1]},
+    "yellow_small_cube": {"shape": "box", "size_m": [0.035, 0.035, 0.035], "mass_kg": 0.025, "rgba": [0.97, 0.8, 0.15, 1]},
+    "green_low_box": {"shape": "box", "size_m": [0.09, 0.09, 0.04], "mass_kg": 0.14, "rgba": [0.12, 0.62, 0.25, 1]},
+    "red_low_box": {"shape": "box", "size_m": [0.09, 0.09, 0.04], "mass_kg": 0.14, "rgba": [0.82, 0.12, 0.12, 1]},
+    "green_mat": {"shape": "box", "size_m": [0.14, 0.12, 0.004], "mass_kg": 0.08, "rgba": [0.12, 0.68, 0.29, 1]},
+    "gray_post": {"shape": "box", "size_m": [0.04, 0.04, 0.14], "mass_kg": 0.2, "rgba": [0.5, 0.5, 0.5, 1]}
+  },
+  "cases": [
+    {
+      "id": "box_on_box",
+      "focus": "blue_cube",
+      "objects": [
+        {"name": "blue_cube", "prototype": "blue_small_cube", "xy_m": [-0.285, -0.02]},
+        {"name": "green_box", "prototype": "green_low_box", "xy_m": [-0.37, 0.02]}
+      ],
+      "tasks": [
+        {"id": "place", "phase": "payload_pending",
+         "instruction": "把蓝色小方块放到绿色盒子上，并稳定释放。",
+         "evaluation": {"kind": "stable_placement", "target": "blue_cube", "destination": "green_box",
+                        "requires_payload_validation": true}}
+      ]
+    },
+    {
+      "id": "box_on_box_distractors",
+      "focus": "blue_cube",
+      "objects": [
+        {"name": "blue_cube", "prototype": "blue_small_cube", "xy_m": [-0.285, -0.02]},
+        {"name": "green_box", "prototype": "green_low_box", "xy_m": [-0.37, 0.02]},
+        {"name": "red_box", "prototype": "red_low_box", "xy_m": [-0.26, 0.15]},
+        {"name": "yellow_cube", "prototype": "yellow_small_cube", "xy_m": [-0.22, -0.12]}
+      ],
+      "tasks": [
+        {"id": "place_green", "phase": "payload_pending",
+         "instruction": "桌上有绿色和红色两个盒子。把蓝色小方块放到绿色盒子上，并稳定释放。",
+         "evaluation": {"kind": "stable_placement", "target": "blue_cube", "destination": "green_box",
+                        "requires_payload_validation": true}},
+        {"id": "place_red", "phase": "payload_pending",
+         "instruction": "桌上有绿色和红色两个盒子。把蓝色小方块放到红色盒子上，并稳定释放。",
+         "evaluation": {"kind": "stable_placement", "target": "blue_cube", "destination": "red_box",
+                        "requires_payload_validation": true}}
+      ]
+    },
+    {
+      "id": "onto_mat",
+      "focus": "blue_cube",
+      "objects": [
+        {"name": "blue_cube", "prototype": "blue_small_cube", "xy_m": [-0.285, -0.02]},
+        {"name": "green_mat", "prototype": "green_mat", "xy_m": [-0.38, 0.075]}
+      ],
+      "tasks": [
+        {"id": "place", "phase": "payload_pending",
+         "instruction": "把蓝色小方块放到绿色垫子上，并稳定释放。",
+         "evaluation": {"kind": "stable_placement", "target": "blue_cube", "destination": "green_mat",
+                        "requires_payload_validation": true}}
+      ]
+    },
+    {
+      "id": "box_near_post",
+      "focus": "blue_cube",
+      "objects": [
+        {"name": "blue_cube", "prototype": "blue_small_cube", "xy_m": [-0.285, -0.02]},
+        {"name": "green_box", "prototype": "green_low_box", "xy_m": [-0.37, 0.02]},
+        {"name": "gray_post", "prototype": "gray_post", "xy_m": [-0.33, -0.09]}
+      ],
+      "tasks": [
+        {"id": "place", "phase": "payload_pending",
+         "instruction": "旁边有一根灰色立柱。把蓝色小方块放到绿色盒子上，并稳定释放，不要碰到立柱。",
+         "evaluation": {"kind": "stable_placement", "target": "blue_cube", "destination": "green_box",
+                        "requires_payload_validation": true, "untouched": ["gray_post"]}}
+      ]
+    }
+  ]
+}
