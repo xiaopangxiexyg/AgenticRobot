@@ -230,7 +230,7 @@ def build_parser() -> argparse.ArgumentParser:
               "--safe-motion-observation-roles and move_tcp_to_pose_safe; default off."))
     parser.add_argument("--tool-hover-candidate-budget-sec", type=float, default=None,
         help=("Planning budget per hover proposal for perception.query_tool_hover_paths@1 "
-              "(default 3; at most 120 and the region budget); requires --enable-tool-hover-queries."))
+              "(default 5; at most 120 and the region budget); requires --enable-tool-hover-queries."))
     parser.add_argument("--tool-hover-region-budget-sec", type=float, default=None,
         help=("Total hover search budget per request (default 20; at most 240). The Route allows "
               "this plus 20 s for capture and the obstacle cloud; requires --enable-tool-hover-queries."))

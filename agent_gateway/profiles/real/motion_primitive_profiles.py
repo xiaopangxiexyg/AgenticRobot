@@ -1825,6 +1825,9 @@ def build_real_agent_primitive_contract_bundle(
             **({} if tool_hover_region_budget_sec is None else {"region_budget_sec": tool_hover_region_budget_sec}),
             **({} if tool_hover_candidate_budget_sec is None
                else {"candidate_budget_sec": tool_hover_candidate_budget_sec}))
+        if tool_hover_registration.reference_frame_id != pose_target_profile.reference_frame_id:
+            # The selected pose is submitted unchanged to the safe TCP Route.
+            raise ValueError("Real tool hover results must use the safe TCP Route's public frame.")
     perception_registrations = list(
         ()
         if perception_capture is None

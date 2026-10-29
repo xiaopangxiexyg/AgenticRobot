@@ -197,7 +197,7 @@ def build_tool_hover_registration(*, capture_registration, back_projection, comp
     """Bind hover queries to an authenticated anchor producer and a safe-motion planner profile.
 
     ``region_budget_sec``/``candidate_budget_sec`` are this deployment's search
-    budgets (defaults 20 s/3 s). They enter the profile identity and size the
+    budgets (defaults 20 s/5 s). They enter the profile identity and size the
     Route: max duration = region budget + capture/cloud reserve.
     """
     region_budget_sec, candidate_budget_sec = validate_hover_budgets(

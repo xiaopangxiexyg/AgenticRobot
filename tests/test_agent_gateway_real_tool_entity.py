@@ -46,6 +46,17 @@ from teleop_runtime.skill_deploy.rm65_profile import (
 pytestmark = [pytest.mark.unit, pytest.mark.contract]
 
 RELATION = ("perception.describe_tool_object_relations", "1")
+
+
+def _frozen(value):
+    """The operation store's immutable JSON form (tuples and read-only mappings)."""
+    from types import MappingProxyType
+
+    if isinstance(value, dict):
+        return MappingProxyType({key: _frozen(item) for key, item in value.items()})
+    if isinstance(value, list):
+        return tuple(_frozen(item) for item in value)
+    return value
 HOVER = ("perception.query_tool_hover_paths", "1")
 CALIBRATIONS = REPO_ROOT / "hardware/rm65/utils/configs/calibrations"
 
@@ -109,6 +120,16 @@ def test_tool_entity_skills_are_default_off(monkeypatch, tmp_path, planners):
 
 
 def test_real_publishes_read_only_relation_and_hover_routes(monkeypatch, tmp_path, planners):
+    from agent_gateway.profiles.real import tool_entity as real_tool_entity
+
+    ports = []
+    original_port = real_tool_entity.RealToolScenePort.__init__
+
+    def record_port(self, **kwargs):
+        ports.append(kwargs)
+        original_port(self, **kwargs)
+
+    monkeypatch.setattr(real_tool_entity.RealToolScenePort, "__init__", record_port)
     lower, guard = _dmtac_lower(monkeypatch)
     localizer = _Localizer()
     composition = _compose(lower, tmp_path, enable_surface_anchor_v2=True, object_localizer=localizer,
@@ -132,6 +153,13 @@ def test_real_publishes_read_only_relation_and_hover_routes(monkeypatch, tmp_pat
         assert hover.skill.io_contract.input_artifact_slots[0].slot_id == "surface_anchor"
         assert manifest.route(*HOVER).route.max_operation_duration_ms == 40_000
         assert manifest.route(*RELATION).route.max_operation_duration_ms == 90_000
+        # Hover targets go unchanged to the safe TCP Route: same public frame.
+        assert hover.reference_frame_id == bundle.pose_target_profile.reference_frame_id
+        assert relation.reference_frame_id == hover.reference_frame_id
+        # Captures and FK are in the Station world; results in the public Station frame.
+        (port,) = ports
+        np.testing.assert_allclose(port["public_from_geometry"],
+            np.linalg.inv(np.asarray(lower.profile.scene_world_from_canonical_station, dtype=float)), atol=1e-12)
         # Both reviewed DMTAC_M arms are bound, including the URDF sensor boxes.
         identities = bundle.tool_object_relation_registration.skill.schema_entry.parameter_profiles
         assert len(identities) == 1
@@ -209,6 +237,8 @@ def test_real_relation_read_runs_the_shared_core_end_to_end(monkeypatch, tmp_pat
         payload = result.execution_result
         validator = bundle.tool_object_relation_registration.payload_validator
         validator.validate_execution_result_for_parameters(parameters, payload)
+        # Later consumers re-validate the stored, frozen form.
+        validator.validate_execution_result_for_parameters(_frozen(parameters), _frozen(payload))
         assert reads == [(role, 0, True) for role in roles]
         assert payload["evaluated_sides"] == ["left", "right"] and payload["unbound_sides"] == []
         assert {(item["label"], item["reason"]) for item in payload["unmeasured"]} == {("cup", "no_mask_above_threshold")}
@@ -247,7 +277,7 @@ def test_relaxed_hover_budgets_size_the_route_and_bind_the_result(monkeypatch, t
         safe_motion_observation_config=SafeMotionObservationConfig(), enable_tool_hover_queries=True)
     try:
         default_registration = default.deployment.gateway_session.contract_bundle.tool_hover_registration
-        assert (default_registration.region_budget_sec, default_registration.candidate_budget_sec) == (20., 3.)
+        assert (default_registration.region_budget_sec, default_registration.candidate_budget_sec) == (20., 5.)
         assert default_registration.entry.route.max_operation_duration_ms == 40_000
     finally:
         default.deployment.gateway_session.close()

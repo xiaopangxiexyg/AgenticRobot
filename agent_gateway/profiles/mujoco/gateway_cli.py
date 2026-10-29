@@ -234,7 +234,7 @@ def build_parser() -> argparse.ArgumentParser:
               'RGB-D scene by a private safe TCP planner, never activated); requires --enable-surface-anchor-v2 and '
               '--enable-observed-point-motion.'))
     parser.add_argument('--tool-hover-candidate-budget-sec', type=float, default=None,
-        help='Planning budget per hover proposal (default 3; at most 120 and the region budget).')
+        help='Planning budget per hover proposal (default 5; at most 120 and the region budget).')
     parser.add_argument('--tool-hover-region-budget-sec', type=float, default=None,
         help='Total hover search budget per request (default 20; at most 240).')
     parser.add_argument('--safe-tcp-motion-profile', choices=tuple(MUJOCO_SAFE_TCP_MOTION_PROFILES), default='local_step', help='Explicit sim-only safe Route limits; ordinary Routes stay unchanged.')
