@@ -769,10 +769,12 @@ def test_explicit_start_clearance_binds_manifest_and_keeps_strict_default(monkey
             safe_motion_observation_config=SafeMotionObservationConfig(), grasp_trajectory_config=config)
         session = composition.deployment.gateway_session
         hashes.append(session.contract_bundle.attachment.execution_manifest_hash)
-        resource, = [r for r in composition.resources.additional_resources
-            if isinstance(r, composition_module.MotionPlanningGeometryResources)]
+        prepare = composition.resources._prepare_static_geometry
+        resource = prepare.__self__
+        assert isinstance(resource, composition_module.MotionPlanningGeometryResources)
+        assert resource not in composition.resources.additional_resources
         monkeypatch.setattr(resource.self_filter, "prepare", lambda: {})
-        resource.start()
+        prepare()
         assert configs[-1].enable_inherited_start_clearance is (config is enabled)
         session.close()
     assert hashes[0] == hashes[1] and hashes[2] != hashes[0]
