@@ -499,9 +499,11 @@ def test_batch_close_keeps_shared_dependencies_until_the_original_executor_drain
         placement_executor=None,
         surface_anchor_executors=(),
         candidate_query_executors=(),
+        tool_entity_executors=(),
         segmentation_batch_executor=SimpleNamespace(wait_all=wait_all),
         contract_bundle=SimpleNamespace(
             surface_anchor_registrations=(), candidate_query_registrations=(),
+            tool_entity_registrations=(),
             segmentation_batch=SimpleNamespace(
                 skill=SimpleNamespace(
                     routes=(SimpleNamespace(max_operation_duration_ms=60_000),)

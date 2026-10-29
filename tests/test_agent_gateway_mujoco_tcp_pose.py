@@ -199,7 +199,9 @@ def _assert_unsettled_passive_read_defers_owned_dependency_cleanup(state_reader)
         spatial_goal_executor=None, rgbd_capture_executor=None,
         object_goal_query_executor=None, surface_anchor_executors=(), localization_executor=None,
         tcp_continuation_query_executor=None, candidate_query_executors=(), safe_tcp_pose_v2_executor=None,
-        contract_bundle=SimpleNamespace(surface_anchor_registrations=(), candidate_query_registrations=()),
+        tool_entity_executors=(),
+        contract_bundle=SimpleNamespace(surface_anchor_registrations=(), candidate_query_registrations=(),
+                                        tool_entity_registrations=()),
         segmentation_executor=None,
         placement_executor=placement_executor,
         grasp_observation_executor=None,
@@ -2604,7 +2606,9 @@ def _gateway_close_retry_session(outcomes, *, started=True):
         spatial_goal_executor=None, segmentation_executor=None, placement_executor=None,
         object_goal_query_executor=None, surface_anchor_executors=(), localization_executor=None,
         tcp_continuation_query_executor=None, candidate_query_executors=(), safe_tcp_pose_v2_executor=None,
-        contract_bundle=SimpleNamespace(surface_anchor_registrations=(), candidate_query_registrations=()),
+        tool_entity_executors=(),
+        contract_bundle=SimpleNamespace(surface_anchor_registrations=(), candidate_query_registrations=(),
+                                        tool_entity_registrations=()),
         _segmentation_model_started=False,
         segmentation_localizer=SimpleNamespace(
             start=lambda: calls["model_start"].append("started"),
@@ -2821,7 +2825,7 @@ def test_unsettled_frozen_query_or_anchor_defers_shared_cleanup(kind):
     registration = SimpleNamespace(skill=SimpleNamespace(
         routes=(SimpleNamespace(max_operation_duration_ms=30_000),)))
     session.contract_bundle = SimpleNamespace(
-        candidate_query_registrations=(),
+        candidate_query_registrations=(), tool_entity_registrations=(),
         object_goal_query_registration=registration if kind == "query" else None,
         surface_anchor_registrations=(registration,) if kind == "anchor" else ())
     session.object_goal_query_executor = reader if kind == "query" else None
