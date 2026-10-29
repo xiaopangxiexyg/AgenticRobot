@@ -309,6 +309,8 @@ def assemble_exclusive_rm65_agent_primitive_composition(
     enable_anchor_motion_v2: bool = False,
     enable_tool_object_relations: bool = False,
     enable_tool_hover_queries: bool = False,
+    tool_hover_region_budget_sec: float | None = None,
+    tool_hover_candidate_budget_sec: float | None = None,
     enable_point_grasp_finger_exchange: bool = False,
     debug_render_object_coordinates: bool = False,
     enable_point_grasp_arm_reachability: bool = False,
@@ -340,6 +342,9 @@ def assemble_exclusive_rm65_agent_primitive_composition(
         raise TypeError("enable_anchor_motion_v2 must be bool.")
     if not isinstance(enable_tool_object_relations, bool) or not isinstance(enable_tool_hover_queries, bool):
         raise TypeError("Tool-entity Skill switches must be bool.")
+    if not enable_tool_hover_queries and (tool_hover_region_budget_sec is not None
+                                          or tool_hover_candidate_budget_sec is not None):
+        raise ValueError("Tool hover search budgets require enabled tool hover queries.")
     if not isinstance(enable_point_grasp_finger_exchange, bool):
         raise TypeError("enable_point_grasp_finger_exchange must be bool.")
     if grasp_trajectory_config is not None and not isinstance(
@@ -1158,7 +1163,9 @@ def assemble_exclusive_rm65_agent_primitive_composition(
                 tool_tcp_poses=tool_tcp_poses, public_from_geometry=public_from_geometry,
                 hover_planner=tool_hover_planner,
                 hover_roles=(() if not enable_tool_hover_queries
-                             else tuple(safe_motion_observation_config.roles)))
+                             else tuple(safe_motion_observation_config.roles)),
+                hover_region_budget_sec=tool_hover_region_budget_sec,
+                hover_candidate_budget_sec=tool_hover_candidate_budget_sec)
 
         def reachability_evaluator_factory(port):
             if arm_reachability_profile is None:

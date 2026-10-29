@@ -48,6 +48,8 @@ class RealToolEntityOptions:
     public_from_geometry: np.ndarray
     hover_planner: RealToolHoverPlanner | None = None
     hover_roles: tuple[str, ...] = ()
+    hover_region_budget_sec: float | None = None
+    hover_candidate_budget_sec: float | None = None
 
     def __post_init__(self):
         if type(self.enable_relations) is not bool or type(self.enable_hover) is not bool:

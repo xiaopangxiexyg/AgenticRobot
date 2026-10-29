@@ -267,8 +267,11 @@ def hover_definition() -> SkillDefinition:
             "tool axis down (optionally within a tilt cone). The Gateway captures the observed scene, "
             "plans each proposal with the deployment's safe-motion planner from the measured state, "
             "re-measures the achieved pose against the original bounds and returns the first certified "
-            "target_tcp_pose_xyz_quat_xyzw. Read-only: submit that pose separately to the safe TCP "
-            "motion Skill, which replans and checks it again before any motion."),
+            "target_tcp_pose_xyz_quat_xyzw. Its surface_anchor input is the surface_anchor output "
+            "Artifact of a completed perception.capture_surface_anchor@2 operation in this session. "
+            "query_incomplete means the deployment's search budget ended first, not that no path exists. "
+            "Read-only: submit that pose separately to the safe TCP motion Skill, which replans and "
+            "checks it again before any motion."),
         intended_target_kind="target_agnostic", cross_target_deployment_policy="not_applicable",
         controlled_component_ids=(),
         parameter_semantics_id="artifact_surface_anchor.tool_entity_hover_bounds.v1",

@@ -55,9 +55,13 @@ RELATION_MAXIMUM_DEPTH_M = 1.5
 # hovering tool footprint; higher points are reported as overhead obstacles.
 ENTITY_HOVER_SUPPORT_WINDOW_M = 0.30
 # One hover search: every candidate starts at the same measured state, at most
-# this long per candidate and in total (the saved-scene region loop budgets).
+# this long per candidate and in total. The defaults equal the saved-scene
+# region loop; deployments may relax both up to the maxima below (reoriented
+# hovers often need more than 3 s per candidate on real scenes).
 ENTITY_HOVER_REGION_BUDGET_SEC = 20.
 ENTITY_HOVER_CANDIDATE_BUDGET_SEC = 3.
+MAX_ENTITY_HOVER_REGION_BUDGET_SEC = 240.
+MAX_ENTITY_HOVER_CANDIDATE_BUDGET_SEC = 120.
 SURFACE_CLUSTER_FIELDS = ("voxel_count", "component_count", "kept_voxel_count",
                           "second_component_voxel_count")
 RELATION_EVIDENCE_SCOPE = "measured_visible_surfaces_vs_gripper_screening_solids_and_bound_contact_solids"
@@ -231,6 +235,20 @@ def _bounded_interval(value, *, name: str, lower: float, upper: float) -> tuple[
     return low, high
 
 
+def validate_hover_budgets(*, region_budget_sec, candidate_budget_sec) -> tuple[float, float]:
+    """Check one deployment's hover search budgets; returns them as floats."""
+    values = []
+    for value, name, upper in ((region_budget_sec, "region_budget_sec", MAX_ENTITY_HOVER_REGION_BUDGET_SEC),
+                               (candidate_budget_sec, "candidate_budget_sec", MAX_ENTITY_HOVER_CANDIDATE_BUDGET_SEC)):
+        if (isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value)
+                or not 0 < value <= upper):
+            raise ValueError(f"{name} must be finite and in (0, {upper}] seconds.")
+        values.append(float(value))
+    if values[1] > values[0]:
+        raise ValueError("candidate_budget_sec cannot exceed region_budget_sec.")
+    return values[0], values[1]
+
+
 def validate_hover_request(*, tip_offset_bounds_xy_m, clearance_bounds_m, orientation_policy,
                            tool_axis_max_tilt_rad, max_candidates) -> None:
     """Reject a malformed hover request before any capture or planning.
@@ -354,9 +372,8 @@ def search_entity_hover_paths(*, entity: ToolEntityBox, anchor_xyz_m, current_tc
     validate_hover_request(tip_offset_bounds_xy_m=tip_offset_bounds_xy_m,
         clearance_bounds_m=clearance_bounds_m, orientation_policy=orientation_policy,
         tool_axis_max_tilt_rad=tool_axis_max_tilt_rad, max_candidates=max_candidates)
-    for value, name in ((region_budget_sec, "region_budget_sec"), (candidate_budget_sec, "candidate_budget_sec")):
-        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
-            raise ValueError(f"{name} must be positive and finite.")
+    region_budget_sec, candidate_budget_sec = validate_hover_budgets(
+        region_budget_sec=region_budget_sec, candidate_budget_sec=candidate_budget_sec)
     began = clock()
     stop = began + region_budget_sec if deadline is None else min(began + region_budget_sec, deadline)
     tip_bounds = [[float(x) for x in interval] for interval in tip_offset_bounds_xy_m]
@@ -450,6 +467,8 @@ __all__ = [
     "ENTITY_HOVER_CANDIDATE_BUDGET_SEC",
     "ENTITY_HOVER_REGION_BUDGET_SEC",
     "ENTITY_HOVER_SUPPORT_WINDOW_M",
+    "MAX_ENTITY_HOVER_CANDIDATE_BUDGET_SEC",
+    "MAX_ENTITY_HOVER_REGION_BUDGET_SEC",
     "OBJECT_MASK_EROSION_PX",
     "RELATION_EVIDENCE_SCOPE",
     "RELATION_MAXIMUM_DEPTH_M",
@@ -468,5 +487,6 @@ __all__ = [
     "search_entity_hover_paths",
     "surface_ambiguous",
     "validate_entity_hover_endpoint",
+    "validate_hover_budgets",
     "validate_hover_request",
 ]

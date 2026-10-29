@@ -212,3 +212,29 @@ def test_native_mujoco_relation_anchor_and_hover_run_through_the_gateway(tmp_pat
               [(a["candidate_index"], a["status"], a["reason"]) for a in query["candidate_attempts"]])
     finally:
         session.close()
+
+
+def test_mujoco_hover_budgets_are_forwarded_and_checked(monkeypatch, tmp_path, capsys):
+    class AssemblyReached(Exception):
+        pass
+
+    received = {}
+
+    def assemble(**kwargs):
+        received.update(kwargs)
+        raise AssemblyReached
+
+    monkeypatch.setattr(gateway_cli, "build_mujoco_agent_tcp_pose_gateway_session", assemble)
+    with pytest.raises(AssemblyReached):
+        gateway_cli.main([*_common(tmp_path), *_observed(), "--enable-tool-hover-queries",
+                          "--tool-hover-candidate-budget-sec", "15", "--tool-hover-region-budget-sec", "60"])
+    assert (received["tool_hover_candidate_budget_sec"], received["tool_hover_region_budget_sec"]) == (15., 60.)
+    monkeypatch.setattr(gateway_cli, "build_mujoco_agent_tcp_pose_gateway_session",
+                        lambda **kwargs: pytest.fail("invalid budgets must fail before assembly"))
+    for flags, message in ((["--tool-hover-region-budget-sec", "60"], "requires --enable-tool-hover-queries"),
+                           (["--enable-tool-hover-queries", "--tool-hover-candidate-budget-sec", "30"],
+                            "invalid tool hover budget")):
+        with pytest.raises(SystemExit) as captured:
+            gateway_cli.main([*_common(tmp_path), *_observed(), *flags])
+        assert captured.value.code == 2
+        assert message in capsys.readouterr().err

@@ -72,7 +72,7 @@ def _compose(lower, tmp_path, **kwargs):
         "camera_registry_path": DEFAULT_RM65_CAMERA_REGISTRY_V4,
         "camera_mount_urdf_path": DEFAULT_RM65_CAMERA_MOUNT_URDF,
         "artifact_root": tmp_path / "artifacts", "enable_back_projection": True}
-    (tmp_path / "artifacts").mkdir(exist_ok=True)
+    (tmp_path / "artifacts").mkdir(parents=True, exist_ok=True)
     return assemble_exclusive_rm65_agent_primitive_composition(**{**base, **kwargs})
 
 
@@ -239,3 +239,59 @@ def test_real_tool_entities_require_the_reviewed_dmtac_tool(monkeypatch, tmp_pat
     lower, _ = _lower(monkeypatch)  # Inspire hands: no reviewed gripper entity.
     with pytest.raises(ValueError, match="DMTAC_M"):
         _compose(lower, tmp_path, object_localizer=_Localizer(), enable_tool_object_relations=True)
+
+
+def test_relaxed_hover_budgets_size_the_route_and_bind_the_result(monkeypatch, tmp_path, planners):
+    lower, guard = _dmtac_lower(monkeypatch)
+    default = _compose(lower, tmp_path / "default", enable_surface_anchor_v2=True, object_localizer=_Localizer(),
+        safe_motion_observation_config=SafeMotionObservationConfig(), enable_tool_hover_queries=True)
+    try:
+        default_registration = default.deployment.gateway_session.contract_bundle.tool_hover_registration
+        assert (default_registration.region_budget_sec, default_registration.candidate_budget_sec) == (20., 3.)
+        assert default_registration.entry.route.max_operation_duration_ms == 40_000
+    finally:
+        default.deployment.gateway_session.close()
+    lower, guard = _dmtac_lower(monkeypatch)
+    relaxed = _compose(lower, tmp_path / "relaxed", enable_surface_anchor_v2=True, object_localizer=_Localizer(),
+        safe_motion_observation_config=SafeMotionObservationConfig(), enable_tool_hover_queries=True,
+        tool_hover_region_budget_sec=60., tool_hover_candidate_budget_sec=15.)
+    session = relaxed.deployment.gateway_session
+    try:
+        registration = session.contract_bundle.tool_hover_registration
+        assert (registration.region_budget_sec, registration.candidate_budget_sec) == (60., 15.)
+        assert registration.entry.route.max_operation_duration_ms == 80_000
+        assert registration.profile_hash != default_registration.profile_hash
+        query = {key: None for key in ("target_tcp_pose_xyz_quat_xyzw", "planned_endpoint_pose_xyz_quat_xyzw",
+                                       "selected_candidate_index", "achieved")}
+        with pytest.raises(ValueError):
+            registration.payload_validator.validate_execution_result({"surface_anchor": {}, "anchor_artifact_id": "a",
+                                                                      "hover_query": query})
+    finally:
+        session.close()
+    assert guard.starts == 0
+
+
+def test_hover_budgets_without_hover_queries_are_rejected(monkeypatch, tmp_path, planners):
+    lower, guard = _dmtac_lower(monkeypatch)
+    with pytest.raises(ValueError, match="search budgets require"):
+        _compose(lower, tmp_path, tool_hover_region_budget_sec=60.)
+    assert guard.starts == 0
+
+
+def test_real_cli_forwards_and_checks_hover_budgets(monkeypatch, tmp_path, capsys):
+    from agent_gateway.profiles.real import gateway_cli
+    from agent_gateway.profiles.real.session_authorization import REAL_AGENT_PRIMITIVE_SESSION_CONFIRM_TOKEN
+    from test_agent_gateway_real_rm65_cli import _argv
+
+    base = [*_argv(confirmation=REAL_AGENT_PRIMITIVE_SESSION_CONFIRM_TOKEN, socket_path=tmp_path / "g.sock")]
+    parser = gateway_cli.build_parser()
+    args = parser.parse_args([*base, "--tool-hover-candidate-budget-sec", "15", "--tool-hover-region-budget-sec", "60"])
+    assert (args.tool_hover_candidate_budget_sec, args.tool_hover_region_budget_sec) == (15., 60.)
+    defaults = parser.parse_args(base)
+    assert defaults.tool_hover_candidate_budget_sec is None and defaults.tool_hover_region_budget_sec is None
+    monkeypatch.setattr(gateway_cli, "resolve_exclusive_rm65_skill_deployment_profile",
+                        lambda *a, **k: pytest.fail("budget errors must stop before device resolution"))
+    with pytest.raises(SystemExit) as error:
+        gateway_cli.main([*base, "--tool-hover-region-budget-sec", "60"])
+    assert error.value.code == 2
+    assert "--tool-hover-*-budget-sec requires --enable-tool-hover-queries" in capsys.readouterr().err

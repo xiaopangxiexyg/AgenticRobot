@@ -2079,6 +2079,8 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
     enable_tool_hover_queries: bool = False,
     tool_entity_by_side: Mapping[str, Any] | None = None,
     tool_hover_roles: tuple[str, ...] = (),
+    tool_hover_region_budget_sec: float | None = None,
+    tool_hover_candidate_budget_sec: float | None = None,
 ) -> MujocoAgentTcpPoseContractBundle:
     """Project one already-constructed no-model application without starting it."""
 
@@ -3163,7 +3165,11 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
                     "planner": "mujoco_private_collision_checked_joint_path_v1",
                     "observed_scene": safe_motion_observation_profile_hash,
                     "safe_motion_route": safe_entry[2].semantic_content_hash},
-                    domain="agenticrobot.mujoco.tool_hover_planner_binding.v1")),)
+                    domain="agenticrobot.mujoco.tool_hover_planner_binding.v1"),
+                **({} if tool_hover_region_budget_sec is None
+                   else {"region_budget_sec": tool_hover_region_budget_sec}),
+                **({} if tool_hover_candidate_budget_sec is None
+                   else {"candidate_budget_sec": tool_hover_candidate_budget_sec})),)
     tcp_pose_comparison_registration = None
     if enable_tcp_pose_comparison:
         from agent_gateway.profiles.tcp_pose_comparison import (

@@ -1277,6 +1277,8 @@ def build_real_agent_primitive_contract_bundle(
     tool_entity_by_side: Mapping[str, object] | None = None,
     tool_hover_planner_profile_hash: str | None = None,
     tool_hover_roles: tuple[str, ...] | None = None,
+    tool_hover_region_budget_sec: float | None = None,
+    tool_hover_candidate_budget_sec: float | None = None,
 ) -> RealAgentPrimitiveContractBundle:
     """Build exact motion and optional passive Routes without runtime effects."""
 
@@ -1819,7 +1821,10 @@ def build_real_agent_primitive_contract_bundle(
             planner_profile_hash=canonical_content_hash(
                 {"planner": tool_hover_planner_profile_hash,
                  "safe_motion_route": safe_pose_route.semantic_content_hash},
-                domain="agenticrobot.real.tool_hover_planner_binding.v1"))
+                domain="agenticrobot.real.tool_hover_planner_binding.v1"),
+            **({} if tool_hover_region_budget_sec is None else {"region_budget_sec": tool_hover_region_budget_sec}),
+            **({} if tool_hover_candidate_budget_sec is None
+               else {"candidate_budget_sec": tool_hover_candidate_budget_sec}))
     perception_registrations = list(
         ()
         if perception_capture is None

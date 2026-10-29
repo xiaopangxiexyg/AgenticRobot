@@ -228,6 +228,12 @@ def build_parser() -> argparse.ArgumentParser:
         help=("Publish read-only perception.query_tool_hover_paths@1 (gripper-box hover paths checked by the "
               "observed safe-move planner, never dispatched); requires surface anchor v2, "
               "--safe-motion-observation-roles and move_tcp_to_pose_safe; default off."))
+    parser.add_argument("--tool-hover-candidate-budget-sec", type=float, default=None,
+        help=("Planning budget per hover proposal for perception.query_tool_hover_paths@1 "
+              "(default 3; at most 120 and the region budget); requires --enable-tool-hover-queries."))
+    parser.add_argument("--tool-hover-region-budget-sec", type=float, default=None,
+        help=("Total hover search budget per request (default 20; at most 240). The Route allows "
+              "this plus 20 s for capture and the obstacle cloud; requires --enable-tool-hover-queries."))
     parser.add_argument("--camera-single-start", action="store_true",
         help="Use the existing single-start camera policy: no retries, restart or reset; default off.")
     parser.add_argument("--enable-point-grasp-finger-exchange", action="store_true",
@@ -1080,6 +1086,20 @@ def main(argv: list[str] | None = None) -> int:
     ):
         parser.error("--enable-tool-hover-queries requires --enable-surface-anchor-v2, "
                      "--safe-motion-observation-roles and the move_tcp_to_pose_safe action")
+    if not args.enable_tool_hover_queries and (args.tool_hover_candidate_budget_sec is not None
+                                               or args.tool_hover_region_budget_sec is not None):
+        parser.error("--tool-hover-*-budget-sec requires --enable-tool-hover-queries")
+    if args.enable_tool_hover_queries:
+        from robot_motion.tool_entity_scene import (
+            ENTITY_HOVER_CANDIDATE_BUDGET_SEC, ENTITY_HOVER_REGION_BUDGET_SEC, validate_hover_budgets)
+        try:
+            validate_hover_budgets(
+                region_budget_sec=(ENTITY_HOVER_REGION_BUDGET_SEC if args.tool_hover_region_budget_sec is None
+                                   else args.tool_hover_region_budget_sec),
+                candidate_budget_sec=(ENTITY_HOVER_CANDIDATE_BUDGET_SEC if args.tool_hover_candidate_budget_sec is None
+                                      else args.tool_hover_candidate_budget_sec))
+        except ValueError as error:
+            parser.error(f"invalid tool hover budget: {error}")
     if args.enable_grasp_observation and (not args.enable_point_grasp or args.point_grasp_backend != "graspgenx"):
         parser.error("--enable-grasp-observation requires --enable-point-grasp and GraspGenX")
     if args.sam3_multi_instance_text and (
@@ -1444,6 +1464,8 @@ def main(argv: list[str] | None = None) -> int:
         enable_anchor_motion_v2=args.enable_anchor_motion_v2,
         enable_tool_object_relations=args.enable_tool_object_relations,
         enable_tool_hover_queries=args.enable_tool_hover_queries,
+        tool_hover_region_budget_sec=args.tool_hover_region_budget_sec,
+        tool_hover_candidate_budget_sec=args.tool_hover_candidate_budget_sec,
         enable_point_grasp_finger_exchange=args.enable_point_grasp_finger_exchange,
         debug_render_object_coordinates=args.debug_render_object_coordinates,
         enable_point_grasp_arm_reachability=(args.enable_point_grasp_arm_reachability),
