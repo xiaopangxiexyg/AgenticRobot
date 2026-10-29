@@ -64,7 +64,17 @@ manifest 身份不变。直接调用原 RM65 规划器时数据类默认仍为�
 非运动臂必须保持固定，运动侧近邻须沿最终稠密执行采样不退化、最终进入原净空，并禁止重新进入。
 许可只绑定一次请求，不修改场景余量或污染下一次规划。查询故障单独报告不可用，不落回另一条规划路径。
 该模式提供规划接纳能力，仍受原执行、deadline、取消和HOLD约束；离线保存场景结果不证明真机跟踪误差或实际运动资格。
-MuJoCo Gateway 的独立 sensor-shaped planner 不通过此 RealMan 选项改变默认接纳。
+
+MuJoCo Gateway 的 sensor-shaped planner 镜像同一语义（`start_clearance="inherited-positive-v1"`）：
+配置观测场景（`--enable-observed-point-motion` 与 `--safe-motion-observation-*`）时默认启用，
+`--strict-start-clearance` 恢复严格起点准入；没有观测场景时 `--enable-inherited-start-clearance`
+为用法错误（退出码 2）。直接构造 `MujocoObservedSafeMotionConfig` 时默认仍为 `strict`，身份不变；
+只有继承模式进入观测 safe profile 身份，`mujoco.agent_safe_tcp_pose.rgbd.<hash>` 随之改变。
+仅原生 RM65 观测 oracle 在正距离下的净空不足可被接纳；接触、穿透、查询不可用和包络拒绝仍返回
+`safe_tcp_start_blocked`，详情含 `planning_phase=inherited_start_clearance_admission`。包络约束仍叠加在
+继承 oracle 上；稠密参考采样回退返回 `safe_tcp_inherited_start_clearance_regressed`，未离开净空返回
+`safe_tcp_inherited_start_clearance_not_exited`，成功路径 metadata 记录 `inherited_start_clearance` 计数。
+不使用观测场景的原生 MuJoCo 场景规划不变。
 
 保存场景的只读查询与显式模式用法见
 [保存场景 Skill 查询](../development/saved_scene_skill_query.md)。
