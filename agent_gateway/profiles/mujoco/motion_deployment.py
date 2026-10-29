@@ -2600,6 +2600,13 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
             allowed_reference_frame_ids=(profile.reference_frame_id,),
             max_requested_duration_ms=None,
             workspace_bounds_by_component={component: profile.workspace_bounds},
+            # Grasp approach and contact accept only this deployment's frame
+            # lineage; publish it as constants so clients need not copy hashes.
+            **({"exact_lineage": {name: getattr(motion_profile, name) for name in (
+                "reference_frame_id", "reference_frame_spec_hash", "frame_graph_hash",
+                "tool_config_hash", "calibration_hash")}}
+               if motion_definition.skill_id in {"motion.approach_grasp_pose",
+                                                 "motion.approach_grasp_contact"} else {}),
             parameter_description=(
                 None
                 if contact_binding is None
