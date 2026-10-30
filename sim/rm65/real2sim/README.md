@@ -92,8 +92,22 @@ core and MuJoCo adapter used for the 20260721 fit; tests compare those hashes to
 fixed historical values rather than silently reinterpreting the fit against
 the current files.
 
-夹爪—物体关系与夹爪悬停路径查询发布为 RealMan 与 MuJoCo Gateway 的默认关闭只读 Skill
-（`perception.describe_tool_object_relations@1`、`perception.query_tool_hover_paths@1`），使用独立绑定
+MuJoCo 持物放置链发布两个默认关闭的只读查询 Skill（`perception.query_support_release_pose@1`、
+`perception.query_grasp_approach@1`），使用独立绑定
+`artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261030_mujoco_agent_place_v1.json`。
+它固定于合并提交 `c8d22fd5109c`，保留前一绑定的全部非运行时引用；183 项已有运行时输入中
+11 项改变（MuJoCo Gateway 装配、会话、CLI、夹爪命名释放观察、持物运动生命周期与观察器、
+物体搬运位姿校验及运动 schema 常量），另绑定 6 项新运行时源码（深度支撑面测量、
+两个查询的 Skill 定义与 MuJoCo 端口、运动 schema），合计 189 项。持物运动去掉竖直 0-8 cm 抬升走廊
+（真机配置本无持物运动），抬升在握持未验证前须超过剩余验证高度（3 cm）加到达容差和 2 mm，否则在
+激活时拒绝；TCP 走完检查路径而物体状态 1.5 s 仿真时间内仍不满足时 HOLD 并给出原因；物体目标经同一
+观测切片中实测的手-物变换换算为 TCP 目标，冻结关系仍约束载荷几何及 3 mm / 2° 滑移门限。1 mm 硬穿透、
+50 ms 观测间隔和 0.6 s 释放窗口不变。离线证据按内容哈希记录：659 项关联测试（运行时源码与本树一致），
+以及 DeepSeek Agent 在 MuJoCo 放置套件上的运行台账（含掉落、抓歪、放置路径阻挡注入）。绑定仍为
+`provisional`，没有新增真机动作、标定或 held-out 资格。
+
+上一阶段夹爪—物体关系与夹爪悬停路径查询发布为 RealMan 与 MuJoCo Gateway 的默认关闭只读 Skill
+（`perception.describe_tool_object_relations@1`、`perception.query_tool_hover_paths@1`），使用独立历史绑定
 `artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261029_skill_gateway_unify_v1.json`。
 它固定于合并提交 `9b5c06ce9523`，保留前一绑定的全部非运行时引用；177 项已有运行时输入中 12 项
 改变（两侧 Gateway 装配、会话、CLI 及 MuJoCo 观测规划），另绑定 6 项新运行时源码（共享工具实体
