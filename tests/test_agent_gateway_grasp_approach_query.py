@@ -186,7 +186,8 @@ def test_native_queried_grasp_then_queried_release_places_the_cube(tmp_path, mon
                    and time.monotonic() < stop):
                 time.sleep(.05)
                 operation = session.service.get_operation(operation_id)
-            assert operation.status == "completed", operation
+            assert operation.status == "completed", (
+                skill_id, operation.status, operation.reason_code, dict(operation.progress_summary or {}))
             return operation.execution_result
 
         frame = session.contract_bundle.grasp_approach_query_registration.reference_frame_id

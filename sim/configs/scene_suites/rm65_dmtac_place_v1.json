@@ -90,6 +90,21 @@
          "evaluation": {"kind": "stable_placement", "target": "blue_cube", "destination": "green_box",
                         "requires_payload_validation": true}}
       ]
+    },
+    {
+      "id": "mat_disturbance",
+      "focus": "blue_cube",
+      "objects": [
+        {"name": "blue_cube", "prototype": "blue_small_cube", "xy_m": [-0.285, -0.02]},
+        {"name": "green_mat", "prototype": "green_mat", "xy_m": [-0.38, 0.075]},
+        {"name": "orange_block", "prototype": "orange_block", "xy_m": [-0.55, -0.24]}
+      ],
+      "tasks": [
+        {"id": "place", "phase": "payload_pending",
+         "instruction": "把蓝色小方块放到绿色垫子上，并稳定释放。",
+         "evaluation": {"kind": "stable_placement", "target": "blue_cube", "destination": "green_mat",
+                        "requires_payload_validation": true}}
+      ]
     }
   ]
 }

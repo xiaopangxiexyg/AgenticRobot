@@ -193,7 +193,8 @@ def test_native_release_pose_is_carried_and_released_on_the_measured_box(tmp_pat
                    and time.monotonic() < stop):
                 time.sleep(.05)
                 operation = session.service.get_operation(operation_id)
-            assert operation.status == "completed", operation
+            assert operation.status == "completed", (
+                skill_id, operation.status, operation.reason_code, dict(operation.progress_summary or {}))
             return operation.execution_result
 
         query = {"support_object_id": "green_box", "reference_frame_id": registration.reference_frame_id}
@@ -271,5 +272,168 @@ def test_native_release_pose_is_carried_and_released_on_the_measured_box(tmp_pat
         center, half, cube = app.capture_passive_application_cut(scene_projector=native).scene_projection
         assert np.all(np.abs(cube[:2, 3] - center[:2]) <= half[:2])
         assert abs(cube[2, 3] - .0175 - (center[2] + half[2])) <= .004
+    finally:
+        session.close()
+
+
+@pytest.mark.integration
+@pytest.mark.optional
+# Grasp, lift, two queries, carry and release with guarded 4 kHz physics: ~200 s.
+@pytest.mark.slow_sim
+@pytest.mark.timeout(480)
+def test_native_release_moves_off_an_object_left_where_the_release_was_planned(tmp_path, monkeypatch):
+    """A block lands on the mat where the first query would release: the second avoids it."""
+    pytest.importorskip("mujoco")
+    from scipy.spatial.transform import Rotation
+
+    from agent_gateway.profiles.mujoco.motion_factory import (
+        MujocoAgentArtifactStorageConfig,
+        build_mujoco_agent_tcp_pose_gateway_session,
+        mujoco_agent_tcp_pose_execution_observation_plan_v1,
+    )
+    from agent_gateway.protocol.contracts import AGENT_SKILL_TERMINAL_OPERATION_STATUSES_V1
+    from deployments.perception.sam2_grounding_dino import encode_grounded_object_segment_artifacts
+    from deployments.perception.sam3_service import Sam3ServiceLocalizer
+    from robot_motion.relative_action import xyzquat_to_pose_matrix
+    from sim.mujoco.deploy import MujocoSimHILTargetConfig
+    from sim.mujoco.scene_suite import materialize_case
+    from sim.mujoco.transforms import pose_to_xyz_quat_xyzw
+    from test_agent_gateway_mujoco_grasp_approach import _compact_world_grasp
+    from test_agent_gateway_mujoco_tcp_pose_comparison import CLIENT, _request
+
+    def green_mat_segment(image, *, language_prompt, pixel_uv, min_score):
+        if language_prompt != "green mat":
+            return None
+        return _green_segment(image, language_prompt="green box", pixel_uv=pixel_uv, min_score=min_score)
+
+    task = materialize_case("mat_disturbance", tmp_path / "scene", variant=0, suite_path=SUITE)
+    localizer = Sam3ServiceLocalizer(endpoint="http://127.0.0.1:8114", timeout_sec=45., min_score=0.3,
+                                     multi_instance_text=False)
+    monkeypatch.setattr(Sam3ServiceLocalizer, "start", lambda self: setattr(self, "_test_started", True))
+    monkeypatch.setattr(Sam3ServiceLocalizer, "started",
+                        property(lambda self: getattr(self, "_test_started", False)))
+    monkeypatch.setattr(localizer, "segment", green_mat_segment)
+    monkeypatch.setattr(localizer, "encode_segment_artifacts", encode_grounded_object_segment_artifacts)
+    artifacts = tmp_path / "artifacts"
+    artifacts.mkdir()
+    session = build_mujoco_agent_tcp_pose_gateway_session(
+        target_config=MujocoSimHILTargetConfig(task_config_path=task, realtime_worker=False,
+            runtime_session_id=CLIENT, control_domain_id=CLIENT,
+            execution_observation_plan=mujoco_agent_tcp_pose_execution_observation_plan_v1(),
+            exposed_pose_sides=("right",), allow_scripted_task_reset=False),
+        allowed_client_ids=(CLIENT,), artifact_storage=MujocoAgentArtifactStorageConfig(root=artifacts),
+        segmentation_localizer=localizer, enable_grippers=True, enable_grasp_approach=True,
+        grasp_contact_target_body="debug_cube", enable_object_state=True,
+        enable_object_follow_observation=True, enable_object_motion=True,
+        enable_object_support_motion_v2=True, object_support_body_names=("green_mat",),
+        enable_named_release_v3=True, enable_support_release_queries=True,
+        support_release_prompt_by_id={"green_mat": "green mat"})
+    try:
+        app = session.application
+        registration = session.contract_bundle.support_release_query_registration
+        app.start_observation_ready()
+        session.start_perception_resources()
+        adapter = session.wire_adapter(authenticated_client_id=CLIENT)
+        sequence = [0]
+
+        def call(skill_id, parameters, version="1"):
+            sequence[0] += 1
+            request = _request(session, adapter, skill_id=skill_id, version=version,
+                               parameters=parameters, sequence=sequence[0])
+            outcome = adapter.submit_skill_request(request.to_wire())
+            assert outcome["accepted"], outcome
+            session.wait(timeout_sec=200.)
+            operation_id = outcome["operation"]["operation_id"]
+            stop = time.monotonic() + 200.
+            operation = session.service.get_operation(operation_id)
+            while (operation.status not in AGENT_SKILL_TERMINAL_OPERATION_STATUSES_V1
+                   and time.monotonic() < stop):
+                time.sleep(.05)
+                operation = session.service.get_operation(operation_id)
+            assert operation.status == "completed", (
+                skill_id, operation.status, operation.reason_code, dict(operation.progress_summary or {}))
+            return operation.execution_result
+
+        motion = session.contract_bundle.motion_profile
+        lineage = ("reference_frame_id", "reference_frame_spec_hash", "frame_graph_hash",
+                   "tool_config_hash", "calibration_hash")
+        grasp = _compact_world_grasp()
+        grasp[0, 3] += -.028 + (-.285 + .30)
+        grasp[1, 3] += -.02
+        grasp[2, 3] += -.033
+        grasp[:3, :3] = grasp[:3, :3] @ Rotation.from_euler("x", 6., degrees=True).as_matrix()
+        for distance, skill_id in ((-.07, "motion.approach_grasp_pose"),
+                                   (-.025, "motion.approach_grasp_pose"),
+                                   (.01, "motion.approach_grasp_contact")):
+            goal = grasp.copy()
+            goal[:3, 3] += grasp[:3, 2] * distance
+            public = app.transform_tcp_pose_xyzquat(tuple(pose_to_xyz_quat_xyzw(goal)),
+                source_frame_id="mujoco_sim_hil/world", target_frame_id=motion.reference_frame_id)
+            call(skill_id, {"pose_targets_by_component": {"right_arm": public},
+                            **{name: getattr(motion, name) for name in lineage},
+                            "controlled_frame_id": "tool_tcp"})
+        call("manipulation.set_gripper_state", {"component_id": "right_gripper",
+                                                "target_state": "closed"}, "3")
+        rig = app.runtime.rig
+        for _ in range(round(.65 / rig.config.timing.physics_timestep_sec)):
+            rig.step_physics()
+        object_profile = session.contract_bundle.object_motion_contract.motion_profile
+        common = {"object_id": "debug_cube", "component_id": "right_arm",
+                  "controlled_frame_id": "object_body", **{name: getattr(object_profile, name) for name in lineage}}
+        call("motion.move_grasped_object_to_pose",
+             {**common, "phase": "lift", "translation_delta_xyz_m": [0., 0., .04]})
+        query = {"support_object_id": "green_mat", "reference_frame_id": registration.reference_frame_id}
+        first = call("perception.query_support_release_pose", query)
+        assert first["status"] == "release_pose_found", first
+        public_from_world = app.target_frame_profile.frame_graph.resolve(
+            "mujoco_sim_hil/world", registration.reference_frame_id).matrix_target_source
+        planned = (np.linalg.inv(public_from_world) @ xyzquat_to_pose_matrix(
+            first["release_object_pose_xyz_quat_xyzw"]))[:3, 3]
+
+        def box(scene, name):
+            body = int(scene.model.body(name).id)
+            geom = [g for g in range(scene.model.ngeom) if scene.model.geom_bodyid[g] == body][0]
+            return scene.data.geom_xpos[geom].copy(), scene.model.geom_size[geom].copy()
+
+        def place_block(scene):
+            # The environment leaves a block where the first release was planned.
+            center, half = box(scene, "green_mat")
+            _, own = box(scene, "orange_block")
+            model, data, mj = scene.model, scene.data, scene.mujoco
+            joint = int(model.body("orange_block").jntadr[0])
+            address, dof = int(model.jnt_qposadr[joint]), int(model.jnt_dofadr[joint])
+            xy = np.clip(planned[:2], center[:2] - half[:2] + own[:2] + .001,
+                         center[:2] + half[:2] - own[:2] - .001)
+            data.qpos[address:address + 3] = (xy[0], xy[1], center[2] + half[2] + own[2] + .001)
+            data.qpos[address + 3:address + 7] = (1., 0., 0., 0.)
+            data.qvel[dof:dof + 6] = 0.
+            mj.mj_forward(model, data)
+
+        rig.capture_scene(place_block)
+        for _ in range(round(.5 / rig.config.timing.physics_timestep_sec)):
+            rig.step_physics()
+        released = call("perception.query_support_release_pose", query)
+        assert released["status"] == "release_pose_found", released
+
+        def native(scene):
+            return box(scene, "green_mat"), box(scene, "orange_block")
+
+        (center, half), (block, block_half) = app.capture_passive_application_cut(
+            scene_projector=native).scene_projection
+        world_release = np.linalg.inv(public_from_world) @ xyzquat_to_pose_matrix(
+            released["release_object_pose_xyz_quat_xyzw"])
+        corners = np.array([[sx, sy, -.0175] for sx in (-.0175, .0175) for sy in (-.0175, .0175)])
+        footprint = corners @ world_release[:3, :3].T + world_release[:3, 3]
+        # Native truth grades only: on the mat and clear of the block.
+        assert np.all(np.abs(footprint[:, :2] - center[:2]) <= half[:2])
+        low, high = footprint[:, :2].min(axis=0), footprint[:, :2].max(axis=0)
+        assert np.any(low > block[:2] + block_half[:2]) or np.any(high < block[:2] - block_half[:2])
+
+        call("motion.move_grasped_object_to_pose",
+             {**common, "phase": "carry",
+              "object_pose_xyz_quat_xyzw": released["release_object_pose_xyz_quat_xyzw"]})
+        call("manipulation.set_gripper_state", {"component_id": "right_gripper", "target_state": "open",
+                                                "release_support_object_id": "green_mat"}, "3")
+        assert session.object_observer.release_snapshot()["stable_supported_release"] is True
     finally:
         session.close()
