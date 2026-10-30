@@ -273,7 +273,14 @@ def tcp_pose_target_schema_entry_v1(
     skill_id: str = TCP_POSE_TARGET_SKILL_ID_V1,
     parameter_description: str | None = None,
     max_target_components: int | None = None,
+    exact_lineage: Mapping[str, str] | None = None,
 ) -> AgentSkillSchemaEntry:
+    """Absolute tool_tcp pose targets.
+
+    With ``exact_lineage`` the frame and calibration identities are published
+    as constants: callers still send them, but a client can restore them from
+    the schema instead of asking a model to copy hashes.
+    """
     selected_skill_id = _required(skill_id, field_name="skill_id")
     if selected_skill_id not in {
         TCP_POSE_TARGET_SKILL_ID_V1,
@@ -315,6 +322,14 @@ def tcp_pose_target_schema_entry_v1(
         "tool_config_hash": {"type": "string", "minLength": 1},
         "calibration_hash": {"type": "string", "minLength": 1},
     }
+    if exact_lineage is not None:
+        lineage = dict(exact_lineage)
+        names = ("reference_frame_id", "reference_frame_spec_hash", "frame_graph_hash",
+                 "tool_config_hash", "calibration_hash")
+        if set(lineage) != set(names) or lineage["reference_frame_id"] not in frames:
+            raise ValueError("exact_lineage must name the deployed frame and its four hashes.")
+        for name in names:
+            properties[name] = {"const": _required(lineage[name], field_name=name)}
     if selected_skill_id == SAFE_TCP_POSE_TARGET_SKILL_ID_V1:
         properties["pose_goal_policy"] = {
             "type": "string", "enum": list(SAFE_TCP_POSE_GOAL_POLICIES_V1),

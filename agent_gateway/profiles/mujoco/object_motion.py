@@ -26,6 +26,22 @@ from sim.mujoco.transforms import pose_to_xyz_quat_xyzw
 
 from .motion_skill import MujocoAgentSafeTcpPoseSkillLifecycle
 
+# Once the TCP has completed its checked path within tolerance, the measured
+# object must reach its goal state within this much simulation time. Lift
+# verification itself needs 0.5 s of unsupported following.
+OBJECT_TERMINAL_GRACE_S = 1.5
+# Before holding is verified, a lift goal must exceed the observer's remaining
+# verification rise by the TCP arrival tolerance plus this margin.
+LIFT_VERIFICATION_MARGIN_M = .002
+
+
+class _ObjectTerminalUnmet(Exception):
+    """The TCP arrived but the measured object state did not; fail with HOLD."""
+
+    def __init__(self, reason_code):
+        super().__init__(reason_code)
+        self.reason_code = reason_code
+
 
 def _native_support_for_object_motion(scene, *, body_name, phase,
                                       max_penetration_m, dynamic):
@@ -98,6 +114,7 @@ class MujocoAgentObjectMotionLifecycle(MujocoAgentSafeTcpPoseSkillLifecycle):
         self._payload = None
         self._object_goal_world = None
         self._object_terminal = None
+        self._object_unmet_since = None
         self._phase = kwargs["request"].parameters["phase"]
         self._object_id = kwargs["request"].parameters["object_id"]
         self._support_object_id = kwargs["request"].parameters.get("support_object_id")
@@ -133,13 +150,18 @@ class MujocoAgentObjectMotionLifecycle(MujocoAgentSafeTcpPoseSkillLifecycle):
         if any(not bounds[2 * i] <= goal[i, 3] <= bounds[2 * i + 1] for i in range(3)):
             raise MujocoTcpPlanRejected("object_motion_goal_outside_workspace")
         world_goal = rigid_pose(np.linalg.inv(public_from_world) @ goal, name="world object goal")
-        if self._phase in {"lift", "place"}:
-            delta = world_goal[:3, 3] - cut.world_from_object[:3, 3]
-            _, rotation = pose_delta_metrics(world_goal, cut.world_from_object)
-            signed = delta[2] if self._phase == "lift" else -delta[2]
-            if (not 0 <= signed <= .08 or np.linalg.norm(delta[:2]) > .003
-                    or rotation > 2.):
-                raise MujocoTcpPlanRejected("object_motion_support_stage_outside_normal_corridor")
+        if self._phase == "lift" and cut.status != "held_verified":
+            # Holding verifies only after the observer's measured rise. A
+            # shorter lift could arrive and then never verify; refuse it now.
+            required = (observer.holding_verification_rise_remaining_m(cut)
+                        + self.motion_profile.translation_tolerance_m + LIFT_VERIFICATION_MARGIN_M)
+            requested = float(world_goal[2, 3] - cut.world_from_object[2, 3])
+            if requested < required:
+                raise MujocoTcpPlanRejected(
+                    "object_motion_lift_below_holding_verification_height",
+                    {"requested_rise_m": requested, "required_rise_m": required})
+        # Lift and place carry no fixed vertical corridor: the measured payload
+        # binding, its support allowance and the follow guard bound every path.
         self._object_goal_world = world_goal
 
         def bind(scene):
@@ -176,7 +198,13 @@ class MujocoAgentObjectMotionLifecycle(MujocoAgentSafeTcpPoseSkillLifecycle):
                 measured_guard=measured_guard, guard_identity=self.motion_profile.semantic_content_hash)
 
         self._payload = self.application.runtime.rig.capture_scene(bind)
-        tool_world_goal = tool_goal_from_object_goal(world_goal, cut.tool_from_object)
+        # Convert the goal through the hand-object transform measured in this
+        # cut. The frozen relation still bounds slip (binding and observer), but
+        # converting through it would turn accumulated slip into an unrequested
+        # TCP rotation and leave the object off its goal by that slip.
+        measured_relation = rigid_pose(np.linalg.inv(cut.world_from_tcp) @ cut.world_from_object,
+                                       name="measured tool_from_object")
+        tool_world_goal = tool_goal_from_object_goal(world_goal, measured_relation)
         tool_public_goal = public_from_world @ tool_world_goal
         target = self.application.transform_tcp_pose_xyzquat(
             tuple(pose_to_xyz_quat_xyzw(tool_public_goal)),
@@ -220,13 +248,29 @@ class MujocoAgentObjectMotionLifecycle(MujocoAgentSafeTcpPoseSkillLifecycle):
 
     def _within_terminal_tolerance(self, pose):
         if not super()._within_terminal_tolerance(pose):
+            self._object_unmet_since = None
             return False
         cut = self._object_observer.observe(phase=self._phase)
         translation, rotation = pose_delta_metrics(self._object_goal_world, cut.world_from_object)
-        return (translation <= self.motion_profile.translation_tolerance_m
-                and math.radians(rotation) <= self.motion_profile.rotation_tolerance_rad
-                and (cut.status == "held_verified" if self._phase == "lift" else True)
-                and (cut.support_contact if self._phase == "place" else not cut.support_contact))
+        if (translation > self.motion_profile.translation_tolerance_m
+                or math.radians(rotation) > self.motion_profile.rotation_tolerance_rad):
+            reason = "object_motion_object_pose_outside_tolerance"
+        elif self._phase == "lift" and cut.status != "held_verified":
+            reason = "object_motion_lift_did_not_verify_holding"
+        elif self._phase == "place" and not cut.support_contact:
+            reason = "object_motion_support_contact_missing"
+        elif self._phase != "place" and cut.support_contact:
+            reason = "object_motion_support_contact_unexpected"
+        else:
+            self._object_unmet_since = None
+            return True
+        # The TCP finished its checked path; give the measured object a short,
+        # bounded settle instead of waiting for the operation timeout.
+        if self._object_unmet_since is None:
+            self._object_unmet_since = cut.sim_time_s
+        elif cut.sim_time_s - self._object_unmet_since >= OBJECT_TERMINAL_GRACE_S:
+            raise _ObjectTerminalUnmet(reason)
+        return False
 
     def _terminal_state_evidence(self, public_final_pose, measured_at):
         cut = self._object_observer.observe(phase=self._phase)
@@ -252,6 +296,9 @@ class MujocoAgentObjectMotionLifecycle(MujocoAgentSafeTcpPoseSkillLifecycle):
     def run(self, **kwargs):
         try:
             return super().run(**kwargs)
+        except _ObjectTerminalUnmet as error:
+            hold = self._hold(reason=error.reason_code)
+            return self._failure(reason_code=error.reason_code, hold=hold)
         except MujocoPhysicalContactFault as error:
             # The lower executor has already latched the same hard fault.
             # Classify only its typed payload pair; all other collisions keep

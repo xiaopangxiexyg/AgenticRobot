@@ -268,7 +268,8 @@ class GripperSkillLifecycle:
         ):
             raise ValueError("port identity does not match deployment binding.")
         if (binding.skill_version == "3" and port.component_id == "right_gripper"
-                and not callable(getattr(port, "command_open_to_support", None))):
+                and not all(callable(getattr(port, name, None)) for name in (
+                    "command_open_to_support", "observe_named_release"))):
             raise TypeError("v3 right gripper lacks named release support binding.")
         if not callable(clock) or not callable(sleep):
             raise TypeError("clock and sleep must be callable.")
@@ -490,6 +491,11 @@ class GripperSkillLifecycle:
                 reason_code="gripper_convergence_timeout",
                 evidence_refs=tuple(evidence),
             )
+        if release_support is not None:
+            # The named-support open is complete; the release window needs
+            # simulated time to pass with the hand open. Its owner keeps the
+            # command and advances its own physics; status is read separately.
+            self.port.observe_named_release(cancel_requested=preempted)
         hold = self._ensure_hold("gripper_target_settled")
         if not hold.succeeded:
             return StationLifecycleExecutionCompletion(

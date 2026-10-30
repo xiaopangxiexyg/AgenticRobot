@@ -212,6 +212,7 @@ def safe_tcp_pose_target_schema_entry_v2(
     max_speed_scale: float | None = None,
     parameter_description: str | None = None,
     max_target_components: int | None = None,
+    exact_lineage: Mapping[str, str] | None = None,
 ) -> AgentSkillSchemaEntry:
     """Clone v1, adding required policy/evidence and rebinding profile hashes."""
     entry = tcp_pose_target_schema_entry_v1(
@@ -227,6 +228,7 @@ def safe_tcp_pose_target_schema_entry_v2(
         max_speed_scale=max_speed_scale,
         parameter_description=parameter_description,
         max_target_components=max_target_components,
+        exact_lineage=exact_lineage,
     )
     wire = entry.to_wire()
     parameters = wire["parameter_schema"]

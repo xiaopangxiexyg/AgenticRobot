@@ -275,6 +275,11 @@ def test_gateway_sim_dependencies_are_confined_to_mujoco_profile() -> None:
         # Plan-only tool hovers bind the same private native planner and its
         # typed rejections in this leaf; nothing is dispatched.
         "agent_gateway/profiles/mujoco/tool_entity.py": ["sim"],
+        # Release-pose queries bind the private payload planner and payload
+        # binding in this leaf; nothing is dispatched.
+        "agent_gateway/profiles/mujoco/support_release_query.py": ["sim"],
+        # Grasp-approach queries bind the same private planner in this leaf.
+        "agent_gateway/profiles/mujoco/grasp_approach_query.py": ["sim"],
         # The concrete safe-TCP lifecycle binds its lower simulation planner.
         "agent_gateway/profiles/mujoco/motion_skill.py": ["sim"],
         "agent_gateway/profiles/mujoco/observation.py": ["sim"],
@@ -346,6 +351,11 @@ def test_gateway_numerical_dependencies_are_confined_to_concrete_profiles() -> N
         # the shared profile layer and its two concrete leaves.
         "agent_gateway/profiles/tool_entity.py": ["numpy"],
         "agent_gateway/profiles/mujoco/tool_entity.py": ["numpy"],
+        # Depth-only support top measurement (plane fit, coverage grid) and the
+        # MuJoCo release query's candidate filtering share this boundary.
+        "agent_gateway/profiles/measured_support.py": ["numpy"],
+        "agent_gateway/profiles/mujoco/support_release_query.py": ["numpy"],
+        "agent_gateway/profiles/mujoco/grasp_approach_query.py": ["numpy"],
         "agent_gateway/profiles/real/tool_entity.py": ["numpy"],
         # The concrete RM65 assembly builds the tool-entity public frame and
         # the request-owned FK inputs at this profile edge.
