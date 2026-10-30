@@ -67,6 +67,10 @@ REAL_OBJECT_MOTION_PLACE_CONTACT_GAP_M = 0.02
 REAL_OBJECT_MOTION_RESTING_GAP_M = 0.12
 # The same grip: the DMTAC closure did not change by more than this between requests.
 REAL_OBJECT_MOTION_SAME_GRIP_CLOSE = 0.03
+# Crooked grasp: measured centroid this far from the pads' centre, or an
+# elongated object's axis tilted this much from the nearest tool axis.
+REAL_OBJECT_MOTION_CROOKED_OFFSET_M = 0.015
+REAL_OBJECT_MOTION_CROOKED_TILT_DEG = 20.0
 
 
 def fit_support_plane_under(*, captures, footprint_min_xy, footprint_max_xy, below_z_m: float,
@@ -227,15 +231,27 @@ class RealObjectMotionLifecycle(RealAgentPrimitiveSkillLifecycle):
 
     def _observation_summary(self, observation: RealHeldObjectObservation) -> dict:
         measurement = observation.measurement
+        metrics = measurement.metrics
+        offset = max(abs(float(metrics.get("centroid_offset_closing_axis_m", 0.0))),
+                     abs(float(metrics.get("centroid_offset_pad_axis_m", 0.0))))
+        tilt = metrics.get("principal_axis_tilt_deg")
+        # Crooked-grasp evidence for the Agent: the measured centroid far from
+        # the pads' centre or an elongated object tilted in the grip.
+        crooked = bool(measurement.held and (
+            offset > REAL_OBJECT_MOTION_CROOKED_OFFSET_M
+            or (tilt is not None and float(tilt) > REAL_OBJECT_MOTION_CROOKED_TILT_DEG)))
         return {"status": measurement.status, "reason": measurement.reason,
                 "relation": measurement.relation.get("relation"),
                 "holding_verified": observation.holding_verified,
                 "gripper_closed_on_object": observation.gripper_closed_on_object,
                 "gripper_measured_close": None if observation.gripper is None
                 else observation.gripper.get("measured_close"),
+                "grip_assessment": ("crooked" if crooked else "centered" if measurement.held else "not_held"),
+                "grip_assessment_thresholds": {"centroid_offset_m": REAL_OBJECT_MOTION_CROOKED_OFFSET_M,
+                                               "principal_axis_tilt_deg": REAL_OBJECT_MOTION_CROOKED_TILT_DEG},
                 "views": [dict(item) for item in observation.segments],
                 "unmeasured": [dict(item) for item in observation.unmeasured],
-                "grip_metrics": {key: value for key, value in measurement.metrics.items()
+                "grip_metrics": {key: value for key, value in metrics.items()
                                  if key in ("centroid_offset_closing_axis_m", "centroid_offset_pad_axis_m",
                                             "principal_axis_tilt_deg", "measured_point_count")}}
 

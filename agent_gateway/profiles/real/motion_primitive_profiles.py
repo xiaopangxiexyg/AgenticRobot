@@ -139,6 +139,28 @@ REAL_AGENT_OBSERVED_ANCHOR_EXECUTOR_ID_V2 = "real-agent-observed-anchor.v2"
 REAL_AGENT_OBJECT_MOTION_ROUTE_ID_V1 = "real.rm65.agent_skill_move_grasped_object"
 REAL_AGENT_OBJECT_MOTION_EXECUTOR_ID_V1 = "real-agent-object-motion.v1"
 REAL_AGENT_OBJECT_MOTION_OBSERVATION_SOURCE_V1 = "real_rgbd_held_object_measurement"
+# The real Route measures whatever the bound arm holds; the summary is what the
+# Agent reads, so it states the measured semantics and the recovery reasons.
+REAL_OBJECT_MOTION_SUMMARY_V1 = (
+    "Move the object held by this arm's gripper (object_id names 'whatever this arm holds') to an "
+    "object-body pose or by translation_delta_xyz_m in the public frame. Before planning the lower "
+    "measures the held object from fresh RGB-D views (the points between the closed pads) and the "
+    "gripper closure, and refuses unless the object is between the fingers with the gripper closed on it "
+    "(object_motion_object_not_between_fingers, object_motion_gripper_not_closed_on_object). The measured "
+    "box, fixed in the tool frame, is carried along the whole collision-checked path (table, camera poles, "
+    "the other arm and observed obstacles). Phases: lift raises a just-grasped object from its support "
+    "(use a translation_delta_xyz_m like [0, 0, 0.05]); carry moves it in free space, keep the object above "
+    "obstacles; place lowers it onto the support measured under the goal, whose box bottom must end 0-2 cm "
+    "above that support (otherwise object_motion_place_target_below_support / _above_support with the "
+    "measured gap). After arrival the object is measured again: the result reports the measured object_state "
+    "and held_object_report (box size, grip_assessment centered or crooked with offsets and tilt), or the "
+    "operation fails with "
+    "object_motion_holding_lost_after_move (dropped or slipped) or object_motion_place_not_on_support. Path "
+    "or endpoint rejections (for example path_search_exhausted, endpoint_collision_blocked) mean that goal "
+    "is blocked: lift higher first, choose another place pose, or approach from the arm's own side. Recovery "
+    "after a drop or a crooked grasp: observe again (perception.describe_tool_object_relations), open the "
+    "gripper, re-plan the grasp. Never opens or closes the gripper and never certifies a stable release; "
+    "open it with the gripper Skill after place and lift the empty gripper with the safe TCP Skill.")
 REAL_AGENT_GRASP_APPROACH_ROUTE_ID_V1 = "real.rm65.agent_skill_grasp_approach"
 REAL_AGENT_GRASP_APPROACH_EXECUTOR_ID_V1 = (
     "control-station.real-agent-grasp-approach.v1"
@@ -1666,8 +1688,9 @@ def build_real_agent_primitive_contract_bundle(
             **pose_target_profile.__dict__, object_id=str(object_motion["object_id"]),
             object_workspace_bounds=tuple(object_motion["object_workspace_bounds"]),
             clock_domain_id=str(object_motion["clock_domain_id"]))
-        object_motion_definition = grasped_object_move_definition(
-            controlled_component_ids=(object_motion_profile.component_id,))
+        object_motion_definition = replace(grasped_object_move_definition(
+            controlled_component_ids=(object_motion_profile.component_id,)),
+            summary=REAL_OBJECT_MOTION_SUMMARY_V1)
         object_motion_schema = real_object_motion_schema_v1(
             definition=object_motion_definition, profile=object_motion_profile)
     safe_pose_schema = tcp_pose_target_schema_entry_v1(
