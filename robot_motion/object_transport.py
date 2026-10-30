@@ -575,11 +575,15 @@ def plan_release_approach_candidates(
     maximum_pair_skew_sec: float = .05,
     allow_quarter_turns: bool = False,
     yaw_offsets_rad: tuple[float, ...] | None = None,
+    include_nearest_to_held: bool = False,
 ) -> tuple[ReleaseApproachCandidate, ...]:
     """Bounded on-support proposals for the existing payload-safe planner.
 
     When it fits, the current-orientation center remains first. Four interior
     corners expose room for IK without asking an Agent to copy coordinates.
+    Opt-in, each orientation also proposes the feasible position nearest the
+    held box's current center, after the center: once the held object is
+    carried over or beside the support, that release needs the least motion.
     Quarter turns or an explicit bounded yaw sample are opt-in because a task
     may require the observed orientation. No candidate is an authority to move,
     and the selected support must be
@@ -587,6 +591,8 @@ def plan_release_approach_candidates(
     """
     if type(allow_quarter_turns) is not bool:
         raise TypeError("Quarter-turn sampling must be explicitly boolean")
+    if type(include_nearest_to_held) is not bool:
+        raise TypeError("Nearest-position sampling must be explicitly boolean")
     if yaw_offsets_rad is not None:
         if allow_quarter_turns or not isinstance(yaw_offsets_rad, (tuple, list)) or not 1 <= len(yaw_offsets_rad) <= 8:
             raise ValueError("Explicit yaw samples replace quarter-turn sampling and require 1..8 angles")
@@ -614,6 +620,7 @@ def plan_release_approach_candidates(
     else:
         angles = (0.,)
     fractions = ((0., 0.), (.85, .85), (.85, -.85), (-.85, .85), (-.85, -.85))
+    held_box_center = (held.reference_from_object @ held.object_from_box)[:2, 3]
     for angle in angles:
         z_rotation = np.array([
             [math.cos(angle), -math.sin(angle), 0.],
@@ -626,10 +633,14 @@ def plan_release_approach_candidates(
         feasible_max = np.asarray(support.region_max_xy_m) - lateral_margin_m - high[:2] + center_offset[:2]
         if np.any(feasible_min > feasible_max):
             continue
+        positions = []
         for x_fraction, y_fraction in fractions:
             fraction = np.array([x_fraction, y_fraction])
             span = np.where(fraction >= 0., feasible_max-center, center-feasible_min)
-            box_center = center + fraction * span
+            positions.append(center + fraction * span)
+        if include_nearest_to_held:
+            positions.insert(1, np.clip(held_box_center, feasible_min, feasible_max))
+        for box_center in positions:
             if np.any(box_center < feasible_min) or np.any(box_center > feasible_max):
                 continue
             proposal = _release_approach_at_box_center(

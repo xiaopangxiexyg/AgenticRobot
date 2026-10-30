@@ -125,6 +125,7 @@ def build_support_release_query_registration(*, segmentation, back_projection, r
         "object_motion_route": object_motion_route.semantic_content_hash,
         "object_motion_profile": motion_profile.semantic_content_hash,
         "yaw_offsets_rad": list(RELEASE_YAW_OFFSETS_RAD),
+        "positions_per_yaw": ["center", "nearest_to_held", "interior_corners_0.85"],
         "lateral_margin_m": RELEASE_LATERAL_MARGIN_M,
         "planning_time_budget_sec": PLANNING_TIME_BUDGET_SEC,
         "path_search_budget_sec": PATH_SEARCH_BUDGET_SEC,
@@ -379,7 +380,8 @@ class MujocoSupportReleaseQuery:
                     held, support, now=now, clearance_m=clearance,
                     minimum_planning_clearance_m=skill.MIN_CLEARANCE_M,
                     maximum_clearance_m=MAXIMUM_RELEASE_CLEARANCE_M,
-                    lateral_margin_m=RELEASE_LATERAL_MARGIN_M, yaw_offsets_rad=RELEASE_YAW_OFFSETS_RAD)
+                    lateral_margin_m=RELEASE_LATERAL_MARGIN_M, yaw_offsets_rad=RELEASE_YAW_OFFSETS_RAD,
+                    include_nearest_to_held=True)
             except ValueError as error:
                 if "fits" not in str(error):
                     raise

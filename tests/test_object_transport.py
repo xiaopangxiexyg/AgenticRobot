@@ -500,6 +500,37 @@ def test_release_candidates_can_rotate_a_rectangular_object_onto_narrow_support(
     assert all(item.proposal.release_clearance_m == .006 for item in candidates)
 
 
+def test_release_candidates_opt_in_to_the_feasible_position_nearest_the_held_object():
+    """A held object carried beside the support gets a release that needs the least motion."""
+    surface = support(region_min_xy_m=(-.41, -.02), region_max_xy_m=(-.33, .06))
+    options = dict(now=10.02, clearance_m=.006,
+        minimum_planning_clearance_m=.004, maximum_clearance_m=.05,
+        lateral_margin_m=.005)
+    beside = observation(box_size_m=(.035, .035, .035),
+        reference_from_object=pose((-.285, -.03, .0766)))
+    default = plan_release_approach_candidates(beside, surface, yaw_offsets_rad=(0., -math.pi / 2.), **options)
+    nearest = plan_release_approach_candidates(
+        beside, surface, yaw_offsets_rad=(0., -math.pi / 2.), include_nearest_to_held=True, **options)
+    assert len(default) == 10 and len(nearest) == 12
+    # The center stays first; the nearest feasible position follows it in each orientation.
+    np.testing.assert_array_equal(nearest[0].proposal.object_goal, default[0].proposal.object_goal)
+    half, margin = .0175, .005
+    expected = (-.33 - margin - half, -.02 + margin + half)
+    for item in (nearest[1], nearest[7]):
+        np.testing.assert_allclose(item.box_center_xy_m, expected, atol=1e-12)
+    assert (nearest[1].yaw_offset_rad, nearest[7].yaw_offset_rad) == (0., -math.pi / 2.)
+    corners = np.asarray([(x, y, z) for x in (-half, half) for y in (-half, half) for z in (-half, half)])
+    for item in nearest:
+        world = corners @ item.proposal.object_goal[:3, :3].T + item.proposal.object_goal[:3, 3]
+        assert np.all(world[:, :2].min(axis=0) >= np.asarray(surface.region_min_xy_m) + margin - 1e-12)
+        assert np.all(world[:, :2].max(axis=0) <= np.asarray(surface.region_max_xy_m) - margin + 1e-12)
+    # Held right over the center: the nearest position is the center and is not repeated.
+    above = observation(box_size_m=(.035, .035, .035), reference_from_object=pose((-.37, .02, .0766)))
+    assert len(plan_release_approach_candidates(above, surface, include_nearest_to_held=True, **options)) == 5
+    with pytest.raises(TypeError, match="explicitly boolean"):
+        plan_release_approach_candidates(beside, surface, include_nearest_to_held=1, **options)
+
+
 def test_release_candidates_accept_explicit_bounded_yaw_samples_without_changing_default():
     held = observation(box_size_m=(.035, .035, .035),
         reference_from_object=pose((-.285, -.02, .0566)))
