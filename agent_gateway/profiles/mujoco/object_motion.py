@@ -26,8 +26,8 @@ from sim.mujoco.transforms import pose_to_xyz_quat_xyzw
 
 from .motion_skill import MujocoAgentSafeTcpPoseSkillLifecycle
 
-# Once the TCP has completed its checked path within tolerance, the measured
-# object must reach its goal state within this much simulation time. Lift
+# Once the TCP has completed its checked path, the measured TCP and object
+# must reach their goal state within this much simulation time. Lift
 # verification itself needs 0.5 s of unsupported following.
 OBJECT_TERMINAL_GRACE_S = 1.5
 # Before holding is verified, a lift goal must exceed the observer's remaining
@@ -248,8 +248,15 @@ class MujocoAgentObjectMotionLifecycle(MujocoAgentSafeTcpPoseSkillLifecycle):
 
     def _within_terminal_tolerance(self, pose):
         if not super()._within_terminal_tolerance(pose):
-            self._object_unmet_since = None
-            return False
+            if not self._path_completed:
+                self._object_unmet_since = None
+                return False
+            # The TCP finished its checked path but does not settle inside the
+            # goal tolerance (e.g. a stretched arm sagging under the payload).
+            # Fail with HOLD after the same bounded settle; waiting for the
+            # operation timeout left the station busy and unobservable.
+            return self._terminal_unmet(self._object_observer.observe(phase=self._phase),
+                                        "object_motion_tcp_pose_outside_tolerance")
         cut = self._object_observer.observe(phase=self._phase)
         translation, rotation = pose_delta_metrics(self._object_goal_world, cut.world_from_object)
         if (translation > self.motion_profile.translation_tolerance_m
@@ -266,6 +273,10 @@ class MujocoAgentObjectMotionLifecycle(MujocoAgentSafeTcpPoseSkillLifecycle):
             return True
         # The TCP finished its checked path; give the measured object a short,
         # bounded settle instead of waiting for the operation timeout.
+        return self._terminal_unmet(cut, reason)
+
+    def _terminal_unmet(self, cut, reason):
+        """One bounded settle after the checked path, shared by TCP and object goals."""
         if self._object_unmet_since is None:
             self._object_unmet_since = cut.sim_time_s
         elif cut.sim_time_s - self._object_unmet_since >= OBJECT_TERMINAL_GRACE_S:

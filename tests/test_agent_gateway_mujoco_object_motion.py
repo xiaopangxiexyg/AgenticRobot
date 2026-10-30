@@ -199,6 +199,36 @@ def test_object_stage_commits_only_after_plan_activation_on_the_live_cut(monkeyp
 
 
 @pytest.mark.unit
+@pytest.mark.parametrize("path_completed", [False, True])
+def test_object_motion_fails_fast_when_the_tcp_does_not_settle_after_its_path(monkeypatch, path_completed):
+    from agent_gateway.profiles.mujoco import object_motion
+    from agent_gateway.profiles.mujoco.object_motion import MujocoAgentObjectMotionLifecycle
+
+    lifecycle = object.__new__(MujocoAgentObjectMotionLifecycle)
+    lifecycle._phase = "lift"
+    lifecycle._object_unmet_since = None
+    lifecycle._path_completed = path_completed
+    clock = [10.]
+    lifecycle._object_observer = SimpleNamespace(observe=lambda **kwargs: SimpleNamespace(sim_time_s=clock[0]))
+    # The measured TCP stays just outside the Route tolerance (a stretched arm
+    # sagging under the payload) for the whole settle window.
+    monkeypatch.setattr(MujocoAgentSafeTcpPoseSkillLifecycle, "_within_terminal_tolerance",
+                        lambda self, pose: False)
+    assert lifecycle._within_terminal_tolerance(None) is False
+    clock[0] += object_motion.OBJECT_TERMINAL_GRACE_S - .01
+    assert lifecycle._within_terminal_tolerance(None) is False
+    clock[0] += .02
+    if not path_completed:
+        # Still moving along its checked path: no settle clock runs.
+        assert lifecycle._within_terminal_tolerance(None) is False
+        assert lifecycle._object_unmet_since is None
+        return
+    with pytest.raises(object_motion._ObjectTerminalUnmet) as unmet:
+        lifecycle._within_terminal_tolerance(None)
+    assert unmet.value.reason_code == "object_motion_tcp_pose_outside_tolerance"
+
+
+@pytest.mark.unit
 @pytest.mark.parametrize("pair_class,expected", [
     ("payload_relation", "object_follow_relation_lost_after_hold"),
     ("payload_support_moved", "object_support_moved_after_hold"),

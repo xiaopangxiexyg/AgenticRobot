@@ -419,6 +419,15 @@ HELD_COMMAND_START_TOLERANCE_RAD = 0.005
 # 1 mm hard-contact fault; a half-speed carry to the same far region of the
 # mat stayed below 0.1 mm.
 HELD_OBJECT_SPEED_SCALE = 0.5
+# A held-object endpoint must solve the requested pose this closely, tighter
+# than the Route's terminal tolerance (3 mm, 2 deg) it is otherwise accepted
+# at. The terminal check compares the measured pose with the request, and the
+# arm sags under the payload: a +6 cm lift past the stretched elbow solved
+# 2.6 mm short, was accepted, settled about 3 mm off its goal and never
+# terminated. Reachable goals solve to within 0.01 mm, so this refuses only
+# goals the arm cannot reach.
+HELD_OBJECT_ENDPOINT_TRANSLATION_TOLERANCE_M = 0.001
+HELD_OBJECT_ENDPOINT_ROTATION_TOLERANCE_RAD = math.radians(0.5)
 
 
 @dataclass(frozen=True)
@@ -873,6 +882,12 @@ class MujocoPlannedTcpMotion:
             # Carried-object paths (live motions and their queries alike) run
             # with bounded joint speed and acceleration; see the constant.
             speed_scale = min(speed_scale, HELD_OBJECT_SPEED_SCALE)
+            # Endpoint acceptance only; the IK objective weight above keeps
+            # the Route tolerances, so reachable goals solve as before.
+            translation_tolerance_m = min(translation_tolerance_m,
+                                          HELD_OBJECT_ENDPOINT_TRANSLATION_TOLERANCE_M)
+            rotation_tolerance_rad = min(rotation_tolerance_rad,
+                                         HELD_OBJECT_ENDPOINT_ROTATION_TOLERANCE_RAD)
         def capture(_scene):
             nonlocal configuration_constraint, constraint_identity
             with self._lock:

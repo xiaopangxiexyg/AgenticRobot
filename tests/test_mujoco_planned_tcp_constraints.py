@@ -306,3 +306,66 @@ def test_held_command_start_is_rejected_once_the_rig_command_changes():
         SimpleNamespace(path=plan.path, measured_start_qpos_by_component=None))
     assert planning_module._measured_start(plan) is plan.measured_start_qpos_by_component
     assert planning_module._measured_start(SimpleNamespace(path=plan.path)) is start
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("payload", [False, True])
+def test_held_object_endpoint_must_solve_the_goal_tighter_than_the_route_tolerance(monkeypatch, payload):
+    """A 2 mm IK miss passes the 3 mm Route tolerance only without a payload."""
+    from types import SimpleNamespace
+    from threading import RLock
+
+    from sim.mujoco.deploy.payload_motion import MujocoPayloadBinding
+
+    planner = object.__new__(planning_module.MujocoPlannedTcpMotion)
+    planner._source_model_qpos = None
+    planner._solver_orientation_weight = None
+    planner._motion_side = "right"
+    planner._lock = RLock()
+    planner._active = planner._pending_plan = None
+    planner.scene = SimpleNamespace(model=SimpleNamespace(nq=12),
+                                    mujoco=SimpleNamespace(mj_kinematics=lambda *args: None),
+                                    body_pose=lambda name: np.eye(4))
+    planner.rig = SimpleNamespace(capture_scene=lambda operation: operation(planner.scene))
+    planner._model_qpos = lambda: np.zeros(12)
+    planner.task_config = SimpleNamespace(right_tool_profile_path="unused")
+    planner.planning_clearance_padding_m = .002
+    planner.pose_for_configuration = lambda model, pair: (float(pair["right"][0]), 0., 0., 0., 0., 0., 1.)
+    bounded = []
+
+    def solve_bounded(goal, seed, **kwargs):
+        bounded.append(kwargs)
+        return np.array([.998, 0., 0., 0., 0., 0.])
+
+    planner._solver = SimpleNamespace(q_min=np.full(6, -np.pi), q_max=np.full(6, np.pi),
+        compute_pose=lambda q: np.eye(4),
+        # Every seed converges 2 mm short, like a lift past the stretched elbow.
+        solve_iterative=lambda **kwargs: np.array([.998, 0., 0., 0., 0., 0.]),
+        solve_bounded_pose=solve_bounded, last_solve_iterations=100,
+        last_solve_converged=False, last_solve_deadline_exceeded=False)
+    monkeypatch.setattr(planning_module, "MujocoJointSceneOracle", lambda *a, **kw: SimpleNamespace(
+        addresses={"left": np.arange(6), "right": np.arange(6, 12)}, source=object(),
+        check=lambda pair: JointConfigurationCheck(safe=not np.any(pair["right"]), reason="fixture_collision")))
+    monkeypatch.setattr(planning_module, "load_rm65_tool_profile", lambda *a, **kw: None)
+    monkeypatch.setattr(planning_module, "endpoint_to_tool_transform", lambda _: np.eye(4))
+    binding = None
+    if payload:
+        binding = object.__new__(MujocoPayloadBinding)
+        object.__setattr__(binding, "source_model_qpos", tuple(np.zeros(12)))
+        object.__setattr__(binding, "_tcp", lambda data: np.eye(4))
+    with pytest.raises(MujocoTcpPlanRejected) as failure:
+        planner.plan((1., 0., 0., 0., 0., 0., 1.), translation_tolerance_m=.003,
+                     rotation_tolerance_rad=.03, cancel_requested=lambda: False, payload_binding=binding)
+    if payload:
+        # No endpoint is accepted: the Agent gets an immediate refusal instead
+        # of a motion that settles outside the terminal tolerance.
+        assert failure.value.reason_code == "safe_tcp_endpoint_search_exhausted"
+        assert bounded and bounded[0]["translation_tolerance_m"] == planning_module.HELD_OBJECT_ENDPOINT_TRANSLATION_TOLERANCE_M
+        assert bounded[0]["rotation_tolerance_rad"] == planning_module.HELD_OBJECT_ENDPOINT_ROTATION_TOLERANCE_RAD
+        diagnostics = failure.value.details["endpoint_search_diagnostics"]
+        assert diagnostics["translation_tolerance_m"] == .001
+    else:
+        # Without a payload the 2 mm miss is still an accepted endpoint
+        # (refused here only by the fixture collision check).
+        assert failure.value.reason_code == "safe_tcp_target_blocked"
+        assert not bounded
