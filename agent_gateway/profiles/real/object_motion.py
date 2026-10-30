@@ -129,11 +129,13 @@ def fit_support_plane_under(*, captures, footprint_min_xy, footprint_max_xy, bel
 class RealHeldObjectPort:
     """Lower-owned held-object measurement for the object-motion lifecycle.
 
-    It also remembers the last carried box of each arm (union of the start
+    It also remembers the carried box of each arm (union of the verified start
     measurement, a resting-support completion and the terminal measurement).
     The next request fuses its fresh measurement with that box while the same
-    grip holds (closure unchanged within ``REAL_OBJECT_MOTION_SAME_GRIP_CLOSE``);
-    an opened or changed grip, or an object no longer held, discards it.
+    grip holds: the gripper received no new command (same last command
+    attempt) and its closure changed by at most ``REAL_OBJECT_MOTION_SAME_GRIP_CLOSE``.
+    A new gripper command, a changed closure, an unverified start or an object
+    no longer held discards it.
     """
 
     def __init__(self, *, observer: RealHeldObjectObserver, public_from_geometry,
@@ -147,7 +149,7 @@ class RealHeldObjectPort:
         self.clock = clock
         self.min_score = float(min_score)
         self.last_captures = ()
-        self._retained: dict[str, tuple[np.ndarray, np.ndarray, float | None]] = {}
+        self._retained: dict[str, tuple[np.ndarray, np.ndarray, tuple]] = {}
 
     def observe(self, *, side: str, cancel_requested: Callable[[], bool]) -> RealHeldObjectObservation:
         revision = int(self.current_station_revision())
@@ -159,25 +161,29 @@ class RealHeldObjectPort:
                                      cancel_requested=cancel_requested, captures=captures)
 
     @staticmethod
-    def _closure(observation: RealHeldObjectObservation) -> float | None:
-        if observation.gripper is None or observation.gripper.get("measured_close") is None:
-            return None
-        return float(observation.gripper["measured_close"])
+    def _grip(observation: RealHeldObjectObservation) -> tuple:
+        gripper = observation.gripper or {}
+        close = gripper.get("measured_close")
+        return (None if close is None else float(close), gripper.get("last_command_attempt_ref"))
+
+    def retains_grip(self, side: str, observation: RealHeldObjectObservation) -> bool:
+        """A verified observation of the same grip as the retained box."""
+        retained = self._retained.get(side)
+        if retained is None or not observation.holding_verified:
+            return False
+        (closure, attempt), (old_closure, old_attempt) = self._grip(observation), retained[2]
+        return (attempt == old_attempt and (closure is None) == (old_closure is None)
+                and (closure is None or abs(closure - old_closure) <= REAL_OBJECT_MOTION_SAME_GRIP_CLOSE))
 
     def fused_box(self, side: str, observation: RealHeldObjectObservation):
         """Tool-frame (low, high) of the fresh box fused with the retained one of the same grip."""
         centre = np.asarray(observation.measurement.tool_from_box)[:3, 3]
         half = np.asarray(observation.measurement.size_xyz_m) / 2.0
         low, high = centre - half, centre + half
-        retained = self._retained.get(side)
-        closure = self._closure(observation)
-        if retained is None or not observation.holding_verified:
-            return low, high, False
-        old_low, old_high, old_closure = retained
-        if (closure is None) != (old_closure is None) or (
-                closure is not None and abs(closure - old_closure) > REAL_OBJECT_MOTION_SAME_GRIP_CLOSE):
+        if not self.retains_grip(side, observation):
             self._retained.pop(side, None)
             return low, high, False
+        old_low, old_high, _ = self._retained[side]
         return np.minimum(low, old_low), np.maximum(high, old_high), True
 
     def remember(self, side: str, low, high, observation: RealHeldObjectObservation | None) -> None:
@@ -185,7 +191,7 @@ class RealHeldObjectPort:
             self._retained.pop(side, None)
             return
         self._retained[side] = (np.asarray(low, dtype=float).copy(), np.asarray(high, dtype=float).copy(),
-                                self._closure(observation))
+                                self._grip(observation))
 
     def forget(self, side: str) -> None:
         self._retained.pop(side, None)
@@ -260,19 +266,27 @@ class RealObjectMotionLifecycle(RealAgentPrimitiveSkillLifecycle):
         self._start = observation
         summary = self._observation_summary(observation)
         if not observation.holding_verified:
+            # An unverified start ends the grip that a retained box belongs to.
+            self._held.forget(self.side)
             reason = ("object_motion_object_not_between_fingers" if observation.measurement.status
                       == "not_between_fingers" else "object_motion_gripper_not_closed_on_object"
-                      if observation.gripper_closed_on_object is False
+                      if observation.gripper_closed_on_object is not True
                       else "object_motion_held_object_unmeasured")
             raise _ObjectMotionUnavailable(reason, "The held object is not verified between the closed fingers.",
                                            {"start_observation": summary})
         lift_completion = None
         if self._phase == "lift":
-            observation, lift_completion = self._complete_resting_object(observation)
-            self._start = observation
-            summary = self._observation_summary(observation)
+            if self._held.retains_grip(self.side, observation):
+                # Only the first lift of a grip starts from rest; the retained box
+                # already reaches the support that object stood on.
+                lift_completion = {"applied": False, "reason": "retained_grip_box"}
+            else:
+                observation, lift_completion = self._complete_resting_object(observation)
+                self._start = observation
+                summary = self._observation_summary(observation)
         # Fuse with the box retained from earlier motions of the same grip.
         low, high, fused = self._held.fused_box(self.side, observation)
+        self._held.remember(self.side, low, high, observation)
         self._box_low_high = (low, high)
         tool_from_object = np.eye(4)
         tool_from_object[:3, 3] = (low + high) / 2.0
@@ -327,7 +341,8 @@ class RealObjectMotionLifecycle(RealAgentPrimitiveSkillLifecycle):
                 height_tolerance_m=REAL_OBJECT_MOTION_SUPPORT_HEIGHT_TOLERANCE_M)
             gap = float(np.min((corners - anchor) @ normal))
             self._report["target_box_bottom_above_support_m"] = gap
-            if gap < -0.002:
+            # Same bound as the planner's carried_object_target_below_support.
+            if gap < 0.0:
                 raise _ObjectMotionUnavailable(
                     "object_motion_place_target_below_support",
                     f"The place goal puts the box bottom {-gap * 100:.1f} cm below the measured support; "
@@ -355,6 +370,11 @@ class RealObjectMotionLifecycle(RealAgentPrimitiveSkillLifecycle):
     def _extra_planning_kwargs(self) -> dict:
         return {"carried_object": self._carried,
                 **({} if self._support is None else {"carried_object_support": self._support})}
+
+    def _pose_goal_policy(self) -> str:
+        # The place gap is checked at the requested pose, so place must end there
+        # (no endpoint-tolerance rescue toward the exempted support top).
+        return "preserve_target" if self._phase == "place" else super()._pose_goal_policy()
 
     def _complete_resting_object(self, observation: RealHeldObjectObservation):
         """Extend a just-grasped object's box down to the support it still rests on.
@@ -402,8 +422,9 @@ class RealObjectMotionLifecycle(RealAgentPrimitiveSkillLifecycle):
     def _extend_arrival_result(self, result, measured_pose):
         try:
             observation = self._held.observe(side=self.side, cancel_requested=lambda: False)
-        except (ValueError, RuntimeError) as error:
-            self._terminal_failure = ("object_motion_terminal_state_unmeasured", str(error))
+        except Exception as error:  # noqa: BLE001 - any capture/segmentation fault leaves the state unmeasured.
+            _LOGGER.warning("Real object motion terminal measurement failed: %s: %s", type(error).__name__, error)
+            self._terminal_failure = ("object_motion_terminal_state_unmeasured", f"{type(error).__name__}: {error}")
             return result
         self._terminal = observation
         summary = self._observation_summary(observation)
@@ -427,9 +448,18 @@ class RealObjectMotionLifecycle(RealAgentPrimitiveSkillLifecycle):
         public = self._held.public_from_geometry @ observation.world_from_tcp @ tool_from_object
         support_contact = self._phase == "place"
         if self._support is not None:
+            anchor = np.asarray(self._support.plane_anchor_xyz_m)
+            normal = np.asarray(self._support.normal_xyz)
             corners = _box_world_corners(observation.world_from_tcp @ tool_from_object, size)
-            gap = float(np.min((corners - np.asarray(self._support.plane_anchor_xyz_m))
-                               @ np.asarray(self._support.normal_xyz)))
+            # The decision uses the grip box (it keeps the lower part that the
+            # cameras stop seeing once the object stands on the support); the
+            # fresh terminal box alone is reported as evidence.
+            fresh = np.eye(4)
+            fresh[:3, 3] = centre
+            fresh_corners = _box_world_corners(observation.world_from_tcp @ fresh, 2.0 * half)
+            self._report["terminal_fresh_box_bottom_above_support_m"] = float(
+                np.min((fresh_corners - anchor) @ normal))
+            gap = float(np.min((corners - anchor) @ normal))
             self._report["terminal_box_bottom_above_support_m"] = gap
             if gap > REAL_OBJECT_MOTION_PLACE_CONTACT_GAP_M:
                 self._terminal_failure = ("object_motion_place_not_on_support",

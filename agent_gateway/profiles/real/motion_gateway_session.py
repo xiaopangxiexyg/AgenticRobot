@@ -1944,16 +1944,26 @@ def assemble_real_agent_primitive_gateway_session(
             def _gripper_reader(port_item):
                 return port_item.observe_state
 
+            def _gripper_command(port_item):
+                return lambda: (port_item.last_command_target_close, port_item.last_command_attempt_ref)
+
+            gripper_readers = {
+                component.split("_", 1)[0]: item for component, item in gripper_ports.items()
+                if component.split("_", 1)[0] in {"left", "right"}
+                and callable(getattr(item, "observe_state", None))}
+            object_motion_side = contract_bundle.object_motion_profile.component_id.split("_", 1)[0]
+            if object_motion_side not in gripper_readers:
+                raise ValueError("Real object motion needs this arm's DMTAC gripper state.")
             held_object_port = RealHeldObjectPort(
                 observer=RealHeldObjectObserver(
                     scene_port=tool_scene_port, segmentation_provider=segmentation_provider,
                     tool_entity_by_side=tool_entity_options.tool_entity_by_side,
                     roles=tuple(back_projection_registration.profile.roles),
-                    gripper_state_by_side={
-                        component.split("_", 1)[0]: _gripper_reader(item)
-                        for component, item in gripper_ports.items()
-                        if component.split("_", 1)[0] in {"left", "right"}
-                        and callable(getattr(item, "observe_state", None))},
+                    gripper_state_by_side={side: _gripper_reader(item) for side, item in gripper_readers.items()},
+                    gripper_command_by_side={
+                        side: _gripper_command(item) for side, item in gripper_readers.items()
+                        if hasattr(item, "last_command_target_close")
+                        and hasattr(item, "last_command_attempt_ref")},
                     maximum_depth_m=min(RELATION_MAXIMUM_DEPTH_M,
                                         back_projection_registration.profile.maximum_depth_m)),
                 public_from_geometry=tool_entity_options.public_from_geometry,
