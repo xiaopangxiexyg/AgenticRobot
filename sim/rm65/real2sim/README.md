@@ -92,6 +92,21 @@ core and MuJoCo adapter used for the 20260721 fit; tests compare those hashes to
 fixed historical values rather than silently reinterpreting the fit against
 the current files.
 
+RealMan 真机持物搬运发布默认关闭的 `motion.move_grasped_object_to_pose@1`（动作
+`move_grasped_object_to_pose`，物体 `<side>_held_object`），使用独立绑定
+`artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261030_real_place_v1.json`。它固定于提交
+`bba13f9d4`（合并 `56dd61af0` = MuJoCo 放置集成 r3 `81d1fe75f` + 真机分支 `4bc971814`，加悬停摘要长度修正，再合并评审修正 `67a90edf8`），保留前一绑定（MuJoCo 持物放置）的
+全部非运行时引用；189 项已有运行时输入中 20 项改变（真机 Gateway 装配、会话、CLI、动作授权、夹爪端口、运动原语
+生命周期与 Profile、带负载的观测安全移动规划、障碍碰撞与起点豁免、悬停查询及其注册，以及经同一分支带入的
+MuJoCo 悬停预算选项），另绑定 3 项新运行时源码（持物包围盒测量、真机持物观测、真机持物运动生命周期），
+合计 192 项；2 项离线查询输入改变（`tool_entity_goals.py` 的水平朝前/朝左/朝右姿态，
+`observed_obstacles.py` 的起点接触豁免）。真机每次持物运动先用三路静止 RGB-D（以两指之间的像素为分割提示）
+和夹爪闭合测量手中物体，不在两指间、或夹爪无采样/有故障/最后指令不是闭合/闭合度不在 0.05–0.97 之间即拒绝；首次 lift 才把包围盒补到其支撑面，同一抓取（夹爪无新指令且闭合度变化不超过 0.03）保留并合并包围盒；测得的工具系包围盒沿整条路径参与碰撞检查，起点时物体自身体素
+豁免；放置只豁免目标足迹下实测支撑面 15 mm 带内的体素，包围盒底面须在支撑面上方 0–2 cm，放置按 `preserve_target` 精确到达目标；到位后再测量，
+掉落或未落在支撑面上则失败并给出原因。离线证据按内容哈希记录：2166 项关联测试（当前绑定测试在本绑定前排除），
+以及只读真机快照上的带负载规划与持物测量结果、持物运动门控的离线核对（21 项）。绑定仍为 `provisional`，没有新增真机运动执行、标定或
+held-out 资格。
+
 MuJoCo 持物放置链发布两个默认关闭的只读查询 Skill（`perception.query_support_release_pose@1`、
 `perception.query_grasp_approach@1`），使用独立绑定
 `artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261030_mujoco_agent_place_v1.json`。
