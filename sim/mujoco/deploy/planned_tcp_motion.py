@@ -389,6 +389,36 @@ class MujocoTcpMotionPlan:
     stages: tuple[tuple[int, MujocoTcpMotionPlan], ...] = ()
     endpoint_search_diagnostics: Mapping[str, Any] | None = None
     observed_planning_input: ObservedJointPlanningInput | None = None
+    # Set only when the trajectory starts at the rig's held joint command
+    # instead of the measured arm cut (held-object plans): the measured cut
+    # that every start-state gate compares against.
+    measured_start_qpos_by_component: Mapping[str, np.ndarray] | None = None
+
+
+def _measured_start(plan) -> Mapping[str, np.ndarray]:
+    """The measured arm cut a plan was searched from (its start unless held-command)."""
+    measured = getattr(plan, "measured_start_qpos_by_component", None)
+    return plan.path.start_qpos_by_component if measured is None else measured
+
+
+def _frozen_copy(value) -> np.ndarray:
+    array = np.asarray(value, dtype=float).copy()
+    array.setflags(write=False)
+    return array
+
+
+# A held-object plan starts at the rig's held joint command when it is this
+# close to the measured arms. The P-servo arms sag below their command under
+# gravity and grasp load (about 1.4 mrad on joint 2, 0.66 mm at the wrist);
+# starting at the sagged cut stepped the command down by that sag and pressed
+# a still-supported object into its support at every lift start.
+HELD_COMMAND_START_TOLERANCE_RAD = 0.005
+# Joint speed scale (acceleration scales with its square) for every plan that
+# carries a held object. At full speed a carry to the far part of a mat drove
+# the soft DMTAC pad contact on the cube from ~0.4 mm to 1.007 mm, past the
+# 1 mm hard-contact fault; a half-speed carry to the same far region of the
+# mat stayed below 0.1 mm.
+HELD_OBJECT_SPEED_SCALE = 0.5
 
 
 @dataclass(frozen=True)
@@ -839,6 +869,10 @@ class MujocoPlannedTcpMotion:
             raise ValueError("path_search_time_budget_sec must be finite and positive.")
         if isinstance(speed_scale, bool) or not math.isfinite(speed_scale) or not 0 < speed_scale <= 1:
             raise ValueError("speed_scale must be finite and in (0, 1].")
+        if payload_binding is not None:
+            # Carried-object paths (live motions and their queries alike) run
+            # with bounded joint speed and acceleration; see the constant.
+            speed_scale = min(speed_scale, HELD_OBJECT_SPEED_SCALE)
         def capture(_scene):
             nonlocal configuration_constraint, constraint_identity
             with self._lock:
@@ -924,6 +958,11 @@ class MujocoPlannedTcpMotion:
                     side: model_qpos[address].copy()
                     for side, address in addresses.items()
                 }
+                measured_start = start
+                held_start = (self._held_command_start(start)
+                              if payload_binding is not None and not preview else None)
+                if held_start is not None:
+                    start = held_start
                 initial = oracle.check(start)
                 egress = None
                 if (not initial.safe and observed_planning_input is not None
@@ -951,7 +990,7 @@ class MujocoPlannedTcpMotion:
                         getattr(self.task_config, side + "_tool_profile_path"), side=side
                     )
                 )
-                measured = xyzquat_to_matrix(self.pose_for_configuration(model_qpos, start))
+                measured = xyzquat_to_matrix(self.pose_for_configuration(model_qpos, measured_start))
                 if payload_binding is not None:
                     self.scene.mujoco.mj_kinematics(self.scene.model, oracle.source)
                     world_tcp = payload_binding._tcp(oracle.source)
@@ -961,7 +1000,7 @@ class MujocoPlannedTcpMotion:
                     ):
                         raise MujocoTcpPlanRejected("safe_tcp_payload_tool_frame_mismatch")
                 if not np.allclose(
-                    solver.compute_pose(start[side]) @ offset, measured, atol=1e-5
+                    solver.compute_pose(measured_start[side]) @ offset, measured, atol=1e-5
                 ):
                     raise MujocoTcpPlanRejected("safe_tcp_ik_model_tool_mismatch")
                 goal = xyzquat_to_matrix(target_pose)
@@ -1263,7 +1302,12 @@ class MujocoPlannedTcpMotion:
                     **({"planning_scene_source": "calibrated_rgbd_and_measured_joints",
                         "observed_scene_hash": observed_planning_input.oracle.scene_hash}
                        if observed_planning_input is not None else {}),
-                    **({"inherited_start_clearance": egress.summary()} if egress is not None else {})})
+                    **({"inherited_start_clearance": egress.summary()} if egress is not None else {}),
+                    # Only a held-command start adds metadata; measured-start
+                    # plans keep their previous path identity.
+                    **({"start_source": "held_command", "held_command_minus_measured_rad": {
+                        arm: (held_start[arm] - measured_start[arm]).tolist() for arm in held_start}}
+                       if held_start is not None else {})})
                 identity = canonical_content_hash(
                     {
                         "path": path.semantic_content_hash,
@@ -1297,6 +1341,9 @@ class MujocoPlannedTcpMotion:
                         "attempts": tuple(MappingProxyType(row) for row in ik_seed_attempts),
                     }),
                     observed_planning_input=observed_planning_input,
+                    measured_start_qpos_by_component=(
+                        None if held_start is None else MappingProxyType(
+                            {arm: _frozen_copy(value) for arm, value in measured_start.items()})),
                 )
                 check_cancelled()
                 if not preview:
@@ -1676,13 +1723,42 @@ class MujocoPlannedTcpMotion:
             payload_binding=stage.payload_binding,
         )
 
+    def _held_command_start(self, measured_start):
+        """The rig's held joint command for both arms, if it is near the measured cut."""
+        accepted = getattr(self.rig, "accepted_qcmd_by_side", None)
+        if not callable(accepted):
+            return None   # private query rigs keep the measured start
+        command = accepted()
+        if set(command) != set(measured_start):
+            return None
+        held = {}
+        for arm, measured in measured_start.items():
+            value = np.asarray(command[arm], dtype=float)
+            if (value.shape != measured.shape or not np.isfinite(value).all()
+                    or float(np.max(np.abs(value - measured))) > HELD_COMMAND_START_TOLERANCE_RAD):
+                return None
+            held[arm] = value.copy()
+        return held
+
+    def _require_held_command_start(self, plan) -> None:
+        """A held-command start is valid only while the rig still holds that command."""
+        if getattr(plan, "measured_start_qpos_by_component", None) is None:
+            return
+        command = self.rig.accepted_qcmd_by_side()
+        if any(not np.array_equal(np.asarray(command[arm], dtype=float),
+                                  np.asarray(plan.path.start_qpos_by_component[arm], dtype=float))
+               for arm in ("left", "right")):
+            raise MujocoTcpPlanRejected("safe_tcp_start_state_changed")
+
     def _bind_live_stage(self, stage, oracle, *, bind_noncontact=True):
         if stage.payload_binding is not None:
             def bind_payload(scene):
                 pair = scene.arm_qpos_by_side()
-                if any(not np.allclose(pair[side], stage.path.start_qpos_by_component[side],
-                                       atol=1e-3, rtol=0) for side in ("left", "right")):
+                measured = _measured_start(stage)
+                if any(not np.allclose(pair[side], measured[side], atol=1e-3, rtol=0)
+                       for side in ("left", "right")):
                     raise MujocoTcpPlanRejected("safe_tcp_start_state_changed")
+                self._require_held_command_start(stage)
                 self._capture_current_payload(stage, oracle, scene)
                 self.rig.set_additional_contact_oracle(stage.payload_binding.contact_oracle(scene))
 
@@ -1715,16 +1791,18 @@ class MujocoPlannedTcpMotion:
                     plan.observed_planning_input.require_current(live)
                 except ValueError as error:
                     raise MujocoTcpPlanRejected(str(error)) from error
+            measured = _measured_start(plan)
             if any(
                 not np.allclose(
                     live[side],
-                    plan.path.start_qpos_by_component[side],
+                    measured[side],
                     atol=1e-3,
                     rtol=0,
                 )
                 for side in ("left", "right")
             ):
                 raise MujocoTcpPlanRejected("safe_tcp_start_state_changed")
+            self._require_held_command_start(plan)
             stage = self._stage_at(plan, 0)
             oracle = self._oracle_for_stage(stage)
             # Validate at the consumption boundary, after scene/planner lock
@@ -1892,7 +1970,7 @@ class MujocoPlannedTcpMotion:
     def _resolve_checked_reference(self, plan, index, q, oracle) -> IKResult:
         if not np.allclose(
             oracle.source.qpos[oracle.addresses[self._inactive_side]],
-            q[self._inactive_side], atol=1e-3, rtol=0,
+            _measured_start(plan)[self._inactive_side], atol=1e-3, rtol=0,
         ):
             raise MujocoTcpPlanRejected("safe_tcp_passive_arm_changed")
         # The payload sweep checks the whole live edge including its endpoint.

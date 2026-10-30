@@ -263,3 +263,46 @@ def test_endpoint_rescue_preserves_admission_deadline_and_diagnostics(monkeypatc
             # Keep successful path metadata/hash inputs unchanged. Native
             # collision details are a separate rejection-only field.
             assert all("collision_check" not in row for row in failure.value.details["endpoint_attempts"])
+
+
+def _held_start_planner(command):
+    from types import SimpleNamespace
+
+    planner = object.__new__(planning_module.MujocoPlannedTcpMotion)
+    planner.rig = SimpleNamespace(accepted_qcmd_by_side=lambda: {k: v.copy() for k, v in command.items()})
+    return planner
+
+
+def test_held_object_plan_starts_at_the_held_command_only_near_the_measured_cut():
+    measured = {"left": np.zeros(6), "right": np.full(6, .1)}
+    sagged = {"left": np.zeros(6), "right": measured["right"] + np.array([0., .0014, .0004, 0., 0., 0.])}
+    held = _held_start_planner(sagged)._held_command_start(measured)
+    np.testing.assert_array_equal(held["right"], sagged["right"])
+    np.testing.assert_array_equal(held["left"], sagged["left"])
+    # Beyond the tolerance (e.g. a blocked arm) the measured cut stays the start.
+    far = {"left": np.zeros(6), "right": measured["right"] + planning_module.HELD_COMMAND_START_TOLERANCE_RAD * 1.5}
+    assert _held_start_planner(far)._held_command_start(measured) is None
+    assert _held_start_planner({"left": np.full(6, np.nan), "right": sagged["right"]})._held_command_start(
+        measured) is None
+    # Private query rigs without a held command keep the measured start.
+    query = object.__new__(planning_module.MujocoPlannedTcpMotion)
+    from types import SimpleNamespace
+    query.rig = SimpleNamespace()
+    assert query._held_command_start(measured) is None
+
+
+def test_held_command_start_is_rejected_once_the_rig_command_changes():
+    from types import SimpleNamespace
+
+    start = {"left": np.zeros(6), "right": np.full(6, .1)}
+    plan = SimpleNamespace(path=SimpleNamespace(start_qpos_by_component=start),
+                           measured_start_qpos_by_component={"left": np.zeros(6), "right": np.full(6, .099)})
+    _held_start_planner(start)._require_held_command_start(plan)
+    moved = {"left": np.zeros(6), "right": start["right"] + 1e-6}
+    with pytest.raises(planning_module.MujocoTcpPlanRejected, match="safe_tcp_start_state_changed"):
+        _held_start_planner(moved)._require_held_command_start(plan)
+    # Plans that start at the measured cut keep the original live-state gates only.
+    _held_start_planner(moved)._require_held_command_start(
+        SimpleNamespace(path=plan.path, measured_start_qpos_by_component=None))
+    assert planning_module._measured_start(plan) is plan.measured_start_qpos_by_component
+    assert planning_module._measured_start(SimpleNamespace(path=plan.path)) is start
