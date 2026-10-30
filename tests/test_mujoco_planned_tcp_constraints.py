@@ -310,8 +310,8 @@ def test_held_command_start_is_rejected_once_the_rig_command_changes():
 
 @pytest.mark.unit
 @pytest.mark.parametrize("payload", [False, True])
-def test_held_object_endpoint_must_solve_the_goal_tighter_than_the_route_tolerance(monkeypatch, payload):
-    """A 2 mm IK miss passes the 3 mm Route tolerance only without a payload."""
+def test_held_object_endpoint_must_leave_a_sag_margin_inside_the_route_tolerance(monkeypatch, payload):
+    """A 2.5 mm IK miss passes the 3 mm Route tolerance only without a payload."""
     from types import SimpleNamespace
     from threading import RLock
 
@@ -335,12 +335,12 @@ def test_held_object_endpoint_must_solve_the_goal_tighter_than_the_route_toleran
 
     def solve_bounded(goal, seed, **kwargs):
         bounded.append(kwargs)
-        return np.array([.998, 0., 0., 0., 0., 0.])
+        return np.array([.9975, 0., 0., 0., 0., 0.])
 
     planner._solver = SimpleNamespace(q_min=np.full(6, -np.pi), q_max=np.full(6, np.pi),
         compute_pose=lambda q: np.eye(4),
-        # Every seed converges 2 mm short, like a lift past the stretched elbow.
-        solve_iterative=lambda **kwargs: np.array([.998, 0., 0., 0., 0., 0.]),
+        # Every seed converges 2.5 mm short, like a lift past the stretched elbow.
+        solve_iterative=lambda **kwargs: np.array([.9975, 0., 0., 0., 0., 0.]),
         solve_bounded_pose=solve_bounded, last_solve_iterations=100,
         last_solve_converged=False, last_solve_deadline_exceeded=False)
     monkeypatch.setattr(planning_module, "MujocoJointSceneOracle", lambda *a, **kw: SimpleNamespace(
@@ -360,12 +360,14 @@ def test_held_object_endpoint_must_solve_the_goal_tighter_than_the_route_toleran
         # No endpoint is accepted: the Agent gets an immediate refusal instead
         # of a motion that settles outside the terminal tolerance.
         assert failure.value.reason_code == "safe_tcp_endpoint_search_exhausted"
-        assert bounded and bounded[0]["translation_tolerance_m"] == planning_module.HELD_OBJECT_ENDPOINT_TRANSLATION_TOLERANCE_M
-        assert bounded[0]["rotation_tolerance_rad"] == planning_module.HELD_OBJECT_ENDPOINT_ROTATION_TOLERANCE_RAD
+        expected_translation = .003 - planning_module.HELD_OBJECT_ENDPOINT_SAG_MARGIN_M
+        expected_rotation = .03 - planning_module.HELD_OBJECT_ENDPOINT_SAG_MARGIN_RAD
+        assert bounded and bounded[0]["translation_tolerance_m"] == pytest.approx(expected_translation)
+        assert bounded[0]["rotation_tolerance_rad"] == pytest.approx(expected_rotation)
         diagnostics = failure.value.details["endpoint_search_diagnostics"]
-        assert diagnostics["translation_tolerance_m"] == .001
+        assert diagnostics["translation_tolerance_m"] == pytest.approx(.002)
     else:
-        # Without a payload the 2 mm miss is still an accepted endpoint
+        # Without a payload the 2.5 mm miss is still an accepted endpoint
         # (refused here only by the fixture collision check).
         assert failure.value.reason_code == "safe_tcp_target_blocked"
         assert not bounded
