@@ -610,14 +610,33 @@ _HELD_OBJECT_REPORT_SCHEMA = {
 
 
 def real_object_motion_schema_v1(*, definition, profile: RealAgentObjectMotionProfile):
-    """The shared object-motion schema plus the lower measurement report."""
+    """The shared object-motion schema plus the lower measurement report.
+
+    The shared root ``oneOf`` (exactly one of the two targets) moves into the
+    target descriptions; the lower validator still enforces it. Some model
+    providers reject a root-level ``oneOf`` beside ``properties`` in tools.
+    """
     entry = grasped_object_move_schema(
         definition=definition, profile=profile, object_id=profile.object_id,
         observation_source=profile.observation_source, clock_domain_id=profile.clock_domain_id)
+    parameters = {key: value for key, value in entry.parameter_schema.items() if key != "oneOf"}
+    properties = dict(parameters["properties"])
+    properties["object_pose_xyz_quat_xyzw"] = {
+        **properties["object_pose_xyz_quat_xyzw"],
+        "description": ("Absolute object-body goal [x, y, z, qx, qy, qz, qw] in the public frame. Give exactly one "
+                        "of object_pose_xyz_quat_xyzw or translation_delta_xyz_m.")}
+    properties["translation_delta_xyz_m"] = {
+        **properties["translation_delta_xyz_m"],
+        "description": ("Offset [dx, dy, dz] of the currently measured object in the public frame, keeping its "
+                        "orientation. Give exactly one of translation_delta_xyz_m or object_pose_xyz_quat_xyzw.")}
+    parameters["properties"] = properties
     result = dict(entry.execution_result_schema)
     result["properties"] = {**result["properties"], "held_object_report": _HELD_OBJECT_REPORT_SCHEMA}
     result["required"] = [*result["required"], "held_object_report"]
-    return replace(entry, execution_result_schema=result)
+    schema_hash = agent_skill_schema_document_hash(parameters, schema_kind="parameter")
+    return replace(entry, parameter_schema=parameters, execution_result_schema=result,
+                   parameter_profiles=tuple(replace(item, parameter_schema_hash=schema_hash)
+                                            for item in entry.parameter_profiles))
 
 
 def _object_motion_payload_validator(*, route: SkillExecutionRoute,
