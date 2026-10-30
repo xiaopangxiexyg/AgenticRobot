@@ -6,13 +6,16 @@ operation:
 1. require a verified, unsupported held object (the same lifted state that
    ``motion.move_grasped_object_to_pose`` phase=carry requires);
 2. capture correlated RGB-D for the bound camera role, text-segment the
-   selected support with its deployment-bound prompt and measure a certified
-   top rectangle from depth only (``agent_gateway.profiles.measured_support``);
+   selected support with its deployment-bound prompt and measure up to three
+   distinct certified top rectangles from depth only, largest first
+   (``agent_gateway.profiles.measured_support``); an object resting on the top
+   leaves the free strips around it as separate regions;
 3. re-capture depth, require the support pixels unchanged, then read the held
    box and propose on-support release poses with bounded yaw turns;
-4. check every proposal with a private, never-activated planner that uses the
-   carry Route's motion profile, envelope and measured payload binding, and
-   keep the planner's ranked selection.
+4. check the proposals of each region in turn with a private, never-activated
+   planner that uses the carry Route's motion profile, envelope and measured
+   payload binding, and keep the planner's ranked selection in the first
+   region that has one.
 
 Native body poses never enter the support measurement. Nothing is commanded,
 retained as a plan or authorized for execution.
@@ -31,7 +34,7 @@ from types import SimpleNamespace
 import numpy as np
 
 from agent_gateway.profiles.back_projection import LiveAlignedDepthCapture
-from agent_gateway.profiles.measured_support import measure_support_top
+from agent_gateway.profiles.measured_support import measure_support_tops
 from agent_gateway.profiles.segmentation import decode_segmentation_mask_npy
 from agent_gateway.protocol.skill_catalog import SkillRouteManifestEntry
 from agent_gateway.protocol.skill_io_contracts import inline_only_skill_io_contract
@@ -62,6 +65,8 @@ RELEASE_LATERAL_MARGIN_M = 0.003
 MAXIMUM_RELEASE_CLEARANCE_M = 0.05
 PLANNING_TIME_BUDGET_SEC = 45.
 PATH_SEARCH_BUDGET_SEC = 8.
+# Distinct certified top rectangles tried in order, largest first.
+MAXIMUM_SUPPORT_REGIONS = 3
 SEGMENTATION_MIN_SCORE = 0.3
 DEPTH_UNCHANGED_TOLERANCE_M = 0.001
 # Leave the executor time to validate and retain its result before the deadline.
@@ -124,6 +129,8 @@ def build_support_release_query_registration(*, segmentation, back_projection, r
         "planning_time_budget_sec": PLANNING_TIME_BUDGET_SEC,
         "path_search_budget_sec": PATH_SEARCH_BUDGET_SEC,
         "support_measurement": "depth_only_certified_top_rectangle_v1",
+        "support_regions": {"maximum": MAXIMUM_SUPPORT_REGIONS, "order": "largest_first",
+                            "maximum_overlap_fraction": .75},
         "planner": "mujoco_private_payload_candidate_planner_v1",
     }, domain="agenticrobot.support_release_query.profile.v1")
     definition = skill.definition()
@@ -193,6 +200,13 @@ def summarize_rejections(diagnostics):
             counts[reason] = counts.get(reason, 0) + 1
     return [{"reason_code": reason, "count": count}
             for reason, count in sorted(counts.items(), key=lambda pair: (-pair[1], pair[0]))]
+
+
+def _rejection_list(limited, counts):
+    """Route-limit filtering first, then planner refusals by count (summed over regions)."""
+    return ([{"reason_code": "carry_target_outside_route_limits", "count": limited}] if limited else []) + [
+        {"reason_code": reason, "count": count}
+        for reason, count in sorted(counts.items(), key=lambda pair: (-pair[1], pair[0]))]
 
 
 def _rejected(*, parameters, revision, frame, reason, held_pose=None, segmentation=None,
@@ -299,24 +313,27 @@ class MujocoSupportReleaseQuery:
                             "mask_bounds_xyxy": [int(v) for v in result["mask_bounds_xyxy"]]}
             evidence.append("support-mask:" + role + ":" + str(result["mask_media_content_hash"]))
             try:
-                top = measure_support_top(paired.depth, mask, maximum_depth_m=self.maximum_depth_m)
+                tops = measure_support_tops(paired.depth, mask, maximum_depth_m=self.maximum_depth_m,
+                                            limit=MAXIMUM_SUPPORT_REGIONS)
             except ValueError:
                 views.append({"role": role, "outcome": "top_not_measured",
                               "score": segmentation["score"], "certified_area_m2": None})
                 continue
+            top = tops[0]
             area = float((top.region_max_xy_m[0] - top.region_min_xy_m[0])
                          * (top.region_max_xy_m[1] - top.region_min_xy_m[1]))
             views.append({"role": role, "outcome": "measured", "score": segmentation["score"],
                           "certified_area_m2": area})
             if best is None or area > best[0]:
-                best = (area, role, paired, mask, top, segmentation,
+                best = (area, role, paired, mask, tops, segmentation,
                         str(result["mask_media_content_hash"]))
         if best is None:
             reason = ("support_not_segmented"
                       if all(view["outcome"] == "not_segmented" for view in views)
                       else "support_top_not_measured")
             return _rejected(reason=reason, views=views, **common), tuple(evidence)
-        _area, role, paired, mask, top, segmentation, mask_hash = best
+        _area, role, paired, mask, tops, segmentation, mask_hash = best
+        top = tops[0]
         result = {"mask_media_content_hash": mask_hash}
         measured = {
             "top_z_m": top.top_z_m, "region_min_xy_m": list(top.region_min_xy_m),
@@ -340,75 +357,89 @@ class MujocoSupportReleaseQuery:
             return _rejected(reason="held_object_not_verified_lifted", segmentation=segmentation,
                              measured=measured, **common), tuple(evidence)
         held_pose = [float(v) for v in pose_to_xyz_quat_xyzw(held.reference_from_object)]
-        support_ref = "support-measured-top:" + canonical_content_hash({
-            "support_id": support_id, "depth": fresh.depth_content_hash,
-            "mask": str(result["mask_media_content_hash"]),
-            "region": [list(top.region_min_xy_m), list(top.region_max_xy_m)],
-            "top_z_m": top.top_z_m}, domain="agenticrobot.support_release_query.support.v1")
-        support = top.observation(support_id=support_id, reference_frame_id=frame,
-                                  scene_revision=revision, measured_at=float(fresh.captured_at),
-                                  evidence_ref=support_ref)
-        evidence += [support_ref, held.pose_evidence_ref, held.grasp_evidence_ref]
-        try:
-            candidates = plan_release_approach_candidates(
-                held, support, now=float(self.application.runtime.clock()), clearance_m=clearance,
-                minimum_planning_clearance_m=skill.MIN_CLEARANCE_M,
-                maximum_clearance_m=MAXIMUM_RELEASE_CLEARANCE_M,
-                lateral_margin_m=RELEASE_LATERAL_MARGIN_M, yaw_offsets_rad=RELEASE_YAW_OFFSETS_RAD)
-        except ValueError as error:
-            if "fits" not in str(error):
-                raise
+        evidence += [held.pose_evidence_ref, held.grasp_evidence_ref]
+        now = float(self.application.runtime.clock())
+        began = time.monotonic()
+        offset = 0          # candidates of the regions already tried
+        limited = 0         # proposals outside the carry Route limits
+        counts = {}         # planner refusals, summed over regions
+        budget_exhausted = False
+        fitted = False
+        for region in tops:
+            region_ref = "support-measured-top:" + canonical_content_hash({
+                "support_id": support_id, "depth": fresh.depth_content_hash,
+                "mask": str(result["mask_media_content_hash"]),
+                "region": [list(region.region_min_xy_m), list(region.region_max_xy_m)],
+                "top_z_m": region.top_z_m}, domain="agenticrobot.support_release_query.support.v1")
+            support = region.observation(support_id=support_id, reference_frame_id=frame,
+                                         scene_revision=revision, measured_at=float(fresh.captured_at),
+                                         evidence_ref=region_ref)
+            try:
+                candidates = plan_release_approach_candidates(
+                    held, support, now=now, clearance_m=clearance,
+                    minimum_planning_clearance_m=skill.MIN_CLEARANCE_M,
+                    maximum_clearance_m=MAXIMUM_RELEASE_CLEARANCE_M,
+                    lateral_margin_m=RELEASE_LATERAL_MARGIN_M, yaw_offsets_rad=RELEASE_YAW_OFFSETS_RAD)
+            except ValueError as error:
+                if "fits" not in str(error):
+                    raise
+                continue
+            fitted = True
+            evidence.append(region_ref)
+            indices = self._admissible(candidates, held)
+            admissible = [candidates[index] for index in indices]
+            limited += len(candidates) - len(indices)
+            try:
+                selection = self._plan(admissible, cancel_requested=cancel_requested, deadline=deadline)
+            except MujocoTcpPlanRejected as error:
+                if cancel_requested():
+                    raise InterruptedError("Support release query cancelled.") from error
+                budget_exhausted = budget_exhausted or error.reason_code in {
+                    "safe_tcp_path_search_exhausted", "safe_tcp_planning_cancelled"}
+                for item in summarize_rejections(error.details.get("candidates")):
+                    counts[item["reason_code"]] = counts.get(item["reason_code"], 0) + item["count"]
+                offset += len(candidates)
+                if float(self.clock()) >= deadline:
+                    break
+                continue
+            if selection is None:
+                offset += len(candidates)
+                continue
+            for item in summarize_rejections(selection.diagnostics):
+                counts[item["reason_code"]] = counts.get(item["reason_code"], 0) + item["count"]
+            chosen = admissible[selection.candidate_index]
+            release = [float(v) for v in pose_to_xyz_quat_xyzw(chosen.proposal.object_goal)]
+            index = offset + int(indices[selection.candidate_index])
+            evidence.append("support-release-plan:" + canonical_content_hash({
+                "candidate_index": index, "release_pose": release,
+                "diagnostics_count": len(selection.diagnostics)},
+                domain="agenticrobot.support_release_query.plan.v1"))
+            return {
+                "semantics": skill.SEMANTICS, "status": "release_pose_found",
+                "reason": "collision_free_release_path_found", "support_object_id": support_id,
+                "reference_frame_id": frame, "station_revision": revision,
+                "release_object_pose_xyz_quat_xyzw": release, "release_clearance_m": clearance,
+                "held_object_pose_xyz_quat_xyzw": held_pose,
+                "yaw_change_rad": float(chosen.yaw_offset_rad),
+                "support_top_z_m": float(region.top_z_m),
+                "support_region_min_xy_m": list(region.region_min_xy_m),
+                "support_region_max_xy_m": list(region.region_max_xy_m),
+                "segmentation": segmentation, "measured_support": measured["evidence"],
+                "candidate_count": offset + len(candidates),
+                "attempted_candidate_count": offset + len(candidates),
+                "selected_candidate_index": index,
+                "path_planning_wall_sec": float(time.monotonic() - began),
+                "candidate_rejections": _rejection_list(limited, counts),
+                "views": views,
+                "motion_executed": False, "execution_authorized": False}, tuple(evidence)
+        if not fitted:
             return _rejected(reason="held_footprint_does_not_fit_support", held_pose=held_pose,
                              segmentation=segmentation, measured=measured, **common), tuple(evidence)
-        indices = self._admissible(candidates, held)
-        admissible = [candidates[index] for index in indices]
-        filtered = len(candidates) - len(indices)
-        limit_rejections = ([{"reason_code": "carry_target_outside_route_limits", "count": filtered}]
-                            if filtered else [])
-        began = time.monotonic()
-        try:
-            selection = self._plan(admissible, cancel_requested=cancel_requested, deadline=deadline)
-        except MujocoTcpPlanRejected as error:
-            if cancel_requested():
-                raise InterruptedError("Support release query cancelled.") from error
-            reason = ("query_budget_exhausted" if error.reason_code in {
-                "safe_tcp_path_search_exhausted", "safe_tcp_planning_cancelled"}
-                else "no_collision_free_release_path")
-            return _rejected(reason=reason, held_pose=held_pose, segmentation=segmentation,
-                             measured=measured, candidate_count=len(candidates),
-                             attempted=len(candidates), planning_wall_sec=time.monotonic() - began,
-                             rejections=[*limit_rejections,
-                                         *summarize_rejections(error.details.get("candidates"))],
-                             **common), tuple(evidence)
-        wall = time.monotonic() - began
-        if selection is None:
-            return _rejected(reason="no_collision_free_release_path", held_pose=held_pose,
-                             segmentation=segmentation, measured=measured,
-                             candidate_count=len(candidates), attempted=len(candidates),
-                             rejections=limit_rejections, **common), tuple(evidence)
-        chosen = admissible[selection.candidate_index]
-        release = [float(v) for v in pose_to_xyz_quat_xyzw(chosen.proposal.object_goal)]
-        evidence.append("support-release-plan:" + canonical_content_hash({
-            "candidate_index": int(selection.candidate_index), "release_pose": release,
-            "diagnostics_count": len(selection.diagnostics)},
-            domain="agenticrobot.support_release_query.plan.v1"))
-        return {
-            "semantics": skill.SEMANTICS, "status": "release_pose_found",
-            "reason": "collision_free_release_path_found", "support_object_id": support_id,
-            "reference_frame_id": frame, "station_revision": revision,
-            "release_object_pose_xyz_quat_xyzw": release, "release_clearance_m": clearance,
-            "held_object_pose_xyz_quat_xyzw": held_pose,
-            "yaw_change_rad": float(chosen.yaw_offset_rad),
-            "support_top_z_m": float(top.top_z_m),
-            "support_region_min_xy_m": list(top.region_min_xy_m),
-            "support_region_max_xy_m": list(top.region_max_xy_m),
-            "segmentation": segmentation, "measured_support": measured["evidence"],
-            "candidate_count": len(candidates), "attempted_candidate_count": len(candidates),
-            "selected_candidate_index": int(indices[selection.candidate_index]),
-            "path_planning_wall_sec": float(wall),
-            "candidate_rejections": [*limit_rejections, *summarize_rejections(selection.diagnostics)],
-            "views": views,
-            "motion_executed": False, "execution_authorized": False}, tuple(evidence)
+        return _rejected(reason="query_budget_exhausted" if budget_exhausted else "no_collision_free_release_path",
+                         held_pose=held_pose, segmentation=segmentation, measured=measured,
+                         candidate_count=offset, attempted=offset,
+                         planning_wall_sec=time.monotonic() - began,
+                         rejections=_rejection_list(limited, counts), **common), tuple(evidence)
 
     @staticmethod
     def _require_unchanged(source: LiveAlignedDepthCapture, fresh: LiveAlignedDepthCapture, mask):

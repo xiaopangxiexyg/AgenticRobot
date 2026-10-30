@@ -168,6 +168,12 @@ MUJOCO_AGENT_OBJECT_MOVE_ROUTE_ID_V1 = "sim.mujoco.motion.move_grasped_object_to
 MUJOCO_AGENT_OBJECT_MOVE_ROUTE_ID_V2 = "sim.mujoco.motion.move_grasped_object_to_pose.v2"
 MUJOCO_AGENT_GRASP_APPROACH_EXECUTOR_ID_V1 = "mujoco-agent-grasp-approach-executor-v1"
 MUJOCO_AGENT_OBJECT_MOVE_MAX_OPERATION_MS = 240_000
+# Simulated time a held object (and the TCP) must stay inside the goal
+# tolerance before an object motion succeeds. Was 60 control cycles (about 4 s
+# at the deployed decision rate), which dominated the wall time of every lift,
+# carry and place under the per-step held-object guards. Holding verification
+# keeps its own 0.5 s unsupported-following window.
+MUJOCO_AGENT_OBJECT_MOVE_STABLE_SEC = 0.5
 
 MUJOCO_AGENT_TCP_POSE_ROUTE_ID_V1 = "sim.mujoco.rm65.agent_skill_tcp_pose"
 MUJOCO_AGENT_TCP_POSE_EXECUTOR_ID_V1 = (
@@ -2765,7 +2771,8 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
             grasped_object_move_definition(controlled_component_ids=(component,)),
             replace(grasp_contract.motion_profile,
                 profile_id="mujoco.agent_object_motion." + grasp_contact_binding.semantic_content_hash,
-                stable_measurement_count=60),
+                stable_measurement_count=max(
+                    3, math.ceil(MUJOCO_AGENT_OBJECT_MOVE_STABLE_SEC * decision_hz))),
             route_id=MUJOCO_AGENT_OBJECT_MOVE_ROUTE_ID_V1,
             executor_id="mujoco-grasped-object-motion-v1",
             binding_prefix="sim.mujoco.agent_object_motion:",

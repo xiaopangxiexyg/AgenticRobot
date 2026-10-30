@@ -199,6 +199,36 @@ def test_object_stage_commits_only_after_plan_activation_on_the_live_cut(monkeyp
 
 
 @pytest.mark.unit
+@pytest.mark.parametrize("path_completed", [False, True])
+def test_object_motion_fails_fast_when_the_tcp_does_not_settle_after_its_path(monkeypatch, path_completed):
+    from agent_gateway.profiles.mujoco import object_motion
+    from agent_gateway.profiles.mujoco.object_motion import MujocoAgentObjectMotionLifecycle
+
+    lifecycle = object.__new__(MujocoAgentObjectMotionLifecycle)
+    lifecycle._phase = "lift"
+    lifecycle._object_unmet_since = None
+    lifecycle._path_completed = path_completed
+    clock = [10.]
+    lifecycle._object_observer = SimpleNamespace(observe=lambda **kwargs: SimpleNamespace(sim_time_s=clock[0]))
+    # The measured TCP stays just outside the Route tolerance (a stretched arm
+    # sagging under the payload) for the whole settle window.
+    monkeypatch.setattr(MujocoAgentSafeTcpPoseSkillLifecycle, "_within_terminal_tolerance",
+                        lambda self, pose: False)
+    assert lifecycle._within_terminal_tolerance(None) is False
+    clock[0] += object_motion.OBJECT_TERMINAL_GRACE_S - .01
+    assert lifecycle._within_terminal_tolerance(None) is False
+    clock[0] += .02
+    if not path_completed:
+        # Still moving along its checked path: no settle clock runs.
+        assert lifecycle._within_terminal_tolerance(None) is False
+        assert lifecycle._object_unmet_since is None
+        return
+    with pytest.raises(object_motion._ObjectTerminalUnmet) as unmet:
+        lifecycle._within_terminal_tolerance(None)
+    assert unmet.value.reason_code == "object_motion_tcp_pose_outside_tolerance"
+
+
+@pytest.mark.unit
 @pytest.mark.parametrize("pair_class,expected", [
     ("payload_relation", "object_follow_relation_lost_after_hold"),
     ("payload_support_moved", "object_support_moved_after_hold"),
@@ -552,5 +582,130 @@ def test_ungrasped_object_request_is_rejected_with_original_domain_hold_and_clea
         assert operation.progress_summary["lower_hold_confirmed"] is True
         assert operation.execution_result is None and not app.target.planned_tcp_motion.active
         np.testing.assert_array_equal(app.scene.data.qpos, before)
+    finally:
+        assert session.close().accepted
+
+
+@pytest.mark.integration
+@pytest.mark.optional
+@pytest.mark.slow_sim
+# Approach, close and one guarded 4 cm lift take about 90 s of 4 kHz physics.
+@pytest.mark.timeout(300)
+def test_native_lift_starts_at_the_held_command_without_pressing_the_object_down(tmp_path):
+    """The P-servo arms sag below their held command; a lift must not step down to the sag."""
+    pytest.importorskip("mujoco")
+    from agent_gateway.protocol.contracts import AGENT_SKILL_TERMINAL_OPERATION_STATUSES_V1
+    from sim.mujoco.deploy.planned_tcp_motion import MujocoPlannedTcpMotion
+    from sim.mujoco.scene_suite import materialize_case
+    from sim.mujoco.transforms import pose_to_xyz_quat_xyzw
+    from test_agent_gateway_mujoco_grasp_approach import _compact_world_grasp
+    from test_agent_gateway_mujoco_tcp_pose_comparison import _request
+
+    suite = resolve_path(Path("sim/configs/scene_suites/rm65_dmtac_place_v1.json"))
+    task = materialize_case("box_on_box", tmp_path / "scene", variant=0, suite_path=suite)
+    session = build_mujoco_agent_tcp_pose_gateway_session(
+        target_config=MujocoSimHILTargetConfig(task_config_path=task, realtime_worker=False,
+            runtime_session_id=CLIENT, control_domain_id=CLIENT,
+            execution_observation_plan=mujoco_agent_tcp_pose_execution_observation_plan_v1(),
+            exposed_pose_sides=("right",), allow_scripted_task_reset=False),
+        allowed_client_ids=(CLIENT,), enable_grippers=True, enable_grasp_approach=True,
+        grasp_contact_target_body="debug_cube", enable_object_state=True,
+        enable_object_follow_observation=True, enable_object_motion=True,
+        enable_object_support_motion_v2=True, object_support_body_names=("green_box",),
+        enable_named_release_v3=True)
+    plans = []
+    original_plan = MujocoPlannedTcpMotion.plan
+
+    def recording_plan(self, *args, **kwargs):
+        plan = original_plan(self, *args, **kwargs)
+        plans.append(plan)
+        return plan
+
+    try:
+        app = session.application
+        app.start_observation_ready()
+        adapter = session.wire_adapter(authenticated_client_id=CLIENT)
+        sequence = [0]
+
+        def call(skill_id, parameters, version="1"):
+            sequence[0] += 1
+            request = _request(session, adapter, skill_id=skill_id, version=version,
+                               parameters=parameters, sequence=sequence[0])
+            outcome = adapter.submit_skill_request(request.to_wire())
+            assert outcome["accepted"], outcome
+            session.wait(timeout_sec=200.)
+            operation = session.service.get_operation(outcome["operation"]["operation_id"])
+            assert operation.status in AGENT_SKILL_TERMINAL_OPERATION_STATUSES_V1
+            assert operation.status == "completed", (
+                skill_id, operation.status, operation.reason_code, dict(operation.progress_summary or {}))
+            return operation
+
+        motion = session.contract_bundle.motion_profile
+        lineage = ("reference_frame_id", "reference_frame_spec_hash", "frame_graph_hash",
+                   "tool_config_hash", "calibration_hash")
+        grasp = _compact_world_grasp()
+        grasp[0, 3] += -.028 + (-.285 + .30)
+        grasp[1, 3] += -.02
+        grasp[2, 3] += -.033
+        grasp[:3, :3] = grasp[:3, :3] @ Rotation.from_euler("x", 6., degrees=True).as_matrix()
+        for distance, skill_id in ((-.07, "motion.approach_grasp_pose"),
+                                   (-.025, "motion.approach_grasp_pose"),
+                                   (.01, "motion.approach_grasp_contact")):
+            goal = grasp.copy()
+            goal[:3, 3] += grasp[:3, 2] * distance
+            public = app.transform_tcp_pose_xyzquat(tuple(pose_to_xyz_quat_xyzw(goal)),
+                source_frame_id="mujoco_sim_hil/world", target_frame_id=motion.reference_frame_id)
+            call(skill_id, {"pose_targets_by_component": {"right_arm": public},
+                            **{name: getattr(motion, name) for name in lineage},
+                            "controlled_frame_id": "tool_tcp"})
+        # As an Agent does: close, then lift at once (no extra settling time).
+        call("manipulation.set_gripper_state", {"component_id": "right_gripper",
+                                                "target_state": "closed"}, "3")
+        rig = app.runtime.rig
+        command = rig.accepted_qcmd_by_side()["right"]
+        measured = rig.measured_qpos_by_side()["right"]
+        assert float(np.max(np.abs(command - measured))) > 1e-3   # the held arm sags below its command
+
+        model = app.scene.model
+        cube = int(model.body("debug_cube").id)
+        table = int(model.body(app.task_config.table_body_name).id)
+        depths = []
+
+        def penetration(scene):
+            deepest = 0.
+            for contact in scene.data.contact[:int(scene.data.ncon)]:
+                bodies = {int(model.geom_bodyid[contact.geom1]), int(model.geom_bodyid[contact.geom2])}
+                if bodies == {cube, table}:
+                    deepest = max(deepest, -float(contact.dist))
+            return deepest
+
+        before = rig.capture_scene(penetration)
+        step = rig.step_physics
+
+        def observed_step(*args, **kwargs):
+            result = step(*args, **kwargs)
+            if len(depths) < 2000:   # the first 0.5 s of simulated lift
+                depths.append(penetration(rig.scene))
+            return result
+
+        rig.step_physics = observed_step
+        object_profile = session.contract_bundle.object_motion_contract.motion_profile
+        MujocoPlannedTcpMotion.plan = recording_plan
+        try:
+            lift = call(GRASPED_OBJECT_MOVE_SKILL_ID, {
+                "object_id": "debug_cube", "component_id": "right_arm", "controlled_frame_id": "object_body",
+                **{name: getattr(object_profile, name) for name in lineage},
+                "phase": "lift", "translation_delta_xyz_m": [0., 0., .04]})
+        finally:
+            MujocoPlannedTcpMotion.plan = original_plan
+            rig.step_physics = step
+        assert lift.execution_result["object_state"]["holding_verified"] is True
+        lift_plans = [plan for plan in plans if plan.payload_binding is not None]
+        assert lift_plans and lift_plans[-1].path.metadata["start_source"] == "held_command"
+        np.testing.assert_array_equal(lift_plans[-1].path.start_qpos_by_component["right"], command)
+        np.testing.assert_allclose(lift_plans[-1].measured_start_qpos_by_component["right"], measured, atol=1e-9)
+        # Starting at the sagged measured cut stepped the wrist ~0.5 mm down and
+        # raised this penetration by ~0.45 mm; the held-command start must not.
+        assert depths and max(depths) <= before + 1e-4, (before, max(depths))
     finally:
         assert session.close().accepted

@@ -10,7 +10,9 @@ import pytest
 from agent_gateway.profiles.back_projection import LiveAlignedDepthCapture
 from agent_gateway.profiles.measured_support import (
     largest_true_rectangle,
+    maximal_true_rectangles,
     measure_support_top,
+    measure_support_tops,
 )
 
 pytestmark = [pytest.mark.unit]
@@ -33,8 +35,11 @@ def _look_at(eye, target):
     return pose
 
 
-def _render(eye=(0.045, -0.25, 0.35), occluder=None):
-    """Ray-cast a box (top and front face) on a table; return depth, box mask, camera pose."""
+def _render(eye=(0.045, -0.25, 0.35), occluder=None, resting=None):
+    """Ray-cast a box (top and front face) on a table; return depth, box mask, camera pose.
+
+    ``resting`` = (x0, y0, x1, y1, height) puts another block on the box top.
+    """
     pose = _look_at(eye, (0.045, 0.045, TOP_Z))
     v, u = np.mgrid[0:HEIGHT, 0:WIDTH].astype(float)
     rays = np.stack(((u - INTRINSICS["cx"]) / INTRINSICS["fx"],
@@ -61,6 +66,20 @@ def _render(eye=(0.045, -0.25, 0.35), occluder=None):
             & (p[..., 2] >= TABLE_Z) & (p[..., 2] <= TOP_Z), True)
         t_table = (TABLE_Z - origin[2]) / world[..., 2]
         hit(t_table, np.ones_like(t_table, dtype=bool), False)
+        if resting is not None:
+            x0, y0, x1, y1, height = resting
+            upper = TOP_Z + height
+            t_cap = (upper - origin[2]) / world[..., 2]
+            p = origin + t_cap[..., None] * world
+            hit(t_cap, (p[..., 0] >= x0) & (p[..., 0] <= x1) & (p[..., 1] >= y0) & (p[..., 1] <= y1), False)
+            for plane, axis, low, high in ((y0, 1, (x0, TOP_Z), (x1, upper)),
+                                           (x0, 0, (y0, TOP_Z), (y1, upper)),
+                                           (x1, 0, (y0, TOP_Z), (y1, upper))):
+                t_side = (plane - origin[axis]) / world[..., axis]
+                p = origin + t_side[..., None] * world
+                other = 1 - axis
+                hit(t_side, (p[..., other] >= low[0]) & (p[..., other] <= high[0])
+                    & (p[..., 2] >= low[1]) & (p[..., 2] <= high[1]), False)
     if occluder is not None:
         x0, y0, x1, y1, distance = occluder
         region = np.zeros_like(mask)
@@ -135,3 +154,35 @@ def test_too_small_visible_top_is_rejected():
     tiny[rows[keep], cols[keep]] = True
     with pytest.raises(ValueError):
         measure_support_top(_capture(depth, pose), tiny, maximum_depth_m=2.)
+
+
+def test_maximal_true_rectangles_returns_both_strips_around_a_blocked_corner():
+    grid = np.ones((45, 45), dtype=bool)
+    grid[25:, :20] = False
+    blocks = maximal_true_rectangles(grid, limit=3)
+    assert blocks[0] == largest_true_rectangle(grid)
+    assert set(blocks[:2]) == {(0, 0, 24, 44), (0, 20, 44, 44)}
+    for row0, col0, row1, col1 in blocks:
+        assert grid[row0:row1 + 1, col0:col1 + 1].all()
+    # A block inside an earlier one is never repeated.
+    assert maximal_true_rectangles(np.ones((5, 5), dtype=bool), limit=3) == [(0, 0, 4, 4)]
+    with pytest.raises(ValueError):
+        maximal_true_rectangles(grid, limit=0)
+
+
+def test_object_resting_on_the_top_leaves_both_free_strips_as_regions():
+    block = (0.0, 0.05, 0.04, 0.09, 0.04)   # far-left corner of the 9 cm top
+    depth, mask, pose = _render(resting=block)
+    tops = measure_support_tops(_capture(depth, pose), mask, maximum_depth_m=2., limit=3)
+    assert len(tops) >= 2
+    assert measure_support_top(_capture(depth, pose), mask, maximum_depth_m=2.).region_min_xy_m == tops[0].region_min_xy_m
+    for top in tops:
+        low, high = np.asarray(top.region_min_xy_m), np.asarray(top.region_max_xy_m)
+        assert np.all(low >= BOX_MIN) and np.all(high <= BOX_MAX)
+        # No certified region reaches under the resting block.
+        assert low[0] >= block[2] or high[1] <= block[1]
+    right = [t for t in tops if t.region_min_xy_m[0] >= block[2]]
+    near = [t for t in tops if t.region_max_xy_m[1] <= block[1]]
+    assert right and near
+    assert right[0].region_max_xy_m[1] - right[0].region_min_xy_m[1] > 0.07
+    assert near[0].region_max_xy_m[0] - near[0].region_min_xy_m[0] > 0.07

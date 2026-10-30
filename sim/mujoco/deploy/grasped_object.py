@@ -95,6 +95,9 @@ class MujocoGraspedObjectObserver:
         self._failure = None
         self._scratch = None
         self._model = None
+        # Last capture and the native state it was computed from (see _capture).
+        self._capture_key = None
+        self._capture_value = None
         self._tracking_phase = None
         self._last_physics_cut_time = None
         self._release_window = None
@@ -152,8 +155,24 @@ class MujocoGraspedObjectObserver:
             self._scratch, self._model = mj.MjData(model), model
         if self._model is not model or (source_data is not None and source_data.model is not model):
             raise ValueError("Object observation model changed.")
+        source = scene.data if source_data is None else source_data
+        selected_support = self._active_support_body_name if support_body_name is None else support_body_name
+        # A capture depends only on this native state: the scratch copy below
+        # recomputes kinematics and collisions from it. The payload guard and
+        # the physics-step observer read the same state every step, so the
+        # second read reuses the first instead of a second copy and collision.
+        key = (float(source.time), source.qpos.tobytes(), source.qvel.tobytes(),
+               source.mocap_pos.tobytes(), source.mocap_quat.tobytes(), selected_support)
+        if key != self._capture_key:
+            self._capture_value = self._capture_uncached(scene, source, selected_support)
+            self._capture_key = key
+        stamp, obj, tcp, sides, supported, other, measured, com = self._capture_value
+        return stamp, obj.copy(), tcp.copy(), sides, supported, other, measured, com
+
+    def _capture_uncached(self, scene, source, selected_support):
+        model, mj = scene.model, scene.mujoco
         data = self._scratch
-        mj.mj_copyData(data, model, scene.data if source_data is None else source_data)
+        mj.mj_copyData(data, model, source)
         mj.mj_kinematics(model, data)
         mj.mj_comPos(model, data)
         mj.mj_collision(model, data)
@@ -163,7 +182,6 @@ class MujocoGraspedObjectObserver:
             raise ValueError("Object observation has nonfinite native state.")
         body = int(model.body(self.object_body_name).id)
         sensors = tuple(int(model.geom(name).id) for name in self.sensor_geom_names)
-        selected_support = self._active_support_body_name if support_body_name is None else support_body_name
         if selected_support not in self.support_body_names:
             raise ValueError("Object support is not in the deployed allowlist.")
         supports = {int(model.body(selected_support).id)}

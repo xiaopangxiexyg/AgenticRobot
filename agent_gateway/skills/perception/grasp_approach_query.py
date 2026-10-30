@@ -5,7 +5,7 @@ object's top face and the surface under it from fresh RGB-D (text
 segmentation, plane fit, footprint orientation), proposes face-aligned grasps
 in a fixed preference order (the reviewed top-down grasp, the same grasp
 turned a quarter turn either way, a horizontal grasp from the arm's own side,
-a horizontal front grasp, the half-turned top-down grasp) and keeps the first
+the half-turned top-down grasp) and keeps the first
 whose approach path from the current arm state and whose straight final
 approach are collision-free. It returns the three tool_tcp poses consumed by
 ``motion.approach_grasp_pose`` (approach, pregrasp) and
@@ -64,7 +64,7 @@ def definition() -> SkillDefinition:
             "height, yaw) and the surface under it, and tries face-aligned grasps in a fixed "
             "order: top-down, top-down turned a quarter turn either way, horizontal from the "
             "arm's own side (useful when a post or box blocks the open fingers from above), "
-            "horizontal from the front, top-down turned a half turn. It returns "
+            "top-down turned a half turn. It returns "
             "the first whose path from the current arm state and whose straight final approach "
             "are collision-free (approach_family says which) and lists why earlier candidates "
             "were refused. Execute in order: "

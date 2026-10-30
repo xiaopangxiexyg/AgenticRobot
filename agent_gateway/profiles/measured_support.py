@@ -6,8 +6,10 @@ From one bound metric-depth cut and the support's semantic mask:
    bounded patch search when the whole mask does not fit one plane);
 2. sample that plane on a 2 mm grid over the mask's measured XY extent and keep
    samples whose pixel lies in the mask with planar metric depth;
-3. take the largest fully observed axis-aligned rectangle, shrink it by a
-   lateral margin and certify it with ``check_observed_support_footprint``.
+3. take the largest fully observed axis-aligned rectangle (optionally also the
+   next largest distinct ones, e.g. both free strips beside an object resting
+   on the top), shrink each by a lateral margin and certify it with
+   ``check_observed_support_footprint``.
 
 No CAD pose, native body or fixed-support assumption is used, so a free box or
 a mat qualifies the same way from simulated or real depth. Occluded or
@@ -133,6 +135,47 @@ def largest_true_rectangle(grid: np.ndarray) -> tuple[int, int, int, int] | None
     return best
 
 
+def maximal_true_rectangles(grid: np.ndarray, *, limit: int,
+                            maximum_overlap_fraction: float = .75) -> list[tuple[int, int, int, int]]:
+    """Up to ``limit`` large all-true blocks, largest first, as (row0, col0, row1, col1).
+
+    Candidates are the row-histogram maximal blocks. A later block is kept only
+    if no kept block covers more than ``maximum_overlap_fraction`` of it, so a
+    sub-block of a kept block never repeats, while two crossing free strips
+    around an obstruction are both returned. The first is ``largest_true_rectangle``.
+    """
+    if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
+        raise ValueError("limit must be a positive integer")
+    rows, cols = grid.shape
+    heights = np.zeros(cols, dtype=int)
+    found: dict[tuple[int, int, int, int], int] = {}
+    for row in range(rows):
+        heights = np.where(grid[row], heights + 1, 0)
+        stack: list[int] = []
+        for col in range(cols + 1):
+            current = int(heights[col]) if col < cols else 0
+            while stack and int(heights[stack[-1]]) >= current:
+                height = int(heights[stack.pop()])
+                left = stack[-1] + 1 if stack else 0
+                if height:
+                    found[(row - height + 1, left, row, col - 1)] = height * (col - left)
+            stack.append(col)
+
+    def overlap(a, b):
+        rows_ = min(a[2], b[2]) - max(a[0], b[0]) + 1
+        cols_ = min(a[3], b[3]) - max(a[1], b[1]) + 1
+        return max(rows_, 0) * max(cols_, 0)
+
+    chosen: list[tuple[int, int, int, int]] = []
+    # Stable on first discovery, so ties resolve exactly like largest_true_rectangle.
+    for block, area in sorted(found.items(), key=lambda item: -item[1]):
+        if all(overlap(block, other) <= maximum_overlap_fraction * area for other in chosen):
+            chosen.append(block)
+            if len(chosen) == limit:
+                break
+    return chosen
+
+
 def fit_support_top_plane(capture: LiveAlignedDepthCapture, mask: np.ndarray, *,
                           maximum_depth_m: float) -> ProjectedSupportSurface:
     """Whole-mask top fit first; a bounded local patch search when it is not one plane."""
@@ -151,6 +194,21 @@ def measure_support_top(capture: LiveAlignedDepthCapture, mask: np.ndarray, *,
                         lateral_margin_m: float = DEFAULT_LATERAL_MARGIN_M,
                         minimum_region_side_m: float = MINIMUM_REGION_SIDE_M) -> MeasuredSupportTop:
     """Certify the largest fully observed rectangle on the support's measured top."""
+    return measure_support_tops(capture, mask, maximum_depth_m=maximum_depth_m,
+                                lateral_margin_m=lateral_margin_m,
+                                minimum_region_side_m=minimum_region_side_m, limit=1)[0]
+
+
+def measure_support_tops(capture: LiveAlignedDepthCapture, mask: np.ndarray, *,
+                         maximum_depth_m: float,
+                         lateral_margin_m: float = DEFAULT_LATERAL_MARGIN_M,
+                         minimum_region_side_m: float = MINIMUM_REGION_SIDE_M,
+                         limit: int = 1) -> tuple[MeasuredSupportTop, ...]:
+    """Certify up to ``limit`` distinct fully observed rectangles, largest first.
+
+    All share one measured plane. A rectangle narrower than the minimum release
+    region after its margin is dropped; none left raises like a too-small top.
+    """
     if not isinstance(capture, LiveAlignedDepthCapture):
         raise TypeError("A bound metric-depth capture is required")
     selected = np.asarray(mask)
@@ -178,39 +236,43 @@ def measure_support_top(capture: LiveAlignedDepthCapture, mask: np.ndarray, *,
     xs = low[0] + GRID_RESOLUTION_M * np.arange(int(counts[0]))
     ys = low[1] + GRID_RESOLUTION_M * np.arange(int(counts[1]))
     grid = plane_coverage_grid(capture, selected, plane, xs=xs, ys=ys)
-    block = largest_true_rectangle(grid)
-    if block is None:
+    blocks = maximal_true_rectangles(grid, limit=limit)
+    if not blocks:
         raise ValueError("No measured support top sample is observed")
-    row0, col0, row1, col1 = block
-    region_min = np.array([xs[col0], ys[row0]]) + lateral_margin_m
-    region_max = np.array([xs[col1], ys[row1]]) - lateral_margin_m
-    if np.any(region_max - region_min < minimum_region_side_m):
-        raise ValueError("Observed support top is smaller than the minimum release region")
     observed = replace(plane,
                        observed_bounds_min_xy_m=tuple(float(value) for value in low),
                        observed_bounds_max_xy_m=tuple(float(value) for value in high))
-    coverage = check_observed_support_footprint(
-        capture, selected, observed,
-        region_min_xy_m=tuple(float(value) for value in region_min),
-        region_max_xy_m=tuple(float(value) for value in region_max),
-        resolution_m=GRID_RESOLUTION_M, maximum_plane_residual_m=MAXIMUM_PLANE_RESIDUAL_M)
     anchor = np.asarray(plane.plane_anchor_reference_xyz_m)
     normal = np.asarray(plane.normal_reference_xyz)
-    corners = np.array([[region_min[0], region_min[1]], [region_min[0], region_max[1]],
-                        [region_max[0], region_min[1]], [region_max[0], region_max[1]]])
-    corner_z = anchor[2] - (normal[0] * (corners[:, 0] - anchor[0])
-                            + normal[1] * (corners[:, 1] - anchor[1])) / normal[2]
-    # The release planner treats top_z_m as the highest support point under the
-    # footprint: keep the upper plane margin and the highest certified corner.
-    top_z = max(float(plane.upper_top_z_m), float(np.max(corner_z)))
     tilt = math.degrees(math.acos(max(-1., min(1., float(normal[2])))))
-    return MeasuredSupportTop(
-        plane=observed, coverage=coverage,
-        region_min_xy_m=tuple(float(value) for value in region_min),
-        region_max_xy_m=tuple(float(value) for value in region_max),
-        observed_min_xy_m=tuple(float(value) for value in low),
-        observed_max_xy_m=tuple(float(value) for value in high),
-        top_z_m=top_z, tilt_deg=tilt)
+    tops = []
+    for row0, col0, row1, col1 in blocks:
+        region_min = np.array([xs[col0], ys[row0]]) + lateral_margin_m
+        region_max = np.array([xs[col1], ys[row1]]) - lateral_margin_m
+        if np.any(region_max - region_min < minimum_region_side_m):
+            continue
+        coverage = check_observed_support_footprint(
+            capture, selected, observed,
+            region_min_xy_m=tuple(float(value) for value in region_min),
+            region_max_xy_m=tuple(float(value) for value in region_max),
+            resolution_m=GRID_RESOLUTION_M, maximum_plane_residual_m=MAXIMUM_PLANE_RESIDUAL_M)
+        corners = np.array([[region_min[0], region_min[1]], [region_min[0], region_max[1]],
+                            [region_max[0], region_min[1]], [region_max[0], region_max[1]]])
+        corner_z = anchor[2] - (normal[0] * (corners[:, 0] - anchor[0])
+                                + normal[1] * (corners[:, 1] - anchor[1])) / normal[2]
+        # The release planner treats top_z_m as the highest support point under the
+        # footprint: keep the upper plane margin and the highest certified corner.
+        top_z = max(float(plane.upper_top_z_m), float(np.max(corner_z)))
+        tops.append(MeasuredSupportTop(
+            plane=observed, coverage=coverage,
+            region_min_xy_m=tuple(float(value) for value in region_min),
+            region_max_xy_m=tuple(float(value) for value in region_max),
+            observed_min_xy_m=tuple(float(value) for value in low),
+            observed_max_xy_m=tuple(float(value) for value in high),
+            top_z_m=top_z, tilt_deg=tilt))
+    if not tops:
+        raise ValueError("Observed support top is smaller than the minimum release region")
+    return tuple(tops)
 
 
 def _window_any(mask: np.ndarray, radius: int) -> np.ndarray:
