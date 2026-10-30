@@ -119,7 +119,10 @@ def _dominant(channel):
 
 @pytest.mark.integration
 @pytest.mark.optional
+# The full physical chain (lift ~65 s, carry ~70 s of guarded 4 kHz physics)
+# needs ~190-230 s; the 120 s default stays for every other test.
 @pytest.mark.slow_sim
+@pytest.mark.timeout(480)
 @pytest.mark.parametrize("case", ["box_on_box", "box_near_post"])
 def test_native_queried_grasp_then_queried_release_places_the_cube(tmp_path, monkeypatch, case):
     """No scripted pregrasp: query, approach, close, lift, query release, carry, open."""

@@ -119,7 +119,10 @@ def _green_segment(image, *, language_prompt, pixel_uv, min_score):
 
 @pytest.mark.integration
 @pytest.mark.optional
+# The full physical chain (lift ~65 s, carry ~70 s of guarded 4 kHz physics)
+# needs ~190-230 s; the 120 s default stays for every other test.
 @pytest.mark.slow_sim
+@pytest.mark.timeout(480)
 def test_native_release_pose_is_carried_and_released_on_the_measured_box(tmp_path, monkeypatch):
     """Grasp, lift, query from depth only, carry to the returned pose and release on the box."""
     pytest.importorskip("mujoco")
