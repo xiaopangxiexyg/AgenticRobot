@@ -1344,7 +1344,7 @@ def test_inactive_joint_reference_and_original_drift_guard_are_preserved(
     planning = _load_offline(
         monkeypatch,
         "sim/mujoco/deploy/planned_tcp_motion.py",
-        names={"MujocoTcpPlanRejected", "MujocoPlannedTcpMotion", "_scene_serialized"},
+        names={"MujocoTcpPlanRejected", "MujocoPlannedTcpMotion", "_scene_serialized", "_measured_start"},
         namespace={
             "np": np,
             "math": math,
