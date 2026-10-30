@@ -96,23 +96,29 @@ HORIZONTAL_SURFACE_CLEARANCE_M = 0.004
 HORIZONTAL_MINIMUM_PAD_OVERLAP_M = 0.008
 HORIZONTAL_PREGRASP_BACKOFF_M = 0.035
 HORIZONTAL_APPROACH_BACKOFF_M = 0.08
-TILTED_PITCH_RAD = math.radians(35.)
 # Fixed preference order: (label, family, top-down yaw offset or None, pad shift).
 # Pads stay centered on the face: a 1 cm shift cleared a nearby post but its
 # 26 mm contact overlap exceeded the 1 mm hard penetration bound in the lift.
 # Horizontal entries carry their downward pitch instead of a top-down yaw.
+# Grasps pitched 35 deg down (side and front) are not offered: to keep the
+# fingertips off the table they hold the 35 mm cube by its top corner, and
+# every lift from one faulted on the pad contact (1.012-1.034 mm, three of
+# three, including two live Agent runs), while level side grasps lifted in
+# all seven runs. Re-add a pitch only with a lift check for its object size.
 CANDIDATES = (
     ("top_down", "top_down", 0., 0.),
     ("top_down_turned_left", "top_down", math.pi / 2., 0.),
     ("top_down_turned_right", "top_down", -math.pi / 2., 0.),
     ("side", "side", 0., 0.),
-    ("side_tilted", "side", TILTED_PITCH_RAD, 0.),
-    ("front_tilted", "front", TILTED_PITCH_RAD, 0.),
     ("top_down_half_turn", "top_down", math.pi, 0.),
 )
 SEGMENTATION_MIN_SCORE = 0.3
 PLANNING_TIME_BUDGET_SEC = 45.
-PATH_SEARCH_BUDGET_SEC = 8.
+# Per candidate path search, a wall-time budget. The level side approach next
+# to the post ran out of 8 s in two of seven live runs (the same measured
+# object planned within it in another run), and the query fell back to a
+# grasp that could not be lifted.
+PATH_SEARCH_BUDGET_SEC = 12.
 _RESULT_RESERVE_SEC = 1.0
 
 

@@ -94,6 +94,26 @@ def test_minimum_area_rectangle_recovers_box_yaw_modulo_quarter_turns(yaw_deg):
     assert np.all(np.abs(extent - .035) < .002)
 
 
+def test_grasp_candidates_offer_level_face_grasps_only():
+    """Pitched face grasps held the 35 mm cube by its corner and faulted every lift."""
+    from types import SimpleNamespace
+
+    from agent_gateway.profiles.mujoco import grasp_approach_query as query
+
+    top = SimpleNamespace(yaw_rad=.01, center_xy_m=(-.19, .02), top_z_m=.036)
+    candidates = query.candidate_grasps(top, surface_z=.001, motion_side="right")
+    assert [item[0] for item in candidates] == [
+        "top_down", "top_down_turned_left", "top_down_turned_right", "side", "top_down_half_turn"]
+    for label, family, _offset, approach, pregrasp, contact in candidates:
+        if family == "top_down":
+            continue
+        # tool z is the approach axis: horizontal for every face grasp.
+        for pose in (approach, pregrasp, contact):
+            assert abs(pose[2, 2]) < 1e-9, label
+    # Without a measured surface ring only top-down grasps are proposed.
+    assert {item[1] for item in query.candidate_grasps(top, surface_z=None, motion_side="right")} == {"top_down"}
+
+
 def _color_segment(rgb_rule):
     def segment(image, *, language_prompt, pixel_uv, min_score):
         from deployments.perception.sam2_grounding_dino import GroundedObjectSegment
