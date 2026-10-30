@@ -92,6 +92,18 @@ core and MuJoCo adapter used for the 20260721 fit; tests compare those hashes to
 fixed historical values rather than silently reinterpreting the fit against
 the current files.
 
+MuJoCo 持物放置第二批（批次 2/2b/2c）使用独立绑定
+`artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261030_mujoco_agent_place_v2.json`。它固定于合并提交
+`eb44be38a`（development `a0121721f` + 任务分支 `bb8aacdff`），保留前一绑定（真机持物放置）的全部非运行时引用；
+192 项运行时输入中 9 项改变（MuJoCo 持物运动规划、对象运动生命周期、持物观测、放置与抓取查询及其度量、
+Gateway 装配），没有新绑定的源码。行为变化均为默认关闭的 MuJoCo 放置链：持物运动从机械臂当前保持的关节指令出发
+（与测量值相差不超过 5 mrad 时），关节速度减半；目标保持 0.5 s 仿真时间；持物终点 IK 须在路由容差内再留出
+1 mm/0.5° 的下垂余量，路径走完后 TCP 在 1.5 s 内未进入容差即带 HOLD 失败；释放查询依次尝试最多三块已认证的
+空闲矩形；抓取查询只提供水平侧抓和俯抓（去掉 35° 俯斜侧抓），每个候选的路径搜索 12 s；持物观测对同一原生状态复用一次
+采样。1 mm 硬穿透、3 mm/2° 滑移、50 ms 观测间隔和 0.6 s 释放窗口均未改变。离线证据按内容哈希记录：772 项关联测试
+（当前绑定测试在本绑定前排除）与 DeepSeek Agent 放置套件运行台账（queue-b-03/04）。绑定仍为 `provisional`，没有新增
+标定、真机运动执行或 held-out 资格。
+
 RealMan 真机持物搬运发布默认关闭的 `motion.move_grasped_object_to_pose@1`（动作
 `move_grasped_object_to_pose`，物体 `<side>_held_object`），使用独立绑定
 `artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261030_real_place_v1.json`。它固定于提交
