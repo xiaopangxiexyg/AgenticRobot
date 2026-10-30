@@ -517,13 +517,23 @@ def test_release_candidates_opt_in_to_the_feasible_position_nearest_the_held_obj
     half, margin = .0175, .005
     expected = (-.33 - margin - half, -.02 + margin + half)
     for item in (nearest[1], nearest[7]):
-        np.testing.assert_allclose(item.box_center_xy_m, expected, atol=1e-12)
+        np.testing.assert_allclose(item.box_center_xy_m, expected, atol=2e-6)
     assert (nearest[1].yaw_offset_rad, nearest[7].yaw_offset_rad) == (0., -math.pi / 2.)
     corners = np.asarray([(x, y, z) for x in (-half, half) for y in (-half, half) for z in (-half, half)])
     for item in nearest:
         world = corners @ item.proposal.object_goal[:3, :3].T + item.proposal.object_goal[:3, 3]
         assert np.all(world[:, :2].min(axis=0) >= np.asarray(surface.region_min_xy_m) + margin - 1e-12)
         assert np.all(world[:, :2].max(axis=0) <= np.asarray(surface.region_max_xy_m) - margin + 1e-12)
+    # Positions clipped onto the feasible boundary never fail the footprint check,
+    # whatever the held pose and yaw (the live mat chain hit a last-bit refusal).
+    rng = np.random.default_rng(3)
+    for _ in range(200):
+        xyz = (rng.uniform(-.5, -.25), rng.uniform(-.12, .16), .0766)
+        tilted = observation(box_size_m=(.035, .035, .035),
+                             reference_from_object=pose(xyz, (rng.uniform(-1, 1), rng.uniform(-1, 1),
+                                                              rng.uniform(-180, 180))))
+        plan_release_approach_candidates(tilted, surface, yaw_offsets_rad=(0., -math.pi / 4., math.pi / 2.),
+                                         include_nearest_to_held=True, **options)
     # Held right over the center: the nearest position is the center and is not repeated.
     above = observation(box_size_m=(.035, .035, .035), reference_from_object=pose((-.37, .02, .0766)))
     assert len(plan_release_approach_candidates(above, surface, include_nearest_to_held=True, **options)) == 5

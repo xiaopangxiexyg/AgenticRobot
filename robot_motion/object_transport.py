@@ -639,7 +639,10 @@ def plan_release_approach_candidates(
             span = np.where(fraction >= 0., feasible_max-center, center-feasible_min)
             positions.append(center + fraction * span)
         if include_nearest_to_held:
-            positions.insert(1, np.clip(held_box_center, feasible_min, feasible_max))
+            # Inset by 1 um: a position clipped onto the feasible boundary must
+            # not fail the footprint check on the last bit.
+            inset = min(1e-6, float(np.min(feasible_max - feasible_min)) / 2.)
+            positions.insert(1, np.clip(held_box_center, feasible_min + inset, feasible_max - inset))
         for box_center in positions:
             if np.any(box_center < feasible_min) or np.any(box_center > feasible_max):
                 continue
