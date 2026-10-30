@@ -684,3 +684,77 @@ def test_diagnostic_read_rejects_reversed_time_without_altering_evidence():
     with pytest.raises(ValueError, match="went backwards"):
         observer.diagnostic_snapshot()
     assert observer.latest is first
+
+
+_CAPTURE_MJCF = """
+<mujoco>
+  <worldbody>
+    <body name="table" pos="0 0 -0.05"><geom name="table_geom" type="box" size="0.3 0.3 0.05"/></body>
+    <body name="cube" pos="0 0 0.0174"><freejoint/>
+      <geom name="cube_geom" type="box" size="0.0175 0.0175 0.0175" mass="0.025"/></body>
+    <body name="left_body" pos="0 0.027 0.0174"><geom name="left_sensor" type="box" size="0.01 0.01 0.01"/></body>
+    <body name="right_body" pos="0 -0.027 0.0174"><geom name="right_sensor" type="box" size="0.01 0.01 0.01"/></body>
+  </worldbody>
+</mujoco>
+"""
+
+
+def test_capture_reuses_an_identical_native_state_and_recomputes_any_change():
+    """The payload guard and the step observer read one state; the second read is reused."""
+    import mujoco
+
+    model = mujoco.MjModel.from_xml_string(_CAPTURE_MJCF)
+    data = mujoco.MjData(model)
+    mujoco.mj_forward(model, data)
+    collisions = []
+
+    def mj_collision(m, d):
+        collisions.append(d)
+        mujoco.mj_collision(m, d)
+
+    class Scene:
+        """Copyable like the native scene: views read their own data."""
+
+        def __init__(self):
+            self.model, self.data = model, data
+            self.mujoco = SimpleNamespace(MjData=mujoco.MjData, mj_copyData=mujoco.mj_copyData,
+                                          mj_kinematics=mujoco.mj_kinematics, mj_comPos=mujoco.mj_comPos,
+                                          mj_collision=mj_collision)
+
+        def body_pose(self, name):
+            body = self.model.body(name).id
+            pose = np.eye(4)
+            pose[:3, :3] = self.data.xmat[body].reshape(3, 3)
+            pose[:3, 3] = self.data.xpos[body]
+            return pose
+
+        def get_gripper_close(self, name):
+            return .5
+
+    scene = Scene()
+    observer = MujocoGraspedObjectObserver(
+        rig=SimpleNamespace(capture_scene=lambda callback: callback(scene)), object_body_name="cube",
+        sensor_geom_names=("left_sensor", "right_sensor"), support_body_names=("table", "left_body"),
+        gripper_name="right", command_state=lambda: (1, 1.), world_tcp_from_scene=lambda view: np.eye(4))
+    first = observer._capture(scene)
+    assert first[3] == (True, True) and first[4] is True and first[5] is False
+    again = observer._capture(scene)
+    assert len(collisions) == 1
+    np.testing.assert_array_equal(first[1], again[1])
+    # Callers get their own arrays; mutating one does not change the next read.
+    again[1][0, 3] = 99.
+    assert observer._capture(scene)[1][0, 3] == pytest.approx(0.)
+    # A private copy of the same state (the payload guard's view) reuses it too.
+    twin = mujoco.MjData(model)
+    mujoco.mj_copyData(twin, model, data)
+    observer._capture(scene, twin)
+    assert len(collisions) == 1
+    # Any state change, or another selected support, is measured afresh.
+    data.qpos[0] += .001
+    moved = observer._capture(scene)
+    assert len(collisions) == 2 and moved[1][0, 3] == pytest.approx(.001)
+    observer._capture(scene, support_body_name="left_body")
+    assert len(collisions) == 3
+    data.time += model.opt.timestep
+    observer._capture(scene)
+    assert len(collisions) == 4
