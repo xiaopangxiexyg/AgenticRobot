@@ -234,6 +234,10 @@ def build_parser() -> argparse.ArgumentParser:
         help=('Publish read-only perception.query_tool_hover_paths@1 (gripper-box hover paths checked on the observed '
               'RGB-D scene by a private safe TCP planner, never activated); requires --enable-surface-anchor-v2 and '
               '--enable-observed-point-motion.'))
+    parser.add_argument('--tool-hover-candidate-budget-sec', type=float, default=None,
+        help='Planning budget per hover proposal (default 5; at most 120 and the region budget).')
+    parser.add_argument('--tool-hover-region-budget-sec', type=float, default=None,
+        help='Total hover search budget per request (default 20; at most 240).')
     parser.add_argument('--safe-tcp-motion-profile', choices=tuple(MUJOCO_SAFE_TCP_MOTION_PROFILES), default='local_step', help='Explicit sim-only safe Route limits; ordinary Routes stay unchanged.')
     parser.add_argument(
         "--enable-spatial-goals",
@@ -741,6 +745,20 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--enable-tool-object-relations requires --artifact-root, segmentation and --enable-safe-tcp-pose")
     if args.enable_tool_hover_queries and not (args.enable_surface_anchor_v2 and args.enable_observed_point_motion):
         parser.error("--enable-tool-hover-queries requires --enable-surface-anchor-v2 and --enable-observed-point-motion")
+    if not args.enable_tool_hover_queries and (args.tool_hover_candidate_budget_sec is not None
+                                               or args.tool_hover_region_budget_sec is not None):
+        parser.error("--tool-hover-*-budget-sec requires --enable-tool-hover-queries")
+    if args.enable_tool_hover_queries:
+        from robot_motion.tool_entity_scene import (
+            ENTITY_HOVER_CANDIDATE_BUDGET_SEC, ENTITY_HOVER_REGION_BUDGET_SEC, validate_hover_budgets)
+        try:
+            validate_hover_budgets(
+                region_budget_sec=(ENTITY_HOVER_REGION_BUDGET_SEC if args.tool_hover_region_budget_sec is None
+                                   else args.tool_hover_region_budget_sec),
+                candidate_budget_sec=(ENTITY_HOVER_CANDIDATE_BUDGET_SEC if args.tool_hover_candidate_budget_sec is None
+                                      else args.tool_hover_candidate_budget_sec))
+        except ValueError as error:
+            parser.error(f"invalid tool hover budget: {error}")
     if args.sam3_multi_instance_text and not args.enable_object_localization:
         parser.error("--sam3-multi-instance-text requires --enable-object-localization")
     if args.enable_object_support_motion_v2 != bool(args.object_support_body):
@@ -972,6 +990,8 @@ def main(argv: list[str] | None = None) -> int:
         safe_motion_observation=safe_motion_observation,
         enable_tool_object_relations=args.enable_tool_object_relations,
         enable_tool_hover_queries=args.enable_tool_hover_queries,
+        tool_hover_region_budget_sec=args.tool_hover_region_budget_sec,
+        tool_hover_candidate_budget_sec=args.tool_hover_candidate_budget_sec,
         enable_safe_tcp_path_constraints=args.enable_safe_tcp_path_constraints,
         enable_tcp_continuation_queries=args.enable_tcp_continuation_queries,
         enable_tcp_candidate_artifacts=args.enable_tcp_candidate_artifacts,

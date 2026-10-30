@@ -1,6 +1,7 @@
 """Explicit capture policy boundaries; no device or motion resources."""
 from dataclasses import replace
 import json
+from pathlib import Path
 from xml.etree import ElementTree as ET
 
 import numpy as np
@@ -53,6 +54,28 @@ def test_explicit_json_roundtrips_and_changes_input_binding(tmp_path):
         tool_tcp_pose_flange_m_rad_by_side={side: np.zeros(6) for side in ('left', 'right')})
     assert calibrated.input_binding_hash != filt.input_binding_hash
     assert Filter.for_binding(urdf_path=path).input_binding_hash is None
+
+
+@pytest.mark.parametrize("size", [.055, .060])
+def test_explicit_extended_tool_shell_is_bounded_without_changing_defaults(size):
+    config = Config(geometry_mode="cad_surface", tool_surface_bounds_m=((-size, size),)*3)
+    assert config.tool_surface_bounds_m[0] == (-size, size)
+    assert Config().tool_surface_bounds_m is None
+    with pytest.raises(ValueError, match="60 mm"):
+        Config(geometry_mode="cad_surface", tool_surface_bounds_m=((-0.060001, .05),)*3)
+    with pytest.raises(ValueError, match="explicit geometry_mode"):
+        Config(tool_surface_bounds_m=((-size, size),)*3)
+
+
+def test_tool_shell_matches_surface_not_expanded_box():
+    from robot_motion.rm65.captured_robot_observations import _asymmetric_surface_membership
+    config = Config.from_json_file(Path(__file__).resolve().parents[1]
+        / 'teleop_runtime/configs/skill_deploy/rm65_captured_self_cad_cables_v1.json')
+    # Robot-local signed ellipsoid, not a world/pixel exception or cube inflation.
+    points = np.array([[.054, 0, 0], [.058, 0, 0], [.05, .04, 0]])
+    matched = _asymmetric_surface_membership(points, np.zeros((1, 3)),
+        np.asarray(config.tool_surface_bounds_m), normalized_squared_limit=config.tool_surface_normalized_squared_limit)
+    np.testing.assert_array_equal(matched, [True, False, False])
 
 
 @pytest.mark.parametrize("option", ["observation_urdf_path", "self_observation_proxy_urdf_path"])

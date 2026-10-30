@@ -93,7 +93,7 @@ class MujocoObservedSafeMotionConfig:
         identity = canonical_content_hash({
             "robot_geometry": _urdf_geometry_identity(self.robot_urdf_path),
             "collision_model": collision,
-            "observation": asdict(self.observation),
+            "observation": self.observation.identity_payload(),
             "maximum_start_drift_rad": self.maximum_start_drift_rad,
             "maximum_inter_camera_skew_sec": self.maximum_inter_camera_skew_sec,
             "self_filter": asdict(RM65CapturedRobotObservationFilterConfig()),

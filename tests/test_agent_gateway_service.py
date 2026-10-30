@@ -506,9 +506,18 @@ def _authoritative_emergency_service(
 
 
 def test_domain_emergency_stop_without_active_operation_has_lower_proof() -> None:
-    service, _, emergency_port, _, manifest, _ = (
+    service, station_port, emergency_port, _, manifest, _ = (
         _authoritative_emergency_service()
     )
+    initial = service.domain_control_state()
+    assert initial == {
+        "schema": "agent_gateway.domain_control_state.v1",
+        "runtime_session_id": manifest.runtime_session_id,
+        "emergency_stop_latched": False,
+        "emergency_stop_confirmed": False,
+        "lower_stop_receipt_ref": None,
+    }
+    assert station_port.calls == emergency_port.calls == []
 
     outcome = service.request_emergency_stop_own_domain(
         request=_emergency_stop_request(manifest),
@@ -524,6 +533,118 @@ def test_domain_emergency_stop_without_active_operation_has_lower_proof() -> Non
     assert service.emergency_stop_latched
     assert service.emergency_stop_confirmed
     assert emergency_port.calls == [(None, "agent_task_aborted")]
+    observed = service.domain_control_state()
+    assert observed == {
+        **initial,
+        "emergency_stop_latched": True,
+        "emergency_stop_confirmed": True,
+        "lower_stop_receipt_ref": outcome.port_receipt.receipt_id,
+    }
+    assert initial["emergency_stop_latched"] is False
+    observed["emergency_stop_latched"] = False
+    assert service.domain_control_state()["emergency_stop_latched"] is True
+    assert station_port.calls == []
+    assert emergency_port.calls == [(None, "agent_task_aborted")]
+
+
+def test_domain_control_state_does_not_reuse_historical_stop_confirmation(
+    monkeypatch,
+) -> None:
+    service, station_port, port, _, manifest, _ = _authoritative_emergency_service()
+    confirmed = service.request_emergency_stop_own_domain(
+        request=_emergency_stop_request(manifest), now=10.1)
+    assert confirmed.accepted
+    make_receipt = port.request_emergency_stop
+
+    def unconfirmed_receipt(**kwargs):
+        return replace(make_receipt(**kwargs), succeeded=False, proves_motion_or_hold=False)
+
+    monkeypatch.setattr(port, "request_emergency_stop", unconfirmed_receipt)
+    unconfirmed = service.request_emergency_stop_own_domain(
+        request=_emergency_stop_request(manifest, idempotency_key="second-stop"), now=10.2)
+    assert not unconfirmed.accepted
+    calls = list(port.calls)
+    state = service.domain_control_state()
+    assert state["runtime_session_id"] == manifest.runtime_session_id
+    assert state["emergency_stop_latched"] is True
+    assert state["emergency_stop_confirmed"] is False
+    assert state["lower_stop_receipt_ref"] == unconfirmed.port_receipt.receipt_id
+    assert state["lower_stop_receipt_ref"] != confirmed.port_receipt.receipt_id
+    assert port.calls == calls
+    assert station_port.calls == []
+
+
+def test_domain_control_state_does_not_confirm_a_rejected_unproven_receipt(monkeypatch) -> None:
+    service, _, port, _, manifest, _ = _authoritative_emergency_service()
+    make_receipt = port.request_emergency_stop
+    monkeypatch.setattr(port, "request_emergency_stop", lambda **kwargs:
+        replace(make_receipt(**kwargs), proves_motion_or_hold=False))
+    with pytest.raises(ValueError, match="Successful emergency stop must prove"):
+        service.request_emergency_stop_own_domain(request=_emergency_stop_request(manifest), now=10.1)
+    state = service.domain_control_state()
+    assert state["emergency_stop_latched"] is True
+    assert state["emergency_stop_confirmed"] is False
+    assert state["lower_stop_receipt_ref"] is None
+    assert port.calls == [(None, "agent_task_aborted")]
+
+
+def test_domain_control_state_observes_pending_stop_without_waiting_for_lower_io(monkeypatch) -> None:
+    service, station_port, port, _, manifest, _ = _authoritative_emergency_service()
+    entered, release = threading.Event(), threading.Event()
+    outcomes = []
+    make_receipt = port.request_emergency_stop
+
+    def blocking_stop(**kwargs):
+        entered.set()
+        assert release.wait(timeout=2.0)
+        return make_receipt(**kwargs)
+
+    monkeypatch.setattr(port, "request_emergency_stop", blocking_stop)
+    worker = threading.Thread(target=lambda: outcomes.append(
+        service.request_emergency_stop_own_domain(request=_emergency_stop_request(manifest), now=10.1)))
+    worker.start()
+    try:
+        assert entered.wait(timeout=1.0)
+        state = service.domain_control_state()
+        assert state["emergency_stop_latched"] is True
+        assert state["emergency_stop_confirmed"] is False
+        assert state["lower_stop_receipt_ref"] is None
+        assert port.calls == station_port.calls == []
+    finally:
+        release.set()
+        worker.join(timeout=2.0)
+        assert not worker.is_alive()
+    assert len(outcomes) == 1 and outcomes[0].accepted
+    assert service.domain_control_state()["emergency_stop_confirmed"] is True
+
+
+@pytest.mark.parametrize("succeeds", [False, True])
+def test_domain_state_observes_latch_before_lower_receipt_without_new_io(succeeds):
+    service, _, emergency_port, _, manifest, _ = _authoritative_emergency_service(
+        emergency_stop_succeeds=succeeds)
+    initial = service.domain_control_state()
+    assert initial == {"schema": "agent_gateway.domain_control_state.v1",
+        "runtime_session_id": manifest.runtime_session_id, "emergency_stop_latched": False,
+        "emergency_stop_confirmed": False, "lower_stop_receipt_ref": None}
+    assert emergency_port.calls == []
+    original = emergency_port.request_emergency_stop
+    observed = []
+
+    def stop(**kwargs):
+        observed.append(service.domain_control_state())
+        return original(**kwargs)
+
+    emergency_port.request_emergency_stop = stop
+    service.request_emergency_stop_own_domain(request=_emergency_stop_request(manifest), now=10.1)
+    assert observed[0]["emergency_stop_latched"] is True
+    assert observed[0]["emergency_stop_confirmed"] is False
+    final = service.domain_control_state()
+    assert final["emergency_stop_latched"] is True
+    assert final["emergency_stop_confirmed"] is succeeds
+    calls = list(emergency_port.calls)
+    final["emergency_stop_latched"] = False
+    assert service.domain_control_state()["emergency_stop_latched"] is True
+    assert emergency_port.calls == calls
 
 
 def test_domain_emergency_stop_preempts_motion_and_latches_admission() -> None:

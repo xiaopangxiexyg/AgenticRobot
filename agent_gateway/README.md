@@ -69,6 +69,25 @@ event replay and generic operations to begin/upload/commit an Artifact,
 begin/read/acknowledge a download, and acknowledge an upper-owned durable
 materialization.
 
+Authenticated `healthz` also projects `domain_control_state` using
+`agent_gateway.domain_control_state.v1`: the current runtime identity, the
+Gateway owner's stop latch, confirmation backed by its lower receipt, and
+that receipt's reference. Reading it performs no device polling, Skill, HOLD,
+stop or recovery. It does not certify physical motion readiness. Clients must
+treat absent or unreadable state as unknown rather than infer readiness from
+transport `status=ok`.
+
+The real application binds its existing fault/lifecycle reader once during
+startup. `control_fault_reason` is bounded and read afresh from that reader.
+The only transport latch is the submission fence that a session without a
+gripper owner retains after a control-loop fault (see
+`docs/agent_gateway/README.md`); once set, `healthz` reports its stable reason
+code, for example `lower_backend_not_ready`, and both Skill submission methods
+are rejected with `control_fault_latched`. Non-running/faulted application
+states remain visible to clients, and failed reads produce an error instead of
+a healthy snapshot. Queue orchestration remains an upper-framework
+responsibility.
+
 There is no RGB- or depth-image method in the protocol. A capture Skill declares
 its selection parameters, output Artifact slots with media/schema/size
 constraints, and a normal executor binding. The same machinery supports point
@@ -554,6 +573,11 @@ consecutive-fresh-frame admission are unchanged. The effective policy is part
 of the source binding identity; missing cameras fail admission, not RGB-only
 fallback. The default policy remains unchanged for existing consumers.
 
+仓库的 `agent_gateway_realsense.json` 使用原 `metadata.startup_priority` 配置左腕 `0`
+→ 主相机 `10` → 右腕 `20`，由原串行 owner 按约 0.5 秒错峰。角色、序列号和流配置不变；
+Gateway 与只读快照复用同一配置，自定义优先级仍由其配置决定。
+只读 SDK 连接检查可使用同一探针的 `--arm-read-check`，不会启动或重开相机。
+
 可选 `--camera-sdk-debug-log NEW_ABSOLUTE_PATH` 保存原生 DEBUG 日志和 SDK/启动上下文，
 不改变相机流、reset 或新鲜度要求。默认不启用；现有文件和符号链接均拒绝覆盖。
 启用日志会提前导入 SDK，单次成功不能据此证明初始化时序问题已根治。
@@ -621,6 +645,13 @@ lower 测量发布与 `RM65RgbCameraGeometry`。这条入口按已对齐 RGB-D �
 
 `--enable-object-localization` adds the supplied-image localization Route using
 the default SAM3 service client. `--enable-point-grasp` is a separate,
+可选 `real-rm65 --camera-single-start` 复用相机只读入口已有的单次启动策略，并在
+来源绑定计算前关闭软件重试、运行时重开和 hardware reset。该开关默认关闭，要求
+完整的相机/registry/Artifact 配置；不改变序列号、流格式、串行优先级、新鲜度准入或
+相机 owner。现场验收可以显式启用，避免把旧配置中的 reset/retry 带入本轮会话。
+
+`--enable-object-localization` adds the supplied-image localization Route after
+loading its reviewed model bundle. `--enable-point-grasp` is a separate,
 default-off module and requires that same localizer plus a reviewed point-grasp
 bundle. GraspGenX in-process inference is the default and does not require a
 loopback service; VGN, GraspNet, and service-mode GraspGenX are explicit
@@ -1035,6 +1066,13 @@ GraspMoE 保留固定版本的插入深度，在 -4～0 cm 区间使用 5 mm 间
 不改变 FCL 几何或 20 mm 最小间距，并分别记录 URDF、容差、删除计数和语义哈希。
 旧的绝对抓姿入口没有保留候选的 RGB-D 快照绑定，不提供这项
 观测夹爪检查；本轮验证建议使用成对的只读规划入口。
+
+真实 Gateway 的静态观测几何由现有会话资源在相机启动前准备，复用同一个自体过滤器
+和规划器模板；模型资源仍在相机准入后启动，随后才启动下层机械臂资源。
+缺失 Pinocchio、trimesh、Embree 或 CAD 资产时直接保留原异常，既不开启也不关闭未启动的
+相机，不进入机械臂启动。环境名、CLI `--help` 或仅检查文件存在均不能代替运行时验收；
+应使用最终启动解释器检查 `README_ENV.md` 中的锁定依赖及实际射线查询。
+不会因缺少 CAD 查询后端而跳过自体过滤或自动切换到另一解释器。
 
 实时 GraspGenX Route 增加可发现的 `point_grasp_rgbd_snapshot` 输出 Artifact，
 保存该次原始 RGB、float32 米制深度、SAM2 掩码、内参/外参和相机附近

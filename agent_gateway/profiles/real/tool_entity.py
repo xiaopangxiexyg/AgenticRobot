@@ -58,6 +58,11 @@ class RealToolEntityOptions:
     public_from_geometry: np.ndarray
     hover_planner: RealToolHoverPlanner | None = None
     hover_roles: tuple[str, ...] = ()
+    hover_region_budget_sec: float | None = None
+    hover_candidate_budget_sec: float | None = None
+    # Real held-object motion (object_id, object_workspace_bounds,
+    # clock_domain_id); it measures the held object with the relation scene port.
+    object_motion: Mapping[str, object] | None = None
 
     def __post_init__(self):
         if type(self.enable_relations) is not bool or type(self.enable_hover) is not bool:
@@ -68,6 +73,10 @@ class RealToolEntityOptions:
             raise TypeError("tool_tcp_poses must be callable.")
         if self.enable_hover != (self.hover_planner is not None) or (self.enable_hover and not self.hover_roles):
             raise ValueError("Hover queries need their planner and observed-scene roles.")
+        if self.object_motion is not None and (
+                not self.enable_relations
+                or set(self.object_motion) != {"object_id", "object_workspace_bounds", "clock_domain_id"}):
+            raise ValueError("Held-object motion needs tool-object relations and its exact binding.")
 
 
 class RealToolScenePort:

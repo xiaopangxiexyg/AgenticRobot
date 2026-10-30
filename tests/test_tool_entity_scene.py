@@ -235,3 +235,21 @@ def test_mask_surface_respects_depth_range_and_erosion():
     assert evidence["mask_erosion_px"] == scene.OBJECT_MASK_EROSION_PX
     with pytest.raises(ValueError):
         scene.object_surface_from_mask(np.zeros((10, 10), bool), capture, maximum_depth_m=1.5)
+
+
+@pytest.mark.parametrize(("region", "candidate"), [
+    (0., 0.), (20., 0.), (float("inf"), 3.), (20., float("nan")), (True, 3.), (20., 30.),
+    (scene.MAX_ENTITY_HOVER_REGION_BUDGET_SEC + 1., 3.), (200., scene.MAX_ENTITY_HOVER_CANDIDATE_BUDGET_SEC + 1.),
+])
+def test_hover_budgets_are_bounded_and_ordered(region, candidate):
+    with pytest.raises(ValueError):
+        scene.validate_hover_budgets(region_budget_sec=region, candidate_budget_sec=candidate)
+
+
+def test_relaxed_budgets_reach_every_candidate_and_the_summary():
+    assert scene.validate_hover_budgets(region_budget_sec=60, candidate_budget_sec=15) == (60., 15.)
+    retry = scene.HoverPlanOutcome(status="path_rejected", reason="ik_search_exhausted", retryable=True)
+    result, calls = _search([retry], region_budget_sec=60., candidate_budget_sec=15.)
+    assert (result["region_budget_sec"], result["candidate_budget_sec"]) == (60., 15.)
+    assert calls and all(0. < budget <= 15. for _, budget in calls)
+    assert max(budget for _, budget in calls) > scene.ENTITY_HOVER_CANDIDATE_BUDGET_SEC

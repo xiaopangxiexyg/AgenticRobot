@@ -592,6 +592,14 @@ class _LegacyRealTeleopOwnerAdapter:
         )
 
 
+class RealAgentMotionActivationFenced(RuntimeError):
+    """A fatal owner fault cannot be rearmed by a late planner."""
+
+    def __init__(self, reason: str) -> None:
+        self.reason = reason
+        super().__init__("real_motion_control_fault_latched: " + reason)
+
+
 class RealAgentMotionPort:
     """Thread-safe request mailbox with control-thread-only effects."""
 
@@ -638,6 +646,7 @@ class RealAgentMotionPort:
         self._hold_applied_at: float | None = None
         self._hold_succeeded: bool | None = None
         self._fault: str | None = None
+        self._activation_fault_reason: str | None = None
         # Preplanned paths use a committed logical clock. A slow observation,
         # expired reference, or other non-dispatch cycle must not advance the
         # path by wall time and then release a future target in one frame.
@@ -715,6 +724,7 @@ class RealAgentMotionPort:
                 raise RuntimeError("real Agent owner is not exclusively attached.")
             if (
                 self._phase == RealAgentMotionPhase.FAULTED
+                or self._activation_fault_reason is not None
                 or lifecycle_state == "fault"
             ):
                 lifecycle_state, execution_gate = "fault", "fault"
@@ -819,6 +829,19 @@ class RealAgentMotionPort:
 
         return self._target_builder is target_builder
 
+    def fence_activations(self, reason: str) -> None:
+        """Latch fatal owner failure at the same lock as activation admission.
+
+        An earlier accepted target is covered by the owner's subsequent HOLD;
+        a late planner cannot replace that HOLD after the control loop stops.
+        """
+        normalized = _required(reason, field_name="control_fault_reason")
+        with self._lock:
+            if self._activation_fault_reason is None:
+                self._activation_fault_reason = normalized
+                self._fault = normalized
+                self._advance_revision()
+
     def submit_activation(
         self,
         activation: RealAgentMotionActivation,
@@ -850,6 +873,8 @@ class RealAgentMotionPort:
                     "preplanned trajectory cannot move the unauthorized inactive arm."
                 )
         with self._lock:
+            if self._activation_fault_reason is not None:
+                raise RealAgentMotionActivationFenced(self._activation_fault_reason)
             if self._phase not in {
                 RealAgentMotionPhase.INACTIVE,
                 RealAgentMotionPhase.HELD,
@@ -1529,6 +1554,7 @@ __all__ = [
     "REAL_AGENT_TRAJECTORY_START_MAX_DRIFT_RAD",
     "RealAgentJointTrajectory",
     "RealAgentMotionActivation",
+    "RealAgentMotionActivationFenced",
     "RealAgentMotionMeasuredPoseCut",
     "RealAgentMotionMeasuredQposCut",
     "RealAgentMotionOwnerCut",

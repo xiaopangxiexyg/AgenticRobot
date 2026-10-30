@@ -31,6 +31,9 @@ MAX_HOVER_CANDIDATES = 8
 MAX_HOVER_TIP_OFFSET_M = 0.25
 MAX_HOVER_CLEARANCE_M = 0.30
 MAX_TOOL_AXIS_TILT_RAD = math.radians(60.)
+# Agent-facing order: the general horizontal approaches first, top-down last.
+HOVER_ORIENTATION_POLICY_IDS = ("tool_axis_forward", "tool_axis_left", "tool_axis_right", "preserve",
+                                "tool_axis_down")
 RELATION_CLASSES = ("between_fingers_in_contact_band", "between_fingers", "in_contact_band", "near", "far",
                     "insufficient_surface")
 UNMEASURED_REASONS = ("no_mask_above_threshold", "no_valid_depth", "relation_budget_exhausted")
@@ -264,8 +267,18 @@ def hover_definition() -> SkillDefinition:
             "Find a collision-checked path that hovers the bound arm's gripper box above an "
             "authenticated surface anchor: the box tip centre lies within explicit horizontal offsets of "
             "the anchor, and the box's lowest point keeps an explicit clearance above the highest "
-            "observed point under its footprint. Orientation preserves the current tool or turns the "
-            "tool axis down (optionally within a tilt cone). The Gateway captures the observed scene, "
+            "observed point under its footprint. Orientation: the gripper normally approaches "
+            "horizontally. tool_axis_forward turns its approach axis (TCP +Z) toward Station +X, "
+            "coming from the robot side (the default); tool_axis_left / tool_axis_right turn it "
+            "toward Station +Y / -Y, coming from the object's right / left side, i.e. the right / "
+            "left arm approaching from its own side, often better for objects near the central "
+            "camera pole, close to the arm or when the forward approach is rejected. A tilt cone "
+            "accepts an approach axis within that angle of the policy axis (the measured tool is kept "
+            "if already inside, otherwise turned only to the cone boundary). preserve keeps the current tool (use it when the arm "
+            "already holds a suitable level posture), and tool_axis_down turns the approach axis "
+            "straight down (only when a top-down approach is explicitly required; exactly-down "
+            "hovers are often out of reach). \"Above the object\" names a position, not a top-down "
+            "orientation. The Gateway captures the observed scene, "
             "plans each proposal with the deployment's safe-motion planner from the measured state, "
             "re-measures the achieved pose against the original bounds and returns the first certified "
             "proposal (target_tcp_pose_xyz_quat_xyzw) with the pose it actually reached "
@@ -274,7 +287,9 @@ def hover_definition() -> SkillDefinition:
             "again before any motion. To keep the executed hover inside the bounds, submit "
             "planned_endpoint_pose_xyz_quat_xyzw with pose_goal_policy=preserve_target; the default policy "
             "may arrive anywhere inside its arrival tolerance, which can move the gripper tip or lowest "
-            "point by about 2 cm."),
+            "point by about 2 cm. Its surface_anchor input is the surface_anchor output Artifact of a completed "
+            "perception.capture_surface_anchor@2 operation in this session. query_incomplete means the "
+            "deployment's search budget ended first, not that no path exists."),
         intended_target_kind="target_agnostic", cross_target_deployment_policy="not_applicable",
         controlled_component_ids=(),
         parameter_semantics_id="artifact_surface_anchor.tool_entity_hover_bounds.v1",
@@ -301,9 +316,20 @@ def hover_schema(*, definition_hash, profile_hash, component_ids, reference_fram
         "clearance_bounds_m": {**interval, "description": (
             "Allowed vertical gap between the box's lowest point and the highest observed point under "
             f"its footprint, an ordered interval within [0, {MAX_HOVER_CLEARANCE_M}] m.")},
-        "orientation_policy": {"type": "string", "enum": ["preserve", "tool_axis_down"]},
+        "orientation_policy": {"type": "string", "enum": list(HOVER_ORIENTATION_POLICY_IDS),
+            "description": ("tool_axis_forward: approach axis horizontal toward Station +X (from the "
+                            "robot side), the default; tool_axis_left / tool_axis_right: approach axis "
+                            "horizontal toward +Y / -Y (from the object's right / left side; right_arm "
+                            "uses tool_axis_left, left_arm tool_axis_right to approach from its own "
+                            "side, e.g. near the central pole); preserve: keep the measured tool "
+                            "orientation; tool_axis_down: approach axis straight down, only for an "
+                            "explicit top-down request.")},
         "tool_axis_max_tilt_rad": {"type": "number", "minimum": 0.0, "maximum": MAX_TOOL_AXIS_TILT_RAD,
-            "description": "Cone around straight down for tool_axis_down; 0 for exactly down or preserve."},
+            "description": ("Cone half-angle around the policy axis (the horizontal direction of "
+                            "tool_axis_forward/left/right, straight down for tool_axis_down); 0 means "
+                            "exactly on the axis and is required for preserve. With a cone, a tool "
+                            "already inside it keeps its measured orientation; otherwise it turns only "
+                            "to the cone boundary.")},
         "max_candidates": {"type": "integer", "minimum": 1, "maximum": MAX_HOVER_CANDIDATES},
     }, "required": sorted(HOVER_PARAMETER_KEYS)}
     hover_query = {"type": "object", "properties": {
@@ -336,12 +362,12 @@ def validate_hover_parameters(value, *, component_ids, reference_frame_id):
     for interval, name in zip(bounds, ("tip X offset", "tip Y offset")):
         _interval(interval, name=name, low=-MAX_HOVER_TIP_OFFSET_M, high=MAX_HOVER_TIP_OFFSET_M)
     _interval(value["clearance_bounds_m"], name="clearance_bounds_m", low=0., high=MAX_HOVER_CLEARANCE_M)
-    if value["orientation_policy"] not in ("preserve", "tool_axis_down"):
-        raise ValueError("orientation_policy must be preserve or tool_axis_down.")
+    if value["orientation_policy"] not in HOVER_ORIENTATION_POLICY_IDS:
+        raise ValueError("orientation_policy must be one of " + ", ".join(HOVER_ORIENTATION_POLICY_IDS) + ".")
     tilt = _number(value["tool_axis_max_tilt_rad"], name="tool_axis_max_tilt_rad", low=0.,
                    high=MAX_TOOL_AXIS_TILT_RAD)
     if value["orientation_policy"] == "preserve" and tilt:
-        raise ValueError("A tool-axis tilt cone applies only to tool_axis_down.")
+        raise ValueError("A tool-axis tilt cone applies only to the tool-axis policies, not preserve.")
     count = value["max_candidates"]
     if isinstance(count, bool) or not isinstance(count, int) or not 1 <= count <= MAX_HOVER_CANDIDATES:
         raise ValueError(f"max_candidates must be an integer from 1 to {MAX_HOVER_CANDIDATES}.")
@@ -401,6 +427,7 @@ def validate_hover_result_for_parameters(parameters, result):
 
 
 __all__ = [
+    "HOVER_ORIENTATION_POLICY_IDS",
     "HOVER_PARAMETER_KEYS",
     "HOVER_QUERY_KEYS",
     "HOVER_RESULT_KEYS",

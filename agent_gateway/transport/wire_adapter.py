@@ -245,6 +245,9 @@ class BoundAgentGatewayWireAdapter:
     def get_gateway_session_capabilities(self) -> Mapping[str, Any]:
         return self.service.protocol_runtime.session_capabilities.to_wire()
 
+    def get_domain_control_state(self) -> Mapping[str, Any]:
+        return self.service.domain_control_state()
+
     def get_hardware_resource_views(self) -> Mapping[str, Any]:
         provider = self._hardware_view_provider
         resources = () if provider is None else provider.resource_views()

@@ -330,6 +330,21 @@ class AgentGatewayService:
         with self._emergency_stop_lock:
             return self._emergency_stop_receipt
 
+    def domain_control_state(self) -> Mapping[str, Any]:
+        """Observe this owner's stop latch without polling or changing devices."""
+        with self._emergency_stop_lock:
+            receipt = self._emergency_stop_receipt
+            return {
+                "schema": "agent_gateway.domain_control_state.v1",
+                "runtime_session_id": self.manifest.runtime_session_id,
+                "emergency_stop_latched": self._emergency_stop_latched,
+                "emergency_stop_confirmed": bool(
+                    self._emergency_stop_confirmed and receipt is not None
+                    and receipt.succeeded and receipt.proves_motion_or_hold
+                ),
+                "lower_stop_receipt_ref": None if receipt is None else receipt.receipt_id,
+            }
+
     def get_routes(self) -> SkillRouteManifest:
         return self.manifest
 
@@ -1086,6 +1101,9 @@ class AgentGatewayService:
                     "lower_hold_confirmed": bool(
                         not executor_no_io and receipt.proves_motion_or_hold
                     ),
+                    **({"failure_diagnostic": dict(receipt.failure_diagnostic)}
+                       if isinstance(receipt, AgentGatewayAuthoritativePortReceipt)
+                       and receipt.failure_diagnostic is not None else {}),
                 },
             )
         if not projection.accepted:

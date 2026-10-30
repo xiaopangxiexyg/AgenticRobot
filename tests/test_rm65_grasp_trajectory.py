@@ -3948,6 +3948,7 @@ def test_endpoint_planner_distinguishes_positive_gap_from_penetration(
             metadata={
                 "closest_geometry_names": ("arm", "camera_pole"),
                 "closest_obstacle_id": "camera_pole",
+                "nearest_observed": {"geometry_name": "arm", "occupied_center_world_m": [.1, .2, .3]},
             },
         )
     )
@@ -3978,6 +3979,9 @@ def test_endpoint_planner_distinguishes_positive_gap_from_penetration(
     assert error.value.details["collision_examples"][0][
         "minimum_distance_m"
     ] == pytest.approx(minimum_distance_m)
+    witness = error.value.details["collision_examples"][0]["nearest_observed"]
+    assert witness["geometry_name"] == "arm"
+    np.testing.assert_allclose(witness["occupied_center_world_m"], [.1, .2, .3])
 
 
 def test_endpoint_planner_uses_pose_tolerance_for_positive_gap_clearance_rescue(
@@ -6631,8 +6635,8 @@ def test_safe_pose_policy_keeps_existing_config_positional_constructor():
     original = RM65GraspTrajectoryPlanningConfig()
     assert next(field for field in fields(original)
                 if field.name == "enable_inherited_start_clearance").kw_only
-    names = [field.name for field in fields(original)
-             if field.name not in {"pose_goal_policy", "enable_inherited_start_clearance"}]
+    all_names = [field.name for field in fields(original) if not field.kw_only]
+    names = all_names[:all_names.index("pose_goal_policy")]
     values = [getattr(original, name) for name in names]
     values[names.index("final_edge_resolution_rad")] = .0017
     values[names.index("path_envelope_ingress_waypoint_fractions")] = (.1, .2)
@@ -6640,6 +6644,7 @@ def test_safe_pose_policy_keeps_existing_config_positional_constructor():
     assert rebuilt.final_edge_resolution_rad == .0017
     assert rebuilt.path_envelope_ingress_waypoint_fractions == (.1, .2)
     assert rebuilt.pose_goal_policy == "within_arrival_tolerance"
+    assert rebuilt.minimum_observed_clearance_m is None
 
 
 
@@ -7126,3 +7131,45 @@ def test_pregrasp_connection_cost_breaks_equal_proximal_travel_by_existing_tcp_a
     else:
         assert costs[1][1] == pytest.approx(costs[0][1])
         assert costs[1][2] < costs[0][2]
+
+
+@pytest.mark.parametrize("ignore", (False, True))
+def test_ignore_start_collisions_exempts_voxels_touching_the_start_robot(ignore):
+    """A cable voxel inside the right hand proxy blocks every start unless explicitly ignored."""
+    profile = _real_profile(envelope_profile_name="agent_grasp_right_absolute_standard_v1.json")
+    builder = build_exclusive_rm65_skill_target_builder(profile)
+    planner = RM65GraspJointTrajectoryPlanner(profile=profile, planning_target_builder=builder,
+        target_envelope_filter=builder.pre_ik_target_safety_filter,
+        config=RM65GraspTrajectoryPlanningConfig(enable_inherited_start_clearance=True,
+                                                 ignore_start_collisions=ignore))
+    start = {side: SAFE_QPOS[side].copy() for side in ("left", "right")}
+    boxes = {name: transform for name, transform, _ in planner.oracle.world_obstacle_proxy_boxes(start)}
+    cable = next(transform for name, transform in boxes.items() if name.startswith("right_hand_proxy"))[:3, 3]
+    cloud = ObservedObstacleCloud(reference_frame_id=profile.station_world_frame_id,
+        points_m=np.vstack([cable, (10., 10., 10.)]), evidence={"source": "synthetic_cable_at_start"})
+    target_q = {side: values.copy() for side, values in start.items()}
+    target_q["right"][0] += .03
+    target = builder.tool_tcp_world_targets_for_qpos_pair(
+        left_qpos=target_q["left"], right_qpos=target_q["right"])["right"]
+    kwargs = dict(qpos_by_side=start, side="right", target_tool_tcp_world=target, speed_scale=.2,
+                  require_grasp_approach=False, time_budget_sec=30.)
+    if not ignore:
+        with pytest.raises(RM65GraspTrajectoryPlanningError) as caught:
+            planner.plan_with_observed_cloud(cloud, **kwargs)
+        assert caught.value.reason_code == "path_start_collision_blocked"
+        assert caught.value.details["minimum_distance_m"] <= 0.0
+        return
+    trajectory = planner.plan_with_observed_cloud(cloud, **kwargs)
+    np.testing.assert_array_equal(trajectory.qpos_by_side["left"][-1], start["left"])
+    assert np.linalg.norm(trajectory.qpos_by_side["right"][-1] - start["right"]) > .01
+    # The template planner keeps the ordinary oracle; only the request exempted the start voxel.
+    assert planner.observed_obstacles is None
+
+
+def test_ignore_start_collisions_is_a_strict_boolean():
+    assert RM65GraspTrajectoryPlanningConfig().ignore_start_collisions is False
+    with pytest.raises(ValueError, match="ignore_start_collisions"):
+        RM65GraspTrajectoryPlanningConfig(ignore_start_collisions=1)
+    moved = RM65GraspTrajectoryPlanningConfig(ignore_start_collisions=True).for_tcp_pose_move(
+        translation_tolerance_m=.002, rotation_tolerance_rad=.02)
+    assert moved.ignore_start_collisions is True

@@ -66,7 +66,8 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 @pytest.mark.parametrize('mode', ['legacy', 'cad_surface'])
-def test_explicit_capture_filter_binds_one_owner_without_starting_resources(monkeypatch, tmp_path, mode):
+@pytest.mark.parametrize('observed_margin', [None, .01])
+def test_explicit_capture_filter_binds_one_owner_without_starting_resources(monkeypatch, tmp_path, mode, observed_margin):
     from robot_motion.rm65.captured_robot_observations import RM65CapturedRobotObservationFilterConfig
     from agent_gateway.profiles.real.motion_observed_scene import SafeMotionObservationConfig
     bindings = []
@@ -87,10 +88,14 @@ def test_explicit_capture_filter_binds_one_owner_without_starting_resources(monk
         camera_config_path=REPO_ROOT / 'teleop_runtime/configs/devices/agent_gateway_realsense.json',
         camera_registry_path=DEFAULT_RM65_CAMERA_REGISTRY_V4, artifact_root=tmp_path / 'artifacts',
         camera_mount_urdf_path=DEFAULT_RM65_CAMERA_MOUNT_URDF,
-        safe_motion_observation_config=SafeMotionObservationConfig(), captured_robot_filter_config=cfg)
+        safe_motion_observation_config=SafeMotionObservationConfig(minimum_clearance_m=observed_margin),
+        captured_robot_filter_config=cfg)
     cleaner = bindings[0]['self_filter']
     assert cleaner.config is cfg and cleaner._runtime is None
     assert bool(cleaner.input_binding_hash) == (mode != 'legacy')
+    planned = bindings[0]['planner_factory']('unqueried-cloud')
+    assert planned.func.__self__.config.minimum_observed_clearance_m == observed_margin
+    assert planned.func.__self__.config.minimum_clearance_m == .02
     assert all(backend.starts == 0 for backend in lower.arm_backends.values())
     assert guard.starts == 0 and not (tmp_path / 'gateway.sock').exists()
     result.deployment.gateway_session.close()
@@ -706,13 +711,15 @@ def test_safe_planner_binding_uses_arrival_tolerances_and_can_observe_without_mo
         safe_motion_debug_dir=tmp_path if debug_enabled else None)
     session = observed.deployment.gateway_session
     assert len(planners) == 1  # Safe static template is lazy, not a fixed-only fallback.
-    geometry_resources = [r for r in observed.resources.additional_resources
-        if isinstance(r, composition_module.MotionPlanningGeometryResources)]
-    assert len(geometry_resources) == 1
+    prepare = observed.resources._prepare_static_geometry
+    assert prepare is not None
+    geometry_resources = prepare.__self__
+    assert isinstance(geometry_resources, composition_module.MotionPlanningGeometryResources)
+    assert geometry_resources not in observed.resources.additional_resources
     prepared = []
-    monkeypatch.setattr(geometry_resources[0].self_filter, 'prepare',
+    monkeypatch.setattr(geometry_resources.self_filter, 'prepare',
                         lambda: prepared.append(True) or {})
-    geometry_resources[0].start()
+    prepare()
     assert prepared == [True] and len(planners) == 2
     for cloud in (object(), object()):
         request = adapter_bindings[0]['planner_factory'](cloud)
@@ -767,16 +774,65 @@ def test_explicit_start_clearance_binds_manifest_and_keeps_strict_default(monkey
             safe_motion_observation_config=SafeMotionObservationConfig(), grasp_trajectory_config=config)
         session = composition.deployment.gateway_session
         hashes.append(session.contract_bundle.attachment.execution_manifest_hash)
-        resource, = [r for r in composition.resources.additional_resources
-            if isinstance(r, composition_module.MotionPlanningGeometryResources)]
+        prepare = composition.resources._prepare_static_geometry
+        resource = prepare.__self__
+        assert isinstance(resource, composition_module.MotionPlanningGeometryResources)
+        assert resource not in composition.resources.additional_resources
         monkeypatch.setattr(resource.self_filter, "prepare", lambda: {})
-        resource.start()
+        prepare()
         assert configs[-1].enable_inherited_start_clearance is (config is enabled)
         session.close()
     assert hashes[0] == hashes[1] and hashes[2] != hashes[0]
     assert all(backend.starts == 0 for backend in lower.arm_backends.values())
     assert guard.starts == 0
     assert not kwargs["socket_path"].exists()
+
+
+def test_ignore_start_collisions_binds_manifest_and_requires_observed_scene(monkeypatch, tmp_path):
+    from robot_motion.observed_scene import SafeMotionObservationConfig
+    from teleop_runtime.skill_deploy.rm65_grasp_trajectory import RM65GraspTrajectoryPlanningConfig
+
+    class Planner:
+        def __call__(self, **kwargs):
+            return None
+        def plan_with_observed_cloud(self, cloud, **kwargs):
+            return cloud
+
+    configs = []
+    def planner(**kwargs):
+        configs.append(kwargs["config"])
+        return Planner()
+
+    monkeypatch.setattr(composition_module, "RM65GraspJointTrajectoryPlanner", planner)
+    lower, guard = _lower(monkeypatch)
+    kwargs = dict(lower=lower, socket_path=tmp_path / "gateway.sock", authorized_side="right",
+        authorized_action="move_tcp_to_pose_safe", confirmation_token=REAL_AGENT_PRIMITIVE_CONFIRM_TOKEN,
+        client_id="rpent:test", client_uid=1000, runtime_session_id="ignore-start:test",
+        control_domain_id="ignore-start:domain", embodiment_instance_id="ignore-start:embodiment")
+    ignore = RM65GraspTrajectoryPlanningConfig(enable_inherited_start_clearance=True, ignore_start_collisions=True)
+    with pytest.raises(ValueError, match="explicit observed safe scene"):
+        assemble_exclusive_rm65_agent_primitive_composition(**kwargs, grasp_trajectory_config=ignore)
+    (tmp_path / "artifacts").mkdir()
+    hashes = []
+    for config in (RM65GraspTrajectoryPlanningConfig(enable_inherited_start_clearance=True), ignore):
+        configs.clear()
+        composition = assemble_exclusive_rm65_agent_primitive_composition(**kwargs,
+            camera_config_path=REPO_ROOT / "teleop_runtime/configs/devices/agent_gateway_realsense.json",
+            camera_registry_path=DEFAULT_RM65_CAMERA_REGISTRY_V4,
+            artifact_root=tmp_path / "artifacts", camera_mount_urdf_path=DEFAULT_RM65_CAMERA_MOUNT_URDF,
+            safe_motion_observation_config=SafeMotionObservationConfig(minimum_clearance_m=.01),
+            grasp_trajectory_config=config)
+        session = composition.deployment.gateway_session
+        hashes.append(session.contract_bundle.attachment.execution_manifest_hash)
+        prepare = composition.resources._prepare_static_geometry
+        monkeypatch.setattr(prepare.__self__.self_filter, "prepare", lambda: {})
+        prepare()
+        assert configs[-1].ignore_start_collisions is (config is ignore)
+        assert configs[-1].minimum_observed_clearance_m == pytest.approx(.01)
+        session.close()
+    assert hashes[0] != hashes[1]
+    assert all(backend.starts == 0 for backend in lower.arm_backends.values())
+    assert guard.starts == 0
 
 
 def test_composition_matches_mujoco_canonical_station_axes_and_pose(

@@ -54,6 +54,7 @@ from robot_motion.rm65 import (
 )
 from robot_motion.rm65.obstacle_collision import (
     RM65_D405_ATTACHED_COLLISION_PROXIES,
+    AttachedBoxCollisionProxy,
     RM65InheritedStartBlocked,
     RM65InheritedStartClearanceOracle,
     RM65ObstacleCollisionOracle,
@@ -64,7 +65,7 @@ from robot_motion.scene_obstacles import ObstacleSceneSnapshot
 from teleop_runtime.target_safety.tcp_pose_envelope_runtime import (
     TCPPoseEnvelopeTargetFilter,
 )
-from robot_motion.observed_obstacles import ObservedObstacleCloud
+from robot_motion.observed_obstacles import ObservedObstacleCloud, without_start_contacts
 
 from .grasp_trajectory_record import write_grasp_trajectory_record
 from .motion_port import RealAgentJointTrajectory
@@ -86,6 +87,12 @@ RM65_GRASP_PATH_PLANNING_TIME_BUDGET_SEC = 120.0
 RM65_GRASP_CAPTURE_SELF_OBSERVATION_SURFACE_MARGIN_M = 0.006
 RM65_GRASP_TERMINAL_TARGET_CONTACT_DEPTH_M = 0.006
 RM65_GRASP_SINGULARITY_HARD_THRESHOLD_DEG = 3.0
+# A measured start may exceed a software joint bound only by the backend's
+# local-observation quantization tolerance (SDK degrees -> radians). Such a
+# start is clipped onto the bound for planning; a larger excess is rejected
+# with an explicit reason instead of an opaque solver or path-search error.
+RM65_GRASP_START_JOINT_LIMIT_TOLERANCE_RAD = math.radians(0.01)
+RM65_GRASP_MAX_ENDPOINT_JOINT_LIMIT_MARGIN_RAD = math.radians(10.0)
 RM65_GRASP_TRAJECTORY_PARAMETERIZATION_SEGMENTED_STOP = "segmented_stop"
 RM65_GRASP_TRAJECTORY_PARAMETERIZATION_CONTINUOUS_C2 = "continuous_c2"
 RM65_GRASP_TRAJECTORY_PARAMETERIZATION_MODES = (
@@ -167,10 +174,186 @@ class RM65GraspTrajectoryPlanningError(RuntimeError):
         super().__init__(self.reason_code)
 
 
+def _wrist_flip_equivalent(qpos: np.ndarray) -> np.ndarray:
+    """Same flange pose with joints 4 and 6 turned half a revolution and 5 negated."""
+    flipped = np.asarray(qpos, dtype=float).copy()
+    flipped[3] += -math.pi if flipped[3] > 0.0 else math.pi
+    flipped[4] = -flipped[4]
+    flipped[5] += -math.pi if flipped[5] > 0.0 else math.pi
+    return flipped
+
+
+def bounded_planning_start_qpos(qpos: np.ndarray, *, side: str) -> np.ndarray:
+    """Return a measured start inside the RM65 software limits, or fail explicitly.
+
+    A start beyond a bound by at most the SDK quantization tolerance (an
+    endpoint planned onto the bound and measured just past it) is clipped onto
+    the bound. A larger excess raises ``start_outside_joint_limits``: no IK seed
+    or path search can start there, and the lower SDK guard rejects HOLD there.
+    """
+    lower = np.asarray(RM65_ABSOLUTE_Q_MIN_RAD, dtype=float)
+    upper = np.asarray(RM65_ABSOLUTE_Q_MAX_RAD, dtype=float)
+    values = np.asarray(qpos, dtype=float).reshape(6)
+    excess = np.maximum(lower - values, values - upper)
+    outside = np.flatnonzero(excess > RM65_GRASP_START_JOINT_LIMIT_TOLERANCE_RAD)
+    if outside.size:
+        joints = [{"joint": int(index) + 1, "qpos_deg": round(math.degrees(values[index]), 3),
+                   "lower_deg": round(math.degrees(lower[index]), 3),
+                   "upper_deg": round(math.degrees(upper[index]), 3),
+                   "excess_deg": round(math.degrees(excess[index]), 3)} for index in outside]
+        twin = _wrist_flip_equivalent(values)
+        twin_in_range = bool(np.all(twin >= lower) and np.all(twin <= upper))
+        described = ", ".join(
+            f"J{item['joint']}={item['qpos_deg']:.1f} deg outside "
+            f"[{item['lower_deg']:.1f}, {item['upper_deg']:.1f}]" for item in joints)
+        hint = (" The same TCP pose is reachable in range at joints "
+                + "[" + ", ".join(f"{math.degrees(value):.1f}" for value in twin) + "] deg."
+                if twin_in_range else "")
+        raise RM65GraspTrajectoryPlanningError("start_outside_joint_limits", details={
+            "planning_phase": "start_joint_limit_admission", "side": side,
+            "tolerance_deg": math.degrees(RM65_GRASP_START_JOINT_LIMIT_TOLERANCE_RAD),
+            "joints": joints, "measured_qpos_deg": [round(math.degrees(v), 3) for v in values],
+            "wrist_flip_equivalent_deg": ([round(math.degrees(v), 3) for v in twin]
+                                          if twin_in_range else None),
+            "message": (f"{side} arm start {described}; move it into the RM65 software joint "
+                        f"range with a joint-space move before planning.{hint}")})
+    return np.clip(values, lower, upper)
+
+
+RM65_CARRIED_OBJECT_MIN_EXTENT_M = 0.005
+RM65_CARRIED_OBJECT_MAX_EXTENT_M = 0.40
+RM65_CARRIED_OBJECT_EXEMPTION_POLICY = "observed_voxels_within_clearance_of_start_carried_box_v1"
+
+
+@dataclass(frozen=True, eq=False)
+class RM65CarriedObjectBox:
+    """A held object as one conservative box fixed in the holding tool frame.
+
+    The lower owner builds this from its own held-object measurement; an Agent
+    parameter never asserts attachment. Observed planning attaches the box to
+    the holding arm's link6 and checks it against the fixed scene (table and
+    camera poles), every robot proxy except the holding hand and its rigidly
+    mounted wrist camera, and the observed voxels. Voxels already within the
+    observed clearance of the box at the measured start (the object's own
+    points and whatever it touches) move with it for that one request only.
+    """
+
+    object_id: str
+    side: str
+    tool_from_box: np.ndarray
+    size_xyz_m: tuple[float, float, float]
+    evidence_ref: str
+
+    def __post_init__(self) -> None:
+        if (not isinstance(self.object_id, str) or not self.object_id or len(self.object_id) > 64
+                or not all(char.isalnum() or char in "_-.:" for char in self.object_id)):
+            raise ValueError("Carried object ID must be a short plain identifier.")
+        if self.side not in _SIDES:
+            raise ValueError("Carried object side must be left or right.")
+        if not isinstance(self.evidence_ref, str) or not self.evidence_ref.strip():
+            raise ValueError("Carried object requires a measurement evidence reference.")
+        transform = np.array(self.tool_from_box, dtype=float, copy=True)
+        if (transform.shape != (4, 4) or not np.isfinite(transform).all()
+                or not np.allclose(transform[3], (0.0, 0.0, 0.0, 1.0), atol=1e-12, rtol=0)
+                or not np.allclose(transform[:3, :3].T @ transform[:3, :3], np.eye(3), atol=1e-6, rtol=0)
+                or not np.isclose(np.linalg.det(transform[:3, :3]), 1.0, atol=1e-6, rtol=0)):
+            raise ValueError("Carried object tool_from_box must be a finite rigid transform.")
+        size = tuple(float(value) for value in self.size_xyz_m)
+        if (len(size) != 3 or not all(math.isfinite(value) for value in size)
+                or min(size) < RM65_CARRIED_OBJECT_MIN_EXTENT_M
+                or max(size) > RM65_CARRIED_OBJECT_MAX_EXTENT_M):
+            raise ValueError("Carried object box extents must be finite and within 5 mm to 0.4 m.")
+        transform.setflags(write=False)
+        object.__setattr__(self, "tool_from_box", transform)
+        object.__setattr__(self, "size_xyz_m", size)
+
+    @property
+    def geometry_name(self) -> str:
+        return "held_object::" + self.object_id
+
+    def to_dict(self) -> dict[str, object]:
+        return {"object_id": self.object_id, "side": self.side,
+                "tool_from_box": self.tool_from_box.tolist(),
+                "size_xyz_m": list(self.size_xyz_m), "evidence_ref": self.evidence_ref}
+
+
+RM65_CARRIED_OBJECT_SUPPORT_EXEMPTION_POLICY = "measured_support_top_voxels_under_carried_box_target_v1"
+RM65_CARRIED_OBJECT_SUPPORT_MAX_TILT_DEG = 10.0
+
+
+@dataclass(frozen=True, eq=False)
+class RM65CarriedObjectSupport:
+    """A measured, fully observed support top on which a carried box is being placed.
+
+    Only for the request that lowers the box onto it: observed voxels under the
+    box's target footprint (widened by the observed clearance) that lie no
+    higher than ``height_tolerance_m`` above the measured plane are the support
+    itself and are not obstacles. Anything standing on the support, all other
+    voxels and the fixed scene stay checked; the box may not end below the plane.
+    """
+
+    support_id: str
+    plane_anchor_xyz_m: tuple[float, float, float]
+    normal_xyz: tuple[float, float, float]
+    region_min_xy_m: tuple[float, float]
+    region_max_xy_m: tuple[float, float]
+    evidence_ref: str
+    height_tolerance_m: float = 0.005
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.support_id, str) or not self.support_id.strip():
+            raise ValueError("Support ID must be a nonempty string.")
+        if not isinstance(self.evidence_ref, str) or not self.evidence_ref.strip():
+            raise ValueError("Support requires a measurement evidence reference.")
+        anchor = np.asarray(self.plane_anchor_xyz_m, dtype=float).reshape(-1)
+        normal = np.asarray(self.normal_xyz, dtype=float).reshape(-1)
+        low = np.asarray(self.region_min_xy_m, dtype=float).reshape(-1)
+        high = np.asarray(self.region_max_xy_m, dtype=float).reshape(-1)
+        if (anchor.shape != (3,) or normal.shape != (3,) or low.shape != (2,) or high.shape != (2,)
+                or not all(np.isfinite(v).all() for v in (anchor, normal, low, high))
+                or np.any(high <= low)):
+            raise ValueError("Support plane and region must be finite with a positive area.")
+        length = float(np.linalg.norm(normal))
+        if not 0.999 <= length <= 1.001:
+            raise ValueError("Support normal must be a unit vector.")
+        normal = normal / length
+        if normal[2] < math.cos(math.radians(RM65_CARRIED_OBJECT_SUPPORT_MAX_TILT_DEG)):
+            raise ValueError("Support top must face upward within 10 degrees.")
+        tolerance = float(self.height_tolerance_m)
+        if not math.isfinite(tolerance) or not 0.0 < tolerance <= 0.02:
+            raise ValueError("Support height tolerance must be within (0, 20 mm].")
+        object.__setattr__(self, "plane_anchor_xyz_m", tuple(float(v) for v in anchor))
+        object.__setattr__(self, "normal_xyz", tuple(float(v) for v in normal))
+        object.__setattr__(self, "region_min_xy_m", tuple(float(v) for v in low))
+        object.__setattr__(self, "region_max_xy_m", tuple(float(v) for v in high))
+        object.__setattr__(self, "height_tolerance_m", tolerance)
+
+    def heights_m(self, points: np.ndarray) -> np.ndarray:
+        """Signed height above the measured plane."""
+        return (np.asarray(points, dtype=float) - np.asarray(self.plane_anchor_xyz_m)) @ np.asarray(self.normal_xyz)
+
+    def to_dict(self) -> dict[str, object]:
+        return {"support_id": self.support_id, "plane_anchor_xyz_m": list(self.plane_anchor_xyz_m),
+                "normal_xyz": list(self.normal_xyz), "region_min_xy_m": list(self.region_min_xy_m),
+                "region_max_xy_m": list(self.region_max_xy_m), "evidence_ref": self.evidence_ref,
+                "height_tolerance_m": self.height_tolerance_m}
+
+
+def _box_corners(world_from_box: np.ndarray, size_xyz_m) -> np.ndarray:
+    signs = np.array([[x, y, z] for x in (-0.5, 0.5) for y in (-0.5, 0.5) for z in (-0.5, 0.5)])
+    local = signs * np.asarray(size_xyz_m, dtype=float)
+    return local @ world_from_box[:3, :3].T + world_from_box[:3, 3]
+
+
 @dataclass(frozen=True)
 class RM65GraspTrajectoryPlanningConfig:
     minimum_clearance_m: float = 0.02
     enable_inherited_start_clearance: bool = field(default=False, kw_only=True)
+    # Explicit experiment mode for observed safe TCP moves: no start-state
+    # collision rejection. Observed voxels touching the robot at the measured
+    # start (cables, attachments, residual self observation) are exempt for the
+    # request; fixed pairs in contact at the start may not get worse and must exit.
+    ignore_start_collisions: bool = field(default=False, kw_only=True)
     maximum_proximal_joint_travel_rad: float = DEFAULT_PATH_MOTION_QUALITY_LIMITS.maximum_proximal_joint_travel_rad
     maximum_tcp_detour_ratio: float = DEFAULT_PATH_MOTION_QUALITY_LIMITS.maximum_tcp_detour_ratio
     maximum_tcp_detour_excess_m: float = DEFAULT_PATH_MOTION_QUALITY_LIMITS.maximum_tcp_detour_excess_m
@@ -217,6 +400,13 @@ class RM65GraspTrajectoryPlanningConfig:
     )
 
     pose_goal_policy: str = "within_arrival_tolerance"
+    minimum_observed_clearance_m: float | None = None
+    # Optional inward margin (rad) from the RM65 software joint limits for IK
+    # endpoints and their seeds. 0 keeps the historical full-range endpoints.
+    # A small margin keeps a planned rest pose off the hard bound, so measured
+    # quantization at the next request cannot place its start outside the
+    # limits. Path samples between endpoints keep the full range.
+    endpoint_joint_limit_margin_rad: float = field(default=0.0, kw_only=True)
 
     def for_tcp_pose_move(
         self, *, translation_tolerance_m: float, rotation_tolerance_rad: float,
@@ -239,6 +429,20 @@ class RM65GraspTrajectoryPlanningConfig:
     def __post_init__(self) -> None:
         if not isinstance(self.enable_inherited_start_clearance, bool):
             raise ValueError("enable_inherited_start_clearance must be bool.")
+        if not isinstance(self.ignore_start_collisions, bool):
+            raise ValueError("ignore_start_collisions must be bool.")
+        observed_clearance = self.minimum_observed_clearance_m
+        if observed_clearance is not None:
+            if (isinstance(observed_clearance, bool) or not np.isfinite(observed_clearance)
+                    or observed_clearance <= 0):
+                raise ValueError("minimum_observed_clearance_m must be finite and positive.")
+            object.__setattr__(self, "minimum_observed_clearance_m", float(observed_clearance))
+        joint_margin = self.endpoint_joint_limit_margin_rad
+        if (isinstance(joint_margin, bool) or not isinstance(joint_margin, (int, float))
+                or not math.isfinite(joint_margin)
+                or not 0.0 <= joint_margin <= RM65_GRASP_MAX_ENDPOINT_JOINT_LIMIT_MARGIN_RAD):
+            raise ValueError("endpoint_joint_limit_margin_rad must be finite within [0, 10 deg].")
+        object.__setattr__(self, "endpoint_joint_limit_margin_rad", float(joint_margin))
         if not isinstance(self.pose_goal_policy, str) or self.pose_goal_policy not in (
             "preserve_target", "within_arrival_tolerance",
         ):
@@ -840,14 +1044,17 @@ class RM65GraspJointTrajectoryPlanner:
         )
         self.observed_obstacles = observed_obstacles
         if observed_obstacles is not None:
-            self.oracle.bind_observed_cloud(observed_obstacles)
+            self.oracle.bind_observed_cloud(observed_obstacles,
+                minimum_clearance_m=self.config.minimum_observed_clearance_m)
 
     def for_observed_cloud(self, cloud: ObservedObstacleCloud) -> RM65GraspJointTrajectoryPlanner:
         """Bind request-owned collision state while retaining the static model."""
         if self.observed_obstacles is not None:
             raise ValueError("Observed planning requires a static planner template.")
         request = copy(self)
-        request.oracle = self.oracle.for_observed_cloud(cloud)
+        request.oracle = (self.oracle.for_observed_cloud(cloud)
+            if self.config.minimum_observed_clearance_m is None else
+            self.oracle.for_observed_cloud(cloud, minimum_clearance_m=self.config.minimum_observed_clearance_m))
         request.observed_obstacles = cloud
         request._local_chain_cache = OrderedDict()
         request._local_chain_cache_lock = threading.Lock()
@@ -878,19 +1085,187 @@ class RM65GraspJointTrajectoryPlanner:
             endpoint_orientation_tolerance_deg=orientation)
         return request
 
+    def _with_carried_object(self, carried: RM65CarriedObjectBox, cloud: ObservedObstacleCloud,
+                             start: Mapping[str, np.ndarray], *,
+                             target_tool_tcp_world: np.ndarray | None = None,
+                             support: RM65CarriedObjectSupport | None = None):
+        """Return a request template whose oracle checks ``carried``, and the cloud without its voxels."""
+        side = carried.side
+        parent = "arm_link6" if side == "left" else "right_arm_link6"
+        camera = next(proxy for proxy in RM65_D405_ATTACHED_COLLISION_PROXIES
+                      if proxy.parent_frame_name == parent)
+        # The oracle's own FK places the wrist-camera proxy at link6 * camera;
+        # use it so the carried box shares exactly the collision model's frame.
+        placed = {name: transform for name, transform, _ in self.oracle.world_obstacle_proxy_boxes(start)}
+        link6_from_camera = np.eye(4)
+        link6_from_camera[:3, :3] = np.asarray(camera.rotation_row_major, dtype=float).reshape(3, 3)
+        link6_from_camera[:3, 3] = camera.center_xyz_m
+        world_from_link6 = placed[camera.geometry_name] @ np.linalg.inv(link6_from_camera)
+        with self._solver_lock:
+            world_from_tool = self.target_builder.tool_tcp_world_targets_for_qpos_pair(
+                left_qpos=start["left"], right_qpos=start["right"])[side]
+        world_from_box = world_from_tool @ carried.tool_from_box
+        link6_from_box = np.linalg.inv(world_from_link6) @ world_from_box
+        u, _, vt = np.linalg.svd(link6_from_box[:3, :3])
+        rotation = u @ vt
+        profile = build_dual_arm_scene_profile(self.path_collision_scene_profile)
+        holding_hand = {box.geometry_name for box in profile.hand_proxy_boxes
+                        if box.geometry_name.startswith(side + "_hand_proxy_")}
+        if not holding_hand:
+            raise ValueError("The collision profile exposes no hand proxies for the holding arm.")
+        # The holding hand grips the object and the same-arm wrist camera is
+        # rigid with it; every other proxy pair and the world stay checked.
+        partners = {name for pair in profile.collision_pairs for name in pair} - holding_hand
+        partners.update(proxy.geometry_name for proxy in RM65_D405_ATTACHED_COLLISION_PROXIES
+                        if proxy.parent_frame_name != parent)
+        proxy = AttachedBoxCollisionProxy(
+            geometry_name=carried.geometry_name, parent_frame_name=parent,
+            center_xyz_m=tuple(float(v) for v in link6_from_box[:3, 3]),
+            size_xyz_m=carried.size_xyz_m,
+            rotation_row_major=tuple(float(v) for v in rotation.reshape(-1)),
+            collision_geometry_names=tuple(sorted(partners)))
+        oracle = build_rm65_profile_obstacle_collision_oracle(
+            scene_profile=self.path_collision_scene_profile, scene=self.scene,
+            expected_reference_frame_id=self.scene.reference_frame_id,
+            expected_reference_frame_spec_hash=self.scene.reference_frame_spec_hash,
+            attached_box_proxies=(*RM65_D405_ATTACHED_COLLISION_PROXIES, proxy),
+            use_profile_proxy_geometry=True)
+        boxes = {name: (transform, half) for name, transform, half in oracle.world_obstacle_proxy_boxes(start)}
+        frame_error = pose_delta_metrics(boxes[proxy.geometry_name][0], world_from_box)
+        if frame_error[0] > 1e-6 or frame_error[1] > 1e-4:
+            raise RM65GraspTrajectoryPlanningError("carried_object_frame_mismatch", details={
+                "planning_phase": "carried_object_binding", "position_error_m": frame_error[0],
+                "orientation_error_deg": frame_error[1]})
+        clearance = (self.scene.minimum_clearance_m if self.config.minimum_observed_clearance_m is None
+                     else self.config.minimum_observed_clearance_m)
+        try:
+            filtered, exemption = without_start_contacts(
+                cloud, ((proxy.geometry_name, *boxes[proxy.geometry_name]),),
+                clearance_m=clearance, start_qpos_by_side=start)
+        except ValueError as error:
+            raise RM65GraspTrajectoryPlanningError("carried_object_scene_unavailable", details={
+                "planning_phase": "carried_object_binding", "message": str(error)}) from error
+        exemption = {**exemption, "policy": RM65_CARRIED_OBJECT_EXEMPTION_POLICY}
+        support_summary = None
+        if support is not None:
+            filtered, support_summary = self._without_support_top_under_target(
+                filtered, carried=carried, support=support, clearance_m=clearance,
+                target_tool_tcp_world=target_tool_tcp_world)
+        if filtered is not cloud:
+            # Keep these exemptions separate from a later ignore-start exemption.
+            filtered = ObservedObstacleCloud(
+                reference_frame_id=cloud.reference_frame_id, points_m=filtered.points_m,
+                evidence={**cloud.evidence_payload(), "carried_object_exemption": exemption,
+                          **({} if support_summary is None
+                             else {"carried_object_support_exemption": support_summary})},
+                voxel_size_m=cloud.voxel_size_m)
+        template = copy(self)
+        template.oracle = oracle
+        template._local_chain_cache = OrderedDict()
+        template._local_chain_cache_lock = threading.Lock()
+        summary = {"carried_object": carried.to_dict(), "parent_frame_name": parent,
+                   "link6_from_box": np.vstack((np.column_stack((rotation, link6_from_box[:3, 3])),
+                                                (0.0, 0.0, 0.0, 1.0))).tolist(),
+                   "world_from_box_at_start": world_from_box.tolist(),
+                   "collision_partner_names": list(proxy.collision_geometry_names),
+                   "excluded_holding_proxy_names": sorted({*holding_hand, camera.geometry_name}),
+                   "observed_exemption": {key: value for key, value in exemption.items()
+                                          if key != "start_qpos_by_side"},
+                   **({} if support_summary is None else {"support_exemption": support_summary})}
+        return template, filtered, summary
+
+    @staticmethod
+    def _without_support_top_under_target(cloud, *, carried, support, clearance_m, target_tool_tcp_world):
+        """Exempt the measured support top under the carried box's target footprint."""
+        if target_tool_tcp_world is None:
+            raise ValueError("A support allowance requires the requested target pose.")
+        target = np.asarray(target_tool_tcp_world, dtype=float).reshape(4, 4)
+        corners = _box_corners(target @ carried.tool_from_box, carried.size_xyz_m)
+        bottom = float(np.min(support.heights_m(corners)))
+        low_xy, high_xy = corners[:, :2].min(axis=0), corners[:, :2].max(axis=0)
+        region_low = np.asarray(support.region_min_xy_m)
+        region_high = np.asarray(support.region_max_xy_m)
+        details = {"planning_phase": "carried_object_support_binding", "support_id": support.support_id,
+                   "target_box_bottom_above_plane_m": bottom,
+                   "target_footprint_min_xy_m": low_xy.tolist(), "target_footprint_max_xy_m": high_xy.tolist(),
+                   "support_region_min_xy_m": list(support.region_min_xy_m),
+                   "support_region_max_xy_m": list(support.region_max_xy_m)}
+        if np.any(low_xy < region_low) or np.any(high_xy > region_high):
+            raise RM65GraspTrajectoryPlanningError("carried_object_footprint_outside_support", details=details)
+        if bottom < 0.0:
+            raise RM65GraspTrajectoryPlanningError("carried_object_target_below_support", details=details)
+        margin = float(clearance_m) + cloud.quantization_margin_m + 0.002
+        points = cloud.points_m
+        inside = np.all((points[:, :2] >= low_xy - margin) & (points[:, :2] <= high_xy + margin), axis=1)
+        exempt = inside & (support.heights_m(points) <= support.height_tolerance_m)
+        summary = {"policy": RM65_CARRIED_OBJECT_SUPPORT_EXEMPTION_POLICY, "support": support.to_dict(),
+                   "lateral_margin_m": margin, "exempt_voxel_count": int(np.count_nonzero(exempt)),
+                   "kept_voxel_count": int(np.count_nonzero(~exempt)),
+                   **{key: value for key, value in details.items() if key != "planning_phase"}}
+        if not np.any(exempt):
+            return cloud, summary
+        if np.all(exempt):
+            raise RM65GraspTrajectoryPlanningError("carried_object_scene_unavailable", details=details)
+        return ObservedObstacleCloud(reference_frame_id=cloud.reference_frame_id, points_m=points[~exempt],
+                                     evidence=cloud.evidence_payload(), voxel_size_m=cloud.voxel_size_m), summary
+
     def plan_with_observed_cloud(
         self, cloud: ObservedObstacleCloud, *,
-        pose_goal_policy: str = "within_arrival_tolerance", **kwargs,
+        pose_goal_policy: str = "within_arrival_tolerance",
+        carried_object: RM65CarriedObjectBox | None = None,
+        carried_object_support: RM65CarriedObjectSupport | None = None, **kwargs,
     ):
-        """Serialize shared target-builder use across observed requests."""
+        """Serialize shared target-builder use across observed requests.
+
+        ``carried_object`` (lower-owned held-object measurement) makes an
+        ordinary safe move of the holding arm check that box along the path;
+        ``carried_object_support`` (measured support top) additionally lets the
+        box be lowered onto that support for this request.
+        """
         monotonic = kwargs.get("monotonic", time.perf_counter)
         started = float(monotonic())
         with self._observed_planning_lock:
-            request = self.for_observed_cloud(cloud)._for_pose_goal_policy(
+            qpos_by_side = kwargs.get("qpos_by_side")
+            template, carried_summary = self, None
+            if carried_object_support is not None and (
+                    carried_object is None or not isinstance(carried_object_support, RM65CarriedObjectSupport)):
+                raise ValueError("A support allowance applies only to a carried object placement.")
+            if carried_object is not None:
+                if not isinstance(carried_object, RM65CarriedObjectBox):
+                    raise TypeError("carried_object must be an RM65CarriedObjectBox.")
+                if (kwargs.get("require_grasp_approach", True) or qpos_by_side is None
+                        or str(kwargs.get("side", "")).strip().lower() != carried_object.side
+                        or not isinstance(self.oracle, RM65ObstacleCollisionOracle)):
+                    raise ValueError("A carried object applies only to an observed safe move of its holding arm.")
+                carried_start = {side: np.asarray(dict(qpos_by_side)[side], dtype=float).reshape(6).copy()
+                                 for side in _SIDES}
+                template, cloud, carried_summary = self._with_carried_object(
+                    carried_object, cloud, carried_start,
+                    target_tool_tcp_world=kwargs.get("target_tool_tcp_world"),
+                    support=carried_object_support)
+            if (self.config.ignore_start_collisions and not kwargs.get("require_grasp_approach", True)
+                    and qpos_by_side is not None and isinstance(template.oracle, RM65ObstacleCollisionOracle)):
+                # Voxels already touching the robot at the measured start move
+                # with it (cables, attachments, self residue); exempt them here.
+                start = {side: np.asarray(dict(qpos_by_side)[side], dtype=float).reshape(6).copy()
+                         for side in _SIDES}
+                clearance = (self.scene.minimum_clearance_m if self.config.minimum_observed_clearance_m is None
+                             else self.config.minimum_observed_clearance_m)
+                cloud, _ = without_start_contacts(cloud, template.oracle.world_obstacle_proxy_boxes(start),
+                                                  clearance_m=clearance, start_qpos_by_side=start)
+            request = template.for_observed_cloud(cloud)._for_pose_goal_policy(
                 pose_goal_policy=pose_goal_policy,
                 require_grasp_approach=kwargs.get("require_grasp_approach", True),
             )
-            return request._plan(_planning_started_at=started, **kwargs)
+            trajectory = request._plan(_planning_started_at=started, **kwargs)
+            if carried_summary is None:
+                return trajectory
+            return RealAgentJointTrajectory(
+                time_from_start_sec=trajectory.time_from_start_sec,
+                qpos_by_side=trajectory.qpos_by_side,
+                planner_evidence_refs=(*trajectory.planner_evidence_refs,
+                    "rm65-carried-object:" + canonical_content_hash(
+                        carried_summary, domain="agenticrobot.rm65.carried_object_plan.v1")))
 
     def tool_tcp_poses_for_qpos_pair(self, *, qpos_by_side):
         """Return explicit-pair FK without exposing mutable native scratch."""
@@ -2439,6 +2814,12 @@ class RM65GraspJointTrajectoryPlanner:
                 monotonic=monotonic,
             )
 
+    def _endpoint_joint_bounds(self) -> tuple[np.ndarray, np.ndarray]:
+        """IK endpoint bounds: the software limits, optionally inset by the config margin."""
+        margin = self.config.endpoint_joint_limit_margin_rad
+        return (np.asarray(RM65_ABSOLUTE_Q_MIN_RAD, dtype=float) + margin,
+                np.asarray(RM65_ABSOLUTE_Q_MAX_RAD, dtype=float) - margin)
+
     def _endpoint_seed_qpos(
         self,
         qpos_by_side: Mapping[str, np.ndarray],
@@ -2463,8 +2844,7 @@ class RM65GraspJointTrajectoryPlanner:
             ),
             dtype=float,
         )
-        lower = np.asarray(RM65_ABSOLUTE_Q_MIN_RAD, dtype=float)
-        upper = np.asarray(RM65_ABSOLUTE_Q_MAX_RAD, dtype=float)
+        lower, upper = self._endpoint_joint_bounds()
         baseline = {
             name: np.asarray(qpos_by_side[name], dtype=float).copy() for name in _SIDES
         }
@@ -2545,8 +2925,10 @@ class RM65GraspJointTrajectoryPlanner:
         monotonic: Callable[[], float] = time.perf_counter,
     ) -> tuple[dict[str, np.ndarray], int, float, float]:
         target_pose = np.asarray(target_tool_tcp_world, dtype=float)
-        lower = np.asarray(RM65_ABSOLUTE_Q_MIN_RAD, dtype=float)
-        upper = np.asarray(RM65_ABSOLUTE_Q_MAX_RAD, dtype=float)
+        lower, upper = self._endpoint_joint_bounds()
+        # SciPy rejects an initial iterate outside its bounds; a measured seed
+        # on (or inside a configured margin of) a joint limit starts on them.
+        seed_qpos = np.clip(np.asarray(seed_qpos, dtype=float), lower, upper)
         position_scale = self.config.endpoint_position_residual_scale_m
         orientation_scale = math.radians(
             self.config.endpoint_orientation_residual_scale_deg
@@ -3011,6 +3393,7 @@ class RM65GraspJointTrajectoryPlanner:
                                     "closest_obstacle_id"
                                 ),
                                 "minimum_distance_m": check.minimum_distance_m,
+                                "nearest_observed": check.metadata.get("nearest_observed"),
                             }
                         else:
                             accepted.append(
@@ -3143,6 +3526,7 @@ class RM65GraspJointTrajectoryPlanner:
                             "closest_obstacle_id"
                         ),
                         "minimum_distance_m": check.minimum_distance_m,
+                        "nearest_observed": check.metadata.get("nearest_observed"),
                     }
                 )
                 if not check.collision_check_available:
@@ -3265,6 +3649,7 @@ class RM65GraspJointTrajectoryPlanner:
                         "closest_geometry_names": item["closest_geometry_names"],
                         "closest_obstacle_id": item["closest_obstacle_id"],
                         "minimum_distance_m": item["minimum_distance_m"],
+                        "nearest_observed": item.get("nearest_observed"),
                     }
                     for item in attempts
                     if item.get("outcome") in {
@@ -5909,8 +6294,13 @@ class RM65GraspJointTrajectoryPlanner:
             .copy()
             for name in _SIDES
         }
+        # Every IK seed and the joint path start at this state; a bound-limited
+        # solver or search cannot start beyond the software joint limits.
+        current[selected_side] = bounded_planning_start_qpos(current[selected_side], side=selected_side)
         target_pose = np.asarray(target_tool_tcp_world, dtype=float).reshape(4, 4).copy()
-        if (self.config.enable_inherited_start_clearance
+        ignore_start = (self.config.ignore_start_collisions
+                        and self.observed_obstacles is not None and not require_grasp_approach)
+        if ((self.config.enable_inherited_start_clearance or ignore_start)
                 and self.observed_obstacles is not None and not require_grasp_approach
                 and type(self.oracle) is RM65ObstacleCollisionOracle):
             baseline_check = self.oracle.check(current)
@@ -5920,10 +6310,10 @@ class RM65GraspJointTrajectoryPlanner:
                         "observed_obstacle_clearance_blocked",
                     }
                     and baseline_check.minimum_distance_m is not None
-                    and baseline_check.minimum_distance_m > 0.0):
+                    and (ignore_start or baseline_check.minimum_distance_m > 0.0)):
                 try:
                     inherited = self.oracle.inherited_start_clearance(
-                        current, active_component=selected_side)
+                        current, active_component=selected_side, allow_start_contact=ignore_start)
                     inherited_check = inherited.check(current)
                 except RM65InheritedStartBlocked as error:
                     raise RM65GraspTrajectoryPlanningError(

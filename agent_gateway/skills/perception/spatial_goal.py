@@ -84,8 +84,18 @@ def spatial_goal_schema(*, definition_hash: str, profile_hash: str,
     parameters = {"type": "object", "additionalProperties": False, "properties": {
         **identity, "current_tcp_pose_xyz_quat_xyzw": vector(7), "anchor_xyz_m": vector(3),
         "offset_xyz_m": vector(3), "offset_frame": {"enum": ["reference", "tool"]},
-        "orientation_mode": {"enum": ["preserve", "align_axis"]},
-        "tool_axis": {"enum": [None, "x", "y", "z"]}, "axis_reference_xyz": nullable_axis,
+        "orientation_mode": {"enum": ["preserve", "align_axis"], "description": (
+            "preserve keeps the current tool orientation; align_axis turns tool_axis onto "
+            "axis_reference_xyz with the least rotation.")},
+        "tool_axis": {"enum": [None, "x", "y", "z"], "description": (
+            "Tool axis to align; z is the gripper approach axis. null with preserve.")},
+        "axis_reference_xyz": {**nullable_axis, "description": (
+            "Reference direction for tool_axis in the reference frame. The general gripper posture "
+            "is horizontal: tool_axis z onto [1, 0, 0] (approach from the robot side), or onto "
+            "[0, 1, 0] / [0, -1, 0] to approach from the object's right / left side (the right / "
+            "left arm's own side; often better near the central pole or close to the arm). Use "
+            "[0, 0, -1] (straight down) only when a top-down approach is explicitly required; "
+            "exactly-down poses are often out of reach. null with preserve.")},
     }, "required": sorted(PARAMETER_KEYS)}
     result = {"type": "object", "additionalProperties": False, "properties": {
         **identity,

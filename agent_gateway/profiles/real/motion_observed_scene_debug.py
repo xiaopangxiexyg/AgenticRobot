@@ -212,6 +212,36 @@ class SafeMotionDebugRecord:
                 results.extend(self._projections(value))
         return results
 
+    def _voxel_sources(self, details):
+        """Trace quantized witnesses to retained depth pixels, not projected centers."""
+        centers = {}
+        for projection in self._projections(details):
+            point = projection["point_world_m"]
+            centers[tuple(point)] = point
+        size = self.payload["policy"]["voxel_size_m"]
+        results = []
+        for point in centers.values():
+            cell = np.floor(np.asarray(point) / size)
+            sources = []
+            for role, capture in self.captures.items():
+                view = self.payload["views"][role]
+                if "filtered_file" not in view:
+                    continue
+                with np.load(self.directory / view["filtered_file"], allow_pickle=False) as data:
+                    points, pixels = data["points_world_m"], data["pixel_uv"]
+                    matches = np.flatnonzero(np.all(np.floor(points / size) == cell, axis=1))
+                    # Bound JSON size while retaining the full arrays on disk.
+                    for index in matches[:16]:
+                        u, v = map(int, pixels[index])
+                        sources.append({"role": role, "pixel_uv": [u, v],
+                            "point_world_m": points[index],
+                            "observed_depth_m": float(capture.depth_m[v, u]),
+                            "view_voxel_support_count": len(matches),
+                            "view_sources_truncated": len(matches) > 16})
+            results.append({"occupied_center_world_m": point,
+                "voxel_size_m": size, "sources": sources})
+        return results
+
     def finish(self, *, error=None, trajectory=None):
         self.payload["state"] = ("interrupted" if isinstance(error, (KeyboardInterrupt, SystemExit))
             else "rejected" if isinstance(error, RM65GraspTrajectoryPlanningError)
@@ -221,6 +251,7 @@ class SafeMotionDebugRecord:
             if isinstance(error, RM65GraspTrajectoryPlanningError):
                 self.payload["error"].update(reason_code=error.reason_code, details=error.details)
                 self.payload["nearest_point_projections"] = self._projections(error.details)
+                self.payload["nearest_voxel_sources"] = self._voxel_sources(error.details)
         else:
             self.payload["trajectory_hash"] = trajectory.semantic_content_hash
         self.phase(self.payload["state"])

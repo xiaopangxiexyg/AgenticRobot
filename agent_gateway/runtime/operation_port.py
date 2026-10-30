@@ -7,11 +7,13 @@ claim a lower HOLD, motion, dispatch, or device/simulator contact.
 
 from __future__ import annotations
 
+import json
 import math
 import threading
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
+from types import MappingProxyType
 from typing import Protocol, runtime_checkable
 
 from dataset_contracts.canonical_encoding import canonical_content_hash
@@ -41,6 +43,34 @@ def _finite_time(value: object, *, field_name: str) -> float:
     if not math.isfinite(normalized):
         raise ValueError(f"{field_name} must be finite.")
     return normalized
+
+
+def freeze_failure_diagnostic(value: Mapping[str, str] | None) -> Mapping[str, str] | None:
+    """Bound non-authoritative context; only operation progress publishes it."""
+    if value is None:
+        return None
+    if not isinstance(value, Mapping):
+        raise ValueError("failure_diagnostic must be an object with at most 8 fields.")
+    fields = dict(value)
+    truncated = fields.pop("diagnostic_truncated", None)
+    if truncated not in (None, "true") or len(fields) > 8:
+        raise ValueError("failure_diagnostic must contain at most 8 context fields.")
+    bounded = {}
+    for key, text in fields.items():
+        if (not isinstance(key, str) or not key or len(key.encode("utf-8")) > 64
+                or not isinstance(text, str)):
+            raise ValueError("failure_diagnostic requires bounded string fields.")
+        encoded = text.encode("utf-8", errors="replace")
+        bounded[key] = encoded[:512].decode("utf-8", errors="ignore")
+        if len(encoded) > 512:
+            truncated = "true"
+        # JSON escaping must not inflate diagnostics past operation bounds.
+        while len(json.dumps(bounded[key], ensure_ascii=False).encode("utf-8")) > 1024:
+            bounded[key] = bounded[key][:len(bounded[key]) // 2]
+            truncated = "true"
+    if truncated is not None:
+        bounded["diagnostic_truncated"] = truncated
+    return MappingProxyType(bounded)
 
 
 @dataclass(frozen=True)
@@ -196,8 +226,12 @@ class AgentGatewayAuthoritativePortReceipt:
     evidence_refs: tuple[str, ...] = ()
     proves_motion_or_hold: bool = False
     receipt_id: str = field(init=False)
+    # Process-local context, not part of the lower authority receipt or its wire
+    # identity. The service publishes it in the separately hash-bound operation.
+    failure_diagnostic: Mapping[str, str] | None = field(default=None, repr=False, compare=False)
 
     def __post_init__(self) -> None:
+        object.__setattr__(self, "failure_diagnostic", freeze_failure_diagnostic(self.failure_diagnostic))
         object.__setattr__(
             self,
             "port_id",

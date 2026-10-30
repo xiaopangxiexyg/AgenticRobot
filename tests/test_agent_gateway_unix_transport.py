@@ -13,6 +13,23 @@ from types import SimpleNamespace
 
 import pytest
 
+from agent_gateway.protocol.contracts import (
+    AGENT_GATEWAY_AUTHORITATIVE_PORT_RECEIPT_FEATURE_V1,
+    AGENT_GATEWAY_DOMAIN_EMERGENCY_STOP_FEATURE_V1,
+    AgentOwnDomainEmergencyStopRequest,
+)
+from agent_gateway.protocol.skill_catalog import (
+    AgentSkillSchemaCatalog,
+    SkillDefinitionCatalog,
+    SkillRouteManifest,
+)
+from agent_gateway.protocol.skill_io_contracts import inline_only_skill_io_catalog_for_routes
+from agent_gateway.runtime.access_policy import AgentSkillAccessPolicy
+from agent_gateway.runtime.operation_port import (
+    AgentGatewayAuthoritativePortReceipt,
+    DeterministicNoIoAgentSkillOperationPort,
+)
+from agent_gateway.runtime.service import AgentGatewayService
 from agent_gateway.transport import unix_transport
 from agent_gateway.transport.unix_transport import (
     AGENT_GATEWAY_UNIX_JSON_PROTOCOL_V2,
@@ -32,6 +49,14 @@ class _FakeBoundFacade(BoundAgentGatewayWireAdapter):
         self.authenticated_client_id = client_id
         self.requests: list[tuple[str, object]] = []
         self.disconnect_reasons: list[str] = []
+        self.domain_state = {
+            "schema": "agent_gateway.domain_control_state.v1",
+            "runtime_session_id": "runtime:test", "emergency_stop_latched": False,
+            "emergency_stop_confirmed": False, "lower_stop_receipt_ref": None,
+        }
+
+    def get_domain_control_state(self):
+        return dict(self.domain_state)
 
     def get_skill_definition_catalog(self):
         self.requests.append(("get_skill_definition_catalog", None))
@@ -200,6 +225,262 @@ def _stop_server(server, thread) -> None:
     server.server_close()
     thread.join(timeout=2.0)
     assert not thread.is_alive()
+
+
+@pytest.mark.parametrize("confirmed", [False, True])
+def test_health_projects_current_owner_state_without_control_requests(short_unix_socket_path_factory, confirmed):
+    facade = _FakeBoundFacade("rpent:test")
+    path = short_unix_socket_path_factory("health-state")
+    server, thread, _ = _start_server(path=path, facade=facade)
+    fault = [None]
+    server.control_fault_reader = lambda: fault[0]
+    try:
+        with socket.socket(socket.AF_UNIX) as peer:
+            peer.connect(str(path))
+            first = _raw_call(peer, request_id="h1", method="healthz", payload=None)
+            assert first["ok"] and first["result"]["domain_control_state"] == facade.domain_state
+            assert first["result"]["control_fault_reason"] is None
+            facade.domain_state.update(emergency_stop_latched=True,
+                emergency_stop_confirmed=confirmed, lower_stop_receipt_ref="lower:proof" if confirmed else None)
+            fault[0] = "lower_control_cycle_failed"
+            second = _raw_call(peer, request_id="h2", method="healthz", payload=None)
+            assert second["ok"] and second["result"]["domain_control_state"] == facade.domain_state
+            assert second["result"]["control_fault_reason"] == fault[0]
+            assert facade.requests == []  # Health reads submit no Skill or stop request.
+        with pytest.raises(RuntimeError, match="already bound"):
+            server.control_fault_reader = lambda: None
+    finally:
+        _stop_server(server, thread)
+
+
+@pytest.mark.parametrize("invalid", ["", "x" * 513, 1])
+def test_health_reader_failure_does_not_publish_ready(short_unix_socket_path_factory, invalid):
+    facade = _FakeBoundFacade("rpent:test")
+    path = short_unix_socket_path_factory("bad-health")
+    server, thread, _ = _start_server(path=path, facade=facade)
+    server.control_fault_reader = lambda: invalid
+    try:
+        with socket.socket(socket.AF_UNIX) as peer:
+            peer.connect(str(path))
+            result = _raw_call(peer, request_id="bad", method="healthz", payload=None)
+            assert not result["ok"] and "result" not in result
+    finally:
+        _stop_server(server, thread)
+
+
+@pytest.mark.parametrize("error", [RuntimeError("offline health failure"), OSError("offline read failure")])
+def test_health_reader_exception_never_returns_a_success_snapshot(short_unix_socket_path_factory, error):
+    facade = _FakeBoundFacade("rpent:test")
+    path = short_unix_socket_path_factory("health-error")
+    server, thread, _ = _start_server(path=path, facade=facade)
+
+    def fail():
+        raise error
+
+    server.control_fault_reader = fail
+    try:
+        with socket.socket(socket.AF_UNIX) as peer:
+            peer.connect(str(path))
+            result = _raw_call(peer, request_id="error", method="healthz", payload=None)
+            assert not result["ok"] and "result" not in result
+    finally:
+        _stop_server(server, thread)
+
+
+@pytest.mark.parametrize("stop_succeeded", [None, True, False], ids=["clear", "confirmed", "unconfirmed"])
+def test_healthz_publishes_real_service_domain_control_state_without_device_io(
+    short_unix_socket_path_factory, monkeypatch, stop_succeeded,
+) -> None:
+    # Use the real service, facade and Unix dispatcher; only the lower port is
+    # synthetic. No upper snapshot or domain_control_state method is mocked.
+    class StopPort:
+        no_io = False
+        port_id = "lower:test-stop"
+
+        def __init__(self):
+            self.calls = []
+
+        def request_emergency_stop(self, *, operation, reason):
+            assert operation is None
+            self.calls.append(reason)
+            return AgentGatewayAuthoritativePortReceipt(
+                port_id=self.port_id, operation_kind="emergency_stop", operation_id=None,
+                succeeded=stop_succeeded is True,
+                status="confirmed" if stop_succeeded else "unconfirmed",
+                completed_at=10.1, call_sequence=len(self.calls) - 1,
+                evidence_refs=("lower:test-stop-receipt",),
+                proves_motion_or_hold=stop_succeeded is True)
+
+    client_id = "rpent:local"
+    definitions = SkillDefinitionCatalog("health-definitions", "1", ())
+    schemas = AgentSkillSchemaCatalog("health-schemas", "1", ())
+    io_catalog = inline_only_skill_io_catalog_for_routes(())
+    manifest = SkillRouteManifest(
+        runtime_session_id="runtime:health-producer", control_domain_id="domain:health-producer",
+        station_manifest_hash="station:test", execution_manifest_hash="execution:test",
+        skill_definition_catalog_hash=definitions.semantic_content_hash,
+        skill_schema_catalog_hash=schemas.semantic_content_hash,
+        skill_io_catalog_hash=io_catalog.semantic_content_hash,
+        target_binding_id="target:test", target_kind="null", current_mode="dry_run",
+        supported_transport_features=(AGENT_GATEWAY_AUTHORITATIVE_PORT_RECEIPT_FEATURE_V1,
+                                      AGENT_GATEWAY_DOMAIN_EMERGENCY_STOP_FEATURE_V1),
+        skill_routes=(), explicit_exclusions=())
+    stop_port = StopPort()
+    operation_port = DeterministicNoIoAgentSkillOperationPort()
+    service = AgentGatewayService(manifest=manifest,
+        access_policy=AgentSkillAccessPolicy(access_policy_id="access:health",
+            allowed_client_ids=(client_id,), allowed_modes=("dry_run",),
+            max_request_timeout_ms=1000, max_grant_lifetime_sec=30.),
+        operation_port=operation_port, domain_emergency_stop_port=stop_port)
+
+    def forbidden(*_args, **_kwargs):
+        pytest.fail("healthz must not observe, poll hardware, launch or grant control")
+
+    facade = BoundAgentGatewayWireAdapter(authenticated_client_id=client_id,
+        definition_catalog=definitions, schema_catalog=schemas, service=service,
+        publish_observation=forbidden, current_station_revision=forbidden,
+        operation_launcher=forbidden, grant_resolver=forbidden)
+    for method in ("get_observation_snapshot", "get_hardware_resource_views", "get_hardware_status_views"):
+        monkeypatch.setattr(facade, method, forbidden)
+    path = short_unix_socket_path_factory("health-producer")
+    server, thread, _ = _start_server(path=path, facade=facade)
+    raw = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    raw.settimeout(1.0)
+    try:
+        raw.connect(str(path))
+        initial = _raw_call(raw, request_id="health:initial", method="healthz", payload=None)
+        assert initial["result"]["domain_control_state"] == {
+            "schema": "agent_gateway.domain_control_state.v1",
+            "runtime_session_id": manifest.runtime_session_id,
+            "emergency_stop_latched": False, "emergency_stop_confirmed": False,
+            "lower_stop_receipt_ref": None}
+        assert initial["result"]["control_fault_reason"] is None
+        assert stop_port.calls == []
+        if stop_succeeded is not None:
+            outcome = service.request_emergency_stop_own_domain(
+                request=AgentOwnDomainEmergencyStopRequest(client_id=client_id,
+                    control_request_id="stop:health", idempotency_key="stop:health",
+                    runtime_session_id=manifest.runtime_session_id,
+                    skill_route_manifest_hash=manifest.semantic_content_hash,
+                    control_domain_id=manifest.control_domain_id,
+                    target_binding_id=manifest.target_binding_id, reason_code="agent_task_aborted"),
+                now=10.1)
+            assert outcome.accepted is stop_succeeded
+        for index in range(2):
+            observed = _raw_call(raw, request_id=f"health:{index}", method="healthz", payload=None)
+            assert observed["result"]["domain_control_state"] == {
+                "schema": "agent_gateway.domain_control_state.v1",
+                "runtime_session_id": manifest.runtime_session_id,
+                "emergency_stop_latched": stop_succeeded is not None,
+                "emergency_stop_confirmed": stop_succeeded is True,
+                "lower_stop_receipt_ref": (None if stop_succeeded is None
+                    else service.emergency_stop_receipt.receipt_id)}
+        assert initial["result"]["domain_control_state"]["emergency_stop_latched"] is False
+        assert stop_port.calls == ([] if stop_succeeded is None else ["agent_task_aborted"])
+        assert operation_port.receipts == ()
+    finally:
+        raw.close()
+        _stop_server(server, thread)
+
+
+@pytest.mark.parametrize("reason", ["control_loop_failed:warn80", "fault:" + "x" * 600])
+def test_retained_control_fault_fences_submissions_but_preserves_diagnostics(
+    short_unix_socket_path_factory, monkeypatch, reason,
+) -> None:
+    path = short_unix_socket_path_factory("retained-fault")
+    facade = _FakeBoundFacade("rpent:local")
+    server, thread, close_calls = _start_server(path=path, facade=facade)
+    raw = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    raw.settimeout(1.0)
+    try:
+        raw.connect(str(path))
+        payload = {"client_id": "rpent:local", "parameters": {}}
+        for method in ("submit_skill_request", "submit_read_only_skill_request"):
+            assert _raw_call(raw, request_id=f"before:{method}", method=method,
+                             payload=payload)["result"]["accepted"] is True
+        facade.requests.clear()
+        assert server.retain_control_fault(reason) is True
+        assert server.retain_control_fault("later failure must not replace the first") is True
+        for invalid in (None, "", " "):
+            with pytest.raises(ValueError):
+                server.retain_control_fault(invalid)
+        assert facade.requests == []
+        for method in ("submit_skill_request", "submit_read_only_skill_request"):
+            rejected = _raw_call(raw, request_id=f"after:{method}", method=method, payload=payload)
+            assert rejected["ok"] is False
+            assert rejected["error"] == {"code": "control_fault_latched", "message": reason[:512]}
+        assert facade.requests == []
+        health = _raw_call(raw, request_id="health:fault", method="healthz", payload=None)
+        assert health["result"]["control_fault_reason"] == reason[:512]
+        assert health["result"]["domain_control_state"] == facade.get_domain_control_state()
+        assert set(health["result"]["domain_control_state"]) == {
+            "schema", "runtime_session_id", "emergency_stop_latched",
+            "emergency_stop_confirmed", "lower_stop_receipt_ref"}
+        # All other methods keep their original dispatch, including controls,
+        # operation reconciliation and retained Artifact access.
+        permitted = unix_transport.AGENT_GATEWAY_UNIX_JSON_METHODS_V2 - {
+            "healthz", "submit_skill_request", "submit_read_only_skill_request"}
+        for method in sorted(permitted):
+            def query(*args, _method=method):
+                facade.requests.append((_method, args))
+                return {"queried": _method}
+
+            monkeypatch.setattr(facade, method, query)
+            response = _raw_call(raw, request_id=f"allowed:{method}", method=method,
+                payload=None if method in unix_transport._NO_PAYLOAD_METHODS else payload)
+            assert response["result"] == {"queried": method}
+        assert [method for method, _ in facade.requests] == sorted(permitted)
+        assert facade.disconnect_reasons == []
+        assert close_calls == []
+        assert server.control_fault_reason == reason[:512]
+    finally:
+        raw.close()
+        _stop_server(server, thread)
+
+
+def test_retained_control_fault_does_not_drain_or_replay_inflight_submission(
+    short_unix_socket_path_factory, monkeypatch,
+) -> None:
+    path = short_unix_socket_path_factory("fault-inflight")
+    facade = _FakeBoundFacade("rpent:local")
+    entered, release = threading.Event(), threading.Event()
+    submit = facade.submit_skill_request
+
+    def pending_submit(payload):
+        entered.set()
+        assert release.wait(timeout=2.0)
+        return submit(payload)
+
+    monkeypatch.setattr(facade, "submit_skill_request", pending_submit)
+    server, thread, _ = _start_server(path=path, facade=facade)
+    worker_channel, query_channel = socket.socket(socket.AF_UNIX), socket.socket(socket.AF_UNIX)
+    pool = ThreadPoolExecutor(max_workers=1)
+    for channel in (worker_channel, query_channel):
+        channel.settimeout(2.0)
+    try:
+        worker_channel.connect(str(path))
+        query_channel.connect(str(path))
+        pending = pool.submit(_raw_call, worker_channel, request_id="inflight:submit",
+            method="submit_skill_request", payload={"client_id": "rpent:local"})
+        assert entered.wait(timeout=1.0)
+        assert server.retain_control_fault("control_loop_failed") is True
+        assert not pending.done()
+        blocked = _raw_call(query_channel, request_id="new:submit",
+            method="submit_skill_request", payload={"client_id": "rpent:local"})
+        assert blocked["error"]["code"] == "control_fault_latched"
+        observed = _raw_call(query_channel, request_id="inflight:query",
+            method="get_own_operation", payload={"client_id": "rpent:local"})
+        assert observed["result"]["reason_code"] == "fake_not_found"
+        release.set()
+        assert pending.result(timeout=1.0)["result"]["accepted"] is True
+        assert [method for method, _ in facade.requests].count("submit_skill_request") == 1
+        assert server.control_fault_reason == "control_loop_failed"
+    finally:
+        release.set()
+        pool.shutdown(wait=True)
+        worker_channel.close()
+        query_channel.close()
+        _stop_server(server, thread)
 
 
 def test_peer_map_is_one_to_one_and_rejects_unconfigured_uid() -> None:

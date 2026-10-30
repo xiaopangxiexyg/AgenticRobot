@@ -74,6 +74,7 @@ from agent_gateway.skills.motion.definition import (
     SAFE_TCP_POSE_TARGET_SKILL_ID_V1,
     TCP_POSE_TARGET_SKILL_ID_V1,
 )
+from agent_gateway.skills.motion.grasped_object import GRASPED_OBJECT_MOVE_SKILL_ID
 from agent_gateway.skills.motion.observed_point import SKILL_ID as OBSERVED_POINT_SKILL_ID
 from agent_gateway.transport.unix_transport import (
     AgentGatewayUnixJsonServer,
@@ -1624,6 +1625,10 @@ def assemble_real_agent_primitive_gateway_session(
                        else contract_bundle.observed_point_profile)
             if profile is None:
                 raise RuntimeError("Observed-point Route has no bound profile.")
+        elif route.skill_id == GRASPED_OBJECT_MOVE_SKILL_ID:
+            profile = contract_bundle.object_motion_profile
+            if profile is None:
+                raise RuntimeError("Object-motion Route has no bound profile.")
         elif route.skill_id in {
             TCP_POSE_TARGET_SKILL_ID_V1,
             SAFE_TCP_POSE_TARGET_SKILL_ID_V1,
@@ -1647,6 +1652,13 @@ def assemble_real_agent_primitive_gateway_session(
         ):
             lifecycle_type = RealAgentPrimitiveSkillLifecycle
             extra = {}
+            if _route.skill_id == GRASPED_OBJECT_MOVE_SKILL_ID:
+                from .object_motion import RealObjectMotionLifecycle
+
+                if held_object_port is None:
+                    raise RuntimeError("Object-motion Route has no held-object port.")
+                lifecycle_type = RealObjectMotionLifecycle
+                extra = {"held_object_port": held_object_port}
             if _route.skill_id == OBSERVED_POINT_SKILL_ID:
                 lifecycle_type = (RealObservedAnchorMotionLifecycle
                                   if _route.skill_version == "2"
@@ -1676,7 +1688,8 @@ def assemble_real_agent_primitive_gateway_session(
                 operation=operation,
                 grasp_trajectory_planner=(
                     safe_pose_trajectory_planner
-                    if _route.skill_id in {SAFE_TCP_POSE_TARGET_SKILL_ID_V1, OBSERVED_POINT_SKILL_ID}
+                    if _route.skill_id in {SAFE_TCP_POSE_TARGET_SKILL_ID_V1, OBSERVED_POINT_SKILL_ID,
+                                           GRASPED_OBJECT_MOVE_SKILL_ID}
                     else grasp_trajectory_planner
                     if _route.skill_id == GRASP_APPROACH_SKILL_ID_V1
                     else None
@@ -1746,6 +1759,7 @@ def assemble_real_agent_primitive_gateway_session(
     back_projection_capture_port = None
     localization_executor = None
     segmentation_provider = None
+    held_object_port = None
     segmentation_executor = None
     surface_anchor_executor = None
     tool_object_relation_executor = None
@@ -1920,6 +1934,30 @@ def assemble_real_agent_primitive_gateway_session(
                 clock=clock, max_retained_operations=max_retained_operations)
             execution_port_by_route_hash[relation_registration.entry.route.semantic_content_hash] = (
                 tool_object_relation_executor)
+        if contract_bundle.object_motion_profile is not None:
+            if (tool_entity_options is None or segmentation_provider is None
+                    or relation_registration is None):
+                raise ValueError("Real object motion needs tool-object relations, segmentation and aligned RGB-D.")
+            from .held_object import RealHeldObjectObserver
+            from .object_motion import RealHeldObjectPort
+
+            def _gripper_reader(port_item):
+                return port_item.observe_state
+
+            held_object_port = RealHeldObjectPort(
+                observer=RealHeldObjectObserver(
+                    scene_port=tool_scene_port, segmentation_provider=segmentation_provider,
+                    tool_entity_by_side=tool_entity_options.tool_entity_by_side,
+                    roles=tuple(back_projection_registration.profile.roles),
+                    gripper_state_by_side={
+                        component.split("_", 1)[0]: _gripper_reader(item)
+                        for component, item in gripper_ports.items()
+                        if component.split("_", 1)[0] in {"left", "right"}
+                        and callable(getattr(item, "observe_state", None))},
+                    maximum_depth_m=min(RELATION_MAXIMUM_DEPTH_M,
+                                        back_projection_registration.profile.maximum_depth_m)),
+                public_from_geometry=tool_entity_options.public_from_geometry,
+                current_station_revision=lambda: producer.current_station_revision, clock=clock)
         if hover_registration is not None:
             if anchor_registration is None or tool_entity_options.hover_planner is None:
                 raise ValueError("Real tool hover queries require surface anchor v2 and their planner.")

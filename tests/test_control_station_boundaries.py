@@ -357,6 +357,8 @@ def test_gateway_numerical_dependencies_are_confined_to_concrete_profiles() -> N
         "agent_gateway/profiles/mujoco/support_release_query.py": ["numpy"],
         "agent_gateway/profiles/mujoco/grasp_approach_query.py": ["numpy"],
         "agent_gateway/profiles/real/tool_entity.py": ["numpy"],
+        "agent_gateway/profiles/real/held_object.py": ["numpy"],
+        "agent_gateway/profiles/real/object_motion.py": ["numpy"],
         # The concrete RM65 assembly builds the tool-entity public frame and
         # the request-owned FK inputs at this profile edge.
         "agent_gateway/profiles/real/rm65_composition.py": ["numpy"],

@@ -134,6 +134,22 @@ Grant。它的公共目标始终是 `canonical_station` 下的实际 DMTAC `tool
 再决定是否恢复。FAULT、混合／异常 execution gate 和已关闭的 owner 仍拒绝；失败 HOLD
 不会被当作正常收尾。这使正常到达并 HOLD 后可以继续下一个 Skill，不削弱原有保护。
 
+独占真机 Skill 的 CANFD 目标仍为 120 Hz，低频阈值为 80 Hz、仅报警；这一显式
+配置不改变其他部署的严格默认值，也不放宽线程故障、目标过期、SDK 错误、力保护或
+禁止追赶策略。控制线程故障时，先在下层锁存 activation 准入，再由原 owner 执行
+fail-closed HOLD；迟到的规划不能替换该 HOLD。生产 Unix transport 随后只保留
+目录、操作/Artifact 查询与取消、HOLD、急停等控制通道，两类新 Skill 提交均拒绝。
+没有确认具备拒绝新提交能力的 transport 仍按原路径关闭，不自动恢复控制。
+配置夹爪的组合仍采用原 shutdown/close 以执行组合 stop，不把 arm-only HOLD 当作
+已停止夹爪的证明；本批仅对不含夹爪执行 owner 的会话保留故障诊断连接。
+
+`healthz` 的 `domain_control_state` 复用域急停状态 v1；外层可选
+`control_fault_reason` 是稳定原因码，不是停止证明。失败操作的
+`progress_summary.failure_diagnostic` 保留阶段和原始下层原因，最多 8 个字符串字段、
+每值 512 UTF-8 字节，截断时另标 `diagnostic_truncated=true`；它不增加 authority
+receipt 权限、不改变原 receipt hash。正常退出仍由原会话 owner 收尾；控制故障后的
+退出码仍为失败，不能因诊断连接保留而记为运行成功。
+
 需要从当前姿态做较远但仍受原有 envelope 约束的诊断移动时，可用
 `--relative-delta-xyz-m DX DY DZ` 替代绝对目标或相机 proposal。该偏移沿
 `canonical_station` 的 XYZ 轴解释；客户端只从同一份提交所绑定的 fresh observation

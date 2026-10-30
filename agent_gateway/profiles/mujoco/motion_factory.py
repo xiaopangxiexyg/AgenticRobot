@@ -575,6 +575,8 @@ def build_mujoco_agent_tcp_pose_gateway_session(
     enable_grasp_approach_queries: bool = False,
     grasp_query_prompt_by_id: Mapping[str, str] | None = None,
     grasp_query_roles: tuple[str, ...] | None = None,
+    tool_hover_region_budget_sec: float | None = None,
+    tool_hover_candidate_budget_sec: float | None = None,
 ) -> MujocoAgentTcpPoseGatewaySession:
     """Build the exact default-off graph; do not start, record, or serve it."""
 
@@ -588,6 +590,9 @@ def build_mujoco_agent_tcp_pose_gateway_session(
     if enable_tool_hover_queries and (not enable_surface_anchor_v2 or safe_motion_observation is None
                                       or not enable_safe_tcp_pose):
         raise ValueError("Tool hover queries require surface anchor v2 and the observed safe TCP scene.")
+    if not enable_tool_hover_queries and (tool_hover_region_budget_sec is not None
+                                          or tool_hover_candidate_budget_sec is not None):
+        raise ValueError("Tool hover search budgets require enabled tool hover queries.")
 
     if type(enable_named_release_v3) is not bool or (enable_named_release_v3 and not (
             enable_object_support_motion_v2 and enable_grippers
@@ -1017,6 +1022,8 @@ def build_mujoco_agent_tcp_pose_gateway_session(
             tool_entity_by_side=tool_entity_by_side,
             tool_hover_roles=(() if safe_motion_observation is None
                               else tuple(safe_motion_observation.observation.roles)),
+            tool_hover_region_budget_sec=tool_hover_region_budget_sec,
+            tool_hover_candidate_budget_sec=tool_hover_candidate_budget_sec,
             history_profile=(
                 None if history_storage is None else history_storage.profile
             ),

@@ -750,6 +750,77 @@ def test_resource_transaction_closes_partial_lower_start() -> None:
     assert source.closes == 1
 
 
+@pytest.mark.parametrize("fail_preparation", [False, True])
+def test_static_preparation_runs_once_before_any_device_start(monkeypatch, fail_preparation):
+    events = []
+
+    def prepare():
+        events.append("prepare")
+        if fail_preparation:
+            raise ModuleNotFoundError("missing CAD runtime")
+
+    monkeypatch.setattr(realsense_perception, "_formal_close_camera_sources",
+        lambda _: events.append("camera.close"))
+    resource = lambda name: SimpleNamespace(
+        start=lambda: events.append(name + ".start"),
+        close=lambda: events.append(name + ".close"))
+    resources = ExclusiveRealPerceptionResources(
+        lower=resource("arm"), camera_sources={"front": object()},
+        artifact_store=resource("store"), additional_resources=(resource("model"),),
+        prepare_static_geometry=prepare,
+        start_cameras=lambda _: events.append("camera.start"),
+        admit_cameras=lambda _: events.append("camera.admit"),
+    )
+    if fail_preparation:
+        with pytest.raises(ModuleNotFoundError, match="missing CAD runtime"):
+            resources.start()
+        assert resources._closed
+        with pytest.raises(RuntimeError, match="cannot restart"):
+            resources.start()
+        resources.close()
+        resources.close()
+        assert events == ["prepare", "store.close"]
+    else:
+        resources.start()
+        resources.start()
+        assert events == ["prepare", "camera.start", "camera.admit", "model.start", "arm.start"]
+        resources.close()
+        resources.close()
+        assert events[5:] == ["arm.close", "model.close", "camera.close", "store.close"]
+
+
+def test_static_preparation_failure_retries_only_unfinished_store_close(monkeypatch):
+    events = []
+
+    def prepare():
+        raise ModuleNotFoundError("missing CAD runtime")
+
+    def close_store():
+        events.append("store.close")
+        if len(events) == 1:
+            raise RuntimeError("store is still busy")
+
+    def unexpected():
+        pytest.fail("No device or model lifecycle may run after static preparation failed")
+
+    monkeypatch.setattr(realsense_perception, "_formal_close_camera_sources", lambda _: unexpected())
+    resources = ExclusiveRealPerceptionResources(
+        lower=SimpleNamespace(start=unexpected, close=unexpected),
+        camera_sources={"front": object()},
+        additional_resources=(SimpleNamespace(start=unexpected, close=unexpected),),
+        artifact_store=SimpleNamespace(close=close_store), prepare_static_geometry=prepare,
+        start_cameras=lambda _: unexpected(), admit_cameras=lambda _: unexpected(),
+    )
+    with pytest.raises(ModuleNotFoundError, match="missing CAD runtime"):
+        resources.start()
+    assert not resources._closed
+    with pytest.raises(RuntimeError, match="cannot restart"):
+        resources.start()
+    resources.close()
+    resources.close()
+    assert resources._closed and events == ["store.close", "store.close"]
+
+
 def test_resource_transaction_retries_only_incomplete_close_stages(monkeypatch) -> None:
     events: list[str] = []
 

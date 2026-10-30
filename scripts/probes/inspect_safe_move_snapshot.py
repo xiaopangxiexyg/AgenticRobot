@@ -30,7 +30,7 @@ from robot_motion.rm65.captured_robot_observations import (
 )
 from scripts.probes.capture_rm65_grasp_snapshot import stationarity
 from scripts.probes.replay_bimanual_grasp_snapshot import load_snapshot_report
-from teleop_runtime.skill_deploy.rm65_grasp_trajectory import RM65GraspJointTrajectoryPlanner
+from teleop_runtime.skill_deploy.rm65_grasp_trajectory import RM65GraspJointTrajectoryPlanner, RM65GraspTrajectoryPlanningConfig
 from teleop_runtime.skill_deploy.rm65_lower_assembly import build_exclusive_rm65_skill_target_builder
 from teleop_runtime.skill_deploy.rm65_profile import (
     ExclusiveRM65SkillDeploymentProfile, resolve_exclusive_rm65_skill_deployment_profile,
@@ -226,11 +226,13 @@ def inspect_captures(captures, *, cleaner, config, profile, builder, output, max
     # This constructor owns independent FK/collision data. Never call its
     # trajectory search, an executor, or any lower resource lifecycle here.
     planner = RM65GraspJointTrajectoryPlanner(profile=profile, planning_target_builder=builder,
-        target_envelope_filter=None, observed_obstacles=cloud)
+        target_envelope_filter=None, observed_obstacles=cloud,
+        config=RM65GraspTrajectoryPlanningConfig(minimum_observed_clearance_m=config.minimum_clearance_m))
     check = planner.oracle.check(qpos)
     boxes = planner.oracle.world_obstacle_proxy_boxes(qpos)
     observed_distance, nearest = ObservedBoxDistance(cloud).check_boxes(boxes,
-        clearance_m=planner.scene.minimum_clearance_m)
+        clearance_m=(planner.scene.minimum_clearance_m if config.minimum_clearance_m is None
+                     else config.minimum_clearance_m))
     point = None if nearest is None else np.array(nearest['occupied_center_world_m'])
     box_payload = [{'name': name, 'pose': pose.tolist(), 'half': half.tolist(),
                     'corners': corners(pose, half).tolist()} for name, pose, half in boxes]
@@ -308,6 +310,7 @@ def main():
     parser.add_argument('--output', type=Path)
     parser.add_argument('--check-only', action='store_true')
     parser.add_argument('--envelope-profile', type=Path)
+    parser.add_argument('--observed-clearance-m', type=float)
     parser.add_argument('--captured-robot-filter-config', type=Path)
     parser.add_argument('--captured-robot-observation-urdf', type=Path)
     parser.add_argument('--captured-robot-self-envelope-urdf', type=Path)
@@ -328,7 +331,8 @@ def main():
     if args.capture is None or args.output is None:
         parser.error('--capture and --output are required unless --check-only is used')
     captures = load_captures(args.capture, profile, binding, geometry)
-    report = inspect_captures(captures, cleaner=cleaner, config=SafeMotionObservationConfig(),
+    report = inspect_captures(captures, cleaner=cleaner,
+        config=SafeMotionObservationConfig(minimum_clearance_m=args.observed_clearance_m),
         profile=profile, builder=builder, output=args.output)
     print(json.dumps({'output': str(args.output), 'collision_reason': report['collision_check']['reason'],
         'inspection': str(args.output / 'inspection.html'), 'device_connections': False}))

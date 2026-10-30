@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import math
 import threading
 import time
@@ -16,6 +17,8 @@ from utils.owned_thread import OwnedThread
 
 from .exclusive_factory import ExclusiveRealAgentPrimitiveDeployment
 
+_LOGGER = logging.getLogger(__name__)
+
 
 class ExclusiveRealSkillResources(Protocol):
     """Lower resource transaction; the Gateway never receives this object."""
@@ -27,6 +30,12 @@ class ExclusiveRealSkillResources(Protocol):
 
 class ExclusiveRealSkillServer(Protocol):
     """Bounded server lifecycle needed by the application owner."""
+
+    @property
+    def control_fault_reader(self) -> Callable[[], str | None] | None: ...
+
+    @control_fault_reader.setter
+    def control_fault_reader(self, reader: Callable[[], str | None]) -> None: ...
 
     def serve_forever(self, poll_interval: float = 0.5) -> None: ...
 
@@ -119,6 +128,19 @@ class ExclusiveRealSkillApplication:
             return self._control_fault
 
     @property
+    def control_fault_reason(self) -> str | None:
+        """Read the application's existing fault/lifecycle state; no device I/O."""
+        with self._lock:
+            fault, state = self._control_fault, self._state
+        if fault is not None:
+            name = type(fault).__name__
+            detail = " ".join(str(fault).split())
+            return (f"{name}: {detail}" if detail else name)[:512].strip()
+        if state != ExclusiveRealSkillApplicationState.RUNNING:
+            return f"application_not_running:{state.value}"
+        return None
+
+    @property
     def startup_admission_receipt(self) -> object | None:
         with self._lock:
             return self._startup_admission_receipt
@@ -158,6 +180,7 @@ class ExclusiveRealSkillApplication:
                 self.deployment.control_runtime.request_startup_hold()
             self.deployment.control_runtime.step()
             server = self.server_factory()
+            server.control_fault_reader = lambda: self.control_fault_reason
             for name in ("serve_forever", "shutdown", "server_close"):
                 if not callable(getattr(server, name, None)):
                     raise TypeError(f"server must expose {name}.")
@@ -215,12 +238,28 @@ class ExclusiveRealSkillApplication:
             try:
                 self.deployment.control_runtime.step()
             except BaseException as exc:  # noqa: BLE001 - fail closed then stop.
+                reason = (
+                    "lower_backend_not_ready"
+                    if isinstance(exc, PositionDispatchNotReady)
+                    else "exclusive_skill_control_cycle_failed"
+                )
+                self.deployment.control_runtime.motion_port.fence_activations(reason)
+                with self._lock:
+                    server = self._server
+                retain_fault = getattr(server, "retain_control_fault", None)
+                diagnostics_retained = False
+                if (callable(retain_fault)
+                        and self.deployment.gateway_session.contract_bundle.gripper_contract is None):
+                    try:
+                        # Fence all submissions before HOLD. Only the existing
+                        # transport may retain queries; it never resumes control.
+                        diagnostics_retained = retain_fault(reason) is True
+                    except Exception:  # noqa: BLE001 - old shutdown remains fail-closed.
+                        _LOGGER.exception("Unable to fence diagnostic transport after control fault")
+                        diagnostics_retained = False
+                # Composed hand owners still require their existing close path
+                # to stop active gripper commands; arm HOLD alone is not enough.
                 try:
-                    reason = (
-                        "lower_backend_not_ready"
-                        if isinstance(exc, PositionDispatchNotReady)
-                        else "exclusive_skill_control_cycle_failed"
-                    )
                     diagnostic = " ".join(str(exc).split())[:512]
                     self.deployment.control_runtime.fail_closed(
                         reason + (f": {diagnostic}" if diagnostic else "")
@@ -235,7 +274,16 @@ class ExclusiveRealSkillApplication:
                     self._state = ExclusiveRealSkillApplicationState.FAULT
                     server = self._server
                 self._control_stop.set()
-                if self._serving.is_set() and server is not None:
+                if diagnostics_retained:
+                    # The transport keeps serving, so make the latch visible to
+                    # the operator instead of looking like a silent stall.
+                    _LOGGER.error(
+                        "Real Skill control loop fault latched: %s: %s. Lower HOLD was "
+                        "requested; new Skill submissions are rejected and the Gateway "
+                        "stays up only for queries. Press Ctrl+C to close it.",
+                        type(exc).__name__, " ".join(str(exc).split())[:512],
+                    )
+                if self._serving.is_set() and server is not None and not diagnostics_retained:
                     server.shutdown()
                 return
             deadline += period
@@ -246,7 +294,7 @@ class ExclusiveRealSkillApplication:
         *,
         ready_callback: Callable[[], None] | None = None,
     ) -> None:
-        """Run the sole Gateway server until shutdown or a lower control fault.
+        """Serve until explicit shutdown; faults retain fenced diagnostics.
 
         The callback is a process-host seam: it runs only after lower startup
         admission and server construction, immediately before transport

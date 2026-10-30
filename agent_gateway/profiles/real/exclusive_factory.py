@@ -220,6 +220,9 @@ def assemble_exclusive_real_agent_primitive_deployment(
             "tool_hover_planner_profile_hash": (None if tool_entity_options.hover_planner is None
                                                 else tool_entity_options.hover_planner.profile_hash),
             "tool_hover_roles": tool_entity_options.hover_roles,
+            "tool_hover_region_budget_sec": tool_entity_options.hover_region_budget_sec,
+            "tool_hover_candidate_budget_sec": tool_entity_options.hover_candidate_budget_sec,
+            "object_motion": tool_entity_options.object_motion,
         }),
         primary_component_id=primary_component_id,
         gripper_contract=gripper_contract,

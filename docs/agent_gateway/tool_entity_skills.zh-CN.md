@@ -21,6 +21,9 @@
   最近的点、中心、面中心、Halton 填充；候选按到达容差内缩，规划终点按**原始**区间重新测量。
   搜索总预算 20 s，每个候选 5 s（2026-10-29 起；倾斜锥悬停在 3 s 时经常来不及完成）。路由
   上限 40 s。`query_incomplete` 表示预算内没有完成，不能证明不可行。
+  部署可用 `--tool-hover-candidate-budget-sec`/`--tool-hover-region-budget-sec` 放宽
+  （真机和 MuJoCo CLI 相同；候选不超过总预算，上限 120 s/240 s，需同时启用悬停查询）。
+  预算进入悬停 Profile 哈希，路由上限为总预算 + 20 s 采集/点云余量，结果校验要求使用本部署预算。
 - 结果中的位姿使用与 `motion.move_tcp_to_pose_safe@1` 相同的公共参考系（注册时强制检查）。
   上层把 `target_tcp_pose_xyz_quat_xyzw` 原样提交给该运动 Skill；运动 Skill 会在新的场景上
   重新规划和检查，悬停查询本身不保留计划。

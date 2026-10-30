@@ -17,6 +17,7 @@ in the public reference frame. Nothing here moves a robot or retains a plan.
 
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
 
@@ -71,10 +72,14 @@ from robot_motion.tool_entity_scene import (
     pose_xyz_quat_xyzw,
     require_vertical_frame,
     search_entity_hover_paths,
+    validate_hover_budgets,
 )
 
 TOOL_OBJECT_RELATION_MAX_OPERATION_MS = 90_000
-TOOL_HOVER_MAX_OPERATION_MS = 40_000
+# Capture, cloud and result reserve on top of the hover search budget; the
+# default 20 s search gives the original 40 s Route.
+TOOL_HOVER_SCENE_RESERVE_SEC = 20.
+TOOL_HOVER_MAX_OPERATION_MS = int((ENTITY_HOVER_REGION_BUDGET_SEC + TOOL_HOVER_SCENE_RESERVE_SEC) * 1000)
 # Leave the executor time to validate and retain its result before the deadline.
 _RESULT_RESERVE_SEC = 1.0
 SIDES = ("left", "right")
@@ -91,6 +96,9 @@ class ToolEntityRegistration:
     roles: tuple[str, ...]
     component_side_by_id: Mapping[str, str]
     reference_frame_id: str
+    # Hover only: the deployment's search budgets (bound into the profile).
+    region_budget_sec: float | None = None
+    candidate_budget_sec: float | None = None
 
 
 def _identity(entities):
@@ -184,8 +192,17 @@ def build_tool_object_relation_registration(*, segmentation, back_projection, ro
 
 
 def build_tool_hover_registration(*, capture_registration, back_projection, component_side_by_id, roles,
-                                  tool_entity_by_side, planner_profile_hash):
-    """Bind hover queries to an authenticated anchor producer and a safe-motion planner profile."""
+                                  tool_entity_by_side, planner_profile_hash,
+                                  region_budget_sec=ENTITY_HOVER_REGION_BUDGET_SEC,
+                                  candidate_budget_sec=ENTITY_HOVER_CANDIDATE_BUDGET_SEC):
+    """Bind hover queries to an authenticated anchor producer and a safe-motion planner profile.
+
+    ``region_budget_sec``/``candidate_budget_sec`` are this deployment's search
+    budgets (defaults 20 s/5 s). They enter the profile identity and size the
+    Route: max duration = region budget + capture/cloud reserve.
+    """
+    region_budget_sec, candidate_budget_sec = validate_hover_budgets(
+        region_budget_sec=region_budget_sec, candidate_budget_sec=candidate_budget_sec)
     sides = dict(component_side_by_id)
     if (not sides or not set(sides.values()) <= set(SIDES)
             or len(set(sides.values())) != len(sides)
@@ -206,8 +223,8 @@ def build_tool_hover_registration(*, capture_registration, back_projection, comp
         "roles": list(roles), "components": dict(sorted(sides.items())),
         "tool_entities": _identity({side: tool_entity_by_side[side] for side in sides.values()}),
         "planner_profile": planner_profile_hash,
-        "region_budget_sec": ENTITY_HOVER_REGION_BUDGET_SEC,
-        "candidate_budget_sec": ENTITY_HOVER_CANDIDATE_BUDGET_SEC,
+        "region_budget_sec": region_budget_sec,
+        "candidate_budget_sec": candidate_budget_sec,
         "evaluation_frame": "public_reference_frame",
     }, domain="agenticrobot.tool_entity_hover.profile.v1")
     definition = hover_definition()
@@ -223,7 +240,8 @@ def build_tool_hover_registration(*, capture_registration, back_projection, comp
         execution_result_schema_hash=schema.execution_result_schema_hash,
         task_evaluation_schema_hash=schema.task_evaluation_schema_hash, input_artifact_slots=(slot,))
     route = _clone_route(back_projection.skill.routes[0], definition=definition, schema=schema,
-        io_contract=io_contract, suffix=".tool_hover_paths", max_operation_duration_ms=TOOL_HOVER_MAX_OPERATION_MS)
+        io_contract=io_contract, suffix=".tool_hover_paths",
+        max_operation_duration_ms=int(math.ceil((region_budget_sec + TOOL_HOVER_SCENE_RESERVE_SEC) * 1000)))
     binding = _clone_binding(back_projection.binding, prefix="tool-hover-paths", route=route)
     components = tuple(sorted(sides))
 
@@ -239,6 +257,10 @@ def build_tool_hover_registration(*, capture_registration, back_projection, comp
         validate_hover_query(value["hover_query"], component_ids=components, reference_frame_id=frame)
         if value["surface_anchor"]["measurement"]["reference_frame_id"] != frame:
             raise ValueError("Hover anchor uses another reference frame.")
+        query = value["hover_query"]
+        if (query["region_budget_sec"] != region_budget_sec
+                or query["candidate_budget_sec"] != candidate_budget_sec):
+            raise ValueError("Hover query used another search budget than its deployment.")
 
     def validate_result_for_parameters(parameters, result):
         validate_parameters(parameters)
@@ -257,7 +279,7 @@ def build_tool_hover_registration(*, capture_registration, back_projection, comp
             "status": "configured_requires_surface_anchor_live_rgbd_and_safe_motion_planner"},
             domain="agenticrobot.tool_entity_hover.availability.v1"))
     return ToolEntityRegistration(SkillRegistrationTemplate(definition, schema, io_contract, (route,)), entry,
-        validator, profile_hash, roles, sides, frame)
+        validator, profile_hash, roles, sides, frame, region_budget_sec, candidate_budget_sec)
 
 
 def _transform_points(transform, points):
@@ -343,7 +365,9 @@ def run_tool_object_relations(*, parameters, roles, reference_frame_id, scene_po
 
 
 def run_tool_hover_query(*, parameters, anchor_xyz_m, side, roles, reference_frame_id, scene_port, planner_port,
-                         entity, expected_station_revision, cancel_requested, clock, deadline):
+                         entity, expected_station_revision, cancel_requested, clock, deadline,
+                         region_budget_sec=ENTITY_HOVER_REGION_BUDGET_SEC,
+                         candidate_budget_sec=ENTITY_HOVER_CANDIDATE_BUDGET_SEC):
     """One hover request over typed ports, evaluated in the public reference frame."""
     public_from_geometry = require_vertical_frame(scene_port.public_from_geometry)
     geometry_from_public = np.linalg.inv(public_from_geometry)
@@ -378,7 +402,8 @@ def run_tool_hover_query(*, parameters, anchor_xyz_m, side, roles, reference_fra
         tool_axis_max_tilt_rad=float(parameters["tool_axis_max_tilt_rad"]),
         max_candidates=parameters["max_candidates"], translation_tolerance_m=planner_port.translation_tolerance_m,
         rotation_tolerance_rad=planner_port.rotation_tolerance_rad, plan_candidate=plan_candidate,
-        cancel_requested=cancel_requested, clock=clock, deadline=deadline)
+        cancel_requested=cancel_requested, clock=clock, deadline=deadline,
+        region_budget_sec=region_budget_sec, candidate_budget_sec=candidate_budget_sec)
     return {"component_id": parameters["component_id"], "reference_frame_id": reference_frame_id,
             "station_revision": revision, "anchor_xyz_m": anchor_xyz, "source_tcp_pose_xyz_quat_xyzw": source_tcp,
             **summary,
@@ -438,7 +463,9 @@ def build_tool_hover_executor(*, registration, capture_registration, scene_port,
             scene_port=scene_port, planner_port=planner_port, entity=entity, expected_station_revision=revision,
             cancel_requested=lambda: (executor.cancel_requested(operation.operation_id)
                                       or clock() >= operation.deadline_at),
-            clock=clock, deadline=operation.deadline_at - _RESULT_RESERVE_SEC)
+            clock=clock, deadline=operation.deadline_at - _RESULT_RESERVE_SEC,
+            region_budget_sec=registration.region_budget_sec,
+            candidate_budget_sec=registration.candidate_budget_sec)
         if current_station_revision() != revision:
             raise RuntimeError("Station revision changed during the hover query; recapture the anchor.")
         payload = {"surface_anchor": anchor, "anchor_artifact_id": artifact_id, "hover_query": query}
@@ -463,6 +490,7 @@ class ToolHoverScene:
 
 __all__ = [
     "TOOL_HOVER_MAX_OPERATION_MS",
+    "TOOL_HOVER_SCENE_RESERVE_SEC",
     "TOOL_OBJECT_RELATION_MAX_OPERATION_MS",
     "HoverPlanOutcome",
     "ToolEntityRegistration",

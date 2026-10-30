@@ -2102,6 +2102,8 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
     enable_grasp_approach_queries: bool = False,
     grasp_query_prompt_by_id: Mapping[str, str] | None = None,
     grasp_query_roles: tuple[str, ...] | None = None,
+    tool_hover_region_budget_sec: float | None = None,
+    tool_hover_candidate_budget_sec: float | None = None,
 ) -> MujocoAgentTcpPoseContractBundle:
     """Project one already-constructed no-model application without starting it."""
 
@@ -3197,7 +3199,11 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
                     "planner": "mujoco_private_collision_checked_joint_path_v1",
                     "observed_scene": safe_motion_observation_profile_hash,
                     "safe_motion_route": safe_entry[2].semantic_content_hash},
-                    domain="agenticrobot.mujoco.tool_hover_planner_binding.v1")),)
+                    domain="agenticrobot.mujoco.tool_hover_planner_binding.v1"),
+                **({} if tool_hover_region_budget_sec is None
+                   else {"region_budget_sec": tool_hover_region_budget_sec}),
+                **({} if tool_hover_candidate_budget_sec is None
+                   else {"candidate_budget_sec": tool_hover_candidate_budget_sec})),)
             if tool_entity_registrations[-1].reference_frame_id != safe_entry[3].motion_profile.reference_frame_id:
                 # The selected pose is submitted unchanged to the safe TCP Route.
                 raise ValueError("MuJoCo tool hover results must use the safe TCP Route's public frame.")

@@ -9,6 +9,7 @@ from deployments.dmtac_graspgenx_alignment_ids import (
 
 import argparse
 import json
+import math
 import os
 import signal
 import stat
@@ -207,6 +208,20 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_const", const=False,
         help="Reject observed safe-move starts below the ordinary 20 mm clearance (the pre-2026-10-29 default).")
     parser.set_defaults(enable_inherited_start_clearance=None)
+    parser.add_argument("--ignore-start-collisions", action="store_true",
+        help=("Experiment mode for observed safe TCP moves and hover queries: never reject a request "
+              "because of collisions at its measured start. Observed voxels already within the observed "
+              "clearance of the robot proxies at the start (cables, attachments, residual self "
+              "observation) are not obstacles for that request; fixed-scene pairs in contact at the "
+              "start may not get worse and must exit. Path, target, workspace and HOLD checks are "
+              "unchanged. Requires --safe-motion-observation-roles; not with --strict-start-clearance."))
+    parser.add_argument("--force-guard-stale-policy", choices=("trip", "warn"), default="trip",
+        help=("Position force guard reaction to a force reading older than 0.4 s. trip (default): "
+              "latch a fault and stop both arms. warn: log and count only; a stale reading never "
+              "latches a fault, blocks motion admission or stops an executing motion. Force/torque "
+              "limits and consecutive reader errors still trip in both modes."))
+    parser.add_argument("--safe-motion-observed-clearance-m", type=float,
+        help="explicit observed-cloud clearance for safe TCP only; default inherits fixed-scene margin; no contact exemption")
     parser.add_argument("--safe-motion-debug-dir", type=Path,
         help="existing private directory for exact RGB-D, filtered points and safe-move rejection evidence; opt-in, no extra captures")
     parser.add_argument("--enable-spatial-goals", action=argparse.BooleanOptionalAction,
@@ -228,6 +243,14 @@ def build_parser() -> argparse.ArgumentParser:
         help=("Publish read-only perception.query_tool_hover_paths@1 (gripper-box hover paths checked by the "
               "observed safe-move planner, never dispatched); requires surface anchor v2, "
               "--safe-motion-observation-roles and move_tcp_to_pose_safe; default off."))
+    parser.add_argument("--tool-hover-candidate-budget-sec", type=float, default=None,
+        help=("Planning budget per hover proposal for perception.query_tool_hover_paths@1 "
+              "(default 5; at most 120 and the region budget); requires --enable-tool-hover-queries."))
+    parser.add_argument("--tool-hover-region-budget-sec", type=float, default=None,
+        help=("Total hover search budget per request (default 20; at most 240). The Route allows "
+              "this plus 20 s for capture and the obstacle cloud; requires --enable-tool-hover-queries."))
+    parser.add_argument("--camera-single-start", action="store_true",
+        help="Use the existing single-start camera policy: no retries, restart or reset; default off.")
     parser.add_argument("--enable-point-grasp-finger-exchange", action="store_true",
         help="Register point-grasp v5 with separately readmitted 180-degree finger exchanges; requires GraspGenX and arm reachability.")
     parser.add_argument(
@@ -365,6 +388,16 @@ def build_parser() -> argparse.ArgumentParser:
             "valid IK branch preference; estimated_execution_time uses the "
             "configured per-joint velocity limits without adding path searches "
             "(default: estimated_execution_time)"
+        ),
+    )
+    parser.add_argument(
+        "--grasp-endpoint-joint-limit-margin-deg",
+        type=float,
+        default=0.0,
+        help=(
+            "keep IK endpoints this many degrees inside the RM65 software joint "
+            "limits (0..10, default 0 = full range); a planned rest pose then "
+            "never sits on a bound that the next measured start could exceed"
         ),
     )
     parser.add_argument(
@@ -626,6 +659,9 @@ def _ready_payload(
         "socket_mode": format(getattr(composition, "socket_mode", 0o600), "04o"),
         "target_kind": manifest.target_kind,
         "current_mode": manifest.current_mode,
+        "position_force_guard_stale_policy": getattr(getattr(getattr(
+            getattr(getattr(composition, "lower", None), "ports", None), "position_force_guard", None),
+            "config", None), "stale_policy", None),
         "runtime_session_id": manifest.runtime_session_id,
         "control_domain_id": manifest.control_domain_id,
         "target_binding_id": manifest.target_binding_id,
@@ -914,6 +950,11 @@ def _emit_lifecycle_event(payload: dict[str, Any]) -> None:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    # Flag-only conflicts of the experiment start-collision mode, before any resource check.
+    if args.ignore_start_collisions and args.safe_motion_observation_roles is None:
+        parser.error("--ignore-start-collisions requires --safe-motion-observation-roles")
+    if args.ignore_start_collisions and args.enable_inherited_start_clearance is False:
+        parser.error("--ignore-start-collisions cannot be combined with --strict-start-clearance")
     if args.enable_surface_anchor_v2 or args.enable_tool_object_relations:
         tokens = sys.argv[1:] if argv is None else argv
         timeout_explicit = any(token == "--sam3-timeout-sec"
@@ -1036,6 +1077,9 @@ def main(argv: list[str] | None = None) -> int:
         )
     if args.debug_motion_skill and args.motion_trace_root is None:
         parser.error("--debug-motion-skill requires --motion-trace-root")
+    if (not math.isfinite(args.grasp_endpoint_joint_limit_margin_deg)
+            or not 0.0 <= args.grasp_endpoint_joint_limit_margin_deg <= 10.0):
+        parser.error("--grasp-endpoint-joint-limit-margin-deg must be within [0, 10]")
 
     socket_path = _absolute_socket_path(parser, args.socket_path)
     camera_registry_arg = _effective_camera_registry(args)
@@ -1050,6 +1094,8 @@ def main(argv: list[str] | None = None) -> int:
         )
     if (args.enable_point_grasp or args.enable_back_projection or args.safe_motion_observation_roles is not None) and not all(perception_supplied):
         parser.error("Point-grasp, back projection or observed safe motion requires the composed camera options")
+    if args.camera_single_start and not all(perception_supplied):
+        parser.error("--camera-single-start requires the composed camera options")
     if args.safe_motion_debug_dir is not None and args.safe_motion_observation_roles is None:
         parser.error("--safe-motion-debug-dir requires --safe-motion-observation-roles")
     if args.enable_inherited_start_clearance and args.safe_motion_observation_roles is None:
@@ -1076,6 +1122,28 @@ def main(argv: list[str] | None = None) -> int:
     ):
         parser.error("--enable-tool-hover-queries requires --enable-surface-anchor-v2, "
                      "--safe-motion-observation-roles and the move_tcp_to_pose_safe action")
+    if "move_grasped_object_to_pose" in actions and (
+        not args.enable_tool_object_relations or args.safe_motion_observation_roles is None
+        or "move_tcp_to_pose_safe" not in actions
+    ):
+        parser.error("move_grasped_object_to_pose requires --enable-tool-object-relations, "
+                     "--safe-motion-observation-roles and the move_tcp_to_pose_safe action")
+    if not args.enable_tool_hover_queries and (args.tool_hover_candidate_budget_sec is not None
+                                               or args.tool_hover_region_budget_sec is not None):
+        parser.error("--tool-hover-*-budget-sec requires --enable-tool-hover-queries")
+    if args.enable_tool_hover_queries:
+        from robot_motion.tool_entity_scene import (
+            ENTITY_HOVER_CANDIDATE_BUDGET_SEC, ENTITY_HOVER_REGION_BUDGET_SEC, validate_hover_budgets)
+        try:
+            validate_hover_budgets(
+                region_budget_sec=(ENTITY_HOVER_REGION_BUDGET_SEC if args.tool_hover_region_budget_sec is None
+                                   else args.tool_hover_region_budget_sec),
+                candidate_budget_sec=(ENTITY_HOVER_CANDIDATE_BUDGET_SEC if args.tool_hover_candidate_budget_sec is None
+                                      else args.tool_hover_candidate_budget_sec))
+        except ValueError as error:
+            parser.error(f"invalid tool hover budget: {error}")
+    if args.safe_motion_observed_clearance_m is not None and args.safe_motion_observation_roles is None:
+        parser.error("--safe-motion-observed-clearance-m requires --safe-motion-observation-roles")
     if args.enable_grasp_observation and (not args.enable_point_grasp or args.point_grasp_backend != "graspgenx"):
         parser.error("--enable-grasp-observation requires --enable-point-grasp and GraspGenX")
     if args.sam3_multi_instance_text and (
@@ -1224,6 +1292,13 @@ def main(argv: list[str] | None = None) -> int:
         lower_kwargs["debug_motion_skill"] = True
     if args.debug_rm65_stream_timing:
         lower_kwargs["debug_rm65_stream_timing"] = True
+    if args.force_guard_stale_policy != "trip":
+        from teleop_runtime.position_force_guard import PositionForceGuardConfig
+        from teleop_runtime.skill_deploy.rm65_ports import build_exclusive_rm65_skill_position_force_guard
+
+        stale_policy = args.force_guard_stale_policy
+        lower_kwargs["force_guard_factory"] = lambda backends: build_exclusive_rm65_skill_position_force_guard(
+            arm_backends=backends, config=PositionForceGuardConfig(stale_policy=stale_policy))
     lower = assemble_exclusive_rm65_skill_lower(**lower_kwargs)
     camera_config = (
         None
@@ -1423,6 +1498,7 @@ def main(argv: list[str] | None = None) -> int:
         grant_lifetime_sec=args.grant_lifetime_sec,
         camera_config_path=camera_config,
         camera_registry_path=camera_registry,
+        camera_single_start=args.camera_single_start,
         artifact_root=artifact_root,
         planned_trajectory_dir=planned_trajectory_dir,
         camera_mount_urdf_path=camera_mount_urdf,
@@ -1439,19 +1515,24 @@ def main(argv: list[str] | None = None) -> int:
         enable_anchor_motion_v2=args.enable_anchor_motion_v2,
         enable_tool_object_relations=args.enable_tool_object_relations,
         enable_tool_hover_queries=args.enable_tool_hover_queries,
+        tool_hover_region_budget_sec=args.tool_hover_region_budget_sec,
+        tool_hover_candidate_budget_sec=args.tool_hover_candidate_budget_sec,
         enable_point_grasp_finger_exchange=args.enable_point_grasp_finger_exchange,
         debug_render_object_coordinates=args.debug_render_object_coordinates,
         enable_point_grasp_arm_reachability=(args.enable_point_grasp_arm_reachability),
         safe_motion_observation_config=(None if args.safe_motion_observation_roles is None
             else SafeMotionObservationConfig(roles=tuple(args.safe_motion_observation_roles),
+                minimum_clearance_m=args.safe_motion_observed_clearance_m,
                 maximum_depth_m=args.safe_motion_maximum_depth_m,
                 maximum_scene_age_sec=args.safe_motion_scene_max_age_sec)),
         safe_motion_debug_dir=safe_motion_debug_dir,
         grasp_trajectory_config=RM65GraspTrajectoryPlanningConfig(
             enable_inherited_start_clearance=_effective_inherited_start_clearance(args),
+            ignore_start_collisions=args.ignore_start_collisions,
             trajectory_parameterization=(args.grasp_trajectory_parameterization),
             trajectory_speed_profile=(args.grasp_trajectory_speed_profile),
             endpoint_candidate_ordering=(args.grasp_endpoint_candidate_ordering),
+            endpoint_joint_limit_margin_rad=math.radians(args.grasp_endpoint_joint_limit_margin_deg),
         ),
     )
 

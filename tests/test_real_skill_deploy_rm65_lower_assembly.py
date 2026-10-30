@@ -177,6 +177,8 @@ def test_lower_assembly_reuses_one_profile_and_starts_no_resources(
             profile.position_profile.rates.command_hz
         )
         assert config.background_streaming_no_catch_up_after_send is True
+        assert config.background_streaming_hz * config.background_streaming_warning_ratio == pytest.approx(80.)
+        assert config.background_streaming_low_rate_warning_only is True
         assert config.position_command_planner == command.planner
         assert config.tool_profile == str(
             profile.tool_profile_path_by_side[config.side]

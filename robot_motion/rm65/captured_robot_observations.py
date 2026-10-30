@@ -116,8 +116,8 @@ class RM65CapturedRobotObservationFilterConfig:
             bounds = np.asarray(self.tool_surface_bounds_m, dtype=float)
             if (bounds.shape != (3, 2) or not np.all(np.isfinite(bounds))
                     or np.any(bounds[:, 0] >= 0) or np.any(bounds[:, 1] <= 0)
-                    or np.any(np.abs(bounds) > 0.050)):
-                raise ValueError("tool_surface_bounds_m requires signed XYZ bounds within 50 mm")
+                    or np.any(np.abs(bounds) > 0.060)):
+                raise ValueError("tool_surface_bounds_m requires signed XYZ bounds within 60 mm")
             object.__setattr__(self, "tool_surface_bounds_m", tuple(map(tuple, bounds.tolist())))
         limit = float(self.tool_surface_normalized_squared_limit)
         if (isinstance(self.tool_surface_normalized_squared_limit, bool)

@@ -14,7 +14,7 @@ import threading
 import math
 from functools import partial
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, replace
 from pathlib import Path
 
 import numpy as np
@@ -152,14 +152,33 @@ def _public_tool_profiles(lower: ExclusiveRM65SkillLowerAssembly) -> dict[str, o
 
 def _route_ids(*, include_grasp_approach_plan: bool = False, include_safe_pose: bool = False,
                include_observed_point: bool = False,
-               include_observed_anchor_v2: bool = False) -> tuple[str, ...]:
+               include_observed_anchor_v2: bool = False,
+               include_object_motion: bool = False) -> tuple[str, ...]:
     return real_agent_motion_route_ids_v1(
         include_safe_pose=include_safe_pose,
         include_observed_point=include_observed_point,
         include_observed_anchor_v2=include_observed_anchor_v2,
+        include_object_motion=include_object_motion,
         include_grasp_approach=True,
         include_grasp_approach_plan=include_grasp_approach_plan,
     )
+
+
+def _public_object_workspace_bounds(*, public_from_geometry, collision_scene_profile):
+    """Held-object pose bounds: the fixed table's footprint, up to 0.8 m above its top."""
+    from robot_motion.rm65 import build_dual_arm_scene_profile
+    from robot_motion.rm65.scene_profiles import fixed_scene_aabb_obstacles
+
+    table = next(item for item in fixed_scene_aabb_obstacles(build_dual_arm_scene_profile(
+        collision_scene_profile or "dual_arm_hand_proxy_dmtac_grasp")) if item.obstacle_id == "fixed-scene:table")
+    centre, size = np.asarray(table.center_xyz_m, dtype=float), np.asarray(table.size_xyz_m, dtype=float)
+    corners = np.array([[x, y, centre[2] + size[2] / 2.0] for x in (-0.5, 0.5) for y in (-0.5, 0.5)])
+    corners[:, :2] = corners[:, :2] * size[:2] + centre[:2]
+    transform = np.asarray(public_from_geometry, dtype=float).reshape(4, 4)
+    public = corners @ transform[:3, :3].T + transform[:3, 3]
+    low, high = public.min(axis=0), public.max(axis=0)
+    return (float(low[0]), float(high[0]), float(low[1]), float(high[1]),
+            float(low[2]) - 0.02, float(high[2]) + 0.80)
 
 
 @dataclass(frozen=True)
@@ -292,6 +311,7 @@ def assemble_exclusive_rm65_agent_primitive_composition(
     grant_lifetime_sec: float = 5.0,
     camera_config_path: str | Path | None = None,
     camera_registry_path: str | Path | None = None,
+    camera_single_start: bool = False,
     artifact_root: str | Path | None = None,
     planned_trajectory_dir: str | Path | None = None,
     camera_mount_urdf_path: str | Path | None = None,
@@ -308,6 +328,8 @@ def assemble_exclusive_rm65_agent_primitive_composition(
     enable_anchor_motion_v2: bool = False,
     enable_tool_object_relations: bool = False,
     enable_tool_hover_queries: bool = False,
+    tool_hover_region_budget_sec: float | None = None,
+    tool_hover_candidate_budget_sec: float | None = None,
     enable_point_grasp_finger_exchange: bool = False,
     debug_render_object_coordinates: bool = False,
     enable_point_grasp_arm_reachability: bool = False,
@@ -339,6 +361,9 @@ def assemble_exclusive_rm65_agent_primitive_composition(
         raise TypeError("enable_anchor_motion_v2 must be bool.")
     if not isinstance(enable_tool_object_relations, bool) or not isinstance(enable_tool_hover_queries, bool):
         raise TypeError("Tool-entity Skill switches must be bool.")
+    if not enable_tool_hover_queries and (tool_hover_region_budget_sec is not None
+                                          or tool_hover_candidate_budget_sec is not None):
+        raise ValueError("Tool hover search budgets require enabled tool hover queries.")
     if not isinstance(enable_point_grasp_finger_exchange, bool):
         raise TypeError("enable_point_grasp_finger_exchange must be bool.")
     if grasp_trajectory_config is not None and not isinstance(
@@ -432,6 +457,10 @@ def assemble_exclusive_rm65_agent_primitive_composition(
         artifact_root,
     )
     perception_enabled = all(value is not None for value in perception_values)
+    if type(camera_single_start) is not bool:
+        raise TypeError("camera_single_start must be boolean.")
+    if camera_single_start and not perception_enabled:
+        raise ValueError("camera_single_start requires the composed perception resources.")
     if perception_enabled != any(value is not None for value in perception_values):
         raise ValueError(
             "camera_config_path, camera_registry_path, and artifact_root must be "
@@ -450,6 +479,11 @@ def assemble_exclusive_rm65_agent_primitive_composition(
             raise ValueError("Surface anchor v2 requires a bounded segmenter timeout of at most 45s.")
     observed_point_enabled = "move_to_observed_point" in normalized_actions
     observed_safe_enabled = safe_motion_observation_config is not None
+    object_motion_enabled = "move_grasped_object_to_pose" in normalized_actions
+    if object_motion_enabled and (not enable_tool_object_relations or not observed_safe_enabled
+                                  or "move_tcp_to_pose_safe" not in normalized_actions):
+        raise ValueError("Held-object motion requires tool-object relations, the observed safe scene "
+                         "and authorized move_tcp_to_pose_safe.")
     if enable_tool_hover_queries and (not enable_surface_anchor_v2 or not observed_safe_enabled
                                       or "move_tcp_to_pose_safe" not in normalized_actions):
         raise ValueError("Tool hover queries require surface anchor v2, the observed safe scene "
@@ -460,6 +494,10 @@ def assemble_exclusive_rm65_agent_primitive_composition(
     )
     if inherited_start_clearance_enabled and not observed_safe_enabled:
         raise ValueError("Inherited start clearance requires an explicit observed safe scene.")
+    ignore_start_collisions_enabled = (
+        grasp_trajectory_config is not None and grasp_trajectory_config.ignore_start_collisions)
+    if ignore_start_collisions_enabled and not observed_safe_enabled:
+        raise ValueError("Ignoring start collisions requires an explicit observed safe scene.")
     if enable_anchor_motion_v2 and (
         not enable_surface_anchor_v2 or not observed_point_enabled or not observed_safe_enabled
     ):
@@ -613,9 +651,11 @@ def assemble_exclusive_rm65_agent_primitive_composition(
                 "input_binding_hash": captured_robot_observation_filter.input_binding_hash,
             }} if captured_robot_observation_filter is not None
                 and captured_robot_observation_filter.config.geometry_mode != "legacy" else {}),
-            **({"safe_motion_observation": asdict(safe_motion_observation_config)}
+            **({"safe_motion_observation": safe_motion_observation_config.identity_payload()}
                if safe_motion_observation_config is not None else {}),
-            **({"safe_motion_start_clearance": "inherited-positive-v1"}
+            **({"safe_motion_start_clearance": "ignore-start-contacts-v1"}
+               if ignore_start_collisions_enabled else
+               {"safe_motion_start_clearance": "inherited-positive-v1"}
                if inherited_start_clearance_enabled else {}),
         },
         domain="dexteleop.real_skill.rm65_execution_manifest.v1",
@@ -749,6 +789,7 @@ def assemble_exclusive_rm65_agent_primitive_composition(
             include_observed_point=observed_point_enabled,
             include_observed_anchor_v2=enable_anchor_motion_v2,
             include_grasp_approach_plan=grasp_enabled,
+            include_object_motion=object_motion_enabled,
         ),
     )
     perception_source_binding = None
@@ -781,6 +822,7 @@ def assemble_exclusive_rm65_agent_primitive_composition(
             scene_world_from_arm_base_by_side=(
                 lower.profile.scene_world_from_arm_base_by_side
             ),
+            single_start=camera_single_start,
         )
         perception_frame_binding = station_frame_binding
         if grasp_enabled or enable_back_projection or observed_safe_enabled:
@@ -1045,6 +1087,9 @@ def assemble_exclusive_rm65_agent_primitive_composition(
             safe_config = (grasp_trajectory_config or RM65GraspTrajectoryPlanningConfig()).for_tcp_pose_move(
                 translation_tolerance_m=convergence_profile.translation_tolerance_m,
                 rotation_tolerance_rad=convergence_profile.rotation_tolerance_rad)
+            if observed_safe_enabled:
+                safe_config = replace(safe_config,
+                    minimum_observed_clearance_m=safe_motion_observation_config.minimum_clearance_m)
 
             safe_static_planner = None
             safe_static_planner_lock = threading.Lock()
@@ -1142,18 +1187,27 @@ def assemble_exclusive_rm65_agent_primitive_composition(
                     geometry_frame_id=lower.profile.station_world_frame_id,
                     translation_tolerance_m=convergence_profile.translation_tolerance_m,
                     rotation_tolerance_rad=convergence_profile.rotation_tolerance_rad,
-                    start_clearance=("inherited-positive-v1" if hover_config.enable_inherited_start_clearance
+                    start_clearance=("ignore-start-contacts-v1" if hover_config.ignore_start_collisions
+                                     else "inherited-positive-v1" if hover_config.enable_inherited_start_clearance
                                      else "strict"),
                     max_inter_camera_skew_sec=perception_capture.profile.max_inter_camera_skew_ms / 1000.0,
                     profile_identity={"execution_manifest_hash": execution_manifest_hash,
                         "planning_config": json.loads(json.dumps(asdict(hover_config))),
-                        "observation": json.loads(json.dumps(asdict(safe_motion_observation_config)))})
+                        "observation": json.loads(json.dumps(safe_motion_observation_config.identity_payload()))})
             tool_entity_options = RealToolEntityOptions(enable_relations=enable_tool_object_relations,
                 enable_hover=enable_tool_hover_queries, tool_entity_by_side=tool_entities,
                 tool_tcp_poses=tool_tcp_poses, public_from_geometry=public_from_geometry,
                 hover_planner=tool_hover_planner,
                 hover_roles=(() if not enable_tool_hover_queries
-                             else tuple(safe_motion_observation_config.roles)))
+                             else tuple(safe_motion_observation_config.roles)),
+                hover_region_budget_sec=tool_hover_region_budget_sec,
+                hover_candidate_budget_sec=tool_hover_candidate_budget_sec,
+                object_motion=(None if not object_motion_enabled else {
+                    "object_id": f"{side}_held_object",
+                    "object_workspace_bounds": _public_object_workspace_bounds(
+                        public_from_geometry=public_from_geometry,
+                        collision_scene_profile=lower.profile.collision_scene_profile),
+                    "clock_domain_id": attachment.clock_domain_id}))
 
         def reachability_evaluator_factory(port):
             if arm_reachability_profile is None:
@@ -1239,7 +1293,6 @@ def assemble_exclusive_rm65_agent_primitive_composition(
         additional_resources = tuple(
             resource
             for resource in (
-                planning_geometry_resources,
                 localization_provider if localization_provider is not None else object_localizer,
                 deployment.gateway_session.station_point_grasp_provider,
             )
@@ -1250,6 +1303,10 @@ def assemble_exclusive_rm65_agent_primitive_composition(
             camera_sources=perception_source_binding.camera_sources,
             artifact_store=artifact_store,
             additional_resources=additional_resources,
+            prepare_static_geometry=(
+                planning_geometry_resources.start
+                if planning_geometry_resources is not None else None
+            ),
         )
     if gripper_ports:
         resources = ExclusiveRealGripperResources(lower=resources,
