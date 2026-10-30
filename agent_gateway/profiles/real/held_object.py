@@ -6,7 +6,8 @@ text segmentation in every view (or, without a text prompt, from a point
 prompt at the pixel showing something between the pads), measures each view's
 object surface and
 fuses them in the holding tool frame (``robot_motion.held_object_measurement``).
-The optional gripper sample adds the measured closure. Nothing here moves the
+The gripper sample adds the measured closure and the last commanded target;
+holding is verified only with that sample. Nothing here moves the
 robot, commands a gripper or grants motion authority; a planner only accepts
 the resulting box through ``RM65CarriedObjectBox``.
 """
@@ -20,6 +21,7 @@ from dataclasses import dataclass, field, replace
 import numpy as np
 
 from agent_gateway.profiles.segmentation import decode_segmentation_mask_npy
+from agent_gateway.skills.gripper.runtime import GripperConvergenceProfile
 from dataset_contracts.canonical_encoding import canonical_content_hash
 from robot_motion.held_object_measurement import (
     HeldObjectBox,
@@ -39,6 +41,9 @@ REAL_HELD_OBJECT_SEMANTICS_V1 = "agenticrobot.real.held_object_observation.v1"
 # A closed gripper that stopped clearly before its full-close position holds
 # something between the pads; a fully closed one holds nothing graspable.
 REAL_HELD_OBJECT_FULL_CLOSE_MARGIN = 0.03
+# An open DMTAC reads about 0.0. Below the gripper Skill's minimum closed
+# position the pads do not grip (the Skill itself never settles a close there).
+REAL_HELD_OBJECT_MIN_CLOSE = GripperConvergenceProfile().minimum_closed_position
 
 
 @dataclass(frozen=True)
@@ -74,15 +79,26 @@ class RealHeldObjectObservation:
 
     @property
     def gripper_closed_on_object(self) -> bool | None:
-        """Measured closure stopped before full close (None without a gripper sample)."""
+        """The DMTAC grips something (None without a gripper sample).
+
+        The gripper must report no fault, its last commanded target (when this
+        session commanded it) must be a close, and the measured closure must
+        have stopped between the minimum closed position and full close.
+        """
         if self.gripper is None or self.gripper.get("measured_close") is None:
             return None
-        return float(self.gripper["measured_close"]) < 1.0 - REAL_HELD_OBJECT_FULL_CLOSE_MARGIN
+        if self.gripper.get("fault_code") is not None:
+            return False
+        target = self.gripper.get("last_command_target_close")
+        if target is not None and float(target) < 0.5:
+            return False
+        close = float(self.gripper["measured_close"])
+        return REAL_HELD_OBJECT_MIN_CLOSE <= close < 1.0 - REAL_HELD_OBJECT_FULL_CLOSE_MARGIN
 
     @property
     def holding_verified(self) -> bool:
-        """Between the fingers in a measured view and, when sampled, closed on something."""
-        return self.measurement.held and self.gripper_closed_on_object is not False
+        """Between the fingers in a measured view and the sampled gripper closed on it."""
+        return self.measurement.held and self.gripper_closed_on_object is True
 
     def carried_object_box(self, *, object_id: str | None = None) -> RM65CarriedObjectBox:
         if not self.measurement.held or self.measurement.tool_from_box is None:
@@ -103,11 +119,14 @@ class RealHeldObjectObserver:
 
     ``scene_port`` is the tool-entity scene port (stationary captures, request-
     safe tool FK); ``gripper_state_by_side`` optionally reads one fresh DMTAC
-    sample per side without commanding it.
+    sample per side without commanding it, and ``gripper_command_by_side``
+    the port's last commanded ``(target_close, attempt_ref)`` (both None
+    before any command).
     """
 
     def __init__(self, *, scene_port, segmentation_provider, tool_entity_by_side: Mapping[str, object],
                  roles: Sequence[str], gripper_state_by_side: Mapping[str, Callable[[], object]] | None = None,
+                 gripper_command_by_side: Mapping[str, Callable[[], tuple]] | None = None,
                  maximum_depth_m: float = RELATION_MAXIMUM_DEPTH_M):
         if not callable(getattr(scene_port, "capture_views", None)):
             raise TypeError("scene_port must capture stationary views.")
@@ -122,6 +141,7 @@ class RealHeldObjectObserver:
         self.tool_entity_by_side = dict(tool_entity_by_side)
         self.roles = tuple(roles)
         self.gripper_state_by_side = dict(gripper_state_by_side or {})
+        self.gripper_command_by_side = dict(gripper_command_by_side or {})
         self.maximum_depth_m = float(maximum_depth_m)
 
     def observe(self, *, side: str, label: str, language_prompt: str | None, min_score: float,
@@ -209,6 +229,11 @@ class RealHeldObjectObserver:
             gripper = {"measured_close": float(sample.measured_close), "moving": sample.moving,
                        "fault_code": sample.fault_code, "observed_at": float(sample.observed_at),
                        "evidence_ref": sample.evidence_ref}
+            command = self.gripper_command_by_side.get(side)
+            if command is not None:
+                target, attempt_ref = command()
+                gripper["last_command_target_close"] = None if target is None else float(target)
+                gripper["last_command_attempt_ref"] = attempt_ref
         return RealHeldObjectObservation(
             side=side, label=label, language_prompt=language_prompt, station_revision=expected_station_revision,
             capture_qpos_by_side=qpos, world_from_tcp=world_from_tcp, measurement=measurement,

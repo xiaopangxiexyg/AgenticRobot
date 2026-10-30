@@ -142,25 +142,27 @@ REAL_AGENT_OBJECT_MOTION_OBSERVATION_SOURCE_V1 = "real_rgbd_held_object_measurem
 # The real Route measures whatever the bound arm holds; the summary is what the
 # Agent reads, so it states the measured semantics and the recovery reasons.
 REAL_OBJECT_MOTION_SUMMARY_V1 = (
-    "Move the object held by this arm's gripper (object_id names 'whatever this arm holds') to an "
-    "object-body pose or by translation_delta_xyz_m in the public frame. Before planning the lower "
-    "measures the held object from fresh RGB-D views (the points between the closed pads) and the "
-    "gripper closure, and refuses unless the object is between the fingers with the gripper closed on it "
-    "(object_motion_object_not_between_fingers, object_motion_gripper_not_closed_on_object). The measured "
-    "box, fixed in the tool frame, is carried along the whole collision-checked path (table, camera poles, "
-    "the other arm and observed obstacles). Phases: lift raises a just-grasped object from its support "
-    "(use a translation_delta_xyz_m like [0, 0, 0.05]); carry moves it in free space, keep the object above "
-    "obstacles; place lowers it onto the support measured under the goal, whose box bottom must end 0-2 cm "
-    "above that support (otherwise object_motion_place_target_below_support / _above_support with the "
-    "measured gap). After arrival the object is measured again: the result reports the measured object_state "
-    "and held_object_report (box size, grip_assessment centered or crooked with offsets and tilt), or the "
-    "operation fails with "
-    "object_motion_holding_lost_after_move (dropped or slipped) or object_motion_place_not_on_support. Path "
-    "or endpoint rejections (for example path_search_exhausted, endpoint_collision_blocked) mean that goal "
-    "is blocked: lift higher first, choose another place pose, or approach from the arm's own side. Recovery "
-    "after a drop or a crooked grasp: observe again (perception.describe_tool_object_relations), open the "
-    "gripper, re-plan the grasp. Never opens or closes the gripper and never certifies a stable release; "
-    "open it with the gripper Skill after place and lift the empty gripper with the safe TCP Skill.")
+    "Move the object held by this arm's gripper (object_id means 'whatever this arm holds') to an "
+    "object-body pose or by translation_delta_xyz_m in the public frame. It first measures the object from "
+    "fresh RGB-D views and the DMTAC closure, and refuses unless it is between the fingers and the gripper "
+    "Skill closed the gripper on it (object_motion_object_not_between_fingers, "
+    "object_motion_gripper_not_closed_on_object; object_motion_held_object_unmeasured or "
+    "_measured_relation_unavailable: observe again). The measured box, fixed in the tool frame, is carried "
+    "along the whole collision-checked path (table, camera poles, other arm, observed obstacles). Phases: "
+    "lift raises a just-grasped object from its support (translation_delta_xyz_m like [0, 0, 0.05]; the "
+    "first lift extends the box down to that support); carry moves it in free space above obstacles; place "
+    "lowers it exactly to the goal, box bottom 0-2 cm above the support measured under it (else "
+    "object_motion_place_target_below_support / _above_support with the gap, or "
+    "object_motion_support_not_measured). Off the table workspace: object_motion_goal_outside_workspace. "
+    "After arrival it is measured again: the result reports object_state and held_object_report (box size; "
+    "grip_assessment centered or crooked, with offsets and tilt), or fails with "
+    "object_motion_holding_lost_after_move (dropped or slipped), object_motion_place_not_on_support or "
+    "object_motion_terminal_state_unmeasured (observe before opening). Path or endpoint rejections "
+    "(path_search_exhausted, endpoint_collision_blocked, ...) mean the goal is blocked: lift higher first, "
+    "choose another place pose or approach from the arm's own side. After a drop or a crooked grasp: observe "
+    "again (perception.describe_tool_object_relations), open the gripper, re-plan the grasp. Never opens or "
+    "closes the gripper: after place open it with the gripper Skill, then lift the empty gripper with the "
+    "safe TCP Skill (this Skill refuses an empty hand).")
 REAL_AGENT_GRASP_APPROACH_ROUTE_ID_V1 = "real.rm65.agent_skill_grasp_approach"
 REAL_AGENT_GRASP_APPROACH_EXECUTOR_ID_V1 = (
     "control-station.real-agent-grasp-approach.v1"
@@ -598,6 +600,7 @@ class RealAgentObjectMotionProfile(RealAgentObservedPointProfile):
             "held_object_identity": "object_between_the_closing_pads_of_the_bound_arm",
             "measurement": "stationary_rgbd_closing_region_point_prompt_plus_dmtac_closure",
             "pose_goal_policy": self.pose_goal_policy,
+            "place_pose_goal_policy": "preserve_target",
         }, domain="agenticrobot.real.object_motion_profile.v1")
 
 
@@ -663,6 +666,9 @@ def _object_motion_payload_validator(*, route: SkillExecutionRoute,
     def validate_task_evaluation(payload):
         if not isinstance(payload, Mapping) or set(payload) != {"aggregate_evaluation_receipt_ref", "task_outcome"}:
             raise ValueError("Real primitive task-evaluation schema mismatch.")
+        _required(payload["aggregate_evaluation_receipt_ref"], field_name="aggregate_evaluation_receipt_ref")
+        if payload["task_outcome"] not in {"failed", "inconclusive", "succeeded"}:
+            raise ValueError("Unsupported real primitive task_outcome.")
 
     def validate_result_for_parameters(parameters, result):
         if result["object_state"]["phase"] != parameters["phase"]:

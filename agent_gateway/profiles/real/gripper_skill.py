@@ -66,6 +66,7 @@ class RealDmtacGripperControlPort:
         self.hold_confirmation_timeout_sec = float(hold_confirmation_timeout_sec)
         self._motion_guard: Callable[[], bool] | None = None
         self._last_command_attempt_ref: str | None = None
+        self._last_command_target_close: float | None = None
         self._last_hold_receipt: GripperHoldReceipt | None = None
         config = getattr(backend, "config", None)
         side = str(getattr(config, "side", "right"))
@@ -138,6 +139,7 @@ class RealDmtacGripperControlPort:
         self._last_command_attempt_ref = self._ref(
             "command_attempt", {"target_close": target}
         )
+        self._last_command_target_close = target
         self._last_hold_receipt = None
         started_at = time.monotonic()
         deadline = started_at + self.command_submission_timeout_sec
@@ -253,6 +255,11 @@ class RealDmtacGripperControlPort:
     @property
     def last_command_attempt_ref(self) -> str | None:
         return self._last_command_attempt_ref
+
+    @property
+    def last_command_target_close(self) -> float | None:
+        """Target closure of the last attempted command (None before any)."""
+        return self._last_command_target_close
 
     def _require_arm_hold(self) -> None:
         if self._motion_guard is not None and not self._motion_guard():

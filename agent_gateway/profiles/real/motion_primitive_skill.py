@@ -377,6 +377,12 @@ class RealAgentPrimitiveSkillLifecycle:
         """Lower-owned planner inputs of a subclass (for example a measured carried box)."""
         return {}
 
+    def _pose_goal_policy(self) -> str:
+        """Endpoint policy of an observed safe move (a subclass may require the exact target)."""
+        if isinstance(self.profile, RealAgentObservedPointProfile):
+            return self.profile.pose_goal_policy
+        return self.request.parameters.get("pose_goal_policy", "within_arrival_tolerance")
+
     def activate(
         self,
         *,
@@ -504,10 +510,7 @@ class RealAgentPrimitiveSkillLifecycle:
                            if planned_tcp or self.route.skill_id in _OBSERVED_SAFE_SKILL_IDS
                            else {}),
                         **({"require_grasp_approach": False,
-                            "pose_goal_policy": (self.profile.pose_goal_policy
-                                if isinstance(self.profile, RealAgentObservedPointProfile)
-                                else self.request.parameters.get(
-                                    "pose_goal_policy", "within_arrival_tolerance"))}
+                            "pose_goal_policy": self._pose_goal_policy()}
                            if self.route.skill_id in _OBSERVED_SAFE_SKILL_IDS else {}),
                         **self._extra_planning_kwargs(),
                     )
