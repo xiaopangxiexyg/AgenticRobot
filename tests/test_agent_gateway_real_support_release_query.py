@@ -12,6 +12,7 @@ import hashlib
 import io
 import math
 import time
+from dataclasses import replace
 from types import SimpleNamespace
 
 import numpy as np
@@ -477,6 +478,45 @@ def test_query_without_a_planned_candidate_reports_the_budget_or_no_path(monkeyp
     assert result["reason"] == "no_collision_free_release_path"
     assert result["attempted_candidate_count"] == result["candidate_count"] == 30  # 4 yaws x 6, then 6 leaned
     _validate(result)
+
+
+def test_query_checks_the_held_yaw_on_every_rectangle_before_turning(monkeypatch):
+    # Two certified rectangles (the tray's two halves); every carry into the first half is out
+    # of reach. The held yaw on the second half comes before the turned yaws of the first:
+    # rectangle by rectangle the first half's 4 yaws alone would use the 24-check budget.
+    original = module.measure_real_support_tops
+    middle_by_role = {}
+
+    def two_halves(capture, mask, **kwargs):
+        top = original(capture, mask, **kwargs)[0]
+        middle = (top.region_min_xy_m[0] + top.region_max_xy_m[0]) / 2.
+        middle_by_role[capture.role] = middle
+        return (replace(top, region_max_xy_m=(middle, top.region_max_xy_m[1])),
+                replace(top, region_min_xy_m=(middle, top.region_min_xy_m[1])))
+
+    monkeypatch.setattr(module, "measure_real_support_tops", two_halves)
+
+    class FirstHalfOutOfReach(_Planner):
+        def plan_with_observed_cloud(self, cloud, **kwargs):
+            box = PUBLIC_FROM_GEOMETRY @ kwargs["target_tool_tcp_world"] @ TOOL_FROM_BOX
+            if (kwargs["pose_goal_policy"] == "within_arrival_tolerance"
+                    and box[0, 3] < middle_by_role["wrist_right"]):
+                self.calls.append(kwargs)
+                raise RM65GraspTrajectoryPlanningError("ik_search_exhausted")
+            return super().plan_with_observed_cloud(cloud, **kwargs)
+
+    planner = FirstHalfOutOfReach()
+    result, _ = _run(_query(monkeypatch, planner=planner))
+    assert result["status"] == "release_pose_found", result
+    _validate(result)
+    assert result["segmentation"]["role"] == "wrist_right"
+    assert result["yaw_change_rad"] == 0. and result["release_lean_rad"] == 0.
+    assert result["support_region_min_xy_m"][0] == pytest.approx(middle_by_role["wrist_right"])
+    refused = result["attempted_candidate_count"] - 1
+    assert {item["reason_code"]: item["count"] for item in result["candidate_rejections"]} == {
+        "carry:ik_search_exhausted": refused}
+    assert 1 <= refused <= 6  # only the first half's held-yaw positions
+    assert result["candidate_count"] > module.REAL_RELEASE_MAX_CHECKED_CANDIDATES
 
 
 def test_query_falls_back_to_the_certified_plane_when_the_wrist_does_not_see_the_target(monkeypatch):

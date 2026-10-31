@@ -16,7 +16,8 @@ One read-only request while the arm stands still:
 3. propose release poses on those rectangles with the shared
    ``plan_release_approach_candidates`` (center, nearest to the held object and
    interior corners, a bounded yaw sample, then the lean pass) and, for each, a
-   pre-place pose straight above it;
+   pre-place pose straight above it. They are checked with the held yaw on
+   every rectangle first, then the turned yaws, then the lean pass;
 4. predict the place motion's own support check when the held box is already
    at (within 3 cm of) the pre-place pose: fit the holding arm's wrist plane as
    the place does (``measure_support_under``) and set the release height from
@@ -379,8 +380,8 @@ def build_real_support_release_registration(*, segmentation, back_projection, pr
         "yaw_offsets_rad": list(REAL_RELEASE_YAW_OFFSETS_RAD),
         "positions_per_yaw": ["center", "nearest_to_held", "interior_corners_0.85"],
         "lean": {"rad": REAL_RELEASE_LEAN_RAD, "yaw_offsets_rad": list(REAL_RELEASE_LEAN_YAW_OFFSETS_RAD),
-                 "toward": "holding_arm_base", "order": "after_the_held_orientation_candidates_of_each_region",
-                 "maximum_tilt_from_support_normal_rad": MAXIMUM_RELEASE_LEAN_RAD},
+                 "toward": "holding_arm_base", "maximum_tilt_from_support_normal_rad": MAXIMUM_RELEASE_LEAN_RAD},
+        "check_order": ["held_yaw_on_every_region", "turned_yaws_on_every_region", "lean_on_every_region"],
         "lateral_margin_m": REAL_RELEASE_LATERAL_MARGIN_M,
         "preplace_height_m": REAL_RELEASE_PREPLACE_HEIGHT_M,
         "release_height": "place_check_plane_of_the_holding_wrist_at_the_preplace_pose_else_certified_plane",
@@ -712,12 +713,16 @@ class RealSupportReleaseQuery:
                                          size_xyz_m=tuple(float(v) for v in size),
                                          evidence_ref=observation.evidence_ref))
         counts: dict[str, int] = {}
-        offset = checked = 0
-        fitted = out_of_budget = False
         passes = ({"yaw_offsets_rad": REAL_RELEASE_YAW_OFFSETS_RAD},
                   {"yaw_offsets_rad": REAL_RELEASE_LEAN_YAW_OFFSETS_RAD, "lean_rad": REAL_RELEASE_LEAN_RAD,
                    "lean_toward_xy_m": self.arm_base_xy_m})
-        for region in tops:
+        # Every proposal first, then checked in the order the real arm reaches best: the
+        # held yaw on every rectangle, then the other yaws, then the lean pass. The real
+        # grasps hold the tool tilted, and a yaw turn about the support normal is then
+        # rarely reachable (offline on the RM65-6F scenes every turned candidate ran out
+        # of IK); rectangle by rectangle, those used the check budget of the first one.
+        proposals = []
+        for region_index, region in enumerate(tops):
             region_ref = "support-measured-top:" + canonical_content_hash({
                 "support_id": support_id, "role": role, "depth": support_capture.depth_content_hash,
                 "mask": mask_hash, "region": [list(region.region_min_xy_m), list(region.region_max_xy_m)],
@@ -725,8 +730,7 @@ class RealSupportReleaseQuery:
                 domain="agenticrobot.real.support_release_query.support.v1")
             support = region.observation(support_id=support_id, reference_frame_id=frame, scene_revision=revision,
                                          measured_at=float(support_capture.acquired_at), evidence_ref=region_ref)
-            recorded = False
-            for orientation in passes:
+            for pass_index, orientation in enumerate(passes):
                 try:
                     candidates = plan_release_approach_candidates(
                         held, support, now=now, clearance_m=clearance,
@@ -740,53 +744,52 @@ class RealSupportReleaseQuery:
                     # Nothing fits this rectangle in this pass (or the lean would tilt
                     # the object too far); stale or invalid observations still raise.
                     continue
-                fitted = True
-                if not recorded:
+                if region_ref not in evidence:
                     evidence.append(region_ref)
-                    recorded = True
                 for local, candidate in enumerate(candidates):
-                    if checked >= REAL_RELEASE_MAX_CHECKED_CANDIDATES or float(self.clock()) >= context.deadline:
-                        out_of_budget = True
-                        break
-                    if cancel_requested():
-                        raise InterruptedError("Support release query cancelled.")
-                    checked += 1
-                    outcome = self._check(candidate, region=region, context=context)
-                    if outcome.release is None:
-                        counts[outcome.reason] = counts.get(outcome.reason, 0) + 1
-                        continue
-                    index = offset + local
-                    release, preplace = _pose_list(outcome.release), _pose_list(outcome.preplace)
-                    evidence.append("support-release-plan:" + canonical_content_hash({
-                        "candidate_index": index, "release_pose": release, "preplace_pose": preplace,
-                        "plane_source": outcome.plane_source},
-                        domain="agenticrobot.real.support_release_query.plan.v1"))
-                    return {
-                        "semantics": skill.SEMANTICS, "status": "release_pose_found",
-                        "reason": "collision_free_release_path_found", "support_object_id": support_id,
-                        "reference_frame_id": frame, "station_revision": revision,
-                        "release_object_pose_xyz_quat_xyzw": release, skill.PREPLACE_KEY: preplace,
-                        "release_clearance_m": clearance, "held_object_pose_xyz_quat_xyzw": held_pose,
-                        "yaw_change_rad": float(candidate.yaw_offset_rad),
-                        "release_lean_rad": float(candidate.lean_rad),
-                        "support_top_z_m": float(outcome.support_top_z_m),
-                        "support_region_min_xy_m": list(region.region_min_xy_m),
-                        "support_region_max_xy_m": list(region.region_max_xy_m),
-                        "segmentation": segmentation, "measured_support": region.evidence(),
-                        "candidate_count": offset + len(candidates), "attempted_candidate_count": checked,
-                        "selected_candidate_index": index,
-                        "path_planning_wall_sec": float(time.monotonic() - began),
-                        "candidate_rejections": _rejection_list(counts), "views": views,
-                        "motion_executed": False, "execution_authorized": False}, tuple(evidence)
-                offset += len(candidates)
-                if out_of_budget:
-                    break
-            if out_of_budget:
-                break
-        if not fitted:
+                    turned = 0 if float(candidate.yaw_offset_rad) == 0. else 1
+                    proposals.append(((pass_index, turned, region_index, local), region, candidate))
+        if not proposals:
             return _rejected(reason="held_footprint_does_not_fit_support", **common), tuple(evidence)
+        proposals.sort(key=lambda item: item[0])
+        checked = 0
+        out_of_budget = False
+        for _rank, region, candidate in proposals:
+            if checked >= REAL_RELEASE_MAX_CHECKED_CANDIDATES or float(self.clock()) >= context.deadline:
+                out_of_budget = True
+                break
+            if cancel_requested():
+                raise InterruptedError("Support release query cancelled.")
+            checked += 1
+            outcome = self._check(candidate, region=region, context=context)
+            if outcome.release is None:
+                counts[outcome.reason] = counts.get(outcome.reason, 0) + 1
+                continue
+            index = checked - 1
+            release, preplace = _pose_list(outcome.release), _pose_list(outcome.preplace)
+            evidence.append("support-release-plan:" + canonical_content_hash({
+                "candidate_index": index, "release_pose": release, "preplace_pose": preplace,
+                "plane_source": outcome.plane_source},
+                domain="agenticrobot.real.support_release_query.plan.v1"))
+            return {
+                "semantics": skill.SEMANTICS, "status": "release_pose_found",
+                "reason": "collision_free_release_path_found", "support_object_id": support_id,
+                "reference_frame_id": frame, "station_revision": revision,
+                "release_object_pose_xyz_quat_xyzw": release, skill.PREPLACE_KEY: preplace,
+                "release_clearance_m": clearance, "held_object_pose_xyz_quat_xyzw": held_pose,
+                "yaw_change_rad": float(candidate.yaw_offset_rad),
+                "release_lean_rad": float(candidate.lean_rad),
+                "support_top_z_m": float(outcome.support_top_z_m),
+                "support_region_min_xy_m": list(region.region_min_xy_m),
+                "support_region_max_xy_m": list(region.region_max_xy_m),
+                "segmentation": segmentation, "measured_support": region.evidence(),
+                "candidate_count": len(proposals), "attempted_candidate_count": checked,
+                "selected_candidate_index": index,
+                "path_planning_wall_sec": float(time.monotonic() - began),
+                "candidate_rejections": _rejection_list(counts), "views": views,
+                "motion_executed": False, "execution_authorized": False}, tuple(evidence)
         return _rejected(reason="query_budget_exhausted" if out_of_budget else "no_collision_free_release_path",
-                         candidate_count=offset, attempted=checked, planning_wall_sec=time.monotonic() - began,
+                         candidate_count=len(proposals), attempted=checked, planning_wall_sec=time.monotonic() - began,
                          counts=counts, **common), tuple(evidence)
 
     @staticmethod
