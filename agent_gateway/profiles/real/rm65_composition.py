@@ -330,6 +330,7 @@ def assemble_exclusive_rm65_agent_primitive_composition(
     enable_tool_hover_queries: bool = False,
     tool_hover_region_budget_sec: float | None = None,
     tool_hover_candidate_budget_sec: float | None = None,
+    support_release_prompt_by_id: Mapping[str, str] | None = None,
     enable_point_grasp_finger_exchange: bool = False,
     debug_render_object_coordinates: bool = False,
     enable_point_grasp_arm_reachability: bool = False,
@@ -484,6 +485,19 @@ def assemble_exclusive_rm65_agent_primitive_composition(
                                   or "move_tcp_to_pose_safe" not in normalized_actions):
         raise ValueError("Held-object motion requires tool-object relations, the observed safe scene "
                          "and authorized move_tcp_to_pose_safe.")
+    if support_release_prompt_by_id is not None:
+        from robot_motion.rm65.scene_profiles import RM65_6F_SCENE_PROFILES
+
+        if (not isinstance(support_release_prompt_by_id, Mapping) or not support_release_prompt_by_id
+                or any(not isinstance(key, str) or not key.strip() or not isinstance(value, str)
+                       or not value.strip() for key, value in support_release_prompt_by_id.items())):
+            raise ValueError("Support release queries need named supports with non-empty prompts.")
+        if not object_motion_enabled:
+            raise ValueError("Support release queries require held-object motion.")
+        if lower.profile.collision_scene_profile not in RM65_6F_SCENE_PROFILES:
+            # The query plans the place of the measured box; with the standard
+            # model the real gripper is 17.2 mm lower than planned.
+            raise ValueError("Support release queries require an RM65-6F collision scene profile.")
     if enable_tool_hover_queries and (not enable_surface_anchor_v2 or not observed_safe_enabled
                                       or "move_tcp_to_pose_safe" not in normalized_actions):
         raise ValueError("Tool hover queries require surface anchor v2, the observed safe scene "
@@ -1194,6 +1208,39 @@ def assemble_exclusive_rm65_agent_primitive_composition(
                     profile_identity={"execution_manifest_hash": execution_manifest_hash,
                         "planning_config": json.loads(json.dumps(asdict(hover_config))),
                         "observation": json.loads(json.dumps(safe_motion_observation_config.identity_payload()))})
+            support_release = None
+            if support_release_prompt_by_id is not None:
+                from .motion_primitive_profiles import RealAgentObjectMotionProfile
+                from .support_release_query import RealSupportReleasePlanner
+
+                release_config = safe_config
+
+                def support_release_planner_factory():
+                    # Same reviewed safe-move configuration, separate instance:
+                    # a query never holds the motion planner's lock.
+                    return RM65GraspJointTrajectoryPlanner(profile=lower.profile,
+                        planning_target_builder=build_exclusive_rm65_skill_target_builder(lower.profile),
+                        target_envelope_filter=lower.target_builder.pre_ik_target_safety_filter,
+                        config=release_config, reachability_config=reachability_config)
+
+                arm_base_public = public_from_geometry @ np.asarray(
+                    lower.profile.scene_world_from_arm_base_by_side[side], dtype=float)
+                support_release = {
+                    "prompt_by_support_id": dict(support_release_prompt_by_id),
+                    "planner": RealSupportReleasePlanner(planner_factory=support_release_planner_factory,
+                        self_filter=captured_robot_observation_filter,
+                        observation_config=safe_motion_observation_config,
+                        geometry_frame_id=lower.profile.station_world_frame_id,
+                        start_clearance=("ignore-start-contacts-v1" if release_config.ignore_start_collisions
+                                         else "inherited-positive-v1"
+                                         if release_config.enable_inherited_start_clearance else "strict"),
+                        speed_scale=RealAgentObjectMotionProfile.speed_scale,
+                        max_inter_camera_skew_sec=perception_capture.profile.max_inter_camera_skew_ms / 1000.0,
+                        profile_identity={"execution_manifest_hash": execution_manifest_hash,
+                            "planning_config": json.loads(json.dumps(asdict(release_config))),
+                            "observation": json.loads(json.dumps(
+                                safe_motion_observation_config.identity_payload()))}),
+                    "arm_base_xy_m": (float(arm_base_public[0, 3]), float(arm_base_public[1, 3]))}
             tool_entity_options = RealToolEntityOptions(enable_relations=enable_tool_object_relations,
                 enable_hover=enable_tool_hover_queries, tool_entity_by_side=tool_entities,
                 tool_tcp_poses=tool_tcp_poses, public_from_geometry=public_from_geometry,
@@ -1207,7 +1254,8 @@ def assemble_exclusive_rm65_agent_primitive_composition(
                     "object_workspace_bounds": _public_object_workspace_bounds(
                         public_from_geometry=public_from_geometry,
                         collision_scene_profile=lower.profile.collision_scene_profile),
-                    "clock_domain_id": attachment.clock_domain_id}))
+                    "clock_domain_id": attachment.clock_domain_id}),
+                support_release=support_release)
 
         def reachability_evaluator_factory(port):
             if arm_reachability_profile is None:

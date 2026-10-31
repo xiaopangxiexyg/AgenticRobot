@@ -223,6 +223,11 @@ def assemble_exclusive_real_agent_primitive_deployment(
             "tool_hover_region_budget_sec": tool_entity_options.hover_region_budget_sec,
             "tool_hover_candidate_budget_sec": tool_entity_options.hover_candidate_budget_sec,
             "object_motion": tool_entity_options.object_motion,
+            **({} if tool_entity_options.support_release is None else {
+                "support_release_prompt_by_id": tool_entity_options.support_release["prompt_by_support_id"],
+                "support_release_planner_profile_hash": (
+                    tool_entity_options.support_release["planner"].profile_hash),
+            }),
         }),
         primary_component_id=primary_component_id,
         gripper_contract=gripper_contract,
