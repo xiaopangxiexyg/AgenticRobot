@@ -92,6 +92,19 @@ core and MuJoCo adapter used for the 20260721 fit; tests compare those hashes to
 fixed historical values rather than silently reinterpreting the fit against
 the current files.
 
+真机 RM65-6F 运动与 Station 模型、相机 registry v5、D435 深度修正和可选的手部—桌面净空使用独立绑定
+`artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261031_real_rm65_6f_v1.json`。它固定于合并提交
+`790182d3a`（基线 `eed84fb8f` 即真机持物绑定提交，+ 任务分支 `66d06523b`），保留前一绑定（真机持物本臂腕部测量）的全部非运行时引用；
+192 项已有运行时输入中 3 项改变（真机 Gateway CLI、障碍碰撞 oracle、抓取轨迹规划），新增 4 项（RealSense 感知绑定、
+场景 profile、障碍场景快照、registry v5），合计 196 项。行为变化只在显式选择时生效：碰撞场景
+`dual_arm_hand_proxy_dmtac_{strict,grasp}_rm65_6f` 使用 joint 6 加长 17.2 mm 的 6F 运动模型（link6 即 6F 法兰），并默认使用 6F Station URDF
+和 registry v5（主相机为 10-31 手眼经机器人连杆 ICP 修正，腕部为 10-31 手眼挂在 6F 法兰上）；registry 的 `depth_correction` 按相机序列号
+修正米制深度（v5 只修 D435，×1.01406；D405 待标定板测量）；`--table-hand-clearance-m`（0–0.02 m，只能配 6F profile）只替换夹爪代理、
+腕部相机代理和所持物体与固定 CAD 桌面之间的净空，接触仍然禁止，肘部、相机立柱和双臂之间保持 0.02 m。观测体素阻挡时，检查结果改为指名观测体素。
+默认 profile、默认净空和标准 RM65 资产不变。6F 资产不在版本库内，由 `scripts/assets/make_rm65_6f_station_assets.py` 生成，其内容哈希记录在
+metadata。离线证据按内容哈希记录：3683 项关联测试（当前绑定测试在本绑定前排除）、6F 模型与安装一致性检查、桌面净空检查、资产复现检查，
+以及 34 个保存的真机场景的 6F 离线复测报告。绑定仍为 `provisional`，没有新增真机运动执行或 held-out 资格。
+
 真机持物测量改用持物臂自己的腕部相机，并且 SAM3 点提示未命中按该视角无掩码处理，使用独立绑定
 `artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261031_real_held_own_wrist_v1.json`。它固定于合并提交
 `b278f4532`（development `e00a9d9d3` + 任务分支 `68e69d748`），保留前一绑定（MuJoCo 持物放置第三批）的全部非运行时引用；

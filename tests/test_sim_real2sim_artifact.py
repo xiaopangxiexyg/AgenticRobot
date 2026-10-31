@@ -25,6 +25,10 @@ ARM_BASELINE_PATH = Path(
 )
 ARM_RUNTIME_BINDING_PATH = Path(
     "sim/rm65/real2sim/artifacts/"
+    "rm65_arm_free_motion_20260721_v4_runtime_binding_20261031_real_rm65_6f_v1.json"
+)
+REAL_HELD_OWN_WRIST_V1_BINDING_PATH = Path(
+    "sim/rm65/real2sim/artifacts/"
     "rm65_arm_free_motion_20260721_v4_runtime_binding_20261031_real_held_own_wrist_v1.json"
 )
 MUJOCO_AGENT_PLACE_V3_BINDING_PATH = Path(
@@ -413,6 +417,143 @@ def test_v4_arm_fit_baseline_remains_frozen_and_provisional() -> None:
 
 def test_current_arm_runtime_binding_uses_exact_current_inputs() -> None:
     binding = Real2SimArtifactManifest.load(ARM_RUNTIME_BINDING_PATH)
+    previous = Real2SimArtifactManifest.load(REAL_HELD_OWN_WRIST_V1_BINDING_PATH)
+    fit = Real2SimArtifactManifest.load(ARM_BASELINE_PATH)
+    tag, old_tag = "20261031-real-rm65-6f-v1", "20261031-real-held-own-wrist-v1"
+    source = "790182d3aca8046ec2c75cfd1ead9b618ffac265"
+    source_tree = "9d92ef6dd177fcc24635d2c91a8340323bb4443a"
+    current = {ref.locator: ref for ref in binding.dependency_artifacts if "-runtime-" + tag in ref.artifact_id}
+    inherited = {ref.locator: ref for ref in previous.dependency_artifacts if "-runtime-" + old_tag in ref.artifact_id}
+    extras = tuple(binding.metadata["new_runtime_sources"])
+    assert extras == (
+        "agent_gateway/profiles/real/realsense_perception.py",
+        "robot_motion/rm65/scene_profiles.py",
+        "robot_motion/scene_obstacles.py",
+        "robot_motion/configs/rm65_camera_registry_v5_rm65_6f_20261031.json",
+    )
+    assert len(current) == 196 and len(inherited) == 192 and set(current) == set(inherited) | set(extras)
+    for path, ref in current.items():
+        assert ref.sha256 == ArtifactRef.from_file(path, artifact_id="current-check", artifact_kind=ref.artifact_kind).sha256
+        assert ref.sha256 == hashlib.sha256(subprocess.check_output(["git", "show", source + ":" + path])).hexdigest()
+        if path in inherited:
+            assert ref.artifact_id == inherited[path].artifact_id.replace(old_tag, tag)
+            assert ref.artifact_kind == inherited[path].artifact_kind
+        else:
+            assert ref.artifact_id == f"real-rm65-6f-owner-{extras.index(path)}-runtime-" + tag
+            assert ref.artifact_kind == ("runtime_source" if path.endswith(".py") else "runtime_configuration")
+    changed = {path for path in inherited if current[path].sha256 != inherited[path].sha256}
+    assert changed == {
+        "agent_gateway/profiles/real/gateway_cli.py",
+        "robot_motion/rm65/obstacle_collision.py",
+        "teleop_runtime/skill_deploy/rm65_grasp_trajectory.py",
+    }
+    assert tuple(binding.metadata["changed_previous_runtime_sources"]) == tuple(sorted(changed))
+    assert tuple(binding.metadata["changed_previous_offline_inputs"]) == ()
+    assert binding.code_revision == binding.environment_fingerprint["source_commit"] == binding.metadata["runtime_source_commit"] == source
+    assert binding.environment_fingerprint["source_tree"] == binding.metadata["offline_validation_source_tree"] == source_tree
+    assert subprocess.check_output(["git", "rev-parse", source + "^{tree}"], text=True).strip() == source_tree
+    assert binding.metadata["mainline_input_commit"] == "eed84fb8f61e63fecc8a9d661ec64d796a9e6fb0"
+    assert binding.metadata["previous_runtime_binding_artifact_sha256"] == previous.artifact_sha256
+    assert binding.metadata["previous_runtime_binding_file_sha256"] == ArtifactRef.from_file(
+        REAL_HELD_OWN_WRIST_V1_BINDING_PATH, artifact_id="parent-check", artifact_kind="real2sim_runtime_binding").sha256
+    refs = {ref.artifact_id: ref for ref in binding.dependency_artifacts}
+    parent = refs["rm65-arm-runtime-binding-real-held-own-wrist-20261031-v1"]
+    assert parent.locator == str(REAL_HELD_OWN_WRIST_V1_BINDING_PATH)
+    assert parent.sha256 == binding.metadata["previous_runtime_binding_file_sha256"]
+    # Every non-runtime predecessor reference is inherited unchanged.
+    for ref in previous.dependency_artifacts:
+        if "-runtime-" + old_tag not in ref.artifact_id:
+            assert refs[ref.artifact_id] == ref
+    assert binding.resolved_timing == previous.resolved_timing == Real2SimArtifactManifest.resolved_timing_from_contract_file(CONTRACT_PATH)
+    assert binding.simulation_contract.sha256 == previous.simulation_contract.sha256
+    assert binding.metadata["fit_artifact_sha256"] == fit.artifact_sha256
+    assert binding.metadata["arm_profile_refit"] is False
+    assert binding.metadata["runtime_behavior_change"] is True
+    assert binding.metadata["runtime_behavior_change_scope"] == (
+        "real_rm65_6f_models_registry_v5_depth_correction_and_optional_table_hand_clearance")
+    assert binding.metadata["migration"] == "namespaced_real_rm65_6f_binding_v1"
+    # RM65-6F motion and Station models (asset store, not versioned: bound by content hash here).
+    assert tuple(binding.metadata["rm65_6f_scene_profiles"]) == (
+        "dual_arm_hand_proxy_dmtac_strict_rm65_6f", "dual_arm_hand_proxy_dmtac_grasp_rm65_6f")
+    assert binding.metadata["rm65_6f_flange_extension_m"] == 0.0172
+    assert binding.metadata["rm65_default_scene_profiles_changed"] is False
+    assert binding.metadata["rm65_6f_planning_model_sha256"] == (
+        "a5ec008c89f454c862e857cc9122887cfa4fa2d07b8a05661c5574fc1e9208d5")
+    assert binding.metadata["rm65_6f_station_model_sha256"] == (
+        "dfed5e8441507e3690596e0b26d77e09ee48491928f4fdc359d240eb74d3d12c")
+    assert binding.metadata["rm65_6f_planning_model_source_sha256"] == (
+        "4d96173e88bd28de6f8e358e114d2b5b0d94d0e724176aef0dceca37e9622e0c")
+    assert binding.metadata["rm65_6f_station_model_source_sha256"] == (
+        "310c3e440d4725ab2511b7bf84b32cf8ad6cefbb90586fbac50893f95c4a1411")
+    registry = "robot_motion/configs/rm65_camera_registry_v5_rm65_6f_20261031.json"
+    assert binding.metadata["camera_registry_v5_sha256"] == current[registry].sha256
+    assert binding.metadata["head_camera_depth_scale_correction"] == 1.01406
+    assert binding.metadata["wrist_camera_depth_scale_corrections"] == "none_until_board_measurement"
+    assert tuple(binding.metadata["depth_scale_correction_range"]) == (0.95, 1.05)
+    assert binding.metadata["table_hand_clearance_default"] == "fixed_scene_margin_unchanged"
+    assert tuple(binding.metadata["table_hand_clearance_cli_range_m"]) == (0.0, 0.02)
+    assert binding.metadata["table_hand_clearance_requires_rm65_6f"] is True
+    assert binding.metadata["table_hand_clearance_contact_blocked"] is True
+    assert binding.metadata["observed_obstacle_block_attribution"] == "observed_voxels_named_when_blocking"
+    # Inherited from real-held-own-wrist v1 unchanged.
+    assert binding.metadata["real_held_object_primary_view"] == "holding_arm_wrist_camera"
+    assert binding.metadata["point_prompt_mask_miss"] == "per_view_no_mask"
+    assert binding.metadata["grasp_fusion_auxiliary_point_mask_miss"] == "excluded_view_target_point_mask_unavailable"
+    assert binding.metadata["real_object_motion_support_view"] == (
+        "holding_arm_wrist_camera_other_views_as_consistency_evidence")
+    assert binding.metadata["ordinary_clearance_m"] == 0.02
+    assert binding.metadata["mujoco_held_object_speed_scale"] == 0.25
+    assert binding.metadata["support_release_measurement"] == "depth_only_certified_top_rectangle_v2"
+    assert binding.metadata["mujoco_agent_place_skills_default_enabled"] is False
+    assert binding.metadata["real_gateway_held_object_motion"] is True
+    assert binding.metadata["real_held_object_motion_default_enabled"] is False
+    assert binding.metadata["new_physical_hardware_validation"] is False
+    expected_offline = (
+        "scripts/probes/query_safe_move_snapshot.py", "robot_motion/tool_entity_goals.py",
+        "robot_motion/observed_obstacles.py", "robot_motion/grasp_visible_scene.py",
+        "deployments/perception/dmtac_grasp_overlay.py",
+        "deployments/perception/profiles/dmtac_graspgenx_alignment_v5_q0.json")
+    previous_refs = {ref.artifact_id: ref for ref in previous.dependency_artifacts}
+    for index, path in enumerate(expected_offline):
+        ref = refs[f"real-rm65-6f-query-input-{index}-{tag}"]
+        assert ref.locator == path
+        assert ref.sha256 == ArtifactRef.from_file(path, artifact_id="offline-check", artifact_kind=ref.artifact_kind).sha256
+        assert ref.sha256 == hashlib.sha256(subprocess.check_output(["git", "show", source + ":" + path])).hexdigest()
+        old_ref = previous_refs[previous.metadata["offline_query_input_artifact_ids"][index]]
+        assert old_ref.locator == path and old_ref.artifact_kind == ref.artifact_kind
+        assert (old_ref.sha256 != ref.sha256) is (path in binding.metadata["changed_previous_offline_inputs"])
+    assert tuple(binding.metadata["offline_query_input_artifact_ids"]) == tuple(
+        f"real-rm65-6f-query-input-{index}-{tag}" for index in range(len(expected_offline)))
+    reports = {
+        "real-rm65-6f-focused-report-" + tag: "89ede6359f494a65faf07f3648b356f994114cf3ac8f0d0ca0103114f6bfe998",
+        "real-rm65-6f-focused-binding-" + tag: "8f1ba9b0f6fd93ec83372a29baa466bea6e8fa967fbfa565f3d84bf682daa68a",
+        "real-rm65-6f-model-check-" + tag: "861f7690ad4634934af878ee0f5562ac88b0b906f373a1598e6969cea2ab16aa",
+        "real-rm65-6f-table-clearance-check-" + tag: "819d1f6c90529054a850a68dbcf9db4107f4e4e1f1151457c7c42cfabbf5adb1",
+        "real-rm65-6f-asset-check-" + tag: "dd6f25fdb91a780f769a056c78a02d9b9fcdc7a7771f347cb67ad60359e0f5e0",
+        "real-rm65-6f-offline-samples-report-" + tag: "e2f2442d874bb3d81a9c25d5822d2df75b150b92531529a75e6b87e0a173ac4c",
+    }
+    assert tuple(binding.metadata["offline_validation_report_artifact_ids"]) == tuple(reports)
+    for artifact_id, digest in reports.items():
+        assert refs[artifact_id].sha256 == digest and refs[artifact_id].artifact_kind == "offline_validation_report"
+    assert binding.metadata["offline_validation_report_artifact_id"] == "real-rm65-6f-focused-report-" + tag
+    offline = next(e for e in binding.validation_evidence if e.validation_id == "real-rm65-6f-offline-consumers-" + tag)
+    assert offline.status == "passed" and dict(offline.metrics) == {
+        "passed_cases": 3683.0, "skipped_cases": 1.0, "failed_cases": 0., "error_cases": 0.}
+    integrity = next(e for e in binding.validation_evidence
+                     if e.validation_id == "runtime-source-content-binding-integrity-" + tag)
+    assert dict(integrity.metrics) == {
+        "bound_runtime_input_file_count": 196.0, "bound_runtime_source_file_count": 191.0,
+        "changed_runtime_source_file_count_from_previous_binding": 3.0, "new_runtime_source_file_count": 3.0,
+        "new_runtime_configuration_file_count": 1.0, "arm_profile_refit_count": 0., "mutated_historical_artifact_count": 0.}
+    assert binding.artifact_sha256 == "042030cee98722fbbb683378a2ef3e71d8e091aa301adfe8cbd1dd54794c037b"
+    assert ArtifactRef.from_file(ARM_RUNTIME_BINDING_PATH, artifact_id="binding-file-check",
+        artifact_kind="real2sim_runtime_binding").sha256 == "d43886c9eb4e8c1d71fd583ab88f948c52853722625b4f35ea156c5b8b4b3104"
+    assert binding.fidelity_claims[0].status == "provisional"
+    assert next(e for e in binding.validation_evidence if e.split == "held_out").status == "not_run"
+
+
+def test_real_held_own_wrist_v1_binding_remains_frozen_after_real_rm65_6f() -> None:
+    binding = Real2SimArtifactManifest.load(REAL_HELD_OWN_WRIST_V1_BINDING_PATH)
     previous = Real2SimArtifactManifest.load(MUJOCO_AGENT_PLACE_V3_BINDING_PATH)
     fit = Real2SimArtifactManifest.load(ARM_BASELINE_PATH)
     tag, old_tag = "20261031-real-held-own-wrist-v1", "20261031-mujoco-agent-place-v3"
@@ -424,7 +565,6 @@ def test_current_arm_runtime_binding_uses_exact_current_inputs() -> None:
     assert extras == ()
     assert len(current) == 192 and len(inherited) == 192 and set(current) == set(inherited) | set(extras)
     for path, ref in current.items():
-        assert ref.sha256 == ArtifactRef.from_file(path, artifact_id="current-check", artifact_kind=ref.artifact_kind).sha256
         assert ref.sha256 == hashlib.sha256(subprocess.check_output(["git", "show", source + ":" + path])).hexdigest()
         if path in inherited:
             assert ref.artifact_id == inherited[path].artifact_id.replace(old_tag, tag)
@@ -496,7 +636,6 @@ def test_current_arm_runtime_binding_uses_exact_current_inputs() -> None:
     for index, path in enumerate(expected_offline):
         ref = refs[f"real-held-own-wrist-query-input-{index}-{tag}"]
         assert ref.locator == path
-        assert ref.sha256 == ArtifactRef.from_file(path, artifact_id="offline-check", artifact_kind=ref.artifact_kind).sha256
         assert ref.sha256 == hashlib.sha256(subprocess.check_output(["git", "show", source + ":" + path])).hexdigest()
         old_ref = previous_refs[previous.metadata["offline_query_input_artifact_ids"][index]]
         assert old_ref.locator == path and old_ref.artifact_kind == ref.artifact_kind
@@ -523,7 +662,7 @@ def test_current_arm_runtime_binding_uses_exact_current_inputs() -> None:
         "changed_runtime_source_file_count_from_previous_binding": 5.0, "new_runtime_source_file_count": 0.0,
         "new_runtime_configuration_file_count": 0., "arm_profile_refit_count": 0., "mutated_historical_artifact_count": 0.}
     assert binding.artifact_sha256 == "bce4be51399d0901083df2f1c9413259507ce43230360cb68fe212cea218a00b"
-    assert ArtifactRef.from_file(ARM_RUNTIME_BINDING_PATH, artifact_id="binding-file-check",
+    assert ArtifactRef.from_file(REAL_HELD_OWN_WRIST_V1_BINDING_PATH, artifact_id="binding-file-check",
         artifact_kind="real2sim_runtime_binding").sha256 == "0df22f253ed33e456485539738a825a8f4f1e487b0a0d555044c7ba521420ba1"
     assert binding.fidelity_claims[0].status == "provisional"
     assert next(e for e in binding.validation_evidence if e.split == "held_out").status == "not_run"
