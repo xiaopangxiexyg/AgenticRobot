@@ -72,7 +72,6 @@ from dataset_contracts.perception_artifacts import (
     SEGMENTATION_OVERLAY_MEDIA_TYPE_V1,
     SEGMENTATION_OVERLAY_SCHEMA_ID_V1,
 )
-from deployments.perception.sam2_grounding_dino import Sam2PointMaskUnavailable
 
 SEGMENT_MASK_OUTPUT_SLOT_ID_V1 = "segmentation_mask"
 SEGMENT_OVERLAY_OUTPUT_SLOT_ID_V1 = "segmentation_overlay"
@@ -644,6 +643,17 @@ def _validate_overlay_jpeg(data: bytes, *, width: int, height: int) -> None:
         raise RuntimeError("Segmentation overlay Artifact is invalid JPEG.") from error
 
 
+def _is_point_mask_miss(error: BaseException) -> bool:
+    """Whether a localizer error is SAM2/SAM3's recoverable point-prompt miss.
+
+    Imported on demand: the shared localizer contract lives with the optional
+    perception models, which importing this module must not load.
+    """
+    from deployments.perception.sam2_grounding_dino import Sam2PointMaskUnavailable
+
+    return isinstance(error, Sam2PointMaskUnavailable)
+
+
 class LiveSegmentationProvider:
     """Capture one target-specific RGB frame and run the shared localizer."""
 
@@ -744,11 +754,11 @@ class LiveSegmentationProvider:
                 pixel_uv=pixel_uv,
                 min_score=float(parameters["min_score"]),
             )
-        except Sam2PointMaskUnavailable:
+        except RuntimeError as error:
             # The localizer ran, but its best mask does not cover the prompted
             # pixel: for this view that is no mask, like a low score. Malformed
             # outputs and transport faults are other RuntimeErrors and still raise.
-            if pixel_uv is None:
+            if pixel_uv is None or not _is_point_mask_miss(error):
                 raise
             return None
         if segment is None:
