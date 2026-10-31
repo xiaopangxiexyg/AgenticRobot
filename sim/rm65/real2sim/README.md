@@ -92,6 +92,18 @@ core and MuJoCo adapter used for the 20260721 fit; tests compare those hashes to
 fixed historical values rather than silently reinterpreting the fit against
 the current files.
 
+真机持物测量改用持物臂自己的腕部相机，并且 SAM3 点提示未命中按该视角无掩码处理，使用独立绑定
+`artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261031_real_held_own_wrist_v1.json`。它固定于合并提交
+`b278f4532`（development `e00a9d9d3` + 任务分支 `68e69d748`），保留前一绑定（MuJoCo 持物放置第三批）的全部非运行时引用；
+192 项已有运行时输入中 5 项改变（真机持物观测与运动生命周期、持物度量、真机相机几何、分割提供者、多视角抓取融合、SAM3 客户端），合计 192 项。
+行为变化：真机持物测量以持物臂自己的腕部相机为主视角，只有它能判定两指之间有物体（种子像素避开深度断边和离夹爪实体 5 mm 以内的点，至少 15 个）；
+其他相机只在主视角确认后、在它们看到主视角物体的位置用点提示分割，每边最多把盒子扩大 3 cm；首次抬起的支撑补全和放置的支撑面只用持物臂腕部相机拟合，
+其他相机的高度作为一致性证据报告（真机持物运动仍默认关闭）。SAM3 点提示的最佳掩码不含所给像素时，该视角按无掩码处理：持物观测记录
+`no_mask_at_seed` 并继续其他视角，分割 Skill 和表面锚点得到原有的无掩码结果，多视角抓取融合排除该辅助视角（`target_point_mask_unavailable`）；
+文本提示的同类异常和传输、协议、掩码格式错误仍然报错，主抓取目标点提示未命中仍使该次请求失败。离线证据按内容哈希记录：
+2262 项关联测试（当前绑定测试在本绑定前排除）、点提示未命中的单独检查，以及 33 个保存的真机场景离线复测报告（不该有物体的臂状态报 held 25/57 → 0/57）。
+绑定仍为 `provisional`，没有新增标定、真机运动执行或 held-out 资格。
+
 MuJoCo 持物放置第三批（批次 2d、四分之一速度、2e）使用独立绑定
 `artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261031_mujoco_agent_place_v3.json`。它固定于合并提交
 `576aacb41`（development `6deeefe32` + 任务分支 `07e567b84`），保留前一绑定（持物放置第二批）的全部非运行时引用；

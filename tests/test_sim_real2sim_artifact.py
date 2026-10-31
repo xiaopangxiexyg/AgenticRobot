@@ -25,6 +25,10 @@ ARM_BASELINE_PATH = Path(
 )
 ARM_RUNTIME_BINDING_PATH = Path(
     "sim/rm65/real2sim/artifacts/"
+    "rm65_arm_free_motion_20260721_v4_runtime_binding_20261031_real_held_own_wrist_v1.json"
+)
+MUJOCO_AGENT_PLACE_V3_BINDING_PATH = Path(
+    "sim/rm65/real2sim/artifacts/"
     "rm65_arm_free_motion_20260721_v4_runtime_binding_20261031_mujoco_agent_place_v3.json"
 )
 MUJOCO_AGENT_PLACE_V2_BINDING_PATH = Path(
@@ -409,6 +413,124 @@ def test_v4_arm_fit_baseline_remains_frozen_and_provisional() -> None:
 
 def test_current_arm_runtime_binding_uses_exact_current_inputs() -> None:
     binding = Real2SimArtifactManifest.load(ARM_RUNTIME_BINDING_PATH)
+    previous = Real2SimArtifactManifest.load(MUJOCO_AGENT_PLACE_V3_BINDING_PATH)
+    fit = Real2SimArtifactManifest.load(ARM_BASELINE_PATH)
+    tag, old_tag = "20261031-real-held-own-wrist-v1", "20261031-mujoco-agent-place-v3"
+    source = "b278f4532de3414a3558f0a96e622534cde93bf8"
+    source_tree = "977805e0570eefcefbbc3291400bed57de287c20"
+    current = {ref.locator: ref for ref in binding.dependency_artifacts if "-runtime-" + tag in ref.artifact_id}
+    inherited = {ref.locator: ref for ref in previous.dependency_artifacts if "-runtime-" + old_tag in ref.artifact_id}
+    extras = tuple(binding.metadata["new_runtime_sources"])
+    assert extras == ()
+    assert len(current) == 192 and len(inherited) == 192 and set(current) == set(inherited) | set(extras)
+    for path, ref in current.items():
+        assert ref.sha256 == ArtifactRef.from_file(path, artifact_id="current-check", artifact_kind=ref.artifact_kind).sha256
+        assert ref.sha256 == hashlib.sha256(subprocess.check_output(["git", "show", source + ":" + path])).hexdigest()
+        if path in inherited:
+            assert ref.artifact_id == inherited[path].artifact_id.replace(old_tag, tag)
+            assert ref.artifact_kind == inherited[path].artifact_kind
+        else:
+            assert ref.artifact_id == f"real-held-own-wrist-owner-{extras.index(path)}-runtime-" + tag
+            assert ref.artifact_kind == "runtime_source"
+    changed = {path for path in inherited if current[path].sha256 != inherited[path].sha256}
+    assert changed == {
+        "agent_gateway/profiles/real/held_object.py",
+        "agent_gateway/profiles/real/object_motion.py",
+        "agent_gateway/profiles/segmentation.py",
+        "deployments/perception/sam3_service.py",
+        "robot_motion/held_object_measurement.py",
+    }
+    assert tuple(binding.metadata["changed_previous_runtime_sources"]) == tuple(sorted(changed))
+    assert tuple(binding.metadata["changed_previous_offline_inputs"]) == ()
+    assert binding.code_revision == binding.environment_fingerprint["source_commit"] == binding.metadata["runtime_source_commit"] == source
+    assert binding.environment_fingerprint["source_tree"] == binding.metadata["offline_validation_source_tree"] == source_tree
+    assert subprocess.check_output(["git", "rev-parse", source + "^{tree}"], text=True).strip() == source_tree
+    assert binding.metadata["mainline_input_commit"] == "e00a9d9d3b32f0fbc9c79b5a89798bccf7c08694"
+    assert binding.metadata["previous_runtime_binding_artifact_sha256"] == previous.artifact_sha256
+    assert binding.metadata["previous_runtime_binding_file_sha256"] == ArtifactRef.from_file(
+        MUJOCO_AGENT_PLACE_V3_BINDING_PATH, artifact_id="parent-check", artifact_kind="real2sim_runtime_binding").sha256
+    refs = {ref.artifact_id: ref for ref in binding.dependency_artifacts}
+    parent = refs["rm65-arm-runtime-binding-mujoco-agent-place-20261031-v3"]
+    assert parent.locator == str(MUJOCO_AGENT_PLACE_V3_BINDING_PATH)
+    assert parent.sha256 == binding.metadata["previous_runtime_binding_file_sha256"]
+    # Every non-runtime predecessor reference is inherited unchanged.
+    for ref in previous.dependency_artifacts:
+        if "-runtime-" + old_tag not in ref.artifact_id:
+            assert refs[ref.artifact_id] == ref
+    assert binding.resolved_timing == previous.resolved_timing == Real2SimArtifactManifest.resolved_timing_from_contract_file(CONTRACT_PATH)
+    assert binding.simulation_contract.sha256 == previous.simulation_contract.sha256
+    assert binding.metadata["fit_artifact_sha256"] == fit.artifact_sha256
+    assert binding.metadata["arm_profile_refit"] is False
+    assert binding.metadata["runtime_behavior_change"] is True
+    assert binding.metadata["runtime_behavior_change_scope"] == (
+        "real_held_object_own_wrist_measurement_and_point_prompt_miss_as_per_view_no_mask")
+    assert binding.metadata["migration"] == "namespaced_real_held_own_wrist_binding_v1"
+    # Real held object measured by the holding arm's own wrist camera; point-prompt misses.
+    assert binding.metadata["real_held_object_observation_semantics"] == "agenticrobot.real.held_object_observation.v2"
+    assert binding.metadata["held_object_measured_box_semantics"] == "agenticrobot.held_object.measured_box.v2"
+    assert binding.metadata["real_held_object_primary_view"] == "holding_arm_wrist_camera"
+    assert binding.metadata["real_held_object_seed_gripper_solid_clearance_m"] == 0.005
+    assert binding.metadata["real_held_object_seed_minimum_pixels"] == 15
+    assert binding.metadata["real_held_object_extension_view_depth_agreement_m"] == 0.03
+    assert binding.metadata["real_held_object_extension_per_side_m"] == 0.03
+    assert binding.metadata["real_object_motion_support_view"] == (
+        "holding_arm_wrist_camera_other_views_as_consistency_evidence")
+    assert binding.metadata["point_prompt_mask_miss"] == "per_view_no_mask"
+    assert binding.metadata["grasp_fusion_auxiliary_point_mask_miss"] == "excluded_view_target_point_mask_unavailable"
+    # Inherited from mujoco-agent-place v3 unchanged.
+    assert binding.metadata["mujoco_held_object_speed_scale"] == 0.25
+    assert binding.metadata["support_release_measurement"] == "depth_only_certified_top_rectangle_v2"
+    assert (binding.metadata["hard_penetration_gate_changed"], binding.metadata["observation_gap_gate_changed"],
+            binding.metadata["release_window_changed"], binding.metadata["noncontact_clearance_gate_changed"]) == (
+        False, False, False, False)
+    assert binding.metadata["mujoco_agent_place_skills_default_enabled"] is False
+    assert binding.metadata["real_gateway_held_object_motion"] is True
+    assert binding.metadata["real_held_object_motion_default_enabled"] is False
+    assert binding.metadata["new_physical_hardware_validation"] is False
+    expected_offline = (
+        "scripts/probes/query_safe_move_snapshot.py", "robot_motion/tool_entity_goals.py",
+        "robot_motion/observed_obstacles.py", "robot_motion/grasp_visible_scene.py",
+        "deployments/perception/dmtac_grasp_overlay.py",
+        "deployments/perception/profiles/dmtac_graspgenx_alignment_v5_q0.json")
+    previous_refs = {ref.artifact_id: ref for ref in previous.dependency_artifacts}
+    for index, path in enumerate(expected_offline):
+        ref = refs[f"real-held-own-wrist-query-input-{index}-{tag}"]
+        assert ref.locator == path
+        assert ref.sha256 == ArtifactRef.from_file(path, artifact_id="offline-check", artifact_kind=ref.artifact_kind).sha256
+        assert ref.sha256 == hashlib.sha256(subprocess.check_output(["git", "show", source + ":" + path])).hexdigest()
+        old_ref = previous_refs[previous.metadata["offline_query_input_artifact_ids"][index]]
+        assert old_ref.locator == path and old_ref.artifact_kind == ref.artifact_kind
+        assert (old_ref.sha256 != ref.sha256) is (path in binding.metadata["changed_previous_offline_inputs"])
+    assert tuple(binding.metadata["offline_query_input_artifact_ids"]) == tuple(
+        f"real-held-own-wrist-query-input-{index}-{tag}" for index in range(len(expected_offline)))
+    reports = {
+        "real-held-own-wrist-focused-report-" + tag: "07ed40079902c2a14198473c6e9954a92d7e3bc435558ec51d7f818ff7b93e9c",
+        "real-held-own-wrist-focused-binding-" + tag: "db548e1f19e2b9447064c25b70d386b5740ea9c0ba5651e61313a1379d62a2c0",
+        "real-held-own-wrist-point-miss-check-" + tag: "64602101928f395d4dd47c1cc51be91b08f8493d8226c1ed9715c40eabfa28ea",
+        "real-held-own-wrist-offline-samples-report-" + tag: "616d098c7c36128325117ed934243b185d3a3b0d240524105b9edd6621e2fad5",
+    }
+    assert tuple(binding.metadata["offline_validation_report_artifact_ids"]) == tuple(reports)
+    for artifact_id, digest in reports.items():
+        assert refs[artifact_id].sha256 == digest and refs[artifact_id].artifact_kind == "offline_validation_report"
+    assert binding.metadata["offline_validation_report_artifact_id"] == "real-held-own-wrist-focused-report-" + tag
+    offline = next(e for e in binding.validation_evidence if e.validation_id == "real-held-own-wrist-offline-consumers-" + tag)
+    assert offline.status == "passed" and dict(offline.metrics) == {
+        "passed_cases": 2262.0, "skipped_cases": 1.0, "failed_cases": 0., "error_cases": 0.}
+    integrity = next(e for e in binding.validation_evidence
+                     if e.validation_id == "runtime-source-content-binding-integrity-" + tag)
+    assert dict(integrity.metrics) == {
+        "bound_runtime_input_file_count": 192.0, "bound_runtime_source_file_count": 188.0,
+        "changed_runtime_source_file_count_from_previous_binding": 5.0, "new_runtime_source_file_count": 0.0,
+        "new_runtime_configuration_file_count": 0., "arm_profile_refit_count": 0., "mutated_historical_artifact_count": 0.}
+    assert binding.artifact_sha256 == "bce4be51399d0901083df2f1c9413259507ce43230360cb68fe212cea218a00b"
+    assert ArtifactRef.from_file(ARM_RUNTIME_BINDING_PATH, artifact_id="binding-file-check",
+        artifact_kind="real2sim_runtime_binding").sha256 == "0df22f253ed33e456485539738a825a8f4f1e487b0a0d555044c7ba521420ba1"
+    assert binding.fidelity_claims[0].status == "provisional"
+    assert next(e for e in binding.validation_evidence if e.split == "held_out").status == "not_run"
+
+
+def test_mujoco_agent_place_v3_binding_remains_frozen_after_real_held_own_wrist() -> None:
+    binding = Real2SimArtifactManifest.load(MUJOCO_AGENT_PLACE_V3_BINDING_PATH)
     previous = Real2SimArtifactManifest.load(MUJOCO_AGENT_PLACE_V2_BINDING_PATH)
     fit = Real2SimArtifactManifest.load(ARM_BASELINE_PATH)
     tag, old_tag = "20261031-mujoco-agent-place-v3", "20261030-mujoco-agent-place-v2"
@@ -420,7 +542,6 @@ def test_current_arm_runtime_binding_uses_exact_current_inputs() -> None:
     assert extras == ()
     assert len(current) == 192 and len(inherited) == 192 and set(current) == set(inherited) | set(extras)
     for path, ref in current.items():
-        assert ref.sha256 == ArtifactRef.from_file(path, artifact_id="current-check", artifact_kind=ref.artifact_kind).sha256
         assert ref.sha256 == hashlib.sha256(subprocess.check_output(["git", "show", source + ":" + path])).hexdigest()
         if path in inherited:
             assert ref.artifact_id == inherited[path].artifact_id.replace(old_tag, tag)
@@ -507,7 +628,6 @@ def test_current_arm_runtime_binding_uses_exact_current_inputs() -> None:
     for index, path in enumerate(expected_offline):
         ref = refs[f"mujoco-agent-place-query-input-{index}-{tag}"]
         assert ref.locator == path
-        assert ref.sha256 == ArtifactRef.from_file(path, artifact_id="offline-check", artifact_kind=ref.artifact_kind).sha256
         assert ref.sha256 == hashlib.sha256(subprocess.check_output(["git", "show", source + ":" + path])).hexdigest()
         old_ref = previous_refs[previous.metadata["offline_query_input_artifact_ids"][index]]
         assert old_ref.locator == path and old_ref.artifact_kind == ref.artifact_kind
@@ -533,7 +653,7 @@ def test_current_arm_runtime_binding_uses_exact_current_inputs() -> None:
         "changed_runtime_source_file_count_from_previous_binding": 5.0, "new_runtime_source_file_count": 0.0,
         "new_runtime_configuration_file_count": 0., "arm_profile_refit_count": 0., "mutated_historical_artifact_count": 0.}
     assert binding.artifact_sha256 == "1f458f87f1657f82a13ef241292853ac10760334a9df6b593797f0388af5bf2c"
-    assert ArtifactRef.from_file(ARM_RUNTIME_BINDING_PATH, artifact_id="binding-file-check",
+    assert ArtifactRef.from_file(MUJOCO_AGENT_PLACE_V3_BINDING_PATH, artifact_id="binding-file-check",
         artifact_kind="real2sim_runtime_binding").sha256 == "5e6fafc11072471deb9d70d5bb1f7e9d4128126fdaa2e63f615691253fa0449d"
     assert binding.fidelity_claims[0].status == "provisional"
     assert next(e for e in binding.validation_evidence if e.split == "held_out").status == "not_run"
