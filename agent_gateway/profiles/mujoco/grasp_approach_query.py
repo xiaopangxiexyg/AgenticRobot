@@ -105,11 +105,17 @@ HORIZONTAL_APPROACH_BACKOFF_M = 0.08
 # every lift from one faulted on the pad contact (1.012-1.034 mm, three of
 # three, including two live Agent runs), while level side grasps lifted in
 # all seven runs. Re-add a pitch only with a lift check for its object size.
+# The level front grasp approaches along the station +x face (from ahead of
+# the object) instead of the arm's own side; it reaches a box whose own-side
+# face is blocked (e.g. the post scene after the cube settles) and holds the
+# cube level, so it lifts like the side grasp. Its path search follows the
+# side grasp's so top-down stays first.
 CANDIDATES = (
     ("top_down", "top_down", 0., 0.),
     ("top_down_turned_left", "top_down", math.pi / 2., 0.),
     ("top_down_turned_right", "top_down", -math.pi / 2., 0.),
     ("side", "side", 0., 0.),
+    ("front", "front", 0., 0.),
     ("top_down_half_turn", "top_down", math.pi, 0.),
 )
 SEGMENTATION_MIN_SCORE = 0.3
