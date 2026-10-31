@@ -158,29 +158,30 @@ class _Planner:
         return SimpleNamespace(qpos_by_side={"left": [np.zeros(6)], "right": [np.zeros(6), end]})
 
 
-def _observation(*, verified=True, size=CUBE, attempt="attempt-1"):
+def _observation(*, verified=True, size=CUBE, attempt="attempt-1", world_from_tcp=WORLD_FROM_TCP):
     return SimpleNamespace(
-        holding_verified=verified, evidence_ref="real-held-object:" + "c" * 64, world_from_tcp=WORLD_FROM_TCP,
+        holding_verified=verified, evidence_ref="real-held-object:" + "c" * 64, world_from_tcp=world_from_tcp,
         capture_qpos_by_side={"left": (0.,) * 6, "right": (0.1,) * 6},
         measurement=SimpleNamespace(tool_from_box=TOOL_FROM_BOX, size_xyz_m=(size, size, size)),
         gripper={"measured_close": 0.6, "last_command_attempt_ref": attempt})
 
 
 def _query(monkeypatch, *, planner=None, segmented=("main", "wrist_right"), retained=True, observation=None,
-           size=CUBE, scene=None):
+           size=CUBE, scene=None, world_from_tcp=WORLD_FROM_TCP):
     monkeypatch.setattr(module, "obstacle_cloud_from_captures", lambda **kwargs: "cloud")
     captures, masks = scene or _scene()
     port = _ScenePort(captures)
     segmenter = _Segmenter(masks, segmented)
     observer = RealHeldObjectObserver(scene_port=port, segmentation_provider=segmenter,
                                       tool_entity_by_side={"right": object()}, roles=ROLES)
-    observed = observation or _observation(size=size)
+    observed = observation or _observation(size=size, world_from_tcp=world_from_tcp)
     observer.observe = lambda **kwargs: observed
     held = RealHeldObjectPort(observer=observer, public_from_geometry=PUBLIC_FROM_GEOMETRY,
                               current_station_revision=lambda: REVISION, clock=lambda: 100.)
     if retained:
         half = np.full(3, size / 2.)
-        held.remember("right", TOOL_FROM_BOX[:3, 3] - half, TOOL_FROM_BOX[:3, 3] + half, _observation(size=size))
+        held.remember("right", TOOL_FROM_BOX[:3, 3] - half, TOOL_FROM_BOX[:3, 3] + half,
+                      _observation(size=size, world_from_tcp=world_from_tcp))
     stub = planner or _Planner()
     planner_port = module.RealSupportReleasePlanner(
         planner_factory=lambda: stub, self_filter=object(), observation_config=None, geometry_frame_id="world",
@@ -285,6 +286,33 @@ def test_real_support_top_refuses_a_steep_top_and_a_tiny_mask():
     tiny[rows[:40], cols[:40]] = True
     with pytest.raises(ValueError, match="insufficient"):
         module.measure_real_support_tops(_depth_capture("wrist_right", depth), tiny, maximum_depth_m=1.5)
+
+
+def test_real_support_top_plane_is_the_support_not_an_object_standing_on_it():
+    # A 6 cm block on a quarter of the tray and inside its mask (as a mask bleeding onto it):
+    # the block top is more than the highest fifth of the masked points, but the most
+    # populated height band is still the tray top.
+    camera = CAMERA_POSES["wrist_right"]
+    depth, on_tray = _render(camera)
+    v, u = np.mgrid[0:H, 0:W].astype(float)
+    distance = camera[2, 3] - (TRAY_TOP + 0.06)
+    x = camera[0, 3] + distance * (u - W / 2.) / F
+    y = camera[1, 3] - distance * (v - H / 2.) / F
+    block_low, block_high = (0.10, -0.28), (0.18, -0.20)
+    on_block = (x >= block_low[0]) & (x <= block_high[0]) & (y >= block_low[1]) & (y <= block_high[1])
+    depth = np.where(on_block, distance, depth)
+    depth = (depth + np.random.default_rng(1).normal(0., 0.0015, depth.shape)).astype(np.float32)
+    mask = on_tray | on_block
+    assert on_block.sum() > 0.2 * mask.sum()
+    top = module.measure_real_support_tops(_depth_capture("wrist_right", depth), mask, maximum_depth_m=1.5)[0]
+    centre = [(a + b) / 2. for a, b in zip(top.region_min_xy_m, top.region_max_xy_m)]
+    assert top.height_at(centre) == pytest.approx(TRAY_TOP, abs=0.002)
+    assert top.tilt_deg < 1.
+    # The certified rectangle is on the tray and clear of the block.
+    for axis in (0, 1):
+        assert TRAY_MIN[axis] <= top.region_min_xy_m[axis] < top.region_max_xy_m[axis] <= TRAY_MAX[axis]
+    assert (top.region_max_xy_m[0] <= block_low[0] or top.region_min_xy_m[0] >= block_high[0]
+            or top.region_max_xy_m[1] <= block_low[1] or top.region_min_xy_m[1] >= block_high[1])
 
 
 # Held object ---------------------------------------------------------------------
@@ -398,15 +426,45 @@ def test_query_counts_refusals_by_leg_and_returns_a_later_candidate(monkeypatch)
     assert result["status"] == "release_pose_found"
     _validate(result)
     counts = {item["reason_code"]: item["count"] for item in result["candidate_rejections"]}
-    assert counts["carry:ik_search_exhausted"] == 1
-    assert counts["place:endpoint_collision_blocked"] == 1
-    assert counts["carry:path_search_exhausted"] == 1
-    # Positions whose place window runs off the tray: the place motion's own wrist check refuses them.
-    assert counts["place:support_not_measured"] >= 1
-    assert result["selected_candidate_index"] == result["attempted_candidate_count"] - 1
-    assert sum(counts.values()) == result["attempted_candidate_count"] - 1
-    # Centres at yaw 0, -90 and +90 deg were refused; the fourth centre (half turn) is returned.
-    assert result["yaw_change_rad"] == pytest.approx(math.pi)
+    # Centre: carry refused; nearest position: place refused; first corner: carry refused.
+    assert counts == {"carry:ik_search_exhausted": 1, "place:endpoint_collision_blocked": 1,
+                      "carry:path_search_exhausted": 1}
+    assert result["selected_candidate_index"] == result["attempted_candidate_count"] - 1 == 3
+    assert result["yaw_change_rad"] == 0.
+    assert len(planner.calls) == 6
+
+
+# Held right above the tray (the pre-place pose of its centre): the place check is predicted.
+ABOVE_TRAY_TCP = _pose(DOWN, ((TRAY_MIN[0] + TRAY_MAX[0]) / 2., (TRAY_MIN[1] + TRAY_MAX[1]) / 2.,
+                              TRAY_TOP + 0.01 + CUBE + module.REAL_RELEASE_PREPLACE_HEIGHT_M + 0.05 - CUBE / 2.))
+
+
+def test_query_from_the_preplace_pose_takes_the_release_height_from_the_place_check(monkeypatch):
+    parts = _query(monkeypatch, world_from_tcp=ABOVE_TRAY_TCP)
+    result, _ = _run(parts)
+    assert result["status"] == "release_pose_found", result
+    _validate(result)
+    release = _geometry(result["release_object_pose_xyz_quat_xyzw"])
+    assert release[2, 3] - CUBE / 2. == pytest.approx(TRAY_TOP + 0.01, abs=1e-3)
+    _carry, place = parts.planner.calls[-2:]
+    support = place["carried_object_support"]
+    # The place check's window: footprint +- 4 cm, the plane of the holding wrist.
+    window = np.asarray(support.region_max_xy_m) - np.asarray(support.region_min_xy_m)
+    np.testing.assert_allclose(window, CUBE + 2 * 0.04, atol=1e-6)
+    assert support.plane_anchor_xyz_m[2] == pytest.approx(TRAY_TOP, abs=1e-3)
+
+
+def test_query_from_above_predicts_the_place_refusal_on_a_narrow_support(monkeypatch):
+    # A 9 cm tray: the place check's window (footprint + 4 cm each side) reaches the table.
+    monkeypatch.setattr(module, "REAL_RELEASE_MAX_CHECKED_CANDIDATES", 1000)
+    narrow = ((0.055, -0.245), (0.145, -0.155), TRAY_TOP)
+    parts = _query(monkeypatch, world_from_tcp=ABOVE_TRAY_TCP, scene=_scene(tray=narrow))
+    result, _ = _run(parts)
+    assert result["reason"] == "no_collision_free_release_path"
+    _validate(result)
+    counts = {item["reason_code"]: item["count"] for item in result["candidate_rejections"]}
+    assert counts == {"place:support_not_measured": result["attempted_candidate_count"]}
+    assert parts.planner.calls == []
 
 
 def test_query_without_a_planned_candidate_reports_the_budget_or_no_path(monkeypatch):
@@ -464,10 +522,17 @@ def planners(monkeypatch):
 
 
 def _lower(monkeypatch, collision_scene_profile):
-    from test_agent_gateway_real_rm65_composition import REPO_ROOT, _Backend, _ForceGuard, _TargetBuilder
+    from test_agent_gateway_real_rm65_composition import (
+        REPO_ROOT,
+        _Backend,
+        _ForceGuard,
+        _TargetBuilder,
+    )
 
     from teleop_runtime.skill_deploy import rm65_profile as profile_module
-    from teleop_runtime.skill_deploy.rm65_lower_assembly import assemble_exclusive_rm65_skill_lower
+    from teleop_runtime.skill_deploy.rm65_lower_assembly import (
+        assemble_exclusive_rm65_skill_lower,
+    )
     from teleop_runtime.skill_deploy.rm65_profile import (
         ExclusiveRM65SkillDeploymentProfile,
         resolve_exclusive_rm65_skill_deployment_profile,
@@ -503,10 +568,19 @@ class _Hand:
 def _compose(lower, tmp_path, **kwargs):
     from test_agent_gateway_real_rm65_composition import REPO_ROOT, _Localizer
 
-    from agent_gateway.profiles.real.gateway_cli import DEFAULT_RM65_CAMERA_MOUNT_URDF, DEFAULT_RM65_CAMERA_REGISTRY_V4
-    from agent_gateway.profiles.real.motion_observed_scene import SafeMotionObservationConfig
-    from agent_gateway.profiles.real.one_shot_authorization import REAL_AGENT_PRIMITIVE_CONFIRM_TOKEN
-    from agent_gateway.profiles.real.rm65_composition import assemble_exclusive_rm65_agent_primitive_composition
+    from agent_gateway.profiles.real.gateway_cli import (
+        DEFAULT_RM65_CAMERA_MOUNT_URDF,
+        DEFAULT_RM65_CAMERA_REGISTRY_V4,
+    )
+    from agent_gateway.profiles.real.motion_observed_scene import (
+        SafeMotionObservationConfig,
+    )
+    from agent_gateway.profiles.real.one_shot_authorization import (
+        REAL_AGENT_PRIMITIVE_CONFIRM_TOKEN,
+    )
+    from agent_gateway.profiles.real.rm65_composition import (
+        assemble_exclusive_rm65_agent_primitive_composition,
+    )
 
     (tmp_path / "artifacts").mkdir(parents=True, exist_ok=True)
     base = {"lower": lower, "socket_path": tmp_path / "release.sock", "authorized_side": "right",
@@ -581,7 +655,9 @@ def test_real_cli_parses_and_checks_support_release_prompts(monkeypatch, tmp_pat
     from test_agent_gateway_real_rm65_cli import _argv
 
     from agent_gateway.profiles.real import gateway_cli
-    from agent_gateway.profiles.real.session_authorization import REAL_AGENT_PRIMITIVE_SESSION_CONFIRM_TOKEN
+    from agent_gateway.profiles.real.session_authorization import (
+        REAL_AGENT_PRIMITIVE_SESSION_CONFIRM_TOKEN,
+    )
 
     base = _argv(confirmation=REAL_AGENT_PRIMITIVE_SESSION_CONFIRM_TOKEN, socket_path=tmp_path / "g.sock")
     parser = gateway_cli.build_parser()

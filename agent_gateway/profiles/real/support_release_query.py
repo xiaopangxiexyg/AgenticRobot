@@ -17,10 +17,11 @@ One read-only request while the arm stands still:
    ``plan_release_approach_candidates`` (center, nearest to the held object and
    interior corners, a bounded yaw sample, then the lean pass) and, for each, a
    pre-place pose straight above it;
-4. predict the place motion's own support check: where the holding arm's wrist
-   camera already sees the release footprint, fit its plane as the place does
-   (``measure_support_under``) and set the release height from it, otherwise
-   from the certified plane (the place measures again from the pre-place pose);
+4. predict the place motion's own support check when the held box is already
+   at (within 3 cm of) the pre-place pose: fit the holding arm's wrist plane as
+   the place does (``measure_support_under``) and set the release height from
+   it; from farther away the certified plane sets it and the place measures
+   again from the pre-place pose;
 5. check each candidate with a dedicated instance of the deployment's observed
    safe-move planner over the cloud of the same cut: the carry leg (current
    pose to pre-place, carried box) and the place leg (pre-place to release,
@@ -104,6 +105,8 @@ REAL_SUPPORT_PLANE_RESIDUAL_M = 0.006
 # at its highest point over the rectangle.
 REAL_SUPPORT_MAX_TILT_DEG = 5.0
 REAL_SUPPORT_GRID_M = 0.004
+# Height band of the plane seed (the most populated band of the masked points).
+REAL_SUPPORT_SEED_BAND_M = 0.004
 REAL_SUPPORT_MIN_REGION_SIDE_M = 0.03
 REAL_SUPPORT_MIN_TOP_POINTS = 150
 REAL_SUPPORT_MAX_GRID_CELLS = 100_000
@@ -111,6 +114,9 @@ REAL_SUPPORT_REGIONS = 3
 # The holding arm's wrist plane and the certified top may disagree by camera
 # calibration; more than this means the wrist sees another surface.
 REAL_SUPPORT_HEIGHT_DISAGREEMENT_M = 0.02
+# The place motion's support check is predicted only when the held box is already
+# within this distance of its pre-place pose (the place measures from there).
+REAL_PLACE_CHECK_PREDICTION_RADIUS_M = 0.03
 REAL_RELEASE_PLANNING_BUDGET_SEC = 60.
 REAL_RELEASE_LEG_BUDGET_SEC = 8.
 REAL_RELEASE_MAX_CHECKED_CANDIDATES = 24
@@ -227,10 +233,10 @@ def measure_real_support_tops(capture: LiveAlignedDepthCapture, mask: np.ndarray
                               limit: int = REAL_SUPPORT_REGIONS) -> tuple[RealMeasuredSupportTop, ...]:
     """Certify up to ``limit`` distinct fully observed top rectangles, largest first.
 
-    The top plane is fitted to the highest fifth of the masked points (sides
-    seen at an angle lie lower), grown to every masked point within
-    ``plane_residual_m`` of it and refitted. A mask clipped by the image border
-    is allowed: only the observed part of the top is certified.
+    The top plane is seeded by the most populated 4 mm height band of the masked
+    points, grown to every masked point within ``plane_residual_m`` of it and
+    refitted. A mask clipped by the image border is allowed: only the observed
+    part of the top is certified.
     """
     if not isinstance(capture, LiveAlignedDepthCapture):
         raise TypeError("A bound metric-depth capture is required")
@@ -246,7 +252,18 @@ def measure_real_support_tops(capture: LiveAlignedDepthCapture, mask: np.ndarray
     points = _mask_points(capture, selected, maximum_depth_m)
     if len(points) < minimum_top_points:
         raise ValueError("Support mask has insufficient valid metric depth")
-    seed = points[points[:, 2] >= float(np.quantile(points[:, 2], .8)) - 1e-9]
+    # Seed: the most populated height band of the masked points. A horizontal top
+    # concentrates its points in one band; sides seen at an angle spread over many,
+    # and objects standing on the support are smaller than it. (On the saved real
+    # scenes the highest fifth of the points picked such objects or depth noise and
+    # tilted the plane.)
+    edges = np.arange(float(points[:, 2].min()), float(points[:, 2].max()) + REAL_SUPPORT_SEED_BAND_M,
+                      REAL_SUPPORT_SEED_BAND_M)
+    if len(edges) < 2:
+        edges = np.array([float(points[:, 2].min()) - 1e-6, float(points[:, 2].max()) + 1e-6])
+    counts, edges = np.histogram(points[:, 2], bins=edges)
+    band = int(np.argmax(counts))
+    seed = points[(points[:, 2] >= edges[band] - plane_residual_m) & (points[:, 2] <= edges[band + 1] + plane_residual_m)]
     if len(seed) < 16:
         raise ValueError("Support top has insufficient measured coverage")
     anchor, normal = _fit_plane(seed)
@@ -349,7 +366,8 @@ def build_real_support_release_registration(*, segmentation, back_projection, pr
         "roles": list(roles), "view_selection": "holding_wrist_if_certified_else_largest_certified_rectangle",
         "prompt_by_support_id": dict(sorted(prompts.items())),
         "segmentation_min_score": REAL_SUPPORT_SEGMENTATION_MIN_SCORE,
-        "support_measurement": {"plane": "upper_fifth_seed_grown_within_residual", "mask_border": "observed_part_only",
+        "support_measurement": {"plane": "most_populated_height_band_seed_grown_within_residual",
+                                "seed_band_m": REAL_SUPPORT_SEED_BAND_M, "mask_border": "observed_part_only",
                                 "plane_residual_m": REAL_SUPPORT_PLANE_RESIDUAL_M,
                                 "maximum_tilt_deg": REAL_SUPPORT_MAX_TILT_DEG, "grid_m": REAL_SUPPORT_GRID_M,
                                 "minimum_region_side_m": REAL_SUPPORT_MIN_REGION_SIDE_M,
@@ -365,7 +383,8 @@ def build_real_support_release_registration(*, segmentation, back_projection, pr
                  "maximum_tilt_from_support_normal_rad": MAXIMUM_RELEASE_LEAN_RAD},
         "lateral_margin_m": REAL_RELEASE_LATERAL_MARGIN_M,
         "preplace_height_m": REAL_RELEASE_PREPLACE_HEIGHT_M,
-        "release_height": "place_check_plane_of_the_holding_wrist_if_seen_else_certified_plane",
+        "release_height": "place_check_plane_of_the_holding_wrist_at_the_preplace_pose_else_certified_plane",
+        "place_check_prediction_radius_m": REAL_PLACE_CHECK_PREDICTION_RADIUS_M,
         "support_height_disagreement_m": REAL_SUPPORT_HEIGHT_DISAGREEMENT_M,
         "legs": {"carry": "within_arrival_tolerance", "place": "preserve_target_with_support_allowance"},
         "planning_time_budget_sec": REAL_RELEASE_PLANNING_BUDGET_SEC,
@@ -589,8 +608,9 @@ class RealSupportReleaseQuery:
 
     def _depth_capture(self, capture) -> LiveAlignedDepthCapture:
         intrinsics = dict(capture.intrinsics)
-        intrinsics.setdefault("width", int(capture.width))
-        intrinsics.setdefault("height", int(capture.height))
+        # The capture's own image size (saved scenes store the intrinsics' size as floats).
+        intrinsics["width"] = int(getattr(capture, "width", intrinsics.get("width")))
+        intrinsics["height"] = int(getattr(capture, "height", intrinsics.get("height")))
         return LiveAlignedDepthCapture(
             source_id=capture.source_id, role=capture.role, captured_at=float(capture.acquired_at),
             station_revision=int(capture.station_revision), capture_group_id=capture.capture_group_id,
@@ -782,13 +802,21 @@ class RealSupportReleaseQuery:
         centre = (footprint_low + footprint_high) / 2.
         certified_anchor = (self.geometry_from_public @ np.r_[np.asarray(region.plane_anchor_xyz_m), 1.])[:3]
         certified_normal = self.geometry_from_public[:3, :3] @ np.asarray(region.normal_xyz)
-        # The place motion fits the holding arm's wrist plane around the footprint,
-        # below the box bottom of the pose it starts from (the pre-place pose).
-        fitted, stats = measure_support_under(
-            captures=context.captures, side=self.side, footprint_min_xy=footprint_low,
-            footprint_max_xy=footprint_high,
-            below_z_m=float(corners[:, 2].min()) + REAL_RELEASE_PREPLACE_HEIGHT_M + 0.01,
-            exclude_box=(context.current_box_world, context.size))
+        # The place motion fits the holding arm's wrist plane around the footprint from
+        # the pose it starts at (the pre-place pose), below that pose's box bottom. Its
+        # result can be predicted only from views taken there: the hand already at the
+        # pre-place pose. From anywhere else the wrist sees another window (often its
+        # own fingers or other objects), so the certified plane stands in.
+        preplace_box = geometry_goal.copy()
+        preplace_box[:3, 3] += self.geometry_from_public[:3, :3] @ np.array([0., 0., REAL_RELEASE_PREPLACE_HEIGHT_M])
+        offset = np.asarray(context.current_box_world)[:3, 3] - preplace_box[:3, 3]
+        fitted, stats = None, {}
+        if float(np.linalg.norm(offset)) <= REAL_PLACE_CHECK_PREDICTION_RADIUS_M:
+            fitted, stats = measure_support_under(
+                captures=context.captures, side=self.side, footprint_min_xy=footprint_low,
+                footprint_max_xy=footprint_high,
+                below_z_m=float(corners[:, 2].min()) + REAL_RELEASE_PREPLACE_HEIGHT_M + 0.01,
+                exclude_box=(context.current_box_world, context.size))
         if fitted is not None:
             anchor, normal, window_low, window_high = (np.asarray(value, dtype=float) for value in fitted)
             if abs(self._plane_z(anchor, normal, centre)
@@ -796,10 +824,12 @@ class RealSupportReleaseQuery:
                 return _Checked("place:support_height_disagrees")
             source = "holding_wrist_place_check"
         elif int(stats.get("support_point_count", 0)) >= REAL_OBJECT_MOTION_SUPPORT_MIN_POINTS:
-            # The wrist sees the footprint but not one plane around it: the place would refuse.
+            # From the pre-place pose the wrist sees the footprint but not one plane
+            # around it: the place would refuse (for example a support narrower than
+            # the footprint plus the place's 4 cm margin on each side).
             return _Checked("place:support_not_measured")
         else:
-            # Not seen yet; the place measures again from the pre-place pose.
+            # Not seen from the pre-place pose yet; the place measures again there.
             anchor, normal = certified_anchor, certified_normal
             window_low = footprint_low - REAL_OBJECT_MOTION_SUPPORT_MARGIN_M
             window_high = footprint_high + REAL_OBJECT_MOTION_SUPPORT_MARGIN_M
