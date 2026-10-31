@@ -29,7 +29,8 @@ SEMANTICS = "agenticrobot.held_object.support_release_pose.v1"
 MIN_CLEARANCE_M = 0.004
 MAX_CLEARANCE_M = 0.03
 DEFAULT_CLEARANCE_M = 0.006
-# Upper bound of a reported release lean (the MuJoCo deployment uses 6 degrees).
+# Upper bound of a reported release lean; equals the planner's lean limit (the
+# MuJoCo deployment checks this at registration and uses 6 degrees).
 MAX_RELEASE_LEAN_RAD = math.radians(10.)
 STATUSES = ("release_pose_found", "no_release_pose")
 REASONS = (
@@ -91,13 +92,15 @@ def definition() -> SkillDefinition:
             "keeps up to three fully observed top rectangles, largest first (the free strips "
             "beside an object already on the top count separately), proposes on-support "
             "positions (the center, the position nearest the held object and four interior "
-            "corners) and yaw turns for the held object, and returns the planner's preferred "
-            "one in the first rectangle that has one whose whole payload path from the current "
-            "arm state is collision-free. When no level pose of a rectangle has such a path, the "
-            "same positions are tried at the current yaw with the held object leaned a few "
-            "degrees, top toward the arm (a reaching arm can hold it leaned where it cannot hold "
-            "it level; it settles flat when released); release_lean_rad reports that lean, 0 for "
-            "a level pose. Pass "
+            "corners) and yaw turns of the held object's orientation, and returns the planner's "
+            "preferred one in the first rectangle that has one whose whole payload path from the "
+            "current arm state is collision-free. Poses keep the orientation the object has in the "
+            "gripper, turned only about the support's normal. When none of a rectangle's poses has "
+            "such a path, the same positions are tried at the current yaw with the held object "
+            "turned a few degrees further, top toward the arm (a reaching arm can hold it leaned "
+            "where it cannot hold it as it is; it settles flat when released; a lean never tilts "
+            "it more than 10 degrees from the support's normal); release_lean_rad "
+            "reports that added lean, 0 when the held orientation is kept. Pass "
             "release_object_pose_xyz_quat_xyzw unchanged to motion.move_grasped_object_to_pose "
             "with phase=carry, then open the gripper with release_support_object_id set to the "
             "same support. Read-only; it never moves the arm or opens the gripper. "
@@ -169,8 +172,8 @@ def schema(*, definition_hash, profile_hash, support_object_ids, reference_frame
         "yaw_change_rad": {"type": ["number", "null"]},
         "release_lean_rad": {"type": ["number", "null"], "minimum": 0,
                              "maximum": MAX_RELEASE_LEAN_RAD,
-                             "description": "Tilt of the release pose from the held orientation "
-                                            "(after yaw), top toward the arm; 0 when level."},
+                             "description": "Lean added to the held orientation (after the yaw turn), "
+                                            "top toward the arm; 0 when the held orientation is kept."},
         "support_top_z_m": {"type": ["number", "null"]},
         "support_region_min_xy_m": _nullable(xy),
         "support_region_max_xy_m": _nullable(xy),

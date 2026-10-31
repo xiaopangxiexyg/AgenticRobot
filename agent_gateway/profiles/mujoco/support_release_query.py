@@ -11,16 +11,23 @@ operation:
    (``agent_gateway.profiles.measured_support``); an object resting on the top
    leaves the free strips around it as separate regions;
 3. re-capture depth, require the support pixels unchanged, then read the held
-   box and propose on-support release poses with bounded yaw turns;
+   box and propose on-support release poses with bounded yaw turns of the held
+   orientation;
 4. check the proposals of each region in turn with a private, never-activated
    planner that uses the carry Route's motion profile, envelope and measured
    payload binding, and keep the planner's ranked selection in the first
-   region that has one; when no level proposal of a region has a path, its
-   positions are tried once more at the current yaw with the held object
-   leaned ``RELEASE_LEAN_RAD`` toward the arm base (calibrated mounting).
+   region that has one; when no proposal of a region at the held orientation
+   has a path, its positions are tried once more at the current yaw with the
+   held object turned ``RELEASE_LEAN_RAD`` further, top toward the arm base
+   (calibrated mounting), unless that would tilt it more than
+   ``MAXIMUM_RELEASE_LEAN_RAD`` from the support normal.
 
-Native body poses never enter the support measurement. Nothing is commanded,
-retained as a plan or authorized for execution.
+The support is measured from depth and the segmentation mask only; native body
+poses never enter it. The held box comes from the deployment's held-object
+observer (``MujocoHeldBoxObservationPort``: in MuJoCo a declared native-physics
+in-hand observation, the stand-in for in-hand sensing, as for
+``state.read_object_state``). Nothing is commanded, retained as a plan or
+authorized for execution.
 """
 
 from __future__ import annotations
@@ -36,7 +43,7 @@ from types import SimpleNamespace
 import numpy as np
 
 from agent_gateway.profiles.back_projection import LiveAlignedDepthCapture
-from agent_gateway.profiles.measured_support import measure_support_tops
+from agent_gateway.profiles.measured_support import SUPPORT_TOP_MEASUREMENT_ID, measure_support_tops
 from agent_gateway.profiles.segmentation import decode_segmentation_mask_npy
 from agent_gateway.protocol.skill_catalog import SkillRouteManifestEntry
 from agent_gateway.protocol.skill_io_contracts import inline_only_skill_io_contract
@@ -49,7 +56,11 @@ from agent_gateway.runtime.payload_validation import AgentSkillPayloadValidatorS
 from agent_gateway.skills.perception import support_release_query as skill
 from agent_gateway.skills.perception.schemas import validate_no_task_evaluation_v1
 from dataset_contracts.canonical_encoding import canonical_content_hash
-from robot_motion.object_transport import plan_release_approach_candidates
+from robot_motion.object_transport import (
+    MAXIMUM_RELEASE_LEAN_RAD,
+    NoReleaseCandidates,
+    plan_release_approach_candidates,
+)
 from robot_motion.path_planning import JointConfigurationCheck
 from robot_motion.relative_action import xyzquat_to_pose_matrix
 from sim.mujoco.deploy.payload_motion import MujocoPayloadBinding
@@ -64,10 +75,12 @@ SUPPORT_RELEASE_MAX_OPERATION_MS = 90_000
 RELEASE_YAW_OFFSETS_RAD = (0., -math.pi / 4., math.pi / 4., -math.pi / 2., math.pi / 2.,
                            -3. * math.pi / 4., 3. * math.pi / 4., math.pi)
 RELEASE_LATERAL_MARGIN_M = 0.003
-# When no level release in a region has a path, the same positions are tried once
-# more at the current yaw with the held object leaned toward the arm base: near the
-# edge of its reach the arm can hold the object leaned where it cannot hold it level
-# (box_on_box v1: 4.5 deg too little, 6 deg enough; it settles flat on release).
+# When no release in a region at the held orientation has a path, the same positions
+# are tried once more at the current yaw with the held object turned further toward the
+# arm base: near the edge of its reach the arm can hold the object leaned where it cannot
+# hold it as it is (box_on_box v1: 4.5 deg too little, 6 deg enough; it settles flat on
+# release). The planner skips a lean that would tilt the object more than
+# MAXIMUM_RELEASE_LEAN_RAD from the support normal.
 RELEASE_LEAN_RAD = math.radians(6.)
 RELEASE_LEAN_YAW_OFFSETS_RAD = (0.,)
 MAXIMUM_RELEASE_CLEARANCE_M = 0.05
@@ -97,6 +110,10 @@ def build_support_release_query_registration(*, segmentation, back_projection, r
                                              prompt_by_support_id, object_motion_contract,
                                              object_motion_route):
     """Bind the query to the segmenter, ordered aligned RGB-D roles and the carry Route."""
+    if not (0. < RELEASE_LEAN_RAD <= MAXIMUM_RELEASE_LEAN_RAD
+            and MAXIMUM_RELEASE_LEAN_RAD == skill.MAX_RELEASE_LEAN_RAD):
+        # The planner's lean limit and the result schema's bound must agree.
+        raise ValueError("Release lean limits of the planner and the result schema differ.")
     prompts = {str(key): str(value) for key, value in dict(prompt_by_support_id).items()}
     supports = tuple(sorted(prompts))
     roles = tuple(roles)
@@ -135,13 +152,12 @@ def build_support_release_query_registration(*, segmentation, back_projection, r
         "yaw_offsets_rad": list(RELEASE_YAW_OFFSETS_RAD),
         "positions_per_yaw": ["center", "nearest_to_held", "interior_corners_0.85"],
         "lean": {"rad": RELEASE_LEAN_RAD, "yaw_offsets_rad": list(RELEASE_LEAN_YAW_OFFSETS_RAD),
-                 "toward": "motion_arm_base", "order": "after_the_level_candidates_of_each_region"},
+                 "toward": "motion_arm_base", "order": "after_the_held_orientation_candidates_of_each_region",
+                 "maximum_tilt_from_support_normal_rad": MAXIMUM_RELEASE_LEAN_RAD},
         "lateral_margin_m": RELEASE_LATERAL_MARGIN_M,
         "planning_time_budget_sec": PLANNING_TIME_BUDGET_SEC,
         "path_search_budget_sec": PATH_SEARCH_BUDGET_SEC,
-        # v2: the top height is the certified plane rectangle's highest corner plus the
-        # certification residual, not the highest masked point.
-        "support_measurement": "depth_only_certified_top_rectangle_v2",
+        "support_measurement": SUPPORT_TOP_MEASUREMENT_ID,
         "support_regions": {"maximum": MAXIMUM_SUPPORT_REGIONS, "order": "largest_first",
                             "maximum_overlap_fraction": .75},
         "planner": "mujoco_private_payload_candidate_planner_v1",
@@ -396,7 +412,7 @@ class MujocoSupportReleaseQuery:
                                          scene_revision=revision, measured_at=float(fresh.captured_at),
                                          evidence_ref=region_ref)
             region_recorded = False
-            # Level candidates first; leaned ones only when no level one has a path.
+            # Held-orientation candidates first; leaned ones only when none of those has a path.
             for orientation in passes:
                 if "lean_rad" in orientation and float(self.clock()) >= deadline:
                     out_of_time = True
@@ -408,9 +424,10 @@ class MujocoSupportReleaseQuery:
                         maximum_clearance_m=MAXIMUM_RELEASE_CLEARANCE_M,
                         lateral_margin_m=RELEASE_LATERAL_MARGIN_M, include_nearest_to_held=True,
                         **orientation)
-                except ValueError as error:
-                    if "fits" not in str(error):
-                        raise
+                except NoReleaseCandidates:
+                    # Nothing fits this region in this orientation pass (or the lean
+                    # would tilt the object past its limit); stale or invalid
+                    # observations still raise.
                     continue
                 fitted = True
                 if not region_recorded:
@@ -467,10 +484,12 @@ class MujocoSupportReleaseQuery:
                     "motion_executed": False, "execution_authorized": False}, tuple(evidence)
             if out_of_time:
                 break
-        if not fitted:
+        if not fitted and not out_of_time:
             return _rejected(reason="held_footprint_does_not_fit_support", held_pose=held_pose,
                              segmentation=segmentation, measured=measured, **common), tuple(evidence)
-        return _rejected(reason="query_budget_exhausted" if budget_exhausted else "no_collision_free_release_path",
+        # Regions or passes left untried for lack of time are a budget outcome.
+        exhausted = budget_exhausted or out_of_time
+        return _rejected(reason="query_budget_exhausted" if exhausted else "no_collision_free_release_path",
                          held_pose=held_pose, segmentation=segmentation, measured=measured,
                          candidate_count=offset, attempted=offset,
                          planning_wall_sec=time.monotonic() - began,

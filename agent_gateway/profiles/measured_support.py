@@ -36,6 +36,10 @@ from .back_projection import (
 
 GRID_RESOLUTION_M = 0.002
 MAXIMUM_PLANE_RESIDUAL_M = 0.002
+# Identity of the support top measurement recorded by its consumers. v2: the top
+# height is the certified plane rectangle's highest corner plus the certification
+# residual, not the highest masked point.
+SUPPORT_TOP_MEASUREMENT_ID = "depth_only_certified_top_rectangle_v2"
 DEFAULT_LATERAL_MARGIN_M = 0.002
 MINIMUM_REGION_SIDE_M = 0.02
 MAXIMUM_GRID_CELLS = 100_000
@@ -410,6 +414,6 @@ def measure_object_top(capture: LiveAlignedDepthCapture, mask: np.ndarray, *,
         tilt_deg=tilt)
 
 
-__all__ = ["MeasuredObjectTop", "MeasuredSupportTop", "fit_support_top_plane",
+__all__ = ["SUPPORT_TOP_MEASUREMENT_ID", "MeasuredObjectTop", "MeasuredSupportTop", "fit_support_top_plane",
            "largest_true_rectangle", "measure_object_top", "measure_support_top",
            "measure_surface_below", "minimum_area_rectangle", "plane_coverage_grid"]

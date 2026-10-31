@@ -361,6 +361,14 @@ class ReleaseApproachProposal:
         object.__setattr__(self, "tool_goal", rigid_pose(self.tool_goal, name="release tool goal"))
 
 
+class ReleaseFootprintDoesNotFit(ValueError):
+    """The complete held footprint does not fit the support region at this release pose."""
+
+
+class NoReleaseCandidates(ValueError):
+    """No bounded release proposal exists for this support and orientation policy."""
+
+
 def _oriented_box_offsets(held: GraspedObjectObservation,
                           object_rotation: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     box = held.object_from_box
@@ -395,7 +403,7 @@ def _release_approach_at_box_center(
     footprint_max = object_goal[:2, 3] + high[:2]
     if (np.any(footprint_min < np.asarray(support.region_min_xy_m) + lateral_margin_m)
             or np.any(footprint_max > np.asarray(support.region_max_xy_m) - lateral_margin_m)):
-        raise ValueError("Complete held footprint does not fit on the selected support")
+        raise ReleaseFootprintDoesNotFit("Complete held footprint does not fit on the selected support")
     object_goal = rigid_pose(object_goal, name="support-relative release object goal")
     return ReleaseApproachProposal(
         support_id=support.support_id, reference_frame_id=held.reference_frame_id,
@@ -563,8 +571,16 @@ class ReleaseApproachCandidate:
     lean_rad: float = 0.
 
 
-# A held object may lean this far toward the arm at release; it settles flat on the support.
+# The query may turn a held object at most this far toward the arm, and a leaned
+# release never tilts the object's box more than this from the support normal.
 MAXIMUM_RELEASE_LEAN_RAD = math.radians(10.)
+
+
+def _support_tilt_rad(held: GraspedObjectObservation, rotation: np.ndarray, normal: np.ndarray) -> float:
+    """Angle between the support normal and the held box axis closest to it."""
+    box = rotation @ held.object_from_box[:3, :3]
+    alignment = float(np.max(np.abs(box.T @ normal)))
+    return math.acos(max(-1., min(1., alignment)))
 
 
 def _lean_rotation(support: SupportSurfaceObservation, *, lean_rad: float,
@@ -572,7 +588,7 @@ def _lean_rotation(support: SupportSurfaceObservation, *, lean_rad: float,
     """Tilt about the support-horizontal axis across the direction to ``lean_toward_xy_m``.
 
     The object's support-normal side turns toward that point (for an arm, its base):
-    a reaching arm can hold the object leaned where it cannot hold it level.
+    a reaching arm can hold the object leaned where it cannot hold it as it is.
     """
     if (not isinstance(lean_toward_xy_m, (tuple, list, np.ndarray)) or len(lean_toward_xy_m) != 2
             or any(isinstance(value, (bool, np.bool_)) for value in lean_toward_xy_m)):
@@ -586,7 +602,7 @@ def _lean_rotation(support: SupportSurfaceObservation, *, lean_rad: float,
     away -= float(away @ normal) * normal
     length = float(np.linalg.norm(away))
     if length < 1e-3:
-        raise ValueError("The lean direction is undefined above the point to lean toward")
+        raise NoReleaseCandidates("The lean direction is undefined above the point to lean toward")
     axis = np.cross(normal, away / length)
     axis /= np.linalg.norm(axis)
     # Rodrigues: a positive turn about normal x away tilts the normal side away;
@@ -622,9 +638,13 @@ def plan_release_approach_candidates(
     carried over or beside the support, that release needs the least motion.
     Quarter turns or an explicit bounded yaw sample are opt-in because a task
     may require the observed orientation. Also opt-in, ``lean_rad`` (at most
-    ``MAXIMUM_RELEASE_LEAN_RAD``) tilts every orientation toward
+    ``MAXIMUM_RELEASE_LEAN_RAD``) turns every orientation further toward
     ``lean_toward_xy_m``; the footprint and the lowest-corner clearance are
-    computed for the tilted box. No candidate is an authority to move,
+    computed for the tilted box, and an orientation whose box would then tilt
+    more than ``MAXIMUM_RELEASE_LEAN_RAD`` from the support normal (an object
+    that already leans in the hand) is skipped. A position whose footprint
+    misses the region by rounding is dropped; ``NoReleaseCandidates`` reports
+    that nothing remains. No candidate is an authority to move,
     and the selected support must be
     observed again when execution starts.
     """
@@ -665,6 +685,8 @@ def plan_release_approach_candidates(
         angles = (0.,)
     fractions = ((0., 0.), (.85, .85), (.85, -.85), (-.85, .85), (-.85, -.85))
     held_box_center = (held.reference_from_object @ held.object_from_box)[:2, 3]
+    normal = np.asarray(support.normal_reference_xyz, dtype=float)
+    tilt_limited = False
     for angle in angles:
         z_rotation = np.array([
             [math.cos(angle), -math.sin(angle), 0.],
@@ -672,6 +694,10 @@ def plan_release_approach_candidates(
             [0., 0., 1.],
         ])
         rotation = lean @ z_rotation @ held.reference_from_object[:3, :3]
+        if lean_rad > 0. and _support_tilt_rad(held, rotation, normal) > MAXIMUM_RELEASE_LEAN_RAD:
+            # The lean adds to the tilt the object already has in the hand.
+            tilt_limited = True
+            continue
         _, low, high, center_offset = _oriented_box_offsets(held, rotation)
         feasible_min = np.asarray(support.region_min_xy_m) + lateral_margin_m - low[:2] + center_offset[:2]
         feasible_max = np.asarray(support.region_max_xy_m) - lateral_margin_m - high[:2] + center_offset[:2]
@@ -690,12 +716,16 @@ def plan_release_approach_candidates(
         for box_center in positions:
             if np.any(box_center < feasible_min) or np.any(box_center > feasible_max):
                 continue
-            proposal = _release_approach_at_box_center(
-                held, support, object_rotation=rotation,
-                box_center_xy_m=box_center,
-                clearance_m=clearance_m,
-                lateral_margin_m=lateral_margin_m,
-            )
+            try:
+                proposal = _release_approach_at_box_center(
+                    held, support, object_rotation=rotation,
+                    box_center_xy_m=box_center,
+                    clearance_m=clearance_m,
+                    lateral_margin_m=lateral_margin_m,
+                )
+            except ReleaseFootprintDoesNotFit:
+                # A boundary position of a zero-width feasible span can miss by rounding.
+                continue
             if any(item.yaw_offset_rad == angle and
                    np.allclose(item.box_center_xy_m, box_center, atol=1e-12, rtol=0.)
                    for item in candidates):
@@ -705,7 +735,11 @@ def plan_release_approach_candidates(
                 yaw_offset_rad=angle, proposal=proposal, lean_rad=float(lean_rad),
             ))
     if not candidates:
-        raise ValueError("No complete held footprint fits the selected support")
+        if tilt_limited:
+            raise NoReleaseCandidates(
+                "Leaning the held object would tilt it more than MAXIMUM_RELEASE_LEAN_RAD "
+                "from the support normal, or no leaned footprint fits the selected support")
+        raise NoReleaseCandidates("No complete held footprint fits the selected support")
     return tuple(candidates)
 
 
