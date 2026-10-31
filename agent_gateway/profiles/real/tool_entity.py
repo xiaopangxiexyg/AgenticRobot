@@ -63,6 +63,9 @@ class RealToolEntityOptions:
     # Real held-object motion (object_id, object_workspace_bounds,
     # clock_domain_id); it measures the held object with the relation scene port.
     object_motion: Mapping[str, object] | None = None
+    # Read-only release pose query for that held object (prompt_by_support_id,
+    # planner: a plan-only RealSupportReleasePlanner, arm_base_xy_m in the public frame).
+    support_release: Mapping[str, object] | None = None
 
     def __post_init__(self):
         if type(self.enable_relations) is not bool or type(self.enable_hover) is not bool:
@@ -77,6 +80,11 @@ class RealToolEntityOptions:
                 not self.enable_relations
                 or set(self.object_motion) != {"object_id", "object_workspace_bounds", "clock_domain_id"}):
             raise ValueError("Held-object motion needs tool-object relations and its exact binding.")
+        if self.support_release is not None and (
+                self.object_motion is None
+                or set(self.support_release) != {"prompt_by_support_id", "planner", "arm_base_xy_m"}
+                or not self.support_release["prompt_by_support_id"]):
+            raise ValueError("Support release queries need held-object motion, named supports and their planner.")
 
 
 class RealToolScenePort:

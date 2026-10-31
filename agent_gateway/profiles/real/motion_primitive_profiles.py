@@ -17,6 +17,8 @@ if TYPE_CHECKING:
     from agent_gateway.profiles.spatial_goal import SpatialGoalRegistration
     from agent_gateway.profiles.tcp_pose_comparison import TcpPoseComparisonRegistration
 
+    from .support_release_query import RealSupportReleaseRegistration
+
 from agent_gateway.profiles.segmentation import SegmentationRegistration
 from agent_gateway.profiles.placement import (
     PlacementRegistration,
@@ -889,6 +891,7 @@ class RealAgentPrimitiveContractBundle:
     object_motion_profile: RealAgentObjectMotionProfile | None = None
     tool_object_relation_registration: ToolEntityRegistration | None = None
     tool_hover_registration: ToolEntityRegistration | None = None
+    support_release_registration: RealSupportReleaseRegistration | None = None
 
     def __post_init__(self) -> None:
         published_skill_ids = {
@@ -1155,6 +1158,14 @@ class RealAgentPrimitiveContractBundle:
             != self.tool_hover_registration.entry
         ):
             raise ValueError("Real tool hover queries need surface anchor v2, the safe TCP Route and their entry.")
+        if self.support_release_registration is not None and (
+            self.object_motion_profile is None or self.segmentation_registration is None
+            or self.perception_capture is None or self.perception_capture.back_projection is None
+            or self.route_manifest.route("perception.query_support_release_pose", "2")
+            != self.support_release_registration.entry
+        ):
+            raise ValueError("Real support release queries need held-object motion, segmentation, "
+                             "aligned RGB-D and their manifest entry.")
         expected_route_count = (
             (1 + int(pose_target_enabled) + int(grasp_approach_enabled)
              + int(safe_pose_enabled) + int(observed_point_enabled)
@@ -1171,6 +1182,7 @@ class RealAgentPrimitiveContractBundle:
             + int(self.surface_anchor_capture_registration is not None)
             + int(self.tool_object_relation_registration is not None)
             + int(self.tool_hover_registration is not None)
+            + int(self.support_release_registration is not None)
             + int(self.placement_registration is not None)
             + (2 if grasp_approach_plan_enabled else 0)
             + int(transport_enabled)
@@ -1459,12 +1471,17 @@ def build_real_agent_primitive_contract_bundle(
     tool_hover_region_budget_sec: float | None = None,
     tool_hover_candidate_budget_sec: float | None = None,
     object_motion: Mapping[str, object] | None = None,
+    support_release_prompt_by_id: Mapping[str, str] | None = None,
+    support_release_planner_profile_hash: str | None = None,
 ) -> RealAgentPrimitiveContractBundle:
     """Build exact motion and optional passive Routes without runtime effects.
 
     ``object_motion`` (``object_id``, ``object_workspace_bounds``,
     ``clock_domain_id``) publishes the real held-object motion Route when the
-    lower envelopes allow it.
+    lower envelopes allow it. ``support_release_prompt_by_id`` (named supports
+    and their segmentation prompts) additionally publishes the read-only
+    ``perception.query_support_release_pose@2`` for that held object, checked
+    by the planner identified by ``support_release_planner_profile_hash``.
     """
 
     if not isinstance(attachment, RealTcpPoseObserveAttachmentSpec):
@@ -2040,6 +2057,22 @@ def build_real_agent_primitive_contract_bundle(
         if tool_hover_registration.reference_frame_id != pose_target_profile.reference_frame_id:
             # The selected pose is submitted unchanged to the safe TCP Route.
             raise ValueError("Real tool hover results must use the safe TCP Route's public frame.")
+    support_release_registration = None
+    if support_release_prompt_by_id:
+        if (object_motion_profile is None or object_motion_route is None or segmentation_registration is None
+                or perception_capture is None or perception_capture.back_projection is None
+                or not support_release_planner_profile_hash):
+            raise ValueError("Real support release queries need held-object motion, segmentation, "
+                             "aligned RGB-D and their payload planner.")
+        from .support_release_query import build_real_support_release_registration
+
+        support_release_registration = build_real_support_release_registration(
+            segmentation=segmentation_registration, back_projection=perception_capture.back_projection,
+            prompt_by_support_id=support_release_prompt_by_id, object_motion_route=object_motion_route,
+            object_motion_profile=object_motion_profile,
+            planner_profile_hash=support_release_planner_profile_hash)
+    elif support_release_planner_profile_hash is not None:
+        raise ValueError("A support release planner needs named support prompts.")
     perception_registrations = list(
         ()
         if perception_capture is None
@@ -2071,6 +2104,8 @@ def build_real_agent_primitive_contract_bundle(
         perception_registrations.append(tool_object_relation_registration.skill)
     if tool_hover_registration is not None:
         perception_registrations.append(tool_hover_registration.skill)
+    if support_release_registration is not None:
+        perception_registrations.append(support_release_registration.skill)
     if placement_registration is not None:
         perception_registrations.append(placement_registration.skill)
     if grasp_approach_plan_registration is not None:
@@ -2287,6 +2322,8 @@ def build_real_agent_primitive_contract_bundle(
         route_items.append(tool_object_relation_registration.entry)
     if tool_hover_registration is not None:
         route_items.append(tool_hover_registration.entry)
+    if support_release_registration is not None:
+        route_items.append(support_release_registration.entry)
     if grasp_approach_plan_registration is not None:
         route_items.append(
             SkillRouteManifestEntry(
@@ -2468,6 +2505,8 @@ def build_real_agent_primitive_contract_bundle(
               if tool_object_relation_registration is not None else ()),
             *((tool_hover_registration.payload_validator,)
               if tool_hover_registration is not None else ()),
+            *((support_release_registration.payload_validator,)
+              if support_release_registration is not None else ()),
             *(
                 ()
                 if placement_registration is None
@@ -2532,6 +2571,7 @@ def build_real_agent_primitive_contract_bundle(
         surface_anchor_capture_registration=surface_anchor_capture_registration,
         tool_object_relation_registration=tool_object_relation_registration,
         tool_hover_registration=tool_hover_registration,
+        support_release_registration=support_release_registration,
         placement_registration=placement_registration,
         station_point_grasp_registration=station_point_grasp_registration,
         station_point_grasp_render_registration=(

@@ -240,6 +240,25 @@ class RealHeldObjectPort:
         old_low, old_high, _ = self._retained[side]
         return np.minimum(low, old_low), np.maximum(high, old_high), True
 
+    def retained_grip_box(self, side: str, observation: RealHeldObjectObservation):
+        """Read-only ``fused_box`` of the retained grip, or None (nothing stored or discarded).
+
+        None unless ``observation`` is verified and of the grip whose box an
+        object motion retained (its first lift completed the box down to the
+        support the object stood on). For read-only consumers such as the
+        support release query.
+        """
+        retained = self._retained.get(side)
+        if retained is None or not observation.holding_verified:
+            return None
+        (closure, attempt), (old_closure, old_attempt) = self._grip(observation), retained[2]
+        if (attempt != old_attempt or (closure is None) != (old_closure is None)
+                or (closure is not None and abs(closure - old_closure) > REAL_OBJECT_MOTION_SAME_GRIP_CLOSE)):
+            return None
+        centre = np.asarray(observation.measurement.tool_from_box)[:3, 3]
+        half = np.asarray(observation.measurement.size_xyz_m) / 2.0
+        return np.minimum(centre - half, retained[0]), np.maximum(centre + half, retained[1])
+
     def remember(self, side: str, low, high, observation: RealHeldObjectObservation | None) -> None:
         if observation is None or not observation.holding_verified:
             self._retained.pop(side, None)

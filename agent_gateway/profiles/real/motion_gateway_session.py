@@ -763,6 +763,7 @@ class RealAgentPrimitiveGatewaySession:
     surface_anchor_executor: PassiveReadSkillExecutor | None = None
     tool_object_relation_executor: PassiveReadSkillExecutor | None = None
     tool_hover_executor: PassiveReadSkillExecutor | None = None
+    support_release_executor: PassiveReadSkillExecutor | None = None
     _close_lock: threading.Lock = field(default_factory=threading.Lock, init=False)
     _close_outcome: AgentGatewayOperationOutcome | None = field(
         default=None,
@@ -784,6 +785,9 @@ class RealAgentPrimitiveGatewaySession:
             raise ValueError("Tool-object relation registration and executor must coexist.")
         if (self.contract_bundle.tool_hover_registration is not None) != (self.tool_hover_executor is not None):
             raise ValueError("Tool hover registration and executor must coexist.")
+        if (self.contract_bundle.support_release_registration is not None) != (
+                self.support_release_executor is not None):
+            raise ValueError("Support release registration and executor must coexist.")
         advertised = (
             "own_domain_emergency_stop_v1"
             in self.contract_bundle.route_manifest.supported_transport_features
@@ -906,6 +910,7 @@ class RealAgentPrimitiveGatewaySession:
             "perception.capture_surface_anchor": self.surface_anchor_executor,
             "perception.describe_tool_object_relations": self.tool_object_relation_executor,
             "perception.query_tool_hover_paths": self.tool_hover_executor,
+            "perception.query_support_release_pose": self.support_release_executor,
             "perception.plan_placement": self.placement_executor,
             "perception.plan_point_grasp": self.station_point_grasp_executor,
             "perception.render_point_grasp_candidate": (
@@ -1042,7 +1047,8 @@ class RealAgentPrimitiveGatewaySession:
                       for executor, registration in (
                           (self.tool_object_relation_executor,
                            self.contract_bundle.tool_object_relation_registration),
-                          (self.tool_hover_executor, self.contract_bundle.tool_hover_registration))
+                          (self.tool_hover_executor, self.contract_bundle.tool_hover_registration),
+                          (self.support_release_executor, self.contract_bundle.support_release_registration))
                       if registration is not None),
                     *((executor, 5.0) for executor in self.rgbd_geometry_executors),
                 )
@@ -1764,6 +1770,7 @@ def assemble_real_agent_primitive_gateway_session(
     surface_anchor_executor = None
     tool_object_relation_executor = None
     tool_hover_executor = None
+    support_release_executor = None
     placement_provider = None
     placement_executor = None
     station_point_grasp_provider = None
@@ -1968,6 +1975,34 @@ def assemble_real_agent_primitive_gateway_session(
                                         back_projection_registration.profile.maximum_depth_m)),
                 public_from_geometry=tool_entity_options.public_from_geometry,
                 current_station_revision=lambda: producer.current_station_revision, clock=clock)
+        support_release_registration = contract_bundle.support_release_registration
+        if support_release_registration is not None:
+            support_release = (None if tool_entity_options is None
+                               else tool_entity_options.support_release)
+            if held_object_port is None or support_release is None:
+                raise ValueError("Real support release queries need held-object motion and their planner.")
+            from .support_release_query import (
+                RealSupportReleaseQuery,
+                build_real_support_release_executor,
+            )
+
+            object_motion_profile = contract_bundle.object_motion_profile
+            support_release_executor = build_real_support_release_executor(
+                registration=support_release_registration,
+                query_port=RealSupportReleaseQuery(
+                    registration=support_release_registration, scene_port=tool_scene_port,
+                    segmentation_provider=segmentation_provider, held_port=held_object_port,
+                    planner=support_release["planner"], object_id=object_motion_profile.object_id,
+                    public_from_geometry=tool_entity_options.public_from_geometry,
+                    object_workspace_bounds=object_motion_profile.object_workspace_bounds,
+                    arm_base_xy_m=support_release["arm_base_xy_m"],
+                    maximum_depth_m=min(RELATION_MAXIMUM_DEPTH_M,
+                                        back_projection_registration.profile.maximum_depth_m),
+                    clock=clock),
+                current_station_revision=lambda: producer.current_station_revision,
+                clock=clock, max_retained_operations=max_retained_operations)
+            execution_port_by_route_hash[support_release_registration.entry.route.semantic_content_hash] = (
+                support_release_executor)
         if hover_registration is not None:
             if anchor_registration is None or tool_entity_options.hover_planner is None:
                 raise ValueError("Real tool hover queries require surface anchor v2 and their planner.")
@@ -2321,6 +2356,7 @@ def assemble_real_agent_primitive_gateway_session(
         surface_anchor_executor=surface_anchor_executor,
         tool_object_relation_executor=tool_object_relation_executor,
         tool_hover_executor=tool_hover_executor,
+        support_release_executor=support_release_executor,
         placement_provider=placement_provider,
         placement_executor=placement_executor,
         station_point_grasp_provider=station_point_grasp_provider,

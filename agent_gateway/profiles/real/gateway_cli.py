@@ -265,6 +265,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--tool-hover-region-budget-sec", type=float, default=None,
         help=("Total hover search budget per request (default 20; at most 240). The Route allows "
               "this plus 20 s for capture and the obstacle cloud; requires --enable-tool-hover-queries."))
+    parser.add_argument("--support-release-prompt", action="append", default=None, metavar="SUPPORT_ID=PROMPT",
+        help=("Publish read-only perception.query_support_release_pose@2 for the held object with this named "
+              "support and its SAM3 text prompt (repeatable, e.g. green_box='green box'); release and pre-place "
+              "poses checked by the observed safe-move planner, never dispatched; requires the "
+              "move_grasped_object_to_pose action and an RM65-6F --collision-scene-profile; default off."))
     parser.add_argument("--camera-single-start", action="store_true",
         help="Use the existing single-start camera policy: no retries, restart or reset; default off.")
     parser.add_argument("--enable-point-grasp-finger-exchange", action="store_true",
@@ -1187,6 +1192,23 @@ def main(argv: list[str] | None = None) -> int:
     ):
         parser.error("move_grasped_object_to_pose requires --enable-tool-object-relations, "
                      "--safe-motion-observation-roles and the move_tcp_to_pose_safe action")
+    support_release_prompt_by_id = None
+    if args.support_release_prompt is not None:
+        support_release_prompt_by_id = {}
+        for item in args.support_release_prompt:
+            support_id, separator, prompt = str(item).partition("=")
+            support_id, prompt = support_id.strip(), prompt.strip()
+            if (not separator or not support_id or not prompt or support_id in support_release_prompt_by_id
+                    or not all(char.isalnum() or char in "_-." for char in support_id)):
+                parser.error("--support-release-prompt takes distinct SUPPORT_ID=PROMPT pairs "
+                             "(SUPPORT_ID letters, digits, '_', '-' or '.')")
+            support_release_prompt_by_id[support_id] = prompt
+        if "move_grasped_object_to_pose" not in actions:
+            parser.error("--support-release-prompt requires the move_grasped_object_to_pose action")
+        if args.collision_scene_profile not in RM65_6F_SCENE_PROFILES:
+            # The query plans the place of the measured box: the standard model
+            # puts the real gripper 17.2 mm lower than planned.
+            parser.error("--support-release-prompt requires an RM65-6F --collision-scene-profile")
     if not args.enable_tool_hover_queries and (args.tool_hover_candidate_budget_sec is not None
                                                or args.tool_hover_region_budget_sec is not None):
         parser.error("--tool-hover-*-budget-sec requires --enable-tool-hover-queries")
@@ -1583,6 +1605,7 @@ def main(argv: list[str] | None = None) -> int:
         enable_tool_hover_queries=args.enable_tool_hover_queries,
         tool_hover_region_budget_sec=args.tool_hover_region_budget_sec,
         tool_hover_candidate_budget_sec=args.tool_hover_candidate_budget_sec,
+        support_release_prompt_by_id=support_release_prompt_by_id,
         enable_point_grasp_finger_exchange=args.enable_point_grasp_finger_exchange,
         debug_render_object_coordinates=args.debug_render_object_coordinates,
         enable_point_grasp_arm_reachability=(args.enable_point_grasp_arm_reachability),
