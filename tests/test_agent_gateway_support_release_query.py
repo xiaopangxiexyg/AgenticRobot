@@ -58,6 +58,9 @@ def test_release_query_contract_hides_nothing_the_agent_must_type():
     assert dict(parameters["properties"]["reference_frame_id"]) == {"const": FRAME}
     assert list(parameters["properties"]["support_object_id"]["enum"]) == ["green_box", "red_box"]
     assert "phase=carry" in definition.summary and "release_support_object_id" in definition.summary
+    # RPent's Gateway adapter refuses a Skill summary over 2000 characters, which
+    # fails the whole discovery (rpent_agent_gateway.contracts).
+    assert len(definition.summary) <= 2_000
     supports = ("green_box", "red_box")
     skill.validate_parameters({"support_object_id": "red_box", "reference_frame_id": FRAME},
                               support_object_ids=supports, reference_frame_id=FRAME)
