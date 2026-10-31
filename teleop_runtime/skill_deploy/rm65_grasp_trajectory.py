@@ -60,7 +60,7 @@ from robot_motion.rm65.obstacle_collision import (
     RM65ObstacleCollisionOracle,
     build_rm65_profile_obstacle_collision_oracle,
 )
-from robot_motion.rm65.scene_profiles import fixed_scene_aabb_obstacles
+from robot_motion.rm65.scene_profiles import DMTAC_SCENE_PROFILES, fixed_scene_aabb_obstacles
 from robot_motion.scene_obstacles import ObstacleSceneSnapshot
 from teleop_runtime.target_safety.tcp_pose_envelope_runtime import (
     TCPPoseEnvelopeTargetFilter,
@@ -74,8 +74,6 @@ from .rm65_profile import ResolvedExclusiveRM65SkillDeploymentProfile
 
 _SIDES = ("left", "right")
 _PATH_COLLISION_SCENE_PROFILE = DEFAULT_GRASP_PATH_COLLISION_SCENE
-_DMTAC_PATH_COLLISION_SCENE_PROFILE = "dual_arm_hand_proxy_dmtac_strict"
-_DMTAC_GRASP_PATH_COLLISION_SCENE_PROFILE = "dual_arm_hand_proxy_dmtac_grasp"
 RM65_GRASP_PATH_PLANNING_TIME_BUDGET_SEC = 120.0
 # The capture-time CAD/depth filter is accurate to a bounded image/depth
 # neighbourhood, but DMTAC points at the pad-height silhouette can still land
@@ -995,10 +993,7 @@ class RM65GraspJointTrajectoryPlanner:
         )
         self.path_collision_scene_profile = (
             profile.collision_scene_profile
-            if profile.collision_scene_profile in {
-                _DMTAC_PATH_COLLISION_SCENE_PROFILE,
-                _DMTAC_GRASP_PATH_COLLISION_SCENE_PROFILE,
-            }
+            if profile.collision_scene_profile in DMTAC_SCENE_PROFILES
             else _PATH_COLLISION_SCENE_PROFILE
         )
         path_profile = build_dual_arm_scene_profile(
