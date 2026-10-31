@@ -17,6 +17,8 @@ from robot_motion.grasp_visible_scene import (
     VisibleGraspScene,
 )
 
+from .sam2_grounding_dino import Sam2PointMaskUnavailable
+
 
 @dataclass(frozen=True)
 class GraspRgbdView:
@@ -154,7 +156,12 @@ def _associate_target(
         return None, "insufficient_shared_target_surface", len(pixels), {}
     center = np.median(pixels, axis=0)
     seed = pixels[np.argmin(np.sum((pixels-center)**2, axis=1))]
-    mask = np.asarray(segment_point(Image.fromarray(view.rgb), pixel_uv=tuple(int(x) for x in seed)), dtype=bool)
+    try:
+        mask = np.asarray(segment_point(Image.fromarray(view.rgb), pixel_uv=tuple(int(x) for x in seed)), dtype=bool)
+    except Sam2PointMaskUnavailable:
+        # The segmenter ran, but its best mask does not cover the shared seed:
+        # an association miss for this view, not a fault of the fusion.
+        return None, "target_point_mask_unavailable", len(pixels), {}
     if mask.shape != view.depth_m.shape or not mask[seed[1], seed[0]]:
         raise RuntimeError("Auxiliary target segmenter returned an invalid mask")
     agreement = np.mean(mask[pixels[:, 1], pixels[:, 0]])
@@ -209,7 +216,8 @@ def fuse_grasp_views(
     """Fuse only associated views; returned points remain in one reference frame.
 
     Auxiliary failures never erase anchor evidence. Invalid poses and segmenter
-    failures are errors; normal occlusion/depth failures are reported exclusions.
+    failures are errors; normal occlusion/depth failures and a point mask that
+    misses the shared seed are reported exclusions.
     A view with no confirmed target is not silently labelled all-background.
     """
     views = (anchor, *auxiliary)

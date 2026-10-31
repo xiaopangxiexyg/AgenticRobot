@@ -643,6 +643,17 @@ def _validate_overlay_jpeg(data: bytes, *, width: int, height: int) -> None:
         raise RuntimeError("Segmentation overlay Artifact is invalid JPEG.") from error
 
 
+def _is_point_mask_miss(error: BaseException) -> bool:
+    """Whether a localizer error is SAM2/SAM3's recoverable point-prompt miss.
+
+    Imported on demand: the shared localizer contract lives with the optional
+    perception models, which importing this module must not load.
+    """
+    from deployments.perception.sam2_grounding_dino import Sam2PointMaskUnavailable
+
+    return isinstance(error, Sam2PointMaskUnavailable)
+
+
 class LiveSegmentationProvider:
     """Capture one target-specific RGB frame and run the shared localizer."""
 
@@ -715,7 +726,11 @@ class LiveSegmentationProvider:
     def try_segment_capture(
         self, *, capture: LiveRgbSegmentationCapture, parameters: Mapping[str, Any],
     ) -> PreparedSegmentation | None:
-        """Run the same validation/encoder while explicitly retaining a no-mask outcome."""
+        """Run the same validation/encoder while explicitly retaining a no-mask outcome.
+
+        No mask (``None``) means no mask above ``min_score`` or, for a point
+        prompt, a best mask that does not cover the prompted pixel.
+        """
 
         if not isinstance(capture, LiveRgbSegmentationCapture):
             raise TypeError("capture must be a LiveRgbSegmentationCapture.")
@@ -732,12 +747,20 @@ class LiveSegmentationProvider:
             )
         pixel_raw = parameters["target_pixel_uv"]
         pixel_uv = None if pixel_raw is None else (int(pixel_raw[0]), int(pixel_raw[1]))
-        segment = self.localizer.segment(
-            capture.image,
-            language_prompt=parameters["language_prompt"],
-            pixel_uv=pixel_uv,
-            min_score=float(parameters["min_score"]),
-        )
+        try:
+            segment = self.localizer.segment(
+                capture.image,
+                language_prompt=parameters["language_prompt"],
+                pixel_uv=pixel_uv,
+                min_score=float(parameters["min_score"]),
+            )
+        except RuntimeError as error:
+            # The localizer ran, but its best mask does not cover the prompted
+            # pixel: for this view that is no mask, like a low score. Malformed
+            # outputs and transport faults are other RuntimeErrors and still raise.
+            if pixel_uv is None or not _is_point_mask_miss(error):
+                raise
+            return None
         if segment is None:
             return None
         encoded = self.localizer.encode_segment_artifacts(capture.image, segment)

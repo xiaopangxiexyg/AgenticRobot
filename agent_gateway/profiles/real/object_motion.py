@@ -2,13 +2,14 @@
 
 ``motion.move_grasped_object_to_pose@1`` on the RealMan station. The bound
 object is "whatever this arm holds": every request first measures it from
-fresh stationary RGB-D views (point prompts inside the gripper's closing
-region, ``RealHeldObjectObserver``) and the DMTAC closure, and refuses unless
+fresh stationary RGB-D views (the holding arm's wrist camera decides,
+``RealHeldObjectObserver``) and the DMTAC closure, and refuses unless
 it is between the fingers with the gripper closed on it. The measured box,
 fixed in the tool frame, converts the object-body goal into the TCP goal and
 is carried by the observed safe-move planner along the whole path. ``place``
-also measures the support plane under the target footprint and lets only that
-support top approach the box. After arrival the object is measured again;
+also measures the support plane under the target footprint with the holding
+arm's wrist camera (``measure_support_under``) and lets only that support
+top approach the box. After arrival the object is measured again;
 the operation reports that measured state, or stops with a reason when the
 object is no longer held. It never opens or closes a gripper.
 
@@ -43,7 +44,11 @@ from teleop_runtime.skill_deploy.rm65_grasp_trajectory import (
     RM65CarriedObjectSupport,
 )
 
-from .held_object import RealHeldObjectObservation, RealHeldObjectObserver
+from .held_object import (
+    REAL_HELD_OBJECT_PRIMARY_ROLE_BY_SIDE,
+    RealHeldObjectObservation,
+    RealHeldObjectObserver,
+)
 from .motion_primitive_profiles import (
     REAL_AGENT_OBJECT_MOTION_EXECUTOR_ID_V1,
     REAL_AGENT_OBJECT_MOTION_ROUTE_ID_V1,
@@ -53,9 +58,9 @@ from .motion_primitive_skill import RealAgentPrimitiveSkillLifecycle
 
 _LOGGER = logging.getLogger(__name__)
 
-# The observed multi-view table surface is a band about 2.5 cm thick (voxels,
-# multi-camera disagreement); support voxels up to 15 mm above the fitted
-# plane under the target footprint are the support itself.
+# The fused multi-view table surface is a band (voxels, multi-camera
+# disagreement); support voxels up to 15 mm above the plane measured under the
+# target footprint are the support itself.
 REAL_OBJECT_MOTION_SUPPORT_HEIGHT_TOLERANCE_M = 0.015
 REAL_OBJECT_MOTION_SUPPORT_MARGIN_M = 0.04
 REAL_OBJECT_MOTION_SUPPORT_MIN_POINTS = 150
@@ -73,11 +78,35 @@ REAL_OBJECT_MOTION_CROOKED_OFFSET_M = 0.015
 REAL_OBJECT_MOTION_CROOKED_TILT_DEG = 20.0
 
 
+def _support_window_points(capture, low, high, below_z_m: float) -> np.ndarray:
+    """World points of one view's valid depth (every second pixel) inside an XY window below a height."""
+    depth = np.asarray(capture.depth_m, dtype=float)
+    rows, cols = np.mgrid[0:depth.shape[0]:2, 0:depth.shape[1]:2]
+    z = depth[rows, cols]
+    valid = np.isfinite(z) & (z > 0) & (z <= 1.5)
+    rows, cols, z = rows[valid], cols[valid], z[valid]
+    intrinsics = capture.intrinsics
+    camera = np.column_stack(((cols - float(intrinsics["cx"])) * z / float(intrinsics["fx"]),
+                              (rows - float(intrinsics["cy"])) * z / float(intrinsics["fy"]), z))
+    pose = np.asarray(capture.source_from_camera, dtype=float).reshape(4, 4)
+    world = camera @ pose[:3, :3].T + pose[:3, 3]
+    keep = np.all((world[:, :2] >= low) & (world[:, :2] <= high), axis=1) & (world[:, 2] < below_z_m)
+    return world[keep]
+
+
+def _outside_box(points: np.ndarray, exclude_box) -> np.ndarray:
+    if exclude_box is None or not len(points):
+        return points
+    world_from_box, size = exclude_box
+    local = (points - world_from_box[:3, 3]) @ world_from_box[:3, :3]
+    return points[~np.all(np.abs(local) <= np.asarray(size) / 2.0 + 0.01, axis=1)]
+
+
 def fit_support_plane_under(*, captures, footprint_min_xy, footprint_max_xy, below_z_m: float,
                             exclude_box=None, margin_m: float = REAL_OBJECT_MOTION_SUPPORT_MARGIN_M):
     """Plane of the measured surface around a target footprint, below ``below_z_m``.
 
-    Uses every view's valid depth inside the footprint widened by ``margin_m``
+    Uses the given views' valid depth inside the footprint widened by ``margin_m``
     (the held object usually hides the footprint itself), drops points inside
     ``exclude_box`` (the held object's own box, ``(world_from_box, size)``) and
     fits z = a x + b y + c with one 2.5-sigma trim. Returns ``None`` when the
@@ -85,25 +114,8 @@ def fit_support_plane_under(*, captures, footprint_min_xy, footprint_max_xy, bel
     """
     low = np.asarray(footprint_min_xy, dtype=float) - margin_m
     high = np.asarray(footprint_max_xy, dtype=float) + margin_m
-    selected = []
-    for capture in captures:
-        depth = np.asarray(capture.depth_m, dtype=float)
-        rows, cols = np.mgrid[0:depth.shape[0]:2, 0:depth.shape[1]:2]
-        z = depth[rows, cols]
-        valid = np.isfinite(z) & (z > 0) & (z <= 1.5)
-        rows, cols, z = rows[valid], cols[valid], z[valid]
-        intrinsics = capture.intrinsics
-        camera = np.column_stack(((cols - float(intrinsics["cx"])) * z / float(intrinsics["fx"]),
-                                  (rows - float(intrinsics["cy"])) * z / float(intrinsics["fy"]), z))
-        pose = np.asarray(capture.source_from_camera, dtype=float).reshape(4, 4)
-        world = camera @ pose[:3, :3].T + pose[:3, 3]
-        keep = np.all((world[:, :2] >= low) & (world[:, :2] <= high), axis=1) & (world[:, 2] < below_z_m)
-        selected.append(world[keep])
-    points = np.concatenate(selected) if selected else np.zeros((0, 3))
-    if exclude_box is not None and len(points):
-        world_from_box, size = exclude_box
-        local = (points - world_from_box[:3, 3]) @ world_from_box[:3, :3]
-        points = points[~np.all(np.abs(local) <= np.asarray(size) / 2.0 + 0.01, axis=1)]
+    selected = [_support_window_points(capture, low, high, below_z_m) for capture in captures]
+    points = _outside_box(np.concatenate(selected) if selected else np.zeros((0, 3)), exclude_box)
     if len(points) < REAL_OBJECT_MOTION_SUPPORT_MIN_POINTS:
         return None, {"support_point_count": len(points)}
     design = np.column_stack((points[:, 0], points[:, 1], np.ones(len(points))))
@@ -124,6 +136,48 @@ def fit_support_plane_under(*, captures, footprint_min_xy, footprint_max_xy, bel
             or stats["plane_tilt_deg"] > 10.0):
         return None, stats
     return (anchor, normal, low, high), stats
+
+
+def measure_support_under(*, captures, side: str, footprint_min_xy, footprint_max_xy, below_z_m: float,
+                          exclude_box=None, margin_m: float = REAL_OBJECT_MOTION_SUPPORT_MARGIN_M):
+    """Support plane around a footprint measured by the holding arm's own wrist camera.
+
+    The wrist camera is rigid with the gripper. On the saved real samples the
+    views together never fitted one plane (p95 residual 1.45-3.15 cm against
+    the 0.8 cm bound) because the station cameras disagreed on the table
+    height by 1.5-3 cm, while the holding arm's wrist camera alone fitted 8
+    of the 9 windows it saw. Only that view is fitted
+    (``fit_support_plane_under``). Every other view's points in the same
+    window are reported as consistency evidence (their heights above the
+    fitted plane); they do not change the plane or the decision.
+    """
+    role = REAL_HELD_OBJECT_PRIMARY_ROLE_BY_SIDE[side]
+    own = [capture for capture in captures if capture.role == role]
+    fitted, stats = fit_support_plane_under(
+        captures=own, footprint_min_xy=footprint_min_xy, footprint_max_xy=footprint_max_xy,
+        below_z_m=below_z_m, exclude_box=exclude_box, margin_m=margin_m)
+    stats = {"measuring_role": role, **stats}
+    if not own:
+        stats["reason"] = "wrist_camera_view_missing"
+    low = np.asarray(footprint_min_xy, dtype=float) - margin_m
+    high = np.asarray(footprint_max_xy, dtype=float) + margin_m
+    others = {}
+    for capture in captures:
+        if capture.role == role:
+            continue
+        points = _outside_box(_support_window_points(capture, low, high, below_z_m), exclude_box)
+        row = {"point_count": len(points)}
+        if len(points) and fitted is not None:
+            anchor, normal = fitted[0], fitted[1]
+            heights = (points - anchor) @ normal
+            row.update(median_height_above_plane_m=float(np.median(heights)),
+                       p10_height_above_plane_m=float(np.percentile(heights, 10)),
+                       p90_height_above_plane_m=float(np.percentile(heights, 90)))
+        elif len(points):
+            row["median_z_m"] = float(np.median(points[:, 2]))
+        others[capture.role] = row
+    stats["other_views"] = others
+    return fitted, stats
 
 
 class RealHeldObjectPort:
@@ -324,15 +378,18 @@ class RealObjectMotionLifecycle(RealAgentPrimitiveSkillLifecycle):
             current_box_world = observation.world_from_tcp @ tool_from_object
             current_corners = _box_world_corners(current_box_world, size)
             # The support lies under the object now; the goal may ask to go below it.
-            fitted, stats = fit_support_plane_under(
-                captures=self._held.last_captures, footprint_min_xy=corners[:, :2].min(axis=0),
+            fitted, stats = measure_support_under(
+                captures=self._held.last_captures, side=self.side, footprint_min_xy=corners[:, :2].min(axis=0),
                 footprint_max_xy=corners[:, :2].max(axis=0),
                 below_z_m=float(current_corners[:, 2].min()) + 0.01, exclude_box=(current_box_world, size))
             self._report["support_measurement"] = stats
             if fitted is None:
-                raise _ObjectMotionUnavailable("object_motion_support_not_measured",
-                                               "No planar support surface was measured under the place footprint.",
-                                               {"support_measurement": stats})
+                raise _ObjectMotionUnavailable(
+                    "object_motion_support_not_measured",
+                    "This arm's wrist camera measured no planar support around the place footprint; move the "
+                    "object so that camera sees the support around the place target (for example carry it "
+                    "above the target first), then place.",
+                    {"support_measurement": stats})
             anchor, normal, low, high = fitted
             self._support = RM65CarriedObjectSupport(
                 support_id="measured_support_under_target", plane_anchor_xyz_m=tuple(anchor),
@@ -380,15 +437,16 @@ class RealObjectMotionLifecycle(RealAgentPrimitiveSkillLifecycle):
         """Extend a just-grasped object's box down to the support it still rests on.
 
         Cameras rarely see the lower part of an object standing on a support.
-        When a planar support is measured within ``REAL_OBJECT_MOTION_RESTING_GAP_M``
-        below the measured box, the same captures are fused again with that
-        plane so the box reaches it. Otherwise the measurement is unchanged.
+        When the holding arm's wrist camera measures a planar support within
+        ``REAL_OBJECT_MOTION_RESTING_GAP_M`` below the measured box, the same
+        captures are fused again with that plane so the box reaches it.
+        Otherwise the measurement is unchanged.
         """
         size = np.asarray(observation.measurement.size_xyz_m)
         box_world = observation.world_from_tcp @ np.asarray(observation.measurement.tool_from_box)
         corners = _box_world_corners(box_world, size)
-        fitted, stats = fit_support_plane_under(
-            captures=self._held.last_captures, footprint_min_xy=corners[:, :2].min(axis=0),
+        fitted, stats = measure_support_under(
+            captures=self._held.last_captures, side=self.side, footprint_min_xy=corners[:, :2].min(axis=0),
             footprint_max_xy=corners[:, :2].max(axis=0), below_z_m=float(corners[:, 2].min()) + 0.01,
             exclude_box=(box_world, size))
         if fitted is None:
@@ -488,4 +546,4 @@ class RealObjectMotionLifecycle(RealAgentPrimitiveSkillLifecycle):
 
 __all__ = ["REAL_AGENT_OBJECT_MOTION_EXECUTOR_ID_V1", "REAL_AGENT_OBJECT_MOTION_ROUTE_ID_V1",
            "RealAgentObjectMotionProfile", "RealHeldObjectPort", "RealObjectMotionLifecycle",
-           "fit_support_plane_under"]
+           "fit_support_plane_under", "measure_support_under"]
