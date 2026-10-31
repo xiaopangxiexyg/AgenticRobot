@@ -541,6 +541,57 @@ def test_release_candidates_opt_in_to_the_feasible_position_nearest_the_held_obj
         plan_release_approach_candidates(beside, surface, include_nearest_to_held=1, **options)
 
 
+def test_release_candidates_opt_in_to_a_bounded_lean_toward_the_arm():
+    """A reaching arm can hold the object leaned toward its base where it cannot hold it level.
+
+    The lean turns the held orientation about the support-horizontal axis across the
+    direction to the base, top toward the base; footprint and lowest-corner clearance
+    are those of the tilted box.
+    """
+    surface = support(region_min_xy_m=(-.41, -.02), region_max_xy_m=(-.33, .06))
+    options = dict(now=10.02, clearance_m=.006,
+        minimum_planning_clearance_m=.004, maximum_clearance_m=.05,
+        lateral_margin_m=.005)
+    held = observation(box_size_m=(.035, .035, .035),
+        reference_from_object=pose((-.285, -.03, .0766), (1., -1., 20.)))
+    base, lean = (0., -.26), math.radians(6.)
+    level = plan_release_approach_candidates(held, surface, include_nearest_to_held=True, **options)
+    leaned = plan_release_approach_candidates(held, surface, include_nearest_to_held=True,
+                                              lean_rad=lean, lean_toward_xy_m=base, **options)
+    assert len(leaned) == len(level) == 6
+    assert all(item.lean_rad == 0. for item in level)
+    center = (np.asarray(surface.region_min_xy_m) + surface.region_max_xy_m) / 2.
+    toward = np.r_[(np.asarray(base) - center) / np.linalg.norm(np.asarray(base) - center), 0.]
+    half, margin = .0175, .005
+    corners = np.asarray([(x, y, z) for x in (-half, half) for y in (-half, half) for z in (-half, half)])
+    for flat, item in zip(level, leaned, strict=True):
+        assert item.lean_rad == lean and item.yaw_offset_rad == flat.yaw_offset_rad
+        turn = Rotation.from_matrix(item.proposal.object_goal[:3, :3] @ flat.proposal.object_goal[:3, :3].T)
+        axis = turn.as_rotvec() / turn.magnitude()
+        assert turn.magnitude() == pytest.approx(lean, abs=1e-9)
+        assert abs(axis[2]) < 1e-9 and abs(float(axis @ toward)) < 1e-9
+        up = turn.apply([0., 0., 1.])
+        assert float(up @ toward) == pytest.approx(math.sin(lean), abs=1e-9)
+        world = corners @ item.proposal.object_goal[:3, :3].T + item.proposal.object_goal[:3, 3]
+        assert world[:, 2].min() - surface.top_z_m == pytest.approx(.006, abs=1e-12)
+        assert np.all(world[:, :2].min(axis=0) >= np.asarray(surface.region_min_xy_m) + margin - 1e-12)
+        assert np.all(world[:, :2].max(axis=0) <= np.asarray(surface.region_max_xy_m) - margin + 1e-12)
+        np.testing.assert_allclose(item.proposal.tool_goal @ held.tool_from_object,
+                                   item.proposal.object_goal, atol=1e-12)
+    for invalid in (-.01, math.radians(10.5), float("nan"), True):
+        with pytest.raises(ValueError, match="Release lean"):
+            plan_release_approach_candidates(held, surface, lean_rad=invalid, lean_toward_xy_m=base, **options)
+    with pytest.raises(ValueError, match="lean toward"):
+        plan_release_approach_candidates(held, surface, lean_rad=lean, **options)
+    with pytest.raises(ValueError, match="undefined"):
+        plan_release_approach_candidates(held, surface, lean_rad=lean, lean_toward_xy_m=tuple(center), **options)
+    # Without a lean the point is unused and nothing changes.
+    same = plan_release_approach_candidates(held, surface, include_nearest_to_held=True,
+                                            lean_toward_xy_m=base, **options)
+    for flat, item in zip(level, same, strict=True):
+        np.testing.assert_array_equal(item.proposal.object_goal, flat.proposal.object_goal)
+
+
 def test_release_candidates_accept_explicit_bounded_yaw_samples_without_changing_default():
     held = observation(box_size_m=(.035, .035, .035),
         reference_from_object=pose((-.285, -.02, .0566)))

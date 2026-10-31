@@ -560,6 +560,40 @@ class ReleaseApproachCandidate:
     box_center_xy_m: tuple[float, float]
     yaw_offset_rad: float
     proposal: ReleaseApproachProposal
+    lean_rad: float = 0.
+
+
+# A held object may lean this far toward the arm at release; it settles flat on the support.
+MAXIMUM_RELEASE_LEAN_RAD = math.radians(10.)
+
+
+def _lean_rotation(support: SupportSurfaceObservation, *, lean_rad: float,
+                   lean_toward_xy_m) -> np.ndarray:
+    """Tilt about the support-horizontal axis across the direction to ``lean_toward_xy_m``.
+
+    The object's support-normal side turns toward that point (for an arm, its base):
+    a reaching arm can hold the object leaned where it cannot hold it level.
+    """
+    if (not isinstance(lean_toward_xy_m, (tuple, list, np.ndarray)) or len(lean_toward_xy_m) != 2
+            or any(isinstance(value, (bool, np.bool_)) for value in lean_toward_xy_m)):
+        raise ValueError("A release lean needs a finite reference XY to lean toward")
+    toward = np.asarray(lean_toward_xy_m, dtype=float)
+    if toward.shape != (2,) or not np.isfinite(toward).all():
+        raise ValueError("A release lean needs a finite reference XY to lean toward")
+    normal = np.asarray(support.normal_reference_xyz, dtype=float)
+    center = (np.asarray(support.region_min_xy_m) + support.region_max_xy_m) / 2.
+    away = np.r_[center - toward, 0.]
+    away -= float(away @ normal) * normal
+    length = float(np.linalg.norm(away))
+    if length < 1e-3:
+        raise ValueError("The lean direction is undefined above the point to lean toward")
+    axis = np.cross(normal, away / length)
+    axis /= np.linalg.norm(axis)
+    # Rodrigues: a positive turn about normal x away tilts the normal side away;
+    # the negative turn tilts it toward the point.
+    angle = -float(lean_rad)
+    skew = np.array([[0., -axis[2], axis[1]], [axis[2], 0., -axis[0]], [-axis[1], axis[0], 0.]])
+    return np.eye(3) + math.sin(angle) * skew + (1. - math.cos(angle)) * (skew @ skew)
 
 
 def plan_release_approach_candidates(
@@ -576,6 +610,8 @@ def plan_release_approach_candidates(
     allow_quarter_turns: bool = False,
     yaw_offsets_rad: tuple[float, ...] | None = None,
     include_nearest_to_held: bool = False,
+    lean_rad: float = 0.,
+    lean_toward_xy_m: tuple[float, float] | None = None,
 ) -> tuple[ReleaseApproachCandidate, ...]:
     """Bounded on-support proposals for the existing payload-safe planner.
 
@@ -585,7 +621,10 @@ def plan_release_approach_candidates(
     held box's current center, after the center: once the held object is
     carried over or beside the support, that release needs the least motion.
     Quarter turns or an explicit bounded yaw sample are opt-in because a task
-    may require the observed orientation. No candidate is an authority to move,
+    may require the observed orientation. Also opt-in, ``lean_rad`` (at most
+    ``MAXIMUM_RELEASE_LEAN_RAD``) tilts every orientation toward
+    ``lean_toward_xy_m``; the footprint and the lowest-corner clearance are
+    computed for the tilted box. No candidate is an authority to move,
     and the selected support must be
     observed again when execution starts.
     """
@@ -593,6 +632,9 @@ def plan_release_approach_candidates(
         raise TypeError("Quarter-turn sampling must be explicitly boolean")
     if type(include_nearest_to_held) is not bool:
         raise TypeError("Nearest-position sampling must be explicitly boolean")
+    if (isinstance(lean_rad, (bool, np.bool_)) or not isinstance(lean_rad, (int, float))
+            or not math.isfinite(lean_rad) or not 0. <= lean_rad <= MAXIMUM_RELEASE_LEAN_RAD):
+        raise ValueError("Release lean must be finite radians in [0, MAXIMUM_RELEASE_LEAN_RAD]")
     if yaw_offsets_rad is not None:
         if allow_quarter_turns or not isinstance(yaw_offsets_rad, (tuple, list)) or not 1 <= len(yaw_offsets_rad) <= 8:
             raise ValueError("Explicit yaw samples replace quarter-turn sampling and require 1..8 angles")
@@ -612,6 +654,8 @@ def plan_release_approach_candidates(
     )
     center = (np.asarray(support.region_min_xy_m)
               + support.region_max_xy_m) / 2.
+    lean = (np.eye(3) if lean_rad == 0. else
+            _lean_rotation(support, lean_rad=float(lean_rad), lean_toward_xy_m=lean_toward_xy_m))
     candidates = []
     if yaw_offsets_rad is not None:
         angles = tuple(float(angle) for angle in yaw_offsets_rad)
@@ -627,7 +671,7 @@ def plan_release_approach_candidates(
             [math.sin(angle), math.cos(angle), 0.],
             [0., 0., 1.],
         ])
-        rotation = z_rotation @ held.reference_from_object[:3, :3]
+        rotation = lean @ z_rotation @ held.reference_from_object[:3, :3]
         _, low, high, center_offset = _oriented_box_offsets(held, rotation)
         feasible_min = np.asarray(support.region_min_xy_m) + lateral_margin_m - low[:2] + center_offset[:2]
         feasible_max = np.asarray(support.region_max_xy_m) - lateral_margin_m - high[:2] + center_offset[:2]
@@ -658,7 +702,7 @@ def plan_release_approach_candidates(
                 continue
             candidates.append(ReleaseApproachCandidate(
                 box_center_xy_m=tuple(float(value) for value in box_center),
-                yaw_offset_rad=angle, proposal=proposal,
+                yaw_offset_rad=angle, proposal=proposal, lean_rad=float(lean_rad),
             ))
     if not candidates:
         raise ValueError("No complete held footprint fits the selected support")
