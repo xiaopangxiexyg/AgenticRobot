@@ -403,6 +403,9 @@ def test_gateway_numerical_dependencies_are_confined_to_concrete_profiles() -> N
         # Concrete perception frame binding uses NumPy only to apply the
         # reviewed scene-to-station transform.  Gateway core remains neutral.
         "agent_gateway/profiles/real/perception_frames.py": ["numpy"],
+        # The real release-pose query fits support planes to RGB-D and plans
+        # the two legs only in this concrete RM65 profile leaf; nothing is dispatched.
+        "agent_gateway/profiles/real/support_release_query.py": ["numpy"],
     }
 
 
