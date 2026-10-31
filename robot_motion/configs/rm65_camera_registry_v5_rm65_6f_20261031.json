@@ -1,0 +1,219 @@
+{
+  "schema_version": "dexteleop.camera_registry.v1",
+  "description": "RM65-6F v5 RealSense registry (2026-10-31) for the real Agent Gateway with the RM65-6F Station model assets/realman_dual_arm_inspire_gripper_dmtacm/realman_dual_arm_inspire_gripper_dmtacm_rm65_6f_20261031.urdf. Head camera: the 2026-10-31 hand-eye (front_single_left.json) refined by point-to-plane ICP of its depth against the robot's own link CAD over 33 saved scenes; its D435 depth is corrected by the fitted metric scale. Wrist cameras: the 2026-10-31 hand-eye T_camera_to_arm_end on the 6F flange (link6 of the selected Station URDF). Wrist role serials retain the deployed Agent Gateway assignment.",
+  "cameras": {
+    "front": {
+      "serial": "213222079798",
+      "model": "RealSense",
+      "stream": "color",
+      "profile": {
+        "width": 640,
+        "height": 480,
+        "fps": 15,
+        "format": "yuyv"
+      },
+      "intrinsics": null,
+      "extrinsics": {
+        "frames": {
+          "head_camera_frame": {
+            "parent_frame": "left_arm_base_link",
+            "transform_convention": "T_camera_to_parent maps camera-frame points into the parent frame; URDF fixed joint origin stores the same child-in-parent pose.",
+            "T_camera_to_parent": [
+              [
+                -0.9999916378399039,
+                -0.0009706202918849701,
+                0.0039726749823850846,
+                -0.2498842
+              ],
+              [
+                -0.0024896915852707043,
+                0.9151500852578114,
+                -0.40310559768927906,
+                -0.0159011
+              ],
+              [
+                -0.003244331375941651,
+                -0.40311211759121013,
+                -0.9151448491714594,
+                0.8575997
+              ],
+              [
+                0.0,
+                0.0,
+                0.0,
+                1.0
+              ]
+            ],
+            "source": {
+              "type": "handeye_refined_by_robot_link_icp",
+              "handeye_path": "AgenticRobotEvidence/camera-calibration-20261031-handoff/front/front_single_left.json",
+              "handeye_sha256": "56246032417c607f332b60a57990fe9d465e11ce90b304c2e46622db110d2b62",
+              "handeye_matrix": "T_camera_to_base",
+              "handeye_method": "HORAUD",
+              "handeye_samples": 72,
+              "calibration_arm": "left",
+              "camera_serial": "213222079798",
+              "refinement": "point_to_plane_icp_of_main_depth_to_both_arms_base_and_links_1_to_5_cad",
+              "refinement_scenes": 33,
+              "refinement_result_path": "temp/real-offline-suite-20261030/cal1031/main-icp-old33.json",
+              "refinement_result_sha256": "976bf2caa1bb91f91435b1cadc7edf9818e0d92f25440ccc833bed3ecc66c418",
+              "refinement_rotation_deg_from_handeye": 0.48,
+              "refinement_translation_mm_from_handeye": 2.72,
+              "refined_link_residual_abs_median_mm": 1.63,
+              "held_out_live_capture_within_5mm_fraction": 0.977
+            },
+            "placements": [
+              {
+                "urdf": "assets/realman_dual_arm_inspire_gripper_dmtacm/realman_dual_arm_inspire_gripper_dmtacm_rm65_6f_20261031.urdf",
+                "frame": "head_camera_frame",
+                "parent_frame": "left_arm_base_link"
+              }
+            ]
+          }
+        }
+      },
+      "metadata": {
+        "mount": "single_front"
+      },
+      "depth_correction": {
+        "model": "metric_scale",
+        "scale": 1.01406,
+        "serial": "213222079798",
+        "source": {
+          "type": "robot_link_icp_joint_fit",
+          "result_path": "temp/real-offline-suite-20261030/cal1031/main-icp-old33.json",
+          "result_sha256": "976bf2caa1bb91f91435b1cadc7edf9818e0d92f25440ccc833bed3ecc66c418",
+          "leave_one_scene_out_std": 8e-05,
+          "live_capture_only_fit": 1.0152,
+          "note": "Multiplies the device depth (units times the device depth scale). Remove after an on-chip Tare calibration of this camera and refit."
+        }
+      }
+    },
+    "left_wrist": {
+      "serial": "260522278055",
+      "model": "RealSense D405",
+      "stream": "color",
+      "profile": {
+        "width": 640,
+        "height": 480,
+        "fps": 15,
+        "format": "yuyv"
+      },
+      "intrinsics": null,
+      "extrinsics": {
+        "frames": {
+          "left_camera_rgb": {
+            "placements": [
+              {
+                "urdf": "assets/realman_dual_arm_inspire_gripper_dmtacm/realman_dual_arm_inspire_gripper_dmtacm_rm65_6f_20261031.urdf",
+                "frame": "left_camera_rgb",
+                "parent_frame": "left_arm_link6"
+              }
+            ],
+            "calibration": {
+              "type": "handeye_on_rm65_6f_flange",
+              "T_camera_to_arm_end": [
+                [
+                  -0.013745537455266854,
+                  0.9957990163144719,
+                  0.09052833427825724,
+                  -0.03394359391439257
+                ],
+                [
+                  -0.999855999427458,
+                  -0.014589508438845527,
+                  0.008667563234935687,
+                  0.009108490171535703
+                ],
+                [
+                  0.00995191484009971,
+                  -0.0903961578311982,
+                  0.9958561613206862,
+                  0.03196924626589062
+                ],
+                [
+                  0.0,
+                  0.0,
+                  0.0,
+                  1.0
+                ]
+              ],
+              "arm_end": "rm65_6f_flange_equals_selected_station_urdf_link6",
+              "handeye_path": "AgenticRobotEvidence/camera-calibration-20261031-handoff/left_wrist/wrist_left_all33.json",
+              "handeye_sha256": "742293ae6f0923dafe211c9f3af0beaaffb50f445301f4058d53753fa045e8e1",
+              "handeye_method": "DANIILIDIS+NONLINEAR",
+              "handeye_samples": 33,
+              "camera_serial": "260522278055"
+            }
+          }
+        }
+      },
+      "metadata": {
+        "mount": "single_left_wrist"
+      }
+    },
+    "right_wrist": {
+      "serial": "261122273924",
+      "model": "RealSense D405",
+      "stream": "color",
+      "profile": {
+        "width": 640,
+        "height": 480,
+        "fps": 15,
+        "format": "yuyv"
+      },
+      "intrinsics": null,
+      "extrinsics": {
+        "frames": {
+          "right_camera_rgb": {
+            "placements": [
+              {
+                "urdf": "assets/realman_dual_arm_inspire_gripper_dmtacm/realman_dual_arm_inspire_gripper_dmtacm_rm65_6f_20261031.urdf",
+                "frame": "right_camera_rgb",
+                "parent_frame": "right_arm_link6"
+              }
+            ],
+            "calibration": {
+              "type": "handeye_on_rm65_6f_flange",
+              "T_camera_to_arm_end": [
+                [
+                  0.015932178609390002,
+                  0.9965408211345538,
+                  0.08156321166572819,
+                  -0.03169326367048847
+                ],
+                [
+                  -0.9996764625282946,
+                  0.014258341462172188,
+                  0.021063474681633176,
+                  0.004677996649696956
+                ],
+                [
+                  0.019827656232500233,
+                  -0.08187240995120379,
+                  0.9964455692796811,
+                  0.030011174674653834
+                ],
+                [
+                  0.0,
+                  0.0,
+                  0.0,
+                  1.0
+                ]
+              ],
+              "arm_end": "rm65_6f_flange_equals_selected_station_urdf_link6",
+              "handeye_path": "AgenticRobotEvidence/camera-calibration-20261031-handoff/right_wrist/wrist_right_47.json",
+              "handeye_sha256": "f2706d01d12b2add92661cee260900f1617bd6676c89f2a04962d1f19bac0acc",
+              "handeye_method": "TSAI+NONLINEAR",
+              "handeye_samples": 47,
+              "camera_serial": "261122273924"
+            }
+          }
+        }
+      },
+      "metadata": {
+        "mount": "single_right_wrist"
+      }
+    }
+  }
+}

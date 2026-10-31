@@ -52,6 +52,22 @@
       ]
     },
     {
+      "bundle_id": "rm65_6f.dmtac_proxy_models",
+      "relative_path": "rm65_inspire_tac",
+      "required_by_default": false,
+      "required_paths": [
+        "rm65_dual_arm_hand_proxy_dmtac_strict_rm65_6f.urdf"
+      ]
+    },
+    {
+      "bundle_id": "rm65_6f.dmtac_station_models",
+      "relative_path": "realman_dual_arm_inspire_gripper_dmtacm",
+      "required_by_default": false,
+      "required_paths": [
+        "realman_dual_arm_inspire_gripper_dmtacm_rm65_6f_20261031.urdf"
+      ]
+    },
+    {
       "bundle_id": "inspire_gripper.tools",
       "relative_path": "inspire_gripper",
       "required_by_default": false,

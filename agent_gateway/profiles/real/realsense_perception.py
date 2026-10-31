@@ -245,11 +245,19 @@ class RealRgbGeometryCapture:
 
 @dataclass(frozen=True)
 class RealPerceptionSourceBinding:
-    """Preflighted camera inventory and trusted static depth poses."""
+    """Preflighted camera inventory, trusted static depth poses and depth corrections.
+
+    ``depth_scale_correction_by_source`` multiplies a source's metric depth
+    (device depth units times the device depth scale). It comes from the
+    camera registry's ``depth_correction`` entry, is bound to that camera's
+    serial, and is applied once where frames become meters; absent sources
+    keep the device scale.
+    """
 
     camera_sources: Mapping[str, object]
     world_from_depth_camera_by_source: Mapping[str, np.ndarray]
     semantic_content_hash: str
+    depth_scale_correction_by_source: Mapping[str, float] = MappingProxyType({})
 
     def __post_init__(self) -> None:
         sources = dict(self.camera_sources)
@@ -267,6 +275,12 @@ class RealPerceptionSourceBinding:
         static_depth_sources = set(self.world_from_depth_camera_by_source)
         if not static_depth_sources.issubset(depth_sources):
             raise ValueError("Static depth poses must belong to enabled depth sources.")
+        corrections = {}
+        for source_id, value in dict(self.depth_scale_correction_by_source).items():
+            if source_id not in depth_sources:
+                raise ValueError("Depth corrections must belong to enabled depth sources.")
+            corrections[source_id] = _depth_scale_correction(
+                value, field_name=f"depth_scale_correction_by_source.{source_id}")
         poses = {}
         for source_id, value in self.world_from_depth_camera_by_source.items():
             matrix = _pose_matrix(
@@ -281,6 +295,7 @@ class RealPerceptionSourceBinding:
             "world_from_depth_camera_by_source",
             MappingProxyType(poses),
         )
+        object.__setattr__(self, "depth_scale_correction_by_source", MappingProxyType(corrections))
         object.__setattr__(
             self,
             "semantic_content_hash",
@@ -289,6 +304,36 @@ class RealPerceptionSourceBinding:
                 field_name="semantic_content_hash",
             ),
         )
+
+    def metric_depth_scale(self, source_id: str, device_scale_m_per_unit: float) -> float:
+        """Meters per device depth unit for ``source_id`` after its correction."""
+        return float(device_scale_m_per_unit) * float(self.depth_scale_correction_by_source.get(source_id, 1.0))
+
+
+# A depth correction repairs a sensor's metric scale; anything outside a few
+# percent is a different fault (wrong units, wrong camera) and is refused.
+REAL_DEPTH_SCALE_CORRECTION_RANGE = (0.95, 1.05)
+
+
+def _depth_scale_correction(value: object, *, field_name: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)):
+        raise ValueError(f"{field_name} must be a finite number.")
+    low, high = REAL_DEPTH_SCALE_CORRECTION_RANGE
+    if not low <= float(value) <= high:
+        raise ValueError(f"{field_name} must be within [{low}, {high}].")
+    return float(value)
+
+
+def _registry_depth_correction(camera_key: str, spec: Mapping[str, object]) -> float | None:
+    """The registry's serial-bound metric depth scale for one camera, if any."""
+    entry = spec.get("depth_correction")
+    if entry is None:
+        return None
+    if not isinstance(entry, Mapping) or entry.get("model") != "metric_scale":
+        raise ValueError(f"camera {camera_key!r} depth_correction must be a metric_scale model.")
+    if str(entry.get("serial")) != str(spec.get("serial")):
+        raise ValueError(f"camera {camera_key!r} depth_correction is bound to another serial.")
+    return _depth_scale_correction(entry.get("scale"), field_name=f"camera_registry.{camera_key}.depth_correction.scale")
 
 
 def build_real_perception_source_binding(
@@ -334,6 +379,7 @@ def build_real_perception_source_binding(
         for side in ("left", "right")
     }
     static_depth_poses: dict[str, np.ndarray] = {}
+    depth_corrections: dict[str, float] = {}
     binding_cameras = []
     for camera_key, config in configs.items():
         spec = registry_cameras.get(camera_key)
@@ -343,6 +389,11 @@ def build_real_perception_source_binding(
             )
         if str(spec.get("serial")) != str(config.serial):
             raise ValueError(f"camera {camera_key!r} serial differs from the registry.")
+        correction = _registry_depth_correction(camera_key, spec)
+        if correction is not None:
+            if not config.enable_depth:
+                raise ValueError(f"camera {camera_key!r} has a depth correction but no depth stream.")
+            depth_corrections[camera_key] = correction
         profile = spec.get("profile")
         if not isinstance(profile, Mapping) or any(
             int(profile.get(field_name, -1)) != int(getattr(config, field_name))
@@ -393,6 +444,8 @@ def build_real_perception_source_binding(
                 "config": config.to_dict(),
                 "registry_serial": str(spec["serial"]),
                 "world_from_depth_camera": pose_payload,
+                # Present only for corrected cameras, so uncorrected bindings keep their identity.
+                **({} if correction is None else {"depth_scale_correction": correction}),
             }
         )
     binding_hash = canonical_content_hash(
@@ -409,6 +462,7 @@ def build_real_perception_source_binding(
         },
         world_from_depth_camera_by_source=static_depth_poses,
         semantic_content_hash=binding_hash,
+        depth_scale_correction_by_source=depth_corrections,
     )
 
 
@@ -1124,7 +1178,8 @@ class RealSenseAgentPerceptionProvider:
         intrinsics_raw = info.get("intrinsics" if aligned else "depth_intrinsics")
         intrinsics = _depth_intrinsics(intrinsics_raw, depth.shape)
         output = io.BytesIO()
-        np.save(output, np.asarray(depth, dtype=np.float32) * scale, allow_pickle=False)
+        metric_scale = self.source_binding.metric_depth_scale(source_id, scale)
+        np.save(output, np.asarray(depth, dtype=np.float32) * metric_scale, allow_pickle=False)
         world_from_camera = self.source_binding.world_from_depth_camera_by_source[
             source_id
         ]
@@ -1210,7 +1265,7 @@ class RealSenseAgentPerceptionProvider:
             raise RuntimeError(f"real_depth_scale_invalid:{source_id}")
         intrinsics = _depth_intrinsics(info.get("intrinsics"), depth_raw.shape)
         depth_m = np.ascontiguousarray(
-            depth_raw.astype(np.float32) * float(scale),
+            depth_raw.astype(np.float32) * self.source_binding.metric_depth_scale(source_id, float(scale)),
             dtype=np.float32,
         )
         if not np.all(np.isfinite(depth_m)) or np.any(depth_m < 0.0):

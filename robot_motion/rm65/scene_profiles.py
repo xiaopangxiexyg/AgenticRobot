@@ -43,6 +43,37 @@ DUAL_ARM_HAND_PROXY_COLLISION_FIXED_GEOMETRIES = (
     "table_0",
 )
 
+# RealMan RM65-6F: the six-axis force sensor puts the mechanical flange this far
+# beyond the standard RM65 link6 along the joint-6 axis (controller-reported
+# flange minus standard URDF FK, constant over 152 calibration poses). The 6F
+# profiles bind motion-model variants whose joint-6 origin carries this length,
+# so link6 is the 6F flange and every flange-relative geometry (hand proxies,
+# wrist cameras, tool TCP) keeps its reviewed offsets.
+RM65_6F_FLANGE_EXTENSION_M = 0.0172
+DMTAC_SCENE_PROFILES_BY_ARM_MODEL = {
+    "rm65": ("dual_arm_hand_proxy_dmtac_strict", "dual_arm_hand_proxy_dmtac_grasp"),
+    "rm65_6f": ("dual_arm_hand_proxy_dmtac_strict_rm65_6f", "dual_arm_hand_proxy_dmtac_grasp_rm65_6f"),
+}
+DMTAC_SCENE_PROFILES = frozenset(
+    name for names in DMTAC_SCENE_PROFILES_BY_ARM_MODEL.values() for name in names)
+DMTAC_GRASP_SCENE_PROFILES = frozenset(
+    names[1] for names in DMTAC_SCENE_PROFILES_BY_ARM_MODEL.values())
+RM65_6F_SCENE_PROFILES = frozenset(DMTAC_SCENE_PROFILES_BY_ARM_MODEL["rm65_6f"])
+_DMTAC_PROXY_URDF_BY_ARM_MODEL = {
+    "rm65": "rm65_dual_arm_hand_proxy_dmtac_strict.urdf",
+    "rm65_6f": "rm65_dual_arm_hand_proxy_dmtac_strict_rm65_6f.urdf",
+}
+
+
+def rm65_arm_model_for_scene_profile(name: str) -> str:
+    """Physical arm model a scene profile's motion model describes ("rm65" or "rm65_6f")."""
+    return "rm65_6f" if str(name) in RM65_6F_SCENE_PROFILES else "rm65"
+
+
+def rm65_flange_extension_m_for_scene_profile(name: str) -> float:
+    """Length between the standard RM65 link6 and the profile's flange (0 for RM65)."""
+    return RM65_6F_FLANGE_EXTENSION_M if str(name) in RM65_6F_SCENE_PROFILES else 0.0
+
 
 def _grasp_full_collision_pairs() -> tuple[tuple[str, str], ...]:
     """Cover the complete arms without changing the live teleop proxy contract.
@@ -519,9 +550,7 @@ def build_dual_arm_scene_profile(
     """Build a pure RM65 dual-arm collision/model profile."""
 
     name = str(name or DEFAULT_COLLISION_SCENE)
-    if dmtac_proxy_urdf_path is not None and name not in {
-        "dual_arm_hand_proxy_dmtac_strict", "dual_arm_hand_proxy_dmtac_grasp"
-    }:
+    if dmtac_proxy_urdf_path is not None and name not in DMTAC_SCENE_PROFILES:
         raise ValueError("A DMTAC proxy candidate requires a DMTAC scene profile.")
     asset_dir = require_asset_path()
     if name == "dual_arm":
@@ -558,20 +587,19 @@ def build_dual_arm_scene_profile(
         "dual_arm_hand_proxy_open",
         "dual_arm_hand_proxy_strict",
         "dual_arm_hand_proxy_grasp_full",
-        "dual_arm_hand_proxy_dmtac_strict",
-        "dual_arm_hand_proxy_dmtac_grasp",
+        *DMTAC_SCENE_PROFILES,
     }:
-        is_dmtac_profile = name in {
-            "dual_arm_hand_proxy_dmtac_strict", "dual_arm_hand_proxy_dmtac_grasp"
-        }
+        is_dmtac_profile = name in DMTAC_SCENE_PROFILES
         if is_dmtac_profile:
-            urdf_name = "rm65_dual_arm_hand_proxy_dmtac_strict.urdf"
+            urdf_name = _DMTAC_PROXY_URDF_BY_ARM_MODEL[rm65_arm_model_for_scene_profile(name)]
         elif name == "dual_arm_hand_proxy_open":
             urdf_name = "rm65_dual_arm_hand_proxy_open.urdf"
         else:
             urdf_name = "rm65_dual_arm_hand_proxy_strict.urdf"
         urdf_path = (Path(dmtac_proxy_urdf_path).resolve(strict=True)
             if dmtac_proxy_urdf_path is not None else asset_dir / urdf_name)
+        if is_dmtac_profile:
+            _require_joint6_flange_extension(urdf_path, rm65_flange_extension_m_for_scene_profile(name))
         hand_proxy_boxes = _load_hand_proxy_boxes(
             urdf_path,
             include_all_collision_boxes=is_dmtac_profile,
@@ -601,7 +629,7 @@ def build_dual_arm_scene_profile(
                 raise ValueError("DMTAC proxy must expose matching sequential boxes per hand; "
                     "three boxes require an explicit candidate path.")
         fixed_scene_box_overrides = ()
-        if name == "dual_arm_hand_proxy_dmtac_grasp":
+        if name in DMTAC_GRASP_SCENE_PROFILES:
             cad_table = _load_fixed_scene_box(
                 asset_dir.parent / "realman_dual_arm_inspire_gripper_dmtacm"
                 / "realman_dual_arm_inspire_gripper_dmtacm.urdf",
@@ -746,15 +774,46 @@ def build_rm65_dual_arm_scene_profile(
     return build_dual_arm_scene_profile(name, dmtac_proxy_urdf_path=dmtac_proxy_urdf_path)
 
 
+RM65_STANDARD_JOINT6_OFFSET_M = 0.144
+
+
+def _require_joint6_flange_extension(urdf_path: Path, extension_m: float) -> None:
+    """Fail when a motion model's joint-6 length does not match its arm model.
+
+    Every RM65 joint-6 origin is a pure translation of the standard 0.144 m
+    (plus the 6F sensor length) from link5; a different length means the file
+    describes another arm model than the profile name claims.
+    """
+    root = ET.parse(urdf_path).getroot()
+    expected = RM65_STANDARD_JOINT6_OFFSET_M + float(extension_m)
+    for joint_name in ("arm_joint6", "right_arm_joint6"):
+        joints = [joint for joint in root.findall("joint") if joint.get("name") == joint_name]
+        origin = None if len(joints) != 1 else joints[0].find("origin")
+        if origin is None:
+            raise ValueError(f"{urdf_path.name} lacks a unique {joint_name} origin.")
+        length = float(np.linalg.norm(np.asarray(origin.get("xyz", "0 0 0").split(), dtype=float)))
+        if abs(length - expected) > 1e-6:
+            raise ValueError(f"{urdf_path.name} {joint_name} length {length:.6f} m does not match "
+                             f"the profile's arm model ({expected:.6f} m).")
+
+
 __all__ = [
     "load_dmtac_self_observation_proxy_boxes",
+    "DMTAC_GRASP_SCENE_PROFILES",
+    "DMTAC_SCENE_PROFILES",
+    "DMTAC_SCENE_PROFILES_BY_ARM_MODEL",
     "DUAL_ARM_DMTAC_HAND_PROXY_CHECKED_COLLISION_PAIRS",
     "DUAL_ARM_HAND_PROXY_CHECKED_COLLISION_PAIRS",
     "DUAL_ARM_HAND_PROXY_COLLISION_FIXED_GEOMETRIES",
     "DualArmSceneProfile",
     "FixedSceneBoxSpec",
     "HandProxyBoxSpec",
+    "RM65_6F_FLANGE_EXTENSION_M",
+    "RM65_6F_SCENE_PROFILES",
+    "RM65_STANDARD_JOINT6_OFFSET_M",
     "build_dual_arm_scene_profile",
     "build_rm65_dual_arm_scene_profile",
     "fixed_scene_aabb_obstacles",
+    "rm65_arm_model_for_scene_profile",
+    "rm65_flange_extension_m_for_scene_profile",
 ]

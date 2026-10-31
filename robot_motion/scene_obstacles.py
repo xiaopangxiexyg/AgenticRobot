@@ -8,6 +8,7 @@ does not initialize a simulator or a hardware backend.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from types import MappingProxyType
 from typing import Any, Mapping, Sequence
 
 import numpy as np
@@ -70,13 +71,21 @@ class AxisAlignedBoxObstacle:
 
 @dataclass(frozen=True)
 class ObstacleSceneSnapshot:
-    """Hash-stable static AABB scene used by one planning request."""
+    """Hash-stable static AABB scene used by one planning request.
+
+    ``hand_minimum_clearance_m_by_obstacle_id`` optionally replaces
+    ``minimum_clearance_m`` for the pairs between one obstacle and the robot's
+    hand assembly (gripper proxies, wrist-camera proxies and a carried object;
+    the collision oracle receives that geometry set). Every other pair keeps
+    ``minimum_clearance_m``. Contact stays blocked at a zero override.
+    """
 
     reference_frame_id: str
     reference_frame_spec_hash: str
     revision: int
     obstacles: tuple[AxisAlignedBoxObstacle, ...] = ()
     minimum_clearance_m: float = 0.0
+    hand_minimum_clearance_m_by_obstacle_id: Mapping[str, float] = field(default_factory=dict, compare=False)
     semantic_content_hash: str = field(init=False)
 
     def __post_init__(self) -> None:
@@ -99,25 +108,44 @@ class ObstacleSceneSnapshot:
         obstacle_ids = tuple(item.obstacle_id for item in obstacles)
         if len(set(obstacle_ids)) != len(obstacle_ids):
             raise ValueError("obstacle_id values must be unique within a scene.")
+        hand_clearances = {}
+        for raw_id, raw_value in dict(self.hand_minimum_clearance_m_by_obstacle_id).items():
+            obstacle_id = str(raw_id)
+            if obstacle_id not in obstacle_ids:
+                raise ValueError(f"hand clearance override names an unknown obstacle {obstacle_id!r}.")
+            value = float(raw_value)
+            if isinstance(raw_value, bool) or not np.isfinite(value) or value < 0.0:
+                raise ValueError("hand clearance overrides must be finite and non-negative.")
+            hand_clearances[obstacle_id] = value
         object.__setattr__(self, "reference_frame_id", frame_id)
         object.__setattr__(self, "reference_frame_spec_hash", frame_hash)
         object.__setattr__(self, "revision", revision)
         object.__setattr__(self, "obstacles", obstacles)
         object.__setattr__(self, "minimum_clearance_m", clearance)
+        object.__setattr__(self, "hand_minimum_clearance_m_by_obstacle_id",
+                           MappingProxyType(dict(sorted(hand_clearances.items()))))
         object.__setattr__(
             self,
             "semantic_content_hash",
             canonical_content_hash(self.to_dict(), domain=_SCENE_HASH_DOMAIN),
         )
 
+    def hand_clearance_m(self, obstacle_id: str) -> float:
+        """Required clearance between the hand assembly and ``obstacle_id``."""
+        return float(self.hand_minimum_clearance_m_by_obstacle_id.get(obstacle_id, self.minimum_clearance_m))
+
     def to_dict(self) -> dict[str, Any]:
-        return {
+        payload = {
             "reference_frame_id": self.reference_frame_id,
             "reference_frame_spec_hash": self.reference_frame_spec_hash,
             "revision": self.revision,
             "minimum_clearance_m": self.minimum_clearance_m,
             "obstacles": [item.to_dict() for item in self.obstacles],
         }
+        # Present only when used, so scenes without overrides keep their identity.
+        if self.hand_minimum_clearance_m_by_obstacle_id:
+            payload["hand_minimum_clearance_m_by_obstacle_id"] = dict(self.hand_minimum_clearance_m_by_obstacle_id)
+        return payload
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any]) -> "ObstacleSceneSnapshot":
@@ -126,6 +154,7 @@ class ObstacleSceneSnapshot:
             reference_frame_spec_hash=str(value["reference_frame_spec_hash"]),
             revision=int(value["revision"]),
             minimum_clearance_m=float(value.get("minimum_clearance_m", 0.0)),
+            hand_minimum_clearance_m_by_obstacle_id=dict(value.get("hand_minimum_clearance_m_by_obstacle_id") or {}),
             obstacles=tuple(
                 AxisAlignedBoxObstacle(
                     obstacle_id=str(item["obstacle_id"]),
