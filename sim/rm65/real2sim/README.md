@@ -92,6 +92,21 @@ core and MuJoCo adapter used for the 20260721 fit; tests compare those hashes to
 fixed historical values rather than silently reinterpreting the fit against
 the current files.
 
+MuJoCo 持物放置第三批（批次 2d、四分之一速度、2e）使用独立绑定
+`artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261031_mujoco_agent_place_v3.json`。它固定于合并提交
+`576aacb41`（development `6deeefe32` + 任务分支 `07e567b84`），保留前一绑定（持物放置第二批）的全部非运行时引用；
+192 项已有运行时输入中 5 项改变（释放候选生成、释放查询与支撑面度量、MuJoCo 持物运动规划），合计 192 项。
+行为变化均为默认关闭的 MuJoCo 放置链：持物关节速度降为四分之一（半速时持物沿规划路径的偏差最多吃掉 3.7 mm 规划间隙，
+四分之一速度最多 0.85 mm）；释放查询在每个朝向下增加离持物最近的可行位置；支撑面顶高改为已认证平面矩形最高角点加 2 mm
+认证残差（原先取掩膜内所有高点的最大值，掩膜边缘落在支撑面上的物体时会把释放高度抬到该物体顶面）；一块区域里保持持物姿态的
+候选都没有路径时，同一区域的位置在当前偏航下再把持物姿态朝机械臂基座多转 6° 尝试一次（物体相对支撑面法线的倾角不超过 10°），
+结果字段 `release_lean_rad` 报告附加的倾角；没有可用候选时以类型化拒绝返回，不再中断查询。
+1 mm 硬穿透、3 mm/2° 滑移、50 ms 观测间隔、0.6 s 释放窗口和 2 mm 非接触间隙均未改变。离线证据按内容哈希记录：
+875 项关联测试（当前绑定测试在本绑定前排除）、独立评审（结论为有条件通过，问题已在 `eb229e6af` 修正）与 DeepSeek Agent 放置套件运行台账
+（queue-b-05 至 queue-b-08，以及 queue-b-08 三次倾斜释放运行在 `07e567b84` 上的重放：运动、夹爪和查询调用结果一致，
+只有一次引用原运行图像 ID 的只读定位调用在重放中未提交）。
+绑定仍为 `provisional`，没有新增标定、真机运动执行或 held-out 资格。
+
 MuJoCo 持物放置第二批（批次 2/2b/2c）使用独立绑定
 `artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261030_mujoco_agent_place_v2.json`。它固定于合并提交
 `eb44be38a`（development `a0121721f` + 任务分支 `bb8aacdff`），保留前一绑定（真机持物放置）的全部非运行时引用；
