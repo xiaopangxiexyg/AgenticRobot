@@ -18,6 +18,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from itertools import pairwise
 from pathlib import Path, PurePosixPath
+from types import MappingProxyType
 
 import numpy as np
 
@@ -29,6 +30,11 @@ from .realsense_perception import (
     RealRgbCameraGeometryCut,
     real_camera_role_for_source,
 )
+
+# Each wrist camera role is rigidly mounted on this arm's link 6 (the only
+# trusted dynamic pose policy below); held-object measurement uses the same
+# pairing to find the holding arm's own camera.
+REAL_WRIST_CAMERA_SIDE_BY_ROLE = MappingProxyType({"wrist_left": "left", "wrist_right": "right"})
 
 
 def _finite_time(value: object, *, field_name: str) -> float:
@@ -586,10 +592,9 @@ def build_rm65_rgb_camera_geometry(
         if source_id in source_binding.world_from_depth_camera_by_source:
             continue
         role = real_camera_role_for_source(source_id)
-        side_by_role = {"wrist_left": "left", "wrist_right": "right"}
-        if role not in side_by_role:
+        if role not in REAL_WRIST_CAMERA_SIDE_BY_ROLE:
             raise ValueError(f"RGB source {source_id!r} has no trusted pose policy")
-        side = side_by_role[role]
+        side = REAL_WRIST_CAMERA_SIDE_BY_ROLE[role]
         camera_frame = f"{side}_camera_rgb"
         expected_parent = f"{side}_arm_link6"
         spec = cameras.get(source_id)
@@ -640,6 +645,7 @@ def build_rm65_rgb_camera_geometry(
 
 
 __all__ = [
+    "REAL_WRIST_CAMERA_SIDE_BY_ROLE",
     "RM65RgbCameraGeometry",
     "RM65StationaryGeometryUnavailable",
     "build_rm65_rgb_camera_geometry",
