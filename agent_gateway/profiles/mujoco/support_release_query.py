@@ -129,7 +129,9 @@ def build_support_release_query_registration(*, segmentation, back_projection, r
         "lateral_margin_m": RELEASE_LATERAL_MARGIN_M,
         "planning_time_budget_sec": PLANNING_TIME_BUDGET_SEC,
         "path_search_budget_sec": PATH_SEARCH_BUDGET_SEC,
-        "support_measurement": "depth_only_certified_top_rectangle_v1",
+        # v2: the top height is the certified plane rectangle's highest corner plus the
+        # certification residual, not the highest masked point.
+        "support_measurement": "depth_only_certified_top_rectangle_v2",
         "support_regions": {"maximum": MAXIMUM_SUPPORT_REGIONS, "order": "largest_first",
                             "maximum_overlap_fraction": .75},
         "planner": "mujoco_private_payload_candidate_planner_v1",

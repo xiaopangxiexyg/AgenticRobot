@@ -9,6 +9,7 @@ import pytest
 
 from agent_gateway.profiles.back_projection import LiveAlignedDepthCapture
 from agent_gateway.profiles.measured_support import (
+    fit_support_top_plane,
     largest_true_rectangle,
     maximal_true_rectangles,
     measure_support_top,
@@ -186,3 +187,34 @@ def test_object_resting_on_the_top_leaves_both_free_strips_as_regions():
     assert right and near
     assert right[0].region_max_xy_m[1] - right[0].region_min_xy_m[1] > 0.07
     assert near[0].region_max_xy_m[0] - near[0].region_min_xy_m[0] > 0.07
+
+
+def _dilated(mask, radius):
+    grown = mask.copy()
+    padded = np.pad(mask, radius)
+    for dy in range(2 * radius + 1):
+        for dx in range(2 * radius + 1):
+            grown |= padded[dy:dy + mask.shape[0], dx:dx + mask.shape[1]]
+    return grown
+
+
+def test_mask_rim_on_a_resting_block_does_not_raise_the_measured_top():
+    """A segmentation rim on an object resting on the top must not set the support height.
+
+    Live SAM3 masks of a mat with a 4 cm block on it kept a few pixels with the block's
+    depth; the highest masked point put the release 4 cm above the mat. A one-pixel rim
+    (about 1 % of the mask) stays inside the plane fit's outlier quantile here too.
+    """
+    block = (0.0, 0.05, 0.04, 0.09, 0.04)
+    depth, mask, pose = _render(resting=block)
+    clean_depth, _, _ = _render()
+    rim = (np.abs(depth - clean_depth) > 1e-6) & _dilated(mask, 1)
+    assert 0 < rim.sum() < 0.02 * mask.sum()
+    capture = _capture(depth, pose)
+    assert fit_support_top_plane(capture, mask | rim, maximum_depth_m=2.).upper_top_z_m > TOP_Z + 0.03
+    tops = measure_support_tops(capture, mask | rim, maximum_depth_m=2., limit=3)
+    assert tops
+    for top in tops:
+        assert TOP_Z <= top.top_z_m <= TOP_Z + 0.004
+        low, high = np.asarray(top.region_min_xy_m), np.asarray(top.region_max_xy_m)
+        assert low[0] >= block[2] or high[1] <= block[1]

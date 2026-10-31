@@ -261,8 +261,12 @@ def measure_support_tops(capture: LiveAlignedDepthCapture, mask: np.ndarray, *,
         corner_z = anchor[2] - (normal[0] * (corners[:, 0] - anchor[0])
                                 + normal[1] * (corners[:, 1] - anchor[1])) / normal[2]
         # The release planner treats top_z_m as the highest support point under the
-        # footprint: keep the upper plane margin and the highest certified corner.
-        top_z = max(float(plane.upper_top_z_m), float(np.max(corner_z)))
+        # footprint. Every certified sample lies within the plane residual, so that
+        # point is the highest certified corner of the plane plus the residual.
+        # plane.upper_top_z_m is the highest of all high mask points instead: a few
+        # mask pixels on an object resting on the support or in front of it (inside
+        # the fit's outlier quantile) would lift the release by that object's height.
+        top_z = float(np.max(corner_z)) + MAXIMUM_PLANE_RESIDUAL_M
         tops.append(MeasuredSupportTop(
             plane=observed, coverage=coverage,
             region_min_xy_m=tuple(float(value) for value in region_min),
