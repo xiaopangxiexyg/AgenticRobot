@@ -36,6 +36,10 @@ from .back_projection import (
 
 GRID_RESOLUTION_M = 0.002
 MAXIMUM_PLANE_RESIDUAL_M = 0.002
+# Identity of the support top measurement recorded by its consumers. v2: the top
+# height is the certified plane rectangle's highest corner plus the certification
+# residual, not the highest masked point.
+SUPPORT_TOP_MEASUREMENT_ID = "depth_only_certified_top_rectangle_v2"
 DEFAULT_LATERAL_MARGIN_M = 0.002
 MINIMUM_REGION_SIDE_M = 0.02
 MAXIMUM_GRID_CELLS = 100_000
@@ -261,8 +265,12 @@ def measure_support_tops(capture: LiveAlignedDepthCapture, mask: np.ndarray, *,
         corner_z = anchor[2] - (normal[0] * (corners[:, 0] - anchor[0])
                                 + normal[1] * (corners[:, 1] - anchor[1])) / normal[2]
         # The release planner treats top_z_m as the highest support point under the
-        # footprint: keep the upper plane margin and the highest certified corner.
-        top_z = max(float(plane.upper_top_z_m), float(np.max(corner_z)))
+        # footprint. Every certified sample lies within the plane residual, so that
+        # point is the highest certified corner of the plane plus the residual.
+        # plane.upper_top_z_m is the highest of all high mask points instead: a few
+        # mask pixels on an object resting on the support or in front of it (inside
+        # the fit's outlier quantile) would lift the release by that object's height.
+        top_z = float(np.max(corner_z)) + MAXIMUM_PLANE_RESIDUAL_M
         tops.append(MeasuredSupportTop(
             plane=observed, coverage=coverage,
             region_min_xy_m=tuple(float(value) for value in region_min),
@@ -406,6 +414,6 @@ def measure_object_top(capture: LiveAlignedDepthCapture, mask: np.ndarray, *,
         tilt_deg=tilt)
 
 
-__all__ = ["MeasuredObjectTop", "MeasuredSupportTop", "fit_support_top_plane",
+__all__ = ["SUPPORT_TOP_MEASUREMENT_ID", "MeasuredObjectTop", "MeasuredSupportTop", "fit_support_top_plane",
            "largest_true_rectangle", "measure_object_top", "measure_support_top",
            "measure_surface_below", "minimum_area_rectangle", "plane_coverage_grid"]

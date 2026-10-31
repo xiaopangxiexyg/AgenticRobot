@@ -143,8 +143,13 @@ def _dominant(channel):
 # needs ~190-230 s; the 120 s default stays for every other test.
 @pytest.mark.slow_sim
 @pytest.mark.timeout(480)
-@pytest.mark.parametrize("case", ["box_on_box", "box_near_post"])
-def test_native_queried_grasp_then_queried_release_places_the_cube(tmp_path, monkeypatch, case):
+@pytest.mark.parametrize(("case", "variant", "lift_m"), [
+    ("box_on_box", 0, .04), ("box_near_post", 0, .04),
+    # The box near the edge of the arm's reach: no level release pose has a path, a
+    # pose with the held object leaned toward the arm does.
+    ("box_on_box", 1, .05)])
+def test_native_queried_grasp_then_queried_release_places_the_cube(tmp_path, monkeypatch, case, variant,
+                                                                   lift_m):
     """No scripted pregrasp: query, approach, close, lift, query release, carry, open."""
     pytest.importorskip("mujoco")
     from agent_gateway.profiles.mujoco.motion_factory import (
@@ -152,6 +157,7 @@ def test_native_queried_grasp_then_queried_release_places_the_cube(tmp_path, mon
         build_mujoco_agent_tcp_pose_gateway_session,
         mujoco_agent_tcp_pose_execution_observation_plan_v1,
     )
+    from agent_gateway.profiles.mujoco.support_release_query import RELEASE_LEAN_RAD
     from agent_gateway.protocol.contracts import AGENT_SKILL_TERMINAL_OPERATION_STATUSES_V1
     from deployments.perception.sam2_grounding_dino import encode_grounded_object_segment_artifacts
     from deployments.perception.sam3_service import Sam3ServiceLocalizer
@@ -159,7 +165,7 @@ def test_native_queried_grasp_then_queried_release_places_the_cube(tmp_path, mon
     from sim.mujoco.scene_suite import materialize_case
     from test_agent_gateway_mujoco_tcp_pose_comparison import CLIENT, _request
 
-    task = materialize_case(case, tmp_path / "scene", variant=0, suite_path=SUITE)
+    task = materialize_case(case, tmp_path / "scene", variant=variant, suite_path=SUITE)
     localizer = Sam3ServiceLocalizer(endpoint="http://127.0.0.1:8114", timeout_sec=45., min_score=0.3,
                                      multi_instance_text=False)
     monkeypatch.setattr(Sam3ServiceLocalizer, "start", lambda self: setattr(self, "_test_started", True))
@@ -237,9 +243,10 @@ def test_native_queried_grasp_then_queried_release_places_the_cube(tmp_path, mon
                   "controlled_frame_id": "object_body",
                   **{name: getattr(object_profile, name) for name in lineage}}
         call("motion.move_grasped_object_to_pose",
-             {**common, "phase": "lift", "translation_delta_xyz_m": [0., 0., .04]})
+             {**common, "phase": "lift", "translation_delta_xyz_m": [0., 0., lift_m]})
         release = call(RELEASE[0], {"support_object_id": "green_box", "reference_frame_id": frame})
         assert release["status"] == "release_pose_found", release
+        assert release["release_lean_rad"] == (RELEASE_LEAN_RAD if variant == 1 else 0.), release
         call("motion.move_grasped_object_to_pose",
              {**common, "phase": "carry",
               "object_pose_xyz_quat_xyzw": release["release_object_pose_xyz_quat_xyzw"]})

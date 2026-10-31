@@ -29,6 +29,9 @@ SEMANTICS = "agenticrobot.held_object.support_release_pose.v1"
 MIN_CLEARANCE_M = 0.004
 MAX_CLEARANCE_M = 0.03
 DEFAULT_CLEARANCE_M = 0.006
+# Upper bound of a reported release lean; equals the planner's lean limit (the
+# MuJoCo deployment checks this at registration and uses 6 degrees).
+MAX_RELEASE_LEAN_RAD = math.radians(10.)
 STATUSES = ("release_pose_found", "no_release_pose")
 REASONS = (
     "collision_free_release_path_found",
@@ -43,7 +46,7 @@ PARAMETER_KEYS = frozenset({"support_object_id", "reference_frame_id", "clearanc
 RESULT_KEYS = frozenset({
     "semantics", "status", "reason", "support_object_id", "reference_frame_id",
     "station_revision", "release_object_pose_xyz_quat_xyzw", "release_clearance_m",
-    "held_object_pose_xyz_quat_xyzw", "yaw_change_rad", "support_top_z_m",
+    "held_object_pose_xyz_quat_xyzw", "yaw_change_rad", "release_lean_rad", "support_top_z_m",
     "support_region_min_xy_m", "support_region_max_xy_m", "segmentation",
     "measured_support", "candidate_count", "attempted_candidate_count",
     "selected_candidate_index", "path_planning_wall_sec", "candidate_rejections", "views",
@@ -88,9 +91,14 @@ def definition() -> SkillDefinition:
             "support in fresh RGB-D from each bound camera (the wrist camera sees past the arm), "
             "keeps up to three fully observed top rectangles, largest first (the free strips "
             "beside an object already on the top count separately), proposes on-support "
-            "positions and yaw turns for the held object, and returns the planner's preferred "
-            "one in the first rectangle that has one whose whole payload path from the current "
-            "arm state is collision-free. Pass "
+            "positions (the center, the position nearest the held object and four interior "
+            "corners) with yaw turns, about the support's normal, of the orientation the object "
+            "has in the gripper, and returns the planner's preferred one in the first rectangle "
+            "that has one whose whole payload path from the current arm state is collision-free. "
+            "If none has such a path, the same positions are tried at the current yaw with the "
+            "object turned a few degrees further, top toward the arm (a reaching arm can hold it "
+            "leaned; it settles flat when released; never more than 10 degrees from the support's "
+            "normal); release_lean_rad reports that added lean, 0 otherwise. Pass "
             "release_object_pose_xyz_quat_xyzw unchanged to motion.move_grasped_object_to_pose "
             "with phase=carry, then open the gripper with release_support_object_id set to the "
             "same support. Read-only; it never moves the arm or opens the gripper. "
@@ -160,6 +168,10 @@ def schema(*, definition_hash, profile_hash, support_object_ids, reference_frame
                                 "maximum": MAX_CLEARANCE_M},
         "held_object_pose_xyz_quat_xyzw": _nullable(_pose_schema()),
         "yaw_change_rad": {"type": ["number", "null"]},
+        "release_lean_rad": {"type": ["number", "null"], "minimum": 0,
+                             "maximum": MAX_RELEASE_LEAN_RAD,
+                             "description": "Lean added to the held orientation (after the yaw turn), "
+                                            "top toward the arm; 0 when the held orientation is kept."},
         "support_top_z_m": {"type": ["number", "null"]},
         "support_region_min_xy_m": _nullable(xy),
         "support_region_max_xy_m": _nullable(xy),
@@ -255,6 +267,7 @@ def validate_result(value, *, support_object_ids, reference_frame_id):
         _pose(value["release_object_pose_xyz_quat_xyzw"], name="release_object_pose_xyz_quat_xyzw")
         _pose(value["held_object_pose_xyz_quat_xyzw"], name="held_object_pose_xyz_quat_xyzw")
         _finite(value["yaw_change_rad"], name="yaw_change_rad", low=-math.pi, high=math.pi)
+        _finite(value["release_lean_rad"], name="release_lean_rad", low=0., high=MAX_RELEASE_LEAN_RAD)
         _finite(value["support_top_z_m"], name="support_top_z_m")
         _xy(value["support_region_min_xy_m"], name="support_region_min_xy_m")
         _xy(value["support_region_max_xy_m"], name="support_region_max_xy_m")
@@ -270,7 +283,8 @@ def validate_result(value, *, support_object_ids, reference_frame_id):
     else:
         if (value["release_object_pose_xyz_quat_xyzw"] is not None
                 or value["selected_candidate_index"] is not None
-                or value["yaw_change_rad"] is not None):
+                or value["yaw_change_rad"] is not None
+                or value["release_lean_rad"] is not None):
             raise ValueError("A rejected release query cannot publish a release pose.")
         if value["held_object_pose_xyz_quat_xyzw"] is not None:
             _pose(value["held_object_pose_xyz_quat_xyzw"], name="held_object_pose_xyz_quat_xyzw")

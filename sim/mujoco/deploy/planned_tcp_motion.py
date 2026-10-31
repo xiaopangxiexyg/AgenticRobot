@@ -414,11 +414,15 @@ def _frozen_copy(value) -> np.ndarray:
 # a still-supported object into its support at every lift start.
 HELD_COMMAND_START_TOLERANCE_RAD = 0.005
 # Joint speed scale (acceleration scales with its square) for every plan that
-# carries a held object. At full speed a carry to the far part of a mat drove
-# the soft DMTAC pad contact on the cube from ~0.4 mm to 1.007 mm, past the
-# 1 mm hard-contact fault; a half-speed carry to the same far region of the
-# mat stayed below 0.1 mm.
-HELD_OBJECT_SPEED_SCALE = 0.5
+# carries a held object. The executed held object leaves its planned path by
+# more than the 2 mm planning reserve at half speed: replays of seven live
+# runs (planned path versus executed cube, same plan) consumed up to 3.7 mm of
+# planned clearance in lateral carries and 2.6 mm at the end of descents near
+# the arm's reach, and one carry over the box edge faulted at 1.992 mm against
+# the 2 mm clearance gate. The same calls at quarter speed consumed at most
+# 0.85 mm. Lifts and carries take about 40-60 % more wall time. (Full speed
+# had also driven the soft pad contact on the cube past the 1 mm hard limit.)
+HELD_OBJECT_SPEED_SCALE = 0.25
 # A held-object endpoint must leave room for the payload sag inside the
 # Route's terminal tolerance (3 mm, 2 deg), which endpoints were otherwise
 # accepted at: the terminal check compares the measured pose with the
