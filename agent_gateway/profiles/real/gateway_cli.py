@@ -234,6 +234,10 @@ def build_parser() -> argparse.ArgumentParser:
               "limits and consecutive reader errors still trip in both modes."))
     parser.add_argument("--safe-motion-observed-clearance-m", type=float,
         help="explicit observed-cloud clearance for safe TCP only; default inherits fixed-scene margin; no contact exemption")
+    parser.add_argument("--table-hand-clearance-m", type=float, default=None,
+        help="clearance between the hand assembly (gripper, wrist cameras, a carried object) and the fixed CAD "
+             "table only (m, 0-0.02; contact stays blocked); default keeps the 0.02 m fixed-scene margin; "
+             "requires an RM65-6F --collision-scene-profile")
     parser.add_argument("--safe-motion-debug-dir", type=Path,
         help="existing private directory for exact RGB-D, filtered points and safe-move rejection evidence; opt-in, no extra captures")
     parser.add_argument("--enable-spatial-goals", action=argparse.BooleanOptionalAction,
@@ -1199,6 +1203,13 @@ def main(argv: list[str] | None = None) -> int:
             parser.error(f"invalid tool hover budget: {error}")
     if args.safe_motion_observed_clearance_m is not None and args.safe_motion_observation_roles is None:
         parser.error("--safe-motion-observed-clearance-m requires --safe-motion-observation-roles")
+    if args.table_hand_clearance_m is not None:
+        if args.collision_scene_profile not in RM65_6F_SCENE_PROFILES:
+            # The standard RM65 model is 17.2 mm short of the 6F gripper: a smaller
+            # modelled table clearance would put the real fingers into the table.
+            parser.error("--table-hand-clearance-m requires an RM65-6F --collision-scene-profile")
+        if not math.isfinite(args.table_hand_clearance_m) or not 0.0 <= args.table_hand_clearance_m <= 0.02:
+            parser.error("--table-hand-clearance-m must be within [0, 0.02]")
     if args.enable_grasp_observation and (not args.enable_point_grasp or args.point_grasp_backend != "graspgenx"):
         parser.error("--enable-grasp-observation requires --enable-point-grasp and GraspGenX")
     if args.sam3_multi_instance_text and (
@@ -1588,6 +1599,7 @@ def main(argv: list[str] | None = None) -> int:
             trajectory_speed_profile=(args.grasp_trajectory_speed_profile),
             endpoint_candidate_ordering=(args.grasp_endpoint_candidate_ordering),
             endpoint_joint_limit_margin_rad=math.radians(args.grasp_endpoint_joint_limit_margin_deg),
+            table_hand_clearance_m=args.table_hand_clearance_m,
         ),
     )
 

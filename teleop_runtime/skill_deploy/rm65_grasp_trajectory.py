@@ -399,6 +399,12 @@ class RM65GraspTrajectoryPlanningConfig:
 
     pose_goal_policy: str = "within_arrival_tolerance"
     minimum_observed_clearance_m: float | None = None
+    # Optional clearance between the hand assembly (gripper proxies, wrist
+    # cameras, a carried object) and the fixed CAD table, replacing
+    # minimum_clearance_m for those pairs only; None keeps minimum_clearance_m.
+    # Every other pair (camera poles, the other arm, the elbow and the table)
+    # keeps minimum_clearance_m, and contact with the table stays blocked at 0.
+    table_hand_clearance_m: float | None = field(default=None, kw_only=True)
     # Optional inward margin (rad) from the RM65 software joint limits for IK
     # endpoints and their seeds. 0 keeps the historical full-range endpoints.
     # A small margin keeps a planned rest pose off the hard bound, so measured
@@ -435,6 +441,12 @@ class RM65GraspTrajectoryPlanningConfig:
                     or observed_clearance <= 0):
                 raise ValueError("minimum_observed_clearance_m must be finite and positive.")
             object.__setattr__(self, "minimum_observed_clearance_m", float(observed_clearance))
+        table_clearance = self.table_hand_clearance_m
+        if table_clearance is not None:
+            if (isinstance(table_clearance, bool) or not isinstance(table_clearance, (int, float))
+                    or not math.isfinite(table_clearance) or not 0.0 <= table_clearance <= self.minimum_clearance_m):
+                raise ValueError("table_hand_clearance_m must be finite within [0, minimum_clearance_m].")
+            object.__setattr__(self, "table_hand_clearance_m", float(table_clearance))
         joint_margin = self.endpoint_joint_limit_margin_rad
         if (isinstance(joint_margin, bool) or not isinstance(joint_margin, (int, float))
                 or not math.isfinite(joint_margin)
@@ -1025,6 +1037,9 @@ class RM65GraspJointTrajectoryPlanner:
             revision=1,
             obstacles=fixed_obstacles,
             minimum_clearance_m=self.config.minimum_clearance_m,
+            hand_minimum_clearance_m_by_obstacle_id=(
+                {} if self.config.table_hand_clearance_m is None
+                else {"fixed-scene:table": self.config.table_hand_clearance_m}),
         )
         # The reviewed IK profile's sparse pairs are authoritative for both
         # search and final path admission. This deliberately does not certify

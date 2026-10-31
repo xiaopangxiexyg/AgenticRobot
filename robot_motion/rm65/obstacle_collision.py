@@ -109,8 +109,51 @@ def _default_rm65_component_indices(
     )
 
 
+def _pair_clearances(collision_model: Any, *, scene: ObstacleSceneSnapshot,
+                     obstacle_geometry_ids: Mapping[int, str], hand_geometry_names: Sequence[str],
+                     fixed_geometry_obstacle_ids: Mapping[str, str] | None) -> tuple[np.ndarray, bool]:
+    """Required clearance of every collision pair, and whether any pair differs from the scene's."""
+    pair_count = len(collision_model.collisionPairs)
+    thresholds = np.full(pair_count, float(scene.minimum_clearance_m), dtype=float)
+    overrides = dict(scene.hand_minimum_clearance_m_by_obstacle_id)
+    if not overrides:
+        thresholds.setflags(write=False)
+        return thresholds, False
+    names = {str(geometry.name): index for index, geometry in enumerate(collision_model.geometryObjects)}
+    hand = tuple(dict.fromkeys(str(name) for name in hand_geometry_names))
+    if not hand:
+        raise ValueError("Hand clearance overrides require the hand-assembly geometry names.")
+    missing = tuple(name for name in hand if name not in names)
+    if missing:
+        raise ValueError(f"hand-assembly geometries do not exist: {missing}")
+    hand_ids = {names[name] for name in hand}
+    obstacle_by_geometry = {int(index): str(obstacle) for index, obstacle in obstacle_geometry_ids.items()}
+    known_obstacles = {obstacle.obstacle_id for obstacle in scene.obstacles}
+    for name, obstacle in dict(fixed_geometry_obstacle_ids or {}).items():
+        if str(obstacle) not in known_obstacles:
+            raise ValueError(f"fixed geometry {name!r} names an unknown obstacle {obstacle!r}.")
+        if str(name) in names:
+            obstacle_by_geometry[names[str(name)]] = str(obstacle)
+    for index, pair in enumerate(collision_model.collisionPairs):
+        first, second = int(pair.first), int(pair.second)
+        for fixed, other in ((first, second), (second, first)):
+            obstacle = obstacle_by_geometry.get(fixed)
+            if obstacle in overrides and other in hand_ids:
+                thresholds[index] = overrides[obstacle]
+    thresholds.setflags(write=False)
+    return thresholds, bool(np.any(thresholds != float(scene.minimum_clearance_m)))
+
+
 class RM65ObstacleCollisionOracle:
-    """Full collision-model oracle augmented with immutable AABB obstacles."""
+    """Full collision-model oracle augmented with immutable AABB obstacles.
+
+    Every collision pair must stay strictly farther apart than its required
+    clearance: ``scene.minimum_clearance_m``, or for a pair between the hand
+    assembly (``hand_geometry_names``) and an obstacle listed in
+    ``scene.hand_minimum_clearance_m_by_obstacle_id`` that override. A fixed
+    URDF geometry that models the same obstacle (``fixed_geometry_obstacle_ids``,
+    geometry name to obstacle id) takes the same override.
+    """
 
     def __init__(
         self,
@@ -124,6 +167,8 @@ class RM65ObstacleCollisionOracle:
         expected_reference_frame_spec_hash: str | None = None,
         attached_box_proxies: Sequence[AttachedBoxCollisionProxy] = (),
         obstacle_moving_geometry_names: Sequence[str] | None = None,
+        hand_geometry_names: Sequence[str] = (),
+        fixed_geometry_obstacle_ids: Mapping[str, str] | None = None,
         stop_at_first_clearance_violation: bool = False,
         collision_scope: str = "full_pinocchio_collision_model",
         pin_module: Any | None = None,
@@ -285,14 +330,15 @@ class RM65ObstacleCollisionOracle:
             stop_at_first_clearance_violation
         )
         self._collision_scope = str(collision_scope)
+        self._scene = scene
+        self._pair_clearance_m, self._uses_pair_clearances = _pair_clearances(
+            collision_model, scene=scene, obstacle_geometry_ids=obstacle_ids,
+            hand_geometry_names=hand_geometry_names, fixed_geometry_obstacle_ids=fixed_geometry_obstacle_ids)
         self._collision_query_margin_m: float | None = None
         if self._stop_at_first_clearance_violation:
-            for request in self._collision_data.collisionRequests:
-                request.security_margin = float(scene.minimum_clearance_m)
-            self._collision_query_margin_m = float(scene.minimum_clearance_m)
+            self._set_query_margins(self._collision_data, 0.0)
         self._reference_full_q = reference.copy()
         self._indices = MappingProxyType(index_map)
-        self._scene = scene
         self._obstacle_ids = MappingProxyType(obstacle_ids)
         self._base_geometry_count = base_geometry_count
         self._attached_proxy_geometry_count = attached_proxy_geometry_count
@@ -334,9 +380,7 @@ class RM65ObstacleCollisionOracle:
         request._collision_data = self._pin.GeometryData(self._collision_model)
         request._collision_query_margin_m = None
         if self._stop_at_first_clearance_violation:
-            for query in request._collision_data.collisionRequests:
-                query.security_margin = float(self._scene.minimum_clearance_m)
-            request._collision_query_margin_m = float(self._scene.minimum_clearance_m)
+            request._set_query_margins(request._collision_data, 0.0)
         request._check_cache = {}
         request._clearance_check_cache = {}
         request._search_check_cache = {}
@@ -355,6 +399,8 @@ class RM65ObstacleCollisionOracle:
         expected_reference_frame_spec_hash: str | None = None,
         attached_box_proxies: Sequence[AttachedBoxCollisionProxy] = (),
         obstacle_moving_geometry_names: Sequence[str] | None = None,
+        hand_geometry_names: Sequence[str] = (),
+        fixed_geometry_obstacle_ids: Mapping[str, str] | None = None,
         stop_at_first_clearance_violation: bool = False,
         collision_scope: str = "full_pinocchio_collision_model",
     ) -> RM65ObstacleCollisionOracle:
@@ -396,6 +442,8 @@ class RM65ObstacleCollisionOracle:
             expected_reference_frame_spec_hash=expected_reference_frame_spec_hash,
             attached_box_proxies=attached_box_proxies,
             obstacle_moving_geometry_names=obstacle_moving_geometry_names,
+            hand_geometry_names=hand_geometry_names,
+            fixed_geometry_obstacle_ids=fixed_geometry_obstacle_ids,
             stop_at_first_clearance_violation=(
                 stop_at_first_clearance_violation
             ),
@@ -440,7 +488,10 @@ class RM65ObstacleCollisionOracle:
                 reason="observed_obstacle_collision_check_unavailable", metadata={"error": str(error)})
         safe = distance >= self._observed_minimum_clearance_m
         closest = {}
-        if nearest is not None and (result.minimum_distance_m is None or distance < result.minimum_distance_m):
+        # Name the voxels when they block: a nearer fixed pair can be safe
+        # under a smaller per-pair clearance (or a larger observed clearance).
+        if nearest is not None and (not safe or result.minimum_distance_m is None
+                                    or distance < result.minimum_distance_m):
             closest = {"closest_geometry_names": (nearest["geometry_name"], "observed_voxels"),
                        "closest_obstacle_id": "observed-rgbd:" + cloud.semantic_content_hash}
         return replace(result, safe=safe, reason=result.reason if safe else "observed_obstacle_clearance_blocked",
@@ -527,14 +578,15 @@ class RM65ObstacleCollisionOracle:
         if not np.isfinite(distances).all():
             return JointConfigurationCheck(safe=False, collision_check_available=False,
                 reason="rigid_endpoint_distance_invalid", metadata=metadata)
-        closest = int(np.argmin(distances))
+        margins = np.asarray(distances) - self._pair_clearance_m[list(pairs)]
+        closest = int(np.argmin(margins))
         pair = self._collision_model.collisionPairs[pairs[closest]]
         distance = distances[closest]
-        return JointConfigurationCheck(safe=distance > self._scene.minimum_clearance_m,
+        return JointConfigurationCheck(safe=bool(margins[closest] > 0.0),
             collision_check_available=True, reason="advisory_rigid_endpoint_clearance",
             minimum_distance_m=distance, metadata={**metadata,
                 "rigid_geometry_count": len(rigid), "queried_pair_count": len(pairs),
-                "minimum_clearance_m": self._scene.minimum_clearance_m,
+                "minimum_clearance_m": float(self._pair_clearance_m[pairs[closest]]),
                 "closest_geometry_names": tuple(str(self._collision_model.geometryObjects[i].name)
                     for i in (int(pair.first), int(pair.second)))})
 
@@ -687,8 +739,9 @@ class RM65ObstacleCollisionOracle:
             guard = self._check_embedded_early_exit(
                 full_q, pair_count=pair_count, clearance_m=margin,
             )
+            guard_margin = float(guard.metadata.get("query_margin_m", margin))
             if guard.collision_check_available and (
-                not guard.safe or guard.minimum_distance_m <= margin
+                not guard.safe or guard.minimum_distance_m <= guard_margin
             ):
                 # The 20--30 mm band remains safe but must refine normally.
                 guard = (
@@ -753,6 +806,8 @@ class RM65ObstacleCollisionOracle:
                 reason="collision_distance_invalid",
                 metadata=metadata,
             )
+        if self._uses_pair_clearances:
+            return self._pair_clearance_check(distances, pair_indices=pair_indices, metadata=metadata)
         if pair_indices is None:
             closest_index = int(np.argmin(distances))
         else:
@@ -779,6 +834,46 @@ class RM65ObstacleCollisionOracle:
             },
         )
 
+    def _set_query_margins(self, collision_data: Any, offset_m: float) -> None:
+        """Security margin of every pair: its required clearance plus ``offset_m``."""
+        margins = self._pair_clearance_m + float(offset_m)
+        for request, margin in zip(collision_data.collisionRequests, margins, strict=True):
+            request.security_margin = float(margin)
+        self._collision_query_margin_m = float(offset_m)
+
+    def _pair_clearance_check(self, distances: np.ndarray, *, pair_indices: tuple[int, ...] | None,
+                              metadata: Mapping[str, Any]) -> JointConfigurationCheck:
+        """Exact check against per-pair clearances.
+
+        Reports contact first (the deepest), otherwise the pair closest to its
+        own clearance. ``adaptive_edge_distance_m`` expresses that margin on the
+        scene-clearance scale, so path refinement triggers as for uniform scenes.
+        """
+        indices = np.arange(distances.size) if pair_indices is None else np.asarray(pair_indices, dtype=int)
+        subset = distances[indices]
+        margins = subset - self._pair_clearance_m[indices]
+        contact = subset <= 0.0
+        local = int(np.argmin(subset)) if np.any(contact) else int(np.argmin(margins))
+        closest_index = int(indices[local])
+        closest_pair = self._collision_model.collisionPairs[closest_index]
+        first_id, second_id = int(closest_pair.first), int(closest_pair.second)
+        # Contact at exactly the requested clearance is blocked, also at a zero clearance.
+        safe = bool(np.all(margins > 0.0))
+        return JointConfigurationCheck(
+            safe=safe,
+            collision_check_available=True,
+            reason="collision_clearance_satisfied" if safe else "collision_clearance_violated",
+            minimum_distance_m=float(distances[closest_index]),
+            metadata={
+                **metadata,
+                "closest_geometry_names": (str(self._collision_model.geometryObjects[first_id].name),
+                                           str(self._collision_model.geometryObjects[second_id].name)),
+                "closest_obstacle_id": self._obstacle_ids.get(first_id, self._obstacle_ids.get(second_id)),
+                "closest_pair_clearance_m": float(self._pair_clearance_m[closest_index]),
+                "adaptive_edge_distance_m": max(0.0, float(margins.min()) + float(self._scene.minimum_clearance_m)),
+            },
+        )
+
     def _check_embedded_early_exit(
         self,
         full_q: np.ndarray,
@@ -793,10 +888,9 @@ class RM65ObstacleCollisionOracle:
             "query_clearance_m": clearance_m,
         }
         try:
-            if self._collision_query_margin_m != clearance_m:
-                for request in self._collision_data.collisionRequests:
-                    request.security_margin = float(clearance_m)
-                self._collision_query_margin_m = float(clearance_m)
+            offset = float(clearance_m) - float(self._scene.minimum_clearance_m)
+            if self._collision_query_margin_m != offset:
+                self._set_query_margins(self._collision_data, offset)
             blocked = bool(
                 self._pin.computeCollisions(
                     self._model,
@@ -862,7 +956,9 @@ class RM65ObstacleCollisionOracle:
         first_id = int(pair.first)
         second_id = int(pair.second)
         result = collision_results[result_index]
-        minimum_distance = float(result.distance_lower_bound) + float(clearance_m)
+        # Lower bounds are relative to each pair's own security margin.
+        query_margin = float(self._pair_clearance_m[result_index]) + offset
+        minimum_distance = float(result.distance_lower_bound) + query_margin
         return JointConfigurationCheck(
             safe=not blocked,
             collision_check_available=True,
@@ -883,6 +979,7 @@ class RM65ObstacleCollisionOracle:
                 "closest_obstacle_id": self._obstacle_ids.get(
                     first_id, self._obstacle_ids.get(second_id)
                 ),
+                **({"query_margin_m": query_margin} if self._uses_pair_clearances else {}),
             },
         )
 
@@ -923,6 +1020,10 @@ class RM65ObstacleCollisionOracle:
             ),
             "collision_pair_count": int(pair_count),
             "minimum_clearance_m": self._scene.minimum_clearance_m,
+            **({"hand_minimum_clearance_m_by_obstacle_id": dict(self._scene.hand_minimum_clearance_m_by_obstacle_id),
+                "hand_clearance_pair_count": int(np.count_nonzero(
+                    self._pair_clearance_m != self._scene.minimum_clearance_m))}
+               if self._uses_pair_clearances else {}),
         }
 
 
@@ -930,11 +1031,18 @@ class RM65StartClearanceProgress:
     """Ordered dense-path proof for inherited active collision pairs."""
 
     def __init__(self, *, pair_indices: tuple[int | str, ...], initial_distances: tuple[float, ...],
-                 ordinary_clearance_m: float, tolerance_m: float, allow_start_contact: bool = False):
+                 ordinary_clearance_m: float | tuple[float, ...], tolerance_m: float,
+                 allow_start_contact: bool = False):
         self.pair_indices = pair_indices
         self.previous = list(initial_distances)
         self.exited = [False] * len(pair_indices)
+        # One clearance for every pair, or one per pair (hand clearance overrides).
         self.ordinary_clearance_m = ordinary_clearance_m
+        self._clearances = (tuple(float(value) for value in ordinary_clearance_m)
+                            if isinstance(ordinary_clearance_m, tuple)
+                            else (float(ordinary_clearance_m),) * len(pair_indices))
+        if len(self._clearances) != len(pair_indices):
+            raise ValueError("Per-pair ordinary clearances must match the inherited pairs.")
         self.tolerance_m = tolerance_m
         # Explicit ignore-start mode: a pair that starts in contact may stay in
         # contact while it does not get worse; once exited it may not return.
@@ -945,9 +1053,10 @@ class RM65StartClearanceProgress:
             return {"reason": "inherited_start_clearance_distance_count_changed"}
         for index, distance in enumerate(distances):
             previous = self.previous[index]
+            clearance = self._clearances[index]
             contact = distance <= 0.0 and not (self.allow_start_contact and not self.exited[index])
             if (not np.isfinite(distance) or contact
-                    or (self.exited[index] and distance <= self.ordinary_clearance_m)
+                    or (self.exited[index] and distance <= clearance)
                     or (not self.exited[index] and distance < previous - self.tolerance_m)):
                 return {"reason": "inherited_start_clearance_regressed",
                     "inherited_pair_index": self.pair_indices[index],
@@ -955,7 +1064,7 @@ class RM65StartClearanceProgress:
             # Compare to the high-water mark. A per-step tolerance must not
             # accumulate into a centimetre-scale retreat over many samples.
             self.previous[index] = max(previous, distance)
-            if distance > self.ordinary_clearance_m:
+            if distance > clearance:
                 self.exited[index] = True
         return None
 
@@ -1006,7 +1115,9 @@ class RM65InheritedStartClearanceOracle:
                           for part in (int(pair.first), int(pair.second)))
             raise RM65InheritedStartBlocked(source="fixed_scene",
                 distance_m=float(self._baseline[index]), geometry_name=" / ".join(names))
-        self._inherited = tuple(int(index) for index in np.flatnonzero(self._baseline <= self._margin))
+        # Per-pair clearances (a hand clearance override may differ from the scene margin).
+        self._thresholds = np.asarray(source._pair_clearance_m, dtype=float)
+        self._inherited = tuple(int(index) for index in np.flatnonzero(self._baseline <= self._thresholds))
         active_indices = set(source._indices[active_component])
 
         def affected(geometry_id: int) -> bool:
@@ -1097,7 +1208,8 @@ class RM65InheritedStartClearanceOracle:
             pair_indices=self.active_inherited_pairs,
             initial_distances=tuple(float(self._baseline[index])
                 for index in self.active_inherited_pairs),
-            ordinary_clearance_m=self._margin,
+            ordinary_clearance_m=tuple(float(self._thresholds[index])
+                for index in self.active_inherited_pairs),
             tolerance_m=self._DISTANCE_TOLERANCE_M,
             allow_start_contact=self.allow_start_contact)
 
@@ -1121,7 +1233,7 @@ class RM65InheritedStartClearanceOracle:
             return JointConfigurationCheck(safe=False, collision_check_available=False,
                 reason="inherited_clearance_collision_check_unavailable",
                 metadata={"exception_type": type(error).__name__})
-        thresholds = np.full(len(distances), self._margin, dtype=float)
+        thresholds = self._thresholds.copy()
         inherited_floor = self._baseline[list(self._inherited)] - self._DISTANCE_TOLERANCE_M
         thresholds[list(self._inherited)] = (inherited_floor if self.allow_start_contact
                                              else np.maximum(0.0, inherited_floor))
@@ -1246,6 +1358,14 @@ def build_rm65_profile_obstacle_collision_oracle(
         if validate_model_resources is not None:
             raise ValueError("Resource validation requires an explicit model content hash.")
         bundle = _profile_collision_solver_bundle(str(scene_profile))
+    profile = bundle.scene_profile
+    # The hand assembly: gripper proxies (not the link3 elbow proxies) and every
+    # attached box (wrist cameras, a carried object).
+    hand_geometry_names = (
+        *(box.geometry_name for box in profile.hand_proxy_boxes
+          if box.geometry_name.startswith(("left_hand_proxy_", "right_hand_proxy_"))),
+        *(proxy.geometry_name for proxy in attached_box_proxies),
+    )
     return RM65ObstacleCollisionOracle.from_solver(
         bundle.solver,
         scene=scene,
@@ -1261,6 +1381,9 @@ def build_rm65_profile_obstacle_collision_oracle(
             if use_profile_proxy_geometry
             else None
         ),
+        hand_geometry_names=hand_geometry_names if scene.hand_minimum_clearance_m_by_obstacle_id else (),
+        fixed_geometry_obstacle_ids={box.geometry_name: f"fixed-scene:{box.name}"
+                                     for box in profile.fixed_scene_boxes},
         stop_at_first_clearance_violation=stop_at_first_clearance_violation,
         collision_scope=(
             "profile_sparse_proxy_pairs"
