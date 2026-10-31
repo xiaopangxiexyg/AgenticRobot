@@ -92,6 +92,18 @@ core and MuJoCo adapter used for the 20260721 fit; tests compare those hashes to
 fixed historical values rather than silently reinterpreting the fit against
 the current files.
 
+真机持物放置位姿查询 `perception.query_support_release_pose@2` 使用独立绑定
+`artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261101_real_support_release_v1.json`。它固定于合并提交
+`b9091bf5e`（基线 `be42c02d9` 即真机 RM65-6F 绑定提交，+ 任务分支 `47cb84014`），保留前一绑定（RM65-6F）的全部非运行时引用；
+196 项已有运行时输入中 7 项改变（真机 Gateway CLI、组合、会话、工厂、primitive profile、物体运动和工具实体的增量接线），
+新增 2 项（真机查询模块和 v2 契约），合计 198 项。行为变化只在显式选择时生效：`--support-release-prompt SUPPORT_ID=PROMPT`
+（可重复）并且部署了物体运动、RM65-6F 场景 profile 和 registry v5 时才发布这个只读查询。它要求一次抬起后保留的已验证抓握，
+按真机深度容差（残差 6 mm、倾斜 5°、4 mm 网格，点数最多的 4 mm 高度带作平面种子）认证支撑面顶部矩形，返回 pre-place 位姿
+（phase=carry）和放置位姿（phase=place，物体底部离支撑面 0.5–1.5 cm），两段都用部署的载荷规划器检查；先在每个矩形上检查持物
+yaw，再检查转 yaw，最后检查倾斜。它不派发运动。MuJoCo 的 v1 查询不变。离线证据按内容哈希记录：1278 项关联测试（当前绑定测试在
+本绑定前排除）、34 个保存的真机场景上的支撑面认证和合成持物查询报告，以及支撑面提示词调查。绑定仍为 `provisional`，没有新增真机运动执行或
+held-out 资格。
+
 真机 RM65-6F 运动与 Station 模型、相机 registry v5、D435 深度修正和可选的手部—桌面净空使用独立绑定
 `artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261031_real_rm65_6f_v1.json`。它固定于合并提交
 `790182d3a`（基线 `eed84fb8f` 即真机持物绑定提交，+ 任务分支 `66d06523b`），保留前一绑定（真机持物本臂腕部测量）的全部非运行时引用；

@@ -1,0 +1,3056 @@
+{
+  "schema_version": "dexteleop.sim.real2sim_artifact.v1",
+  "name": "rm65_arm_free_motion_20260721_v4_runtime_binding_20261101_real_support_release_v1",
+  "simulation_contract": {
+    "artifact_id": "rm65-bimanual-physics-runtime-20261101-real-support-release-v1",
+    "artifact_kind": "simulation_contract",
+    "sha256": "dbf0cd77b5e8ffbd0f7951f9a4ae10c6c25757e6f32657e16f1fe14cf100938d",
+    "locator": "sim/configs/rm65_bimanual_physics_v1.json"
+  },
+  "resolved_timing": {
+    "sample_hz": 15.0,
+    "policy_hz": 15.0,
+    "reference_hz": 60.0,
+    "ik_hz": 60.0,
+    "command_hz": 120.0,
+    "physics_hz": 1000.0,
+    "camera_hz": 30.0,
+    "interpolation": "timestamp_linear",
+    "command_hold": "zero_order_hold_between_command_ticks",
+    "parameter_source": "project_default_pending_real_system_id"
+  },
+  "dependency_artifacts": [
+    {
+      "artifact_id": "rm65-arm-free-motion-fit-20260721-v4",
+      "artifact_kind": "real2sim_fit_artifact",
+      "sha256": "89d72aed454bdc309959f7489486eb5ef3eae13d688be444efd849b637d6bd53",
+      "locator": "sim/rm65/real2sim/artifacts/rm65_arm_free_motion_20260721_v4.json"
+    },
+    {
+      "artifact_id": "rm65-arm-runtime-binding-20260922-v5",
+      "artifact_kind": "real2sim_runtime_binding",
+      "sha256": "4a0d1d520864138bc1cef41347cf3fe43ec4a3f511710fdc2b77404c342768d8",
+      "locator": "sim/rm65/real2sim/artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20260922_v5.json"
+    },
+    {
+      "artifact_id": "rm65-arm-runtime-binding-20261017-v7",
+      "artifact_kind": "real2sim_runtime_binding",
+      "sha256": "1ce52c5c3cbd0a95e999efead5fa00ca2c8098b75eb76bfc896ad503b26dbbe7",
+      "locator": "sim/rm65/real2sim/artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261017_v7.json"
+    },
+    {
+      "artifact_id": "rm65-arm-runtime-binding-20261018-v8",
+      "artifact_kind": "real2sim_runtime_binding",
+      "sha256": "48ee5ff7dc5b54c7d98e3ae2cb7b7707237a40dab742e10a473d771b8b7fea68",
+      "locator": "sim/rm65/real2sim/artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261018_v8.json"
+    },
+    {
+      "artifact_id": "rm65-arm-runtime-binding-20261022-v9",
+      "artifact_kind": "real2sim_runtime_binding",
+      "sha256": "092b48c008aba04d647ff2fa8da5677f2dde18529a6db26dc4330053c8f71f43",
+      "locator": "sim/rm65/real2sim/artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261022_v9.json"
+    },
+    {
+      "artifact_id": "rm65-arm-runtime-binding-20261023-v10",
+      "artifact_kind": "real2sim_runtime_binding",
+      "sha256": "5538d158d25ee13bb7e81e515e1aff4e709c2534c38c79fe94dde81338e4841c",
+      "locator": "sim/rm65/real2sim/artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261023_v10.json"
+    },
+    {
+      "artifact_id": "rm65-arm-runtime-binding-20261023-v12",
+      "artifact_kind": "real2sim_runtime_binding",
+      "sha256": "eb186b84b763e95aa9007bec06938f743f3c9d96f299635aa8a1b9deb25749cf",
+      "locator": "sim/rm65/real2sim/artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261023_v12.json"
+    },
+    {
+      "artifact_id": "rm65-arm-runtime-binding-20261023-v13",
+      "artifact_kind": "real2sim_runtime_binding",
+      "sha256": "17823a6795c15a7ebf72ec214fcfa3bddd90fb8e16fc74d3d89e5bb80df49195",
+      "locator": "sim/rm65/real2sim/artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261023_v13.json"
+    },
+    {
+      "artifact_id": "rm65-arm-runtime-binding-20261023-v14",
+      "artifact_kind": "real2sim_runtime_binding",
+      "sha256": "edbe370d312a8a9ddb468c709e9fdab385e3dd632210e601c5bb60164ae7bc67",
+      "locator": "sim/rm65/real2sim/artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261023_v14.json"
+    },
+    {
+      "artifact_id": "rm65-arm-runtime-binding-20261024-v15",
+      "artifact_kind": "real2sim_runtime_binding",
+      "sha256": "d1bdc45d9b97cae9b751c178c43d0479614dc11c4a1ce00ef8e6bc93a19583f5",
+      "locator": "sim/rm65/real2sim/artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261024_v15.json"
+    },
+    {
+      "artifact_id": "rm65-arm-runtime-binding-20261025-v16",
+      "artifact_kind": "real2sim_runtime_binding",
+      "sha256": "bdce9be991355646e0044f8ba1044c1f5c2d26a479bfa187d2f884ae65f3b8d1",
+      "locator": "sim/rm65/real2sim/artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261025_v16.json"
+    },
+    {
+      "artifact_id": "rm65-arm-runtime-binding-20261025-v17",
+      "artifact_kind": "real2sim_runtime_binding",
+      "sha256": "28bb9dcccf33fe31240e97357202f21592da80046dcec4840bd29c183b1a8697",
+      "locator": "sim/rm65/real2sim/artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261025_v17.json"
+    },
+    {
+      "artifact_id": "rm65-arm-runtime-binding-20261025-v18",
+      "artifact_kind": "real2sim_runtime_binding",
+      "sha256": "486f5e8ddf1ea043919a1d260003b872b13b3f23fa5d93188aede09ea244381b",
+      "locator": "sim/rm65/real2sim/artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261025_v18.json"
+    },
+    {
+      "artifact_id": "rm65-arm-runtime-binding-20261025-v19",
+      "artifact_kind": "real2sim_runtime_binding",
+      "sha256": "2006daae911cd81a64b073fa0b766c8daf92feced8088d2a4b9a0db96c4e718d",
+      "locator": "sim/rm65/real2sim/artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261025_v19.json"
+    },
+    {
+      "artifact_id": "rm65-arm-runtime-binding-20261025-v20",
+      "artifact_kind": "real2sim_runtime_binding",
+      "sha256": "1eb876c2a58425e23f49cd727a4d40bcf51cfd09d21138a3133ba4d3396f9417",
+      "locator": "sim/rm65/real2sim/artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261025_v20.json"
+    },
+    {
+      "artifact_id": "rm65-arm-runtime-binding-20261025-v21",
+      "artifact_kind": "real2sim_runtime_binding",
+      "sha256": "b08732bb1948a3f5592e20fe9353a78851850c51fd987373ad3252495252785b",
+      "locator": "sim/rm65/real2sim/artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261025_v21.json"
+    },
+    {
+      "artifact_id": "rm65-arm-runtime-binding-20261025-v22",
+      "artifact_kind": "real2sim_runtime_binding",
+      "sha256": "dfb07cb6f0159796e677ea03fa2783e6d372a54490502c75612112cc5c249fd4",
+      "locator": "sim/rm65/real2sim/artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261025_v22.json"
+    },
+    {
+      "artifact_id": "rm65-arm-runtime-binding-20261025-v23",
+      "artifact_kind": "real2sim_runtime_binding",
+      "sha256": "3044ac2565ee102e5f594c91c90213847c64aa4298dc297739f32ea7d83faff1",
+      "locator": "sim/rm65/real2sim/artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261025_v23.json"
+    },
+    {
+      "artifact_id": "rm65-arm-runtime-binding-20261025-v24",
+      "artifact_kind": "real2sim_runtime_binding",
+      "sha256": "475e7e045be44493b9ca6d35793ee1240b5b47a249a33181b77c6ff694475101",
+      "locator": "sim/rm65/real2sim/artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261025_v24.json"
+    },
+    {
+      "artifact_id": "rm65-arm-runtime-binding-20261026-v25",
+      "artifact_kind": "real2sim_runtime_binding",
+      "sha256": "6b9eae23fb2e84c1b4c9d58c6fb14a7ec4f8c07035ff4f7066766894f1340c1d",
+      "locator": "sim/rm65/real2sim/artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261026_v25.json"
+    },
+    {
+      "artifact_id": "rm65-arm-runtime-binding-checkpoint-observer-20261026-v1",
+      "artifact_kind": "real2sim_runtime_binding",
+      "sha256": "ed75ba721879cc066138002595c6c754141abfcf16a7ccaf6ee293a6084a67c4",
+      "locator": "sim/rm65/real2sim/artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261026_checkpoint_observer_v1.json"
+    },
+    {
+      "artifact_id": "checkpoint-integration-consumer-validation-20261026-checkpoint-integration-v1",
+      "artifact_kind": "offline_validation_report",
+      "sha256": "9d36a79ed11c82d65e55a329249b5b7f87dd3574911694bdba3329ff3b64a80d",
+      "locator": "artifact://checkpoint-integration-consumer-validation-20261026-checkpoint-integration-v1"
+    },
+    {
+      "artifact_id": "checkpoint-integration-source-binding-20261026-checkpoint-integration-v1",
+      "artifact_kind": "offline_validation_binding",
+      "sha256": "4866f303f483d5100624795bbc2204f62fd029b03818b3a68e0370100d77d0b4",
+      "locator": "artifact://checkpoint-integration-source-binding-20261026-checkpoint-integration-v1"
+    },
+    {
+      "artifact_id": "rm65-arm-runtime-binding-checkpoint-integration-20261026-v1",
+      "artifact_kind": "real2sim_runtime_binding",
+      "sha256": "8e30199e20433a163ef1b4ec8d337ec6daa5c7324cd26752842f8472ed1d5032",
+      "locator": "sim/rm65/real2sim/artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261026_checkpoint_integration_v1.json"
+    },
+    {
+      "artifact_id": "readonly-defaults-consumer-report-20261027-readonly-defaults-v1",
+      "artifact_kind": "offline_validation_report",
+      "sha256": "2466618ed98732d4be629477617835a4b18375ffe9a178e8ef59a7512e564848",
+      "locator": "artifact://readonly-defaults-consumer-report-20261027-readonly-defaults-v1"
+    },
+    {
+      "artifact_id": "readonly-defaults-consumer-binding-20261027-readonly-defaults-v1",
+      "artifact_kind": "offline_validation_report",
+      "sha256": "e1ce849c949f626e0d5f5fd0e1a3c3c24a71999631976bba7031fed27b14b2fd",
+      "locator": "artifact://readonly-defaults-consumer-binding-20261027-readonly-defaults-v1"
+    },
+    {
+      "artifact_id": "rm65-arm-runtime-binding-readonly-defaults-20261027-v1",
+      "artifact_kind": "real2sim_runtime_binding",
+      "sha256": "2e050d85c5f2f34fa72e655dbfa2cf4ec39b4710d2ab14004a205680e32cd523",
+      "locator": "sim/rm65/real2sim/artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261027_readonly_defaults_v1.json"
+    },
+    {
+      "artifact_id": "sam3-default-consumer-report-20261027-sam3-default-v1",
+      "artifact_kind": "offline_validation_report",
+      "sha256": "d4851c0b1870ceace39f06b37ac5c924efff0ccf359ab29ddaee7edccc58b02c",
+      "locator": "artifact://sam3-default-consumer-report-20261027-sam3-default-v1"
+    },
+    {
+      "artifact_id": "sam3-default-consumer-binding-20261027-sam3-default-v1",
+      "artifact_kind": "offline_validation_report",
+      "sha256": "6ecf759f848c679ebcb706dcaf9b7b47200cacda6f926750ce588144258338b9",
+      "locator": "artifact://sam3-default-consumer-binding-20261027-sam3-default-v1"
+    },
+    {
+      "artifact_id": "rm65-arm-runtime-binding-sam3-default-20261027-v1",
+      "artifact_kind": "real2sim_runtime_binding",
+      "sha256": "1fcd40b52c7cba40e62f5ad1c3d3f9442376b0ffc720769d6ea3b7e00475580e",
+      "locator": "sim/rm65/real2sim/artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261027_sam3_default_v1.json"
+    },
+    {
+      "artifact_id": "motion-gripper-source-consumer-report-20261027-motion-gripper-v1",
+      "artifact_kind": "offline_validation_report",
+      "sha256": "94fc1ebbd943550b85c5b5d05da8b05f43e8fa84123d94395bb3e6ad82db153f",
+      "locator": "artifact://motion-gripper-source-consumer-report-20261027-motion-gripper-v1"
+    },
+    {
+      "artifact_id": "motion-gripper-source-consumer-binding-20261027-motion-gripper-v1",
+      "artifact_kind": "offline_validation_report",
+      "sha256": "16a55f3499f8bb7feff7f11d95557ea436e226fb8184c8c90ec8aa1aa5f1d9c3",
+      "locator": "artifact://motion-gripper-source-consumer-binding-20261027-motion-gripper-v1"
+    },
+    {
+      "artifact_id": "rm65-arm-runtime-binding-motion-gripper-20261027-v1",
+      "artifact_kind": "real2sim_runtime_binding",
+      "sha256": "780e43c74196bb8e44a6a23fd98a0f0d6400e9057a414d0e02ca518841be7966",
+      "locator": "sim/rm65/real2sim/artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261027_motion_gripper_v1.json"
+    },
+    {
+      "artifact_id": "sam3-candidates-source-consumer-report-20261028-sam3-candidates-v1",
+      "artifact_kind": "offline_validation_report",
+      "sha256": "422b228d067f107d6b0d77d69b9bcf30af3e409616e10a9451a5143daa1db4b8",
+      "locator": "artifact://sam3-candidates-source-consumer-report-20261028-sam3-candidates-v1"
+    },
+    {
+      "artifact_id": "sam3-candidates-source-consumer-binding-20261028-sam3-candidates-v1",
+      "artifact_kind": "offline_validation_report",
+      "sha256": "a4bbf3d35cafd0ef9bdb945e89a6558ef14f646eae28354e38edaf8ba620e15d",
+      "locator": "artifact://sam3-candidates-source-consumer-binding-20261028-sam3-candidates-v1"
+    },
+    {
+      "artifact_id": "rm65-arm-runtime-binding-sam3-candidates-20261028-v1",
+      "artifact_kind": "real2sim_runtime_binding",
+      "sha256": "63b0ea27ad8614fd3dde48964c1b574150e52b73fdf7fe416db87e896704366d",
+      "locator": "sim/rm65/real2sim/artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261028_sam3_candidates_v1.json"
+    },
+    {
+      "artifact_id": "sam3-placement-source-consumer-report-20261028-sam3-placement-v1",
+      "artifact_kind": "offline_validation_report",
+      "sha256": "e7c2f19f90da42da568ce5667d4c4f75554637e9c83dd63958a24aca71acc1bd",
+      "locator": "artifact://sam3-placement-source-consumer-report-20261028-sam3-placement-v1"
+    },
+    {
+      "artifact_id": "sam3-placement-source-consumer-binding-20261028-sam3-placement-v1",
+      "artifact_kind": "offline_validation_report",
+      "sha256": "703750885f9a368e1a803a4d3624267b6196eadf5c7b3cc0bb44b5da51bdda05",
+      "locator": "artifact://sam3-placement-source-consumer-binding-20261028-sam3-placement-v1"
+    },
+    {
+      "artifact_id": "rm65-arm-runtime-binding-sam3-placement-20261028-v1",
+      "artifact_kind": "real2sim_runtime_binding",
+      "sha256": "fa5b47717090f98cd963d23dafe220625b4a94e70d79d0e99cc94bc891335049",
+      "locator": "sim/rm65/real2sim/artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261028_sam3_placement_v1.json"
+    },
+    {
+      "artifact_id": "agent-proposal-cut-source-consumer-report-20261028-agent-proposal-cut-v1",
+      "artifact_kind": "offline_validation_report",
+      "sha256": "da77476444daa176b5411d7d1ce636a45d8d37a502e9edec1e3fc304ad3daf5f",
+      "locator": "artifact://agent-proposal-cut-source-consumer-report-20261028-agent-proposal-cut-v1"
+    },
+    {
+      "artifact_id": "agent-proposal-cut-source-consumer-binding-20261028-agent-proposal-cut-v1",
+      "artifact_kind": "offline_validation_report",
+      "sha256": "34e0d318bfb36d68e30fc4135194a3f3c521d9a21aac69574b8a3ba2f462769f",
+      "locator": "artifact://agent-proposal-cut-source-consumer-binding-20261028-agent-proposal-cut-v1"
+    },
+    {
+      "artifact_id": "rm65-arm-runtime-binding-agent-proposal-cut-20261028-v1",
+      "artifact_kind": "real2sim_runtime_binding",
+      "sha256": "ef4e1473204ed99a2b17208b3e53279aa10ca7d8f9cfd8be2e21cfd05044b394",
+      "locator": "sim/rm65/real2sim/artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261028_agent_proposal_cut_v1.json"
+    },
+    {
+      "artifact_id": "named-release-source-consumer-report-20261028-named-release-v1",
+      "artifact_kind": "offline_validation_report",
+      "sha256": "62a2613926e21b72e6d668d975b785e1859297f5c8fc6d7aec4fa72fc3f57cb4",
+      "locator": "artifact://named-release-source-consumer-report-20261028-named-release-v1"
+    },
+    {
+      "artifact_id": "named-release-source-consumer-binding-20261028-named-release-v1",
+      "artifact_kind": "offline_validation_report",
+      "sha256": "08d751996f84a3b187f4c41fbbc0587b86ec36a76c7e6b951b80c2168a762c63",
+      "locator": "artifact://named-release-source-consumer-binding-20261028-named-release-v1"
+    },
+    {
+      "artifact_id": "rm65-arm-runtime-binding-named-release-20261028-v1",
+      "artifact_kind": "real2sim_runtime_binding",
+      "sha256": "76c5d691fbf2eee6ba6a5c26e9be3b469aa1763f38d043e97da11e9cb8bccd66",
+      "locator": "sim/rm65/real2sim/artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261028_named_release_v1.json"
+    },
+    {
+      "artifact_id": "real-observed-motion-source-consumer-report-20261028-real-observed-motion-v1",
+      "artifact_kind": "offline_validation_report",
+      "sha256": "252dda8154ce050fc2de9d05859342f035ca585b1bc04f68229f364bdc9218cd",
+      "locator": "artifact://real-observed-motion-source-consumer-report-20261028-real-observed-motion-v1"
+    },
+    {
+      "artifact_id": "real-observed-motion-source-consumer-binding-20261028-real-observed-motion-v1",
+      "artifact_kind": "offline_validation_report",
+      "sha256": "07205330078bd5fba8ffa829ff9e465e75e91aa52643ef61882b5aed3fbb8281",
+      "locator": "artifact://real-observed-motion-source-consumer-binding-20261028-real-observed-motion-v1"
+    },
+    {
+      "artifact_id": "rm65-arm-runtime-binding-real-observed-motion-20261028-v1",
+      "artifact_kind": "real2sim_runtime_binding",
+      "sha256": "a795f95e7d99d952c2277a7c55e66ed1ad95ca3509a77843968ff2131b9098df",
+      "locator": "sim/rm65/real2sim/artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261028_real_observed_motion_v1.json"
+    },
+    {
+      "artifact_id": "explicit-clearance-source-consumer-report-20261028-explicit-clearance-v1",
+      "artifact_kind": "offline_validation_report",
+      "sha256": "ef7282a6019d176030ccbd7f425383f595c54d81047714a89a411a0afce8a3c1",
+      "locator": "artifact://explicit-clearance-source-consumer-report-20261028-explicit-clearance-v1"
+    },
+    {
+      "artifact_id": "explicit-clearance-source-consumer-binding-20261028-explicit-clearance-v1",
+      "artifact_kind": "offline_validation_report",
+      "sha256": "386829d2229913d14eac7d2f2416bdab3e2257d26d610db5ec57673ab4169b67",
+      "locator": "artifact://explicit-clearance-source-consumer-binding-20261028-explicit-clearance-v1"
+    },
+    {
+      "artifact_id": "skill-region-query-offline-source-20261028-skill-region-checked-v2",
+      "artifact_kind": "offline_query_source",
+      "sha256": "c602f2037315d8c8b002319f5d778f2980dd899c2d760d0006c8db5eddaddfc1",
+      "locator": "scripts/probes/query_safe_move_snapshot.py"
+    },
+    {
+      "artifact_id": "rm65-arm-runtime-binding-explicit-clearance-20261028-v1",
+      "artifact_kind": "real2sim_runtime_binding",
+      "sha256": "7b55fba29f586b194529fa3c86ced30a44f6fff4f62243f1c2595baf28e698a7",
+      "locator": "sim/rm65/real2sim/artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261028_explicit_clearance_v1.json"
+    },
+    {
+      "artifact_id": "skill-region-core-report-20261028-skill-region-checked-v2",
+      "artifact_kind": "offline_validation_report",
+      "sha256": "112ea68158843001c3fcff48d5dc9cb1073c0b20ce5260739e1df60f47f27785",
+      "locator": "artifact://skill-region-core-report-20261028-skill-region-checked-v2"
+    },
+    {
+      "artifact_id": "skill-region-core-binding-20261028-skill-region-checked-v2",
+      "artifact_kind": "offline_validation_report",
+      "sha256": "b9d2c1b971843d38cdc7a2f91841b69f2e37cad63aaf1efbf4e537896f0fe1d4",
+      "locator": "artifact://skill-region-core-binding-20261028-skill-region-checked-v2"
+    },
+    {
+      "artifact_id": "skill-region-query-report-20261028-skill-region-checked-v2",
+      "artifact_kind": "offline_validation_report",
+      "sha256": "4335d7e8f5ce58ce0bd1550ecb9435fea1d1a3bdddf6caf76c07b61613f30d91",
+      "locator": "artifact://skill-region-query-report-20261028-skill-region-checked-v2"
+    },
+    {
+      "artifact_id": "skill-region-query-binding-20261028-skill-region-checked-v2",
+      "artifact_kind": "offline_validation_report",
+      "sha256": "3cabb7cf4035199c475dfc78fe86a14e969e07ba3a4abfbb99f8f5229f6e78c6",
+      "locator": "artifact://skill-region-query-binding-20261028-skill-region-checked-v2"
+    },
+    {
+      "artifact_id": "combined-query-input-0-20261029-skill-hover-visual-v1",
+      "artifact_kind": "offline_query_source",
+      "sha256": "7479273dbcbc1355aa24b0540b1c8053284fdbaa6df6ff313d59731a691401f7",
+      "locator": "scripts/probes/query_safe_move_snapshot.py"
+    },
+    {
+      "artifact_id": "combined-query-input-1-20261029-skill-hover-visual-v1",
+      "artifact_kind": "offline_query_source",
+      "sha256": "0ad28b8a539624d9077fc03dbc1dce203542ba7651160a16eeaf073c37a5cea8",
+      "locator": "robot_motion/tool_entity_goals.py"
+    },
+    {
+      "artifact_id": "combined-query-input-2-20261029-skill-hover-visual-v1",
+      "artifact_kind": "offline_query_source",
+      "sha256": "4c33f82dd6e431beecaf06b0035715c27fa5daa84e8b6c84f245f6b7d44922df",
+      "locator": "robot_motion/observed_obstacles.py"
+    },
+    {
+      "artifact_id": "combined-query-input-3-20261029-skill-hover-visual-v1",
+      "artifact_kind": "offline_query_source",
+      "sha256": "92db50a4b07e5df28e8a41eb80b1dfa28db99c4332fc44ce363cbc820126b205",
+      "locator": "robot_motion/grasp_visible_scene.py"
+    },
+    {
+      "artifact_id": "combined-query-input-4-20261029-skill-hover-visual-v1",
+      "artifact_kind": "offline_query_source",
+      "sha256": "d710bd09d893e9cda9b3b524bfe90dc0aeb9af370b267b542cbf1c890615274e",
+      "locator": "deployments/perception/dmtac_grasp_overlay.py"
+    },
+    {
+      "artifact_id": "combined-query-input-5-20261029-skill-hover-visual-v1",
+      "artifact_kind": "offline_query_configuration",
+      "sha256": "27d1351e570c2abb72c2b45b477531558f4a238b3d4daac3c9bbe3796a40ec98",
+      "locator": "deployments/perception/profiles/dmtac_graspgenx_alignment_v5_q0.json"
+    },
+    {
+      "artifact_id": "rm65-arm-runtime-binding-skill-region-20261028-v2",
+      "artifact_kind": "real2sim_runtime_binding",
+      "sha256": "56d0e4562d8abec99bfc5a543949fea5b128ae6378056ff243d729acc44ec31f",
+      "locator": "sim/rm65/real2sim/artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261028_skill_region_checked_v2.json"
+    },
+    {
+      "artifact_id": "combined-focused-report-20261029-skill-hover-visual-v1",
+      "artifact_kind": "offline_validation_report",
+      "sha256": "343381c2b13e8a8a5baff1a43c94bc150d354a2d2c4e5b5c30ce637182f98a77",
+      "locator": "artifact://combined-focused-report-20261029-skill-hover-visual-v1"
+    },
+    {
+      "artifact_id": "combined-focused-binding-20261029-skill-hover-visual-v1",
+      "artifact_kind": "offline_validation_report",
+      "sha256": "d1bd667b5b36709aff44a9199090d1f7ef545e90bba8de19723a672c456dbdea",
+      "locator": "artifact://combined-focused-binding-20261029-skill-hover-visual-v1"
+    },
+    {
+      "artifact_id": "observed-query-input-0-20261029-observed-cache-order-v1",
+      "artifact_kind": "offline_query_source",
+      "sha256": "fca6cb0e038df7e2cf18c80337ef9951c50128ef266beece56b0193df057b5b2",
+      "locator": "scripts/probes/query_safe_move_snapshot.py"
+    },
+    {
+      "artifact_id": "observed-query-input-1-20261029-observed-cache-order-v1",
+      "artifact_kind": "offline_query_source",
+      "sha256": "0ad28b8a539624d9077fc03dbc1dce203542ba7651160a16eeaf073c37a5cea8",
+      "locator": "robot_motion/tool_entity_goals.py"
+    },
+    {
+      "artifact_id": "observed-query-input-2-20261029-observed-cache-order-v1",
+      "artifact_kind": "offline_query_source",
+      "sha256": "54ff12756d68db793c303864478aa924ff60b9cfebd2464ad9622f37c0dfd8ce",
+      "locator": "robot_motion/observed_obstacles.py"
+    },
+    {
+      "artifact_id": "observed-query-input-3-20261029-observed-cache-order-v1",
+      "artifact_kind": "offline_query_source",
+      "sha256": "92db50a4b07e5df28e8a41eb80b1dfa28db99c4332fc44ce363cbc820126b205",
+      "locator": "robot_motion/grasp_visible_scene.py"
+    },
+    {
+      "artifact_id": "observed-query-input-4-20261029-observed-cache-order-v1",
+      "artifact_kind": "offline_query_source",
+      "sha256": "d710bd09d893e9cda9b3b524bfe90dc0aeb9af370b267b542cbf1c890615274e",
+      "locator": "deployments/perception/dmtac_grasp_overlay.py"
+    },
+    {
+      "artifact_id": "observed-query-input-5-20261029-observed-cache-order-v1",
+      "artifact_kind": "offline_query_configuration",
+      "sha256": "27d1351e570c2abb72c2b45b477531558f4a238b3d4daac3c9bbe3796a40ec98",
+      "locator": "deployments/perception/profiles/dmtac_graspgenx_alignment_v5_q0.json"
+    },
+    {
+      "artifact_id": "rm65-arm-runtime-binding-skill-hover-visual-20261029-v1",
+      "artifact_kind": "real2sim_runtime_binding",
+      "sha256": "2be3606c9b558ccfe1cd925062f481c148a5df2658e9be5456217d5f15da0c99",
+      "locator": "sim/rm65/real2sim/artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261029_skill_hover_visual_v1.json"
+    },
+    {
+      "artifact_id": "observed-cache-focused-report-20261029-observed-cache-order-v1",
+      "artifact_kind": "offline_validation_report",
+      "sha256": "21fd2272868f3f099c0d2b9a2a50cdcb541504e114f669f23113b3d65b6fd18f",
+      "locator": "artifact://observed-cache-focused-report-20261029-observed-cache-order-v1"
+    },
+    {
+      "artifact_id": "observed-cache-focused-binding-20261029-observed-cache-order-v1",
+      "artifact_kind": "offline_validation_report",
+      "sha256": "c310575746c318c787d5313d71baa3ac40d75061f80423b462e305b6ba5144cb",
+      "locator": "artifact://observed-cache-focused-binding-20261029-observed-cache-order-v1"
+    },
+    {
+      "artifact_id": "rm65-arm-runtime-binding-observed-cache-order-20261029-v1",
+      "artifact_kind": "real2sim_runtime_binding",
+      "sha256": "ff265d915da9226371af42185d351587ad146683822255a54304a45d975abca5",
+      "locator": "sim/rm65/real2sim/artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261029_observed_cache_order_v1.json"
+    },
+    {
+      "artifact_id": "relation-query-input-0-20261029-skill-relations-v1",
+      "artifact_kind": "offline_query_source",
+      "sha256": "0a692e22c577bc2dee5376351fa0c93c1f25a1e2a8831ae2543f7c610cbd715c",
+      "locator": "scripts/probes/query_safe_move_snapshot.py"
+    },
+    {
+      "artifact_id": "relation-query-input-1-20261029-skill-relations-v1",
+      "artifact_kind": "offline_query_source",
+      "sha256": "a73be20c596eb0ddf0cc3528fe6a3c38fe125dac371667bad457d9d60766fde7",
+      "locator": "robot_motion/tool_entity_goals.py"
+    },
+    {
+      "artifact_id": "relation-query-input-2-20261029-skill-relations-v1",
+      "artifact_kind": "offline_query_source",
+      "sha256": "54ff12756d68db793c303864478aa924ff60b9cfebd2464ad9622f37c0dfd8ce",
+      "locator": "robot_motion/observed_obstacles.py"
+    },
+    {
+      "artifact_id": "relation-query-input-3-20261029-skill-relations-v1",
+      "artifact_kind": "offline_query_source",
+      "sha256": "92db50a4b07e5df28e8a41eb80b1dfa28db99c4332fc44ce363cbc820126b205",
+      "locator": "robot_motion/grasp_visible_scene.py"
+    },
+    {
+      "artifact_id": "relation-query-input-4-20261029-skill-relations-v1",
+      "artifact_kind": "offline_query_source",
+      "sha256": "d710bd09d893e9cda9b3b524bfe90dc0aeb9af370b267b542cbf1c890615274e",
+      "locator": "deployments/perception/dmtac_grasp_overlay.py"
+    },
+    {
+      "artifact_id": "relation-query-input-5-20261029-skill-relations-v1",
+      "artifact_kind": "offline_query_configuration",
+      "sha256": "27d1351e570c2abb72c2b45b477531558f4a238b3d4daac3c9bbe3796a40ec98",
+      "locator": "deployments/perception/profiles/dmtac_graspgenx_alignment_v5_q0.json"
+    },
+    {
+      "artifact_id": "relation-focused-report-20261029-skill-relations-v1",
+      "artifact_kind": "offline_validation_report",
+      "sha256": "4e57d7e46c32569429d438d9f8841813f41fadbbd32611075e3ba4915070c02c",
+      "locator": "artifact://relation-focused-report-20261029-skill-relations-v1"
+    },
+    {
+      "artifact_id": "relation-focused-binding-20261029-skill-relations-v1",
+      "artifact_kind": "offline_validation_report",
+      "sha256": "83121638167cec24fa82533ce8106184110ebe4eac9671e60eb4431b45c31e79",
+      "locator": "artifact://relation-focused-binding-20261029-skill-relations-v1"
+    },
+    {
+      "artifact_id": "relation-real-samples-report-20261029-skill-relations-v1",
+      "artifact_kind": "offline_validation_report",
+      "sha256": "54de033312d9a3ccc51a93f2c1ce86c9acfd4a73d7837f3f00a96a6b25ee5b85",
+      "locator": "artifact://relation-real-samples-report-20261029-skill-relations-v1"
+    },
+    {
+      "artifact_id": "relation-mujoco-report-20261029-skill-relations-v1",
+      "artifact_kind": "offline_validation_report",
+      "sha256": "f175ae499a8ebf76d011a79e1c80186b4c3a5be54df5d7441bbc576c32be90f3",
+      "locator": "artifact://relation-mujoco-report-20261029-skill-relations-v1"
+    },
+    {
+      "artifact_id": "rm65-arm-runtime-binding-skill-relations-20261029-v1",
+      "artifact_kind": "real2sim_runtime_binding",
+      "sha256": "ea11d919ae694c5568014953117e6ec317db6ef4ffcadc81ab8b7ea15a1211f4",
+      "locator": "sim/rm65/real2sim/artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261029_skill_relations_v1.json"
+    },
+    {
+      "artifact_id": "gateway-unify-query-input-0-20261029-skill-gateway-unify-v1",
+      "artifact_kind": "offline_query_source",
+      "sha256": "cce5b1bfcad13b8a6f53ceb74cdd48675c5974fd85d6151d7628871283d5a057",
+      "locator": "scripts/probes/query_safe_move_snapshot.py"
+    },
+    {
+      "artifact_id": "gateway-unify-query-input-1-20261029-skill-gateway-unify-v1",
+      "artifact_kind": "offline_query_source",
+      "sha256": "a73be20c596eb0ddf0cc3528fe6a3c38fe125dac371667bad457d9d60766fde7",
+      "locator": "robot_motion/tool_entity_goals.py"
+    },
+    {
+      "artifact_id": "gateway-unify-query-input-2-20261029-skill-gateway-unify-v1",
+      "artifact_kind": "offline_query_source",
+      "sha256": "54ff12756d68db793c303864478aa924ff60b9cfebd2464ad9622f37c0dfd8ce",
+      "locator": "robot_motion/observed_obstacles.py"
+    },
+    {
+      "artifact_id": "gateway-unify-query-input-3-20261029-skill-gateway-unify-v1",
+      "artifact_kind": "offline_query_source",
+      "sha256": "92db50a4b07e5df28e8a41eb80b1dfa28db99c4332fc44ce363cbc820126b205",
+      "locator": "robot_motion/grasp_visible_scene.py"
+    },
+    {
+      "artifact_id": "gateway-unify-query-input-4-20261029-skill-gateway-unify-v1",
+      "artifact_kind": "offline_query_source",
+      "sha256": "d710bd09d893e9cda9b3b524bfe90dc0aeb9af370b267b542cbf1c890615274e",
+      "locator": "deployments/perception/dmtac_grasp_overlay.py"
+    },
+    {
+      "artifact_id": "gateway-unify-query-input-5-20261029-skill-gateway-unify-v1",
+      "artifact_kind": "offline_query_configuration",
+      "sha256": "27d1351e570c2abb72c2b45b477531558f4a238b3d4daac3c9bbe3796a40ec98",
+      "locator": "deployments/perception/profiles/dmtac_graspgenx_alignment_v5_q0.json"
+    },
+    {
+      "artifact_id": "gateway-unify-focused-report-20261029-skill-gateway-unify-v1",
+      "artifact_kind": "offline_validation_report",
+      "sha256": "ae1fede89d51aa43e6bde7418cfdf14ac9095167b472ae9b99088b338d7f37a2",
+      "locator": "artifact://gateway-unify-focused-report-20261029-skill-gateway-unify-v1"
+    },
+    {
+      "artifact_id": "gateway-unify-focused-binding-20261029-skill-gateway-unify-v1",
+      "artifact_kind": "offline_validation_report",
+      "sha256": "bd9a9fc41a8235b2f6d159b9189efd3064e2070c693b0408cb529595507e7fce",
+      "locator": "artifact://gateway-unify-focused-binding-20261029-skill-gateway-unify-v1"
+    },
+    {
+      "artifact_id": "gateway-unify-real-samples-report-20261029-skill-gateway-unify-v1",
+      "artifact_kind": "offline_validation_report",
+      "sha256": "a8467d695ff2dd79b69415948e650b7f8f3c206f05f9a387a02158f7e65669b0",
+      "locator": "artifact://gateway-unify-real-samples-report-20261029-skill-gateway-unify-v1"
+    },
+    {
+      "artifact_id": "gateway-unify-mujoco-hover-report-20261029-skill-gateway-unify-v1",
+      "artifact_kind": "offline_validation_report",
+      "sha256": "701ea4927f91552a2e4cf651989bc83ee87cf10007c66c92c6b497070dfba68d",
+      "locator": "artifact://gateway-unify-mujoco-hover-report-20261029-skill-gateway-unify-v1"
+    },
+    {
+      "artifact_id": "rm65-arm-runtime-binding-skill-gateway-unify-20261029-v1",
+      "artifact_kind": "real2sim_runtime_binding",
+      "sha256": "d2a5227263fe0515456b80794b98c3254755effb338ef0bec6dbaf049527eb47",
+      "locator": "sim/rm65/real2sim/artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261029_skill_gateway_unify_v1.json"
+    },
+    {
+      "artifact_id": "mujoco-agent-place-query-input-0-20261030-mujoco-agent-place-v1",
+      "artifact_kind": "offline_query_source",
+      "sha256": "cce5b1bfcad13b8a6f53ceb74cdd48675c5974fd85d6151d7628871283d5a057",
+      "locator": "scripts/probes/query_safe_move_snapshot.py"
+    },
+    {
+      "artifact_id": "mujoco-agent-place-query-input-1-20261030-mujoco-agent-place-v1",
+      "artifact_kind": "offline_query_source",
+      "sha256": "a73be20c596eb0ddf0cc3528fe6a3c38fe125dac371667bad457d9d60766fde7",
+      "locator": "robot_motion/tool_entity_goals.py"
+    },
+    {
+      "artifact_id": "mujoco-agent-place-query-input-2-20261030-mujoco-agent-place-v1",
+      "artifact_kind": "offline_query_source",
+      "sha256": "54ff12756d68db793c303864478aa924ff60b9cfebd2464ad9622f37c0dfd8ce",
+      "locator": "robot_motion/observed_obstacles.py"
+    },
+    {
+      "artifact_id": "mujoco-agent-place-query-input-3-20261030-mujoco-agent-place-v1",
+      "artifact_kind": "offline_query_source",
+      "sha256": "92db50a4b07e5df28e8a41eb80b1dfa28db99c4332fc44ce363cbc820126b205",
+      "locator": "robot_motion/grasp_visible_scene.py"
+    },
+    {
+      "artifact_id": "mujoco-agent-place-query-input-4-20261030-mujoco-agent-place-v1",
+      "artifact_kind": "offline_query_source",
+      "sha256": "d710bd09d893e9cda9b3b524bfe90dc0aeb9af370b267b542cbf1c890615274e",
+      "locator": "deployments/perception/dmtac_grasp_overlay.py"
+    },
+    {
+      "artifact_id": "mujoco-agent-place-query-input-5-20261030-mujoco-agent-place-v1",
+      "artifact_kind": "offline_query_configuration",
+      "sha256": "27d1351e570c2abb72c2b45b477531558f4a238b3d4daac3c9bbe3796a40ec98",
+      "locator": "deployments/perception/profiles/dmtac_graspgenx_alignment_v5_q0.json"
+    },
+    {
+      "artifact_id": "mujoco-agent-place-focused-report-20261030-mujoco-agent-place-v1",
+      "artifact_kind": "offline_validation_report",
+      "sha256": "5a755457cc791dd77546fce9242adeb41b1dbd98bf6298d59bd2dfcdcd38069e",
+      "locator": "artifact://mujoco-agent-place-focused-report-20261030-mujoco-agent-place-v1"
+    },
+    {
+      "artifact_id": "mujoco-agent-place-focused-binding-20261030-mujoco-agent-place-v1",
+      "artifact_kind": "offline_validation_report",
+      "sha256": "6241a80defcd25a35801e17582c62330af75f6b7e8cb91eefe7b8b654ac4424f",
+      "locator": "artifact://mujoco-agent-place-focused-binding-20261030-mujoco-agent-place-v1"
+    },
+    {
+      "artifact_id": "mujoco-agent-place-agent-cohort-report-20261030-mujoco-agent-place-v1",
+      "artifact_kind": "offline_validation_report",
+      "sha256": "cb61b7ebd56e1dcc28eb0c561a5421c50684bf6a1436ba5ac1c07b7786bfe661",
+      "locator": "artifact://mujoco-agent-place-agent-cohort-report-20261030-mujoco-agent-place-v1"
+    },
+    {
+      "artifact_id": "rm65-arm-runtime-binding-mujoco-agent-place-20261030-v1",
+      "artifact_kind": "real2sim_runtime_binding",
+      "sha256": "19ce010aa88190b13b3c067837bc894d3e97cc6d177774f9e7b0fd24a38dc76e",
+      "locator": "sim/rm65/real2sim/artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261030_mujoco_agent_place_v1.json"
+    },
+    {
+      "artifact_id": "real-place-query-input-0-20261030-real-place-v1",
+      "artifact_kind": "offline_query_source",
+      "sha256": "cce5b1bfcad13b8a6f53ceb74cdd48675c5974fd85d6151d7628871283d5a057",
+      "locator": "scripts/probes/query_safe_move_snapshot.py"
+    },
+    {
+      "artifact_id": "real-place-query-input-1-20261030-real-place-v1",
+      "artifact_kind": "offline_query_source",
+      "sha256": "faaaeabf3dd8360712a214258643bb6dffe967d1c236a084467e227c5004a0d7",
+      "locator": "robot_motion/tool_entity_goals.py"
+    },
+    {
+      "artifact_id": "real-place-query-input-2-20261030-real-place-v1",
+      "artifact_kind": "offline_query_source",
+      "sha256": "993a70853ac30cf7b4a1ca5549f24914d414264e33de17807804da2dd08afd65",
+      "locator": "robot_motion/observed_obstacles.py"
+    },
+    {
+      "artifact_id": "real-place-query-input-3-20261030-real-place-v1",
+      "artifact_kind": "offline_query_source",
+      "sha256": "92db50a4b07e5df28e8a41eb80b1dfa28db99c4332fc44ce363cbc820126b205",
+      "locator": "robot_motion/grasp_visible_scene.py"
+    },
+    {
+      "artifact_id": "real-place-query-input-4-20261030-real-place-v1",
+      "artifact_kind": "offline_query_source",
+      "sha256": "d710bd09d893e9cda9b3b524bfe90dc0aeb9af370b267b542cbf1c890615274e",
+      "locator": "deployments/perception/dmtac_grasp_overlay.py"
+    },
+    {
+      "artifact_id": "real-place-query-input-5-20261030-real-place-v1",
+      "artifact_kind": "offline_query_configuration",
+      "sha256": "27d1351e570c2abb72c2b45b477531558f4a238b3d4daac3c9bbe3796a40ec98",
+      "locator": "deployments/perception/profiles/dmtac_graspgenx_alignment_v5_q0.json"
+    },
+    {
+      "artifact_id": "real-place-focused-report-20261030-real-place-v1",
+      "artifact_kind": "offline_validation_report",
+      "sha256": "82bdd2888aadff02ee559bd47767c2267d9359c1977c054df9ad4eb18c5abba4",
+      "locator": "artifact://real-place-focused-report-20261030-real-place-v1"
+    },
+    {
+      "artifact_id": "real-place-focused-binding-20261030-real-place-v1",
+      "artifact_kind": "offline_validation_report",
+      "sha256": "4264ec58076e7d5c892f6444a87888e8c0d743de0419b508fd86e6d25546ffc8",
+      "locator": "artifact://real-place-focused-binding-20261030-real-place-v1"
+    },
+    {
+      "artifact_id": "real-place-offline-carry-report-20261030-real-place-v1",
+      "artifact_kind": "offline_validation_report",
+      "sha256": "b25fcdaa7d87accecebdfae7adb9e3e38009d5448af533f63ff968aa9a197bee",
+      "locator": "artifact://real-place-offline-carry-report-20261030-real-place-v1"
+    },
+    {
+      "artifact_id": "rm65-arm-runtime-binding-real-place-20261030-v1",
+      "artifact_kind": "real2sim_runtime_binding",
+      "sha256": "609278175ab9906fae62a2eede288f165f1f9fcc9296ddf99fe71684a0ab04df",
+      "locator": "sim/rm65/real2sim/artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261030_real_place_v1.json"
+    },
+    {
+      "artifact_id": "mujoco-agent-place-query-input-0-20261030-mujoco-agent-place-v2",
+      "artifact_kind": "offline_query_source",
+      "sha256": "cce5b1bfcad13b8a6f53ceb74cdd48675c5974fd85d6151d7628871283d5a057",
+      "locator": "scripts/probes/query_safe_move_snapshot.py"
+    },
+    {
+      "artifact_id": "mujoco-agent-place-query-input-1-20261030-mujoco-agent-place-v2",
+      "artifact_kind": "offline_query_source",
+      "sha256": "faaaeabf3dd8360712a214258643bb6dffe967d1c236a084467e227c5004a0d7",
+      "locator": "robot_motion/tool_entity_goals.py"
+    },
+    {
+      "artifact_id": "mujoco-agent-place-query-input-2-20261030-mujoco-agent-place-v2",
+      "artifact_kind": "offline_query_source",
+      "sha256": "993a70853ac30cf7b4a1ca5549f24914d414264e33de17807804da2dd08afd65",
+      "locator": "robot_motion/observed_obstacles.py"
+    },
+    {
+      "artifact_id": "mujoco-agent-place-query-input-3-20261030-mujoco-agent-place-v2",
+      "artifact_kind": "offline_query_source",
+      "sha256": "92db50a4b07e5df28e8a41eb80b1dfa28db99c4332fc44ce363cbc820126b205",
+      "locator": "robot_motion/grasp_visible_scene.py"
+    },
+    {
+      "artifact_id": "mujoco-agent-place-query-input-4-20261030-mujoco-agent-place-v2",
+      "artifact_kind": "offline_query_source",
+      "sha256": "d710bd09d893e9cda9b3b524bfe90dc0aeb9af370b267b542cbf1c890615274e",
+      "locator": "deployments/perception/dmtac_grasp_overlay.py"
+    },
+    {
+      "artifact_id": "mujoco-agent-place-query-input-5-20261030-mujoco-agent-place-v2",
+      "artifact_kind": "offline_query_configuration",
+      "sha256": "27d1351e570c2abb72c2b45b477531558f4a238b3d4daac3c9bbe3796a40ec98",
+      "locator": "deployments/perception/profiles/dmtac_graspgenx_alignment_v5_q0.json"
+    },
+    {
+      "artifact_id": "mujoco-agent-place-focused-report-20261030-mujoco-agent-place-v2",
+      "artifact_kind": "offline_validation_report",
+      "sha256": "e1586262f81f1540b7f83aec08a80aaae0f63b7b4e1fff9115df5dbcc8f628b8",
+      "locator": "artifact://mujoco-agent-place-focused-report-20261030-mujoco-agent-place-v2"
+    },
+    {
+      "artifact_id": "mujoco-agent-place-focused-binding-20261030-mujoco-agent-place-v2",
+      "artifact_kind": "offline_validation_report",
+      "sha256": "d339b81adb4196f98abffd9d21e3d0b088d209a5acf0db6d1038dfc772cde828",
+      "locator": "artifact://mujoco-agent-place-focused-binding-20261030-mujoco-agent-place-v2"
+    },
+    {
+      "artifact_id": "mujoco-agent-place-agent-cohort-report-20261030-mujoco-agent-place-v2",
+      "artifact_kind": "offline_validation_report",
+      "sha256": "773af23f34203e9367f13cf125e83ba0026bb241a5494e15a895703384c0a0e2",
+      "locator": "artifact://mujoco-agent-place-agent-cohort-report-20261030-mujoco-agent-place-v2"
+    },
+    {
+      "artifact_id": "rm65-arm-runtime-binding-mujoco-agent-place-20261030-v2",
+      "artifact_kind": "real2sim_runtime_binding",
+      "sha256": "bfaced6fc44df348e3095350b31af071bc35f9388c4ae265132a49d371d5511f",
+      "locator": "sim/rm65/real2sim/artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261030_mujoco_agent_place_v2.json"
+    },
+    {
+      "artifact_id": "mujoco-agent-place-query-input-0-20261031-mujoco-agent-place-v3",
+      "artifact_kind": "offline_query_source",
+      "sha256": "cce5b1bfcad13b8a6f53ceb74cdd48675c5974fd85d6151d7628871283d5a057",
+      "locator": "scripts/probes/query_safe_move_snapshot.py"
+    },
+    {
+      "artifact_id": "mujoco-agent-place-query-input-1-20261031-mujoco-agent-place-v3",
+      "artifact_kind": "offline_query_source",
+      "sha256": "faaaeabf3dd8360712a214258643bb6dffe967d1c236a084467e227c5004a0d7",
+      "locator": "robot_motion/tool_entity_goals.py"
+    },
+    {
+      "artifact_id": "mujoco-agent-place-query-input-2-20261031-mujoco-agent-place-v3",
+      "artifact_kind": "offline_query_source",
+      "sha256": "993a70853ac30cf7b4a1ca5549f24914d414264e33de17807804da2dd08afd65",
+      "locator": "robot_motion/observed_obstacles.py"
+    },
+    {
+      "artifact_id": "mujoco-agent-place-query-input-3-20261031-mujoco-agent-place-v3",
+      "artifact_kind": "offline_query_source",
+      "sha256": "92db50a4b07e5df28e8a41eb80b1dfa28db99c4332fc44ce363cbc820126b205",
+      "locator": "robot_motion/grasp_visible_scene.py"
+    },
+    {
+      "artifact_id": "mujoco-agent-place-query-input-4-20261031-mujoco-agent-place-v3",
+      "artifact_kind": "offline_query_source",
+      "sha256": "d710bd09d893e9cda9b3b524bfe90dc0aeb9af370b267b542cbf1c890615274e",
+      "locator": "deployments/perception/dmtac_grasp_overlay.py"
+    },
+    {
+      "artifact_id": "mujoco-agent-place-query-input-5-20261031-mujoco-agent-place-v3",
+      "artifact_kind": "offline_query_configuration",
+      "sha256": "27d1351e570c2abb72c2b45b477531558f4a238b3d4daac3c9bbe3796a40ec98",
+      "locator": "deployments/perception/profiles/dmtac_graspgenx_alignment_v5_q0.json"
+    },
+    {
+      "artifact_id": "mujoco-agent-place-focused-report-20261031-mujoco-agent-place-v3",
+      "artifact_kind": "offline_validation_report",
+      "sha256": "1e8522e219a7d98f31f4573fb839837bfc249f2a00c689f762f9566b4afa1dc0",
+      "locator": "artifact://mujoco-agent-place-focused-report-20261031-mujoco-agent-place-v3"
+    },
+    {
+      "artifact_id": "mujoco-agent-place-focused-binding-20261031-mujoco-agent-place-v3",
+      "artifact_kind": "offline_validation_report",
+      "sha256": "18db0a69414fbaf2ca4054e3d91351c302faee3cd997c22d8948245f2b6dbeb0",
+      "locator": "artifact://mujoco-agent-place-focused-binding-20261031-mujoco-agent-place-v3"
+    },
+    {
+      "artifact_id": "mujoco-agent-place-agent-cohort-report-20261031-mujoco-agent-place-v3",
+      "artifact_kind": "offline_validation_report",
+      "sha256": "2d9a059c88e140af80b72e916b140f2f1b5ec15a4886ea67f9a020ab569a44e3",
+      "locator": "artifact://mujoco-agent-place-agent-cohort-report-20261031-mujoco-agent-place-v3"
+    },
+    {
+      "artifact_id": "rm65-arm-runtime-binding-mujoco-agent-place-20261031-v3",
+      "artifact_kind": "real2sim_runtime_binding",
+      "sha256": "5e6fafc11072471deb9d70d5bb1f7e9d4128126fdaa2e63f615691253fa0449d",
+      "locator": "sim/rm65/real2sim/artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261031_mujoco_agent_place_v3.json"
+    },
+    {
+      "artifact_id": "real-held-own-wrist-query-input-0-20261031-real-held-own-wrist-v1",
+      "artifact_kind": "offline_query_source",
+      "sha256": "cce5b1bfcad13b8a6f53ceb74cdd48675c5974fd85d6151d7628871283d5a057",
+      "locator": "scripts/probes/query_safe_move_snapshot.py"
+    },
+    {
+      "artifact_id": "real-held-own-wrist-query-input-1-20261031-real-held-own-wrist-v1",
+      "artifact_kind": "offline_query_source",
+      "sha256": "faaaeabf3dd8360712a214258643bb6dffe967d1c236a084467e227c5004a0d7",
+      "locator": "robot_motion/tool_entity_goals.py"
+    },
+    {
+      "artifact_id": "real-held-own-wrist-query-input-2-20261031-real-held-own-wrist-v1",
+      "artifact_kind": "offline_query_source",
+      "sha256": "993a70853ac30cf7b4a1ca5549f24914d414264e33de17807804da2dd08afd65",
+      "locator": "robot_motion/observed_obstacles.py"
+    },
+    {
+      "artifact_id": "real-held-own-wrist-query-input-3-20261031-real-held-own-wrist-v1",
+      "artifact_kind": "offline_query_source",
+      "sha256": "92db50a4b07e5df28e8a41eb80b1dfa28db99c4332fc44ce363cbc820126b205",
+      "locator": "robot_motion/grasp_visible_scene.py"
+    },
+    {
+      "artifact_id": "real-held-own-wrist-query-input-4-20261031-real-held-own-wrist-v1",
+      "artifact_kind": "offline_query_source",
+      "sha256": "d710bd09d893e9cda9b3b524bfe90dc0aeb9af370b267b542cbf1c890615274e",
+      "locator": "deployments/perception/dmtac_grasp_overlay.py"
+    },
+    {
+      "artifact_id": "real-held-own-wrist-query-input-5-20261031-real-held-own-wrist-v1",
+      "artifact_kind": "offline_query_configuration",
+      "sha256": "27d1351e570c2abb72c2b45b477531558f4a238b3d4daac3c9bbe3796a40ec98",
+      "locator": "deployments/perception/profiles/dmtac_graspgenx_alignment_v5_q0.json"
+    },
+    {
+      "artifact_id": "real-held-own-wrist-focused-report-20261031-real-held-own-wrist-v1",
+      "artifact_kind": "offline_validation_report",
+      "sha256": "07ed40079902c2a14198473c6e9954a92d7e3bc435558ec51d7f818ff7b93e9c",
+      "locator": "artifact://real-held-own-wrist-focused-report-20261031-real-held-own-wrist-v1"
+    },
+    {
+      "artifact_id": "real-held-own-wrist-focused-binding-20261031-real-held-own-wrist-v1",
+      "artifact_kind": "offline_validation_report",
+      "sha256": "db548e1f19e2b9447064c25b70d386b5740ea9c0ba5651e61313a1379d62a2c0",
+      "locator": "artifact://real-held-own-wrist-focused-binding-20261031-real-held-own-wrist-v1"
+    },
+    {
+      "artifact_id": "real-held-own-wrist-point-miss-check-20261031-real-held-own-wrist-v1",
+      "artifact_kind": "offline_validation_report",
+      "sha256": "64602101928f395d4dd47c1cc51be91b08f8493d8226c1ed9715c40eabfa28ea",
+      "locator": "artifact://real-held-own-wrist-point-miss-check-20261031-real-held-own-wrist-v1"
+    },
+    {
+      "artifact_id": "real-held-own-wrist-offline-samples-report-20261031-real-held-own-wrist-v1",
+      "artifact_kind": "offline_validation_report",
+      "sha256": "616d098c7c36128325117ed934243b185d3a3b0d240524105b9edd6621e2fad5",
+      "locator": "artifact://real-held-own-wrist-offline-samples-report-20261031-real-held-own-wrist-v1"
+    },
+    {
+      "artifact_id": "rm65-arm-runtime-binding-real-held-own-wrist-20261031-v1",
+      "artifact_kind": "real2sim_runtime_binding",
+      "sha256": "0df22f253ed33e456485539738a825a8f4f1e487b0a0d555044c7ba521420ba1",
+      "locator": "sim/rm65/real2sim/artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261031_real_held_own_wrist_v1.json"
+    },
+    {
+      "artifact_id": "real-rm65-6f-query-input-0-20261031-real-rm65-6f-v1",
+      "artifact_kind": "offline_query_source",
+      "sha256": "cce5b1bfcad13b8a6f53ceb74cdd48675c5974fd85d6151d7628871283d5a057",
+      "locator": "scripts/probes/query_safe_move_snapshot.py"
+    },
+    {
+      "artifact_id": "real-rm65-6f-query-input-1-20261031-real-rm65-6f-v1",
+      "artifact_kind": "offline_query_source",
+      "sha256": "faaaeabf3dd8360712a214258643bb6dffe967d1c236a084467e227c5004a0d7",
+      "locator": "robot_motion/tool_entity_goals.py"
+    },
+    {
+      "artifact_id": "real-rm65-6f-query-input-2-20261031-real-rm65-6f-v1",
+      "artifact_kind": "offline_query_source",
+      "sha256": "993a70853ac30cf7b4a1ca5549f24914d414264e33de17807804da2dd08afd65",
+      "locator": "robot_motion/observed_obstacles.py"
+    },
+    {
+      "artifact_id": "real-rm65-6f-query-input-3-20261031-real-rm65-6f-v1",
+      "artifact_kind": "offline_query_source",
+      "sha256": "92db50a4b07e5df28e8a41eb80b1dfa28db99c4332fc44ce363cbc820126b205",
+      "locator": "robot_motion/grasp_visible_scene.py"
+    },
+    {
+      "artifact_id": "real-rm65-6f-query-input-4-20261031-real-rm65-6f-v1",
+      "artifact_kind": "offline_query_source",
+      "sha256": "d710bd09d893e9cda9b3b524bfe90dc0aeb9af370b267b542cbf1c890615274e",
+      "locator": "deployments/perception/dmtac_grasp_overlay.py"
+    },
+    {
+      "artifact_id": "real-rm65-6f-query-input-5-20261031-real-rm65-6f-v1",
+      "artifact_kind": "offline_query_configuration",
+      "sha256": "27d1351e570c2abb72c2b45b477531558f4a238b3d4daac3c9bbe3796a40ec98",
+      "locator": "deployments/perception/profiles/dmtac_graspgenx_alignment_v5_q0.json"
+    },
+    {
+      "artifact_id": "real-rm65-6f-focused-report-20261031-real-rm65-6f-v1",
+      "artifact_kind": "offline_validation_report",
+      "sha256": "89ede6359f494a65faf07f3648b356f994114cf3ac8f0d0ca0103114f6bfe998",
+      "locator": "artifact://real-rm65-6f-focused-report-20261031-real-rm65-6f-v1"
+    },
+    {
+      "artifact_id": "real-rm65-6f-focused-binding-20261031-real-rm65-6f-v1",
+      "artifact_kind": "offline_validation_report",
+      "sha256": "8f1ba9b0f6fd93ec83372a29baa466bea6e8fa967fbfa565f3d84bf682daa68a",
+      "locator": "artifact://real-rm65-6f-focused-binding-20261031-real-rm65-6f-v1"
+    },
+    {
+      "artifact_id": "real-rm65-6f-model-check-20261031-real-rm65-6f-v1",
+      "artifact_kind": "offline_validation_report",
+      "sha256": "861f7690ad4634934af878ee0f5562ac88b0b906f373a1598e6969cea2ab16aa",
+      "locator": "artifact://real-rm65-6f-model-check-20261031-real-rm65-6f-v1"
+    },
+    {
+      "artifact_id": "real-rm65-6f-table-clearance-check-20261031-real-rm65-6f-v1",
+      "artifact_kind": "offline_validation_report",
+      "sha256": "819d1f6c90529054a850a68dbcf9db4107f4e4e1f1151457c7c42cfabbf5adb1",
+      "locator": "artifact://real-rm65-6f-table-clearance-check-20261031-real-rm65-6f-v1"
+    },
+    {
+      "artifact_id": "real-rm65-6f-asset-check-20261031-real-rm65-6f-v1",
+      "artifact_kind": "offline_validation_report",
+      "sha256": "dd6f25fdb91a780f769a056c78a02d9b9fcdc7a7771f347cb67ad60359e0f5e0",
+      "locator": "artifact://real-rm65-6f-asset-check-20261031-real-rm65-6f-v1"
+    },
+    {
+      "artifact_id": "real-rm65-6f-offline-samples-report-20261031-real-rm65-6f-v1",
+      "artifact_kind": "offline_validation_report",
+      "sha256": "e2f2442d874bb3d81a9c25d5822d2df75b150b92531529a75e6b87e0a173ac4c",
+      "locator": "artifact://real-rm65-6f-offline-samples-report-20261031-real-rm65-6f-v1"
+    },
+    {
+      "artifact_id": "rm65-arm-runtime-binding-real-rm65-6f-20261031-v1",
+      "artifact_kind": "real2sim_runtime_binding",
+      "sha256": "d43886c9eb4e8c1d71fd583ab88f948c52853722625b4f35ea156c5b8b4b3104",
+      "locator": "sim/rm65/real2sim/artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261031_real_rm65_6f_v1.json"
+    },
+    {
+      "artifact_id": "rm65-correlated-rgbd-contract-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "sim_planning_source",
+      "sha256": "2cfd9177deb45c3eff250f338d9beca5c8d84d352567762b6829f165f3b5a7a9",
+      "locator": "agent_gateway/profiles/back_projection.py"
+    },
+    {
+      "artifact_id": "rm65-shared-localization-provider-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "sim_planning_source",
+      "sha256": "bae89b4cfb89404a36bc8308d52c5d71c76eb52c85e7e09f46a2fe8938f64477",
+      "locator": "agent_gateway/profiles/localization.py"
+    },
+    {
+      "artifact_id": "rm65-shared-localization-deployment-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "sim_planning_source",
+      "sha256": "72d6a9d0c8d620942c384b5314ca97f5d391573c95fb317366613de0cbc6bf2c",
+      "locator": "agent_gateway/profiles/localization_deployment.py"
+    },
+    {
+      "artifact_id": "rm65-depth-capture-conversion-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "sim_planning_source",
+      "sha256": "f96ddce061f1cdc7455eaf9e29aa2da85a9034ff5c555a18731064a94de0e4bc",
+      "locator": "agent_gateway/profiles/mujoco/back_projection.py"
+    },
+    {
+      "artifact_id": "rm65-motion-launcher-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "sim_planning_source",
+      "sha256": "214dede94143baaf7a814fd189420cd15fde4697725b2f7906f581fdbe9578e2",
+      "locator": "agent_gateway/profiles/mujoco/gateway_cli.py"
+    },
+    {
+      "artifact_id": "rm65-native-grasp-deployment-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "runtime_source",
+      "sha256": "f52beb7ed6ee45e3530a8bc47300bc475e59aa805134301e110e5f746116537f",
+      "locator": "agent_gateway/profiles/mujoco/grasp_deployment.py"
+    },
+    {
+      "artifact_id": "rm65-native-grasp-fast-plan-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "runtime_source",
+      "sha256": "80d6a2079d58594c720e33f7bcea1b132fe772e8f3b4efa435894c82b540ad58",
+      "locator": "agent_gateway/profiles/mujoco/grasp_fast_plan.py"
+    },
+    {
+      "artifact_id": "rm65-native-grasp-observation-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "runtime_source",
+      "sha256": "3fea5de24032e6bf67fcf8cd1a119ed5faa777e1835f9256066ff9f29f1f8cdf",
+      "locator": "agent_gateway/profiles/mujoco/grasp_observation.py"
+    },
+    {
+      "artifact_id": "rm65-motion-application-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "sim_native_skill_consumer_source",
+      "sha256": "2972efd7effd7ca35c4902900e7edf6d219a9f4a436c714d2c0821b550c2994d",
+      "locator": "agent_gateway/profiles/mujoco/motion_application.py"
+    },
+    {
+      "artifact_id": "rm65-motion-deployment-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "sim_planning_source",
+      "sha256": "4094688081f06fb1d88c23d235397cacd55cf386618970a693520daa456867e4",
+      "locator": "agent_gateway/profiles/mujoco/motion_deployment.py"
+    },
+    {
+      "artifact_id": "rm65-motion-factory-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "sim_planning_source",
+      "sha256": "265e31a06621221cfbd38a93691f943d586a7882703a1d9e606565d1025b63ff",
+      "locator": "agent_gateway/profiles/mujoco/motion_factory.py"
+    },
+    {
+      "artifact_id": "rm65-segmentation-session-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "sim_planning_source",
+      "sha256": "a63a5985d737caa2a0ec3a0f2e079b9f616626b48d8ff0fe66c46d6b3d10f446",
+      "locator": "agent_gateway/profiles/mujoco/motion_gateway_session.py"
+    },
+    {
+      "artifact_id": "rm65-observed-scene-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "sim_planning_source",
+      "sha256": "01fb06563f4012ee61beb4cc462e292a59f606bb999b716031d85e9ad198a9ea",
+      "locator": "agent_gateway/profiles/mujoco/motion_observed_scene.py"
+    },
+    {
+      "artifact_id": "rm65-native-prepared-skill-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "sim_native_skill_consumer_source",
+      "sha256": "e219d3a032afd5ae33a52f4e89b714c5fb2dbaef46ac6d01704e41632b555226",
+      "locator": "agent_gateway/profiles/mujoco/motion_skill.py"
+    },
+    {
+      "artifact_id": "rm65-object-path-query-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "sim_planning_source",
+      "sha256": "1eb4ec6fa5e6596d5b729f5ce9f6e605ae8463d4ca093a8a7348f5981b5a1336",
+      "locator": "agent_gateway/profiles/mujoco/object_goal_query.py"
+    },
+    {
+      "artifact_id": "rm65-observed-point-consumer-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "sim_planning_source",
+      "sha256": "13b43f84e40d30525c5bac94884e82d9a25a12ef7d086af6492102dbb82050f9",
+      "locator": "agent_gateway/profiles/mujoco/observed_point_motion.py"
+    },
+    {
+      "artifact_id": "rm65-native-continuation-executor-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "runtime_source",
+      "sha256": "effbd44d3e349ff01be617afbe95330d5ac7ee0ca7feccf308890443d3a5a6cf",
+      "locator": "agent_gateway/profiles/mujoco/tcp_continuation_query.py"
+    },
+    {
+      "artifact_id": "rm65-retained-observed-point-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "sim_planning_source",
+      "sha256": "4b3b5790a891a0acb2e9eac1b05d05ad86a71e4681e59e2e2e3c3f66b1bcc928",
+      "locator": "agent_gateway/profiles/observed_target.py"
+    },
+    {
+      "artifact_id": "rm65-paired-rgbd-codec-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "sim_planning_source",
+      "sha256": "5a6ec3a4f5b85604f24f56129d6c5be529244c4fc452fed93ad11b947248b22b",
+      "locator": "agent_gateway/profiles/paired_rgbd.py"
+    },
+    {
+      "artifact_id": "rm65-pose-candidate-executor-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "runtime_source",
+      "sha256": "708ab6e4def45eaaa3d286ea69eb280c92aa043c90a9df1e37356f2e85ee2c02",
+      "locator": "agent_gateway/profiles/pose_candidate_set.py"
+    },
+    {
+      "artifact_id": "rm65-query-geometry-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "sim_planning_source",
+      "sha256": "88c5af853beaaaeb9b5017ffaaea5bd14434729f65fd6136fa3ae99c0e4919ad",
+      "locator": "agent_gateway/profiles/query_geometry.py"
+    },
+    {
+      "artifact_id": "rm65-real-current-gateway-cli-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "runtime_source",
+      "sha256": "269c9b9af7b37b9bcd8583cb2e9eae3536c9482318f86ad756542d1374b7fc5c",
+      "locator": "agent_gateway/profiles/real/gateway_cli.py"
+    },
+    {
+      "artifact_id": "rm65-real-localization-deployment-facade-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "sim_planning_source",
+      "sha256": "ec98602786c4f20a73456c2e88d121ba9dfc9280e159173f508b45b03d579163",
+      "locator": "agent_gateway/profiles/real/localization_deployment.py"
+    },
+    {
+      "artifact_id": "rm65-real-localization-provider-facade-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "sim_planning_source",
+      "sha256": "117db9ed9f0fcdcfa26c95cef26526fbd6a311494b3720f6ad011684be746218",
+      "locator": "agent_gateway/profiles/real/localization_gateway.py"
+    },
+    {
+      "artifact_id": "rm65-real-compatibility-motion-factory-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "runtime_source",
+      "sha256": "28568c50c50e62c9b3f3bc46a3f95592d7908627fa9d7fb992182d0ffba491a3",
+      "locator": "agent_gateway/profiles/real/motion_factory.py"
+    },
+    {
+      "artifact_id": "rm65-real-current-gateway-session-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "runtime_source",
+      "sha256": "4bb75c908d6b94282461fdc21d744bfd9849f4e236927df6064ceb9f9105f462",
+      "locator": "agent_gateway/profiles/real/motion_gateway_session.py"
+    },
+    {
+      "artifact_id": "rm65-real-current-motion-profiles-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "runtime_source",
+      "sha256": "c7b0d026851b6486f95005cbf29cb739f51ca6b1aaede2fb7580e35fe1f93758",
+      "locator": "agent_gateway/profiles/real/motion_primitive_profiles.py"
+    },
+    {
+      "artifact_id": "rm65-real-current-one-shot-client-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "runtime_source",
+      "sha256": "93c5695ccccce6d7b9d2778eb268b6025f097ff0400d3627af940eb3ff0f99e7",
+      "locator": "agent_gateway/profiles/real/one_shot_client.py"
+    },
+    {
+      "artifact_id": "rm65-real-current-composition-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "runtime_source",
+      "sha256": "5d8716d5e270f23d46e27f90f1dbcd8a9b9ec878187b4d3a59e2315a2895cdf3",
+      "locator": "agent_gateway/profiles/real/rm65_composition.py"
+    },
+    {
+      "artifact_id": "rm65-real-current-authorization-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "runtime_source",
+      "sha256": "cfe35773489f4ebd2e6ed688a746820a50d74774a113893da14fbc5230b5f2af",
+      "locator": "agent_gateway/profiles/real/session_authorization.py"
+    },
+    {
+      "artifact_id": "rm65-region-continuation-executor-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "runtime_source",
+      "sha256": "9186ecfce0662ac763a974d70edc25d3ad9843d7ec083555e824b74a85850399",
+      "locator": "agent_gateway/profiles/region_continuation_query.py"
+    },
+    {
+      "artifact_id": "rm65-relation-continuation-executor-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "runtime_source",
+      "sha256": "9c7e9a6041ad5671a24fdf606c38be40205860738ce24952bd155aba0893526a",
+      "locator": "agent_gateway/profiles/relation_continuation_query.py"
+    },
+    {
+      "artifact_id": "rm65-paired-rgbd-capture-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "sim_planning_source",
+      "sha256": "e09981f981e53fb0af880487d6d216d4c4eca116ab4beb0578a00ee5283f3997",
+      "locator": "agent_gateway/profiles/rgbd_capture.py"
+    },
+    {
+      "artifact_id": "rm65-segmentation-provider-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "sim_planning_source",
+      "sha256": "f4e01435ca75da992ce844abd8a80cd9bbfc5ea283fddc19d2ab51282c816bad",
+      "locator": "agent_gateway/profiles/segmentation.py"
+    },
+    {
+      "artifact_id": "rm65-segmentation-batch-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "sim_planning_source",
+      "sha256": "f86dc785255f179cf7441634652348fe7c539e948976e30ce27e6afe4e0559e7",
+      "locator": "agent_gateway/profiles/segmentation_batch.py"
+    },
+    {
+      "artifact_id": "rm65-spatial-goal-provider-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "sim_planning_source",
+      "sha256": "bbf11198b7c478c6b6d724bc6b02df48f0ca524ea92aa2c8e610e5b30eb79164",
+      "locator": "agent_gateway/profiles/spatial_goal.py"
+    },
+    {
+      "artifact_id": "rm65-surface-anchor-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "sim_planning_source",
+      "sha256": "7db5c54979b50252891d0286d650915df67880928980484e6c8a8295b1fa242a",
+      "locator": "agent_gateway/profiles/surface_anchor.py"
+    },
+    {
+      "artifact_id": "rm65-surface-selection-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "sim_planning_source",
+      "sha256": "dd8803e52d7f2c2d22bac34e613a59c9b525374d23f64e3362ca1e86e4f920ec",
+      "locator": "agent_gateway/profiles/surface_anchor_selection.py"
+    },
+    {
+      "artifact_id": "rm65-paired-surface-anchor-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "sim_planning_source",
+      "sha256": "adf42d6eae374d17700f9f4e7552027b7e7dfce9c0c4214cf09be423d72b08bb",
+      "locator": "agent_gateway/profiles/surface_anchor_v3.py"
+    },
+    {
+      "artifact_id": "rm65-tcp-continuation-executor-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "runtime_source",
+      "sha256": "db4f080460cba8403c3e2ccfa8a39448110c067e32bb1c368caa11a6d04e7db5",
+      "locator": "agent_gateway/profiles/tcp_continuation_query.py"
+    },
+    {
+      "artifact_id": "rm65-retained-motion-definitions-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "runtime_source",
+      "sha256": "a89608b8ce2a77a83f51ab035b9319e159575ba66ee564de3d3f2ec7d61f2606",
+      "locator": "agent_gateway/skills/motion/definition.py"
+    },
+    {
+      "artifact_id": "rm65-observed-point-contract-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "sim_planning_source",
+      "sha256": "c6f2d533e525d25e473c226e7217f32a099e484e83b10615152b73838d2b46b9",
+      "locator": "agent_gateway/skills/motion/observed_point.py"
+    },
+    {
+      "artifact_id": "rm65-safe-tcp-v2-contract-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "runtime_source",
+      "sha256": "62e83be5dc3f9c071cd0f56f62cbeb56a0014386faffd77263c87c9e144572fd",
+      "locator": "agent_gateway/skills/motion/path_constraint.py"
+    },
+    {
+      "artifact_id": "rm65-segmentation-definitions-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "sim_planning_source",
+      "sha256": "e442827be2d2b3b961108686e98b9f0ced3c9450b8702e8cc9295de2ffb3df42",
+      "locator": "agent_gateway/skills/perception/definition.py"
+    },
+    {
+      "artifact_id": "rm65-object-path-contract-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "sim_planning_source",
+      "sha256": "1a332836bbacb724a2e3a129e9c3567aec10a31ceacd8ae82db47f8dd5855229",
+      "locator": "agent_gateway/skills/perception/object_goal_query.py"
+    },
+    {
+      "artifact_id": "rm65-pose-candidate-contract-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "runtime_source",
+      "sha256": "a195e1afb5e36225333846e36775b82be3e7ce60ee324902fb8fc18fa2395746",
+      "locator": "agent_gateway/skills/perception/pose_candidate_set.py"
+    },
+    {
+      "artifact_id": "rm65-region-continuation-contract-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "runtime_source",
+      "sha256": "38bc32b64a01867ec25a6bccbd5dca1cab17f005a5c0cff3f379ca9899399271",
+      "locator": "agent_gateway/skills/perception/region_continuation_query.py"
+    },
+    {
+      "artifact_id": "rm65-relation-continuation-contract-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "runtime_source",
+      "sha256": "801da2c372e813a4caa23d8dfb963f45635891cd2c0b93d3f3fc4d0d3e1043be",
+      "locator": "agent_gateway/skills/perception/relation_continuation_query.py"
+    },
+    {
+      "artifact_id": "rm65-paired-rgbd-skill-contract-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "sim_planning_source",
+      "sha256": "f69d8ff8539bc58805a73f0f735f05e83a66e110d95eaf6b4aafde23b0d6dbea",
+      "locator": "agent_gateway/skills/perception/rgbd_schemas.py"
+    },
+    {
+      "artifact_id": "rm65-segmentation-schemas-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "sim_planning_source",
+      "sha256": "ddc97330c43bc94a81b3b8249f542cb19d5ccf05045e44024f515f84a059a54c",
+      "locator": "agent_gateway/skills/perception/segmentation_schemas.py"
+    },
+    {
+      "artifact_id": "rm65-spatial-goal-contract-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "sim_planning_source",
+      "sha256": "78923cdcf1dabbcc3b70259088d3c8cba2945792b74a5aaa1e6e89d5912a5d9d",
+      "locator": "agent_gateway/skills/perception/spatial_goal.py"
+    },
+    {
+      "artifact_id": "rm65-surface-anchor-contract-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "sim_planning_source",
+      "sha256": "49fc91316290c2a4ed30b1b39faf3c585acf7bd21cdcb0e3c5757d8e7b2732c4",
+      "locator": "agent_gateway/skills/perception/surface_anchor.py"
+    },
+    {
+      "artifact_id": "rm65-surface-anchor-v2-contract-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "sim_planning_source",
+      "sha256": "4f4eacec70d54c4e806d0df74bb1cd13dbe70ec4cb2e05f8beb4cfe9092f35e3",
+      "locator": "agent_gateway/skills/perception/surface_anchor_v2.py"
+    },
+    {
+      "artifact_id": "rm65-surface-anchor-v3-contract-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "sim_planning_source",
+      "sha256": "6e7621344f97bbe7c5e54fa48083e686ca08954ed293a35cf62442d1a13d59db",
+      "locator": "agent_gateway/skills/perception/surface_anchor_v3.py"
+    },
+    {
+      "artifact_id": "rm65-tcp-continuation-contract-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "runtime_source",
+      "sha256": "5c2afb5290cd7eec04a0c62da0a684e519e0247584d49ce04e73d651ca08999d",
+      "locator": "agent_gateway/skills/perception/tcp_continuation_query.py"
+    },
+    {
+      "artifact_id": "checkpoint-control_composition-observability-execution_difference-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "sim_checkpoint_source",
+      "sha256": "091ba862349fe5cc1dbd3cd49e3be9685a4c135c8eff0670674332e64573887e",
+      "locator": "control_composition/observability/execution_difference.py"
+    },
+    {
+      "artifact_id": "checkpoint-control_composition-observability-modules-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "sim_checkpoint_source",
+      "sha256": "e9f986341a8d9479a83f92777748f991f741a51aa5a07c41bbb4cd37f9a28549",
+      "locator": "control_composition/observability/modules.py"
+    },
+    {
+      "artifact_id": "rm65-real-compatibility-control-station-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "runtime_source",
+      "sha256": "84bb4084da6263f444864f05f6421c250c3b3f1d1ca5b15c6bc832ec8333a189",
+      "locator": "control_station/real_agent_primitive_runtime.py"
+    },
+    {
+      "artifact_id": "checkpoint-dataset_contracts-action_schema-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "sim_checkpoint_source",
+      "sha256": "6bf81bb7ff362769614dae29a7bb6c748b70ac11cfa2217984ed8f5f63633b6d",
+      "locator": "dataset_contracts/action_schema.py"
+    },
+    {
+      "artifact_id": "checkpoint-dataset_contracts-canonical_encoding-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "sim_checkpoint_source",
+      "sha256": "d4e34543a70e2a30d55484faf5e0dba7ac6208e91455084b33fa0324db827591",
+      "locator": "dataset_contracts/canonical_encoding.py"
+    },
+    {
+      "artifact_id": "checkpoint-dataset_contracts-control_trace-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "sim_checkpoint_source",
+      "sha256": "7f60c67888c42d43a8754ff6ddc919e73ce311974f7c1b5a5dd35387ca4b9aa6",
+      "locator": "dataset_contracts/control_trace.py"
+    },
+    {
+      "artifact_id": "rm65-paired-rgbd-artifact-contract-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "sim_planning_source",
+      "sha256": "75e5d503d7088deba91dd2636b6704d940bb95754100358e3e9fcb928a7686e2",
+      "locator": "dataset_contracts/perception_artifacts.py"
+    },
+    {
+      "artifact_id": "rm65-sam3-rpc-model-client-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "runtime_source",
+      "sha256": "a161a2aba900630f01b2cbca0478aab8b1d667f42de8cd961bdde98e333af64c",
+      "locator": "deployments/perception/sam3_service.py"
+    },
+    {
+      "artifact_id": "checkpoint-robot_motion-action-adaptation-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "sim_checkpoint_source",
+      "sha256": "2a211d7ca46542991718c79951d3bb2decb8e42187e3667e04fc12d31bf3e893",
+      "locator": "robot_motion/action/adaptation.py"
+    },
+    {
+      "artifact_id": "checkpoint-robot_motion-action-admission_checkpoint-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "sim_checkpoint_source",
+      "sha256": "b111470d26e022e57a733a85cca93309b86c07306366a893cbba684e6b0d8541",
+      "locator": "robot_motion/action/admission_checkpoint.py"
+    },
+    {
+      "artifact_id": "checkpoint-robot_motion-action-arbiter-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "sim_checkpoint_source",
+      "sha256": "8ad7c33120903015790e6db6ae91590653574a79f4f7983e4165c87628929f66",
+      "locator": "robot_motion/action/arbiter.py"
+    },
+    {
+      "artifact_id": "checkpoint-robot_motion-action-arbitration_runtime-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "sim_checkpoint_source",
+      "sha256": "64e2f9244ca6045289fc6a8e847e229a372c43fb6ca8293f4a64f432141a94eb",
+      "locator": "robot_motion/action/arbitration_runtime.py"
+    },
+    {
+      "artifact_id": "checkpoint-robot_motion-action-authoritative_checkpoint-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "sim_checkpoint_source",
+      "sha256": "ce62ae8b09ca36c8fcf7fe49f169dd4ffe09f5a652747ed186c243084988fe1e",
+      "locator": "robot_motion/action/authoritative_checkpoint.py"
+    },
+    {
+      "artifact_id": "checkpoint-robot_motion-action-authoritative_control-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "sim_checkpoint_source",
+      "sha256": "24cf1d482d904d8f22b304f55b5c30fb17f65849ab09d8850434b7aa9b0b0721",
+      "locator": "robot_motion/action/authoritative_control.py"
+    },
+    {
+      "artifact_id": "checkpoint-robot_motion-action-authoritative_trace-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "sim_checkpoint_source",
+      "sha256": "ff270227dec27f1da317fa5bcb95a09536d5e58a210d8077c2db353b560bf535",
+      "locator": "robot_motion/action/authoritative_trace.py"
+    },
+    {
+      "artifact_id": "checkpoint-robot_motion-action-authority-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "sim_checkpoint_source",
+      "sha256": "f025500710c464b67c7429f85f3ceebba1ab70288095e3d36f2538ba42442e78",
+      "locator": "robot_motion/action/authority.py"
+    },
+    {
+      "artifact_id": "checkpoint-robot_motion-action-candidate_authorization-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "sim_checkpoint_source",
+      "sha256": "21d669fca827591c84161f476af5c78411c5ea3b4409577b0f59316528aba617",
+      "locator": "robot_motion/action/candidate_authorization.py"
+    },
+    {
+      "artifact_id": "checkpoint-robot_motion-action-checkpoint_codec-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "sim_checkpoint_source",
+      "sha256": "296d38a13b3ff846224de4514175de5f017e1726c4ccf2c6a50e58373db4398e",
+      "locator": "robot_motion/action/checkpoint_codec.py"
+    },
+    {
+      "artifact_id": "checkpoint-robot_motion-action-component_action-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "sim_checkpoint_source",
+      "sha256": "d2d17c5f88f6c893686aca48a4e18ea5f5df6daa828f41d5bfc704d28e4b8fe9",
+      "locator": "robot_motion/action/component_action.py"
+    },
+    {
+      "artifact_id": "checkpoint-robot_motion-action-components-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "sim_checkpoint_source",
+      "sha256": "bc34b204fb349694f30f423de4cd4215b7213fe3f0697f76eca9e0fc684a64ed",
+      "locator": "robot_motion/action/components.py"
+    },
+    {
+      "artifact_id": "checkpoint-robot_motion-action-decision_checkpoint-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "sim_checkpoint_source",
+      "sha256": "7c927ca9106c0fba76f8617df6d05bcb0b3aff44cc51f4518b248c429ba44ca8",
+      "locator": "robot_motion/action/decision_checkpoint.py"
+    },
+    {
+      "artifact_id": "checkpoint-robot_motion-action-dispatch_context-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "sim_checkpoint_source",
+      "sha256": "b3cc6a0d3f731a3d1e21d3c59c60d6aa9e98ca32b2fe64857249b6d7bef6c6b5",
+      "locator": "robot_motion/action/dispatch_context.py"
+    },
+    {
+      "artifact_id": "checkpoint-robot_motion-action-execution_handoff-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "sim_checkpoint_source",
+      "sha256": "645a259b256a41e230d658bbdbaffb9b3c358ace958c663266daf003770f48b4",
+      "locator": "robot_motion/action/execution_handoff.py"
+    },
+    {
+      "artifact_id": "checkpoint-robot_motion-action-execution_observation-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "sim_checkpoint_source",
+      "sha256": "17aacd76da1a3505a124f5a30f4849508886ec493bb360a7bb06d67dd2927ad9",
+      "locator": "robot_motion/action/execution_observation.py"
+    },
+    {
+      "artifact_id": "checkpoint-robot_motion-action-executor-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "sim_checkpoint_source",
+      "sha256": "044e5d8dea57d78465544ff40d4a23b462b90a60a23b90f77150b81b3a3b718e",
+      "locator": "robot_motion/action/executor.py"
+    },
+    {
+      "artifact_id": "checkpoint-robot_motion-action-persistence-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "sim_checkpoint_source",
+      "sha256": "cb5aa2b90d2d7e597f820ef3fc1d184850e443e0f17c82f24a3b04d1c08bb5ae",
+      "locator": "robot_motion/action/persistence.py"
+    },
+    {
+      "artifact_id": "checkpoint-robot_motion-action-proposal-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "sim_checkpoint_source",
+      "sha256": "37e2c3ec9f0d53b5c0758112c8b5ab69ee80bc3c208d7fa2874b46ed3af7fb91",
+      "locator": "robot_motion/action/proposal.py"
+    },
+    {
+      "artifact_id": "checkpoint-robot_motion-action-schema-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "sim_checkpoint_source",
+      "sha256": "0cc6a5108d35531857ec4e9de708b4a1f7792468bd686de8801fc59dadd6e4d7",
+      "locator": "robot_motion/action/schema.py"
+    },
+    {
+      "artifact_id": "checkpoint-robot_motion-action-target_capability-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "sim_checkpoint_source",
+      "sha256": "767274f737c7553e8f6c45bad4e0cf8fb259a4bd4971f05baddf176766142144",
+      "locator": "robot_motion/action/target_capability.py"
+    },
+    {
+      "artifact_id": "rm65-camera-registry-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "camera_registry",
+      "sha256": "7a0c1e612508c15dc5e0d8445e362498d92b28606e6f7157f47b88fda965e9ba",
+      "locator": "robot_motion/configs/rm65_camera_registry.json"
+    },
+    {
+      "artifact_id": "rm65-object-release-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "sim_object_follow_payload_source",
+      "sha256": "72099c4bab5a3e9520017c49c1fb3198281de57e559c97a300d8b399f32668b1",
+      "locator": "robot_motion/object_release.py"
+    },
+    {
+      "artifact_id": "rm65-object-transport-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "sim_object_follow_payload_source",
+      "sha256": "1765fc8d4b6e45828549d9bbf0c560cbfd52e09d31521796076ea587f48239e5",
+      "locator": "robot_motion/object_transport.py"
+    },
+    {
+      "artifact_id": "rm65-observed-joint-input-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "sim_planning_source",
+      "sha256": "19360355fdf5456a3694f6e38cc15ff683959c98330d991840b9aad4b09fa5fa",
+      "locator": "robot_motion/observed_planning.py"
+    },
+    {
+      "artifact_id": "rm65-tcp-axis-constraint-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "runtime_source",
+      "sha256": "8ed641a6a2c975ad68f17bf588f1254b01f5b16a7d579d4a28598f9de3fe9a21",
+      "locator": "robot_motion/path_constraints.py"
+    },
+    {
+      "artifact_id": "checkpoint-robot_motion-position_control-capability-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "sim_checkpoint_source",
+      "sha256": "9f6392164dd12c9befd47baf7f3979d0676f642567b73d976b1def06f9c00ca0",
+      "locator": "robot_motion/position_control/capability.py"
+    },
+    {
+      "artifact_id": "rm65-waypoint-cancellation-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "sim_planning_source",
+      "sha256": "e509bbfdfa3c501e5c033d72da4514007797019c145b811cb62e0fd4534349a7",
+      "locator": "robot_motion/position_control/offline_waypoint_trajectory.py"
+    },
+    {
+      "artifact_id": "checkpoint-robot_motion-position_control-trajectory-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "sim_checkpoint_source",
+      "sha256": "21e63b29b10b5583628c6ff90476686d281a006b60da3ae1447228cae78787a6",
+      "locator": "robot_motion/position_control/trajectory.py"
+    },
+    {
+      "artifact_id": "checkpoint-robot_motion-position_control-trajectory_checkpoint-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "sim_checkpoint_source",
+      "sha256": "cb8798b610eea1ca3843ef241dd4f886028d7494133d6dbd717ee60f0149a983",
+      "locator": "robot_motion/position_control/trajectory_checkpoint.py"
+    },
+    {
+      "artifact_id": "checkpoint-robot_motion-rm65-dual_arm_ik-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "sim_checkpoint_source",
+      "sha256": "c4aa959de3b2f302bddf4f01d8e63c5f409c9a9b734e0950abc498490dbd1985",
+      "locator": "robot_motion/rm65/dual_arm_ik.py"
+    },
+    {
+      "artifact_id": "checkpoint-robot_motion-rm65-dual_arm_target_solver-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "sim_checkpoint_source",
+      "sha256": "a274667e536aaa9b550aff800eba9abaf97397271b9c7b1e1fb182a1e0658cf8",
+      "locator": "robot_motion/rm65/dual_arm_target_solver.py"
+    },
+    {
+      "artifact_id": "checkpoint-robot_motion-rm65-ik_checkpoint-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "sim_checkpoint_source",
+      "sha256": "0e283c5c3aa0a2e4fd7dd9e2ec5cb8a843040ef58e59bfa5d0dadb241269418f",
+      "locator": "robot_motion/rm65/ik_checkpoint.py"
+    },
+    {
+      "artifact_id": "rm65-observed-collision-model-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "sim_planning_source",
+      "sha256": "b62077a939d00a47f59d65f46551745bc6a01581788959f4b33fd5dc92dc8756",
+      "locator": "robot_motion/rm65/obstacle_collision.py"
+    },
+    {
+      "artifact_id": "checkpoint-robot_motion-rm65-retargeter_checkpoint-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "sim_checkpoint_source",
+      "sha256": "c477a6f3c97e1a49fff403bc37a67372b7fbbaf718e57975787650075cd1c892",
+      "locator": "robot_motion/rm65/retargeter_checkpoint.py"
+    },
+    {
+      "artifact_id": "rm65-single-arm-ik-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "sim_planning_source",
+      "sha256": "a96858093aeb3f8fb81658eacf86ac3b6d6b85506677fbf2119b78e3e6be2480",
+      "locator": "robot_motion/rm65/single_arm_ik.py"
+    },
+    {
+      "artifact_id": "checkpoint-robot_motion-runtime-cancellation-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "sim_checkpoint_source",
+      "sha256": "549811dfe82f48cf81aa65b481a5ece991a98a0ac5df6f4761e14a0f2a7eaf32",
+      "locator": "robot_motion/runtime/cancellation.py"
+    },
+    {
+      "artifact_id": "checkpoint-robot_motion-runtime-control_admission-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "sim_checkpoint_source",
+      "sha256": "79e38bc906816b03be67ed962b36a8c0a8e699cc07d8a6d49401998e57cd6ae1",
+      "locator": "robot_motion/runtime/control_admission.py"
+    },
+    {
+      "artifact_id": "checkpoint-robot_motion-runtime-dispatch-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "sim_checkpoint_source",
+      "sha256": "7c83f7708546728c9943e7360b5a9ca7e1afb39d8e9bcbfdefa8ccf74221ec97",
+      "locator": "robot_motion/runtime/dispatch.py"
+    },
+    {
+      "artifact_id": "checkpoint-robot_motion-runtime-dispatch_owner-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "sim_checkpoint_source",
+      "sha256": "612f3449cccc90dbc512c5d9a30cc00621fd3a40928b82ddfd464657a0fdaf38",
+      "locator": "robot_motion/runtime/dispatch_owner.py"
+    },
+    {
+      "artifact_id": "checkpoint-robot_motion-runtime-execution_checkpoint-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "sim_checkpoint_source",
+      "sha256": "6d04f10eaf99c99e4592e20bfe1d505e73bf507b689331070a01ad6105c9699d",
+      "locator": "robot_motion/runtime/execution_checkpoint.py"
+    },
+    {
+      "artifact_id": "checkpoint-robot_motion-runtime-execution_gate-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "sim_checkpoint_source",
+      "sha256": "6e8504d0c52ea49addb13f63d443d2c4821eeb6e6c434799dec699c4ca293159",
+      "locator": "robot_motion/runtime/execution_gate.py"
+    },
+    {
+      "artifact_id": "checkpoint-robot_motion-runtime-identity-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "sim_checkpoint_source",
+      "sha256": "05bf4b80035697f588ff5780272ec8dfc8b9361e28de0e7316724dff88a1eeb1",
+      "locator": "robot_motion/runtime/identity.py"
+    },
+    {
+      "artifact_id": "checkpoint-robot_motion-runtime-immutable-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "sim_checkpoint_source",
+      "sha256": "fcbe2db947f0ce266babed6dbe642b3b09b5b248aec9a0b13f267fe311dca3fa",
+      "locator": "robot_motion/runtime/immutable.py"
+    },
+    {
+      "artifact_id": "checkpoint-robot_motion-runtime-producer_epoch-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "sim_checkpoint_source",
+      "sha256": "29d30763389066e567f0db40d2d4d89c8a9dbf44221c62777e399e6d349b6fd1",
+      "locator": "robot_motion/runtime/producer_epoch.py"
+    },
+    {
+      "artifact_id": "rm65-spatial-goal-regions-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "runtime_source",
+      "sha256": "99d5b08a04f319d3a0fe3f9cd2ab53b2e4d2cacb89939e463ae064cd7e549935",
+      "locator": "robot_motion/spatial_goal_regions.py"
+    },
+    {
+      "artifact_id": "rm65-relation-goal-core-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "sim_planning_source",
+      "sha256": "b9db7bd09e1f0d1d5424af5cb281ed509af3a190e80a934797749ebd3817f33a",
+      "locator": "robot_motion/spatial_goals.py"
+    },
+    {
+      "artifact_id": "checkpoint-robot-motion-target-safety-checkpoint-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "sim_checkpoint_source",
+      "sha256": "df589ea2050ee2d38409daa631936db904dbb3b41e4894f754246fb510760c06",
+      "locator": "robot_motion/target_safety/checkpoint.py"
+    },
+    {
+      "artifact_id": "rm65-tcp-envelope-query-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "sim_planning_source",
+      "sha256": "a8ab0339217ea5334e4efa064b5e3b611983c9cd56d887cf5f5ffab4a0d8229e",
+      "locator": "robot_motion/target_safety/runtime.py"
+    },
+    {
+      "artifact_id": "rm65-tcp-pose-envelope-core-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "sim_command_admission_source",
+      "sha256": "657e1e825a3829d5454e090ffbb34314b702b5d47c53db0a81952841a00f7906",
+      "locator": "robot_motion/target_safety/tcp_pose_envelope.py"
+    },
+    {
+      "artifact_id": "rm65-native-continuation-clutter-scene-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "sim_validation_fixture",
+      "sha256": "34e1e2de22f5a22b09a2a15d91faf25e385ec31569cd2d51c5e0784c2cd9ee70",
+      "locator": "sim/configs/rm65_bimanual_dmtacm_clutter_boxes_v1.json"
+    },
+    {
+      "artifact_id": "rm65-native-continuation-clutter-task-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "sim_validation_fixture",
+      "sha256": "a841b27942189d7136d067c43e16996caf594f112f004fc028fb1884d8a2fc65",
+      "locator": "sim/configs/tasks/rm65_right_dmtacm_clutter_boxes_agent_v1.json"
+    },
+    {
+      "artifact_id": "checkpoint-sim-mujoco-actuation-checkpoint-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "sim_checkpoint_source",
+      "sha256": "0fd7ce73db510fa27f3f3ccab460b29802367d32d522e5ded384c0d49a898ab6",
+      "locator": "sim/mujoco/actuation/checkpoint.py"
+    },
+    {
+      "artifact_id": "rm65-arm-mujoco-executor-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "sim_backend_adapter_source",
+      "sha256": "df41767bd65d7b9d7c5eaf9c51a6c2502dbf42e056bd3a96a1b687f38529b6be",
+      "locator": "sim/mujoco/actuation/executor.py"
+    },
+    {
+      "artifact_id": "rm65-gripper-executor-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "sim_object_follow_payload_source",
+      "sha256": "3632a9cb16f928d41275fc1a12e59a0c33e4f12ff3b61dc3fe53e518a6cb14a2",
+      "locator": "sim/mujoco/actuation/gripper_executor.py"
+    },
+    {
+      "artifact_id": "checkpoint-sim-mujoco-adapters-checkpoint-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "sim_checkpoint_source",
+      "sha256": "387f9e907388d67465b49d8b0b40bbec7b9617f587648e5f851f25843973cda8",
+      "locator": "sim/mujoco/adapters/checkpoint.py"
+    },
+    {
+      "artifact_id": "rm65-position-rig-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "sim_command_admission_source",
+      "sha256": "74fb622e30698cfb43822338d575dd8b49eac6436003e6e78053735ecf455616",
+      "locator": "sim/mujoco/adapters/robot_motion.py"
+    },
+    {
+      "artifact_id": "rm65-command-guard-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "sim_command_admission_source",
+      "sha256": "8e46a5361b687d53fbc6a834361ba60be9da86826f55f3107cc163d82f538666",
+      "locator": "sim/mujoco/adapters/tcp_pose_command_guard.py"
+    },
+    {
+      "artifact_id": "rm65-envelope-adapter-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "sim_command_admission_source",
+      "sha256": "da9c97f6cf262c39122f0126e48ad46d86a3b75a7118fa6ac43edfe16656d1ce",
+      "locator": "sim/mujoco/adapters/tcp_pose_envelope.py"
+    },
+    {
+      "artifact_id": "rm65-collision-oracle-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "sim_grasp_contact_source",
+      "sha256": "d4c7c3455dfad9bca8e34fa38ce3df62ac09122acb08763fad32bee3c354b15d",
+      "locator": "sim/mujoco/collision_safety/oracle.py"
+    },
+    {
+      "artifact_id": "rm65-collision-policy-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "sim_object_follow_payload_source",
+      "sha256": "206fe03b9d0c4550218e58c1c14cb5e079baa29210eb29e6daa586e53e2fcde9",
+      "locator": "sim/mujoco/collision_safety/policy.py"
+    },
+    {
+      "artifact_id": "rm65-collision-projection-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "sim_grasp_contact_source",
+      "sha256": "19e0a21f233788fc922e9a3df1ba3298b1b5966a48cb185967b75406c178e4a9",
+      "locator": "sim/mujoco/collision_safety/projection.py"
+    },
+    {
+      "artifact_id": "rm65-collision-result-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "sim_grasp_contact_source",
+      "sha256": "14f97c5b26971d82a011d04395a37486843cbb3049b459795e7659b33267f79b",
+      "locator": "sim/mujoco/collision_safety/result.py"
+    },
+    {
+      "artifact_id": "rm65-position-assembly-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "sim_command_admission_source",
+      "sha256": "81d18dc93e7fb53d4fd6545e1f3c2089660a55a9a22b951127ec94903d36db61",
+      "locator": "sim/mujoco/control/desk_tcp_position.py"
+    },
+    {
+      "artifact_id": "rm65-agent-skill-target-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "sim_agent_skill_target_source",
+      "sha256": "03d59a0c653c78bdc0321ab1f1d7db9eb8a280190e332d724ec42ca928da0a8f",
+      "locator": "sim/mujoco/deploy/agent_skill_target.py"
+    },
+    {
+      "artifact_id": "checkpoint-sim-mujoco-deploy-component_action_profile-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "sim_checkpoint_source",
+      "sha256": "80707f7f53cfa29ad0c13b06362d339f37f00ae445c1c35012be68f1d276c965",
+      "locator": "sim/mujoco/deploy/component_action_profile.py"
+    },
+    {
+      "artifact_id": "rm65-contact-timing-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "sim_object_follow_payload_source",
+      "sha256": "8e4721e30b4fa28584b3fd53129c532cb8074951e45786fe37053cfd76dd7af7",
+      "locator": "sim/mujoco/deploy/contact_timing.py"
+    },
+    {
+      "artifact_id": "checkpoint-sim-mujoco-deploy-execution_difference-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "sim_checkpoint_source",
+      "sha256": "7983de34b11a92e239e1048bbfe84cfa385a721b1b3b0be0289fe34d90da4dcb",
+      "locator": "sim/mujoco/deploy/execution_difference.py"
+    },
+    {
+      "artifact_id": "checkpoint-sim-mujoco-deploy-execution_pose_observation-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "sim_checkpoint_source",
+      "sha256": "2b865a3e80bf582ba200de01f6b28a1e59c30dccdaf456f8c612614dd4b77812",
+      "locator": "sim/mujoco/deploy/execution_pose_observation.py"
+    },
+    {
+      "artifact_id": "rm65-grasp-contact-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "sim_grasp_contact_source",
+      "sha256": "896617786c6611173608cb49cda67df2bdfbaf6b68c06115d497a19d934ae459",
+      "locator": "sim/mujoco/deploy/grasp_contact.py"
+    },
+    {
+      "artifact_id": "rm65-grasped-object-observer-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "sim_object_follow_payload_source",
+      "sha256": "c4814285b108fe4ce27dd8fe3fa9dc510e87ba288fad87c49047585ddb3476c6",
+      "locator": "sim/mujoco/deploy/grasped_object.py"
+    },
+    {
+      "artifact_id": "checkpoint-sim-mujoco-deploy-observation-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "sim_checkpoint_source",
+      "sha256": "67baf0571f28482b40fb918cd90406466e1f1d3d0727f92aa1655f86f6a05f33",
+      "locator": "sim/mujoco/deploy/observation.py"
+    },
+    {
+      "artifact_id": "checkpoint-sim-mujoco-deploy-observation_checkpoint-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "sim_checkpoint_source",
+      "sha256": "8dbfa4deac19a3473d897c1d2b0067c4ada2a0c5a7b30053c8b362c73cd4f801",
+      "locator": "sim/mujoco/deploy/observation_checkpoint.py"
+    },
+    {
+      "artifact_id": "rm65-payload-motion-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "sim_object_follow_payload_source",
+      "sha256": "bc5b4ae30e372a6ca69b29c276f23ad75c5fe8595fcc7ec85e538b0d26e66b02",
+      "locator": "sim/mujoco/deploy/payload_motion.py"
+    },
+    {
+      "artifact_id": "rm65-planned-tcp-motion-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "sim_grasp_contact_source",
+      "sha256": "c0a8f8bb0cf4ba627025f4a60a7cf56991a34b1c27312551376ffcfb147bed55",
+      "locator": "sim/mujoco/deploy/planned_tcp_motion.py"
+    },
+    {
+      "artifact_id": "checkpoint-sim-mujoco-deploy-pose_kinematics-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "sim_checkpoint_source",
+      "sha256": "344912f9a4a555d76227c806ea47edb65253f73ac10440fa59b6235642e2ad29",
+      "locator": "sim/mujoco/deploy/pose_kinematics.py"
+    },
+    {
+      "artifact_id": "checkpoint-sim-mujoco-deploy-pose_resolution-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "sim_checkpoint_source",
+      "sha256": "19c9446a40eb42aa04fb75b9613bdb58398e84467d8304332fd6bf8aea55bead",
+      "locator": "sim/mujoco/deploy/pose_resolution.py"
+    },
+    {
+      "artifact_id": "rm65-deploy-runtime-core-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "sim_runtime_source",
+      "sha256": "4dedfef2d379d1f3708a06e0425a31f93cfa3e9de2bf2680e24acf25ca525eea",
+      "locator": "sim/mujoco/deploy/runtime.py"
+    },
+    {
+      "artifact_id": "checkpoint-sim-mujoco-deploy-runtime_checkpoint-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "sim_checkpoint_source",
+      "sha256": "4848dec17d572e7f78784bcd5caf60bbf0d8a7c0569836314c7b05589705b595",
+      "locator": "sim/mujoco/deploy/runtime_checkpoint.py"
+    },
+    {
+      "artifact_id": "checkpoint-sim-mujoco-deploy-target_checkpoint-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "sim_checkpoint_source",
+      "sha256": "a42a66cd2743e5653cacbc3b5f4995068ac5663fa0ac8edd6888b612394de12b",
+      "locator": "sim/mujoco/deploy/target_checkpoint.py"
+    },
+    {
+      "artifact_id": "checkpoint-sim-mujoco-deploy-target_measurement-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "sim_checkpoint_source",
+      "sha256": "9de3a614522d1ecf78229796833832b014a9c4fa8f62e29fcdd3c4ba102d95c7",
+      "locator": "sim/mujoco/deploy/target_measurement.py"
+    },
+    {
+      "artifact_id": "checkpoint-sim-mujoco-deploy-target_preparation-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "sim_checkpoint_source",
+      "sha256": "8ffb3556f13f04146f35699aba69a54dfde9df95dc9e4c7c9f5e55f817e4e140",
+      "locator": "sim/mujoco/deploy/target_preparation.py"
+    },
+    {
+      "artifact_id": "rm65-rgbd-source-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "sim_planning_source",
+      "sha256": "44839367f22a644288ae2b7349866004dfeff72b51a3e0e4873649f2cc55e960",
+      "locator": "sim/mujoco/depth_snapshot.py"
+    },
+    {
+      "artifact_id": "checkpoint-sim-mujoco-ik-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "sim_checkpoint_source",
+      "sha256": "209959b2593d7257feedc9151a06d8d8b5330c0f74b622a7ef23a28fdbf63104",
+      "locator": "sim/mujoco/ik.py"
+    },
+    {
+      "artifact_id": "checkpoint-sim-mujoco-native_checkpoint-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "sim_checkpoint_source",
+      "sha256": "815af665301cc5b009ab0a2cdd33ceaf1d2ce0109d78967b3057868e3eb4c99f",
+      "locator": "sim/mujoco/native_checkpoint.py"
+    },
+    {
+      "artifact_id": "checkpoint-sim-mujoco-scene-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "sim_checkpoint_source",
+      "sha256": "31fe899e1c7bff198ef2a4ed599035344f13ce572b2699a1766cd54f762080bf",
+      "locator": "sim/mujoco/scene.py"
+    },
+    {
+      "artifact_id": "rm65-arm-actuator-core-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "sim_actuator_core_source",
+      "sha256": "5a7bc50ef6a171586e3dc53f0ee9ad35b7048a2b30a0569f093186f0a343a643",
+      "locator": "sim/rm65/actuation/core.py"
+    },
+    {
+      "artifact_id": "checkpoint-sim-rm65-actuation-gripper-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "sim_checkpoint_source",
+      "sha256": "4c17b5f59a5021136c63999c45a8919479c010c2866b33347caa9dcb33d92767",
+      "locator": "sim/rm65/actuation/gripper.py"
+    },
+    {
+      "artifact_id": "rm65-arm-profile-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "actuation_profile",
+      "sha256": "551b8a832f97d6e4fdfaef96b0cd3ff8b7dee46f4610ac948e23ff13602c48de",
+      "locator": "sim/rm65/actuation/profile.py"
+    },
+    {
+      "artifact_id": "rm65-grasp-trajectory-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "runtime_source",
+      "sha256": "4dd83a94f49f5dedc374a5dcda0dec8ab16e39ba46984a34779ca2c8fc205982",
+      "locator": "teleop_runtime/skill_deploy/rm65_grasp_trajectory.py"
+    },
+    {
+      "artifact_id": "real-gripper-resources-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "runtime_source",
+      "sha256": "7dae2b69d142d598ad616b8aac3d79f6f2779a6d062c3177393a24139d40290d",
+      "locator": "agent_gateway/profiles/real/gripper_skill.py"
+    },
+    {
+      "artifact_id": "placement-owner-0-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "runtime_source",
+      "sha256": "806f38c11e14c97d89d226672866dd9d2a81a761777345ef48c35cc2a25ca95f",
+      "locator": "agent_gateway/profiles/mujoco/gripper_skill.py"
+    },
+    {
+      "artifact_id": "placement-owner-1-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "runtime_source",
+      "sha256": "5780169c5876e4e2c16606134f30b56badf6d7ab3fa952f1631044e70877ce99",
+      "locator": "agent_gateway/profiles/mujoco/held_box.py"
+    },
+    {
+      "artifact_id": "placement-owner-2-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "runtime_source",
+      "sha256": "d8067ed50468ff7bb179d6e4a1d2c6d94cd1c575b8d77869e5c8badb913dc3f4",
+      "locator": "agent_gateway/profiles/mujoco/object_motion.py"
+    },
+    {
+      "artifact_id": "placement-owner-3-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "runtime_source",
+      "sha256": "412dad00fc489576d527ffdc75cf8c80fad749bf6e73eec39020338efb102e8f",
+      "locator": "agent_gateway/profiles/mujoco/object_state.py"
+    },
+    {
+      "artifact_id": "placement-owner-4-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "runtime_source",
+      "sha256": "fab733f440a58edf7b7f0eac9912822988a7566cb0275e9053dd3d01057801dd",
+      "locator": "agent_gateway/profiles/mujoco/support_box.py"
+    },
+    {
+      "artifact_id": "placement-owner-5-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "runtime_source",
+      "sha256": "012bbae834abb5deddbfa103b981bd91cbe97877db5119315a844ac9a7c80c55",
+      "locator": "agent_gateway/profiles/real/perception_cli.py"
+    },
+    {
+      "artifact_id": "placement-owner-6-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "runtime_source",
+      "sha256": "d6fe27ec9659ac787ceb87f412353f7d74680984dc8d266bf617806fbf244e52",
+      "locator": "agent_gateway/skills/gripper/deployment.py"
+    },
+    {
+      "artifact_id": "placement-owner-7-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "runtime_source",
+      "sha256": "b1f8542796e69341b03426f4a04a04b818f68c94d0a00877195fd24d7a3414c5",
+      "locator": "agent_gateway/skills/gripper/runtime.py"
+    },
+    {
+      "artifact_id": "placement-owner-8-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "runtime_source",
+      "sha256": "8709f5d42e0f0c97b37e5d8087d855b5d5502e34c522b4861876743e61063c79",
+      "locator": "agent_gateway/skills/motion/grasped_object.py"
+    },
+    {
+      "artifact_id": "named-release-owner-0-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "runtime_source",
+      "sha256": "cf14475e7fb48b4174c7816fe9268c751cc76621bc0de8cfde602e9f3446ad5a",
+      "locator": "agent_gateway/skills/gripper/definition.py"
+    },
+    {
+      "artifact_id": "real-observed-motion-owner-0-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "runtime_source",
+      "sha256": "30d3d127aaad169b9219ace35d36c2ea9e177cc82cc12a7b55764053ec26c44d",
+      "locator": "agent_gateway/profiles/real/exclusive_factory.py"
+    },
+    {
+      "artifact_id": "real-observed-motion-owner-1-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "runtime_source",
+      "sha256": "ef514c55dc88d1d159d48bae0d06bfe2efa02bf4bdec9f24faa61feea83addf5",
+      "locator": "agent_gateway/profiles/real/motion_primitive_skill.py"
+    },
+    {
+      "artifact_id": "real-observed-motion-owner-2-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "runtime_source",
+      "sha256": "dcfaedf5c1b504ed1f5ceede14096cc8afd937e7d910d76f4a3fd9d8735fdb06",
+      "locator": "agent_gateway/profiles/real/observed_point_motion.py"
+    },
+    {
+      "artifact_id": "real-observed-motion-owner-3-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "runtime_configuration",
+      "sha256": "372080fba48909b0575366994dd0f05b33df51686bb02898bf955f523a975378",
+      "locator": "teleop_runtime/configs/skill_deploy/rm65_dmtac_capture_self_filter_cad_v1.json"
+    },
+    {
+      "artifact_id": "skill-region-owner-0-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "runtime_source",
+      "sha256": "f0b9d9eb399076d087f73040152f98dd1afe7d8c3dc622daba8dfd67f4833277",
+      "locator": "robot_motion/path_planning/motion_quality.py"
+    },
+    {
+      "artifact_id": "skill-region-owner-1-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "runtime_source",
+      "sha256": "26ba847f6dddd85ce87ed105d7d7293d33bee7ade57b55eaab2e5e732fb65a14",
+      "locator": "robot_motion/path_planning/sampling.py"
+    },
+    {
+      "artifact_id": "combined-runtime-owner-0-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "runtime_source",
+      "sha256": "9c8a62d6047f190d7b4ff98c9c9af498d93ccfd09a8bf1295b5dc69a8058859a",
+      "locator": "sim/mujoco/actuation/__init__.py"
+    },
+    {
+      "artifact_id": "combined-runtime-owner-1-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "runtime_source",
+      "sha256": "8f10ef7c917d8add4143010f93d68b456f3d809188df375386669a399219a8e8",
+      "locator": "sim/mujoco/actuation/gripper_profile.py"
+    },
+    {
+      "artifact_id": "combined-runtime-owner-2-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "runtime_source",
+      "sha256": "53c352369bad9cec47fd6062361ade11ad06a59e24922774c82f3cfb57264f3e",
+      "locator": "sim/mujoco/mjcf.py"
+    },
+    {
+      "artifact_id": "combined-runtime-owner-3-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "runtime_source",
+      "sha256": "895a3174d69ee6eb10238fddf0dc9596e0e737e03a0985c6b6016f434faf2753",
+      "locator": "sim/mujoco/modeling/geometry.py"
+    },
+    {
+      "artifact_id": "combined-runtime-owner-4-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "runtime_source",
+      "sha256": "46a18d86d607cd57d48b4d3ec2ff826e589d2babd96a14ed19a58881ab261421",
+      "locator": "sim/mujoco/modeling/gripper_actuators.py"
+    },
+    {
+      "artifact_id": "combined-runtime-owner-5-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "runtime_source",
+      "sha256": "c32b776f8223a95e78beb309a712b5202d72025bd358df532f65833fa4ca2b72",
+      "locator": "sim/mujoco/modeling/objects.py"
+    },
+    {
+      "artifact_id": "observed-cache-owner-0-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "runtime_source",
+      "sha256": "993a70853ac30cf7b4a1ca5549f24914d414264e33de17807804da2dd08afd65",
+      "locator": "robot_motion/observed_obstacles.py"
+    },
+    {
+      "artifact_id": "tool-entity-gateway-owner-0-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "runtime_source",
+      "sha256": "5c024b5bd3863341f8e049379661d08eb82d02514d3c9c947a4d095de702ecfc",
+      "locator": "robot_motion/tool_entity_scene.py"
+    },
+    {
+      "artifact_id": "tool-entity-gateway-owner-1-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "runtime_source",
+      "sha256": "4aabfcd5b28ff268b6e031620a539cd475163da76cae3569fd1d075a41ff9d30",
+      "locator": "deployments/perception/dmtac_tool_entity.py"
+    },
+    {
+      "artifact_id": "tool-entity-gateway-owner-2-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "runtime_source",
+      "sha256": "ac01e2bcfbc15a8c3a7c15f22950319965225bf0f9149c123d4849d670e3e701",
+      "locator": "agent_gateway/skills/perception/tool_entity.py"
+    },
+    {
+      "artifact_id": "tool-entity-gateway-owner-3-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "runtime_source",
+      "sha256": "baf394ac9c1e4536b4894047bec640f0c3c138435c6d0c58218c48ba167a3bb2",
+      "locator": "agent_gateway/profiles/tool_entity.py"
+    },
+    {
+      "artifact_id": "tool-entity-gateway-owner-4-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "runtime_source",
+      "sha256": "9b35883caffa0f7fa255d5b02081aa9661c6cd33674719694b625b44141d4f83",
+      "locator": "agent_gateway/profiles/real/tool_entity.py"
+    },
+    {
+      "artifact_id": "tool-entity-gateway-owner-5-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "runtime_source",
+      "sha256": "5ddb832eb94eb1ff46e21351367ffb8de4660add7f397e8a7d6ad4e4d690363d",
+      "locator": "agent_gateway/profiles/mujoco/tool_entity.py"
+    },
+    {
+      "artifact_id": "mujoco-agent-place-owner-0-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "runtime_source",
+      "sha256": "88b8fd0d0e9af62dd02694ae882be0cb574dbe6ed03f943a9dcc65785de3631c",
+      "locator": "agent_gateway/profiles/measured_support.py"
+    },
+    {
+      "artifact_id": "mujoco-agent-place-owner-1-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "runtime_source",
+      "sha256": "6f31df3455f65b89c4ffa9fa7d6f7c7c46f9cc941035e8035ca9480b7a4f7961",
+      "locator": "agent_gateway/skills/perception/support_release_query.py"
+    },
+    {
+      "artifact_id": "mujoco-agent-place-owner-2-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "runtime_source",
+      "sha256": "7e6762af397e29d91dd10d4e1ea35e3d8bc781da43b41c74bec852c58ea5828b",
+      "locator": "agent_gateway/profiles/mujoco/support_release_query.py"
+    },
+    {
+      "artifact_id": "mujoco-agent-place-owner-3-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "runtime_source",
+      "sha256": "28fef9095ec10113d8799df914e750f280694fa72d50a483094b9b3f29c3983d",
+      "locator": "agent_gateway/skills/perception/grasp_approach_query.py"
+    },
+    {
+      "artifact_id": "mujoco-agent-place-owner-4-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "runtime_source",
+      "sha256": "b680b6648f139a33fe9a853e672000df7dcf0fb76883199b656b184fa1d9c81a",
+      "locator": "agent_gateway/profiles/mujoco/grasp_approach_query.py"
+    },
+    {
+      "artifact_id": "mujoco-agent-place-owner-5-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "runtime_source",
+      "sha256": "28b19a76035e732f9299538b7c280799f0123db9dcda864dc91454d2095139fa",
+      "locator": "agent_gateway/skills/motion/schemas.py"
+    },
+    {
+      "artifact_id": "real-place-owner-0-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "runtime_source",
+      "sha256": "8b5453083390d4773142f02adb5169e20074586d6cbf417b03c4bd7294910e48",
+      "locator": "robot_motion/held_object_measurement.py"
+    },
+    {
+      "artifact_id": "real-place-owner-1-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "runtime_source",
+      "sha256": "ebca59d25c9a7266a5149cc23ccfd7d4bc8895785722c34b2c0f72864c5719c8",
+      "locator": "agent_gateway/profiles/real/held_object.py"
+    },
+    {
+      "artifact_id": "real-place-owner-2-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "runtime_source",
+      "sha256": "ec3effd08c6ea1187aa8e727f7f4cc43d0ac571704c4ced1aa8946430c65753b",
+      "locator": "agent_gateway/profiles/real/object_motion.py"
+    },
+    {
+      "artifact_id": "real-rm65-6f-owner-0-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "runtime_source",
+      "sha256": "609489e273e8ad5e82b0706163e02d273c95fe7b9c95238b2337bde9a9943df1",
+      "locator": "agent_gateway/profiles/real/realsense_perception.py"
+    },
+    {
+      "artifact_id": "real-rm65-6f-owner-1-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "runtime_source",
+      "sha256": "3e309a59ff20dc63582b51a790323965e7f9095deacf5a6b38100332a342efca",
+      "locator": "robot_motion/rm65/scene_profiles.py"
+    },
+    {
+      "artifact_id": "real-rm65-6f-owner-2-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "runtime_source",
+      "sha256": "f07f7d2f75ed1a83476682321eff8160c4646fd40facdb7b974fccbc6c983261",
+      "locator": "robot_motion/scene_obstacles.py"
+    },
+    {
+      "artifact_id": "real-rm65-6f-owner-3-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "runtime_configuration",
+      "sha256": "dec5a9b84069eb0cae67f53ec45c79f1b6d6989f0a946470fe5fcbedc348c268",
+      "locator": "robot_motion/configs/rm65_camera_registry_v5_rm65_6f_20261031.json"
+    },
+    {
+      "artifact_id": "real-support-release-owner-0-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "runtime_source",
+      "sha256": "efb5607b24c24932b9409dd0d1fddf76d74f497ad80aed5978a593a59bf335fa",
+      "locator": "agent_gateway/profiles/real/support_release_query.py"
+    },
+    {
+      "artifact_id": "real-support-release-owner-1-runtime-20261101-real-support-release-v1",
+      "artifact_kind": "runtime_source",
+      "sha256": "1783c69ffa9a75e36c329498ef4b8bd32bb7e490e34e5f60b055b630458e411d",
+      "locator": "agent_gateway/skills/perception/support_release_query_v2.py"
+    },
+    {
+      "artifact_id": "real-support-release-query-input-0-20261101-real-support-release-v1",
+      "artifact_kind": "offline_query_source",
+      "sha256": "cce5b1bfcad13b8a6f53ceb74cdd48675c5974fd85d6151d7628871283d5a057",
+      "locator": "scripts/probes/query_safe_move_snapshot.py"
+    },
+    {
+      "artifact_id": "real-support-release-query-input-1-20261101-real-support-release-v1",
+      "artifact_kind": "offline_query_source",
+      "sha256": "faaaeabf3dd8360712a214258643bb6dffe967d1c236a084467e227c5004a0d7",
+      "locator": "robot_motion/tool_entity_goals.py"
+    },
+    {
+      "artifact_id": "real-support-release-query-input-2-20261101-real-support-release-v1",
+      "artifact_kind": "offline_query_source",
+      "sha256": "993a70853ac30cf7b4a1ca5549f24914d414264e33de17807804da2dd08afd65",
+      "locator": "robot_motion/observed_obstacles.py"
+    },
+    {
+      "artifact_id": "real-support-release-query-input-3-20261101-real-support-release-v1",
+      "artifact_kind": "offline_query_source",
+      "sha256": "92db50a4b07e5df28e8a41eb80b1dfa28db99c4332fc44ce363cbc820126b205",
+      "locator": "robot_motion/grasp_visible_scene.py"
+    },
+    {
+      "artifact_id": "real-support-release-query-input-4-20261101-real-support-release-v1",
+      "artifact_kind": "offline_query_source",
+      "sha256": "d710bd09d893e9cda9b3b524bfe90dc0aeb9af370b267b542cbf1c890615274e",
+      "locator": "deployments/perception/dmtac_grasp_overlay.py"
+    },
+    {
+      "artifact_id": "real-support-release-query-input-5-20261101-real-support-release-v1",
+      "artifact_kind": "offline_query_configuration",
+      "sha256": "27d1351e570c2abb72c2b45b477531558f4a238b3d4daac3c9bbe3796a40ec98",
+      "locator": "deployments/perception/profiles/dmtac_graspgenx_alignment_v5_q0.json"
+    },
+    {
+      "artifact_id": "real-support-release-focused-report-20261101-real-support-release-v1",
+      "artifact_kind": "offline_validation_report",
+      "sha256": "cd37a149d0edd0f4b3c398da4e28c5d88d5e3f122569c612eb4c7cfc83bd064d",
+      "locator": "artifact://real-support-release-focused-report-20261101-real-support-release-v1"
+    },
+    {
+      "artifact_id": "real-support-release-focused-binding-20261101-real-support-release-v1",
+      "artifact_kind": "offline_validation_report",
+      "sha256": "6ddb068d94d136ef68cada8e5e270ac5fb5fb8c220a70de2ebea0b78b8fa5ca4",
+      "locator": "artifact://real-support-release-focused-binding-20261101-real-support-release-v1"
+    },
+    {
+      "artifact_id": "real-support-release-offline-samples-report-20261101-real-support-release-v1",
+      "artifact_kind": "offline_validation_report",
+      "sha256": "149f93725f62763612781b3ce022c95e8283c14eb4c366d8f24761fc1ae65c3f",
+      "locator": "artifact://real-support-release-offline-samples-report-20261101-real-support-release-v1"
+    },
+    {
+      "artifact_id": "real-support-release-prompt-survey-20261101-real-support-release-v1",
+      "artifact_kind": "offline_validation_report",
+      "sha256": "61e1c8e26a725a4c9d038f646b68d176514e08ea00567de1643ea519144b6fae",
+      "locator": "artifact://real-support-release-prompt-survey-20261101-real-support-release-v1"
+    }
+  ],
+  "fidelity_claims": [
+    {
+      "component": "arm.position_response.free_motion.runtime_source_binding",
+      "status": "provisional",
+      "evidence_artifact_ids": [
+        "rm65-correlated-rgbd-contract-runtime-20261101-real-support-release-v1",
+        "rm65-shared-localization-provider-runtime-20261101-real-support-release-v1",
+        "rm65-shared-localization-deployment-runtime-20261101-real-support-release-v1",
+        "rm65-depth-capture-conversion-runtime-20261101-real-support-release-v1",
+        "rm65-motion-launcher-runtime-20261101-real-support-release-v1",
+        "rm65-native-grasp-deployment-runtime-20261101-real-support-release-v1",
+        "rm65-native-grasp-fast-plan-runtime-20261101-real-support-release-v1",
+        "rm65-native-grasp-observation-runtime-20261101-real-support-release-v1",
+        "rm65-motion-application-runtime-20261101-real-support-release-v1",
+        "rm65-motion-deployment-runtime-20261101-real-support-release-v1",
+        "rm65-motion-factory-runtime-20261101-real-support-release-v1",
+        "rm65-segmentation-session-runtime-20261101-real-support-release-v1",
+        "rm65-observed-scene-runtime-20261101-real-support-release-v1",
+        "rm65-native-prepared-skill-runtime-20261101-real-support-release-v1",
+        "rm65-object-path-query-runtime-20261101-real-support-release-v1",
+        "rm65-observed-point-consumer-runtime-20261101-real-support-release-v1",
+        "rm65-native-continuation-executor-runtime-20261101-real-support-release-v1",
+        "rm65-retained-observed-point-runtime-20261101-real-support-release-v1",
+        "rm65-paired-rgbd-codec-runtime-20261101-real-support-release-v1",
+        "rm65-pose-candidate-executor-runtime-20261101-real-support-release-v1",
+        "rm65-query-geometry-runtime-20261101-real-support-release-v1",
+        "rm65-real-current-gateway-cli-runtime-20261101-real-support-release-v1",
+        "rm65-real-localization-deployment-facade-runtime-20261101-real-support-release-v1",
+        "rm65-real-localization-provider-facade-runtime-20261101-real-support-release-v1",
+        "rm65-real-compatibility-motion-factory-runtime-20261101-real-support-release-v1",
+        "rm65-real-current-gateway-session-runtime-20261101-real-support-release-v1",
+        "rm65-real-current-motion-profiles-runtime-20261101-real-support-release-v1",
+        "rm65-real-current-one-shot-client-runtime-20261101-real-support-release-v1",
+        "rm65-real-current-composition-runtime-20261101-real-support-release-v1",
+        "rm65-real-current-authorization-runtime-20261101-real-support-release-v1",
+        "rm65-region-continuation-executor-runtime-20261101-real-support-release-v1",
+        "rm65-relation-continuation-executor-runtime-20261101-real-support-release-v1",
+        "rm65-paired-rgbd-capture-runtime-20261101-real-support-release-v1",
+        "rm65-segmentation-provider-runtime-20261101-real-support-release-v1",
+        "rm65-segmentation-batch-runtime-20261101-real-support-release-v1",
+        "rm65-spatial-goal-provider-runtime-20261101-real-support-release-v1",
+        "rm65-surface-anchor-runtime-20261101-real-support-release-v1",
+        "rm65-surface-selection-runtime-20261101-real-support-release-v1",
+        "rm65-paired-surface-anchor-runtime-20261101-real-support-release-v1",
+        "rm65-tcp-continuation-executor-runtime-20261101-real-support-release-v1",
+        "rm65-retained-motion-definitions-runtime-20261101-real-support-release-v1",
+        "rm65-observed-point-contract-runtime-20261101-real-support-release-v1",
+        "rm65-safe-tcp-v2-contract-runtime-20261101-real-support-release-v1",
+        "rm65-segmentation-definitions-runtime-20261101-real-support-release-v1",
+        "rm65-object-path-contract-runtime-20261101-real-support-release-v1",
+        "rm65-pose-candidate-contract-runtime-20261101-real-support-release-v1",
+        "rm65-region-continuation-contract-runtime-20261101-real-support-release-v1",
+        "rm65-relation-continuation-contract-runtime-20261101-real-support-release-v1",
+        "rm65-paired-rgbd-skill-contract-runtime-20261101-real-support-release-v1",
+        "rm65-segmentation-schemas-runtime-20261101-real-support-release-v1",
+        "rm65-spatial-goal-contract-runtime-20261101-real-support-release-v1",
+        "rm65-surface-anchor-contract-runtime-20261101-real-support-release-v1",
+        "rm65-surface-anchor-v2-contract-runtime-20261101-real-support-release-v1",
+        "rm65-surface-anchor-v3-contract-runtime-20261101-real-support-release-v1",
+        "rm65-tcp-continuation-contract-runtime-20261101-real-support-release-v1",
+        "checkpoint-control_composition-observability-execution_difference-runtime-20261101-real-support-release-v1",
+        "checkpoint-control_composition-observability-modules-runtime-20261101-real-support-release-v1",
+        "rm65-real-compatibility-control-station-runtime-20261101-real-support-release-v1",
+        "checkpoint-dataset_contracts-action_schema-runtime-20261101-real-support-release-v1",
+        "checkpoint-dataset_contracts-canonical_encoding-runtime-20261101-real-support-release-v1",
+        "checkpoint-dataset_contracts-control_trace-runtime-20261101-real-support-release-v1",
+        "rm65-paired-rgbd-artifact-contract-runtime-20261101-real-support-release-v1",
+        "rm65-sam3-rpc-model-client-runtime-20261101-real-support-release-v1",
+        "checkpoint-robot_motion-action-adaptation-runtime-20261101-real-support-release-v1",
+        "checkpoint-robot_motion-action-admission_checkpoint-runtime-20261101-real-support-release-v1",
+        "checkpoint-robot_motion-action-arbiter-runtime-20261101-real-support-release-v1",
+        "checkpoint-robot_motion-action-arbitration_runtime-runtime-20261101-real-support-release-v1",
+        "checkpoint-robot_motion-action-authoritative_checkpoint-runtime-20261101-real-support-release-v1",
+        "checkpoint-robot_motion-action-authoritative_control-runtime-20261101-real-support-release-v1",
+        "checkpoint-robot_motion-action-authoritative_trace-runtime-20261101-real-support-release-v1",
+        "checkpoint-robot_motion-action-authority-runtime-20261101-real-support-release-v1",
+        "checkpoint-robot_motion-action-candidate_authorization-runtime-20261101-real-support-release-v1",
+        "checkpoint-robot_motion-action-checkpoint_codec-runtime-20261101-real-support-release-v1",
+        "checkpoint-robot_motion-action-component_action-runtime-20261101-real-support-release-v1",
+        "checkpoint-robot_motion-action-components-runtime-20261101-real-support-release-v1",
+        "checkpoint-robot_motion-action-decision_checkpoint-runtime-20261101-real-support-release-v1",
+        "checkpoint-robot_motion-action-dispatch_context-runtime-20261101-real-support-release-v1",
+        "checkpoint-robot_motion-action-execution_handoff-runtime-20261101-real-support-release-v1",
+        "checkpoint-robot_motion-action-execution_observation-runtime-20261101-real-support-release-v1",
+        "checkpoint-robot_motion-action-executor-runtime-20261101-real-support-release-v1",
+        "checkpoint-robot_motion-action-persistence-runtime-20261101-real-support-release-v1",
+        "checkpoint-robot_motion-action-proposal-runtime-20261101-real-support-release-v1",
+        "checkpoint-robot_motion-action-schema-runtime-20261101-real-support-release-v1",
+        "checkpoint-robot_motion-action-target_capability-runtime-20261101-real-support-release-v1",
+        "rm65-camera-registry-runtime-20261101-real-support-release-v1",
+        "rm65-object-release-runtime-20261101-real-support-release-v1",
+        "rm65-object-transport-runtime-20261101-real-support-release-v1",
+        "rm65-observed-joint-input-runtime-20261101-real-support-release-v1",
+        "rm65-tcp-axis-constraint-runtime-20261101-real-support-release-v1",
+        "checkpoint-robot_motion-position_control-capability-runtime-20261101-real-support-release-v1",
+        "rm65-waypoint-cancellation-runtime-20261101-real-support-release-v1",
+        "checkpoint-robot_motion-position_control-trajectory-runtime-20261101-real-support-release-v1",
+        "checkpoint-robot_motion-position_control-trajectory_checkpoint-runtime-20261101-real-support-release-v1",
+        "checkpoint-robot_motion-rm65-dual_arm_ik-runtime-20261101-real-support-release-v1",
+        "checkpoint-robot_motion-rm65-dual_arm_target_solver-runtime-20261101-real-support-release-v1",
+        "checkpoint-robot_motion-rm65-ik_checkpoint-runtime-20261101-real-support-release-v1",
+        "rm65-observed-collision-model-runtime-20261101-real-support-release-v1",
+        "checkpoint-robot_motion-rm65-retargeter_checkpoint-runtime-20261101-real-support-release-v1",
+        "rm65-single-arm-ik-runtime-20261101-real-support-release-v1",
+        "checkpoint-robot_motion-runtime-cancellation-runtime-20261101-real-support-release-v1",
+        "checkpoint-robot_motion-runtime-control_admission-runtime-20261101-real-support-release-v1",
+        "checkpoint-robot_motion-runtime-dispatch-runtime-20261101-real-support-release-v1",
+        "checkpoint-robot_motion-runtime-dispatch_owner-runtime-20261101-real-support-release-v1",
+        "checkpoint-robot_motion-runtime-execution_checkpoint-runtime-20261101-real-support-release-v1",
+        "checkpoint-robot_motion-runtime-execution_gate-runtime-20261101-real-support-release-v1",
+        "checkpoint-robot_motion-runtime-identity-runtime-20261101-real-support-release-v1",
+        "checkpoint-robot_motion-runtime-immutable-runtime-20261101-real-support-release-v1",
+        "checkpoint-robot_motion-runtime-producer_epoch-runtime-20261101-real-support-release-v1",
+        "rm65-spatial-goal-regions-runtime-20261101-real-support-release-v1",
+        "rm65-relation-goal-core-runtime-20261101-real-support-release-v1",
+        "checkpoint-robot-motion-target-safety-checkpoint-runtime-20261101-real-support-release-v1",
+        "rm65-tcp-envelope-query-runtime-20261101-real-support-release-v1",
+        "rm65-tcp-pose-envelope-core-runtime-20261101-real-support-release-v1",
+        "rm65-native-continuation-clutter-scene-runtime-20261101-real-support-release-v1",
+        "rm65-native-continuation-clutter-task-runtime-20261101-real-support-release-v1",
+        "checkpoint-sim-mujoco-actuation-checkpoint-runtime-20261101-real-support-release-v1",
+        "rm65-arm-mujoco-executor-runtime-20261101-real-support-release-v1",
+        "rm65-gripper-executor-runtime-20261101-real-support-release-v1",
+        "checkpoint-sim-mujoco-adapters-checkpoint-runtime-20261101-real-support-release-v1",
+        "rm65-position-rig-runtime-20261101-real-support-release-v1",
+        "rm65-command-guard-runtime-20261101-real-support-release-v1",
+        "rm65-envelope-adapter-runtime-20261101-real-support-release-v1",
+        "rm65-collision-oracle-runtime-20261101-real-support-release-v1",
+        "rm65-collision-policy-runtime-20261101-real-support-release-v1",
+        "rm65-collision-projection-runtime-20261101-real-support-release-v1",
+        "rm65-collision-result-runtime-20261101-real-support-release-v1",
+        "rm65-position-assembly-runtime-20261101-real-support-release-v1",
+        "rm65-agent-skill-target-runtime-20261101-real-support-release-v1",
+        "checkpoint-sim-mujoco-deploy-component_action_profile-runtime-20261101-real-support-release-v1",
+        "rm65-contact-timing-runtime-20261101-real-support-release-v1",
+        "checkpoint-sim-mujoco-deploy-execution_difference-runtime-20261101-real-support-release-v1",
+        "checkpoint-sim-mujoco-deploy-execution_pose_observation-runtime-20261101-real-support-release-v1",
+        "rm65-grasp-contact-runtime-20261101-real-support-release-v1",
+        "rm65-grasped-object-observer-runtime-20261101-real-support-release-v1",
+        "checkpoint-sim-mujoco-deploy-observation-runtime-20261101-real-support-release-v1",
+        "checkpoint-sim-mujoco-deploy-observation_checkpoint-runtime-20261101-real-support-release-v1",
+        "rm65-payload-motion-runtime-20261101-real-support-release-v1",
+        "rm65-planned-tcp-motion-runtime-20261101-real-support-release-v1",
+        "checkpoint-sim-mujoco-deploy-pose_kinematics-runtime-20261101-real-support-release-v1",
+        "checkpoint-sim-mujoco-deploy-pose_resolution-runtime-20261101-real-support-release-v1",
+        "rm65-deploy-runtime-core-runtime-20261101-real-support-release-v1",
+        "checkpoint-sim-mujoco-deploy-runtime_checkpoint-runtime-20261101-real-support-release-v1",
+        "checkpoint-sim-mujoco-deploy-target_checkpoint-runtime-20261101-real-support-release-v1",
+        "checkpoint-sim-mujoco-deploy-target_measurement-runtime-20261101-real-support-release-v1",
+        "checkpoint-sim-mujoco-deploy-target_preparation-runtime-20261101-real-support-release-v1",
+        "rm65-rgbd-source-runtime-20261101-real-support-release-v1",
+        "checkpoint-sim-mujoco-ik-runtime-20261101-real-support-release-v1",
+        "checkpoint-sim-mujoco-native_checkpoint-runtime-20261101-real-support-release-v1",
+        "checkpoint-sim-mujoco-scene-runtime-20261101-real-support-release-v1",
+        "rm65-arm-actuator-core-runtime-20261101-real-support-release-v1",
+        "checkpoint-sim-rm65-actuation-gripper-runtime-20261101-real-support-release-v1",
+        "rm65-arm-profile-runtime-20261101-real-support-release-v1",
+        "rm65-grasp-trajectory-runtime-20261101-real-support-release-v1",
+        "real-gripper-resources-runtime-20261101-real-support-release-v1",
+        "placement-owner-0-runtime-20261101-real-support-release-v1",
+        "placement-owner-1-runtime-20261101-real-support-release-v1",
+        "placement-owner-2-runtime-20261101-real-support-release-v1",
+        "placement-owner-3-runtime-20261101-real-support-release-v1",
+        "placement-owner-4-runtime-20261101-real-support-release-v1",
+        "placement-owner-5-runtime-20261101-real-support-release-v1",
+        "placement-owner-6-runtime-20261101-real-support-release-v1",
+        "placement-owner-7-runtime-20261101-real-support-release-v1",
+        "placement-owner-8-runtime-20261101-real-support-release-v1",
+        "named-release-owner-0-runtime-20261101-real-support-release-v1",
+        "real-observed-motion-owner-0-runtime-20261101-real-support-release-v1",
+        "real-observed-motion-owner-1-runtime-20261101-real-support-release-v1",
+        "real-observed-motion-owner-2-runtime-20261101-real-support-release-v1",
+        "real-observed-motion-owner-3-runtime-20261101-real-support-release-v1",
+        "skill-region-owner-0-runtime-20261101-real-support-release-v1",
+        "skill-region-owner-1-runtime-20261101-real-support-release-v1",
+        "combined-runtime-owner-0-runtime-20261101-real-support-release-v1",
+        "combined-runtime-owner-1-runtime-20261101-real-support-release-v1",
+        "combined-runtime-owner-2-runtime-20261101-real-support-release-v1",
+        "combined-runtime-owner-3-runtime-20261101-real-support-release-v1",
+        "combined-runtime-owner-4-runtime-20261101-real-support-release-v1",
+        "combined-runtime-owner-5-runtime-20261101-real-support-release-v1",
+        "observed-cache-owner-0-runtime-20261101-real-support-release-v1",
+        "rm65-arm-runtime-binding-skill-hover-visual-20261029-v1",
+        "real-support-release-query-input-0-20261101-real-support-release-v1",
+        "real-support-release-query-input-1-20261101-real-support-release-v1",
+        "real-support-release-query-input-2-20261101-real-support-release-v1",
+        "real-support-release-query-input-3-20261101-real-support-release-v1",
+        "real-support-release-query-input-4-20261101-real-support-release-v1",
+        "real-support-release-query-input-5-20261101-real-support-release-v1",
+        "relation-real-samples-report-20261029-skill-relations-v1",
+        "relation-mujoco-report-20261029-skill-relations-v1",
+        "tool-entity-gateway-owner-0-runtime-20261101-real-support-release-v1",
+        "tool-entity-gateway-owner-1-runtime-20261101-real-support-release-v1",
+        "tool-entity-gateway-owner-2-runtime-20261101-real-support-release-v1",
+        "tool-entity-gateway-owner-3-runtime-20261101-real-support-release-v1",
+        "tool-entity-gateway-owner-4-runtime-20261101-real-support-release-v1",
+        "tool-entity-gateway-owner-5-runtime-20261101-real-support-release-v1",
+        "gateway-unify-real-samples-report-20261029-skill-gateway-unify-v1",
+        "gateway-unify-mujoco-hover-report-20261029-skill-gateway-unify-v1",
+        "mujoco-agent-place-owner-0-runtime-20261101-real-support-release-v1",
+        "mujoco-agent-place-owner-1-runtime-20261101-real-support-release-v1",
+        "mujoco-agent-place-owner-2-runtime-20261101-real-support-release-v1",
+        "mujoco-agent-place-owner-3-runtime-20261101-real-support-release-v1",
+        "mujoco-agent-place-owner-4-runtime-20261101-real-support-release-v1",
+        "mujoco-agent-place-owner-5-runtime-20261101-real-support-release-v1",
+        "mujoco-agent-place-agent-cohort-report-20261030-mujoco-agent-place-v1",
+        "real-place-owner-0-runtime-20261101-real-support-release-v1",
+        "real-place-owner-1-runtime-20261101-real-support-release-v1",
+        "real-place-owner-2-runtime-20261101-real-support-release-v1",
+        "real-place-offline-carry-report-20261030-real-place-v1",
+        "mujoco-agent-place-agent-cohort-report-20261030-mujoco-agent-place-v2",
+        "mujoco-agent-place-agent-cohort-report-20261031-mujoco-agent-place-v3",
+        "real-held-own-wrist-point-miss-check-20261031-real-held-own-wrist-v1",
+        "real-held-own-wrist-offline-samples-report-20261031-real-held-own-wrist-v1",
+        "real-rm65-6f-owner-0-runtime-20261101-real-support-release-v1",
+        "real-rm65-6f-owner-1-runtime-20261101-real-support-release-v1",
+        "real-rm65-6f-owner-2-runtime-20261101-real-support-release-v1",
+        "real-rm65-6f-owner-3-runtime-20261101-real-support-release-v1",
+        "real-rm65-6f-model-check-20261031-real-rm65-6f-v1",
+        "real-rm65-6f-table-clearance-check-20261031-real-rm65-6f-v1",
+        "real-rm65-6f-asset-check-20261031-real-rm65-6f-v1",
+        "real-rm65-6f-offline-samples-report-20261031-real-rm65-6f-v1",
+        "real-support-release-owner-0-runtime-20261101-real-support-release-v1",
+        "real-support-release-owner-1-runtime-20261101-real-support-release-v1",
+        "real-support-release-focused-report-20261101-real-support-release-v1",
+        "real-support-release-focused-binding-20261101-real-support-release-v1",
+        "real-support-release-offline-samples-report-20261101-real-support-release-v1",
+        "real-support-release-prompt-survey-20261101-real-support-release-v1"
+      ],
+      "limitations": [
+        "Both independent predecessor bindings and the original fit remain immutable; no response parameter was refit.",
+        "The combined source keeps the mainline optional model graph and private native state boundaries; no model-quality claim is added.",
+        "Checkpoint data is private and caller-fenced; target restoration accepts only an inactive original envelope and preserves the historical reference.",
+        "Standalone active envelope projection is not Gateway operation/READY or physical authorization restoration.",
+        "Full Gateway/application/disk/RPent joint restore, task success and hardware acceptance remain outside this qualification."
+      ],
+      "notes": "Provisional source identity; unchanged v4 fit and timing. No new hardware response qualification."
+    }
+  ],
+  "validation_evidence": [
+    {
+      "validation_id": "runtime-source-content-binding-integrity-20261101-real-support-release-v1",
+      "split": "validation",
+      "status": "passed",
+      "metrics": {
+        "bound_runtime_input_file_count": 198.0,
+        "bound_runtime_source_file_count": 193.0,
+        "changed_runtime_source_file_count_from_previous_binding": 7.0,
+        "new_runtime_source_file_count": 2.0,
+        "new_runtime_configuration_file_count": 0.0,
+        "arm_profile_refit_count": 0.0,
+        "mutated_historical_artifact_count": 0.0
+      },
+      "evidence_artifact_ids": [
+        "rm65-correlated-rgbd-contract-runtime-20261101-real-support-release-v1",
+        "rm65-shared-localization-provider-runtime-20261101-real-support-release-v1",
+        "rm65-shared-localization-deployment-runtime-20261101-real-support-release-v1",
+        "rm65-depth-capture-conversion-runtime-20261101-real-support-release-v1",
+        "rm65-motion-launcher-runtime-20261101-real-support-release-v1",
+        "rm65-native-grasp-deployment-runtime-20261101-real-support-release-v1",
+        "rm65-native-grasp-fast-plan-runtime-20261101-real-support-release-v1",
+        "rm65-native-grasp-observation-runtime-20261101-real-support-release-v1",
+        "rm65-motion-application-runtime-20261101-real-support-release-v1",
+        "rm65-motion-deployment-runtime-20261101-real-support-release-v1",
+        "rm65-motion-factory-runtime-20261101-real-support-release-v1",
+        "rm65-segmentation-session-runtime-20261101-real-support-release-v1",
+        "rm65-observed-scene-runtime-20261101-real-support-release-v1",
+        "rm65-native-prepared-skill-runtime-20261101-real-support-release-v1",
+        "rm65-object-path-query-runtime-20261101-real-support-release-v1",
+        "rm65-observed-point-consumer-runtime-20261101-real-support-release-v1",
+        "rm65-native-continuation-executor-runtime-20261101-real-support-release-v1",
+        "rm65-retained-observed-point-runtime-20261101-real-support-release-v1",
+        "rm65-paired-rgbd-codec-runtime-20261101-real-support-release-v1",
+        "rm65-pose-candidate-executor-runtime-20261101-real-support-release-v1",
+        "rm65-query-geometry-runtime-20261101-real-support-release-v1",
+        "rm65-real-current-gateway-cli-runtime-20261101-real-support-release-v1",
+        "rm65-real-localization-deployment-facade-runtime-20261101-real-support-release-v1",
+        "rm65-real-localization-provider-facade-runtime-20261101-real-support-release-v1",
+        "rm65-real-compatibility-motion-factory-runtime-20261101-real-support-release-v1",
+        "rm65-real-current-gateway-session-runtime-20261101-real-support-release-v1",
+        "rm65-real-current-motion-profiles-runtime-20261101-real-support-release-v1",
+        "rm65-real-current-one-shot-client-runtime-20261101-real-support-release-v1",
+        "rm65-real-current-composition-runtime-20261101-real-support-release-v1",
+        "rm65-real-current-authorization-runtime-20261101-real-support-release-v1",
+        "rm65-region-continuation-executor-runtime-20261101-real-support-release-v1",
+        "rm65-relation-continuation-executor-runtime-20261101-real-support-release-v1",
+        "rm65-paired-rgbd-capture-runtime-20261101-real-support-release-v1",
+        "rm65-segmentation-provider-runtime-20261101-real-support-release-v1",
+        "rm65-segmentation-batch-runtime-20261101-real-support-release-v1",
+        "rm65-spatial-goal-provider-runtime-20261101-real-support-release-v1",
+        "rm65-surface-anchor-runtime-20261101-real-support-release-v1",
+        "rm65-surface-selection-runtime-20261101-real-support-release-v1",
+        "rm65-paired-surface-anchor-runtime-20261101-real-support-release-v1",
+        "rm65-tcp-continuation-executor-runtime-20261101-real-support-release-v1",
+        "rm65-retained-motion-definitions-runtime-20261101-real-support-release-v1",
+        "rm65-observed-point-contract-runtime-20261101-real-support-release-v1",
+        "rm65-safe-tcp-v2-contract-runtime-20261101-real-support-release-v1",
+        "rm65-segmentation-definitions-runtime-20261101-real-support-release-v1",
+        "rm65-object-path-contract-runtime-20261101-real-support-release-v1",
+        "rm65-pose-candidate-contract-runtime-20261101-real-support-release-v1",
+        "rm65-region-continuation-contract-runtime-20261101-real-support-release-v1",
+        "rm65-relation-continuation-contract-runtime-20261101-real-support-release-v1",
+        "rm65-paired-rgbd-skill-contract-runtime-20261101-real-support-release-v1",
+        "rm65-segmentation-schemas-runtime-20261101-real-support-release-v1",
+        "rm65-spatial-goal-contract-runtime-20261101-real-support-release-v1",
+        "rm65-surface-anchor-contract-runtime-20261101-real-support-release-v1",
+        "rm65-surface-anchor-v2-contract-runtime-20261101-real-support-release-v1",
+        "rm65-surface-anchor-v3-contract-runtime-20261101-real-support-release-v1",
+        "rm65-tcp-continuation-contract-runtime-20261101-real-support-release-v1",
+        "checkpoint-control_composition-observability-execution_difference-runtime-20261101-real-support-release-v1",
+        "checkpoint-control_composition-observability-modules-runtime-20261101-real-support-release-v1",
+        "rm65-real-compatibility-control-station-runtime-20261101-real-support-release-v1",
+        "checkpoint-dataset_contracts-action_schema-runtime-20261101-real-support-release-v1",
+        "checkpoint-dataset_contracts-canonical_encoding-runtime-20261101-real-support-release-v1",
+        "checkpoint-dataset_contracts-control_trace-runtime-20261101-real-support-release-v1",
+        "rm65-paired-rgbd-artifact-contract-runtime-20261101-real-support-release-v1",
+        "rm65-sam3-rpc-model-client-runtime-20261101-real-support-release-v1",
+        "checkpoint-robot_motion-action-adaptation-runtime-20261101-real-support-release-v1",
+        "checkpoint-robot_motion-action-admission_checkpoint-runtime-20261101-real-support-release-v1",
+        "checkpoint-robot_motion-action-arbiter-runtime-20261101-real-support-release-v1",
+        "checkpoint-robot_motion-action-arbitration_runtime-runtime-20261101-real-support-release-v1",
+        "checkpoint-robot_motion-action-authoritative_checkpoint-runtime-20261101-real-support-release-v1",
+        "checkpoint-robot_motion-action-authoritative_control-runtime-20261101-real-support-release-v1",
+        "checkpoint-robot_motion-action-authoritative_trace-runtime-20261101-real-support-release-v1",
+        "checkpoint-robot_motion-action-authority-runtime-20261101-real-support-release-v1",
+        "checkpoint-robot_motion-action-candidate_authorization-runtime-20261101-real-support-release-v1",
+        "checkpoint-robot_motion-action-checkpoint_codec-runtime-20261101-real-support-release-v1",
+        "checkpoint-robot_motion-action-component_action-runtime-20261101-real-support-release-v1",
+        "checkpoint-robot_motion-action-components-runtime-20261101-real-support-release-v1",
+        "checkpoint-robot_motion-action-decision_checkpoint-runtime-20261101-real-support-release-v1",
+        "checkpoint-robot_motion-action-dispatch_context-runtime-20261101-real-support-release-v1",
+        "checkpoint-robot_motion-action-execution_handoff-runtime-20261101-real-support-release-v1",
+        "checkpoint-robot_motion-action-execution_observation-runtime-20261101-real-support-release-v1",
+        "checkpoint-robot_motion-action-executor-runtime-20261101-real-support-release-v1",
+        "checkpoint-robot_motion-action-persistence-runtime-20261101-real-support-release-v1",
+        "checkpoint-robot_motion-action-proposal-runtime-20261101-real-support-release-v1",
+        "checkpoint-robot_motion-action-schema-runtime-20261101-real-support-release-v1",
+        "checkpoint-robot_motion-action-target_capability-runtime-20261101-real-support-release-v1",
+        "rm65-camera-registry-runtime-20261101-real-support-release-v1",
+        "rm65-object-release-runtime-20261101-real-support-release-v1",
+        "rm65-object-transport-runtime-20261101-real-support-release-v1",
+        "rm65-observed-joint-input-runtime-20261101-real-support-release-v1",
+        "rm65-tcp-axis-constraint-runtime-20261101-real-support-release-v1",
+        "checkpoint-robot_motion-position_control-capability-runtime-20261101-real-support-release-v1",
+        "rm65-waypoint-cancellation-runtime-20261101-real-support-release-v1",
+        "checkpoint-robot_motion-position_control-trajectory-runtime-20261101-real-support-release-v1",
+        "checkpoint-robot_motion-position_control-trajectory_checkpoint-runtime-20261101-real-support-release-v1",
+        "checkpoint-robot_motion-rm65-dual_arm_ik-runtime-20261101-real-support-release-v1",
+        "checkpoint-robot_motion-rm65-dual_arm_target_solver-runtime-20261101-real-support-release-v1",
+        "checkpoint-robot_motion-rm65-ik_checkpoint-runtime-20261101-real-support-release-v1",
+        "rm65-observed-collision-model-runtime-20261101-real-support-release-v1",
+        "checkpoint-robot_motion-rm65-retargeter_checkpoint-runtime-20261101-real-support-release-v1",
+        "rm65-single-arm-ik-runtime-20261101-real-support-release-v1",
+        "checkpoint-robot_motion-runtime-cancellation-runtime-20261101-real-support-release-v1",
+        "checkpoint-robot_motion-runtime-control_admission-runtime-20261101-real-support-release-v1",
+        "checkpoint-robot_motion-runtime-dispatch-runtime-20261101-real-support-release-v1",
+        "checkpoint-robot_motion-runtime-dispatch_owner-runtime-20261101-real-support-release-v1",
+        "checkpoint-robot_motion-runtime-execution_checkpoint-runtime-20261101-real-support-release-v1",
+        "checkpoint-robot_motion-runtime-execution_gate-runtime-20261101-real-support-release-v1",
+        "checkpoint-robot_motion-runtime-identity-runtime-20261101-real-support-release-v1",
+        "checkpoint-robot_motion-runtime-immutable-runtime-20261101-real-support-release-v1",
+        "checkpoint-robot_motion-runtime-producer_epoch-runtime-20261101-real-support-release-v1",
+        "rm65-spatial-goal-regions-runtime-20261101-real-support-release-v1",
+        "rm65-relation-goal-core-runtime-20261101-real-support-release-v1",
+        "checkpoint-robot-motion-target-safety-checkpoint-runtime-20261101-real-support-release-v1",
+        "rm65-tcp-envelope-query-runtime-20261101-real-support-release-v1",
+        "rm65-tcp-pose-envelope-core-runtime-20261101-real-support-release-v1",
+        "rm65-native-continuation-clutter-scene-runtime-20261101-real-support-release-v1",
+        "rm65-native-continuation-clutter-task-runtime-20261101-real-support-release-v1",
+        "checkpoint-sim-mujoco-actuation-checkpoint-runtime-20261101-real-support-release-v1",
+        "rm65-arm-mujoco-executor-runtime-20261101-real-support-release-v1",
+        "rm65-gripper-executor-runtime-20261101-real-support-release-v1",
+        "checkpoint-sim-mujoco-adapters-checkpoint-runtime-20261101-real-support-release-v1",
+        "rm65-position-rig-runtime-20261101-real-support-release-v1",
+        "rm65-command-guard-runtime-20261101-real-support-release-v1",
+        "rm65-envelope-adapter-runtime-20261101-real-support-release-v1",
+        "rm65-collision-oracle-runtime-20261101-real-support-release-v1",
+        "rm65-collision-policy-runtime-20261101-real-support-release-v1",
+        "rm65-collision-projection-runtime-20261101-real-support-release-v1",
+        "rm65-collision-result-runtime-20261101-real-support-release-v1",
+        "rm65-position-assembly-runtime-20261101-real-support-release-v1",
+        "rm65-agent-skill-target-runtime-20261101-real-support-release-v1",
+        "checkpoint-sim-mujoco-deploy-component_action_profile-runtime-20261101-real-support-release-v1",
+        "rm65-contact-timing-runtime-20261101-real-support-release-v1",
+        "checkpoint-sim-mujoco-deploy-execution_difference-runtime-20261101-real-support-release-v1",
+        "checkpoint-sim-mujoco-deploy-execution_pose_observation-runtime-20261101-real-support-release-v1",
+        "rm65-grasp-contact-runtime-20261101-real-support-release-v1",
+        "rm65-grasped-object-observer-runtime-20261101-real-support-release-v1",
+        "checkpoint-sim-mujoco-deploy-observation-runtime-20261101-real-support-release-v1",
+        "checkpoint-sim-mujoco-deploy-observation_checkpoint-runtime-20261101-real-support-release-v1",
+        "rm65-payload-motion-runtime-20261101-real-support-release-v1",
+        "rm65-planned-tcp-motion-runtime-20261101-real-support-release-v1",
+        "checkpoint-sim-mujoco-deploy-pose_kinematics-runtime-20261101-real-support-release-v1",
+        "checkpoint-sim-mujoco-deploy-pose_resolution-runtime-20261101-real-support-release-v1",
+        "rm65-deploy-runtime-core-runtime-20261101-real-support-release-v1",
+        "checkpoint-sim-mujoco-deploy-runtime_checkpoint-runtime-20261101-real-support-release-v1",
+        "checkpoint-sim-mujoco-deploy-target_checkpoint-runtime-20261101-real-support-release-v1",
+        "checkpoint-sim-mujoco-deploy-target_measurement-runtime-20261101-real-support-release-v1",
+        "checkpoint-sim-mujoco-deploy-target_preparation-runtime-20261101-real-support-release-v1",
+        "rm65-rgbd-source-runtime-20261101-real-support-release-v1",
+        "checkpoint-sim-mujoco-ik-runtime-20261101-real-support-release-v1",
+        "checkpoint-sim-mujoco-native_checkpoint-runtime-20261101-real-support-release-v1",
+        "checkpoint-sim-mujoco-scene-runtime-20261101-real-support-release-v1",
+        "rm65-arm-actuator-core-runtime-20261101-real-support-release-v1",
+        "checkpoint-sim-rm65-actuation-gripper-runtime-20261101-real-support-release-v1",
+        "rm65-arm-profile-runtime-20261101-real-support-release-v1",
+        "rm65-grasp-trajectory-runtime-20261101-real-support-release-v1",
+        "real-gripper-resources-runtime-20261101-real-support-release-v1",
+        "placement-owner-0-runtime-20261101-real-support-release-v1",
+        "placement-owner-1-runtime-20261101-real-support-release-v1",
+        "placement-owner-2-runtime-20261101-real-support-release-v1",
+        "placement-owner-3-runtime-20261101-real-support-release-v1",
+        "placement-owner-4-runtime-20261101-real-support-release-v1",
+        "placement-owner-5-runtime-20261101-real-support-release-v1",
+        "placement-owner-6-runtime-20261101-real-support-release-v1",
+        "placement-owner-7-runtime-20261101-real-support-release-v1",
+        "placement-owner-8-runtime-20261101-real-support-release-v1",
+        "named-release-owner-0-runtime-20261101-real-support-release-v1",
+        "real-observed-motion-owner-0-runtime-20261101-real-support-release-v1",
+        "real-observed-motion-owner-1-runtime-20261101-real-support-release-v1",
+        "real-observed-motion-owner-2-runtime-20261101-real-support-release-v1",
+        "real-observed-motion-owner-3-runtime-20261101-real-support-release-v1",
+        "skill-region-owner-0-runtime-20261101-real-support-release-v1",
+        "skill-region-owner-1-runtime-20261101-real-support-release-v1",
+        "combined-runtime-owner-0-runtime-20261101-real-support-release-v1",
+        "combined-runtime-owner-1-runtime-20261101-real-support-release-v1",
+        "combined-runtime-owner-2-runtime-20261101-real-support-release-v1",
+        "combined-runtime-owner-3-runtime-20261101-real-support-release-v1",
+        "combined-runtime-owner-4-runtime-20261101-real-support-release-v1",
+        "combined-runtime-owner-5-runtime-20261101-real-support-release-v1",
+        "observed-cache-owner-0-runtime-20261101-real-support-release-v1",
+        "tool-entity-gateway-owner-0-runtime-20261101-real-support-release-v1",
+        "tool-entity-gateway-owner-1-runtime-20261101-real-support-release-v1",
+        "tool-entity-gateway-owner-2-runtime-20261101-real-support-release-v1",
+        "tool-entity-gateway-owner-3-runtime-20261101-real-support-release-v1",
+        "tool-entity-gateway-owner-4-runtime-20261101-real-support-release-v1",
+        "tool-entity-gateway-owner-5-runtime-20261101-real-support-release-v1",
+        "mujoco-agent-place-owner-0-runtime-20261101-real-support-release-v1",
+        "mujoco-agent-place-owner-1-runtime-20261101-real-support-release-v1",
+        "mujoco-agent-place-owner-2-runtime-20261101-real-support-release-v1",
+        "mujoco-agent-place-owner-3-runtime-20261101-real-support-release-v1",
+        "mujoco-agent-place-owner-4-runtime-20261101-real-support-release-v1",
+        "mujoco-agent-place-owner-5-runtime-20261101-real-support-release-v1",
+        "real-place-owner-0-runtime-20261101-real-support-release-v1",
+        "real-place-owner-1-runtime-20261101-real-support-release-v1",
+        "real-place-owner-2-runtime-20261101-real-support-release-v1",
+        "real-rm65-6f-owner-0-runtime-20261101-real-support-release-v1",
+        "real-rm65-6f-owner-1-runtime-20261101-real-support-release-v1",
+        "real-rm65-6f-owner-2-runtime-20261101-real-support-release-v1",
+        "real-rm65-6f-owner-3-runtime-20261101-real-support-release-v1",
+        "real-support-release-owner-0-runtime-20261101-real-support-release-v1",
+        "real-support-release-owner-1-runtime-20261101-real-support-release-v1",
+        "rm65-arm-runtime-binding-real-rm65-6f-20261031-v1"
+      ],
+      "notes": "Runtime inputs rebound at merge b9091bf5e (base be42c02d9, the real-rm65-6f v1 binding commit, + task 47cb84014); every predecessor reference inherited; two new runtime sources (the real release-pose query module and the v2 contract); no refit."
+    },
+    {
+      "validation_id": "real-support-release-offline-consumers-20261101-real-support-release-v1",
+      "split": "validation",
+      "status": "passed",
+      "metrics": {
+        "passed_cases": 1278.0,
+        "skipped_cases": 0.0,
+        "failed_cases": 0.0,
+        "error_cases": 0.0
+      },
+      "evidence_artifact_ids": [
+        "real-support-release-query-input-0-20261101-real-support-release-v1",
+        "real-support-release-query-input-1-20261101-real-support-release-v1",
+        "real-support-release-query-input-2-20261101-real-support-release-v1",
+        "real-support-release-query-input-3-20261101-real-support-release-v1",
+        "real-support-release-query-input-4-20261101-real-support-release-v1",
+        "real-support-release-query-input-5-20261101-real-support-release-v1",
+        "real-support-release-focused-report-20261101-real-support-release-v1",
+        "real-support-release-focused-binding-20261101-real-support-release-v1",
+        "real-support-release-offline-samples-report-20261101-real-support-release-v1",
+        "real-support-release-prompt-survey-20261101-real-support-release-v1"
+      ],
+      "notes": "Focused files on b9091bf5e through scripts/run_pytest.sh with the current-binding test deselected before this binding; offline real-scene release query on 34 saved RM65-6F scenes (SAM3 loopback, no devices): support certification by view and prompt, synthetic held-cube table queries refused by the real planner (clutter, other hand, reach at the home pose); no two-leg plan was claimed."
+    },
+    {
+      "validation_id": "new-held-out-arm-response-20261101-real-support-release-v1",
+      "split": "held_out",
+      "status": "not_run",
+      "metrics": {},
+      "evidence_artifact_ids": [],
+      "notes": "No new physical calibration, held-out response or hardware execution."
+    }
+  ],
+  "code_revision": "b9091bf5ecc8f4024f8a09034de717e92dae84ba",
+  "environment_fingerprint": {
+    "source_commit": "b9091bf5ecc8f4024f8a09034de717e92dae84ba",
+    "source_tree": "9ce324cf9650c7ed1cde31c37c81c8a38b15e191",
+    "python": "3.10.20",
+    "platform": "x86_64",
+    "numpy": "1.26.4",
+    "mujoco": "3.10.0",
+    "pin-pink": "4.2.0",
+    "qpsolvers": "4.11.0",
+    "osqp": "1.1.3"
+  },
+  "metadata": {
+    "owner": "sim.rm65",
+    "binding_kind": "runtime_source_rebind",
+    "fit_profile_name": "rm65_bimanual_udp_feedback_20260721.v4",
+    "fit_artifact_sha256": "501702e3b741096fc3038b082405073bad51f63626b7296b75d2847e85df778d",
+    "fit_simulation_contract_sha256": "baa5efcd490f27b0d2e261ac2e5c91181a0618de75596017a05714a02333a0df",
+    "previous_runtime_binding_artifact_sha256": "042030cee98722fbbb683378a2ef3e71d8e091aa301adfe8cbd1dd54794c037b",
+    "previous_runtime_binding_file_sha256": "d43886c9eb4e8c1d71fd583ab88f948c52853722625b4f35ea156c5b8b4b3104",
+    "arm_profile_refit": false,
+    "runtime_behavior_change": true,
+    "runtime_behavior_change_scope": "real_support_release_query_v2_for_named_supports",
+    "runtime_source_commit": "b9091bf5ecc8f4024f8a09034de717e92dae84ba",
+    "mainline_input_commit": "be42c02d9af76f2b3eab0582b28d9e8c951563e4",
+    "migration": "namespaced_real_support_release_binding_v1",
+    "offline_validation_report_artifact_id": "real-support-release-focused-report-20261101-real-support-release-v1",
+    "offline_validation_binding_artifact_id": "real-support-release-focused-binding-20261101-real-support-release-v1",
+    "offline_validation_source_tree": "9ce324cf9650c7ed1cde31c37c81c8a38b15e191",
+    "offline_validation_execution_head": "b9091bf5ecc8f4024f8a09034de717e92dae84ba",
+    "changed_previous_runtime_sources": [
+      "agent_gateway/profiles/real/exclusive_factory.py",
+      "agent_gateway/profiles/real/gateway_cli.py",
+      "agent_gateway/profiles/real/motion_gateway_session.py",
+      "agent_gateway/profiles/real/motion_primitive_profiles.py",
+      "agent_gateway/profiles/real/object_motion.py",
+      "agent_gateway/profiles/real/rm65_composition.py",
+      "agent_gateway/profiles/real/tool_entity.py"
+    ],
+    "new_runtime_sources": [
+      "agent_gateway/profiles/real/support_release_query.py",
+      "agent_gateway/skills/perception/support_release_query_v2.py"
+    ],
+    "external_candidate_rpc_dependency_commit": "24eb2ff00cc70ac782dbfa82c59020a228164a47",
+    "gripper_max_operation_duration_ms": 15000,
+    "support_footprint_maximum_samples": 100000,
+    "predecessor_qualification": "real-rm65-6f v1 be42c02d9 full acceptance full-b-01: 22128 tests, 0 failures or errors, 18 skipped.",
+    "gateway_prunes_expired_proposals": true,
+    "lower_factory_prune_default": false,
+    "ttl_and_hold_changed": false,
+    "named_release_v3_default": false,
+    "named_release_v3_sim_only": true,
+    "unchanged_gripper_v1_v2_defaults": true,
+    "real_observed_point_default": false,
+    "real_surface_anchor_v2_default": false,
+    "real_anchor_motion_v2_default": false,
+    "capture_self_filter_default_changed": false,
+    "operator_authorization_required": true,
+    "inherited_start_clearance_default": true,
+    "inherited_start_clearance_manifest_bound": true,
+    "inherited_start_query_failure_preserved": true,
+    "ordinary_clearance_m": 0.02,
+    "offline_query_validation_report_artifact_id": "real-support-release-focused-report-20261101-real-support-release-v1",
+    "offline_query_source_artifact_id": "real-support-release-query-input-0-20261101-real-support-release-v1",
+    "offline_validation_mode": "fixed_staged_tree",
+    "saved_scene_region_candidate_policy_default": "proximity",
+    "saved_scene_region_halton_explicit": true,
+    "source_native_comparison_inherited_clearance_enabled": true,
+    "source_native_comparison_formal_02_positive_start_count": 12,
+    "source_native_comparison_formal_03_positive_start_count": 12,
+    "source_native_comparison_formal_04_positive_start_count": 12,
+    "source_native_comparison_scenes_per_run": 12,
+    "strict_start_native_comparison_status": "not_run",
+    "offline_query_input_artifact_ids": [
+      "real-support-release-query-input-0-20261101-real-support-release-v1",
+      "real-support-release-query-input-1-20261101-real-support-release-v1",
+      "real-support-release-query-input-2-20261101-real-support-release-v1",
+      "real-support-release-query-input-3-20261101-real-support-release-v1",
+      "real-support-release-query-input-4-20261101-real-support-release-v1",
+      "real-support-release-query-input-5-20261101-real-support-release-v1"
+    ],
+    "inherited_start_clearance_default_scope": "saved_scene_query_real_gateway_and_mujoco_gateway_cli_observed_scene",
+    "direct_planner_start_clearance_default_changed": false,
+    "source_native_comparison_scope": "historical predecessor opt-in comparison; not a validation of this new default",
+    "new_physical_hardware_validation": false,
+    "binding_coverage": "predecessor runtime inputs plus changed sources and explicit offline query inputs; not a transitive dependency inventory",
+    "changed_previous_offline_inputs": [],
+    "observed_distance_cache_default": true,
+    "saved_scene_endpoint_ordering_default": "joint_distance",
+    "saved_scene_endpoint_ordering_alternatives": [
+      "estimated_execution_time",
+      "tcp_arc_estimated_execution_time"
+    ],
+    "tool_object_relation_semantics": "agenticrobot.relation.tool_object.v1",
+    "tool_object_relation_gateway_route": true,
+    "tool_object_relation_contact_solids": "urdf_dmtac_sensor_collision_boxes_open_v1",
+    "tool_object_relation_contact_solids_urdf_binding": "saved_scene_manifest_fixed_files (asset store is untracked)",
+    "tool_object_relation_gripper_pose_source": "frame_capture_qpos",
+    "tool_object_relation_fusion": "per_label_one_surface_per_role",
+    "tool_object_relation_planning_self_filter_used": false,
+    "hover_tool_axis_max_tilt_default_rad": 0.0,
+    "hover_tool_axis_max_tilt_limit_rad": 1.0471975511965976,
+    "hover_achieved_tilt_checked": true,
+    "real_sample_relation_validation": "21 operator samples: clean 0 between/band, pregrasp 5/5 between, contact 3/4 band",
+    "mujoco_relation_validation": "20/20 designed placements match exact geometry",
+    "offline_validation_report_artifact_ids": [
+      "real-support-release-focused-report-20261101-real-support-release-v1",
+      "real-support-release-focused-binding-20261101-real-support-release-v1",
+      "real-support-release-offline-samples-report-20261101-real-support-release-v1",
+      "real-support-release-prompt-survey-20261101-real-support-release-v1"
+    ],
+    "tool_entity_gateway_skill_ids": [
+      "perception.describe_tool_object_relations@1",
+      "perception.query_tool_hover_paths@1"
+    ],
+    "tool_entity_gateway_profiles": [
+      "agent_gateway.profiles.real",
+      "agent_gateway.profiles.mujoco"
+    ],
+    "tool_entity_gateway_skills_default_enabled": false,
+    "tool_entity_gateway_skills_read_only": true,
+    "tool_entity_gateway_enable_flags": [
+      "--enable-tool-object-relations",
+      "--enable-tool-hover-queries"
+    ],
+    "tool_object_relation_max_operation_ms": 90000,
+    "tool_hover_semantics": "agenticrobot.relation.tool_entity_hover.v1",
+    "tool_hover_max_operation_ms": 40000,
+    "tool_hover_input_artifact": "capture_surface_anchor@2",
+    "hover_region_budget_sec": 20.0,
+    "hover_candidate_budget_sec": 5.0,
+    "tcp_region_candidate_budget_sec": 3.0,
+    "hover_registration_frame": "safe_tcp_route_public_frame",
+    "hover_requires_vertical_public_frame": true,
+    "hover_certified_pose_field": "planned_endpoint_pose_xyz_quat_xyzw",
+    "hover_certified_pose_goal_policy": "preserve_target",
+    "query_and_move_composite_skill": false,
+    "mujoco_tool_object_relation_requires_safe_tcp_pose": true,
+    "mujoco_observed_start_clearance_config_default": "strict",
+    "mujoco_gateway_cli_observed_start_clearance_default": "inherited-positive-v1",
+    "mujoco_twin_hover_collision_configuration_changed": false,
+    "real_sample_gateway_relation_validation": "21 saved samples via RealToolScenePort and saved SAM3 masks: 354/354 views and 162/162 fused objects equal to the probe",
+    "real_sample_gateway_hover_validation": "6 samples x 2 arms x 2 policies at 5 s/20 s: probe == Gateway core 24/24; public frame found 8/24 (preserve 6, tool_axis_down 2); public == world status 23/24, the one difference a first candidate at the 5 s edge (5.001 s vs 4.949 s)",
+    "mujoco_gateway_hover_validation": "preserve 8/8 safe_tcp_target_blocked with native right_arm_link5 vs camera pole penetration 2.3-3.4 cm, unchanged with the strict profile and strict start; tool_axis_down path_found; planned endpoint with preserve_target executed: 0.57 mm error, 6.23 cm clearance, cube contacts only with the table",
+    "mujoco_agent_place_gateway_skill_ids": [
+      "perception.query_support_release_pose@1",
+      "perception.query_grasp_approach@1"
+    ],
+    "mujoco_agent_place_gateway_profiles": [
+      "agent_gateway.profiles.mujoco"
+    ],
+    "mujoco_agent_place_skills_default_enabled": false,
+    "mujoco_agent_place_skills_read_only": true,
+    "mujoco_agent_place_enable_flags": [
+      "--enable-support-release-queries",
+      "--enable-grasp-approach-queries"
+    ],
+    "support_release_semantics": "agenticrobot.held_object.support_release_pose.v1",
+    "support_release_max_operation_ms": 90000,
+    "support_release_measurement": "depth_only_certified_top_rectangle_v2",
+    "grasp_approach_query_semantics": "agenticrobot.object.face_aligned_grasp_approach.v1",
+    "grasp_approach_query_max_operation_ms": 90000,
+    "grasp_approach_query_selection": "first_feasible_in_preference_order",
+    "grasp_approach_query_approach_shortenings_m": [
+      0.0,
+      0.01,
+      0.02,
+      0.03,
+      0.045
+    ],
+    "grasp_approach_query_minimum_stage_jacobian_sigma": 0.02,
+    "mujoco_object_motion_lift_corridor_removed": true,
+    "mujoco_object_motion_max_operation_ms": 240000,
+    "mujoco_object_motion_goal_relation": "measured_in_the_same_correlated_cut",
+    "mujoco_object_motion_slip_gate_reference": "frozen_lift_relation_3mm_2deg_unchanged",
+    "mujoco_object_motion_terminal_grace_sim_sec": 1.5,
+    "mujoco_object_motion_lift_verification_rise_m": 0.03,
+    "mujoco_object_motion_lift_refusal_margin_m": 0.002,
+    "hard_penetration_gate_changed": false,
+    "observation_gap_gate_changed": false,
+    "release_window_changed": false,
+    "real_gateway_held_object_motion": true,
+    "grasp_frame_lineage_published_as_schema_constants": true,
+    "mujoco_named_release_v3_observes_release_window": true,
+    "mujoco_named_release_maximum_observation_sec": 1.5,
+    "rigid_pose_validation_tolerances_changed": false,
+    "mujoco_place_scene_suite": "sim/configs/scene_suites/rm65_dmtac_place_v1.json",
+    "real_held_object_motion_default_enabled": false,
+    "real_place_gateway_skill_ids": [
+      "motion.move_grasped_object_to_pose@1"
+    ],
+    "real_place_gateway_profiles": [
+      "agent_gateway.profiles.real"
+    ],
+    "real_place_enable_action": "move_grasped_object_to_pose",
+    "real_place_route_id": "real.rm65.agent_skill_move_grasped_object",
+    "real_place_max_operation_ms": 180000,
+    "real_carried_object_planning_default_enabled": false,
+    "real_carried_object_exemption_policy": "observed_voxels_within_clearance_of_start_carried_box_v1",
+    "real_carried_object_support_exemption_policy": "measured_support_top_voxels_under_carried_box_target_v1",
+    "real_held_object_measurement": "stationary_rgbd_closing_region_point_prompt_plus_dmtac_closure",
+    "real_held_object_box_semantics": "agenticrobot.held_object.measured_box.v1",
+    "real_place_support_gap_m": [
+      0.0,
+      0.02
+    ],
+    "real_place_support_height_band_m": 0.015,
+    "real_lift_resting_support_completion_max_gap_m": 0.12,
+    "real_crooked_grasp_thresholds": {
+      "centroid_offset_m": 0.015,
+      "principal_axis_tilt_deg": 20.0
+    },
+    "real_hover_orientation_policies_added": [
+      "tool_axis_forward",
+      "tool_axis_left",
+      "tool_axis_right"
+    ],
+    "real_planning_start_joint_limit_tolerance_deg": 0.01,
+    "real_endpoint_joint_limit_margin_default_rad": 0.0,
+    "real_canfd_low_rate_policy": "warn_only_below_80_hz",
+    "real_held_object_grip_gate": "dmtac_sample_required_no_fault_last_command_close_closure_0.05_to_0.97",
+    "real_lift_resting_support_completion_scope": "first_lift_of_a_grip_without_retained_box",
+    "real_retained_grip_identity": "dmtac_last_command_attempt_and_closure_within_0.03",
+    "real_place_pose_goal_policy": "preserve_target",
+    "real_object_motion_review": "independent static review 2026-10-30 (route lifecycle; planner, measurement and upper exposure); confirmed findings fixed in 67a90edf8",
+    "mujoco_object_motion_start": "held_joint_command_when_within_tolerance_of_measured_arms",
+    "mujoco_object_motion_held_command_start_tolerance_rad": 0.005,
+    "mujoco_held_object_speed_scale": 0.25,
+    "mujoco_object_motion_goal_hold_sim_sec": 0.5,
+    "mujoco_held_object_endpoint_sag_margin_m": 0.001,
+    "mujoco_held_object_endpoint_sag_margin_rad": 0.008726646259971648,
+    "mujoco_object_motion_tcp_settle_fail_fast": true,
+    "mujoco_grasped_object_capture_reuse": "identical_native_state_only",
+    "support_release_max_regions": 3,
+    "support_release_region_order": "largest_first_overlap_at_most_0.75",
+    "grasp_approach_query_candidates": [
+      "top_down",
+      "top_down_turned_left",
+      "top_down_turned_right",
+      "side",
+      "top_down_half_turn"
+    ],
+    "grasp_approach_query_pitched_face_grasps": false,
+    "grasp_approach_query_path_search_budget_sec": 12.0,
+    "mujoco_place_scene_suite_cases_added": [
+      "mat_disturbance"
+    ],
+    "support_release_nearest_to_held_candidate": true,
+    "support_release_nearest_inset_m": 1e-06,
+    "support_release_lean_rad": 0.10471975511965978,
+    "support_release_lean_yaw_offsets_rad": [
+      0.0
+    ],
+    "support_release_lean_toward": "motion_arm_base",
+    "support_release_lean_order": "after_the_held_orientation_candidates_of_each_region",
+    "support_release_lean_maximum_tilt_from_support_normal_rad": 0.17453292519943295,
+    "support_release_refusals": "typed_no_release_candidates",
+    "support_release_top_height": "certified_plane_highest_corner_plus_2mm_residual",
+    "support_release_independent_review": "approve_with_findings_resolved_in_eb229e6af",
+    "noncontact_clearance_gate_changed": false,
+    "real_held_object_observation_semantics": "agenticrobot.real.held_object_observation.v2",
+    "held_object_measured_box_semantics": "agenticrobot.held_object.measured_box.v2",
+    "real_held_object_primary_view": "holding_arm_wrist_camera",
+    "real_held_object_seed_gripper_solid_clearance_m": 0.005,
+    "real_held_object_seed_minimum_pixels": 15,
+    "real_held_object_extension_view_depth_agreement_m": 0.03,
+    "real_held_object_extension_per_side_m": 0.03,
+    "real_object_motion_support_view": "holding_arm_wrist_camera_other_views_as_consistency_evidence",
+    "point_prompt_mask_miss": "per_view_no_mask",
+    "grasp_fusion_auxiliary_point_mask_miss": "excluded_view_target_point_mask_unavailable",
+    "real_offline_sample_evidence": "34_saved_real_scenes_rm65_6f_held_on_empty_arms_0_of_59_right_arm_lowest_box_bottom_median_3.83_to_2.91_cm",
+    "rm65_6f_scene_profiles": [
+      "dual_arm_hand_proxy_dmtac_strict_rm65_6f",
+      "dual_arm_hand_proxy_dmtac_grasp_rm65_6f"
+    ],
+    "rm65_6f_flange_extension_m": 0.0172,
+    "rm65_default_scene_profiles_changed": false,
+    "rm65_6f_planning_model_sha256": "a5ec008c89f454c862e857cc9122887cfa4fa2d07b8a05661c5574fc1e9208d5",
+    "rm65_6f_station_model_sha256": "dfed5e8441507e3690596e0b26d77e09ee48491928f4fdc359d240eb74d3d12c",
+    "rm65_6f_planning_model_source_sha256": "4d96173e88bd28de6f8e358e114d2b5b0d94d0e724176aef0dceca37e9622e0c",
+    "rm65_6f_station_model_source_sha256": "310c3e440d4725ab2511b7bf84b32cf8ad6cefbb90586fbac50893f95c4a1411",
+    "rm65_6f_asset_generator": "scripts/assets/make_rm65_6f_station_assets.py",
+    "camera_registry_v5_sha256": "dec5a9b84069eb0cae67f53ec45c79f1b6d6989f0a946470fe5fcbedc348c268",
+    "head_camera_depth_scale_correction": 1.01406,
+    "wrist_camera_depth_scale_corrections": "none_until_board_measurement",
+    "depth_scale_correction_range": [
+      0.95,
+      1.05
+    ],
+    "table_hand_clearance_default": "fixed_scene_margin_unchanged",
+    "table_hand_clearance_cli_range_m": [
+      0.0,
+      0.02
+    ],
+    "table_hand_clearance_requires_rm65_6f": true,
+    "table_hand_clearance_contact_blocked": true,
+    "observed_obstacle_block_attribution": "observed_voxels_named_when_blocking",
+    "real_support_release_query_version": "2",
+    "real_support_release_semantics": "agenticrobot.held_object.support_release_pose.v2",
+    "real_support_release_default_enabled": false,
+    "real_support_release_enable_action": "gateway_cli_support_release_prompt_support_id_equals_prompt_repeatable",
+    "real_support_release_requires": [
+      "real_object_motion",
+      "rm65_6f_scene_profile",
+      "camera_registry_v5",
+      "holding_arm_wrist_camera"
+    ],
+    "real_support_release_held_object": "verified_grip_retained_since_its_lift",
+    "real_support_release_measurement": "most_populated_height_band_seed_grown_within_residual",
+    "real_support_release_plane_residual_m": 0.006,
+    "real_support_release_maximum_tilt_deg": 5.0,
+    "real_support_release_grid_m": 0.004,
+    "real_support_release_view_selection": "holding_wrist_if_certified_else_largest_certified_rectangle",
+    "real_support_release_preplace_height_m": 0.05,
+    "real_support_release_clearance_band_m": [
+      0.005,
+      0.015
+    ],
+    "real_support_release_check_order": "held_yaw_on_every_region_then_turned_yaws_then_lean",
+    "real_support_release_legs": "carry_within_arrival_tolerance_then_place_preserve_target_with_support_allowance",
+    "real_support_release_place_check_prediction_radius_m": 0.03,
+    "real_support_release_max_checked_candidates": 24,
+    "real_support_release_max_operation_ms": 120000,
+    "real_support_release_dispatches_motion": false,
+    "real_held_object_port_retained_grip_box": "read_only_no_store_no_discard",
+    "mujoco_support_release_v1_changed": false,
+    "real_offline_support_release_evidence": "34_saved_real_scenes_support_certification_white_mat_prompt_and_synthetic_table_queries_without_a_two_leg_plan"
+  },
+  "artifact_sha256": "940da5b0e006e771d75904cc18ccc6e45e5d5b079ce5d020b82a129964859fcb"
+}
