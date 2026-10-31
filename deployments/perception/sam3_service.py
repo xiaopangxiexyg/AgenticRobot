@@ -347,9 +347,7 @@ class Sam3ServiceLocalizer:
             image, language_prompt=None, pixel_uv=pixel_uv, min_score=0.0,
         )
         if segment is None:
-            raise Sam2PointMaskUnavailable(
-                "SAM3 point mask does not contain the requested pixel"
-            )
+            raise Sam2PointMaskUnavailable("SAM3 returned no point-prompted mask")
         return segment.mask
 
     encode_segment_artifacts = staticmethod(encode_grounded_object_segment_artifacts)

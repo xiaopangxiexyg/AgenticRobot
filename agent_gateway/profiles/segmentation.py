@@ -72,6 +72,7 @@ from dataset_contracts.perception_artifacts import (
     SEGMENTATION_OVERLAY_MEDIA_TYPE_V1,
     SEGMENTATION_OVERLAY_SCHEMA_ID_V1,
 )
+from deployments.perception.sam2_grounding_dino import Sam2PointMaskUnavailable
 
 SEGMENT_MASK_OUTPUT_SLOT_ID_V1 = "segmentation_mask"
 SEGMENT_OVERLAY_OUTPUT_SLOT_ID_V1 = "segmentation_overlay"
@@ -715,7 +716,11 @@ class LiveSegmentationProvider:
     def try_segment_capture(
         self, *, capture: LiveRgbSegmentationCapture, parameters: Mapping[str, Any],
     ) -> PreparedSegmentation | None:
-        """Run the same validation/encoder while explicitly retaining a no-mask outcome."""
+        """Run the same validation/encoder while explicitly retaining a no-mask outcome.
+
+        No mask (``None``) means no mask above ``min_score`` or, for a point
+        prompt, a best mask that does not cover the prompted pixel.
+        """
 
         if not isinstance(capture, LiveRgbSegmentationCapture):
             raise TypeError("capture must be a LiveRgbSegmentationCapture.")
@@ -732,12 +737,20 @@ class LiveSegmentationProvider:
             )
         pixel_raw = parameters["target_pixel_uv"]
         pixel_uv = None if pixel_raw is None else (int(pixel_raw[0]), int(pixel_raw[1]))
-        segment = self.localizer.segment(
-            capture.image,
-            language_prompt=parameters["language_prompt"],
-            pixel_uv=pixel_uv,
-            min_score=float(parameters["min_score"]),
-        )
+        try:
+            segment = self.localizer.segment(
+                capture.image,
+                language_prompt=parameters["language_prompt"],
+                pixel_uv=pixel_uv,
+                min_score=float(parameters["min_score"]),
+            )
+        except Sam2PointMaskUnavailable:
+            # The localizer ran, but its best mask does not cover the prompted
+            # pixel: for this view that is no mask, like a low score. Malformed
+            # outputs and transport faults are other RuntimeErrors and still raise.
+            if pixel_uv is None:
+                raise
+            return None
         if segment is None:
             return None
         encoded = self.localizer.encode_segment_artifacts(capture.image, segment)

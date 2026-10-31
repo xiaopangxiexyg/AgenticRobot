@@ -168,7 +168,11 @@ class RealHeldObjectObserver:
                         "target_pixel_uv": None if seed is None else list(seed),
                         "min_score": float(min_score)})
         if prepared is None:
-            unmeasured.append({"role": capture.role, "use": use, "reason": "no_mask_above_threshold"})
+            # None: no mask above min_score or, for a point prompt, SAM3's best
+            # mask misses the seed (try_segment_capture). This view measures
+            # nothing; the other views still run.
+            unmeasured.append({"role": capture.role, "use": use,
+                               "reason": "no_mask_above_threshold" if seed is None else "no_mask_at_seed"})
             return None
         evidence = prepared.execution_result
         mask = decode_segmentation_mask_npy(
