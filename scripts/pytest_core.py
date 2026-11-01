@@ -26,6 +26,7 @@ CORE_MODULES = frozenset(
         'tests/test_agent_gateway_evaluation_contracts.py',
         'tests/test_agent_gateway_event_journal.py',
         'tests/test_agent_gateway_grasp_approach_query.py',
+        'tests/test_agent_gateway_hardware_connection.py',
         'tests/test_agent_gateway_hardware_readonly.py',
         'tests/test_agent_gateway_motion_schemas.py',
         'tests/test_agent_gateway_mujoco_fast_grasp.py',
