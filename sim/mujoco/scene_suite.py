@@ -31,6 +31,15 @@ def _name(value: Any, field: str) -> str:
     return value
 
 
+def _quaternion_zyx(yaw: float, pitch: float, roll: float) -> tuple[float, float, float, float]:
+    """wxyz quaternion of R = Rz(yaw) Ry(pitch) Rx(roll)."""
+    cy, sy = math.cos(yaw / 2.0), math.sin(yaw / 2.0)
+    cp, sp = math.cos(pitch / 2.0), math.sin(pitch / 2.0)
+    cr, sr = math.cos(roll / 2.0), math.sin(roll / 2.0)
+    return (cr * cp * cy + sr * sp * sy, sr * cp * cy - cr * sp * sy,
+            cr * sp * cy + sr * cp * sy, cr * cp * sy - sr * sp * cy)
+
+
 def load_suite(path: str | Path = DEFAULT_SUITE) -> dict[str, Any]:
     """Read declarative fixtures; source geometry is never an Agent input."""
 
@@ -74,6 +83,7 @@ def build_case(
     objects: dict[str, FreeBodyObjectSpec] = {}
     support_heights: dict[str, float] = {}
     yaws: dict[str, float] = {}
+    tilted: dict[str, bool] = {}
     for entry in case["objects"]:
         name = _name(entry["name"], "object name")
         if name in objects:
@@ -81,6 +91,28 @@ def build_case(
         prototype = suite["prototypes"][entry["prototype"]]
         shape = prototype["shape"]
         size = tuple(prototype["size_m"])
+        if entry.get("fixed", False) is True:
+            # A fixed fixture (e.g. an inclined board or its wedge): explicit
+            # center height and roll/pitch/yaw, welded to the world.
+            if name == case["focus"] or "support" in entry or "xy_m" in entry:
+                raise ValueError(f"Fixed object {name!r} needs xyz_m only and cannot be the focus.")
+            x, y, z = (float(value) for value in entry["xyz_m"])
+            roll, pitch, yaw = (math.radians(float(value))
+                                for value in entry.get("rpy_deg", (0., 0., 0.)))
+            if not all(math.isfinite(value) for value in (x, y, z, roll, pitch, yaw)):
+                raise ValueError("Fixed object pose must be finite.")
+            obj = FreeBodyObjectSpec(
+                name=name, shape=shape, size_m=size,
+                initial_position_m=(x + offset_x, y + offset_y, z),
+                initial_quaternion_wxyz=_quaternion_zyx(yaw, pitch, roll),
+                mass_kg=prototype["mass_kg"], rgba=tuple(prototype["rgba"]),
+                contact=material, fixed=True,
+            )
+            objects[name] = obj
+            support_heights[name] = float(base_task.table_top_z_m)
+            yaws[name] = yaw
+            tilted[name] = abs(roll) > 1e-12 or abs(pitch) > 1e-12
+            continue
         x, y = entry["xy_m"]
         yaw = math.radians(float(entry.get("yaw_deg", 0.0)))
         if not math.isfinite(yaw):
@@ -91,7 +123,7 @@ def build_case(
             if support not in objects:
                 raise ValueError("Object support must precede the supported object.")
             top = objects[support]
-            if top.shape != "box" or yaws[support] != 0.0:
+            if top.shape != "box" or yaws[support] != 0.0 or tilted[support]:
                 raise ValueError("Fixture supports must be axis-aligned boxes.")
             height = top.initial_position_m[2] + top.size_m[2] / 2.0
             # The complete horizontal projection must fit on the support.
@@ -118,6 +150,7 @@ def build_case(
         objects[name] = obj
         support_heights[name] = height
         yaws[name] = yaw
+        tilted[name] = False
     if focus not in objects:
         raise ValueError("Scene focus must reference an existing object.")
     if yaws[focus] != 0.0:
