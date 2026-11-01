@@ -92,6 +92,15 @@ core and MuJoCo adapter used for the 20260721 fit; tests compare those hashes to
 fixed historical values rather than silently reinterpreting the fit against
 the current files.
 
+真机放置的小支撑物窗口使用独立绑定
+`artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261101_real_small_support_v1.json`。它固定于合并提交
+`43f134f95`（基线 `dfbd54b98` 即真机放置位姿查询绑定提交，+ 任务分支 `529a16a94`），保留前一绑定的全部非运行时引用；
+198 项已有运行时输入中 2 项改变（真机物体运动的放置支撑面测量、真机放置位姿查询），新增 0 项，合计 198 项。
+放置前先用足迹外扩 4 cm 的窗口测量支撑面（原规则），它不是一个平面时改用足迹外扩 1 cm 的窗口；一个窗口通过要求持物臂腕部相机的点
+拟合成一个平面，并且没有点低于该平面 1.5 cm 以上（越过支撑物边缘时下方表面会出现在这里）。0–2 cm 间隙检查、规划器的支撑面许可和
+抬起补全不变；放置位姿查询按同一检查预测，并让足迹离认证顶面边缘至少 1.5 cm。离线证据按内容哈希记录：1168 项关联测试
+（当前绑定测试在本绑定前排除）、小支撑物说明与放置生命周期冒烟输出。绑定仍为 `provisional`，没有新增真机运动执行或 held-out 资格。
+
 真机持物放置位姿查询 `perception.query_support_release_pose@2` 使用独立绑定
 `artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261101_real_support_release_v1.json`。它固定于合并提交
 `b9091bf5e`（基线 `be42c02d9` 即真机 RM65-6F 绑定提交，+ 任务分支 `47cb84014`），保留前一绑定（RM65-6F）的全部非运行时引用；
