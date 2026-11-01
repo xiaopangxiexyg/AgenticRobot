@@ -38,7 +38,9 @@ bash scripts/run_pytest.sh -q -m "contract and not optional and not hardware and
 bash scripts/run_pytest.sh -q -m "integration and not optional and not hardware and not slow_sim"
 # Parallel bounded edit feedback (unit + integration, isolated caches/reports):
 bash scripts/run_fast_feedback.sh
-# Complete compatibility and integration-commit acceptance:
+# Routine final merge acceptance (core, target 5–8 minutes):
+bash scripts/run_merge_acceptance.sh --durations=30
+# Complete compatibility, scenario and pressure matrices:
 bash scripts/run_full_acceptance.sh --durations=50
 # On the validated six-shard integration host, use the same setting as Harness:
 DEXTELEOP_FULL_ACCEPTANCE_SHARDS=6 bash scripts/run_full_acceptance.sh --durations=50
@@ -57,9 +59,9 @@ coverage of those suites.
 | Change | Development feedback | Before integration |
 | --- | --- | --- |
 | Documentation or Skill wording | Links, examples, relevant contract checks | Review the diff; no new text-matching tests by default |
-| Behavior or bug fix | Focused owner tests, including the demonstrated failure | Affected consumers and failure/state transitions |
-| Public contract, dependency boundary, refactor | Contract and owner tests; compare collection if tests move | Relevant cross-package suites and full non-hardware acceptance on the combined commit |
-| Simulation/control dynamics | Deterministic replay or simulator cases with declared inputs | Relevant complete simulation acceptance; report hardware separately |
+| Behavior or bug fix | Focused owner tests, including the demonstrated failure | Core acceptance plus affected consumers and failure/state transitions |
+| Public contract, dependency boundary, refactor | Contract and owner tests; compare collection if tests move | Core plus affected cross-package suites; complete acceptance for broad or unclear effects |
+| Simulation/control dynamics | Deterministic replay or simulator cases with declared inputs | Core plus the relevant complete simulation/control matrices; report hardware separately |
 
 Use coverage, when available in the test environment, to locate missed changed
 branches. For a bug fix, reproduce the fault when practical and check that the
@@ -71,6 +73,50 @@ and recovery. Do not prescribe an arbitrary repository percentage or create
 duplicate tests to raise it. A minimal environment's optional skips are useful
 feedback but do not satisfy acceptance for changed optional behavior. Record
 missing dependencies and known unrelated failures explicitly.
+
+### Core merge acceptance
+
+`bash scripts/run_merge_acceptance.sh` selects the explicit responsibilities in
+`scripts/pytest_core.py`: shared authority/safety, public motion and data
+contracts, neutral Gateway admission and transport, persistence/lifecycle
+failures, and short native continuation/dispatch/contact witnesses. Mixed
+modules retain their cheap protection and contract cases while complete
+mechanical, profile, scenario, historical-binding and stress families remain
+available through `run_full_acceptance.sh` or focused owner commands. This is
+a deliberate reduction of routine coverage, authorized for the 5–8 minute
+merge-feedback target; it is not equivalent to the complete suite.
+
+The core mode reuses the complete runner's process cleanup, short TMPDIR,
+isolated caches, native-memory release and atomic evidence publication. It
+defaults to two shards and permits at most two live pytest processes. A
+process/concurrency limit is not a RAM limit: use the host's existing memory,
+swap and pressure safeguards. Duration is measured from entry through cleanup
+and formal report publication; the target never authorizes skipping work at
+timeout. A dirty source or a changed commit cannot publish passing core evidence.
+
+The Run retains `shard-plan.json` with selected targets and omitted modules and
+families. The final `merge-core-acceptance.xml` names `acceptance.kind=core` and
+the tested commit. Omitted cases produce no pass/skip rows. The complete
+entrypoint and its output scope remain unchanged. No new tests are required
+merely to describe the reduced set; reuse the existing behavior and runner checks.
+
+Core acceptance does not infer which extra suites a change requires. The
+integration owner must run the relevant owner tests on the combined input:
+
+| Changed semantics | Additional evidence |
+| --- | --- |
+| B601 motion, recovery, feedback, torque/velocity budgets, workspace or calibration profiles | Complete affected B601 mechanical, multi-centre and deadline matrices |
+| Grasp/release, payload/contact/slip, collision, model/scene or actuator configuration | Affected complete physical task chains, native geometry and friction/profile matrices |
+| Checkpoint bindings, observations, alias/owner identity, locking or persisted state | Complete affected checkpoint state/owner/fresh-process matrices |
+| Perception/provider-specific provenance, profile construction or retained-query consumers | Affected provider/route/identity and native consumer suites |
+| Dataset transform, durability, worker concurrency or retention semantics | Relevant full transaction/recovery/volume or child-process suites |
+| Shared foundational changes, environment/assets, or uncertain consumers | Complete non-hardware acceptance |
+
+These suites may exceed eight minutes. When required, finish them before final
+admission and retain their exact combined commit/environment evidence. The core
+result alone cannot replace a required full Profile. External Harness and
+existing integration callers are not automatically switched by this new entrypoint.
+See the [scope and coverage decisions](../docs/development/plans/core-acceptance-20261101.md).
 
 ### 显式按变更验收：先隔离 B601 长控制测试
 
