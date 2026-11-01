@@ -103,7 +103,15 @@ def test_grasp_candidates_offer_level_face_grasps_only():
     top = SimpleNamespace(yaw_rad=.01, center_xy_m=(-.19, .02), top_z_m=.036)
     candidates = query.candidate_grasps(top, surface_z=.001, motion_side="right")
     assert [item[0] for item in candidates] == [
-        "top_down", "top_down_turned_left", "top_down_turned_right", "side", "top_down_half_turn"]
+        "top_down", "top_down_turned_left", "top_down_turned_right", "side", "front",
+        "top_down_half_turn"]
+    # The level side and front face grasps approach along perpendicular
+    # horizontal axes; both hold the cube level (tool z horizontal).
+    side = next(item for item in candidates if item[0] == "side")
+    front = next(item for item in candidates if item[0] == "front")
+    side_axis = side[5][:3, 2]
+    front_axis = front[5][:3, 2]
+    assert abs(float(side_axis @ front_axis)) < 1e-6
     for label, family, _offset, approach, pregrasp, contact in candidates:
         if family == "top_down":
             continue
