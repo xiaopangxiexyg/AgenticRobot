@@ -145,8 +145,9 @@ shifted to a mandatory developer run. The independent 40Hz plant case, positive
 and negative residual loads, every distinct safety-refusal reason, retained-case control
 ticks and assertions remain unchanged. The former complete-cycle 20° instance
 is not replaced by a claim that routine core still exercises that combination.
-Retained pytest node IDs remain stable. Four scheduling weights use the prior
-protected Run's remaining case sums; weights never filter tests.
+Retained pytest node IDs and the previously protected module-batch layout
+remain stable. Scheduling refreshes are separate measured changes; weights
+never filter tests.
 
 The time target never turns a failure, timeout, resource or cleanup error into
 passing evidence. Existing Harness required Profiles need an explicit change

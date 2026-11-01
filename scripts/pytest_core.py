@@ -492,8 +492,9 @@ EXTENDED_FAMILIES = {
     ),
 }
 
-# Original fixed green development d92d01f3e; scheduling only, not selection.
-# The four compressed modules use retained-case sums from protected 758675776 r3.
+# Same fixed green development d92d01f3e; scheduling only, not selection.
+# Keep the protected 758675776 layout while reducing sample matrices;
+# refresh scheduling data as a separate measured change.
 CORE_WEIGHTS = {
     'tests/test_agent_gateway_artifact_producer.py': 0.438,
     'tests/test_agent_gateway_artifact_store.py': 8.057,
@@ -509,12 +510,12 @@ CORE_WEIGHTS = {
     'tests/test_agent_gateway_unix_transport.py': 1.812,
     'tests/test_authoritative_checkpoint.py': 0.319,
     'tests/test_authoritative_checkpoint_codec.py': 0.756,
-    'tests/test_b601_automatic_calibration.py': 18.458,
-    'tests/test_b601_calibration_cycle.py': 10.534,
+    'tests/test_b601_automatic_calibration.py': 29.355,
+    'tests/test_b601_calibration_cycle.py': 22.778,
     'tests/test_b601_calibration_session.py': 5.148,
     'tests/test_b601_command_calibration.py': 0.663,
     'tests/test_b601_command_field_runtime.py': 3.326,
-    'tests/test_b601_coordinated_holding.py': 37.310,
+    'tests/test_b601_coordinated_holding.py': 58.486,
     'tests/test_b601_cruise_velocity.py': 7.863,
     'tests/test_b601_holding_calibration.py': 5.054,
     'tests/test_b601_managed_cycle.py': 9.851,
@@ -544,7 +545,7 @@ CORE_WEIGHTS = {
     'tests/test_mujoco_collision_safety.py': 3.313,
     'tests/test_mujoco_execution_checkpoint.py': 14.074,
     'tests/test_mujoco_fast_runtime.py': 26.983,
-    'tests/test_mujoco_observation_checkpoint.py': 14.470,
+    'tests/test_mujoco_observation_checkpoint.py': 31.077,
     'tests/test_mujoco_physics_scene.py': 9.154,
     'tests/test_mujoco_runtime_checkpoint.py': 5.799,
     'tests/test_mujoco_skill_scene_suite.py': 0.555,
