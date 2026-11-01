@@ -40,7 +40,7 @@ bash scripts/run_pytest.sh -q -m "integration and not optional and not hardware 
 bash scripts/run_fast_feedback.sh
 # Routine final merge acceptance (core, target 5–8 minutes):
 bash scripts/run_merge_acceptance.sh --durations=30
-# Complete compatibility, scenario and pressure matrices:
+# Explicit diagnosis of the remaining complete suite (not a routine merge gate):
 bash scripts/run_full_acceptance.sh --durations=50
 # On the validated six-shard integration host, use the same setting as Harness:
 DEXTELEOP_FULL_ACCEPTANCE_SHARDS=6 bash scripts/run_full_acceptance.sh --durations=50
@@ -60,8 +60,8 @@ coverage of those suites.
 | --- | --- | --- |
 | Documentation or Skill wording | Links, examples, relevant contract checks | Review the diff; no new text-matching tests by default |
 | Behavior or bug fix | Focused owner tests, including the demonstrated failure | Core acceptance plus affected consumers and failure/state transitions |
-| Public contract, dependency boundary, refactor | Contract and owner tests; compare collection if tests move | Core plus affected cross-package suites; complete acceptance for broad or unclear effects |
-| Simulation/control dynamics | Deterministic replay or simulator cases with declared inputs | Core plus the relevant complete simulation/control matrices; report hardware separately |
+| Public contract, dependency boundary, refactor | Contract and owner tests; compare collection if tests move | Core plus the smallest checks for unresolved consumer or boundary questions |
+| Simulation/control dynamics | Short deterministic replay or simulator cases with declared inputs | Core plus checks for the actual changed dynamics or failure; report hardware separately |
 
 Use coverage, when available in the test environment, to locate missed changed
 branches. For a bug fix, reproduce the fault when practical and check that the
@@ -84,7 +84,10 @@ modules retain their cheap protection and contract cases while complete
 mechanical, profile, scenario, historical-binding and stress families remain
 available through `run_full_acceptance.sh` or focused owner commands. This is
 a deliberate reduction of routine coverage, authorized for the 5–8 minute
-merge-feedback target; it is not equivalent to the complete suite.
+merge-feedback target for every subsequent routine merge. It is not equivalent
+to the complete suite. This budget also requires retiring unjustified long
+tests; transferring all the old matrices into mandatory development work does
+not satisfy it.
 
 The core mode reuses the complete runner's process cleanup, short TMPDIR,
 isolated caches, native-memory release and atomic evidence publication. It
@@ -103,22 +106,31 @@ the tested commit. Omitted cases produce no pass/skip rows. The complete
 entrypoint and its output scope remain unchanged. No new tests are required
 merely to describe the reduced set; reuse the existing behavior and runner checks.
 
-Core acceptance does not infer which extra suites a change requires. The
-integration owner must run the relevant owner tests on the combined input:
+Run the core once on the fixed combined input. Do not automatically append
+fast-feedback, motion and complete matrices or make those same matrices
+mandatory at every development checkpoint. A B601, grasp, checkpoint, provider
+or storage directory name alone does not require its whole matrix. For a real
+defect or unresolved behavior, identify the specific invariant and run the
+smallest relevant existing check; broad uncertainty requires investigation,
+not an automatic repeated full run. Retire repeated scenes and excessive
+parameter combinations with explicit coverage decisions instead of moving
+their cost to an earlier stage.
 
-| Changed semantics | Additional evidence |
-| --- | --- |
-| B601 motion, recovery, feedback, torque/velocity budgets, workspace or calibration profiles | Complete affected B601 mechanical, multi-centre and deadline matrices |
-| Grasp/release, payload/contact/slip, collision, model/scene or actuator configuration | Affected complete physical task chains, native geometry and friction/profile matrices |
-| Checkpoint bindings, observations, alias/owner identity, locking or persisted state | Complete affected checkpoint state/owner/fresh-process matrices |
-| Perception/provider-specific provenance, profile construction or retained-query consumers | Affected provider/route/identity and native consumer suites |
-| Dataset transform, durability, worker concurrency or retention semantics | Relevant full transaction/recovery/volume or child-process suites |
-| Shared foundational changes, environment/assets, or uncertain consumers | Complete non-hardware acceptance |
+Three multi-minute native functions (five parametrized scenarios) have been
+physically removed from the grasp-approach and support-release query modules.
+Their cumulative case time was 672.894 seconds in the fixed complete baseline:
+query/grasp/lift/carry/release across three layouts, measured-box release, and
+replanning after a block occupies the release location. Their dedicated image
+segmenters and setup helpers were removed too. All eleven cheap query,
+geometry and CLI cases remain unchanged and are now core. Existing lower
+motion, collision/contact and held/release tests remain, but no longer prove
+these five complete provider/physical-task chains. Do not reintroduce them as
+a required developer or merge matrix merely to recover the old test count.
 
-These suites may exceed eight minutes. When required, finish them before final
-admission and retain their exact combined commit/environment evidence. The core
-result alone cannot replace a required full Profile. External Harness and
-existing integration callers are not automatically switched by this new entrypoint.
+The time target never turns a failure, timeout, resource or cleanup error into
+passing evidence. Existing Harness required Profiles need an explicit change
+by their configuration owner; this entrypoint does not silently bypass them.
+External Harness and existing callers are not automatically switched.
 See the [scope and coverage decisions](../docs/development/plans/core-acceptance-20261101.md).
 
 ### 显式按变更验收：先隔离 B601 长控制测试
@@ -176,7 +188,8 @@ Python 元编程的全部依赖；新增所有者或新的可省略测试族需�
 固定 base/HEAD 及省略列表；省略项没有伪造的 pass/skip receipt。
 完整入口和按变更模式都只接受 verbosity/durations 参数，拒绝额外筛选、插件、
 环境 `PYTEST_ADDOPTS`/`PYTEST_PLUGINS` 和非零 `PYTHONOPTIMIZE`，避免静默
-缩小已声明集合或关闭断言。完整入口仍是默认行为。
+缩小已声明集合或关闭断言。`run_full_acceptance.sh` 不带选项仍表示完整范围；
+日常合并使用前述独立 core 入口。
 
 分片结束后先保留 `diagnostic-acceptance.xml`，清理临时资源并完成最终校验后，
 才以不覆盖现有文件的方式发布正式汇总 JUnit。原子发布需要 Linux `renameat2`
@@ -189,9 +202,9 @@ Python 元编程的全部依赖；新增所有者或新的可省略测试族需�
 
 **affected 成功只证明清单列出的集合，不能声称完整验收成功。** 现有明确要求
 完整验收的 Harness Profile/集成门禁继续调用无此选项的完整入口。本轮只接通
-仓库 runner 的显式调用，没有激活或改写外部 Harness 配置。跨包公共契约、
-共享控制/安全、依赖、环境或资产变化，以及最终组合提交的完整验证，继续使用
-完整验收；不得把本入口冒充必需的 full evidence。
+仓库 runner 的显式调用，没有激活或改写外部 Harness 配置。后续日常组合提交
+使用 core 标准；对具体缺陷或未闭合风险选择最小必要检查，不按变更类别一律
+追加完整矩阵。不得把 affected 或 core 冒充尚生效门禁必需的 full evidence。
 
 ## Maintaining the test set
 
@@ -498,7 +511,8 @@ children and removes only that link after the run.  Additional pytest options
 may be appended, but the marker, cache, JUnit, and basetemp options remain
 owned by the wrapper.
 
-`scripts/run_full_acceptance.sh` is the complete non-hardware integration gate.
+`scripts/run_full_acceptance.sh` explicitly runs the remaining complete
+non-hardware diagnostic suite; routine integration uses the core gate above.
 Before allocating an artifact root or starting any shard, it requires the
 checkout-relative B601 URDF under the recorded `hardware/reBotArm_control_py`
 gitlink to be a readable file. Some complete-suite cases use that fixed input;
@@ -605,9 +619,9 @@ Python multiprocessing/forkserver 使用 `TMPDIR` 创建 Unix socket，不读取
   for modules not yet listed in `tests/conftest.py`.
 - `slow_sim`: the legacy-compatible orthogonal cost marker for measured
   long-running deterministic simulation, IK replay, repository-wide source
-  scans, physical closed-loop, or high-volume soak verification. It remains in
-  the complete `unit`/`integration` and `not hardware` gates and is excluded
-  only by an explicit fast selector.
+  scans, physical closed-loop, or high-volume soak verification. Explicit
+  complete runs include these cases; fast selectors exclude them. Core uses
+  its reviewed responsibility inventory, independently of this cost marker.
 - `integration`: multi-component, filesystem, worker, writer, or loopback
   behavior.
 - `contract`: an orthogonal public schema, dependency-boundary, action, or data
@@ -624,9 +638,11 @@ mechanism that preserves current pytest node IDs.  New tests should carry the
 most precise marker possible; unclassified tests must not silently grow into
 multi-component or optional-dependency tests.
 
-Use the `not slow_sim` selector for local edit feedback only. Marker changes
-must not reduce the complete integration-commit gate, and a slow test may move
-to this tier only when the same behavior is still executed by the full suite.
+Use `not slow_sim` for bounded edit feedback; a marker change alone is not a
+coverage-retirement decision. Remove or shrink costly cases through an
+authorized behavior review, explaining which core invariant remains and which
+combination coverage is intentionally lost. Do not retain retired scenarios as
+a recurring mandatory development or merge matrix.
 
 ## Finding and adding tests
 

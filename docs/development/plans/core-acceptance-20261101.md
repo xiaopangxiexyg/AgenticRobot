@@ -1,9 +1,11 @@
 # Core merge acceptance: 5–8 minute scope
 
 The user authorized large reductions of routine tests on 2026-11-01. The target
-is final merge-feedback invocation time, with complete matrices selected by
-change or run separately. Production control, physics rates, limits, hardware
-permissions and complete-suite evidence contracts are unchanged.
+is final merge-feedback invocation time for every subsequent routine merge.
+The user clarified that retaining old long matrices as mandatory development
+work does not satisfy the goal. Retire redundant or over-expensive coverage
+and preserve core behavior. Production control, physics rates, limits,
+hardware permissions and evidence failure semantics are unchanged.
 
 ## Why the set changes
 
@@ -48,7 +50,7 @@ balance work; they never decide whether a test runs.
 
 | Family | Disposition and cost |
 | --- | --- |
-| Complete automatic/manual grasp, tilted placement and changed-support tasks | Extended physical scenarios, not equivalent duplicates. Related grasp/release/contact/scene changes must exercise them. Core no longer proves full physical task success for unrelated changes. |
+| Complete automatic/manual grasp, tilted placement and changed-support tasks | Five query/lift/carry/release scenarios are physically retired below. Other physical scenarios are explicit diagnostic choices, not required matrices based on a directory name. Core no longer proves those complete physical tasks. |
 | Multi-centre calibration and stiction/residual/friction/frequency sweeps | Extended B601 qualification. Core loses routine cross-centre and long synthetic-plant interaction coverage, retains short original-owner success/failures. |
 | Repeated native profile/side/task scoring and cold-cache scenarios | Extended consumer/model matrix; short native wiring and original strict guards remain core. |
 | All native scene offsets and full learning profile oracles | Extended scene/learning suite. Cheap materialization/configuration and action/success predicates remain. |
@@ -56,12 +58,25 @@ balance work; they never decide whether a test runs.
 | Historical runtime binding checks against already-frozen Git trees | Extended historical compatibility. Current binding must still match exact current inputs. |
 | Provider/profile-specific application and perception matrices | Owner-focused evidence when those semantics change. Neutral wire and shared artifact rules remain core; core does not prove every concrete provider. |
 
-The first implementation removes these responsibilities from the routine Run,
-without moving test files under active peer ownership or deleting unique
-scenarios. Full owner tests and `run_full_acceptance.sh` preserve their actual
-assertions. Physical deletion of equivalent duplicates is a later coherent
-change only after moving any unique failure assertion; it is not needed to
-claim a lower routine runtime. No new tests or production validators are added.
+The first implementation only selected a smaller routine Run. This revision
+also physically retires three native functions (five cases) in the two query
+modules, with 672.894 seconds of baseline cumulative case time:
+
+- `test_native_queried_grasp_then_queried_release_places_the_cube`: three full
+  RGB-D query/approach/contact/lift/release chains, including near-post and
+  leaned release layouts (421.182 seconds).
+- `test_native_release_pose_is_carried_and_released_on_the_measured_box`:
+  measured footprint/clearance through real carry/open (149.762 seconds).
+- `test_native_release_moves_off_an_object_left_where_the_release_was_planned`:
+  observe, occupy the old release location, re-query, carry/open (101.950 seconds).
+
+Their dedicated native setup and synthetic image helpers leave with them.
+All eleven cheap query input/status/geometry/CLI cases remain verbatim and join
+core. Existing lower execution, contact/collision and held/release boundaries
+remain. They are not equivalent evidence for these complete provider/physical
+chains; that composition coverage is intentionally retired under the user's
+authorization, not shifted into mandatory development qualification. No new
+tests or production validators are added.
 
 ## Callers and implementation
 
@@ -77,9 +92,14 @@ complete set; `--changed-since` retains its existing independent meaning.
 
 The core plan lists selected and omitted identities and the report is
 `merge-core-acceptance.xml`, explicitly scoped to a clean tested commit.
-Selection is not an automatic integration-permission or change-impact oracle.
-The integration owner still selects required extended evidence for the exact
-combined source. Existing Harness full Profiles are not reconfigured here.
+Every subsequent routine merge uses this one core gate, without automatically
+stacking fast-feedback, motion or full acceptance. For concrete unresolved
+behavior, choose the smallest check that answers the question. Do not impose
+the old complete owner matrices merely by directory or move their recurring
+cost into development. Timeouts, test/resource/cleanup failures remain failures
+or incomplete runs. Selection is not permission to integrate or move a branch.
+Existing Harness full Profiles need an explicit configuration-owner migration;
+they are not reconfigured or silently bypassed here.
 
 ## Completion evidence
 
