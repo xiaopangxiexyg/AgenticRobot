@@ -473,21 +473,19 @@ def plan_shards(
                 f"tests root is outside repository: {tests_root}"
             ) from error
         expected_modules.append(relative)
-        if core is not None and relative in core["EXTENDED_FAMILIES"]:
-            extended = core["EXTENDED_FAMILIES"][relative]
-            names = [name for name in _split_test_functions(path, relative)
-                     if name not in extended]
-            weight = _estimated_weight(path, relative, profile) / len(names)
-            weighted.extend((f"{relative}::{name}", Path(f"{path}::{name}"), weight)
-                            for name in names)
-        else:
-            weighted.extend(_shard_items(path, relative, profile))
+        weighted.extend(_shard_items(path, relative, profile))
 
     shards: list[list[tuple[str, Path, float]]] = [[] for _ in range(shard_count)]
     totals = [0.0] * shard_count
     for item in sorted(weighted, key=lambda value: (-value[2], value[0])):
+        lanes = range(shard_count)
+        if core is not None and shard_count > 1:
+            # Even batches contain native owners; odd batches contain contracts.
+            # With the core runner's two jobs, native batches never overlap.
+            lane = 0 if item[0] in core["CORE_NATIVE_MODULES"] else 1
+            lanes = range(lane, shard_count, 2)
         index = min(
-            range(shard_count),
+            lanes,
             key=lambda candidate: (
                 totals[candidate],
                 len(shards[candidate]),
@@ -584,6 +582,7 @@ def write_plan(
             f"{path}::{name}" for path, names in core["EXTENDED_FAMILIES"].items()
             for name in names
         )
+        manifest["layout"] = "native-serial-module-batches.v1"
     (output_dir / manifest_name).write_text(
         json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )

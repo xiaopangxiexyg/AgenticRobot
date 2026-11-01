@@ -66,7 +66,11 @@ claim a lower routine runtime. No new tests or production validators are added.
 ## Callers and implementation
 
 `run_merge_acceptance.sh` is a thin `--core` call into the existing complete
-runner. Two workers, short TMPDIR, private caches, native heap release,
+runner. Four module-isolated batches use two workers; registered heavy native
+owners alternate with contract batches and do not run on both workers at once.
+Small handwritten models can still run in the contract batch.
+Shorter processes bound native retention without changing GC. Short TMPDIR,
+private caches, native heap release,
 interruption cleanup and non-overwriting JUnit publication share one
 implementation. `run_full_acceptance.sh` without this flag still runs the
 complete set; `--changed-since` retains its existing independent meaning.

@@ -598,3 +598,67 @@ CORE_WEIGHTS = {
     'tests/test_teleop_runtime_arm_init_qpos_execute.py': 1.407,
     'tests/test_teleop_runtime_lazy_imports.py': 0.697,
 }
+
+# These native owners share a serial lane; pure contracts run alongside them.
+CORE_NATIVE_MODULES = frozenset(
+    {
+        'tests/test_agent_gateway_mujoco_fast_grasp.py',
+        'tests/test_agent_gateway_mujoco_gripper_contact.py',
+        'tests/test_agent_gateway_mujoco_safe_tcp_pose.py',
+        'tests/test_agent_gateway_surface_anchor.py',
+        'tests/test_b601_workspace_collision.py',
+        'tests/test_dmtac_cube_contact_probe.py',
+        'tests/test_mujoco_collision_safety.py',
+        'tests/test_mujoco_execution_checkpoint.py',
+        'tests/test_mujoco_fast_runtime.py',
+        'tests/test_mujoco_grasped_object_observer.py',
+        'tests/test_mujoco_observation_checkpoint.py',
+        'tests/test_mujoco_physics_scene.py',
+        'tests/test_mujoco_runtime_checkpoint.py',
+        'tests/test_mujoco_skill_scene_suite.py',
+        'tests/test_mujoco_target_checkpoint.py',
+        'tests/test_mujoco_tcp_motion_chain.py',
+        'tests/test_mujoco_temp_pipeline.py',
+        'tests/test_observed_point_motion.py',
+        'tests/test_position_admittance_active_shared_ik.py',
+        'tests/test_rebot_b601_active_report.py',
+        'tests/test_rebot_b601_active_report_load.py',
+        'tests/test_rebot_b601_axis_visualization.py',
+        'tests/test_rebot_b601_dynamics.py',
+        'tests/test_rebot_b601_haptics.py',
+        'tests/test_rebot_b601_hardware_backend.py',
+        'tests/test_rebot_b601_ik.py',
+        'tests/test_rebot_b601_joint_motion.py',
+        'tests/test_rebot_b601_low_gain_probe.py',
+        'tests/test_rebot_b601_model.py',
+        'tests/test_rebot_b601_mujoco.py',
+        'tests/test_rebot_b601_mujoco_contact.py',
+        'tests/test_rebot_b601_mujoco_haptics.py',
+        'tests/test_rebot_b601_mujoco_mit.py',
+        'tests/test_rebot_b601_real2sim.py',
+        'tests/test_rebot_b601_rm65_free_drive_integration.py',
+        'tests/test_rebot_b601_rm65_mujoco_launcher.py',
+        'tests/test_rebot_b601_rm65_real_connectivity.py',
+        'tests/test_rebot_b601_rs_gripper_control.py',
+        'tests/test_rebot_b601_shared_control.py',
+        'tests/test_rebot_b601_shared_control_mujoco.py',
+        'tests/test_rebot_b601_shared_control_runtime.py',
+        'tests/test_rebot_b601_staged_assist.py',
+        'tests/test_rebot_b601_submodule_boundary.py',
+        'tests/test_replay_position_admittance_active_pipeline.py',
+        'tests/test_replay_position_admittance_ik_trace.py',
+        'tests/test_rm65_ik_checkpoint.py',
+    }
+)
+
+
+def pytest_collection_modifyitems(config, items):
+    """Core-only plugin: defer exact families without prefix-matching new tests."""
+    selected, extended = [], []
+    for item in items:
+        module = item.path.relative_to(config.rootpath).as_posix()
+        family = getattr(item, "originalname", None) or item.name.split("[", 1)[0]
+        (extended if family in EXTENDED_FAMILIES.get(module, ()) else selected).append(item)
+    if extended:
+        config.hook.pytest_deselected(items=extended)
+        items[:] = selected

@@ -88,7 +88,10 @@ merge-feedback target; it is not equivalent to the complete suite.
 
 The core mode reuses the complete runner's process cleanup, short TMPDIR,
 isolated caches, native-memory release and atomic evidence publication. It
-defaults to two shards and permits at most two live pytest processes. A
+defaults to four module-isolated batches and permits at most two live pytest
+processes. Registered heavy native owners occupy alternating batches, so those
+batches never overlap; small handwritten models may still run in the contract
+batch. Shorter processes bound retained native state. A
 process/concurrency limit is not a RAM limit: use the host's existing memory,
 swap and pressure safeguards. Duration is measured from entry through cleanup
 and formal report publication; the target never authorizes skipping work at

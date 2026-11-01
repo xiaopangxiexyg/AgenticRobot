@@ -164,7 +164,7 @@ prepare_asset_compat_link() {
 
 configure_shards() {
   local default_shards=4
-  [[ "$ACCEPTANCE_PROFILE" != core ]] || default_shards=2
+  [[ "$ACCEPTANCE_PROFILE" != core ]] || default_shards=4
   SHARD_COUNT="${DEXTELEOP_FULL_ACCEPTANCE_SHARDS:-$default_shards}"
   case "$SHARD_COUNT" in
     1|2|3|4|5|6|7|8|9|10|11|12) ;;
@@ -174,7 +174,9 @@ configure_shards() {
   if ((SHARD_COUNT > 6)) && [[ -z "${DEXTELEOP_FULL_ACCEPTANCE_MAX_JOBS:-}" ]]; then
     die "DEXTELEOP_FULL_ACCEPTANCE_MAX_JOBS must be explicit when SHARD_COUNT exceeds 6"
   fi
-  MAX_JOBS="${DEXTELEOP_FULL_ACCEPTANCE_MAX_JOBS:-$SHARD_COUNT}"
+  local default_jobs="$SHARD_COUNT"
+  [[ "$ACCEPTANCE_PROFILE" != core ]] || default_jobs=2
+  MAX_JOBS="${DEXTELEOP_FULL_ACCEPTANCE_MAX_JOBS:-$default_jobs}"
   case "$MAX_JOBS" in
     1|2|3|4|5|6) ;;
     *) die "DEXTELEOP_FULL_ACCEPTANCE_MAX_JOBS must be an integer from 1 to 6: $MAX_JOBS" ;;
@@ -303,6 +305,8 @@ run_shard() {
   local name="shard-${index}"
   local shard_tmp="$SHORT_TMP_ROOT/$name"
   local -a shard_paths=()
+  local -a core_options=()
+  [[ "$ACCEPTANCE_PROFILE" != core ]] || core_options=(-p scripts.pytest_core)
   mkdir -- "$shard_tmp" "$RUN_ROOT/${name}-xdg-cache" "$RUN_ROOT/${name}-matplotlib-cache" \
     "$RUN_ROOT/${name}-numba-cache"
   mapfile -t shard_paths <"$RUN_ROOT/${name}-paths.txt"
@@ -321,6 +325,7 @@ run_shard() {
     -o "cache_dir=$RUN_ROOT/${name}-pytest-cache" \
     --junitxml="${SHARD_XMLS[index]}" \
     "${shard_paths[@]}" \
+    "${core_options[@]}" \
     "$@" \
     >"${SHARD_LOGS[index]}" 2>&1
 }
