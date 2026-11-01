@@ -782,9 +782,13 @@ def test_automatic_tracking_recovery_invalid_cap_rejected_before_owner(cap):
             motion_tracking_recovery_cap_nm=cap)
 
 
-@pytest.mark.parametrize("feedback_gain", [0.,40.])
-@pytest.mark.parametrize("stop", ["human","lease","deadline","exposure"])
-@pytest.mark.parametrize("governor", [False, True])
+# Keep every pair of exit cause, governed mode and feedback gain.
+@pytest.mark.parametrize("governor,stop,feedback_gain", [
+    (False, "human", 0.), (True, "human", 40.),
+    (False, "lease", 40.), (True, "lease", 0.),
+    (False, "deadline", 0.), (True, "deadline", 40.),
+    (False, "exposure", 40.), (True, "exposure", 0.),
+])
 def test_automatic_tracking_recovery_keeps_original_session_exit_budgets(settings,stop,feedback_gain,governor):
     settings = replace(settings,limits=replace(settings.limits,max_abs_assist_nm=1.),
         staged_assist=replace(settings.staged_assist,max_total_overlay_nm=1.))

@@ -112,7 +112,7 @@ def test_replay_driver_refreshes_heartbeat_after_callback_stops_owner(settings, 
     assert replay.controller.status()["automatic_calibration"]["state"] == "cancelled"
 
 
-@pytest.mark.parametrize("offset", [0.02, math.radians(20)])
+@pytest.mark.parametrize("offset", [0.02])
 def test_native_cycle_positions_observes_runs_twelve_legs_returns_and_waits_for_gui_disable_confirmation(
     settings, offset
 ):
@@ -758,7 +758,7 @@ def _exercise_transfer_with_quantized_stiction_plant(
 
 @pytest.mark.parametrize("continuous,friction,residual", [
     (False, .2, 0.), (False, .6, 0.),
-    (True, .2, 0.), (True, .6, 0.), (True, .2, .16), (True, .2, -.16),
+    (True, .6, 0.), (True, .2, .16), (True, .2, -.16),
 ])
 def test_transfer_native_owner_with_quantized_stiction_plant_reaches_twenty_degrees(tmp_path, friction, continuous, residual, record_property):
     _exercise_transfer_with_quantized_stiction_plant(

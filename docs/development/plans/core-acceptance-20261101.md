@@ -78,6 +78,25 @@ chains; that composition coverage is intentionally retired under the user's
 authorization, not shifted into mandatory development qualification. No new
 tests or production validators are added.
 
+The next compression physically reduces eight existing parameter matrices
+from 63 to 31 cases. Thirty-one removed cases were in routine core; one was in
+the explicit quantized-plant suite. All remaining function bodies and control
+ticks stay unchanged, apart from removing unreachable observer hold setup.
+The table in `tests/README.md` records each retained role and lost cross-product.
+Stop/gain/governor retains every two-factor pair. Observer pending and both
+distinct rejection states remain; ordinary active/hold with enabled observation
+are intentionally omitted. Selected J2 and non-selected controlled J3 are not
+treated as interchangeable passive axes.
+
+Review identified that legacy low-friction quantized motion is a successful
+20° trial, while legacy high-friction motion must time out and return before
+the success assertions. Both remain. Only the continuous low-friction
+zero-residual duplicate is removed; both residual signs and the independent
+40Hz case remain available without becoming required development work.
+Routine core's ideal .02-radian full cycle keeps the complete original
+12-leg/return/GUI-disable assertions; maximum-excursion × full-cycle × GUI
+confirmation coverage is explicitly retired.
+
 ## Callers and implementation
 
 `run_merge_acceptance.sh` is a thin `--core` call into the existing complete

@@ -52,7 +52,7 @@ def source():
 
 @pytest.mark.parametrize(
     "ending",
-    ("pending", "active", "hold", "watermark_rejected", "measurement_rejected"),
+    ("pending", "watermark_rejected", "measurement_rejected"),
 )
 def test_enabled_cartesian_cut_restores_without_publish_and_continues(
     source, monkeypatch, ending
@@ -66,9 +66,6 @@ def test_enabled_cartesian_cut_restores_without_publish_and_continues(
         == "dispatched"
     )
     clock.advance_to(10.01)
-    if ending == "hold":
-        runtime.transition_execution_gate("hold", reason="observed-checkpoint")
-        runtime.step()
     if ending in ("watermark_rejected", "measurement_rejected"):
         publish = MujocoExecutionDifferenceObserver.publish_execution_observation
 

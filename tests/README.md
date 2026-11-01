@@ -127,6 +127,27 @@ motion, collision/contact and held/release tests remain, but no longer prove
 these five complete provider/physical-task chains. Do not reintroduce them as
 a required developer or merge matrix merely to recover the old test count.
 
+Eight further parameter families retain 31 of their original 63 cases:
+
+| Family | Before → after | Retained boundary and intentional loss |
+| --- | --- | --- |
+| Enabled Cartesian observation checkpoint | 5 → 3 | Pending, rejected watermark and rejected measurement remain; ordinary active/hold × enabled-observer combinations leave. |
+| Six-axis pose-observation jitter | 12 → 4 | Controlled J2/J3, passive first/last indices and both phases remain; full axis × phase coverage leaves. |
+| Fixed probe jitter | 10 → 4 | Selected J2 at both periods and passive first/last indices remain; other passive axis × period combinations leave. |
+| Varying support-effort timeout | 4 → 2 | Both periods retain rejection and unchanged leg budget at 1.5s; duplicate 3s configurations leave. |
+| Nominal entry margin | 8 → 4 | Both controlled axes retain default rejection and explicit expanded admission, with both signs; full three-factor coverage leaves. |
+| Tracking-recovery exit budgets | 16 → 8 | Every pair of stop cause, governor mode and feedback gain remains; three-factor exhaustive coverage leaves. |
+| Ideal full-cycle excursion | 2 → 1 | The .02-radian complete cycle retains all 12 legs, returns and one-shot GUI-disable confirmation; 20° × full-cycle completion leaves core. |
+| Quantized stiction plant | 6 → 5 | Legacy low-friction success and high-friction timeout remain distinct; only continuous low-friction zero-residual success leaves. |
+
+The last plant family remains outside routine core; its reduced cost is not
+shifted to a mandatory developer run. The independent 40Hz plant case, positive
+and negative residual loads, every distinct safety-refusal reason, retained-case control
+ticks and assertions remain unchanged. The former complete-cycle 20° instance
+is not replaced by a claim that routine core still exercises that combination.
+Retained pytest node IDs remain stable. Four scheduling weights use the prior
+protected Run's remaining case sums; weights never filter tests.
+
 The time target never turns a failure, timeout, resource or cleanup error into
 passing evidence. Existing Harness required Profiles need an explicit change
 by their configuration owner; this entrypoint does not silently bypass them.
