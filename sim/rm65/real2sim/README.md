@@ -92,6 +92,16 @@ core and MuJoCo adapter used for the 20260721 fit; tests compare those hashes to
 fixed historical values rather than silently reinterpreting the fit against
 the current files.
 
+MuJoCo 放置到斜板（倾斜支撑面）与水平正面抓取使用独立绑定
+`artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261101_mujoco_place_slope_v1.json`。它固定于集成提交
+`d7ca1ac9e`（两次合并加一个测试修正；基线 `06d472193` 即当时 development 的最新绑定提交，+ 抓取分支 `030bb2774`、斜面分支 `833835014` 和合并后的放置查询测试修正），保留前一绑定的全部非运行时引用；
+199 项已有运行时输入中 7 项改变（支撑面投影与测量、MuJoCo 抓取查询与释放查询、释放查询 Skill 摘要、`robot_motion/object_transport.py`、`sim/mujoco/modeling/objects.py`），新增 2 项（`sim/contracts/scene/object.py`、`sim/mujoco/scene_suite.py`），合计 201 项。
+抓取查询在 `side` 之后、`top_down_half_turn` 之前加入水平 `front` 面抓取；场景合同支持固定（焊接到世界、没有自由关节）的物体，只有 `fixed` 为真时才序列化，原有合同字节与哈希不变；
+支撑面测量新增独立的倾斜平面入口（≤ 30°，`allow_inclined` 默认关闭；近水平路径的 1° 不变量不动），倾斜顶面高度取区域中心处的平面高度加 2 mm 残差；
+MuJoCo 释放查询（仍为 v1）在倾斜区域先试“摆正”一轮（把手中物体最接近法线的盒轴转到支撑法线上，保持偏航采样，不叠加倾斜），水平支撑的候选、顺序和返回字段不变；真机释放路径不打开倾斜开关，行为不变。
+离线证据按内容哈希记录：关联测试 1138 项（当前绑定测试在本绑定前排除）、原生斜板放置链报告、116 上两种坡向的斜板 Agent 队列报告和抓取证据报告。
+1 mm 穿透、3 mm/2° 滑移、50 ms 观测间隔、0.6 s 释放窗口和 2 mm 非接触间隙门限都不变。绑定仍为 `provisional`，没有真机运动执行或 held-out 资格。
+
 真机操作者断开／重连双臂双夹爪与操作者开合夹爪使用独立绑定
 `artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261101_real_hardware_connection_v1.json`。它固定于合并提交
 `f99ab7c8a`（基线 `d92d01f3e` 即真机持物闭合测量绑定提交，+ 任务分支 `0f20b76bc`），保留前一绑定的全部非运行时引用；
