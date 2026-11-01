@@ -36,6 +36,7 @@ Semantics: ``agenticrobot.held_object.measured_box.v2``.
 
 from __future__ import annotations
 
+import dataclasses
 import math
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -280,6 +281,54 @@ def _view_surface(view: HeldObjectView):
     return surface, row
 
 
+# The narrowest closing region kept for a fully closed gripper (positive box extents).
+HELD_OBJECT_MIN_OPENING_M = 0.001
+
+
+def tool_entity_at_opening(entity: ToolEntityBox, opening_m: float) -> ToolEntityBox:
+    """The gripper entity with its fingers and closing region at a measured opening.
+
+    A parallel-jaw ``ToolEntityBox`` models the fingers at the geometry's
+    maximum opening (twice the closing region's half width along the closing
+    axis, the first box axis). At a smaller opening each finger part and each
+    contact-only solid moves inward by half the difference, and the closing
+    region narrows to the opening. The palm and the hover envelope are
+    unchanged. ``opening_m`` at or above the maximum returns ``entity``.
+    """
+    if entity.grasp_region is None or len(entity.parts) < 3:
+        raise ValueError("The gripper entity needs its finger parts and closing region.")
+    opening = float(opening_m)
+    if not math.isfinite(opening) or opening < 0.0:
+        raise ValueError("The gripper opening must be finite and non-negative.")
+    rotation = np.asarray(entity.tcp_from_box_rotation, dtype=float).reshape(3, 3)
+    closing = rotation[:, 0]
+    region_centre = np.asarray(entity.grasp_region[0], dtype=float)
+    region_half = np.asarray(entity.grasp_region[1], dtype=float)
+    maximum = 2.0 * float(region_half[0])
+    opening = max(HELD_OBJECT_MIN_OPENING_M, opening)
+    if opening >= maximum:
+        return entity
+    shift = (maximum - opening) / 2.0
+    parts = []
+    for centre, half in entity.parts:
+        offset = float((np.asarray(centre, dtype=float) - region_centre) @ closing)
+        low, high = offset - float(half[0]), offset + float(half[0])
+        # A finger lies wholly on one side of the closing region; the palm spans it.
+        side = 1.0 if low >= region_half[0] - 1e-6 else -1.0 if high <= -region_half[0] + 1e-6 else 0.0
+        parts.append((tuple(np.asarray(centre, dtype=float) - side * shift * closing), tuple(half)))
+    contact = []
+    for pose, half in entity.contact_solids:
+        transform = np.asarray(pose, dtype=float).reshape(4, 4).copy()
+        side = 1.0 if float((transform[:3, 3] - region_centre) @ closing) > 0.0 else -1.0
+        transform[:3, 3] = transform[:3, 3] - side * shift * closing
+        contact.append((tuple(transform.reshape(-1)), tuple(half)))
+    narrowed = region_half.copy()
+    narrowed[0] = opening / 2.0
+    return dataclasses.replace(entity, parts=tuple(parts), contact_solids=tuple(contact),
+                               grasp_region=(tuple(region_centre), tuple(narrowed)),
+                               source={**dict(entity.source), "held_object_opening_m": opening})
+
+
 def _closing_axis_box(points: np.ndarray, *, region_centre, axis_index: int, margin_m: float):
     """(low, high) of the points, symmetric about the closing-region centre along the closing axis, plus margin."""
     low, high = points.min(axis=0), points.max(axis=0)
@@ -427,5 +476,6 @@ def measure_held_object_box(*, views: Sequence[HeldObjectView], entity: ToolEnti
                          view_relations=tuple(view_rows), metrics=metrics)
 
 
-__all__ = ["HELD_OBJECT_BOX_SEMANTICS_V2", "HeldObjectBox", "HeldObjectView", "SupportPlane",
-           "grip_seed_pixel", "gripper_solid_distance_m", "measure_held_object_box", "projected_seed_pixel"]
+__all__ = ["HELD_OBJECT_BOX_SEMANTICS_V2", "HELD_OBJECT_MIN_OPENING_M", "HeldObjectBox", "HeldObjectView",
+           "SupportPlane", "grip_seed_pixel", "gripper_solid_distance_m", "measure_held_object_box",
+           "projected_seed_pixel", "tool_entity_at_opening"]

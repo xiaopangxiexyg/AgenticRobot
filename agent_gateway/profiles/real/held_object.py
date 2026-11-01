@@ -12,7 +12,10 @@ extend the primary box by a bounded amount. Other cameras add their station
 calibration error to the gripper geometry; on the saved real samples their
 own "between the pads" pixels were mostly the gripper's fingers.
 The gripper sample adds the measured closure and the last commanded target;
-holding is verified only with that sample. Nothing here moves the
+holding is verified only with that sample. With a sample, the fingers and the
+closing region are placed at the measured opening (``real_dmtac_opening_m``)
+before any seed or relation is computed: a partly closed empty gripper then
+shows its own fingers outside the narrowed closing region. Nothing here moves the
 robot, commands a gripper or grants motion authority; a planner only accepts
 the resulting box through ``RM65CarriedObjectBox``.
 """
@@ -36,6 +39,7 @@ from robot_motion.held_object_measurement import (
     grip_seed_pixel,
     measure_held_object_box,
     projected_seed_pixel,
+    tool_entity_at_opening,
 )
 from robot_motion.relative_action import xyzquat_to_pose_matrix
 from robot_motion.tool_entity_scene import (
@@ -56,6 +60,18 @@ REAL_HELD_OBJECT_FULL_CLOSE_MARGIN = 0.03
 # An open DMTAC reads about 0.0. Below the gripper Skill's minimum closed
 # position the pads do not grip (the Skill itself never settles a close there).
 REAL_HELD_OBJECT_MIN_CLOSE = GripperConvergenceProfile().minimum_closed_position
+
+
+def real_dmtac_opening_m(entity, measured_close: float) -> float:
+    """Opening between the DMTAC pads at a measured closure.
+
+    Linear from the entity's maximum opening (measured_close 0) to closed (1).
+    On the 2026-11-01 held samples the opening this gives at the settled
+    closure was within about 1 cm of the held object's width (cube and can
+    at 0.14-0.22 give 5.5-6.1 cm, bottle and bar at 0.64 give 2.5 cm).
+    """
+    close = min(1.0, max(0.0, float(measured_close)))
+    return 2.0 * float(entity.grasp_region[1][0]) * (1.0 - close)
 
 
 @dataclass(frozen=True)
@@ -225,7 +241,14 @@ class RealHeldObjectObserver:
                 raise RuntimeError("Held-object capture needs this revision's capture-time joint state.")
         qpos = {s: tuple(float(v) for v in np.asarray(q, dtype=float).reshape(6))
                 for s, q in captures[0].capture_qpos_by_side.items()}
+        gripper = self._gripper_sample(side)
         entity = self.tool_entity_by_side[side]
+        if (gripper is not None and entity.grasp_region is not None and len(entity.parts) >= 3):
+            # The fingers sit at the measured closure, not at the open envelope:
+            # a partly closed empty gripper must not show its own fingers in
+            # the closing region, and finger points are not the held object.
+            gripper["opening_m"] = real_dmtac_opening_m(entity, gripper["measured_close"])
+            entity = tool_entity_at_opening(entity, gripper["opening_m"])
 
         def tcp_of(capture):
             return xyzquat_to_pose_matrix(self.scene_port.tcp_pose_by_side(capture.capture_qpos_by_side)[side])
@@ -287,22 +310,26 @@ class RealHeldObjectObserver:
             # The holding arm's own camera sees the closing region empty: nothing is held there.
             measurement = replace(measurement, status="not_between_fingers",
                                   reason="no_object_between_fingers_in_wrist_view")
-        gripper = None
-        reader = self.gripper_state_by_side.get(side)
-        if reader is not None:
-            sample = reader()
-            gripper = {"measured_close": float(sample.measured_close), "moving": sample.moving,
-                       "fault_code": sample.fault_code, "observed_at": float(sample.observed_at),
-                       "evidence_ref": sample.evidence_ref}
-            command = self.gripper_command_by_side.get(side)
-            if command is not None:
-                target, attempt_ref = command()
-                gripper["last_command_target_close"] = None if target is None else float(target)
-                gripper["last_command_attempt_ref"] = attempt_ref
         return RealHeldObjectObservation(
             side=side, label=label, language_prompt=language_prompt, station_revision=expected_station_revision,
             capture_qpos_by_side=qpos, world_from_tcp=world_from_tcp, measurement=measurement,
             segments=tuple(segments), unmeasured=tuple(unmeasured), gripper=gripper)
+
+    def _gripper_sample(self, side: str) -> dict | None:
+        """One fresh DMTAC sample of ``side`` and its last commanded target, or None without a reader."""
+        reader = self.gripper_state_by_side.get(side)
+        if reader is None:
+            return None
+        sample = reader()
+        gripper = {"measured_close": float(sample.measured_close), "moving": sample.moving,
+                   "fault_code": sample.fault_code, "observed_at": float(sample.observed_at),
+                   "evidence_ref": sample.evidence_ref}
+        command = self.gripper_command_by_side.get(side)
+        if command is not None:
+            target, attempt_ref = command()
+            gripper["last_command_target_close"] = None if target is None else float(target)
+            gripper["last_command_attempt_ref"] = attempt_ref
+        return gripper
 
 
 __all__ = ["REAL_HELD_OBJECT_PRIMARY_ROLE_BY_SIDE", "REAL_HELD_OBJECT_SEMANTICS_V2", "RealHeldObjectObservation",
