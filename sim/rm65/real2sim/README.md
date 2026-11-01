@@ -92,6 +92,16 @@ core and MuJoCo adapter used for the 20260721 fit; tests compare those hashes to
 fixed historical values rather than silently reinterpreting the fit against
 the current files.
 
+真机持物测量按 DMTAC 实测闭合放置手指，使用独立绑定
+`artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261101_real_held_closure_v1.json`。它固定于合并提交
+`1664dba7f`（基线 `d95a13374` 即真机放置小支撑物窗口绑定提交，+ 任务分支 `c20f490d5`），保留前一绑定的全部非运行时引用；
+198 项已有运行时输入中 2 项改变（`robot_motion/held_object_measurement.py` 新增 `tool_entity_at_opening`，
+`agent_gateway/profiles/real/held_object.py` 先读夹爪样本），新增 0 项，合计 198 项。有夹爪读数时，手指、DMTAC 接触实体和闭合区域
+按实测开口放置（开口 = 最大开口 7.05 cm ×（1 − 闭合度），最小 1 mm）后再取种子像素和计算包围盒，部分闭合的空夹爪不再把自己的手指当成物体；
+没有夹爪读数时几何不变。离线证据按内容哈希记录：1412 项关联测试（当前绑定测试在本绑定前排除）、14 个 Dashboard 持物样本
+（28 个手臂状态，视觉加闭合判定 TP/FN/FP/TN 6/0/2/20 → 6/0/0/22）和 34 个保存的 RM65-6F 场景回归（空手臂持物 0/59，目标 5/5）。
+绑定仍为 `provisional`，没有新增真机运动执行或 held-out 资格。
+
 真机放置的小支撑物窗口使用独立绑定
 `artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261101_real_small_support_v1.json`。它固定于合并提交
 `43f134f95`（基线 `dfbd54b98` 即真机放置位姿查询绑定提交，+ 任务分支 `529a16a94`），保留前一绑定的全部非运行时引用；
