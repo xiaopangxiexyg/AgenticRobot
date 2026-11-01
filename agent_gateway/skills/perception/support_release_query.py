@@ -86,7 +86,8 @@ def definition() -> SkillDefinition:
         skill_id=SKILL_ID, skill_version="1", skill_kind="inspection",
         summary=(
             "Find a release pose for the object currently held in the gripper above a named "
-            "support (box top or mat). Requires the held object to be lifted clear of the table "
+            "support (box top, mat, or a board inclined up to 30 degrees: the object is then "
+            "turned to lie flat on it). Requires the held object to be lifted clear of the table "
             "first (motion.move_grasped_object_to_pose phase=lift). The Gateway segments the "
             "support in fresh RGB-D from each bound camera (the wrist camera sees past the arm), "
             "keeps up to three fully observed top rectangles, largest first (the free strips "

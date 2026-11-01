@@ -21,6 +21,10 @@ from robot_motion.pose import pose_delta_metrics
 
 _IDENTITY_3 = np.eye(3)
 _HOMOGENEOUS_ROW = np.array((0., 0., 0., 1.))
+# Steepest support a release may be planned on (an inclined board). Producers
+# opt in per observation (SupportSurfaceObservation.maximum_tilt_deg); the
+# default bound stays 1 degree.
+MAXIMUM_SUPPORT_TILT_DEG = 30.
 
 
 def rigid_pose(value, *, name: str) -> np.ndarray:
@@ -172,6 +176,10 @@ class SupportSurfaceObservation:
     evidence_ref: str
     geometry_complete: bool
     source_measurement_times_sec: tuple[float, ...] = ()
+    # Release planning is normal-aware; a producer that measured an inclined
+    # top (an inclined board) states its bound here. The default keeps the
+    # near-horizontal invariant every existing producer relies on.
+    maximum_tilt_deg: float = 1.
 
     def __post_init__(self):
         for name in ("support_id", "reference_frame_id", "evidence_ref"):
@@ -185,11 +193,17 @@ class SupportSurfaceObservation:
             raise ValueError("Support time, revision and height must be finite")
         if self.geometry_complete is not True:
             raise ValueError("Release approach requires complete conservative support geometry")
+        if (isinstance(self.maximum_tilt_deg, (bool, np.bool_))
+                or not isinstance(self.maximum_tilt_deg, (int, float))
+                or not 0. < float(self.maximum_tilt_deg) <= MAXIMUM_SUPPORT_TILT_DEG):
+            raise ValueError("Support tilt bound must be in (0, MAXIMUM_SUPPORT_TILT_DEG] degrees")
         normal = np.asarray(self.normal_reference_xyz, dtype=float)
         if (normal.shape != (3,) or not np.isfinite(normal).all()
                 or not np.isclose(np.linalg.norm(normal), 1., atol=1e-6, rtol=0)
-                or normal[2] < math.cos(math.radians(1.))):
-            raise ValueError("Release approach requires a measured near-horizontal upward support")
+                or normal[2] < math.cos(math.radians(float(self.maximum_tilt_deg)))):
+            raise ValueError("Release approach requires a measured near-horizontal upward support "
+                             "(or one within the observation's declared tilt bound)")
+        object.__setattr__(self, "maximum_tilt_deg", float(self.maximum_tilt_deg))
         object.__setattr__(self, "normal_reference_xyz", tuple(float(value) for value in normal))
         for name in ("region_min_xy_m", "region_max_xy_m"):
             values = np.asarray(getattr(self, name), dtype=float)
@@ -569,11 +583,17 @@ class ReleaseApproachCandidate:
     yaw_offset_rad: float
     proposal: ReleaseApproachProposal
     lean_rad: float = 0.
+    # Rotation that brought the held box axis nearest the support normal onto
+    # it (level_to_support); 0 when the held orientation is kept.
+    leveling_rad: float = 0.
 
 
 # The query may turn a held object at most this far toward the arm, and a leaned
 # release never tilts the object's box more than this from the support normal.
 MAXIMUM_RELEASE_LEAN_RAD = math.radians(10.)
+# A leveling turn larger than the steepest support plus this much in-hand tilt
+# would mean an object held on its edge, not a slope to follow.
+MAXIMUM_LEVELING_RAD = math.radians(MAXIMUM_SUPPORT_TILT_DEG + 10.)
 
 
 def _support_tilt_rad(held: GraspedObjectObservation, rotation: np.ndarray, normal: np.ndarray) -> float:
@@ -581,6 +601,23 @@ def _support_tilt_rad(held: GraspedObjectObservation, rotation: np.ndarray, norm
     box = rotation @ held.object_from_box[:3, :3]
     alignment = float(np.max(np.abs(box.T @ normal)))
     return math.acos(max(-1., min(1., alignment)))
+
+
+def _leveling_rotation(held: GraspedObjectObservation, rotation: np.ndarray,
+                       normal: np.ndarray) -> tuple[np.ndarray, float]:
+    """Smallest turn putting the box axis nearest the support normal onto it, and its angle."""
+    box = rotation @ held.object_from_box[:3, :3]
+    projections = box.T @ normal
+    axis_index = int(np.argmax(np.abs(projections)))
+    current = box[:, axis_index] * (1. if projections[axis_index] >= 0. else -1.)
+    cross = np.cross(current, normal)
+    sine, cosine = float(np.linalg.norm(cross)), float(current @ normal)
+    angle = math.atan2(sine, cosine)
+    if sine < 1e-12:
+        return np.eye(3), 0.
+    axis = cross / sine
+    skew = np.array([[0., -axis[2], axis[1]], [axis[2], 0., -axis[0]], [-axis[1], axis[0], 0.]])
+    return np.eye(3) + math.sin(angle) * skew + (1. - math.cos(angle)) * (skew @ skew), angle
 
 
 def _lean_rotation(support: SupportSurfaceObservation, *, lean_rad: float,
@@ -628,6 +665,7 @@ def plan_release_approach_candidates(
     include_nearest_to_held: bool = False,
     lean_rad: float = 0.,
     lean_toward_xy_m: tuple[float, float] | None = None,
+    level_to_support: bool = False,
 ) -> tuple[ReleaseApproachCandidate, ...]:
     """Bounded on-support proposals for the existing payload-safe planner.
 
@@ -642,7 +680,11 @@ def plan_release_approach_candidates(
     ``lean_toward_xy_m``; the footprint and the lowest-corner clearance are
     computed for the tilted box, and an orientation whose box would then tilt
     more than ``MAXIMUM_RELEASE_LEAN_RAD`` from the support normal (an object
-    that already leans in the hand) is skipped. A position whose footprint
+    that already leans in the hand) is skipped. Opt-in, ``level_to_support``
+    turns every (yawed) orientation by the smallest rotation that puts the box
+    axis nearest the support normal onto it, so the object lands flat on an
+    inclined support (or one it leans against in the hand); it excludes a
+    lean. A position whose footprint
     misses the region by rounding is dropped; ``NoReleaseCandidates`` reports
     that nothing remains. No candidate is an authority to move,
     and the selected support must be
@@ -652,9 +694,13 @@ def plan_release_approach_candidates(
         raise TypeError("Quarter-turn sampling must be explicitly boolean")
     if type(include_nearest_to_held) is not bool:
         raise TypeError("Nearest-position sampling must be explicitly boolean")
+    if type(level_to_support) is not bool:
+        raise TypeError("Leveling to the support must be explicitly boolean")
     if (isinstance(lean_rad, (bool, np.bool_)) or not isinstance(lean_rad, (int, float))
             or not math.isfinite(lean_rad) or not 0. <= lean_rad <= MAXIMUM_RELEASE_LEAN_RAD):
         raise ValueError("Release lean must be finite radians in [0, MAXIMUM_RELEASE_LEAN_RAD]")
+    if level_to_support and lean_rad != 0.:
+        raise ValueError("A leveled release is not leaned")
     if yaw_offsets_rad is not None:
         if allow_quarter_turns or not isinstance(yaw_offsets_rad, (tuple, list)) or not 1 <= len(yaw_offsets_rad) <= 8:
             raise ValueError("Explicit yaw samples replace quarter-turn sampling and require 1..8 angles")
@@ -694,6 +740,13 @@ def plan_release_approach_candidates(
             [0., 0., 1.],
         ])
         rotation = lean @ z_rotation @ held.reference_from_object[:3, :3]
+        leveling = 0.
+        if level_to_support:
+            align, leveling = _leveling_rotation(held, rotation, normal)
+            if leveling > MAXIMUM_LEVELING_RAD:
+                tilt_limited = True
+                continue
+            rotation = align @ rotation
         if lean_rad > 0. and _support_tilt_rad(held, rotation, normal) > MAXIMUM_RELEASE_LEAN_RAD:
             # The lean adds to the tilt the object already has in the hand.
             tilt_limited = True
@@ -733,6 +786,7 @@ def plan_release_approach_candidates(
             candidates.append(ReleaseApproachCandidate(
                 box_center_xy_m=tuple(float(value) for value in box_center),
                 yaw_offset_rad=angle, proposal=proposal, lean_rad=float(lean_rad),
+                leveling_rad=float(leveling),
             ))
     if not candidates:
         if tilt_limited:
