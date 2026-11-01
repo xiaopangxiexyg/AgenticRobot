@@ -43,16 +43,19 @@ def add_free_body_object(
             "quat": format_float_list(spec.initial_quaternion_wxyz),
         },
     )
-    ET.SubElement(body, "freejoint", {"name": f"{spec.name}_freejoint"})
-    ET.SubElement(
-        body,
-        "inertial",
-        {
-            "pos": "0 0 0",
-            "mass": f"{spec.mass_kg:.12g}",
-            "diaginertia": format_float_list(spec.inertia_diagonal_kg_m2 or ()),
-        },
-    )
+    if not spec.fixed:
+        # A fixed object has no joint: MuJoCo welds a jointless body to its
+        # parent (the world), so it keeps this pose and has no inertia of its own.
+        ET.SubElement(body, "freejoint", {"name": f"{spec.name}_freejoint"})
+        ET.SubElement(
+            body,
+            "inertial",
+            {
+                "pos": "0 0 0",
+                "mass": f"{spec.mass_kg:.12g}",
+                "diaginertia": format_float_list(spec.inertia_diagonal_kg_m2 or ()),
+            },
+        )
     shape = {"type": spec.shape, "size": format_float_list(_mujoco_geom_size(spec))}
     if visual_mesh_path is None:
         visual_shape = shape

@@ -26,10 +26,12 @@ import numpy as np
 from robot_motion.object_transport import SupportSurfaceObservation
 
 from .back_projection import (
+    MAXIMUM_INCLINED_SUPPORT_TILT_DEG,
     LiveAlignedDepthCapture,
     ObservedSupportFootprintCoverage,
     ProjectedSupportSurface,
     check_observed_support_footprint,
+    project_depth_mask_inclined_support_surface,
     project_depth_mask_support_surface,
     search_depth_mask_support_surface,
 )
@@ -40,6 +42,12 @@ MAXIMUM_PLANE_RESIDUAL_M = 0.002
 # height is the certified plane rectangle's highest corner plus the certification
 # residual, not the highest masked point.
 SUPPORT_TOP_MEASUREMENT_ID = "depth_only_certified_top_rectangle_v2"
+# Opt-in measurement of an inclined top (allow_inclined): the near-horizontal
+# path is tried first and decides every level top exactly as before; only a top
+# it refuses is fitted as an inclined plane (<= 30 deg), and its height is the
+# plane height at the region center plus the residual.
+INCLINED_SUPPORT_TOP_MEASUREMENT_ID = "depth_only_certified_inclined_rectangle_v1"
+LEVEL_SUPPORT_TILT_DEG = 1.
 DEFAULT_LATERAL_MARGIN_M = 0.002
 MINIMUM_REGION_SIDE_M = 0.02
 MAXIMUM_GRID_CELLS = 100_000
@@ -57,6 +65,7 @@ class MeasuredSupportTop:
     observed_max_xy_m: tuple[float, float]
     top_z_m: float
     tilt_deg: float
+    inclined: bool = False
 
     def observation(self, *, support_id: str, reference_frame_id: str, scene_revision: int,
                     measured_at: float, evidence_ref: str) -> SupportSurfaceObservation:
@@ -65,7 +74,9 @@ class MeasuredSupportTop:
             scene_revision=scene_revision, measured_at=measured_at, top_z_m=self.top_z_m,
             normal_reference_xyz=self.plane.normal_reference_xyz,
             region_min_xy_m=self.region_min_xy_m, region_max_xy_m=self.region_max_xy_m,
-            evidence_ref=evidence_ref, geometry_complete=True)
+            evidence_ref=evidence_ref, geometry_complete=True,
+            maximum_tilt_deg=(MAXIMUM_INCLINED_SUPPORT_TILT_DEG if self.inclined
+                              else LEVEL_SUPPORT_TILT_DEG))
 
 
 def _mask_points(capture: LiveAlignedDepthCapture, mask: np.ndarray, maximum_depth_m: float):
@@ -181,15 +192,25 @@ def maximal_true_rectangles(grid: np.ndarray, *, limit: int,
 
 
 def fit_support_top_plane(capture: LiveAlignedDepthCapture, mask: np.ndarray, *,
-                          maximum_depth_m: float) -> ProjectedSupportSurface:
-    """Whole-mask top fit first; a bounded local patch search when it is not one plane."""
+                          maximum_depth_m: float, allow_inclined: bool = False) -> ProjectedSupportSurface:
+    """Whole-mask top fit first; a bounded local patch search when it is not one plane.
+
+    With ``allow_inclined``, a mask both near-horizontal fits refuse is fitted
+    as one inclined plane (``project_depth_mask_inclined_support_surface``).
+    """
     try:
         return project_depth_mask_support_surface(capture, mask, mask_clipped=False,
                                                   maximum_depth_m=maximum_depth_m)
     except ValueError:
-        searched = search_depth_mask_support_surface(
-            capture, mask, mask_clipped=False, maximum_depth_m=maximum_depth_m,
-            patch_size_px=24, stride_px=12, maximum_patches=1024)
+        try:
+            searched = search_depth_mask_support_surface(
+                capture, mask, mask_clipped=False, maximum_depth_m=maximum_depth_m,
+                patch_size_px=24, stride_px=12, maximum_patches=1024)
+        except ValueError:
+            if not allow_inclined:
+                raise
+            return project_depth_mask_inclined_support_surface(
+                capture, mask, mask_clipped=False, maximum_depth_m=maximum_depth_m)
         return searched.candidate
 
 
@@ -207,14 +228,18 @@ def measure_support_tops(capture: LiveAlignedDepthCapture, mask: np.ndarray, *,
                          maximum_depth_m: float,
                          lateral_margin_m: float = DEFAULT_LATERAL_MARGIN_M,
                          minimum_region_side_m: float = MINIMUM_REGION_SIDE_M,
-                         limit: int = 1) -> tuple[MeasuredSupportTop, ...]:
+                         limit: int = 1, allow_inclined: bool = False) -> tuple[MeasuredSupportTop, ...]:
     """Certify up to ``limit`` distinct fully observed rectangles, largest first.
 
     All share one measured plane. A rectangle narrower than the minimum release
     region after its margin is dropped; none left raises like a too-small top.
+    With ``allow_inclined`` a top the near-horizontal fit refuses may be an
+    inclined plane (``INCLINED_SUPPORT_TOP_MEASUREMENT_ID``).
     """
     if not isinstance(capture, LiveAlignedDepthCapture):
         raise TypeError("A bound metric-depth capture is required")
+    if type(allow_inclined) is not bool:
+        raise TypeError("allow_inclined must be explicitly boolean")
     selected = np.asarray(mask)
     if selected.dtype != np.bool_ or selected.shape != capture.depth_m.shape:
         raise ValueError("Support mask must be a paired full-resolution boolean grid")
@@ -228,7 +253,8 @@ def measure_support_tops(capture: LiveAlignedDepthCapture, mask: np.ndarray, *,
                         ("minimum_region_side_m", minimum_region_side_m)):
         if isinstance(value, bool) or not math.isfinite(value) or value < 0:
             raise ValueError(f"{name} must be finite and non-negative")
-    plane = fit_support_top_plane(capture, selected, maximum_depth_m=maximum_depth_m)
+    plane = fit_support_top_plane(capture, selected, maximum_depth_m=maximum_depth_m,
+                                  allow_inclined=allow_inclined)
     points = _mask_points(capture, selected, maximum_depth_m)
     if len(points) < 16:
         raise ValueError("Support mask has insufficient valid metric depth")
@@ -249,6 +275,7 @@ def measure_support_tops(capture: LiveAlignedDepthCapture, mask: np.ndarray, *,
     anchor = np.asarray(plane.plane_anchor_reference_xyz_m)
     normal = np.asarray(plane.normal_reference_xyz)
     tilt = math.degrees(math.acos(max(-1., min(1., float(normal[2])))))
+    inclined = tilt > LEVEL_SUPPORT_TILT_DEG
     tops = []
     for row0, col0, row1, col1 in blocks:
         region_min = np.array([xs[col0], ys[row0]]) + lateral_margin_m
@@ -271,13 +298,21 @@ def measure_support_tops(capture: LiveAlignedDepthCapture, mask: np.ndarray, *,
         # mask pixels on an object resting on the support or in front of it (inside
         # the fit's outlier quantile) would lift the release by that object's height.
         top_z = float(np.max(corner_z)) + MAXIMUM_PLANE_RESIDUAL_M
+        if inclined:
+            # On an inclined top the corners differ by centimetres: the planner's
+            # plane passes through the region center at top_z_m with the measured
+            # normal, so the center height plus the residual is that plane.
+            region_center = (region_min + region_max) / 2.
+            top_z = float(anchor[2] - (normal[0] * (region_center[0] - anchor[0])
+                                       + normal[1] * (region_center[1] - anchor[1])) / normal[2]
+                          + MAXIMUM_PLANE_RESIDUAL_M)
         tops.append(MeasuredSupportTop(
             plane=observed, coverage=coverage,
             region_min_xy_m=tuple(float(value) for value in region_min),
             region_max_xy_m=tuple(float(value) for value in region_max),
             observed_min_xy_m=tuple(float(value) for value in low),
             observed_max_xy_m=tuple(float(value) for value in high),
-            top_z_m=top_z, tilt_deg=tilt))
+            top_z_m=top_z, tilt_deg=tilt, inclined=inclined))
     if not tops:
         raise ValueError("Observed support top is smaller than the minimum release region")
     return tuple(tops)

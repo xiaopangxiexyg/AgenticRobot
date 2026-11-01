@@ -42,8 +42,15 @@ from types import SimpleNamespace
 
 import numpy as np
 
-from agent_gateway.profiles.back_projection import LiveAlignedDepthCapture
-from agent_gateway.profiles.measured_support import SUPPORT_TOP_MEASUREMENT_ID, measure_support_tops
+from agent_gateway.profiles.back_projection import (
+    MAXIMUM_INCLINED_SUPPORT_TILT_DEG,
+    LiveAlignedDepthCapture,
+)
+from agent_gateway.profiles.measured_support import (
+    INCLINED_SUPPORT_TOP_MEASUREMENT_ID,
+    SUPPORT_TOP_MEASUREMENT_ID,
+    measure_support_tops,
+)
 from agent_gateway.profiles.segmentation import decode_segmentation_mask_npy
 from agent_gateway.protocol.skill_catalog import SkillRouteManifestEntry
 from agent_gateway.protocol.skill_io_contracts import inline_only_skill_io_contract
@@ -154,6 +161,10 @@ def build_support_release_query_registration(*, segmentation, back_projection, r
         "lean": {"rad": RELEASE_LEAN_RAD, "yaw_offsets_rad": list(RELEASE_LEAN_YAW_OFFSETS_RAD),
                  "toward": "motion_arm_base", "order": "after_the_held_orientation_candidates_of_each_region",
                  "maximum_tilt_from_support_normal_rad": MAXIMUM_RELEASE_LEAN_RAD},
+        "inclined_support": {"measurement": INCLINED_SUPPORT_TOP_MEASUREMENT_ID,
+                             "maximum_tilt_deg": MAXIMUM_INCLINED_SUPPORT_TILT_DEG,
+                             "leveled_pass": "first_on_an_inclined_region",
+                             "yaw_offsets_rad": list(RELEASE_YAW_OFFSETS_RAD)},
         "lateral_margin_m": RELEASE_LATERAL_MARGIN_M,
         "planning_time_budget_sec": PLANNING_TIME_BUDGET_SEC,
         "path_search_budget_sec": PATH_SEARCH_BUDGET_SEC,
@@ -347,7 +358,7 @@ class MujocoSupportReleaseQuery:
             evidence.append("support-mask:" + role + ":" + str(result["mask_media_content_hash"]))
             try:
                 tops = measure_support_tops(paired.depth, mask, maximum_depth_m=self.maximum_depth_m,
-                                            limit=MAXIMUM_SUPPORT_REGIONS)
+                                            limit=MAXIMUM_SUPPORT_REGIONS, allow_inclined=True)
             except ValueError:
                 views.append({"role": role, "outcome": "top_not_measured",
                               "score": segmentation["score"], "certified_area_m2": None})
@@ -413,7 +424,10 @@ class MujocoSupportReleaseQuery:
                                          evidence_ref=region_ref)
             region_recorded = False
             # Held-orientation candidates first; leaned ones only when none of those has a path.
-            for orientation in passes:
+            # On an inclined top the object is first turned to lie flat on it.
+            region_passes = ((({"yaw_offsets_rad": RELEASE_YAW_OFFSETS_RAD, "level_to_support": True},)
+                              if region.inclined else ()) + passes)
+            for orientation in region_passes:
                 if "lean_rad" in orientation and float(self.clock()) >= deadline:
                     out_of_time = True
                     break

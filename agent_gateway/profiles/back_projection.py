@@ -735,6 +735,107 @@ def project_depth_mask_support_surface(
         maximum_plane_residual_m=max_residual, top_point_count=len(top))
 
 
+# Inclined supports (an inclined board) have their own measurement entry: the
+# near-horizontal path above keeps its 1 degree invariant and its "highest 20 %"
+# top band, which on a slope is only a narrow strip at the upper end.
+MAXIMUM_INCLINED_SUPPORT_TILT_DEG = 30.
+
+
+def project_depth_mask_inclined_support_surface(
+    capture: LiveAlignedDepthCapture,
+    mask: np.ndarray,
+    *,
+    mask_clipped: bool,
+    maximum_depth_m: float,
+    maximum_tilt_deg: float = MAXIMUM_INCLINED_SUPPORT_TILT_DEG,
+    minimum_top_points: int = 32,
+    maximum_plane_residual_m: float = .002,
+    top_height_margin_m: float = .002,
+    minimum_inlier_fraction: float = .6,
+) -> ProjectedSupportSurface:
+    """Fit the dominant plane of a support mask that may be inclined (<= 30 degrees).
+
+    All valid mask points are fitted (trimmed least squares: three refits on
+    the 70 % of points nearest the current plane), then the points within the
+    plane residual are the measured top; they must be at least
+    ``minimum_inlier_fraction`` of the mask, so a side face or an object
+    resting on the support cannot carry the fit. Same result type and
+    residual bound as the near-horizontal path; read-only.
+    """
+    if not isinstance(capture, LiveAlignedDepthCapture):
+        raise TypeError("A bound metric-depth capture is required")
+    selected = np.asarray(mask)
+    if selected.dtype != np.bool_ or selected.shape != capture.depth_m.shape:
+        raise ValueError("Support mask must be a paired full-resolution boolean grid")
+    if type(mask_clipped) is not bool or mask_clipped:
+        raise ValueError("Clipped or unverified support masks are not complete regions")
+    if (isinstance(minimum_top_points, bool) or not isinstance(minimum_top_points, int)
+            or minimum_top_points < 16):
+        raise ValueError("Support plane needs at least sixteen measured top points")
+    for name, value in (("maximum_depth_m", maximum_depth_m),
+                        ("maximum_tilt_deg", maximum_tilt_deg),
+                        ("maximum_plane_residual_m", maximum_plane_residual_m),
+                        ("top_height_margin_m", top_height_margin_m),
+                        ("minimum_inlier_fraction", minimum_inlier_fraction)):
+        if isinstance(value, bool) or not math.isfinite(value) or value <= 0:
+            raise ValueError(f"{name} must be finite and positive")
+    if (maximum_tilt_deg > MAXIMUM_INCLINED_SUPPORT_TILT_DEG or maximum_plane_residual_m > .002
+            or top_height_margin_m > .005 or minimum_inlier_fraction > 1.):
+        raise ValueError("Support plane and uncertainty limits exceed the release geometry profile")
+    valid = (selected & np.isfinite(capture.depth_m)
+             & (capture.depth_m > 0.) & (capture.depth_m <= maximum_depth_m))
+    rows, cols = np.nonzero(valid)
+    if len(rows) < minimum_top_points:
+        raise ValueError("Support mask has insufficient valid metric depth")
+    points = _project_pixels(
+        u=cols.astype(np.float64), v=rows.astype(np.float64),
+        depth=capture.depth_m[valid].astype(np.float64),
+        intrinsics=capture.intrinsics,
+        reference_from_camera=capture.reference_from_camera)
+
+    def fit(subset):
+        center = np.mean(subset, axis=0)
+        _, singular, vectors = np.linalg.svd(subset - center, full_matrices=False)
+        if singular[1] <= 1e-5:
+            raise ValueError("Support top is geometrically degenerate")
+        normal = vectors[-1]
+        return center, (normal if normal[2] >= 0 else -normal)
+
+    center, normal = fit(points)
+    for _ in range(3):
+        distance = np.abs((points - center) @ normal)
+        keep = distance <= np.quantile(distance, .7)
+        if int(np.count_nonzero(keep)) < minimum_top_points:
+            break
+        center, normal = fit(points[keep])
+    distance = np.abs((points - center) @ normal)
+    top = points[distance <= maximum_plane_residual_m]
+    if len(top) < minimum_top_points or len(top) < minimum_inlier_fraction * len(points):
+        raise ValueError("Observed support top does not fit a stable plane")
+    center, normal = fit(top)
+    if normal[2] < math.cos(math.radians(maximum_tilt_deg)):
+        raise ValueError("Observed support top is steeper than the inclined support profile")
+    residual = np.abs((top - center) @ normal)
+    max_residual = float(np.quantile(residual, .95))
+    if max_residual > maximum_plane_residual_m:
+        raise ValueError("Observed support top does not fit a stable plane")
+    xy_bounds = np.quantile(top[:, :2], [.05, .95], axis=0)
+    if np.any(xy_bounds[1] <= xy_bounds[0]):
+        raise ValueError("Observed support top has no finite placement region")
+    return ProjectedSupportSurface(
+        source_id=capture.source_id,
+        capture_group_id=capture.capture_group_id,
+        captured_at=capture.captured_at,
+        station_revision=capture.station_revision,
+        depth_content_hash=capture.depth_content_hash,
+        upper_top_z_m=float(np.max(top[:, 2]) + top_height_margin_m),
+        plane_anchor_reference_xyz_m=tuple(float(value) for value in center),
+        normal_reference_xyz=tuple(float(value) for value in normal),
+        observed_bounds_min_xy_m=tuple(float(value) for value in xy_bounds[0]),
+        observed_bounds_max_xy_m=tuple(float(value) for value in xy_bounds[1]),
+        maximum_plane_residual_m=max_residual, top_point_count=len(top))
+
+
 def project_depth_mask_geometry(
     capture: LiveAlignedDepthCapture,
     mask: np.ndarray,

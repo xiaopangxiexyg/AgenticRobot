@@ -65,6 +65,11 @@ def _validate_shape_size(shape: str, size: tuple[float, float, float]) -> None:
 
 @dataclass(frozen=True)
 class FreeBodyObjectSpec:
+    """One scene object. ``fixed`` welds it to the world: it has no free joint
+    and keeps its initial pose, e.g. an inclined board or a shelf. A fixed
+    object is serialized with ``"fixed": true``; a free one omits the key, so
+    every existing contract keeps its exact serialization and hash."""
+
     name: str
     shape: str = "box"
     size_m: tuple[float, float, float] = (0.03, 0.03, 0.03)
@@ -74,6 +79,7 @@ class FreeBodyObjectSpec:
     inertia_diagonal_kg_m2: tuple[float, float, float] | None = None
     rgba: tuple[float, float, float, float] = (0.85, 0.18, 0.12, 1.0)
     contact: ContactMaterialSpec = field(default_factory=ContactMaterialSpec)
+    fixed: bool = False
 
     def __post_init__(self) -> None:
         name = str(self.name).strip()
@@ -100,6 +106,8 @@ class FreeBodyObjectSpec:
         )
         if any(value <= 0.0 for value in inertia):
             raise ValueError("Object inertia values must be positive.")
+        if not isinstance(self.fixed, bool):
+            raise TypeError("Object fixed must be a boolean.")
         object.__setattr__(self, "name", name)
         object.__setattr__(self, "shape", shape)
         object.__setattr__(self, "size_m", size)
@@ -110,7 +118,7 @@ class FreeBodyObjectSpec:
         object.__setattr__(self, "rgba", finite_tuple(self.rgba, 4, "object rgba"))
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        payload = {
             "name": self.name,
             "shape": self.shape,
             "size_m": list(self.size_m),
@@ -121,6 +129,9 @@ class FreeBodyObjectSpec:
             "rgba": list(self.rgba),
             "contact": self.contact.to_dict(),
         }
+        if self.fixed:
+            payload["fixed"] = True
+        return payload
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, Any]) -> "FreeBodyObjectSpec":
@@ -141,6 +152,7 @@ class FreeBodyObjectSpec:
             ),
             rgba=tuple(payload.get("rgba", (0.85, 0.18, 0.12, 1.0))),
             contact=ContactMaterialSpec.from_dict(payload.get("contact")),
+            fixed=bool(payload.get("fixed", False)),
         )
 
 
