@@ -92,6 +92,17 @@ core and MuJoCo adapter used for the 20260721 fit; tests compare those hashes to
 fixed historical values rather than silently reinterpreting the fit against
 the current files.
 
+真机操作者断开／重连双臂双夹爪与操作者开合夹爪使用独立绑定
+`artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261101_real_hardware_connection_v1.json`。它固定于合并提交
+`f99ab7c8a`（基线 `d92d01f3e` 即真机持物闭合测量绑定提交，+ 任务分支 `0f20b76bc`），保留前一绑定的全部非运行时引用；
+198 项已有运行时输入中 3 项改变（真机 Gateway CLI、组合、相机资源；Unix 传输和运行时服务也有改动，但不是绑定的运行时输入），新增 1 项
+（`agent_gateway/profiles/real/hardware_connection.py`），合计 199 项。内容移植自 2026-10-24 现场标签
+`agent-safe-move-hardware-connection-production-final-20261024`（`da450b2a6`、`998359d5c`、`36a39440e`），并新增操作者夹爪 RPC。
+只有显式 `--enable-hardware-connection-control`（要求双夹爪 v2 配置）才启用：断开走原应用关闭事务，相机与感知模型常驻；重连新建双臂、
+双夹爪、控制运行时和执行会话，只建立初始 HOLD，新 `runtime_session_id` 使旧请求、计划和批准失效；急停锁存不能经重连解除。
+`request_operator_gripper` 只在已连接、代次一致、无急停锁存、无控制故障且没有 Skill 操作时执行，走夹爪 Skill 端口与收敛规则后 HOLD 夹爪。
+离线证据按内容哈希记录：1353 项关联测试（当前绑定测试在本绑定前排除）与设计说明。绑定仍为 `provisional`，没有新增真机运动执行或 held-out 资格。
+
 真机持物测量按 DMTAC 实测闭合放置手指，使用独立绑定
 `artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261101_real_held_closure_v1.json`。它固定于合并提交
 `1664dba7f`（基线 `d95a13374` 即真机放置小支撑物窗口绑定提交，+ 任务分支 `c20f490d5`），保留前一绑定的全部非运行时引用；
