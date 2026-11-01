@@ -5,9 +5,10 @@ planner and synthetic measurements (no MuJoCo stepping, no camera). They pin
 what the module docstring promises: the regions are tried largest first; in
 each region the held orientation is tried before the lean; the lean pass runs
 only when no held-orientation proposal of that region has a path and is
-skipped when it does not fit; refusals are typed and counted over regions; and
-running out of time is a budget outcome. Every result must satisfy the Skill's
-own result validator.
+skipped when it does not fit; on an inclined region a leveled pass (the object
+turned to lie flat on the top) comes before both; refusals are typed and
+counted over regions; and running out of time is a budget outcome. Every
+result must satisfy the Skill's own result validator.
 """
 
 from __future__ import annotations
@@ -27,6 +28,7 @@ pytestmark = [pytest.mark.unit]
 FRAME = "mujoco_sim_hil/station"
 PARAMETERS = {"support_object_id": "green_box", "reference_frame_id": FRAME}
 LEAN = module.RELEASE_LEAN_RAD
+LEVEL = "leveled"
 PER_PASS = 3
 
 
@@ -39,13 +41,14 @@ def _pose(x=0., y=0., z=0.):
 class _Region:
     """A certified top rectangle as measure_support_tops returns it."""
 
-    def __init__(self, index):
+    def __init__(self, index, *, inclined=False):
         self.index = index
         self.region_min_xy_m = (-.40 + .02 * index, -.03)
         self.region_max_xy_m = (-.34 + .02 * index, .03)
         self.top_z_m = .042
         self.plane = SimpleNamespace(top_point_count=500, maximum_plane_residual_m=.001)
-        self.tilt_deg = .2
+        self.tilt_deg = 12. if inclined else .2
+        self.inclined = inclined
         self.coverage = SimpleNamespace(sample_count=400)
         self.observed_min_xy_m = self.region_min_xy_m
         self.observed_max_xy_m = self.region_max_xy_m
@@ -63,7 +66,9 @@ class _Clock:
 
 
 class _Planner:
-    """Plans a pass's first proposal when its (region, lean) is in ``paths``."""
+    """Plans a pass's first proposal when its (region, pass) is in ``paths``.
+
+    A pass is the lean in radians, or LEVEL for the leveled pass."""
 
     def __init__(self, paths=(), *, reason="safe_tcp_target_blocked", clock=None, advance_s=0.):
         self.paths = set(paths)
@@ -76,7 +81,7 @@ class _Planner:
         del cancel_requested, deadline
         if not candidates:
             return None
-        key = (candidates[0].region, candidates[0].lean_rad)
+        key = (candidates[0].region, candidates[0].pass_key)
         self.calls.append(key)
         if self.clock is not None:
             self.clock.now += self.advance_s
@@ -87,8 +92,8 @@ class _Planner:
 
 
 def _run(monkeypatch, planner, *, regions=2, fits=lambda region, lean: True, clock=None,
-         deadline=45.):
-    tops = [_Region(index) for index in range(regions)]
+         deadline=45., inclined=False):
+    tops = [_Region(index, inclined=inclined) for index in range(regions)]
     monkeypatch.setattr(module, "measure_support_tops", lambda depth, mask, **_: tops)
     monkeypatch.setattr(module, "decode_segmentation_mask_npy",
                         lambda *_, **__: np.ones((4, 4), dtype=bool))
@@ -96,15 +101,22 @@ def _run(monkeypatch, planner, *, regions=2, fits=lambda region, lean: True, clo
 
     def candidates(held, support, **kwargs):
         lean = float(kwargs.get("lean_rad", 0.))
+        leveled = kwargs.get("level_to_support", False)
         if "lean_rad" in kwargs:
             assert kwargs["lean_toward_xy_m"] == (0., -.2)  # the calibrated arm base
-        if not fits(support.region, lean):
+        if leveled:
+            # The leveled pass keeps the held yaw samples and is never leaned.
+            assert leveled is True and "lean_rad" not in kwargs
+            assert kwargs["yaw_offsets_rad"] == module.RELEASE_YAW_OFFSETS_RAD
+        pass_key = LEVEL if leveled else lean
+        if not fits(support.region, pass_key):
             raise NoReleaseCandidates("nothing fits this region in this pass")
-        proposed.append((support.region, lean))
+        proposed.append((support.region, pass_key))
         return [SimpleNamespace(
             proposal=SimpleNamespace(object_goal=_pose(-.37, .01 * k, .06),
                                      tool_goal=_pose(-.37, .01 * k, .12)),
-            yaw_offset_rad=0., lean_rad=lean, region=support.region) for k in range(PER_PASS)]
+            yaw_offset_rad=0., lean_rad=lean, region=support.region, pass_key=pass_key)
+            for k in range(PER_PASS)]
 
     monkeypatch.setattr(module, "plan_release_approach_candidates", candidates)
     query = object.__new__(module.MujocoSupportReleaseQuery)
@@ -208,3 +220,30 @@ def test_an_exhausted_path_search_is_reported_as_a_budget_outcome(monkeypatch):
     assert result["reason"] == "query_budget_exhausted"
     assert result["candidate_rejections"] == [
         {"reason_code": "safe_tcp_path_search_exhausted", "count": 4 * PER_PASS}]
+
+
+def test_an_inclined_region_is_first_tried_leveled(monkeypatch):
+    planner = _Planner(paths={(0, LEVEL)})
+    result, _evidence, proposed = _run(monkeypatch, planner, regions=1, inclined=True)
+    assert planner.calls == [(0, LEVEL)] and proposed == [(0, LEVEL)]
+    assert result["status"] == "release_pose_found"
+    assert result["release_lean_rad"] == 0.
+    assert result["selected_candidate_index"] == 0
+
+
+def test_an_inclined_region_falls_back_to_the_held_then_the_leaned_pass(monkeypatch):
+    planner = _Planner(paths={(0, LEAN)})
+    result, _evidence, _proposed = _run(monkeypatch, planner, regions=1, inclined=True)
+    assert planner.calls == [(0, LEVEL), (0, 0.), (0, LEAN)]
+    assert result["release_lean_rad"] == pytest.approx(LEAN)
+    assert result["selected_candidate_index"] == 2 * PER_PASS
+    assert result["candidate_rejections"] == [
+        {"reason_code": "safe_tcp_target_blocked", "count": 2 * PER_PASS}]
+
+
+def test_a_leveled_pass_that_does_not_fit_is_skipped(monkeypatch):
+    planner = _Planner(paths={(0, 0.)})
+    result, _evidence, proposed = _run(monkeypatch, planner, regions=1, inclined=True,
+                                       fits=lambda region, key: key != LEVEL)
+    assert proposed == [(0, 0.)] and planner.calls == [(0, 0.)]
+    assert result["status"] == "release_pose_found"
