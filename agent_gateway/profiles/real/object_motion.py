@@ -8,7 +8,8 @@ it is between the fingers with the gripper closed on it. The measured box,
 fixed in the tool frame, converts the object-body goal into the TCP goal and
 is carried by the observed safe-move planner along the whole path. ``place``
 also measures the support plane under the target footprint with the holding
-arm's wrist camera (``measure_support_under``) and lets only that support
+arm's wrist camera (``measure_place_support``: the footprint widened by 4 cm,
+or by 1 cm for a support smaller than that) and lets only that support
 top approach the box. After arrival the object is measured again;
 the operation reports that measured state, or stops with a reason when the
 object is no longer held. It never opens or closes a gripper.
@@ -62,7 +63,20 @@ _LOGGER = logging.getLogger(__name__)
 # disagreement); support voxels up to 15 mm above the plane measured under the
 # target footprint are the support itself.
 REAL_OBJECT_MOTION_SUPPORT_HEIGHT_TOLERANCE_M = 0.015
+# The held object hides the footprint itself, so the support is measured in the
+# footprint widened by this margin on every side.
 REAL_OBJECT_MOTION_SUPPORT_MARGIN_M = 0.04
+# A support smaller than that window leaves the lower surface around it inside
+# it, and the window is not one plane. A place then measures the footprint
+# widened by only this margin: a support at least this much larger than the
+# footprint on every side covers it.
+REAL_OBJECT_MOTION_SMALL_SUPPORT_MARGIN_M = 0.01
+# A support window must not reach past the support's edge: holding-wrist points
+# this far below the fitted plane are the lower surface beyond it. A few such
+# points (depth noise, flying pixels) are tolerated.
+REAL_OBJECT_MOTION_SUPPORT_DROPOFF_M = 0.015
+REAL_OBJECT_MOTION_SUPPORT_DROPOFF_MIN_POINTS = 20
+REAL_OBJECT_MOTION_SUPPORT_DROPOFF_FRACTION = 0.01
 REAL_OBJECT_MOTION_SUPPORT_MIN_POINTS = 150
 REAL_OBJECT_MOTION_SUPPORT_MAX_RESIDUAL_M = 0.008
 # A placed box bottom within this gap of the measured plane is on the support.
@@ -178,6 +192,63 @@ def measure_support_under(*, captures, side: str, footprint_min_xy, footprint_ma
         others[capture.role] = row
     stats["other_views"] = others
     return fitted, stats
+
+
+def _support_dropoff(*, captures, side: str, low, high, below_z_m: float, exclude_box, anchor, normal) -> dict:
+    """Holding-wrist points in a support window that lie well below its fitted plane.
+
+    The plane fit trims outliers, so a window that crosses the support's edge can
+    still fit the top; the lower surface beyond the edge shows up here instead.
+    """
+    role = REAL_HELD_OBJECT_PRIMARY_ROLE_BY_SIDE[side]
+    selected = [_support_window_points(capture, low, high, below_z_m) for capture in captures
+                if capture.role == role]
+    points = _outside_box(np.concatenate(selected) if selected else np.zeros((0, 3)), exclude_box)
+    below = 0
+    if len(points):
+        below = int(np.count_nonzero((np.asarray(anchor) - points) @ np.asarray(normal)
+                                     > REAL_OBJECT_MOTION_SUPPORT_DROPOFF_M))
+    allowed = max(REAL_OBJECT_MOTION_SUPPORT_DROPOFF_MIN_POINTS,
+                  int(REAL_OBJECT_MOTION_SUPPORT_DROPOFF_FRACTION * len(points)))
+    return {"window_point_count": len(points), "points_below_plane": below,
+            "allowed_points_below_plane": allowed, "covers_window": below <= allowed}
+
+
+def measure_place_support(*, captures, side: str, footprint_min_xy, footprint_max_xy, below_z_m: float,
+                          exclude_box=None):
+    """Support plane for a place: the footprint+4 cm window, else the footprint+1 cm window.
+
+    A window is the support when its holding-wrist points fit one plane (as
+    ``measure_support_under``) and none of them lies more than
+    ``REAL_OBJECT_MOTION_SUPPORT_DROPOFF_M`` below that plane, i.e. the window
+    does not reach past the support's edge. The wide window passes on a table, a
+    mat or any support larger than it. A smaller support fails it (the surface
+    below shows); then the footprint widened by
+    ``REAL_OBJECT_MOTION_SMALL_SUPPORT_MARGIN_M`` is tried the same way, so a
+    support at least that much larger than the footprint on every visible side
+    is measured, and a footprint whose window shows the surface beyond the edge
+    is refused. Parts hidden from this camera (behind the held object, or a
+    strip right past an edge behind the support itself) cannot be checked here;
+    the release query certifies the whole footprint before the place.
+    ``stats["support_window"]`` names the window used (``footprint_plus_4cm`` /
+    ``footprint_plus_1cm``, None when neither passes).
+    """
+    common = {"captures": captures, "side": side, "below_z_m": below_z_m, "exclude_box": exclude_box}
+    windows = {}
+    for name, margin in (("footprint_plus_4cm", REAL_OBJECT_MOTION_SUPPORT_MARGIN_M),
+                         ("footprint_plus_1cm", REAL_OBJECT_MOTION_SMALL_SUPPORT_MARGIN_M)):
+        fitted, stats = measure_support_under(footprint_min_xy=footprint_min_xy, footprint_max_xy=footprint_max_xy,
+                                              margin_m=margin, **common)
+        if fitted is not None:
+            anchor, normal, low, high = fitted
+            stats = {**stats, "dropoff": _support_dropoff(low=low, high=high, anchor=anchor, normal=normal,
+                                                          **common)}
+            if stats["dropoff"]["covers_window"]:
+                return fitted, {**stats, "support_window": name,
+                                **({"wide_window": windows["footprint_plus_4cm"]} if windows else {})}
+        windows[name] = stats
+    wide = windows["footprint_plus_4cm"]
+    return None, {**wide, "support_window": None, "small_window": windows["footprint_plus_1cm"]}
 
 
 class RealHeldObjectPort:
@@ -397,7 +468,7 @@ class RealObjectMotionLifecycle(RealAgentPrimitiveSkillLifecycle):
             current_box_world = observation.world_from_tcp @ tool_from_object
             current_corners = _box_world_corners(current_box_world, size)
             # The support lies under the object now; the goal may ask to go below it.
-            fitted, stats = measure_support_under(
+            fitted, stats = measure_place_support(
                 captures=self._held.last_captures, side=self.side, footprint_min_xy=corners[:, :2].min(axis=0),
                 footprint_max_xy=corners[:, :2].max(axis=0),
                 below_z_m=float(current_corners[:, 2].min()) + 0.01, exclude_box=(current_box_world, size))
@@ -405,9 +476,10 @@ class RealObjectMotionLifecycle(RealAgentPrimitiveSkillLifecycle):
             if fitted is None:
                 raise _ObjectMotionUnavailable(
                     "object_motion_support_not_measured",
-                    "This arm's wrist camera measured no planar support around the place footprint; move the "
-                    "object so that camera sees the support around the place target (for example carry it "
-                    "above the target first), then place.",
+                    "This arm's wrist camera measured no planar support around the place footprint (the support "
+                    "top must reach about 1 cm beyond the held box's footprint on every side and be seen there); "
+                    "move the object so that camera sees the support around the place target (for example carry "
+                    "it above the target first), then place.",
                     {"support_measurement": stats})
             anchor, normal, low, high = fitted
             self._support = RM65CarriedObjectSupport(
@@ -565,4 +637,4 @@ class RealObjectMotionLifecycle(RealAgentPrimitiveSkillLifecycle):
 
 __all__ = ["REAL_AGENT_OBJECT_MOTION_EXECUTOR_ID_V1", "REAL_AGENT_OBJECT_MOTION_ROUTE_ID_V1",
            "RealAgentObjectMotionProfile", "RealHeldObjectPort", "RealObjectMotionLifecycle",
-           "fit_support_plane_under", "measure_support_under"]
+           "fit_support_plane_under", "measure_place_support", "measure_support_under"]
