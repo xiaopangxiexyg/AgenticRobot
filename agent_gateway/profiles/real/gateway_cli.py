@@ -492,7 +492,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--peer-idle-timeout-sec", type=float, default=10.0)
     parser.add_argument("--grant-lifetime-sec", type=float, default=5.0)
     parser.add_argument("--enable-hardware-connection-control", action="store_true",
-        help="operator-only bilateral arm/gripper release and fresh reconnect; retain cameras/models")
+        help=("operator-only bilateral arm/gripper release and fresh reconnect (cameras/models retained), "
+              "and operator open/close of either gripper while no Skill runs"))
     return parser
 
 

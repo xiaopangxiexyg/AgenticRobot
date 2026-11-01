@@ -350,3 +350,144 @@ def test_persistent_transport_controls_real_application_generations(monkeypatch,
         thread.join(timeout=5)
     assert not thread.is_alive() and not errors
     assert cameras.closes == model.closes == 1
+
+
+def _gripper(owner, component="right_gripper", target="closed", generation=0, client="operator"):
+    return owner.operator_gripper(client, {"component_id": component, "target_state": target,
+                                           "expected_generation": generation})
+
+
+def test_operator_gripper_commands_either_hand_through_its_skill_port_and_holds(monkeypatch):
+    owner, _, _, _ = harness(monkeypatch)
+    owner.current.application.start()
+    try:
+        right = owner.current.hands["right_gripper"].backend
+        right.samples = [(0.4, True), (0.97, False), (0.97, False), (0.97, False)]
+        before = owner.current.hands["right_gripper"].last_command_attempt_ref
+        closed = _gripper(owner)
+        assert closed["status"] == "target_reached" and closed["hold_confirmed"] is True
+        assert closed["measured_close"] == pytest.approx(0.97) and closed["moving"] is False
+        assert closed["component_id"] == "right_gripper" and closed["generation"] == 0
+        assert right.commands == [1.0] and right.holds[-1] == "operator_gripper_settled"
+        # A new command attempt: a held object's retained grip is no longer trusted.
+        assert owner.current.hands["right_gripper"].last_command_attempt_ref not in (None, before)
+        left = owner.current.hands["left_gripper"].backend
+        left.samples = [(0.3, True), (0.01, False), (0.01, False), (0.01, False)]
+        opened = _gripper(owner, component="left_gripper", target="open")
+        assert opened["status"] == "target_reached" and left.commands == [0.0]
+        # Stopped on an object: a close that settles before full closure.
+        right.samples = [(0.5, True)] + [(0.6, False)] * 40
+        contact = _gripper(owner)
+        assert contact["status"] == "settled_before_full_close"
+        assert owner.snapshot("operator")["operator_gripper_busy"] is None
+    finally:
+        owner.close()
+
+
+def test_operator_gripper_refusals_send_no_command(monkeypatch):
+    owner, generations, _, _ = harness(monkeypatch)
+    owner.current.application.start()
+    hands = owner.current.hands
+    try:
+        with pytest.raises(PermissionError):
+            _gripper(owner, client="agent")
+        with pytest.raises(ValueError, match="Invalid operator gripper"):
+            _gripper(owner, component="right_arm")
+        with pytest.raises(ValueError, match="Invalid operator gripper"):
+            _gripper(owner, target="half")
+        with pytest.raises(RuntimeError, match="binding changed"):
+            _gripper(owner, generation=1)
+        store = owner.current.deployment.gateway_session.service.operation_store
+        monkeypatch.setattr(store, "active_operation", lambda: object())
+        with pytest.raises(RuntimeError, match="Skill operation is active"):
+            _gripper(owner)
+        monkeypatch.undo()
+        owner._gripper_command = "left_gripper"
+        with pytest.raises(RuntimeError, match="still running"):
+            _gripper(owner)
+        with pytest.raises(RuntimeError, match="operator gripper command is running"):
+            owner.facade("operator", "submit_skill_request")
+        owner._gripper_command = None
+        owner.request("operator", {"action": "disconnect", "expected_generation": 0})
+        assert settle(owner)["state"] == "disconnected"
+        with pytest.raises(RuntimeError, match="disconnected"):
+            _gripper(owner)
+        assert all(not port.backend.commands for port in hands.values())
+        assert len(generations) == 1
+    finally:
+        owner.close()
+
+
+def test_operator_gripper_is_refused_after_an_emergency_stop(monkeypatch):
+    owner, _, _, _ = harness(monkeypatch)
+    owner.current.application.start()
+    try:
+        owner.facade("operator", "request_emergency_stop_own_domain")
+        with pytest.raises(RuntimeError, match="Emergency stop is latched"):
+            _gripper(owner)
+        assert not owner.current.hands["right_gripper"].backend.commands
+    finally:
+        owner.close()
+
+
+def test_operator_gripper_reports_a_timeout_and_still_holds(monkeypatch):
+    from agent_gateway.profiles.real import hardware_connection
+
+    clock = iter(float(index) for index in range(1000))
+    port = SimpleNamespace(component_id="right_gripper", calls=[])
+
+    def command_close(target):
+        port.calls.append(("command", target))
+        return SimpleNamespace(accepted=True, evidence_refs=("command:1",))
+
+    def poll_state():
+        return SimpleNamespace(measured_close=0.5, moving=True, fault_code=None, evidence_ref="sample")
+
+    def hold(*, reason):
+        port.calls.append(("hold", reason))
+        return SimpleNamespace(succeeded=True, evidence_refs=("hold:1",))
+
+    port.command_close, port.poll_state, port.hold = command_close, poll_state, hold
+    result = hardware_connection.run_operator_gripper_command(
+        port, "open", timeout_sec=3.0, clock=lambda: next(clock), sleep=lambda _: None)
+    assert result["status"] == "timeout" and result["hold_confirmed"] is True
+    assert port.calls == [("command", 0.0), ("hold", "operator_gripper_timeout")]
+
+
+def test_operator_gripper_over_the_persistent_transport(monkeypatch, short_unix_socket_path_factory):
+    owner, _, _, _ = harness(monkeypatch)
+    path = short_unix_socket_path_factory("operator-gripper")
+    owner._server_factory = lambda current: AgentGatewayUnixJsonServer(socket_path=path,
+        peer_client_map=AgentGatewayUnixPeerClientMap({os.getuid(): "operator"}),
+        facade_factory=current.facade, hardware_connection_control=current,
+        close_gateway=lambda: current.current.deployment.gateway_session.close())
+    ready, errors = threading.Event(), []
+
+    def serve():
+        try:
+            owner.serve_forever(ready_callback=ready.set)
+        except BaseException as error:
+            errors.append(error)
+    thread = threading.Thread(target=serve)
+    thread.start()
+    channel = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        assert ready.wait(3)
+        channel.settimeout(5)
+        channel.connect(str(path))
+        def call(method, payload=None):
+            return _raw_call(channel, request_id="gripper:test", method=method, payload=payload)
+        assert call("healthz")["result"]["operator_gripper_control"] == "agent_gateway.operator_gripper.v1"
+        owner.current.hands["left_gripper"].backend.samples = [(0.02, False)] * 3
+        reply = call("request_operator_gripper",
+                     {"component_id": "left_gripper", "target_state": "open", "expected_generation": 0})
+        assert reply["ok"] and reply["result"]["status"] == "target_reached"
+        refused = call("request_operator_gripper",
+                       {"component_id": "left_gripper", "target_state": "open", "expected_generation": 7})
+        assert refused["ok"] is False
+        assert call("read_hardware_connection_state")["result"]["state"] == "connected"
+    finally:
+        channel.close()
+        owner.request_shutdown()
+        thread.join(timeout=5)
+    assert not thread.is_alive() and not errors

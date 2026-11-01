@@ -418,7 +418,8 @@ def test_retained_control_fault_fences_submissions_but_preserves_diagnostics(
             "emergency_stop_confirmed", "lower_stop_receipt_ref"}
         # All other methods keep their original dispatch, including controls,
         # operation reconciliation and retained Artifact access.
-        operator_lifecycle = {"read_hardware_connection_state", "request_hardware_connection"}
+        operator_lifecycle = {"read_hardware_connection_state", "request_hardware_connection",
+                              "request_operator_gripper"}
         permitted = unix_transport.AGENT_GATEWAY_UNIX_JSON_METHODS_V2 - {
             "healthz", "submit_skill_request", "submit_read_only_skill_request"} - operator_lifecycle
         for method in sorted(permitted):

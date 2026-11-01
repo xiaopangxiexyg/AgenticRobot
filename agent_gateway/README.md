@@ -1274,6 +1274,17 @@ Skill，也不允许只读身份调用。默认启动和原有真机授权参数
 
 离线生命周期、真实 Unix 传输及假 SDK 验证不构成设备释放／重连或物理运动验收。
 
+#### 操作者开合夹爪
+
+同一个 `--enable-hardware-connection-control` 还提供操作者 RPC `request_operator_gripper`，载荷
+`{component_id, target_state, expected_generation}`（`left_gripper`／`right_gripper`，`open`／`closed`），
+`healthz.operator_gripper_control` 声明 `agent_gateway.operator_gripper.v1`。它不是 Skill，不受 Agent 的
+`--authorized-gripper-sides` 限制，也不需要 GUI 批准；只有已连接、代次一致、没有急停锁存、控制循环无故障并且
+没有正在执行的 Skill 操作时才执行，执行期间拒绝新的 Skill 提交。命令走该夹爪 Skill 端口的同一路径（要求手臂处于
+确认的 HOLD，记录新的命令尝试，所以手里物体保留的抓握不再被信任），按 Skill 的收敛规则等待到位或在物体上停住，
+最多 5 秒，然后 HOLD 夹爪；结果给出 `status`（`target_reached`／`settled_before_full_close`／`timeout`／`fault`／
+`command_rejected`）、实测闭合度和 HOLD 是否确认。
+
 #### 显式夹爪 v2 合同基础
 
 `manipulation.set_gripper_state@1` 及现有右夹爪接入保持默认行为。

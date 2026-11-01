@@ -53,6 +53,7 @@ AGENT_GATEWAY_UNIX_JSON_METHODS_V2 = frozenset(
         "request_emergency_stop_own_domain",
         "read_hardware_connection_state",
         "request_hardware_connection",
+        "request_operator_gripper",
         "begin_artifact_upload",
         "write_artifact_chunk",
         "commit_artifact_upload",
@@ -558,7 +559,7 @@ class _AgentGatewayUnixRequestHandler(socketserver.BaseRequestHandler):
                     break
 
                 if server._hardware_connection_control is not None and request.method not in {
-                    "read_hardware_connection_state", "request_hardware_connection",
+                    "read_hardware_connection_state", "request_hardware_connection", "request_operator_gripper",
                 }:
                     try:
                         facade = server._hardware_connection_control.facade(client_id, request.method, facade)
@@ -877,12 +878,20 @@ class AgentGatewayUnixJsonServer(
             }:
                 return _error_response(request.request_id,
                     code="control_fault_latched", message=fault_reason), False
-            if request.method in {"read_hardware_connection_state", "request_hardware_connection"}:
+            if request.method in {"read_hardware_connection_state", "request_hardware_connection",
+                                  "request_operator_gripper"}:
                 control = self._hardware_connection_control
                 if control is None:
                     raise ValueError("Hardware connection control is not enabled")
-                result = (control.snapshot(client_id) if request.method == "read_hardware_connection_state"
-                          else control.request(client_id, request.payload or {}))
+                if request.method == "read_hardware_connection_state":
+                    result = control.snapshot(client_id)
+                elif request.method == "request_hardware_connection":
+                    result = control.request(client_id, request.payload or {})
+                else:
+                    gripper = getattr(control, "operator_gripper", None)
+                    if not callable(gripper):
+                        raise ValueError("Operator gripper control is not enabled")
+                    result = gripper(client_id, request.payload or {})
             elif request.method == "healthz":
                 # A retained fence reports its stable reason code; otherwise
                 # read the application's fault/lifecycle owner afresh.
@@ -903,6 +912,8 @@ class AgentGatewayUnixJsonServer(
                 }
                 if self._hardware_connection_control is not None:
                     result["hardware_connection_control"] = "agent_gateway.hardware_connection.v1"
+                    if callable(getattr(self._hardware_connection_control, "operator_gripper", None)):
+                        result["operator_gripper_control"] = "agent_gateway.operator_gripper.v1"
             elif request.method == "get_skill_definition_catalog":
                 result = facade.get_skill_definition_catalog()
             elif request.method == "get_agent_skill_schema_catalog":
