@@ -19,6 +19,7 @@ import numpy as np
 import pytest
 
 from agent_gateway.profiles.back_projection import LiveAlignedDepthCapture
+from agent_gateway.profiles.real import object_motion
 from agent_gateway.profiles.real import support_release_query as module
 from agent_gateway.profiles.real.held_object import RealHeldObjectObserver
 from agent_gateway.profiles.real.object_motion import RealHeldObjectPort
@@ -455,9 +456,36 @@ def test_query_from_the_preplace_pose_takes_the_release_height_from_the_place_ch
     assert support.plane_anchor_xyz_m[2] == pytest.approx(TRAY_TOP, abs=1e-3)
 
 
-def test_query_from_above_predicts_the_place_refusal_on_a_narrow_support(monkeypatch):
-    # A 9 cm tray: the place check's window (footprint + 4 cm each side) reaches the table.
+def test_query_from_above_measures_a_small_support_in_the_place_small_window(monkeypatch):
+    # A 9 cm tray seen by a wrist camera beside its +x edge: the place's footprint + 4 cm window
+    # shows the table past that edge, the footprint + 1 cm window stays on the tray, so the place
+    # check is predicted with the small window. (Lowered for enough depth samples in that window
+    # at this test's resolution.)
+    narrow = ((0.055, -0.245), (0.145, -0.155), TRAY_TOP)
+    poses = {**CAMERA_POSES, "wrist_right": _pose(DOWN, (0.18, -0.20, 0.20))}
+    parts = _query(monkeypatch, world_from_tcp=ABOVE_TRAY_TCP, scene=_scene(poses, tray=narrow))
+    result, _ = _run(parts)
+    assert result["status"] == "release_pose_found", result
+    _validate(result)
+    release = _geometry(result["release_object_pose_xyz_quat_xyzw"])
+    assert release[2, 3] - CUBE / 2. == pytest.approx(TRAY_TOP + 0.01, abs=1e-3)
+    support = parts.planner.calls[-1]["carried_object_support"]
+    window = np.asarray(support.region_max_xy_m) - np.asarray(support.region_min_xy_m)
+    np.testing.assert_allclose(window, CUBE + 2 * object_motion.REAL_OBJECT_MOTION_SMALL_SUPPORT_MARGIN_M,
+                               atol=1e-6)
+    assert support.plane_anchor_xyz_m[2] == pytest.approx(TRAY_TOP, abs=1e-3)
+    # Footprints stay twice the lateral margin inside the certified top.
+    for axis, (low, high) in enumerate(zip(narrow[0], narrow[1])):
+        assert low + 2 * module.REAL_RELEASE_LATERAL_MARGIN_M <= release[axis, 3] - CUBE / 2. + 1e-6
+        assert release[axis, 3] + CUBE / 2. <= high - 2 * module.REAL_RELEASE_LATERAL_MARGIN_M + 1e-6
+
+
+def test_query_from_above_predicts_the_place_refusal_when_no_window_is_one_plane(monkeypatch):
+    # The wrist sees the footprint, but neither place window is one plane: the place would refuse.
+    # (A 9 cm tray keeps every proposal within the prediction radius of the held box.)
     monkeypatch.setattr(module, "REAL_RELEASE_MAX_CHECKED_CANDIDATES", 1000)
+    monkeypatch.setattr(module, "measure_place_support", lambda **kwargs: (
+        None, {"support_point_count": 500, "support_window": None}))
     narrow = ((0.055, -0.245), (0.145, -0.155), TRAY_TOP)
     parts = _query(monkeypatch, world_from_tcp=ABOVE_TRAY_TCP, scene=_scene(tray=narrow))
     result, _ = _run(parts)

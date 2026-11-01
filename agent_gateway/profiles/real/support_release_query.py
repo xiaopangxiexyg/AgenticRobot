@@ -20,7 +20,7 @@ One read-only request while the arm stands still:
    every rectangle first, then the turned yaws, then the lean pass;
 4. predict the place motion's own support check when the held box is already
    at (within 3 cm of) the pre-place pose: fit the holding arm's wrist plane as
-   the place does (``measure_support_under``) and set the release height from
+   the place does (``measure_place_support``) and set the release height from
    it; from farther away the certified plane sets it and the place measures
    again from the pre-place pose;
 5. check each candidate with a dedicated instance of the deployment's observed
@@ -77,11 +77,12 @@ from teleop_runtime.skill_deploy.rm65_grasp_trajectory import (
 from .held_object import REAL_HELD_OBJECT_PRIMARY_ROLE_BY_SIDE
 from .motion_observed_scene import obstacle_cloud_from_captures
 from .object_motion import (
+    REAL_OBJECT_MOTION_SMALL_SUPPORT_MARGIN_M,
     REAL_OBJECT_MOTION_SUPPORT_HEIGHT_TOLERANCE_M,
     REAL_OBJECT_MOTION_SUPPORT_MARGIN_M,
     REAL_OBJECT_MOTION_SUPPORT_MIN_POINTS,
     RealHeldObjectPort,
-    measure_support_under,
+    measure_place_support,
 )
 
 REAL_SUPPORT_RELEASE_MAX_OPERATION_MS = 120_000
@@ -94,7 +95,10 @@ REAL_RELEASE_YAW_OFFSETS_RAD = (0., -math.pi / 2., math.pi / 2., math.pi)
 # The lean pass of the MuJoCo query (calibrated there; the real reach differs).
 REAL_RELEASE_LEAN_RAD = math.radians(6.)
 REAL_RELEASE_LEAN_YAW_OFFSETS_RAD = (0.,)
-REAL_RELEASE_LATERAL_MARGIN_M = 0.005
+# Applied when a top rectangle is certified and again when positions are proposed
+# on it: a footprint stays twice this far inside the observed top, so the place's
+# small-support window (footprint + 1 cm) still lies on the certified top.
+REAL_RELEASE_LATERAL_MARGIN_M = 0.0075
 # Bound of the shared candidate generator; the Agent's clearance is the v2 band.
 REAL_RELEASE_MAXIMUM_CLEARANCE_M = 0.05
 REAL_SUPPORT_SEGMENTATION_MIN_SCORE = 0.3
@@ -383,6 +387,7 @@ def build_real_support_release_registration(*, segmentation, back_projection, pr
                  "toward": "holding_arm_base", "maximum_tilt_from_support_normal_rad": MAXIMUM_RELEASE_LEAN_RAD},
         "check_order": ["held_yaw_on_every_region", "turned_yaws_on_every_region", "lean_on_every_region"],
         "lateral_margin_m": REAL_RELEASE_LATERAL_MARGIN_M,
+        "place_support_windows_m": [REAL_OBJECT_MOTION_SUPPORT_MARGIN_M, REAL_OBJECT_MOTION_SMALL_SUPPORT_MARGIN_M],
         "preplace_height_m": REAL_RELEASE_PREPLACE_HEIGHT_M,
         "release_height": "place_check_plane_of_the_holding_wrist_at_the_preplace_pose_else_certified_plane",
         "place_check_prediction_radius_m": REAL_PLACE_CHECK_PREDICTION_RADIUS_M,
@@ -815,7 +820,7 @@ class RealSupportReleaseQuery:
         offset = np.asarray(context.current_box_world)[:3, 3] - preplace_box[:3, 3]
         fitted, stats = None, {}
         if float(np.linalg.norm(offset)) <= REAL_PLACE_CHECK_PREDICTION_RADIUS_M:
-            fitted, stats = measure_support_under(
+            fitted, stats = measure_place_support(
                 captures=context.captures, side=self.side, footprint_min_xy=footprint_low,
                 footprint_max_xy=footprint_high,
                 below_z_m=float(corners[:, 2].min()) + REAL_RELEASE_PREPLACE_HEIGHT_M + 0.01,
@@ -828,8 +833,8 @@ class RealSupportReleaseQuery:
             source = "holding_wrist_place_check"
         elif int(stats.get("support_point_count", 0)) >= REAL_OBJECT_MOTION_SUPPORT_MIN_POINTS:
             # From the pre-place pose the wrist sees the footprint but not one plane
-            # around it: the place would refuse (for example a support narrower than
-            # the footprint plus the place's 4 cm margin on each side).
+            # around it, even within 1 cm: the place would refuse (an edge or a step
+            # next to the footprint, or a surface that is not one plane).
             return _Checked("place:support_not_measured")
         else:
             # Not seen from the pre-place pose yet; the place measures again there.
