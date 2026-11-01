@@ -10,6 +10,7 @@ import ctypes
 import errno
 import json
 import os
+import runpy
 import socket
 import sys
 import tempfile
@@ -287,6 +288,7 @@ WEIGHT_PROFILES = {
     "fast": FAST_WEIGHTS,
     "fast-integration": FAST_INTEGRATION_WEIGHTS,
     "full": FULL_WEIGHTS,
+    "core": {},
 }
 
 
@@ -436,6 +438,11 @@ def plan_shards(
     repository = repository.resolve()
     tests_root = tests_root.resolve()
     files = sorted(path for path in tests_root.rglob("test_*.py") if path.is_file())
+    core = None
+    if profile == "core":
+        core = runpy.run_path(str(Path(__file__).with_name("pytest_core.py")))
+        files = [repository / name for name in sorted(core["CORE_MODULES"])]
+        WEIGHT_PROFILES["core"] = core["CORE_WEIGHTS"]
     selected = None
     if test_modules is not None:
         requested = list(test_modules)
@@ -471,8 +478,14 @@ def plan_shards(
     shards: list[list[tuple[str, Path, float]]] = [[] for _ in range(shard_count)]
     totals = [0.0] * shard_count
     for item in sorted(weighted, key=lambda value: (-value[2], value[0])):
+        lanes = range(shard_count)
+        if core is not None and shard_count > 1:
+            # Even batches contain native owners; odd batches contain contracts.
+            # With the core runner's two jobs, native batches never overlap.
+            lane = 0 if item[0] in core["CORE_NATIVE_MODULES"] else 1
+            lanes = range(lane, shard_count, 2)
         index = min(
-            range(shard_count),
+            lanes,
             key=lambda candidate: (
                 totals[candidate],
                 len(shards[candidate]),
@@ -557,6 +570,19 @@ def write_plan(
         ),
         "shards": manifest_shards,
     }
+    if profile == "core":
+        core = runpy.run_path(str(Path(__file__).with_name("pytest_core.py")))
+        manifest["omitted_modules"] = sorted(
+            path.relative_to(repository).as_posix()
+            for path in tests_root.rglob("test_*.py")
+            if path.is_file() and path.relative_to(repository).as_posix()
+            not in core["CORE_MODULES"]
+        )
+        manifest["omitted_test_families"] = sorted(
+            f"{path}::{name}" for path, names in core["EXTENDED_FAMILIES"].items()
+            for name in names
+        )
+        manifest["layout"] = "native-serial-module-batches.v1"
     (output_dir / manifest_name).write_text(
         json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
@@ -573,7 +599,8 @@ def _test_suites(root: ET.Element, source: Path) -> Iterable[ET.Element]:
     raise ValueError(f"JUnit shard root is not <testsuite> or <testsuites>: {source}")
 
 
-def merge_junit(destination: Path, sources: list[Path]) -> None:
+def merge_junit(destination: Path, sources: list[Path], *, suite_name: str | None = None,
+                head: str | None = None) -> None:
     if not sources:
         raise ValueError(f"no JUnit reports were supplied for {destination}")
     roots: list[ET.Element] = []
@@ -605,6 +632,12 @@ def merge_junit(destination: Path, sources: list[Path]) -> None:
                     )
                 seen_cases.add(identity)
             merged.append(copy.deepcopy(child))
+
+    if suite_name is not None:
+        merged.set("name", suite_name)
+        properties = ET.SubElement(merged, "properties")
+        ET.SubElement(properties, "property", name="acceptance.kind", value="core")
+        ET.SubElement(properties, "property", name="acceptance.head", value=head or "")
 
     ET.indent(merged, space="  ")
     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -779,6 +812,8 @@ def _parser() -> argparse.ArgumentParser:
     plan.add_argument("--manifest-name", default="shard-plan.json")
     merge = commands.add_parser("merge-junit", help="merge and validate shard JUnit")
     merge.add_argument("--output", type=Path, required=True)
+    merge.add_argument("--name")
+    merge.add_argument("--head")
     merge.add_argument("sources", type=Path, nargs="+")
     publish = commands.add_parser("publish-junit", help="publish a finalized, non-overwriting JUnit report")
     publish.add_argument("--input", type=Path, required=True)
@@ -809,7 +844,8 @@ def main(argv: list[str] | None = None) -> int:
                 arguments.manifest_name,
             )
         elif arguments.command == "merge-junit":
-            merge_junit(arguments.output, arguments.sources)
+            merge_junit(arguments.output, arguments.sources,
+                        suite_name=arguments.name, head=arguments.head)
         elif arguments.command == "publish-junit":
             return int(publish_junit(arguments.input, arguments.output, arguments.sources,
                                      arguments.shard_status, arguments.wrapper_error))

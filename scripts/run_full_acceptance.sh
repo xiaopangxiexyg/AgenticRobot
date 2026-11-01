@@ -22,9 +22,12 @@ die() {
 }
 
 CHANGE_BASE=""
+ACCEPTANCE_PROFILE="full"
+CORE_HEAD=""
 PYTEST_ARGUMENTS=()
 while (($#)); do
   case "$1" in
+    --core) ACCEPTANCE_PROFILE="core" ;;
     --changed-since|--changed-since=*)
       [[ -z "$CHANGE_BASE" ]] || die "--changed-since may be supplied only once"
       if [[ "$1" == --changed-since ]]; then
@@ -41,6 +44,11 @@ while (($#)); do
   shift
 done
 set -- "${PYTEST_ARGUMENTS[@]}"
+if [[ "$ACCEPTANCE_PROFILE" == core ]]; then
+  [[ -z "$CHANGE_BASE" ]] || die "core and change-aware full acceptance are separate scopes"
+  [[ -z "$(git -C "$REPO_ROOT" status --porcelain --untracked-files=all --ignore-submodules=none)" ]] || die "core acceptance requires a clean committed source"
+  CORE_HEAD="$(git -C "$REPO_ROOT" rev-parse HEAD)"
+fi
 
 [[ -z "${PYTEST_ADDOPTS:-}" ]] || die "acceptance does not allow ambient PYTEST_ADDOPTS"
 [[ -z "${PYTEST_PLUGINS:-}" ]] || die "acceptance does not allow ambient PYTEST_PLUGINS"
@@ -108,10 +116,14 @@ prepare_run_root() {
   fi
 
   local report_name="full-acceptance.xml"
+  [[ "$ACCEPTANCE_PROFILE" != core ]] || report_name="merge-core-acceptance.xml"
   [[ -z "$CHANGE_BASE" ]] || report_name="changed-acceptance.xml"
   JUNIT_DESTINATION="${DEXTELEOP_FULL_ACCEPTANCE_JUNIT:-$RUN_ROOT/$report_name}"
   if [[ -n "$CHANGE_BASE" && "${JUNIT_DESTINATION##*/}" == full-acceptance.xml ]]; then
     die "change-aware evidence must not be named full-acceptance.xml"
+  fi
+  if [[ "$ACCEPTANCE_PROFILE" == core && "${JUNIT_DESTINATION##*/}" == full-acceptance.xml ]]; then
+    die "core evidence must not be named full-acceptance.xml"
   fi
   case "$JUNIT_DESTINATION" in
     /*) ;;
@@ -151,7 +163,9 @@ prepare_asset_compat_link() {
 }
 
 configure_shards() {
-  SHARD_COUNT="${DEXTELEOP_FULL_ACCEPTANCE_SHARDS:-4}"
+  local default_shards=4
+  [[ "$ACCEPTANCE_PROFILE" != core ]] || default_shards=4
+  SHARD_COUNT="${DEXTELEOP_FULL_ACCEPTANCE_SHARDS:-$default_shards}"
   case "$SHARD_COUNT" in
     1|2|3|4|5|6|7|8|9|10|11|12) ;;
     *) die "DEXTELEOP_FULL_ACCEPTANCE_SHARDS must be an integer from 1 to 12: $SHARD_COUNT" ;;
@@ -160,11 +174,16 @@ configure_shards() {
   if ((SHARD_COUNT > 6)) && [[ -z "${DEXTELEOP_FULL_ACCEPTANCE_MAX_JOBS:-}" ]]; then
     die "DEXTELEOP_FULL_ACCEPTANCE_MAX_JOBS must be explicit when SHARD_COUNT exceeds 6"
   fi
-  MAX_JOBS="${DEXTELEOP_FULL_ACCEPTANCE_MAX_JOBS:-$SHARD_COUNT}"
+  local default_jobs="$SHARD_COUNT"
+  [[ "$ACCEPTANCE_PROFILE" != core ]] || default_jobs=2
+  MAX_JOBS="${DEXTELEOP_FULL_ACCEPTANCE_MAX_JOBS:-$default_jobs}"
   case "$MAX_JOBS" in
     1|2|3|4|5|6) ;;
     *) die "DEXTELEOP_FULL_ACCEPTANCE_MAX_JOBS must be an integer from 1 to 6: $MAX_JOBS" ;;
   esac
+  if [[ "$ACCEPTANCE_PROFILE" == core ]]; then
+    ((MAX_JOBS <= 2)) || die "core acceptance uses at most two live pytest processes"
+  fi
   ((MAX_JOBS <= SHARD_COUNT)) || die \
     "DEXTELEOP_FULL_ACCEPTANCE_MAX_JOBS must not exceed SHARD_COUNT ($SHARD_COUNT): $MAX_JOBS"
 }
@@ -208,7 +227,7 @@ prepare_shards() {
       --tests-root "$REPO_ROOT/tests" \
       --output-dir "$RUN_ROOT" \
       --shards "$SHARD_COUNT" \
-      --profile full || die "could not build a complete shard plan"
+      --profile "$ACCEPTANCE_PROFILE" || die "could not build an acceptance shard plan"
   fi
   for ((index = 0; index < SHARD_COUNT; index++)); do
     SHARD_LOGS[index]="$RUN_ROOT/shard-${index}.log"
@@ -286,6 +305,8 @@ run_shard() {
   local name="shard-${index}"
   local shard_tmp="$SHORT_TMP_ROOT/$name"
   local -a shard_paths=()
+  local -a core_options=()
+  [[ "$ACCEPTANCE_PROFILE" != core ]] || core_options=(-p scripts.pytest_core)
   mkdir -- "$shard_tmp" "$RUN_ROOT/${name}-xdg-cache" "$RUN_ROOT/${name}-matplotlib-cache" \
     "$RUN_ROOT/${name}-numba-cache"
   mapfile -t shard_paths <"$RUN_ROOT/${name}-paths.txt"
@@ -304,6 +325,7 @@ run_shard() {
     -o "cache_dir=$RUN_ROOT/${name}-pytest-cache" \
     --junitxml="${SHARD_XMLS[index]}" \
     "${shard_paths[@]}" \
+    "${core_options[@]}" \
     "$@" \
     >"${SHARD_LOGS[index]}" 2>&1
 }
@@ -378,8 +400,13 @@ if ! cleanup_resources 0; then
   WRAPPER_ERRORS+=("temporary resource cleanup failed")
 fi
 DIAGNOSTIC_JUNIT="$RUN_ROOT/diagnostic-acceptance.xml"
+MERGE_ARGUMENTS=()
+if [[ "$ACCEPTANCE_PROFILE" == core ]]; then
+  [[ "$(git -C "$REPO_ROOT" rev-parse HEAD)" == "$CORE_HEAD" && -z "$(git -C "$REPO_ROOT" status --porcelain --untracked-files=all --ignore-submodules=none)" ]] || die "core acceptance source changed during execution"
+  MERGE_ARGUMENTS+=(--name merge-core-acceptance --head "$CORE_HEAD")
+fi
 if ! python3 "$REPO_ROOT/scripts/pytest_sharding.py" merge-junit \
-  --output "$DIAGNOSTIC_JUNIT" "${SHARD_XMLS[@]}"; then
+  --output "$DIAGNOSTIC_JUNIT" "${MERGE_ARGUMENTS[@]}" "${SHARD_XMLS[@]}"; then
   die "cannot merge shard JUnit; individual shard evidence is retained"
 fi
 

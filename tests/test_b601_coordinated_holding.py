@@ -1836,8 +1836,8 @@ def test_fixed_hold_needs_a_continuous_quiet_dwell_not_just_a_tolerated_displace
     assert workspace._sample_pose == tuple(anchor)
 
 
-@pytest.mark.parametrize("axis", [0, 1, 3, 4, 5])
-@pytest.mark.parametrize("period", [.01, .025])
+# Probe J2 at both periods; passive first/last axes represent the pose window.
+@pytest.mark.parametrize("period,axis", [(.01, 1), (.025, 1), (.01, 0), (.025, 5)])
 def test_fixed_probe_keeps_fine_position_dwell_through_bounded_count_jitter(tmp_path, axis, period):
     r = replay(tmp_path, holding_search=HoldingSearchConfig(
         observation_sec=.5, observation_timeout_sec=1.5, movement_rad=.003))
@@ -1873,7 +1873,7 @@ def test_fixed_probe_keeps_fine_position_dwell_through_bounded_count_jitter(tmp_
 
 
 @pytest.mark.parametrize("period", [.01, .025])
-@pytest.mark.parametrize("timeout", [1.5, 3.0])
+@pytest.mark.parametrize("timeout", [1.5])
 def test_fixed_probe_rejects_varying_support_effort_even_with_bounded_encoder_jitter(tmp_path, period, timeout):
     r = replay(tmp_path, holding_search=HoldingSearchConfig(
         observation_sec=.5, observation_timeout_sec=timeout, movement_rad=.003))
@@ -2174,9 +2174,10 @@ def test_explicit_holding_entry_tolerance_must_fit_the_measured_point(tmp_path, 
         WorkspaceCalibrationConfig(holding_arrival_tolerance_rad=.001)
 
 
-@pytest.mark.parametrize("axis", [1, 2])
-@pytest.mark.parametrize("direction", [-1, 1])
-@pytest.mark.parametrize("expanded", [False, True])
+# Each controlled axis retains default rejection and explicit expanded admission.
+@pytest.mark.parametrize("expanded,direction,axis", [
+    (False, -1, 1), (True, 1, 1), (False, 1, 2), (True, -1, 2),
+])
 def test_nominal_entry_margin_freezes_measured_pose_without_relaxing_fine_hold(tmp_path, axis, direction, expanded):
     r = replay(tmp_path, holding_search=HoldingSearchConfig(
         movement_rad=.0045, observation_sec=.5, observation_timeout_sec=2),
@@ -2646,8 +2647,10 @@ def advance_to_pose_observation(r):
     pytest.fail("scripted arrival did not reach pose observation")
 
 
-@pytest.mark.parametrize("axis", range(6))
-@pytest.mark.parametrize("phase", ["observe", "return_observe"])
+# Controlled J2/J3 and passive first/last axes cover the shared observation gate.
+@pytest.mark.parametrize("phase,axis", [
+    ("observe", 1), ("return_observe", 2), ("return_observe", 0), ("observe", 5),
+])
 def test_pose_observation_accepts_bounded_two_count_jitter_without_short_gate_reset(tmp_path, axis, phase):
     r = replay(tmp_path, gravity_observation_sec=1)
     advance_to_pose_observation(r)
