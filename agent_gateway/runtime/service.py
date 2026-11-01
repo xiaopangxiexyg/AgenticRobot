@@ -295,7 +295,8 @@ class AgentGatewayService:
         self.clock_domain_id = normalized_clock_domain
         self._admission_lock = threading.RLock()
         self._observation_lock = threading.RLock()
-        self._close_lock = threading.Lock()
+        # Internal close and public cancellation share the same control barrier.
+        self._close_lock = threading.RLock()
         self._closed = False
         self._close_outcome: AgentGatewayOperationOutcome | None = None
         self._grant_invocations_by_hash: dict[str, int] = {}
@@ -309,6 +310,8 @@ class AgentGatewayService:
         self._emergency_stop_latched = False
         self._emergency_stop_confirmed = False
         self._emergency_stop_receipt: AgentSkillOperationPortReceipt | None = None
+        self._emergency_controls_inflight = 0
+        self._emergency_admission_closed = False
 
     @property
     def is_closed(self) -> bool:
@@ -751,99 +754,111 @@ class AgentGatewayService:
         # Use the same lock order as motion admission.  Once this block exits,
         # no concurrent submitter can pass the motion-route latch check after
         # the emergency stop has begun.
-        with self._admission_lock, self._emergency_stop_lock:
-            self._emergency_stop_latched = True
-        port = self.domain_emergency_stop_port
-        active = self.operation_store.active_operation()
-        active_motion = None
-        if active is not None:
-            active_request = self.operation_store.request_for_operation(
-                active.operation_id
-            )
-            if active_request is not None:
-                active_route = self.manifest.route(
-                    active_request.skill_id,
-                    active_request.skill_version,
-                    active_request.route_id,
-                    active_request.route_version,
-                ).route
-                if active_route.may_move_robot:
-                    active_motion = active
+        with self._admission_lock:
+            if self._emergency_admission_closed:
+                self._abandon_control_request(action="request_emergency_stop_own_domain",
+                    client_id=request.client_id, idempotency_key=request.idempotency_key,
+                    request_hash=request.semantic_content_hash)
+                return AgentGatewayControlPlaneOutcome(False, "control_generation_closed",
+                    request.semantic_content_hash)
+            self._emergency_controls_inflight += 1
         try:
-            if port is None:  # Closed by constructor/manifest consistency.
-                raise RuntimeError("domain emergency-stop port is unavailable.")
-            receipt = port.request_emergency_stop(
-                operation=active_motion,
-                reason=request.reason_code,
-            )
-            self._require_port_receipt(
-                receipt,
-                expected_port=port,
-                operation_kind="emergency_stop",
-                operation_id=(
-                    None if active_motion is None else active_motion.operation_id
+            with self._admission_lock, self._emergency_stop_lock:
+                self._emergency_stop_latched = True
+            port = self.domain_emergency_stop_port
+            active = self.operation_store.active_operation()
+            active_motion = None
+            if active is not None:
+                active_request = self.operation_store.request_for_operation(
+                    active.operation_id
+                )
+                if active_request is not None:
+                    active_route = self.manifest.route(
+                        active_request.skill_id,
+                        active_request.skill_version,
+                        active_request.route_id,
+                        active_request.route_version,
+                    ).route
+                    if active_route.may_move_robot:
+                        active_motion = active
+            try:
+                if port is None:  # Closed by constructor/manifest consistency.
+                    raise RuntimeError("domain emergency-stop port is unavailable.")
+                receipt = port.request_emergency_stop(
+                    operation=active_motion,
+                    reason=request.reason_code,
+                )
+                self._require_port_receipt(
+                    receipt,
+                    expected_port=port,
+                    operation_kind="emergency_stop",
+                    operation_id=(
+                        None if active_motion is None else active_motion.operation_id
+                    ),
+                )
+            except Exception:
+                self._abandon_control_request(
+                    action="request_emergency_stop_own_domain",
+                    client_id=request.client_id,
+                    idempotency_key=request.idempotency_key,
+                    request_hash=request.semantic_content_hash,
+                )
+                raise
+
+            confirmed = bool(receipt.succeeded and receipt.proves_motion_or_hold)
+            with self._emergency_stop_lock:
+                self._emergency_stop_confirmed = (
+                    self._emergency_stop_confirmed or confirmed
+                )
+                self._emergency_stop_receipt = receipt
+            projected_operation = active_motion
+            projection_accepted = True
+            if active_motion is not None:
+                revision = max(
+                    active_motion.current_station_revision,
+                    self.operation_store.latest_station_revision or 0,
+                )
+                projection = self.operation_store.terminate_after_emergency_stop(
+                    operation_id=active_motion.operation_id,
+                    emergency_stop_confirmed=confirmed,
+                    reason_code=(
+                        "operation_cancelled_after_emergency_stop"
+                        if confirmed
+                        else "operation_failed_after_unconfirmed_emergency_stop"
+                    ),
+                    current_station_revision=revision,
+                    updated_at=max(timestamp, active_motion.updated_at),
+                    execution_receipt_refs=(receipt.receipt_id,),
+                )
+                projection_accepted = projection.accepted
+                projected_operation = projection.operation
+            accepted = confirmed and projection_accepted
+            result = AgentGatewayControlPlaneOutcome(
+                accepted,
+                (
+                    "domain_emergency_stop_confirmed"
+                    if accepted
+                    else "domain_emergency_stop_not_confirmed"
+                ),
+                request.semantic_content_hash,
+                projected_operation,
+                port_receipt=receipt,
+                publish_authoritative_port_receipt=(
+                    AGENT_GATEWAY_AUTHORITATIVE_PORT_RECEIPT_FEATURE_V1
+                    in self.manifest.supported_transport_features
                 ),
             )
-        except Exception:
-            self._abandon_control_request(
+            self._complete_control_request(
                 action="request_emergency_stop_own_domain",
                 client_id=request.client_id,
                 idempotency_key=request.idempotency_key,
                 request_hash=request.semantic_content_hash,
+                outcome=result,
             )
-            raise
-
-        confirmed = bool(receipt.succeeded and receipt.proves_motion_or_hold)
-        with self._emergency_stop_lock:
-            self._emergency_stop_confirmed = (
-                self._emergency_stop_confirmed or confirmed
-            )
-            self._emergency_stop_receipt = receipt
-        projected_operation = active_motion
-        projection_accepted = True
-        if active_motion is not None:
-            revision = max(
-                active_motion.current_station_revision,
-                self.operation_store.latest_station_revision or 0,
-            )
-            projection = self.operation_store.terminate_after_emergency_stop(
-                operation_id=active_motion.operation_id,
-                emergency_stop_confirmed=confirmed,
-                reason_code=(
-                    "operation_cancelled_after_emergency_stop"
-                    if confirmed
-                    else "operation_failed_after_unconfirmed_emergency_stop"
-                ),
-                current_station_revision=revision,
-                updated_at=max(timestamp, active_motion.updated_at),
-                execution_receipt_refs=(receipt.receipt_id,),
-            )
-            projection_accepted = projection.accepted
-            projected_operation = projection.operation
-        accepted = confirmed and projection_accepted
-        result = AgentGatewayControlPlaneOutcome(
-            accepted,
-            (
-                "domain_emergency_stop_confirmed"
-                if accepted
-                else "domain_emergency_stop_not_confirmed"
-            ),
-            request.semantic_content_hash,
-            projected_operation,
-            port_receipt=receipt,
-            publish_authoritative_port_receipt=(
-                AGENT_GATEWAY_AUTHORITATIVE_PORT_RECEIPT_FEATURE_V1
-                in self.manifest.supported_transport_features
-            ),
-        )
-        self._complete_control_request(
-            action="request_emergency_stop_own_domain",
-            client_id=request.client_id,
-            idempotency_key=request.idempotency_key,
-            request_hash=request.semantic_content_hash,
-            outcome=result,
-        )
-        return result
+            return result
+        finally:
+            with self._admission_lock:
+                self._emergency_controls_inflight -= 1
 
     def grant_invocations_used(self, grant: SkillExecutionGrant) -> int:
         if not isinstance(grant, SkillExecutionGrant):
@@ -1422,12 +1437,17 @@ class AgentGatewayService:
         normalized_reason = _required_text(reason, field_name="reason")
         revision = _revision(current_station_revision)
         timestamp = self._time() if now is None else _finite_time(now, field_name="now")
-        return self._request_hold(
-            reason=normalized_reason,
-            control_kind="hold",
-            current_station_revision=revision,
-            requested_at=timestamp,
-        )
+        with self._close_lock:
+            if self._close_outcome is not None:
+                # Late cancellation must consume the same authoritative stop
+                # proof, rather than entering a device which has been released.
+                return self._close_outcome
+            return self._request_hold(
+                reason=normalized_reason,
+                control_kind="hold",
+                current_station_revision=revision,
+                requested_at=timestamp,
+            )
 
     def expire_due_operation(
         self,
@@ -1541,6 +1561,9 @@ class AgentGatewayService:
             self._closed = True
             if self.operation_store.total_admitted != 0:
                 raise RuntimeError("Gateway has admitted work; lower HOLD remains required.")
+            self._emergency_admission_closed = True
+            if self._emergency_controls_inflight:
+                raise RuntimeError("Unused Gateway still has an emergency control call in flight.")
 
 
     def close(
@@ -1565,7 +1588,15 @@ class AgentGatewayService:
                 requested_at=timestamp,
             )
             if outcome.accepted:
-                self._close_outcome = outcome
+                with self._admission_lock:
+                    # Emergency control stays independent of close/HOLD, but
+                    # device release must wait for any such SDK call to exit.
+                    self._emergency_admission_closed = True
+                    if self._emergency_controls_inflight:
+                        return AgentGatewayOperationOutcome(False,
+                            "emergency_control_still_inflight_at_close",
+                            outcome.operation, outcome.port_receipt)
+                    self._close_outcome = outcome
             return outcome
 
     def _request_hold(
@@ -1659,117 +1690,120 @@ class AgentGatewayService:
         use_hold: bool,
         allow_existing_control: bool = False,
     ) -> AgentGatewayOperationOutcome:
-        reservation = self.operation_store.reserve_control(
-            operation_id=operation.operation_id,
-            control_kind=control_kind,
-            terminal_status=terminal_status,
-            reason_code=reservation_reason,
-            current_station_revision=current_station_revision,
-            updated_at=requested_at,
-        )
-        if not reservation.accepted or reservation.operation is None:
-            if not (
-                allow_existing_control
-                and reservation.reason_code
-                == "operation_control_reservation_conflict"
-                and reservation.operation is not None
-                and not reservation.operation.terminal
-            ):
-                return self._operation_outcome_from_store(reservation)
-        reserved = reservation.operation
-        if reserved is None:
-            return AgentGatewayOperationOutcome(False, "operation_not_found")
-        if reserved.terminal:
-            return AgentGatewayOperationOutcome(
-                True,
-                "operation_already_terminal",
-                reserved,
+        with self._close_lock:
+            if self._close_outcome is not None:
+                return self._close_outcome
+            reservation = self.operation_store.reserve_control(
+                operation_id=operation.operation_id,
+                control_kind=control_kind,
+                terminal_status=terminal_status,
+                reason_code=reservation_reason,
+                current_station_revision=current_station_revision,
+                updated_at=requested_at,
             )
+            if not reservation.accepted or reservation.operation is None:
+                if not (
+                    allow_existing_control
+                    and reservation.reason_code
+                    == "operation_control_reservation_conflict"
+                    and reservation.operation is not None
+                    and not reservation.operation.terminal
+                ):
+                    return self._operation_outcome_from_store(reservation)
+            reserved = reservation.operation
+            if reserved is None:
+                return AgentGatewayOperationOutcome(False, "operation_not_found")
+            if reserved.terminal:
+                return AgentGatewayOperationOutcome(
+                    True,
+                    "operation_already_terminal",
+                    reserved,
+                )
 
-        try:
-            if use_hold:
-                control_port: AgentDomainControlPort | AgentSkillExecutionPort = (
-                    self.domain_control_port
+            try:
+                if use_hold:
+                    control_port: AgentDomainControlPort | AgentSkillExecutionPort = (
+                        self.domain_control_port
+                    )
+                    selected_executor = self.execution_port_for_request(request)
+                    hold_operation = (
+                        reserved
+                        if selected_executor is self.domain_control_port
+                        else None
+                    )
+                    receipt = self.domain_control_port.request_hold(
+                        operation=hold_operation,
+                        reason=reason,
+                    )
+                    receipt_kind = "hold"
+                    receipt_operation_id = (
+                        None
+                        if hold_operation is None
+                        else hold_operation.operation_id
+                    )
+                else:
+                    control_port = self.execution_port_for_request(request)
+                    receipt = control_port.cancel(
+                        request=request,
+                        operation=reserved,
+                        reason=reason,
+                    )
+                    receipt_kind = "cancel"
+                    receipt_operation_id = reserved.operation_id
+                self._require_port_receipt(
+                    receipt,
+                    expected_port=control_port,
+                    operation_kind=receipt_kind,
+                    operation_id=receipt_operation_id,
                 )
-                selected_executor = self.execution_port_for_request(request)
-                hold_operation = (
-                    reserved
-                    if selected_executor is self.domain_control_port
-                    else None
+            except Exception as error:
+                failed = self.operation_store.record_control_failure(
+                    operation_id=reserved.operation_id,
+                    expected_operation_hash=reserved.semantic_content_hash,
+                    reason_code=f"control_port_exception:{type(error).__name__}",
+                    current_station_revision=current_station_revision,
+                    updated_at=self._time_at_least(reserved.updated_at),
                 )
-                receipt = self.domain_control_port.request_hold(
-                    operation=hold_operation,
-                    reason=reason,
+                return AgentGatewayOperationOutcome(
+                    False,
+                    (
+                        "control_port_exception"
+                        if failed.accepted
+                        else "operation_superseded_after_control_exception"
+                    ),
+                    failed.operation,
                 )
-                receipt_kind = "hold"
-                receipt_operation_id = (
-                    None
-                    if hold_operation is None
-                    else hold_operation.operation_id
+
+            finished_at = self._time_at_least(reserved.updated_at)
+            if receipt.succeeded:
+                finalized = self.operation_store.finalize_control(
+                    operation_id=reserved.operation_id,
+                    expected_operation_hash=reserved.semantic_content_hash,
+                    reason_code=success_reason,
+                    current_station_revision=current_station_revision,
+                    updated_at=finished_at,
+                    execution_receipt_refs=(receipt.receipt_id,),
                 )
-            else:
-                control_port = self.execution_port_for_request(request)
-                receipt = control_port.cancel(
-                    request=request,
-                    operation=reserved,
-                    reason=reason,
+                return AgentGatewayOperationOutcome(
+                    finalized.accepted,
+                    success_reason if finalized.accepted else finalized.reason_code,
+                    finalized.operation,
+                    receipt,
                 )
-                receipt_kind = "cancel"
-                receipt_operation_id = reserved.operation_id
-            self._require_port_receipt(
-                receipt,
-                expected_port=control_port,
-                operation_kind=receipt_kind,
-                operation_id=receipt_operation_id,
-            )
-        except Exception as error:
             failed = self.operation_store.record_control_failure(
                 operation_id=reserved.operation_id,
                 expected_operation_hash=reserved.semantic_content_hash,
-                reason_code=f"control_port_exception:{type(error).__name__}",
-                current_station_revision=current_station_revision,
-                updated_at=self._time_at_least(reserved.updated_at),
-            )
-            return AgentGatewayOperationOutcome(
-                False,
-                (
-                    "control_port_exception"
-                    if failed.accepted
-                    else "operation_superseded_after_control_exception"
-                ),
-                failed.operation,
-            )
-
-        finished_at = self._time_at_least(reserved.updated_at)
-        if receipt.succeeded:
-            finalized = self.operation_store.finalize_control(
-                operation_id=reserved.operation_id,
-                expected_operation_hash=reserved.semantic_content_hash,
-                reason_code=success_reason,
+                reason_code=failure_reason,
                 current_station_revision=current_station_revision,
                 updated_at=finished_at,
                 execution_receipt_refs=(receipt.receipt_id,),
             )
             return AgentGatewayOperationOutcome(
-                finalized.accepted,
-                success_reason if finalized.accepted else finalized.reason_code,
-                finalized.operation,
+                False,
+                failure_reason if failed.accepted else failed.reason_code,
+                failed.operation,
                 receipt,
             )
-        failed = self.operation_store.record_control_failure(
-            operation_id=reserved.operation_id,
-            expected_operation_hash=reserved.semantic_content_hash,
-            reason_code=failure_reason,
-            current_station_revision=current_station_revision,
-            updated_at=finished_at,
-            execution_receipt_refs=(receipt.receipt_id,),
-        )
-        return AgentGatewayOperationOutcome(
-            False,
-            failure_reason if failed.accepted else failed.reason_code,
-            failed.operation,
-            receipt,
-        )
 
     def _time(self) -> float:
         return _finite_time(self._clock(), field_name="clock result")

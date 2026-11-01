@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+import os
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -63,6 +64,42 @@ from teleop_runtime.skill_deploy.rm65_profile import (
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+def test_generation_reuses_only_its_live_owned_endpoint(monkeypatch, short_unix_socket_path_factory):
+    from agent_gateway.transport.unix_transport import (
+        AgentGatewayUnixJsonServer, AgentGatewayUnixPeerClientMap,
+        validate_agent_gateway_unix_server_preflight,
+    )
+    from tests.test_agent_gateway_unix_transport import _FakeBoundFacade
+    monkeypatch.setattr(composition_module, "validate_agent_gateway_unix_server_preflight",
+                        validate_agent_gateway_unix_server_preflight)
+    path = short_unix_socket_path_factory("generation-composition")
+    server = AgentGatewayUnixJsonServer(socket_path=path,
+        peer_client_map=AgentGatewayUnixPeerClientMap({os.getuid(): "rpent:test"}),
+        facade_factory=_FakeBoundFacade, close_gateway=lambda: None)
+    lower, _ = _lower(monkeypatch)
+    kwargs = dict(lower=lower, socket_path=path, authorized_side="right",
+        authorized_action="move_tcp_to_pose", confirmation_token=REAL_AGENT_PRIMITIVE_CONFIRM_TOKEN,
+        client_id="rpent:test", client_uid=os.getuid(), runtime_session_id="runtime:replacement",
+        control_domain_id="control:replacement", embodiment_instance_id="robot:test")
+    result = None
+    try:
+        with pytest.raises(FileExistsError):
+            assemble_exclusive_rm65_agent_primitive_composition(**kwargs)
+        result = assemble_exclusive_rm65_agent_primitive_composition(**kwargs, retained_transport=server)
+        assert result.socket_path == path
+        assert all(backend.starts == 0 for backend in lower.arm_backends.values())
+        with pytest.raises(RuntimeError, match="ownership or configuration"):
+            assemble_exclusive_rm65_agent_primitive_composition(**{**kwargs, "client_id": "different-peer"}, retained_transport=server)
+        server.server_close()
+        with pytest.raises((RuntimeError, FileNotFoundError)):
+            assemble_exclusive_rm65_agent_primitive_composition(**kwargs, retained_transport=server)
+    finally:
+        if result is not None:
+            result.deployment.gateway_session.close_unused()
+        lower.ports.close()
+        server.server_close()
 
 
 @pytest.mark.parametrize('mode', ['legacy', 'cad_surface'])

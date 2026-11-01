@@ -418,8 +418,10 @@ def test_retained_control_fault_fences_submissions_but_preserves_diagnostics(
             "emergency_stop_confirmed", "lower_stop_receipt_ref"}
         # All other methods keep their original dispatch, including controls,
         # operation reconciliation and retained Artifact access.
+        operator_lifecycle = {"read_hardware_connection_state", "request_hardware_connection",
+                              "request_operator_gripper"}
         permitted = unix_transport.AGENT_GATEWAY_UNIX_JSON_METHODS_V2 - {
-            "healthz", "submit_skill_request", "submit_read_only_skill_request"}
+            "healthz", "submit_skill_request", "submit_read_only_skill_request"} - operator_lifecycle
         for method in sorted(permitted):
             def query(*args, _method=method):
                 facade.requests.append((_method, args))
@@ -429,6 +431,12 @@ def test_retained_control_fault_fences_submissions_but_preserves_diagnostics(
             response = _raw_call(raw, request_id=f"allowed:{method}", method=method,
                 payload=None if method in unix_transport._NO_PAYLOAD_METHODS else payload)
             assert response["result"] == {"queried": method}
+        assert [method for method, _ in facade.requests] == sorted(permitted)
+        for method in sorted(operator_lifecycle):
+            response = _raw_call(raw, request_id=f"unsupported:{method}", method=method,
+                payload=None if method in unix_transport._NO_PAYLOAD_METHODS else {})
+            assert response["ok"] is False
+            assert response["error"]["code"] == "gateway_request_invalid"
         assert [method for method, _ in facade.requests] == sorted(permitted)
         assert facade.disconnect_reasons == []
         assert close_calls == []

@@ -27,7 +27,7 @@ import threading
 from collections import deque
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Protocol
 
 from .wire_adapter import BoundAgentGatewayWireAdapter
 
@@ -51,6 +51,9 @@ AGENT_GATEWAY_UNIX_JSON_METHODS_V2 = frozenset(
         "cancel_own_read_only_operation",
         "request_hold_own_domain",
         "request_emergency_stop_own_domain",
+        "read_hardware_connection_state",
+        "request_hardware_connection",
+        "request_operator_gripper",
         "begin_artifact_upload",
         "write_artifact_chunk",
         "commit_artifact_upload",
@@ -83,8 +86,23 @@ _NO_PAYLOAD_METHODS = frozenset(
         "get_hardware_resource_views",
         "get_hardware_status_views",
         "get_observation_snapshot",
+        "read_hardware_connection_state",
     }
 )
+
+
+class AgentGatewayHardwareConnectionControl(Protocol):
+    """Trusted application lifecycle port, absent from Skill discovery."""
+
+    @property
+    def control_fault_reason(self) -> str | None: ...
+
+    def snapshot(self, client_id: str) -> Mapping[str, Any]: ...
+
+    def request(self, client_id: str, payload: Mapping[str, Any]) -> Mapping[str, Any]: ...
+
+    def facade(self, client_id: str, method: str | None = None,
+               bound_facade: BoundAgentGatewayWireAdapter | None = None) -> BoundAgentGatewayWireAdapter: ...
 
 
 class AgentGatewayUnixProtocolError(RuntimeError):
@@ -206,18 +224,14 @@ def _socket_mode(value: object) -> int:
     return value
 
 
-def validate_agent_gateway_unix_server_preflight(
+def _validate_endpoint_configuration(
     *,
     socket_path: str | os.PathLike[str],
     peer_idle_timeout_sec: float = (
         DEFAULT_AGENT_GATEWAY_UNIX_PEER_IDLE_TIMEOUT_SEC
     ),
 ) -> tuple[str, float]:
-    """Validate the side-effect-free endpoint facts needed before startup.
-
-    The server repeats this check immediately before binding, so this function
-    is a fail-fast configuration preflight rather than a reservation claim.
-    """
+    """Validate endpoint configuration without granting ownership or a bind."""
 
     path = os.fspath(socket_path)
     if not isinstance(path, str) or not path or not os.path.isabs(path):
@@ -246,12 +260,22 @@ def validate_agent_gateway_unix_server_preflight(
         )
     if parent_stat.st_mode & stat.S_IWOTH:
         raise ValueError("Unix socket parent directory cannot be world-writable.")
+    return path, _peer_idle_timeout(peer_idle_timeout_sec)
+
+
+def validate_agent_gateway_unix_server_preflight(
+    *, socket_path: str | os.PathLike[str],
+    peer_idle_timeout_sec: float = DEFAULT_AGENT_GATEWAY_UNIX_PEER_IDLE_TIMEOUT_SEC,
+) -> tuple[str, float]:
+    """Reject any existing endpoint before a new exclusive bind."""
+    path, timeout = _validate_endpoint_configuration(
+        socket_path=socket_path, peer_idle_timeout_sec=peer_idle_timeout_sec)
     if os.path.lexists(path):
         raise FileExistsError(
             "Refusing to replace an existing Unix socket path; remove only "
             "the verified stale endpoint explicitly."
         )
-    return path, _peer_idle_timeout(peer_idle_timeout_sec)
+    return path, timeout
 
 
 def validate_agent_gateway_unix_group_parent(
@@ -534,6 +558,18 @@ class _AgentGatewayUnixRequestHandler(socketserver.BaseRequestHandler):
                         )
                     break
 
+                if server._hardware_connection_control is not None and request.method not in {
+                    "read_hardware_connection_state", "request_hardware_connection", "request_operator_gripper",
+                }:
+                    try:
+                        facade = server._hardware_connection_control.facade(client_id, request.method, facade)
+                    except Exception as error:
+                        code, message, terminate = _public_error(error)
+                        if not server._try_write_response(self.request, _error_response(
+                            request.request_id, code=code, message=message,
+                        )) or terminate:
+                            break
+                        continue
                 response, terminate = server._dispatch_request(
                     facade=facade,
                     client_id=client_id,
@@ -587,6 +623,7 @@ class AgentGatewayUnixJsonServer(
         ),
         max_disconnect_events: int = 64,
         control_fault_reader: Callable[[], str | None] | None = None,
+        hardware_connection_control: AgentGatewayHardwareConnectionControl | None = None,
     ) -> None:
         path, peer_idle_timeout = validate_agent_gateway_unix_server_preflight(
             socket_path=socket_path,
@@ -600,6 +637,11 @@ class AgentGatewayUnixJsonServer(
             raise TypeError("close_gateway must be callable.")
         if control_fault_reader is not None and not callable(control_fault_reader):
             raise TypeError("control_fault_reader must be callable.")
+        if hardware_connection_control is not None and any(
+            not callable(getattr(hardware_connection_control, name, None))
+            for name in ("snapshot", "request", "facade")
+        ):
+            raise TypeError("Hardware connection control must implement snapshot/request/facade")
         if (
             isinstance(max_disconnect_events, bool)
             or not isinstance(max_disconnect_events, int)
@@ -617,6 +659,7 @@ class AgentGatewayUnixJsonServer(
         self._facade_factory = facade_factory
         self._close_gateway = close_gateway
         self._control_fault_reader = control_fault_reader
+        self._hardware_connection_control = hardware_connection_control
         self._connection_lock = threading.RLock()
         self._connection_available = threading.Condition(self._connection_lock)
         self._active_connections: dict[str, dict[int, socket.socket]] = {}
@@ -663,6 +706,31 @@ class AgentGatewayUnixJsonServer(
                 self._unlink_owned_endpoint()
             raise
 
+    def validate_retained_endpoint(self, *, socket_path: str | os.PathLike[str],
+                                   peer_idle_timeout_sec: float,
+                                   client_id_by_uid: Mapping[int, str],
+                                   socket_mode: int) -> tuple[str, float]:
+        """Only the live owner can lend its exact existing endpoint to a generation."""
+        path, timeout = _validate_endpoint_configuration(
+            socket_path=socket_path, peer_idle_timeout_sec=peer_idle_timeout_sec)
+        with self._connection_lock:
+            current = os.lstat(path)
+            if (self._transport_closed or not self._bound_here
+                    or path != self.socket_path or timeout != self.peer_idle_timeout_sec
+                    or dict(client_id_by_uid) != dict(self.peer_client_map.client_id_by_uid)
+                    or socket_mode != self.socket_mode
+                    or not stat.S_ISSOCK(current.st_mode)
+                    or current.st_uid != os.getuid()
+                    or (current.st_dev, current.st_ino) != self._bound_endpoint_identity
+                    or stat.S_IMODE(current.st_mode) != self.socket_mode):
+                raise RuntimeError("Retained Gateway endpoint ownership or configuration changed")
+            if self.socket_mode == 0o660:
+                parent = os.lstat(os.path.dirname(path))
+                required = stat.S_ISGID | stat.S_IRGRP | stat.S_IXGRP
+                if parent.st_mode & required != required:
+                    raise ValueError("Retained group-shared socket parent permissions changed")
+        return path, timeout
+
     @property
     def control_fault_reader(self) -> Callable[[], str | None] | None:
         return self._control_fault_reader
@@ -699,6 +767,8 @@ class AgentGatewayUnixJsonServer(
 
     @property
     def control_fault_reason(self) -> str | None:
+        if self._hardware_connection_control is not None:
+            return self._hardware_connection_control.control_fault_reason
         with self._control_fault_lock:
             return self._control_fault_reason
 
@@ -808,7 +878,21 @@ class AgentGatewayUnixJsonServer(
             }:
                 return _error_response(request.request_id,
                     code="control_fault_latched", message=fault_reason), False
-            if request.method == "healthz":
+            if request.method in {"read_hardware_connection_state", "request_hardware_connection",
+                                  "request_operator_gripper"}:
+                control = self._hardware_connection_control
+                if control is None:
+                    raise ValueError("Hardware connection control is not enabled")
+                if request.method == "read_hardware_connection_state":
+                    result = control.snapshot(client_id)
+                elif request.method == "request_hardware_connection":
+                    result = control.request(client_id, request.payload or {})
+                else:
+                    gripper = getattr(control, "operator_gripper", None)
+                    if not callable(gripper):
+                        raise ValueError("Operator gripper control is not enabled")
+                    result = gripper(client_id, request.payload or {})
+            elif request.method == "healthz":
                 # A retained fence reports its stable reason code; otherwise
                 # read the application's fault/lifecycle owner afresh.
                 fault = fault_reason
@@ -826,6 +910,10 @@ class AgentGatewayUnixJsonServer(
                     "domain_control_state": facade.get_domain_control_state(),
                     "control_fault_reason": fault,
                 }
+                if self._hardware_connection_control is not None:
+                    result["hardware_connection_control"] = "agent_gateway.hardware_connection.v1"
+                    if callable(getattr(self._hardware_connection_control, "operator_gripper", None)):
+                        result["operator_gripper_control"] = "agent_gateway.operator_gripper.v1"
             elif request.method == "get_skill_definition_catalog":
                 result = facade.get_skill_definition_catalog()
             elif request.method == "get_agent_skill_schema_catalog":
