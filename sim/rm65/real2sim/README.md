@@ -92,6 +92,14 @@ core and MuJoCo adapter used for the 20260721 fit; tests compare those hashes to
 fixed historical values rather than silently reinterpreting the fit against
 the current files.
 
+G4 与原生周期/命令拒绝修复的组合使用后继绑定
+`artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261103_g4_command_refusal_v1.json`，固定源码 `a1b9e59a7f07a792929ae2e681d77288a67b0454`。
+它以 G4 的 205 项输入为运行时父，只有 `sim/mujoco/actuation/executor.py` 改变；
+G4 查询代码与命令拒绝/原生周期的既有代码保持对应已审提交的原始内容。
+并行父保留 command-refusal 清单，68 份历史清单原字节不变；两侧旧报告继续归属各自原源码。
+本组合的既有 owner 检查为 397 passed / 0 skipped；完整最终 core 与真实模型结果另存证据。
+输入集合不是传递依赖闭包；仍为 `provisional`，没有 refit、真机执行或新 held-out 资格。
+
 MuJoCo release@3 调平优先与最终倾角限制使用独立绑定
 `artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261103_mujoco_g4_release_leveling_v1.json`。
 它固定源码 `465cf60dc4af8f7e869fc179c2c88fbe5be28e18`，基线为 development
