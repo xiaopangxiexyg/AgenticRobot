@@ -1,4 +1,4 @@
-"""MuJoCo registration and port for ``perception.query_grasp_approach@1``.
+"""MuJoCo registration and port for ``perception.query_grasp_approach@1/@2``.
 
 One read-only request, with the motion application HOLD and no active
 operation:
@@ -46,6 +46,7 @@ from agent_gateway.runtime.passive_read_executor import (
 )
 from agent_gateway.runtime.payload_validation import AgentSkillPayloadValidatorSet
 from agent_gateway.skills.perception import grasp_approach_query as skill
+from agent_gateway.skills.perception import grasp_approach_query_v2 as skill_v2
 from agent_gateway.skills.perception.schemas import validate_no_task_evaluation_v1
 from dataset_contracts.canonical_encoding import canonical_content_hash
 from robot_motion.path_planning import JointConfigurationCheck
@@ -212,7 +213,7 @@ def horizontal_grasp(center_xy, *, approach_xy, object_top_z, surface_z, pitch_r
     return None
 
 
-def candidate_grasps(measured_top, *, surface_z, motion_side):
+def candidate_grasps(measured_top, *, surface_z, motion_side, preferred_family=None):
     """(label, family, yaw offset or None, approach, pregrasp, contact) in preference order."""
     yaw = float(measured_top.yaw_rad)
     reference_from_top = _yaw(yaw)
@@ -221,6 +222,8 @@ def candidate_grasps(measured_top, *, surface_z, motion_side):
     side_sign = -1. if motion_side == "left" else 1.
     out = []
     for label, family, offset, pad_shift in CANDIDATES:
+        if preferred_family is not None and family != preferred_family:
+            continue
         if family == "top_down":
             shift = np.eye(4)
             shift[0, 3] = pad_shift
@@ -258,8 +261,11 @@ class GraspApproachQueryRegistration:
 
 def build_grasp_approach_query_registration(*, segmentation, back_projection, roles,
                                             prompt_by_object_id, grasp_approach_contract,
-                                            grasp_approach_route):
+                                            grasp_approach_route, skill_version="1"):
     """Bind the query to the segmenter, ordered RGB-D roles and the grasp approach Route."""
+    if skill_version not in ("1", "2"):
+        raise ValueError("MuJoCo grasp query version must be 1 or 2.")
+    contract = skill if skill_version == "1" else skill_v2
     prompts = {str(key): str(value) for key, value in dict(prompt_by_object_id).items()}
     roles = tuple(roles)
     if not prompts or any(not key for key in prompts):
@@ -303,17 +309,18 @@ def build_grasp_approach_query_registration(*, segmentation, back_projection, ro
                        "surface_clearance_m": HORIZONTAL_SURFACE_CLEARANCE_M,
                        "minimum_pad_overlap_m": HORIZONTAL_MINIMUM_PAD_OVERLAP_M,
                        "backoff_m": [HORIZONTAL_PREGRASP_BACKOFF_M, HORIZONTAL_APPROACH_BACKOFF_M]},
-        "selection": "first_feasible_in_preference_order",
+        "selection": ("first_feasible_in_preference_order" if skill_version == "1"
+                      else "first_feasible_in_requested_family_or_auto_order"),
         "planning_time_budget_sec": PLANNING_TIME_BUDGET_SEC,
         "path_search_budget_sec": PATH_SEARCH_BUDGET_SEC,
         "object_measurement": "depth_only_top_plane_minimum_area_rectangle_surface_ring_v1",
         "planner": "mujoco_private_contact_and_closure_entry_planner_v1",
-    }, domain="agenticrobot.grasp_approach_query.profile.v1")
-    definition = skill.definition()
-    schema = skill.schema(definition_hash=definition.semantic_content_hash, profile_hash=profile_hash,
+    }, domain=f"agenticrobot.grasp_approach_query.profile.v{skill_version}")
+    definition = contract.definition()
+    schema = contract.schema(definition_hash=definition.semantic_content_hash, profile_hash=profile_hash,
                           prompt_by_object_id=prompts, reference_frame_id=frame)
     io_contract = inline_only_skill_io_contract(
-        skill_id=skill.SKILL_ID, skill_version="1",
+        skill_id=skill.SKILL_ID, skill_version=skill_version,
         skill_definition_hash=definition.semantic_content_hash,
         parameter_schema_hash=schema.parameter_schema_hash,
         execution_result_schema_hash=schema.execution_result_schema_hash,
@@ -321,9 +328,10 @@ def build_grasp_approach_query_registration(*, segmentation, back_projection, ro
     base_route = back_projection.skill.routes[0]
     if base_route.control_effect_class != "read_only" or base_route.may_move_robot:
         raise ValueError("Grasp queries require a read-only base Route.")
-    route = replace(base_route, skill_id=skill.SKILL_ID, skill_version="1",
+    suffix = "" if skill_version == "1" else "_v2"
+    route = replace(base_route, skill_id=skill.SKILL_ID, skill_version=skill_version,
         skill_definition_hash=definition.semantic_content_hash,
-        route_id=base_route.route_id + ".grasp_approach", route_version="1",
+        route_id=base_route.route_id + ".grasp_approach" + suffix, route_version=skill_version,
         parameter_schema_hash=schema.parameter_schema_hash,
         execution_result_schema_hash=schema.execution_result_schema_hash,
         task_evaluation_schema_hash=schema.task_evaluation_schema_hash,
@@ -332,26 +340,27 @@ def build_grasp_approach_query_registration(*, segmentation, back_projection, ro
         max_operation_duration_ms=GRASP_APPROACH_MAX_OPERATION_MS)
     base_binding = back_projection.binding.to_ref()
     binding = replace(base_binding,
-        deployment_binding_id="grasp-approach:" + base_binding.deployment_binding_id,
+        deployment_binding_id=("grasp-approach:" if skill_version == "1" else "grasp-approach-v2:")
+                              + base_binding.deployment_binding_id,
         deployment_binding_hash=canonical_content_hash(
             {"base": base_binding.deployment_binding_hash, "route": route.semantic_content_hash},
-            domain="agenticrobot.grasp_approach_query.binding.v1"))
+            domain=f"agenticrobot.grasp_approach_query.binding.v{skill_version}"))
     objects = tuple(sorted(prompts))
 
     def validate_parameters(value):
-        skill.validate_parameters(value, object_ids=objects, reference_frame_id=frame)
+        contract.validate_parameters(value, object_ids=objects, reference_frame_id=frame)
 
     def validate_result(value):
-        skill.validate_result(value, object_ids=objects, reference_frame_id=frame)
+        contract.validate_result(value, object_ids=objects, reference_frame_id=frame)
 
     def validate_result_for_parameters(parameters, result):
         validate_parameters(parameters)
         validate_result(result)
-        skill.validate_result_for_parameters(parameters, result)
+        contract.validate_result_for_parameters(parameters, result)
 
     validator = AgentSkillPayloadValidatorSet(
         validator_id="grasp-approach:" + profile_hash, skill_id=skill.SKILL_ID,
-        skill_version="1", route_id=route.route_id, route_version="1",
+        skill_version=skill_version, route_id=route.route_id, route_version=skill_version,
         parameter_schema_hash=schema.parameter_schema_hash,
         execution_result_schema_hash=schema.execution_result_schema_hash,
         task_evaluation_schema_hash=schema.task_evaluation_schema_hash,
@@ -362,7 +371,7 @@ def build_grasp_approach_query_registration(*, segmentation, back_projection, ro
         availability_hash=canonical_content_hash({
             "route": route.semantic_content_hash, "profile": profile_hash,
             "status": "configured_requires_open_gripper_live_rgbd_text_segmentation_and_planner"},
-            domain="agenticrobot.grasp_approach_query.availability.v1"))
+            domain=f"agenticrobot.grasp_approach_query.availability.v{skill_version}"))
     return GraspApproachQueryRegistration(
         SkillRegistrationTemplate(definition, schema, io_contract, (route,)), entry, validator,
         profile_hash, roles, prompts, frame)
@@ -384,6 +393,8 @@ def _rejected(*, parameters, revision, frame, reason, measured=None, views=(),
 class MujocoGraspApproachQuery:
     """Measured grasps, private contact planning and pre-contact closure checks."""
 
+    _skill = skill
+
     def __init__(self, *, registration: GraspApproachQueryRegistration, application,
                  observer, gripper_name: str, segmentation_provider, capture_port, motion_profile,
                  prepare_projection, maximum_depth_m: float,
@@ -395,6 +406,7 @@ class MujocoGraspApproachQuery:
         if not callable(prepare_projection) or not callable(clock):
             raise TypeError("Grasp query needs the approach envelope projector and the Gateway clock.")
         self.registration = registration
+        self._skill = (skill if registration.skill.definition.skill_version == "1" else skill_v2)
         self.application = application
         self.observer = observer
         self.gripper_name = gripper_name
@@ -412,8 +424,12 @@ class MujocoGraspApproachQuery:
         if not self._lock.acquire(blocking=False):
             raise RuntimeError("Grasp approach query is already running.")
         try:
-            return self._query(parameters, revision=expected_station_revision,
-                               cancel_requested=cancel_requested, deadline=deadline)
+            result, evidence = self._query(parameters, revision=expected_station_revision,
+                                           cancel_requested=cancel_requested, deadline=deadline)
+            if self._skill is skill_v2:
+                result["semantics"] = skill_v2.SEMANTICS
+                result["preferred_family"] = parameters.get("preferred_family")
+            return result, evidence
         finally:
             self._lock.release()
 
@@ -479,7 +495,11 @@ class MujocoGraspApproachQuery:
                     "support_z_m": float(surface if surface is not None
                                          else top.top_z_m - max(top.extent_xy_m))}
         common.update(measured=measured, views=views)
-        candidates = candidate_grasps(top, surface_z=surface, motion_side=self.application.motion_side)
+        preferred_family = parameters.get("preferred_family") if self._skill is skill_v2 else None
+        candidates = candidate_grasps(top, surface_z=surface, motion_side=self.application.motion_side,
+                                      preferred_family=preferred_family)
+        if preferred_family is not None and not candidates:
+            return _rejected(reason="preferred_family_unavailable", **common), tuple(evidence)
         began = time.monotonic()
         rejections = []
         for index, (label, family, offset, approach, pregrasp, contact) in enumerate(candidates):
@@ -780,7 +800,7 @@ def build_grasp_approach_query_executor(*, registration, query_port, current_sta
 
     executor = PassiveReadSkillExecutor(
         port_id="agent-gateway:" + registration.entry.deployment_binding.deployment_binding_id,
-        executor_id="passive.grasp-approach.v1", read=read,
+        executor_id="passive.grasp-approach.v" + registration.skill.definition.skill_version, read=read,
         current_station_revision=current_station_revision, clock=clock,
         max_retained_operations=max_retained_operations)
     return executor

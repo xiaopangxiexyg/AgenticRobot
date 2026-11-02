@@ -132,7 +132,7 @@ from .motion_primitive_profiles import (
     MUJOCO_AGENT_TCP_CARDINAL_STEP_EXECUTOR_ID_V1,
     MUJOCO_AGENT_TCP_CARDINAL_STEP_PARAMETER_PROFILE_ID_V1,
     MUJOCO_AGENT_TCP_CARDINAL_STEP_ROUTE_ID_V1,
-    MUJOCO_AGENT_TCP_FIXED_CARDINAL_STEP_DIRECTION_BY_SKILL_ID_V1,
+    MUJOCO_AGENT_TCP_FIXED_CARDINAL_STEP_DIRECTION_BY_SKILL_ID_V1 as MUJOCO_AGENT_TCP_FIXED_CARDINAL_STEP_DIRECTION_BY_SKILL_ID_V1,
     MUJOCO_AGENT_TCP_FIXED_CARDINAL_STEP_EXECUTOR_ID_BY_SKILL_ID_V1,
     MUJOCO_AGENT_TCP_FIXED_CARDINAL_STEP_ROUTE_ID_BY_SKILL_ID_V1,
     MUJOCO_AGENT_TCP_FIXED_ORIENTATION_EXECUTOR_ID_BY_SKILL_ID_V1,
@@ -836,9 +836,9 @@ class MujocoAgentTcpPoseContractBundle:
     candidate_query_registrations: tuple[SpatialGoalRegistration, ...] = ()
     # Shared tool-entity relations/hover Skills (agent_gateway.profiles.tool_entity).
     tool_entity_registrations: tuple[Any, ...] = ()
-    # perception.query_support_release_pose@1 (mujoco/support_release_query.py).
+    # Selected perception.query_support_release_pose@1/@3 (mujoco/support_release_query.py).
     support_release_query_registration: Any | None = None
-    # perception.query_grasp_approach@1 (mujoco/grasp_approach_query.py).
+    # Selected perception.query_grasp_approach@1/@2 (mujoco/grasp_approach_query.py).
     grasp_approach_query_registration: Any | None = None
 
     def __post_init__(self) -> None:
@@ -869,12 +869,14 @@ class MujocoAgentTcpPoseContractBundle:
                 raise ValueError("Unknown tool-entity registration.")
         grasp_query = self.grasp_approach_query_registration
         if grasp_query is not None and (
-                self.route_manifest.route("perception.query_grasp_approach", "1") != grasp_query.entry
+                self.route_manifest.route("perception.query_grasp_approach",
+                    grasp_query.skill.definition.skill_version) != grasp_query.entry
                 or self.grasp_approach_contract is None):
             raise ValueError("Grasp approach query registration differs from its manifest entry.")
         release_query = self.support_release_query_registration
         if release_query is not None:
-            if self.route_manifest.route("perception.query_support_release_pose", "1") != release_query.entry:
+            if self.route_manifest.route("perception.query_support_release_pose",
+                    release_query.skill.definition.skill_version) != release_query.entry:
                 raise ValueError("Support release query registration differs from its manifest entry.")
             if (self.object_motion_contract is None
                     or not set(release_query.support_object_ids) <= set(self.object_support_body_names)):
@@ -2105,9 +2107,11 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
     enable_support_release_queries: bool = False,
     support_release_prompt_by_id: Mapping[str, str] | None = None,
     support_release_roles: tuple[str, ...] | None = None,
+    support_release_query_version: str = "1",
     enable_grasp_approach_queries: bool = False,
     grasp_query_prompt_by_id: Mapping[str, str] | None = None,
     grasp_query_roles: tuple[str, ...] | None = None,
+    grasp_approach_query_version: str = "1",
     tool_hover_region_budget_sec: float | None = None,
     tool_hover_candidate_budget_sec: float | None = None,
 ) -> MujocoAgentTcpPoseContractBundle:
@@ -3241,7 +3245,7 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
         support_release_query_registration = build_support_release_query_registration(
             segmentation=segmentation, back_projection=depth_capture.back_projection, roles=roles,
             prompt_by_support_id=prompts, object_motion_contract=object_entry[3],
-            object_motion_route=object_entry[2])
+            object_motion_route=object_entry[2], skill_version=support_release_query_version)
     elif support_release_prompt_by_id or support_release_roles is not None:
         raise ValueError("Support release prompts and role require enable_support_release_queries.")
     grasp_approach_query_registration = None
@@ -3262,7 +3266,8 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
             roles=(tuple(grasp_query_roles) if grasp_query_roles is not None
                    else tuple(depth_capture.back_projection.profile.roles)),
             prompt_by_object_id=grasp_query_prompt_by_id,
-            grasp_approach_contract=approach_entry[3], grasp_approach_route=approach_entry[2])
+            grasp_approach_contract=approach_entry[3], grasp_approach_route=approach_entry[2],
+            skill_version=grasp_approach_query_version)
     elif grasp_query_prompt_by_id or grasp_query_roles is not None:
         raise ValueError("Grasp query prompts and roles require enable_grasp_approach_queries.")
     tcp_pose_comparison_registration = None

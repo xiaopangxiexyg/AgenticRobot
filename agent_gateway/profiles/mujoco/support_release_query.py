@@ -1,4 +1,4 @@
-"""MuJoCo registration and port for ``perception.query_support_release_pose@1``.
+"""MuJoCo registration and port for ``perception.query_support_release_pose@1/@3``.
 
 One read-only request, with the motion application HOLD and no active
 operation:
@@ -61,11 +61,13 @@ from agent_gateway.runtime.passive_read_executor import (
 )
 from agent_gateway.runtime.payload_validation import AgentSkillPayloadValidatorSet
 from agent_gateway.skills.perception import support_release_query as skill
+from agent_gateway.skills.perception import support_release_query_v3 as skill_v3
 from agent_gateway.skills.perception.schemas import validate_no_task_evaluation_v1
 from dataset_contracts.canonical_encoding import canonical_content_hash
 from robot_motion.object_transport import (
     MAXIMUM_RELEASE_LEAN_RAD,
     NoReleaseCandidates,
+    _support_tilt_rad,
     plan_release_approach_candidates,
 )
 from robot_motion.path_planning import JointConfigurationCheck
@@ -115,8 +117,11 @@ class SupportReleaseQueryRegistration:
 
 def build_support_release_query_registration(*, segmentation, back_projection, roles,
                                              prompt_by_support_id, object_motion_contract,
-                                             object_motion_route):
+                                             object_motion_route, skill_version="1"):
     """Bind the query to the segmenter, ordered aligned RGB-D roles and the carry Route."""
+    contract = {"1": skill, "3": skill_v3}.get(skill_version)
+    if contract is None:
+        raise ValueError("MuJoCo support release queries support skill versions 1 and 3.")
     if not (0. < RELEASE_LEAN_RAD <= MAXIMUM_RELEASE_LEAN_RAD
             and MAXIMUM_RELEASE_LEAN_RAD == skill.MAX_RELEASE_LEAN_RAD):
         # The planner's lean limit and the result schema's bound must agree.
@@ -172,12 +177,12 @@ def build_support_release_query_registration(*, segmentation, back_projection, r
         "support_regions": {"maximum": MAXIMUM_SUPPORT_REGIONS, "order": "largest_first",
                             "maximum_overlap_fraction": .75},
         "planner": "mujoco_private_payload_candidate_planner_v1",
-    }, domain="agenticrobot.support_release_query.profile.v1")
-    definition = skill.definition()
-    schema = skill.schema(definition_hash=definition.semantic_content_hash, profile_hash=profile_hash,
+    }, domain="agenticrobot.support_release_query.profile.v" + skill_version)
+    definition = contract.definition()
+    schema = contract.schema(definition_hash=definition.semantic_content_hash, profile_hash=profile_hash,
                           support_object_ids=supports, reference_frame_id=frame)
     io_contract = inline_only_skill_io_contract(
-        skill_id=skill.SKILL_ID, skill_version="1",
+        skill_id=contract.SKILL_ID, skill_version=skill_version,
         skill_definition_hash=definition.semantic_content_hash,
         parameter_schema_hash=schema.parameter_schema_hash,
         execution_result_schema_hash=schema.execution_result_schema_hash,
@@ -185,9 +190,10 @@ def build_support_release_query_registration(*, segmentation, back_projection, r
     base_route = back_projection.skill.routes[0]
     if base_route.control_effect_class != "read_only" or base_route.may_move_robot:
         raise ValueError("Release queries require a read-only base Route.")
-    route = replace(base_route, skill_id=skill.SKILL_ID, skill_version="1",
+    route = replace(base_route, skill_id=contract.SKILL_ID, skill_version=skill_version,
         skill_definition_hash=definition.semantic_content_hash,
-        route_id=base_route.route_id + ".support_release_pose", route_version="1",
+        route_id=base_route.route_id + ".support_release_pose" + ("_v3" if skill_version == "3" else ""),
+        route_version=skill_version,
         parameter_schema_hash=schema.parameter_schema_hash,
         execution_result_schema_hash=schema.execution_result_schema_hash,
         task_evaluation_schema_hash=schema.task_evaluation_schema_hash,
@@ -196,25 +202,26 @@ def build_support_release_query_registration(*, segmentation, back_projection, r
         max_operation_duration_ms=SUPPORT_RELEASE_MAX_OPERATION_MS)
     base_binding = back_projection.binding.to_ref()
     binding = replace(base_binding,
-        deployment_binding_id="support-release-pose:" + base_binding.deployment_binding_id,
+        deployment_binding_id=("support-release-pose-v3:" if skill_version == "3"
+                               else "support-release-pose:") + base_binding.deployment_binding_id,
         deployment_binding_hash=canonical_content_hash(
             {"base": base_binding.deployment_binding_hash, "route": route.semantic_content_hash},
-            domain="agenticrobot.support_release_query.binding.v1"))
+            domain="agenticrobot.support_release_query.binding.v" + skill_version))
 
     def validate_parameters(value):
-        skill.validate_parameters(value, support_object_ids=supports, reference_frame_id=frame)
+        contract.validate_parameters(value, support_object_ids=supports, reference_frame_id=frame)
 
     def validate_result(value):
-        skill.validate_result(value, support_object_ids=supports, reference_frame_id=frame)
+        contract.validate_result(value, support_object_ids=supports, reference_frame_id=frame)
 
     def validate_result_for_parameters(parameters, result):
         validate_parameters(parameters)
         validate_result(result)
-        skill.validate_result_for_parameters(parameters, result)
+        contract.validate_result_for_parameters(parameters, result)
 
     validator = AgentSkillPayloadValidatorSet(
-        validator_id="support-release-pose:" + profile_hash, skill_id=skill.SKILL_ID,
-        skill_version="1", route_id=route.route_id, route_version="1",
+        validator_id="support-release-pose:" + profile_hash, skill_id=contract.SKILL_ID,
+        skill_version=skill_version, route_id=route.route_id, route_version=skill_version,
         parameter_schema_hash=schema.parameter_schema_hash,
         execution_result_schema_hash=schema.execution_result_schema_hash,
         task_evaluation_schema_hash=schema.task_evaluation_schema_hash,
@@ -225,7 +232,7 @@ def build_support_release_query_registration(*, segmentation, back_projection, r
         availability_hash=canonical_content_hash({
             "route": route.semantic_content_hash, "profile": profile_hash,
             "status": "configured_requires_held_object_live_rgbd_text_segmentation_and_payload_planner"},
-            domain="agenticrobot.support_release_query.availability.v1"))
+            domain="agenticrobot.support_release_query.availability.v" + skill_version))
     return SupportReleaseQueryRegistration(
         SkillRegistrationTemplate(definition, schema, io_contract, (route,)), entry, validator,
         profile_hash, roles, prompts, supports, frame)
@@ -251,12 +258,12 @@ def _rejection_list(limited, counts):
 
 def _rejected(*, parameters, revision, frame, reason, held_pose=None, segmentation=None,
               measured=None, candidate_count=0, attempted=0, planning_wall_sec=0., views=(),
-              rejections=()):
+              rejections=(), contract=skill):
     return {
-        "semantics": skill.SEMANTICS, "status": "no_release_pose", "reason": reason,
+        "semantics": contract.SEMANTICS, "status": "no_release_pose", "reason": reason,
         "support_object_id": parameters["support_object_id"], "reference_frame_id": frame,
         "station_revision": revision, "release_object_pose_xyz_quat_xyzw": None,
-        "release_clearance_m": skill.requested_clearance_m(parameters),
+        "release_clearance_m": contract.requested_clearance_m(parameters),
         "held_object_pose_xyz_quat_xyzw": held_pose, "yaw_change_rad": None,
         "support_top_z_m": None if measured is None else measured["top_z_m"],
         "support_region_min_xy_m": None if measured is None else measured["region_min_xy_m"],
@@ -266,11 +273,26 @@ def _rejected(*, parameters, revision, frame, reason, held_pose=None, segmentati
         "candidate_count": candidate_count, "attempted_candidate_count": attempted,
         "selected_candidate_index": None, "path_planning_wall_sec": float(planning_wall_sec),
         "candidate_rejections": list(rejections), "release_lean_rad": None,
-        "views": list(views), "motion_executed": False, "execution_authorized": False}
+        "views": list(views), "motion_executed": False, "execution_authorized": False,
+        **({key: None for key in skill_v3.ANGLE_KEYS} if contract is skill_v3 else {})}
+
+
+def _support_measurement(region):
+    return {
+        "top_z_m": region.top_z_m, "region_min_xy_m": list(region.region_min_xy_m),
+        "region_max_xy_m": list(region.region_max_xy_m),
+        "evidence": {"top_point_count": int(region.plane.top_point_count),
+                     "plane_residual_m": float(region.plane.maximum_plane_residual_m),
+                     "plane_tilt_deg": float(region.tilt_deg),
+                     "footprint_sample_count": int(region.coverage.sample_count),
+                     "observed_region_min_xy_m": list(region.observed_min_xy_m),
+                     "observed_region_max_xy_m": list(region.observed_max_xy_m)}}
 
 
 class MujocoSupportReleaseQuery:
     """Measured support, verified held box and private payload planning in one read."""
+
+    _skill = skill
 
     def __init__(self, *, registration: SupportReleaseQueryRegistration, application, observer,
                  segmentation_provider, capture_port, motion_profile, prepare_projection,
@@ -286,6 +308,7 @@ class MujocoSupportReleaseQuery:
             raise TypeError("Release query needs the carry envelope projector and the Gateway clock.")
         self.clock = clock
         self.registration = registration
+        self._skill = {"1": skill, "3": skill_v3}[registration.skill.definition.skill_version]
         self.application = application
         self.observer = observer
         self.segmentation_provider = segmentation_provider
@@ -327,8 +350,8 @@ class MujocoSupportReleaseQuery:
         registration = self.registration
         frame = registration.reference_frame_id
         support_id = parameters["support_object_id"]
-        clearance = skill.requested_clearance_m(parameters)
-        common = dict(parameters=parameters, revision=revision, frame=frame)
+        clearance = self._skill.requested_clearance_m(parameters)
+        common = dict(parameters=parameters, revision=revision, frame=frame, contract=self._skill)
         if not self._held_verified_without_observing():
             return _rejected(reason="held_object_not_verified_lifted", **common), (
                 "support-release-precondition:held-not-verified",)
@@ -379,15 +402,7 @@ class MujocoSupportReleaseQuery:
         _area, role, paired, mask, tops, segmentation, mask_hash = best
         top = tops[0]
         result = {"mask_media_content_hash": mask_hash}
-        measured = {
-            "top_z_m": top.top_z_m, "region_min_xy_m": list(top.region_min_xy_m),
-            "region_max_xy_m": list(top.region_max_xy_m),
-            "evidence": {"top_point_count": int(top.plane.top_point_count),
-                         "plane_residual_m": float(top.plane.maximum_plane_residual_m),
-                         "plane_tilt_deg": float(top.tilt_deg),
-                         "footprint_sample_count": int(top.coverage.sample_count),
-                         "observed_region_min_xy_m": list(top.observed_min_xy_m),
-                         "observed_region_max_xy_m": list(top.observed_max_xy_m)}}
+        measured = _support_measurement(top)
         common["views"] = views
         if cancel_requested():
             raise InterruptedError("Support release query cancelled.")
@@ -434,7 +449,7 @@ class MujocoSupportReleaseQuery:
                 try:
                     candidates = plan_release_approach_candidates(
                         held, support, now=now, clearance_m=clearance,
-                        minimum_planning_clearance_m=skill.MIN_CLEARANCE_M,
+                        minimum_planning_clearance_m=self._skill.MIN_CLEARANCE_M,
                         maximum_clearance_m=MAXIMUM_RELEASE_CLEARANCE_M,
                         lateral_margin_m=RELEASE_LATERAL_MARGIN_M, include_nearest_to_held=True,
                         **orientation)
@@ -477,8 +492,21 @@ class MujocoSupportReleaseQuery:
                     "candidate_index": index, "release_pose": release,
                     "diagnostics_count": len(selection.diagnostics)},
                     domain="agenticrobot.support_release_query.plan.v1"))
+                selected_measurement = measured["evidence"]
+                angles = {}
+                if self._skill is skill_v3:
+                    selected_measurement = _support_measurement(region)["evidence"]
+                    normal = np.asarray(support.normal_reference_xyz, dtype=float)
+                    angles = {
+                        "support_tilt_deg": float(region.tilt_deg),
+                        "held_tilt_from_support_normal_rad": _support_tilt_rad(
+                            held, held.reference_from_object[:3, :3], normal),
+                        "release_tilt_from_support_normal_rad": _support_tilt_rad(
+                            held, chosen.proposal.object_goal[:3, :3], normal),
+                        "release_leveling_rad": float(chosen.leveling_rad),
+                    }
                 return {
-                    "semantics": skill.SEMANTICS, "status": "release_pose_found",
+                    "semantics": self._skill.SEMANTICS, "status": "release_pose_found",
                     "reason": "collision_free_release_path_found", "support_object_id": support_id,
                     "reference_frame_id": frame, "station_revision": revision,
                     "release_object_pose_xyz_quat_xyzw": release, "release_clearance_m": clearance,
@@ -488,14 +516,14 @@ class MujocoSupportReleaseQuery:
                     "support_top_z_m": float(region.top_z_m),
                     "support_region_min_xy_m": list(region.region_min_xy_m),
                     "support_region_max_xy_m": list(region.region_max_xy_m),
-                    "segmentation": segmentation, "measured_support": measured["evidence"],
+                    "segmentation": segmentation, "measured_support": selected_measurement,
                     "candidate_count": offset + len(candidates),
                     "attempted_candidate_count": offset + len(candidates),
                     "selected_candidate_index": index,
                     "path_planning_wall_sec": float(time.monotonic() - began),
                     "candidate_rejections": _rejection_list(limited, counts),
                     "views": views,
-                    "motion_executed": False, "execution_authorized": False}, tuple(evidence)
+                    "motion_executed": False, "execution_authorized": False, **angles}, tuple(evidence)
             if out_of_time:
                 break
         if not fitted and not out_of_time:
@@ -627,7 +655,7 @@ def build_support_release_query_executor(*, registration, query_port, current_st
 
     executor = PassiveReadSkillExecutor(
         port_id="agent-gateway:" + registration.entry.deployment_binding.deployment_binding_id,
-        executor_id="passive.support-release-pose.v1", read=read,
+        executor_id="passive.support-release-pose.v" + registration.skill.definition.skill_version, read=read,
         current_station_revision=current_station_revision, clock=clock,
         max_retained_operations=max_retained_operations)
     return executor

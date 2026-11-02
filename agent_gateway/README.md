@@ -1928,6 +1928,29 @@ its Active final pre-IK TCP envelope. Ordinary RealTeleop invocations do not
 advertise or start the Gateway, and the repository's offline tests are not
 real-hardware validation.
 
+### 可选抓取与释放查询版本（MuJoCo）
+
+Python 装配 `build_mujoco_agent_tcp_pose_gateway_session` 和对应 contract bundle
+在已有 query 开关与感知资源启用后，支持显式选择单个查询版本：
+
+- `grasp_approach_query_version="2"` 发布 `perception.query_grasp_approach@2`。
+  可选参数 `preferred_family=top_down|side|front` 将搜索限制在该抓取族，保留族内
+  原候选顺序；省略时使用原自动顺序。指定族不产生候选时返回
+  `preferred_family_unavailable`，候选全被拒绝时返回对应拒绝信息，不跨族回退。
+  `candidate_count` 与候选编号针对本次实际搜索的列表。
+- `support_release_query_version="3"` 发布 `perception.query_support_release_pose@3`。
+  沿用 carry 到返回位姿、再具名开爪的流程。成功结果增加 `support_tilt_deg`、
+  `held_tilt_from_support_normal_rad`、`release_tilt_from_support_normal_rad` 和
+  `release_leveling_rad`；角度和 `measured_support` 对应最终选中的支撑区域，持物
+  倾角使用同一次持物观测。未选中释放位姿时四个新角度为 null。
+
+两个选择参数默认均为 `"1"`，旧合同与身份保持。MuJoCo 释放查询不占用 RealMan
+已有的 `@2` 两段搬运/放置合同。每个部署只装配选定版本的一套注册和执行器；
+RPent 的仿真附件审核 grasp `@1/@2`、优先 `@2`，release `@1/@3`、优先 `@3`，
+只有旧版本的部署仍可附着；真机 release 继续仅使用 `@2`。
+查询均只读，不授权执行；闭合、起吊与放置仍经过原下层检查，角度提案不能代替
+开爪之后的新鲜稳定释放证据。
+
 ### Real Skill target-frame invariant
 
 The real Skill API is TCP-based, but the RM65 coupled solver is endpoint-frame
