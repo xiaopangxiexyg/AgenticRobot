@@ -13,7 +13,14 @@ operation:
 4. keep the first whose approach pose is reachable from the current arm state
    and whose pregrasp is reachable from that approach configuration, both
    with a private planner bound to the grasp approach Route's profile and
-   envelope. Every refused candidate is reported with its reason.
+   envelope;
+5. plan the contact pose with the terminal-contact exemption, then on a private
+   cut at that arm configuration step the gripper through grasp apertures and
+   refuse the candidate when no gripped aperture keeps the planner's ordinary
+   clearance to non-target geometry (sensor/object pairs keep the
+   terminal-contact penetration bound). This is the lift-start admission the
+   open-hand approach/pregrasp stages do not see.
+   Every refused candidate is reported with its reason.
 
 Nothing is commanded, retained as a plan or authorized for execution.
 """
@@ -44,7 +51,12 @@ from agent_gateway.skills.perception.schemas import validate_no_task_evaluation_
 from dataset_contracts.canonical_encoding import canonical_content_hash
 from robot_motion.path_planning import JointConfigurationCheck
 from robot_motion.relative_action import xyzquat_to_pose_matrix
-from sim.mujoco.deploy.planned_tcp_motion import MujocoPlannedTcpMotion, MujocoTcpPlanRejected
+from sim.mujoco.deploy.grasp_contact import MujocoGraspContactBinding
+from sim.mujoco.deploy.planned_tcp_motion import (
+    MujocoJointSceneOracle,
+    MujocoPlannedTcpMotion,
+    MujocoTcpPlanRejected,
+)
 from sim.mujoco.transforms import pose_to_xyz_quat_xyzw
 
 GRASP_APPROACH_MAX_OPERATION_MS = 90_000
@@ -498,6 +510,19 @@ class MujocoGraspApproachQuery:
                     reason = "near_arm_singularity"
                 if reason is not None:
                     reason = "pregrasp_" + reason
+                else:
+                    # Contact uses the terminal-contact exemption; approach/pregrasp
+                    # do not. Plan it privately, then admit a gripped finger aperture
+                    # against non-target clearance (the lift-start gate).
+                    reason, contact_q = self._plan_contact_stage(
+                        contact, start_q=pregrasp_q, object_id=parameters["object_id"],
+                        cancel_requested=cancel_requested, deadline=deadline)
+                    if reason is not None:
+                        reason = "contact_" + reason
+                    elif self._closed_lift_start_blocked(
+                            contact_q, object_id=parameters["object_id"],
+                            cancel_requested=cancel_requested):
+                        reason = "closed_lift_start_blocked"
             else:
                 reason = "approach_" + reason
             if reason is not None:
@@ -589,6 +614,125 @@ class MujocoGraspApproachQuery:
             return float(np.linalg.svd(jacobian, compute_uv=False)[-1])
 
         return app.runtime.rig.capture_scene(compute)
+
+    def _contact_binding(self, object_id):
+        if self.observer is None:
+            raise RuntimeError("Contact / lift-start checks require the grasped-object observer.")
+        sensors = tuple(self.observer.sensor_geom_names)
+
+        def compute(live):
+            hard = float(live.collision_projector().policy.hard_penetration_m)
+            binding = MujocoGraspContactBinding(
+                object_id, sensors, max_penetration_m=hard)
+            binding.pair_clearances(live)
+            return binding
+
+        return self.application.runtime.rig.capture_scene(compute)
+
+    def _plan_contact_stage(self, pose, *, start_q, object_id, cancel_requested, deadline):
+        """(None, final arm q) for the contact pose with terminal-contact exemption."""
+        app = self.application
+        scene = app.scene
+        source = app.runtime.rig.capture_scene(lambda live: live.data.qpos.copy())
+        names = scene.arm_specs[app.motion_side].joint_names
+        if len(names) != len(start_q):
+            raise ValueError("Stage configuration differs from the motion-side arm.")
+        for name, value in zip(names, start_q):
+            source[scene.joint_qpos_addr(name)] = value
+        binding = self._contact_binding(object_id)
+        planner = self._planner(source_model_qpos=source)
+        try:
+            profile = self.motion_profile
+            constraint, identity = self._constraint(planner)
+            budget = min(PLANNING_TIME_BUDGET_SEC, max(1., float(deadline) - float(self.clock())))
+            goal = self._goals((pose,))[0]
+            plan = planner.plan(
+                goal,
+                translation_tolerance_m=profile.translation_tolerance_m,
+                rotation_tolerance_rad=profile.rotation_tolerance_rad,
+                normalize_ik_objective=profile.normalize_ik_objective,
+                cancel_requested=lambda: cancel_requested() or float(self.clock()) >= deadline,
+                configuration_constraint=constraint, constraint_identity=identity,
+                contact_binding=binding,
+                deadline_monotonic=float(self.clock()) + budget,
+                path_search_time_budget_sec=min(PATH_SEARCH_BUDGET_SEC, budget),
+            )
+            return None, np.asarray(plan.trajectory.q_rad[-1], dtype=float)
+        except MujocoTcpPlanRejected as error:
+            if cancel_requested():
+                raise InterruptedError("Grasp approach query cancelled.") from None
+            return error.reason_code, None
+        finally:
+            planner.clear()
+
+    def _closed_lift_start_blocked(self, arm_q, *, object_id, cancel_requested) -> bool:
+        """True when closing at the contact arm pose loses clearance to a neighbour.
+
+        Private cut only: contact arm joints, gripper stepped through grasp
+        apertures (not kinematic close=1.0, which collapses the pads through the
+        object and self-collides). Sensor/object pairs keep the terminal-contact
+        penetration bound; every other pair keeps the planner clearance.
+
+        The oracle reports only the closest failing pair. Once pads dig past the
+        contact bound into the target, a nearby board is masked, so the sweep
+        must walk open→closed and treat any non-target / non-self refusal as a
+        block. Target over-penetration and finger self-collision are skipped:
+        a real close settles inside the contact bound with a payload binding, and
+        are not lift-start neighbour faults. A fully safe open hand is not an
+        early admit — later closes are still checked.
+        """
+        if cancel_requested():
+            raise InterruptedError("Grasp approach query cancelled.")
+        app = self.application
+        side = app.motion_side
+        gripper_name = self.gripper_name
+        binding = self._contact_binding(object_id)
+        padding = float(app.target.planned_tcp_motion.planning_clearance_padding_m)
+        # 0.30..0.90: catches the side-board refusal (~0.35) before target
+        # over-penetration becomes the closest pair.
+        grasp_closes = tuple(round(0.30 + 0.05 * i, 2) for i in range(13))
+
+        def compute(live):
+            model_qpos = live.data.qpos.copy()
+            names = live.arm_specs[side].joint_names
+            if len(names) != len(arm_q):
+                raise ValueError("Stage configuration differs from the motion-side arm.")
+            for name, value in zip(names, arm_q):
+                model_qpos[live.joint_qpos_addr(name)] = float(value)
+            spec = live.gripper_specs[gripper_name]
+            for close in grasp_closes:
+                if cancel_requested():
+                    raise InterruptedError("Grasp approach query cancelled.")
+                cut = model_qpos.copy()
+                for joint_name, value in zip(spec.joint_names, spec.qpos_from_close(close)):
+                    cut[live.joint_qpos_addr(joint_name)] = float(value)
+                oracle = MujocoJointSceneOracle(
+                    live, cut,
+                    clearance_padding_m=padding,
+                    contact_binding=binding,
+                    cancel_requested=cancel_requested,
+                )
+                start = {
+                    arm: np.asarray(
+                        [cut[live.joint_qpos_addr(name)]
+                         for name in live.arm_specs[arm].joint_names],
+                        dtype=float,
+                    )
+                    for arm in ("left", "right")
+                }
+                answer = oracle.check(start)
+                if answer.safe:
+                    continue
+                meta = answer.metadata or {}
+                bodies = {meta.get("body1"), meta.get("body2")}
+                if object_id in bodies and meta.get("pair_class") == "4:8":
+                    continue
+                if meta.get("pair_class") == "4:4":
+                    continue
+                return True
+            return False
+
+        return bool(app.runtime.rig.capture_scene(compute))
 
     def _plan_stage(self, pose, *, start_q, cancel_requested, deadline):
         """(None, final arm q) when a path to pose exists from start_q (None: the live state)."""
