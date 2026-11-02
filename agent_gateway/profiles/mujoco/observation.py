@@ -18,6 +18,7 @@ from agent_gateway.protocol.contracts import AgentObservationSnapshot
 from agent_gateway.protocol.state_schemas import (
     validate_agent_state_result_v1,
 )
+from agent_gateway.runtime.passive_read_executor import PassiveReadError
 from agent_gateway.runtime.service import (
     AgentGatewayObservationOutcome,
     AgentGatewayService,
@@ -687,6 +688,17 @@ class MujocoAgentObservationProducer:
         observation_cut = capture.observation_cut
         measurement = capture.measurement
         if observation_cut is None or measurement is None:
+            if capture.snapshot.lifecycle_state == "closed":
+                raise PassiveReadError(
+                    "Passive TCP pose source is closed.",
+                    reason_code="passive_tcp_pose_source_closed",
+                    diagnostic={
+                        "lifecycle_state": capture.snapshot.lifecycle_state,
+                        "measurement_valid": capture.snapshot.measurement_valid,
+                        "runtime_session_id": capture.snapshot.runtime_session_id,
+                        "station_revision": capture.snapshot.station_revision,
+                    },
+                )
             raise RuntimeError(
                 "A typed passive TCP pose measurement cut is unavailable."
             )
