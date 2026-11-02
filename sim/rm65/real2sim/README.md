@@ -92,6 +92,16 @@ core and MuJoCo adapter used for the 20260721 fit; tests compare those hashes to
 fixed historical values rather than silently reinterpreting the fit against
 the current files.
 
+Gateway 参数 identity 拒绝诊断使用独立绑定
+`artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261103_parameter_feedback_v1.json`，固定源码 `5ee11a896bfaac4a8653eff2f07e5c0c24d26346`（development `99ccb870` 与反馈修复 `0c58a171` 的合并）。
+它继承 closure-entry 绑定的全部非运行时引用；已有 201 项输入仅 `motion_deployment.py` 改变，
+新增 `runtime/payload_validation.py` 与 `runtime/service.py` 两个诊断路径输入，共 203 项；该集合不声称覆盖传递依赖闭包。
+identity 精确比较仍在 operation admission 前拒绝，公开错误只增加固定字段派生的 reason code；
+命令、HOLD、安全限值、wire schema 与重试授权不变。
+当前源码的既有 Gateway service/TCP/safe-TCP 检查为 215 passed、1 skipped；JUnit 与源码绑定 receipt 按哈希保留在任务证据 `runif-20261103-013657/`。
+旧 Agent、斜板和闭合报告保留原来源，不作为该合并版本的新通过证据；完整 core 门禁及后续模型实验另行记录。
+绑定仍为 `provisional`，没有 refit、新硬件执行或 held-out 资格，历史清单原字节不变。
+
 MuJoCo 抓取查询的预接触闭合障碍检查使用独立绑定
 `artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261103_mujoco_closure_entry_v1.json`。
 它固定源码 `7da5e97728f055f5d0a9de0a55eb1b169a58a3dd`，基线为 development
