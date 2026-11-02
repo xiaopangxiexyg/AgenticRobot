@@ -92,6 +92,8 @@ RELEASE_LATERAL_MARGIN_M = 0.003
 # MAXIMUM_RELEASE_LEAN_RAD from the support normal.
 RELEASE_LEAN_RAD = math.radians(6.)
 RELEASE_LEAN_YAW_OFFSETS_RAD = (0.,)
+# Version 3 also levels a box that leans in the hand above a flat support.
+HELD_TILT_LEVELING_THRESHOLD_RAD = math.radians(1.5)
 MAXIMUM_RELEASE_CLEARANCE_M = 0.05
 PLANNING_TIME_BUDGET_SEC = 45.
 PATH_SEARCH_BUDGET_SEC = 8.
@@ -177,6 +179,11 @@ def build_support_release_query_registration(*, segmentation, back_projection, r
         "support_regions": {"maximum": MAXIMUM_SUPPORT_REGIONS, "order": "largest_first",
                             "maximum_overlap_fraction": .75},
         "planner": "mujoco_private_payload_candidate_planner_v1",
+        **({"release_orientation": {
+            "level_first_above_held_tilt_rad": HELD_TILT_LEVELING_THRESHOLD_RAD,
+            "maximum_final_tilt_from_support_normal_rad": MAXIMUM_RELEASE_LEAN_RAD,
+            "tilt_measure": "closest_unoriented_measured_box_axis",
+        }} if skill_version == "3" else {}),
     }, domain="agenticrobot.support_release_query.profile.v" + skill_version)
     definition = contract.definition()
     schema = contract.schema(definition_hash=definition.semantic_content_hash, profile_hash=profile_hash,
@@ -438,10 +445,15 @@ class MujocoSupportReleaseQuery:
                                          scene_revision=revision, measured_at=float(fresh.captured_at),
                                          evidence_ref=region_ref)
             region_recorded = False
-            # Held-orientation candidates first; leaned ones only when none of those has a path.
-            # On an inclined top the object is first turned to lie flat on it.
+            # Version 3 also tries leveling first when the held box leans
+            # relative to this region; v1 retains its inclined-top trigger.
+            level_first = region.inclined or (
+                self._skill is skill_v3
+                and _support_tilt_rad(held, held.reference_from_object[:3, :3],
+                                      np.asarray(support.normal_reference_xyz, dtype=float))
+                > HELD_TILT_LEVELING_THRESHOLD_RAD)
             region_passes = ((({"yaw_offsets_rad": RELEASE_YAW_OFFSETS_RAD, "level_to_support": True},)
-                              if region.inclined else ()) + passes)
+                              if level_first else ()) + passes)
             for orientation in region_passes:
                 if "lean_rad" in orientation and float(self.clock()) >= deadline:
                     out_of_time = True
@@ -452,6 +464,7 @@ class MujocoSupportReleaseQuery:
                         minimum_planning_clearance_m=self._skill.MIN_CLEARANCE_M,
                         maximum_clearance_m=MAXIMUM_RELEASE_CLEARANCE_M,
                         lateral_margin_m=RELEASE_LATERAL_MARGIN_M, include_nearest_to_held=True,
+                        **({"limit_release_tilt": True} if self._skill is skill_v3 else {}),
                         **orientation)
                 except NoReleaseCandidates:
                     # Nothing fits this region in this orientation pass (or the lean
@@ -527,7 +540,11 @@ class MujocoSupportReleaseQuery:
             if out_of_time:
                 break
         if not fitted and not out_of_time:
-            return _rejected(reason="held_footprint_does_not_fit_support", held_pose=held_pose,
+            # v3 can have no candidates because every final orientation
+            # exceeds its tilt limit; do not misreport that as a footprint failure.
+            reason = ("no_collision_free_release_path" if self._skill is skill_v3
+                      else "held_footprint_does_not_fit_support")
+            return _rejected(reason=reason, held_pose=held_pose,
                              segmentation=segmentation, measured=measured, **common), tuple(evidence)
         # Regions or passes left untried for lack of time are a budget outcome.
         exhausted = budget_exhausted or out_of_time

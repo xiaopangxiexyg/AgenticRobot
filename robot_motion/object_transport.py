@@ -666,6 +666,7 @@ def plan_release_approach_candidates(
     lean_rad: float = 0.,
     lean_toward_xy_m: tuple[float, float] | None = None,
     level_to_support: bool = False,
+    limit_release_tilt: bool = False,
 ) -> tuple[ReleaseApproachCandidate, ...]:
     """Bounded on-support proposals for the existing payload-safe planner.
 
@@ -684,7 +685,9 @@ def plan_release_approach_candidates(
     turns every (yawed) orientation by the smallest rotation that puts the box
     axis nearest the support normal onto it, so the object lands flat on an
     inclined support (or one it leans against in the hand); it excludes a
-    lean. A position whose footprint
+    lean. Opt-in, ``limit_release_tilt`` applies the same
+    ``MAXIMUM_RELEASE_LEAN_RAD`` limit to every final orientation, including
+    an unchanged or yawed held orientation. A position whose footprint
     misses the region by rounding is dropped; ``NoReleaseCandidates`` reports
     that nothing remains. No candidate is an authority to move,
     and the selected support must be
@@ -747,8 +750,10 @@ def plan_release_approach_candidates(
                 tilt_limited = True
                 continue
             rotation = align @ rotation
-        if lean_rad > 0. and _support_tilt_rad(held, rotation, normal) > MAXIMUM_RELEASE_LEAN_RAD:
-            # The lean adds to the tilt the object already has in the hand.
+        if (lean_rad > 0. or limit_release_tilt) and (
+                _support_tilt_rad(held, rotation, normal) > MAXIMUM_RELEASE_LEAN_RAD):
+            # Check the final orientation: yaw on an inclined support can
+            # change its tilt, as can an added lean.
             tilt_limited = True
             continue
         _, low, high, center_offset = _oriented_box_offsets(held, rotation)
@@ -790,6 +795,9 @@ def plan_release_approach_candidates(
             ))
     if not candidates:
         if tilt_limited:
+            if limit_release_tilt:
+                raise NoReleaseCandidates(
+                    "No release orientation within the tilt limit fits the selected support")
             raise NoReleaseCandidates(
                 "Leaning the held object would tilt it more than MAXIMUM_RELEASE_LEAN_RAD "
                 "from the support normal, or no leaned footprint fits the selected support")
