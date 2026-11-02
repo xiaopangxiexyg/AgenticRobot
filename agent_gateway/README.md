@@ -242,6 +242,18 @@ handoff, and fail-closed HOLD semantics. This is the replaceability seam for
 changing the upper planning model or framework without changing downstream
 execution ownership.
 
+Parameter validators may declare an `AgentSkillParameterRejection` with a
+fixed public reason code. Other `TypeError`, `ValueError` and `KeyError`
+rejections retain `parameter_payload_rejected`; arbitrary exception messages
+are not transmitted. The MuJoCo TCP pose validator reports exact identity
+mismatches as `parameter_payload_rejected_<field>_mismatch`, including
+`frame_graph_hash`. These are pre-admission rejections: `accepted=false`, no
+operation, no execution and no task-success claim. The four-field submission
+response and its v2 schema are unchanged. Consumers should report the named
+field, reread its authoritative state when correction is requested, and create
+a fresh request only after correcting the arguments; never substitute identity
+values or bypass the validator automatically.
+
 ### Compatibility and semantic changes
 
 Treat a change to parameters, units, frames, intended effects, initiation,

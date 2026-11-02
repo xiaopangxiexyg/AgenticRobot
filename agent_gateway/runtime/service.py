@@ -53,7 +53,10 @@ from .operation_store import (
     BoundedInMemoryAgentSkillOperationStore,
     OperationStoreOutcome,
 )
-from .payload_validation import AgentSkillPayloadValidatorRegistry
+from .payload_validation import (
+    AgentSkillParameterRejection,
+    AgentSkillPayloadValidatorRegistry,
+)
 from .protocol_runtime import AgentGatewayProtocolRuntime
 
 _LOGGER = logging.getLogger(__name__)
@@ -941,10 +944,14 @@ class AgentGatewayService:
                         route=route,
                         payload=request.parameters,
                     )
-                except (TypeError, ValueError, KeyError):
+                except (TypeError, ValueError, KeyError) as error:
                     return AgentGatewaySubmission(
                         accepted=False,
-                        reason_code="parameter_payload_rejected",
+                        reason_code=(
+                            error.reason_code
+                            if isinstance(error, AgentSkillParameterRejection)
+                            else "parameter_payload_rejected"
+                        ),
                         access_decision=decision,
                     )
             observation = self.get_observation()

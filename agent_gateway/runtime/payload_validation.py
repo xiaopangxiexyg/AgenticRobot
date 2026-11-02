@@ -21,6 +21,18 @@ ContextualResultPayloadValidator = Callable[
 ]
 
 
+class AgentSkillParameterRejection(ValueError):
+    """Validator-owned public code, separate from the local exception message.
+
+    Producers supply a fixed, bounded identifier; never include request values,
+    paths or arbitrary exception text in the public reason code.
+    """
+
+    def __init__(self, reason_code: str, message: str) -> None:
+        super().__init__(message)
+        self.reason_code = reason_code
+
+
 def _required(value: object, *, field_name: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{field_name} must be a non-empty string.")
@@ -197,6 +209,7 @@ class AgentSkillPayloadValidatorRegistry:
 
 
 __all__ = [
+    "AgentSkillParameterRejection",
     "AgentSkillPayloadValidatorRegistry",
     "AgentSkillPayloadValidatorSet",
     "ContextualResultPayloadValidator",
