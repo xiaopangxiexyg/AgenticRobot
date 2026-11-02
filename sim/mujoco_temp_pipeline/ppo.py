@@ -43,6 +43,7 @@ UNSAFE_TERMINATION_REASONS = frozenset(
         "sim_joint_position_limit_violation",
         "sim_collision_margin_violation",
         "robot_environment_penetration",
+        "arm_command_collision_bound",
         "robot_environment_clearance_violation",
     }
 )

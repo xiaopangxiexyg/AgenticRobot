@@ -30,6 +30,14 @@ _COLLISION_PROJECTION_MODES = frozenset(
 )
 
 
+class MujocoCommandCollisionFault(RuntimeError):
+    """An arm command rejected before arm actuator acceptance or physics advance."""
+
+    def __init__(self, message, check):
+        super().__init__(message)
+        self.check = check
+
+
 class MujocoPhysicalContactFault(RuntimeError):
     """Latched native hard-contact failure with the exact checked pair."""
 
@@ -542,10 +550,11 @@ class MujocoActuatedPositionExecutor:
                 self._last_admitted_target_check = admitted_check
                 if not admitted_check.safe:
                     self._last_safety_status = "unsafe_upstream_admitted"
-                    raise RuntimeError(
+                    raise MujocoCommandCollisionFault(
                         "Upstream-admitted MuJoCo arm qcmd exceeds the hard "
                         "collision bound: "
-                        f"{admitted_check.to_dict()}"
+                        f"{admitted_check.to_dict()}",
+                        admitted_check,
                     )
                 self._last_safety_status = self.collision_projection_mode
                 tick_safety_status = self.collision_projection_mode
@@ -910,6 +919,7 @@ __all__ = [
     "COLLISION_PROJECTION_MODE_EXECUTOR",
     "COLLISION_PROJECTION_MODE_UPSTREAM_ADMITTED",
     "ActuatedPositionTick",
+    "MujocoCommandCollisionFault",
     "MujocoPhysicalContactFault",
     "MujocoActuatedPositionExecutor",
     "normalize_collision_projection_mode",

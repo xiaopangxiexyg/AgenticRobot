@@ -12,6 +12,7 @@ import numpy as np
 from robot_motion.runtime import EffectorCommand, TeleopCommand
 from sim.contracts import TimingSpec
 
+from ...actuation.executor import MujocoCommandCollisionFault
 from ...adapters import MujocoPositionExecutionConfig, MujocoPositionExecutionRig
 from ...collision_safety import project_grippers_then_arms
 from ...grasp_contact import extract_gripper_contact_scores
@@ -321,6 +322,7 @@ class CubeLiftKernel:
         self._accepted_controlled_qpos = self.scene.kinematic_controlled_qpos()
         self._last_safety_result = None
         self._last_active_collision_check = None
+        self._last_command_collision_check = None
         self._policy_worst_active_collision_check = None
         self._post_settle_geom_friction: tuple[
             tuple[int, np.ndarray, np.ndarray], ...
@@ -424,6 +426,7 @@ class CubeLiftKernel:
         self._termination_reason = None
         self._last_safety_result = None
         self._last_active_collision_check = None
+        self._last_command_collision_check = None
         self._policy_worst_active_collision_check = None
         self._pose_target_reanchored = False
         self._pre_action_pose_target_translation_error_m = None
@@ -670,6 +673,7 @@ class CubeLiftKernel:
         self._last_accepted_action.fill(0.0)
         self._last_safety_result = None
         self._last_active_collision_check = None
+        self._last_command_collision_check = None
         self._policy_worst_active_collision_check = None
         self._pose_target_reanchored = False
         self._scripted_pregrasp_reset_applied = True
@@ -777,6 +781,7 @@ class CubeLiftKernel:
         self._last_accepted_action.fill(0.0)
         self._last_safety_result = None
         self._last_active_collision_check = None
+        self._last_command_collision_check = None
         self._policy_worst_active_collision_check = None
         self._pose_target_reanchored = False
         self._scripted_contact_reset_applied = True
@@ -1102,7 +1107,17 @@ class CubeLiftKernel:
                 period = 1.0 / self.config.command_hz
                 while self._next_command_time <= self.physics_time + 1e-12:
                     self._next_command_time += period
-            self._step_physics()
+            try:
+                self._step_physics()
+            except MujocoCommandCollisionFault as error:
+                # The rig has rejected pending proposals and latched the fault.
+                # Only reset may close/rearm it. No arm command was accepted
+                # and no physics tick advanced; this is not actual contact.
+                self._last_command_collision_check = error.check
+                self._termination_reason = "arm_command_collision_bound"
+                if due:
+                    command_ticks -= 1
+                break
             physics_ticks += 1
             if self._check_termination(check_success=True):
                 break
@@ -2031,6 +2046,11 @@ class CubeLiftKernel:
             # projection above. These simulator-only facts are emitted for
             # cost accounting and diagnostics; they never enter the actor
             # observation contract.
+            "command_collision_rejection": (
+                None
+                if self._last_command_collision_check is None
+                else self._last_command_collision_check.to_dict()
+            ),
             "safety_actual_forbidden_contact": actual_forbidden_contact,
             "safety_actual_collision_category": (
                 None
