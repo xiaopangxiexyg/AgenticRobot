@@ -53,6 +53,7 @@ from agent_gateway.protocol.state_schemas import (
     validate_agent_state_route_schema_v1,
 )
 from agent_gateway.runtime.payload_validation import (
+    AgentSkillParameterRejection,
     AgentSkillPayloadValidatorRegistry,
     AgentSkillPayloadValidatorSet,
 )
@@ -1517,7 +1518,10 @@ def _motion_validators(
         }
         for field_name, expected in exact.items():
             if payload[field_name] != expected:
-                raise ValueError(f"TCP pose target {field_name} mismatch.")
+                raise AgentSkillParameterRejection(
+                    f"parameter_payload_rejected_{field_name}_mismatch",
+                    f"TCP pose target {field_name} mismatch.",
+                )
         pose = tuple(float(item) for item in poses[profile.component_id])
         bounds = profile.workspace_bounds
         if not (
