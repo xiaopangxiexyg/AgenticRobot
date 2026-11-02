@@ -92,6 +92,26 @@ core and MuJoCo adapter used for the 20260721 fit; tests compare those hashes to
 fixed historical values rather than silently reinterpreting the fit against
 the current files.
 
+MuJoCo release@3 调平优先与最终倾角限制使用独立绑定
+`artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261103_mujoco_g4_release_leveling_v1.json`。
+它固定源码 `465cf60dc4af8f7e869fc179c2c88fbe5be28e18`，基线为 development
+`292a66cfe728c989b408a4018db1f41f4b43d747`；继承前任 G2 绑定的全部 244 项非运行时引用。
+205 项已有运行时输入中 3 项改变；没有新增运行时输入，总数仍为 205，其中 Python 源码 200 项。
+仅 MuJoCo release@3 在斜面或持物盒相对支撑法向倾斜超过 1.5° 时优先尝试调平；
+所有 @3 释放建议的最终倾角限制为 10°，度量使用盒体最接近法向的无向轴。
+共享几何函数以显式选项启用该 cap；release@1 与真机 release@2 保留旧策略。
+这些是建议生成策略，不是执行成功证据；四个已有角度字段仍只描述选中区域、持物观测与建议。
+当前固定源码的离线检查 108 项通过、0 项跳过。
+前任 11 份 G2 报告及原始/中间/最终三个历史 context 原样保留，不改写为 G4 运行。
+G4 原生对照保留 baseline `1a72179369bc0578769adee1998f5142f5a217e3` 与 candidate `db2c9aa06c5436c75ed0f9bdd59baf4e1e7b759b`、各自真实 harness 来源：4 native cells retained. Both contact12 injections fell flat before pad contact, so qualified preclose crooked fault count is zero. The separate matched carry12 pair held approximately 11.615 degrees; baseline proposed 11.615 degrees, candidate approximately zero, both placed stably. This demonstrates the policy effect on one whole-held orientation control, not recovery success-rate gain.
+集成后原生确认使用 lower `465cf60dc4af8f7e869fc179c2c88fbe5be28e18`、native harness `c44d4c12752214569c13a76160a8b81f26d17741`：Two full chains placed stably on source 465cf60: a 12 degree whole-held carry near a post and a 20 degree toward slope, both followed by 3 s observation. The first slope slot failed setup from the wrong support ID before observations; retained alongside the corrected fresh slot. No physical limits changed.
+集成后模型 API Agent 使用同一 lower、upper `20fca1fd4de7ebf721631373003af8bec2483790`、Agent harness `69c036be425a88dd09085da6c7a6bedc20f2b4b6`：One actual model API Agent box-near-post run: physical grade true, native success rule true, finish success, normal cleanup, 24 calls and 280.829 agent seconds. Not a statistical cohort or deliberately crooked grasp.
+独立审阅：Independent static review of the three runtime owners and the minimal binding preparation. Integrated runtime blobs match the reviewed original G4; README retains the incoming parameter-feedback and CubeLift text. Existing focused checks pass 108/108. Legacy query v1 and Real v2 remain on the default uncapped factory behavior. G2 metadata and evidence attribution are retained unchanged.
+物理覆盖局限：Only MuJoCo. No new calibration or held-out qualification. The original >=4/5 crooked-grasp objective is not met: contact12 is not a valid crooked-hold fault. Whole-held carry controls are a separate condition. Cube-arm forbidden contacts and permitted object-table/support transient penetrations are reported separately; this is not an all-contact <=1 mm claim. No autonomous optimal-family selection or statistical success-rate improvement is claimed.
+所有本次运行（包括拒绝、失败和中止）应在所绑定报告中完整保留；前任报告作为历史证据保留，不替代本次候选验证。
+1 mm 硬穿透、3 mm/2° 滑移、50 ms 观测间隔、0.6 s 释放窗口及 2 mm 非接触间隙均不变。
+未重新拟合、未执行真机或新增 held-out 资格；绑定仍为 `provisional`。
+
 MuJoCo 抓取族选择与释放姿态说明使用独立绑定
 `artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261103_mujoco_g2_queries_v1.json`。
 它固定源码 `49f455d283c47dd23ee644b272dc8713d8ee45a8`，基线为 development

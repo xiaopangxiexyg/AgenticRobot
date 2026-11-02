@@ -25,6 +25,10 @@ ARM_BASELINE_PATH = Path(
 )
 ARM_RUNTIME_BINDING_PATH = Path(
     "sim/rm65/real2sim/artifacts/"
+    "rm65_arm_free_motion_20260721_v4_runtime_binding_20261103_mujoco_g4_release_leveling_v1.json"
+)
+MUJOCO_G2_QUERIES_V1_BINDING_PATH = Path(
+    "sim/rm65/real2sim/artifacts/"
     "rm65_arm_free_motion_20260721_v4_runtime_binding_20261103_mujoco_g2_queries_v1.json"
 )
 PARAMETER_FEEDBACK_V1_BINDING_PATH = Path(
@@ -449,15 +453,15 @@ def test_v4_arm_fit_baseline_remains_frozen_and_provisional() -> None:
 
 def test_current_arm_runtime_binding_uses_exact_current_inputs() -> None:
     binding = Real2SimArtifactManifest.load(ARM_RUNTIME_BINDING_PATH)
-    previous = Real2SimArtifactManifest.load(PARAMETER_FEEDBACK_V1_BINDING_PATH)
+    previous = Real2SimArtifactManifest.load(MUJOCO_G2_QUERIES_V1_BINDING_PATH)
     fit = Real2SimArtifactManifest.load(ARM_BASELINE_PATH)
-    source, source_tree = '49f455d283c47dd23ee644b272dc8713d8ee45a8', 'a1c9e85a87a8e48bbe4eaae458518ee0d3650449'
-    tag, old_tag = '20261103-mujoco-g2-queries-v1', '20261103-parameter-feedback-v1'
+    source, source_tree = '465cf60dc4af8f7e869fc179c2c88fbe5be28e18', '2d9914d3d80ce31337b5c092c0616561da5928ef'
+    tag, old_tag = '20261103-mujoco-g4-release-leveling-v1', '20261103-mujoco-g2-queries-v1'
     current = {r.locator: r for r in binding.dependency_artifacts if "-runtime-" + tag in r.artifact_id}
     inherited = {r.locator: r for r in previous.dependency_artifacts if "-runtime-" + old_tag in r.artifact_id}
-    extras = ('agent_gateway/skills/perception/grasp_approach_query_v2.py', 'agent_gateway/skills/perception/support_release_query_v3.py')
+    extras = ()
     assert tuple(binding.metadata["new_runtime_sources"]) == extras
-    assert len(inherited) == 203 and len(current) == 205
+    assert len(inherited) == 205 and len(current) == 205
     assert set(current) == set(inherited) | set(extras)
     assert sum(r.locator.endswith(".py") for r in current.values()) == 200
     for path, ref in current.items():
@@ -467,25 +471,25 @@ def test_current_arm_runtime_binding_uses_exact_current_inputs() -> None:
             assert ref.artifact_id == inherited[path].artifact_id.replace(old_tag, tag)
             assert ref.artifact_kind == inherited[path].artifact_kind
         else:
-            assert ref.artifact_id == f"mujoco-g2-query-owner-{extras.index(path)}-runtime-{tag}"
+            assert ref.artifact_id == f"mujoco-g4-release-owner-{extras.index(path)}-runtime-{tag}"
             assert ref.artifact_kind == "runtime_source"
     changed = {p for p in inherited if current[p].sha256 != inherited[p].sha256}
-    assert changed == {'agent_gateway/profiles/mujoco/motion_deployment.py', 'agent_gateway/profiles/mujoco/motion_factory.py', 'agent_gateway/profiles/mujoco/support_release_query.py', 'agent_gateway/profiles/mujoco/grasp_approach_query.py'}
+    assert changed == {'robot_motion/object_transport.py', 'agent_gateway/profiles/mujoco/support_release_query.py', 'agent_gateway/skills/perception/support_release_query_v3.py'}
     assert tuple(binding.metadata["changed_previous_runtime_sources"]) == tuple(sorted(changed))
     assert tuple(binding.metadata["changed_previous_offline_inputs"]) == ()
     assert binding.code_revision == binding.metadata["runtime_source_commit"] == binding.environment_fingerprint["source_commit"] == source
     assert binding.metadata["offline_validation_source_tree"] == binding.environment_fingerprint["source_tree"] == source_tree
     assert subprocess.check_output(["git", "rev-parse", source + "^{tree}"], text=True).strip() == source_tree
-    assert binding.metadata["mainline_input_commit"] == 'c88b6e524d62155dc9f866f410b858bdb71dd8d5'
+    assert binding.metadata["mainline_input_commit"] == '292a66cfe728c989b408a4018db1f41f4b43d747'
     assert binding.metadata["feedback_input_commit"] == "0c58a1719990282ad362577167011860221bbd81"
     refs = {r.artifact_id: r for r in binding.dependency_artifacts}
     for ref in previous.dependency_artifacts:
         if "-runtime-" + old_tag not in ref.artifact_id:
             assert refs[ref.artifact_id] == ref
-    parent = refs['rm65-arm-runtime-binding-parameter-feedback-20261103-v1']
-    assert parent.locator == str(PARAMETER_FEEDBACK_V1_BINDING_PATH)
+    parent = refs['rm65-arm-runtime-binding-mujoco-g2-queries-20261103-v1']
+    assert parent.locator == str(MUJOCO_G2_QUERIES_V1_BINDING_PATH)
     assert parent.sha256 == binding.metadata["previous_runtime_binding_file_sha256"] == ArtifactRef.from_file(
-        PARAMETER_FEEDBACK_V1_BINDING_PATH, artifact_id="parent-check", artifact_kind="real2sim_runtime_binding").sha256
+        MUJOCO_G2_QUERIES_V1_BINDING_PATH, artifact_id="parent-check", artifact_kind="real2sim_runtime_binding").sha256
     assert binding.metadata["previous_runtime_binding_artifact_sha256"] == previous.artifact_sha256
     assert binding.metadata["fit_artifact_sha256"] == fit.artifact_sha256
     assert binding.resolved_timing == previous.resolved_timing == Real2SimArtifactManifest.resolved_timing_from_contract_file(CONTRACT_PATH)
@@ -496,33 +500,28 @@ def test_current_arm_runtime_binding_uses_exact_current_inputs() -> None:
         ref = refs[artifact_id]
         assert ref.sha256 == ArtifactRef.from_file(ref.locator, artifact_id="offline-check", artifact_kind=ref.artifact_kind).sha256
         assert ref.sha256 == hashlib.sha256(subprocess.check_output(["git", "show", source + ":" + ref.locator])).hexdigest()
-    assert binding.metadata['migration'] == 'namespaced_mujoco_g2_queries_binding_v1'
-    assert binding.metadata['runtime_behavior_change_scope'] == 'opt_in_mujoco_grasp_family_query_v2_and_release_orientation_query_v3'
+    assert binding.metadata['migration'] == 'namespaced_mujoco_g4_release_leveling_binding_v1'
+    assert binding.metadata['runtime_behavior_change_scope'] == 'opt_in_mujoco_release_query_v3_leveling_first_and_final_ten_degree_cap'
     assert binding.metadata["runtime_behavior_change"] is True
     for key in ("arm_profile_refit", "new_physical_hardware_validation", "runtime_control_semantics_changed", "wire_schema_version_changed", "automatic_retry_authorization"):
         assert binding.metadata[key] is False
     reports = {
-        'mujoco-g2-query-focused-report-20261103-mujoco-g2-queries-v1': '95035c673b01d317ee7b81910a5531cd7a14e75f9068640f2bb6ef8acc88c560',
-        'mujoco-g2-query-focused-binding-20261103-mujoco-g2-queries-v1': 'a4dfb3a0dfe62b85e497da81be6eda3546a932e205dc0e4fa86d464f36a6a2b5',
-        'mujoco-g2-query-integration-native-report-20261103-mujoco-g2-queries-v1': 'b874637cbc7233e6662d0c33e97e3315fcb5619c45cb869d7509c8f07b2a0722',
-        'mujoco-g2-query-integration-agent-report-20261103-mujoco-g2-queries-v1': '0c2d2b8b054e995e9fcaa252f01964a31a4c857c297b9702f9de228de472bab3',
-        'mujoco-g2-query-integration-review-report-20261103-mujoco-g2-queries-v1': '89ce4df88e22a2d335b807d4b1e0a1b94718fbc713e97be51a9d88a625fd7f87',
-        'mujoco-g2-query-original-native-report-20261103-mujoco-g2-queries-v1': '47169259d9658c251333f7f5dc1aa04375a7867b26416529866b742ebdcd7318',
-        'mujoco-g2-query-original-agent-report-20261103-mujoco-g2-queries-v1': '8664bfedef6bf14c7f032247a2aea8f0205979794c64fe009a77423ce8ae6a35',
-        'mujoco-g2-query-original-review-report-20261103-mujoco-g2-queries-v1': 'bef13feebfdb7a999273fd28b1bc5578bfb5e7caada53e08776a22a0c0c6287d',
-        'mujoco-g2-query-prior-integration-native-report-20261103-mujoco-g2-queries-v1': '453c1832559a6963f42cc012076bc5a9e85521e2a3377b033f76178537afdbb5',
-        'mujoco-g2-query-prior-integration-agent-report-20261103-mujoco-g2-queries-v1': 'd4040f8c0d9c8ff659f011a57976190da92d5cb51b78f60881af8f672d3351d4',
-        'mujoco-g2-query-prior-integration-review-report-20261103-mujoco-g2-queries-v1': '7fbd63b2d3b6a4d046366c80788c39d37489967edd5243aa1e55d75b2270c289',
+        'mujoco-g4-release-focused-log-20261103-mujoco-g4-release-leveling-v1': '266e78967cd9a711d18068d56e6ae5d3339d23a91b3b756b0e64970a395a76fd',
+        'mujoco-g4-release-focused-xml-20261103-mujoco-g4-release-leveling-v1': 'e3054c18977a9dfca28b77c8be3e7c105bf8c67f79507b30e1e51d1c46931d4e',
+        'mujoco-g4-release-original-native-controls-20261103-mujoco-g4-release-leveling-v1': '3f2cd25234a1adcb16639145665eff4442a7a34f8690a5db3fc188b8f6cc5c40',
+        'mujoco-g4-release-integration-native-20261103-mujoco-g4-release-leveling-v1': 'e6e6269e1d385d0508863950a454552af3a6fcf0d589bba2b8f3a1ed3c35fb74',
+        'mujoco-g4-release-integration-agent-20261103-mujoco-g4-release-leveling-v1': '4e55394180171b1b168a0b079f5310638eeab46421ffe8a6724a3dab2ec7184b',
+        'mujoco-g4-release-review-20261103-mujoco-g4-release-leveling-v1': 'd59a135248cc4f5f8e3ab38b2a6301e1ef4c1e2ddb527683fcc445b21111f1ac',
     }
     assert tuple(binding.metadata["offline_validation_report_artifact_ids"]) == tuple(reports)
     for artifact_id, digest in reports.items():
         assert refs[artifact_id].sha256 == digest and refs[artifact_id].artifact_kind == "offline_validation_report"
-    offline = next(e for e in binding.validation_evidence if e.validation_id == 'mujoco-g2-query-offline-consumers-' + tag)
-    assert offline.status == "passed" and dict(offline.metrics) == {'passed_cases': 52.0, 'skipped_cases': 3.0, 'failed_cases': 0.0, 'error_cases': 0.0}
+    offline = next(e for e in binding.validation_evidence if e.validation_id == 'mujoco-g4-release-offline-consumers-' + tag)
+    assert offline.status == "passed" and dict(offline.metrics) == {'passed_cases': 108.0, 'skipped_cases': 0.0, 'failed_cases': 0.0, 'error_cases': 0.0}
     integrity = next(e for e in binding.validation_evidence if e.validation_id == "runtime-source-content-binding-integrity-" + tag)
-    assert dict(integrity.metrics) == {'bound_runtime_input_file_count': 205.0, 'bound_runtime_source_file_count': 200.0, 'changed_runtime_source_file_count_from_previous_binding': 4.0, 'new_runtime_source_file_count': 2.0, 'new_runtime_configuration_file_count': 0.0, 'arm_profile_refit_count': 0.0, 'mutated_historical_artifact_count': 0.0}
-    assert binding.artifact_sha256 == '7533dcdc36d51a1568dad347e3aa0b02319aae895a94ab1ad08bb5aaf05232bd'
-    assert ArtifactRef.from_file(ARM_RUNTIME_BINDING_PATH, artifact_id="binding-file-check", artifact_kind="real2sim_runtime_binding").sha256 == '383cbe4b2c7770a3ca2f5ed128c797f86cb554468b5b70bfff8fa2f92648199a'
+    assert dict(integrity.metrics) == {'bound_runtime_input_file_count': 205.0, 'bound_runtime_source_file_count': 200.0, 'changed_runtime_source_file_count_from_previous_binding': 3.0, 'new_runtime_source_file_count': 0.0, 'new_runtime_configuration_file_count': 0.0, 'arm_profile_refit_count': 0.0, 'mutated_historical_artifact_count': 0.0}
+    assert binding.artifact_sha256 == '747e8688fb9e46efe620d81343f1baea503c53ed13ebb9cb0033bf2b1f844edd'
+    assert ArtifactRef.from_file(ARM_RUNTIME_BINDING_PATH, artifact_id="binding-file-check", artifact_kind="real2sim_runtime_binding").sha256 == 'e5517fd639ba9586faced572bdc0f0a55353326b7ad04ed130252252fac0d009'
     assert binding.fidelity_claims[0].status == "provisional"
     assert next(e for e in binding.validation_evidence if e.split == "held_out").status == "not_run"
 
