@@ -1982,6 +1982,15 @@ measurement, cancellation, and durable trace closure remain required. A
 completed execution may therefore return a required environment verdict of
 `failed`; consumers must gate task success on that verdict, not execution status.
 
+The bounded control-cycle count includes lower `not_due` and
+`execution_kept_existing` returns. Those cuts retain their actual composition
+and lower no-action evidence; they add no dispatch or measurement. Dispatch
+chains and the public first/last cycle receipt references still cover verified
+dispatches, and a completed execution requires at least one. Lower cancellation,
+HOLD, or other terminal execution statuses return execution failure with the
+lower reason and confirmed HOLD, without a task evaluation. Deadline and
+persistence decisions remain with the lower runtime.
+
 ## Observation and visual cuts
 
 Low-rate state observations and pull-based visual captures are separate. RGB is

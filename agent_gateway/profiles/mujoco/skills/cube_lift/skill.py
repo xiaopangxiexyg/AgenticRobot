@@ -583,6 +583,46 @@ class CubeLiftAgentSkillLifecycle:
             terminal_hold_confirmed=True,
         )
 
+    def _failed_cycle_completion(
+        self,
+        cycle: Any,
+        *,
+        reason_code: str,
+    ) -> StationLifecycleExecutionCompletion:
+        """Project lower refusal evidence without claiming task evaluation."""
+
+        proof = self._ensure_hold(reason=reason_code, end_episode=True)
+        execution = getattr(cycle, "execution", None)
+        diagnostic = {
+            "phase": "lower_execution",
+            "lower_execution_status": str(getattr(execution, "status", "missing")),
+            "cycle_index": str(getattr(cycle, "cycle_index", "missing")),
+        }
+        references = list(self._hold_refs(proof))
+        for field, id_field in (
+            ("publication_attempt", "publication_attempt_id"),
+            ("directive", "directive_id"),
+            ("cancellation", "cancellation_id"),
+        ):
+            value = getattr(execution, field, None)
+            reference = getattr(value, id_field, None)
+            if reference is not None:
+                references.append(reference)
+        publication = getattr(execution, "publication_attempt", None)
+        rejection_reason = getattr(publication, "rejection_reason", None)
+        if rejection_reason is not None:
+            diagnostic["publication_rejection_reason"] = rejection_reason
+        directive = getattr(execution, "directive", None)
+        if directive is not None:
+            diagnostic["directive_status"] = directive.global_status
+        return StationLifecycleExecutionCompletion(
+            succeeded=False,
+            reason_code=reason_code,
+            execution_receipt_refs=tuple(dict.fromkeys(references)),
+            terminal_hold_confirmed=True,
+            failure_diagnostic=diagnostic,
+        )
+
     def run(
         self,
         *,
@@ -601,6 +641,7 @@ class CubeLiftAgentSkillLifecycle:
                 or self._activated_request_hash != request.semantic_content_hash
             ):
                 raise ValueError("CubeLift run does not match the activation.")
+        observed_dispatch = False
         for _ in range(self.max_control_cycles):
             if not self._wait_for_station_cut(cancel_requested):
                 proof = self._ensure_hold(reason="operation_preempted")
@@ -609,25 +650,42 @@ class CubeLiftAgentSkillLifecycle:
                     proof=proof,
                 )
             cycle = self.application.step()
-            observer = getattr(self.application, "execution_difference_observer", None)
-            if observer is None or not callable(getattr(observer, "snapshot", None)):
-                raise RuntimeError("CubeLift execution observer is unavailable.")
+            execution_status = getattr(getattr(cycle, "execution", None), "status", None)
+            if execution_status not in {"dispatched", "not_due", "execution_kept_existing"}:
+                return self._failed_cycle_completion(
+                    cycle,
+                    reason_code="cube_lift_lower_execution_failed_under_hold",
+                )
+            measurement_snapshot = None
+            if execution_status == "dispatched":
+                observer = getattr(self.application, "execution_difference_observer", None)
+                if observer is None or not callable(getattr(observer, "snapshot", None)):
+                    raise RuntimeError("CubeLift execution observer is unavailable.")
+                measurement_snapshot = observer.snapshot()
             self.evidence_collector.observe_cycle(
                 cycle,
-                measurement_snapshot=observer.snapshot(),
+                measurement_snapshot=measurement_snapshot,
             )
+            observed_dispatch = observed_dispatch or execution_status == "dispatched"
             if bool(cancel_requested()):
                 proof = self._ensure_hold(reason="operation_preempted_after_cycle")
                 return self._cancelled_completion(
                     reason_code="cube_lift_execution_preempted_under_hold",
                     proof=proof,
                 )
+            if execution_status != "dispatched":
+                continue
             candidate = self.candidate_observer.capture()
             if not isinstance(candidate, CubeLiftCandidateObservation):
                 raise TypeError("Candidate observer returned an invalid observation.")
             if candidate.candidate_satisfied:
                 break
 
+        if not observed_dispatch:
+            return self._failed_cycle_completion(
+                cycle,
+                reason_code="cube_lift_no_dispatch_under_hold",
+            )
         proof = self._ensure_hold(
             reason="candidate_or_control_cycle_limit",
             end_episode=True,

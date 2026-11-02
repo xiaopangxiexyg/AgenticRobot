@@ -242,7 +242,7 @@ class _FakeApplication:
 
     def step(self):
         self.calls.append("application.step")
-        return SimpleNamespace(cycle_index=0)
+        return SimpleNamespace(cycle_index=0, execution=SimpleNamespace(status="dispatched"))
 
     def _measurement_snapshot(self):
         self.calls.append("measurement.snapshot")
