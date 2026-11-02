@@ -571,6 +571,9 @@ def test_tcp_observation_transforms_raw_arm_base_pose_before_publication(
     producer.application = application
     producer.execution_reference_frame_id = "right_arm_base"
     producer.reference_frame_id = station.frame_id
+    producer._execution_to_reference = graph.resolve(
+        producer.execution_reference_frame_id, producer.reference_frame_id
+    )
 
     projection = producer._capture_scene(SimpleNamespace(state_is_finite=lambda: True))
 
