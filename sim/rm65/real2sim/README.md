@@ -92,6 +92,21 @@ core and MuJoCo adapter used for the 20260721 fit; tests compare those hashes to
 fixed historical values rather than silently reinterpreting the fit against
 the current files.
 
+MuJoCo 抓取查询的预接触闭合障碍检查使用独立绑定
+`artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261103_mujoco_closure_entry_v1.json`。
+它固定源码 `7da5e97728f055f5d0a9de0a55eb1b169a58a3dd`，基线为 development
+`ca545b971204e4d7d2e284dfc246481918a0fdea`；继承斜板绑定的全部非运行时引用，
+201 项已有运行时输入中只有 MuJoCo `grasp_approach_query.py` 改变，没有新增运行时输入或重新拟合。
+查询先私有规划末端接触位姿，再调用原有碰撞投影器，从开放夹爪扫到首个配置的传感器/目标接触边界。
+此预览使用零穿透接触边界和原规划间隙；提前遇到邻物、自碰或未配置接触时拒绝。
+若末端位姿已经接触目标，则以原硬接触上限重新检查全部碰撞对。取消或预算耗尽不得返回 found。
+预测在首次目标接触处结束，不推断自定心后的闭合开度、不证明双垫抓持或起吊，也不跳过非法碰撞继续扫描。
+后续闭合、接触证据、抬升及携物仍由现有下层执行链负责；公开 query@1 字段不变，具体 profile identity 已更新。
+证据为 72 项已有 owner/consumer 检查、独立代码审阅和同机三个原生 MuJoCo 场景：旧侧坡动作前拒绝，
+新版侧坡与朝向坡均稳定放置，闭合最大穿透 0.778 mm。使用颜色分割，没有新模型 API Agent 队列或真机执行。
+1 mm 硬穿透、3 mm/2° 滑移、50 ms 观测间隔、0.6 s 释放窗口及 2 mm 非接触间隙均不变；
+绑定仍为 `provisional`，既有 Agent 报告只作为历史继承，未作为本次候选的新验证。
+
 MuJoCo 放置到斜板（倾斜支撑面）与水平正面抓取使用独立绑定
 `artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261101_mujoco_place_slope_v1.json`。它固定于集成提交
 `d7ca1ac9e`（两次合并加一个测试修正；基线 `06d472193` 即当时 development 的最新绑定提交，+ 抓取分支 `030bb2774`、斜面分支 `833835014` 和合并后的放置查询测试修正），保留前一绑定的全部非运行时引用；
