@@ -361,6 +361,7 @@ _DIRECT_COMPONENT_COMPOSITION_LEGACY_NOT_APPLICABLE = frozenset(
 _DIRECT_COMPONENT_COMPOSITION_LINEAGE_POLICIES = frozenset(
     {
         "authoritative_immediate_component_human_composition_lineage_v1",
+        "authoritative_immediate_component_policy_composition_lineage_v1",
         "authoritative_immediate_component_policy_human_"
         "composition_lineage_v1",
         "authoritative_scheduled_component_policy_human_"
@@ -818,6 +819,40 @@ TRACE_REQUIREMENT_PROFILES_V1: Mapping[str, TraceRequirementProfile] = MappingPr
                 writer_failure_behavior="mark_uncommitted_continue",
                 lineage_policy_id=(
                     "authoritative_immediate_component_human_"
+                    "composition_lineage_v1"
+                ),
+                profile_scope="formal_capture",
+                implementation_status="runtime_integrated",
+            ),
+            _profile(
+                "deployable_sim_immediate_component_policy_composer_v1",
+                "deployable_sim_immediate_component_policy_composer",
+                required=(
+                    _AUTHORITATIVE_SIM_CORE_REQUIRED
+                    | _IMMEDIATE_COMPONENT_EXECUTION_EVENT_TYPES
+                    | _DIRECT_COMPONENT_HOT_COMPOSITION_REQUIRED
+                    | _AUTHORITATIVE_POLICY_SOURCE_REQUIRED
+                    | {
+                        "execution_gate_event",
+                        "execution_cancellation",
+                        "execution_cancellation_ack",
+                    }
+                ),
+                not_applicable=(
+                    _AUTHORITATIVE_NOT_APPLICABLE
+                    | _DIRECT_COMPONENT_COMPOSITION_LEGACY_NOT_APPLICABLE
+                    | _SCHEDULED_REFERENCE_EVENT_TYPES
+                    | {
+                        "component_execution_target_activation",
+                        "human_command_emission",
+                        "source_adapter_receipt",
+                    }
+                ),
+                receipt_policy="required",
+                measurement_policy="required",
+                writer_failure_behavior="mark_uncommitted_continue",
+                lineage_policy_id=(
+                    "authoritative_immediate_component_policy_"
                     "composition_lineage_v1"
                 ),
                 profile_scope="formal_capture",

@@ -114,17 +114,26 @@ def _cycle(index: int = 0):
         disposition_id=f"disposition:{suffix}",
         semantic_content_hash=f"hash:disposition:{suffix}",
     )
-    input_receipt = SimpleNamespace(
-        accepted=True,
+    policy_input = SimpleNamespace(
         composition_input_id=f"composition-input:{suffix}",
         semantic_content_hash=f"hash:composition-input:{suffix}",
+        input_role="policy",
+        runtime_session_id="runtime:cube-lift:test",
+        control_domain_id="mujoco-sim-hil",
+        source_fact_ids=(f"policy-emission:{suffix}",),
+        source_fact_hashes=(f"hash:policy-emission:{suffix}",),
     )
-    policy = SimpleNamespace(
-        role="policy",
-        accepted=True,
-        source_emission_id=f"policy-emission:{suffix}",
-        semantic_content_hash=f"hash:policy-submission:{suffix}",
-        input_receipt=input_receipt,
+    input_snapshot = SimpleNamespace(
+        composition_input_snapshot_id=f"input-snapshot:{suffix}",
+        semantic_content_hash=f"hash:input-snapshot:{suffix}",
+        control_domain_id="mujoco-sim-hil",
+        selected_input_by_role={"policy": policy_input},
+    )
+    composition_result = SimpleNamespace(
+        composition_evaluation_id=f"composition-evaluation:{suffix}",
+        semantic_content_hash=f"hash:composition-evaluation:{suffix}",
+        composition_input_snapshot_id=input_snapshot.composition_input_snapshot_id,
+        composition_input_snapshot_hash=input_snapshot.semantic_content_hash,
     )
     composition = SimpleNamespace(
         decision_key=f"decision-key:{suffix}",
@@ -134,6 +143,11 @@ def _cycle(index: int = 0):
             control_domain_id="mujoco-sim-hil",
         ),
         disposition=disposition,
+        proposal_submission=SimpleNamespace(
+            input_snapshot=input_snapshot,
+            composition_evaluation=composition_result,
+            proposal_admission=proposal_admission,
+        ),
         proposal_admission=proposal_admission,
         blocked_reason=None,
         error=None,
@@ -165,7 +179,7 @@ def _cycle(index: int = 0):
     cycle = SimpleNamespace(
         cycle_index=index,
         semantic_content_hash=f"hash:cycle:{suffix}",
-        policy_submission=policy,
+        policy_submission=None,
         composition_step=composition,
         execution=execution,
     )

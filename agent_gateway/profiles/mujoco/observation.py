@@ -279,7 +279,9 @@ class MujocoAgentObservationProducer:
             raise ValueError(
                 "Observation producer requires the canonical Station axis contract."
             )
-        frame_graph.resolve(execution_reference_frame_id, reference_frame_id)
+        execution_to_reference = frame_graph.resolve(
+            execution_reference_frame_id, reference_frame_id
+        )
         reference_frame_spec_hash = _required(
             getattr(frame_spec, "semantic_content_hash", None),
             field_name=f"{component_id} reference frame spec hash",
@@ -306,6 +308,7 @@ class MujocoAgentObservationProducer:
         self.pose_schema_hash = pose_schema_hash
         self.execution_reference_frame_id = execution_reference_frame_id
         self.reference_frame_id = reference_frame_id
+        self._execution_to_reference = execution_to_reference
         self.reference_frame_spec_hash = reference_frame_spec_hash
         self.source_binding = source_binding
         self.source_binding_id = source_binding.source_binding_id
@@ -374,15 +377,9 @@ class MujocoAgentObservationProducer:
                 scene,
                 self.application.task_config,
             )
-            raw_vector = pose_matrix_to_xyzquat(pose_by_side[self.motion_side])
-            vector = (
-                None
-                if raw_vector is None
-                else self.application.transform_tcp_pose_xyzquat(
-                    raw_vector,
-                    source_frame_id=self.execution_reference_frame_id,
-                    target_frame_id=self.reference_frame_id,
-                )
+            vector = pose_matrix_to_xyzquat(
+                self._execution_to_reference.matrix_target_source
+                @ pose_by_side[self.motion_side]
             )
             if vector is not None:
                 values = [float(item) for item in vector]

@@ -90,6 +90,7 @@ def test_initial_profiles_classify_every_event_type_once() -> None:
         "deployable_sim_scheduled_pose_human_replay_station_v1",
         "deployable_sim_scheduled_pose_composer_station_v1",
         "deployable_sim_immediate_component_human_composer_v1",
+        "deployable_sim_immediate_component_policy_composer_v1",
         "deployable_sim_immediate_component_policy_human_composer_v1",
         "deployable_sim_scheduled_component_policy_human_composer_v1",
     }

@@ -55,7 +55,6 @@ from control_station.sim_hil_profile.application import (
     MujocoSimHILApplication,
     MujocoSimHILPassiveApplicationCut,
 )
-from robot_motion.action import BIMANUAL_EE_POSE_V1
 from robot_motion.coordinate_profiles import STATION_RETARGET_FRAME_CONTRACT_V1
 from robot_motion.runtime.control_admission import ControlCut
 
@@ -93,10 +92,11 @@ def _composition() -> MujocoSimHILComposition:
     runtime = SimpleNamespace(
         config=runtime_config,
         catalog=SimpleNamespace(
-            action_space=BIMANUAL_EE_POSE_V1,
+            action_space="mujoco.rm65.right_cube_lift.pose_qpos.v1:component-action",
             semantic_content_hash="catalog:test",
         ),
         action_schema=_hashed("action-schema:test"),
+        component_execution_binding=_hashed("component-execution-binding:test"),
         component_target_capability=_hashed("target-capability:test"),
         target_runtime_action_contract=_hashed("target-action-contract:test"),
         execution_capability=_hashed("execution-capability:test"),

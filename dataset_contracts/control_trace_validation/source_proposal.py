@@ -271,10 +271,11 @@ def _validate_policy_closure(
                     "An emission needs an admission receipt or typed shadow status.",
                 )
 
-    if lineage_policy_id != (
+    if lineage_policy_id not in {
+        "authoritative_immediate_component_policy_composition_lineage_v1",
         "authoritative_scheduled_component_policy_human_"
-        "composition_lineage_v1"
-    ):
+        "composition_lineage_v1",
+    }:
         return
     for fact in context.ordered:
         if fact.event_type != "policy_action_emission":

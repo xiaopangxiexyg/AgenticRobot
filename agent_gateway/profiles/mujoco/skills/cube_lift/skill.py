@@ -451,7 +451,7 @@ class CubeLiftAgentSkillLifecycle:
         self._validate_call(
             request=request,
             operation=operation,
-            expected_status="admitted",
+            expected_status="activated",
         )
         if not callable(cancel_requested):
             raise TypeError("cancel_requested must be callable.")

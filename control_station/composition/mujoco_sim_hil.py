@@ -142,7 +142,7 @@ MUJOCO_SIM_HIL_AGENT_SKILL_EXECUTION_MANIFEST_ID_V1 = (
     "mujoco_sim_hil_agent_skill_policy_only_v1"
 )
 MUJOCO_SIM_HIL_AGENT_SKILL_TRACE_PROFILE_ID_V1 = (
-    "deployable_sim_hil_agent_skill_policy_only_v1"
+    "deployable_sim_immediate_component_policy_composer_v1"
 )
 MUJOCO_SIM_HIL_AGENT_SKILL_PRODUCER_EPOCH_HASH_DOMAIN_V1 = (
     "dexteleop.control_station.mujoco_sim_hil_agent_skill_producer_epoch.v1"
@@ -2942,9 +2942,9 @@ def build_mujoco_sim_hil_agent_skill_station_manifest(
             "Agent Skill Sim-HIL manifest requires policy-only alpha=0."
         )
     runtime = composition.runtime
-    if runtime.catalog.action_space != BIMANUAL_EE_POSE_V1:
+    if runtime.component_execution_binding is None:
         raise ValueError(
-            "Agent Skill Sim-HIL manifest requires pose-native execution."
+            "Agent Skill Sim-HIL manifest requires component-bound execution."
         )
     if runtime.reference_activation_spec.activation_mode != "immediate_target":
         raise ValueError(

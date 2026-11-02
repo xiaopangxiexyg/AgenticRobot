@@ -53,10 +53,6 @@ _TARGET_REQUEST_EVENT_TYPES = frozenset(
 )
 _TARGET_SUBMISSION_EVENT_TYPES = frozenset({"target_execution_submission"})
 _TARGET_COMPLETION_EVENT_TYPES = frozenset({"target_execution_completion"})
-_RESOLVED_TARGET_EVENT_TYPES = frozenset({"component_execution_target"})
-_TARGET_ADMISSION_EVENT_TYPES = frozenset(
-    {"component_execution_target_admission"}
-)
 _SAFETY_EVENT_TYPES = frozenset({"shared_safety_result"})
 _DISPATCH_EVENT_TYPES = frozenset(
     {"command", "dispatch_owner", "dispatch_receipt"}
@@ -394,16 +390,31 @@ class CubeLiftExecutionEvidenceCollector:
             != self.control_domain_id
         ):
             raise ValueError("CubeLift control cut session/domain mismatch.")
-        policy = getattr(cycle, "policy_submission", None)
+        # A control cut may reuse a valid policy input admitted during
+        # activation or an earlier cycle. Bind evidence to the selected input,
+        # rather than requiring a new source submission on every control cut.
+        evaluation = getattr(composition, "proposal_submission", None)
+        input_snapshot = getattr(evaluation, "input_snapshot", None)
+        policy = getattr(input_snapshot, "selected_input_by_role", {}).get("policy")
+        composition_result = getattr(evaluation, "composition_evaluation", None)
         if (
             policy is None
-            or getattr(policy, "role", None) != "policy"
-            or not bool(getattr(policy, "accepted", False))
+            or getattr(policy, "input_role", None) != "policy"
+            or getattr(policy, "runtime_session_id", None) != self.runtime_session_id
+            or getattr(policy, "control_domain_id", None) != self.control_domain_id
+            or getattr(input_snapshot, "control_domain_id", None) != self.control_domain_id
+            or getattr(composition_result, "composition_input_snapshot_id", None)
+            != getattr(input_snapshot, "composition_input_snapshot_id", None)
+            or getattr(composition_result, "composition_input_snapshot_hash", None)
+            != getattr(input_snapshot, "semantic_content_hash", None)
         ):
-            raise ValueError("CubeLift requires an accepted policy submission.")
-        input_receipt = getattr(policy, "input_receipt", None)
+            raise ValueError("CubeLift requires the exact selected policy input.")
+        source_ids = tuple(getattr(policy, "source_fact_ids", ()))
+        source_hashes = tuple(getattr(policy, "source_fact_hashes", ()))
+        if not source_ids or len(source_ids) != len(source_hashes):
+            raise ValueError("CubeLift selected policy source lineage is incomplete.")
         disposition = getattr(composition, "disposition", None)
-        proposal_admission = getattr(composition, "proposal_admission", None)
+        proposal_admission = getattr(evaluation, "proposal_admission", None)
         if (
             getattr(composition, "blocked_reason", None) is not None
             or getattr(composition, "error", None) is not None
@@ -508,15 +519,19 @@ class CubeLiftExecutionEvidenceCollector:
             event_types=_TARGET_COMPLETION_EVENT_TYPES,
             category="target completion",
         )
-        resolved_target_refs = _required_trace_refs(
-            trace_facts,
-            event_types=_RESOLVED_TARGET_EVENT_TYPES,
-            category="resolved target",
+        # Receiver-owned target facts are persisted by the trace sink; the
+        # authoritative step carries their exact objects, not duplicate facts.
+        resolved_target_refs = (
+            _ref(
+                kind="component_execution_target", value=target, id_field="target_id"
+            ),
         )
-        target_admission_refs = _required_trace_refs(
-            trace_facts,
-            event_types=_TARGET_ADMISSION_EVENT_TYPES,
-            category="target admission",
+        target_admission_refs = (
+            _ref(
+                kind="component_execution_target_admission",
+                value=admission,
+                id_field="receipt_id",
+            ),
         )
         dispatch_refs = _required_trace_refs(
             trace_facts,
@@ -588,11 +603,26 @@ class CubeLiftExecutionEvidenceCollector:
             fact_hash=association_hash,
         )
         source_refs = (
-            _ref(kind="policy_submission", value=policy, id_field="source_emission_id"),
+            *(
+                CubeLiftExecutionFactRef(
+                    kind="policy_source_fact", fact_id=fact_id, fact_hash=fact_hash
+                )
+                for fact_id, fact_hash in zip(source_ids, source_hashes)
+            ),
             _ref(
-                kind="policy_input_admission",
-                value=input_receipt,
+                kind="policy_input",
+                value=policy,
                 id_field="composition_input_id",
+            ),
+            _ref(
+                kind="composition_input_snapshot",
+                value=input_snapshot,
+                id_field="composition_input_snapshot_id",
+            ),
+            _ref(
+                kind="composition_evaluation",
+                value=composition_result,
+                id_field="composition_evaluation_id",
             ),
             _ref(
                 kind="composition_step",

@@ -124,7 +124,7 @@ def _operation(request: AgentSkillRequest, *, status: str) -> AgentSkillOperatio
         updated_at=10.1,
         deadline_at=40.0,
         lower_operation_id=(
-            None if status == "admitted" else "lower:cube-lift-agent-skill-test"
+            None if status in {"admitted", "activated"} else "lower:cube-lift-agent-skill-test"
         ),
         execution_receipt_refs=("station-start:1",),
         progress_summary={"phase": status},
@@ -390,7 +390,7 @@ def test_success_orders_hold_evaluation_episode_commit_and_runtime_terminal() ->
 
     activation = lifecycle.activate(
         request=request,
-        operation=_operation(request, status="admitted"),
+        operation=_operation(request, status="activated"),
         cancel_requested=lambda: False,
     )
     completion = lifecycle.run(
@@ -433,7 +433,7 @@ def test_cancel_forces_lower_hold_then_close_aborts_uncommitted_episode() -> Non
     lifecycle, _, _, _, request = _lifecycle(calls)
     lifecycle.activate(
         request=request,
-        operation=_operation(request, status="admitted"),
+        operation=_operation(request, status="activated"),
         cancel_requested=lambda: False,
     )
 

@@ -1972,6 +1972,16 @@ terminal evaluator live in `profiles/mujoco/skills/cube_lift`. This keeps task
 meaning independent from a simulator while keeping execution policy in the
 concrete Gateway profile.
 
+The policy-only CubeLift assembly uses the current component execution binding
+and `deployable_sim_immediate_component_policy_composer_v1` trace profile.
+Activation consumes the Gateway's `activated` operation projection. Execution
+evidence follows the policy input selected by the accepted composition cut,
+including valid inputs admitted during activation or an earlier cycle, and the
+exact receiver-owned target and admission receipts. Full source, target,
+measurement, cancellation, and durable trace closure remain required. A
+completed execution may therefore return a required environment verdict of
+`failed`; consumers must gate task success on that verdict, not execution status.
+
 ## Observation and visual cuts
 
 Low-rate state observations and pull-based visual captures are separate. RGB is
