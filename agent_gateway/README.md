@@ -1955,6 +1955,9 @@ Python 装配 `build_mujoco_agent_tcp_pose_gateway_session` 和对应 contract b
   `held_tilt_from_support_normal_rad`、`release_tilt_from_support_normal_rad` 和
   `release_leveling_rad`；角度和 `measured_support` 对应最终选中的支撑区域，持物
   倾角使用同一次持物观测。未选中释放位姿时四个新角度为 null。
+  对倾斜支撑，或持物盒相对该区域法向倾斜超过 1.5° 时，优先尝试摆正。
+  所有最终候选姿态中，最接近支撑法向的无向盒轴倾角不得超过 10°；
+  该限制在 yaw、摆正或附加倾斜之后检查，不会退回超限的原持物姿态。
 
 两个选择参数默认均为 `"1"`，旧合同与身份保持。MuJoCo 释放查询不占用 RealMan
 已有的 `@2` 两段搬运/放置合同。每个部署只装配选定版本的一套注册和执行器；
