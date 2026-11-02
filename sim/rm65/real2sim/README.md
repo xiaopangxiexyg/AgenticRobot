@@ -92,6 +92,28 @@ core and MuJoCo adapter used for the 20260721 fit; tests compare those hashes to
 fixed historical values rather than silently reinterpreting the fit against
 the current files.
 
+MuJoCo 抓取族选择与释放姿态说明使用独立绑定
+`artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261103_mujoco_g2_queries_v1.json`。
+它固定源码 `49f455d283c47dd23ee644b272dc8713d8ee45a8`，基线为 development
+`c88b6e524d62155dc9f866f410b858bdb71dd8d5`；继承前任参数拒绝反馈绑定的全部 232 项非运行时引用。
+203 项已有运行时输入中 4 项改变；新增 `grasp_approach_query_v2.py` 与 `support_release_query_v3.py`，合计 205 项。
+部署显式选择单个 query 版本，默认仍为 grasp@1 / release@1；旧版本 identity 保留，真机 release@2 不变。
+grasp@2 可用 `preferred_family=top_down/side/front` 限定唯一抓取族；省略时沿用原有候选顺序，指定后不跨族回退。
+release@3 增加 `support_tilt_deg`、`held_tilt_from_support_normal_rad`、
+`release_tilt_from_support_normal_rad`、`release_leveling_rad`；它们说明选中支撑区域、实测持物盒和释放建议，
+不是执行后姿态或稳定放置证据，无选中释放建议时为 null。RPent sim_active 优先 grasp@2 / release@3，兼容旧 @1 部署；real_active 保持 release@2。
+新集成组合的离线检查 52 项通过、3 项跳过。
+原 cohort 保留 lower `1a72179369bc0578769adee1998f5142f5a217e3` / upper `898d18e8d1f3be3b340d488fdf1e4914c2d72123` 的实际执行身份；原生结果：1 次自动抓取完整放置链通过；8 个只读查询比较覆盖 top_down/side/front 的可行结果与明确拒绝，不跨族回退。耗时每格仅 1 次，不作统计加速保证。
+原 cohort 模型 API Agent 结果：3 个固定条件各重复 3 次，物理评分 9/9、原生成功规则 9/9；finish 为 8 success、1 reported，接受成功但评分失败为 0。9 次均为自动族选择；reported 不算成功声明。
+中间组合 lower `48803caff6c12adb56c95d491383bf3c1cfd7753` / upper `1bf84001cc790bf79a0f7dd4b5b65abee8c8ee10` 保留原生报告：48803ca 组合的 4 个条件完成稳定释放及 3 s 后观察：指定 side、指定 front、10° 侧斜面、20° 朝向斜面。监测 cube-arm 最大穿透 0.9104 mm。另完整保留 1 次外层 240 s 总时限中断；新槽位加长整场等待后完成，运动与物理门限不变。
+中间组合模型 API Agent 报告：48803ca/1bf8400 组合的 3 个代表条件各 1 次真实 DeepSeek 运行，物理评分和原生成功规则均 3/3，finish 分布 {'success': 3}。独立 harness 9483573 的只读探针覆盖三个指定族的原始模型参数、网关参数与 lower 回显，finish=reported、物理状态不变；不计入放置样本，不证明自主最优族选择。
+新组合 lower `49f455d283c47dd23ee644b272dc8713d8ee45a8` / upper `1bf84001cc790bf79a0f7dd4b5b65abee8c8ee10` 的原生确认：纳入主线 c88b6e5 的 CubeLift/观测修复后，最终 49f455d 组合以指定 side 完成 1 次抓取、抬升、搬运、具名稳定释放及 3 s 后观察。它是针对新增观测路径的确认，不冒充四条件重新运行。
+新组合模型 API Agent 确认：最终 49f455d/1bf8400 组合在远距前向场景完成 1 次真实 DeepSeek 放置，物理评分及原生成功规则为 true，finish=success，cleanup 正常；不是成功率统计。
+独立审阅：原始 14 文件交叉审阅保留。最终组合的 6 个 G2 runtime 文件逐字等同已审的 488 集成；新主线 c88 的 10 个非 README 文件逐字保留，README 自动合并仅增原 G2 段。参数拒绝反馈、上层事件上下文均保留；52 项 focused 通过、3 跳过，上层 1bf 完整门禁另已通过。全部旧/中间/最终运行分开绑定，未访问独立会话或修改其工作树。
+所有本次运行（包括拒绝、失败和中止）应在所绑定报告中完整保留；前任报告作为历史证据保留，不替代本次候选验证。
+1 mm 硬穿透、3 mm/2° 滑移、50 ms 观测间隔、0.6 s 释放窗口及 2 mm 非接触间隙均不变。
+未重新拟合、未执行真机或新增 held-out 资格；绑定仍为 `provisional`。
+
 Gateway 参数 identity 拒绝诊断使用独立绑定
 `artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261103_parameter_feedback_v1.json`，固定源码 `5ee11a896bfaac4a8653eff2f07e5c0c24d26346`（development `99ccb870` 与反馈修复 `0c58a171` 的合并）。
 它继承 closure-entry 绑定的全部非运行时引用；已有 201 项输入仅 `motion_deployment.py` 改变，
