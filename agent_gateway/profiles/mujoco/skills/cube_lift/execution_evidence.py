@@ -16,6 +16,7 @@ from agent_gateway.skills.cube_lift.definition import (
     validate_cube_lift_execution_result_v1,
 )
 from dataset_contracts.canonical_encoding import canonical_content_hash
+from robot_motion.action import AuthoritativeControlStep
 
 from .terminal_evaluator import CubeLiftLowerHoldProof
 
@@ -352,6 +353,10 @@ class CubeLiftExecutionEvidenceCollector:
             field_name="control_domain_id",
         )
         self._cycles: list[CubeLiftExecutionCycleEvidence] = []
+        self._observed_cycle_refs: list[str] = []
+        self._non_dispatch_cycles: list[
+            tuple[int, str, tuple[CubeLiftExecutionFactRef, ...]]
+        ] = []
         self._measurement_hashes: set[str] = set()
         self._last_observer_measurement_count = 0
         self._sealed = False
@@ -374,7 +379,7 @@ class CubeLiftExecutionEvidenceCollector:
             getattr(cycle, "cycle_index", None),
             field_name="cycle_index",
         )
-        if cycle_index != len(self._cycles):
+        if cycle_index != len(self._observed_cycle_refs):
             raise ValueError("CubeLift cycle indexes must be consecutive from zero.")
         cycle_hash = _required(
             getattr(cycle, "semantic_content_hash", None),
@@ -390,6 +395,12 @@ class CubeLiftExecutionEvidenceCollector:
             != self.control_domain_id
         ):
             raise ValueError("CubeLift control cut session/domain mismatch.")
+        execution = getattr(cycle, "execution", None)
+        if getattr(execution, "status", None) in {"not_due", "execution_kept_existing"}:
+            references = self._non_dispatch_execution_refs(execution)
+            self._non_dispatch_cycles.append((cycle_index, execution.status, references))
+            self._observed_cycle_refs.append(f"mujoco-sim-hil-cycle:{cycle_hash}")
+            return
         # A control cut may reuse a valid policy input admitted during
         # activation or an earlier cycle. Bind evidence to the selected input,
         # rather than requiring a new source submission on every control cut.
@@ -428,7 +439,6 @@ class CubeLiftExecutionEvidenceCollector:
         if proposal is None:
             raise ValueError("Accepted CubeLift proposal admission has no proposal.")
 
-        execution = getattr(cycle, "execution", None)
         if execution is None or getattr(execution, "status", None) != "dispatched":
             raise ValueError("CubeLift evidence accepts dispatched cycles only.")
         if (
@@ -664,6 +674,85 @@ class CubeLiftExecutionEvidenceCollector:
         )
         self._measurement_hashes.add(association_hash)
         self._last_observer_measurement_count = observer_count
+        self._observed_cycle_refs.append(f"mujoco-sim-hil-cycle:{cycle_hash}")
+
+    def _non_dispatch_execution_refs(
+        self, execution: AuthoritativeControlStep
+    ) -> tuple[CubeLiftExecutionFactRef, ...]:
+        """Keep lower no-action evidence separate from verified dispatch chains."""
+
+        if not isinstance(execution, AuthoritativeControlStep):
+            raise TypeError("Non-dispatched CubeLift cycles require a lower-owned step.")
+        if any(
+            getattr(execution, field) is not None
+            for field in (
+                "decision", "action_adaptation", "target_execution_request",
+                "target_submission_receipt", "target_completion_receipt",
+                "target_dispatch_result", "safety_result", "resolution_failure",
+                "command", "command_id", "dispatch_context", "dispatch_validation",
+                "dispatch_receipt_id", "cancellation", "cancellation_receipt",
+                "cancellation_dispatch_validation",
+            )
+        ) or execution.dispatch_receipts:
+            raise ValueError("A neutral CubeLift cycle cannot claim dispatch or cancellation.")
+        if execution.status == "not_due":
+            if any(value is not None for value in (
+                execution.snapshot, execution.computation,
+                execution.publication_attempt, execution.directive,
+            )) or execution.trace_facts:
+                raise ValueError("A not-due cycle cannot claim an arbitration decision cut.")
+            return ()
+
+        snapshot = execution.snapshot
+        computation = execution.computation
+        publication = execution.publication_attempt
+        directive = execution.directive
+        if (
+            snapshot is None or computation is None or publication is None
+            or directive is None
+            or snapshot.runtime_session_id != self.runtime_session_id
+            or snapshot.control_domain_id != self.control_domain_id
+            or computation.arbitration_input_snapshot_id
+            != snapshot.arbitration_input_snapshot_id
+            or computation.arbitration_input_hash != snapshot.semantic_content_hash
+            or publication.result_id != computation.result_id
+            or publication.accepted
+            or directive.arbitration_result_id != computation.result_id
+            or directive.publication_fallback != publication.required_fallback
+            or directive.global_status != "normal"
+            or directive.requires_execution_epoch_increment
+            or directive.requires_backend_hold or directive.fault_latched
+            or not directive.directive_by_selection_group
+            or any(
+                item.directive != "keep_existing_until_expiry"
+                or not item.existing_segment_id
+                for item in directive.directive_by_selection_group.values()
+            )
+        ):
+            raise ValueError("CubeLift requires the exact lower keep-existing directive.")
+        facts = tuple(execution.trace_facts)
+        if any(
+            fact.runtime_session_id != self.runtime_session_id
+            or fact.control_domain_id != self.control_domain_id
+            for fact in facts
+        ):
+            raise ValueError("CubeLift neutral trace session/domain mismatch.")
+        trace_refs = _required_trace_refs(
+            facts,
+            event_types=(
+                _AUTHORITY_EVENT_TYPES - {"arbitration_decision"}
+            ) | {"arbitration_publication_rejected"},
+            category="keep-existing authority",
+        )
+        return (
+            _ref(kind="arbitration_input_snapshot", value=snapshot,
+                 id_field="arbitration_input_snapshot_id"),
+            _ref(kind="arbitration_computation", value=computation, id_field="result_id"),
+            _ref(kind="arbitration_publication_attempt", value=publication,
+                 id_field="publication_attempt_id"),
+            _ref(kind="execution_directive", value=directive, id_field="directive_id"),
+            *trace_refs,
+        )
 
     def seal_for_hold(
         self,
@@ -733,6 +822,7 @@ class CubeLiftExecutionEvidenceCollector:
                 "runtime_session_id": self.runtime_session_id,
                 "control_domain_id": self.control_domain_id,
                 "last_cycle_receipt_ref": cycles[-1].cycle_receipt_ref,
+                "last_observed_cycle_receipt_ref": self._observed_cycle_refs[-1],
                 "last_measurement_ref": measurement_refs[-1].to_wire(),
                 "lower_hold_proof_hash": lower_hold_proof.semantic_content_hash,
                 "lower_gate_snapshot_hash": lower_hold_proof.gate_snapshot_hash,
@@ -743,8 +833,14 @@ class CubeLiftExecutionEvidenceCollector:
             {
                 "runtime_session_id": self.runtime_session_id,
                 "control_domain_id": self.control_domain_id,
-                "cycle_receipt_refs": tuple(
-                    cycle.cycle_receipt_ref for cycle in cycles
+                "cycle_receipt_refs": tuple(self._observed_cycle_refs),
+                "non_dispatch_cycles": tuple(
+                    {
+                        "cycle_index": index,
+                        "execution_status": status,
+                        "execution_refs": tuple(ref.to_wire() for ref in refs),
+                    }
+                    for index, status, refs in self._non_dispatch_cycles
                 ),
                 "dispatch_receipt_refs": tuple(
                     cycle.dispatch_receipt_ref for cycle in cycles
@@ -766,7 +862,7 @@ class CubeLiftExecutionEvidenceCollector:
             terminal_state_hash=(
                 f"cube-lift-terminal-control-state:{terminal_state_hash}"
             ),
-            cycle_count=len(cycles),
+            cycle_count=len(self._observed_cycle_refs),
             dispatched_cycle_count=len(cycles),
             measurement_count=len(measurement_refs),
             **category_hashes,

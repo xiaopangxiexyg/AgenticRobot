@@ -134,6 +134,16 @@ release@3 增加 `support_tilt_deg`、`held_tilt_from_support_normal_rad`、
 1 mm 硬穿透、3 mm/2° 滑移、50 ms 观测间隔、0.6 s 释放窗口及 2 mm 非接触间隙均不变。
 未重新拟合、未执行真机或新增 held-out 资格；绑定仍为 `provisional`。
 
+下发前命令碰撞拒绝的类型化异常使用后继绑定
+`artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261103_command_refusal_v1.json`，固定源码 `a1f9351158ee59ec33f47fb6943a7ecdde53c6fd`。
+继承前版 203 项运行时输入，只有 `sim/mujoco/actuation/executor.py` 内容改变；
+原碰撞检查、阈值、拒绝命令及 rig 故障锁存不变。离线 CubeLift 训练仅捕获这一明确异常，
+将回合记为 `arm_command_collision_bound` 并施加既有不安全终止惩罚；未知异常仍上抛。
+被拒命令不计为已接受的 arm command 或新增 physics tick，不能记成实际碰撞。
+当前组合源码的既有定向检查 336 passed，完整门禁与固定种子训练重放另存证据。
+此输入集合并非传递依赖闭包；训练 kernel/PPO 的消费者变化不属于这 203 项 arm 运行时绑定。
+旧清单不变，仍为 `provisional`，没有 refit、新硬件执行或 held-out 资格。
+
 Gateway 参数 identity 拒绝诊断使用独立绑定
 `artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261103_parameter_feedback_v1.json`，固定源码 `5ee11a896bfaac4a8653eff2f07e5c0c24d26346`（development `99ccb870` 与反馈修复 `0c58a171` 的合并）。
 它继承 closure-entry 绑定的全部非运行时引用；已有 201 项输入仅 `motion_deployment.py` 改变，
