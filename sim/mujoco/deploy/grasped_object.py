@@ -128,6 +128,11 @@ class MujocoGraspedObjectObserver:
         return self.measured_closed(measured)
 
     def _reset_generation(self, generation, target):
+        if target == 1. and self._active_inclination_band is not None:
+            # Repeating close continues this physical grasp. Keep the original
+            # relation, attitude and latched failure; only opening revokes it.
+            self._generation = generation
+            return
         # Opening revokes the grasp as before. Only a previously verified grasp
         # arms release diagnostics; initial open/closed commands are not proof.
         released_verified_grasp = target == 0. and self._failure is None and (
@@ -188,7 +193,7 @@ class MujocoGraspedObjectObserver:
 
         An incompatible proposed band leaves the old policy unchanged. A true
         violation of the old policy remains latched; it cannot be washed away
-        by a new release goal. Only a generation reset clears the policy.
+        by a new release goal. Opening clears the policy; repeated close does not.
         """
         if not isinstance(band, ObjectInclinationBand):
             raise TypeError("A grasp inclination policy requires an immutable ObjectInclinationBand.")

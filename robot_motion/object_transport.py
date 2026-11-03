@@ -604,17 +604,22 @@ def _support_tilt_rad(held: GraspedObjectObservation, rotation: np.ndarray, norm
 
 
 def _leveling_rotation(held: GraspedObjectObservation, rotation: np.ndarray,
-                       normal: np.ndarray) -> tuple[np.ndarray, float]:
-    """Smallest turn putting the box axis nearest the support normal onto it, and its angle."""
-    box = rotation @ held.object_from_box[:3, :3]
-    projections = box.T @ normal
-    axis_index = int(np.argmax(np.abs(projections)))
-    current = box[:, axis_index] * (1. if projections[axis_index] >= 0. else -1.)
+                       normal: np.ndarray, *, axis_object_xyz=None) -> tuple[np.ndarray, float]:
+    """Smallest turn aligning the selected signed material axis with the normal."""
+    if axis_object_xyz is None:
+        box = rotation @ held.object_from_box[:3, :3]
+        projections = box.T @ normal
+        axis_index = int(np.argmax(np.abs(projections)))
+        current = box[:, axis_index] * (1. if projections[axis_index] >= 0. else -1.)
+    else:
+        current = rotation @ axis_object_xyz
     cross = np.cross(current, normal)
     sine, cosine = float(np.linalg.norm(cross)), float(current @ normal)
     angle = math.atan2(sine, cosine)
     if sine < 1e-12:
-        return np.eye(3), 0.
+        # An explicitly selected antiparallel axis must retain its pi angle,
+        # so the caller's existing maximum-leveling gate rejects it.
+        return np.eye(3), 0. if axis_object_xyz is None else angle
     axis = cross / sine
     skew = np.array([[0., -axis[2], axis[1]], [axis[2], 0., -axis[0]], [-axis[1], axis[0], 0.]])
     return np.eye(3) + math.sin(angle) * skew + (1. - math.cos(angle)) * (skew @ skew), angle
@@ -667,6 +672,7 @@ def plan_release_approach_candidates(
     lean_toward_xy_m: tuple[float, float] | None = None,
     level_to_support: bool = False,
     limit_release_tilt: bool = False,
+    leveling_axis_object_xyz: tuple[float, float, float] | None = None,
 ) -> tuple[ReleaseApproachCandidate, ...]:
     """Bounded on-support proposals for the existing payload-safe planner.
 
@@ -685,7 +691,11 @@ def plan_release_approach_candidates(
     turns every (yawed) orientation by the smallest rotation that puts the box
     axis nearest the support normal onto it, so the object lands flat on an
     inclined support (or one it leans against in the hand); it excludes a
-    lean. Opt-in, ``limit_release_tilt`` applies the same
+    lean. When ``leveling_axis_object_xyz`` is supplied, it instead aligns that
+    fixed signed unit material axis, expressed in object coordinates; the
+    grasp owner selects it once, and no yaw candidate reselects its sign/axis.
+    The same maximum leveling angle still applies. Opt-in,
+    ``limit_release_tilt`` applies the same
     ``MAXIMUM_RELEASE_LEAN_RAD`` limit to every final orientation, including
     an unchanged or yawed held orientation. A position whose footprint
     misses the region by rounding is dropped; ``NoReleaseCandidates`` reports
@@ -699,6 +709,13 @@ def plan_release_approach_candidates(
         raise TypeError("Nearest-position sampling must be explicitly boolean")
     if type(level_to_support) is not bool:
         raise TypeError("Leveling to the support must be explicitly boolean")
+    if leveling_axis_object_xyz is not None:
+        if not level_to_support:
+            raise ValueError("A fixed leveling axis requires level_to_support")
+        leveling_axis_object_xyz = np.asarray(leveling_axis_object_xyz, dtype=float)
+        if (leveling_axis_object_xyz.shape != (3,) or not np.isfinite(leveling_axis_object_xyz).all()
+                or not np.isclose(np.linalg.norm(leveling_axis_object_xyz), 1., atol=1e-6, rtol=0)):
+            raise ValueError("The fixed leveling axis must be a finite object-frame unit vector")
     if (isinstance(lean_rad, (bool, np.bool_)) or not isinstance(lean_rad, (int, float))
             or not math.isfinite(lean_rad) or not 0. <= lean_rad <= MAXIMUM_RELEASE_LEAN_RAD):
         raise ValueError("Release lean must be finite radians in [0, MAXIMUM_RELEASE_LEAN_RAD]")
@@ -745,7 +762,8 @@ def plan_release_approach_candidates(
         rotation = lean @ z_rotation @ held.reference_from_object[:3, :3]
         leveling = 0.
         if level_to_support:
-            align, leveling = _leveling_rotation(held, rotation, normal)
+            align, leveling = _leveling_rotation(held, rotation, normal,
+                                                 axis_object_xyz=leveling_axis_object_xyz)
             if leveling > MAXIMUM_LEVELING_RAD:
                 tilt_limited = True
                 continue

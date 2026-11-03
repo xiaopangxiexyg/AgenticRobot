@@ -426,6 +426,11 @@ class MujocoSupportReleaseQuery:
             return _rejected(reason="held_object_not_verified_lifted", segmentation=segmentation,
                              measured=measured, **common), tuple(evidence)
         held_pose = [float(v) for v in pose_to_xyz_quat_xyzw(held.reference_from_object)]
+        leveling_axis = None
+        if self._skill is skill_v4:
+            cut = self.observer.observe(phase="carry")
+            anchor = self.observer.grasp_attitude_anchor(command_generation=cut.command_generation)
+            leveling_axis = up_facing_box_axis(anchor, held.object_from_box, (0., 0., 1.))
         evidence += [held.pose_evidence_ref, held.grasp_evidence_ref]
         now = float(self.application.runtime.clock())
         began = time.monotonic()
@@ -458,7 +463,8 @@ class MujocoSupportReleaseQuery:
             region_passes = ((({"yaw_offsets_rad": RELEASE_YAW_OFFSETS_RAD, "level_to_support": True},)
                               if level_first else ()) + passes)
             if self._skill is skill_v4:
-                region_passes = ({"yaw_offsets_rad": RELEASE_YAW_OFFSETS_RAD, "level_to_support": True},)
+                region_passes = ({"yaw_offsets_rad": RELEASE_YAW_OFFSETS_RAD, "level_to_support": True,
+                                  "leveling_axis_object_xyz": leveling_axis},)
             for orientation in region_passes:
                 if "lean_rad" in orientation and float(self.clock()) >= deadline:
                     out_of_time = True
