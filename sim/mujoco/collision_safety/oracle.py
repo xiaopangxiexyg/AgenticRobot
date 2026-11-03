@@ -177,11 +177,15 @@ class CollisionSafetyOracle:
             "nij,nj->ni", np.abs(rotation), self._local_aabb_half
         )
         separation = (
-            np.abs(world_center[self._geom1_ids] - world_center[self._geom2_ids])
-            - world_half[self._geom1_ids]
-            - world_half[self._geom2_ids]
+            np.take(world_center, self._geom1_ids, axis=0)
+            - np.take(world_center, self._geom2_ids, axis=0)
         )
-        aabb_lower_bound = np.linalg.norm(np.maximum(separation, 0.0), axis=1)
+        np.abs(separation, out=separation)
+        separation -= np.take(world_half, self._geom1_ids, axis=0)
+        separation -= np.take(world_half, self._geom2_ids, axis=0)
+        np.maximum(separation, 0.0, out=separation)
+        separation = np.asfortranarray(separation)
+        aabb_lower_bound = np.linalg.norm(separation, axis=1)
         candidate_indices = np.flatnonzero(aabb_lower_bound <= limit)
         for pair_index in candidate_indices:
             pair = self._pairs[int(pair_index)]
