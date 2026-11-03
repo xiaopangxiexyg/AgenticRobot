@@ -428,6 +428,7 @@ def test_object_support_v2_is_opt_in_and_reuses_the_same_physics_owner(tmp_path,
             lifecycle.motion_profile = profile
             lifecycle.request = SimpleNamespace(parameters=parameters)
             lifecycle._phase = "place"
+            lifecycle._attitude_v3 = lifecycle._release_approach = False
             lifecycle._object_id = "debug_cube"
             lifecycle._support_object_id = "large_blue_cube"
             lifecycle._object_observer = SimpleNamespace(
