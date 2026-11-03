@@ -102,6 +102,7 @@ def goal_delta_teacher_action(
     lift_step_m: float = 0.004,
     pick_close_distance_m: float = 0.035,
     pick_lift_active: Any | None = None,
+    pick_lift_lock_xy: bool = False,
 ) -> np.ndarray:
     """Map actor-visible target/closure state to the task's latent action.
 
@@ -216,6 +217,12 @@ def goal_delta_teacher_action(
             lift_active,
             proprio[..., 27] <= 0.5,
         )
+        if pick_lift_lock_xy:
+            # Label zero requested base-frame XY even in the first settling
+            # cycle. The fitted actor still receives no simulator phase field.
+            desired_task_action[..., :2] = np.where(
+                lift_active[..., None], np.float32(0.0), desired_task_action[..., :2]
+            )
         desired_task_action[..., 2] = np.where(
             lift_motion_active,
             np.clip(lift_step / tcp_scale[2], 0.0, 1.0),
@@ -288,6 +295,7 @@ def collect_goal_delta_bootstrap_dataset(
                 task_observation,
                 lift_step_m=config.lift_step_m,
                 pick_close_distance_m=config.pick_close_distance_m,
+                pick_lift_lock_xy=config.pick_lift_lock_xy,
                 pick_lift_active=(
                     np.asarray(
                         [
@@ -376,6 +384,10 @@ def collect_goal_delta_bootstrap_dataset(
         target_actions=np.ascontiguousarray(target_actions, dtype=np.float32),
         collection_metadata={
             "bootstrap_id": GOAL_DELTA_ACTOR_BOOTSTRAP_ID,
+            "pick_lift_xy_mode": (
+                "zero_requested_base_xy" if config.pick_lift_lock_xy
+                else "target_centering"
+            ) if task_config.task_objective == LIFT_TASK_OBJECTIVE else "not_applicable",
             "teacher_source": (
                 "optional_sim_contact_phase_teacher_plus_actor_observation"
                 ".proprio_and_reach_target_delta"

@@ -465,6 +465,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--record-root", type=Path, default=DEFAULT_RECORD_ROOT)
     parser.add_argument("--run-name", default=None)
+    parser.add_argument(
+        "--goal-delta-bootstrap-lock-lift-xy",
+        action="store_true",
+        help="Set Pick teacher XY requests to zero in lift, without adding actor phase input.",
+    )
     parser.add_argument("--total-timesteps", type=int, default=200_000)
     parser.add_argument("--num-envs", type=int, default=4)
     parser.add_argument("--rollout-steps", type=int, default=128)
@@ -620,6 +625,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         learning_rate=args.goal_delta_bootstrap_learning_rate,
         target_mse=args.goal_delta_bootstrap_target_mse,
         lift_step_m=args.goal_delta_bootstrap_lift_step_m,
+        pick_lift_lock_xy=args.goal_delta_bootstrap_lock_lift_xy,
         pick_close_distance_m=(
             args.goal_delta_bootstrap_pick_close_distance_m
         ),

@@ -343,6 +343,14 @@ use the simulator post-contact phase only inside this optional teacher to label
 lift samples. That phase is never appended to the 31-D actor observation, and
 both evaluation and deployment run without it.
 
+For a Pick contact that loses stability under continued target centering,
+`--goal-delta-bootstrap-lock-lift-xy` optionally labels zero requested base-frame
+XY increments during the reported lift phase, including its first settling
+cycle. The default retains target centering. This changes teacher labels only;
+the actor keeps the same observations and stationary action mapping. Zero XY
+requests do not guarantee zero actual TCP drift. Record the explicit lift step
+and assess collected teacher success and fitted actor success separately.
+
 ```bash
 python -m sim.mujoco_temp_pipeline.train \
   --task-config sim/configs/tasks/rm65_right_cube_reach_goal_delta_overhead_progress_xyz_v4.json \

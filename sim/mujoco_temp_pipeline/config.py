@@ -445,6 +445,7 @@ class GoalDeltaActorBootstrapConfig:
     max_grad_norm: float = 1.0
     lift_step_m: float = 0.004
     pick_close_distance_m: float = 0.035
+    pick_lift_lock_xy: bool = False
 
     def __post_init__(self) -> None:
         if int(self.transitions) < 0:
