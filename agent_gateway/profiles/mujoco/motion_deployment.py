@@ -3717,7 +3717,7 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
                 **({"object_id": grasp_contact_binding.target_body_name,
                     "object_clock_domain_id": "mujoco-native-physics:" + exact["runtime_session_id"]}
                    | ({"object_support_body_names": object_support_body_names}
-                      if safe_route.skill_version == "2" else {})
+                      if safe_route.skill_version in {"2", "3"} else {})
                    if safe_route.skill_id == GRASPED_OBJECT_MOVE_SKILL_ID else {}),
             )
         )
