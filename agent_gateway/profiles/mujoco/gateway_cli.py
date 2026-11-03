@@ -311,6 +311,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="opt in to place-on-selected-object v2; requires --enable-object-motion and --object-support-body",
     )
     parser.add_argument(
+        "--enable-object-attitude-motion-v3", action="store_true",
+        help="opt in to inclination-preserving lift/carry and controlled release approach v3; "
+             "requires --enable-object-motion and --enable-object-support-motion-v2",
+    )
+    parser.add_argument(
         "--enable-named-release-v3", action="store_true",
         help="replace the gripper v2 Route with v3 named-support release; requires the right-hand object-support graph",
     )
@@ -320,9 +325,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--enable-support-release-queries", action="store_true",
-        help="publish read-only perception.query_support_release_pose@1 (measured support top, held box, "
-             "payload-safe carry check); requires --enable-named-release-v3, segmentation and "
+        help="publish the selected read-only perception.query_support_release_pose version "
+             "(measured support top, held box, payload-safe path check); "
+             "requires --enable-named-release-v3, segmentation and "
              "--support-release-prompt",
+    )
+    parser.add_argument(
+        "--support-release-query-version", choices=("1", "3", "4"), default="1",
+        help="select one release query version; v4 requires --enable-object-attitude-motion-v3",
     )
     parser.add_argument(
         "--support-release-prompt", action="append", default=[], metavar="SUPPORT=PROMPT",
@@ -765,6 +775,11 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--enable-object-support-motion-v2 requires --object-support-body, and vice versa")
     if args.enable_object_support_motion_v2 and not args.enable_object_motion:
         parser.error("--enable-object-support-motion-v2 requires --enable-object-motion")
+    if args.enable_object_attitude_motion_v3 and not (
+        args.enable_object_motion and args.enable_object_support_motion_v2
+    ):
+        parser.error("--enable-object-attitude-motion-v3 requires --enable-object-motion "
+                     "and --enable-object-support-motion-v2")
     if args.enable_named_release_v3 and not (
         args.enable_object_support_motion_v2 and args.enable_grippers
         and args.enable_object_follow_observation and args.enable_object_motion
@@ -777,6 +792,10 @@ def main(argv: list[str] | None = None) -> int:
                      "--support-release-prompt and --artifact-root with segmentation")
     if (args.support_release_prompt or args.support_release_role) and not args.enable_support_release_queries:
         parser.error("--support-release-prompt/--support-release-role require --enable-support-release-queries")
+    if args.support_release_query_version != "1" and not args.enable_support_release_queries:
+        parser.error("--support-release-query-version 3/4 requires --enable-support-release-queries")
+    if args.support_release_query_version == "4" and not args.enable_object_attitude_motion_v3:
+        parser.error("--support-release-query-version 4 requires --enable-object-attitude-motion-v3")
     support_release_prompts = {}
     for item in args.support_release_prompt:
         support, separator, prompt = item.partition("=")
@@ -1011,9 +1030,11 @@ def main(argv: list[str] | None = None) -> int:
         enable_object_follow_observation=args.enable_object_follow_observation,
         enable_object_motion=args.enable_object_motion,
         enable_object_support_motion_v2=args.enable_object_support_motion_v2,
+        enable_object_attitude_motion_v3=args.enable_object_attitude_motion_v3,
         enable_named_release_v3=args.enable_named_release_v3,
         object_support_body_names=tuple(args.object_support_body),
         enable_support_release_queries=args.enable_support_release_queries,
+        support_release_query_version=args.support_release_query_version,
         support_release_prompt_by_id=support_release_prompts or None,
         support_release_roles=tuple(args.support_release_role) or None,
         enable_grasp_approach_queries=args.enable_grasp_approach_queries,
