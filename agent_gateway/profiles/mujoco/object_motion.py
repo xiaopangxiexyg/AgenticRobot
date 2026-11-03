@@ -330,7 +330,7 @@ class MujocoAgentObjectMotionLifecycle(MujocoAgentSafeTcpPoseSkillLifecycle):
     def _terminal_state_evidence(self, public_final_pose, measured_at):
         cut = self._object_observer.observe(phase=self._phase)
         self._object_terminal = {
-            "object_id": self._object_id, "phase": getattr(self, "_public_phase", self._phase),
+            "object_id": self._object_id, "phase": self._public_phase,
             "reference_frame_id": self.motion_profile.reference_frame_id,
             "pose_xyz_quat_xyzw": list(pose_to_xyz_quat_xyzw(self._public_from_world() @ cut.world_from_object)),
             "measured_at": cut.sim_time_s,

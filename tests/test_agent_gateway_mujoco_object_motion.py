@@ -165,6 +165,7 @@ def test_object_terminal_hash_input_contains_measured_body_goal_and_native_clock
     lifecycle.deployment_binding = SimpleNamespace(control_domain_id="domain")
     lifecycle.motion_profile = _profile()
     lifecycle._object_id, lifecycle._phase = "debug_cube", "carry"
+    lifecycle._public_phase = "carry"
     lifecycle._support_object_id = None
     obj = np.eye(4)
     obj[:3, 3] = (.1, .2, .3)
@@ -188,6 +189,7 @@ def test_object_stage_commits_only_after_plan_activation_on_the_live_cut(monkeyp
     scene = SimpleNamespace(data=object())
     lifecycle = object.__new__(MujocoAgentObjectMotionLifecycle)
     lifecycle._phase = "place"
+    lifecycle._inclination_band = None
     lifecycle._support_object_id = None
     lifecycle.application = SimpleNamespace(runtime=SimpleNamespace(
         rig=SimpleNamespace(capture_scene=lambda callback: callback(scene))))

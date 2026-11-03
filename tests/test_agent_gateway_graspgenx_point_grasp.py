@@ -325,7 +325,7 @@ def _asset_bundle(tmp_path: Path) -> Path:
                 "schema_version": "dexteleop.perception_graspgenx_point_grasp_assets.v1",
                 "model_profile_id": "graspgenx-test",
                 "source": {
-                    "git_url": "https://github.com/NVlabs/GraspGenX.git",
+                    "git_url": "https://github.com/CYBER-QAQ/GraspGenX.git",
                     "revision": GRASPGENX_REVIEWED_REVISION,
                     "license": "Apache-2.0",
                 },

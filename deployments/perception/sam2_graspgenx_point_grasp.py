@@ -68,7 +68,7 @@ from .sam2_vgn_point_grasp import (
     Sam2VgnPointGraspPlanner,
 )
 
-GRASPGENX_GIT_URL = "https://github.com/NVlabs/GraspGenX.git"
+GRASPGENX_GIT_URL = "https://github.com/CYBER-QAQ/GraspGenX.git"
 GRASPGENX_REVIEWED_REVISION = "d9464a263f2bcb7ad70b13d75de04cadde8d9ff7"
 GRASPGENX_CHECKPOINT_GIT_URL = "https://huggingface.co/adithyamurali/GraspGenXModel"
 GRASPGENX_CHECKPOINT_REVIEWED_REVISION = "7c834043c11a11417e31d6d5ea9355801e40a2c1"
