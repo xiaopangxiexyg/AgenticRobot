@@ -187,6 +187,13 @@ def build_support_release_query_registration(*, segmentation, back_projection, r
             "maximum_final_tilt_from_support_normal_rad": MAXIMUM_RELEASE_LEAN_RAD,
             "tilt_measure": "closest_unoriented_measured_box_axis",
         }} if skill_version == "3" else {}),
+        **({"release_orientation": {
+            "level_to_support_only": True,
+            "tilt_axis": "same_signed_material_box_axis_from_original_grasp",
+            "ordinary_inclination_deviation_rad": OBJECT_INCLINATION_DEVIATION_RAD_V3,
+            "release_inclination_band": "original_grasp_to_support_aligned_goal",
+            "object_motion_phase": "release_approach",
+        }} if skill_version == "4" else {}),
     }, domain="agenticrobot.support_release_query.profile.v" + skill_version)
     definition = contract.definition()
     schema = contract.schema(definition_hash=definition.semantic_content_hash, profile_hash=profile_hash,

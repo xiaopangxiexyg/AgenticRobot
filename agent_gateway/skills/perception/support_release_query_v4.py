@@ -38,7 +38,7 @@ def schema(**kwargs):
     properties = dict(result["properties"])
     properties["semantics"] = {"const": SEMANTICS}
     result["properties"] = properties
-    return replace(base, execution_result_schema=result,
+    return replace(base, skill_version=SKILL_VERSION, execution_result_schema=result,
         parameter_profiles=tuple(replace(item, parameter_profile_id="support-release-pose-v4")
                                  for item in base.parameter_profiles))
 
