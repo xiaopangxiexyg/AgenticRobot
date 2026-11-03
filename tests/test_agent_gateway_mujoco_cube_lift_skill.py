@@ -228,6 +228,8 @@ class _FakeApplication:
             snapshot=self._measurement_snapshot
         )
         self.started = False
+        self.closed = False
+        self.execution_finished = False
         self.next_decision_at = None
 
     @staticmethod
@@ -260,9 +262,15 @@ class _FakeApplication:
         self.calls.append("application.end_episode")
         return _hold_transition()
 
+    def finish_episode_execution(self) -> None:
+        self.calls.append("application.finish_episode_execution")
+        self.started = False
+        self.execution_finished = True
+
     def close(self) -> None:
         self.calls.append("application.close")
         self.started = False
+        self.closed = True
 
 
 class _FakeTraceCapture:
@@ -419,13 +427,16 @@ def test_success_orders_hold_evaluation_episode_commit_and_runtime_terminal() ->
         "collector.seal_for_hold",
         "terminal.evaluate",
         "trace.finalize",
-        "application.close",
+        "application.finish_episode_execution",
         "trace.complete_runtime",
         "trace.close",
     ]
 
     lifecycle.close()
     assert calls[-1] == "trace.close"
+    assert lifecycle._closed is True
+    assert lifecycle.application.execution_finished is True
+    assert lifecycle.application.closed is False
 
 
 def test_cancel_forces_lower_hold_then_close_aborts_uncommitted_episode() -> None:
@@ -444,6 +455,7 @@ def test_cancel_forces_lower_hold_then_close_aborts_uncommitted_episode() -> Non
     )
     lifecycle.close()
 
+    assert lifecycle.application.closed is True
     assert control.succeeded is True
     assert control.lower_hold_confirmed is True
     assert calls == [

@@ -341,7 +341,7 @@ class MujocoSimHILApplication(
                 fault_class = None
             elif self._episode_ended:
                 lifecycle_state = "episode_ended"
-                gate = self.runtime.capture_execution_gate_snapshot(
+                gate = self.runtime.authoritative_port.capture_execution_gate_snapshot(
                     now=captured_at
                 )
                 execution_gate = str(gate.status)
@@ -1221,6 +1221,10 @@ class MujocoSimHILApplication(
                 raise RuntimeError(
                     "The Sim-HIL application is closed and must be rebuilt."
                 )
+            if self._composition_close_complete:
+                raise RuntimeError(
+                    "The Sim-HIL execution is closed and must be rebuilt."
+                )
             if self._human_input_check_active:
                 raise RuntimeError(
                     "Sim-HIL cannot start while passive human input "
@@ -1995,85 +1999,113 @@ class MujocoSimHILApplication(
         self._last_error = None
         return report, operation_receipt
 
-    def close(self) -> None:
+    def _close_execution_locked(self) -> list[BaseException]:
+        """Drain the sole lower executor and terminalize its trace once."""
+
+        errors: list[BaseException] = []
+        composition_started = bool(
+            getattr(self.composition, "started", False)
+        )
+        composition_close = getattr(self.composition, "close", None)
+        composition_close_required = bool(
+            composition_started
+            or self._started
+            or self._sources_started
+            or self._restart_required
+        )
+        if not composition_started and not callable(composition_close):
+            # Compatibility compositions that fail before entering their
+            # lifecycle historically need no lower close.  The application
+            # must still release sources/viewer already opened by warm-up.
+            composition_close_required = False
+        if (
+            not self._composition_close_complete
+            and not composition_close_required
+        ):
+            # Preserve the historical no-start/preview-only behavior:
+            # a composition that was never entered owns nothing to close.
+            self._composition_close_complete = True
+        if self._close_human_source_required is None:
+            application_owns_human = bool(
+                self.control_cycle_port.spec.application_owns_human_source_close
+            )
+            self._close_human_source_required = bool(
+                (application_owns_human and composition_started)
+                or (self._sources_started and not composition_started)
+            )
+
+        if not self._composition_close_complete and composition_started:
+            try:
+                self.hold(reason="shutdown")
+            except BaseException as error:  # noqa: BLE001 - cleanup continues.
+                errors.append(error)
+
+        if not self._control_cycle_close_complete:
+            try:
+                self.control_cycle_port.close()
+            except BaseException as error:  # noqa: BLE001 - cleanup continues.
+                errors.append(error)
+            else:
+                self._control_cycle_close_complete = True
+
+        if not self._composition_close_complete:
+            try:
+                if not callable(composition_close):
+                    raise TypeError(
+                        "Started Sim-HIL composition must expose close()."
+                    )
+                composition_close()
+            except BaseException as error:  # noqa: BLE001 - retry owns runtime.
+                errors.append(error)
+            else:
+                self._composition_close_complete = True
+
+        lower_close_complete = bool(
+            self._control_cycle_close_complete
+            and self._composition_close_complete
+        )
+        if not lower_close_complete:
+            self._last_error = ";".join(
+                f"{type(error).__name__}:{error}" for error in errors
+            )
+            raise RuntimeError(
+                "Sim-HIL close encountered lower-runtime errors: "
+                + self._last_error
+            ) from errors[0]
+
+        self._started = False
+        return errors
+
+    def finish_episode_execution(self) -> None:
+        """Close execution while the session still owns passive scene access.
+
+        The episode must already have ended under HOLD. The rig is drained
+        and its trace becomes terminal; no subsequent execution can restart.
+        Sources and the viewer are released by the later application close.
+        """
+
         with self._lock:
             if self._closed:
-                return
-            errors: list[BaseException] = []
-            composition_started = bool(
-                getattr(self.composition, "started", False)
-            )
-            composition_close = getattr(self.composition, "close", None)
-            composition_close_required = bool(
-                composition_started
-                or self._started
-                or self._sources_started
-                or self._restart_required
-            )
-            if not composition_started and not callable(composition_close):
-                # Compatibility compositions that fail before entering their
-                # lifecycle historically need no lower close.  The application
-                # must still release sources/viewer already opened by warm-up.
-                composition_close_required = False
-            if (
-                not self._composition_close_complete
-                and not composition_close_required
-            ):
-                # Preserve the historical no-start/preview-only behavior:
-                # a composition that was never entered owns nothing to close.
-                self._composition_close_complete = True
-            if self._close_human_source_required is None:
-                application_owns_human = bool(
-                    self.control_cycle_port.spec.application_owns_human_source_close
-                )
-                self._close_human_source_required = bool(
-                    (application_owns_human and composition_started)
-                    or (self._sources_started and not composition_started)
-                )
-
-            if not self._composition_close_complete and composition_started:
-                try:
-                    self.hold(reason="shutdown")
-                except BaseException as error:  # noqa: BLE001 - cleanup continues.
-                    errors.append(error)
-
-            if not self._control_cycle_close_complete:
-                try:
-                    self.control_cycle_port.close()
-                except BaseException as error:  # noqa: BLE001 - cleanup continues.
-                    errors.append(error)
-                else:
-                    self._control_cycle_close_complete = True
-
-            if not self._composition_close_complete:
-                try:
-                    if not callable(composition_close):
-                        raise TypeError(
-                            "Started Sim-HIL composition must expose close()."
-                        )
-                    composition_close()
-                except BaseException as error:  # noqa: BLE001 - retry owns runtime.
-                    errors.append(error)
-                else:
-                    self._composition_close_complete = True
-
-            lower_close_complete = bool(
-                self._control_cycle_close_complete
-                and self._composition_close_complete
-            )
-            if not lower_close_complete:
+                raise RuntimeError("The Sim-HIL application is closed.")
+            if not self._episode_ended:
+                raise RuntimeError("Execution completion requires episode end.")
+            errors = self._close_execution_locked()
+            if errors:
                 self._last_error = ";".join(
                     f"{type(error).__name__}:{error}" for error in errors
                 )
                 raise RuntimeError(
-                    "Sim-HIL close encountered lower-runtime errors: "
+                    "Sim-HIL execution close encountered errors: "
                     + self._last_error
                 ) from errors[0]
 
-            # The control-cycle bindings and composition/runtime no longer own
-            # execution or shared simulation data.  Only now can source and
-            # native-viewer teardown proceed.
-            self._started = False
+    def close(self) -> None:
+        with self._lock:
+            if self._closed:
+                return
+            errors = self._close_execution_locked()
+            # Execution and its trace are closed before session-owned sources
+            # and the passive viewer release their shared simulation data.
             if (
                 self._close_human_source_required
                 and not self._human_source_close_complete

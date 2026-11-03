@@ -2017,6 +2017,15 @@ HOLD, or other terminal execution statuses return execution failure with the
 lower reason and confirmed HOLD, without a task evaluation. Deadline and
 persistence decisions remain with the lower runtime.
 
+After a normally evaluated CubeLift episode, the Sim-HIL application closes its
+execution runtime and durable trace while retaining passive scene access under
+the ended episode's HOLD. Same-session TCP reads acquire a new locked scene and
+control cut; they do not replay the terminal measurement or restart execution.
+The Gateway session closes these retained application resources after confirmed
+HOLD and worker drain. Pending drain or missing HOLD proof is not a successful
+close and retains the resources for explicit retry. Failure cleanup still fully
+closes the application; reads after that close remain invalid.
+
 ## Observation and visual cuts
 
 Low-rate state observations and pull-based visual captures are separate. RGB is

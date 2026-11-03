@@ -463,8 +463,9 @@ class ControlTraceEpisodeSessionCapture:
     def complete_runtime(self) -> ControlTraceSessionFinalizationReceipt:
         """Join one durable commit with the later durable terminal fact.
 
-        The owning application must already be closed so its lower runtime has
-        emitted exactly one ``runtime_trace_terminal`` outside the episode.
+        The owning execution runtime must already be closed and have emitted
+        exactly one ``runtime_trace_terminal`` outside the episode. A simulator
+        application may retain passive scene resources until session close.
         """
 
         with self._lock:

@@ -307,7 +307,14 @@ class CubeLiftAgentSkillLifecycle:
         ):
             if not callable(getattr(trace_capture, method_name, None)):
                 raise TypeError(f"trace_capture must expose {method_name}().")
-        for method_name in ("start", "step", "hold", "end_episode", "close"):
+        for method_name in (
+            "start",
+            "step",
+            "hold",
+            "end_episode",
+            "finish_episode_execution",
+            "close",
+        ):
             if not callable(getattr(application, method_name, None)):
                 raise TypeError(f"application must expose {method_name}().")
         if not isinstance(evidence_collector, CubeLiftExecutionEvidenceCollector):
@@ -719,12 +726,11 @@ class CubeLiftAgentSkillLifecycle:
         with self._state_lock:
             self._trace_finalized = True
             self._trace_prepared = False
-        self.application.close()
+        self.application.finish_episode_execution()
         trace_finalization = self.trace_capture.complete_runtime()
         self.trace_capture.close(now=float(self.clock()))
         with self._state_lock:
             self._trace_finalization = trace_finalization
-            self._closed = True
         execution_result = execution_cut.to_execution_result(
             lower_hold_proof=proof,
             trace_finalization=trace_finalization,
@@ -823,10 +829,15 @@ class CubeLiftAgentSkillLifecycle:
                     self._trace_prepared = False
                 except BaseException as error:  # noqa: BLE001 - cleanup continues.
                     errors.append(error)
-            try:
-                self.application.close()
-            except BaseException as error:  # noqa: BLE001 - retain the dependent trace owner.
-                errors.append(error)
+            if not (
+                self._trace_finalized and self._trace_finalization is not None
+            ):
+                try:
+                    self.application.close()
+                except BaseException as error:  # noqa: BLE001 - retain the dependent trace owner.
+                    errors.append(error)
+            # A completed episode released execution and its durable trace.
+            # Its passive application resources remain owned by the session.
             # Failed cleanup retains the trace owner for the same close retry.
             if (
                 not errors

@@ -146,13 +146,35 @@ class MujocoCubeLiftAgentGatewaySession:
         """Close the Gateway through its HOLD-first service boundary once."""
 
         with self._close_lock:
-            if self._close_outcome is None:
-                self._close_outcome = self.service.close(
-                    current_station_revision=(
-                        self.observation_producer.current_station_revision
-                    )
+            if self._close_outcome is not None:
+                return self._close_outcome
+            outcome = self.service.close(
+                current_station_revision=(
+                    self.observation_producer.current_station_revision
                 )
-            return self._close_outcome
+            )
+            if not outcome.accepted:
+                return outcome
+            if outcome.port_receipt is None:
+                return AgentGatewayOperationOutcome(
+                    False,
+                    "cube_lift_session_close_hold_unconfirmed",
+                    outcome.operation,
+                )
+            self.worker.close_after_hold(hold_receipt=outcome.port_receipt)
+            if not self.worker.thread_drained:
+                return AgentGatewayOperationOutcome(
+                    False,
+                    "cube_lift_session_worker_shutdown_pending",
+                    outcome.operation,
+                    outcome.port_receipt,
+                )
+            # The worker can no longer start or access application resources.
+            # Retry any prior lifecycle failure before releasing passive data.
+            self.lifecycle.close()
+            self.application.close()
+            self._close_outcome = outcome
+            return outcome
 
 
 def assemble_mujoco_cube_lift_agent_gateway_session(

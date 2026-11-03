@@ -2747,6 +2747,17 @@ def test_application_close_waits_for_runtime_before_sources_and_viewer() -> None
     assert human_source.close_calls == 0
     assert viewer.close_calls == 0
 
+    app._episode_ended = True
+    app.finish_episode_execution()
+
+    assert app._closed is False
+    assert app.started is False
+    assert policy_source.close_calls == 0
+    assert human_source.close_calls == 1
+    assert viewer.close_calls == 0
+    with pytest.raises(RuntimeError, match="execution is closed"):
+        app.start()
+
     app.close()
 
     assert app._closed is True

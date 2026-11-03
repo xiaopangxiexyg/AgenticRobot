@@ -484,6 +484,13 @@ class BoundedStationAgentSkillOperationWorker:
             return self._state
 
     @property
+    def thread_drained(self) -> bool:
+        """Report release readiness after close_after_hold fences launches."""
+
+        with self._condition:
+            return self._thread is None or not self._thread.is_alive()
+
+    @property
     def operation_id(self) -> str | None:
         with self._condition:
             return self._operation_id

@@ -184,7 +184,8 @@ def _task() -> SimpleNamespace:
 def _application() -> SimpleNamespace:
     composition = _composition()
     task = _task()
-    return SimpleNamespace(
+    application = SimpleNamespace(
+        closed=False,
         config=SimpleNamespace(
             runtime_session_id=RUNTIME_SESSION_ID,
             control_domain_id=CONTROL_DOMAIN_ID,
@@ -235,6 +236,9 @@ def _application() -> SimpleNamespace:
             },
         ),
     )
+    application.close = lambda: setattr(application, "closed", True)
+    return application
+
 
 
 def _execution_manifest(application):
@@ -503,6 +507,7 @@ def test_application_passive_cut_is_no_start_no_step_and_uses_existing_owner() -
         return SimpleNamespace(status="hold", gate_epoch=9)
 
     runtime.capture_execution_gate_snapshot = capture_gate
+    runtime.authoritative_port.capture_execution_gate_snapshot = capture_gate
     application.runtime = runtime
 
     configured = application.capture_passive_application_cut(
@@ -523,6 +528,24 @@ def test_application_passive_cut_is_no_start_no_step_and_uses_existing_owner() -
     assert held.execution_gate == "hold"
     assert held.execution_gate_epoch == 9
     assert calls == {"scene": 2, "gate": 1}
+
+    application._started = False
+    application._episode_ended = True
+    ended = application.capture_passive_application_cut(
+        scene_projector=lambda scene: {"scene": scene}
+    )
+    assert ended.lifecycle_state == "episode_ended"
+    assert ended.execution_gate == "hold"
+    assert ended.scene_projection == {"scene": "scene:test"}
+    assert calls == {"scene": 3, "gate": 2}
+
+    application._closed = True
+    closed = application.capture_passive_application_cut(
+        scene_projector=lambda scene: {"scene": scene}
+    )
+    assert closed.lifecycle_state == "closed"
+    assert closed.scene_projection is None
+    assert calls == {"scene": 3, "gate": 2}
 
 
 @pytest.mark.integration
@@ -957,7 +980,10 @@ def test_exact_gateway_session_launches_one_fail_closed_station_worker(
     assert replay["accepted"]
     assert replay["idempotent_replay"]
     assert replay["operation"]["operation_id"] == operation_id
+    assert not application.closed
     assert session.close().accepted
+    assert application.closed
+    assert session.worker.thread_drained
 
 
 @pytest.mark.integration
