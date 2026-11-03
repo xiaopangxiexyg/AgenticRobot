@@ -111,6 +111,20 @@ resolved by the same helper as the training kernel. This observation reference
 is independent of the software TCP used to emit the public absolute-pose action.
 The real-robot external estimator/FK source and its calibration are not wired
 or proven by this simulation adapter.
+
+The native TempPPO Sim-HIL profile rejects tasks with
+`pose_target_anti_windup=True`. The task kernel may reanchor its pose target
+after an IK/safety intervention; the native policy source retains its previous
+policy target and records downstream feedback without rebasing it. Equal task
+hashes therefore do not establish equivalent action-state dynamics between
+these executors. This admission check leaves both execution paths unchanged.
+Use a checkpoint trained under a matching native action-state contract. Do not
+flip a historical task flag or override checkpoint metadata to admit old weights.
+Setting the flag to false alone is not evidence of deployment qualification.
+Historical native experiments that admitted anti-windup tasks retain their
+recorded observations and safety/task outcomes; they do not qualify those
+checkpoints as matching the native execution contract.
+
 The progress-only v3 Reach profile removes the old per-step absolute proximity
 reward. A stationary policy therefore receives no dense reach return; only
 measured reduction in target distance and terminal success are positive. This

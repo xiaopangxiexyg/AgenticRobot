@@ -110,6 +110,14 @@ def validate_temp_ppo_hil_profile(
         raise ValueError("Temporary PPO Sim-HIL requires a pose-action task.")
     if task_config.action_layout != CUBE_LIFT_POSE_ACTION_LAYOUT_VERSION:
         raise ValueError("Temporary PPO task action layout is not the pose layout.")
+    if task_config.pose_target_anti_windup:
+        raise ValueError(
+            "Temporary PPO Sim-HIL does not support pose_target_anti_windup=True: "
+            "its sequential decoder retains the previous policy target and "
+            "does not implement the task kernel's post-intervention reanchor. "
+            "Use a checkpoint trained with a matching action-state contract; "
+            "do not override task metadata to bypass this check."
+        )
     supported_layout_dims = {
         CUBE_LIFT_NORMAL_MOTION_TRACKING_NO_EPISODE_CLOCK_OBSERVATION_LAYOUT_VERSION: 28,
         CUBE_LIFT_NORMAL_MOTION_TRACKING_NO_EPISODE_CLOCK_CUBE_POSE_OBSERVATION_LAYOUT_VERSION: 35,

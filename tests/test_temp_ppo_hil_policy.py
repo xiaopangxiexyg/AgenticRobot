@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 from robot_motion.deploy import (
     POLICY_SOURCE_ACTION_SEQUENTIAL_TARGET_DELTA,
@@ -298,9 +299,15 @@ def test_35d_observation_includes_cube_and_deltas_advance_at_policy_cadence() ->
     )
 
 
-def test_goal_delta_observation_is_deployable_and_uses_pose_action_frame() -> None:
+@pytest.mark.parametrize("pose_target_anti_windup", (False, True))
+def test_goal_delta_observation_is_deployable_and_uses_pose_action_frame(
+    pose_target_anti_windup: bool,
+) -> None:
     scene = _ObservationScene()
-    config = CubeLiftTaskConfig.load(TASK_CONFIG_38_PATH)
+    config = replace(
+        CubeLiftTaskConfig.load(TASK_CONFIG_38_PATH),
+        pose_target_anti_windup=pose_target_anti_windup,
+    )
     adapter = TempPPOHILObservationAdapter(
         scene,
         config,
@@ -313,6 +320,10 @@ def test_goal_delta_observation_is_deployable_and_uses_pose_action_frame() -> No
         active_action_indices=(0, 1, 2),
     )
 
+    if pose_target_anti_windup:
+        with pytest.raises(ValueError, match="pose_target_anti_windup=True"):
+            validate_temp_ppo_hil_profile(config, policy)
+        return
     validate_temp_ppo_hil_profile(config, policy)
     observation = adapter.capture(step_index=0)
 
@@ -469,7 +480,10 @@ def test_pick_goal_delta_xyz_gripper_profile_uses_generic_hil_projection() -> No
             assert values.shape == (31,)
             return values
 
-    config = CubeLiftTaskConfig.load(TASK_CONFIG_PICK_XYZ_GRIPPER_PATH)
+    config = replace(
+        CubeLiftTaskConfig.load(TASK_CONFIG_PICK_XYZ_GRIPPER_PATH),
+        pose_target_anti_windup=False,
+    )
     policy_contract = SimpleNamespace(
         observation_dim=31,
         action_dim=4,
