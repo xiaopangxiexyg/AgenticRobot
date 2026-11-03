@@ -830,3 +830,10 @@ motion should stop at the safety boundary instead of moving through the table.
 Treat reward and success metrics from this mismatched run as invalid: the
 override is a collision regression tool, not a general checkpoint compatibility
 mechanism. Without the explicit override, hash mismatch remains a hard error.
+
+Evaluation diagnostics use the same balanced episode quota as success and return
+metrics. Each worker contributes its first requested quota of complete episodes,
+including terminal steps. Auto-reset workers continue while other workers finish;
+these additional actions and their forbidden-contact/hard-violation counts are
+reported separately in `surplus_execution`. The physical batch, checkpoint
+inference, collision event tracking, and safety behavior are unchanged.

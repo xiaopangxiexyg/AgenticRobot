@@ -145,6 +145,9 @@ def run(args: argparse.Namespace) -> dict[str, object]:
     projected_actions = 0
     rejected_actions = 0
     evaluated_actions = 0
+    surplus_actions = 0
+    surplus_forbidden_contacts = 0
+    surplus_hard_violations = 0
     blocking_body_pairs: Counter[str] = Counter()
     blocking_categories: Counter[str] = Counter()
     blocking_category_projection_fraction_sum: Counter[str] = Counter()
@@ -173,6 +176,8 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         observation, _infos = env.reset()
         max_steps = args.episodes * 600
         for _ in range(max_steps):
+            # Include the terminal step, then exclude this worker after its quota.
+            active = completed_by_env < target_episodes_per_env
             actor_observation = encode_policy_observation(
                 task_config,
                 observation,
@@ -201,14 +206,15 @@ def run(args: argparse.Namespace) -> dict[str, object]:
                     observation=observation,
                 )
                 action_diagnostics.update(
-                    latent_action,
-                    environment_action,
-                    action_scale,
+                    latent_action[active],
+                    environment_action[active],
+                    action_scale[active],
                 )
             observation, reward, terminated, truncated, infos = env.step(
                 environment_action
             )
-            evaluated_actions += args.num_envs
+            evaluated_actions += int(np.count_nonzero(active))
+            surplus_actions += int(np.count_nonzero(~active))
             done = np.logical_or(terminated, truncated)
             transition_infos = tuple(
                 info.get("final_info", info) if done[env_id] else info
@@ -285,14 +291,14 @@ def run(args: argparse.Namespace) -> dict[str, object]:
                         for info in transition_infos
                     ],
                     dtype=np.float64,
-                ),
+                )[active],
                 projection_alpha=np.asarray(
                     [
                         float(info.get("safety_projection_alpha", 1.0))
                         for info in transition_infos
                     ],
                     dtype=np.float64,
-                ),
+                )[active],
                 preventive_intervention=np.asarray(
                     [
                         bool(
@@ -304,32 +310,40 @@ def run(args: argparse.Namespace) -> dict[str, object]:
                         for info in transition_infos
                     ],
                     dtype=bool,
-                ),
-                preventive_onset=collision_events.preventive_onset,
+                )[active],
+                preventive_onset=collision_events.preventive_onset[active],
             )
             collision_preventive_events += int(
-                np.count_nonzero(collision_events.preventive_onset)
+                np.count_nonzero(collision_events.preventive_onset[active])
             )
             collision_preventive_blocked_fraction_sum += float(
-                np.sum(collision_events.preventive_blocked_fraction)
+                np.sum(collision_events.preventive_blocked_fraction[active])
             )
             collision_preventive_streak_steps_max = max(
                 collision_preventive_streak_steps_max,
-                int(np.max(collision_events.preventive_streak_steps)),
+                int(np.max(collision_events.preventive_streak_steps[active])),
             )
             collision_actual_forbidden_contacts += int(
-                np.count_nonzero(collision_events.actual_forbidden_contact)
+                np.count_nonzero(collision_events.actual_forbidden_contact[active])
             )
             collision_hard_violations += int(
-                np.count_nonzero(collision_events.hard_violation)
+                np.count_nonzero(collision_events.hard_violation[active])
             )
             for category in collision_events.preventive_category[
-                collision_events.preventive_onset
+                active & collision_events.preventive_onset
             ]:
                 collision_preventive_event_categories[
                     "unknown" if category is None else str(category)
                 ] += 1
-            for info in transition_infos:
+            surplus_forbidden_contacts += int(
+                np.count_nonzero(collision_events.actual_forbidden_contact[~active])
+            )
+            surplus_hard_violations += int(
+                np.count_nonzero(collision_events.hard_violation[~active])
+            )
+            for env_id, info in enumerate(transition_infos):
+                if not active[env_id]:
+                    continue
                 tracking_error_sum += float(info.get("arm_tracking_error_rad_mean", 0.0))
                 tracking_error_max = max(
                     tracking_error_max,
@@ -441,6 +455,14 @@ def run(args: argparse.Namespace) -> dict[str, object]:
             task_config.cube_spawn_yaw_jitter_rad
         ),
         "episodes": args.episodes,
+        "diagnostic_population": "first_requested_episode_quota_per_env",
+        "evaluated_action_count": evaluated_actions,
+        "surplus_execution": {
+            "description": "Auto-reset execution after a worker reached its episode quota",
+            "action_count": surplus_actions,
+            "collision_actual_forbidden_contact_count": surplus_forbidden_contacts,
+            "collision_hard_violation_count": surplus_hard_violations,
+        },
         "successes": successes,
         "success_rate": successes / args.episodes,
         "deterministic": not args.stochastic,
