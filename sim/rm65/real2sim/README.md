@@ -92,6 +92,16 @@ core and MuJoCo adapter used for the 20260721 fit; tests compare those hashes to
 fixed historical values rather than silently reinterpreting the fit against
 the current files.
 
+公开 feature 的 oracle AABB 临时数组优化使用独立后继绑定
+`artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261104_oracle_aabb_v1.json`，固定源码 `64c3eed8ea7ec5aa5374589389d9a6afafd453ef`。
+继承 G4 combined 的 205 项输入（200 项 Python），改变项为
+`sim/mujoco/collision_safety/oracle.py`。
+69 份历史清单原字节保留；旧 fit、硬件与运行报告继续归属原 source，不提升资格。
+当前 source 的既有 focused 为 140 passed / 6 skipped；最终 core 尚待该后继绑定提交后的独立验证。
+402 次 oracle 对照来自独立旧源码 d9c6 与 candidate 12de498，只证明所采样 query 的结果/候选对一致。
+不包含私有 solver profile；私有 native 抓取结果不归属于此公开源码。
+仍为 `provisional`，没有新 refit、硬件执行或 held-out 资格；输入集合不是传递依赖闭包。
+
 G4 与原生周期/命令拒绝修复的组合使用后继绑定
 `artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261103_g4_command_refusal_v1.json`，固定源码 `a1b9e59a7f07a792929ae2e681d77288a67b0454`。
 它以 G4 的 205 项输入为运行时父，只有 `sim/mujoco/actuation/executor.py` 改变；
