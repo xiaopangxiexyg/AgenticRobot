@@ -74,6 +74,9 @@ from agent_gateway.skills.motion.grasped_object import (
     grasped_object_place_definition_v2,
     grasped_object_place_schema_v2,
     validate_grasped_object_move,
+    grasped_object_move_definition_v3, grasped_object_move_schema_v3,
+    validate_grasped_object_move_v3, validate_object_motion_state_v3,
+    OBJECT_INCLINATION_DEVIATION_RAD_V3,
     validate_grasped_object_place_v2,
     validate_object_motion_state,
     validate_object_motion_state_v2,
@@ -167,6 +170,7 @@ MUJOCO_AGENT_GRASP_APPROACH_ROUTE_ID_V1 = "sim.mujoco.motion.approach_grasp_pose
 MUJOCO_AGENT_GRASP_CONTACT_ROUTE_ID_V1 = "sim.mujoco.motion.approach_grasp_contact.v1"
 MUJOCO_AGENT_OBJECT_MOVE_ROUTE_ID_V1 = "sim.mujoco.motion.move_grasped_object_to_pose.v1"
 MUJOCO_AGENT_OBJECT_MOVE_ROUTE_ID_V2 = "sim.mujoco.motion.move_grasped_object_to_pose.v2"
+MUJOCO_AGENT_OBJECT_MOVE_ROUTE_ID_V3 = "sim.mujoco.motion.move_grasped_object_to_pose.v3"
 MUJOCO_AGENT_GRASP_APPROACH_EXECUTOR_ID_V1 = "mujoco-agent-grasp-approach-executor-v1"
 MUJOCO_AGENT_OBJECT_MOVE_MAX_OPERATION_MS = 240_000
 # Simulated time a held object (and the TCP) must stay inside the goal
@@ -820,6 +824,7 @@ class MujocoAgentTcpPoseContractBundle:
     grasp_contact_contract: MujocoAgentSafeTcpPoseContract | None = None
     object_motion_contract: MujocoAgentSafeTcpPoseContract | None = None
     object_support_motion_contract_v2: MujocoAgentSafeTcpPoseContract | None = None
+    object_attitude_motion_contract_v3: MujocoAgentSafeTcpPoseContract | None = None
     object_support_body_names: tuple[str, ...] = ()
     fast_grasp_contract: Any | None = None
     observed_point_contract: MujocoAgentSafeTcpPoseContract | None = None
@@ -982,6 +987,7 @@ class MujocoAgentTcpPoseContractBundle:
             ("motion.approach_grasp_contact", "1", self.grasp_contact_contract),
             (GRASPED_OBJECT_MOVE_SKILL_ID, "1", self.object_motion_contract),
             (GRASPED_OBJECT_MOVE_SKILL_ID, "2", self.object_support_motion_contract_v2),
+            (GRASPED_OBJECT_MOVE_SKILL_ID, "3", self.object_attitude_motion_contract_v3),
         ):
             if safe is None:
                 continue
@@ -1476,6 +1482,8 @@ def _motion_validators(
     is_anchor_region = is_anchor_v3 or is_anchor_v4
     is_object_support_v2 = (route.skill_id == GRASPED_OBJECT_MOVE_SKILL_ID
                             and route.skill_version == "2")
+    is_object_attitude_v3 = (route.skill_id == GRASPED_OBJECT_MOVE_SKILL_ID
+                             and route.skill_version == "3")
 
     def validate_parameters(payload: Mapping[str, Any]) -> None:
         if route.skill_id == OBSERVED_POINT_SKILL_ID:
@@ -1489,7 +1497,10 @@ def _motion_validators(
                 validate_observed_point_parameters(payload, component_id=profile.component_id)
             return
         if object_id is not None:
-            if is_object_support_v2:
+            if is_object_attitude_v3:
+                validate_grasped_object_move_v3(payload, profile=profile, object_id=object_id,
+                    support_object_ids=object_support_body_names)
+            elif is_object_support_v2:
                 validate_grasped_object_place_v2(payload, profile=profile,
                     object_id=object_id, support_object_ids=object_support_body_names)
             else:
@@ -1566,9 +1577,14 @@ def _motion_validators(
                     raise ValueError("Object terminal support is outside the deployed allowlist.")
                 state = {key: value for key, value in state.items()
                          if key != "support_object_id"}
-            validate_object_motion_state(state, profile=profile,
-                object_id=object_id, observation_source="mujoco_native_physics",
-                clock_domain_id=object_clock_domain_id)
+            if is_object_attitude_v3:
+                validate_object_motion_state_v3(state, profile=profile, object_id=object_id,
+                    observation_source="mujoco_native_physics", clock_domain_id=object_clock_domain_id,
+                    support_object_ids=object_support_body_names)
+            else:
+                validate_object_motion_state(state, profile=profile,
+                    object_id=object_id, observation_source="mujoco_native_physics",
+                    clock_domain_id=object_clock_domain_id)
         refs = payload["execution_receipt_refs"]
         if (
             not isinstance(refs, (tuple, list))
@@ -1624,6 +1640,10 @@ def _motion_validators(
                 if any(report[key] != parameters[key] for key in ("observation_operation_id", "point_index")):
                     raise ValueError("Observed-point result does not match the requested reference.")
             return
+        if is_object_attitude_v3:
+            validate_object_motion_state_v3(result["object_state"], parameters=parameters,
+                profile=profile, object_id=object_id, observation_source="mujoco_native_physics",
+                clock_domain_id=object_clock_domain_id, support_object_ids=object_support_body_names)
         if is_object_support_v2:
             validate_object_motion_state_v2(result["object_state"],
                 parameters=parameters, profile=profile, object_id=object_id,
@@ -2101,6 +2121,7 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
     enable_object_follow_observation: bool = False,
     enable_object_motion: bool = False,
     enable_object_support_motion_v2: bool = False,
+    enable_object_attitude_motion_v3: bool = False,
     object_support_body_names: tuple[str, ...] = (),
     enable_grasp_approach: bool = False,
     grasp_contact_binding: MujocoGraspContactBinding | None = None,
@@ -2597,6 +2618,9 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
                 observation_source="mujoco_native_physics",
                 clock_domain_id="mujoco-native-physics:" + exact["runtime_session_id"],
             )
+            if motion_definition.skill_version == "3":
+                return grasped_object_move_schema_v3(
+                    **kwargs, support_object_ids=object_support_body_names)
             if motion_definition.skill_version == "2":
                 return grasped_object_place_schema_v2(
                     **kwargs, support_object_ids=object_support_body_names)
@@ -2790,6 +2814,27 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
             path_search_time_budget_sec=15.0,
         )
         object_contract = item[3]
+        planned_motions.append(item)
+    object_attitude_contract_v3 = None
+    if enable_object_attitude_motion_v3:
+        if not enable_object_motion or not object_support_body_names:
+            raise ValueError("Object inclination v3 requires observed object motion and named supports.")
+        attitude_identity = canonical_content_hash({
+            "target_contact_binding": grasp_contact_binding.to_payload(),
+            "maximum_inclination_deviation_rad": OBJECT_INCLINATION_DEVIATION_RAD_V3,
+            "yaw": "free_about_world_up", "anchor": "original_grasp_generation",
+        }, domain="mujoco.object_inclination_policy.v3")
+        item = planned_motion_contract(
+            grasped_object_move_definition_v3(controlled_component_ids=(component,)),
+            replace(object_contract.motion_profile,
+                profile_id="mujoco.agent_object_attitude.v3." + attitude_identity),
+            route_id=MUJOCO_AGENT_OBJECT_MOVE_ROUTE_ID_V3,
+            executor_id="mujoco-grasped-object-attitude-v3",
+            binding_prefix="sim.mujoco.agent_object_attitude_v3:",
+            duration_ms=MUJOCO_AGENT_OBJECT_MOVE_MAX_OPERATION_MS,
+            path_search_time_budget_sec=15.0,
+        )
+        object_attitude_contract_v3 = item[3]
         planned_motions.append(item)
     if enable_object_support_motion_v2:
         item = planned_motion_contract(
@@ -3231,7 +3276,7 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
         prompts = dict(support_release_prompt_by_id or {})
         object_entry = next((item for item in planned_motions
                              if item[2].skill_id == "motion.move_grasped_object_to_pose"
-                             and item[2].skill_version == "1"), None)
+                             and item[2].skill_version == ("3" if support_release_query_version == "4" else "1")), None)
         if (segmentation is None or depth_capture is None or depth_capture.back_projection is None
                 or object_entry is None or not object_support_body_names):
             raise ValueError("Support release queries need segmentation, aligned RGB-D, object motion "
@@ -3715,6 +3760,7 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
         grasp_contact_contract=contact_contract,
         object_motion_contract=object_contract,
         object_support_motion_contract_v2=object_support_contract_v2,
+        object_attitude_motion_contract_v3=object_attitude_contract_v3,
         object_support_body_names=object_support_body_names,
         depth_capture=depth_capture,
         rgb_capture=rgb_capture,

@@ -201,7 +201,7 @@ def _preconditions(bundle: MujocoAgentTcpPoseContractBundle) -> None:
         )
     if (
         hand is None
-        or hand.deployment_binding.skill_version != "2"
+        or hand.deployment_binding.skill_version not in {"2", "3"}
         or set(hand.deployment_binding.port_binding_hash_by_component or {})
         != {"left_gripper", "right_gripper"}
     ):

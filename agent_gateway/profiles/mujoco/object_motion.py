@@ -14,7 +14,10 @@ from agent_gateway.profiles.motion_primitive_resolution import (
 from agent_gateway.runtime.station_operation_worker import (
     StationLifecycleActivationEvidence,
 )
-from agent_gateway.skills.motion.grasped_object import OBJECT_MOVE_LINEAGE_FIELDS
+from agent_gateway.skills.motion.grasped_object import (
+    OBJECT_MOVE_LINEAGE_FIELDS, OBJECT_INCLINATION_DEVIATION_RAD_V3,
+)
+from robot_motion.object_attitude import ObjectInclinationBand, up_facing_box_axis
 from robot_motion.object_transport import rigid_pose, tool_goal_from_object_goal
 from robot_motion.path_planning import JointConfigurationCheck
 from robot_motion.pose import pose_delta_metrics
@@ -25,6 +28,7 @@ from sim.mujoco.deploy.planned_tcp_motion import MujocoTcpPlanRejected
 from sim.mujoco.transforms import pose_to_xyz_quat_xyzw
 
 from .motion_skill import MujocoAgentSafeTcpPoseSkillLifecycle
+from .held_box import _complete_box_geom
 
 # Once the TCP has completed its checked path, the measured TCP and object
 # must reach their goal state within this much simulation time. Lift
@@ -115,12 +119,21 @@ class MujocoAgentObjectMotionLifecycle(MujocoAgentSafeTcpPoseSkillLifecycle):
         self._object_goal_world = None
         self._object_terminal = None
         self._object_unmet_since = None
-        self._phase = kwargs["request"].parameters["phase"]
+        self._public_phase = kwargs["request"].parameters["phase"]
+        self._attitude_v3 = kwargs["route"].skill_version == "3"
+        self._release_approach = self._attitude_v3 and self._public_phase == "release_approach"
+        self._phase = "carry" if self._release_approach else self._public_phase
+        self._inclination_band = None
+        self._grasp_generation = None
         self._object_id = kwargs["request"].parameters["object_id"]
         self._support_object_id = kwargs["request"].parameters.get("support_object_id")
         if self._object_id != object_observer.object_body_name:
             raise ValueError("Object motion differs from the deployed observed object.")
-        if (kwargs["route"].skill_version == "2" and (
+        if (self._attitude_v3 and (
+                self._public_phase not in {"lift", "carry", "release_approach"}
+                or (self._release_approach and self._support_object_id not in object_observer.support_body_names[1:])
+                or (not self._release_approach and self._support_object_id is not None))) or (
+                kwargs["route"].skill_version == "2" and (
                 self._phase != "place" or self._support_object_id not in object_observer.support_body_names[1:]
         )) or (kwargs["route"].skill_version == "1" and self._support_object_id is not None):
             raise ValueError("Object support identity differs from the admitted Route.")
@@ -136,7 +149,7 @@ class MujocoAgentObjectMotionLifecycle(MujocoAgentSafeTcpPoseSkillLifecycle):
 
     def _resolve_object_goal(self, _measured):
         observer, parameters = self._object_observer, self.request.parameters
-        support_selection = ({} if self._support_object_id is None else
+        support_selection = ({} if self._support_object_id is None or self._release_approach else
                              {"place_support_body_name": self._support_object_id})
         cut = observer.observe(phase=self._phase, establish=True, **support_selection)
         public_from_world = self._public_from_world()
@@ -173,6 +186,32 @@ class MujocoAgentObjectMotionLifecycle(MujocoAgentSafeTcpPoseSkillLifecycle):
                     max_penetration_m=scene.collision_projector().policy.hard_penetration_m,
                     dynamic=self._support_object_id is not None)
 
+            if self._attitude_v3:
+                anchor = observer.grasp_attitude_anchor(command_generation=cut.command_generation)
+                body = int(scene.model.body(self._object_id).id)
+                geom = _complete_box_geom(scene.model, scene.mujoco, body)
+                quat = scene.model.geom_quat[geom]
+                object_from_box = xyzquat_to_pose_matrix((*scene.model.geom_pos[geom],
+                    float(quat[1]), float(quat[2]), float(quat[3]), float(quat[0])))
+                axis = up_facing_box_axis(anchor, object_from_box, (0., 0., 1.))
+                if self._release_approach:
+                    support_body = int(scene.model.body(self._support_object_id).id)
+                    support_geom = _complete_box_geom(scene.model, scene.mujoco, support_body)
+                    rotation = scene.data.geom_xmat[support_geom].reshape(3, 3)
+                    index = int(np.argmax(np.abs(rotation[2])))
+                    normal = rotation[:, index] * (1. if rotation[2, index] >= 0. else -1.)
+                    if float((world_goal[:3, :3] @ axis) @ normal) < math.cos(
+                            OBJECT_INCLINATION_DEVIATION_RAD_V3):
+                        raise MujocoTcpPlanRejected("object_release_goal_not_aligned_with_named_support")
+                self._inclination_band = ObjectInclinationBand.from_poses(
+                    anchor,
+                    axis_object_xyz=axis, up_world_xyz=(0., 0., 1.),
+                    max_deviation_rad=OBJECT_INCLINATION_DEVIATION_RAD_V3,
+                    goal_world_from_object=world_goal if self._release_approach else None)
+                if not self._inclination_band.accepts(world_goal):
+                    raise MujocoTcpPlanRejected("object_goal_changes_grasped_inclination")
+                self._grasp_generation = cut.command_generation
+
             def view(data):
                 result = copy.copy(scene)
                 result.data = data
@@ -195,7 +234,8 @@ class MujocoAgentObjectMotionLifecycle(MujocoAgentSafeTcpPoseSkillLifecycle):
                     and observer.measured_closed(
                         view(data).get_gripper_close(observer.gripper_name))),
                 tool_from_object=cut.tool_from_object, support=support,
-                measured_guard=measured_guard, guard_identity=self.motion_profile.semantic_content_hash)
+                measured_guard=measured_guard, guard_identity=self.motion_profile.semantic_content_hash,
+                **({"inclination_band": self._inclination_band} if self._attitude_v3 else {}))
 
         self._payload = self.application.runtime.rig.capture_scene(bind)
         # Convert the goal through the hand-object transform measured in this
@@ -220,11 +260,15 @@ class MujocoAgentObjectMotionLifecycle(MujocoAgentSafeTcpPoseSkillLifecycle):
             if evidence.succeeded:
                 # Commit the stage only after the owned plan and guard were
                 # activated. Scratch preflights do not change tick policy.
-                self.application.runtime.rig.capture_scene(lambda scene:
-                    self._object_observer.observe(
+                def commit(scene):
+                    if self._inclination_band is not None:
+                        self._object_observer.bind_grasp_inclination_band(
+                            command_generation=self._grasp_generation, band=self._inclination_band)
+                    return self._object_observer.observe(
                         phase=self._phase, source_data=scene.data,
-                        **({} if self._support_object_id is None else
-                           {"place_support_body_name": self._support_object_id})))
+                        **({} if self._support_object_id is None or self._release_approach else
+                           {"place_support_body_name": self._support_object_id}))
+                self.application.runtime.rig.capture_scene(commit)
             return evidence
         except (ValueError, MujocoTcpPlanRejected) as error:
             logging.getLogger(__name__).warning("Object motion activation rejected: %s", error)
@@ -286,7 +330,7 @@ class MujocoAgentObjectMotionLifecycle(MujocoAgentSafeTcpPoseSkillLifecycle):
     def _terminal_state_evidence(self, public_final_pose, measured_at):
         cut = self._object_observer.observe(phase=self._phase)
         self._object_terminal = {
-            "object_id": self._object_id, "phase": self._phase,
+            "object_id": self._object_id, "phase": self._public_phase,
             "reference_frame_id": self.motion_profile.reference_frame_id,
             "pose_xyz_quat_xyzw": list(pose_to_xyz_quat_xyzw(self._public_from_world() @ cut.world_from_object)),
             "measured_at": cut.sim_time_s,

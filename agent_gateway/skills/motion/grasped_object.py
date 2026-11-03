@@ -16,6 +16,8 @@ from agent_gateway.skills.motion.schemas import (
 
 GRASPED_OBJECT_MOVE_SKILL_ID = "motion.move_grasped_object_to_pose"
 OBJECT_MOVE_PHASES = ("lift", "carry", "place")
+OBJECT_ATTITUDE_PHASES_V3 = ("lift", "carry", "release_approach")
+OBJECT_INCLINATION_DEVIATION_RAD_V3 = math.radians(5.)
 OBJECT_MOVE_LINEAGE_FIELDS = (
     "reference_frame_id", "reference_frame_spec_hash", "controlled_frame_id",
     "frame_graph_hash", "tool_config_hash", "calibration_hash",
@@ -60,6 +62,88 @@ def grasped_object_place_definition_v2(*, controlled_component_ids):
         parameter_semantics_id="grasped_object.place_on_bound_support.v2",
         task_outcome_semantics_id="grasped_object_selected_support_arrival.v2",
     )
+
+
+def grasped_object_move_definition_v3(*, controlled_component_ids):
+    return replace(
+        grasped_object_move_definition(controlled_component_ids=controlled_component_ids),
+        skill_version="3",
+        summary=(
+            "Move the held object through its measured hand-object relation, including an "
+            "arbitrarily oriented grasp. Lift and carry preserve the inclination of the "
+            "same material box axis frozen at grasp establishment within 5 degrees; yaw "
+            "about world vertical remains free. This constrains the object, not a horizontal "
+            "hand pose or a locked quaternion. Use phase=release_approach and the named "
+            "support_object_id for a leveled release goal: the object stays unsupported "
+            "while its inclination changes within the bounded interval to that support. "
+            "Pass a query_support_release_pose@4 object goal unchanged for this phase, "
+            "then open with that release_support_object_id and observe stable release. "
+            "The original grasp relation, collision, measured following and HOLD checks "
+            "remain active. Unsupported or unreachable orientations are refused; motion "
+            "completion alone is not released placement."
+        ),
+        parameter_semantics_id="grasped_object.yaw_free_inclination.v3",
+        task_outcome_semantics_id="grasped_object_inclination_bounded_arrival.v3",
+    )
+
+
+def grasped_object_move_schema_v3(*, definition, profile, object_id,
+                                  support_object_ids, observation_source, clock_domain_id):
+    base = grasped_object_move_schema(definition=definition, profile=profile, object_id=object_id,
+        observation_source=observation_source, clock_domain_id=clock_domain_id)
+    parameters = dict(base.parameter_schema)
+    properties = dict(parameters["properties"])
+    properties["phase"] = {"enum": list(OBJECT_ATTITUDE_PHASES_V3)}
+    properties["support_object_id"] = {"enum": list(support_object_ids)}
+    parameters["properties"] = properties
+    parameters["allOf"] = [{"if": {"properties": {"phase": {"const": "release_approach"}}},
+        "then": {"required": ["support_object_id"]},
+        "else": {"not": {"required": ["support_object_id"]}}}]
+    result = dict(base.execution_result_schema)
+    result_properties = dict(result["properties"])
+    state = dict(result_properties["object_state"])
+    state_properties = dict(state["properties"])
+    state_properties["phase"] = {"enum": list(OBJECT_ATTITUDE_PHASES_V3)}
+    state_properties["support_contact"] = {"const": False}
+    state_properties["support_object_id"] = {"enum": list(support_object_ids)}
+    state["properties"] = state_properties
+    state["allOf"] = parameters["allOf"]
+    result_properties["object_state"] = state
+    result["properties"] = result_properties
+    schema_hash = agent_skill_schema_document_hash(parameters, schema_kind="parameter")
+    return replace(base, skill_version="3", parameter_schema=parameters, execution_result_schema=result,
+        parameter_profiles=tuple(replace(item, parameter_schema_hash=schema_hash) for item in base.parameter_profiles))
+
+
+def validate_grasped_object_move_v3(parameters, *, profile, object_id, support_object_ids):
+    if not isinstance(parameters, Mapping) or parameters.get("phase") not in OBJECT_ATTITUDE_PHASES_V3:
+        raise ValueError("Object motion v3 requires lift, carry or release_approach.")
+    release = parameters["phase"] == "release_approach"
+    if (release and parameters.get("support_object_id") not in tuple(support_object_ids)
+            or not release and "support_object_id" in parameters):
+        raise ValueError("Only release_approach binds an admitted named support.")
+    original = {key: value for key, value in parameters.items() if key != "support_object_id"}
+    if release:
+        original["phase"] = "carry"
+    validate_grasped_object_move(original, profile=profile, object_id=object_id)
+
+
+def validate_object_motion_state_v3(state, *, profile, object_id, observation_source,
+                                    clock_domain_id, support_object_ids, parameters=None):
+    if not isinstance(state, Mapping) or state.get("phase") not in OBJECT_ATTITUDE_PHASES_V3:
+        raise ValueError("Object motion v3 terminal phase is invalid.")
+    release = state["phase"] == "release_approach"
+    if (release and state.get("support_object_id") not in tuple(support_object_ids)
+            or not release and "support_object_id" in state):
+        raise ValueError("Object motion v3 terminal support differs from its phase.")
+    if parameters is not None and (state["phase"] != parameters["phase"]
+            or state.get("support_object_id") != parameters.get("support_object_id")):
+        raise ValueError("Object motion v3 terminal context differs from its request.")
+    original = {key: value for key, value in state.items() if key != "support_object_id"}
+    if release:
+        original["phase"] = "carry"
+    validate_object_motion_state(original, profile=profile, object_id=object_id,
+        observation_source=observation_source, clock_domain_id=clock_domain_id)
 
 
 def grasped_object_place_schema_v2(*, definition, profile, object_id,

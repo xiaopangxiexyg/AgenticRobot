@@ -65,6 +65,7 @@ from .motion_deployment import (
     MUJOCO_AGENT_GRASP_CONTACT_ROUTE_ID_V1,
     MUJOCO_AGENT_OBJECT_MOVE_ROUTE_ID_V1,
     MUJOCO_AGENT_OBJECT_MOVE_ROUTE_ID_V2,
+    MUJOCO_AGENT_OBJECT_MOVE_ROUTE_ID_V3,
     MUJOCO_AGENT_SAFE_TCP_POSE_ROUTE_ID_V1,
     MUJOCO_AGENT_SAFE_TCP_POSE_ROUTE_ID_V2,
     MUJOCO_AGENT_TCP_POSE_MAX_ROTATION_DELTA_RAD_V1,
@@ -290,6 +291,7 @@ def _build_standard_tcp_pose_envelope_runtime(
     grasp_contact_binding: MujocoGraspContactBinding | None = None,
     enable_object_motion: bool = False,
     enable_object_support_motion_v2: bool = False,
+    enable_object_attitude_motion_v3: bool = False,
     object_support_body_names: tuple[str, ...] = (),
     motion_side: str = "right",
     enable_fast_grasp: bool = False,
@@ -445,6 +447,18 @@ def _build_standard_tcp_pose_envelope_runtime(
                     }, domain="mujoco.object_motion.absolute_envelope.v1"),
                     allowed_route_ids=(MUJOCO_AGENT_OBJECT_MOVE_ROUTE_ID_V1,),
                 ))
+                if enable_object_attitude_motion_v3:
+                    entries.append(TCPPoseEnvelopeCatalogEntry(
+                        envelope_id="mujoco.agent_object_attitude.safety.absolute.v3",
+                        profile=replace(grasp_profile, profile_id="mujoco-agent-object-attitude-envelope-v3"),
+                        constraint_set_hash=canonical_content_hash({
+                            "target_contact_binding": grasp_contact_binding.to_payload(),
+                            "support_body_names": list(object_support_body_names),
+                            "payload_policy": "grasp_generation_yaw_free_inclination_v3",
+                            "maximum_inclination_deviation_rad": math.radians(5.),
+                        }, domain="mujoco.object_attitude.absolute_envelope.v3"),
+                        allowed_route_ids=(MUJOCO_AGENT_OBJECT_MOVE_ROUTE_ID_V3,),
+                    ))
                 if enable_object_support_motion_v2:
                     entries.append(TCPPoseEnvelopeCatalogEntry(
                         envelope_id="mujoco.agent_object_support_motion.safety.absolute.v2",
@@ -558,6 +572,7 @@ def build_mujoco_agent_tcp_pose_gateway_session(
     enable_object_follow_observation: bool = False,
     enable_object_motion: bool = False,
     enable_object_support_motion_v2: bool = False,
+    enable_object_attitude_motion_v3: bool = False,
     enable_named_release_v3: bool = False,
     object_support_body_names: tuple[str, ...] = (),
     safe_tcp_planning_clearance_padding_m: float = 0.002,
@@ -744,6 +759,9 @@ def build_mujoco_agent_tcp_pose_gateway_session(
         raise TypeError("enable_object_follow_observation must be boolean.")
     if enable_object_follow_observation and not enable_object_state:
         raise ValueError("Object follow observation requires explicit object-state feedback.")
+    if (type(enable_object_attitude_motion_v3) is not bool
+            or enable_object_attitude_motion_v3 and not (enable_object_motion and enable_object_support_motion_v2)):
+        raise ValueError("Object inclination v3 requires the complete named-support object chain.")
     if type(enable_object_motion) is not bool:
         raise TypeError("enable_object_motion must be boolean.")
     if enable_object_motion and (not enable_object_follow_observation or not enable_grippers
@@ -927,6 +945,7 @@ def build_mujoco_agent_tcp_pose_gateway_session(
         enable_fast_grasp=fast_grasp_planner is not None,
         enable_object_motion=enable_object_motion,
         enable_object_support_motion_v2=enable_object_support_motion_v2,
+        enable_object_attitude_motion_v3=enable_object_attitude_motion_v3,
         object_support_body_names=object_support_body_names,
         motion_side=side,
     )
@@ -1081,6 +1100,7 @@ def build_mujoco_agent_tcp_pose_gateway_session(
             enable_object_follow_observation=enable_object_follow_observation,
             enable_object_motion=enable_object_motion,
             enable_object_support_motion_v2=enable_object_support_motion_v2,
+        enable_object_attitude_motion_v3=enable_object_attitude_motion_v3,
             object_support_body_names=object_support_body_names,
             enable_grasp_approach=enable_grasp_approach,
             grasp_contact_binding=grasp_contact_binding,

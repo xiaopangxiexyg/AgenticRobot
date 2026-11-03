@@ -62,6 +62,9 @@ from agent_gateway.runtime.passive_read_executor import (
 from agent_gateway.runtime.payload_validation import AgentSkillPayloadValidatorSet
 from agent_gateway.skills.perception import support_release_query as skill
 from agent_gateway.skills.perception import support_release_query_v3 as skill_v3
+from agent_gateway.skills.perception import support_release_query_v4 as skill_v4
+from agent_gateway.skills.motion.grasped_object import OBJECT_INCLINATION_DEVIATION_RAD_V3
+from robot_motion.object_attitude import ObjectInclinationBand, up_facing_box_axis
 from agent_gateway.skills.perception.schemas import validate_no_task_evaluation_v1
 from dataset_contracts.canonical_encoding import canonical_content_hash
 from robot_motion.object_transport import (
@@ -121,9 +124,9 @@ def build_support_release_query_registration(*, segmentation, back_projection, r
                                              prompt_by_support_id, object_motion_contract,
                                              object_motion_route, skill_version="1"):
     """Bind the query to the segmenter, ordered aligned RGB-D roles and the carry Route."""
-    contract = {"1": skill, "3": skill_v3}.get(skill_version)
+    contract = {"1": skill, "3": skill_v3, "4": skill_v4}.get(skill_version)
     if contract is None:
-        raise ValueError("MuJoCo support release queries support skill versions 1 and 3.")
+        raise ValueError("MuJoCo support release queries support skill versions 1, 3 and 4.")
     if not (0. < RELEASE_LEAN_RAD <= MAXIMUM_RELEASE_LEAN_RAD
             and MAXIMUM_RELEASE_LEAN_RAD == skill.MAX_RELEASE_LEAN_RAD):
         # The planner's lean limit and the result schema's bound must agree.
@@ -199,7 +202,7 @@ def build_support_release_query_registration(*, segmentation, back_projection, r
         raise ValueError("Release queries require a read-only base Route.")
     route = replace(base_route, skill_id=contract.SKILL_ID, skill_version=skill_version,
         skill_definition_hash=definition.semantic_content_hash,
-        route_id=base_route.route_id + ".support_release_pose" + ("_v3" if skill_version == "3" else ""),
+        route_id=base_route.route_id + ".support_release_pose" + ("_v" + skill_version if skill_version in {"3", "4"} else ""),
         route_version=skill_version,
         parameter_schema_hash=schema.parameter_schema_hash,
         execution_result_schema_hash=schema.execution_result_schema_hash,
@@ -209,7 +212,7 @@ def build_support_release_query_registration(*, segmentation, back_projection, r
         max_operation_duration_ms=SUPPORT_RELEASE_MAX_OPERATION_MS)
     base_binding = back_projection.binding.to_ref()
     binding = replace(base_binding,
-        deployment_binding_id=("support-release-pose-v3:" if skill_version == "3"
+        deployment_binding_id=("support-release-pose-v" + skill_version + ":" if skill_version in {"3", "4"}
                                else "support-release-pose:") + base_binding.deployment_binding_id,
         deployment_binding_hash=canonical_content_hash(
             {"base": base_binding.deployment_binding_hash, "route": route.semantic_content_hash},
@@ -281,7 +284,7 @@ def _rejected(*, parameters, revision, frame, reason, held_pose=None, segmentati
         "selected_candidate_index": None, "path_planning_wall_sec": float(planning_wall_sec),
         "candidate_rejections": list(rejections), "release_lean_rad": None,
         "views": list(views), "motion_executed": False, "execution_authorized": False,
-        **({key: None for key in skill_v3.ANGLE_KEYS} if contract is skill_v3 else {})}
+        **({key: None for key in skill_v3.ANGLE_KEYS} if contract in (skill_v3, skill_v4) else {})}
 
 
 def _support_measurement(region):
@@ -315,7 +318,7 @@ class MujocoSupportReleaseQuery:
             raise TypeError("Release query needs the carry envelope projector and the Gateway clock.")
         self.clock = clock
         self.registration = registration
-        self._skill = {"1": skill, "3": skill_v3}[registration.skill.definition.skill_version]
+        self._skill = {"1": skill, "3": skill_v3, "4": skill_v4}[registration.skill.definition.skill_version]
         self.application = application
         self.observer = observer
         self.segmentation_provider = segmentation_provider
@@ -448,12 +451,14 @@ class MujocoSupportReleaseQuery:
             # Version 3 also tries leveling first when the held box leans
             # relative to this region; v1 retains its inclined-top trigger.
             level_first = region.inclined or (
-                self._skill is skill_v3
+                self._skill in (skill_v3, skill_v4)
                 and _support_tilt_rad(held, held.reference_from_object[:3, :3],
                                       np.asarray(support.normal_reference_xyz, dtype=float))
                 > HELD_TILT_LEVELING_THRESHOLD_RAD)
             region_passes = ((({"yaw_offsets_rad": RELEASE_YAW_OFFSETS_RAD, "level_to_support": True},)
                               if level_first else ()) + passes)
+            if self._skill is skill_v4:
+                region_passes = ({"yaw_offsets_rad": RELEASE_YAW_OFFSETS_RAD, "level_to_support": True},)
             for orientation in region_passes:
                 if "lean_rad" in orientation and float(self.clock()) >= deadline:
                     out_of_time = True
@@ -464,7 +469,7 @@ class MujocoSupportReleaseQuery:
                         minimum_planning_clearance_m=self._skill.MIN_CLEARANCE_M,
                         maximum_clearance_m=MAXIMUM_RELEASE_CLEARANCE_M,
                         lateral_margin_m=RELEASE_LATERAL_MARGIN_M, include_nearest_to_held=True,
-                        **({"limit_release_tilt": True} if self._skill is skill_v3 else {}),
+                        **({"limit_release_tilt": True} if self._skill in (skill_v3, skill_v4) else {}),
                         **orientation)
                 except NoReleaseCandidates:
                     # Nothing fits this region in this orientation pass (or the lean
@@ -480,7 +485,8 @@ class MujocoSupportReleaseQuery:
                 limited += len(candidates) - len(indices)
                 try:
                     selection = self._plan(admissible, cancel_requested=cancel_requested,
-                                           deadline=deadline)
+                                           deadline=deadline,
+                                           **({"held": held} if self._skill is skill_v4 else {}))
                 except MujocoTcpPlanRejected as error:
                     if cancel_requested():
                         raise InterruptedError("Support release query cancelled.") from error
@@ -507,7 +513,7 @@ class MujocoSupportReleaseQuery:
                     domain="agenticrobot.support_release_query.plan.v1"))
                 selected_measurement = measured["evidence"]
                 angles = {}
-                if self._skill is skill_v3:
+                if self._skill in (skill_v3, skill_v4):
                     selected_measurement = _support_measurement(region)["evidence"]
                     normal = np.asarray(support.normal_reference_xyz, dtype=float)
                     angles = {
@@ -542,7 +548,7 @@ class MujocoSupportReleaseQuery:
         if not fitted and not out_of_time:
             # v3 can have no candidates because every final orientation
             # exceeds its tilt limit; do not misreport that as a footprint failure.
-            reason = ("no_collision_free_release_path" if self._skill is skill_v3
+            reason = ("no_collision_free_release_path" if self._skill in (skill_v3, skill_v4)
                       else "held_footprint_does_not_fit_support")
             return _rejected(reason=reason, held_pose=held_pose,
                              segmentation=segmentation, measured=measured, **common), tuple(evidence)
@@ -584,7 +590,7 @@ class MujocoSupportReleaseQuery:
                 kept.append(index)
         return tuple(kept[:64])
 
-    def _plan(self, candidates, *, cancel_requested, deadline):
+    def _plan(self, candidates, *, cancel_requested, deadline, held=None):
         if not candidates:
             return None
         app = self.application
@@ -595,6 +601,18 @@ class MujocoSupportReleaseQuery:
         object_id = observer.object_body_name
         cut = observer.observe(phase="carry")
         public = self.registration.reference_frame_id
+        band = None
+        if self._skill is skill_v4:
+            from sim.mujoco.deploy.target_measurement import MUJOCO_SIM_HIL_WORLD_FRAME_ID_V1
+            anchor = observer.grasp_attitude_anchor(command_generation=cut.command_generation)
+            axis = up_facing_box_axis(anchor, held.object_from_box, (0., 0., 1.))
+            public_from_world = app.target_frame_profile.frame_graph.resolve(
+                MUJOCO_SIM_HIL_WORLD_FRAME_ID_V1, public).matrix_target_source
+            goal_world = np.linalg.inv(public_from_world) @ candidates[0].proposal.object_goal
+            band = ObjectInclinationBand.from_poses(anchor,
+                axis_object_xyz=axis, up_world_xyz=(0., 0., 1.),
+                max_deviation_rad=OBJECT_INCLINATION_DEVIATION_RAD_V3,
+                goal_world_from_object=goal_world)
 
         def bind(scene):
             def view(data):
@@ -618,7 +636,8 @@ class MujocoSupportReleaseQuery:
                     observer.command_state() == (cut.command_generation, 1.)
                     and observer.measured_closed(view(data).get_gripper_close(observer.gripper_name))),
                 tool_from_object=cut.tool_from_object, support=None,
-                measured_guard=measured_guard, guard_identity=profile.semantic_content_hash)
+                measured_guard=measured_guard, guard_identity=profile.semantic_content_hash,
+                **({"inclination_band": band} if band is not None else {}))
 
         payload = rig.capture_scene(bind)
         goals = tuple(app.transform_tcp_pose_xyzquat(

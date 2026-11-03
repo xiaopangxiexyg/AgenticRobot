@@ -11,6 +11,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from robot_motion.object_attitude import ObjectInclinationBand
 from robot_motion.object_transport import rigid_pose
 from robot_motion.object_release import (
     ObjectReleaseMeasurement,
@@ -87,6 +88,8 @@ class MujocoGraspedObjectObserver:
         self._active_support_body_name = self.support_body_names[0]
         self._generation = None
         self._anchor = None
+        self._attitude_anchor = None
+        self._active_inclination_band = None
         self._initial_z = self._initial_tcp_z = None
         self._window_start = None
         self._window_count = 0
@@ -139,6 +142,8 @@ class MujocoGraspedObjectObserver:
         if target == 1.:
             self._active_support_body_name = self.support_body_names[0]
         self._anchor = self._last = self._window_start = None
+        self._attitude_anchor = None
+        self._active_inclination_band = None
         self._verified = False
         self._window_count = 0
         self._failure = None
@@ -148,6 +153,65 @@ class MujocoGraspedObjectObserver:
     @property
     def active_support_body_name(self):
         return self._active_support_body_name
+
+    def _require_grasp_generation(self, command_generation):
+        if (command_generation != self._generation or self._anchor is None
+                or self._attitude_anchor is None
+                or self.command_state() != (command_generation, 1.)):
+            raise ObjectMotionPreconditionError("Inclination policy requires the current established grasp generation.")
+
+    def grasp_attitude_anchor(self, *, command_generation):
+        """Copy the original material pose; no new observation or holding proof."""
+        def read(_scene):
+            self._require_grasp_generation(command_generation)
+            result = self._attitude_anchor.copy()
+            result.setflags(write=False)
+            return result
+
+        return self.rig.capture_scene(read)
+
+    def grasp_inclination_band(self, *, command_generation):
+        """Read the immutable active band, including during HOLD."""
+        def read(_scene):
+            self._require_grasp_generation(command_generation)
+            return self._active_inclination_band
+
+        return self.rig.capture_scene(read)
+
+    def _require_inclination(self, world_from_object):
+        band = self._active_inclination_band
+        if band is not None and not band.accepts(world_from_object):
+            raise ObjectRelationInvalidated("Object inclination left the bound grasp-generation band.")
+
+    def bind_grasp_inclination_band(self, *, command_generation, band):
+        """Commit an admitted stage under the original rig lock, without reanchoring.
+
+        An incompatible proposed band leaves the old policy unchanged. A true
+        violation of the old policy remains latched; it cannot be washed away
+        by a new release goal. Only a generation reset clears the policy.
+        """
+        if not isinstance(band, ObjectInclinationBand):
+            raise TypeError("A grasp inclination policy requires an immutable ObjectInclinationBand.")
+
+        def bind(scene):
+            self._require_grasp_generation(command_generation)
+            if self._failure is not None:
+                raise ObjectRelationInvalidated("Object relation invalidated: " + self._failure)
+            _, obj, *_ = self._capture(scene, source_data=scene.data)
+            try:
+                self._require_inclination(obj)
+            except ObjectRelationInvalidated as error:
+                self._failure = str(error)
+                raise
+            previous = self._active_inclination_band
+            if previous is not None and (band.axis_object_xyz != previous.axis_object_xyz
+                                         or band.up_world_xyz != previous.up_world_xyz):
+                raise ObjectMotionPreconditionError("A grasp generation retains its material axis and world-up basis.")
+            if not band.accepts(obj):
+                raise ObjectMotionPreconditionError("The proposed inclination band excludes the current object pose.")
+            self._active_inclination_band = band
+
+        self.rig.capture_scene(bind)
 
     def _capture(self, scene, source_data=None, *, support_body_name=None):
         model, mj = scene.model, scene.mujoco
@@ -275,6 +339,7 @@ class MujocoGraspedObjectObserver:
             if other or (support and phase == "carry"):
                 raise ObjectRelationInvalidated("Object has contact outside the selected phase support policy.")
             relative = rigid_pose(np.linalg.inv(tcp) @ obj, name="measured tool_from_object")
+            self._require_inclination(obj)
             if not all(sides):
                 previous = self._last
                 timestep = (None if self._model is None else float(self._model.opt.timestep))
@@ -297,7 +362,9 @@ class MujocoGraspedObjectObserver:
                     raise ObjectMotionPreconditionError("A new grasp must first establish the measured lift relation.")
                 if not self._can_establish_relation(measured):
                     raise ObjectMotionPreconditionError("Target-bound close must settle before the lift relation is frozen.")
+                attitude_anchor = rigid_pose(obj, name="grasp attitude anchor")
                 self._anchor = relative
+                self._attitude_anchor = attitude_anchor
                 self._initial_z, self._initial_tcp_z = com[2], float(tcp[2, 3])
             slip, angle = pose_delta_metrics(self._anchor, relative)
             if slip > .003 or angle > 2.0:
@@ -348,7 +415,8 @@ class MujocoGraspedObjectObserver:
         Dormant before an explicit lift unless contact tracking is bound. That
         mode freezes a contact-secured relation after an explicit close while
         supported; it still requires an actual observed lift to verify holding.
-        Expected relation losses remain latched
+        An opted-in inclination band also persists through HOLD and planner
+        clear. Expected relation or inclination losses remain latched
         for the next object operation; they do not invent a global arm fault.
         Active payload guards retain their original stop behavior. Unexpected
         observer failures propagate to the rig's existing fault/hold boundary.

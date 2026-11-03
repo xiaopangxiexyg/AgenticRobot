@@ -177,13 +177,14 @@ class MujocoPayloadBinding:
     _measured_guard: Callable | None = field(repr=False)
     _measured_oracle: Any = field(repr=False)
     guard_identity: str | None
+    inclination_band: Any
 
     @classmethod
     def capture(cls, scene, source_data, *, target_body_name, sensor_geom_names,
                 tcp_pose_from_data, gripper_closed_from_data, tool_from_object=None,
                 support=None, translation_tolerance_m=.003,
                 rotation_tolerance_rad=_MAX_RELATIVE_ROTATION_RAD, measured_guard=None,
-                guard_identity=None):
+                guard_identity=None, inclination_band=None):
         """Caller holds the scene lock; all derivations use one private native cut."""
         if source_data.model is not scene.model:
             raise ValueError("Payload source must belong to this exact native scene model")
@@ -216,7 +217,8 @@ class MujocoPayloadBinding:
             "source_mocap_pos": tuple(tuple(float(v) for v in row) for row in source_data.mocap_pos),
             "source_mocap_quat": tuple(tuple(float(v) for v in row) for row in source_data.mocap_quat),
             "source_eq_active": tuple(bool(v) for v in source_data.eq_active),
-            "support": support, "translation_tolerance_m": float(translation_tolerance_m),
+            "support": support, "inclination_band": inclination_band,
+            "translation_tolerance_m": float(translation_tolerance_m),
             "rotation_tolerance_rad": float(rotation_tolerance_rad), "_model": scene.model,
             "_live_data": scene.data, "_physics_timestep_sec": timestep,
             "_signature": _model_signature(scene.model), "_tcp": tcp_pose_from_data,
@@ -240,7 +242,7 @@ class MujocoPayloadBinding:
         return binding
 
     def to_payload(self):
-        return {"target_body_name": self.target_body_name, "sensor_geom_names": self.sensor_geom_names,
+        payload = {"target_body_name": self.target_body_name, "sensor_geom_names": self.sensor_geom_names,
                 "tool_from_object": self.tool_from_object, "source_model_qpos": self.source_model_qpos,
                 "source_mocap_pos": self.source_mocap_pos, "source_mocap_quat": self.source_mocap_quat,
                 "source_eq_active": self.source_eq_active,
@@ -249,6 +251,9 @@ class MujocoPayloadBinding:
                 "rotation_tolerance_rad": self.rotation_tolerance_rad,
                 "native_geometry_hash": self._signature, "scene_policy": dict(self._policy),
                 "guard_identity": self.guard_identity}
+        if self.inclination_band is not None:
+            payload["inclination_band"] = self.inclination_band.to_payload()
+        return payload
 
     @property
     def semantic_content_hash(self):
@@ -536,6 +541,10 @@ class _PayloadSceneOracle(CollisionSafetyOracle):
                 or (support.phase == "place" and rise > .003))
 
     def check(self, data, *, _measured_support=False, **kwargs):
+        if (self.binding.inclination_band is not None
+                and not self.binding.inclination_band.accepts(_body_pose(data, self._body))):
+            return CollisionCheckResult(safe=False, minimum_distance_m=0.,
+                body1_name=self.binding.target_body_name, pair_class="payload_object_inclination")
         if self._dynamic_support_body is not None:
             translation, angle = pose_delta_metrics(
                 self._frozen_support_pose, _body_pose(data, self._dynamic_support_body))

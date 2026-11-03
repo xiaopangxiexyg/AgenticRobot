@@ -1836,6 +1836,7 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
         ('motion.approach_grasp_contact', "1", 'grasp-contact', contract_bundle.grasp_contact_contract),
         ('motion.move_grasped_object_to_pose', "1", 'grasped-object-motion', contract_bundle.object_motion_contract),
         ('motion.move_grasped_object_to_pose', "2", 'grasped-object-support-motion-v2', contract_bundle.object_support_motion_contract_v2),
+        ('motion.move_grasped_object_to_pose', "3", 'grasped-object-attitude-motion-v3', contract_bundle.object_attitude_motion_contract_v3),
     ):
         if safe_contract is None:
             continue
