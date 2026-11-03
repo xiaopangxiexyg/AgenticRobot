@@ -1961,10 +1961,63 @@ Python 装配 `build_mujoco_agent_tcp_pose_gateway_session` 和对应 contract b
 
 两个选择参数默认均为 `"1"`，旧合同与身份保持。MuJoCo 释放查询不占用 RealMan
 已有的 `@2` 两段搬运/放置合同。每个部署只装配选定版本的一套注册和执行器；
-RPent 的仿真附件审核 grasp `@1/@2`、优先 `@2`，release `@1/@3`、优先 `@3`，
+RPent 的仿真附件审核 grasp `@1/@2`、优先 `@2`，release `@1/@3/@4`、仍优先 `@3`，
 只有旧版本的部署仍可附着；真机 release 继续仅使用 `@2`。
 查询均只读，不授权执行；闭合、起吊与放置仍经过原下层检查，角度提案不能代替
 开爪之后的新鲜稳定释放证据。
+
+### 显式启用 6D 抓姿与持物姿态保护（MuJoCo）
+
+`--enable-fast-grasp` 发布 `perception.capture_grasp_observation@1`、
+`perception.plan_grasp_fast@1`、`motion.execute_grasp_approach_plan@1`。
+三者复用冻结 RGB-D 观测、GraspGenX 候选和一次性 pending-plan 链；完整接近路径
+仍须通过下层检查，执行接近不隐式闭爪。支持 6D 候选不保证每个抓姿都有可行的
+后续搬运与放置路径。
+
+`--enable-object-attitude-motion-v3` 在原 object-motion 与 support-v2 开关上增加
+`motion.move_grasped_object_to_pose@3`。`lift`、`carry` 保持同一 grasp generation
+冻结的物体材料轴相对世界竖直方向的倾角，允许上下 5° 偏差及绕世界竖直轴的 yaw。
+这约束的是物体，不要求手腕水平或锁定四元数。
+
+放置组合显式选择 `--support-release-query-version 4`。只读 query@4 返回调平的
+`release_object_pose_xyz_quat_xyzw`；将该目标原样交给 object-motion@3，使用
+`phase=release_approach` 和同一 `support_object_id`。该阶段仍不允许物体接触支撑，
+倾角可在原锚点至释放目标的受控区间内变化，不承诺单调调平或固定角速度。
+随后由 gripper@3 具名开爪（`release_support_object_id`），再读取满足原释放规则
+的新鲜稳定证据。query 的四个角度字段描述观测与提案，不能代替实际放置证据。
+object-motion@3 不接受旧的 `phase=place`；旧 object-motion@1/@2、query@1/@3
+及其语义保留。新开关默认关闭，release query 默认仍为 @1。
+
+以下示例使用原 MuJoCo CLI 与显式模型 service 模式。先准备已有 task 配置、
+模型 bundle 和两个模型服务；变量须替换为该部署的实际值，路径使用绝对路径。
+`OBJECT_ID`、`SUPPORT_ID` 必须已在 task 中声明，命令不会创建物体或支撑。
+
+```bash
+"$NATIVE_PYTHON" -m agent_gateway mujoco \
+  --socket-path "$GW_SOCKET" --task-config "$TASK_JSON" \
+  --client-id "$CLIENT_ID" --client-uid "$CLIENT_UID" \
+  --motion-side right --no-realtime-worker \
+  --artifact-root "$ARTIFACT_ROOT" \
+  --enable-grippers --enable-grasp-approach \
+  --grasp-contact-target-body "$OBJECT_ID" \
+  --enable-object-state --enable-object-follow-observation \
+  --enable-object-motion --enable-object-support-motion-v2 \
+  --object-support-body "$SUPPORT_ID" \
+  --enable-object-attitude-motion-v3 --enable-named-release-v3 \
+  --enable-support-release-queries --support-release-query-version 4 \
+  --support-release-prompt "$SUPPORT_ID=$SUPPORT_PROMPT" \
+  --enable-object-localization --object-localization-backend sam3-service \
+  --sam3-endpoint "$SAM3_ENDPOINT" \
+  --enable-fast-grasp --graspgenx-point-grasp-bundle "$GGX_BUNDLE" \
+  --graspgenx-mode service --graspgenx-host 127.0.0.1 \
+  --graspgenx-port "$GGX_PORT" --graspgenx-planner graspmoe \
+  --graspgenx-alignment-profile DMTAC_M_graspgenx_alignment_v5_q0
+```
+
+RPent 使用 `motion` attachment 的 `--include-execution --include-fast-grasp`
+显式加入完整 fast 三件套，并显式选择 object-motion@3/query@4。按当前 discovery
+分别选择 object-motion、fast execution 和夹爪的精确 safety envelope，不能套用
+旧版本或普通 TCP 的 envelope。所有原持物关系、跟随、碰撞、取消与 HOLD 检查保留。
 
 ### Real Skill target-frame invariant
 
