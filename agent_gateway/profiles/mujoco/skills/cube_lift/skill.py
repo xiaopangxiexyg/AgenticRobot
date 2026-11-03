@@ -825,18 +825,23 @@ class CubeLiftAgentSkillLifecycle:
                     errors.append(error)
             try:
                 self.application.close()
-            except BaseException as error:  # noqa: BLE001 - trace cleanup continues.
+            except BaseException as error:  # noqa: BLE001 - retain the dependent trace owner.
                 errors.append(error)
-            if self._trace_finalized and self._trace_finalization is None:
+            # Failed cleanup retains the trace owner for the same close retry.
+            if (
+                not errors
+                and self._trace_finalized
+                and self._trace_finalization is None
+            ):
                 try:
                     self._trace_finalization = self.trace_capture.complete_runtime()
-                except BaseException as error:  # noqa: BLE001 - close still required.
+                except BaseException as error:  # noqa: BLE001 - retain trace owner.
                     errors.append(error)
-            try:
-                self.trace_capture.close(now=float(self.clock()))
-            except BaseException as error:  # noqa: BLE001 - report all cleanup errors.
-                errors.append(error)
-            self._closed = True
+            if not errors:
+                try:
+                    self.trace_capture.close(now=float(self.clock()))
+                except BaseException as error:  # noqa: BLE001 - report cleanup failure.
+                    errors.append(error)
             if errors:
                 raise RuntimeError(
                     "CubeLift lifecycle close encountered errors: "
@@ -844,6 +849,7 @@ class CubeLiftAgentSkillLifecycle:
                         f"{type(error).__name__}:{error}" for error in errors
                     )
                 ) from errors[0]
+            self._closed = True
 
 
 def build_mujoco_cube_lift_agent_skill_lifecycle(
