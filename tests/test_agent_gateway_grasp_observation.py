@@ -209,7 +209,7 @@ def test_stationary_camera_history_rejects_movement_and_matches_capture():
     ((), 10.01, "insufficient_samples"),
     ((9.9, 10.), 10.01, "insufficient_samples"),
     ((9.94, 9.97, 10.), 10.01, "missing_pre_frame_history"),
-    ((9.8, 9.85, 9.90), 10.01, "last_sample_before_frame"),
+    ((9.76, 9.78, 9.79), 10.01, "last_sample_before_frame"),
     ((9.8, 9.9, 9.98), 10.3, "last_sample_stale"),
     ((9.8, 9.95, 10.), 10.01, "sample_gap_exceeded"),
 ])

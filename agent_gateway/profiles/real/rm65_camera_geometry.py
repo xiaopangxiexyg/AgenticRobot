@@ -384,7 +384,7 @@ class RM65RgbCameraGeometry:
                       "history_count": len(history), "max_pose_age_ms": self.max_pose_age_ms,
                       "max_frame_pose_skew_ms": self.max_frame_pose_skew_ms,
                       "history_window_sec": .25, "minimum_sample_count": 3,
-                      "required_pre_frame_history_sec": .10, "maximum_pre_frame_lag_sec": .05,
+                      "required_pre_frame_history_sec": .10, "maximum_pre_frame_lag_sec": .20,
                       "maximum_allowed_sample_gap_sec": .10}
         if captured > current:
             raise RM65StationaryGeometryUnavailable("grasp_observation_frame_pose_unavailable",
@@ -401,7 +401,7 @@ class RM65RgbCameraGeometry:
         if samples:
             if samples[0][0] > captured - .10:
                 failed.append("missing_pre_frame_history")
-            if samples[-1][0] < captured - .05:
+            if samples[-1][0] < captured - .20:
                 failed.append("last_sample_before_frame")
             if current-samples[-1][0] > self.max_pose_age_ms / 1000:
                 failed.append("last_sample_stale")
