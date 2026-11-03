@@ -106,7 +106,9 @@ derived target delta. The goal-delta Reach profile converts estimated object
 pose plus measured-qpos RM65 forward kinematics into the same right-base frame
 used by xyz pose actions. Its 3-D feature is real-computable and non-privileged,
 and the Sim-HIL adapter reconstructs the same feature from the MuJoCo object
-pose and measured TCP pose before emitting the public absolute-pose action.
+pose and the task-selected grasp frame (`body` or calibrated `tool_tcp`)
+resolved by the same helper as the training kernel. This observation reference
+is independent of the software TCP used to emit the public absolute-pose action.
 The real-robot external estimator/FK source and its calibration are not wired
 or proven by this simulation adapter.
 The progress-only v3 Reach profile removes the old per-step absolute proximity

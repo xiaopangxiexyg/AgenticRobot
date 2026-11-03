@@ -63,6 +63,7 @@ from sim.mujoco.tasks.cube_lift.learning import (
     encode_policy_observation,
 )
 from sim.mujoco.tasks.cube_lift.reach_guidance import build_reach_guidance
+from sim.mujoco.tool_frames import resolve_task_grasp_frame
 from sim.mujoco.tasks.cube_lift.spec import (
     CubeLiftActionSpec,
     CUBE_LIFT_NORMAL_MOTION_TRACKING_NO_EPISODE_CLOCK_OBSERVATION_LAYOUT_VERSION,
@@ -159,7 +160,7 @@ class TempPPOHILObservationAdapter:
     Target-error fields are zeroed because reconstructing the old CubeLift
     internal qpos target before composition would introduce the forbidden
     second IK owner.  The optional reach delta is reconstructed from the
-    externally observable object pose and the measured TCP pose in the same
+    externally observable object pose and the configured task grasp frame in the same
     right-arm-base frame used by the public pose action.  Motion deltas advance
     only on policy-cadence samples, not on every faster Control Station
     composition tick.
@@ -177,21 +178,14 @@ class TempPPOHILObservationAdapter:
         self._previous_qpos: np.ndarray | None = None
         self._previous_close: float | None = None
         self._last_compact_action = np.zeros(7, dtype=np.float32)
-        self._endpoint_to_tool: np.ndarray | None = None
+        self._grasp_body_id: int | None = None
+        self._body_from_grasp: np.ndarray | None = None
         if (
             task_config.observation_layout
             == CUBE_LIFT_NORMAL_MOTION_TRACKING_NO_EPISODE_CLOCK_CUBE_POSE_REACH_DELTA_OBSERVATION_LAYOUT_VERSION
         ):
-            from robot_motion.rm65 import (
-                endpoint_to_tool_transform,
-                load_rm65_tool_profile,
-            )
-
-            self._endpoint_to_tool = endpoint_to_tool_transform(
-                load_rm65_tool_profile(
-                    task_config.right_tool_profile_path,
-                    side="right",
-                )
+            self._grasp_body_id, self._body_from_grasp = resolve_task_grasp_frame(
+                scene, task_config
             )
 
     @property
@@ -265,26 +259,28 @@ class TempPPOHILObservationAdapter:
             self.task_config.observation_layout
             == CUBE_LIFT_NORMAL_MOTION_TRACKING_NO_EPISODE_CLOCK_CUBE_POSE_REACH_DELTA_OBSERVATION_LAYOUT_VERSION
         ):
-            if cube_pose is None or self._endpoint_to_tool is None:
+            if (
+                cube_pose is None
+                or self._grasp_body_id is None
+                or self._body_from_grasp is None
+            ):
                 raise RuntimeError("Reach-delta observation dependencies are unavailable.")
             base_pose = np.asarray(
                 self.scene.body_pose(_arm_base_body_name(self.scene, "right")),
                 dtype=float,
             ).reshape(4, 4)
-            endpoint_pose = np.asarray(
-                self.scene.body_pose(
-                    self.scene.arm_specs["right"].controlled_body
-                ),
-                dtype=float,
-            ).reshape(4, 4)
+            grasp_position = (
+                self.scene.data.xpos[self._grasp_body_id]
+                + self.scene.data.xmat[self._grasp_body_id].reshape(3, 3)
+                @ self._body_from_grasp[:3, 3]
+            )
             if not np.all(np.isfinite(base_pose)) or not np.all(
-                np.isfinite(endpoint_pose)
+                np.isfinite(grasp_position)
             ):
-                raise ValueError("MuJoCo right-arm-base/TCP poses are not finite.")
-            tool_pose = endpoint_pose @ self._endpoint_to_tool
+                raise ValueError("MuJoCo right-arm-base/grasp poses are not finite.")
             compact_state[35:38] = build_reach_guidance(
                 cube_pose[:3],
-                tool_pose[:3, 3],
+                grasp_position,
                 base_pose[:3, :3],
                 target_height_offset_m=(
                     self.task_config.reach_target_height_offset_m

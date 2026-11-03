@@ -99,10 +99,18 @@ class _ObservationScene:
     def __init__(self) -> None:
         self.qpos = np.zeros(6, dtype=np.float32)
         self.close = 0.2
+        self.data = SimpleNamespace(
+            xpos=np.asarray([[0.3, -0.1, 0.2], [0.3, -0.08, 0.18]], dtype=float),
+            xmat=np.tile(np.eye(3, dtype=float).reshape(1, 9), (2, 1)),
+        )
         self.cube_pose = np.asarray(
             [0.4, 0.1, 0.03, 1.0, 0.0, 0.0, 0.0],
             dtype=np.float32,
         )
+
+    @staticmethod
+    def body_id(name: str) -> int:
+        return {"right_tcp": 0, "right_gripper_grasp_center_frame": 1}[name]
 
     def get_arm_qpos(self, side: str) -> np.ndarray:
         assert side == "right"
@@ -122,10 +130,12 @@ class _ObservationScene:
 
     @staticmethod
     def body_pose(name: str) -> np.ndarray:
-        assert name in {"right_arm_base_link", "right_tcp"}
+        assert name in {"right_arm_base_link", "right_tcp", "right_gripper_grasp_center_frame"}
         pose = np.eye(4, dtype=float)
         if name == "right_tcp":
             pose[:3, 3] = (0.3, -0.1, 0.2)
+        elif name == "right_gripper_grasp_center_frame":
+            pose[:3, 3] = (0.3, -0.08, 0.18)
         return pose
 
 
@@ -306,11 +316,10 @@ def test_goal_delta_observation_is_deployable_and_uses_pose_action_frame() -> No
     validate_temp_ppo_hil_profile(config, policy)
     observation = adapter.capture(step_index=0)
 
-    endpoint_pose = scene.body_pose("right_tcp")
-    tool_position = (endpoint_pose @ adapter._endpoint_to_tool)[:3, 3]
+    grasp_position = scene.body_pose(config.right_grasp_body_name)[:3, 3]
     expected = scene.cube_pose[:3].astype(float, copy=True)
     expected[2] += config.reach_target_height_offset_m
-    expected -= tool_position
+    expected -= grasp_position
     np.testing.assert_allclose(
         observation.state_dict["temp_ppo_state"][28:35],
         scene.cube_pose,
@@ -340,11 +349,10 @@ def test_overhead_goal_delta_has_matching_nonprivileged_hil_semantics() -> None:
     observation = adapter.capture(step_index=0)
 
     base_pose = scene.body_pose("right_arm_base_link")
-    endpoint_pose = scene.body_pose("right_tcp")
-    tool_position = (endpoint_pose @ adapter._endpoint_to_tool)[:3, 3]
+    grasp_position = scene.body_pose(config.right_grasp_body_name)[:3, 3]
     expected = build_reach_guidance(
         scene.cube_pose[:3],
-        tool_position,
+        grasp_position,
         base_pose[:3, :3],
         target_height_offset_m=config.reach_target_height_offset_m,
         guidance_height_offset_m=config.reach_guidance_height_offset_m,
