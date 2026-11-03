@@ -32,6 +32,7 @@ def _composition(*, human_alpha: float = 0.0) -> MujocoSimHILComposition:
     )
     runtime = SimpleNamespace(
         config=runtime_config,
+        component_execution_binding=_hashed("component-execution-binding:test"),
         catalog=SimpleNamespace(
             action_space=BIMANUAL_EE_POSE_V1,
             semantic_content_hash="catalog:test",
