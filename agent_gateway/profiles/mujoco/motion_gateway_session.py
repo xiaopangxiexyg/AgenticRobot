@@ -172,6 +172,7 @@ class MujocoAgentTcpPoseGatewaySession:
     grasp_contact_executor: ReusableStationAgentSkillOperationExecutor | None = None
     object_motion_executor: ReusableStationAgentSkillOperationExecutor | None = None
     object_support_motion_executor_v2: ReusableStationAgentSkillOperationExecutor | None = None
+    object_attitude_motion_executor_v3: ReusableStationAgentSkillOperationExecutor | None = None
     object_observer: MujocoGraspedObjectObserver | None = None
     gripper_executor: ReusableStationAgentSkillOperationExecutor | None = None
     gripper_ports: Mapping[str, MujocoGripperControlPort] = field(default_factory=dict)
@@ -284,6 +285,9 @@ class MujocoAgentTcpPoseGatewaySession:
         if (self.contract_bundle.object_support_motion_contract_v2 is not None
                 ) != (self.object_support_motion_executor_v2 is not None):
             raise ValueError("Object support v2 registration and executor must coexist.")
+        if (self.contract_bundle.object_attitude_motion_contract_v3 is not None
+                ) != (self.object_attitude_motion_executor_v3 is not None):
+            raise ValueError("Object attitude v3 registration and executor must coexist.")
         if (getattr(self.contract_bundle, "support_release_query_registration", None) is not None
                 ) != (self.support_release_query_executor is not None):
             raise ValueError("Support release query registration and executor must coexist.")
@@ -548,6 +552,7 @@ class MujocoAgentTcpPoseGatewaySession:
             *((self.grasp_contact_executor,) if self.grasp_contact_executor is not None else ()),
             *((self.object_motion_executor,) if self.object_motion_executor is not None else ()),
             *((self.object_support_motion_executor_v2,) if self.object_support_motion_executor_v2 is not None else ()),
+            *((self.object_attitude_motion_executor_v3,) if self.object_attitude_motion_executor_v3 is not None else ()),
             *((self.execute_grasp_plan_executor,) if self.execute_grasp_plan_executor is not None else ()),
             *((self.observed_point_executor,) if self.observed_point_executor is not None else ()),
             *((self.observed_anchor_executor_v2,) if self.observed_anchor_executor_v2 is not None else ()),
@@ -2156,6 +2161,7 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
         grasp_contact_executor=planned_executors.get(("motion.approach_grasp_contact", "1")),
         object_motion_executor=planned_executors.get(("motion.move_grasped_object_to_pose", "1")),
         object_support_motion_executor_v2=planned_executors.get(("motion.move_grasped_object_to_pose", "2")),
+        object_attitude_motion_executor_v3=planned_executors.get(("motion.move_grasped_object_to_pose", "3")),
         object_observer=object_observer,
         gripper_executor=gripper_executor,
         gripper_ports=gripper_ports,
