@@ -390,8 +390,12 @@ hard penetration, and no clearance violation. An unanchored 8192-step PPO
 continuation regressed to 20/32 with five hard penetrations. The optional
 `--actor-reference-mse-coef` freezes the post-initialization actor and penalizes
 deterministic latent-action drift using the same deployable observations. It is
-default-off and does not make the actor or critic privileged. A coefficient-2
-8192-step ablation retained 28/32 but still did not beat the bootstrap
+default-off and does not make the actor or critic privileged. Capturing the
+reference also freezes the actor observation normalizer after initialization,
+so its action for the same raw observation does not drift as PPO visits new
+states. An independent privileged critic normalizer continues to update. The
+uncaptured default path retains adaptive actor normalization. The earlier
+coefficient-2 8192-step ablation, collected before normalizer freezing, retained 28/32 but still did not beat the bootstrap
 checkpoint, so the bootstrap checkpoint remains the current validated model.
 
 Bootstrap collection records its own success, safety-projection, rejection,

@@ -479,6 +479,8 @@ class PPOSmokeTrainer:
                 self.config.actor_reference_mse_coef
             ),
             "uses_privileged_observation": False,
+            "observation_normalizer": "frozen_at_reference_capture",
+            "observation_normalizer_count": float(self.observation_normalizer.count),
         }
 
     @staticmethod
@@ -1177,7 +1179,11 @@ class PPOSmokeTrainer:
             self.task_observation = next_task_observation
             self.observation = next_observation
             self._reward_observation = next_reward_observation
-            self.observation_normalizer.update(next_observation)
+            # The captured reference includes the actor's input coordinates.
+            # Updating those statistics would change its raw-observation policy
+            # even though its weights remain frozen.
+            if self._actor_reference_policy is None:
+                self.observation_normalizer.update(next_observation)
             if self.critic_observation_normalizer is not None:
                 self.critic_observation_normalizer.update(
                     next_reward_observation
