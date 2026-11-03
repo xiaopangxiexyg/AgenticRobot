@@ -68,6 +68,10 @@ class RealDmtacGripperControlPort:
         self._last_command_attempt_ref: str | None = None
         self._last_command_target_close: float | None = None
         self._last_hold_receipt: GripperHoldReceipt | None = None
+        self._diagnostic_read_count = 0
+        self._diagnostic_max_read_sec = 0.0
+        self._diagnostic_last_read: dict[str, object] = {}
+        self._diagnostic_command: dict[str, object] = {}
         config = getattr(backend, "config", None)
         side = str(getattr(config, "side", "right"))
         if component_id not in {"left_gripper", "right_gripper"}:
@@ -141,6 +145,10 @@ class RealDmtacGripperControlPort:
         )
         self._last_command_target_close = target
         self._last_hold_receipt = None
+        self._diagnostic_read_count = 0
+        self._diagnostic_max_read_sec = 0.0
+        self._diagnostic_last_read = {}
+        self._diagnostic_command = {"status": "submission_started"}
         started_at = time.monotonic()
         deadline = started_at + self.command_submission_timeout_sec
         attempts = 0
@@ -179,6 +187,10 @@ class RealDmtacGripperControlPort:
             if time.monotonic() >= deadline:
                 break
         command_ref = self._ref("command", {"target_close": target, "accepted": accepted})
+        self._diagnostic_command = {
+            "accepted": accepted, "attempts": attempts,
+            "elapsed_sec": time.monotonic() - started_at, "receipt": command_ref,
+        }
         if not accepted:
             _LOG.error(
                 "DMTAC Skill command rejected: component=%s target_close=%s "
@@ -194,7 +206,20 @@ class RealDmtacGripperControlPort:
 
     def observe_state(self) -> GripperStateSample:
         read_started = time.monotonic()
-        reading = self.backend.read_gripper_state_now()
+        reading = None
+        try:
+            reading = self.backend.read_gripper_state_now()
+        finally:
+            elapsed = time.monotonic() - read_started
+            self._diagnostic_read_count += 1
+            self._diagnostic_max_read_sec = max(self._diagnostic_max_read_sec, elapsed)
+            # Retain only one small feedback cut; never fetch extra device state.
+            self._diagnostic_last_read = {
+                "read_elapsed_sec": elapsed,
+                **({key: reading.get(key) for key in (
+                    "timestamp", "joint_pos", "status_code", "is_moving", "error_code",
+                )} if isinstance(reading, Mapping) else {"feedback_unavailable": True}),
+            }
         if time.monotonic() - read_started > 0.2:
             raise RuntimeError(
                 "DMTAC fresh gripper state read exceeded its 200 ms budget."
@@ -210,6 +235,7 @@ class RealDmtacGripperControlPort:
             include_tactile_arrays=False,
             include_tactile_vector=False,
         )
+        self._diagnostic_last_read["read_and_cache_elapsed_sec"] = time.monotonic() - read_started
         # Include cached-state access in the acquisition window. A slow getter
         # must not make an old read look fresh by assigning a later timestamp.
         if time.monotonic() - read_started > 0.2:
@@ -268,6 +294,12 @@ class RealDmtacGripperControlPort:
             )
 
     def hold(self, *, reason: str) -> GripperHoldReceipt:
+        pre_hold_diagnostics = (
+            self.component_id, reason, self._last_command_attempt_ref,
+            self._last_command_target_close, self._diagnostic_command,
+            self._diagnostic_read_count, self._diagnostic_max_read_sec,
+            dict(self._diagnostic_last_read),
+        )
         self._last_hold_receipt = None
         started_at = time.monotonic()
         deadline = started_at + self.hold_confirmation_timeout_sec
@@ -311,6 +343,14 @@ class RealDmtacGripperControlPort:
             ),
         )
         self._last_hold_receipt = receipt
+        if reason in {"gripper_execution_preempted", "gripper_convergence_timeout",
+                      "station_operation_worker_exception"}:
+            # Preserve pre-stop feedback, but emit only after the stop attempt.
+            _LOG.warning(
+                "DMTAC pre-HOLD feedback: component=%s reason=%s command_attempt=%s "
+                "target_close=%s command=%r read_count=%s max_read_sec=%.6f last_read=%r",
+                *pre_hold_diagnostics,
+            )
         return receipt
 
     @property

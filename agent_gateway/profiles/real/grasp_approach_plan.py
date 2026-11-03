@@ -958,7 +958,13 @@ class BoundedRealGraspApproachPlanStore:
             and (stored.reserved_by_operation_id is None or stored.consumed)
         ]
         for plan_id in expired:
-            self._plans.pop(plan_id, None)
+            stored = self._plans.pop(plan_id)
+            _LOGGER.warning(
+                "Grasp plan expired: plan_id=%s planning_operation_id=%s "
+                "created_at=%.6f expires_at=%.6f now=%.6f overdue_sec=%.6f consumed=%s",
+                plan_id, stored.plan.planning_operation_id, stored.plan.created_at,
+                stored.plan.expires_at, now, now - stored.plan.expires_at, stored.consumed,
+            )
 
     def put(self, plan: RealGraspApproachPlan, *, now: float) -> None:
         if not isinstance(plan, RealGraspApproachPlan):
@@ -1023,6 +1029,10 @@ class BoundedRealGraspApproachPlanStore:
             self._prune(now=timestamp)
             stored = self._plans.get(requested_id)
             if stored is None:
+                _LOGGER.warning(
+                    "Grasp plan lookup miss: operation_id=%s plan_id=%s now=%.6f",
+                    requested_operation, requested_id, timestamp,
+                )
                 raise RealGraspApproachPlanLookupError("grasp_path_plan_not_found")
             plan = stored.plan
             if plan.source_kind == "frozen_observation_fast" and not self._fast_plan_committed(plan):

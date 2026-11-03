@@ -8,6 +8,7 @@ the Gateway store's CAS boundary.  This module imports no lower runtime.
 
 from __future__ import annotations
 
+import logging
 import math
 import threading
 import time
@@ -23,6 +24,8 @@ from ..protocol.contracts import (
     AgentSkillRequest,
 )
 from .operation_port import AgentGatewayAuthoritativePortReceipt, freeze_failure_diagnostic
+
+_LOGGER = logging.getLogger(__name__)
 
 STATION_OPERATION_WORKER_STATES_V1 = (
     "idle",
@@ -535,6 +538,16 @@ class BoundedStationAgentSkillOperationWorker:
             current_station_revision=self._revision(),
             now=now,
         )
+        receipt = getattr(outcome, "port_receipt", None)
+        _LOGGER.warning(
+            "Station operation timeout: operation_id=%s deadline_at=%.6f now=%.6f "
+            "overdue_sec=%.6f accepted=%s reason=%s receipt_id=%s "
+            "receipt_kind=%s receipt_succeeded=%s proves_motion_or_hold=%s",
+            operation.operation_id, operation.deadline_at, now, now - operation.deadline_at,
+            getattr(outcome, "accepted", None), getattr(outcome, "reason_code", None),
+            getattr(receipt, "receipt_id", None), getattr(receipt, "operation_kind", None),
+            getattr(receipt, "succeeded", None), getattr(receipt, "proves_motion_or_hold", None),
+        )
         with self._condition:
             self._last_completion_outcome = outcome
         return outcome
@@ -939,6 +952,14 @@ class BoundedStationAgentSkillOperationWorker:
                 raise TypeError("Lifecycle returned invalid execution completion.")
             worker_phase = "timeout_reconciliation"
             if self._expire_if_due(service=service, operation=running) is not None:
+                _LOGGER.warning(
+                    "Station completion superseded by timeout: operation_id=%s "
+                    "succeeded=%s reason=%s terminal_hold_confirmed=%s "
+                    "evidence_count=%s last_evidence=%s",
+                    running.operation_id, completion.succeeded, completion.reason_code,
+                    completion.terminal_hold_confirmed, len(completion.execution_receipt_refs),
+                    completion.execution_receipt_refs[-1:] or None,
+                )
                 return
             receipt_refs = completion.execution_receipt_refs
             if not completion.terminal_hold_confirmed:
@@ -1061,6 +1082,11 @@ class BoundedStationAgentSkillOperationWorker:
             except Exception as error:  # noqa: BLE001 - retain first failure.
                 self._record_worker_error(error)
             self._set_state("finished")
+            if self.last_error is not None:
+                _LOGGER.error(
+                    "Station operation failed: operation_id=%s phase=%s error=%.500s",
+                    admitted.operation_id, worker_phase, self.last_error,
+                )
 
     def _record_worker_error(self, error: BaseException) -> None:
         detail = f"{type(error).__name__}:{error}"
