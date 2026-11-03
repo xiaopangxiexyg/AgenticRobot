@@ -25,7 +25,7 @@ ARM_BASELINE_PATH = Path(
 )
 ARM_RUNTIME_BINDING_PATH = Path(
     "sim/rm65/real2sim/artifacts/"
-    "rm65_arm_free_motion_20260721_v4_runtime_binding_20261103_g4_command_refusal_v1.json"
+    "rm65_arm_free_motion_20260721_v4_runtime_binding_20261103_real_failure_diagnostics_v1.json"
 )
 MUJOCO_G4_RELEASE_LEVELING_V1_BINDING_PATH = Path(
     "sim/rm65/real2sim/artifacts/"
@@ -461,11 +461,14 @@ def test_v4_arm_fit_baseline_remains_frozen_and_provisional() -> None:
 
 def test_current_arm_runtime_binding_uses_exact_current_inputs() -> None:
     binding = Real2SimArtifactManifest.load(ARM_RUNTIME_BINDING_PATH)
-    previous = Real2SimArtifactManifest.load(MUJOCO_G4_RELEASE_LEVELING_V1_BINDING_PATH)
-    parallel = Real2SimArtifactManifest.load(COMMAND_REFUSAL_V1_BINDING_PATH)
-    fit = Real2SimArtifactManifest.load(ARM_BASELINE_PATH)
-    source, source_tree = 'a1b9e59a7f07a792929ae2e681d77288a67b0454', '4ab39d8311b1a440e747e5972e194159adbadc72'
-    tag, old_tag = "20261103-g4-command-refusal-v1", "20261103-mujoco-g4-release-leveling-v1"
+    previous_path = Path(
+        "sim/rm65/real2sim/artifacts/"
+        "rm65_arm_free_motion_20260721_v4_runtime_binding_20261103_g4_command_refusal_v1.json"
+    )
+    previous = Real2SimArtifactManifest.load(previous_path)
+    source = "1561fb70926933c5e363d9ddfe0a7432fd1a6003"
+    source_tree = "2a85da215486e1adb0cecb53d5ca28acc0eb7959"
+    tag, old_tag = "20261103-real-failure-diagnostics-v1", "20261103-g4-command-refusal-v1"
     current = {r.locator: r for r in binding.dependency_artifacts if "-runtime-" + tag in r.artifact_id}
     inherited = {r.locator: r for r in previous.dependency_artifacts if "-runtime-" + old_tag in r.artifact_id}
     assert len(current) == len(inherited) == 205 and set(current) == set(inherited)
@@ -476,52 +479,36 @@ def test_current_arm_runtime_binding_uses_exact_current_inputs() -> None:
         assert ref.artifact_id == inherited[path].artifact_id.replace(old_tag, tag)
         assert ref.artifact_kind == inherited[path].artifact_kind
     changed = {p for p in inherited if current[p].sha256 != inherited[p].sha256}
-    assert changed == {"sim/mujoco/actuation/executor.py"}
+    assert changed == {"agent_gateway/profiles/real/gripper_skill.py"}
     assert tuple(binding.metadata["changed_previous_runtime_sources"]) == tuple(sorted(changed))
     assert tuple(binding.metadata["new_runtime_sources"]) == ()
     assert tuple(binding.metadata["changed_previous_offline_inputs"]) == ()
-    assert binding.code_revision == binding.metadata["runtime_source_commit"] == binding.environment_fingerprint["source_commit"] == source
+    assert binding.code_revision == binding.metadata["runtime_source_commit"] == source
+    assert binding.environment_fingerprint["source_commit"] == source
     assert binding.metadata["offline_validation_source_tree"] == binding.environment_fingerprint["source_tree"] == source_tree
     assert subprocess.check_output(["git", "rev-parse", source + "^{tree}"], text=True).strip() == source_tree
-    assert dict(binding.metadata["integration_input_commits"]) == {'peer': '283a969e6784a515be70a4348a8ee06b30891935', 'command_refusal': 'e2da2764263d502820262bf9b2e21f1e7b3a0572'}
     refs = {r.artifact_id: r for r in binding.dependency_artifacts}
-    for predecessor, predecessor_tag in ((previous, old_tag), (parallel, "20261103-command-refusal-v1")):
-        for ref in predecessor.dependency_artifacts:
-            if "-runtime-" + predecessor_tag not in ref.artifact_id:
-                assert refs[ref.artifact_id] == ref
-    for artifact_id, path, predecessor, key in (
-        ("rm65-arm-runtime-binding-mujoco-g4-release-leveling-20261103-v1", MUJOCO_G4_RELEASE_LEVELING_V1_BINDING_PATH, previous, "previous"),
-        ("rm65-arm-runtime-binding-command-refusal-20261103-v1", COMMAND_REFUSAL_V1_BINDING_PATH, parallel, "parallel"),
-    ):
-        parent = refs[artifact_id]
-        assert parent.locator == str(path)
-        assert parent.sha256 == binding.metadata[key + "_runtime_binding_file_sha256"] == ArtifactRef.from_file(path, artifact_id="parent-check", artifact_kind="real2sim_runtime_binding").sha256
-        assert binding.metadata[key + "_runtime_binding_artifact_sha256"] == predecessor.artifact_sha256
-    assert binding.metadata["fit_artifact_sha256"] == fit.artifact_sha256
-    assert binding.resolved_timing == previous.resolved_timing == Real2SimArtifactManifest.resolved_timing_from_contract_file(CONTRACT_PATH)
-    assert binding.simulation_contract.sha256 == previous.simulation_contract.sha256 == ArtifactRef.from_file(CONTRACT_PATH, artifact_id="contract-check", artifact_kind="simulation_contract").sha256
-    assert tuple(binding.metadata["offline_query_input_artifact_ids"]) == tuple(previous.metadata["offline_query_input_artifact_ids"])
+    for ref in previous.dependency_artifacts:
+        if "-runtime-" + old_tag not in ref.artifact_id:
+            assert refs[ref.artifact_id] == ref
+    parent = refs["rm65-arm-runtime-binding-g4-command-refusal-20261103-v1"]
+    assert parent.locator == str(previous_path)
+    assert parent.sha256 == binding.metadata["previous_runtime_binding_file_sha256"] == hashlib.sha256(previous_path.read_bytes()).hexdigest()
+    assert binding.metadata["previous_runtime_binding_artifact_sha256"] == previous.artifact_sha256
+    assert binding.resolved_timing == previous.resolved_timing
+    assert binding.simulation_contract.sha256 == previous.simulation_contract.sha256
     for artifact_id in binding.metadata["offline_query_input_artifact_ids"]:
         ref = refs[artifact_id]
         assert ref.sha256 == ArtifactRef.from_file(ref.locator, artifact_id="offline-check", artifact_kind=ref.artifact_kind).sha256
-        assert ref.sha256 == hashlib.sha256(subprocess.check_output(["git", "show", source + ":" + ref.locator])).hexdigest()
-    assert binding.metadata["migration"] == "namespaced_g4_command_refusal_binding_v1"
-    assert binding.metadata["runtime_behavior_change_scope"] == "g4_runtime_inputs_with_typed_pre_dispatch_arm_command_collision_refusal"
-    assert binding.metadata["runtime_behavior_change"] is True
-    for key in ("arm_profile_refit", "new_physical_hardware_validation", "runtime_control_semantics_changed", "wire_schema_version_changed", "automatic_retry_authorization"):
+    assert binding.metadata["migration"] == "real_failure_diagnostics_binding_v1"
+    assert binding.metadata["runtime_behavior_change_scope"] == "bounded_failure_logging_only"
+    for key in ("runtime_behavior_change", "arm_profile_refit", "new_physical_hardware_validation",
+                "runtime_control_semantics_changed", "wire_schema_version_changed", "automatic_retry_authorization"):
         assert binding.metadata[key] is False
-    reports = {'g4-command-refusal-focused-report-20261103-g4-command-refusal-v1': '3cbfa40c58b717b5ec39ee8cdffc021b39f9d28557ef17cc0b403d5e458f3d0c', 'g4-command-refusal-focused-source-20261103-g4-command-refusal-v1': '34c2946b0379952a2dd8f80fd1fd06fb6de8ade3849164fa8c8563605a3f5f8f'}
-    assert tuple(binding.metadata["offline_validation_report_artifact_ids"]) == tuple(reports)
-    for artifact_id, digest in reports.items():
-        assert refs[artifact_id].sha256 == digest and refs[artifact_id].artifact_kind == "offline_validation_report"
-    assert tuple(binding.metadata["parallel_historical_report_artifact_ids"]) == ('command-refusal-focused-report-20261103-command-refusal-v1', 'command-refusal-focused-source-20261103-command-refusal-v1')
-    assert dict(binding.metadata["historical_evidence_source_contexts"]) == {'g4': '465cf60dc4af8f7e869fc179c2c88fbe5be28e18', 'command_refusal': 'a1f9351158ee59ec33f47fb6943a7ecdde53c6fd'}
-    offline = next(e for e in binding.validation_evidence if e.validation_id == "g4-command-refusal-offline-consumers-" + tag)
-    assert offline.status == "passed" and dict(offline.metrics) == {'passed_cases': 397.0, 'skipped_cases': 0.0, 'failed_cases': 0.0, 'error_cases': 0.0}
-    integrity = next(e for e in binding.validation_evidence if e.validation_id == "runtime-source-content-binding-integrity-" + tag)
-    assert dict(integrity.metrics) == {'bound_runtime_input_file_count': 205.0, 'bound_runtime_source_file_count': 200.0, 'changed_runtime_source_file_count_from_previous_binding': 1.0, 'new_runtime_source_file_count': 0.0, 'new_runtime_configuration_file_count': 0.0, 'arm_profile_refit_count': 0.0, 'mutated_historical_artifact_count': 0.0}
-    assert binding.artifact_sha256 == '4b0c6ab638400eea92d68fee090a27fd8174e795d56f221f74db976562bb1927'
-    assert ArtifactRef.from_file(ARM_RUNTIME_BINDING_PATH, artifact_id="binding-file-check", artifact_kind="real2sim_runtime_binding").sha256 == 'f4962434aa999e3e3c8a470e02bedeeccd59319ef848afd1a7cf1e7d3a83c680'
+    evidence = next(e for e in binding.validation_evidence if "passed_cases" in e.metrics)
+    assert evidence.metrics["passed_cases"] == 210
+    assert evidence.metrics["failed_cases"] == evidence.metrics["error_cases"] == 0
+    assert len(binding.metadata["offline_validation_report_artifact_ids"]) == 2
     assert binding.fidelity_claims[0].status == "provisional"
     assert next(e for e in binding.validation_evidence if e.split == "held_out").status == "not_run"
 

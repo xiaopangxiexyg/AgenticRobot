@@ -92,6 +92,12 @@ core and MuJoCo adapter used for the 20260721 fit; tests compare those hashes to
 fixed historical values rather than silently reinterpreting the fit against
 the current files.
 
+当前轻量失败诊断使用后继绑定
+`artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261103_real_failure_diagnostics_v1.json`，
+固定源码 `1561fb70926933c5e363d9ddfe0a7432fd1a6003`。205 项已有输入中仅真实夹爪适配器的
+诊断记录发生变化；旧清单和历史证据保持不变，210 项既有 owner 检查通过。
+只增加失败日志，不改变控制、超时、HOLD 证明或重试规则；没有新真机验证。
+
 G4 与原生周期/命令拒绝修复的组合使用后继绑定
 `artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261103_g4_command_refusal_v1.json`，固定源码 `a1b9e59a7f07a792929ae2e681d77288a67b0454`。
 它以 G4 的 205 项输入为运行时父，只有 `sim/mujoco/actuation/executor.py` 改变；
