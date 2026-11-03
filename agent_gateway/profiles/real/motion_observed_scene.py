@@ -3,9 +3,7 @@
 from __future__ import annotations
 
 import logging
-import json
 import tempfile
-from collections.abc import Mapping
 from pathlib import Path
 from PIL import Image
 import time
@@ -26,7 +24,11 @@ from teleop_runtime.skill_deploy.rm65_grasp_trajectory import (
     RM65GraspTrajectoryPlanningError,
 )
 
-from .motion_observed_scene_debug import SafeMotionDebugRecord, validate_debug_directory
+from .motion_observed_scene_debug import (
+    SafeMotionDebugRecord,
+    encode_record_json,
+    validate_debug_directory,
+)
 from .rm65_camera_geometry import RM65StationaryGeometryUnavailable
 
 
@@ -143,14 +145,7 @@ class ObservedSafeMovePlanner:
                     try:
                         try:
                             # Freeze correlated views without intervening disk I/O.
-                            for role in self.config.roles:
-                                try:
-                                    with _timed_phase(record_timing, "capture_rgbd", role=role):
-                                        captures.append(self.provider.capture_aligned_rgbd(role=role,
-                                            expected_station_revision=revision, require_stationary=True))
-                                except (RuntimeError, ValueError) as error:
-                                    raise self._observation_error(error, stage="capture_rgbd", role=role,
-                                                                  captures=captures) from error
+                            self._capture_views(captures, revision, record_timing)
                         except BaseException as error:
                             remember_primary(error)
                             raise
@@ -181,17 +176,8 @@ class ObservedSafeMovePlanner:
                                         with _timed_phase(record_timing, "save_input", role=capture.role):
                                             record.capture(capture)
                         self._require_current(captures, revision)
-                        try:
-                            cloud = obstacle_cloud_from_captures(captures=captures, config=self.config,
-                                reference_frame_id=self.reference_frame_id, self_filter=self.self_filter,
-                                planning_qpos_by_side=kwargs["qpos_by_side"],
-                                max_inter_camera_skew_sec=self.provider.max_inter_camera_skew_ms / 1000,
-                                debug_record=record, record_timing=record_timing)
-                        except RM65GraspTrajectoryPlanningError:
-                            raise
-                        except (RuntimeError, ValueError) as error:
-                            raise self._observation_error(error, stage="obstacle_cloud", role=None,
-                                                          captures=captures) from error
+                        cloud = self._build_obstacle_cloud(
+                            captures, kwargs["qpos_by_side"], record, record_timing)
                     except RM65GraspTrajectoryPlanningError:
                         raise
                     except (RuntimeError, ValueError) as error:
@@ -261,6 +247,33 @@ class ObservedSafeMovePlanner:
         finally:
             logging.getLogger(__name__).info("Safe-move preparation %.3fs; phases=%s",
                 time.perf_counter() - wall_started, timings)
+
+    def _capture_views(self, captures, revision, record_timing):
+        """Append each acquired view so partial evidence survives a later failure."""
+        for role in self.config.roles:
+            try:
+                with _timed_phase(record_timing, "capture_rgbd", role=role):
+                    captures.append(self.provider.capture_aligned_rgbd(
+                        role=role, expected_station_revision=revision, require_stationary=True))
+            except (RuntimeError, ValueError) as error:
+                raise self._observation_error(
+                    error, stage="capture_rgbd", role=role, captures=captures) from error
+
+    def _build_obstacle_cloud(self, captures, qpos_by_side, record, record_timing):
+        """Preserve lower planning refusals; classify observation processing errors."""
+        try:
+            return obstacle_cloud_from_captures(
+                captures=captures, config=self.config,
+                reference_frame_id=self.reference_frame_id, self_filter=self.self_filter,
+                planning_qpos_by_side=qpos_by_side,
+                max_inter_camera_skew_sec=self.provider.max_inter_camera_skew_ms / 1000,
+                debug_record=record, record_timing=record_timing)
+        except RM65GraspTrajectoryPlanningError:
+            raise
+        except (RuntimeError, ValueError) as error:
+            raise self._observation_error(
+                error, stage="obstacle_cloud", role=None, captures=captures) from error
+
     def _save_inputs(self, record, captures, request):
         views = []
         for cut in captures:
@@ -307,12 +320,4 @@ class ObservedSafeMovePlanner:
 
 
 def _save_json(path, value):
-    def encode(item):
-        if isinstance(item, np.ndarray):
-            return item.tolist()
-        if isinstance(item, np.generic):
-            return item.item()
-        if isinstance(item, Mapping):
-            return dict(item)
-        raise TypeError(type(item).__name__)
-    path.write_text(json.dumps(value, default=encode, ensure_ascii=False, indent=2, allow_nan=False))
+    path.write_text(encode_record_json(value), encoding="utf-8")

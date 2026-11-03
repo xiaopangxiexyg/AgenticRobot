@@ -200,12 +200,19 @@ def test_live_adapter_reads_existing_provider_once_and_never_falls_back(problem)
 def debug_adapter(tmp_path, *, problem="rejected", now=None, events=None):
     from robot_motion.path_planning import JointPathPlannerConfig
     from teleop_runtime.skill_deploy.rm65_grasp_trajectory import (
+        RM65CarriedObjectBox,
+        RM65CarriedObjectSupport,
         RM65GraspTrajectoryPlanningConfig,
     )
     now = [10.] if now is None else now
     events = [] if events is None else events
     context_file = tmp_path / "input-config.json"
     context_file.write_text('{"serial":"unit-test-camera"}')
+    carried = RM65CarriedObjectBox(object_id="ball", side="right",
+        tool_from_box=np.eye(4), size_xyz_m=(.04, .04, .04), evidence_ref="measured-box")
+    support = RM65CarriedObjectSupport(support_id="table", plane_anchor_xyz_m=(0., 0., 0.),
+        normal_xyz=(0., 0., 1.), region_min_xy_m=(-1., -1.), region_max_xy_m=(1., 1.),
+        evidence_ref="measured-support")
 
     def read(**kwargs):
         events.append("read:" + kwargs["role"])
@@ -228,6 +235,8 @@ def debug_adapter(tmp_path, *, problem="rejected", now=None, events=None):
 
             def __call__(self, **kwargs):
                 events.append("plan")
+                assert kwargs["carried_object"] is carried
+                assert kwargs["carried_object_support"] is support
                 # Inputs must already be inspectable if this process dies here.
                 record = json.loads(next(tmp_path.glob("scene-*/record.json")).read_text())
                 assert record["state"] == "recording" and record["stages"][-1]["phase"] == "planning"
@@ -253,6 +262,7 @@ def debug_adapter(tmp_path, *, problem="rejected", now=None, events=None):
         debug_context_files={"camera-config.json": context_file})
     kwargs = {"qpos_by_side": {s: np.zeros(6) for s in ("left", "right")},
         "side": "right", "target_tool_tcp_world": np.eye(4), "speed_scale": .2,
+        "carried_object": carried, "carried_object_support": support,
         "require_grasp_approach": False}
     return adapter, kwargs, events
 
@@ -280,6 +290,8 @@ def test_debug_keeps_exact_inputs_masks_cloud_geometry_and_outcome(tmp_path, pro
     assert record["depth_unit"] == "meters" and record["rgb_order"] == "RGB"
     assert record["context"]["runtime_session_id"] == "session:test"
     assert record["request"]["side"] == "right"
+    assert record["request"]["carried_object"] == kwargs["carried_object"].to_dict()
+    assert record["request"]["carried_object_support"] == kwargs["carried_object_support"].to_dict()
     assert record["planner"]["start_obstacle_proxy_boxes"][0]["name"] == "arm_link3_proxy_0"
     assert (directory / "camera-config.json").read_bytes() == (tmp_path / "input-config.json").read_bytes()
     for role, view in record["views"].items():

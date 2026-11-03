@@ -17,6 +17,8 @@ from pathlib import Path
 import numpy as np
 
 from teleop_runtime.skill_deploy.rm65_grasp_trajectory import (
+    RM65CarriedObjectBox,
+    RM65CarriedObjectSupport,
     RM65GraspTrajectoryPlanningError,
 )
 
@@ -32,6 +34,8 @@ def validate_debug_directory(value: str | Path) -> Path:
 
 
 def _json_default(value):
+    if isinstance(value, (RM65CarriedObjectBox, RM65CarriedObjectSupport)):
+        return value.to_dict()
     if isinstance(value, Mapping):
         return dict(value)
     if isinstance(value, np.ndarray):
@@ -41,6 +45,12 @@ def _json_default(value):
     if isinstance(value, Path):
         return str(value)
     raise TypeError(f"Unsupported debug value: {type(value).__name__}")
+
+
+def encode_record_json(value) -> str:
+    """Project known planning values to JSON without changing planner inputs."""
+    return json.dumps(value, default=_json_default, allow_nan=False,
+                      ensure_ascii=False, indent=2)
 
 
 class SafeMotionDebugRecord:
@@ -105,8 +115,7 @@ class SafeMotionDebugRecord:
         self.payload["elapsed_sec"] = time.perf_counter() - self.started
         self.payload["recording_io_sec"] = self.io_sec
         with self._atomic_file("record.json") as stream:
-            stream.write(json.dumps(self.payload, default=_json_default, allow_nan=False,
-                                    ensure_ascii=False, indent=2).encode("utf-8"))
+            stream.write(encode_record_json(self.payload).encode("utf-8"))
 
     def phase(self, name, *, role=None):
         self.payload["stages"].append({"phase": name, "role": role,
