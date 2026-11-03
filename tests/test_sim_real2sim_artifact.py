@@ -25,7 +25,7 @@ ARM_BASELINE_PATH = Path(
 )
 ARM_RUNTIME_BINDING_PATH = Path(
     "sim/rm65/real2sim/artifacts/"
-    "rm65_arm_free_motion_20260721_v4_runtime_binding_20261103_real_failure_diagnostics_v1.json"
+    "rm65_arm_free_motion_20260721_v4_runtime_binding_20261103_mujoco_oracle_array_v1.json"
 )
 MUJOCO_G4_RELEASE_LEVELING_V1_BINDING_PATH = Path(
     "sim/rm65/real2sim/artifacts/"
@@ -463,12 +463,12 @@ def test_current_arm_runtime_binding_uses_exact_current_inputs() -> None:
     binding = Real2SimArtifactManifest.load(ARM_RUNTIME_BINDING_PATH)
     previous_path = Path(
         "sim/rm65/real2sim/artifacts/"
-        "rm65_arm_free_motion_20260721_v4_runtime_binding_20261103_g4_command_refusal_v1.json"
+        "rm65_arm_free_motion_20260721_v4_runtime_binding_20261103_real_failure_diagnostics_v1.json"
     )
     previous = Real2SimArtifactManifest.load(previous_path)
-    source = "1561fb70926933c5e363d9ddfe0a7432fd1a6003"
-    source_tree = "2a85da215486e1adb0cecb53d5ca28acc0eb7959"
-    tag, old_tag = "20261103-real-failure-diagnostics-v1", "20261103-g4-command-refusal-v1"
+    source = "12de49816b45fee70d8671b47092099789d71f79"
+    source_tree = "241427e48bb58ab3708413505e01a9f8e5953cb0"
+    tag, old_tag = "20261103-mujoco-oracle-array-v1", "20261103-real-failure-diagnostics-v1"
     current = {r.locator: r for r in binding.dependency_artifacts if "-runtime-" + tag in r.artifact_id}
     inherited = {r.locator: r for r in previous.dependency_artifacts if "-runtime-" + old_tag in r.artifact_id}
     assert len(current) == len(inherited) == 205 and set(current) == set(inherited)
@@ -479,7 +479,7 @@ def test_current_arm_runtime_binding_uses_exact_current_inputs() -> None:
         assert ref.artifact_id == inherited[path].artifact_id.replace(old_tag, tag)
         assert ref.artifact_kind == inherited[path].artifact_kind
     changed = {p for p in inherited if current[p].sha256 != inherited[p].sha256}
-    assert changed == {"agent_gateway/profiles/real/gripper_skill.py"}
+    assert changed == {'sim/mujoco/collision_safety/oracle.py'}
     assert tuple(binding.metadata["changed_previous_runtime_sources"]) == tuple(sorted(changed))
     assert tuple(binding.metadata["new_runtime_sources"]) == ()
     assert tuple(binding.metadata["changed_previous_offline_inputs"]) == ()
@@ -491,7 +491,7 @@ def test_current_arm_runtime_binding_uses_exact_current_inputs() -> None:
     for ref in previous.dependency_artifacts:
         if "-runtime-" + old_tag not in ref.artifact_id:
             assert refs[ref.artifact_id] == ref
-    parent = refs["rm65-arm-runtime-binding-g4-command-refusal-20261103-v1"]
+    parent = refs["rm65-arm-runtime-binding-real-failure-diagnostics-20261103-v1"]
     assert parent.locator == str(previous_path)
     assert parent.sha256 == binding.metadata["previous_runtime_binding_file_sha256"] == hashlib.sha256(previous_path.read_bytes()).hexdigest()
     assert binding.metadata["previous_runtime_binding_artifact_sha256"] == previous.artifact_sha256
@@ -500,15 +500,15 @@ def test_current_arm_runtime_binding_uses_exact_current_inputs() -> None:
     for artifact_id in binding.metadata["offline_query_input_artifact_ids"]:
         ref = refs[artifact_id]
         assert ref.sha256 == ArtifactRef.from_file(ref.locator, artifact_id="offline-check", artifact_kind=ref.artifact_kind).sha256
-    assert binding.metadata["migration"] == "real_failure_diagnostics_binding_v1"
-    assert binding.metadata["runtime_behavior_change_scope"] == "bounded_failure_logging_only"
+    assert binding.metadata["migration"] == "namespaced_mujoco_oracle_array_binding_v1"
+    assert binding.metadata["runtime_behavior_change_scope"] == "equivalent_collision_oracle_array_selection_and_layout_only"
     for key in ("runtime_behavior_change", "arm_profile_refit", "new_physical_hardware_validation",
                 "runtime_control_semantics_changed", "wire_schema_version_changed", "automatic_retry_authorization"):
         assert binding.metadata[key] is False
     evidence = next(e for e in binding.validation_evidence if "passed_cases" in e.metrics)
-    assert evidence.metrics["passed_cases"] == 210
+    assert evidence.metrics["passed_cases"] == 47
     assert evidence.metrics["failed_cases"] == evidence.metrics["error_cases"] == 0
-    assert len(binding.metadata["offline_validation_report_artifact_ids"]) == 2
+    assert len(binding.metadata["offline_validation_report_artifact_ids"]) == 5
     assert binding.fidelity_claims[0].status == "provisional"
     assert next(e for e in binding.validation_evidence if e.split == "held_out").status == "not_run"
 

@@ -92,6 +92,13 @@ core and MuJoCo adapter used for the 20260721 fit; tests compare those hashes to
 fixed historical values rather than silently reinterpreting the fit against
 the current files.
 
+MuJoCo collision oracle 的等价数组取值与布局优化使用后继绑定
+`artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261103_mujoco_oracle_array_v1.json`，固定源码 `12de49816b45fee70d8671b47092099789d71f79`。
+它继承真实失败诊断基线 `f014026056faf9611bcc8e28c805c90bae18edad`；205 项 runtime 中只有 oracle.py 哈希变化，200 项为 Python，前任全部266项非 runtime 引用及诊断/历史报告保持原归属。
+本组合既有 focused 检查 47 passed / 0 skipped；原生、真实 Agent 与独立审阅见本组合各自绑定报告。
+旧2297的47项检查与Agent成功只属历史，不替代本组合资格；471 baseline与b57各成本失败亦独立保留。
+本改动不含b57动态准入，保持原运算、pair顺序、距离协调、阈值、控制和诊断语义，不能说明动态撤手浅碰已修复；无refit、真机或新held-out资格。输入集合不是传递闭包，仍为`provisional`。
+
 当前轻量失败诊断使用后继绑定
 `artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261103_real_failure_diagnostics_v1.json`，
 固定源码 `1561fb70926933c5e363d9ddfe0a7432fd1a6003`。205 项已有输入中仅真实夹爪适配器的
