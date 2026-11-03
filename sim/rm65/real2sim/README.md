@@ -92,6 +92,13 @@ core and MuJoCo adapter used for the 20260721 fit; tests compare those hashes to
 fixed historical values rather than silently reinterpreting the fit against
 the current files.
 
+显式 6D 抓姿与持物姿态保护使用独立后继绑定
+`artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261104_free_angle_grasp_place_v1.json`，固定源码 `2f8daa47fffbc62ab0a52165103508e244d158ff`。
+本绑定继承 oracle-array 前任的全部 272 项非 runtime 引用；原 205 项 runtime 中 11 项改变，显式新增 3 项，共 208 项，其中 Python 源码 203 项。
+新增语义通过 object-motion@3、release-query@4 及显式 fast 抓姿接线启用；lift/carry 保护抓取建立时的物体倾角并允许竖向 yaw，release_approach 才允许受控调平。旧版本与默认选择保留；runtime_behavior_change 为 true，原生控制、wire schema、重试授权、refit 和真机验证标志仍为 false。
+本绑定既有检查记录 86 passed / 0 skipped；CLI、原生链、实际 Agent 与独立审阅的来源、结果和限制分别保存在绑定报告中，不能互相替代。历史报告仍归属于原固定源，不作为当前任意抓姿覆盖或抓放成功的证明。
+输入集合不是传递闭包；无新标定或 held-out 资格，仍为 `provisional`。
+
 MuJoCo collision oracle 的等价数组取值与布局优化使用后继绑定
 `artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261103_mujoco_oracle_array_v1.json`，固定源码 `12de49816b45fee70d8671b47092099789d71f79`。
 它继承真实失败诊断基线 `f014026056faf9611bcc8e28c805c90bae18edad`；205 项 runtime 中只有 oracle.py 哈希变化，200 项为 Python，前任全部266项非 runtime 引用及诊断/历史报告保持原归属。
