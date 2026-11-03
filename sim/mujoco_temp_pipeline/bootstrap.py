@@ -78,14 +78,20 @@ def validate_goal_delta_bootstrap_task(config: CubeLiftTaskConfig) -> None:
         and components == GOAL_DELTA_CONTACT_ACTION_COMPONENTS
         and config.post_contact_phase_enabled
         and not build_policy_action_transform(config).observation_conditioning_enabled
-        and config.resolved_policy_action_scale == (1.0,) * config.policy_action_dim
-        and config.resolved_policy_action_bias == (0.0,) * config.policy_action_dim
+        and (
+            config.resolved_policy_action_scale,
+            config.resolved_policy_action_bias,
+        ) in (
+            ((1.0, 1.0, 1.0, 1.0), (0.0, 0.0, 0.0, 0.0)),
+            ((1.0, 1.0, 1.0, 0.5), (0.0, 0.0, 0.0, 0.5)),
+        )
     )
     if not (valid_reach or valid_contact or valid_pick):
         raise ValueError(
             "Goal-delta actor bootstrap requires Reach xyz, Contact "
             "goal-delta xyz-plus-gripper precision, or the stationary direct "
-            "Pick xyz-plus-gripper profile; "
+            "Pick xyz-plus-gripper profile with identity xyz and either "
+            "identity or nonnegative gripper decoding; "
             f"got objective={config.task_objective!r}, components={components!r}."
         )
     metadata = build_learning_metadata(config)

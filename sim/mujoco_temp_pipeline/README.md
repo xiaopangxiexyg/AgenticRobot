@@ -351,6 +351,18 @@ the actor keeps the same observations and stationary action mapping. Zero XY
 requests do not guarantee zero actual TCP drift. Record the explicit lift step
 and assess collected teacher success and fitted actor success separately.
 
+Pick bootstrap also accepts an explicit stationary close-only gripper decoder:
+`policy_action_scale=[1,1,1,0.5]` and
+`policy_action_bias=[0,0,0,0.5]`. Its public gripper action is in `[0,1]`,
+so this profile cannot request opening; xyz stays identity. The teacher inverts
+that same mapping: public hold `0` is latent `-1`, and close `1` is latent `1`.
+This has a distinct task/transform identity and requires correctly relabeled
+training data and a matching checkpoint; it is not an old-checkpoint override.
+A finite tanh actor may leave a small positive hold residual. Existing close
+limits and collision projection still apply, and strict rollout evidence is
+required independently of training loss. The default identity decoder is
+unchanged; other Pick affine mappings remain unsupported by this bootstrap.
+
 ```bash
 python -m sim.mujoco_temp_pipeline.train \
   --task-config sim/configs/tasks/rm65_right_cube_reach_goal_delta_overhead_progress_xyz_v4.json \
