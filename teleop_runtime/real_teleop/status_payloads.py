@@ -23,34 +23,11 @@ from .runtime_health import _command_backend_status_text
 from .wrist_depth_freshness import (
     WRIST_DEPTH_CAMERA_KEYS,
     WristDepthFreshnessMonitor,
+    _json_safe_value,
+    _safe_float_value,
+    _safe_int_value,
 )
 
-
-def _json_safe_value(value: object) -> object:
-    if isinstance(value, np.ndarray):
-        return value.astype(float, copy=False).reshape(-1).round(4).tolist()
-    if isinstance(value, np.generic):
-        return value.item()
-    if isinstance(value, Mapping):
-        return {str(key): _json_safe_value(item) for key, item in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [_json_safe_value(item) for item in value]
-    return value
-
-def _safe_float_value(value: object) -> float | None:
-    try:
-        result = float(value)
-    except (TypeError, ValueError):
-        return None
-    if not np.isfinite(result):
-        return None
-    return result
-
-def _safe_int_value(value: object) -> int | None:
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return None
 
 def _compact_runtime_float(value: object, *, digits: int = 3) -> str:
     numeric = _safe_float_value(value)

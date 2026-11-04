@@ -10,6 +10,7 @@ from .core import (
     GeometryRef,
     GripperPair,
     URDFDocument,
+    URDFValidationError,
     Vec3,
     identity,
     invert_rigid,

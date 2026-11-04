@@ -10,7 +10,7 @@ from typing import Any, Mapping
 
 from dataset_contracts.canonical_encoding import canonical_content_hash
 
-from .control_admission import ControlCut
+from .control_admission import ControlAdmissionCoordinator, ControlCut
 from .identity import RuntimeFactIdentity
 from .immutable import deep_freeze
 from .contracts import ObservationChannel
@@ -283,7 +283,7 @@ class ReceiverObservationCutBuilder:
 
     def capture(
         self,
-        coordinator: "ControlAdmissionCoordinator",
+        coordinator: ControlAdmissionCoordinator,
         *,
         selected_source_samples: Mapping[str, ObservationSampleRef],
         payload_handles_by_stream: Mapping[str, Any],
@@ -292,10 +292,6 @@ class ReceiverObservationCutBuilder:
         context_dependencies: tuple[str, ...] = (),
     ) -> "ObservationBundle":
         """Freeze one receiver-local cut and its process-local payload handles."""
-
-        # Import locally to keep this module's public data contracts lightweight
-        # and avoid a runtime import cycle in type-checking environments.
-        from .control_admission import ControlAdmissionCoordinator
 
         if not isinstance(coordinator, ControlAdmissionCoordinator):
             raise TypeError("coordinator must be a ControlAdmissionCoordinator.")

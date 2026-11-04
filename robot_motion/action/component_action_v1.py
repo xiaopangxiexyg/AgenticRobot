@@ -290,7 +290,6 @@ def build_robot_action_v1_runtime_schema(
     active_effectors: list[str] = []
     metadata: dict[str, Any] = {}
     for component in component_catalog.components:
-        component_id = component.component_id
         side, kind = split_effector_name(component.effector_name)
         active_effectors.append(component.effector_name)
         if kind == "arm":

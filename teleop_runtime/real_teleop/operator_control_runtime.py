@@ -44,7 +44,6 @@ from .arm_runtime import _impedance_force_control_not_ready_sides
 from .components import RealTeleopComponents
 from .dataset_layout import (
     collection_task_ui_state as _collection_task_ui_state,
-    default_task_id_from_name as _default_task_id_from_name,
     expand_cli_path as _expand_cli_path,
     task_definition_for_key as _task_definition_for_key,
 )
@@ -2693,7 +2692,6 @@ class RealTeleopControlInput:
                 self._publish_init_arm_state(message=message, control_hint=message)
                 return True
 
-            side = str(getattr(controller, "selected_side", "left") or "left")
             fix_controller = getattr(self.components, "fix_arm_controller", None)
             any_side_fixed = bool(
                 fix_controller is not None

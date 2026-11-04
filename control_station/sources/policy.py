@@ -5,15 +5,13 @@ from __future__ import annotations
 import math
 import threading
 from dataclasses import dataclass, field
-from types import MappingProxyType
-from typing import Mapping, Protocol
+from typing import Protocol
 
 from dataset_contracts.canonical_encoding import canonical_content_hash
 from control_composition.composition import (
     CompositionInputDraft,
     TemporallySampledCompositionInput,
     build_composition_input_draft,
-    build_robot_action_v1_composition_input_draft,
     build_temporally_sampled_composition_input,
 )
 from control_composition.temporal_sampling import GuaranteedNextComponentAction

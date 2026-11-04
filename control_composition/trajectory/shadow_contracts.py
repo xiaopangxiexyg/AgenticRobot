@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass, field
 from typing import Any, Mapping
 
@@ -13,6 +12,7 @@ from robot_motion.runtime.immutable import deep_freeze
 from ..composition import CompositionInputAdmissionReceipt
 from ..events import CompositionDomainEvent
 from ..runtime import CompositeProposalSubmission
+from ._validation import _finite, _nonnegative_int, _required
 from .contracts import (
     TRAJECTORY_EDITING_MODE_PASS_THROUGH,
     TRAJECTORY_EDITING_MODE_RESIDUAL_ACTIVE,
@@ -30,26 +30,6 @@ TRAJECTORY_COMPOSITION_SHADOW_EVENT_KIND = (
 TRAJECTORY_SHADOW_EXECUTABLE_PREVIEW_UNAVAILABLE = (
     "unavailable_non_authoritative_shadow"
 )
-
-
-def _required(value: object, *, name: str) -> str:
-    normalized = str(value).strip()
-    if not normalized:
-        raise ValueError(f"{name} must be non-empty.")
-    return normalized
-
-
-def _finite(value: object, *, name: str) -> float:
-    result = float(value)
-    if not math.isfinite(result):
-        raise ValueError(f"{name} must be finite.")
-    return result
-
-
-def _nonnegative_int(value: object, *, name: str) -> int:
-    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-        raise ValueError(f"{name} must be a non-negative integer.")
-    return int(value)
 
 
 def _optional(value: object | None, *, name: str) -> str | None:

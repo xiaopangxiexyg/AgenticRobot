@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import math
 from dataclasses import replace
 
 from robot_motion.action import ComponentActionTrajectory
@@ -11,6 +10,7 @@ from robot_motion.runtime.control_admission import ControlCut
 from ..activation import CompositionActivationScope
 from ..residual_anchor import ResidualAnchorReceipt, ResidualAnchorRequest
 
+from ._validation import _finite, _nonnegative_int, _required
 from .contracts import (
     TRAJECTORY_EDITING_MODE_PASS_THROUGH,
     TRAJECTORY_EDITING_MODE_RESIDUAL_ACTIVE,
@@ -34,26 +34,6 @@ from .anchor_lifecycle import (
     ResidualRebaseRequest,
     build_successor_active_residual_anchor_binding,
 )
-
-
-def _required(value: object, *, name: str) -> str:
-    normalized = str(value).strip()
-    if not normalized:
-        raise ValueError(f"{name} must be non-empty.")
-    return normalized
-
-
-def _finite(value: object, *, name: str) -> float:
-    result = float(value)
-    if not math.isfinite(result):
-        raise ValueError(f"{name} must be finite.")
-    return result
-
-
-def _nonnegative_int(value: object, *, name: str) -> int:
-    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-        raise ValueError(f"{name} must be a non-negative integer.")
-    return int(value)
 
 
 def empty_trajectory_editing_state(*, reducer_id: str) -> TrajectoryEditingState:

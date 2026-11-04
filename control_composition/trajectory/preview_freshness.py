@@ -8,11 +8,11 @@ age from ``ComponentActionTrajectory.created_at``.
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass, field
 
 from dataset_contracts.canonical_encoding import canonical_content_hash
 
+from ._validation import _finite, _required
 from .preview import TrajectoryIntentPreviewSnapshot
 
 
@@ -39,20 +39,6 @@ TRAJECTORY_PREVIEW_FRESHNESS_EVIDENCE_HASH_DOMAIN_DEVELOPMENT = (
 TRAJECTORY_PREVIEW_FRESHNESS_ASSESSMENT_HASH_DOMAIN_DEVELOPMENT = (
     "dexteleop.trajectory_preview_freshness_assessment.development"
 )
-
-
-def _required(value: object, *, name: str) -> str:
-    normalized = str(value).strip()
-    if not normalized:
-        raise ValueError(f"{name} must be non-empty.")
-    return normalized
-
-
-def _finite(value: object, *, name: str) -> float:
-    result = float(value)
-    if not math.isfinite(result):
-        raise ValueError(f"{name} must be finite.")
-    return result
 
 
 @dataclass(frozen=True)

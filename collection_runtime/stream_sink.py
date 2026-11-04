@@ -37,6 +37,8 @@ from dataset_contracts.stream_catalog import (
 )
 from robot_motion.runtime.observation_cut import ObservationSampleRef
 
+from .immutable_canonical_store import fsync_directory as _fsync_directory
+
 
 @dataclass(frozen=True)
 class NativeStreamAppendReceipt:
@@ -77,17 +79,6 @@ def _write_all(fd: int, payload: bytes) -> None:
         if count <= 0:
             raise OSError("Native stream write made no progress.")
         offset += count
-
-
-def _fsync_directory(path: Path) -> None:
-    flags = os.O_RDONLY
-    if hasattr(os, "O_DIRECTORY"):
-        flags |= os.O_DIRECTORY
-    fd = os.open(path, flags)
-    try:
-        os.fsync(fd)
-    finally:
-        os.close(fd)
 
 
 def _file_sha256(path: Path) -> str:

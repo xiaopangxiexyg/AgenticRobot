@@ -9,7 +9,7 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, Iterable, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 import numpy as np
 
@@ -1009,7 +1009,6 @@ def _merge_stream_results_into_manifests(
         previous_manifest = read_json(manifest_path) if manifest_path.is_file() else {}
         previous_stream_paths = _manifest_stream_paths(config.output_root, previous_manifest)
         side = manifest_tasks[0].side
-        episode_index = manifest_tasks[0].episode_index
         relative_dir = str(manifest_path.parent.resolve().relative_to(config.output_root))
         streams: dict[str, dict[str, Any]] = {}
         frame_count = 0

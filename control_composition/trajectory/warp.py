@@ -11,6 +11,7 @@ from scipy.spatial.transform import Rotation
 from dataset_contracts.canonical_encoding import canonical_content_hash
 from robot_motion.action import ComponentAction
 
+from ._validation import _finite, _required
 from .contracts import (
     TRAJECTORY_EDITING_MODE_RESIDUAL_ACTIVE,
     TRAJECTORY_TARGET_STATUS_READY,
@@ -26,20 +27,6 @@ RESIDUAL_TEMPORAL_WARP_SPEC_HASH_DOMAIN_DEVELOPMENT = (
 TRAJECTORY_RESIDUAL_TEMPORAL_SAMPLE_HASH_DOMAIN_DEVELOPMENT = (
     "dexteleop.trajectory_residual_temporal_sample.development"
 )
-
-
-def _required(value: object, *, name: str) -> str:
-    normalized = str(value).strip()
-    if not normalized:
-        raise ValueError(f"{name} must be non-empty.")
-    return normalized
-
-
-def _finite(value: object, *, name: str) -> float:
-    result = float(value)
-    if not math.isfinite(result):
-        raise ValueError(f"{name} must be finite.")
-    return result
 
 
 @dataclass(frozen=True)

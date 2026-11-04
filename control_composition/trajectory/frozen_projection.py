@@ -7,7 +7,6 @@ admitted to, no cursor advances, and no target watermark closes.
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Mapping
@@ -38,6 +37,7 @@ from control_composition.residual_anchor_lifecycle import (
 from control_composition.runtime import ControlCompositionRuntime
 from control_composition.temporal import CompositionTemporalSelectionSpec
 
+from ._validation import _finite, _required
 from .contracts import (
     TrajectoryEditingState,
 )
@@ -54,20 +54,6 @@ FROZEN_TRAJECTORY_RESIDUAL_INPUT_HASH_DOMAIN_DEVELOPMENT = (
 FROZEN_TRAJECTORY_COMPOSITION_PROJECTION_HASH_DOMAIN_DEVELOPMENT = (
     "dexteleop.frozen_trajectory_composition_projection.development"
 )
-
-
-def _required(value: object, *, name: str) -> str:
-    normalized = str(value).strip()
-    if not normalized:
-        raise ValueError(f"{name} must be non-empty.")
-    return normalized
-
-
-def _finite(value: object, *, name: str) -> float:
-    result = float(value)
-    if not math.isfinite(result):
-        raise ValueError(f"{name} must be finite.")
-    return result
 
 
 def _lineage(

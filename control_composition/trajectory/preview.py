@@ -9,7 +9,6 @@ model architecture, or device backend.
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass, field
 
 from dataset_contracts.canonical_encoding import canonical_content_hash
@@ -17,6 +16,8 @@ from robot_motion.action.trajectory import (
     ComponentActionTrajectory,
     ComponentActionTrajectoryKeyframe,
 )
+
+from ._validation import _finite, _required
 
 
 TRAJECTORY_INTENT_PREVIEW_CLASS_PRODUCER_LOCKED = "producer_locked_intent"
@@ -36,20 +37,6 @@ TRAJECTORY_INTENT_PREVIEW_SNAPSHOT_HASH_DOMAIN_DEVELOPMENT = (
 TRAJECTORY_INTENT_PREVIEW_EXECUTION_EVIDENCE_STATUS = (
     "external_downstream_observation_only"
 )
-
-
-def _required(value: object, *, name: str) -> str:
-    normalized = str(value).strip()
-    if not normalized:
-        raise ValueError(f"{name} must be non-empty.")
-    return normalized
-
-
-def _finite(value: object, *, name: str) -> float:
-    result = float(value)
-    if not math.isfinite(result):
-        raise ValueError(f"{name} must be finite.")
-    return result
 
 
 def _preview_class_for(

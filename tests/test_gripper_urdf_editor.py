@@ -7,6 +7,7 @@ import pytest
 
 from utils.gripper_urdf_editor.core import URDFDocument, URDFValidationError, get_origin
 from utils.gripper_urdf_editor.mesh import MeshCache
+from utils.gripper_urdf_editor.viewer import build_gripper_scene
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -151,3 +152,27 @@ def test_export_refuses_input_path_and_existing_target(tmp_path: Path) -> None:
     with pytest.raises(URDFValidationError, match="already exists"):
         document.export(target)
     assert target.read_text(encoding="utf-8") == "keep"
+
+
+def test_scene_reports_unreadable_geometry_as_warning() -> None:
+    document, pair, endpoint_a, endpoint_b = _selection(PROXY)
+
+    class UnreadableMeshCache(MeshCache):
+        def geometry_triangles(self, document, ref):
+            raise URDFValidationError("Preview supports STL/OBJ meshes, not .dae")
+
+    shapes, _markers, warnings = build_gripper_scene(
+        document,
+        pair,
+        endpoint_a,
+        endpoint_b,
+        0.0,
+        UnreadableMeshCache(),
+        show_visuals=True,
+        show_collisions=True,
+        show_contact_frames=False,
+    )
+
+    assert shapes == []
+    assert warnings
+    assert all("Preview supports STL/OBJ meshes" in warning for warning in warnings)

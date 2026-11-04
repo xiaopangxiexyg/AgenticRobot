@@ -7,7 +7,6 @@ or advance the trajectory emission barrier.
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Mapping, Protocol, runtime_checkable
@@ -23,6 +22,7 @@ from ..composition import (
     CompositionSpec,
 )
 from ..composition.input_adapter import build_composition_input_draft
+from ._validation import _finite, _required
 from .contracts import (
     TRAJECTORY_EDITING_MODE_PASS_THROUGH,
     TRAJECTORY_EDITING_MODE_RESIDUAL_ACTIVE,
@@ -64,20 +64,6 @@ class TrajectoryCompositionInputReceiver(Protocol):
         *,
         activation_scope: CompositionActivationScope | None = None,
     ) -> CompositionInputAdmissionReceipt: ...
-
-
-def _required(value: object, *, name: str) -> str:
-    normalized = str(value).strip()
-    if not normalized:
-        raise ValueError(f"{name} must be non-empty.")
-    return normalized
-
-
-def _finite(value: object, *, name: str) -> float:
-    result = float(value)
-    if not math.isfinite(result):
-        raise ValueError(f"{name} must be finite.")
-    return result
 
 
 def _lineage(

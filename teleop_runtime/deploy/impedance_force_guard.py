@@ -221,11 +221,11 @@ class ImpedanceForceGuardMonitor:
         *,
         start: bool = True,
     ) -> dict[str, object]:
+        """Start a new guard generation after explicit backend re-arm."""
+
         with self._worker_lifecycle_lock:
             if self._worker_closed:
                 raise RuntimeError("worker owner is closed")
-            """Start a new guard generation after explicit backend re-arm."""
-
             with self._lock:
                 fault = self._fault
                 stop_error = self._emergency_stop_error
@@ -238,7 +238,6 @@ class ImpedanceForceGuardMonitor:
                     + stop_error
                 )
             self._stop_event.set()
-            old_threads = tuple(self._threads)
             self._drain_workers()
             with self._lock:
                 self._threads = []
