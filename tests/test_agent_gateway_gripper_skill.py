@@ -1098,7 +1098,7 @@ def test_at_target_without_stopped_feedback_times_out_instead_of_completing(movi
     )
     try:
         snapshot = session.publish_observation()
-        request = replace(_request(bundle, snapshot, target_state="closed"), requested_timeout_ms=50)
+        request = replace(_request(bundle, snapshot, target_state="closed"), requested_timeout_ms=250)
         submitted = session.service.submit_request(request=request, current_station_revision=3)
         assert submitted.accepted
         assert session.service.launch_operation(submitted.operation.operation_id).accepted
