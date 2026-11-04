@@ -102,6 +102,9 @@ confirmation coverage is explicitly retired.
 `run_merge_acceptance.sh` is a thin `--core` call into the existing complete
 runner. Four module-isolated batches use two workers; registered heavy native
 owners alternate with contract batches and do not run on both workers at once.
+On the guarded local merge host, an explicit eight-batch, four-worker setting
+runs at most two native batches at once; `tests/README.md` records its memory
+envelope and measurement.
 Small handwritten models can still run in the contract batch.
 Shorter processes bound native retention without changing GC. Short TMPDIR,
 private caches, native heap release,
@@ -128,4 +131,6 @@ the unchanged memory/pressure envelope. Report complete invocation time,
 native peak and pressure/OOM/swap counters, selected case outcomes and any
 environment skips separately. Multiple clean-process observations distinguish
 one fast sample from repeatable feedback. New mainline inputs require their
-own combined checks; an old-base result never authorizes promotion.
+own combined checks; an old-base result never authorizes promotion. The later
+local four-process layout has its own guarded envelope and measurements in
+`tests/README.md`; it does not change this remote envelope.

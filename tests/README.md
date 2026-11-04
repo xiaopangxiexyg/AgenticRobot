@@ -38,8 +38,15 @@ bash scripts/run_pytest.sh -q -m "contract and not optional and not hardware and
 bash scripts/run_pytest.sh -q -m "integration and not optional and not hardware and not slow_sim"
 # Parallel bounded edit feedback (unit + integration, isolated caches/reports):
 bash scripts/run_fast_feedback.sh
-# Routine final merge acceptance (core, target 5–8 minutes):
+# Routine final merge acceptance (core; default four batches, two processes):
 bash scripts/run_merge_acceptance.sh --durations=30
+# The same core on the validated local merge host: four processes under its memory
+# guard, printing the scope's memory.peak and memory.events before the scope exits
+systemd-run --user --scope -p MemoryHigh=12G -p MemoryMax=16G -p MemorySwapMax=0 \
+  env DEXTELEOP_FULL_ACCEPTANCE_SHARDS=8 DEXTELEOP_FULL_ACCEPTANCE_MAX_JOBS=4 \
+  bash -c 'bash scripts/run_merge_acceptance.sh --durations=30; status=$?
+    cg="/sys/fs/cgroup$(cut -d: -f3 /proc/self/cgroup)"
+    echo "memory.peak $(cat "$cg/memory.peak")"; cat "$cg/memory.events"; exit "$status"'
 # Explicit diagnosis of the remaining complete suite (not a routine merge gate):
 bash scripts/run_full_acceptance.sh --durations=50
 # On the validated six-shard integration host, use the same setting as Harness:
@@ -90,12 +97,44 @@ tests; transferring all the old matrices into mandatory development work does
 not satisfy it.
 
 The core mode reuses the complete runner's process cleanup, short TMPDIR,
-isolated caches, native-memory release and atomic evidence publication. It
-defaults to four module-isolated batches and permits at most two live pytest
-processes. Registered heavy native owners occupy alternating batches, so those
-batches never overlap; small handwritten models may still run in the contract
-batch. Shorter processes bound retained native state. A
-process/concurrency limit is not a RAM limit: use the host's existing memory,
+isolated caches, native-memory release and atomic evidence publication. By
+default it runs four module-isolated batches with two live pytest processes.
+Registered heavy native owners occupy the even batches, and batch N starts only
+after batch N−MAX_JOBS has finished, so with the default no two native batches
+overlap; small handwritten models may still run in the contract batches.
+Shorter processes bound retained native state.
+
+The runner accepts at most four live core processes, which still holds at most
+two native batches at a time, and above two processes it requires at least
+eight batches. Only the local merge host (`zc-MS-7E24`, Ryzen 9 7950X, 32
+logical CPUs, 61 GiB RAM) uses this, through the guarded eight-batch,
+four-process command above, and only while the host has at least 16 GiB
+available (`free -g`); the runner itself does not detect the guard. On
+2026-11-04 the official entrypoint ran core for `d9d13401e` in 208.6 seconds
+with the eight-batch layout (scope peak 6.8 GiB) and in 392.0 seconds with the
+default layout (4.5 GiB), each with the same 7,036 records, 0 failures, the 1
+existing skip and no memory.high events. Host load averages were 8–13,
+counting other agents' runs. An earlier commit with the same eight-batch path
+took 223.3 seconds (7.0 GiB). The eight-batch layout spent 6–13% more summed
+batch time in these runs, so a host with fewer idle cores gains less.
+
+Each 23-module native process of the default layout keeps about 2 GiB of
+native memory by the end of its batch and peaks at 3.7–4.2 GiB; the
+eight-batch native processes kept 1.5–2.0 GiB and peaked at 2.5–4.1 GiB. Under
+the 6 GiB high / 8 GiB max / no-swap envelope of the 2026-11-01 remote core
+runs, the eight-batch, four-process layout was throttled continuously until it
+was stopped. Other hosts, including the 192.168.70.116 field PC, keep the
+default; another host needs its own guarded measurement and explicit approval
+first. A measurement is the guarded command's result plus the `memory.peak` and
+`memory.events` lines it prints; they must be read inside the scope because
+the scope's counters disappear when it exits. If a guarded run reports
+memory.high or oom_kill events, hits pytest timeouts or takes clearly longer
+than five minutes, rerun the default layout, report both results and
+re-measure before using the four-process layout again; also re-measure after
+`CORE_NATIVE_MODULES` changes. `systemd-run` prints the scope name; after an
+interrupted run, stop that scope with `systemctl --user stop` so that no
+worker survives.
+A process/concurrency limit is not a RAM limit: use the host's existing memory,
 swap and pressure safeguards. Duration is measured from entry through cleanup
 and formal report publication; the target never authorizes skipping work at
 timeout. A dirty source or a changed commit cannot publish passing core evidence.
