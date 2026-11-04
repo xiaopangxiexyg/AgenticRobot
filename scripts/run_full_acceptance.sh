@@ -182,7 +182,11 @@ configure_shards() {
     *) die "DEXTELEOP_FULL_ACCEPTANCE_MAX_JOBS must be an integer from 1 to 6: $MAX_JOBS" ;;
   esac
   if [[ "$ACCEPTANCE_PROFILE" == core ]]; then
-    ((MAX_JOBS <= 2)) || die "core acceptance uses at most two live pytest processes"
+    # Native owners occupy even batches, and batch N starts only after batch
+    # N-MAX_JOBS finishes, so four live processes hold at most two native
+    # batches. Above the two-job default those batches overlap; select it only
+    # under the larger memory guard documented in tests/README.md.
+    ((MAX_JOBS <= 4)) || die "core acceptance uses at most four live pytest processes"
   fi
   ((MAX_JOBS <= SHARD_COUNT)) || die \
     "DEXTELEOP_FULL_ACCEPTANCE_MAX_JOBS must not exceed SHARD_COUNT ($SHARD_COUNT): $MAX_JOBS"
