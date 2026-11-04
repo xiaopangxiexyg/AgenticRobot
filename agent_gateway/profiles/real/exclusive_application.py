@@ -236,6 +236,8 @@ class ExclusiveRealSkillApplication:
         deadline = time.monotonic()
         while not self._control_stop.is_set():
             try:
+                self.deployment.gateway_session.reconcile_gripper_connections(
+                    self.deployment.control_runtime.fail_closed)
                 self.deployment.control_runtime.step()
             except BaseException as exc:  # noqa: BLE001 - fail closed then stop.
                 reason = (

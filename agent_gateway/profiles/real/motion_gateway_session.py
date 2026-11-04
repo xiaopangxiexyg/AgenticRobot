@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import math
 import threading
 import time
@@ -772,6 +773,37 @@ class RealAgentPrimitiveGatewaySession:
     _artifact_store_closed: bool = field(default=False, init=False)
     _grasp_approach_plan_store_closed: bool = field(default=False, init=False)
     _closed_executor_ids: set[int] = field(default_factory=set, init=False)
+    _gripper_connections: dict[str, tuple[int, bool]] | None = field(default=None, init=False)
+
+    def reconcile_gripper_connections(self, stop_arm: Callable[[str], object]) -> None:
+        """Stop old control on loss; establish HOLD on a recovered serial owner."""
+        current = {key: port.connection_token for key, port in self.gripper_ports.items()}
+        previous, self._gripper_connections = self._gripper_connections, current
+        if previous is None or current == previous:
+            return
+        operation = self.service.operation_store.active_operation()
+        request = (None if operation is None else
+                   self.service.operation_store.request_for_operation(operation.operation_id))
+        active_control = request is not None and self.service.manifest.route(
+            request.skill_id, request.skill_version, request.route_id,
+            request.route_version).route.control_effect_class != "read_only"
+        recovered = any(token[1] and previous.get(key) != token for key, token in current.items())
+        if not active_control and not recovered:
+            return
+        # Apply arm HOLD on its control thread before cancellation waits for
+        # it. Stop hands explicitly: a used motion executor may prove only arm HOLD.
+        _, hand_hold = stop_arm_and_grippers(
+            arm_stop=lambda: stop_arm("gripper_connection_changed"),
+            ports=self.gripper_ports, reason="gripper_connection_changed")
+        outcome = (self.service.cancel_operation(
+            operation_id=operation.operation_id, reason="gripper_connection_changed",
+            current_station_revision=self.observation_producer.current_station_revision,
+        ) if active_control else None)
+        logging.getLogger(__name__).warning(
+            "Gripper connection changed: operation_id=%s before=%s after=%s "
+            "gripper_hold=%s cancellation=%s",
+            None if operation is None else operation.operation_id, previous, current,
+            hand_hold.succeeded, None if outcome is None else outcome.reason_code)
 
     def __post_init__(self) -> None:
         if (self.contract_bundle.tcp_pose_comparison_registration is not None) != (self.tcp_pose_comparison_executor is not None):

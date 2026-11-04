@@ -853,6 +853,13 @@ class DMTacGripperBackend(EffectorBackend):
         self._last_connection_opened_monotonic = time.monotonic()
         self._last_connection_open_thread = threading.current_thread().name
 
+    @property
+    def gripper_connection_token(self) -> tuple[int, bool]:
+        """Observe the serial lifetime without device I/O or waiting on recovery."""
+        device = self.device
+        return (self._connection_generation,
+                device is not None and getattr(device, "gripper", None) is not None)
+
     def _mark_gripper_connection_closed_locked(self) -> None:
         self._last_connection_closed_at = time.time()
         self._last_connection_closed_monotonic = time.monotonic()
@@ -1231,6 +1238,8 @@ class DMTacGripperBackend(EffectorBackend):
         quarantine: bool = True,
     ) -> bool:
         error_text = f"{prefix}: {exc}"
+        if self._closing and not force:
+            return False
         if not force and self._runtime_fault_auto_recovery_blocked_locked():
             incident_id = self._runtime_fault_active_incident_id
             suppressed = (
@@ -2024,7 +2033,9 @@ class DMTacGripperBackend(EffectorBackend):
             self._last_command = command.copy()
         return sent
 
-    def send_fixed_joint_pos(self, joint_pos: object) -> bool:
+    def send_fixed_joint_pos(self, joint_pos: object, *,
+                             continuous_grasp_override: bool | None = None,
+                             expected_connection_generation: int | None = None) -> bool:
         if self.config.observation_only:
             raise RuntimeError(
                 f"{self.name} is observation-only; refusing fixed gripper command dispatch."
@@ -2041,8 +2052,9 @@ class DMTacGripperBackend(EffectorBackend):
             joint_pos,
             bypass_send_commands=True,
             force=True,
-            continuous_grasp_override=None,
+            continuous_grasp_override=continuous_grasp_override,
             preserve_existing_grip=False,
+            expected_connection_generation=expected_connection_generation,
         )
 
     def hold_gripper_motion(self, reason: str = "manual gripper hold") -> bool:
@@ -2164,11 +2176,13 @@ class DMTacGripperBackend(EffectorBackend):
                     if was_closing and not recovered:
                         self._closing = True
 
-    def read_gripper_state_now(self) -> dict[str, object] | None:
+    def read_gripper_state_now(self, *, allow_reconnect: bool = True) -> dict[str, object] | None:
         if not self.config.connect_hardware:
             return None
         with self._lock:
             if self.device is None or getattr(self.device, "gripper", None) is None:
+                if not allow_reconnect:
+                    return None
                 recovered = self._handle_gripper_io_error_locked(
                     "read_now_no_connection",
                     RuntimeError("device is not connected"),
@@ -2179,6 +2193,9 @@ class DMTacGripperBackend(EffectorBackend):
             try:
                 gripper_state = self.device.read_gripper_state()
             except Exception as exc:  # noqa: BLE001
+                if not allow_reconnect:
+                    self._quarantine_gripper_io_error_locked("read_now_failed", exc)
+                    raise
                 recovered = self._handle_gripper_io_error_locked("read_now_failed", exc)
                 if not recovered:
                     raise
@@ -2273,6 +2290,7 @@ class DMTacGripperBackend(EffectorBackend):
         force: bool,
         continuous_grasp_override: bool | None,
         preserve_existing_grip: bool,
+        expected_connection_generation: int | None = None,
     ) -> bool:
         attempt_started_perf = time.perf_counter()
         attempt_started_wall = time.time()
@@ -2430,6 +2448,9 @@ class DMTacGripperBackend(EffectorBackend):
             if not acquired_lock:
                 return finish("io_busy", sent=False, skip_reason="io_busy")
             try:
+                if (expected_connection_generation is not None
+                        and expected_connection_generation != self._connection_generation):
+                    return finish("connection_changed", sent=False, skip_reason="connection_generation")
                 if self.device is None or getattr(self.device, "gripper", None) is None:
                     return finish("not_connected", sent=False, skip_reason="not_connected")
                 try:

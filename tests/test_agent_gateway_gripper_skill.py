@@ -347,8 +347,10 @@ class _FakeDmtacBackend:
         self.commands: list[float] = []
         self.holds: list[str] = []
         self.samples = [(0.0, True), (0.98, False)]
+        self._last_sample = (0.98, False)
         self.held = False
         self.events = []
+        self.gripper_connection_token = (1, True)
 
     def start(self):
         self.events.append("hand_start")
@@ -362,16 +364,18 @@ class _FakeDmtacBackend:
     def readiness_report(self):
         return {"ready": True, "reason": ""}
 
-    def send_fixed_joint_pos(self, value):
+    def send_fixed_joint_pos(self, value, **_kwargs):
         self.held = False
         self.commands.append(float(value))
         return True
 
-    def read_gripper_state_now(self):
+    def read_gripper_state_now(self, **kwargs):
         return {"timestamp": time.time()}
 
     def get_state(self, **_kwargs):
-        close, moving = self.samples.pop(0) if self.samples else (0.98, False)
+        if self.samples:
+            self._last_sample = self.samples.pop(0)
+        close, moving = self._last_sample
         if self.held:
             moving = False
         return {
@@ -514,7 +518,7 @@ def test_startup_fault16_reconnect_is_scoped_once_and_requires_fresh_stopped_sta
             self.ready = recovered
             return recovered
 
-        def read_gripper_state_now(self):
+        def read_gripper_state_now(self, **kwargs):
             if self.config.side == failed_side and post_state == "stale":
                 return {"timestamp": time.time() - 10.0}
             return super().read_gripper_state_now()
@@ -674,7 +678,7 @@ def test_real_backend_startup_fault16_reconnect_without_fault_clear_or_position_
 )
 def test_real_gripper_never_reuses_cached_state_after_invalid_fresh_read(reading):
     backend = _FakeDmtacBackend()
-    backend.read_gripper_state_now = lambda: reading
+    backend.read_gripper_state_now = lambda **kwargs: reading
     port = RealDmtacGripperControlPort(backend=backend)
     with pytest.raises(RuntimeError):
         port.observe_state()
@@ -727,7 +731,16 @@ def test_real_gripper_command_or_failed_read_clears_previous_stop_proof():
     port.command_close(1.0)
     assert port.last_hold_receipt is None
     assert port.hold(reason="second stop").succeeded
-    backend.read_gripper_state_now = lambda: None
+    old_ref = port.last_command_attempt_ref
+    backend.gripper_connection_token = (2, True)
+    assert port.last_command_target_close is None
+    assert port.last_command_attempt_ref != old_ref
+    assert port.last_hold_receipt is None
+    with pytest.raises(RuntimeError, match="connection changed"):
+        port.poll_state()
+    assert port.readiness().ready
+    assert port.command_close(1.0).accepted
+    backend.read_gripper_state_now = lambda **kwargs: None
     with pytest.raises(RuntimeError, match="unavailable"):
         port.hold(reason="unproved stop")
     assert port.last_hold_receipt is None
@@ -736,7 +749,7 @@ def test_real_gripper_command_or_failed_read_clears_previous_stop_proof():
 def test_real_gripper_fresh_timestamp_does_not_hide_an_over_budget_read():
     backend = _FakeDmtacBackend()
 
-    def slow_read():
+    def slow_read(**kwargs):
         time.sleep(0.21)
         return {"timestamp": time.time()}
 
@@ -948,7 +961,7 @@ def test_real_gripper_hold_does_not_wait_through_unknown_state_or_hardware_fault
 def test_real_gripper_hold_without_stop_ack_does_not_claim_or_query_stopped_state(caplog):
     backend = _FakeDmtacBackend()
     backend.hold_gripper_motion = lambda reason: False
-    backend.read_gripper_state_now = lambda: pytest.fail("No stop ACK")
+    backend.read_gripper_state_now = lambda **kwargs: pytest.fail("No stop ACK")
     port = RealDmtacGripperControlPort(backend=backend)
     assert not port.hold(reason="no ack").succeeded
     assert "stop_ack=False" in caplog.text
@@ -979,8 +992,8 @@ def test_real_skill_waits_for_busy_native_backend_without_changing_stream_policy
     entered = threading.Event()
     native_send = backend.send_fixed_joint_pos
 
-    def send(value):
-        sent = native_send(value)
+    def send(value, **kwargs):
+        sent = native_send(value, **kwargs)
         entered.set()
         return sent
 
@@ -1014,7 +1027,7 @@ def test_real_skill_preserves_send_failure_before_hold_overwrites_it(status, cap
         "gripper_is_moving": False,
     }
     backend.get_state = lambda **kwargs: dict(diagnostic)
-    backend.send_fixed_joint_pos = lambda value: sends.append(value) or False
+    backend.send_fixed_joint_pos = lambda value, **kwargs: sends.append(value) or False
 
     def hold(reason):
         diagnostic["gripper_last_send_status"] = "gripper_hold"
@@ -1035,10 +1048,11 @@ def test_real_skill_preserves_send_failure_before_hold_overwrites_it(status, cap
 
 
 
-def test_cancelled_real_command_never_calls_backend():
+@pytest.mark.parametrize("target", [0.0, 1.0])
+def test_cancelled_real_command_never_calls_backend(target):
     backend = _FakeDmtacBackend()
     port = RealDmtacGripperControlPort(backend=backend)
-    assert not port.command_close(1.0, cancel_requested=lambda: True).accepted
+    assert not port.command_close(target, cancel_requested=lambda: True).accepted
     assert backend.commands == []
 
 
@@ -1047,7 +1061,7 @@ def test_diagnostic_read_failure_does_not_retry_or_prevent_hold(caplog):
     backend = _FakeDmtacBackend()
     attempts = []
     original_get_state = backend.get_state
-    backend.send_fixed_joint_pos = lambda target: attempts.append(target) or False
+    backend.send_fixed_joint_pos = lambda target, **kwargs: attempts.append(target) or False
     backend.get_state = lambda **kwargs: (_ for _ in ()).throw(RuntimeError("diagnostic unavailable"))
     port = RealDmtacGripperControlPort(backend=backend)
     assert not port.command_close(1.0).accepted
@@ -1147,7 +1161,7 @@ def controlled_real_gripper(monkeypatch):
     monkeypatch.setattr(owner, "time", SimpleNamespace(
         monotonic=clock, time=clock.wall, sleep=clock.sleep))
     backend = _FakeDmtacBackend()
-    backend.read_gripper_state_now = lambda: {"timestamp": clock.wall()}
+    backend.read_gripper_state_now = lambda **kwargs: {"timestamp": clock.wall()}
     port = RealDmtacGripperControlPort(
         backend=backend, clock=clock,
         command_submission_timeout_sec=0.02, hold_confirmation_timeout_sec=0.05)
@@ -1157,7 +1171,7 @@ def controlled_real_gripper(monkeypatch):
 def test_real_hold_cannot_confirm_an_earlier_measurement(controlled_real_gripper):
     backend, port, clock = controlled_real_gripper
     backend.samples = [(0.98, False)]
-    backend.read_gripper_state_now = lambda: {"timestamp": clock.wall() - 0.01}
+    backend.read_gripper_state_now = lambda **kwargs: {"timestamp": clock.wall() - 0.01}
     assert not port.hold(reason="stop needs newer feedback").succeeded
     assert len(backend.holds) == 1 and backend.commands == []
 
@@ -1175,7 +1189,7 @@ def test_real_hold_rejects_late_stop_or_stopped_feedback(controlled_real_gripper
             clock.sleep(0.051)
         return result
 
-    def read():
+    def read(**kwargs):
         reads.append(1)
         if phase == "read":
             clock.sleep(0.051)
@@ -1206,7 +1220,7 @@ def test_real_feedback_rejects_unavailable_or_invalid_acquisition_time(controlle
         "future": {"timestamp": clock.wall() + 0.001},
         "nan": {"timestamp": float("nan")},
     }[reading]
-    backend.read_gripper_state_now = lambda: value
+    backend.read_gripper_state_now = lambda **kwargs: value
     with pytest.raises(RuntimeError):
         port.observe_state()
 
@@ -1216,7 +1230,7 @@ def test_real_feedback_slow_access_cannot_refresh_an_old_cut(controlled_real_gri
     backend, port, clock = controlled_real_gripper
     native_get = backend.get_state
 
-    def read():
+    def read(**kwargs):
         if phase == "read":
             clock.sleep(0.201)
         return {"timestamp": clock.wall()}
@@ -1236,7 +1250,7 @@ def test_cancel_during_unwritten_busy_retry_prevents_later_dispatch(controlled_r
     backend, port, _clock = controlled_real_gripper
     cancelled = [False]
 
-    def busy(target):
+    def busy(target, **kwargs):
         backend.commands.append(target)
         cancelled[0] = True
         return False

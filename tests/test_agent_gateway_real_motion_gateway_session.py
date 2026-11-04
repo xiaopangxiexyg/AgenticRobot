@@ -459,6 +459,7 @@ class _ComposedGripperBackend:
         self.commands = []
         self.holds = []
         self.close_fraction = 0.0
+        self.gripper_connection_token = (1, True)
         self.stop_ok = True
         self.clock = clock
 
@@ -468,7 +469,7 @@ class _ComposedGripperBackend:
     def readiness_report(self):
         return {"ready": True}
 
-    def read_gripper_state_now(self):
+    def read_gripper_state_now(self, **kwargs):
         if self.clock is not None:
             self.clock.value += .001
             return {"timestamp": self.clock()}
@@ -481,7 +482,7 @@ class _ComposedGripperBackend:
             "gripper_error_code": 0,
         }
 
-    def send_fixed_joint_pos(self, value):
+    def send_fixed_joint_pos(self, value, **kwargs):
         self.commands.append(value)
         self.close_fraction = value
         return True
@@ -627,6 +628,7 @@ def test_composed_gripper_requires_separate_authorization_and_executes_under_hol
 def test_composed_gripper_reserves_the_same_operation_slot_as_arm_motion(_composed_gripper_fixture):
     gateway, backend, request, snapshot, clock = _composed_gripper_fixture()
     try:
+        gateway.reconcile_gripper_connections(lambda reason: None)
         auth = RealAgentPrimitiveSessionAuthorization(
             gateway_session=gateway,
             side="right",
@@ -655,6 +657,12 @@ def test_composed_gripper_reserves_the_same_operation_slot_as_arm_motion(_compos
         )
         assert not rejected.accepted
         assert "active" in rejected.reason_code or "busy" in rejected.reason_code
+        assert not backend.commands
+        operation_id = gateway.service.operation_store.active_operation_id
+        backend.gripper_connection_token = (2, True)
+        gateway.reconcile_gripper_connections(lambda reason: None)
+        assert gateway.service.get_operation(operation_id).status == "cancelled"
+        assert gateway.service.operation_store.active_operation_id is None
         assert not backend.commands
     finally:
         assert gateway.close().accepted
@@ -790,11 +798,11 @@ def test_composed_gripper_rechecks_arm_hold_before_io_busy_retry(
     send = backend.send_fixed_joint_pos
     get_state = backend.get_state
 
-    def busy_once(target):
+    def busy_once(target, **kwargs):
         attempts.append(clock())
         if len(attempts) == 1:
             return False
-        return send(target)
+        return send(target, **kwargs)
 
     backend.send_fixed_joint_pos = busy_once
     backend.get_state = lambda **kwargs: {

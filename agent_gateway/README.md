@@ -1318,9 +1318,19 @@ MuJoCo 组合显式使用 `--enable-grippers --no-realtime-worker`，或 factory
 `real-rm65 --right-gripper-config /absolute/right-gripper.json` 使用既有
 `DMTacGripperBackendConfig` 字段配置独立的右夹爪 backend，配置必须显式提供
 `side: "right"` 和 `gripper_port`，不是 USB assignment 文件。默认不启用触觉采集；
-部署禁止启动张开、自动清故障、自动重连和触觉 reset。初始化可以设置已有的速度/力矩，
+部署禁止启动张开、自动清故障和触觉 reset。初始化可以设置已有的速度/力矩，
 但不发位置命令；反馈表明夹爪正在运动、状态无效或资源启动失败时，不发布 endpoint。
 机器人、相机、模型与夹爪均由 application 一次启动和关闭，不按 Skill 请求重建。
+
+`reconnect_on_error: true` 允许既有 backend 后台 supervisor 在串口断开后按
+`reconnect_cooldown_sec` 重试连接；SDK 内层不重试旧交易，Skill 的同步读取也不重建连接。
+连接恢复后由原控制 owner 确认机械臂和夹爪 HOLD，不重放旧位置目标。连接状态或代次改变会
+结束旧主动操作，并使旧握持、旧停止证明及旧计划身份失效；操作者主动关闭资源时停止自动恢复。
+旧配置显式设置 `false` 时仍关闭此功能。
+
+张开请求先读取新鲜、无故障的位置；闭合比例已在 `0.001` 以内时，先确认停止，再跳过
+重复位置写入并按原有稳定反馈规则完成。仍需张开时使用单次模式，关闭该次命令的持续夹取模式。
+此规则同时用于 Skill 和操作者按钮；未知或故障反馈、未确认的 HOLD 都不能短路为成功。
 
 在显式双夹爪 `--gripper-skill-version 2` 配置下，可添加
 `--gripper-startup-reconnect-on-fault16`：仅当启动反馈恰为

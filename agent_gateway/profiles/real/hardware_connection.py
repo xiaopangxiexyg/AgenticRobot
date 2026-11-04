@@ -38,6 +38,10 @@ def run_operator_gripper_command(port: Any, target_state: str, *,
     contact, for consecutive non-moving samples. Then the gripper is held.
     """
     convergence = convergence or GripperConvergenceProfile()
+    if not port.readiness().ready:
+        return {"schema": OPERATOR_GRIPPER_SCHEMA, "component_id": port.component_id,
+                "target_state": target_state, "command_accepted": False,
+                "status": "not_ready", "evidence_refs": []}
     target = 0.0 if target_state == "open" else 1.0
     started = clock()
     receipt = port.command_close(target)

@@ -68,6 +68,9 @@ class RealDmtacGripperControlPort:
         self._last_command_attempt_ref: str | None = None
         self._last_command_target_close: float | None = None
         self._last_hold_receipt: GripperHoldReceipt | None = None
+        self._admission_connection: tuple[int, bool] | None = None
+        self._command_connection: tuple[int, bool] | None = None
+        self._hold_connection: tuple[int, bool] | None = None
         self._diagnostic_read_count = 0
         self._diagnostic_max_read_sec = 0.0
         self._diagnostic_last_read: dict[str, object] = {}
@@ -122,15 +125,18 @@ class RealDmtacGripperControlPort:
         return f"dmtac-gripper-{kind}:{digest}"
 
     def readiness(self) -> GripperReadiness:
+        connection = self.connection_token
         report = self.backend.readiness_report()
         ready = bool(self.backend.is_ready()) and bool(report.get("ready"))
+        ready = ready and connection == self.connection_token and connection[1]
+        self._admission_connection = connection
         ref = self._ref(
             "readiness",
             {"ready": ready, "reason": str(report.get("reason", ""))},
         )
         return GripperReadiness(
             ready=ready,
-            lower_operation_id=f"dmtac-gripper:{self.component_id}:live-session",
+            lower_operation_id=f"dmtac-gripper:{self.component_id}:connection-{connection[0]}",
             evidence_refs=(ref,),
         )
 
@@ -138,12 +144,15 @@ class RealDmtacGripperControlPort:
         self, target_close: float, *, cancel_requested: Callable[[], bool] | None = None,
     ) -> GripperCommandReceipt:
         self._require_arm_hold()
+        connection = self._admission_connection or self.connection_token
+        self._require_connection(connection)
         target = float(target_close)
         # A hardware write may change the scene even if its ACK is lost.
         self._last_command_attempt_ref = self._ref(
             "command_attempt", {"target_close": target}
         )
         self._last_command_target_close = target
+        self._command_connection = connection
         self._last_hold_receipt = None
         self._diagnostic_read_count = 0
         self._diagnostic_max_read_sec = 0.0
@@ -154,6 +163,21 @@ class RealDmtacGripperControlPort:
         attempts = 0
         diagnostic: dict[str, object] = {}
         accepted = False
+        if target == 0.0 and not (cancel_requested is not None and cancel_requested()):
+            sample = self.observe_state()
+            self._require_connection(connection)
+            if sample.fault_code is None and sample.measured_close <= 0.001:
+                hold = self.hold(reason="gripper_already_open")
+                self._require_connection(connection)
+                self._diagnostic_command = {"status": "already_open_position_write_skipped",
+                                            "accepted": hold.succeeded}
+                _LOG.info("DMTAC already open: component=%s stopped=%s; position write skipped",
+                          self.component_id, hold.succeeded)
+                return GripperCommandReceipt(
+                    accepted=hold.succeeded and not (cancel_requested is not None and cancel_requested()),
+                    lower_operation_id=f"dmtac-gripper-already-open:{self._sequence}",
+                    evidence_refs=(sample.evidence_ref, *hold.evidence_refs),
+                )
         while True:
             if cancel_requested is not None and cancel_requested():
                 diagnostic = {"gripper_last_send_status": "preempted_before_dispatch"}
@@ -161,7 +185,12 @@ class RealDmtacGripperControlPort:
             # A busy retry can outlive the arm's original fresh HOLD cut.
             self._require_arm_hold()
             attempts += 1
-            accepted = bool(self.backend.send_fixed_joint_pos(target))
+            self._require_connection(connection)
+            accepted = bool(self.backend.send_fixed_joint_pos(
+                target, continuous_grasp_override=False if target == 0.0 else None,
+                expected_connection_generation=connection[0],
+            ))
+            self._require_connection(connection)
             if accepted:
                 break
             try:
@@ -205,10 +234,12 @@ class RealDmtacGripperControlPort:
         )
 
     def observe_state(self) -> GripperStateSample:
+        connection = self.connection_token
+        self._require_connection(connection)
         read_started = time.monotonic()
         reading = None
         try:
-            reading = self.backend.read_gripper_state_now()
+            reading = self.backend.read_gripper_state_now(allow_reconnect=False)
         finally:
             elapsed = time.monotonic() - read_started
             self._diagnostic_read_count += 1
@@ -236,6 +267,7 @@ class RealDmtacGripperControlPort:
             include_tactile_vector=False,
         )
         self._diagnostic_last_read["read_and_cache_elapsed_sec"] = time.monotonic() - read_started
+        self._require_connection(connection)
         # Include cached-state access in the acquisition window. A slow getter
         # must not make an old read look fresh by assigning a later timestamp.
         if time.monotonic() - read_started > 0.2:
@@ -271,7 +303,19 @@ class RealDmtacGripperControlPort:
 
     def poll_state(self) -> GripperStateSample:
         self._require_arm_hold()
-        return self.observe_state()
+        connection = self._command_connection or self._admission_connection or self.connection_token
+        self._require_connection(connection)
+        sample = self.observe_state()
+        self._require_connection(connection)
+        return sample
+
+    @property
+    def connection_token(self) -> tuple[int, bool]:
+        return self.backend.gripper_connection_token
+
+    def _require_connection(self, expected: tuple[int, bool]) -> None:
+        if not expected[1] or self.connection_token != expected:
+            raise RuntimeError("DMTAC connection changed; the old gripper operation cannot continue.")
 
     def bind_motion_guard(self, guard: Callable[[], bool]) -> None:
         if self._motion_guard is not None or not callable(guard):
@@ -280,12 +324,16 @@ class RealDmtacGripperControlPort:
 
     @property
     def last_command_attempt_ref(self) -> str | None:
-        return self._last_command_attempt_ref
+        connection = self.connection_token
+        attempt = self._last_command_attempt_ref if self._command_connection == connection else None
+        return "dmtac-gripper-connection:" + canonical_content_hash(
+            {"connection": connection, "attempt": attempt},
+            domain="dexteleop.real.gripper_connection.v1")
 
     @property
     def last_command_target_close(self) -> float | None:
         """Target closure of the last attempted command (None before any)."""
-        return self._last_command_target_close
+        return self._last_command_target_close if self._command_connection == self.connection_token else None
 
     def _require_arm_hold(self) -> None:
         if self._motion_guard is not None and not self._motion_guard():
@@ -294,6 +342,7 @@ class RealDmtacGripperControlPort:
             )
 
     def hold(self, *, reason: str) -> GripperHoldReceipt:
+        connection = self.connection_token
         pre_hold_diagnostics = (
             self.component_id, reason, self._last_command_attempt_ref,
             self._last_command_target_close, self._diagnostic_command,
@@ -319,7 +368,7 @@ class RealDmtacGripperControlPort:
             if sample.observed_at < stop_requested_at or sample.fault_code is not None:
                 break
             if sample.moving is False:
-                succeeded = time.monotonic() <= deadline
+                succeeded = time.monotonic() <= deadline and self.connection_token == connection
                 break
             if sample.moving is None:
                 break
@@ -343,6 +392,7 @@ class RealDmtacGripperControlPort:
             ),
         )
         self._last_hold_receipt = receipt
+        self._hold_connection = connection
         if reason in {"gripper_execution_preempted", "gripper_convergence_timeout",
                       "station_operation_worker_exception"}:
             # Preserve pre-stop feedback, but emit only after the stop attempt.
@@ -355,7 +405,7 @@ class RealDmtacGripperControlPort:
 
     @property
     def last_hold_receipt(self) -> GripperHoldReceipt | None:
-        return self._last_hold_receipt
+        return self._last_hold_receipt if self._hold_connection == self.connection_token else None
 
 
 def stop_arm_and_grippers(
@@ -437,13 +487,12 @@ class ExclusiveRealGripperResources:
             for name in (
                 "open_on_start",
                 "clear_fault_on_start",
-                "reconnect_on_error",
                 "auto_recover_internal_communication_fault",
                 "tactile_reset_on_start",
             )
         ):
             raise ValueError(
-                "Gripper Skill resources forbid startup opening/reset and automatic recovery."
+                "Gripper Skill resources forbid startup opening/reset and automatic fault clearing."
             )
         if startup_reconnect_on_fault16 and any(
             not callable(getattr(port.backend, "force_reconnect_gripper", None))

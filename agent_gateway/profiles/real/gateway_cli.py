@@ -1100,19 +1100,18 @@ def main(argv: list[str] | None = None) -> int:
                     "connect_tactile": False,
                     "clear_fault_on_start": False,
                     "auto_recover_internal_communication_fault": False,
-                    "reconnect_on_error": False,
+                    "reconnect_on_error": True,
                     **values,
                 }
             )
             if (
                 config.open_on_start
                 or config.clear_fault_on_start
-                or config.reconnect_on_error
                 or config.auto_recover_internal_communication_fault
                 or config.tactile_reset_on_start
             ):
                 raise ValueError(
-                    "startup opening, fault clearing and automatic recovery are forbidden in this Skill profile"
+                    "startup opening, fault clearing and tactile reset are forbidden in this Skill profile"
                 )
             gripper_backends[hand_side] = DMTacGripperBackend(config)
         except (ValueError, TypeError) as error:

@@ -375,6 +375,13 @@ def test_operator_gripper_commands_either_hand_through_its_skill_port_and_holds(
         left.samples = [(0.3, True), (0.01, False), (0.01, False), (0.01, False)]
         opened = _gripper(owner, component="left_gripper", target="open")
         assert opened["status"] == "target_reached" and left.commands == [0.0]
+        # An already-open endpoint with a latched running bit needs STOP,
+        # never another position trigger. The fake reports stopped after HOLD.
+        left.samples = [(0.0, True)] * 5
+        repeated = _gripper(owner, component="left_gripper", target="open")
+        assert repeated["status"] == "target_reached" and repeated["hold_confirmed"] is True
+        assert left.commands == [0.0]
+        assert "gripper_already_open" in left.holds
         # Stopped on an object: a close that settles before full closure.
         right.samples = [(0.5, True)] + [(0.6, False)] * 40
         contact = _gripper(owner)
@@ -434,7 +441,8 @@ def test_operator_gripper_reports_a_timeout_and_still_holds(monkeypatch):
     from agent_gateway.profiles.real import hardware_connection
 
     clock = iter(float(index) for index in range(1000))
-    port = SimpleNamespace(component_id="right_gripper", calls=[])
+    port = SimpleNamespace(component_id="right_gripper", calls=[],
+                           readiness=lambda: SimpleNamespace(ready=True))
 
     def command_close(target):
         port.calls.append(("command", target))
