@@ -108,7 +108,8 @@ The runner accepts at most four live core processes, which still holds at most
 two native batches at a time, and above two processes it requires at least
 eight batches. Only the local merge host (`zc-MS-7E24`, Ryzen 9 7950X, 32
 logical CPUs, 61 GiB RAM) uses this, through the guarded eight-batch,
-four-process command above; the runner itself does not detect the guard. On
+four-process command above, and only while the host has at least 16 GiB
+available (`free -g`); the runner itself does not detect the guard. On
 2026-11-04 the official entrypoint ran core for `d9d13401e` in 208.6 seconds
 with the eight-batch layout (scope peak 6.8 GiB) and in 392.0 seconds with the
 default layout (4.5 GiB), each with the same 7,036 records, 0 failures, the 1
