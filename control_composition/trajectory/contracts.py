@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass, field
 
 from dataset_contracts.canonical_encoding import canonical_content_hash
@@ -14,6 +13,7 @@ from robot_motion.action import (
 
 from ..residual_anchor import ResidualAnchorReceipt
 
+from ._validation import _finite, _nonnegative_int, _required
 from .lifecycle import (
     TRAJECTORY_INTERACTION_MODE_PASS_THROUGH,
     TRAJECTORY_INTERACTION_MODE_RESIDUAL_ACTIVE,
@@ -58,26 +58,6 @@ TRAJECTORY_PUBLICATION_BASIS_HASH_DOMAIN_DEVELOPMENT = (
 TRAJECTORY_TARGET_PREPARATION_HASH_DOMAIN_DEVELOPMENT = (
     "dexteleop.trajectory_target_preparation.development"
 )
-
-
-def _required(value: object, *, name: str) -> str:
-    normalized = str(value).strip()
-    if not normalized:
-        raise ValueError(f"{name} must be non-empty.")
-    return normalized
-
-
-def _finite(value: object, *, name: str) -> float:
-    result = float(value)
-    if not math.isfinite(result):
-        raise ValueError(f"{name} must be finite.")
-    return result
-
-
-def _nonnegative_int(value: object, *, name: str) -> int:
-    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-        raise ValueError(f"{name} must be a non-negative integer.")
-    return int(value)
 
 
 @dataclass(frozen=True)

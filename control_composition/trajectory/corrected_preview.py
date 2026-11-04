@@ -25,6 +25,7 @@ from control_composition.residual_anchor_lifecycle import (
     build_residual_anchor_lifecycle_snapshot,
 )
 
+from ._validation import _required
 from .preview import (
     TrajectoryIntentPreviewPoint,
     TrajectoryIntentPreviewSnapshot,
@@ -46,13 +47,6 @@ TRAJECTORY_CORRECTED_PREVIEW_SNAPSHOT_HASH_DOMAIN_DEVELOPMENT = (
 TRAJECTORY_CORRECTED_PREVIEW_STATUSES_DEVELOPMENT = frozenset(
     {"ready", "unavailable", "invalid"}
 )
-
-
-def _required(value: object, *, name: str) -> str:
-    normalized = str(value).strip()
-    if not normalized:
-        raise ValueError(f"{name} must be non-empty.")
-    return normalized
 
 
 def _context_block_reason(

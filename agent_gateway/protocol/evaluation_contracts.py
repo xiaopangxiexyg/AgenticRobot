@@ -8,7 +8,6 @@ rearm receipt, or proof that the lower runtime executed an operation.
 
 from __future__ import annotations
 
-import math
 from collections.abc import Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
@@ -16,6 +15,7 @@ from typing import Any
 
 from dataset_contracts.canonical_encoding import canonical_content_hash
 
+from ._contract_validation import finite_number as _finite
 from .skill_catalog import (
     MAX_AGENT_SKILL_TIMEOUT_MS_V1,
     validate_route_id,
@@ -98,15 +98,6 @@ def _optional(value: object | None, *, field_name: str) -> str | None:
     if value is None:
         return None
     return _required(value, field_name=field_name)
-
-
-def _finite(value: object, *, field_name: str) -> float:
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise TypeError(f"{field_name} must be a number.")
-    normalized = float(value)
-    if not math.isfinite(normalized):
-        raise ValueError(f"{field_name} must be finite.")
-    return normalized
 
 
 def _positive_integer(

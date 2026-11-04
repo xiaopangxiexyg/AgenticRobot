@@ -30,6 +30,8 @@ from robot_motion.coordinate_frames import CoordinateFrameSpec
 from robot_motion.coordinate_profiles import STATION_RETARGET_FRAME_CONTRACT_V1
 from robot_motion.runtime.immutable import deep_freeze, deep_thaw
 
+from ._pose import _POSE_ATOL, _rigid_pose
+
 TCP_DISPLACEMENT_PRIMITIVE_HASH_DOMAIN_V1 = (
     "dexteleop.robot_motion.tcp_displacement_primitive.v1"
 )
@@ -39,8 +41,6 @@ TCP_DISPLACEMENT_TARGET_HASH_DOMAIN_V1 = (
 TCP_DISPLACEMENT_POSE_CONVENTION_V1 = "T_reference_tool_tcp"
 TCP_CONTROLLED_FRAME_ID = "tool_tcp"
 SHORT_STEP_DISTANCE_M = 0.03
-
-_POSE_ATOL = 1e-9
 
 
 class CardinalTCPPoseDirection(str, Enum):
@@ -137,38 +137,6 @@ def _vector3(value: object, *, name: str) -> np.ndarray:
     if vector.shape != (3,) or not np.all(np.isfinite(vector)):
         raise ValueError(f"{name} must contain three finite values.")
     return deep_freeze(np.ascontiguousarray(vector, dtype=np.float64))
-
-
-def _rigid_pose(value: object, *, name: str) -> np.ndarray:
-    try:
-        pose = np.asarray(value, dtype=np.float64)
-    except (TypeError, ValueError) as exc:
-        raise ValueError(f"{name} must be a numeric 4x4 pose.") from exc
-    if pose.shape != (4, 4) or not np.all(np.isfinite(pose)):
-        raise ValueError(f"{name} must be a finite 4x4 pose.")
-    if not np.allclose(
-        pose[3],
-        (0.0, 0.0, 0.0, 1.0),
-        rtol=0.0,
-        atol=_POSE_ATOL,
-    ):
-        raise ValueError(f"{name} must be homogeneous.")
-    rotation = pose[:3, :3]
-    if not np.allclose(
-        rotation.T @ rotation,
-        np.eye(3),
-        rtol=0.0,
-        atol=_POSE_ATOL,
-    ):
-        raise ValueError(f"{name} rotation must be orthonormal.")
-    if not math.isclose(
-        float(np.linalg.det(rotation)),
-        1.0,
-        rel_tol=0.0,
-        abs_tol=_POSE_ATOL,
-    ):
-        raise ValueError(f"{name} rotation determinant must be +1.")
-    return deep_freeze(np.ascontiguousarray(pose, dtype=np.float64))
 
 
 @dataclass(frozen=True)

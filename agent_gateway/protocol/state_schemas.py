@@ -18,6 +18,7 @@ from typing import Any
 
 from dataset_contracts.canonical_encoding import canonical_content_hash
 
+from ._contract_validation import finite_number as _finite
 from .skill_catalog import (
     AgentSkillSchemaEntry,
     SkillDefinition,
@@ -65,15 +66,6 @@ def _nonnegative_integer(value: object, *, field_name: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
         raise ValueError(f"{field_name} must be a non-negative integer.")
     return value
-
-
-def _finite(value: object, *, field_name: str) -> float:
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise TypeError(f"{field_name} must be a number.")
-    normalized = float(value)
-    if not math.isfinite(normalized):
-        raise ValueError(f"{field_name} must be finite.")
-    return normalized
 
 
 def _component_ids(values: tuple[str, ...], *, field_name: str) -> tuple[str, ...]:
