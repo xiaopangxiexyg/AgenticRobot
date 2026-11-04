@@ -481,8 +481,9 @@ def plan_shards(
         lanes = range(shard_count)
         if core is not None and shard_count > 1:
             # Even batches contain native owners; odd batches contain contracts.
-            # The core runner starts batches in order, so its default two jobs
-            # never overlap native batches and its four-job cap allows two.
+            # The core runner starts batch N only after batch N-MAX_JOBS
+            # finishes, so its default two jobs never overlap native batches
+            # and its four-job cap allows at most two at once.
             lane = 0 if item[0] in core["CORE_NATIVE_MODULES"] else 1
             lanes = range(lane, shard_count, 2)
         index = min(

@@ -40,10 +40,13 @@ bash scripts/run_pytest.sh -q -m "integration and not optional and not hardware 
 bash scripts/run_fast_feedback.sh
 # Routine final merge acceptance (core; default four batches, two processes):
 bash scripts/run_merge_acceptance.sh --durations=30
-# The same core on the validated local merge host: four processes under its memory guard
+# The same core on the validated local merge host: four processes under its memory
+# guard, printing the scope's memory.peak and memory.events before the scope exits
 systemd-run --user --scope -p MemoryHigh=12G -p MemoryMax=16G -p MemorySwapMax=0 \
   env DEXTELEOP_FULL_ACCEPTANCE_SHARDS=8 DEXTELEOP_FULL_ACCEPTANCE_MAX_JOBS=4 \
-  bash scripts/run_merge_acceptance.sh --durations=30
+  bash -c 'bash scripts/run_merge_acceptance.sh --durations=30; status=$?
+    cg="/sys/fs/cgroup$(cut -d: -f3 /proc/self/cgroup)"
+    echo "memory.peak $(cat "$cg/memory.peak")"; cat "$cg/memory.events"; exit "$status"'
 # Explicit diagnosis of the remaining complete suite (not a routine merge gate):
 bash scripts/run_full_acceptance.sh --durations=50
 # On the validated six-shard integration host, use the same setting as Harness:
@@ -106,13 +109,13 @@ two native batches at a time, and above two processes it requires at least
 eight batches. Only the local merge host (`zc-MS-7E24`, Ryzen 9 7950X, 32
 logical CPUs, 61 GiB RAM) uses this, through the guarded eight-batch,
 four-process command above; the runner itself does not detect the guard. On
-2026-11-04 the official entrypoint ran core for `38a97cb39` in 223.3 seconds:
-7,036 records, 0 failures, the 1 existing skip, a scope peak of 7.0 GiB and no
-memory.high events. Host load averages were 11–13 at start and end, counting
-other agents' runs and this one. An experiment run of the same layout took
-216.1 seconds. The default layout took 389 seconds for the same record set on
-that host (another task's `e67b949e` run). The eight-batch layout spends about
-13% more summed testcase time, so a host with fewer idle cores gains less.
+2026-11-04 the official entrypoint ran core for `d9d13401e` in 208.6 seconds
+with the eight-batch layout (scope peak 6.8 GiB) and in 392.0 seconds with the
+default layout (4.5 GiB), each with the same 7,036 records, 0 failures, the 1
+existing skip and no memory.high events. Host load averages were 8–13,
+counting other agents' runs. An earlier commit with the same eight-batch path
+took 223.3 seconds (7.0 GiB). The eight-batch layout spent 6–13% more summed
+batch time in these runs, so a host with fewer idle cores gains less.
 
 Each 23-module native process of the default layout keeps about 2 GiB of
 native memory by the end of its batch and peaks at 3.7–4.2 GiB; the
@@ -121,12 +124,15 @@ the 6 GiB high / 8 GiB max / no-swap envelope of the 2026-11-01 remote core
 runs, the eight-batch, four-process layout was throttled continuously until it
 was stopped. Other hosts, including the 192.168.70.116 field PC, keep the
 default; another host needs its own guarded measurement and explicit approval
-first. If a guarded run hits pytest timeouts, loses a worker to the memory
-limit or takes clearly longer than five minutes, rerun the default layout,
-report both results and re-measure before using the four-process layout again;
-also re-measure after `CORE_NATIVE_MODULES` changes. `systemd-run` prints the
-scope name; after an interrupted run, stop that scope with
-`systemctl --user stop` so that no worker survives.
+first. A measurement is the guarded command's result plus the `memory.peak` and
+`memory.events` lines it prints; they must be read inside the scope because
+the scope's counters disappear when it exits. If a guarded run reports
+memory.high or oom_kill events, hits pytest timeouts or takes clearly longer
+than five minutes, rerun the default layout, report both results and
+re-measure before using the four-process layout again; also re-measure after
+`CORE_NATIVE_MODULES` changes. `systemd-run` prints the scope name; after an
+interrupted run, stop that scope with `systemctl --user stop` so that no
+worker survives.
 A process/concurrency limit is not a RAM limit: use the host's existing memory,
 swap and pressure safeguards. Duration is measured from entry through cleanup
 and formal report publication; the target never authorizes skipping work at

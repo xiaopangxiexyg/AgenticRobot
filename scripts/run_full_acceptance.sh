@@ -373,6 +373,8 @@ trap on_signal INT TERM
 
 OVERALL_STATUS=0
 WRAPPER_ERRORS=()
+# Batch N starts only after batch N-MAX_JOBS is reaped. Core relies on this
+# order to keep at most two native batches live (see configure_shards).
 for ((index = 0; index < SHARD_COUNT; index++)); do
   if ((index >= MAX_JOBS)); then
     wait_shard "$((index - MAX_JOBS))"
