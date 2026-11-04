@@ -461,10 +461,6 @@ from teleop_runtime.real_teleop.movement import (
 VIRTUAL_DESK_SWEEP_CONVENTION_VERSION = 2
 TRACKER_GUI_WARN_AGE_SEC = 0.25
 TRACKER_GUI_STALE_AGE_SEC = 0.50
-CAMERA_STARTUP_SELF_CHECK_DURATION_SEC = 3.0
-CAMERA_STARTUP_SELF_CHECK_INTERVAL_SEC = 0.2
-CAMERA_STARTUP_SELF_CHECK_CONSECUTIVE_FRESH_SAMPLES = 3
-CAMERA_STARTUP_SELF_CHECK_FRESH_FRAME_MAX_AGE_SEC = DEFAULT_CAMERA_FRAME_MAX_AGE_SEC
 # MIGRATION(real-teleop, batch 1): wrist-depth freshness now lives in the
 # dependency-light component below.  This legacy entrypoint deliberately
 # re-exports the former names so parallel callers and external scripts do not

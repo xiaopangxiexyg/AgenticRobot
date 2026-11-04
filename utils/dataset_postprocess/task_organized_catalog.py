@@ -459,7 +459,6 @@ def _video_issues(
         import cv2
     except ModuleNotFoundError as exc:
         raise ModuleNotFoundError("manifest generation requires opencv-python") from exc
-    episode_index = int(record["episode_index"])
     declared = int(record["frame_count"])
     paths = record.get("video_paths")
     paths = paths if isinstance(paths, Mapping) else {}

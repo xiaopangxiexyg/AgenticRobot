@@ -54,21 +54,20 @@ from .sim_hil_profile.config import (
     DEFAULT_VIVE_COORDINATE_PROFILE,
     DEFAULT_VIVE_PORT,
     MujocoSimHILApplicationConfig,
-    SIM_HIL_BLEND_FAILURE_FALLBACKS,
     SIM_HIL_HUMAN_TIMEOUT_FALLBACKS,
     SIM_HIL_POLICY_BACKENDS,
     acceptance_profile_config as _acceptance_profile_config,
 )
 from .sim_hil_profile.factory import (
-    _SimHILReadinessProvider,
-    _bind_sim_target_session_anchors,
+    # Re-exported for tests that address the historical Sim-HIL facade.
+    _SimHILReadinessProvider as _SimHILReadinessProvider,
+    _bind_sim_target_session_anchors as _bind_sim_target_session_anchors,
     build_application_graph as _build_application_graph,
 )
 from .sim_hil_profile.human import (
-    _SimHILHumanAttachment,
     _bind_vive_coordinate_profile,
     _build_passive_single_vive_gripper_component_source,
-    _build_single_vive_gripper_component_source_spec,
+    _build_single_vive_gripper_component_source_spec as _build_single_vive_gripper_component_source_spec,
     _file_sha256,
 )
 from .sim_hil_profile.operator_view import (
@@ -86,17 +85,7 @@ from .sim_hil_profile.profile_selection import (
 )
 from .sim_hil_profile.status import (
     SIM_HIL_STATUS_SCHEMA_V1,
-    _composition_step_status,
-    _emission_status,
-    _execution_difference_status,
-    _human_channel_status,
-    _human_gripper_target_status,
-    _input_submission_status,
-    _mix_status,
-    _mujoco_gripper_execution_status,
-    _runtime_contract_status,
-    _target_execution_status,
-    _vive_receiver_status,
+    _vive_receiver_status as _vive_receiver_status,
 )
 
 

@@ -2377,7 +2377,9 @@ class MujocoSimHILComposition:
             cached = self._submission_by_key.get(key)
             if cached is not None:
                 return cached
-            now = _finite(
+            # Policy timing comes from the emission itself; ``observed_at`` is
+            # only validated so callers keep the same error contract.
+            _finite(
                 self.runtime.clock() if observed_at is None else observed_at,
                 name="observed_at",
             )
@@ -2701,17 +2703,12 @@ class MujocoSimHILComposition:
             hold = None
             blocked_reason = None
             error_text = None
-            readiness_failures: tuple[str, ...] = ()
             runtime_gate_failures: tuple[str, ...] = ()
             try:
                 gate = self.runtime.capture_execution_gate_snapshot(now=now)
                 if gate.status != "ready":
                     blocked_reason = f"execution_gate_not_ready:{gate.status}"
                 else:
-                    readiness_failures = self._mix_readiness_failures(
-                        readiness,
-                        target_effective_at=target,
-                    )
                     runtime_gate_failures = self._runtime_gate_readiness_failures(
                         readiness,
                         target_effective_at=target,

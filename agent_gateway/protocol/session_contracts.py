@@ -12,7 +12,6 @@ from ._contract_validation import (
     identifier,
     nonnegative_integer,
     positive_integer,
-    required_text,
     unique_sorted_text,
 )
 from .artifact_contracts import AGENT_ARTIFACT_ACCESS_MECHANISMS_V2

@@ -387,13 +387,15 @@ def resolve_real_arm_execution_config(
     reference_explicit = explicit("position_reference_hz", "--position-reference-hz")
     ik_explicit = explicit("dual_arm_ik_hz", "--dual-arm-ik-hz")
     control_explicit = explicit("arm_control_hz", "--arm-control-hz")
-    follow_explicit = explicit("arm_canfd_follow", "--arm-canfd-follow", "--no-arm-canfd-follow")
+    # The bare calls below only record explicit overrides; the resolved values
+    # honor any non-None argument, including formal-profile injected defaults.
+    explicit("arm_canfd_follow", "--arm-canfd-follow", "--no-arm-canfd-follow")
     stream_explicit = explicit("arm_canfd_follow_stream_hz", "--arm-canfd-follow-stream-hz")
     post_ik_alpha_explicit = explicit(
         "position_post_ik_qpos_smoothing_alpha",
         "--position-post-ik-qpos-smoothing-alpha",
     )
-    alpha_explicit = explicit("arm_follow_qpos_alpha", "--arm-follow-qpos-alpha")
+    explicit("arm_follow_qpos_alpha", "--arm-follow-qpos-alpha")
     warning_explicit = explicit("arm_canfd_follow_warning_ratio", "--arm-canfd-follow-warning-ratio")
     trajectory_explicit = explicit("arm_canfd_trajectory_mode", "--arm-canfd-trajectory-mode")
     radio_explicit = explicit("arm_canfd_radio", "--arm-canfd-radio")
@@ -455,8 +457,6 @@ def resolve_real_arm_execution_config(
         arm_canfd_follow = True
     elif requested_profile == IMPEDANCE_40HZ_PROFILE_NAME:
         arm_canfd_follow = False
-    elif raw_follow is not None:
-        arm_canfd_follow = bool(raw_follow)
     else:
         arm_canfd_follow = mode == "position"
 

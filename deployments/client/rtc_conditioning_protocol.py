@@ -415,9 +415,6 @@ def build_rtc_conditioned_inference_envelope_v3(
     """Bind exact request, canonical bundle, encoding, and loaded capability."""
 
     source_contract = bundle.continuation_contract
-    contract = normalize_model_continuation_contract(
-        source_contract
-    ).runtime
     validate_rtc_model_continuation_capability_v3_binding(
         capability,
         continuation_contract=source_contract,

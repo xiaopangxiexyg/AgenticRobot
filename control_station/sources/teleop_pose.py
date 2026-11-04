@@ -7,13 +7,9 @@ imports; no source production or numerical adaptation is implemented here.
 
 from teleop_runtime.action.passive_teleop import (
     AttachablePassiveTeleopComponentSource,
-    PASSIVE_TELEOP_COMPONENT_BINDING_HASH_DOMAIN_V1,
     PASSIVE_TELEOP_COMPONENT_SOURCE_CONTRACT_ID_V1,
-    PASSIVE_TELEOP_COMPONENT_SOURCE_HASH_DOMAIN_V1,
-    PASSIVE_TELEOP_POSE_BINDING_HASH_DOMAIN_V1,
     PASSIVE_TELEOP_POSE_GENERIC_SOURCE_CONTRACT_ID_V1,
     PASSIVE_TELEOP_POSE_SOURCE_CONTRACT_ID_V1,
-    PASSIVE_TELEOP_POSE_SOURCE_HASH_DOMAIN_V1,
     PassiveTeleopComponentBindingReceipt,
     PassiveTeleopComponentClockBridge,
     PassiveTeleopComponentSessionSource,

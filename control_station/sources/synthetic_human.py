@@ -8,9 +8,7 @@ and tests while the old MuJoCo composition fixtures are retired.
 from teleop_runtime.action.synthetic_human import (
     SYNTHETIC_HUMAN_POSE_GENERIC_SOURCE_CONTRACT_ID_V1,
     SYNTHETIC_HUMAN_POSE_SOURCE_CONTRACT_ID_V1,
-    SYNTHETIC_HUMAN_POSE_SOURCE_HASH_DOMAIN_V1,
     SYNTHETIC_HUMAN_QPOS_SOURCE_CONTRACT_ID_V1,
-    SYNTHETIC_HUMAN_QPOS_SOURCE_HASH_DOMAIN_V1,
     SyntheticHumanPoseSource,
     SyntheticHumanPoseSourceSpec,
     SyntheticHumanQposSource,
@@ -20,6 +18,7 @@ from teleop_runtime.action.synthetic_human import (
 
 __all__ = [
     "SYNTHETIC_HUMAN_QPOS_SOURCE_CONTRACT_ID_V1",
+    "SYNTHETIC_HUMAN_POSE_GENERIC_SOURCE_CONTRACT_ID_V1",
     "SYNTHETIC_HUMAN_POSE_SOURCE_CONTRACT_ID_V1",
     "SyntheticHumanPoseSource",
     "SyntheticHumanPoseSourceSpec",
