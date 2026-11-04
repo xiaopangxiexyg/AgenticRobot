@@ -396,7 +396,7 @@ def build_mujoco_fast_grasp_contract(
     named_binding = {}
     if target_prompt is not None:
         target_prompt = required_text(target_prompt, field_name="target_prompt", maximum_length=256)
-        segmentation = bundle.segmentation_geometry
+        segmentation = bundle.segmentation
         if segmentation is None:
             raise ValueError("Named fast grasp requires the existing segmentation deployment.")
         target_object_id = contact.contact_binding.target_body_name

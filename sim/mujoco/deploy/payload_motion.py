@@ -115,6 +115,7 @@ class MujocoPayloadSupport:
     lateral_tolerance_m: float = .003
     dynamic_body_name: str | None = None
     frozen_pose_xyz_quat_xyzw: tuple[float, ...] | None = None
+    fixed_pickup_object: bool = False
 
     def __post_init__(self):
         object.__setattr__(self, "geom_names", _names(self.geom_names, "Support geoms"))
@@ -132,6 +133,9 @@ class MujocoPayloadSupport:
             raise ValueError("Lift lateral tolerance must retain the 3mm bound")
         if (self.dynamic_body_name is None) != (self.frozen_pose_xyz_quat_xyzw is None):
             raise ValueError("Dynamic support requires both body identity and frozen pose")
+        if (type(self.fixed_pickup_object) is not bool or (self.fixed_pickup_object
+                and (self.phase != "lift" or self.dynamic_body_name is None))):
+            raise ValueError("Fixed pickup object requires a pose-bound lift support")
         if self.dynamic_body_name is not None:
             _names((self.dynamic_body_name,), "Dynamic support body")
             pose = _vector(self.frozen_pose_xyz_quat_xyzw, 7, "Frozen support pose")
@@ -143,6 +147,8 @@ class MujocoPayloadSupport:
         if self.dynamic_body_name is None:
             payload.pop("dynamic_body_name")
             payload.pop("frozen_pose_xyz_quat_xyzw")
+        if not self.fixed_pickup_object:
+            payload.pop("fixed_pickup_object")
         return payload
 
 
@@ -385,12 +391,16 @@ class _PayloadSceneOracle(CollisionSafetyOracle):
                 raise ValueError("Payload support cannot exceed the scene hard penetration bound")
             if binding.support.dynamic_body_name is not None:
                 body = int(model.body(binding.support.dynamic_body_name).id)
-                joint = int(model.body_jntadr[body])
-                if (body == self._body or model.body_parentid[body] != 0
-                        or model.body_jntnum[body] != 1
-                        or model.jnt_type[joint] != mujoco.mjtJoint.mjJNT_FREE
+                if (body in (0, self._body) or model.body_parentid[body] != 0
                         or np.any(model.body_parentid[1:] == body)):
-                    raise ValueError("Dynamic support requires another top-level free rigid body")
+                    raise ValueError("Pose-bound support requires another top-level rigid body without descendants")
+                if binding.support.fixed_pickup_object:
+                    if model.body_jntnum[body] != 0 or model.body_mocapid[body] >= 0:
+                        raise ValueError("Fixed pickup object cannot have joints or mocap")
+                else:
+                    joint = int(model.body_jntadr[body])
+                    if model.body_jntnum[body] != 1 or model.jnt_type[joint] != mujoco.mjtJoint.mjJNT_FREE:
+                        raise ValueError("Dynamic support requires another top-level free rigid body")
                 self._dynamic_support_body = body
                 self._frozen_support_pose = xyzquat_to_pose_matrix(
                     binding.support.frozen_pose_xyz_quat_xyzw)
@@ -402,20 +412,20 @@ class _PayloadSceneOracle(CollisionSafetyOracle):
                 source_pose = _body_pose(source, body)
                 displacement, angle = pose_delta_metrics(self._frozen_support_pose, source_pose)
                 if displacement > 1e-5 or angle > .001:
-                    raise ValueError("Frozen dynamic support pose differs from its captured source cut")
+                    raise ValueError("Frozen support pose differs from its captured source cut")
                 self._inverse_source_support_pose = np.linalg.inv(source_pose)
                 collision_geoms = {int(g) for g in np.flatnonzero(
                     (model.geom_bodyid == body)
                     & ((model.geom_contype != 0) | (model.geom_conaffinity != 0)))}
                 if set(self._supports) != collision_geoms:
-                    raise ValueError("Dynamic support must bind its complete collision geometry")
+                    raise ValueError("Pose-bound support must bind its complete collision geometry")
             for geom in self._supports:
                 body = int(model.geom_bodyid[geom])
                 if self._dynamic_support_body is not None:
                     if (body != self._dynamic_support_body
                             or model.geom_contype[geom] != 8
                             or model.geom_type[geom] != mujoco.mjtGeom.mjGEOM_BOX):
-                        raise ValueError("Dynamic support must use its complete native box identity")
+                        raise ValueError("Pose-bound support must use its complete native box identity")
                     continue
                 while body and model.body_dofnum[body] == 0:
                     if model.body_mocapid[body] >= 0:

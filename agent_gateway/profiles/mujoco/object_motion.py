@@ -60,11 +60,12 @@ def _native_support_for_object_motion(scene, *, body_name, phase,
         if (len(geoms) != 1 or model.body_parentid[body] != 0
                 or model.body_jntnum[body] != 0 or model.body_mocapid[body] >= 0):
             raise ValueError("Pickup support must be one fixed native box.")
-        # Scene objects retain their native OBJECT collision group even when
-        # fixed. The existing pose-bound support path owns that geometry class.
-        dynamic = int(model.geom_contype[geoms[0]]) == 8
+    # Fixed scene objects still use the OBJECT collision group. Bind their
+    # captured pose and geometry through the same native oracle.
+    fixed_pickup_object = fixed_pickup and int(model.geom_contype[geoms[0]]) == 8
+    pose_bound = dynamic or fixed_pickup_object
     data = scene.data
-    if dynamic:
+    if pose_bound:
         data = scene.mujoco.MjData(model)
         scene.mujoco.mj_copyData(data, model, scene.data)
         scene.mujoco.mj_kinematics(model, data)
@@ -105,12 +106,13 @@ def _native_support_for_object_motion(scene, *, body_name, phase,
     if not dynamic and not fixed_pickup:
         lower[2] = upper[2]
     frozen = {}
-    if dynamic:
+    if pose_bound:
         pose = np.eye(4)
         pose[:3, :3] = data.xmat[body].reshape(3, 3)
         pose[:3, 3] = data.xpos[body]
         frozen = {"dynamic_body_name": body_name,
-                  "frozen_pose_xyz_quat_xyzw": tuple(pose_to_xyz_quat_xyzw(pose))}
+                  "frozen_pose_xyz_quat_xyzw": tuple(pose_to_xyz_quat_xyzw(pose)),
+                  "fixed_pickup_object": fixed_pickup_object}
     return MujocoPayloadSupport(
         tuple(model.geom(g).name for g in geoms),
         tuple(normals[0]) if dynamic or fixed_pickup else (0., 0., 1.),
