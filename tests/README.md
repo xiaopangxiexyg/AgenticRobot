@@ -38,8 +38,12 @@ bash scripts/run_pytest.sh -q -m "contract and not optional and not hardware and
 bash scripts/run_pytest.sh -q -m "integration and not optional and not hardware and not slow_sim"
 # Parallel bounded edit feedback (unit + integration, isolated caches/reports):
 bash scripts/run_fast_feedback.sh
-# Routine final merge acceptance (core, target 5–8 minutes):
+# Routine final merge acceptance (core; default four batches, two processes):
 bash scripts/run_merge_acceptance.sh --durations=30
+# The same core on the validated local merge host: four processes under its memory guard
+systemd-run --user --scope -p MemoryHigh=12G -p MemoryMax=16G -p MemorySwapMax=0 \
+  env DEXTELEOP_FULL_ACCEPTANCE_SHARDS=8 DEXTELEOP_FULL_ACCEPTANCE_MAX_JOBS=4 \
+  bash scripts/run_merge_acceptance.sh --durations=30
 # Explicit diagnosis of the remaining complete suite (not a routine merge gate):
 bash scripts/run_full_acceptance.sh --durations=50
 # On the validated six-shard integration host, use the same setting as Harness:
@@ -90,12 +94,26 @@ tests; transferring all the old matrices into mandatory development work does
 not satisfy it.
 
 The core mode reuses the complete runner's process cleanup, short TMPDIR,
-isolated caches, native-memory release and atomic evidence publication. It
-defaults to four module-isolated batches and permits at most two live pytest
-processes. Registered heavy native owners occupy alternating batches, so those
-batches never overlap; small handwritten models may still run in the contract
-batch. Shorter processes bound retained native state. A
-process/concurrency limit is not a RAM limit: use the host's existing memory,
+isolated caches, native-memory release and atomic evidence publication. By
+default it runs four module-isolated batches with two live pytest processes.
+Registered heavy native owners occupy the even batches, and batch N starts only
+after batch N−MAX_JOBS has finished, so with the default no two native batches
+overlap; small handwritten models may still run in the contract batches.
+Shorter processes bound retained native state.
+
+The runner accepts at most four live core processes, which still holds at most
+two native batches at a time. On the local merge host (`zc-MS-7E24`, Ryzen 9
+7950X, 32 logical CPUs, 61 GiB RAM) use the guarded eight-batch, four-process
+command above. On 2026-11-04 it ran core for `38a97cb39` in 223.3 seconds:
+7,036 records, 0 failures, the 1 existing skip, a scope peak of 7.0 GiB and no
+memory.high events, while other agents kept the host load at 11–13. The
+default layout needed about 389 seconds for the same record set on that host.
+Each native process keeps about 2 GiB of native memory by the end of its batch
+and peaks at 3.7–4.2 GiB, so the four-process layout under the former 6 GiB
+memory.high was throttled continuously until it was stopped. Keep the default
+on other hosts, including the 192.168.70.116 field PC, unless their headroom
+is measured.
+A process/concurrency limit is not a RAM limit: use the host's existing memory,
 swap and pressure safeguards. Duration is measured from entry through cleanup
 and formal report publication; the target never authorizes skipping work at
 timeout. A dirty source or a changed commit cannot publish passing core evidence.

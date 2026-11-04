@@ -102,6 +102,9 @@ confirmation coverage is explicitly retired.
 `run_merge_acceptance.sh` is a thin `--core` call into the existing complete
 runner. Four module-isolated batches use two workers; registered heavy native
 owners alternate with contract batches and do not run on both workers at once.
+On the guarded local merge host, an explicit eight-batch, four-worker setting
+runs at most two native batches at once; `tests/README.md` records its memory
+envelope and measurement.
 Small handwritten models can still run in the contract batch.
 Shorter processes bound native retention without changing GC. Short TMPDIR,
 private caches, native heap release,
