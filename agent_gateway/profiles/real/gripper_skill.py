@@ -129,7 +129,11 @@ class RealDmtacGripperControlPort:
         report = self.backend.readiness_report()
         ready = bool(self.backend.is_ready()) and bool(report.get("ready"))
         ready = ready and connection == self.connection_token and connection[1]
-        self._admission_connection = connection
+        if self._admission_connection is not None and connection != self._admission_connection:
+            hold = self.last_hold_receipt
+            ready = ready and hold is not None and hold.succeeded
+        if ready:
+            self._admission_connection = connection
         ref = self._ref(
             "readiness",
             {"ready": ready, "reason": str(report.get("reason", ""))},
@@ -146,6 +150,8 @@ class RealDmtacGripperControlPort:
         self._require_arm_hold()
         connection = self._admission_connection or self.connection_token
         self._require_connection(connection)
+        if self._admission_connection is None:
+            self._admission_connection = connection
         target = float(target_close)
         # A hardware write may change the scene even if its ACK is lost.
         self._last_command_attempt_ref = self._ref(

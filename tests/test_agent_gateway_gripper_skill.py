@@ -738,6 +738,8 @@ def test_real_gripper_command_or_failed_read_clears_previous_stop_proof():
     assert port.last_hold_receipt is None
     with pytest.raises(RuntimeError, match="connection changed"):
         port.poll_state()
+    assert not port.readiness().ready
+    assert port.hold(reason="recovered connection").succeeded
     assert port.readiness().ready
     assert port.command_close(1.0).accepted
     backend.read_gripper_state_now = lambda **kwargs: None
