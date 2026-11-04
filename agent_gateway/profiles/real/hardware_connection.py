@@ -36,12 +36,16 @@ def run_operator_gripper_command(port: Any, target_state: str, *,
     so a held object's retained grip is no longer trusted) and the Skill's
     convergence rule: the target within tolerance, or a close that stopped on
     contact, for consecutive non-moving samples. Then the gripper is held.
+    An unready port is refused before any command, like the other refusals,
+    so a result always has one of the five ``operator_gripper.v1`` statuses.
     """
     convergence = convergence or GripperConvergenceProfile()
-    if not port.readiness().ready:
-        return {"schema": OPERATOR_GRIPPER_SCHEMA, "component_id": port.component_id,
-                "target_state": target_state, "command_accepted": False,
-                "status": "not_ready", "evidence_refs": []}
+    readiness = port.readiness()
+    if not readiness.ready:
+        _LOG.warning("Operator gripper refused, port not ready: component=%s evidence=%s",
+                     port.component_id, ",".join(readiness.evidence_refs))
+        raise RuntimeError(f"Gripper {port.component_id} is not ready (connection lost or recovering, "
+                           "or HOLD not yet confirmed); no command was sent")
     target = 0.0 if target_state == "open" else 1.0
     started = clock()
     receipt = port.command_close(target)
@@ -326,8 +330,8 @@ class RealHardwareConnectionOwner:
 
         Not a Skill and not limited to the Agent's authorized gripper sides. Refused
         unless the hardware is connected, the generation matches, no stop is
-        latched, the control loop has no fault and no Skill operation is active;
-        new Skill submissions are refused while it runs.
+        latched, the control loop has no fault, no Skill operation is active and
+        the gripper port is ready; new Skill submissions are refused while it runs.
         """
         self._authorize(client_id)
         if (set(payload) != {"component_id", "target_state", "expected_generation"}
@@ -460,13 +464,31 @@ class RealHardwareConnectionOwner:
             self._server.shutdown()
 
     def close(self) -> None:
+        """Close the generation, then the retained transport and the resident devices.
+
+        Like the plain application close, every stage is attempted even when an
+        earlier one fails (for example a HOLD that cannot be confirmed), so the
+        socket is unlinked and cameras and models are released before the
+        process exits. The generation keeps its own unconfirmed stages for a
+        retry; the error names every failed stage. A transition that still owns
+        resources is never closed underneath.
+        """
         with self._lock:
             self._closing = True
             thread = self._transition
         if thread is not None and not thread.join_and_confirm(timeout=3.0):
             raise RuntimeError("Hardware transition still owns resources; close is incomplete")
-        self.current.application.close()
+        stages = [("generation", self.current.application.close)]
         if self._server is not None:
-            self._server.server_close()
-        self._resident.close()
+            stages.append(("transport", self._server.server_close))
+        stages.append(("resident", self._resident.close))
+        errors: list[tuple[str, Exception]] = []
+        for stage, close in stages:
+            try:
+                close()
+            except Exception as error:  # noqa: BLE001 - later stages still close.
+                errors.append((stage, error))
+        if errors:
+            raise RuntimeError("Hardware connection close incomplete: " + "; ".join(
+                f"{stage}:{type(error).__name__}:{error}" for stage, error in errors)) from errors[0][1]
         self._closed = True
