@@ -580,6 +580,8 @@ def build_mujoco_agent_tcp_pose_gateway_session(
     enable_grasp_approach: bool = False,
     grasp_contact_target_body: str | None = None,
     fast_grasp_planner: Any | None = None,
+    fast_grasp_object_prompt: str | None = None,
+    pickup_support_body_name: str | None = None,
     fast_grasp_approach_config: Mapping[str, float] | None = None,
     safe_motion_observation: MujocoObservedSafeMotionConfig | None = None,
     enable_tool_object_relations: bool = False,
@@ -812,6 +814,10 @@ def build_mujoco_agent_tcp_pose_gateway_session(
         )
     if grasp_contact_target_body is not None and not enable_grasp_approach:
         raise ValueError("Terminal contact requires explicit grasp approach enablement.")
+    if fast_grasp_object_prompt is not None and (
+        fast_grasp_planner is None or segmentation_localizer is None
+    ):
+        raise ValueError("Named fast grasp requires fast grasp planning and text segmentation.")
     if fast_grasp_planner is not None:
         if side != "right":
             raise ValueError("Fast grasp currently requires the native right arm.")
@@ -1102,6 +1108,7 @@ def build_mujoco_agent_tcp_pose_gateway_session(
             enable_object_support_motion_v2=enable_object_support_motion_v2,
         enable_object_attitude_motion_v3=enable_object_attitude_motion_v3,
             object_support_body_names=object_support_body_names,
+            pickup_support_body_name=pickup_support_body_name,
             enable_grasp_approach=enable_grasp_approach,
             grasp_contact_binding=grasp_contact_binding,
         )
@@ -1116,7 +1123,8 @@ def build_mujoco_agent_tcp_pose_gateway_session(
                        "terminal_offset_m": 0., "terminal_speed_scale": .25}
                       if fast_grasp_approach_config is None else dict(fast_grasp_approach_config))
             contract_bundle = build_mujoco_fast_grasp_contract(contract_bundle,
-                model_profile_hash=fast_grasp_planner.semantic_content_hash, approach_config=config)
+                model_profile_hash=fast_grasp_planner.semantic_content_hash, approach_config=config,
+                target_prompt=fast_grasp_object_prompt)
         if history_storage is not None:
             source_binding = contract_bundle.history_source_binding
             if source_binding is None:

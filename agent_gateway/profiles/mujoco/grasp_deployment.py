@@ -35,6 +35,7 @@ from agent_gateway.skills.motion.schemas import (
 from agent_gateway.skills.perception.grasp_fast_plan_schemas import (
     fast_grasp_plan_schema_entry_v1,
     fast_grasp_plan_skill_definition_v1,
+    fast_grasp_plan_skill_definition_v2,
     validate_fast_grasp_plan_parameters_v1,
     validate_fast_grasp_plan_result_for_parameters_v1,
     validate_fast_grasp_plan_result_v1,
@@ -137,6 +138,7 @@ class MujocoFastGraspContract:
     approach_config: Mapping[str, Any]
     source_by_role: Mapping[str, str]
     model_profile_hash: str
+    target_prompt: str | None = None
 
     def __post_init__(self) -> None:
         for name in ("profile_hash", "frame_binding_hash", "model_profile_hash"):
@@ -268,7 +270,7 @@ def _route(*, base, definition, schema, io, route_id, duration_ms):
     return replace(
         base,
         skill_id=definition.skill_id,
-        skill_version="1",
+        skill_version=definition.skill_version,
         skill_definition_hash=definition.semantic_content_hash,
         route_id=route_id,
         route_version="1",
@@ -333,7 +335,7 @@ def _passive_registration(
     validator = AgentSkillPayloadValidatorSet(
         validator_id=route_id + ":" + profile_hash,
         skill_id=definition.skill_id,
-        skill_version="1",
+        skill_version=definition.skill_version,
         route_id=route_id,
         route_version="1",
         parameter_schema_hash=schema.parameter_schema_hash,
@@ -367,7 +369,7 @@ def _passive_registration(
 def _inline_io(definition, schema):
     return inline_only_skill_io_contract(
         skill_id=definition.skill_id,
-        skill_version="1",
+        skill_version=definition.skill_version,
         skill_definition_hash=definition.semantic_content_hash,
         parameter_schema_hash=schema.parameter_schema_hash,
         execution_result_schema_hash=schema.execution_result_schema_hash,
@@ -380,6 +382,7 @@ def build_mujoco_fast_grasp_contract(
     *,
     model_profile_hash: str,
     approach_config: Mapping[str, Any],
+    target_prompt: str | None = None,
 ) -> MujocoAgentTcpPoseContractBundle:
     """Append three closed registrations without starting or acquiring resources."""
     model_hash = sha256_digest(model_profile_hash, field_name="model_profile_hash")
@@ -389,6 +392,20 @@ def build_mujoco_fast_grasp_contract(
     approach = bundle.grasp_approach_contract
     contact = bundle.grasp_contact_contract
     profile = approach.motion_profile
+    target_object_id = None
+    named_binding = {}
+    if target_prompt is not None:
+        target_prompt = required_text(target_prompt, field_name="target_prompt", maximum_length=256)
+        segmentation = bundle.segmentation_geometry
+        if segmentation is None:
+            raise ValueError("Named fast grasp requires the existing segmentation deployment.")
+        target_object_id = contact.contact_binding.target_body_name
+        named_binding = {
+            "target_object_id": target_object_id,
+            "target_prompt": target_prompt,
+            "segmentation_binding_hash": segmentation.binding.semantic_content_hash,
+            "pixel_selection": "same_frozen_rgbd_mask_interior",
+        }
     if (
         not 0
         < config["near_distance_m"] + config["terminal_offset_m"]
@@ -460,6 +477,7 @@ def build_mujoco_fast_grasp_contract(
             "max_speed_scale": MUJOCO_FAST_GRASP_MAX_SPEED_SCALE_V1,
             "plan_ttl_sec": MUJOCO_FAST_GRASP_PLAN_TTL_SEC_V1,
             "plan_id_prefix": MUJOCO_GRASP_APPROACH_PLAN_ID_PREFIX_V1,
+            **named_binding,
         },
         domain="dexteleop.mujoco.fast_grasp.profile.v1",
     )
@@ -514,18 +532,21 @@ def build_mujoco_fast_grasp_contract(
         result=lambda value: validate_observation_result(value, roles=roles),
         contextual=validate_observation_result_for_parameters,
     )
-    definition = fast_grasp_plan_skill_definition_v1(
+    define_fast_grasp = (fast_grasp_plan_skill_definition_v1 if target_object_id is None
+                         else fast_grasp_plan_skill_definition_v2)
+    definition = define_fast_grasp(
         controlled_component_ids=(profile.component_id,)
     )
     schema = fast_grasp_plan_schema_entry_v1(
         skill_definition_hash=definition.semantic_content_hash,
-        parameter_profile_id="mujoco-first-acceptable-grasp-v1",
+        parameter_profile_id="mujoco-first-acceptable-grasp-v" + definition.skill_version,
         parameter_profile_hash=profile_hash,
         component_id=profile.component_id,
         side="right",
         roles=roles,
         min_speed_scale=MUJOCO_FAST_GRASP_MIN_SPEED_SCALE_V1,
         max_speed_scale=MUJOCO_FAST_GRASP_MAX_SPEED_SCALE_V1,
+        target_object_id=target_object_id,
         **{
             name: frames[name]
             for name in (
@@ -542,7 +563,8 @@ def build_mujoco_fast_grasp_contract(
         definition=definition,
         schema=schema,
         io=_inline_io(definition, schema),
-        route_id=MUJOCO_PLAN_GRASP_FAST_ROUTE_ID_V1,
+        route_id=(MUJOCO_PLAN_GRASP_FAST_ROUTE_ID_V1 if target_object_id is None
+                  else "sim.mujoco.perception.plan_grasp_fast.v2"),
         executor_id=MUJOCO_PLAN_GRASP_FAST_EXECUTOR_ID_V1,
         profile_hash=profile_hash,
         duration_ms=45_000,
@@ -653,6 +675,7 @@ def build_mujoco_fast_grasp_contract(
         config,
         rgb.profile.source_id_by_role,
         model_hash,
+        target_prompt,
     )
     registrations = (observation, fast, execute)
     definitions = replace(

@@ -48,7 +48,7 @@ class _ObjectTerminalUnmet(Exception):
 
 
 def _native_support_for_object_motion(scene, *, body_name, phase,
-                                      max_penetration_m, dynamic):
+                                      max_penetration_m, dynamic, fixed_pickup=False):
     """Bind the current top face; a free support need not be exactly level."""
     model = scene.model
     body = int(model.body(body_name).id)
@@ -56,6 +56,13 @@ def _native_support_for_object_motion(scene, *, body_name, phase,
              & ((model.geom_contype != 0) | (model.geom_conaffinity != 0)))]
     if not geoms:
         raise ValueError("Object support stage requires native support geometry.")
+    if fixed_pickup:
+        if (len(geoms) != 1 or model.body_parentid[body] != 0
+                or model.body_jntnum[body] != 0 or model.body_mocapid[body] >= 0):
+            raise ValueError("Pickup support must be one fixed native box.")
+        # Scene objects retain their native OBJECT collision group even when
+        # fixed. The existing pose-bound support path owns that geometry class.
+        dynamic = int(model.geom_contype[geoms[0]]) == 8
     data = scene.data
     if dynamic:
         data = scene.mujoco.MjData(model)
@@ -68,14 +75,14 @@ def _native_support_for_object_motion(scene, *, body_name, phase,
         rotation = data.geom_xmat[geom].reshape(3, 3)
         center = data.geom_xpos[geom]
         size = model.geom_size[geom]
-        if dynamic:
+        if dynamic or fixed_pickup:
             # A free box may rest on any native face. Select its upward face
             # from the measured orientation, without inferring it from a
             # privileged object pose or changing the native collision model.
             axis = int(np.argmax(np.abs(rotation[2, :])))
             sign = float(np.sign(rotation[2, axis]))
             normal = rotation[:, axis] * sign
-            if normal[2] < math.cos(math.radians(1.)):
+            if dynamic and not fixed_pickup and normal[2] < math.cos(math.radians(1.)):
                 raise ValueError("Dynamic support top face is not near-horizontal and upward.")
             normals.append(normal)
             tangents = [i for i in range(3) if i != axis]
@@ -95,7 +102,7 @@ def _native_support_for_object_motion(scene, *, body_name, phase,
         raise ValueError("Dynamic support boxes must have one measured top face.")
     region = np.asarray(points)
     lower, upper = region.min(axis=0), region.max(axis=0)
-    if not dynamic:
+    if not dynamic and not fixed_pickup:
         lower[2] = upper[2]
     frozen = {}
     if dynamic:
@@ -106,15 +113,16 @@ def _native_support_for_object_motion(scene, *, body_name, phase,
                   "frozen_pose_xyz_quat_xyzw": tuple(pose_to_xyz_quat_xyzw(pose))}
     return MujocoPayloadSupport(
         tuple(model.geom(g).name for g in geoms),
-        tuple(normals[0]) if dynamic else (0., 0., 1.),
+        tuple(normals[0]) if dynamic or fixed_pickup else (0., 0., 1.),
         tuple(lower), tuple(upper), phase, max_penetration_m, **frozen)
 
 
 class MujocoAgentObjectMotionLifecycle(MujocoAgentSafeTcpPoseSkillLifecycle):
     """Resolve once from a correlated cut; no second planner or physics owner."""
 
-    def __init__(self, *, object_observer, **kwargs):
+    def __init__(self, *, object_observer, pickup_support_body_name=None, **kwargs):
         self._object_observer = object_observer
+        self._pickup_support_body_name = pickup_support_body_name
         self._payload = None
         self._object_goal_world = None
         self._object_terminal = None
@@ -154,9 +162,22 @@ class MujocoAgentObjectMotionLifecycle(MujocoAgentSafeTcpPoseSkillLifecycle):
         cut = observer.observe(phase=self._phase, establish=True, **support_selection)
         public_from_world = self._public_from_world()
         current = public_from_world @ cut.world_from_object
+        pickup = None
+        if self._phase == "lift" and self._pickup_support_body_name is not None:
+            pickup = self.application.runtime.rig.capture_scene(
+                lambda scene: _native_support_for_object_motion(
+                    scene, body_name=self._pickup_support_body_name, phase="lift",
+                    fixed_pickup=True, dynamic=False,
+                    max_penetration_m=scene.collision_projector().policy.hard_penetration_m))
         if "translation_delta_xyz_m" in parameters:
             goal = current.copy()
-            goal[:3, 3] += np.asarray(parameters["translation_delta_xyz_m"], dtype=float)
+            delta = np.asarray(parameters["translation_delta_xyz_m"], dtype=float)
+            if pickup is not None and cut.status != "held_verified":
+                world_delta = public_from_world[:3, :3].T @ delta
+                if np.linalg.norm(world_delta[:2]) < 1e-9 and world_delta[2] > 0.:
+                    normal = np.asarray(pickup.normal_world)
+                    delta = public_from_world[:3, :3] @ (normal * (world_delta[2] / normal[2]))
+            goal[:3, 3] += delta
         else:
             goal = xyzquat_to_pose_matrix(parameters["object_pose_xyz_quat_xyzw"])
         bounds = self.motion_profile.workspace_bounds
@@ -178,8 +199,8 @@ class MujocoAgentObjectMotionLifecycle(MujocoAgentSafeTcpPoseSkillLifecycle):
         self._object_goal_world = world_goal
 
         def bind(scene):
-            support = None
-            if self._phase in {"lift", "place"}:
+            support = pickup
+            if support is None and self._phase in {"lift", "place"}:
                 support_name = (self._support_object_id or self.application.task_config.table_body_name)
                 support = _native_support_for_object_motion(
                     scene, body_name=support_name, phase=self._phase,

@@ -826,6 +826,7 @@ class MujocoAgentTcpPoseContractBundle:
     object_support_motion_contract_v2: MujocoAgentSafeTcpPoseContract | None = None
     object_attitude_motion_contract_v3: MujocoAgentSafeTcpPoseContract | None = None
     object_support_body_names: tuple[str, ...] = ()
+    pickup_support_body_name: str | None = None
     fast_grasp_contract: Any | None = None
     observed_point_contract: MujocoAgentSafeTcpPoseContract | None = None
     observed_anchor_contract_v2: MujocoAgentSafeTcpPoseContract | None = None
@@ -2123,6 +2124,7 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
     enable_object_support_motion_v2: bool = False,
     enable_object_attitude_motion_v3: bool = False,
     object_support_body_names: tuple[str, ...] = (),
+    pickup_support_body_name: str | None = None,
     enable_grasp_approach: bool = False,
     grasp_contact_binding: MujocoGraspContactBinding | None = None,
     enable_tool_object_relations: bool = False,
@@ -2225,6 +2227,16 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
     if enable_object_support_motion_v2 and not enable_object_motion:
         raise ValueError("Object support v2 requires the original object motion chain.")
     object_support_body_names = tuple(object_support_body_names)
+    if pickup_support_body_name is not None and (
+        not enable_object_attitude_motion_v3
+        or not isinstance(pickup_support_body_name, str)
+        or not pickup_support_body_name.strip()
+        or pickup_support_body_name in object_support_body_names
+        or pickup_support_body_name == application.task_config.table_body_name
+        or grasp_contact_binding is None
+        or pickup_support_body_name == grasp_contact_binding.target_body_name
+    ):
+        raise ValueError("Pickup support must be a distinct fixed body for object attitude motion.")
     if (len(set(object_support_body_names)) != len(object_support_body_names)
             or any(not isinstance(name, str) or not name or name.strip() != name
                    for name in object_support_body_names)):
@@ -2823,6 +2835,9 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
             "target_contact_binding": grasp_contact_binding.to_payload(),
             "maximum_inclination_deviation_rad": OBJECT_INCLINATION_DEVIATION_RAD_V3,
             "yaw": "free_about_world_up", "anchor": "original_grasp_generation",
+            **({"pickup_support_body_name": pickup_support_body_name,
+                "pickup_lift": "normal_departure_with_world_rise"}
+               if pickup_support_body_name is not None else {}),
         }, domain="mujoco.object_inclination_policy.v3")
         item = planned_motion_contract(
             grasped_object_move_definition_v3(controlled_component_ids=(component,)),
@@ -3343,7 +3358,7 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
             source_binding_hash=canonical_content_hash({
                 "state_source_binding": state_binding.semantic_content_hash,
                 "contact_binding": grasp_contact_binding.semantic_content_hash,
-                "support_body": application.task_config.table_body_name,
+                "support_body": pickup_support_body_name or application.task_config.table_body_name,
                 "measurement": "native_body_origin_jacobian_contact_private_copy.v1",
                 **({"follow_producer": "rig_tick_frozen_contact_lift_release.v1"}
                    if enable_object_follow_observation else {}),
@@ -3762,6 +3777,7 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
         object_support_motion_contract_v2=object_support_contract_v2,
         object_attitude_motion_contract_v3=object_attitude_contract_v3,
         object_support_body_names=object_support_body_names,
+        pickup_support_body_name=pickup_support_body_name,
         depth_capture=depth_capture,
         rgb_capture=rgb_capture,
         rgbd_capture=rgbd_capture,

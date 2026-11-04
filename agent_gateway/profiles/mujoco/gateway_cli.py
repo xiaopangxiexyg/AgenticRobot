@@ -359,6 +359,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--enable-fast-grasp", action="store_true",
         help="publish frozen observation, first-acceptable GraspGenX planning and paired one-use native execution")
+    parser.add_argument("--fast-grasp-object-prompt",
+        help="text mask prompt for the configured grasp target, enabling named fast planning v2")
+    parser.add_argument("--pickup-support-body",
+        help="fixed native box supporting the initial object before object-attitude lift")
     parser.add_argument("--sam2-grounding-dino-bundle", type=Path)
     parser.add_argument("--graspgenx-point-grasp-bundle", type=Path)
     parser.add_argument("--graspgenx-source-root", type=Path)
@@ -1043,6 +1047,8 @@ def main(argv: list[str] | None = None) -> int:
         enable_grasp_approach=args.enable_grasp_approach,
         grasp_contact_target_body=args.grasp_contact_target_body,
         fast_grasp_planner=fast_grasp_planner,
+        fast_grasp_object_prompt=args.fast_grasp_object_prompt,
+        pickup_support_body_name=args.pickup_support_body,
         safe_tcp_planning_clearance_padding_m=args.safe_tcp_planning_clearance_padding_m,
     )
     viewer = None

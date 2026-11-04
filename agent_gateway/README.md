@@ -1974,6 +1974,15 @@ RPent 的仿真附件审核 grasp `@1/@2`、优先 `@2`，release `@1/@3/@4`、�
 仍须通过下层检查，执行接近不隐式闭爪。支持 6D 候选不保证每个抓姿都有可行的
 后续搬运与放置路径。
 
+同时传入 `--fast-grasp-object-prompt "blue cube"` 可选用 `plan_grasp_fast@2`。
+该版本接收已绑定的物体 ID，在留存的同一帧 RGB-D 上调用已有文字分割与掩膜内选点，
+再使用同一个 GraspGenX 路径规划器。RPent 的 `--semantic-grasp-place` 附件为模型提供
+观测、抓取和放置目标引用，内部保留原 Gateway 身份校验、执行准入和结果证据。
+
+对从斜面起抓的实验可另绑定 `--pickup-support-body <body>`，要求启用物体姿态 v3。
+指定物体的初始支撑使用独立的固定原生盒，与放置目标分别绑定。起吊的纯竖直上升请求
+沿初始支撑的法向离面，同时满足原请求的竖直升高量和现有的载荷检查。
+
 `--enable-object-attitude-motion-v3` 在原 object-motion 与 support-v2 开关上增加
 `motion.move_grasped_object_to_pose@3`。`lift`、`carry` 保持同一 grasp generation
 冻结的物体材料轴相对世界竖直方向的倾角，允许上下 5° 偏差及绕世界竖直轴的 yaw。

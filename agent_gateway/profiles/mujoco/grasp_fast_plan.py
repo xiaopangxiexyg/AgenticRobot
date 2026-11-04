@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import threading
@@ -14,6 +15,10 @@ import numpy as np
 from PIL import Image
 
 from agent_gateway.profiles.grasp_observation import read_retained_grasp_observation
+from agent_gateway.profiles.segmentation import (
+    LiveRgbSegmentationCapture, decode_segmentation_mask_npy,
+)
+from agent_gateway.profiles.surface_anchor_selection import select_mask_interior_pixel
 from agent_gateway.runtime.passive_read_executor import (
     PassiveReadError,
     PassiveReadResult,
@@ -145,6 +150,7 @@ class MujocoFastGraspPlanProvider:
         operation_lookup,
         current_station_revision,
         clock,
+        segmentation_provider=None,
         monotonic=time.perf_counter,
     ):
         if not isinstance(model, Sam2GraspGenXPointGraspPlanner):
@@ -169,6 +175,9 @@ class MujocoFastGraspPlanProvider:
             current_station_revision,
         )
         self.clock, self.monotonic = clock, monotonic
+        if self.contract.target_prompt is not None and segmentation_provider is None:
+            raise ValueError("Named fast grasp requires its bound segmentation provider.")
+        self.segmentation_provider = segmentation_provider
         self._lock = threading.RLock()
         self._retained = None
         self._closed = False
@@ -431,6 +440,37 @@ class MujocoFastGraspPlanProvider:
 
         return select, priority, result_box
 
+    def _named_target_pixel(self, arrays, metadata, revision):
+        rgb = arrays["rgb"]
+        capture = LiveRgbSegmentationCapture(
+            source_id=metadata["source_id"], role=metadata["role"],
+            captured_at=metadata["acquired_at"], station_revision=revision,
+            image=Image.fromarray(rgb), rgb_content_hash=hashlib.sha256(rgb.tobytes()).hexdigest(),
+        )
+        segmented = self.segmentation_provider.try_segment_capture(
+            capture=capture,
+            parameters={"role": capture.role, "language_prompt": self.contract.target_prompt,
+                        "target_pixel_uv": None, "min_score": 0.3},
+        )
+        if segmented is None:
+            return None, "named_grasp_no_mask"
+        result = segmented.execution_result
+        mask = decode_segmentation_mask_npy(
+            segmented.mask_npy, width=capture.image.width, height=capture.image.height,
+            expected_count=result["mask_pixel_count"],
+            expected_bounds=tuple(result["mask_bounds_xyxy"]),
+        )
+        try:
+            pixel, _ = select_mask_interior_pixel(
+                mask, arrays["depth_m"], requested_pixel_uv=None,
+                maximum_depth_m=metadata["depth_valid_range_m"][1],
+            )
+        except RuntimeError as error:
+            if str(error) != "surface_anchor_mask_has_no_valid_depth":
+                raise
+            return None, "named_grasp_mask_has_no_depth"
+        return pixel, None
+
     def plan_request(self, request, operation, *, cancelled=lambda: False):
         started = self.monotonic()
         p, c, app = request.parameters, self.contract, self.application
@@ -459,12 +499,11 @@ class MujocoFastGraspPlanProvider:
             if selected is None:
                 raise ValueError("Requested role is not in this frozen observation.")
             arrays, metadata = selected
-            u, v = p["target_pixel_uv"]
-            if (
-                not 0 <= u < arrays["rgb"].shape[1]
-                or not 0 <= v < arrays["rgb"].shape[0]
-            ):
-                raise ValueError("Target pixel is outside the retained native image.")
+            pixel = p.get("target_pixel_uv")
+            if pixel is not None:
+                u, v = pixel
+                if not (0 <= u < arrays["rgb"].shape[1] and 0 <= v < arrays["rgb"].shape[0]):
+                    raise ValueError("Target pixel is outside the retained native image.")
             reference_from_camera = rigid_pose(
                 metadata["T_reference_from_camera"], name="captured optical transform"
             )
@@ -519,21 +558,30 @@ class MujocoFastGraspPlanProvider:
             try:
                 if budget > 0 and self.monotonic() < deadline and not cancelled():
                     try:
-                        self.model.plan(
-                            Image.fromarray(arrays["rgb"]),
-                            arrays["depth_m"],
-                            pixel_uv=(u, v),
-                            intrinsics=metadata["camera_intrinsics"],
-                            base_from_camera=reference_from_camera,
-                            max_candidates=1,
-                            candidate_selector=selector,
-                            proposal_priority=priority,
-                            visible_scene_factory=visible_scene,
-                            use_visible_target_points=True,
-                            refine_grasp_centers=True,
-                            refine_grasp_axial_depth=True,
-                            preparation_guard=preparation_guard,
-                        )
+                        if c.target_prompt is not None:
+                            preparation_guard()
+                            pixel, selection_failure = self._named_target_pixel(
+                                arrays, metadata, request.expected_station_revision)
+                            preparation_guard()
+                            if selection_failure is not None:
+                                reason = selection_failure
+                        if pixel is not None:
+                            u, v = pixel
+                            self.model.plan(
+                                Image.fromarray(arrays["rgb"]),
+                                arrays["depth_m"],
+                                pixel_uv=tuple(pixel),
+                                intrinsics=metadata["camera_intrinsics"],
+                                base_from_camera=reference_from_camera,
+                                max_candidates=1,
+                                candidate_selector=selector,
+                                proposal_priority=priority,
+                                visible_scene_factory=visible_scene,
+                                use_visible_target_points=True,
+                                refine_grasp_centers=True,
+                                refine_grasp_axial_depth=True,
+                                preparation_guard=preparation_guard,
+                            )
                     except PointGraspPlanningError as error:
                         reason = error.reason_code
                     except MujocoTcpPlanRejected as error:
@@ -559,7 +607,9 @@ class MujocoFastGraspPlanProvider:
                     "observation_operation_id": source.operation_id,
                     "observation_content_hash": result_hash,
                     "role": p["role"],
-                    "target_pixel_uv": list(p["target_pixel_uv"]),
+                    "target_pixel_uv": None if pixel is None else list(pixel),
+                    **({"target_object_id": p["target_object_id"]}
+                       if c.target_prompt is not None else {}),
                     **{
                         n: getattr(profile, n)
                         for n in (

@@ -1582,7 +1582,8 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
         source = MujocoObjectStateSource(application=application, profile=registration.profile,
             contact_binding=contract_bundle.grasp_contact_contract.contact_binding,
             gripper_port=(gripper_ports.get("right_gripper") if registration.profile.release_supported else None),
-            additional_support_body_names=contract_bundle.object_support_body_names)
+            additional_support_body_names=contract_bundle.object_support_body_names,
+            pickup_support_body_name=contract_bundle.pickup_support_body_name)
         if contract_bundle.object_motion_contract is not None:
             object_observer = source.follow_observer
             if object_observer is None:
@@ -1880,6 +1881,8 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
 
                 lifecycle = MujocoAgentObjectMotionLifecycle
                 extra["object_observer"] = object_observer
+                if _route.skill_version == "3" and contract_bundle.pickup_support_body_name is not None:
+                    extra["pickup_support_body_name"] = contract_bundle.pickup_support_body_name
             return lifecycle(
                 **extra,
                 path_search_time_budget_sec=_contract.path_search_time_budget_sec,
@@ -1976,6 +1979,7 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
         fast_grasp_provider = MujocoFastGraspPlanProvider(
             application=application, bundle=contract_bundle, model=fast_grasp_planner,
             observation_executor=grasp_observation_executor, artifact_store=artifact_store,
+            segmentation_provider=segmentation_provider,
             operation_lookup=lambda identifier: service.get_operation(identifier),
             current_station_revision=revision, clock=runtime_clock)
         fast_grasp_executor = build_mujoco_fast_grasp_executor(provider=fast_grasp_provider,

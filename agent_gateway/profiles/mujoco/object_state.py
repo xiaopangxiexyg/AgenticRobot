@@ -13,7 +13,7 @@ from sim.mujoco.transforms import pose_to_xyz_quat_xyzw
 
 class MujocoObjectStateSource:
     def __init__(self, *, application, profile, contact_binding, gripper_port=None,
-                 additional_support_body_names=()):
+                 additional_support_body_names=(), pickup_support_body_name=None):
         if profile.observation_source != "mujoco_native_physics":
             raise ValueError("Native object source requires its explicit observation identity")
         if profile.release_supported != (gripper_port is not None):
@@ -29,10 +29,15 @@ class MujocoObjectStateSource:
         self.application, self.profile, self.contact_binding = application, profile, contact_binding
         self._model = application.scene.model
         self._body = int(self._model.body(profile.object_id).id)
-        self._support = int(self._model.body(application.task_config.table_body_name).id)
+        initial_support = pickup_support_body_name or application.task_config.table_body_name
+        self._support = int(self._model.body(initial_support).id)
+        if pickup_support_body_name is not None and (
+                self._model.body_parentid[self._support] != 0
+                or self._model.body_jntnum[self._support] != 0):
+            raise ValueError("Pickup support must be a fixed world body.")
         additional_support_body_names = tuple(additional_support_body_names)
         if (len(set(additional_support_body_names)) != len(additional_support_body_names)
-                or application.task_config.table_body_name in additional_support_body_names):
+                or initial_support in additional_support_body_names):
             raise ValueError("Additional object supports must have distinct native identities.")
         self._sensors = {int(self._model.geom(name).id) for name in contact_binding.sensor_geom_names}
         self._target_geoms = set(np.flatnonzero((self._model.geom_bodyid == self._body)
@@ -58,7 +63,7 @@ class MujocoObjectStateSource:
             self._follow = MujocoGraspedObjectObserver(
                 rig=rig, object_body_name=profile.object_id,
                 sensor_geom_names=contact_binding.sensor_geom_names,
-                support_body_names=(application.task_config.table_body_name,
+                support_body_names=(initial_support,
                                     *additional_support_body_names),
                 gripper_name=gripper_port.gripper_name,
                 command_state=lambda: rig.latest_gripper_command(gripper_port.gripper_name),

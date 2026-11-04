@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import math
 from collections.abc import Mapping, Sequence
+from dataclasses import replace
 from typing import Any
 
 from agent_gateway.protocol._contract_validation import (
@@ -97,6 +98,19 @@ def fast_grasp_plan_skill_definition_v1(
     )
 
 
+def fast_grasp_plan_skill_definition_v2(*, controlled_component_ids):
+    """Select a depth-supported point for a named target on the retained view."""
+    return replace(
+        fast_grasp_plan_skill_definition_v1(controlled_component_ids=controlled_component_ids),
+        skill_version="2",
+        summary="Plan a grasp for the named object on the retained RGB-D observation. "
+                "The Skill selects a depth-supported mask interior and checks the complete "
+                "grasp path before returning a retained grasp plan.",
+        parameter_semantics_id="frozen_observation.named_object.first_acceptable.v2",
+        execution_result_semantics_id="immutable_named_first_acceptable_grasp_plan.v2",
+    )
+
+
 def fast_grasp_plan_schema_entry_v1(
     *,
     skill_definition_hash: str,
@@ -112,6 +126,7 @@ def fast_grasp_plan_schema_entry_v1(
     frame_graph_hash: str,
     tool_config_hash: str,
     calibration_hash: str,
+    target_object_id: str | None = None,
 ) -> AgentSkillSchemaEntry:
     """Bind strict semantic schemas to explicit deployment-owned identities."""
     identities = {
@@ -148,6 +163,11 @@ def fast_grasp_plan_schema_entry_v1(
         "speed_scale": {"type": "number", "minimum": minimum, "maximum": maximum},
         "planning_budget_sec": {"type": "number", "minimum": 1, "maximum": 30},
     }
+    if target_object_id is not None:
+        del parameter_properties["target_pixel_uv"]
+        parameter_properties["target_object_id"] = {
+            "enum": [required_text(target_object_id, field_name="target_object_id")],
+        }
     parameter_schema = {
         "type": "object",
         "additionalProperties": False,
@@ -211,6 +231,9 @@ def fast_grasp_plan_schema_entry_v1(
             },
         },
     }
+    if target_object_id is not None:
+        result_properties["target_pixel_uv"] = {"anyOf": [pixel, {"type": "null"}]}
+        result_properties["target_object_id"] = {"const": target_object_id}
     result_schema = {
         "type": "object",
         "additionalProperties": False,
@@ -236,7 +259,7 @@ def fast_grasp_plan_schema_entry_v1(
     }
     return AgentSkillSchemaEntry(
         skill_id=PLAN_GRASP_FAST_SKILL_ID_V1,
-        skill_version="1",
+        skill_version="1" if target_object_id is None else "2",
         skill_definition_hash=skill_definition_hash,
         parameter_schema=parameter_schema,
         execution_result_schema=result_schema,
@@ -289,6 +312,13 @@ def _source(payload: Mapping[str, Any], schema: Mapping[str, Any]) -> None:
     )
     if payload["role"] not in schema["properties"]["role"]["enum"]:
         raise ValueError("role is not supported by this deployment.")
+    if "target_object_id" in payload:
+        if payload["target_object_id"] not in schema["properties"]["target_object_id"].get(
+            "enum", (schema["properties"]["target_object_id"].get("const"),)
+        ):
+            raise ValueError("The requested object is not the bound grasp target.")
+        if payload.get("target_pixel_uv") is None and payload.get("planning_status") != "path_found":
+            return
     _pixel(payload["target_pixel_uv"])
 
 
@@ -403,7 +433,10 @@ def validate_fast_grasp_plan_result_for_parameters_v1(
         )
         if result[field] != requested:
             raise ValueError(f"Fast grasp result {field} differs from the request.")
-    if _pixel(result["target_pixel_uv"]) != _pixel(parameters["target_pixel_uv"]):
+    if "target_object_id" in parameters:
+        if result["target_object_id"] != parameters["target_object_id"]:
+            raise ValueError("Fast grasp result object differs from the request.")
+    elif _pixel(result["target_pixel_uv"]) != _pixel(parameters["target_pixel_uv"]):
         raise ValueError("Fast grasp result target_pixel_uv differs from the request.")
 
 
@@ -411,6 +444,7 @@ __all__ = [
     "PLAN_GRASP_FAST_SKILL_ID_V1",
     "fast_grasp_plan_schema_entry_v1",
     "fast_grasp_plan_skill_definition_v1",
+    "fast_grasp_plan_skill_definition_v2",
     "validate_fast_grasp_plan_parameters_v1",
     "validate_fast_grasp_plan_result_for_parameters_v1",
     "validate_fast_grasp_plan_result_v1",
