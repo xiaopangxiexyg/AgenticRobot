@@ -14,6 +14,7 @@ import pytest
 
 from control_station import real_rule_based_writing_entrypoint, real_teleop_entrypoint
 from control_station.rule_based_writing import RuleBasedWritingWebUi
+from dataset_interface.capture_modalities import CaptureModalityBindingError
 from robot_motion.action import HandActionSpec
 from robot_motion.deploy.schema import (
     ACTION_ARM_POSE_SLICES,
@@ -675,6 +676,33 @@ def test_rule_tactile_toggle_is_explicit_for_blank_dataset(tmp_path: Path) -> No
     assert args.dmtac_tactile is False
     assert args.tactile_bundle_root == ""
     assert args.tactile_bundle_min_free_gb == 0.0
+
+
+def test_rule_tactile_rejects_populated_dataset_without_modality_contract(
+    tmp_path: Path,
+) -> None:
+    dataset_root = tmp_path / "formal"
+    (dataset_root / "meta").mkdir(parents=True)
+    (dataset_root / "meta" / "episodes.jsonl").write_text(
+        '{"episode_index": 0}\n',
+        encoding="utf-8",
+    )
+    args = argparse.Namespace(
+        dataset_root=str(dataset_root),
+        ignore_camera=[],
+        ignore_tactile=[],
+        rule_collect_tactile=None,
+        tactile_bundle_root="",
+        tactile_bundle_min_free_gb=0.0,
+        tactile_bundle_min_free_source="default",
+        tactile_artifact_integrity=True,
+    )
+
+    with pytest.raises(
+        CaptureModalityBindingError,
+        match="has no capture modality contract",
+    ):
+        rule_based_plan._resolve_rule_tactile_capture(args)
 
 
 def test_rule_tactile_toggle_defaults_to_ten_gib_when_root_is_present(

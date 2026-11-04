@@ -24,6 +24,7 @@ import numpy as np
 
 from dataset_contracts.capture_modalities import CaptureModalityContract
 from dataset_interface.capture_modalities import (
+    CaptureModalityBindingError,
     dataset_is_blank,
     read_capture_modality_contract,
 )
