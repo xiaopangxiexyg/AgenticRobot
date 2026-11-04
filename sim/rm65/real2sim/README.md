@@ -86,6 +86,14 @@ held-out result, while v2 and v1 remain historical. Promotion to `identified`
 requires a new clean capture collected after v4 is frozen and never used for
 tuning.
 
+硬件连接 owner 关闭补全与操作者夹爪未就绪拒绝使用后继绑定
+`artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261104_hardware_connection_close_v1.json`，
+固定源码 `92ded2a693fdfe722c3f7a48c9fd28312dbfcd96`（development `e67b949e` 与任务 `25af2cf2` 的合并）。继承全部 209 项运行时输入（204 项 Python），
+只有操作者硬件连接入口 `hardware_connection.py` 改变：关闭时依次尝试当前代次、常驻传输和常驻相机／模型，
+某一步失败（例如 HOLD 无法确认）后仍删除 socket 并释放相机和模型；夹爪端口未就绪时拒绝且不发送命令，
+`agent_gateway.operator_gripper.v1` 仍只有五种 status。既有检查 725 passed / 1 skipped，另有离线复现；
+没有新增真机验证，不改变控制语义、wire schema 或拟合参数，仍为 `provisional`。
+
 夹爪已张开请求与串口自动恢复使用后继绑定
 `artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261104_gripper_open_recovery_v1.json`，
 固定源码 `17228f31263626f207b232c630bf4de686930f99`。继承全部 209 项运行时输入（204 项 Python），其中真实

@@ -25,7 +25,7 @@ ARM_BASELINE_PATH = Path(
 )
 ARM_RUNTIME_BINDING_PATH = Path(
     "sim/rm65/real2sim/artifacts/"
-    "rm65_arm_free_motion_20260721_v4_runtime_binding_20261104_gripper_open_recovery_v1.json"
+    "rm65_arm_free_motion_20260721_v4_runtime_binding_20261104_hardware_connection_close_v1.json"
 )
 MUJOCO_G4_RELEASE_LEVELING_V1_BINDING_PATH = Path(
     "sim/rm65/real2sim/artifacts/"
@@ -462,10 +462,10 @@ def test_v4_arm_fit_baseline_remains_frozen_and_provisional() -> None:
 def test_current_arm_runtime_binding_uses_exact_current_inputs() -> None:
     binding = Real2SimArtifactManifest.load(ARM_RUNTIME_BINDING_PATH)
     previous_path = Path("sim/rm65/real2sim/artifacts/"
-        "rm65_arm_free_motion_20260721_v4_runtime_binding_20261104_semantic_grasp_place_v1.json")
+        "rm65_arm_free_motion_20260721_v4_runtime_binding_20261104_gripper_open_recovery_v1.json")
     previous = Real2SimArtifactManifest.load(previous_path)
-    source, source_tree = "17228f31263626f207b232c630bf4de686930f99", "3d0248617a4f895c27afe0479bd7702557323152"
-    tag, old_tag = "20261104-gripper-open-recovery-v1", "20261104-semantic-grasp-place-v1"
+    source, source_tree = "92ded2a693fdfe722c3f7a48c9fd28312dbfcd96", "3e72419b31f7c4ad4f7c565edbcfaa0bcfc8692f"
+    tag, old_tag = "20261104-hardware-connection-close-v1", "20261104-gripper-open-recovery-v1"
     current = {r.locator: r for r in binding.dependency_artifacts if "-runtime-" + tag in r.artifact_id}
     inherited = {r.locator: r for r in previous.dependency_artifacts if "-runtime-" + old_tag in r.artifact_id}
     assert len(current) == len(inherited) == 209 and set(current) == set(inherited)
@@ -476,10 +476,7 @@ def test_current_arm_runtime_binding_uses_exact_current_inputs() -> None:
         assert ref.artifact_id == inherited[path].artifact_id.replace(old_tag, tag)
         assert ref.artifact_kind == inherited[path].artifact_kind
     changed = {p for p in inherited if current[p].sha256 != inherited[p].sha256}
-    assert changed == {"agent_gateway/profiles/real/gateway_cli.py",
-                       "agent_gateway/profiles/real/motion_gateway_session.py",
-                       "agent_gateway/profiles/real/gripper_skill.py",
-                       "agent_gateway/profiles/real/hardware_connection.py"}
+    assert changed == {"agent_gateway/profiles/real/hardware_connection.py"}
     assert tuple(binding.metadata["changed_previous_runtime_sources"]) == tuple(sorted(changed))
     assert tuple(binding.metadata["new_runtime_sources"]) == ()
     assert tuple(binding.metadata["changed_previous_offline_inputs"]) == ()
@@ -491,7 +488,7 @@ def test_current_arm_runtime_binding_uses_exact_current_inputs() -> None:
     for ref in previous.dependency_artifacts:
         if "-runtime-" + old_tag not in ref.artifact_id:
             assert refs[ref.artifact_id] == ref
-    parent = refs["rm65-arm-runtime-binding-semantic-grasp-place-20261104-v1"]
+    parent = refs["rm65-arm-runtime-binding-gripper-open-recovery-20261104-v1"]
     assert parent.locator == str(previous_path)
     assert parent.sha256 == binding.metadata["previous_runtime_binding_file_sha256"] == hashlib.sha256(previous_path.read_bytes()).hexdigest()
     assert binding.metadata["previous_runtime_binding_artifact_sha256"] == previous.artifact_sha256
@@ -500,17 +497,17 @@ def test_current_arm_runtime_binding_uses_exact_current_inputs() -> None:
     for artifact_id in binding.metadata["offline_query_input_artifact_ids"]:
         ref = refs[artifact_id]
         assert ref.sha256 == ArtifactRef.from_file(ref.locator, artifact_id="offline-check", artifact_kind=ref.artifact_kind).sha256
-    assert binding.metadata["migration"] == "gripper_recovery_open_binding_v1"
-    assert binding.metadata["runtime_behavior_change_scope"] == "measured_open_idempotency_and_generation_fenced_serial_recovery"
-    for key in ("runtime_behavior_change", "runtime_control_semantics_changed", "automatic_connection_recovery"):
+    assert binding.metadata["migration"] == "hardware_connection_close_binding_v1"
+    assert binding.metadata["runtime_behavior_change_scope"] == "owner_close_attempts_every_stage_and_operator_gripper_not_ready_refusal"
+    for key in ("runtime_behavior_change", "automatic_connection_recovery"):
         assert binding.metadata[key] is True
-    for key in ("arm_profile_refit", "new_physical_hardware_validation", "automatic_position_replay",
-                "wire_schema_version_changed", "automatic_retry_authorization"):
+    for key in ("runtime_control_semantics_changed", "arm_profile_refit", "new_physical_hardware_validation",
+                "automatic_position_replay", "wire_schema_version_changed", "automatic_retry_authorization"):
         assert binding.metadata[key] is False
     evidence = next(e for e in binding.validation_evidence if "passed_cases" in e.metrics)
-    assert evidence.metrics["passed_cases"] == 508
+    assert evidence.metrics["passed_cases"] == 725
     assert evidence.metrics["failed_cases"] == evidence.metrics["error_cases"] == 0
-    assert len(binding.metadata["offline_validation_report_artifact_ids"]) == 2
+    assert len(binding.metadata["offline_validation_report_artifact_ids"]) == 4
     assert binding.fidelity_claims[0].status == "provisional"
     assert next(e for e in binding.validation_evidence if e.split == "held_out").status == "not_run"
 
