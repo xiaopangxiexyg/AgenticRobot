@@ -102,17 +102,31 @@ overlap; small handwritten models may still run in the contract batches.
 Shorter processes bound retained native state.
 
 The runner accepts at most four live core processes, which still holds at most
-two native batches at a time. On the local merge host (`zc-MS-7E24`, Ryzen 9
-7950X, 32 logical CPUs, 61 GiB RAM) use the guarded eight-batch, four-process
-command above. On 2026-11-04 it ran core for `38a97cb39` in 223.3 seconds:
+two native batches at a time, and above two processes it requires at least
+eight batches. Only the local merge host (`zc-MS-7E24`, Ryzen 9 7950X, 32
+logical CPUs, 61 GiB RAM) uses this, through the guarded eight-batch,
+four-process command above; the runner itself does not detect the guard. On
+2026-11-04 the official entrypoint ran core for `38a97cb39` in 223.3 seconds:
 7,036 records, 0 failures, the 1 existing skip, a scope peak of 7.0 GiB and no
-memory.high events, while other agents kept the host load at 11–13. The
-default layout needed about 389 seconds for the same record set on that host.
-Each native process keeps about 2 GiB of native memory by the end of its batch
-and peaks at 3.7–4.2 GiB, so the four-process layout under the former 6 GiB
-memory.high was throttled continuously until it was stopped. Keep the default
-on other hosts, including the 192.168.70.116 field PC, unless their headroom
-is measured.
+memory.high events. Host load averages were 11–13 at start and end, counting
+other agents' runs and this one. An experiment run of the same layout took
+216.1 seconds. The default layout took 389 seconds for the same record set on
+that host (another task's `e67b949e` run). The eight-batch layout spends about
+13% more summed testcase time, so a host with fewer idle cores gains less.
+
+Each 23-module native process of the default layout keeps about 2 GiB of
+native memory by the end of its batch and peaks at 3.7–4.2 GiB; the
+eight-batch native processes kept 1.5–2.0 GiB and peaked at 2.5–4.1 GiB. Under
+the 6 GiB high / 8 GiB max / no-swap envelope of the 2026-11-01 remote core
+runs, the eight-batch, four-process layout was throttled continuously until it
+was stopped. Other hosts, including the 192.168.70.116 field PC, keep the
+default; another host needs its own guarded measurement and explicit approval
+first. If a guarded run hits pytest timeouts, loses a worker to the memory
+limit or takes clearly longer than five minutes, rerun the default layout,
+report both results and re-measure before using the four-process layout again;
+also re-measure after `CORE_NATIVE_MODULES` changes. `systemd-run` prints the
+scope name; after an interrupted run, stop that scope with
+`systemctl --user stop` so that no worker survives.
 A process/concurrency limit is not a RAM limit: use the host's existing memory,
 swap and pressure safeguards. Duration is measured from entry through cleanup
 and formal report publication; the target never authorizes skipping work at

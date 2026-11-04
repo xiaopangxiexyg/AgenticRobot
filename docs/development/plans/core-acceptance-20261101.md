@@ -131,4 +131,6 @@ the unchanged memory/pressure envelope. Report complete invocation time,
 native peak and pressure/OOM/swap counters, selected case outcomes and any
 environment skips separately. Multiple clean-process observations distinguish
 one fast sample from repeatable feedback. New mainline inputs require their
-own combined checks; an old-base result never authorizes promotion.
+own combined checks; an old-base result never authorizes promotion. The later
+local four-process layout has its own guarded envelope and measurements in
+`tests/README.md`; it does not change this remote envelope.
