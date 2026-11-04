@@ -86,6 +86,15 @@ held-out result, while v2 and v1 remain historical. Promotion to `identified`
 requires a new clean capture collected after v4 is frozen and never used for
 tuning.
 
+夹爪已张开请求与串口自动恢复使用后继绑定
+`artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261104_gripper_open_recovery_v1.json`，
+固定源码 `17228f31263626f207b232c630bf4de686930f99`。继承全部 209 项运行时输入（204 项 Python），其中真实
+Gateway CLI、会话、夹爪端口和操作者夹爪入口四项改变。复用后台连接恢复，恢复后确认初始 HOLD；
+旧指令和旧停止证明不跨连接代次使用。实测已张开的重复请求确认 HOLD 后完成，不重复写位置；
+实际张开使用单次模式。既有 owner 检查 508 passed / 0 skipped；没有新增真机验证，
+不授权旧操作重试或位置重放，不改变 wire schema 或拟合参数，仍为 `provisional`。
+输入集合不是传递闭包；完整发布提交另固定串口后端与应用组合的改变。
+
 The v4 fit manifest remains immutable when runtime implementation or
 configuration changes. In particular, its source hashes describe the exact
 core and MuJoCo adapter used for the 20260721 fit; tests compare those hashes to
