@@ -736,3 +736,7 @@ plan.
 门禁以及 RM65 响应配置保持；绑定固定提交 `b978c73d386bab608a0febb5ba1ba51e9cafded6`，原生离线消费者 77 passed。
 V11 为独立 B601 候选的历史绑定，不作为当前绑定；V12/V13 及旧 fit 均保留原字节。
 未重拟合响应参数，fidelity 仍 provisional，新 held-out 仍 not_run，不代表设备或抓取验收。
+
+### 具名抓放运行来源
+
+当前 provisional 绑定见 `artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20261104_semantic_grasp_place_v1.json`。MuJoCo 可选用具名抓取与固定斜面起抓，复用原生载荷和接触检查。各闭环报告保留其实际试次、结果和固定源码。
